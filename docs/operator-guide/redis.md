@@ -66,7 +66,7 @@ the snapshot.
 - `kubectl` bound to the cluster:
 
   ```sh
-  export KUBECONFIG="$(apprafter kubeconfig --refresh)"
+  apprafter kubeconfig --refresh > /tmp/kc && export KUBECONFIG=/tmp/kc
   ```
 
 - Pre-flight: the seeded provider, the dragonfly-operator, and the

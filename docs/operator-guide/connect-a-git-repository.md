@@ -107,7 +107,7 @@ in this runbook: `kubectl get applications.argoproj.io bootstrap -n argocd`.
 
    ```sh
    apprafter bootstrap-all     # or: apprafter apply && apprafter kubeconfig && apprafter cluster-bootstrap
-   export KUBECONFIG=$(apprafter kubeconfig)
+   apprafter kubeconfig > /tmp/kc && export KUBECONFIG=/tmp/kc
    ```
 
    The `cluster-bootstrap` summary line ends with

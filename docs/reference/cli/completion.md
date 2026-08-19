@@ -26,7 +26,7 @@ Usage: apprafter completion <SHELL>
 Examples:
 
 ```sh
-apprafter completion bash > ~/.local/share/bash-completion/completions/apprafter
-apprafter completion zsh > ~/.zfunc/_apprafter  # ~/.zfunc must be on fpath
-apprafter completion fish > ~/.config/fish/completions/apprafter.fish
+mkdir -p ~/.local/share/bash-completion/completions && apprafter completion bash > ~/.local/share/bash-completion/completions/apprafter
+mkdir -p ~/.zfunc && apprafter completion zsh > ~/.zfunc/_apprafter  # ~/.zfunc must be on fpath
+mkdir -p ~/.config/fish/completions && apprafter completion fish > ~/.config/fish/completions/apprafter.fish
 ```

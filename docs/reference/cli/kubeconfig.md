@@ -26,5 +26,5 @@ Examples:
 
 ```sh
 apprafter kubeconfig --refresh
-export KUBECONFIG="$(apprafter kubeconfig)"
+apprafter kubeconfig > /tmp/kc && export KUBECONFIG=/tmp/kc
 ```

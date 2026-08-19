@@ -67,9 +67,21 @@ pub struct CommandExamples {
 ///
 /// # House rules for an entry
 ///
-/// * **One line, opening with `apprafter`.** Two lines in one entry
-///   would be tokenised as one command with the second line's flags
-///   charged to the first, so the guard rejects it; write two entries.
+/// * **One line, and it must invoke this command.** Two lines in one
+///   entry would be tokenised as one command with the second line's
+///   flags charged to the first, so the guard rejects it; write two
+///   entries. A setup or follow-up command may share the line through
+///   `&&` — `mkdir -p …` before a completion redirect, `export
+///   KUBECONFIG=…` after the fetch — because a recipe that only works
+///   with a step the reader has to infer is not a worked example. The
+///   guard reads every segment and still requires one of them to be
+///   this command.
+/// * **It must work verbatim.** Not "resolve" — work. The guard checks
+///   the path and the flag names, which is all it can; it cannot know
+///   that `export KUBECONFIG="$(apprafter kubeconfig)"` points kubectl
+///   at a YAML document where it wants a path list, or that a redirect
+///   into a directory that does not exist yet exits 1. Both shipped
+///   here and both were found at a terminal, not by a gate.
 /// * **A leaf command carries at least one; a hidden command carries
 ///   none.** `auth login` / `logout` / `status` are hidden because
 ///   AppRafter Cloud is not available yet — an example would advertise
@@ -233,10 +245,16 @@ pub const EXAMPLES: &[CommandExamples] = &[
     // has a published recipe, each ending at its own destination.
     CommandExamples {
         path: &["completion"],
+        // The `mkdir -p` is not decoration: on a clean machine none of
+        // these directories exists, and the redirect alone fails with
+        // `No such file or directory` and exit 1 — on the one command
+        // whose example IS the instruction. The developer quickstart's
+        // three recipes each open with the same line; these are those
+        // recipes, one line each.
         lines: &[
-            "apprafter completion bash > ~/.local/share/bash-completion/completions/apprafter",
-            "apprafter completion zsh > ~/.zfunc/_apprafter  # ~/.zfunc must be on fpath",
-            "apprafter completion fish > ~/.config/fish/completions/apprafter.fish",
+            "mkdir -p ~/.local/share/bash-completion/completions && apprafter completion bash > ~/.local/share/bash-completion/completions/apprafter",
+            "mkdir -p ~/.zfunc && apprafter completion zsh > ~/.zfunc/_apprafter  # ~/.zfunc must be on fpath",
+            "mkdir -p ~/.config/fish/completions && apprafter completion fish > ~/.config/fish/completions/apprafter.fish",
         ],
     },
     CommandExamples {
@@ -272,7 +290,16 @@ pub const EXAMPLES: &[CommandExamples] = &[
         path: &["kubeconfig"],
         lines: &[
             "apprafter kubeconfig --refresh",
-            "export KUBECONFIG=\"$(apprafter kubeconfig)\"",
+            // NOT `export KUBECONFIG="$(apprafter kubeconfig)"`. This
+            // command prints the kubeconfig DOCUMENT, and `KUBECONFIG`
+            // is a colon-separated list of PATHS — kubectl finds no
+            // file in the YAML, falls back to `https://localhost:8080`
+            // and reports a connection error, so the reader debugs
+            // their cluster instead of their shell. The substitution
+            // also swallows a failed fetch: `export X="$(cmd)"` exits
+            // 0 whatever `cmd` did. Both quickstarts write the file
+            // and export its path; so does this.
+            "apprafter kubeconfig > /tmp/kc && export KUBECONFIG=/tmp/kc",
         ],
     },
     CommandExamples {
@@ -555,6 +582,25 @@ fn after_help(path: &[&str]) -> Option<String> {
 /// The walk keys on the same path `docsgen`'s projection uses — the
 /// subcommand names from the root down — so a command that gains an
 /// example in the reference gains it in `--help` with no second edit.
+///
+/// # It refuses rather than overwrites
+///
+/// A command that already declares an after-help of its own — through
+/// `#[command(after_help = …)]` or `after_long_help` — is a **conflict
+/// and panics**, because either resolution is silent. Overwriting
+/// loses the author's text; leaving it loses the examples. And
+/// `after_long_help` in particular does not even collide visibly: clap
+/// falls back from it to `after_help`, so declaring one makes `--help`
+/// show the attribute and `-h` show the examples. That was measured,
+/// not reasoned about — with `after_long_help` on one variant, `--help`
+/// dropped its `Examples:` section while `docsgen check` and every
+/// example test stayed green.
+///
+/// The panic is deliberate. This is a property of a *static* tree, so
+/// it cannot depend on user input: it either holds for every invocation
+/// or for none, and every test that spawns the binary hits it on the
+/// first run. `attach_refuses_to_overwrite_a_commands_own_after_help`
+/// pins that it fires, and its sibling that it does not.
 pub fn attach(command: clap::Command) -> clap::Command {
     attach_at(command, &mut Vec::new())
 }
@@ -572,7 +618,18 @@ fn attach_at(mut command: clap::Command, path: &mut Vec<String>) -> clap::Comman
 
     let key: Vec<&str> = path.iter().map(String::as_str).collect();
     match after_help(&key) {
-        Some(block) => command.after_help(block),
+        Some(block) => {
+            assert!(
+                command.get_after_help().is_none() && command.get_after_long_help().is_none(),
+                "`apprafter {}` declares its own after-help AND has examples in \
+                 `EXAMPLES`. One of them would be lost silently — an \
+                 `after_long_help` attribute in particular takes over `--help` \
+                 while `-h` keeps showing the examples. Put the text in the \
+                 command's doc comment or in the examples table, not both.",
+                key.join(" ")
+            );
+            command.after_help(block)
+        }
         None => command,
     }
 }
@@ -656,5 +713,53 @@ mod tests {
     #[test]
     fn the_shipped_table_declares_each_path_once() {
         assert_eq!(duplicate_path(EXAMPLES), None);
+    }
+
+    /// A two-node stand-in for the real tree. `plan` is a path the
+    /// shipped [`EXAMPLES`] declares, so [`attach`] has something to
+    /// attach there; `whoami` is another. Built by hand rather than
+    /// from `Cli::command()` because the point is to hand `attach` a
+    /// command that ALREADY carries an after-help, which the real tree
+    /// (correctly) never does.
+    fn tree_with(plan: clap::Command) -> clap::Command {
+        clap::Command::new("apprafter").subcommand(plan)
+    }
+
+    #[test]
+    fn attach_puts_the_examples_on_a_command_that_declares_none_of_its_own() {
+        // The "does not fire" half. Without it, a refusal that fired on
+        // everything would look identical to a working one.
+        let attached = attach(tree_with(clap::Command::new("plan")));
+        let plan = attached
+            .get_subcommands()
+            .find(|sub| sub.get_name() == "plan")
+            .expect("the subcommand survives the walk");
+        let after = plan
+            .get_after_help()
+            .expect("`apprafter plan` has examples, so a block was attached")
+            .to_string();
+        assert!(after.starts_with("Examples:"), "{after}");
+        for line in examples_for(&["plan"]) {
+            assert!(after.contains(line), "{after}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "declares its own after-help")]
+    fn attach_refuses_a_commands_own_after_help_rather_than_overwriting_it() {
+        attach(tree_with(
+            clap::Command::new("plan").after_help("something hand-written"),
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "declares its own after-help")]
+    fn attach_refuses_an_after_long_help_too() {
+        // The one that does not collide visibly: clap falls back from
+        // `after_long_help` to `after_help`, so this shape makes
+        // `--help` drop the examples while `-h` keeps them.
+        attach(tree_with(
+            clap::Command::new("plan").after_long_help("something hand-written"),
+        ));
     }
 }

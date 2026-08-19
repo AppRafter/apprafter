@@ -280,8 +280,11 @@ mod tests {
 
     #[test]
     fn a_setup_line_before_the_command_is_allowed() {
-        // Four walkthroughs open this way; both invocations are checked
-        // and one of them is this command's.
+        // A setup command sharing the line: both invocations are
+        // checked and one of them is this command's. The shape is
+        // exercised for the LEXER, not endorsed — this particular
+        // line is the C3 defect (`KUBECONFIG` takes a path list, not
+        // a document), and no shipped example writes it any more.
         assert!(judged(
             &["app", "list"],
             &["export KUBECONFIG=\"$(apprafter kubeconfig)\" && apprafter app list"]

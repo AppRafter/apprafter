@@ -68,7 +68,7 @@ the GC controller deletes the PVC and removes the snapshot.
 - `kubectl` bound to the cluster:
 
   ```sh
-  export KUBECONFIG="$(apprafter kubeconfig --refresh)"
+  apprafter kubeconfig --refresh > /tmp/kc && export KUBECONFIG=/tmp/kc
   ```
 
 - Pre-flight: the seeded provider, a default StorageClass, and the

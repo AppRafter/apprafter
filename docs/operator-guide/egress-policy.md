@@ -59,7 +59,7 @@ row with nothing declared.
 - `kubectl` bound to the cluster:
 
   ```sh
-  export KUBECONFIG="$(apprafter kubeconfig --refresh)"
+  apprafter kubeconfig --refresh > /tmp/kc && export KUBECONFIG=/tmp/kc
   ```
 
 - The `cilium` and `hubble` CLIs (the `nix develop` shell ships

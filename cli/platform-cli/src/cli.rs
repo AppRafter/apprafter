@@ -1052,11 +1052,12 @@ pub enum TargetCommand {
         #[arg(long)]
         provider: Option<String>,
         /// Hetzner Cloud API token. Required when `--provider
-        /// hetzner-cloud`. Format `hcloud_<64+ alphanumeric>`;
-        /// passed via `--token` or env `HCLOUD_TOKEN` (the env
-        /// fallback is for CI ergonomics — interactive use should
-        /// prefer the flag so the token doesn't linger in shell
-        /// history's env-leak surface).
+        /// hetzner-cloud`. Exactly 64 ASCII alphanumeric characters,
+        /// with no prefix — copy it whole out of the Cloud Console's
+        /// Security → API Tokens panel. Passed via `--token` or env
+        /// `HCLOUD_TOKEN` (the env fallback is for CI ergonomics —
+        /// interactive use should prefer the flag so the token
+        /// doesn't linger in shell history's env-leak surface).
         #[arg(long, env = "HCLOUD_TOKEN", hide_env_values = true)]
         token: Option<String>,
         /// Path to the SSH public key used for server provisioning.

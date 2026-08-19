@@ -255,9 +255,19 @@ impl Error for ResolveError {}
 ///
 /// * a `#` that opens a comment ends the line — `apprafter up  # alias:
 ///   apprafter bootstrap-all` documents one invocation, not two;
-/// * one level of `$( … )` and of backticks is unwrapped, because
-///   `export KUBECONFIG="$(apprafter kubeconfig --refresh)"` is how
-///   four walkthroughs open;
+/// * one level of `$( … )` and of backticks is unwrapped — and the
+///   outer line is read from the MASK, so a substitution's own flags
+///   are not charged to the command around it. The corpus needs the
+///   masking direction today: `apprafter target add bad --token
+///   "$(python -c 'print("a"*64)')"` in `troubleshooting.md` reads as
+///   `-c` on `target add` without it. The unwrapping direction was
+///   written for `export KUBECONFIG="$(apprafter kubeconfig
+///   --refresh)"`, which five guide pages used to open with; that
+///   idiom was **wrong** — the command prints the kubeconfig document
+///   and `KUBECONFIG` is a path list — and was replaced by
+///   `apprafter kubeconfig > /tmp/kc && export KUBECONFIG=/tmp/kc`.
+///   The unwrapping stays: it costs nothing, and a documented command
+///   inside a substitution is a documented command;
 /// * the line splits on `;`, `&&`, `||` and a top-level `|`, and an
 ///   invocation may start only at a segment's start (after an optional
 ///   `$ ` prompt). That last rule is what keeps `sudo mv apprafter
