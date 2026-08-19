@@ -18,10 +18,8 @@ Field-by-field reference for everything the platform exposes:
   Only four of them are flag fallbacks declared through clap, so the
   generated CLI reference cannot carry the rest; this page is
   hand-written and names the call site for each.
-- **CRDs** — `Application`, `ServiceProvider`, `ResourceClaim`,
-  `AccessGrant`, `ExternalSurface`, `MigrationPlan`,
-  `Infrastructure`, `ServiceProviderPlugin`,
-  `InfrastructureProviderPlugin`. Source of truth:
+- **Custom resources** — the objects the platform installs into a
+  cluster, [listed below](#custom-resources). Source of truth:
   `schemas/v1alpha1/` (CUE). A generated field reference is not
   yet published.
 - **Notifications HTTP API** — request/response shapes, error
@@ -40,3 +38,31 @@ check` byte-compares it against the clap tree and will reject the
 change. Run `just docsgen-generate` instead, or, for the authored
 paragraphs on its index, edit the constants in
 `cli/docsgen/src/render.rs` and regenerate.
+
+## Custom resources
+
+The operator's Helm chart installs each of these, which is what puts
+them in a running cluster. Some are written by the platform rather
+than by a person: you read those, you do not author them.
+
+| Object | Who writes it | What it is for |
+| ------ | ------------- | -------------- |
+| `Application` | Developer | The unit of deployment — one image, its environment, and what it needs. |
+| `ServiceProvider` | Operator | A backend implementation that a declared need can resolve to. |
+| `SourceCredential` | Operator | One private git or registry credential. It holds no secret material itself: the material stays sealed and is referenced. |
+| `SharedVolume` | Operator | A persistent volume that several applications mount at once. |
+| `PlatformStack` | Operator | The one object per cluster that pins the platform version and its cluster-wide settings. |
+| `ResourceClaim` | The platform | One application's claim on one backing service, generated from a declared need. |
+| `RetainedClaim` | The platform | The snapshot taken when a claim is deleted, so what stood behind it can still be recovered. |
+| `MigrationPlan` | The platform | The approval gate a destructive change waits behind. |
+
+Other schemas under `schemas/v1alpha1/` describe objects the platform
+does **not** install — `AccessGrant`, `ExternalSurface`,
+`ServiceProviderPlugin` and `InfrastructureProviderPlugin`. No CRD
+ships for any of them, so they cannot be created in a cluster today.
+
+`Infrastructure` is a schema that is deliberately not a cluster object
+at all: it describes the substrate the platform runs on, and
+`apprafter` reads it from disk rather than from the cluster.
+`APPRAFTER_MANIFEST` names the path — see
+[environment variables](environment.md).

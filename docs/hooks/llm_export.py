@@ -205,8 +205,8 @@ def _twin_uri(dest_uri: str) -> str:
     ``dev-guide/quickstart.md`` to ``dev-guide/quickstart/index.html``,
     and the twin belongs at ``dev-guide/quickstart.md`` — one URL, one
     trailing ``/`` swapped for ``.md``.  A section index page
-    (``architecture/index.md`` → ``architecture/index.html``) therefore
-    lands at ``architecture.md``, which is again the page URL with its
+    (``reference/index.md`` → ``reference/index.html``) therefore
+    lands at ``reference.md``, which is again the page URL with its
     slash replaced.  The site root is the one page with no slash to
     replace, so it keeps ``index.md``.
     """

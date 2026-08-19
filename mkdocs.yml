@@ -156,8 +156,6 @@ markdown_extensions:
 
 nav:
   - Home: index.md
-  - Architecture: architecture/index.md
-  - Concepts: concepts/index.md
   - Operator Guide:
       - Overview: operator-guide/index.md
       - Quickstart: operator-guide/quickstart.md

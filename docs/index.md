@@ -26,17 +26,14 @@ tiers is a platform operation, not a manifest rewrite.
 
 ## Sections
 
-- **[Architecture](architecture/index.md)** — high-level structure
-  (layers, control plane, substrate model, tier ladder).
-- **[Concepts](concepts/index.md)** — the AppRafter object model:
-  `Application`, `ServiceProvider`, `ResourceClaim`, `AccessGrant`,
-  `MigrationPlan`, `ExternalSurface`, `Infrastructure`.
 - **[Operator Guide](operator-guide/index.md)** — installing and
   running the platform.
 - **[Developer Guide](dev-guide/index.md)** — building applications
   on the platform.
-- **[Reference](reference/index.md)** — every CRD, every CLI command.
-- **[ADRs](adr/README.md)** — architectural decisions.
+- **[Reference](reference/index.md)** — the custom resources the
+  platform installs, every CLI command, every environment variable.
+- **[ADRs](adr/README.md)** — the reasoning behind each architectural
+  choice, one decision per record.
 
 ## Status
 
