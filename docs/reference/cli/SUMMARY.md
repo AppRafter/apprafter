@@ -7,6 +7,7 @@
 * [apprafter backup](backup.md)
 * [apprafter bootstrap-all](bootstrap-all.md)
 * [apprafter cluster-bootstrap](cluster-bootstrap.md)
+* [apprafter completion](completion.md)
 * [apprafter destroy](destroy.md)
 * [apprafter doctor](doctor.md)
 * [apprafter export](export.md)

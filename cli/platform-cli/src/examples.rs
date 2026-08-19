@@ -227,6 +227,18 @@ pub const EXAMPLES: &[CommandExamples] = &[
         path: &["cluster-bootstrap"],
         lines: &["apprafter cluster-bootstrap  # phase 3 of bootstrap-all, on its own"],
     },
+    // The flag list already names the shells; what it cannot show is
+    // where the script has to land, and that is both the whole
+    // difficulty and different for every shell. One line per shell that
+    // has a published recipe, each ending at its own destination.
+    CommandExamples {
+        path: &["completion"],
+        lines: &[
+            "apprafter completion bash > ~/.local/share/bash-completion/completions/apprafter",
+            "apprafter completion zsh > ~/.zfunc/_apprafter  # ~/.zfunc must be on fpath",
+            "apprafter completion fish > ~/.config/fish/completions/apprafter.fish",
+        ],
+    },
     CommandExamples {
         path: &["destroy"],
         lines: &[

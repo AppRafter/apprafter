@@ -35,6 +35,7 @@ cli-core      = { path = "../cli-core" }
 cli-state     = { path = "../cli-state" }
 cli-providers = { path = "../cli-providers" }
 clap          = { workspace = true }
+clap_complete = { workspace = true }
 dirs          = { workspace = true }
 indicatif     = { workspace = true }
 miette        = { workspace = true }

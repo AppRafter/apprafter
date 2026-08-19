@@ -1442,6 +1442,38 @@
     },
     {
       "path": [
+        "completion"
+      ],
+      "aliases": [],
+      "about": "Print a shell completion script on stdout",
+      "long_about": "Print a shell completion script on stdout.\n\nThe script is built from this binary's own command tree, so it completes the subcommands, flags and fixed-value choices of the version you are running rather than a newer or older one — and it goes stale when you upgrade, so re-run this then.\n\nNothing is installed: the script goes to stdout and where it has to land differs per shell. The quickstart carries a recipe for `bash`, `zsh` and `fish`.",
+      "usage": "Usage: apprafter completion <SHELL>",
+      "hidden": false,
+      "examples": [
+        "apprafter completion bash > ~/.local/share/bash-completion/completions/apprafter",
+        "apprafter completion zsh > ~/.zfunc/_apprafter  # ~/.zfunc must be on fpath",
+        "apprafter completion fish > ~/.config/fish/completions/apprafter.fish"
+      ],
+      "args": [],
+      "positionals": [
+        {
+          "id": "shell",
+          "value_name": "SHELL",
+          "required": true,
+          "multiple": false,
+          "possible_values": [
+            "bash",
+            "elvish",
+            "fish",
+            "powershell",
+            "zsh"
+          ],
+          "help": "Shell to emit the script for. Every value listed produces a working script; published install recipes cover `bash`, `zsh` and `fish`"
+        }
+      ]
+    },
+    {
+      "path": [
         "destroy"
       ],
       "aliases": [],

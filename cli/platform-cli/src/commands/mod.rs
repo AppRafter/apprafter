@@ -12,6 +12,7 @@ pub mod auth;
 pub mod backup;
 pub mod bootstrap_all;
 pub mod cluster_bootstrap;
+pub mod completions;
 pub mod destroy;
 pub mod doctor;
 pub mod firewall_spec;

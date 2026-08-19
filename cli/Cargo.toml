@@ -24,6 +24,11 @@ repository   = "https://github.com/apprafter/apprafter"
 
 [workspace.dependencies]
 clap                 = { version = "4.5", features = ["derive", "env"] }
+# The completion generator is versioned in lockstep with clap and only
+# compiles against a matching major, so it carries clap's requirement
+# verbatim rather than a floor of its own: one edit then moves both, and
+# a mismatch is a compile error rather than a subtly wrong script.
+clap_complete        = "4.5"
 thiserror            = "1.0"
 tracing              = "0.1"
 tracing-subscriber   = { version = "0.3", features = ["env-filter", "fmt"] }

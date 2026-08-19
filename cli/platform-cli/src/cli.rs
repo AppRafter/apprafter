@@ -342,6 +342,23 @@ pub enum Commands {
         #[arg(long = "server-type")]
         server_type: Option<String>,
     },
+    /// Print a shell completion script on stdout.
+    ///
+    /// The script is built from this binary's own command tree, so it
+    /// completes the subcommands, flags and fixed-value choices of the
+    /// version you are running rather than a newer or older one — and
+    /// it goes stale when you upgrade, so re-run this then.
+    ///
+    /// Nothing is installed: the script goes to stdout and where it has
+    /// to land differs per shell. The quickstart carries a recipe for
+    /// `bash`, `zsh` and `fish`.
+    Completion {
+        /// Shell to emit the script for. Every value listed produces a
+        /// working script; published install recipes cover `bash`,
+        /// `zsh` and `fish`.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Debug, Subcommand)]

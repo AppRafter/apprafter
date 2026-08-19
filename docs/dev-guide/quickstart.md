@@ -75,6 +75,64 @@ recommended path; build-from-source is for contributors.
     Inside the shell, build the CLI once with `cargo install --path
     cli/platform-cli` so `apprafter` is on your `PATH`.
 
+### Shell completion
+
+The CLI can complete its own subcommands, flags, and the values of the
+flags that take a fixed set. `apprafter completion <shell>` prints the
+script to stdout and installs nothing — putting that output where your
+shell reads completions from is the whole job, and where that is depends
+on the shell:
+
+=== "bash"
+
+    Needs the `bash-completion` package, which most distributions ship;
+    on macOS install it with `brew install bash-completion@2`.
+
+    ```sh
+    mkdir -p ~/.local/share/bash-completion/completions
+    apprafter completion bash > ~/.local/share/bash-completion/completions/apprafter
+    ```
+
+    Open a new shell to pick it up.
+
+=== "zsh"
+
+    The script has to land in a directory on `fpath`:
+
+    ```sh
+    mkdir -p ~/.zfunc
+    apprafter completion zsh > ~/.zfunc/_apprafter
+    ```
+
+    If `~/.zfunc` is not on `fpath` already, add both of these to
+    `~/.zshrc`, in this order — `compinit` reads `fpath` as it runs, so
+    a line added after it has no effect until the next shell:
+
+    ```sh
+    fpath=(~/.zfunc $fpath)
+    autoload -Uz compinit && compinit
+    ```
+
+    Open a new shell to pick it up.
+
+=== "fish"
+
+    ```sh
+    mkdir -p ~/.config/fish/completions
+    apprafter completion fish > ~/.config/fish/completions/apprafter.fish
+    ```
+
+    fish reads that directory at the next prompt; no restart needed.
+
+To check it worked, type a partial command and press Tab — the
+subcommand list should complete.
+
+Two things worth knowing. The script describes the binary that produced
+it, so it goes stale when you upgrade: re-run the same command after
+installing a new release. And the three shells above are the ones with a
+published recipe, not the whole list — `apprafter completion --help`
+names every value the argument accepts.
+
 ## Prerequisites
 
 Only the CLI and a Hetzner token are needed to stand up a Tier 1

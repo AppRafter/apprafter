@@ -338,6 +338,7 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
             credential_file.as_deref(),
             server_type.as_deref(),
         )?,
+        Commands::Completion { shell } => commands::completions::run(shell)?,
     }
     Ok(())
 }

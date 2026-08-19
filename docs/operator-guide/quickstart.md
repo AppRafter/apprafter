@@ -52,6 +52,13 @@ is not published yet, so ARM servers need a source build. The
 [developer quickstart](../dev-guide/quickstart.md#install) carries the
 same table with the source and Nix alternatives spelled out.
 
+While you are there, install shell completion —
+`apprafter completion <shell>` prints the script and the
+[recipe per shell](../dev-guide/quickstart.md#shell-completion) says
+where to put it. Every command on this page becomes one Tab away, which
+saves the most typing on the deeply nested ones such as
+`apprafter target firewall cloudflare-origin enable`.
+
 You will also need:
 
 - A Hetzner Cloud API token with Read+Write access.

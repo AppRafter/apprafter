@@ -57,6 +57,7 @@ specific release rather than scraping these pages.
 | [`apprafter backup`](backup.md) | — | Encrypted backup (Kind 2, restic local-pull): native extraction + serialized config/app CRs + decrypted user secrets, all wrapped into a restic repository. |
 | [`apprafter bootstrap-all`](bootstrap-all.md) | `up` | One-command provisioning: runs `apply` → polls for the k3s kubeconfig to become SSH-reachable → runs `cluster-bootstrap` for a freshly-provisioned cluster. |
 | [`apprafter cluster-bootstrap`](cluster-bootstrap.md) | `cb` | Install Cilium (CNI + kube-proxy replacement) and apply the Gateway API standard-install CRDs into the cluster pointed to by the cached kubeconfig |
+| [`apprafter completion`](completion.md) | — | Print a shell completion script on stdout |
 | [`apprafter destroy`](destroy.md) | — | Destroy infrastructure managed by this state |
 | [`apprafter doctor`](doctor.md) | — | Self-diagnostic over the active target's config, credentials and reachability plus the surrounding shell environment (kubectl, helm, ssh, DNS). |
 | [`apprafter export`](export.md) | — | Native data export (Kind 1) — pull pg dumps, volume tars, redis snapshots to a plain local folder + `manifest.json`. |
