@@ -3,7 +3,7 @@
 //!
 //! A path reference has two shapes that read alike and resolve
 //! differently — a code span against the repository root, a link target
-//! against the page's own directory — and `docs/reference/index.md:10`
+//! against the page's own directory — and `docs/reference/index.md`
 //! writes the same text in both roles on one line. Every case here is
 //! about telling those apart, so the top-level directory list is a fixed
 //! fiction rather than this checkout's: what a claim *looks like* must
@@ -45,7 +45,7 @@ fn a_line_suffix_and_an_anchor_are_stripped() {
 
 #[test]
 fn a_code_span_that_is_a_links_text_is_page_relative() {
-    // `docs/reference/index.md:10` is exactly this shape. Read as a
+    // `docs/reference/index.md` is exactly this shape. Read as a
     // repo-root path it is a false positive; the target is what the
     // reader clicks, and it resolves next to the page.
     let r = found("the tree ships as [`cli/commands.json`](cli/commands.json), which\n");
@@ -99,13 +99,13 @@ fn an_external_url_is_not_a_claim() {
 
 #[test]
 fn a_glob_is_extracted_here_and_answered_at_resolution() {
-    // Eight corpus spans are patterns rather than paths — README's
-    // `providers/*` and `backstage-plugins/*`, the five `**`
-    // exclusions on `docs/contributing/documentation-gate.md`, and
+    // The corpus writes patterns as well as paths — README's
+    // `providers/*` and `backstage-plugins/*`, the `**` exclusions on
+    // `docs/contributing/documentation-gate.md`, and
     // `docs/reference/environment.md`'s `e2e/*.sh`. Every one is
     // correct documentation and would be a finding if a pattern were
     // resolved as a filename; they are the ONLY corpus references that
-    // do not resolve.
+    // do not resolve, which `corpus_census` asserts and prints.
     //
     // They are still extracted. The suppression belongs to the gate,
     // which asks `is_pattern` only after a path has FAILED to resolve
@@ -129,8 +129,8 @@ fn a_bracketed_filename_is_not_a_pattern_but_a_star_is() {
     // reference stops resolving, gets read as a pattern, and goes
     // silent, which is the one moment this check exists for.
     //
-    // Excluding brackets is free: all eight corpus patterns carry a
-    // `*`, and none is bracket-only.
+    // Excluding brackets is free: every corpus pattern carries a `*`,
+    // and none is bracket-only — `corpus_census` prints the live list.
     assert!(!is_pattern("cli/docsgen/src/gate.rs"));
     assert!(!is_pattern("cli"));
     assert!(!is_pattern(
@@ -155,10 +155,10 @@ fn a_relative_target_beginning_with_http_is_still_a_claim() {
 
 #[test]
 fn a_directory_keeps_its_trailing_slash_off_the_path() {
-    // The corpus writes the bare directory form 28 times (`cli/`,
-    // `docs/`, `manifests/` …) against 18 deeper paths, so it is the
-    // majority shape, not an edge. `cli/` and `cli` are one claim, and
-    // the resolver is given the one spelling the git listing uses.
+    // The bare directory form (`cli/`, `docs/`, `manifests/` …) is a
+    // large fraction of the corpus's spans, not an edge — `corpus_census`
+    // prints which directories and how often. `cli/` and `cli` are one
+    // claim, and the resolver is given the spelling the git listing uses.
     let r = found("The crates live under `cli/` and the schemas under `schemas/v1alpha1/`.\n");
     assert_eq!(r.len(), 2, "{r:?}");
     assert_eq!(r[0].path, "cli");
@@ -218,4 +218,74 @@ fn a_multi_backtick_span_is_read_by_the_same_rule_as_scan_uses() {
     let r = found("``a `cli/nope.rs` b`` then `cli/docsgen/src/gate.rs`\n");
     assert_eq!(r.len(), 1, "{r:?}");
     assert_eq!(r[0].path, "cli/docsgen/src/gate.rs");
+}
+
+/// A tripwire, not an assertion: it prints the shape of every path
+/// claim the corpus writes, so a later reader can tell "the docs
+/// changed" from "the grammar changed" without a figure in a comment
+/// going stale in between. `codepath`'s module docs name it instead of
+/// quoting a tally; five of the seven figures that used to sit there
+/// were wrong by the time anyone re-ran them.
+///
+/// Ignored because it loads the clap tree, shells out to `git` and
+/// reads the working tree.
+#[test]
+#[ignore = "corpus census; run with --ignored --nocapture"]
+fn corpus_census() {
+    let root = docsgen::repo_root().unwrap();
+    let rows = docsgen::gate::Gate::new(&root)
+        .unwrap()
+        .code_path_census()
+        .unwrap();
+    let (links, spans): (Vec<_>, Vec<_>) = rows.iter().partition(|r| r.reference.page_relative);
+    let destinations: std::collections::BTreeSet<&str> =
+        links.iter().map(|r| r.reference.path.as_str()).collect();
+    let unresolved: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.resolved.is_none())
+        .map(|r| r.reference.path.as_str())
+        .collect();
+    let bare: std::collections::BTreeMap<&str, usize> = spans
+        .iter()
+        .filter(|r| !r.reference.path.contains('/'))
+        .fold(std::collections::BTreeMap::new(), |mut acc, r| {
+            *acc.entry(r.reference.path.as_str()).or_default() += 1;
+            acc
+        });
+    println!("references:            {}", rows.len());
+    println!("  code spans:          {}", spans.len());
+    println!(
+        "  link targets:        {} across {} distinct destinations",
+        links.len(),
+        destinations.len()
+    );
+    println!(
+        "spans that resolve:    {}",
+        spans.iter().filter(|r| r.resolved.is_some()).count()
+    );
+    println!("bare top-level dirs:   {bare:?}");
+    println!("unresolved:            {unresolved:?}");
+    // The two properties `codepath`'s module docs state, asserted here
+    // rather than written there as a number: every link target
+    // resolves, and the only things that do not resolve are the globs
+    // `is_pattern` suppresses. Both are what make that check ship with
+    // no finding and no exemption.
+    let dead_links: Vec<&str> = links
+        .iter()
+        .filter(|r| r.resolved.is_none())
+        .map(|r| r.reference.path.as_str())
+        .collect();
+    assert!(
+        dead_links.is_empty(),
+        "every link target resolves: {dead_links:?}"
+    );
+    let stragglers: Vec<&str> = unresolved
+        .iter()
+        .copied()
+        .filter(|path| !is_pattern(path))
+        .collect();
+    assert!(
+        stragglers.is_empty(),
+        "the only unresolved references are globs: {stragglers:?}"
+    );
 }

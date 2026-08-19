@@ -184,12 +184,17 @@ sentence and why; if the citation is still reported, declare an
 
 ### The census
 
-`docs/measurements/docs-health.json` records seven numbers about the
-corpus, and the gate compares this run against them **by value**:
+`docs/measurements/docs-health.json` records a number per counter about
+the corpus, and the gate compares this run against them **by value**:
 
-- six **obligation counts** — pages, invocations, resolved
-  identifiers, complete CUE documents, code paths, ADR references —
-  may not decrease. Growth passes silently and needs no action: adding
+- the **obligation counts** — pages, invocations, resolved
+  identifiers, complete CUE documents, `cue` fences, code paths, ADR
+  references — may not decrease. (`cue` fences are counted separately
+  from complete CUE documents because it is the *fence* that the built
+  site has to render as highlighted CUE, and
+  `scripts/docs-artefacts-check.py` is only as strong as the number of
+  them there are to check.)
+  Growth passes silently and needs no action: adding
   a guide is not a regression, and a gate that made you re-record a
   file in order to write a page is a gate you would route around.
 - **`exemptions`** is compared for equality in *both* directions, so

@@ -216,7 +216,7 @@ fn a_citation_written_only_as_a_link_or_a_path_is_a_reference() {
 fn a_reference_wrapped_across_a_line_break_is_still_a_reference() {
     // Added because the corpus holds exactly one, and it would otherwise
     // be the single reference nobody checks:
-    // `docs/operator-guide/target-store.md:8` wraps `[ADR` / `> 0030]`
+    // `docs/operator-guide/target-store.md` wraps `[ADR` / `> 0030]`
     // across a blockquote line break. A line-local scan alone reports 61
     // of the 62 IN-GRAMMAR citations and is silent about the 62nd — the
     // corpus holds 66, the other 4 carrying no `ADR NNNN` text at all —
@@ -260,7 +260,7 @@ fn a_reference_wrapped_across_a_line_break_is_still_a_reference() {
 fn a_line_ending_on_the_word_adr_does_not_swallow_the_next_number() {
     // The negative control the wrap rule was missing. `ADR` is an
     // ordinary English noun in this corpus —
-    // `docs/operator-guide/index.md:54` writes "An ADR describes the
+    // `docs/operator-guide/index.md` writes "An ADR describes the
     // world as it was when it was ratified" — and a year is the
     // commonest four-digit run in it, so an unanchored join reported
     // `ADR 2026`: no such ADR, a hard finding on a correct sentence.

@@ -8,11 +8,11 @@
 //! field name is written: `expose.public` — a field that does not
 //! exist — sat in eight locations across three files, six of them
 //! fences. **Two** of those fences are `kubectl apply -f -` heredocs
-//! (`operator-guide/needs-networkpolicy-walk.md`, lines 118 and 136),
-//! and the apiserver **prunes** an unknown key rather than rejecting
-//! it, so a reader who copies the block gets a silent no-op and an
-//! apply-and-see check reports success. A third
-//! (`operator-guide/gitops-walk.md:80`) is worse in a quieter way: it
+//! (in `operator-guide/needs-networkpolicy-walk.md`), and the apiserver
+//! **prunes** an unknown key rather than rejecting it, so a reader who
+//! copies the block gets a silent no-op and an apply-and-see check
+//! reports success. A third
+//! (in `operator-guide/gitops-walk.md`) is worse in a quieter way: it
 //! is a manifest committed to a GitOps repository and applied by
 //! Argo CD, so the pruning happens with nobody at a terminal at all.
 //! Membership is the only gate that sees any of them.

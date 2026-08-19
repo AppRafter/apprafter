@@ -173,7 +173,7 @@
 //! next run against it by value — the obligation counts may only grow,
 //! the exemption count may not move at all. [`HEALTH_BASELINE`] is the
 //! resulting finding class. Its limits, and the three ratchets that
-//! were rejected before these seven fields were chosen, are argued
+//! were rejected before these fields were chosen, are argued
 //! there rather than repeated here.
 //!
 //! # Exit codes
@@ -422,6 +422,25 @@ pub struct Stats {
     /// make it a function of `now` and of this checkout's tags — see
     /// [`health`]'s module docs.
     pub cue_documents: usize,
+    /// Fences tagged `cue`, complete documents or not.
+    ///
+    /// A **superset** of [`Stats::cue_documents`], and counted for a
+    /// different consumer: this one is the floor under
+    /// `scripts/docs-artefacts-check.py`, which requires every `cue`
+    /// fence on the built site to have rendered as highlighted CUE.
+    /// That check is only ever as strong as the number of fences there
+    /// are to check, and it had a zero-check rather than a floor —
+    /// nothing anywhere noticed the corpus writing less CUE.
+    ///
+    /// It is recorded and enforced **here**, in the tool that reads the
+    /// corpus, rather than in the Python pass that reads the site: a
+    /// counter one tool records and another enforces is a seam, and
+    /// `docsgen metrics` is what re-records the census. The two scopes
+    /// differ and are meant to — this counts the in-scope corpus, the
+    /// Python pass covers every published page including `docs/adr/`,
+    /// which is out of the census's scope for the same reason it is out
+    /// of every other counter's.
+    pub cue_fences: usize,
     /// One entry per exemption declared, whichever channel declared it:
     /// a fence's `check=none` marker or any of the three front-matter
     /// lists. A [`Reason`] rather than a count so they can be reported
@@ -437,6 +456,7 @@ impl Stats {
         self.code_paths += other.code_paths;
         self.adr_references += other.adr_references;
         self.cue_documents += other.cue_documents;
+        self.cue_fences += other.cue_fences;
         self.exemptions.extend(other.exemptions);
     }
 
@@ -465,15 +485,29 @@ impl Stats {
         format!(
             "docsgen gate: {pages} page(s), {} invocation(s), {} identifier(s) resolved \
              ({} of them only under an opaque subtree), {} complete CUE \
-             document(s), {} code path(s), {} ADR reference(s), {exemptions}",
+             document(s) in {} `cue` fence(s), {} code path(s), {} ADR reference(s), \
+             {exemptions}",
             self.invocations,
             self.identifiers,
             self.opaque,
             self.cue_documents,
+            self.cue_fences,
             self.code_paths,
             self.adr_references
         )
     }
+}
+
+/// One path claim, as [`Gate::code_path_census`] found it.
+pub struct PathRow {
+    /// The page that wrote it, repository-relative.
+    pub file: String,
+    /// The claim as written, with the surface it was written on.
+    pub reference: codepath::Reference,
+    /// What it resolves to in the repository — `None` when it does not
+    /// resolve at all, which for this corpus means it is a glob
+    /// [`codepath::is_pattern`] suppresses.
+    pub resolved: Option<String>,
 }
 
 /// One run's measurement of the corpus.
@@ -504,6 +538,7 @@ impl Census {
             invocations: self.stats.invocations,
             identifiers: self.stats.identifiers,
             cue_documents: self.stats.cue_documents,
+            cue_fences: self.stats.cue_fences,
             code_paths: self.stats.code_paths,
             adr_references: self.stats.adr_references,
             exemptions: self.stats.exemptions.len(),
@@ -699,8 +734,8 @@ impl Gate {
 
     /// What is wrong with citing this ADR, if anything.
     ///
-    /// `Draft` and `Proposed` are silent on purpose: 9 of the 66
-    /// in-scope citations name ADRs 0025–0029, all Draft, and
+    /// `Draft` and `Proposed` are silent on purpose: 9 in-scope
+    /// citations name ADRs 0025–0029, all Draft, and
     /// documentation legitimately cites a decision the project is
     /// working to. `Accepted` covers the four ADRs (0001, 0042, 0043,
     /// 0053) that are superseded *in part* and still stand — see
@@ -787,7 +822,7 @@ impl Gate {
                 health::Kind::Loss => HEALTH_BASELINE,
                 health::Kind::Exemptions => HEALTH_EXEMPTIONS,
             };
-            // Line 1: the census is seven numbers and no prose, so
+            // Line 1: the census is numbers and no prose, so
             // there is nothing to anchor on, and a reader who opens it
             // sees the whole file at once. The message names the field.
             findings.push(finding(code, health::FILE, 1, divergence.message));
@@ -842,6 +877,52 @@ impl Gate {
             stats,
         };
         Ok((findings, census))
+    }
+
+    /// Every path claim the corpus writes, with what it resolved to.
+    ///
+    /// The dump [`codepath`]'s module docs name in place of the figures
+    /// that used to sit there. Those figures were measured once and
+    /// then went on being quoted: five of seven were wrong by the time
+    /// anyone re-ran them, and the two that survived were the two that
+    /// carried the argument. So the shape of the corpus is a command,
+    /// not a paragraph — `cli/docsgen/tests/codepath_test.rs`'s
+    /// `corpus_census` prints it.
+    ///
+    /// It goes through the same masking and the same resolver as
+    /// [`Gate::page`] rather than re-deriving either: a dump that
+    /// answered differently from the check would be worse than none.
+    pub fn code_path_census(&self) -> Result<Vec<PathRow>, Box<dyn Error>> {
+        let files = scan::in_scope(&self.repo_root)?;
+        let mut out = Vec::new();
+        for path in &files {
+            let shown = path
+                .strip_prefix(&self.repo_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            let source = std::fs::read_to_string(path)?;
+            let blocks = scan::scan_markdown(&source);
+            let front = blocks
+                .iter()
+                .find(|block| block.kind == BlockKind::FrontMatter);
+            let prose = mask_front_matter(&source, front);
+            let directory = page_directory(&shown);
+            for reference in codepath::references(&prose, &self.tops) {
+                let target = if reference.page_relative {
+                    normalise(directory, &reference.path)
+                } else {
+                    Some(reference.path.clone())
+                };
+                let resolved = target.filter(|t| self.resolves(t));
+                out.push(PathRow {
+                    file: shown.clone(),
+                    reference,
+                    resolved,
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// Every finding on one page, CUE documents included — the shape a
@@ -1021,6 +1102,15 @@ impl Gate {
                     // stands — see [`health`]'s module docs.
                     stats.invocations += invocations.len();
                     stats.cue_documents += usize::from(document);
+                    // Tagged `cue`, whether or not it is a complete
+                    // document: what the built site has to render as
+                    // highlighted CUE is the fence, not the subset of
+                    // fences `cue vet` can be handed. Same rule as the
+                    // two counts above about exemptions — taken before
+                    // the silencing test.
+                    stats.cue_fences += usize::from(
+                        matches!(&block.kind, BlockKind::Fence { tag } if tag.as_deref() == Some("cue")),
+                    );
 
                     if let Some((marker, _)) = &marker {
                         findings.extend(audit(
@@ -1833,13 +1923,14 @@ mod tests {
     fn the_census_line_prints_every_committed_counter() {
         // The line is where a reviewer reads the numbers before
         // committing them, so a counter that reaches the file without
-        // reaching the line is a number nobody reviews. Seven distinct
-        // values, so a field printed in the wrong slot fails here.
+        // reaching the line is a number nobody reviews. A distinct
+        // value per field, so one printed in the wrong slot fails here.
         let stats = Stats {
             invocations: 11,
             identifiers: 22,
             opaque: 33,
             cue_documents: 44,
+            cue_fences: 88,
             code_paths: 55,
             adr_references: 66,
             exemptions: vec![Reason::Historical],
@@ -1851,6 +1942,7 @@ mod tests {
             "22 identifier(s)",
             "33 of them only under an opaque subtree",
             "44 complete CUE document(s)",
+            "88 `cue` fence(s)",
             "55 code path(s)",
             "66 ADR reference(s)",
             "1 exemptions",

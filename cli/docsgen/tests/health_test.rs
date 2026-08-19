@@ -23,6 +23,7 @@ fn census() -> Baseline {
         invocations: 384,
         identifiers: 236,
         cue_documents: 2,
+        cue_fences: 17,
         code_paths: 73,
         adr_references: 66,
         exemptions: 2,
@@ -31,11 +32,12 @@ fn census() -> Baseline {
 
 /// Every field a change may only grow, named once so a test that
 /// sweeps them cannot silently miss one.
-const OBLIGATIONS: [&str; 6] = [
+const OBLIGATIONS: [&str; 7] = [
     "pages",
     "invocations",
     "identifiers",
     "cue_documents",
+    "cue_fences",
     "code_paths",
     "adr_references",
 ];
@@ -47,6 +49,7 @@ fn shift(baseline: &mut Baseline, field: &str, delta: isize) {
         "invocations" => &mut baseline.invocations,
         "identifiers" => &mut baseline.identifiers,
         "cue_documents" => &mut baseline.cue_documents,
+        "cue_fences" => &mut baseline.cue_fences,
         "code_paths" => &mut baseline.code_paths,
         "adr_references" => &mut baseline.adr_references,
         "exemptions" => &mut baseline.exemptions,

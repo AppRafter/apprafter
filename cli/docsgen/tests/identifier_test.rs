@@ -70,7 +70,7 @@ fn a_declared_but_unshipped_need_is_flagged_distinctly() {
 
 #[test]
 fn a_filename_that_shares_a_root_stem_is_not_a_path() {
-    // README.md:17 and eleven more: "`spec.md` (its `Revision` line) and
+    // README.md and eleven more: "`spec.md` (its `Revision` line) and
     // `plan.md` are the source of truth". `plan.md` was already out
     // because `plan` is not a root; `spec.md` was not.
     assert!(extract_paths("`spec.md` §3.8 — full field reference").is_empty());
@@ -82,7 +82,7 @@ fn a_filename_that_shares_a_root_stem_is_not_a_path() {
 
 #[test]
 fn a_named_multi_claim_list_keeps_its_type_component() {
-    // docs/dev-guide/application-cue.md:118-127, verbatim. Losing `pg`
+    // docs/dev-guide/application-cue.md, verbatim. Losing `pg`
     // across the `[` turned `needs.pg.name` into `needs.name` and
     // reported eleven correct lines.
     let fence = r#"needs: {
@@ -118,7 +118,7 @@ fn a_named_multi_claim_list_keeps_its_type_component() {
 
 #[test]
 fn a_cue_only_schema_still_backs_the_docs_that_name_it() {
-    // gitops-walk.md:43 and troubleshooting.md:93. `Infrastructure` is
+    // gitops-walk.md and troubleshooting.md. `Infrastructure` is
     // the manifest `apprafter apply` reads and ships no CRD, so a
     // CRD-only field set calls both lines wrong.
     let f = FieldSet::from_repo(&docsgen::repo_root().unwrap()).unwrap();

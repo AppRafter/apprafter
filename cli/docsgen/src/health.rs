@@ -24,7 +24,7 @@
 //!   timestamp would turn unrelated commits into CI failures), applied
 //!   to the one file that would have broken it.
 //!
-//!   None of the seven kept here is such a number, and that is
+//!   No counter kept here is such a number, and that is
 //!   **maintained rather than assumed**. Exemptions are aged against
 //!   `now` and this checkout's tags on every run, so the obvious
 //!   implementation — let a `check=none` fence drop out of the walk —
@@ -36,7 +36,7 @@
 //!   invocations, identifiers and CUE documents before it stops
 //!   reporting on them. Re-run over one `check=none` fence on a corpus
 //!   page, with `since=` naming a tag this checkout has and then one it
-//!   does not: both runs printed the same seven numbers, and only the
+//!   does not: both runs printed the same census, and only the
 //!   findings differed. Any change that moves a count inside a
 //!   silencing branch re-opens this.
 //! * **It would move the comparison into the wrong command.**
@@ -49,10 +49,10 @@
 //!   code for both, and a caller that cannot tell them apart eventually
 //!   treats both as "the docs are wrong again".
 //!
-//! So: seven integers, compared by value, with the file's exact bytes
+//! So: integers, compared by value, with the file's exact bytes
 //! nobody's business but a reviewer's.
 //!
-//! # Why these seven, and what growth means
+//! # Why these counters, and what growth means
 //!
 //! Every field here is an **obligation count** — a number that falls
 //! when documented surface is deleted. That is the whole selection
@@ -81,19 +81,19 @@
 //!
 //! That last point is the one to keep. Against all three rejected
 //! ratchets, deleting a page was free and invisible. Against these
-//! seven a **file** cannot leave `git ls-files` on its own without one
+//! counters a **file** cannot leave `git ls-files` on its own without one
 //! of them falling — which is a narrower guarantee than it first
 //! reads, and the gap section below states how much narrower: what
 //! goes loud is the file's disappearance, not its content's.
 //!
-//! Even that holds only per commit. The seven are corpus-wide sums, so
+//! Even that holds only per commit. They are corpus-wide sums, so
 //! a deletion nets out against unrelated growth beside it. Re-run:
 //! `git rm docs/index.md` (which contributes only to `pages`) beside a
 //! three-line stub page printed the committed census byte for byte and
 //! exited 0. Sizing a deletion is the reviewer's job; this file only
 //! makes an *unaccompanied* one loud.
 //!
-//! One of the seven is not purely an obligation count, and the
+//! One of them is not purely an obligation count, and the
 //! exception is worth naming rather than discovering: `identifiers`
 //! counts the paths that **resolved**, so it also falls when a path
 //! stops resolving — a field renamed in `schemas/v1alpha1`, a CRD
@@ -123,7 +123,7 @@
 //! get, and one diff line is a fair price for retiring one.
 //!
 //! Equality guarantees a review line for a **net** change, and only
-//! per commit — the same netting the six sums have, and it was worth
+//! per commit — the same netting the ratcheted sums have, and it was worth
 //! stating there and not here until a reviewer landed it. Declaring
 //! one exemption while retiring another passes green: trading
 //! `docs/dev-guide/application-cue.md`'s narrow one-path
@@ -155,11 +155,11 @@
 //!
 //! The opaque count is left out for a harder reason than it once said
 //! here. An earlier revision claimed it was "a ratio of two numbers
-//! already here", which is false — [`Baseline`] holds seven fields and
-//! this is not one of them, so only the denominator is committed and
+//! already here", which is false — it is in no [`Baseline`] field, so
+//! only the denominator is committed and
 //! the count is an independent measurement. The gap section below
 //! refutes it outright: its second example moves the opaque count
-//! 115 → 114 while all seven committed numbers hold, which no
+//! 115 → 114 while every committed number holds, which no
 //! derivation of them could do.
 //!
 //! The real reason is that **its direction cannot be read**. It falls
@@ -190,7 +190,7 @@
 //! * **A rich invocation for a trivially-resolving one.**
 //!   `docs/operator-guide/backup-restore.md` documents `apprafter
 //!   backup enable` with twelve flags. Replaced by the bare `apprafter
-//!   backup enable`, all seven numbers held and the gate exited 0 —
+//!   backup enable`, every number held and the gate exited 0 —
 //!   `invocations` counts invocations, never the flags inside one.
 //! * **A deep identifier for a shallow one.**
 //!   `docs/operator-guide/needs-pg-walk.md` claims `spec.base.needs.pg`
@@ -200,13 +200,13 @@
 //!   so nothing compared it.
 //! * **A specific path for its parent directory.**
 //!   `docs/reference/index.md` names `cli/docsgen/src/render.rs`.
-//!   Rewritten to `cli/docsgen/src`, all seven numbers held and the
+//!   Rewritten to `cli/docsgen/src`, every number held and the
 //!   gate exited 0: a directory resolves exactly as a blob does, and
 //!   `code_paths` counts references, not depth.
 //!
 //! And a fourth shape, larger than the three above and the one to read
 //! first: **the counters count claims, not documentation.** Prose that
-//! carries no counted claim is invisible to all seven, so a page can
+//! carries no counted claim is invisible to all of them, so a page can
 //! lose its entire explanation with the census unchanged. Both re-run
 //! through the whole of `scripts/docs-check.sh`, not just the gate:
 //! deleting 145 non-claim prose lines from
@@ -214,8 +214,8 @@
 //! committed census byte for byte and exited 0; and `docs/index.md` —
 //! which makes no counted claim at all — can be gutted **in place** to
 //! a single `# AppRafter` heading, with no `git rm` and nothing added
-//! beside it, and all seven numbers still hold. That is the honest
-//! reading of "a file cannot leave on its own" above: the seven notice
+//! beside it, and every number still holds. That is the honest
+//! reading of "a file cannot leave on its own" above: they notice
 //! a page leaving `git ls-files`, not a page being emptied where it
 //! stands. Sweeping all 33 corpus pages, `docs/index.md` is the only
 //! one that can be gutted for free today — but every one of them can
@@ -275,6 +275,12 @@ pub struct Baseline {
     /// Fenced blocks that are complete CUE documents, and so go
     /// through `cue vet`.
     pub cue_documents: usize,
+    /// Fences tagged `cue`, complete documents or not — the floor under
+    /// the built site's lexer check. See [`crate::gate::Stats::cue_fences`]
+    /// for why the number is recorded and enforced on this side rather
+    /// than in `scripts/docs-artefacts-check.py`, which is what reads
+    /// the rendered blocks.
+    pub cue_fences: usize,
     /// Repository paths the documentation names, in code spans and in
     /// link targets alike.
     pub code_paths: usize,
@@ -340,6 +346,7 @@ pub fn compare(committed: &Baseline, current: &Baseline) -> Vec<Divergence> {
             committed.cue_documents,
             current.cue_documents,
         ),
+        ("cue_fences", committed.cue_fences, current.cue_fences),
         ("code_paths", committed.code_paths, current.code_paths),
         (
             "adr_references",
@@ -438,6 +445,7 @@ mod tests {
             invocations: 384,
             identifiers: 236,
             cue_documents: 2,
+            cue_fences: 17,
             code_paths: 73,
             adr_references: 66,
             exemptions: 2,

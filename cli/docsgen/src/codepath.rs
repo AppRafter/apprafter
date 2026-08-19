@@ -102,15 +102,30 @@
 //!
 //! # Measured over the corpus
 //!
-//! 54 repo-root-relative references in code spans and 19 page-relative
-//! link targets across 17 distinct destinations. Of the 54, **46
-//! resolve** — 28 of them the bare `` `cli/` `` directory form and 18
-//! with a deeper path — and the remaining 8 are the globs, suppressed
-//! by [`is_pattern`]. Of the 19 link targets, every one resolves.
+//! Two properties, and no tally. Every **link target** resolves; and
+//! the only **code spans** that do not resolve are globs, which
+//! [`is_pattern`] suppresses. Together those are why this check ships
+//! with no finding and no exemption: it is a regression guard on a
+//! surface that is correct today, which is the only moment at which
+//! such a guard can be installed honestly.
 //!
-//! So this check ships with no finding and no exemption: it is a
-//! regression guard on a surface that is correct today, which is the
-//! only moment at which such a guard can be installed honestly.
+//! Both are asserted rather than asserted-here-in-prose, and the shape
+//! behind them is printed rather than quoted:
+//!
+//! ```text
+//! cargo test -p docsgen --test codepath_test corpus_census -- --ignored --nocapture
+//! ```
+//!
+//! That prints the split (spans, link targets, distinct destinations),
+//! how many resolve, the bare top-level-directory forms with their
+//! counts, and every unresolved reference; it fails if a link target
+//! stops resolving or a non-glob span does. Seven figures used to sit
+//! in this paragraph instead. Five of them were wrong the next time
+//! anybody measured — including "28 of them the bare `` `cli/` ``
+//! directory form", which was doubly wrong: the shape is *any*
+//! top-level directory written bare, and `cli` is a small minority of
+//! it (`docs` outnumbers it, and eight different directories are
+//! written that way).
 
 /// One path-shaped claim.
 #[derive(Debug, Clone, PartialEq, Eq)]

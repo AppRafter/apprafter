@@ -544,7 +544,7 @@ fn a_directory_resolves_as_readily_as_a_file() {
 
 #[test]
 fn a_page_relative_link_resolves_against_the_page() {
-    // The `docs/reference/index.md:10` shape: read as a repo-root path
+    // The `docs/reference/index.md` shape: read as a repo-root path
     // this fails, and reporting it would be the check's first false
     // positive on the day it shipped.
     let (repo, now) = tag_repo();
@@ -735,7 +735,7 @@ fn a_reference_to_an_unused_slot_is_reported() {
 fn a_citation_inside_a_fence_is_judged_like_any_other() {
     // The design decision, pinned: ADR references are read page-wide off
     // the source, not from prose alone. The corpus writes one inside a
-    // fence — `docs/operator-guide/needs-pg-walk.md:247`, a comment in a
+    // fence — `docs/operator-guide/needs-pg-walk.md`, a comment in a
     // shell block — so a prose-only rule would drop a real citation, and
     // would make "move the sentence into the block" a way to stop one
     // being checked.
@@ -756,7 +756,7 @@ fn a_citation_wrapped_across_a_line_break_is_still_judged() {
     // a finding on a shape a scanner could reach by accident. This is
     // the one that fails if references are dropped on the floor by the
     // wrap rule specifically: the corpus's only wrapped citation
-    // (`docs/operator-guide/target-store.md:8`) is written exactly like
+    // (`docs/operator-guide/target-store.md`) is written exactly like
     // this, and "wrap the line" must not be a way to hide a citation.
     let (repo, now) = tag_repo();
     let gate = gate_with(repo.path(), now);
@@ -790,7 +790,7 @@ fn a_citation_written_only_as_a_link_is_judged() {
 fn a_prose_line_ending_on_the_word_adr_is_not_a_citation() {
     // The false positive the wrap rule manufactured, through the real
     // gate: `ADR` is an ordinary noun in this corpus's register —
-    // `docs/operator-guide/index.md:54` writes "An ADR describes the
+    // `docs/operator-guide/index.md` writes "An ADR describes the
     // world as it was when it was ratified" — and this reported
     // "`ADR 2026`: no such ADR", a hard finding on a correct sentence,
     // with a remedy that named neither cause.
@@ -1092,9 +1092,9 @@ fn an_absent_census_breaks_the_gate_rather_than_failing_the_documentation() {
 
 #[test]
 fn the_baseline_maps_every_stat_to_its_own_field() {
-    // Seven distinct values, because a swap between two fields of the
-    // same type COMPILES: `code_paths` into `adr_references` is caught
-    // in the live corpus today only by 73 happening not to equal 66.
+    // A distinct value per field, because a swap between two fields of
+    // the same type COMPILES: `code_paths` into `adr_references` is
+    // caught in the live corpus only by the two happening to differ.
     let census = gate::Census {
         pages: 1,
         stats: gate::Stats {
@@ -1104,6 +1104,7 @@ fn the_baseline_maps_every_stat_to_its_own_field() {
             // baseline that picked this up would ratchet a ratio.
             opaque: 99,
             cue_documents: 4,
+            cue_fences: 8,
             code_paths: 5,
             adr_references: 6,
             exemptions: vec![
@@ -1124,6 +1125,7 @@ fn the_baseline_maps_every_stat_to_its_own_field() {
             invocations: 2,
             identifiers: 3,
             cue_documents: 4,
+            cue_fences: 8,
             code_paths: 5,
             adr_references: 6,
             exemptions: 7,

@@ -108,9 +108,10 @@ pub enum BlockKind {
     /// would see a fraction of the surface. Obligations come from
     /// block content. (The untagged group is 0 today, because the gate
     /// reports an unlabelled fence; that it moved at all is the
-    /// reason not to key on it; `sh` is 165 today. `corpus_census`
-    /// prints the live
-    /// distribution.)
+    /// reason not to key on it. `corpus_census` prints the live
+    /// distribution — a standalone "`sh` is N today" stood here and was
+    /// wrong at three successive commits, which is the whole argument
+    /// for naming the command instead of its output.)
     Fence { tag: Option<String> },
     /// A code block that renders as code but carries no fence: a
     /// four-space indented run at top level, or an HTML `<pre>`.
