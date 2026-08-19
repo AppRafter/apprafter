@@ -4,11 +4,15 @@
 # Local-first documentation gate, in four passes:
 #
 #   1. the strict mkdocs build (dead links, dead anchors, unlisted
-#      pages, missing snippet includes);
+#      pages, missing snippet includes) — plus the one hazard mkdocs
+#      reports at INFO, where --strict cannot reach it: a link into a
+#      page `exclude_docs` dropped;
 #   2. what the two BUILD HOOKS were supposed to leave behind, read
-#      back off the site that was just built: llms.txt, llms-full.txt
-#      and one markdown twin per page, and every ```cue fence rendered
-#      as highlighted code;
+#      back off the site that was just built and checked against the
+#      COMMITTED SOURCE it was built from: llms.txt, llms-full.txt and
+#      one markdown twin per page — each carrying its page's own
+#      markdown and its authored description — and every ```cue fence
+#      rendered as highlighted CUE;
 #   3. `docsgen check` — the byte-compare of the GENERATED CLI
 #      reference under docs/reference/cli/ against the clap tree;
 #   4. `docsgen gate` — every claim in the HAND-WRITTEN documentation
@@ -31,9 +35,12 @@
 # later hook overwrite the lexer, and turning pygments off site-wide
 # are all one failure here.
 #
-# Every expectation it asserts is derived from the site that was just
-# built, so it stays true as pages are added: nothing here restates a
-# page list, a page count, or a language.
+# Every expectation it asserts is derived from THE OTHER SIDE — the
+# page set from the site that was just built, the content of each
+# artefact from the committed source that produced it — so it stays
+# true as pages are added and cannot be satisfied by an artefact
+# vouching for itself. Nothing here restates a page list, a page count,
+# or a language.
 #
 # Order matters throughout: the mkdocs build reports on what is
 # committed, so it runs first and its failures (a dead link a
@@ -68,7 +75,26 @@ exec nix develop --command bash -c '
   set -euo pipefail
   out="$(mktemp -d)"
   trap '"'"'rm -rf "$out"'"'"' EXIT
-  mkdocs build --strict --site-dir "$out/site"
+  # The build log is kept, not just streamed: mkdocs reports the one
+  # hazard mkdocs.yml itself warns about -- a link into a page that
+  # `exclude_docs` dropped -- at INFO, which --strict does not promote.
+  # Adding `adr/0*.md` to exclude_docs unpublishes all 58 numbered ADRs
+  # with a green build, no ERROR and no WARNING, while docs/adr/README.md
+  # goes on publishing its index with every link dead. The message is
+  # already produced and already names both pages; this fails on it.
+  mkdocs build --strict --site-dir "$out/site" 2>&1 | tee "$out/build.log"
+  if grep -F "which is excluded from the built site" "$out/build.log" >"$out/excluded.log"; then
+      echo >&2
+      echo "ERROR: a published page links to a page the build excluded, so that link" >&2
+      echo "is a 404 on the published site. mkdocs logs this at INFO and --strict does" >&2
+      echo "not promote it, which is why it is caught here:" >&2
+      sed "s/^/  /" "$out/excluded.log" >&2
+      echo >&2
+      echo "Either drop the entry from exclude_docs in mkdocs.yml, or stop linking the" >&2
+      echo "target: an excluded file is referenced by path in backticks, never as a" >&2
+      echo "link (mkdocs.yml says so where the list is declared)." >&2
+      exit 1
+  fi
   # Pass 2 lives in its own file: an apostrophe inside a heredoc in
   # this single-quoted `bash -c` string closes the string, and the
   # truncation is silent -- see the module docstring there.

@@ -68,6 +68,16 @@ twins cover every published page, and the index covers that set minus
 against the site on every run, so they are checked rather than written
 down.
 
+It asserts the *content* too, and against the committed source rather
+than against anything this hook produced: each twin and each bundle
+entry must **be** its page's markdown with the front matter stripped,
+and each index entry must carry the description that page's front
+matter authored.  :func:`_require_descriptions` below fails the build
+when a page has no description, but nothing in this file can attest
+that the description reached ``llms.txt`` — an entry line rendered
+without its ``: description`` suffix leaves every count in the artefact
+balanced.  That is why the check lives on the other side.
+
 One thing this does not do
 --------------------------
 

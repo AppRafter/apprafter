@@ -25,8 +25,16 @@ anchored count silently loses exactly them.
 
 The measurement that settles it independently of any of these is the
 built site: ``scripts/docs-check.sh`` matches every ``cue`` fence in a
-page's source to the block the build produced for it and requires that
-block to carry syntax tokens.
+page's **committed source** to the block the build produced for it, and
+requires that block to have been read *as CUE* — a ``//`` line coming
+back as a comment token, a ``#Definition`` as a definition. Both halves
+matter. The fence set comes from the committed source rather than from
+the markdown twin because the twin is itself an artefact of the other
+hook: reading it there let a twin writer that stripped fenced blocks
+take 28 of 31 fences out of scope with the pass still reporting OK. And
+"carries syntax tokens" was too weak on its own — a hook installing
+``class CUE(YamlLexer)`` passes it with every block tokenised as YAML,
+where ``//`` is not a comment and ``#Application`` is one.
 
 Registering the lexer is the easy half.  The hard half is that the
 registration must not be allowed to fail quietly, and by default it
