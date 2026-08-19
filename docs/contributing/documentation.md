@@ -224,6 +224,26 @@ string, each repository path it names must exist, and each decision it
 cites must still stand. That is deliberate — a page explaining a gate
 that the gate does not read is the first page to go stale.
 
+## Do not hand-edit the generated CLI reference
+
+Everything under `docs/reference/cli/` is written by `docsgen` from the
+clap definitions in `cli/platform-cli/src/cli.rs`, and `docsgen check`
+byte-compares the committed tree against them — so a hand edit there is
+rejected, not merged. To change one of those pages, change the doc
+comment or the flag it describes and run:
+
+```sh
+just docsgen-generate
+```
+
+The authored paragraphs on that section's index are not doc comments:
+they are constants in `cli/docsgen/src/render.rs`. Edit those and
+regenerate the same way.
+
+This paragraph used to sit on `docs/reference/index.md`, where it told a
+reader looking up a flag not to edit a file they were never going to
+open. It belongs here.
+
 ## Checking your work
 
 ```sh
