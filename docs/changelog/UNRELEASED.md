@@ -9,6 +9,178 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## docs (no release) — 2.19g publication: the documentation site becomes a deployable application (2026-08-19)
+
+> **No version bump and no monorepo tag, and the answer is derived rather
+> than assumed.** `git diff --name-only <base>..HEAD -- cli/ operator/
+> schemas/ platform-stack/ argocd-cue-cmp/` is empty, so `apprafter --help`
+> is byte-identical, the byte-compared `docs/reference/cli/commands.json` did
+> not move, and no chart artefact changed. `cli/Cargo.toml` is bumped to
+> match a **released tag** in the commit that cuts it; documentation and CI
+> work cuts none. The new `ghcr.io/apprafter/docs` image is versioned by
+> commit SHA rather than by a git tag, so publication introduces no tag
+> stream of its own either.
+>
+> Seventh of the documentation track's ten subphases — branch
+> `feat/2.19g-publication`, **ADR 0057** (decision 8 is no longer "decided,
+> not yet implemented"; see its 2.19g amendment for the
+> build-outside-the-Dockerfile decision, what the release path filter fires
+> on and why it is not `exclude_docs`, and the wildcard listener that made a
+> new zone and certificate unnecessary).
+>
+> **The software is complete and the site is not serving.** Five manual steps
+> stand between this branch and a reader, none of which the repository can
+> take: the push, confirming the zone, a Cloudflare DNS record, one
+> `apprafter app add`, and setting `docsUrl` in the CMS before landing the
+> held-back landing commit. `docs/operator-guide/publish-the-docs-site.md` is
+> the runbook for the middle three and is written to be followed without the
+> ADR or the plan.
+
+### Added
+
+- **`docs-site/` — the publication unit.** A one-stage `Dockerfile` over
+  `caddy:2-alpine` that copies in a **prebuilt** `site/`, and a `Caddyfile`
+  serving it.
+
+  **The site is built in the release workflow under `nix develop`, never in
+  the image**, and the reason is recorded in the Dockerfile because it is the
+  single most likely "improvement" a later contributor makes: a
+  `pip install mkdocs-material` build stage would be a second, unpinned
+  toolchain producing the published site while the gate validates a
+  differently-built one. Both builds would succeed and only the published
+  bytes would differ.
+
+  Cache rules follow what MkDocs actually emits, which is not what the
+  landing emits. MkDocs fingerprints the bundle, the search worker and the
+  two stylesheets; the favicon and the lunr language stemmers under
+  `assets/` carry no digest — re-derive with `find site/assets -type f |
+  grep -vE '\.[0-9a-f]{8}\.min\.'`. So the landing's blanket
+  `header /_astro/* … immutable`, correct there because Astro hashes every
+  name it emits, is not transliterable: it would pin mutable URLs for a year.
+  Three disjoint matchers instead — the digest form is `immutable`, the two
+  undigested subtrees get a day, everything else 300s, and anything matching
+  neither falls through with no `Cache-Control` deliberately. The `{8}`
+  length anchor is load-bearing: a loose `[0-9a-f]+` also matches
+  `lunr.da.min.js` and `lunr.de.min.js`. HTML is 300s rather than the
+  landing's hour because `search/search_index.json` is not fingerprinted and
+  must not outlive the pages it indexes. `.md` is forced to `text/plain`;
+  the base image's `mailcap` otherwise supplies `text/markdown`, which
+  browsers offer as a download, defeating the twins' purpose.
+
+- **`docs-site/apprafter/Application.cue`** — the deployable manifest.
+  `docs` in the `apprafter` namespace, two replicas, public on
+  `docs.apprafter.dev`, one internal replica in `dev`. No `needs` (the site
+  is fully static), no `env` (nothing is configurable at runtime), and no
+  `imagePolicy` — the operator already resolves the rolling tag to its
+  current digest each reconcile, so restating the default would create a
+  second place to change it. Each absence is stated in the file with its
+  reason.
+
+- **`.github/workflows/release-docs.yml`** — a path-filtered push to
+  `master` that builds under nix and pushes `ghcr.io/apprafter/docs` at
+  `:<sha>` and `:latest`.
+
+  **It runs `scripts/docs-check.sh` itself rather than trusting `docs.yml`.**
+  Workflows triggered by one event run independently; there is no `needs:`
+  across them and nothing observes the other job's conclusion, so a push that
+  fails the gate would still run this one to completion and publish. The path
+  sets also differ in the publishing direction — `docs-site/**` fires a
+  release and is absent from `docs.yml`'s filter entirely. And `--strict` is
+  not a substitute: it does not catch a stale generated CLI reference, a
+  claim that no longer resolves against the product, a broken `llms.txt`, or
+  a link into an `exclude_docs`'d page, which mkdocs reports at INFO, below
+  `--strict`'s reach.
+
+  **The filter fires when the published bytes change, and it is not a copy of
+  `exclude_docs`.** The internal changelog and measurement paths are negated
+  — they touch `docs/` on nearly every commit and change nothing a reader
+  sees. But `hooks/` and `reference/cli/SUMMARY.md` are excluded from the
+  site and deliberately **do** fire: the hooks run at build time and shape
+  every page, and `SUMMARY.md` is the nav of every published page. A filter
+  transliterated from `exclude_docs` would have made a hook rewrite and a nav
+  change unreleasable, silently.
+
+- **`docs/operator-guide/publish-the-docs-site.md`** — the runbook for the
+  three cluster-and-DNS steps, written as the worked instance of "add an
+  application on a subdomain of a zone you already connected". It documents
+  two surfaces that had no published page: the operator's
+  `PublicRouteReady` condition, including the `NoMatchingZone` reason a
+  reader most needs, and the `apprafter.io/cert-sans` annotation that makes
+  the certificate's hostname list readable off the live Secret.
+
+### Changed
+
+- **The landing's nav Docs link now points at `https://docs.apprafter.dev/`**
+  — in a **commit of its own**, which is the deliverable. The tracked
+  `landing/web/src/data/fallback/siteSettings.json` feeds the *release* path
+  (the image builds with `LANDING_USE_FALLBACK=1`) while the Payload global
+  feeds the *preview* path, so setting it turns the front door's Docs item
+  from a "Soon" badge into a live link the next time the landing image is
+  built. Landing it before DNS resolves points that link at a host that does
+  not answer — worse than the badge, because it looks shipped — so the commit
+  is isolated and its message says so, and it can be dropped from a push
+  without unpicking the rest of the branch.
+
+  The value is not typed from memory: it is byte-identical to `mkdocs.yml`'s
+  `site_url` and its host equals `expose.hostname` in the manifest. Verified
+  through the release path itself — `astro build` under
+  `LANDING_USE_FALLBACK=1`, with the nav anchor read out of `dist/index.html`
+  in both states, so the check distinguishes rather than confirms itself.
+
+### Notes
+
+- **A new subdomain needs no new zone and no new certificate**, and this is
+  re-derived rather than cited because every future subdomain gets the same
+  treatment. `platform-stack/cue/render_tool.cue` emits two HTTPS listeners
+  per allowed domain — apex and `*.<zone>` — both naming the same imported
+  certificate Secret, and `render_httproute` sets `parentRefs[0]` with no
+  `sectionName`, so a route attaches by hostname match. The limit worth
+  knowing: coverage is **exactly one label** in both layers
+  (`hostname_covered_by_zone` in the operator, `hostname_matches_domain` in
+  the CLI), so a subdomain one level deep is free and anything deeper is a
+  new zone.
+
+- **`docs-site/` needed no exclusion in either place**, verified by probe
+  rather than assumed: `scan::in_scope` lists `git ls-files -z -- docs
+  README.md`, where `docs` is a git leading-directory pathspec rather than a
+  string prefix, and `mkdocs.yml`'s `exclude_docs` is relative to
+  `docs_dir`. The built site is covered by an existing unanchored `site/`
+  rule in `.gitignore` — confirmed with `git check-ignore -v` instead of
+  adding a second rule.
+
+- **The `exclude_docs` ↔ path-filter coupling is stated and unenforced.**
+  Removing an `exclude_docs` entry publishes a page whose edits no longer cut
+  a release, and nothing checks it. Recorded here rather than in a comment
+  nobody re-runs.
+
+### Reported, not fixed
+
+- **The landing serves `200` for unknown URLs.** `landing/web/Caddyfile`'s
+  `try_files … /404.html` rewrites an unknown URL to a file that exists, so
+  `file_server` has nothing to fail on and every unknown URL answers 200 with
+  the 404 page body. Measured on the real Caddyfile over the real built
+  `dist`. The docs Caddyfile omits the fallback and returns a real 404, which
+  is why the difference surfaced.
+
+- **Two deployable manifests are validated by nobody.**
+  `scripts/lint-cue.sh` covers `schemas/`, `platform-stack/cue/` and
+  `examples/` — not `docs-site/` and not `landing/`. Not hypothetical:
+  `cue vet ./landing/web/apprafter` passes while `cue fmt --check` on the
+  same directory fails, naming both files. A schema change that invalidates
+  either manifest currently surfaces at Argo CD sync time, in the cluster.
+
+- **SPDX enforcement reaches neither `docs-site/**` nor `landing/**`.**
+  `PATTERNS` in `scripts/check-spdx-headers.sh` has no glob for either tree
+  and no global `**/*.cue`, so the correct headers on the new files are
+  unenforced.
+
+- **`scripts/docs-artefacts-check.py` crashes on a new page that is written
+  but not yet staged.** `source` is built from `git ls-files` while
+  `published` comes from the build output, and the `orphan_pages` guard that
+  exists for exactly this case only appends to `problems`, below a line that
+  dereferences the missing key first — so a contributor writing a new page
+  meets a traceback before they meet the guard's message.
+
 ## docs (no release) — 2.19f information architecture: the site's structure and URLs settled before publication (2026-08-19)
 
 > **No version bump and no monorepo tag, and the answer is recorded rather

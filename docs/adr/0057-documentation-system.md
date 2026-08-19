@@ -272,7 +272,9 @@ them it is a red test.
 
 ### 8. Publication target is `docs.apprafter.dev`
 
-*(Decided; not yet implemented.)*
+*(Implemented in 2.19g — see the amendment below for the image, the release
+workflow's path filter, and the five manual steps that stand between the
+merged branch and a site a reader can reach.)*
 
 The site ships as its own image with its own `Application.cue`, mirroring the
 landing and CMS deployments, and is served on its own hostname. A path on the
@@ -1167,6 +1169,221 @@ that derives its expectation from the same side it checks is vacuous.*
   number. That is the counter working exactly as decided in the 2.19d
   amendment.
 
+## Amendment — 2.19g (publication) as delivered, 2026-08-19
+
+Decision 8 is implemented. The site is a deployable application like any
+other this platform runs: its own image, its own `Application.cue`, its own
+release workflow, its own hostname. **It is not yet serving**, and the gap
+between this branch and a reader reaching `https://docs.apprafter.dev/` is
+entirely manual — see the handoff below, which is the part of this amendment
+that must not be skimmed.
+
+No release and no monorepo tag rides it. `cli/`, `operator/`, `schemas/`,
+`platform-stack/` and `argocd-cue-cmp/` are untouched — re-derive with
+`git diff --name-only <base>..HEAD -- cli/ operator/ schemas/ platform-stack/
+argocd-cue-cmp/`, which is empty — so `apprafter --help` is byte-identical,
+the byte-compared `commands.json` did not move, and no chart artefact
+changed. `cli/Cargo.toml` is bumped to match a *released* tag in the commit
+that cuts it; docs and CI work cuts none. The new `ghcr.io/apprafter/docs`
+image is versioned by commit SHA rather than by a git tag, so publication
+introduces no tag stream of its own either.
+
+### The site is built in the workflow, not in the Dockerfile
+
+`docs-site/Dockerfile` is one stage over `caddy:2-alpine` and copies a
+**prebuilt** `site/` in. It has no build stage, and the reason is recorded in
+the file itself because it is the single most likely "improvement" a later
+contributor makes.
+
+A `pip install mkdocs-material` inside the image would introduce a second,
+unpinned toolchain that produces the published site while the gate validates
+a differently-built one. Decision 2 established one `python3.withPackages`
+environment for exactly this reason: a byte-compared artefact needs one
+pinned toolchain across a contributor's machine and CI. An image that builds
+independently is that invariant's first breach, and the drift would be
+invisible — both builds succeed and only the published bytes differ.
+
+So `.github/workflows/release-docs.yml` runs `mkdocs build --strict` under
+`nix develop` and hands the result to `docker/build-push-action`. The
+published bytes are produced by a validating build rather than merely
+vouched for by one.
+
+### The release workflow gates itself, and does not lean on `docs.yml`
+
+`docs.yml` guarantees nothing about this workflow: workflows triggered by one
+event run independently, there is no `needs:` across them, and nothing here
+observes that job's conclusion — a push that fails the gate would still run
+this one to completion and publish. The two path filters also differ in the
+publishing direction (`docs-site/**` fires a release and does not appear in
+`docs.yml`'s filter at all), so commits exist that publish a site the gate
+never ran on.
+
+`--strict` alone is not a substitute. It catches dead links, dead anchors,
+unlisted pages and missing includes; it does not catch a stale generated CLI
+reference, a claim that no longer resolves against the product, a broken
+`llms.txt` or markdown twin, or a link into an `exclude_docs`'d page — which
+mkdocs reports at INFO, below `--strict`'s reach, and which
+`scripts/docs-check.sh` greps for explicitly. Publishing on `--strict` alone
+ships every one of those and reports success. So the release job runs
+`scripts/docs-check.sh` itself, sharing `docs.yml`'s rust-cache key, and
+checks out at `fetch-depth: 0` because `docsgen gate` ages exemptions against
+real tag dates.
+
+### The path filter fires when the published bytes change
+
+The trigger is a path-filtered push to `master`, per the Deferred bullet's
+"negated path filter" and the Re-evaluation bullet below it. The negation set
+is **not** a copy of `mkdocs.yml`'s `exclude_docs`, and reading it as one
+would break the site quietly. Re-derive the exclusion list with
+`sed -n '/^exclude_docs:/,/^$/p' mkdocs.yml`; the entries split three ways:
+
+- The internal changelog and measurement paths are **negated**, which is the
+  Re-evaluation bullet discharged: they touch `docs/` on nearly every commit
+  and change nothing a reader sees.
+- `superpowers/` appears in neither list, because the tree is gitignored and
+  cannot appear in a push diff. A pattern for an unreachable case is dead
+  config.
+- `hooks/` and `reference/cli/SUMMARY.md` are excluded from the site as
+  static files but deliberately **fire**. The hooks *run* at build time and
+  shape every page; `SUMMARY.md` is the literate-nav fragment and is the nav
+  of every published page. A filter transliterated from `exclude_docs` would
+  have made a hook rewrite and a nav change unreleasable, silently.
+
+`mkdocs.yml` and `flake.nix`/`flake.lock` fire: a theme bump rewrites every
+page's HTML and changes the fingerprinted asset filenames while nothing under
+`docs/` moves. `docs-site/**` fires — the Caddyfile is baked into the image,
+and without it a cache-header fix would reach production only whenever
+someone next happened to edit a page. `docs-site/apprafter/**` is carved back
+out: Argo CD reads the manifest from the cluster's config source, so it is
+not an input to the image and editing it must not mint a digest. Product
+source is absent by design: it changes what the gate *checks*, not what the
+site *contains*, and the regeneration that must follow it touches `docs/` and
+fires this.
+
+**This coupling is stated and unenforced.** Removing an `exclude_docs` entry
+publishes a page whose edits no longer cut a release, and nothing checks it.
+Promoting that comparison to a real check is available work, recorded here
+rather than in a comment nobody re-runs.
+
+### The cache rules are shaped by what MkDocs actually emits
+
+`mkdocs build` fingerprints exactly the bundle, the search worker and the two
+stylesheets — `<name>.<8-hex>.min.<css|js>` with a `.map` each — and **that
+is not all of `assets/`**: the favicon and the lunr language stemmers under
+`assets/javascripts/lunr/` carry no digest. Re-derive with
+`find site/assets -type f | grep -vE '\.[0-9a-f]{8}\.min\.'`.
+
+The landing's blanket `header /_astro/* … immutable` is therefore not
+transliterable, though it is correct there — Astro hashes every name it
+emits. Copying it would pin mutable URLs for a year, and a theme upgrade
+changing a stemmer would never reach a reader holding the old one. Three
+disjoint matchers instead: a `path_regexp` on the digest form → immutable;
+the two undigested subtrees → one day; everything else → 300s. The `{8}`
+length anchor is load-bearing rather than decorative: a loose `[0-9a-f]+`
+also matches `lunr.da.min.js` and `lunr.de.min.js`, since `d`, `a` and `e`
+are hex digits. Anything under `assets/` matching neither rule falls through
+with no `Cache-Control` at all, deliberately — under-caching is recoverable,
+a year-long pin on a mutable URL is not.
+
+HTML is 300s rather than the landing's 3600 because `search/search_index.json`
+is not fingerprinted and must not outlive the pages it indexes. And `.md` is
+forced to `text/plain`: the base image's `mailcap` supplies `text/markdown`,
+which browsers offer as a download, defeating the twins' purpose — an input
+this repository neither pins nor tests, so the header is set explicitly
+rather than inherited.
+
+### A new subdomain needs no new zone and no new certificate
+
+Worth recording because every future subdomain gets the same treatment, and
+because it is the reason publication is a DNS record rather than a
+certificate ceremony.
+
+`platform-stack/cue/render_tool.cue` emits **two** HTTPS listeners per
+`gateway.allowedDomains` entry — `https-apex-<san>` for the zone and
+`https-wild-<san>` for `*.<zone>` — and both name the same
+`importedCertRef` Secret. One registration, one certificate, both hostnames.
+The operator's `render_httproute` sets `parentRefs[0]` to the `platform`
+Gateway on port 443 with **no `sectionName`**, so a route attaches by
+hostname match and nothing has to be told the wildcard listener exists.
+
+The coverage rule is one label, in both layers, and that is the limit worth
+knowing: `hostname_covered_by_zone` accepts the apex or a prefix containing
+no dot, so `docs.apprafter.dev` is covered by `apprafter.dev` and a nested
+host would not be. The CLI's `hostname_matches_domain` agrees. A subdomain
+one level deep is free; anything deeper is a new zone.
+
+### The handoff — what is left, and who does it
+
+The software is complete and the site does not exist. Five steps stand
+between this branch and a reader, none of which this repository can take.
+`docs/operator-guide/publish-the-docs-site.md` is the runbook for the middle
+three and is written to be followed without this ADR or the plan.
+
+1. **Push the branch.** Standing policy is that the agent commits locally and
+   the operator pushes. Nothing else can start until the release workflow has
+   run once and `ghcr.io/apprafter/docs:latest` exists.
+2. **Confirm the zone.** `apprafter target domain list` must show
+   `apprafter.dev`; the wildcard listener covers `docs.` by the rule above.
+   If it is absent, registering it has certificate implications the runbook
+   sets out.
+3. **The DNS record**, in the operator's Cloudflare account: a proxied record
+   for `docs` in the `apprafter.dev` zone. Outside the repository entirely.
+4. **Register the application once** —
+   `apprafter app add https://github.com/AppRafter/apprafter --name docs
+   --path docs-site --branch master`. `--path` is load-bearing: a root
+   registration sweeps in every other manifest this repository carries. Every
+   later documentation change then deploys itself, because the operator
+   re-resolves the rolling tag to its current digest each reconcile (ADR
+   0040), so this step happens exactly once.
+5. **Set `docsUrl` in the CMS**, and only then land the held-back landing
+   commit. This is the ordering hazard, and it is why the landing switch is a
+   commit of its own: the tracked fallback JSON feeds the *release* path and
+   the Payload global feeds the *preview* path, so both must be set, and
+   either one set before DNS resolves points the landing's front door at a
+   host that does not answer — a worse failure than the "Soon" badge it
+   replaces, because it looks shipped. The commit can be dropped from a push
+   without unpicking anything else on the branch.
+
+Until step 5, the landing keeps rendering the badge and nothing links a
+reader anywhere. That is the correct state for a site that is not serving.
+
+### Consequences
+
+- **The documentation now has a deployment, and therefore an outage mode.**
+  Everything before this was a build; from here a bad publish is a live site
+  serving stale or broken pages. The mitigations are the release job's own
+  gate, the 300s HTML TTL that bounds how long a bad page persists in caches,
+  and rollback by SHA tag.
+- **`docs-site/` is deliberately outside the gate's corpus**, and needed no
+  exclusion in either place: `scan::in_scope` lists `git ls-files -z -- docs
+  README.md`, where `docs` is a git leading-directory pathspec rather than a
+  string prefix, and `exclude_docs` is relative to `docs_dir`. Verified by
+  probe rather than assumed.
+- **Two deployable manifests are validated by nobody.** `scripts/lint-cue.sh`
+  vets `schemas/`, `platform-stack/cue/` and `examples/` — not `docs-site/`
+  and not `landing/`. The evidence that this matters is not hypothetical:
+  `cue vet ./landing/web/apprafter` passes while `cue fmt --check` on the
+  same directory fails, which is what an uncovered path looks like after a
+  year. A schema change that invalidates either manifest currently surfaces
+  at Argo CD sync time, in the cluster.
+- **SPDX enforcement does not reach `docs-site/**` or `landing/**`.** The
+  headers on the new files are correct and unenforced; `PATTERNS` in
+  `scripts/check-spdx-headers.sh` has no glob that matches either tree. The
+  tracked-file count the script prints moved by one when this subphase added
+  a workflow and did not move when it added a `.cue` file under `docs-site/`,
+  which is the measurement.
+- **A finding about the landing, reported and not touched:** its Caddyfile's
+  `try_files … /404.html` rewrites unknown URLs to a file that exists, so
+  `file_server` never fails and every unknown URL answers **200** with the
+  404 page body. A/B measured on one image with only that line changed. The
+  docs Caddyfile omits the fallback and returns a real 404.
+- **`scripts/docs-artefacts-check.py` crashes on a new page that is written
+  but not yet staged** — `source` is built from `git ls-files` while
+  `published` comes from the build output, and the `orphan_pages` guard that
+  exists for exactly this case only appends to `problems`, below a line that
+  dereferences the missing key first. Every contributor writing a new page
+  meets a traceback before they meet the guard's message.
+
 ## Alternatives considered
 
 - **Port the site to VitePress or Astro Starlight.** Rejected. The 93 existing
@@ -1248,7 +1465,11 @@ that derives its expectation from the same side it checks is vacuous.*
   redirect map was not built together with the trigger that will require it.)*
 - **Publication** — image, Caddy configuration, release workflow with a
   negated path filter, `Application.cue`, DNS zone, and the landing switch.
-  Blocked on the restructure by design.
+  Blocked on the restructure by design. *(Delivered in 2.19g — see the
+  amendment above for the build-outside-the-Dockerfile decision, for what the
+  path filter fires on and why it is not `exclude_docs`, for the wildcard
+  listener that made a new zone and certificate unnecessary, and for the
+  handoff: the software is complete and the site is not yet serving.)*
 - **CLI-UX examples and completions** — per-command usage examples, shell
   completions and the surrounding usability fixes. Sequenced **before** the
   guide content, because the CLI check resolves examples against the *current*
@@ -1301,4 +1522,14 @@ Andrey Ryahovskiy.
   contract; `docs/contributing/documentation-gate.md` — the gate's own page.
 - `mkdocs.yml` — the validation settings, the `not_in_nav` allow-list and the
   site exclusions.
+- `docs-site/` — the publication unit: `Dockerfile` (no build stage, by
+  decision), `Caddyfile` (the three cache matchers and the `.md` content
+  type) and `apprafter/Application.cue` (the deployable manifest).
+- `.github/workflows/release-docs.yml` — the gated release path and its
+  path filter; `docs/operator-guide/publish-the-docs-site.md` — the runbook
+  for the manual steps it cannot take.
+- ADR 0040 — tag-to-digest resolution. Why registering the application once
+  is enough and every later documentation change deploys itself.
+- ADR 0045 — per-application egress policy. Why the docs site shares the
+  `apprafter` namespace with the landing rather than taking one of its own.
 - `LICENSE-CC-BY-4.0`, `NOTICE` — the documentation licence texts.
