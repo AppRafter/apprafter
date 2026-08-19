@@ -19,8 +19,8 @@ Tasks for operators (anyone running an AppRafter cluster):
 - **Target store** — multi-target setups, credential rotation,
   the resolution chain. See
   [`target-store.md`](target-store.md).
-- **Troubleshooting** — diagnostic-code catalogue + the
-  walk-found common failures. See
+- **Troubleshooting** — diagnostic-code catalogue + the common
+  failures found in end-to-end runs. See
   [`troubleshooting.md`](troubleshooting.md).
 - **Tier upgrades** — `apprafter upgrade-tier 1 → 2 → 3 → 4`,
   with safety semantics from `MigrationPlan`. Stub today;
@@ -43,9 +43,15 @@ Canonical references:
 - [`target-store.md`](target-store.md) — file layout + credential
   resolution chain.
 - [`troubleshooting.md`](troubleshooting.md) — diagnostic codes.
-- [`gitops-walk.md`](gitops-walk.md) — Argo CD + repo-creds walk.
-- [`needs-pg-walk.md`](needs-pg-walk.md) — `needs.pg` Postgres
-  provisioning + GC walk.
+- [Connect a Git repository](connect-a-git-repository.md) — Argo CD +
+  repo credentials, for GitHub and GitLab, public and private.
+- [Connect a domain](connect-a-domain.md) and the
+  [Cloudflare Origin CA certificate](cloudflare-origin-cert.md) —
+  serving an application publicly over HTTPS.
+- [Postgres](postgres.md) (`needs.pg`), [Redis](redis.md)
+  (`needs.redis`) and [persistent disk](persistent-disk.md)
+  (`needs.disk`) from a declared dependency, and the
+  [egress](egress-policy.md) each declaration opens.
 - [`recovery.md`](recovery.md) — Hetzner rescue-mode runbook.
 - [`docs/reference/cli/`](../reference/cli/index.md) — every
   subcommand + flag.

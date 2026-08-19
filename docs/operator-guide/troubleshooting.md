@@ -236,7 +236,7 @@ variants in future releases.
 file an issue — recurring catch-all messages should be promoted
 to a typed variant with its own help text.
 
-## Common walk-found failures
+## Common failures found in end-to-end runs
 
 ### "state has no provider — run `apprafter init` first"
 
@@ -281,7 +281,7 @@ input errors with a hint pointing at the Hetzner Cloud Console.
 
 ### `apprafter target add` printed plaintext to stderr
 
-Walk-found in v0.1.78. The wizard's "✓ Token verified" line is
+Found in an end-to-end run of v0.1.78. The wizard's "✓ Token verified" line is
 fine; the prior "(token bytes: <value>)" debug line is gone. If
 you see the value echoed anywhere in v0.1.78+, file an issue.
 
@@ -350,7 +350,7 @@ The step-5 public path has several moving parts; work outward:
   host. Re-check `apprafter target cert import` and the zone's
   apex + wildcard coverage.
 
-Full runbook: [connect a domain](../public-ingress/connect-a-domain.md).
+Full runbook: [connect a domain](connect-a-domain.md).
 
 ### Node shows `NotReady` after bootstrap {#node-not-ready}
 

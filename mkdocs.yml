@@ -43,10 +43,10 @@ exclude_docs: |
 # Pages deliberately reachable by URL but absent from nav. Anything
 # NOT on this list that is missing from nav fails the build — an
 # orphaned guide (node-prep.md was invisible for months) is a bug.
+# Only the ADR bodies are on it: `adr/README.md` is the nav entry and
+# indexes every record, so listing each one beside it would be noise.
 not_in_nav: |
   adr/*
-  license.md
-  contributing/README.md
 
 # NOTE: mkdocs 1.6.1's validation levels are warn/info/ignore only —
 # there is no literal "error" level. `--strict` (see the Justfile) is
@@ -161,20 +161,24 @@ nav:
       - Quickstart: operator-guide/quickstart.md
       - Target store: operator-guide/target-store.md
       - Node preparation: operator-guide/node-prep.md
-      - GitOps walk: operator-guide/gitops-walk.md
-      - needs.pg walk: operator-guide/needs-pg-walk.md
-      - needs.redis walk: operator-guide/needs-redis-walk.md
-      - needs.disk walk: operator-guide/needs-disk-walk.md
-      - needs.networkpolicy walk: operator-guide/needs-networkpolicy-walk.md
+      - Connect a Git repository: operator-guide/connect-a-git-repository.md
+      # Public ingress was a top-level section of two pages. Both are
+      # about cluster-owned resources (the zones on the platform Gateway
+      # and the certificate that terminates TLS for them), which is
+      # operator work, so they live in this section rather than holding
+      # a tab of their own.
+      - Connect a domain: operator-guide/connect-a-domain.md
+      - Cloudflare Origin CA cert: operator-guide/cloudflare-origin-cert.md
+      - Postgres: operator-guide/postgres.md
+      - Redis: operator-guide/redis.md
+      - Persistent disk: operator-guide/persistent-disk.md
       - Shared volumes: operator-guide/shared-volumes.md
+      - Egress policy: operator-guide/egress-policy.md
       - Backup & restore: operator-guide/backup-restore.md
       - Platform management: operator-guide/platform-management.md
       - Migration plans: operator-guide/migration-plans.md
       - Troubleshooting: operator-guide/troubleshooting.md
       - Recovery: operator-guide/recovery.md
-  - Public ingress:
-      - Connect a domain: public-ingress/connect-a-domain.md
-      - Cloudflare Origin CA cert: public-ingress/cloudflare-origin-cert.md
   - Developer Guide:
       - Overview: dev-guide/index.md
       - Quickstart: dev-guide/quickstart.md
@@ -193,8 +197,14 @@ nav:
       # tracing-subscriber).
       - Environment variables: reference/environment.md
   - Contributing:
+      - Overview: contributing/README.md
       - Setup: contributing/setup.md
       - Writing documentation: contributing/documentation.md
       - Documentation gate: contributing/documentation-gate.md
-      - License Headers: contributing/license-headers.md
+      - License headers: contributing/license-headers.md
+      # Which license covers which directory and how the FSL conversion
+      # works. It was reachable by URL but absent from the nav, which
+      # made it findable only by search — this is a page visitors look
+      # for by name.
+      - Licensing: license.md
   - ADRs: adr/README.md

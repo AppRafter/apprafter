@@ -150,11 +150,11 @@ every `name` (or, for an unnamed disk, the last `mountPath` segment)
 must be unique, and at most one entry per type may be unnamed.
 
 `apprafter app scaffold --needs <pg|redis|disk>` (repeatable) emits
-a starter `needs` block for you. The full operational walks —
+a starter `needs` block for you. The full operational guides —
 provisioning, isolation, retention, and GC — live in the operator
-guide: [needs.pg](../operator-guide/needs-pg-walk.md),
-[needs.redis](../operator-guide/needs-redis-walk.md),
-[needs.disk](../operator-guide/needs-disk-walk.md).
+guide: [Postgres](../operator-guide/postgres.md),
+[Redis](../operator-guide/redis.md),
+[persistent disk](../operator-guide/persistent-disk.md).
 
 ### Referencing claims and secrets
 
@@ -225,9 +225,9 @@ sets with `apprafter platform egress set <profile>`:
 
 The per-need allow rules are emitted at **every** profile — tightening the
 profile never blocks a declared dependency. `needs.disk` adds no egress
-rule (a mounted volume has no network target). The full walk — observing a
+rule (a mounted volume has no network target). The full guide — observing a
 Hubble drop, flipping the profile — is the operator guide's
-[needs.networkpolicy walk](../operator-guide/needs-networkpolicy-walk.md).
+[egress gated by declared dependencies](../operator-guide/egress-policy.md).
 
 ## Multi-environment patterns
 

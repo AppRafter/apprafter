@@ -2,7 +2,7 @@
 description: "Watching a declared Postgres dependency all the way through: claim, provisioning, credential binding, and the grace window after removal."
 ---
 
-# needs.pg manual walk — Postgres from a declared dependency
+# Postgres from a declared dependency
 
 This guide walks a Tier-1 operator through the full `needs.pg` chain:
 an Application that declares `spec.base.needs.pg` gets a Postgres
@@ -58,20 +58,20 @@ the password Secret, and removes the snapshot.
 
 ## Step 0 — run the k3d e2e first (cheap gate)
 
-Before spending a real Tier-1 cluster, run the automated walk on a
-local k3d cluster. It exercises the identical chain and is the
-pre-manual-walk gate:
+Before spending a real Tier-1 cluster, run the automated end-to-end
+script on a local k3d cluster. It exercises the identical chain, and is
+the gate to clear before working through this guide by hand:
 
 ```sh
 bash e2e/needs-pg-walk.sh        # green in ~8-12 min on k3d
 ```
 
-If that is red, fix it before continuing — the manual walk only adds
-value once the automated chain is green.
+If that is red, fix it before continuing — going through it by hand
+only adds value once the automated chain is green.
 
 ## Platform-CLI coverage
 
-This walk exercises every shipped `platform-cli` subcommand. Raw
+This guide exercises every shipped `platform-cli` subcommand. Raw
 `kubectl` / `psql` are sanity-only supplements that confirm the
 machine state behind each CLI surface.
 
@@ -126,7 +126,7 @@ The env-var name is yours to pick; `claim.pg.url` names the field in the
 connection `Secret`. The `claim` binding is generated from your own
 `needs` block by `apprafter app validate` and by the CUE CMP at render
 time, so referencing a field you did not provision fails to compile
-rather than at runtime. The rest of this walk assumes that binding is in
+rather than at runtime. The rest of this guide assumes that binding is in
 place.
 
 ### Register the app with `apprafter app add`
@@ -337,7 +337,7 @@ kubectl -n cnpg-system get database.postgresql.cnpg.io claim-demo-parser-pg \
 **13. Force the GC (without a 7-day wait).** The `RetainedClaim` is
 immutable (a CEL `self == oldSelf` rule), so an in-place
 `kubectl patch` of `retainUntil` is **rejected**. Delete it and
-re-create it with a past `retainUntil` — your e2e/walk kubeconfig is
+re-create it with a past `retainUntil` — the kubeconfig you are using is
 `system:masters`, which the operator-only webhook permits to CREATE:
 
 ```sh
@@ -440,7 +440,7 @@ still present after several cycles, CloudNativePG did NOT honor
 
 ## DoD checklist
 
-The walk must exercise both shipped surfaces. Check every box.
+A complete run must exercise both shipped surfaces. Check every box.
 
 **Surface 1 — Argo CD UI (`apprafter open argocd`):**
 

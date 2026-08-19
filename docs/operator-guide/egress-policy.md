@@ -2,7 +2,7 @@
 description: "How a declared dependency is also what opens the egress path to it, how to watch an undeclared reach get dropped, and the cluster-wide profile knob."
 ---
 
-# needs.networkpolicy manual walk — egress gated by declared dependencies
+# Egress gated by declared dependencies
 
 This guide walks a Tier-1 operator through the `needs`-derived egress
 policy: the operator emits one egress **CiliumNetworkPolicy** per
@@ -66,9 +66,9 @@ row with nothing declared.
   `cilium-cli`). Hubble is the lens that makes a drop **observable** —
   without it you only see a connection time out.
 
-## Step 0 — run the automated walk first (cheap gate)
+## Step 0 — run the automated end-to-end script first (cheap gate)
 
-Before spending a real cluster, run the automated enforcement walk on a
+Before spending a real cluster, run the automated enforcement script on a
 local kind cluster. It brings kind up with the default CNI and kube-proxy
 disabled so Cilium owns the datapath, bootstraps with Cilium, enables
 Hubble, then proves the chain end to end (a needs-less app dropped to
@@ -78,7 +78,7 @@ Postgres, a `needs.pg` app forwarded, profile switches via the CLI):
 just e2e-networkpolicy
 ```
 
-On **rootless podman** the walk preflights the memlock limit and, if it is
+On **rootless podman** the script preflights the memlock limit and, if it is
 too low, fails in a few seconds with the exact fix (instead of a ~7-minute
 cilium-agent `CrashLoopBackOff`). Cilium's eBPF agent raises
 `RLIMIT_MEMLOCK` to infinity at startup; under rootless podman the kind
@@ -96,9 +96,10 @@ loginctl terminate-user "$USER"   # or log out / in (a reboot also works)
 ```
 
 **Rootful Docker** (including GitHub Actions `ubuntu-latest`) needs nothing —
-`dockerd` ships `LimitMEMLOCK=infinity`. In CI the walk runs nightly on a
+`dockerd` ships `LimitMEMLOCK=infinity`. In CI the script runs nightly on a
 rootful Docker runner (`.github/workflows/e2e-networkpolicy-nightly.yml`).
-The other AppRafter walks use kindnet (no Cilium) and never hit this.
+The other AppRafter end-to-end scripts use kindnet (no Cilium) and
+never hit this.
 
 ## Step 1 — deploy one app with a need and one without
 
@@ -263,10 +264,11 @@ value and it survives Argo CD self-heal. If you opt into an infra-repo that
 declares the field, Git wins on the next sync and `apprafter platform
 egress set` prints a warning — change the profile in the repo instead.
 
-## What this walk does NOT cover (deferred)
+## What this guide does NOT cover (deferred)
 
 - **`connects` / app-to-app egress** and **`AccessGrant`-gated**, per-app
-  fine-grained access. This walk ships only the cluster-wide profile; finer
+  fine-grained access. The shipped slice covers only the cluster-wide
+  profile; finer
   control layers onto the same CNP mechanism later.
 - **`ExternalSurface`-gated external egress.** The `internet` profile
   leaves `world` open; allow-listing specific external destinations is a
@@ -279,5 +281,6 @@ egress set` prints a warning — change the profile in the repo instead.
 
 - [ADR 0045 — needs → NetworkPolicy egress](https://github.com/apprafter/apprafter/blob/master/docs/adr/0045-needs-networkpolicy-egress.md)
 - [Declaring dependencies — the `needs` block](../dev-guide/application-cue.md#declaring-dependencies-the-needs-block)
-- [needs.pg walk](needs-pg-walk.md), [needs.redis walk](needs-redis-walk.md)
+- [Postgres from a declared dependency](postgres.md),
+  [Redis from a declared dependency](redis.md)
 - [Platform management](platform-management.md)

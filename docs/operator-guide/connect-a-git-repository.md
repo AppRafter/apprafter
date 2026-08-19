@@ -2,7 +2,7 @@
 description: "Wiring a bootstrap repository end to end, for each combination of GitHub or GitLab and public or private."
 ---
 
-# AppRafter GitOps walk — bootstrap from Git
+# Connect a Git repository — GitHub or GitLab, public or private
 
 This guide walks a cluster operator through wiring `spec.argocd.bootstrapRepo`
 for each combination of `(GitHub | GitLab) × (public | private)`. Goal is one
@@ -121,7 +121,7 @@ feature — the Argo CD web UI (`cluster-bootstrap` installs it) and the
 `apprafter argocd-password` subcommand. `kubectl` checks are
 sanity-only supplements.
 
-**1. Argo CD UI walk (primary)** — open the UI and visually verify:
+**1. Argo CD UI check (primary)** — open the UI and visually verify:
 
 ```sh
 # Starts a local port-forward, prints credentials, and opens the browser.
@@ -206,7 +206,7 @@ Identical to Quadrant 1, with one addition:
 Same two-surface pattern as Quadrant 1, plus a Secret-presence check
 (`kubectl` only, since AppRafter doesn't ship a UI for repo creds).
 
-**1. Argo CD UI walk (primary)** — open via CLI:
+**1. Argo CD UI check (primary)** — open via CLI:
 
 ```sh
 apprafter open argocd

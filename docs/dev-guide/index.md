@@ -15,10 +15,10 @@ to AppRafter):
   See [`application-cue.md`](application-cue.md).
 - **Working with platform services** — declaring `needs.{pg, redis,
   disk}` and binding the provisioned credentials into env-vars with
-  `claim` references (ADR 0046). The provisioning walks live in the
-  operator guide: [needs.pg](../operator-guide/needs-pg-walk.md),
-  [needs.redis](../operator-guide/needs-redis-walk.md),
-  [needs.disk](../operator-guide/needs-disk-walk.md).
+  `claim` references (ADR 0046). The provisioning guides live in the
+  operator guide: [Postgres](../operator-guide/postgres.md),
+  [Redis](../operator-guide/redis.md),
+  [persistent disk](../operator-guide/persistent-disk.md).
 - **Private repos and registries** — source credentials for a private
   Git repository and image-pull secrets for a private registry. See
   [`private-repos-and-registries.md`](private-repos-and-registries.md).
@@ -27,7 +27,7 @@ to AppRafter):
   [`image-iteration.md`](image-iteration.md).
 - **Egress** — a declared `need` is also what opens your pods' network
   path to that backend; an undeclared reach is denied. See the
-  [needs.networkpolicy walk](../operator-guide/needs-networkpolicy-walk.md).
+  [egress guide](../operator-guide/egress-policy.md).
 
 Canonical references:
 

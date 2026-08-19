@@ -2,7 +2,7 @@
 description: "Watching a declared persistent-disk dependency all the way through, including the single-writer constraints it puts on the workload."
 ---
 
-# needs.disk manual walk — persistent disk from a declared dependency
+# Persistent disk from a declared dependency
 
 This guide walks a Tier-1 operator through the full `needs.disk` chain: an
 Application that declares `spec.base.needs.disk` gets a persistent block
@@ -84,21 +84,22 @@ the GC controller deletes the PVC and removes the snapshot.
 
 ## Step 0 — run the k3d e2e first (cheap gate)
 
-Before spending a real Tier-1 cluster, run the automated walk on a local
-k3d/kind cluster. It exercises the identical chain (provision → mount →
-data durability → delete + snapshot → reattach → force-GC) plus a
-`needs.pg`-array multi-claim assertion, and is the pre-manual-walk gate:
+Before spending a real Tier-1 cluster, run the automated end-to-end
+script on a local k3d/kind cluster. It exercises the identical chain
+(provision → mount → data durability → delete + snapshot → reattach →
+force-GC) plus a `needs.pg`-array multi-claim assertion, and is the gate
+to clear before working through this guide by hand:
 
 ```sh
 just e2e-disk        # green in ~3-5 min (kind+podman, LOCAL_OPERATOR build)
 ```
 
-If that is red, fix it before continuing — the manual walk only adds value
-once the automated chain is green.
+If that is red, fix it before continuing — going through it by hand
+only adds value once the automated chain is green.
 
 ## Platform-CLI coverage
 
-This walk exercises every shipped `platform-cli` subcommand. Raw `kubectl`
+This guide exercises every shipped `platform-cli` subcommand. Raw `kubectl`
 is a sanity-only supplement that confirms the machine state behind each CLI
 surface.
 
@@ -318,8 +319,8 @@ kubectl -n demo exec "$POD3" -- cat /data/probe           # -> hello-disk (data 
 The `RetainedClaim` is immutable (a CEL `self == oldSelf` rule), so an
 in-place `kubectl patch` of `retainUntil` is **rejected**. Delete the app
 to snapshot a fresh `RetainedClaim`, then delete and re-create it with a
-past `retainUntil` — your walk kubeconfig is `system:masters`, which the
-operator-only webhook permits to CREATE:
+past `retainUntil` — the kubeconfig you are using is `system:masters`,
+which the operator-only webhook permits to CREATE:
 
 ```sh
 kubectl -n demo delete application.apprafter.io web --wait=true
@@ -357,7 +358,7 @@ delete it — STOP, this is a closure-blocking bug.**
 
 ## DoD checklist
 
-The walk must exercise both shipped surfaces. Check every box.
+A complete run must exercise both shipped surfaces. Check every box.
 
 **Surface 1 — Argo CD UI (`apprafter open argocd`):**
 

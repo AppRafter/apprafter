@@ -193,7 +193,7 @@
 //!   backup enable`, every number held and the gate exited 0 —
 //!   `invocations` counts invocations, never the flags inside one.
 //! * **A deep identifier for a shallow one.**
-//!   `docs/operator-guide/needs-pg-walk.md` claims `spec.base.needs.pg`
+//!   `docs/operator-guide/postgres.md` claims `spec.base.needs.pg`
 //!   in its opening sentence. Rewritten to `spec.base`, `identifiers`
 //!   held at 236 and the gate exited 0. The one number that moved was
 //!   the opaque share (115 → 114) — which is printed and not committed,

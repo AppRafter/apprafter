@@ -250,8 +250,9 @@ byte-identical to the pre-colour baseline.
   credential resolution chain reference.
 - [`troubleshooting.md`](./troubleshooting.md) — diagnostic-code
   catalogue, common failures, recovery commands.
-- [`gitops-walk.md`](./gitops-walk.md) — wiring Argo CD to a Git
-  repository for GitOps deployment of your applications.
+- [Connect a Git repository](./connect-a-git-repository.md) — wiring
+  Argo CD to a Git repository for GitOps deployment of your
+  applications.
 - [`platform-management.md`](./platform-management.md) — platform
   version lifecycle, release channels, upgrade and freeze.
 - [`docs/reference/cli/`](../reference/cli/index.md) — full subcommand

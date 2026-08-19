@@ -740,7 +740,7 @@ fn a_reference_to_an_unused_slot_is_reported() {
 fn a_citation_inside_a_fence_is_judged_like_any_other() {
     // The design decision, pinned: ADR references are read page-wide off
     // the source, not from prose alone. The corpus writes one inside a
-    // fence — `docs/operator-guide/needs-pg-walk.md`, a comment in a
+    // fence — `docs/operator-guide/postgres.md`, a comment in a
     // shell block — so a prose-only rule would drop a real citation, and
     // would make "move the sentence into the block" a way to stop one
     // being checked.

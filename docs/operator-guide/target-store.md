@@ -103,7 +103,7 @@ SSH public key resolution is analogous (`APPRAFTER_SSH_PUBLIC_KEY`
 env → target store's `ssh_key_path` → read the file).
 
 When nothing resolves, the typed error lists **all three** paths.
-Walks confirmed this is what operators read first:
+End-to-end runs confirmed this is what operators read first:
 
 ```text
 Error: apprafter::cli::other

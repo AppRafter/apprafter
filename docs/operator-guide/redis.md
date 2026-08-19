@@ -2,7 +2,7 @@
 description: "Watching a declared Redis dependency all the way through, including the per-claim logical-database isolation on a shared Dragonfly pool."
 ---
 
-# needs.redis manual walk — Redis from a declared dependency
+# Redis from a declared dependency
 
 This guide walks a Tier-1 operator through the full `needs.redis` chain:
 an Application that declares `spec.base.needs.redis` gets an isolated,
@@ -83,21 +83,22 @@ the snapshot.
 
 ## Step 0 — run the k3d e2e first (cheap gate)
 
-Before spending a real Tier-1 cluster, run the automated walk on a local
-k3d cluster. It exercises the identical chain (including the `$N`-ACL
-isolation proof and the `FLUSHDB`/`DELUSER` GC proof) and is the
-pre-manual-walk gate:
+Before spending a real Tier-1 cluster, run the automated end-to-end
+script on a local k3d cluster. It exercises the identical chain
+(including the `$N`-ACL isolation proof and the `FLUSHDB`/`DELUSER` GC
+proof) and is the gate to clear before working through this guide by
+hand:
 
 ```sh
 bash e2e/needs-redis-walk.sh        # green in ~8-12 min on k3d
 ```
 
-If that is red, fix it before continuing — the manual walk only adds
+If that is red, fix it before continuing — going through it by hand only adds
 value once the automated chain is green.
 
 ## Platform-CLI coverage
 
-This walk exercises every shipped `platform-cli` subcommand. Raw
+This guide exercises every shipped `platform-cli` subcommand. Raw
 `kubectl` / `redis-cli` are sanity-only supplements that confirm the
 machine state behind each CLI surface.
 
@@ -150,7 +151,7 @@ spec: base: {
 ```
 
 The env-var names are yours to pick; `claim.redis.<field>` names a field
-in the connection `Secret`. The rest of this walk assumes both bindings
+in the connection `Secret`. The rest of this guide assumes both bindings
 are in place.
 
 ### Register the app with `apprafter app add`
@@ -364,7 +365,7 @@ kubectl -n dragonfly-system exec deploy/platform-redis-ephemeral-000 -- \
 
 The `RetainedClaim` is immutable (a CEL `self == oldSelf` rule), so an
 in-place `kubectl patch` of `retainUntil` is **rejected**. Delete it and
-re-create it with a past `retainUntil` — your e2e/walk kubeconfig is
+re-create it with a past `retainUntil` — the kubeconfig you are using is
 `system:masters`, which the operator-only webhook permits to CREATE:
 
 ```sh
@@ -423,7 +424,7 @@ NOT run `ACL DELUSER` — STOP, this is a closure-blocking bug.**
 
 ## DoD checklist
 
-The walk must exercise both shipped surfaces. Check every box.
+A complete run must exercise both shipped surfaces. Check every box.
 
 **Surface 1 — Argo CD UI (`apprafter open argocd`):**
 

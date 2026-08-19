@@ -125,7 +125,8 @@ fn a_named_multi_claim_list_keeps_its_type_component() {
 
 #[test]
 fn a_cue_only_schema_still_backs_the_docs_that_name_it() {
-    // gitops-walk.md and troubleshooting.md. `Infrastructure` is
+    // connect-a-git-repository.md and troubleshooting.md.
+    // `Infrastructure` is
     // the manifest `apprafter apply` reads and ships no CRD, so a
     // CRD-only field set calls both lines wrong.
     let f = FieldSet::from_repo(&docsgen::repo_root().unwrap()).unwrap();

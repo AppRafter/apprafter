@@ -203,8 +203,8 @@ Two behaviours are load-bearing:
   newly-provisioned one, not whatever owned the objects on the source.
 - **Volumes** are restored by streaming the tar on stdin to `tar x` in a
   helper pod that mounts the fresh PVC read-write.
-- **Redis** restore is a documented skeleton today and is exercised on the
-  live walk.
+- **Redis** restore is a documented skeleton today and is exercised in the
+  live end-to-end run.
 
 ### Secrets are re-sealed for the target
 

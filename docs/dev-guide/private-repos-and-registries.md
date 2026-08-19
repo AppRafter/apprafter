@@ -93,8 +93,8 @@ need the Git-clone half. Two ways in:
   bootstrap-time path driven by `APPRAFTER_ARGOCD_REPO_TOKEN`, and it
   is **Git-only** (Argo CD never pulls an image for it), so a
   fine-grained PAT is fine there. The four `(GitHub | GitLab) ×
-  (public | private)` quadrants are walked end-to-end in the
-  [GitOps walk](../operator-guide/gitops-walk.md).
+  (public | private)` quadrants are walked end-to-end in
+  [Connect a Git repository](../operator-guide/connect-a-git-repository.md).
 
 GitLab private repos use a **Project Access Token** with
 `read_repository`; self-hosted Gitea/Forgejo use an arbitrary token
@@ -123,4 +123,5 @@ passing), Argo CD or the kubelet will fail at clone/pull time.
 - **`401` / `404`** in the Argo CD UI on the source repo → the
   Git credential is expired, lacks repo access, or wasn't registered
   for the matching `--url-prefix`. See the
-  [GitOps walk troubleshooting tables](../operator-guide/gitops-walk.md).
+  [Connect a Git repository](../operator-guide/connect-a-git-repository.md)
+  troubleshooting tables.

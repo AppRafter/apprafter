@@ -268,7 +268,7 @@ The production path serves your app over HTTPS through Cloudflare:
 TLS terminates at the cluster Gateway on a Cloudflare Origin CA
 certificate, and the node's `80`/`443` are firewalled so the only way
 in is through Cloudflare. This summarizes the
-[connect-a-domain runbook](../public-ingress/connect-a-domain.md) —
+[connect-a-domain runbook](../operator-guide/connect-a-domain.md) —
 see it for the full DNS detail.
 
 **5.1 — Lock the origin firewall to Cloudflare (once per cluster):**
@@ -284,7 +284,7 @@ In the Cloudflare dashboard add the site for `<zone>`, set your
 registrar's nameservers to Cloudflare's, and set **SSL/TLS → Full
 (strict)**. Mint a **Cloudflare Origin CA** certificate for `<zone>`
 + `*.<zone>` (full steps:
-[Cloudflare Origin CA certificate](../public-ingress/cloudflare-origin-cert.md))
+[Cloudflare Origin CA certificate](../operator-guide/cloudflare-origin-cert.md))
 and import it:
 
 ```sh
@@ -388,12 +388,12 @@ first.
   auto-redeploy iteration loop.
 - [Troubleshooting](../operator-guide/troubleshooting.md) — diagnostic
   codes and common bring-up failures.
-- [connect a domain](../public-ingress/connect-a-domain.md) and the
-  [Cloudflare Origin CA cert](../public-ingress/cloudflare-origin-cert.md)
+- [connect a domain](../operator-guide/connect-a-domain.md) and the
+  [Cloudflare Origin CA cert](../operator-guide/cloudflare-origin-cert.md)
   guide — the full public-ingress runbook.
 - [operator quickstart](../operator-guide/quickstart.md) — the full
   cluster lifecycle and day-2 operations.
-- [gitops-walk](../operator-guide/gitops-walk.md) — wiring Argo CD to
-  GitHub / GitLab, public and private.
+- [Connect a Git repository](../operator-guide/connect-a-git-repository.md)
+  — wiring Argo CD to GitHub / GitLab, public and private.
 - [`schemas/v1alpha1/application.cue`](https://github.com/apprafter/apprafter/blob/master/schemas/v1alpha1/application.cue) —
   the Application CRD shape your manifest is validated against.
