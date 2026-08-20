@@ -1,6 +1,6 @@
 ---
 title: "apprafter restore"
-description: "Restore a backup into a target cluster: replays the CRs, secrets and native data (pg/redis/volumes) captured by `apprafter backup`."
+description: "Restore a backup into a target cluster: replays the CRs, secrets and native data (pg + volumes) captured by `apprafter backup`."
 audience: reference
 status: stable
 ---
@@ -9,7 +9,7 @@ status: stable
 
 # `apprafter restore`
 
-Restore a backup into a target cluster: replays the CRs, secrets and native data (pg/redis/volumes) captured by `apprafter backup`. Modes: restore-into-running (default; the target must already be bootstrapped), `--data-only` (reload native data only, no CR/secret replay), and `--reprovision` (provision a fresh cluster first, then replay). Secrets are re-sealed against the target cluster's sealed-secrets key
+Restore a backup into a target cluster: replays the CRs, secrets and native data (pg + volumes) captured by `apprafter backup`. Redis contents are neither captured nor restored — a redis claim comes back empty. Modes: restore-into-running (default; the target must already be bootstrapped), `--data-only` (reload native data only, no CR/secret replay), and `--reprovision` (provision a fresh cluster first, then replay). Secrets are re-sealed against the target cluster's sealed-secrets key
 
 ```text
 Usage: apprafter restore [OPTIONS] <REPO>
@@ -22,7 +22,7 @@ Usage: apprafter restore [OPTIONS] <REPO>
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--credential-file` | — | — | no | Path to a dotenv credential file containing the operator's S3 credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`, optional `AWS_DEFAULT_REGION`). REQUIRED to restore from a remote `s3:`/`b2:`/`gs:`/`azure:` repo (falls back to the matching env vars); the operator's full creds are read locally, NEVER from the cluster |
-| `--data-only` | flag | — | no | Replay only native data (pg/redis/volumes); skip CR + secret replay. Useful when the cluster is already configured |
+| `--data-only` | flag | — | no | Replay only native data (pg + volumes); skip CR + secret replay. Useful when the cluster is already configured |
 | `--passphrase` | — | — | no | Passphrase for the restic repo. Falls back to `RESTIC_PASSWORD`; prompts interactively on a TTY |
 | `--reprovision` | flag | — | no | Re-provision the target cluster before replaying data |
 | `--server-type` | — | — | no | Server type (SKU) to use when `--reprovision` is set (e.g. `cx22`, `cx32`). Forwarded to the `apply` phase. Resolution: this flag > manifest `spec.nodes[0].type` > recorded state > target default > `APPRAFTER_SERVER_TYPE`. There is NO implicit default — if none is set, provisioning fails with `apprafter::provider::server_type_not_selected` |

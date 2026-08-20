@@ -60,7 +60,7 @@ specific release rather than scraping these pages.
 | [`apprafter completion`](completion.md) | — | Print a shell completion script on stdout |
 | [`apprafter destroy`](destroy.md) | — | Destroy every `apprafter=true`-labelled resource in the provider project the token belongs to — servers, floating IPs, firewalls, networks and SSH keys |
 | [`apprafter doctor`](doctor.md) | — | Self-diagnostic over the active target's config, credentials and reachability plus the surrounding shell environment (kubectl, helm, ssh, DNS). |
-| [`apprafter export`](export.md) | — | Native data export (Kind 1) — pull pg dumps, volume tars, redis snapshots to a plain local folder + `manifest.json`. |
+| [`apprafter export`](export.md) | — | Native data export (Kind 1) — pull pg dumps and volume tars to a plain local folder + `manifest.json`. |
 | [`apprafter import`](import.md) | — | Rebuild local state from live Hetzner Cloud resources tagged with `apprafter=true`. |
 | [`apprafter init`](init.md) | — | Bootstrap a fresh cluster on the given provider/tier |
 | [`apprafter kubeconfig`](kubeconfig.md) | `kc` | Print the cached k3s kubeconfig (decrypted), fetching it over SSH on first use. |
@@ -70,8 +70,8 @@ specific release rather than scraping these pages.
 | [`apprafter open`](open.md) | — | Open a platform UI (Argo CD today; Backstage, Grafana and Hubble are not wired up yet). |
 | [`apprafter plan`](plan.md) | — | Preview infrastructure changes — NOT IMPLEMENTED, it prints `no changes` unconditionally and never contacts the provider. |
 | [`apprafter platform`](platform.md) | — | Inspect and control the cluster's PlatformStack — the declarative platform-version resource managed by PlatformController |
-| [`apprafter repo`](repo.md) | — | Manage git-repo creds Argo CD uses to pull private user repos. |
-| [`apprafter restore`](restore.md) | — | Restore a backup into a target cluster: replays the CRs, secrets and native data (pg/redis/volumes) captured by `apprafter backup`. |
+| [`apprafter repo`](repo.md) | — | Manage the credentials Argo CD uses to clone private user repos (and the workload pull-secrets for the matching registry). |
+| [`apprafter restore`](restore.md) | — | Restore a backup into a target cluster: replays the CRs, secrets and native data (pg + volumes) captured by `apprafter backup`. |
 | [`apprafter secret`](secret.md) | — | Seal secret material with the in-cluster sealed-secrets controller's public cert. |
 | [`apprafter status`](status.md) | — | Print the current cluster status — SKELETON, it reads local state and never contacts the cluster. |
 | [`apprafter target`](target.md) | `t` | Manage deployment targets — persistent named bundles of `(provider, region, credentials, defaults)`. |

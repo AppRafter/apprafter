@@ -277,9 +277,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: AppCommand,
     },
-    /// Manage git-repo creds Argo CD uses to pull private user
-    /// repos. Writes `repo-creds`-typed Secrets in the `argocd`
-    /// namespace per Argo CD's documented contract.
+    /// Manage the credentials Argo CD uses to clone private user
+    /// repos (and the workload pull-secrets for the matching
+    /// registry). Writes a sealed `SourceCredential` in
+    /// `apprafter-system`; the operator derives the Argo CD
+    /// `repo-creds` Secret and the pull-secret from it.
     Repo {
         #[command(subcommand)]
         action: RepoCommand,
@@ -308,9 +310,10 @@ pub enum Commands {
         #[command(subcommand)]
         action: NodeAction,
     },
-    /// Native data export (Kind 1) — pull pg dumps, volume tars, redis
-    /// snapshots to a plain local folder + `manifest.json`. No CRs, no
-    /// secrets, no encryption. A debugging / one-off-recovery convenience.
+    /// Native data export (Kind 1) — pull pg dumps and volume tars to a
+    /// plain local folder + `manifest.json`. Redis contents are NOT
+    /// captured (the extractor logs a skip). No CRs, no secrets, no
+    /// encryption. A debugging / one-off-recovery convenience.
     Export {
         /// Narrow scope to these namespaces (repeatable). Ignored unless
         /// `--select` is also passed.
@@ -332,7 +335,9 @@ pub enum Commands {
         action: BackupAction,
     },
     /// Restore a backup into a target cluster: replays the CRs, secrets and
-    /// native data (pg/redis/volumes) captured by `apprafter backup`. Modes:
+    /// native data (pg + volumes) captured by `apprafter backup`. Redis
+    /// contents are neither captured nor restored — a redis claim comes back
+    /// empty. Modes:
     /// restore-into-running (default; the target must already be bootstrapped),
     /// `--data-only` (reload native data only, no CR/secret replay), and
     /// `--reprovision` (provision a fresh cluster first, then replay). Secrets
@@ -349,7 +354,7 @@ pub enum Commands {
         /// Snapshot id to restore (defaults to the latest).
         #[arg(long)]
         snapshot: Option<String>,
-        /// Replay only native data (pg/redis/volumes); skip CR + secret
+        /// Replay only native data (pg + volumes); skip CR + secret
         /// replay. Useful when the cluster is already configured.
         #[arg(long, default_value_t = false)]
         data_only: bool,
@@ -460,12 +465,14 @@ pub enum RepoCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum RepoCredsCommand {
-    /// Register a git-repo credential. Creates an Argo CD
-    /// `repo-creds`-typed Secret in the `argocd` namespace.
-    /// All Applications with a `repoURL` starting with the
-    /// registered `--url-prefix` inherit these creds.
+    /// Register a git-repo credential. Seals the material and
+    /// creates a `SourceCredential` in `apprafter-system`; the
+    /// operator derives the Argo CD `repo-creds` Secret and the
+    /// workload pull-secret from it. All Applications with a
+    /// `repoURL` starting with the registered `--url-prefix`
+    /// inherit these creds.
     Add {
-        /// Friendly name. Used as the Secret's
+        /// Friendly name. Used as the `SourceCredential`'s
         /// `metadata.name` (DNS-1123) and surfaces in
         /// `apprafter repo creds list`.
         name: String,
@@ -513,11 +520,12 @@ pub enum RepoCredsCommand {
         /// Creds name (as listed via `repo creds list`).
         name: String,
     },
-    /// Rotate a creds entry's token in-place. Patches the
-    /// existing Secret rather than recreating it — Argo CD
-    /// repo-server holds a cached reference to the Secret's
-    /// resourceVersion and a recreate would cause a brief
-    /// reconnect window.
+    /// Rotate a creds entry's token in-place. Re-seals the
+    /// material under the same name, leaving the
+    /// `SourceCredential`'s spec (and therefore its coverage)
+    /// untouched, so the change is not a gated one; the operator
+    /// re-derives the Argo CD repo-cred and the pull-secret on its
+    /// next reconcile.
     Rotate {
         /// Creds name.
         name: String,

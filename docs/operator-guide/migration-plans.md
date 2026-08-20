@@ -19,68 +19,117 @@ reference, §3.8 of
 
 ## What counts as destructive
 
-The `MigrationController` classifies changes into four risk levels:
+The `MigrationController` classifies changes into five risk levels,
+ordered by severity — the number is the `severity` each entry in the
+plan's `spec.changes[]` carries beside its `classification`:
 
-| Classification      | Examples                                                   |
-| ------------------- | ---------------------------------------------------------- |
-| `safe`              | Env-var additions, replica count changes, label updates.   |
-| `requires-restart`  | Public hostname change, scale-to-zero, major Argo CD bump. |
-| `data-migration`    | Storage-class change, `needs.pg` removal.                  |
-| `breaking`          | Kubernetes minor upgrade, Cilium major version change.     |
+| Classification      | Sev | Examples                                                   |
+| ------------------- | --- | ---------------------------------------------------------- |
+| `safe`              | 0   | Env-var literal edits, replica count changes, label updates. |
+| `requires-restart`  | 1   | Losing a public hostname, scale-to-zero, major Argo CD bump. |
+| `breaking`          | 2   | Kubernetes minor upgrade, Cilium major version change, narrowing a `SourceCredential`. |
+| `data-migration`    | 3   | Storage-class change, `needs.pg` removal.                  |
+| `security-boundary` | 4   | Anything that changes **what gets pulled or who can reach it**: an image *repository* move, publishing a new public hostname, going public, wiring in a new `secret:` reference. |
 
-Only `requires-restart`, `data-migration`, and `breaking` changes
-create a `MigrationPlan`. Safe changes are applied immediately.
+Only `requires-restart` and above create a `MigrationPlan`. Safe
+changes are applied immediately.
+
+`security-boundary` is the class to know: it is the most severe, it
+outranks a co-occurring `data-migration` for the plan's headline, and
+several of the edits that carry it *look* additive. A plan whose
+`spec.changes[]` holds more than one candidate lists them all, so a
+severe op cannot ride along behind a benign-looking primary.
 
 Platform-stack specific triggers (applied when diffing a
 `PlatformStack` upgrade):
 
 - Any diff classified as `requires-restart`, `data-migration`, or
-  `breaking` in the chart's compatibility metadata.
+  `breaking` in the chart's compatibility metadata. Those four (with
+  `safe`) are the whole vocabulary on that side — the chart's
+  `#ChangeClass` has no `security-boundary`, which is an
+  application- and credential-scope class only.
 
 ### Application triggers (ADR 0051)
 
 For an application edit, the diff is taken between the last applied
 spec and the new spec, each evaluated under its own environment, so a
 change in one environment gates only that environment's deployment.
-The following gate:
+Thirteen edits gate. Read the `security-boundary` half twice: several
+of them are things people think of as additions.
 
-- **Removing a `needs.*` dependency** — the backing platform service
-  (its `ResourceClaim` and data) is garbage-collected (`data-migration`).
-- **Changing or removing `expose.hostname` on a publicly-routed app**
-  (one with `expose.network: "public"`) — the app becomes unreachable
-  on the old hostname (`requires-restart`). On a non-public app a
-  hostname edit is inert and does not gate.
-- **Changing `expose.network` from `public` to a non-public value**
-  (`internal` or `vpn`) — removes external reachability
-  (`requires-restart`).
-- **Scaling to zero** (`replicas` N → 0) — a deliberate outage
-  (`requires-restart`).
-- **Changing the image repository** (the path, not the tag) — a
-  different image (`requires-restart`).
-- **Removing an env value that is a reference** (a `claim.*` selector
-  or a `secret: "name/key"` reference) — the workload loses a wired
-  dependency (`requires-restart`).
+| The edit | Trigger | Class |
+| --- | --- | --- |
+| Removing a `needs.*` dependency — the backing claim and its data are garbage-collected | `needs-removal` | `data-migration` |
+| `expose.network` `public` → non-public (`internal` / `vpn`) — external reachability withdrawn | `network-visibility-change` | `requires-restart` |
+| A publicly-routed app **loses** a hostname (removed, or swapped for another) | `domain-change` | `requires-restart` |
+| `replicas` N → 0 — a deliberate outage | `scale-to-zero` | `requires-restart` |
+| Removing an env key whose value is a reference (`claim.…` or `secret:"name/key"`) | `env-ref-removal` | `requires-restart` |
+| `expose.network` non-public → **`public`** — the app is now on the public Gateway | `network-visibility-escalation` | `security-boundary` |
+| A public app **gains** a hostname — including its first, and including a second one beside an existing one | `public-hostname-add` | `security-boundary` |
+| A public app's `expose.port` changes — the public route now targets something else | `public-port-retarget` | `security-boundary` |
+| The image **repository** changes (the path, not the tag) — a different pull source | `image-path-change` | `security-boundary` |
+| `imagePolicy.resolve` `off` → anything else on a tag-referenced image — a pinned reference goes back to floating | `image-policy-relaxation` | `security-boundary` |
+| An env key becomes a `secret:"name/key"` reference — from absent, from a literal, or from a `claim.…` reference | `env-secret-ref-add` | `security-boundary` |
+| An env key stops being a reference and becomes a literal | `env-ref-downgrade` | `security-boundary` |
+| An env key's `secret:` reference is re-pointed at a different secret | `env-secret-ref-retarget` | `security-boundary` |
+
+A hostname swap `{a}` → `{b}` on a public app fires **two** — `a` was
+lost (`domain-change`) and `b` was gained (`public-hostname-add`) —
+and the plan's headline is the more severe of the two.
 
 These edits do **not** gate — they auto-apply, and the soft-destructive
 ones emit a `SoftDestructiveChange` Kubernetes Event you can see with
 `kubectl get events`:
 
-- Any addition (a new `needs`, env var, or expose rule).
+- Adding a `needs`, or an env var that is a **literal** or a
+  `claim.…` reference. (An added `secret:` reference gates — the row
+  above.)
+- Any hostname or port edit on a **non-public** app: nothing is routed,
+  so nothing changes externally.
 - Scaling from zero (0 → N) or down to a non-zero count.
 - Removing an env *literal* (a plain string, not a reference).
 - Changing only the image **tag** on the same repository — the operator
   resolves the tag to a digest and rolls it out automatically.
+- Turning `imagePolicy.resolve` **off** (pinning the tag verbatim) —
+  that is hardening, not relaxation.
 - Changing `needs.*.size` — storage is expansion-only, so a shrink is
   rejected at the provisioner layer.
+- Changing `needs.*.selector` — deferred while a single provider tier
+  ships; the edit produces the same `(type, name)` key on both sides,
+  so no candidate is raised.
 
-Removal or narrowing of a `SourceCredential` that active applications
-depend on is classified as destructive today; live gating for the
-`sourcecredential` scope is not implemented yet.
+### SourceCredential triggers
+
+**Narrowing a `SourceCredential` is gated, and it pauses derivation.**
+Removing a covered `repoPrefix` or registry `host` — including dropping
+a whole `git` or `registry` half — raises a `coverage-removal` trigger
+classified `breaking`, and the controller creates a plan **before**
+either derivation half runs.
+
+While it is pending, the credential reports
+`status.phase: AwaitingMigrationApproval` with `Ready=False` /
+`MigrationPending=True` (both messages name the plan), and the
+previously derived, **wider** Secrets are deliberately left in place —
+so in-flight applications keep cloning and pulling. Nothing is derived
+from the narrowed spec until you act:
+
+```sh
+apprafter migration list                     # the plan, in the credential's namespace
+apprafter migration approve <plan-name>      # derive with the narrowed coverage
+```
+
+Re-widening the spec also clears it: the stale plan is garbage-collected
+and derivation proceeds. There is no reject — see below.
+
+Adding coverage, creating a credential, and rotating the material
+(`apprafter repo creds rotate`, which replaces the sealed material and
+leaves the spec untouched) are **not** destructive and do not gate.
 
 ## Approval semantics by scope
 
-`MigrationPlan` carries a `spec.scope.type` discriminator:
-`application` or `platform`. The approval semantics differ.
+`MigrationPlan` carries a `spec.scope.type` discriminator with three
+values — `application`, `platform` and `sourcecredential`. The approval
+semantics differ: only `platform` can be rejected.
 
 ### Application scope
 
@@ -125,6 +174,22 @@ applies-and-clears rather than re-creating a new gate.
   the value recorded in the plan's previous-spec snapshot. The
   cluster remains on the current version.
 
+### SourceCredential scope
+
+**Approve only**, on the same reasoning as application scope: the
+gated change is a coverage *removal* on a config object, so there is
+no controller-side state to roll back. The admission webhook denies
+`status.phase=rejected` on a `sourcecredential` plan by any path, with
+the message *"sourcecredential-scope MigrationPlans cannot be
+rejected; … sourcecredential-scope plans are approve-only"*. To back
+out, re-widen the credential's spec — the stale plan is collected and
+derivation resumes with the wider coverage.
+
+The plan lives in the credential's own namespace (`apprafter-system`
+for the credentials `apprafter repo creds add` writes) with a
+controlling `ownerReference` back to the `SourceCredential`, so
+deleting the credential collects the plan too.
+
 ## Lifecycle
 
 A `MigrationPlan` moves through these phases:
@@ -138,11 +203,15 @@ pending-approval → approved → executing → completed
 Plans in `pending-approval` state remain there indefinitely — there
 is no automatic expiration. If you want to dismiss a platform-scope
 plan without approving it, use `apprafter migration reject`. For an
-application-scope plan, revert the triggering commit in Git.
+application-scope plan, revert the triggering commit in Git; for a
+`sourcecredential` plan, re-widen the credential's spec.
 
 For an application-scope plan the operator **deletes** the plan once it
 applies the approved spec (the plan is a consumed ticket, ADR 0051), so
-an approved application plan does not linger in `completed`.
+an approved application plan does not linger in `completed`. A
+`sourcecredential` plan is consumed the same way — the controller
+derives both halves with the narrowed spec, stamps the new baseline,
+and then deletes the plan.
 
 ## CLI surface
 
@@ -150,7 +219,8 @@ an approved application plan does not linger in `completed`.
 # List MigrationPlans across ALL namespaces, with namespace, name,
 # scope, classification, and current phase. Platform-scope plans
 # live in apprafter-system; application-scope plans live in the
-# application's own namespace.
+# application's own namespace; sourcecredential-scope plans live in
+# the credential's namespace.
 apprafter migration list
 
 # Approve a plan. The namespace is resolved automatically from the
@@ -159,14 +229,15 @@ apprafter migration list
 apprafter migration approve <plan-name>
 
 # Reject a plan (platform scope only). Reverts spec.pin to the
-# previous value. Application-scope plans have no reject command —
-# revert the change in Git instead.
+# previous value. Application- and sourcecredential-scope plans have
+# no reject — revert the change in Git, or re-widen the credential.
 apprafter migration reject <plan-name>
 ```
 
 You can also inspect and patch plans directly with `kubectl`. Use the
-plan's own namespace (`apprafter-system` for platform scope, the
-application's namespace for application scope):
+plan's own namespace (`apprafter-system` for platform and
+sourcecredential scope, the application's namespace for application
+scope):
 
 ```sh
 kubectl get migrationplans -A

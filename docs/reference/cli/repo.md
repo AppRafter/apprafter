@@ -1,6 +1,6 @@
 ---
 title: "apprafter repo"
-description: "Manage git-repo creds Argo CD uses to pull private user repos."
+description: "Manage the credentials Argo CD uses to clone private user repos (and the workload pull-secrets for the matching registry)."
 audience: reference
 status: stable
 ---
@@ -9,7 +9,7 @@ status: stable
 
 # `apprafter repo`
 
-Manage git-repo creds Argo CD uses to pull private user repos. Writes `repo-creds`-typed Secrets in the `argocd` namespace per Argo CD's documented contract
+Manage the credentials Argo CD uses to clone private user repos (and the workload pull-secrets for the matching registry). Writes a sealed `SourceCredential` in `apprafter-system`; the operator derives the Argo CD `repo-creds` Secret and the pull-secret from it
 
 ```text
 Usage: apprafter repo <COMMAND>
@@ -37,7 +37,7 @@ Subcommands:
 
 ### `apprafter repo creds add`
 
-Register a git-repo credential. Creates an Argo CD `repo-creds`-typed Secret in the `argocd` namespace. All Applications with a `repoURL` starting with the registered `--url-prefix` inherit these creds
+Register a git-repo credential. Seals the material and creates a `SourceCredential` in `apprafter-system`; the operator derives the Argo CD `repo-creds` Secret and the workload pull-secret from it. All Applications with a `repoURL` starting with the registered `--url-prefix` inherit these creds
 
 ```text
 Usage: apprafter repo creds add [OPTIONS] --url-prefix <URL_PREFIX> <NAME>
@@ -45,7 +45,7 @@ Usage: apprafter repo creds add [OPTIONS] --url-prefix <URL_PREFIX> <NAME>
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `<NAME>` | yes | Friendly name. Used as the Secret's `metadata.name` (DNS-1123) and surfaces in `apprafter repo creds list` |
+| `<NAME>` | yes | Friendly name. Used as the `SourceCredential`'s `metadata.name` (DNS-1123) and surfaces in `apprafter repo creds list` |
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
@@ -107,7 +107,7 @@ apprafter repo creds remove <name> --force
 
 ### `apprafter repo creds rotate`
 
-Rotate a creds entry's token in-place. Patches the existing Secret rather than recreating it — Argo CD repo-server holds a cached reference to the Secret's resourceVersion and a recreate would cause a brief reconnect window
+Rotate a creds entry's token in-place. Re-seals the material under the same name, leaving the `SourceCredential`'s spec (and therefore its coverage) untouched, so the change is not a gated one; the operator re-derives the Argo CD repo-cred and the pull-secret on its next reconcile
 
 ```text
 Usage: apprafter repo creds rotate [OPTIONS] <NAME>

@@ -150,14 +150,37 @@ runs, consult the alternatives list in the error body and pass
 
 ### `apprafter::state::corrupt`
 
-`<cwd>/.apprafter/state.json` failed to parse. The file was
-written by a previous `apply` / `import` and may have been
-hand-edited or copied across incompatible CLI versions.
+A target's `state.json` failed to parse. The file was written by a
+previous `apply` / `import` and may have been hand-edited or copied
+across incompatible CLI versions.
+
+**Where it is.** State is per **target**, not per directory:
+
+```text
+<config-root>/state/<target>/.apprafter/state.json
+```
+
+where `<config-root>` is `APPRAFTER_CONFIG_DIR` if set, else
+`$XDG_CONFIG_HOME/apprafter` (`~/.config/apprafter`). The error's own
+summary line prints the exact path — `state file at <path>: <message>`
+— and that path is the one to act on.
+
+Two stale pointers to ignore. The diagnostic's `help:` text still
+describes the pre-v0.1.154 layout ("the local `.apprafter/state.json`
+file"), and so did this page; that per-cwd file is now only a legacy
+artefact, moved into the per-target slot on first use and never written
+again. Deleting a `.apprafter/` directory in your project fixes
+nothing — the file that failed to parse is under the config root.
 
 **Fix.** If the file looks salvageable, edit it by hand. Otherwise
-delete `.apprafter/` and run `apprafter import` — the
-`apprafter=true` Hetzner label is the canonical idempotency
-anchor, so `import` rebuilds state from live API objects.
+delete that target's state directory and run `apprafter import` — the
+`apprafter=true` Hetzner label is the canonical idempotency anchor, so
+`import` rebuilds state from live API objects:
+
+```sh
+rm -rf "${APPRAFTER_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/apprafter}/state/<target>"
+apprafter import --target <target>
+```
 
 ### `apprafter::target::invalid_config`
 
@@ -272,10 +295,22 @@ attempt blocked on the kernel's default TCP connect timeout
 
 If you see `> 60 s` consistently on `k3s-ready`:
 
-- Re-run with `RUST_LOG=debug,kubeconfig=trace apprafter up` to
-  see each attempt's error message. The most common failure is
-  `cat: /etc/rancher/k3s/k3s.yaml: No such file` — that means
-  SSH works but k3s hasn't written the file yet; just wait.
+- **Read the spinner — the reason is already on it.** Every failed
+  attempt rewrites the progress line to `attempt <n> — k3s not ready
+  yet (<error>); next retry in <s>s`, and logs the same at `WARN`,
+  which the default log level already shows. The most common one is
+  `cat: /etc/rancher/k3s/k3s.yaml: No such file` — SSH works but k3s
+  hasn't written the file yet; just wait. The other is `apiserver
+  <addr> not accepting connections yet`, which is the second gate: the
+  file exists but `:6443` isn't up.
+- For more than that, raise the level **by crate**:
+  `RUST_LOG=apprafter=debug,cli_providers=debug apprafter up`. Those
+  are the target names the CLI logs under (`apprafter`, `cli_core`,
+  `cli_state`, `cli_providers`); a directive naming anything else —
+  `kubeconfig=trace`, say — matches no target and silently enables
+  nothing, and because `RUST_LOG` **replaces** the default filter
+  rather than adding to it, such a directive on its own turns the
+  logging off instead of up.
 - Confirm the Hetzner Cloud Firewall has port 22 open
   (`apprafter doctor` sanity-checks DNS + reachability, not
   port-level connectivity).
@@ -323,12 +358,40 @@ The common ones:
 
 ### SSH key rejected or `ssh-key path` FAIL {#ssh-key}
 
-`apprafter doctor` reports `✗ SSH public key readable` when the
-path passed to `target add --ssh-key` doesn't exist or isn't a
-public key. Point it at a real `*.pub` file (e.g.
-`~/.ssh/id_ed25519.pub`, not the private key) and re-add the
-target. The key is injected into the node at provision time, so a
-change only takes effect on the next `apply`/`up`.
+Point `--ssh-key` at a real **public** key file (e.g.
+`~/.ssh/id_ed25519.pub`, not the private key). The key is injected into
+the node at provision time, so a change only takes effect on the next
+`apply` / `up` — re-add the target with `--force --ssh-key <path>`
+first.
+
+**What checks what, exactly** — because the obvious check does less
+than it looks:
+
+- `apprafter target add --ssh-key <path>` **refuses at add time** if
+  the path does not exist: `SSH key path '<path>' does not exist`
+  (code `apprafter::cli::other`). So a bad path never gets stored in
+  the first place.
+- `apprafter doctor`'s check is named **`SSH key readable`** — not
+  "SSH public key readable" — and that is all it verifies. It FAILs
+  when the stored path has since disappeared or cannot be read, and
+  otherwise PASSes, printing the file's first whitespace-delimited
+  token as the algorithm. It does **not** validate that the file is a
+  public key: pointed at a file containing `not-a-key` it reports
+
+    ```text
+      ✓ SSH key readable (/path/to/fake.pub (not-a-key))
+    ```
+
+    and pointed at a *private* key it passes just as happily, printing
+    `✓ SSH key readable (…/id_ed25519 (-----BEGIN))`. A green tick here
+    means "a file is there", not "the key is right".
+- With no key configured at all the check is a **WARN**, `SSH key path
+  configured`, not a FAIL — provisioning is what refuses.
+
+So if provisioning fails on SSH and `doctor` is green, compare the
+stored path's contents against the key the node actually has: `head -c
+20 <path>` should start with `ssh-ed25519` / `ssh-rsa` / `ecdsa-`, not
+`-----BEGIN`.
 
 ### App stuck on `ImagePullBackOff` (registry auth) {#registry-auth}
 

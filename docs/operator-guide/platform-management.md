@@ -176,17 +176,64 @@ apprafter platform unfreeze cilium
 
 If Argo CD itself becomes unable to reconcile — a corrupted
 ConfigMap, a stale chart, or a pod-eviction loop that the normal
-upgrade path cannot resolve — use the rescue command:
+upgrade path cannot resolve — the rescue command re-runs the whole
+`cluster-bootstrap` loader path against the active target.
+
+**Know what it moves before you run it.** This is not an Argo CD
+reinstall; it is the initial bootstrap again, on a cluster that is
+already serving traffic:
+
+- **Cilium** — `helm upgrade --install cilium cilium/cilium` into
+  `kube-system`, the CNI under every pod on the node. (It is skipped
+  when the release already matches the loader's fingerprint, so a
+  no-drift cluster is a no-op here — but a cluster whose Cilium values
+  have moved gets a real upgrade of its CNI.)
+- **Argo CD** — `helm upgrade --install argocd argo/argo-cd`, then a
+  wait for `argocd-server` to become Available.
+- **The AppProjects, the root `platform` Application, and the
+  `PlatformStack/default` singleton** — re-applied server-side with
+  field manager `apprafter-cli` **and `--force-conflicts`**.
+
+That last one has a consequence the command does not spell out: the
+re-applied `PlatformStack` carries the bootstrap defaults, and
+`--force-conflicts` means it takes ownership of those fields from
+whoever set them. Verified against a live apiserver, a rescue **resets**:
+
+| Field | Back to |
+| --- | --- |
+| `spec.channel` | `stable` |
+| `spec.autoUpgrade` | `true` on tier 1 (`false` on other tiers) |
+| `spec.source.upstream` / `.repoURL` / `.checkInterval` | the shipped defaults (`oci://ghcr.io/apprafter/platform-stack`, `6h`) |
+
+`spec.pin` and everything you added under `spec.values` — registered
+domains, the egress profile — are **not** in the applied set and
+survive (checked, both). If you run on `beta`, or deliberately turned
+`autoUpgrade` off, set them again after the rescue and confirm with
+`apprafter platform status`.
+
+And the whole platform goes noisy while it converges. The command says
+so itself, on the confirmation prompt:
+
+> Emergency rescue: re-run the loader's cluster-bootstrap path against
+> the active target. This will apply the upstream Cilium / Argo CD /
+> CRDs / operator manifests as in the initial bootstrap — all
+> AppRafter-managed Applications will lose their current Sync/Healthy
+> state for a few reconcile cycles.
+
+(The CRDs and the operator in that sentence are not installed by the
+command itself — they come back through the chart's child Applications
+once the root Application syncs. The loader waits for each CRD to reach
+`Established` before it applies the `PlatformStack`, which is why a
+rescue can sit for a while on a cluster whose Argo CD is unhappy.)
 
 ```sh
-apprafter platform rescue --yes
+apprafter platform rescue          # prompts; answering no cancels
+apprafter platform rescue --yes    # required in a non-interactive shell
 ```
 
-This re-runs the `cluster-bootstrap` loader path (Argo CD Helm
-install) against the active target. After Argo CD is running again,
-the root Application resumes normal platform-stack reconciliation.
-The command requires explicit confirmation because it overwrites the
-live Argo CD installation.
+Without `--yes` on a non-TTY the command refuses rather than prompting
+into a void. After Argo CD is running again, the root Application
+resumes normal platform-stack reconciliation.
 
 ## Fork support
 

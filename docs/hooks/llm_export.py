@@ -265,17 +265,21 @@ def _section_pages(
 def _dir_audiences() -> dict[str, str]:
     """Map a source directory to the audience of the nav group it sits in.
 
-    This is how a page outside the nav still gets a sensible audience:
-    ``contributing/README.md`` is ``not_in_nav``, but its directory
-    holds three pages that are in the *Contributing* group, so it
-    inherits ``contributing``.  Likewise every ADR record inherits from
-    ``adr/README.md``, which is the nav's *ADRs* entry — so the records
-    and their index agree instead of splitting into 'adr' and 'adrs'.
+    This is how a page outside the nav still gets a sensible audience.
+    ``not_in_nav`` in ``mkdocs.yml`` holds exactly one pattern —
+    ``adr/*`` — so the ADR records are what this map is for today: each
+    inherits from ``adr/README.md``, which is the nav's *ADRs* entry, and
+    records and index therefore agree on ``adrs`` instead of splitting
+    into 'adr' and 'adrs'.  It generalises to any future ``not_in_nav``
+    page whose directory has a nav-listed sibling; do not read a
+    directory here as evidence that some page in it is out of the nav.
 
-    The site root is excluded on purpose: it is not a section. A
-    root-level page outside the nav (``license.md``) inherits nothing
-    and falls back to :data:`_DEFAULT_AUDIENCE`, rather than claiming
-    the audience of the home page it merely sits beside.
+    The site root is excluded on purpose: it is not a section, so a
+    root-level page outside the nav would inherit nothing and fall back
+    to :data:`_DEFAULT_AUDIENCE` rather than claim the audience of the
+    home page it merely sits beside.  No page is in that position today
+    (``license.md`` sits at the root but IS in the nav, under
+    *Contributing*); the branch is a guard, not a description.
     """
     mapping: dict[str, str] = {}
     for item, pages in _groups:

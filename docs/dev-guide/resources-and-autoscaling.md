@@ -12,13 +12,45 @@ whether your manifest carries a `resources` block.
 
 | Your manifest | What the container asks for | Right-sizing |
 | --- | --- | --- |
-| **no** `resources` | the platform's values: requests `cpu: 25m`, `memory: 32Mi`; limits `memory: 512Mi`; no CPU limit | **on** — the platform observes the pod and corrects its *requests* on the live pod, without a restart |
-| **any** `resources` | exactly what you wrote, and nothing else | **off** for that application in that environment — the numbers are yours |
+| **no** `resources` | the platform's values: requests `cpu: 25m`, `memory: 32Mi`; limits `memory: 512Mi`; no CPU limit | **observed and reported**; see the note below — the *applying* half does not run on the shipped release |
+| **any** `resources` | exactly what you wrote, and nothing else | **off** for that application in that environment — no autoscaler object at all |
 
 The second row is the part that surprises people: the block is not a
 set of hints the platform refines. Writing it is how you say "I own
 these numbers", and the automatic correction stops for that
 application.
+
+!!! warning "Right-sizing observes but does not apply, on the shipped release"
+
+    The autoscaler ships in three parts. The **recommender** runs and does
+    its job: recommendations are computed, written to the
+    `VerticalPodAutoscaler`, and mirrored onto your application's status,
+    so everything under
+    [Seeing what it decided](#seeing-what-it-decided) works.
+
+    The **updater** and the **admission controller** — the two that would
+    actually change a pod — do not start. The platform passes them
+    `--feature-gates=InPlaceOrRecreate=true`
+    (`platform-stack/cue/component_vpa.cue:58` and
+    `platform-stack/cue/component_vpa.cue:87`), and the version it
+    pins rejects that name outright:
+
+    ```console
+    $ podman run --rm registry.k8s.io/autoscaling/vpa-updater:1.7.1 \
+        --feature-gates=InPlaceOrRecreate=true
+    invalid argument "InPlaceOrRecreate=true" for "--feature-gates" flag: unrecognized feature gate: InPlaceOrRecreate
+    ```
+
+    (Same for `vpa-admission-controller:1.7.1`. The chart is pinned at
+    `vertical-pod-autoscaler` 0.11.0, whose `appVersion` is `1.7.1`.)
+    Both Deployments therefore crash-loop, and because the mutating webhook
+    is registered `failurePolicy: Ignore`, nothing anywhere fails loudly —
+    pods are simply created with the Deployment's `32Mi` and keep it.
+
+    **So, today:** read the recommendation, act on it yourself with an
+    explicit `resources` block. Do not plan capacity on the assumption that
+    a request will be corrected upward for you. This is being tracked as a
+    platform defect — the fix is not a change you can make from a manifest.
 
 The design behind the automatic half is
 [ADR 0054](https://github.com/apprafter/apprafter/blob/master/docs/adr/0054-vpa-vertical-autoscaling.md);
@@ -50,10 +82,11 @@ Three things follow from that, and all three are deliberate:
   problem](#when-512mi-is-the-problem)* below — this is the one case
   where the default is not enough and you have to act.
 
-The 32Mi request is a starting point, not a verdict: on a cluster where
-the automatic right-sizing is enabled — it is, unless somebody turned
-it off — the live pod's request is corrected to what the application
-actually uses, once the platform has watched it run.
+The 32Mi request is a starting point, not a verdict: the platform
+watches the pod and works out what it actually needs. On the shipped
+release that number is *reported* rather than applied (the warning
+above), so treat it as a measurement you act on — the live pod keeps
+its 32Mi until you write a `resources` block.
 
 ## Setting an explicit request and limit
 
@@ -186,11 +219,12 @@ is empty.
 
 An application with no `resources` gets a `VerticalPodAutoscaler`
 alongside its Deployment, and it is configured narrowly. Read as
-"what may change":
+"what may change" — with the standing caveat that the applying half is
+down on the shipped release, so today nothing in the first row happens:
 
 | Setting | Value | What it means for you |
 | --- | --- | --- |
-| update mode | `InPlace` | The request on the **running pod** is changed where it stands. No eviction, no restart, no rollout. If the node cannot fit the new request the change is deferred and retried rather than forced. |
+| update mode | `InPlace` | The request on the **running pod** would be changed where it stands. No eviction, no restart, no rollout. If the node cannot fit the new request the change is deferred and retried rather than forced. (Requires the updater, which does not currently start.) |
 | controlled values | `RequestsOnly` | Only **requests** are ever touched. Your limits — or the platform's `512Mi` — are never rewritten. |
 | controlled resources | `cpu`, `memory` | Nothing else is autoscaled, `ephemeral-storage` included. |
 | floor | `cpu: 25m`, `memory: 32Mi` | The platform's own starting values: the request is never corrected below them. |
@@ -203,15 +237,34 @@ Two consequences worth carrying:
 platform renders `32Mi` into the Deployment template and the autoscaler
 edits the *pod*; they are different fields and neither reverts the
 other. `kubectl describe deployment` is therefore the wrong place to
-look — read the pod, as below.
+look — read the pod, as below. (While the updater is down the pod reads
+`32Mi` too; the difference between the two only becomes visible once
+the applying half runs.)
 
-**It only runs where the autoscaler is installed.** It is part of the
-platform and on by default; if it is missing, applications simply stay
-at the starting values and no recommendation is ever reported. To
-check:
+**It only runs where the autoscaler is installed** — and "installed"
+is not one question but two. The CRD being present says the component
+was rendered; it says nothing about whether the three controllers are
+up. Ask both:
 
 ```sh
+# 1. Is the component installed at all?
 kubectl get crd verticalpodautoscalers.autoscaling.k8s.io
+
+# 2. Are its controllers actually running? This is the load-bearing one.
+kubectl -n vpa get pods
+```
+
+On the shipped release the second command is the one that tells the
+truth: the `…-recommender` pod is `Running`, while the `…-updater` and
+`…-admission-controller` pods sit in `CrashLoopBackOff` — the
+feature-gate defect in the warning at the top of this page. The first
+command passes in exactly that state, which is why it cannot be the
+test.
+
+```sh
+# Why a controller is down, when it is. The label is stable; the
+# Deployment name carries the Helm release prefix.
+kubectl -n vpa logs -l app.kubernetes.io/component=updater --tail=5
 ```
 
 ## Seeing what it decided
@@ -247,8 +300,9 @@ has no autoscaler; the pod has not been observed long enough for a
 recommendation to exist yet; or the autoscaler is not installed on the
 cluster.
 
-To see what is actually in effect right now — the corrected request on
-the live pod, which is what the scheduler reserves for it:
+To see what is actually in effect right now — the request on the live
+pod, which is what the scheduler reserves for it (and which, until the
+updater runs, is still the `32Mi` the Deployment asked for):
 
 ```sh
 kubectl -n apprafter get pod -l apprafter.io/application=reporting \
@@ -341,6 +395,12 @@ using its default. The three modes:
 | `up-only` | Corrects **up** only. A request that has been raised is never brought back down on a running pod, so nothing is reclaimed. |
 | `off` | Keeps observing and keeps reporting recommendations; changes no pod. |
 
+On the shipped release all three behave like `off`, because the two
+components that change pods do not start (the warning at the top of
+this page). The mode is still worth setting correctly — it is what the
+cluster will do the moment that is fixed — but changing it today
+changes nothing you can observe.
+
 ```sh
 apprafter platform autoscale set up-only
 apprafter platform autoscale set off
@@ -352,7 +412,9 @@ An invalid mode is rejected before the cluster is contacted:
 × invalid autoscale mode 'bogus' (expected full|up-only|off)
 ```
 
-> **`off` freezes, it does not restore.** Pods already corrected keep
+> **`off` freezes, it does not restore.** (Read this for the day the
+> applying half runs; with no pod ever corrected, there is nothing to
+> freeze today.) Pods already corrected keep
 > the sizes they have; the next deploy or pod recreation puts each one
 > back to the platform's `32Mi` starting request, because that is what
 > the Deployment template has always said. If you are switching to `off`

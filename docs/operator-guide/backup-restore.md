@@ -15,9 +15,38 @@ There are three commands:
 
 | Command | Captures | Encrypted | Replays |
 | --- | --- | --- | --- |
-| `apprafter export` | native data only (pg dumps, volume tars, redis snapshots) + `manifest.json` | no | no — a plain folder for inspection / migrate-out |
-| `apprafter backup create` | native data **plus** config/app CRs **plus** decrypted user secrets | yes (restic) | via `apprafter restore` |
+| `apprafter export` | native data only — pg dumps and volume tars + `manifest.json`. **No redis** (see below) | no | no — a plain folder for inspection / migrate-out |
+| `apprafter backup create` | the same native data **plus** config/app CRs **plus** decrypted user secrets | yes (restic) | via `apprafter restore` |
 | `apprafter restore` | — | — | replays a `backup` into a running target cluster |
+
+!!! danger "Redis contents are not backed up, and not restored"
+
+    Neither `export` nor `backup create` captures the contents of a
+    `needs.redis` claim, and `restore` does not put any back. Both ends are
+    a log line and nothing else:
+
+    - the extractor's redis arm prints
+      `info: redis extraction for claim <ns>/<claim> deferred to T12 — skipping`
+      and writes no file (`cli/backup-core/src/extract.rs:217`) — so the
+      `redis/` directory in the layout below is never created;
+    - the restore's redis step prints
+      `info: redis restore for namespace <ns> deferred to T12 (Dragonfly RDB) — skipping`
+      (`cli/platform-cli/src/commands/restore.rs:1046`).
+
+    A restore therefore re-provisions each redis claim **empty**: the claim
+    goes `Ready`, the connection Secret is fresh, and every key that was in it
+    is gone. The end-to-end harness matches — it asserts the redis claim comes
+    back `Ready` and that a **pg** row survived, and says so in a comment
+    rather than claiming a redis round-trip
+    (`e2e/backup-s3-sequential-kind.sh:716`).
+
+    **What to do about it.** Treat redis as rebuildable-from-source until this
+    lands: a cache, a queue you can drain before the migration, a session store
+    you can afford to empty. Data you cannot lose belongs in `needs.pg` or
+    `needs.disk`, both of which are captured and replayed. Note also that a
+    non-persistent (`persistent: false`) redis claim is not even considered for
+    capture — only `persistent: true` claims reach the skipped step
+    (`cli/backup-core/src/extract.rs:101`).
 
 The full design rationale is in
 [ADR 0050](https://github.com/apprafter/apprafter/blob/master/docs/adr/0050-backup-restore.md).
@@ -50,9 +79,11 @@ The layout:
 apprafter-export/
   pg/<ns>/<claim>.dump          # pg_dump -Fc (custom format)
   volumes/<ns>/<claim>/data.tar # tar of the volume contents
-  redis/<ns>/<claim>/           # documented skeleton
   manifest.json                 # cluster id, platformVersion, namespaces, resources
 ```
+
+A `redis/` directory appears in the code's layout comment but is never
+written — see the warning above.
 
 The pg dumps are standard PostgreSQL custom-format archives: open them with
 any matching `pg_restore`, e.g. `pg_restore -l pg/demo/shop-pg.dump` to list
@@ -204,8 +235,9 @@ Two behaviours are load-bearing:
   newly-provisioned one, not whatever owned the objects on the source.
 - **Volumes** are restored by streaming the tar on stdin to `tar x` in a
   helper pod that mounts the fresh PVC read-write.
-- **Redis** restore is a documented skeleton today and is exercised in the
-  live end-to-end run.
+- **Redis** is **not** restored — the step logs a skip and moves on, and there
+  is nothing in the artifact for it to load anyway. The claim is re-provisioned
+  empty. See the warning at the top of this page.
 
 ### Secrets are re-sealed for the target
 
@@ -462,8 +494,8 @@ compensating provider controls (object versioning / object lock).
 > do not. If your provider cannot express it and you decline to hand the cluster
 > full delete, issue a credential with **no** Delete at all: `backup` still
 > works (restic uses non-exclusive locks), but the in-cluster `check` cannot
-> drop its own lock — set `--check-cron off` to disable the in-cluster check and
-> run `apprafter backup check` operator-side instead. Verify your provider's
+> drop its own lock — [park the in-cluster check](#parking-the-in-cluster-check)
+> and run `apprafter backup check` operator-side instead. Verify your provider's
 > behavior — the Verify checklist below has a step for confirming it.
 
 > **Hetzner Object Storage (the flagship provider) — branch (a), verified.**
@@ -556,8 +588,53 @@ the in-cluster **`apprafter-backup-check` CronJob** runs weekly (default
 `0 6 * * 0`). By default it verifies structure only; `--read-data` re-downloads
 and re-hashes **every** pack for a deep verify (slower, bandwidth-heavy). Run the
 operator-side `check` when your provider can't express the scoped-delete policy
-and you disabled the in-cluster check (`--check-cron off`), or any time you want
-a manual verification with full credentials.
+and you have [parked the in-cluster check](#parking-the-in-cluster-check), or any
+time you want a manual verification with full credentials.
+
+#### Parking the in-cluster check
+
+There is **no off switch** for the weekly check today. `--check-cron` takes a
+five-field cron and nothing else: whatever you pass is written verbatim to
+`PlatformStack.spec.backup.checkSchedule` (`spec.backup.checkSchedule` is an
+unconstrained string in the CRD) and rendered verbatim into the CronJob's
+`schedule:` field
+(`platform-stack/cue/render_tool.cue:538`). A word like `off` is not handled
+anywhere in the CLI — it reaches the apiserver and is rejected:
+
+```console
+$ kubectl apply -f apprafter-backup-check.yaml
+The CronJob "apprafter-backup-check" is invalid: spec.schedule: Invalid value: "off": expected exactly 5 fields, found 1: [off]
+```
+
+which fails the platform-stack sync and leaves the whole backup component
+`OutOfSync` — the opposite of what you wanted.
+
+Two things that do work:
+
+- **Give it a schedule that never comes.** The 31st of February is a valid
+  five-field cron and no date ever matches it, so the CronJob exists, is
+  Synced, and never fires:
+
+    ```sh
+    apprafter backup enable --bucket s3:… --credential apprafter-backup-s3 \
+                            --check-cron "0 6 31 2 *" --i-have-saved-credentials
+    ```
+
+    (verified against a Kubernetes apiserver: `schedule: "0 6 31 2 *"` is
+    accepted and stored as written.)
+
+- **Or edit `PlatformStack.spec.backup.checkSchedule` in your infra repo** to
+  the same value, if the backup block is git-managed.
+
+Do **not** reach for `kubectl patch cronjob apprafter-backup-check
+--patch '{"spec":{"suspend":true}}'`. The CronJob is chart-owned and the
+platform components sync with `selfHeal: true`
+(`platform-stack/cue/platform.cue:112`), so Argo CD reverts the suspend on
+its next reconcile.
+
+Whichever you choose, run `apprafter backup check` operator-side on your own
+cadence — parking the in-cluster check means nothing verifies the repository
+until you do.
 
 > **Where check failures surface.** The weekly in-cluster check runs `restic`
 > directly (the runner binary has no check-only mode), so a failed check shows
@@ -631,8 +708,9 @@ the design's Verify items:
   credential can delete an object under `locks/*` but is **refused** deleting an
   object under `data/` (or `snapshots/`). If the deny doesn't hold, your
   provider can't express the append-only guarantee — fall back to
-  `enforce: cluster` with provider object-lock, or to the no-delete +
-  `--check-cron off` variant.
+  `enforce: cluster` with provider object-lock, or to the no-delete variant
+  with the in-cluster check
+  [parked](#parking-the-in-cluster-check).
 - **A minimal end-to-end.** `apprafter backup enable` → wait for (or
   trigger) one backup Job → `apprafter backup status` shows a fresh
   `lastSuccess` → `apprafter restore s3:… --reprovision` into a **throwaway**
