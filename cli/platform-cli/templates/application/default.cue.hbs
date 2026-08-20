@@ -3,12 +3,12 @@
 //
 // This is your code under your license — feel free to add
 // your own SPDX-License-Identifier header on top. The CMP
-// plugin renders this file at sync time; `cue vet ./apprafter/
-// ...` catches typos locally before you push (the AppRafter
-// v1alpha1 schemas are vendored under `apprafter/cue.mod/pkg/`,
-// so neither a network call nor a `cue mod tidy` step is
-// needed). Argo CD's apiserver validates the rendered CR
-// against the AppRafter CRD on apply.
+// plugin renders this file at sync time. Check it locally with
+// `apprafter app validate`, which lays out a workspace and
+// injects the AppRafter v1alpha1 schemas for you — a bare
+// `cue vet` here fails, because nothing is vendored beside this
+// file. Argo CD's apiserver validates the rendered CR against
+// the AppRafter CRD on apply.
 
 package apprafter
 

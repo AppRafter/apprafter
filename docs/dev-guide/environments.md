@@ -388,6 +388,30 @@ apprafter app remove <app> --env <old-env> --yes
 apprafter app add --env <new-env> --namespace <namespace>
 ```
 
+!!! danger "The data does not move with the deployment"
+
+    Replacing a deployment replaces its dependencies too. Removing the
+    old one deletes its `ResourceClaim`s, and the new one provisions
+    fresh, empty ones — a `needs.pg` database in the new environment
+    starts with no rows in it.
+
+    What happens to the old data: a finalizer snapshots each claim into
+    an immutable `RetainedClaim` and holds the database and its role for
+    **seven days**. After that the collector drops the role, the
+    database, the password Secret and the snapshot. So the window to
+    recover anything is a week, and nothing warns you when it closes.
+
+    `--keep-data` is not the answer here. It strips the cascade
+    finalizer so the removal does not prune the synced AppRafter
+    resource — which keeps the old environment's workload running, no
+    longer managed by Argo CD. That is useful when you intend to
+    re-attach data after a teardown; it is not a way to carry data from
+    one environment to another.
+
+    **If the new environment needs the old data, move it yourself
+    before removing anything** — take a dump from the old database and
+    load it into the new one once its claim is `ready`.
+
 Editing the `spec.environments.staging` block and pushing, on the other
 hand, needs no CLI step at all: Argo CD syncs the change and the
 operator re-renders that deployment. Only the *choice* of environment is

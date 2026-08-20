@@ -747,10 +747,13 @@ pub enum AppCommand {
         /// `<git-url>` without cwd context.
         #[arg(long)]
         branch: Option<String>,
-        /// Path under the repo to render. Defaults to `/` —
-        /// matches the cue-cmp plugin's `discover.find.glob:
-        /// **/apprafter*.cue` rule (sidecar walks the entire
-        /// repo for matching files when path is `/`).
+        /// Path under the repo to render. Defaults to `/`, which
+        /// lets the cue-cmp plugin walk the whole repository: its
+        /// discovery command matches any `.cue` file under an
+        /// `apprafter/` directory, or any file named
+        /// `apprafter*.cue` anywhere. Both shapes work — the
+        /// scaffolded `apprafter/Application.cue` is matched by the
+        /// first.
         #[arg(long, default_value = "/")]
         path: String,
         /// AppProject the Application joins. Default `apps`

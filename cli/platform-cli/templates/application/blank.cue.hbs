@@ -6,10 +6,10 @@
 // your own SPDX-License-Identifier header on top. Every
 // field below carries a TODO; fill them in before
 // committing. The CMP plugin renders this file at sync
-// time, and `cue vet ./apprafter/...` catches typos locally
-// before you push (the AppRafter v1alpha1 schemas are
-// vendored under `apprafter/cue.mod/pkg/`, so neither a
-// network call nor a `cue mod tidy` step is needed).
+// time. Check it locally with `apprafter app validate`, which
+// lays out a workspace and injects the AppRafter v1alpha1
+// schemas for you — a bare `cue vet` here fails, because
+// nothing is vendored beside this file.
 
 package apprafter
 

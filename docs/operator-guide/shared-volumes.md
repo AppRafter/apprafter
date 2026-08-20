@@ -287,8 +287,8 @@ apprafter app remove reader --yes
 apprafter volume rm shared-uploads --namespace apps
 ```
 
-> The two verbs are spelled differently on purpose. `app remove` accepts
-> `rm` as an alias; `volume` has only `rm`, and spelling it `remove`
+> The two verbs are spelled differently on purpose. `apprafter app remove`
+> accepts `apprafter app rm` as an alias; `volume` has only `rm`, and spelling it `remove`
 > there is an unrecognised subcommand (clap suggests `rm`). Both refuse
 > to act without `--yes` in a non-interactive shell. Note the explicit
 > `--namespace apps` on every `volume` line above — without it they act

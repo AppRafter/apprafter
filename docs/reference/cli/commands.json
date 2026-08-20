@@ -166,7 +166,7 @@
           "env": null,
           "required": false,
           "possible_values": [],
-          "help": "Path under the repo to render. Defaults to `/` — matches the cue-cmp plugin's `discover.find.glob: **/apprafter*.cue` rule (sidecar walks the entire repo for matching files when path is `/`)"
+          "help": "Path under the repo to render. Defaults to `/`, which lets the cue-cmp plugin walk the whole repository: its discovery command matches any `.cue` file under an `apprafter/` directory, or any file named `apprafter*.cue` anywhere. Both shapes work — the scaffolded `apprafter/Application.cue` is matched by the first"
         },
         {
           "id": "project",
