@@ -1,6 +1,6 @@
 ---
 title: "apprafter destroy"
-description: "Destroy infrastructure managed by this state"
+description: "Destroy every `apprafter=true`-labelled resource in the provider project the token belongs to — servers, floating IPs, firewalls, networks and SSH keys"
 audience: reference
 status: stable
 ---
@@ -9,7 +9,11 @@ status: stable
 
 # `apprafter destroy`
 
-Destroy infrastructure managed by this state
+Destroy every `apprafter=true`-labelled resource in the provider project the token belongs to — servers, floating IPs, firewalls, networks and SSH keys.
+
+NOT scoped to one cluster. The label is the only filter; no cluster name is consulted. If a second AppRafter cluster lives in the same project, this deletes that one too. `--target` selects the state file and the token, never what gets deleted — and `HCLOUD_TOKEN` outranks the stored token, so the environment decides which project is swept.
+
+To remove one machine while another stays, put them in separate provider projects (each target with its own token), or delete the server by ID in the provider console.
 
 ```text
 Usage: apprafter destroy [OPTIONS]
@@ -17,8 +21,8 @@ Usage: apprafter destroy [OPTIONS]
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--target` | — | — | no | Override the active target for the credential resolution chain (see `apprafter apply --target`) |
-| `--yes` | flag | — | no | Confirm without prompting |
+| `--target` | — | — | no | Override the active target for the credential resolution chain (see `apprafter apply --target`). Selects the state file and the token only — it does NOT narrow what is deleted |
+| `--yes` | flag | — | no | Confirm without prompting. Read the command description first: the sweep covers the whole project, not one cluster |
 
 Examples:
 

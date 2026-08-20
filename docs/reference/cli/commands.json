@@ -1477,8 +1477,8 @@
         "destroy"
       ],
       "aliases": [],
-      "about": "Destroy infrastructure managed by this state",
-      "long_about": null,
+      "about": "Destroy every `apprafter=true`-labelled resource in the provider project the token belongs to — servers, floating IPs, firewalls, networks and SSH keys",
+      "long_about": "Destroy every `apprafter=true`-labelled resource in the provider project the token belongs to — servers, floating IPs, firewalls, networks and SSH keys.\n\nNOT scoped to one cluster. The label is the only filter; no cluster name is consulted. If a second AppRafter cluster lives in the same project, this deletes that one too. `--target` selects the state file and the token, never what gets deleted — and `HCLOUD_TOKEN` outranks the stored token, so the environment decides which project is swept.\n\nTo remove one machine while another stays, put them in separate provider projects (each target with its own token), or delete the server by ID in the provider console.",
       "usage": "Usage: apprafter destroy [OPTIONS]",
       "hidden": false,
       "examples": [
@@ -1496,7 +1496,7 @@
           "env": null,
           "required": false,
           "possible_values": [],
-          "help": "Override the active target for the credential resolution chain (see `apprafter apply --target`)"
+          "help": "Override the active target for the credential resolution chain (see `apprafter apply --target`). Selects the state file and the token only — it does NOT narrow what is deleted"
         },
         {
           "id": "yes",
@@ -1508,7 +1508,7 @@
           "env": null,
           "required": false,
           "possible_values": [],
-          "help": "Confirm without prompting"
+          "help": "Confirm without prompting. Read the command description first: the sweep covers the whole project, not one cluster"
         }
       ],
       "positionals": []

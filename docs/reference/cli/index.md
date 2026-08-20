@@ -58,7 +58,7 @@ specific release rather than scraping these pages.
 | [`apprafter bootstrap-all`](bootstrap-all.md) | `up` | One-command provisioning: runs `apply` → polls for the k3s kubeconfig to become SSH-reachable → runs `cluster-bootstrap` for a freshly-provisioned cluster. |
 | [`apprafter cluster-bootstrap`](cluster-bootstrap.md) | `cb` | Install Cilium (CNI + kube-proxy replacement) and apply the Gateway API standard-install CRDs into the cluster pointed to by the cached kubeconfig |
 | [`apprafter completion`](completion.md) | — | Print a shell completion script on stdout |
-| [`apprafter destroy`](destroy.md) | — | Destroy infrastructure managed by this state |
+| [`apprafter destroy`](destroy.md) | — | Destroy every `apprafter=true`-labelled resource in the provider project the token belongs to — servers, floating IPs, firewalls, networks and SSH keys |
 | [`apprafter doctor`](doctor.md) | — | Self-diagnostic over the active target's config, credentials and reachability plus the surrounding shell environment (kubectl, helm, ssh, DNS). |
 | [`apprafter export`](export.md) | — | Native data export (Kind 1) — pull pg dumps, volume tars, redis snapshots to a plain local folder + `manifest.json`. |
 | [`apprafter import`](import.md) | — | Rebuild local state from live Hetzner Cloud resources tagged with `apprafter=true`. |
