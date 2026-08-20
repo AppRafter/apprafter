@@ -31,8 +31,17 @@ patch of each phase.
 > spec onward. Nothing re-checked it for seven subphases — the same defect
 > this track polices in every comment it reviews, applied to its own
 > roadmap. Re-derived from the shipped command tree it is **five**, closing
-> **seven** untaught leaf commands. Three more commands are deliberately
-> left undocumented, and that is a finding rather than a gap.
+> **eight** untaught leaf commands. Three commands are deliberately left
+> undocumented, and that is a finding rather than a gap.
+>
+> The eight is a measurement, and the command is the durable form of it:
+> the inventory in ADR 0057's 2.19i amendment returns **10** untaught leaf
+> commands at `0a2ba48` and **2** at this commit. A first pass wrote seven
+> by subtracting the three deliberate absences from the 10 — but only two
+> of the three are in it (`login`, `plan`); `upgrade-tier` was already
+> named in `docs/operator-guide/index.md` at `0a2ba48`, so there was never
+> a third member to subtract. Re-derive the ends, do not adjust the
+> number.
 
 ### Added
 
@@ -96,8 +105,10 @@ patch of each phase.
   record is the only local copy of the provisioned resource IDs. The
   file-layout diagram is corrected with it — `state/<target>/` was
   described as a "runtime cache. Reserved.", which it has not been since
-  state moved out of `<cwd>/.apprafter/`. Closes `target show`,
-  `target rename` and `target remove`.
+  state moved out of `<cwd>/.apprafter/`. Closes `target rename` and
+  `target remove`; `target show` was already taught in
+  `docs/operator-guide/quickstart.md` and closed no untaught leaf, but is
+  documented properly here.
 - **`docs/dev-guide/image-iteration.md`** gained `apprafter app rollback`,
   placed there because that page already teaches how a deploy happens and
   how to undo one. The distinction it turns on: a rollback moves the Git
@@ -129,7 +140,70 @@ patch of each phase.
   metrics`. The committed floor had drifted to `32/398/246/2/17/91/68/2`,
   well below the live reading, because it ratchets only on a fall — which
   meant the five new pages could have been gutted for free. Now
-  `37/566/322/5/22/104/76/2`.
+  `37/576/322/5/22/104/76/2`.
+
+### Fixed
+
+Four defects a reader, an honesty pass and an adversarial pass found in the
+five pages after they landed. Every one of them is a wrong *value*, a wrong
+*scope* or a claim about what a command prints — the class the gate cannot
+see, which is why three reviews found them and `just lint` did not.
+
+- **`apprafter destroy` is scoped to a provider project, not to a cluster,
+  and the machine guide's Route B told the reader to destroy the cluster
+  they had just built.** `HetznerCloudProvider::destroy` iterates
+  `refresh_servers()`, which filters on the `apprafter=true` label alone —
+  `self.spec.name` is never read on that path — and repeats it for floating
+  IPs, firewalls, networks and SSH keys; `--target` selects only the state
+  file and the token. Route B put a second cluster in the *same* Hetzner
+  project and then ran `apprafter destroy --yes --target <old-name>`, which
+  would have taken both. Route B now requires the new target to live in its
+  own Hetzner project with its own API token, says that this is what makes
+  the teardown safe rather than tidy, and sends a reader who must share one
+  project to the Cloud Console to delete the old server by ID. The scope
+  itself is stated where it belongs — a named `#destroy-scope` section in
+  `docs/operator-guide/target-store.md`, whose multi-cluster pattern ends in
+  `destroy --target dev` and now gives each target its own project and its
+  own token — and every other page that tells a reader to run `destroy`
+  either states the scope or links it: both quickstarts, `troubleshooting`,
+  `recovery`, `postgres`, `redis` and `persistent-disk` (whose cleanup
+  comment said "tear down the Tier-1 cluster" for a project-wide command).
+  Also recorded: `HCLOUD_TOKEN` outranks the target's stored token, so an
+  exported variable, not `--target`, decides which project is emptied.
+- **`apprafter app list` does not show the logical name**, and
+  `environments.md` named it as the place to read one. `app_row` fills the
+  NAME column from the Argo CD `metadata.name`, which `app add` sets to
+  `<name>-<env>` — so on the page's own two-environment example the column
+  reads `parser-staging` / `parser-prod` and the logical name is in no
+  column at all. The page now prints a real two-row `app list` (a
+  byte-identical transcript of the release binary), says NAME is the
+  per-environment identity and the logical name is what remains when the
+  `ENV` suffix comes off, and states where the name actually comes from:
+  `--name`, or the repository's last path segment lowercased with non-
+  `[a-z0-9-]` folded to `-` when `--name` is omitted.
+- **`apprafter app status` does not surface a webhook rejection**, and
+  `resources-and-autoscaling.md` said the sync error would name the field.
+  `status_detail_lines` prints project / repo / revision / path /
+  destination / environment / sync state / health, and `print_app_detail`
+  adds the CR phase, image, VPA recommendation, pods, services and claims —
+  nothing reads `status.operationState.message` or `status.conditions`. The
+  page now shows what `app status` really prints on a rejected app (again a
+  byte-identical transcript, `sync state: OutOfSync`), says plainly that the
+  reason is not in it, and gives the `kubectl -n argocd get
+  application.argoproj.io … -o jsonpath` that carries the message — by the
+  Argo CD application name, which is `<app>` or `<app>-<env>`.
+- **The corrected headline figure was itself un-re-derived.** Five places
+  said the work closed *seven* untaught leaf commands; it closed **eight**.
+  The seven came from subtracting the three deliberate absences from the
+  stable 10, but only two of the three (`login`, `plan`) are in that 10 —
+  `upgrade-tier` was already named in `docs/operator-guide/index.md` at
+  `0a2ba48`. All five now say eight and state the derivation rather than the
+  subtraction: the inventory command returns 10 at `0a2ba48` and 2 at the
+  close. ADR 0057's table summed to 9 and credited `target show`, which the
+  same section names two paragraphs earlier as one of the plan's extras that
+  was never a gap (it is taught twice in `docs/operator-guide/quickstart.md`
+  at `0a2ba48`); `target show` is dropped from the row and the table sums to
+  8. Documenting it again was still worth doing.
 
 ### Notes
 

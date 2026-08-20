@@ -1897,8 +1897,21 @@ is **10**. The two extras in the plan's count were `apprafter target show`
 upgrade-tier` (named in `docs/operator-guide/index.md`) — both pages lost to a
 basename collision. Neither was a gap.
 
-Of the stable 10, **three are deliberate absences** (below), so the real work
-was **seven untaught leaf commands**, and they cluster onto five capabilities:
+**The work was eight untaught leaf commands, and the durable form of that
+figure is the command, not the number.** Run the block above at both ends: it
+returns **10** at `0a2ba48` and **2** at the closing commit, and 10 − 2 = 8.
+The 2 that remain are `apprafter login` and `apprafter plan`, the two
+deliberate absences that are still absent.
+
+A first pass wrote *seven*, by subtracting the **three** deliberate absences
+from the 10 — and that is the arithmetic to distrust, because only two of the
+three are members of the 10. `upgrade-tier` was **already** named in
+`docs/operator-guide/index.md` at `0a2ba48`, so the command never listed it
+and there was nothing to subtract. Subtracting a set from a list it is not
+inside is how a corrected figure comes out wrong a second time; measuring both
+ends is how it does not.
+
+The eight cluster onto five capabilities:
 
 | Guide | Untaught leaves it closes |
 |---|---|
@@ -1906,7 +1919,13 @@ was **seven untaught leaf commands**, and they cluster onto five capabilities:
 | `docs/dev-guide/secrets.md` | `secret remove` |
 | `docs/dev-guide/environments.md` | `platform env set`, `platform env show` |
 | `docs/operator-guide/choosing-the-machine.md` | — (raises a one-mention capability to a page) |
-| `docs/operator-guide/target-store.md` + `docs/dev-guide/image-iteration.md` | `target show`, `target rename`, `target remove`, `app rollback` |
+| `docs/operator-guide/target-store.md` + `docs/dev-guide/image-iteration.md` | `target rename`, `target remove`, `app rollback` |
+
+The rows sum to 8, matching the measurement. `apprafter target show` is
+**not** among them although `target-store.md` now documents it: it was already
+taught twice in `docs/operator-guide/quickstart.md` at `0a2ba48` and is named
+two paragraphs above as one of the plan's two extras that were never gaps.
+Documenting it again was worth doing and closed no untaught leaf.
 
 The fifth row is two extensions rather than a new page, decided on content:
 `target show`/`rename`/`remove` complete the lifecycle `target-store.md`
@@ -1920,8 +1939,9 @@ first-class command shipped. That bullet is corrected in the same change.
 ### The three deliberate absences
 
 `apprafter login`, `apprafter upgrade-tier` and `apprafter plan` are
-**deliberately undocumented, and will re-appear in any future run of the
-command above.** They are not an oversight and must not be written:
+**deliberately undocumented.** Two of the three — `login` and `plan` — are
+the whole of the command's output at the closing commit and will re-appear in
+any future run of it. They are not an oversight and must not be written:
 
 - **`apprafter login`** — its own `about` opens "NOT IMPLEMENTED, it prints
   what it would do and writes nothing", and points at `apprafter kubeconfig`
@@ -1997,6 +2017,56 @@ made nine, which is a list nobody reads. It is now grouped by the job — get
 something running, describe your application, give it a dependency, ship it —
 the same idiom 2.19f gave the operator index for the same reason.
 
+### What three reviews found after the pages landed, and what it says about the gate
+
+The pages were gated green, and then read three ways — by a reader following
+each page literally with the release binary, by an honesty pass and by an
+adversarial pass. Four defects survived the gate. **Every one is a wrong
+value, a wrong scope, or a claim about what a command prints** — which is the
+whole of "the gate checks names, not truth", stated for once with evidence
+instead of as a caution.
+
+- **`apprafter destroy` is scoped to a provider project, not to a cluster,
+  and one page told a reader to destroy the cluster they had just built.**
+  `HetznerCloudProvider::destroy` iterates `refresh_servers()`, which filters
+  on the `apprafter=true` label alone — `self.spec.name` is never consulted on
+  the destroy path — and repeats that for floating IPs, firewalls, networks
+  and SSH keys; `apprafter destroy --target <name>` selects only the state
+  file and the token. `choosing-the-machine.md`'s Route B stood a second
+  cluster up **in the same Hetzner project** and then ran
+  `apprafter destroy --yes --target <old-name>`, which would have taken both.
+  Every name in that command resolves, so the gate had nothing to object to.
+  Route B now requires the new target to have a Hetzner project and token of
+  its own and says that this, not tidiness, is what makes the teardown safe;
+  the scope itself is stated once in `docs/operator-guide/target-store.md`
+  under an explicit `#destroy-scope` anchor and linked from every page that
+  tells a reader to run the command. The absent sentence — *`destroy` removes
+  every `apprafter=true`-labelled resource in the token's project, not one
+  cluster* — is what made the error possible, so it is now written down rather
+  than left to be re-derived.
+- **`apprafter app list` does not show the logical name**, though
+  `environments.md` named it as where to read one. `app_row` fills NAME from
+  the Argo CD `metadata.name`, which `build_application_manifest` sets to
+  `<name>-<env>`. Fixed with a real two-row transcript and a statement of
+  where the name comes from (`--name`, else the repository's last path
+  segment).
+- **`apprafter app status` does not surface a webhook rejection**, though
+  `resources-and-autoscaling.md` said the sync error would name the field.
+  Neither `status_detail_lines` nor `print_app_detail` reads
+  `status.operationState.message` or `status.conditions`. Fixed by keeping
+  `app status` for the signal, printing what it really outputs, and naming the
+  `kubectl … -o jsonpath` that carries the message.
+- **The corrected headline figure was itself un-re-derived** — see the section
+  above. Seven should have been eight, and the table summed to nine. A count
+  corrected once is not a count that has been measured; the durable form is
+  the command, which is why the correction above states both ends of it rather
+  than the difference.
+
+The first of the four is the one worth generalising from: it is not a typo but
+a **scope** error, and scope errors are exactly what a name-resolving gate is
+blind to. Any future page that instructs a destructive command should state
+what that command's blast radius is, in the same breath, from the source.
+
 ### Consequences
 
 - **This subphase cuts a CLI patch release, `v0.2.47`.** Not for the guides:
@@ -2007,14 +2077,15 @@ the same idiom 2.19f gave the operator index for the same reason.
   regenerated in the same commit. No chart, operator or configuration-plugin
   artefact is touched.
 - **The census grew on every axis and shrank on none.** Live gate readings,
-  `0a2ba48` → this commit: 33 → 37 pages, 427 → 566 invocations, 248 → 322
+  `0a2ba48` → this commit: 33 → 37 pages, 427 → 576 invocations, 248 → 322
   identifiers, 2 → 5 complete CUE documents in 17 → 22 `cue` fences, 104 → 104
   code paths, 70 → 76 ADR references, and the LLM artefacts 60 → 64 indexed /
   119 → 123 bundled / 119 → 123 twins. **Exemptions stayed at 2** — five new
   pages needed no escape hatch. The *committed* floor had drifted well below
   the live reading (it still said 32/398/246/2/17/91/68/2, last written before
   2.19h) because it ratchets only on a fall; `docsgen metrics` re-records it
-  here, which is what actually defends the new pages against being gutted.
+  here at `37/576/322/5/22/104/76/2`, which is what actually defends the new
+  pages against being gutted.
 - **`code_paths` did not move at all** — 104 before and 104 after. That is the
   "assume no repository checkout" rule showing up as a number: the five pages
   cite absolute GitHub URLs where they need a repository file and backtick no
@@ -2145,11 +2216,14 @@ the same idiom 2.19f gave the operator index for the same reason.
   exist only in `--help` today. Last, because every earlier package is a
   precondition for writing one that stays true. *(Delivered in 2.19i — and
   "roughly fifteen" was **wrong**: re-derived from the command tree it is
-  five, closing seven untaught leaf commands, with three more deliberately
-  left undocumented because they are not implemented. See the 2.19i amendment
-  above for the corrected inventory command, why the original produced three
-  different answers, the three deliberate absences, and the contradictions
-  between guides written in parallel.)*
+  five, closing eight untaught leaf commands — the inventory command returns
+  10 at `0a2ba48` and 2 at the close. Three commands stay undocumented on
+  purpose because they are not implemented (`login`, `plan`, `upgrade-tier`),
+  but only two of them are in that 10: `upgrade-tier` was already *named as
+  absent* in the operator index at `0a2ba48`, and the check is a mention
+  test. See the 2.19i amendment above for the corrected inventory command,
+  why the original produced three different answers, the deliberate
+  absences, and the contradictions between guides written in parallel.)*
 
 ## Owner
 
