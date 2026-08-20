@@ -57,10 +57,27 @@ Key rules enforced by the admission webhook:
 | A referenced disk does **not** count toward the `replicas > 1` block | Owned disks block multiple replicas (`RWO` cannot be held by two pods on two nodes). A `ref` disk does not, because the SharedVolume's PVC is not this Application's to manage. |
 
 SharedVolume **existence** is checked by the controller, not the webhook. The
-webhook is stateless and only validates shape. If a referenced
-`SharedVolume` does not exist yet, the Application controller sets an
-`AwaitingSharedVolume` condition and pauses the reconcile until the volume
-appears.
+webhook is stateless and only validates shape. A `ref` disk makes the
+Application controller emit an ordinary `shared-disk` `ResourceClaim`, so the
+Application is held by the same `AwaitingResourceClaim` gate every other
+dependency uses. What names the *reason* is the claim: while the referenced
+`SharedVolume` is absent — or present but not yet `status.ready` — the
+provisioner publishes `Ready=False` on that claim with reason
+`AwaitingSharedVolume` and requeues every 30s. So the diagnostic lives one
+level down:
+
+```sh
+kubectl -n apps get resourceclaim.apprafter.io -o \
+  jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.type}{" "}{.status.conditions[?(@.type=="Ready")].reason}{"\n"}{end}'
+# -> <claim> shared-disk AwaitingSharedVolume
+#    message: "SharedVolume shared-uploads not ready"
+```
+
+The reference claim carries the label `apprafter.io/shared-volume=<ref>`,
+which is also how the volume's own `refCount` is computed — so
+`kubectl -n apps get resourceclaim.apprafter.io -l
+apprafter.io/shared-volume=shared-uploads` lists exactly the claims that
+`REFS` counts.
 
 ## Trust-group model
 
@@ -75,6 +92,14 @@ The platform does not provide additional access-control isolation within a
 namespace beyond what Kubernetes RBAC already enforces.
 
 ## Managing SharedVolumes with the CLI
+
+> **`--namespace` is not optional in practice.** `volume create`,
+> `volume status` and `volume rm` default it to **`apprafter-system`**,
+> not to the namespace your apps live in — omit it and you create the
+> volume somewhere your Applications cannot reference it, or get
+> `SharedVolume '<name>' not found in apprafter-system` looking for one
+> you did create. Only `volume list` treats the flag as genuinely
+> optional: omitted, it lists cluster-wide.
 
 ### Create
 
@@ -101,7 +126,7 @@ Prints a table with one row per SharedVolume:
 | SIZE | Requested size from `spec.size` |
 | READY | `true` once the backing PVC exists |
 | REFS | Number of ResourceClaims currently bound to this volume |
-| USED/CAP | Used and capacity bytes from the last kubelet sample (blank until the first pod mounts the volume) |
+| USED/FREE | Used and **free** bytes from the last kubelet sample — `usedBytes` / `capacityBytes − usedBytes`, not used-over-capacity. An em-dash (`—`) until the first sample lands |
 
 ### Status
 
@@ -109,9 +134,24 @@ Prints a table with one row per SharedVolume:
 apprafter volume status <name> [--namespace <ns>]
 ```
 
-Single-resource detail view: `spec.size`, backing PVC name
-(`status.pvcRef`), reference count (`status.refCount`), capacity bytes, and
-both `Ready` and `CapacityWarning` conditions.
+Single-resource detail view — six fixed lines, no conditions:
+
+```text
+SharedVolume:  apps/shared-uploads
+  Size:        2Gi
+  Ready:       true
+  PVC ref:     sv-apps-shared-uploads
+  Ref count:   2
+  Used/Free:   41943040/2105540608 bytes
+```
+
+`Size` is `spec.size` echoed back; the rest is status the operator wrote.
+`Ready` is `status.ready`, `PVC ref` is `status.pvcRef`, `Ref count` is
+`status.refCount`, and `Used/Free` is derived from
+`status.capacity.{usedBytes,capacityBytes}` — it prints an em-dash (`—`)
+until the first kubelet sample lands. The `CapacityWarning` condition
+described below is **not** among these lines; read it with `kubectl`
+(see [Capacity signal](#capacity-signal)).
 
 ### Remove
 
@@ -160,19 +200,28 @@ unreachable, parse error, no node) is logged at debug level and the
 reconcile continues with `capacity` absent for that cycle. A CapacityWarning
 is only ever stamped when a fresh sample is available.
 
-### Viewing capacity in the CLI
+### Reading the capacity signal
 
-Both `apprafter volume status` and `apprafter app status` surface the
-capacity condition:
+**No `apprafter` command prints `CapacityWarning` today.** The operator
+stamps the condition on the CR and emits the Event; the CLI does not read
+either. `apprafter volume status` shows the sampled bytes (`Used/Free`)
+and nothing about the warning, and `apprafter app status` says nothing
+about SharedVolumes at all. Until a CLI surface exists, read the
+condition and the Event directly:
 
 ```sh
-apprafter volume status shared-uploads
-# → CapacityWarning: True (NodeNearlyFull)
-#   Node filesystem 12.3% free (< 15% threshold)
+kubectl -n apps get sharedvolume shared-uploads -o \
+  jsonpath='{.status.conditions[?(@.type=="CapacityWarning")].status}{" "}{.status.conditions[?(@.type=="CapacityWarning")].reason}{"\n"}'
+# -> True NodeNearlyFull      (or: False SufficientCapacity)
 
-apprafter app status my-app
-# → SharedVolume shared-uploads: CapacityWarning True — node 12.3% free
+kubectl -n apps describe sharedvolume shared-uploads
+# the Events section carries the edge-triggered Warning, reason
+# `CapacityWarning`
 ```
+
+`Used/Free` from `apprafter volume status` is the same sample the
+condition is computed from, so an em-dash there means no sample landed
+this cycle and the condition will not have been re-stamped either.
 
 ## Tier-1 single-namespace invariant
 
@@ -206,25 +255,41 @@ apprafter volume create shared-uploads --size 2Gi --namespace apps
 
 # 2. Check it is ready.
 apprafter volume status shared-uploads --namespace apps
-# → Ready: True  pvcRef: sv-apps-shared-uploads  refCount: 0
+# → SharedVolume:  apps/shared-uploads
+#     Size:        2Gi
+#     Ready:       true
+#     PVC ref:     sv-apps-shared-uploads
+#     Ref count:   0
+#     Used/Free:   —
 
 # 3. Deploy two Applications that reference the volume.
 #    Both Application.cue files include:
 #    needs: disk: { ref: "shared-uploads", mountPath: "/uploads" }
-apprafter app add writer  --namespace apps
-apprafter app add reader  --namespace apps
+#    `app add` takes the REPO URL, not the app name — `--name` is what
+#    names the Argo CD Application (it defaults to the repo basename).
+apprafter app add https://github.com/your-org/writer.git \
+  --name writer --namespace apps
+apprafter app add https://github.com/your-org/reader.git \
+  --name reader --namespace apps
 
-# 4. Confirm both apps are healthy and the volume shows refCount 2.
+# 4. Confirm both apps are healthy and the volume shows Ref count 2.
 #    `app status` takes no --namespace: the namespace was fixed by
 #    `app add` above and is read back off the app's Argo CD Application.
 apprafter app status writer
 apprafter app status reader
 apprafter volume status shared-uploads --namespace apps
-# → Ready: True  refCount: 2
+# → …  Ref count:   2
 
 # 5. Remove apps, then the volume.
-apprafter app rm writer --yes
-apprafter app rm reader --yes
-# wait for refCount to drop to 0 …
+apprafter app remove writer --yes
+apprafter app remove reader --yes
+# wait for Ref count to drop to 0 …
 apprafter volume rm shared-uploads --namespace apps
 ```
+
+> The two verbs are spelled differently on purpose. `app remove` accepts
+> `rm` as an alias; `volume` has only `rm`, and spelling it `remove`
+> there is an unrecognised subcommand (clap suggests `rm`). Both refuse
+> to act without `--yes` in a non-interactive shell. Note the explicit
+> `--namespace apps` on every `volume` line above — without it they act
+> on `apprafter-system`.

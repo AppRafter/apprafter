@@ -97,7 +97,15 @@ apprafter app scaffold --name parser --namespace demo --needs pg
 > }
 > ```
 >
-> `cue vet ./apprafter/...` validates it locally before you push.
+> `apprafter app validate` checks it locally before you push. Use that
+> and not a bare `cue vet ./apprafter/...`: the scaffold no longer
+> vendors the schema next to your manifest (ADR 0046), so `apprafter/`
+> has no `cue.mod/` and `cue` refuses the import outright —
+> `imports are unavailable because there is no cue.mod/module.cue file`.
+> `app validate` lays the bundled schema and the generated `claim`
+> binding into a temp workspace first, which is also what makes the
+> `claim.pg.url` reference below resolve the same way it will at sync
+> time.
 
 `needs.pg` provisions the database and publishes its connection
 `Secret`, but injects nothing into your container (ADR 0046). Bind the
@@ -272,8 +280,17 @@ kubectl -n demo run dsn-check --rm -it --restart=Never \
   --image=postgres:16 \
   --env="DATABASE_URL=$(kubectl -n demo get secret parser-pg-conn \
     -o jsonpath='{.data.url}' | base64 -d)" \
-  -- psql "$DATABASE_URL" -tAc "SELECT 1"          # -> 1
+  -- sh -c 'psql "$DATABASE_URL" -tAc "SELECT 1"'   # -> 1
 ```
+
+> **The single quotes around the `sh -c` script are load-bearing.**
+> `--env` sets `DATABASE_URL` *inside the pod*; your own shell has
+> never heard of it. Writing `-- psql "$DATABASE_URL" …` lets the
+> local shell expand it first, and because it is unset there the
+> container is handed an empty argument — `psql ""` falls back to
+> libpq's defaults and tries a local socket that does not exist in
+> that pod. Single-quoting hands `sh` the literal `$DATABASE_URL`, so
+> the expansion happens where the variable is.
 
 **11. Inspect the app via the CLI.**
 

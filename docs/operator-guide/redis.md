@@ -119,7 +119,15 @@ apprafter app scaffold --name web --namespace demo --needs redis
 > }
 > ```
 >
-> `cue vet ./apprafter/...` validates it locally before you push.
+> `apprafter app validate` checks it locally before you push. Use that
+> and not a bare `cue vet ./apprafter/...`: the scaffold no longer
+> vendors the schema next to your manifest (ADR 0046), so `apprafter/`
+> has no `cue.mod/` and `cue` refuses the import outright —
+> `imports are unavailable because there is no cue.mod/module.cue file`.
+> `app validate` lays the bundled schema and the generated `claim`
+> binding into a temp workspace first, which is also what makes the
+> `claim.redis.*` references below resolve the same way they will at
+> sync time.
 
 `needs.redis` provisions the logical DB and publishes its connection
 `Secret`, but injects nothing into your container (ADR 0046). Bind the
@@ -236,11 +244,21 @@ admin user — the admin password is in the per-instance admin Secret):
 ```sh
 ADMIN_PW=$(kubectl -n dragonfly-system get secret \
   platform-redis-ephemeral-000-admin -o jsonpath='{.data.password}' | base64 -d)
-kubectl -n dragonfly-system exec deploy/platform-redis-ephemeral-000 -- \
+kubectl -n dragonfly-system exec platform-redis-ephemeral-000-0 -- \
   redis-cli -a "$ADMIN_PW" --no-auth-warning \
   ACL GETUSER claim_demo_web-redis_redis
 # -> the user's rules, including the `$<dbnum>` selector and `&claim_demo_web-redis_redis:*` channel pattern
 ```
+
+> **The exec target is a pod, not a Deployment.** The dragonfly-operator
+> backs each instance with a **StatefulSet**, so the pod is the CR name
+> plus the ordinal — `platform-redis-ephemeral-000-0` — and
+> `kubectl exec deploy/platform-redis-ephemeral-000` gets you
+> `deployments.apps "platform-redis-ephemeral-000" not found`. The same
+> StatefulSet uses the `OnDelete` update strategy, which is also why
+> `kubectl rollout status` is unavailable for it; wait on the pod
+> instead (`kubectl -n dragonfly-system wait --for=condition=Ready
+> pod/platform-redis-ephemeral-000-0`).
 
 **7. The connection Secret carries the decomposed fields.**
 
@@ -275,18 +293,37 @@ kubectl -n demo get deployment web -o \
 # -> web-redis-conn
 ```
 
-**10. (Optional) prove the DSN connects and is DB-isolated.** With the
-`redis-cli` baked into the Dragonfly image you can run as the claim's
-own user from inside the cluster:
+**10. (Optional) prove the connection works and is DB-isolated.** With
+the `redis-cli` baked into the Dragonfly image you can run as the
+claim's own user from inside the cluster. Take the credential from the
+Secret's decomposed `pass` key and pass it with `--user` / `--pass`:
 
 ```sh
-DSN=$(kubectl -n demo get secret web-redis-conn \
-  -o jsonpath='{.data.url}' | base64 -d)
-kubectl -n dragonfly-system exec deploy/platform-redis-ephemeral-000 -- \
-  redis-cli -u "$DSN" --no-auth-warning SET hello world   # -> OK
-kubectl -n dragonfly-system exec deploy/platform-redis-ephemeral-000 -- \
-  redis-cli -u "$DSN" --no-auth-warning GET hello         # -> world
+WEB_PW=$(kubectl -n demo get secret web-redis-conn \
+  -o jsonpath='{.data.pass}' | base64 -d)
+WEB_DB=$(kubectl -n demo get resourceclaim.apprafter.io web-redis \
+  -o jsonpath='{.status.dbnum}')
+
+kubectl -n dragonfly-system exec platform-redis-ephemeral-000-0 -- \
+  redis-cli --user claim_demo_web-redis_redis --pass "$WEB_PW" \
+  --no-auth-warning -n "$WEB_DB" SET hello world      # -> OK
+kubectl -n dragonfly-system exec platform-redis-ephemeral-000-0 -- \
+  redis-cli --user claim_demo_web-redis_redis --pass "$WEB_PW" \
+  --no-auth-warning -n "$WEB_DB" GET hello            # -> world
 ```
+
+> **Do not hand this `redis-cli` the DSN with `-u`.** The DSN in
+> `claim.redis.url` is correct and your application's client library
+> will use it — but the Dragonfly image bundles redis-cli **6.0.16**,
+> whose URL parser drops the userinfo *username* and authenticates as
+> `default`. `redis-cli -u "$DSN"` therefore fails with `NOAUTH` rather
+> than logging in as the claim's user, which would make the isolation
+> check below "pass" for the wrong reason. The explicit
+> `--user` / `--pass` flags work on 6.0.x. `-n <dbnum>` matters for the
+> same reason: without it redis-cli operates on DB 0, where a
+> `$N`-pinned user has no rights, so a plain `SET` comes back `NOPERM`
+> even though the credential is correct. The cross-DB check below
+> deliberately omits `-n` — there, `NOPERM` is the point.
 
 A *second* claim's user is denied this claim's DB (the `$N` pin is a hard
 wall — the isolation proof). Provision a second app (`api`) the same way,
@@ -294,12 +331,18 @@ then:
 
 ```sh
 # As the api user, SELECT of web's DB number returns NOPERM:
-DSN2=$(kubectl -n demo get secret api-redis-conn -o jsonpath='{.data.url}' | base64 -d)
-WEB_DB=$(kubectl -n demo get resourceclaim.apprafter.io web-redis -o jsonpath='{.status.dbnum}')
-kubectl -n dragonfly-system exec deploy/platform-redis-ephemeral-000 -- \
-  redis-cli -u "$DSN2" --no-auth-warning SELECT "$WEB_DB"
+API_PW=$(kubectl -n demo get secret api-redis-conn \
+  -o jsonpath='{.data.pass}' | base64 -d)
+kubectl -n dragonfly-system exec platform-redis-ephemeral-000-0 -- \
+  redis-cli --user claim_demo_api-redis_redis --pass "$API_PW" \
+  --no-auth-warning SELECT "$WEB_DB"
 # -> NOPERM ... (api cannot reach web's DB)
 ```
+
+> Judge this by the reply text, not by the exit status — fold stderr in
+> (`2>&1`) so the reply is visible either way. `NOPERM` is the pass; a
+> `NOAUTH` or `WRONGPASS` means the login itself failed, so the DB pin
+> was never exercised and the check proved nothing.
 
 **11. Inspect the app via the CLI.**
 
@@ -333,7 +376,7 @@ fired:
 ```sh
 ADMIN_PW=$(kubectl -n dragonfly-system get secret \
   platform-redis-ephemeral-000-admin -o jsonpath='{.data.password}' | base64 -d)
-kubectl -n dragonfly-system exec deploy/platform-redis-ephemeral-000 -- \
+kubectl -n dragonfly-system exec platform-redis-ephemeral-000-0 -- \
   redis-cli -a "$ADMIN_PW" --no-auth-warning ACL GETUSER claim_demo_web-redis_redis
 # -> still present
 ```
@@ -381,12 +424,12 @@ ADMIN_PW=$(kubectl -n dragonfly-system get secret \
   platform-redis-ephemeral-000-admin -o jsonpath='{.data.password}' | base64 -d)
 
 # The ACL user is dropped:
-kubectl -n dragonfly-system exec deploy/platform-redis-ephemeral-000 -- \
+kubectl -n dragonfly-system exec platform-redis-ephemeral-000-0 -- \
   redis-cli -a "$ADMIN_PW" --no-auth-warning ACL GETUSER claim_demo_web-redis_redis
 # -> (empty / nil — the user no longer exists)
 
 # The DB is empty (FLUSHDB ran):
-kubectl -n dragonfly-system exec deploy/platform-redis-ephemeral-000 -- \
+kubectl -n dragonfly-system exec platform-redis-ephemeral-000-0 -- \
   redis-cli -a "$ADMIN_PW" --no-auth-warning -n "$WEB_DB" DBSIZE
 # -> 0
 

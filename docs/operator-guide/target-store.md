@@ -45,13 +45,16 @@ it and removing one deletes it.
 ### `config.yaml` (global)
 
 ```yaml
-schema_version: 1
 active_target: prod
+version: 1
 ```
 
 Exactly one `active_target`. Empty string == "no active target",
 which makes most operational commands fail-loud with an
-onboarding hint pointing at `apprafter target add`.
+onboarding hint pointing at `apprafter target add`. `version` is the
+on-disk format revision (`1` today). It is spelled `version`, not
+`schema_version`: a hand-written file using the latter is rejected as
+`apprafter::target::invalid_config` with `missing field "version"`.
 
 Override the entire store root via `APPRAFTER_CONFIG_DIR`:
 
@@ -71,7 +74,14 @@ region: nbg1
 default_tier: solo
 cluster_name: platform-1
 ssh_key_path: /home/operator/.ssh/id_ed25519.pub
+firewall: null
+server_type: null
 ```
+
+Every key is written on every save — an unset optional is serialised as
+`null`, not omitted, so a freshly created target's file is the block
+above with `cluster_name`, `ssh_key_path`, `firewall` and `server_type`
+all `null`.
 
 Field reference:
 
@@ -82,11 +92,13 @@ Field reference:
 | `default_tier` | no       | `solo` / `team` / `prod` / `regulated`. Hint for `init` / `up`.    |
 | `cluster_name` | no       | Falls back to `platform-1`.                                        |
 | `ssh_key_path` | no       | Path (not body). Source-of-truth stays in `~/.ssh/`.               |
+| `firewall`     | no       | Cloud-firewall toggles for this target, written by `apprafter target firewall`. |
+| `server_type`  | no       | Preferred Hetzner server type (`cx22`, `ccx23`, …), written by `apprafter target machine`. This is the "target preference" rung of the server-type chain and the field `target show` reports as `Server type:`. |
 
 ### `targets/<name>/credentials.yaml` (per-target, **mode 0600**)
 
 ```yaml
-hetzner_token: hxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+hetzner_token: hxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
 Mode 0600 is enforced on every write. The CLI redacts the value
@@ -114,16 +126,40 @@ Hetzner token in this order:
 SSH public key resolution is analogous (`APPRAFTER_SSH_PUBLIC_KEY`
 env → target store's `ssh_key_path` → read the file).
 
-When nothing resolves, the typed error lists **all three** paths.
-End-to-end runs confirmed this is what operators read first:
+There is **no single "chain tried 1/2/3" error**. Each rung fails with
+its own message, and which one you get tells you where you actually
+are. All three are `apprafter::cli::other`; the `help:` footer is
+omitted here.
+
+On an empty store you never reach the token chain at all — resolving
+the per-target state directory refuses first, so this is the message a
+first run produces:
 
 ```text
-Error: apprafter::cli::other
-  × no Hetzner token configured. Resolution chain tried:
-  │  1. --token flag — not set
-  │  2. HCLOUD_TOKEN env — not set
-  │  3. active target — no target store at /home/op/.config/apprafter/
+  × no active target — run `apprafter target add <name> --provider hetzner-
+  │ cloud …` first, or supply `--target <name>` to point at a specific one
 ```
+
+With a target configured but no token in its `credentials.yaml`:
+
+```text
+  × target `prod` has no Hetzner Cloud token stored. Run `apprafter target add
+  │ prod --renew --token <X>` to add one, or pass `--token`/`HCLOUD_TOKEN` for
+  │ this invocation.
+```
+
+And with `--target` pointing at a name that is not in the store — note
+that it lists what is:
+
+```text
+  × target `ghost` not found (available: prod). Pass `--target <name>` with a
+  │ configured name, or `apprafter target use <name>` to switch the active
+  │ pointer.
+```
+
+Each names the rung that failed and the next thing to type, which is
+what you need; what none of them does is enumerate the other two, so
+do not go looking for a rung-by-rung report.
 
 ## Common patterns
 
@@ -153,9 +189,15 @@ apprafter target add prod --token "$PROD_PROJECT_TOKEN" ... --region nbg1
 apprafter target add dev  --token "$DEV_PROJECT_TOKEN"  ... --region fsn1
 
 apprafter target list
-# Active │ Name  │ Provider       │ Region │ Tier
-#   *    │ prod  │ hetzner-cloud  │ nbg1   │ solo
-#        │ dev   │ hetzner-cloud  │ fsn1   │ solo
+# ┌────────┬──────┬───────────────┬────────┬──────┐
+# │ Active │ Name │ Provider      │ Region │ Tier │
+# ├────────┼──────┼───────────────┼────────┼──────┤
+# │        │ dev  │ hetzner-cloud │ fsn1   │ solo │
+# │ *      │ prod │ hetzner-cloud │ nbg1   │ solo │
+# └────────┴──────┴───────────────┴────────┴──────┘
+#
+# 2 targets configured. Active: 'prod'.
+# (rows are sorted by name, not by creation order)
 
 apprafter target use dev          # switch active
 apprafter up --dry-run            # → shows Target: dev (active)
