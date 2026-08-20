@@ -130,3 +130,44 @@ the fork/dev-build override knobs. If the intent is to keep a
 fork-build escape hatch, it now belongs on the **chart** side
 (`component_apprafter-operator.cue`), not on `Infrastructure.cue` —
 so option 2 should say *moved*, not merely *deprecated*.
+
+## Product decisions the closing walk (2.19j) left to the owner
+
+Both were found by reading, not by any gate, and both are deliberately
+not acted on here.
+
+### The VPA controllers have never run
+
+`platform-stack/cue/component_vpa.cue:58,87` passes
+`--feature-gates=InPlaceOrRecreate=true` to the updater and the
+admission controller. The chart is pinned to `vertical-pod-autoscaler`
+0.11.0 (appVersion 1.7.1), and that image rejects the gate — so both
+pods have been in `CrashLoopBackOff` since the component shipped in
+2.16e, not since some later drift. Recommendations are computed and
+never applied.
+
+Why nothing was changed: removing the gate would let the updater start,
+and its first action is to evict pods in order to resize them. That is a
+move from "nothing happens" to "your workloads restart" on a live
+cluster, which is an owner's decision rather than a documentation one.
+
+The yank policy does not apply. Every published version carrying the
+component is affected equally, and `currentVersion` is the only
+published one — yanking would leave clusters with no unyanked version to
+land on. This is a fix-forward, not a withdrawal.
+
+`docs/dev-guide/resources-and-autoscaling.md` now describes what happens
+today and gives the tell (`kubectl -n vpa get pods`), because the page's
+own installed-check passes in this state.
+
+### `spec.argocd.bootstrapRepo` / `bootstrapPath` are vestigial
+
+Dead since v0.1.97 — no reader in `cli/` or `operator/` — but still
+declared in `schemas/v1alpha1/infrastructure.cue` and
+`cli/cli-core/src/manifest.rs`. They are what kept a 298-line page
+documenting a removed capability passing the drift gate for nine
+subphases: every identifier on it resolved.
+
+Left in place because removing a schema field is a compatibility
+decision. Worth knowing: while they stand, a replacement page for that
+capability would pass the gate just as falsely.
