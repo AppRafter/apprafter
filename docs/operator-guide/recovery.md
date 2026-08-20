@@ -15,6 +15,10 @@ scratch — you have two options:
 2. **Tear down and re-apply.** Faster (`destroy --yes` +
    `apply`); the right move when you don't actually need the
    data on the disk and just want a working cluster again.
+   Check first that this cluster is the only AppRafter cluster
+   in its Hetzner project — `destroy` removes every
+   `apprafter=true` resource in the token's project, not one
+   cluster ([scope](target-store.md#destroy-scope)).
 
 This page documents option 1. AppRafter VMs are key-only — we
 pass an SSH key to Hetzner at server creation, so root has **no

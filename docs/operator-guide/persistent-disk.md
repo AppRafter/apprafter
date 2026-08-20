@@ -408,5 +408,5 @@ kubectl -n demo get resourceclaim.apprafter.io web-disk -o \
 
 ```sh
 apprafter app remove web --keep-data    # leave any retained PVC in place
-apprafter destroy --yes                  # tear down the Tier-1 cluster
+apprafter destroy --yes                  # every apprafter=true resource in the token's project
 ```

@@ -253,7 +253,7 @@ spec: {
 | Inspect target config         | `apprafter target show` (alias: `apprafter t info`)      |
 | Platform version / status     | `apprafter platform status`                              |
 | Upgrade platform              | `apprafter platform upgrade --to <version>`              |
-| Tear down                     | `apprafter destroy --yes`                                |
+| Tear down                     | `apprafter destroy --yes` — every `apprafter=true` resource in the token's project, not one cluster ([scope](target-store.md#destroy-scope)) |
 
 The credential resolution chain (flag → env → target store) means
 all of the above work without an explicit `HCLOUD_TOKEN` export

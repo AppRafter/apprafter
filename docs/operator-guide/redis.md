@@ -476,5 +476,5 @@ kubectl -n demo get resourceclaim.apprafter.io web-redis -o \
 
 ```sh
 apprafter app remove web --keep-data    # leave any retained data in place
-apprafter destroy --yes                  # tear down the Tier-1 cluster
+apprafter destroy --yes                  # every apprafter=true resource in the token's project
 ```

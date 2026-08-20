@@ -494,5 +494,5 @@ kubectl -n demo get resourceclaim.apprafter.io parser-pg -o \
 
 ```sh
 apprafter app remove parser --keep-data    # leave any retained data in place
-apprafter destroy --yes                     # tear down the Tier-1 cluster
+apprafter destroy --yes                     # every apprafter=true resource in the token's project
 ```

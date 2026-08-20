@@ -332,6 +332,22 @@ cluster you are about to take apart, and both have downtime. Read
 captures, the passphrase you must keep, and the extra `--credential-file`
 an `s3:` repository needs.
 
+!!! danger "`apprafter destroy` empties a provider project, not a cluster"
+
+    Both routes run `apprafter destroy`, and it is wider than its name
+    suggests. It deletes **every** resource labelled `apprafter=true` in
+    the Hetzner project the token belongs to — servers, floating IPs,
+    firewalls, networks and SSH keys — and it never looks at a cluster
+    name. `--target <name>` chooses only which state file it reads and
+    which token it uses, never which cluster is removed. One AppRafter
+    cluster per Hetzner project and the command means exactly what you
+    expect; **two clusters in one project, and destroying either one
+    destroys both.**
+
+    `HCLOUD_TOKEN` exported in your shell also outranks the target's
+    stored token, so an environment variable — not `--target` — would
+    decide which project is emptied.
+
 ### Route A — same target, one machine at a time
 
 Cheapest, and the machine is gone while the new one comes up.
@@ -357,40 +373,70 @@ if you may want to go back to it:
   (destroyed server: type=<sku> region=<region> — note for restore --reprovision)
 ```
 
-### Route B — a second target, cut over, then remove the old one
+### Route B — a second target in a second Hetzner project, cut over, then remove the old one
 
 More expensive for as long as both run, and the old cluster stays up
-until you are satisfied with the new one.
+until you are satisfied with the new one. It asks for one thing Route A
+does not, and the whole route rests on it: **the new target needs its own
+Hetzner project, with an API token issued in that project.**
 
-The new target needs a **cluster name of its own**. Provisioning looks
-for a machine by cluster name across the whole provider project, so a
-second target left on the same name would find the first target's machine
-and reconcile it instead of creating anything — read the old name off
-`apprafter target show` and choose a different one:
+That is not tidiness. It is what makes the last step — destroying the old
+cluster — a thing you can do at all, per the scope box above: with both
+clusters in one project, `apprafter destroy --target <old-name>` would
+take the new one with it, and nothing in the command or its flags can
+narrow it. A second project is also why the new target needs no
+`--cluster-name` juggling: `platform-1` in the new project is a different
+machine from `platform-1` in the old one.
+
+Create the project in the Hetzner Cloud Console, issue an API token in it
+(Security → API Tokens), and register the new target with that token:
 
 ```sh
 apprafter backup create
-apprafter target add <new-name> --provider hetzner-cloud --server-type <sku> --cluster-name <new-cluster>
+apprafter target add <new-name> --provider hetzner-cloud --token <new-project-token> --region <region> --server-type <sku>
 apprafter restore <repo> --reprovision --target <new-name> --server-type <sku>
 ```
 
 Then move DNS to the new cluster (see [Connect a
-domain](connect-a-domain.md)), confirm it, and destroy the old one:
+domain](connect-a-domain.md)), confirm it, and empty the old project:
 
 ```sh
 apprafter destroy --yes --target <old-name>
 ```
 
+That is safe here for one reason and you should be able to state it: the
+old target's stored token belongs to the old project, and the old project
+now holds nothing you want. Check that `HCLOUD_TOKEN` is **not** exported
+in the shell you run it in — it outranks the stored token and would
+redirect the command at whichever project it names.
+
 `apprafter target use <name>` switches which target the commands without
 `--target` act on.
 
+!!! warning "If the two clusters must share one Hetzner project"
+
+    Then `apprafter destroy` is not the teardown for this: it has no flag
+    that narrows it to one cluster, and running it removes both. Delete
+    the old machine **by ID in the Hetzner Cloud Console** instead — the
+    server first, then its floating IP, firewall and network if nothing
+    else uses them — and then `apprafter target remove <old-name> --yes`
+    to drop the local record that now points at nothing.
+
+    A shared project also brings back the cluster-name collision: the new
+    target needs a **name of its own**, because provisioning looks for a
+    machine by cluster name across the whole project and a second target
+    left on the same name would find the first target's machine and
+    reconcile it instead of creating anything. Read the old name off
+    `apprafter target show` and pass a different one as
+    `--cluster-name <new-cluster>`.
+
 > **What will not work:** running `apprafter restore --reprovision` while
-> the old machine is still there under the same cluster name.
-> Provisioning finds that machine, reconciles it, and creates nothing —
-> the `--server-type` you passed is never used and the machine does not
-> change. What makes a rebuild real is that no machine answers to the
-> name: either the old one is gone (Route A), or the new cluster has a
-> name of its own (Route B).
+> a machine under the same cluster name is still there **in the same
+> project**. Provisioning finds that machine, reconciles it, and creates
+> nothing — the `--server-type` you passed is never used and the machine
+> does not change. What makes a rebuild real is that no machine in the
+> project answers to the name: either the old one is gone (Route A), or
+> the new cluster is in a project of its own (Route B).
 
 ## Related
 

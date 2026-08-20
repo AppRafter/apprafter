@@ -316,7 +316,10 @@ The common ones:
   has hit its server / IP / volume limit. Raise the limit in the
   Hetzner Cloud Console (Project → Limits) or free up resources,
   then re-run. `apprafter destroy --yes` clears any half-built
-  resources tagged `apprafter=true` before you retry.
+  resources before you retry — but it removes **every** resource
+  tagged `apprafter=true` in that project, running clusters included,
+  so only reach for it when the project holds nothing else
+  ([scope](target-store.md#destroy-scope)).
 
 ### SSH key rejected or `ssh-key path` FAIL {#ssh-key}
 

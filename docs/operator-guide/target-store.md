@@ -143,9 +143,14 @@ through the store. `HCLOUD_TOKEN` can be unset after `target add`.
 
 ### Multi-cluster operator (dev + prod)
 
+**Give each target a Hetzner project of its own, with an API token
+issued in that project.** Read [the destroy scope](#destroy-scope) below
+before you decide otherwise: it is what makes the last line of this
+snippet mean "tear down dev" rather than "tear down everything".
+
 ```sh
-apprafter target add prod ... --region nbg1
-apprafter target add dev  ... --region fsn1
+apprafter target add prod --token "$PROD_PROJECT_TOKEN" ... --region nbg1
+apprafter target add dev  --token "$DEV_PROJECT_TOKEN"  ... --region fsn1
 
 apprafter target list
 # Active │ Name  │ Provider       │ Region │ Tier
@@ -159,6 +164,28 @@ apprafter up --dry-run            # → shows Target: dev (active)
 apprafter apply --target dev
 apprafter destroy --target dev --yes
 ```
+
+Different regions do **not** separate two targets: a Hetzner project
+spans every region, so `nbg1` and `fsn1` clusters under one token are
+still one blast radius. Two projects are what separates them.
+
+#### `apprafter destroy` is scoped to a project, not to a cluster {#destroy-scope}
+
+`destroy` deletes **every** resource labelled `apprafter=true` in the
+Hetzner project its token belongs to — servers, floating IPs, firewalls,
+networks and SSH keys — and it never looks at a cluster name.
+`--target <name>` selects the state file it reads and the token it uses,
+and nothing else. So:
+
+- **one AppRafter cluster per Hetzner project** and `destroy --target X`
+  means what it looks like;
+- **two clusters in one project** and `destroy --target X` removes both.
+  There is no flag that narrows it. The only safe teardown of one of them
+  is by ID in the Hetzner Cloud Console.
+
+Note also that `HCLOUD_TOKEN` sits **above** the target store in the
+[resolution chain](#credential-resolution-chain): an exported variable,
+not `--target`, decides which project a `destroy` empties.
 
 ### CI / scripted setup (env-var only)
 
@@ -322,6 +349,12 @@ So the order is destroy, then remove:
 apprafter destroy --yes --target prod
 apprafter target remove prod --yes
 ```
+
+The first line is the one to be sure about: it empties `prod`'s whole
+Hetzner project, not just `prod`'s cluster — see [the destroy
+scope](#destroy-scope). If another AppRafter cluster shares that project,
+delete this one's server by ID in the Cloud Console and run only the
+second line.
 
 If you did it the other way round, you have lost the record and not
 the cluster. Recreate the target with the same token and region, then

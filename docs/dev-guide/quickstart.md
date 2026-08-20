@@ -434,9 +434,13 @@ apprafter destroy --yes          # removes the Hetzner server + all tagged resou
 ```
 
 `destroy` reads live state from the Hetzner API and removes every
-resource tagged `apprafter=true`, so it works even if your local
-state file is stale. Drop the `--yes` to be prompted for confirmation
-first.
+resource tagged `apprafter=true` **in the project the token belongs
+to**, so it works even if your local state file is stale — and so it is
+scoped to a project rather than to a cluster. That is the right thing
+here, where the project holds only the cluster this guide built; if you
+ever run two AppRafter clusters under one Hetzner token, read [the
+destroy scope](../operator-guide/target-store.md#destroy-scope) first.
+Drop the `--yes` to be prompted for confirmation first.
 
 ## Where to look next
 
