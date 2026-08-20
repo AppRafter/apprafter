@@ -88,9 +88,19 @@ private image has no covering credential — the operator renders the
 condition `ImageResolved=False` with the reason:
 
 ```sh
-kubectl get application <app-name> \
+kubectl -n <namespace> get application.apprafter.io <app-name> \
   -o jsonpath='{.status.conditions[?(@.type=="ImageResolved")]}'
 ```
+
+!!! warning "Spell out `.apprafter.io`, and pass the namespace"
+    AppRafter's `applications.apprafter.io` CRD and Argo CD's
+    `applications.argoproj.io` share the plural `applications`, so a
+    bare `kubectl get application` is ambiguous — it can hand you the
+    Argo CD object, which has no `ImageResolved` condition, and you
+    read an empty result as "resolution is fine". The workload CR also
+    lives in your application's own namespace (the one
+    `apprafter app add --namespace` set, `apprafter` by default), never
+    in `default`, so `-n` is required too.
 
 The workload still runs on the tag; you lose the digest pin and the
 auto-roll on same-tag pushes until resolution succeeds again. Fixing
@@ -208,14 +218,16 @@ apprafter app rollback <app-name> --to main --yes
 ## Escape hatches
 
 Two standard `kubectl` commands cover the cases the auto-deploy loop
-does not:
+does not. Both act on the `Deployment` the operator renders, which
+carries your manifest's `metadata.name` and lives in your manifest's
+`metadata.namespace` — so pass `-n`, exactly as above:
 
 - **Force a re-pull without changing the image.** If you re-pushed
   the same tag and want the workload to roll immediately rather than
   wait for the next reconcile (or you simply want fresh pods):
 
   ```sh
-  kubectl rollout restart deployment/<app-name>
+  kubectl -n <namespace> rollout restart deployment/<app-name>
   ```
 
 - **Revert to the previous build.** Neither `git revert` of a same-tag
@@ -224,7 +236,7 @@ does not:
   to its previous pod template:
 
   ```sh
-  kubectl rollout undo deployment/<app-name>
+  kubectl -n <namespace> rollout undo deployment/<app-name>
   ```
 
   The operator owns the `Deployment` and re-resolves on its next

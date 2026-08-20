@@ -11,12 +11,14 @@ Cloudflare. Everything runs through the `apprafter` CLI. Budget ~15
 minutes of hands-on time, plus DNS-propagation wait at the end.
 
 !!! warning "This guide provisions a paid server"
-    Bringing the cluster up creates a real **Hetzner Cloud CPX22**
-    server, billed by Hetzner (hourly) for as long as it runs — this
-    is not a free sandbox. When you are done, tear everything down
-    with [`apprafter destroy --yes`](#clean-up) so you stop being
-    billed. If you only want to evaluate AppRafter without the public
-    domain, there is an [exit point](#checkpoint) after step 4.
+    Bringing the cluster up creates a real **Hetzner Cloud** server of
+    the type you pick in step 1, billed by Hetzner (hourly) for as long
+    as it runs — this is not a free sandbox. There is no default server
+    type: you choose one, and that choice is what you are billed for.
+    When you are done, tear everything down with
+    [`apprafter destroy --yes`](#clean-up) so you stop being billed. If
+    you only want to evaluate AppRafter without the public domain,
+    there is an [exit point](#checkpoint) after step 4.
 
 ## Install
 
@@ -135,21 +137,32 @@ names every value the argument accepts.
 
 ## Prerequisites
 
-Only the CLI and a Hetzner token are needed to stand up a Tier 1
-cluster. The rest depends on what you want to do — the happy path
-drives everything through `apprafter app *` and server-side
-validation, so `kubectl` and `cue` are **optional**.
+`apprafter` is not a self-contained binary: it **shells out to
+`kubectl` and `helm`** rather than reimplementing them. Every command
+that talks to the cluster — `app list`, `app status`, `app logs`,
+`secret seal`, `repo creds`, `target domain`, `backup`, `restore` —
+spawns `kubectl`, and `cluster-bootstrap` additionally spawns `helm`.
+Both must be on your `PATH` before you start; without `kubectl` you get
+
+```text
+× spawn kubectl: No such file or directory (os error 2)
+```
+
+`cue` is the genuinely optional one — it is needed only by
+`apprafter app validate`, and the cluster validates every change
+server-side regardless.
 
 | Tool / credential | When you need it | Notes |
 | ----------------- | ---------------- | ----- |
-| `apprafter` CLI | **Always** | the one hard requirement — see [Install](#install). |
+| `apprafter` CLI | **Always** | see [Install](#install). |
+| `kubectl` ≥ 1.29 | **Always** | the CLI spawns it for every cluster-facing command; `apprafter doctor` checks it. |
+| `helm` ≥ 3 | **Always** | spawned by `cluster-bootstrap` (step 1) to install the Argo CD loader; `apprafter doctor` checks it. |
 | Hetzner Cloud API token | **Always (Tier 1)** | create one in the Hetzner Cloud console. |
 | SSH public key | **Always (Tier 1)** | injected into the node for break-glass access. |
 | Docker ≥ 24 | To ship **your own** app | builds and pushes the container image (step 3). |
 | A container registry | To ship **your own** app | e.g. GHCR — where the image lives. See [private repos & registries](./private-repos-and-registries.md). |
 | Domain + Cloudflare account | **Public HTTPS only** | step 5 — skip it if you only want to evaluate. |
-| `kubectl` ≥ 1.29 | _Optional_ | only for raw cluster inspection; `apprafter app *` covers the happy path. |
-| `cue` ≥ 0.10 | _Optional_ | only for `apprafter app validate` locally; the cluster validates every change server-side regardless. |
+| `cue` ≥ 0.10 | _Optional_ | only for `apprafter app validate` locally. |
 | Bun ≥ 1.x | _Optional_ | only to run the OneBun starter on your machine. |
 
 ## 1. Register a target and bring the cluster up
@@ -163,15 +176,37 @@ apprafter target add prod \
     --token  "<your-hcloud-token>" \
     --region nbg1 \
     --tier   solo \
-    --ssh-key ~/.ssh/id_ed25519.pub
+    --ssh-key ~/.ssh/id_ed25519.pub \
+    --server-type <sku>
 
 apprafter up          # alias: apprafter bootstrap-all
-# ↳ provisions a CPX22 with cloud-init k3s, waits for the node,
+# ↳ provisions the server with cloud-init k3s, waits for the node,
 #   then bootstraps Cilium + Gateway API + Argo CD + the platform
 #   stack (operator, admission webhook, cert-manager). ~3 min.
 
 apprafter doctor                 # self-diagnostic; exits 1 on FAIL
 ```
+
+!!! warning "There is no default server type — you must pick one"
+    Provisioning is a spending decision, so AppRafter refuses to guess
+    ([ADR 0056](../adr/0056-machine-picker.md)). If no server type is
+    set anywhere, `apprafter up` fails with
+    `apprafter::provider::server_type_not_selected` rather than
+    silently billing you for a class you did not choose.
+
+    Rather than hardcoding a SKU that Hetzner may retire, run the
+    picker — it lists the live `(region × SKU)` catalogue with prices
+    and saves your choice on the target:
+
+    ```sh
+    apprafter target machine          # interactive picker
+    ```
+
+    `apprafter target machine` is also the **only** way to change the
+    type later: `target add <existing>` errors, and `--renew` is
+    credentials-only. Non-interactively, set it with `target add
+    --server-type <sku>` as above, `apprafter up --server-type <sku>`
+    for one run, or `APPRAFTER_SERVER_TYPE`.
 
 `up` runs `apply` → kubeconfig poll → `cluster-bootstrap`
 under one progress display. Preview it first with
@@ -181,26 +216,38 @@ under one progress display. Preview it first with
 day-2 commands are in the
 [operator quickstart](../operator-guide/quickstart.md).
 
-`apprafter doctor` prints one line per check; output resembles:
+`apprafter doctor` prints one line per check — six for the target,
+four for the environment — then a one-line summary:
 
 ```text
 Checking target `prod`...
-  ✓ credentials.yaml present
-  ✓ Hetzner token format
-  ✓ Hetzner API reachable (token authenticates)
-  ✓ SSH public key readable
+  ✓ Config file readable (~/.config/apprafter/targets/prod/config.yaml)
+  ✓ Credentials file present (mode 0600) (~/.config/apprafter/targets/prod/credentials.yaml)
+  ✓ Provider `hetzner-cloud` supported
+  ✓ Token format valid (64 chars, alphanumeric)
+  ✓ Token verified against provider API (Hetzner Cloud /v1/locations, 84 ms)
+  ✓ SSH key readable (~/.ssh/id_ed25519.pub (ssh-ed25519))
 
 Checking environment...
-  ✓ kubectl (Client Version: v1.29.x)
-  ⚠ cue (not found — optional; needed only for local `app validate`)
+  ✓ `kubectl` on PATH (Client Version: v1.35.3)
+  ✓ `helm` on PATH (v3.19.1+gv3.19.1)
+  ✓ `ssh` on PATH (OpenSSH_10.2p1, OpenSSL 3.6.1 27 Jan 2026)
+  ✓ DNS resolves `api.hetzner.cloud` (443/tcp)
 
-N checks: … passed, 1 warning(s), 0 FAIL
+10 checks for target `prod`: 10 passed. All good — ready for `apprafter init` / `apprafter apply`.
 ```
 
+The tool versions in parentheses are whatever you have installed, and
+the API-ping timing varies. `--no-ping` skips the Hetzner round-trip
+(useful offline); the check then reports `⚠ … (skipped — --no-ping)`
+and the summary counts it as a warning.
+
 A non-zero exit (any `✗ FAIL`) means something is broken — see
-[Troubleshooting](../operator-guide/troubleshooting.md). Then point
-`kubectl` at the new cluster (optional — only if you want to poke at
-raw resources):
+[Troubleshooting](../operator-guide/troubleshooting.md).
+
+Exporting `KUBECONFIG` is optional — the `apprafter app *` commands
+resolve the cluster from the target store themselves. Do it only if
+you also want to drive `kubectl` by hand:
 
 ```sh
 apprafter kubeconfig > /tmp/kc && export KUBECONFIG=/tmp/kc
@@ -275,18 +322,26 @@ apprafter app add                # auto-detects the git origin
 #   `apprafter repo creds add`.
 ```
 
-`apprafter app add` confirms the registration; output resembles:
+On a TTY `apprafter app add` opens a short wizard, pre-filling each
+field from your git remote and the scaffolded manifest; pressing Enter
+through it accepts the defaults below. It then confirms:
 
 ```text
 ✓ Application 'my-service' registered in AppProject 'apps'.
   Repo:        https://github.com/<your-org>/my-service.git
   Revision:    main
-  Path:        apprafter
-  Destination: my-service (created if missing)
+  Path:        /
+  Destination: apprafter (created if missing)
 
 Argo CD will sync the workload within a reconcile cycle. State:
   apprafter app status my-service
 ```
+
+`Path: /` is the repo root — the CUE plugin walks the whole repository
+for a manifest, so it does not need the `apprafter/` subdirectory
+named. `Destination: apprafter` is the namespace the operator watches
+and the one `apprafter app scaffold` wrote into your manifest's
+`metadata.namespace`; `--path` and `--namespace` override both.
 
 Watch it converge with the simple `app` commands — no raw `kubectl`
 needed (each takes the logical app name, `my-service`):
@@ -305,12 +360,17 @@ Application argocd/my-service
   project:       apps
   repo:          https://github.com/<your-org>/my-service.git
   revision:      main
-  path:          apprafter
-  destination:   my-service
-  environment:   prod
+  path:          /
+  destination:   apprafter
+  environment:   (base)
   sync state:    Synced
   health:        Healthy
 ```
+
+`environment: (base)` is what a deployment registered without `--env`
+reports: no `spec.environments` overlay is applied, so `spec.base`
+renders as written. Below this block `app status` also lists the
+workload pods, services and any resource claims.
 
 `apprafter app list` shows every app you've registered; `apprafter
 app rollback my-service` reverts to the previous revision.
@@ -376,13 +436,15 @@ apprafter target ip              # prints the A (IPv4) + AAAA (IPv6) values
 | CNAME | `www` | `<zone>`      |
 
 **5.5 — Make the application public.** In
-`apprafter/Application.cue`, flip the existing `expose` block to
-`public` and set the hostname:
+`apprafter/Application.cue`, open up the existing `expose` block. The
+`bun` skeleton scaffolds `port: 3000` with `network` and `hostname`
+present but commented out — uncomment both, set the hostname, and keep
+whatever port your process actually binds:
 
 ```cue
 spec: base: expose: {
-    port:     8080              // your service's listen port
-    network:  "public"         // was "internal"
+    port:     3000             // your service's listen port
+    network:  "public"         // was commented out; default is "internal"
     hostname: "<zone>"         // or a subdomain, e.g. "app.<zone>"
 }
 ```
@@ -408,9 +470,12 @@ curl --resolve <zone>:443:<node-ip> https://<zone>/   # refused / times out
 
 ## What you just got
 
-- A typed OneBun service (`@onebun/core` decorators + DI), with
-  Prometheus `/metrics` (the operator scrapes it) and OpenTelemetry
-  tracing.
+- A container image of your own, rolling out on every push of the tag
+  it names (see [`image-iteration.md`](./image-iteration.md)). If you
+  started from the `bun-http` example, that is a typed OneBun service
+  (`@onebun/core` decorators + DI) that serves Prometheus `/metrics`
+  and emits OpenTelemetry traces — the endpoints exist, but the Tier-1
+  baseline ships no scraper or collector to consume them yet.
 - A v1alpha1 `Application` manifest validated by the admission webhook
   on every change, and by `apprafter app validate` locally.
 - A public HTTPS endpoint on your domain through Cloudflare — TLS

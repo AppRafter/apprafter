@@ -15,7 +15,7 @@ see [`docs/dev-guide/quickstart.md`](../dev-guide/quickstart.md).
 
 | Component         | Tier-1 baseline                                                        |
 | ----------------- | ---------------------------------------------------------------------- |
-| Substrate         | One Hetzner CPX22 (2 vCPU / 4 GB / 40 GB) in `nbg1` (or your region). |
+| Substrate         | One Hetzner Cloud server, of the type you pick in step 1, in `nbg1` (or your region). |
 | Network           | Hetzner private network 10.0.0.0/16, subnet 10.0.0.0/24.              |
 | Firewall          | TCP 22 (SSH) + 6443 (kube API) + 80/443 (HTTP/S) + UDP 51820 (WG).    |
 | Kubernetes        | k3s single-node (traefik + servicelb disabled).                        |
@@ -64,8 +64,12 @@ You will also need:
 - A Hetzner Cloud API token with Read+Write access.
 - An SSH key whose **public** half you will hand to the provider for
   the new node. The CLI never touches the private half.
-- `kubectl`, for the verification steps on this page. The `apprafter`
-  steps do not need it.
+- **`kubectl` and `helm` on your `PATH`.** These are not optional and
+  not only for the verification steps: the CLI shells out to `kubectl`
+  for every cluster-facing command and to `helm` inside
+  `cluster-bootstrap`. Without `kubectl`, `apprafter` fails with
+  `× spawn kubectl: No such file or directory (os error 2)`. Step 3's
+  `apprafter doctor` checks both.
 
 The rest of this page assumes `apprafter` is on `PATH`.
 
@@ -80,13 +84,64 @@ apprafter target add prod \
     --token  "<your-hcloud-token>" \
     --region nbg1 \
     --tier   solo \
-    --ssh-key ~/.ssh/id_ed25519.pub
+    --ssh-key ~/.ssh/id_ed25519.pub \
+    --server-type <sku>
 ```
 
 The wizard auto-fills any flag you skip. On a TTY without
 `--no-interactive` you can run `apprafter target add prod` alone
 and answer the prompts; the wizard validates the token against
 the Hetzner API before saving.
+
+!!! warning "The server type has no default — step 2 fails without it"
+    Provisioning is a spending decision, so AppRafter refuses to guess
+    a machine class ([ADR 0056](../adr/0056-machine-picker.md)). The
+    resolution chain is `--server-type` flag → manifest
+    `spec.nodes[0].type` → recorded state → target default →
+    `APPRAFTER_SERVER_TYPE`, and if every rung is empty `apprafter
+    bootstrap-all` aborts with
+    `apprafter::provider::server_type_not_selected` before creating
+    anything.
+
+    Rather than copying a SKU that Hetzner may retire, run the picker
+    — it crosses the live catalogue with per-region availability and
+    price, and saves the choice on the target:
+
+    ```sh
+    apprafter target machine          # interactive picker
+    apprafter target machine --server-type <sku>   # non-interactive
+    ```
+
+    `target machine` is also the only way to change the type on an
+    existing target: `target add <existing>` errors and `--renew` is
+    credentials-only.
+
+    The declarative rung is an `Infrastructure` manifest, handed to
+    `apprafter apply` through `APPRAFTER_MANIFEST`. It outranks
+    everything except an explicit `--server-type`, which makes it the
+    right place to pin the substrate for a cluster under review:
+
+    ```cue
+    // infra.cue — APPRAFTER_MANIFEST=./infra.cue apprafter apply
+    package infra
+
+    import v1alpha1 "apprafter.io/schemas/v1alpha1"
+
+    infra: v1alpha1.#Infrastructure & {
+        apiVersion: "apprafter.io/v1alpha1"
+        kind:       "Infrastructure"
+        metadata: name: "platform-1"
+        spec: {
+            provider: "hetzner-cloud"
+            region:   "nbg1"
+            nodes: [{
+                role:  "control-plane"
+                type:  "<sku>"
+                count: 1
+            }]
+        }
+    }
+    ```
 
 The first target on a fresh store is auto-activated. To check:
 
@@ -112,8 +167,9 @@ apprafter bootstrap-all         # (alias: apprafter up)
 This runs three phases under a unified progress display:
 
 1. **`apply`** — provisions the SSH key, private network, firewall,
-   the CPX22 server, and a `#cloud-config` user-data block that
-   installs fail2ban + k3s. Around 30 s on the Hetzner side;
+   the server of the type you chose in step 1, and a `#cloud-config`
+   user-data block that installs fail2ban + k3s. Around 30 s on the
+   Hetzner side;
    cloud-init needs another 90–180 s after that.
 2. **`k3s-ready` (poll)** — waits for cloud-init + k3s to finish
    on the new node, then retrieves the kubeconfig over SSH.
@@ -162,15 +218,15 @@ Export the kubeconfig and check the cluster:
 ```sh
 apprafter kubeconfig > /tmp/kc && export KUBECONFIG=/tmp/kc
 
-kubectl get nodes
-# <hostname>   Ready   control-plane,master   <age>   v1.31.x+k3s
-
-kubectl -n argocd get pods
-# argocd-server-...   Running
-
-kubectl get applications.apprafter.io -A
-# (empty until you deploy your first Application)
+kubectl get nodes                       # the one node, STATUS Ready
+kubectl -n argocd get pods              # argocd-server + repo-server Running
+kubectl get applications.apprafter.io -A   # empty until you deploy an app
 ```
+
+The cloud-init block installs k3s from `https://get.k3s.io` without
+pinning `INSTALL_K3S_VERSION`, so the `VERSION` column reports
+whichever k3s is current stable on the day you provision, not a
+version this page can name.
 
 ### Open the Argo CD UI
 
@@ -192,8 +248,9 @@ within a few minutes of `cluster-bootstrap` completing.
 The AppRafter operator and admission webhook are installed by
 `cluster-bootstrap` as part of the platform stack. Verify the
 end-to-end path by applying an `Application` CR. It is inlined here so
-that nothing on this page needs a checkout; the same manifest also ships
-in the repository as `manifests/tier-1/application/example-app.yaml`.
+that nothing on this page needs a checkout; a fuller version, adding a
+`prod` environment override, ships in the repository as
+`manifests/tier-1/application/example-app.yaml`.
 
 ```sh
 kubectl apply -f - <<'YAML'
@@ -230,14 +287,16 @@ application from a Git repo — scaffold, register with `apprafter app
 add`, then watch it with `apprafter app status` / `app logs` — follow
 the [developer quickstart](../dev-guide/quickstart.md).
 
-To opt out of the operator or webhook in a custom `Infrastructure.cue`:
-
-```cue
-spec: {
-    operator?:        { enabled: false }   // skip operator helm release
-    admissionWebhook?: { enabled: false }  // skip admission-webhook
-}
-```
+!!! note "There is no supported opt-out for the operator or webhook"
+    Earlier releases let an `Infrastructure.cue` set
+    `spec.operator.enabled: false` / `spec.admissionWebhook.enabled:
+    false`, because `cluster-bootstrap` installed both with a direct
+    `helm install`. That path was removed: both now arrive as
+    components of the platform-stack chart that Argo CD reconciles, so
+    setting either field has no effect — the CLI reads no
+    `Infrastructure.cue` during `cluster-bootstrap` at all. The fields
+    still parse for backwards compatibility; their removal is tracked
+    in `docs/measurements/schema-followups.md`.
 
 ## Day-2 operations
 
@@ -267,12 +326,14 @@ diagnostic code and a multi-line `help:` block. Examples:
 
 ```text
 Error: apprafter::target::not_found
+
   × target `ghost` not found (available: prod)
-  help: Either the `--target` flag was given a name that is not
-        in the store, or no target has been created yet. List
-        existing targets with `apprafter target list`; create a
-        new one with `apprafter target add <name> --provider
-        hetzner-cloud ...`.
+  help: Either the `--target` flag was given a name that's not in the store,
+        or no target has been created yet. List existing targets with
+        `apprafter target list`; create a new one with `apprafter target add
+        <name> --provider hetzner-cloud …`. If the store is empty (`available:
+        ` shows nothing), this is your first run — start with `apprafter
+        target add`.
 ```
 
 Set `NO_COLOR=1` for CI / pipe consumers. Output stays

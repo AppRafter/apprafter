@@ -25,19 +25,35 @@ the rest.
 
 Place your manifest at `apprafter/Application.cue` in the root
 of your repository (or the repository path you registered with
-`apprafter app add`). The CMP discovery rule is:
+`apprafter app add`). The CMP decides whether a repository is CUE by
+running a shell probe from `spec.source.path` and checking whether it
+printed anything:
 
 ```yaml
 discover:
   find:
-    glob: "**/apprafter*.cue"
+    command:
+      - sh
+      - -c
+      - |
+        if [ "$(basename "$PWD")" = "apprafter" ]; then
+          find . -maxdepth 1 -type f -name '*.cue' -print -quit
+        else
+          find . -type f -name '*.cue' \( -path '*/apprafter/*' -o -name 'apprafter*.cue' \) -print -quit
+        fi
 ```
 
-Any file matching that glob anywhere in the repository (or in the
-configured `spec.source.path`) triggers CUE compilation. The
-recommended layout is `apprafter/Application.cue`; avoid naming
-other CUE files in the repo `apprafter*.cue` unless you want them
-compiled alongside the manifest.
+So a file is picked up when **either** it sits anywhere under an
+`apprafter/` directory — whatever it is called, which is why
+`apprafter/Application.cue` works — **or** its own filename starts
+with `apprafter`. The special case at the top handles a
+`spec.source.path` that already points *at* the `apprafter/`
+directory: there, any `.cue` file directly inside it matches.
+
+The recommended layout is `apprafter/Application.cue`. Bear in mind
+that every `.cue` file under `apprafter/` is compiled, not just the
+one named `Application.cue`, and that a stray `apprafter-notes.cue`
+elsewhere in the repo also matches the second branch.
 
 For a monorepo with multiple services, each service can have its
 own `apprafter/Application.cue`. Control which paths Argo CD
@@ -322,19 +338,31 @@ without applying any environment overlay.
 
 ## How the CUE CMP works
 
-The `argocd-cue-cmp` sidecar container runs inside the Argo CD
-`argocd-repo-server` pod. When Argo CD clones a repository and the
-discovery rule matches a `apprafter*.cue` file, the sidecar runs:
+The CUE plugin runs in a sidecar container named `cue-cmp`, inside
+the Argo CD `argocd-repo-server` pod. When Argo CD clones a repository
+and the discovery probe above prints a match, the sidecar runs its
+`entrypoint.sh`, which does three things worth knowing about:
 
-```sh
-cue export ./... --out yaml
-```
-
-The CUE standard library resolves imports (including
-`apprafter.io/schemas/v1alpha1`) from a vendored copy embedded in
-the sidecar image. The resulting YAML — one or more Kubernetes
-resource documents separated by `---` — is returned to Argo CD and
-processed like any other manifest source.
+1. **It changes directory into `apprafter/`** when `spec.source.path`
+   pointed at a parent. Everything below runs from the package
+   directory.
+2. **It writes the schema and the `claim` binding into your checkout**
+   — a workspace-local CUE module holding the exact
+   `apprafter.io/schemas/v1alpha1` the sidecar image ships, plus a
+   generated `apprafter_claim_gen.cue` that defines the `claim` value
+   your `env` references resolve against (ADR 0046). Both are
+   inject-wins: they overwrite anything you vendored. This is why you
+   do not vendor the schema yourself, and why bare
+   `claim.pg.url` selectors resolve without you declaring them.
+3. **It exports each manifest separately.** A single
+   `cue export ./... --out yaml` would emit your named top-level values
+   (`app: …`, `web: …`) as keys of one YAML document, which Argo CD
+   would reject as a manifest with no `apiVersion`. So the sidecar
+   exports to JSON, enumerates the top-level values that look like
+   Kubernetes objects (`apiVersion` + `kind` present), and re-exports
+   each one on its own with `cue export ./... -e <key> --out yaml`,
+   separated by `---`. Top-level helper values that are not Kubernetes
+   objects are skipped rather than emitted.
 
 The sidecar is installed and kept up to date by the platform-stack
 chart; no manual sidecar configuration is required on your part.
@@ -359,10 +387,9 @@ From the CLI:
 kubectl get applications.argoproj.io <app-name> -n argocd \
     -o jsonpath='{.status.conditions}'
 
-# Tail CMP sidecar logs for the full cue output.
-kubectl logs -n argocd \
-    -l app.kubernetes.io/name=argocd-repo-server \
-    -c argocd-cue-cmp --tail=50
+# Tail CMP sidecar logs for the full cue output. The container is
+# named `cue-cmp` — `argocd-cue-cmp` is the image, not the container.
+kubectl logs -n argocd deploy/argocd-repo-server -c cue-cmp --tail=50
 ```
 
 ### Common errors
@@ -370,10 +397,16 @@ kubectl logs -n argocd \
 **`package "apprafter.io/schemas/v1alpha1" not found`**
 
 The import path must match exactly. Confirm the `package` directive
-at the top of your file and the import string. The sidecar bundles
-the schemas — do not vendor them yourself in the app repository
-unless you are also supplying a `cue.mod/module.cue` with
-`replace` directives.
+at the top of your file and the import string.
+
+Do **not** vendor the schemas into your repository. The sidecar lays
+its own bundled copy down inject-wins before rendering, so a schema
+you vendored under your own `<your-repo>/cue.mod/pkg/` tree is
+overwritten at sync time and only diverges from what actually renders.
+`apprafter app scaffold` stopped vendoring in ADR 0046 for exactly
+this reason. The one place vendoring still matters is running `cue` by
+hand — use `apprafter app validate`, which lays out the same workspace
+the sidecar does.
 
 **`field not allowed: <field-name>`**
 

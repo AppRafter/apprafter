@@ -83,3 +83,50 @@ Whoever takes it: `cli/docsgen/tests/identifier_test.rs` asserts
 `spec.argocd.bootstrapRepo` resolves and is the test that fails under
 option 1. Swap it for another CUE-only path — the assertion is about
 harvesting CUE-only schemas, not about this field.
+
+## `spec.operator.enabled` / `spec.admissionWebhook.enabled`
+
+**Opened:** 2026-08-20 (2.19j, correcting
+`docs/operator-guide/quickstart.md`).
+**Status:** open — needs a product decision.
+
+### What is dead
+
+`enabled: false` was an opt-out from a direct `helm install` that
+`cluster-bootstrap` performed. That install was removed: the operator
+and the admission webhook now arrive as components of the platform-stack
+chart, reconciled by Argo CD. `cluster_bootstrap.rs`'s module docs list
+"Direct `helm install` of cert-manager, the operator, the
+admission-webhook" under *What deliberately went away vs. v0.1.x*, and
+`cluster-bootstrap` reads no `Infrastructure.cue` at all — so nothing
+can consult the flag even in principle.
+
+### What is still declared
+
+- `schemas/v1alpha1/infrastructure.cue` declares `operator?` and
+  `admissionWebhook?`, each `{enabled?, image?, tag?}`. Both docstrings
+  still describe the removed behaviour ("`cluster-bootstrap` installs
+  the operator in `apprafter-system` by default").
+- `cli/cli-core/src/manifest.rs` deserialises both blocks.
+
+The only consumer of either block is
+`cli-providers::k8s::image_ref::resolve_image_ref`, which has **no
+production caller** — a fact `CLAUDE.md` already records for the
+sibling `RELEASED_OPERATOR_VERSION` constant. So all three fields
+(`enabled`, `image`, `tag`) parse and are ignored.
+
+### Why it is the same class as the entry above
+
+Setting `operator.enabled: false` is *worse* than a no-op that errors:
+an operator reads the documented field, sets it, sees `cue vet` pass,
+and gets the operator installed anyway. The page documenting it passed
+every gate for the same reason the bootstrap-repository page did — the
+identifiers resolve against the CUE.
+
+### The decision needed
+
+Same three options as above, with one difference: `image` / `tag` were
+the fork/dev-build override knobs. If the intent is to keep a
+fork-build escape hatch, it now belongs on the **chart** side
+(`component_apprafter-operator.cue`), not on `Infrastructure.cue` —
+so option 2 should say *moved*, not merely *deprecated*.
