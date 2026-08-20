@@ -169,6 +169,10 @@ nav:
       - Overview: operator-guide/index.md
       - Quickstart: operator-guide/quickstart.md
       - Target store: operator-guide/target-store.md
+      # Sits with the target pages rather than under "Day 2": the
+      # machine is chosen when the target is set up, and after
+      # provisioning it can only be changed by rebuilding.
+      - Choosing the machine: operator-guide/choosing-the-machine.md
       - Node preparation: operator-guide/node-prep.md
       - Connect a Git repository: operator-guide/connect-a-git-repository.md
       # Public ingress was a top-level section of two pages. Both are
@@ -197,6 +201,13 @@ nav:
       - Overview: dev-guide/index.md
       - Quickstart: dev-guide/quickstart.md
       - Writing Application.cue: dev-guide/application-cue.md
+      # Ordered as the work happens: author the manifest, then the
+      # three things you reach for while filling it in (environments,
+      # sizing, secrets), then the credentials a private source needs,
+      # then the push-to-deploy loop you live in afterwards.
+      - Deploying more than one environment: dev-guide/environments.md
+      - Resources and autoscaling: dev-guide/resources-and-autoscaling.md
+      - Secrets: dev-guide/secrets.md
       - Private repos & registries: dev-guide/private-repos-and-registries.md
       - Image iteration: dev-guide/image-iteration.md
   - Reference:

@@ -237,7 +237,9 @@ is a property of the deployment, not of the cluster: `apprafter app add
 `spec.environment: "staging"`, and the operator unifies
 `spec.environments.staging` onto `spec.base` before rendering
 (ADR 0044). Register the same manifest twice with different `--env`
-values and you get two independent deployments from one file.
+values and you get two independent deployments from one file — [Deploying
+more than one environment](environments.md) covers that end to end,
+including the namespaces the two deployments need.
 
 Merge rules, per field:
 
@@ -262,10 +264,11 @@ package apprafter
 import v1alpha1 "apprafter.io/schemas/v1alpha1"
 
 app: v1alpha1.#Application & {
-    metadata: {
-        name:      "parser"
-        namespace: "apprafter"
-    }
+    // No `metadata.namespace` here on purpose: a manifest that pins
+    // one renders the same object for every environment, so the two
+    // deployments would collide. Leave it out and each deployment
+    // takes the namespace you pass to `apprafter app add --namespace`.
+    metadata: name: "parser"
     spec: {
         base: {
             image:    "ghcr.io/my-org/parser:1.2.0"

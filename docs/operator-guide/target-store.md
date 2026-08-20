@@ -1,13 +1,15 @@
 ---
-description: "The on-disk layout of target configuration, the credential resolution chain, and the multi-target patterns operators actually use."
+description: "The on-disk layout of target configuration, the credential resolution chain, the multi-target patterns operators actually use, and the inspect / rename / remove lifecycle — including why removing a target does not remove its servers."
 ---
 
 # Target store reference
 
 > Reference companion to [`quickstart.md`](./quickstart.md). The
 > quickstart covers the happy path; this page documents the
-> on-disk layout, the credential resolution chain, and the
-> multi-target patterns operators actually use.
+> on-disk layout, the credential resolution chain, the
+> multi-target patterns operators actually use, and the rest of a
+> target's life — inspecting one, renaming one, and removing one
+> without stranding the servers it provisioned.
 >
 > Authoritative design rationale: [ADR
 > 0030](../adr/0030-cli-target-store-and-credential-chain.md).
@@ -27,8 +29,18 @@ $XDG_CONFIG_HOME/apprafter/          # ~/.config/apprafter on Linux
 ├── auth/                            # reserved for `apprafter auth` (Managed; stub)
 │   └── .keep
 └── state/
-    └── <target>/                    # per-target runtime cache. Reserved.
+    └── <target>/
+        └── .apprafter/
+            ├── state.json           # provisioned resource IDs + cached kubeconfig
+            └── known_hosts          # per-cluster SSH known_hosts
 ```
+
+The `state/<target>/` half is not a scratch cache. It is the only
+local record of what a target provisioned — the Hetzner server,
+network, firewall and floating-IP IDs, plus the age-encrypted
+kubeconfig. Everything under it is keyed by target name, which is why
+[renaming a target](#inspecting-renaming-and-removing-a-target) moves
+it and removing one deletes it.
 
 ### `config.yaml` (global)
 
@@ -189,6 +201,168 @@ chmod 700 ~/.config/apprafter
 
 `doctor` will continue to pass; only the directory above is
 tightened.
+
+## Inspecting, renaming and removing a target
+
+The patterns above create targets and switch between them. These three
+commands finish the lifecycle. All of them are **local** — they read
+and write the store on this machine and never call your cloud
+provider, which is also why `target remove` is the one to be careful
+with.
+
+### Inspect one — `apprafter target show`
+
+With no argument, `show` reports the **active** target. Pass a name to
+read another one without switching to it:
+
+```sh
+apprafter target show            # the active target
+apprafter target show dev        # another one; the active target is unchanged
+```
+
+```text
+Target: prod (active)
+  Provider:    hetzner-cloud
+  Region:      nbg1
+  Server type: not set
+  Default tier: solo
+  Cluster name: not set
+  SSH key:     not set
+  Hetzner token: set (64 chars; read credentials.yaml for the raw value)
+
+Config:      /home/operator/.config/apprafter/targets/prod/config.yaml
+Credentials: /home/operator/.config/apprafter/targets/prod/credentials.yaml (mode 0600)
+```
+
+How to read it:
+
+- **`(active)`** is printed only when the target you asked about is the
+  active one, so `show` with no argument doubles as "which target am I
+  on".
+- **`not set`** is an empty optional field, not a fault. `Cluster name:
+  not set` means provisioning will use the `platform-1` default;
+  `Server type: not set` means this target contributes nothing to the
+  server-type resolution chain, and `apprafter target machine` is what
+  fills it in — see [Choosing the
+  machine](choosing-the-machine.md#which-one-wins) for the rest of that
+  chain.
+- **The token line reports presence and length only.** The bytes are
+  never printed, here or in `apprafter whoami`. Read
+  `credentials.yaml` directly if a script needs the value.
+- **The two paths at the foot** are the files every field above was
+  read from — useful when you are not sure which store an
+  `APPRAFTER_CONFIG_DIR` in your shell is pointing at.
+
+Two refusals are worth recognising. On an empty store, or after the
+active pointer has been cleared:
+
+```text
+× no active target and no name supplied. Run `apprafter target list` to see
+│ configured targets, or `apprafter target add` to create one.
+```
+
+and on a name that is not in the store — note that it lists what *is*:
+
+```text
+Error: apprafter::target::not_found
+
+  × target `ghost` not found (available: dev, prod)
+```
+
+### Rename one — `apprafter target rename`
+
+```sh
+apprafter target rename prod production
+```
+
+```text
+target renamed: `prod` → `production` (active pointer updated)
+```
+
+The parenthetical appears only when the renamed target was the active
+one; the pointer is moved for you, so you are still on the same target
+under its new name.
+
+**A rename is safe on a target with a live cluster.** Configuration,
+credentials and the per-target state directory all move together, so
+the next `apprafter apply`, `apprafter kubeconfig` or `apprafter
+destroy` finds exactly the state it had before, under the new name.
+
+What does *not* move is anything outside the store that names the old
+target: a `--target prod` in a CI job, a shell alias, a runbook. Those
+are yours to update.
+
+The destination name follows the same rule as `target add`:
+alphanumeric and `-`, not starting or ending with `-`, at most 64
+characters. Three things are refused outright, each before anything is
+written:
+
+- **the destination already exists.** Rename never merges two targets;
+  the error suggests picking a different name, or removing the existing
+  target first.
+- **the source does not exist.** The same `not_found` error as above,
+  listing the targets that do.
+- **the two names are identical.** Nothing to rename, and the CLI says
+  so rather than performing a no-op.
+
+### Remove one — `apprafter target remove`
+
+Read this before you run it.
+
+> **`target remove` deletes the local record, not the servers.** The
+> per-target state directory goes with the target, and that directory
+> is where the CLI keeps the IDs of the server, network, firewall and
+> floating IPs it provisioned. Remove a target whose cluster is still
+> running and the machines keep running — and keep billing — with
+> nothing left on your machine pointing at them.
+
+So the order is destroy, then remove:
+
+```sh
+apprafter destroy --yes --target prod
+apprafter target remove prod --yes
+```
+
+If you did it the other way round, you have lost the record and not
+the cluster. Recreate the target with the same token and region, then
+rebuild the record from the account itself:
+
+```sh
+apprafter target add prod --provider hetzner-cloud --token "$HCLOUD_TOKEN" --region nbg1
+apprafter import
+```
+
+`import` is read-only: it lists the resources labelled `apprafter=true`
+in the account and writes them back into the target's state, creating
+and deleting nothing. The cached kubeconfig is not among them, because
+it never lived in your cloud account — `apprafter kubeconfig --refresh`
+fetches a fresh one over SSH.
+
+**Confirmation is not optional.** At a terminal you are prompted, and
+the prompt defaults to *no*. Without a terminal — a CI job, a pipeline,
+a scripted teardown — there is no prompt, and no silent deletion
+either:
+
+```text
+× non-interactive invocation: pass `--yes` to confirm removing target `dev`
+│ (refusing silent destruction)
+```
+
+**The active pointer is repaired for you.** Removing a target that was
+not active just removes it. Removing the active one moves the pointer
+to the alphabetically first target that remains:
+
+```text
+target `prod` removed; active switched to `dev` (alphabetically next)
+```
+
+and removing the last target clears the pointer entirely, returning the
+store to its fresh state — the next `apprafter target add` greets you
+as a first run and auto-activates what it creates:
+
+```text
+target `dev` removed; no targets left, active pointer cleared
+```
 
 ## Anti-patterns
 

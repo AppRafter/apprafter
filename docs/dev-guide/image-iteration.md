@@ -1,5 +1,5 @@
 ---
-description: "How a re-pushed mutable tag becomes a rollout with no manifest edit, how to confirm it happened, and how to opt out."
+description: "How a re-pushed mutable tag becomes a rollout with no manifest edit, how to confirm it happened, how to opt out, and how to roll a bad deploy back."
 ---
 
 # Image iteration: push and it deploys
@@ -11,8 +11,9 @@ you. You do not edit the manifest, and you do not bump a tag — the
 push is the deploy.
 
 This page covers the loop, how to confirm it worked, how to opt out
-when you want a hand-pinned reference, and the `kubectl` escape
-hatches for forcing or reverting a roll.
+when you want a hand-pinned reference, how to roll a bad deploy back
+with `apprafter app rollback`, and the `kubectl` escape hatches for
+forcing or reverting a roll.
 
 The design rationale lives in
 [ADR 0040](../adr/0040-image-digest-resolution.md).
@@ -122,6 +123,88 @@ no image line.
 The default (the field absent, or `resolve: digest`) is digest
 resolution as described above.
 
+## Rolling back a bad deploy
+
+`apprafter app rollback` undoes a bad **manifest** change. It reads
+Argo CD's sync history for your application, points the application at
+an earlier Git revision, and lets auto-sync do the rest — the same path
+a normal deploy takes, so the rollback lands within a reconcile cycle.
+
+Look at the history first. `apprafter app status <app-name>` prints the
+revision the application currently tracks and its last three syncs;
+these are the lines that matter here:
+
+```text
+  revision:      main
+  sync state:    Synced
+  health:        Healthy
+
+Recent revisions (last 3):
+  #  7 9f2c1ab    2026-08-19T18:04:11Z
+  #  6 3e81f40    2026-08-19T11:52:07Z
+  #  5 c07a2d9    2026-08-18T09:20:44Z
+```
+
+With no flag, the rollback goes to the sync **before** the most recent
+one — `3e81f40` above. You are shown both revisions and asked to
+confirm:
+
+```sh
+apprafter app rollback <app-name>
+```
+
+Or name the revision yourself — a commit SHA, a tag or a branch — and
+skip the prompt. `--yes` is required in a non-interactive shell, where
+there is nobody to answer it:
+
+```sh
+apprafter app rollback <app-name> --to 3e81f40 --yes
+```
+
+If the application is deployed to more than one environment, `--env`
+chooses which deployment rolls back. A single deployment resolves from
+the name alone, so the flag is only needed to disambiguate:
+
+```sh
+apprafter app rollback <app-name> --env staging --yes
+```
+
+Two refusals you may meet, both before anything is changed:
+
+- **fewer than two entries in the sync history.** There is no
+  "previous" yet, so pass `--to` with the revision you want.
+- **the revision you asked for is the one already tracked.** The
+  rollback would be a no-op, and the CLI says so rather than issuing an
+  empty change.
+
+### It rolls back Git, not the image
+
+The rollback moves the revision your manifest is rendered from. If the
+regression arrived as a **new build pushed under an unchanged tag**,
+the older commit still names that same tag, resolution still finds the
+same current digest, and you get the same bad image back.
+
+- The manifest changed (a new tag, an env value, replica count) →
+  `apprafter app rollback`.
+- The image behind an unchanged tag changed → the escape hatches below.
+
+### A rollback pins you off the branch
+
+`apprafter app add` normally leaves an application tracking a
+**branch** — the one you were on, or `main` when it had no way to tell
+(`--branch` overrides it). Rolling back replaces that with the single
+revision you rolled back to, which is the point: pushes to the branch
+stop deploying, so the bad revision cannot arrive again while you fix
+it. `apprafter app status` shows the change, with the `revision:` line
+reading a commit instead of a branch name.
+
+When the fix is merged, resume tracking with the same command — `--to`
+takes the branch name:
+
+```sh
+apprafter app rollback <app-name> --to main --yes
+```
+
 ## Escape hatches
 
 Two standard `kubectl` commands cover the cases the auto-deploy loop
@@ -135,9 +218,10 @@ does not:
   kubectl rollout restart deployment/<app-name>
   ```
 
-- **Revert to the previous build.** `git revert` of a same-tag push
-  is not a true image rollback, because the tag in Git is unchanged.
-  To roll the `Deployment` back to its previous pod template:
+- **Revert to the previous build.** Neither `git revert` of a same-tag
+  push nor `apprafter app rollback` is a true image rollback, because
+  the tag in Git is unchanged either way. To roll the `Deployment` back
+  to its previous pod template:
 
   ```sh
   kubectl rollout undo deployment/<app-name>
