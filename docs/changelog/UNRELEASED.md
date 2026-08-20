@@ -9,6 +9,159 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.47 — 2.19i the missing guides: five, not fifteen (2026-08-20)
+
+> **CLI patch release; no chart, operator or cue-cmp release.** The guides
+> change no code. What changes the shipped binary is one `about`:
+> `apprafter plan --help` no longer promises a diff the command never
+> computes. `cli/Cargo.toml` is bumped 0.2.46 → 0.2.47 in the same commit,
+> per the rule that `apprafter --version` names the code it is running, and
+> `docs/reference/cli/commands.json` moves by its `cli_version` line and the
+> `plan` entry, regenerated in the same commit.
+>
+> Ninth of the documentation track's ten subphases — branch
+> `feat/2.19i-missing-guides`, **ADR 0057** (see its 2.19i amendment for the
+> corrected inventory command, why the original produced three different
+> answers, the three deliberate absences, and the four cross-guide
+> contradictions resolved at the wiring step).
+>
+> ### The count in the roadmap was never re-derived, and it was wrong
+>
+> This subphase was carried as "roughly fifteen missing guides" from the
+> spec onward. Nothing re-checked it for seven subphases — the same defect
+> this track polices in every comment it reviews, applied to its own
+> roadmap. Re-derived from the shipped command tree it is **five**, closing
+> **seven** untaught leaf commands. Three more commands are deliberately
+> left undocumented, and that is a finding rather than a gap.
+
+### Added
+
+- **`docs/dev-guide/resources-and-autoscaling.md`** — the capability with
+  zero prior coverage. What a container asks for when the manifest is
+  silent (requests `cpu: 25m` / `memory: 32Mi`, limits `memory: 512Mi`, and
+  **no** CPU limit), how to set an explicit block, and the fact that
+  writing one is also the opt-out: any `resources` block removes that
+  application's autoscaler. Covers the `InPlace` / `RequestsOnly` update
+  policy, reading `VPA reco:` out of `apprafter app status` (including why
+  its `limits.` prefix is a mislabel and what `uncapped` means when an
+  application is being OOM-killed), and the cluster-wide
+  `apprafter platform autoscale show|set`. Closes `platform autoscale set`
+  and `platform autoscale show`.
+- **`docs/dev-guide/secrets.md`** — sealing an application secret and
+  binding it to an env-var. The page leads with the sharp edge rather than
+  filing it under troubleshooting: `apprafter secret seal --namespace`
+  defaults to `apprafter-system`, which is right for platform credentials
+  and wrong for an application secret, and the failure is silent at seal
+  time — the command succeeds, the controller unseals a healthy `Secret`,
+  and the app sits at `EnvSecretMissing` forever. Also documents that the
+  sealing scope is the literal `<namespace>/<name>`, so a mis-sealed secret
+  can be neither moved nor renamed, and that the diagnostic folds "not
+  found" and "missing key" into one message — with the two commands that
+  tell them apart. Closes `secret remove`.
+- **`docs/dev-guide/environments.md`** — deploying one manifest as two
+  deployments. What an environment selects and what it is not (not a
+  namespace-per-team model, not a cluster mode, not a Git branch, not a
+  tenant boundary), how `--env` is checked against the manifest before
+  anything reaches the cluster, the cluster-wide soft default, and the rule
+  that every `apprafter app` verb takes the **logical** name with `--env`
+  only to disambiguate. Closes `platform env set` and `platform env show`.
+- **`docs/operator-guide/choosing-the-machine.md`** — raised from a single
+  troubleshooting line to a page, for a capability whose introduction was a
+  breaking change. Reading the live catalogue and its filter grammar, the
+  five-rung resolution order and which source each printed label names, the
+  x86-only constraint (every platform image is published `linux/amd64`),
+  what happens to a cluster provisioned before the implicit default was
+  removed, and why the machine of a running cluster is a rebuild — with the
+  trap that makes a naive rebuild a no-op. **Names no machine type on
+  purpose**: the catalogue is the provider's, live and per-region, and the
+  picker is the list.
+
+### Changed
+
+- **`apprafter plan`'s `about`** no longer claims a capability it does not
+  have. It read "Show the diff between the desired state and what is live";
+  `cli/platform-cli/src/commands/plan.rs` builds a `DryRunProvider` and
+  never contacts the provider, so the output is the constant `no changes`.
+  Rewritten caveat-first — the generated reference lifts the lead sentence
+  into the overview table and the page description — naming `apprafter
+  apply` as where the comparison actually lives and `target show` /
+  `platform status` / `app status <name>` as the read-only views.
+  `apprafter status` is deliberately **not** named: its own `about` says it
+  is a skeleton that never contacts the cluster.
+- **`docs/operator-guide/target-store.md`** gained the rest of a target's
+  life — `target show`, `target rename`, `target remove` — as sections
+  rather than a page of its own, so `target use` and `target remove` are
+  not in different places. Leads with the consequence that matters:
+  **removing a target deletes the local record, not the servers**, and the
+  record is the only local copy of the provisioned resource IDs. The
+  file-layout diagram is corrected with it — `state/<target>/` was
+  described as a "runtime cache. Reserved.", which it has not been since
+  state moved out of `<cwd>/.apprafter/`. Closes `target show`,
+  `target rename` and `target remove`.
+- **`docs/dev-guide/image-iteration.md`** gained `apprafter app rollback`,
+  placed there because that page already teaches how a deploy happens and
+  how to undo one. The distinction it turns on: a rollback moves the Git
+  revision, so it does nothing for a bad build pushed under an unchanged
+  tag. The page's existing "Revert to the previous build" bullet, which
+  taught `kubectl rollout undo` as the only revert while a first-class
+  command shipped, is corrected to name both. Closes `app rollback`.
+- **Both section indexes rebuilt as maps.** `docs/dev-guide/index.md` was a
+  flat list of six bullets and three more would have made nine; it is now
+  grouped by the job, the same idiom the operator index already uses.
+- **`docs/operator-guide/index.md`'s tier-upgrade entry** said "`apprafter
+  upgrade-tier` exists and the safety semantics run through
+  `MigrationPlan`", which reads as though the capability ships and only the
+  guide is missing. It now says plainly that the command is not implemented
+  in this release, so this is a missing capability rather than a missing
+  page.
+- **Four contradictions between guides written in parallel**, resolved
+  before publication rather than shipped: `--env` on an ambiguous
+  application was documented as prompting when the code returns an error;
+  two multi-environment examples pinned `metadata.namespace`, demonstrating
+  exactly the collision the new page warns about; the five per-field merge
+  rules were stated twice near-verbatim (the canonical statement stays in
+  `docs/dev-guide/application-cue.md`, the field reference, and the new page
+  links to it); and `examples/applications/parser.cue` was advertised in the
+  developer index as "a worked multi-environment manifest" when it pins a
+  namespace and its `dev` override sets an `expose.network` the admission
+  webhook rejects — the pointer is removed.
+- **`docs/measurements/docs-health.json` re-recorded** with `docsgen
+  metrics`. The committed floor had drifted to `32/398/246/2/17/91/68/2`,
+  well below the live reading, because it ratchets only on a fall — which
+  meant the five new pages could have been gutted for free. Now
+  `37/566/322/5/22/104/76/2`.
+
+### Notes
+
+- **The gate checks names, not truth.** It resolves command paths, flag
+  names, schema identifiers, repository paths and ADR citations; it does
+  not check values, ordering, or whether a command succeeds. Every value on
+  the five pages was therefore checked against the code that parses it, and
+  every command safe without a cluster was run — including the error
+  strings, which are transcripts rather than paraphrases.
+- **`code_paths` did not move** — 104 before and after. The guides cite
+  absolute GitHub URLs where they need a repository file, so a reader with
+  only the release binary can follow every page.
+- **Recorded, not fixed**, each with a probe: `ServerTypeNotSelected`'s help
+  tells the reader to set `nodes[0].kind` in the Infrastructure manifest,
+  but the key is `type` (`kind` is only the Rust field name behind a
+  `serde(rename)`) — fixing it would move `commands.json` a second time in a
+  subphase whose CLI change is meant to be one `about`;
+  `cli/platform-cli/src/examples.rs` uses `cx22`/`cx32` in five examples
+  which this repository's own changelog calls retired, unresolvable without
+  a provider token, which is why the machine guide names no type at all;
+  and `docs/operator-guide/troubleshooting.md` advises passing `--region`
+  alongside `--server-type` on the provisioning command, where `--region`
+  does not exist — the gate passes it because the two flags are never
+  written in one invocation.
+- **2.19h predicted this subphase would be blocked by two of its unbuilt
+  items.** It expected the secrets guide to be unable to say what is sealed
+  and where without `secret list` and a namespace wizard. The guide answers
+  both, with `kubectl` — honest, but a `kubectl` answer on a page whose
+  whole subject is a first-class CLI task. Both remain unbuilt, and the
+  guide is now the evidence that they are wanted rather than the blocker
+  that was predicted.
+
 ## cli v0.2.46 — 2.19h CLI UX: a worked example on every command, shell completions, and two guards (2026-08-19)
 
 > **CLI patch release; no chart, operator or cue-cmp release.** Re-derive

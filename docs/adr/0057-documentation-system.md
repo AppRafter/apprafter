@@ -1853,6 +1853,203 @@ is allowed to do.
   with `KeyError: 'reference/cli/completion/'` rather than saying the page is
   untracked. Staging fixes it. Reported twice now, still unfixed.
 
+## Amendment — 2.19i (the missing guides) as delivered, 2026-08-20
+
+The last content subphase, and the one this whole track was sequenced to make
+writable. It closes with **five** guides, not the "roughly fifteen" the
+Deferred bullet below has carried since this ADR was written.
+
+### The figure was never re-derived, and it was wrong in both directions
+
+"Roughly fifteen missing guides" was an estimate made before any of the
+machinery existed. Nothing re-checked it for seven subphases — the same defect
+this track polices in every comment it reviews, applied to its own roadmap.
+Re-derived from the shipped command tree rather than from the estimate:
+
+```bash
+python3 - <<'PY'
+import json, pathlib
+d = json.loads(pathlib.Path('docs/reference/cli/commands.json').read_text())
+real = [c for c in d['commands'] if c['path'] and not c['hidden']]
+leaf = [c for c in real if not any(o['path'][:len(c['path'])] == c['path']
+                                   and len(o['path']) > len(c['path']) for o in real)]
+guides = [p for p in pathlib.Path('docs').rglob('*.md')
+          if not str(p).startswith(('docs/adr/', 'docs/changelog/', 'docs/measurements/',
+                                    'docs/superpowers/', 'docs/reference/', 'docs/contributing/'))]
+text = {str(p): p.read_text() for p in guides}          # keyed by PATH, not by p.name
+for c in leaf:
+    inv = 'apprafter ' + ' '.join(c['path'])
+    if not any(inv in t for t in text.values()):
+        print(inv)
+PY
+```
+
+**The `str(p)` in that line is a correction, and the original defect is worth
+recording because it produced three different answers to one question.** The
+plan for this subphase keyed the corpus by `p.name`, so same-basename pages
+overwrite each other in the dict: `docs/index.md`, `docs/dev-guide/index.md`
+and `docs/operator-guide/index.md` collapse to one entry, as do the two
+`quickstart.md`. Which one survives is dictionary-insertion order, so the
+figure is not stable — the plan measured **12** at `0a2ba48`, re-running its
+exact command on the same tree gave **11**, and keyed by full path the answer
+is **10**. The two extras in the plan's count were `apprafter target show`
+(shown twice in `docs/operator-guide/quickstart.md`) and `apprafter
+upgrade-tier` (named in `docs/operator-guide/index.md`) — both pages lost to a
+basename collision. Neither was a gap.
+
+Of the stable 10, **three are deliberate absences** (below), so the real work
+was **seven untaught leaf commands**, and they cluster onto five capabilities:
+
+| Guide | Untaught leaves it closes |
+|---|---|
+| `docs/dev-guide/resources-and-autoscaling.md` | `platform autoscale set`, `platform autoscale show` |
+| `docs/dev-guide/secrets.md` | `secret remove` |
+| `docs/dev-guide/environments.md` | `platform env set`, `platform env show` |
+| `docs/operator-guide/choosing-the-machine.md` | — (raises a one-mention capability to a page) |
+| `docs/operator-guide/target-store.md` + `docs/dev-guide/image-iteration.md` | `target show`, `target rename`, `target remove`, `app rollback` |
+
+The fifth row is two extensions rather than a new page, decided on content:
+`target show`/`rename`/`remove` complete the lifecycle `target-store.md`
+already opens with `add`/`list`/`use`, and splitting them across two pages
+would have put `target use` and `target remove` in different places.
+`app rollback` went to `image-iteration.md` because that page already teaches
+"how a deploy happens and how to undo one" — and because its existing escape-
+hatch bullet taught `kubectl rollout undo` as the *only* revert while a
+first-class command shipped. That bullet is corrected in the same change.
+
+### The three deliberate absences
+
+`apprafter login`, `apprafter upgrade-tier` and `apprafter plan` are
+**deliberately undocumented, and will re-appear in any future run of the
+command above.** They are not an oversight and must not be written:
+
+- **`apprafter login`** — its own `about` opens "NOT IMPLEMENTED, it prints
+  what it would do and writes nothing", and points at `apprafter kubeconfig`
+  as today's answer.
+- **`apprafter upgrade-tier`** — likewise "NOT IMPLEMENTED, it validates
+  `--to` and prints the move it would make". `docs/operator-guide/index.md`
+  now says so in reader terms under "Not documented yet"; it previously read
+  "`apprafter upgrade-tier` exists and the safety semantics run through
+  `MigrationPlan`", which describes the capability as shipped and only the
+  guide as missing. Corrected here.
+- **`apprafter plan`** — a skeleton over `DryRunProvider`.
+
+A guide for any of the three would document the future, which this project has
+ruled out. Note that `upgrade-tier` no longer appears in the command's output
+*because it is now named as absent* — the check is a mention test, not a
+teaching test, and this is the one place that distinction bites. A reader
+re-running it and seeing two rather than three should not conclude that
+`upgrade-tier` acquired a guide.
+
+### One defect the inventory surfaced, fixed rather than documented
+
+`apprafter plan`'s `about` read "Show the diff between the desired state and
+what is live" — but `cli/platform-cli/src/commands/plan.rs` constructs a
+`DryRunProvider` and never reads the provider. `login` and `upgrade-tier` say
+plainly that they are not implemented; `plan` claimed a capability it does not
+have. The `about` is rewritten caveat-first (the generated reference lifts the
+lead sentence into the overview table and the page description, so a caveat in
+sentence two is invisible where the reader decides), naming `apprafter apply`
+as where the comparison actually lives and `target show` / `platform status` /
+`app status` as the read-only views. `apprafter status` was deliberately **not**
+named: its own `about` says it is a skeleton that never contacts the cluster,
+so pointing one skeleton at another is no answer.
+
+### Contradictions between guides written in parallel, and how each was resolved
+
+The five were written concurrently and could not see each other. Four
+disagreements survived to the wiring step:
+
+- **`--env` on an ambiguous app: "asks" versus "errors".**
+  `environments.md`'s command table said the CLI "asks when there are two or
+  more" while its own prose two sections later said it errors, and
+  `image-iteration.md` said the flag "is only needed to disambiguate".
+  `single_deployment_or_guidance` in `cli/platform-cli/src/commands/app.rs`
+  returns `Err(per_env_guidance_message(…))` for two or more. The table now
+  says it stops and lists them.
+- **`metadata.namespace` pinned in a multi-environment example.**
+  `environments.md` establishes that a manifest pinning `metadata.namespace`
+  renders the same object for every environment — the configuration plugin
+  stamps `spec.environment` and a label but never renames the CR — so a second
+  environment collides. Both `docs/dev-guide/application-cue.md`'s
+  multi-environment example and `resources-and-autoscaling.md`'s example
+  pinned one while declaring `environments`, demonstrating the trap the new
+  page warns against. Both now omit it, with the reason in a comment;
+  `secrets.md` keeps its pin (its example declares no environments) and gained
+  a pointer where it discusses sealing per environment.
+- **The five per-field merge rules stated twice, near-verbatim.**
+  `application-cue.md` §"Multi-environment patterns" and `environments.md`
+  each carried the full list. Two parallel enumerations of one rule set drift.
+  `application-cue.md` stays canonical — the merge rule is a field semantic
+  and that page is the field reference — and `environments.md` compresses to a
+  one-sentence summary plus a link, keeping only its own outcome tables.
+- **`examples/applications/parser.cue` described as "a worked
+  multi-environment manifest"** in the developer index. It pins
+  `metadata.namespace: "demo"` and its `dev` override sets
+  `expose.network: "vpn"`, which `operator/admission-webhook/src/validator.rs`
+  rejects outright. The pointer is removed rather than repaired; the file
+  itself is a `cue vet` fixture and is left alone.
+
+### Both section indexes were rebuilt as maps
+
+`docs/dev-guide/index.md` was a flat list of six bullets; three more would have
+made nine, which is a list nobody reads. It is now grouped by the job — get
+something running, describe your application, give it a dependency, ship it —
+the same idiom 2.19f gave the operator index for the same reason.
+
+### Consequences
+
+- **This subphase cuts a CLI patch release, `v0.2.47`.** Not for the guides:
+  the `plan` `about` fix changes `apprafter plan --help`, so the shipped
+  binary changes, and the rule that `apprafter --version` names the code it is
+  running applies. `cli/Cargo.toml` moves 0.2.46 → 0.2.47 and
+  `docs/reference/cli/commands.json` moves by exactly its `cli_version` line,
+  regenerated in the same commit. No chart, operator or configuration-plugin
+  artefact is touched.
+- **The census grew on every axis and shrank on none.** Live gate readings,
+  `0a2ba48` → this commit: 33 → 37 pages, 427 → 566 invocations, 248 → 322
+  identifiers, 2 → 5 complete CUE documents in 17 → 22 `cue` fences, 104 → 104
+  code paths, 70 → 76 ADR references, and the LLM artefacts 60 → 64 indexed /
+  119 → 123 bundled / 119 → 123 twins. **Exemptions stayed at 2** — five new
+  pages needed no escape hatch. The *committed* floor had drifted well below
+  the live reading (it still said 32/398/246/2/17/91/68/2, last written before
+  2.19h) because it ratchets only on a fall; `docsgen metrics` re-records it
+  here, which is what actually defends the new pages against being gutted.
+- **`code_paths` did not move at all** — 104 before and 104 after. That is the
+  "assume no repository checkout" rule showing up as a number: the five pages
+  cite absolute GitHub URLs where they need a repository file and backtick no
+  source path a reader without a checkout could not open.
+- **Two of 2.19h's five unbuilt items had their trigger here, and it did not
+  fire the way that amendment predicted.** It expected the sealed-secrets
+  guide to be unable to say what is sealed and where without `secret list` and
+  a namespace wizard. The guide answers both with `kubectl get sealedsecrets
+  --all-namespaces` and a key listing, which is honest but is a `kubectl`
+  answer on a page whose whole subject is a first-class CLI task. `secret
+  list` and the wizard remain unbuilt, and the guide is the evidence that they
+  are wanted rather than the blocker that was predicted.
+- **`ServerTypeNotSelected`'s help names a manifest field that does not
+  exist.** It tells the reader to set `nodes[0].kind`; the manifest key is
+  `type` (`kind` is only the Rust field name behind a `serde(rename)`).
+  `choosing-the-machine.md` quotes the real message and corrects it in prose
+  rather than printing a field CUE will reject. The fix belongs in
+  `cli/cli-core/src/error.rs` and is not made here — it would move
+  `commands.json` a second time in a subphase whose CLI change is meant to be
+  one `about`.
+- **Shipped examples name `cx22`/`cx32`, which this repository's own changelog
+  says were retired.** `cli/platform-cli/src/examples.rs` uses them in five
+  places, which propagate into the generated reference and into
+  `docs/reference/environment.md`. Either the examples teach a dead machine
+  type or the changelog over-generalised a region-specific retirement; it
+  could not be settled without a provider token. `choosing-the-machine.md`
+  therefore names **no** machine type at all and teaches the picker as the
+  list, which is the durable answer regardless of how that question resolves.
+- **`docs/operator-guide/troubleshooting.md` gives advice that cannot be
+  followed**: under `server_type_unavailable` it says to pass `--server-type`
+  "with `--region`" on the provisioning command, but `--region` exists only on
+  `target add` and `init`. The gate passes it because the two flags are never
+  written in one invocation — a live example of "the gate checks names, not
+  truth". Recorded, not fixed.
+
 ## Alternatives considered
 
 - **Port the site to VitePress or Astro Starlight.** Rejected. The 93 existing
@@ -1946,7 +2143,13 @@ is allowed to do.
   hard error, not a to-do.
 - **The guide content** — roughly fifteen missing guides for capabilities that
   exist only in `--help` today. Last, because every earlier package is a
-  precondition for writing one that stays true.
+  precondition for writing one that stays true. *(Delivered in 2.19i — and
+  "roughly fifteen" was **wrong**: re-derived from the command tree it is
+  five, closing seven untaught leaf commands, with three more deliberately
+  left undocumented because they are not implemented. See the 2.19i amendment
+  above for the corrected inventory command, why the original produced three
+  different answers, the three deliberate absences, and the contradictions
+  between guides written in parallel.)*
 
 ## Owner
 
