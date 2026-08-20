@@ -12,9 +12,14 @@ patch of each phase.
 ## cli v0.2.47 — 2.19i the missing guides: five, not fifteen (2026-08-20)
 
 > **CLI patch release; no chart, operator or cue-cmp release.** The guides
-> change no code. What changes the shipped binary is one `about`:
+> change no code. What changes the shipped binary is two `about` texts.
 > `apprafter plan --help` no longer promises a diff the command never
-> computes. `cli/Cargo.toml` is bumped 0.2.46 → 0.2.47 in the same commit,
+> computes; and `apprafter destroy --help` now opens with its real scope —
+> every `apprafter=true`-labelled resource in the token's **project**, not
+> one cluster. The second landed late, after a review found that the prose
+> sweep correcting eight pages had left untouched the sentence a reader of a
+> destructive command meets first, which is also the reference page's title,
+> its `description` and what `--help` prints. `cli/Cargo.toml` is bumped 0.2.46 → 0.2.47 in the same commit,
 > per the rule that `apprafter --version` names the code it is running, and
 > `docs/reference/cli/commands.json` moves by its `cli_version` line and the
 > `plan` entry, regenerated in the same commit.
@@ -219,8 +224,10 @@ see, which is why three reviews found them and `just lint` did not.
 - **Recorded, not fixed**, each with a probe: `ServerTypeNotSelected`'s help
   tells the reader to set `nodes[0].kind` in the Infrastructure manifest,
   but the key is `type` (`kind` is only the Rust field name behind a
-  `serde(rename)`) — fixing it would move `commands.json` a second time in a
-  subphase whose CLI change is meant to be one `about`;
+  `serde(rename)`) — deferred because it is an error-message fix in
+  `cli/cli-core/src/error.rs` rather than documentation, not because the
+  subphase was holding to a single `about` (it ended with two, the second
+  being the `destroy` scope correction above);
   `cli/platform-cli/src/examples.rs` uses `cx22`/`cx32` in five examples
   which this repository's own changelog calls retired, unresolvable without
   a provider token, which is why the machine guide names no type at all;

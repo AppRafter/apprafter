@@ -2103,9 +2103,12 @@ what that command's blast radius is, in the same breath, from the source.
   `type` (`kind` is only the Rust field name behind a `serde(rename)`).
   `choosing-the-machine.md` quotes the real message and corrects it in prose
   rather than printing a field CUE will reject. The fix belongs in
-  `cli/cli-core/src/error.rs` and is not made here — it would move
-  `commands.json` a second time in a subphase whose CLI change is meant to be
-  one `about`.
+  `cli/cli-core/src/error.rs` and is not made here because it is an
+  error-message change rather than a documentation one. The reason first
+  written here — that the subphase was holding its CLI change to a single
+  `about` — did not survive: a review found `destroy`'s own `about`
+  asserting the narrow scope this subphase had just spent eight pages
+  correcting, so the subphase ends with two.
 - **Shipped examples name `cx22`/`cx32`, which this repository's own changelog
   says were retired.** `cli/platform-cli/src/examples.rs` uses them in five
   places, which propagate into the generated reference and into
