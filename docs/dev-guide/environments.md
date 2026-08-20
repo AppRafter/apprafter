@@ -271,6 +271,22 @@ row, and a base-only deployment reads `(base)`:
 apprafter app list
 ```
 
+```text
++----------------+---------+---------+------------------------------------+--------+--------+---------+
+| NAME           | ENV     | PROJECT | REPO                               | REV    | SYNC   | HEALTH  |
++----------------+---------+---------+------------------------------------+--------+--------+---------+
+| parser-prod    | prod    | apps    | https://github.com/acme/parser.git | v1.4.0 | Synced | Healthy |
++----------------+---------+---------+------------------------------------+--------+--------+---------+
+| parser-staging | staging | apps    | https://github.com/acme/parser.git | main   | Synced | Healthy |
++----------------+---------+---------+------------------------------------+--------+--------+---------+
+```
+
+**Read the logical name off that table by stripping the `ENV` suffix**,
+because no column carries it: `NAME` is the per-environment identity
+`<app>-<env>`, which is the Argo CD application's own name. Here the
+logical name is `parser`, and it is `parser` you type at every
+`apprafter app` command below.
+
 `apprafter app status` takes the **logical** name and aggregates: it
 finds every environment of that app and prints a full detail block for
 each, separated by a rule. When there is more than one, a header lists
@@ -291,9 +307,17 @@ one environment shows which one it is too.
 
 ## Working with one environment
 
-Every `apprafter app` command takes the **logical** name — `parser`, the
-name you passed to `apprafter app add` and the one `apprafter app list`
-shows. You never type `parser-prod`. `--env` exists only to say *which*
+Every `apprafter app` command takes the **logical** name — `parser`. It
+is what you passed to `apprafter app add --name`, or, when you passed no
+`--name`, the repository's own last path segment: `.git` dropped,
+lowercased, and every character that is not a letter, digit or `-` folded
+to `-` (so a `https://github.com/acme/parser.git` remote gives `parser`,
+and `.../My_App` gives `my-app`). It is **not** a column of
+`apprafter app list`,
+which shows the per-environment `<app>-<env>` identity instead — see
+[above](#seeing-which-environment-a-deployment-is-in).
+
+You never type `parser-prod`. `--env` exists only to say *which*
 deployment you mean, and only when there is more than one:
 
 | Command | `--env` | Without it |

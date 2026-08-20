@@ -135,8 +135,52 @@ typo here surfaces as a failed sync rather than as a local error:
 
 ```sh
 apprafter app validate                 # shape: passes on "12x"
-apprafter app status reporting         # after the push: the sync error names the field
 ```
+
+After the push, `apprafter app status` tells you *that* it failed — the
+deployment sits at `sync state: OutOfSync` and never leaves it:
+
+```sh
+apprafter app status reporting
+```
+
+```text
+Application argocd/reporting
+  project:       apps
+  repo:          https://github.com/acme/reporting.git
+  revision:      HEAD
+  path:          apprafter
+  destination:   reporting
+  environment:   (base)
+  sync state:    OutOfSync
+  health:        Missing
+
+(workload detail unavailable — app not synced yet)
+```
+
+It does not tell you *why*. The block above is everything
+`apprafter app status` prints — it reads Argo CD's sync and health
+summary and the workload underneath, and neither the sync conditions nor
+the operation result are among them, so the rejection text appears
+nowhere in it.
+
+That text is on the Argo CD Application, and `kubectl` is what reads it
+today. Point it at the cluster with `apprafter kubeconfig` if you have
+not already, then ask for the sync conditions — by the **Argo CD
+application name**, which is `<app>` for a base-only deployment and
+`<app>-<env>` for an environment one:
+
+```sh
+kubectl -n argocd get application.argoproj.io reporting \
+    -o jsonpath='{range .status.conditions[*]}{.type}: {.message}{"\n"}{end}'
+```
+
+The `SyncError` line it prints wraps the webhook's own sentence — the one
+quoted above, naming the field and the value: `resources.limits.memory
+value "12x" must be a Kubernetes quantity …`.
+`{.status.operationState.message}` carries the same sentence behind the
+apply-level prefix, and is the one to reach for when the conditions list
+is empty.
 
 ## What the platform does when you leave it alone
 
