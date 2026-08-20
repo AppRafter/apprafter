@@ -31,9 +31,13 @@ Guide](../dev-guide/index.md) is the shorter path.
 - [Node preparation](node-prep.md) — the control-plane reservations and
   host swap a Tier-1 node needs, what `apprafter node prep` applies, and
   how to read the result.
-- [Connect a Git repository](connect-a-git-repository.md) — pointing
-  Argo CD at your repository, for each combination of GitHub or GitLab
-  and public or private.
+- [Private repos & registries](../dev-guide/private-repos-and-registries.md)
+  — `apprafter repo creds add` registers one credential that Argo CD
+  clones private repositories with and the node pulls private images
+  with, for GitHub, GitLab and self-hosted Gitea or Forgejo. A public
+  repository needs none of this: registering an application with
+  `apprafter app add` is the whole step, and the
+  [developer quickstart](../dev-guide/quickstart.md) walks it.
 
 ## Put it on the internet
 

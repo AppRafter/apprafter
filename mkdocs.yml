@@ -174,7 +174,6 @@ nav:
       # provisioning it can only be changed by rebuilding.
       - Choosing the machine: operator-guide/choosing-the-machine.md
       - Node preparation: operator-guide/node-prep.md
-      - Connect a Git repository: operator-guide/connect-a-git-repository.md
       # Public ingress was a top-level section of two pages. Both are
       # about cluster-owned resources (the zones on the platform Gateway
       # and the certificate that terminates TLS for them), which is

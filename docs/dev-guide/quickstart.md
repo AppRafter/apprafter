@@ -458,7 +458,5 @@ Drop the `--yes` to be prompted for confirmation first.
   guide — the full public-ingress runbook.
 - [operator quickstart](../operator-guide/quickstart.md) — the full
   cluster lifecycle and day-2 operations.
-- [Connect a Git repository](../operator-guide/connect-a-git-repository.md)
-  — wiring Argo CD to GitHub / GitLab, public and private.
 - [`schemas/v1alpha1/application.cue`](https://github.com/apprafter/apprafter/blob/master/schemas/v1alpha1/application.cue) —
   the Application CRD shape your manifest is validated against.

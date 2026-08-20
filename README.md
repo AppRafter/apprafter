@@ -107,7 +107,7 @@ Full operator and developer documentation:
 - [Operator quickstart](./docs/operator-guide/quickstart.md) — provision and bootstrap a Tier-1 cluster.
 - [Platform management](./docs/operator-guide/platform-management.md) — PlatformStack lifecycle, channels, upgrade and freeze.
 - [Migration plans](./docs/operator-guide/migration-plans.md) — approve and reject destructive-change gates.
-- [Connect a Git repository](./docs/operator-guide/connect-a-git-repository.md) — wiring Argo CD to your Git repositories.
+- [Private repos & registries](./docs/dev-guide/private-repos-and-registries.md) — registering the credential Argo CD clones with and the node pulls with.
 - [Writing Application.cue](./docs/dev-guide/application-cue.md) — the CUE manifest format, CMP, and multi-environment patterns.
 
 ## License

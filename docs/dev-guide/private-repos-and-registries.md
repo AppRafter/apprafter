@@ -82,19 +82,16 @@ tokens → Tokens (classic)**.
 ## Private source repo only (no private image)
 
 If your image is public but the **source repo** is private, you only
-need the Git-clone half. Two ways in:
+need the Git-clone half — and it is the same `apprafter repo creds add`
+as above, run once after the cluster is up. There is no separate
+bootstrap-time path: a repository becomes the cluster's business when
+you register an application from it with `apprafter app add`, never
+before.
 
-- **Per-app, after bootstrap** — the same `apprafter repo creds add`
-  as above. A private repo clone on GitHub also accepts a
-  **fine-grained PAT** (Contents: Read-only) *if that credential is
-  used for Git only* — but if the same prefix also pulls a private
-  GHCR image, fall back to the classic PAT per the rule above.
-- **The cluster's own bootstrap/state repo** — that is a separate,
-  bootstrap-time path driven by `APPRAFTER_ARGOCD_REPO_TOKEN`, and it
-  is **Git-only** (Argo CD never pulls an image for it), so a
-  fine-grained PAT is fine there. The four `(GitHub | GitLab) ×
-  (public | private)` quadrants are walked end-to-end in
-  [Connect a Git repository](../operator-guide/connect-a-git-repository.md).
+A private repo clone on GitHub also accepts a **fine-grained PAT**
+(Contents: Read-only) *if that credential is used for Git only* — but
+if the same prefix also pulls a private GHCR image, fall back to the
+classic PAT per the rule above.
 
 GitLab private repos use a **Project Access Token** with
 `read_repository`; self-hosted Gitea/Forgejo use an arbitrary token
@@ -122,6 +119,12 @@ passing), Argo CD or the kubelet will fail at clone/pull time.
   [Troubleshooting → registry auth](../operator-guide/troubleshooting.md#registry-auth).
 - **`401` / `404`** in the Argo CD UI on the source repo → the
   Git credential is expired, lacks repo access, or wasn't registered
-  for the matching `--url-prefix`. See the
-  [Connect a Git repository](../operator-guide/connect-a-git-repository.md)
-  troubleshooting tables.
+  for the matching `--url-prefix`. Run `apprafter repo creds show` and
+  read the validity verdict: anything other than `GitValid=True` is the
+  answer, and [Verify and rotate](#verify-and-rotate) above has the
+  rotate/re-register commands. Treat a `404` on a repository you can
+  browse in a web UI as an auth failure rather than a missing repo —
+  GitHub and GitLab both answer `404` instead of `403` for a private
+  repository the credential may not read, so the cause is either no
+  registered prefix matching this `repoURL` or a token without access
+  to it.

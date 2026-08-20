@@ -438,7 +438,7 @@ workflow publishes, and move it deliberately.
 | Pods stuck on `ImagePullBackOff`, or the Application says `ResolveFailed` | Step 1 — the package is private and the cluster has no credential covering it. Also [Troubleshooting → registry auth](troubleshooting.md#registry-auth). |
 | The site answers but the landing still badges Docs "Soon" | Step 5, and note there are two values: the CMS global feeds the preview build, the tracked fallback JSON feeds the released image. |
 | Applications nobody asked for appeared alongside it | The registration was made without `--path docs-site`, so the whole repository was rendered. Remove it with `apprafter app remove` and register again. |
-| Argo CD never syncs at all | The repository connection: [Connect a Git repository](connect-a-git-repository.md). |
+| Argo CD never syncs at all | The repository credential — `apprafter repo creds show` must report `GitValid=True` for a prefix covering this repo: [Private repos & registries](../dev-guide/private-repos-and-registries.md). |
 
 ## For contributors
 

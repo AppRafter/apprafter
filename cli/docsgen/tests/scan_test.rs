@@ -217,9 +217,11 @@ fn a_stray_backtick_in_a_heading_does_not_swallow_the_next_claim() {
 
 #[test]
 fn a_wrapped_shell_pipeline_is_not_a_table_row() {
-    // `operator-guide/connect-a-git-repository.md` verbatim. Bounding
-    // the region on any `|`-leading line splits this span and deletes
-    // the invocation — the same class of loss the bounding prevents.
+    // Taken verbatim from `operator-guide/connect-a-git-repository.md`,
+    // which 2.19j withdrew; the string is kept because the parser
+    // property is what is under test, not the page. Bounding the
+    // region on any `|`-leading line splits this span and deletes the
+    // invocation — the same class of loss the bounding prevents.
     let src = "- `kubectl` configured against the cluster (run `apprafter kubeconfig\n  \
                | tee /tmp/kc` and `export KUBECONFIG=/tmp/kc`).\n";
     let bodies: Vec<String> = blocks(src)

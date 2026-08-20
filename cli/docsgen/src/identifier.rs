@@ -11,12 +11,15 @@
 //! (in `operator-guide/egress-policy.md`), and the apiserver
 //! **prunes** an unknown key rather than rejecting it, so a reader who
 //! copies the block gets a silent no-op and an apply-and-see check
-//! reports success. A third
-//! (in `operator-guide/connect-a-git-repository.md`) is worse in a
-//! quieter way: it
-//! is a manifest committed to a GitOps repository and applied by
-//! Argo CD, so the pruning happens with nobody at a terminal at all.
-//! Membership is the only gate that sees any of them.
+//! reports success. A third sat in a manifest a page told the reader
+//! to commit to a GitOps repository for Argo CD to apply, which is
+//! worse in a quieter way: the pruning happens with nobody at a
+//! terminal at all. (That page, `connect-a-git-repository.md`, was
+//! withdrawn in 2.19j — the bootstrap-repository capability it
+//! documented was removed in v0.1.97 — so only the first two are
+//! still findable in the corpus. The class is the point, not the
+//! count: any fence a reader is told to commit rather than run has
+//! it.) Membership is the only gate that sees any of them.
 //!
 //! # The two surfaces, and why they are extracted differently
 //!
@@ -323,10 +326,24 @@ impl FieldSet {
     /// `InfrastructureProviderPlugin`, `ServiceProviderPlugin`,
     /// `AccessGrant`, `ExternalSurface`. `Infrastructure` is not an
     /// obscure corner: it is the manifest `apprafter apply` reads, and
-    /// the operator guides name `spec.nodes` and
-    /// `spec.argocd.bootstrapRepo` six times between them. Resolving
-    /// only against CRDs calls all six wrong, and a gate that fails
-    /// correct documentation is a gate that gets switched off.
+    /// the operator guides name `spec.nodes` in several places.
+    /// Resolving only against CRDs calls every one of them wrong, and
+    /// a gate that fails correct documentation is a gate that gets
+    /// switched off.
+    ///
+    /// **This harvest resolves dead fields as readily as live ones,
+    /// and that is a known hole rather than a property.** A CUE
+    /// schema keeps a field until someone removes it from the CUE;
+    /// nothing here asks whether any code still reads it.
+    /// `spec.argocd.bootstrapRepo` and `spec.argocd.bootstrapPath` are
+    /// the standing example — vestigial since v0.1.97 (no reader in
+    /// `cli/` or `operator/`; `cli-core`'s `bootstrap_repo` is
+    /// deserialised and dropped), still resolving here, and they are
+    /// why `connect-a-git-repository.md` passed nine subphases of
+    /// green gates while documenting a capability the product had
+    /// removed. A page can be wholly false and still clear this gate,
+    /// so long as every name on it is spelled right. See
+    /// `docs/measurements/schema-followups.md`.
     ///
     /// Only the `spec` subtree is taken: `apiVersion`, `kind` and
     /// `metadata` are the same shape on every kind and the CRDs

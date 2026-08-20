@@ -284,9 +284,10 @@ byte-identical to the pre-colour baseline.
   credential resolution chain reference.
 - [`troubleshooting.md`](./troubleshooting.md) — diagnostic-code
   catalogue, common failures, recovery commands.
-- [Connect a Git repository](./connect-a-git-repository.md) — wiring
-  Argo CD to a Git repository for GitOps deployment of your
-  applications.
+- [Private repos & registries](../dev-guide/private-repos-and-registries.md)
+  — `apprafter repo creds add`, the one credential Argo CD clones a
+  private repository with and the node pulls a private image with, and
+  the token-scope rules that differ between the two.
 - [`platform-management.md`](./platform-management.md) — platform
   version lifecycle, release channels, upgrade and freeze.
 - [`docs/reference/cli/`](../reference/cli/index.md) — full subcommand

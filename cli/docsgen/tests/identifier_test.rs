@@ -125,10 +125,21 @@ fn a_named_multi_claim_list_keeps_its_type_component() {
 
 #[test]
 fn a_cue_only_schema_still_backs_the_docs_that_name_it() {
-    // connect-a-git-repository.md and troubleshooting.md.
-    // `Infrastructure` is
-    // the manifest `apprafter apply` reads and ships no CRD, so a
-    // CRD-only field set calls both lines wrong.
+    // `Infrastructure` is the manifest `apprafter apply` reads and
+    // ships no CRD, so a CRD-only field set would call every line
+    // naming it wrong. `spec.nodes` is named across
+    // choosing-the-machine.md and troubleshooting.md.
+    //
+    // `spec.argocd.bootstrapRepo` is asserted for the harvesting, NOT
+    // because a page names it — after 2.19j withdrew
+    // connect-a-git-repository.md, no page in the corpus does, and the
+    // field has had no reader in `cli/` or `operator/` since v0.1.97.
+    // It stays here as the live reproduction of the hole documented on
+    // `FieldSet::from_repo`: a dead schema field resolves exactly like
+    // a live one. If the follow-up in
+    // `docs/measurements/schema-followups.md` retires the field from
+    // the CUE, this line is the one that fails — swap it for another
+    // CUE-only path and the coverage is unchanged.
     let f = FieldSet::from_repo(&docsgen::repo_root().unwrap()).unwrap();
     resolve_path(&f, "spec.argocd.bootstrapRepo").expect("Infrastructure field");
     resolve_path(&f, "spec.nodes").expect("Infrastructure field");
