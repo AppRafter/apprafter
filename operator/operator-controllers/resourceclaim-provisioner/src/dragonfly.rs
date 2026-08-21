@@ -99,6 +99,34 @@ pub fn pool_instance_name(persistent: bool, index: u32) -> String {
     format!("platform-redis-{class}-{index:03}")
 }
 
+/// Persistence class of a Dragonfly pool instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolClass {
+    Ephemeral,
+    Persistent,
+}
+
+/// Parse a pool-instance name back into its class — the exact inverse of
+/// [`pool_instance_name`].
+///
+/// `None` for any name that is not one of ours. This is a SAFETY boundary,
+/// not a convenience: the reaper (ADR 0042 §9) deletes by name, so anything
+/// failing to parse here belongs to a user or another system and must never
+/// be touched. Keep it strict — a loose `contains("-persistent-")` would
+/// match a user's own `my-persistent-cache`.
+pub fn class_of_instance(name: &str) -> Option<PoolClass> {
+    let rest = name.strip_prefix("platform-redis-")?;
+    let (class, index) = rest.rsplit_once('-')?;
+    if index.is_empty() || !index.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    match class {
+        "ephemeral" => Some(PoolClass::Ephemeral),
+        "persistent" => Some(PoolClass::Persistent),
+        _ => None,
+    }
+}
+
 /// Deterministic ACL username for a claim (DNS-ish, redis-safe).
 pub fn acl_user(claim_ns: &str, claim_name: &str) -> String {
     format!("claim_{claim_ns}_{claim_name}_redis")
@@ -369,6 +397,44 @@ mod tests {
             pool_instance_name(true, 12),
             "platform-redis-persistent-012"
         );
+    }
+
+    // --- class_of_instance() (ADR 0042 §9 reaper — inverse of the above) ---
+
+    #[test]
+    fn class_of_instance_round_trips_pool_instance_name() {
+        // The reaper deletes BY NAME, so this round-trip is what makes the
+        // naming convention safe to depend on.
+        for persistent in [false, true] {
+            for index in [0u32, 7, 999] {
+                let name = pool_instance_name(persistent, index);
+                let want = if persistent {
+                    PoolClass::Persistent
+                } else {
+                    PoolClass::Ephemeral
+                };
+                assert_eq!(
+                    class_of_instance(&name),
+                    Some(want),
+                    "round-trip failed for {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn class_of_instance_rejects_foreign_dragonflies() {
+        for name in [
+            "my-cache",
+            "platform-redis-weird-000",
+            "platform-redis-ephemeral",
+            "platform-redis-ephemeral-",
+            "platform-redis-ephemeral-abc",
+            "platform-redis-ephemeral-000-extra",
+            "",
+        ] {
+            assert_eq!(class_of_instance(name), None, "must reject {name:?}");
+        }
     }
 
     // --- acl_user() ---
