@@ -10,6 +10,8 @@ keys described below, and apps bind them via explicit `claim.redis.<field>`
 env references rather than platform auto-injection. §§1–6 and §8 (pool
 architecture, `$N` ACL isolation, DB-number allocation/recycling, the
 reconcile loop, scripting policy, GC) are unaffected and remain in effect.
+**Extended by §9** (2026-08-21): shared-instance reaping and unconditional
+volume preservation.
 
 ## Context
 
@@ -122,11 +124,21 @@ The whole-instance snapshot format does **not** constrain GC, because GC operate
 
 ### Scope
 
-In scope: pooled lazy shared instances (per persistence class), per-DB `$N` isolation, channel-prefix pub/sub isolation, claim→`(instance, dbnum)` allocation + recycling, the reconcile loop, scripting (declared-keys-gated), the DB-pinned connection contract, `FLUSHDB` GC. Out of scope (for now): per-DB *resource* isolation / noisy-neighbour controls (accepted within a cluster; see Risks), automatic pool auto-scaling (manual/triggered initially), HA/replication topology tuning, Redis Cluster sharding, multi-tenant *adversarial* isolation, and a `needs.redis` size/eviction surface beyond the MVP.
+In scope: pooled lazy shared instances (per persistence class), per-DB `$N` isolation, channel-prefix pub/sub isolation, claim→`(instance, dbnum)` allocation + recycling, the reconcile loop, scripting (declared-keys-gated), the DB-pinned connection contract, `FLUSHDB` GC. Out of scope (for now): per-DB *resource* isolation / noisy-neighbour controls (accepted within a cluster; see Risks), automatic pool auto-**growth** (adding an instance when a class runs out of slots — manual/triggered initially; pool **shrink** is in scope and specified in §9), HA/replication topology tuning, Redis Cluster sharding, multi-tenant *adversarial* isolation, and a `needs.redis` size/eviction surface beyond the MVP.
 
 ## Consequences
 
 - **Easier:** apps use ordinary key names (no prefix); `SCAN` is DB-confined so the key-name leak is gone; GC is a single `FLUSHDB`; keyspace notifications become usable; `needs.redis` still reuses the entire 2.4 claim → schedule → provision → inject → GC pipeline. The dragonfly-operator handles instance lifecycle, auth, replication, and snapshots, and Dragonfly already ships `$N` — no engine swap needed.
+- **Operationally visible (§9, 2026-08-21):** a shared instance with no tenants
+  is now **reaped**, returning its Guaranteed reservation (256Mi CNPG / 320Mi
+  Dragonfly) — but reaping a CNPG cluster **leaves its PVC behind**, because the
+  reaper strips the volume's `ownerReference` before deleting the `Cluster` and
+  does so unconditionally (§9.4). Expect `kubectl get pvc` to show volumes with
+  no owning cluster; that is the design, not a leak, and it does not accumulate
+  — the next provision under the same instance name adopts the same volume
+  (§9.5). A reaped persistent Dragonfly instance also comes back with its
+  snapshot contents intact (§9.6), which `FLUSHDB`-on-allocation (§3) is what
+  makes safe.
 - **Harder / neutral:** a **finite, recycled DB-number namespace** to allocate (claim→`(instance, dbnum)` state, an allocation index, capacity handling, and a **recycle-safety `FLUSHDB`-on-allocation** invariant). `--dbnum` is very likely **restart-only**, so the default must be set generously up front (and measured — see below) and capacity grown by adding pool instances. Pub/sub still needs a channel prefix (keys don't). The provisioner performs imperative, continuously-reconciled Redis I/O. Scripting is allowed but pinned to one instance flag staying unset.
 
 ## Alternatives considered
@@ -163,6 +175,252 @@ In scope: pooled lazy shared instances (per persistence class), per-DB `$N` isol
 5. **Client-library init under the ACL.** ioredis / node-redis / BullMQ connect, health, and `maxmemory-policy` checks pass; if a client probes `CONFIG GET maxmemory-policy`, decide `+config|get` vs disabling the check — do not widen to `+@dangerous`.
 6. **Restart durability + recycle-safety.** Kill a pool pod; confirm the reconcile loop re-pins all live claims to the correct `dbnum`s. Allocate a recycled number; confirm `FLUSHDB`-on-allocation leaves no inherited keys.
 
+## §9 — Shrinking the pool (2026-08-21, extends Decision)
+
+Added after acceptance; a continuation of §§1–8, which live as subsections of
+Decision above. §1 states that "instances are created lazily; a solo cluster
+with no Redis apps runs no Dragonfly pod." The lazy-create half is real. The
+other half — giving an instance back when its last tenant leaves — was never
+built. This section specifies it.
+
+The gap spans **both** shared backends the `resourceclaim-provisioner` creates
+lazily, so §9 governs both: the shared CNPG cluster (`plan.md` 2.4, applied by
+`provision_cloudnativepg`) and the Dragonfly pool instances
+(`provision_dragonfly`). Tenant-level reclamation exists for each —
+`remove_managed_role` / `remove_database` for Postgres, `FLUSHDB` +
+`ACL DELUSER` for Redis (`gc_drop_dragonfly`) — but across the whole crate
+`delete` is called only on PVCs, Secrets and `RetainedClaim`s, never on a
+`Cluster` or a `Dragonfly`. A tenantless instance therefore keeps its full
+Guaranteed reservation: **256Mi** for the CNPG cluster, **320Mi** for a
+Dragonfly pool instance ([ADR 0053](0053-resource-governance.md), 2.16d). On
+the ~4 GB Tier-1 node those are not rounding errors — an idle Dragonfly
+holding 320Mi was a material part of the node-saturation incident of
+2026-08-21, which is what prompted this section.
+
+Symbols named in this section live in
+`operator/operator-controllers/resourceclaim-provisioner/src/` (`reconcile.rs`,
+`gc.rs`, `dragonfly.rs`, `grace.rs`). They are cited by name rather than by
+line, because the reaper this section specifies is implemented in those same
+functions.
+
+### 9.1 The liveness predicate — three vetoes
+
+A shared instance is reapable only when nothing in the cluster can be pointing
+at it. Three vetoes, each sufficient on its own to keep the instance:
+
+- **ALLOCATED** — a live `ResourceClaim` names the instance in
+  `status.instance`. A tenant exists and is connected.
+- **INTENT** — an unallocated claim of the matching type and persistence class
+  exists. It has not named an instance yet, but it is on its way to this one.
+- **RETAINED** — a `RetainedClaim` snapshot names the instance (with one
+  exception, §9.6).
+
+**INTENT is not a precaution; it closes a real window in the provision path.**
+`provision_dragonfly` SSA-applies the `Dragonfly` CR as its first step and does
+not write `status.instance`/`status.dbnum` until it calls `patch_allocation`,
+several steps later. Between those two points the instance exists and *no
+object in the cluster refers to it*. A predicate built on ALLOCATED and
+RETAINED alone, evaluated inside that window, reaps the instance the
+provisioner is in the middle of populating. `provision_cloudnativepg` has the
+same shape around its `Cluster` apply. The window is short, the reaper's poll
+is not synchronised with it, and a race that is merely unlikely is still a
+race.
+
+### 9.2 Teardown is not symmetric — measured, 2026-08-21
+
+Measured on kind + podman against **the versions this platform pins**: CNPG
+chart `cloudnative-pg-0.28.2` (`app_version 1.29.1`, per
+`platform-stack/cue/component_cloudnative-pg.cue`) and `dragonfly-operator
+v1.5.0`. The versions are recorded inline because §9.3's safety argument is a
+claim about a specific operator's reconcile behaviour: were a future chart to
+start re-adding the ownerReference, the strip would quietly stop protecting
+anything. **Re-measure on a CNPG chart bump** — and that instruction is
+enforced rather than left as prose: the pg e2e walk asserts the PVC is still
+`Bound` after a reap and that the same PV is re-adopted, so a CNPG version that
+starts re-adding the ownerReference makes the reap cascade and **fails the
+walk**. These are observations, not expectations.
+
+**CNPG owns the volume, so a plain delete takes it — measured, not inferred.**
+On chart 0.28.2 the shared cluster's PVC is created carrying a controller
+ownerReference:
+
+```
+[{"apiVersion":"postgresql.cnpg.io/v1","controller":true,"kind":"Cluster",
+  "name":"platform-postgres","uid":"dcd48d90-5e54-4afd-850f-4d0857bd06a3"}]
+```
+
+and the `Cluster` carries **no finalizers** (`finalizers=` empty). With that
+reference left **intact** — a live cluster on PV
+`pvc-03e87227-ea32-4eb2-ba1f-2de5813b56a4`, marker row `42` written — deleting
+the `Cluster` destroyed the database:
+
+```
+PVCs in cnpg-system:            No resources found in cnpg-system namespace.
+PVs still bound to that claim:  0
+```
+
+The reasoning belongs beside the observation, because it says what would have
+to change for the result to change: a `controller: true` ownerReference with no
+finalizer to intervene makes this the apiserver garbage collector's doing, not
+CNPG's — there is no CNPG-side deletion hook to negotiate with and nothing to
+switch off. **The strip in §9.3 is therefore a requirement, not a precaution.**
+
+This counterfactual is recorded here because it is the one observation the e2e
+walk can never make — running it destroys a database, so no test may perform
+it, and this ADR is its only record.
+
+**Dragonfly does not.** A persistent pool instance's snapshot PVC has **empty**
+`ownerReferences`, and the StatefulSet the operator creates ships
+`persistentVolumeClaimRetentionPolicy: {"whenDeleted":"Retain","whenScaled":"Retain"}`.
+After deleting the `Dragonfly`, the PVC remains `Bound`. An **ephemeral**
+instance has no `volumeClaimTemplates` at all — StatefulSet, Service and pod
+all cascade and nothing is left behind. So the Dragonfly arm of the reaper is
+just the delete; the asymmetry to engineer around is CNPG's alone.
+
+**`--cascade=orphan` was tested and rejected.** It is the obvious way to keep a
+volume, and it does not work here. Control experiment: with orphan propagation
+the Postgres pod was still `Running` **29 seconds** after the `Cluster` was
+gone. Orphan does not select what it orphans — it detaches the entire owned
+subtree, pod included — so it preserves the volume by preserving everything and
+reclaims **no memory at all**, which is the only thing the reaper exists to do.
+
+### 9.3 The reaper strips the CNPG PVC's ownerReference before deleting
+
+Immediately before deleting a CNPG `Cluster`, the reaper removes the
+controller `ownerReference` from each PVC that `Cluster` owns. This converts an
+unrecoverable cascade into a preserved volume. Measured on chart 0.28.2:
+`after delete: PVC SURVIVED`, with `pods remaining: none` — so the workload is
+gone and the memory genuinely returned, while the volume stays.
+
+**The strip holds.** After stripping, the reference was observed empty at
+t = 30 s, 60 s and 90 s; a genuine reconcile was then forced with a real spec
+change (`shared_buffers` 32MB → 48MB) and the reference was still empty 45 s
+past it. CNPG **never re-added it** to a running cluster. The forced reconcile
+matters: without it the observation would only show that CNPG had not happened
+to reconcile, not that reconciling leaves the strip in place.
+
+Ordering is strip-then-delete, and it fails safe in that direction. If the
+reaper dies between the two steps, what remains is a live, healthy cluster
+whose PVC has no owner — a volume that would survive a later delete instead of
+being cleaned up. The opposite ordering has no safe failure at all.
+
+The strip is re-applied on every reap, because CNPG re-adds the reference when
+it adopts the volume back (§9.5). The stripped state is transient by design.
+
+### 9.4 Volume preservation is unconditional
+
+Preservation is **not** conditional on the reap looking correct. The tempting
+refinement — preserve the volume when the predicate ran against a complete
+picture, let the cascade run otherwise — cannot be built, and the reason is
+worth stating precisely rather than asserting.
+
+The failure the refinement would guard against is a predicate computed off a
+**truncated LIST**: a list call that returns fewer objects than exist. Such a
+LIST does not truncate selectively. It omits live `ResourceClaim`s and
+`RetainedClaim`s with the same silence, and hands back no signal that either
+set was short. So the exact condition under which the reap is wrong is the
+condition under which a "does this reap look clean?" test also reports clean.
+The test would pass precisely in the case it exists to catch. **A safety net
+that fails in the same instant as the thing it is meant to catch is not a
+safety net** — it is a second copy of the assumption that already failed.
+
+Preservation is therefore paid on every reap, sound or not. The price is a
+`Bound` PVC; the alternative price is a tenant's data. §9.5 shows the price is
+smaller than it first looks.
+
+### 9.5 The leak is continuity, not waste
+
+Both operators re-adopt a preserved volume by name, with the data intact.
+Re-provisioning under the same CR name after a reap, measured:
+
+- **CNPG** (chart 0.28.2) — the re-provisioned cluster **adopted the same PV**,
+  `pvc-c8c53a3f-7441-425c-929e-da342401cbab`; `SELECT id FROM reap_marker`
+  returned **`42`**, the row written before the reap; the cluster reached
+  `READY 1` with `Cluster in healthy state`; no PVC-conflict events; and CNPG
+  **re-added its ownerReference** on adoption.
+- **Dragonfly, persistent** — the same PV before and after
+  (`pvc-c8d14acb-d8bb-4152-b635-597345dd91b1`); the pod came up `Ready`.
+
+Because the PVC name is derived deterministically from the CR name, and the
+reaper's counterpart recreates the CR under that same name (§1's pool naming),
+the preserved volume is exactly what the next provision picks up. The "leak" a
+preserved PVC represents is therefore **continuity, not accumulation**: a
+reap/re-provision cycle reuses one volume rather than stranding one and
+allocating a second. What is left behind is bounded by the number of pool
+instance *names*, not by the number of reaps.
+
+### 9.6 Remanence — a reaped instance does not come back empty
+
+Preserving the volume preserves what is on it, and for a persistent Dragonfly
+instance that is a snapshot RDB which is **not synchronised with GC**. §8
+reclaims a tenant with `SELECT <N>; FLUSHDB ASYNC` — in memory — while the
+snapshot is written on the instance's cron. A snapshot taken before the flush
+and never superseded (the instance is reaped before the next cron tick)
+outlives the tenant whose keys it holds. A future cohort adopting that volume
+starts an instance that loads those bytes back into those DB numbers.
+
+This is not a new exposure. It is §3's exposure with a longer arm. §3 already
+requires `FLUSHDB` **on allocation**, not only on teardown, precisely because a
+prior cleanup may have failed — so every DB number a new tenant is handed is
+cleared before that tenant can read it, whether the stale bytes arrived from a
+failed GC or from a resurrected snapshot. The recycle-safety invariant is keyed
+on allocation, not on instance continuity, so it survives the instance being
+deleted and recreated underneath the pool unchanged. What §3 did not consider
+is that the instance could be recreated at all; that is the only thing §9 adds
+here.
+
+The residue is confined to DB numbers no new tenant takes: those retain stale
+bytes on disk until something allocates them, and allocation is the thing that
+clears them. Recorded plainly so no future reader assumes a reaped instance
+returns empty — it does not. (Ephemeral instances have no volume at all, §9.2,
+so they have no remanence.)
+
+### 9.7 `RetainedClaim` vetoes two of the three, and reclaim latency splits
+
+The RETAINED veto applies to the shared CNPG cluster and to persistent
+Dragonfly instances, and **not** to ephemeral Dragonfly instances. §8 already
+draws that line in principle: "ephemeral claims hold no data, so their number
+may be freed immediately on deletion." A snapshot naming an ephemeral instance
+has nothing to reattach to, so it has nothing to protect.
+
+> **That §8 sentence describes intent, not shipped behaviour, and the
+> difference matters here.** Nothing in the code frees an ephemeral claim's DB
+> number early: `GRACE_PERIOD` (`grace.rs`) is an unconditional
+> `7 * 24 * 60 * 60` with no persistence branch; `snapshot_retained_claim`
+> writes a `RetainedClaim` for every Dragonfly claim regardless of class,
+> deliberately, "so the 7-day `RetainedClaim` lifecycle is uniform"; and
+> `used_dbnums` reserves *every* `RetainedClaim` matching the instance, with no
+> class filter. So the veto asymmetry above is about the **instance**, not the
+> **slot**: an ephemeral instance is reaped roughly one dwell after its last
+> claim goes, while that claim's DB number stays reserved for the full seven
+> days either way. §9 neither changes §8's slot behaviour nor depends on §8's
+> "immediately" ever becoming true — it only declines to keep a *pod* alive for
+> a snapshot that has no data in it.
+
+The consequence is a **split in reclaim latency**: an ephemeral pool instance
+comes back roughly one reaper dwell after its last claim goes away, while the
+CNPG shared cluster and persistent instances are held for at least the 7-day
+grace floor of the last snapshot naming them. That is the correct trade — the
+grace window's whole promise is that a recreate within it reattaches to
+retained data — but it means the memory win on a persistent class is a slow one
+and should not be expected to show up during a walk.
+
+**Slot reservation is unaffected either way.** `used_dbnums` (`dragonfly.rs`)
+derives the reserved set from live claims ∪ `RetainedClaim`s and **never** from
+the running instance. A `RetainedClaim`'s `(instance, dbnum)` reservation
+therefore survives the instance vanishing entirely: the number stays
+unavailable for the whole grace window whether or not a pod exists to hold it,
+and a recreated instance starts with exactly those slots already spoken for.
+The reaper cannot cause a recycled-number collision by removing the instance,
+because the instance was never the source of truth for which numbers are taken.
+
+**Follow-up (deferred, not rejected).** §9 is backend-agnostic in substance —
+the predicate, the strip and the preservation rule govern the shared CNPG
+cluster as much as the Dragonfly pool — so it arguably belongs in its own ADR
+rather than inside a Redis-titled one. Deferred deliberately: promoting it
+before the reaper exists would churn the record for no gain. Revisit once the
+implementation lands.
+
 ## Owner
 
 Platform / operator team.
@@ -178,3 +436,4 @@ Revisit if: per-DB overhead (Pre-merge #1) makes a generous `dbnum` too costly (
 - Dragonfly ACL (`ACL SETUSER`; `$N` DB selector → `NOPERM` on other DBs; command/key/channel rules; `SETUSER` propagates to live connections, `DELUSER` closes them); Dragonfly `--dbnum` (max DBs for `SELECT`, default 16); `CONFIG SET` (runtime reconfig, but not all flags are mutable); Dragonfly `SCAN` (iterates the selected DB), `FLUSHDB` (clears the selected DB only); Lua (declared-keys default, `allow-undeclared-keys`, no scripts on read-only replicas); Namespaces (experimental, no replication).
 - Redis/Valkey persistence (RDB/AOF are whole-dataset; no per-DB snapshot/backup); Redis 7+ restrictive pub/sub default; Valkey 9.0/9.1 (numbered DBs as lightweight namespaces, per-database ACL, near-zero overhead for unused DBs) as the engine-swap alternative.
 - `dragonflydb/dragonfly-operator` (`Dragonfly` CR — instances, `passwordFromSecret`/`aclFromSecret`, replication, snapshots to PVC/S3; service targets the master).
+- **Shared-instance reaping — §9 covers the shared CNPG cluster as well as the Dragonfly pool** (instance liveness predicate, CNPG PVC `ownerReference` stripping, unconditional volume preservation, snapshot remanence). Sizing of the reserved memory it reclaims: [ADR 0053](0053-resource-governance.md) (Guaranteed stateful backends) and `platform-stack/cue/service_providers.cue`; CNPG chart pin: `platform-stack/cue/component_cloudnative-pg.cue`.
