@@ -13,7 +13,7 @@
 #   scripting/client-init/restart-repin (2.6-5, Pre-merge #4/#5/#6) ->
 #   persistent variant + restart-durable data (2.6-2/2.6-3, §6) ->
 #   delete + snapshot (2.4f/2.6-4) -> force-GC (2.6-7) ->
-#   redis-cli ACL/FLUSHDB proof
+#   redis-cli ACL/FLUSHDB proof -> shared-instance reaping (ADR 0042 §9)
 #
 # Concretely, on a k3d cluster bootstrapped with the platform stack
 # (operator + admission-webhook + the always-on dragonfly-operator + the
@@ -55,6 +55,28 @@
 #  10. Force GC by deleting + re-creating the RetainedClaim with a past
 #      retainUntil; ASSERT FLUSHDB + ACL DELUSER ran (the ACL user is
 #      gone, the DB is empty), and the snapshot is removed.
+#  11. Shared-instance reaping (ADR 0042 §9). The EPHEMERAL arm: remove
+#      the last tenant and ASSERT the instance, its StatefulSet and its
+#      pod are gone, while the `RetainedClaim` REMAINS (the §9.7
+#      asymmetry — an ephemeral instance is not held for the 7-day
+#      grace, because a snapshot naming it has no data to reattach to)
+#      and the `-admin` Secret REMAINS (the deliberate keep). The memory
+#      is then asserted NUMERICALLY: the node's allocated memory
+#      requests must drop by at least the instance's own reservation,
+#      which is what a reaper that deletes the CR while the StatefulSet
+#      lingers would fail.
+#  12. Clean re-create: the pool comes back as a NEW object (a different
+#      uid — not a survivor), the admin password is byte-identical (the
+#      Secret was kept, so nothing rotates), and the app's Deployment
+#      reaches Available again.
+#  13. NEGATIVE test: with the app live, three dwells pass and the
+#      instance uid is unchanged while `reaped` does not move (and
+#      `veto_live` does, proving the reaper was running and deciding).
+#      An over-eager reaper is far worse than an absent one.
+#  14. PERSISTENT arm: a deleted-but-in-grace claim VETOES the instance
+#      (`veto_retained`); dropping the snapshot then lets it be reaped
+#      within one dwell, with its snapshot PVC still Bound, and the
+#      re-provision adopts the SAME PV.
 #
 # CLI state injection
 # -------------------
@@ -131,6 +153,12 @@ ACL_USER2="claim_demo_api-redis_redis"
 ACL_USER3="claim_demo_worker-redis_redis"
 # RetainedClaim name = cnpg::k8s_name(demo, web-redis).
 RETAINED="claim-demo-web-redis"
+# ... and the same derivation for the api / worker claims. Both matter to
+# the ADR 0042 §9 phases: the api snapshot is the one that must NOT hold an
+# ephemeral instance alive (§9.7), the worker snapshot is the one that MUST
+# hold a persistent one.
+RETAINED2="claim-demo-api-redis"
+RETAINED3="claim-demo-worker-redis"
 
 DF_NS="dragonfly-system"            # shared Dragonfly instance namespace
 # The ephemeral pool instance (index 0) the first non-persistent claim
@@ -144,6 +172,20 @@ DF_INSTANCE_P="platform-redis-persistent-000"
 DF_ADMIN_SECRET_P="platform-redis-persistent-000-admin"
 RETAINED_NS="apprafter-system"      # RetainedClaim namespace
 PROVIDER="redis-integrated"         # seeded ServiceProvider
+
+# ADR 0042 §9 — the shared-backend reaper's dwell, pinned SHORT on the
+# operator Deployment (Phase 1b) via APPRAFTER_REAP_DWELL_SECS. Production
+# runs unset, at the 600s default; a walk that raced a ten-minute timer
+# could only ever assert a transient, so it pins the timer instead and
+# asserts terminal outcomes.
+REAP_DWELL_SECS=30
+
+# The Guaranteed memory reservation a Dragonfly pool instance holds (ADR
+# 0053 / platform-stack `service_providers.cue`, T1 seed 320Mi). Phase 6
+# asserts the running instance really requests at least this much, and the
+# ephemeral-reap phase asserts the node gives back at least this much — so
+# the threshold is tied to the shipped sizing rather than picked.
+DRAGONFLY_MEM_MI=320
 
 # ---------------------------------------------------------------
 # Tool checks (fail loudly, never silently skip)
@@ -360,6 +402,148 @@ cond_status() {
 }
 
 # ---------------------------------------------------------------
+# Local helper: strip_ansi — drop SGR escape sequences from stdin.
+#
+# LOAD-BEARING for every log-based assertion below. `tracing_subscriber::
+# fmt()` colourises by default (it does not check for a TTY), and it wraps
+# each structured FIELD separately — so a line that reads
+# `... loop starting dwell_secs=30` on screen is actually
+# `dwell_secs<ESC>[0m<ESC>[2m=<ESC>[0m30` in the bytes, and a grep for the
+# literal `dwell_secs=30` matches NOTHING. Found by running this walk: the
+# operator had logged exactly the expected line and the assertion still
+# failed.
+# ---------------------------------------------------------------
+strip_ansi() {
+    sed $'s/\033\\[[0-9;]*[a-zA-Z]//g'
+}
+
+# ---------------------------------------------------------------
+# Local helper: operator_pod — the name of the Running apprafter-operator
+# pod (replicaCount is 1, so this is the leader).
+#
+# Prometheus counters are PER-POD and reset to zero on restart, so every
+# counter comparison in the §9 phases re-reads this and FAILS if the pod
+# changed underneath it — otherwise a mid-test operator restart would make
+# "the counter did not increase" trivially true and turn the negative test
+# into a false green.
+# ---------------------------------------------------------------
+operator_pod() {
+    kubectl -n "$RETAINED_NS" get pods \
+        -l app.kubernetes.io/name=apprafter-operator \
+        --field-selector=status.phase=Running \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------
+# Local helper: operator_metrics — the operator's /metrics text.
+#
+# Scraped through the apiserver's pod-proxy subresource rather than a
+# port-forward or a curl sidecar: no background process to reap, no image
+# to pull, and the walk's kubeconfig is system:masters so pods/proxy is
+# already permitted.
+# ---------------------------------------------------------------
+operator_metrics() {
+    local pod port
+    pod="$(operator_pod)"
+    [ -n "$pod" ] || return 1
+    port=$(kubectl -n "$RETAINED_NS" get deploy apprafter-operator \
+        -o jsonpath='{.spec.template.spec.containers[0].ports[0].containerPort}' \
+        2>/dev/null || true)
+    kubectl get --raw \
+        "/api/v1/namespaces/${RETAINED_NS}/pods/${pod}:${port:-8080}/proxy/metrics" \
+        2>/dev/null
+}
+
+# ---------------------------------------------------------------
+# Local helper: metric_value <series> — the current value of an exact
+# Prometheus series (name + rendered label set), or 0 when the series is
+# absent (a CounterVec child that has never been incremented emits no
+# line at all, so "absent" and "zero" are the same statement).
+#
+# A FAILED SCRAPE IS NOT ZERO. It returns non-zero so `set -e` aborts the
+# walk at the call site: silently reading 0 would make every "did not
+# increase" assertion in the §9 phases pass for the wrong reason.
+# ---------------------------------------------------------------
+metric_value() {
+    local series="$1" body
+    body="$(operator_metrics || true)"
+    if [ -z "$body" ]; then
+        # Empty covers BOTH a failed scrape and a genuinely empty exposition
+        # (a freshly-restarted operator that has not touched a single metric
+        # yet emits a zero-byte body — observed on this walk's own cluster).
+        # Neither is a number to reason from: the second means the counters
+        # this phase is comparing against have been reset, so treating it as
+        # 0 would make a "did not increase" assertion pass on a restart.
+        printf 'ERROR: the operator /metrics endpoint returned nothing (pod %q) — either the scrape failed or the operator restarted and has emitted no metric yet; refusing to read a counter delta from it\n' \
+            "$(operator_pod)" >&2
+        return 1
+    fi
+    printf '%s\n' "$body" | awk -v want="$series" \
+        '$1 == want { printf "%d", $2 + 0; found = 1 }
+         END { if (!found) printf "0" }'
+}
+
+# reap_metric <backend> <result> — apprafter_shared_backend_reap_total
+# for one (backend, result) pair. The label ORDER is the CounterVec's
+# declaration order in operator-core/src/metrics.rs (`&["backend",
+# "result"]`), which is what the exposition renders.
+reap_metric() {
+    metric_value "apprafter_shared_backend_reap_total{backend=\"$1\",result=\"$2\"}"
+}
+
+# ---------------------------------------------------------------
+# Local helper: _mem_sum_mi — sum whitespace-separated Kubernetes memory
+# quantities read on stdin into a MiB total.
+#
+# Used by the two readers below so the ephemeral-reap phase can assert the
+# memory NUMERICALLY. An unrecognised suffix is reported on stderr and
+# counted as zero: it appears identically in the before and after readings
+# of the same pod, so it cancels out of the delta the assertion is about,
+# and it must not pass silently.
+# ---------------------------------------------------------------
+_mem_sum_mi() {
+    awk '
+        function to_mi(v,   n) {
+            if (v == "") return 0
+            n = v
+            if (v ~ /^[0-9.]+Ki$/) { sub(/Ki$/, "", n); return n / 1024 }
+            if (v ~ /^[0-9.]+Mi$/) { sub(/Mi$/, "", n); return n }
+            if (v ~ /^[0-9.]+Gi$/) { sub(/Gi$/, "", n); return n * 1024 }
+            if (v ~ /^[0-9.]+Ti$/) { sub(/Ti$/, "", n); return n * 1048576 }
+            if (v ~ /^[0-9.]+[kK]$/) { sub(/[kK]$/, "", n); return n * 1000 / 1048576 }
+            if (v ~ /^[0-9.]+M$/)  { sub(/M$/, "", n);  return n * 1000000 / 1048576 }
+            if (v ~ /^[0-9.]+G$/)  { sub(/G$/, "", n);  return n * 1000000000 / 1048576 }
+            if (v ~ /^[0-9]+$/) return v / 1048576
+            printf "  WARN: unrecognised memory quantity %s — counted as 0\n", v > "/dev/stderr"
+            return 0
+        }
+        { for (i = 1; i <= NF; i++) total += to_mi($i) }
+        END { printf "%d", total + 0 }'
+}
+
+# pod_mem_requests_mi <ns> <pod> — the pod's total container memory
+# requests, in MiB.
+pod_mem_requests_mi() {
+    kubectl -n "$1" get pod "$2" \
+        -o jsonpath='{range .spec.containers[*]}{.resources.requests.memory}{" "}{end}' \
+        2>/dev/null | _mem_sum_mi
+}
+
+# node_mem_requests_mi <node> — the sum of container memory REQUESTS over
+# every non-terminated pod scheduled on <node>: the quantity `kubectl
+# describe node` prints as "Allocated resources / memory requests",
+# computed from the API so the unit suffix is parsed rather than
+# screen-scraped out of a human-formatted table.
+node_mem_requests_mi() {
+    local node="$1"
+    kubectl get pods -A -o jsonpath='{range .items[*]}{.spec.nodeName}{"|"}{.status.phase}{"|"}{range .spec.containers[*]}{.resources.requests.memory}{" "}{end}{"\n"}{end}' \
+        2>/dev/null \
+        | awk -F'|' -v node="$node" \
+            '$1 == node && ($2 == "Running" || $2 == "Pending") { print $3 }' \
+        | _mem_sum_mi
+}
+
+# ---------------------------------------------------------------
 # Local helper: redis_admin <args...>  — run redis-cli against the
 # shared Dragonfly instance AS THE ADMIN (default) user, reading the
 # admin password from the per-instance admin Secret. Used for the
@@ -511,6 +695,44 @@ for _crd in applications serviceproviders resourceclaims retainedclaims; do
         "crd/${_crd}.apprafter.io" --timeout=30s
 done
 printf '  branch CRDs applied + Established\n'
+
+# ADR 0042 §9 — pin a SHORT reaper dwell so the §9 phases assert a TERMINAL
+# outcome (reaped / still there) instead of racing the 600s production
+# default. This is the operator's own env seam (main.rs reads
+# APPRAFTER_REAP_DWELL_SECS); it is set HERE, after the automated-sync
+# disable above, because Argo CD would otherwise revert the Deployment env
+# on its next sync.
+printf '  pinning APPRAFTER_REAP_DWELL_SECS=%s on the operator (ADR 0042 §9) ...\n' \
+    "$REAP_DWELL_SECS"
+kubectl -n apprafter-system set env deploy/apprafter-operator \
+    "APPRAFTER_REAP_DWELL_SECS=${REAP_DWELL_SECS}"
+kubectl -n apprafter-system rollout status deploy/apprafter-operator --timeout=180s
+
+# PROVE the pin took effect. The reaper logs its dwell ONCE, at loop start,
+# after leader election — so this also proves the loop is actually running.
+# Without this assertion a walk whose env never landed would run at the
+# 600s default and every §9 phase would time out for a reason nothing in
+# the log explains.
+printf '  waiting for the reaper loop to report the pinned dwell ...\n'
+_dwell_seen=""
+_dwell_deadline=$(( $(date +%s) + 180 ))
+while [ "$(date +%s)" -lt "$_dwell_deadline" ]; do
+    if kubectl -n apprafter-system logs deploy/apprafter-operator --tail=-1 2>/dev/null \
+        | strip_ansi \
+        | grep 'SharedBackendReaper loop starting' \
+        | grep -q "dwell_secs=${REAP_DWELL_SECS}"; then
+        _dwell_seen="ok"
+        break
+    fi
+    sleep 5
+done
+if [ "$_dwell_seen" != "ok" ]; then
+    printf 'ERROR: the operator never logged "SharedBackendReaper loop starting" with dwell_secs=%s — APPRAFTER_REAP_DWELL_SECS did not take effect, or the reaper never became leader\n' \
+        "$REAP_DWELL_SECS" >&2
+    kubectl -n apprafter-system logs deploy/apprafter-operator --tail=80 >&2 2>&1 || true
+    exit 1
+fi
+printf '  ok: SharedBackendReaper running with dwell_secs=%s\n' "$REAP_DWELL_SECS"
 fi  # end APPRAFTER_E2E_LOCAL_OPERATOR (Phase 1b)
 
 # ===============================================================
@@ -709,6 +931,43 @@ assert_eq "ephemeral Dragonfly instance present (lazy-create)" "$df_count" "1"
 # The per-instance admin Secret exists (read-or-created by the provisioner).
 admin_present=$(jp secret "$DF_NS" "$DF_ADMIN_SECRET" '{.metadata.name}')
 assert_eq "Dragonfly admin Secret present" "$admin_present" "$DF_ADMIN_SECRET"
+
+# ---- ADR 0042 §9 baseline ---------------------------------------------
+# Recorded HERE, while the pool instance is freshly provisioned and known
+# good, because the reap phases are all statements ABOUT this object: that
+# the thing which comes back is a different one (uid), that nothing rotated
+# under it (admin password), and that its reservation actually left the node
+# (memory).
+EPH_UID_1=$(jp dragonfly.dragonflydb.io "$DF_NS" "$DF_INSTANCE" '{.metadata.uid}')
+if [ -z "$EPH_UID_1" ]; then
+    printf 'ERROR: could not read the ephemeral pool instance uid — the reap assertions identify the instance BY uid, not by name\n' >&2
+    exit 1
+fi
+# The admin Secret is deliberately NOT deleted by the reaper, so the
+# password must be byte-identical after a reap/re-create cycle. Compared as
+# the raw base64 from `.data` — no decode, so this is a bytewise statement.
+EPH_ADMIN_PW_1=$(jp secret "$DF_NS" "$DF_ADMIN_SECRET" '{.data.password}')
+if [ -z "$EPH_ADMIN_PW_1" ]; then
+    printf 'ERROR: admin Secret %s has no `password` key\n' "$DF_ADMIN_SECRET" >&2
+    exit 1
+fi
+printf '  baseline: %s uid=%s\n' "$DF_INSTANCE" "$EPH_UID_1"
+
+# The instance's own Guaranteed reservation — the number the reap must give
+# back. Asserted rather than assumed so the node-level threshold below is
+# tied to what this cluster actually runs.
+EPH_POD_MEM_MI=$(pod_mem_requests_mi "$DF_NS" "${DF_INSTANCE}-0")
+if [ "$EPH_POD_MEM_MI" -lt "$DRAGONFLY_MEM_MI" ]; then
+    printf 'ERROR: pool instance pod %s requests %sMi of memory, expected at least %sMi (ADR 0053 seed) — the reap memory assertion is calibrated on that number\n' \
+        "${DF_INSTANCE}-0" "$EPH_POD_MEM_MI" "$DRAGONFLY_MEM_MI" >&2
+    exit 1
+fi
+printf '  baseline: %s-0 requests %sMi of memory\n' "$DF_INSTANCE" "$EPH_POD_MEM_MI"
+
+NODE_NAME=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')
+NODE_MEM_BASELINE_MI=$(node_mem_requests_mi "$NODE_NAME")
+printf '  baseline: node %s allocated memory requests = %sMi\n' \
+    "$NODE_NAME" "$NODE_MEM_BASELINE_MI"
 
 # The $N ACL user exists on the instance with the right DB selector.
 acl_line=$(redis_admin ACL GETUSER "$ACL_USER" || true)
@@ -1186,6 +1445,348 @@ fi
 printf '  ok: api user %s untouched by web GC (scoped reclaim)\n' "$ACL_USER2"
 
 # ===============================================================
+# Phase 13: ephemeral reap (ADR 0042 §9.1/§9.7) — the last tenant leaves
+#           and the pool instance is given back, snapshot notwithstanding
+# ===============================================================
+
+phase "Phase 13: ephemeral reap — instance gone, RetainedClaim + admin Secret kept"
+
+EPH_REAPED_BEFORE=$(reap_metric dragonfly-ephemeral reaped)
+
+# The node reading the assertion below subtracts from. NOT the Phase-6
+# baseline, deliberately: the class-split phase brings up the PERSISTENT
+# pool instance with its own 320Mi reservation somewhere between the two,
+# so a delta measured from Phase 6 would be racing that phase rather than
+# measuring this reap. The Phase-6 number is printed alongside for context.
+NODE_MEM_PRE_REAP_MI=$(node_mem_requests_mi "$NODE_NAME")
+printf '  node %s allocated memory requests: %sMi (Phase-6 baseline was %sMi)\n' \
+    "$NODE_NAME" "$NODE_MEM_PRE_REAP_MI" "$NODE_MEM_BASELINE_MI"
+
+# `api` is the ephemeral instance's last tenant (`web` went in Phase 11 and
+# its slot was reclaimed in Phase 12). Deleting the APPLICATION cascades to
+# the claim; the claim's finalizer snapshots a RetainedClaim.
+kubectl delete "$APP_RES" "$APP2" -n "$APP_NS" --wait=true
+wait_jsonpath retainedclaim "$RETAINED_NS" "$RETAINED2" \
+    '{.spec.claimRef.name}' "$CLAIM2" 120
+
+# Timeout arithmetic: the sweep ticks every 60s, so the first tick after the
+# last claim goes only STARTS the dwell and the reap lands on the next one —
+# up to 2 ticks (~120s) plus the dwell itself. dwell + 180 keeps a real
+# margin over that; it is a timeout, not a threshold, so slack here weakens
+# nothing.
+wait_gone dragonfly.dragonflydb.io "$DF_NS" "$DF_INSTANCE" \
+    $(( REAP_DWELL_SECS + 180 ))
+
+# The WORKLOAD is gone too, not just the CR. A reaper that deleted the
+# Dragonfly while the operator left the StatefulSet behind would reclaim
+# nothing, and the CR-level assertion above would not notice.
+wait_gone statefulset "$DF_NS" "$DF_INSTANCE" 180
+wait_gone pod "$DF_NS" "${DF_INSTANCE}-0" 180
+
+# §9.7 — the snapshot is STILL THERE, and the instance went anyway. This is
+# the whole point of the ephemeral fast path: a RetainedClaim naming an
+# ephemeral instance has no data to reattach to, so holding a 320Mi pod for
+# the full 7-day grace would buy nothing. (The claim's DB NUMBER stays
+# reserved for the grace either way — that is the slot, not the instance.)
+retained_after=$(jp retainedclaim "$RETAINED_NS" "$RETAINED2" '{.metadata.name}')
+assert_eq "RetainedClaim survives the ephemeral reap (§9.7 asymmetry)" \
+    "$retained_after" "$RETAINED2"
+
+# The admin Secret is a deliberate keep: deleting it would make the next
+# provision mint a FRESH admin password while the old pod may still be
+# terminating behind the Service.
+admin_after=$(jp secret "$DF_NS" "$DF_ADMIN_SECRET" '{.metadata.name}')
+assert_eq "admin Secret survives the ephemeral reap" \
+    "$admin_after" "$DF_ADMIN_SECRET"
+
+# ---- THE NUMERIC ASSERTION --------------------------------------------
+# The reservation actually left the node. If this number does not move, the
+# feature did not work regardless of what the CRs say — which is exactly the
+# failure a reaper that deletes the CR while its StatefulSet lingers would
+# produce.
+NODE_MEM_POST_REAP_MI=$(node_mem_requests_mi "$NODE_NAME")
+mem_drop=$(( NODE_MEM_PRE_REAP_MI - NODE_MEM_POST_REAP_MI ))
+if [ "$mem_drop" -lt "$DRAGONFLY_MEM_MI" ]; then
+    printf 'ERROR: node %s allocated memory requests fell only %sMi (%sMi -> %sMi), want at least %sMi — the reaped instance held %sMi, so its reservation did NOT come back\n' \
+        "$NODE_NAME" "$mem_drop" "$NODE_MEM_PRE_REAP_MI" "$NODE_MEM_POST_REAP_MI" \
+        "$DRAGONFLY_MEM_MI" "$EPH_POD_MEM_MI" >&2
+    kubectl -n "$DF_NS" get pods -o wide >&2 2>&1 || true
+    exit 1
+fi
+printf '  ok: node allocated memory requests fell %sMi (%sMi -> %sMi, >= %sMi)\n' \
+    "$mem_drop" "$NODE_MEM_PRE_REAP_MI" "$NODE_MEM_POST_REAP_MI" "$DRAGONFLY_MEM_MI"
+
+eph_reaped_after=$(reap_metric dragonfly-ephemeral reaped)
+if [ "$eph_reaped_after" -le "$EPH_REAPED_BEFORE" ]; then
+    printf 'ERROR: dragonfly-ephemeral reaped counter did not move (%s -> %s) — the instance went away for some reason OTHER than the reaper\n' \
+        "$EPH_REAPED_BEFORE" "$eph_reaped_after" >&2
+    exit 1
+fi
+printf '  ok: dragonfly-ephemeral reaped %s -> %s (the reaper is what removed it)\n' \
+    "$EPH_REAPED_BEFORE" "$eph_reaped_after"
+
+# ===============================================================
+# Phase 14: clean re-create — a NEW instance, the SAME admin credential
+# ===============================================================
+
+phase "Phase 14: re-create — new pool instance, unrotated admin password"
+
+kubectl apply -f - <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${APP2}
+  namespace: ${APP_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+    replicas: 1
+    expose:
+      port: 80
+    needs:
+      redis:
+        selector:
+          tier: integrated
+YAML
+
+# A full lazy re-create (Dragonfly CR + pod boot + ACL user), so budget more
+# than the first provision did.
+wait_jsonpath "$CLAIM_RES" "$APP_NS" "$CLAIM2" '{.status.ready}' true 600
+
+EPH_UID_2=$(jp dragonfly.dragonflydb.io "$DF_NS" "$DF_INSTANCE" '{.metadata.uid}')
+if [ -z "$EPH_UID_2" ] || [ "$EPH_UID_2" = "$EPH_UID_1" ]; then
+    printf 'ERROR: the pool instance uid is %q, want a NEW uid different from the reaped %q — the instance was never actually deleted, so Phase 13 proved nothing\n' \
+        "$EPH_UID_2" "$EPH_UID_1" >&2
+    exit 1
+fi
+printf '  ok: re-created pool instance is a NEW object (uid %s -> %s)\n' \
+    "$EPH_UID_1" "$EPH_UID_2"
+
+# Nothing rotated: the admin Secret was kept, so the credential the
+# provisioner drives ACL with is bit-for-bit the one from Phase 6.
+admin_pw_2=$(jp secret "$DF_NS" "$DF_ADMIN_SECRET" '{.data.password}')
+assert_eq "admin password is byte-identical after the reap round-trip" \
+    "$admin_pw_2" "$EPH_ADMIN_PW_1"
+
+kubectl -n "$APP_NS" wait --for=condition=Available \
+    "deployment/${APP2}" --timeout=300s
+printf '  Deployment %s -> Available on the re-created pool instance\n' "$APP2"
+
+# ===============================================================
+# Phase 15: negative test — a pool instance with a LIVE tenant is
+#           never reaped (ADR 0042 §9.1 ALLOCATED)
+# ===============================================================
+
+phase "Phase 15: negative test — 3x dwell with a live tenant, nothing is reaped"
+
+OP_POD_BEFORE=$(operator_pod)
+EPH_REAPED_BEFORE_NEG=$(reap_metric dragonfly-ephemeral reaped)
+EPH_VETO_LIVE_BEFORE_NEG=$(reap_metric dragonfly-ephemeral veto_live)
+
+printf '  sleeping %ss (3x dwell) with the api claim live ...\n' \
+    "$(( REAP_DWELL_SECS * 3 ))"
+sleep $(( REAP_DWELL_SECS * 3 ))
+
+# Counters are per-pod and reset on restart, so a restart here would make
+# "did not increase" true for the wrong reason.
+OP_POD_AFTER=$(operator_pod)
+assert_eq "the operator pod did not restart during the negative test" \
+    "$OP_POD_AFTER" "$OP_POD_BEFORE"
+
+uid_after_neg=$(jp dragonfly.dragonflydb.io "$DF_NS" "$DF_INSTANCE" '{.metadata.uid}')
+assert_eq "the live pool instance kept its identity across 3x dwell" \
+    "$uid_after_neg" "$EPH_UID_2"
+
+eph_reaped_after_neg=$(reap_metric dragonfly-ephemeral reaped)
+assert_eq "no ephemeral reap fired while a tenant was live" \
+    "$eph_reaped_after_neg" "$EPH_REAPED_BEFORE_NEG"
+
+# And it was VETOED, not merely skipped: without this, a reaper that had
+# died would pass the assertion above for exactly the wrong reason.
+eph_veto_live_after_neg=$(reap_metric dragonfly-ephemeral veto_live)
+if [ "$eph_veto_live_after_neg" -le "$EPH_VETO_LIVE_BEFORE_NEG" ]; then
+    printf 'ERROR: dragonfly-ephemeral veto_live did not move (%s -> %s) across 3x dwell — the reaper was not evaluating the instance at all, so "nothing was reaped" says nothing\n' \
+        "$EPH_VETO_LIVE_BEFORE_NEG" "$eph_veto_live_after_neg" >&2
+    exit 1
+fi
+printf '  ok: dragonfly-ephemeral veto_live %s -> %s (evaluated every tick, vetoed every time)\n' \
+    "$EPH_VETO_LIVE_BEFORE_NEG" "$eph_veto_live_after_neg"
+
+# ===============================================================
+# Phase 16: persistent arm (ADR 0042 §9.2/§9.5/§9.7) — a snapshot HOLDS
+#           the instance; post-grace it is reaped with its PVC intact
+#           and the re-provision adopts the SAME volume
+# ===============================================================
+
+phase "Phase 16: persistent arm — RETAINED holds, post-grace reap preserves the PVC"
+
+PER_UID_1=$(jp dragonfly.dragonflydb.io "$DF_NS" "$DF_INSTANCE_P" '{.metadata.uid}')
+if [ -z "$PER_UID_1" ]; then
+    printf 'ERROR: could not read the persistent pool instance uid\n' >&2
+    exit 1
+fi
+
+# The snapshot PVC — discovered, not assumed: the dragonfly-operator derives
+# its name from its own volumeClaimTemplate plus the StatefulSet ordinal.
+DF_PVC=$(kubectl -n "$DF_NS" get pvc --no-headers \
+    -o custom-columns=NAME:.metadata.name 2>/dev/null \
+    | grep -- "$DF_INSTANCE_P" | head -1 || true)
+if [ -z "$DF_PVC" ]; then
+    printf 'ERROR: no PVC matching %s in %s — the persistent arm has no volume to assert on\n' \
+        "$DF_INSTANCE_P" "$DF_NS" >&2
+    kubectl -n "$DF_NS" get pvc >&2 2>&1 || true
+    exit 1
+fi
+DF_PV_1=$(jp pvc "$DF_NS" "$DF_PVC" '{.spec.volumeName}')
+df_pvc_phase=$(jp pvc "$DF_NS" "$DF_PVC" '{.status.phase}')
+assert_eq "snapshot PVC ${DF_PVC} is Bound (baseline)" "$df_pvc_phase" "Bound"
+printf '  baseline: %s uid=%s, PVC %s -> PV %s\n' \
+    "$DF_INSTANCE_P" "$PER_UID_1" "$DF_PVC" "$DF_PV_1"
+
+PER_REAPED_BEFORE=$(reap_metric dragonfly-persistent reaped)
+PER_VETO_RETAINED_BEFORE=$(reap_metric dragonfly-persistent veto_retained)
+
+# Remove the tenant. Unlike the ephemeral arm, the snapshot it leaves behind
+# DOES veto: a persistent instance holds data a recreate-within-grace can
+# reattach to.
+kubectl delete "$APP_RES" "$APP3" -n "$APP_NS" --wait=true
+wait_jsonpath retainedclaim "$RETAINED_NS" "$RETAINED3" \
+    '{.spec.claimRef.name}' "$CLAIM3" 120
+
+printf '  waiting for a veto_retained tick on the dragonfly-persistent arm ...\n'
+deadline=$(( $(date +%s) + 240 ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    per_veto_now=$(reap_metric dragonfly-persistent veto_retained)
+    [ "$per_veto_now" -gt "$PER_VETO_RETAINED_BEFORE" ] && break
+    sleep 10
+done
+per_veto_now=$(reap_metric dragonfly-persistent veto_retained)
+if [ "$per_veto_now" -le "$PER_VETO_RETAINED_BEFORE" ]; then
+    printf 'ERROR: dragonfly-persistent veto_retained never moved (%s -> %s) — the reaper is not evaluating the persistent instance at all, so nothing below would mean anything\n' \
+        "$PER_VETO_RETAINED_BEFORE" "$per_veto_now" >&2
+    exit 1
+fi
+printf '  ok: dragonfly-persistent veto_retained %s -> %s (the snapshot held the instance)\n' \
+    "$PER_VETO_RETAINED_BEFORE" "$per_veto_now"
+per_uid_grace=$(jp dragonfly.dragonflydb.io "$DF_NS" "$DF_INSTANCE_P" '{.metadata.uid}')
+assert_eq "persistent instance survived the grace window" "$per_uid_grace" "$PER_UID_1"
+
+# Simulate post-grace: drop the snapshot outright (a plain delete, NOT the
+# past-retainUntil GC dance of Phase 12 — reclaiming the tenant's DB is not
+# what is under test here, and leaving the data on the volume is what makes
+# the re-adoption assertion below mean something).
+kubectl delete retainedclaim "$RETAINED3" -n "$RETAINED_NS" --wait=true
+
+wait_gone dragonfly.dragonflydb.io "$DF_NS" "$DF_INSTANCE_P" \
+    $(( REAP_DWELL_SECS + 180 ))
+wait_gone pod "$DF_NS" "${DF_INSTANCE_P}-0" 180
+
+# ---- the volume survives ----------------------------------------------
+# ADR 0042 §9.2, measured on dragonfly-operator v1.5.0: the snapshot PVC is
+# unowned and the StatefulSet ships persistentVolumeClaimRetentionPolicy
+# Retain, so the delete leaves it Bound. Held under observation rather than
+# sampled once — a cascade would delete it asynchronously.
+printf '  holding the snapshot PVC under observation for 30s ...\n'
+for _ in $(seq 1 6); do
+    df_pvc_phase=$(jp pvc "$DF_NS" "$DF_PVC" '{.status.phase}')
+    df_pvc_deleting=$(jp pvc "$DF_NS" "$DF_PVC" '{.metadata.deletionTimestamp}')
+    if [ "$df_pvc_phase" != "Bound" ] || [ -n "$df_pvc_deleting" ]; then
+        printf 'ERROR: snapshot PVC %s did NOT survive the reap (phase=%q deletionTimestamp=%q) — ADR 0042 §9.2 says the Dragonfly arm is just the delete because the PVC is unowned and retained; re-measure that against the dragonfly-operator this cluster runs\n' \
+            "$DF_PVC" "$df_pvc_phase" "$df_pvc_deleting" >&2
+        kubectl -n "$DF_NS" get pvc >&2 2>&1 || true
+        exit 1
+    fi
+    sleep 5
+done
+df_pv_after=$(jp pvc "$DF_NS" "$DF_PVC" '{.spec.volumeName}')
+assert_eq "snapshot PVC still bound to the SAME PV after the reap" \
+    "$df_pv_after" "$DF_PV_1"
+
+per_reaped_after=$(reap_metric dragonfly-persistent reaped)
+if [ "$per_reaped_after" -le "$PER_REAPED_BEFORE" ]; then
+    printf 'ERROR: dragonfly-persistent reaped counter did not move (%s -> %s) — the instance went away for some reason OTHER than the reaper\n' \
+        "$PER_REAPED_BEFORE" "$per_reaped_after" >&2
+    exit 1
+fi
+printf '  ok: dragonfly-persistent reaped %s -> %s\n' \
+    "$PER_REAPED_BEFORE" "$per_reaped_after"
+
+# ---- re-provision adopts the same volume (§9.5) ------------------------
+kubectl apply -f - <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${APP3}
+  namespace: ${APP_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+    replicas: 1
+    expose:
+      port: 80
+    needs:
+      redis:
+        persistent: true
+        selector:
+          tier: integrated
+YAML
+
+wait_jsonpath "$CLAIM_RES" "$APP_NS" "$CLAIM3" '{.status.ready}' true 600
+
+PER_UID_2=$(jp dragonfly.dragonflydb.io "$DF_NS" "$DF_INSTANCE_P" '{.metadata.uid}')
+if [ -z "$PER_UID_2" ] || [ "$PER_UID_2" = "$PER_UID_1" ]; then
+    printf 'ERROR: the persistent instance uid is %q, want a NEW uid different from the reaped %q\n' \
+        "$PER_UID_2" "$PER_UID_1" >&2
+    exit 1
+fi
+df_pv_readopted=$(jp pvc "$DF_NS" "$DF_PVC" '{.spec.volumeName}')
+assert_eq "re-provisioned persistent instance adopted the SAME PV (§9.5)" \
+    "$df_pv_readopted" "$DF_PV_1"
+printf '  ok: persistent instance re-created (uid %s -> %s) on the original volume\n' \
+    "$PER_UID_1" "$PER_UID_2"
+
+# ===============================================================
+# Phase 17: sweep health — no per-tick error, and the arm with no
+#           instances is silent rather than failing
+# ===============================================================
+
+phase "Phase 17: sweep health — the reaper errored on no tick of this run"
+
+# The reaper reports a failed sweep on its OWN counter, under the synthetic
+# backend label `unknown` (reaper.rs `run`), not on
+# apprafter_reconcile_errors_total. Assert BOTH: the real bucket, and the
+# reconcile-error series a future re-plumbing might move the signal to — so
+# such a move fails this walk rather than silently passing it.
+sweep_errors=$(reap_metric unknown error)
+assert_eq 'apprafter_shared_backend_reap_total{backend="unknown",result="error"}' \
+    "$sweep_errors" "0"
+reconcile_errors=$(metric_value \
+    'apprafter_reconcile_errors_total{kind="SharedBackendReaper"}')
+assert_eq 'apprafter_reconcile_errors_total{kind="SharedBackendReaper"}' \
+    "$reconcile_errors" "0"
+
+if kubectl -n apprafter-system logs deploy/apprafter-operator --tail=-1 2>/dev/null \
+    | strip_ansi | grep -q 'SharedBackendReaper sweep failed'; then
+    printf 'ERROR: the operator log carries a "SharedBackendReaper sweep failed" line — a sweep aborted on this run\n' >&2
+    kubectl -n apprafter-system logs deploy/apprafter-operator --tail=-1 2>/dev/null \
+        | strip_ansi | grep 'SharedBackendReaper' >&2 || true
+    exit 1
+fi
+printf '  ok: no sweep-failure line in the operator log\n'
+
+# The CNPG arm ran on every tick of this walk with NOTHING to reap — the
+# CNPG operator is always-on and its CRD is served, and the `pg-integrated`
+# provider is seeded, but this walk creates no pg claim so the shared
+# Cluster was never lazily created. An empty candidate set must be silent:
+# no error (asserted above, the error bucket is shared) and no reap.
+cnpg_reaped=$(reap_metric cnpg reaped)
+assert_eq "cnpg reaps on a cluster with no shared CNPG Cluster" "$cnpg_reaped" "0"
+
+# ===============================================================
 # Done — tear down on success path
 # ===============================================================
 
@@ -1204,3 +1805,4 @@ rm -rf "$TMPDIR_WORK"
 
 printf '\nneeds-redis-walk GREEN in %s\n' "$(elapsed)"
 printf 'Chain proven: generate -> schedule -> provision -> resume + explicit env refs (2.12) -> isolation -> EVAL-confinement/client-init/restart-repin -> persistent variant + restart-durable -> delete + snapshot -> GC -> FLUSHDB/DELUSER\n'
+printf 'ADR 0042 §9 proven: ephemeral reap (instance+STS+pod gone, RetainedClaim + admin Secret kept, node memory returned) -> clean re-create (new uid, unrotated password) -> live tenant never reaped -> persistent RETAINED veto then post-grace reap with the PVC preserved and the same PV re-adopted -> no sweep error\n'
