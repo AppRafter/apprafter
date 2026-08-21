@@ -44,10 +44,15 @@ _components: "sealed-secrets": #Component & {
 		// limit (BestEffort-adjacent — no OOM ceiling). Add a memory
 		// limit (measured 22Mi → 128Mi headroom) so the controller is
 		// Burstable with a bounded ceiling, not unbounded.
+		// 0.2.56: the 2.16d baseline measured 22Mi and chose a 32Mi
+		// request; 64Mi shipped here by mistake and went unnoticed
+		// because the D2 budget-close summed the measurement's chosen
+		// column, not this file. Live working set on the dogfood
+		// cluster is 14Mi. Corrected to the 32Mi the baseline chose.
 		resources: {
 			requests: {
 				cpu:    "50m"
-				memory: "64Mi"
+				memory: "32Mi"
 			}
 			limits: memory: "128Mi"
 		}
