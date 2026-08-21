@@ -136,29 +136,46 @@ so option 2 should say *moved*, not merely *deprecated*.
 Both were found by reading, not by any gate, and both are deliberately
 not acted on here.
 
-### The VPA controllers have never run
+### The VPA controllers have never run — FIXED in platform-stack 0.2.55
 
-`platform-stack/cue/component_vpa.cue:58,87` passes
-`--feature-gates=InPlaceOrRecreate=true` to the updater and the
-admission controller. The chart is pinned to `vertical-pod-autoscaler`
-0.11.0 (appVersion 1.7.1), and that image rejects the gate — so both
-pods have been in `CrashLoopBackOff` since the component shipped in
-2.16e, not since some later drift. Recommendations are computed and
-never applied.
+**Resolved 2026-08-21 at the owner's instruction.** Kept here because the
+diagnosis is worth more than the fix.
 
-Why nothing was changed: removing the gate would let the updater start,
-and its first action is to evict pods in order to resize them. That is a
-move from "nothing happens" to "your workloads restart" on a live
-cluster, which is an owner's decision rather than a documentation one.
+The gate was renamed upstream: `InPlaceOrRecreate` → `InPlace`, which now
+matches the `updateMode` the operator already rendered. VPA 1.7.1 rejects an
+unknown gate by refusing to start rather than warning, so the updater and the
+admission controller crash-looped from the day the component shipped in 2.16e.
+The recommender was unaffected — recommendations accrued and nothing applied
+them.
 
-The yank policy does not apply. Every published version carrying the
-component is affected equally, and `currentVersion` is the only
-published one — yanking would leave clusters with no unyanked version to
-land on. This is a fix-forward, not a withdrawal.
+The correct name was not guessed. The binary prints its own gate list when
+given a bad one:
 
-`docs/dev-guide/resources-and-autoscaling.md` now describes what happens
-today and gives the tell (`kubectl -n vpa get pods`), because the page's
-own installed-check passes in this state.
+```sh
+kubectl -n vpa logs deploy/vpa-vertical-pod-autoscaler-updater \
+  | grep -A6 'feature-gates mapStringBool'
+```
+
+which returns `AllAlpha`, `AllBeta`, `CPUStartupBoost`, `InPlace`,
+`PerVPAConfig`. The CRD independently confirms the mode is real:
+`["Off","Initial","Recreate","InPlaceOrRecreate","InPlace","Auto"]`.
+
+The design was right and is unchanged. ADR 0054 chose `InPlace` over
+`InPlaceOrRecreate` deliberately, because the latter falls back to *evicting*
+the pod on an infeasible resize — an outage for a single-replica app. So the
+fix restores non-evicting in-place resize, not eviction.
+
+**What it changes on upgrade:** the updater begins applying recommendations to
+live pods via the resize subresource. No restarts; a pod whose node cannot fit
+the new request is deferred and retried. Apps with an explicit
+`spec.resources` block are untouched — the operator renders no VPA for them.
+
+**Still open: whether to yank the affected versions.** Every platform-stack
+release carrying the component is equally broken, so a yank sweep would have to
+cover all of them. A cluster following the channel moves to 0.2.55 on its own
+and needs nothing; a cluster **pinned** to an older version stays broken
+silently, and a yank is what would surface that as `YankedVersion=True`. That
+is the only case a sweep buys, and it is the owner's call.
 
 ### `spec.argocd.bootstrapRepo` / `bootstrapPath` are vestigial
 

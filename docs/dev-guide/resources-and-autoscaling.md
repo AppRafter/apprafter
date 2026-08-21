@@ -20,37 +20,41 @@ set of hints the platform refines. Writing it is how you say "I own
 these numbers", and the automatic correction stops for that
 application.
 
-!!! warning "Right-sizing observes but does not apply, on the shipped release"
+!!! warning "Before platform-stack 0.2.55, right-sizing observed but never applied"
 
-    The autoscaler ships in three parts. The **recommender** runs and does
-    its job: recommendations are computed, written to the
-    `VerticalPodAutoscaler`, and mirrored onto your application's status,
-    so everything under
-    [Seeing what it decided](#seeing-what-it-decided) works.
+    Check which side of this you are on before reading further:
 
-    The **updater** and the **admission controller** — the two that would
-    actually change a pod — do not start. The platform passes them
-    `--feature-gates=InPlaceOrRecreate=true`
-    (`platform-stack/cue/component_vpa.cue:58` and
-    `platform-stack/cue/component_vpa.cue:87`), and the version it
-    pins rejects that name outright:
-
-    ```console
-    $ podman run --rm registry.k8s.io/autoscaling/vpa-updater:1.7.1 \
-        --feature-gates=InPlaceOrRecreate=true
-    invalid argument "InPlaceOrRecreate=true" for "--feature-gates" flag: unrecognized feature gate: InPlaceOrRecreate
+    ```sh
+    kubectl -n vpa get pods          # all three Running → it applies
+    apprafter platform status        # the platform version this cluster is on
     ```
 
-    (Same for `vpa-admission-controller:1.7.1`. The chart is pinned at
-    `vertical-pod-autoscaler` 0.11.0, whose `appVersion` is `1.7.1`.)
-    Both Deployments therefore crash-loop, and because the mutating webhook
-    is registered `failurePolicy: Ignore`, nothing anywhere fails loudly —
-    pods are simply created with the Deployment's `32Mi` and keep it.
+    The autoscaler ships in three parts. The **recommender** always ran:
+    recommendations were computed, written to the `VerticalPodAutoscaler`
+    and mirrored onto your application's status, so everything under
+    [Seeing what it decided](#seeing-what-it-decided) worked. The
+    **updater** and the **admission controller** — the two that actually
+    change a pod — did not start at all. They were passed a feature gate
+    named `InPlaceOrRecreate`; upstream renamed it to `InPlace`, and the
+    pinned version rejects an unknown gate by refusing to start rather
+    than warning. Both Deployments crash-looped from the day the component
+    shipped.
 
-    **So, today:** read the recommendation, act on it yourself with an
-    explicit `resources` block. Do not plan capacity on the assumption that
-    a request will be corrected upward for you. This is being tracked as a
-    platform defect — the fix is not a change you can make from a manifest.
+    Nothing failed loudly, and that is the part worth remembering. The
+    mutating webhook is registered `failurePolicy: Ignore` — correct, so a
+    down admission pod cannot deadlock pod creation cluster-wide — so a
+    dead webhook admits pods unchanged instead of rejecting them. The CRDs
+    install from the chart independently of the controllers, so every
+    "is the autoscaler installed?" check that looks for the CRD passed the
+    whole time. Pods were created with the Deployment's seed request and
+    kept it, beside a recommendation saying otherwise.
+
+    **On 0.2.55 and later** the updater applies recommendations in place,
+    without eviction — see
+    [What the platform does when you leave it alone](#what-the-platform-does-when-you-leave-it-alone).
+    **On anything earlier**, read the recommendation and act on it yourself
+    with an explicit `resources` block, and do not plan capacity on the
+    assumption that a request will be corrected upward for you.
 
 The design behind the automatic half is
 [ADR 0054](https://github.com/apprafter/apprafter/blob/master/docs/adr/0054-vpa-vertical-autoscaling.md);
@@ -224,7 +228,7 @@ down on the shipped release, so today nothing in the first row happens:
 
 | Setting | Value | What it means for you |
 | --- | --- | --- |
-| update mode | `InPlace` | The request on the **running pod** would be changed where it stands. No eviction, no restart, no rollout. If the node cannot fit the new request the change is deferred and retried rather than forced. (Requires the updater, which does not currently start.) |
+| update mode | `InPlace` | The request on the **running pod** would be changed where it stands. No eviction, no restart, no rollout. If the node cannot fit the new request the change is deferred and retried rather than forced. (Requires the updater, which runs from platform-stack 0.2.55.) |
 | controlled values | `RequestsOnly` | Only **requests** are ever touched. Your limits — or the platform's `512Mi` — are never rewritten. |
 | controlled resources | `cpu`, `memory` | Nothing else is autoscaled, `ephemeral-storage` included. |
 | floor | `cpu: 25m`, `memory: 32Mi` | The platform's own starting values: the request is never corrected below them. |
@@ -254,12 +258,13 @@ kubectl get crd verticalpodautoscalers.autoscaling.k8s.io
 kubectl -n vpa get pods
 ```
 
-On the shipped release the second command is the one that tells the
-truth: the `…-recommender` pod is `Running`, while the `…-updater` and
-`…-admission-controller` pods sit in `CrashLoopBackOff` — the
-feature-gate defect in the warning at the top of this page. The first
-command passes in exactly that state, which is why it cannot be the
-test.
+The second command is the one that tells the truth, and the first is the
+trap. Before platform-stack 0.2.55 the `…-recommender` pod is `Running`
+while the `…-updater` and `…-admission-controller` pods sit in
+`CrashLoopBackOff` — the gate defect in the warning at the top of this
+page. The CRD check passes in exactly that state and always did, which
+is why it cannot be the test. Expect three `Running` pods; anything less
+means recommendations are accruing and nothing is applying them.
 
 ```sh
 # Why a controller is down, when it is. The label is stable; the

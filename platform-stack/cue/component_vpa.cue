@@ -16,11 +16,35 @@ package platformstack
 // AppRafter CRD).
 //
 // In-place resize is an upstream ALPHA feature gated behind
-// `--feature-gates=InPlaceOrRecreate=true` on the updater + admission
-// controller — re-read the gate name on every chart bump. `failurePolicy:
-// Ignore` (chart default) keeps a down admission pod from deadlocking
-// cluster-wide pod creation. Recommender resources are load-bearing — MEASURE
-// on a real node (2.16e T13) and pin; the values below are a generous seed.
+// `--feature-gates=InPlace=true` on the updater + admission controller.
+//
+// The gate is named `InPlace`, matching the `updateMode` the operator
+// renders. It was `InPlaceOrRecreate` when this component was written, and
+// upstream renamed it; 1.7.1 rejects the old name outright — not with a
+// warning, but by refusing to start. ADR 0054 anticipated exactly this
+// ("semantics moved between VPA minors — re-read the gate name on every
+// chart bump") and the instruction was not followed, so both the updater
+// and the admission controller sat in CrashLoopBackOff from the day this
+// component shipped until 2026-08-21. The recommender was unaffected, so
+// recommendations kept accruing and nothing ever applied them.
+//
+// Two things made that silent, and both are worth knowing before changing
+// anything here. `failurePolicy: Ignore` on the admission webhook — correct,
+// it stops a down admission pod deadlocking cluster-wide pod creation — also
+// means a dead webhook admits VPA objects unmutated rather than failing. And
+// the CRDs install from the chart independently of the controllers, so every
+// "is VPA installed?" check that looks for the CRD passes while nothing runs.
+// **The tell is `kubectl -n vpa get pods`, not the CRD.**
+//
+// The valid gates are printed by the binary itself on a bad one — read them
+// from the crash log rather than from upstream docs, which describe a
+// different minor:
+//
+//   kubectl -n vpa logs deploy/vpa-vertical-pod-autoscaler-updater \
+//     | grep -A6 'feature-gates mapStringBool'
+//
+// Recommender resources are load-bearing — MEASURE on a real node
+// (2.16e T13) and pin; the values below are a generous seed.
 _components: "vpa": #Component & {
 	name:      "vpa"
 	enabled:   bool | *true
@@ -55,7 +79,7 @@ _components: "vpa": #Component & {
 					values: ["kube-system"]
 				}]
 			}
-			extraArgs: ["--feature-gates=InPlaceOrRecreate=true"]
+			extraArgs: ["--feature-gates=InPlace=true"]
 			// 2.16d: no platform pod BestEffort (the admission controller is a
 			// lightweight webhook).
 			resources: {
@@ -84,7 +108,7 @@ _components: "vpa": #Component & {
 			replicas: 1
 			extraArgs: [
 				"--in-place-skip-disruption-budget=true",
-				"--feature-gates=InPlaceOrRecreate=true",
+				"--feature-gates=InPlace=true",
 			]
 			// 2.16d: no platform pod BestEffort (the updater watches + patches).
 			resources: {

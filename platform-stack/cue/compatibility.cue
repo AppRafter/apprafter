@@ -1760,6 +1760,46 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.55": {
+	change:          "safe"
+	operatorVersion: "v0.2.41"
+	notes: """
+		fix/vpa: the updater and admission controller are passed
+		`--feature-gates=InPlace=true`. They were passed
+		`--feature-gates=InPlaceOrRecreate=true`, which VPA 1.7.1 does not
+		recognise — it refuses to start rather than warning, so BOTH pods have
+		been in CrashLoopBackOff since the component shipped in 2.16e. The
+		recommender was unaffected, so recommendations accrued and nothing ever
+		applied them: vertical autoscaling has never actually run on any
+		cluster carrying this component.
+
+		Upstream renamed the gate; it now matches the `updateMode: InPlace`
+		the operator already renders, and the CRD accepts that mode
+		(`["Off","Initial","Recreate","InPlaceOrRecreate","InPlace","Auto"]`,
+		read off a live cluster). No operator, CRD or API change — one string
+		in two `extraArgs` lists.
+
+		WHAT CHANGES ON UPGRADE: both pods start, and the updater begins
+		applying recommendations to live pods. It resizes IN PLACE via the
+		resize subresource and does NOT evict — that is why ADR 0054 chose
+		`InPlace` over `InPlaceOrRecreate` (which falls back to eviction, an
+		outage for a single-replica app). Expect requests on managed workloads
+		to move toward their recommendations without restarts; a pod whose
+		node cannot satisfy the new request is deferred and retried, not
+		evicted. Apps with an explicit `spec.resources` block are untouched —
+		the operator renders no VPA for them.
+
+		Not classified `breaking`: nothing is rejected and no manual step is
+		required. It is nonetheless the first time this feature does anything,
+		so a cluster that has been running with it "enabled" will see resource
+		requests change for the first time.
+
+		The tell that it worked is `kubectl -n vpa get pods` — all three
+		Running. The CRD check that every "is it installed" probe used passes
+		in both states and always did.
+		"""
+	references: ["platform-stack/cue/component_vpa.cue", "docs/adr/0054-vertical-autoscaling-vpa.md"]
+}
 compatibility: "0.2.54": {
 	change:          "breaking"
 	operatorVersion: "v0.2.41"

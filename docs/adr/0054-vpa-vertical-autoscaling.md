@@ -21,7 +21,7 @@ We will adopt the **upstream Vertical Pod Autoscaler** (official `kubernetes/aut
 - **Cluster knob (`PlatformStack.spec.resources.autoscale.mode`), three-valued, default `full`:** `full` (InPlace, bidirectional), `up-only` (InPlace + `evictionRequirements: TargetHigherThanRequests` — raises but never reclaims), `off` (`updateMode: Off` — recommender still learns and the mirror still populates; pods untouched). The operator reads the knob **with fallback to compiled-in tier defaults and never writes `PlatformStack.spec`**. `apprafter platform autoscale set|show` flips it (merge-patch).
 - **Read-only mirror:** the operator reflects `VerticalPodAutoscaler.status.recommendation` (`target` + `uncappedTarget`) into `Application.status.recommendedResources` in the single status apply payload, surfaced by `apprafter app status`.
 - **Pro-mode opt-out (implicit, per-env):** an app with explicit `resources` (effective spec) gets no VPA CR; the operator prunes any existing CR when the app transitions to pro-mode.
-- **Chart config:** self-managed webhook cert (`certGen` + `registerWebhook: false`, the CNPG precedent — no cert-manager dependency); `admissionController.mutatingWebhookConfiguration.failurePolicy: Ignore` (chart default); `--feature-gates=InPlaceOrRecreate=true` on updater + admission controller (in-place is an upstream **alpha** gate — off by default, and the webhook rejects in-place-mode VPA objects when it is off); recommender tuned for weekly peaks (`--memory-aggregation-interval=24h` ×14, `--memory-histogram-decay-half-life=168h`, `--memory-saver=true`); `--in-place-skip-disruption-budget=true`; syncWave -4.
+- **Chart config:** self-managed webhook cert (`certGen` + `registerWebhook: false`, the CNPG precedent — no cert-manager dependency); `admissionController.mutatingWebhookConfiguration.failurePolicy: Ignore` (chart default); `--feature-gates=InPlace=true` on updater + admission controller (in-place is an upstream **alpha** gate — off by default, and the webhook rejects in-place-mode VPA objects when it is off; **the gate was named `InPlaceOrRecreate` when this ADR was written and upstream renamed it — see the amendment**); recommender tuned for weekly peaks (`--memory-aggregation-interval=24h` ×14, `--memory-histogram-decay-half-life=168h`, `--memory-saver=true`); `--in-place-skip-disruption-budget=true`; syncWave -4.
 
 Out of scope (documented follow-ups): backend right-sizing (CNPG/Dragonfly resources live on the CR, not the pod — a recommendation-only path into `ServiceProvider.spec.config`); the KEDA/HPA exclusion guard (KEDA is not shipped and `autoscale` is removed from v1alpha1 — the 2.6a KEDA subphase owns both sides of the exclusion); git/template writeback (Phase 3, MCP-agent approval-gate).
 
@@ -50,6 +50,53 @@ Out of scope (documented follow-ups): backend right-sizing (CNPG/Dragonfly resou
 - **`mode: off` is not symmetric:** it freezes live pods but the next pod recreation admits at the seed (32Mi) — a deferred, decoupled capacity change. Mitigation: `autoscale set off` warns at the point of action; the walk pins the behaviour.
 - **metrics-server is an undeclared prerequisite** (the recommender reads `metrics.k8s.io`; k3s installs it by default). Mitigation: recorded here; the walk asserts `kubectl top pod` responds.
 - **`vpa_available` startup probe can go stale-true** if an infra overlay disables the component while the operator runs. We accept this (the `cilium_available` precedent has the same property); a live cluster is the only thing that catches it.
+
+## Amendment — the gate name, and the risk this ADR named coming true (2026-08-21)
+
+This ADR's Risks section says, of in-place being an upstream alpha feature:
+"semantics moved between VPA minors. Mitigation: pin the version explicitly,
+enable the feature gate deliberately, **validate the CR is accepted in the
+real-Hetzner walk**, and **re-read the gate name on every chart bump**."
+
+Both mitigations were written down and neither was performed. Upstream renamed
+the gate to `InPlace` — matching the `updateMode` this ADR already chose — and
+VPA 1.7.1 rejects the old name by refusing to start. So from the day the
+component shipped in 2.16e until 2026-08-21, the updater and the admission
+controller were in `CrashLoopBackOff` on every cluster carrying it. The
+recommender was unaffected: recommendations accrued, and nothing applied them.
+**Vertical autoscaling has never run.**
+
+Fixed in platform-stack `0.2.55`: one string, in two `extraArgs` lists. The
+decision itself is unchanged and was correct — the CRD accepts `InPlace`
+(`["Off","Initial","Recreate","InPlaceOrRecreate","InPlace","Auto"]`, read off
+a live cluster), and D1's reasoning for preferring it over `InPlaceOrRecreate`
+still holds.
+
+### Why it stayed invisible for months, which is the part worth carrying forward
+
+Three properties combined, and each is defensible alone:
+
+- **`failurePolicy: Ignore`** on the admission webhook is correct — it stops a
+  down admission pod deadlocking cluster-wide pod creation. It also means a
+  dead webhook admits VPA objects unmutated instead of failing loudly.
+- **The CRDs install from the chart independently of the controllers.** Every
+  "is VPA installed?" probe that checks for the CRD passes while nothing runs.
+  The documentation page written for this feature used exactly that check.
+- **Nothing asserts that a recommendation was ever applied.** The mirror
+  populates from the recommender, so `apprafter app status` shows a VPA
+  recommendation on a pod whose requests have never moved.
+
+The tell is `kubectl -n vpa get pods`, not the CRD. It is now in the component's
+comment, in the compatibility note and on the operator guide.
+
+### What would have caught it
+
+Not a documentation gate: every identifier resolved and every command existed.
+The closing walk of the documentation track found it by **reading the live
+cluster while checking a page's claims** — which is also the only reason the
+CRD-vs-controllers gap surfaced. The durable lesson matches the one that ADR
+recorded for itself and did not act on: an alpha upstream feature needs a check
+that the feature *did something*, not that its objects exist.
 
 ## Owner
 
