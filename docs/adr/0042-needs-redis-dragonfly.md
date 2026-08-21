@@ -235,10 +235,13 @@ v1.5.0`. The versions are recorded inline because §9.3's safety argument is a
 claim about a specific operator's reconcile behaviour: were a future chart to
 start re-adding the ownerReference, the strip would quietly stop protecting
 anything. **Re-measure on a CNPG chart bump** — and that instruction is
-enforced rather than left as prose: the pg e2e walk asserts the PVC is still
-`Bound` after a reap and that the same PV is re-adopted, so a CNPG version that
-starts re-adding the ownerReference makes the reap cascade and **fails the
-walk**. These are observations, not expectations.
+enforced rather than left as prose by the pg e2e walk
+(`e2e/needs-pg-walk.sh`) **extended in this same change**, which asserts the
+PVC is still `Bound` after a reap and that the same PV is re-adopted, so a CNPG
+version that starts re-adding the ownerReference makes the reap cascade and
+**fails the walk**. Until that extension lands, the enforcement is a commitment
+this change makes rather than a property it already has. These are
+observations, not expectations.
 
 **CNPG owns the volume, so a plain delete takes it — measured, not inferred.**
 On chart 0.28.2 the shared cluster's PVC is created carrying a controller
