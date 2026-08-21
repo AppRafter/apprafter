@@ -50,12 +50,24 @@ _components: "dragonfly-operator": #Component & {
 		// The kube-rbac-proxy sidecar fronts the operator's /metrics endpoint.
 		// It is left ENABLED (disabling it exposes metrics unauthenticated),
 		// but its upstream default request of 64Mi is four times its measured
-		// footprint (live 9Mi) and nothing currently consumes what it guards —
-		// the chart ships `rbacProxyMetricsReader.create: false`, so no
-		// Prometheus ServiceAccount is bound to it. The earlier decision to
-		// leave it at the chart default (see the comment above) is what kept
-		// its 64Mi out of the 2.16d D2 budget-close entirely.
-		rbacProxy: resources: requests: memory: "16Mi"
+		// footprint (live 9Mi on the dogfood cluster 2026-08-21) and nothing
+		// currently consumes what it guards — the chart ships
+		// `serviceMonitor.rbacProxyMetricsReader.create: false`, so no Prometheus
+		// ServiceAccount is bound to it. That 9Mi is a zero-traffic figure —
+		// nothing scrapes this endpoint today. Re-measure under load if
+		// serviceMonitor is ever enabled. Leaving it at the chart default
+		// (see the comment above) is why this sidecar needed its own pin,
+		// added here.
+		rbacProxy: resources: {
+			requests: memory: "16Mi"
+			// ADR 0053 §1: platform components get a CPU request and NO CPU
+			// limit — CPU is compressible, so a ceiling only adds latency
+			// cliffs with no safety benefit. The chart ships
+			// `limits.cpu: 500m`; Helm deletes a key whose user-supplied
+			// value is null. The `manager` container above already follows
+			// this pattern.
+			limits: cpu: null
+		}
 	}
 
 	// Operator + its CRD bundle must exist before any ServiceProvider CR
