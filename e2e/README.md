@@ -110,6 +110,54 @@ and runs nightly via
 of the per-push `e2e-k3d.yml` gate (booting a Postgres pod is heavier)
 and is not a dependency of `just e2e`.
 
+## substrate-upgrade-hetzner.sh
+
+Real-Hetzner proof that a cluster can be moved onto a **bigger machine**
+via backup → destroy → `restore --reprovision --server-type`, with the
+workload and all Postgres data intact. A *planned substrate upgrade*
+(same target, same project, same region — `cx23` → `cx33` in `hel1`),
+not disaster recovery.
+
+The central assertion is a **deterministic digest of the CMS application
+database**: for every user table, its row count plus a content hash over
+the rows in an explicit `ORDER BY ... COLLATE "C"`. (`pg_dump` output is
+unordered and hashing it produces false failures.) The digest is computed
+twice on the unchanged source and asserted identical *before* it is
+relied on — an unreproducible digest is either a false alarm or a false
+pass, and you cannot tell which from the outcome. Phase 7 then asserts it
+is byte-identical after the upgrade, with row counts matching table for
+table, alongside: server type is now the big SKU **read from the Hetzner
+API**, server id changed, and node allocatable memory grew.
+
+Two legs share every phase — one switch, no forked script:
+
+```sh
+set -a; . ./backup-test.env; set +a          # exports OLD_CLUSTER_TOKEN + S3_*
+
+# Leg A — host-local restic repo (`backup create`). Needs only the token.
+./e2e/substrate-upgrade-hetzner.sh
+
+# Leg B — real off-site S3 (`backup enable` + the in-cluster CronJob runner).
+APPRAFTER_SUBSTRATE_BACKEND=s3 ./e2e/substrate-upgrade-hetzner.sh
+```
+
+The project baseline **must be zero resources**: the walk refuses to
+start otherwise, because its teardown sweeps the project. Teardown is
+armed before the first provision and API-verifies zero at the end; a leak
+is a failure, not a note. Cost is two short-lived boxes, ~EUR 0.02.
+
+A missing precondition exits 2 *before* anything is provisioned — this
+walk never returns green for a gate that did not run. Judge a run by
+reading the log: the `FAILED:` marker, each phase's `ok:` lines, and the
+final GREEN banner.
+
+Note: the CMS initialises **lazily** — its Payload adapter runs
+`prodMigrations` and the global seed on the first request that reaches a
+payload route, so a pod that is merely `Ready` has written nothing to the
+database. Phase 3 wakes it from inside the pod and waits for
+`payload_migrations` to appear, otherwise the "CMS database" fingerprint
+would cover nothing but the walk's own seed rows.
+
 ## Nightly CI
 
 `.github/workflows/nightly.yml` runs this script every night at
