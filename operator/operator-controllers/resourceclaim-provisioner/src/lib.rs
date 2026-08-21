@@ -245,3 +245,41 @@ pub async fn run_acl_reconcile(
     let ctx = Arc::new(Context::new(client, metrics));
     acl_reconcile::run(ctx).await
 }
+
+/// Spawn the shared-backend reaper loop (ADR 0042 §9).
+///
+/// Deletes a Dragonfly pool instance, or the shared CNPG `Cluster`, once
+/// nothing in the cluster can be pointing at it anymore (no live
+/// `ResourceClaim` allocated or in-flight onto it, no `RetainedClaim`
+/// snapshot naming it — see [`reaper::reap_decision`] for the full veto
+/// table). `dwell` is the minimum time a candidate must stay continuously
+/// empty before it is reaped; the caller owns any env-var override so this
+/// function stays a pure "wire the config in" seam.
+///
+/// # An interval task, NOT a kube-rs `Controller`
+///
+/// Same shape as [`run_acl_reconcile`], and for a sharper reason than that
+/// loop's: this one deletes. Two independent facts rule out a `Controller`.
+///
+/// **A destructive sweeper must not own a reflector store.** The predicate
+/// this loop drives is a NEGATIVE — "nothing in the cluster references this
+/// instance" — so a stale watch cache does not read as "stale", it reads as
+/// "empty", and an empty read here means a delete. A `Controller`'s
+/// reflector is exactly that stale cache, handed to the one task that must
+/// never trust it; a plain LIST on every tick is the only read this
+/// predicate can safely be built on.
+///
+/// **A `Controller` would watch-storm where the CRDs are not served.** Both
+/// `dragonflydb.io` and `postgresql.cnpg.io` are cluster-optional — absent
+/// on any cluster that has not installed that backend's component. A watch
+/// against an unserved GVK retries forever; the sweep's LIST just 404s once
+/// per tick and moves on. See [`reaper::run`]'s own doc comment for the
+/// full accounting (this wrapper only threads the `Context`).
+pub async fn run_reaper(
+    client: Client,
+    metrics: Arc<Metrics>,
+    dwell: std::time::Duration,
+) -> Result<(), ReconcileError> {
+    let ctx = Arc::new(Context::new(client, metrics));
+    reaper::run(ctx, dwell).await
+}

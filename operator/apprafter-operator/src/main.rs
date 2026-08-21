@@ -297,6 +297,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // SharedBackendReaper — ninth loop (ADR 0042 §9). Deletes a Dragonfly
+    // pool instance or the shared CNPG cluster once nothing references it.
+    // `APPRAFTER_REAP_DWELL_SECS` overrides the default 10-minute dwell so
+    // e2e walks can assert a terminal outcome instead of racing a real
+    // ten-minute timer; production runs unset, at the default.
+    let reap_dwell = std::time::Duration::from_secs(
+        env::var("APPRAFTER_REAP_DWELL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(600),
+    );
+    let reaper_handle = tokio::spawn({
+        let client = client.clone();
+        let metrics = metrics.clone();
+        async move {
+            if let Err(err) = operator_controllers_resourceclaim_provisioner::run_reaper(
+                client, metrics, reap_dwell,
+            )
+            .await
+            {
+                error!(%err, "SharedBackendReaper loop error");
+            }
+        }
+    });
+
     tokio::select! {
         _ = server_handle => warn!("HTTP server exited"),
         _ = controller_handle => warn!("Application controller exited"),
@@ -307,6 +332,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = resourceclaim_provisioner_handle => warn!("ResourceClaimProvisioner controller exited"),
         _ = resourceclaim_gc_handle => warn!("ResourceClaimGC controller exited"),
         _ = dragonfly_acl_handle => warn!("DragonflyAclReconcile loop exited"),
+        // Spawned after the leadership-acquired wait loop above, same as
+        // every other handle in this select! — leader-gated for free, no
+        // extra lease logic of its own. Without this arm the reaper task's
+        // death would be invisible: the process would carry on serving
+        // /healthz forever with the reaper silently gone.
+        _ = reaper_handle => warn!("SharedBackendReaper loop exited"),
         _ = leader_handle => warn!("leader election exited"),
         _ = tokio::signal::ctrl_c() => info!("ctrl-c received, shutting down"),
     }
