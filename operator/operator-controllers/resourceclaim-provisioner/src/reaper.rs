@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
-//! Pure policy for the shared-backend reaper (ADR 0042 §9).
+//! The shared-backend reaper (ADR 0042 §9) — pure policy, and the sweep
+//! that drives it.
 //!
 //! Both shared backends this crate creates lazily — the shared CNPG
 //! `Cluster` (`provision_cloudnativepg`) and the Dragonfly pool instances
@@ -8,11 +9,16 @@
 //! full Guaranteed reservation (256Mi CNPG / 320Mi Dragonfly), which on a
 //! ~4 GB Tier-1 node is not a rounding error.
 //!
-//! This module answers exactly one question, for one candidate instance:
-//! **may it be deleted?** It is I/O-free on purpose — no `Api`, no
-//! `Client`, no `Instant::now()`. The caller LISTs, measures the clock and
-//! performs the delete; keeping the decision pure is what makes the whole
-//! §9.1 predicate table-testable without a cluster.
+//! The module is in two halves, and the seam between them is deliberate.
+//!
+//! The **predicate** answers exactly one question, for one candidate
+//! instance: **may it be deleted?** It is I/O-free on purpose — no `Api`,
+//! no `Client`, no `Instant::now()`. Keeping the decision pure is what
+//! makes the whole §9.1 predicate table-testable without a cluster.
+//!
+//! The **sweep** ([`run`] / `sweep`, at the bottom of this file) is the I/O
+//! that feeds it: it LISTs, measures the clock, and performs the delete.
+//! It holds no policy of its own.
 //!
 //! ## The three vetoes (§9.1)
 //!
@@ -40,13 +46,21 @@
 //! exists throughout that window, so vetoing on "an unallocated claim of
 //! this class exists" covers all of it.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ListMeta;
+use kube::api::{Api, DeleteParams, DynamicObject, ListParams, Preconditions};
+use kube::ResourceExt;
 use serde_json::Value;
+use tracing::{debug, info, warn};
 
-use crate::dragonfly::PoolClass;
-use crate::reconcile::Backend;
+use crate::acl_reconcile::redis_namespace_from;
+use crate::dragonfly::{class_of_instance, PoolClass};
+use crate::reconcile::{dragonfly_cluster_ar, Backend};
+use crate::{Context, ReconcileError};
 use operator_core::{ResourceClaim, RetainedClaim, ServiceProvider};
 
 /// `ResourceClaim.spec.type` of a Redis claim (the Dragonfly backend's
@@ -305,6 +319,449 @@ pub fn reap_decision(
         Some(elapsed) if elapsed >= dwell => Decision::Reap,
         _ => Decision::Dwell,
     }
+}
+
+// ---------------------------------------------------------------------------
+// The sweep — the I/O that drives the predicate above
+// ---------------------------------------------------------------------------
+
+/// How often the sweep runs. The reap itself is gated by `dwell` (minutes),
+/// so the tick only bounds how promptly an elapsed dwell is noticed; a
+/// minute is far below any dwell worth configuring and costs three LISTs.
+const TICK: Duration = Duration::from_secs(60);
+
+/// Metric `backend` label for a candidate — the `backend` dimension of
+/// `apprafter_shared_backend_reap_total`.
+fn backend_label(target: &Target) -> &'static str {
+    match target {
+        Target::Dragonfly {
+            class: PoolClass::Ephemeral,
+            ..
+        } => "dragonfly-ephemeral",
+        Target::Dragonfly {
+            class: PoolClass::Persistent,
+            ..
+        } => "dragonfly-persistent",
+        Target::Cnpg { .. } => "cnpg",
+    }
+}
+
+/// Metric `result` label for a veto.
+fn veto_label(reason: VetoReason) -> &'static str {
+    match reason {
+        VetoReason::Live => "veto_live",
+        VetoReason::Intent => "veto_intent",
+        VetoReason::Retained => "veto_retained",
+    }
+}
+
+/// The candidate's own `metadata.name`.
+fn target_name(target: &Target) -> &str {
+    match target {
+        Target::Dragonfly { name, .. } | Target::Cnpg { name } => name,
+    }
+}
+
+/// Key under which a candidate's dwell clock is held.
+///
+/// BACKEND-QUALIFIED, not the bare name: the dwell map is shared by every
+/// backend arm, and a CNPG provider whose `config./cluster` happened to
+/// name a string in the `platform-redis-<class>-<index>` shape would
+/// otherwise share one clock with a Dragonfly pool instance — two
+/// different instances, one timer, and whichever emptied first could reap
+/// the other early. Qualifying the key costs a `format!` per candidate per
+/// tick and removes the class of bug entirely.
+fn dwell_key(target: &Target) -> String {
+    format!("{}/{}", backend_label(target), target_name(target))
+}
+
+/// Did this LIST come back truncated (a non-empty `continue` token)?
+///
+/// LOAD-BEARING. A success-but-partial LIST is the one realistic path to a
+/// false "empty": it omits objects with no error and no signal other than
+/// this token, and it omits live `ResourceClaim`s and `RetainedClaim`s with
+/// equal silence. Every list the predicate reasons from is checked with
+/// this, and a `true` aborts the pass.
+fn list_truncated(meta: &ListMeta) -> bool {
+    meta.continue_.as_deref().is_some_and(|c| !c.is_empty())
+}
+
+/// The cluster-wide veto sets one sweep pass reasons from.
+///
+/// Gathered ONCE per pass and shared by every backend arm, so all arms
+/// judge against the same instant of cluster state rather than each
+/// re-listing and drifting apart. `providers` is carried alongside `idx`
+/// because arms need the raw list too (namespace resolution), and re-listing
+/// it would reintroduce exactly the second, unchecked snapshot this struct
+/// exists to prevent.
+struct SweepInputs {
+    live: Vec<ResourceClaim>,
+    retained: Vec<RetainedClaim>,
+    providers: Vec<ServiceProvider>,
+    idx: ProviderIndex,
+    /// The instant the pass began — the clock every candidate in it is
+    /// measured against.
+    now: Instant,
+}
+
+/// Run the shared-backend reaper (ADR 0042 §9) forever.
+///
+/// # An interval task, NOT a kube-rs `Controller`
+///
+/// This shape is deliberate, and there are two independent reasons for it.
+///
+/// **A destructive sweeper must not own a reflector store.** The predicate
+/// this task drives is a NEGATIVE — "nothing in the cluster references this
+/// instance" — and a stale cache reads as emptiness. Every other controller
+/// in this crate reconciles a positive (an object exists, make it so), where
+/// a stale store costs a late reconcile; here it costs a live database. A
+/// `Controller` would hand this task exactly the cache it must not have.
+///
+/// **A `Controller` would watch-storm where the CRDs are not served.** The
+/// foreign `dragonflydb.io` / `postgresql.cnpg.io` CRDs are cluster-optional
+/// (absent on kind/e2e without the component). A watch against an unserved
+/// resource retries forever; a LIST simply 404s once per tick and is
+/// tolerated.
+pub async fn run(ctx: Arc<Context>, dwell: Duration) -> Result<(), ReconcileError> {
+    info!(
+        tick_secs = TICK.as_secs(),
+        dwell_secs = dwell.as_secs(),
+        "SharedBackendReaper loop starting"
+    );
+    // In-memory ONLY. A restart forgets the dwell and costs one extra dwell —
+    // it fails in the safe direction. Do NOT persist it by annotating a
+    // foreign CR: that is an SSA write into an object another operator owns,
+    // on every tick, and it would make the reap decision depend on a write
+    // succeeding.
+    let mut empty_since: HashMap<String, Instant> = HashMap::new();
+    loop {
+        if let Err(err) = sweep(&ctx, dwell, &mut empty_since).await {
+            warn!(%err, "SharedBackendReaper sweep failed — retrying next tick");
+            ctx.metrics
+                .shared_backend_reap_total
+                .with_label_values(&["unknown", "error"])
+                .inc();
+        }
+        tokio::time::sleep(TICK).await;
+    }
+}
+
+/// One sweep pass: gather the shared veto sets, then run each backend arm
+/// against them.
+async fn sweep(
+    ctx: &Arc<Context>,
+    dwell: Duration,
+    empty_since: &mut HashMap<String, Instant>,
+) -> Result<(), ReconcileError> {
+    // LOAD-BEARING INVARIANT 1 — every read is LIVE. This task deliberately
+    // owns no reflector store: the predicate is a NEGATIVE ("nothing
+    // references this"), so a stale cache reads as emptiness and deletes a
+    // live backend. Never swap these for a store "because it is faster".
+    let live = Api::<ResourceClaim>::all(ctx.client.clone())
+        .list(&Default::default())
+        .await?;
+    let retained = Api::<RetainedClaim>::all(ctx.client.clone())
+        .list(&Default::default())
+        .await?;
+    let providers = Api::<ServiceProvider>::all(ctx.client.clone())
+        .list(&Default::default())
+        .await?;
+
+    // LOAD-BEARING INVARIANT 2 — a success-but-partial LIST is the one
+    // realistic path to a false "empty". Abort the pass rather than reason
+    // from a truncated veto set.
+    //
+    // NOTE the deliberate asymmetry with the arm-level truncation check: this
+    // one returns BEFORE `empty_since.retain` below, so every dwell clock
+    // survives an aborted pass; an arm's own check returns after, so its
+    // clocks are dropped. Both fail safe (the first resumes where it left
+    // off, the second costs one extra dwell), and the difference is only that
+    // this abort happens before any arm has had a chance to report what it
+    // saw — retaining on an empty `seen` here would wipe every clock in the
+    // cluster on a single truncated read.
+    for (what, meta) in [
+        ("resourceclaims", &live.metadata),
+        ("retainedclaims", &retained.metadata),
+        ("serviceproviders", &providers.metadata),
+    ] {
+        if list_truncated(meta) {
+            warn!(list = what, "LIST truncated — skipping this reap pass");
+            return Ok(());
+        }
+    }
+
+    // LOAD-BEARING INVARIANT 3 — every error above propagated via `?` and
+    // aborted the pass. An error is NEVER read as emptiness.
+    //
+    // `providers.items` is fed in APISERVER ORDER — deliberately not sorted,
+    // deduped or filtered first. `provider_index`'s collision tie-break is
+    // first-wins specifically to match `find_provider` (reconcile.rs), which
+    // resolves with `.find(...)` over the same list order; reordering here
+    // would silently break that equivalence and resolve the reaper to a
+    // different cluster than the provisioner used.
+    let idx = provider_index(&providers.items);
+    let inputs = SweepInputs {
+        live: live.items,
+        retained: retained.items,
+        providers: providers.items,
+        idx,
+        // One clock reading for the whole pass, so every candidate in it is
+        // judged against the same instant — as `SweepInputs` claims.
+        now: Instant::now(),
+    };
+
+    // Each arm RETURNS the set of dwell keys it examined, and `sweep` unions
+    // them. This is a type-enforced contract on purpose: the earlier shape
+    // passed a `&mut BTreeSet` for arms to fill, and an arm that forgot to
+    // fill it failed SILENTLY — its clocks were wiped on every tick, so its
+    // instances could never reach the dwell, with no error, no metric and no
+    // log to say so. Returning the set makes forgetting impossible.
+    //
+    // The `?` here is PROVISIONAL and must not survive the CNPG arm. It
+    // couples the arms: any non-404 Dragonfly error aborts the pass before a
+    // second arm runs. The realistic trigger is not a transient but a 403
+    // from missing `dragonflydb.io` RBAC — which recurs every tick, so CNPG
+    // would never be reaped at all, permanently, while the metric reported
+    // only `unknown/error` with nothing to say a different backend was the
+    // collateral damage. Invariant 3 requires that an error not be read as
+    // emptiness FOR THE RESOURCE THAT ERRORED; it does not require one
+    // backend's failure to veto another. Task 6 must run both arms and
+    // combine their results (union the `seen` sets, propagate a failure only
+    // after both have run).
+    let seen: BTreeSet<String> = sweep_dragonfly(ctx, &inputs, dwell, empty_since).await?;
+
+    // An arm that bailed early (CRD not served, or its own LIST truncated)
+    // reports an empty set, so this drops its clocks. That is correct for
+    // "CRD not served" (there are no instances to time) and costs one extra
+    // dwell for a truncated list — the same cost, in the same safe direction,
+    // that this loop already accepts on an operator restart. Deliberate, not
+    // an oversight; see the note on the top-level truncation check above.
+    empty_since.retain(|key, _| seen.contains(key));
+    Ok(())
+}
+
+/// The Dragonfly arm: reap tenantless pool instances (ADR 0042 §9.2 — the
+/// Dragonfly teardown is just the delete; the volume asymmetry to engineer
+/// around is CNPG's alone).
+async fn sweep_dragonfly(
+    ctx: &Arc<Context>,
+    inputs: &SweepInputs,
+    dwell: Duration,
+    empty_since: &mut HashMap<String, Instant>,
+) -> Result<BTreeSet<String>, ReconcileError> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    // Resolved from the providers this pass ALREADY listed and truncation-
+    // checked — not a second `redis_namespace(ctx)` call, which would read a
+    // different apiserver snapshot, unchecked, on a path that deletes.
+    let df_ns = redis_namespace_from(&inputs.providers);
+    let api: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), &df_ns, &dragonfly_cluster_ar());
+
+    // GATE 1 of 2 — only instances THIS operator stamped are candidates
+    // (`dragonfly_object` sets the label; `admin_secret_object` uses the same
+    // one). Name-parsing below is gate 2. Two independent gates is the whole
+    // point: `platform-redis-<class>-<index>` is not a reserved namespace of
+    // names, so on the name alone a user's own `Dragonfly` in this namespace
+    // would be a candidate. An instance created before the stamp existed is
+    // simply not a candidate until the provisioner's next SSA apply stamps
+    // it — the safe direction, and it self-heals on the next reconcile.
+    let selector = ListParams::default().labels("apprafter.io/managed-by=apprafter");
+    let dragonflies = match api.list(&selector).await {
+        Ok(list) => list,
+        // The dragonflydb.io CRD is cluster-OPTIONAL — absent on kind/e2e
+        // without the component. Nothing to reap is not a failure, and it
+        // must not be logged as one on every tick. Any OTHER error aborts
+        // the pass (invariant 3: an error is never emptiness).
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            debug!(namespace = %df_ns, "dragonflydb.io CRD not served — nothing to reap");
+            return Ok(seen);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    // Invariant 2 again — a truncated instance list would hide instances,
+    // which is harmless, but it is also the signal that this apiserver is
+    // paginating our reads, so the veto sets above cannot be trusted either.
+    if list_truncated(&dragonflies.metadata) {
+        warn!(
+            list = "dragonflies",
+            "LIST truncated — skipping this reap pass"
+        );
+        return Ok(seen);
+    }
+
+    let now = inputs.now;
+
+    for obj in &dragonflies.items {
+        let name = obj.name_any();
+        // GATE 2 of 2 — a name that does not parse is NOT ours even if it
+        // carries our label. Skip it silently and never touch it.
+        let Some(class) = class_of_instance(&name) else {
+            continue;
+        };
+        // Already being deleted — leave it alone. Without this an instance
+        // stuck in graceful deletion cycles forever: Reap → the delete is a
+        // no-op → clock cleared → Dwell → the dwell elapses → Reap again,
+        // logging "reaped" and incrementing the `reaped` counter once per
+        // dwell, indefinitely. That corrupts the one number anyone will use
+        // to ask whether the reaper did something it should not have.
+        if obj.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+        let target = Target::Dragonfly {
+            name: name.clone(),
+            class,
+        };
+        let key = dwell_key(&target);
+        seen.insert(key.clone());
+
+        let empty_for = empty_since.get(&key).map(|t| now.duration_since(*t));
+        match reap_decision(
+            &target,
+            &inputs.live,
+            &inputs.retained,
+            &inputs.idx,
+            empty_for,
+            dwell,
+        ) {
+            Decision::Veto(reason) => {
+                // Something points at it again — drop any clock so a later
+                // emptying starts a FULL dwell rather than resuming a stale
+                // one.
+                empty_since.remove(&key);
+                // `debug!`, NOT `info!`: this fires every tick for every
+                // instance that has a tenant, i.e. constantly on any healthy
+                // cluster running an app.
+                debug!(
+                    instance = %name, ?class, ?reason,
+                    "shared-backend instance still referenced — not reaping"
+                );
+                ctx.metrics
+                    .shared_backend_reap_total
+                    .with_label_values(&[backend_label(&target), veto_label(reason)])
+                    .inc();
+            }
+            Decision::Dwell => {
+                // `info!` ONCE, on the tick the dwell starts — not on every
+                // tick it continues, which would be a line per instance per
+                // minute for the whole dwell.
+                if let Entry::Vacant(slot) = empty_since.entry(key.clone()) {
+                    slot.insert(now);
+                    info!(
+                        instance = %name, ?class, dwell_secs = dwell.as_secs(),
+                        "shared-backend instance has no tenants — starting dwell"
+                    );
+                }
+                ctx.metrics
+                    .shared_backend_reap_total
+                    .with_label_values(&[backend_label(&target), "dwelling"])
+                    .inc();
+            }
+            Decision::Reap => {
+                // Delete under a uid precondition, so a name-reuse race —
+                // the instance we judged was deleted and re-created by a
+                // fresh provision between our LIST and this call — fails
+                // with 409 instead of killing the new instance.
+                let params = DeleteParams {
+                    preconditions: Some(Preconditions {
+                        uid: obj.metadata.uid.clone(),
+                        resource_version: None,
+                    }),
+                    ..Default::default()
+                };
+
+                // Deletes the Dragonfly CR ONLY.
+                //
+                // NEVER the snapshot PVC. Measured on dragonfly-operator
+                // v1.5.0: it is unowned with `persistentVolumeClaimRetentionPolicy`
+                // Retain, survives the delete, and the next provision adopts it
+                // by name with its data intact (ADR 0042 §9.2/§9.5). Preservation
+                // is UNCONDITIONAL — a truncated LIST lies identically about live
+                // and retained claims, so the reaper cannot tell a correct reap
+                // from an incorrect one, and a conditional safety net is none.
+                //
+                // NEVER `<instance>-admin`. It is unowned by design and will not
+                // cascade; deleting it would make the read-or-create in
+                // `provision_dragonfly` mint a FRESH admin password on the next
+                // provision while the old pod may still be Terminating behind the
+                // Service — an admin auth failure with no upside.
+                //
+                // The restriction is enforced ONLY here. RBAC grants
+                // `persistentvolumeclaims: delete` and `secrets: delete` for
+                // other arms of this crate and will not stop the mistake.
+                match api.delete(&name, &params).await {
+                    Ok(_) => {
+                        empty_since.remove(&key);
+                        // Structurally 0 — `reap_decision` returns `Reap` only
+                        // after both vetoes failed to fire. Asserting rather
+                        // than logging them: they can only ever catch a
+                        // plumbing regression (an arm passing veto sets that
+                        // are not the ones the decision was made from), which
+                        // an assert expresses precisely and which costs
+                        // nothing in a release build.
+                        debug_assert_eq!(
+                            inputs
+                                .live
+                                .iter()
+                                .filter(|c| is_allocated_on(c, &target, &inputs.idx))
+                                .count(),
+                            0,
+                            "reaped {name} while a live claim was allocated on it"
+                        );
+                        debug_assert_eq!(
+                            inputs
+                                .live
+                                .iter()
+                                .filter(|c| is_intent_for(c, &target, &inputs.idx))
+                                .count(),
+                            0,
+                            "reaped {name} while a claim carried intent toward it"
+                        );
+                        // NOT structurally 0, and that is why it is logged:
+                        // on an ephemeral instance a snapshot may name it and
+                        // deliberately not veto (the §9.7 exception). This
+                        // makes that exception visible at the moment it is
+                        // exercised rather than leaving it implied.
+                        let retained_naming = inputs
+                            .retained
+                            .iter()
+                            .filter(|r| r.spec.instance.as_deref() == Some(name.as_str()))
+                            .count();
+                        info!(
+                            instance = %name,
+                            ?class,
+                            uid = obj.metadata.uid.as_deref().unwrap_or("<none>"),
+                            dwell_secs = dwell.as_secs(),
+                            empty_secs = empty_for.map(|d| d.as_secs()).unwrap_or_default(),
+                            retained = retained_naming,
+                            "reaped tenantless shared-backend instance"
+                        );
+                        ctx.metrics
+                            .shared_backend_reap_total
+                            .with_label_values(&[backend_label(&target), "reaped"])
+                            .inc();
+                    }
+                    // 409 = the uid precondition failed (name reused under a
+                    // new instance); 404 = it went away under us. Both mean
+                    // the thing we judged is not the thing that is there now,
+                    // so the reap is abandoned and the clock reset — the next
+                    // pass re-judges whatever is there on its own merits.
+                    Err(kube::Error::Api(e)) if e.code == 409 || e.code == 404 => {
+                        empty_since.remove(&key);
+                        warn!(
+                            instance = %name, ?class, code = e.code,
+                            "reap abandoned — instance changed identity under us; re-judged next tick"
+                        );
+                        ctx.metrics
+                            .shared_backend_reap_total
+                            .with_label_values(&[backend_label(&target), "veto_uid_conflict"])
+                            .inc();
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+    }
+    Ok(seen)
 }
 
 #[cfg(test)]
@@ -843,6 +1300,76 @@ mod tests {
             idx.cnpg_cluster.get("pg-integrated").map(String::as_str),
             Some(CLUSTER)
         );
+    }
+
+    // --- 19/20/21/22: the sweep's pure helpers ---
+
+    #[test]
+    fn backend_label_distinguishes_every_target_kind() {
+        // These strings are the `backend` dimension of
+        // `apprafter_shared_backend_reap_total` and are declared in
+        // `operator_core::metrics`. A rename here silently splits a metric
+        // series in two, so the mapping is pinned exactly.
+        assert_eq!(
+            backend_label(&dragonfly_target(EPHEMERAL_000, PoolClass::Ephemeral)),
+            "dragonfly-ephemeral"
+        );
+        assert_eq!(
+            backend_label(&dragonfly_target(PERSISTENT_000, PoolClass::Persistent)),
+            "dragonfly-persistent"
+        );
+        assert_eq!(backend_label(&cnpg_target(CLUSTER)), "cnpg");
+    }
+
+    #[test]
+    fn veto_label_maps_every_reason() {
+        assert_eq!(veto_label(VetoReason::Live), "veto_live");
+        assert_eq!(veto_label(VetoReason::Intent), "veto_intent");
+        assert_eq!(veto_label(VetoReason::Retained), "veto_retained");
+    }
+
+    #[test]
+    fn dwell_key_is_backend_qualified_so_backends_cannot_share_a_clock() {
+        // The dwell map is shared by every backend arm. A CNPG cluster whose
+        // name collided with a Dragonfly pool instance's must NOT share its
+        // clock — two instances on one timer means whichever empties first
+        // can reap the other early.
+        let collide = "platform-redis-ephemeral-000";
+        let df = dwell_key(&dragonfly_target(collide, PoolClass::Ephemeral));
+        let pg = dwell_key(&cnpg_target(collide));
+        assert_ne!(df, pg);
+        assert_eq!(df, "dragonfly-ephemeral/platform-redis-ephemeral-000");
+        assert_eq!(pg, "cnpg/platform-redis-ephemeral-000");
+        // The same class + name is stable across calls — the key is what the
+        // clock is stored under, so an unstable key would never accumulate a
+        // dwell at all.
+        assert_eq!(
+            df,
+            dwell_key(&dragonfly_target(collide, PoolClass::Ephemeral))
+        );
+        // The two dragonfly classes are also distinct keys.
+        assert_ne!(
+            dwell_key(&dragonfly_target(collide, PoolClass::Ephemeral)),
+            dwell_key(&dragonfly_target(collide, PoolClass::Persistent))
+        );
+    }
+
+    #[test]
+    fn list_truncated_detects_only_a_non_empty_continue_token() {
+        // A complete LIST carries no continue token; the apiserver also
+        // returns an EMPTY string rather than null in some encodings, and
+        // that is complete too. Treating "" as truncated would abort every
+        // pass; treating a real token as complete would reason from a
+        // partial veto set — the failure this guard exists for.
+        assert!(!list_truncated(&ListMeta::default()));
+        assert!(!list_truncated(&ListMeta {
+            continue_: Some(String::new()),
+            ..Default::default()
+        }));
+        assert!(list_truncated(&ListMeta {
+            continue_: Some("eyJ2IjoibWV0YS5rOHMuaW8vdjEi".into()),
+            ..Default::default()
+        }));
     }
 
     #[test]

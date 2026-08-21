@@ -334,14 +334,27 @@ pub(crate) async fn redis_namespace(ctx: &Arc<Context>) -> Result<String, Reconc
             .list(&Default::default())
             .await?
             .items;
-    let ns = providers
+    Ok(redis_namespace_from(&providers))
+}
+
+/// The resolution itself, over a provider list the caller already holds.
+///
+/// Split out of [`redis_namespace`] so a caller that has ALREADY listed
+/// providers does not list them a second time. The reaper (ADR 0042 §9) is
+/// exactly that caller, and for it the second list was not merely wasteful:
+/// it came from a DIFFERENT apiserver snapshot and was not truncation-
+/// checked, on a path that deletes. `redis_namespace` now delegates here, so
+/// the async and pure forms cannot drift apart.
+///
+/// Pure, so unlike the async wrapper it is table-testable.
+pub(crate) fn redis_namespace_from(providers: &[operator_core::ServiceProvider]) -> String {
+    providers
         .iter()
         .find(|p| p.spec.backend == "dragonfly")
         .and_then(|p| p.spec.config.as_ref())
         .and_then(|cfg| cfg.pointer("/namespace").and_then(Value::as_str))
         .unwrap_or("dragonfly-system")
-        .to_string();
-    Ok(ns)
+        .to_string()
 }
 
 /// Read a single `data.<key>` value from a Secret, base64-decoded to a
@@ -607,6 +620,63 @@ mod tests {
         assert_eq!(password_from_redis_url("redis://user@host:6379/0"), None);
         // Empty password component.
         assert_eq!(password_from_redis_url("redis://user:@host:6379/0"), None);
+    }
+
+    // --- redis_namespace_from() ---
+
+    fn dragonfly_provider(config: Option<serde_json::Value>) -> operator_core::ServiceProvider {
+        operator_core::ServiceProvider::new(
+            "redis-integrated",
+            operator_core::ServiceProviderSpec {
+                type_: "redis".into(),
+                backend: "dragonfly".into(),
+                config,
+            },
+        )
+    }
+
+    #[test]
+    fn redis_namespace_from_reads_the_config_override() {
+        let providers = vec![dragonfly_provider(Some(
+            serde_json::json!({ "namespace": "tenant-dragonfly" }),
+        ))];
+        assert_eq!(redis_namespace_from(&providers), "tenant-dragonfly");
+    }
+
+    #[test]
+    fn redis_namespace_from_falls_back_to_the_well_known_default() {
+        // No providers at all, a dragonfly provider with no config, and one
+        // whose config omits `/namespace` all resolve to the default.
+        assert_eq!(redis_namespace_from(&[]), "dragonfly-system");
+        assert_eq!(
+            redis_namespace_from(&[dragonfly_provider(None)]),
+            "dragonfly-system"
+        );
+        assert_eq!(
+            redis_namespace_from(&[dragonfly_provider(Some(
+                serde_json::json!({ "other": "field" })
+            ))]),
+            "dragonfly-system"
+        );
+    }
+
+    #[test]
+    fn redis_namespace_from_ignores_non_dragonfly_backends() {
+        // A cnpg provider listed FIRST must not shadow the dragonfly one —
+        // the match is on `spec.backend`, not on list position.
+        let pg = operator_core::ServiceProvider::new(
+            "pg-integrated",
+            operator_core::ServiceProviderSpec {
+                type_: "pg".into(),
+                backend: "cloudnative-pg".into(),
+                config: Some(serde_json::json!({ "namespace": "cnpg-system" })),
+            },
+        );
+        let providers = vec![
+            pg,
+            dragonfly_provider(Some(serde_json::json!({ "namespace": "df-ns" }))),
+        ];
+        assert_eq!(redis_namespace_from(&providers), "df-ns");
     }
 
     #[test]
