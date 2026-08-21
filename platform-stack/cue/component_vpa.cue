@@ -93,6 +93,47 @@ _components: "vpa": #Component & {
 				"--memory-aggregation-interval-count=14",
 				"--memory-histogram-decay-half-life=168h",
 				"--memory-saver=true",
+				//
+				// 2026-08-21 incident: upstream's own minimum-recommendation
+				// floors are `--pod-recommendation-min-memory-mb=250` and
+				// `--pod-recommendation-min-cpu-millicores=25` (VPA 1.7.1
+				// pkg/recommender/config/config.go). Re-read both defaults on
+				// every chart bump: the pin below fixes the BEHAVIOUR, but the
+				// numbers quoted here go stale silently. Despite the `-mb`
+				// spelling the flag is MiB — upstream multiplies by 1024², so
+				// 250 renders as `250Mi`.
+				//
+				// Unset, they made EVERY VPA on a live T1 cluster report an
+				// identical 250Mi/25m target across workloads whose real
+				// working sets ranged 6Mi-82Mi. `minAllowed: 32Mi` could not
+				// bind under any input — structurally dead code, shadowed by
+				// an invisible floor 7.8x higher. (`maxAllowed: 512Mi` is a
+				// different case: it still binds whenever a recommendation
+				// exceeds it, and simply never did here because every
+				// recommendation sat at the floor. The documented
+				// `[32Mi, 512Mi]` correction range is real — see
+				// docs/dev-guide/resources-and-autoscaling.md.)
+				//
+				// Pinning the memory floor to the 2.16d seed (32Mi) removes
+				// the shadow. NOTE THE COUPLING THIS CREATES: the floor is now
+				// hard-pinned in chart source, so `minAllowed` is authoritative
+				// only UPWARD. Raise it above 32Mi and it binds; lower it below
+				// and this pin silently overrides it — the same failure mode
+				// this change fixes, relocated from 250Mi to 32Mi. The two must
+				// move together (compiled-in default: `default_autoscale_config`
+				// in operator-controllers/application/src/lib.rs; per-cluster
+				// override: PlatformStack.spec.resources.autoscale.minAllowed).
+				//
+				// The CPU floor is pinned at the value it already defaults to.
+				// That is deliberate: it buys immunity from a silent upstream
+				// default change on the next chart bump — the failure mode that
+				// produced BOTH this bug and the feature-gate bug amended into
+				// ADR 0054 on the same day. That coincidence, upstream's CPU
+				// default of 25m being exactly the seed's 25m, is also why
+				// nobody caught the memory column: one axis read correct, so
+				// the other was assumed correct by association.
+				"--pod-recommendation-min-memory-mb=32",
+				"--pod-recommendation-min-cpu-millicores=25",
 			]
 			resources: {
 				// measured idle ~12Mi (2.16e T13 walk); sized above that for the
