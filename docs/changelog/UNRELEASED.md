@@ -9,6 +9,70 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## platform-stack 0.2.55 — vertical autoscaling starts working (2026-08-21)
+
+> **Chart-only release; no CLI, operator or cue-cmp change.** One string in
+> two `extraArgs` lists. No CRD move, no API change, no manual step.
+
+### Fixed
+
+- **The VPA updater and admission controller have never started, on any
+  cluster, since the component shipped in 2.16e.** They were passed
+  `--feature-gates=InPlaceOrRecreate=true`; upstream renamed that gate to
+  `InPlace`, and VPA 1.7.1 rejects an unknown gate by refusing to start
+  rather than warning. Both Deployments were in `CrashLoopBackOff` — 2785 and
+  2786 restarts over nine days on the cluster where this was found. The
+  recommender was unaffected, so recommendations were computed and mirrored
+  onto application status the whole time and **nothing ever applied them**.
+  Vertical autoscaling has therefore not run at any point in its life.
+
+  The correct name was read off the binary rather than guessed — it prints
+  its own gate list when given a bad one (`AllAlpha`, `AllBeta`,
+  `CPUStartupBoost`, `InPlace`, `PerVPAConfig`) — and the CRD independently
+  confirms the mode: `["Off","Initial","Recreate","InPlaceOrRecreate",
+  "InPlace","Auto"]`.
+
+  **The design was right and is unchanged.** ADR 0054 chose `updateMode:
+  InPlace` over `InPlaceOrRecreate` on purpose, because the latter falls back
+  to *evicting* a pod on an infeasible resize — an outage for a single-replica
+  app. The gate simply grew the same name as the mode it enables.
+
+### What changes when a cluster upgrades
+
+The updater starts applying recommendations to live pods through the resize
+subresource. **No evictions and no restarts**: a pod whose node cannot satisfy
+the new request is deferred and retried. Applications carrying an explicit
+`spec.resources` block are untouched — the operator renders no VPA for them.
+
+This is not classified breaking: nothing is rejected and nothing must be done
+by hand. It is worth reading anyway, because it is the first time the feature
+does anything, so requests on managed workloads will move for the first time.
+
+### Why it stayed invisible, which is the part worth keeping
+
+Three properties combined, each defensible alone:
+
+- `failurePolicy: Ignore` on the mutating webhook is correct — it stops a down
+  admission pod deadlocking cluster-wide pod creation — and it also means a
+  dead webhook admits pods unchanged instead of failing.
+- The CRDs install from the chart independently of the controllers, so every
+  "is the autoscaler installed?" probe that checks for the CRD passed
+  throughout. The guide written for the feature used exactly that check.
+- Nothing asserted that a recommendation had ever been *applied*. The status
+  mirror populates from the recommender, so `apprafter app status` showed a
+  recommendation beside a pod whose requests had never moved.
+
+**The tell is `kubectl -n vpa get pods`, not the CRD.** It is now in the
+component's comment, in the compatibility note and on the guide.
+
+ADR 0054's own Risks section predicted this — "semantics moved between VPA
+minors … re-read the gate name on every chart bump, and validate the CR is
+accepted in the real-Hetzner walk" — and neither mitigation was performed. The
+ADR carries an amendment saying so. It was found by the documentation track's
+closing walk, by reading a live cluster while checking a page's claims; no
+documentation gate could have caught it, because every identifier resolved and
+every command existed.
+
 ## cli v0.2.47 — 2.19i the missing guides: five, not fifteen (2026-08-20)
 
 > **CLI patch release; no chart, operator or cue-cmp release.** The guides
