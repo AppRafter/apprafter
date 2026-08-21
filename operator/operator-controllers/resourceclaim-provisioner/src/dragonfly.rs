@@ -207,6 +207,11 @@ pub fn channel_prefix(user: &str) -> String {
 /// snapshot→PVC block (whole-instance durability; ADR 0042 §6). The
 /// provisioner creates a per-instance admin-password Secret separately
 /// and references it via `authentication.passwordFromSecret`.
+///
+/// The CR carries the `apprafter.io/managed-by` ownership stamp — the same
+/// label [`admin_secret_object`] puts on the admin Secret. This is
+/// LOAD-BEARING for the reaper (ADR 0042 §9), not inventory decoration; see
+/// the comment on the label itself.
 pub fn dragonfly_object(
     name: &str,
     ns: &str,
@@ -268,7 +273,23 @@ pub fn dragonfly_object(
     json!({
         "apiVersion": "dragonflydb.io/v1alpha1",
         "kind": "Dragonfly",
-        "metadata": { "name": name, "namespace": ns },
+        "metadata": {
+            "name": name,
+            "namespace": ns,
+            // Ownership stamp, spelled exactly as `admin_secret_object`
+            // spells it. LOAD-BEARING: the reaper (ADR 0042 §9) LISTs its
+            // candidates under this selector, so an instance this operator
+            // did not create can never become one — whatever it is called.
+            //
+            // Without it, parsing the NAME is the only gate on a delete, and
+            // `platform-redis-<class>-<index>` is not a reserved namespace of
+            // names: a user's own `Dragonfly` called
+            // `platform-redis-ephemeral-007` in this namespace would be
+            // reaped, and logged as a tenantless pool instance while it went.
+            "labels": {
+                "apprafter.io/managed-by": "apprafter",
+            },
+        },
         "spec": spec,
     })
 }
@@ -515,6 +536,47 @@ mod tests {
             &BackendResources::dragonfly_t1(),
         );
         assert!(eph["spec"].get("snapshot").is_none());
+    }
+
+    #[test]
+    fn dragonfly_cr_is_stamped_with_the_ownership_label() {
+        // SAFETY, not inventory: the reaper (ADR 0042 §9) selects its delete
+        // candidates on this label, so an unstamped CR is one whose only
+        // protection from deletion is that its name failed to parse. The
+        // stamp must match `admin_secret_object`'s byte for byte — a
+        // divergence here silently empties the reaper's candidate set (it
+        // would then reap nothing, which fails safe but never shrinks the
+        // pool) or, if the selector were relaxed to match, widens it.
+        for persistent in [false, true] {
+            let cr = dragonfly_object(
+                &pool_instance_name(persistent, 0),
+                "dragonfly-system",
+                1024,
+                1,
+                1,
+                persistent,
+                &BackendResources::dragonfly_t1(),
+            );
+            assert_eq!(
+                cr["metadata"]["labels"]["apprafter.io/managed-by"], "apprafter",
+                "pool instance CR must carry the ownership stamp"
+            );
+        }
+        // Same key and value as the admin Secret's stamp.
+        let secret = admin_secret_object("x-admin", "dragonfly-system", "pw");
+        let cr = dragonfly_object(
+            "platform-redis-ephemeral-000",
+            "dragonfly-system",
+            1024,
+            1,
+            1,
+            false,
+            &BackendResources::dragonfly_t1(),
+        );
+        assert_eq!(
+            cr["metadata"]["labels"]["apprafter.io/managed-by"],
+            secret["metadata"]["labels"]["apprafter.io/managed-by"]
+        );
     }
 
     #[test]
