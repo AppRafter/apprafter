@@ -1760,6 +1760,45 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.57": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.43"
+	notes: """
+		Shared-backend reaper (ADR 0042 §9): a lazily-created shared backend is now
+		DELETED once nothing references it. Until now nothing anywhere deleted one,
+		so an instance serving zero tenants held its Guaranteed reservation forever
+		— 320Mi per Dragonfly pool instance, 256Mi per shared CNPG cluster, a
+		material part of the T1 node saturation this series has been chasing. The
+		redis e2e walk measured node allocated memory requests falling 570Mi
+		(2496 -> 1926).
+
+		VOLUMES ARE PRESERVED, UNCONDITIONALLY. Before deleting the shared CNPG
+		`Cluster` the operator strips that Cluster's `controller` ownerReference off
+		the instance PVC — an unstripped delete cascades and destroys the database —
+		so the PVC stays `Bound` and the next provision re-adopts the SAME PV by
+		name with its data intact (the pg walk asserts the marker row still reads
+		`42`). EXPECT `kubectl get pvc` TO SHOW VOLUMES WITH NO OWNING CLUSTER: that
+		is the design, not a leak.
+
+		RECLAIM LATENCY IS ASYMMETRIC. A `RetainedClaim` snapshot vetoes the reap,
+		so a persistent Dragonfly instance and the CNPG cluster come back only after
+		every claim's 7-day grace has elapsed; ephemeral Dragonfly is exempt from
+		that veto and reclaims ~one dwell after its last app is deleted. The dwell
+		is 10 minutes, overridable with `APPRAFTER_REAP_DWELL_SECS` on the operator
+		Deployment (e2e only — production runs unset). Every delete needs two
+		independent gates: the instance must be named by platform config AND carry
+		the `apprafter.io/managed-by: apprafter` stamp the provisioner now sets, so
+		a user's own `Cluster`/`Dragonfly` in those namespaces is never a candidate.
+
+		change=requires-restart, not safe: this is the release where the operator
+		begins deleting stateful backends on its own. Safe by construction and green
+		on both e2e walks, but a property an operator should acknowledge rather than
+		have auto-synced onto a live cluster. Operator + admission-webhook images
+		roll v0.2.42 -> v0.2.43.
+		"""
+	references: ["docs/adr/0042-needs-redis-dragonfly.md"]
+}
+
 compatibility: "0.2.56": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.42"
