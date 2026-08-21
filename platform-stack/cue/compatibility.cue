@@ -1760,9 +1760,63 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.56": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.42"
+	notes: """
+		Node-saturation fix; the full story is ADR 0054. LOAD-BEARING ITEM: the VPA
+		recommender's upstream minimum-recommendation floors (default 250 for
+		`--pod-recommendation-min-memory-mb`, 25 for
+		`--pod-recommendation-min-cpu-millicores`) were never pinned in this repo,
+		and upstream clamps into `[minAllowed, maxAllowed]` AFTER applying them — so
+		all five VPAs on a live T1 node reported an IDENTICAL 250Mi/25m target across
+		workloads whose real working sets ranged 6Mi-82Mi, and `minAllowed: 32Mi` was
+		structurally dead code (32 < 250 < 512). The memory floor is now pinned to
+		the 2.16d seed (32Mi); the CPU floor is pinned at its own current default,
+		for immunity from a silent upstream change on the next chart bump.
+
+		Alongside it, 256Mi + 100m of platform requests are reclaimed on a
+		single-replica (solo) tier against measured live footprints (the operator
+		sized for reconcile-storm headroom rather than to formula; the webhook's
+		live figure is below the reporting cutoff): recommender `replicas` 2->1
+		(64Mi + 50m — upstream defaults all three components to 2, the other two
+		were already pinned), sealed-secrets 64Mi->32Mi, dragonfly kube-rbac-proxy
+		64Mi->16Mi, apprafter-operator 128Mi->64Mi, admission-webhook 64Mi->16Mi;
+		the remaining 50m is a cilium `cni.resources` pin, so the
+		`install-cni-binaries` init container stops shadowing the agent's measured
+		50m. The three VPA PodDisruptionBudgets are disabled — upstream's
+		`minAvailable: 1` against our pinned `replicas: 1` is arithmetically
+		unsatisfiable and blocks `kubectl drain`. `limits.cpu` is dropped from the
+		operator (500m), the webhook (200m) and the dragonfly kube-rbac-proxy
+		(500m) per ADR 0053 §1: platform components get a CPU request and no CPU
+		limit. The admission-webhook chart pin, four versions behind the shipped
+		chart tree at v0.2.38 through a repeated oversight, is corrected to v0.2.42
+		(the intervening versions were functionally identical republishes, so this
+		carries no unreviewed behaviour change).
+
+		UPGRADE HAZARD on an already-saturated node: the VPA chart's cert-generation
+		Job is a Helm pre-upgrade hook (PreSync for Argo CD) requesting 16Mi, and a
+		hook that cannot schedule means the sync phase never runs — so the cluster
+		that most needs this fix is the one that can fail to install it. If the vpa
+		Application hangs with a Pending `...admission-certgen-...` pod, free a
+		little allocatable first (`apprafter platform autoscale set off`, then
+		reclaim any orphaned backend) and the sync proceeds.
+
+		change=requires-restart, CORRECTING the `safe` 0.2.55 shipped: ADR 0054
+		already held that a cluster-wide mutating admission webhook on pod CREATE
+		plus an updater that mutates live pods is not a safe auto-sync, and this is
+		the release where that machinery first runs with usable floors. Operator
+		image rolls v0.2.41 -> v0.2.42; the admission-webhook image rolls v0.2.38 ->
+		v0.2.42 with it, because its chart pin was stale (see above).
+		"""
+	references: ["docs/adr/0054-vpa-vertical-autoscaling.md", "docs/adr/0053-resource-governance.md"]
+}
+
 compatibility: "0.2.55": {
 	change:          "safe"
 	operatorVersion: "v0.2.41"
+	yanked:          true
+	yankedReason:    "The one-string `InPlace` feature-gate fix is itself correct, but it ACTIVATED vertical autoscaling for the first time on every cluster carrying it — with the shipped default `autoscale: full` and upstream's unpinned 250Mi minimum-recommendation floor, which `minAllowed: 32Mi` cannot bind under, so every managed app's request jumps to 250Mi regardless of a 6Mi working set: on a ~1959Mi-allocatable T1 node the admissible app count is zero. Fixed in 0.2.56 (floors pinned to the 32Mi seed)."
 	notes: """
 		fix/vpa: the updater and admission controller are passed
 		`--feature-gates=InPlace=true`. They were passed
