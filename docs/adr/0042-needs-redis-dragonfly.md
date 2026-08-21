@@ -239,9 +239,7 @@ enforced rather than left as prose by the pg e2e walk
 (`e2e/needs-pg-walk.sh`) **extended in this same change**, which asserts the
 PVC is still `Bound` after a reap and that the same PV is re-adopted, so a CNPG
 version that starts re-adding the ownerReference makes the reap cascade and
-**fails the walk**. Until that extension lands, the enforcement is a commitment
-this change makes rather than a property it already has. These are
-observations, not expectations.
+**fails the walk**. These are observations, not expectations.
 
 **CNPG owns the volume, so a plain delete takes it — measured, not inferred.**
 On chart 0.28.2 the shared cluster's PVC is created carrying a controller
