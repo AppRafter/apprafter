@@ -244,6 +244,18 @@ rules:
   # so `delete` is not strictly needed for the GC path — but it
   # is granted here so a future hard-cleanup or operator
   # break-glass can remove a stale CNPG CR without an RBAC edit.
+  #
+  # ADR 0042 §9 extension: that "future hard-cleanup" consumer now
+  # exists — the shared-backend reaper (`reaper.rs`, the
+  # `SharedBackendReaper` loop). It `delete`s the shared `Cluster`
+  # once nothing references it, but only after it PATCHES the
+  # instance's PersistentVolumeClaim to strip the Cluster's
+  # `controller: true` ownerReference first (ADR 0042 §9.3) — an
+  # unstripped delete cascades and destroys the volume; the strip
+  # converts the delete into a preserved, still-`Bound` PVC that the
+  # next provision re-adopts by name with its data intact. The reaper
+  # never deletes the PVC itself — see the `persistentvolumeclaims`
+  # rule below, where `patch` (not `delete`) is its verb.
   - apiGroups:
       - postgresql.cnpg.io
     resources:
@@ -267,6 +279,22 @@ rules:
   # Pending. The per-instance admin-password Secret (dragonfly-system)
   # and the per-claim connection Secret (claim namespace) are covered
   # by the cluster-wide secrets rule below.
+  #
+  # ADR 0042 §9: "the GC may delete a stale instance on hard cleanup"
+  # above was a prophecy — the shared-backend reaper (`reaper.rs`, the
+  # `SharedBackendReaper` loop) is now that consumer. It deletes ONLY
+  # the `Dragonfly` CR of a stamped, tenantless pool instance:
+  #
+  #   - it NEVER deletes the snapshot PVC (measured on
+  #     dragonfly-operator v1.5.0: unowned, `Retain` retention policy,
+  #     survives the delete and is re-adopted by name with its data
+  #     intact on the next provision — ADR 0042 §9.2/§9.5);
+  #   - it NEVER deletes `<instance>-admin`.
+  #
+  # The `persistentvolumeclaims: delete` and `secrets: delete` rules
+  # elsewhere in this file WOULD permit either of those deletes — the
+  # restriction is enforced in `reaper.rs` and code review, not by
+  # this ClusterRole.
   - apiGroups:
       - dragonflydb.io
     resources:
@@ -293,6 +321,13 @@ rules:
   # an unowned RWO PVC (the shared-volume backing PVC `sv-<ns>-<name>`)
   # and its deletion finalizer deletes it on `SharedVolume` remove. Same
   # verbs already granted here; no new rule needed — noted for clarity.
+  #
+  # ADR 0042 §9 extension: the shared-backend reaper (`reaper.rs`) is a
+  # `patch` consumer of this rule too — before it deletes the shared
+  # CNPG `Cluster` it strips that Cluster's ownerReference off the
+  # instance's PVC (§9.3) so the volume survives the cascade. It never
+  # deletes a PVC of either backend; `delete` above is not a verb the
+  # reaper uses.
   - apiGroups:
       - ""
     resources:
