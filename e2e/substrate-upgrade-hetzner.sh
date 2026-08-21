@@ -961,8 +961,30 @@ else
     assert_eq "PlatformStack spec.backup.enabled" "$enabled_cr" "true"
     wait_jsonpath cronjob "$BACKUP_NS" "$BACKUP_CRONJOB" '{.metadata.name}' "$BACKUP_CRONJOB" 420
     printf '  ok: the in-cluster backup runner (CronJob %s) is wired\n' "$BACKUP_CRONJOB"
+
+    # --- tier 1 of the credential model: what the CLUSTER gets ---------------
+    # `enable --credential-file` auto-seals the operator's dotenv into a
+    # SealedSecret in apprafter-system; the runner mounts it via envFrom. Read
+    # the name off the CR rather than assuming the default, then assert the
+    # sealed material uses the NEUTRAL S3_* keys (the CLI translates to restic's
+    # AWS_* only at the point of use — AWS_* landing in the cluster would mean
+    # the translation leaked into stored state).
+    CRED_SECRET="$(jp platformstack "$BACKUP_NS" default '{.spec.backup.credentialRef.name}')"
+    [ -n "$CRED_SECRET" ] || { printf 'FAILED: PlatformStack has no spec.backup.credentialRef.name after enable\n' >&2; exit 1; }
+    printf '  ok: cluster credential is a SealedSecret named %s in %s\n' "$CRED_SECRET" "$BACKUP_NS"
+    wait_jsonpath secret "$BACKUP_NS" "$CRED_SECRET" '{.metadata.name}' "$CRED_SECRET" 240
+    cred_keys="$(kubectl -n "$BACKUP_NS" get secret "$CRED_SECRET" -o jsonpath='{.data}' 2>/dev/null || true)"
+    printf '%s' "$cred_keys" | grep -q 'S3_ACCESS_KEY_ID' || {
+        printf 'FAILED: the cluster credential Secret %s does not carry the neutral S3_ACCESS_KEY_ID key\n' "$CRED_SECRET" >&2; exit 1; }
+    if printf '%s' "$cred_keys" | grep -q 'AWS_'; then
+        printf 'FAILED: the cluster credential Secret %s carries AWS_* keys — the restic translation leaked into stored cluster state\n' "$CRED_SECRET" >&2; exit 1
+    fi
+    printf '  ok: cluster credential holds NEUTRAL S3_* keys and no AWS_* keys\n'
+
     # Trigger NOW rather than waiting for the cron — the assertion is about the
-    # runner's OUTCOME, not about cron firing on time.
+    # runner's OUTCOME, not about cron firing on time. The runner has NO
+    # credential source other than the sealed Secret above, so a Completed Job
+    # plus a new off-site snapshot is the end-to-end proof that tier 1 works.
     MANUAL_JOB="apprafter-backup-manual-$(date +%s)"
     kubectl -n "$BACKUP_NS" create job --from="cronjob/${BACKUP_CRONJOB}" "$MANUAL_JOB"
     wait_job_complete "$MANUAL_JOB" "$BACKUP_NS" 1200
@@ -980,12 +1002,23 @@ else
             "$SNAPS_BEFORE" "$SNAPS_AFTER" "$S3_REPO" >&2
         exit 1
     fi
-    printf '  ok: a NEW snapshot landed OFF-SITE (%s -> %s snapshot[s] in %s)\n' \
+    printf '  ok: a NEW snapshot landed OFF-SITE (%s -> %s snapshot[s] in %s), written by the in-cluster runner using ONLY the sealed credential\n' \
         "$SNAPS_BEFORE" "$SNAPS_AFTER" "$S3_REPO"
     apprafter backup check --credential-file "$CRED_FILE"
     printf '  ok: apprafter backup check passed (off-site repo is structurally sound)\n'
     RESTORE_REPO="$S3_REPO"
+    # The artifact must live somewhere the cluster does NOT control. Leg B never
+    # creates a host-local repo, so prove there is no local fallback that a
+    # later restore could silently read instead of the bucket.
+    [ ! -e "$LOCAL_REPO" ] || {
+        printf 'FAILED: a host-local restic repo exists at %s in the s3 leg — a restore could read it instead of the bucket\n' "$LOCAL_REPO" >&2; exit 1; }
+    printf '  ok: no host-local restic repo exists — the only artifact is the off-site one\n'
 fi
+case "$RESTORE_REPO" in
+    s3:*) [ "$BACKEND" = "s3" ] || { printf 'FAILED: backend=%s resolved an s3 repo\n' "$BACKEND" >&2; exit 1; } ;;
+    *)    [ "$BACKEND" = "local" ] || { printf 'FAILED: backend=s3 did not resolve an s3: repo (got %q)\n' "$RESTORE_REPO" >&2; exit 1; } ;;
+esac
+printf '  ok: restore source resolved for backend=%s: %s\n' "$BACKEND" "$RESTORE_REPO"
 
 # The comparison in phase 7 is only meaningful if the source DB did not move
 # underneath the backup. Re-fingerprint the SOURCE now: if this trips, the
@@ -1014,6 +1047,35 @@ else
 fi
 printf '  ok: target %s is still registered — this is an UPGRADE of the same target, not a new one\n' "$TARGET"
 
+if [ "$BACKEND" = "s3" ]; then
+    # --- tier 2 of the credential model: what the OPERATOR keeps -------------
+    # The cluster is GONE. Anything that still works against the bucket from
+    # here can only be using the operator's local dotenv — there is no cluster
+    # left to read a credential from. That is the sharpest available proof that
+    # the two tiers are genuinely separate, so make it explicit before the
+    # restore relies on it.
+    postmortem_snaps="$(s3_snapshot_count)"
+    [ "${postmortem_snaps:-0}" -ge 1 ] || {
+        printf 'FAILED: cannot list the off-site repo with the operator dotenv after the cluster died (got %s snapshot[s])\n' "${postmortem_snaps:-0}" >&2; exit 1; }
+    printf '  ok: the off-site repo is still readable with the OPERATOR credentials alone (%s snapshot[s]) — the cluster is gone, so these creds came from the local dotenv, never from the cluster\n' \
+        "$postmortem_snaps"
+
+    # OBSERVATION, not a gate. `backup check` is documented as an operator-side
+    # verb to "Run OUTSIDE the cluster with the operator's full S3 credentials",
+    # and with an explicit --repo + --credential-file it needs neither the
+    # cluster nor the CR. Record what it ACTUALLY does with the cluster gone —
+    # this is the moment an operator most wants to verify a backup. Printed as a
+    # finding either way; it never passes or fails the walk.
+    probe_log="${TMPDIR_WORK}/check-no-cluster.log"
+    if apprafter backup check --repo "$S3_REPO" --credential-file "$CRED_FILE" >"$probe_log" 2>&1; then
+        printf '  observation: "backup check --repo --credential-file" WORKS with the cluster destroyed (cluster-independent, as documented)\n'
+    else
+        printf '  observation/FINDING: "backup check --repo --credential-file" FAILS with the cluster destroyed, though it needs neither the cluster nor the CR:\n'
+        sed 's/^/      | /' "$probe_log"
+        printf '      (reported as a finding — NOT treated as a walk failure; the restore path below is unaffected)\n'
+    fi
+fi
+
 # ===============================================================
 # Phase 6: restore --reprovision onto the BIG SKU
 # ===============================================================
@@ -1037,6 +1099,9 @@ grep -qE 'provisioning a fresh cluster' "$restore_log" || {
 grep -qE 'Restored backup' "$restore_log" || {
     printf 'FAILED: restore did not report completion\n' >&2; sed 's/^/    | /' "$restore_log" >&2; exit 1; }
 printf '  ok: restore --reprovision provisioned a fresh cluster and replayed the backup\n'
+if [ "$BACKEND" = "s3" ]; then
+    printf '  ok: the replay source was the OFF-SITE repo %s, read with the operator dotenv while no cluster existed\n' "$RESTORE_REPO"
+fi
 sed 's/^/    | /' "$restore_log"
 
 # ===============================================================
