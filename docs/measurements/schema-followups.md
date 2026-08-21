@@ -136,10 +136,12 @@ so option 2 should say *moved*, not merely *deprecated*.
 Both were found by reading, not by any gate, and both are deliberately
 not acted on here.
 
-### The VPA controllers have never run — FIXED in platform-stack 0.2.55
+### The VPA controllers have never run — FIXED in platform-stack 0.2.56
 
-**Resolved 2026-08-21 at the owner's instruction.** Kept here because the
-diagnosis is worth more than the fix.
+**Resolved 2026-08-21 at the owner's instruction — but in `0.2.56`, not the
+`0.2.55` that first carried the fix. `0.2.55` is yanked; see the decision at
+the end of this section.** Kept here because the diagnosis is worth more than
+the fix.
 
 The gate was renamed upstream: `InPlaceOrRecreate` → `InPlace`, which now
 matches the `updateMode` the operator already rendered. VPA 1.7.1 rejects an
@@ -165,17 +167,35 @@ The design was right and is unchanged. ADR 0054 chose `InPlace` over
 the pod on an infeasible resize — an outage for a single-replica app. So the
 fix restores non-evicting in-place resize, not eviction.
 
-**What it changes on upgrade:** the updater begins applying recommendations to
-live pods via the resize subresource. No restarts; a pod whose node cannot fit
-the new request is deferred and retried. Apps with an explicit
-`spec.resources` block are untouched — the operator renders no VPA for them.
+**What it changes on upgrade to `0.2.56`:** the updater begins applying
+recommendations to live pods via the resize subresource. No restarts; a pod
+whose node cannot fit the new request is deferred and retried. Apps with an
+explicit `spec.resources` block are untouched — the operator renders no VPA
+for them.
 
-**Still open: whether to yank the affected versions.** Every platform-stack
-release carrying the component is equally broken, so a yank sweep would have to
-cover all of them. A cluster following the channel moves to 0.2.55 on its own
-and needs nothing; a cluster **pinned** to an older version stays broken
-silently, and a yank is what would surface that as `YankedVersion=True`. That
-is the only case a sweep buys, and it is the owner's call.
+**Decided, in part: `0.2.55` is yanked. Do not send a cluster to it.**
+Starting the controllers turned out to be half the repair. With them finally
+up, a second unread upstream default surfaced — the recommender's own
+`--pod-recommendation-min-memory-mb`, which defaults to **250** and which the
+chart never pinned. Upstream applies that floor *before* clamping into
+`[minAllowed, maxAllowed]`, so on `0.2.55` every managed application
+recommends an identical 250Mi regardless of its real working set and the
+`minAllowed: 32Mi` clamp cannot bind. On the single-node T1 cluster this was
+found on, that is +1744Mi across eight pods and an admissible application
+count of zero — so `0.2.55` is strictly worse than the crash-looping state it
+fixed. `0.2.56` pins the floor to the 32Mi seed. ADR 0054's second amendment
+has the full account.
+
+`0.2.55` carries `yanked: true` in `compatibility.cue`, so the resolver skips
+it when selecting channel-latest and a cluster pinned to it surfaces
+`YankedVersion=True`; **a cluster following the channel lands on `0.2.56`.**
+
+**Still open: the wider sweep.** Every earlier release carrying the component
+has the crash-looping controllers, and none of those was yanked here. The
+argument for leaving them is that they are inert rather than harmful and
+`kubectl -n vpa get pods` shows the state plainly; the argument against is
+that a cluster **pinned** to one stays broken silently and only a yank
+surfaces it. Still the owner's call.
 
 ### `spec.argocd.bootstrapRepo` / `bootstrapPath` are vestigial
 

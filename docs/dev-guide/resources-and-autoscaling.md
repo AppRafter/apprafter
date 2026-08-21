@@ -96,10 +96,12 @@ Three things follow from that, and all three are deliberate:
   where the default is not enough and you have to act.
 
 The 32Mi request is a starting point, not a verdict: the platform
-watches the pod and works out what it actually needs. On the shipped
-release that number is *reported* rather than applied (the warning
-above), so treat it as a measurement you act on — the live pod keeps
-its 32Mi until you write a `resources` block.
+watches the pod and works out what it actually needs, and from
+platform-stack 0.2.56 it corrects the running pod to that number in
+place. On anything earlier the number is *reported* rather than applied
+(the warning above): there, treat it as a measurement you act on
+yourself, because the live pod keeps its 32Mi until you write a
+`resources` block.
 
 ## Setting an explicit request and limit
 
@@ -419,11 +421,11 @@ using its default. The three modes:
 | `up-only` | Corrects **up** only. A request that has been raised is never brought back down on a running pod, so nothing is reclaimed. |
 | `off` | Keeps observing and keeps reporting recommendations; changes no pod. |
 
-On the shipped release all three behave like `off`, because the two
-components that change pods do not start (the warning at the top of
-this page). The mode is still worth setting correctly — it is what the
-cluster will do the moment that is fixed — but changing it today
-changes nothing you can observe.
+From platform-stack 0.2.56 all three do exactly what the table says. On
+anything earlier all three behave like `off`, because the two components
+that change pods do not start (the warning at the top of this page) —
+setting the mode correctly is still worth doing there, since it is what
+the cluster will do the moment it is upgraded.
 
 ```sh
 apprafter platform autoscale set up-only

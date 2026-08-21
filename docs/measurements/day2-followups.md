@@ -13,9 +13,15 @@ Internal working data — this tree is excluded from the site
 
 **Opened:** 2026-08-20 (2.19j, correcting
 `docs/dev-guide/resources-and-autoscaling.md`).
-**Status:** open — deliberately NOT fixed here; the fix changes live
-cluster behaviour and is the cluster owner's call.
-**Severity:** the whole applying half of ADR 0054 is inert, silently.
+**Status:** RESOLVED in platform-stack `0.2.56` — option 1 below is what
+was taken. The gate rename itself shipped in `0.2.55`, which is
+**yanked**: starting the controllers exposed a second unpinned upstream
+default underneath this one — the recommender's own 250Mi minimum
+recommendation — which made every application recommend an identical
+250Mi and could not be clamped by `minAllowed: 32Mi`. `0.2.56` pins that
+floor to the 32Mi seed. See ADR 0054's two amendments.
+**Severity (while open):** the whole applying half of ADR 0054 was
+inert, silently.
 
 ### What is wrong
 
@@ -79,7 +85,13 @@ pods `CrashLoopBackOff`, nine days.
 Net effect: recommendations are computed and reported; **no pod request
 is ever changed**. Applications keep the rendered `32Mi` forever.
 
-### The decision needed
+### The decision needed — taken, option 1
+
+Kept as written because the resize-wave warning below is the accurate
+one and was nearly lost: it was recorded here on 2026-08-20 and did not
+reach the release notes until a review caught the omission. It now sits
+in the `0.2.56` `notes` block of `compatibility.cue`, which is what
+`apprafter platform status` surfaces to an upgrading operator.
 
 Renaming the gate to `InPlace` is a one-word change — and it flips live
 behaviour from "nothing happens" to "the updater starts resizing running
