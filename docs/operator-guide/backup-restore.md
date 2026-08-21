@@ -199,6 +199,11 @@ specific snapshot (default `latest`).
   `DisasterRecoveryPlan` object that automates the drill is not implemented
   yet; today the drill is this command, run deliberately.
 
+  Recovery is not its only use. The same mode, given `--server-type`, is how a
+  **healthy** cluster is moved onto a bigger machine — a planned operation with
+  a different shape and a different checklist. See
+  [Move a cluster onto a bigger machine](#substrate-upgrade).
+
 ### Restore ordering and the two safety invariants
 
 The full restore is a fixed sequence:
@@ -250,6 +255,283 @@ The Kubernetes secret `type` is round-tripped (e.g. `kubernetes.io/tls` stays
 a TLS secret, not an `Opaque` one). The two capture paths re-seal into their
 respective namespaces: app user secrets into their app namespace,
 `SourceCredential` material into `apprafter-system`.
+
+## Move a cluster onto a bigger machine {#substrate-upgrade}
+
+The node under a healthy cluster has become too small — it is out of
+allocatable memory and the scheduler has started refusing pods — and you want
+the same cluster, with the same data, on a bigger machine. There is no
+in-place resize, so the move is a rebuild: take a backup, release the machine,
+provision a bigger one, and replay the backup into it.
+
+It runs the same `--reprovision` command as disaster recovery, and it is not
+the same operation. In a disaster the source cluster is already gone, the
+backup is whatever the schedule last managed to take, and you are recovering
+from a position you did not choose. Here the source is healthy and in your
+hands: you take the backup yourself and know it is current, you drain what
+will not survive, and you pick the hour. If your cluster is already dead, read
+[Target modes](#target-modes) (c) instead — the sequence below assumes a
+cluster that still works.
+
+**What this section does not cover.** The machine-choice side of the move
+lives on [Choosing the
+machine](choosing-the-machine.md#changing-the-machine): why `apprafter target
+machine` refuses on a running cluster, how wide `apprafter destroy` really is
+(it empties a provider **project**, not a cluster), the variant that stands
+the new cluster up in a second Hetzner project and keeps the old one serving
+until you are satisfied, and the cluster-name collision that turns a rebuild
+into a silent no-op. Read that page once before your first upgrade. What
+follows is the backup side: the sequence for each storage backend, what to
+verify when it is over, and what it costs you.
+
+### Before you start
+
+- **Redis contents will not come across.** A restore re-provisions every
+  `needs.redis` claim empty — see the warning at the top of this page. A
+  planned upgrade is the good case for this: you can drain a queue, accept an
+  empty cache, or move anything you cannot lose into `needs.pg` or
+  `needs.disk` *before* you take the backup. In a disaster you get no such
+  chance.
+- **A bigger node does not raise per-application limits.** The default memory
+  limit is 512Mi on every machine size and does not grow with the node — see
+  [Resources and
+  autoscaling](../dev-guide/resources-and-autoscaling.md#when-512mi-is-the-problem).
+  If one application is the thing hitting a ceiling, a bigger machine may not
+  be the fix you need.
+- **Do not resize in the provider console instead.** It looks cheaper and it
+  leaves the cluster's recorded machine type disagreeing with the live one,
+  which `apprafter apply` then warns about on every run until you reconcile it
+  with `apprafter import --force`. The route below keeps the record and the
+  machine in step.
+
+### It is one cluster, not two
+
+`apprafter destroy` clears the recorded cluster from local state; it does not
+touch the target. The name, the token, the region and the SSH key all survive,
+which is exactly what lets `restore --reprovision --target <same>` provision
+back into the same target and the same Hetzner project. You register no second
+target, issue no second token, and cut nothing over: at the end there is one
+cluster in one project, on a bigger machine.
+
+That is what separates this from the second-project route on [Choosing the
+machine](choosing-the-machine.md#changing-the-machine), which deliberately
+runs two clusters at once — safer, and more expensive for as long as both are
+up.
+
+### The sequence — host-local repository
+
+```sh
+# 1 — back up, into a repository that is not on the cluster
+RESTIC_PASSWORD=<passphrase> apprafter backup create --repo /backups/prod-repo
+
+# 2 — confirm the snapshot is really there, before anything is destroyed
+RESTIC_PASSWORD=<passphrase> apprafter backup list --repo /backups/prod-repo
+
+# 3 — release the machine (read the destroy-scope warning on the machine page)
+apprafter destroy --yes --target prod
+
+# 4 — record the new machine on the target, in the one window that allows it
+#     (see "the target keeps reporting the old machine" below)
+apprafter target machine --target prod --server-type cx33
+
+# 5 — provision the bigger machine and replay the backup into it
+RESTIC_PASSWORD=<passphrase> apprafter restore /backups/prod-repo \
+    --reprovision --server-type cx33 --target prod
+```
+
+### The sequence — off-site (S3) repository
+
+When the cluster already pushes an encrypted repository off-site on a schedule
+([Off-site scheduled backup](#off-site-scheduled-backup-s3)), the artifact you
+restore from is already there. Step 1 becomes a check that it is current and
+intact rather than a fresh backup.
+
+```sh
+# 1 — confirm the off-site repository is current and sound.
+#     Do this BEFORE the destroy — see the second defect below for why.
+apprafter backup status
+apprafter backup check --repo s3:<endpoint>/<bucket>/<prefix> \
+    --credential-file ./operator-s3.env
+
+# 2 — release the machine
+apprafter destroy --yes --target prod
+
+# 3 — record the new machine on the target
+apprafter target machine --target prod --server-type cx33
+
+# 4 — provision the bigger machine and replay from off-site
+apprafter restore s3:<endpoint>/<bucket>/<prefix> \
+    --reprovision --server-type cx33 --target prod \
+    --credential-file ./operator-s3.env
+```
+
+The credentials in `--credential-file` are the **operator's**, read from your
+own machine: between steps 2 and 4 there is no cluster left to read a
+credential from. That is the [two-tier credential
+model](#off-site-scheduled-backup-s3) doing the exact job it exists for, and a
+substrate upgrade is a cheap way to find out whether yours actually works —
+if the operator-side credentials cannot reach the repository while the cluster
+is down, neither could a real recovery.
+
+Scheduled backup survives the move. `PlatformStack.spec.backup` is part of the
+captured configuration, so the rebuilt cluster comes back with the same
+bucket, schedule and retention, and `apprafter backup status` reports it
+enabled again without you re-running `apprafter backup enable`.
+
+### What to verify afterwards
+
+`restore` reports success once it has replayed the artifact. That is not the
+same as the upgrade having worked. Six checks, each earning its place:
+
+1. **The server type, read from the provider.** Take it from the Hetzner Cloud
+   Console or the provider API — not from `apprafter target show` and not from
+   local state. Local records say what AppRafter asked for; only the provider
+   says what it got, and the two can disagree (they do; see below).
+2. **The server id changed.** A new id is what proves a genuinely new machine
+   rather than a local record rewritten around the old one. If the id is the
+   same, no rebuild happened — the most likely cause is the cluster-name
+   collision described on [Choosing the
+   machine](choosing-the-machine.md#changing-the-machine), where provisioning
+   finds the existing machine, reconciles it, and never uses the
+   `--server-type` you passed.
+3. **Node allocatable memory grew.** This is the number the scheduler budgets
+   against, and it is the reason you did any of this — a bigger SKU whose
+   allocatable did not move has bought you nothing.
+
+    ```sh
+    kubectl get node -o jsonpath='{.items[0].status.allocatable.memory}'
+    ```
+
+    Across the two validation runs it went from 1963 MiB to 5895 MiB on a
+    `cx23` → `cx33` move.
+
+4. **The workload reached `Ready` on its own.** Not "the pods exist" — the
+   application's own readiness, arrived at without you intervening. The
+   restore resumes workloads only after the data is loaded, so an application
+   that reaches `Ready` did so against restored state.
+5. **A sealed secret decrypts to its original value.** SealedSecrets are bound
+   to the cluster that sealed them, so every one of them was re-sealed against
+   the new cluster's key during the replay ([Secrets are re-sealed for the
+   target](#secrets-are-re-sealed-for-the-target)). Read one back and compare
+   it to what you put in. The failure this catches is an application sitting
+   at `Ready=False` with `EnvSecretMissing`.
+6. **The data, compared properly.** A marker row is not evidence. A single row
+   you planted and read back proves only that *a* restore happened; it would
+   still read back if every other table had been truncated. Use the stronger
+   check the walk uses:
+
+    - **per-table row counts**, compared table for table, so "rows went
+      missing" is a distinguishable failure from "the same rows, different
+      bytes"; and
+    - **a content digest** over every user table, hashed with an explicit,
+      deterministic `ORDER BY` — otherwise the digest depends on the order
+      rows happen to come back in and tells you nothing.
+
+    Compute both on the source before the backup and again on the upgraded
+    cluster. Compute each **twice on each side**: if the two computations on
+    one side disagree, that database is still being written to and any
+    comparison across the upgrade is noise rather than a result — a failure you
+    want to be able to tell apart from real data loss. Both validation runs
+    did exactly this against a real CMS database — 73 tables and 701 rows in
+    the first — and the digest came back byte-identical each time.
+
+### The downtime
+
+The cluster is destroyed and rebuilt. This is not a live migration and there
+is no overlap: from `apprafter destroy` until the workloads are back up on the
+new machine, the cluster does not exist and nothing it served is reachable.
+
+Two full runs of the automated walk on real Hetzner took **29m35s** and
+**21m9s** wall-clock. Read that as an order of magnitude, not a budget — it
+covers the whole walk, including standing the original cluster up and seeding
+it, which you are not doing. Your outage is the `destroy` → workloads-`Ready`
+span inside it.
+
+What dominates that span is the rebuild: provisioning the machine and running
+the full bootstrap — Cilium, Argo CD, then the platform stack syncing its
+components — not the data load, which was small at this size and scales with
+your data rather than with anything AppRafter controls. So plan for tens of
+minutes rather than seconds, and measure your own before you commit to a
+maintenance window. The walk's phase banners carry an elapsed clock, which
+makes the Phase 5 → Phase 7 span the number to read off a run of your own.
+
+### Two defects to plan around
+
+Both were found by the validation runs. They are current behaviour with a
+workaround, not planned work.
+
+#### `apprafter target show` keeps reporting the old machine
+
+After `restore --reprovision --server-type <big>`, the live machine and the
+recorded state are both the new SKU — but the target's saved *preference* is
+untouched, because the backfill that writes it only fills the slot when it is
+empty and yours is not. So `apprafter target show <name>` prints the old SKU
+indefinitely.
+
+It is harmless immediately: recorded state outranks the target preference in
+the resolution chain (flag → manifest → recorded state → target preference →
+`APPRAFTER_SERVER_TYPE`), so the stale value is shadowed for as long as that
+state exists. It stops being harmless the moment the state is cleared — which
+is precisely what `apprafter destroy` does. A **second** upgrade run without an
+explicit `--server-type` would resolve the stale preference and rebuild the
+machine you were trying to leave.
+
+The correction has to happen in the window between `destroy` and `restore` —
+which is why it is a step of its own in both sequences above. `apprafter
+target machine` refuses on a target that already runs a provisioned cluster,
+so once the restore has finished there is no supported command left to fix it.
+If you have already completed an upgrade without that step, either pass
+`--server-type` explicitly on every future rebuild, or set the preference in
+the destroy-to-restore window of the next one.
+
+#### `backup check`, `prune` and `unlock` fail once the cluster is gone
+
+All three resolve a kubeconfig as their first statement (`run_backup_check`,
+`run_backup_prune` and `run_backup_unlock` in
+`cli/platform-cli/src/commands/backup.rs`), and `apprafter destroy` clears the
+provider section of the state file. So between the destroy and the restore all
+three exit with:
+
+```text
+state has no hetzner_cloud section; run `apprafter apply` first
+```
+
+None of them needs the cluster or the `PlatformStack` when `--repo` and
+`--credential-file` are both given — the repository URL and the operator's
+credentials are the entire input. The failure therefore lands exactly where it
+hurts most: verifying an off-site backup *before* restoring from it, with no
+cluster in the world to ask.
+
+Two ways around it:
+
+- **Check before you destroy.** Step 1 of the S3 sequence above does this
+  deliberately, and it is the better habit regardless — a repository you
+  verify while the cluster is still up is one you can still fall back to.
+- **Use stock restic**, which needs no AppRafter and no cluster at all (the
+  repository is a plain restic repo — see [Assumptions and
+  portability](#assumptions-and-portability)):
+
+    ```sh
+    restic -r s3:<endpoint>/<bucket>/<prefix> snapshots
+    restic -r s3:<endpoint>/<bucket>/<prefix> check
+    ```
+
+### The executable version
+
+`e2e/substrate-upgrade-hetzner.sh` is this procedure written as a script, and
+it is the specification the section above describes: it provisions a `cx23`,
+deploys a real application with a `needs.pg` claim and a `secret:` reference,
+fingerprints the database, upgrades to a `cx33` through the sequence above,
+and asserts every item in *What to verify afterwards*. One switch
+(`APPRAFTER_SUBSTRATE_BACKEND=local|s3`) selects the storage backend, so both
+sequences are the same script. Its Phase 7 is where the verification list came
+from.
+
+Unlike the local-cluster harnesses cited elsewhere on this site, it runs
+against **real Hetzner** and spends real money — two short-lived machines, on
+the order of a couple of euro cents — and it calls `apprafter destroy`, which
+empties the whole project its token belongs to. Point it at a project you are
+willing to lose.
 
 ## Assumptions and portability
 
@@ -684,6 +966,9 @@ The DR steps:
    [Target modes](#target-modes)):
    - `--reprovision` — the source cluster is dead: provision **and** bootstrap a
      fresh cluster in the registered target, then replay. Real-Hetzner only.
+     (The same mode with `--server-type` also performs a *planned* move onto a
+     bigger machine — [Move a cluster onto a bigger
+     machine](#substrate-upgrade).)
    - neither flag (restore into a running, already-bootstrapped target; select
      it with `--target <name>`) — the default path.
    - `--data-only` — reload only native data into an already-configured target.
@@ -729,5 +1014,12 @@ the design's Verify items:
 
 - The end-to-end harness: `e2e/backup-restore-walk.sh` exercises
   export → backup → restore-into-fresh → data-only on local clusters.
+- `e2e/substrate-upgrade-hetzner.sh` — the planned-upgrade walk on real
+  Hetzner: `cx23` → `cx33` with the workload and every byte of its Postgres
+  intact, on either storage backend. See [Move a cluster onto a bigger
+  machine](#substrate-upgrade).
+- [Choosing the machine](choosing-the-machine.md#changing-the-machine) — why a
+  machine change is a rebuild, how far `apprafter destroy` reaches, and the
+  two-project alternative that keeps the old cluster serving.
 - [ADR 0050](https://github.com/apprafter/apprafter/blob/master/docs/adr/0050-backup-restore.md)
   for the full design and the rejected alternatives.

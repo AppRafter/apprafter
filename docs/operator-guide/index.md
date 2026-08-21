@@ -74,7 +74,10 @@ binds the credentials, and opens exactly the egress that need implies.
 
 - [Backup and restore](backup-restore.md) — what each export and backup
   command captures, where it lands, and how a backup is replayed into a
-  running cluster. Set this up before you need it.
+  running cluster. Set this up before you need it. It is also how you
+  [move a cluster onto a bigger
+  machine](backup-restore.md#substrate-upgrade) when the node it runs on
+  has become too small.
 - [Platform management](platform-management.md) — how the platform
   upgrades itself: the `PlatformStack` resource, channels and pins,
   component freezes, and the CLI that edits them.

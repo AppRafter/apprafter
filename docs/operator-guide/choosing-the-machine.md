@@ -366,6 +366,12 @@ target keeps the **old** type as its saved preference, so either pick a
 new one first or pass `--server-type` to the restore; otherwise the
 rebuild reproduces the machine you were trying to leave.
 
+[Move a cluster onto a bigger
+machine](backup-restore.md#substrate-upgrade) is this route from the
+backup side: the same four commands with an off-site (`s3:`) variant, what
+to check once the new machine is up, how long the outage runs, and two
+defects worth planning around. It is validated end to end on real Hetzner.
+
 `destroy` names the machine it removed on its way out, so keep the line
 if you may want to go back to it:
 
