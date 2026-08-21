@@ -81,6 +81,21 @@ _components: cilium: #Component & {
 			}
 			limits: memory: "256Mi"
 		}
+		// A pod's CPU request is max(sum of containers, max of initContainers),
+		// so the `install-cni-binaries` init container's chart-default 100m
+		// SHADOWED the 50m measured for the agent above — the pinned value was
+		// inert and the node booked 100m. Memory was unaffected
+		// (max(106, 10) = 106). Same class as the VPA recommender floors:
+		// an upstream default we never read winning over a value we measured.
+		// Memory is pinned anyway, at the chart's own current default: same
+		// reasoning as the VPA CPU floor — the pin is not for today's number,
+		// it is immunity from a silent upstream default change on the next
+		// chart bump. If upstream raises this above the agent's 106Mi it
+		// would start shadowing memory too, exactly as it did CPU.
+		cni: resources: requests: {
+			cpu:    "10m"
+			memory: "10Mi"
+		}
 		gatewayAPI: {
 			enabled: bool | *true
 			hostNetwork: enabled: bool | *true
