@@ -33,12 +33,24 @@ securityContext:
   runAsNonRoot: true
   runAsUser: 65532
 
+# Request trimmed 64Mi -> 16Mi (0.2.56 node-saturation fix). 2.16d
+# baseline measured this pod at 1Mi with the same "already set —
+# keep" annotation that dropped it from that measurement's sum. On
+# the dogfood cluster 2026-08-21 this pod fell below `kubectl top`'s
+# 5Mi reporting cutoff, so no precise live figure exists — just
+# confirmation it's comfortably under 16Mi.
+#
+# limits.cpu removed per ADR 0053 §1 ("modest CPU request, no CPU
+# limit" for platform components — a CPU limit only adds latency
+# cliffs with no safety benefit, and CPU is compressible so
+# throttling, not OOM, is the actual risk). This pod is
+# request/response with no watch cache, unlike the operator. The
+# memory limit is unchanged.
 resources:
   requests:
     cpu: 20m
-    memory: 64Mi
+    memory: 16Mi
   limits:
-    cpu: 200m
     memory: 256Mi
 
 # ValidatingWebhookConfiguration knobs. `failurePolicy: Fail`

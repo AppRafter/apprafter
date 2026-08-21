@@ -59,12 +59,42 @@ securityContext:
   runAsNonRoot: true
   runAsUser: 65532
 
+# Request trimmed 128Mi -> 64Mi (0.2.56 node-saturation fix). 2.16d
+# baseline measured this pod at 12Mi and annotated it "already set —
+# keep", which also silently dropped it from that measurement's
+# ~800Mi platform-request sum. Live on the dogfood cluster
+# 2026-08-21: 15Mi — but that reading, like the 12Mi baseline, comes
+# from a cluster running essentially one application; the operator's
+# memory is dominated by kube-rs watch caches across 8 CRDs, which
+# scale with object count, not time. Nobody has measured a
+# reconcile-storm working set. 64Mi is deliberate headroom over the
+# 15Mi idle reading, not a measurement.
+#
+# This deliberately deviates upward from ADR 0053's "requests ≈
+# measured RSS x 0.8" rule, which would land near 10Mi here — do not
+# "correct" it back down to the formula's answer. Kubelet ranks
+# evictions by usage above request: at 128Mi the operator sat below
+# its request for any working set up to 128Mi (effectively last in
+# the eviction order); at 32Mi a storm that reached 100Mi would put
+# it 68Mi over request and near the front of the queue. This is a
+# single-replica control plane, so eviction ranking during a storm
+# is worth more than the extra reclaim — hence 64Mi, not the ~10Mi
+# the formula would give.
+#
+# limits.cpu removed per ADR 0053 §1 ("modest CPU request, no CPU
+# limit" for platform components — a CPU limit only adds latency
+# cliffs with no safety benefit, and CPU is compressible so
+# throttling, not OOM, is the actual risk). This Deployment is
+# replicas: 1 behind leader election (10s renew / 30s expiry);
+# sustained CFS throttling during a reconcile storm that delays a
+# lease renewal past 30s would flap leadership on the only
+# control-plane replica. The memory limit stays — it is the burst
+# ceiling and reconcile storms are why it stays generous.
 resources:
   requests:
     cpu: 50m
-    memory: 128Mi
+    memory: 64Mi
   limits:
-    cpu: 500m
     memory: 512Mi
 
 nodeSelector: {}
