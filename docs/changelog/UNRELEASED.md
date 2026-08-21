@@ -9,6 +9,192 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## platform-stack 0.2.56 — the floors underneath the floors, and 256Mi back (2026-08-21)
+
+> **Chart release. The `apprafter-operator` and `apprafter-admission-webhook`
+> charts move v0.2.41 → v0.2.42 — `values.yaml` only, no Rust change, so the
+> images published at the new tag are the same code with different requests.
+> No CLI and no cue-cmp release.** `0.2.55` is **yanked**, and `0.2.56` is
+> classified `requires-restart`, correcting the `safe` that `0.2.55` shipped.
+>
+> Found on a live ~4GB Tier-1 node that had booked **1952Mi of its 1959Mi**
+> allocatable memory in requests, with a Postgres instance `Pending` for four
+> days and no running copy anywhere. Platform infrastructure held **86.9%** of
+> those requests; user application code held **13.1%**.
+
+### Fixed
+
+- **Every VPA on the cluster recommended the same number, and the number was
+  upstream's, not ours.** All five `VerticalPodAutoscaler` objects reported an
+  **identical** `250Mi / 25m` target — across workloads whose real working sets
+  ranged from **6Mi to 82Mi**. Identical targets across a 14× spread of actual
+  usage are not a recommendation; they are a constant.
+
+  The constant is upstream's own minimum-recommendation floor. VPA's
+  recommender ships `--pod-recommendation-min-memory-mb` defaulting to **250**
+  and `--pod-recommendation-min-cpu-millicores` defaulting to **25**
+  (`pkg/recommender/config/config.go` at tag
+  `vertical-pod-autoscaler-1.7.1`, the version we pin). Neither was set
+  anywhere in this repository. Upstream applies those floors **first** and
+  clamps into `[minAllowed, maxAllowed]` **afterwards** — so with
+  `32 < 250 < 512`, the `minAllowed: 32Mi` that ADR 0054 calls "the seed floor"
+  could not bind under any input. It was **structurally dead code, shadowed by
+  an invisible floor 7.8× higher**.
+
+  `maxAllowed: 512Mi` is a different case and the distinction matters: the
+  ceiling still binds whenever a recommendation exceeds it, and simply never
+  did here because every recommendation sat at the floor. It was unexercised,
+  not inert — the documented `[32Mi, 512Mi]` correction range is real, and only
+  its lower half was dead.
+
+  Both floors are now pinned on the recommender's `extraArgs`: memory to
+  **32Mi**, the 2.16d seed, which makes `minAllowed` reachable; CPU to **25m**,
+  which is the value it already defaults to. The CPU pin is deliberate even
+  though it changes nothing today — it buys immunity from a silent upstream
+  default change on the next chart bump, which is the failure mode that
+  produced both this bug and the feature-gate bug in `0.2.55`.
+
+  **This is why `0.2.55` is yanked.** The one-string gate fix in `0.2.55` is
+  itself correct, but it started vertical autoscaling for the first time on
+  every cluster carrying it, with the shipped default `mode: full` and these
+  floors still unset. A VPA targets a *Deployment*, and every pod of that
+  Deployment is admitted at the recommendation — so the five objects above
+  cover five Deployments totalling **eight pods**, because three of the five
+  applications run two replicas. Every one of them would have been admitted at
+  250Mi instead of the 32Mi seed: `8 × (250 − 32)` = **+1744Mi on a node with
+  7Mi free.** At a 250Mi floor the admissible application count on this tier is
+  **zero**. The fix for the first bug would have saturated the node.
+
+  ADR 0054 carries a second amendment with the full account, including the
+  coupling this creates — `minAllowed` is now authoritative only *upward*, so
+  lowering it below 32Mi is silently overridden by the chart pin and the two
+  must move together.
+
+- **The VPA recommender ran two replicas nobody asked for.** The other two
+  components in `component_vpa.cue` pin `replicas: 1`; the recommender did not,
+  and the upstream chart defaults **all three** to 2. A second recommender on a
+  single-node cluster is a hot standby with no failure domain to stand by for
+  — the chart auto-enables leader election above one replica — so it reserved
+  **64Mi + 50m** of node allocatable to do nothing. Live usage was 19Mi
+  (leader) and 8Mi (standby). Pinned to 1.
+
+- **The cilium CNI init container shadowed the agent request the 2.16d baseline
+  measured.** A pod's CPU request is `max(sum of containers, max of init
+  containers)`, and `install-cni-binaries` inherited the chart default of
+  **100m** — so the 50m pinned for the agent was inert and the node booked
+  100m. `cni.resources` is now pinned (`cpu: 10m`, `memory: 10Mi`, the chart's
+  own current defaults) and the effective pod request goes **100m → 50m**.
+  Memory was never affected (`max(106, 10) = 106`). Same class as the
+  recommender floors: an upstream default nobody read winning over a value we
+  measured.
+
+- **sealed-secrets requested 64Mi where the 2.16d baseline had chosen 32Mi.**
+  That baseline measured the controller at 22Mi and picked a 32Mi request;
+  64Mi shipped here by mistake and went unnoticed because the D2 budget-close
+  summed the measurement's chosen column, not this file. Live 14Mi. Corrected
+  to **32Mi**.
+
+- **The admission-webhook chart pin was four versions behind the chart tree.**
+  `component_admission-webhook.cue` pinned `v0.2.38` while the shipped charts
+  were at `v0.2.41` — a repeated oversight across three releases. Corrected to
+  **v0.2.42**. The intervening versions were functionally identical
+  republishes, so no unreviewed behaviour is picked up; the webhook image on
+  existing clusters nevertheless rolls v0.2.38 → v0.2.42 on upgrade.
+
+### Changed
+
+- **256Mi of memory requests reclaimed on a single-replica (solo) tier**, each
+  against a measured footprint:
+
+  | Component | Before | After | Reclaimed | Basis |
+  | --- | --- | --- | --- | --- |
+  | VPA recommender (`replicas` 2 → 1) | 2 × 64Mi | 64Mi | **64Mi + 50m** | standby serves no failure domain; live 19Mi / 8Mi |
+  | sealed-secrets | 64Mi | 32Mi | **32Mi** | 2.16d measured 22Mi and chose 32Mi; live 14Mi |
+  | dragonfly kube-rbac-proxy | 64Mi | 16Mi | **48Mi** | upstream default, never pinned; live 9Mi at zero traffic |
+  | apprafter-operator | 128Mi | 64Mi | **64Mi** | 2.16d measured 12Mi, live 15Mi — 64Mi is headroom, not a measurement |
+  | admission-webhook | 64Mi | 16Mi | **48Mi** | 2.16d measured 1Mi; live below `kubectl top`'s 5Mi cutoff |
+
+  **100m of CPU requests** comes off with it: 50m from the dropped recommender
+  replica and 50m from the cilium `cni.resources` pin above.
+
+  Two entries carry caveats worth reading before anyone "corrects" them:
+
+  - The **operator's 64Mi is deliberate headroom, not a measurement**, and it
+    deviates *upward* from ADR 0053's "request ≈ measured RSS × 0.8" rule,
+    which would land near 10Mi. Its memory is dominated by kube-rs watch caches
+    across 8 CRDs, which scale with object count rather than time, and nobody
+    has measured a reconcile-storm working set — the 12Mi and 15Mi readings
+    both come from clusters running essentially one application. Kubelet ranks
+    evictions by usage *above request*, and this is a single-replica control
+    plane, so eviction ranking during a storm is worth more than the extra
+    reclaim.
+  - The **dragonfly kube-rbac-proxy's 9Mi is a zero-traffic figure.** Nothing
+    scrapes the endpoint it guards today — the chart ships
+    `serviceMonitor.rbacProxyMetricsReader.create: false`, so no Prometheus
+    ServiceAccount is bound to it. It stays *enabled* (disabling it exposes
+    metrics unauthenticated); re-measure if `serviceMonitor` is ever turned on.
+
+### Removed
+
+- **The three VPA PodDisruptionBudgets.** Upstream ships all three components'
+  `podDisruptionBudget.enabled: true` with `minAvailable: 1`, which against our
+  pinned `replicas: 1` can never be satisfied — `kubectl drain` blocks forever
+  on the node holding the only copy. `minAvailable: 0` is *not* the
+  alternative: the template gates on truthiness, so 0 renders a selector-only
+  PDB that permits everything while reading as misconfigured to the next
+  operator. **This trade-off is only valid at one replica** — raising any of
+  the three above `replicas: 1` (a multi-node tier overlay is the likely
+  trigger) must re-enable that component's PDB in the same edit, and the
+  admission controller is the sharp case: at two replicas with no PDB a drain
+  can evict both webhook pods at once, and `failurePolicy: Ignore` means the
+  cluster then admits VPA objects unmutated with no error.
+
+- **`limits.cpu` from three containers** — apprafter-operator (500m),
+  admission-webhook (200m) and the dragonfly kube-rbac-proxy (500m, via a Helm
+  null-override, since Helm deletes a key whose user-supplied value is null) —
+  per ADR 0053 §1: platform components get a modest CPU request and **no** CPU
+  limit. CPU is compressible, so a ceiling only adds latency cliffs with no
+  safety benefit; throttling, not OOM, is the actual risk. It matters most on
+  the operator, which is `replicas: 1` behind leader election (10s renew / 30s
+  expiry) — sustained CFS throttling during a reconcile storm that delayed a
+  lease renewal past 30s would flap leadership on the only control-plane
+  replica. Memory limits are unchanged throughout.
+
+### Notes
+
+- **`change: requires-restart`, correcting the `safe` that `0.2.55` shipped.**
+  ADR 0054 had already argued for it — "installing a cluster-wide mutating
+  admission webhook on pod CREATE + an updater that mutates live pods is not a
+  `safe` auto-sync" — and `0.2.55` was the release in which that machinery
+  first ran at all.
+- **Upgrade hazard on an already-saturated node.** The VPA chart's
+  cert-generation Job is a Helm `pre-upgrade` hook (PreSync for Argo CD)
+  requesting 16Mi, and a hook that cannot schedule means the sync phase never
+  runs — so the cluster that most needs this fix is the one that can fail to
+  install it. If the `vpa` Application hangs with a `Pending`
+  `...admission-certgen-...` pod, free a little allocatable first
+  (`apprafter platform autoscale set off`, then reclaim any orphaned backend)
+  and the sync proceeds.
+- **Why the CPU column is why nobody read the memory column.**
+  `--pod-recommendation-min-cpu-millicores` defaults to 25m and the 2.16d
+  application seed requests 25m, so the CPU column of `kubectl get vpa` printed
+  exactly what a correct system would print, on every object — and the memory
+  column beside it was assumed correct by association.
+
+### Reported, not fixed
+
+Two findings from the same investigation are deferred to their own plans rather
+than folded into a resource-governance release:
+
+- **The Application controller never reads `Deployment.status`.** The saturated
+  node ran four days with its database `Pending` and no instance running, and
+  Argo CD rendered the application **Healthy** throughout. Readiness is
+  inferred from what was applied, not from what is running.
+- **A Dragonfly pool is never reaped when its last claim goes.** The instance
+  stays up holding **320Mi Guaranteed** while serving zero claims — on this
+  node, the single largest recoverable block, and one that no amount of request
+  trimming addresses.
+
 ## platform-stack 0.2.55 — vertical autoscaling starts working (2026-08-21)
 
 > **Chart-only release; no CLI, operator or cue-cmp change.** One string in
