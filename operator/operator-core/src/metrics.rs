@@ -24,6 +24,24 @@
 //!     hash failed, by reason {HashMissing, HashMismatch} (2.16b-sec
 //!     N-3 — surfaces a stale/forged approval re-gate + measures any
 //!     hashless tail in the wild).
+//!   - apprafter_shared_backend_reap_total{backend,result} —
+//!     shared-backend reaper decisions (ADR 0042 §9). `backend` ∈
+//!     {dragonfly-ephemeral, dragonfly-persistent, cnpg, unknown};
+//!     `result` ∈ {reaped, dwelling, veto_live, veto_intent,
+//!     veto_retained, veto_uid_conflict, veto_owner_reattached,
+//!     error}. The full label domain is declared here even though the
+//!     Dragonfly and CNPG arms each emit only part of it — the
+//!     `veto_owner_reattached` result is CNPG-only (its PVC
+//!     ownerReference strip, §9.3) and `unknown`/`error` mark a sweep
+//!     that failed before it could attribute a backend.
+//!     NOTE the results have MIXED semantics: `reaped` and
+//!     `veto_uid_conflict` count EVENTS, while `dwelling` and every
+//!     `veto_*` are per-tick SAMPLES — the sweep increments one per
+//!     instance per tick regardless of whether anything changed. So
+//!     `rate(...{result="veto_live"}[5m])` measures tick-rate ×
+//!     instance-count, not a rate of vetoes; alert on `reaped`, and
+//!     read the sample series as "how many instances were in this
+//!     state", not "how often this happened".
 //!
 //! Metrics are registered into a single `Registry` that the HTTP
 //! `/metrics` handler in `apprafter-operator` encodes.
@@ -42,6 +60,7 @@ pub struct Metrics {
     pub soft_destructive_total: CounterVec,
     pub claim_retained_total: CounterVec,
     pub migration_regate_total: CounterVec,
+    pub shared_backend_reap_total: CounterVec,
 }
 
 impl Default for Metrics {
@@ -144,6 +163,15 @@ impl Metrics {
         )
         .expect("CounterVec must build with a non-empty name");
 
+        let shared_backend_reap_total = CounterVec::new(
+            opts!(
+                "apprafter_shared_backend_reap_total",
+                "Shared-backend reaper decisions (ADR 0042 §9), by backend and result"
+            ),
+            &["backend", "result"],
+        )
+        .expect("CounterVec must build with a non-empty name");
+
         registry
             .register(Box::new(reconcile_total.clone()))
             .expect("reconcile_total registers cleanly");
@@ -174,6 +202,9 @@ impl Metrics {
         registry
             .register(Box::new(migration_regate_total.clone()))
             .expect("migration_regate_total registers cleanly");
+        registry
+            .register(Box::new(shared_backend_reap_total.clone()))
+            .expect("shared_backend_reap_total registers cleanly");
 
         Self {
             registry,
@@ -187,6 +218,7 @@ impl Metrics {
             soft_destructive_total,
             claim_retained_total,
             migration_regate_total,
+            shared_backend_reap_total,
         }
     }
 
@@ -239,6 +271,9 @@ mod tests {
         m.migration_regate_total
             .with_label_values(&["HashMismatch", "demo"])
             .inc();
+        m.shared_backend_reap_total
+            .with_label_values(&["dragonfly-ephemeral", "reaped"])
+            .inc();
         let body = String::from_utf8(m.encode()).unwrap();
         assert!(body.contains("apprafter_reconcile_total"), "{body}");
         assert!(
@@ -253,6 +288,10 @@ mod tests {
         assert!(body.contains("apprafter_soft_destructive_total"), "{body}");
         assert!(body.contains("apprafter_claim_retained_total"), "{body}");
         assert!(body.contains("apprafter_migration_regate_total"), "{body}");
+        assert!(
+            body.contains("apprafter_shared_backend_reap_total"),
+            "{body}"
+        );
     }
 
     #[test]
