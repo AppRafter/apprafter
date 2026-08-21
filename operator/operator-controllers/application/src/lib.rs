@@ -1286,6 +1286,16 @@ async fn prune_vpa(client: &Client, namespace: &str, name: &str) -> Result<(), R
 /// Tier-invariant: `Full` mode, 25m/32Mi min, 1/512Mi max. When the
 /// PlatformStack `spec.resources.autoscale` knob is absent or only overrides
 /// the `mode`, these floors are preserved as-is via `resolve_autoscale_config`.
+///
+/// COUPLED TO CHART SOURCE, one-directionally. `min_allowed` is a clamp the VPA
+/// recommender applies AFTER its own minimum-recommendation floor, which
+/// platform-stack 0.2.56 pins to 32Mi in `platform-stack/cue/component_vpa.cue`
+/// (`--pod-recommendation-min-memory-mb`). That makes this value authoritative
+/// only UPWARD: raise the memory minimum above 32Mi and it binds; lower it below
+/// and the chart pin silently overrides it, and nothing here reports the
+/// conflict. Change one and change the other. (Before 0.2.56 the floor was
+/// unpinned at upstream's 250Mi default, which made this clamp structurally dead
+/// — ADR 0054, second amendment.)
 fn default_autoscale_config() -> operator_core::AutoscaleConfig {
     operator_core::AutoscaleConfig {
         mode: operator_core::AutoscaleMode::Full,

@@ -12,7 +12,7 @@ whether your manifest carries a `resources` block.
 
 | Your manifest | What the container asks for | Right-sizing |
 | --- | --- | --- |
-| **no** `resources` | the platform's values: requests `cpu: 25m`, `memory: 32Mi`; limits `memory: 512Mi`; no CPU limit | **observed and reported**; see the note below — the *applying* half does not run on the shipped release |
+| **no** `resources` | the platform's values: requests `cpu: 25m`, `memory: 32Mi`; limits `memory: 512Mi`; no CPU limit | **observed and applied in place**, from platform-stack 0.2.56; see the note below if your cluster is older |
 | **any** `resources` | exactly what you wrote, and nothing else | **off** for that application in that environment — no autoscaler object at all |
 
 The second row is the part that surprises people: the block is not a
@@ -20,7 +20,7 @@ set of hints the platform refines. Writing it is how you say "I own
 these numbers", and the automatic correction stops for that
 application.
 
-!!! warning "Before platform-stack 0.2.55, right-sizing observed but never applied"
+!!! warning "Before platform-stack 0.2.56, right-sizing corrected nothing"
 
     Check which side of this you are on before reading further:
 
@@ -49,7 +49,16 @@ application.
     whole time. Pods were created with the Deployment's seed request and
     kept it, beside a recommendation saying otherwise.
 
-    **On 0.2.55 and later** the updater applies recommendations in place,
+    That gate was fixed in 0.2.55, which is **yanked** and should not be
+    run: with the controllers finally up, a second unread upstream default
+    surfaced — the recommender's own minimum-recommendation floor of
+    250Mi, which made every application recommend an identical 250Mi
+    regardless of what it actually used, and made the floor in the table
+    below unreachable. **0.2.56 pins that floor** and is the first release
+    on which right-sizing both runs and recommends your application's real
+    numbers.
+
+    **On 0.2.56 and later** the updater applies recommendations in place,
     without eviction — see
     [What the platform does when you leave it alone](#what-the-platform-does-when-you-leave-it-alone).
     **On anything earlier**, read the recommendation and act on it yourself
@@ -223,12 +232,13 @@ is empty.
 
 An application with no `resources` gets a `VerticalPodAutoscaler`
 alongside its Deployment, and it is configured narrowly. Read as
-"what may change" — with the standing caveat that the applying half is
-down on the shipped release, so today nothing in the first row happens:
+"what may change" — with the standing caveat that on anything before
+platform-stack 0.2.56 the applying half is down, so nothing in the first
+row happens there:
 
 | Setting | Value | What it means for you |
 | --- | --- | --- |
-| update mode | `InPlace` | The request on the **running pod** would be changed where it stands. No eviction, no restart, no rollout. If the node cannot fit the new request the change is deferred and retried rather than forced. (Requires the updater, which runs from platform-stack 0.2.55.) |
+| update mode | `InPlace` | The request on the **running pod** would be changed where it stands. No eviction, no restart, no rollout. If the node cannot fit the new request the change is deferred and retried rather than forced. (Requires the updater, which runs from platform-stack 0.2.56.) |
 | controlled values | `RequestsOnly` | Only **requests** are ever touched. Your limits — or the platform's `512Mi` — are never rewritten. |
 | controlled resources | `cpu`, `memory` | Nothing else is autoscaled, `ephemeral-storage` included. |
 | floor | `cpu: 25m`, `memory: 32Mi` | The platform's own starting values: the request is never corrected below them. |
@@ -241,9 +251,9 @@ Two consequences worth carrying:
 platform renders `32Mi` into the Deployment template and the autoscaler
 edits the *pod*; they are different fields and neither reverts the
 other. `kubectl describe deployment` is therefore the wrong place to
-look — read the pod, as below. (While the updater is down the pod reads
-`32Mi` too; the difference between the two only becomes visible once
-the applying half runs.)
+look — read the pod, as below. (While the updater is down — anything
+before 0.2.56 — the pod reads `32Mi` too; the difference between the two
+only becomes visible once the applying half runs.)
 
 **It only runs where the autoscaler is installed** — and "installed"
 is not one question but two. The CRD being present says the component
@@ -365,9 +375,18 @@ the container's own memory limit, and for an application with no
 there is no CPU limit to bind first, so `maxAllowed.cpu` really is the
 CPU ceiling.
 
-If you do edit them, two traps: `mode` is required on that object, so
-send it in the same patch; and each map replaces the built-in one
-wholesale, so write every key you mean to keep.
+If you do edit them, three traps: `mode` is required on that object, so
+send it in the same patch; each map replaces the built-in one wholesale,
+so write every key you mean to keep; and **`minAllowed` is authoritative
+only upward.** The autoscaler applies its own minimum-recommendation
+floor *before* this clamp, and the platform pins that floor to the same
+`32Mi` — so raising `minAllowed.memory` above `32Mi` works as you would
+expect, while lowering it below `32Mi` changes nothing and reports no
+error. Recommendations simply stop at `32Mi` either way. (This is the
+defect that platform-stack 0.2.56 fixed, one level up: the floor used to
+sit unpinned at the autoscaler's own default of 250Mi, which put it
+*above* `minAllowed` and made the clamp unreachable in the other
+direction.)
 
 ```sh
 kubectl -n apprafter-system patch platformstack default --type=merge \
@@ -417,9 +436,7 @@ An invalid mode is rejected before the cluster is contacted:
 × invalid autoscale mode 'bogus' (expected full|up-only|off)
 ```
 
-> **`off` freezes, it does not restore.** (Read this for the day the
-> applying half runs; with no pod ever corrected, there is nothing to
-> freeze today.) Pods already corrected keep
+> **`off` freezes, it does not restore.** Pods already corrected keep
 > the sizes they have; the next deploy or pod recreation puts each one
 > back to the platform's `32Mi` starting request, because that is what
 > the Deployment template has always said. If you are switching to `off`
