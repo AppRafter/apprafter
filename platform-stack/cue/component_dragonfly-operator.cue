@@ -33,8 +33,10 @@ _components: "dragonfly-operator": #Component & {
 		// (top-level `resources` is NOT read); its default is `{}`
 		// (BestEffort) so this seed is what lifts the pod to Burstable.
 		// The chart's kube-rbac-proxy sidecar (`rbacProxy.enabled: true`)
-		// already ships its own requests+limits, so it is not BestEffort
-		// and is left at the chart default. This sizes the OPERATOR pod
+		// already ships its own requests+limits, so it is not
+		// BestEffort — but its chart-default request was never pinned
+		// here, so it stayed out of the 2.16d D2 budget-close (see the
+		// `rbacProxy` block below). This sizes the OPERATOR pod
 		// only; the shared Dragonfly instances the provisioner creates get
 		// their Guaranteed resources from the redis-integrated
 		// ServiceProvider config (service_providers.cue).
@@ -45,6 +47,15 @@ _components: "dragonfly-operator": #Component & {
 			}
 			limits: memory: "64Mi"
 		}
+		// The kube-rbac-proxy sidecar fronts the operator's /metrics endpoint.
+		// It is left ENABLED (disabling it exposes metrics unauthenticated),
+		// but its upstream default request of 64Mi is four times its measured
+		// footprint (live 9Mi) and nothing currently consumes what it guards —
+		// the chart ships `rbacProxyMetricsReader.create: false`, so no
+		// Prometheus ServiceAccount is bound to it. The earlier decision to
+		// leave it at the chart default (see the comment above) is what kept
+		// its 64Mi out of the 2.16d D2 budget-close entirely.
+		rbacProxy: resources: requests: memory: "16Mi"
 	}
 
 	// Operator + its CRD bundle must exist before any ServiceProvider CR
