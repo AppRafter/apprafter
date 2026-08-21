@@ -130,6 +130,12 @@ impl BackendResources {
 /// `res` gives the pod Guaranteed QoS (requests==limits, incl.
 /// `ephemeral-storage`) and a `shared_buffers` that must be coherent with
 /// the memory limit — CNPG >=1.19's webhook rejects an incoherent pair.
+///
+/// The CR carries the `apprafter.io/managed-by` ownership stamp — the same
+/// label [`basic_auth_secret`] puts on the role password Secret and
+/// `dragonfly_object` puts on a pool instance. This is LOAD-BEARING for the
+/// reaper (ADR 0042 §9), not inventory decoration; see the comment on the
+/// label itself.
 pub fn cluster_object(
     name: &str,
     ns: &str,
@@ -143,6 +149,26 @@ pub fn cluster_object(
         "metadata": {
             "name": name,
             "namespace": ns,
+            // Ownership stamp, spelled exactly as `basic_auth_secret` and
+            // `dragonfly::dragonfly_object` spell it. LOAD-BEARING: the
+            // reaper (ADR 0042 §9) LISTs its candidates under this selector,
+            // so a `Cluster` this operator did not create can never become
+            // one — whatever it is called.
+            //
+            // It is the SECOND of the CNPG arm's two gates. The first is that
+            // the name must appear as a value in the reaper's
+            // `ProviderIndex.cnpg_cluster` map, i.e. some `ServiceProvider`
+            // config points at it; this label is what stops a `Cluster` a
+            // user happened to name `platform-postgres` in the CNPG namespace
+            // from being reaped on the strength of that name alone.
+            //
+            // A `Cluster` created before this stamp existed simply stops being
+            // a candidate until the provisioner's next SSA apply marks it,
+            // which happens on every reconcile of any pg claim — the safe
+            // direction, and self-healing.
+            "labels": {
+                "apprafter.io/managed-by": "apprafter",
+            },
         },
         "spec": {
             "instances": instances,
@@ -413,6 +439,51 @@ mod tests {
         );
         // ephemeral-storage present on requests+limits
         assert_eq!(v["spec"]["resources"]["limits"]["ephemeral-storage"], "1Gi");
+    }
+
+    #[test]
+    fn cluster_cr_is_stamped_with_the_ownership_label() {
+        // SAFETY, not inventory: the reaper (ADR 0042 §9) selects its delete
+        // candidates on this label, and the CNPG candidate it deletes owns a
+        // live database. An unstamped `Cluster` is one whose only protection
+        // is that its name failed to appear in a ServiceProvider config.
+        //
+        // The stamp must match `basic_auth_secret`'s AND
+        // `dragonfly::dragonfly_object`'s byte for byte: ONE selector string
+        // in the reaper covers both arms, so a divergence here either
+        // silently empties the CNPG arm's candidate set (it would then reap
+        // nothing — fails safe, but the pool never shrinks) or, if the
+        // selector were relaxed to match, widens BOTH arms' candidate sets at
+        // once.
+        let cluster = cluster_object(
+            "platform-postgres",
+            "cnpg-system",
+            1,
+            "10Gi",
+            &BackendResources::cnpg_t1(),
+        );
+        assert_eq!(
+            cluster["metadata"]["labels"]["apprafter.io/managed-by"], "apprafter",
+            "the shared CNPG Cluster must carry the ownership stamp"
+        );
+        let secret = basic_auth_secret("approle-pw", "cnpg-system", "approle", "pw");
+        assert_eq!(
+            cluster["metadata"]["labels"]["apprafter.io/managed-by"],
+            secret["metadata"]["labels"]["apprafter.io/managed-by"]
+        );
+        let dragonfly = crate::dragonfly::dragonfly_object(
+            "platform-redis-ephemeral-000",
+            "dragonfly-system",
+            1024,
+            1,
+            1,
+            false,
+            &BackendResources::dragonfly_t1(),
+        );
+        assert_eq!(
+            cluster["metadata"]["labels"]["apprafter.io/managed-by"],
+            dragonfly["metadata"]["labels"]["apprafter.io/managed-by"]
+        );
     }
 
     // --- database_object() ---
