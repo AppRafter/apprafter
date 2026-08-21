@@ -162,6 +162,27 @@ patch of each phase.
 
 ### Notes
 
+- **Expect application requests to move, and only upward.** The reclaim above
+  is the platform side. This is also the first release on which *app-side*
+  right-sizing runs with a floor that binds — and because the pinned floor
+  (32Mi) equals the seed (32Mi), a fleet that has never been corrected can move
+  in one direction only: up. It lands at once rather than gradually, because
+  the floors apply at the recommender's output and the existing
+  `VerticalPodAutoscalerCheckpoint` histograms already carry ~14 days of real
+  usage. How much depends on the fleet: with upstream's default
+  `--recommendation-margin-fraction` of 0.15, anything using under ~28Mi stays
+  at the 32Mi floor and does not move at all, while an application measured at
+  82Mi targets ~94Mi (+62Mi). On the incident node most of the eight pods sit
+  under that threshold, so the 256Mi reclaimed is real — but a fleet of heavier
+  applications will give more of it back, and that should be budgeted before
+  upgrading a node that is already tight. This is the resize wave
+  `docs/measurements/day2-followups.md` predicted on 2026-08-20; it did not
+  reach the release notes until a review caught the omission.
+- **An upward resize the node cannot satisfy is deferred and retried
+  silently.** Nothing reads `Deployment.status`, so the application still
+  renders Healthy while its pod never gets the memory the autoscaler asked
+  for — the same shape as the four-day `Pending` Postgres that started this
+  investigation, and the reason that gap is listed below as a deferred item.
 - **`change: requires-restart`, correcting the `safe` that `0.2.55` shipped.**
   ADR 0054 had already argued for it — "installing a cluster-wide mutating
   admission webhook on pod CREATE + an updater that mutates live pods is not a

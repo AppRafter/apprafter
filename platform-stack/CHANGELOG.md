@@ -144,6 +144,26 @@ pod, free a little allocatable first
 (`apprafter platform autoscale set off`, then reclaim any
 orphaned backend) and the sync proceeds.
 
+**Expect application requests to move, and only upward.** This is
+also the first release on which app-side right-sizing runs with a
+floor that *binds*, and because the pinned floor (32Mi) equals the
+seed (32Mi), a fleet that has never been corrected can move in one
+direction only: up. It lands at once rather than gradually — the
+floors apply at the recommender's output, so the existing
+`VerticalPodAutoscalerCheckpoint` histograms already carry ~14 days
+of real usage. How much depends on the fleet: with upstream's
+default `--recommendation-margin-fraction` of 0.15, anything using
+under ~28Mi stays at the 32Mi floor and does not move at all, while
+an application measured at 82Mi targets ~94Mi (+62Mi). The 256Mi
+reclaimed above is platform-side and real, but the application side
+may take a bite out of it — a larger one on a fleet of heavier
+applications. Budget for that before upgrading a node that is
+already tight. And note that an upward resize the node cannot
+satisfy is deferred and retried **silently**: nothing reads
+`Deployment.status`, so the application still renders Healthy — the
+same shape as the four-day `Pending` Postgres that started this
+investigation.
+
 **Change class:** `requires-restart`, **correcting the `safe`
 that 0.2.55 shipped**. A cluster-wide mutating admission webhook
 on pod CREATE plus an updater that mutates live pods is not a

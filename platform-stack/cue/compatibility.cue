@@ -1802,6 +1802,23 @@ compatibility: "0.2.56": {
 		little allocatable first (`apprafter platform autoscale set off`, then
 		reclaim any orphaned backend) and the sync proceeds.
 
+		EXPECT APP REQUESTS TO MOVE, AND ONLY UPWARD. This is also the first
+		release on which app-side right-sizing runs with a floor that BINDS, and
+		because the pinned floor (32Mi) equals the seed (32Mi), a fleet that has
+		never been corrected can move in one direction only: up. It lands at once
+		rather than gradually — the floors apply at the recommender's output, so
+		the existing VerticalPodAutoscalerCheckpoint histograms already carry
+		~14 days of real usage. How much depends on the fleet: with upstream's
+		default `--recommendation-margin-fraction` of 0.15, anything using under
+		~28Mi stays at the 32Mi floor and does not move at all, while an app
+		measured at 82Mi targets ~94Mi (+62Mi). So the 256Mi reclaimed above is
+		platform-side and real, but the app side may take a bite out of it — a
+		larger one on a fleet with heavier apps. Budget for it before upgrading a
+		node that is already tight. Note also that an upward resize the node
+		cannot satisfy is deferred and retried SILENTLY: nothing reads
+		`Deployment.status`, so the Application still renders Healthy — the same
+		shape as the four-day Pending Postgres that started this investigation.
+
 		change=requires-restart, CORRECTING the `safe` 0.2.55 shipped: ADR 0054
 		already held that a cluster-wide mutating admission webhook on pod CREATE
 		plus an updater that mutates live pods is not a safe auto-sync, and this is
