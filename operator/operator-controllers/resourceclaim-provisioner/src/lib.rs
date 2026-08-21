@@ -66,6 +66,7 @@ pub mod disk;
 pub mod dragonfly;
 pub mod gc;
 pub mod grace;
+pub mod reaper;
 pub mod reconcile;
 pub mod redis_client;
 pub mod shared_volume;
