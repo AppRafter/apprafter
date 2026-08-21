@@ -19,11 +19,12 @@
 
 ## Unreleased
 
-_Nothing pending. Note that this file has sections for 0.1.0 and
-0.2.56 only — the versions between them were never written up
-here. Their operator-facing notes live in `cue/compatibility.cue`
-(read by `PlatformController`, and the authoritative per-version
-record) and in `docs/changelog/UNRELEASED.md`._
+_Nothing pending. Note that this file has sections for 0.1.0,
+0.2.56 and 0.2.57 only — the versions between them were never
+written up here. Their operator-facing notes live in
+`cue/compatibility.cue` (read by `PlatformController`, and the
+authoritative per-version record) and in
+`docs/changelog/UNRELEASED.md`._
 
 **Build-tooling notes (not part of any chart release):**
 
@@ -42,6 +43,64 @@ record) and in `docs/changelog/UNRELEASED.md`._
   `compatibility: (currentVersion): #VersionRecord` — i.e. the
   current version MUST have a compatibility entry, caught at
   edit time before any CI runs.
+
+## 0.2.57 — shared backends can now shrink (2026-08-21)
+
+Classification **`requires-restart`**. Operator +
+admission-webhook charts v0.2.42 → v0.2.43; the operator image
+carries new code. No CLI and no cue-cmp release.
+
+**What this release does.** A shared backend that the platform
+created lazily is now **deleted once nothing references it**.
+Until now nothing anywhere deleted a `Cluster` or a `Dragonfly`:
+[ADR 0042](../docs/adr/0042-needs-redis-dragonfly.md) §1 promised
+a lazy pool, and lazy-create was built while lazy-*release* was
+not — so an instance that had served a claim and no longer served
+any kept its full Guaranteed reservation for the lifetime of the
+cluster. That is **320Mi** per Dragonfly pool instance and
+**256Mi** per shared CNPG cluster, and it was a material part of
+the Tier-1 node saturation `0.2.56` documents. On the redis e2e
+walk, node allocated memory requests fell **570Mi (2496 →
+1926)** across a reap.
+
+**Your volumes are not deleted, ever.** Before deleting the
+shared CNPG `Cluster`, the operator strips that Cluster's
+`controller` ownerReference off the instance
+`PersistentVolumeClaim`, verifies the strip, and only then
+deletes. Without that step the delete cascades and the database
+is destroyed by the apiserver's garbage collector — measured, not
+inferred (ADR 0042 §9.2). With it, the PVC stays `Bound` and the
+next provision re-adopts the **same PV** by name with its data
+intact; the pg walk asserts exactly that, down to the marker row
+still reading `42`. Preservation is unconditional rather than
+gated on a safety check, because at the moment of the delete a
+truncated LIST lies identically about live claims and retained
+ones — the reaper cannot tell a correct reap from an incorrect
+one, so it protects both the same way.
+
+**Expect `kubectl get pvc` to show volumes with no owning
+cluster.** That is the design, not a leak. Reclaiming the disk
+of a backend you are finished with is a deliberate operator
+action, not something a sweeper does on your behalf.
+
+**Reclaim latency is asymmetric, by design.** A `RetainedClaim`
+snapshot vetoes the reap, so the shared CNPG cluster and a
+*persistent* Dragonfly instance come back only after every
+claim's 7-day retention grace has elapsed. An *ephemeral*
+Dragonfly instance — whose data does not outlive its claim — is
+exempt from that veto and is reclaimed roughly one **dwell**
+after its last application is deleted. The dwell is 10 minutes;
+`APPRAFTER_REAP_DWELL_SECS` on the operator Deployment overrides
+it for testing, and production runs unset.
+
+**Nothing of yours is a candidate.** Every delete requires two
+independent gates: the instance must be named by platform
+configuration **and** carry the
+`apprafter.io/managed-by: apprafter` label the provisioner now
+stamps. A `Cluster` or `Dragonfly` you created yourself in those
+namespaces satisfies neither, and an instance created before the
+stamp existed is simply skipped until the platform's next apply
+stamps it.
 
 ## 0.2.56 — resource governance corrected (2026-08-21)
 

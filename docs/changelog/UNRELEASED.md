@@ -9,6 +9,84 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## platform-stack 0.2.57 — shared backends can now shrink (2026-08-21)
+
+> **Chart + operator release. The `apprafter-operator` and
+> `apprafter-admission-webhook` charts move v0.2.42 → v0.2.43, and the operator
+> image carries real new code this time. No CLI and no cue-cmp release.**
+> Classified `requires-restart`: this is the release where the operator begins
+> deleting stateful backends on its own, and that is a property an operator
+> should acknowledge rather than have auto-synced onto a live cluster.
+>
+> ADR 0042 §1 promised a **lazy** pool — "a solo cluster with no Redis apps
+> runs no Dragonfly pod". Lazy-create was built; lazy-*release* was not. Nothing
+> anywhere deleted a `Cluster` or a `Dragonfly`, so the pool was lazy exactly
+> once, on the way up. An instance that had served a claim and no longer served
+> any kept its full Guaranteed reservation for the lifetime of the cluster — a
+> material part of the Tier-1 node saturation recorded in `0.2.56`, and the one
+> block no amount of request-trimming addresses.
+
+### Added
+
+- **A shared backend is now deleted once nothing references it** (ADR 0042 §9).
+  Two backends, one mechanism: a Dragonfly pool instance (**320Mi** Guaranteed)
+  and the shared CNPG cluster (**256Mi** Guaranteed). Measured on the redis e2e
+  walk: node allocated memory requests fell **570Mi (2496 → 1926)** across a
+  reap. The walk asserts the drop numerically rather than trusting the CR being
+  gone, because a reaper that deletes a CR while its StatefulSet lingers looks
+  identical from the API and returns nothing.
+
+- **Volumes are preserved unconditionally, and re-adopted by name.** The CNPG
+  instance PVC carries a `controller: true` ownerReference, so a plain delete
+  cascades and the database is destroyed by the apiserver's garbage collector
+  — no CNPG-side hook to negotiate with, nothing to switch off (measured,
+  ADR 0042 §9.2). The reaper therefore JSON-patches that one reference away
+  (RFC 6902, with a `test` op so a stale index fails closed rather than
+  removing a foreign entry), verifies the strip by re-LISTing, and only then
+  deletes the `Cluster`. The pg walk asserts the round trip: PVC still `Bound`,
+  no ownerReference to the reaped `Cluster`, the **same PV** re-adopted on
+  re-provision, and the marker row still reading `42`.
+
+  **Preservation is unconditional on purpose.** A truncated LIST lies
+  identically about live claims and retained ones, so at the moment of the
+  delete the reaper cannot distinguish a correct reap from an incorrect one —
+  and a safety net that only catches the cases you already knew about is not a
+  safety net. Operators should expect `kubectl get pvc` to show volumes with no
+  owning cluster; that is the design, not a leak.
+
+- **Reclaim latency is deliberately asymmetric.** The predicate has three
+  vetoes, each sufficient alone: `ALLOCATED` (a live claim names the instance),
+  `INTENT` (an unallocated claim of the matching class could still land on it —
+  this closes the real window between the provisioner's CR apply and its
+  allocation write, not a hypothetical one), and `RETAINED` (a `RetainedClaim`
+  snapshot names it). `RETAINED` does **not** veto an ephemeral Dragonfly
+  instance, whose data does not outlive its claim — so ephemeral capacity comes
+  back roughly one dwell after its last app is deleted, while persistent
+  Dragonfly and CNPG wait for every claim's 7-day grace to elapse first.
+
+- **Two independent gates guard every delete.** A candidate must be named by
+  platform config *and* carry the `apprafter.io/managed-by: apprafter` label the
+  provisioner now stamps on both CRs. Neither a borrowed name nor a borrowed
+  label is enough on its own: `platform-redis-<class>-<index>` is not a reserved
+  namespace of names, so on the name alone a user's own `Dragonfly` in that
+  namespace would be a candidate. An instance created before the stamp existed
+  is simply not a candidate until the provisioner's next apply stamps it — the
+  safe direction, and it self-heals.
+
+- **The sweep is a periodic interval task, not a kube-rs `Controller`,** and
+  that shape is load-bearing twice over. The predicate it drives is a
+  *negative* — "nothing in the cluster references this instance" — and a stale
+  reflector cache reads exactly like emptiness; every other controller in the
+  crate reconciles a positive, where a stale store costs a late reconcile rather
+  than a live database. Separately, the `dragonflydb.io` and `postgresql.cnpg.io`
+  CRDs are cluster-optional, and a watch against an unserved resource retries
+  forever where a LIST simply 404s once per tick. Tick is 60s, dwell is 600s,
+  overridable via `APPRAFTER_REAP_DWELL_SECS` on the operator Deployment (used
+  by the e2e walks so they can assert a terminal outcome instead of racing a
+  ten-minute timer; production runs unset). The dwell clock is in-memory only —
+  a restart forgets it and costs one extra dwell, which fails in the safe
+  direction. It runs under leader election with the operator's other loops.
+
 ## platform-stack 0.2.56 — the floors underneath the floors, and 256Mi back (2026-08-21)
 
 > **Chart release. The `apprafter-operator` and `apprafter-admission-webhook`
