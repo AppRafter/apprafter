@@ -59,6 +59,25 @@ _components: "vpa": #Component & {
 		admissionController: {
 			replicas:        1
 			registerWebhook: false
+			// A PDB with minAvailable:1 against replicas:1 can never be
+			// satisfied — `kubectl drain` blocks forever on a node whose
+			// only copy of the pod is the one being evicted. The chart
+			// ships all three enabled (`*.podDisruptionBudget.enabled`).
+			// `minAvailable: 0` is NOT the alternative: the template gates
+			// on truthiness, so 0 renders a selector-only PDB that permits
+			// everything while reading as misconfigured to the next
+			// operator.
+			//
+			// THIS TRADE-OFF IS ONLY VALID AT ONE REPLICA. If any of the
+			// three components is ever raised above `replicas: 1` — a
+			// multi-node tier overlay is the likely trigger, see
+			// tier_team.cue — re-enable that component's PDB in the same
+			// edit. The admission controller is the sharp case: at two
+			// replicas with no PDB a drain can evict both webhook pods at
+			// once, and the `failurePolicy: Ignore` below means the cluster
+			// then admits VPA objects UNMUTATED with no error — the same
+			// silent-failure class this file's header warns about.
+			podDisruptionBudget: enabled: false
 			certGen: {
 				enabled: true
 				// 2.16d: the one-shot cert-generation Job pod must not be
@@ -88,6 +107,18 @@ _components: "vpa": #Component & {
 			}
 		}
 		recommender: {
+			// The other two components in this file pin `replicas: 1`; this
+			// one did not, and the upstream chart defaults ALL THREE to 2
+			// (`recommender.replicas`). A second recommender on a
+			// single-node cluster is a hot standby with no failure domain to
+			// stand by for — the chart auto-enables leader election above
+			// one replica — so it costs 50m + 64Mi of node allocatable to do
+			// nothing. That is the RESERVATION, which is the scarce thing on
+			// a saturated node; live usage was 19Mi (leader) and 8Mi
+			// (standby), two pods sharing one ReplicaSet hash.
+			replicas: 1
+			// See `admissionController.podDisruptionBudget` for why.
+			podDisruptionBudget: enabled: false
 			extraArgs: [
 				"--memory-aggregation-interval=24h",
 				"--memory-aggregation-interval-count=14",
@@ -121,7 +152,7 @@ _components: "vpa": #Component & {
 				// and this pin silently overrides it — the same failure mode
 				// this change fixes, relocated from 250Mi to 32Mi. The two must
 				// move together (compiled-in default: `default_autoscale_config`
-				// in operator-controllers/application/src/lib.rs; per-cluster
+				// in operator/operator-controllers/application/src/lib.rs; per-cluster
 				// override: PlatformStack.spec.resources.autoscale.minAllowed).
 				//
 				// The CPU floor is pinned at the value it already defaults to.
@@ -147,6 +178,8 @@ _components: "vpa": #Component & {
 		}
 		updater: {
 			replicas: 1
+			// See `admissionController.podDisruptionBudget` for why.
+			podDisruptionBudget: enabled: false
 			extraArgs: [
 				"--in-place-skip-disruption-budget=true",
 				"--feature-gates=InPlace=true",
