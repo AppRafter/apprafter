@@ -51,15 +51,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ListMeta;
-use kube::api::{Api, DeleteParams, DynamicObject, ListParams, Preconditions};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ListMeta, ObjectMeta};
+use kube::api::{Api, DeleteParams, DynamicObject, ListParams, Patch, PatchParams, Preconditions};
 use kube::ResourceExt;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
 use crate::acl_reconcile::redis_namespace_from;
 use crate::dragonfly::{class_of_instance, PoolClass};
-use crate::reconcile::{dragonfly_cluster_ar, Backend};
+use crate::reconcile::{cluster_ar, dragonfly_cluster_ar, pvc_ar, Backend};
 use crate::{Context, ReconcileError};
 use operator_core::{ResourceClaim, RetainedClaim, ServiceProvider};
 
@@ -77,6 +77,46 @@ const PG_TYPE: &str = "pg";
 /// the reaper resolves a provider to exactly the cluster the provisioner
 /// would have created for it.
 const DEFAULT_CNPG_CLUSTER: &str = "platform-postgres";
+
+/// Namespace the shared CNPG `Cluster` lives in when a `cloudnative-pg`
+/// provider's `config./namespace` is absent. Mirrors the literal
+/// `provision_cloudnativepg` falls back to (reconcile.rs) for the same
+/// reason [`DEFAULT_CNPG_CLUSTER`] mirrors its cluster name.
+const DEFAULT_CNPG_NAMESPACE: &str = "cnpg-system";
+
+/// Label key of the ownership stamp every candidate of every arm must
+/// carry (`dragonfly::dragonfly_object` and `cnpg::cluster_object` both
+/// emit it; each module has a test pinning its object's stamp against the
+/// other's).
+const MANAGED_BY_KEY: &str = "apprafter.io/managed-by";
+
+/// Label value of that stamp.
+const MANAGED_BY_VALUE: &str = "apprafter";
+
+/// The stamp as a LIST label selector.
+///
+/// ONE source for both arms on purpose — otherwise one arm's literal could
+/// be retyped and only that arm's candidate set would silently empty.
+/// Built from the same two constants [`is_stamped`] checks, so the
+/// server-side filter and the client-side re-check cannot disagree.
+fn managed_by_selector() -> String {
+    format!("{MANAGED_BY_KEY}={MANAGED_BY_VALUE}")
+}
+
+/// Does this object carry the ownership stamp?
+///
+/// **GATE 2, made structural.** Every arm also passes
+/// [`managed_by_selector`] to its LIST, so in the normal case this is
+/// redundant — deliberately. That selector is ONE argument on ONE call:
+/// drop it, add a field selector beside it, or "optimise" the LIST into a
+/// reflector, and the entire second gate disappears with nothing failing
+/// and no test noticing, because a test can only pin the selector STRING,
+/// never that the arm still filters on it. This re-check is the gate the
+/// arms cannot lose by editing a call argument, and it is what the
+/// `arm_rejects_an_unstamped_candidate` tests actually exercise.
+fn is_stamped(obj: &DynamicObject) -> bool {
+    obj.labels().get(MANAGED_BY_KEY).map(String::as_str) == Some(MANAGED_BY_VALUE)
+}
 
 /// One reap candidate: a shared backend instance that currently exists.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,6 +211,48 @@ pub fn provider_index(providers: &[ServiceProvider]) -> ProviderIndex {
         }
     }
     idx
+}
+
+/// The namespace the shared CNPG `Cluster`s live in, resolved over a
+/// provider list the caller ALREADY holds.
+///
+/// The `redis_namespace_from` pattern (acl_reconcile.rs), for the same
+/// reason: the reaper must not take a second, un-truncation-checked
+/// apiserver snapshot on a path that deletes. It lives here rather than
+/// beside its Dragonfly twin because it pairs with [`provider_index`]'s
+/// `/cluster` resolution directly above — both mirror
+/// `provision_cloudnativepg` (reconcile.rs), and a namespace resolved
+/// differently from the provisioner's is a namespace the reaper finds no
+/// clusters in.
+///
+/// Deliberately ONE namespace for the whole arm, from the FIRST
+/// `cloudnative-pg` provider in apiserver order — exactly what
+/// `redis_namespace_from` does for Dragonfly. A second cnpg provider
+/// pointing at a DIFFERENT namespace therefore has its cluster listed in
+/// the wrong place and simply never becomes a candidate: an under-reap,
+/// the safe direction. It cannot fail the other way, because
+/// `is_allocated_on` / `is_retained_for` match a cluster by NAME with no
+/// namespace — a claim on a same-named cluster in the other namespace
+/// OVER-vetoes this one rather than under-vetoing it.
+///
+/// Backend matching goes through [`Backend::from_spec_backend`] rather
+/// than a literal, so a backend rename cannot leave this silently
+/// resolving to the default.
+///
+/// Pure, so unlike a namespace read off a live LIST it is table-testable.
+fn cnpg_namespace_from(providers: &[ServiceProvider]) -> String {
+    providers
+        .iter()
+        .find(|p| {
+            matches!(
+                Backend::from_spec_backend(&p.spec.backend),
+                Some(Backend::Cloudnativepg)
+            )
+        })
+        .and_then(|p| p.spec.config.as_ref())
+        .and_then(|cfg| cfg.pointer("/namespace").and_then(Value::as_str))
+        .unwrap_or(DEFAULT_CNPG_NAMESPACE)
+        .to_string()
 }
 
 /// Is this claim ALLOCATED on `target`? Deletion-AGNOSTIC: a claim
@@ -517,18 +599,32 @@ async fn sweep(
     // instances could never reach the dwell, with no error, no metric and no
     // log to say so. Returning the set makes forgetting impossible.
     //
-    // The `?` here is PROVISIONAL and must not survive the CNPG arm. It
-    // couples the arms: any non-404 Dragonfly error aborts the pass before a
-    // second arm runs. The realistic trigger is not a transient but a 403
-    // from missing `dragonflydb.io` RBAC — which recurs every tick, so CNPG
-    // would never be reaped at all, permanently, while the metric reported
-    // only `unknown/error` with nothing to say a different backend was the
-    // collateral damage. Invariant 3 requires that an error not be read as
-    // emptiness FOR THE RESOURCE THAT ERRORED; it does not require one
-    // backend's failure to veto another. Task 6 must run both arms and
-    // combine their results (union the `seen` sets, propagate a failure only
-    // after both have run).
-    let seen: BTreeSet<String> = sweep_dragonfly(ctx, &inputs, dwell, empty_since).await?;
+    // The arms are UNCOUPLED, deliberately: neither is `?`-ed until BOTH
+    // have run. A `?` on the first arm would abort the pass before the
+    // second ever executed, and the realistic trigger is not a transient but
+    // a 403 from missing `dragonflydb.io` RBAC — which recurs every tick, so
+    // CNPG would never be reaped at all, permanently, while the metric
+    // reported only `unknown/error` with nothing to say a different backend
+    // was the collateral damage. Invariant 3 requires that an error not be
+    // read as emptiness FOR THE RESOURCE THAT ERRORED; it does not require
+    // one backend's failure to veto another.
+    //
+    // They run SEQUENTIALLY rather than joined: both take `&mut empty_since`,
+    // and they share that map by design (`dwell_key` is backend-qualified
+    // precisely so they can).
+    let dragonfly = sweep_dragonfly(ctx, &inputs, dwell, empty_since).await;
+    let cnpg = sweep_cnpg(ctx, &inputs, dwell, empty_since).await;
+
+    // Union what each arm reported. An arm that ERRORED contributes nothing,
+    // so its clocks are dropped below — correct: an arm that could not read
+    // its instances cannot vouch for any of them, and the cost is one extra
+    // dwell once it recovers. The other arm's clocks are unaffected, which is
+    // the whole point of not `?`-ing above. (`.flatten()` over the two
+    // `Result`s is what yields only the `Ok` sets.)
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for keys in [dragonfly.as_ref(), cnpg.as_ref()].into_iter().flatten() {
+        seen.extend(keys.iter().cloned());
+    }
 
     // An arm that bailed early (CRD not served, or its own LIST truncated)
     // reports an empty set, so this drops its clocks. That is correct for
@@ -537,6 +633,20 @@ async fn sweep(
     // that this loop already accepts on an operator restart. Deliberate, not
     // an oversight; see the note on the top-level truncation check above.
     empty_since.retain(|key, _| seen.contains(key));
+
+    // Only NOW propagate. Dragonfly first so a simultaneous double failure
+    // reports deterministically rather than by whichever the compiler
+    // evaluated first — which means the CNPG error is about to be dropped
+    // unseen, so log it before it goes. A double failure is the case most
+    // worth reading (it usually means the apiserver, not a backend), and it
+    // is the one where the returned error is least representative.
+    if dragonfly.is_err() {
+        if let Err(err) = &cnpg {
+            warn!(%err, "CNPG arm also failed this pass — only the Dragonfly error is returned");
+        }
+    }
+    dragonfly?;
+    cnpg?;
     Ok(())
 }
 
@@ -565,7 +675,7 @@ async fn sweep_dragonfly(
     // would be a candidate. An instance created before the stamp existed is
     // simply not a candidate until the provisioner's next SSA apply stamps
     // it — the safe direction, and it self-heals on the next reconcile.
-    let selector = ListParams::default().labels("apprafter.io/managed-by=apprafter");
+    let selector = ListParams::default().labels(&managed_by_selector());
     let dragonflies = match api.list(&selector).await {
         Ok(list) => list,
         // The dragonflydb.io CRD is cluster-OPTIONAL — absent on kind/e2e
@@ -598,6 +708,12 @@ async fn sweep_dragonfly(
         let Some(class) = class_of_instance(&name) else {
             continue;
         };
+        // GATE 1 again, per object — see [`is_stamped`]. The LIST selector
+        // above already filtered on this server-side; re-checking here is what
+        // keeps the gate from being deleted along with one call argument.
+        if !is_stamped(obj) {
+            continue;
+        }
         // Already being deleted — leave it alone. Without this an instance
         // stuck in graceful deletion cycles forever: Reap → the delete is a
         // no-op → clock cleared → Dwell → the dwell elapses → Reap again,
@@ -657,13 +773,28 @@ async fn sweep_dragonfly(
                     .inc();
             }
             Decision::Reap => {
+                // No uid ⇒ NO PRECONDITION AT ALL. `Preconditions { uid: None,
+                // resource_version: None }` is not a weaker precondition, it is
+                // an unconditional delete: the name-reuse race below would then
+                // kill whatever now holds the name. Refuse the candidate and
+                // leave the clock so the next tick retries. (The apiserver
+                // always sets a uid — this is a "cannot happen" that must still
+                // not fall through to a delete.)
+                let Some(uid) = obj.metadata.uid.clone().filter(|u| !u.is_empty()) else {
+                    warn!(
+                        instance = %name, ?class,
+                        "pool instance has no uid — cannot precondition the delete; not reaping"
+                    );
+                    continue;
+                };
+
                 // Delete under a uid precondition, so a name-reuse race —
                 // the instance we judged was deleted and re-created by a
                 // fresh provision between our LIST and this call — fails
                 // with 409 instead of killing the new instance.
                 let params = DeleteParams {
                     preconditions: Some(Preconditions {
-                        uid: obj.metadata.uid.clone(),
+                        uid: Some(uid.clone()),
                         resource_version: None,
                     }),
                     ..Default::default()
@@ -729,7 +860,7 @@ async fn sweep_dragonfly(
                         info!(
                             instance = %name,
                             ?class,
-                            uid = obj.metadata.uid.as_deref().unwrap_or("<none>"),
+                            %uid,
                             dwell_secs = dwell.as_secs(),
                             empty_secs = empty_for.map(|d| d.as_secs()).unwrap_or_default(),
                             retained = retained_naming,
@@ -764,11 +895,575 @@ async fn sweep_dragonfly(
     Ok(seen)
 }
 
+// ---------------------------------------------------------------------------
+// The CNPG arm — and the §9.3 ownerReference strip it cannot delete without
+// ---------------------------------------------------------------------------
+
+/// Indices into `meta.ownerReferences` of every entry whose `uid` is `uid`,
+/// in DESCENDING order.
+///
+/// **Matching on UID and not on name is the whole point.** A `Cluster` that
+/// was deleted and re-created keeps its name and gets a fresh uid, and CNPG
+/// re-adds the reference pointing at the NEW uid when it re-adopts the
+/// volume (ADR 0042 §9.5). Matching by name would strip the live cluster's
+/// reference off a volume it legitimately owns, turning the reaper into a
+/// generator of orphaned PVCs.
+///
+/// Descending so the caller can emit one `remove` op per index without an
+/// earlier removal shifting the indices of the later ones.
+///
+/// An EMPTY `uid` matches nothing, ever. The caller already refuses to
+/// judge a candidate without a uid, but a helper that would happily select
+/// every reference with an absent uid is not one to leave loaded.
+fn owner_ref_indices(meta: &ObjectMeta, uid: &str) -> Vec<usize> {
+    if uid.is_empty() {
+        return Vec::new();
+    }
+    let Some(refs) = meta.owner_references.as_ref() else {
+        return Vec::new();
+    };
+    refs.iter()
+        .enumerate()
+        .filter(|(_, r)| r.uid == uid)
+        .map(|(i, _)| i)
+        .rev()
+        .collect()
+}
+
+/// RFC 6902 ops that remove exactly the `ownerReferences` entries pointing
+/// at `uid` — and nothing else.
+///
+/// Each `remove` is preceded by a `test` on the uid at that exact index. A
+/// JSON Patch is applied op-by-op and a failed `test` rejects the WHOLE
+/// patch (422), so if the array shifted between the read and this write the
+/// patch fails loudly instead of removing whatever now sits at that index.
+///
+/// That is why this is a JSON Patch and not a merge-patch of the filtered
+/// array: RFC 7396 replaces an array wholesale, so a merge-patch would
+/// silently discard a co-owner added concurrently — the one thing the
+/// "strip only OUR entry" rule exists to prevent.
+fn strip_owner_ops(meta: &ObjectMeta, uid: &str) -> Vec<Value> {
+    owner_ref_indices(meta, uid)
+        .into_iter()
+        .flat_map(|i| {
+            [
+                json!({
+                    "op": "test",
+                    "path": format!("/metadata/ownerReferences/{i}/uid"),
+                    "value": uid,
+                }),
+                json!({
+                    "op": "remove",
+                    "path": format!("/metadata/ownerReferences/{i}"),
+                }),
+            ]
+        })
+        .collect()
+}
+
+/// Outcome of the §9.3 strip for one `Cluster`.
+enum Strip {
+    /// VERIFIED by re-read: no PVC in the namespace still carries an
+    /// ownerReference to this `Cluster`. Carries how many were stripped.
+    Verified(usize),
+    /// NOT verified — the delete must NOT proceed.
+    Unverified(StripFailure),
+}
+
+/// Why a strip did not verify.
+///
+/// The log reason and the metric bucket both hang off this ONE enum rather
+/// than being chosen at each call site, so a new failure mode cannot be
+/// added with a log string but no metric mapping (or worse, silently
+/// inherit a bucket that misdescribes it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StripFailure {
+    /// A PVC still carried the ownerReference on the verifying re-read.
+    /// GENUINE reattachment — something put it back.
+    OwnerReattached,
+    /// The PVC LIST taken before the patches came back truncated, so the
+    /// set of PVCs to strip was not knowable.
+    ListTruncated,
+    /// The verifying re-LIST came back truncated, so the strip could not
+    /// be confirmed.
+    VerifyListTruncated,
+    /// A LIST or PATCH errored outright, so nothing about the PVCs is
+    /// known.
+    ReadFailed,
+}
+
+impl StripFailure {
+    /// The `result` label for `apprafter_shared_backend_reap_total`.
+    ///
+    /// Only GENUINE reattachment gets `veto_owner_reattached`. The other
+    /// three are read failures, and calling them reattachment would make
+    /// the metric assert something about CNPG's behaviour that the reaper
+    /// never observed — precisely backwards in the debugging session where
+    /// the difference matters. They share `veto_unverified`; the `reason`
+    /// log field is what separates them there.
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::OwnerReattached => "veto_owner_reattached",
+            Self::ListTruncated | Self::VerifyListTruncated | Self::ReadFailed => "veto_unverified",
+        }
+    }
+
+    /// The `reason` log field — finer-grained than the metric bucket.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::OwnerReattached => "owner_reference_present",
+            Self::ListTruncated => "pvc_list_truncated",
+            Self::VerifyListTruncated => "pvc_list_truncated_on_verify",
+            Self::ReadFailed => "pvc_read_failed",
+        }
+    }
+}
+
+/// Remove this `Cluster`'s `ownerReference` from every PVC that carries it,
+/// then RE-READ to confirm it is gone.
+///
+/// Returns [`Strip::Verified`] only when a fresh, untruncated LIST shows no
+/// PVC in `ns` owned by `uid`. Anything else is [`Strip::Unverified`] and
+/// the caller must abandon the reap.
+async fn strip_cnpg_pvc_owners(
+    ctx: &Arc<Context>,
+    ns: &str,
+    uid: &str,
+) -> Result<Strip, ReconcileError> {
+    let pvc_api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), ns, &pvc_ar());
+
+    // NO label selector, unlike every other LIST in this file: the PVC is
+    // CNPG's own object and carries no apprafter stamp. The ownerReference
+    // uid IS the filter, and it is a tighter one than any label — it names
+    // this exact `Cluster` instance.
+    //
+    // DO NOT NARROW THIS LIST. Not with a label selector "for efficiency",
+    // not with a field selector, and check the namespace twice. The failure
+    // is silent and total: a narrowed scope returns no PVCs, every one this
+    // `Cluster` owns is left with its ownerReference intact, and the
+    // function reports `Verified(0)` — which the caller reads as "nothing to
+    // preserve, safe to delete" and the volume cascades away. The verifying
+    // re-LIST below cannot catch it either, because it uses the SAME scope
+    // and so agrees, confidently, that no PVC points at this cluster. There
+    // is one PVC per instance on a Tier-1 cluster; the LIST is not the cost
+    // worth optimising.
+    let before = pvc_api.list(&ListParams::default()).await?;
+    // Invariant 2, and here it is not merely a hygiene check: a truncated
+    // PVC LIST would hide a PVC this `Cluster` owns, we would leave that
+    // one's reference intact, and the delete would cascade it away.
+    if list_truncated(&before.metadata) {
+        return Ok(Strip::Unverified(StripFailure::ListTruncated));
+    }
+
+    let mut stripped = 0usize;
+    for pvc in &before.items {
+        let ops = strip_owner_ops(&pvc.metadata, uid);
+        if ops.is_empty() {
+            continue;
+        }
+        let patch: json_patch::Patch = serde_json::from_value(Value::Array(ops))?;
+        pvc_api
+            .patch(
+                &pvc.name_any(),
+                &PatchParams::default(),
+                &Patch::Json::<()>(patch),
+            )
+            .await?;
+        stripped += 1;
+    }
+
+    // RE-READ, and re-LIST rather than re-GET each PVC we touched: this also
+    // catches a PVC that was not in the first LIST at all (created between
+    // the two calls, or hidden by a partial read the truncation check did not
+    // flag). The question that must be answered `false` before deleting is
+    // "does ANY PVC here still point at this Cluster?", not "did my patches
+    // land?".
+    let after = pvc_api.list(&ListParams::default()).await?;
+    if list_truncated(&after.metadata) {
+        return Ok(Strip::Unverified(StripFailure::VerifyListTruncated));
+    }
+    if after
+        .items
+        .iter()
+        .any(|pvc| !owner_ref_indices(&pvc.metadata, uid).is_empty())
+    {
+        return Ok(Strip::Unverified(StripFailure::OwnerReattached));
+    }
+    Ok(Strip::Verified(stripped))
+}
+
+/// The CNPG arm: reap the shared `Cluster` once nothing claims it (ADR 0042
+/// §9.2/§9.3).
+///
+/// Structurally the Dragonfly arm, with one addition that is not cosmetic:
+/// CNPG owns its PVC through a `controller: true` ownerReference, so this
+/// arm must STRIP that reference and VERIFY the strip before it may delete.
+/// See the comment at the strip site.
+async fn sweep_cnpg(
+    ctx: &Arc<Context>,
+    inputs: &SweepInputs,
+    dwell: Duration,
+    empty_since: &mut HashMap<String, Instant>,
+) -> Result<BTreeSet<String>, ReconcileError> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+
+    // GATE 1 of 2, and the PRIMARY safety gate of this arm: a `Cluster` is a
+    // candidate only if its name appears as a VALUE in the provider index,
+    // i.e. some `ServiceProvider` the platform ships config points at it.
+    // NEVER "every Cluster in the namespace" — a user may run their own CNPG
+    // clusters there, and the only one this reaper may touch is the one the
+    // platform's own config named.
+    //
+    // Empty set ⇒ no `cloudnative-pg` provider exists ⇒ this operator cannot
+    // have created a shared cluster ⇒ nothing here is ours. Returning before
+    // the LIST is the same gate, expressed once more where it cannot be
+    // bypassed. NOTE this also means deleting the pg provider while its
+    // cluster still runs makes that cluster permanently un-reapable — the
+    // safe direction, and the same stance `is_intent_for` takes on a
+    // permanently-unschedulable pg claim.
+    let managed: BTreeSet<&str> = inputs
+        .idx
+        .cnpg_cluster
+        .values()
+        .map(String::as_str)
+        .collect();
+    if managed.is_empty() {
+        return Ok(seen);
+    }
+
+    // Resolved from the providers this pass ALREADY listed and truncation-
+    // checked — not a second LIST, which would be a different apiserver
+    // snapshot, unchecked, on a path that deletes.
+    let cnpg_ns = cnpg_namespace_from(&inputs.providers);
+    let api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), &cnpg_ns, &cluster_ar());
+
+    // GATE 2 of 2 — only clusters THIS operator stamped
+    // (`cnpg::cluster_object` sets the label; `cnpg::basic_auth_secret` uses
+    // the same one). Two INDEPENDENT gates is the whole point: neither a
+    // borrowed name nor a borrowed label is enough on its own. A cluster
+    // created before the stamp existed is simply not a candidate until the
+    // provisioner's next SSA apply stamps it — the safe direction, and it
+    // self-heals on the next reconcile of any pg claim.
+    let selector = ListParams::default().labels(&managed_by_selector());
+    let clusters = match api.list(&selector).await {
+        Ok(list) => list,
+        // The postgresql.cnpg.io CRD is cluster-OPTIONAL — absent on kind/e2e
+        // without the component. Nothing to reap is not a failure, and it
+        // must not be logged as one on every tick. Any OTHER error aborts
+        // this arm (invariant 3: an error is never emptiness).
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            debug!(namespace = %cnpg_ns, "postgresql.cnpg.io CRD not served — nothing to reap");
+            return Ok(seen);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    // Invariant 2 again — a truncated cluster list would hide clusters, which
+    // is harmless, but it is also the signal that this apiserver is
+    // paginating our reads, so the veto sets above cannot be trusted either.
+    if list_truncated(&clusters.metadata) {
+        warn!(
+            list = "clusters",
+            "LIST truncated — skipping this reap pass"
+        );
+        return Ok(seen);
+    }
+
+    let now = inputs.now;
+
+    for obj in &clusters.items {
+        let name = obj.name_any();
+        // GATE 1 again, per object — the label alone never selects a target.
+        if !managed.contains(name.as_str()) {
+            continue;
+        }
+        // GATE 2 again, per object — see [`is_stamped`]. The LIST selector
+        // above already filtered on this server-side; re-checking here is what
+        // keeps the gate from being deleted along with one call argument.
+        if !is_stamped(obj) {
+            continue;
+        }
+        // Already being deleted — leave it alone. Without this a cluster
+        // stuck in graceful deletion cycles forever: Reap → the delete is a
+        // no-op → clock cleared → Dwell → the dwell elapses → Reap again,
+        // once per dwell, indefinitely, corrupting the one number anyone will
+        // use to ask whether the reaper did something it should not have.
+        if obj.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+        let target = Target::Cnpg { name: name.clone() };
+        let key = dwell_key(&target);
+        seen.insert(key.clone());
+
+        let empty_for = empty_since.get(&key).map(|t| now.duration_since(*t));
+        match reap_decision(
+            &target,
+            &inputs.live,
+            &inputs.retained,
+            &inputs.idx,
+            empty_for,
+            dwell,
+        ) {
+            Decision::Veto(reason) => {
+                // Something points at it again — drop any clock so a later
+                // emptying starts a FULL dwell rather than resuming a stale
+                // one.
+                empty_since.remove(&key);
+                // `debug!`, NOT `info!`: this fires every tick for every
+                // cluster that has a tenant, i.e. constantly on any healthy
+                // cluster running an app with `needs.pg`.
+                debug!(
+                    cluster = %name, namespace = %cnpg_ns, ?reason,
+                    "shared CNPG cluster still referenced — not reaping"
+                );
+                ctx.metrics
+                    .shared_backend_reap_total
+                    .with_label_values(&[backend_label(&target), veto_label(reason)])
+                    .inc();
+            }
+            Decision::Dwell => {
+                // `info!` ONCE, on the tick the dwell starts.
+                if let Entry::Vacant(slot) = empty_since.entry(key.clone()) {
+                    slot.insert(now);
+                    info!(
+                        cluster = %name, namespace = %cnpg_ns, dwell_secs = dwell.as_secs(),
+                        "shared CNPG cluster has no tenants — starting dwell"
+                    );
+                }
+                ctx.metrics
+                    .shared_backend_reap_total
+                    .with_label_values(&[backend_label(&target), "dwelling"])
+                    .inc();
+            }
+            Decision::Reap => {
+                // No uid ⇒ no uid-matched strip and no delete precondition.
+                // Both are load-bearing here, so this candidate is not
+                // judgeable; leave the clock so the next tick retries. (The
+                // apiserver always sets a uid — this is a "cannot happen"
+                // that must still not fall through to a delete.)
+                let Some(uid) = obj.metadata.uid.clone().filter(|u| !u.is_empty()) else {
+                    warn!(
+                        cluster = %name, namespace = %cnpg_ns,
+                        "CNPG cluster has no uid — cannot strip or precondition; not reaping"
+                    );
+                    continue;
+                };
+
+                // The CNPG instance PVC carries a `controller: true` ownerReference to the
+                // Cluster, so a plain delete CASCADES and destroys the database. Measured on
+                // the shipped chart cloudnative-pg-0.28.2 / app 1.29.1: an unstripped delete
+                // left `No resources found` and a marker row written beforehand was gone.
+                //
+                // Stripping first converts that into a preserved volume: the pod and initdb
+                // Job still cascade (the memory is genuinely reclaimed) while the PVC survives
+                // Bound, and the next provision adopts it by name with the data intact.
+                // CNPG does not re-add the reference — verified at t=30/60/90s and after a
+                // forced reconcile. `--cascade=orphan` was tested and REJECTED: it orphans the
+                // pod too, which stays Running and reclaims nothing.
+                //
+                // Preservation is UNCONDITIONAL (ADR 0042 §9.4). Do not make it depend on the
+                // reap looking "clean": a truncated LIST lies identically about live claims and
+                // retained ones, so the reaper cannot tell a correct reap from an incorrect
+                // one, and a conditional safety net is no safety net.
+                //
+                // This arm NEVER deletes a PersistentVolumeClaim. RBAC grants
+                // persistentvolumeclaims:delete for other arms of this crate and will not stop
+                // the mistake — this comment and code review are the only guard.
+                // NO `?` ON THIS CALL, and it must never grow one. A `?` here
+                // does not merely lose the backend attribution — it returns
+                // `Err` from the whole arm, so the arm contributes NO keys to
+                // `seen`, so `empty_since.retain` in `sweep` wipes EVERY CNPG
+                // dwell clock. The cycle is then: Dwell → clock set → dwell
+                // elapses → Reap → strip errors → clock wiped → Dwell, forever.
+                // The cluster is never reaped, and the only signal is
+                // `unknown/error`. That is precisely the arm-coupling failure
+                // the two arms were uncoupled to prevent, re-created one level
+                // down and confined to a single backend.
+                //
+                // So an I/O failure is folded into the SAME `Unverified` path
+                // as a reattached reference: it is one more way of not being
+                // able to establish preservation, and every one of them means
+                // "do not delete, keep the clock, retry next tick". Realistic
+                // triggers are a 422 from a lost `test` race and 5xx; RBAC does
+                // grant `persistentvolumeclaims: patch`, so 403 is unlikely.
+                let outcome = strip_cnpg_pvc_owners(ctx, &cnpg_ns, &uid)
+                    .await
+                    .unwrap_or_else(|err| {
+                        // Logged HERE because this is the only place the
+                        // underlying kube error still exists — the arm below
+                        // sees a reason code, not a cause.
+                        warn!(
+                            cluster = %name, namespace = %cnpg_ns, %uid, %err,
+                            "CNPG PVC ownerReference strip could not complete"
+                        );
+                        Strip::Unverified(StripFailure::ReadFailed)
+                    });
+
+                let stripped = match outcome {
+                    Strip::Verified(n) => n,
+                    // The strip did not verify. ABORT this candidate: do not
+                    // delete, and leave the dwell clock ALONE so the next tick
+                    // retries rather than restarting the whole dwell.
+                    Strip::Unverified(failure) => {
+                        warn!(
+                            cluster = %name, namespace = %cnpg_ns, %uid,
+                            reason = failure.reason(),
+                            "CNPG PVC ownerReference strip did not verify — NOT reaping \
+                             (deleting now would cascade the volume away)"
+                        );
+                        ctx.metrics
+                            .shared_backend_reap_total
+                            .with_label_values(&[backend_label(&target), failure.metric_label()])
+                            .inc();
+                        continue;
+                    }
+                };
+
+                // FOLLOW-UP (not implemented, deliberately): a post-delete
+                // PVC-survival check.
+                //
+                // The verify above closes the window it can. One window it
+                // cannot close: if a future CNPG version SSA-applies its PVC
+                // with `ownerReferences` in the apply body, SSA RESTORES the
+                // reference — including in the gap between the verify and this
+                // delete. No code-level defence closes that gap, because the
+                // last read before a delete is always stale by the time the
+                // delete lands.
+                //
+                // What would help is a re-LIST AFTER the delete that `warn!`s
+                // if a PVC we stripped now carries a `deletionTimestamp`. It
+                // cannot prevent the loss — by then the GC has it — but it
+                // converts silent destruction into an attributable signal, and
+                // it is the only thing that would tell us §9.3's measured "CNPG
+                // does not re-add it" had stopped holding. Left out for now
+                // because it adds a LIST per reap to a path that runs rarely
+                // and the e2e walk (Task 9) asserts PVC survival directly; the
+                // reasoning is recorded here so the next person finds it rather
+                // than rediscovering it.
+                //
+                // Delete under a uid precondition, so a name-reuse race — the
+                // cluster we judged was deleted and re-created by a fresh
+                // provision between our LIST and this call — fails with 409
+                // instead of killing the new one.
+                let params = DeleteParams {
+                    preconditions: Some(Preconditions {
+                        uid: Some(uid.clone()),
+                        resource_version: None,
+                    }),
+                    ..Default::default()
+                };
+
+                match api.delete(&name, &params).await {
+                    Ok(_) => {
+                        empty_since.remove(&key);
+                        // Structurally 0 — `reap_decision` returns `Reap` only
+                        // after all three vetoes failed to fire. Asserting
+                        // rather than logging: they can only ever catch a
+                        // plumbing regression (an arm passing veto sets that
+                        // are not the ones the decision was made from), which
+                        // an assert expresses precisely and which costs
+                        // nothing in a release build.
+                        //
+                        // Note the third one is an assert here where the
+                        // Dragonfly arm logs a count: `is_retained_for` has no
+                        // §9.7 exception for CNPG, so a snapshot naming this
+                        // cluster ALWAYS vetoes and can never coexist with a
+                        // reap.
+                        debug_assert_eq!(
+                            inputs
+                                .live
+                                .iter()
+                                .filter(|c| is_allocated_on(c, &target, &inputs.idx))
+                                .count(),
+                            0,
+                            "reaped {name} while a live claim was allocated on it"
+                        );
+                        debug_assert_eq!(
+                            inputs
+                                .live
+                                .iter()
+                                .filter(|c| is_intent_for(c, &target, &inputs.idx))
+                                .count(),
+                            0,
+                            "reaped {name} while a claim carried intent toward it"
+                        );
+                        debug_assert_eq!(
+                            inputs
+                                .retained
+                                .iter()
+                                .filter(|r| is_retained_for(r, &target))
+                                .count(),
+                            0,
+                            "reaped {name} while a RetainedClaim snapshot named it"
+                        );
+                        info!(
+                            cluster = %name,
+                            namespace = %cnpg_ns,
+                            %uid,
+                            pvcs_preserved = stripped,
+                            dwell_secs = dwell.as_secs(),
+                            empty_secs = empty_for.map(|d| d.as_secs()).unwrap_or_default(),
+                            "reaped tenantless shared CNPG cluster — its PVCs were preserved"
+                        );
+                        ctx.metrics
+                            .shared_backend_reap_total
+                            .with_label_values(&[backend_label(&target), "reaped"])
+                            .inc();
+                    }
+                    // 409 = the uid precondition failed (name reused under a
+                    // new cluster); 404 = it went away under us. Both mean the
+                    // thing we judged is not the thing that is there now, so
+                    // the reap is abandoned and the clock reset.
+                    //
+                    // Both leave a stripped PVC behind. On 409 that self-heals
+                    // — the new cluster adopts the volume and CNPG re-adds its
+                    // own ownerReference (§9.5). On 404 the volume is simply
+                    // unowned, which is the state §9.3 was aiming for anyway.
+                    Err(kube::Error::Api(e)) if e.code == 409 || e.code == 404 => {
+                        empty_since.remove(&key);
+                        warn!(
+                            cluster = %name, namespace = %cnpg_ns, code = e.code,
+                            "reap abandoned — cluster changed identity under us; re-judged next tick"
+                        );
+                        ctx.metrics
+                            .shared_backend_reap_total
+                            .with_label_values(&[backend_label(&target), "veto_uid_conflict"])
+                            .inc();
+                    }
+                    // A delete that failed AFTER a successful strip. This is
+                    // the one bad state this ordering can leave, and it is
+                    // logged loudly because nothing else will surface it: the
+                    // cluster is LIVE and its PVC is now UNOWNED, so it will
+                    // LEAK rather than cascade if a human deletes the cluster
+                    // later. It does not self-heal on a running cluster —
+                    // CNPG re-adds the reference only when it re-adopts a
+                    // volume for a re-created cluster (§9.5), and the measured
+                    // behaviour is that it never re-adds it to a live one.
+                    // Small and recoverable (re-add the ownerReference, or
+                    // delete the PVC by hand once the data is not wanted), but
+                    // it must be visible.
+                    Err(e) => {
+                        warn!(
+                            cluster = %name, namespace = %cnpg_ns, %uid,
+                            pvcs_stripped = stripped, %e,
+                            "CNPG cluster delete FAILED after its PVC ownerReference was \
+                             stripped — the cluster is LIVE with an UNOWNED PVC, which will \
+                             LEAK instead of cascading if it is deleted by hand later \
+                             (ADR 0042 §9.3)"
+                        );
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+    }
+    Ok(seen)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
     use operator_core::{
         ResourceClaimSpec, ResourceClaimStatus, RetainedClaimSpec, ServiceProviderSpec,
     };
@@ -1393,6 +2088,414 @@ mod tests {
                 DWELL,
             ),
             Decision::Veto(VetoReason::Live)
+        );
+    }
+
+    // --- 23/24: cnpg_namespace_from() ---
+
+    #[test]
+    fn cnpg_namespace_from_reads_the_config_override() {
+        assert_eq!(
+            cnpg_namespace_from(&[provider(
+                "pg-integrated",
+                "pg",
+                "cloudnative-pg",
+                Some(json!({ "cluster": CLUSTER, "namespace": "tenant-cnpg" })),
+            )]),
+            "tenant-cnpg"
+        );
+    }
+
+    #[test]
+    fn cnpg_namespace_from_falls_back_to_the_well_known_default() {
+        // No providers at all, a cnpg provider with no config, one whose
+        // config omits `/namespace`, and a cluster whose only provider is a
+        // backend this controller does not drive all resolve to the default.
+        // The resolution must match `provision_cloudnativepg`'s inline
+        // fallback — a namespace resolved differently is one the reaper finds
+        // no clusters in, so the arm would silently reap nothing.
+        assert_eq!(cnpg_namespace_from(&[]), "cnpg-system");
+        assert_eq!(
+            cnpg_namespace_from(&[provider("pg-integrated", "pg", "cloudnative-pg", None)]),
+            "cnpg-system"
+        );
+        assert_eq!(
+            cnpg_namespace_from(&[provider(
+                "pg-integrated",
+                "pg",
+                "cloudnative-pg",
+                Some(json!({ "cluster": CLUSTER })),
+            )]),
+            "cnpg-system"
+        );
+        assert_eq!(
+            cnpg_namespace_from(&[provider("redis-integrated", "redis", "dragonfly", None)]),
+            "cnpg-system"
+        );
+    }
+
+    #[test]
+    fn cnpg_namespace_from_takes_the_first_cnpg_provider_in_list_order() {
+        // Same first-wins tie-break `provider_index` and `find_provider` use,
+        // over the same apiserver-ordered list.
+        let ns = cnpg_namespace_from(&[
+            provider(
+                "pg-a",
+                "pg",
+                "cloudnative-pg",
+                Some(json!({ "namespace": "first-cnpg" })),
+            ),
+            provider(
+                "pg-b",
+                "pg",
+                "cloudnative-pg",
+                Some(json!({ "namespace": "second-cnpg" })),
+            ),
+        ]);
+        assert_eq!(ns, "first-cnpg");
+    }
+
+    // --- 25..29: the §9.3 ownerReference strip's pure selection ---
+
+    /// The uid of the `Cluster` being reaped in the strip tests.
+    const CLUSTER_UID: &str = "dcd48d90-5e54-4afd-850f-4d0857bd06a3";
+
+    fn owner(uid: &str, name: &str, controller: bool) -> OwnerReference {
+        OwnerReference {
+            api_version: "postgresql.cnpg.io/v1".into(),
+            kind: "Cluster".into(),
+            name: name.into(),
+            uid: uid.into(),
+            controller: Some(controller),
+            block_owner_deletion: None,
+        }
+    }
+
+    fn meta_owned_by(owners: Vec<OwnerReference>) -> ObjectMeta {
+        ObjectMeta {
+            name: Some("platform-postgres-1".into()),
+            namespace: Some("cnpg-system".into()),
+            owner_references: Some(owners),
+            ..Default::default()
+        }
+    }
+
+    /// A PVC document shaped the way the apiserver returns it, so the ops
+    /// under test can actually be APPLIED rather than merely inspected.
+    fn pvc_doc(meta: &ObjectMeta) -> Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": serde_json::to_value(meta).unwrap(),
+        })
+    }
+
+    #[test]
+    fn owner_ref_indices_matches_on_uid_not_name() {
+        // The recreate case, and the reason this selects on uid: a `Cluster`
+        // deleted and re-created keeps its NAME and gets a fresh uid, and CNPG
+        // re-adds the reference under the new one. Matching by name would
+        // strip a live cluster's reference off a volume it owns.
+        let meta = meta_owned_by(vec![owner("a-fresh-uid", "platform-postgres", true)]);
+        assert!(
+            owner_ref_indices(&meta, CLUSTER_UID).is_empty(),
+            "same NAME, different uid must not be selected"
+        );
+        let meta = meta_owned_by(vec![owner(CLUSTER_UID, "renamed-somehow", true)]);
+        assert_eq!(
+            owner_ref_indices(&meta, CLUSTER_UID),
+            vec![0],
+            "the uid is what selects, whatever the entry calls itself"
+        );
+    }
+
+    #[test]
+    fn owner_ref_indices_are_descending_and_ignore_absent_or_empty_uids() {
+        // Descending so one `remove` per index does not shift the next.
+        let meta = meta_owned_by(vec![
+            owner(CLUSTER_UID, "platform-postgres", true),
+            owner("other-uid", "someone-else", false),
+            owner(CLUSTER_UID, "platform-postgres", true),
+        ]);
+        assert_eq!(owner_ref_indices(&meta, CLUSTER_UID), vec![2, 0]);
+        // No ownerReferences at all — a PVC nothing owns (the Dragonfly
+        // shape) must select nothing rather than panic.
+        assert!(owner_ref_indices(&ObjectMeta::default(), CLUSTER_UID).is_empty());
+        // An EMPTY uid must match nothing, ever: the caller refuses to judge
+        // a candidate without a uid, but a helper that selected every
+        // reference with an absent uid is not one to leave loaded.
+        let meta = meta_owned_by(vec![owner("", "no-uid", true)]);
+        assert!(owner_ref_indices(&meta, "").is_empty());
+    }
+
+    #[test]
+    fn strip_owner_ops_is_empty_when_the_pvc_is_not_ours() {
+        // The no-op path the sweep uses to skip a PVC entirely — an empty op
+        // list must never be sent as a patch, and must never be mistaken for
+        // "strip succeeded on a PVC we do not own".
+        let meta = meta_owned_by(vec![owner("other-uid", "someone-else", true)]);
+        assert!(strip_owner_ops(&meta, CLUSTER_UID).is_empty());
+    }
+
+    #[test]
+    fn strip_owner_ops_removes_only_our_entry_when_applied() {
+        // The highest-stakes selection in the file, exercised by APPLYING the
+        // ops rather than eyeballing them: a co-owner must survive, and the
+        // entry pointing at this Cluster must not.
+        let meta = meta_owned_by(vec![
+            owner("other-uid", "someone-else", false),
+            owner(CLUSTER_UID, "platform-postgres", true),
+        ]);
+        let ops = strip_owner_ops(&meta, CLUSTER_UID);
+        // test+remove per matching index — the `test` is what makes the
+        // apiserver reject the whole patch if the array shifted.
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0]["op"], "test");
+        assert_eq!(ops[0]["path"], "/metadata/ownerReferences/1/uid");
+        assert_eq!(ops[0]["value"], CLUSTER_UID);
+        assert_eq!(ops[1]["op"], "remove");
+        assert_eq!(ops[1]["path"], "/metadata/ownerReferences/1");
+
+        let mut doc = pvc_doc(&meta);
+        let patch: json_patch::Patch = serde_json::from_value(Value::Array(ops)).unwrap();
+        json_patch::patch(&mut doc, &patch).expect("the strip must apply cleanly");
+        let left = doc["metadata"]["ownerReferences"].as_array().unwrap();
+        assert_eq!(left.len(), 1, "the co-owner must survive the strip");
+        assert_eq!(left[0]["uid"], "other-uid");
+        // And the object is now unowned BY US, which is what the sweep
+        // re-reads to verify before it may delete.
+        let after: ObjectMeta = serde_json::from_value(doc["metadata"].clone()).unwrap();
+        assert!(owner_ref_indices(&after, CLUSTER_UID).is_empty());
+    }
+
+    #[test]
+    fn strip_owner_ops_removes_every_matching_entry_without_shifting() {
+        // Two entries pointing at the same Cluster (pathological, but the
+        // descending order is what makes it correct rather than lucky): both
+        // go, the one between them stays.
+        let meta = meta_owned_by(vec![
+            owner(CLUSTER_UID, "platform-postgres", true),
+            owner("other-uid", "someone-else", false),
+            owner(CLUSTER_UID, "platform-postgres", false),
+        ]);
+        let ops = strip_owner_ops(&meta, CLUSTER_UID);
+        let mut doc = pvc_doc(&meta);
+        let patch: json_patch::Patch = serde_json::from_value(Value::Array(ops)).unwrap();
+        json_patch::patch(&mut doc, &patch).expect("descending removals must not shift");
+        let left = doc["metadata"]["ownerReferences"].as_array().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0]["uid"], "other-uid");
+    }
+
+    #[test]
+    fn strip_owner_ops_fail_closed_when_the_array_shifted_under_them() {
+        // The reason for the `test` op. Ops computed against a two-entry
+        // array, applied to a document where the other owner has since been
+        // removed and ours has slid to index 0: the patch must be REJECTED
+        // whole, not remove whatever now sits at index 1. This is the
+        // apiserver's behaviour on a 422, reproduced here on the same ops.
+        let read = meta_owned_by(vec![
+            owner("other-uid", "someone-else", false),
+            owner(CLUSTER_UID, "platform-postgres", true),
+        ]);
+        let ops = strip_owner_ops(&read, CLUSTER_UID);
+        let shifted = meta_owned_by(vec![owner(CLUSTER_UID, "platform-postgres", true)]);
+        let mut doc = pvc_doc(&shifted);
+        let patch: json_patch::Patch = serde_json::from_value(Value::Array(ops)).unwrap();
+        assert!(
+            json_patch::patch(&mut doc, &patch).is_err(),
+            "a shifted ownerReferences array must fail the test op, not be blindly edited"
+        );
+    }
+
+    // --- 30: the ApiResources the arms delete through ---
+
+    #[test]
+    fn the_arms_address_the_plurals_the_apiserver_serves() {
+        // A wrong plural 404s forever, and each arm's own "CRD not served"
+        // branch swallows a 404 as `Ok` — so the reaper would report nothing
+        // to reap, on every tick, silently, for the entire life of the
+        // cluster. `ApiResource::from_gvk` INFERS the plural from the kind
+        // (kube-core `to_plural`), so it is inference that is pinned here,
+        // not a string this file wrote.
+        assert_eq!(cluster_ar().plural, "clusters");
+        assert_eq!(cluster_ar().group, "postgresql.cnpg.io");
+        assert_eq!(cluster_ar().version, "v1");
+        assert_eq!(pvc_ar().plural, "persistentvolumeclaims");
+        assert_eq!(dragonfly_cluster_ar().plural, "dragonflies");
+    }
+
+    // --- 31: the selector both arms share ---
+
+    #[test]
+    fn the_managed_by_selector_matches_the_stamp_both_arms_emit() {
+        // One selector covers both arms. The per-module tests pin each
+        // object's stamp against the other's; this pins the SELECTOR against
+        // the objects, so a stamp change that kept both objects in agreement
+        // could still not silently empty both candidate sets at once.
+        let dragonfly = crate::dragonfly::dragonfly_object(
+            EPHEMERAL_000,
+            "dragonfly-system",
+            1024,
+            1,
+            1,
+            false,
+            &crate::cnpg::BackendResources::dragonfly_t1(),
+        );
+        let cluster = crate::cnpg::cluster_object(
+            CLUSTER,
+            "cnpg-system",
+            1,
+            "10Gi",
+            &crate::cnpg::BackendResources::cnpg_t1(),
+        );
+        for obj in [&dragonfly, &cluster] {
+            let value = obj["metadata"]["labels"][MANAGED_BY_KEY]
+                .as_str()
+                .expect("both arms' objects must carry the stamp");
+            assert_eq!(
+                managed_by_selector(),
+                format!("{MANAGED_BY_KEY}={value}"),
+                "the LIST selector must match the label actually emitted"
+            );
+        }
+    }
+
+    // --- 32/33: GATE 2 is structural, not just a LIST argument ---
+
+    /// A candidate object as the apiserver would return it, with whatever
+    /// labels the caller wants — including none.
+    fn stamped_object(labels: &[(&str, &str)]) -> DynamicObject {
+        let mut obj = DynamicObject::new("platform-postgres", &cluster_ar());
+        obj.metadata.labels = Some(
+            labels
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        );
+        obj
+    }
+
+    #[test]
+    fn is_stamped_accepts_only_the_exact_key_and_value() {
+        assert!(is_stamped(&stamped_object(&[(
+            MANAGED_BY_KEY,
+            MANAGED_BY_VALUE
+        )])));
+        // Extra labels are fine — the stamp is a marker, not the whole map.
+        assert!(is_stamped(&stamped_object(&[
+            ("app.kubernetes.io/name", "postgres"),
+            (MANAGED_BY_KEY, MANAGED_BY_VALUE),
+        ])));
+        // A DIFFERENT value on the right key is not our object. This is the
+        // realistic near-miss: another controller stamping its own name.
+        assert!(!is_stamped(&stamped_object(&[(
+            MANAGED_BY_KEY,
+            "somebody-else"
+        )])));
+        // The right value on a different key is not it either.
+        assert!(!is_stamped(&stamped_object(&[(
+            "managed-by",
+            MANAGED_BY_VALUE
+        )])));
+        // No labels at all — a user's own Cluster, or one created before the
+        // stamp existed.
+        assert!(!is_stamped(&stamped_object(&[])));
+        let mut bare = DynamicObject::new("platform-postgres", &cluster_ar());
+        bare.metadata.labels = None;
+        assert!(!is_stamped(&bare));
+    }
+
+    #[test]
+    fn the_client_side_gate_survives_a_selectorless_list() {
+        // The point of the re-check, stated as a test: an object that a
+        // selectorless LIST would return — because someone dropped the
+        // selector argument, added a field selector beside it, or swapped in
+        // a reflector — is still rejected. A test that only pinned the
+        // selector STRING would pass in all of those cases.
+        let unstamped = stamped_object(&[]);
+        assert!(
+            !is_stamped(&unstamped),
+            "an unstamped object must be rejected by the arm itself, not only by the apiserver"
+        );
+        // And it is rejected DESPITE passing gate 1: the name is exactly the
+        // one the platform's own ServiceProvider config points at.
+        let idx = seeded_index();
+        assert!(
+            idx.cnpg_cluster.values().any(|c| c == "platform-postgres"),
+            "fixture must actually pass gate 1 for this to mean anything"
+        );
+    }
+
+    // --- 34: the strip-failure → metric/log mapping (FIX 3) ---
+
+    #[test]
+    fn strip_failure_maps_read_failures_away_from_reattachment() {
+        // Only a GENUINE reattachment may claim `veto_owner_reattached` — it
+        // is the signal that §9.3's measured "CNPG does not re-add the
+        // reference" has stopped holding, and a read failure counted into it
+        // would be an assertion about CNPG the reaper never observed.
+        assert_eq!(
+            StripFailure::OwnerReattached.metric_label(),
+            "veto_owner_reattached"
+        );
+        for failure in [
+            StripFailure::ListTruncated,
+            StripFailure::VerifyListTruncated,
+            StripFailure::ReadFailed,
+        ] {
+            assert_eq!(
+                failure.metric_label(),
+                "veto_unverified",
+                "{failure:?} is a read failure, not a reattachment"
+            );
+        }
+        // The log reason stays finer than the metric bucket — that is what
+        // separates the three inside `veto_unverified`.
+        let reasons = [
+            StripFailure::OwnerReattached.reason(),
+            StripFailure::ListTruncated.reason(),
+            StripFailure::VerifyListTruncated.reason(),
+            StripFailure::ReadFailed.reason(),
+        ];
+        let distinct: BTreeSet<&str> = reasons.into_iter().collect();
+        assert_eq!(
+            distinct.len(),
+            reasons.len(),
+            "every failure mode needs its own log reason"
+        );
+        // Both buckets must actually render as distinct series under the
+        // `cnpg` backend. Asserting on the ENCODED exposition rather than on
+        // `with_label_values` returning something: the CounterVec accepts any
+        // string, so "it did not panic" would be a test that cannot fail.
+        let m = operator_core::metrics::Metrics::new();
+        for failure in [
+            StripFailure::OwnerReattached,
+            StripFailure::ListTruncated,
+            StripFailure::VerifyListTruncated,
+            StripFailure::ReadFailed,
+        ] {
+            m.shared_backend_reap_total
+                .with_label_values(&["cnpg", failure.metric_label()])
+                .inc();
+        }
+        let body = String::from_utf8(m.encode()).unwrap();
+        for label in ["veto_owner_reattached", "veto_unverified"] {
+            assert!(
+                body.contains(&format!(r#"backend="cnpg",result="{label}""#)),
+                "{label} must render as a series under the cnpg backend:\n{body}"
+            );
+        }
+        // The three read failures shared one bucket, so it counted 3 while
+        // reattachment counted 1 — which is what "separate buckets" means
+        // operationally.
+        assert!(
+            body.contains(r#"backend="cnpg",result="veto_unverified"} 3"#),
+            "the three read failures must aggregate into one bucket:\n{body}"
+        );
+        assert!(
+            body.contains(r#"backend="cnpg",result="veto_owner_reattached"} 1"#),
+            "reattachment must not absorb the read failures:\n{body}"
         );
     }
 }

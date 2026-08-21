@@ -35,7 +35,14 @@ serde_json         = "1"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror          = "1"
-kube               = { version = "0.95", default-features = false, features = ["client", "runtime", "derive", "rustls-tls"] }
+# `jsonpatch` exposes `Patch::Json` (RFC 6902). The shared-backend reaper
+# needs it to remove ONE `ownerReferences` entry from a CNPG PVC under a
+# `test` precondition (ADR 0042 §9.3) — a merge-patch would replace the
+# whole array and silently discard a concurrent co-owner. The feature adds
+# no compilation: `json-patch` is already an unconditional dependency of
+# kube-runtime, so this only makes the enum variant visible.
+kube               = { version = "0.95", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "jsonpatch"] }
+json-patch         = "2"
 k8s-openapi        = { version = "0.23", default-features = false, features = ["v1_31"] }
 schemars           = "0.8"
 futures            = "0.3"

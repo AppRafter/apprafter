@@ -29,11 +29,22 @@
 //!     {dragonfly-ephemeral, dragonfly-persistent, cnpg, unknown};
 //!     `result` ∈ {reaped, dwelling, veto_live, veto_intent,
 //!     veto_retained, veto_uid_conflict, veto_owner_reattached,
-//!     error}. The full label domain is declared here even though the
-//!     Dragonfly and CNPG arms each emit only part of it — the
-//!     `veto_owner_reattached` result is CNPG-only (its PVC
-//!     ownerReference strip, §9.3) and `unknown`/`error` mark a sweep
-//!     that failed before it could attribute a backend.
+//!     veto_unverified, error}. The full label domain is declared here
+//!     even though the Dragonfly and CNPG arms each emit only part of
+//!     it — `veto_owner_reattached` and `veto_unverified` are CNPG-only
+//!     (its PVC ownerReference strip, §9.3) and `unknown`/`error` mark
+//!     a sweep that failed before it could attribute a backend.
+//!     The two strip results are DELIBERATELY separate and must not be
+//!     merged back: `veto_owner_reattached` means the reference was
+//!     observed BACK on the PVC after the strip — a real claim about
+//!     CNPG's behaviour, and the signal that §9.3's measured "CNPG does
+//!     not re-add it" has stopped holding on some chart version.
+//!     `veto_unverified` means the reaper could not READ well enough to
+//!     say either way (a truncated LIST, or a LIST/PATCH that errored).
+//!     Both block the delete identically, but only the first is
+//!     evidence about the database operator; counting a read failure as
+//!     a reattachment would make the metric lie in exactly the
+//!     debugging session where the difference matters.
 //!     NOTE the results have MIXED semantics: `reaped` and
 //!     `veto_uid_conflict` count EVENTS, while `dwelling` and every
 //!     `veto_*` are per-tick SAMPLES — the sweep increments one per
