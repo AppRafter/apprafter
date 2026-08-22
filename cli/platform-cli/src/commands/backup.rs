@@ -72,6 +72,7 @@ use cli_providers::backup::ResourceRef;
 use cli_providers::k8s::kubectl::KubectlCli;
 use cli_providers::k8s::sealing::{build_sealed_secret, fetch_controller_public_key};
 use serde_json::Value;
+use tempfile::NamedTempFile;
 
 use crate::commands::k8s_helpers::{
     ensure_kubeconfig_tempfile, kubectl_get_json, kubectl_get_json_cluster_wide,
@@ -1461,24 +1462,168 @@ impl ResticRunner for CredentialedRestic {
     }
 }
 
-/// Resolve the target restic repo for an operator maintenance verb.
+// ---------------------------------------------------------------------------
+// 2b-bis. Offline operation of the operator maintenance verbs
+//
+// `check`, `prune` and `unlock` run OUTSIDE the cluster with the operator's own
+// S3 credentials — the whole point is that they work on the REPOSITORY, not on
+// the cluster. Up through v0.2.48 all three reached for the cached kubeconfig
+// as their first statement, which made them unusable in the one situation they
+// matter most: `apprafter destroy` clears `state.hetzner_cloud`, so verifying an
+// off-site backup BEFORE restoring from it failed with "state has no
+// hetzner_cloud section; run `apprafter apply` first".
+//
+// The kubeconfig is only ever needed to read inputs off the PlatformStack CR.
+// [`cluster_need`] states — once — exactly which inputs are still unresolved,
+// and therefore whether the cluster must be reached at all.
+// ---------------------------------------------------------------------------
+
+/// The retention inputs a maintenance verb carries, for the purpose of deciding
+/// whether it must reach the cluster.
 ///
-/// * `Some(repo)` — use the explicit `--repo` override verbatim.
-/// * `None` — read `PlatformStack/default.spec.backup.bucket`; error when
-///   backup is unconfigured (no `spec.backup.bucket`), directing the operator
-///   to pass `--repo` or run `apprafter backup enable`.
-fn resolve_backup_repo(repo_override: Option<&str>, kubeconfig: &Path) -> Result<String> {
+/// `check` and `unlock` have no retention inputs at all
+/// ([`RetentionArgs::NotApplicable`]); `prune` carries the three `--keep-*`
+/// overrides, any of which, when absent, must be read from
+/// `spec.backup.retention`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetentionArgs {
+    /// The verb has no retention inputs (`check`, `unlock`).
+    NotApplicable,
+    /// `backup prune`'s `--keep-daily` / `--keep-weekly` / `--keep-monthly`.
+    Prune {
+        keep_daily: Option<u32>,
+        keep_weekly: Option<u32>,
+        keep_monthly: Option<u32>,
+    },
+}
+
+impl RetentionArgs {
+    /// The `--keep-*` flags this invocation did NOT supply, in flag spelling.
+    /// Empty for [`RetentionArgs::NotApplicable`] (no retention inputs exist)
+    /// and for a fully-specified prune.
+    fn missing_flags(self) -> Vec<&'static str> {
+        match self {
+            RetentionArgs::NotApplicable => Vec::new(),
+            RetentionArgs::Prune {
+                keep_daily,
+                keep_weekly,
+                keep_monthly,
+            } => [
+                ("--keep-daily", keep_daily),
+                ("--keep-weekly", keep_weekly),
+                ("--keep-monthly", keep_monthly),
+            ]
+            .into_iter()
+            .filter(|(_, v)| v.is_none())
+            .map(|(flag, _)| flag)
+            .collect(),
+        }
+    }
+}
+
+/// What this invocation still has to read from the PlatformStack CR — and
+/// therefore why it needs a reachable cluster. Empty `reasons` ⇒ the verb runs
+/// entirely off the cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct ClusterNeed {
+    /// Human phrases naming the unresolved inputs.
+    reasons: Vec<&'static str>,
+    /// The flags that would resolve them locally, in `--flag <value>` form.
+    flags: Vec<String>,
+}
+
+impl ClusterNeed {
+    fn is_needed(&self) -> bool {
+        !self.reasons.is_empty()
+    }
+
+    /// Operator-facing explanation for the moment the cluster is genuinely
+    /// needed but unreachable. Names the unresolved inputs AND the exact flags
+    /// that would remove the need — for someone doing disaster recovery, whose
+    /// cluster is *supposed* to be gone, "run `apprafter apply` first" is not
+    /// an answer.
+    fn hint(&self, verb: &str) -> String {
+        if !self.is_needed() {
+            return format!("`apprafter backup {verb}` does not need a cluster.");
+        }
+        format!(
+            "`apprafter backup {verb}` reads {} from the PlatformStack CR, so it needs a \
+             reachable cluster. If the cluster no longer exists (disaster recovery — verifying \
+             an off-site repo before restoring into a new cluster), pass {} and the command runs \
+             entirely off the cluster.",
+            self.reasons.join(" and "),
+            self.flags.join(" ")
+        )
+    }
+}
+
+/// State the rule ONCE: which inputs of a maintenance verb cannot be resolved
+/// from the command line alone. Pure — table-tested without a cluster.
+pub(crate) fn cluster_need(repo_override: Option<&str>, retention: RetentionArgs) -> ClusterNeed {
+    let mut need = ClusterNeed::default();
+    if repo_override.is_none() {
+        need.reasons.push("the repository URL (spec.backup.bucket)");
+        need.flags.push("--repo <restic-repo>".to_string());
+    }
+    let missing = retention.missing_flags();
+    if !missing.is_empty() {
+        need.reasons
+            .push("the retention policy (spec.backup.retention)");
+        need.flags
+            .extend(missing.into_iter().map(|f| format!("{f} <n>")));
+    }
+    need
+}
+
+/// Does this invocation of `backup check` / `prune` / `unlock` need to reach the
+/// cluster?
+///
+/// `--repo` removes the repo lookup; for prune, explicit retention removes the
+/// other reason. Anything still unresolved must come from the PlatformStack CR.
+pub(crate) fn backup_verb_needs_cluster(
+    repo_override: Option<&str>,
+    retention: RetentionArgs,
+) -> bool {
+    cluster_need(repo_override, retention).is_needed()
+}
+
+/// Acquire the kubeconfig ONLY on the paths that genuinely need it.
+///
+/// Returns `Ok(None)` when every CR-backed input was supplied on the command
+/// line — the verb then never touches state, kubectl or the cluster. When the
+/// cluster IS needed and cannot be resolved, the underlying error is annotated
+/// with [`ClusterNeed::hint`] so the operator learns which flags would let the
+/// command run offline.
+fn kubeconfig_if_cluster_needed(
+    verb: &str,
+    repo_override: Option<&str>,
+    retention: RetentionArgs,
+) -> Result<Option<NamedTempFile>> {
+    if !backup_verb_needs_cluster(repo_override, retention) {
+        return Ok(None);
+    }
+    match ensure_kubeconfig_tempfile() {
+        Ok(kc) => Ok(Some(kc)),
+        Err(e) => Err(CliError::Other(format!(
+            "{e}\n{}",
+            cluster_need(repo_override, retention).hint(verb)
+        ))),
+    }
+}
+
+/// Pick the restic repo from the `--repo` override, else the CR's
+/// `spec.backup.bucket`. Pure — the impure caller supplies `spec_backup`
+/// (`None` when there was no cluster to read it from, which is indistinguishable
+/// from "backup was never configured" as far as this decision goes).
+fn repo_from_spec_backup(
+    repo_override: Option<&str>,
+    spec_backup: Option<&Value>,
+) -> Result<String> {
     if let Some(r) = repo_override {
         return Ok(r.to_string());
     }
-    let ps = kubectl_get_json(
-        "platformstack",
-        Some(PLATFORMSTACK_NAME),
-        Some(PLATFORMSTACK_NAMESPACE),
-        kubeconfig,
-    )?;
-    ps.as_ref()
-        .and_then(|p| p.pointer("/spec/backup/bucket"))
+    spec_backup
+        .and_then(|s| s.pointer("/bucket"))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
@@ -1487,6 +1632,30 @@ fn resolve_backup_repo(repo_override: Option<&str>, kubeconfig: &Path) -> Result
                 "backup not configured — pass --repo or run `apprafter backup enable`".into(),
             )
         })
+}
+
+/// Resolve the target restic repo for an operator maintenance verb.
+///
+/// * `Some(repo)` — use the explicit `--repo` override verbatim; the cluster is
+///   never touched (`kubeconfig` may be `None`).
+/// * `None` — read `PlatformStack/default.spec.backup.bucket`; error when
+///   backup is unconfigured (no `spec.backup.bucket`) or there was no cluster
+///   to read, directing the operator to pass `--repo` or run
+///   `apprafter backup enable`.
+fn resolve_backup_repo(repo_override: Option<&str>, kubeconfig: Option<&Path>) -> Result<String> {
+    if repo_override.is_some() {
+        return repo_from_spec_backup(repo_override, None);
+    }
+    let ps = match kubeconfig {
+        Some(kc) => kubectl_get_json(
+            "platformstack",
+            Some(PLATFORMSTACK_NAME),
+            Some(PLATFORMSTACK_NAMESPACE),
+            kc,
+        )?,
+        None => None,
+    };
+    repo_from_spec_backup(None, ps.as_ref().and_then(|p| p.pointer("/spec/backup")))
 }
 
 /// Compute the retention policy for a prune from the CR's `spec.backup` plus CLI
@@ -1531,6 +1700,16 @@ fn retention_from_spec_backup(
 /// chunk-1 [`run_prune`]. On success it stamps the PlatformStack
 /// `apprafter.io/last-prune` annotation with the current RFC3339 time so
 /// `apprafter backup status` can surface when the repo was last pruned.
+///
+/// ## Cluster access is LAZY (v0.2.49)
+///
+/// The CR is read for TWO things — the repo fallback and the retention defaults
+/// — so prune needs a cluster unless `--repo` AND all three `--keep-*` flags
+/// are supplied ([`backup_verb_needs_cluster`]). In that fully-specified case
+/// the prune runs entirely off the cluster and the `last-prune` stamp (a
+/// cluster-side audit annotation) is skipped with a printed note: there is no
+/// CR to stamp, and a prune that already succeeded must not be reported as a
+/// failure.
 pub fn run_backup_prune(
     repo_override: Option<&str>,
     credential_file: Option<&Path>,
@@ -1538,77 +1717,89 @@ pub fn run_backup_prune(
     keep_weekly: Option<u32>,
     keep_monthly: Option<u32>,
 ) -> Result<()> {
-    let kc = ensure_kubeconfig_tempfile()?;
+    let retention = RetentionArgs::Prune {
+        keep_daily,
+        keep_weekly,
+        keep_monthly,
+    };
+    let kc = kubeconfig_if_cluster_needed("prune", repo_override, retention)?;
     let creds = resolve_operator_s3_creds(credential_file, &|k| std::env::var(k).ok())?;
     let pass = creds["RESTIC_PASSWORD"].clone();
 
-    // Fetch the CR once: repo fallback (spec.backup.bucket) + retention defaults
-    // (spec.backup.retention) both read from it.
-    let ps = kubectl_get_json(
-        "platformstack",
-        Some(PLATFORMSTACK_NAME),
-        Some(PLATFORMSTACK_NAMESPACE),
-        kc.path(),
-    )?;
+    // Fetch the CR once (when we have a cluster at all): repo fallback
+    // (spec.backup.bucket) + retention defaults (spec.backup.retention) both
+    // read from it.
+    let ps = match &kc {
+        Some(kc) => kubectl_get_json(
+            "platformstack",
+            Some(PLATFORMSTACK_NAME),
+            Some(PLATFORMSTACK_NAMESPACE),
+            kc.path(),
+        )?,
+        None => None,
+    };
     let spec_backup = ps.as_ref().and_then(|p| p.pointer("/spec/backup"));
 
-    let repo = match repo_override {
-        Some(r) => r.to_string(),
-        None => spec_backup
-            .and_then(|s| s.pointer("/bucket"))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| {
-                CliError::Other(
-                    "backup not configured — pass --repo or run `apprafter backup enable`".into(),
-                )
-            })?,
-    };
-
+    let repo = repo_from_spec_backup(repo_override, spec_backup)?;
     let policy = retention_from_spec_backup(spec_backup, keep_daily, keep_weekly, keep_monthly);
 
     let runner = CredentialedRestic { creds };
     run_prune(&runner, &repo, &pass, &policy)?;
-
-    // Stamp last-prune so `backup status` can report it. Best-effort ordering:
-    // the prune already succeeded, so a merge-patch failure here surfaces as an
-    // error (the annotation is the audit trail — we don't want to swallow it).
-    let ts = chrono::Utc::now().to_rfc3339();
-    let body = serde_json::json!({
-        "metadata": { "annotations": { "apprafter.io/last-prune": ts } }
-    })
-    .to_string();
-    kubectl_merge_patch(
-        "platformstack",
-        PLATFORMSTACK_NAME,
-        Some(PLATFORMSTACK_NAMESPACE),
-        None,
-        &body,
-        kc.path(),
-    )?;
 
     println!("✓ Pruned {repo}");
     println!(
         "  retention: keepDaily={} keepWeekly={} keepMonthly={}",
         policy.keep_daily, policy.keep_weekly, policy.keep_monthly
     );
-    println!("  last-prune stamped: {ts}");
+
+    // Stamp last-prune so `backup status` can report it. Best-effort ordering:
+    // the prune already succeeded, so a merge-patch failure here surfaces as an
+    // error (the annotation is the audit trail — we don't want to swallow it).
+    // With no cluster there is nothing to stamp; say so rather than failing.
+    match &kc {
+        Some(kc) => {
+            let ts = chrono::Utc::now().to_rfc3339();
+            let body = serde_json::json!({
+                "metadata": { "annotations": { "apprafter.io/last-prune": ts } }
+            })
+            .to_string();
+            kubectl_merge_patch(
+                "platformstack",
+                PLATFORMSTACK_NAME,
+                Some(PLATFORMSTACK_NAMESPACE),
+                None,
+                &body,
+                kc.path(),
+            )?;
+            println!("  last-prune stamped: {ts}");
+        }
+        None => {
+            println!(
+                "  last-prune NOT stamped — ran without a cluster (repo and retention were \
+                 fully specified on the command line)"
+            );
+        }
+    }
     Ok(())
 }
 
 /// `apprafter backup check` — verify an off-site restic repo's integrity
 /// (`restic check`, opt-in `--read-data` for a deep, full-download verify), run
 /// OUTSIDE the cluster with the operator's full S3 creds.
+///
+/// The cluster is reached ONLY to resolve the repo URL from
+/// `spec.backup.bucket`; with `--repo` the command needs no cluster at all —
+/// which is the point, since verifying a repo before restoring from it happens
+/// when the cluster is gone.
 pub fn run_backup_check(
     repo_override: Option<&str>,
     credential_file: Option<&Path>,
     read_data: bool,
 ) -> Result<()> {
-    let kc = ensure_kubeconfig_tempfile()?;
+    let kc = kubeconfig_if_cluster_needed("check", repo_override, RetentionArgs::NotApplicable)?;
     let creds = resolve_operator_s3_creds(credential_file, &|k| std::env::var(k).ok())?;
     let pass = creds["RESTIC_PASSWORD"].clone();
-    let repo = resolve_backup_repo(repo_override, kc.path())?;
+    let repo = resolve_backup_repo(repo_override, kc.as_ref().map(|f| f.path()))?;
 
     let runner = CredentialedRestic { creds };
     runner.run(&restic_check_argv(&repo, read_data), &pass)?;
@@ -1624,14 +1815,17 @@ pub fn run_backup_check(
 /// `apprafter backup unlock` — remove STALE locks from an off-site restic repo
 /// (`restic unlock`; never touches live locks held by a concurrent run), run
 /// OUTSIDE the cluster with the operator's full S3 creds.
+///
+/// Like [`run_backup_check`], the cluster is reached ONLY to resolve the repo
+/// URL from `spec.backup.bucket`; with `--repo` no cluster is required.
 pub fn run_backup_unlock(
     repo_override: Option<&str>,
     credential_file: Option<&Path>,
 ) -> Result<()> {
-    let kc = ensure_kubeconfig_tempfile()?;
+    let kc = kubeconfig_if_cluster_needed("unlock", repo_override, RetentionArgs::NotApplicable)?;
     let creds = resolve_operator_s3_creds(credential_file, &|k| std::env::var(k).ok())?;
     let pass = creds["RESTIC_PASSWORD"].clone();
-    let repo = resolve_backup_repo(repo_override, kc.path())?;
+    let repo = resolve_backup_repo(repo_override, kc.as_ref().map(|f| f.path()))?;
 
     let runner = CredentialedRestic { creds };
     runner.run(&restic_unlock_argv(&repo), &pass)?;
@@ -3080,6 +3274,182 @@ mod tests {
         // Most-recent (new) should appear in the "Last backup Job" line.
         assert!(s.contains("apprafter-backup-28900000"));
         assert!(s.contains("Succeeded"));
+    }
+
+    // ------------------------------------------------------------------
+    // 2d. backup_verb_needs_cluster — when may check/prune/unlock run with
+    //     no cluster at all (the DR case: the cluster is gone by design)
+    // ------------------------------------------------------------------
+
+    /// `--keep-*` triple, for terse table rows below.
+    fn prune_keeps(d: Option<u32>, w: Option<u32>, m: Option<u32>) -> RetentionArgs {
+        RetentionArgs::Prune {
+            keep_daily: d,
+            keep_weekly: w,
+            keep_monthly: m,
+        }
+    }
+
+    #[test]
+    fn needs_cluster_table_check_and_unlock() {
+        // check / unlock carry no retention inputs: `--repo` is the ONLY
+        // reason they'd have to reach the cluster.
+        let table = [
+            (None, true, "no --repo → must read spec.backup.bucket"),
+            (
+                Some("s3:https://h/b"),
+                false,
+                "--repo given → fully offline",
+            ),
+        ];
+        for (repo, expect, why) in table {
+            assert_eq!(
+                backup_verb_needs_cluster(repo, RetentionArgs::NotApplicable),
+                expect,
+                "{why}"
+            );
+        }
+    }
+
+    #[test]
+    fn needs_cluster_table_prune() {
+        let repo = Some("s3:https://h/b");
+        let table = [
+            // (repo, keeps, needs_cluster, why)
+            (
+                repo,
+                prune_keeps(Some(7), Some(4), Some(6)),
+                false,
+                "--repo + all three --keep-* → nothing left to read from the CR",
+            ),
+            (
+                repo,
+                prune_keeps(None, Some(4), Some(6)),
+                true,
+                "--keep-daily missing → retention defaults come from the CR",
+            ),
+            (
+                repo,
+                prune_keeps(Some(7), None, Some(6)),
+                true,
+                "--keep-weekly missing → retention defaults come from the CR",
+            ),
+            (
+                repo,
+                prune_keeps(Some(7), Some(4), None),
+                true,
+                "--keep-monthly missing → retention defaults come from the CR",
+            ),
+            (
+                repo,
+                prune_keeps(None, None, None),
+                true,
+                "no --keep-* at all → retention defaults come from the CR",
+            ),
+            (
+                None,
+                prune_keeps(Some(7), Some(4), Some(6)),
+                true,
+                "no --repo → the bucket still comes from the CR",
+            ),
+            (None, prune_keeps(None, None, None), true, "nothing given"),
+        ];
+        for (r, keeps, expect, why) in table {
+            assert_eq!(backup_verb_needs_cluster(r, keeps), expect, "{why}");
+        }
+    }
+
+    #[test]
+    fn needs_cluster_repo_alone_is_enough_for_check_but_not_for_prune() {
+        // The asymmetry, stated on its own: `--repo` fully frees check/unlock,
+        // but prune ALSO needs the retention policy, which otherwise comes from
+        // `spec.backup.retention`.
+        let repo = Some("s3:https://h/b");
+        assert!(!backup_verb_needs_cluster(
+            repo,
+            RetentionArgs::NotApplicable
+        ));
+        assert!(backup_verb_needs_cluster(
+            repo,
+            prune_keeps(Some(7), Some(4), None)
+        ));
+    }
+
+    #[test]
+    fn offline_hint_for_check_points_at_repo_only() {
+        let h = cluster_need(None, RetentionArgs::NotApplicable).hint("check");
+        assert!(h.contains("backup check"), "names the verb: {h}");
+        assert!(h.contains("--repo"), "names --repo: {h}");
+        assert!(
+            !h.contains("--keep-"),
+            "check has no retention inputs — must not mention --keep-*: {h}"
+        );
+    }
+
+    #[test]
+    fn offline_hint_for_prune_names_only_the_missing_keep_flags() {
+        // --repo and --keep-daily supplied; the hint must ask for exactly the
+        // two that are missing and NOT re-ask for what was already given.
+        let h =
+            cluster_need(Some("s3:https://h/b"), prune_keeps(Some(7), None, Some(6))).hint("prune");
+        assert!(h.contains("--keep-weekly"), "names the missing flag: {h}");
+        assert!(
+            !h.contains("--keep-daily"),
+            "--keep-daily was supplied — must not be re-asked: {h}"
+        );
+        assert!(
+            !h.contains("--keep-monthly"),
+            "--keep-monthly was supplied — must not be re-asked: {h}"
+        );
+        assert!(
+            !h.contains("--repo <"),
+            "--repo was supplied — must not be re-asked: {h}"
+        );
+    }
+
+    #[test]
+    fn offline_hint_mentions_disaster_recovery_when_repo_missing() {
+        let h = cluster_need(None, prune_keeps(None, None, None)).hint("prune");
+        assert!(h.contains("--repo"), "{h}");
+        assert!(h.contains("--keep-daily"), "{h}");
+        assert!(h.contains("--keep-weekly"), "{h}");
+        assert!(h.contains("--keep-monthly"), "{h}");
+        assert!(
+            h.to_lowercase().contains("no longer exists")
+                || h.to_lowercase().contains("disaster recovery"),
+            "the DR case must be named — the operator's cluster is SUPPOSED to be gone: {h}"
+        );
+    }
+
+    #[test]
+    fn resolve_backup_repo_with_override_needs_no_kubeconfig() {
+        // Passing `None` for the kubeconfig proves the override path never
+        // reaches for the cluster (a kubectl shell-out here would fail).
+        let repo = resolve_backup_repo(Some("s3:https://h/b"), None).expect("override honoured");
+        assert_eq!(repo, "s3:https://h/b");
+    }
+
+    #[test]
+    fn resolve_backup_repo_without_override_or_cluster_is_an_error() {
+        let err = resolve_backup_repo(None, None).expect_err("no repo, no cluster → error");
+        let msg = format!("{err}");
+        assert!(msg.contains("--repo"), "must point at --repo: {msg}");
+    }
+
+    #[test]
+    fn repo_from_spec_backup_prefers_override_then_bucket() {
+        let spec = json!({ "bucket": "s3:from-cr" });
+        assert_eq!(
+            repo_from_spec_backup(Some("s3:from-flag"), Some(&spec)).unwrap(),
+            "s3:from-flag"
+        );
+        assert_eq!(
+            repo_from_spec_backup(None, Some(&spec)).unwrap(),
+            "s3:from-cr"
+        );
+        // Empty bucket is treated as unconfigured.
+        let empty = json!({ "bucket": "" });
+        assert!(repo_from_spec_backup(None, Some(&empty)).is_err());
     }
 
     #[test]
