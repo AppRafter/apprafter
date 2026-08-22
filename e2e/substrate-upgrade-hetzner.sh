@@ -255,6 +255,15 @@ wait_jsonpath() {
 # jp <kind> <ns> <name> <jsonpath> — read one value (uses $KUBECONFIG)
 jp() { kubectl -n "$2" get "$1" "$3" -o jsonpath="$4" 2>/dev/null || true; }
 
+# yaml_scalar <file> <key> — read a TOP-LEVEL plain scalar out of a small,
+# flat YAML file (the target's config.yaml). serde_yaml writes these unquoted
+# and unindented, so a keyed match is exact rather than a grep over prose;
+# quotes and CR are stripped defensively in case the writer ever adds them.
+yaml_scalar() {
+    sed -n "s/^${2}:[[:space:]]*//p" "$1" 2>/dev/null \
+        | head -1 | tr -d '\r"'"'" | sed 's/[[:space:]]*$//'
+}
+
 # ---------------------------------------------------------------
 # Hetzner API helpers — the walk reads the SUBSTRATE FACTS (id, SKU, count)
 # from the provider, never from local state, because local state is exactly
@@ -1060,20 +1069,45 @@ if [ "$BACKEND" = "s3" ]; then
     printf '  ok: the off-site repo is still readable with the OPERATOR credentials alone (%s snapshot[s]) — the cluster is gone, so these creds came from the local dotenv, never from the cluster\n' \
         "$postmortem_snaps"
 
-    # OBSERVATION, not a gate. `backup check` is documented as an operator-side
-    # verb to "Run OUTSIDE the cluster with the operator's full S3 credentials",
-    # and with an explicit --repo + --credential-file it needs neither the
-    # cluster nor the CR. Record what it ACTUALLY does with the cluster gone —
-    # this is the moment an operator most wants to verify a backup. Printed as a
-    # finding either way; it never passes or fails the walk.
-    probe_log="${TMPDIR_WORK}/check-no-cluster.log"
-    if apprafter backup check --repo "$S3_REPO" --credential-file "$CRED_FILE" >"$probe_log" 2>&1; then
-        printf '  observation: "backup check --repo --credential-file" WORKS with the cluster destroyed (cluster-independent, as documented)\n'
-    else
-        printf '  observation/FINDING: "backup check --repo --credential-file" FAILS with the cluster destroyed, though it needs neither the cluster nor the CR:\n'
-        sed 's/^/      | /' "$probe_log"
-        printf '      (reported as a finding — NOT treated as a walk failure; the restore path below is unaffected)\n'
-    fi
+    # The DR-realistic moment: VERIFY THE ARTIFACT BEFORE RESTORING FROM IT,
+    # with the cluster gone by definition. Up through v0.2.48 all three operator
+    # maintenance verbs called `ensure_kubeconfig_tempfile()` as their first
+    # statement, and `destroy` clears `state.hetzner_cloud`, so this died with
+    # "state has no hetzner_cloud section; run `apprafter apply` first" — this
+    # walk found that, and f7ee105 made the kubeconfig lazy. A real provision
+    # with the cluster destroyed is the only place that fix can be proven end to
+    # end, so it is an ASSERTION now, not a note.
+    check_log="${TMPDIR_WORK}/check-no-cluster.log"
+    apprafter backup check --repo "$S3_REPO" --credential-file "$CRED_FILE" >"$check_log" 2>&1 || {
+        printf 'FAILED: backup check --repo --credential-file still needs a live cluster — the artifact cannot be verified before restoring from it:\n' >&2
+        sed 's/^/    | /' "$check_log" >&2
+        exit 1
+    }
+    printf '  ok: backup check VERIFIED the off-site repo with the cluster DESTROYED (--repo + operator dotenv only)\n'
+    sed 's/^/    | /' "$check_log"
+
+    # `unlock` is the other fully-offline verb (--repo alone resolves it). It
+    # removes only STALE locks and never touches snapshot data, so it is safe to
+    # run against the very repo the next phase restores from.
+    unlock_log="${TMPDIR_WORK}/unlock-no-cluster.log"
+    apprafter backup unlock --repo "$S3_REPO" --credential-file "$CRED_FILE" >"$unlock_log" 2>&1 || {
+        printf 'FAILED: backup unlock --repo --credential-file still needs a live cluster:\n' >&2
+        sed 's/^/    | /' "$unlock_log" >&2
+        exit 1
+    }
+    printf '  ok: backup unlock ran OFFLINE against the off-site repo (stale locks only; snapshot data untouched)\n'
+    sed 's/^/    | /' "$unlock_log"
+
+    # `prune` is DELIBERATELY NOT EXERCISED, and this is a statement of intent,
+    # not a silent skip: offline prune needs --repo AND all three --keep-* (it
+    # otherwise reads spec.backup.retention off the CR), and ANY prune forgets
+    # snapshots from the exact repo phase 6 restores from. Proving one more
+    # offline code path is not worth risking the artifact under test.
+    printf '  note: backup prune deliberately NOT run — it would forget snapshots from the repo phase 6 restores from. (Offline prune needs --repo plus all three --keep-*; out of scope here BY CHOICE, not skipped silently.)\n'
+
+    # Neither verb may have cost us the artifact we still depend on.
+    after_verbs="$(s3_snapshot_count)"
+    assert_eq "the off-site snapshot survived the offline maintenance verbs" "$after_verbs" "$postmortem_snaps"
 fi
 
 # ===============================================================
@@ -1190,12 +1224,33 @@ if [ "$BACKEND" = "s3" ]; then
     assert_contains "scheduled off-site backup is still ENABLED after the upgrade" "$status_out" "Backup: ENABLED"
 fi
 
-# Informational (NOT an assertion): the target's recorded server-type
-# PREFERENCE is a separate rung from the live fact, and `restore
-# --server-type` upgrades the box without rewriting the preference.
-printf '\n  --- target record vs live substrate (informational) ---\n'
-apprafter target show "$TARGET" 2>/dev/null | sed 's/^/    | /' || true
+# --- the target's STORED machine preference ------------------------------
+# A separate rung from the live server and from state.json, and the one that
+# bites LATER rather than now: the resolution chain is
+# flag > manifest > recorded state > target preference > env, and `destroy`
+# clears the recorded state that shadows the preference. So a preference left
+# pointing at the OLD machine is invisible until the NEXT reprovision that omits
+# --server-type — which then silently rebuilds the smaller box. `target machine`
+# refuses on a provisioned cluster, so there is no supported way to fix it by
+# hand either. Asserting it here catches the downgrade one step before anyone
+# can lose a machine to it.
+#
+# `apprafter target show` has no --json/-o flag, so the target's own config.yaml
+# IS the machine-readable path — and it is exactly what the adoption writes. The
+# human readout is asserted too, since that is the surface an operator reads.
+TARGET_CFG="${APPRAFTER_CONFIG_DIR}/targets/${TARGET}/config.yaml"
+[ -r "$TARGET_CFG" ] || { printf 'FAILED: target config not readable at %s\n' "$TARGET_CFG" >&2; exit 1; }
+printf '\n  --- target record vs live substrate ---\n'
+sed 's/^/    | /' "$TARGET_CFG"
 printf '    | live server: id %s, type %s (Hetzner API)\n\n' "$NEW_SERVER_ID" "$NEW_SERVER_TYPE"
+
+stored_type="$(yaml_scalar "$TARGET_CFG" server_type)"
+assert_eq "target's STORED server_type adopted the provisioned machine (config.yaml)" "$stored_type" "$SKU_BIG"
+assert_eq "stored preference agrees with the LIVE Hetzner API" "$stored_type" "$NEW_SERVER_TYPE"
+stored_region="$(yaml_scalar "$TARGET_CFG" region)"
+assert_eq "target's STORED region still matches the provisioned machine" "$stored_region" "$REGION"
+show_type="$(apprafter target show "$TARGET" 2>/dev/null | awk -F': *' '/^[[:space:]]*Server type:/ {print $2; exit}')"
+assert_eq "apprafter target show reports the UPGRADED machine (operator-visible surface)" "$show_type" "$SKU_BIG"
 
 printf '=== substrate upgrade VERIFIED ===\n'
 printf '  server:            id %s (%s)  ->  id %s (%s)\n' \
