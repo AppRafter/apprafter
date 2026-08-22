@@ -9,6 +9,68 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.49 — two substrate-upgrade fixes: offline backup verbs, and the target adopts the machine it provisioned (2026-08-22)
+
+> CLI-only (monorepo tag `v0.2.49`; no operator, chart or cue-cmp change).
+> Both defects were surfaced by `e2e/substrate-upgrade-hetzner.sh` — a real
+> Hetzner cluster moved from `cx23` to `cx33` by backup → `destroy` →
+> `restore --reprovision --server-type cx33`. The walk itself ran GREEN twice;
+> these are the two rough edges it exposed along the way.
+
+### Fixed
+
+- **`apprafter backup check`, `prune` and `unlock` no longer require a live
+  cluster.** All three are documented as running outside the cluster with your
+  own S3 credentials, but each one reached for the cached kubeconfig before
+  doing anything else. Because `apprafter destroy` clears the cluster section of
+  the state file, they failed with `state has no hetzner_cloud section; run
+  apprafter apply first` — at exactly the moment they matter most. Verifying an
+  off-site repository *before* restoring from it is a core disaster-recovery
+  step, and at that point the cluster is gone by definition.
+
+  The cluster was only ever consulted to read inputs off the `PlatformStack` CR,
+  so it is now contacted only when something is genuinely still unresolved:
+
+  - `check` and `unlock` read the CR only for the repository URL, so `--repo`
+    alone makes them run entirely off the cluster.
+  - `prune` reads it for the repository URL **and** the retention defaults
+    (`spec.backup.retention`), so it needs a cluster unless `--repo` and all
+    three of `--keep-daily` / `--keep-weekly` / `--keep-monthly` are given.
+
+  When the cluster genuinely is needed and cannot be reached, the error now
+  names the unresolved inputs and the exact flags that would remove the need —
+  for `prune`, only the `--keep-*` flags actually missing — instead of telling
+  someone whose cluster is *supposed* to be gone to run `apprafter apply`.
+
+  One consequence worth knowing: a fully-offline `prune` cannot write the
+  cluster-side `apprafter.io/last-prune` annotation that `apprafter backup
+  status` reports, so it prints that the stamp was skipped. The prune itself
+  still happened; only the audit annotation is missing, and the next prune run
+  against a live cluster stamps it again.
+
+- **The target now records the machine it actually provisioned.** After
+  `restore --reprovision --server-type cx33`, `apprafter target show` still
+  reported `Server type: cx23`. The running server and the state file were both
+  correct — only the target's stored preference was stale, because the routine
+  that adopts the live machine into the target config ran only when a server
+  already existed at the start of the apply. A reprovision *creates* the server,
+  so it never ran.
+
+  This was worse than a display bug. Machine selection resolves
+  flag → manifest → recorded state → **target preference** → environment, and
+  the recorded state that was hiding the stale preference is cleared by
+  `destroy`. A second upgrade run without an explicit `--server-type` would
+  therefore have silently rebuilt the *old, smaller* machine. There was no way
+  to correct it by hand either: `apprafter target machine` refuses while the
+  cluster is provisioned, leaving only the window between `destroy` and
+  `restore`.
+
+  After any successful provision the target's stored machine (and region) now
+  equal what was actually built, overwriting a disagreeing value rather than
+  only filling an empty one. Recording it is best-effort: if the target config
+  cannot be written, you get a warning — a provision that succeeded is never
+  reported as a failure.
+
 ## platform-stack 0.2.57 — shared backends can now shrink (2026-08-21)
 
 > **Chart + operator release. The `apprafter-operator` and
