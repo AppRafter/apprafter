@@ -247,10 +247,11 @@ pub fn run(target_override: Option<&str>, server_type_flag: Option<&str>) -> Res
     // backfill + guard without an extra API round-trip (M17/N8).
     let live_servers = persist_state(&provider, &mut state, &paths, &cluster)?;
 
-    // 2.16h: backfill + guard — exists-path only (server was already present
-    // before this apply, i.e. we captured a server_id at apply start).
-    if let Some(server_id) = existing_server_id {
-        run_backfill_and_guard(
+    match existing_server_id {
+        // 2.16h exists-path: the server predates this apply (we captured a
+        // server_id at apply start). Fill the target's empty slots and warn on
+        // fact drift — the machine may have been changed outside AppRafter.
+        Some(server_id) => run_backfill_and_guard(
             &live_servers,
             server_id,
             state_server_type_at_start.as_deref(),
@@ -258,7 +259,20 @@ pub fn run(target_override: Option<&str>, server_type_flag: Option<&str>) -> Res
             target_region_at_start.as_deref(),
             &target_store,
             &target_name,
-        );
+        ),
+        // v0.2.49 create-path: this apply PROVISIONED the server, so the live
+        // facts are authoritative — adopt them into the target outright. The
+        // new server's id was recorded by `persist_state` just above.
+        None => {
+            if let Some(new_server_id) = state.hetzner_cloud.as_ref().map(|h| h.server_id) {
+                adopt_provisioned_machine(
+                    &live_servers,
+                    new_server_id,
+                    &target_store,
+                    &target_name,
+                );
+            }
+        }
     }
 
     Ok(())
@@ -607,6 +621,113 @@ fn run_backfill_and_guard(
             );
         }
         Guard::Silent => {}
+    }
+}
+
+/// v0.2.49: adopt the machine we JUST PROVISIONED into the target config —
+/// the create-path counterpart of [`run_backfill_and_guard`].
+///
+/// ### Why this exists
+///
+/// `run_backfill_and_guard` runs only when a server already existed at the
+/// start of the apply, so a `restore --reprovision --server-type <new>` (which
+/// *creates* the server) left the target's stored preference pointing at the
+/// OLD machine. `apprafter target show` then reported the previous SKU while
+/// the live box and `state.json` were both correct.
+///
+/// That is worse than cosmetic. The resolution chain is
+/// flag → manifest → recorded state → **target preference** → env, and
+/// `destroy` clears the recorded state — so the stale preference stops being
+/// shadowed and the NEXT reprovision without an explicit `--server-type`
+/// silently rebuilds the old, smaller machine. There is also no way to correct
+/// it by hand: `apprafter target machine` refuses on a provisioned cluster.
+///
+/// ### Adopt, don't backfill
+///
+/// The exists-path fills only EMPTY slots ("the target never recorded one").
+/// Here we know the truth authoritatively — we just built the box — so an
+/// existing value that disagrees is overwritten. A preference that contradicts
+/// the machine we provisioned is not a preference, it is stale data, and
+/// leaving it is precisely the silent-downgrade hazard above. Both fields are
+/// adopted for the same reason: `region` sits on the same shadowed rung.
+///
+/// ### No drift guard
+///
+/// [`classify_guard`] compares the *recorded fact* (`state.hetzner_cloud
+/// .server_type`) against live. On the create path that fact is `None` by
+/// construction — `existing_server_id` is derived from the same
+/// `state.hetzner_cloud`, so reaching here means there was no recorded state to
+/// disagree with live — and the classification would be `Guard::Silent` every
+/// time. There is nothing to guard: we created this server, so live and intent
+/// agree by construction. The create path therefore adopts without guarding.
+///
+/// Best-effort, exactly like the exists path: a config-write failure prints a
+/// warning and never fails an apply that already provisioned successfully.
+fn adopt_provisioned_machine(
+    live_servers: &[Server],
+    server_id: u64,
+    target_store: &TargetStorePaths,
+    target_name: &str,
+) {
+    let (live_type, live_region) = match backfill_from(live_servers, server_id) {
+        BackfillOutcome::Adopt {
+            server_type,
+            region,
+        } => (server_type, region),
+        BackfillOutcome::AmbiguousSkip => {
+            eprintln!(
+                "warning: multiple servers matched id {server_id} in the live listing — \
+                 not recording the provisioned machine in the target config"
+            );
+            return;
+        }
+        // No match — nothing authoritative to adopt (never blank a good value).
+        BackfillOutcome::Skip => return,
+    };
+    if live_type.is_none() && live_region.is_none() {
+        return; // the API reported neither field; leave the target as it is
+    }
+
+    let mut target = match load_target(target_store, target_name) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "warning: could not load target config to record the provisioned machine: {e}"
+            );
+            return;
+        }
+    };
+
+    let mut changed = false;
+    if let Some(t) = live_type {
+        if target.config.server_type.as_deref() != Some(t.as_str()) {
+            match &target.config.server_type {
+                Some(prev) => eprintln!("  target machine updated: {prev} → {t} (provisioned)"),
+                None => eprintln!(
+                    "  server type baseline established: {t} (recorded from the \
+                     provisioned server)"
+                ),
+            }
+            target.config.server_type = Some(t);
+            changed = true;
+        }
+    }
+    if let Some(r) = live_region {
+        if target.config.region.as_deref() != Some(r.as_str()) {
+            match &target.config.region {
+                Some(prev) => eprintln!("  target region updated: {prev} → {r} (provisioned)"),
+                None => eprintln!(
+                    "  region baseline established: {r} (recorded from the provisioned server)"
+                ),
+            }
+            target.config.region = Some(r);
+            changed = true;
+        }
+    }
+    if changed {
+        if let Err(e) = save_target(target_store, &target) {
+            eprintln!("warning: could not persist the provisioned machine to target config: {e}");
+        }
     }
 }
 
@@ -1088,5 +1209,150 @@ mod tests {
             Some("cx22"),
             "server_type should also have been backfilled in the same pass"
         );
+    }
+
+    // ── adopt_provisioned_machine (create path) ──────────────────────────────
+
+    /// Build a temp target store holding one target with the given stored
+    /// machine preference. Returns `(tempdir, store, name)` — the tempdir must
+    /// stay alive for the duration of the test.
+    fn target_store_with(
+        server_type: Option<&str>,
+        region: Option<&str>,
+    ) -> (
+        tempfile::TempDir,
+        cli_core::target::TargetStorePaths,
+        String,
+    ) {
+        use cli_core::target::{Target, TargetConfig, TargetCredentials, TargetStorePaths};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = TargetStorePaths::for_root(tmp.path().to_path_buf());
+        let name = "test-adopt".to_string();
+        save_target(
+            &store,
+            &Target {
+                name: name.clone(),
+                config: TargetConfig {
+                    provider: "hetzner-cloud".into(),
+                    server_type: server_type.map(str::to_string),
+                    region: region.map(str::to_string),
+                    ..Default::default()
+                },
+                credentials: TargetCredentials::default(),
+            },
+        )
+        .expect("save target");
+        (tmp, store, name)
+    }
+
+    fn live_server(id: u64, server_type: &str, region: &str) -> Server {
+        use cli_providers::hetzner_cloud::types::{LocationRef, ServerStatus, ServerTypeRef};
+        Server {
+            id,
+            name: "platform-1".into(),
+            status: ServerStatus::Running,
+            server_type: Some(ServerTypeRef {
+                name: server_type.to_string(),
+            }),
+            location: Some(LocationRef {
+                name: region.to_string(),
+            }),
+            public_net: None,
+            labels: Default::default(),
+        }
+    }
+
+    #[test]
+    fn adopt_provisioned_machine_overwrites_a_stale_target_preference() {
+        // The substrate-upgrade case: the target still says cx23 because that
+        // is what it was before `destroy`, but we have just provisioned cx33.
+        // A preference that disagrees with the box we built is stale data — and
+        // it is what the next rebuild would silently use once `destroy` clears
+        // the recorded state that currently shadows it.
+        let (_tmp, store, name) = target_store_with(Some("cx23"), Some("nbg1"));
+
+        adopt_provisioned_machine(&[live_server(77, "cx33", "fsn1")], 77, &store, &name);
+
+        let saved = load_target(&store, &name).expect("load after adopt");
+        assert_eq!(
+            saved.config.server_type.as_deref(),
+            Some("cx33"),
+            "the target must record the machine that was actually provisioned"
+        );
+        assert_eq!(
+            saved.config.region.as_deref(),
+            Some("fsn1"),
+            "the region actually provisioned is adopted in the same pass"
+        );
+    }
+
+    #[test]
+    fn adopt_provisioned_machine_establishes_a_baseline_when_target_was_empty() {
+        // Fresh target (no preference recorded yet) → the provisioned facts
+        // become the baseline.
+        let (_tmp, store, name) = target_store_with(None, None);
+
+        adopt_provisioned_machine(&[live_server(5, "cpx31", "hel1")], 5, &store, &name);
+
+        let saved = load_target(&store, &name).expect("load after adopt");
+        assert_eq!(saved.config.server_type.as_deref(), Some("cpx31"));
+        assert_eq!(saved.config.region.as_deref(), Some("hel1"));
+    }
+
+    #[test]
+    fn adopt_provisioned_machine_leaves_target_alone_when_id_not_in_listing() {
+        // No live server matched the id we just recorded → nothing authoritative
+        // to adopt, so the stored preference must survive untouched.
+        let (_tmp, store, name) = target_store_with(Some("cx23"), Some("nbg1"));
+
+        adopt_provisioned_machine(&[live_server(1, "cx33", "fsn1")], 999, &store, &name);
+
+        let saved = load_target(&store, &name).expect("load after no-op adopt");
+        assert_eq!(saved.config.server_type.as_deref(), Some("cx23"));
+        assert_eq!(saved.config.region.as_deref(), Some("nbg1"));
+    }
+
+    #[test]
+    fn adopt_provisioned_machine_skips_an_ambiguous_id_match() {
+        // Two servers with the same id (defensive — Hetzner ids are unique):
+        // we cannot tell which is ours, so we must not overwrite anything.
+        let (_tmp, store, name) = target_store_with(Some("cx23"), Some("nbg1"));
+
+        adopt_provisioned_machine(
+            &[
+                live_server(7, "cx33", "fsn1"),
+                live_server(7, "cx43", "nbg1"),
+            ],
+            7,
+            &store,
+            &name,
+        );
+
+        let saved = load_target(&store, &name).expect("load after ambiguous adopt");
+        assert_eq!(saved.config.server_type.as_deref(), Some("cx23"));
+        assert_eq!(saved.config.region.as_deref(), Some("nbg1"));
+    }
+
+    #[test]
+    fn adopt_provisioned_machine_keeps_fields_the_api_did_not_report() {
+        // The live API returned no type/location for the server. Adopt nothing
+        // rather than blanking a good preference.
+        use cli_providers::hetzner_cloud::types::ServerStatus;
+        let (_tmp, store, name) = target_store_with(Some("cx23"), Some("nbg1"));
+        let bare = Server {
+            id: 3,
+            name: "platform-1".into(),
+            status: ServerStatus::Running,
+            server_type: None,
+            location: None,
+            public_net: None,
+            labels: Default::default(),
+        };
+
+        adopt_provisioned_machine(&[bare], 3, &store, &name);
+
+        let saved = load_target(&store, &name).expect("load after empty adopt");
+        assert_eq!(saved.config.server_type.as_deref(), Some("cx23"));
+        assert_eq!(saved.config.region.as_deref(), Some("nbg1"));
     }
 }
