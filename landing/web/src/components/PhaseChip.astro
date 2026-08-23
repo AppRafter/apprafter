@@ -1,0 +1,48 @@
+---
+// SPDX-FileCopyrightText: 2026 AppRafter contributors
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//
+// Renders a roadmap-phase chip from the canonical registry
+// (src/data/phases.json). Pass the STABLE id; the display label and
+// the anchor both come from the registry, so a renumber changes what
+// people read, not what they subscribed to. Generalises the
+// Advantages `.phase-tag` visual — it does NOT replace those Today:
+// chips (Part 4 of the presentation design spec).
+
+import phaseRegistry from '../data/phases.json';
+
+type Props = { id: string };
+
+const { id } = Astro.props;
+const entry = phaseRegistry.phases.find((p) => p.id === id);
+if (!entry) {
+  throw new Error(
+    `[PhaseChip] unknown phase id "${id}" — must be one of ${phaseRegistry.phases
+      .map((p) => p.id)
+      .join(', ')}`,
+  );
+}
+---
+
+<a class="phase-chip" href={entry.anchor} data-phase-id={entry.id}>{entry.label}</a>
+
+<style>
+  .phase-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fg-faint);
+    padding: 3px 8px;
+    border: 1px solid var(--border-strong);
+    text-decoration: none;
+    transition: color 120ms ease, border-color 120ms ease;
+  }
+  .phase-chip:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+</style>
