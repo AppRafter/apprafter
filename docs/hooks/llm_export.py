@@ -491,7 +491,21 @@ def _ordered() -> tuple[list[_Section], list[_Doc]]:
             # sub-section it sits in ('CLI / Overview'). A page title
             # would repeat the heading it sits under; a bare nav label
             # is ambiguous the moment two sub-sections use one word.
-            entries.append((" / ".join((*prefix, page.title or doc.title)), doc))
+            # The ADRs nav item is a top-level Page, so its section
+            # heading (`_group_label` below) and this entry label are
+            # both the nav title "ADRs" — the index would list "ADRs"
+            # twice, once as the `## ADRs` heading and once as its lone
+            # entry. Relabel just the entry so the reader sees the
+            # heading is the group and the entry is the index page under
+            # it. Keyed on the source path, not on a heading==label
+            # collision, so the identical `## Home`→[Home] pairing (a
+            # deliberate one-page group) is left untouched.
+            label = (
+                "ADR index"
+                if src_uri == "adr/README.md"
+                else " / ".join((*prefix, page.title or doc.title))
+            )
+            entries.append((label, doc))
         if entries:
             sections.append((_group_label(item), entries))
 

@@ -559,6 +559,13 @@ if nav_unread:
 # its own output. This is the label the index must carry for the pages
 # that are published, in scope and off the nav.
 UNSECTIONED = "Other pages"
+# Per-page label overrides that the hook applies to avoid a nav-title
+# echo (e.g. `## ADRs` heading + `[ADRs]` entry both reading "ADRs").
+# Must stay in sync with the equivalent dict in llm_export.py's
+# `_ordered()`.  Keyed by src_uri.
+LABEL_OVERRIDES: dict[str, str] = {
+    "adr/README.md": "ADR index",
+}
 
 index_path = site / "llms.txt"
 index = ""
@@ -752,7 +759,7 @@ else:
         if page not in source:
             continue
         src_uri, body, authored = source[page]
-        want_label = nav_label.get(src_uri) or title_of(src_uri, body)
+        want_label = LABEL_OVERRIDES.get(src_uri) or nav_label.get(src_uri) or title_of(src_uri, body)
         if not label.strip():
             unlabelled.append(page)
         elif want_label and label.strip() != want_label:
