@@ -116,7 +116,7 @@ apprafter app logs <name> --env prod
 
 ## `apprafter app open`
 
-Port-forward the app's primary Service to localhost and open it in a browser. Wraps `kubectl port-forward` with AppRafter-aware resolution: Application name → Argo CD CR → `spec.destination.namespace` → child Service via the `app.kubernetes.io/instance=<name>` label → container port (Service.spec.ports[0] OR `--container-port` override). Picks a free local port starting at 8080 with auto-increment to 8090 if busy. Blocks on Ctrl+C — the port-forward dies with the command
+Port-forward the app's primary Service to localhost and open it in a browser. Wraps `kubectl port-forward` with AppRafter-aware resolution: Application name → Argo CD CR → `spec.destination.namespace` → child Service via the operator's `app.kubernetes.io/name=<app>` label (Argo CD's `instance` label is on the Argo app, not the rendered child) → container port (Service.spec.ports[0] OR `--container-port` override). Picks a free local port starting at 8080 with auto-increment to 8090 if busy. Blocks on Ctrl+C — the port-forward dies with the command
 
 ```text
 Usage: apprafter app open [OPTIONS] <NAME>

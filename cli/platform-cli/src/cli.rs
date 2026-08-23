@@ -208,9 +208,14 @@ pub enum Commands {
         #[arg(long)]
         target: Option<String>,
     },
-    /// Install Cilium (CNI + kube-proxy replacement) and apply
-    /// the Gateway API standard-install CRDs into the cluster
-    /// pointed to by the cached kubeconfig.
+    /// GitOps loader for the cluster pointed to by the cached
+    /// kubeconfig: install Cilium (CNI + kube-proxy replacement),
+    /// then Argo CD, then apply the single root `platform`
+    /// Application pointing at the platform-stack chart and wait
+    /// for it to report Healthy. Everything else — Gateway API
+    /// CRDs, cert-manager, the operator + admission webhook,
+    /// network policies — is reconciled from that chart by Argo
+    /// CD, not installed here. Idempotent; re-running is a no-op.
     #[command(name = "cluster-bootstrap", alias = "cb")]
     ClusterBootstrap,
     /// Print the Argo CD admin password (decrypted), fetching it
@@ -981,9 +986,10 @@ pub enum AppCommand {
     /// open it in a browser. Wraps `kubectl port-forward` with
     /// AppRafter-aware resolution: Application name → Argo CD
     /// CR → `spec.destination.namespace` → child Service via
-    /// the `app.kubernetes.io/instance=<name>` label →
-    /// container port (Service.spec.ports[0] OR
-    /// `--container-port` override). Picks a free local port
+    /// the operator's `app.kubernetes.io/name=<app>` label
+    /// (Argo CD's `instance` label is on the Argo app, not the
+    /// rendered child) → container port (Service.spec.ports[0]
+    /// OR `--container-port` override). Picks a free local port
     /// starting at 8080 with auto-increment to 8090 if busy.
     /// Blocks on Ctrl+C — the port-forward dies with the
     /// command.

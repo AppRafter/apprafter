@@ -31,9 +31,8 @@ recommended path; build-from-source is for contributors.
     [GitHub Releases](https://github.com/AppRafter/apprafter/releases)
     and drop it on your `PATH`. The asset name carries the tag, so the
     first line resolves the newest release rather than naming one — a
-    literal tag written here goes stale the next time we cut a release,
-    which is what it had done. Substitute an explicit `v0.2.x` if you
-    want to pin.
+    literal tag written here goes stale the next time we cut a release.
+    Substitute an explicit `v0.2.x` if you want to pin.
 
     ```sh
     VERSION=$(curl -fsSL https://api.github.com/repos/AppRafter/apprafter/releases/latest \

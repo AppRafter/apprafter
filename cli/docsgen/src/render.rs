@@ -346,12 +346,14 @@ fn render_index(tree: &Tree) -> String {
         "Every apprafter command, flag and default, generated from the clap definitions.",
     );
     s.push_str("# CLI reference\n\n");
-    s.push_str(
-        "Generated from `cli/platform-cli/src/cli.rs`. Every command, flag, default and\n\
-         alias below is projected straight from the parser, so this page cannot describe\n\
-         a flag the binary does not have. Run `apprafter <command> --help` for the same\n\
-         information shell-formatted.\n\n",
-    );
+    s.push_str(&format!(
+        "Generated from `cli/platform-cli/src/cli.rs` at **apprafter v{}** — the release\n\
+         this whole reference describes. Every command, flag, default and alias below is\n\
+         projected straight from the parser, so this page cannot describe a flag the\n\
+         binary does not have. Run `apprafter <command> --help` for the same information\n\
+         shell-formatted.\n\n",
+        tree.cli_version
+    ));
     s.push_str(START_HERE);
     s.push_str("## Every command\n\n");
     s.push_str(

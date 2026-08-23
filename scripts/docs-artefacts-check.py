@@ -81,6 +81,7 @@ All four were "the artefact is right, so the site must be":
 """
 
 import html
+import posixpath
 import re
 import subprocess
 import sys
@@ -156,6 +157,126 @@ def twin_for(url):
     return "index.md" if url == "" else url.rstrip("/") + ".md"
 
 
+# The link rewrite the hook applies to every twin and bundle body,
+# RE-DERIVED here rather than imported: a twin sits at a different URL
+# from its page, so a relative link written against the source tree
+# resolves a directory wrong once moved, and the hook rewrites each to an
+# absolute URL. This is that same rule, independently, so the byte
+# compare below is source -> expectation, never the hook vouching for
+# itself. `url_for`/`twin_for` above are what map a `.md` target to the
+# page's twin.
+LINK = re.compile(r"(?<=\]\()([^)]+)(?=\))")
+FENCE_LINE = re.compile(r"^[ \t]*(?:`{3,}|~{3,})")
+# An inline code span: a `](…)` inside one is prose about link syntax
+# (an ADR carries `[a-z0-9]([a-z0-9-]*[a-z0-9])?` and `- [Page](url)`),
+# not a link, so the rewrite and the scanners below step over it.
+CODE_SPAN = re.compile(r"(`+).+?\1")
+# Already resolvable as written: an absolute URL (`scheme:`), a
+# protocol-relative `//host`, or a bare `#fragment`.
+ABSOLUTE = re.compile(r"^(?:[a-z][a-z0-9+.-]*:|//|#)")
+
+
+def line_links(line):
+    """Link targets on a line, outside any inline code span."""
+    targets, pos = [], 0
+    for span in CODE_SPAN.finditer(line):
+        targets.extend(LINK.findall(line[pos : span.start()]))
+        pos = span.end()
+    targets.extend(LINK.findall(line[pos:]))
+    return targets
+
+
+def absolutise(target, src_uri):
+    """One relative link target -> the absolute URL the hook must emit."""
+    if ABSOLUTE.match(target):
+        return target
+    path, hashsep, frag = target.partition("#")
+    if not path:
+        return target
+    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(src_uri), path))
+    if resolved.endswith(".md"):
+        dest = base + twin_for(url_for(resolved))
+    else:
+        dest = base + resolved
+    return dest + hashsep + frag
+
+
+def rewrite_line(line, src_uri):
+    """Absolutise the links on one line, leaving inline code spans alone."""
+    out, pos = [], 0
+    for span in CODE_SPAN.finditer(line):
+        out.append(LINK.sub(lambda m: absolutise(m.group(0), src_uri), line[pos : span.start()]))
+        out.append(span.group(0))
+        pos = span.end()
+    out.append(LINK.sub(lambda m: absolutise(m.group(0), src_uri), line[pos:]))
+    return "".join(out)
+
+
+def rewrite_links(body, src_uri):
+    """The body a twin/bundle entry must carry: relative links absolutised."""
+    out = []
+    in_fence = False
+    for line in body.split("\n"):
+        if FENCE_LINE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+        elif in_fence:
+            out.append(line)
+        else:
+            out.append(rewrite_line(line, src_uri))
+    return "\n".join(out)
+
+
+def surviving_relative_links(body):
+    """Relative link targets left in a rewritten body, outside code.
+
+    The property `rewrite_links` is meant to establish, checked on the
+    RESULT rather than by re-running the rewrite: whatever the transform
+    did, a twin or bundle entry read on its own must not carry a link that
+    only resolves against the source tree it no longer sits in. Inline
+    code spans are stepped over -- a `](…)` there is prose, not a link.
+    """
+    bad = []
+    in_fence = False
+    for line in body.split("\n"):
+        if FENCE_LINE.match(line):
+            in_fence = not in_fence
+        elif not in_fence:
+            bad.extend(t for t in line_links(line) if not ABSOLUTE.match(t))
+    return bad
+
+
+def served(url):
+    """Does the built site actually serve this absolute in-site URL?
+
+    The other half of "every link is absolute": absolute is not enough if
+    it 404s. Resolved against the built site rather than against the rule
+    that wrote it -- a `.md` link lands on a twin, a `/`-terminated link
+    on a directory's `index.html`, anything else on a static file (or the
+    page's own `index.html`). A `#fragment`/`?query` is dropped first.
+    """
+    rel = url[len(base):].split("#")[0].split("?")[0]
+    if rel == "":
+        return (site / "index.html").is_file()
+    if (site / rel).is_file():
+        return True
+    if rel.endswith("/"):
+        return (site / rel / "index.html").is_file()
+    return (site / (rel + "/index.html")).is_file()
+
+
+def dead_site_links(body):
+    """In-site absolute links (base-rooted) a twin carries that 404."""
+    dead = []
+    in_fence = False
+    for line in body.split("\n"):
+        if FENCE_LINE.match(line):
+            in_fence = not in_fence
+        elif not in_fence:
+            dead.extend(t for t in line_links(line) if t.startswith(base) and not served(t))
+    return dead
+
+
 # A fenced block, delimiter run and blockquote prefix matched on both
 # ends. Prose lives outside these; a shell transcript inside one is not
 # a sentence the renderer owes the reader.
@@ -226,6 +347,25 @@ for path in tracked:
         " ".join(str(description).split()) if description else "",
     )
 
+# Everything under docs/ is published on THIS site, so a link to a page's
+# GitHub blob view is a second canonical address for a page that already
+# has one here -- and the off-site one is the address that gets cited as
+# the source. mkdocs cannot catch it: `validation.links.absolute_links`
+# fires on links to this site, and a github.com link is legitimately
+# off-site as written. Scanned on the committed source, where the link is
+# authored, so it fails before the build rather than after publication.
+GITHUB_DOCS = re.compile(r"github\.com/apprafter/apprafter/blob/[^)\s]*/docs/")
+github_docs_links = sorted(
+    src_uri for src_uri, body, _ in source.values() if GITHUB_DOCS.search(body)
+)
+if github_docs_links:
+    problems.append(
+        str(len(github_docs_links))
+        + " page(s) link to a `github.com/apprafter/apprafter/blob/*/docs/**` URL -- a"
+        + " second, off-site address for a page this site already publishes; link the"
+        + " site-relative `.md` path instead: " + show(github_docs_links)
+    )
+
 # What the site actually published, as site-root-relative URL paths.
 # Deriving the page SET from the build output is the whole point:
 # a page added tomorrow is covered without editing this script.
@@ -234,9 +374,14 @@ published = sorted(
     for p in site.rglob("index.html")
     if not p.relative_to(site).as_posix().startswith("assets/")
 )
-# The ADRs are bundled and twinned but deliberately not indexed --
-# docs/hooks/llm_export.py says why.
-indexable = [u for u in published if not u.startswith("adr/")]
+# The numbered ADR records are bundled and twinned but deliberately not
+# indexed -- docs/hooks/llm_export.py says why. `adr/README.md` (the ADR
+# index page, published at `adr/`) is NOT a record and IS indexed, so it
+# is the `ADRs` nav group's one representative on the map. Matched here
+# on the URL rather than the source path, and independently of the hook:
+# a numbered record's URL is `adr/NNNN-…/`, the index page's is `adr/`.
+ADR_RECORD = re.compile(r"adr/\d")
+indexable = [u for u in published if not ADR_RECORD.match(u)]
 indexable_set = set(indexable)
 
 orphan_pages = [u for u in published if u not in source]
@@ -448,38 +593,58 @@ else:
             " declares, so the index states different terms from the site footer: "
             + want_licence
         )
-    # The two sentences the hook GENERATES rather than writes out, each
-    # checked against the thing it describes: the twin rule against
-    # `twin_for` (which the twins block below enforces against the site),
-    # and the bundle's URL and the size of what it leaves out against
-    # the pages the build published. An index claiming a twin rule the
-    # site does not implement is a detectable lie, and it was not
-    # detected.
+    # The sentence the hook GENERATES rather than writes out, checked
+    # against the things it describes: the twin rule against `twin_for`
+    # (which the twins block below enforces against the site), and the two
+    # bundle URLs plus the two counts against the pages the build
+    # published. An index naming a twin rule, a bundle or a count the site
+    # does not back is a detectable lie, and it was not detected.
     if base:
         root_twin = base + twin_for("")
+        guides_url = base + "llms-guides.txt"
         bundle_url = base + "llms-full.txt"
-        stated = [line for line in lines if root_twin in line and bundle_url in line]
+        stated = [
+            line
+            for line in lines
+            if root_twin in line and guides_url in line and bundle_url in line
+        ]
         if not stated:
             problems.append(
-                "llms.txt states neither where a page's markdown twin lives nor where"
-                " the full corpus is bundled: no line of it names both `" + root_twin
-                + "` (the site root's twin, per `twin_for`) and `" + bundle_url + "`."
-                " A reader of the index cannot discover either from anywhere else"
+                "llms.txt does not, in one line, name where a page's markdown twin"
+                " lives, where the indexed pages are bundled and where the whole corpus"
+                " is: no line names all of `" + root_twin + "` (the site root's twin,"
+                " per `twin_for`), `" + guides_url + "` and `" + bundle_url + "`. A"
+                " reader of the index cannot discover them from anywhere else"
             )
         else:
-            adr_pages = sum(1 for u in published if u.startswith("adr/"))
-            claimed = re.search(r"(\d+) pages under", stated[0])
-            if not claimed:
+            # The numbered records only -- the ADR index page IS listed,
+            # so the "N numbered records under adr/" count excludes it
+            # (matches the hook's `n_excluded`); the indexed count is every
+            # published page the map lists (matches the hook's `n_indexed`).
+            n_records = sum(1 for u in published if ADR_RECORD.match(u))
+            n_indexed = len(indexable)
+            claimed_records = re.search(r"(\d+) numbered records under", stated[0])
+            claimed_indexed = re.search(r"(\d+) indexed pages", stated[0])
+            if not claimed_records or not claimed_indexed:
                 problems.append(
-                    "llms.txt's generated sentence no longer says how many pages it"
-                    " leaves out of the index, so the one number in it that could be"
-                    " wrong is now absent instead: " + stated[0].strip()[:120]
+                    "llms.txt's generated sentence no longer states both counts (the"
+                    " indexed-page total bundled in llms-guides.txt and the"
+                    " numbered-record total it leaves out), so a number that could be"
+                    " wrong is now absent instead: " + stated[0].strip()[:160]
                 )
-            elif int(claimed.group(1)) != adr_pages:
-                problems.append(
-                    "llms.txt says it leaves " + claimed.group(1) + " page(s) out of the"
-                    " index; the build published " + str(adr_pages) + " under `adr/`"
-                )
+            else:
+                if int(claimed_records.group(1)) != n_records:
+                    problems.append(
+                        "llms.txt says it leaves " + claimed_records.group(1)
+                        + " numbered record(s) out of the index; the build published "
+                        + str(n_records) + " under `adr/`"
+                    )
+                if int(claimed_indexed.group(1)) != n_indexed:
+                    problems.append(
+                        "llms.txt says it bundles " + claimed_indexed.group(1)
+                        + " indexed page(s) in llms-guides.txt; the build published "
+                        + str(n_indexed) + " indexable page(s)"
+                    )
     headings = re.findall(r"(?m)^## (.+)$", index)
     want_headings = [
         group
@@ -621,83 +786,95 @@ else:
             + " page's front matter: " + show(mismatched)
         )
 
-full_path = site / "llms-full.txt"
-if not full_path.is_file():
-    problems.append("llms-full.txt was not written")
-else:
-    bundled = re.findall(
-        # `audience:` is [^\n]+ rather than \S+ so an author writing a
-        # two-word audience does not read here as a missing page.
-        r"(?ms)^---\nurl: (\S+)\n(description: [^\n]*\n)?audience: [^\n]+\n---\n(.*?)"
-        r"(?=^---\nurl: |\Z)",
-        full_path.read_text(),
-    )
-    # As a SET against the pages the site published, in both
-    # directions, with repeats named -- the rule the twins block forty
-    # lines below already states and this block did not carry. Comparing
-    # CARDINALITY here meant one dropped page hid behind one duplicated
-    # page: removing `operator-guide/troubleshooting.md`, the largest
-    # operator guide, and appending a second copy of `license.md` left
-    # the bundle 119 entries long with 118 distinct URLs, and the whole
-    # corpus handed to a model was quietly one page short. Each entry
-    # that IS present was already byte-compared; an absent one was
-    # invisible.
-    bundled_urls = [url for url, _, _ in bundled]
-    repeated = sorted({u for u in bundled_urls if bundled_urls.count(u) > 1})
+# One bundle entry (also one twin, which is a one-entry bundle):
+# `audience:` is [^\n]+ rather than \S+ so a two-word audience does not
+# read as a missing page.
+BUNDLE_ENTRY = re.compile(
+    r"(?ms)^---\nurl: (\S+)\n(description: [^\n]*\n)?audience: [^\n]+\n---\n(.*?)"
+    r"(?=^---\nurl: |\Z)"
+)
+
+
+def check_bundle(name, expected_pages):
+    """A bundle artefact vs the exact pages it should carry, byte for byte.
+
+    The same three attacks the twins block guards: a SET comparison both
+    ways with repeats named (a dropped page hides behind a duplicated one
+    when only counts are compared -- removing the largest operator guide
+    and appending a second `license.md` left the old check balanced and
+    the corpus a page short), and each entry's body and description
+    compared to the committed source -- not "is it long enough", which
+    filler passes and swapped bodies defeat. The body is compared to the
+    source with the link rewrite RE-DERIVED here, and the result is then
+    checked for any surviving relative link, so a rewrite that silently
+    stopped absolutising is caught from the other side too.
+    """
+    path = site / name
+    if not path.is_file():
+        problems.append(name + " was not written")
+        return
+    entries = BUNDLE_ENTRY.findall(path.read_text())
+    urls = [url for url, _, _ in entries]
+    repeated = sorted({u for u in urls if urls.count(u) > 1})
     if repeated:
         problems.append(
-            str(len(repeated))
-            + " page(s) appear in llms-full.txt more than once, which is also how a"
-            + " missing page hides from a count: " + show(repeated)
+            str(len(repeated)) + " page(s) appear in " + name + " more than once, which"
+            + " is also how a missing page hides from a count: " + show(repeated)
         )
-    if base:
-        bundled_pages = {u[len(base):] for u in bundled_urls if u.startswith(base)}
-        unbundled = sorted(u for u in published if u not in bundled_pages)
-        if unbundled:
-            problems.append(
-                str(len(unbundled))
-                + " published page(s) are missing from llms-full.txt, so the corpus it"
-                + " hands a model is not the corpus the site publishes: "
-                + show(unbundled)
-            )
-        phantom = sorted(u for u in bundled_pages if u not in set(published))
-        if phantom:
-            problems.append(
-                str(len(phantom))
-                + " llms-full.txt entr(ies) name a page the site does not publish: "
-                + show(phantom)
-            )
-    # Not "is it empty" and not "is it long enough" -- both of those
-    # were passed by a writer that kept the first forty characters and
-    # padded the rest with filler, and neither could see two pages'
-    # bodies swapped for each other. The bundle carries the committed
-    # page or it does not.
-    wrong_body = []
-    wrong_desc = []
-    for url, desc_line, body in bundled:
-        if not base or not url.startswith(base):
+    if not base:
+        return
+    expected = set(expected_pages)
+    pages = {u[len(base):] for u in urls if u.startswith(base)}
+    absent = sorted(expected - pages)
+    if absent:
+        problems.append(
+            str(len(absent)) + " page(s) that belong in " + name + " are missing, so the"
+            + " corpus it hands a model is not the set it should be: " + show(absent)
+        )
+    extra = sorted(pages - expected)
+    if extra:
+        problems.append(
+            str(len(extra)) + " " + name + " entr(ies) name a page that does not belong"
+            + " in this bundle: " + show(extra)
+        )
+    wrong_body, wrong_desc, stray_links = [], [], []
+    for url, desc_line, body in entries:
+        if not url.startswith(base):
             continue
         page = url[len(base):]
         if page not in source:
             continue
-        _, want_body, want_desc = source[page]
-        if body.strip() != want_body:
+        src_uri, want_body, want_desc = source[page]
+        if body.strip() != rewrite_links(want_body, src_uri):
             wrong_body.append(page)
         got_desc = desc_line[len("description: "):].strip() if desc_line else ""
         if got_desc != want_desc:
             wrong_desc.append(page)
+        if surviving_relative_links(body):
+            stray_links.append(page)
     if wrong_body:
         problems.append(
-            str(len(wrong_body))
-            + " llms-full.txt entr(ies) do not carry their page's committed markdown --"
-            + " truncated, padded, or holding some other page's body: " + show(wrong_body)
+            str(len(wrong_body)) + " " + name + " entr(ies) do not carry their page's"
+            + " committed markdown with links absolutised -- truncated, padded, wrongly"
+            + " rewritten, or holding another page's body: " + show(wrong_body)
         )
     if wrong_desc:
         problems.append(
-            str(len(wrong_desc))
-            + " llms-full.txt entr(ies) carry a description that is not the one in the"
-            + " page's front matter: " + show(wrong_desc)
+            str(len(wrong_desc)) + " " + name + " entr(ies) carry a description that is"
+            + " not the one in the page's front matter: " + show(wrong_desc)
         )
+    if stray_links:
+        problems.append(
+            str(len(stray_links)) + " " + name + " entr(ies) still carry a relative link"
+            + " that only resolves against the source tree, not from where the bundle is"
+            + " served: " + show(stray_links)
+        )
+
+
+# llms-full.txt is the whole corpus; llms-guides.txt is the indexed
+# (non-record) pages only -- the same set llms.txt maps.
+check_bundle("llms-full.txt", published)
+check_bundle("llms-guides.txt", indexable)
 
 # Twins, as a SET against the pages the site published: two equal
 # counts can hide a missing twin behind a stray .md somewhere else.
@@ -713,22 +890,60 @@ if twins - expected_twins:
         str(len(twins - expected_twins)) + " markdown file(s) in the site match no"
         + " published page: " + show(twins - expected_twins)
     )
-# Same rule as the bundle, and for the same three attacks: a twin IS
-# its page's committed markdown with the front matter stripped, so that
-# is what it is compared to. A length floor let a padded twin through
-# and could not tell two swapped twins apart at all.
-wrong_twin = [
-    u
-    for u in published
-    if twin_for(u) in twins
-    and u in source
-    and (site / twin_for(u)).read_text().strip() != source[u][1]
-]
+# Same rule as the bundle, and for the same attacks: a twin IS its
+# page's committed markdown with the front matter stripped, behind the
+# SAME derived header a bundle entry carries (so a twin fetched on its
+# own still says where it came from) and with its relative links
+# absolutised (so they resolve from the twin's URL, not the source
+# tree). Each is compared to the source, header re-derived, links
+# re-derived; a length floor let a padded twin through and could not tell
+# two swapped twins apart at all.
+no_header, wrong_twin, twin_wrong_desc, twin_stray_links, twin_dead = [], [], [], [], []
+for u in published:
+    if twin_for(u) not in twins or u not in source:
+        continue
+    src_uri, want_body, want_desc = source[u]
+    entry = BUNDLE_ENTRY.match((site / twin_for(u)).read_text())
+    if not entry:
+        no_header.append(u)
+        continue
+    got_url, desc_line, body = entry.group(1), entry.group(2), entry.group(3)
+    got_desc = desc_line[len("description: "):].strip() if desc_line else ""
+    if got_url != base + u or got_desc != want_desc:
+        twin_wrong_desc.append(u)
+    if body.strip() != rewrite_links(want_body, src_uri):
+        wrong_twin.append(u)
+    if surviving_relative_links(body):
+        twin_stray_links.append(u)
+    if dead_site_links(body):
+        twin_dead.append(u + " (" + dead_site_links(body)[0][len(base):] + ")")
+if no_header:
+    problems.append(
+        str(len(no_header)) + " markdown twin(s) do not open on the derived `---` header"
+        + " (url / [description] / audience) that a page fetched as markdown on its own"
+        + " needs to be self-describing: " + show(no_header)
+    )
+if twin_wrong_desc:
+    problems.append(
+        str(len(twin_wrong_desc)) + " markdown twin(s) carry a header whose url or"
+        + " description is not the one derived from the page: " + show(twin_wrong_desc)
+    )
 if wrong_twin:
     problems.append(
         str(len(wrong_twin))
-        + " markdown twin(s) are not their page's committed markdown -- present,"
-        + " counted, and holding something else: " + show(wrong_twin)
+        + " markdown twin(s) are not their page's committed markdown (links absolutised)"
+        + " -- present, counted, and holding something else: " + show(wrong_twin)
+    )
+if twin_stray_links:
+    problems.append(
+        str(len(twin_stray_links)) + " markdown twin(s) still carry a relative link that"
+        + " only resolves against the source tree, not from the twin's URL: "
+        + show(twin_stray_links)
+    )
+if twin_dead:
+    problems.append(
+        str(len(twin_dead)) + " markdown twin(s) carry an absolute in-site link the built"
+        + " site does not serve -- absolutised to a URL that 404s: " + show(twin_dead)
     )
 
 # --- the CUE lexer, read off the rendered page rather than the registry.
@@ -820,6 +1035,21 @@ def code_blocks(page_html):
     ]
 
 
+# A rendered mermaid diagram. Material's superfences mapping turns a
+# ```mermaid fence into `<pre class="mermaid">` (not a pygments
+# `<div class="highlight">`) and loads mermaid.js to typeset it. So a
+# mermaid fence needs its own signature set: if the `custom_fences`
+# mapping is dropped from mkdocs.yml, superfences renders the fence as an
+# ordinary code listing instead and the diagram silently becomes a wall
+# of `flowchart` source -- a green build with no diagram on the page.
+MERMAID_BLOCK = re.compile(r'<pre class="mermaid">(.*?)</pre>', re.S)
+
+
+def mermaid_blocks(page_html):
+    """Signatures of the mermaid diagrams a page rendered."""
+    return {squash(visible(inner)) for inner in MERMAID_BLOCK.findall(page_html)}
+
+
 def token_starting(spans, classes, prefix):
     """Did any span in `classes` hold text starting with `prefix`?"""
     return any(
@@ -870,6 +1100,13 @@ def token_starting(spans, classes, prefix):
 BLOCK_SYNTAX = re.compile(r'^(?:!!! |\?\?\?\+? |=== "|--8<--|[-*+] \[[ xX]\] |\|.*\|$)')
 ARTICLE = re.compile(r"<article[^>]*>(.*?)</article>", re.S)
 META = re.compile(r'<meta name="description" content="([^"]*)"')
+# The per-page pointer at the markdown twin (overrides/main.html). It is
+# what makes the whole export path reachable by an agent that lands on an
+# HTML page rather than guessing `/llms.txt`; without it the twins,
+# llms.txt and the bundles are invisible from the rendered site. The href
+# must be exactly where the twin is served, so it is compared to
+# `twin_for(url)` -- the same rule the twins block enforces against disk.
+ALT = re.compile(r'<link rel="alternate" type="text/markdown" href="([^"]*)"')
 
 checked = 0
 proven = 0
@@ -883,7 +1120,9 @@ no_heading = []
 lost_prose = []
 raw_syntax = []
 lost_block = []
+lost_mermaid = []
 wrong_meta = []
+wrong_alt = []
 for url in published:
     if url not in source:
         continue
@@ -931,9 +1170,16 @@ for url in published:
     if want_meta and (not got_meta or one_line(html.unescape(got_meta.group(1))) != want_meta):
         wrong_meta.append(url)
 
+    if base:
+        want_alt = base + twin_for(url)
+        got_alt = ALT.search(page_html)
+        if not got_alt or got_alt.group(1) != want_alt:
+            wrong_alt.append(url)
+
     blocks = code_blocks(page_html)
     page_fences = fences(page_md)
     signatures = {signature for signature, _ in blocks}
+    mermaid_sigs = mermaid_blocks(page_html)
     # EVERY fenced block, not only the `cue` ones. The prose assertion
     # above cannot cover these: `markdown_prose` deletes fenced blocks
     # before `longest_runs` reads the source, deliberately -- a shell
@@ -947,9 +1193,14 @@ for url in published:
     # all fail it; every one of the corpus's fences matches today, so
     # this ships with no exemption.
     for lang, body in page_fences:
-        if squash(body) not in signatures:
+        # A mermaid fence renders as a diagram, not a code block, so it is
+        # asserted against the mermaid blocks the page produced -- a
+        # POSITIVE check that enabling mermaid actually took, and stays.
+        target_sigs = mermaid_sigs if lang == "mermaid" else signatures
+        if squash(body) not in target_sigs:
             first = next((line for line in body.split("\n") if line.strip()), "")
-            lost_block.append(url + " (```" + (lang or "") + " `" + first.strip()[:50] + "`)")
+            marker = url + " (```" + (lang or "") + " `" + first.strip()[:50] + "`)"
+            (lost_mermaid if lang == "mermaid" else lost_block).append(marker)
     # `docs/adr/` is out of the drift gate's corpus, so the committed
     # census's `cue_fences` floor does not reach these -- reported on the
     # OK line rather than left to be discovered.
@@ -1008,6 +1259,13 @@ if lost_block:
         + " (which are built from the source, before rendering) still vouching for them: "
         + show(lost_block)
     )
+if lost_mermaid:
+    problems.append(
+        str(len(lost_mermaid)) + " ```mermaid fence(s) did not render as a"
+        + " `<pre class=\"mermaid\">` diagram -- the superfences `custom_fences` mermaid"
+        + " mapping is gone from mkdocs.yml, so the diagram is published as a wall of"
+        + " source instead: " + show(lost_mermaid)
+    )
 if no_heading:
     problems.append(
         str(len(no_heading)) + " published page(s) have no H1 and no run of plain prose"
@@ -1036,6 +1294,34 @@ if wrong_meta:
         + " `site_description:` -- half of what a page's front-matter `description:` is"
         + " for: " + show(wrong_meta)
     )
+if wrong_alt:
+    problems.append(
+        str(len(wrong_alt)) + " published page(s) carry no `<link rel=\"alternate\""
+        + " type=\"text/markdown\">`, or one whose href is not where the twin is served"
+        + " (base + twin_for(url)) -- so an agent on the HTML page cannot find the markdown"
+        + " layer, and overrides/main.html is missing or has drifted from `_twin_uri`: "
+        + show(wrong_alt)
+    )
+
+# robots.txt is the other half of "the export path is reachable": a
+# static file copied to the site root that points a crawler at the
+# sitemap. The Sitemap line is compared to `site_url` so a change to the
+# hostname that left robots.txt behind fails here rather than pointing
+# crawlers at the old origin.
+if base:
+    robots = site / "robots.txt"
+    if not robots.is_file():
+        problems.append(
+            "robots.txt was not published at the site root, so there is no `Sitemap:`"
+            " line and no crawl allowance -- add docs/robots.txt (mkdocs copies it)"
+        )
+    else:
+        want_sitemap = "Sitemap: " + base + "sitemap.xml"
+        if want_sitemap not in robots.read_text():
+            problems.append(
+                "robots.txt carries no `" + want_sitemap + "` line, so it does not point a"
+                " crawler at the sitemap mkdocs writes at that URL"
+            )
 
 if not checked:
     lexer_problems.append(
@@ -1096,9 +1382,11 @@ if problems or lexer_problems:
 
 print(
     "llm artefacts OK: " + str(len(listed)) + " page(s) indexed in llms.txt, "
-    + str(len(published)) + " bundled in llms-full.txt, " + str(len(twins))
-    + " markdown twin(s), each carrying its page's committed markdown and its"
-    + " authored description; " + str(len(published)) + " page(s) rendered carrying"
+    + str(len(published)) + " bundled in llms-full.txt, " + str(len(indexable))
+    + " in llms-guides.txt, " + str(len(twins))
+    + " markdown twin(s), each behind a derived header, carrying its page's committed"
+    + " markdown with links absolutised and its authored description; "
+    + str(len(published)) + " page(s) rendered carrying"
     + " their own heading, prose and meta description; CUE lexer OK: " + str(checked)
     + " highlighted fence(s), " + str(proven) + " of them proved to be CUE rather than"
     + " merely coloured, " + str(unfloored) + " of them on `adr/` pages the committed"

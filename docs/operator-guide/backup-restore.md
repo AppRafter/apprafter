@@ -49,7 +49,7 @@ There are three commands:
     (`cli/backup-core/src/extract.rs:101`).
 
 The full design rationale is in
-[ADR 0050](https://github.com/apprafter/apprafter/blob/master/docs/adr/0050-backup-restore.md).
+[ADR 0050](../adr/0050-backup-restore.md).
 [Velero](https://velero.io/) was evaluated and rejected — it requires an
 object-storage bucket as its backup location, which would force a purchase
 into the default path; AppRafter's default is a zero-bucket local pull.
@@ -568,7 +568,7 @@ and **no** first-class health condition — failure surfaces as a non-zero Job
 exit plus a status ConfigMap plus an optional webhook (below).
 
 The design and the rejected alternatives (K8up / helper-runs-restic) are in
-[ADR 0050](https://github.com/apprafter/apprafter/blob/master/docs/adr/0050-backup-restore.md).
+[ADR 0050](../adr/0050-backup-restore.md).
 
 ### The two-tier credential model — read this first
 
@@ -1021,5 +1021,5 @@ the design's Verify items:
 - [Choosing the machine](choosing-the-machine.md#changing-the-machine) — why a
   machine change is a rebuild, how far `apprafter destroy` reaches, and the
   two-project alternative that keeps the old cluster serving.
-- [ADR 0050](https://github.com/apprafter/apprafter/blob/master/docs/adr/0050-backup-restore.md)
+- [ADR 0050](../adr/0050-backup-restore.md)
   for the full design and the rejected alternatives.

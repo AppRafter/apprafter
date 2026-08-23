@@ -194,11 +194,17 @@ deleting the credential collects the plan too.
 
 A `MigrationPlan` moves through these phases:
 
-```text
-pending-approval → approved → executing → completed
-                → rejected (platform scope only)
-                → failed
+```mermaid
+flowchart LR
+    P["pending-approval"] -->|"approve"| A["approved"]
+    P -->|"reject (platform scope only)"| R["rejected"]
+    A --> X["executing"]
+    X --> C["completed"]
+    X --> F["failed"]
 ```
+
+A plan sits at `pending-approval` until someone acts on it; approval is
+the gate, and nothing downstream runs until it is given.
 
 Plans in `pending-approval` state remain there indefinitely — there
 is no automatic expiration. If you want to dismiss a platform-scope

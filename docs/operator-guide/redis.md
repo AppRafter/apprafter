@@ -16,7 +16,7 @@ Redis-compatible server. Each claim gets its **own numbered logical DB**
 on a shared pool instance, pinned by a per-claim `$N` ACL user, so apps
 use ordinary key names with complete keyspace separation. The full design
 and the measured per-DB overhead are in
-[ADR 0042](https://github.com/apprafter/apprafter/blob/master/docs/adr/0042-needs-redis-dragonfly.md).
+[ADR 0042](../adr/0042-needs-redis-dragonfly.md).
 
 ## The chain in one paragraph
 

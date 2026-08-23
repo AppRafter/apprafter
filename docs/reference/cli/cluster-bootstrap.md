@@ -1,6 +1,6 @@
 ---
 title: "apprafter cluster-bootstrap"
-description: "Install Cilium (CNI + kube-proxy replacement) and apply the Gateway API standard-install CRDs into the cluster pointed to by the cached kubeconfig"
+description: "GitOps loader for the cluster pointed to by the cached kubeconfig: install Cilium (CNI + kube-proxy replacement), then Argo CD, then apply the single root `platform` Application pointing at the platform-stack chart and wait for it to report Healthy."
 audience: reference
 status: stable
 ---
@@ -9,7 +9,7 @@ status: stable
 
 # `apprafter cluster-bootstrap`
 
-Install Cilium (CNI + kube-proxy replacement) and apply the Gateway API standard-install CRDs into the cluster pointed to by the cached kubeconfig
+GitOps loader for the cluster pointed to by the cached kubeconfig: install Cilium (CNI + kube-proxy replacement), then Argo CD, then apply the single root `platform` Application pointing at the platform-stack chart and wait for it to report Healthy. Everything else — Gateway API CRDs, cert-manager, the operator + admission webhook, network policies — is reconciled from that chart by Argo CD, not installed here. Idempotent; re-running is a no-op
 
 ```text
 Usage: apprafter cluster-bootstrap

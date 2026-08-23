@@ -16,7 +16,7 @@ is a single knob, `PlatformStack.spec.network.egress.profile`, managed by
 The full design — the per-app CNP, the static connection-target catalog,
 the three profiles, and the deferred `connects` / `AccessGrant` /
 `ExternalSurface` follow-ups — is in
-[ADR 0045](https://github.com/apprafter/apprafter/blob/master/docs/adr/0045-needs-networkpolicy-egress.md).
+[ADR 0045](../adr/0045-needs-networkpolicy-egress.md).
 
 ## The model in one paragraph
 
@@ -281,7 +281,7 @@ never hit this.
 
 ## Related
 
-- [ADR 0045 — needs → NetworkPolicy egress](https://github.com/apprafter/apprafter/blob/master/docs/adr/0045-needs-networkpolicy-egress.md)
+- [ADR 0045 — needs → NetworkPolicy egress](../adr/0045-needs-networkpolicy-egress.md)
 - [Declaring dependencies — the `needs` block](../dev-guide/application-cue.md#declaring-dependencies-the-needs-block)
 - [Postgres from a declared dependency](postgres.md),
   [Redis from a declared dependency](redis.md)

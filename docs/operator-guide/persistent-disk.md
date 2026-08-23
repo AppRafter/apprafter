@@ -18,7 +18,7 @@ replica). Because the PVC is single-writer, a `needs.disk` workload is
 pinned to `replicas: 1` with a `Recreate` rollout. The full design — the
 launch-minimal `class: local` slice, the unowned-PVC retention model, and
 the deferred replicated/shared classes — is in
-[ADR 0043](https://github.com/apprafter/apprafter/blob/master/docs/adr/0043-needs-disk-named-claims.md).
+[ADR 0043](../adr/0043-needs-disk-named-claims.md).
 
 ## The chain in one paragraph
 

@@ -1,0 +1,13 @@
+# The AppRafter documentation site is meant to be read — by people and
+# by agents. Nothing here is disallowed.
+#
+# Machine-readable entry points (see also the <link rel="alternate"
+# type="text/markdown"> in every page's head, and ADR 0057):
+#   /llms.txt         curated index of the guides, one line per page
+#   /llms-guides.txt  the indexed guides, bundled as one markdown file
+#   /llms-full.txt    the whole corpus (guides + ADR records)
+#   /<page>.md        the markdown twin of any page (drop the trailing /)
+User-agent: *
+Allow: /
+
+Sitemap: https://docs.apprafter.dev/sitemap.xml

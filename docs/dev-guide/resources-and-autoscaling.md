@@ -66,9 +66,9 @@ application.
     assumption that a request will be corrected upward for you.
 
 The design behind the automatic half is
-[ADR 0054](https://github.com/apprafter/apprafter/blob/master/docs/adr/0054-vpa-vertical-autoscaling.md);
+[ADR 0054](../adr/0054-vpa-vertical-autoscaling.md);
 the values it starts from are
-[ADR 0053](https://github.com/apprafter/apprafter/blob/master/docs/adr/0053-resource-governance.md).
+[ADR 0053](../adr/0053-resource-governance.md).
 
 ## If you set nothing
 
@@ -471,8 +471,8 @@ on the next sync — change the mode there instead.
   crash-looping or unschedulable pod.
 - [Platform management](../operator-guide/platform-management.md) — the
   `PlatformStack` resource the cluster-wide mode lives on.
-- [ADR 0053](https://github.com/apprafter/apprafter/blob/master/docs/adr/0053-resource-governance.md)
+- [ADR 0053](../adr/0053-resource-governance.md)
   and
-  [ADR 0054](https://github.com/apprafter/apprafter/blob/master/docs/adr/0054-vpa-vertical-autoscaling.md)
+  [ADR 0054](../adr/0054-vpa-vertical-autoscaling.md)
   — why the starting values are what they are, and why the correction
   happens in place.

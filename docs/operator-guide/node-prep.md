@@ -15,9 +15,9 @@ transient control-plane spike is absorbed instead of OOM-killing k3s or a
 data-critical pod. `apprafter node status` reports the resulting posture.
 
 The design decisions and trade-offs are in
-[ADR 0055](https://github.com/apprafter/apprafter/blob/master/docs/adr/0055-node-swap-policy.md)
+[ADR 0055](../adr/0055-node-swap-policy.md)
 (swap policy) and
-[ADR 0053](https://github.com/apprafter/apprafter/blob/master/docs/adr/0053-resource-governance.md)
+[ADR 0053](../adr/0053-resource-governance.md)
 (the reservations).
 
 > **`apprafter node reserve-headroom` was removed.** The old command that only
@@ -135,13 +135,13 @@ This applies to **Tier-1** (single-node, kine/sqlite control plane) only. sqlite
 tolerates paging, so mild swap (`swappiness=10`) is safe there. Tier-2 and above
 use etcd, which is latency-sensitive — paging etcd can trigger leader churn — so
 swap on those tiers is deferred and will use a stricter policy. See
-[ADR 0055](https://github.com/apprafter/apprafter/blob/master/docs/adr/0055-node-swap-policy.md).
+[ADR 0055](../adr/0055-node-swap-policy.md).
 
 ## Where to look next
 
-- [ADR 0055](https://github.com/apprafter/apprafter/blob/master/docs/adr/0055-node-swap-policy.md)
+- [ADR 0055](../adr/0055-node-swap-policy.md)
   — node swap policy and rationale.
-- [ADR 0053](https://github.com/apprafter/apprafter/blob/master/docs/adr/0053-resource-governance.md)
+- [ADR 0053](../adr/0053-resource-governance.md)
   — QoS, reservations, and the `reserve-headroom` → `node prep` history.
 - [`platform-management.md`](./platform-management.md) — managing the platform
   stack.

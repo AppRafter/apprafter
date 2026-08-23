@@ -11,7 +11,7 @@ process manager like pm2, where sibling processes wrote to the same folder —
 while preserving AppRafter's single-operator-managed lifecycle.
 
 The full design decisions and trade-offs are in
-[ADR 0049](https://github.com/apprafter/apprafter/blob/master/docs/adr/0049-cross-app-sharedvolume.md).
+[ADR 0049](../adr/0049-cross-app-sharedvolume.md).
 
 ## When to use a SharedVolume
 

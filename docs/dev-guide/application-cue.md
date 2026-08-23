@@ -124,6 +124,19 @@ injected into your container automatically: you name the env-vars you
 want and bind them to claim fields yourself (see *Referencing claims
 and secrets* below).
 
+```mermaid
+flowchart LR
+    N["needs entry"] --> RC["ResourceClaim (one per entry)"]
+    RC --> P["provisioner creates the backend (Postgres / Redis / disk)"]
+    P --> S["connection Secret (url, user, pass, host, port, db)"]
+    S --> E["env var you declare, bound as claim.&lt;need&gt;.&lt;field&gt;"]
+    E --> C["your container"]
+```
+
+The Application stays paused at `AwaitingResourceClaim` until every
+claim is ready, so your container never starts without the connection
+details it binds.
+
 ```cue
 spec: base: {
     image:    "ghcr.io/my-org/api:1.0.0"

@@ -9,6 +9,48 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.50 — corrected CLI --help, and a docs-site LLM-export/reference correctness pass (2026-08-23)
+
+> Monorepo tag `v0.2.50`. The CLI change is two `--help` corrections; the bulk is
+> docs.apprafter.dev — the markdown/LLM export layer and the generated CLI
+> reference. No operator, chart or cue-cmp change. Surfaced by a two-axis review
+> of the published docs site (how a human reads it, and how an LLM consumes it).
+> Every fix carries a matching assertion in `scripts/docs-artefacts-check.py` or
+> the docsgen gate, so it cannot silently regress.
+
+### Fixed
+
+- **`apprafter cluster-bootstrap --help` described an architecture that was
+  removed.** It claimed the command "installs Cilium and applies the Gateway API
+  standard-install CRDs" directly. Since the GitOps loader landed it installs
+  Cilium, then Argo CD, applies the single root `platform` Application, and lets
+  Argo CD reconcile everything else (Gateway API CRDs, cert-manager, the operator
+  + admission webhook, network policies) from the platform-stack chart. The
+  doc-comment — and so the generated reference and `llms.txt` — now say so.
+- **`apprafter app open --help` named the wrong Service label.** It said the
+  child Service is resolved via `app.kubernetes.io/instance`; the code selects on
+  `app.kubernetes.io/name` (the operator's label — `instance` is on the Argo CD
+  Application, not the rendered child). Corrected.
+
+### Changed / Added — docs.apprafter.dev
+
+- **The ADR index page is now listed in `llms.txt`.** The `ADRs` nav group had no
+  representation on the map at all; the numbered records still stay out.
+- **Markdown twins are self-describing and their links resolve.** Each twin now
+  carries the same `url`/`description`/`audience` header the bundle uses, and all
+  relative links in the twins and bundles are rewritten to absolute URLs — a
+  section-index twin previously 404'd on every link it carried.
+- **New `llms-guides.txt`** — the indexed guides bundled on their own (~a third of
+  the full corpus), while `llms-full.txt` stays the whole corpus.
+- **The export path is reachable from the HTML site.** Every page advertises its
+  markdown twin via `<link rel="alternate" type="text/markdown">`, and a new
+  `robots.txt` points crawlers at the sitemap — no need to guess `/llms.txt`.
+- **The CLI version is stamped on the generated reference** (drift-proof, from the
+  clap tree); the 17 ADR links that pointed at GitHub now point at the site;
+  mermaid diagrams for the bootstrap handover, the migration-plan gate, the
+  need→claim→secret→env chain and the tier model; and the home page leads with a
+  worked `Application.cue`.
+
 ## cli v0.2.49 — two substrate-upgrade fixes: offline backup verbs, and the target adopts the machine it provisioned (2026-08-22)
 
 > CLI-only (monorepo tag `v0.2.49`; no operator, chart or cue-cmp change).

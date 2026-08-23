@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+
+<!--
+  Point every HTML page at its markdown twin, so an agent that arrives on
+  a rendered page can find the plain-text layer `docs/hooks/llm_export.py`
+  publishes without having to guess that `/llms.txt` exists. The href is
+  the same rule as `_twin_uri` there: the site root's twin is
+  `index.md`; every other page renders at `<url>/` and its twin is that
+  URL with the trailing slash swapped for `.md`.
+
+  `scripts/docs-artefacts-check.py` asserts this href equals
+  `site_url + twin_for(page.url)` on every built page, so a page whose
+  alternate link stops matching where the twin is served fails the gate.
+-->
+{% block extrahead %}
+  {{ super() }}
+  {% if page and page.canonical_url %}
+    {% if page.is_homepage %}
+      <link rel="alternate" type="text/markdown" href="{{ config.site_url }}index.md">
+    {% else %}
+      <link rel="alternate" type="text/markdown" href="{{ page.canonical_url[:-1] }}.md">
+    {% endif %}
+  {% endif %}
+{% endblock %}

@@ -77,6 +77,10 @@ validation:
 
 theme:
   name: material
+  # Adds one <link rel="alternate" type="text/markdown"> per page (see
+  # overrides/main.html), so an agent on a rendered page can reach the
+  # markdown twin without guessing /llms.txt exists.
+  custom_dir: overrides
   features:
     - navigation.instant
     - navigation.tracking
@@ -141,7 +145,16 @@ markdown_extensions:
   - admonition
   - pymdownx.details
   - pymdownx.highlight # explicit: a build hook registers a CUE pygments lexer and needs this extension present to attach to
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      # Structural concepts (the tier model, the bootstrap → Argo CD
+      # handover, the need → claim → secret → env chain, the migration
+      # gate) are carried as `mermaid` diagrams. Material renders these to
+      # `<pre class="mermaid">` and loads mermaid.js itself; the source
+      # fence reaches the twin/bundle unchanged (it IS the diagram).
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.snippets: # guides include REAL files instead of carrying copies
       # Snippet paths are written repo-root-relative (e.g.
       # "examples/applications/redis-app.cue"). `!relative $config_dir`

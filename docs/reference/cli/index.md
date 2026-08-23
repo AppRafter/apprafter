@@ -9,10 +9,11 @@ status: stable
 
 # CLI reference
 
-Generated from `cli/platform-cli/src/cli.rs`. Every command, flag, default and
-alias below is projected straight from the parser, so this page cannot describe
-a flag the binary does not have. Run `apprafter <command> --help` for the same
-information shell-formatted.
+Generated from `cli/platform-cli/src/cli.rs` at **apprafter v0.2.50** — the release
+this whole reference describes. Every command, flag, default and alias below is
+projected straight from the parser, so this page cannot describe a flag the
+binary does not have. Run `apprafter <command> --help` for the same information
+shell-formatted.
 
 ## Start here
 
@@ -56,7 +57,7 @@ specific release rather than scraping these pages.
 | [`apprafter argocd-password`](argocd-password.md) | — | Print the Argo CD admin password (decrypted), fetching it from the cluster on first use. |
 | [`apprafter backup`](backup.md) | — | Encrypted backup (Kind 2, restic local-pull): native extraction + serialized config/app CRs + decrypted user secrets, all wrapped into a restic repository. |
 | [`apprafter bootstrap-all`](bootstrap-all.md) | `up` | One-command provisioning: runs `apply` → polls for the k3s kubeconfig to become SSH-reachable → runs `cluster-bootstrap` for a freshly-provisioned cluster. |
-| [`apprafter cluster-bootstrap`](cluster-bootstrap.md) | `cb` | Install Cilium (CNI + kube-proxy replacement) and apply the Gateway API standard-install CRDs into the cluster pointed to by the cached kubeconfig |
+| [`apprafter cluster-bootstrap`](cluster-bootstrap.md) | `cb` | GitOps loader for the cluster pointed to by the cached kubeconfig: install Cilium (CNI + kube-proxy replacement), then Argo CD, then apply the single root `platform` Application pointing at the platform-stack chart and wait for it to report Healthy. |
 | [`apprafter completion`](completion.md) | — | Print a shell completion script on stdout |
 | [`apprafter destroy`](destroy.md) | — | Destroy every `apprafter=true`-labelled resource in the provider project the token belongs to — servers, floating IPs, firewalls, networks and SSH keys |
 | [`apprafter doctor`](doctor.md) | — | Self-diagnostic over the active target's config, credentials and reachability plus the surrounding shell environment (kubectl, helm, ssh, DNS). |

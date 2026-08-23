@@ -183,6 +183,24 @@ This runs three phases under a unified progress display:
    admission webhook — from that chart without further CLI
    intervention.
 
+```mermaid
+flowchart TD
+    A["apprafter bootstrap-all"] --> B["apply: SSH key, network, firewall, server, k3s via cloud-init"]
+    B --> C["k3s-ready: poll cloud-init, fetch kubeconfig over SSH"]
+    C --> D["cluster-bootstrap"]
+    subgraph loader["cluster-bootstrap (CLI loader)"]
+        D --> E["helm install Cilium (CNI)"]
+        E --> F["helm install Argo CD"]
+        F --> G["kubectl apply root 'platform' Application"]
+    end
+    G --> H{"Argo CD reconciles the platform-stack chart"}
+    H --> I["Gateway API CRDs, cert-manager, operator + admission webhook, default-deny NetworkPolicy, self-signed ClusterIssuer; adopts the Cilium release"]
+```
+
+The CLI installs only what the node needs to schedule Argo CD (Cilium,
+then Argo CD itself); everything past the root Application is Argo CD's
+to reconcile from the chart.
+
 Preview before spending a Hetzner cent:
 
 ```sh
