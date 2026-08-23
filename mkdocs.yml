@@ -245,3 +245,4 @@ nav:
       # for by name.
       - Licensing: license.md
   - ADRs: adr/README.md
+  - Status: status.md

@@ -120,6 +120,7 @@ Full operator and developer documentation:
 - [Migration plans](https://docs.apprafter.dev/operator-guide/migration-plans/) — approve and reject destructive-change gates.
 - [Private repos & registries](https://docs.apprafter.dev/dev-guide/private-repos-and-registries/) — registering the credential Argo CD clones with and the node pulls with.
 - [Writing Application.cue](https://docs.apprafter.dev/dev-guide/application-cue/) — the CUE manifest format, CMP, and multi-environment patterns.
+- [Feature status](https://docs.apprafter.dev/status/) — every user-facing feature, its status, and the phase it lands in.
 
 ## Development
 
