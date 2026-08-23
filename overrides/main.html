@@ -22,3 +22,23 @@
     {% endif %}
   {% endif %}
 {% endblock %}
+
+<!--
+  A footer line naming the release the docs describe. The version is
+  single-sourced at build time from the committed generated CLI reference
+  (`docs/reference/cli/index.md`) by `docs/hooks/llm_export.py`, which
+  publishes it as `config.extra.cli_version` -- so there is no second
+  version literal here to drift, and if that reference line ever moves the
+  hook degrades to a build-date rather than failing the build. `{{ super() }}`
+  keeps material's own footer; the line is appended after it.
+-->
+{% block footer %}
+  {{ super() }}
+  {%- if config.extra.cli_version %}
+  <div class="md-footer-meta__inner md-grid" style="padding-top:0">
+    <div class="md-copyright" style="margin:0 auto;opacity:.7;font-size:.64rem">
+      Documentation for AppRafter {{ config.extra.cli_version }}
+    </div>
+  </div>
+  {%- endif %}
+{% endblock %}

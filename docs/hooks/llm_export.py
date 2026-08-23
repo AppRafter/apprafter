@@ -121,6 +121,7 @@ from __future__ import annotations
 import posixpath
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from mkdocs.config.defaults import MkDocsConfig
@@ -617,10 +618,33 @@ def _render_bundle(
     return "\n".join(out)
 
 
+# The site footer names the release the docs describe. The version is
+# single-sourced from the committed generated CLI reference — the same
+# docsgen origin that stamps `reference/cli/index.md` — so the footer
+# cannot name a version the reference does not. Read at build time from
+# the committed file (always inside docs_dir, so always reachable);
+# falls back to a build-stamped date if that line ever moves, rather
+# than failing the build over a decorative footer.
+_CLI_VERSION_RE = re.compile(r"at \*\*apprafter (v[0-9][0-9A-Za-z.\-]*)\*\*")
+
+
+def _cli_version(config: MkDocsConfig) -> str:
+    ref = Path(config["docs_dir"]) / "reference" / "cli" / "index.md"
+    try:
+        m = _CLI_VERSION_RE.search(ref.read_text(encoding="utf-8"))
+    except OSError:
+        m = None
+    if m:
+        return m.group(1)
+    return "built " + datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
 def on_config(config: MkDocsConfig) -> MkDocsConfig:
     """Drop anything held over from a previous build (`mkdocs serve` rebuilds)."""
     _docs.clear()
     _groups.clear()
+    config["extra"] = config.get("extra") or {}
+    config["extra"]["cli_version"] = _cli_version(config)
     return config
 
 
