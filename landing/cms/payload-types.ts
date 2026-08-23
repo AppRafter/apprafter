@@ -199,6 +199,10 @@ export interface WaitlistSignup {
    */
   interests?: ('tier2' | 'observability' | 'managed' | 'tier3' | 'tier4')[] | null;
   /**
+   * Which upcoming roadmap phase(s) this signup wants to hear about. Options are generated from the phase registry; ids match interests so old records stay valid.
+   */
+  phases?: ('tier2' | 'managed' | 'tier3' | 'tier4' | 'federation')[] | null;
+  /**
    * Triggers a Calendly link email via afterChange hook.
    */
   wantsCall?: boolean | null;
@@ -318,6 +322,7 @@ export interface WaitlistSignupsSelect<T extends boolean = true> {
   email?: T;
   useCase?: T;
   interests?: T;
+  phases?: T;
   wantsCall?: T;
   source?: T;
   callEmailSentAt?: T;

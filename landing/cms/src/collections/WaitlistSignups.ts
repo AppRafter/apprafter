@@ -4,6 +4,7 @@
 import type { CollectionConfig } from 'payload';
 
 import { sendDiscoveryEmail } from '../hooks/sendDiscoveryEmail';
+import { phaseOptions } from './waitlistPhaseOptions';
 
 /**
  * Pre-launch waitlist storage. Submitted unauthenticated from
@@ -17,7 +18,7 @@ export const WaitlistSignups: CollectionConfig = {
   slug: 'waitlist-signups',
   admin: {
     useAsTitle: 'email',
-    defaultColumns: ['email', 'wantsCall', 'interests', 'callEmailSentAt', 'createdAt'],
+    defaultColumns: ['email', 'wantsCall', 'interests', 'phases', 'callEmailSentAt', 'createdAt'],
     description:
       'Launch waitlist. Email is the unique key; interests record which upcoming releases the signup wants; wantsCall toggles a follow-up Calendly invitation.',
   },
@@ -54,6 +55,16 @@ export const WaitlistSignups: CollectionConfig = {
         { label: 'Tier 4 — confidential (Phase 6+)', value: 'tier4' },
       ],
       admin: { description: 'Which upcoming releases this signup wants to hear about.' },
+    },
+    {
+      name: 'phases',
+      type: 'select',
+      hasMany: true,
+      options: phaseOptions(),
+      admin: {
+        description:
+          'Which upcoming roadmap phase(s) this signup wants to hear about. Options are generated from the phase registry; ids match interests so old records stay valid.',
+      },
     },
     {
       name: 'wantsCall',
