@@ -14,7 +14,7 @@
 
 ---
 
-> **Status:** pre-1.0, under active development. The single-node **Tier 1** path has shipped (MVP, the `v0.1.x` series); multi-node tiers, the platform services, and the managed cloud are in active development. `spec.md` (its `Revision` line) and `plan.md` are the source of truth — this README states what runs today versus what is on the roadmap.
+> **Status:** pre-1.0, under active development. The single-node **Tier 1 MVP** (milestone **M1**, the `v0.1.x` series) has shipped; multi-node tiers, the platform services, and the managed cloud are in active development. `spec.md` (its `Revision` line) and `plan.md` are the source of truth — this README states what runs today versus what is on the roadmap.
 
 ## What it is
 

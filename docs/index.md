@@ -81,4 +81,4 @@ flowchart LR
 
 ## Status
 
-Pre-MVP. Active development.
+Pre-MVP (managed offering). Active development.
