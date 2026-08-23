@@ -34,6 +34,15 @@ const anchorFor = (num: string) => phaseAnchor(byLabel.get(num)?.id ?? num);
                 <li>{item.text}</li>
               ))}
             </ul>
+            {byLabel.get(p.num) && byLabel.get(p.num)!.status !== 'shipped' && (
+              <button
+                type="button"
+                class="roadmap-waitlist btn-waitlist"
+                data-preselect={byLabel.get(p.num)!.id}
+              >
+                Get notified when {p.num} ships
+              </button>
+            )}
           </div>
         ))
       }
@@ -41,6 +50,17 @@ const anchorFor = (num: string) => phaseAnchor(byLabel.get(num)?.id ?? num);
     <p class="roadmap-closing">{data.closing}</p>
   </Container>
 </section>
+
+<script>
+  for (const b of document.querySelectorAll('.roadmap-waitlist')) {
+    b.addEventListener('click', () => {
+      const preselect = (b as HTMLElement).dataset.preselect;
+      document.dispatchEvent(
+        new CustomEvent('waitlist:toggle', { detail: { open: true, preselect } }),
+      );
+    });
+  }
+</script>
 
 <style>
   .roadmap {
@@ -97,6 +117,10 @@ const anchorFor = (num: string) => phaseAnchor(byLabel.get(num)?.id ?? num);
     width: 10px;
     height: 1px;
     background: var(--accent);
+  }
+  .roadmap-waitlist {
+    margin-top: 20px;
+    justify-self: start;
   }
   .roadmap-closing {
     margin-top: 56px;

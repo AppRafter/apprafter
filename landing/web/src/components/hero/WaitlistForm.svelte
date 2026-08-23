@@ -75,6 +75,7 @@ $effect(() => {
 });
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PHASE_IDS = new Set(['tier2', 'managed', 'tier3', 'tier4', 'federation']);
 
 async function submit(ev: SubmitEvent) {
   ev.preventDefault();
@@ -97,6 +98,9 @@ async function submit(ev: SubmitEvent) {
         useCase: useCase || undefined,
         wantsCall,
         interests: interestKeys.length ? interestKeys : undefined,
+        phases: interestKeys.filter((k) => PHASE_IDS.has(k)).length
+          ? interestKeys.filter((k) => PHASE_IDS.has(k))
+          : undefined,
         source: typeof document !== 'undefined' ? document.referrer || 'direct' : 'direct',
       }),
     });
