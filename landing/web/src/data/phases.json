@@ -1,0 +1,46 @@
+{
+  "phases": [
+    {
+      "id": "tier1",
+      "label": "Shipped",
+      "title": "Tier 1 single-node control plane",
+      "status": "shipped",
+      "anchor": "/#roadmap-phase-tier1"
+    },
+    {
+      "id": "tier2",
+      "label": "Phase 3",
+      "title": "Production multi-node + observability",
+      "status": "planned",
+      "anchor": "/#roadmap-phase-tier2"
+    },
+    {
+      "id": "managed",
+      "label": "Phase 4",
+      "title": "Managed offering launch",
+      "status": "planned",
+      "anchor": "/#roadmap-phase-managed"
+    },
+    {
+      "id": "tier3",
+      "label": "Phase 5+",
+      "title": "Production Tier 3 + multi-tenancy",
+      "status": "planned",
+      "anchor": "/#roadmap-phase-tier3"
+    },
+    {
+      "id": "tier4",
+      "label": "Phase 6+",
+      "title": "Confidential workloads",
+      "status": "planned",
+      "anchor": "/#roadmap-phase-tier4"
+    },
+    {
+      "id": "federation",
+      "label": "Phase 8+",
+      "title": "Cross-cluster federation",
+      "status": "planned",
+      "anchor": "/#roadmap-phase-federation"
+    }
+  ]
+}
