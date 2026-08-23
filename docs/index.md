@@ -56,6 +56,7 @@ apprafter app add          # registers it; Argo CD deploys it and keeps it synce
   choice, one decision per record.
 
 For machine readers, `/llms.txt` is a curated index of these guides,
+`/llms-guides.txt` bundles the indexed guides on their own,
 `/llms-full.txt` bundles the whole corpus, and every page is also served
 as markdown at its own URL with the trailing `/` swapped for `.md`.
 
