@@ -48,7 +48,12 @@ export const LandingHero: GlobalConfig = {
       type: 'group',
       fields: [
         { name: 'label', type: 'text', required: true, localized: true },
-        { name: 'href', type: 'text', required: true },
+        {
+          name: 'href',
+          type: 'text',
+          required: true,
+          defaultValue: 'https://docs.apprafter.dev/operator-guide/quickstart/',
+        },
       ],
     },
     {

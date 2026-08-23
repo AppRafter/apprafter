@@ -8,7 +8,7 @@
   "cueSnippet": "apiVersion: apprafter.io/v1alpha1\nkind: Application\nmetadata: {\n    name:      \"billing-api\"\n    namespace: \"prod\"\n}\n\nspec: {\n    base: {\n        image:    \"ghcr.io/me/billing:v1.4.2\"\n        replicas: 3\n\n        expose: {\n            port:     8080\n            network:  \"public\"\n            hostname: \"billing.example.com\"\n        }\n\n        needs: {\n            pg: {size: \"small\"}\n        }\n\n        env: {\n            DATABASE_URL: claim.pg.url\n            STRIPE_KEY:   secret: \"stripe/api-key\"\n            LOG_LEVEL:    \"info\"\n        }\n    }\n\n    environments: {\n        dev: {\n            replicas: 1\n            expose: {\n                port:    8080\n                network: \"internal\"\n            }\n        }\n        prod: {\n            replicas: 3\n        }\n    }\n}",
   "primaryCTA": {
     "label": "Try self-host",
-    "href": "https://github.com/AppRafter/apprafter#quickstart"
+    "href": "https://docs.apprafter.dev/operator-guide/quickstart/"
   },
   "secondaryCTA": {
     "label": "Join the waitlist"
