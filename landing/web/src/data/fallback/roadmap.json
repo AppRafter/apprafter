@@ -60,5 +60,5 @@
       ]
     }
   ],
-  "closing": "Roadmap is driven by shipped features, not PR dates. Each phase is a finished product on its own, not “an MVP we'll polish later”."
+  "closing": "Roadmap is driven by shipped features, not PR dates. Each phase is a finished product on its own, not “an MVP we'll polish later”. These public phases are a deliberately coarser product sequence — the fine-grained OSS build order lives in plan.md, and the phase numbers here are not meant to be reconciled against it."
 }
