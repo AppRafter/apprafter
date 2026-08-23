@@ -80,6 +80,13 @@ flowchart LR
 | **3. Production** | Established product        | 3–5× dedicated EPYC       | €500–2000/mo |
 | **4. Regulated**  | Compliance / sovereignty   | TDX/SEV-SNP, confidential | €2000+/mo    |
 
+Tiers 2–4 are on the roadmap — multi-node and observability land in
+[Phase 3](https://apprafter.dev/#roadmap-phase-tier2),
+bare-metal Tier 3 in
+[Phase 5+](https://apprafter.dev/#roadmap-phase-tier3),
+and confidential Tier 4 in
+[Phase 6+](https://apprafter.dev/#roadmap-phase-tier4).
+
 ## Status
 
 Pre-MVP (managed offering). Active development.

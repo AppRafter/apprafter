@@ -1,0 +1,26 @@
+/* SPDX-FileCopyrightText: 2026 AppRafter contributors */
+/* SPDX-License-Identifier: FSL-1.1-Apache-2.0          */
+
+/* Roadmap-phase chip for the docs. Purely additive — an attr_list
+ * class on an ordinary markdown link, so it degrades to a plain
+ * [Phase N](url) link in the markdown twin and llms-full.txt (no
+ * plugin, one-way principle). The link target is the landing roadmap
+ * anchor, id-derived to match phases.json. */
+.phase-chip {
+  display: inline-block;
+  font-family: var(--md-code-font-family, monospace);
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 0.1rem 0.4rem;
+  border: 1px solid var(--md-default-fg-color--lighter);
+  border-radius: 0;
+  color: var(--md-default-fg-color--light);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.phase-chip:hover {
+  border-color: var(--md-accent-fg-color);
+  color: var(--md-accent-fg-color);
+}

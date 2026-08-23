@@ -108,6 +108,11 @@ theme:
         icon: material/weather-sunny
         name: Switch to light mode
 
+# Additive-only stylesheet: the .phase-chip class for roadmap-phase
+# links (attr_list, no plugin). See docs/stylesheets/extra.css.
+extra_css:
+  - stylesheets/extra.css
+
 plugins:
   - search
   # The CLI reference is generated (`just docsgen-generate`), so its
