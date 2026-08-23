@@ -115,11 +115,11 @@ covered end-to-end in the [operator quickstart](https://docs.apprafter.dev/opera
 
 Full operator and developer documentation:
 
-- [Operator quickstart](./docs/operator-guide/quickstart.md) — provision and bootstrap a Tier-1 cluster.
-- [Platform management](./docs/operator-guide/platform-management.md) — PlatformStack lifecycle, channels, upgrade and freeze.
-- [Migration plans](./docs/operator-guide/migration-plans.md) — approve and reject destructive-change gates.
-- [Private repos & registries](./docs/dev-guide/private-repos-and-registries.md) — registering the credential Argo CD clones with and the node pulls with.
-- [Writing Application.cue](./docs/dev-guide/application-cue.md) — the CUE manifest format, CMP, and multi-environment patterns.
+- [Operator quickstart](https://docs.apprafter.dev/operator-guide/quickstart/) — provision and bootstrap a Tier-1 cluster.
+- [Platform management](https://docs.apprafter.dev/operator-guide/platform-management/) — PlatformStack lifecycle, channels, upgrade and freeze.
+- [Migration plans](https://docs.apprafter.dev/operator-guide/migration-plans/) — approve and reject destructive-change gates.
+- [Private repos & registries](https://docs.apprafter.dev/dev-guide/private-repos-and-registries/) — registering the credential Argo CD clones with and the node pulls with.
+- [Writing Application.cue](https://docs.apprafter.dev/dev-guide/application-cue/) — the CUE manifest format, CMP, and multi-environment patterns.
 
 ## Development
 
