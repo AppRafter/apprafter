@@ -210,17 +210,16 @@ describe('content sections (Phase F)', () => {
   });
 
   test('roadmap phase ids are stable anchors for comparison cross-links', () => {
-    // The slug formula lives in Roadmap.astro and the link target
-    // lives in comparison.json — both must agree on the same id.
-    const rm = readFileSync(join(ROOT, 'src/components/sections/Roadmap.astro'), 'utf8');
+    // The slug formula lives in src/lib/phase-anchor.ts (id-derived,
+    // R2) and the link target lives in comparison.json — both must
+    // agree on the same id anchor. The old label-derived slug doubled
+    // to #roadmap-phase-phase-8; that must never come back.
     const cmpJson = readFileSync(join(ROOT, 'src/data/fallback/comparison.json'), 'utf8');
-    const roadmapJson = readFileSync(join(ROOT, 'src/data/fallback/roadmap.json'), 'utf8');
-    // Slug-builder function still in component.
-    expect(rm).toContain('roadmap-phase-');
-    // Comparison row links to #roadmap-phase-phase-8.
-    expect(cmpJson).toContain('#roadmap-phase-phase-8');
-    // Roadmap data carries the matching Phase 8+ phase.
-    expect(roadmapJson).toContain('Phase 8+');
+    const roadmap = readFileSync(join(ROOT, 'src/components/sections/Roadmap.astro'), 'utf8');
+    expect(cmpJson).toContain('#roadmap-phase-federation');
+    expect(cmpJson).not.toContain('#roadmap-phase-phase-8');
+    expect(roadmap).toContain('phaseAnchor');
+    expect(roadmap).not.toContain('roadmap-phase-phase');
   });
 
   test('all section eyebrows are unique (no copy-paste collisions)', () => {

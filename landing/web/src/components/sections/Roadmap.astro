@@ -2,15 +2,20 @@
 // SPDX-FileCopyrightText: 2026 AppRafter contributors
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 
+import phaseRegistry from '../../data/phases.json';
 import { getRoadmap } from '../../lib/cms';
+import { phaseAnchor } from '../../lib/phase-anchor';
 import Container from '../primitives/Container.astro';
 import SectionHead from '../primitives/SectionHead.astro';
 
 const data = await getRoadmap();
 const phases = data.phases ?? [];
 
-const slug = (num: string) =>
-  `roadmap-phase-${num.toLowerCase().replace(/\W+/g, '-').replace(/^-|-$/g, '')}`;
+// Map each roadmap block's display label (p.num, e.g. "Phase 3") to
+// the registry entry so the anchor derives from the stable id, not the
+// label. Falls back to the label if a block has no registry twin.
+const byLabel = new Map(phaseRegistry.phases.map((e) => [e.label, e]));
+const anchorFor = (num: string) => phaseAnchor(byLabel.get(num)?.id ?? num);
 ---
 
 <section aria-label="Roadmap" id="roadmap" data-screen-label="roadmap">
@@ -19,7 +24,7 @@ const slug = (num: string) =>
     <div class="roadmap">
       {
         phases.map((p) => (
-          <div class="roadmap-phase" id={slug(p.num)}>
+          <div class="roadmap-phase" id={anchorFor(p.num)}>
             <div class="phase-meta">
               <div class="phase-num">{p.num}</div>
               <h3>{p.title}</h3>
