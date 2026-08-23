@@ -5,10 +5,24 @@
 import { getBoringTech } from '../../lib/cms';
 import Container from '../primitives/Container.astro';
 import SectionHead from '../primitives/SectionHead.astro';
+import PhaseChip from '../PhaseChip.astro';
 
 const data = await getBoringTech();
 const underHood = data.underHood ?? [];
 const ourCode = data.ourCode ?? [];
+
+// Every unreleased component carries a phase chip (PRES-02). Keyed by
+// the item `name` in boringTech.json; anything not listed is shipped
+// today and renders no chip. Ids resolve against src/data/phases.json.
+const itemPhase: Record<string, string> = {
+  'Talos Linux': 'tier3',
+  ClickHouse: 'tier2',
+  OpenBao: 'tier2',
+  Backstage: 'managed',
+  'Kamaji + Capsule': 'tier3',
+  'MCP server with agentic safety gate': 'managed',
+  'NATS-based audit log layer on top of kine': 'tier2',
+};
 ---
 
 <section aria-label="Boring tech" id="stack" data-screen-label="stack">
@@ -23,6 +37,7 @@ const ourCode = data.ourCode ?? [];
               <li>
                 <span class="name">{item.name}</span>
                 <span class="desc">{item.desc}</span>
+                {itemPhase[item.name] && <PhaseChip id={itemPhase[item.name]!} />}
               </li>
             ))
           }
@@ -38,6 +53,7 @@ const ourCode = data.ourCode ?? [];
                   <span class="ours">{item.name}</span>
                 </span>
                 <span class="desc">{item.desc}</span>
+                {itemPhase[item.name] && <PhaseChip id={itemPhase[item.name]!} />}
               </li>
             ))
           }

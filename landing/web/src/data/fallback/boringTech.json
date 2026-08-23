@@ -25,7 +25,7 @@
     { "name": "ClickHouse", "desc": "Logs, traces, application analytics." },
     { "name": "OpenBao", "desc": "Secrets management (HashiCorp Vault fork, BSL-free)." },
     { "name": "Backstage", "desc": "Developer portal with TypeScript plugins." },
-    { "name": "Kamaji + Capsule", "desc": "Hard multi-tenancy (Phase 5+)." },
+    { "name": "Kamaji + Capsule", "desc": "Hard multi-tenancy." },
     { "name": "cert-manager · external-dns · KEDA", "desc": "Standard k8s add-ons." }
   ],
   "ourCode": [

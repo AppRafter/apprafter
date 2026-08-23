@@ -222,6 +222,24 @@ describe('content sections (Phase F)', () => {
     expect(roadmap).not.toContain('roadmap-phase-phase');
   });
 
+  test('PRES-02: every unreleased boringTech item carries a phase chip', () => {
+    const bt = readFileSync(join(ROOT, 'src/components/sections/BoringTech.astro'), 'utf8');
+    for (const name of [
+      'Talos Linux',
+      'ClickHouse',
+      'OpenBao',
+      'Backstage',
+      'Kamaji + Capsule',
+      'MCP server with agentic safety gate',
+      'NATS-based audit log layer on top of kine',
+    ]) {
+      expect(bt).toContain(name);
+    }
+    expect(bt).toContain('<PhaseChip id={itemPhase[item.name]!} />');
+    const btJson = readFileSync(join(ROOT, 'src/data/fallback/boringTech.json'), 'utf8');
+    expect(btJson).not.toContain('Hard multi-tenancy (Phase 5+)');
+  });
+
   test('all section eyebrows are unique (no copy-paste collisions)', () => {
     // Every section's eyebrow lives in its fallback JSON — ValueProps
     // moved its previously-hardcoded "Why AppRafter" into the CMS
