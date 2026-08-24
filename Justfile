@@ -263,6 +263,19 @@ docs-build:
 docs-check:
     bash scripts/docs-check.sh
 
+# Live landing content smoke (SYS-3 layer c). Probes the running
+# production site — the CMS retags prod with no PR, so an image smoke
+# would never witness a content-only regression. Defaults to
+# apprafter.dev; pass a base URL to probe a preview/local host.
+landing-smoke base='https://apprafter.dev':
+    bash scripts/landing-site-smoke.sh {{base}}
+
+# Landing fallback-JSON schema gate (SYS-3 layer a). The bun test that
+# validates the fallback JSONs baked into the reproducible image against
+# the site shapes and the phase registry.
+landing-check:
+    cd landing && bun test landing-content-gate.test.ts
+
 # Regenerate `docs/reference/cli/**` from the clap definitions.
 #
 # MUST be run (and the result committed) after ANY change to the CLI

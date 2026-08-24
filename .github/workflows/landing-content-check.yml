@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+name: landing-content-check
+
+# SYS-3 landing content gate. live-smoke = layer (c) against the running
+# prod origin (the CMS retags prod with no PR, so this is the only moment
+# a content-only regression is caught): daily schedule + post-promote
+# (repository_dispatch landing-promote-to-prod) + manual. fallback-schema
+# = layer (a) bun test on PRs touching the fallback/registry inputs.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  repository_dispatch:
+    types: [landing-promote-to-prod]
+  pull_request:
+    paths:
+      - 'landing/web/src/data/fallback/**'
+      - 'landing/web/src/data/phases.json'
+      - 'landing/web/src/lib/types.ts'
+      - 'landing/landing-content-gate.test.ts'
+      - 'scripts/landing-site-smoke.sh'
+      - '.github/workflows/landing-content-check.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  live-smoke:
+    name: layer (c) live smoke — apprafter.dev
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install jq
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
+      - name: landing-site-smoke against apprafter.dev
+        run: bash scripts/landing-site-smoke.sh https://apprafter.dev
+
+  fallback-schema:
+    name: layer (a) fallback + registry schema
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: bun test the content gate
+        working-directory: landing
+        run: bun install --frozen-lockfile && bun test landing-content-gate.test.ts
