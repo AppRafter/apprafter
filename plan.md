@@ -4138,6 +4138,9 @@ Decision 0 (ADR 0056 §d): provisioning — это spending decision, implicit `
 
 **Размер:** XL · a–i (закрыты) — L; впереди только j (прогулка по каждому гайду + шесть ручных шагов оператора из (g), без которых сайт не отдаётся).
 
+> 🚧 **Presentation-walk (Tier A + SYS-1/2/3) — на ветке `feat/presentation-walk`, ожидает push + prod-promote + live-smoke.**
+> Двадцать коммитов `3626d5c…e9e10de` закрывают: PRES-01/03/04/05/06/07/08 (Tier-A точечные правки: CTA → operator-quickstart, product-path README, абсолютные ссылки docs, формулировки MVP, `llms-guides.txt` в machine-readers, версионный футер, ADR-index relabel), SYS-1 (фазовый реестр `phases.json` + `PhaseChip` на лендинге + PRES-02 boringTech chips + PRES-09 decoupled public phases), SYS-2 (публичная страница `/status/` с колонкой Phase + per-phase поле subscribe на форме; строка в `docs/status.md` добавлена этим треком), SYS-3 (content-gate: live-smoke скрипт + workflow + schema-тест + Payload validate). Дизайн-спек: `docs/superpowers/specs/2026-08-23-presentation-walk-design.md`.
+
 ---
 
 ## Фаза 2.9 — Dev Mode + Services (Phase 2B из dev-mode-task.md)

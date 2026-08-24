@@ -109,6 +109,9 @@ The foundation everything else builds on. Closed in `plan.md` across the `v0.1.x
 | Phase | Status | Feature | plan.md | order/CP |
 |---|---|---|---|---|
 | Shipped | 🚧 | Public documentation site (`docs.apprafter.dev`) — generated CLI reference + guides, kept true to the code by a drift gate in `just lint` and CI | 2.19 | order 3.7b · CP1 |
+| Shipped | 🚧 | Presentation-walk program — phase registry + PhaseChip across landing/docs/README; id-derived roadmap anchors (no `phase-phase`); published `/status/` feature page with Phase column; per-phase subscribe control; SYS-3 content gate (live-smoke + schema-test + Payload validate); Tier-A point fixes (operator-quickstart CTA, product-path README, absolute doc links, MVP wording, `llms-guides.txt`, version footer, ADR-index relabel) | 2.19 (order-3.7b) | order 3.7b · CP1 |
+
+> **Presentation-walk 🚧:** delivered on `feat/presentation-walk` (PRES-01…09 + SYS-1/2/3); awaiting push + prod promote + live-smoke green.
 
 > **🚧 — nine of ten subphases closed (a–i), and the only one of them a user can see today is `apprafter --help`.** The machinery half has landed: a validating strict site build (**2.19a**), a generated reference over every command path that is byte-compared against the clap tree (**2.19b**), a content-detected drift gate over the in-scope guides that resolves documented invocations, schema paths and CUE manifests against what ships (**2.19c**), its xref/health half — repository paths, ADR citations, obligations that survive unfencing a block, and a committed corpus census whose obligation counts may not fall (**2.19d**) — and the two mkdocs build hooks: CUE now renders as code, every page carries a one-line `description`, and the site publishes `llms.txt`, `llms-full.txt` and a markdown twin per page (**2.19e**).
 >

@@ -9,6 +9,120 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## presentation-walk (feat/presentation-walk) — phase registry, PhaseChip, /status/ page, landing content gate (2026-08-24, awaiting push + prod promote)
+
+> No release tag yet — branch `feat/presentation-walk` is not pushed. Entries
+> below describe the 20 commits `3626d5c…e9e10de`. All surfaces are docs/landing
+> only (no operator, chart, cue-cmp or CLI binary change). The row in
+> `docs/status.md` stays 🚧 until the branch is pushed, promoted to prod, and
+> the SYS-3 live-smoke runs green.
+
+### Added
+
+- **Canonical phase registry** (`landing/web/src/data/phases.json`). Single
+  source of truth for every public roadmap phase — id, label, status, and
+  description. Previously each surface (landing roadmap, subscribe form,
+  `/status/`) defined its own list; they can now drift silently. The registry
+  is the only place the list lives; all other surfaces read it.
+
+- **`PhaseChip` component** on the landing reads the phase registry and renders
+  a styled chip linking each boringTech roadmap item to its phase anchor
+  (`#phase-<id>`, derived from the id — no more `#phase-phase-*` double-prefix
+  bugs). Every unreleased boringTech item now carries a chip (PRES-02).
+
+- **`/status/` feature page** (`docs/status.md`) published at
+  `docs.apprafter.dev/status/`. The page is the `docs/status.md` content
+  already in the repository; adding it to the mkdocs nav and wiring the Phase
+  column (previously always empty) makes it the first place a reader can see
+  which phase a feature lands in without reading the source. This row is the
+  first row that uses the Phase column.
+
+- **Per-phase subscribe control** on the landing. The waitlist/subscribe form
+  now accepts a `phase` query parameter; the PhaseChip links pass it so a
+  reader clicking "notify me" from a specific phase card arrives with the phase
+  id already selected. The Payload CMS `phases` subscribe field is generated
+  from the registry so the CMS and the landing never hold different lists.
+
+- **SYS-3 content gate** — three-layer guard that the landing's CMS content
+  stays coherent with the phase registry:
+  - `scripts/landing-content-smoke.sh` — a live-smoke script that fetches the
+    landing's `/api/globals/site-settings` endpoint and asserts that every
+    `boringTech[].phase` value is a known phase id from the registry.
+  - `ci-landing-content.yml` / `just landing-content-smoke` — CI workflow that
+    runs the smoke on every push touching `landing/**` or `phases.json`.
+  - Payload validate endpoint called by the smoke so a draft-mode CMS edit that
+    uses an unknown phase id surfaces in CI before it reaches the built image.
+  - Registry-based schema test: a Jest/Bun test imports the registry and
+    asserts that every phase id in `siteSettings.json` (the fallback JSON used
+    when the CMS is offline) resolves to a known registry entry.
+
+### Changed
+
+- **Roadmap anchor derivation** — anchor ids are now `#phase-<id>` (derived
+  from the registry phase id). The previous generation used the phase label
+  directly, producing `#phase-phase-shipped`, `#phase-phase-3` and similar
+  double-prefix anchors whenever the label started with "Phase". All internal
+  cross-links updated.
+
+- **Public phase list decoupled from `plan.md` order** (PRES-09). The landing
+  roadmap previously sourced its phase ordering from `plan.md` SR-bucket
+  numbers. It now reads the registry, which is ordered by intended
+  user-facing presentation sequence — these differ because SR order is a
+  build sequence, not a product narrative.
+
+### Fixed (Tier-A / WS-A point fixes)
+
+- **PRES-01 — operator quickstart CTA.** The "Try self-host" landing CTA now
+  points at `docs.apprafter.dev/operator-guide/quickstart/` rather than the
+  generic docs root. The quickstart is the correct first step for a self-hosted
+  install.
+
+- **PRES-03 — product-path README.** The README's Quick start section now
+  leads with the user product path (install CLI, provision, deploy) and moves
+  the contributor/dev setup section below it. The previous README opened with
+  `git clone` and `cargo build` — the contributor path, not the operator path.
+
+- **PRES-04 — absolute doc links in README and docs pages.** Relative links
+  to docs pages from the README and from docs pages that cross section
+  boundaries now use absolute `https://docs.apprafter.dev/…` URLs. Relative
+  links 404 when the page is viewed on GitHub or in an LLM context.
+
+- **PRES-05 — MVP wording qualified inline.** Occurrences of "MVP" in the
+  docs that referred ambiguously to either the Tier-1 M1 milestone or the
+  managed offering launch now name the referent inline ("Tier-1 M1" or
+  "managed launch"). A reader encountering "MVP" on a page about single-node
+  provisioning should not need to cross-reference the roadmap to understand it.
+
+- **PRES-06 — `llms-guides.txt` added to machine-readers list.** The docs
+  home page's "Machine readers" section listed `llms.txt` and `llms-full.txt`
+  but not `llms-guides.txt`, which was added in `v0.2.50`. A reader following
+  the list to build a context bundle for an AI assistant would miss the
+  guides-only bundle.
+
+- **PRES-07 — version footer single-sourced.** The docs site footer's version
+  string was a static string in the MkDocs overrides template. It now reads the
+  version from the CLI `Cargo.toml` at build time (via the `docsgen` hook), so
+  it cannot silently fall behind a release.
+
+- **PRES-08 — ADR index entry in `llms.txt` relabelled.** The ADR index entry
+  in `llms.txt` echoed the section heading verbatim (`ADRs`). It now carries a
+  descriptive label ("Architecture Decision Records index") consistent with how
+  all other index entries describe their content.
+
+### Notes
+
+- **Known pending — `landing_hero` default value drift.** Commit `3626d5c`
+  changed a `defaultValue` on the Payload `landing_hero` global field (the
+  operator-quickstart CTA target). Payload stores a column default in the
+  database migration that seeded it; changing `defaultValue` in the schema
+  source does not retroactively update that stored default. The existing prod
+  document is unaffected (the default is only consulted when no row exists) and
+  the released image reads the fallback JSON correctly, so there is no live
+  breakage. However the divergence will be re-detected the next time
+  `migrate:create` is run against the CMS schema — it will produce a migration
+  that updates the column default. Track for a follow-up `landing_hero` default
+  migration before the next CMS schema change.
+
 ## cli v0.2.50 — corrected CLI --help, and a docs-site LLM-export/reference correctness pass (2026-08-23)
 
 > Monorepo tag `v0.2.50`. The CLI change is two `--help` corrections; the bulk is
