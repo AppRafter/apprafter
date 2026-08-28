@@ -3,7 +3,7 @@
   "underHoodLabel": "Under the hood",
   "ourCodeLabel": "What we wrote ourselves",
   "title": "Boring tech, opinionated glue.",
-  "lede": "We don't reinvent the Kubernetes control plane. Under the hood — well-known, proven components. The real work is opinionated composition and a thin layer of code where no ready solution exists.",
+  "lede": "We don't reinvent the Kubernetes control plane. Under the hood — well-known, proven components, which the platform runs and upgrades itself through GitOps. You never operate them by hand: developers and operators both work through the apprafter CLI and one manifest — no kubectl, no YAML. The real work is opinionated composition and a thin layer of code where no ready solution exists.",
   "underHood": [
     {
       "name": "Talos Linux",
