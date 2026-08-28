@@ -9,6 +9,45 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.51 — persistent redis is backed up and restored (T12, 2026-08-28)
+
+Closes the redis leg of 2.6d that shipped deferred. Until now `export` /
+`backup create` captured a `needs.redis` claim as nothing and `restore` put
+none back — the backup table promised a redis snapshot that no code produced
+(the 2.19j walk named it). CLI-only; no operator/chart/cue-cmp change.
+
+### Added
+
+- **Persistent-redis backup.** `apprafter export` and `backup create` capture a
+  `persistent: true` `needs.redis` claim as a whole-instance Dragonfly snapshot
+  — a `SAVE` on the instance admin port, then a tar of its snapshot directory to
+  `redis/<ns>/<claim>/dump.tar` (`cli/backup-core/src/extract.rs`). A Dragonfly
+  instance fronts a pool of claims sharing it, so capture dedupes by instance.
+  Ephemeral (`persistent: false`) claims carry no durable data and are skipped
+  by declaration.
+- **Persistent-redis restore.** `apprafter restore` — both `--into <fresh>` and
+  `--data-only` — reloads each captured snapshot by live-loading it into the
+  **running** instance with `DFLY LOAD` on the data port (admin password read
+  from the instance `-admin` Secret). Nothing is scaled or restarted
+  (`cli/platform-cli/src/commands/restore.rs`).
+
+### Fixed
+
+- The first-cut restore scaled the Dragonfly CR to 0 and back to free the RWO
+  PVC for a helper pod. That made the resourceclaim provisioner treat the
+  instance as vanished and re-provision the claim — FLUSHing the just-restored
+  data on a same-cluster `--data-only` restore. Replaced with the no-scale
+  `DFLY LOAD` path above, which the provisioner never sees as a disappearance.
+
+### Verified
+
+- `e2e/backup-restore-walk.sh` GREEN end-to-end on kind+podman (two clusters):
+  the chain now sets `t12key` in persistent redis, asserts `dump.tar` is
+  captured, and confirms the key is recovered on **both** restore paths —
+  restore-into-fresh and `--data-only` (which first mutates the key, then proves
+  the snapshot value is restored over it). Full-DR + real-Hetzner ride the 2.6d
+  T13 manual walk.
+
 ## presentation-walk (feat/presentation-walk) — phase registry, PhaseChip, /status/ page, landing content gate (2026-08-24, awaiting push + prod promote)
 
 > No release tag yet — branch `feat/presentation-walk` is not pushed. Entries
