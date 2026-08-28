@@ -37,7 +37,7 @@ const anchorFor = (num: string) => phaseAnchor(byLabel.get(num)?.id ?? num);
             {byLabel.get(p.num) && byLabel.get(p.num)!.status !== 'shipped' && (
               <button
                 type="button"
-                class="roadmap-waitlist btn-waitlist"
+                class="roadmap-waitlist"
                 data-preselect={byLabel.get(p.num)!.id}
               >
                 Get notified when {p.num} ships
@@ -121,6 +121,19 @@ const anchorFor = (num: string) => phaseAnchor(byLabel.get(num)?.id ?? num);
   .roadmap-waitlist {
     margin-top: 20px;
     justify-self: start;
+    font-family: var(--font-sans);
+    font-size: 13px;
+    padding: 8px 12px;
+    border: 1px solid var(--border-strong);
+    background: transparent;
+    color: var(--fg);
+    cursor: pointer;
+    border-radius: 4px;
+    transition: border-color 150ms ease;
+  }
+  .roadmap-waitlist:hover {
+    border-color: var(--accent);
+    color: var(--accent);
   }
   .roadmap-closing {
     margin-top: 56px;
