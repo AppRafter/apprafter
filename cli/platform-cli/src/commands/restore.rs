@@ -1104,76 +1104,46 @@ fn resolve_redis_instance(ns: &str, claim: &str, kubeconfig: &Path) -> Result<St
         })
 }
 
-/// Restore one Dragonfly instance's whole-instance snapshot. Scale the CR to 0
-/// so the snapshot PVC is free AND Dragonfly cannot shutdown-save over the
-/// restore; a helper pod clears the PVC and untars the backup; then scale back
-/// to 1 so Dragonfly auto-loads the restored snapshot on start.
+/// Restore one Dragonfly instance's whole-instance snapshot by live-loading it
+/// into the RUNNING instance: untar the backup into the pod's snapshot dir,
+/// then `DFLY LOAD` the latest summary. No scale, so the provisioner never sees
+/// the instance vanish and cannot re-provision (FLUSHDB) the claim's DB
+/// mid-restore (the failure the scale approach hit on --data-only).
 fn restore_one_redis_instance(
     instance: &str,
     tar_path: &Path,
     k: &dyn KubeExec,
-    kubeconfig: &Path,
+    _kubeconfig: &Path,
 ) -> Result<()> {
     let df_ns = "dragonfly-system";
-    let pvc = format!("df-{instance}-0");
     let pod = format!("{instance}-0");
 
-    // 1. Scale the Dragonfly CR to 0 (frees the RWO PVC; no shutdown-save race).
-    kubectl_merge_patch(
-        "dragonflies.dragonflydb.io",
-        instance,
-        Some(df_ns),
-        None,
-        r#"{"spec":{"replicas":0}}"#,
-        kubeconfig,
-    )?;
-    wait_pod_gone(&pod, df_ns, kubeconfig)?;
+    // DFLY LOAD works on the data port 6379, which is password-auth'd; read the
+    // instance admin password (the admin port 9999 refuses DFLY LOAD).
+    let pw = k.get_secret_key(&format!("{instance}-admin"), df_ns, "password")?;
+    let pw_q = shell_single_quote(&pw);
 
-    // 2. Helper pod mounts the freed PVC RW at /data; clear + untar.
-    let helper = truncate_pod_name(&format!("ld-redis-{instance}"));
-    let spec = volume_pod_spec(&helper, df_ns, VOLUME_IMAGE, &pvc, false);
-    {
-        let _guard = PodCleanupGuard {
-            name: helper.clone(),
-            namespace: df_ns.to_string(),
-            k,
-        };
-        k.apply_and_wait_pod_ready(&spec)?;
-        // Clear old snapshots, then untar the backup. The file streams to sh's
-        // stdin; `exec tar x` replaces sh, inheriting that stdin.
-        let argv: Vec<&str> = vec!["sh", "-c", "rm -f /data/* 2>/dev/null; exec tar x -C /data"];
-        k.exec_stream_from_file(&helper, df_ns, &argv, tar_path)?;
-        // _guard drops here → helper delete issued.
-    }
-    // The helper must be fully gone before scale-up so the Dragonfly pod can
-    // remount the RWO PVC.
-    wait_pod_gone(&helper, df_ns, kubeconfig)?;
+    // One exec: the tar streams to sh's stdin; `tar x` reads it; then DFLY LOAD
+    // the latest snapshot. Fail loudly if DFLY LOAD does not return OK.
+    let script = format!(
+        "set -e; \
+         rm -f /dragonfly/snapshots/* 2>/dev/null || true; \
+         tar x -C /dragonfly/snapshots; \
+         SUM=$(ls -1 /dragonfly/snapshots/*summary.dfs | sort | tail -1); \
+         OUT=$(redis-cli -a {pw_q} --no-auth-warning -p 6379 DFLY LOAD \"$SUM\"); \
+         [ \"$OUT\" = OK ] || {{ echo \"DFLY LOAD failed: $OUT\" >&2; exit 1; }}"
+    );
+    let argv: Vec<&str> = vec!["sh", "-c", &script];
+    k.exec_stream_from_file(&pod, df_ns, &argv, tar_path)?;
 
-    // 3. Scale back to 1 → Dragonfly auto-loads the restored snapshot.
-    kubectl_merge_patch(
-        "dragonflies.dragonflydb.io",
-        instance,
-        Some(df_ns),
-        None,
-        r#"{"spec":{"replicas":1}}"#,
-        kubeconfig,
-    )?;
-    println!("  ✓ redis instance restored: {instance} (snapshot replayed)");
+    println!("  ✓ redis instance restored: {instance} (DFLY LOAD replayed the snapshot)");
     Ok(())
 }
 
-/// Block until a pod no longer exists (used around Dragonfly scale-0/scale-1).
-fn wait_pod_gone(pod: &str, ns: &str, kubeconfig: &Path) -> Result<()> {
-    for _ in 0..60 {
-        let got = kubectl_get_json("pods", Some(pod), Some(ns), kubeconfig)?;
-        if got.is_none() {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
-    Err(CliError::Other(format!(
-        "pod {ns}/{pod} still present after 120s (redis restore scale wait)"
-    )))
+/// POSIX-safe single-quote of an arbitrary string for embedding in a `sh -c`
+/// script (wraps in single quotes, escaping embedded single quotes).
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// **ReSealUserSecrets** — re-seal each app user secret under
@@ -1462,6 +1432,12 @@ mod tests {
     use cli_core::resolve::resolve_precedence;
     use serde_json::json;
     use std::io::Write;
+
+    #[test]
+    fn shell_single_quote_escapes_embedded_quotes() {
+        assert_eq!(super::shell_single_quote("abc123"), "'abc123'");
+        assert_eq!(super::shell_single_quote("a'b"), "'a'\\''b'");
+    }
 
     #[test]
     fn restore_rejects_a_newer_manifest_version_with_a_clear_error() {
