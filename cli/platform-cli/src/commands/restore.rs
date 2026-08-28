@@ -733,8 +733,8 @@ fn load_data(data_dir: &Path, manifest: &BackupManifest, kubeconfig: &Path) -> R
     load_pg_dumps(data_dir, &k, kubeconfig)?;
     // volumes: data/volumes/<ns>/<name>/data.tar
     load_volumes(data_dir, manifest, &k, kubeconfig)?;
-    // redis: documented skeleton (T12 verifies Dragonfly RDB).
-    load_redis_skeleton(data_dir);
+    // redis: data/redis/<ns>/<claim>/dump.tar → Dragonfly whole-instance snapshot.
+    load_redis(data_dir, &k, kubeconfig)?;
     Ok(())
 }
 
@@ -1039,20 +1039,141 @@ fn load_one_volume(
     Ok(())
 }
 
-/// Redis restore skeleton — the Dragonfly RDB injection path (snapshot PVC +
-/// whether a `DEBUG RELOAD` is needed) is verified on the live walk in T12.
-/// For now, log a note per persisted redis artifact so the operator knows it
-/// was not loaded.
-fn load_redis_skeleton(data_dir: &Path) {
+/// Restore each persistent-redis whole-instance snapshot. The backup keys
+/// artifacts by CLAIM (`data/redis/<ns>/<claim>/dump.tar`), but a Dragonfly
+/// snapshot is whole-INSTANCE (all claims sharing a pool instance are in one
+/// snapshot), so we resolve each claim's fresh `status.instance` and restore
+/// each unique instance exactly once.
+fn load_redis(data_dir: &Path, k: &dyn KubeExec, kubeconfig: &Path) -> Result<()> {
     let redis_root = data_dir.join("redis");
-    if let Ok(ns_entries) = std::fs::read_dir(&redis_root) {
-        for ns_entry in ns_entries.flatten() {
-            let ns = ns_entry.file_name().to_string_lossy().into_owned();
-            eprintln!(
-                "info: redis restore for namespace {ns} deferred to T12 (Dragonfly RDB) — skipping"
-            );
+    let Ok(ns_entries) = std::fs::read_dir(&redis_root) else {
+        return Ok(());
+    };
+    let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for ns_entry in ns_entries.flatten() {
+        let ns_path = ns_entry.path();
+        if !ns_path.is_dir() {
+            continue;
+        }
+        let ns = ns_entry.file_name().to_string_lossy().into_owned();
+        let Ok(claim_entries) = std::fs::read_dir(&ns_path) else {
+            continue;
+        };
+        for claim_entry in claim_entries.flatten() {
+            let dir = claim_entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let tar_path = dir.join("dump.tar");
+            if !tar_path.exists() {
+                continue;
+            }
+            let claim = claim_entry.file_name().to_string_lossy().into_owned();
+            let instance = resolve_redis_instance(&ns, &claim, kubeconfig)?;
+            if !done.insert(instance.clone()) {
+                continue; // another claim already restored this instance's snapshot
+            }
+            restore_one_redis_instance(&instance, &tar_path, k, kubeconfig)?;
         }
     }
+    Ok(())
+}
+
+/// The Dragonfly pool instance a fresh persistent-redis claim is bound to
+/// (`status.instance`), resolved from the regenerated claim.
+fn resolve_redis_instance(ns: &str, claim: &str, kubeconfig: &Path) -> Result<String> {
+    let claim_json = kubectl_get_json(
+        "resourceclaims.apprafter.io",
+        Some(claim),
+        Some(ns),
+        kubeconfig,
+    )?
+    .ok_or_else(|| {
+        CliError::Other(format!(
+            "claim {ns}/{claim} not found at redis LoadData — was it gated/applied?"
+        ))
+    })?;
+    claim_json
+        .pointer("/status/instance")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            CliError::Other(format!(
+                "claim {ns}/{claim} has no status.instance (not provisioned)"
+            ))
+        })
+}
+
+/// Restore one Dragonfly instance's whole-instance snapshot. Scale the CR to 0
+/// so the snapshot PVC is free AND Dragonfly cannot shutdown-save over the
+/// restore; a helper pod clears the PVC and untars the backup; then scale back
+/// to 1 so Dragonfly auto-loads the restored snapshot on start.
+fn restore_one_redis_instance(
+    instance: &str,
+    tar_path: &Path,
+    k: &dyn KubeExec,
+    kubeconfig: &Path,
+) -> Result<()> {
+    let df_ns = "dragonfly-system";
+    let pvc = format!("df-{instance}-0");
+    let pod = format!("{instance}-0");
+
+    // 1. Scale the Dragonfly CR to 0 (frees the RWO PVC; no shutdown-save race).
+    kubectl_merge_patch(
+        "dragonflies.dragonflydb.io",
+        instance,
+        Some(df_ns),
+        None,
+        r#"{"spec":{"replicas":0}}"#,
+        kubeconfig,
+    )?;
+    wait_pod_gone(&pod, df_ns, kubeconfig)?;
+
+    // 2. Helper pod mounts the freed PVC RW at /data; clear + untar.
+    let helper = truncate_pod_name(&format!("ld-redis-{instance}"));
+    let spec = volume_pod_spec(&helper, df_ns, VOLUME_IMAGE, &pvc, false);
+    {
+        let _guard = PodCleanupGuard {
+            name: helper.clone(),
+            namespace: df_ns.to_string(),
+            k,
+        };
+        k.apply_and_wait_pod_ready(&spec)?;
+        // Clear old snapshots, then untar the backup. The file streams to sh's
+        // stdin; `exec tar x` replaces sh, inheriting that stdin.
+        let argv: Vec<&str> = vec!["sh", "-c", "rm -f /data/* 2>/dev/null; exec tar x -C /data"];
+        k.exec_stream_from_file(&helper, df_ns, &argv, tar_path)?;
+        // _guard drops here → helper delete issued.
+    }
+    // The helper must be fully gone before scale-up so the Dragonfly pod can
+    // remount the RWO PVC.
+    wait_pod_gone(&helper, df_ns, kubeconfig)?;
+
+    // 3. Scale back to 1 → Dragonfly auto-loads the restored snapshot.
+    kubectl_merge_patch(
+        "dragonflies.dragonflydb.io",
+        instance,
+        Some(df_ns),
+        None,
+        r#"{"spec":{"replicas":1}}"#,
+        kubeconfig,
+    )?;
+    println!("  ✓ redis instance restored: {instance} (snapshot replayed)");
+    Ok(())
+}
+
+/// Block until a pod no longer exists (used around Dragonfly scale-0/scale-1).
+fn wait_pod_gone(pod: &str, ns: &str, kubeconfig: &Path) -> Result<()> {
+    for _ in 0..60 {
+        let got = kubectl_get_json("pods", Some(pod), Some(ns), kubeconfig)?;
+        if got.is_none() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    Err(CliError::Other(format!(
+        "pod {ns}/{pod} still present after 120s (redis restore scale wait)"
+    )))
 }
 
 /// **ReSealUserSecrets** — re-seal each app user secret under

@@ -47,7 +47,7 @@ pub struct ExtractItem {
     pub kind: DataKind,
     /// `Pg`     → `status.connectionSecretRef` (the connection Secret name).
     /// `Volume` → `status.volumeClaimRef` (the PVC name).
-    /// `Redis`  → the claim name itself (snapshot PVC resolved at run-time).
+    /// `Redis`  → `status.instance` (the Dragonfly pool instance; snapshot PVC is `df-<instance>-0`).
     pub source: String,
 }
 
@@ -59,8 +59,9 @@ pub struct ExtractItem {
 ///
 /// Rules per `spec.type`:
 /// * `pg` → always emit a `Pg` item; source = `status.connectionSecretRef`.
-/// * `redis` → only when `spec.persistent == true`; source = claim name
-///   (the exact snapshot PVC path is resolved at run-time, T12).
+/// * `redis` → only when `spec.persistent == true` AND provisioned (has
+///   `status.instance`); source = `status.instance` (the Dragonfly pool
+///   instance whose snapshot PVC is `df-<instance>-0`).
 /// * `disk` / `shared-disk` → emit a `Volume` item; source = `status.volumeClaimRef`.
 /// * everything else → silently skipped (out of scope this cycle).
 ///
@@ -104,15 +105,17 @@ pub fn plan_extraction(claims: &[Value]) -> Vec<ExtractItem> {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 if persistent {
-                    // The exact Dragonfly snapshot PVC name is resolved at
-                    // run-time in T12; the claim name is sufficient as the
-                    // plan-level identifier.
-                    items.push(ExtractItem {
-                        namespace: ns,
-                        claim_name: name.clone(),
-                        kind: DataKind::Redis,
-                        source: name,
-                    });
+                    // The Dragonfly pool instance this claim is bound to (status.instance);
+                    // its snapshot lives on PVC df-<instance>-0. A persistent claim not yet
+                    // provisioned has no status.instance and no data to dump — skip it.
+                    if let Some(instance) = c.pointer("/status/instance").and_then(Value::as_str) {
+                        items.push(ExtractItem {
+                            namespace: ns,
+                            claim_name: name,
+                            kind: DataKind::Redis,
+                            source: instance.to_string(),
+                        });
+                    }
                 }
                 // Non-persistent redis (ephemeral): no snapshot worth keeping.
             }
@@ -177,7 +180,7 @@ pub(crate) fn pg_dump_pod_spec_with_password(
 /// ```text
 /// <out_dir>/pg/<ns>/<claim>.dump           (pg_dump custom format, -Fc)
 /// <out_dir>/volumes/<ns>/<claim>/data.tar  (tar c -C /data .)
-/// <out_dir>/redis/<ns>/<claim>/            (documented skeleton; T12)
+/// <out_dir>/redis/<ns>/<claim>/dump.tar    (tar c -C /dragonfly/snapshots .)
 /// ```
 ///
 /// For each item:
@@ -192,10 +195,13 @@ pub(crate) fn pg_dump_pod_spec_with_password(
 ///   name) at `/data` read-only; execs `tar c -C /data .` and streams to
 ///   `volumes/<ns>/<claim>/data.tar`; deletes the pod.
 ///
-/// * **Redis** — persistent Dragonfly snapshot; the exact snapshot PVC path
-///   (and whether to trigger `BGSAVE` first) is verified on the live walk
-///   in T12.  This cycle emits a log note and skips, preserving the item in
-///   the returned plan so callers can surface a "not yet extracted" warning.
+/// * **Redis** — persistent Dragonfly snapshot; `item.source` is the claim's
+///   `status.instance` (the Dragonfly pool instance) whose pod is
+///   `<instance>-0` in `dragonfly-system`. Execs a synchronous `SAVE` on the
+///   admin port 9999 (no password) so the snapshot is current, then `tar`s the
+///   whole `/dragonfly/snapshots` dir (the snapshot is a multi-file `.dfs`
+///   set) to `redis/<ns>/<claim>/dump.tar`. No helper pod — the Dragonfly pod
+///   is already running with the PVC mounted and carries `redis-cli` + `tar`.
 ///
 /// The helper-pod names are deterministic (`bk-<kind>-<claim>`) and include
 /// a truncation to stay under the 63-char DNS-1123 limit.
@@ -214,16 +220,7 @@ pub fn run_extraction(
         match item.kind {
             DataKind::Pg => extract_pg(k, item, out_dir, pg_image)?,
             DataKind::Volume => extract_volume(k, item, out_dir)?,
-            DataKind::Redis => {
-                // Persistent Dragonfly snapshot extraction is verified on the
-                // live walk in T12 (the exact snapshot PVC naming + whether a
-                // BGSAVE is needed before the tar).  Skip with a log note for
-                // now so the plan remains actionable once T12 lands.
-                eprintln!(
-                    "info: redis extraction for claim {}/{} deferred to T12 — skipping",
-                    item.namespace, item.claim_name
-                );
-            }
+            DataKind::Redis => extract_redis(k, item, out_dir)?,
         }
     }
     Ok(())
@@ -336,6 +333,39 @@ fn extract_volume(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Resul
     // _guard drops here (or on any earlier return) → delete_pod_best_effort called.
 }
 
+/// Extract a persistent Redis (Dragonfly) claim's whole-instance snapshot.
+///
+/// `item.source` is the claim's `status.instance` (the Dragonfly pool
+/// instance). Its pod is `<instance>-0` in `dragonfly-system`, with the
+/// snapshot PVC mounted at `/dragonfly/snapshots` and an admin port 9999
+/// (no password). We exec a synchronous `SAVE` (so the snapshot is current,
+/// not up-to-30-min stale) and then `tar` the whole snapshot dir — the
+/// snapshot is a multi-file `.dfs` set, so the directory is the unit. No
+/// helper pod: the Dragonfly pod is already running with the PVC mounted and
+/// carries both `redis-cli` and `tar`.
+fn extract_redis(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Result<()> {
+    let instance = &item.source; // status.instance
+    let ns = &item.namespace; // the app/claim namespace — the backup key
+    let claim = &item.claim_name;
+
+    let pod = format!("{instance}-0");
+    let df_ns = "dragonfly-system";
+
+    let dest = out_dir.join("redis").join(ns).join(claim);
+    fs::create_dir_all(&dest)
+        .map_err(|e| CliError::Other(format!("create dir {}: {e}", dest.display())))?;
+    let tar_path = dest.join("dump.tar");
+
+    // SAVE (admin port 9999, nopass) then tar the snapshot dir. Discard SAVE's
+    // stdout so only the tarball reaches the file.
+    let argv: Vec<&str> = vec![
+        "sh",
+        "-c",
+        "redis-cli -p 9999 SAVE >/dev/null 2>&1 && tar c -C /dragonfly/snapshots .",
+    ];
+    exec_stream_to_file(k, &pod, df_ns, &argv, &tar_path)
+}
+
 /// Build the `pg_dump` argument vector for a custom-format dump.
 ///
 /// Returns a `Vec<String>` so the caller is not constrained by the lifetime of
@@ -396,7 +426,8 @@ mod tests {
     #[test]
     fn persistent_redis_is_planned() {
         let claims = vec![json!({"spec":{"type":"redis","persistent":true},
-            "metadata":{"name":"r","namespace":"demo"},"status":{"ready":true}})];
+            "metadata":{"name":"r","namespace":"demo"},
+            "status":{"ready":true,"instance":"platform-redis-persistent-000"}})];
         let plan = plan_extraction(&claims);
         assert!(plan.iter().any(|i| i.kind == DataKind::Redis));
     }
@@ -453,19 +484,34 @@ mod tests {
     }
 
     #[test]
-    fn persistent_redis_source_is_claim_name() {
-        // The snapshot PVC path is resolved at run-time (T12); the plan
-        // uses the claim name as the source key.
+    fn persistent_redis_source_is_status_instance() {
+        // The source is the Dragonfly pool instance (status.instance) whose
+        // snapshot PVC is df-<instance>-0; the claim name remains the backup key.
+        let claims = vec![json!({
+            "spec": { "type": "redis", "persistent": true },
+            "metadata": { "name": "my-cache", "namespace": "prod" },
+            "status": { "ready": true, "instance": "platform-redis-persistent-000" }
+        })];
+        let plan = plan_extraction(&claims);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].source, "platform-redis-persistent-000");
+        assert_eq!(plan[0].claim_name, "my-cache");
+        assert_eq!(plan[0].namespace, "prod");
+    }
+
+    #[test]
+    fn persistent_redis_without_status_instance_is_skipped() {
+        // A persistent redis claim that never provisioned has no
+        // status.instance — no Dragonfly snapshot exists, so skip it.
         let claims = vec![json!({
             "spec": { "type": "redis", "persistent": true },
             "metadata": { "name": "my-cache", "namespace": "prod" },
             "status": { "ready": true }
         })];
-        let plan = plan_extraction(&claims);
-        assert_eq!(plan.len(), 1);
-        assert_eq!(plan[0].source, "my-cache");
-        assert_eq!(plan[0].claim_name, "my-cache");
-        assert_eq!(plan[0].namespace, "prod");
+        assert!(
+            plan_extraction(&claims).is_empty(),
+            "unprovisioned persistent redis (no status.instance) must be skipped"
+        );
     }
 
     #[test]
