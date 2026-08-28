@@ -106,6 +106,18 @@ PROVIDER_NS="apprafter-system"      # ServiceProvider + SourceCredential ns
 DISK_PROVIDER="disk-local"          # seeded owned-disk ServiceProvider
 STORAGE_CLASS="local-path"
 
+# T12: persistent-redis backup + restore coordinates.
+# The claim name follows the operator's derivation: <app>-redis.
+REDIS_CLAIM="${APP}-redis"          # generated ResourceClaim name
+DF_NS="dragonfly-system"            # shared Dragonfly instance namespace
+# The persistent pool instance the `persistent: true` claim lands on:
+# pool_instance_name(true, 0) in operator-controllers/resourceclaim-provisioner.
+DF_INSTANCE_P="platform-redis-persistent-000"
+DF_ADMIN_SECRET_P="platform-redis-persistent-000-admin"
+# Known key+value written into redis before export (proves round-trip).
+REDIS_T12_KEY="t12key"
+REDIS_T12_VAL="t12value"
+
 # Backup artifacts (host paths, under the temp workspace).
 RESTIC_PASS="walk-restic-passphrase-2026"
 
@@ -331,6 +343,29 @@ app_pod() {
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true
 }
 
+# redis_admin_on <instance> <admin-secret> <args...>
+#   Run redis-cli against a Dragonfly instance as the admin user, reading the
+#   password from the named Secret (key `password`). Mirrors the pattern from
+#   needs-redis-walk.sh. Runs the client INSIDE the StatefulSet pod via
+#   `kubectl exec` so no host-side redis-cli is required.
+#
+#   By default both kubectl calls use the ambient $KUBECONFIG. To pin a
+#   specific cluster (e.g. the Phase-5 FRESH cluster whose recovered data
+#   lives on $DST_KUBECONFIG), set RADMIN_KUBECONFIG=<path> for the call —
+#   it is threaded into --kubeconfig on both the secret read and the exec,
+#   mirroring how the pg/volume assertions retarget kubectl at the fresh
+#   cluster (via `export KUBECONFIG=$DST_KUBECONFIG`).
+redis_admin_on() {
+    local instance="$1" admin_secret="$2"; shift 2
+    local kc_arg=()
+    [ -n "${RADMIN_KUBECONFIG:-}" ] && kc_arg=(--kubeconfig "$RADMIN_KUBECONFIG")
+    local admin_pw
+    admin_pw=$(kubectl "${kc_arg[@]}" -n "$DF_NS" get secret "$admin_secret" \
+        -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)
+    kubectl "${kc_arg[@]}" -n "$DF_NS" exec "${instance}-0" -- \
+        redis-cli -a "$admin_pw" --no-auth-warning "$@" 2>/dev/null
+}
+
 # wait_pod_log <pod> <extended-regex> [timeout]  (uses $KUBECONFIG)
 #   Poll a pod's stdout until it matches. The app's ENTRYPOINT runs its
 #   tracked migration ASYNCHRONOUSLY relative to pod-Ready — the container has
@@ -522,6 +557,9 @@ spec:
       disk:
         size: 1Gi
         mountPath: ${MOUNT_PATH}
+      redis:
+        persistent: true
+        selector: { tier: integrated }
 YAML
 }
 
@@ -565,6 +603,7 @@ apply_test_app
 # The owned-disk + pg claims provision; the app resumes Ready.
 wait_jsonpath "$CLAIM_RES" "$APP_NS" "$DISK_CLAIM" '{.status.ready}' true 300
 wait_jsonpath "$CLAIM_RES" "$APP_NS" "$PG_CLAIM" '{.status.ready}' true 360
+wait_jsonpath "$CLAIM_RES" "$APP_NS" "$REDIS_CLAIM" '{.status.ready}' true 360
 wait_jsonpath "$APP_RES" "$APP_NS" "$APP" '{.status.phase}' Ready 300
 kubectl -n "$APP_NS" wait --for=condition=Available "deployment/${APP}" --timeout=300s
 retry 40 5 -- kubectl -n "$APP_NS" wait --for=condition=Ready \
@@ -605,6 +644,28 @@ assert_eq "pg known row present on source" "$pg_count" "1"
 kubectl -n "$APP_NS" exec "$POD" -- sh -c "echo volume-marker-walk > ${MOUNT_PATH}/marker"
 vol_marker=$(kubectl -n "$APP_NS" exec "$POD" -- cat "${MOUNT_PATH}/marker" 2>/dev/null || true)
 assert_eq "volume marker present on source" "$vol_marker" "volume-marker-walk"
+
+# T12: write a KNOWN key into the persistent redis instance before export.
+# The persistent-redis claim routes to DF_INSTANCE_P; force a SAVE so the
+# snapshot on disk is current before `apprafter export` tars it.
+# Use the dbnum the claim was allocated to (status.dbnum) so the key lands
+# exactly in the claim's own DB — the admin user can address any DB.
+redis_dbnum=$(kubectl -n "$APP_NS" get "$CLAIM_RES" "$REDIS_CLAIM" \
+    -o jsonpath='{.status.dbnum}' 2>/dev/null | tr -d '[:space:]' || true)
+if [ -z "$redis_dbnum" ]; then
+    printf 'FAILED: could not read %s status.dbnum\n' "$REDIS_CLAIM" >&2; exit 1
+fi
+printf '  T12: redis claim %s dbnum=%s on %s\n' "$REDIS_CLAIM" "$redis_dbnum" "$DF_INSTANCE_P"
+redis_set=$(redis_admin_on "$DF_INSTANCE_P" "$DF_ADMIN_SECRET_P" \
+    -n "$redis_dbnum" SET "$REDIS_T12_KEY" "$REDIS_T12_VAL" || true)
+assert_eq "T12 — SET ${REDIS_T12_KEY} in persistent redis (pre-export)" "$redis_set" "OK"
+# Force a snapshot so the on-disk dump.rdb is current (the admin SAVE —
+# mirrors the persistent-durability step in needs-redis-walk.sh).
+redis_admin_on "$DF_INSTANCE_P" "$DF_ADMIN_SECRET_P" SAVE >/dev/null 2>&1 || true
+redis_get=$(redis_admin_on "$DF_INSTANCE_P" "$DF_ADMIN_SECRET_P" \
+    -n "$redis_dbnum" GET "$REDIS_T12_KEY" || true)
+assert_eq "T12 — GET ${REDIS_T12_KEY} readable before export (sanity)" \
+    "$redis_get" "$REDIS_T12_VAL"
 
 # ===============================================================
 # Phase 1b: SourceCredential round-trip (rev-5)
@@ -683,6 +744,21 @@ else
     tar -tf "$VOL_TAR" >&2 2>&1 || true
     exit 1
 fi
+
+# T12: redis dump.tar captured by extract_redis.
+# Path: data/redis/<app-ns>/<claim>/dump.tar
+REDIS_DUMP_TAR="${EXPORT_DIR}/redis/${APP_NS}/${REDIS_CLAIM}/dump.tar"
+[ -f "$REDIS_DUMP_TAR" ] || {
+    printf 'FAILED: T12 — expected redis dump.tar %s missing\n' "$REDIS_DUMP_TAR" >&2
+    ls -R "$EXPORT_DIR" >&2 2>&1 || true
+    exit 1
+}
+[ -s "$REDIS_DUMP_TAR" ] || {
+    printf 'FAILED: T12 — redis dump.tar %s is empty\n' "$REDIS_DUMP_TAR" >&2
+    exit 1
+}
+printf '  ok: T12 — redis dump.tar captured at %s (size=%s)\n' \
+    "$REDIS_DUMP_TAR" "$(wc -c <"$REDIS_DUMP_TAR" | tr -d ' ')"
 
 # ===============================================================
 # Phase 3: `apprafter backup create` -> encrypted restic repo + list + H1
@@ -859,6 +935,34 @@ else
     rvol=$(kubectl -n "$APP_NS" exec "$RPOD" -- cat "${MOUNT_PATH}/marker" 2>/dev/null || true)
     assert_eq "H2 — backed-up volume marker restored into the fresh cluster" "$rvol" "volume-marker-walk"
 
+    # T12: prove redis recovery on the FRESH cluster. The fresh cluster boots
+    # with an EMPTY redis; `apprafter restore` above already ran load_redis
+    # (scale Dragonfly to 0 → untar dump.tar into the PVC → scale back to 1,
+    # Dragonfly auto-loads the snapshot). So the correct recovery proof is
+    # simply: after the restore the backed-up key is PRESENT — no FLUSH (a
+    # FLUSH here would only UNDO the restore we are trying to verify).
+    #
+    # Everything below must hit the FRESH cluster, not the source: the dbnum
+    # read uses the ambient $KUBECONFIG (already re-exported to $DST_KUBECONFIG
+    # above, same mechanism as the pg/volume H2 assertions), and the redis GET
+    # is pinned to $DST_KUBECONFIG via RADMIN_KUBECONFIG.
+    wait_jsonpath "$CLAIM_RES" "$APP_NS" "$REDIS_CLAIM" '{.status.ready}' true 360
+    rredis_dbnum=$(kubectl -n "$APP_NS" get "$CLAIM_RES" "$REDIS_CLAIM" \
+        -o jsonpath='{.status.dbnum}' 2>/dev/null | tr -d '[:space:]' || true)
+    if [ -z "$rredis_dbnum" ]; then
+        printf 'FAILED: T12 — could not read %s status.dbnum in fresh cluster\n' "$REDIS_CLAIM" >&2
+        exit 1
+    fi
+    printf '  T12: fresh cluster redis claim %s dbnum=%s on %s\n' \
+        "$REDIS_CLAIM" "$rredis_dbnum" "$DF_INSTANCE_P"
+    recovered=$(RADMIN_KUBECONFIG="$DST_KUBECONFIG" \
+        redis_admin_on "$DF_INSTANCE_P" "$DF_ADMIN_SECRET_P" \
+        -n "$rredis_dbnum" GET "$REDIS_T12_KEY" || true)
+    assert_eq "T12 — redis key recovered on fresh cluster after restore" \
+        "$recovered" "$REDIS_T12_VAL"
+    printf '  ok: T12 — load_redis replayed the snapshot on the fresh cluster (key %s=%s)\n' \
+        "$REDIS_T12_KEY" "$REDIS_T12_VAL"
+
     # The user secret + SourceCredential material were re-sealed + present.
     wait_jsonpath secret "$APP_NS" "$USER_SECRET" '{.metadata.name}' "$USER_SECRET" 120
     us_val=$(kubectl -n "$APP_NS" get secret "$USER_SECRET" -o jsonpath="{.data.${USER_SECRET_KEY}}" 2>/dev/null | base64 -d || true)
@@ -887,6 +991,13 @@ else
     kubectl -n "$APP_NS" exec "$RPOD" -- psql "$rpg_url" -v ON_ERROR_STOP=1 \
         -c "INSERT INTO app_data (payload) VALUES ('post-restore-mutation');" || true
     kubectl -n "$APP_NS" exec "$RPOD" -- sh -c "echo mutated > ${MOUNT_PATH}/marker" || true
+    # T12 --data-only: mutate the redis key too (STRICTLY before the restore),
+    # so a plain GET afterwards is a real proof that load_redis overwrote it —
+    # not a vacuous read of a key that never changed. Pinned to the fresh
+    # cluster ($DST_KUBECONFIG), where this round-trip runs.
+    RADMIN_KUBECONFIG="$DST_KUBECONFIG" \
+        redis_admin_on "$DF_INSTANCE_P" "$DF_ADMIN_SECRET_P" \
+        -n "$rredis_dbnum" SET "$REDIS_T12_KEY" "mutated-value" >/dev/null 2>&1 || true
 
     apprafter restore "$RESTIC_REPO" --target fresh --data-only --passphrase "$RESTIC_PASS"
 
@@ -899,6 +1010,17 @@ else
     dvol=$(kubectl -n "$APP_NS" exec "$RPOD2" -- cat "${MOUNT_PATH}/marker" 2>/dev/null || true)
     assert_eq "--data-only restored the volume marker to the backed-up value" "$dvol" "volume-marker-walk"
     printf '  ok: --data-only round-trip reloaded the backed-up volume data\n'
+
+    # T12 --data-only: the key was mutated to `mutated-value` above; the
+    # --data-only restore re-ran load_redis, so it must be back to the
+    # backed-up value. Pinned to the fresh cluster ($DST_KUBECONFIG).
+    dredis_val=$(RADMIN_KUBECONFIG="$DST_KUBECONFIG" \
+        redis_admin_on "$DF_INSTANCE_P" "$DF_ADMIN_SECRET_P" \
+        -n "$rredis_dbnum" GET "$REDIS_T12_KEY" || true)
+    assert_eq "T12 --data-only — redis key overwritten back to backed-up value" \
+        "$dredis_val" "$REDIS_T12_VAL"
+    printf '  ok: T12 --data-only — mutated redis key %s restored to %s\n' \
+        "$REDIS_T12_KEY" "$REDIS_T12_VAL"
 fi
 
 # ===============================================================
@@ -919,7 +1041,7 @@ rm -rf "$TMPDIR_WORK"
 
 printf '\nbackup-restore-walk GREEN in %s\n' "$(elapsed)"
 if [ "$TWO_CLUSTER_OK" -eq 1 ]; then
-    printf 'Chain proven: deploy (pg+disk+secret+tracked-migration) -> write data -> SourceCredential round-trip -> export (openable dumps) -> backup (encrypted restic + list + H1) -> restore-into-fresh (auto-register, migration SKIPS, backed-up data, re-sealed secrets) -> --data-only round-trip\n'
+    printf 'Chain proven: deploy (pg+disk+redis+secret+tracked-migration) -> write data (pg row + volume marker + T12 redis key) -> SourceCredential round-trip -> export (openable pg dump + volume tar + T12 redis dump.tar) -> backup (encrypted restic + list + H1) -> restore-into-fresh (auto-register, migration SKIPS, backed-up data, T12 redis FLUSH+recovery, re-sealed secrets) -> --data-only round-trip (incl. T12 redis)\n'
 else
-    printf 'Chain proven (single-cluster): deploy -> write data -> SourceCredential round-trip -> export (openable dumps) -> backup (encrypted restic + list + H1 + rev-5 material). Restore-into-fresh SOFT-skipped (two-cluster resource limit) -> rides the real-Hetzner manual walk (2.6d T13).\n'
+    printf 'Chain proven (single-cluster): deploy (pg+disk+redis+secret+tracked-migration) -> write data (pg row + volume marker + T12 redis key) -> SourceCredential round-trip -> export (openable pg dump + volume tar + T12 redis dump.tar captured) -> backup (encrypted restic + list + H1 + rev-5 material). Restore-into-fresh SOFT-skipped (two-cluster resource limit) -> rides the real-Hetzner manual walk (2.6d T13).\n'
 fi
