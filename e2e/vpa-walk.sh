@@ -2,9 +2,12 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 #
 # 2.16e VPA vertical-autoscaling walk (real Hetzner, PUBLISHED artifacts).
-# Provisions a throwaway solo node with the current CLI (v0.2.39) + published
-# platform-stack 0.2.49 / operator v0.2.39 / cue-cmp 0.1.20, then validates the
-# 2.16e VPA integration. In-place resize needs k8s 1.35 + containerd 2.0 —
+# Provisions a throwaway solo node with the current CLI + channel-latest
+# platform-stack (0.2.56+ carries the `InPlace` feature-gate fix + the pinned
+# recommender floors), then validates the 2.16e VPA integration AND that the
+# three controllers are actually Running (the crash-loop guard added 2026-08-28,
+# the check this walk lacked when it passed green on the crash-looping 0.2.49).
+# In-place resize needs k8s 1.35 + containerd 2.0 —
 # kind/k3d can't do it, so this MUST run on real Hetzner.
 #
 # SCOPE: this walk hard-asserts the operator↔VPA INTEGRATION that is
@@ -74,7 +77,7 @@ spec:
 EOF
 }
 
-printf '=== Phase 1: provision (CLI %s) + bootstrap published 0.2.49 ===\n' "$($APPRAFTER --version 2>/dev/null)"
+printf '=== Phase 1: provision (CLI %s) + bootstrap channel-latest (0.2.56+ InPlace fix) ===\n' "$($APPRAFTER --version 2>/dev/null)"
 "$APPRAFTER" target add e2e --provider hetzner-cloud --tier solo --region "$REGION" \
     --token "$TOKEN" --no-interactive --force || { mark_fail "target add"; exit 1; }
 timeout 1500 "$APPRAFTER" up || { mark_fail "apprafter up"; exit 1; }
@@ -91,6 +94,32 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
 done
 NVPA=$(kubectl -n vpa get deploy -o name 2>/dev/null | wc -l | tr -d ' ')
 [ "${NVPA:-0}" -ge 1 ] && ok "vpa component deployed ($NVPA deployments: recommender/updater/admission)" || mark_fail "vpa component not deployed"
+
+# CONTROLLERS RUNNING — the tell for the InPlace feature-gate crash-loop
+# (2026-08-21): a wrong gate name (`InPlaceOrRecreate` on VPA 1.7.1) puts the
+# updater + admission-controller in CrashLoopBackOff. The recommender is
+# UNAFFECTED, so a recommendation still appears (#9) and a dead updater
+# trivially passes no-thrash (#4) — this walk was GREEN on the crash-looping
+# ps 0.2.49 for exactly that reason. Asserting the three controllers are
+# Available (and none CrashLoopBackOff) is the ONLY check that catches it.
+printf '\n=== VPA controllers Running (feature-gate crash-loop guard) ===\n'
+[ "${NVPA:-0}" -eq 3 ] && ok "3 VPA controller deployments present (recommender/updater/admission)" || mark_fail "expected 3 VPA controller deployments, found ${NVPA:-0}"
+if kubectl -n vpa wait --for=condition=Available deploy --all --timeout=300s >/dev/null 2>&1; then
+    ok "all VPA controllers Available (updater + admission NOT CrashLoopBackOff — InPlace gate accepted)"
+else
+    mark_fail "a VPA controller is NOT Available within 300s — updater/admission CrashLoopBackOff (bad feature-gate name?)"
+    kubectl -n vpa get pods 2>/dev/null | sed 's/^/    VPAPOD /'
+    kubectl -n vpa logs deploy/vpa-updater --tail=20 2>/dev/null | grep -iE "feature-gate|InPlace|flag|invalid|unknown" | sed 's/^/    UPD /'
+fi
+CLB=$(kubectl -n vpa get pods -o json 2>/dev/null | python3 -c "import json,sys
+d=json.load(sys.stdin); bad=[]
+for p in d.get('items',[]):
+    for cs in p.get('status',{}).get('containerStatuses',[]):
+        w=(cs.get('state',{}).get('waiting') or {}).get('reason','')
+        if w in ('CrashLoopBackOff','Error') or cs.get('restartCount',0)>=3:
+            bad.append(p['metadata']['name']+'/'+cs['name']+':'+(w or 'restarts='+str(cs.get('restartCount',0))))
+print('\n'.join(bad))" 2>/dev/null)
+[ -z "$CLB" ] && ok "no crash-looping / high-restart container in the vpa namespace" || mark_fail "crash-looping VPA container(s): $CLB"
 
 # #2 metrics-server (M1 hard prereq)
 printf '\n=== #2 metrics-server (kubectl top) ===\n'
@@ -116,7 +145,7 @@ POD=$(app_pod "$APP"); printf '  app pod: %s\n' "$POD"
 [ -n "$POD" ] && ok "managed app Running" || mark_fail "managed app pod never appeared"
 
 # #1 the operator emitted a VPA CR AND the webhook ACCEPTED it (validates the alpha feature gate)
-printf '\n=== #1 VPA CR created + accepted (feature-gate InPlaceOrRecreate) ===\n'
+printf '\n=== #1 VPA CR created + accepted (feature-gate InPlace) ===\n'
 deadline=$(( $(date +%s) + 120 ))
 while [ "$(date +%s)" -lt "$deadline" ]; do vpa_exists "$APP" && break; sleep 10; done
 if vpa_exists "$APP"; then
@@ -181,6 +210,13 @@ if [ -n "$RECO" ]; then
     grep -qi "Too few replicas" <(kubectl -n vpa logs deploy/vpa-updater --tail=300 2>/dev/null) && mark_fail "#4 'Too few replicas' in updater log (min-replicas skipped the app)" || ok "#4 no 'Too few replicas' (minReplicas:1 works)"
     POD2=$(app_pod "$APP"); UID1=$(pod_uid "$POD2"); R1=$(pod_restarts "$POD2")
     [ "$UID0" = "$UID1" ] && [ "${R1:-0}" = "${R0:-0}" ] && ok "#4 pod not recreated (uid stable, RESTARTS=$R1) — in-place, no thrash" || mark_fail "#4 pod recreated (uid $UID0→$UID1, restarts $R0→$R1)"
+    # apply-observation (SOFT): with updateMode=InPlace on k8s 1.35 the updater
+    # right-sizes the pod's requests toward the recommendation IN PLACE (no
+    # recreate). It lags the first recommendation and needs the seed to differ
+    # from it, so this is logged, not asserted.
+    REQ=$(kubectl -n "$NS" get pod "$POD2" -o jsonpath='{.spec.containers[0].resources.requests.memory}' 2>/dev/null)
+    printf '  apply-observation (soft): pod requests.memory=%s vs VPA target=%s\n' "${REQ:-<unset>}" "$RECO"
+    [ -n "$REQ" ] && [ "$REQ" = "$RECO" ] && ok "apply OBSERVED: pod requests.memory==recommendation ($REQ), resized in place" || printf '  note: requests not yet ==recommendation (in-place resize lags first rec / seed may already match); soft\n'
 else
     mark_fail "#9 no VPA recommendation after 15m (metrics-server? feature-gate? history) — mirror untestable"
 fi
