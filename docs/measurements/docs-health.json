@@ -1,10 +1,10 @@
 {
   "pages": 37,
   "invocations": 652,
-  "identifiers": 362,
+  "identifiers": 358,
   "cue_documents": 7,
   "cue_fences": 22,
-  "code_paths": 118,
+  "code_paths": 117,
   "adr_references": 87,
   "exemptions": 5
 }

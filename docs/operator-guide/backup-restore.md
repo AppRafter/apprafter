@@ -15,38 +15,31 @@ There are three commands:
 
 | Command | Captures | Encrypted | Replays |
 | --- | --- | --- | --- |
-| `apprafter export` | native data only — pg dumps and volume tars + `manifest.json`. **No redis** (see below) | no | no — a plain folder for inspection / migrate-out |
+| `apprafter export` | native data only — pg dumps, volume tars, and persistent-redis snapshots + `manifest.json` | no | no — a plain folder for inspection / migrate-out |
 | `apprafter backup create` | the same native data **plus** config/app CRs **plus** decrypted user secrets | yes (restic) | via `apprafter restore` |
 | `apprafter restore` | — | — | replays a `backup` into a running target cluster |
 
-!!! danger "Redis contents are not backed up, and not restored"
+!!! note "Redis: persistent claims are captured and restored; ephemeral caches are not"
 
-    Neither `export` nor `backup create` captures the contents of a
-    `needs.redis` claim, and `restore` does not put any back. Both ends are
-    a log line and nothing else:
+    A `persistent: true` `needs.redis` claim **is** backed up and restored.
+    `export` and `backup create` capture it as a whole-instance Dragonfly
+    snapshot — a `SAVE` on the instance, then a tar of its snapshot directory
+    written to `redis/<ns>/<claim>/dump.tar`
+    (`cli/backup-core/src/extract.rs`). `restore` reloads it by live-loading
+    that snapshot into the **running** instance with `DFLY LOAD` — nothing is
+    scaled or restarted, so the claim provisioner never re-provisions (and
+    FLUSHes) the DB mid-restore
+    (`cli/platform-cli/src/commands/restore.rs`).
 
-    - the extractor's redis arm prints
-      `info: redis extraction for claim <ns>/<claim> deferred to T12 — skipping`
-      and writes no file (`cli/backup-core/src/extract.rs:217`) — so the
-      `redis/` directory in the layout below is never created;
-    - the restore's redis step prints
-      `info: redis restore for namespace <ns> deferred to T12 (Dragonfly RDB) — skipping`
-      (`cli/platform-cli/src/commands/restore.rs:1046`).
+    A `persistent: false` claim is **not** captured — it is a cache by
+    declaration, with no durable PVC to snapshot, and a restore re-provisions it
+    empty. The persistence gate is `cli/backup-core/src/extract.rs:101`.
 
-    A restore therefore re-provisions each redis claim **empty**: the claim
-    goes `Ready`, the connection Secret is fresh, and every key that was in it
-    is gone. The end-to-end harness matches — it asserts the redis claim comes
-    back `Ready` and that a **pg** row survived, and says so in a comment
-    rather than claiming a redis round-trip
-    (`e2e/backup-s3-sequential-kind.sh:716`).
-
-    **What to do about it.** Treat redis as rebuildable-from-source until this
-    lands: a cache, a queue you can drain before the migration, a session store
-    you can afford to empty. Data you cannot lose belongs in `needs.pg` or
-    `needs.disk`, both of which are captured and replayed. Note also that a
-    non-persistent (`persistent: false`) redis claim is not even considered for
-    capture — only `persistent: true` claims reach the skipped step
-    (`cli/backup-core/src/extract.rs:101`).
+    **Whole-instance semantics.** A Dragonfly *instance* fronts a pool of claims
+    that share it, each on its own logical DB. The snapshot and `DFLY LOAD` act
+    on the **whole instance**, so backup dedupes by instance and a restore
+    brings back every persistent claim on that instance together — restoring one
+    app's redis rolls its pool-siblings back to the same point in time.
 
 The full design rationale is in
 [ADR 0050](../adr/0050-backup-restore.md).
@@ -79,11 +72,13 @@ The layout:
 apprafter-export/
   pg/<ns>/<claim>.dump          # pg_dump -Fc (custom format)
   volumes/<ns>/<claim>/data.tar # tar of the volume contents
+  redis/<ns>/<claim>/dump.tar   # tar of a persistent Dragonfly snapshot
   manifest.json                 # cluster id, platformVersion, namespaces, resources
 ```
 
-A `redis/` directory appears in the code's layout comment but is never
-written — see the warning above.
+The `redis/` directory holds one `dump.tar` per **persistent** redis claim —
+a whole-instance Dragonfly snapshot. Ephemeral (`persistent: false`) claims
+carry no durable data and are skipped, so they never appear here.
 
 The pg dumps are standard PostgreSQL custom-format archives: open them with
 any matching `pg_restore`, e.g. `pg_restore -l pg/demo/shop-pg.dump` to list
@@ -240,9 +235,14 @@ Two behaviours are load-bearing:
   newly-provisioned one, not whatever owned the objects on the source.
 - **Volumes** are restored by streaming the tar on stdin to `tar x` in a
   helper pod that mounts the fresh PVC read-write.
-- **Redis** is **not** restored — the step logs a skip and moves on, and there
-  is nothing in the artifact for it to load anyway. The claim is re-provisioned
-  empty. See the warning at the top of this page.
+- **Redis** (persistent claims) is restored by live-loading the captured
+  Dragonfly snapshot into the running instance with `DFLY LOAD`: the tar is
+  unpacked into the instance's snapshot directory and the latest snapshot is
+  loaded on the data port (admin password read from the instance's `-admin`
+  Secret). Nothing is scaled or restarted, so the claim provisioner never
+  re-provisions (and FLUSHes) the DB mid-restore. Ephemeral
+  (`persistent: false`) claims carry no snapshot and come back empty — see the
+  note at the top of this page.
 
 ### Secrets are re-sealed for the target
 
@@ -286,12 +286,12 @@ verify when it is over, and what it costs you.
 
 ### Before you start
 
-- **Redis contents will not come across.** A restore re-provisions every
-  `needs.redis` claim empty — see the warning at the top of this page. A
-  planned upgrade is the good case for this: you can drain a queue, accept an
-  empty cache, or move anything you cannot lose into `needs.pg` or
-  `needs.disk` *before* you take the backup. In a disaster you get no such
-  chance.
+- **Persistent redis comes across; ephemeral caches do not.** A restore
+  live-loads each `persistent: true` `needs.redis` claim's Dragonfly snapshot
+  back into place — see the note at the top of this page. A `persistent: false`
+  claim is re-provisioned empty (it is a cache by declaration). A planned
+  upgrade is the good case for the latter: drain a queue or accept an empty
+  cache before you take the backup. In a disaster you get no such chance.
 - **A bigger node does not raise per-application limits.** The default memory
   limit is 512Mi on every machine size and does not grow with the node — see
   [Resources and
