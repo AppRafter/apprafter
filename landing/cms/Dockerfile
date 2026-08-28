@@ -30,6 +30,14 @@ RUN bun install --frozen-lockfile
 
 COPY cms cms
 
+# The CMS bundles the shared phase registry at build time
+# (waitlistPhaseOptions.ts and the Roadmap `num` validate import it
+# across the web/ workspace). Only web/package.json is copied above, so
+# the registry file itself must be present for the Next build to
+# resolve + inline it — it stays the single source
+# (landing/web/src/data/phases.json); nothing is kept at runtime.
+COPY web/src/data/phases.json web/src/data/phases.json
+
 # Next standalone output writes to cms/.next/standalone with the
 # workspace root as the tracing base (set in next.config.mjs).
 RUN cd cms && bun run build
