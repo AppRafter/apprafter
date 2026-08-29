@@ -25,6 +25,7 @@ pub mod identifier;
 pub mod invocation;
 pub mod marker;
 pub mod model;
+pub mod recipe;
 pub mod render;
 pub mod scan;
 pub mod shipped;
