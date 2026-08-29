@@ -363,7 +363,7 @@ fn collect_heads(text: &str, out: &mut Vec<String>) {
 /// four fenced recipes in the backup guide, and reading its head as the
 /// assignment would charge those lines to a command nobody runs.
 fn head_of(segment: &str) -> Option<&str> {
-    let mut tokens = segment.trim().split_whitespace();
+    let mut tokens = segment.split_whitespace();
     let mut first = tokens.next()?;
     if first == "$" {
         first = tokens.next()?;

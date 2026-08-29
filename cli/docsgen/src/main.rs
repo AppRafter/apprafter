@@ -51,9 +51,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some("generate") => generate(&cli, &root),
         Some("check") => docsgen::check::check(&cli, &root),
         Some("metrics") => metrics(&root),
+        Some("recipe-report") => recipe_report(&root),
         other => {
             let got = other.unwrap_or("(nothing)");
-            Err(format!("docsgen: usage: docsgen <generate|check|gate|metrics> (got {got})").into())
+            Err(format!(
+                "docsgen: usage: docsgen <generate|check|gate|metrics|recipe-report> (got {got})"
+            )
+            .into())
         }
     }
 }
@@ -74,6 +78,36 @@ fn metrics(root: &std::path::Path) -> Result<(), Box<dyn Error>> {
     println!(
         "docsgen metrics: wrote {}",
         path.strip_prefix(root).unwrap_or(&path).display()
+    );
+    Ok(())
+}
+
+/// Print every foreign command sitting in a guide's recipe path.
+///
+/// The working instrument for the restructure ADR 0058 asks for: the
+/// list of what to fix, shrinking as pages are rewritten. It **exits 0
+/// whatever it finds** — this is a report, and the check it reports on
+/// is deliberately not part of `gate` until the corpus is green (see
+/// `gate::RECIPE_PURITY`). Wiring a red check into the run that
+/// lefthook and `just lint` call would make the repository
+/// uncommittable for the length of the restructure.
+fn recipe_report(root: &std::path::Path) -> Result<(), Box<dyn Error>> {
+    let findings = docsgen::gate::Gate::new(root)?.recipe_findings()?;
+    let mut by_page: std::collections::BTreeMap<&str, Vec<&docsgen::gate::Finding>> =
+        std::collections::BTreeMap::new();
+    for found in &findings {
+        by_page.entry(found.file.as_str()).or_default().push(found);
+    }
+    for (page, found) in &by_page {
+        println!("{page}  ({} foreign command(s))", found.len());
+        for f in found {
+            println!("  {}:{} {}", f.file, f.line, f.message);
+        }
+    }
+    println!(
+        "docsgen recipe-report: {} finding(s) across {} page(s)",
+        findings.len(),
+        by_page.len()
     );
     Ok(())
 }

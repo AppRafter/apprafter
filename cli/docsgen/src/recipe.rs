@@ -111,6 +111,16 @@ pub const ALLOWLIST: &[(&str, &str)] = &[
         "the documented portability escape hatch: a repository \
        stays readable with no AppRafter at all",
     ),
+    (
+        "vault",
+        "the reader's own secret store, feeding a provider token into \
+         the environment before any AppRafter command runs",
+    ),
+    (
+        "loginctl",
+        "ends the reader's own login session so a host group membership \
+         takes effect; their machine, not the platform",
+    ),
     // The reader's own shell.
     ("export", "shell builtin: the reader's environment"),
     ("source", "shell builtin: the reader's environment"),

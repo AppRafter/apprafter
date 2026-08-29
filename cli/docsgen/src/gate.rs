@@ -200,6 +200,7 @@ use crate::identifier::{self, FieldSet};
 use crate::invocation::{self, Tree};
 use crate::marker::{self, Age, Check, Marker, Reason};
 use crate::model;
+use crate::recipe;
 use crate::scan::{self, BlockKind};
 
 use clap::CommandFactory;
@@ -259,6 +260,18 @@ pub const HEALTH_BASELINE: &str = "health-baseline";
 /// The declared-exemption count no longer equals the committed census —
 /// one was declared, or one was retired.
 pub const HEALTH_EXEMPTIONS: &str = "health-exemptions";
+/// A foreign command in a guide's recipe path: not `apprafter`, not on
+/// [`crate::recipe::ALLOWLIST`], not inside a collapsed disclosure, and
+/// not on a [`crate::recipe::BREAK_GLASS_PAGES`] page. ADR 0058.
+///
+/// **Not yet part of [`Gate::corpus`].** It is red on the corpus by
+/// design — that is what 2.20c exists to fix — and wiring a red check
+/// into the run that lefthook and `just lint` call would make the
+/// repository uncommittable for the length of the restructure. It is
+/// reachable through [`Gate::recipe_findings`] and `docsgen
+/// recipe-report`, and the last commit of 2.20c moves it into
+/// [`Gate::page`].
+pub const RECIPE_PURITY: &str = "recipe-purity";
 
 /// Front-matter key exempting an inline span from the CLI check, by the
 /// span's literal text.
@@ -290,6 +303,13 @@ fn remedy(code: &str) -> &'static str {
         CUE_DOCUMENT => {
             "fix the manifest until `apprafter app validate` accepts it — a reader \
              copies this block verbatim"
+        }
+        RECIPE_PURITY => {
+            "route it by role (ADR 0058): delete walk material and assert the \
+             property in prose with the e2e as its evidence, collapse independent \
+             verification into a `???` disclosure, move mechanism to its own page, \
+             move failure handling to troubleshooting.md — or, if AppRafter cannot \
+             own the tool, add it to recipe::ALLOWLIST with the reason"
         }
         UNLABELLED_FENCE => {
             "give the fence an info string (```sh, ```cue, ```yaml, ```text …) — \
@@ -385,6 +405,58 @@ fn finding(code: &'static str, file: &str, line: usize, message: String) -> Find
         message,
         remedy: remedy(code),
     }
+}
+
+/// Whether a page is a guide — the only shape ADR 0058 calls a recipe.
+fn is_guide(path: &str) -> bool {
+    path.starts_with("docs/operator-guide/") || path.starts_with("docs/dev-guide/")
+}
+
+/// [`RECIPE_PURITY`] findings on one page, given its source.
+///
+/// Free rather than a method so the rule is testable without a clap
+/// tree or a checkout, the same split [`crate::scan`] and
+/// [`crate::invocation`] already keep.
+fn recipe_findings_for(file: &str, source: &str) -> Vec<Finding> {
+    let disclosures = recipe::disclosure_ranges(source);
+    let mut findings = Vec::new();
+
+    for block in scan::scan_markdown(source) {
+        // Spans are out of scope, front matter is not a claim, and a
+        // fence whose info string says it is not shell would only
+        // invent commands out of CUE and mermaid — see the recipe
+        // module docs for the measurement behind both.
+        match &block.kind {
+            BlockKind::Fence { tag } if recipe::is_non_shell_tag(tag.as_deref()) => continue,
+            BlockKind::Fence { .. } | BlockKind::Literal => {}
+            BlockKind::FrontMatter | BlockKind::InlineSpan => continue,
+        }
+        if recipe::inside_disclosure(&disclosures, block.line) {
+            continue;
+        }
+        // The body's first line sits one below a fence's delimiter, and
+        // a literal block anchors on its own first line. Same ±1 the
+        // rest of this module derives from one value.
+        let body_line = match &block.kind {
+            BlockKind::Fence { .. } => block.line + 1,
+            _ => block.line,
+        };
+        for (offset, text) in invocation::logical_lines(&block.body) {
+            for name in recipe::foreign_commands(&text) {
+                findings.push(finding(
+                    RECIPE_PURITY,
+                    file,
+                    body_line + offset,
+                    format!(
+                        "`{name}` runs in the recipe path — a guide's main flow \
+                         carries `apprafter` commands and allowlisted external \
+                         tools only"
+                    ),
+                ));
+            }
+        }
+    }
+    findings
 }
 
 /// What the corpus looked like, for the line printed on every run.
@@ -851,6 +923,40 @@ impl Gate {
             // there is nothing to anchor on, and a reader who opens it
             // sees the whole file at once. The message names the field.
             findings.push(finding(code, health::FILE, 1, divergence.message));
+        }
+        sort(&mut findings);
+        Ok(findings)
+    }
+
+    /// Every foreign command sitting in a guide's recipe path.
+    ///
+    /// Separate from [`Gate::corpus`] on purpose — see
+    /// [`RECIPE_PURITY`] for why a red check cannot join the run that
+    /// gates every commit until the restructure that turns it green has
+    /// happened.
+    ///
+    /// Scope is the two guide trees. `README.md`, the ADR corpus and
+    /// `docs/reference/cli/**` are not recipes: the first is a product
+    /// front door, the second is a decision record, and the third is
+    /// generated from the clap tree and judged by `docsgen check`.
+    pub fn recipe_findings(&self) -> Result<Vec<Finding>, Box<dyn Error>> {
+        let files = scan::in_scope(&self.repo_root).map_err(|e| {
+            format!("could not list the in-scope documentation (is `git` on PATH?): {e}")
+        })?;
+        let mut findings = Vec::new();
+
+        for path in &files {
+            let shown = path
+                .strip_prefix(&self.repo_root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            if !is_guide(&shown) || recipe::break_glass_reason(&shown).is_some() {
+                continue;
+            }
+            let source =
+                std::fs::read_to_string(path).map_err(|e| format!("reading {shown}: {e}"))?;
+            findings.extend(recipe_findings_for(&shown, &source));
         }
         sort(&mut findings);
         Ok(findings)
