@@ -186,6 +186,7 @@ pub fn add(
         scaffold_target.exists(),
         use_wizard,
         scaffold_flag,
+        git_url.is_some(),
     );
     // Step 0 may settle a namespace ≠ clap's `--namespace`
     // default. Carry it forward to the outer wizard so the

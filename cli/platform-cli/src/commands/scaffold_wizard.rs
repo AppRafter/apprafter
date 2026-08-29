@@ -72,7 +72,16 @@ pub fn decide_scaffold_step(
     scaffold_target_exists: bool,
     use_wizard: bool,
     scaffold_flag: bool,
+    explicit_git_url: bool,
 ) -> ScaffoldDecision {
+    // An explicit `<git-url>` names where the manifest lives, and
+    // Argo CD renders it from there. Step 0 bridges a fresh LOCAL
+    // checkout to a registered app; there is nothing local to bridge
+    // here, and requiring a cwd manifest contradicts the argument's
+    // own help — "Required when cwd is not a git repo".
+    if explicit_git_url {
+        return ScaffoldDecision::Skip;
+    }
     if scaffold_target_exists {
         return ScaffoldDecision::Skip;
     }
@@ -299,15 +308,15 @@ mod tests {
     #[test]
     fn decide_scaffold_step_skips_when_target_exists() {
         assert_eq!(
-            decide_scaffold_step(true, true, true),
+            decide_scaffold_step(true, true, true, false),
             ScaffoldDecision::Skip
         );
         assert_eq!(
-            decide_scaffold_step(true, false, false),
+            decide_scaffold_step(true, false, false, false),
             ScaffoldDecision::Skip
         );
         assert_eq!(
-            decide_scaffold_step(true, true, false),
+            decide_scaffold_step(true, true, false, false),
             ScaffoldDecision::Skip
         );
     }
@@ -318,11 +327,11 @@ mod tests {
         // prompts naturally; scaffold flag is a non-
         // interactive convenience).
         assert_eq!(
-            decide_scaffold_step(false, true, false),
+            decide_scaffold_step(false, true, false, false),
             ScaffoldDecision::Interactive
         );
         assert_eq!(
-            decide_scaffold_step(false, true, true),
+            decide_scaffold_step(false, true, true, false),
             ScaffoldDecision::Interactive
         );
     }
@@ -330,7 +339,7 @@ mod tests {
     #[test]
     fn decide_scaffold_step_routes_non_interactive_when_scaffold_flag_set() {
         assert_eq!(
-            decide_scaffold_step(false, false, true),
+            decide_scaffold_step(false, false, true, false),
             ScaffoldDecision::NonInteractive
         );
     }
@@ -341,9 +350,30 @@ mod tests {
         // would surprise operators in CI pipelines. Force
         // them to be explicit about wanting a scaffold.
         assert_eq!(
-            decide_scaffold_step(false, false, false),
+            decide_scaffold_step(false, false, false, false),
             ScaffoldDecision::Refuse
         );
+    }
+
+    #[test]
+    fn decide_scaffold_step_skips_when_an_explicit_git_url_was_given() {
+        // `app add <git-url>` names the repository that holds the
+        // manifest. Step 0 exists to bridge a fresh LOCAL checkout
+        // to a registered app; with an explicit URL there is nothing
+        // local to bridge, and demanding a cwd manifest contradicts
+        // the argument's own help ("Required when cwd is not a git
+        // repo"). The documented workaround was cloning a repository
+        // the operator does not otherwise need.
+        for use_wizard in [true, false] {
+            for scaffold_flag in [true, false] {
+                assert_eq!(
+                    decide_scaffold_step(false, use_wizard, scaffold_flag, true),
+                    ScaffoldDecision::Skip,
+                    "explicit git url must skip step 0 \
+                     (wizard={use_wizard}, scaffold={scaffold_flag})"
+                );
+            }
+        }
     }
 
     #[test]
