@@ -209,6 +209,14 @@ nav:
       - Migration plans: operator-guide/migration-plans.md
       - Troubleshooting: operator-guide/troubleshooting.md
       - Recovery: operator-guide/recovery.md
+  - How it works:
+      # Mechanism, split out of the guides by ADR 0058: a guide is a
+      # recipe, and an explanation of what the platform does behind a
+      # step is a different job for a different reader. Sits after the
+      # two guide sections because that is the order the reader meets
+      # them in — run the recipe first, come here when it surprises you.
+      - Overview: how-it-works/index.md
+      - Declared Postgres dependencies: how-it-works/needs-pg.md
   - Developer Guide:
       - Overview: dev-guide/index.md
       - Quickstart: dev-guide/quickstart.md

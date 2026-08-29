@@ -47,20 +47,46 @@ fn the_check_is_red_on_the_corpus_today() {
 }
 
 #[test]
-fn the_four_worst_pages_are_all_loud() {
+fn the_pages_not_yet_restructured_are_still_loud() {
     let found = findings();
-    // The four pages the census named: each transcribes an e2e walk,
-    // and they are the four highest foreign-command counts in the
-    // corpus. If one of these goes quiet without its page being
-    // rewritten, the check has lost surface.
+    // Of the four pages the census named — each transcribing an e2e
+    // walk, and the four highest foreign-command counts in the corpus —
+    // these three are still to do. If one goes quiet without its page
+    // being rewritten, the check has lost surface.
     for page in [
-        "docs/operator-guide/postgres.md",
         "docs/operator-guide/redis.md",
         "docs/operator-guide/persistent-disk.md",
         "docs/operator-guide/egress-policy.md",
     ] {
         let count = found.iter().filter(|f| f.file == page).count();
         assert!(count > 0, "{page} should be red and is not");
+    }
+}
+
+/// Pages 2.20c has rewritten into recipes. This list grows as the
+/// restructure proceeds, and every entry is a page that used to be
+/// loud — which is what makes it evidence rather than bookkeeping.
+const RESTRUCTURED: &[&str] = &["docs/operator-guide/postgres.md"];
+
+#[test]
+fn a_restructured_page_is_silent() {
+    // The other half of the red state: a page that WAS loud and now is
+    // not. Kept as an assertion rather than deleted, because a page
+    // going quiet is the evidence the restructure worked, and an
+    // assertion that only ever gets removed proves nothing. postgres.md
+    // carried 40 findings before 2.20c.
+    let found = findings();
+    for page in RESTRUCTURED {
+        let hits: Vec<_> = found
+            .iter()
+            .filter(|f| f.file == *page)
+            .map(|f| format!("{}:{} {}", f.file, f.line, f.message))
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "{page} was restructured and must stay a recipe, got:\n{}",
+            hits.join("\n")
+        );
     }
 }
 
