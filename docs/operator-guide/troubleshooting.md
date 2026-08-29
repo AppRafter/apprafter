@@ -330,12 +330,17 @@ Found in an end-to-end run of v0.1.78. The wizard's "✓ Token verified" line is
 fine; the prior "(token bytes: <value>)" debug line is gone. If
 you see the value echoed anywhere in v0.1.78+, file an issue.
 
-### Cilium CNI did not roll over to v6 after Cilium chart update
+### Cilium pods did not pick up a config change
 
-The Cilium chart `upgrade-install` does not trigger a DaemonSet
-restart on every config change; manually
-`kubectl -n kube-system rollout restart ds/cilium` after the
-chart bump. Doing it for you is not implemented yet.
+They do now, and no manual roll is needed. The platform stack sets
+`rollOutCiliumPods`, `operator.rollOutPods` and `envoy.rollOutPods` on the
+Cilium chart (`platform-stack/cue/component_cilium.cue`), which stamps a config
+checksum onto each pod template — so a values change rolls the agent, the
+operator and Envoy on its own.
+
+If a Cilium pod is genuinely stuck, that is a different problem from a config
+change not landing: read the agent's logs before restarting anything, because a
+roll will hide the reason.
 
 ### Provisioning fails on a Hetzner quota or server-type limit {#quota}
 

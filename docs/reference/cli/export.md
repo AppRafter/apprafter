@@ -1,6 +1,6 @@
 ---
 title: "apprafter export"
-description: "Native data export (Kind 1) — pull pg dumps and volume tars to a plain local folder + `manifest.json`."
+description: "Native data export (Kind 1) — pull pg dumps, volume tars and persistent-redis snapshots to a plain local folder + `manifest.json`."
 audience: reference
 status: stable
 ---
@@ -9,7 +9,7 @@ status: stable
 
 # `apprafter export`
 
-Native data export (Kind 1) — pull pg dumps and volume tars to a plain local folder + `manifest.json`. Redis contents are NOT captured (the extractor logs a skip). No CRs, no secrets, no encryption. A debugging / one-off-recovery convenience
+Native data export (Kind 1) — pull pg dumps, volume tars and persistent-redis snapshots to a plain local folder + `manifest.json`. An ephemeral (`persistent: false`) redis claim is a cache by declaration and is skipped. No CRs, no secrets, no encryption. A debugging / one-off-recovery convenience
 
 ```text
 Usage: apprafter export [OPTIONS]

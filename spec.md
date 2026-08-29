@@ -1416,29 +1416,50 @@ Subsequent to M1 delivery, ADRs 0025–0029 reframe `cluster-bootstrap` as a min
 
 ---
 
-## Known limitations of v0.1.x
+## Known limitations
 
-The following features are declared in the Application manifest schema and accepted by the operator, but are not enforced or fully implemented in the v0.1.x series. They are addressed in later phases of the roadmap (§6).
+Capabilities the roadmap (§6) still owes, as of the revision above. A field that
+is **not in the schema** is named as such: the earlier form of this section
+described three fields as "accepted by the operator" that
+`schemas/v1alpha1/application.cue` does not declare, so a reader following it
+wrote a manifest the admission webhook rejects.
 
-- **Platform stack installed imperatively.** Sub-phases 1.5–1.18 install Cilium, cert-manager, Argo CD, the AppRafter operator, admission webhook, and Backstage via direct `helm install` and `kubectl apply` in `apprafter cluster-bootstrap`. Drift correction does not apply to platform components, and changing platform configuration requires rebuilding the CLI. M1.5 (Self-managing rethink) replaces this with Argo CD-managed platform components from a versioned OCI chart.
+- **`confidential` workloads.** The field was **removed from the schema** and
+  re-appears in its owning subphase (Phase 6 / M6, Kata-CC runtimeClass and
+  confidential-nodepool scheduling). Writing it today is a validation error, not
+  an accepted no-op.
 
-- **HTTPRoute auto-generation** is deferred to Phase 4 (M4). v0.1.x renders Deployment + Service per Application, but does not auto-create Gateway HTTPRoute resources. Operators must manually configure routing via `kubectl apply` on HTTPRoute manifests until Phase 4 lands. Hostname conflict detection, TLS auto-issuance, WebSocket/sticky semantics, URL rewrites — all part of Phase 4 deliverable.
+- **Declared external egress.** There is no `connects` field in the schema. Egress
+  is enforced today from `needs` — the operator renders a per-application
+  CiliumNetworkPolicy (default-deny plus DNS, same-namespace, world and one rule
+  per declared need; ADR 0045), with the cluster-wide profile set through
+  `apprafter platform egress`. What is still owed is a way to declare a specific
+  external dependency and have an FQDN policy generated for it.
 
-- **`confidential: true` flag** is deferred to Phase 6 (M6). The manifest field is accepted but does not enforce Kata-CC runtimeClass or confidential nodepool scheduling until the CoCo stack is implemented.
+- **Static egress IP allocation.** There is no `network.egressIP` field in the
+  schema. Cilium Egress Gateway with family-aware static allocation lands in
+  Phase 4 (M4).
 
-- **`connects.egress.external` not enforced.** The field is currently advisory only — Applications declare external dependencies for documentation purposes, but Cilium FQDN policies blocking non-declared egress land in Phase 4.
+- **AccessGrant.** The `AccessGrant` CRD does not ship in the operator chart, so
+  its `approvers` / JIT cluster-admin flow is design, not accepted input.
+  Phase 4 (M4).
 
-- **Static egress IP allocation manual.** `network.egressIP.static: true` is accepted in the manifest but not provisioned by the operator yet. Cilium Egress Gateway with family-aware static IP allocation lands in Phase 4.
+- **Automatic DNS.** Records are created by hand or by the reader's provider.
+  external-dns and the `DNSZone` CRD land in Phase 4 (M4).
 
-- **Hard multi-tenancy is opt-in at Tier 2.** Tier 2's default is an HA substrate only; v0.1.x runs single-tenant. Hard multi-tenancy via Kamaji is opt-in (`PlatformStack.spec.values.multitenancy: true`, default off — ADR 0038). Kamaji + Capsule + AppRafter Tenant CRD land in Phase 3 (M3).
+- **Automatic certificate issuance.** A public route is served on a certificate
+  the operator imports (`apprafter target cert import`); `certMode` accepts the
+  imported form only. Issuance-on-demand is Phase 4 (M4).
 
-- **AccessGrant `approvers` / JIT cluster-admin** — fields accepted but reconciliation lands in Phase 4 (M4).
+- **Hard multi-tenancy is opt-in at Tier 2.** Tier 2's default is an HA substrate
+  only. Hard multi-tenancy via Kamaji is opt-in
+  (`PlatformStack.spec.values.multitenancy: true`, default off — ADR 0038);
+  Kamaji + Capsule + the Tenant CRD land in Phase 3 (M3).
 
-- **DNS automation.** External DNS records are managed manually in v0.1.x. external-dns + `DNSZone` CRD land in Phase 4 (M4).
-
-- **MigrationPlan reconciler.** The `MigrationPlan` CRD schema is defined; reconciler implementation with both application and platform scopes lands in M1.5. Until then, all changes are applied immediately by the operator without approval gating.
-
----
+- **Platform services beyond pg, redis and disk.** JetStream, ClickHouse and S3
+  providers are designed and deferred post-launch; a `needs` type no provider
+  ships is documented as declared rather than usable, and the documentation gate
+  enforces that distinction (`cli/docsgen/src/shipped.rs`).
 
 ## 7. Open Questions and Decisions
 

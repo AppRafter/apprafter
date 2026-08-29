@@ -330,14 +330,14 @@ RESTIC_PASSWORD=<passphrase> apprafter backup list --repo /backups/prod-repo
 # 3 — release the machine (read the destroy-scope warning on the machine page)
 apprafter destroy --yes --target prod
 
-# 4 — record the new machine on the target, in the one window that allows it
-#     (see "the target keeps reporting the old machine" below)
-apprafter target machine --target prod --server-type cx33
-
-# 5 — provision the bigger machine and replay the backup into it
+# 4 — provision the bigger machine and replay the backup into it
 RESTIC_PASSWORD=<passphrase> apprafter restore /backups/prod-repo \
     --reprovision --server-type cx33 --target prod
 ```
+
+`--server-type` on the restore is the whole answer: the target records the
+machine it actually provisioned, so a later rebuild that names no type
+reproduces the new machine rather than the old one.
 
 ### The sequence — off-site (S3) repository
 
@@ -347,8 +347,7 @@ restore from is already there. Step 1 becomes a check that it is current and
 intact rather than a fresh backup.
 
 ```sh
-# 1 — confirm the off-site repository is current and sound.
-#     Do this BEFORE the destroy — see the second defect below for why.
+# 1 — confirm the off-site repository is current and sound
 apprafter backup status
 apprafter backup check --repo s3:<endpoint>/<bucket>/<prefix> \
     --credential-file ./operator-s3.env
@@ -356,14 +355,16 @@ apprafter backup check --repo s3:<endpoint>/<bucket>/<prefix> \
 # 2 — release the machine
 apprafter destroy --yes --target prod
 
-# 3 — record the new machine on the target
-apprafter target machine --target prod --server-type cx33
-
-# 4 — provision the bigger machine and replay from off-site
+# 3 — provision the bigger machine and replay from off-site
 apprafter restore s3:<endpoint>/<bucket>/<prefix> \
     --reprovision --server-type cx33 --target prod \
     --credential-file ./operator-s3.env
 ```
+
+Step 1 is worth doing before the destroy regardless — a repository you verify
+while the cluster is still up is one you can still fall back to — but it is not
+a constraint: `backup check` runs offline from `--repo` and the operator's
+credentials, with or without a cluster.
 
 The credentials in `--credential-file` are the **operator's**, read from your
 own machine: between steps 2 and 4 there is no cluster left to read a
@@ -384,9 +385,10 @@ enabled again without you re-running `apprafter backup enable`.
 same as the upgrade having worked. Six checks, each earning its place:
 
 1. **The server type, read from the provider.** Take it from the Hetzner Cloud
-   Console or the provider API — not from `apprafter target show` and not from
-   local state. Local records say what AppRafter asked for; only the provider
-   says what it got, and the two can disagree (they do; see below).
+   Console or the provider API rather than from local records: only the
+   provider says what it actually got. `apprafter target show` should agree —
+   the target adopts the machine it provisioned — and a disagreement between
+   the two is itself the finding.
 2. **The server id changed.** A new id is what proves a genuinely new machine
    rather than a local record rewritten around the old one. If the id is the
    same, no rebuild happened — the most likely cause is the cluster-name
@@ -455,66 +457,34 @@ minutes rather than seconds, and measure your own before you commit to a
 maintenance window. The walk's phase banners carry an elapsed clock, which
 makes the Phase 5 → Phase 7 span the number to read off a run of your own.
 
-### Two defects to plan around
+### Two defects the validation runs found
 
-Both were found by the validation runs. They are current behaviour with a
-workaround, not planned work.
+Both were found by the two validation runs of this procedure, and both are
+fixed as of cli v0.2.49. They are recorded here because the fix changed what
+the sequence above looks like, and an operator reading an older copy of this
+page will find two steps that no longer exist.
 
-#### `apprafter target show` keeps reporting the old machine
+- **The target now records the machine it provisioned.** A
+  `restore --reprovision --server-type <big>` used to leave the target's saved
+  preference pointing at the old machine, so a later rebuild that named no type
+  would resolve the stale value and reproduce the machine you were leaving. The
+  sequence therefore carried a `apprafter target machine` step in the window
+  between `destroy` and `restore`, which is no longer needed.
+- **`backup check`, `prune` and `unlock` no longer need a live cluster.** All
+  three used to resolve a kubeconfig before doing anything, so between the
+  destroy and the restore they failed — exactly when verifying an off-site
+  repository matters most. `check` and `unlock` now run offline from `--repo`
+  plus the operator's credentials; `prune` also needs all three `--keep-*`
+  flags, because without them it reads the retention policy from the cluster.
 
-After `restore --reprovision --server-type <big>`, the live machine and the
-recorded state are both the new SKU — but the target's saved *preference* is
-untouched, because the backfill that writes it only fills the slot when it is
-empty and yours is not. So `apprafter target show <name>` prints the old SKU
-indefinitely.
+If you need to inspect a repository with no AppRafter at all, stock `restic`
+still works — it is a plain restic repository (see [Assumptions and
+portability](#assumptions-and-portability)):
 
-It is harmless immediately: recorded state outranks the target preference in
-the resolution chain (flag → manifest → recorded state → target preference →
-`APPRAFTER_SERVER_TYPE`), so the stale value is shadowed for as long as that
-state exists. It stops being harmless the moment the state is cleared — which
-is precisely what `apprafter destroy` does. A **second** upgrade run without an
-explicit `--server-type` would resolve the stale preference and rebuild the
-machine you were trying to leave.
-
-The correction has to happen in the window between `destroy` and `restore` —
-which is why it is a step of its own in both sequences above. `apprafter
-target machine` refuses on a target that already runs a provisioned cluster,
-so once the restore has finished there is no supported command left to fix it.
-If you have already completed an upgrade without that step, either pass
-`--server-type` explicitly on every future rebuild, or set the preference in
-the destroy-to-restore window of the next one.
-
-#### `backup check`, `prune` and `unlock` fail once the cluster is gone
-
-All three resolve a kubeconfig as their first statement (`run_backup_check`,
-`run_backup_prune` and `run_backup_unlock` in
-`cli/platform-cli/src/commands/backup.rs`), and `apprafter destroy` clears the
-provider section of the state file. So between the destroy and the restore all
-three exit with:
-
-```text
-state has no hetzner_cloud section; run `apprafter apply` first
+```sh
+restic -r s3:<endpoint>/<bucket>/<prefix> snapshots
+restic -r s3:<endpoint>/<bucket>/<prefix> check
 ```
-
-None of them needs the cluster or the `PlatformStack` when `--repo` and
-`--credential-file` are both given — the repository URL and the operator's
-credentials are the entire input. The failure therefore lands exactly where it
-hurts most: verifying an off-site backup *before* restoring from it, with no
-cluster in the world to ask.
-
-Two ways around it:
-
-- **Check before you destroy.** Step 1 of the S3 sequence above does this
-  deliberately, and it is the better habit regardless — a repository you
-  verify while the cluster is still up is one you can still fall back to.
-- **Use stock restic**, which needs no AppRafter and no cluster at all (the
-  repository is a plain restic repo — see [Assumptions and
-  portability](#assumptions-and-portability)):
-
-    ```sh
-    restic -r s3:<endpoint>/<bucket>/<prefix> snapshots
-    restic -r s3:<endpoint>/<bucket>/<prefix> check
-    ```
 
 ### The executable version
 

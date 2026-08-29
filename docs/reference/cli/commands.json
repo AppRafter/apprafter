@@ -1559,7 +1559,7 @@
         "export"
       ],
       "aliases": [],
-      "about": "Native data export (Kind 1) — pull pg dumps and volume tars to a plain local folder + `manifest.json`. Redis contents are NOT captured (the extractor logs a skip). No CRs, no secrets, no encryption. A debugging / one-off-recovery convenience",
+      "about": "Native data export (Kind 1) — pull pg dumps, volume tars and persistent-redis snapshots to a plain local folder + `manifest.json`. An ephemeral (`persistent: false`) redis claim is a cache by declaration and is skipped. No CRs, no secrets, no encryption. A debugging / one-off-recovery convenience",
       "long_about": null,
       "usage": "Usage: apprafter export [OPTIONS]",
       "hidden": false,
@@ -2626,7 +2626,7 @@
         "restore"
       ],
       "aliases": [],
-      "about": "Restore a backup into a target cluster: replays the CRs, secrets and native data (pg + volumes) captured by `apprafter backup`. Redis contents are neither captured nor restored — a redis claim comes back empty. Modes: restore-into-running (default; the target must already be bootstrapped), `--data-only` (reload native data only, no CR/secret replay), and `--reprovision` (provision a fresh cluster first, then replay). Secrets are re-sealed against the target cluster's sealed-secrets key",
+      "about": "Restore a backup into a target cluster: replays the CRs, secrets and native data (pg, volumes and persistent-redis snapshots) captured by `apprafter backup`. A persistent redis claim is reloaded into the running instance with `DFLY LOAD`; an ephemeral one comes back empty because it holds no durable data. Modes: restore-into-running (default; the target must already be bootstrapped), `--data-only` (reload native data only, no CR/secret replay), and `--reprovision` (provision a fresh cluster first, then replay). Secrets are re-sealed against the target cluster's sealed-secrets key",
       "long_about": null,
       "usage": "Usage: apprafter restore [OPTIONS] <REPO>",
       "hidden": false,

@@ -355,22 +355,21 @@ Cheapest, and the machine is gone while the new one comes up.
 ```sh
 apprafter backup create                                    # to an off-cluster repository
 apprafter destroy --yes                                    # releases the machine
-apprafter target machine                                   # pick the new one
 apprafter restore <repo> --reprovision --server-type <sku> # rebuild, then replay
 ```
 
 `apprafter destroy` clears the recorded cluster, which is what makes
 `apprafter target machine` available again — it is the same "target with
-no cluster yet" state a freshly registered target is in. Note that the
-target keeps the **old** type as its saved preference, so either pick a
-new one first or pass `--server-type` to the restore; otherwise the
-rebuild reproduces the machine you were trying to leave.
+no cluster yet" state a freshly registered target is in. You do not need
+it here: `--server-type` on the restore names the machine to build, and
+the target adopts what it actually provisioned, so a later rebuild that
+names no type reproduces the new machine rather than the old one.
 
 [Move a cluster onto a bigger
 machine](backup-restore.md#substrate-upgrade) is this route from the
-backup side: the same four commands with an off-site (`s3:`) variant, what
-to check once the new machine is up, how long the outage runs, and two
-defects worth planning around. It is validated end to end on real Hetzner.
+backup side: the same three commands with an off-site (`s3:`) variant, what
+to check once the new machine is up, and how long the outage runs. It is
+validated end to end on real Hetzner.
 
 `destroy` names the machine it removed on its way out, so keep the line
 if you may want to go back to it:
