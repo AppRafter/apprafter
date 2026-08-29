@@ -2124,6 +2124,64 @@ what that command's blast radius is, in the same breath, from the source.
   written in one invocation — a live example of "the gate checks names, not
   truth". Recorded, not fixed.
 
+## Amendment — what measurement overturned, 2026-08-29
+
+Two decisions recorded above did not survive later measurement. Both are
+superseded by ADR 0058; the text they amend stays as written, per this
+document's own convention.
+
+### The 2.19i ratification of `kubectl`-dominance
+
+The 2.19i amendment concluded that *"the dependency guides are
+`kubectl`-dominated inside their fences because the observations they teach (a
+claim reaching `ready`, a role appearing in `pg_roles`, a policy dropping a
+packet) are `kubectl` **reads**. That is a reason to keep them together, not to
+split them"*, with `postgres.md` at 40/10 and `redis.md` at 39/10.
+
+The 2026-08-29 census re-measured the same corpus with a dimension the earlier
+count did not have — **the role each foreign command plays for the reader**
+rather than its position relative to a fence. Across 27 pages there are 325
+foreign commands, of which only **61 are SETUP**: VERIFY 153, TROUBLESHOOT 60,
+EXPLAIN 51. Four out of five are not part of achieving anything, and 96 blocks
+sit before the recipe they interrupt is complete.
+
+Of those 61 SETUP commands, 27 are legitimately external and 8 are laziness
+where an `apprafter` command already exists. Of the 23 that looked like product
+gaps, **14 were walk material that does not belong on a guide at all** — the
+forced-GC sections instruct the reader to hand-author a `RetainedClaim`, which
+`operator/admission-webhook/src/validator_retainedclaim.rs` exists to forbid.
+
+The correlation the fence count could not see: **five pages reference an e2e
+walk, and four of them are the four worst pages in the corpus** (51, 49, 43 and
+26 foreign commands). The fifth, `backup-restore.md`, references walks too and
+stayed clean at 23 — because its walks are CLI-driven. A guide inherits the
+shape of its walk. "Keep them together" preserved the transcription; ADR 0058
+separates the recipe from the validation artifact that produced it.
+
+### Decision 7's forbidden-claims lint
+
+Decision 7 still describes a curated forbidden-claims lint as *"the only guard
+against **recurrence** of prose drift"*. It was retracted in rev 3 of
+`2026-08-17-documentation-system-design.md` and no code implements it —
+`grep -i forbidden cli/docsgen/src/` returns nothing. The contradiction is
+resolved here: the `behaviour-claim` gate specified by ADR 0058 supersedes it.
+
+That gate is not novel. `cli/docsgen/src/shipped.rs` is already a
+behavioural-truth check — it classifies each `needs` key as shipped or merely
+declared from whether a provisioner backend arm and a seeded `ServiceProvider`
+exist, and fails a guide that presents an unshipped type as usable. Its own
+docstring states the intent: *"A guide that shows a reader `needs: jetstream:
+{}` and calls it usable would be schema-valid and product-false."* It was never
+generalised past `needs` keys, which is why the summary above — that the gate
+resolves names and never truth — reads as absolute when it is not quite.
+
+The generalisation is the same three-part shape: a flat table of predicates each
+carrying its evidence, a completeness test derived from the source of truth so a
+new entry forces a decision rather than defaulting to unchecked, and a loud
+failure rather than a vacuous pass. Nothing in the dropped staleness gating or
+the deferred `verified-by` bindings is revived; those rejections stand with
+their measurements.
+
 ## Alternatives considered
 
 - **Port the site to VitePress or Astro Starlight.** Rejected. The 93 existing
