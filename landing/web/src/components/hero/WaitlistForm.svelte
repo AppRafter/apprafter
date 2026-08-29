@@ -10,6 +10,8 @@
 // LANDING_CMS_PORT; in prod set PUBLIC_CMS_URL to the absolute
 // origin of the deployed CMS.
 
+import { waitlistFields } from '../../lib/waitlist-payload';
+
 type Props = {
   formIntro: string;
   emailLabel: string;
@@ -75,7 +77,6 @@ $effect(() => {
 });
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const PHASE_IDS = new Set(['tier2', 'managed', 'tier3', 'tier4', 'federation']);
 
 async function submit(ev: SubmitEvent) {
   ev.preventDefault();
@@ -87,9 +88,7 @@ async function submit(ev: SubmitEvent) {
   submitting = true;
   try {
     const base = import.meta.env.PUBLIC_CMS_URL || '';
-    const interestKeys = Object.entries(selected)
-      .filter(([, v]) => v)
-      .map(([k]) => k);
+    const fields = waitlistFields(selected, interests);
     const res = await fetch(`${base}/api/waitlist-signups`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -97,10 +96,8 @@ async function submit(ev: SubmitEvent) {
         email,
         useCase: useCase || undefined,
         wantsCall,
-        interests: interestKeys.length ? interestKeys : undefined,
-        phases: interestKeys.filter((k) => PHASE_IDS.has(k)).length
-          ? interestKeys.filter((k) => PHASE_IDS.has(k))
-          : undefined,
+        interests: fields.interests,
+        phases: fields.phases,
         source: typeof document !== 'undefined' ? document.referrer || 'direct' : 'direct',
       }),
     });

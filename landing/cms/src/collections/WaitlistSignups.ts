@@ -4,6 +4,7 @@
 import type { CollectionConfig } from 'payload';
 
 import { sendDiscoveryEmail } from '../hooks/sendDiscoveryEmail';
+import { interestOptions } from './waitlistInterestOptions';
 import { phaseOptions } from './waitlistPhaseOptions';
 
 /**
@@ -47,13 +48,7 @@ export const WaitlistSignups: CollectionConfig = {
       name: 'interests',
       type: 'select',
       hasMany: true,
-      options: [
-        { label: 'Tier 2 — production multi-node (Phase 3)', value: 'tier2' },
-        { label: 'Observability (Phase 3)', value: 'observability' },
-        { label: 'Managed offering (Phase 4)', value: 'managed' },
-        { label: 'Tier 3 — bare metal (Phase 5+)', value: 'tier3' },
-        { label: 'Tier 4 — confidential (Phase 6+)', value: 'tier4' },
-      ],
+      options: interestOptions,
       admin: { description: 'Which upcoming releases this signup wants to hear about.' },
     },
     {

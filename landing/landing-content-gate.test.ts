@@ -10,6 +10,9 @@
 import { describe, expect, test } from 'bun:test';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { interestOptions } from './cms/src/collections/waitlistInterestOptions';
+import { phaseOptions } from './cms/src/collections/waitlistPhaseOptions';
+import { waitlistFields } from './web/src/lib/waitlist-payload';
 
 const ROOT = import.meta.dir;
 const FALLBACK = join(ROOT, 'web/src/data/fallback');
@@ -79,6 +82,52 @@ describe('SYS-3 (a) — fallback ⊆ registry', () => {
     expect(labels.length).toBeGreaterThan(0);
     for (const lbl of new Set(labels)) {
       expect(regLabels.has(lbl)).toBe(true);
+    }
+  });
+});
+
+// The form posts two independent fields and each has its own select
+// options in WaitlistSignups. A value the site can send that the
+// collection cannot accept is not a visible failure: Payload answers
+// 400 and WaitlistForm reports 400 as already-signed-up, so the
+// visitor sees success and no row is written. `federation` shipped in
+// the `phases` enum and the roadmap button while never being an
+// `interests` option, and lost every signup that clicked it.
+describe('SYS-3 (a) — WaitlistSignups accepts everything the site can send', () => {
+  test('every phase the roadmap offers a button for is a `phases` option', () => {
+    const reg = readJson(REGISTRY) as { phases: Array<{ id: string; status: string }> };
+    const accepted = new Set(phaseOptions().map((o) => o.value));
+    // Roadmap.astro renders the notify button for non-shipped phases only.
+    const offered = reg.phases.filter((p) => p.status !== 'shipped').map((p) => p.id);
+    expect(offered.length).toBeGreaterThan(0);
+    for (const id of offered) {
+      expect(accepted.has(id)).toBe(true);
+    }
+  });
+
+  test('every interest checkbox the fallback renders is an `interests` option', () => {
+    const accepted = new Set(interestOptions.map((o) => o.value));
+    const copy = readJson(join(FALLBACK, 'waitlistCopy.json')) as {
+      interests: Array<{ key: string }>;
+    };
+    expect(copy.interests.length).toBeGreaterThan(0);
+    for (const it of copy.interests) {
+      expect(accepted.has(it.key)).toBe(true);
+    }
+  });
+
+  test('a phase id is never silently routed into `interests`', () => {
+    const reg = readJson(REGISTRY) as { phases: Array<{ id: string }> };
+    const offeredKeys = (
+      readJson(join(FALLBACK, 'waitlistCopy.json')) as { interests: Array<{ key: string }> }
+    ).interests;
+    const accepted = new Set(interestOptions.map((o) => o.value));
+    for (const p of reg.phases) {
+      const fields = waitlistFields({ [p.id]: true }, offeredKeys);
+      for (const key of fields.interests ?? []) {
+        expect(accepted.has(key)).toBe(true);
+      }
+      expect(fields.phases).toEqual([p.id]);
     }
   });
 });

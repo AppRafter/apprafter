@@ -66,8 +66,12 @@ describe('landing/cms scaffold', () => {
     // honesty pass: signups carry which upcoming things they want notified about
     expect(wl).toContain("name: 'interests'");
     expect(wl).toContain('hasMany: true');
+    // The option values moved into waitlistInterestOptions so the landing
+    // content gate can assert against the declared list rather than a copy.
+    const opts = readFileSync(join(ROOT, 'src/collections/waitlistInterestOptions.ts'), 'utf8');
+    expect(wl).toContain('options: interestOptions');
     for (const k of ['tier2', 'observability', 'managed', 'tier3', 'tier4']) {
-      expect(wl).toContain(`value: '${k}'`);
+      expect(opts).toContain(`value: '${k}'`);
     }
   });
 
