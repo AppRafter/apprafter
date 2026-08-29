@@ -22,7 +22,17 @@ pub fn run(force: bool, dry_run: bool, target_override: Option<&str>) -> Result<
     let resolved = resolve_state_paths(target_override)?;
     let paths = resolved.paths;
     let target_store = resolved.store;
-    let mut state = State::load_or_default(&paths)?;
+    // `--force` is the rebuild-from-live flag, so it must also reach
+    // the case where the file itself is unreadable. Without it the
+    // behaviour is unchanged: an unparseable state.json is an error.
+    let (mut state, quarantined) = State::load_or_recover(&paths, force)?;
+    if let Some(backup) = &quarantined {
+        eprintln!(
+            "warning: state.json was unreadable and has been moved to {}. \
+             Rebuilding from the live provider objects.",
+            backup.display()
+        );
+    }
 
     let target_config = load_active_target_config(&target_store, target_override);
 
