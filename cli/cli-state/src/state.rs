@@ -456,7 +456,10 @@ mod tests {
 
         let (loaded, quarantined) = State::load_or_recover(&paths, false).unwrap();
         assert_eq!(loaded.provider.as_deref(), Some("hetzner-cloud"));
-        assert!(quarantined.is_none(), "a parseable file is never quarantined");
+        assert!(
+            quarantined.is_none(),
+            "a parseable file is never quarantined"
+        );
     }
 
     #[test]
@@ -485,10 +488,16 @@ mod tests {
         std::fs::write(paths.state_file(), b"{ this is not json").unwrap();
 
         let (loaded, quarantined) = State::load_or_recover(&paths, true).unwrap();
-        assert_eq!(loaded.provider, None, "recovery starts from a default state");
+        assert_eq!(
+            loaded.provider, None,
+            "recovery starts from a default state"
+        );
 
         let backup = quarantined.expect("force must report where the corrupt file went");
-        assert!(backup.exists(), "the corrupt file is renamed, never deleted");
+        assert!(
+            backup.exists(),
+            "the corrupt file is renamed, never deleted"
+        );
         assert_eq!(
             std::fs::read(&backup).unwrap(),
             b"{ this is not json",
