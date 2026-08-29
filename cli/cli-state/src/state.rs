@@ -396,6 +396,41 @@ impl State {
         })
     }
 
+    /// [`load_or_default`], plus a repair path for an unparseable file.
+    ///
+    /// `import --force` exists to rebuild state from the live provider
+    /// objects, which is exactly the situation a corrupt `state.json`
+    /// creates — but the load happened before the force check, so the
+    /// flag could never be reached and the documented remedy was an
+    /// `rm -rf` of the state directory.
+    ///
+    /// The corrupt file is RENAMED, never deleted: it may hold the only
+    /// record of a field the rebuild cannot recover. The returned path
+    /// is the caller's to report.
+    ///
+    /// [`load_or_default`]: Self::load_or_default
+    pub fn load_or_recover(paths: &StatePaths, force: bool) -> Result<(Self, Option<PathBuf>)> {
+        match Self::load_or_default(paths) {
+            Ok(state) => Ok((state, None)),
+            Err(err) => {
+                if !force {
+                    return Err(err);
+                }
+                let live = paths.state_file();
+                // This crate carries no date dependency (cli-core,
+                // serde, serde_json, thiserror), so the stamp is epoch
+                // seconds rather than RFC 3339.
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let backup = live.with_file_name(format!("{STATE_FILE}.corrupt-{stamp}"));
+                std::fs::rename(&live, &backup)?;
+                Ok((Self::default(), Some(backup)))
+            }
+        }
+    }
+
     pub fn save(&self, paths: &StatePaths) -> Result<()> {
         std::fs::create_dir_all(paths.state_dir())?;
         let bytes = serde_json::to_vec_pretty(self)?;
@@ -408,6 +443,80 @@ impl State {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn load_or_recover_returns_the_state_when_the_file_parses() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::for_root(dir.path());
+        let state = State {
+            provider: Some("hetzner-cloud".into()),
+            ..Default::default()
+        };
+        state.save(&paths).unwrap();
+
+        let (loaded, quarantined) = State::load_or_recover(&paths, false).unwrap();
+        assert_eq!(loaded.provider.as_deref(), Some("hetzner-cloud"));
+        assert!(quarantined.is_none(), "a parseable file is never quarantined");
+    }
+
+    #[test]
+    fn load_or_recover_without_force_still_reports_an_unparseable_file() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::for_root(dir.path());
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+        std::fs::write(paths.state_file(), b"{ this is not json").unwrap();
+
+        let err = State::load_or_recover(&paths, false).unwrap_err();
+        assert!(
+            matches!(err, CliError::InvalidState { .. }),
+            "without --force the corrupt file is still an error, got {err:?}"
+        );
+        assert!(
+            paths.state_file().exists(),
+            "the corrupt file must be left untouched when force is not passed"
+        );
+    }
+
+    #[test]
+    fn load_or_recover_with_force_quarantines_and_continues() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::for_root(dir.path());
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+        std::fs::write(paths.state_file(), b"{ this is not json").unwrap();
+
+        let (loaded, quarantined) = State::load_or_recover(&paths, true).unwrap();
+        assert_eq!(loaded.provider, None, "recovery starts from a default state");
+
+        let backup = quarantined.expect("force must report where the corrupt file went");
+        assert!(backup.exists(), "the corrupt file is renamed, never deleted");
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            b"{ this is not json",
+            "the quarantined bytes are preserved verbatim"
+        );
+        assert!(
+            !paths.state_file().exists(),
+            "the corrupt file no longer occupies the live path"
+        );
+        let name = backup.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("state.json.corrupt-"),
+            "backup name must be discoverable, got {name}"
+        );
+    }
+
+    #[test]
+    fn load_or_recover_with_force_on_a_missing_file_is_a_plain_default() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::for_root(dir.path());
+
+        let (loaded, quarantined) = State::load_or_recover(&paths, true).unwrap();
+        assert_eq!(loaded.provider, None);
+        assert!(
+            quarantined.is_none(),
+            "nothing to quarantine when nothing exists"
+        );
+    }
 
     fn make_store() -> (tempfile::TempDir, TargetStorePaths) {
         let dir = tempdir().unwrap();
