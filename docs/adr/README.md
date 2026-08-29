@@ -89,6 +89,7 @@ ADRs are never deleted; supersession preserves the historical record.
 | 0055 | [node swap policy — provisioned host swap + pod NoSwap, Tier-1](./0055-node-swap-policy.md) | Accepted |
 | 0056 | [machine-picker — live (region × SKU) matrix and no implicit server-type default](./0056-machine-picker.md) | Accepted |
 | 0057 | [documentation system — MkDocs-Material retained, generated CLI reference, content-detected drift gate](./0057-documentation-system.md) | Accepted |
+| 0058 | [public surfaces are written for their reader, not derived from our artifacts](./0058-public-surfaces-are-written-for-their-reader.md) | Accepted |
 
 ## Writing a new record
 
