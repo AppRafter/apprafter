@@ -321,6 +321,79 @@ pub fn logical_lines(body: &str) -> Vec<(usize, String)> {
     out
 }
 
+/// The head token of every shell segment on one documentation line.
+///
+/// The same reading [`extract`] performs — comment stripped, one level
+/// of `$( … )` and backticks unwrapped, split on `;`, `&&`, `||` and a
+/// top-level `|`, an optional `$ ` prompt dropped — but keeping every
+/// head instead of only [`BINARY`].
+///
+/// It does not judge. Whether a head names a command at all, and
+/// whether that command belongs where it is written, is
+/// [`crate::recipe`]'s question; running this over prose returns the
+/// first word of the prose and that is expected.
+///
+/// Shared with [`extract`] rather than re-derived: two shell readings
+/// over one corpus disagree eventually, and the one nobody exercises is
+/// the one that drifts.
+pub fn segment_heads(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_heads(line, &mut out);
+    out
+}
+
+fn collect_heads(text: &str, out: &mut Vec<String>) {
+    let text = strip_comment(text);
+    let (masked, inner) = unwrap_substitutions(text);
+    for (_, segment) in segments(&masked) {
+        if let Some(head) = head_of(segment) {
+            out.push(head.to_string());
+        }
+    }
+    for (_, sub) in inner {
+        collect_heads(&sub, out);
+    }
+}
+
+/// The command word of one segment: its first token, with a `console`
+/// prompt and any leading `VAR=value` assignments skipped.
+///
+/// `env`-style prefixes matter here in a way they do not for
+/// [`invocation_of`]: `RESTIC_PASSWORD=… apprafter backup list` opens
+/// four fenced recipes in the backup guide, and reading its head as the
+/// assignment would charge those lines to a command nobody runs.
+fn head_of(segment: &str) -> Option<&str> {
+    let mut tokens = segment.trim().split_whitespace();
+    let mut first = tokens.next()?;
+    if first == "$" {
+        first = tokens.next()?;
+    }
+    // An `env`-style prefix is not the command: the head of
+    // `RESTIC_PASSWORD=… apprafter backup list` is `apprafter`, and
+    // reading the assignment's VALUE as the head would invent a command
+    // named `hunter2`. Skip assignments until a real token appears.
+    //
+    // `POD=$(kubectl …)` needs nothing here: `unwrap_substitutions`
+    // lifts the inner command out and `collect_heads` recurses into it,
+    // so the outer segment is an assignment alone and yields no head.
+    while is_assignment(first) {
+        first = tokens.next()?;
+    }
+    Some(first)
+}
+
+/// Whether a token is a shell variable assignment — `NAME=` anything.
+/// `NAME` is the conservative shell shape: ASCII alphanumeric and
+/// underscore, not opening with a digit.
+fn is_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Extract from `text`, reporting positions relative to `base`.
 fn collect(text: &str, base: usize, out: &mut Vec<(usize, Invocation)>) {
     let text = strip_comment(text);
@@ -689,6 +762,62 @@ fn unresolved(tree: &Tree, at: &[usize], token: &str) -> Step {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn segment_heads_names_every_command_on_the_line() {
+        assert_eq!(
+            segment_heads("kubectl get pods && apprafter app list"),
+            vec!["kubectl".to_string(), "apprafter".to_string()]
+        );
+    }
+
+    #[test]
+    fn segment_heads_drops_a_console_prompt() {
+        assert_eq!(
+            segment_heads("$ kubectl get pods"),
+            vec!["kubectl".to_string()]
+        );
+    }
+
+    #[test]
+    fn segment_heads_reads_a_pipeline_as_its_stages() {
+        assert_eq!(
+            segment_heads("kubectl get pods -o json | jq '.items[0]'"),
+            vec!["kubectl".to_string(), "jq".to_string()]
+        );
+    }
+
+    #[test]
+    fn segment_heads_ignores_a_comment() {
+        assert_eq!(
+            segment_heads("apprafter app list  # then kubectl get pods"),
+            vec!["apprafter".to_string()]
+        );
+    }
+
+    #[test]
+    fn segment_heads_sees_into_a_substitution() {
+        // `POD=$(kubectl get pod …)` documents a kubectl call, and the
+        // assignment must not hide it.
+        let heads = segment_heads("POD=$(kubectl -n demo get pod -o name)");
+        assert!(heads.contains(&"kubectl".to_string()), "got {heads:?}");
+    }
+
+    #[test]
+    fn segment_heads_skips_an_env_prefix() {
+        // Four fenced recipes in the backup guide open this way.
+        assert_eq!(
+            segment_heads("RESTIC_PASSWORD=hunter2 apprafter backup list"),
+            vec!["apprafter".to_string()]
+        );
+    }
+
+    #[test]
+    fn segment_heads_is_empty_when_there_is_no_token() {
+        assert!(segment_heads("").is_empty());
+        assert!(segment_heads("   ").is_empty());
+    }
+
     use super::*;
 
     #[test]
