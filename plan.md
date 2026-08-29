@@ -4009,9 +4009,16 @@ Decision 0 (ADR 0056 §d): provisioning — это spending decision, implicit `
 
 ---
 
-### 2.18 Known Limitations docs sync
+### 2.18 Known Limitations docs sync — ЗАКРЫТА в 2.20c (2026-08-29, `57dfd96`)
 
 **Source:** tracker §1.1.
+
+> Закрыта внутри долга протухания 2.20c: `spec.md § Known limitations` переписан. Три пункта
+> описывали `confidential`, `connects.egress.external` и `network.egressIP` как «declared in the
+> manifest schema and accepted by the operator» — ни одного из трёх нет в `schemas/v1alpha1`,
+> то есть читатель по ним писал манифест, который отвергает webhook. Плюс HTTPRoute и
+> MigrationPlan-реконсайлер числились отложенными, хотя отгружены (последний ещё и утверждал,
+> что изменения применяются «without approval gating»).
 
 **Цель:** перед `v0.2.0-services` tag убедиться, что `spec.md` § Known limitations of v0.1.x отражает реальное состояние закрытого Phase 2.
 
@@ -4193,9 +4200,18 @@ Decision 0 (ADR 0056 §d): provisioning — это spending decision, implicit `
   исключение не декоративное. Два решения с замером: inline-спаны вне области (проза даёт первое
   слово предложения), теги ИСКЛЮЧАЮТ но не выбирают (без этого CUE/mermaid/YAML дают ~30
   выдуманных команд). Аллоулист пополнен `vault` и `loginctl` по осмотру.
-- [ ] **2.20c — перестройка 27 страниц** + слой механики + долг протухания
-  (два дефекта backup-restore, reaper в redis/postgres, Cilium в troubleshooting,
-  redis в export/`--help`, `spec.md § Known limitations`). **Закрывает 2.18.** Гейт зеленеет.
+- [~] **2.20c — перестройка 27 страниц** + слой механики + долг протухания. Гейт зеленеет.
+  - [x] **часть 1 — долг протухания** (2026-08-29, `57dfd96`): два дефекта backup-restore
+    (раздел + обходные шаги в обеих последовательностях + пункт верификации),
+    `choosing-the-machine` в трёх местах, Cilium в troubleshooting, redis в `export`/`restore`
+    `--help` + регенерация референса, `spec.md § Known limitations` → **закрывает 2.18**.
+    Перепись перезаписана в том же коммите (652 → 646): ратчет считает только вверх, поэтому
+    удаление ложного раздела — единственная операция, против которой он возражает.
+  - [ ] **часть 2 — перестройка страниц.** 174 находки на 14 страницах; рабочий список —
+    `docsgen recipe-report`. Reaper-шаги в `redis.md`/`postgres.md` намеренно НЕ чинились
+    отдельно: они внутри секций «Confirm the X is physically gone», которые перестройка
+    удаляет целиком.
+  - [ ] **часть 3** — подключить `recipe-purity` в `Gate::page()` последним коммитом.
 - [ ] **2.20d — гейт `behaviour-claim`** — обобщение `shipped.rs`; засев предикатами, на
   которых обожглись (`backup_verb_needs_cluster`, `rollOutCiliumPods`, adoption на
   create-пути, redis-capture в export).
