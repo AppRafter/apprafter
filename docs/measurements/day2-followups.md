@@ -13,13 +13,24 @@ Internal working data — this tree is excluded from the site
 
 **Opened:** 2026-08-20 (2.19j, correcting
 `docs/dev-guide/resources-and-autoscaling.md`).
-**Status:** RESOLVED in platform-stack `0.2.56` — option 1 below is what
-was taken. The gate rename itself shipped in `0.2.55`, which is
-**yanked**: starting the controllers exposed a second unpinned upstream
-default underneath this one — the recommender's own 250Mi minimum
+**Status:** RESOLVED in platform-stack `0.2.56`, and **live-re-validated
+on real Hetzner against `0.2.57` on 2026-08-28** — the gate the chart
+ships is `InPlace`, matching the `updateMode` the operator renders
+(`platform-stack/cue/component_vpa.cue`). Option 1 below is what was
+taken. The gate rename itself shipped in `0.2.55`, which is **yanked**:
+starting the controllers exposed a second unpinned upstream default
+underneath this one — the recommender's own 250Mi minimum
 recommendation — which made every application recommend an identical
 250Mi and could not be clamped by `minAllowed: 32Mi`. `0.2.56` pins that
 floor to the 32Mi seed. See ADR 0054's two amendments.
+
+The re-validation is part of the resolution rather than a formality: for
+a week this was *fixed in code and unverified live*, which is the state
+the entry itself was written in. `e2e/vpa-walk.sh` on real Hetzner
+confirmed all three controllers Available, the recommendation landing on
+the pinned 32Mi floor, the mirror into `Application.status`, and — the
+observation the walk had never made — the managed pod's
+`requests.memory` **resized in place**, uid stable, no recreation.
 **Severity (while open):** the whole applying half of ADR 0054 was
 inert, silently.
 
@@ -119,19 +130,38 @@ the name changed upstream and nothing here noticed, because a
 crash-looping controller in a namespace nobody watches produces no
 signal that reaches an operator.
 
-### Guard worth adding
+### The guard, and why the walk had been passing
 
-Nothing in `just lint`, `just crd-validate` or the e2e asserts that the
-VPA controllers reach `Running`. A component whose pods never start is
-invisible to every gate we have. The cheapest guard is an e2e assertion
-that every Deployment in the `vpa` namespace reports
-`availableReplicas >= 1` after the platform converges.
+**Added 2026-08-28** — `e2e/vpa-walk.sh` now asserts all three VPA
+controllers are Available and none is in `CrashLoopBackOff`, plus a soft
+observation that an apply actually lands. This section previously asked
+for that guard; it exists.
+
+What is worth carrying is the reason it was missing. The walk was green
+throughout the crash-loop — on platform-stack `0.2.49`, with the
+updater and admission controller down — because it asserted only the
+**recommender** path, which the bad gate never touched, and because a
+dead updater passes a no-thrash check trivially. The tell was
+`kubectl -n vpa get pods`, which the walk never read.
+
+So the component was invisible to every gate we had *and* to the walk
+written to exercise it. A walk that observes only the half of a
+mechanism that still works is not a weaker check than none; it is worse,
+because it reports green. That is the shape to look for elsewhere, not
+the specific assertion.
 
 ## `apprafter backup enable --cron` / `--check-cron` accept a value the apiserver rejects
 
 **Opened:** 2026-08-20 (2.19j, correcting
 `docs/operator-guide/backup-restore.md`).
-**Status:** open — small, self-contained CLI fix.
+**Status:** open. **The documentation half landed and the CLI half did
+not**, which is worth stating because that split is how an entry gets
+forgotten: `backup-restore.md` no longer offers `--check-cron off`, says
+plainly that there is no off switch today, and uses a never-firing
+schedule instead — so the symptom stopped being visible while the defect
+stayed. Re-verified 2026-08-30: both flags are still
+`#[arg(long, value_name = "cron")]` with no `value_parser`
+(`cli/platform-cli/src/cli.rs:1560`, `:1588`).
 
 ### What is wrong
 
