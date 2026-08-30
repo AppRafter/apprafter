@@ -1,137 +1,43 @@
 ---
-description: "Watching a declared Redis dependency all the way through, including the per-claim logical-database isolation on a shared Dragonfly pool."
+description: "Give an application a Redis-compatible cache or store by declaring it in the manifest: how to declare it, bind it, use it correctly, and remove it safely."
 ---
 
 # Redis from a declared dependency
 
-This guide walks a Tier-1 operator through the full `needs.redis` chain:
-an Application that declares `spec.base.needs.redis` gets an isolated,
-Redis-compatible connection provisioned on demand, its connection
-details published in a `Secret` the app binds to env-vars of its
-choosing, and — when the dependency is removed — the data retained for a
-7-day grace period and then physically flushed.
+An application declares that it needs Redis, and the platform provisions an
+isolated, Redis-compatible connection for it, publishes the connection details,
+and binds them to the env-vars you name. Removing the dependency retains the
+data for seven days before flushing it.
 
-The backend is [Dragonfly](https://www.dragonflydb.io/), a single-process
-Redis-compatible server. Each claim gets its **own numbered logical DB**
-on a shared pool instance, pinned by a per-claim `$N` ACL user, so apps
-use ordinary key names with complete keyspace separation. The full design
-and the measured per-DB overhead are in
-[ADR 0042](../adr/0042-needs-redis-dragonfly.md).
+Each application gets its own logical database on a shared pool, walled off
+from every other by the credential it is given. You do not create an instance,
+a user, or a password.
 
-## The chain in one paragraph
-
-You declare `needs: { redis: {} }` on an Application. The operator
-generates a `ResourceClaim` and **pauses** the Application
-(`status.phase=AwaitingResourceClaim`). The scheduler matches the claim
-to a `ServiceProvider` (the seeded `redis-integrated`) and marks it
-`Scheduled=True`. The provisioner lazily creates a shared Dragonfly
-instance (first claim only), allocates the claim a numbered logical DB
-(`status.dbnum`), creates a `$N`-pinned ACL user over the Redis protocol,
-and writes a connection `Secret` carrying the decomposed fields `url`,
-`user`, `pass`, `host`, `port`, `db`, `channelPrefix`; it marks the claim
-`ready=true`. The Application then **resumes** to `Ready`, and the
-rendered Deployment carries a `secretKeyRef` for every claim field the
-manifest referenced. When you delete the claim (or remove the
-dependency), a finalizer snapshots an immutable `RetainedClaim`
-(deletion + 7 days, `backend: dragonfly`) and the connection Secret
-cascades away — but the ACL user and the DB's data survive the grace
-window. Once `retainUntil` passes, the GC controller runs `FLUSHDB`
-(empties the DB) + `ACL DELUSER` (drops the user), deletes the connection
-Secret (belt-and-suspenders, it usually cascaded already), and removes
-the snapshot.
-
-## How an app uses the connection
-
-- **Keys:** use the DSN (`claim.redis.url`) with **ordinary key names** — no
-  prefix. The `$N` ACL pins the user to one logical DB, so `SET foo`,
-  `GET foo`, `SCAN` etc. are naturally confined to that DB and cannot
-  see, enumerate, or collide with any other tenant's keys.
-- **Pub/sub channels:** channels are **server-wide** (not DB-scoped), so
-  the app **must** prefix every channel name with the claim's
-  `channelPrefix` field (`claim.redis.channelPrefix`, whose value is
-  `<aclUser>:`). The ACL enforces it — `PUBLISH`/`SUBSCRIBE` to an
-  unprefixed channel returns `NOPERM`.
-- **Persistence:** add `persistent: true` to the need to route the claim
-  onto a *persistent* pool instance (whole-instance snapshot → PVC)
-  instead of the default ephemeral one. Persistence is an instance-level
-  property in Redis, so persistent claims land on a separate instance.
-
-## Prerequisites
-
-- A real Tier-1 cluster provisioned with `apprafter bootstrap-all` (see
-  [`quickstart.md`](quickstart.md)), operator **≥ v0.2.18** (the release
-  that ships the always-on dragonfly-operator, the `redis-integrated`
-  ServiceProvider, and the Dragonfly backend in the ResourceClaim
-  provisioner / GC controllers).
-- `kubectl` bound to the cluster:
-
-  ```sh
-  apprafter kubeconfig --refresh > /tmp/kc && export KUBECONFIG=/tmp/kc
-  ```
-
-- Pre-flight: the seeded provider, the dragonfly-operator, and the
-  admission webhook are all Ready:
-
-  ```sh
-  kubectl get serviceprovider redis-integrated -n apprafter-system \
-    -o jsonpath='{.metadata.labels.tier} {.spec.backend}{"\n"}'  # -> integrated dragonfly
-  kubectl -n dragonfly-system rollout status \
-    deploy -l app.kubernetes.io/name=dragonfly-operator           # -> available
-  kubectl -n apprafter-system rollout status \
-    deploy admission-webhook                                      # -> available
-  ```
-
-## Commands used on this page
-
-Every step below runs through the `apprafter` CLI. The `kubectl` and
-`redis-cli` reads are there to show you the machine state behind each
-one; you never need them to drive the chain.
-
-| Stage | Command |
-| ----- | ------- |
-| Identity + target | `apprafter target list`, `apprafter target add …`, `apprafter whoami` |
-| Self-diagnostic | `apprafter doctor` |
-| Provision | `apprafter bootstrap-all` (then re-run `apprafter cluster-bootstrap` once to prove idempotency) |
-| Cluster access | `apprafter kubeconfig --refresh`, `apprafter argocd-password` |
-| Cluster + platform health | `apprafter status`, `apprafter platform status` |
-| Author the manifest | `apprafter app scaffold --needs redis` |
-| Register the app | `apprafter app add` (public repo); `apprafter repo creds add/list/show` for the private-repo variant |
-| Inspect the app | `apprafter app status`, `apprafter app logs` |
-| Portal | `apprafter open argocd` |
-| Cleanup | `apprafter app remove --keep-data`, `apprafter destroy --yes` |
-
-### Author the manifest with `apprafter app scaffold`
+## Declare the dependency
 
 ```sh
 apprafter app scaffold --name web --namespace demo --needs redis
 ```
 
-> The repeatable `--needs redis` flag emits the `spec.base.needs` block
-> for you; an unknown type is a clear error. The generated
-> `apprafter/Application.cue` carries:
->
-> ```cue
-> spec: base: {
->     // ... image / replicas / expose ...
->     needs: {
->         redis: { selector: { tier: "integrated" } }
->     }
-> }
-> ```
->
-> `apprafter app validate` checks it locally before you push. Use that
-> and not a bare `cue vet ./apprafter/...`: the scaffold no longer
-> vendors the schema next to your manifest (ADR 0046), so `apprafter/`
-> has no `cue.mod/` and `cue` refuses the import outright —
-> `imports are unavailable because there is no cue.mod/module.cue file`.
-> `app validate` lays the bundled schema and the generated `claim`
-> binding into a temp workspace first, which is also what makes the
-> `claim.redis.*` references below resolve the same way they will at
-> sync time.
+That writes a `needs` block into `apprafter/Application.cue`:
 
-`needs.redis` provisions the logical DB and publishes its connection
-`Secret`, but injects nothing into your container (ADR 0046). Bind the
-env-vars you want to the claim fields yourself:
+```cue
+spec: base: {
+    // ... image / replicas / expose ...
+    needs: {
+        redis: { selector: { tier: "integrated" } }
+    }
+}
+```
+
+Add `persistent: true` if the data must survive a restart. Persistence in Redis
+is a property of the whole server rather than of one database, so a persistent
+claim is placed on a separate persistent instance — a difference in where the
+claim lands, not in how you use it. Without it you get a cache: fast, shared,
+and empty after a restart.
+
+**Declaring the dependency does not inject anything into your container.** Bind
+the env-vars you want:
 
 ```cue
 spec: base: {
@@ -143,381 +49,159 @@ spec: base: {
 }
 ```
 
-The env-var names are yours to pick; `claim.redis.<field>` names a field
-in the connection `Secret`. The rest of this guide assumes both bindings
-are in place.
+The env-var names are yours. `claim.redis.<field>` names a field of the
+connection Secret the platform will publish — `url`, `user`, `pass`, `host`,
+`port`, `db` and `channelPrefix` are all available.
 
-### Register the app with `apprafter app add`
+Check it before you push:
 
-Public repo:
+```sh
+apprafter app validate
+```
+
+Use that rather than a bare `cue vet ./apprafter/...`: the scaffold does not
+vendor the schema next to your manifest, so `cue` refuses the import outright.
+`app validate` lays the bundled schema and the generated `claim` binding into a
+temporary workspace first, which is what makes `claim.redis.*` resolve the same
+way it will at sync time.
+
+## Two rules for using the connection
+
+This is the whole of what an application author needs to know, and the second
+one is the one that bites.
+
+**Keys: use ordinary names.** No prefix, no namespacing of your own. Your
+credential is pinned to your own logical database, so `SET foo` cannot see or
+collide with another application's `foo`. Isolation is enforced by the server,
+not by a convention you have to remember.
+
+**Channels: you must prefix them.** Redis pub/sub is server-wide rather than
+per-database, so there is no equivalent pin for channels. Prefix every channel
+name with `claim.redis.channelPrefix` — that is what the second env-var above
+is for. This is enforced, not advisory: publishing or subscribing to an
+unprefixed channel returns `NOPERM`.
+
+## Register the application
 
 ```sh
 apprafter app add https://github.com/your-org/web.git \
   --name web --namespace demo --project apps
 ```
 
-Private repo — register the git credential first:
+If the repository is private, register the credential first:
 
 ```sh
 apprafter repo creds add web-creds \
   --url-prefix https://github.com/your-org \
   --type pat --token "$YOUR_PAT"
-apprafter repo creds list           # confirm it is registered
-apprafter repo creds show web-creds
+apprafter repo creds list
 ```
 
-## Happy chain — steps 1 to 12
-
-The numbered steps below assume the Application CR is in the cluster (via
-Argo CD sync after `app add`, or applied directly for a quick check). The
-`kubectl` lines are the machine-readable proof behind each CLI surface;
-the constants (`demo` namespace, `web` app, `web-redis` claim, ACL user
-`claim_demo_web-redis_redis`, connection Secret `web-redis-conn`) are
-derived deterministically from the claim's `(namespace, name)`.
-
-> **Naming — the `web` you query is the apprafter.io `metadata.name`, not
-> the `apprafter app add` name.** The steps address
-> `application.apprafter.io web` and `resourceclaim.apprafter.io
-> web-redis`: the kinds are group-qualified on purpose, because bare
-> `application` also matches Argo CD's `argoproj.io` Application and bare
-> `resourceclaim` matches the k8s 1.32+ DRA `resource.k8s.io`
-> ResourceClaim. If `kubectl get application.apprafter.io <name>` returns
-> "not found", you likely used the `app add` name; use the
-> `Application.cue` `metadata.name` instead.
-
-**1. The Application carries the dependency.**
-
-```sh
-kubectl -n demo get application.apprafter.io web \
-  -o jsonpath='{.spec.base.needs.redis.selector.tier}{"\n"}'   # -> integrated
-```
-
-**2. The operator generated a ResourceClaim.**
-
-```sh
-kubectl -n demo get resourceclaim.apprafter.io web-redis \
-  -o jsonpath='type={.spec.type} tier={.spec.selector.tier}{"\n"}'
-# -> type=redis tier=integrated
-```
-
-**3. The Application is gated.**
-
-```sh
-kubectl -n demo get application.apprafter.io web -o jsonpath='{.status.phase}{"\n"}'
-# -> AwaitingResourceClaim
-kubectl -n demo get application.apprafter.io web -o \
-  jsonpath='{.status.conditions[?(@.type=="ResourceClaimPending")].status}{"\n"}'
-# -> True
-```
-
-**4. The scheduler matched a provider.**
-
-```sh
-kubectl -n demo get resourceclaim.apprafter.io web-redis \
-  -o jsonpath='{.status.provider}{"\n"}'                    # -> redis-integrated
-kubectl -n demo get resourceclaim.apprafter.io web-redis -o \
-  jsonpath='{.status.conditions[?(@.type=="Scheduled")].status}{"\n"}'   # -> True
-```
-
-**5. The shared Dragonfly instance was lazily created.** The first
-ephemeral claim creates `platform-redis-ephemeral-000`; later ephemeral
-claims reuse it (each on its own numbered DB). A `persistent: true` claim
-lands on `platform-redis-persistent-000` instead.
-
-```sh
-kubectl -n dragonfly-system get dragonfly.dragonflydb.io
-# exactly one instance for the ephemeral class: platform-redis-ephemeral-000
-```
-
-**6. The claim is provisioned.** (The lazy instance boot makes this the
-slow step.)
-
-```sh
-kubectl -n demo get resourceclaim.apprafter.io web-redis -o \
-  jsonpath='ready={.status.ready} instance={.status.instance} db={.status.dbnum}{"\n"}'
-# -> ready=true instance=platform-redis-ephemeral-000 db=<0..1023>
-```
-
-The `$N` ACL user exists on the instance (exec the Dragonfly pod as the
-admin user — the admin password is in the per-instance admin Secret):
-
-```sh
-ADMIN_PW=$(kubectl -n dragonfly-system get secret \
-  platform-redis-ephemeral-000-admin -o jsonpath='{.data.password}' | base64 -d)
-kubectl -n dragonfly-system exec platform-redis-ephemeral-000-0 -- \
-  redis-cli -a "$ADMIN_PW" --no-auth-warning \
-  ACL GETUSER claim_demo_web-redis_redis
-# -> the user's rules, including the `$<dbnum>` selector and `&claim_demo_web-redis_redis:*` channel pattern
-```
-
-> **The exec target is a pod, not a Deployment.** The dragonfly-operator
-> backs each instance with a **StatefulSet**, so the pod is the CR name
-> plus the ordinal — `platform-redis-ephemeral-000-0` — and
-> `kubectl exec deploy/platform-redis-ephemeral-000` gets you
-> `deployments.apps "platform-redis-ephemeral-000" not found`. The same
-> StatefulSet uses the `OnDelete` update strategy, which is also why
-> `kubectl rollout status` is unavailable for it; wait on the pod
-> instead (`kubectl -n dragonfly-system wait --for=condition=Ready
-> pod/platform-redis-ephemeral-000-0`).
-
-**7. The connection Secret carries the decomposed fields.**
-
-```sh
-kubectl -n demo get resourceclaim.apprafter.io web-redis \
-  -o jsonpath='{.status.connectionSecretRef}{"\n"}'         # -> web-redis-conn
-kubectl -n demo get secret web-redis-conn \
-  -o jsonpath='{.data.url}' | base64 -d; echo
-# -> redis://claim_demo_web-redis_redis:…@platform-redis-ephemeral-000.dragonfly-system.svc:6379/<dbnum>
-kubectl -n demo get secret web-redis-conn \
-  -o jsonpath='{.data.channelPrefix}' | base64 -d; echo
-# -> claim_demo_web-redis_redis:
-kubectl -n demo get secret web-redis-conn \
-  -o jsonpath='{.metadata.ownerReferences[0].kind}{"\n"}'   # -> ResourceClaim
-```
-
-**8. The Application resumed.**
-
-```sh
-kubectl -n demo get application.apprafter.io web -o jsonpath='{.status.phase}{"\n"}'
-# -> Ready
-```
-
-**9. Both declared claim references resolved in the Deployment.**
-
-```sh
-kubectl -n demo get deployment web -o \
-  jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REDIS_URL")].valueFrom.secretKeyRef.name}{"\n"}'
-# -> web-redis-conn
-kubectl -n demo get deployment web -o \
-  jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="REDIS_CHANNEL_PREFIX")].valueFrom.secretKeyRef.name}{"\n"}'
-# -> web-redis-conn
-```
-
-**10. (Optional) prove the connection works and is DB-isolated.** With
-the `redis-cli` baked into the Dragonfly image you can run as the
-claim's own user from inside the cluster. Take the credential from the
-Secret's decomposed `pass` key and pass it with `--user` / `--pass`:
-
-```sh
-WEB_PW=$(kubectl -n demo get secret web-redis-conn \
-  -o jsonpath='{.data.pass}' | base64 -d)
-WEB_DB=$(kubectl -n demo get resourceclaim.apprafter.io web-redis \
-  -o jsonpath='{.status.dbnum}')
-
-kubectl -n dragonfly-system exec platform-redis-ephemeral-000-0 -- \
-  redis-cli --user claim_demo_web-redis_redis --pass "$WEB_PW" \
-  --no-auth-warning -n "$WEB_DB" SET hello world      # -> OK
-kubectl -n dragonfly-system exec platform-redis-ephemeral-000-0 -- \
-  redis-cli --user claim_demo_web-redis_redis --pass "$WEB_PW" \
-  --no-auth-warning -n "$WEB_DB" GET hello            # -> world
-```
-
-> **Do not hand this `redis-cli` the DSN with `-u`.** The DSN in
-> `claim.redis.url` is correct and your application's client library
-> will use it — but the Dragonfly image bundles redis-cli **6.0.16**,
-> whose URL parser drops the userinfo *username* and authenticates as
-> `default`. `redis-cli -u "$DSN"` therefore fails with `NOAUTH` rather
-> than logging in as the claim's user, which would make the isolation
-> check below "pass" for the wrong reason. The explicit
-> `--user` / `--pass` flags work on 6.0.x. `-n <dbnum>` matters for the
-> same reason: without it redis-cli operates on DB 0, where a
-> `$N`-pinned user has no rights, so a plain `SET` comes back `NOPERM`
-> even though the credential is correct. The cross-DB check below
-> deliberately omits `-n` — there, `NOPERM` is the point.
-
-A *second* claim's user is denied this claim's DB (the `$N` pin is a hard
-wall — the isolation proof). Provision a second app (`api`) the same way,
-then:
-
-```sh
-# As the api user, SELECT of web's DB number returns NOPERM:
-API_PW=$(kubectl -n demo get secret api-redis-conn \
-  -o jsonpath='{.data.pass}' | base64 -d)
-kubectl -n dragonfly-system exec platform-redis-ephemeral-000-0 -- \
-  redis-cli --user claim_demo_api-redis_redis --pass "$API_PW" \
-  --no-auth-warning SELECT "$WEB_DB"
-# -> NOPERM ... (api cannot reach web's DB)
-```
-
-> Judge this by the reply text, not by the exit status — fold stderr in
-> (`2>&1`) so the reply is visible either way. `NOPERM` is the pass; a
-> `NOAUTH` or `WRONGPASS` means the login itself failed, so the DB pin
-> was never exercised and the check proved nothing.
-
-**11. Inspect the app via the CLI.**
+## Watch it come up
 
 ```sh
 apprafter app status web
-apprafter app logs web --tail 50
 ```
 
-> `apprafter app status web` surfaces, by default, the AppRafter phase,
-> the workload Pods and Services with live status, and the ResourceClaim
-> provisioning state (provider / ready / Scheduled / connection Secret);
-> add `--resources` for the full Argo CD resource tree. While the chain
-> is in flight the claim shows `ready=false` until the provisioner
-> finishes.
+The first `needs.redis` in a fresh cluster is the slow one: the platform
+creates the shared instance on first use, and later claims reuse it. While that
+runs, `app status` reports the claim as not ready and the application as
+`AwaitingResourceClaim` — the workload is held back rather than started against
+a connection that does not exist yet.
 
-**12. Delete the dependency — the data is retained.** Removing the
-`needs.redis` block (and re-syncing) deletes the claim; for a direct
-check:
+When it finishes you should see the application `Ready`, and the claim with a
+provider, `ready`, and a connection Secret. `apprafter app logs web` shows
+whether your application picked the connection up.
+
+??? note "Verify independently with kubectl"
+
+    ```sh
+    kubectl -n demo get resourceclaim.apprafter.io web-redis -o \
+      jsonpath='ready={.status.ready} instance={.status.instance} db={.status.dbnum}{"\n"}'
+    # -> ready=true instance=platform-redis-ephemeral-000 db=<0..1023>
+
+    kubectl -n demo get application.apprafter.io web -o jsonpath='{.status.phase}{"\n"}'
+    # -> Ready
+
+    kubectl -n demo get secret web-redis-conn -o jsonpath='{.data.url}' | base64 -d; echo
+    kubectl -n demo get secret web-redis-conn -o jsonpath='{.data.channelPrefix}' | base64 -d; echo
+    ```
+
+    Reaching for the instance itself has two sharp edges — the exec target is a
+    StatefulSet pod rather than a Deployment, and `redis-cli -u` silently
+    authenticates as the wrong user on the bundled client version. Both are in
+    [How it works](../how-it-works/needs-redis.md#watching-it-happen).
+
+## Remove the dependency
+
+Drop the `needs.redis` block from the manifest and push. The claim goes with
+it, and so does the connection Secret — but **the data and the credential are
+kept for seven days**, then flushed automatically.
+
+That grace window is the point: removing a dependency by accident, or on a
+branch, does not destroy data. There is no supported way to shorten it, and the
+retention record is deliberately not hand-editable — here it is also what
+reserves the database number, so removing it by hand can hand another
+application a database that still holds retained data.
+
+To remove the whole application instead:
 
 ```sh
-kubectl -n demo delete resourceclaim.apprafter.io web-redis
-kubectl -n apprafter-system get retainedclaim claim-demo-web-redis -o \
-  jsonpath='claim={.spec.claimRef.name} backend={.spec.backend} user={.spec.aclUser} until={.spec.retainUntil}{"\n"}'
-# -> claim=web-redis backend=dragonfly user=claim_demo_web-redis_redis until=<RFC3339, ~7 days out>
-kubectl -n demo get secret web-redis-conn          # -> NotFound (cascaded)
+apprafter app remove web --keep-data
 ```
 
-The ACL user (and the DB's data) survive the grace floor — GC has not
-fired:
+??? note "Verify independently with kubectl"
 
-```sh
-ADMIN_PW=$(kubectl -n dragonfly-system get secret \
-  platform-redis-ephemeral-000-admin -o jsonpath='{.data.password}' | base64 -d)
-kubectl -n dragonfly-system exec platform-redis-ephemeral-000-0 -- \
-  redis-cli -a "$ADMIN_PW" --no-auth-warning ACL GETUSER claim_demo_web-redis_redis
-# -> still present
-```
+    Right after removal — the snapshot exists and the connection Secret is
+    gone, while the data and the credential are kept:
 
-## Confirm the data and the ACL user are physically gone
+    ```sh
+    kubectl -n apprafter-system get retainedclaim claim-demo-web-redis -o \
+      jsonpath='backend={.spec.backend} user={.spec.aclUser} until={.spec.retainUntil}{"\n"}'
+    # -> backend=dragonfly user=claim_demo_web-redis_redis until=<RFC3339, ~7 days out>
 
-The `RetainedClaim` is immutable (a CEL `self == oldSelf` rule), so an
-in-place `kubectl patch` of `retainUntil` is **rejected**. Delete it and
-re-create it with a past `retainUntil` — the kubeconfig you are using is
-`system:masters`, which the operator-only webhook permits to CREATE:
+    kubectl -n demo get secret web-redis-conn        # -> NotFound (cascaded)
+    ```
 
-```sh
-WEB_DB=$(kubectl -n apprafter-system get retainedclaim claim-demo-web-redis \
-  -o jsonpath='{.spec.dbnum}')   # capture before deleting the snapshot
-kubectl -n apprafter-system delete retainedclaim claim-demo-web-redis
+    Confirming the flush itself needs the shared pool's admin credential and an
+    unrestricted client against an instance that hosts other applications'
+    databases, so the guide does not walk it — `e2e/needs-redis-walk.sh`
+    asserts it instead. The reasoning is in
+    [How it works](../how-it-works/needs-redis.md#the-grace-window-and-the-flush).
 
-kubectl apply -f - <<YAML
-apiVersion: apprafter.io/v1alpha1
-kind: RetainedClaim
-metadata:
-  name: claim-demo-web-redis
-  namespace: apprafter-system
-spec:
-  claimRef:
-    name: web-redis
-    namespace: demo
-  provider: redis-integrated
-  backend: dragonfly
-  instance: platform-redis-ephemeral-000
-  dbnum: ${WEB_DB}
-  aclUser: claim_demo_web-redis_redis
-  connectionSecretRef: web-redis-conn
-  connectionSecretNamespace: demo
-  retainUntil: "2000-01-01T00:00:00Z"
-YAML
-```
+## How it works
 
-The GC fires immediately. It runs `FLUSHDB` on the claim's DB and
-`ACL DELUSER` on the claim's user, then deletes the snapshot. Confirm the
-user is **physically gone from the instance** — not merely that the
-snapshot was removed:
-
-```sh
-ADMIN_PW=$(kubectl -n dragonfly-system get secret \
-  platform-redis-ephemeral-000-admin -o jsonpath='{.data.password}' | base64 -d)
-
-# The ACL user is dropped:
-kubectl -n dragonfly-system exec platform-redis-ephemeral-000-0 -- \
-  redis-cli -a "$ADMIN_PW" --no-auth-warning ACL GETUSER claim_demo_web-redis_redis
-# -> (empty / nil — the user no longer exists)
-
-# The DB is empty (FLUSHDB ran):
-kubectl -n dragonfly-system exec platform-redis-ephemeral-000-0 -- \
-  redis-cli -a "$ADMIN_PW" --no-auth-warning -n "$WEB_DB" DBSIZE
-# -> 0
-
-# The snapshot is gone:
-kubectl -n apprafter-system get retainedclaim claim-demo-web-redis   # -> NotFound
-```
-
-The freed DB number returns to the pool implicitly — the next allocation
-scan reads only LIVE claims' `status.dbnum`, so this DB is reusable.
-**If the ACL user is still present after the snapshot is gone, the GC did
-NOT run `ACL DELUSER`. Stop here and
-[report it](https://github.com/apprafter/apprafter/issues) — the platform
-is not doing what it promises, and a credential you were told was revoked
-still opens the database.**
-
-## Checklist — did it work?
-
-A complete run exercises both surfaces AppRafter ships. Check every
-box.
-
-**Surface 1 — Argo CD UI (`apprafter open argocd`):**
-
-- [ ] The bootstrap / platform Application is **Synced** + **Healthy**.
-- [ ] The `redis-integrated` ServiceProvider resource shows green.
-- [ ] The `platform-redis-ephemeral-000` Dragonfly instance shows green
-      (created lazily on the first claim).
-
-**Surface 2 — kubectl / redis-cli assertions:**
-
-- [ ] ResourceClaim `web-redis` reaches `status.ready=true` with a
-      `status.instance` + `status.dbnum` (steps 2, 4, 6).
-- [ ] Application `web` transitions `AwaitingResourceClaim → Ready`
-      (steps 3, 8).
-- [ ] The `claim.redis.url` **and** `claim.redis.channelPrefix`
-      references render as `secretKeyRef`s on the Deployment (step 9).
-- [ ] **Isolation: a second claim's user gets `NOPERM` on the first
-      claim's DB** (step 10).
-- [ ] Deleting the claim cascades the connection Secret + writes a
-      `RetainedClaim` (`backend: dragonfly`); the ACL user survives the
-      grace floor (step 12).
-- [ ] **Forcing the GC runs `FLUSHDB` + `ACL DELUSER` — the user is gone
-      and the DB is empty — and the snapshot is removed.**
+[Declared Redis dependencies](../how-it-works/needs-redis.md) covers the shared
+pool, what the per-claim credential actually enforces, why channels are the one
+exception, how object names are derived, and the teardown after the grace
+window.
 
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 | ------- | ------------ | --- |
-| Claim stuck `Scheduled` absent / Application stuck `AwaitingResourceClaim` | `needs.redis.selector` does not match any provider's `metadata.labels` | Confirm `selector.tier=integrated` and that `redis-integrated` carries `tier=integrated`: `kubectl get serviceprovider redis-integrated -n apprafter-system -o yaml`. |
-| `status.ready` never `true` | shared Dragonfly instance not Ready, or a provisioner error reaching it over the Redis protocol | `kubectl -n dragonfly-system get dragonfly.dragonflydb.io`; check the operator logs: `kubectl -n apprafter-system logs deploy/apprafter-operator`. |
-| `kubectl apply` of the Application rejected | admission webhook: an unknown `needs` key | Use only the closed `needs` key set. |
-| App starts but the Redis env-vars are empty or absent | the manifest declares `needs.redis` but never binds it — nothing is auto-injected | Add `env: { REDIS_URL: claim.redis.url }` (see *Author the manifest*). |
-| App gets `NOPERM` on a pub/sub channel | the app published/subscribed to an unprefixed channel | Prefix every channel name with the claim's `channelPrefix`; keys need no prefix. |
-| ACL user missing after a Dragonfly pod restart | runtime ACL users are in-memory and lost on reload | The reconcile loop re-pins them on instance readiness; if it lingers, check the operator logs for the ACL reconcile task. |
+| The application stays at `AwaitingResourceClaim` and the claim never gets a provider | the `needs.redis.selector` matches no provider | Confirm the selector reads `tier=integrated`: `kubectl get serviceprovider redis-integrated -n apprafter-system -o yaml`. |
+| The claim never reaches `ready` | the shared instance is not up, or the provisioner errored | Check the pod in `dragonfly-system`, then the operator log: `kubectl -n apprafter-system logs deploy/apprafter-operator`. |
+| `NOPERM` on publish or subscribe | the channel name is not prefixed | Prefix it with `claim.redis.channelPrefix`. Channels are server-wide, so the prefix is what scopes them — see *Two rules* above. |
+| `NOPERM` on an ordinary key operation | the client connected to database 0 instead of the claim's | The DSN carries the database number; a client that ignores it lands on 0, where the credential has no rights. |
+| The application starts but its Redis env-vars are empty or missing | the manifest declares `needs.redis` but binds nothing — nothing is injected automatically | Add both bindings, as above. |
+| Data vanished after a restart | the claim is ephemeral, which is the default | Add `persistent: true` to the need. The claim moves to a persistent instance. |
 
-## For contributors
+## Prerequisites
 
-Nothing in this section is needed to run Redis — it is here for people
-changing the platform itself.
+- A Tier-1 cluster provisioned with `apprafter bootstrap-all` (see the
+  [Quickstart](quickstart.md)), operator **≥ v0.2.18** — the release that ships
+  the always-on dragonfly-operator, the `redis-integrated` provider, and the
+  Dragonfly backend in the claim controllers.
+- For the verification blocks above only, a kubeconfig:
 
-**The automated end-to-end script.** It needs a checkout of the AppRafter
-repository, which nothing above does. `e2e/needs-redis-walk.sh`
-exercises this identical chain on a local k3d cluster (including the
-`$N`-ACL isolation proof and the `FLUSHDB`/`DELUSER` GC proof), and is
-the cheap gate to clear before anyone spends a real one on it:
-
-```sh
-bash e2e/needs-redis-walk.sh        # green in ~8-12 min on k3d
-```
-
-If that is red, fix it before continuing: working through this guide
-by hand only adds value once the automated chain is green.
-
-**One assertion to re-run by hand if you touch the claim controllers.**
-Two of them write this claim's status — the scheduler records which
-provider it picked, the provisioner records the database it allocated —
-and each writes through server-side apply (SSA) under its own field
-manager. Get a field manager wrong in either one and it silently erases
-the other's verdict, which no step above would notice. After provisioning,
-the scheduler's condition must still read `True`:
-
-```sh
-kubectl -n demo get resourceclaim.apprafter.io web-redis -o \
-  jsonpath='{.status.conditions[?(@.type=="Scheduled")].status}{"\n"}'   # -> True
-```
+  ```sh
+  apprafter kubeconfig --refresh > /tmp/kc && export KUBECONFIG=/tmp/kc
+  ```
 
 ## Cleanup
 
 ```sh
-apprafter app remove web --keep-data    # leave any retained data in place
-apprafter destroy --yes                  # every apprafter=true resource in the token's project
+apprafter app remove web --keep-data
+apprafter destroy --yes    # every apprafter=true resource in the token's project
 ```

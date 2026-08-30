@@ -217,6 +217,7 @@ nav:
       # them in — run the recipe first, come here when it surprises you.
       - Overview: how-it-works/index.md
       - Declared Postgres dependencies: how-it-works/needs-pg.md
+      - Declared Redis dependencies: how-it-works/needs-redis.md
   - Developer Guide:
       - Overview: dev-guide/index.md
       - Quickstart: dev-guide/quickstart.md

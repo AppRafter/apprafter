@@ -51,10 +51,9 @@ fn the_pages_not_yet_restructured_are_still_loud() {
     let found = findings();
     // Of the four pages the census named — each transcribing an e2e
     // walk, and the four highest foreign-command counts in the corpus —
-    // these three are still to do. If one goes quiet without its page
+    // these two are still to do. If one goes quiet without its page
     // being rewritten, the check has lost surface.
     for page in [
-        "docs/operator-guide/redis.md",
         "docs/operator-guide/persistent-disk.md",
         "docs/operator-guide/egress-policy.md",
     ] {
@@ -66,15 +65,18 @@ fn the_pages_not_yet_restructured_are_still_loud() {
 /// Pages 2.20c has rewritten into recipes. This list grows as the
 /// restructure proceeds, and every entry is a page that used to be
 /// loud — which is what makes it evidence rather than bookkeeping.
-const RESTRUCTURED: &[&str] = &["docs/operator-guide/postgres.md"];
+const RESTRUCTURED: &[&str] = &[
+    "docs/operator-guide/postgres.md",
+    "docs/operator-guide/redis.md",
+];
 
 #[test]
 fn a_restructured_page_is_silent() {
     // The other half of the red state: a page that WAS loud and now is
     // not. Kept as an assertion rather than deleted, because a page
     // going quiet is the evidence the restructure worked, and an
-    // assertion that only ever gets removed proves nothing. postgres.md
-    // carried 40 findings before 2.20c.
+    // assertion that only ever gets removed proves nothing. Before
+    // 2.20c these carried 40 and 39 findings.
     let found = findings();
     for page in RESTRUCTURED {
         let hits: Vec<_> = found

@@ -18,6 +18,10 @@ than taken on faith.
 - [Declared Postgres dependencies](needs-pg.md) — how `needs.pg` becomes a
   database: the claim, the scheduler, the lazily-created shared cluster, the
   connection Secret, and the phased drop after the grace window.
+- [Declared Redis dependencies](needs-redis.md) — how `needs.redis` becomes an
+  isolated logical database on a shared pool, what the per-claim credential
+  enforces, why channels are the one exception, and the flush after the grace
+  window.
 
 ## Why this section exists
 
