@@ -9,7 +9,25 @@ Internal working data — this tree is excluded from the site
 (`exclude_docs` in `mkdocs.yml`) and from the documentation gate
 (`docs/measurements/` is in `EXCLUDED`, `cli/docsgen/src/scan.rs:96`).
 
-## VPA in-place right-sizing has never run: wrong feature-gate name
+Entries are numbered `D<n>` so they can be referred to without quoting a
+title. Numbers are permanent: a resolved entry keeps its number and its
+text rather than being deleted, because what was wrong and what it cost
+is the part worth having later.
+
+| | Entry | Status |
+| --- | --- | --- |
+| **D1** | VPA in-place right-sizing has never run: wrong feature-gate name | RESOLVED |
+| **D2** | `backup enable --cron` / `--check-cron` accept a value the apiserver rejects | open (docs half landed, CLI half did not) |
+| **D3** | Two diagnostics whose `help:` text describes a layout that moved | open |
+| **D4** | Removing a `needs.*` entry orphans its ResourceClaim forever | open — high |
+| **D5** | A Dragonfly restart drops every claim's ACL user | open — high |
+| **D6** | Rotating a secret does not take effect until something else restarts the pods | open — high, security |
+| **D7** | The CLI cannot answer the question its own error asks | open |
+| **D8** | A capacity warning nobody can receive | open |
+| **D9** | There is nothing to roll a moving tag back to | open |
+| **D10** | The applying half of right-sizing has never been observed to apply anything | open — high |
+
+## D1. VPA in-place right-sizing has never run: wrong feature-gate name
 
 **Opened:** 2026-08-20 (2.19j, correcting
 `docs/dev-guide/resources-and-autoscaling.md`).
@@ -28,9 +46,15 @@ The re-validation is part of the resolution rather than a formality: for
 a week this was *fixed in code and unverified live*, which is the state
 the entry itself was written in. `e2e/vpa-walk.sh` on real Hetzner
 confirmed all three controllers Available, the recommendation landing on
-the pinned 32Mi floor, the mirror into `Application.status`, and — the
-observation the walk had never made — the managed pod's
-`requests.memory` **resized in place**, uid stable, no recreation.
+the pinned 32Mi floor, and the mirror into `Application.status`.
+
+**It did not confirm that anything was applied to a pod**, though this
+entry and `plan-history.md` both said so. The apply-observation's test is
+`[ "$REQ" = "$RECO" ]`, and the seed request and the recommender's pinned
+floor are both 32Mi — so a pod the updater never touched passes it
+identically. The walk's own comment concedes the possibility ("seed may
+already match"). That is **D10**, and it is the same shape as the defect
+this entry records.
 **Severity (while open):** the whole applying half of ADR 0054 was
 inert, silently.
 
@@ -83,15 +107,15 @@ pods `CrashLoopBackOff`, nine days.
 - The mutating webhook is registered `failurePolicy: Ignore`
   (deliberately, and correctly — it stops a down admission pod from
   deadlocking pod creation), so nothing fails when it is absent.
-- `Application.status.recommendedResources.notApplied` is set **only**
-  for node-capacity infeasibility
-  (`operator-controllers/application/src/lib.rs:1372`), never for "no
-  updater". So the status reads exactly as it would if everything were
-  working.
-- The installed-check the docs previously offered —
-  `kubectl get crd verticalpodautoscalers.autoscaling.k8s.io` — passes
-  in this state. It answers "was the component rendered", not "is the
-  autoscaler working".
+- `Application.status.recommendedResources.notApplied` is **never set**.
+  The only production call site passes `infeasible: false` outright
+  (`operator-controllers/application/src/lib.rs:870`, with the comment
+  above it deferring the probe to "a follow-up"), and the field is
+  populated only when that flag is true (`:1382`) — so the whole
+  downstream path is built and dead: the CRD field, the operator type,
+  and the CLI's ` · not applied — {reason}` rendering. An earlier version
+  of this bullet said it was set for node-capacity infeasibility; that
+  was wrong. Tracked as **D10**.
 
 Net effect: recommendations are computed and reported; **no pod request
 is ever changed**. Applications keep the rendered `32Mi` forever.
@@ -150,7 +174,7 @@ mechanism that still works is not a weaker check than none; it is worse,
 because it reports green. That is the shape to look for elsewhere, not
 the specific assertion.
 
-## `apprafter backup enable --cron` / `--check-cron` accept a value the apiserver rejects
+## D2. `apprafter backup enable --cron` / `--check-cron` accept a value the apiserver rejects
 
 **Opened:** 2026-08-20 (2.19j, correcting
 `docs/operator-guide/backup-restore.md`).
@@ -203,7 +227,7 @@ check" deserves a first-class spelling. If it does, it is a
 `--check-cron off` that maps onto it — **not** a string that reaches
 `schedule:`.
 
-## Two diagnostics whose `help:` text describes a layout that moved
+## D3. Two diagnostics whose `help:` text describes a layout that moved
 
 **Opened:** 2026-08-20 (2.19j, correcting
 `docs/operator-guide/troubleshooting.md`).
@@ -235,7 +259,7 @@ troubleshooting page now states the correct answer beside the stale one.
    one string is the outlier, and it names a field that a manifest
    author cannot set.
 
-## Removing a `needs.*` entry orphans its ResourceClaim forever
+## D4. Removing a `needs.*` entry orphans its ResourceClaim forever
 
 **Opened:** 2026-08-30 (2.20c, correcting `docs/operator-guide/postgres.md`,
 `redis.md`, `persistent-disk.md` and their `how-it-works/` siblings).
@@ -324,7 +348,7 @@ desired-set diff, and a walk step that removes one `needs` entry from a
 two-need app and asserts a `RetainedClaim` appears while the other claim is
 untouched. Without that last one the class stays invisible exactly as it is now.
 
-## A Dragonfly restart drops every claim's ACL user
+## D5. A Dragonfly restart drops every claim's ACL user
 
 **Opened:** 2026-08-30 (2.20c, correcting `docs/operator-guide/redis.md` and
 `docs/how-it-works/needs-redis.md`).
@@ -408,7 +432,7 @@ Ships with: a walk step that restarts the pool instance and asserts a tenant
 can still authenticate immediately afterwards. No current walk restarts an
 instance, which is why this was never caught.
 
-## Rotating a secret does not take effect until something else restarts the pods
+## D6. Rotating a secret does not take effect until something else restarts the pods
 
 **Opened:** 2026-08-30 (2.20c, correcting `docs/dev-guide/secrets.md`).
 **Status:** OPEN.
@@ -465,7 +489,7 @@ it up without any manual action. No current walk rotates a secret.
 operator → `appVersion` → platform-stack → compatibility chain. It was
 deliberately kept out of the 2.20 documentation track for that reason.
 
-## The CLI cannot answer the question its own error asks
+## D7. The CLI cannot answer the question its own error asks
 
 **Opened:** 2026-08-30 (2.20c, correcting `docs/dev-guide/secrets.md`).
 **Status:** OPEN.
@@ -518,7 +542,7 @@ Worth pairing with a smaller change that removes the need for it: have
 `EnvSecretMissing`, so the ambiguous half of the message becomes concrete
 without a second command at all.
 
-## A capacity warning nobody can receive
+## D8. A capacity warning nobody can receive
 
 **Opened:** 2026-08-30 (2.20c, correcting `docs/operator-guide/shared-volumes.md`).
 **Status:** OPEN.
@@ -554,7 +578,7 @@ Worth doing at the same time: `apprafter app status` says nothing about
 SharedVolumes even for an application that mounts one, so an application-side
 reader has no path to the warning at all.
 
-## There is nothing to roll a moving tag back to
+## D9. There is nothing to roll a moving tag back to
 
 **Opened:** 2026-08-30 (2.20c, correcting `docs/dev-guide/image-iteration.md`).
 **Status:** OPEN.
@@ -600,4 +624,100 @@ feature creates.
 
 Ships with a walk step that pushes a second image to the same tag and asserts
 the rollback returns the workload to the first.
+
+## D10. The applying half of right-sizing has never been observed to apply anything
+
+**Opened:** 2026-08-30 (re-reading **D1** against the tree).
+**Status:** OPEN.
+**Severity:** high. `InPlace` behaves correctly by construction and by
+upstream source; what is missing is any evidence it has ever acted, and any
+signal when it cannot.
+
+### What is right, first
+
+The mode choice is sound and was verified outside the repository, so this
+entry is not "VPA is broken again":
+
+- **`InPlace` is a valid `updateMode`** on the shipped chart —
+  `helm show crds vertical-pod-autoscaler --version 0.11.0` gives
+  `["Off","Initial","Recreate","InPlaceOrRecreate","InPlace","Auto"]` on the
+  **v1** block. (The **v1beta2** block of the same CRD carries only
+  `[Off, Initial, Recreate, Auto]`, so the `autoscaling.k8s.io/v1` string at
+  `operator-rendering/src/lib.rs:774` is load-bearing and nothing in-tree
+  asserts it.)
+- **`InPlace` never evicts**, by explicit upstream construction at tag
+  `vertical-pod-autoscaler-1.7.1`, in three places in `pkg/updater`: the mode
+  branch never populates `podsForEviction`; on an actuation error it logs,
+  records a failure and `continue`s, where `InPlaceOrRecreate` falls back to
+  eviction; and the restriction layer's deferred/in-progress timeout →
+  `InPlaceEvict` path is gated to `InPlaceOrRecreate`.
+
+So the property the mode was chosen for — a request change without a restart
+— holds. The rest of this entry is about not being able to tell whether it
+ever happens.
+
+### What is wrong
+
+**The apply-observation is degenerate.** `e2e/vpa-walk.sh:213-219` tests
+`[ "$REQ" = "$RECO" ]`. The rendered seed request is 32Mi
+(`operator-rendering/src/lib.rs:333`) and the recommender's memory floor is
+pinned to 32Mi (`platform-stack/cue/component_vpa.cue:166`), and the recorded
+0.2.57 run observed exactly 32Mi on both sides. **A pod the updater never
+touched satisfies that equality.** The walk concedes it inline ("seed may
+already match") and the check is soft, but the result was written up as
+"resized in place" in both `plan-history.md` and D1 above.
+
+**It also reads the wrong field.** `spec.containers[].resources.requests` is
+what the updater *patches* — the desired value. What the kubelet actually
+actuated is `status.containerStatuses[].resources`, and the in-flight and
+blocked states are the `PodResizePending` / `PodResizeInProgress` pod
+conditions. The walk reads none of the three, so even a moved `spec` would
+prove the updater patched, not that the resize landed.
+
+**The failure mode of the mode we chose is the one nothing reports.** Because
+`InPlace` defers instead of evicting, an infeasible upward resize is silent
+and indefinite. ADR 0054 anticipated exactly this and specified a
+`recommendation not applied — node capacity` signal on `Application.status`.
+The signal is dead: the only production call site hardcodes
+`infeasible: false` (`application/src/lib.rs:870`), the field is populated
+only when that is true (`:1382`), and the CRD field, the operator type and
+the CLI rendering are all built and unreachable.
+
+**And the Kubernetes side is unpinned and unprobed.** In-place pod resize is
+itself a Kubernetes feature. ADR 0054:13 says it is GA "on the **pinned** k8s
+v1.35" — nothing pins k8s: `build_k3s_user_data` installs stable-channel k3s
+with no `INSTALL_K3S_VERSION`, which `quickstart.md` states outright. It is
+benign today because the gate is on by default at the versions the stable
+channel serves, but that is an accident of upstream defaults rather than
+something the platform arranges or would notice changing. The contrast is
+sharp: the swap path *does* preflight the kubelet version
+(`node_prep.rs`, `k8s_ge_134`); the VPA prerequisite does not.
+
+### The fix
+
+1. **Make the walk able to fail.** Seed the app above the floor — an explicit
+   large request, or a workload that allocates — so the recommendation and the
+   seed genuinely differ, then assert on `status.containerStatuses[].resources`
+   rather than `spec`, and hard-fail rather than log. Without a differing
+   pair the assertion cannot distinguish success from no-op, which is what it
+   currently does not.
+2. **Emit the deferred signal.** Wire the `notApplied` probe the ADR
+   specified and the whole downstream path already implements — read the
+   VPA's own in-place condition rather than inferring node capacity, since
+   upstream now reports it.
+3. **Preflight the Kubernetes prerequisite** the way the swap path already
+   preflights its own: a version and feature check at bootstrap, and a walk
+   assertion, so an unpinned upstream moving under us is a finding rather
+   than a silence.
+
+### The shape worth carrying
+
+D1 was a component that never ran while every gate reported green, because
+the walk asserted only the half that still worked. The guard added for it
+asserts the controllers are *up*. This entry is the next layer of the same
+thing: the controllers are up, and the assertion that they *do* anything
+passes whether they do or not.
+
+A walk that cannot fail is not evidence. Both times the tell was the same —
+an assertion whose success condition is satisfied by the null case.
 
