@@ -42,9 +42,10 @@ deletion and reattaches the same PVC, data intact, because the provisioner's
 apply is idempotent on the same name.
 
 Names are derived from the claim's `(namespace, name)`: an app `web` in
-namespace `demo` gets `ResourceClaim` `web-disk` and PVC
-`claim-demo-web-disk`. A named entry in a multi-disk `needs.disk` array gets
-`<app>-disk-<name>`.
+namespace `demo` gets `ResourceClaim` `web-disk` and PVC `claim-demo-web-disk`.
+A named entry in a multi-disk array is identified by its `name`, or — when
+omitted — by the last segment of its `mountPath`, and that identity is what the
+claim and PVC names are built from.
 
 **Delete the Application, not the claim, when you want the retention path.**
 The claim is owned by the Application, so deleting the claim alone while the
@@ -55,8 +56,13 @@ if you were not expecting it.
 
 ## Single writer, and what it forces
 
-`ReadWriteOnce` means exactly one pod may mount the volume. Two consequences
-are enforced rather than advised:
+`ReadWriteOnce` means exactly one pod may mount the volume. This section is
+about a disk an application *owns* — one it declares with a `size` and a
+`mountPath`. A volume several applications read is a different primitive
+(`SharedVolume`, reached through `needs.disk.ref`) and is not subject to either
+constraint below.
+
+For an owned disk, two consequences are enforced rather than advised:
 
 - the admission webhook **rejects** `needs.disk` together with `replicas > 1`;
 - the renderer sets `strategy: Recreate`, so a rolling update never overlaps
@@ -64,8 +70,8 @@ are enforced rather than advised:
   cannot mount until the old one releases, and the old one does not terminate
   until the new one is ready.
 
-`readOnly: true` on the need mounts it read-only — useful for a sidecar that
-consumes a volume another need writes.
+`readOnly: true` on the need mounts it read-only, so the container cannot write
+to it.
 
 ## Watching it happen
 
@@ -87,14 +93,24 @@ kubectl -n demo get deployment web -o jsonpath='{.spec.strategy.type}{"\n"}'   #
 
 ## The grace window, and the deletion
 
-Deleting the Application, or removing the dependency, writes an immutable
-`RetainedClaim` snapshot with `retainUntil` at deletion + 7 days carrying the
+**Deleting the Application** deletes its claim — the `ResourceClaim` carries a
+controlling `ownerReference` back to it — and the finalizer writes an immutable
+`RetainedClaim` snapshot with `retainUntil` at deletion + 7 days, carrying the
 volume claim's name and namespace. The PVC survives untouched. Once
 `retainUntil` passes, the GC deletes the PVC and removes the snapshot.
 
+Editing the manifest is a different path. Dropping a `needs.<type>` key is
+classified as a destructive `data-migration` change, so it is gated behind a
+MigrationPlan and the Application pauses at `AwaitingMigrationApproval`. Even
+after approval nothing deletes the claim: the render path applies claims for
+*declared* needs and skips the block when there are none. The retention path
+runs on Application deletion, not on a manifest edit.
+
 The snapshot is immutable by a CEL `self == oldSelf` rule, and the admission
-webhook accepts a CREATE only from the operator's ServiceAccount: it is written
-by the provisioner's finalizer, never by hand. There is no supported way to
+webhook restricts CREATE to the operator's ServiceAccount, with a deliberate
+cluster-admin break-glass (`system:masters`, `kubeadm:cluster-admins`): it is
+written by the provisioner's finalizer, and hand-writing one is unsupported
+rather than impossible. There is no supported way to
 shorten the window, and the guide does not teach one — the snapshot is the
 work order the GC executes, so a hand-written substitute is a way to delete the
 wrong volume.

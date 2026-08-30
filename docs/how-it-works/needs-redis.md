@@ -50,6 +50,13 @@ one. That pin is the wall:
 That asymmetry is the one thing an application author has to know, and it is
 why the recipe binds two env-vars rather than one.
 
+**Credentials are runtime state on the instance, not stored configuration.** A
+Dragonfly restart drops every claim's ACL user, so all of that pool's tenants
+fail authentication at once until the provisioner's reconcile re-pins them —
+about five minutes. It is self-healing and needs no operator action, but it is
+worth recognising, because a simultaneous `WRONGPASS` across unrelated
+applications looks like something far worse than a pod that restarted.
+
 **Persistence is an instance-level property**, not a per-database one: Redis
 snapshots the whole dataset. So `persistent: true` routes the claim onto a
 *separate* persistent instance rather than turning persistence on for one
@@ -101,16 +108,28 @@ Two shapes catch people out when reaching for the instance directly:
 
 ## The grace window, and the flush
 
-Removing the dependency deletes the claim. A finalizer writes an immutable
-`RetainedClaim` snapshot with `retainUntil` set to deletion + 7 days, and the
-connection Secret cascades away — but the ACL user and the database's contents
-survive the window. Once `retainUntil` passes, the GC runs `FLUSHDB` on the
-claim's database and `ACL DELUSER` on its user, then removes the snapshot.
+**Deleting the Application deletes the claim** — the `ResourceClaim` carries an
+ownerRef back to it, so the cascade is what starts this. A finalizer writes an
+immutable `RetainedClaim` snapshot with `retainUntil` set to deletion + 7 days,
+and the connection Secret cascades away, but the ACL user and the database's
+contents survive the window.
+
+Editing the manifest is a different path. Dropping a `needs.<type>` key is a
+destructive `data-migration` change, so it is gated behind a MigrationPlan and
+the Application pauses at `AwaitingMigrationApproval`. Even after approval
+nothing deletes the claim: the render path applies claims for *declared* needs
+and skips the block when there are none. The retention path runs on Application
+deletion, not on a manifest edit.
+
+Once `retainUntil` passes, the GC runs `FLUSHDB` on the claim's database and
+`ACL DELUSER` on its user, then removes the snapshot.
 
 **The snapshot is not a knob.** It is immutable by a CEL `self == oldSelf` rule,
-and the admission webhook accepts a CREATE only from the operator's
-ServiceAccount. Beyond being forbidden, hand-writing one here is actively
-unsafe in a way the Postgres equivalent is not: [ADR
+and the admission webhook restricts CREATE to the operator's ServiceAccount,
+with a deliberate cluster-admin break-glass (`system:masters`,
+`kubeadm:cluster-admins`) — so hand-writing one is unsupported rather than
+impossible. What makes it a bad idea here, in a way the Postgres equivalent is
+not, is what it costs: [ADR
 0042](../adr/0042-needs-redis-dragonfly.md) derives the allocator's reserved
 database set from live claims **∪** `RetainedClaim`s and never from the running
 instance, so deleting a snapshot frees a database number that still holds

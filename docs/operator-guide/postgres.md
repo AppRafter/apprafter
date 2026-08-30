@@ -6,7 +6,7 @@ description: "Give an application a Postgres database by declaring it in the man
 
 An application declares that it needs Postgres, and the platform provisions a
 database for it, publishes the connection details, and binds them to the
-env-var you name. Removing the dependency retains the data for seven days
+env-var you name. Retiring the application retains the data for seven days
 before dropping it.
 
 You do not create a database, a user, or a password. You do not connect
@@ -20,10 +20,12 @@ Scaffold the manifest with the dependency in place:
 apprafter app scaffold --name parser --namespace demo --needs pg
 ```
 
-`--needs` is repeatable, and the key set is closed — `pg`, `jetstream`,
-`clickhouse`, `redis`, `s3`, `notifications`, `disk`. Providers ship today for
-`pg`, `redis` and `disk`; each has a guide in this section. An unknown key is a
-clear error rather than a silent no-op.
+`--needs` is repeatable, and today it accepts the three types a provider ships
+for — `pg`, `redis` and `disk` — each with a guide in this section. Anything
+else is a clear error naming the supported set. The manifest schema itself
+allows a wider closed set (`jetstream`, `clickhouse`, `s3`, `notifications` as
+well), so a hand-written need of one of those validates but has no provider to
+schedule it.
 
 That writes a `needs` block into `apprafter/Application.cue`:
 
@@ -123,30 +125,46 @@ for the full Argo CD resource tree.
 
 ## Remove the dependency
 
-Drop the `needs.pg` block from the manifest and push. The claim goes with it,
-and so does the connection Secret — but **the database and its role are kept
-for seven days**, then dropped automatically.
+**Dropping the `needs.pg` block from the manifest does not take effect on
+push.** Removing a declared dependency is classified as a destructive change,
+so the platform holds it: the application pauses at
+`AwaitingMigrationApproval`, the previously-applied spec keeps running, and
+nothing is torn down until you approve the change.
 
-That grace window is the point: removing a dependency by accident, or on a
+```sh
+apprafter migration list
+apprafter migration approve <plan-name>
+```
+
+The approval gate is covered on [Migration plans](migration-plans.md). Remove
+the `env` binding in the same edit — `claim.pg.url` is generated from the
+`needs` block, so a binding left behind fails `apprafter app validate`.
+
+**To retire the application and start the retention clock, delete it:**
+
+```sh
+apprafter app remove parser
+```
+
+That deletes the Argo CD Application, which prunes the AppRafter `Application`
+CR and the claim with it. The connection Secret goes; **the database and its
+role are kept for seven days**, then dropped automatically.
+
+That grace window is the point: removing an application by accident, or on a
 branch, does not destroy data. There is no supported way to shorten it, and the
 retention record is deliberately not hand-editable — it carries the whole work
 order the platform will execute, so a hand-written substitute is a way to drop
 the wrong database.
 
-To remove the whole application instead:
-
-```sh
-apprafter app remove parser --keep-data
-```
-
-`--keep-data` leaves any retained data in place. Without it, the same seven-day
-window still applies — the flag governs what `app remove` itself touches, not
-the grace period.
+`--keep-data` does something different, despite the name: it strips the cascade
+first, so **only** the Argo CD object is deleted and the workload, its
+`Application` CR and its claim all keep running. Use it to hand an application
+off or re-register it elsewhere, not to retire one.
 
 ??? note "Verify independently with kubectl"
 
-    Right after removal — the snapshot exists, the connection Secret is gone,
-    and the database survives:
+    Right after `app remove` — the snapshot exists, the connection Secret is
+    gone, and the database survives:
 
     ```sh
     kubectl -n apprafter-system get retainedclaim claim-demo-parser-pg -o \
@@ -196,6 +214,6 @@ that proves a database is physically dropped.
 ## Cleanup
 
 ```sh
-apprafter app remove parser --keep-data
-apprafter destroy --yes    # every apprafter=true resource in the token's project
+apprafter app remove parser   # the database enters its seven-day window
+apprafter destroy --yes       # every apprafter=true resource in the token's project
 ```

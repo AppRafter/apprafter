@@ -45,11 +45,15 @@ vendor the schema next to your manifest, so `cue` refuses the import outright.
 
 ### Keep `replicas: 1`
 
-A disk admits exactly one writer, and this is enforced rather than advised: the
-manifest is **rejected** if `needs.disk` appears with `replicas > 1`. The
-platform also switches your rollout to `Recreate`, so an update stops the old
-pod before starting the new one — a brief gap instead of an overlap, because
-two pods cannot hold the same volume at once.
+A disk provisioned this way admits exactly one writer, and this is enforced
+rather than advised: the manifest is **rejected** if such a `needs.disk` appears
+with `replicas > 1`. The platform also switches your rollout to `Recreate`, so
+an update stops the old pod before starting the new one — a brief gap instead of
+an overlap, because two pods cannot hold the same volume at once.
+
+If several applications must read one volume, that is a different primitive:
+see [Shared volumes](shared-volumes.md), which is not subject to either
+constraint.
 
 Plan for that gap. An application that must never be down cannot use a `local`
 disk for the thing that must never be down.
@@ -68,9 +72,10 @@ needs: {
 }
 ```
 
-Each gets its own volume. Names and mount paths must be unique within the app.
-Add `readOnly: true` to an entry to mount it read-only — useful for a container
-that only consumes a volume another one writes.
+Each gets its own volume. An entry's identity is its `name`, or — if you omit
+one — the last segment of its `mountPath`; either way it must be unique within
+the app, as must the paths. Add `readOnly: true` to an entry to mount it
+read-only.
 
 ## Register the application
 
@@ -116,30 +121,46 @@ as the pod starts.
 
 ## Remove the dependency, and get it back
 
-Drop the `needs.disk` block and push, or remove the application entirely:
+**Dropping the `needs.disk` block from the manifest does not take effect on
+push.** Removing a declared dependency is classified as a destructive change,
+so the platform holds it: the application pauses at
+`AwaitingMigrationApproval` and nothing is torn down until you approve it.
 
 ```sh
-apprafter app remove web --keep-data
+apprafter migration list
+apprafter migration approve <plan-name>
 ```
 
-**The volume survives.** It is deliberately not owned by anything that would
-cascade, so neither removing the application nor removing the dependency
-deletes it. It is kept for seven days and then deleted automatically.
+The approval gate is covered on [Migration plans](migration-plans.md).
+
+**To retire the application, delete it:**
+
+```sh
+apprafter app remove web
+```
+
+**The volume survives either way.** It is deliberately not owned by anything
+that would cascade, so retiring the application does not delete it. It is kept
+for seven days and then deleted automatically.
 
 **Re-declaring the dependency inside that window brings the same volume back**,
-with the data still in it. Put the `needs.disk` block back and push; the
-pending deletion is cancelled and the original volume is reattached. This is
-the intended way to undo an accidental removal, and the automated walk proves
-it end to end.
+with the data still in it: register the application again and the pending
+deletion is cancelled, the original volume reattached. This is the intended way
+to undo an accidental removal, and `e2e/needs-disk-walk.sh` exercises it end to
+end.
 
 There is no supported way to shorten the seven days, and the retention record
 is deliberately not hand-editable — it is the work order the cleanup executes,
 so a hand-written substitute is a way to delete the wrong volume.
 
+`--keep-data` does something different, despite the name: it strips the cascade
+first, so **only** the Argo CD object is deleted and the workload, its
+`Application` CR and its volume all keep running. Use it to hand an application
+off or re-register it elsewhere, not to retire one.
+
 ??? note "Verify independently with kubectl"
 
-    After removing the application — the snapshot exists and the volume is
-    untouched:
+    After `app remove` — the snapshot exists and the volume is untouched:
 
     ```sh
     kubectl -n apprafter-system get retainedclaim claim-demo-web-disk -o \
@@ -150,8 +171,8 @@ so a hand-written substitute is a way to delete the wrong volume.
     # -> Bound   (still there)
     ```
 
-    After re-declaring, the claim points at the same volume and the snapshot is
-    gone — the deletion was cancelled:
+    After re-registering, the claim points at the same volume and the snapshot
+    is gone — the deletion was cancelled:
 
     ```sh
     kubectl -n demo get resourceclaim.apprafter.io web-disk \
@@ -191,6 +212,6 @@ and the deletion after the grace window.
 ## Cleanup
 
 ```sh
-apprafter app remove web --keep-data
+apprafter app remove web   # the volume enters its seven-day window
 apprafter destroy --yes    # every apprafter=true resource in the token's project
 ```

@@ -101,13 +101,24 @@ cascade away when the claim goes.
 
 ## The grace window, and the phased drop
 
-Removing the dependency deletes the claim. A finalizer then writes an immutable
-`RetainedClaim` snapshot with `retainUntil` set to **deletion + 7 days**, and
-the connection Secret cascades away — but the role and the database survive the
-window. Deleting a dependency does not delete data.
+**Deleting the Application deletes the claim** — every generated
+`ResourceClaim` carries a controlling `ownerReference` back to it, so the delete
+cascades. A finalizer then writes an immutable `RetainedClaim` snapshot with
+`retainUntil` set to **deletion + 7 days**, and the connection Secret cascades
+away, but the role and the database survive the window.
+
+Editing the manifest is a different path. Dropping a `needs.<type>` key is
+classified as a destructive `data-migration` change, so it is gated: the
+operator cuts a MigrationPlan and holds the Application at
+`AwaitingMigrationApproval` until the change is approved. And even after
+approval nothing deletes the claim — the render path applies claims for
+*declared* needs and skips the block entirely when there are none, so the claim
+stays in place, still holding its database. The retention path runs on
+Application deletion, not on a manifest edit.
 
 The snapshot is immutable by a CEL `self == oldSelf` rule, and the admission
-webhook accepts a CREATE only from the operator's ServiceAccount:
+webhook rejects a CREATE from anyone but the operator's ServiceAccount or a
+cluster-admin break-glass identity (`system:masters`, `kubeadm:cluster-admins`):
 [RetainedClaims are written by the provisioner's finalizer, never by
 hand](https://github.com/apprafter/apprafter/blob/master/operator/admission-webhook/src/validator_retainedclaim.rs).
 There is no supported way to shorten the window, and the guide does not teach
@@ -126,17 +137,31 @@ it cannot drop a role that still owns a database:
 3. only once CloudNativePG confirms the role is gone does the GC prune the
    entry, delete the password Secret, and delete the snapshot.
 
-Each stage is a `ROLE_DROP_REQUEUE` cycle, roughly 15 seconds. An entry still
+Each stage is one reconcile cycle, roughly 15 seconds. An entry still
 reading `ensure: absent` with the snapshot still present is mid-drain, not
 stuck. A drop that stays wedged across many cycles is reported in the operator
 log as `role drop BLOCKED (CNPG cannotReconcile)` — most often a role that
 still owns a database with live connections.
 
 **`ensure: absent` is the platform's intent, not proof.** What proves the data
-is gone is the catalog, and the automated walk asserts exactly that: after the
-GC completes, `pg_database` and `pg_roles` carry no row for the claim's
-identifiers. If you are verifying this yourself on a real cluster, that is the
-query to run — and a row still present after several cycles is a
+is gone is the catalog, and `e2e/needs-pg-walk.sh` asserts exactly that: after
+the GC completes, `pg_database` and `pg_roles` carry no row for the claim's
+identifiers. To check it yourself on a real cluster, query the catalog through
+the CloudNativePG primary:
+
+```sh
+PRIMARY=$(kubectl -n cnpg-system get pod \
+  -l cnpg.io/cluster=platform-postgres,role=primary \
+  -o jsonpath='{.items[0].metadata.name}')
+
+kubectl exec "$PRIMARY" -n cnpg-system -- psql -U postgres -tAc \
+  "SELECT 1 FROM pg_database WHERE datname='claim_demo_parser_pg'"   # -> (empty)
+kubectl exec "$PRIMARY" -n cnpg-system -- psql -U postgres -tAc \
+  "SELECT 1 FROM pg_roles WHERE rolname='claim_demo_parser_pg'"      # -> (empty)
+```
+
+The database row clears before the role row, so give these a few cycles. A row
+still present after several is a
 [bug worth reporting](https://github.com/apprafter/apprafter/issues), because
 data you were told was dropped is still on disk.
 

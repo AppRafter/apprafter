@@ -6,7 +6,7 @@ description: "Give an application a Redis-compatible cache or store by declaring
 
 An application declares that it needs Redis, and the platform provisions an
 isolated, Redis-compatible connection for it, publishes the connection details,
-and binds them to the env-vars you name. Removing the dependency retains the
+and binds them to the env-vars you name. Retiring the application retains the
 data for seven days before flushing it.
 
 Each application gets its own logical database on a shared pool, walled off
@@ -134,26 +134,46 @@ whether your application picked the connection up.
 
 ## Remove the dependency
 
-Drop the `needs.redis` block from the manifest and push. The claim goes with
-it, and so does the connection Secret — but **the data and the credential are
-kept for seven days**, then flushed automatically.
+**Dropping the `needs.redis` block from the manifest does not take effect on
+push.** Removing a declared dependency is classified as a destructive change,
+so the platform holds it: the application pauses at
+`AwaitingMigrationApproval`, the previously-applied spec keeps running, and
+nothing is torn down until you approve the change.
 
-That grace window is the point: removing a dependency by accident, or on a
+```sh
+apprafter migration list
+apprafter migration approve <plan-name>
+```
+
+The approval gate is covered on [Migration plans](migration-plans.md). Remove
+the `env` bindings in the same edit — `claim.redis.*` is generated from the
+`needs` block, so a binding left behind fails `apprafter app validate`.
+
+**To retire the application and start the retention clock, delete it:**
+
+```sh
+apprafter app remove web
+```
+
+That deletes the Argo CD Application, which prunes the AppRafter `Application`
+CR and the claim with it. The connection Secret goes; **the data and the
+credential are kept for seven days**, then flushed automatically.
+
+That grace window is the point: retiring an application by accident, or on a
 branch, does not destroy data. There is no supported way to shorten it, and the
 retention record is deliberately not hand-editable — here it is also what
 reserves the database number, so removing it by hand can hand another
 application a database that still holds retained data.
 
-To remove the whole application instead:
-
-```sh
-apprafter app remove web --keep-data
-```
+`--keep-data` does something different, despite the name: it strips the cascade
+first, so **only** the Argo CD object is deleted and the workload, its
+`Application` CR and its claim all keep running. Use it to hand an application
+off or re-register it elsewhere, not to retire one.
 
 ??? note "Verify independently with kubectl"
 
-    Right after removal — the snapshot exists and the connection Secret is
-    gone, while the data and the credential are kept:
+    Right after `app remove` — the snapshot exists and the connection Secret
+    is gone, while the data and the credential are kept:
 
     ```sh
     kubectl -n apprafter-system get retainedclaim claim-demo-web-redis -o \
@@ -184,6 +204,7 @@ window.
 | The claim never reaches `ready` | the shared instance is not up, or the provisioner errored | Check the pod in `dragonfly-system`, then the operator log: `kubectl -n apprafter-system logs deploy/apprafter-operator`. |
 | `NOPERM` on publish or subscribe | the channel name is not prefixed | Prefix it with `claim.redis.channelPrefix`. Channels are server-wide, so the prefix is what scopes them — see *Two rules* above. |
 | `NOPERM` on an ordinary key operation | the client connected to database 0 instead of the claim's | The DSN carries the database number; a client that ignores it lands on 0, where the credential has no rights. |
+| Every application on the pool starts failing `WRONGPASS` or `NOPERM` at once, shortly after a restart | claim credentials are runtime state on the instance and do not survive one | Nothing to do. The platform re-asserts every claim's credential automatically, within about five minutes. If it persists well past that, check the operator log: `kubectl -n apprafter-system logs deploy/apprafter-operator`. |
 | The application starts but its Redis env-vars are empty or missing | the manifest declares `needs.redis` but binds nothing — nothing is injected automatically | Add both bindings, as above. |
 | Data vanished after a restart | the claim is ephemeral, which is the default | Add `persistent: true` to the need. The claim moves to a persistent instance. |
 
@@ -202,6 +223,6 @@ window.
 ## Cleanup
 
 ```sh
-apprafter app remove web --keep-data
+apprafter app remove web   # the data enters its seven-day window
 apprafter destroy --yes    # every apprafter=true resource in the token's project
 ```
