@@ -26,6 +26,7 @@ is the part worth having later.
 | **D8** | A capacity warning nobody can receive | open |
 | **D9** | There is nothing to roll a moving tag back to | open |
 | **D10** | The applying half of right-sizing has never been observed to apply anything | open — high |
+| **D11** | 584 failures share one catch-all, and the cheap checks run last | open — high |
 
 ## D1. VPA in-place right-sizing has never run: wrong feature-gate name
 
@@ -771,4 +772,143 @@ passes whether they do or not.
 
 A walk that cannot fail is not evidence. Both times the tell was the same —
 an assertion whose success condition is satisfied by the null case.
+
+## D11. 584 failures share one catch-all, and the cheap checks run last
+
+**Opened:** 2026-08-30, from a transcript the project owner hit:
+
+```text
+$ apprafter backup list
+> Backup passphrase: ********
+Error: apprafter::cli::other
+  × spawn restic: No such file or directory (os error 2)
+```
+
+**Status:** OPEN.
+**Severity:** high. Two defects meet in that transcript, and neither is the
+one the error text suggests.
+
+### Part 1 — the taxonomy has been overtaken by the code
+
+`cli/cli-core/src/error.rs` defines 14 variants: 13 typed plus
+`Other(String)`. Every one carries a stable `code(apprafter::*)` and
+multi-line `help(...)` — **diagnostic coverage is 100%**. The gap is not
+variants without help; it is failures without a variant.
+
+Measured across the operator-facing crates (excluding `docsgen`, `tests/`
+and `#[cfg(test)]` blocks):
+
+| | |
+| --- | --- |
+| `CliError::Other` construction sites | **584** |
+| production source files | 112 |
+| files that construct the catch-all | 57 |
+| files that construct a typed variant | ~8 |
+| backup + restore subsystem | **181 catch-alls, zero typed variants** |
+
+The two variants that exist for exactly the right purpose —
+`ProviderApiUnreachable` and `ProviderTokenRejected` — are wired into **two
+call sites each**, both on the `target add` ping. Every other provider
+transport failure (DNS, TLS, refused, proxy, timeout) is one of 17
+identical `transport error talking to {endpoint}` catch-alls.
+
+There is no typed variant for: a missing external binary other than `cue`;
+any `kubectl` / `helm` / `restic` subprocess failure; cluster reachability,
+RBAC, or a missing CRD; prompt cancellation or a non-TTY shell; a missing
+Kubernetes object; or anything at all in backup and restore.
+
+**The clearest single symptom:** `docs/operator-guide/quickstart.md` documents
+the catch-all string as expected output — *"Without `kubectl`, `apprafter`
+fails with `× spawn kubectl: No such file or directory (os error 2)`"*. When a
+documented UX is a catch-all error, the taxonomy has stopped describing the
+product.
+
+### Part 2 — the cheap check runs after the expensive step
+
+The reported transcript is not only an untyped error. **The operator typed a
+secret into a command that could not have worked**, because the passphrase
+prompt runs before anything checks that `restic` exists. Ordered by what the
+inversion costs:
+
+1. **`restore --reprovision`** — the sharpest, because the instinct was
+   right and stopped one rung too high. Credentials *are* gated first,
+   deliberately, with a comment at `restore.rs:126-133`: "a bad passphrase
+   must not leave a freshly re-provisioned cluster half-restored." It gates
+   the passphrase and not the binary. The `Reprovision` step then runs a full
+   billable Hetzner provision plus bootstrap, and the first `restic` spawn
+   happens in the step after it — so a missing binary costs a paid, running
+   cluster before anyone notices.
+2. **`bootstrap-all`** — phase 1/3 creates billable resources; phase 3/3 is
+   the first code to need `helm`, and performs no binary preflight. The
+   provider layer already learned this exact lesson one level down
+   (`provider.rs:301-334` validates the SKU against the live catalogue before
+   any create, because "a retired type here used to fail mid-apply at step 4,
+   leaking SSH-key + network + firewall state").
+3. **`repo creds add`** — the wizard collects a friendly name, URL prefix,
+   auth type, username and finally a **production PAT**, then discovers a
+   duplicate name, an absent kubectl, an unreachable cluster or a missing
+   sealed-secrets controller. `rotate`, in the same file, resolves the cluster
+   first: the correct pattern is a sibling function away.
+4. **`backup create`** — prompt, then kubeconfig, then kubectl, then restic.
+   An operator with no cluster types a secret and is then told there is no
+   cluster.
+5. **`backup list`** — the reported case.
+6. **`backup prune` / `check` / `unlock`** — all three round-trip to the
+   cluster before spawning restic, and `check`/`unlock` are explicitly built
+   to work with `--repo` and no cluster at all, because verifying a repository
+   happens when the cluster is gone. These are the outage commands; the
+   missing-binary check matters more there, not less.
+7. **`doctor`** — inverted the other way. With no active target it returns a
+   catch-all at `doctor.rs:183` and never reaches `build_env_checks()`, so a
+   first-run user — the audience its own module docstring names — is told
+   nothing about kubectl, helm, ssh or DNS. The environment half depends on no
+   target and should always print.
+
+### Part 3 — `doctor` does not cover what the CLI needs
+
+| binary | spawn sites | fatal | doctor checks |
+| --- | --- | --- | --- |
+| `kubectl` | 36 | yes | yes — **WARN only** |
+| `restic` | 8 | yes | **no** |
+| `git` | 7 (3 fatal) | partly | **no** |
+| `helm` | — | yes | yes — WARN only |
+
+**A missing `kubectl` exits 0.** `check_tool` returns a WARN, `has_failures()`
+counts only FAIL, so `doctor` prints *"Ready to go; review warnings if they
+apply to your use case"* — while the quickstart calls kubectl and helm "not
+optional". A unit test pins the WARN behaviour; nothing asserts a FAIL. The
+inline justification is a developer-workflow argument applied to an
+operator-facing tool.
+
+`restic` is worse than unchecked: it is absent from the quickstart's
+prerequisites entirely, while `kubectl` and `helm` are named. A good preflight
+exists — `preflight_restic_version` at `backup.rs:2142`, which even has a
+`NotFound` branch — and is called from exactly one command, `backup enable`.
+
+### The fix
+
+Three moves, in this order, because each makes the next cheaper:
+
+1. **`preflight_tool(...)` at the top of every command that spawns one**,
+   before any prompt, any cluster round-trip and any billable step. This is
+   the whole of the reported bug and it is mechanical: the check exists, it is
+   simply not called. Ship it with a test that asserts, per command, that no
+   prompt or provider call precedes it.
+2. **`ExternalToolNotFound { tool, needed_by, min_version }`**, code
+   `apprafter::env::tool_not_found`, with install lines per platform and the
+   sentence that matters after a prompt: *nothing was sent anywhere and no
+   passphrase was used*. Then promote the two recurring subprocess families —
+   a `Kubectl` variant with a stderr classifier for the three shapes that
+   actually recur (unreachable / forbidden / CRD missing), and a `Restic`
+   variant that separates a wrong passphrase from a broken repository, since
+   today both are one raw-stderr catch-all.
+3. **Make `doctor` load-bearing**: FAIL rather than WARN for a binary the CLI
+   cannot work without, add `restic` and `git`, run the environment half
+   unconditionally, and derive the checked list from the binaries the CLI
+   actually spawns so a new dependency cannot be added without appearing
+   there.
+
+584 is not a number to drive to zero. The catch-all is the right home for a
+genuinely one-off failure; what it is not is the right home for the six
+commands on the disaster-recovery path.
 
