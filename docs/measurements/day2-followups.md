@@ -581,15 +581,137 @@ anyway.
    seconds before a restart. The failure mode collapses from "every tenant,
    every restart, up to five minutes" to "one just-created claim, rarely".
 
-Upstream supports the rules the platform needs in file form:
-`LoadToRegistryFromFile` parses each line with `ParseAclSetUser`, the same
-parser `ACL SETUSER` uses, so `$N`, `~*` and `&user:*` all work by
-construction. A live confirm on the pinned image is a confirmation, not an
-investigation.
+### Verified 2026-08-30 — ADR 0042's revisit condition is met
 
-Ships with: a walk step that restarts the pool instance and asserts a tenant
-can still authenticate immediately afterwards. No current walk restarts an
-instance, which is why this was never caught.
+ADR 0042 rejected this design twice, at `:25` ("conflicting signals on whether
+that file can carry key/channel patterns") and at `:152` as a named alternative:
+*"Dragonfly's ACL-file support for key/channel patterns is ambiguous … Revisit
+if file-based ACLs are officially confirmed."* An audit against upstream source
+at the pinned versions resolves the ambiguity. **So this is ADR-first work: the
+0042 amendment comes before the code.**
+
+**The parser is the same one.** At dragonfly `v1.37.0`,
+`AclFamily::LoadToRegistryFromFile` (`acl_family.cc:289`) parses each line with
+`ParseAclSetUser` (`:318`) — one definition (`:1056-1156`), exactly two call
+sites, the other being `AclFamily::SetUser` (`:142`), which backs runtime
+`ACL SETUSER`. Both file entry points route through it: startup `Load()`
+(`:355-357`) and the runtime `ACL LOAD` command (`:361-368`). There is no
+separate, weaker file parser. `$N`, `~*`, `&user:*`, `resetkeys` and
+`resetchannels` therefore parse identically in both paths.
+
+**Three qualifications that "identical by construction" glosses over.**
+
+1. The file path adds a layer with no runtime counterpart:
+   `MaterializeFileContents` (`:701-722`) splits on `\n` then on a **single
+   space**, and requires every non-empty line to begin with the literal token
+   `USER` and carry at least four tokens. So the file grammar is
+   `USER <name> <rules…>`, and double spaces or a tab are a malformed line, not
+   whitespace. The builder must emit exactly single-space-joined lines, and the
+   byte-comparison test in step 1 below has to compare against *that* form, not
+   against the `SETUSER` argv.
+2. File mode passes `hashed=true`, which only **adds** the `#<sha256hex>`
+   password form; our `>plaintext` form is unaffected (`:822`, the `>` branch is
+   unconditional). Safe direction. Noted only because if we ever pre-hash, an
+   invalid hex string is not an error — `user.cc:92-102` logs and inserts no
+   password, silently yielding a user with no credential.
+3. Runtime additionally passes the existing user's `has_all_keys`; the file path
+   takes the default. Affects only the "pattern after `*`" guard
+   (`:1072-1078`), which our vector does not trip.
+
+**`aclFromSecret` exists and is usable, with one trap.** At dragonfly-operator
+`v1.5.0` (`api/v1alpha1/dragonfly_types.go:56-59`) it is a
+`corev1.SecretKeySelector` — Secret name plus a **caller-chosen key**. The
+operator (`internal/resources/resources.go:191-213`) turns it into a Secret
+volume `dragonfly-acl`, projects the chosen key to the filename
+`dragonfly.acl`, mounts it at `/var/lib/dragonfly`, and appends
+`--aclfile=/var/lib/dragonfly/dragonfly.acl` itself.
+
+The trap: **`optional` is accepted by the CRD schema and silently ignored** —
+`resources.go:195-204` never sets `SecretVolumeSource.Optional`, so it stays
+nil, which means *required*. A CR whose `aclFromSecret` names a Secret that does
+not exist yet gives a pod that cannot start. **The Secret must be written before
+the CR gains the field**, and `provision_dragonfly`'s current ordering must be
+checked against that.
+
+Also worth pinning down separately: the Dragonfly **server** image is not
+pinned by this platform at all. `dragonfly_object` emits no `spec.image`, the
+chart's `dragonflyImage` default is empty and platform-stack does not override
+it, so the tag resolves to the operator's compiled-in
+`internal/resources/version.go` default, today `v1.37.0`. Every ACL fact above
+is a fact about a tag we do not control.
+
+### The concurrency risk, corrected
+
+An earlier draft of this entry treated "derive the whole file from a fresh LIST"
+as sufficient. It is not, and the reason is specific.
+
+The provisioner reconcile (`main.rs:247`) and the ACL resync loop
+(`main.rs:287`) are **separate tokio tasks**. The 2.6 dbnum allocator race —
+commit `7890d9e`, which caused a real isolation breach — was fixed by
+**serialisation, not atomicity**: a single added line,
+`.with_config(ControllerConfig::default().concurrency(1))`. That serialises the
+controller against itself. It does **not** serialise the controller against the
+resync loop, so these two writers do race.
+
+And the dominant window is not a stale snapshot. `claims_to_repin`
+(`acl_reconcile.rs:94-125`) requires `status.ready == true`, while the ACL user
+is created at `reconcile.rs:655-657` — **before** the terminal ready apply at
+`:704`. So a concurrent whole-file derivation drops the in-flight claim's line
+*even if it LISTs strictly after the provisioner wrote the file*. A
+resourceVersion precondition does not close that; the filter does not see the
+claim yet.
+
+The damage is also delayed and therefore hard to catch: a dropped line breaks
+nothing at the time, because the user is alive in memory. It breaks at the next
+restart, arbitrarily later, for reasons that look unrelated.
+
+Nor can per-key SSA ownership save us — `Secret.data` is a granular map under
+SSA, but `aclFromSecret` selects **one key** projected to one file, so the whole
+file is a single key with a single owner.
+
+The design that survives this: **one writer.** The resync loop owns the file;
+`provision_dragonfly` and `gc_drop_dragonfly` keep doing their imperative
+`ACL SETUSER` / `DELUSER` and do not touch the Secret. Durability then lags
+liveness by at most one tick, which is the correct tradeoff — the file is the
+restart-survival mechanism, not the grant mechanism. `ACL LOAD` being available
+is a bonus the loop can use to converge a running instance to the file.
+
+### The e2e story, corrected
+
+An earlier version of this entry said: *"Ships with a walk step that restarts
+the pool instance … No current walk restarts an instance, which is why this was
+never caught."* **The second sentence is false**, and the truth is more
+interesting.
+
+`e2e/needs-redis-walk.sh` restarts a Dragonfly pool instance **twice**, by
+deterministic StatefulSet pod name — `:1203` kills the ephemeral instance in
+Phase 9 and `:1307` the persistent one in Phase 10 (added 2026-06-05 in
+`cf398e3`). Phase 9 then asserts a tenant re-authenticates after the restart.
+
+It asserts it with a **420-second deadline** (`:1218-1231` — one
+`RESYNC_INTERVAL` plus slack), under a comment at `:1193-1194` that ratifies the
+outage in so many words:
+
+> the transient failure window between Ready and re-pin is racy, so we do not
+> assert it; eventual recovery is the acceptance criterion
+
+So the defect is not uncovered by the walk. **It is codified as passing by it.**
+The walk saw the outage, decided it was acceptable, and wrote that decision into
+the assertion — which is the third instance in this file of the same shape, after
+D1's `[ "$REQ" = "$RECO" ]` and D3's test pinning the stale help text.
+
+The delta is therefore one word, not one step: Phase 9's assertion tightens from
+*recovers within 420s* to *never lost authentication at all* — poll `PING` as
+the tenant across the restart and require no `NOAUTH`/`WRONGPASS` window beyond
+the pod's own unreadiness. Phase 10 gets the same for the persistent instance,
+where the sharpest form lives: the keyspace comes back from the snapshot and the
+ACL table does not, so the tenant is locked out of data that is intact.
+
+Ships with: the ADR 0042 amendment; the tightened Phase 9/10 assertions; a test
+that the file line and the `SETUSER` argv are the same grant; and an assertion
+that the provisioner can still reach the instance as `default` after the file is
+in place — the lockout in step 2 above is the one failure here that has no
+recovery short of deleting the CR.
 
 ## D6. Rotating a secret does not take effect until something else restarts the pods
 
