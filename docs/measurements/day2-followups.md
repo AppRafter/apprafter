@@ -931,13 +931,6 @@ first-class answer, so the guide reached for `kubectl get sealedsecrets
 This is not the platform declining to own something. It is the platform raising
 a question and then having no way to answer it.
 
-**The demand was already recorded once.** ADR 0057's 2.19h amendment predicted
-that the sealed-secrets guide would be unable to say what is sealed and in which
-namespace without such a listing, and the 2.19j walk observed exactly that,
-noting the guide answers both through `kubectl` — "honest, but a `kubectl`
-answer on a page whose whole subject is a first-class CLI task". This is the
-second observation of the same gap.
-
 ### Why it bites so often
 
 `secret seal` and `secret remove` both default `--namespace` to
@@ -947,16 +940,67 @@ single most likely way to arrive at `EnvSecretMissing` — and sealed secrets ar
 namespace-bound, so the recovery is to re-seal rather than move. The one mistake
 the default invites is the one the CLI cannot help diagnose.
 
-### The fix
+### The message is not ambiguous by necessity — the operator throws the answer away
 
-A listing subcommand under `apprafter secret`, with an all-namespaces flag,
-printing name, namespace and **key names** — never values — is enough to answer both questions and to collapse the
-whole "telling a wrong namespace from a wrong key" section into one command.
+This entry originally called the condition message "deliberately ambiguous",
+which implies a reason. There isn't one. `check_env_secret_refs`
+(`operator-controllers/application/src/lib.rs:1553-1578`) **has both facts in
+hand and discards the distinction**:
 
-Worth pairing with a smaller change that removes the need for it: have
-`app status` name the resolved namespace it looked in when it reports
-`EnvSecretMissing`, so the ambiguous half of the message becomes concrete
-without a second command at all.
+```rust
+let exists = match api.get_opt(secret_name).await? {
+    Some(secret) => { /* … key present in data or string_data? … */ }
+    None => false,          // ← the Secret does not exist
+};
+if !exists {
+    missing.push(format!(
+        "env {} → secret \"{}/{}\": Secret \"{}\" not found or missing key \"{}\"",
+        …
+    ));
+}
+```
+
+The `None` arm and the failed key lookup are two different answers collapsed
+into one `bool`, and then reported as "not found **or** missing key". The
+namespace is in scope on the line above and is not named either, even though
+sealing into the wrong namespace is the most likely way to get here.
+
+So the first fix is not a new command. It is naming what the code already
+knows.
+
+### One index, read in two directions
+
+The second question — *which secrets does this application consume* — is the
+same lookup D6 and D14 need, read the other way round:
+
+| direction | question | needed by |
+| --- | --- | --- |
+| app → secrets | which secrets does this app resolve, and do they exist? | **D7** (diagnosis) |
+| secret → apps | which apps resolve this secret, and are they on an older revision? | **D6** (blast radius), **D14** (disclosure) |
+
+Neither direction exists today. Both fall out of a single pass — LIST
+Applications, scan each `env` for `EnvValue::Ref(EnvRef::Secret(_))` — which the
+operator is already positioned to do, since it watches every Application anyway.
+Building one direction and not the other would be the waste.
+
+### The fix, cheapest first
+
+1. **Name the cause and the namespace** in the `EnvSecretMissing` message. Two
+   lines in `check_env_secret_refs`, and it removes the need for a second
+   command in the common case entirely. Carries the operator release chain.
+2. **A listing subcommand** under `apprafter secret` — name, namespace and
+   **key names, never values** — with an all-namespaces flag. Answers "what is
+   sealed and where" *before* an error rather than after, and collapses the
+   guide's "telling a wrong namespace from a wrong key" section into one
+   command. CLI-only.
+3. **Both directions of the index**, surfaced where each is asked: the app→secrets
+   view in `app status`, the secret→apps view at the point of sealing (D6) and in
+   whatever discloses a seal (D14).
+
+**The demand was already recorded twice before this entry.** ADR 0057's 2.19h
+amendment predicted the guide would be unable to say what is sealed and in which
+namespace; the 2.19j walk observed exactly that. Counting this entry, three
+independent observations of one missing verb.
 
 ## D8. A capacity warning nobody can receive
 
