@@ -28,6 +28,7 @@ is the part worth having later.
 | **D10** | The applying half of right-sizing has never been observed to apply anything | open — high |
 | **D11** | 584 failures share one catch-all, and the cheap checks run last | open — high |
 | **D12** | Removing `expose` leaves the Service behind | open — medium |
+| **D13** | A registry credential copy that nothing ever reclaims | open — high, security |
 
 ## D1. VPA in-place right-sizing has never run: wrong feature-gate name
 
@@ -409,43 +410,92 @@ deletes.** A finalizer should be an optimisation layered on top of ownership;
 here it is the only path, and it is driven by somebody else's code.
 
 The consequence is that removal is not a property of the reconcile loop at all.
-It is handled per-child, ad hoc, by whoever was last bitten — which is why the
-count is what it is:
+It is handled per-child, one child at a time. The Application controller can
+create **eight** kinds; here is where each stands:
 
-| child of `Application` | created when | pruned when undeclared |
+| child of `Application` | created when | removed when no longer wanted |
 | --- | --- | --- |
 | Deployment | always | n/a — always desired |
-| Service | `expose` is set | **no** — see D12 |
-| CiliumNetworkPolicy | Cilium present | **no** (`lib.rs:737`, no `else`) |
-| HTTPRoute | `expose.network: public` | yes — `prune_http_route`, added 1.83b |
-| VerticalPodAutoscaler | managed env | yes — `prune_vpa`, added 2.16e |
+| Service | `expose` is set | **no** — D12 |
+| CiliumNetworkPolicy | Cilium present | **no** (`lib.rs:736-740`, no `else`) |
+| HTTPRoute | `expose.network: public` | yes — `prune_http_route` (1.83b) |
+| VerticalPodAutoscaler | managed env | yes — `prune_vpa` (2.16e) |
 | ResourceClaim | each `needs.*` entry | **no** — this defect |
+| MigrationPlan | a gated change | yes — LIST-driven, `lib.rs:1974-1995` |
+| pull-secret `Secret` copy | private image | **no**, and no ownerRef — D13 |
 
-Both prune arms were added reactively, with the feature that first exposed the
-staleness. Neither generalised, because neither could: they are single
-`delete(name)` calls that work only because HTTPRoute and VPA are **singletons
-at a name derived from the app's name**. Claims are a **set of variable size
-with data-dependent names** (`<app>-<type>[-<name>]`), so the same trick does
-not reach them — removing an unwanted claim requires first knowing which claims
-exist, and the loop performs no LIST of anything.
+**Neither prune arm was reactive.** This was the investigation's most
+uncomfortable finding, and it moves the diagnosis: this is not a class nobody
+thought of.
 
-Note also what the controller calls the claims it fetched (`lib.rs:513-517`):
-the variable is named `current`, and it is built by GETting exactly the names
-`generate_resource_claims` just produced from the new manifest. It is the
-desired set wearing the name of the live set. A claim whose need was removed is
-not merely un-deleted; it is **unobservable** — no code path in the controller
-could learn it exists.
+- `prune_http_route` shipped in the **same commit** as the apply it balances
+  (3abd6d7, 1.83b, 2026-06-13 — `git log -S"apply_http_route"` returns that one
+  commit), pre-specified in the design doc written that morning.
+- `prune_vpa` was pre-specified even harder: filed as hazard **H7** by external
+  design review round R2, written into a locked decision, and supplied verbatim
+  as a fenced Rust block in the plan's Task 4 — the shipped function is
+  character-for-character the planned one.
+
+And 2.16e's spec states the rule **in the abstract**, quoting the doc-comment it
+wanted copied: *"on the exact precedent of `prune_http_route` … same 404-is-OK
+shape + doc-comment '**child must disappear when the app stops qualifying**'"*.
+
+So the general rule was written down, twice, five months apart, by two different
+reviews — and applied each time to exactly the one child in front of the author.
+That is the process failure, and it is not inattention. It is that **nothing in
+the repository holds the rule**: it lived in two design documents and one
+doc-comment, none of which any later change is obliged to read.
+
+Two mechanical facts about why the existing arms could not have spread on their
+own. Both prune arms are single `delete(name)` calls against a **singleton at a
+name derived from the app's name**; claims are a **set of variable size with
+data-dependent names** (`<app>-<type>[-<name>]`), so the shape does not reach
+them. But that is only an argument about reuse, not an excuse: the Service is a
+singleton at a fixed name with `delete` already in its RBAC, and it has no arm
+either (D12). The discriminator is not difficulty.
+
+### What the controller does and does not see
+
+An earlier version of this entry said the orphan is *unobservable*. That is
+wrong, and the truth is worse.
+
+The controller process **does** watch every ResourceClaim in the cluster:
+`lib.rs:145` builds `Api::<ResourceClaim>::all(...)` and `:162` passes it to
+`.owns(claims, watcher::Config::default())`. kube-runtime maps an owned object
+back to its owner through `metadata.ownerReferences`, and the orphan still
+carries the controlling ownerRef the operator stamped on it, pointing at a
+still-live Application. **The orphan's own events therefore re-enqueue its owning
+Application.** The operator wakes up *because of* the orphan.
+
+What is discarded is the observation. `Controller::run` hands `reconcile` only
+the `Arc<Application>`, and every live-side read in the reconcile body is
+**name-addressed off the projected desired state** — `claim_api.get(claim_name)`
+(`:517`), `api.get_opt(&name)` in `apply_deployment` (`:1003`), the VPA read at
+`:865`. The correct statement is: *the reconcile body never reads a child it did
+not just render*. Note what the variable is called at `:513-517` — `current`,
+built by GETting exactly the names `generate_resource_claims` just produced. It
+is the desired set wearing the name of the live set.
 
 ### The fix
 
-The same reconcile already prunes two of its five optional children —
-`prune_http_route` (`lib.rs:758`) and `prune_vpa` (`lib.rs:784`). A third arm in
-that shape is the minimum that closes this entry, but the table above is the
-argument for not stopping there: the generic form is to LIST the children this
+Not "a third prune arm in the same shape" — that phrasing was in an earlier
+version of this entry and it will not work. `has_needs` (`lib.rs:504-505`) gates
+the entire needs block on the NEW spec, so removing the **last** need skips the
+block wholesale and any `else` arm inside it never runs. The prune must sit
+outside that gate.
+
+The generic form is what the ownership principle asks for: LIST the children this
 Application owns and delete those absent from the desired set. Generated claims
-carry no labels today (only name, namespace and `ownerReferences`), so the
-selector is the owner UID rather than a label — which is fine, and is the same
-predicate `list_resource_claims_for_app` already uses.
+carry no labels (only name, namespace, `ownerReferences`), so the predicate is
+the owner UID — the same one `list_resource_claims_for_app` already uses, and the
+same one the `.owns()` watch is already routing on. Four LIST-then-delete sites
+exist in the operator to copy from, of which `platform-stack/src/reconcile.rs:685-696`
+is the only one that computes a real keep-set at runtime; `delete_all_key_plans_except`
+(`application/src/lib.rs:1974-1995`, pure filter at `:2304-2324`) is the closest
+in-crate model.
+
+Ships with: the missing `delete` verb on `resourceclaims` in `rbac.yaml`; the
+ordering constraint below; and the walk step.
 
 Ordering matters and is the whole risk: the delete must happen only after the
 plan is approved and the new spec applied, so an unapproved edit cannot destroy
@@ -1000,17 +1050,37 @@ existed.
 
 ### Why this one is the clearest evidence for D4's root cause
 
-The doc comment on `prune_http_route` (`lib.rs:1173`) names the triggering
-scenario in its own words:
+An earlier version of this section said the Service "was left behind" because
+the fix was scoped to the incident. The archaeology found something sharper, in
+two documents that contradict each other.
 
-> `public → internal`, or removed `expose`). 404-tolerant …
+**The 1.83b design spec asserted the Service already prunes.** From
+`docs/superpowers/specs/2026-06-13-1-83b-app-public-ingress-design.md:67`:
 
-The author of the prune arm **reasoned explicitly about `expose` being
-removed**, and pruned the HTTPRoute for it. The Service is rendered from that
-same `expose` field, and is applied two blocks earlier in the same function. It
-was left behind — not because removal was overlooked, but because the fix was
-scoped to the incident (a stale public route, found in 1.83b) rather than to the
-relation. That is the whole of D4's diagnosis, visible in a single comment.
+> When `network != "public"` (or unset) the controller does **not** apply an
+> HTTPRoute and **prunes** any stale one (the app flipped public → internal) —
+> **same prune discipline the Service already follows**.
+
+It does not follow it. It never has.
+
+**The implementer discovered that, wrote it down, and shipped anyway.** The
+doc-comment on `prune_http_route` (`lib.rs:1171-1176`) is that discovery:
+
+> Best-effort delete of a stale `HTTPRoute` named `name` (the app flipped
+> `public → internal`, or removed `expose`). 404-tolerant … 1.83b — **the
+> Service has no analogous prune**, but the design requires the route disappears
+> when the app stops being public.
+
+So the comment is a tombstone. Somebody checked the spec's premise, found it
+false, recorded the finding in the one place nobody re-reads, and closed the
+subphase. The Service already has `delete` in its RBAC
+(`rbac.yaml:118-126`) — nothing blocked the six-line fix except that it was not
+the thing being shipped that day.
+
+This is D4's diagnosis in miniature, and it is the strongest argument in this
+file for making the rule mechanical rather than documentary. The rule was in a
+spec. The violation was in a comment. Both were true, both were visible, and
+seventy-eight days later the Service is still there.
 
 The CiliumNetworkPolicy at `lib.rs:737` has the same missing `else`. It is far
 lower risk — the controller always threads `needs_targets`, so
@@ -1031,4 +1101,76 @@ also the first time this operator will remove a networking object a user might
 still have DNS or callers pointed at. The delete belongs behind the same
 destructive-change gate as a `needs` removal if `expose` removal is classified
 destructive; check `is_destructive` before assuming it is not.
+
+## D13. A registry credential copy that nothing ever reclaims
+
+**Opened:** 2026-08-30, from the same ownership audit that produced D12 — this
+is the third and worst instance of the class.
+
+**Status:** OPEN.
+**Severity:** high, security. A registry credential written into an application
+namespace survives the removal of the private image, the deletion of the
+Application, **and** the deletion of the `SourceCredential` it came from. Only
+deleting the namespace reclaims it.
+
+### What is wrong
+
+`apply_pull_secret_copy` (`operator-controllers/application/src/lib.rs:1583-1604`)
+projects the SourceCredential's derived `dockerconfigjson` into the app's
+namespace so the kubelet can pull:
+
+```rust
+"metadata": {
+    "name": name,
+    "namespace": namespace,
+    "labels": { "apprafter.io/managed-by": "apprafter" }
+},
+"type": "kubernetes.io/dockerconfigjson",
+```
+
+There is **no `ownerReferences` key at all**. Every other child this controller
+writes carries a controlling ownerRef; this one carries a label and nothing
+else. So unlike D4 and D12 — where the apiserver cascade at least covers
+Application deletion — this Secret is not reclaimed even then.
+
+Nor does the SourceCredential side reclaim it. `gc_derived_secrets`
+(`sourcecredential/src/lib.rs:605-627`) runs on the credential's finalizer path
+and deletes by `{SOURCE_CREDENTIAL_LABEL}={name}` — **a different label**, which
+the copy does not carry — across `ARGOCD_NAMESPACE` and the credential's own
+namespace, **neither of which is the app namespace** the copy was written to.
+Two misses, independently sufficient.
+
+### Why it probably happened, and why the naive fix is wrong
+
+The copy is named `app_pull_secret_name(&cred_name)` — **after the credential,
+not after the Application** (`lib.rs:1462`). It is therefore shared by every app
+in that namespace pulling through the same credential. Adding a controlling
+ownerRef to one Application would be actively harmful: deleting that app would
+cascade-delete a Secret its neighbours still need, and their pods would start
+failing `ImagePullBackOff` on the next node reschedule.
+
+That is very likely the reasoning that left the ownerRef off — and it is sound
+as far as it goes. What is missing is the other half: having correctly decided
+that no single Application owns this object, nobody assigned it an owner at all.
+A shared child needs a **reference count or a sweep**, not an ownerRef, and it
+got neither.
+
+### The fix
+
+Two shapes, and the choice is a real one:
+
+1. **Namespace sweep** — after the reconcile, LIST Secrets in the namespace
+   carrying `apprafter.io/managed-by: apprafter` and typed
+   `kubernetes.io/dockerconfigjson`, and delete any that no Deployment in that
+   namespace references via `imagePullSecrets`. Keeps sharing, costs one LIST.
+2. **Per-app copies** — name the copy after the Application and give it a
+   controlling ownerRef, restoring the cascade and letting D4's generic
+   owned-children diff cover it for free. Costs one Secret per app per
+   credential instead of one per credential.
+
+(2) is the smaller change to reason about and folds this defect into D4's fix
+rather than adding a fourth special case; (1) avoids duplicating credential
+material. Either way it ships with a test that deletes an Application and
+asserts no `dockerconfigjson` Secret survives in its namespace — which is the
+assertion that would have caught all three of D4, D12 and D13.
 
