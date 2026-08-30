@@ -20,50 +20,18 @@ set of hints the platform refines. Writing it is how you say "I own
 these numbers", and the automatic correction stops for that
 application.
 
-!!! warning "Before platform-stack 0.2.56, right-sizing corrected nothing"
+!!! note "On a cluster older than platform-stack 0.2.56, nothing is applied"
 
-    Check which side of this you are on before reading further:
+    Recommendations were computed and reported, but the two components that
+    change a pod never started — so every reading surface on this page worked
+    while nothing acted on it. `apprafter platform status` tells you which
+    side of 0.2.56 your cluster is on.
 
-    ```sh
-    kubectl -n vpa get pods          # all three Running → it applies
-    apprafter platform status        # the platform version this cluster is on
-    ```
-
-    The autoscaler ships in three parts. The **recommender** always ran:
-    recommendations were computed, written to the `VerticalPodAutoscaler`
-    and mirrored onto your application's status, so everything under
-    [Seeing what it decided](#seeing-what-it-decided) worked. The
-    **updater** and the **admission controller** — the two that actually
-    change a pod — did not start at all. They were passed a feature gate
-    named `InPlaceOrRecreate`; upstream renamed it to `InPlace`, and the
-    pinned version rejects an unknown gate by refusing to start rather
-    than warning. Both Deployments crash-looped from the day the component
-    shipped.
-
-    Nothing failed loudly, and that is the part worth remembering. The
-    mutating webhook is registered `failurePolicy: Ignore` — correct, so a
-    down admission pod cannot deadlock pod creation cluster-wide — so a
-    dead webhook admits pods unchanged instead of rejecting them. The CRDs
-    install from the chart independently of the controllers, so every
-    "is the autoscaler installed?" check that looks for the CRD passed the
-    whole time. Pods were created with the Deployment's seed request and
-    kept it, beside a recommendation saying otherwise.
-
-    That gate was fixed in 0.2.55, which is **yanked** and should not be
-    run: with the controllers finally up, a second unread upstream default
-    surfaced — the recommender's own minimum-recommendation floor of
-    250Mi, which made every application recommend an identical 250Mi
-    regardless of what it actually used, and made the floor in the table
-    below unreachable. **0.2.56 pins that floor** and is the first release
-    on which right-sizing both runs and recommends your application's real
-    numbers.
-
-    **On 0.2.56 and later** the updater applies recommendations in place,
-    without eviction — see
-    [What the platform does when you leave it alone](#what-the-platform-does-when-you-leave-it-alone).
-    **On anything earlier**, read the recommendation and act on it yourself
-    with an explicit `resources` block, and do not plan capacity on the
-    assumption that a request will be corrected upward for you.
+    On anything earlier, read the recommendation and act on it yourself with
+    an explicit `resources` block, and do not plan capacity on the assumption
+    that a request will be corrected upward for you. The defect, and how to
+    tell a dead controller from a healthy quiet one, are in
+    [How it works](../how-it-works/resources-and-autoscaling.md#the-defect-this-diagnosis-exists-for).
 
 The design behind the automatic half is
 [ADR 0054](../adr/0054-vpa-vertical-autoscaling.md);
@@ -212,23 +180,10 @@ summary and the workload underneath, and neither the sync conditions nor
 the operation result are among them, so the rejection text appears
 nowhere in it.
 
-That text is on the Argo CD Application, and `kubectl` is what reads it
-today. Point it at the cluster with `apprafter kubeconfig` if you have
-not already, then ask for the sync conditions — by the **Argo CD
-application name**, which is `<app>` for a base-only deployment and
-`<app>-<env>` for an environment one:
-
-```sh
-kubectl -n argocd get application.argoproj.io reporting \
-    -o jsonpath='{range .status.conditions[*]}{.type}: {.message}{"\n"}{end}'
-```
-
-The `SyncError` line it prints wraps the webhook's own sentence — the one
-quoted above, naming the field and the value: `resources.limits.memory
-value "12x" must be a Kubernetes quantity …`.
-`{.status.operationState.message}` carries the same sentence behind the
-apply-level prefix, and is the one to reach for when the conditions list
-is empty.
+That text is on the Argo CD Application, which the CLI does not read today.
+Reading it takes one `kubectl` command against the sync conditions —
+[How it works](../how-it-works/resources-and-autoscaling.md#reading-a-rejected-manifest)
+has it, with the naming rule for environment deployments.
 
 ## What the platform does when you leave it alone
 
@@ -257,32 +212,12 @@ look — read the pod, as below. (While the updater is down — anything
 before 0.2.56 — the pod reads `32Mi` too; the difference between the two
 only becomes visible once the applying half runs.)
 
-**It only runs where the autoscaler is installed** — and "installed"
-is not one question but two. The CRD being present says the component
-was rendered; it says nothing about whether the three controllers are
-up. Ask both:
-
-```sh
-# 1. Is the component installed at all?
-kubectl get crd verticalpodautoscalers.autoscaling.k8s.io
-
-# 2. Are its controllers actually running? This is the load-bearing one.
-kubectl -n vpa get pods
-```
-
-The second command is the one that tells the truth, and the first is the
-trap. Before platform-stack 0.2.55 the `…-recommender` pod is `Running`
-while the `…-updater` and `…-admission-controller` pods sit in
-`CrashLoopBackOff` — the gate defect in the warning at the top of this
-page. The CRD check passes in exactly that state and always did, which
-is why it cannot be the test. Expect three `Running` pods; anything less
-means recommendations are accruing and nothing is applying them.
-
-```sh
-# Why a controller is down, when it is. The label is stable; the
-# Deployment name carries the Helm release prefix.
-kubectl -n vpa logs -l app.kubernetes.io/component=updater --tail=5
-```
+**It only runs where the autoscaler is installed**, and a cluster can have
+the component rendered while the controllers that apply recommendations are
+down — which looks identical from here, because a recommendation still
+appears. If the numbers below never move, that is the thing to rule out:
+[How it works](../how-it-works/resources-and-autoscaling.md#is-the-applying-half-actually-running)
+has the two readings that separate them.
 
 ## Seeing what it decided
 
@@ -317,26 +252,13 @@ has no autoscaler; the pod has not been observed long enough for a
 recommendation to exist yet; or the autoscaler is not installed on the
 cluster.
 
-To see what is actually in effect right now — the request on the live
-pod, which is what the scheduler reserves for it (and which, until the
-updater runs, is still the `32Mi` the Deployment asked for):
+??? note "Reading the live pod instead"
 
-```sh
-kubectl -n apprafter get pod -l apprafter.io/application=reporting \
-  -o jsonpath='{.items[0].spec.containers[0].resources}'; echo
-```
-
-And the raw recommendation, including the uncapped figure, from the
-autoscaler object itself:
-
-```sh
-kubectl -n apprafter get vpa -l apprafter.io/application=reporting \
-  -o jsonpath='{.items[0].status.recommendation.containerRecommendations[0]}'; echo
-```
-
-Both selectors take the name from your manifest's `metadata.name`.
-Replace `apprafter` with the namespace the application deploys to if it
-is not the default one.
+    `app status` reports the recommendation. What the scheduler has actually
+    reserved is on the pod, and — until the applying half runs — is still the
+    starting request the Deployment asked for. Both raw readings, and why the
+    Deployment permanently disagrees with the pod, are in
+    [How it works](../how-it-works/resources-and-autoscaling.md#the-deployment-and-the-pod-disagree-permanently).
 
 ## When 512Mi is the problem {#when-512mi-is-the-problem}
 
@@ -377,23 +299,10 @@ the container's own memory limit, and for an application with no
 there is no CPU limit to bind first, so `maxAllowed.cpu` really is the
 CPU ceiling.
 
-If you do edit them, three traps: `mode` is required on that object, so
-send it in the same patch; each map replaces the built-in one wholesale,
-so write every key you mean to keep; and **`minAllowed` is authoritative
-only upward.** The autoscaler applies its own minimum-recommendation
-floor *before* this clamp, and the platform pins that floor to the same
-`32Mi` — so raising `minAllowed.memory` above `32Mi` works as you would
-expect, while lowering it below `32Mi` changes nothing and reports no
-error. Recommendations simply stop at `32Mi` either way. (This is the
-defect that platform-stack 0.2.56 fixed, one level up: the floor used to
-sit unpinned at the autoscaler's own default of 250Mi, which put it
-*above* `minAllowed` and made the clamp unreachable in the other
-direction.)
-
-```sh
-kubectl -n apprafter-system patch platformstack default --type=merge \
-  -p '{"spec":{"resources":{"autoscale":{"mode":"full","maxAllowed":{"cpu":"2","memory":"512Mi"}}}}}'
-```
+They are an operator-side knob with three sharp edges, and editing them is
+covered in
+[How it works](../how-it-works/resources-and-autoscaling.md#the-cluster-wide-floors-and-ceilings).
+For the case on this page it is the wrong lever regardless.
 
 ## Turning the automatic behaviour off
 
@@ -423,7 +332,7 @@ using its default. The three modes:
 
 From platform-stack 0.2.56 all three do exactly what the table says. On
 anything earlier all three behave like `off`, because the two components
-that change pods do not start (the warning at the top of this page) —
+that change pods do not start (the note at the top of this page) —
 setting the mode correctly is still worth doing there, since it is what
 the cluster will do the moment it is upgraded.
 

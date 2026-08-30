@@ -71,6 +71,7 @@ const RESTRUCTURED: &[&str] = &[
     "docs/operator-guide/redis.md",
     "docs/operator-guide/persistent-disk.md",
     "docs/operator-guide/egress-policy.md",
+    "docs/dev-guide/resources-and-autoscaling.md",
 ];
 
 #[test]
@@ -79,7 +80,7 @@ fn a_restructured_page_is_silent() {
     // not. Kept as an assertion rather than deleted, because a page
     // going quiet is the evidence the restructure worked, and an
     // assertion that only ever gets removed proves nothing. Before
-    // 2.20c these carried 40, 39, 36 and 21 findings.
+    // 2.20c these carried 40, 39, 36, 21 and 8 findings.
     let found = findings();
     for page in RESTRUCTURED {
         let hits: Vec<_> = found
