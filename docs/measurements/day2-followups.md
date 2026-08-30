@@ -29,6 +29,7 @@ is the part worth having later.
 | **D11** | 584 failures share one catch-all, and the cheap checks run last | open — high |
 | **D12** | Removing `expose` leaves the Service behind | open — medium |
 | **D13** | A registry credential copy that nothing ever reclaims | open — high, security |
+| **D14** | A swapped credential redirects data and passes every gate | open — high, security |
 
 ## D1. VPA in-place right-sizing has never run: wrong feature-gate name
 
@@ -805,16 +806,51 @@ Two facts settle how:
 2. **It requeues every 60s** (`lib.rs:959`). So a content hash is recomputed
    within a minute of any re-seal without needing a Secret watch at all.
 
-That 60-second window **is** the batch. Four seals inside a minute are one
-reconcile and one roll; four seals spread over ten minutes are up to four rolls,
-which is the correct behaviour anyway. Adding a Secret watch would *break* this —
-it would fire once per Secret and reintroduce the fan-out. The absence of the
-watch is the feature here, and the fix should not add one.
+An earlier version of this section called that 60-second window "the batch".
+**It is not, and the correction matters more than the original claim.** The
+window is a coincidence, not a barrier: the requeue can fire between the first
+seal and the second, which is *worse* than either extreme. The app then rolls
+into a configuration that was never an intended state — one new credential and
+two old ones — and for values that must move together (migrating three
+third-party services from a dev contour to a prod one, say) that is a partial
+cutover: production Sentry with a development Stripe key. Nothing about a timer
+can fix this, because the timer does not know where the developer's sequence
+ends.
 
-Note also that `secret seal` already batches within a secret: re-sealing
-**replaces** all keys and does not merge (its own help says so), so every key of
-one secret necessarily moves in a single command. Only the multi-*secret* case
-needs the window above.
+**The atomicity primitive already exists and the docs do not use it.** A
+Kubernetes Secret is written atomically — every key changes in one apiserver
+write — and `secret seal` already *forces* all-of-one-secret at once, since
+re-sealing replaces rather than merges. So values that must switch together
+belong in **one secret with several keys**, not several secrets. The manifest
+syntax already supports it (`secret:"thirdparty/sentry-dsn"`,
+`secret:"thirdparty/stripe-key"`); nothing requires one secret per value, and
+`docs/dev-guide/secrets.md` reads as if it did because its examples happen to be
+single-value. Grouping makes the coordinated cutover atomic by construction,
+with no new machinery and no dependence on a human's timing.
+
+That leaves the ordering question only for values that genuinely cannot share a
+Secret, and the honest answer is that a timer must not be what decides. Two
+requirements pull in opposite directions and one mechanism cannot serve both:
+
+- The **leaked-credential** case wants the roll automatic and immediate.
+  Forgetting is the failure, so it must not depend on memory. This is the case
+  that opened this entry.
+- The **coordinated-cutover** case wants the roll explicit and human-timed.
+  Automatic is the failure, because only the developer knows where the sequence
+  ends.
+
+What makes both safe is neither default but the thing missing underneath: **the
+state is currently invisible in both directions**, which this entry already says
+is its worst property. Stamp the resolved-config hash *and surface it* — pods
+running revision `abc` while the current resolved config is `def` — and the
+automatic mode becomes verifiable rather than hopeful, and an opt-out becomes
+safe to offer. Only then is a per-app `rollout: manual` worth adding, declared
+in the manifest rather than issued as a command, so it stays declarative and
+stays visible. Ship the automatic roll plus the visibility first; add the opt-out
+only if a real case survives grouping.
+
+Adding a Secret *watch* is still the wrong move: it fires once per Secret and
+tightens the fan-out into an even smaller window.
 
 **The roll is not gated behind a MigrationPlan, and must not be.** The sentence
 above about respecting destructive-change gating means the narrow thing: a
@@ -1357,4 +1393,94 @@ rather than adding a fourth special case; (1) avoids duplicating credential
 material. Either way it ships with a test that deletes an Application and
 asserts no `dockerconfigjson` Secret survives in its namespace — which is the
 assertion that would have caught all three of D4, D12 and D13.
+
+## D14. A swapped credential redirects data and passes every gate
+
+**Opened:** 2026-08-30, raised by the project owner while reviewing D6: a secret
+can be replaced with a broken one, or with one belonging to somebody else's
+account of the same service, and nothing gates or records it.
+
+**Status:** OPEN.
+**Severity:** high, security. The availability half is loud and recoverable.
+The exfiltration half is silent and is the one that matters.
+
+### The two threats are not the same
+
+**Availability.** Re-seal a working credential as a broken one and the
+application starts failing. Noisy, attributable by timing, recoverable by
+re-sealing the right value.
+
+**Exfiltration.** Re-seal a credential as the attacker's *own account of the
+same service* — their Sentry DSN, their S3 endpoint and keys, their OTLP
+collector, their webhook URL. The application keeps working perfectly. Nothing
+degrades, no probe fails, `Ready` stays true, and the platform's data begins
+arriving in somebody else's tenancy. Sentry payloads alone carry request bodies,
+user identifiers and stack-local variables.
+
+The second is the whole finding. A credential swap is not a configuration change
+that might break something; it is a **redirection of where data goes**, and it
+is indistinguishable from normal operation by every signal the platform has.
+
+### Why nothing catches it
+
+Four independent misses, each sufficient on its own:
+
+1. **MigrationPlan gates the manifest, and the manifest does not change.** The
+   value `secret:"sentry/dsn"` is byte-identical before and after. No spec diff,
+   no plan, no approval. (The owner's judgement that a rotation should not be
+   plan-gated is correct and is not in tension with this — see the fix.)
+2. **Egress does not constrain the destination.** `EgressProfile`
+   (`operator-core/src/platform_stack.rs:58-66`) has exactly three values —
+   `Internet` (the documented default: DNS + same-ns + `world` + needs),
+   `Internal`, `Strict` — it is **cluster-wide, not per-app**, and none of them
+   name permitted hosts. Under the default profile an application may open a
+   connection to any address on the internet.
+3. **The seal is unattributed.** `apprafter secret seal` writes no annotation
+   recording who sealed it or when — the SealedSecret's `resourceVersion` and
+   whatever the apiserver audit log happens to retain are the entire record.
+4. **Nothing surfaces that it happened.** No condition, no event, no `app
+   status` line says a referenced Secret's contents changed. This is D6's
+   invisibility, seen from the security side rather than the operations side.
+
+The actor here is anyone who can create a SealedSecret in the application's
+namespace — an ordinary developer role, a compromised CI token, or a stolen
+kubeconfig. It does not require cluster-admin.
+
+### The fix is not to gate the secret
+
+Gating a credential change behind an approval is theatre: the reviewer would be
+approving an opaque blob they cannot diff, and it would tax the one operation —
+revoking a leak — that must be fast. That path should be rejected explicitly so
+it is not proposed again.
+
+**The enforceable control is egress allowlisting by destination.** If an
+application's policy names the hosts it may reach, a DSN repointed at
+`attacker.example` is refused by the CNP no matter what the credential says. The
+secret answers *what* we authenticate as; the network policy answers *where the
+data may go*, and only the second can be enforced by the platform. This is
+precisely the tightening ADR 0045 left on the table — the note already sits in
+the chart source at `platform-stack/cue/render_tool.cue:633`, "tighten to
+toFQDNs when the endpoint is known" — plus the DNS-visibility rule at `:614`
+that Cilium requires for `toFQDNs` to resolve at all.
+
+That is a real piece of work: per-application declared destinations (a `network`
+or `egress` block naming FQDNs), rendered into `toFQDNs` rules alongside today's
+per-need rules, with the cluster profile remaining the floor. It also pays for
+itself well beyond this threat — it is the difference between "this app can
+reach the internet" and "this app can reach Stripe and Sentry".
+
+Cheap and worth doing regardless, because neither stops a determined insider but
+both turn a silent redirect into a recorded one:
+
+- **Attribution on the seal** — stamp who and when as annotations on the
+  SealedSecret, and make `secret seal` refuse to overwrite without `--yes` in a
+  non-interactive shell (it already does the latter).
+- **Surface the change** — the resolved-config hash from D6, plus an event when
+  a referenced Secret's contents change, so an application owner can see that
+  something they did not do happened to their configuration.
+
+Ships with: the D6 hash and status surface (shared); a decision recorded in an
+ADR on whether per-app FQDN egress lands before launch; and a walk step that
+asserts an application under a destination-restricted profile cannot reach a
+host outside its declared set.
 
