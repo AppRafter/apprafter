@@ -763,6 +763,68 @@ Secret's `resourceVersion`, or an unrelated write to the Secret rolls every
 application referencing it. And the roll must respect the same destructive-change
 gating everything else does, so a rotation cannot bypass a MigrationPlan.
 
+### What this is not: there is no rotation feature
+
+The title says "rotating a secret", which overstates what exists. There is no
+`apprafter secret rotate` verb and no rotation policy. The CLI ships `seal`
+(create-or-replace) and `remove`; "rotation" is a developer re-sealing the same
+name with a new value. So this entry is the **propagation leg of an explicit
+re-seal**, not a half-built feature.
+
+The only `rotate` in the tree is `apprafter repo creds rotate`, which re-seals a
+SourceCredential's token. Whether *that* propagates is a separate question —
+Argo CD's repo-server may read credentials per-operation rather than at start —
+and is worth checking rather than assuming.
+
+**The platform-owned half is unbuilt and tracked elsewhere.** `plan.md` 2.16a
+("Per-claim password rotation", all boxes unchecked, pulled into launch as SR:A
+off the 2.4g walk) records that a claim role's password is generated **only on
+(re)provision** — `should_provision` is false once the claim is ready — so it is
+**static for the entire life of the claim**. That is the generation gap; this
+entry is the propagation gap. Both are needed and they are different fixes.
+
+**And 2.16a's acceptance criterion is wrong for the same reason this entry
+exists.** It reads, in translation: *"the application keeps connecting (it
+re-reads the updated Secret)"*. A pod does not re-read a Secret consumed as an
+environment variable — `valueFrom.secretKeyRef` is resolved once at pod start
+and never again (only *volume*-mounted Secrets are refreshed by the kubelet),
+and ADR 0046's renderer emits exactly `EnvVar{valueFrom: secretKeyRef}`. So
+2.16a as planned would rotate the credential in the database and leave every
+running pod authenticating with the old one — silently, in the same way this
+entry describes. **This fix is a prerequisite for 2.16a**, and 2.16a's
+acceptance line needs correcting before it is built.
+
+### Batching: the decoupling already exists, and it is not the MigrationPlan
+
+A developer who re-seals four secrets in a row should get one rollout, not four.
+Two facts settle how:
+
+1. **The operator does not watch Secrets.** The controller is
+   `Controller::new(apps).owns(claims).owns(plans)` (`lib.rs:159-163`) — no
+   `.watches(Secret)`. A Secret changing wakes nothing.
+2. **It requeues every 60s** (`lib.rs:959`). So a content hash is recomputed
+   within a minute of any re-seal without needing a Secret watch at all.
+
+That 60-second window **is** the batch. Four seals inside a minute are one
+reconcile and one roll; four seals spread over ten minutes are up to four rolls,
+which is the correct behaviour anyway. Adding a Secret watch would *break* this —
+it would fire once per Secret and reintroduce the fan-out. The absence of the
+watch is the feature here, and the fix should not add one.
+
+Note also that `secret seal` already batches within a secret: re-sealing
+**replaces** all keys and does not merge (its own help says so), so every key of
+one secret necessarily moves in a single command. Only the multi-*secret* case
+needs the window above.
+
+**The roll is not gated behind a MigrationPlan, and must not be.** The sentence
+above about respecting destructive-change gating means the narrow thing: a
+rotation must not become a side door that pushes an already-pending gated change
+through. It does not mean the rotation itself needs approval. MigrationPlan
+gates changes that can *lose data*; a rolling restart to pick up a new
+credential loses nothing. And an approval step sitting between "revoke" and
+"revoked" is backwards for the case that motivates the whole feature — a leaked
+key is rotated precisely because it must take effect now.
+
 Ships with a walk step that seals a new value and asserts the running pod picks
 it up without any manual action. No current walk rotates a secret.
 
