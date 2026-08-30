@@ -30,6 +30,80 @@ existing SealedSecrets into OpenBao kv-v2 and rewrites Application
 manifests to use OpenBao paths. The migration is non-destructive and
 one-time.
 
+## Amendment — `apprafter secret` is an operator toolkit, not a developer one (2026-08-30)
+
+The Decision above says "**developers** commit `kind: SealedSecret` manifests"
+and the Consequences say "Application authors see a single `secret(...)` API
+regardless of which backend resolves it". Both frame the Tier-1 backend as
+developer-facing. That framing is withdrawn.
+
+**`apprafter secret seal` / `remove` are an operator surface, available at
+Tier 1 only, and are never presented as a developer workflow.** The
+`secret: "<name>/<key>"` reference in a manifest stays exactly as it is — that
+half of the original consequence holds, and is the part that makes the Tier-2
+migration mechanical. What changes is who runs the sealing command and where it
+is documented.
+
+### Why
+
+This ADR already names the reason in its own Negative consequences:
+SealedSecrets "does not provide dynamic credentials, automatic rotation, or
+fine-grained ACL". Tier 1 deliberately ships a **primitive** in place of the
+real thing, because a KMS-less single node cannot carry OpenBao's unseal UX or
+its footprint. A primitive chosen for that reason cannot then be asked to carry
+an authorization story. Attempting one produces the worst outcome: a control
+that looks like a boundary and is not.
+
+The concrete case that forced this. `ApplicationMigrationStrategy` classifies
+`env-secret-ref-retarget` — repointing an environment variable at a *different*
+secret — as `security-boundary`, the most severe class the app-scope detector
+has, gated behind a MigrationPlan and an explicit approval. Re-sealing that same
+secret with different contents reaches the identical outcome with no gate, no
+classification and no record. Read as a developer-facing platform, that is an
+authorization hole. Read correctly — an operator holding the cluster's sealing
+key, on a single-node tier — there is no boundary being crossed, because the
+actor already holds every credential in the cluster.
+
+Role separation at Tier 1 is the operator's own to enforce, through who holds a
+kubeconfig that can create SealedSecrets in a namespace. Where operator and
+developer are the same person, which is the tier's design centre, there is
+nothing to gate. Where a team does separate them on Tier 1, Kubernetes RBAC is
+the mechanism, not a gate inside `apprafter secret`.
+
+### What this obliges us to do instead
+
+Not building an authorization story does not mean silence. Three deliverables,
+in order:
+
+1. **Say it.** Every surface that presents `apprafter secret` states that it is
+   a Tier-1 operator tool standing in for OpenBao, that it carries no
+   fine-grained access control or audit, and that Tier 2+ replaces it. The
+   Backstage banner this ADR already promised ("a visible banner explaining
+   this and prompting the migration as the user approaches Tier 2") is the
+   Tier-2 half of the same obligation and is still unshipped — it is deferred
+   with the rest of the portal, so the CLI and the documentation carry it until
+   then.
+2. **Move the documentation.** `docs/dev-guide/secrets.md` is in the wrong
+   guide and is written to the wrong reader ("your manifest, your repository").
+   The developer-facing half — binding an env var to `secret: "<name>/<key>"`
+   and reading `EnvSecretMissing` — stays in the developer guide; the sealing
+   workflow belongs to the operator guide.
+3. **Make the blast radius visible**, which is an operations obligation rather
+   than a security one: which applications resolve this secret, and which of
+   them are still running an older revision. See D6 and D14 in
+   `docs/measurements/day2-followups.md`.
+
+### What follows at Tier 2+
+
+With OpenBao's revisions and the portal in place, the platform can watch a
+secret's revision and **notify** the owners of dependent applications, offering
+a restart rather than performing one. An opt-in knob — per application in the
+manifest, or cluster-wide, on the shape of `autoRestartAppsOnEnvChanges` — is
+the right place for automation, because by then the two things that make it
+unsafe today are gone: revisions are observable, and the identity performing the
+change is authenticated and audited. Automatic restart is explicitly **not** the
+Tier-1 default; see D6 for why an unknowable blast radius makes it unsafe there.
+
 ## Consequences
 
 Positive:

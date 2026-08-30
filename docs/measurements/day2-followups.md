@@ -29,7 +29,7 @@ is the part worth having later.
 | **D11** | 584 failures share one catch-all, and the cheap checks run last | open — high |
 | **D12** | Removing `expose` leaves the Service behind | open — medium |
 | **D13** | A registry credential copy that nothing ever reclaims | open — high, security |
-| **D14** | Re-sealing a secret performs a gated change through an ungated door | open — high, security |
+| **D14** | Re-sealing a secret performs a gated change through an ungated door | resolved by decision — disclosure work open |
 
 ## D1. VPA in-place right-sizing has never run: wrong feature-gate name
 
@@ -877,9 +877,14 @@ So the order inverts. **Visibility first, action explicit:**
    that an imperative restart verb is usually a symptom does not apply here — a
    coordinated credential cutover is not a symptom, it is the operation.
 
-An automatic roll may still be right later, scoped to the unambiguous case (a
-secret exactly one application references), once the visibility exists to make
-it verifiable. It is not the thing to ship first.
+An automatic roll may still be right later, but **not at Tier 1** — see the ADR
+0007 amendment of 2026-08-30 and D14. `apprafter secret` is an operator tool
+standing in for OpenBao on a single node; the conditions that would make an
+automatic roll safe (observable revisions, an authenticated and audited actor)
+arrive with OpenBao and the portal at Tier 2+, where the right shape is a
+notification offering a restart plus an opt-in knob — per application or
+cluster-wide, on the shape of `autoRestartAppsOnEnvChanges`. At Tier 1 the roll
+stays an explicit act.
 
 Adding a Secret *watch* remains the wrong move regardless: it fires once per
 Secret and tightens the fan-out into an even smaller window.
@@ -1434,8 +1439,12 @@ allowlisting as the control. The owner's framing is stronger and is now the
 entry: this is not a new threat to mitigate, it is **an inconsistency in a
 policy this platform already ratified**.
 
-**Status:** OPEN.
-**Severity:** high, security.
+**Status:** RESOLVED BY DECISION 2026-08-30 — the asymmetry is accepted at
+Tier 1, deliberately, and the outstanding work is disclosure rather than a gate.
+See the ADR 0007 amendment of the same date. The three deliverables it names are
+still open; they are tracked here and in D6.
+**Severity while read as a security hole:** high. Read correctly it is not one —
+see "Why this is not the hole it looks like" below.
 
 ### The same change is the most severe class through one door and unclassified through the other
 
@@ -1515,32 +1524,63 @@ merits — the difference between "this app may reach the internet" and "this ap
 may reach Stripe and Sentry" is real — but it is defence in depth for one vector,
 not the answer to this entry.
 
-### What would
+### Why this is not the hole it looks like
 
-The gap is a policy inconsistency, so the fix belongs at the policy layer, and
-its shape is an owner's decision rather than a mechanical one. The options, with
-the tradeoff each accepts:
+The owner's resolution, ratified as an amendment to ADR 0007 on 2026-08-30:
+**`apprafter secret` is an operator toolkit, not a developer one, and it exists
+only at Tier 1 as a deliberate primitive standing in for OpenBao.**
 
-1. **Record and surface every seal.** Stamp author and timestamp as annotations;
-   emit an event on the applications that reference the secret; surface "a
-   referenced secret changed at T" in `app status`. Does not stop anybody;
-   converts a silent substitution into an attributable one, which is what
-   forensics and insider-mistake both need. Cheap, and needed regardless of
-   which of the following is chosen.
-2. **Classify the seal.** Give `secret seal` the same vocabulary the manifest
-   path uses: re-sealing an existing name that live applications reference is a
-   `security-boundary` change, and say so at the point of use — including which
-   applications are affected (see D6, where the same reverse index is needed).
-   Warning, not blocking.
-3. **Gate the seal for a subset.** Require approval only where the manifest path
-   already does, i.e. replacing a secret that at least one running application
-   currently resolves. Consistent with the ratified policy, and the expensive
-   option: it puts an approval between "revoke" and "revoked".
+ADR 0007 already stated the premise in its own Negative consequences —
+SealedSecrets "does not provide dynamic credentials, automatic rotation, or
+fine-grained ACL" — and Tier 1 accepts that because a KMS-less single node
+cannot carry OpenBao's unseal UX or footprint. **A primitive chosen for that
+reason cannot then be asked to carry an authorization story.** Trying to build
+one produces the worst outcome available: a control that looks like a boundary
+and is not.
 
-The recommendation is 1 + 2 before launch and an explicit ADR decision on 3,
-because leaving 3 undecided is what produced the inconsistency in the first
-place.
+So the analysis above measured an operator tool against developer-tool
+expectations. The actor in every scenario is someone holding a kubeconfig that
+can create SealedSecrets in the namespace — which at Tier 1 means someone who
+already holds every credential in the cluster. There is no boundary being
+crossed. Where operator and developer are the same person, the tier's design
+centre, there is nothing to gate; where a team separates the roles on Tier 1,
+Kubernetes RBAC is the mechanism, not a gate inside `apprafter secret`.
 
-Ships with: the reverse index from D6 (which applications reference a secret);
-annotations and an event on seal; and an ADR recording the decision on 3 so the
-asymmetry is either closed or deliberately accepted in writing.
+What survives is the **asymmetry in what we say**, not in what we enforce. The
+MigrationPlan path treats an env retarget as `security-boundary` because a
+manifest change is reviewable; the seal path cannot be reviewed, so it must be
+*disclosed* instead.
+
+### The outstanding work is disclosure
+
+Per the ADR amendment, in order:
+
+1. **Say it.** Every surface presenting `apprafter secret` states that it is a
+   Tier-1 operator tool standing in for OpenBao, carrying no fine-grained access
+   control or audit, replaced at Tier 2+. ADR 0007's promised Backstage banner
+   is the Tier-2-approach half and is still unshipped with the rest of the
+   portal, so the CLI and the docs carry this until then.
+2. **Move the page.** `docs/dev-guide/secrets.md` is in the wrong guide and
+   written to the wrong reader ("your manifest, your repository"). The binding
+   half — `secret: "<name>/<key>"` and reading `EnvSecretMissing` — stays with
+   developers; the sealing workflow moves to the operator guide.
+3. **Make the blast radius visible** — which applications resolve this secret,
+   and which are still on an older revision. Shared with D6, and an operations
+   obligation rather than a security one.
+
+Attribution on the seal (who, when) is still worth stamping, for the
+insider-mistake and forensics cases rather than as a control.
+
+**Rejected, and recorded so it is not proposed again:** gating the seal behind
+an approval. The reviewer would be approving an opaque blob they cannot diff,
+and it taxes the one operation that must be fast — revoking a leak.
+
+### What changes at Tier 2+
+
+With OpenBao's revisions and the portal, the platform can watch a secret's
+revision and **notify** the owners of dependent applications, offering a restart
+rather than performing one. An opt-in knob — per application in the manifest or
+cluster-wide, on the shape of `autoRestartAppsOnEnvChanges` — is the right home
+for automation there, because the two things that make it unsafe at Tier 1 are
+gone: revisions are observable, and the identity performing the change is
+authenticated and audited.
