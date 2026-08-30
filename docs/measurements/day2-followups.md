@@ -27,6 +27,7 @@ is the part worth having later.
 | **D9** | There is nothing to roll a moving tag back to | open |
 | **D10** | The applying half of right-sizing has never been observed to apply anything | open — high |
 | **D11** | 584 failures share one catch-all, and the cheap checks run last | open — high |
+| **D12** | Removing `expose` leaves the Service behind | open — medium |
 
 ## D1. VPA in-place right-sizing has never run: wrong feature-gate name
 
@@ -383,12 +384,68 @@ needs walks (`e2e/needs-pg-walk.sh`, `needs-redis-walk.sh`, `needs-disk-walk.sh`
 removes a single `needs` entry. `app-migration-walk.sh` touches `needs_pg` once,
 and only for the `selector` tripwire.
 
+### The root cause: an ownership relation modelled as a lifetime binding
+
+*Added 2026-08-30, after the project owner named the principle: whoever creates
+a resource owns it, and owning it means being able to change **and delete** it.*
+
+Two different things were treated as one.
+
+An `ownerReference` is a **lifetime binding** — "this child dies with its
+parent" — and it is executed by the apiserver's garbage collector, not by us.
+**Ownership** is "the parent decides whether this child exists at all", and only
+a controller can execute that. Every generated claim carries
+`controller: true, blockOwnerDeletion: true` (`lib.rs:2645-2653`), and that was
+taken to have settled the question. It answers what happens when the parent
+dies. It never answers what happens when the parent no longer wants the child.
+
+This is why the gap looked closed. The one deletion scenario anyone ever
+exercised — deleting the whole Application — is performed **entirely by the
+apiserver**, and performed correctly: it stamps a `deletionTimestamp`, which
+fires the provisioner finalizer, which writes the `RetainedClaim`, which starts
+the seven-day clock, which the reaper eventually collects. That whole chain is
+sound. Exactly one link is missing, the first one: **the operator never
+deletes.** A finalizer should be an optimisation layered on top of ownership;
+here it is the only path, and it is driven by somebody else's code.
+
+The consequence is that removal is not a property of the reconcile loop at all.
+It is handled per-child, ad hoc, by whoever was last bitten — which is why the
+count is what it is:
+
+| child of `Application` | created when | pruned when undeclared |
+| --- | --- | --- |
+| Deployment | always | n/a — always desired |
+| Service | `expose` is set | **no** — see D12 |
+| CiliumNetworkPolicy | Cilium present | **no** (`lib.rs:737`, no `else`) |
+| HTTPRoute | `expose.network: public` | yes — `prune_http_route`, added 1.83b |
+| VerticalPodAutoscaler | managed env | yes — `prune_vpa`, added 2.16e |
+| ResourceClaim | each `needs.*` entry | **no** — this defect |
+
+Both prune arms were added reactively, with the feature that first exposed the
+staleness. Neither generalised, because neither could: they are single
+`delete(name)` calls that work only because HTTPRoute and VPA are **singletons
+at a name derived from the app's name**. Claims are a **set of variable size
+with data-dependent names** (`<app>-<type>[-<name>]`), so the same trick does
+not reach them — removing an unwanted claim requires first knowing which claims
+exist, and the loop performs no LIST of anything.
+
+Note also what the controller calls the claims it fetched (`lib.rs:513-517`):
+the variable is named `current`, and it is built by GETting exactly the names
+`generate_resource_claims` just produced from the new manifest. It is the
+desired set wearing the name of the live set. A claim whose need was removed is
+not merely un-deleted; it is **unobservable** — no code path in the controller
+could learn it exists.
+
 ### The fix
 
-The same reconcile already prunes two other declared-then-undeclared children —
-`prune_http_route` (`lib.rs:758`, when the app stops being public) and
-`prune_vpa` (`lib.rs:784`). Claims are the one child with no prune arm; the fix
-is a third one in the same shape.
+The same reconcile already prunes two of its five optional children —
+`prune_http_route` (`lib.rs:758`) and `prune_vpa` (`lib.rs:784`). A third arm in
+that shape is the minimum that closes this entry, but the table above is the
+argument for not stopping there: the generic form is to LIST the children this
+Application owns and delete those absent from the desired set. Generated claims
+carry no labels today (only name, namespace and `ownerReferences`), so the
+selector is the owner UID rather than a label — which is fine, and is the same
+predicate `list_resource_claims_for_app` already uses.
 
 Ordering matters and is the whole risk: the delete must happen only after the
 plan is approved and the new spec applied, so an unapproved edit cannot destroy
@@ -911,4 +968,67 @@ Three moves, in this order, because each makes the next cheaper:
 584 is not a number to drive to zero. The catch-all is the right home for a
 genuinely one-off failure; what it is not is the right home for the six
 commands on the disaster-recovery path.
+
+## D12. Removing `expose` leaves the Service behind
+
+**Opened:** 2026-08-30, found by applying the ownership principle recorded in
+D4's root-cause section to the other children of `Application` rather than to
+claims alone.
+
+**Status:** OPEN.
+**Severity:** medium — no data or cost is stranded, but a developer who removes
+`expose` has said "stop serving this" and the cluster keeps a live Service with
+its ClusterIP and its pod selector intact.
+
+### What is wrong
+
+`operator-controllers/application/src/lib.rs:726`:
+
+```rust
+if let Some(service) = &rendered.service {
+    apply_service(&ctx.client, &namespace, service, &pp).await?;
+}
+// no else
+```
+
+The renderer emits a Service if and only if `expose` is set
+(`operator-rendering/src/lib.rs:184` — `.map(|expose| render_service(...))`), so
+the Service is an optional child exactly like the HTTPRoute and the VPA. Those
+two have an `else` arm that deletes the stale object. This one has nothing, and
+`git log -S"prune_service" -- operator/` is empty: no such function has ever
+existed.
+
+### Why this one is the clearest evidence for D4's root cause
+
+The doc comment on `prune_http_route` (`lib.rs:1173`) names the triggering
+scenario in its own words:
+
+> `public → internal`, or removed `expose`). 404-tolerant …
+
+The author of the prune arm **reasoned explicitly about `expose` being
+removed**, and pruned the HTTPRoute for it. The Service is rendered from that
+same `expose` field, and is applied two blocks earlier in the same function. It
+was left behind — not because removal was overlooked, but because the fix was
+scoped to the incident (a stale public route, found in 1.83b) rather than to the
+relation. That is the whole of D4's diagnosis, visible in a single comment.
+
+The CiliumNetworkPolicy at `lib.rs:737` has the same missing `else`. It is far
+lower risk — the controller always threads `needs_targets`, so
+`rendered.network_policy` is `Some` on every controller-driven render, and the
+`None` arm belongs to the bare `render_application` entry point used by tests.
+It is listed here so the audit is complete, not because it is known to bite.
+
+### The fix
+
+Ships with D4, because it is the same fix: either a third and fourth prune arm,
+or the generic owned-children diff that makes prune arms unnecessary. Add a unit
+test that renders with `expose`, then without, and asserts the Service is
+deleted; and a walk step that removes `expose` from an exposed app and asserts
+the Service is gone while the Deployment survives.
+
+One caution for whoever implements it: deleting the Service is correct but is
+also the first time this operator will remove a networking object a user might
+still have DNS or callers pointed at. The delete belongs behind the same
+destructive-change gate as a `needs` removal if `expose` removal is classified
+destructive; check `is_destructive` before assuming it is not.
 
