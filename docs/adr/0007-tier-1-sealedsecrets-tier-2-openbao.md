@@ -93,6 +93,53 @@ in order:
    them are still running an older revision. See D6 and D14 in
    `docs/measurements/day2-followups.md`.
 
+### A second Tier-1 delivery mode, considered and deferred
+
+The disclosure obligation above is forced by *how* the secret is delivered, not
+by Tier 1 as such. An imperative seal cannot be reviewed — the reviewer would be
+looking at an opaque blob — so disclosure is the only control left. A different
+delivery form changes what is available:
+
+| form | reviewable? | control it admits |
+| --- | --- | --- |
+| `apprafter secret seal` (imperative) | no | **disclosure** only |
+| ciphertext inline in the Application manifest | yes — the *fact* and the variable, never the value | **MigrationPlan gating** |
+
+An inline sealed env value would make a credential change a spec diff, which the
+app-scope migration detector already inspects on every reconcile, and which it is
+already careful to describe without leaking: `DestructiveChange`'s `from`/`to`
+carry only sentinels. A new trigger classified `security-boundary`, symmetric
+with `env-secret-ref-retarget`, would follow directly.
+
+The mode is coherent and is **not** blocked by ADR 0024. ADR 0039 declines to put
+material in a CR spec because it "would be **plaintext**-at-rest … violating ADR
+0024", and then states that a sealed blob is "safe in transit, at rest, and in
+Git — which is what makes the GitOps delivery mode safe". The objection is to
+plaintext, not to ciphertext.
+
+Two properties decide its shape:
+
+- **It is sugar over what already exists**, not a new decryption path. The form is
+  equivalent to writing a `kind: SealedSecret` carrying the ciphertext *and* an
+  Application manifest referencing it by `ref`, in one place. The operator
+  therefore decrypts nothing: it renders a SealedSecret at a derived name plus an
+  ordinary `secretKeyRef`, and the sealed-secrets controller does the rest. Strict
+  scope survives for free, because a derived name (`<app>-env-<VAR>`) is a real
+  `(namespace, name)` pair. Weakening the scope to namespace- or cluster-wide to
+  avoid the derived name is explicitly rejected: a liftable blob would undercut
+  the very gate the mode exists to provide.
+- **The secret cannot be shared between applications.** Exactly one owner. That is
+  the cost, and simultaneously a property — a blast radius of one, where it is
+  precisely the *unknown* radius of a shared secret that makes an automatic
+  rollout unsafe today.
+
+Deferred to the backlog (`plan.md` §∞.10): worthwhile, but a substantial amount of
+work to add for Tier 1 alone, and it does not block launch. It is a **second**
+mode rather than a replacement — rotation becomes a commit and a sync instead of
+one command, which is slower for the case that matters most, and the imperative
+path remains necessary for platform credentials in `apprafter-system`, which have
+no Application manifest at all.
+
 ### What follows at Tier 2+
 
 With OpenBao's revisions and the portal in place, the platform can watch a
