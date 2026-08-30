@@ -29,7 +29,7 @@ is the part worth having later.
 | **D11** | 584 failures share one catch-all, and the cheap checks run last | open — high |
 | **D12** | Removing `expose` leaves the Service behind | open — medium |
 | **D13** | A registry credential copy that nothing ever reclaims | open — high, security |
-| **D14** | A swapped credential redirects data and passes every gate | open — high, security |
+| **D14** | Re-sealing a secret performs a gated change through an ungated door | open — high, security |
 
 ## D1. VPA in-place right-sizing has never run: wrong feature-gate name
 
@@ -842,15 +842,47 @@ requirements pull in opposite directions and one mechanism cannot serve both:
 What makes both safe is neither default but the thing missing underneath: **the
 state is currently invisible in both directions**, which this entry already says
 is its worst property. Stamp the resolved-config hash *and surface it* — pods
-running revision `abc` while the current resolved config is `def` — and the
-automatic mode becomes verifiable rather than hopeful, and an opt-out becomes
-safe to offer. Only then is a per-app `rollout: manual` worth adding, declared
-in the manifest rather than issued as a command, so it stays declarative and
-stays visible. Ship the automatic roll plus the visibility first; add the opt-out
-only if a real case survives grouping.
+running revision `abc` while the current resolved config is `def`.
 
-Adding a Secret *watch* is still the wrong move: it fires once per Secret and
-tightens the fan-out into an even smaller window.
+### Why the automatic roll should not be the default after all
+
+Two further objections from the owner, both of which the draft above failed:
+
+**A secret is not owned by one application.** Nothing stops three Applications
+in a namespace from referencing `secret:"thirdparty/sentry-dsn"`. Re-sealing it
+therefore rolls all three — possibly across teams — and **the person sealing has
+no way to know that**. `secret seal` prints nothing about who consumes the
+secret, and the operator holds no reverse index: `check_env_secret_refs` reads
+per-application, so "which applications reference secret X" is answerable
+(LIST Applications, scan `env`) but is not answered anywhere today. An automatic
+roll with an unknowable blast radius is not a safe default.
+
+**And `rollout: manual` had nowhere to live.** The draft proposed it as an
+Application field, but the Application is per-app and the secret is shared: app
+A declaring `manual` does not constrain app B, which will still roll. The
+setting logically belongs to the *secret*, and **secrets have no declarative
+surface at all** — `secret seal` is an imperative command with no manifest
+behind it. The knob was proposed with no valid home, which is a design answer in
+itself.
+
+So the order inverts. **Visibility first, action explicit:**
+
+1. The resolved-config hash on the pod template, surfaced in `app status` as
+   drift — nothing silent in either direction.
+2. The reverse index, surfaced at the point of use: `secret seal` reports which
+   applications resolve this secret and that they are now running an older
+   revision. This is also what D14 needs, for a different reason.
+3. The roll is then an explicit act by someone who can see what it will touch.
+   Whether that is `app restart` or something better is open, but the objection
+   that an imperative restart verb is usually a symptom does not apply here — a
+   coordinated credential cutover is not a symptom, it is the operation.
+
+An automatic roll may still be right later, scoped to the unambiguous case (a
+secret exactly one application references), once the visibility exists to make
+it verifiable. It is not the thing to ship first.
+
+Adding a Secret *watch* remains the wrong move regardless: it fires once per
+Secret and tightens the fan-out into an even smaller window.
 
 **The roll is not gated behind a MigrationPlan, and must not be.** The sentence
 above about respecting destructive-change gating means the narrow thing: a
@@ -1394,93 +1426,121 @@ material. Either way it ships with a test that deletes an Application and
 asserts no `dockerconfigjson` Secret survives in its namespace — which is the
 assertion that would have caught all three of D4, D12 and D13.
 
-## D14. A swapped credential redirects data and passes every gate
+## D14. Re-sealing a secret performs a gated change through an ungated door
 
-**Opened:** 2026-08-30, raised by the project owner while reviewing D6: a secret
-can be replaced with a broken one, or with one belonging to somebody else's
-account of the same service, and nothing gates or records it.
+**Opened:** 2026-08-30, raised by the project owner. Reframed the same day —
+the first draft led with the exfiltration threat and proposed egress
+allowlisting as the control. The owner's framing is stronger and is now the
+entry: this is not a new threat to mitigate, it is **an inconsistency in a
+policy this platform already ratified**.
 
 **Status:** OPEN.
-**Severity:** high, security. The availability half is loud and recoverable.
-The exfiltration half is silent and is the one that matters.
+**Severity:** high, security.
 
-### The two threats are not the same
+### The same change is the most severe class through one door and unclassified through the other
 
-**Availability.** Re-seal a working credential as a broken one and the
-application starts failing. Noisy, attributable by timing, recoverable by
-re-sealing the right value.
+`ApplicationMigrationStrategy` already treats *where an environment variable's
+value comes from* as a security question, and treats it as the **most severe**
+one it has. `classification_severity` (`operator-core/src/migration.rs:90-94`)
+ranks `security-boundary` at 4, above `data-migration`. Three env transitions
+earn it (`migration/src/strategy.rs:413-509`):
 
-**Exfiltration.** Re-seal a credential as the attacker's *own account of the
-same service* — their Sentry DSN, their S3 endpoint and keys, their OTLP
-collector, their webhook URL. The application keeps working perfectly. Nothing
-degrades, no probe fails, `Ready` stays true, and the platform's data begins
-arriving in somebody else's tenancy. Sentry payloads alone carry request bodies,
-user identifiers and stack-local variables.
+| trigger | transition | classification |
+| --- | --- | --- |
+| `env-secret-ref-add` | non-Secret → `Ref(Secret(a))` | `security-boundary` |
+| `env-ref-downgrade` | `Ref(_)` → `Literal(_)` | `security-boundary` |
+| `env-secret-ref-retarget` | `Ref(Secret(a))` → `Ref(Secret(b))`, a≠b | `security-boundary` |
 
-The second is the whole finding. A credential swap is not a configuration change
-that might break something; it is a **redirection of where data goes**, and it
-is indistinguishable from normal operation by every signal the platform has.
+The third is the one that matters. **Pointing an env var at a different secret
+is gated behind a MigrationPlan and an explicit approval.** The care taken is
+visible in the code: `from`/`to` carry only ref *sentinels*, never a literal
+value, so the plan cannot leak the credential it describes.
 
-### Why nothing catches it
+Now do the same thing the other way: leave the manifest untouched and re-seal
+secret `a` with different contents. The environment variable resolves to a
+different credential — **the identical outcome the retarget trigger exists to
+gate** — and there is no plan, no approval, no classification, and no record
+beyond the SealedSecret's `resourceVersion`. `apprafter secret seal` writes not
+even an annotation saying who sealed it or when.
 
-Four independent misses, each sufficient on its own:
+One door treats this as the most severe class of change the platform knows. The
+other has no gate at all. Whatever the right answer is, it cannot be both.
 
-1. **MigrationPlan gates the manifest, and the manifest does not change.** The
-   value `secret:"sentry/dsn"` is byte-identical before and after. No spec diff,
-   no plan, no approval. (The owner's judgement that a rotation should not be
-   plan-gated is correct and is not in tension with this — see the fix.)
-2. **Egress does not constrain the destination.** `EgressProfile`
-   (`operator-core/src/platform_stack.rs:58-66`) has exactly three values —
-   `Internet` (the documented default: DNS + same-ns + `world` + needs),
-   `Internal`, `Strict` — it is **cluster-wide, not per-app**, and none of them
-   name permitted hosts. Under the default profile an application may open a
-   connection to any address on the internet.
-3. **The seal is unattributed.** `apprafter secret seal` writes no annotation
-   recording who sealed it or when — the SealedSecret's `resourceVersion` and
-   whatever the apiserver audit log happens to retain are the entire record.
-4. **Nothing surfaces that it happened.** No condition, no event, no `app
-   status` line says a referenced Secret's contents changed. This is D6's
-   invisibility, seen from the security side rather than the operations side.
+### What the ungated door permits
 
-The actor here is anyone who can create a SealedSecret in the application's
-namespace — an ordinary developer role, a compromised CI token, or a stolen
-kubeconfig. It does not require cluster-admin.
+**Availability.** Re-seal a working credential as a broken one: the application
+fails. Loud, recoverable.
 
-### The fix is not to gate the secret
+**Redirection.** Re-seal a credential as somebody else's account of the *same*
+service — their Sentry DSN, their S3 endpoint and keys, their OTLP collector.
+The application keeps working perfectly, `Ready` stays true, and data begins
+arriving in another tenancy. Sentry payloads alone carry request bodies, user
+identifiers and stack-local variables.
 
-Gating a credential change behind an approval is theatre: the reviewer would be
-approving an opaque blob they cannot diff, and it would tax the one operation —
-revoking a leak — that must be fast. That path should be rejected explicitly so
-it is not proposed again.
+**Substitution.** Re-seal a credential that *is* a trust boundary rather than a
+destination — a JWT signing key, a TLS client certificate, a webhook signing
+secret, an SSH deploy key. Nothing is redirected anywhere; the attacker gains
+the ability to forge tokens the application will honour, or to decrypt what it
+protects.
 
-**The enforceable control is egress allowlisting by destination.** If an
-application's policy names the hosts it may reach, a DSN repointed at
-`attacker.example` is refused by the CNP no matter what the credential says. The
-secret answers *what* we authenticate as; the network policy answers *where the
-data may go*, and only the second can be enforced by the platform. This is
-precisely the tightening ADR 0045 left on the table — the note already sits in
-the chart source at `platform-stack/cue/render_tool.cue:633`, "tighten to
-toFQDNs when the endpoint is known" — plus the DNS-visibility rule at `:614`
-that Cilium requires for `toFQDNs` to resolve at all.
+The actor needs only permission to create a SealedSecret in the application's
+namespace: an ordinary developer role, a compromised CI token, a stolen
+kubeconfig. Not cluster-admin.
 
-That is a real piece of work: per-application declared destinations (a `network`
-or `egress` block naming FQDNs), rendered into `toFQDNs` rules alongside today's
-per-need rules, with the cluster profile remaining the floor. It also pays for
-itself well beyond this threat — it is the difference between "this app can
-reach the internet" and "this app can reach Stripe and Sentry".
+### What will not fix it
 
-Cheap and worth doing regardless, because neither stops a determined insider but
-both turn a silent redirect into a recorded one:
+**Gating the secret itself.** A reviewer would be approving an opaque blob they
+cannot diff, and it taxes the one operation that must be fast — revoking a leak.
+Recorded here so it is not proposed again.
 
-- **Attribution on the seal** — stamp who and when as annotations on the
-  SealedSecret, and make `secret seal` refuse to overwrite without `--yes` in a
-  non-interactive shell (it already does the latter).
-- **Surface the change** — the resolved-config hash from D6, plus an event when
-  a referenced Secret's contents change, so an application owner can see that
-  something they did not do happened to their configuration.
+**Egress allowlisting.** An earlier draft named this "the enforceable control".
+That was overreach, on two counts the owner identified.
 
-Ships with: the D6 hash and status surface (shared); a decision recorded in an
-ADR on whether per-app FQDN egress lands before launch; and a walk step that
-asserts an application under a destination-restricted profile cannot reach a
-host outside its declared set.
+First, it does not exist and was not planned. What 2.10 / ADR 0045 shipped is a
+per-application CNP **derived from `needs`**, plus a cluster-wide
+`EgressProfile` with exactly three values — `Internet` (default: DNS + same-ns +
+`world` + needs), `Internal`, `Strict` (`operator-core/src/platform_stack.rs:58-66`).
+None names permitted hosts, and the profile is not per-app. The `network:` field
+in `schemas/v1alpha1/application.cue:102` is *ingress* exposure, not egress
+destinations. A manifest-declared destination allowlist would be net-new work;
+the only trace of the idea is a note in the chart source
+(`platform-stack/cue/render_tool.cue:633`, "tighten to toFQDNs when the endpoint
+is known").
 
+Second, and decisively: **it covers one of the three vectors above.** Destination
+allowlisting can refuse a connection to `attacker.example`. It does nothing about
+substitution, where no new destination is contacted at all and the credential
+itself is the thing being forged with. It remains worth building on its own
+merits — the difference between "this app may reach the internet" and "this app
+may reach Stripe and Sentry" is real — but it is defence in depth for one vector,
+not the answer to this entry.
+
+### What would
+
+The gap is a policy inconsistency, so the fix belongs at the policy layer, and
+its shape is an owner's decision rather than a mechanical one. The options, with
+the tradeoff each accepts:
+
+1. **Record and surface every seal.** Stamp author and timestamp as annotations;
+   emit an event on the applications that reference the secret; surface "a
+   referenced secret changed at T" in `app status`. Does not stop anybody;
+   converts a silent substitution into an attributable one, which is what
+   forensics and insider-mistake both need. Cheap, and needed regardless of
+   which of the following is chosen.
+2. **Classify the seal.** Give `secret seal` the same vocabulary the manifest
+   path uses: re-sealing an existing name that live applications reference is a
+   `security-boundary` change, and say so at the point of use — including which
+   applications are affected (see D6, where the same reverse index is needed).
+   Warning, not blocking.
+3. **Gate the seal for a subset.** Require approval only where the manifest path
+   already does, i.e. replacing a secret that at least one running application
+   currently resolves. Consistent with the ratified policy, and the expensive
+   option: it puts an approval between "revoke" and "revoked".
+
+The recommendation is 1 + 2 before launch and an explicit ADR decision on 3,
+because leaving 3 undecided is what produced the inconsistency in the first
+place.
+
+Ships with: the reverse index from D6 (which applications reference a secret);
+annotations and an event on seal; and an ADR recording the decision on 3 so the
+asymmetry is either closed or deliberately accepted in writing.
