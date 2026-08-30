@@ -72,6 +72,7 @@ const RESTRUCTURED: &[&str] = &[
     "docs/operator-guide/persistent-disk.md",
     "docs/operator-guide/egress-policy.md",
     "docs/dev-guide/resources-and-autoscaling.md",
+    "docs/dev-guide/secrets.md",
 ];
 
 #[test]
@@ -80,7 +81,11 @@ fn a_restructured_page_is_silent() {
     // not. Kept as an assertion rather than deleted, because a page
     // going quiet is the evidence the restructure worked, and an
     // assertion that only ever gets removed proves nothing. Before
-    // 2.20c these carried 40, 39, 36, 21 and 8 findings.
+    // 2.20c these carried 40, 39, 36, 21, 8 and 5 findings. secrets.md
+    // is silent partly by typed `known-broken` exemption: two of its
+    // blocks are documented workarounds for tracked defects, and
+    // burying a security-relevant one behind a disclosure would be
+    // worse than carrying it in the open with an expiry on it.
     let found = findings();
     for page in RESTRUCTURED {
         let hits: Vec<_> = found

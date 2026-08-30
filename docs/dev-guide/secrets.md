@@ -164,29 +164,32 @@ with no sealing step at all. Both are covered together in
 
 ## Check that it arrived
 
-List the **key names** of the unsealed `Secret` — never its values:
-
-```sh
-kubectl -n shop get secret checkout-secrets \
-    -o go-template='{{range $k, $v := .data}}{{$k}}{{"\n"}}{{end}}'
-```
-
-```text
-stripe-api-key
-webhook-signing-secret
-```
-
-If the command reports `NotFound`, the controller has not unsealed
-anything into `shop` — see [When it goes wrong](#when-it-goes-wrong).
-
-Then confirm the app accepted the reference:
-
 ```sh
 apprafter app status checkout
 ```
 
-A healthy app prints `AppRafter phase: Ready`. Anything else, and the
-phase names the reason.
+A healthy app prints `AppRafter phase: Ready`. Anything else and the
+phase names the reason — `EnvSecretMissing` is the one this page is
+about, and [When it goes wrong](#when-it-goes-wrong) takes it from
+there.
+
+??? note "Listing the sealed keys directly"
+
+    `apprafter secret` has no listing subcommand yet, so confirming *which keys*
+    landed means reading the unsealed `Secret` — key names only, never
+    values:
+
+    ```sh
+    kubectl -n shop get secret checkout-secrets \
+        -o go-template='{{range $k, $v := .data}}{{$k}}{{"\n"}}{{end}}'
+    ```
+
+    ```text
+    stripe-api-key
+    webhook-signing-secret
+    ```
+
+    `NotFound` here means nothing was unsealed into `shop` at all.
 
 ## Replace a value
 
@@ -213,15 +216,27 @@ In a script there is no prompt to answer, so the command **errors
 instead of overwriting silently**; pass `--yes` when replacement is
 what you mean.
 
-Rotating the value does not restart anything. The rendered Deployment
-still points at the same `Secret` and the same key, so nothing about
-the workload changed and no rollout is triggered — running pods keep
-the value they were started with. Roll them yourself when the new
-value must take effect:
+!!! warning "Known gap: re-sealing does not reach the running pods"
 
-```sh
-kubectl -n shop rollout restart deployment -l apprafter.io/application=checkout
-```
+    The rendered Deployment still points at the same `Secret` and the
+    same key, so **nothing about the workload changed** and no rollout
+    is triggered. Pods already running keep the value they started
+    with, for as long as they keep running — indefinitely, if nothing
+    else restarts them.
+
+    **This matters most in the case you least want it to.** Re-sealing
+    is what you do to revoke a leaked credential, and on its own it
+    revokes nothing on the pods still serving traffic. The application
+    stays `Ready` throughout, because from the platform's side nothing
+    happened.
+
+    Until the platform rolls the workload for you — tracked as a defect
+    — force it after any rotation that must take effect:
+
+    <!-- docs: check=none reason=known-broken since=v0.2.51 — the workaround for a tracked defect: re-sealing does not reach running pods, so this stands until the operator rolls the workload itself -->
+    ```sh
+    kubectl -n shop rollout restart deployment -l apprafter.io/application=checkout
+    ```
 
 ## Remove it
 
@@ -279,40 +294,36 @@ previous pods keep running the previous spec until the reference
 resolves.
 
 `apprafter app status <name>` shows the phase. The message naming the
-variable is on the `Ready` condition:
-
-```sh
-kubectl -n shop get application.apprafter.io checkout \
-    -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}'
-```
+variable reads:
 
 ```text
 env STRIPE_KEY → secret "checkout-secrets/stripe-api-key": Secret
 "checkout-secrets" not found or missing key "stripe-api-key"
 ```
 
-!!! note "`kubectl get application` is ambiguous here"
-    AppRafter ships its own `applications.apprafter.io` CRD, which
-    shadows Argo CD's `applications.argoproj.io` on the short name.
-    Write `application.apprafter.io` when you mean the workload CR, as
-    above.
+??? note "Reading the condition directly"
+
+    ```sh
+    kubectl -n shop get application.apprafter.io checkout \
+        -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}'
+    ```
+
+    Write `application.apprafter.io` in full: AppRafter's own CRD
+    shadows Argo CD's `applications.argoproj.io` on the short name, so a
+    bare `application` is ambiguous.
 
 ### Telling a wrong namespace from a wrong key
 
 That message covers both causes with one sentence — "not found **or**
-missing key" — so it does not distinguish them for you. Two commands
-do.
+missing key" — and does not distinguish them.
 
-**First, find where the secret actually is:**
-
-```sh
-kubectl get sealedsecrets --all-namespaces
-```
-
-If your secret appears under `apprafter-system` (or any namespace that
-is not the app's), that is the namespace mistake and the message's
-"not found" half is the true one. The fix is to seal it again into the
-app's namespace and then delete the stray copy:
+**Start with the namespace, because that is the likely one.** `seal`
+defaults to `apprafter-system`, which is right for platform credentials
+and wrong for an application secret, so sealing into the wrong namespace
+is the most common way to arrive here. If that is what happened, seal it
+again into the app's namespace and delete the stray copy — sealed
+secrets are bound to the namespace they were sealed for, so re-sealing
+is the fix rather than moving:
 
 ```sh
 apprafter secret seal checkout-secrets \
@@ -321,22 +332,30 @@ apprafter secret seal checkout-secrets \
 apprafter secret remove checkout-secrets --namespace apprafter-system --yes
 ```
 
-**If it is already in the right namespace**, the name resolved and the
-key did not. List the keys and compare them with the part of the
-reference after the `/`:
+**If it was already in the right namespace**, the name resolved and the
+key did not. A key spelled `stripe_api_key` in the secret and
+`stripe-api-key` in the manifest fails exactly as a missing secret does.
+Fix whichever side is wrong and the operator picks it up on its next
+pass, with no further action.
 
-```sh
-kubectl -n shop get secret checkout-secrets \
-    -o go-template='{{range $k, $v := .data}}{{$k}}{{"\n"}}{{end}}'
-```
+!!! note "Known gap: telling the two apart needs `kubectl`"
 
-A key spelled `stripe_api_key` in the secret and `stripe-api-key` in
-the manifest fails exactly as a missing secret does. Fix whichever
-side is wrong — the manifest reference, or the key you sealed — and
-the operator picks it up on its next pass without any further action.
+    `apprafter secret` has no listing subcommand, so the platform raises a
+    question — "not found *or* missing key" — that it gives you no way
+    to answer. Tracked as a defect. Until it lands:
 
-**If it appears in no namespace at all**, it was never sealed; go back
-to [Seal a value](#seal-a-value).
+    <!-- docs: check=none reason=known-broken since=v0.2.51 — the workaround for a tracked defect: there is no `apprafter secret list`, so the two questions EnvSecretMissing raises have no first-class answer -->
+    ```sh
+    # where is it sealed?
+    kubectl get sealedsecrets --all-namespaces
+
+    # what keys does it actually carry?
+    kubectl -n shop get secret checkout-secrets \
+        -o go-template='{{range $k, $v := .data}}{{$k}}{{"\n"}}{{end}}'
+    ```
+
+    Appearing in no namespace at all means it was never sealed; go back
+    to [Seal a value](#seal-a-value).
 
 ## Platform credentials, and why the default exists
 

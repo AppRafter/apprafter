@@ -377,3 +377,113 @@ investigation.
 Ships with: a walk step that restarts the pool instance and asserts a tenant
 can still authenticate immediately afterwards. No current walk restarts an
 instance, which is why this was never caught.
+
+## Rotating a secret does not take effect until something else restarts the pods
+
+**Opened:** 2026-08-30 (2.20c, correcting `docs/dev-guide/secrets.md`).
+**Status:** OPEN.
+**Severity:** high, and security-relevant. The operation a developer performs
+to revoke a leaked credential does not revoke it.
+
+### What is wrong
+
+`apprafter secret seal <name>` re-seals the value and the controller unseals it
+into the `Secret`. Nothing else happens. The rendered Deployment still points at
+the same `Secret` and the same key, so **no field of the workload changed** and
+no rollout is triggered — running pods keep the value they started with, for as
+long as they keep running.
+
+`docs/dev-guide/secrets.md` documented the consequence honestly and then handed
+the reader `kubectl -n <ns> rollout restart deployment -l
+apprafter.io/application=<app>` as the remedy. That is a foreign command
+standing in for platform behaviour, on a developer page, for the one operation
+where being wrong is a security incident: a developer who rotates a leaked key
+and sees the command succeed has not rotated anything on the pods still serving
+traffic.
+
+Nothing in the operator hashes or otherwise tracks the resolved contents of the
+Secrets an application references — `grep -rn "env.secret.*hash\|secrets_hash"
+operator/` returns nothing.
+
+### What it costs
+
+The window is unbounded. A pod that is not restarted for other reasons serves
+the old credential indefinitely, and no status, condition or metric says so —
+the application is `Ready` throughout, because from the platform's point of view
+nothing changed. The failure is silent in both directions: the developer
+believes the rotation landed, and the platform believes there is nothing to do.
+
+### The fix
+
+Stamp a hash of the resolved env-Secret contents onto the rendered pod template
+as an annotation — `apprafter.io/env-secrets-hash`. Re-sealing changes the
+hash, the template changes, and the Deployment rolls on the operator's next
+reconcile. This is the standard Kubernetes idiom for exactly this problem, and
+it keeps the behaviour declarative rather than adding an imperative restart
+verb — which matters, because the owner's position is that an `app restart`
+command is normally a symptom rather than a feature.
+
+Two things to get right. The hash must cover the *resolved values*, not the
+Secret's `resourceVersion`, or an unrelated write to the Secret rolls every
+application referencing it. And the roll must respect the same destructive-change
+gating everything else does, so a rotation cannot bypass a MigrationPlan.
+
+Ships with a walk step that seals a new value and asserts the running pod picks
+it up without any manual action. No current walk rotates a secret.
+
+**Release chain:** this is operator behaviour, so it carries the full
+operator → `appVersion` → platform-stack → compatibility chain. It was
+deliberately kept out of the 2.20 documentation track for that reason.
+
+## The CLI cannot answer the question its own error asks
+
+**Opened:** 2026-08-30 (2.20c, correcting `docs/dev-guide/secrets.md`).
+**Status:** OPEN.
+**Severity:** medium. Every diagnosis path for the most common secrets mistake
+leaves the CLI.
+
+### What is wrong
+
+When an env reference does not resolve, the operator reports
+`EnvSecretMissing` and the condition message is deliberately ambiguous:
+
+```text
+env STRIPE_KEY -> secret "checkout-secrets/stripe-api-key": Secret
+"checkout-secrets" not found or missing key "stripe-api-key"
+```
+
+"not found **or** missing key" names two causes and distinguishes neither. The
+two follow-up questions are *where is the secret* and *what keys does it have* —
+and `apprafter secret` ships only `seal` and `remove`. Neither question has a
+first-class answer, so the guide reached for `kubectl get sealedsecrets
+--all-namespaces` and a `go-template` over `.data`, three times across the page.
+
+This is not the platform declining to own something. It is the platform raising
+a question and then having no way to answer it.
+
+**The demand was already recorded once.** ADR 0057's 2.19h amendment predicted
+that the sealed-secrets guide would be unable to say what is sealed and in which
+namespace without such a listing, and the 2.19j walk observed exactly that,
+noting the guide answers both through `kubectl` — "honest, but a `kubectl`
+answer on a page whose whole subject is a first-class CLI task". This is the
+second observation of the same gap.
+
+### Why it bites so often
+
+`secret seal` and `secret remove` both default `--namespace` to
+`apprafter-system`, which is right for platform credentials and wrong for every
+application secret. Sealing into the wrong namespace is therefore the
+single most likely way to arrive at `EnvSecretMissing` — and sealed secrets are
+namespace-bound, so the recovery is to re-seal rather than move. The one mistake
+the default invites is the one the CLI cannot help diagnose.
+
+### The fix
+
+A listing subcommand under `apprafter secret`, with an all-namespaces flag,
+printing name, namespace and **key names** — never values — is enough to answer both questions and to collapse the
+whole "telling a wrong namespace from a wrong key" section into one command.
+
+Worth pairing with a smaller change that removes the need for it: have
+`app status` name the resolved namespace it looked in when it reports
+`EnvSecretMissing`, so the ambiguous half of the message becomes concrete
+without a second command at all.

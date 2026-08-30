@@ -414,10 +414,17 @@ fn is_guide(path: &str) -> bool {
 
 /// [`RECIPE_PURITY`] findings on one page, given its source.
 ///
-/// Free rather than a method so the rule is testable without a clap
-/// tree or a checkout, the same split [`crate::scan`] and
-/// [`crate::invocation`] already keep.
-fn recipe_findings_for(file: &str, source: &str) -> Vec<Finding> {
+/// `exempt` decides whether a block's `<!-- docs: check=none … -->`
+/// marker is a STANDING exemption. It is threaded in rather than
+/// resolved here so the rule stays testable without a clap tree or a
+/// checkout — the same split [`crate::scan`] and [`crate::invocation`]
+/// already keep — while the marker's typing, dating and 180-day expiry
+/// stay owned by [`crate::marker`], the one place that knows them.
+fn recipe_findings_for(
+    file: &str,
+    source: &str,
+    exempt: &mut dyn FnMut(usize, &Option<String>) -> bool,
+) -> Vec<Finding> {
     let disclosures = recipe::disclosure_ranges(source);
     let mut findings = Vec::new();
 
@@ -432,6 +439,15 @@ fn recipe_findings_for(file: &str, source: &str) -> Vec<Finding> {
             BlockKind::FrontMatter | BlockKind::InlineSpan => continue,
         }
         if recipe::inside_disclosure(&disclosures, block.line) {
+            continue;
+        }
+        // A workaround for a tracked defect is a foreign command in a
+        // recipe path on purpose, and hiding it behind a disclosure
+        // would bury the thing a reader most needs to see. The typed
+        // channel is the right answer: a `known-broken` exemption is
+        // dated, counted, and expires — so it goes when the defect
+        // does, or it says so loudly.
+        if exempt(block.line, &block.tag_line) {
             continue;
         }
         // The body's first line sits one below a fence's delimiter, and
@@ -956,7 +972,18 @@ impl Gate {
             }
             let source =
                 std::fs::read_to_string(path).map_err(|e| format!("reading {shown}: {e}"))?;
-            findings.extend(recipe_findings_for(&shown, &source));
+            // Marker diagnostics belong to `corpus`, which already
+            // reports them; here they are consulted and discarded, so a
+            // malformed marker is not reported twice by two runs.
+            let mut sink = Vec::new();
+            let mut stats = Stats::default();
+            let mut exempt = |line: usize, tag: &Option<String>| {
+                self.fence_marker(&shown, line, tag, &mut sink, &mut stats)
+                    .is_some_and(|(m, ex)| {
+                        m.check == Check::None && ex.as_ref().is_some_and(Exemption::silences)
+                    })
+            };
+            findings.extend(recipe_findings_for(&shown, &source, &mut exempt));
         }
         sort(&mut findings);
         Ok(findings)
