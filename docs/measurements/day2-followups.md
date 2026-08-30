@@ -17,7 +17,7 @@ is the part worth having later.
 | | Entry | Status |
 | --- | --- | --- |
 | **D1** | VPA in-place right-sizing has never run: wrong feature-gate name | RESOLVED |
-| **D2** | `backup enable --cron` / `--check-cron` accept a value the apiserver rejects | open (docs half landed, CLI half did not) |
+| **D2** | `--cron` / `--check-cron` are the wrong surface, not an unvalidated one | open (docs half landed, CLI half did not) |
 | **D3** | Two diagnostics whose `help:` text describes a layout that moved | open |
 | **D4** | Removing a `needs.*` entry orphans its ResourceClaim forever | open — high |
 | **D5** | A Dragonfly restart drops every claim's ACL user | open — high |
@@ -174,11 +174,14 @@ mechanism that still works is not a weaker check than none; it is worse,
 because it reports green. That is the shape to look for elsewhere, not
 the specific assertion.
 
-## D2. `apprafter backup enable --cron` / `--check-cron` accept a value the apiserver rejects
+## D2. `--cron` / `--check-cron` are the wrong surface, not an unvalidated one
 
 **Opened:** 2026-08-20 (2.19j, correcting
 `docs/operator-guide/backup-restore.md`).
-**Status:** open. **The documentation half landed and the CLI half did
+**Reframed:** 2026-08-30 — the original entry proposed adding a
+`value_parser`. That treats the symptom. The flags should not take a cron
+expression at all.
+**Status:** OPEN. **The documentation half landed and the CLI half did
 not**, which is worth stating because that split is how an entry gets
 forgotten: `backup-restore.md` no longer offers `--check-cron off`, says
 plainly that there is no off switch today, and uses a never-firing
@@ -187,45 +190,69 @@ stayed. Re-verified 2026-08-30: both flags are still
 `#[arg(long, value_name = "cron")]` with no `value_parser`
 (`cli/platform-cli/src/cli.rs:1560`, `:1588`).
 
-### What is wrong
+### What they do
 
-Both flags are `Option<String>` with no validation
-(`cli/platform-cli/src/cli.rs`, `check_cron` / `cron`). The value is
-threaded into `spec.backup.schedule` / `spec.backup.checkSchedule` —
-declared `string` in `schemas/v1alpha1/platformstack.cue:87` with no
-pattern — and rendered verbatim into the CronJob's `schedule:` field
-(`platform-stack/cue/render_tool.cue:538`).
+Nothing but pass a string through. The value is threaded into
+`spec.backup.schedule` / `spec.backup.checkSchedule` — declared bare
+`string` in `schemas/v1alpha1/platformstack.cue:76,87` with no pattern —
+and written **verbatim** into the CronJob's `schedule:` field
+(`platform-stack/cue/render_tool.cue:453`, `:538`). Defaults are
+`0 3 * * *` nightly and `0 6 * * 0` weekly for the integrity check.
 
-A non-cron value therefore travels all the way to the apiserver before
-anything objects, and when it does object it takes the platform-stack
-sync down with it. Verified against a real apiserver (kind):
+### Why a cron expression is the wrong thing to ask for
 
+**The expressiveness is unwanted.** An operator wants to say *when* — a
+time of day, perhaps a day of week — and possibly *how often*. Steps,
+ranges, minute-granularity: none of it means anything for a nightly
+backup.
+
+**And it is already being misused.** There is no off switch for the
+weekly check, so the page now teaches `--check-cron "0 6 31 2 *"` — the
+31st of February, a date that never arrives. That is not a schedule; it
+is a hack standing in for a missing `--check off`, and the documentation
+teaches it as the supported answer.
+
+**The timezone is unset and unnamed.** `timeZone` appears nowhere — not
+in the chart, not in the schema, not in the CLI — and no page says
+"UTC". A CronJob without it runs in the kube-controller-manager's
+timezone. An operator writing `0 3 * * *` means three in the morning
+*their* time, and has no way to learn what the three means. That is a
+correctness trap, not an ergonomic one, and no amount of syntax
+validation catches it.
+
+**A typo takes the platform down, not the command.** The two crons are
+the only options in `backup enable` with no client-side check — unlike
+`--enforce` and `--staging-mode` (`commands/backup.rs:1732-1745`) — so a
+bad value travels to the apiserver and fails the platform-stack sync:
+
+<!-- docs: check=none reason=third-party-output since=v0.2.51 — the apiserver's own rejection, quoted -->
 ```console
 $ kubectl apply -f apprafter-backup-check.yaml     # schedule: "off"
 The CronJob "apprafter-backup-check" is invalid: spec.schedule: Invalid value: "off": expected exactly 5 fields, found 1: [off]
 ```
 
-This is not hypothetical wording: `--check-cron off` was offered three
-times in `backup-restore.md` as the way to disable the in-cluster check.
-It is not implemented anywhere — no `"off"` literal exists in
+`--check-cron off` was offered three times on the backup page before
+2.19j, and is implemented nowhere — no `"off"` literal exists in
 `commands/backup.rs` — so every operator who followed that instruction
-broke their platform sync. The page now documents a never-firing
-schedule (`0 6 31 2 *`, verified accepted) instead.
+broke their platform sync.
 
 ### The fix
 
-A clap `value_parser` on both flags that rejects anything that is not
-five whitespace-separated fields, alongside the existing client-side
-enum checks for `--enforce` and `--staging-mode`
-(`commands/backup.rs:1732-1745`) — cron is the odd one out among the
-validated options. Rejecting at the CLI keeps a typo from reaching the
-CR at all.
+Replace the surface rather than validate it:
 
-Optionally, and separately: decide whether "disable the in-cluster
-check" deserves a first-class spelling. If it does, it is a
-`checkSchedule: ""`-means-omit-the-CronJob branch in the chart plus a
-`--check-cron off` that maps onto it — **not** a string that reaches
-`schedule:`.
+- **`--at 03:00`** for the time of day, with **`--timezone`** beside it,
+  because a time without a zone is not a time. The CLI composes the cron
+  and sets `spec.timeZone` on the CronJob; neither is the operator's
+  problem.
+- **Frequency stays a product decision.** Daily for the backup, weekly
+  for the check. If a second value is ever needed it is
+  `--every day|week`, not a cron field.
+- **`--check off` as a real branch** — a `checkSchedule: ""`-means-omit
+  path in the chart — so disabling the check stops requiring a date that
+  never comes.
+
+Keeping a raw-cron escape hatch is defensible later; it must not be the
+only surface, and it must not be the one the guide teaches.
 
 ## D3. Two diagnostics whose `help:` text describes a layout that moved
 
