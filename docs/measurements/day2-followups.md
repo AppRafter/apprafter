@@ -1223,6 +1223,47 @@ yellow**, naming the version it is held at, on the model of the other
 attention-warranting states. Worth surfacing in `platform status` as well, so an
 operator can see every pinned application in one place rather than per-app.
 
+### Surfacing it in Argo CD: yes, and the carrier already ships
+
+The owner asked whether a rolled-back application can be marked in the Argo UI.
+It can, and it is a new branch in a script that already exists.
+
+`resource.customizations.health.apprafter.io_Application`
+(`platform-stack/cue/component_argocd.cue:142`) already reads `obj.status.phase`
+and, for `AwaitingMigrationApproval`, returns `Degraded` with a message lifted
+from the `MigrationPending` condition. A pinned application is the same shape:
+one more branch, reading status the operator already writes.
+
+**And it bubbles up, unlike the ADR 0048 case — which is the point.** That work
+found the MigrationPlan's health did *not* reach the root Application, because
+Argo aggregates from an app's **managed** resource set (`status.resources`), and
+the anchored plan was a live tree child that nothing managed. The AppRafter
+`Application` CR is the opposite: it is rendered by the CMP from the user's
+repository, so it *is* a managed resource of their Argo Application. Its health
+therefore aggregates, and the application's own tile in the Argo list changes
+state — top-level visibility, without the A5 problem that defeated the earlier
+attempt.
+
+Two cautions, both learned the expensive way on that ADR:
+
+- **`Suspended`, not `Degraded`.** A pinned app is deliberately held, not
+  broken; `Degraded` would be wrong on the merits and would trip health-gated
+  automation and alerting. ADR 0048 chose `Suspended` for exactly this
+  distinction.
+- **Because it *does* aggregate here, it changes the user's Argo app health**,
+  which can interact with auto-sync, self-heal and anything gated on health.
+  That interaction is precisely the class of claim ADR 0048's A5 finding was
+  empirically disproven on, so it must be settled by a live probe rather than by
+  reading the aggregation rules.
+
+**On "icon": achievable, but not a custom one.** Argo has no per-resource custom
+icon; what you get is the icon bound to the health status, and `Suspended` has
+its own distinct one. **On "label": two real mechanisms.** The health script's
+`hs.message`, shown on the node, and `spec.info` on the Argo Application, which
+renders as name/value rows in the app detail view — currently unused anywhere in
+this repository, and written through the same patch route the pin already needs,
+so it is nearly free once that path exists.
+
 Ships with: a walk step that pushes a second image to the same tag and asserts
 the rollback returns the workload to the first **and that it stays there across
 at least two reconciles** (the naive fix passes the first assertion and fails the
