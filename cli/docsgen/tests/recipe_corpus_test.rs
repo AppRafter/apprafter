@@ -46,18 +46,17 @@ fn the_check_is_red_on_the_corpus_today() {
     );
 }
 
+/// Pages 2.20c has not reached yet, of the four the census named as
+/// worst — each of them an e2e walk transcribed into prose. Entries
+/// move to [`RESTRUCTURED`] as they are rewritten; the list emptying is
+/// what ends the red state.
+const STILL_LOUD: &[&str] = &["docs/operator-guide/egress-policy.md"];
+
 #[test]
 fn the_pages_not_yet_restructured_are_still_loud() {
     let found = findings();
-    // Of the four pages the census named — each transcribing an e2e
-    // walk, and the four highest foreign-command counts in the corpus —
-    // these two are still to do. If one goes quiet without its page
-    // being rewritten, the check has lost surface.
-    for page in [
-        "docs/operator-guide/persistent-disk.md",
-        "docs/operator-guide/egress-policy.md",
-    ] {
-        let count = found.iter().filter(|f| f.file == page).count();
+    for page in STILL_LOUD {
+        let count = found.iter().filter(|f| f.file == *page).count();
         assert!(count > 0, "{page} should be red and is not");
     }
 }
@@ -68,6 +67,7 @@ fn the_pages_not_yet_restructured_are_still_loud() {
 const RESTRUCTURED: &[&str] = &[
     "docs/operator-guide/postgres.md",
     "docs/operator-guide/redis.md",
+    "docs/operator-guide/persistent-disk.md",
 ];
 
 #[test]
@@ -76,7 +76,7 @@ fn a_restructured_page_is_silent() {
     // not. Kept as an assertion rather than deleted, because a page
     // going quiet is the evidence the restructure worked, and an
     // assertion that only ever gets removed proves nothing. Before
-    // 2.20c these carried 40 and 39 findings.
+    // 2.20c these carried 40, 39 and 36 findings.
     let found = findings();
     for page in RESTRUCTURED {
         let hits: Vec<_> = found
