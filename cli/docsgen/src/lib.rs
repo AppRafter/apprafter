@@ -15,6 +15,7 @@
 //! precedent.
 
 pub mod adr;
+pub mod behaviour;
 pub mod check;
 pub mod codepath;
 pub mod cuedoc;

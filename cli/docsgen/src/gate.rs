@@ -193,6 +193,7 @@
 //! `Err` is propagated here rather than folded into the finding list.
 
 use crate::adr;
+use crate::behaviour;
 use crate::codepath;
 use crate::cuedoc::{self, Document};
 use crate::health::{self, Baseline};
@@ -260,6 +261,15 @@ pub const HEALTH_BASELINE: &str = "health-baseline";
 /// The declared-exemption count no longer equals the committed census —
 /// one was declared, or one was retired.
 pub const HEALTH_EXEMPTIONS: &str = "health-exemptions";
+/// A sentence a page carries that the tree says is false.
+///
+/// The class every other check is blind to by construction: they
+/// resolve names, and a stale defect note names only things that still
+/// exist. Each watched phrase is bound to a code fact in
+/// [`crate::behaviour::CLAIMS`], so the table records what to watch and
+/// the repository decides the answer — revert the fix and the phrase
+/// becomes true again and stops being reported.
+pub const BEHAVIOUR_CLAIM: &str = "behaviour-claim";
 /// A foreign command in a guide's recipe path: not `apprafter`, not on
 /// [`crate::recipe::ALLOWLIST`], not inside a collapsed disclosure, and
 /// not on a [`crate::recipe::BREAK_GLASS_PAGES`] page. ADR 0058.
@@ -303,6 +313,13 @@ fn remedy(code: &str) -> &'static str {
         CUE_DOCUMENT => {
             "fix the manifest until `apprafter app validate` accepts it — a reader \
              copies this block verbatim"
+        }
+        BEHAVIOUR_CLAIM => {
+            "the page describes behaviour the code no longer has. Read the \
+             evidence the finding names, then correct the sentence — and if \
+             the page was documenting a defect that has since been fixed, \
+             retract the note rather than softening it (ADR 0058: a defect \
+             note is a commitment to retract it)"
         }
         RECIPE_PURITY => {
             "route it by role (ADR 0058): delete walk material and assert the \
@@ -985,6 +1002,18 @@ impl Gate {
                     })
             };
             findings.extend(recipe_findings_for(&shown, &source, &mut exempt));
+            for (claim, line) in behaviour::falsified(&self.repo_root, &source, behaviour::CLAIMS)?
+            {
+                findings.push(finding(
+                    BEHAVIOUR_CLAIM,
+                    &shown,
+                    line,
+                    format!(
+                        "`{}` — the tree says otherwise ({}). {}",
+                        claim.phrase, claim.evidence, claim.because
+                    ),
+                ));
+            }
         }
         sort(&mut findings);
         Ok(findings)

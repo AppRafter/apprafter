@@ -65,6 +65,44 @@ worth knowing, set out below.
 | `health-baseline` | An obligation count fell below the committed census: the corpus lost documented surface it used to have. |
 | `health-exemptions` | The declared-exemption count no longer equals the census — one was declared, or one was retired. |
 | `recipe-purity` | A foreign command in a guide's recipe path: not `apprafter`, not an allowlisted external tool, not inside a collapsed disclosure, and not on a break-glass page. |
+| `behaviour-claim` | A watched sentence the tree says is false — the class every check above is blind to, because a stale claim names only things that still exist. |
+
+## `behaviour-claim`
+
+Every other class resolves a **name**. That is the design, and it is also
+the blind spot: the passage that cost most in this repository was one
+whose every noun resolved and whose verb was false. `backup-restore.md`
+documented two already-fixed defects as current behaviour for a week
+while the gate reported green, because `apprafter target machine` was
+still a command, `backup.rs` was still a file, and `run_backup_check`
+was still a function.
+
+`cli/docsgen/src/behaviour.rs` carries the watched sentences. Each entry
+binds a phrase to a **code fact** — a file and an anchor, and whether the
+anchor's presence makes the phrase true or false — so the table records
+what to watch and the repository decides the answer. Revert the fix
+behind an entry and the fact flips, the phrase becomes true again, and
+the check stops objecting. That is what keeps it from becoming the
+rotting deny-list ADR 0057 decision 7 would have been.
+
+Two properties are load-bearing and both are tested:
+
+- **An unreadable evidence file is an error, not a pass.** A renamed
+  file is exactly how a check like this goes quiet, so it fails and
+  names the path.
+- **Each entry is proved against the page that earned it.**
+  `behaviour_history_test.rs` pulls the real pages out of git history at
+  the commit where they shipped wrong, and asserts the check reports
+  them — and that the corrected pages are silent. A check written after
+  the fact passes on the corpus it was written against; the only
+  evidence it would have caught anything is that it catches what it
+  missed.
+
+Its honest scope: it watches sentences somebody thought to add. A
+behavioural claim nobody has burned on yet is not in the table and is
+not checked. Adding an entry is how a fix stops its page from
+describing the old behaviour again, and it should stay cheap enough to
+do every time.
 
 ## `recipe-purity`
 
