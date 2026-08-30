@@ -23,7 +23,7 @@ is the part worth having later.
 | **D5** | A Dragonfly restart drops every claim's ACL user | open — high |
 | **D6** | Rotating a secret does not take effect until something else restarts the pods | open — high, security |
 | **D7** | The CLI cannot answer the question its own error asks | open |
-| **D8** | A capacity warning nobody can receive | open |
+| **D8** | A node-scoped warning published through an optional object | open — medium-high |
 | **D9** | There is nothing to roll a moving tag back to | open |
 | **D10** | The applying half of right-sizing has never been observed to apply anything | open — high |
 | **D11** | 584 failures share one catch-all, and the cheap checks run last | open — high |
@@ -1002,41 +1002,97 @@ amendment predicted the guide would be unable to say what is sealed and in which
 namespace; the 2.19j walk observed exactly that. Counting this entry, three
 independent observations of one missing verb.
 
-## D8. A capacity warning nobody can receive
+## D8. A node-scoped warning published through an optional object
 
 **Opened:** 2026-08-30 (2.20c, correcting `docs/operator-guide/shared-volumes.md`).
+**Re-diagnosed 2026-08-30** after the owner asked whether `CapacityWarning`
+covers the volume or the machine's disk. It covers the machine's disk, and that
+inverts what is wrong here.
+
 **Status:** OPEN.
-**Severity:** medium. The signal exists, is correct, and reaches nobody.
+**Severity:** medium-high. The original entry said the signal reaches nobody
+through the CLI. It is worse: for most clusters the signal is never raised at
+all.
 
-### What is wrong
+### `CapacityWarning` is the node's disk, not the volume's
 
-The operator stamps a `CapacityWarning` condition on the `SharedVolume` CR and
-emits an edge-triggered Warning Event when a volume's node is nearly full. Both
-are the platform telling an operator to act before a disk fills.
+`node_free_fraction` (`resourceclaim-provisioner/src/capacity.rs:52-59`) reads
+`/node/fs/availableBytes` ÷ `/node/fs/capacityBytes` from the kubelet Summary
+API — **the node's root filesystem** — and `is_capacity_warning` fires below
+`DEFAULT_NODE_FREE_THRESHOLD = 0.15`, i.e. when the node is more than 85% full.
+The module's own docstring states the blast radius:
 
-No CLI surface reads either. `apprafter volume status` prints the sampled
-`Used`/`Free` bytes and nothing about the warning; `apprafter app status` says
-nothing about SharedVolumes at all. The guide names this itself, and then hands
-the reader two `kubectl` reads — one for the condition, one for
-`describe … | Events` — as the only way to receive a warning the platform went
-to the trouble of raising.
+> A node's local-path filesystem can fill up; when it does, the local-path PVCs
+> backing a `SharedVolume` **(and owned disks)** silently stop accepting writes.
 
-This is the same class as the `EnvSecretMissing` diagnosis gap recorded above:
-the platform opens a loop it cannot close. It is worse in one respect — that
-one is reached only after something has already gone wrong, while this one is
-the *early* warning, so a signal that reaches nobody costs the lead time it
-exists to buy.
+So the answer to "is there an equivalent for the node's disk?" is inverted:
+**the node's disk is the only thing warned about**, and it is stamped on a
+`SharedVolume`.
 
-### The fix
+### The defect: a node fact carried by an optional object
 
-`apprafter volume status` is already the command an operator runs to look at a
-volume, and already prints the sample the condition is derived from. Printing
-the condition beside it — the status, the reason, and the timestamp — closes
-the loop with no new noun and no new command to learn.
+A cluster with no `SharedVolume` gets **no node-disk warning at all**. Nothing
+else computes it, and nothing else carries it. Yet everything on a Tier-1 node
+shares that filesystem: owned `needs.disk` PVCs, CNPG data, Dragonfly snapshots,
+container images, logs. The docstring names owned disks explicitly as affected,
+and owned disks have no carrier for the signal.
 
-Worth doing at the same time: `apprafter app status` says nothing about
-SharedVolumes even for an application that mounts one, so an application-side
-reader has no path to the warning at all.
+Attaching a node-scoped fact to an application-scoped, optional CR is the
+whole bug. The CLI gap the original entry recorded is downstream of it.
+
+### There is no per-volume fullness warning
+
+`pvc_usage` (`capacity.rs:64-77`) samples `(usedBytes, capacityBytes)` per PVC
+and `shared_volume.rs:200` writes it to `status.capacity`. But
+`is_capacity_warning` takes **only** `node_free_fraction` — the per-volume
+numbers are sampled, stored, and **never thresholded**. A volume can be at 99%
+of its own request on a healthy node and nothing says so.
+
+### What the owner asked for
+
+1. **The node-disk warning belongs on every command that touches the target**,
+   in yellow, on the model of the CLI's own new-version notice —
+   `commands::version_check::maybe_warn_about_newer_version()`, called once from
+   `lib.rs:92` at the top of dispatch. That is the right shape and the right
+   hook: one call site, every command, non-fatal, impossible to miss and
+   impossible to be in the wrong place for. It also removes the dependency on
+   any particular CR existing.
+2. **The per-volume signal belongs in two places** — `apprafter volume status`
+   for the volume itself, and in the status of each application that consumes
+   it. Neither mentions capacity today.
+3. **`app status` should report the application's full state, including every
+   claim it consumes and that claim's own condition** — for example the size of
+   the database or the volume.
+
+On (3), the foundation is already there and is narrower than it sounds.
+`print_resource_claims` (`cli/platform-cli/src/commands/app.rs:1605`) already
+prints a claim table — `NAME / PROVIDER / READY / SCHEDULED / SECRET`. What is
+missing is the *state* column: the claim is shown as provisioned or not, never
+as how full it is. For volumes and owned disks the platform already samples the
+numbers (`pvc_usage`) and simply does not route them to an application-side
+reader. For a database size it would need a new probe — CNPG and Dragonfly both
+expose one.
+
+### The fix, in dependency order
+
+1. **Move the node signal off the `SharedVolume`.** It is node-scoped, so it
+   belongs somewhere node-scoped — a condition on the `PlatformStack` singleton
+   is the natural carrier, since that object already exists on every cluster and
+   is what `apprafter platform status` reads. Keep stamping the `SharedVolume`
+   too if useful, but stop making it the only path.
+2. **Warn on every command**, via the `version_check` hook shape, reading that
+   condition. Yellow, non-fatal, and best-effort in the same sense the sampler
+   already is — a cluster that cannot be reached must not turn a warning into an
+   error.
+3. **Threshold the per-volume sample** the platform already takes, and surface it
+   in `volume status` alongside the existing `Used`/`Free` line.
+4. **Extend the `app status` claim table with state**, starting with the volume
+   and disk numbers that already exist, and note the database-size probe as
+   follow-on work rather than blocking on it.
+
+Ships with: a walk that fills a node past the threshold and asserts the warning
+appears on an unrelated command (not just on `volume status`), and a walk step
+asserting a cluster with no `SharedVolume` still warns.
 
 ## D9. There is nothing to roll a moving tag back to
 
