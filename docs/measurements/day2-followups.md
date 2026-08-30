@@ -18,7 +18,7 @@ is the part worth having later.
 | --- | --- | --- |
 | **D1** | VPA in-place right-sizing has never run: wrong feature-gate name | RESOLVED |
 | **D2** | `--cron` / `--check-cron` are the wrong surface, not an unvalidated one | open (docs half landed, CLI half did not) |
-| **D3** | Two diagnostics whose `help:` text describes a layout that moved | open |
+| **D3** | Two diagnostics whose `help:` text describes a layout that moved | RESOLVED |
 | **D4** | Removing a `needs.*` entry orphans its ResourceClaim forever | open — high |
 | **D5** | A Dragonfly restart drops every claim's ACL user | open — high |
 | **D6** | Rotating a secret does not take effect until something else restarts the pods | open — high, security |
@@ -240,10 +240,14 @@ broke their platform sync.
 
 Replace the surface rather than validate it:
 
-- **`--at 03:00`** for the time of day, with **`--timezone`** beside it,
-  because a time without a zone is not a time. The CLI composes the cron
-  and sets `spec.timeZone` on the CronJob; neither is the operator's
-  problem.
+- **`--at 03:00`** for the time of day, defaulting to **the operator's
+  own timezone** — read from the machine running the command — with
+  `--timezone` to override it. A time without a zone is not a time, and
+  the zone the operator means is the one they are in; UTC is a
+  reasonable thing to ask for and a poor thing to assume. The CLI
+  composes the cron and sets `spec.timeZone` on the CronJob, so neither
+  is the operator's problem, and `backup status` prints the schedule
+  back in the same zone it was given.
 - **Frequency stays a product decision.** Daily for the backup, weekly
   for the check. If a second value is ever needed it is
   `--every day|week`, not a cron field.
@@ -258,12 +262,24 @@ only surface, and it must not be the one the guide teaches.
 
 **Opened:** 2026-08-20 (2.19j, correcting
 `docs/operator-guide/troubleshooting.md`).
-**Status:** open — text-only, but it is the text an operator reads at
-the exact moment they are stuck.
+**Status:** RESOLVED 2026-08-30. Both help texts corrected in
+`cli/cli-core/src/error.rs`, each with a test pinning the fix and its
+negative.
 
-Both live in `cli/cli-core/src/error.rs`. Left alone here because
-changing a shipped diagnostic's help is a CLI release, and because the
-troubleshooting page now states the correct answer beside the stale one.
+The entry deferred these because "changing a shipped diagnostic's help
+is a CLI release". That was true when written and stopped being true
+once 2.20a put two CLI fixes on the same release — the cost argument
+had quietly expired, and nothing re-examined it. Worth noting as a
+pattern: a deferral justified by a cost should name what makes the cost
+go away, or it outlives its reason.
+
+**A test was holding the second one in place.**
+`server_type_not_selected_has_stable_code_and_actionable_help` asserted
+the help contains `nodes[0].kind` — the wrong string, the Rust field
+name. So the defect was not merely unnoticed; it was defended on every
+run. That assertion now checks the durable part of the hint and the
+specific field name is pinned, positively and negatively, by a test of
+its own. **A test that pins the wrong string is worse than no test.**
 
 1. **`apprafter::state::corrupt`** (error.rs:152-155) says "The local
    `.apprafter/state.json` file … delete `.apprafter/`". State moved to
@@ -275,6 +291,12 @@ troubleshooting page now states the correct answer beside the stale one.
    the fix is to make the help point at it rather than at a fixed
    location.
 
+   **Fixed better than proposed.** The entry suggested pointing the help
+   at the real path. Since 2.20a there is a repair that needs no path at
+   all: `apprafter import --force` moves the unreadable file aside and
+   rebuilds from live resources, so the help now names that and says the
+   file is preserved rather than deleted.
+
 2. **`apprafter::provider::server_type_not_selected`** (error.rs:142)
    says "set `nodes[0].kind` in your Infrastructure manifest". There is
    no `kind` field on a node: the manifest schema declares
@@ -285,6 +307,8 @@ troubleshooting page now states the correct answer beside the stale one.
    `bootstrap-all --server-type` both say `spec.nodes[0].type` — so this
    one string is the outlier, and it names a field that a manifest
    author cannot set.
+
+   Now reads `spec.nodes[0].type`.
 
 ## D4. Removing a `needs.*` entry orphans its ResourceClaim forever
 

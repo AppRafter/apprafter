@@ -139,7 +139,7 @@ pub enum CliError {
             "No server type selected. Choose one:\n\
              • interactive: `apprafter target machine` (opens the machine picker)\n\
              • non-interactive / CI: `--server-type <sku>` or `APPRAFTER_SERVER_TYPE`\n\
-             • declaratively: set `nodes[0].kind` in your Infrastructure manifest"
+             • declaratively: set `spec.nodes[0].type` in your Infrastructure manifest"
         )
     )]
     ServerTypeNotSelected,
@@ -149,10 +149,11 @@ pub enum CliError {
     #[diagnostic(
         code(apprafter::state::corrupt),
         help(
-            "The local `.apprafter/state.json` file failed to parse. It was written by a \
-             previous run of `apprafter apply` / `import`. If the file looks salvageable, edit \
-             it by hand; otherwise delete `.apprafter/` and run `apprafter import` to rebuild \
-             it from live Hetzner resources tagged with `apprafter=true`."
+            "The state file named above failed to parse. It was written by a previous run \
+             of `apprafter apply` / `import`. Run `apprafter import --force` to rebuild it \
+             from live Hetzner resources tagged with `apprafter=true` — the unreadable file \
+             is moved aside rather than deleted, so it stays available if you want to \
+             salvage anything from it."
         )
     )]
     InvalidState { path: PathBuf, message: String },
@@ -425,8 +426,15 @@ mod tests {
             "missing interactive hint: {help}"
         );
         assert!(help.contains("--server-type"), "missing CI hint: {help}");
+        // The manifest hint is asserted by
+        // `server_type_help_names_the_manifest_key_not_the_rust_field`,
+        // which also pins the negative. This assertion used to require
+        // `nodes[0].kind` — the Rust field name — and so held the
+        // defect in place rather than catching it: a test that pins the
+        // wrong string is worse than no test, because it defends the
+        // bug on every run.
         assert!(
-            help.contains("nodes[0].kind"),
+            help.contains("Infrastructure manifest"),
             "missing manifest hint: {help}"
         );
     }
@@ -549,6 +557,49 @@ mod tests {
         assert!(
             !help.contains("rotated / revoked"),
             "outage help should not mention rotation: {help}"
+        );
+    }
+
+    #[test]
+    fn server_type_help_names_the_manifest_key_not_the_rust_field() {
+        // `kind` is the Rust field name — `type` is a keyword, so the
+        // struct renames it (cli-core/src/manifest.rs). The manifest
+        // key an author actually writes is `spec.nodes[0].type`
+        // (schemas/v1alpha1/infrastructure.cue). This help named the
+        // Rust side for months, telling operators to set a field the
+        // schema does not have; every other surface got it right, so it
+        // was the one outlier.
+        let help = help_of(&CliError::ServerTypeNotSelected);
+        assert!(
+            help.contains("spec.nodes[0].type"),
+            "help must name the manifest key: {help}"
+        );
+        assert!(
+            !help.contains("nodes[0].kind"),
+            "help must not name the Rust field: {help}"
+        );
+    }
+
+    #[test]
+    fn corrupt_state_help_points_at_the_repair_that_exists() {
+        // The old help said "delete `.apprafter/`", which stopped being
+        // the state location in v0.1.154 — an operator following it
+        // removed a legacy artefact and kept hitting the error. It is
+        // also no longer the remedy: `import --force` moves the
+        // unreadable file aside and rebuilds, so nothing has to be
+        // deleted by hand at all.
+        let err = CliError::InvalidState {
+            path: std::path::PathBuf::from("/anywhere/state.json"),
+            message: "expected value".into(),
+        };
+        let help = help_of(&err);
+        assert!(
+            help.contains("import --force"),
+            "help must name the repair that exists: {help}"
+        );
+        assert!(
+            !help.contains("delete `.apprafter/`"),
+            "help must not send the operator at a path state left in v0.1.154: {help}"
         );
     }
 
