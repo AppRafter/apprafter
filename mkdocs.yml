@@ -219,6 +219,7 @@ nav:
       - Declared Postgres dependencies: how-it-works/needs-pg.md
       - Declared Redis dependencies: how-it-works/needs-redis.md
       - Declared disk dependencies: how-it-works/needs-disk.md
+      - Egress derived from declared dependencies: how-it-works/egress-policy.md
   - Developer Guide:
       - Overview: dev-guide/index.md
       - Quickstart: dev-guide/quickstart.md

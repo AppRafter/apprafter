@@ -46,18 +46,20 @@ fn the_check_is_red_on_the_corpus_today() {
     );
 }
 
-/// Pages 2.20c has not reached yet, of the four the census named as
-/// worst — each of them an e2e walk transcribed into prose. Entries
-/// move to [`RESTRUCTURED`] as they are rewritten; the list emptying is
-/// what ends the red state.
-const STILL_LOUD: &[&str] = &["docs/operator-guide/egress-policy.md"];
-
 #[test]
-fn the_pages_not_yet_restructured_are_still_loud() {
+fn the_four_worst_pages_are_all_restructured() {
+    // The four pages the census named as worst — each an e2e walk
+    // transcribed into prose — are done. What remains is the long tail,
+    // which `the_check_is_red_on_the_corpus_today` still guards.
     let found = findings();
-    for page in STILL_LOUD {
-        let count = found.iter().filter(|f| f.file == *page).count();
-        assert!(count > 0, "{page} should be red and is not");
+    for page in [
+        "docs/operator-guide/postgres.md",
+        "docs/operator-guide/redis.md",
+        "docs/operator-guide/persistent-disk.md",
+        "docs/operator-guide/egress-policy.md",
+    ] {
+        let count = found.iter().filter(|f| f.file == page).count();
+        assert_eq!(count, 0, "{page} was restructured and must stay a recipe");
     }
 }
 
@@ -68,6 +70,7 @@ const RESTRUCTURED: &[&str] = &[
     "docs/operator-guide/postgres.md",
     "docs/operator-guide/redis.md",
     "docs/operator-guide/persistent-disk.md",
+    "docs/operator-guide/egress-policy.md",
 ];
 
 #[test]
@@ -76,7 +79,7 @@ fn a_restructured_page_is_silent() {
     // not. Kept as an assertion rather than deleted, because a page
     // going quiet is the evidence the restructure worked, and an
     // assertion that only ever gets removed proves nothing. Before
-    // 2.20c these carried 40, 39 and 36 findings.
+    // 2.20c these carried 40, 39, 36 and 21 findings.
     let found = findings();
     for page in RESTRUCTURED {
         let hits: Vec<_> = found
@@ -163,8 +166,10 @@ fn only_platform_tools_are_reported() {
     names.dedup();
     assert_eq!(
         names,
-        vec!["hubble".to_string(), "kubectl".to_string()],
-        "the reported tools changed; if this is a new guide reaching for a \
-         new tool, decide whether it is allowlisted or a finding"
+        vec!["kubectl".to_string()],
+        "the reported tools changed. A tool LEAVING this list is progress — a \
+         page was restructured, so narrow the expectation. A tool ARRIVING is \
+         either a guide reaching for something new or a gap in the allowlist, \
+         and both want a human. (`hubble` left with egress-policy.md in 2.20c.)"
     );
 }

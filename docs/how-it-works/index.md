@@ -25,6 +25,9 @@ than taken on faith.
 - [Declared disk dependencies](needs-disk.md) — how `needs.disk` becomes a
   mounted volume, why that volume has no owner and what the retention model
   rests on, and what single-writer storage forces on a rollout.
+- [Egress derived from declared dependencies](egress-policy.md) — the per-app
+  CiliumNetworkPolicy, which rules each profile emits, and how to tell a policy
+  drop from a missing listener.
 
 ## Why this section exists
 

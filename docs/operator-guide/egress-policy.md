@@ -1,217 +1,46 @@
 ---
-description: "How a declared dependency is also what opens the egress path to it, how to watch an undeclared reach get dropped, and the cluster-wide profile knob."
+description: "The cluster-wide egress posture: what declaring a dependency opens, the three profiles, how to change one, and what to do when an application loses reach."
 ---
 
-# Egress gated by declared dependencies
+# Egress policy
 
-This guide walks a Tier-1 operator through the `needs`-derived egress
-policy: the operator emits one egress **CiliumNetworkPolicy** per
-Application, so an app can reach an in-cluster backend (Postgres, Redis)
-only when it has **declared** that dependency. An app without `needs.pg`
-cannot reach the shared Postgres — the attempt is dropped at the Cilium
-datapath, visible as a Hubble `DROPPED` verdict. The cluster-wide posture
-is a single knob, `PlatformStack.spec.network.egress.profile`, managed by
-`apprafter platform egress`.
+An application may reach an in-cluster backend only when it has **declared**
+that dependency. `needs.pg` is what opens the path to Postgres; `needs.redis`
+is what opens the path to Redis. Everything else in-cluster — another
+namespace's database, an undeclared service — is denied at the network
+datapath, not by convention.
 
-The full design — the per-app CNP, the static connection-target catalog,
-the three profiles, and the deferred `connects` / `AccessGrant` /
-`ExternalSurface` follow-ups — is in
-[ADR 0045](../adr/0045-needs-networkpolicy-egress.md).
+There is one knob, cluster-wide: how much the *baseline* allows on top of that.
 
-## The model in one paragraph
+## The three profiles
 
-For **every** Application the operator renders one
-`CiliumNetworkPolicy` named `<deployment-name>-egress` in the app's
-namespace, selecting the app's pods on egress (which makes those pods
-default-deny on egress — a Cilium policy is an allow-list). The baseline
-rules allow DNS (kube-dns), same-namespace traffic, and the external
-internet (`toEntities: [world]`); then **one allow rule per declared
-network need** — `needs.pg` adds an allow to `cnpg-system` on port 5432,
-`needs.redis` adds an allow to `dragonfly-system` on 6379. Everything else
-in-cluster (cross-namespace, another team's database, an undeclared
-service) is denied. The `egress.profile` chooses which **baseline** rules
-are emitted; the need rules are always emitted regardless of profile.
-
-| Profile | Baseline allows | Meaning |
+| Profile | What it allows | When |
 | --- | --- | --- |
-| `internet` (default) | DNS + same-namespace + `world` + needs | Internet open; cross-service in-cluster gated by needs. |
-| `internal` | DNS + same-namespace + needs | In-cluster only — no external internet. |
-| `strict` | DNS + needs | Maximal — even same-namespace egress is denied (apps isolated within a namespace). |
+| `internet` (default) | DNS, same-namespace, the external internet, plus every declared need | The launch default. Applications reach the internet freely; in-cluster reach is gated by what they declare. |
+| `internal` | DNS, same-namespace, plus every declared need | No outbound internet. For clusters that must not talk to the outside world. |
+| `strict` | DNS plus every declared need | Applications are isolated even from co-located pods in their own namespace. |
 
-The profile lives on the cluster-wide `PlatformStack` singleton. When the
-field is unset the operator falls back to the documented `internet`
-default, so a freshly bootstrapped cluster behaves like the table's first
-row with nothing declared.
+**A declared need stays open at every profile.** Tightening the posture never
+breaks a dependency an application declared — it removes baseline reach, not
+need-derived reach.
 
-> **Behaviour change.** The moment the egress-aware operator rolls out,
-> existing apps become egress-restricted for cross-namespace in-cluster
-> traffic. DNS, same-namespace, the external internet, and any **declared**
-> need stay open. An app that silently relied on reaching an **undeclared**
-> in-cluster service (for example another namespace's Postgres without a
-> `needs.pg`) will break — this is the intended security tightening.
-> Declare the dependency, or relax the profile, to restore reach.
-
-## Prerequisites
-
-- A real Tier-1 cluster provisioned with `apprafter bootstrap-all` (see
-  [`quickstart.md`](quickstart.md)) running **Cilium** (the platform's CNI
-  on every tier) with Hubble available for flow observation.
-- `kubectl` bound to the cluster:
-
-  ```sh
-  apprafter kubeconfig --refresh > /tmp/kc && export KUBECONFIG=/tmp/kc
-  ```
-
-- The `cilium` and `hubble` CLIs (the `nix develop` shell ships
-  `cilium-cli`). Hubble is the lens that makes a drop **observable** —
-  without it you only see a connection time out.
-
-## Step 1 — deploy one app with a need and one without
-
-Register two Applications in a tenant namespace. `web` declares
-`needs.pg`; `noproxy` declares nothing.
+## Read and change the posture
 
 ```sh
-kubectl create namespace demo
-
-# web — declares needs.pg
-kubectl apply -f - <<'YAML'
-apiVersion: apprafter.io/v1alpha1
-kind: Application
-metadata:
-  name: web
-  namespace: demo
-spec:
-  base:
-    image: nginxdemos/hello:plain-text
-    replicas: 1
-    expose: { port: 80, network: internal }
-    needs:
-      pg:
-        selector: { tier: integrated }
-        size: small
-YAML
-
-# noproxy — no needs
-kubectl apply -f - <<'YAML'
-apiVersion: apprafter.io/v1alpha1
-kind: Application
-metadata:
-  name: noproxy
-  namespace: demo
-spec:
-  base:
-    image: nginxdemos/hello:plain-text
-    replicas: 1
-    expose: { port: 80, network: internal }
-YAML
-```
-
-Wait for both to reach `Ready`:
-
-```sh
-kubectl -n demo wait --for=jsonpath='{.status.phase}'=Ready \
-  application.apprafter.io/web application.apprafter.io/noproxy --timeout=8m
-```
-
-## Step 2 — inspect the emitted policies
-
-Each Application has its own egress policy. `web-egress` carries the pg
-allow rule; `noproxy-egress` carries only the baseline.
-
-```sh
-kubectl -n demo get ciliumnetworkpolicies
-
-# web-egress references cnpg-system + port 5432 (the pg allow rule):
-kubectl -n demo get ciliumnetworkpolicy web-egress -o jsonpath='{.spec.egress}'
-
-# noproxy-egress has NO cnpg-system reference (no pg rule):
-kubectl -n demo get ciliumnetworkpolicy noproxy-egress -o jsonpath='{.spec.egress}'
-```
-
-The policy is owned by its Application, so deleting the app cascades the
-policy away.
-
-## Step 3 — observe the enforcement (the load-bearing proof)
-
-Connectivity must be probed **from inside the app's own pods**, because
-those are the pods the policy selects on egress (a separate tool pod is not
-selected, so it would have open egress and prove nothing).
-
-```sh
-WEB=$(kubectl -n demo get pod -l apprafter.io/application=web \
-  -o jsonpath='{.items[0].metadata.name}')
-NOPROXY=$(kubectl -n demo get pod -l apprafter.io/application=noproxy \
-  -o jsonpath='{.items[0].metadata.name}')
-
-# noproxy -> Postgres: DENIED (no needs.pg). The connect fails:
-kubectl -n demo exec "$NOPROXY" -- \
-  timeout 8 nc -w 5 -z platform-postgres-rw.cnpg-system 5432; echo "exit=$?"
-
-# web -> Postgres: ALLOWED (declared needs.pg). The connect succeeds:
-kubectl -n demo exec "$WEB" -- \
-  timeout 8 nc -w 5 -z platform-postgres-rw.cnpg-system 5432; echo "exit=$?"
-```
-
-Confirm the **datapath verdict** with Hubble — this is what distinguishes a
-policy drop from a missing listener:
-
-```sh
-# A DROPPED flow from noproxy toward cnpg-system:
-hubble observe --pod demo/noproxy --to-namespace cnpg-system --verdict DROPPED
-
-# A FORWARDED flow from web toward cnpg-system:
-hubble observe --pod demo/web --to-namespace cnpg-system --verdict FORWARDED
-```
-
-Under the default `internet` profile, both pods can still reach the
-external internet:
-
-```sh
-kubectl -n demo exec "$WEB" -- timeout 8 nc -w 5 -z 1.1.1.1 443; echo "exit=$?"
-```
-
-## Step 4 — tighten the posture with the CLI
-
-`apprafter platform egress` reads and sets the cluster-wide profile. There
-is no need to hand-edit the `PlatformStack` CR.
-
-```sh
-# Show the active profile and what it allows:
 apprafter platform egress show
+```
 
-# Tighten to in-cluster only — drops the `world` rule, keeps the needs:
+prints the active profile and what it allows. To change it:
+
+```sh
 apprafter platform egress set internal
 ```
 
-After the operator re-renders (a few seconds), `web-egress` no longer
-carries the `world` rule. The external connect is now denied, while
-Postgres still works for `web`:
-
-```sh
-kubectl -n demo get ciliumnetworkpolicy web-egress -o jsonpath='{.spec.egress}'  # no `world`
-kubectl -n demo exec "$WEB" -- timeout 8 nc -w 5 -z 1.1.1.1 443; echo "exit=$?"   # fails
-kubectl -n demo exec "$WEB" -- \
-  timeout 8 nc -w 5 -z platform-postgres-rw.cnpg-system 5432; echo "exit=$?"      # succeeds
-```
-
-Tighten further to isolate apps **within** a namespace:
-
-```sh
-apprafter platform egress set strict
-```
-
-Under `strict` the same-namespace baseline rule is dropped too, so an app
-can no longer reach a co-located pod it does not have a need for — only
-DNS and its declared needs remain. The declared need stays open at every
-profile, so `web` keeps reaching Postgres.
-
-```sh
-# noproxy can no longer reach the same-namespace web pod under strict:
-WEB_IP=$(kubectl -n demo get pod "$WEB" -o jsonpath='{.status.podIP}')
-kubectl -n demo exec "$NOPROXY" -- timeout 8 nc -w 5 -z "$WEB_IP" 80; echo "exit=$?"  # fails
-hubble observe --pod demo/noproxy --to-namespace demo --verdict DROPPED
-```
+The operator re-renders every application's policy within a few seconds. There
+is no `PlatformStack` CR to hand-edit, and the value survives Argo CD's
+self-heal — see [How it
+works](../how-it-works/egress-policy.md#how-the-profile-survives-a-gitops-sync)
+for the one case where it does not.
 
 To return to the launch default:
 
@@ -219,65 +48,61 @@ To return to the launch default:
 apprafter platform egress set internet
 ```
 
-## How the profile persists across GitOps syncs
+??? note "Verify independently with kubectl"
 
-`apprafter platform egress set` writes the profile with a server-side apply
-under the `apprafter-cli` field manager. On a Tier-1 cluster with no
-infra-repo, the platform-stack chart does **not** declare
-`spec.network.egress.profile`, so nothing in Git competes with the CLI's
-value and it survives Argo CD self-heal. If you opt into an infra-repo that
-declares the field, Git wins on the next sync and `apprafter platform
-egress set` prints a warning — change the profile in the repo instead.
+    Each application has its own policy, named after its deployment. The
+    difference between an application that declares a dependency and one that
+    does not is visible in the rules:
 
-## What this guide does NOT cover (deferred)
+    ```sh
+    kubectl -n demo get ciliumnetworkpolicies
 
-- **`connects` / app-to-app egress** and **`AccessGrant`-gated**, per-app
-  fine-grained access. The shipped slice covers only the cluster-wide
-  profile; finer
-  control layers onto the same CNP mechanism later.
-- **`ExternalSurface`-gated external egress.** The `internet` profile
-  leaves `world` open; allow-listing specific external destinations is a
-  future step.
-- **L7 / DNS-aware rules and mTLS.** The policy is L3/L4 only at launch.
-- **`needs.disk`** — a mounted volume has no network target, so it adds no
-  egress rule.
+    # an app with needs.pg carries an allow to cnpg-system on 5432
+    kubectl -n demo get ciliumnetworkpolicy web-egress -o jsonpath='{.spec.egress}'
+    ```
 
-## For contributors — the automated end-to-end script
+    After `platform egress set internal` the same policy no longer carries the
+    `world` rule, while its pg rule is untouched.
 
-Optional, and it needs a checkout of the AppRafter repository — nothing
-above does. If you are changing the platform, `just e2e-networkpolicy`
-runs the enforcement script on a local kind cluster: it brings kind up
-with the default CNI and kube-proxy disabled so Cilium owns the
-datapath, bootstraps with Cilium, enables Hubble, then proves the chain
-end to end (a needs-less app dropped to Postgres, a `needs.pg` app
-forwarded, profile switches via the CLI):
+## When you tighten the posture
 
-```sh
-just e2e-networkpolicy
-```
+An application that silently relied on reaching an **undeclared** in-cluster
+service will lose that reach. This is the intended tightening rather than a
+regression, and it is the one thing to plan for before changing the profile.
 
-On **rootless podman** the script preflights the memlock limit and, if it is
-too low, fails in a few seconds with the exact fix (instead of a ~7-minute
-cilium-agent `CrashLoopBackOff`). Cilium's eBPF agent raises
-`RLIMIT_MEMLOCK` to infinity at startup; under rootless podman the kind
-node is capped at the host user's systemd memlock hard limit (default
-8 MB) and no container flag (privileged / `CAP_SYS_RESOURCE` / `--ulimit`)
-can exceed it. Raise it once, as root, then re-login:
+The fix is to declare the dependency — that is what opens the path, and it is
+also what makes the dependency visible to everyone reading the manifest. Where
+no `needs` type covers the destination yet, relaxing the profile is the
+interim answer.
 
-```sh
-sudo mkdir -p /etc/systemd/system/user@.service.d
-printf '[Service]\nLimitMEMLOCK=infinity\n' \
-  | sudo tee /etc/systemd/system/user@.service.d/90-memlock.conf
-sudo systemctl daemon-reload
-loginctl terminate-user "$USER"   # or log out / in (a reboot also works)
-# verify: podman run --rm busybox sh -c 'ulimit -Hl'   # must print: unlimited
-```
+The same applies the first time an egress-aware operator rolls out onto a
+cluster whose applications predate it: DNS, same-namespace, the internet and
+every declared need stay open; undeclared cross-namespace reach does not.
 
-**Rootful Docker** (including GitHub Actions `ubuntu-latest`) needs nothing —
-`dockerd` ships `LimitMEMLOCK=infinity`. In CI the script runs nightly on a
-rootful Docker runner (`.github/workflows/e2e-networkpolicy-nightly.yml`).
-The other AppRafter end-to-end scripts use kindnet (no Cilium) and
-never hit this.
+## How it works
+
+[Egress derived from declared dependencies](../how-it-works/egress-policy.md)
+covers the per-application policy the operator renders, which rules each
+profile emits, how to tell a policy drop from a missing listener, and what is
+deliberately not covered by the shipped slice.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| ------- | ------------ | --- |
+| An application cannot reach an in-cluster service it used to reach | the dependency is not declared, and the baseline no longer covers it | Declare it (`needs.pg`, `needs.redis`) — that is what opens the path. Check what the app's own policy allows: `kubectl -n <ns> get ciliumnetworkpolicy <app>-egress -o jsonpath='{.spec.egress}'`. |
+| An application cannot reach the internet | the profile is `internal` or `strict` | `apprafter platform egress show`; set `internet` if outbound access is intended. |
+| Two applications in one namespace cannot reach each other | the profile is `strict`, which drops the same-namespace baseline | Either declare the dependency, or move to `internal`. |
+| A connection times out and it is unclear whether policy or the service is at fault | both look identical from inside the pod | Ask the datapath: `hubble observe --pod <ns>/<app> --to-namespace <target-ns> --verdict DROPPED`. A `DROPPED` verdict is the policy; no flow at all is usually DNS or a missing listener. |
+| `apprafter platform egress set` warns that Git owns the field | an infrastructure repository declares the profile | Change it in the repository — Argo CD will otherwise revert the CLI's value on the next sync. |
+
+## Prerequisites
+
+- A Tier-1 cluster provisioned with `apprafter bootstrap-all` (see the
+  [Quickstart](quickstart.md)). Cilium is the platform's CNI on every tier, so
+  the policy machinery is always present.
+- For the verification blocks above only, a kubeconfig, and — to read datapath
+  verdicts — the `hubble` CLI (the `nix develop` shell ships `cilium-cli`).
 
 ## Related
 
