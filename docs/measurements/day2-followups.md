@@ -1132,14 +1132,60 @@ loop to recover from it.
 
 ### The fix
 
-Retain the previously-resolved digest — one field on `Application.status`
-alongside the resolution the operator already performs — and let
-`app rollback` fall back to it when the Git revision is unchanged. That makes
-the command mean what its name says in the case the platform's own headline
-feature creates.
+Retaining the digest is the easy half. `StatusImage`
+(`operator-core/src/application.rs:469-480`) already carries
+`{tag, resolved, resolvedAt}` — the *current* resolution with its timestamp — so
+a `previous` sibling (or a short bounded history) is a small additive change to
+a struct that exists. `status.lastAppliedSpec` does not help here and should not
+be reached for: it holds the previous *spec*, which carries the tag, and after a
+same-tag push the tag is identical.
 
-Ships with a walk step that pushes a second image to the same tag and asserts
-the rollback returns the workload to the first.
+The hard half is what the owner's follow-up questions expose.
+
+**A rollback against a moving tag must pin, so it is a mode change, not a value
+change.** If the workload is merely set back to the older digest, the operator's
+next reconcile re-resolves `:latest`, finds the bad build again, and rolls
+forward — within the 60-second requeue. So rolling back necessarily takes the
+application *off* the moving-tag train. That is not a side effect to tolerate;
+it is the operation.
+
+Three consequences follow, and all three are requirements rather than polish:
+
+1. **A verb to get back on the train is mandatory, not a nice-to-have.** Without
+   it, `rollback` is a one-way door out of the platform's headline feature, and
+   the only documented way back is hand-editing the manifest — which is the same
+   "abandon auto-deploy to recover from it" trap this entry already records,
+   arrived at from the other side.
+2. **The pin must be visible.** `ImageResolved` is documented as *"absent when
+   `imagePolicy.resolve: off`"*, and an absent condition is not something a human
+   reads. Without a positive statement — `app status` saying, in words, that this
+   application is pinned at a digest and is no longer following `:latest` — the
+   next failure is silent: a developer pushes the fix, nothing deploys, and
+   nothing says why. That is the same shape as D6, D8 and D10 in this file.
+3. **`--to` is already taken, by a Git revision.** The flag exists today and
+   documents itself as "commit SHA / tag / branch". A digest is also a hash, so
+   `--to <hash>` is ambiguous the moment images enter. The clean discriminator is
+   the OCI form itself: `--to sha256:…` is an image digest, anything else is a
+   Git revision. Worth deciding explicitly rather than discovering later.
+
+**Where the pin lives is the open design question**, and it is not obvious.
+`app rollback` avoids GitOps drift today by patching `spec.source.targetRevision`
+on the **Argo CD** Application — Argo's own field, which Argo will not revert.
+There is no Argo-side equivalent for an image pin, and the AppRafter
+`Application` CR is rendered by the CMP from the Git manifest, so writing
+`spec.base.image` on the CR would be undone by the next sync.
+
+The precedent to follow is 2.10's: `apprafter platform egress set` hit exactly
+this and solved it with a **dedicated SSA field manager**
+(`apprafter-cli-egress`), which lets the CLI own one field inside an object Argo
+otherwise manages without the two pruning each other. An image pin written under
+its own manager, and read by the operator ahead of the resolver, fits that shape.
+
+Ships with: a walk step that pushes a second image to the same tag and asserts
+the rollback returns the workload to the first **and that it stays there across
+at least two reconciles** (the naive fix passes the first assertion and fails the
+second); a step asserting the un-pin verb returns the app to following the tag;
+and an assertion that `app status` states the pinned mode in words.
 
 ## D10. The applying half of right-sizing has never been observed to apply anything
 
