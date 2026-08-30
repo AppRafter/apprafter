@@ -14,22 +14,26 @@ title. Numbers are permanent: a resolved entry keeps its number and its
 text rather than being deleted, because what was wrong and what it cost
 is the part worth having later.
 
-| | Entry | Status |
-| --- | --- | --- |
-| **D1** | VPA in-place right-sizing has never run: wrong feature-gate name | RESOLVED |
-| **D2** | `--cron` / `--check-cron` are the wrong surface, not an unvalidated one | open (docs half landed, CLI half did not) |
-| **D3** | Two diagnostics whose `help:` text describes a layout that moved | RESOLVED |
-| **D4** | Removing a `needs.*` entry orphans its ResourceClaim forever | open — high |
-| **D5** | A Dragonfly restart drops every claim's ACL user | open — high |
-| **D6** | Rotating a secret does not take effect until something else restarts the pods | open — high, security |
-| **D7** | The CLI cannot answer the question its own error asks | open |
-| **D8** | A node-scoped warning published through an optional object | open — medium-high |
-| **D9** | There is nothing to roll a moving tag back to | open |
-| **D10** | The applying half of right-sizing has never been observed to apply anything | open — high |
-| **D11** | 584 failures share one catch-all, and the cheap checks run last | open — high |
-| **D12** | Removing `expose` leaves the Service behind | open — medium |
-| **D13** | A registry credential copy that nothing ever reclaims | open — high, security |
-| **D14** | Re-sealing a secret performs a gated change through an ungated door | resolved by decision — disclosure work open |
+Fixes are planned as **`plan.md` §2.22**, grouped by shared fix and release
+chain rather than one entry at a time — several of these share a root cause and
+would otherwise touch the same code three times.
+
+| | Entry | Status | Planned as |
+| --- | --- | --- | --- |
+| **D1** | VPA in-place right-sizing has never run: wrong feature-gate name | RESOLVED | — |
+| **D2** | `--cron` / `--check-cron` are the wrong surface, not an unvalidated one | open (docs half landed, CLI half did not) | **unplanned** |
+| **D3** | Two diagnostics whose `help:` text describes a layout that moved | RESOLVED | — |
+| **D4** | Removing a `needs.*` entry orphans its ResourceClaim forever | open — high | 2.22b |
+| **D5** | A Dragonfly restart drops every claim's ACL user | open — high | 2.22f |
+| **D6** | Rotating a secret does not take effect until something else restarts the pods | open — high, security | 2.22c |
+| **D7** | The CLI cannot answer the question its own error asks | open | 2.22c |
+| **D8** | A node-scoped warning published through an optional object | open — medium-high | 2.22d |
+| **D9** | There is nothing to roll a moving tag back to | open | 2.22e |
+| **D10** | The applying half of right-sizing has never been observed to apply anything | open — high | 2.22d |
+| **D11** | 584 failures share one catch-all, and the cheap checks run last | open — high | 2.22a |
+| **D12** | Removing `expose` leaves the Service behind | open — medium | 2.22b |
+| **D13** | A registry credential copy that nothing ever reclaims | open — high, security | 2.22b |
+| **D14** | Re-sealing a secret performs a gated change through an ungated door | resolved by decision — disclosure work open | 2.22c |
 
 ## D1. VPA in-place right-sizing has never run: wrong feature-gate name
 
