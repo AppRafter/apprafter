@@ -10,7 +10,7 @@ Date: 2026-08-08.
 
 The 2.16d resource baseline (ADR 0053) gave every app container a conservative Burstable seed (`requests {cpu 25m, memory 32Mi}`, `limits {memory 512Mi}`) so no pod is BestEffort. That closed *safety* but not *right-sizing*: the 32Mi request under-provisions real workloads (the scheduler over-packs a narrow node), and a seed cannot know an arbitrary app's true footprint — only observation can. AppRafter targets a Vercel-like "it just works" experience on a single ~4GB T1 node (measured allocatable ~1958Mi after reservations), so the platform, not the user, should correct requests to observed usage.
 
-Kubernetes in-place pod resize is GA cluster-side on the pinned k8s v1.35 (`InPlacePodVerticalScaling`), containerd is ≥2.0 (CRI `UpdateContainerResources`), cgroup v2 — so a request change can be applied to a live pod without eviction, which removes the single-node eviction objection that otherwise makes vertical autoscaling hostile to a one-replica app.
+Kubernetes in-place pod resize (`InPlacePodVerticalScaling`) is available cluster-side on the k3s releases the stable channel serves — **not on a version this platform pins; see the third amendment**, containerd is ≥2.0 (CRI `UpdateContainerResources`), cgroup v2 — so a request change can be applied to a live pod without eviction, which removes the single-node eviction objection that otherwise makes vertical autoscaling hostile to a one-replica app.
 
 ## Decision
 
@@ -50,6 +50,48 @@ Out of scope (documented follow-ups): backend right-sizing (CNPG/Dragonfly resou
 - **`mode: off` is not symmetric:** it freezes live pods but the next pod recreation admits at the seed (32Mi) — a deferred, decoupled capacity change. Mitigation: `autoscale set off` warns at the point of action; the walk pins the behaviour.
 - **metrics-server is an undeclared prerequisite** (the recommender reads `metrics.k8s.io`; k3s installs it by default). Mitigation: recorded here; the walk asserts `kubectl top pod` responds.
 - **`vpa_available` startup probe can go stale-true** if an infra overlay disables the component while the operator runs. We accept this (the `cilium_available` precedent has the same property); a live cluster is the only thing that catches it.
+
+## Third amendment — the premise was never pinned (2026-08-30)
+
+The Context above originally asserted that in-place resize is GA on a Kubernetes
+version *this platform pins*, and named one. Nothing in this platform pins a
+Kubernetes version. `build_k3s_user_data`
+(`cli-providers/src/hetzner_cloud/user_data.rs:486`) installs stable-channel k3s
+with no `INSTALL_K3S_VERSION`, and `quickstart.md` states as much. The sentence
+has been corrected; this records why it mattered and what to do.
+
+**It is benign today and that is the problem.** `InPlacePodVerticalScaling` is
+on by default at the versions the stable channel currently serves, so the
+premise holds — by an upstream default rather than by anything the platform
+arranges. A channel that moves under us would turn the whole applying half of
+this ADR back off, and nothing would report it: the failure mode is exactly the
+silence D10 records, arriving from a different direction.
+
+The contrast is sharp and in-tree. The node-swap path *does* preflight its
+kubelet prerequisite (`node_prep.rs`, `k8s_ge_134`). The VPA prerequisite, on
+which this ADR's central claim rests, is preflighted nowhere.
+
+**Actions**, tracked as D10 in `docs/measurements/day2-followups.md`: preflight
+the version and the feature gate at bootstrap the way the swap path does, assert
+it in `e2e/vpa-walk.sh`, and decide separately whether the platform should pin a
+Kubernetes version at all — an unpinned control plane is a larger question than
+this ADR, and this amendment does not settle it.
+
+**Mechanically guarded.** The phrase is now a `behaviour-claim` entry
+(`cli/docsgen/src/behaviour.rs`), anchored on `INSTALL_K3S_VERSION` with
+`Expect::Present`: any page asserting a pinned Kubernetes fails the
+documentation gate until something actually pins one, at which point the claim
+becomes true and the entry retires itself. This is the third document found in
+one session asserting a property of the tree that does not hold — after the
+1.83b design spec's "same prune discipline the Service already follows" (D12)
+and ADR 0007's developer-facing framing of `apprafter secret` — which is the
+argument for making the class mechanical rather than noticing it a fourth time.
+
+One sharp edge, learned by tripping over it while writing this amendment: a
+watched phrase must be chosen so that **the correction can describe itself
+without quoting it**. The first draft of the paragraph above reproduced the old
+sentence verbatim and failed its own gate. That is the check working, and it is
+also a constraint on phrase selection worth knowing before adding an entry.
 
 ## Amendment — the gate name, and the risk this ADR named coming true (2026-08-21)
 

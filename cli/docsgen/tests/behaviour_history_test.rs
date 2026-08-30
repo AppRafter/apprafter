@@ -113,6 +113,39 @@ fn it_catches_the_stale_redis_capture_claim() {
 }
 
 #[test]
+fn it_catches_the_unpinned_kubernetes_premise() {
+    // docs/adr/0054-vpa-vertical-autoscaling.md at 1417aa7 — the last
+    // commit before the correction. Its Context rested the whole
+    // in-place premise on "the pinned k8s v1.35" while nothing in the
+    // platform pinned a version: `build_k3s_user_data` installs
+    // stable-channel k3s with no `INSTALL_K3S_VERSION`, and
+    // `quickstart.md` says so outright. Every name in the sentence
+    // resolved, so `docsgen gate` was green on it — the same blind spot
+    // the three fixtures above record, found in an ADR rather than a
+    // guide.
+    let root = repo_root();
+    let Some(page) = at_commit(
+        &root,
+        "1417aa7",
+        "docs/adr/0054-vpa-vertical-autoscaling.md",
+    ) else {
+        eprintln!("fixture commit 1417aa7 unavailable in this checkout — skipping");
+        return;
+    };
+
+    let phrases: Vec<&str> = behaviour::falsified(&root, &page, CLAIMS)
+        .expect("judged")
+        .iter()
+        .map(|(c, _)| c.phrase)
+        .collect();
+    assert!(
+        phrases.contains(&"the pinned k8s v1.35"),
+        "the unpinned-Kubernetes premise went unreported on the ADR that \
+         carried it: {phrases:?}"
+    );
+}
+
+#[test]
 fn the_corrected_pages_are_silent() {
     // The other half: the same pages as they stand now report nothing.
     // Without this, a check that flagged every page would pass every
@@ -122,6 +155,7 @@ fn the_corrected_pages_are_silent() {
         "docs/operator-guide/backup-restore.md",
         "docs/operator-guide/troubleshooting.md",
         "docs/reference/cli/export.md",
+        "docs/adr/0054-vpa-vertical-autoscaling.md",
     ] {
         let page = std::fs::read_to_string(root.join(path)).expect("read");
         let found = behaviour::falsified(&root, &page, CLAIMS).expect("judged");

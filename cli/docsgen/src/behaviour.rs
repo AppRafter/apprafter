@@ -115,6 +115,23 @@ pub const CLAIMS: &[Claim] = &[
                   claim verbatim from the doc comment.",
     },
     Claim {
+        phrase: "the pinned k8s v1.35",
+        evidence: "cli/cli-providers/src/hetzner_cloud/user_data.rs",
+        anchor: "INSTALL_K3S_VERSION",
+        // PRESENT, not Absent: this phrase becomes TRUE the day someone
+        // actually pins the version, and the entry retires itself. That
+        // is the property this table exists for — the sentence is not
+        // forbidden, it is unsupported, and the tree decides which.
+        truth: Expect::Present,
+        because: "ADR 0054 rests its whole in-place premise on a pinned \
+                  Kubernetes, and nothing pins one: build_k3s_user_data \
+                  installs stable-channel k3s with no INSTALL_K3S_VERSION, \
+                  which quickstart.md states outright. Benign today only \
+                  because the gate is on by default at the versions the \
+                  channel serves — an upstream default, not something the \
+                  platform arranges or would notice changing. D10.",
+    },
+    Claim {
         phrase: "backing claim and its data are garbage-collected",
         evidence: "operator/charts/apprafter-operator/templates/rbac.yaml",
         // The verb list of the resourceclaims rule, verbatim and without
