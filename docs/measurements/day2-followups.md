@@ -204,3 +204,176 @@ troubleshooting page now states the correct answer beside the stale one.
    `bootstrap-all --server-type` both say `spec.nodes[0].type` — so this
    one string is the outlier, and it names a field that a manifest
    author cannot set.
+
+## Removing a `needs.*` entry orphans its ResourceClaim forever
+
+**Opened:** 2026-08-30 (2.20c, correcting `docs/operator-guide/postgres.md`,
+`redis.md`, `persistent-disk.md` and their `how-it-works/` siblings).
+**Status:** OPEN.
+**Severity:** high. Data and credentials the operator believes are on a
+seven-day clock stay live indefinitely, and the shared backend they sit on can
+never scale down.
+
+### What is wrong
+
+Four documents say the claim is garbage-collected. No code deletes it.
+
+- ADR 0051:86-87 — "on the next reconcile the controller applies the new spec
+  (**including any `needs` GC**)".
+- ADR 0051:107-108 — "removal of any `needs.*` entry — the `ResourceClaim` and
+  its data are garbage-collected."
+- `spec.md:555` (public) — the same sentence.
+- `docs/operator-guide/migration-plans.md:62` (public) — "the backing claim and
+  its data are garbage-collected".
+- `plan.md:3599` — the removal of a `needs.*` entry is described as triggering
+  the 2.4f ResourceClaim GC, with the gate mandatory for that reason.
+
+What the code does: the Application controller's needs block
+(`operator-controllers/application/src/lib.rs:504-544`) is **generate-only**.
+`has_needs` gates the whole block on the NEW spec, `generate_resource_claims`
+builds payloads for the declared entries, and the loop SSA-applies exactly
+those names. There is no LIST of live claims, no diff against a desired set,
+and no delete. Removing the last need makes `has_needs` false and the block is
+skipped entirely — the claim is not even read.
+
+Approving the MigrationPlan changes nothing:
+`ApplicationMigrationStrategy::execute_step`
+(`operator-controllers/migration/src/strategy.rs:70-80`) unconditionally
+returns `Succeeded` for every step, so approval marches the plan to `completed`
+and does zero cluster work.
+
+**The RBAC confirms it was never intended to be possible.**
+`charts/apprafter-operator/templates/rbac.yaml:202-212` grants
+`get, list, watch, create, patch, update` on `resourceclaims`. There is no
+`delete` verb — no code path could delete a claim today even if one existed.
+(Same class as the two RBAC-versus-code mismatches ADR 0048 and the 0.2.31 GC
+fix already cost us.)
+
+### What it costs
+
+1. **The retention path never starts.** No delete means no `deletion_timestamp`,
+   so the provisioner finalizer
+   (`resourceclaim-provisioner/src/reconcile.rs:144-159`) never fires, no
+   `RetainedClaim` snapshot is written, the seven-day clock never starts, and
+   `gc.rs` never has anything to reclaim. The database, volume or ACL user
+   survives indefinitely — and for redis it is *actively re-asserted* every 300s
+   by the ACL resync loop.
+2. **The shared backend can never scale down.** The reaper LISTs every live
+   `ResourceClaim` as its veto set (`reaper.rs:541`) and vetoes on any match
+   (`reaper.rs:389`, `Decision::Veto(VetoReason::Live)`). An orphan is
+   indistinguishable from a live tenant, so the pool instance or shared CNPG
+   cluster is pinned up forever by an application that no longer declares it.
+3. **Visible but unflagged.** `apprafter app status` does list the claim (the
+   orphan keeps its `ownerReferences`, and `list_resource_claims_for_app`
+   filters on exactly that), but nothing marks it as undeclared — no condition,
+   no phase, no metric. The operator has to diff the printed claim table against
+   their own manifest to notice.
+
+### Why every gate passed
+
+No test asserts the current behaviour, and no walk exercises the path. All four
+needs walks (`e2e/needs-pg-walk.sh`, `needs-redis-walk.sh`, `needs-disk-walk.sh`,
+`app-migration-walk.sh`) delete the whole Application to test retention; none
+removes a single `needs` entry. `app-migration-walk.sh` touches `needs_pg` once,
+and only for the `selector` tripwire.
+
+### The fix
+
+The same reconcile already prunes two other declared-then-undeclared children —
+`prune_http_route` (`lib.rs:758`, when the app stops being public) and
+`prune_vpa` (`lib.rs:784`). Claims are the one child with no prune arm; the fix
+is a third one in the same shape.
+
+Ordering matters and is the whole risk: the delete must happen only after the
+plan is approved and the new spec applied, so an unapproved edit cannot destroy
+anything, and the provisioner finalizer must still run so the snapshot is
+written and the seven-day window opens as documented.
+
+Ships with: the missing `delete` verb in `rbac.yaml`, a unit test on the
+desired-set diff, and a walk step that removes one `needs` entry from a
+two-need app and asserts a `RetainedClaim` appears while the other claim is
+untouched. Without that last one the class stays invisible exactly as it is now.
+
+## A Dragonfly restart drops every claim's ACL user
+
+**Opened:** 2026-08-30 (2.20c, correcting `docs/operator-guide/redis.md` and
+`docs/how-it-works/needs-redis.md`).
+**Status:** OPEN.
+**Severity:** high. A single pod restart is a cluster-wide Redis
+authentication outage for every non-persistent claim, for up to five minutes.
+
+### What is wrong
+
+Per-claim ACL users are created imperatively and only imperatively.
+`dragonfly_object` (`resourceclaim-provisioner/src/dragonfly.rs:215-295`) emits
+`replicas`, `args`, `resources`, `authentication.passwordFromSecret` and — when
+persistent — a `snapshot` block. It sets **no `aclFromSecret` and no
+`--aclfile`**, so the users exist only in the Dragonfly process's memory.
+Upstream loads users from a file only when that flag is set
+(`AclFamily::Init`), and the snapshot path never touches the ACL registry.
+
+The `default` admin user survives, because the dragonfly-operator injects it as
+`DFLY_requirepass` from `passwordFromSecret`. So after a restart the operator
+can still log in while every tenant cannot — which is why the failure reads as
+a credential problem rather than a restart.
+
+Recovery is a blind fixed-period sweep, not a reaction:
+`acl_reconcile::run` (`acl_reconcile.rs:210-221`) is
+`loop { resync_all(...); sleep(RESYNC_INTERVAL) }` with `RESYNC_INTERVAL = 300s`
+(`:57`). There is no watch and no readiness edge. The provisioner cannot help
+either — `should_provision` (`reconcile.rs:1418-1421`) returns false once
+`status.ready` is true, so a provisioned claim is never re-touched.
+
+**ADR 0042 §4 ratified more than shipped** (`docs/adr/0042-…:79-81`): "It
+watches the pool instances' pod readiness / `status` generation. On a (re)start
+transition it enumerates every live `ResourceClaim` bound to that instance and
+re-applies each `ACL SETUSER`" — **and** a periodic resync as a backstop. Only
+the periodic half was built, and `plan.md:3170` ticks 2.6-5 on the stronger
+wording.
+
+### What it costs
+
+The ACL table is process-global, so a restart drops every user at once.
+`POOL_INSTANCE_INDEX` is hardcoded to `0` (`reconcile.rs:421`), so a cluster
+runs exactly one ephemeral and one persistent instance — an ephemeral restart
+is therefore a **cluster-wide** authentication outage across unrelated tenants
+and namespaces. The window is uniform in (0, 300s], mean ~150s.
+
+For a `persistent: true` claim the keyspace is restored from the snapshot but
+the ACL table is not part of it, so the tenant is locked out of its own intact
+data. That is the sharpest form: nothing was lost, and it is unreachable
+anyway.
+
+### The fix
+
+`aclFromSecret` is a CRD field the platform already pins and has never used.
+
+1. A pure builder beside `acl_setuser_args` (`dragonfly.rs:165`) emitting the
+   same rule vector in ACL-file form, byte-compared against it in a test so the
+   live grant and the persisted grant cannot drift.
+2. A per-instance `Secret` `<instance>-acl` holding one line per live claim
+   **plus a `default` line consistent with the admin password** — mandatory:
+   upstream synthesises `default` only when the file omits it, so a file that
+   carries one fully overrides the `requirepass`-derived admin, and a file that
+   omits one risks locking the provisioner out of its own instance.
+3. `spec.aclFromSecret` on the CR; the dragonfly-operator mounts it and adds
+   the flag itself.
+4. Rewrite the Secret at the three points that already mutate ACL state —
+   `provision_dragonfly`, `gc_drop_dragonfly`, and the resync loop, which
+   becomes the reconciler of the file (`claims_to_repin` already computes
+   exactly the required set).
+5. **Keep the loop.** The mounted Secret is read-only, so `ACL SAVE` is
+   impossible, and Dragonfly does not re-read the file on Secret update without
+   an explicit `ACL LOAD` — the loop remains the path for a claim created
+   seconds before a restart. The failure mode collapses from "every tenant,
+   every restart, up to five minutes" to "one just-created claim, rarely".
+
+Upstream supports the rules the platform needs in file form:
+`LoadToRegistryFromFile` parses each line with `ParseAclSetUser`, the same
+parser `ACL SETUSER` uses, so `$N`, `~*` and `&user:*` all work by
+construction. A live confirm on the pinned image is a confirmation, not an
+investigation.
+
+Ships with: a walk step that restarts the pool instance and asserts a tenant
+can still authenticate immediately afterwards. No current walk restarts an
+instance, which is why this was never caught.

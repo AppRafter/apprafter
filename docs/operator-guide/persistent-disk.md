@@ -133,6 +133,16 @@ apprafter migration approve <plan-name>
 
 The approval gate is covered on [Migration plans](migration-plans.md).
 
+!!! warning "Known gap: the claim is left behind"
+
+    Approving the change does not currently release the data. Nothing deletes
+    the claim once its need is undeclared, so the seven-day window never
+    starts and the backing volume stays live — and keeps the shared backend
+    from scaling down. **Retire the application with `apprafter app remove`
+    instead** when you want the retention path; that is the route the platform
+    actually implements today. Tracked as a defect.
+
+
 **To retire the application, delete it:**
 
 ```sh

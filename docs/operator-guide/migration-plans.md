@@ -59,11 +59,21 @@ of them are things people think of as additions.
 
 | The edit | Trigger | Class |
 | --- | --- | --- |
-| Removing a `needs.*` dependency — the backing claim and its data are garbage-collected | `needs-removal` | `data-migration` |
+| Removing a `needs.*` dependency — the data behind it is at stake (see the note below) | `needs-removal` | `data-migration` |
 | `expose.network` `public` → non-public (`internal` / `vpn`) — external reachability withdrawn | `network-visibility-change` | `requires-restart` |
 | A publicly-routed app **loses** a hostname (removed, or swapped for another) | `domain-change` | `requires-restart` |
 | `replicas` N → 0 — a deliberate outage | `scale-to-zero` | `requires-restart` |
 | Removing an env key whose value is a reference (`claim.…` or `secret:"name/key"`) | `env-ref-removal` | `requires-restart` |
+
+!!! warning "Known gap: approving a `needs.*` removal does not release the data"
+
+    The gate fires correctly and holds the change until you approve it. What
+    does not happen afterwards is the cleanup: nothing deletes the now-undeclared
+    claim, so the seven-day retention window never starts and the database,
+    volume or credential behind it stays live — and keeps its shared backend
+    from scaling down. To release the data, retire the application with
+    `apprafter app remove`, which is the path the platform implements today.
+    Tracked as a defect.
 | `expose.network` non-public → **`public`** — the app is now on the public Gateway | `network-visibility-escalation` | `security-boundary` |
 | A public app **gains** a hostname — including its first, and including a second one beside an existing one | `public-hostname-add` | `security-boundary` |
 | A public app's `expose.port` changes — the public route now targets something else | `public-port-retarget` | `security-boundary` |
