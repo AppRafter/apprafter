@@ -264,13 +264,13 @@ pub const HEALTH_EXEMPTIONS: &str = "health-exemptions";
 /// [`crate::recipe::ALLOWLIST`], not inside a collapsed disclosure, and
 /// not on a [`crate::recipe::BREAK_GLASS_PAGES`] page. ADR 0058.
 ///
-/// **Not yet part of [`Gate::corpus`].** It is red on the corpus by
-/// design — that is what 2.20c exists to fix — and wiring a red check
-/// into the run that lefthook and `just lint` call would make the
-/// repository uncommittable for the length of the restructure. It is
-/// reachable through [`Gate::recipe_findings`] and `docsgen
-/// recipe-report`, and the last commit of 2.20c moves it into
-/// [`Gate::page`].
+/// Part of [`Gate::corpus`] since the 2.20c restructure took the corpus
+/// to zero. It was built red and held out of that run for the length of
+/// the rewrite, because a red check in the run lefthook and `just lint`
+/// call would have made the repository uncommittable while 27 pages
+/// were being rewritten. `docsgen recipe-report` still prints the same
+/// findings grouped by page, which is the readable form when there are
+/// any.
 pub const RECIPE_PURITY: &str = "recipe-purity";
 
 /// Front-matter key exempting an inline span from the CLI check, by the
@@ -926,6 +926,7 @@ impl Gate {
             )
         })?;
         let (mut findings, census) = self.walk()?;
+        findings.extend(self.recipe_findings()?);
         for divergence in health::compare(&committed, &census.baseline()) {
             // Two classes, because the two events want opposite
             // remedies — see [`HEALTH_BASELINE`]. Matched exhaustively

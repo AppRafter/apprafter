@@ -398,14 +398,15 @@ same as the upgrade having worked. Six checks, each earning its place:
    `--server-type` you passed.
 3. **Node allocatable memory grew.** This is the number the scheduler budgets
    against, and it is the reason you did any of this — a bigger SKU whose
-   allocatable did not move has bought you nothing.
+   allocatable did not move has bought you nothing. Across the two
+   validation runs it went from 1963 MiB to 5895 MiB on a `cx23` → `cx33`
+   move.
 
-    ```sh
-    kubectl get node -o jsonpath='{.items[0].status.allocatable.memory}'
-    ```
+    ??? note "Reading it with kubectl"
 
-    Across the two validation runs it went from 1963 MiB to 5895 MiB on a
-    `cx23` → `cx33` move.
+        ```sh
+        kubectl get node -o jsonpath='{.items[0].status.allocatable.memory}'
+        ```
 
 4. **The workload reached `Ready` on its own.** Not "the pods exist" — the
    application's own readiness, arrived at without you intervening. The
@@ -853,6 +854,7 @@ unconstrained string in the CRD) and rendered verbatim into the CronJob's
 (`platform-stack/cue/render_tool.cue:538`). A word like `off` is not handled
 anywhere in the CLI — it reaches the apiserver and is rejected:
 
+<!-- docs: check=none reason=third-party-output since=v0.2.51 — the apiserver's own rejection transcript, quoted to show what a bad `schedule:` costs -->
 ```console
 $ kubectl apply -f apprafter-backup-check.yaml
 The CronJob "apprafter-backup-check" is invalid: spec.schedule: Invalid value: "off": expected exactly 5 fields, found 1: [off]

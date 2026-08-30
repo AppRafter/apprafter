@@ -487,3 +487,87 @@ Worth pairing with a smaller change that removes the need for it: have
 `app status` name the resolved namespace it looked in when it reports
 `EnvSecretMissing`, so the ambiguous half of the message becomes concrete
 without a second command at all.
+
+## A capacity warning nobody can receive
+
+**Opened:** 2026-08-30 (2.20c, correcting `docs/operator-guide/shared-volumes.md`).
+**Status:** OPEN.
+**Severity:** medium. The signal exists, is correct, and reaches nobody.
+
+### What is wrong
+
+The operator stamps a `CapacityWarning` condition on the `SharedVolume` CR and
+emits an edge-triggered Warning Event when a volume's node is nearly full. Both
+are the platform telling an operator to act before a disk fills.
+
+No CLI surface reads either. `apprafter volume status` prints the sampled
+`Used`/`Free` bytes and nothing about the warning; `apprafter app status` says
+nothing about SharedVolumes at all. The guide names this itself, and then hands
+the reader two `kubectl` reads — one for the condition, one for
+`describe … | Events` — as the only way to receive a warning the platform went
+to the trouble of raising.
+
+This is the same class as the `EnvSecretMissing` diagnosis gap recorded above:
+the platform opens a loop it cannot close. It is worse in one respect — that
+one is reached only after something has already gone wrong, while this one is
+the *early* warning, so a signal that reaches nobody costs the lead time it
+exists to buy.
+
+### The fix
+
+`apprafter volume status` is already the command an operator runs to look at a
+volume, and already prints the sample the condition is derived from. Printing
+the condition beside it — the status, the reason, and the timestamp — closes
+the loop with no new noun and no new command to learn.
+
+Worth doing at the same time: `apprafter app status` says nothing about
+SharedVolumes even for an application that mounts one, so an application-side
+reader has no path to the warning at all.
+
+## There is nothing to roll a moving tag back to
+
+**Opened:** 2026-08-30 (2.20c, correcting `docs/dev-guide/image-iteration.md`).
+**Status:** OPEN.
+**Severity:** medium. The command a developer reaches for after shipping a bad
+build does nothing in the case they are most likely to be in.
+
+### What is wrong
+
+The platform resolves a moving tag to a digest and re-rolls the workload when
+that tag moves (ADR 0040) — which is the feature, and it means a developer can
+ship by pushing `:latest` and never touch the manifest.
+
+`apprafter app rollback` patches `spec.source.targetRevision` on the Argo CD
+Application: it rolls back the **Git revision**. After a same-tag push the Git
+revision has not changed, so there is nothing for it to roll back to and the
+command achieves nothing. `git revert` has the same problem for the same reason.
+
+Nothing retains the digest that was previously resolved — a grep for a
+prior-resolution field across `operator-core` and the Application controller
+finds none — so even a rollback that wanted to act on the image has no target.
+
+The guide documents this accurately and hands the reader `kubectl rollout undo`,
+noting that the operator owns the Deployment and re-resolves on its next pass,
+so the undo holds only until then. That is true, which makes it a workaround
+with an expiry measured in seconds.
+
+### What it costs
+
+The failure lands at the worst moment. A developer who has just shipped a
+broken build runs the command named `rollback`, sees it succeed, and is no
+better off — and the one remedy that does work is temporary by construction.
+The durable answer the guide gives is to switch the manifest to a hand-pinned
+digest with `imagePolicy.resolve: off`, which means abandoning the auto-deploy
+loop to recover from it.
+
+### The fix
+
+Retain the previously-resolved digest — one field on `Application.status`
+alongside the resolution the operator already performs — and let
+`app rollback` fall back to it when the Git revision is unchanged. That makes
+the command mean what its name says in the case the platform's own headline
+feature creates.
+
+Ships with a walk step that pushes a second image to the same tag and asserts
+the rollback returns the workload to the first.
+

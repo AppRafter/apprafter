@@ -393,17 +393,17 @@ badge → expand the error accordion. The CMP wrapper normalizes
 CUE errors to a single-line summary in the badge, with the full
 `cue export` stderr in the expandable details.
 
-From the CLI:
+??? note "Reading the same thing from a shell"
 
-```sh
-# Check Argo CD Application sync state.
-kubectl get applications.argoproj.io <app-name> -n argocd \
-    -o jsonpath='{.status.conditions}'
+    ```sh
+    # Argo CD Application sync state.
+    kubectl get applications.argoproj.io <app-name> -n argocd \
+        -o jsonpath='{.status.conditions}'
 
-# Tail CMP sidecar logs for the full cue output. The container is
-# named `cue-cmp` — `argocd-cue-cmp` is the image, not the container.
-kubectl logs -n argocd deploy/argocd-repo-server -c cue-cmp --tail=50
-```
+    # The CMP sidecar's log, for the full cue output. The container is
+    # named `cue-cmp` — `argocd-cue-cmp` is the image, not the container.
+    kubectl logs -n argocd deploy/argocd-repo-server -c cue-cmp --tail=50
+    ```
 
 ### Common errors
 

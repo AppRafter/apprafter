@@ -96,19 +96,21 @@ curl -s -o /dev/null -w '%{http_code}\n' \
       registries](../dev-guide/private-repos-and-registries.md) for the
       token type, which is not a free choice.
 
-Confirm what the cluster actually holds, rather than what you meant to
-register — a credential whose prefix does not match this image covers
-nothing, and there is no error that says so:
+??? note "Confirming the credential actually covers this image"
 
-```sh
-kubectl get sourcecredentials.apprafter.io -n apprafter-system \
-  -o custom-columns=NAME:.metadata.name,HOSTS:.spec.registry.hosts
-```
+    Confirm what the cluster actually holds, rather than what you meant to
+    register — a credential whose prefix does not match this image covers
+    nothing, and there is no error that says so:
 
-One of the listed `HOSTS` prefixes must be a prefix of
-`ghcr.io/apprafter/docs`. A cluster serving other AppRafter properties
-will already list credentials for *their* orgs; those do not cover this
-one.
+    ```sh
+    kubectl get sourcecredentials.apprafter.io -n apprafter-system \
+      -o custom-columns=NAME:.metadata.name,HOSTS:.spec.registry.hosts
+    ```
+
+    One of the listed `HOSTS` prefixes must be a prefix of
+    `ghcr.io/apprafter/docs`. A cluster serving other AppRafter properties
+    will already list credentials for *their* orgs; those do not cover this
+    one.
 
 ## Step 2 — Confirm the zone covers `docs.`
 
@@ -123,105 +125,105 @@ of `:443` listeners, the apex and a wildcard, both terminating TLS from
 the one imported certificate, and the certificate is minted for `<zone>`
 and `*.<zone>` together.
 
-### Check that yourself rather than taking it on trust
+??? note "Checking that yourself rather than taking it on trust"
 
-Two commands, each reading the live cluster:
+    Two commands, each reading the live cluster:
 
-```sh
-kubectl get gateway platform -n apprafter-system \
-  -o jsonpath='{range .spec.listeners[*]}{.name}{"\t"}{.hostname}{"\n"}{end}'
-```
+    ```sh
+    kubectl get gateway platform -n apprafter-system \
+      -o jsonpath='{range .spec.listeners[*]}{.name}{"\t"}{.hostname}{"\n"}{end}'
+    ```
 
-Expect an apex listener and a wildcard listener for the zone, alongside
-the plain `http` one that redirects to HTTPS:
+    Expect an apex listener and a wildcard listener for the zone, alongside
+    the plain `http` one that redirects to HTTPS:
 
-```text
-https-apex-apprafter-dev	apprafter.dev
-https-wild-apprafter-dev	*.apprafter.dev
-http
-```
+    ```text
+    https-apex-apprafter-dev	apprafter.dev
+    https-wild-apprafter-dev	*.apprafter.dev
+    http
+    ```
 
-Then the names the certificate actually carries, which the CLI records
-on the Secret when it imports one.
+    Then the names the certificate actually carries, which the CLI records
+    on the Secret when it imports one.
 
-**The Secret's name is yours, not the platform's** — you chose it at
-`apprafter target cert import <name>`, and the chart only copies it into
-both listeners. So read the name off the cluster instead of typing one:
-the `Cert` column of the `apprafter target domain list` above prints it,
-and this derives it from the wildcard listener that will actually serve
-`docs.`:
+    **The Secret's name is yours, not the platform's** — you chose it at
+    `apprafter target cert import <name>`, and the chart only copies it into
+    both listeners. So read the name off the cluster instead of typing one:
+    the `Cert` column of the `apprafter target domain list` above prints it,
+    and this derives it from the wildcard listener that will actually serve
+    `docs.`:
 
-```sh
-cert=$(kubectl get gateway platform -n apprafter-system \
-  -o jsonpath='{.spec.listeners[?(@.hostname=="*.apprafter.dev")].tls.certificateRefs[0].name}')
-echo "${cert:-<no wildcard listener for this zone>}"
+    ```sh
+    cert=$(kubectl get gateway platform -n apprafter-system \
+      -o jsonpath='{.spec.listeners[?(@.hostname=="*.apprafter.dev")].tls.certificateRefs[0].name}')
+    echo "${cert:-<no wildcard listener for this zone>}"
 
-kubectl get secret "$cert" -n apprafter-system \
-  -o jsonpath='{.metadata.annotations.apprafter\.io/cert-sans}{"\n"}'
-```
+    kubectl get secret "$cert" -n apprafter-system \
+      -o jsonpath='{.metadata.annotations.apprafter\.io/cert-sans}{"\n"}'
+    ```
 
-**Covered** looks like a name printed for `$cert` and a SAN list holding
-both the apex and the wildcard, in either order:
+    **Covered** looks like a name printed for `$cert` and a SAN list holding
+    both the apex and the wildcard, in either order:
 
-```text
-cf-origin-cert-apprafter
-*.apprafter.dev,apprafter.dev
-```
+    ```text
+    cf-origin-cert-apprafter
+    *.apprafter.dev,apprafter.dev
+    ```
 
-**Not covered** has two distinguishable shapes, and they need different
-fixes:
+    **Not covered** has two distinguishable shapes, and they need different
+    fixes:
 
-- `$cert` prints the placeholder and the second command errors on an
-  empty name — there is **no wildcard listener**, so the zone is not
-  registered. That is the "If the zone is not listed" case below, and
-  `PublicRouteReady` will say `NoMatchingZone`.
-- `$cert` prints a name but the SAN list holds only the apex — the zone
-  is registered against a certificate **minted for one name**. The
-  wildcard listener then presents something that does not match `docs.`
-  and Cloudflare answers **526**. Re-mint for both names and rotate with
-  `apprafter target cert import … --replace`; nothing about the zone
-  registration needs to change.
+    - `$cert` prints the placeholder and the second command errors on an
+      empty name — there is **no wildcard listener**, so the zone is not
+      registered. That is the "If the zone is not listed" case below, and
+      `PublicRouteReady` will say `NoMatchingZone`.
+    - `$cert` prints a name but the SAN list holds only the apex — the zone
+      is registered against a certificate **minted for one name**. The
+      wildcard listener then presents something that does not match `docs.`
+      and Cloudflare answers **526**. Re-mint for both names and rotate with
+      `apprafter target cert import … --replace`; nothing about the zone
+      registration needs to change.
 
-A missing `apprafter.io/cert-sans` annotation is a third, milder case: a
-Secret imported by hand rather than through the CLI carries no SAN
-record, so the command prints nothing and tells you only that this check
-cannot answer. Read the certificate itself — `kubectl get secret "$cert"
--o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -text` —
-or re-import it through the CLI, which writes the annotation.
+    A missing `apprafter.io/cert-sans` annotation is a third, milder case: a
+    Secret imported by hand rather than through the CLI carries no SAN
+    record, so the command prints nothing and tells you only that this check
+    cannot answer. Read the certificate itself — `kubectl get secret "$cert"
+    -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -text` —
+    or re-import it through the CLI, which writes the annotation.
 
-**The wildcard is one level deep, in both layers.**
-`docs.apprafter.dev` is a single label under the apex and is covered.
-`a.b.apprafter.dev` is two, and is covered by neither the listener nor
-the certificate — it would need its own zone and its own certificate.
+    **The wildcard is one level deep, in both layers.**
+    `docs.apprafter.dev` is a single label under the apex and is covered.
+    `a.b.apprafter.dev` is two, and is covered by neither the listener nor
+    the certificate — it would need its own zone and its own certificate.
 
-### If the zone is not listed
+    ### If the zone is not listed
 
-Mint and import the certificate, then register the apex — the full
-procedure is [Cloudflare Origin CA
-certificate](cloudflare-origin-cert.md), and it is one certificate per
-registrable zone:
+    Mint and import the certificate, then register the apex — the full
+    procedure is [Cloudflare Origin CA
+    certificate](cloudflare-origin-cert.md), and it is one certificate per
+    registrable zone:
 
-```sh
-apprafter target cert import cf-origin-cert-apprafter \
-  --cert ./origin.pem --key ./origin.key
-apprafter target domain add apprafter.dev --cert cf-origin-cert-apprafter
-```
+    ```sh
+    apprafter target cert import cf-origin-cert-apprafter \
+      --cert ./origin.pem --key ./origin.key
+    apprafter target domain add apprafter.dev --cert cf-origin-cert-apprafter
+    ```
 
-The Secret name here is an example and yours to choose; whatever you
-pass to `import` is what you pass to `--cert`, and what the check above
-reads back off the Gateway.
+    The Secret name here is an example and yours to choose; whatever you
+    pass to `import` is what you pass to `--cert`, and what the check above
+    reads back off the Gateway.
 
-Two things that catch people here:
+    Two things that catch people here:
 
-- **Register the apex, not the subdomain.** `apprafter target domain
-  add` takes a registrable domain and refuses a `*.` prefix; the
-  wildcard listener is generated from the apex. Adding
-  `docs.apprafter.dev` as a zone of its own is not the way to get a
-  subdomain served.
-- **Mint the certificate for both names.** Cloudflare's Origin CA form
-  takes a hostname list; enter `apprafter.dev` **and** `*.apprafter.dev`.
-  Rotating a certificate that already covers both is
-  `apprafter target cert import … --replace`.
+    - **Register the apex, not the subdomain.** `apprafter target domain
+      add` takes a registrable domain and refuses a `*.` prefix; the
+      wildcard listener is generated from the apex. Adding
+      `docs.apprafter.dev` as a zone of its own is not the way to get a
+      subdomain served.
+    - **Mint the certificate for both names.** Cloudflare's Origin CA form
+      takes a hostname list; enter `apprafter.dev` **and** `*.apprafter.dev`.
+      Rotating a certificate that already covers both is
+      `apprafter target cert import … --replace`.
 
 ## Step 3 — The DNS record
 
@@ -334,28 +336,35 @@ with their states, which is where an image-pull or crash-loop failure
 shows up. The application-level "Healthy" can go green before the pods
 are actually running.
 
-For the AppRafter resource itself, **spell the group out**. Argo CD
-installs a resource also called `applications` in the same cluster, and
-a bare `kubectl get applications` does not report the collision — it
-silently resolves to one of the two groups and hides everything in the
-other. Which one it picks is not worth relying on;
-`applications.apprafter.io` and `applications.argoproj.io` always mean
-what they say:
+??? note "Reading the phase with kubectl"
 
-```sh
-kubectl get applications.apprafter.io docs -n apprafter \
-  -o jsonpath='{.status.phase}{"\n"}'
-```
+    For the AppRafter resource itself, **spell the group out**. Argo CD
+    installs a resource also called `applications` in the same cluster, and
+    a bare `kubectl get applications` does not report the collision — it
+    silently resolves to one of the two groups and hides everything in the
+    other. Which one it picks is not worth relying on;
+    `applications.apprafter.io` and `applications.argoproj.io` always mean
+    what they say:
+
+    ```sh
+    kubectl get applications.apprafter.io docs -n apprafter \
+      -o jsonpath='{.status.phase}{"\n"}'
+    ```
 
 ### The public-route verdict
 
-The operator records what became of the public route, and this is the
-single most useful line when the site does not answer:
+The operator records what became of the public route, and its verdict is
+the single most useful thing to read when the site does not answer:
 
-```sh
-kubectl get applications.apprafter.io docs -n apprafter \
-  -o jsonpath='{range .status.conditions[?(@.type=="PublicRouteReady")]}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
-```
+??? note "Reading the verdict with kubectl"
+
+    The operator records what became of the public route, and this is the
+    single most useful line when the site does not answer:
+
+    ```sh
+    kubectl get applications.apprafter.io docs -n apprafter \
+      -o jsonpath='{range .status.conditions[?(@.type=="PublicRouteReady")]}{.status}{"\t"}{.reason}{"\t"}{.message}{"\n"}{end}'
+    ```
 
 | Reason | What it means | What to do |
 | --- | --- | --- |

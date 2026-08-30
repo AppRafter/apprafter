@@ -250,20 +250,26 @@ apprafter migration approve <plan-name>
 apprafter migration reject <plan-name>
 ```
 
-You can also inspect and patch plans directly with `kubectl`. Use the
-plan's own namespace (`apprafter-system` for platform and
-sourcecredential scope, the application's namespace for application
-scope):
+??? note "Reading and approving a plan without the CLI"
 
-```sh
-kubectl get migrationplans -A
+    The status-subresource patch is the authoritative approval — the CLI
+    and the Argo CD button both perform it — so this is a genuine
+    break-glass path rather than a second, weaker one. It is here for
+    when the CLI is unavailable, not as an everyday alternative:
+    approving by hand skips nothing, but it also records nothing about
+    who approved beyond the Kubernetes audit log.
 
-kubectl describe migrationplan <plan-name> -n <namespace>
+    Use the plan's own namespace — `apprafter-system` for platform and
+    sourcecredential scope, the application's namespace for application
+    scope:
 
-# Approve manually (equivalent to `apprafter migration approve`):
-kubectl patch migrationplan <plan-name> -n <namespace> \
-    --type merge -p '{"status":{"phase":"approved"}}'
-```
+    ```sh
+    kubectl get migrationplans -A
+    kubectl describe migrationplan <plan-name> -n <namespace>
+
+    kubectl patch migrationplan <plan-name> -n <namespace> \
+        --type merge -p '{"status":{"phase":"approved"}}'
+    ```
 
 ## Approval surfaces — today and later
 

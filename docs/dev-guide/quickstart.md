@@ -244,14 +244,16 @@ and the summary counts it as a warning.
 A non-zero exit (any `✗ FAIL`) means something is broken — see
 [Troubleshooting](../operator-guide/troubleshooting.md).
 
-Exporting `KUBECONFIG` is optional — the `apprafter app *` commands
-resolve the cluster from the target store themselves. Do it only if
-you also want to drive `kubectl` by hand:
+You do not need `KUBECONFIG` for anything on this page — the
+`apprafter app` commands resolve the cluster from the target store
+themselves.
 
-```sh
-apprafter kubeconfig > /tmp/kc && export KUBECONFIG=/tmp/kc
-kubectl get nodes                # ↳ Ready
-```
+??? note "If you want a shell against the cluster anyway"
+
+    ```sh
+    apprafter kubeconfig > /tmp/kc && export KUBECONFIG=/tmp/kc
+    kubectl get nodes                # ↳ Ready
+    ```
 
 ## 2. Scaffold your application
 

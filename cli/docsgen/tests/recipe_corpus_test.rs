@@ -36,13 +36,21 @@ fn findings() -> Vec<docsgen::gate::Finding> {
 }
 
 #[test]
-fn the_check_is_red_on_the_corpus_today() {
+fn the_corpus_is_green() {
+    // 2.20c took it there, from 174 findings across 14 pages. This is
+    // the assertion that keeps it there: recipe-purity is part of
+    // `Gate::corpus` now, so a regression fails `just lint` — but this
+    // test names the corpus-wide fact, which a per-page failure does
+    // not.
     let found = findings();
+    let shown: Vec<String> = found
+        .iter()
+        .map(|f| format!("{}:{} {}", f.file, f.line, f.message))
+        .collect();
     assert!(
-        !found.is_empty(),
-        "recipe-purity found nothing, which would mean the guides already \
-         satisfy ADR 0058 — the census measured 325 foreign commands, so a \
-         silent check is a broken check, not a clean corpus"
+        found.is_empty(),
+        "a guide reached for a foreign command in its recipe path:\n{}",
+        shown.join("\n")
     );
 }
 
@@ -154,28 +162,36 @@ fn a_break_glass_page_is_never_reported() {
 }
 
 #[test]
-fn only_platform_tools_are_reported() {
-    // Every finding today names a tool AppRafter could plausibly have
-    // replaced. A new name appearing here is either a real regression
-    // in a guide or a gap in the allowlist, and both want a human.
-    let found = findings();
-    let mut names: Vec<String> = found
-        .iter()
-        .filter_map(|f| {
-            f.message
-                .split('`')
-                .nth(1)
-                .map(std::string::ToString::to_string)
-        })
-        .collect();
-    names.sort();
-    names.dedup();
-    assert_eq!(
-        names,
-        vec!["kubectl".to_string()],
-        "the reported tools changed. A tool LEAVING this list is progress — a \
-         page was restructured, so narrow the expectation. A tool ARRIVING is \
-         either a guide reaching for something new or a gap in the allowlist, \
-         and both want a human. (`hubble` left with egress-policy.md in 2.20c.)"
+fn the_exemptions_are_all_typed_and_dated() {
+    // The corpus being green rests partly on typed exemptions — blocks
+    // that are documented workarounds for tracked defects, kept visible
+    // rather than buried behind a disclosure. That is only honest while
+    // each one carries a reason and a version, which `marker.rs` ages
+    // and expires. A bare `check=none` would be an untyped escape
+    // hatch, which ADR 0057 forbids; the gate rejects one, and this
+    // pins that the corpus has none.
+    let root = repo_root();
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args([
+            "grep",
+            "-h",
+            "-o",
+            "<!-- docs: check=none[^>]*>",
+            "--",
+            "docs",
+        ])
+        .output()
+        .expect("git grep");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let markers: Vec<&str> = text.lines().collect();
+    assert!(
+        !markers.is_empty(),
+        "expected the corpus to carry exemptions"
     );
+    for m in markers {
+        assert!(m.contains("reason="), "untyped exemption: {m}");
+        assert!(m.contains("since=v"), "undated exemption: {m}");
+    }
 }

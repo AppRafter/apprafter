@@ -231,15 +231,27 @@ reachability checks plus the surrounding shell environment
 (`kubectl`, `helm`, `ssh`, DNS). Each check reports PASS / WARN /
 FAIL with a hint pointing at the right next command.
 
-Export the kubeconfig and check the cluster:
+Then check the cluster and the platform on it:
 
 ```sh
-apprafter kubeconfig > /tmp/kc && export KUBECONFIG=/tmp/kc
-
-kubectl get nodes                       # the one node, STATUS Ready
-kubectl -n argocd get pods              # argocd-server + repo-server Running
-kubectl get applications.apprafter.io -A   # empty until you deploy an app
+apprafter status
+apprafter platform status
 ```
+
+`status` reports the node and the cluster's own health; `platform
+status` reports the platform-stack components Argo CD is reconciling,
+which is the half that takes a few minutes to settle after
+`cluster-bootstrap` returns.
+
+??? note "Reading the same thing with kubectl"
+
+    ```sh
+    apprafter kubeconfig > /tmp/kc && export KUBECONFIG=/tmp/kc
+
+    kubectl get nodes                          # the one node, STATUS Ready
+    kubectl -n argocd get pods                 # argocd-server + repo-server Running
+    kubectl get applications.apprafter.io -A   # empty until you deploy an app
+    ```
 
 The cloud-init block installs k3s from `https://get.k3s.io` without
 pinning `INSTALL_K3S_VERSION`, so the `VERSION` column reports
@@ -261,49 +273,27 @@ In the UI you will see the platform-stack Argo CD `Application`
 and its child components. Each should be **Synced** and **Healthy**
 within a few minutes of `cluster-bootstrap` completing.
 
-### Smoke: apply your first Application CR
+### Smoke: deploy something
 
-The AppRafter operator and admission webhook are installed by
-`cluster-bootstrap` as part of the platform stack. Verify the
-end-to-end path by applying an `Application` CR. It is inlined here so
-that nothing on this page needs a checkout; a fuller version, adding a
-`prod` environment override, ships in the repository as
-`manifests/tier-1/application/example-app.yaml`.
+The operator and the admission webhook arrive with the platform stack, so
+`platform status` reporting them healthy already says the reconcile path is
+up. To prove it end to end, deploy a real application the way you will
+always deploy one — scaffold a manifest, register it, watch it come up:
 
 ```sh
-kubectl apply -f - <<'YAML'
-apiVersion: apprafter.io/v1alpha1
-kind: Application
-metadata:
-  name: parser
-  namespace: default
-spec:
-  base:
-    image: nginxdemos/hello:plain-text
-    replicas: 1
-    expose: { port: 80, network: internal }
-    env:
-      LOG_LEVEL: info
-YAML
-
-kubectl get applications.apprafter.io parser -n default \
-    -o jsonpath='{.status.phase}'
-# → Ready
-
-kubectl get deployment parser -n default
-# parser   1/1   1   ...
+apprafter app scaffold --name parser --namespace default
+apprafter app add <git-url> --name parser --namespace default
+apprafter app status parser
 ```
 
-The operator reconciles the `Application` CR into a Deployment and
-Service via server-side apply. The status field `phase=Ready` and
-`endpointURL` are written by the operator after a successful
-reconcile. The admission webhook validates the create and update
-payloads against the CRD schema and cross-field invariants.
+The [developer quickstart](../dev-guide/quickstart.md) walks that in full,
+including the repository side.
 
-The `kubectl apply` above is a platform smoke test. To ship a real
-application from a Git repo — scaffold, register with `apprafter app
-add`, then watch it with `apprafter app status` / `app logs` — follow
-the [developer quickstart](../dev-guide/quickstart.md).
+Deploying by `kubectl apply` of an `Application` CR is deliberately not
+shown here. It works, and it is the wrong first habit: the platform's
+control surface is Git plus the CLI, and a hand-applied CR is drift Argo CD
+will fight with on its next sync. `kubectl apply` against a cluster is
+reserved for emergency overrides.
 
 !!! note "There is no supported opt-out for the operator or webhook"
     Earlier releases let an `Infrastructure.cue` set
@@ -321,7 +311,7 @@ the [developer quickstart](../dev-guide/quickstart.md).
 | Task                          | Command                                                  |
 | ----------------------------- | -------------------------------------------------------- |
 | Open Argo CD UI               | `apprafter open argocd`                                  |
-| List Applications             | `apprafter app list` (raw: `kubectl get applications.apprafter.io -A`) |
+| List Applications             | `apprafter app list`                                     |
 | Argo CD admin password only   | `apprafter argocd-password`                              |
 | Re-fetch kubeconfig           | `apprafter kubeconfig --refresh` (alias: `apprafter kc --refresh`) |
 | Rebuild local state           | `apprafter import` (live Hetzner → state.json)           |

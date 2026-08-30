@@ -64,9 +64,9 @@ worth knowing, set out below.
 | `unclosed-pre` | An HTML `pre` element that never meets its closing tag. The same failure as the row above with a different edit behind it, which is why it is its own class. |
 | `health-baseline` | An obligation count fell below the committed census: the corpus lost documented surface it used to have. |
 | `health-exemptions` | The declared-exemption count no longer equals the census — one was declared, or one was retired. |
-| `recipe-purity` | A foreign command in a guide's recipe path: not `apprafter`, not an allowlisted external tool, not inside a collapsed disclosure, and not on a break-glass page. **Not yet part of `docsgen gate`** — see below. |
+| `recipe-purity` | A foreign command in a guide's recipe path: not `apprafter`, not an allowlisted external tool, not inside a collapsed disclosure, and not on a break-glass page. |
 
-## `recipe-purity`, and why it is not in `gate` yet
+## `recipe-purity`
 
 [ADR 0058](../adr/0058-public-surfaces-are-written-for-their-reader.md)
 makes a guide a recipe: its main flow carries `apprafter` commands and
@@ -75,21 +75,20 @@ material deleted, independent verification collapsed into a `???`
 disclosure, mechanism to its own page, failure handling to
 `troubleshooting.md`.
 
-The check that enforces that is written and tested, and it is **red on
-the corpus by design**: as of this writing it reports 174 foreign
-commands across 14 guide pages, which is the work the restructure
-exists to do. Wiring a red check into the run that lefthook and
-`just lint` call would make the repository uncommittable until the last
-page is rewritten, so it lives behind its own subcommand until then:
+The check runs as part of `docsgen gate`. It was built **red** — 174
+foreign commands across 14 guide pages — and deliberately held out of
+that run for the length of the 2.20c restructure, because a red check in
+the run lefthook and `just lint` call would have made the repository
+uncommittable while 27 pages were being rewritten. The commit that took
+the corpus to zero moved it in.
+
+When there are findings, the readable form is grouped by page:
 
 ```sh
 cd cli && cargo run -p docsgen -- recipe-report
 ```
 
-It prints the findings grouped by page and exits 0 whatever it finds.
-It is the working list for the restructure, and it shrinks as pages are
-rewritten. The commit that turns the last page green moves the check
-into `gate`.
+It exits 0 whatever it finds — it is a report, not a second gate.
 
 Two limits are deliberate and worth knowing before you read a silent
 page as a clean one:
@@ -103,6 +102,15 @@ page as a clean one:
   could satisfy it by collapsing everything and saying nothing; that is
   review's job, and the one-block-per-section-outcome rule is stated in
   ADR 0058 rather than enforced here.
+
+A block that is a documented workaround for a tracked defect is the
+third way to be silent, and the honest one: mark it
+`<!-- docs: check=none reason=known-broken since=vX.Y.Z — why -->`.
+Collapsing such a block into a disclosure would bury the thing a reader
+most needs to see, while the typed channel keeps it visible, counted,
+and expiring — so it goes when the defect does, or it says so loudly.
+The corpus carries several today, each pointing at an entry in
+`docs/measurements/day2-followups.md`.
 
 An external tool the platform genuinely cannot own belongs on the
 allowlist in `cli/docsgen/src/recipe.rs`, with the reason on the row —

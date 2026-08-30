@@ -63,15 +63,16 @@ Application is held by the same `AwaitingResourceClaim` gate every other
 dependency uses. What names the *reason* is the claim: while the referenced
 `SharedVolume` is absent — or present but not yet `status.ready` — the
 provisioner publishes `Ready=False` on that claim with reason
-`AwaitingSharedVolume` and requeues every 30s. So the diagnostic lives one
-level down:
+`AwaitingSharedVolume` and requeues every 30s.
 
-```sh
-kubectl -n apps get resourceclaim.apprafter.io -o \
-  jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.type}{" "}{.status.conditions[?(@.type=="Ready")].reason}{"\n"}{end}'
-# -> <claim> shared-disk AwaitingSharedVolume
-#    message: "SharedVolume shared-uploads not ready"
-```
+??? note "Reading that reason with kubectl"
+
+    ```sh
+    kubectl -n apps get resourceclaim.apprafter.io -o \
+      jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.type}{" "}{.status.conditions[?(@.type=="Ready")].reason}{"\n"}{end}'
+    # -> <claim> shared-disk AwaitingSharedVolume
+    #    message: "SharedVolume shared-uploads not ready"
+    ```
 
 The reference claim carries the label `apprafter.io/shared-volume=<ref>`,
 which is also how the volume's own `refCount` is computed — so
@@ -207,8 +208,9 @@ stamps the condition on the CR and emits the Event; the CLI does not read
 either. `apprafter volume status` shows the sampled bytes (`Used/Free`)
 and nothing about the warning, and `apprafter app status` says nothing
 about SharedVolumes at all. Until a CLI surface exists, read the
-condition and the Event directly:
+condition and the Event directly — tracked as a defect:
 
+<!-- docs: check=none reason=known-broken since=v0.2.51 — the workaround for a tracked defect: the operator raises CapacityWarning and no CLI surface reads it -->
 ```sh
 kubectl -n apps get sharedvolume shared-uploads -o \
   jsonpath='{.status.conditions[?(@.type=="CapacityWarning")].status}{" "}{.status.conditions[?(@.type=="CapacityWarning")].reason}{"\n"}'

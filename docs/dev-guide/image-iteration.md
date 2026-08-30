@@ -85,12 +85,15 @@ Resolution is best-effort and **never blocks the rollout**. If it
 fails — the registry is unreachable, the reference is malformed, or a
 private image has no covering credential — the operator renders the
 **verbatim tag** (the pre-resolution behaviour) and records a status
-condition `ImageResolved=False` with the reason:
+condition `ImageResolved=False` with the reason. `apprafter app status
+<app-name>` reports the phase; the condition itself reads:
 
-```sh
-kubectl -n <namespace> get application.apprafter.io <app-name> \
-  -o jsonpath='{.status.conditions[?(@.type=="ImageResolved")]}'
-```
+??? note "Reading the condition with kubectl"
+
+    ```sh
+    kubectl -n <namespace> get application.apprafter.io <app-name> \
+      -o jsonpath='{.status.conditions[?(@.type=="ImageResolved")]}'
+    ```
 
 !!! warning "Spell out `.apprafter.io`, and pass the namespace"
     AppRafter's `applications.apprafter.io` CRD and Argo CD's
@@ -218,7 +221,10 @@ apprafter app rollback <app-name> --to main --yes
 ## Escape hatches
 
 Two standard `kubectl` commands cover the cases the auto-deploy loop
-does not. Both act on the `Deployment` the operator renders, which
+does not. The second is a workaround for a tracked defect rather than a
+design: with a moving tag there is nothing for `apprafter app rollback`
+to act on, because the Git revision it rolls back is unchanged and no
+previously-resolved digest is retained. Both act on the `Deployment` the operator renders, which
 carries your manifest's `metadata.name` and lives in your manifest's
 `metadata.namespace` — so pass `-n`, exactly as above:
 
@@ -226,6 +232,7 @@ carries your manifest's `metadata.name` and lives in your manifest's
   the same tag and want the workload to roll immediately rather than
   wait for the next reconcile (or you simply want fresh pods):
 
+  <!-- docs: check=none reason=external-tool since=v0.2.51 — a manual re-pull the auto-deploy loop deliberately does not cover: a tag that has not moved has nothing for the platform to act on -->
   ```sh
   kubectl -n <namespace> rollout restart deployment/<app-name>
   ```
@@ -235,6 +242,7 @@ carries your manifest's `metadata.name` and lives in your manifest's
   the tag in Git is unchanged either way. To roll the `Deployment` back
   to its previous pod template:
 
+  <!-- docs: check=none reason=known-broken since=v0.2.51 — the workaround for a tracked defect: app rollback cannot roll back a moving tag, and no previously-resolved digest is retained -->
   ```sh
   kubectl -n <namespace> rollout undo deployment/<app-name>
   ```
