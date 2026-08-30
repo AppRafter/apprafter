@@ -1168,18 +1168,60 @@ Three consequences follow, and all three are requirements rather than polish:
    the OCI form itself: `--to sha256:…` is an image digest, anything else is a
    Git revision. Worth deciding explicitly rather than discovering later.
 
-**Where the pin lives is the open design question**, and it is not obvious.
-`app rollback` avoids GitOps drift today by patching `spec.source.targetRevision`
-on the **Argo CD** Application — Argo's own field, which Argo will not revert.
-There is no Argo-side equivalent for an image pin, and the AppRafter
-`Application` CR is rendered by the CMP from the Git manifest, so writing
-`spec.base.image` on the CR would be undone by the next sync.
+### Where the pin lives — and why the platform's own pin was easy
 
-The precedent to follow is 2.10's: `apprafter platform egress set` hit exactly
-this and solved it with a **dedicated SSA field manager**
-(`apprafter-cli-egress`), which lets the CLI own one field inside an object Argo
-otherwise manages without the two pruning each other. An image pin written under
-its own manager, and read by the operator ahead of the resolver, fits that shape.
+The owner's intuition that the platform version pin is the same mechanism is
+correct, and their diagnosis of why it does not transfer directly is also
+correct. Both are worth writing down, because the platform pin is a working,
+production-proven instance of exactly what this needs.
+
+**How the platform pin reaches Argo — a three-hop chain.**
+
+1. The CLI writes `spec.pin` on the `PlatformStack` singleton with a plain
+   `kubectl_merge_patch` (`commands/platform.rs`).
+2. The `PlatformController` reads `spec.channel` / `spec.pin`, resolves a target
+   version, and **SSA-patches the parent `platform` Argo CD Application** in the
+   `argocd` namespace under the dedicated field manager `platform-controller`,
+   setting `spec.source.{targetRevision, helm.valuesObject}`
+   (`platform-stack/src/reconcile.rs:6-9`, `:386-402`).
+3. Argo CD propagates the change to the children.
+
+**Why that was easy, and the app case is not.** The `PlatformStack` CR is
+created by `cluster-bootstrap` step 5 and **lives only in the cluster** — no Git
+repository contains it, so nothing contests a CLI write. The application's
+AppRafter `Application` CR is the opposite: it is rendered by the CUE CMP from
+the user's Git repository, so Argo owns it and the next sync reverts anything
+the CLI writes into its `spec`. That asymmetry is the whole reason
+`platform pin` was a merge-patch and an app-level pin is a design question.
+
+**The owner's proposal — hold app pins in a cluster-only object, on the grounds
+that a rollback pin is an intermediate state rather than normal cluster
+operation — is sound**, and the reasoning is the part to keep: a pin that
+contradicts the repository should not be written into the repository.
+
+Two candidate homes, with the honest objection to each:
+
+- **An annotation on the `Application` CR under a dedicated SSA field manager.**
+  Cheapest, and this repository already has *empirical* evidence it works: ADR
+  0048's anchor stamping established that an SSA-written annotation survives an
+  Argo sync without `ignoreDifferences` — and that finding is on record
+  specifically because only the live probe was authoritative about it. The pin
+  then lives next to the thing it pins and disappears with it, which sidesteps
+  D4's ownership problem for free.
+- **A per-app pin map on the `PlatformStack`.** Works, and matches the
+  cluster-only property exactly, but puts application-scoped data on the
+  platform's own object and needs its own garbage collection — an app deleted
+  while pinned leaves a stale entry, which is D4's defect class in a new place.
+  Prefer the annotation unless something forces this.
+
+**A consequence of either, which argues for the visibility requirement above.**
+A pin held outside Git is invisible *to* Git: a reader of the repository sees
+`:latest` and cannot know the cluster is holding an older digest. So the status
+surface is not decoration here — it is the only place the truth exists. The
+owner's requirement is that `app status` mark a rolled-back application **in
+yellow**, naming the version it is held at, on the model of the other
+attention-warranting states. Worth surfacing in `platform status` as well, so an
+operator can see every pinned application in one place rather than per-app.
 
 Ships with: a walk step that pushes a second image to the same tag and asserts
 the rollback returns the workload to the first **and that it stays there across
