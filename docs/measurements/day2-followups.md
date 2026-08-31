@@ -24,7 +24,7 @@ would otherwise touch the same code three times.
 | **D2** | `--cron` / `--check-cron` are the wrong surface, not an unvalidated one | open (docs half landed, CLI half did not) | 2.22g |
 | **D3** | Two diagnostics whose `help:` text describes a layout that moved | RESOLVED | — |
 | **D4** | Removing a `needs.*` entry orphans its ResourceClaim forever | FIXED 2.22b — walk-verified | 2.22b |
-| **D5** | A Dragonfly restart drops every claim's ACL user | FIXED 2.22f — walk rewritten, run in flight | 2.22f |
+| **D5** | A Dragonfly restart drops every claim's ACL user | RESOLVED 2.22f — walk GREEN | 2.22f |
 | **D6** | Rotating a secret does not take effect until something else restarts the pods | FIXED 2.22c — walk owed | 2.22c |
 | **D7** | The CLI cannot answer the question its own error asks | FIXED 2.22c — walk owed | 2.22c |
 | **D8** | A node-scoped warning published through an optional object | FIXED 2.22d — walk step still owed | 2.22d |
@@ -522,12 +522,29 @@ untouched. Without that last one the class stays invisible exactly as it is now.
 
 **Opened:** 2026-08-30 (2.20c, correcting `docs/operator-guide/redis.md` and
 `docs/how-it-works/needs-redis.md`).
-**Status:** FIXED 2026-08-31 (2.22f, ADR 0042 §10). Walk rewritten and running
-at the time of writing.
+**Status:** RESOLVED 2026-08-31 (2.22f, ADR 0042 §10). `e2e/needs-redis-walk.sh`
+**GREEN on kind+podman**, 106 assertions. The decisive one: with the operator
+scaled to ZERO — so nothing could re-pin at runtime — a tenant authenticated on
+the FIRST attempt after its instance restarted, on both the ephemeral and the
+persistent arm. The credential could only have come from the file.
+
+The walk also found a product defect on its first run, recorded below.
 
 **Two claims in the analysis below were REFUTED while implementing, both in the
 dangerous direction.** They are corrected inline, but read the ADR §10 text as
 the record.
+
+**And the walk found a third thing neither the analysis nor the design
+anticipated.** The first design had the resync loop add `aclFromSecret` to the
+CR — which makes the dragonfly-operator roll the StatefulSet. So the FIRST
+claim on a fresh instance was handed a working connection Secret and then had
+its instance restarted out from under it, seconds later. The walk hit it
+head-on: the provision-phase ACL assertion ran against a pod still pulling its
+image. Fixed by having the CR carry the field from birth, with the provisioner
+seeding a default-only file immediately before the apply (create-if-absent, so
+the loop remains the only writer of the CONTENTS). A fresh instance now never
+rolls for this reason; the one-time roll is confined to instances that predate
+the feature, which is where the release notes put it.
 **Severity:** high. A single pod restart is a cluster-wide Redis
 authentication outage for every non-persistent claim, for up to five minutes.
 
