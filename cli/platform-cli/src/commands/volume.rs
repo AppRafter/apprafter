@@ -211,7 +211,33 @@ fn status(name: &str, namespace: &str) -> Result<()> {
         (Some(u), Some(c)) => println!("  Used/Free:   {u}/{} bytes", c - u),
         _ => println!("  Used/Free:   —"),
     }
+    // 2.22d (D8): the operator has always sampled these numbers and, until
+    // now, never judged them — `CapacityWarning` reported the NODE. It now
+    // reports this volume, and this is where an operator reads it.
+    if let Some(msg) = capacity_warning_message(&sv) {
+        println!(
+            "  {}",
+            cli_core::style::warn(&format!("Capacity:    {msg}"))
+        );
+    }
     Ok(())
+}
+
+/// The `CapacityWarning` message when the condition is `True`.
+///
+/// Pure, so the shape is tested without a cluster. `None` for any other
+/// status, including absent — a volume the sampler could not read is not a
+/// volume with room, and printing a reassurance we did not measure is how a
+/// capacity display stops being worth reading.
+pub(crate) fn capacity_warning_message(sv: &Value) -> Option<String> {
+    let conds = sv.pointer("/status/conditions")?.as_array()?;
+    let c = conds
+        .iter()
+        .find(|c| c.get("type").and_then(Value::as_str) == Some("CapacityWarning"))?;
+    if c.get("status").and_then(Value::as_str) != Some("True") {
+        return None;
+    }
+    c.get("message").and_then(Value::as_str).map(str::to_string)
 }
 
 fn rm(name: &str, namespace: &str, yes: bool) -> Result<()> {
@@ -310,5 +336,40 @@ mod tests {
         let m = sharedvolume_manifest("v", "10Gi", "ns");
         assert_eq!(m["apiVersion"], "apprafter.io/v1alpha1");
         assert_eq!(m["metadata"]["name"], "v");
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sv_with(status: &str) -> Value {
+        json!({ "status": { "conditions": [
+            { "type": "Ready", "status": "True" },
+            { "type": "CapacityWarning", "status": status, "message": "volume 91.2% full" }
+        ]}})
+    }
+
+    #[test]
+    fn a_full_volume_surfaces_its_message() {
+        assert_eq!(
+            capacity_warning_message(&sv_with("True")).as_deref(),
+            Some("volume 91.2% full")
+        );
+    }
+
+    #[test]
+    fn a_healthy_volume_prints_nothing_extra() {
+        assert!(capacity_warning_message(&sv_with("False")).is_none());
+    }
+
+    #[test]
+    fn an_unsampled_volume_gets_no_reassurance() {
+        // A volume the sampler could not read is not a volume with room.
+        // Printing "plenty of space" from an absent condition is how a
+        // capacity display stops being worth reading.
+        assert!(capacity_warning_message(&json!({ "status": {} })).is_none());
+        assert!(capacity_warning_message(&json!({})).is_none());
     }
 }

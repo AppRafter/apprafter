@@ -39,8 +39,7 @@ use operator_core::{
 
 use crate::{Context, ReconcileError, FIELD_MANAGER};
 use operator_core::capacity::{
-    is_capacity_warning, node_free_fraction, pvc_usage, should_emit_event,
-    DEFAULT_NODE_FREE_THRESHOLD,
+    is_volume_warning, pvc_usage, should_emit_event, DEFAULT_VOLUME_FULL_THRESHOLD,
 };
 
 /// The `ServiceProvider.spec.type` a `SharedVolume` binds to. There is no
@@ -436,9 +435,21 @@ pub async fn reconcile_shared_volume(
         None => None,
     };
     let capacity: Option<(i64, i64)> = summary.as_ref().and_then(|s| pvc_usage(s, &pvc_name));
-    let node_free = summary.as_ref().and_then(node_free_fraction);
-    let now_warning =
-        node_free.is_some_and(|f| is_capacity_warning(f, DEFAULT_NODE_FREE_THRESHOLD));
+
+    // 2.22d (D8): `CapacityWarning` on a SharedVolume now means THE VOLUME.
+    //
+    // It used to be derived from the NODE's free fraction, so a condition
+    // named for a volume reported something else entirely — and the volume's
+    // own usage, which the sampler above has always collected, was written to
+    // `status.capacity` and never thresholded. A volume at 99% of its own
+    // request on a healthy node said nothing.
+    //
+    // The node signal has not been dropped; it moved to where it belongs, as
+    // `NodeDiskPressure` on the PlatformStack singleton, which every cluster
+    // has whether or not it has a SharedVolume.
+    let now_warning = capacity
+        .and_then(|(used, cap)| is_volume_warning(used, cap, DEFAULT_VOLUME_FULL_THRESHOLD))
+        .unwrap_or(false);
 
     // 7. Write the terminal status — ready / pvcRef / refCount / capacity /
     //    BOTH the `Ready` and (when sampled) the `CapacityWarning`
@@ -455,17 +466,23 @@ pub async fn reconcile_shared_volume(
         &format!("provisioned PVC {pvc_name} (class {storage_class})"),
         &prior,
     );
-    // The CapacityWarning condition is only stamped when we have a node-free
-    // sample this cycle; a sample-less cycle leaves it absent (no stale value).
-    let capacity_cond = node_free.map(|frac| {
-        let pct_free = frac * 100.0;
+    // Stamped only when the volume's own usage was sampled this cycle; a
+    // sample-less cycle leaves the condition absent rather than carrying a
+    // stale value forward.
+    let capacity_cond = capacity.map(|(used, cap)| {
+        let pct_used = if cap > 0 {
+            used as f64 / cap as f64 * 100.0
+        } else {
+            0.0
+        };
         if now_warning {
             capacity_warning_condition(
                 "True",
-                "NodeNearlyFull",
+                "VolumeNearlyFull",
                 &format!(
-                    "node filesystem {pct_free:.1}% free (< {:.0}% threshold)",
-                    DEFAULT_NODE_FREE_THRESHOLD * 100.0
+                    "volume {pct_used:.1}% full (> {:.0}% threshold) — writes will fail when it \
+                     reaches capacity",
+                    DEFAULT_VOLUME_FULL_THRESHOLD * 100.0
                 ),
                 &prior,
             )
@@ -473,7 +490,7 @@ pub async fn reconcile_shared_volume(
             capacity_warning_condition(
                 "False",
                 "SufficientCapacity",
-                &format!("node filesystem {pct_free:.1}% free"),
+                &format!("volume {pct_used:.1}% full"),
                 &prior,
             )
         }
@@ -495,14 +512,22 @@ pub async fn reconcile_shared_volume(
     //    (anti-spam). Best-effort: a publish failure is logged, not fatal.
     let was_warning = was_capacity_warning(&prior);
     if should_emit_event(was_warning, now_warning) {
-        let pct_free = node_free.map(|f| f * 100.0).unwrap_or(0.0);
+        let pct_used = capacity
+            .map(|(u, c)| {
+                if c > 0 {
+                    u as f64 / c as f64 * 100.0
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
         let recorder = build_recorder(&ctx.client, &sv);
         let ev = KubeEvent {
             type_: EventType::Warning,
             reason: "CapacityWarning".into(),
             note: Some(format!(
-                "SharedVolume {name}: node filesystem only {pct_free:.1}% free (< {:.0}% threshold) — backing volume may stop accepting writes",
-                DEFAULT_NODE_FREE_THRESHOLD * 100.0
+                "SharedVolume {name}: volume {pct_used:.1}% full (> {:.0}% threshold) — writes will fail when it reaches capacity",
+                DEFAULT_VOLUME_FULL_THRESHOLD * 100.0
             )),
             action: "Provision".into(),
             secondary: None,

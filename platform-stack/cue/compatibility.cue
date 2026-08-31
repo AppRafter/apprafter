@@ -1797,6 +1797,21 @@ compatibility: "0.2.58": {
 		change=requires-restart: the operator Deployment rolls, and the first
 		reconcile after it performs the deletions above for anything already
 		undeclared.
+
+		CAPACITY SIGNALS MOVE, AND ONE CHANGES MEANING (2.22d / D8). The node's
+		disk-pressure signal used to be computed inside the SharedVolume
+		reconcile, so a cluster with no SharedVolume was never warned about its
+		own disk — while owned disks, CNPG data, Dragonfly snapshots, images and
+		logs all share that filesystem. It now lives as `NodeDiskPressure` on the
+		PlatformStack singleton, which every cluster has, and the CLI prints it
+		as a banner on EVERY command rather than in one status view.
+
+		`CapacityWarning` on a SharedVolume now means THE VOLUME. It previously
+		reported the node's free space under a name that says otherwise, while
+		the volume's own usage was sampled, written to `status.capacity` and
+		never judged. EXPECT THE CONDITION TO FLIP on upgrade: a volume with
+		room on a nearly-full node stops warning, and a nearly-full volume on a
+		healthy node starts. Both are corrections; neither is a regression.
 		"""
 }
 

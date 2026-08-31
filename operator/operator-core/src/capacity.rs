@@ -92,6 +92,28 @@ pub fn is_capacity_warning(node_free_fraction: f64, threshold: f64) -> bool {
     node_free_fraction < threshold
 }
 
+/// Fraction of a volume's own capacity above which it is worth warning.
+/// 0.85 ⇒ warn once the volume is more than 85% full.
+pub const DEFAULT_VOLUME_FULL_THRESHOLD: f64 = 0.85;
+
+/// Whether a volume's OWN usage is above the warning threshold (2.22d / D8).
+///
+/// Distinct from [`is_capacity_warning`], which reads the node's filesystem.
+/// The platform sampled both from the beginning and thresholded only the
+/// node, so a volume at 99% of its own request on a healthy node said
+/// nothing — while the condition it would have set was, confusingly, called
+/// `CapacityWarning` and reported the node instead.
+///
+/// `None` when the numbers cannot support a judgement: a non-positive
+/// capacity is not "0% full", it is unknown, and returning `false` there
+/// would be an assertion the data does not carry.
+pub fn is_volume_warning(used_bytes: i64, capacity_bytes: i64, threshold: f64) -> Option<bool> {
+    if capacity_bytes <= 0 || used_bytes < 0 {
+        return None;
+    }
+    Some(used_bytes as f64 / capacity_bytes as f64 > threshold)
+}
+
 /// Edge-trigger: emit a Warning Event only on an OK→warning transition
 /// (anti-spam). warn→warn and any →OK transition are suppressed.
 pub fn should_emit_event(was_warning: bool, is_warning: bool) -> bool {
@@ -181,6 +203,31 @@ impl CapacityCache {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_volume_past_the_threshold_warns_and_one_below_does_not() {
+        assert_eq!(is_volume_warning(90, 100, 0.85), Some(true));
+        assert_eq!(is_volume_warning(50, 100, 0.85), Some(false));
+    }
+
+    #[test]
+    fn exactly_at_the_threshold_does_not_warn() {
+        // Strictly greater: a volume sitting on the line is not yet a
+        // problem, and a threshold that fires AT its own value makes the
+        // number in the message look wrong to whoever reads it.
+        assert_eq!(is_volume_warning(85, 100, 0.85), Some(false));
+    }
+
+    #[test]
+    fn unusable_numbers_are_unknown_rather_than_healthy() {
+        // A non-positive capacity is not "0% full" — it is a sample that
+        // cannot support a judgement. Returning false there would assert
+        // something the data does not carry, which is how a monitoring
+        // surface starts lying quietly.
+        assert_eq!(is_volume_warning(10, 0, 0.85), None);
+        assert_eq!(is_volume_warning(10, -1, 0.85), None);
+        assert_eq!(is_volume_warning(-1, 100, 0.85), None);
+    }
 
     #[test]
     fn parses_node_free_fraction_from_summary() {
