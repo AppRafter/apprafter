@@ -174,21 +174,32 @@ pub fn run(target_override: Option<&str>, no_ping: bool) -> Result<()> {
             .filter(|s| !s.is_empty()),
     };
 
+    // Environment half FIRST, and genuinely unconditionally.
+    //
+    // D11 / 2.22a: the comment here used to claim it "runs regardless of
+    // target state" while the `None` arm below returned `Err` before
+    // reaching it — so a first-run user, the audience this module's own
+    // docstring names, learned nothing about kubectl, helm, ssh or DNS.
+    // These checks depend on no target, so nothing about a target can
+    // gate them.
+    report.env_checks = build_env_checks();
+
     match resolved {
         Some(name) => {
             report.target_name = Some(name.clone());
             report.target_checks = build_target_checks(&paths, &name, no_ping);
         }
         None => {
-            return Err(CliError::Other(
-                "no active target and no `--target` supplied. Run `apprafter target add` to configure one, then re-run `apprafter doctor`."
-                    .to_string(),
-            ));
+            // A warning, not an error: "you have not configured a target
+            // yet" is the expected state before `target add`, and the
+            // environment report above is exactly what that reader came
+            // for. Exit stays 0 unless a REQUIRED tool is missing.
+            report.target_checks = vec![Check::warn("active target").with_hint(
+                "none configured. Run `apprafter target add <name>` to set one up, \
+                 then re-run `apprafter doctor` for the target-side checks.",
+            )];
         }
     }
-
-    // Environment half — runs regardless of target state.
-    report.env_checks = build_env_checks();
 
     print_report(&report);
 
@@ -391,23 +402,36 @@ fn check_ssh_key(target: &Target) -> Check {
 // Environment-side checks
 // ---------------------------------------------------------------
 
+/// The environment half, derived from [`cli_core::tools::ALL`].
+///
+/// Derived rather than hand-listed on purpose: D11 found `restic` with
+/// eight spawn sites, fatal on every one, and named in no checked list —
+/// and `git` likewise. A hand-written list is a second place to forget.
 fn build_env_checks() -> Vec<Check> {
-    vec![
-        check_tool("kubectl", &["version", "--client"]),
-        check_tool("helm", &["version", "--short"]),
-        check_tool("ssh", &["-V"]),
-        check_dns_resolves("api.hetzner.cloud"),
-    ]
+    let mut checks: Vec<Check> = cli_core::tools::ALL.iter().map(check_tool).collect();
+    checks.push(check_dns_resolves("api.hetzner.cloud"));
+    checks
 }
 
-/// Probe for a binary on PATH. Missing = WARN (the platform's
-/// operational commands still install / use the tool through
-/// `cargo run`-style paths in development; doctor isn't the
-/// authoritative installer). Found = PASS with the first
-/// non-empty line of the tool's `--version`-style output as
-/// the detail.
-fn check_tool(name: &str, version_args: &[&str]) -> Check {
-    let out = Command::new(name).args(version_args).output();
+/// Probe for a binary on PATH.
+///
+/// Found = PASS with the first non-empty line of its version output.
+/// Missing = **FAIL when the tool is required**, WARN otherwise.
+///
+/// The old behaviour warned unconditionally, with a rationale about
+/// development workflows — a developer-workflow argument applied to an
+/// operator-facing tool. The consequence D11 recorded: a missing
+/// `kubectl` printed "Ready to go; review warnings if they apply" and
+/// exited 0, while the quickstart calls kubectl and helm not optional.
+/// A test pinned that behaviour, so it was defended on every run.
+///
+/// Feature-scoped tools still warn, because an operator who never backs
+/// up genuinely does not need `restic` — but the hint now names the
+/// capability that is unavailable instead of implying the install is
+/// optional in general.
+fn check_tool(tool: &cli_core::tools::Tool) -> Check {
+    let name = tool.name;
+    let out = Command::new(name).args(tool.version_args).output();
     match out {
         Ok(o) if o.status.success() => Check::pass(format!("`{name}` on PATH"))
             .with_detail(first_nonempty_line(&o).unwrap_or_else(|| "version unknown".to_string())),
@@ -424,9 +448,18 @@ fn check_tool(name: &str, version_args: &[&str]) -> Check {
                 ))
             }
         }
-        Err(e) => Check::warn(format!("`{name}` on PATH")).with_hint(format!(
-            "not found ({e}); install when you need it — `apprafter doctor` keeps running",
-        )),
+        Err(e) => {
+            let label = format!("`{name}` on PATH");
+            let hint = format!(
+                "not found ({e}) — needed for {}.\n{}",
+                tool.purpose, tool.install
+            );
+            if tool.required {
+                Check::fail(label).with_hint(hint)
+            } else {
+                Check::warn(label).with_hint(hint)
+            }
+        }
     }
 }
 
@@ -467,8 +500,16 @@ fn check_dns_resolves(host: &str) -> Check {
 // ---------------------------------------------------------------
 
 pub fn print_report(report: &DoctorReport) {
-    if let Some(name) = &report.target_name {
-        println!("Checking target `{name}`...");
+    // The target section prints whenever there is anything to say —
+    // which now includes "you have not configured one". Gating it on
+    // `target_name` alone counted the no-target warning in the summary
+    // and never showed it, so the reader saw a warning total they could
+    // not account for.
+    if !report.target_checks.is_empty() {
+        match &report.target_name {
+            Some(name) => println!("Checking target `{name}`..."),
+            None => println!("Checking target..."),
+        }
         for c in &report.target_checks {
             print_check_line(c);
         }
@@ -578,12 +619,70 @@ mod tests {
     }
 
     #[test]
-    fn check_tool_warns_on_missing_binary() {
-        // No system ships a binary called this; the function
-        // must downgrade to WARN with a hint.
-        let c = check_tool("apprafter-doctor-no-such-binary", &["--version"]);
+    fn check_tool_warns_on_a_missing_feature_scoped_binary() {
+        // No system ships a binary called this. A feature-scoped tool
+        // still warns — an operator who never backs up genuinely does
+        // not need restic — but the hint must name what is unavailable
+        // and how to install it, not just say "not found".
+        let absent = cli_core::tools::Tool {
+            name: "apprafter-doctor-no-such-binary",
+            purpose: "a test",
+            install: "there is nothing to install",
+            required: false,
+            version_args: &["--version"],
+        };
+        let c = check_tool(&absent);
         assert_eq!(c.status, CheckStatus::Warn);
-        assert!(c.hint.is_some());
+        let hint = c.hint.expect("a missing tool must say how to get it");
+        assert!(hint.contains("a test"), "{hint}");
+        assert!(hint.contains("there is nothing to install"), "{hint}");
+    }
+
+    #[test]
+    fn check_tool_fails_on_a_missing_required_binary() {
+        // The behaviour D11 recorded, inverted. The previous version of
+        // this test asserted WARN unconditionally and therefore DEFENDED
+        // the defect on every run: a missing kubectl printed "Ready to
+        // go" and exited 0 while the quickstart calls it not optional.
+        let absent = cli_core::tools::Tool {
+            name: "apprafter-doctor-no-such-binary",
+            purpose: "a test",
+            install: "there is nothing to install",
+            required: true,
+            version_args: &["--version"],
+        };
+        assert_eq!(check_tool(&absent).status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn a_missing_required_tool_makes_the_whole_run_fail() {
+        // The half that matters to a shell: has_failures drives the exit
+        // code, so the FAIL above must actually reach it. Asserting the
+        // status alone would pass even if the report ignored it.
+        let report = DoctorReport {
+            target_name: None,
+            target_checks: vec![],
+            env_checks: vec![Check::fail("`kubectl` on PATH")],
+        };
+        assert!(
+            report.has_failures(),
+            "a missing required tool must exit non-zero"
+        );
+    }
+
+    #[test]
+    fn the_environment_half_covers_every_spawned_binary() {
+        // Derived from cli_core::tools::ALL rather than hand-listed, so
+        // a new dependency cannot be added without appearing here. D11
+        // found restic with eight spawn sites and no check at all.
+        let checks = build_env_checks();
+        for t in cli_core::tools::ALL {
+            assert!(
+                checks.iter().any(|c| c.name.contains(t.name)),
+                "`{}` is spawned by the CLI but `doctor` does not check it",
+                t.name
+            );
+        }
     }
 
     #[test]

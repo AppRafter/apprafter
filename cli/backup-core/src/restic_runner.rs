@@ -37,6 +37,26 @@ pub trait ResticRunner {
 /// via the environment (never on argv).
 pub struct SubprocessRestic;
 
+/// Build a classified [`CliError::Restic`] from a failed invocation.
+///
+/// One place, so every restic failure gets the same treatment: the
+/// stderr is classified (wrong passphrase / missing repository / stale
+/// lock) and the remedy for that class becomes the diagnostic's help.
+/// An unrecognised failure carries an empty hint and renders verbatim.
+fn restic_error(argv: &[String], exit: Option<i32>, stderr: &[u8]) -> CliError {
+    let stderr = String::from_utf8_lossy(stderr).into_owned();
+    let hint = cli_core::diagnose::classify_restic(&stderr)
+        .hint()
+        .unwrap_or_default()
+        .to_string();
+    CliError::Restic {
+        verb: argv.first().map(String::as_str).unwrap_or("?").to_string(),
+        exit,
+        stderr,
+        hint,
+    }
+}
+
 impl ResticRunner for SubprocessRestic {
     fn run(&self, argv: &[String], pass: &str) -> Result<()> {
         let out = Command::new("restic")
@@ -45,12 +65,7 @@ impl ResticRunner for SubprocessRestic {
             .output()
             .map_err(|e| CliError::Other(format!("spawn restic: {e}")))?;
         if !out.status.success() {
-            return Err(CliError::Other(format!(
-                "restic {} failed (exit {:?}): {}",
-                argv.first().map(String::as_str).unwrap_or("?"),
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr)
-            )));
+            return Err(restic_error(argv, out.status.code(), &out.stderr));
         }
         Ok(())
     }
@@ -62,12 +77,7 @@ impl ResticRunner for SubprocessRestic {
             .output()
             .map_err(|e| CliError::Other(format!("spawn restic: {e}")))?;
         if !out.status.success() {
-            return Err(CliError::Other(format!(
-                "restic {} failed (exit {:?}): {}",
-                argv.first().map(String::as_str).unwrap_or("?"),
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr)
-            )));
+            return Err(restic_error(argv, out.status.code(), &out.stderr));
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }

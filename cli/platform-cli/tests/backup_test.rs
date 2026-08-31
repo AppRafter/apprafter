@@ -95,15 +95,37 @@ fn restore_reprovision_and_data_only_are_mutually_exclusive() {
 
 #[test]
 fn restore_into_running_errors_for_a_real_reason_not_a_stub() {
-    // Post-T11, `apprafter restore <repo>` drives the real restore-into-running
-    // flow. With no RESTIC_PASSWORD set and no TTY (assert_cmd has no terminal),
-    // the mandatory-passphrase gate fires first — a REAL precondition error, not
-    // the removed "not yet implemented" stub.
-    cli()
+    // Post-T11, `apprafter restore <repo>` drives the real
+    // restore-into-running flow, so a REAL precondition must fire rather
+    // than the removed "not yet implemented" stub.
+    //
+    // 2.22a moved WHICH precondition fires, deliberately: the binary
+    // check now runs before the credential gate (D11). Both are real, so
+    // the stub assertion is unchanged — but rather than accepting either
+    // message and weakening the test, it now asserts the ORDERING, which
+    // is the thing 2.22a changed. The environment decides which branch
+    // applies, so the test asks the same question the code does.
+    let restic_present = cli_core::tools::preflight_tool(&cli_core::tools::RESTIC, "test").is_ok();
+
+    let assertion = cli()
         .args(["restore", "/tmp/fake-repo"])
         .env_remove("RESTIC_PASSWORD")
         .assert()
         .failure()
-        .stderr(contains("passphrase"))
         .stderr(contains("not yet implemented").not());
+
+    if restic_present {
+        // Binary available → the credential gate is the first thing that
+        // can fail, exactly as before.
+        assertion.stderr(contains("passphrase"));
+    } else {
+        // Binary missing → the preflight fires FIRST. The second half is
+        // the actual fix: the command must not have asked for a
+        // passphrase it could never have used. Without this, moving the
+        // preflight back down would still pass.
+        assertion
+            .stderr(contains("restic"))
+            .stderr(contains("not on PATH"))
+            .stderr(contains("passphrase").not());
+    }
 }

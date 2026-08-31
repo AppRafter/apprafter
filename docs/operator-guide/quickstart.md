@@ -64,12 +64,19 @@ You will also need:
 - A Hetzner Cloud API token with Read+Write access.
 - An SSH key whose **public** half you will hand to the provider for
   the new node. The CLI never touches the private half.
-- **`kubectl` and `helm` on your `PATH`.** These are not optional and
-  not only for the verification steps: the CLI shells out to `kubectl`
-  for every cluster-facing command and to `helm` inside
-  `cluster-bootstrap`. Without `kubectl`, `apprafter` fails with
-  `× spawn kubectl: No such file or directory (os error 2)`. Step 3's
-  `apprafter doctor` checks both.
+- **`kubectl` on your `PATH`.** Not optional: the CLI shells out to it
+  for every cluster-facing command, and `apprafter doctor` reports a
+  missing `kubectl` as a failure rather than a warning.
+- **`helm`** for `cluster-bootstrap`, **`restic`** for backup and
+  restore, **`git`** for reading an application repository, and an
+  **SSH client** for node preparation. Each is needed only by the
+  commands that use it, so `doctor` reports a missing one as a warning
+  naming the capability you will not have.
+
+Any command that needs a tool checks for it **before** it prompts for
+anything, contacts a cluster or creates a billable resource, and names
+the install steps when it is absent. Step 3's `apprafter doctor` lists
+all five up front.
 
 The rest of this page assumes `apprafter` is on `PATH`.
 

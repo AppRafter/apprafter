@@ -3,6 +3,7 @@
 
 pub mod credentials;
 pub mod cue;
+pub mod diagnose;
 pub mod error;
 pub mod logging;
 pub mod manifest;

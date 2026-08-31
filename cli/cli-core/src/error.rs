@@ -105,6 +105,40 @@ pub enum CliError {
     )]
     CueExport { exit: i32, stderr: String },
 
+    /// A `restic` invocation failed, classified.
+    ///
+    /// The whole point over the catch-all is `hint`: it comes from
+    /// [`crate::diagnose::classify_restic`], so a wrong passphrase and a
+    /// missing repository stop rendering as the same wall of stderr. An
+    /// unrecognised failure carries an empty hint and the original text
+    /// is all the reader gets — deliberately, since a confident wrong
+    /// classification is worse than none.
+    #[error("restic {verb} failed (exit {exit:?}): {stderr}")]
+    #[diagnostic(code(apprafter::backup::restic_failed), help("{hint}"))]
+    Restic {
+        verb: String,
+        exit: Option<i32>,
+        stderr: String,
+        hint: String,
+    },
+
+    /// A `kubectl` invocation failed, classified.
+    ///
+    /// Same shape as [`CliError::Restic`]: `hint` is derived from
+    /// [`crate::diagnose::classify_kubectl`], which separates the three
+    /// shapes that actually recur — cannot reach the apiserver, refused
+    /// by RBAC, kind not served — because each has a different remedy
+    /// and today they render identically.
+    #[error("kubectl {verb} {resource} failed (exit {exit:?}): {stderr}")]
+    #[diagnostic(code(apprafter::cluster::kubectl_failed), help("{hint}"))]
+    Kubectl {
+        verb: String,
+        resource: String,
+        exit: Option<i32>,
+        stderr: String,
+        hint: String,
+    },
+
     /// Hetzner Cloud API call failed.
     #[error("hetzner-cloud {endpoint} failed (status {status}): {code}: {message}")]
     #[diagnostic(

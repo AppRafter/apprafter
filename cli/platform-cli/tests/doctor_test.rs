@@ -49,16 +49,38 @@ fn seed_target_with_ssh(dir: &std::path::Path, ssh_key: Option<&std::path::Path>
 }
 
 #[test]
-fn doctor_on_empty_store_errors_with_onboarding_hint() {
+fn doctor_on_empty_store_still_reports_the_environment() {
+    // D11 / 2.22a. This test previously asserted `.failure()` with "no
+    // active target" on stderr — the exact behaviour the audit called
+    // wrong. `doctor`'s own docstring names first-run users as its
+    // audience, and a first-run user has no target by definition, so
+    // aborting there told them nothing about kubectl, helm, ssh or DNS:
+    // precisely what they opened the command to learn.
+    //
+    // The exit status is deliberately NOT asserted. It now depends on
+    // whether a REQUIRED tool is present on the machine running the
+    // test, which is not a property of this code path. The exit-code
+    // rule is unit-tested instead, in
+    // `doctor::tests::a_missing_required_tool_makes_the_whole_run_fail`.
     let dir = tempfile::tempdir().unwrap();
-    cli()
+    let out = cli()
         .env("APPRAFTER_CONFIG_DIR", dir.path())
         .env("APPRAFTER_NO_PING", "1")
         .arg("doctor")
-        .assert()
-        .failure()
-        .stderr(contains("no active target"))
-        .stderr(contains("apprafter target add"));
+        .output()
+        .expect("doctor runs");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+
+    // The environment half reached the reader.
+    for tool in ["kubectl", "helm", "restic", "git", "ssh"] {
+        assert!(
+            stdout.contains(tool),
+            "`{tool}` missing from the report a first-run user sees:\n{stdout}"
+        );
+    }
+    // And they are told what to do next, as a check rather than an abort.
+    assert!(stdout.contains("active target"), "{stdout}");
+    assert!(stdout.contains("apprafter target add"), "{stdout}");
 }
 
 #[test]

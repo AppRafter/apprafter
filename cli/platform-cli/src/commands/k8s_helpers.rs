@@ -38,6 +38,33 @@ use tempfile::NamedTempFile;
 
 use crate::commands::state_paths::resolve_state_paths;
 
+/// Build a classified [`CliError::Kubectl`] from a failed invocation.
+///
+/// One place, so every `kubectl` failure in this module gets the same
+/// treatment: the stderr is classified (unreachable / forbidden / kind
+/// not served) and the remedy for that class becomes the diagnostic's
+/// help. Anything unrecognised carries an empty hint and renders
+/// verbatim — a confident wrong classification would send the reader
+/// somewhere else, which is worse than the raw text.
+///
+/// D11 / 2.22a. These were 39 spawn sites pasting raw stderr into the
+/// catch-all; classifying at the choke points rather than at every call
+/// site is the point — the entry is explicit that 584 is not a number to
+/// drive to zero.
+fn kubectl_error(verb: &str, resource: &str, exit: Option<i32>, stderr: &str) -> CliError {
+    let hint = cli_core::diagnose::classify_kubectl(stderr)
+        .hint()
+        .unwrap_or_default()
+        .to_string();
+    CliError::Kubectl {
+        verb: verb.to_string(),
+        resource: resource.to_string(),
+        exit,
+        stderr: stderr.to_string(),
+        hint,
+    }
+}
+
 /// Decrypt the cached kubeconfig from state and write it to a
 /// `NamedTempFile`. Callers MUST keep the returned file alive
 /// for the duration of the `kubectl` invocation — when the
@@ -114,10 +141,7 @@ pub fn kubectl_get_json(
         if stderr.contains("NotFound") || stderr.contains("not found") {
             return Ok(None);
         }
-        return Err(CliError::Other(format!(
-            "kubectl get {resource} failed (exit {:?}): {stderr}",
-            out.status.code()
-        )));
+        return Err(kubectl_error("get", resource, out.status.code(), &stderr));
     }
 
     let value: serde_json::Value = serde_json::from_slice(&out.stdout)
@@ -171,10 +195,12 @@ pub(crate) fn kubectl_get_json_by_selector(
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(CliError::Other(format!(
-            "kubectl get {resource} -l {selector} failed (exit {:?}): {stderr}",
-            out.status.code()
-        )));
+        return Err(kubectl_error(
+            "get",
+            &format!("{resource} -l {selector}"),
+            out.status.code(),
+            &stderr,
+        ));
     }
 
     let value: serde_json::Value = serde_json::from_slice(&out.stdout)
@@ -228,10 +254,7 @@ pub(crate) fn kubectl_get_json_cluster_wide(
         if stderr.contains("NotFound") || stderr.contains("not found") {
             return Ok(None);
         }
-        return Err(CliError::Other(format!(
-            "kubectl get {resource} failed (exit {:?}): {stderr}",
-            out.status.code()
-        )));
+        return Err(kubectl_error("get", resource, out.status.code(), &stderr));
     }
 
     let value: serde_json::Value = serde_json::from_slice(&out.stdout)
@@ -267,11 +290,12 @@ pub fn kubectl_apply_json(manifest: &serde_json::Value, kubeconfig_path: &Path) 
         .output()
         .map_err(|e| CliError::Other(format!("spawn kubectl apply: {e}")))?;
     if !out.status.success() {
-        return Err(CliError::Other(format!(
-            "kubectl apply failed (exit {:?}): {}",
+        return Err(kubectl_error(
+            "apply",
+            "manifest",
             out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        )));
+            &String::from_utf8_lossy(&out.stderr),
+        ));
     }
     Ok(())
 }
@@ -297,11 +321,12 @@ pub fn kubectl_delete(
         .output()
         .map_err(|e| CliError::Other(format!("spawn kubectl delete: {e}")))?;
     if !out.status.success() {
-        return Err(CliError::Other(format!(
-            "kubectl delete {resource}/{name} failed (exit {:?}): {}",
+        return Err(kubectl_error(
+            "delete",
+            &format!("{resource}/{name}"),
             out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        )));
+            &String::from_utf8_lossy(&out.stderr),
+        ));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let trimmed = stdout.trim();
@@ -343,10 +368,12 @@ pub fn kubectl_merge_patch(
         .map_err(|e| CliError::Other(format!("spawn kubectl: {e}")))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(CliError::Other(format!(
-            "kubectl patch {resource}/{name} failed (exit {:?}): {stderr}",
-            out.status.code()
-        )));
+        return Err(kubectl_error(
+            "patch",
+            &format!("{resource}/{name}"),
+            out.status.code(),
+            &stderr,
+        ));
     }
     Ok(())
 }
@@ -396,10 +423,12 @@ pub fn kubectl_apply_server_side(
         .map_err(|e| CliError::Other(format!("wait for kubectl apply: {e}")))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(CliError::Other(format!(
-            "kubectl apply --server-side failed (exit {:?}): {stderr}",
-            out.status.code()
-        )));
+        return Err(kubectl_error(
+            "apply --server-side",
+            "manifest",
+            out.status.code(),
+            &stderr,
+        ));
     }
     Ok(())
 }

@@ -64,6 +64,22 @@ pub struct Tool {
     pub purpose: &'static str,
     /// Platform-agnostic install guidance, already wrapped.
     pub install: &'static str,
+    /// Whether the CLI's core path is unusable without it.
+    ///
+    /// Only `kubectl` is `true`: every cluster-facing command spawns it,
+    /// so its absence is not a warning about a feature, it is the CLI
+    /// not working. The rest are feature-scoped — an operator who never
+    /// backs up genuinely does not need `restic` — so they warn rather
+    /// than fail, and the warning names the capability that is
+    /// unavailable instead of implying the install is mandatory.
+    ///
+    /// This distinction is what `doctor` reports on; D11's complaint was
+    /// that a missing `kubectl` printed "Ready to go" and exited 0.
+    pub required: bool,
+    /// Arguments that make the tool print its version. `ssh -V` writes
+    /// to stderr and some tools exit non-zero, which `check_tool`
+    /// tolerates — any output at all counts as present.
+    pub version_args: &'static [&'static str],
 }
 
 /// Restic — every backup and restore path.
@@ -76,6 +92,8 @@ pub const RESTIC: Tool = Tool {
               • Arch       pacman -S restic\n  \
               • Nix        nix profile install nixpkgs#restic\n  \
               • other      https://restic.readthedocs.io/en/stable/020_installation.html",
+    required: false,
+    version_args: &["version"],
 };
 
 /// kubectl — every command that talks to a cluster.
@@ -87,6 +105,8 @@ pub const KUBECTL: Tool = Tool {
               • Debian     apt install kubectl\n  \
               • Nix        nix profile install nixpkgs#kubectl\n  \
               • other      https://kubernetes.io/docs/tasks/tools/",
+    required: true,
+    version_args: &["version", "--client"],
 };
 
 /// Helm — chart installs during bootstrap.
@@ -98,6 +118,8 @@ pub const HELM: Tool = Tool {
               • Debian     apt install helm\n  \
               • Nix        nix profile install nixpkgs#kubernetes-helm\n  \
               • other      https://helm.sh/docs/intro/install/",
+    required: false,
+    version_args: &["version", "--short"],
 };
 
 /// Git — repository probes and scaffolding.
@@ -109,6 +131,8 @@ pub const GIT: Tool = Tool {
               • Debian     apt install git\n  \
               • Nix        nix profile install nixpkgs#git\n  \
               • other      https://git-scm.com/downloads",
+    required: false,
+    version_args: &["--version"],
 };
 
 /// SSH — node preparation over the provider's public IP.
@@ -119,6 +143,8 @@ pub const SSH: Tool = Tool {
               • macOS      preinstalled\n  \
               • Debian     apt install openssh-client\n  \
               • Nix        nix profile install nixpkgs#openssh",
+    required: false,
+    version_args: &["-V"],
 };
 
 /// Every tool this CLI can spawn.
@@ -250,6 +276,8 @@ mod tests {
                 name: "definitely-not-a-real-binary-9f3a",
                 purpose: "a test",
                 install: "install it",
+                required: true,
+                version_args: &["--version"],
             },
             "apprafter backup list",
         )
@@ -278,7 +306,23 @@ mod tests {
                 "`{}` purpose is a clause without a trailing stop",
                 t.name
             );
+            assert!(
+                !t.version_args.is_empty(),
+                "`{}` needs version args so `doctor` can report which one is installed",
+                t.name
+            );
         }
+    }
+
+    #[test]
+    fn kubectl_is_the_only_required_tool() {
+        // The judgement this table encodes, stated so a change to it is
+        // deliberate: kubectl is spawned by every cluster-facing command,
+        // so its absence is the CLI not working. The rest are
+        // feature-scoped and an operator who never backs up genuinely
+        // does not need restic — warning there, failing here.
+        let required: Vec<&str> = ALL.iter().filter(|t| t.required).map(|t| t.name).collect();
+        assert_eq!(required, vec!["kubectl"], "required set changed");
     }
 
     #[test]
