@@ -21,7 +21,7 @@ would otherwise touch the same code three times.
 | | Entry | Status | Planned as |
 | --- | --- | --- | --- |
 | **D1** | VPA in-place right-sizing has never run: wrong feature-gate name | RESOLVED | — |
-| **D2** | `--cron` / `--check-cron` are the wrong surface, not an unvalidated one | open (docs half landed, CLI half did not) | **unplanned** |
+| **D2** | `--cron` / `--check-cron` are the wrong surface, not an unvalidated one | open (docs half landed, CLI half did not) | 2.22g |
 | **D3** | Two diagnostics whose `help:` text describes a layout that moved | RESOLVED | — |
 | **D4** | Removing a `needs.*` entry orphans its ResourceClaim forever | open — high | 2.22b |
 | **D5** | A Dragonfly restart drops every claim's ACL user | open — high | 2.22f |
