@@ -750,7 +750,7 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         &namespace,
         &mut rendered.deployment,
         &source_creds,
-        &pp,
+        &app,
     )
     .await?;
 
@@ -1601,7 +1601,7 @@ async fn attach_pull_secret(
     namespace: &str,
     deployment: &mut Deployment,
     creds: &[SourceCredential],
-    pp: &PatchParams,
+    app: &Application,
 ) -> Result<(), ReconcileError> {
     let Some(image) = deployment_image(deployment) else {
         return Ok(());
@@ -1621,7 +1621,7 @@ async fn attach_pull_secret(
     };
 
     let copy_name = app_pull_secret_name(&cred_name);
-    apply_pull_secret_copy(client, namespace, &copy_name, &dockercfg, pp).await?;
+    apply_pull_secret_copy(client, namespace, &copy_name, &cred_name, &dockercfg, app).await?;
     set_image_pull_secret(deployment, &copy_name);
     info!(%cred_name, %copy_name, %namespace, "attached pull-secret to workload");
     Ok(())
@@ -1742,26 +1742,73 @@ async fn check_env_secret_refs(
 }
 
 /// SSA-apply a per-workload copy of the derived pull-secret.
+/// Project the SourceCredential's derived pull-secret into the workload
+/// namespace, owned by every Application that consumes it (2.22b / D13).
+///
+/// This Secret has TWO dependencies, and neither is expressible as a single
+/// controlling ownerReference — which is what left it owned by nobody:
+///
+///  * **The SourceCredential it is derived from** lives in another namespace,
+///    and Kubernetes forbids cross-namespace owner references (the GC reads
+///    the owner as absent). That half is the SourceCredential's finalizer,
+///    which sweeps by [`SOURCE_CREDENTIAL_LABEL`] — so the copy carries that
+///    label from here on, which is exactly what it was missing.
+///  * **The Applications that pull through it** are several, in this
+///    namespace, and the copy is named after the CREDENTIAL, so they share
+///    one object. A controlling ownerRef from any one of them would
+///    cascade-delete a Secret its neighbours still need.
+///
+/// The second half is what `ownerReferences` being a LIST is for: the garbage
+/// collector removes a dependent only when **all** its owners are gone, so
+/// adding one non-controller entry per consuming Application gives reference
+/// counting for free, executed by the apiserver.
+///
+/// The field manager is per-Application deliberately. Server-side apply owns
+/// `metadata.ownerReferences` as a map keyed by `uid`, so each Application's
+/// entry belongs to its own manager and they coexist; a single shared manager
+/// would prune whichever entry it did not send this time, and two apps would
+/// take turns evicting each other.
 async fn apply_pull_secret_copy(
     client: &Client,
     namespace: &str,
     name: &str,
+    cred_name: &str,
     dockercfg: &str,
-    pp: &PatchParams,
+    app: &Application,
 ) -> Result<(), ReconcileError> {
     let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let owner = owner_reference(app);
     let payload = json!({
         "apiVersion": "v1",
         "kind": "Secret",
         "metadata": {
             "name": name,
             "namespace": namespace,
-            "labels": { "apprafter.io/managed-by": "apprafter" }
+            "labels": {
+                "apprafter.io/managed-by": "apprafter",
+                "apprafter.io/source-credential": cred_name,
+            },
+            "ownerReferences": [{
+                "apiVersion": owner.api_version,
+                "kind": owner.kind,
+                "name": owner.name,
+                "uid": owner.uid,
+                // NOT the controller: no single Application decides whether a
+                // shared Secret exists. `blockOwnerDeletion` is likewise off —
+                // this must never hold up deleting an app.
+                "controller": false,
+                "blockOwnerDeletion": false,
+            }],
         },
         "type": "kubernetes.io/dockerconfigjson",
         "stringData": { ".dockerconfigjson": dockercfg }
     });
-    api.patch(name, pp, &Patch::Apply(&payload)).await?;
+    let per_app = PatchParams::apply(&format!(
+        "{FIELD_MANAGER}.app.{}",
+        app.metadata.name.as_deref().unwrap_or("unknown")
+    ))
+    .force();
+    api.patch(name, &per_app, &Patch::Apply(&payload)).await?;
     Ok(())
 }
 

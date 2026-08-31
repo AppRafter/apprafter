@@ -607,21 +607,35 @@ async fn gc_derived_secrets(
     cred_namespace: &str,
     name: &str,
 ) -> Result<(), ReconcileError> {
+    // 2.22b (D13): sweep CLUSTER-WIDE by label, not two hard-coded
+    // namespaces.
+    //
+    // The derived material does not all live where this function used to
+    // look. The Argo repo-cred and the canonical dockerconfigjson are in
+    // `argocd` / the credential's own namespace, but the Application
+    // controller projects a pull-secret copy into EVERY workload namespace
+    // that pulls through this credential — and those namespaces are not
+    // knowable from here without listing them.
+    //
+    // Deleting the PAT is exactly the moment every derivative must be
+    // revoked: leaving a copy behind leaves a working registry credential in
+    // a namespace after the operator believed they were all withdrawn. The
+    // label is the only thing tying them together, since a cross-namespace
+    // ownerReference is impossible (see this module's docstring), so the
+    // sweep follows the label wherever it went. `cred_namespace` is no
+    // longer read for this reason — the selector is namespace-agnostic.
+    let _ = cred_namespace;
     let selector = format!("{SOURCE_CREDENTIAL_LABEL}={name}");
-    let mut namespaces = vec![ARGOCD_NAMESPACE];
-    if cred_namespace != ARGOCD_NAMESPACE {
-        namespaces.push(cred_namespace);
-    }
-    for ns in namespaces {
-        let api: Api<Secret> = Api::namespaced(client.clone(), ns);
-        let lp = ListParams::default().labels(&selector);
-        for secret in api.list(&lp).await? {
-            if let Some(secret_name) = secret.metadata.name {
-                // ignore "already gone" so re-runs after a partial
-                // delete still converge
-                let _ = api.delete(&secret_name, &DeleteParams::default()).await;
-            }
-        }
+    let all: Api<Secret> = Api::all(client.clone());
+    let lp = ListParams::default().labels(&selector);
+    for secret in all.list(&lp).await? {
+        let (Some(secret_name), Some(ns)) = (secret.metadata.name, secret.metadata.namespace)
+        else {
+            continue;
+        };
+        let api: Api<Secret> = Api::namespaced(client.clone(), &ns);
+        // ignore "already gone" so re-runs after a partial delete converge
+        let _ = api.delete(&secret_name, &DeleteParams::default()).await;
     }
     Ok(())
 }
