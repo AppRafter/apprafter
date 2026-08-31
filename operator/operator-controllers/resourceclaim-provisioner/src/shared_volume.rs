@@ -37,11 +37,11 @@ use operator_core::{
     ResourceClaim, ServiceProvider, SharedVolume, SharedVolumeCondition, COND_CAPACITY_WARNING,
 };
 
-use crate::capacity::{
+use crate::{Context, ReconcileError, FIELD_MANAGER};
+use operator_core::capacity::{
     is_capacity_warning, node_free_fraction, pvc_usage, should_emit_event,
     DEFAULT_NODE_FREE_THRESHOLD,
 };
-use crate::{Context, ReconcileError, FIELD_MANAGER};
 
 /// The `ServiceProvider.spec.type` a `SharedVolume` binds to. There is no
 /// scheduler for `SharedVolume` CRs (they carry no selector), so the

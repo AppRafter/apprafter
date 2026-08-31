@@ -60,7 +60,6 @@ use tracing::{info, warn};
 use operator_core::{Metrics, ResourceClaim, SharedVolume};
 
 pub mod acl_reconcile;
-pub mod capacity;
 pub mod cnpg;
 pub mod disk;
 pub mod dragonfly;
@@ -71,7 +70,7 @@ pub mod reconcile;
 pub mod redis_client;
 pub mod shared_volume;
 
-use capacity::CapacityCache;
+use operator_core::capacity::CapacityCache;
 use redis_client::{RedisAdmin, RedisClient};
 
 pub(crate) const KIND: &str = "ResourceClaim";

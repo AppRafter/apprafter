@@ -1679,6 +1679,7 @@ version = "0.1.2"
 dependencies = [
  "async-trait",
  "chrono",
+ "http",
  "k8s-openapi",
  "kube",
  "prometheus",

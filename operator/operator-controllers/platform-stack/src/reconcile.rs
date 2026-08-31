@@ -42,9 +42,9 @@ use crate::compatibility::{
 use crate::desired::{build as build_desired, DesiredSource};
 use crate::oci::{channel_matches, tags_in_channel, Channel};
 use crate::status::{
-    append_version_history, condition, upsert_condition, COND_MIGRATION_PENDING, COND_READY,
-    COND_SYNCED, COND_UNAUTHORIZED_SOURCE_MODIFICATION, COND_UPGRADE_AVAILABLE,
-    COND_UPSTREAM_REACHABLE, COND_YANKED_VERSION,
+    append_version_history, condition, upsert_condition, COND_MIGRATION_PENDING,
+    COND_NODE_DISK_PRESSURE, COND_READY, COND_SYNCED, COND_UNAUTHORIZED_SOURCE_MODIFICATION,
+    COND_UPGRADE_AVAILABLE, COND_UPSTREAM_REACHABLE, COND_YANKED_VERSION,
 };
 use crate::{FIELD_MANAGER, SINGLETON_NAME, SINGLETON_NAMESPACE};
 
@@ -166,6 +166,11 @@ struct Context {
     #[allow(dead_code)]
     metrics: Arc<Metrics>,
     app_api_resource: ApiResource,
+    /// TTL cache for the kubelet Summary sample behind `NodeDiskPressure`
+    /// (2.22d / D8). Shared with the provisioner's own use of the same type,
+    /// so a node's kubelet is hit at most once per TTL per controller rather
+    /// than once per reconcile.
+    capacity: operator_core::capacity::CapacityCache,
 }
 
 pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), Error> {
@@ -190,6 +195,7 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), Error> {
         client,
         metrics,
         app_api_resource,
+        capacity: operator_core::capacity::CapacityCache::new(),
     });
 
     info!(
@@ -234,6 +240,27 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), Error> {
         })
         .await;
     Ok(())
+}
+
+/// Best-effort node-free fraction for the cluster's first node (2.22d / D8).
+///
+/// Single-node Tier 1 is the case this serves; on a larger cluster the first
+/// node is a sample rather than a survey, which is honest for a warning and
+/// would be wrong for anything that acted on it. `None` on any failure — the
+/// caller leaves the condition untouched rather than asserting a false
+/// negative, because "we could not look" and "there is space" are different
+/// answers and only one of them is safe to print.
+async fn sample_node_free_fraction(
+    client: &Client,
+    cache: &operator_core::capacity::CapacityCache,
+) -> Option<f64> {
+    let nodes = Api::<k8s_openapi::api::core::v1::Node>::all(client.clone())
+        .list(&Default::default())
+        .await
+        .ok()?;
+    let node = nodes.items.first()?.name_any();
+    let summary = cache.summary_for_node(client, &node).await?;
+    operator_core::capacity::node_free_fraction(&summary)
 }
 
 async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Action, Error> {
@@ -978,6 +1005,45 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         )
     };
     upsert_condition(&mut new_status, cond_ready);
+
+    // `NodeDiskPressure` (2.22d / D8). The node's root filesystem carries
+    // every local-path PVC, the CNPG data directory, Dragonfly's snapshots,
+    // the image store and the logs, so it filling up stops far more than
+    // volumes. The signal itself is not new — it was computed inside the
+    // SharedVolume reconcile and stamped there, so a cluster with no
+    // SharedVolume was never warned about its own disk.
+    //
+    // BEST-EFFORT, like the sampler it calls: an unreachable kubelet, a
+    // missing node or a parse failure leaves the condition untouched rather
+    // than flipping it to a false negative. A decorative read must never
+    // fail a reconcile — the ADR 0048 anchor-403 lesson.
+    if let Some(fraction) = sample_node_free_fraction(&ctx.client, &ctx.capacity).await {
+        let pct_free = (fraction * 100.0).round() as i64;
+        let cond = if operator_core::capacity::is_capacity_warning(
+            fraction,
+            operator_core::capacity::DEFAULT_NODE_FREE_THRESHOLD,
+        ) {
+            condition(
+                COND_NODE_DISK_PRESSURE,
+                "True",
+                "NodeFilesystemNearlyFull",
+                &format!(
+                    "the node's filesystem is {}% full ({pct_free}% free). Every workload on                      this node shares it — local-path volumes, database storage, snapshots,                      container images and logs.",
+                    100 - pct_free
+                ),
+                &prior_conds,
+            )
+        } else {
+            condition(
+                COND_NODE_DISK_PRESSURE,
+                "False",
+                "SufficientSpace",
+                &format!("the node's filesystem has {pct_free}% free"),
+                &prior_conds,
+            )
+        };
+        upsert_condition(&mut new_status, cond);
+    }
 
     // `YankedVersion` condition (B.1.74a). True iff the
     // currently-deployed target is annotated `yanked: true` in

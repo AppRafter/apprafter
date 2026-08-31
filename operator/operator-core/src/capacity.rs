@@ -1,6 +1,17 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Capacity-signal via the kubelet Summary API (Phase 2.6c, Task 11).
 //!
+//! # Why this lives in `operator-core` (2.22d / D8)
+//!
+//! It used to live in the ResourceClaim provisioner, which meant the NODE's
+//! disk-pressure signal was computed only while reconciling a
+//! `SharedVolume` — an optional, application-scoped object. A cluster with
+//! none got no warning at all, though everything on a Tier-1 node shares
+//! that filesystem: owned disks, CNPG data, Dragonfly snapshots, container
+//! images and logs. A node-scoped fact needs a node-scoped carrier, so the
+//! PlatformStack controller now computes it too and both import from here
+//! rather than one of them owning it.
+//!
 //! A node's local-path filesystem can fill up; when it does, the
 //! local-path PVCs backing a `SharedVolume` (and owned disks) silently
 //! stop accepting writes. To surface this BEFORE it bites, the provisioner

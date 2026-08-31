@@ -90,6 +90,11 @@ pub fn run() -> Result<()> {
     // effort — never fails the invocation. A 6h cache means the
     // network round-trip happens four times a day at most.
     commands::version_check::maybe_warn_about_newer_version();
+    // 2.22d (D8): the node's disk is not specific to any one command — when
+    // it fills, every workload on that node stops writing at once — so it
+    // warns here, on the same hook, rather than waiting for someone to run
+    // the one status command that would have shown it.
+    commands::node_disk_check::maybe_warn_about_node_disk();
 
     // `Cli::parse()` would build the clap tree WITHOUT the worked
     // examples, so `--help` would be the one consumer of

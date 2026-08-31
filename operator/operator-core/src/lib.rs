@@ -2,6 +2,7 @@
 //! Shared types and helpers for the AppRafter operator.
 
 pub mod application;
+pub mod capacity;
 pub mod leader;
 pub mod matching;
 pub mod metrics;

@@ -47,6 +47,16 @@ pub const COND_YANKED_VERSION: &str = "YankedVersion";
 /// `apprafter platform status`.
 pub const COND_UPSTREAM_REACHABLE: &str = "UpstreamReachable";
 
+/// `NodeDiskPressure` — the node's root filesystem is nearly full
+/// (2.22d / D8).
+///
+/// Node-scoped, so it lives on the singleton every cluster has rather than
+/// on a `SharedVolume`. Until 2.22d this signal was computed only while
+/// reconciling a SharedVolume, so a cluster with none was never warned —
+/// while owned disks, CNPG data, Dragonfly snapshots, images and logs all
+/// share that filesystem.
+pub const COND_NODE_DISK_PRESSURE: &str = "NodeDiskPressure";
+
 /// Maximum entries kept in `PlatformStack.status.versionHistory`.
 /// Ring-buffer behaviour: oldest entry drops when this cap is
 /// exceeded. Per spec.md §3.11 ("recent N transitions"); 10 is
