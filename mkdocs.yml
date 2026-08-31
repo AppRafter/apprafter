@@ -204,6 +204,7 @@ nav:
       - Persistent disk: operator-guide/persistent-disk.md
       - Shared volumes: operator-guide/shared-volumes.md
       - Egress policy: operator-guide/egress-policy.md
+      - Secrets: operator-guide/secrets.md
       - Backup & restore: operator-guide/backup-restore.md
       - Platform management: operator-guide/platform-management.md
       - Migration plans: operator-guide/migration-plans.md
