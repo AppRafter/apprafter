@@ -23,20 +23,20 @@ would otherwise touch the same code three times.
 | **D1** | VPA in-place right-sizing has never run: wrong feature-gate name | RESOLVED | — |
 | **D2** | `--cron` / `--check-cron` are the wrong surface, not an unvalidated one | open (docs half landed, CLI half did not) | 2.22g |
 | **D3** | Two diagnostics whose `help:` text describes a layout that moved | RESOLVED | — |
-| **D4** | Removing a `needs.*` entry orphans its ResourceClaim forever | open — high | 2.22b |
+| **D4** | Removing a `needs.*` entry orphans its ResourceClaim forever | FIXED 2.22b — walk-verified | 2.22b |
 | **D5** | A Dragonfly restart drops every claim's ACL user | open — high | 2.22f |
-| **D6** | Rotating a secret does not take effect until something else restarts the pods | open — high, security | 2.22c |
-| **D7** | The CLI cannot answer the question its own error asks | open | 2.22c |
-| **D8** | A node-scoped warning published through an optional object | open — medium-high | 2.22d |
+| **D6** | Rotating a secret does not take effect until something else restarts the pods | FIXED 2.22c — walk owed | 2.22c |
+| **D7** | The CLI cannot answer the question its own error asks | FIXED 2.22c — walk owed | 2.22c |
+| **D8** | A node-scoped warning published through an optional object | FIXED 2.22d — walk step still owed | 2.22d |
 | **D9** | There is nothing to roll a moving tag back to | open | 2.22e |
-| **D10** | The applying half of right-sizing has never been observed to apply anything | open — high | 2.22d |
-| **D11** | 584 failures share one catch-all, and the cheap checks run last | open — high | 2.22a |
-| **D12** | Removing `expose` leaves the Service behind | open — medium | 2.22b |
-| **D13** | A registry credential copy that nothing ever reclaims | open — high, security | 2.22b |
-| **D14** | Re-sealing a secret performs a gated change through an ungated door | resolved by decision — disclosure work open |
+| **D10** | The applying half of right-sizing has never been observed to apply anything | FIXED 2.22d — walk rewritten, not yet run | 2.22d |
+| **D11** | 584 failures share one catch-all, and the cheap checks run last | FIXED 2.22a | 2.22a |
+| **D12** | Removing `expose` leaves the Service behind | FIXED 2.22b — walk-verified | 2.22b |
+| **D13** | A registry credential copy that nothing ever reclaims | FIXED 2.22b — walk step still owed | 2.22b |
+| **D14** | Re-sealing a secret performs a gated change through an ungated door | RESOLVED (decision + disclosure landed 2.22c) |
 | **D15** | The destructive-change gate never engaged for a base-only app | RESOLVED |
 | **D16** | A reconcile that fails leaves no trace outside the operator's log | open — high |
-| **D17** | A Dragonfly tenant can read every other tenant's key counts | open — medium, isolation | 2.22c |
+| **D17** | A Dragonfly tenant can read every other tenant's key counts | open — medium, isolation | 2.22f |
 
 ## D1. VPA in-place right-sizing has never run: wrong feature-gate name
 
@@ -325,7 +325,8 @@ its own. **A test that pins the wrong string is worse than no test.**
 
 **Opened:** 2026-08-30 (2.20c, correcting `docs/operator-guide/postgres.md`,
 `redis.md`, `persistent-disk.md` and their `how-it-works/` siblings).
-**Status:** OPEN.
+**Status:** FIXED 2026-08-31 (2.22b). Generalised owned-child prune in the
+Application controller; **walk-verified** by `e2e/needs-removal-walk.sh`.
 **Severity:** high. Data and credentials the operator believes are on a
 seven-day clock stay live indefinitely, and the shared backend they sit on can
 never scale down.
@@ -724,7 +725,9 @@ recovery short of deleting the CR.
 ## D6. Rotating a secret does not take effect until something else restarts the pods
 
 **Opened:** 2026-08-30 (2.20c, correcting `docs/dev-guide/secrets.md`).
-**Status:** OPEN.
+**Status:** FIXED 2026-08-31 (2.22c). Config drift is visible without rolling
+anything (`status.envConfig.changedAt` vs each pod `status.startTime`). Walk owed
+at the 2.22 close.
 **Severity:** high, and security-relevant. The operation a developer performs
 to revoke a leaked credential does not revoke it.
 
@@ -915,7 +918,9 @@ deliberately kept out of the 2.20 documentation track for that reason.
 ## D7. The CLI cannot answer the question its own error asks
 
 **Opened:** 2026-08-30 (2.20c, correcting `docs/dev-guide/secrets.md`).
-**Status:** OPEN.
+**Status:** FIXED 2026-08-31 (2.22c). `EnvSecretMissing` names the cause, the
+namespace and the available keys; `apprafter secret list` answers it directly.
+Walk owed at the 2.22 close.
 **Severity:** medium. Every diagnosis path for the most common secrets mistake
 leaves the CLI.
 
@@ -1016,7 +1021,11 @@ independent observations of one missing verb.
 covers the volume or the machine's disk. It covers the machine's disk, and that
 inverts what is wrong here.
 
-**Status:** OPEN.
+**Status:** FIXED 2026-08-31 (2.22d) — code complete, **walk step still owed**.
+The node signal moved to the `PlatformStack` singleton and warns on every
+command; owned disks, Postgres databases and Dragonfly logical DBs all report a
+figure in `app status`. No walk asserts the banner yet: the "Ships with" note
+below was a plan, not a delivery.
 **Severity:** medium-high. The original entry said the signal reaches nobody
 through the CLI. It is worse: for most clusters the signal is never raised at
 all.
@@ -1370,7 +1379,9 @@ and an assertion that `app status` states the pinned mode in words.
 ## D10. The applying half of right-sizing has never been observed to apply anything
 
 **Opened:** 2026-08-30 (re-reading **D1** against the tree).
-**Status:** OPEN.
+**Status:** FIXED 2026-08-31 (2.22d) — code complete, **walk rewritten but not
+yet run**. In-place resize needs a real Hetzner node (kind/k3d cannot do it), so
+the rewritten `e2e/vpa-walk.sh` runs in the batch at the 2.22 close.
 **Severity:** high. `InPlace` behaves correctly by construction and by
 upstream source; what is missing is any evidence it has ever acted, and any
 signal when it cannot.
@@ -1526,7 +1537,9 @@ Error: apprafter::cli::other
   × spawn restic: No such file or directory (os error 2)
 ```
 
-**Status:** OPEN.
+**Status:** FIXED 2026-08-31 (2.22a). Preflight before every prompt and every
+billable step; typed `kubectl`/`restic` classifiers at the choke points; `doctor`
+fails rather than warns on a binary the CLI cannot work without.
 **Severity:** high. Two defects meet in that transcript, and neither is the
 one the error text suggests.
 
@@ -1660,7 +1673,8 @@ commands on the disaster-recovery path.
 D4's root-cause section to the other children of `Application` rather than to
 claims alone.
 
-**Status:** OPEN.
+**Status:** FIXED 2026-08-31 (2.22b), by the same owned-child prune as D4;
+**walk-verified**.
 **Severity:** medium — no data or cost is stranded, but a developer who removes
 `expose` has said "stop serving this" and the cluster keeps a live Service with
 its ClusterIP and its pod selector intact.
@@ -1742,7 +1756,10 @@ destructive; check `is_destructive` before assuming it is not.
 **Opened:** 2026-08-30, from the same ownership audit that produced D12 — this
 is the third and worst instance of the class.
 
-**Status:** OPEN.
+**Status:** FIXED 2026-08-31 (2.22b). The pull-secret copy carries an owner per
+consuming app (reference counting, since cross-namespace ownerRefs are
+forbidden) instead of a new shape. **Walk step still owed** — the
+needs-removal walk does not assert the reclaim.
 **Severity:** high, security. A registry credential written into an application
 namespace survives the removal of the private image, the deletion of the
 Application, **and** the deletion of the `SourceCredential` it came from. Only
@@ -2205,6 +2222,11 @@ disclosure, recorded rather than unnoticed; or wait for upstream to filter
 
 Worth deciding deliberately rather than inheriting. It should not block
 2.22d, and it should not stay unwritten either.
+
+*Re-filed 2026-08-31:* the index had this under **2.22c**, which closed on the
+secrets work without touching it. Its home is **2.22f** — that subphase is
+already an ADR-first decision about the same ACL vector, so the `+info`
+question is decided there rather than inherited.
 
 ### Related, same investigation
 
