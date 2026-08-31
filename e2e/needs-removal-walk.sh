@@ -455,14 +455,22 @@ printf '  apprafter-operator + admission-webhook now running the working-tree bu
 # those CRDs via the apprafter-operator Application, so disable automated sync
 # on the parent + operator apps (else Argo reverts the drift) then apply the
 # BRANCH-rendered CRDs server-side. Mirrors needs-disk-walk Phase 1b.
-printf '  applying branch operator CRDs (released chart predates 2.12 env node) ...\n'
+# 2.22b HARNESS LESSON: the branch RBAC must ship with the branch IMAGE.
+# This phase used to render only CustomResourceDefinitions, so the cluster kept
+# the PUBLISHED ClusterRole while running the working-tree operator. 2.22b adds
+# `delete` on resourceclaims, and without it the prune 403s on every reconcile —
+# which is exactly what the third run of this walk showed. The operator survives
+# it (the delete warns and retries rather than failing the reconcile, per the
+# ADR 0048 anchor-403 lesson), so the symptom is a silent no-op rather than a
+# crash, and only reading the log finds it.
+printf '  applying branch operator CRDs + RBAC (released chart predates this branch) ...\n'
 for _app in platform apprafter-operator; do
     kubectl -n argocd patch applications.argoproj.io "$_app" --type=merge \
         -p '{"spec":{"syncPolicy":{"automated":null}}}' >/dev/null 2>&1 || true
 done
 _yq() { if command -v yq >/dev/null 2>&1; then yq "$@"; else nix run nixpkgs#yq-go -- "$@"; fi; }
 helm template apprafter-operator "${REPO_ROOT}/operator/charts/apprafter-operator" \
-    | _yq 'select(.kind == "CustomResourceDefinition")' \
+    | _yq 'select(.kind == "CustomResourceDefinition" or .kind == "ClusterRole")' \
     | kubectl apply --server-side --force-conflicts -f -
 for _crd in applications serviceproviders resourceclaims retainedclaims; do
     retry 12 5 -- kubectl wait --for=condition=Established \
@@ -737,6 +745,14 @@ printf '  ok: Application back to Ready on one need\n'
 # ===============================================================
 
 phase "Phase 7: drop expose — Service pruned, Deployment survives"
+
+# Assert the Service is STILL THERE before removing what creates it. Without
+# this the `wait_gone` below passes vacuously if anything pruned it earlier —
+# Phase 4's presence check is six minutes and two reconcile storms away, and
+# an assertion satisfied by the null case is the exact failure this whole
+# subphase was opened to stop repeating.
+retry 3 5 -- kubectl -n "$APP_NS" get service "$APP" >/dev/null
+printf '  ok: Service still present immediately before expose is removed\n'
 
 apply_parser "$NEEDS_ONE" "$EXPOSE_OFF"
 
