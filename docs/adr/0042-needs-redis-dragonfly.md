@@ -61,7 +61,7 @@ ACL SETUSER claim_<ns>_<app>_redis \
 - `$<N>` pins the user to DB N — `SELECT` of any other DB is `NOPERM`. This is the hard keyspace boundary.
 - `~*` then means "all keys **in DB N**" — the claim owns its whole DB, **with no key prefix on the app side**. `SCAN`/`RANDOMKEY` are confined to DB N, so the cross-tenant key-name enumeration leak that key-prefix isolation suffers does not exist here.
 - `&claim_<ns>_<app>_redis:*` — pub/sub channel isolation (channels are not DB-scoped, so they still need an explicit prefix). `resetchannels` first, since the default is no channels.
-- `+@all -@admin -@dangerous` — blocks server-wide / admin / data-destroying commands on the shared instance (`FLUSHALL`, `SWAPDB`, `CONFIG`, `KEYS`, `DEBUG`, `REPLICAOF`, `SHUTDOWN`, `MIGRATE`, `RESTORE`, `CLIENT KILL/LIST/NO-EVICT`, …). `+info` and the safe `CLIENT` subcommands are re-granted (otherwise `-@dangerous` strips them and breaks client init / pool health checks); `+sort_ro` restores read-only `SORT`. Scripting (`@scripting`) is intentionally retained (§5).
+- `+@all -@admin -@dangerous` — blocks server-wide / admin / data-destroying commands on the shared instance (`FLUSHALL`, `SWAPDB`, `CONFIG`, `KEYS`, `DEBUG`, `REPLICAOF`, `SHUTDOWN`, `MIGRATE`, `RESTORE`, …). `+sort_ro` restores read-only `SORT`. **Corrected 2026-08-31 (§10):** this bullet used to list `CLIENT KILL/LIST/NO-EVICT` among the blocked commands and to say `+info` was re-granted. Neither is accurate. `CLIENT` is registered `SLOW | CONNECTION` (`server_family.cc:4294, :4326`) with no `ADMIN`/`DANGEROUS` bit and no subcommand granularity, so `-@admin -@dangerous` does not touch it and the whole command survives — see the recorded risk in §11. `+info` was dropped in §11. Scripting (`@scripting`) is intentionally retained (§5).
 - **Optional self-service knob:** because `$N` confines the user to DB N, it is *safe* to re-grant `+flushdb` — the user's `FLUSHDB` can only ever clear DB N. This lets an app "clear my own cache", which key-prefix isolation can never allow (there `FLUSHDB` would wipe the shared DB 0). Off by default; enable per-tier if wanted.
 
 The provisioner holds the instance admin credential (the `passwordFromSecret` Secret **it creates** when it lazily creates the `Dragonfly` CR; the operator consumes it) and runs `ACL SETUSER` over a Redis client (a new provisioner dependency).
@@ -163,7 +163,7 @@ In scope: pooled lazy shared instances (per persistence class), per-DB `$N` isol
 - **Scripting on a shared instance.** Mitigation: declared-keys default + `$N` confinement, `allow-undeclared-keys` unset, no admin, per-claim-instance upgrade for stricter tiers, Pre-merge #4.
 - **Snapshot data-loss / ephemeral total loss.** Persistent instances lose writes since the last snapshot; ephemeral instances lose *all* DBs on any restart. Persistence/backup is whole-instance. Mitigation: documented; sensible snapshot interval; zero-loss durability → Postgres.
 - **Noisy neighbour (no resource isolation).** Numbered DBs isolate logically, not by resources — one claim can saturate CPU/memory/IO for all DBs on its instance. Accepted within a cluster for now; horizontal pool growth and the per-claim-instance tier are the levers, and per-DB resource controls can be added later.
-- **`INFO` exposure.** Re-granting `+info` lets a claim read aggregate server stats on the shared instance. Accepted (trusted single-tenant).
+- **`INFO` exposure.** ~~Re-granting `+info` lets a claim read aggregate server stats on the shared instance. Accepted (trusted single-tenant).~~ **Superseded by §11 (2026-08-31).** The "trusted single-tenant" premise stopped describing the deployment the moment `POOL_INSTANCE_INDEX` was hard-coded to `0`: one ephemeral and one persistent instance serve every tenant in the cluster, across unrelated namespaces. `+info` is dropped and `-pubsub` added.
 - **ACL-user / DB growth.** Many claims → many users + DBs per instance. Accepted at Tier-1 scale; pool growth when an instance's footprint hits its measured limit.
 
 ## Pre-merge verification
@@ -172,7 +172,7 @@ In scope: pooled lazy shared instances (per persistence class), per-DB `$N` isol
 2. ✅ **RESOLVED 2026-06-05 — `dbnum` is immutable (restart-only).** `CONFIG SET dbnum 64` → `ERR … can't set immutable config`. Source: registered non-mutable (`main_service.cc:909`; `config_registry` `is_mutable=false` → READONLY). No online vertical growth — horizontal pool growth is the only capacity lever, as §1/§3 assume.
 3. **Cross-DB command containment under `$N`.** Confirm `MOVE` / `COPY … DB` / `SWAPDB` are denied for a `$N`-pinned user; add explicit `-move` / `copy` restrictions if not.
 4. **In-script ACL + DB confinement.** Confirm `EVAL` cannot touch keys outside DB N (declared-keys + `$N`); `ACL DRYRUN` + a live `EVAL`. If not enforced, take the §5 fallback.
-5. **Client-library init under the ACL.** ioredis / node-redis / BullMQ connect, health, and `maxmemory-policy` checks pass; if a client probes `CONFIG GET maxmemory-policy`, decide `+config|get` vs disabling the check — do not widen to `+@dangerous`.
+5. **Client-library init under the ACL.** ioredis / node-redis / BullMQ connect, health, and `maxmemory-policy` checks pass; if a client probes `CONFIG GET maxmemory-policy`, decide `+config|get` vs disabling the check — do not widen to `+@dangerous`. **Amended 2026-08-31 (§11):** with `+info` dropped, BullMQ's version probe is unconditional and its `init()` rejects, so a BullMQ tenant needs `skipVersionCheck: true` — one line, tenant-side. ioredis ≥ 5 has a purpose-built `NOPERM` branch and degrades to a warning; node-redis, redis-py, go-redis, lettuce and jedis never issue `INFO` on connect.
 6. **Restart durability + recycle-safety.** Kill a pool pod; confirm the reconcile loop re-pins all live claims to the correct `dbnum`s. Allocate a recycled number; confirm `FLUSHDB`-on-allocation leaves no inherited keys.
 
 ## §9 — Shrinking the pool (2026-08-21, extends Decision)
@@ -421,6 +421,167 @@ cluster as much as the Dragonfly pool — so it arguably belongs in its own ADR
 rather than inside a Redis-titled one. Deferred deliberately: promoting it
 before the reaper exists would churn the record for no gain. Revisit once the
 implementation lands.
+
+## §10 — File-backed ACL durability (2026-08-31, extends Decision §4)
+
+### The revisit condition is met
+
+§4 and the Alternatives list rejected file-based ACLs twice, the second time
+with a named condition: *"Dragonfly's ACL-file support for key/channel patterns
+is ambiguous; the reconcile loop is robust regardless. Revisit if file-based
+ACLs are officially confirmed."*
+
+At the pinned server there is no ambiguity. `ParseAclSetUser` has **one
+definition** (`acl_family.cc:1056`) and exactly **two call sites**: runtime
+`ACL SETUSER` (`AclFamily::SetUser`, `:142`) and the file loader
+(`LoadToRegistryFromFile`, `:318`). Both file entry points — startup `Load()`
+and the runtime `ACL LOAD` command — route through it. Every token this
+platform emits (`$N`, `~*`, `&user:*`, `resetkeys`, `resetchannels`, the
+category grants) is parsed by the same code on both paths, and upstream's own
+suite round-trips key and channel patterns through `ACL SAVE` / `ACL LOAD`.
+
+So §4's "not reliably persisted via `--aclfile`" is **retracted**.
+
+§4's reconcile loop is **not** retracted. It becomes the file's sole writer and
+remains the backstop for a claim created inside one tick.
+
+Also retracted honestly: §4 described a loop that "watches the pool instances'
+pod readiness / `status` generation" and re-applies on a restart transition.
+Only the periodic half was ever built. This amendment does not add the watch —
+it adds durability, which makes the watch unnecessary rather than overdue.
+
+### The `default` line is a security gate, and its failure is the opposite of what was assumed
+
+The working note that preceded this amendment said a wrong `default` line risks
+locking the provisioner out of its own instance. **Omitting it does the
+opposite, and the opposite is far worse.**
+
+`AclFamily::Init` early-returns (`acl_family.cc:626-627`) whenever `--aclfile`
+loads, so `UserRegistry::Init` — the only consumer of the `requirepass` value
+the dragonfly-operator injects from `passwordFromSecret` — never runs.
+`LoadToRegistryFromFile` then synthesises `default` with **`nopass = true`**,
+`+@all ~* &*`. Verified live on a kind cluster with the real operator, a real
+`authentication.passwordFromSecret`, and a tenant-only ACL Secret:
+unauthenticated `PING` returned `PONG`, `ACL WHOAMI` returned `default`, and an
+unauthenticated `SET` succeeded.
+
+**A file that parses successfully but omits `default` silently disables
+authentication on an instance serving every tenant in the cluster.**
+
+The lockout is real but has a different cause: `User::is_active_` defaults
+false, and the synthesised default's `is_active = true` applies only when the
+file omits `default` — so a `default` line missing the `on` token yields an
+inactive default nobody can authenticate as.
+
+Both failures are closed by the same rule: **the builder refuses to emit a file
+without `USER default on >…`**, and the walk asserts the boundary in both
+directions — unauthenticated access denied, a wrong password rejected, the
+admin password accepted.
+
+### Grammar, corrected
+
+`MaterializeFileContents` splits lines on `\n` and tokens with
+`absl::StrSplit(command, ' ', absl::SkipEmpty())`. **`SkipEmpty` tolerates
+double spaces** — upstream tests this deliberately. The working note claimed
+single-space joining was a correctness constraint; it is not. It survives only
+as a byte-stability requirement, so that a re-derived file compares equal to
+the live one and the loop can skip the write.
+
+What is fatal: a tab or `\r` (glued into a token rather than splitting it), any
+first token that is not `USER` (there is no comment syntax — a `#` header
+rejects the whole file), fewer than four tokens on a line, and a whitespace-only
+line.
+
+Failure is all-or-nothing and, importantly, **safe**: one bad line yields zero
+users loaded, a `LOG(WARNING)`, and the server starts anyway — falling back to
+the `requirepass`-derived default. **A malformed file degrades to exactly
+today's post-restart behaviour, no worse.** That is the strongest argument that
+this change is safe to make.
+
+### `ACL LOAD` is prohibited
+
+The runtime path evicts every connection whose authenticated user is not
+`default` and then **clears the registry** (`acl_family.cc:326-334`), destroying
+every user the incoming file does not name. It does not diff against the new
+file, so even a file perfectly in sync with memory drops every tenant
+connection. Combined with the kubelet's projected-Secret refresh lag, an
+`ACL LOAD` fired straight after a Secret write can load the *previous* file and
+delete users the provisioner has just created.
+
+It is never added to the operator's Redis seam. The startup path is safe by
+contrast — it passes no reply builder, so it neither clears nor evicts.
+
+### Two further prohibitions
+
+- **Never `CONFIG SET requirepass` on an `--aclfile` instance.** Several
+  `UserRegistry` tables are assigned only in the skipped `Init`, and the
+  `requirepass` config hook is the one path that dereferences them.
+- **Rotation ordering (for 2.16a).** If credential rotation ever reaches the
+  admin password, the ACL file must be rewritten **before** the
+  `<instance>-admin` Secret is rotated. A restart in the reverse window locks
+  out everyone, including the operator.
+
+### Break-glass
+
+Two in-band recoveries from a bad file, neither losing data:
+
+1. Correct the `<instance>-acl` Secret and delete the pod — startup re-loads
+   the fixed file.
+2. Detach the field entirely:
+   `kubectl -n dragonfly-system patch dragonfly <inst> --type=json -p '[{"op":"remove","path":"/spec/aclFromSecret"}]'`.
+   The operator rolls the StatefulSet without `--aclfile`, and the default user
+   is reseeded from the injected admin password.
+
+Note that the pod healthcheck cannot detect a broken ACL configuration: it
+probes the admin port, which is exempt from authentication.
+
+### The server image is pinned here
+
+The platform pinned no Dragonfly server image: the CR carried no `image`, the
+chart's default was empty, so the tag came from the operator's compiled-in
+default. Every ACL fact above is a fact about **v1.37.0**, and an operator-chart
+bump would have changed it silently. The provisioner now sets `spec.image`
+explicitly.
+
+## §11 — `+info` and `PUBSUB` are revoked (2026-08-31)
+
+`INFO KEYSPACE` on this server emits a line for every **non-empty** database
+regardless of which one the connection selected — a live enumeration of which
+tenants currently hold data, with their key counts, expiries and hit ratios.
+The ACL grammar cannot scope `INFO` to a section or a database: a
+`+info|keyspace` token fails to resolve, and enforcement is whole-command. It
+is `+info` on or off.
+
+`PUBSUB` is worse and was not in the original finding. It is registered `SLOW`
+only, so it survives `-@admin -@dangerous`, and it takes the generic ACL path —
+the `&{user}:*` channel patterns constrain what a tenant may subscribe to, not
+what `PUBSUB CHANNELS` *returns*. Channel names are
+`claim_<namespace>_<app>_redis:`, so `PUBSUB CHANNELS '*'` returns **the
+Kubernetes namespace and application name of every pub/sub-using tenant in
+plaintext**. Shipping the `INFO` fix alone would have let us claim tenants
+cannot see each other while they still could, through a channel that names them.
+
+**Both are dropped.** Pub/sub itself is untouched — `PUBSUB` is a distinct
+command from `SUBSCRIBE`/`PUBLISH` — and the safe `CLIENT` subcommands stay
+granted, so client handshakes are unaffected.
+
+Waiting for upstream was not a live option: the `INFO KEYSPACE` loop is
+byte-identical on `main` three minor releases past our pin, with no issue and no
+PR. Doing it now costs two tokens in a rule vector this subphase is already
+rewriting; doing it later costs a forced re-pin of every user **and** a rewrite
+of a persisted file.
+
+### Recorded risk, NOT fixed here
+
+`CLIENT` is granted, so `CLIENT LIST` returns peer addresses, DB indices and
+per-connection command counts for every tenant, and `CLIENT KILL` / `CLIENT
+PAUSE` let any tenant sever another tenant's connections or stall the shared
+instance. That is a **cross-tenant denial of service and a larger disclosure
+than the one this section closes.** It is not fixed here because `-client`
+cannot be scoped to subcommands at this version and would break the
+`CLIENT SETNAME`/`SETINFO` handshake every client performs. Recorded rather than
+inherited; the real remedy is per-tenant instances (already the higher-tier
+answer) or upstream subcommand granularity.
 
 ## Owner
 
