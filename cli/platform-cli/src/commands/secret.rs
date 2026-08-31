@@ -126,7 +126,8 @@ pub fn run_seal(
     }
 
     let pub_key = fetch_controller_public_key(&KubectlCli, kc.path())?;
-    let cr = build_sealed_secret(&pub_key, namespace, name, &data, secret_type)?;
+    let mut cr = build_sealed_secret(&pub_key, namespace, name, &data, secret_type)?;
+    stamp_provenance(&mut cr);
 
     if stdout {
         let yaml = serde_yaml::to_string(&cr)
@@ -184,6 +185,38 @@ fn report_consumers(name: &str, namespace: &str, kubeconfig_path: &Path) {
     println!(
         "  Their running pods keep the PREVIOUS value: an environment variable \n           from a secret is resolved once at pod start and never re-read. They \n           pick this value up when they next restart."
     );
+}
+
+/// Record who sealed this and when (2.22c / D14).
+///
+/// **This is provenance, not attestation.** The value is self-reported by
+/// the machine running the command and anyone who can seal can also edit
+/// it, so it authenticates nothing. It is here for the two cases D14 says
+/// are worth serving — an insider mistake and a forensic reconstruction —
+/// where the question is "when did this last change, and roughly by whom",
+/// and today the only answer is a resourceVersion.
+///
+/// Stamped by the COMMAND, not by `build_sealed_secret`: that builder is
+/// shared with the restore path, which re-seals every captured secret for
+/// the target cluster, and attributing a machine restore to whoever ran it
+/// would be a lie in the record rather than a gap in it.
+fn stamp_provenance(cr: &mut Value) {
+    let who = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    let Some(meta) = cr.pointer_mut("/metadata").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let ann = meta
+        .entry("annotations")
+        .or_insert_with(|| Value::Object(Default::default()));
+    if let Some(ann) = ann.as_object_mut() {
+        ann.insert("apprafter.io/sealed-by".to_string(), Value::String(who));
+        ann.insert(
+            "apprafter.io/sealed-at".to_string(),
+            Value::String(chrono::Utc::now().to_rfc3339()),
+        );
+    }
 }
 
 /// Returns `true` when a `SealedSecret` OR a `Secret` named `name` exists
@@ -399,6 +432,10 @@ pub struct SealedSecretSummary {
     /// is read for its contents — the names answer both questions
     /// `EnvSecretMissing` raises without touching the material.
     pub keys: Vec<String>,
+    /// `apprafter.io/sealed-at` when the seal was stamped by this CLI.
+    /// Absent for anything sealed before 2.22c, or applied by other means —
+    /// shown as `-` rather than guessed at.
+    pub sealed_at: Option<String>,
 }
 
 /// Parse `kubectl get sealedsecrets -o json` into summaries.
@@ -428,10 +465,15 @@ pub fn parse_sealed_secret_summaries(v: &Value) -> Vec<SealedSecretSummary> {
                 .map(|m| m.keys().cloned().collect())
                 .unwrap_or_default();
             keys.sort();
+            let sealed_at = item
+                .pointer("/metadata/annotations/apprafter.io~1sealed-at")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             Some(SealedSecretSummary {
                 namespace,
                 name,
                 keys,
+                sealed_at,
             })
         })
         .collect();
@@ -451,13 +493,21 @@ pub fn render_secret_list(rows: &[SealedSecretSummary], scope: &str) -> String {
         .unwrap_or(9)
         .max(9);
     let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(4).max(4);
+    let sealed_w = rows
+        .iter()
+        .map(|r| r.sealed_at.as_deref().unwrap_or("-").len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
     let mut s = format!("Sealed secrets in {scope}:\n\n");
     s.push_str(&format!(
-        "  {:<ns_w$}  {:<name_w$}  KEYS\n",
+        "  {:<ns_w$}  {:<name_w$}  {:<sealed_w$}  KEYS\n",
         "NAMESPACE",
         "NAME",
+        "SEALED",
         ns_w = ns_w,
-        name_w = name_w
+        name_w = name_w,
+        sealed_w = sealed_w
     ));
     for r in rows {
         let keys = if r.keys.is_empty() {
@@ -466,12 +516,14 @@ pub fn render_secret_list(rows: &[SealedSecretSummary], scope: &str) -> String {
             r.keys.join(", ")
         };
         s.push_str(&format!(
-            "  {:<ns_w$}  {:<name_w$}  {}\n",
+            "  {:<ns_w$}  {:<name_w$}  {:<sealed_w$}  {}\n",
             r.namespace,
             r.name,
+            r.sealed_at.as_deref().unwrap_or("-"),
             keys,
             ns_w = ns_w,
-            name_w = name_w
+            name_w = name_w,
+            sealed_w = sealed_w
         ));
     }
     s
@@ -577,6 +629,33 @@ mod list_tests {
         assert_eq!(rows.len(), 1);
         assert!(rows[0].keys.is_empty());
         assert!(render_secret_list(&rows, "x").contains("(none)"));
+    }
+
+    #[test]
+    fn an_unstamped_seal_shows_a_dash_rather_than_a_guess() {
+        // Anything sealed before 2.22c, or applied by other means, carries no
+        // provenance annotation. Inventing one would be worse than admitting
+        // it is unknown — the whole value of the field is that it is a record.
+        let v = json!({ "items": [sealed("shop", "old", &["k"])] });
+        let rows = parse_sealed_secret_summaries(&v);
+        assert_eq!(rows[0].sealed_at, None);
+        assert!(
+            render_secret_list(&rows, "x").contains("  -  "),
+            "{}",
+            render_secret_list(&rows, "x")
+        );
+    }
+
+    #[test]
+    fn a_stamped_seal_shows_its_timestamp() {
+        let mut item = sealed("shop", "new", &["k"]);
+        item["metadata"]["annotations"] =
+            json!({ "apprafter.io/sealed-at": "2026-08-31T09:00:00+00:00" });
+        let rows = parse_sealed_secret_summaries(&json!({ "items": [item] }));
+        assert_eq!(
+            rows[0].sealed_at.as_deref(),
+            Some("2026-08-31T09:00:00+00:00")
+        );
     }
 
     #[test]
@@ -794,5 +873,55 @@ mod binding_tests {
         let b = parse_secret_bindings(&v);
         assert_eq!(b.len(), 2);
         assert_eq!(apps_consuming(&b, "shop", "creds"), vec!["web"]);
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn it_stamps_who_and_when_without_disturbing_the_sealed_payload() {
+        // The annotation must never touch spec: a builder that reshaped the
+        // ciphertext would break the seal, and that failure would surface
+        // only at unseal time on the cluster.
+        let mut cr = json!({
+            "metadata": { "name": "checkout", "namespace": "shop" },
+            "spec": { "encryptedData": { "k": "AgB1" } }
+        });
+        let before = cr["spec"].clone();
+        stamp_provenance(&mut cr);
+        assert_eq!(cr["spec"], before, "the sealed payload was modified");
+
+        let ann = &cr["metadata"]["annotations"];
+        assert!(ann["apprafter.io/sealed-by"].is_string());
+        let at = ann["apprafter.io/sealed-at"].as_str().unwrap();
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(at).is_ok(),
+            "sealed-at is not RFC3339: {at}"
+        );
+    }
+
+    #[test]
+    fn it_preserves_annotations_that_are_already_there() {
+        let mut cr = json!({
+            "metadata": {
+                "name": "c", "namespace": "s",
+                "annotations": { "kept": "yes" }
+            }
+        });
+        stamp_provenance(&mut cr);
+        assert_eq!(cr["metadata"]["annotations"]["kept"], "yes");
+        assert!(cr["metadata"]["annotations"]["apprafter.io/sealed-by"].is_string());
+    }
+
+    #[test]
+    fn a_shapeless_object_is_left_alone_rather_than_panicking() {
+        // Defensive: the builder is shared and could change shape. Losing
+        // provenance is acceptable; panicking mid-seal is not.
+        let mut cr = json!("not an object");
+        stamp_provenance(&mut cr);
+        assert_eq!(cr, json!("not an object"));
     }
 }
