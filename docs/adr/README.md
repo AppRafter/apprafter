@@ -90,6 +90,7 @@ ADRs are never deleted; supersession preserves the historical record.
 | 0056 | [machine-picker — live (region × SKU) matrix and no implicit server-type default](./0056-machine-picker.md) | Accepted |
 | 0057 | [documentation system — MkDocs-Material retained, generated CLI reference, content-detected drift gate](./0057-documentation-system.md) | Accepted |
 | 0058 | [public surfaces are written for their reader, not derived from our artifacts](./0058-public-surfaces-are-written-for-their-reader.md) | Accepted |
+| 0059 | [rolling back a moving tag pins the application to a digest](./0059-application-image-pin.md) | Accepted |
 
 ## Writing a new record
 
