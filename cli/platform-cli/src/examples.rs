@@ -142,8 +142,16 @@ pub const EXAMPLES: &[CommandExamples] = &[
     CommandExamples {
         path: &["app", "rollback"],
         lines: &[
-            "apprafter app rollback <name>  # to the previous entry in Argo CD history",
-            "apprafter app rollback <name> --to <revision> --yes",
+            "apprafter app rollback <name>  # previous image digest, else previous Git revision",
+            "apprafter app rollback <name> --to sha256:<64-hex> --yes  # pin to an image digest",
+            "apprafter app rollback <name> --to <revision> --yes  # roll back the Git revision",
+        ],
+    },
+    CommandExamples {
+        path: &["app", "unpin"],
+        lines: &[
+            "apprafter app unpin <name>  # resume following the image tag",
+            "apprafter app unpin <name> --env prod --yes",
         ],
     },
     CommandExamples {

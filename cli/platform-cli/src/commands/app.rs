@@ -34,8 +34,12 @@ use cli_core::{CliError, Result};
 use serde_json::{json, Value};
 use tabled::{Table, Tabled};
 
+use cli_providers::k8s::kubectl::APPRAFTER_CLI_PIN_FIELD_MANAGER;
+
+use crate::commands::app_open;
 use crate::commands::k8s_helpers::{
-    ensure_kubeconfig_tempfile, kubectl_get_json, kubectl_get_json_by_selector, kubectl_merge_patch,
+    ensure_kubeconfig_tempfile, kubectl_apply_server_side, kubectl_get_json,
+    kubectl_get_json_by_selector, kubectl_merge_patch,
 };
 
 const ARGOCD_NAMESPACE: &str = "argocd";
@@ -887,6 +891,13 @@ fn print_app_detail(app: &Value, show_resources: bool, kubeconfig_path: &Path) {
                     // pre-first-resolve).
                     if let Some(image_line) = format_image_line(&cr, &chrono::Utc::now()) {
                         println!("{image_line}");
+                    }
+                    // ADR 0059: a pin is invisible to a reader of the Git
+                    // repository, so this line is the only place the truth
+                    // exists. Yellow, and immediately after the image line
+                    // it qualifies.
+                    if let Some(pin_line) = format_pin_line(&cr) {
+                        println!("{}", style::warn(&pin_line));
                     }
                     // 2.16e: VPA recommendation — only printed when the
                     // operator has written status.recommendedResources.
@@ -2052,25 +2063,140 @@ pub fn logs(
     Ok(())
 }
 
-/// `apprafter app rollback <name> [--to <rev>]` — patches
-/// `spec.source.targetRevision` to the requested revision (or
-/// the previous entry in `status.history` when `--to` is
-/// omitted). Argo CD's automated sync picks up the change on
-/// the next reconcile and rolls back the workload.
+/// `apprafter app rollback <name> [--to <revision|sha256:digest>]`.
+///
+/// Two operations behind one verb, because a developer who has shipped a bad
+/// build should not have to know which of them their situation calls for:
+///
+///  * an **image digest** pins the AppRafter CR to that digest (ADR 0059).
+///    This is a MODE change — the application stops following its tag —
+///    because merely setting the workload back would be undone by the next
+///    reconcile re-resolving the tag and finding the bad build again.
+///  * a **Git revision** patches the Argo CD Application's `targetRevision`,
+///    which is what this command has always done.
+///
+/// Bare `rollback` prefers the retained digest when the CR has one; see
+/// [`classify_rollback_target`].
 pub fn rollback(name: &str, env: Option<String>, to: Option<String>, yes: bool) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
     let (app, argo_name) = resolve_app_for_command(name, env.as_deref(), kc.path())?;
 
+    // The AppRafter CR is where a pin lives and where the retained digest is
+    // recorded. Absent on an application Argo CD has not synced yet, which
+    // is a refusal rather than a fallback: a pin write cannot create the CR.
+    let cr = read_apprafter_cr(&app, kc.path());
+
+    match classify_rollback_target(to.as_deref(), cr.as_ref(), &app)? {
+        RollbackTarget::Digest(digest) => {
+            let cr = cr.ok_or_else(|| {
+                CliError::Other(format!(
+                    "Application '{argo_name}' has not synced yet, so it has no resolved \
+                     image to pin. Wait for the first sync, then retry."
+                ))
+            })?;
+            rollback_to_digest(&app, &argo_name, &cr, &digest, yes, kc.path())
+        }
+        RollbackTarget::GitRevision(rev) => {
+            rollback_to_revision(&app, &argo_name, &rev, yes, kc.path())
+        }
+    }
+}
+
+/// Pin the application to `digest` (ADR 0059).
+fn rollback_to_digest(
+    argo_app: &Value,
+    argo_name: &str,
+    cr: &Value,
+    digest: &str,
+    yes: bool,
+    kubeconfig: &Path,
+) -> Result<()> {
+    let reference = compose_pin_reference(digest, cr)?;
+    let cr_name = cr
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Other("AppRafter Application CR has no name".into()))?;
+    let cr_ns = cr
+        .pointer("/metadata/namespace")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            argo_app
+                .pointer("/spec/destination/namespace")
+                .and_then(Value::as_str)
+        })
+        .ok_or_else(|| CliError::Other("cannot determine the application's namespace".into()))?;
+
+    if pin_appears_git_managed(cr) {
+        return Err(CliError::Other(format!(
+            "'{cr_name}' declares `apprafter.io/image-pin` in its own manifest, so Git owns \
+             it and the next sync would revert this pin. Change the manifest instead."
+        )));
+    }
+
+    let current = cr
+        .pointer("/status/image/resolved")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    if current == reference {
+        return Err(CliError::Other(format!(
+            "'{cr_name}' is already running {reference} — rollback would be a no-op."
+        )));
+    }
+
+    if !yes {
+        if !io::stdin().is_terminal() {
+            return Err(CliError::Other(
+                "non-interactive shell — pass `--yes` to skip the confirmation prompt".into(),
+            ));
+        }
+        println!("Roll back '{cr_name}' from {current} to {reference}?");
+        println!(
+            "  This PINS the application: it stops following its tag until you run \
+             `apprafter app unpin {cr_name}`."
+        );
+        println!("  To roll back a Git revision instead, pass `--to <revision>`.");
+        let confirmed = inquire::Confirm::new("Confirm?")
+            .with_default(false)
+            .prompt()
+            .map_err(|e| CliError::Other(format!("confirmation prompt: {e}")))?;
+        if !confirmed {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    let at = chrono::Utc::now().to_rfc3339();
+    let body = pin_manifest(cr_name, cr_ns, Some((&reference, &at)));
+    kubectl_apply_server_side(
+        &serde_json::to_string(&body).unwrap_or_default(),
+        APPRAFTER_CLI_PIN_FIELD_MANAGER,
+        kubeconfig,
+    )?;
+
+    println!(
+        "{}",
+        cli_core::style::warn(&format!(
+            "✓ '{cr_name}' pinned to {reference}. It is no longer following its tag — \
+         resume with `apprafter app unpin {cr_name}`."
+        ))
+    );
+    let _ = argo_name;
+    Ok(())
+}
+
+/// Patch the Argo CD Application's `targetRevision` — the original behaviour.
+fn rollback_to_revision(
+    app: &Value,
+    argo_name: &str,
+    target_revision: &str,
+    yes: bool,
+    kubeconfig: &Path,
+) -> Result<()> {
     let current_revision = app
         .pointer("/spec/source/targetRevision")
         .and_then(Value::as_str)
         .unwrap_or("?")
         .to_string();
-
-    let target_revision = match to {
-        Some(explicit) => explicit,
-        None => pick_previous_revision(&app)?.to_string(),
-    };
 
     if target_revision == current_revision {
         return Err(CliError::Other(format!(
@@ -2099,17 +2225,17 @@ pub fn rollback(name: &str, env: Option<String>, to: Option<String>, yes: bool) 
         }
     }
 
-    let body = format!(r#"{{"spec":{{"source":{{"targetRevision":"{target_revision}"}}}}}}"#);
+    let body = rollback_patch_body(target_revision);
     // Patch the RESOLVED Argo CD object (`<name>-<env>` for an env
     // deploy), NOT the bare logical name — otherwise a per-env rollback
     // would target a non-existent `<name>` Application.
     kubectl_merge_patch(
         "application.argoproj.io",
-        &argo_name,
+        argo_name,
         Some(ARGOCD_NAMESPACE),
         None,
         &body,
-        kc.path(),
+        kubeconfig,
     )?;
 
     println!(
@@ -2117,6 +2243,104 @@ pub fn rollback(name: &str, env: Option<String>, to: Option<String>, yes: bool) 
          sync the workload within a reconcile cycle."
     );
     Ok(())
+}
+
+/// `apprafter app unpin <name>` — resume following the tag (ADR 0059).
+///
+/// Mandatory rather than a convenience: without it `rollback` is a one-way
+/// door out of the platform's auto-deploy feature, and the only way back
+/// would be hand-editing the manifest — the same trap the defect records,
+/// entered from the other side.
+///
+/// Removes the pin by re-applying the SAME body under the SAME field manager
+/// with the annotations omitted, so server-side apply prunes exactly the two
+/// keys that manager owns.
+pub fn unpin(name: &str, env: Option<String>, yes: bool) -> Result<()> {
+    let kc = ensure_kubeconfig_tempfile()?;
+    let (app, argo_name) = resolve_app_for_command(name, env.as_deref(), kc.path())?;
+    let cr = read_apprafter_cr(&app, kc.path()).ok_or_else(|| {
+        CliError::Other(format!(
+            "Application '{argo_name}' has not synced yet — there is nothing pinned."
+        ))
+    })?;
+
+    let cr_name = cr
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Other("AppRafter Application CR has no name".into()))?;
+    let cr_ns = cr
+        .pointer("/metadata/namespace")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            app.pointer("/spec/destination/namespace")
+                .and_then(Value::as_str)
+        })
+        .ok_or_else(|| CliError::Other("cannot determine the application's namespace".into()))?;
+
+    let pinned = cr
+        .pointer("/metadata/annotations/apprafter.io~1image-pin")
+        .and_then(Value::as_str);
+    let Some(pinned) = pinned else {
+        println!("'{cr_name}' is not pinned — nothing to do.");
+        return Ok(());
+    };
+
+    let tag = cr
+        .pointer("/status/image/tag")
+        .and_then(Value::as_str)
+        .unwrap_or("its tag");
+
+    if !yes {
+        if !io::stdin().is_terminal() {
+            return Err(CliError::Other(
+                "non-interactive shell — pass `--yes` to skip the confirmation prompt".into(),
+            ));
+        }
+        println!("Un-pin '{cr_name}' (currently held at {pinned})?");
+        println!(
+            "  It will resume following {tag} and may roll forward to whatever that now \
+             points at, within one reconcile."
+        );
+        let confirmed = inquire::Confirm::new("Confirm?")
+            .with_default(false)
+            .prompt()
+            .map_err(|e| CliError::Other(format!("confirmation prompt: {e}")))?;
+        if !confirmed {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    let body = pin_manifest(cr_name, cr_ns, None);
+    kubectl_apply_server_side(
+        &serde_json::to_string(&body).unwrap_or_default(),
+        APPRAFTER_CLI_PIN_FIELD_MANAGER,
+        kc.path(),
+    )?;
+
+    println!("✓ '{cr_name}' un-pinned — following {tag} again.");
+    Ok(())
+}
+
+/// Fetch the AppRafter `Application` CR behind an Argo CD Application.
+///
+/// `None` when Argo CD has not synced the application yet (no
+/// `status.resources`), or the repository renders no AppRafter CR at all.
+/// Best-effort on the read itself; the CALLERS decide whether absence is
+/// fatal, and for both pin verbs it is.
+fn read_apprafter_cr(argo_app: &Value, kubeconfig: &Path) -> Option<Value> {
+    let cr_name = app_open::find_apprafter_app_name(argo_app)?;
+    let ns = argo_app
+        .pointer("/spec/destination/namespace")
+        .and_then(Value::as_str)?;
+    kubectl_get_json(
+        "application.apprafter.io",
+        Some(&cr_name),
+        Some(ns),
+        kubeconfig,
+    )
+    .ok()
+    .flatten()
 }
 
 pub fn remove(name: &str, yes: bool, keep_data: bool, env: Option<String>) -> Result<()> {
@@ -2529,6 +2753,192 @@ pub(crate) fn build_kubectl_logs_target(app_name: &str, pod: Option<&str>) -> Ku
 ///
 /// Returns a string with a lifetime tied to `app` through the
 /// `Value` borrow.
+/// What `apprafter app rollback` was asked to roll back to (ADR 0059).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RollbackTarget {
+    /// An image digest — pin the AppRafter CR to `repo@sha256:…`.
+    Digest(String),
+    /// A Git revision — patch the Argo CD Application's `targetRevision`.
+    GitRevision(String),
+}
+
+/// Decide whether `--to` names an image digest or a Git revision, and what a
+/// bare `rollback` means (ADR 0059).
+///
+/// `sha256:<64 lowercase hex>` is a digest; anything else is a Git revision.
+/// A value that carries a colon but is not a well-formed digest is REJECTED
+/// rather than passed through, because Git refnames forbid `:` — letting it
+/// fall through would only defer the same failure to Argo CD, with a worse
+/// message and a reconcile cycle in between.
+///
+/// With no `--to`, the retained digest wins when the CR has one. For a
+/// tag-following application a `targetRevision` rollback provably does not
+/// roll the workload back — that is the whole of D9 — so preferring Git there
+/// would be preferring the known-wrong answer. The presence of
+/// `status.image.previous` is exactly the evidence that the digest has moved.
+///
+/// Pure: `cr` is the AppRafter Application CR, `argo` the Argo CD one.
+pub(crate) fn classify_rollback_target(
+    to: Option<&str>,
+    cr: Option<&Value>,
+    argo: &Value,
+) -> Result<RollbackTarget> {
+    if let Some(raw) = to {
+        let raw = raw.trim();
+        if let Some(hex) = raw.strip_prefix("sha256:") {
+            if !is_canonical_sha256_hex(hex) {
+                return Err(CliError::Other(format!(
+                    "`--to {raw}` is not a canonical digest — expected \
+                     `sha256:` followed by 64 lowercase hex characters."
+                )));
+            }
+            return Ok(RollbackTarget::Digest(raw.to_string()));
+        }
+        if raw.contains(':') {
+            return Err(CliError::Other(format!(
+                "`--to {raw}` is neither an image digest nor a Git revision. \
+                 Image digests are `sha256:<64 hex>`; Git refnames cannot \
+                 contain `:`."
+            )));
+        }
+        return Ok(RollbackTarget::GitRevision(raw.to_string()));
+    }
+
+    if let Some(prev) = cr
+        .and_then(|c| c.pointer("/status/image/previous/resolved"))
+        .and_then(Value::as_str)
+    {
+        return Ok(RollbackTarget::Digest(prev.to_string()));
+    }
+    Ok(RollbackTarget::GitRevision(
+        pick_previous_revision(argo)?.to_string(),
+    ))
+}
+
+/// `true` for exactly 64 lowercase hex characters.
+///
+/// Case matters: OCI digests are canonically lowercase, and an uppercase
+/// variant would be a different string to every registry and to the
+/// operator's own validator, so accepting it here would produce a pin the
+/// operator then rejects.
+fn is_canonical_sha256_hex(hex: &str) -> bool {
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Turn whatever the user typed into the full `repo@sha256:…` the operator's
+/// repository-identity guard expects (ADR 0059).
+///
+/// A bare `sha256:…` carries no repository, and the annotation must, so the
+/// repository is recovered from a reference the CR itself already recorded —
+/// `status.image.previous.resolved`, then `status.image.resolved`, then
+/// `status.image.tag`. If the digest matches none of them we error rather
+/// than guess: a guessed repository is how a pin ends up pointing at somebody
+/// else's image.
+pub(crate) fn compose_pin_reference(digest: &str, cr: &Value) -> Result<String> {
+    if digest.contains('@') || !digest.starts_with("sha256:") {
+        // Already a full reference (or something we should not touch).
+        return Ok(digest.to_string());
+    }
+    let image = cr.pointer("/status/image");
+    let candidates = [
+        image
+            .and_then(|i| i.pointer("/previous/resolved"))
+            .and_then(Value::as_str),
+        image
+            .and_then(|i| i.get("resolved"))
+            .and_then(Value::as_str),
+        image.and_then(|i| i.get("tag")).and_then(Value::as_str),
+    ];
+    for c in candidates.into_iter().flatten() {
+        if let Some(repo) = reference_repository(c) {
+            return Ok(format!("{repo}@{digest}"));
+        }
+    }
+    Err(CliError::Other(format!(
+        "cannot tell which repository `{digest}` belongs to — the application \
+         has recorded no resolved image yet. Pass the full reference \
+         (`--to <repo>@{digest}`)."
+    )))
+}
+
+/// The `repo` part of `repo@sha256:…` or `repo:tag`.
+fn reference_repository(reference: &str) -> Option<&str> {
+    if let Some((repo, _)) = reference.split_once('@') {
+        return Some(repo);
+    }
+    // `:` is only a tag separator when it comes after the last `/` — a
+    // registry host may carry a port (`localhost:5000/x`).
+    let last_slash = reference.rfind('/').map_or(0, |i| i + 1);
+    match reference[last_slash..].rfind(':') {
+        Some(i) => Some(&reference[..last_slash + i]),
+        None => Some(reference),
+    }
+}
+
+/// The SSA body that places (or, with `pin: None`, removes) the pin.
+///
+/// Carries NOTHING but the two annotations, which is what makes un-pinning
+/// work: server-side apply prunes the keys this manager owns and no longer
+/// lists. A body that also named a spec field would make `unpin` delete that
+/// field too — the 2.10 egress defect at a new address.
+pub(crate) fn pin_manifest(
+    name: &str,
+    namespace: &str,
+    pin: Option<(&str, &str)>,
+) -> serde_json::Value {
+    let mut annotations = serde_json::Map::new();
+    if let Some((reference, at)) = pin {
+        annotations.insert("apprafter.io/image-pin".into(), json!(reference));
+        annotations.insert("apprafter.io/image-pinned-at".into(), json!(at));
+    }
+    json!({
+        "apiVersion": "apprafter.io/v1alpha1",
+        "kind": "Application",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "annotations": Value::Object(annotations),
+        },
+    })
+}
+
+/// `true` when an Argo-CD-shaped field manager already owns the pin
+/// annotation on this CR (ADR 0059).
+///
+/// If the user's own manifest declares the annotation then Git owns it, the
+/// next sync reverts our write, and reporting success would be a lie. Refuse
+/// instead. Same shape as `platform::egress_field_appears_git_managed`, and
+/// for the same reason.
+pub(crate) fn pin_appears_git_managed(cr: &Value) -> bool {
+    let Some(entries) = cr
+        .pointer("/metadata/managedFields")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    entries.iter().any(|e| {
+        let manager = e.get("manager").and_then(Value::as_str).unwrap_or("");
+        let is_argo = manager.contains("argocd")
+            || manager.contains("argo-cd")
+            || manager.contains("application-controller");
+        is_argo
+            && e.pointer("/fieldsV1/f:metadata/f:annotations/f:apprafter.io~1image-pin")
+                .is_some()
+    })
+}
+
+/// The Git-revision rollback patch body.
+///
+/// Built with `json!` rather than `format!`: the old hand-spliced string
+/// produced malformed JSON for any revision containing a quote or a
+/// backslash, and a patch body is not a place to discover that.
+pub(crate) fn rollback_patch_body(revision: &str) -> String {
+    json!({ "spec": { "source": { "targetRevision": revision } } }).to_string()
+}
+
 pub(crate) fn pick_previous_revision(app: &Value) -> Result<&str> {
     let history = app
         .pointer("/status/history")
@@ -2844,6 +3254,38 @@ fn print_status(app: &Value) {
 /// "resolved <age> ago" suffix is deterministic in tests,
 /// mirroring `format_pod_age`'s clock seam. The age suffix is
 /// dropped when `resolvedAt` is missing or unparseable.
+/// The "this application is held at a digest" line (ADR 0059).
+///
+/// `None` when the application is not pinned. Reads `status.image.pinned`,
+/// which the operator writes only when the pin is HONOURED — a pin the
+/// operator rejected must not be reported here, because a status line saying
+/// "held at X" while the workload follows the tag is worse than silence.
+///
+/// This exists because the pin is invisible to Git, permanently: a reader of
+/// the repository sees `:latest` and cannot know the cluster is deliberately
+/// holding an older digest. So this is not decoration — it is the only place
+/// the truth exists, which is also why it names the way out.
+pub(crate) fn format_pin_line(cr: &Value) -> Option<String> {
+    let pinned = cr.pointer("/status/image/pinned")?;
+    let reference = pinned.get("resolved").and_then(Value::as_str)?;
+    let name = cr
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or("<app>");
+    let tag = cr
+        .pointer("/status/image/tag")
+        .and_then(Value::as_str)
+        .unwrap_or("its tag");
+    let mut line = format!(
+        "  pinned:        held at {reference} — NOT following {tag}\n\
+         \x20                resume with `apprafter app unpin {name}`"
+    );
+    if let Some(at) = pinned.get("at").and_then(Value::as_str) {
+        line.push_str(&format!("\n                 pinned at {at}"));
+    }
+    Some(line)
+}
+
 pub(crate) fn format_image_line(cr: &Value, now: &chrono::DateTime<chrono::Utc>) -> Option<String> {
     let image = cr.pointer("/status/image")?;
     let tag = image.get("tag").and_then(Value::as_str).unwrap_or("?");
@@ -3777,6 +4219,271 @@ mod tests {
         // panic, just echo whatever was passed.
         let now = chrono::Utc::now();
         assert_eq!(format_pod_age("not-a-timestamp", &now), "not-a-timestamp");
+    }
+
+    // ---- ADR 0059: rollback target classification + pin write ----
+
+    const HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn cr_with_previous(prev: &str) -> Value {
+        json!({ "status": { "image": {
+            "tag": "ghcr.io/acme/web:latest",
+            "resolved": "ghcr.io/acme/web@sha256:bbb",
+            "previous": { "resolved": prev, "tag": "ghcr.io/acme/web:latest" }
+        }}})
+    }
+
+    fn argo_with_history() -> Value {
+        json!({ "status": { "history": [
+            { "revision": "aaaaaaa" },
+            { "revision": "bbbbbbb" },
+            { "revision": "ccccccc" }
+        ]}})
+    }
+
+    #[test]
+    fn a_sha256_target_is_an_image_digest() {
+        let to = format!("sha256:{HEX}");
+        assert_eq!(
+            classify_rollback_target(Some(&to), None, &json!({})).unwrap(),
+            RollbackTarget::Digest(to.clone())
+        );
+    }
+
+    #[test]
+    fn a_branch_name_is_still_a_git_revision() {
+        assert_eq!(
+            classify_rollback_target(Some("main"), None, &json!({})).unwrap(),
+            RollbackTarget::GitRevision("main".into())
+        );
+        assert_eq!(
+            classify_rollback_target(Some("v1.2.3"), None, &json!({})).unwrap(),
+            RollbackTarget::GitRevision("v1.2.3".into())
+        );
+    }
+
+    #[test]
+    fn a_colon_bearing_value_that_is_not_a_digest_is_rejected_not_passed_through() {
+        // Git refnames forbid `:`, so falling through would only defer the
+        // same failure to Argo CD — with a worse message and a reconcile
+        // cycle in between.
+        let err = classify_rollback_target(Some("sha256:deadbeef"), None, &json!({})).unwrap_err();
+        assert!(format!("{err}").contains("64 lowercase hex"), "{err}");
+        let err = classify_rollback_target(Some("weird:thing"), None, &json!({})).unwrap_err();
+        assert!(format!("{err}").contains("cannot contain"), "{err}");
+    }
+
+    #[test]
+    fn an_uppercase_digest_is_rejected() {
+        // OCI digests are canonically lowercase. Accepting an uppercase
+        // variant here would produce a pin the operator's own validator
+        // then rejects — a failure two components away from the typo.
+        let to = format!("sha256:{}", HEX.to_uppercase());
+        assert!(classify_rollback_target(Some(&to), None, &json!({})).is_err());
+    }
+
+    #[test]
+    fn bare_rollback_prefers_the_retained_digest_over_the_git_revision() {
+        // For a tag-following app the git path provably does not roll the
+        // workload back — that is the defect. Preferring it would be
+        // preferring the known-wrong answer.
+        let cr = cr_with_previous("ghcr.io/acme/web@sha256:aaa");
+        assert_eq!(
+            classify_rollback_target(None, Some(&cr), &argo_with_history()).unwrap(),
+            RollbackTarget::Digest("ghcr.io/acme/web@sha256:aaa".into())
+        );
+    }
+
+    #[test]
+    fn bare_rollback_falls_back_to_git_when_no_digest_was_retained() {
+        let cr = json!({ "status": { "image": { "tag": "ghcr.io/acme/web:latest" }}});
+        assert_eq!(
+            classify_rollback_target(None, Some(&cr), &argo_with_history()).unwrap(),
+            RollbackTarget::GitRevision("bbbbbbb".into())
+        );
+        assert_eq!(
+            classify_rollback_target(None, None, &argo_with_history()).unwrap(),
+            RollbackTarget::GitRevision("bbbbbbb".into())
+        );
+    }
+
+    // ---- compose_pin_reference ----
+
+    #[test]
+    fn a_bare_digest_gains_the_repository_the_app_already_recorded() {
+        let cr = cr_with_previous("ghcr.io/acme/web@sha256:aaa");
+        let composed = compose_pin_reference(&format!("sha256:{HEX}"), &cr).unwrap();
+        assert_eq!(composed, format!("ghcr.io/acme/web@sha256:{HEX}"));
+    }
+
+    #[test]
+    fn a_repository_is_never_guessed() {
+        // A guessed repository is how a pin ends up pointing at somebody
+        // else's image, so an app with no recorded image is an error rather
+        // than a default.
+        let err = compose_pin_reference(&format!("sha256:{HEX}"), &json!({})).unwrap_err();
+        assert!(format!("{err}").contains("which repository"), "{err}");
+    }
+
+    #[test]
+    fn a_full_reference_passes_through_untouched() {
+        let full = format!("ghcr.io/acme/web@sha256:{HEX}");
+        assert_eq!(compose_pin_reference(&full, &json!({})).unwrap(), full);
+    }
+
+    #[test]
+    fn a_registry_port_is_not_mistaken_for_a_tag() {
+        // `localhost:5000/web:latest` — the `:` in the host must not be
+        // read as the tag separator, or the composed pin would name the
+        // repository `localhost`.
+        let cr = json!({ "status": { "image": { "tag": "localhost:5000/web:latest" }}});
+        let composed = compose_pin_reference(&format!("sha256:{HEX}"), &cr).unwrap();
+        assert_eq!(composed, format!("localhost:5000/web@sha256:{HEX}"));
+    }
+
+    // ---- pin_manifest ----
+
+    #[test]
+    fn the_pin_body_carries_nothing_but_the_two_annotations() {
+        // Load-bearing: un-pinning re-applies this body with the keys
+        // omitted, and SSA prunes whatever the manager owns and no longer
+        // lists. A body naming a spec field would make `unpin` delete that
+        // field too — the 2.10 egress defect at a new address.
+        let body = pin_manifest(
+            "web",
+            "demo",
+            Some(("repo@sha256:aaa", "2026-08-31T10:00:00Z")),
+        );
+        let meta = body.get("metadata").unwrap().as_object().unwrap();
+        let mut keys: Vec<&str> = meta.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["annotations", "name", "namespace"]);
+        assert!(body.get("spec").is_none());
+        let anns = body
+            .pointer("/metadata/annotations")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(anns.len(), 2);
+    }
+
+    #[test]
+    fn the_unpin_body_is_the_same_body_with_the_keys_omitted() {
+        let body = pin_manifest("web", "demo", None);
+        assert_eq!(
+            body.pointer("/metadata/annotations")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            body.pointer("/metadata/name").and_then(Value::as_str),
+            Some("web")
+        );
+    }
+
+    #[test]
+    fn the_pin_manager_is_distinct_from_every_other_cli_manager() {
+        // Same guard the egress manager carries: sharing a manager with
+        // another write would make one command's apply prune the other's
+        // fields.
+        use cli_providers::k8s::kubectl::{
+            APPRAFTER_CLI_EGRESS_FIELD_MANAGER, APPRAFTER_CLI_FIELD_MANAGER,
+            APPRAFTER_CLI_PIN_FIELD_MANAGER,
+        };
+        assert_ne!(APPRAFTER_CLI_PIN_FIELD_MANAGER, APPRAFTER_CLI_FIELD_MANAGER);
+        assert_ne!(
+            APPRAFTER_CLI_PIN_FIELD_MANAGER,
+            APPRAFTER_CLI_EGRESS_FIELD_MANAGER
+        );
+        // And not Argo-CD-shaped, or our own write would trip the
+        // git-ownership guard on the next invocation.
+        for needle in ["argocd", "argo-cd", "application-controller"] {
+            assert!(!APPRAFTER_CLI_PIN_FIELD_MANAGER.contains(needle));
+        }
+    }
+
+    // ---- pin_appears_git_managed ----
+
+    #[test]
+    fn a_manifest_declared_pin_is_detected_as_git_owned() {
+        let cr = json!({ "metadata": { "managedFields": [
+            { "manager": "argocd-application-controller",
+              "fieldsV1": { "f:metadata": { "f:annotations": { "f:apprafter.io/image-pin": {} }}}}
+        ]}});
+        assert!(pin_appears_git_managed(&cr));
+    }
+
+    #[test]
+    fn our_own_pin_write_is_not_mistaken_for_a_git_owner() {
+        let cr = json!({ "metadata": { "managedFields": [
+            { "manager": "apprafter-cli-pin",
+              "fieldsV1": { "f:metadata": { "f:annotations": { "f:apprafter.io/image-pin": {} }}}}
+        ]}});
+        assert!(!pin_appears_git_managed(&cr));
+        assert!(!pin_appears_git_managed(&json!({})));
+    }
+
+    #[test]
+    fn argo_owning_a_different_annotation_is_not_a_git_owned_pin() {
+        // Argo stamps its own tracking annotation on every managed object.
+        // Treating that as ownership of OUR key would refuse every pin.
+        let cr = json!({ "metadata": { "managedFields": [
+            { "manager": "argocd-application-controller",
+              "fieldsV1": { "f:metadata": { "f:annotations": {
+                  "f:argocd.argoproj.io/tracking-id": {} }}}}
+        ]}});
+        assert!(!pin_appears_git_managed(&cr));
+    }
+
+    // ---- rollback_patch_body ----
+
+    #[test]
+    fn the_rollback_patch_body_survives_a_quote_in_the_revision() {
+        // The old hand-spliced `format!` produced malformed JSON here, and
+        // a patch body is not a place to discover that.
+        let body = rollback_patch_body(r#"we"ird"#);
+        let parsed: Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(
+            parsed
+                .pointer("/spec/source/targetRevision")
+                .and_then(Value::as_str),
+            Some(r#"we"ird"#)
+        );
+    }
+
+    // ---- format_pin_line ----
+
+    #[test]
+    fn the_pin_line_names_the_digest_the_tag_and_the_way_out() {
+        let cr = json!({
+            "metadata": { "name": "web" },
+            "status": { "image": {
+                "tag": "ghcr.io/acme/web:latest",
+                "pinned": { "resolved": "ghcr.io/acme/web@sha256:aaa", "at": "2026-08-31T10:00:00Z" }
+            }}
+        });
+        let line = format_pin_line(&cr).expect("pinned");
+        assert!(line.contains("ghcr.io/acme/web@sha256:aaa"), "{line}");
+        assert!(
+            line.contains("NOT following ghcr.io/acme/web:latest"),
+            "{line}"
+        );
+        assert!(line.contains("apprafter app unpin web"), "{line}");
+    }
+
+    #[test]
+    fn an_unpinned_app_prints_no_pin_line() {
+        assert!(format_pin_line(&json!({})).is_none());
+        // And a REJECTED pin must not print one either: the operator writes
+        // `status.image.pinned` only when the pin is honoured, so a status
+        // line saying "held at X" while the workload follows the tag is
+        // worse than silence.
+        let rejected = json!({ "metadata": { "annotations": { "apprafter.io/image-pin": "bad" }},
+                               "status": { "image": { "tag": "app:latest" }}});
+        assert!(format_pin_line(&rejected).is_none());
     }
 
     #[test]

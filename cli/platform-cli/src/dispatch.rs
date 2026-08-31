@@ -136,6 +136,7 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
             AppCommand::Rollback { name, env, to, yes } => {
                 commands::app::rollback(&name, env, to, yes)?
             }
+            AppCommand::Unpin { name, env, yes } => commands::app::unpin(&name, env, yes)?,
             AppCommand::Open {
                 name,
                 env,

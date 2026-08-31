@@ -27,6 +27,7 @@ Subcommands:
 - [`apprafter app rollback`](#apprafter-app-rollback) — Roll back to a previous revision.
 - [`apprafter app scaffold`](#apprafter-app-scaffold) — Generate a starter `apprafter/Application.cue` based on the cwd's runtime markers (bun.lock / Cargo.toml / pyproject.toml / etc.).
 - [`apprafter app status`](#apprafter-app-status) — Show detail view for one Application: sync state, health, source repo + revision, destinations, recent sync history (last 3 revisions).
+- [`apprafter app unpin`](#apprafter-app-unpin) — Resume following the image tag after `app rollback` pinned the application to a digest.
 - [`apprafter app validate`](#apprafter-app-validate) — Validate an AppRafter `Application.cue` manifest LOCALLY, reproducing the cluster's render-time `cue` pipeline.
 
 ## `apprafter app add`
@@ -182,14 +183,15 @@ Usage: apprafter app rollback [OPTIONS] <NAME>
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--env` | — | — | no | Select the env-deployment `<name>-<env>`. Omit for a base/single-env app; if the app is deployed per-env and `--env` is omitted, the command errors with the available environments |
-| `--to` | — | — | no | Explicit revision (commit SHA / tag / branch). Without the flag: previous entry in `status.history` |
+| `--to` | `<revision|sha256:digest>` | — | no | What to roll back to. `sha256:<64 hex>` is an IMAGE digest and pins the app to it (it stops following its tag until `apprafter app unpin`); anything else is a Git revision (commit SHA / tag / branch). Without the flag: the previously resolved image digest when the app has one, else the previous `status.history` entry |
 | `--yes` | flag | — | no | Skip confirmation prompt. Required in non-interactive shells |
 
 Examples:
 
 ```sh
-apprafter app rollback <name>  # to the previous entry in Argo CD history
-apprafter app rollback <name> --to <revision> --yes
+apprafter app rollback <name>  # previous image digest, else previous Git revision
+apprafter app rollback <name> --to sha256:<64-hex> --yes  # pin to an image digest
+apprafter app rollback <name> --to <revision> --yes  # roll back the Git revision
 ```
 
 ## `apprafter app scaffold`
@@ -237,6 +239,30 @@ Examples:
 ```sh
 apprafter app status <name>
 apprafter app status <name> --resources
+```
+
+## `apprafter app unpin`
+
+Resume following the image tag after `app rollback` pinned the application to a digest. The app may roll forward to whatever the tag now points at within one reconcile
+
+```text
+Usage: apprafter app unpin [OPTIONS] <NAME>
+```
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| `<NAME>` | yes | Application name |
+
+| Flag | Value | Default | Required | Description |
+| --- | --- | --- | --- | --- |
+| `--env` | — | — | no | Select the env-deployment `<name>-<env>`. Omit for a base/single-env app; if the app is deployed per-env and `--env` is omitted, the command errors with the available environments |
+| `--yes` | flag | — | no | Skip confirmation prompt. Required in non-interactive shells |
+
+Examples:
+
+```sh
+apprafter app unpin <name>  # resume following the image tag
+apprafter app unpin <name> --env prod --yes
 ```
 
 ## `apprafter app validate`

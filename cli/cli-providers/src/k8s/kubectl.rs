@@ -31,6 +31,21 @@ pub const APPRAFTER_CLI_FIELD_MANAGER: &str = "apprafter-cli";
 /// never mistakes it for a git owner. (Walk-found, 2.10 / ADR 0045.)
 pub const APPRAFTER_CLI_EGRESS_FIELD_MANAGER: &str = "apprafter-cli-egress";
 
+/// Dedicated field manager for the image pin written by `apprafter app
+/// rollback` and removed by `apprafter app unpin` (ADR 0059).
+///
+/// **This manager must own exactly the two pin annotations and nothing
+/// else, ever.** Un-pinning works by re-applying the SAME body with the keys
+/// omitted, and server-side apply then prunes whatever this manager owned
+/// and no longer lists. Give it a second field to own and the un-pin would
+/// silently delete that too — which is
+/// [`APPRAFTER_CLI_EGRESS_FIELD_MANAGER`]'s defect reappearing at a new
+/// address.
+///
+/// Deliberately not Argo-CD-shaped, so the pre-write ownership check never
+/// mistakes our own previous write for a git owner.
+pub const APPRAFTER_CLI_PIN_FIELD_MANAGER: &str = "apprafter-cli-pin";
+
 /// URL of the upstream "standard install" YAML — Gateway, HTTPRoute,
 /// GRPCRoute, ReferenceGrant CRDs (the conformance baseline).
 pub fn gateway_api_crds_url() -> String {

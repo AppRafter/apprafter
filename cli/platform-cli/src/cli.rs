@@ -946,10 +946,31 @@ pub enum AppCommand {
         /// available environments.
         #[arg(long)]
         env: Option<String>,
-        /// Explicit revision (commit SHA / tag / branch).
-        /// Without the flag: previous entry in `status.history`.
-        #[arg(long = "to")]
+        /// What to roll back to. `sha256:<64 hex>` is an IMAGE
+        /// digest and pins the app to it (it stops following its
+        /// tag until `apprafter app unpin`); anything else is a
+        /// Git revision (commit SHA / tag / branch). Without the
+        /// flag: the previously resolved image digest when the app
+        /// has one, else the previous `status.history` entry.
+        #[arg(long = "to", value_name = "revision|sha256:digest")]
         to: Option<String>,
+        /// Skip confirmation prompt. Required in non-interactive
+        /// shells.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
+    /// Resume following the image tag after `app rollback` pinned
+    /// the application to a digest. The app may roll forward to
+    /// whatever the tag now points at within one reconcile.
+    Unpin {
+        /// Application name.
+        name: String,
+        /// Select the env-deployment `<name>-<env>`.
+        /// Omit for a base/single-env app; if the app is deployed
+        /// per-env and `--env` is omitted, the command errors with the
+        /// available environments.
+        #[arg(long)]
+        env: Option<String>,
         /// Skip confirmation prompt. Required in non-interactive
         /// shells.
         #[arg(long, default_value_t = false)]
