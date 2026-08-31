@@ -1569,6 +1569,56 @@ fn resolve_needs_targets(
     targets
 }
 
+/// Whether `secret` carries `key` in either `data` or `stringData`.
+fn secret_carries_key(secret: &Secret, key: &str) -> bool {
+    let in_data = secret.data.as_ref().is_some_and(|d| d.contains_key(key));
+    let in_string_data = secret
+        .string_data
+        .as_ref()
+        .is_some_and(|d| d.contains_key(key));
+    in_data || in_string_data
+}
+
+/// The keys a Secret does carry, rendered for the `EnvSecretMissing` message.
+///
+/// Key NAMES only — never values, and the values are never read. A name is
+/// not secret material, and printing them turns "carries no key `foo`" into
+/// something the reader can act on without a second command: the common
+/// cause is a `stripe_api_key` / `stripe-api-key` mismatch, which is obvious
+/// the moment both spellings are on screen and invisible otherwise.
+///
+/// Capped, because a Secret may legitimately carry many keys and a condition
+/// message is not a place to page through them.
+fn describe_available_keys(secret: &Secret) -> String {
+    const MAX: usize = 8;
+    let mut keys: Vec<&str> = secret
+        .data
+        .as_ref()
+        .into_iter()
+        .flat_map(|d| d.keys().map(String::as_str))
+        .chain(
+            secret
+                .string_data
+                .as_ref()
+                .into_iter()
+                .flat_map(|d| d.keys().map(String::as_str)),
+        )
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    if keys.is_empty() {
+        return " (it carries no keys at all)".to_string();
+    }
+    let shown = keys.len().min(MAX);
+    let more = keys.len().saturating_sub(shown);
+    let list = keys[..shown].join(", ");
+    if more > 0 {
+        format!(" (it carries: {list}, and {more} more)")
+    } else {
+        format!(" (it carries: {list})")
+    }
+}
+
 /// Namespace SourceCredentials and their canonical derived
 /// pull-secrets live in.
 const SOURCECRED_NAMESPACE: &str = "apprafter-system";
@@ -1715,26 +1765,32 @@ async fn check_env_secret_refs(
     let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
     let mut missing: Vec<String> = Vec::new();
     for (var_name, secret_name, key) in &checks {
-        let exists = match api.get_opt(secret_name).await? {
+        // 2.22c (D7): name WHICH of the two causes it is, and in which
+        // namespace. This match already knows — the `None` arm is "no such
+        // Secret" and a failed key lookup is "wrong key" — and the previous
+        // version collapsed both into one bool and reported "not found OR
+        // missing key", so the operator raised a question it then refused to
+        // answer. The namespace was in scope the whole time and unnamed,
+        // even though sealing into the wrong one is the likeliest way here.
+        let detail = match api.get_opt(secret_name).await? {
+            None => Some(format!(
+                "no Secret \"{secret_name}\" in namespace \"{namespace}\""
+            )),
             Some(secret) => {
-                let in_data = secret
-                    .data
-                    .as_ref()
-                    .map(|d| d.contains_key(key.as_str()))
-                    .unwrap_or(false);
-                let in_string_data = secret
-                    .string_data
-                    .as_ref()
-                    .map(|d| d.contains_key(key.as_str()))
-                    .unwrap_or(false);
-                in_data || in_string_data
+                if secret_carries_key(&secret, key) {
+                    None
+                } else {
+                    Some(format!(
+                        "Secret \"{secret_name}\" exists in namespace \"{namespace}\" \
+                         but carries no key \"{key}\"{}",
+                        describe_available_keys(&secret)
+                    ))
+                }
             }
-            None => false,
         };
-        if !exists {
+        if let Some(detail) = detail {
             missing.push(format!(
-                "env {} → secret \"{}/{}\": Secret \"{}\" not found or missing key \"{}\"",
-                var_name, secret_name, key, secret_name, key
+                "env {var_name} → secret \"{secret_name}/{key}\": {detail}"
             ));
         }
     }
@@ -4531,6 +4587,60 @@ mod tests {
 
     fn desired(names: &[&str]) -> std::collections::BTreeSet<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn secret_with(keys: &[&str]) -> Secret {
+        Secret {
+            data: Some(
+                keys.iter()
+                    .map(|k| (k.to_string(), k8s_openapi::ByteString(b"redacted".to_vec())))
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn it_lists_the_keys_a_secret_does_carry() {
+        // The whole point of D7's cheapest fix: "carries no key
+        // stripe-api-key (it carries: stripe_api_key)" answers the
+        // question on the spot. Sorted, so the message is stable.
+        let s = secret_with(&["stripe_api_key", "webhook_secret"]);
+        assert_eq!(
+            describe_available_keys(&s),
+            " (it carries: stripe_api_key, webhook_secret)"
+        );
+    }
+
+    #[test]
+    fn it_caps_a_long_key_list_rather_than_paging_a_condition_message() {
+        let names: Vec<String> = (0..12).map(|i| format!("k{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let out = describe_available_keys(&secret_with(&refs));
+        assert!(out.contains("and 4 more"), "{out}");
+        assert!(!out.contains("k11"), "{out}");
+    }
+
+    #[test]
+    fn an_empty_secret_says_so_rather_than_rendering_an_empty_list() {
+        // "(it carries: )" reads like a bug. This is a real state — a
+        // sealed secret whose keys were all removed — and deserves words.
+        assert_eq!(
+            describe_available_keys(&Secret::default()),
+            " (it carries no keys at all)"
+        );
+    }
+
+    #[test]
+    fn key_lookup_covers_both_data_and_string_data() {
+        // `stringData` is write-only on a live object, but the check has
+        // always accepted either and a Secret built locally uses it.
+        let s = Secret {
+            string_data: Some([("k".to_string(), "v".to_string())].into_iter().collect()),
+            ..Default::default()
+        };
+        assert!(secret_carries_key(&s, "k"));
+        assert!(!secret_carries_key(&s, "other"));
     }
 
     #[test]
