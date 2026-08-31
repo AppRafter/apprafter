@@ -1881,12 +1881,40 @@ enforces the pattern.
 That is the third instance of the rule this file keeps re-learning, in a new
 place: **only a live apiserver validates a CRD schema.**
 
+### The same assumption, twice
+
+Fixing the CRD pattern did not fix the bug — it **moved the rejection one
+layer up**. The admission webhook carried an independent copy of the same
+belief (`validator_migrationplan.rs`, in both the typed and the raw-fallback
+branch):
+
+```text
+admission webhook "migrationplans.apprafter.io" denied the request:
+spec.scope.application.environment: environment is required
+```
+
+And a unit test asserted exactly that, so the webhook half was **defended on
+every run** — the third instance in this session of a test that pins a defect,
+after D3's `nodes[0].kind` and `doctor`'s WARN-on-missing-kubectl.
+
+The comment above the webhook check named the duplication as deliberate:
+*"the CRD pattern also rejects it — defence-in-depth"*. Defence in depth is
+the right instinct and it multiplies a wrong premise as faithfully as a right
+one. Only the second walk run showed the second layer, because the first
+never got past the first.
+
 ### The fix
 
 `environment` now accepts the base sentinel:
 `^([a-z0-9][a-z0-9-]{0,62}[a-z0-9])?$`. The CRD is aligned with what the
 operator has always written, rather than the reverse — `""` for base is the
 established internal contract in four places, and the schema was the outlier.
+
+The webhook's requirement is removed in both branches, its defect-pinning
+test is flipped to assert that both shapes the operator can emit (present-and-
+empty, and absent) are accepted, and a sibling test asserts the `ref` guards
+that share the branch still fire — so dropping the wrong check did not weaken
+the right ones.
 
 Guarded by an apiserver probe in `scripts/validate-crds.sh`, alongside the
 `imagePolicy.resolve: "off"` one, so `just crd-validate` fails if the pattern

@@ -480,12 +480,18 @@ fn validate_application_scope(
                     "namespace is required",
                 ));
             }
-            if app.environment.is_empty() {
-                errors.push(ValidationError::new(
-                    "spec.scope.application.environment",
-                    "environment is required",
-                ));
-            }
+            // NOT validated: `environment`. The EMPTY STRING IS THE BASE
+            // (unset `spec.environment`) DEPLOY, and is what the operator
+            // writes for it everywhere — `env_owned`, `PlanKey`,
+            // `plan_name` and `plans_to_delete` all key on "" for base.
+            // Requiring it non-empty here froze every base-only
+            // Application that hit a destructive change: the plan could
+            // not be admitted, so the gate never engaged and the reconcile
+            // retried a rejection every 30s indefinitely. D15, found by the
+            // 2.22b needs-removal walk after the same assumption was fixed
+            // one layer down in the CRD pattern — the webhook carried an
+            // independent copy of it, which is why fixing the schema alone
+            // moved the rejection rather than removing it.
         }
         // Raw fallback (spec did not deserialize): `ref` may be absent, so
         // the PRESENCE branch lives here, matching the pre-refactor
@@ -515,13 +521,8 @@ fn validate_application_scope(
                     }
                 }
             }
-            let env = app.get("environment").and_then(Value::as_str).unwrap_or("");
-            if env.is_empty() {
-                errors.push(ValidationError::new(
-                    "spec.scope.application.environment",
-                    "environment is required",
-                ));
-            }
+            // See the typed branch above: "" is the base env, not a
+            // missing value.
         }
     }
 }
@@ -857,16 +858,50 @@ mod tests {
     }
 
     #[test]
-    fn rejects_application_scope_missing_environment() {
+    fn accepts_the_base_env_scope() {
+        // D15. This test previously asserted the OPPOSITE — that an
+        // absent environment is rejected — and so defended a defect that
+        // froze every base-only Application: the operator writes "" for
+        // an unset `spec.environment`, the webhook refused it, and the
+        // gating plan could never be admitted, so the reconcile retried a
+        // rejection every 30s forever while the gate never engaged.
+        //
+        // Both shapes the operator can produce must pass: the field
+        // present-and-empty (what `create_plan_for` actually emits) and
+        // the field absent (the raw-fallback path).
+        let mut present_empty = application_scope_object();
+        present_empty["spec"]["scope"]["application"]["environment"] = json!("");
+        assert!(
+            !validate_migrationplan(&present_empty, None)
+                .iter()
+                .any(|e| e.field == "spec.scope.application.environment"),
+            "the base env is a legitimate scope, not a missing value"
+        );
+
+        let mut absent = application_scope_object();
+        absent["spec"]["scope"]["application"]
+            .as_object_mut()
+            .unwrap()
+            .remove("environment");
+        assert!(!validate_migrationplan(&absent, None)
+            .iter()
+            .any(|e| e.field == "spec.scope.application.environment"));
+    }
+
+    #[test]
+    fn still_rejects_an_application_scope_with_no_ref() {
+        // The guard that IS wanted must survive removing the one that was
+        // not: dropping the environment requirement must not weaken the
+        // ref checks that share the branch.
         let mut obj = application_scope_object();
         obj["spec"]["scope"]["application"]
             .as_object_mut()
             .unwrap()
-            .remove("environment");
+            .remove("ref");
         let errors = validate_migrationplan(&obj, None);
         assert!(errors
             .iter()
-            .any(|e| e.field == "spec.scope.application.environment"));
+            .any(|e| e.field.starts_with("spec.scope.application.ref")));
     }
 
     #[test]
