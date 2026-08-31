@@ -38,6 +38,7 @@ would otherwise touch the same code three times.
 | **D16** | A reconcile that fails leaves no trace outside the operator's log | open — high |
 | **D17** | A Dragonfly tenant can read every other tenant's key counts | open — medium, isolation | 2.22f |
 | **D18** | Two git-ownership guards could never fire: kubectl hides `managedFields` | FIXED 2.22e | 2.22e |
+| **D19** | The 2.22d size sampler deletes a live claim's whole allocation | FIXED 2.22f — same day, self-inflicted | 2.22f |
 
 ## D1. VPA in-place right-sizing has never run: wrong feature-gate name
 
@@ -2337,3 +2338,99 @@ call site; here it is a CLI flag nobody passed. **A unit test that constructs
 the input cannot tell you the input never arrives** — only a live probe can,
 which is why the walk asserted the field manager rather than just the
 annotation value.
+
+## D19. The size sampler deletes a live claim's whole allocation
+
+**Opened:** 2026-08-31, by an adversarial verifier checking an unrelated D5
+claim. It was looking at whether `status.ready` is sticky, noticed that the
+2.22d sampler applies a partial status under the provisioner's own field
+manager, and said so.
+**Status:** FIXED 2026-08-31 (2.22f), the same day, before the subphase that
+found it did anything else.
+**Severity:** **critical, and self-inflicted.** Data loss plus a tenant
+isolation breach, on every provisioned claim, within one tick of an upgrade.
+Introduced by 2.22d and never shipped.
+
+### What is wrong
+
+Server-side apply REPLACES a field manager's owned field-set on every apply. It
+does not accumulate. So a body carrying only `status.size`, applied under the
+manager that also owns the claim's allocation, deletes the allocation.
+
+2.22d added two such applies — `refresh_claim_size` (Postgres, on the 60s ready
+gate) and `refresh_claim_keys` (redis, on the 300s ACL loop) — both using
+`apply_params()`, which is `PatchParams::apply(FIELD_MANAGER)`, the same manager
+that writes the terminal status.
+
+Measured on a real apiserver (Kubernetes 1.35, this repository's own CRD).
+Before:
+
+```text
+{conditions, connectionSecretRef, dbnum, instance, ready: true}
+```
+
+After one size-only apply under the same manager:
+
+```text
+{size: {keys, measuredAt}}
+```
+
+Nothing else survives.
+
+### What it costs
+
+The consequences compound rather than stopping at a missing field.
+
+`should_provision` returns false only while `status.ready == true`. Prune
+`ready` and a live, working claim is re-provisioned. Allocation `FLUSHDB`s the
+logical DB as its recycle-safety invariant — **so the tenant's data is
+destroyed**. And the freed `dbnum` returns to the pool while the original
+tenant's application is still connected to it, which is precisely the 2.6
+isolation breach that commit `7890d9e` was written to close.
+
+The trigger is not rare. `keys_write_is_worth_it` and `size_write_is_worth_it`
+both return true on a first sample, so this fires on **every existing claim**
+within one tick of the upgrade that carries 2.22d.
+
+### Why nothing caught it
+
+The codebase already documents this exact hazard — `status_apply_body`'s
+doc-comment in `reconcile.rs` explains, at length and correctly, that a terminal
+apply omitting `instance`/`dbnum` would prune the allocation and name the
+consequences. 2.22d added a new writer at a new address and did not apply the
+lesson.
+
+Every gate passed. The unit tests exercise the deadband predicates and the
+body shape, both of which are correct — **the defect is which manager carries a
+correct body**, which is not observable in process. `cargo test`, `clippy`, the
+CRD check and the docs gate have nothing to say about field-manager choice. No
+walk covers it either: the size feature shipped without a walk step (recorded
+against D8 as a debt at the time), and even a walk that asserted the size
+appears would have passed, because the size *does* appear — it is everything
+else that vanishes.
+
+### The fix
+
+A dedicated field manager, `resourceclaim-provisioner-size`, for the sample and
+nothing else. SSA then merges rather than prunes: the size manager owns exactly
+`status.size`, and the provisioner keeps owning the allocation. Verified on the
+same apiserver — the full status survives, and a second sample updates the size
+without disturbing it.
+
+This is the `apprafter-cli-egress` rule (2.10) and the `apprafter-cli-pin` rule
+(2.22e / ADR 0059) at a third address: **a partial apply gets its own manager,
+and that manager writes nothing else, ever.**
+
+### The shape worth carrying
+
+Three defects in this file now share one root: **SSA field-set replacement is
+not intuitive, and the codebase keeps re-learning it.** 2.10 (egress pruned
+`source`/`values`), 2.22e (the pin manager, designed correctly *because* 2.10
+was remembered), and now 2.22d's sampler, written by someone — me — who had
+just read the doc-comment warning about it while fixing `status.image` for the
+very same reason in 2.22e.
+
+Reading the warning was not enough. The guard that would have helped is a test
+that asserts the *wiring*, which is what shipped with this fix: any
+`patch_status` whose body mentions `size` must use `size_apply_params`. It was
+verified by reintroducing the defect and watching it name the offending line.

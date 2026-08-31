@@ -388,7 +388,10 @@ async fn refresh_claim_keys(ctx: &Arc<Context>, addr: &str, admin_pw: &str, spec
     if let Err(e) = api
         .patch_status(
             &spec.claim_name,
-            &crate::reconcile::apply_params(),
+            // DEDICATED manager — see `crate::SIZE_FIELD_MANAGER`. Under the
+            // provisioner's own manager this size-only body would prune the
+            // claim's entire allocation.
+            &crate::reconcile::size_apply_params(),
             &kube::api::Patch::Apply(&body),
         )
         .await

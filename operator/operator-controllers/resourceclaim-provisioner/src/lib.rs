@@ -83,6 +83,30 @@ pub(crate) const KIND: &str = "ResourceClaim";
 /// status fields.
 pub const FIELD_MANAGER: &str = "resourceclaim-provisioner";
 
+/// Field manager for the **size/keys sample only** (2.22d / D8).
+///
+/// Server-side apply REPLACES a manager's owned field-set on every apply, so
+/// a partial body under [`FIELD_MANAGER`] prunes everything that manager owns
+/// and no longer lists. The terminal status apply owns `ready`, `instance`,
+/// `dbnum`, `connectionSecretRef` and the conditions — so a size-only apply
+/// under the same manager **deletes the whole allocation**.
+///
+/// That is not a hypothetical: measured on a real apiserver, a claim whose
+/// status read
+/// `{conditions, connectionSecretRef, dbnum, instance, ready:true}` read
+/// `{size}` and nothing else after one size-only apply. The consequences
+/// compound — a pruned `ready` makes `should_provision` true again, and a
+/// re-provision hands the freed `dbnum` to another claim and `FLUSHDB`s on
+/// allocation, which is the 2.6 isolation breach plus data loss.
+///
+/// A dedicated manager makes the write a MERGE instead: it owns exactly
+/// `status.size` and nothing else can be pruned by it. Same reasoning as
+/// `apprafter-cli-egress` and `apprafter-cli-pin` on the CLI side.
+///
+/// **Nothing else may ever be written under this manager**, or a later
+/// size-only apply would prune that too.
+pub const SIZE_FIELD_MANAGER: &str = "resourceclaim-provisioner-size";
+
 /// Finalizer the provisioner installs so deletes are observed. On
 /// delete it only logs (role/DB retained for 2.4f) and self-removes.
 pub(crate) const PROVISIONER_FINALIZER: &str = "apprafter.io/resourceclaim-provisioner";

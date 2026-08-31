@@ -1337,6 +1337,13 @@ pub(crate) fn apply_params() -> PatchParams {
     PatchParams::apply(FIELD_MANAGER).force()
 }
 
+/// Apply params for the size/keys sample — a DIFFERENT field manager, so the
+/// partial body merges instead of pruning the provisioner's whole status.
+/// See [`crate::SIZE_FIELD_MANAGER`] for what it cost to learn that.
+pub(crate) fn size_apply_params() -> PatchParams {
+    PatchParams::apply(crate::SIZE_FIELD_MANAGER).force()
+}
+
 /// Retry budget for the GC's `spec.managed.roles` read-modify-write
 /// (mirrors the provisioner's [`ROLE_RMW_RETRIES`]).
 pub(crate) const GC_ROLE_RMW_RETRIES: usize = ROLE_RMW_RETRIES;
@@ -1524,8 +1531,13 @@ async fn refresh_claim_size(ctx: &Context, claim: &ResourceClaim, ns: &str, name
             "measuredAt": Utc::now().to_rfc3339(),
         }},
     });
+    // DEDICATED manager, not `apply_params()`. This body carries only
+    // `status.size`, and SSA replaces a manager's field-set on every apply —
+    // so under the provisioner's own manager it would prune `ready`,
+    // `instance`, `dbnum` and `connectionSecretRef`, re-provisioning a live
+    // claim and handing its dbnum away. See `crate::SIZE_FIELD_MANAGER`.
     if let Err(e) = api
-        .patch_status(name, &apply_params(), &Patch::Apply(&body))
+        .patch_status(name, &size_apply_params(), &Patch::Apply(&body))
         .await
     {
         tracing::debug!(%name, %ns, %e, "size refresh status write failed (retrying next tick)");
