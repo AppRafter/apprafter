@@ -122,8 +122,38 @@ pub fn kubectl_get_json(
     namespace: Option<&str>,
     kubeconfig_path: &Path,
 ) -> Result<Option<serde_json::Value>> {
+    kubectl_get_json_inner(resource, name, namespace, kubeconfig_path, false)
+}
+
+/// Same as [`kubectl_get_json`], but asks for `metadata.managedFields`.
+///
+/// **kubectl STRIPS `managedFields` from `get -o json` by default** (it has
+/// since 1.21, to keep output readable). Any caller that inspects field
+/// ownership therefore sees an empty list and concludes nobody owns anything
+/// — so an ownership guard built on the plain getter cannot fire, ever. Two
+/// shipped guards were dead for exactly this reason before it was found on a
+/// live cluster; both now call this.
+pub fn kubectl_get_json_showing_managed_fields(
+    resource: &str,
+    name: Option<&str>,
+    namespace: Option<&str>,
+    kubeconfig_path: &Path,
+) -> Result<Option<serde_json::Value>> {
+    kubectl_get_json_inner(resource, name, namespace, kubeconfig_path, true)
+}
+
+fn kubectl_get_json_inner(
+    resource: &str,
+    name: Option<&str>,
+    namespace: Option<&str>,
+    kubeconfig_path: &Path,
+    show_managed_fields: bool,
+) -> Result<Option<serde_json::Value>> {
     let mut c = Command::new("kubectl");
     c.arg("get").arg(resource);
+    if show_managed_fields {
+        c.arg("--show-managed-fields");
+    }
     if let Some(n) = name {
         c.arg(n);
     }

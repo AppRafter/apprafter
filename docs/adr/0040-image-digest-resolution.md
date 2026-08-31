@@ -53,7 +53,9 @@ In scope: tag→digest resolution for public and private (via `SourceCredential.
 
 - **Registry rate-limits** (GHCR, Docker Hub) at fleet scale × apps × ~60 s. Mitigation: conditional requests (a no-op when the digest is unchanged), reuse of the existing requeue (no extra polling), room for per-registry backoff.
 - **Reconcile-path latency** from registry I/O. Mitigation: a bounded timeout with graceful fallback to the tag; resolution is best-effort and never blocks reconcile.
-- **A genuinely bad image auto-deploys** — the flip side of push→deploy. Accepted: this is the customer's CI contract (tagging a protected branch = intent to deploy); recovery is `kubectl rollout undo` / re-push, and the resolved digest is recorded for forensics. Regulated workloads opt out.
+- **A genuinely bad image auto-deploys** — the flip side of push→deploy. Accepted: this is the customer's CI contract (tagging a protected branch = intent to deploy), and the resolved digest is recorded for forensics. Regulated workloads opt out.
+
+  *Amended 2026-08-31 (ADR 0059).* The recovery this ADR named was wrong, and had been for as long as the feature shipped. `kubectl rollout undo` is undone by the operator's next pass, because the operator owns the Deployment and re-resolves the tag — so it lasts one reconcile. And `apprafter app rollback` rolled back the **Git revision**, which after a same-tag push has not moved. The real recovery is ADR 0059: the previously resolved digest is retained, and rolling back **pins** the application to it, because setting the workload back without pinning is undone the same way.
 - **Private-image resolution requires a covering `SourceCredential`;** absent one, there is no auto-deploy (it falls back to the tag). Accepted and surfaced via the `ImageResolved=False` status condition.
 
 ## Owner
@@ -67,6 +69,7 @@ Revisit if reconcile p99 latency attributable to registry I/O exceeds ~200 ms, i
 ## References
 
 - ADR 0039 — `SourceCredential` (the registry pull-secret seam; `pick_pull_credential`).
+- ADR 0059 — the recovery path for a moving tag: digest retention + the image pin.
 - `operator/operator-controllers/application/src/pull_secret.rs`; `operator/operator-rendering/` (pure render).
 - The 2.4g `needs.pg` CMS manual walk, where the mutable-tag asymmetry surfaced.
 - `spec.md` (application image / deployment), `plan.md` Phase 2.

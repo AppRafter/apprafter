@@ -15,7 +15,8 @@ use tabled::settings::{object::Columns, Modify, Width};
 use tabled::{Table, Tabled};
 
 use crate::commands::k8s_helpers::{
-    ensure_kubeconfig_tempfile, kubectl_apply_server_side, kubectl_get_json, kubectl_merge_patch,
+    ensure_kubeconfig_tempfile, kubectl_apply_server_side, kubectl_get_json,
+    kubectl_get_json_by_selector, kubectl_get_json_showing_managed_fields, kubectl_merge_patch,
 };
 use cli_providers::k8s::kubectl::APPRAFTER_CLI_EGRESS_FIELD_MANAGER;
 
@@ -105,11 +106,16 @@ pub fn status(cached: bool) -> Result<()> {
 /// without a cluster-wide view an operator would have to run `app status` per
 /// application to discover which ones have stopped receiving builds.
 fn print_pinned_applications(kubeconfig: &std::path::Path) {
-    let Ok(Some(list)) = kubectl_get_json("application.apprafter.io", None, None, kubeconfig)
+    // Cluster-wide, via the selector helper: `kubectl_get_json` with no
+    // namespace does NOT pass `-A`, so it would silently list only the
+    // kubeconfig's default namespace — and a roll-up that quietly omits most
+    // of the cluster is worse than no roll-up, because it reads as "nothing
+    // is pinned". An empty selector matches every object.
+    let Ok(items) = kubectl_get_json_by_selector("application.apprafter.io", "", None, kubeconfig)
     else {
         return;
     };
-    let rows = pinned_app_rows(&list);
+    let rows = pinned_app_rows(&items);
     if rows.is_empty() {
         return;
     }
@@ -131,10 +137,7 @@ fn print_pinned_applications(kubeconfig: &std::path::Path) {
 /// Reads `status.image.pinned`, which the operator writes only when the pin
 /// is HONOURED — a rejected pin must not appear here, or an operator would
 /// chase an application that is in fact still following its tag.
-pub(crate) fn pinned_app_rows(list: &Value) -> Vec<String> {
-    let Some(items) = list.get("items").and_then(Value::as_array) else {
-        return Vec::new();
-    };
+pub(crate) fn pinned_app_rows(items: &[Value]) -> Vec<String> {
     items
         .iter()
         .filter_map(|app| {
@@ -779,7 +782,11 @@ fn format_egress_profile(json: &Value) -> String {
 /// PlatformStack and print the current egress profile + legend.
 pub fn egress_show() -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
-    let json = kubectl_get_json(
+    // Managed-fields variant: `egress_field_appears_git_managed` reads
+    // `metadata.managedFields`, which kubectl strips from `get -o json`
+    // unless asked. Shipped in 2.10 on the plain getter, so the warning
+    // below had never once been reachable.
+    let json = kubectl_get_json_showing_managed_fields(
         "platformstack",
         Some(PLATFORMSTACK_NAME),
         Some(PLATFORMSTACK_NAMESPACE),
@@ -1048,16 +1055,15 @@ mod tests {
         // it has no `status.image.pinned` and is still following its tag.
         // Listing it would send an operator chasing an application that is
         // not actually held.
-        let list = json!({ "items": [
-            { "metadata": { "name": "web", "namespace": "demo" },
-              "status": { "image": { "pinned": { "resolved": "ghcr.io/acme/web@sha256:aaa" }}}},
-            { "metadata": { "name": "api", "namespace": "demo" },
-              "metadata2": {},
-              "status": { "image": { "tag": "ghcr.io/acme/api:latest" }}},
-            { "metadata": { "name": "worker", "namespace": "other" },
-              "status": { "image": { "pinned": { "resolved": "ghcr.io/acme/worker@sha256:bbb" }}}}
-        ]});
-        let rows = pinned_app_rows(&list);
+        let items = vec![
+            json!({ "metadata": { "name": "web", "namespace": "demo" },
+                    "status": { "image": { "pinned": { "resolved": "ghcr.io/acme/web@sha256:aaa" }}}}),
+            json!({ "metadata": { "name": "api", "namespace": "demo" },
+                    "status": { "image": { "tag": "ghcr.io/acme/api:latest" }}}),
+            json!({ "metadata": { "name": "worker", "namespace": "other" },
+                    "status": { "image": { "pinned": { "resolved": "ghcr.io/acme/worker@sha256:bbb" }}}}),
+        ];
+        let rows = pinned_app_rows(&items);
         assert_eq!(rows.len(), 2);
         assert!(rows[0].contains("demo/web"), "{:?}", rows);
         assert!(rows[0].contains("sha256:aaa"), "{:?}", rows);
@@ -1066,8 +1072,8 @@ mod tests {
 
     #[test]
     fn pinned_app_rows_is_empty_when_nothing_is_pinned() {
-        assert!(pinned_app_rows(&json!({ "items": [] })).is_empty());
-        assert!(pinned_app_rows(&json!({})).is_empty());
+        assert!(pinned_app_rows(&[]).is_empty());
+        assert!(pinned_app_rows(&[json!({ "metadata": { "name": "x" }})]).is_empty());
     }
 
     fn frozen_now() -> DateTime<Utc> {

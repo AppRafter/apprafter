@@ -46,7 +46,7 @@ The foundation everything else builds on. Closed in `plan.md` across the `v0.1.x
 |---|---|---|---|---|
 | Shipped | ✅ | CLI `apprafter`: provision + lifecycle for a Hetzner Tier-1 cluster (`init` → `apply` → `bootstrap-all` → `destroy`) | 1.1–1.3 | baseline |
 | Shipped | ✅ | One-command cluster bootstrap (k3s + Cilium + Gateway API + cert-manager + Argo CD + Backstage) | 1.4–1.5 | baseline |
-| Shipped | ✅ | Deploy applications via a CUE `Application` manifest + GitOps (Argo CD) | 1.6–1.9, 1.15 | baseline |
+| Shipped | ✅ | Deploy applications via a CUE `Application` manifest + GitOps (Argo CD), including tag→digest auto-deploy and rollback | 1.6–1.9, 1.15, 2.4h, 2.22e | baseline |
 | Shipped | ✅ | Typed config + composition (CUE + admission-webhook validation) | 1.5, 1.14 | baseline |
 | Shipped | ✅ | One manifest for dev/prod (per-environment expansion) | 1.9c | baseline |
 | Shipped | ✅ | Backstage developer portal: app status view + golden-path template (scaffold a Bun HTTP service) | 1.10–1.11 | baseline |

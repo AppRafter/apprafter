@@ -9,6 +9,99 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## platform-stack 0.2.59 / operator v0.2.45 — day-2 signals, and the way back from a bad build (2.22c–2.22e, unreleased)
+
+Four defects found by rewriting the guides, and one recovery path that never
+existed. Released as one batch; nothing here has been pushed.
+
+### Added
+
+- **`apprafter app rollback` can roll back an image, and holds it** (ADR 0059).
+  `--to sha256:<64 hex>` is an image digest; anything else is a Git revision.
+  With no `--to` the retained digest wins when there is one. Rolling back an
+  image **pins** the application — it stops following its tag — because setting
+  the workload back without pinning is undone by the next reconcile within a
+  minute.
+- **`apprafter app unpin <name>`** resumes following the tag. Mandatory rather
+  than convenient: without it `rollback` is a one-way door out of auto-deploy.
+- **The pin is stated in four places**, because it lives outside Git and is
+  therefore invisible to a reader of the repository: a yellow line in
+  `apprafter app status`, a roll-up in `apprafter platform status`, the
+  `ImageResolved=True/Pinned` condition, and a `Suspended` tile in Argo CD.
+- **`status.image.previous`** records the resolution before the current one —
+  the thing a rollback rolls back *to*.
+- **`apprafter secret list`** — which applications consume a secret and which
+  secrets an application needs, by key name, never by value.
+- **Size and capacity reach a human.** `apprafter app status` reports how full
+  an owned disk is, how many bytes a Postgres database holds (scraped from
+  CloudNativePG's own exporter, so it costs no connection slot from the tenants
+  being measured), and how many KEYS a Dragonfly tenant holds. Redis reports
+  keys rather than bytes and is labelled as such: per-database byte figures
+  exist inside Dragonfly and are summed across databases at every point they
+  could reach a client.
+- **A node running out of disk warns on every command**, not only while a
+  `SharedVolume` happens to be reconciling.
+- **A right-sizing recommendation says why it was not applied**, read from the
+  kubelet's own `PodResizePending` / `PodResizeInProgress` conditions, plus a
+  startup probe that reports a cluster whose Kubernetes predates in-place
+  resize rather than leaving `updateMode: InPlace` silently actuating nothing.
+
+### Fixed
+
+- **Five status builders were deleting `status.image`.** Status is applied
+  whole-object under one forced field manager, so a payload that omits a field
+  prunes it — entering a MigrationPlan gate, a claim pause, `EnvSecretMissing`
+  or an invalid spec destroyed the resolved-image record outright. Harmless
+  while nothing read it; fatal once it holds the only rollback target, because
+  it vanished exactly when an application was in trouble.
+- **`EnvSecretMissing` names the cause, the namespace and the available keys**
+  instead of stating a fact the CLI could not act on.
+- **Configuration drift is visible without rolling anything.**
+  `status.envConfig.changedAt` against a pod's `status.startTime` identifies a
+  pod running older configuration. Deliberately NOT a digest on the pod
+  template: that would roll every consumer on every secret change, and a secret
+  is not owned by one application, so the blast radius would be unknowable to
+  whoever sealed it.
+- **The rollback patch body was hand-spliced with `format!`**, so any revision
+  containing a quote produced malformed JSON.
+- **Two git-ownership guards could never fire** (D18). `kubectl` strips
+  `metadata.managedFields` from `get -o json` unless asked, so the warning that
+  an infra repository owns `spec.network.egress.profile` (shipped in 2.10) and
+  the refusal to write a pin the manifest declares both read an empty list and
+  concluded nobody owned anything. Both now use a getter that passes
+  `--show-managed-fields`. Their unit tests had always passed — they construct
+  input the code never received, which is why only a live cluster found it.
+- **`apprafter platform status`'s pinned roll-up listed one namespace.**
+  `kubectl_get_json` with no namespace does not pass `-A`, so a cluster-wide
+  read silently returned only the kubeconfig's default namespace — reading as
+  "nothing is pinned".
+
+### Changed
+
+- **A bare `apprafter app rollback <name>` now prefers the retained image
+  digest** over the previous Git revision when the application has one. For a
+  tag-following application the Git path provably does not roll the workload
+  back, so preferring it was preferring the known-wrong answer.
+- **`ImageResolved` is four states**, not two: `True/Resolved`, `True/Pinned`,
+  `False/PinRejected`, `False/ResolveFailed`. "Absent" was already spent on
+  `imagePolicy.resolve: off`.
+- **`apprafter doctor` fails rather than warns** on a binary the CLI cannot
+  work without. A missing `kubectl` used to exit 0 with "Ready to go".
+
+### Known limits
+
+- **The Argo CD tile signal is conditional.** `Suspended` is the
+  second-healthiest code in gitops-engine's ordering, so it overrides `Healthy`
+  and nothing else: a pinned application whose sibling managed resource is
+  `Progressing` shows `Progressing`. That includes a repository rendering
+  several applications into one Argo Application.
+- **User Argo Applications must stay single-wave, hook-free and without
+  `managedNamespaceMetadata`.** A permanently-`Suspended` managed resource
+  parks a sync operation in `Running` when the task set spans more than one
+  wave or phase. The shipped shape does not, which makes this an invariant
+  rather than an accident.
+
+
 ## cli v0.2.51 — persistent redis is backed up and restored (T12, 2026-08-28)
 
 Closes the redis leg of 2.6d that shipped deferred. Until now `export` /

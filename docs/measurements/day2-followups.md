@@ -28,7 +28,7 @@ would otherwise touch the same code three times.
 | **D6** | Rotating a secret does not take effect until something else restarts the pods | FIXED 2.22c — walk owed | 2.22c |
 | **D7** | The CLI cannot answer the question its own error asks | FIXED 2.22c — walk owed | 2.22c |
 | **D8** | A node-scoped warning published through an optional object | FIXED 2.22d — walk step still owed | 2.22d |
-| **D9** | There is nothing to roll a moving tag back to | open | 2.22e |
+| **D9** | There is nothing to roll a moving tag back to | RESOLVED 2.22e — walk GREEN | 2.22e |
 | **D10** | The applying half of right-sizing has never been observed to apply anything | FIXED 2.22d — walk rewritten, not yet run | 2.22d |
 | **D11** | 584 failures share one catch-all, and the cheap checks run last | FIXED 2.22a | 2.22a |
 | **D12** | Removing `expose` leaves the Service behind | FIXED 2.22b — walk-verified | 2.22b |
@@ -37,6 +37,7 @@ would otherwise touch the same code three times.
 | **D15** | The destructive-change gate never engaged for a base-only app | RESOLVED |
 | **D16** | A reconcile that fails leaves no trace outside the operator's log | open — high |
 | **D17** | A Dragonfly tenant can read every other tenant's key counts | open — medium, isolation | 2.22f |
+| **D18** | Two git-ownership guards could never fire: kubectl hides `managedFields` | FIXED 2.22e | 2.22e |
 
 ## D1. VPA in-place right-sizing has never run: wrong feature-gate name
 
@@ -1203,7 +1204,11 @@ asserting a cluster with no `SharedVolume` still warns.
 ## D9. There is nothing to roll a moving tag back to
 
 **Opened:** 2026-08-30 (2.20c, correcting `docs/dev-guide/image-iteration.md`).
-**Status:** OPEN.
+**Status:** RESOLVED 2026-08-31 (2.22e, ADR 0059). `e2e/image-rollback-walk.sh`
+**GREEN on kind+podman** — 30 assertions, including the two that only a live
+cluster could settle: the pin survives an Argo sync without drift, and the
+`Suspended` tile aggregates to the user's own Argo Application while the sync
+operation still reaches `Succeeded`.
 **Severity:** medium. The command a developer reaches for after shipping a bad
 build does nothing in the case they are most likely to be in.
 
@@ -1375,6 +1380,40 @@ the rollback returns the workload to the first **and that it stays there across
 at least two reconciles** (the naive fix passes the first assertion and fails the
 second); a step asserting the un-pin verb returns the app to following the tag;
 and an assertion that `app status` states the pinned mode in words.
+
+*Amended 2026-08-31 while implementing.* Three corrections, each found by
+checking a claim above rather than by building on it.
+
+**The same-tag push is not achievable in a hermetic walk, and the failure would
+be silent.** The operator resolves digests over HTTPS against webpki roots with
+no CA or insecure escape hatch (`oci_resolve.rs` hardcodes the scheme), so an
+in-cluster `registry:2` is unreachable to it — and resolution failure is SOFT
+by design (ADR 0040): it renders the verbatim tag and the rollout proceeds. A
+walk pointed at a plain-HTTP registry would therefore have gone GREEN while
+testing nothing. `e2e/image-rollback-walk.sh` moves the MANIFEST from
+`nginx:1.27-alpine` to `1.28-alpine` instead, which drives the same retention
+and shift code path with two public tags, no credentials and no new product
+surface. Funding a CA-bundle escape hatch in the resolver is a real product
+gap (private registries with their own CA are unsupported today) but it is a
+separate change with its own security review.
+
+**`Suspended` DOES stall a sync — just not ours.** Read out of gitops-engine at
+the shipped version: a non-hook task settles only on `Healthy` or `Degraded`, so
+a permanently-`Suspended` managed resource parks the operation in `Running`
+whenever the task set spans more than one wave or phase. `CreateNamespace=true`
+does NOT arm it (`syncNamespace` returns unmodified for an existing namespace
+without `managedNamespaceMetadata`); waves, hooks and
+`managedNamespaceMetadata` do. The shipped app shape has none, so this is an
+INVARIANT to keep rather than a hazard to accept, and the walk asserts
+`operationState.phase == Succeeded` rather than only the tile state.
+
+**The tile signal is conditional.** `Suspended` is the second-healthiest code in
+gitops-engine's ordering, so it overrides `Healthy` and nothing else. A pinned
+app whose sibling managed resource is `Progressing` shows `Progressing` — which
+includes a repository rendering several applications into one Argo Application.
+The health branch is therefore keyed on the pin marker alone and evaluated above
+the `Progressing` fall-through; nested under a phase check it would read
+`Progressing` exactly while the rollback rolled pods.
 
 ## D10. The applying half of right-sizing has never been observed to apply anything
 
@@ -2240,3 +2279,61 @@ but anyone who flips that flag to reach the metrics publishes every tenant's
 worth a comment wherever someone would be tempted, which is exactly where
 this platform will be tempted if it ever wants those metrics.
 
+## D18. Two git-ownership guards could never fire
+
+**Opened:** 2026-08-31, found by the 2.22e walk asserting the field manager
+that owns the pin annotation. The assertion read `<none>` while the write had
+plainly succeeded.
+**Status:** FIXED 2026-08-31 (2.22e), same day, in the change that found it.
+**Severity:** medium. No data loss and no wrong behaviour — but two warnings
+that exist specifically to stop a user writing something Git will silently
+revert had never once been reachable, so the failure they guard against
+produced no warning at all.
+
+### What is wrong
+
+**`kubectl` strips `metadata.managedFields` from `get -o json` by default.** It
+has since 1.21, to keep output readable; `--show-managed-fields` restores it.
+Measured on the walk's own cluster: the same object read without the flag
+reports zero `managedFields` entries and with it reports three.
+
+Both of this repository's field-ownership guards read `metadata.managedFields`
+out of `kubectl_get_json`, which does not pass the flag:
+
+- `egress_field_appears_git_managed` (`platform.rs`), shipped in **2.10**, warns
+  that an infra repository declares `spec.network.egress.profile` so
+  `apprafter platform egress set` will be reverted on the next sync.
+- `pin_appears_git_managed` (`app.rs`), written in **2.22e** hours earlier,
+  refuses to write an image pin the user's own manifest declares.
+
+Both saw an empty list, concluded nobody owned anything, and returned `false`
+every time.
+
+### What it costs
+
+The guard's whole job is to catch the case where the CLI would report success
+for a write that Git reverts within a sync. With the guard dead, that case
+produces a cheerful `✓` and then silently un-does itself — which is worse than
+having no guard, because the message trained the operator to expect a warning
+that could not come.
+
+The 2.10 one has been dead since it shipped. Nothing detected it: it is
+unit-tested against hand-built JSON that carries `managedFields`, so the tests
+pass and prove only that the predicate is correct given input it never receives.
+
+### The fix
+
+`kubectl_get_json_showing_managed_fields` — the same getter with the flag — and
+both call sites moved onto it. Kept as a separate function rather than making
+the flag universal: every other caller would pay a larger payload for a field
+it does not read.
+
+### The shape worth carrying
+
+This is the D10 shape at a different address: a signal built end-to-end, unit
+tested, and unreachable in production because one layer below the tested
+boundary discards its input. In D10 it was a hardcoded `false` at the only
+call site; here it is a CLI flag nobody passed. **A unit test that constructs
+the input cannot tell you the input never arrives** — only a live probe can,
+which is why the walk asserted the field manager rather than just the
+annotation value.

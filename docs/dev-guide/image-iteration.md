@@ -190,16 +190,59 @@ Two refusals you may meet, both before anything is changed:
   rollback would be a no-op, and the CLI says so rather than issuing an
   empty change.
 
-### It rolls back Git, not the image
+### Rolling back an image, and rolling back Git
 
-The rollback moves the revision your manifest is rendered from. If the
-regression arrived as a **new build pushed under an unchanged tag**,
-the older commit still names that same tag, resolution still finds the
-same current digest, and you get the same bad image back.
+`--to` decides which of the two you get, by the shape of the value:
 
-- The manifest changed (a new tag, an env value, replica count) →
-  `apprafter app rollback`.
-- The image behind an unchanged tag changed → the escape hatches below.
+- `--to sha256:<64 hex>` is an **image digest**. The application is held
+  at that image.
+- anything else is a **Git revision** — a commit SHA, tag or branch.
+
+With no `--to`, you get the image rollback when the platform has a
+previous digest to offer, and the Git rollback otherwise. That default
+is deliberate: if your regression arrived as a new build under an
+unchanged tag, the older commit still names that same tag, so a Git
+rollback would resolve to the same bad image and change nothing.
+
+### An image rollback holds the application
+
+Rolling back an image is not just a value change. If the workload were
+simply set back to the older digest, the next reconcile would resolve
+your tag again, find the same bad build, and roll forward — within a
+minute. So the rollback **pins**: the application stops following its
+tag until you release it.
+
+```sh
+apprafter app rollback <app-name> --yes
+```
+
+`apprafter app status` says so, in yellow:
+
+```text
+  image:         ghcr.io/acme/web:latest -> @sha256:9f2c…
+  pinned:        held at ghcr.io/acme/web@sha256:41ab… — NOT following ghcr.io/acme/web:latest
+                 resume with `apprafter app unpin web`
+```
+
+In Argo CD the application's tile reads **Suspended** with the same
+message — held, not broken.
+
+**A pinned application receives no new builds.** Pushing a fix does
+nothing until you release it:
+
+```sh
+apprafter app unpin <app-name> --yes
+```
+
+Within a reconcile the application follows its tag again and picks up
+whatever that now points at.
+
+One property is worth knowing because nothing else can tell you: the
+pin lives in the cluster, not in your repository. Your manifest still
+says `:latest`, which is the truth about your intent — but it means a
+reader of the repository cannot see that the cluster is deliberately
+holding an older build. `apprafter app status`, `apprafter platform
+status` and the Argo CD tile are the only places that fact exists.
 
 ### A rollback pins you off the branch
 
@@ -218,36 +261,21 @@ takes the branch name:
 apprafter app rollback <app-name> --to main --yes
 ```
 
-## Escape hatches
+## Escape hatch
 
-Two standard `kubectl` commands cover the cases the auto-deploy loop
-does not. The second is a workaround for a tracked defect rather than a
-design: with a moving tag there is nothing for `apprafter app rollback`
-to act on, because the Git revision it rolls back is unchanged and no
-previously-resolved digest is retained. Both act on the `Deployment` the operator renders, which
-carries your manifest's `metadata.name` and lives in your manifest's
-`metadata.namespace` — so pass `-n`, exactly as above:
+One case the auto-deploy loop deliberately does not cover: you re-pushed
+the same tag to the same digest — nothing moved — and you want fresh pods
+anyway. There is nothing for the platform to act on, so roll the
+`Deployment` by hand. It carries your manifest's `metadata.name` and
+lives in your manifest's `metadata.namespace`, so pass `-n` exactly as
+above:
 
-- **Force a re-pull without changing the image.** If you re-pushed
-  the same tag and want the workload to roll immediately rather than
-  wait for the next reconcile (or you simply want fresh pods):
+<!-- docs: check=none reason=external-tool since=v0.2.51 — a manual re-pull the auto-deploy loop deliberately does not cover: a tag that has not moved has nothing for the platform to act on -->
+```sh
+kubectl -n <namespace> rollout restart deployment/<app-name>
+```
 
-  <!-- docs: check=none reason=external-tool since=v0.2.51 — a manual re-pull the auto-deploy loop deliberately does not cover: a tag that has not moved has nothing for the platform to act on -->
-  ```sh
-  kubectl -n <namespace> rollout restart deployment/<app-name>
-  ```
-
-- **Revert to the previous build.** Neither `git revert` of a same-tag
-  push nor `apprafter app rollback` is a true image rollback, because
-  the tag in Git is unchanged either way. To roll the `Deployment` back
-  to its previous pod template:
-
-  <!-- docs: check=none reason=known-broken since=v0.2.51 — the workaround for a tracked defect: app rollback cannot roll back a moving tag, and no previously-resolved digest is retained -->
-  ```sh
-  kubectl -n <namespace> rollout undo deployment/<app-name>
-  ```
-
-  The operator owns the `Deployment` and re-resolves on its next
-  reconcile, so an undo holds only until the next resolution. To pin a
-  specific build durably, switch the manifest to a hand-pinned digest
-  with `imagePolicy.resolve: off`.
+`kubectl rollout undo` is **not** the way to revert a bad build. The
+operator owns the `Deployment` and re-resolves on its next pass, so an
+undo lasts until the next reconcile and no longer. Use
+`apprafter app rollback`, which holds.

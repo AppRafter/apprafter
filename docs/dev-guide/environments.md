@@ -328,6 +328,7 @@ deployment you mean, and only when there is more than one:
 | `apprafter app logs` | picks one | resolves a single deployment; with two or more it stops and lists them |
 | `apprafter app open` | picks one | same |
 | `apprafter app rollback` | picks one | same |
+| `apprafter app unpin` | picks one | same |
 | `apprafter app remove` | removes one | removes **every** environment of the app |
 
 So a one-environment app never needs `--env`:
@@ -352,8 +353,11 @@ to target one.
 ```
 
 Rollbacks are per environment for the same reason a revision is:
-`apprafter app rollback parser --env prod` moves that deployment's
-revision and leaves staging where it is.
+`apprafter app rollback parser --env prod` acts on that deployment and
+leaves staging where it is. An image pin is per environment too — one
+environment can be held at an older build while the other keeps
+following the tag — so `apprafter app unpin` takes `--env` on the same
+terms.
 
 ## Removing an environment
 

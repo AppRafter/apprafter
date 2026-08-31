@@ -53,8 +53,9 @@ filling it in.
   source credentials for a private Git repository and image-pull
   secrets for a private registry.
 - [Image iteration](image-iteration.md) — pushing a moved tag and
-  having the cluster resolve and roll out the new digest, and rolling a
-  bad deploy back with `apprafter app rollback`.
+  having the cluster resolve and roll out the new digest, rolling a bad
+  build back with `apprafter app rollback` (which holds the application
+  at that image), and releasing it again with `apprafter app unpin`.
 
 ## Canonical references
 

@@ -39,7 +39,7 @@ use cli_providers::k8s::kubectl::APPRAFTER_CLI_PIN_FIELD_MANAGER;
 use crate::commands::app_open;
 use crate::commands::k8s_helpers::{
     ensure_kubeconfig_tempfile, kubectl_apply_server_side, kubectl_get_json,
-    kubectl_get_json_by_selector, kubectl_merge_patch,
+    kubectl_get_json_by_selector, kubectl_get_json_showing_managed_fields, kubectl_merge_patch,
 };
 
 const ARGOCD_NAMESPACE: &str = "argocd";
@@ -2333,7 +2333,11 @@ fn read_apprafter_cr(argo_app: &Value, kubeconfig: &Path) -> Option<Value> {
     let ns = argo_app
         .pointer("/spec/destination/namespace")
         .and_then(Value::as_str)?;
-    kubectl_get_json(
+    // The managed-fields variant: `pin_appears_git_managed` reads
+    // `metadata.managedFields`, and kubectl STRIPS that from `get -o json`
+    // unless asked. Without the flag the guard sees an empty list, concludes
+    // nobody owns the annotation, and can never fire.
+    kubectl_get_json_showing_managed_fields(
         "application.apprafter.io",
         Some(&cr_name),
         Some(ns),
