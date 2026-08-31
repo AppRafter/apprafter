@@ -34,7 +34,8 @@ would otherwise touch the same code three times.
 | **D12** | Removing `expose` leaves the Service behind | open — medium | 2.22b |
 | **D13** | A registry credential copy that nothing ever reclaims | open — high, security | 2.22b |
 | **D14** | Re-sealing a secret performs a gated change through an ungated door | resolved by decision — disclosure work open |
-| **D15** | The destructive-change gate never engaged for a base-only app | RESOLVED | 2.22c |
+| **D15** | The destructive-change gate never engaged for a base-only app | RESOLVED |
+| **D16** | A reconcile that fails leaves no trace outside the operator's log | open — high | 2.22c |
 
 ## D1. VPA in-place right-sizing has never run: wrong feature-gate name
 
@@ -1924,4 +1925,92 @@ apiserver's own 422 against exactly this object.
 **Also worth keeping:** the walk that found this was written to prove D4 and
 D12, and never reached its own subject. A walk exercising a real default is
 worth more than the assertion it was aimed at.
+
+## D16. A reconcile that fails leaves no trace outside the operator's log
+
+**Opened:** 2026-08-31, from the 2.22b walk. Three consecutive runs had the
+operator 403 on every claim delete, every thirty seconds, and the only place
+that was visible was `kubectl logs deploy/apprafter-operator`.
+
+**Status:** OPEN.
+**Severity:** high — not because any single failure is severe, but because it
+makes every future failure cost a log read to find.
+
+### The distinction that matters
+
+It is not that the platform surfaces nothing. **Designed** failure modes are
+surfaced well: `AwaitingResourceClaim`, `EnvSecretMissing`, `ImageResolved`,
+`PublicRouteReady`, `MigrationPending` all reach `status.conditions` and are
+rendered by `apprafter app status`.
+
+What vanishes is the **undesigned** failure — the one that reaches
+`error_policy` through a `?`. And those are precisely the ones nobody
+anticipated, so they are the ones worth reporting.
+
+`error_policy` (`operator-controllers/application/src/lib.rs:1018-1031`) is the
+whole of it:
+
+```rust
+warn!(%name, %namespace, %err, "reconcile error");
+ctx.metrics.reconcile_total.with_label_values(&[KIND, &namespace, "error"]).inc();
+ctx.metrics.reconcile_errors.with_label_values(&[KIND]).inc();
+Action::requeue(Duration::from_secs(30))
+```
+
+A log line, two counters, a retry. No Event, no condition, no status write.
+There are **48** `?`/`return Err` sites in that reconcile funnelling into it,
+and **2** `recorder.publish` calls in the whole controller — both advisory
+notices about design-time choices (`SoftDestructiveChange`,
+`SelectorChangeUnderMultipleProviders`), neither about a failure.
+
+The Prometheus counter is real but answers the wrong question: it says *how
+many* errors, cluster-wide, never *which object* or *what happened*.
+
+### What it cost, concretely
+
+The 2.22b walk. The prune issued a delete, the apiserver refused it 403
+because the branch RBAC had not reached the cluster, the operator warned and
+retried — correctly, per the ADR 0048 lesson that a decorative failure must
+not freeze a reconcile. The result was a **silent no-op**: `app status` said
+Ready, the Application's conditions were clean, and the claim simply never
+went away. Three runs and a log read to find it.
+
+The same shape has now cost this project four times: the ADR 0048 anchor 403,
+the 0.2.31 MigrationPlan GC, D15's plan rejection loop, and this. Every one
+was a repeating error visible only in the log.
+
+### The proposal
+
+Keep the last few problems on the object, with expiry, and print them where an
+operator already looks — the owner's framing, and it maps onto machinery that
+mostly exists.
+
+- **Emit a Kubernetes Event from `error_policy`.** It is the single choke
+  point: every one of those 48 paths passes through it, so one change covers
+  them all — the same leverage as classifying at the kubectl/restic choke
+  points in 2.22a. Events bring dedup, `count`, `firstTimestamp`/`lastTimestamp`
+  and apiserver-side TTL for free, so "predict expiry" needs no new mechanism.
+  **RBAC note:** the operator holds `create` on events and nothing else
+  (`rbac.yaml:521-526`); reading them back needs `get`/`list`, and that verb
+  ships with the code that needs it.
+- **Keep a bounded `status.recentProblems[]`** alongside, because the event TTL
+  (an hour by default) is shorter than the interval of a slow-recurring
+  failure, and because a condition on the object survives an event GC that a
+  reader cannot control. Bounded — last N distinct reasons with `lastSeen` —
+  so it cannot grow without limit, and pruned by age so a fixed problem does
+  not linger as a scar.
+- **Print both in `apprafter app status` and `apprafter platform status`.** No
+  CLI surface reads Events today at all (a repo-wide grep for an events read in
+  `cli/` returns nothing), so the platform emits two events that no first-class
+  surface has ever shown.
+
+Two things to get right. A recurring error must **deduplicate rather than
+spam** — thirty-second retries would otherwise write a status update twice a
+minute forever, which is its own kind of damage. And a problem that stops
+recurring must **age out on its own**, or the surface becomes a list of things
+that used to be wrong, which readers learn to ignore.
+
+Ships with a walk assertion that a deliberately-induced reconcile failure —
+the 403 is the obvious fixture, since it is reproducible by withholding one
+RBAC verb — shows up in `app status` without reading a log.
 
