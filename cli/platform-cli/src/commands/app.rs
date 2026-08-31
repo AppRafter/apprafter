@@ -1723,6 +1723,24 @@ pub(crate) fn backing_resource(claim: &Value) -> String {
         .pointer("/status/volumeClaimRef")
         .and_then(Value::as_str)
     {
+        // 2.22d (D8): an owned disk is the ONE claim shape with its own
+        // denominator, so a percentage here means something. A pg or redis
+        // claim is a tenant of a shared backend, where a per-tenant byte
+        // count has no per-tenant limit to be read against — those rows name
+        // the backend, and the backend's own fullness is reported where the
+        // backend lives.
+        let used = claim
+            .pointer("/status/capacity/usedBytes")
+            .and_then(Value::as_i64);
+        let cap = claim
+            .pointer("/status/capacity/capacityBytes")
+            .and_then(Value::as_i64);
+        if let (Some(used), Some(cap)) = (used, cap) {
+            if cap > 0 {
+                let pct = (used as f64 / cap as f64 * 100.0).round() as i64;
+                return format!("pvc/{pvc} ({pct}% full)");
+            }
+        }
         return format!("pvc/{pvc}");
     }
     "—".to_string()
@@ -4249,6 +4267,29 @@ mod backing_tests {
     #[test]
     fn a_disk_claim_names_its_pvc() {
         let c = json!({ "status": { "volumeClaimRef": "web-disk-data" }});
+        assert_eq!(backing_resource(&c), "pvc/web-disk-data");
+    }
+
+    #[test]
+    fn a_disk_claim_reports_how_full_its_own_volume_is() {
+        // The one claim shape with its own denominator: an owned PVC has a
+        // capacity of its own, so a percentage is a judgement rather than a
+        // number floating free.
+        let c = json!({ "status": {
+            "volumeClaimRef": "web-disk-data",
+            "capacity": { "usedBytes": 91, "capacityBytes": 100 }
+        }});
+        assert_eq!(backing_resource(&c), "pvc/web-disk-data (91% full)");
+    }
+
+    #[test]
+    fn a_zero_capacity_sample_is_not_rendered_as_a_percentage() {
+        // A capacity of zero is an unusable sample, not an empty disk. The
+        // row falls back to naming the PVC rather than dividing by it.
+        let c = json!({ "status": {
+            "volumeClaimRef": "web-disk-data",
+            "capacity": { "usedBytes": 5, "capacityBytes": 0 }
+        }});
         assert_eq!(backing_resource(&c), "pvc/web-disk-data");
     }
 

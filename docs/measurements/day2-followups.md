@@ -1111,9 +1111,30 @@ expose one.
    answers the easy half of the question the column exists for and reads as if
    it had answered both.
 
-   **Still open:** per-claim capacity needs the operator to sample it and write
-   it to the claim status, the way `SharedVolume.status.capacity` already
-   works. Database size needs a query per backend on top of that.
+   **Then done properly, same day, after asking what actually blocked it.**
+   The provisioner now samples an owned disk's own PVC while provisioning it —
+   the kubelet Summary call it already makes for SharedVolumes — and writes
+   `status.capacity` on the claim, which `app status` renders as
+   `pvc/<name> (91% full)`.
+
+   **Disk only, and that is the finding rather than a shortcut.** An owned
+   disk has its own PVC and therefore its own denominator, so a percentage is
+   a judgement. A `pg` or `redis` claim is a tenant of a *shared* backend:
+   `pg_database_size` would give bytes with no per-tenant limit to read them
+   against, and a tenant at 3 GB is fine or fatal depending on a shared PVC it
+   does not own. The actionable figure there is the backend's own fullness,
+   which is a backend-level fact and is sampled where the backend lives.
+
+   Two further costs that argued the same way. The operator has **no SQL
+   client at all** — it drives CNPG declaratively through CRs — so per-database
+   size means a new connection path, tenant credentials held in-process, and a
+   new failure surface inside a reconcile loop. And Dragonfly does not report
+   per-DB memory: `DBSIZE` counts keys, and the limit that matters is the
+   instance's `--maxmemory`.
+
+   Per-tenant size for a shared backend remains worth having as **cost
+   attribution** — which is where `spec.md` §7 already files it — and is a
+   different feature from a capacity signal.
 
 Ships with: a walk that fills a node past the threshold and asserts the warning
 appears on an unrelated command (not just on `volume status`), and a walk step

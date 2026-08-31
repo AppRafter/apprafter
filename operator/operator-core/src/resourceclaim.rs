@@ -45,6 +45,16 @@ pub struct ResourceClaimSpec {
     pub persistent: Option<bool>,
 }
 
+/// Bytes used and available on the volume backing a `disk` claim
+/// (2.22d / D8).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct ClaimCapacity {
+    #[serde(rename = "usedBytes")]
+    pub used_bytes: i64,
+    #[serde(rename = "capacityBytes")]
+    pub capacity_bytes: i64,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub struct ResourceClaimStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -76,6 +86,16 @@ pub struct ResourceClaimStatus {
         rename = "volumeClaimRef"
     )]
     pub volume_claim_ref: Option<String>,
+    /// Used and total bytes of the volume backing this claim (2.22d / D8).
+    ///
+    /// Set for `disk` claims only, and deliberately so. An owned disk has
+    /// its OWN PVC and therefore its own denominator, which makes a
+    /// fraction meaningful. A `pg` or `redis` claim lives on a SHARED
+    /// backend, where a per-tenant number has no per-tenant limit to be
+    /// measured against — the actionable figure there is the backend's own
+    /// fullness, not the tenant's slice of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<ClaimCapacity>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]

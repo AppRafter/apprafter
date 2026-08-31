@@ -46,7 +46,7 @@ pub use platform_stack::{
     ResourceQuantities,
 };
 pub use resourceclaim::{
-    ResourceClaim, ResourceClaimCondition, ResourceClaimSpec, ResourceClaimStatus,
+    ClaimCapacity, ResourceClaim, ResourceClaimCondition, ResourceClaimSpec, ResourceClaimStatus,
 };
 pub use retainedclaim::{ClaimRef, RetainedClaim, RetainedClaimSpec};
 pub use serviceprovider::{ServiceProvider, ServiceProviderSpec, ServiceProviderStatus};

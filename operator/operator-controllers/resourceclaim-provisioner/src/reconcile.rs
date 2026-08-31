@@ -376,10 +376,11 @@ async fn provision_cloudnativepg(
         &ctx.client,
         ns,
         name,
-        Some(&conn_secret_name),
-        None,
         cond,
-        None,
+        ClaimStatusFields {
+            conn_secret_name: Some(&conn_secret_name),
+            ..Default::default()
+        },
     )
     .await?;
 
@@ -705,10 +706,12 @@ async fn provision_dragonfly(
         &ctx.client,
         ns,
         name,
-        Some(&conn_secret_name),
-        None,
         cond,
-        Some((&instance, dbnum)),
+        ClaimStatusFields {
+            conn_secret_name: Some(&conn_secret_name),
+            allocation: Some((&instance, dbnum)),
+            ..Default::default()
+        },
     )
     .await?;
 
@@ -820,7 +823,24 @@ async fn provision_disk(
         &format!("provisioned PVC {pvc_name} (class {storage_class})"),
         &prior,
     );
-    patch_status(&ctx.client, ns, name, None, Some(&pvc_name), cond, None).await?;
+    // 2.22d (D8): sample this claim's OWN volume while we are here. An owned
+    // disk has its own PVC and therefore its own denominator, which is what
+    // makes a fraction meaningful — unlike a tenant slice of a shared
+    // backend. Best-effort: an unreadable kubelet leaves capacity absent
+    // rather than failing a provision that otherwise succeeded.
+    let capacity = sample_claim_volume(ctx, &pvc_name).await;
+    patch_status(
+        &ctx.client,
+        ns,
+        name,
+        cond,
+        ClaimStatusFields {
+            volume_claim_ref: Some(&pvc_name),
+            capacity,
+            ..Default::default()
+        },
+    )
+    .await?;
 
     ctx.metrics
         .claim_provisioned_total
@@ -921,7 +941,7 @@ async fn provision_shared_disk(
             &format!("SharedVolume {sv_name} not ready"),
             &prior,
         );
-        patch_status(&ctx.client, ns, name, None, None, cond, None).await?;
+        patch_status(&ctx.client, ns, name, cond, ClaimStatusFields::default()).await?;
         return Ok(Action::requeue(Duration::from_secs(30)));
     };
 
@@ -934,7 +954,19 @@ async fn provision_shared_disk(
         &format!("bound SharedVolume {sv_name} PVC {pvc_ref}"),
         &prior,
     );
-    patch_status(&ctx.client, ns, name, None, Some(&pvc_ref), cond, None).await?;
+    let capacity = sample_claim_volume(ctx, &pvc_ref).await;
+    patch_status(
+        &ctx.client,
+        ns,
+        name,
+        cond,
+        ClaimStatusFields {
+            volume_claim_ref: Some(&pvc_ref),
+            capacity,
+            ..Default::default()
+        },
+    )
+    .await?;
 
     ctx.metrics
         .claim_provisioned_total
@@ -1330,13 +1362,36 @@ pub(crate) const GC_ROLE_RMW_RETRIES: usize = ROLE_RMW_RETRIES;
 /// status in the terminal apply keeps all four fields owned — the same
 /// full-body re-send the crate uses in `cnpg.rs` / `gc.rs`. The CNPG path
 /// threads `None` (it owns no instance/dbnum) and is unaffected.
+/// The optional fields a claim-status apply may carry (2.22d).
+///
+/// Bundled rather than passed positionally because the list had grown to
+/// four `Option`s and every call site read `None, None, None` — a shape in
+/// which a miscount compiles cleanly and writes the wrong field. Named
+/// fields make each site say which half of the claim it is publishing.
+#[derive(Default, Clone, Copy)]
+struct ClaimStatusFields<'a> {
+    /// CNPG / dragonfly publish this; the disk backends do not.
+    conn_secret_name: Option<&'a str>,
+    /// The disk backends publish this; CNPG / dragonfly do not.
+    volume_claim_ref: Option<&'a str>,
+    /// Dragonfly's `(instance, dbnum)` allocation.
+    allocation: Option<(&'a str, u16)>,
+    /// Used/total bytes of the claim's own volume — disk claims only
+    /// (2.22d / D8), and absent when the sample failed.
+    capacity: Option<(i64, i64)>,
+}
+
 fn status_apply_body(
     name: &str,
-    conn_secret_name: Option<&str>,
-    volume_claim_ref: Option<&str>,
     cond: ResourceClaimCondition,
-    allocation: Option<(&str, u16)>,
+    fields: ClaimStatusFields<'_>,
 ) -> Value {
+    let ClaimStatusFields {
+        conn_secret_name,
+        volume_claim_ref,
+        allocation,
+        capacity,
+    } = fields;
     // `ready` is DERIVED from the Ready condition the caller passed (the
     // `cond` arg is always the `Ready` condition): `ready=true` iff the
     // condition is `True`. The success paths (CNPG / dragonfly / disk /
@@ -1361,6 +1416,13 @@ fn status_apply_body(
     if let Some(vcr) = volume_claim_ref {
         status["volumeClaimRef"] = json!(vcr);
     }
+    // 2.22d (D8): only sent when sampled, so a cycle that could not read the
+    // kubelet leaves the previous figure alone instead of pruning it to
+    // nothing. An absent capacity means "not measured this pass", which is
+    // different from "empty" and must not render as it.
+    if let Some((used, cap)) = capacity {
+        status["capacity"] = json!({ "usedBytes": used, "capacityBytes": cap });
+    }
     if let Some((instance, dbnum)) = allocation {
         status["instance"] = json!(instance);
         status["dbnum"] = json!(dbnum);
@@ -1378,17 +1440,35 @@ fn status_apply_body(
 /// `instance` / `dbnum` allocation. Never touches `provider` or
 /// `Scheduled`. See [`status_apply_body`] for why the allocation MUST ride
 /// the terminal apply.
+/// Used/total bytes of a claim's own PVC, sampled from the kubelet (2.22d / D8).
+///
+/// Only meaningful for an OWNED disk: it has its own PVC and therefore its
+/// own denominator. A `pg` or `redis` claim is a tenant of a shared backend,
+/// where a per-tenant byte count has no per-tenant limit to be read against,
+/// and the actionable figure is the backend's own fullness instead.
+///
+/// `None` on any failure — an unreadable kubelet leaves the previous figure
+/// alone rather than failing a provision that otherwise succeeded, and the
+/// status writer omits the field so SSA does not prune it.
+async fn sample_claim_volume(ctx: &Context, pvc_name: &str) -> Option<(i64, i64)> {
+    let nodes = Api::<k8s_openapi::api::core::v1::Node>::all(ctx.client.clone())
+        .list(&Default::default())
+        .await
+        .ok()?;
+    let node = nodes.items.first()?.name_any();
+    let summary = ctx.capacity.summary_for_node(&ctx.client, &node).await?;
+    operator_core::capacity::pvc_usage(&summary, pvc_name)
+}
+
 async fn patch_status(
     client: &Client,
     ns: &str,
     name: &str,
-    conn_secret_name: Option<&str>,
-    volume_claim_ref: Option<&str>,
     cond: ResourceClaimCondition,
-    allocation: Option<(&str, u16)>,
+    fields: ClaimStatusFields<'_>,
 ) -> Result<(), ReconcileError> {
     let api: Api<ResourceClaim> = Api::namespaced(client.clone(), ns);
-    let body = status_apply_body(name, conn_secret_name, volume_claim_ref, cond, allocation);
+    let body = status_apply_body(name, cond, fields);
     api.patch_status(name, &apply_params(), &Patch::Apply(&body))
         .await?;
     Ok(())
@@ -2046,10 +2126,12 @@ mod tests {
         let cond = ready_condition("True", "Provisioned", "ok", &[]);
         let body = status_apply_body(
             "web-redis",
-            Some("web-redis-conn"),
-            None,
             cond,
-            Some(("platform-redis-ephemeral-000", 7)),
+            ClaimStatusFields {
+                conn_secret_name: Some("web-redis-conn"),
+                allocation: Some(("platform-redis-ephemeral-000", 7)),
+                ..Default::default()
+            },
         );
         assert_eq!(body["status"]["ready"], true);
         assert_eq!(body["status"]["connectionSecretRef"], "web-redis-conn");
@@ -2065,7 +2147,14 @@ mod tests {
         // then carries only ready / connectionSecretRef / conditions, exactly
         // as before, so the pg path is unaffected.
         let cond = ready_condition("True", "Provisioned", "ok", &[]);
-        let body = status_apply_body("demo-web-pg", Some("demo-web-pg-conn"), None, cond, None);
+        let body = status_apply_body(
+            "demo-web-pg",
+            cond,
+            ClaimStatusFields {
+                conn_secret_name: Some("demo-web-pg-conn"),
+                ..Default::default()
+            },
+        );
         assert_eq!(body["status"]["ready"], true);
         assert_eq!(body["status"]["connectionSecretRef"], "demo-web-pg-conn");
         assert!(body["status"].get("instance").is_none());
@@ -2084,10 +2173,11 @@ mod tests {
         let cond = ready_condition("True", "Provisioned", "ok", &[]);
         let body = status_apply_body(
             "claim-demo-app-disk-data",
-            None,
-            Some("claim-demo-app-disk-data"),
             cond,
-            None,
+            ClaimStatusFields {
+                volume_claim_ref: Some("claim-demo-app-disk-data"),
+                ..Default::default()
+            },
         );
         assert_eq!(body["status"]["ready"], true);
         assert_eq!(body["status"]["volumeClaimRef"], "claim-demo-app-disk-data");
@@ -2115,7 +2205,7 @@ mod tests {
             "SharedVolume does-not-exist not ready",
             &[],
         );
-        let body = status_apply_body("web-shared-disk", None, None, cond, None);
+        let body = status_apply_body("web-shared-disk", cond, ClaimStatusFields::default());
         assert_eq!(
             body["status"]["ready"], false,
             "a Ready=False condition must yield ready:false"
