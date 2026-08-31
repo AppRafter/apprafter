@@ -33,6 +33,15 @@
 //! Secret the claim points at (`status.connectionSecretRef`) and reads the
 //! `pass` key ([`read_secret_key`]). This keeps the password in exactly one
 //! place (the connection Secret) — the same value the app uses.
+//!
+//! ## A second passenger: how much each tenant holds (2.22d / D8)
+//!
+//! The loop also samples each claim's `DBSIZE` and stamps it on
+//! `status.size.keys`, because it already holds everything that needs — the
+//! instance address and its admin password, resolved once per instance — and
+//! its cadence matches the window the Postgres size scrape is cached for, so
+//! the two figures age alike. See [`refresh_claim_keys`] for why the figure
+//! is a key count and not bytes.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,10 +70,11 @@ const RESYNC_INTERVAL: Duration = Duration::from_secs(300);
 /// ACL user to re-pin.
 const REDIS_TYPE: &str = "redis";
 
-/// One claim's ACL re-pin payload, derived purely from a live
-/// `ResourceClaim` (no I/O). The loop turns each of these into an `ACL
-/// SETUSER` after it recovers the password from the connection Secret.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One claim's per-tick payload, derived purely from a live `ResourceClaim`
+/// (no I/O). The loop turns each of these into an `ACL SETUSER` after it
+/// recovers the password from the connection Secret, and into a `DBSIZE`
+/// sample of the same claim's logical DB.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RepinSpec {
     /// The deterministic `$N` ACL username (`claim_<ns>_<name>_redis`).
     pub user: String,
@@ -75,6 +85,11 @@ pub struct RepinSpec {
     pub conn_secret_ref: String,
     /// The claim's namespace (where `conn_secret_ref` lives).
     pub claim_namespace: String,
+    /// The claim's own name — the object the size sample is written back to.
+    pub claim_name: String,
+    /// The size figure already on the claim, so the deadband can decide
+    /// whether a fresh sample is worth a write without a second read.
+    pub previous_size: Option<operator_core::ClaimSize>,
 }
 
 /// Pure decision: the set of claims to re-pin on `instance`.
@@ -112,6 +127,7 @@ pub fn claims_to_repin(claims: &[ResourceClaim], instance: &str) -> Vec<RepinSpe
             }
             let dbnum = st.dbnum?;
             let conn_secret_ref = st.connection_secret_ref.clone()?;
+            let previous_size = st.size.clone();
             let ns = c.namespace().unwrap_or_default();
             let name = c.name_any();
             Some(RepinSpec {
@@ -119,6 +135,8 @@ pub fn claims_to_repin(claims: &[ResourceClaim], instance: &str) -> Vec<RepinSpe
                 dbnum,
                 conn_secret_ref,
                 claim_namespace: ns,
+                claim_name: name,
+                previous_size,
             })
         })
         .collect()
@@ -280,6 +298,11 @@ pub async fn reconcile_instance_acls(
     );
 
     for spec in to_repin {
+        // Sample how much this tenant holds, before the ACL half — the two
+        // are independent, and an unreadable connection Secret should not
+        // also blind the size.
+        refresh_claim_keys(ctx, &addr, &admin_pw, &spec).await;
+
         // Recover this claim's password from its connection Secret's `pass`
         // key (2.12 decomposed format; the Secret is written by
         // `redis_connection_secret_object`). A missing Secret / key is
@@ -312,6 +335,69 @@ pub async fn reconcile_instance_acls(
         }
     }
     Ok(())
+}
+
+/// Refresh `status.size.keys` on one ready dragonfly claim (2.22d / D8).
+///
+/// # Why a key count and not bytes
+///
+/// Because a key count is the whole of what Dragonfly will honestly say
+/// about a single logical DB. The full reasoning — which routes exist, which
+/// look like sizes and are not, and what it would cost to get real bytes —
+/// is on [`crate::redis_client::RedisAdmin::dbsize`]. The short of it: the
+/// per-DB byte figures exist inside the server and are summed away at every
+/// point they could reach a client.
+///
+/// The CLI therefore renders this as `N keys`, never as a size. A number
+/// labelled in the wrong unit is worse than an absent one.
+///
+/// # Why it lives here
+///
+/// This loop already holds what the sample needs: the instance address and
+/// its admin password, read once per instance rather than once per claim.
+/// Its 300s cadence is also the right one — it matches the window the
+/// Postgres scrape is cached for, so the two figures age alike.
+///
+/// Best-effort throughout. An unreachable instance, a failed `SELECT`, a
+/// rejected patch: all are logged at debug and leave the previous figure
+/// alone. It must never disturb the ACL re-pin that is this loop's actual
+/// job, and it must never write a zero it did not measure — "not sampled"
+/// and "empty" are different facts about a tenant's data.
+async fn refresh_claim_keys(ctx: &Arc<Context>, addr: &str, admin_pw: &str, spec: &RepinSpec) {
+    let keys = match ctx.redis.dbsize(addr, admin_pw, spec.dbnum).await {
+        Ok(n) => n,
+        Err(err) => {
+            tracing::debug!(
+                user = %spec.user, dbnum = spec.dbnum, %err,
+                "DBSIZE sample failed — keeping the previous figure"
+            );
+            return;
+        }
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    if !crate::reconcile::keys_write_is_worth_it(spec.previous_size.as_ref(), keys, &now) {
+        return;
+    }
+    let api: Api<ResourceClaim> = Api::namespaced(ctx.client.clone(), &spec.claim_namespace);
+    let body = serde_json::json!({
+        "apiVersion": "apprafter.io/v1alpha1",
+        "kind": "ResourceClaim",
+        "metadata": { "name": spec.claim_name },
+        "status": { "size": { "keys": keys, "measuredAt": now } },
+    });
+    if let Err(e) = api
+        .patch_status(
+            &spec.claim_name,
+            &crate::reconcile::apply_params(),
+            &kube::api::Patch::Apply(&body),
+        )
+        .await
+    {
+        tracing::debug!(
+            name = %spec.claim_name, ns = %spec.claim_namespace, %e,
+            "key-count status write failed (retrying next tick)"
+        );
+    }
 }
 
 /// Resolve the dragonfly namespace from the FIRST `ServiceProvider` whose
@@ -445,8 +531,41 @@ mod tests {
                 dbnum: 7,
                 conn_secret_ref: "web-redis-conn".to_string(),
                 claim_namespace: "demo".to_string(),
+                claim_name: "web-redis".to_string(),
+                previous_size: None,
             }]
         );
+    }
+
+    #[test]
+    fn claims_to_repin_carries_the_previous_size_for_the_deadband() {
+        // The size sample runs inside this loop, so the figure already on
+        // the claim has to travel with the spec. Reading it back per claim
+        // would be a second apiserver round-trip on a path that already
+        // holds the object.
+        let mut c = redis_claim(
+            "demo",
+            "web-redis",
+            Some("platform-redis-ephemeral-000"),
+            Some(7),
+            Some(true),
+            Some("web-redis-conn"),
+        );
+        c.status.as_mut().unwrap().size = Some(operator_core::ClaimSize {
+            bytes: None,
+            keys: Some(4200),
+            measured_at: Some("2026-08-31T10:00:00+00:00".into()),
+        });
+        let repin = claims_to_repin(&[c], "platform-redis-ephemeral-000");
+        assert_eq!(repin.len(), 1);
+        assert_eq!(repin[0].claim_name, "web-redis");
+        assert_eq!(
+            repin[0].previous_size.as_ref().and_then(|s| s.keys),
+            Some(4200)
+        );
+        // And never a byte figure: the CLI renders `bytes` as a size, so a
+        // key count landing in that field would be shown in the wrong unit.
+        assert_eq!(repin[0].previous_size.as_ref().and_then(|s| s.bytes), None);
     }
 
     #[test]

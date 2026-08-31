@@ -1126,16 +1126,66 @@ expose one.
    does not own. The actionable figure there is the backend's own fullness,
    which is a backend-level fact and is sampled where the backend lives.
 
-   Two further costs that argued the same way. The operator has **no SQL
-   client at all** — it drives CNPG declaratively through CRs — so per-database
-   size means a new connection path, tenant credentials held in-process, and a
-   new failure surface inside a reconcile loop. And Dragonfly does not report
-   per-DB memory: `DBSIZE` counts keys, and the limit that matters is the
-   instance's `--maxmemory`.
+   Two further costs argued for deferring per-tenant size entirely. **Both
+   were wrong, and the owner rejected them the same day.**
 
-   Per-tenant size for a shared backend remains worth having as **cost
-   attribution** — which is where `spec.md` §7 already files it — and is a
-   different feature from a capacity signal.
+   *Corrected 2026-08-31, twice, both times after being pushed on it.*
+
+   The first correction is that the question had been conflated. "Am I about
+   to run out" needs a denominator; "how much data do I have" does not. The
+   second sizes a backup, shows growth and explains a bill on its own, and it
+   is the one that was asked for.
+
+   **Postgres — the objection collapsed on inspection.** The claim was that
+   the operator has no SQL client, so per-database size means a connection
+   path, tenant credentials held in-process and a new failure surface inside a
+   reconcile loop. But CloudNativePG's instance manager already runs a
+   Prometheus exporter on every instance pod, always on, and
+   `cnpg_pg_database_size_bytes{datname}` is one of its DEFAULT metrics. One
+   HTTP GET through the apiserver pod-proxy — the shape `operator-core::capacity`
+   already uses for the kubelet Summary API — returns every tenant database's
+   size from a single scrape. It is also *better* than the client that was
+   rejected, not merely cheaper: the exporter holds its own connection, so a
+   scrape costs nothing from the shared cluster's `max_connections`, which a
+   client of ours would have taken from the tenants it was measuring.
+
+   **Redis — the conclusion held, the reasoning did not.** The original text
+   ("Dragonfly does not report per-DB memory") was inferred from our own trait,
+   not from upstream. Re-derived against the v1.37.0 source and re-checked
+   against `main`, every route to per-logical-DB BYTES is genuinely closed:
+
+   - Per-DB byte figures *do* exist — `obj_memory_usage` and `table_mem_usage`
+     live per database in `Metrics.db_stats[i]` and are still in scope at the
+     very loop that emits the `db`-labelled metrics — but every emission site
+     sums across databases before printing. Nothing reaches a client per-DB.
+     Exposing them upstream is a ~3-line patch at an existing loop; the
+     blocker is that it is not upstreamed, not that the data is unreachable.
+   - All seven `db`-labelled Prometheus metrics are counters.
+   - Several `DEBUG` subcommands (`SEGMENTS`, `VALUES`, `TOPK`, `KEYS`,
+     `COMPRESSION`) genuinely *are* scoped to the selected DB — a fact the
+     first pass missed — but report slot capacity, logical lengths, or a
+     Huffman-training sample. `COMPRESSION`'s `raw_size` is the trap: it looks
+     like a byte total and is not, being truncated at 512 bytes per key,
+     aborted mid-scan at a frequency cap with no flag in the reply, blind to
+     anything stored inline (all keys ≤16 bytes contribute zero), and limited
+     to one value type per call.
+   - `INFO MEMORY` *is* scoped to the caller's dragonfly NAMESPACE, so
+     namespaces would answer this. But on this version a non-default namespace
+     is not snapshotted, not exported to `/metrics`, gets no TTL expiry or
+     eviction, and — because the replication journal carries no namespace — is
+     replayed into the replica's default namespace. That route costs data, not
+     just accuracy.
+   - No released version helps: `main` does not have it, `INFO KEYSPACE` is
+     byte-identical from v1.37.0 through current `main`, and there is no open
+     or merged upstream PR adding it.
+
+   So redis reports a **key count**, and the CLI labels it `keys` rather than
+   rendering it as a size. Real bytes would need the upstream patch or one
+   Dragonfly instance per claim — which is ADR 0042 reversed, at 320Mi per
+   tenant, and is not worth it on T1.
+
+   Per-tenant size as **cost attribution** — where `spec.md` §7 files it —
+   remains a separate feature from this capacity signal.
 
 Ships with: a walk that fills a node past the threshold and asserts the warning
 appears on an unrelated command (not just on `volume status`), and a walk step

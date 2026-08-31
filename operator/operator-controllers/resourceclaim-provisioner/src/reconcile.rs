@@ -1548,21 +1548,85 @@ pub fn size_write_is_worth_it(
     now_rfc3339: &str,
 ) -> bool {
     let Some(prev) = previous else { return true };
-    let Some(prev_bytes) = prev.bytes else {
-        return true;
+    figure_write_is_worth_it(
+        prev.bytes,
+        prev.measured_at.as_deref(),
+        bytes,
+        BYTES_DEADBAND,
+        now_rfc3339,
+    )
+}
+
+/// Whether a new Dragonfly key count is worth a status write (2.22d / D8).
+///
+/// The redis figure is sampled from the ACL resync loop, which sleeps on a
+/// fixed interval rather than waking on `resourceVersion`, so the deadband
+/// here is not guarding against the write loop the Postgres one guards
+/// against — it is just declining to churn an object every five minutes for
+/// a number that did not move.
+pub fn keys_write_is_worth_it(
+    previous: Option<&operator_core::ClaimSize>,
+    keys: i64,
+    now_rfc3339: &str,
+) -> bool {
+    let Some(prev) = previous else { return true };
+    figure_write_is_worth_it(
+        prev.keys,
+        prev.measured_at.as_deref(),
+        keys,
+        KEYS_DEADBAND,
+        now_rfc3339,
+    )
+}
+
+/// A move of more than a mebibyte is worth recording whatever the database's
+/// size, so a large one is not held to a proportional threshold it would
+/// take gigabytes to cross.
+const BYTES_DEADBAND: i64 = 1_048_576;
+
+/// The same role for a key count. Small enough that a tenant watching their
+/// cache fill sees it move, large enough that ordinary churn on a busy
+/// keyspace does not rewrite the object on every tick.
+const KEYS_DEADBAND: i64 = 100;
+
+/// The deadband itself, over one figure and its own absolute threshold.
+///
+/// Shared by both sampled figures so bytes and keys cannot drift into
+/// different write cadences.
+///
+/// Writes when there is no previous figure, when it moved materially, or
+/// when the last sample is over an hour old. "Material" is a move past
+/// `absolute` OR past 1% — the two clauses cover each other, since the
+/// proportional one is useless on a tiny figure and the absolute one is
+/// useless on a huge one.
+///
+/// Crossing zero is always material and is handled first. For bytes that is
+/// a formality, since an empty Postgres database still occupies megabytes;
+/// for keys it is the common case, because an empty logical DB is a normal
+/// steady state, and without this clause a tenant's first writes would show
+/// up only when the staleness timer eventually fired.
+fn figure_write_is_worth_it(
+    previous: Option<i64>,
+    previous_measured_at: Option<&str>,
+    sample: i64,
+    absolute: i64,
+    now_rfc3339: &str,
+) -> bool {
+    let Some(prev) = previous else { return true };
+    let material = if prev == 0 || sample == 0 {
+        prev != sample
+    } else {
+        let delta = (sample - prev).abs();
+        delta > absolute || delta * 100 / prev >= 1
     };
-    let delta = (bytes - prev_bytes).abs();
-    if delta > 1_048_576 || (prev_bytes > 0 && delta * 100 / prev_bytes >= 1) {
+    if material {
         return true;
     }
-    let stale = prev
-        .measured_at
-        .as_deref()
+    previous_measured_at
         .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
         .zip(chrono::DateTime::parse_from_rfc3339(now_rfc3339).ok())
         .map(|(then, now)| (now - then).num_seconds() > 3600)
-        .unwrap_or(true);
-    stale
+        .unwrap_or(true)
 }
 
 /// Used/total bytes of a claim's own PVC, sampled from the kubelet (2.22d / D8).
@@ -2042,6 +2106,118 @@ mod tests {
             Some(&prev),
             100_000_000,
             "2026-08-31T11:00:00+00:00"
+        ));
+    }
+
+    /// A previous key-count figure, as the ACL loop reads it off the claim.
+    fn prev_keys(keys: i64, measured_at: &str) -> operator_core::ClaimSize {
+        operator_core::ClaimSize {
+            bytes: None,
+            keys: Some(keys),
+            measured_at: Some(measured_at.into()),
+        }
+    }
+
+    #[test]
+    fn a_tenants_first_key_writes_immediately() {
+        // The clause this exists for. An empty logical DB is a perfectly
+        // normal steady state for redis, so `prev == 0` is common — and with
+        // only the proportional and absolute clauses, a tenant's first
+        // writes would show up when the staleness timer fired an hour later.
+        // Postgres never hits this, because an empty database still occupies
+        // megabytes; that is why the old rule survived without it.
+        let prev = prev_keys(0, "2026-08-31T10:00:00+00:00");
+        assert!(keys_write_is_worth_it(
+            Some(&prev),
+            1,
+            "2026-08-31T10:05:00+00:00"
+        ));
+    }
+
+    #[test]
+    fn a_flushed_keyspace_writes_immediately() {
+        // The same crossing in the other direction: a tenant who cleared
+        // their cache should not keep reading as full for an hour.
+        let prev = prev_keys(5_000, "2026-08-31T10:00:00+00:00");
+        assert!(keys_write_is_worth_it(
+            Some(&prev),
+            0,
+            "2026-08-31T10:05:00+00:00"
+        ));
+    }
+
+    #[test]
+    fn a_steady_empty_keyspace_still_refreshes_when_stale() {
+        // Zero-to-zero is not a move, so it must fall through to the
+        // staleness clause rather than being answered by the crossing check.
+        // Otherwise an idle claim's measuredAt ages forever and the tenant
+        // cannot tell "empty" from "we stopped looking".
+        let prev = prev_keys(0, "2026-08-31T09:00:00+00:00");
+        assert!(!keys_write_is_worth_it(
+            Some(&prev),
+            0,
+            "2026-08-31T09:05:00+00:00"
+        ));
+        assert!(keys_write_is_worth_it(
+            Some(&prev),
+            0,
+            "2026-08-31T11:00:00+00:00"
+        ));
+    }
+
+    #[test]
+    fn ordinary_churn_on_a_busy_keyspace_does_not_write() {
+        // 20 keys on a 100k keyspace is neither 100 keys nor 1%.
+        let prev = prev_keys(100_000, "2026-08-31T10:00:00+00:00");
+        assert!(!keys_write_is_worth_it(
+            Some(&prev),
+            100_020,
+            "2026-08-31T10:05:00+00:00"
+        ));
+        assert!(keys_write_is_worth_it(
+            Some(&prev),
+            101_500,
+            "2026-08-31T10:05:00+00:00"
+        ));
+    }
+
+    #[test]
+    fn a_first_key_sample_always_writes() {
+        assert!(keys_write_is_worth_it(None, 0, "2026-08-31T10:00:00Z"));
+        // A claim that has only ever carried a byte figure has no key
+        // figure to compare against, so the first key sample is new.
+        let bytes_only = operator_core::ClaimSize {
+            bytes: Some(1000),
+            keys: None,
+            measured_at: Some("2026-08-31T10:00:00+00:00".into()),
+        };
+        assert!(keys_write_is_worth_it(
+            Some(&bytes_only),
+            42,
+            "2026-08-31T10:00:30+00:00"
+        ));
+    }
+
+    #[test]
+    fn the_two_figures_do_not_share_a_threshold() {
+        // A 200-key move is material; 200 bytes is not. If both ever read
+        // the same constant, one of the two would be wrong by orders of
+        // magnitude, and it would look correct in whichever test came first.
+        let keys = prev_keys(100_000, "2026-08-31T10:00:00+00:00");
+        assert!(keys_write_is_worth_it(
+            Some(&keys),
+            100_200,
+            "2026-08-31T10:05:00+00:00"
+        ));
+        let bytes = operator_core::ClaimSize {
+            bytes: Some(100_000_000),
+            keys: None,
+            measured_at: Some("2026-08-31T10:00:00+00:00".into()),
+        };
+        assert!(!size_write_is_worth_it(
+            Some(&bytes),
+            100_000_200,
+            "2026-08-31T10:05:00+00:00"
         ));
     }
 

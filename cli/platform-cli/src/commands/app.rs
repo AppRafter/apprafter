@@ -1725,9 +1725,12 @@ fn human_bytes(n: i64) -> String {
 ///
 ///  * a **disk** has its own PVC, so used/total and a percentage;
 ///  * **pg** reports on-disk BYTES, read from CNPG's own exporter;
-///  * **redis** reports a KEY COUNT and says so — Dragonfly accounts per-DB
-///    memory internally but sums across databases at every emission point,
-///    and the only routes to bytes walk the keyspace on shared shard threads.
+///  * **redis** reports a KEY COUNT and says so, because that is the whole
+///    of what Dragonfly will tell us about one logical DB: the per-DB byte
+///    figures exist inside the server but are summed across databases at
+///    every point they could reach a client, the `db`-labelled metrics are
+///    all counters, and the DB-scoped `DEBUG` subcommands report slot
+///    capacity or logical lengths rather than bytes.
 ///
 /// `—` when nothing has been measured. Never a zero: "not sampled" and
 /// "empty" are different, and rendering the first as the second tells a

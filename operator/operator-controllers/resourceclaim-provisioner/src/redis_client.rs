@@ -28,9 +28,9 @@ pub enum RedisAdminError {
         #[source]
         source: redis::RedisError,
     },
-    /// A command (`ACL SETUSER` / `ACL DELUSER` / `SELECT` / `FLUSHDB`)
-    /// failed on the wire. The command verb is named; arguments (which
-    /// include passwords for `SETUSER`) are NOT.
+    /// A command (`ACL SETUSER` / `ACL DELUSER` / `SELECT` / `FLUSHDB` /
+    /// `DBSIZE`) failed on the wire. The command verb is named; arguments
+    /// (which include passwords for `SETUSER`) are NOT.
     #[error("redis command {verb} failed on {addr}: {source}")]
     Command {
         verb: &'static str,
@@ -41,8 +41,9 @@ pub enum RedisAdminError {
 }
 
 /// Imperative Redis admin operations the provisioner + GC drive against a
-/// shared pool instance, authenticated as the instance admin user. All
-/// three are idempotent so re-reconciles and re-pins are safe.
+/// shared pool instance, authenticated as the instance admin user. All are
+/// idempotent (`dbsize` trivially so, being a read) — re-reconciles and
+/// re-pins are safe.
 #[async_trait]
 pub trait RedisAdmin: Send + Sync {
     /// Run `ACL SETUSER <args...>` on `addr` as the admin user. `args` is
@@ -70,6 +71,36 @@ pub trait RedisAdmin: Send + Sync {
     /// allocate + reclaim on GC — ADR 0042 §3/§8). Idempotent: flushing an
     /// empty DB is a no-op.
     async fn flushdb(&self, addr: &str, admin_pw: &str, dbnum: u16) -> Result<(), RedisAdminError>;
+
+    /// `SELECT <dbnum>; DBSIZE` on `addr` — the number of keys in one
+    /// tenant's logical DB (2.22d / D8).
+    ///
+    /// A COUNT, not bytes, and every caller must render it as such. That is
+    /// not a shortcut taken for convenience; it is the whole of what
+    /// Dragonfly will tell us about one `$N`, established by reading the
+    /// v1.37.0 source rather than assumed:
+    ///
+    ///  * per-DB byte figures DO exist — `obj_memory_usage` and
+    ///    `table_mem_usage` live per database in `Metrics.db_stats[i]`, and
+    ///    are still in scope at the very loop that emits the `db`-labelled
+    ///    metrics — but every emission site sums across databases before
+    ///    printing, so nothing reaches a client per-DB;
+    ///  * the seven `db`-labelled Prometheus metrics are all counters;
+    ///  * several `DEBUG` subcommands (`SEGMENTS`, `VALUES`, `TOPK`, `KEYS`,
+    ///    `COMPRESSION`) genuinely ARE scoped to the selected DB, but report
+    ///    slot capacity, logical lengths or a truncated Huffman-training
+    ///    sample — none is a byte total, and `COMPRESSION`'s `raw_size` is
+    ///    the dangerous one, because it looks like a size and is not;
+    ///  * `INFO MEMORY` is scoped to the caller's dragonfly NAMESPACE, which
+    ///    would work, but on this version a non-default namespace is not
+    ///    snapshotted, not exported, and — because the replication journal
+    ///    carries no namespace — is replayed into the replica's default
+    ///    namespace. That route costs data, not just accuracy.
+    ///
+    /// So the honest per-tenant figure is the key count, and the CLI labels
+    /// it `keys`. Bytes would need either a ~3-line upstream patch at the
+    /// existing per-db emission loop, or one Dragonfly instance per claim.
+    async fn dbsize(&self, addr: &str, admin_pw: &str, dbnum: u16) -> Result<i64, RedisAdminError>;
 }
 
 /// Production [`RedisAdmin`] over the `redis` crate's async multiplexed
@@ -191,6 +222,27 @@ impl RedisAdmin for RedisClient {
                 source,
             })
     }
+
+    async fn dbsize(&self, addr: &str, admin_pw: &str, dbnum: u16) -> Result<i64, RedisAdminError> {
+        let mut conn = self.connect(addr, admin_pw).await?;
+        redis::cmd("SELECT")
+            .arg(dbnum)
+            .query_async::<()>(&mut conn)
+            .await
+            .map_err(|source| RedisAdminError::Command {
+                verb: "SELECT",
+                addr: addr.to_string(),
+                source,
+            })?;
+        redis::cmd("DBSIZE")
+            .query_async::<i64>(&mut conn)
+            .await
+            .map_err(|source| RedisAdminError::Command {
+                verb: "DBSIZE",
+                addr: addr.to_string(),
+                source,
+            })
+    }
 }
 
 /// Test double for [`RedisAdmin`] that records every call instead of
@@ -204,6 +256,11 @@ pub struct FakeRedis {
     pub setuser_calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
     pub deluser_calls: std::sync::Mutex<Vec<(String, String)>>,
     pub flushdb_calls: std::sync::Mutex<Vec<(String, u16)>>,
+    pub dbsize_calls: std::sync::Mutex<Vec<(String, u16)>>,
+    /// What [`RedisAdmin::dbsize`] answers. `None` makes the call FAIL,
+    /// so a test can drive the unreachable-instance path — the one that
+    /// must leave the previous figure alone rather than stamping a zero.
+    pub dbsize_answer: std::sync::Mutex<Option<i64>>,
 }
 
 #[cfg(test)]
@@ -247,11 +304,41 @@ impl RedisAdmin for FakeRedis {
             .push((addr.to_string(), dbnum));
         Ok(())
     }
+
+    async fn dbsize(
+        &self,
+        addr: &str,
+        _admin_pw: &str,
+        dbnum: u16,
+    ) -> Result<i64, RedisAdminError> {
+        self.dbsize_calls
+            .lock()
+            .unwrap()
+            .push((addr.to_string(), dbnum));
+        self.dbsize_answer
+            .lock()
+            .unwrap()
+            .ok_or_else(|| RedisAdminError::Command {
+                verb: "DBSIZE",
+                addr: addr.to_string(),
+                source: redis::RedisError::from((redis::ErrorKind::IoError, "fake instance down")),
+            })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_unreachable_instance_fails_dbsize_rather_than_answering_zero() {
+        // The default answer is absent, and absent must be an ERROR, not a
+        // zero. A zero would be written to the claim as "this tenant holds
+        // nothing" — a confident statement about someone's data, made
+        // because we could not reach the server.
+        let fake = FakeRedis::default();
+        assert!(fake.dbsize("h:6379", "pw", 7).await.is_err());
+    }
 
     #[tokio::test]
     async fn fake_redis_records_each_call() {
@@ -261,6 +348,12 @@ mod tests {
             .await
             .unwrap();
         fake.acl_deluser("h:6379", "pw", "u").await.unwrap();
+        *fake.dbsize_answer.lock().unwrap() = Some(4200);
+        assert_eq!(fake.dbsize("h:6379", "pw", 7).await.unwrap(), 4200);
+        assert_eq!(
+            fake.dbsize_calls.lock().unwrap().as_slice(),
+            &[("h:6379".to_string(), 7)]
+        );
         assert_eq!(
             fake.flushdb_calls.lock().unwrap().as_slice(),
             &[("h:6379".to_string(), 7)]
