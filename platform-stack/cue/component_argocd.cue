@@ -139,6 +139,32 @@ _components: argocd: #Component & {
 				  kinds: ["VerticalPodAutoscalerCheckpoint"]
 				"""
 
+			// ADR 0059: the pinned branch is keyed on the pin
+			// marker ALONE and sits ABOVE both `Ready` and the
+			// `Progressing` fall-through -- not nested under a
+			// phase check. Nested, the tile would read
+			// `Progressing` exactly while a rollback rolls pods,
+			// which is the one moment someone is looking at it.
+			//
+			// It sits BELOW `AwaitingMigrationApproval` on
+			// purpose: that state needs an operator action, a pin
+			// is a deliberate hold, and the more urgent one wins
+			// when an app is somehow both.
+			//
+			// `Suspended`, never `Degraded` -- a pinned app is held,
+			// not broken, and `Degraded` would trip health-gated
+			// automation and alerting. Two limits worth knowing,
+			// both from gitops-engine at the shipped version:
+			// `Suspended` is the SECOND-healthiest code, so it
+			// overrides `Healthy` and nothing else -- the pin is
+			// invisible on the tile whenever a sibling managed
+			// resource is `Progressing`, including a repository
+			// that renders several apps into one Argo Application.
+			// And a permanently-`Suspended` managed resource hangs
+			// a sync operation whose task set spans more than one
+			// wave or phase; the shipped app shape (one CR, no
+			// waves, no hooks, no managedNamespaceMetadata) does
+			// not, and that is an invariant to keep.
 			"resource.customizations.health.apprafter.io_Application": """
 				hs = {}
 				if obj.status ~= nil and obj.status.phase ~= nil then
@@ -155,11 +181,23 @@ _components: argocd: #Component & {
 				    end
 				    return hs
 				  end
-				  if obj.status.phase == "Ready" then
-				    hs.status = "Healthy"
-				    hs.message = "Reconcile complete"
+				end
+				if obj.status ~= nil and obj.status.image ~= nil and obj.status.image.pinned ~= nil then
+				  local ref = obj.status.image.pinned.resolved
+				  if ref ~= nil then
+				    hs.status = "Suspended"
+				    local tag = "its tag"
+				    if obj.status.image.tag ~= nil then
+				      tag = obj.status.image.tag
+				    end
+				    hs.message = "Pinned to " .. ref .. " by rollback; not following " .. tag
 				    return hs
 				  end
+				end
+				if obj.status ~= nil and obj.status.phase == "Ready" then
+				  hs.status = "Healthy"
+				  hs.message = "Reconcile complete"
+				  return hs
 				end
 				hs.status = "Progressing"
 				hs.message = "Awaiting controller reconcile"

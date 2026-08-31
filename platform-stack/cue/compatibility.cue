@@ -1760,6 +1760,59 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.59": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.45"
+	notes: """
+		Three day-2 signals that nobody received, and the recovery path for a
+		moving-tag deploy (2.22c/2.22d/2.22e; D6/D8/D10/D9 in the day-2 ledger).
+
+		ROLLING BACK A MOVING TAG NOW WORKS, AND IT PINS (ADR 0059). `apprafter app
+		rollback` used to patch the Git revision only, so after a same-tag push it
+		reported success and did nothing — the exact case a developer is in after
+		shipping a bad build through `:latest`. It now retains the previously
+		resolved digest and holds the application at it. That is a MODE CHANGE by
+		necessity: set the workload back without pinning and the next reconcile
+		re-resolves the tag and rolls the bad build forward inside 60 seconds.
+
+		A PINNED APPLICATION STOPS RECEIVING NEW BUILDS until `apprafter app unpin`.
+		It is stated in `app status` in yellow, in `platform status`, in the
+		`ImageResolved` condition (now `True/Pinned`), and on the Argo CD tile as
+		`Suspended`. The pin lives outside Git on purpose — a pin written into the
+		manifest would be a lie about intent — which is also why it is invisible to
+		a reader of the repository and why all four surfaces exist.
+
+		`status.image` STOPS BEING DELETED ON A PAUSE. Five status builders pruned
+		it whenever an application entered a MigrationPlan gate, a claim pause,
+		`EnvSecretMissing` or an invalid spec. Harmless while nothing read it;
+		fatal once it holds the rollback target, because it vanished exactly when
+		an application was in trouble.
+
+		A RIGHT-SIZING RECOMMENDATION NOW SAYS WHY IT WAS NOT APPLIED. The signal
+		ADR 0054 specified was built end to end and never fired — the only
+		production call site passed a hardcoded `false`. The operator now reads the
+		kubelet's own `PodResizePending` / `PodResizeInProgress` conditions, and
+		reports a cluster whose Kubernetes predates in-place resize instead of
+		leaving `updateMode: InPlace` silently actuating nothing.
+
+		DISK PRESSURE AND DATABASE SIZE REACH A HUMAN. The node-disk warning moved
+		off the optional `SharedVolume` onto the `PlatformStack` singleton and now
+		prints on every command; `app status` reports how full an owned disk is,
+		how many bytes a Postgres database holds (scraped from CNPG's own exporter)
+		and how many keys a Dragonfly tenant holds. Redis reports KEYS, not bytes:
+		per-database byte figures exist inside Dragonfly and are summed away at
+		every point they could reach a client.
+
+		CONFIG DRIFT IS VISIBLE WITHOUT ROLLING ANYTHING. `status.envConfig` records
+		when the resolved secret configuration last changed, so a pod started before
+		it is identifiably running older configuration — without putting the digest
+		on the pod template, which would roll every consumer on every secret change.
+
+		Requires a restart: new operator image. No CRD change — `status` carries
+		`x-kubernetes-preserve-unknown-fields`.
+		"""
+}
+
 compatibility: "0.2.58": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.44"

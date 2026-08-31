@@ -91,7 +91,67 @@ pub fn status(cached: bool) -> Result<()> {
     })?;
 
     print_status(&json, Utc::now());
+    print_pinned_applications(kc.path());
     Ok(())
+}
+
+/// List every application currently held at an image digest (ADR 0059).
+///
+/// Best-effort and silent on failure: this is a decorative addition to a
+/// command whose job is the platform's own version state, and an unreadable
+/// application list must not turn `platform status` into an error.
+///
+/// It exists because a pin is invisible to a reader of the Git repository, so
+/// without a cluster-wide view an operator would have to run `app status` per
+/// application to discover which ones have stopped receiving builds.
+fn print_pinned_applications(kubeconfig: &std::path::Path) {
+    let Ok(Some(list)) = kubectl_get_json("application.apprafter.io", None, None, kubeconfig)
+    else {
+        return;
+    };
+    let rows = pinned_app_rows(&list);
+    if rows.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "{}",
+        cli_core::style::warn(&format!(
+            "Pinned applications ({}) — held at a digest, NOT following their tag:",
+            rows.len()
+        ))
+    );
+    for row in rows {
+        println!("{}", cli_core::style::warn(&format!("  {row}")));
+    }
+}
+
+/// Pure: one line per pinned application in a `kubectl get -o json` list.
+///
+/// Reads `status.image.pinned`, which the operator writes only when the pin
+/// is HONOURED — a rejected pin must not appear here, or an operator would
+/// chase an application that is in fact still following its tag.
+pub(crate) fn pinned_app_rows(list: &Value) -> Vec<String> {
+    let Some(items) = list.get("items").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|app| {
+            let reference = app
+                .pointer("/status/image/pinned/resolved")
+                .and_then(Value::as_str)?;
+            let name = app
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            let ns = app
+                .pointer("/metadata/namespace")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            Some(format!("{ns}/{name}  {reference}"))
+        })
+        .collect()
 }
 
 /// Stamp the recheck-request annotation on the singleton
@@ -979,6 +1039,36 @@ mod tests {
     use serde_json::json;
 
     use chrono::TimeZone;
+
+    // ---- ADR 0059: pinned-application roll-up ----
+
+    #[test]
+    fn pinned_app_rows_lists_only_honoured_pins() {
+        // The middle app carries a pin ANNOTATION the operator rejected, so
+        // it has no `status.image.pinned` and is still following its tag.
+        // Listing it would send an operator chasing an application that is
+        // not actually held.
+        let list = json!({ "items": [
+            { "metadata": { "name": "web", "namespace": "demo" },
+              "status": { "image": { "pinned": { "resolved": "ghcr.io/acme/web@sha256:aaa" }}}},
+            { "metadata": { "name": "api", "namespace": "demo" },
+              "metadata2": {},
+              "status": { "image": { "tag": "ghcr.io/acme/api:latest" }}},
+            { "metadata": { "name": "worker", "namespace": "other" },
+              "status": { "image": { "pinned": { "resolved": "ghcr.io/acme/worker@sha256:bbb" }}}}
+        ]});
+        let rows = pinned_app_rows(&list);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].contains("demo/web"), "{:?}", rows);
+        assert!(rows[0].contains("sha256:aaa"), "{:?}", rows);
+        assert!(rows[1].contains("other/worker"), "{:?}", rows);
+    }
+
+    #[test]
+    fn pinned_app_rows_is_empty_when_nothing_is_pinned() {
+        assert!(pinned_app_rows(&json!({ "items": [] })).is_empty());
+        assert!(pinned_app_rows(&json!({})).is_empty());
+    }
 
     fn frozen_now() -> DateTime<Utc> {
         // A fixed reference moment so relative-date tests
