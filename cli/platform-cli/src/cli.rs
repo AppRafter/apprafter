@@ -444,6 +444,20 @@ pub enum SecretCommand {
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
+    /// List sealed secrets: where each one lives and which keys it
+    /// carries. Never prints a value — the key NAMES come from the
+    /// `SealedSecret`'s own `encryptedData` map, so nothing decrypts
+    /// and no `Secret` is read for its contents.
+    ///
+    /// Defaults to EVERY namespace, unlike `seal`: you reach for a
+    /// listing precisely when you do not know where something was
+    /// sealed. Narrow it with `--namespace`.
+    List {
+        /// Restrict to one namespace. Omit to search them all.
+        #[arg(long, short = 'n')]
+        namespace: Option<String>,
+    },
+
     /// Delete a `SealedSecret` and the `Secret` the controller
     /// unsealed from it, by name — so you don't `kubectl delete
     /// sealedsecret,secret` by hand. Idempotent (absent objects

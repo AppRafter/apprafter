@@ -17,8 +17,30 @@ Usage: apprafter secret <COMMAND>
 
 Subcommands:
 
+- [`apprafter secret list`](#apprafter-secret-list) — List sealed secrets: where each one lives and which keys it carries.
 - [`apprafter secret remove`](#apprafter-secret-remove) — Delete a `SealedSecret` and the `Secret` the controller unsealed from it, by name — so you don't `kubectl delete sealedsecret,secret` by hand.
 - [`apprafter secret seal`](#apprafter-secret-seal) — Seal one or more `--from-literal KEY=VALUE` pairs into a bitnami `SealedSecret`.
+
+## `apprafter secret list`
+
+List sealed secrets: where each one lives and which keys it carries. Never prints a value — the key NAMES come from the `SealedSecret`'s own `encryptedData` map, so nothing decrypts and no `Secret` is read for its contents.
+
+Defaults to EVERY namespace, unlike `seal`: you reach for a listing precisely when you do not know where something was sealed. Narrow it with `--namespace`.
+
+```text
+Usage: apprafter secret list [OPTIONS]
+```
+
+| Flag | Value | Default | Required | Description |
+| --- | --- | --- | --- | --- |
+| `--namespace`, `-n` | — | — | no | Restrict to one namespace. Omit to search them all |
+
+Examples:
+
+```sh
+apprafter secret list
+apprafter secret list --namespace <ns>
+```
 
 ## `apprafter secret remove`
 

@@ -227,6 +227,7 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
                 stdout,
                 yes,
             )?,
+            SecretCommand::List { namespace } => commands::secret::run_list(namespace.as_deref())?,
             SecretCommand::Remove {
                 name,
                 namespace,

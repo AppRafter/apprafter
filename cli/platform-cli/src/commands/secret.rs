@@ -341,3 +341,203 @@ mod tests {
         );
     }
 }
+
+/// One sealed secret as `secret list` renders it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealedSecretSummary {
+    pub namespace: String,
+    pub name: String,
+    /// Key NAMES, sorted. Read from the `SealedSecret`'s own
+    /// `spec.encryptedData` map, so nothing is decrypted and no `Secret`
+    /// is read for its contents — the names answer both questions
+    /// `EnvSecretMissing` raises without touching the material.
+    pub keys: Vec<String>,
+}
+
+/// Parse `kubectl get sealedsecrets -o json` into summaries.
+///
+/// Pure, so the shape is tested without a cluster. Tolerant by design: a
+/// SealedSecret with no `encryptedData` is a real state (sealed empty, or
+/// a hand-written CR) and renders with no keys rather than being dropped —
+/// a listing that silently omits an object is worse than one that shows an
+/// odd row, because the reader is here to find out where something is.
+pub fn parse_sealed_secret_summaries(v: &Value) -> Vec<SealedSecretSummary> {
+    let mut out: Vec<SealedSecretSummary> = v
+        .get("items")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|item| {
+            let name = item.pointer("/metadata/name")?.as_str()?.to_string();
+            let namespace = item
+                .pointer("/metadata/namespace")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let mut keys: Vec<String> = item
+                .pointer("/spec/encryptedData")
+                .and_then(Value::as_object)
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            keys.sort();
+            Some(SealedSecretSummary {
+                namespace,
+                name,
+                keys,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+    out
+}
+
+/// Render the table. Pure so the column maths is tested directly.
+pub fn render_secret_list(rows: &[SealedSecretSummary], scope: &str) -> String {
+    if rows.is_empty() {
+        return format!("No sealed secrets found in {scope}.\n");
+    }
+    let ns_w = rows
+        .iter()
+        .map(|r| r.namespace.len())
+        .max()
+        .unwrap_or(9)
+        .max(9);
+    let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(4).max(4);
+    let mut s = format!("Sealed secrets in {scope}:\n\n");
+    s.push_str(&format!(
+        "  {:<ns_w$}  {:<name_w$}  KEYS\n",
+        "NAMESPACE",
+        "NAME",
+        ns_w = ns_w,
+        name_w = name_w
+    ));
+    for r in rows {
+        let keys = if r.keys.is_empty() {
+            "(none)".to_string()
+        } else {
+            r.keys.join(", ")
+        };
+        s.push_str(&format!(
+            "  {:<ns_w$}  {:<name_w$}  {}\n",
+            r.namespace,
+            r.name,
+            keys,
+            ns_w = ns_w,
+            name_w = name_w
+        ));
+    }
+    s
+}
+
+/// `apprafter secret list` — where each sealed secret lives and what keys
+/// it carries.
+///
+/// D7: the operator's `EnvSecretMissing` used to ask two questions — is it
+/// in the wrong namespace, or is the key spelled differently — and the CLI
+/// could answer neither, so the guide reached for `kubectl` three times on
+/// a page whose whole subject is a first-class task. The condition message
+/// now names the cause; this command answers the same questions BEFORE an
+/// error rather than after.
+pub fn run_list(namespace: Option<&str>) -> Result<()> {
+    let kc = ensure_kubeconfig_tempfile()?;
+    let json = match namespace {
+        Some(ns) => kubectl_get_json("sealedsecrets", None, Some(ns), kc.path())?,
+        None => crate::commands::k8s_helpers::kubectl_get_json_cluster_wide(
+            "sealedsecrets",
+            None,
+            kc.path(),
+        )?,
+    };
+    let rows = json
+        .as_ref()
+        .map(parse_sealed_secret_summaries)
+        .unwrap_or_default();
+    let scope = match namespace {
+        Some(ns) => format!("namespace '{ns}'"),
+        None => "every namespace".to_string(),
+    };
+    print!("{}", render_secret_list(&rows, &scope));
+    Ok(())
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sealed(ns: &str, name: &str, keys: &[&str]) -> Value {
+        let mut enc = serde_json::Map::new();
+        for k in keys {
+            enc.insert((*k).to_string(), json!("AgB1c2VsZXNz"));
+        }
+        json!({
+            "metadata": { "name": name, "namespace": ns },
+            "spec": { "encryptedData": Value::Object(enc) }
+        })
+    }
+
+    #[test]
+    fn it_reads_key_names_without_touching_any_value() {
+        // The property that makes this command safe to run anywhere: the
+        // names come from the SealedSecret's OWN encryptedData map, so
+        // nothing decrypts and no Secret is read. The values in the
+        // fixture are ciphertext and never appear in the output.
+        let v = json!({ "items": [sealed("shop", "checkout", &["stripe-api-key", "webhook"])] });
+        let rows = parse_sealed_secret_summaries(&v);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].keys, vec!["stripe-api-key", "webhook"]);
+
+        let out = render_secret_list(&rows, "every namespace");
+        assert!(out.contains("stripe-api-key"), "{out}");
+        assert!(!out.contains("AgB1c2VsZXNz"), "ciphertext leaked: {out}");
+    }
+
+    #[test]
+    fn keys_are_sorted_so_the_output_is_stable() {
+        let v = json!({ "items": [sealed("shop", "c", &["zeta", "alpha", "mid"])] });
+        assert_eq!(
+            parse_sealed_secret_summaries(&v)[0].keys,
+            vec!["alpha", "mid", "zeta"]
+        );
+    }
+
+    #[test]
+    fn rows_are_sorted_by_namespace_then_name() {
+        let v = json!({ "items": [
+            sealed("shop", "b", &["k"]),
+            sealed("apprafter-system", "z", &["k"]),
+            sealed("shop", "a", &["k"]),
+        ]});
+        let rows = parse_sealed_secret_summaries(&v);
+        let got: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.namespace.as_str(), r.name.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("apprafter-system", "z"), ("shop", "a"), ("shop", "b")]
+        );
+    }
+
+    #[test]
+    fn a_sealed_secret_with_no_keys_is_shown_not_dropped() {
+        // A listing that silently omits an object is worse than one that
+        // shows an odd row: the reader is here to find out WHERE something
+        // is, and an omission answers "nowhere".
+        let v = json!({ "items": [{ "metadata": { "name": "empty", "namespace": "shop" } }] });
+        let rows = parse_sealed_secret_summaries(&v);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].keys.is_empty());
+        assert!(render_secret_list(&rows, "x").contains("(none)"));
+    }
+
+    #[test]
+    fn an_empty_result_says_where_it_looked() {
+        // "No sealed secrets found." with no scope leaves the reader
+        // unsure whether they searched the right place — which is the
+        // exact confusion this command exists to end.
+        let out = render_secret_list(&[], "namespace 'shop'");
+        assert!(out.contains("namespace 'shop'"), "{out}");
+    }
+}

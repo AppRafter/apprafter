@@ -436,6 +436,13 @@ pub const EXAMPLES: &[CommandExamples] = &[
         lines: &["apprafter secret remove <name> --namespace <ns> --yes"],
     },
     CommandExamples {
+        path: &["secret", "list"],
+        lines: &[
+            "apprafter secret list",
+            "apprafter secret list --namespace <ns>",
+        ],
+    },
+    CommandExamples {
         path: &["secret", "seal"],
         lines: &[
             "apprafter secret seal <name> --from-literal TOKEN=<value> --namespace <ns>",
