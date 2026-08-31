@@ -51,6 +51,18 @@ pub fn run(target_override: Option<&str>, dry_run: bool, server_type: Option<&st
         return Ok(());
     }
 
+    // D11 / 2.22a. Phase 1/3 creates billable resources; phase 3/3 is the
+    // first code to need `helm`. The provider layer already learned this one
+    // rung down — it validates the SKU against the live catalogue before any
+    // create, because a retired type used to fail mid-apply at step 4 and leak
+    // SSH-key + network + firewall state. Same lesson, one level up: check the
+    // binaries before spending anything. After the dry-run return, so a plan
+    // preview still works on a machine with neither installed.
+    cli_core::tools::preflight_tools(
+        &[&cli_core::tools::KUBECTL, &cli_core::tools::HELM],
+        "apprafter bootstrap-all",
+    )?;
+
     // Phase 1/3 — apply. No spinner: apply itself spends most of
     // its time inside `provider.apply()` calling the Hetzner REST
     // API, which logs through `tracing` to stderr; a spinner here

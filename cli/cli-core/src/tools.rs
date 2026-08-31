@@ -193,6 +193,19 @@ pub fn preflight_tool(tool: &Tool, needed_by: &str) -> Result<PathBuf, CliError>
     })
 }
 
+/// Assert every tool in `tools` is available, in order.
+///
+/// Reports the **first** missing one rather than collecting all of them:
+/// the reader installs it and re-runs, and a list of four things to
+/// install reads as a bigger problem than "you are missing restic".
+/// Order the slice so the most likely omission comes first.
+pub fn preflight_tools(tools: &[&Tool], needed_by: &str) -> Result<(), CliError> {
+    for tool in tools {
+        preflight_tool(tool, needed_by)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

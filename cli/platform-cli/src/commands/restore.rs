@@ -125,6 +125,23 @@ pub fn run_restore(
         ));
     }
 
+    // 0. External binaries, before the credential gate below.
+    //
+    //    D11 / 2.22a. The gate at step 1 had the right instinct and stopped
+    //    one rung too high: it refuses to provision on a bad passphrase, and
+    //    said nothing about a missing binary. `--reprovision` then runs a full
+    //    billable provision plus bootstrap, and the first `restic` spawn is in
+    //    the step AFTER it — so an absent restic used to cost a paid, running
+    //    Hetzner cluster before anything noticed. `helm` is only reachable on
+    //    the reprovision path (bootstrap installs the charts), so it is
+    //    demanded only there; restic and kubectl are needed by every mode.
+    let mut needed: Vec<&cli_core::tools::Tool> =
+        vec![&cli_core::tools::RESTIC, &cli_core::tools::KUBECTL];
+    if reprovision {
+        needed.push(&cli_core::tools::HELM);
+    }
+    cli_core::tools::preflight_tools(&needed, "apprafter restore")?;
+
     // 1. Passphrase + credentials (mandatory — the repo holds decrypted
     //    secrets). Gate FIRST, before touching any cluster/repo — a bad
     //    passphrase must not leave a freshly re-provisioned cluster

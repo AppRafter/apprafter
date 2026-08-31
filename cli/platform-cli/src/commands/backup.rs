@@ -63,6 +63,7 @@ use backup_core::prune::{run_prune, RetentionPolicy};
 use backup_core::restic::{restic_check_argv, restic_unlock_argv};
 use backup_core::{KubeExec, ResticRunner, StagingMode, SubprocessRestic};
 use base64::Engine as _;
+use cli_core::tools::{preflight_tools, KUBECTL, RESTIC};
 use cli_core::{CliError, Result};
 use cli_providers::backup::extract::run_extraction;
 use cli_providers::backup::images::pg_helper_image;
@@ -944,6 +945,11 @@ impl KubeExec for KubectlExec {
 /// `namespaces` when `select` is set. Writes `<out>/{pg,volumes,redis}/…`
 /// plus a `<out>/manifest.json`. No CRs, no secrets, no encryption.
 pub fn run_export(namespaces: &[String], select: bool, out: Option<&str>) -> Result<()> {
+    // D11 / 2.22a: the external binaries this command spawns, checked
+    // BEFORE any prompt, kubeconfig or provider call. The reported bug
+    // was a passphrase typed into a command that could not have worked.
+    preflight_tools(&[&KUBECTL], "apprafter export")?;
+
     let resolved = resolve_state_paths(None)?;
     let cluster_id = resolved.target_name.clone();
     let kc = ensure_kubeconfig_tempfile()?;
@@ -1025,6 +1031,11 @@ pub fn run_backup(
     passphrase: Option<&str>,
     staging_mode: Option<&str>,
 ) -> Result<()> {
+    // D11 / 2.22a: the external binaries this command spawns, checked
+    // BEFORE any prompt, kubeconfig or provider call. The reported bug
+    // was a passphrase typed into a command that could not have worked.
+    preflight_tools(&[&RESTIC, &KUBECTL], "apprafter backup create")?;
+
     let staging_mode = parse_staging_mode(staging_mode)?;
 
     let resolved = resolve_state_paths(None)?;
@@ -1104,6 +1115,11 @@ pub fn run_backup(
 
 /// `apprafter backup list` — list the snapshots in a restic repo.
 pub fn run_backup_list(repo: Option<&str>, passphrase: Option<&str>) -> Result<()> {
+    // D11 / 2.22a: the external binaries this command spawns, checked
+    // BEFORE any prompt, kubeconfig or provider call. The reported bug
+    // was a passphrase typed into a command that could not have worked.
+    preflight_tools(&[&RESTIC], "apprafter backup list")?;
+
     let resolved = resolve_state_paths(None)?;
     let env_pass = std::env::var("RESTIC_PASSWORD").ok();
     let is_tty = std::io::stdin().is_terminal();
@@ -1717,6 +1733,11 @@ pub fn run_backup_prune(
     keep_weekly: Option<u32>,
     keep_monthly: Option<u32>,
 ) -> Result<()> {
+    // D11 / 2.22a: the external binaries this command spawns, checked
+    // BEFORE any prompt, kubeconfig or provider call. The reported bug
+    // was a passphrase typed into a command that could not have worked.
+    preflight_tools(&[&RESTIC], "apprafter backup prune")?;
+
     let retention = RetentionArgs::Prune {
         keep_daily,
         keep_weekly,
@@ -1796,6 +1817,11 @@ pub fn run_backup_check(
     credential_file: Option<&Path>,
     read_data: bool,
 ) -> Result<()> {
+    // D11 / 2.22a: the external binaries this command spawns, checked
+    // BEFORE any prompt, kubeconfig or provider call. The reported bug
+    // was a passphrase typed into a command that could not have worked.
+    preflight_tools(&[&RESTIC], "apprafter backup check")?;
+
     let kc = kubeconfig_if_cluster_needed("check", repo_override, RetentionArgs::NotApplicable)?;
     let creds = resolve_operator_s3_creds(credential_file, &|k| std::env::var(k).ok())?;
     let pass = creds["RESTIC_PASSWORD"].clone();
@@ -1822,6 +1848,11 @@ pub fn run_backup_unlock(
     repo_override: Option<&str>,
     credential_file: Option<&Path>,
 ) -> Result<()> {
+    // D11 / 2.22a: the external binaries this command spawns, checked
+    // BEFORE any prompt, kubeconfig or provider call. The reported bug
+    // was a passphrase typed into a command that could not have worked.
+    preflight_tools(&[&RESTIC], "apprafter backup unlock")?;
+
     let kc = kubeconfig_if_cluster_needed("unlock", repo_override, RetentionArgs::NotApplicable)?;
     let creds = resolve_operator_s3_creds(credential_file, &|k| std::env::var(k).ok())?;
     let pass = creds["RESTIC_PASSWORD"].clone();
@@ -2414,6 +2445,11 @@ pub(crate) fn format_backup_status(
 /// `apprafter backup status` — show the operator's backup configuration, last
 /// Job outcomes, runner self-reported status, and last prune time.
 pub fn run_backup_status() -> Result<()> {
+    // D11 / 2.22a: the external binaries this command spawns, checked
+    // BEFORE any prompt, kubeconfig or provider call. The reported bug
+    // was a passphrase typed into a command that could not have worked.
+    preflight_tools(&[&KUBECTL], "apprafter backup status")?;
+
     let kc = ensure_kubeconfig_tempfile()?;
 
     // 1. Fetch PlatformStack to get spec.backup + last-prune annotation.

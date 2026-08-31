@@ -56,6 +56,12 @@ pub fn add(
     no_validate: bool,
     no_interactive: bool,
 ) -> Result<()> {
+    // D11 / 2.22a: before the wizard, which collects a production PAT
+    // over four prompts and only then discovers there is no kubectl,
+    // no cluster, or a duplicate name. `rotate` below already resolves
+    // the cluster first — the correct order was one function away.
+    cli_core::tools::preflight_tool(&cli_core::tools::KUBECTL, "apprafter repo creds add")?;
+
     let stdin_is_tty = io::stdin().is_terminal();
     let stdout_is_tty = std::io::stdout().is_terminal();
     if crate::commands::repo_creds_wizard::should_use_wizard(
@@ -199,6 +205,7 @@ pub fn show(name: &str) -> Result<()> {
 }
 
 pub fn rotate(name: &str, token: Option<String>, no_validate: bool) -> Result<()> {
+    cli_core::tools::preflight_tool(&cli_core::tools::KUBECTL, "apprafter repo creds rotate")?;
     let kc = ensure_kubeconfig_tempfile()?;
     let cred = kubectl_get_json(
         "sourcecredential",
