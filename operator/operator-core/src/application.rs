@@ -461,6 +461,28 @@ pub fn image_repo(image: &str) -> &str {
     }
 }
 
+/// `status.envConfig` — the resolved-secret configuration the operator most
+/// recently computed, and when it last CHANGED (2.22c / D6).
+///
+/// `digest` is a hash over the resolved `secret:` env values, never the
+/// values themselves; `changedAt` moves only when the digest does, which is
+/// what makes it usable as a drift boundary: a pod started before it is
+/// running an older configuration.
+///
+/// This deliberately does NOT live on the pod template. Putting the digest
+/// there would roll the Deployment on every change, which is precisely the
+/// automatic rollout rejected as a Tier-1 default (D6) — a secret is not
+/// owned by one application, so the blast radius of an automatic roll is
+/// unknowable to whoever sealed it. Keeping the digest in status makes the
+/// drift VISIBLE without making it act.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct EnvConfigStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "changedAt")]
+    pub changed_at: Option<String>,
+}
+
 /// `status.image` — the resolved-image truth (ADR 0040). `tag` is the
 /// reference as written in `spec`; `resolved` is `repo@sha256:…`
 /// actually rendered into the Deployment; `resolvedAt` is the RFC3339
@@ -514,6 +536,10 @@ pub struct ApplicationStatus {
     pub endpoint_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<StatusImage>,
+    /// The resolved-secret configuration digest and when it last changed
+    /// (2.22c / D6). Absent when the application binds no `secret:` refs.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "envConfig")]
+    pub env_config: Option<EnvConfigStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
     /// Full `ApplicationSpec` snapshot the operator stamps after a

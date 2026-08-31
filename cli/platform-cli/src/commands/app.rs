@@ -29,6 +29,7 @@ use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::process::Command;
 
+use cli_core::style;
 use cli_core::{CliError, Result};
 use serde_json::{json, Value};
 use tabled::{Table, Tabled};
@@ -863,6 +864,13 @@ fn print_app_detail(app: &Value, show_resources: bool, kubeconfig_path: &Path) {
             // 1. AppRafter Application phase (group-qualified
             //    apprafter.io read). Non-fatal — a missing CR /
             //    absent phase simply skips the line.
+            // Hoisted: the AppRafter CR is read once and reused below for the
+            // secret bindings (2.22c / D7) and the config-drift boundary
+            // (D6). Both are properties of THIS CR — an earlier draft passed
+            // the Argo CD Application to the bindings parser by mistake,
+            // which reads `spec.base.env` and would simply have found
+            // nothing, every time, silently.
+            let mut apprafter_cr: Option<Value> = None;
             match kubectl_get_json(
                 "application.apprafter.io",
                 Some(inner_name),
@@ -885,6 +893,7 @@ fn print_app_detail(app: &Value, show_resources: bool, kubeconfig_path: &Path) {
                     if let Some(reco_line) = format_recommendation_line(&cr) {
                         println!("{reco_line}");
                     }
+                    apprafter_cr = Some(cr);
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -895,9 +904,14 @@ fn print_app_detail(app: &Value, show_resources: bool, kubeconfig_path: &Path) {
                 }
             }
 
+            let config_changed_at = apprafter_cr
+                .as_ref()
+                .and_then(|cr| cr.pointer("/status/envConfig/changedAt"))
+                .and_then(Value::as_str);
+
             // 2. Pods (moved out of --resources). Non-fatal.
             match list_pods_for_apprafter_app(inner_name, dest_ns, kubeconfig_path) {
-                Ok(pods) => print_pod_summaries(&pods, inner_name, dest_ns),
+                Ok(pods) => print_pod_summaries(&pods, inner_name, dest_ns, config_changed_at),
                 Err(e) => {
                     eprintln!();
                     eprintln!(
@@ -930,7 +944,9 @@ fn print_app_detail(app: &Value, show_resources: bool, kubeconfig_path: &Path) {
             // half of the same index `secret seal` reads the other way for
             // its blast radius. Non-fatal: this is a read that adds context,
             // and failing `app status` over it would be the wrong trade.
-            print_secret_bindings_for_app(app, inner_name, dest_ns);
+            if let Some(cr) = apprafter_cr.as_ref() {
+                print_secret_bindings_for_app(cr, inner_name, dest_ns);
+            }
         }
         _ => {
             println!();
@@ -1037,6 +1053,12 @@ pub(crate) struct PodSummary {
     /// Human-readable age computed at print time. Format
     /// mirrors `kubectl get pods` (`s`, `m`, `h`, `d` units).
     pub age: String,
+    /// RFC3339 `status.startTime` — when the kubelet started this pod, which
+    /// is the moment it resolved its env from Secrets and never re-read them.
+    /// Compared against `status.envConfig.changedAt` to decide whether the
+    /// pod is running an older configuration (2.22c / D6). Falls back to
+    /// `metadata.creationTimestamp` when the pod has not started yet.
+    pub started_at: Option<String>,
 }
 
 /// Service surface rendered into the default `app status`
@@ -1187,13 +1209,45 @@ fn summarise_pod(pod: &Value, now: &chrono::DateTime<chrono::Utc>) -> PodSummary
         .map(|ts| format_pod_age(ts, now))
         .unwrap_or_else(|| "?".to_string());
 
+    let started_at = pod
+        .pointer("/status/startTime")
+        .or_else(|| pod.pointer("/metadata/creationTimestamp"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
     PodSummary {
         name,
         ready: format!("{ready_count}/{total_count}"),
         status,
         restarts,
         age,
+        started_at,
     }
+}
+
+/// Whether a pod started BEFORE the application's resolved configuration
+/// last changed — i.e. it is running an older set of secret values
+/// (2.22c / D6).
+///
+/// This is the whole drift mechanism, and it needs no marker on the pod.
+/// An environment variable sourced from a Secret is resolved once when the
+/// kubelet starts the container and is never re-read, so "started before the
+/// config changed" is exactly "running the previous configuration".
+///
+/// Deliberately conservative: an unparseable or absent timestamp on either
+/// side reports NOT stale. A false "your pods are stale" teaches the reader
+/// to ignore the column, which costs more than the occasional miss.
+pub(crate) fn pod_is_stale(started_at: Option<&str>, changed_at: Option<&str>) -> bool {
+    let (Some(started), Some(changed)) = (started_at, changed_at) else {
+        return false;
+    };
+    let (Ok(started), Ok(changed)) = (
+        chrono::DateTime::parse_from_rfc3339(started),
+        chrono::DateTime::parse_from_rfc3339(changed),
+    ) else {
+        return false;
+    };
+    started < changed
 }
 
 /// Pure helper — format a duration from `since` to `now` using
@@ -1330,7 +1384,12 @@ fn print_argocd_resources(app: &Value) {
     }
 }
 
-fn print_pod_summaries(pods: &[PodSummary], inner_name: &str, namespace: &str) {
+fn print_pod_summaries(
+    pods: &[PodSummary],
+    inner_name: &str,
+    namespace: &str,
+    config_changed_at: Option<&str>,
+) {
     println!();
     println!("Workload pods ({namespace}, app.kubernetes.io/name={inner_name}):");
     if pods.is_empty() {
@@ -1355,9 +1414,13 @@ fn print_pod_summaries(pods: &[PodSummary], inner_name: &str, namespace: &str) {
         name_w = name_w,
         status_w = status_w,
     );
+    let mut any_stale = false;
     for p in pods {
-        println!(
-            "  {:<name_w$}  {:<5}  {:<status_w$}  {:<8}  {}",
+        let stale = pod_is_stale(p.started_at.as_deref(), config_changed_at);
+        any_stale |= stale;
+        let flag = if stale { "  ← old config" } else { "" };
+        let row = format!(
+            "  {:<name_w$}  {:<5}  {:<status_w$}  {:<8}  {}{flag}",
             p.name,
             p.ready,
             p.status,
@@ -1365,6 +1428,24 @@ fn print_pod_summaries(pods: &[PodSummary], inner_name: &str, namespace: &str) {
             p.age,
             name_w = name_w,
             status_w = status_w,
+        );
+        // Yellow, not red: the pod is healthy and serving. It is serving the
+        // PREVIOUS secret values, which is a thing to know rather than an
+        // outage — and colouring it as a failure would train the reader to
+        // ignore it.
+        if stale {
+            println!("{}", style::warn(&row));
+        } else {
+            println!("{row}");
+        }
+    }
+    if any_stale {
+        println!();
+        println!(
+            "  {}",
+            style::warn(
+                "Some pods started before this application's secrets last changed, \n                   so they are still serving the previous values. An environment \n                   variable from a secret is resolved once at pod start and never \n                   re-read; restarting the workload is what picks up the new one."
+            )
         );
     }
 }
@@ -4036,5 +4117,61 @@ mod tests {
         assert_eq!(deployment_environment(&app2), "prod");
         let app3 = serde_json::json!({ "metadata": { "name": "x" } });
         assert_eq!(deployment_environment(&app3), "(base)");
+    }
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::*;
+
+    #[test]
+    fn a_pod_started_before_the_config_changed_is_stale() {
+        assert!(pod_is_stale(
+            Some("2026-08-31T10:00:00Z"),
+            Some("2026-08-31T11:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn a_pod_started_after_the_config_changed_is_current() {
+        assert!(!pod_is_stale(
+            Some("2026-08-31T12:00:00Z"),
+            Some("2026-08-31T11:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn a_missing_timestamp_never_reports_stale() {
+        // Conservative on purpose: a false "your pods are stale" teaches the
+        // reader to ignore the column, which costs more than a miss. An app
+        // that binds no secrets has no changedAt at all and must stay quiet.
+        assert!(!pod_is_stale(None, Some("2026-08-31T11:00:00Z")));
+        assert!(!pod_is_stale(Some("2026-08-31T10:00:00Z"), None));
+        assert!(!pod_is_stale(None, None));
+    }
+
+    #[test]
+    fn an_unparseable_timestamp_never_reports_stale() {
+        assert!(!pod_is_stale(
+            Some("not-a-time"),
+            Some("2026-08-31T11:00:00Z")
+        ));
+        assert!(!pod_is_stale(Some("2026-08-31T10:00:00Z"), Some("nope")));
+    }
+
+    #[test]
+    fn offsets_are_compared_as_instants_not_as_strings() {
+        // The operator writes RFC3339 with an offset (Utc::now().to_rfc3339()
+        // yields +00:00) while the kubelet writes Z. A string comparison would
+        // get this wrong; these are the same instant, so neither is stale.
+        assert!(!pod_is_stale(
+            Some("2026-08-31T11:00:00Z"),
+            Some("2026-08-31T11:00:00+00:00")
+        ));
+        // And an offset that IS earlier must still register.
+        assert!(pod_is_stale(
+            Some("2026-08-31T10:00:00Z"),
+            Some("2026-08-31T13:00:00+01:00")
+        ));
     }
 }

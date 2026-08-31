@@ -583,8 +583,14 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // no Secret dependency. If any secret ref is unresolvable, set
     // `Ready=False/EnvSecretMissing` and requeue in 30s. Do NOT render or apply
     // children in this case — the missing Secret may not exist yet / ever.
+    // 2.22c (D6): the digest of the resolved `secret:` material, computed in
+    // the same pass that validates the refs. `None` when the app binds no
+    // secret refs, or when any ref is unresolved (a partial configuration has
+    // no meaningful digest and would otherwise churn the drift boundary).
+    let mut env_config_digest_now: Option<String> = None;
     if let Some(env) = effective.env.as_ref() {
-        let missing = check_env_secret_refs(env, &ctx.client, &namespace).await?;
+        let (missing, digest) = check_env_secret_refs(env, &ctx.client, &namespace).await?;
+        env_config_digest_now = digest;
         if !missing.is_empty() {
             info!(
                 %name, %namespace,
@@ -903,6 +909,27 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     }
     let mut status = build_status(&app, "Ready", conditions, endpoint_url);
     status.image = image_status;
+
+    // 2.22c (D6): record the resolved-config digest, and move `changedAt`
+    // ONLY when the digest itself moved. That is what makes the field usable
+    // as a drift boundary — `app status` compares it against each pod's
+    // startTime, so a pod that began before the last change is running an
+    // older configuration. Stamping the time on every reconcile would make
+    // every pod look stale a minute after it started.
+    if let Some(digest) = env_config_digest_now {
+        let previous = existing_env_config(&app);
+        let unchanged =
+            previous.as_ref().and_then(|p| p.digest.as_deref()) == Some(digest.as_str());
+        let changed_at = if unchanged {
+            previous.as_ref().and_then(|p| p.changed_at.clone())
+        } else {
+            Some(Utc::now().to_rfc3339())
+        };
+        status.env_config = Some(operator_core::EnvConfigStatus {
+            digest: Some(digest),
+            changed_at,
+        });
+    }
 
     // 2.16e (ADR 0054): if the VPA is available AND we applied one for this
     // reconcile, GET the live VPA CR and mirror its recommendation into the
@@ -1569,6 +1596,33 @@ fn resolve_needs_targets(
     targets
 }
 
+/// Hash the resolved `secret:` env material into a stable digest (2.22c / D6).
+///
+/// The values go in and only a hex digest comes out — they are never logged,
+/// stored or returned. Sorted by `(secret, key)` first, so the digest is a
+/// function of the CONFIGURATION rather than of map iteration order: an
+/// unsorted hash would appear to change on every reconcile and turn the
+/// drift signal into permanent noise, which is the failure mode that makes a
+/// surface get ignored.
+///
+/// Length is mixed in per field. Without it `("ab","c")` and `("a","bc")`
+/// hash alike, so two different configurations could look identical — and a
+/// drift signal that misses a change is worse than none.
+fn env_config_digest(material: &mut [(String, String, Vec<u8>)]) -> String {
+    use sha2::{Digest, Sha256};
+    material.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    let mut h = Sha256::new();
+    for (secret, key, value) in material.iter() {
+        h.update((secret.len() as u64).to_be_bytes());
+        h.update(secret.as_bytes());
+        h.update((key.len() as u64).to_be_bytes());
+        h.update(key.as_bytes());
+        h.update((value.len() as u64).to_be_bytes());
+        h.update(value);
+    }
+    format!("sha256:{:x}", h.finalize())
+}
+
 /// Whether `secret` carries `key` in either `data` or `stringData`.
 fn secret_carries_key(secret: &Secret, key: &str) -> bool {
     let in_data = secret.data.as_ref().is_some_and(|d| d.contains_key(key));
@@ -1740,7 +1794,7 @@ async fn check_env_secret_refs(
     env: &std::collections::BTreeMap<String, operator_core::EnvValue>,
     client: &Client,
     namespace: &str,
-) -> Result<Vec<String>, ReconcileError> {
+) -> Result<(Vec<String>, Option<String>), ReconcileError> {
     use operator_core::{EnvRef, EnvValue};
     // Collect the (var_name, secret_name, key) tuples we need to check.
     // Same iteration order as unresolved_env_secret_refs (BTreeMap).
@@ -1760,10 +1814,15 @@ async fn check_env_secret_refs(
         ));
     }
     if checks.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
     let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
     let mut missing: Vec<String> = Vec::new();
+    // 2.22c (D6): hash the RESOLVED values as we go, in the pass that already
+    // fetches each Secret. Values are hashed and dropped — never logged,
+    // never stored, never returned. Sorted by (secret, key) so the digest is
+    // a function of the configuration and not of map iteration order.
+    let mut material: Vec<(String, String, Vec<u8>)> = Vec::new();
     for (var_name, secret_name, key) in &checks {
         // 2.22c (D7): name WHICH of the two causes it is, and in which
         // namespace. This match already knows — the `None` arm is "no such
@@ -1778,6 +1837,9 @@ async fn check_env_secret_refs(
             )),
             Some(secret) => {
                 if secret_carries_key(&secret, key) {
+                    if let Some(v) = secret.data.as_ref().and_then(|d| d.get(key)) {
+                        material.push((secret_name.clone(), key.clone(), v.0.clone()));
+                    }
                     None
                 } else {
                     Some(format!(
@@ -1794,7 +1856,9 @@ async fn check_env_secret_refs(
             ));
         }
     }
-    Ok(missing)
+    let digest =
+        (missing.is_empty() && !material.is_empty()).then(|| env_config_digest(&mut material));
+    Ok((missing, digest))
 }
 
 /// SSA-apply a per-workload copy of the derived pull-secret.
@@ -1942,6 +2006,11 @@ fn build_status(
         // clobber a baseline stamped by the classifier's own apply. The
         // stamp itself lands with a later 2.16b reconcile task.
         last_applied_spec: None,
+        // 2.22c: carried forward rather than recomputed here. `build_status`
+        // has no access to the resolved secrets, and the success path
+        // overwrites this with the fresh digest before applying; every other
+        // caller genuinely wants the previous value preserved.
+        env_config: existing_env_config(app),
         // 2.16e: VPA recommendations are written by a later task; None
         // here omits the field from the SSA payload (skip_serializing_if).
         recommended_resources: None,
@@ -2597,6 +2666,7 @@ fn plans_to_delete(
 /// / environment) — this only fills the one new field.
 fn with_stamped_baseline(base: ApplicationStatus, spec: &ApplicationSpec) -> ApplicationStatus {
     ApplicationStatus {
+        env_config: base.env_config.clone(),
         last_applied_spec: Some(spec.clone()),
         ..base
     }
@@ -2633,6 +2703,17 @@ fn is_deletion_marked(app: &Application) -> bool {
 /// (the pause self-cancelled in ~200ms). Re-sending the existing baseline keeps
 /// the manager's ownership so it survives the pause. Only the render path
 /// ([`with_stamped_baseline`]) deliberately overrides it with the new spec.
+/// The `envConfig` a previous reconcile recorded (2.22c / D6).
+///
+/// Carried forward on every status write the way the migration baseline is:
+/// `apply_status` is single-field-manager SSA with `.force()`, so a payload
+/// omitting the field PRUNES it. A paused or failing reconcile would
+/// otherwise erase the drift boundary the CLI reads, which is exactly when a
+/// reader most wants it.
+fn existing_env_config(app: &Application) -> Option<operator_core::EnvConfigStatus> {
+    app.status.as_ref().and_then(|s| s.env_config.clone())
+}
+
 fn existing_baseline(app: &Application) -> Option<ApplicationSpec> {
     app.status
         .as_ref()
@@ -2669,6 +2750,7 @@ fn build_paused_status(app: &Application, plan_ns: &str, plan_name: &str) -> App
     let pending = migration_pending_condition(plan_ns, plan_name, previous_conditions);
 
     ApplicationStatus {
+        env_config: existing_env_config(app),
         phase: Some(PHASE_AWAITING_MIGRATION_APPROVAL.to_string()),
         observed_generation: app.metadata.generation,
         conditions: Some(vec![ready, pending]),
@@ -2713,6 +2795,7 @@ fn build_migration_failed_status(app: &Application, plan_name: &str) -> Applicat
     let failed = migration_failed_condition(plan_name, previous_conditions);
 
     ApplicationStatus {
+        env_config: existing_env_config(app),
         phase: Some(PHASE_AWAITING_MIGRATION_APPROVAL.to_string()),
         observed_generation: app.metadata.generation,
         conditions: Some(vec![ready, failed]),
@@ -3161,6 +3244,7 @@ fn build_resource_claim_paused_status(app: &Application, unready: &[String]) -> 
     let pending = resource_claim_pending_condition(unready, previous_conditions);
 
     ApplicationStatus {
+        env_config: existing_env_config(app),
         phase: Some(PHASE_AWAITING_RESOURCE_CLAIM.to_string()),
         observed_generation: app.metadata.generation,
         conditions: Some(vec![ready, pending]),
@@ -3252,6 +3336,7 @@ fn build_env_secret_missing_status(app: &Application, messages: &[String]) -> Ap
     let ready = ready_condition("False", "EnvSecretMissing", &message, previous_conditions);
 
     ApplicationStatus {
+        env_config: existing_env_config(app),
         phase: Some(PHASE_ENV_SECRET_MISSING.to_string()),
         observed_generation: app.metadata.generation,
         conditions: Some(vec![ready]),
@@ -3290,6 +3375,7 @@ fn build_invalid_effective_spec_status(app: &Application, message: &str) -> Appl
     );
 
     ApplicationStatus {
+        env_config: existing_env_config(app),
         phase: Some(PHASE_INVALID_EFFECTIVE_SPEC.to_string()),
         observed_generation: app.metadata.generation,
         conditions: Some(vec![ready]),
@@ -3753,6 +3839,7 @@ mod tests {
         let mut app = Application::new("web", ApplicationSpec::default());
         app.metadata.generation = Some(7);
         app.status = Some(ApplicationStatus {
+            env_config: None,
             phase: Some("Ready".into()),
             observed_generation: Some(6),
             conditions: None,
@@ -3829,6 +3916,7 @@ mod tests {
         };
         let mut app = Application::new("web", ApplicationSpec::default());
         app.status = Some(ApplicationStatus {
+            env_config: None,
             phase: Some("Ready".into()),
             observed_generation: Some(3),
             conditions: None,
@@ -4601,6 +4689,57 @@ mod tests {
     }
 
     #[test]
+    fn the_digest_is_a_function_of_configuration_not_iteration_order() {
+        // An unsorted hash would appear to change on every reconcile and turn
+        // the drift signal into permanent noise — the failure mode that makes
+        // a surface get ignored.
+        let mut a = vec![
+            ("s2".to_string(), "k".to_string(), b"v2".to_vec()),
+            ("s1".to_string(), "k".to_string(), b"v1".to_vec()),
+        ];
+        let mut b = vec![
+            ("s1".to_string(), "k".to_string(), b"v1".to_vec()),
+            ("s2".to_string(), "k".to_string(), b"v2".to_vec()),
+        ];
+        assert_eq!(env_config_digest(&mut a), env_config_digest(&mut b));
+    }
+
+    #[test]
+    fn a_changed_value_changes_the_digest() {
+        let mut before = vec![("s".to_string(), "k".to_string(), b"old".to_vec())];
+        let mut after = vec![("s".to_string(), "k".to_string(), b"new".to_vec())];
+        assert_ne!(
+            env_config_digest(&mut before),
+            env_config_digest(&mut after)
+        );
+    }
+
+    #[test]
+    fn field_boundaries_cannot_be_shifted_without_changing_the_digest() {
+        // Without a length prefix ("ab","c") and ("a","bc") hash alike, so two
+        // different configurations would look identical. A drift signal that
+        // MISSES a change is worse than none.
+        let mut x = vec![("ab".to_string(), "c".to_string(), b"v".to_vec())];
+        let mut y = vec![("a".to_string(), "bc".to_string(), b"v".to_vec())];
+        assert_ne!(env_config_digest(&mut x), env_config_digest(&mut y));
+    }
+
+    #[test]
+    fn the_digest_never_contains_the_material() {
+        let mut m = vec![(
+            "s".to_string(),
+            "k".to_string(),
+            b"sk_live_super_secret".to_vec(),
+        )];
+        let d = env_config_digest(&mut m);
+        assert!(d.starts_with("sha256:"), "{d}");
+        assert!(
+            !d.contains("sk_live"),
+            "material leaked into the digest: {d}"
+        );
+    }
+
+    #[test]
     fn it_lists_the_keys_a_secret_does_carry() {
         // The whole point of D7's cheapest fix: "carries no key
         // stripe-api-key (it carries: stripe_api_key)" answers the
@@ -4813,6 +4952,7 @@ mod tests {
         let mut app = Application::new("parser", ApplicationSpec::default());
         app.metadata.generation = Some(4);
         app.status = Some(ApplicationStatus {
+            env_config: None,
             phase: Some("Ready".into()),
             observed_generation: Some(3),
             conditions: None,
@@ -5807,6 +5947,7 @@ mod tests {
         let mut app = Application::new("web", ApplicationSpec::default());
         app.metadata.generation = Some(5);
         app.status = Some(ApplicationStatus {
+            env_config: None,
             phase: Some("Ready".into()),
             observed_generation: Some(4),
             conditions: None,
@@ -5860,6 +6001,7 @@ mod tests {
         let fixed_time = "2026-06-10T12:00:00+00:00".to_string();
         let mut app = Application::new("web", ApplicationSpec::default());
         app.status = Some(ApplicationStatus {
+            env_config: None,
             phase: Some(PHASE_ENV_SECRET_MISSING.into()),
             observed_generation: None,
             conditions: Some(vec![ApplicationCondition {
@@ -6163,6 +6305,7 @@ mod tests {
     #[test]
     fn with_stamped_baseline_sets_field_and_preserves_rest() {
         let base = ApplicationStatus {
+            env_config: None,
             phase: Some("Ready".into()),
             observed_generation: Some(9),
             conditions: Some(vec![ready_condition("True", "Ok", "ok", &[])]),
@@ -6417,6 +6560,7 @@ mod tests {
         let mut app = Application::new("web", ApplicationSpec::default());
         app.metadata.generation = Some(8);
         app.status = Some(ApplicationStatus {
+            env_config: None,
             phase: Some("Ready".into()),
             observed_generation: Some(7),
             conditions: None,
