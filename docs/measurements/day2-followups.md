@@ -1092,9 +1092,28 @@ expose one.
    error.
 3. **Threshold the per-volume sample** the platform already takes, and surface it
    in `volume status` alongside the existing `Used`/`Free` line.
-4. **Extend the `app status` claim table with state**, starting with the volume
-   and disk numbers that already exist, and note the database-size probe as
-   follow-on work rather than blocking on it.
+4. **Extend the `app status` claim table with state.**
+
+   *Corrected 2026-08-31 while implementing:* the premise that "the volume and
+   disk numbers already exist" is wrong. `ResourceClaimStatus` carries no size
+   and no usage; a PVC carries its provisioned size but not its fullness; and
+   fullness comes from the kubelet Summary API, which only the operator
+   samples. So the CLI cannot show a claim's capacity today at any price.
+
+   What shipped instead is a **`BACKING` column** naming the concrete resource
+   serving each claim — the pooled instance and logical DB for redis, the
+   standalone PVC for a disk — which is in the claim's own status, costs
+   nothing, and turns a row reading `true true` into one an operator can act
+   on. Two apps on one Dragonfly instance are isolated only by that DB number,
+   and it was previously invisible.
+
+   Printing a claim's provisioned size alone was considered and rejected: it
+   answers the easy half of the question the column exists for and reads as if
+   it had answered both.
+
+   **Still open:** per-claim capacity needs the operator to sample it and write
+   it to the claim status, the way `SharedVolume.status.capacity` already
+   works. Database size needs a query per backend on top of that.
 
 Ships with: a walk that fills a node past the threshold and asserts the warning
 appears on an unrelated command (not just on `volume status`), and a walk step

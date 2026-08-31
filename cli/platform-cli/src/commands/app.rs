@@ -1093,6 +1093,12 @@ pub(crate) struct ResourceClaimSummary {
     /// `status.connectionSecretRef` — the Secret holding the
     /// connection material. None until the claim is fulfilled.
     pub secret_ref: Option<String>,
+    /// The concrete backend resource serving this claim, when the
+    /// provisioner has named one: the pooled instance and logical DB for
+    /// redis, the standalone PVC for a disk, the connection Secret's
+    /// backing cluster otherwise. Answers "what actually got created",
+    /// which the ready/scheduled pair does not.
+    pub backing: String,
     /// Whether `status.conditions[]` carries
     /// `{type: "Scheduled", status: "True"}` — the provisioner
     /// has placed the claim on a backing cluster.
@@ -1686,7 +1692,40 @@ fn summarise_resource_claim(claim: &Value) -> ResourceClaimSummary {
         ready,
         secret_ref,
         scheduled,
+        backing: backing_resource(claim),
     }
+}
+
+/// The concrete backend resource serving a claim (2.22d / D8).
+///
+/// The table has always answered "was it provisioned" and never "what
+/// exists now". A pooled Dragonfly claim lives as a numbered DB on a named
+/// instance; a disk claim is a standalone PVC. Both are in the claim's own
+/// status already, so this costs nothing and turns a row that said `true
+/// true` into one an operator can act on.
+///
+/// Deliberately NOT a size or a fullness. Neither is on the ResourceClaim,
+/// and neither is reachable from the CLI: a PVC carries its provisioned
+/// size but not its usage, and usage comes from the kubelet Summary API,
+/// which only the operator samples. Printing provisioned size alone would
+/// answer the easy half of the question the column exists for, and read as
+/// if it had answered both. Recorded as follow-on in D8 instead.
+pub(crate) fn backing_resource(claim: &Value) -> String {
+    let instance = claim.pointer("/status/instance").and_then(Value::as_str);
+    let dbnum = claim.pointer("/status/dbnum").and_then(Value::as_i64);
+    if let (Some(i), Some(n)) = (instance, dbnum) {
+        return format!("{i} (db {n})");
+    }
+    if let Some(i) = instance {
+        return i.to_string();
+    }
+    if let Some(pvc) = claim
+        .pointer("/status/volumeClaimRef")
+        .and_then(Value::as_str)
+    {
+        return format!("pvc/{pvc}");
+    }
+    "—".to_string()
 }
 
 /// The `secret:` bindings this Application declares, read off the CR the
@@ -1747,22 +1786,32 @@ fn print_resource_claims(claims: &[ResourceClaimSummary], namespace: &str) {
         .max()
         .unwrap_or(8)
         .max(8);
+    let backing_w = claims
+        .iter()
+        .map(|c| c.backing.len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
     println!(
-        "  {:<name_w$}  {:<provider_w$}  READY  SCHEDULED  SECRET",
+        "  {:<name_w$}  {:<provider_w$}  READY  SCHEDULED  {:<backing_w$}  SECRET",
         "NAME",
         "PROVIDER",
+        "BACKING",
         name_w = name_w,
         provider_w = provider_w,
+        backing_w = backing_w,
     );
     for c in claims {
         let secret = c.secret_ref.as_deref().unwrap_or("-");
         println!(
-            "  {:<name_w$}  {:<provider_w$}  {:<5}  {:<9}  {}",
+            "  {:<name_w$}  {:<provider_w$}  {:<5}  {:<9}  {:<backing_w$}  {}",
             c.name,
             c.provider,
             if c.ready { "true" } else { "false" },
             if c.scheduled { "true" } else { "false" },
+            c.backing,
             secret,
+            backing_w = backing_w,
             name_w = name_w,
             provider_w = provider_w,
         );
@@ -4173,5 +4222,39 @@ mod drift_tests {
             Some("2026-08-31T10:00:00Z"),
             Some("2026-08-31T13:00:00+01:00")
         ));
+    }
+}
+
+#[cfg(test)]
+mod backing_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_pooled_claim_names_its_instance_and_logical_db() {
+        // "ready true, scheduled true" told an operator nothing about WHERE
+        // the data went. A Dragonfly claim is a numbered DB on a shared
+        // instance, and both halves matter: two apps on the same instance
+        // are isolated only by that number.
+        let c = json!({ "status": { "instance": "platform-redis-ephemeral-000", "dbnum": 7 }});
+        assert_eq!(backing_resource(&c), "platform-redis-ephemeral-000 (db 7)");
+    }
+
+    #[test]
+    fn an_instance_without_a_db_number_still_names_the_instance() {
+        let c = json!({ "status": { "instance": "platform-redis-persistent-000" }});
+        assert_eq!(backing_resource(&c), "platform-redis-persistent-000");
+    }
+
+    #[test]
+    fn a_disk_claim_names_its_pvc() {
+        let c = json!({ "status": { "volumeClaimRef": "web-disk-data" }});
+        assert_eq!(backing_resource(&c), "pvc/web-disk-data");
+    }
+
+    #[test]
+    fn an_unprovisioned_claim_shows_a_dash_rather_than_an_empty_cell() {
+        assert_eq!(backing_resource(&json!({ "status": {} })), "—");
+        assert_eq!(backing_resource(&json!({})), "—");
     }
 }
