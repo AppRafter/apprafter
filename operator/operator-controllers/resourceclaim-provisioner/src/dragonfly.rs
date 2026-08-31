@@ -272,6 +272,20 @@ pub fn dragonfly_object(
         // mandatory) is a fact about v1.37.0, and an operator-chart bump
         // would have changed it silently.
         "image": DRAGONFLY_SERVER_IMAGE,
+        // ADR 0042 §10: born loading its ACL file. The provisioner seeds
+        // `<instance>-acl` (default line only) BEFORE this apply, because the
+        // dragonfly-operator never sets `SecretVolumeSource.Optional` — a CR
+        // naming a Secret that does not exist yields a pod that cannot start.
+        //
+        // Set at BIRTH rather than added later by the resync loop: adding the
+        // field to a live CR makes the operator roll the StatefulSet, so the
+        // first claim on a fresh instance would be handed a working connection
+        // and then have its instance restarted seconds later. The walk caught
+        // exactly that.
+        "aclFromSecret": {
+            "name": acl_secret_name(name),
+            "key": ACL_SECRET_KEY,
+        },
         "args": [
             format!("--dbnum={dbnum}"),
             format!("--num_shards={num_shards}"),
@@ -1146,6 +1160,29 @@ mod tests {
         );
         assert_eq!(cr["spec"]["image"], DRAGONFLY_SERVER_IMAGE);
         assert!(DRAGONFLY_SERVER_IMAGE.ends_with(":v1.37.0"));
+    }
+
+    #[test]
+    fn a_fresh_instance_is_born_loading_its_acl_file() {
+        // Set at BIRTH, not added later. Adding `aclFromSecret` to a live CR
+        // makes the dragonfly-operator roll the StatefulSet, so the FIRST
+        // claim on a fresh instance would be handed a working connection and
+        // then have its instance restarted seconds later — which is what the
+        // walk caught.
+        let cr = dragonfly_object(
+            "platform-redis-ephemeral-000",
+            "dragonfly-system",
+            16,
+            1,
+            1,
+            false,
+            &BackendResources::dragonfly_t1(),
+        );
+        assert_eq!(
+            cr["spec"]["aclFromSecret"]["name"],
+            "platform-redis-ephemeral-000-acl"
+        );
+        assert_eq!(cr["spec"]["aclFromSecret"]["key"], ACL_SECRET_KEY);
     }
 
     // --- acl_setuser_args() ---

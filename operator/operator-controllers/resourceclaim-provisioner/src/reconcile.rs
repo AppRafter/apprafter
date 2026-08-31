@@ -536,6 +536,53 @@ async fn provision_dragonfly(
         info!(%instance, %df_ns, "created Dragonfly admin password Secret");
     }
 
+    // 1b. Seed the ACL file BEFORE the CR names it, so a new instance is BORN
+    //     loading one (ADR 0042 §10).
+    //
+    //     WHY THIS IS NOT "the loop writes it": if the CR is created without
+    //     `aclFromSecret` and the loop adds the field a moment later, the
+    //     dragonfly-operator rolls the StatefulSet — so the FIRST claim on a
+    //     fresh instance would be handed a connection Secret and then have its
+    //     instance restarted out from under it, seconds later. The walk caught
+    //     exactly that. Seeding here means a fresh instance never rolls for
+    //     this reason at all; the one-time roll is left where it belongs, on
+    //     instances that predate the feature.
+    //
+    //     CREATE-IF-ABSENT, never overwrite. The resync loop owns the file's
+    //     CONTENTS and is still its only writer — this seeds a default-only
+    //     file so the mount has something to point at, and the loop adds the
+    //     tenant lines on its next pass. Overwriting here would make the
+    //     provisioner a second content writer, which is what one-writer
+    //     exists to prevent.
+    //
+    //     Ordering is not cosmetic: the operator never sets
+    //     `SecretVolumeSource.Optional`, so a CR naming a Secret that does not
+    //     exist yields a pod that cannot start.
+    let acl_secret_name = dragonfly::acl_secret_name(&instance);
+    if secret_api.get_opt(&acl_secret_name).await?.is_none() {
+        let admin_pw =
+            crate::acl_reconcile::read_secret_key(ctx, &df_ns, &admin_secret_name, "password")
+                .await?;
+        match dragonfly::acl_file_contents(&admin_pw, &[]) {
+            Ok(contents) => {
+                let obj = dragonfly::acl_secret_object(&acl_secret_name, &df_ns, &contents);
+                secret_api
+                    .patch(&acl_secret_name, &apply_params(), &Patch::Apply(&obj))
+                    .await?;
+                info!(%instance, %df_ns, "seeded the instance ACL file (default line only)");
+            }
+            Err(err) => {
+                // Cannot happen with a generated password, but a file without
+                // a `default` line would DISABLE authentication on the shared
+                // instance — so refuse to create the CR rather than create one
+                // pointing at a Secret we could not build.
+                return Err(ReconcileError::Provisioning(format!(
+                    "refusing to seed the ACL file for {instance}: {err}"
+                )));
+            }
+        }
+    }
+
     let df_api: Api<DynamicObject> =
         Api::namespaced_with(ctx.client.clone(), &df_ns, &dragonfly_cluster_ar());
     let df_body = dragonfly::dragonfly_object(
