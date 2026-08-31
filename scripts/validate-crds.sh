@@ -54,6 +54,38 @@ kubectl --context "$CTX" wait --for=condition=Established --timeout=60s \
 # and this apply was HARD-REJECTED ("Unsupported value: \"off\": supported
 # values: \"digest\", \"false\""). A server-side dry-run validates against the
 # live OpenAPI schema without needing the operator to run.
+echo "==> regression: MigrationPlan base-env scope (environment: \"\") must be accepted"
+kubectl --context "$CTX" create namespace crd-validate >/dev/null 2>&1 || true
+if kubectl --context "$CTX" apply --dry-run=server -f - >/dev/null 2>/tmp/crd-baseenv-err.txt <<'YAML'
+apiVersion: apprafter.io/v1alpha1
+kind: MigrationPlan
+metadata:
+  name: crd-validate-base-env
+  namespace: crd-validate
+spec:
+  scope:
+    type: application
+    application:
+      ref:
+        name: parser
+        namespace: crd-validate
+      environment: ""
+  trigger:
+    type: needs-removal
+    field: needs.pg
+YAML
+then
+    echo "    OK: base-env MigrationPlan accepted by the apiserver"
+else
+    echo "    FAIL: the apiserver rejected a base-env MigrationPlan." >&2
+    echo "    An Application with no spec.environment is the COMMON case, and the" >&2
+    echo "    operator writes \"\" for it everywhere. Rejecting it here means every" >&2
+    echo "    destructive change on such an app retries a 422 forever: the plan is" >&2
+    echo "    never created, the gate never engages, and the reconcile freezes." >&2
+    cat /tmp/crd-baseenv-err.txt >&2
+    exit 1
+fi
+
 echo "==> regression: Application imagePolicy.resolve: \"off\" must be accepted"
 kubectl --context "$CTX" create namespace crd-validate >/dev/null 2>&1 || true
 if kubectl --context "$CTX" apply --dry-run=server -f - >/dev/null 2>/tmp/crd-off-err.txt <<'YAML'

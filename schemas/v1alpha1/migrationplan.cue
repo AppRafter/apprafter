@@ -78,7 +78,16 @@ package v1alpha1
 			name:      string & =~"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$"
 			namespace: string & =~"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$"
 		}
-		environment: string & =~"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$"
+		// The empty string is the BASE (unset `spec.environment`) deploy, and
+		// is the value the whole operator already uses for it — `env_owned`,
+		// `PlanKey`, `plan_name` and `plans_to_delete` all key on "" for base.
+		// The pattern used to reject it, so a base-only Application hitting a
+		// destructive change produced a MigrationPlan the apiserver refused
+		// with 422, forever: the plan could never be created, the gate never
+		// engaged, and the reconcile retried every 30s indefinitely. Found by
+		// the 2.22b needs-removal walk; app-migration-walk never saw it
+		// because all of its Applications carry an environment.
+		environment: string & =~"^([a-z0-9][a-z0-9-]{0,62}[a-z0-9])?$"
 	}
 
 	platform?: {

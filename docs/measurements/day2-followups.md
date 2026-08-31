@@ -33,7 +33,8 @@ would otherwise touch the same code three times.
 | **D11** | 584 failures share one catch-all, and the cheap checks run last | open — high | 2.22a |
 | **D12** | Removing `expose` leaves the Service behind | open — medium | 2.22b |
 | **D13** | A registry credential copy that nothing ever reclaims | open — high, security | 2.22b |
-| **D14** | Re-sealing a secret performs a gated change through an ungated door | resolved by decision — disclosure work open | 2.22c |
+| **D14** | Re-sealing a secret performs a gated change through an ungated door | resolved by decision — disclosure work open |
+| **D15** | The destructive-change gate never engaged for a base-only app | RESOLVED | 2.22c |
 
 ## D1. VPA in-place right-sizing has never run: wrong feature-gate name
 
@@ -1817,3 +1818,82 @@ cluster-wide, on the shape of `autoRestartAppsOnEnvChanges` — is the right hom
 for automation there, because the two things that make it unsafe at Tier 1 are
 gone: revisions are observable, and the identity performing the change is
 authenticated and audited.
+
+## D15. The destructive-change gate never engaged for a base-only app
+
+**Opened:** 2026-08-31, found on the FIRST run of the 2.22b needs-removal
+walk — by a walk written to prove a different fix.
+
+**Status:** RESOLVED the same day (schema fix + apiserver regression probe).
+**Severity:** high. Not a missing feature: a **reconcile freeze**, and the
+whole approval gate silently inert for the common case.
+
+### What was wrong
+
+`reconcile` derives the environment as
+`app.spec.environment.clone().unwrap_or_default()`
+(`application/src/lib.rs:244`), so an Application with no `spec.environment`
+— a base-only deploy, which is the default — yields `""`. The comment there
+says so plainly: *"or the empty string for the base/default env — the same
+value `create_plan_for` / the plan scope carry"*. The whole operator agrees:
+`env_owned`, `PlanKey`, `plan_name` and `plans_to_delete` all key on `""`
+for base.
+
+The CRD did not. `schemas/v1alpha1/migrationplan.cue` constrained
+`scope.application.environment` to
+`^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$`, which rejects the empty string, so the
+apiserver refused every plan the operator built for such an app:
+
+```text
+MigrationPlan.apprafter.io "parser-migration-1788139452" is invalid:
+spec.scope.application.environment: Invalid value: "":
+  in body should match '^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$'
+```
+
+### What it cost
+
+The operator detected the change correctly and logged
+`destructive change detected — creating gating MigrationPlan
+trigger=needs-removal` — and then failed the apply, returned the error, and
+retried. Every thirty seconds, with a fresh plan name, indefinitely. The walk
+log shows four cycles in two minutes before it gave up.
+
+So for any base-only Application:
+
+1. **The gate never engaged.** A destructive edit could not be approved,
+   because the object that carries the approval could not be created.
+2. **The reconcile froze.** The error returns before the render and apply
+   steps, so the application stopped converging on anything at all — the same
+   shape as the ADR 0048 anchor-403 freeze, reached from a different
+   direction.
+3. **Silently.** Nothing surfaced on the Application; the evidence lived only
+   in the operator's log.
+
+### Why nothing caught it
+
+`e2e/app-migration-walk.sh` is the walk built for this machinery, and every
+Application in it carries an environment (`mig-dev`, `mig-prod`). The
+empty-environment path — the default one — was never exercised. Unit tests
+did not catch it either, for the reason unit tests never catch this class:
+`create_plan_for` returns a well-formed struct, and only an apiserver
+enforces the pattern.
+
+That is the third instance of the rule this file keeps re-learning, in a new
+place: **only a live apiserver validates a CRD schema.**
+
+### The fix
+
+`environment` now accepts the base sentinel:
+`^([a-z0-9][a-z0-9-]{0,62}[a-z0-9])?$`. The CRD is aligned with what the
+operator has always written, rather than the reverse — `""` for base is the
+established internal contract in four places, and the schema was the outlier.
+
+Guarded by an apiserver probe in `scripts/validate-crds.sh`, alongside the
+`imagePolicy.resolve: "off"` one, so `just crd-validate` fails if the pattern
+tightens again. The red state was not synthesised: the walk log carries the
+apiserver's own 422 against exactly this object.
+
+**Also worth keeping:** the walk that found this was written to prove D4 and
+D12, and never reached its own subject. A walk exercising a real default is
+worth more than the assertion it was aimed at.
+
