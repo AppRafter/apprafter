@@ -9,7 +9,7 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
-## platform-stack 0.2.59 / operator v0.2.45 — day-2 signals, and the way back from a bad build (2.22c–2.22e, unreleased)
+## platform-stack 0.2.59 / operator v0.2.45 — day-2 signals, the way back from a bad build, and durable Redis credentials (2.22c–2.22f, unreleased)
 
 Four defects found by rewriting the guides, and one recovery path that never
 existed. Released as one batch; nothing here has been pushed.
@@ -45,6 +45,9 @@ existed. Released as one batch; nothing here has been pushed.
   kubelet's own `PodResizePending` / `PodResizeInProgress` conditions, plus a
   startup probe that reports a cluster whose Kubernetes predates in-place
   resize rather than leaving `updateMode: InPlace` silently actuating nothing.
+- **Redis credentials survive a Dragonfly restart** (ADR 0042 §10). The ACL set
+  is written to a file the instance loads at startup, so a pod restart no
+  longer drops every tenant's credential at once.
 
 ### Fixed
 
@@ -64,6 +67,18 @@ existed. Released as one batch; nothing here has been pushed.
   whoever sealed it.
 - **The rollback patch body was hand-spliced with `format!`**, so any revision
   containing a quote produced malformed JSON.
+- **A Dragonfly restart was a cluster-wide Redis authentication outage.** One
+  ephemeral and one persistent instance serve every tenant, so a single pod
+  restart locked out every application for up to five minutes. For a
+  `persistent: true` claim it was sharper still: the keyspace came back from
+  the snapshot and the tenant was locked out of its own intact data.
+- **A revoked tenant's grant could come back.** Nothing shrank an instance's
+  durable state when its last claim was garbage-collected, so a restart could
+  re-grant a credential the platform had already revoked.
+- **The size sampler deleted a live claim's whole allocation** (see the
+  operator changelog above) — pruned `ready`, `instance`, `dbnum` and
+  `connectionSecretRef`, re-provisioning a working claim and destroying its
+  data. Introduced in this same unreleased batch and fixed before publication.
 - **Two git-ownership guards could never fire** (D18). `kubectl` strips
   `metadata.managedFields` from `get -o json` unless asked, so the warning that
   an infra repository owns `spec.network.egress.profile` (shipped in 2.10) and
@@ -87,6 +102,19 @@ existed. Released as one batch; nothing here has been pushed.
   `imagePolicy.resolve: off`.
 - **`apprafter doctor` fails rather than warns** on a binary the CLI cannot
   work without. A missing `kubectl` used to exit 0 with "Ready to go".
+
+### Security
+
+- **`INFO` and `PUBSUB` are revoked from application credentials** (ADR 0042
+  §11). `INFO KEYSPACE` reported every non-empty database on the shared
+  instance regardless of the caller's own, and `PUBSUB CHANNELS` returned
+  every pub/sub application's Kubernetes namespace and name in plaintext.
+  Neither can be narrowed to one tenant in the ACL grammar. Publishing and
+  subscribing on your own prefix are unaffected, as are client handshakes.
+- **Recorded and not fixed:** `CLIENT` cannot be scoped to subcommands at the
+  pinned Dragonfly version, so an application can still enumerate and
+  terminate another application's connections on the shared instance. The
+  remedy is a dedicated instance, which is already the higher-tier answer.
 
 ### Known limits
 

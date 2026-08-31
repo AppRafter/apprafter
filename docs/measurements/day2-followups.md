@@ -24,7 +24,7 @@ would otherwise touch the same code three times.
 | **D2** | `--cron` / `--check-cron` are the wrong surface, not an unvalidated one | open (docs half landed, CLI half did not) | 2.22g |
 | **D3** | Two diagnostics whose `help:` text describes a layout that moved | RESOLVED | — |
 | **D4** | Removing a `needs.*` entry orphans its ResourceClaim forever | FIXED 2.22b — walk-verified | 2.22b |
-| **D5** | A Dragonfly restart drops every claim's ACL user | open — high | 2.22f |
+| **D5** | A Dragonfly restart drops every claim's ACL user | FIXED 2.22f — walk rewritten, run in flight | 2.22f |
 | **D6** | Rotating a secret does not take effect until something else restarts the pods | FIXED 2.22c — walk owed | 2.22c |
 | **D7** | The CLI cannot answer the question its own error asks | FIXED 2.22c — walk owed | 2.22c |
 | **D8** | A node-scoped warning published through an optional object | FIXED 2.22d — walk step still owed | 2.22d |
@@ -36,7 +36,7 @@ would otherwise touch the same code three times.
 | **D14** | Re-sealing a secret performs a gated change through an ungated door | RESOLVED (decision + disclosure landed 2.22c) |
 | **D15** | The destructive-change gate never engaged for a base-only app | RESOLVED |
 | **D16** | A reconcile that fails leaves no trace outside the operator's log | open — high |
-| **D17** | A Dragonfly tenant can read every other tenant's key counts | open — medium, isolation | 2.22f |
+| **D17** | A Dragonfly tenant can read every other tenant's key counts | FIXED 2.22f — and it was larger than key counts | 2.22f |
 | **D18** | Two git-ownership guards could never fire: kubectl hides `managedFields` | FIXED 2.22e | 2.22e |
 | **D19** | The 2.22d size sampler deletes a live claim's whole allocation | FIXED 2.22f — same day, self-inflicted | 2.22f |
 
@@ -522,7 +522,12 @@ untouched. Without that last one the class stays invisible exactly as it is now.
 
 **Opened:** 2026-08-30 (2.20c, correcting `docs/operator-guide/redis.md` and
 `docs/how-it-works/needs-redis.md`).
-**Status:** OPEN.
+**Status:** FIXED 2026-08-31 (2.22f, ADR 0042 §10). Walk rewritten and running
+at the time of writing.
+
+**Two claims in the analysis below were REFUTED while implementing, both in the
+dangerous direction.** They are corrected inline, but read the ADR §10 text as
+the record.
 **Severity:** high. A single pod restart is a cluster-wide Redis
 authentication outage for every non-persistent claim, for up to five minutes.
 
@@ -2220,7 +2225,13 @@ RBAC verb — shows up in `app status` without reading a log.
 per-database size for D8. Not the thing being looked for, which is how this
 kind of finding usually arrives.
 
-**Status:** OPEN.
+**Status:** FIXED 2026-08-31 (2.22f, ADR 0042 §11) — and the finding was
+larger than recorded here. `PUBSUB CHANNELS` output is not filtered by the
+user's `&{user}:*` patterns, and channel names carry the Kubernetes namespace
+and application name, so it returned every pub/sub tenant's IDENTITY, not just
+key counts. Both `+info` and `PUBSUB` are dropped. `CLIENT` remains granted and
+cannot be scoped to subcommands at this version — recorded as an accepted risk
+in ADR 0042 §11 rather than inherited silently.
 **Severity:** medium. Metadata only — no keys, no values — but it is an
 isolation boundary the platform claims and does not hold.
 
