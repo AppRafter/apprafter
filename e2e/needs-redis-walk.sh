@@ -1182,17 +1182,94 @@ case "$init_config" in
     *) printf 'ERROR: CONFIG GET was permitted — ACL over-widened past §5: %q\n' "$init_config" >&2; exit 1 ;;
 esac
 
+# ---- ADR 0042 §11 (D17): cross-tenant metadata is denied ---------------
+# INFO KEYSPACE emits a line per NON-EMPTY database regardless of the DB the
+# connection selected, so with `+info` a tenant could enumerate which other
+# tenants hold data and how much. There is no section- or DB-scoped grant.
+info_reply=$(redis_as "$ACL_USER" "$PW" -n "$claim_dbnum" INFO KEYSPACE)
+case "$info_reply" in
+    *NOPERM*) printf '  ok: INFO denied — a tenant cannot enumerate other tenants key counts\n' ;;
+    *) printf 'ERROR: INFO was permitted — every tenant can read every other tenant %s keyspace stats: %q\n' "'" "$info_reply" >&2; exit 1 ;;
+esac
+# PUBSUB is the larger leak and was not in the original finding: its output
+# is NOT filtered by the user's `&{user}:*` patterns, and channel names carry
+# the Kubernetes namespace and application name.
+pubsub_reply=$(redis_as "$ACL_USER" "$PW" -n "$claim_dbnum" PUBSUB CHANNELS '*')
+case "$pubsub_reply" in
+    *NOPERM*) printf '  ok: PUBSUB CHANNELS denied — tenant identities are not enumerable\n' ;;
+    *) printf 'ERROR: PUBSUB CHANNELS was permitted — it returns every pub/sub tenant namespace and app name: %q\n' "$pubsub_reply" >&2; exit 1 ;;
+esac
+# And pub/sub ITSELF must still work: PUBSUB is a distinct command from
+# PUBLISH/SUBSCRIBE, so revoking it must not cost the feature.
+pub_ok=$(redis_as "$ACL_USER" "$PW" -n "$claim_dbnum" PUBLISH "${ACL_USER}:probe" hello)
+case "$pub_ok" in
+    *NOPERM*) printf 'ERROR: PUBLISH on the tenant own channel prefix was denied — -pubsub took the feature with it: %q\n' "$pub_ok" >&2; exit 1 ;;
+    *) printf '  ok: PUBLISH on the tenant own channel prefix still works (%q)\n' "$pub_ok" ;;
+esac
+
 # ---- Pre-merge #6: kill the Dragonfly pod -> reconcile loop re-pins the
 #      user -> the app reconnects without NOPERM ------------------------
-# Per-claim ACL users live in the running process, not on the CR, so a pod
-# restart wipes them. The connection Secret's DSN is unchanged, but the
-# user no longer exists on the fresh pod, so the app's login fails
-# (WRONGPASS/NOPERM) until the acl_reconcile loop (300s resync) re-asserts
-# it. We poll the web user's login until it PINGs again — proving the
-# reconcile loop re-pinned the user and the app reconnects without NOPERM
-# (the transient failure window between Ready and re-pin is racy, so we do
-# not assert it; eventual recovery is the acceptance criterion).
+# 2.22f (ADR 0042 §10) REWROTE THIS PHASE. It used to poll the tenant's
+# login for up to 420 seconds and accept eventual recovery, under a comment
+# saying the outage window "is racy, so we do not assert it". That did not
+# leave the defect uncovered — it CODIFIED it as passing. The walk saw a
+# cluster-wide authentication outage twice per run and wrote the decision to
+# tolerate it into the acceptance criterion.
+#
+# The assertion is now that authentication was NEVER lost: the ACL set is
+# persisted to a file the instance loads at startup, so the tenant's user
+# exists from the first moment the pod serves.
+#
+# THE OPERATOR IS SCALED TO ZERO BEFORE THE KILL, and that is what makes the
+# assertion mean something. With the operator running, a fast re-pin could
+# make a polling assertion pass while the file did nothing — the degenerate
+# case. With it stopped, NOTHING can create the user at runtime, so a
+# successful single-shot login can only come from the file.
 redis_admin -n "$claim_dbnum" SET repin-marker present >/dev/null || true
+
+# The loop must have written the file before we can test that it works.
+printf '  waiting for the durable ACL file to carry the web user ...\n'
+acl_deadline=$(( $(date +%s) + 420 ))
+acl_ok=""
+while [ "$(date +%s)" -lt "$acl_deadline" ]; do
+    body=$(kubectl -n "$DF_NS" get secret "${DF_INSTANCE}-acl" \
+        -o jsonpath='{.data.acl}' 2>/dev/null | base64 -d 2>/dev/null || true)
+    if printf '%s' "$body" | grep -q "^USER ${ACL_USER} "; then acl_ok="yes"; break; fi
+    sleep 10
+done
+if [ "$acl_ok" != "yes" ]; then
+    printf 'ERROR: the ACL file never carried USER %s — durability was never established, so the restart assertion below would prove nothing\n' "$ACL_USER" >&2
+    kubectl -n "$DF_NS" get secret "${DF_INSTANCE}-acl" -o yaml >&2 2>&1 || true
+    exit 1
+fi
+printf '  ok: durable ACL file carries USER %s\n' "$ACL_USER"
+
+# The file is only loaded if the CR points at it.
+acl_ref=$(kubectl -n "$DF_NS" get dragonfly "$DF_INSTANCE" \
+    -o jsonpath='{.spec.aclFromSecret.name}' 2>/dev/null || true)
+if [ "$acl_ref" = "${DF_INSTANCE}-acl" ]; then
+    printf '  ok: Dragonfly CR loads %s at startup\n' "$acl_ref"
+else
+    printf 'ERROR: spec.aclFromSecret is %q, expected %s — the file exists but nothing reads it\n' "$acl_ref" "${DF_INSTANCE}-acl" >&2
+    exit 1
+fi
+
+# The default line must be present. Its ABSENCE is not a lockout — it makes
+# the loaded default `nopass +@all ~* &*` and turns authentication OFF on the
+# instance serving every tenant. Assert it in the file before asserting it on
+# the wire below.
+if printf '%s' "$body" | grep -q '^USER default on >'; then
+    printf '  ok: the ACL file carries a well-formed default line\n'
+else
+    printf 'ERROR: the ACL file has no `USER default on >` line — loading it would DISABLE authentication on this instance\n' >&2
+    exit 1
+fi
+
+printf '  scaling the operator to 0 so nothing can re-pin at runtime ...\n'
+kubectl -n apprafter-system scale deploy/apprafter-operator --replicas=0
+kubectl -n apprafter-system wait --for=delete pod \
+    -l app.kubernetes.io/name=apprafter-operator --timeout=120s 2>/dev/null || true
+OLD_DF_UID=$(kubectl -n "$DF_NS" get pod "${DF_INSTANCE}-0" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
 
 printf '  killing the ephemeral Dragonfly pod (wipes runtime ACL users) ...\n'
 # Delete the StatefulSet pod by its deterministic name and WAIT for it to
@@ -1210,27 +1287,60 @@ printf '  waiting for the ephemeral instance to roll back to Ready ...\n'
 retry 40 10 -- kubectl -n "$DF_NS" wait --for=condition=Ready \
     "pod/${DF_INSTANCE}-0" --timeout=30s
 
-# The reconcile loop re-pins within ~one RESYNC_INTERVAL (300s). Poll the
-# web user's login until it succeeds again (no WRONGPASS/NOPERM). Budget a
-# little over one interval for the resync to fire + ACL SETUSER to land.
-printf '  waiting for the reconcile loop to re-pin the web ACL user ...\n'
-deadline=$(( $(date +%s) + 420 ))
-repinned=""
-while [ "$(date +%s)" -lt "$deadline" ]; do
-    got=$(redis_as "$ACL_USER" "$PW" -n "$claim_dbnum" PING)
-    if [ "$got" = "PONG" ]; then
-        repinned="ok"
-        break
-    fi
-    printf '    %s: web login not re-pinned yet (got=%q)\n' "$(date +%H:%M:%S)" "$got"
-    sleep 10
-done
-if [ "$repinned" != "ok" ]; then
-    printf 'ERROR: web ACL user was NOT re-pinned after the pod restart — reconcile loop did not recover the user\n' >&2
-    redis_admin ACL LIST >&2 2>&1 || true
+# The pod really is a different one — otherwise everything below would be
+# asserting against a process that never lost its in-memory ACL table.
+NEW_DF_UID=$(kubectl -n "$DF_NS" get pod "${DF_INSTANCE}-0" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+if [ -n "$OLD_DF_UID" ] && [ "$OLD_DF_UID" = "$NEW_DF_UID" ]; then
+    printf 'ERROR: the Dragonfly pod uid did not change (%s) — it never restarted, so nothing below is evidence\n' "$OLD_DF_UID" >&2
+    kubectl -n apprafter-system scale deploy/apprafter-operator --replicas=1 || true
     exit 1
 fi
-printf '  ok: web user re-pinned by the reconcile loop — app reconnects without NOPERM\n'
+printf '  ok: the instance is a fresh process (uid %s -> %s)\n' "${OLD_DF_UID:0:8}" "${NEW_DF_UID:0:8}"
+
+# SINGLE SHOT, no poll. The operator is stopped, so nothing can create this
+# user at runtime; a PONG here can only come from the file the instance
+# loaded at startup. A poll would reintroduce exactly the "eventual recovery"
+# criterion this phase was rewritten to remove.
+got=$(redis_as "$ACL_USER" "$PW" -n "$claim_dbnum" PING)
+if [ "$got" = "PONG" ]; then
+    printf '  ok: the web user authenticated on the FIRST attempt after the restart — the ACL survived it\n'
+else
+    printf 'ERROR: the web user could not authenticate immediately after the restart (got=%q) — the ACL file did not survive the restart, which is the whole of D5\n' "$got" >&2
+    kubectl -n "$DF_NS" exec "${DF_INSTANCE}-0" -- sh -c 'cat /var/lib/dragonfly/dragonfly.acl' >&2 2>&1 || true
+    kubectl -n apprafter-system scale deploy/apprafter-operator --replicas=1 || true
+    exit 1
+fi
+
+# THE DEFAULT-USER TRIAD. A file that parses but omits `USER default` yields
+# an ACTIVE nopass superuser with authentication disabled — on the instance
+# serving every tenant in the cluster. Assert the boundary in both
+# directions, on the wire, not just in the file.
+noauth=$(kubectl -n "$DF_NS" exec "${DF_INSTANCE}-0" -- \
+    redis-cli --no-auth-warning PING 2>&1 || true)
+case "$noauth" in
+    *NOAUTH*|*Authentication*|*ERR*) printf '  ok: unauthenticated access is refused (%s)\n' "$(printf '%s' "$noauth" | head -c 40)" ;;
+    *) printf 'ERROR: an UNAUTHENTICATED client got %q — the ACL file disabled authentication on a shared instance\n' "$noauth" >&2
+       kubectl -n apprafter-system scale deploy/apprafter-operator --replicas=1 || true
+       exit 1 ;;
+esac
+wrongpw=$(redis_as default "definitely-not-the-admin-password" PING)
+case "$wrongpw" in
+    PONG) printf 'ERROR: the default user accepted a WRONG password — nopass is in effect\n' >&2
+          kubectl -n apprafter-system scale deploy/apprafter-operator --replicas=1 || true
+          exit 1 ;;
+    *) printf '  ok: the default user rejects a wrong password\n' ;;
+esac
+if [ "$(redis_admin PING)" = "PONG" ]; then
+    printf '  ok: the admin password still works — the file did not lock the operator out\n'
+else
+    printf 'ERROR: the admin password no longer works — the default line is malformed (missing `on`?)\n' >&2
+    kubectl -n apprafter-system scale deploy/apprafter-operator --replicas=1 || true
+    exit 1
+fi
+
+printf '  restoring the operator ...\n'
+kubectl -n apprafter-system scale deploy/apprafter-operator --replicas=1
+kubectl -n apprafter-system rollout status deploy/apprafter-operator --timeout=180s
 
 # And the re-pinned user is still confined to its own DB (the re-pin is the
 # SAME $N-scoped grant, not a widened one).
@@ -1303,6 +1413,29 @@ assert_eq "worker SET a durable key in its own DB" "$worker_set" "OK"
 # claim user lacks @admin; this is the platform proving durability).
 redis_admin_on "$DF_INSTANCE_P" "$DF_ADMIN_SECRET_P" SAVE >/dev/null 2>&1 || true
 
+# Same control as the ephemeral phase: the loop must have persisted this
+# instance's users first, and the operator must be STOPPED, or a runtime
+# re-pin could make the assertion below pass while the file did nothing.
+printf '  waiting for the persistent instance durable ACL file to carry the worker ...\n'
+acl_p_deadline=$(( $(date +%s) + 420 ))
+acl_p_ok=""
+while [ "$(date +%s)" -lt "$acl_p_deadline" ]; do
+    body_p=$(kubectl -n "$DF_NS" get secret "${DF_INSTANCE_P}-acl" \
+        -o jsonpath='{.data.acl}' 2>/dev/null | base64 -d 2>/dev/null || true)
+    if printf '%s' "$body_p" | grep -q "^USER ${ACL_USER3} "; then acl_p_ok="yes"; break; fi
+    sleep 10
+done
+if [ "$acl_p_ok" != "yes" ]; then
+    printf 'ERROR: the persistent instance ACL file never carried USER %s\n' "$ACL_USER3" >&2
+    exit 1
+fi
+printf '  ok: persistent instance ACL file carries USER %s\n' "$ACL_USER3"
+
+printf '  scaling the operator to 0 so nothing can re-pin at runtime ...\n'
+kubectl -n apprafter-system scale deploy/apprafter-operator --replicas=0
+kubectl -n apprafter-system wait --for=delete pod \
+    -l app.kubernetes.io/name=apprafter-operator --timeout=120s 2>/dev/null || true
+
 printf '  killing the persistent Dragonfly pod (data must survive) ...\n'
 kubectl -n "$DF_NS" delete pod "${DF_INSTANCE_P}-0" --ignore-not-found 2>/dev/null || true
 
@@ -1311,27 +1444,30 @@ printf '  waiting for the persistent instance to roll back to Ready ...\n'
 retry 40 10 -- kubectl -n "$DF_NS" wait --for=condition=Ready \
     "pod/${DF_INSTANCE_P}-0" --timeout=30s
 
-# The reconcile loop re-pins the worker user, then the durable key is still
-# there (snapshot->PVC restore). Poll login first (re-pin), then read.
-printf '  waiting for the worker ACL user re-pin, then reading the durable key ...\n'
-deadline=$(( $(date +%s) + 420 ))
-survived=""
-while [ "$(date +%s)" -lt "$deadline" ]; do
-    got=$(redis_as_on "$DF_INSTANCE_P" "$ACL_USER3" "$PW3" -n "$claim3_dbnum" \
-        GET durable-key)
-    case "$got" in
-        survives-restart) survived="ok"; break ;;
-        *NOPERM*|*WRONGPASS*) : ;; # user not re-pinned yet — keep polling
-        *) : ;;
-    esac
-    printf '    %s: durable-key not readable yet (got=%q)\n' "$(date +%H:%M:%S)" "$got"
-    sleep 10
-done
-if [ "$survived" != "ok" ]; then
-    printf 'ERROR: durable-key did NOT survive the persistent pod restart — persistence broken\n' >&2
-    exit 1
-fi
-printf '  ok: persistent: true data survived a pod restart (snapshot->PVC restore)\n'
+# 2.22f: SINGLE SHOT, no poll — same rewrite as the ephemeral phase. The
+# 420s poll here tolerated the same outage, and on a PERSISTENT instance it
+# is the sharpest form of the defect: the keyspace comes back from the
+# snapshot and the tenant is locked out of its own intact data. If the ACL
+# file works, the user exists from the first moment the pod serves.
+printf '  reading the durable key as the worker, immediately after the restart ...\n'
+got=$(redis_as_on "$DF_INSTANCE_P" "$ACL_USER3" "$PW3" -n "$claim3_dbnum" GET durable-key)
+case "$got" in
+    survives-restart)
+        printf '  ok: persistent data survived AND the worker authenticated on the first attempt\n' ;;
+    *NOPERM*|*WRONGPASS*)
+        printf 'ERROR: the worker could not authenticate immediately after the restart (got=%q) — the data survived and the tenant is locked out of it, which is the sharpest form of D5\n' "$got" >&2
+        kubectl -n "$DF_NS" exec "${DF_INSTANCE_P}-0" -- sh -c 'cat /var/lib/dragonfly/dragonfly.acl' >&2 2>&1 || true
+        kubectl -n apprafter-system scale deploy/apprafter-operator --replicas=1 || true
+        exit 1 ;;
+    *)
+        printf 'ERROR: durable-key did NOT survive the persistent pod restart (got=%q) — persistence broken\n' "$got" >&2
+        kubectl -n apprafter-system scale deploy/apprafter-operator --replicas=1 || true
+        exit 1 ;;
+esac
+
+printf '  restoring the operator ...\n'
+kubectl -n apprafter-system scale deploy/apprafter-operator --replicas=1
+kubectl -n apprafter-system rollout status deploy/apprafter-operator --timeout=180s
 
 # ===============================================================
 # Phase 11: delete + snapshot (2.4f/2.6-4) — RetainedClaim (dragonfly), cascade

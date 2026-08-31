@@ -1761,7 +1761,12 @@ compatibility: "0.2.39": {
 }
 
 compatibility: "0.2.59": {
-	change:          "requires-restart"
+	// `breaking` rather than `requires-restart`: behaviourally the same gate
+	// (both create a platform MigrationPlan and wait for approval), but this
+	// release REVOKES a documented grant from live tenant credentials and
+	// rolls every Dragonfly instance once. An operator approving it should
+	// read that, not infer it from "restart".
+	change:          "breaking"
 	operatorVersion: "v0.2.45"
 	notes: """
 		Three day-2 signals that nobody received, and the recovery path for a
@@ -1808,7 +1813,39 @@ compatibility: "0.2.59": {
 		it is identifiably running older configuration — without putting the digest
 		on the pod template, which would roll every consumer on every secret change.
 
-		Requires a restart: new operator image. No CRD change — `status` carries
+		A DRAGONFLY RESTART NO LONGER DROPS EVERY TENANT'S CREDENTIALS (ADR 0042
+		§10). Per-claim ACL users were runtime-only, so one pod restart was a
+		cluster-wide Redis authentication outage — one ephemeral and one persistent
+		instance serve every tenant — recovered by a blind 300s sweep, mean 150s.
+		For a `persistent: true` claim it was sharper: the keyspace came back from
+		the snapshot and the tenant was locked out of its own intact data. The ACL
+		set is now written to a file the instance loads at startup.
+
+		**ONE-TIME ROLL, AND EPHEMERAL REDIS TENANTS LOSE THEIR KEYSPACE.** Pointing
+		an existing instance at its ACL file makes the dragonfly-operator roll the
+		StatefulSet once. A `persistent: true` instance restores from its snapshot;
+		an EPHEMERAL one holds nothing durable by declaration, so its data is gone.
+		Schedule this approval accordingly — after it, the field is set and the
+		instance never rolls for this reason again.
+
+		**`INFO` AND `PUBSUB` ARE REVOKED FROM TENANT CREDENTIALS** (ADR 0042 §11).
+		`INFO KEYSPACE` enumerated every non-empty database on the shared instance
+		regardless of the caller's own, and `PUBSUB CHANNELS` returned every
+		pub/sub tenant's Kubernetes namespace and application name in plaintext —
+		neither is scopeable in the ACL grammar, so both are dropped. Pub/sub
+		itself is unaffected, and client handshakes are unaffected.
+
+		**A BULLMQ TENANT MUST SET `skipVersionCheck: true`.** Its version probe
+		calls `INFO` unconditionally and its `init()` rejects without it — one
+		line, tenant-side. ioredis >= 5 degrades to a warning; node-redis,
+		redis-py, go-redis, lettuce and jedis never call `INFO` on connect.
+
+		The Dragonfly SERVER image is now pinned (`v1.37.0`). It was previously
+		whatever the dragonfly-operator's compiled-in default happened to be, and
+		every ACL guarantee above is a property of that tag.
+
+		Requires a restart: new operator image, plus the one-time Dragonfly roll
+		described above. No CRD change — `status` carries
 		`x-kubernetes-preserve-unknown-fields`.
 		"""
 }
