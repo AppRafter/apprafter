@@ -199,6 +199,14 @@ rules:
   # elapses — if it is back (a recovery re-claim) the GC deletes the
   # stale snapshot instead of dropping a now-live claim's role/DB. The
   # `get` verb already granted here covers that read (no new verb).
+  # 2.22b (D4): `delete` — the Application controller removes a claim
+  # whose `needs.*` entry the user dropped, which is what starts the
+  # documented retention path (deletionTimestamp -> provisioner
+  # finalizer -> RetainedClaim -> seven-day window). Four documents said
+  # this already happened; nothing deleted, and this rule carried no
+  # `delete`, so no code path COULD have. Granted in the same change as
+  # the code that uses it — the lesson from the ADR 0048 anchor 403 and
+  # the 0.2.31 MigrationPlan GC, both of which shipped a verb short.
   - apiGroups:
       - apprafter.io
     resources:
@@ -210,6 +218,7 @@ rules:
       - create
       - patch
       - update
+      - delete
   # ResourceClaim status — written by the 2.3 scheduler and the
   # 2.4c provisioner only (NOT the Application controller). No
   # `create` here.

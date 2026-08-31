@@ -68,6 +68,22 @@ pub struct Claim {
     /// The incident. Every entry earned its place; this says how, so a
     /// later reader can judge whether it is still worth carrying.
     pub because: &'static str,
+    /// Whether the phrase is TRUE of the tree as this entry was last
+    /// reviewed.
+    ///
+    /// Most entries are `false` — a page said something the fix had
+    /// already made untrue. An entry flips to `true` when its fix lands,
+    /// and stays in the table to catch a revert.
+    ///
+    /// Recorded rather than assumed because assuming it cost us: the
+    /// original GC entry anchored on the `resourceclaims` verb list
+    /// *without* `delete`, reasoning that "no implementation can delete a
+    /// claim without this rule changing first". 2.22b appended `- delete`
+    /// to that rule and the anchor, being a prefix of the new list, went
+    /// on matching — so the claim kept reading false while the behaviour
+    /// had become true, and the invariant test could not see it because a
+    /// rotted anchor reads exactly like an unfixed defect.
+    pub holds_today: bool,
 }
 
 /// The watched sentences.
@@ -85,6 +101,7 @@ pub const CLAIMS: &[Claim] = &[
                   f7ee105 made the kubeconfig lazy. backup-restore.md kept \
                   describing the old behaviour for a week, and every name in \
                   the passage still resolved.",
+        holds_today: false,
     },
     Claim {
         phrase: "keeps reporting the old machine",
@@ -94,6 +111,7 @@ pub const CLAIMS: &[Claim] = &[
         because: "the target's saved machine went stale after a \
                   restore --reprovision until e94fb4c adopted the live facts \
                   on the create path. Same page, same week, same silence.",
+        holds_today: false,
     },
     Claim {
         phrase: "rollout restart ds/cilium",
@@ -103,6 +121,7 @@ pub const CLAIMS: &[Claim] = &[
         because: "troubleshooting.md told operators to roll the DaemonSet by \
                   hand after a chart bump long after the chart began stamping \
                   a config checksum that rolls it automatically.",
+        holds_today: false,
     },
     Claim {
         phrase: "redis contents are not captured",
@@ -113,6 +132,7 @@ pub const CLAIMS: &[Claim] = &[
                   captured, false since cli v0.2.51 shipped persistent-redis \
                   snapshots — and the generated reference republished the \
                   claim verbatim from the doc comment.",
+        holds_today: false,
     },
     Claim {
         phrase: "the pinned k8s v1.35",
@@ -130,26 +150,27 @@ pub const CLAIMS: &[Claim] = &[
                   because the gate is on by default at the versions the \
                   channel serves — an upstream default, not something the \
                   platform arranges or would notice changing. D10.",
+        holds_today: false,
     },
     Claim {
         phrase: "backing claim and its data are garbage-collected",
-        evidence: "operator/charts/apprafter-operator/templates/rbac.yaml",
-        // The verb list of the resourceclaims rule, verbatim and without
-        // `delete`. Anchoring on the whole list rather than on the
-        // resource name is what makes this decidable: no implementation
-        // can delete a claim without this rule changing first, so the
-        // phrase becomes true exactly when the list does. Reformatting
-        // the rule breaks the match and fails
-        // `every_seeded_claim_is_false_today` loudly — which is the
-        // right outcome for an edit to the RBAC this hinges on.
-        anchor: "- resourceclaims\n    verbs:\n      - get\n      - list\n      \
-                 - watch\n      - create\n      - patch\n      - update",
-        truth: Expect::Absent,
-        because: "four documents say removing a needs.* entry garbage-collects \
-                  the claim — ADR 0051 twice, spec.md and migration-plans.md. \
-                  Nothing deletes it, and the operator's RBAC carries no delete \
-                  verb on resourceclaims at all, so no code path could. Tracked \
-                  in docs/measurements/day2-followups.md.",
+        evidence: "operator/operator-controllers/application/src/lib.rs",
+        // Anchored on the FUNCTION that does the deleting, not on the RBAC
+        // that permits it. The first version anchored on the resourceclaims
+        // verb list without `delete`, on the reasoning that no code could
+        // delete a claim without that rule changing — true, but the anchor
+        // was a PREFIX of the list, so 2.22b appended `- delete` and the
+        // anchor went on matching. Anchoring on the behaviour cannot rot
+        // that way: the phrase is true exactly while something deletes.
+        anchor: "async fn prune_orphaned_claims",
+        truth: Expect::Present,
+        because: "four documents said removing a needs.* entry garbage-collects \
+                  the claim — ADR 0051 twice, spec.md and migration-plans.md — \
+                  while nothing deleted it and the operator's RBAC carried no \
+                  delete verb at all. Fixed in 2.22b (D4); the entry stays to \
+                  catch a revert, which would make every one of those four \
+                  documents wrong again.",
+        holds_today: true,
     },
 ];
 
@@ -230,19 +251,25 @@ mod tests {
     }
 
     #[test]
-    fn every_seeded_claim_is_false_today() {
-        // Each entry exists because a page said this and the fix had
-        // already landed. If one starts holding again, either the fix
-        // was reverted — which is worth knowing loudly — or the anchor
-        // stopped meaning what it meant.
+    fn every_claim_matches_its_recorded_state() {
+        // Replaces an assertion that every claim is false today. That held
+        // while every entry was an unfixed defect, and it hid the failure
+        // it was meant to catch: when 2.22b fixed the GC defect, its
+        // anchor did not flip (it was a prefix of the rule it watched), so
+        // the claim kept reading false and a blanket "all false" passed.
+        //
+        // Recording each entry's state makes both directions loud: a fix
+        // landing without its entry being reviewed fails here, and so does
+        // a revert.
         let root = root();
         for claim in CLAIMS {
-            assert!(
-                !holds(&root, claim).expect("evidence readable"),
-                "`{}` is true of the tree again. Either the fix behind it was \
-                 reverted, or `{}` no longer decides it. Both need a human.",
-                claim.phrase,
-                claim.anchor
+            let actual = holds(&root, claim).expect("evidence readable");
+            assert_eq!(
+                actual, claim.holds_today,
+                "`{}` is now {} of the tree but the table records {}. Either the \
+                 behaviour changed and this entry needs reviewing, or `{}` stopped \
+                 deciding it. Both need a human.",
+                claim.phrase, actual, claim.holds_today, claim.anchor
             );
         }
     }
@@ -293,6 +320,7 @@ mod tests {
             truth: Expect::Present,
             because: "a fixture: its anchor is this table, so the phrase is \
                       true for as long as this module exists.",
+            holds_today: true,
         };
         let page = "The operator reconciles the application on every change.\n";
         assert!(falsified(&root, page, &[alive]).expect("judged").is_empty());

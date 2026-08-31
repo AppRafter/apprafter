@@ -502,9 +502,42 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     let effective = effective_spec(&app, app.spec.environment.as_deref())
         .expect("effective_spec validated at the migration gate (step 1) — Ok is invariant here");
     let has_needs = effective.needs.as_ref().is_some_and(|n| !n.is_empty());
+    let app_uid = app.metadata.uid.clone().unwrap_or_default();
+
+    // The desired claim set, hoisted OUT of the `has_needs` arm below so the
+    // prune that follows can see it even when it is empty.
+    let payloads = if has_needs {
+        generate_resource_claims(&effective, &name, &app_uid, &namespace)
+    } else {
+        Vec::new()
+    };
+
+    // ---- 2.22b (D4): delete the claims this Application no longer declares ----
+    //
+    // Placed here for three reasons, each of which a more obvious position
+    // gets wrong:
+    //
+    //  * OUTSIDE the `has_needs` arm. That arm is gated on the NEW spec, so
+    //    removing the LAST need skips it wholesale and any `else` inside it
+    //    never runs — which is why "a third prune arm in the same shape as
+    //    `prune_http_route`" does not work here.
+    //  * BEFORE the readiness gate below. That gate returns early while any
+    //    remaining claim is unready; an orphan behind it would wait for a
+    //    sibling it has nothing to do with.
+    //  * AFTER the migration gate at step 1, which returns early while a plan
+    //    is pending. `needs-removal` is a detected, `data-migration`-classified
+    //    trigger, so by the time execution is here the removal has been
+    //    approved. Nothing is destroyed on an unapproved edit.
+    //
+    // The delete is what starts the documented retention path: the apiserver
+    // stamps a deletionTimestamp, the provisioner finalizer snapshots a
+    // RetainedClaim, and the seven-day clock begins. Until now nothing deleted,
+    // so none of that ever ran for a removed need.
+    let desired: std::collections::BTreeSet<String> =
+        payloads.iter().map(|(n, _)| n.clone()).collect();
+    prune_orphaned_claims(&ctx.client, &namespace, &app_uid, &desired).await?;
+
     if has_needs {
-        let app_uid = app.metadata.uid.clone().unwrap_or_default();
-        let payloads = generate_resource_claims(&effective, &name, &app_uid, &namespace);
         let claim_api: Api<ResourceClaim> = Api::namespaced(ctx.client.clone(), &namespace);
         for (claim_name, payload) in &payloads {
             claim_api
@@ -725,6 +758,18 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
 
     if let Some(service) = &rendered.service {
         apply_service(&ctx.client, &namespace, service, &pp).await?;
+    } else {
+        // 2.22b (D12): the app dropped `expose`, so the Service it rendered
+        // must go. It never did: 1.83b's design doc asserted "same prune
+        // discipline the Service already follows", the implementer found that
+        // false and recorded it in `prune_http_route`'s own doc comment — "the
+        // Service has no analogous prune" — and shipped the route arm alone.
+        // `delete` on services has been in the RBAC the whole time.
+        //
+        // A singleton at a name derived from the app's, so the fixed-name
+        // shape is right here; claims needed the desired-set diff above only
+        // because their names are data-dependent.
+        prune_service(&ctx.client, &namespace, &name).await?;
     }
 
     // 2.10 (ADR 0045): SSA-apply the per-Application egress CNP — but ONLY
@@ -737,6 +782,14 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         if let Some(cnp) = rendered.network_policy.take() {
             let owner = owner_reference(&app);
             apply_network_policy(&ctx.client, &namespace, &owner, cnp).await?;
+        } else {
+            // 2.22b (D12): defensive rather than reachable today — the
+            // controller always threads `needs_targets`, so this arm belongs
+            // to the bare `render_application` entry point used by tests. It
+            // exists so the table of "children that disappear when
+            // undeclared" has no remaining blank, which is how the other two
+            // gaps survived.
+            prune_network_policy(&ctx.client, &namespace, &name).await?;
         }
     } else {
         debug!(
@@ -1272,6 +1325,115 @@ async fn apply_vpa(
 /// Best-effort delete of a stale `VerticalPodAutoscaler` named `name` (the app
 /// switched to pro-mode / explicit resources). 404-tolerant (a missing VPA is a
 /// no-op — it may never have existed, or already cascaded). 2.16e.
+/// Names of live claims this Application owns and no longer declares.
+///
+/// Pure, so the safety rules below are testable without a cluster — which
+/// matters more here than anywhere else in this file, because getting them
+/// wrong deletes a tenant's database.
+///
+/// Three guards, each load-bearing:
+///
+///  * **An empty `app_uid` prunes nothing.** `app.metadata.uid` is read with
+///    `unwrap_or_default()`, so an Application without one yields `""` — and
+///    `""` would match every claim carrying no controller reference. Refusing
+///    outright is the only safe reading of "I cannot prove I own this".
+///  * **Ownership is the CONTROLLER reference, not any owner reference.** A
+///    claim may legitimately carry several; only the controlling one means
+///    "this Application decides whether it exists".
+///  * **A claim already terminating is left alone.** It has a
+///    deletionTimestamp, so the finalizer is running and the retention
+///    snapshot is being written; a second delete would race that.
+pub(crate) fn claims_to_prune<'a>(
+    live: &'a [ResourceClaim],
+    app_uid: &str,
+    desired: &std::collections::BTreeSet<String>,
+) -> Vec<&'a str> {
+    if app_uid.is_empty() {
+        return Vec::new();
+    }
+    live.iter()
+        .filter(|c| c.metadata.deletion_timestamp.is_none())
+        .filter(|c| {
+            c.metadata
+                .owner_references
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|o| o.controller.unwrap_or(false) && o.uid == app_uid)
+        })
+        .filter_map(|c| c.metadata.name.as_deref())
+        .filter(|n| !desired.contains(*n))
+        .collect()
+}
+
+/// Delete the claims this Application owns and no longer declares (2.22b / D4).
+///
+/// This is the first thing in this controller that removes a child on the
+/// strength of the desired set rather than a fixed name — the generic form the
+/// two singleton prune arms below could not generalise into, because claim
+/// names are data-dependent (`<app>-<type>[-<name>]`) and the loop had no view
+/// of the live set at all.
+///
+/// 404-tolerant per claim, and a failure on one claim does not abandon the
+/// rest: the next reconcile retries, and leaving a second orphan behind
+/// because the first errored would be the worse outcome.
+async fn prune_orphaned_claims(
+    client: &Client,
+    namespace: &str,
+    app_uid: &str,
+    desired: &std::collections::BTreeSet<String>,
+) -> Result<(), ReconcileError> {
+    if app_uid.is_empty() {
+        return Ok(());
+    }
+    let api: Api<ResourceClaim> = Api::namespaced(client.clone(), namespace);
+    let live = api.list(&Default::default()).await?.items;
+    for name in claims_to_prune(&live, app_uid, desired) {
+        info!(
+            %name, %namespace,
+            "claim is no longer declared by its owning Application — deleting; \
+             the provisioner finalizer snapshots a RetainedClaim and starts the \
+             retention window"
+        );
+        match api.delete(name, &DeleteParams::default()).await {
+            Ok(_) => {}
+            Err(kube::Error::Api(e)) if e.code == 404 => {}
+            Err(e) => {
+                warn!(%name, %namespace, %e, "failed to delete orphaned claim; retrying next reconcile");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort delete of a stale `Service` (2.22b / D12). 404-tolerant.
+async fn prune_service(client: &Client, namespace: &str, name: &str) -> Result<(), ReconcileError> {
+    let api: Api<Service> = Api::namespaced(client.clone(), namespace);
+    match api.delete(name, &DeleteParams::default()).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Best-effort delete of a stale egress `CiliumNetworkPolicy` (2.22b / D12).
+/// 404-tolerant, and tolerant of the CRD being absent entirely — this runs
+/// only under the `cilium_available` probe, but a cluster that loses the CRD
+/// between probe and delete must not fail a reconcile over it.
+async fn prune_network_policy(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+) -> Result<(), ReconcileError> {
+    let api: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), namespace, &cnp_api_resource());
+    match api.delete(name, &DeleteParams::default()).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 async fn prune_vpa(client: &Client, namespace: &str, name: &str) -> Result<(), ReconcileError> {
     let api: Api<DynamicObject> =
         Api::namespaced_with(client.clone(), namespace, &vpa_api_resource());
@@ -4300,6 +4462,100 @@ mod tests {
         assert_eq!(payload["spec"]["type"], json!("disk"));
         assert_eq!(payload["spec"]["name"], json!("data"));
         assert_eq!(payload["spec"]["size"], json!("2Gi"));
+    }
+
+    /// A claim owned (or not) by `owner_uid`, for the prune tests.
+    fn owned_claim(name: &str, owner_uid: Option<&str>, controller: bool) -> ResourceClaim {
+        let mut c = ready_claim(name, Some(true), Some("s"));
+        c.metadata.owner_references = owner_uid.map(|uid| {
+            vec![
+                k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                    api_version: "apprafter.io/v1alpha1".into(),
+                    kind: "Application".into(),
+                    name: "web".into(),
+                    uid: uid.into(),
+                    controller: Some(controller),
+                    block_owner_deletion: Some(true),
+                },
+            ]
+        });
+        c
+    }
+
+    fn desired(names: &[&str]) -> std::collections::BTreeSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn it_prunes_a_claim_the_app_owns_and_no_longer_declares() {
+        // The D4 case exactly: a two-need app drops one need. The
+        // remaining claim stays; the dropped one goes.
+        let live = vec![
+            owned_claim("web-pg", Some("uid-1"), true),
+            owned_claim("web-redis", Some("uid-1"), true),
+        ];
+        let out = claims_to_prune(&live, "uid-1", &desired(&["web-pg"]));
+        assert_eq!(out, vec!["web-redis"]);
+    }
+
+    #[test]
+    fn removing_the_last_need_still_prunes() {
+        // The position that matters: `has_needs` is false here, so a
+        // prune living inside that arm would never run. Every claim is
+        // undeclared and every one must go.
+        let live = vec![owned_claim("web-pg", Some("uid-1"), true)];
+        assert_eq!(
+            claims_to_prune(&live, "uid-1", &desired(&[])),
+            vec!["web-pg"]
+        );
+    }
+
+    #[test]
+    fn an_empty_app_uid_prunes_nothing_at_all() {
+        // `app.metadata.uid` is read with `unwrap_or_default()`, so an
+        // Application without one yields "". Matching on "" would delete
+        // every claim carrying no controller reference — somebody else's
+        // databases. Refusing outright is the only safe reading of "I
+        // cannot prove I own this".
+        let live = vec![
+            owned_claim("web-pg", None, false),
+            owned_claim("other-pg", Some("uid-2"), true),
+        ];
+        assert!(claims_to_prune(&live, "", &desired(&[])).is_empty());
+    }
+
+    #[test]
+    fn another_applications_claims_are_never_touched() {
+        let live = vec![
+            owned_claim("web-pg", Some("uid-1"), true),
+            owned_claim("other-pg", Some("uid-2"), true),
+        ];
+        assert_eq!(
+            claims_to_prune(&live, "uid-1", &desired(&[])),
+            vec!["web-pg"]
+        );
+    }
+
+    #[test]
+    fn a_non_controller_owner_reference_does_not_confer_ownership() {
+        // A claim may legitimately carry several owner references; only
+        // the CONTROLLING one means "this Application decides whether it
+        // exists". Treating any reference as ownership would let a
+        // bystander delete it.
+        let live = vec![owned_claim("web-pg", Some("uid-1"), false)];
+        assert!(claims_to_prune(&live, "uid-1", &desired(&[])).is_empty());
+    }
+
+    #[test]
+    fn a_claim_already_terminating_is_left_alone() {
+        // It has a deletionTimestamp, so the provisioner finalizer is
+        // running and the retention snapshot is being written. A second
+        // delete would race that.
+        let mut c = owned_claim("web-pg", Some("uid-1"), true);
+        c.metadata.deletion_timestamp = Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            chrono::Utc::now(),
+        ));
+        assert!(claims_to_prune(&[c], "uid-1", &desired(&[])).is_empty());
     }
 
     fn ready_claim(name: &str, ready: Option<bool>, secret: Option<&str>) -> ResourceClaim {
