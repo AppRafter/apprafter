@@ -135,8 +135,55 @@ pub fn run_seal(
     } else {
         apply_manifest(&cr, kc.path())?;
         println!("sealedsecret/{name} applied to namespace {namespace}");
+        report_consumers(name, namespace, kc.path());
     }
     Ok(())
+}
+
+/// Name the applications this seal just affected, and what has NOT happened
+/// to them yet (2.22c / D6 + D14).
+///
+/// Best-effort: a failure to read the Applications must never turn a
+/// successful seal into an error, so this reports nothing and stays quiet.
+/// The seal already happened; a decorative lookup that fails the command
+/// afterwards would be strictly worse than silence — the operator-RBAC
+/// lesson from ADR 0048, applied to the CLI.
+///
+/// Why it prints at all: a secret is not owned by one application. Nothing
+/// stops three Applications in a namespace resolving the same one, and until
+/// now the person sealing had no way to know that — `seal` said nothing and
+/// the operator holds no reverse index. That unknowable blast radius is the
+/// reason the automatic roll was rejected as a Tier-1 default (D6), which
+/// makes showing it the thing that has to exist instead.
+fn report_consumers(name: &str, namespace: &str, kubeconfig_path: &Path) {
+    let Ok(Some(apps)) = crate::commands::k8s_helpers::kubectl_get_json_cluster_wide(
+        "applications.apprafter.io",
+        None,
+        kubeconfig_path,
+    ) else {
+        return;
+    };
+    let consumers = apps_consuming(&parse_secret_bindings(&apps), namespace, name);
+    if consumers.is_empty() {
+        return;
+    }
+    let n = consumers.len();
+    let plural = if n == 1 {
+        "application"
+    } else {
+        "applications"
+    };
+    println!();
+    println!(
+        "  {n} {plural} in '{namespace}' resolve this secret: {}",
+        consumers.join(", ")
+    );
+    // Deliberately NOT naming a command to restart them: no such verb ships
+    // today, and inventing one in a message is the defect D3 recorded — help
+    // text describing a layout that does not exist.
+    println!(
+        "  Their running pods keep the PREVIOUS value: an environment variable \n           from a secret is resolved once at pod start and never re-read. They \n           pick this value up when they next restart."
+    );
 }
 
 /// Returns `true` when a `SealedSecret` OR a `Secret` named `name` exists
@@ -539,5 +586,213 @@ mod list_tests {
         // exact confusion this command exists to end.
         let out = render_secret_list(&[], "namespace 'shop'");
         assert!(out.contains("namespace 'shop'"), "{out}");
+    }
+}
+
+/// One `secret:"<name>/<key>"` binding, resolved to the Application that
+/// declares it (2.22c / D6 + D7 + D14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretBinding {
+    pub namespace: String,
+    pub app: String,
+    /// `base`, or the environment key the override came from.
+    pub scope: String,
+    pub env_var: String,
+    pub secret: String,
+    pub key: String,
+}
+
+/// Every `secret:` binding declared by the Applications in `apps_json`.
+///
+/// ONE pass, read in BOTH directions — which is the point. Filtered by app
+/// it answers "which secrets does this consume" (D7, diagnosis); filtered by
+/// secret it answers "which applications would this change touch" (D6's
+/// blast radius, D14's disclosure). Building one direction and not the other
+/// would be the waste, since the scan is identical.
+///
+/// Pure: takes the JSON `kubectl get applications -o json` returns, so the
+/// shape is tested without a cluster.
+pub fn parse_secret_bindings(apps_json: &Value) -> Vec<SecretBinding> {
+    let mut out = Vec::new();
+    for item in apps_json
+        .get("items")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let Some(app) = item.pointer("/metadata/name").and_then(Value::as_str) else {
+            continue;
+        };
+        let namespace = item
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        collect_env_bindings(
+            item.pointer("/spec/base/env"),
+            namespace,
+            app,
+            "base",
+            &mut out,
+        );
+        // Per-environment overrides declare their own bindings (2.9), and a
+        // secret referenced only by one environment is just as real as a base
+        // one — omitting them would under-report a blast radius, which is the
+        // direction that costs.
+        if let Some(envs) = item
+            .pointer("/spec/environments")
+            .and_then(Value::as_object)
+        {
+            for (env_name, env_body) in envs {
+                collect_env_bindings(env_body.get("env"), namespace, app, env_name, &mut out);
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        (&a.namespace, &a.secret, &a.app, &a.env_var).cmp(&(
+            &b.namespace,
+            &b.secret,
+            &b.app,
+            &b.env_var,
+        ))
+    });
+    out
+}
+
+fn collect_env_bindings(
+    env: Option<&Value>,
+    namespace: &str,
+    app: &str,
+    scope: &str,
+    out: &mut Vec<SecretBinding>,
+) {
+    let Some(map) = env.and_then(Value::as_object) else {
+        return;
+    };
+    for (var, value) in map {
+        // The CR carries the resolved marker `{secret: "<name>/<key>"}`
+        // (ADR 0046). A literal is a plain string and a claim ref is
+        // `{claim: ...}`; neither is a Secret dependency.
+        let Some(path) = value.get("secret").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some((name, key)) = path.split_once('/') else {
+            // The webhook rejects a malformed ref on the way in, so this
+            // is defensive — but skipping silently is right: a listing is
+            // not the place to re-litigate admission.
+            continue;
+        };
+        out.push(SecretBinding {
+            namespace: namespace.to_string(),
+            app: app.to_string(),
+            scope: scope.to_string(),
+            env_var: var.clone(),
+            secret: name.to_string(),
+            key: key.to_string(),
+        });
+    }
+}
+
+/// The applications that resolve `secret` in `namespace`, deduplicated and
+/// sorted — the blast radius of re-sealing it.
+pub fn apps_consuming(bindings: &[SecretBinding], namespace: &str, secret: &str) -> Vec<String> {
+    let mut apps: Vec<String> = bindings
+        .iter()
+        .filter(|b| b.namespace == namespace && b.secret == secret)
+        .map(|b| b.app.clone())
+        .collect();
+    apps.sort();
+    apps.dedup();
+    apps
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn app(ns: &str, name: &str, base_env: Value, envs: Value) -> Value {
+        json!({
+            "metadata": { "name": name, "namespace": ns },
+            "spec": { "base": { "env": base_env }, "environments": envs }
+        })
+    }
+
+    #[test]
+    fn it_reads_secret_markers_and_ignores_the_other_env_shapes() {
+        // Three value shapes share the env map (ADR 0046): a literal is a
+        // plain string, a claim ref is {claim: ...}, and only {secret: ...}
+        // is a Secret dependency. Counting a claim ref would inflate every
+        // blast radius the D6 disclosure prints.
+        let v = json!({ "items": [app("shop", "web", json!({
+            "STRIPE_KEY": { "secret": "checkout/stripe-api-key" },
+            "DATABASE_URL": { "claim": "pg.url" },
+            "LOG_LEVEL": "info"
+        }), json!({}))]});
+        let b = parse_secret_bindings(&v);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].secret, "checkout");
+        assert_eq!(b[0].key, "stripe-api-key");
+        assert_eq!(b[0].env_var, "STRIPE_KEY");
+        assert_eq!(b[0].scope, "base");
+    }
+
+    #[test]
+    fn a_binding_declared_only_by_an_environment_still_counts() {
+        // Under-reporting is the direction that costs: an operator told
+        // "this touches one app" who then breaks three has been misled by
+        // the surface that was supposed to prevent exactly that.
+        let v = json!({ "items": [app("shop", "web", json!({}), json!({
+            "prod": { "env": { "SENTRY_DSN": { "secret": "obs/dsn" } } }
+        }))]});
+        let b = parse_secret_bindings(&v);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].scope, "prod");
+        assert_eq!(b[0].secret, "obs");
+    }
+
+    #[test]
+    fn the_same_index_answers_both_directions() {
+        // The property that made building one direction alone wasteful.
+        let v = json!({ "items": [
+            app("shop", "web", json!({ "A": { "secret": "shared/k" } }), json!({})),
+            app("shop", "api", json!({ "B": { "secret": "shared/k" } }), json!({})),
+            app("shop", "api", json!({ "C": { "secret": "other/k" } }), json!({})),
+        ]});
+        let b = parse_secret_bindings(&v);
+
+        // secret -> apps (D6 blast radius, D14 disclosure)
+        assert_eq!(apps_consuming(&b, "shop", "shared"), vec!["api", "web"]);
+        // app -> secrets (D7 diagnosis)
+        let webs: Vec<&str> = b
+            .iter()
+            .filter(|x| x.app == "web")
+            .map(|x| x.secret.as_str())
+            .collect();
+        assert_eq!(webs, vec!["shared"]);
+    }
+
+    #[test]
+    fn a_secret_of_the_same_name_in_another_namespace_is_a_different_secret() {
+        // Sealed secrets are namespace-bound by construction, so a blast
+        // radius that ignored the namespace would name innocent apps.
+        let v = json!({ "items": [
+            app("shop", "web", json!({ "A": { "secret": "creds/k" } }), json!({})),
+            app("blog", "site", json!({ "A": { "secret": "creds/k" } }), json!({})),
+        ]});
+        let b = parse_secret_bindings(&v);
+        assert_eq!(apps_consuming(&b, "shop", "creds"), vec!["web"]);
+        assert_eq!(apps_consuming(&b, "blog", "creds"), vec!["site"]);
+    }
+
+    #[test]
+    fn an_app_consuming_a_secret_twice_is_listed_once() {
+        let v = json!({ "items": [app("shop", "web", json!({
+            "A": { "secret": "creds/one" },
+            "B": { "secret": "creds/two" }
+        }), json!({}))]});
+        let b = parse_secret_bindings(&v);
+        assert_eq!(b.len(), 2);
+        assert_eq!(apps_consuming(&b, "shop", "creds"), vec!["web"]);
     }
 }

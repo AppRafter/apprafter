@@ -925,6 +925,12 @@ fn print_app_detail(app: &Value, show_resources: bool, kubeconfig_path: &Path) {
                     eprintln!("⚠ Could not fetch resource-claim state ({e}).");
                 }
             }
+
+            // 5. Secrets this app resolves (2.22c / D7). The app -> secrets
+            // half of the same index `secret seal` reads the other way for
+            // its blast radius. Non-fatal: this is a read that adds context,
+            // and failing `app status` over it would be the wrong trade.
+            print_secret_bindings_for_app(app, inner_name, dest_ns);
         }
         _ => {
             println!();
@@ -1599,6 +1605,45 @@ fn summarise_resource_claim(claim: &Value) -> ResourceClaimSummary {
         ready,
         secret_ref,
         scheduled,
+    }
+}
+
+/// The `secret:` bindings this Application declares, read off the CR the
+/// caller already fetched (2.22c / D7).
+///
+/// No extra API call: `app status` holds the Application JSON, and the
+/// bindings live in its own spec. That is why this direction is nearly free
+/// once the parser exists — the other direction (`secret seal`'s blast
+/// radius) needs a cluster-wide list, this one needs nothing.
+///
+/// Prints the SECRET and KEY names only. A key name is not secret material;
+/// the value is, and nothing here reads one.
+fn print_secret_bindings_for_app(app: &Value, name: &str, namespace: &str) {
+    // parse_secret_bindings takes a LIST shape; wrap the single CR so the
+    // one parser serves both callers rather than growing a near-copy.
+    let wrapped = serde_json::json!({ "items": [app] });
+    let bindings = crate::commands::secret::parse_secret_bindings(&wrapped);
+    if bindings.is_empty() {
+        return;
+    }
+    println!();
+    println!("Secrets ({namespace}/{name}):");
+    let var_w = bindings
+        .iter()
+        .map(|b| b.env_var.len())
+        .max()
+        .unwrap_or(3)
+        .max(3);
+    println!("  {:<var_w$}  SECRET/KEY  (SCOPE)", "ENV", var_w = var_w);
+    for b in &bindings {
+        println!(
+            "  {:<var_w$}  {}/{}  ({})",
+            b.env_var,
+            b.secret,
+            b.key,
+            b.scope,
+            var_w = var_w
+        );
     }
 }
 

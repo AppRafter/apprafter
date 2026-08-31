@@ -69,6 +69,8 @@ apprafter secret remove <name> --namespace <ns> --yes
 
 Seal one or more `--from-literal KEY=VALUE` pairs into a bitnami `SealedSecret`. Fetches the controller's public cert over the TLS-authenticated kube API (strict scope: the sealed blob only unseals as `<namespace>/<name>`).
 
+OPERATOR TOOL, TIER 1 ONLY. SealedSecrets stands in for OpenBao on a single node that has no KMS to auto-unseal one (ADR 0007). It carries no fine-grained access control and no audit trail: anyone able to seal here already holds every credential in the cluster. Tier 2+ replaces it, and `upgrade-tier` migrates what is sealed.
+
 Re-sealing an existing name REPLACES its keys — it does not merge; pass all keys in one command. Use `--yes` to skip the overwrite prompt.
 
 ```text
