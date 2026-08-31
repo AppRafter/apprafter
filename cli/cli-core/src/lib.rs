@@ -11,6 +11,7 @@ pub mod secrets;
 pub mod style;
 pub mod target;
 pub mod tier;
+pub mod tools;
 
 pub use credentials::{
     read_ssh_public_key_body, resolve_hetzner_ssh_public_key, resolve_hetzner_token,

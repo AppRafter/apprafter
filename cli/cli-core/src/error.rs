@@ -69,6 +69,30 @@ pub enum CliError {
     )]
     CueNotFound,
 
+    /// A required external binary is not on `PATH`.
+    ///
+    /// Raised by [`crate::tools::preflight_tool`] BEFORE any prompt, any
+    /// cluster round-trip and any billable provider call — see D11 in
+    /// `docs/measurements/day2-followups.md` for the eight places where
+    /// that ordering was inverted, the worst of which spent a paid
+    /// Hetzner cluster before discovering the binary was missing.
+    #[error("`{tool}` is required by `{needed_by}` ({purpose}) but is not on PATH")]
+    #[diagnostic(
+        code(apprafter::env::tool_not_found),
+        help(
+            "{install}\n\n\
+             Nothing was sent anywhere and no credential was used: this check runs \
+             before the command does any work, so re-running it after installing is \
+             safe. `apprafter doctor` lists every external tool the CLI needs."
+        )
+    )]
+    ExternalToolNotFound {
+        tool: String,
+        needed_by: String,
+        purpose: String,
+        install: String,
+    },
+
     /// Calling `cue export` produced a non-zero exit code.
     #[error("cue export failed (exit {exit}): {stderr}")]
     #[diagnostic(
@@ -460,6 +484,34 @@ mod tests {
         assert!(
             help.contains("docs/contributing/setup.md"),
             "missing setup-doc hint: {help}"
+        );
+    }
+
+    #[test]
+    fn tool_not_found_names_the_command_and_carries_the_install_hint() {
+        // The two halves that make this variant worth having over the
+        // catch-all: the reader learns which command is blocked, and
+        // gets an install line rather than `os error 2`.
+        let err = CliError::ExternalToolNotFound {
+            tool: "restic".into(),
+            needed_by: "apprafter backup list".into(),
+            purpose: "backup and restore".into(),
+            install: "brew install restic".into(),
+        };
+        assert_eq!(code_of(&err), "apprafter::env::tool_not_found");
+
+        let rendered = err.to_string();
+        assert!(rendered.contains("apprafter backup list"), "{rendered}");
+        assert!(rendered.contains("backup and restore"), "{rendered}");
+
+        let help = help_of(&err);
+        // Proves the per-tool install hint is interpolated rather than
+        // dropped — a static help would pass every other assertion here.
+        assert!(help.contains("brew install restic"), "{help}");
+        // The sentence that matters after a passphrase prompt.
+        assert!(
+            help.contains("no credential was used"),
+            "missing the nothing-happened reassurance: {help}"
         );
     }
 
