@@ -23,6 +23,11 @@ use operator_core::{ResourceClaim, RetainedClaim};
 /// `--maxmemory_policy` Redis-ism that crash-loops the binary.
 const DRAGONFLY_MAXMEMORY: &str = "256mb";
 
+/// The Dragonfly SERVER image, pinned by ADR 0042 §10. Bump deliberately and
+/// re-verify §10's ACL facts when you do — they are properties of this tag,
+/// not of Dragonfly in general.
+pub const DRAGONFLY_SERVER_IMAGE: &str = "docker.dragonflydb.io/dragonflydb/dragonfly:v1.37.0";
+
 /// Lowest free DB number `< max` not in `used`, or None if the instance
 /// is full (the signal to grow the pool — ADR 0042 §3). DB 0 is
 /// allocatable; the platform reserves nothing there for redis.
@@ -177,7 +182,28 @@ pub fn acl_setuser_args(user: &str, password: &str, dbnum: u16) -> Vec<String> {
         "-@dangerous".into(),
         "-move".into(),
         "-copy".into(),
-        "+info".into(),
+        // ADR 0042 §11: `+info` was re-granted in 2.6 on a "trusted
+        // single-tenant" premise that `POOL_INSTANCE_INDEX = 0` had already
+        // falsified — one instance serves every tenant in the cluster.
+        // `INFO KEYSPACE` emits a line per NON-EMPTY database regardless of
+        // the selected one, so it enumerates which tenants hold data, with
+        // their key counts. The ACL grammar cannot scope `INFO` to a section
+        // or a DB (`+info|keyspace` does not resolve), so it is on or off.
+        //
+        // `-pubsub` is the same disclosure, larger. `PUBSUB` is registered
+        // SLOW-only, so it survives `-@admin -@dangerous`, and the
+        // `&{user}:*` patterns constrain what a user may SUBSCRIBE to, not
+        // what `PUBSUB CHANNELS` RETURNS. Channel names are
+        // `claim_<ns>_<app>_redis:`, so `PUBSUB CHANNELS '*'` hands back the
+        // namespace and application name of every pub/sub tenant in
+        // plaintext. Pub/sub itself is untouched: `PUBSUB` is a distinct
+        // command from `SUBSCRIBE` / `PUBLISH`.
+        //
+        // Cost, in full: a BullMQ tenant needs `skipVersionCheck: true`,
+        // because its version probe is unconditional. ioredis >= 5 has a
+        // `NOPERM` branch and degrades to a warning; node-redis, redis-py,
+        // go-redis, lettuce and jedis never call `INFO` on connect.
+        "-pubsub".into(),
         "+sort_ro".into(),
         // No per-subcommand `+client|setname` grants: Dragonfly's ACL parser
         // rejects the `command|subcommand` form ("Unrecognized parameter
@@ -238,6 +264,14 @@ pub fn dragonfly_object(
     // Dragonfly rejects writes at its own ceiling rather than being OOM-killed.
     let mut spec = json!({
         "replicas": replicas,
+        // ADR 0042 §10: pin the SERVER image. The platform pinned none — the
+        // CR carried no `image`, the chart default is empty — so the tag came
+        // from the dragonfly-operator's compiled-in default. Every ACL fact
+        // this platform relies on (the file grammar, the `$N` selector, and
+        // the `default`-synthesis behaviour that makes the default line
+        // mandatory) is a fact about v1.37.0, and an operator-chart bump
+        // would have changed it silently.
+        "image": DRAGONFLY_SERVER_IMAGE,
         "args": [
             format!("--dbnum={dbnum}"),
             format!("--num_shards={num_shards}"),
@@ -313,6 +347,161 @@ pub fn admin_secret_object(name: &str, ns: &str, password: &str) -> Value {
         "type": "Opaque",
         "stringData": {
             "password": password,
+        },
+    })
+}
+
+/// The key the ACL file is projected from. The dragonfly-operator renames it
+/// to `dragonfly.acl` on mount, so this name is ours alone (ADR 0042 §10).
+pub const ACL_SECRET_KEY: &str = "acl";
+
+/// `<instance>-acl` — the Secret holding one ACL file for a pool instance.
+pub fn acl_secret_name(instance: &str) -> String {
+    format!("{instance}-acl")
+}
+
+/// Why a file line cannot drift from the live grant, and why building the
+/// file can fail (ADR 0042 §10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AclFileError {
+    /// A token carries whitespace, `\r`, or a control byte. The file grammar
+    /// splits on spaces and newlines, so such a token silently becomes two
+    /// tokens or a broken line — and one broken line rejects the WHOLE file.
+    UnrepresentableToken { line: usize, token: String },
+    /// Fewer than four tokens. `MaterializeFileContents` requires
+    /// `USER <name> <rule> <rule>` at minimum and rejects the file otherwise.
+    TooFewTokens { line: usize, count: usize },
+    /// The admin password is empty. Emitting `USER default on >` would give
+    /// the shared instance a default user with no credential.
+    EmptyAdminPassword,
+}
+
+impl std::fmt::Display for AclFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnrepresentableToken { line, token } => write!(
+                f,
+                "ACL file line {line} carries a token the file grammar cannot represent: {token:?}"
+            ),
+            Self::TooFewTokens { line, count } => {
+                write!(
+                    f,
+                    "ACL file line {line} has {count} tokens, needs at least 4"
+                )
+            }
+            Self::EmptyAdminPassword => {
+                write!(
+                    f,
+                    "refusing to build an ACL file with an empty default password"
+                )
+            }
+        }
+    }
+}
+
+/// The file form of an `ACL SETUSER` argv.
+///
+/// The ONLY producer of a file line, and it takes the same argv the live
+/// grant uses — so divergence between what a tenant is granted at runtime and
+/// what survives a restart is unrepresentable rather than merely tested.
+pub fn acl_file_line(args: &[String]) -> String {
+    format!("USER {}", args.join(" "))
+}
+
+/// The `default` line: `USER default on >{pw} ~* &* +@all`.
+///
+/// Every token is load-bearing.
+///
+///  * `on` — `User::is_active_` defaults to FALSE, and the synthesised
+///    default's `is_active = true` applies only when the file omits `default`
+///    entirely. A default line without `on` is a user nobody can authenticate
+///    as, which is the lockout the working note feared.
+///  * `+@all ~* &*` — the file path pre-applies `-@all` to every user, so the
+///    admin's grants must be stated rather than inherited.
+///  * no `$N` — `User::db_` defaults to "all databases", which is what the
+///    provisioner needs.
+///
+/// The line itself is mandatory, and that is a security gate rather than a
+/// nicety: with `--aclfile` loaded, the registry initialiser that consumes the
+/// operator-injected admin password never runs, so a file OMITTING `default`
+/// yields an active `nopass +@all ~* &*` user and turns authentication off on
+/// an instance serving every tenant in the cluster. Verified live.
+pub fn admin_acl_args(admin_pw: &str) -> Vec<String> {
+    vec![
+        "default".into(),
+        "on".into(),
+        format!(">{admin_pw}"),
+        "~*".into(),
+        "&*".into(),
+        "+@all".into(),
+    ]
+}
+
+/// Build the whole ACL file: the `default` line, then one line per tenant,
+/// sorted by username.
+///
+/// Sorted because the loop skips the write when the derived content equals the
+/// live content, and an unsorted derivation from a LIST would churn the Secret
+/// on every pass for no change.
+///
+/// **Refuses rather than emits a damaged file.** The caller skips the write and
+/// leaves the previous file in place, which is strictly better than replacing a
+/// working file with one the server will reject — a rejected file loads zero
+/// users, and the instance falls back to a default the tenants cannot use.
+pub fn acl_file_contents(admin_pw: &str, tenants: &[Vec<String>]) -> Result<String, AclFileError> {
+    if admin_pw.is_empty() {
+        return Err(AclFileError::EmptyAdminPassword);
+    }
+    let mut lines: Vec<Vec<String>> = vec![admin_acl_args(admin_pw)];
+    let mut sorted: Vec<Vec<String>> = tenants.to_vec();
+    sorted.sort_by(|a, b| a.first().cmp(&b.first()));
+    lines.extend(sorted);
+
+    for (i, args) in lines.iter().enumerate() {
+        // +1 for the `USER` literal the file form prepends.
+        let count = args.len() + 1;
+        if count < 4 {
+            return Err(AclFileError::TooFewTokens { line: i + 1, count });
+        }
+        for token in args {
+            if token.is_empty()
+                || token
+                    .chars()
+                    .any(|c| c.is_ascii_whitespace() || c.is_control())
+            {
+                return Err(AclFileError::UnrepresentableToken {
+                    line: i + 1,
+                    token: token.clone(),
+                });
+            }
+        }
+    }
+
+    let mut out: String = lines
+        .iter()
+        .map(|a| acl_file_line(a))
+        .collect::<Vec<_>>()
+        .join("\n");
+    out.push('\n');
+    Ok(out)
+}
+
+/// The `<instance>-acl` Secret object. Labelled like the CR and the admin
+/// Secret so the reaper's inventory selector finds it.
+pub fn acl_secret_object(name: &str, ns: &str, contents: &str) -> Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": name,
+            "namespace": ns,
+            "labels": {
+                "apprafter.io/managed-by": "apprafter",
+            },
+        },
+        "type": "Opaque",
+        "stringData": {
+            ACL_SECRET_KEY: contents,
         },
     })
 }
@@ -791,6 +980,174 @@ mod tests {
         assert_eq!(r, Resolution::Insufficient);
     }
 
+    // --- ACL file builder (ADR 0042 §10) ---
+
+    fn hex_pw() -> String {
+        "s3cr3t".to_string()
+    }
+
+    #[test]
+    fn a_file_line_is_the_runtime_argv_with_one_literal_in_front() {
+        // Divergence between the live grant and the persisted grant is
+        // unrepresentable BY CONSTRUCTION: there is one producer, and it takes
+        // the same argv `ACL SETUSER` is given.
+        let args = acl_setuser_args("claim_demo_web_redis", &hex_pw(), 7);
+        let line = acl_file_line(&args);
+        assert_eq!(line, format!("USER {}", args.join(" ")));
+        assert!(line.starts_with("USER claim_demo_web_redis on >"));
+    }
+
+    #[test]
+    fn the_default_line_carries_on_and_states_its_grants() {
+        let args = admin_acl_args(&hex_pw());
+        assert_eq!(args[0], "default");
+        // `on` — is_active_ defaults FALSE, and the synthesised default's
+        // is_active applies only when the file omits `default` entirely. A
+        // default line without `on` is a user nobody can authenticate as.
+        assert!(args.iter().any(|a| a == "on"), "{args:?}");
+        // The file path pre-applies `-@all` to every user, so the admin's
+        // grants must be stated rather than inherited.
+        assert!(args.iter().any(|a| a == "+@all"), "{args:?}");
+        assert!(args.iter().any(|a| a == "~*"), "{args:?}");
+        assert!(args.iter().any(|a| a == "&*"), "{args:?}");
+        // No `$N`: db_ defaults to all databases, which is what the
+        // provisioner needs.
+        assert!(!args.iter().any(|a| a.starts_with('$')), "{args:?}");
+    }
+
+    #[test]
+    fn the_file_always_opens_with_a_default_line() {
+        // THE security gate. With `--aclfile` loaded, the registry
+        // initialiser that consumes the operator-injected admin password
+        // never runs — so a file omitting `default` yields an ACTIVE
+        // `nopass +@all ~* &*` user and turns authentication OFF on an
+        // instance serving every tenant in the cluster. Verified live.
+        let f = acl_file_contents(&hex_pw(), &[]).expect("a tenantless file is still a file");
+        assert!(f.starts_with("USER default on >s3cr3t "), "{f}");
+        assert!(
+            f.ends_with('\n'),
+            "must end with exactly one newline: {f:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_admin_password_is_refused() {
+        // `USER default on >` would be a default user with no credential.
+        assert_eq!(
+            acl_file_contents("", &[]),
+            Err(AclFileError::EmptyAdminPassword)
+        );
+    }
+
+    #[test]
+    fn a_token_carrying_whitespace_is_refused_rather_than_written() {
+        // The grammar splits on spaces, so a space inside a password turns
+        // one line into a malformed one — and ONE malformed line rejects the
+        // WHOLE file, taking every tenant's credential with it. Refusing
+        // leaves the previous, working file in place.
+        let bad = acl_setuser_args("claim_a", "pass word", 1);
+        assert!(matches!(
+            acl_file_contents(&hex_pw(), &[bad]),
+            Err(AclFileError::UnrepresentableToken { .. })
+        ));
+        let cr = acl_setuser_args("claim_a", "pass\rword", 1);
+        assert!(matches!(
+            acl_file_contents(&hex_pw(), &[cr]),
+            Err(AclFileError::UnrepresentableToken { .. })
+        ));
+        let nl = acl_setuser_args("claim_a", "pass\nword", 1);
+        assert!(matches!(
+            acl_file_contents(&hex_pw(), &[nl]),
+            Err(AclFileError::UnrepresentableToken { .. })
+        ));
+    }
+
+    #[test]
+    fn a_line_with_too_few_tokens_is_refused() {
+        // `MaterializeFileContents` requires `USER <name> <rule> <rule>`.
+        assert!(matches!(
+            acl_file_contents(&hex_pw(), &[vec!["claim_a".into(), "on".into()]]),
+            Err(AclFileError::TooFewTokens { .. })
+        ));
+    }
+
+    #[test]
+    fn tenant_lines_are_sorted_so_a_re_derivation_compares_equal() {
+        // The loop skips the write when the derived file equals the live one.
+        // An unsorted derivation from a LIST would churn the Secret on every
+        // pass, destroying the one cheap signal for "when did this instance's
+        // ACL set last change".
+        let a = acl_setuser_args("claim_aaa", "p1", 1);
+        let b = acl_setuser_args("claim_bbb", "p2", 2);
+        let one = acl_file_contents(&hex_pw(), &[a.clone(), b.clone()]).unwrap();
+        let two = acl_file_contents(&hex_pw(), &[b, a]).unwrap();
+        assert_eq!(one, two);
+        let lines: Vec<&str> = one.trim_end().split('\n').collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].starts_with("USER claim_aaa "), "{one}");
+        assert!(lines[2].starts_with("USER claim_bbb "), "{one}");
+    }
+
+    #[test]
+    fn a_built_file_carries_no_revoked_grant() {
+        // The file is derived whole, so a tenant absent from the input is
+        // absent from the file — which is what makes revocation durable
+        // rather than merely runtime.
+        let a = acl_setuser_args("claim_kept", "p1", 1);
+        let f = acl_file_contents(&hex_pw(), &[a]).unwrap();
+        assert!(f.contains("USER claim_kept "));
+        assert!(!f.contains("claim_revoked"));
+    }
+
+    #[test]
+    fn every_built_line_satisfies_the_file_grammar() {
+        // Belt and braces against the whole-file rejection: four tokens
+        // minimum, `USER` first, no empty lines.
+        let t1 = acl_setuser_args("claim_a", "p1", 1);
+        let t2 = acl_setuser_args("claim_b", "p2", 2);
+        let f = acl_file_contents(&hex_pw(), &[t1, t2]).unwrap();
+        for line in f.trim_end().split('\n') {
+            assert!(!line.is_empty(), "empty line in {f:?}");
+            let toks: Vec<&str> = line.split(' ').filter(|s| !s.is_empty()).collect();
+            assert_eq!(toks[0], "USER", "{line}");
+            assert!(toks.len() >= 4, "{line}");
+        }
+    }
+
+    #[test]
+    fn the_acl_secret_is_labelled_for_the_reaper() {
+        let s = acl_secret_object(
+            "platform-redis-ephemeral-000-acl",
+            "dragonfly-system",
+            "USER default on >x ~* &* +@all\n",
+        );
+        assert_eq!(s["type"], "Opaque");
+        assert_eq!(
+            s["metadata"]["labels"]["apprafter.io/managed-by"], "apprafter",
+            "the reaper LISTs its inventory under this selector"
+        );
+        assert!(s["stringData"][ACL_SECRET_KEY]
+            .as_str()
+            .unwrap()
+            .starts_with("USER default "));
+    }
+
+    #[test]
+    fn the_server_image_is_pinned_on_the_cr() {
+        // Every ACL fact ADR 0042 §10 relies on is a fact about this tag.
+        let cr = dragonfly_object(
+            "platform-redis-ephemeral-000",
+            "dragonfly-system",
+            16,
+            1,
+            1,
+            false,
+            &BackendResources::dragonfly_t1(),
+        );
+        assert_eq!(cr["spec"]["image"], DRAGONFLY_SERVER_IMAGE);
+        assert!(DRAGONFLY_SERVER_IMAGE.ends_with(":v1.37.0"));
+    }
+
     // --- acl_setuser_args() ---
 
     #[test]
@@ -798,7 +1155,7 @@ mod tests {
         let args = acl_setuser_args("claim_demo_web_redis", "s3cr3t", 7);
         // ACL SETUSER <user> on >pw $7 resetkeys ~* resetchannels
         //   &claim_demo_web_redis:* +@all -@admin -@dangerous -move -copy
-        //   +info +sort_ro ...
+        //   -pubsub +sort_ro ...
         assert_eq!(args[0], "claim_demo_web_redis");
         assert!(args.iter().any(|a| a == "on"));
         assert!(args.iter().any(|a| a == ">s3cr3t"));
@@ -810,7 +1167,21 @@ mod tests {
         assert!(args.iter().any(|a| a == "+@all"));
         assert!(args.iter().any(|a| a == "-@admin"));
         assert!(args.iter().any(|a| a == "-@dangerous"));
-        assert!(args.iter().any(|a| a == "+info"));
+        // ADR 0042 §11: `+info` is REVOKED. `INFO KEYSPACE` enumerates every
+        // non-empty database on the shared instance regardless of the
+        // selected one, so it tells a tenant which other tenants hold data
+        // and how much. There is no section- or DB-scoped form.
+        assert!(
+            !args.iter().any(|a| a == "+info"),
+            "+info must not be granted — it enumerates every tenant's key counts"
+        );
+        // And `PUBSUB` is the same disclosure with names attached: channel
+        // names carry the namespace and app, and `PUBSUB CHANNELS` output is
+        // NOT filtered by the user's `&{user}:*` patterns.
+        assert!(
+            args.iter().any(|a| a == "-pubsub"),
+            "PUBSUB CHANNELS returns every tenant's namespace and app name — must be denied"
+        );
         // Cross-DB escape commands (MOVE/COPY) name a DESTINATION DB outside
         // the `$N` pin and are NOT in @admin/@dangerous (only SWAPDB is), so
         // they must be denied explicitly. SWAPDB stays denied via @dangerous.
