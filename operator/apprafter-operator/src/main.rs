@@ -75,6 +75,33 @@ async fn vpa_available(client: &Client) -> bool {
         .is_some()
 }
 
+/// Probe whether this cluster's Kubernetes can actuate an in-place pod
+/// resize (2.22d / D10). Run ONCE at startup and threaded into the
+/// Application controller, which folds a negative into the same
+/// `status.recommendedResources.notApplied` message a blocked resize uses.
+///
+/// In-place resize is a Kubernetes feature, not a VPA one, and nothing pins
+/// the Kubernetes version — `build_k3s_user_data` installs the stable
+/// channel. It works today because the gate is on by default at the versions
+/// that channel serves, which is an upstream default rather than something
+/// the platform arranges. Without this probe, a cluster that drifted below
+/// the threshold would run `updateMode: InPlace` forever with nothing
+/// actuating and every gate reporting green.
+///
+/// Unreadable version → `true`: refusing to claim a defect we cannot
+/// evidence. A wrong "your cluster is too old" on every app would be worse
+/// than the silence, and the pod-condition probe still covers the real
+/// blocks.
+async fn in_place_resize_supported(client: &Client) -> bool {
+    let Ok(info) = client.apiserver_version().await else {
+        return true;
+    };
+    match application_controller::parse_apiserver_version(&info.major, &info.minor) {
+        Some((major, minor)) => application_controller::in_place_resize_supported(major, minor),
+        None => true,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -162,6 +189,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "probed VerticalPodAutoscaler CRD availability (lazily re-probed if false)"
     );
 
+    // 2.22d (D10): probe the KUBERNETES half of right-sizing. The VPA CRD
+    // being served says the recommender can run; it says nothing about
+    // whether the kubelet can act on a recommendation without a restart.
+    let in_place = in_place_resize_supported(&client).await;
+    info!(
+        in_place_resize_supported = in_place,
+        "probed in-place pod resize support (updateMode: InPlace actuates nothing without it)"
+    );
+
     // 2.9 (ADR 0044): the active environment is now a PER-CR property
     // (`Application.spec.environment`), resolved inside the reconcile
     // loop — there is no cluster-wide `APPRAFTER_ENV` selector anymore.
@@ -170,7 +206,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let metrics = metrics.clone();
         async move {
             if let Err(err) =
-                application_controller::run(client, metrics, cilium, gateway_api, vpa).await
+                application_controller::run(client, metrics, cilium, gateway_api, vpa, in_place)
+                    .await
             {
                 error!(%err, "Application controller error");
             }

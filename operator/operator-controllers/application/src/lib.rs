@@ -107,6 +107,18 @@ pub struct Context {
     /// CRD is served; an `AtomicBool` so the re-probe result survives across
     /// reconciles without a per-reconcile probe once served.
     pub vpa_available: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether this cluster's Kubernetes can actuate an in-place pod resize
+    /// at all (2.22d / D10). Probed ONCE at startup from the apiserver
+    /// version.
+    ///
+    /// In-place resize is a Kubernetes feature, not a VPA one, and the
+    /// platform does not pin a Kubernetes version — `build_k3s_user_data`
+    /// installs the stable channel with no `INSTALL_K3S_VERSION`. It works
+    /// today by upstream default rather than by anything we arrange, so a
+    /// cluster below the threshold would leave `updateMode: InPlace` doing
+    /// nothing, forever, with every gate green. That is the exact shape of
+    /// the defect this probe exists to make loud.
+    pub in_place_resize_supported: bool,
 }
 
 #[derive(Debug, Error)]
@@ -136,6 +148,7 @@ pub async fn run(
     cilium_available: bool,
     gateway_api_available: bool,
     vpa_available: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    in_place_resize_supported: bool,
 ) -> Result<(), ReconcileError> {
     let apps: Api<Application> = Api::all(client.clone());
     // 2.4d: watch child ResourceClaims so the provisioner flipping a
@@ -156,6 +169,7 @@ pub async fn run(
         cilium_available,
         gateway_api_available,
         vpa_available,
+        in_place_resize_supported,
     });
 
     Controller::new(apps, watcher::Config::default())
@@ -943,11 +957,28 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
             &vpa_api_resource(),
         );
         if let Ok(Some(live_vpa)) = vpa_api.get_opt(&name).await {
-            // `infeasible` conservatively false — the exact updater-infeasible
-            // signal source is a walk-time detail; a follow-up can wire the
-            // VPA condition type `NoPodsMatched` / `FetchingHistory` into the
-            // updater-infeasible probe.
-            status.recommended_resources = map_vpa_recommendation(&live_vpa.data, false);
+            // 2.22d (D10): in observe-only mode nothing is applied BY DESIGN,
+            // so there is no block to report — `platform autoscale show`
+            // already says why. Reporting "not applied" here would dress a
+            // deliberate setting up as a fault, and the unsupported-Kubernetes
+            // message would be an outright wrong diagnosis.
+            let observe_only = live_vpa
+                .data
+                .pointer("/spec/updatePolicy/updateMode")
+                .and_then(Value::as_str)
+                == Some("Off");
+            let blocked = if observe_only {
+                None
+            } else {
+                resize_block(
+                    &ctx.client,
+                    &namespace,
+                    &name,
+                    ctx.in_place_resize_supported,
+                )
+                .await
+            };
+            status.recommended_resources = map_vpa_recommendation(&live_vpa.data, blocked);
         }
     }
 
@@ -1550,16 +1581,22 @@ fn quantities(v: Option<&Value>) -> Option<BTreeMap<String, String>> {
 
 /// Map a live VPA CR's `.status.recommendation.containerRecommendations[0]`
 /// into an [`operator_core::RecommendedResources`] for the Application status.
-/// Returns `None` when there is no recommendation AND `infeasible` is false
-/// (VPA not yet populated — omit the field rather than emit an empty struct).
-/// When `infeasible` is true the `not_applied` message is always set.
-fn map_vpa_recommendation(vpa: &Value, infeasible: bool) -> Option<RecommendedResources> {
+///
+/// `not_applied` is the message from [`resize_block_message`], or `None` when
+/// the resize is not blocked. Returns `None` when there is no recommendation
+/// AND nothing is blocked (VPA not yet populated — omit the field rather than
+/// emit an empty struct), so a blocked resize is reported even before the
+/// recommender has produced a target.
+fn map_vpa_recommendation(
+    vpa: &Value,
+    not_applied: Option<String>,
+) -> Option<RecommendedResources> {
     let cr = vpa.pointer("/status/recommendation/containerRecommendations/0");
     let recommendation = cr.map(|c| ContainerRecommendation {
         target: quantities(c.pointer("/target")),
         uncapped_target: quantities(c.pointer("/uncappedTarget")),
     });
-    if recommendation.is_none() && !infeasible {
+    if recommendation.is_none() && not_applied.is_none() {
         return None;
     }
     Some(RecommendedResources {
@@ -1568,8 +1605,154 @@ fn map_vpa_recommendation(vpa: &Value, infeasible: bool) -> Option<RecommendedRe
             .and_then(|v| v.as_str())
             .map(String::from),
         recommendation,
-        not_applied: infeasible.then(|| "recommendation not applied — node capacity".to_string()),
+        not_applied,
     })
+}
+
+/// List the app's pods and ask [`resize_block_message`] whether a resize is
+/// stuck (2.22d / D10).
+///
+/// Selects on `apprafter.io/application`, the stable minimal label the
+/// Deployment selector itself uses, so it matches the workload's pods across
+/// the label-set widening that made the selector immutable.
+///
+/// Best-effort: an unreadable pod list yields `None`, leaving the status as
+/// "not blocked" rather than failing a reconcile over a decorative read. That
+/// is the ADR 0048 anchor-403 lesson, and it is why the `pods` `list` verb
+/// ships in the same change as this code rather than after it.
+async fn resize_block(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    in_place_supported: bool,
+) -> Option<String> {
+    if !in_place_supported {
+        // No point reading pods: the kubelet was never asked, so no pod
+        // carries a resize condition and the silence would look like health.
+        return Some(UNSUPPORTED_IN_PLACE.to_string());
+    }
+    let api: Api<DynamicObject> =
+        Api::namespaced_with(client.clone(), namespace, &pod_api_resource());
+    let lp = kube::api::ListParams::default().labels(&format!("apprafter.io/application={name}"));
+    let pods = api.list(&lp).await.ok()?;
+    let docs: Vec<Value> = pods.items.into_iter().map(|p| p.data).collect();
+    resize_block_message(&docs)
+}
+
+/// What the status says when the cluster's Kubernetes cannot resize a pod in
+/// place at all. Named rather than inlined so the walk can assert on the
+/// exact string.
+pub const UNSUPPORTED_IN_PLACE: &str =
+    "recommendation not applied — this cluster's Kubernetes does not support in-place \
+     pod resize (needs 1.33 or newer)";
+
+/// The Kubernetes minor version from which in-place pod resize is on by
+/// default: beta from 1.33, GA at 1.35. Below it the feature gate is alpha
+/// and off, so `updateMode: InPlace` can never actuate.
+const IN_PLACE_RESIZE_MIN_MINOR: u64 = 33;
+
+/// `true` when an apiserver `(major, minor)` can actuate in-place pod resize.
+///
+/// Compares the minor NUMERICALLY, which is the whole point: a string
+/// comparison puts `"1.9"` above `"1.33"` and would report an ancient
+/// cluster as capable. Unparseable input is handled by the caller.
+pub fn in_place_resize_supported(major: u64, minor: u64) -> bool {
+    major > 1 || (major == 1 && minor >= IN_PLACE_RESIZE_MIN_MINOR)
+}
+
+/// Parse an apiserver-reported `(major, minor)` pair.
+///
+/// The apiserver reports minor with a build suffix on many distributions
+/// (`"33+"` on GKE, `"31+"` on some k3s builds), so take the leading digits
+/// rather than parsing the field whole. `None` when either field carries no
+/// leading digit at all.
+pub fn parse_apiserver_version(major: &str, minor: &str) -> Option<(u64, u64)> {
+    fn digits(s: &str) -> Option<u64> {
+        let d: String = s.trim().chars().take_while(char::is_ascii_digit).collect();
+        d.parse().ok()
+    }
+    Some((digits(major)?, digits(minor)?))
+}
+
+/// `v1/Pod` as a dynamic API resource — the controller reads pods only for
+/// the resize probe above, so it does not pull in the typed `Pod` here.
+fn pod_api_resource() -> kube::discovery::ApiResource {
+    kube::discovery::ApiResource::from_gvk(&kube::core::GroupVersionKind {
+        group: String::new(),
+        version: "v1".into(),
+        kind: "Pod".into(),
+    })
+}
+
+/// Why an in-place resize has not landed, read off the app's own pods
+/// (2.22d / D10). `None` when nothing is blocked.
+///
+/// # Why the pod and not the VPA
+///
+/// ADR 0054 specified this signal and the whole downstream path — the CRD
+/// field, the operator type, the CLI rendering — was built for it, but the
+/// only production call site passed a hardcoded `false`, so it has never
+/// fired. The follow-up note left in its place guessed that the VPA CR
+/// carries an in-place condition to read. It does not: the updater's only
+/// observable outputs for this path are log lines, an Event on the pod, and
+/// its own Prometheus counters. Nothing lands on the VPA CR.
+///
+/// The kubelet, on the other hand, states it directly. `PodResizePending`
+/// carries `Infeasible` (the node cannot fit this, ever, as it stands) or
+/// `Deferred` (not now, possibly later), and `PodResizeInProgress` with
+/// reason `Error` carries an actuation failure. That is a first-hand fact
+/// from the component that would do the resizing, rather than an inference
+/// about node capacity — which is what the old hardcoded message asserted
+/// without evidence, and which is only ever right for `Infeasible`.
+///
+/// This matters more under `InPlace` than it would under
+/// `InPlaceOrRecreate`: because `InPlace` never falls back to eviction, a
+/// blocked resize is silent and indefinite. Nothing else would ever say so.
+///
+/// Pure over the pod list so the mapping is testable without a cluster.
+pub fn resize_block_message(pods: &[Value]) -> Option<String> {
+    for pod in pods {
+        let conds = pod
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for c in conds {
+            if c.get("status").and_then(Value::as_str) != Some("True") {
+                continue;
+            }
+            // A condition without a type is not ours; skip it rather than
+            // abandoning the whole scan (a `?` here would make one malformed
+            // condition hide a real block on a later pod).
+            let Some(type_) = c.get("type").and_then(Value::as_str) else {
+                continue;
+            };
+            let reason = c.get("reason").and_then(Value::as_str).unwrap_or_default();
+            let detail = c.get("message").and_then(Value::as_str).unwrap_or_default();
+            let head = match (type_, reason) {
+                ("PodResizePending", "Infeasible") => {
+                    "recommendation not applied — the node cannot fit it"
+                }
+                ("PodResizePending", "Deferred") => {
+                    "recommendation not applied — waiting for room on the node"
+                }
+                ("PodResizePending", _) => "recommendation not applied — the kubelet is holding it",
+                ("PodResizeInProgress", "Error") => {
+                    "recommendation not applied — the resize failed"
+                }
+                _ => continue,
+            };
+            // The kubelet's own message names the resource that did not fit.
+            // Carry it when there is one; the head alone says a resize is
+            // stuck without saying what would unstick it.
+            return Some(if detail.is_empty() {
+                head.to_string()
+            } else {
+                format!("{head}: {detail}")
+            });
+        }
+    }
+    None
 }
 
 /// Resolve the connection-target catalog for the effective needs' network
@@ -6652,7 +6835,7 @@ mod tests {
                 }
             }
         });
-        let r = map_vpa_recommendation(&vpa, false).unwrap();
+        let r = map_vpa_recommendation(&vpa, None).unwrap();
         assert_eq!(
             r.recommendation.as_ref().unwrap().target.as_ref().unwrap()["memory"],
             "300Mi"
@@ -6670,7 +6853,9 @@ mod tests {
     }
 
     #[test]
-    fn map_vpa_reco_not_applied_on_infeasible() {
+    fn map_vpa_reco_reports_a_block_even_with_no_recommendation_yet() {
+        // A blocked resize must surface before the recommender has produced
+        // a target, not only after — the block is the more urgent fact.
         let vpa = serde_json::json!({
             "status": {
                 "recommendation": {
@@ -6679,11 +6864,119 @@ mod tests {
             }
         });
         assert_eq!(
-            map_vpa_recommendation(&vpa, true)
+            map_vpa_recommendation(&vpa, Some("recommendation not applied — x".into()))
                 .unwrap()
                 .not_applied
                 .as_deref(),
-            Some("recommendation not applied — node capacity")
+            Some("recommendation not applied — x")
+        );
+    }
+
+    // --- in-place resize support gate (2.22d / D10) ---
+
+    #[test]
+    fn the_minor_version_is_compared_as_a_number_not_a_string() {
+        // The trap this test exists for: "1.9" > "1.33" as strings, so a
+        // lexical comparison would report a 2018-era cluster as capable of a
+        // feature that went beta in 2025 — and the failure would be silent,
+        // because InPlace never evicts and so never complains.
+        assert!(!in_place_resize_supported(1, 9));
+        assert!(!in_place_resize_supported(1, 32));
+        assert!(in_place_resize_supported(1, 33));
+        assert!(in_place_resize_supported(1, 35));
+        assert!(in_place_resize_supported(2, 0));
+    }
+
+    #[test]
+    fn a_build_suffixed_minor_still_parses() {
+        // GKE and several k3s builds report minor as "33+".
+        assert_eq!(parse_apiserver_version("1", "33+"), Some((1, 33)));
+        assert_eq!(parse_apiserver_version("1", " 34 "), Some((1, 34)));
+        assert_eq!(parse_apiserver_version("1", "33"), Some((1, 33)));
+        assert_eq!(parse_apiserver_version("", "33"), None);
+        assert_eq!(parse_apiserver_version("1", "next"), None);
+    }
+
+    // --- resize_block_message() (2.22d / D10) ---
+
+    /// A pod carrying one condition.
+    fn pod_with(type_: &str, status: &str, reason: &str, message: &str) -> serde_json::Value {
+        serde_json::json!({ "status": { "conditions": [
+            { "type": type_, "status": status, "reason": reason, "message": message }
+        ]}})
+    }
+
+    #[test]
+    fn an_infeasible_resize_names_the_node_and_carries_the_kubelet_message() {
+        let pods = [pod_with(
+            "PodResizePending",
+            "True",
+            "Infeasible",
+            "memory 4Gi exceeds node allocatable",
+        )];
+        assert_eq!(
+            resize_block_message(&pods).as_deref(),
+            Some(
+                "recommendation not applied — the node cannot fit it: \
+                 memory 4Gi exceeds node allocatable"
+            )
+        );
+    }
+
+    #[test]
+    fn a_deferred_resize_is_not_reported_as_a_capacity_failure() {
+        // The old hardcoded message said "node capacity" for every block.
+        // Deferred means "not now, possibly later" — asserting the node is
+        // too small is a diagnosis we have no evidence for, and it would
+        // send someone to resize a node that was never the problem.
+        let pods = [pod_with("PodResizePending", "True", "Deferred", "")];
+        assert_eq!(
+            resize_block_message(&pods).as_deref(),
+            Some("recommendation not applied — waiting for room on the node")
+        );
+    }
+
+    #[test]
+    fn a_healthy_pod_reports_no_block() {
+        let pods = [pod_with("Ready", "True", "", "")];
+        assert!(resize_block_message(&pods).is_none());
+        assert!(resize_block_message(&[]).is_none());
+    }
+
+    #[test]
+    fn a_resolved_condition_is_not_a_block() {
+        // The kubelet leaves PodResizePending in place with status False once
+        // the resize lands. Reading the type without the status would report
+        // every successfully resized pod as blocked forever.
+        let pods = [pod_with("PodResizePending", "False", "Deferred", "")];
+        assert!(resize_block_message(&pods).is_none());
+    }
+
+    #[test]
+    fn a_malformed_condition_does_not_hide_a_real_block_behind_it() {
+        // A `?` on the type lookup would have returned None here and the
+        // genuine block on the second pod would never have been seen.
+        let pods = [
+            serde_json::json!({ "status": { "conditions": [{ "status": "True" }] }}),
+            pod_with("PodResizePending", "True", "Infeasible", ""),
+        ];
+        assert_eq!(
+            resize_block_message(&pods).as_deref(),
+            Some("recommendation not applied — the node cannot fit it")
+        );
+    }
+
+    #[test]
+    fn an_actuation_error_is_reported_too() {
+        let pods = [pod_with(
+            "PodResizeInProgress",
+            "True",
+            "Error",
+            "container runtime refused",
+        )];
+        assert_eq!(
+            resize_block_message(&pods).as_deref(),
+            Some("recommendation not applied — the resize failed: container runtime refused")
         );
     }
 }

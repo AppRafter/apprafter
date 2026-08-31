@@ -421,6 +421,19 @@ rules:
       - pods/proxy
     verbs:
       - get
+  # 2.22d (D10): `pods` list — the Application controller reads its own app's
+  # pods to find out why a VPA in-place resize has not landed. The kubelet
+  # states it on the pod (`PodResizePending` / `PodResizeInProgress`); the VPA
+  # CR carries nothing, so there is no other source. Under `InPlace` the
+  # updater never evicts, which makes a blocked resize silent and indefinite
+  # unless something reads this. Granted in the same change as the code that
+  # uses it — the ADR 0048 / 0.2.31 lesson, which we have now paid for twice.
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - list
   # Phase 2.4f RetainedClaim CRD — written by the provisioner
   # finalizer (the deletion snapshot: create/patch via SSA) and
   # consumed + deleted by the RetainedClaim GC controller (the

@@ -15,11 +15,18 @@
 # (validating the alpha feature gate), the floors/policy are correct, the
 # recommendation is mirrored into Application.status, the managed→pro prune
 # fires, the `off` knob is honoured, failurePolicy is Ignore, and metrics-server
-# is present. The RESIZE DYNAMICS themselves (a real upward move, downward
-# reclaim, up-only, the 512Mi cap) are upstream-VPA behaviour and need a
-# sustained memory workload — which the AppRafter `Application` schema cannot
-# express (no `command`/`args`) — so they are documented as manually-verifiable
-# rather than auto-asserted here (see the NOTE at the end + spec walk #4-7).
+# is present.
+#
+# 2.22d (D10) added the half that was missing: a real UPWARD in-place resize is
+# now hard-asserted. It had been "observed" by comparing the pod's requests to
+# the recommendation on a tiny app whose recommendation IS the seed — an
+# equality an untouched pod satisfies, which was nonetheless written up as
+# evidence of a resize. The walk now runs a second app whose footprint comes
+# from the image itself (the schema expresses no `command`/`args`), so the pair
+# genuinely differs, reads what the KUBELET actuated rather than what the
+# updater asked for, and fails rather than logging. The remaining dynamics
+# (downward reclaim, up-only, the 512Mi cap) need a shaped workload or a
+# multi-day window and stay manually verified (see the NOTE at the end).
 #
 # Judged by log markers (ok:/FAILED/GREEN). Bulletproof cleanup + verify both
 # token projects -> 0. Tokens from backup-test.env (pre-flight hz.py list = 0).
@@ -59,6 +66,21 @@ trap 'exit 143' INT TERM
 
 NS=default
 APP=vpa-app
+# 2.22d (D10): a SECOND managed app whose idle footprint is far above the 32Mi
+# seed, so the recommendation and the seed genuinely DIFFER.
+#
+# This exists because the apply-observation could not fail. The rendered seed
+# is 32Mi and the recommender's floor is pinned to 32Mi, so for a tiny nginx
+# the recommendation IS 32Mi — and `requests == recommendation` is satisfied by
+# a pod the updater never touched. That equality was reported as "resized in
+# place" and written up as evidence. An assertion whose success condition is
+# met by the null case is not evidence.
+#
+# The schema expresses no `command`/`args`, so the workload has to come from
+# the image itself. RabbitMQ's Erlang VM idles around 100Mi with no arguments
+# and no required env — comfortably above both the seed and the floor.
+HOG=vpa-hog
+SEED_MEM=32Mi
 # Safe field extraction via kubectl jsonpath (NO eval).
 vpa_jp() { kubectl -n "$NS" get verticalpodautoscaler "$1" -o jsonpath="$2" 2>/dev/null; }
 vpa_exists() { kubectl -n "$NS" get verticalpodautoscaler "$1" >/dev/null 2>&1; }
@@ -76,6 +98,42 @@ spec:
     expose: { port: 80 }
 EOF
 }
+deploy_hog() {  # 2.22d (D10): managed, but with a real footprint — see $HOG above
+    kubectl apply -f - <<EOF
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata: { name: $HOG, namespace: $NS }
+spec:
+  base:
+    image: rabbitmq:3-alpine
+    expose: { port: 5672 }
+EOF
+}
+# What the KUBELET actuated, not what the updater asked for. `spec` carries the
+# desired value — the updater patching it proves a patch, not a resize; the
+# resize is only real once it appears here.
+pod_actuated_mem() {
+    kubectl -n "$NS" get pod "$1" \
+        -o jsonpath='{.status.containerStatuses[0].resources.requests.memory}' 2>/dev/null
+}
+# Mebibytes from a Kubernetes quantity, for ordering comparisons. `-1` marks
+# an unparseable value so a bad reading fails the comparison instead of
+# silently comparing as zero.
+#
+# Both suffix families are handled because the VPA emits either: binary `Ki`
+# `Mi` `Gi`, decimal `k` `M` `G` (kilo is LOWERCASE in the decimal family,
+# where `K` is not a suffix at all), and bare bytes.
+mem_mib() { python3 -c "
+import re,sys
+s=sys.argv[1].strip()
+m=re.match(r'^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?\$',s)
+if not m: print(-1); raise SystemExit
+v=float(m.group(1)); u=(m.group(2) or '')
+f={'':1/2**20,
+   'Ki':1/1024,'Mi':1,'Gi':1024,'Ti':1024**2,'Pi':1024**3,'Ei':1024**4,
+   'k':1000/2**20,'M':1000**2/2**20,'G':1000**3/2**20,
+   'T':1000**4/2**20,'P':1000**5/2**20,'E':1000**6/2**20}
+print(int(v*f[u]))" "$1" 2>/dev/null || echo -1; }
 
 printf '=== Phase 1: provision (CLI %s) + bootstrap channel-latest (0.2.56+ InPlace fix) ===\n' "$($APPRAFTER --version 2>/dev/null)"
 "$APPRAFTER" target add e2e --provider hetzner-cloud --tier solo --region "$REGION" \
@@ -144,6 +202,29 @@ while [ "$(date +%s)" -lt "$deadline" ]; do [ -n "$(app_pod $APP)" ] && break; s
 POD=$(app_pod "$APP"); printf '  app pod: %s\n' "$POD"
 [ -n "$POD" ] && ok "managed app Running" || mark_fail "managed app pod never appeared"
 
+# 2.22d (D10): deploy the differing-pair app NOW, so its usage history
+# accumulates during the same window the recommender is already warming up in.
+deploy_hog || mark_fail "apply hog app"
+deadline=$(( $(date +%s) + 300 ))
+while [ "$(date +%s)" -lt "$deadline" ]; do [ -n "$(app_pod $HOG)" ] && break; sleep 15; done
+HOGPOD=$(app_pod "$HOG"); printf '  hog pod: %s\n' "$HOGPOD"
+[ -n "$HOGPOD" ] && ok "hog app Running (footprint above the ${SEED_MEM} seed)" \
+    || mark_fail "hog app pod never appeared — the differing-pair assertion cannot run"
+
+# 2.22d (D10) part 3: in-place resize is a KUBERNETES feature and nothing pins
+# the Kubernetes version — `build_k3s_user_data` installs the stable channel.
+# It works today by upstream default rather than by anything the platform
+# arranges, so assert it directly instead of assuming it.
+printf '\n=== D10 kubernetes prerequisite (in-place pod resize) ===\n'
+K8SMINOR=$(kubectl version -o json 2>/dev/null | python3 -c "
+import json,sys,re
+m=json.load(sys.stdin).get('serverVersion',{}).get('minor','')
+d=re.match(r'^(\d+)',str(m)); print(d.group(1) if d else -1)" 2>/dev/null || echo -1)
+printf '  server minor: %s\n' "$K8SMINOR"
+[ "${K8SMINOR:--1}" -ge 33 ] 2>/dev/null \
+    && ok "D10 k8s minor $K8SMINOR >= 33 — in-place pod resize is on by default" \
+    || mark_fail "D10 k8s minor $K8SMINOR < 33 — updateMode:InPlace actuates NOTHING on this cluster"
+
 # #1 the operator emitted a VPA CR AND the webhook ACCEPTED it (validates the alpha feature gate)
 printf '\n=== #1 VPA CR created + accepted (feature-gate InPlace) ===\n'
 deadline=$(( $(date +%s) + 120 ))
@@ -210,13 +291,84 @@ if [ -n "$RECO" ]; then
     grep -qi "Too few replicas" <(kubectl -n vpa logs deploy/vpa-updater --tail=300 2>/dev/null) && mark_fail "#4 'Too few replicas' in updater log (min-replicas skipped the app)" || ok "#4 no 'Too few replicas' (minReplicas:1 works)"
     POD2=$(app_pod "$APP"); UID1=$(pod_uid "$POD2"); R1=$(pod_restarts "$POD2")
     [ "$UID0" = "$UID1" ] && [ "${R1:-0}" = "${R0:-0}" ] && ok "#4 pod not recreated (uid stable, RESTARTS=$R1) — in-place, no thrash" || mark_fail "#4 pod recreated (uid $UID0→$UID1, restarts $R0→$R1)"
-    # apply-observation (SOFT): with updateMode=InPlace on k8s 1.35 the updater
-    # right-sizes the pod's requests toward the recommendation IN PLACE (no
-    # recreate). It lags the first recommendation and needs the seed to differ
-    # from it, so this is logged, not asserted.
-    REQ=$(kubectl -n "$NS" get pod "$POD2" -o jsonpath='{.spec.containers[0].resources.requests.memory}' 2>/dev/null)
-    printf '  apply-observation (soft): pod requests.memory=%s vs VPA target=%s\n' "${REQ:-<unset>}" "$RECO"
-    [ -n "$REQ" ] && [ "$REQ" = "$RECO" ] && ok "apply OBSERVED: pod requests.memory==recommendation ($REQ), resized in place" || printf '  note: requests not yet ==recommendation (in-place resize lags first rec / seed may already match); soft\n'
+    # apply-observation on the TINY app stays soft AND is no longer allowed to
+    # claim success from the degenerate case (2.22d / D10). Its recommendation
+    # is the 32Mi floor, which is also the seed, so the equality proves nothing
+    # either way — say so rather than printing `ok:` and having it read back as
+    # evidence that a resize was observed.
+    ACT=$(pod_actuated_mem "$POD2")
+    printf '  tiny-app observation: actuated requests.memory=%s vs VPA target=%s (seed %s)\n' \
+        "${ACT:-<unset>}" "$RECO" "$SEED_MEM"
+    if [ "$RECO" = "$SEED_MEM" ]; then
+        printf '  inconclusive: recommendation == seed == %s, so an untouched pod satisfies this\n' "$SEED_MEM"
+        printf '  inconclusive: proves nothing either way — the hog app below carries the real assertion\n'
+    elif [ -n "$ACT" ] && [ "$ACT" = "$RECO" ]; then
+        ok "tiny app actuated to the recommendation ($ACT)"
+    else
+        printf '  note: tiny app not yet actuated to %s (in-place resize lags the first rec); soft\n' "$RECO"
+    fi
+
+    # THE assertion (2.22d / D10). The hog app's footprint is far above the
+    # floor, so its recommendation cannot equal the seed — which means an
+    # untouched pod FAILS this, and that is the whole point.
+    printf '\n=== D10 apply-observation (differing pair, HARD) ===\n'
+    HRECO=""; hdl=$(( $(date +%s) + 900 ))
+    while [ "$(date +%s)" -lt "$hdl" ]; do
+        HRECO=$(vpa_jp "$HOG" '{.status.recommendation.containerRecommendations[0].target.memory}')
+        [ -n "$HRECO" ] && break
+        sleep 30
+    done
+    if [ -z "$HRECO" ]; then
+        mark_fail "D10 no recommendation for the hog app after 15m — differing-pair assertion could not run"
+    elif [ "$(mem_mib "$HRECO")" -lt 0 ]; then
+        mark_fail "D10 hog recommendation '$HRECO' could not be parsed as a quantity — the comparison would be meaningless, so this is a walk-harness bug, not a resize failure"
+    elif [ "$(mem_mib "$HRECO")" -le "$(mem_mib "$SEED_MEM")" ]; then
+        # Not a resize failure: the premise failed. Say which, or the next
+        # reader will debug the wrong thing.
+        mark_fail "D10 hog recommendation $HRECO is not above the $SEED_MEM seed — the pair is degenerate, so this walk still cannot observe a resize (pick a heavier image)"
+    else
+        ok "D10 differing pair established: hog recommendation $HRECO > $SEED_MEM seed"
+        HPOD=$(app_pod "$HOG"); HUID0=$(pod_uid "$HPOD")
+        HACT=""; adl=$(( $(date +%s) + 600 ))
+        while [ "$(date +%s)" -lt "$adl" ]; do
+            HACT=$(pod_actuated_mem "$(app_pod "$HOG")")
+            [ "$HACT" = "$HRECO" ] && break
+            sleep 20
+        done
+        if [ "$HACT" = "$HRECO" ]; then
+            ok "D10 APPLY OBSERVED: kubelet-actuated requests.memory=$HACT == recommendation, from a $SEED_MEM seed"
+            HUID1=$(pod_uid "$(app_pod "$HOG")")
+            [ "$HUID0" = "$HUID1" ] \
+                && ok "D10 resize was IN PLACE (pod uid stable across the resize)" \
+                || mark_fail "D10 pod was RECREATED (uid $HUID0→$HUID1) — InPlace must never evict"
+        else
+            printf '  --- D10 DIAGNOSTIC ---\n'
+            printf '  hog pod status.containerStatuses[0].resources: %s\n' "$(kubectl -n "$NS" get pod "$(app_pod "$HOG")" -o jsonpath='{.status.containerStatuses[0].resources}' 2>/dev/null)"
+            printf '  hog pod resize conditions: %s\n' "$(kubectl -n "$NS" get pod "$(app_pod "$HOG")" -o jsonpath='{range .status.conditions[*]}{.type}={.status}({.reason}) {end}' 2>/dev/null)"
+            printf '  Application.status.recommendedResources: %s\n' "$(kubectl -n "$NS" get application.apprafter.io "$HOG" -o jsonpath='{.status.recommendedResources}' 2>/dev/null)"
+            kubectl -n vpa logs deploy/vpa-updater --tail=200 2>/dev/null | grep -iE "in-place|inplace|resize|infeasible|deferred" | tail -20 | sed 's/^/    UPDLOG /'
+            printf '  --- END DIAGNOSTIC ---\n'
+            mark_fail "D10 in-place resize NEVER actuated: recommendation $HRECO, actuated ${HACT:-<unset>} after 10m"
+        fi
+    fi
+
+    # 2.22d (D10) part 2: the deferred/infeasible signal. It was specified by
+    # ADR 0054 and built end-to-end, but the only production call site passed a
+    # hardcoded false, so it had never fired. On a healthy cluster it must be
+    # ABSENT — and a wrong `notApplied` is now possible, so assert the absence.
+    printf '\n=== D10 notApplied signal ===\n'
+    NA=$(kubectl -n "$NS" get application.apprafter.io "$HOG" -o jsonpath='{.status.recommendedResources.notApplied}' 2>/dev/null)
+    if [ -z "$NA" ]; then
+        ok "D10 notApplied absent on a healthy cluster (nothing is blocking the resize)"
+    else
+        # A message mentioning in-place support means the operator's own k8s
+        # probe disagrees with the version assertion above — one of the two is
+        # wrong, and that is worth failing over.
+        mark_fail "D10 notApplied is set on a healthy cluster: $NA"
+    fi
+    # Done with the hog — later phases toggle cluster-wide autoscale and would
+    # otherwise be reasoning about two apps.
+    kubectl delete application.apprafter.io "$HOG" -n "$NS" --wait=false 2>/dev/null
 else
     mark_fail "#9 no VPA recommendation after 15m (metrics-server? feature-gate? history) — mirror untestable"
 fi
@@ -263,8 +415,10 @@ printf '  node capacity=%s allocatable=%s\n' "$CAP" "$ALLOC"
 ok "#14 headroom measured (allocatable=$ALLOC) — record vs the 2.16d baseline in docs/measurements/"
 
 printf '\n=== NOTE: resize-dynamics scenarios (#5 downward / #6 up-only / #7 512Mi cap / #12 image-rollout) ===\n'
-printf '  These need a sustained memory workload the Application schema cannot express (no command/args)\n'
-printf '  and/or a multi-day decay window; they are upstream-VPA behaviours validated manually, not here.\n'
+printf '  The UPWARD in-place resize is now asserted here (D10): the hog app carries a footprint the\n'
+printf '  image supplies, so its recommendation cannot equal the seed and an untouched pod fails.\n'
+printf '  The rest need a shaped workload the schema cannot express (no command/args) and/or a\n'
+printf '  multi-day decay window; they stay upstream-VPA behaviours validated manually.\n'
 printf '  This walk gates the operator<->VPA INTEGRATION (#1/#2/#3/#8/#9/#4-no-thrash/#10/#11/#13/#14).\n'
 
 printf '\n=== SUMMARY (FAIL=%s) ===\n' "$FAIL"

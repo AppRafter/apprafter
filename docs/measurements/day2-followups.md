@@ -1443,14 +1443,66 @@ sharp: the swap path *does* preflight the kubelet version
    rather than `spec`, and hard-fail rather than log. Without a differing
    pair the assertion cannot distinguish success from no-op, which is what it
    currently does not.
+
+   *Shipped as:* a second managed app in the same walk. An explicit large
+   request was not usable — it puts the app in pro-mode, which prunes the VPA
+   (that is what check #10 asserts) — and the schema expresses no
+   `command`/`args`, so the footprint has to come from the image itself:
+   `rabbitmq:3-alpine`, whose Erlang VM idles well above the 32Mi floor with
+   no arguments and no required env. It is deployed alongside the tiny app so
+   its history accumulates in the window the recommender is already warming
+   up in.
+
+   The walk now asserts the pair genuinely differs *before* asserting the
+   resize, and names which of the two failed — a degenerate pair is a
+   harness problem, not a resize failure, and conflating them sends the next
+   reader to debug the wrong component. It then polls
+   `status.containerStatuses[0].resources`, checks the pod uid is unchanged
+   (an `InPlace` resize that evicted would be a defect in itself), and dumps
+   the pod's resize conditions plus the updater log on failure.
+
+   The tiny app's observation stays, but can no longer report `ok:` from the
+   degenerate case — it prints `inconclusive:` and says why.
 2. **Emit the deferred signal.** Wire the `notApplied` probe the ADR
-   specified and the whole downstream path already implements — read the
-   VPA's own in-place condition rather than inferring node capacity, since
-   upstream now reports it.
+   specified and the whole downstream path already implements.
+
+   *Corrected 2026-08-31 while implementing:* this line said to read "the
+   VPA's own in-place condition". **There is no such condition.** Checked
+   against the updater at tag `vertical-pod-autoscaler-1.7.1`: its only
+   observable outputs on the in-place path are log lines
+   (`"In-place update deferred"`, `"In-place update infeasible…"`), an Event
+   recorded on the *pod*, and its own Prometheus counters. Nothing is written
+   to the `VerticalPodAutoscaler` CR status at all.
+
+   The kubelet states it directly instead, and first-hand: `PodResizePending`
+   with reason `Infeasible` (will not fit as things stand) or `Deferred` (not
+   now, possibly later), and `PodResizeInProgress` with reason `Error` for an
+   actuation failure. Conditions rather than the older `status.resize` field;
+   the feature is GA as of Kubernetes 1.35.
+
+   That also fixes a second thing the old code got wrong. The hardcoded
+   message said "node capacity" for *every* block, which is only ever right
+   for `Infeasible` — a `Deferred` resize reported as a capacity failure
+   sends someone to resize a node that was never the problem.
 3. **Preflight the Kubernetes prerequisite** the way the swap path already
    preflights its own: a version and feature check at bootstrap, and a walk
    assertion, so an unpinned upstream moving under us is a finding rather
    than a silence.
+
+   *Shipped as:* a startup probe in the operator (`apiserver_version` →
+   `(major, minor)` → ≥1.33, the release from which the gate is on by
+   default) folded into the **same** `notApplied` field, so it reuses the
+   whole downstream path — CRD field, operator type, CLI rendering — and adds
+   no new surface. Plus a direct walk assertion on the server minor version.
+   An unreadable version degrades to "supported": refusing to claim a defect
+   we cannot evidence, since a wrong "your cluster is too old" on every app
+   would be worse than the silence it replaces.
+
+   One case had to be carved out. In observe-only mode (`platform autoscale
+   set off`) the VPA is emitted with `updateMode: Off` and nothing is applied
+   *by design*, so the probe is skipped entirely — otherwise a deliberate
+   setting would be dressed up as a fault, and on an older cluster the
+   unsupported-Kubernetes message would be an outright wrong diagnosis.
 
 ### The shape worth carrying
 
