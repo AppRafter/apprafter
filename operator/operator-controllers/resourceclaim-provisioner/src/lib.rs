@@ -101,6 +101,11 @@ pub struct Context {
     /// most once per TTL across all reconciles. Capacity sampling is
     /// best-effort and NEVER fails a reconcile.
     pub capacity: Arc<CapacityCache>,
+    /// TTL cache of scraped backend metric bodies (2.22d / D8). One CNPG
+    /// scrape carries EVERY tenant database's size, so the cache means the
+    /// per-claim size refresh costs one HTTP GET per backend per window
+    /// rather than one per claim per reconcile.
+    pub backend_metrics: Arc<operator_core::promscrape::MetricsCache>,
 }
 
 impl Context {
@@ -113,6 +118,7 @@ impl Context {
             metrics,
             redis: Arc::new(RedisClient),
             capacity: Arc::new(CapacityCache::new()),
+            backend_metrics: Arc::new(operator_core::promscrape::MetricsCache::new()),
         }
     }
 }

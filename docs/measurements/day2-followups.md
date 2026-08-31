@@ -35,7 +35,8 @@ would otherwise touch the same code three times.
 | **D13** | A registry credential copy that nothing ever reclaims | open — high, security | 2.22b |
 | **D14** | Re-sealing a secret performs a gated change through an ungated door | resolved by decision — disclosure work open |
 | **D15** | The destructive-change gate never engaged for a base-only app | RESOLVED |
-| **D16** | A reconcile that fails leaves no trace outside the operator's log | open — high | 2.22c |
+| **D16** | A reconcile that fails leaves no trace outside the operator's log | open — high |
+| **D17** | A Dragonfly tenant can read every other tenant's key counts | open — medium, isolation | 2.22c |
 
 ## D1. VPA in-place right-sizing has never run: wrong feature-gate name
 
@@ -2053,4 +2054,65 @@ that used to be wrong, which readers learn to ignore.
 Ships with a walk assertion that a deliberately-induced reconcile failure —
 the 403 is the obvious fixture, since it is reproducible by withholding one
 RBAC verb — shows up in `app status` without reading a log.
+
+## D17. A Dragonfly tenant can read every other tenant's key counts
+
+**Opened:** 2026-08-31, found while investigating whether Dragonfly reports
+per-database size for D8. Not the thing being looked for, which is how this
+kind of finding usually arrives.
+
+**Status:** OPEN.
+**Severity:** medium. Metadata only — no keys, no values — but it is an
+isolation boundary the platform claims and does not hold.
+
+### What is wrong
+
+Per-claim ACL users are granted `+info`
+(`resourceclaim-provisioner/src/dragonfly.rs`, the `acl_setuser_args`
+vector). `INFO KEYSPACE` on Dragonfly v1.37.0 iterates **every** database on
+the instance regardless of which one the connection selected
+(`src/server/server_family.cc:3429-3444` loops `m.db_stats` for all `i`),
+and the ACL does not filter its output by database.
+
+The `$N` isolation ADR 0042 built is real for data — a tenant cannot read
+another's keys — and does not extend to this. On a shared pool instance every
+tenant can see, for every other tenant: key count, expiring-key count, hits,
+misses and hit ratio.
+
+### What it discloses
+
+Not data, but not nothing. Key counts and hit ratios over time are a usage
+signal: they show whether a neighbour is growing, idle, or being hammered.
+On a platform whose whole shape is "several tenants share one instance", the
+fact that tenancy is visible at all is the part worth fixing.
+
+`POOL_INSTANCE_INDEX` is hardcoded to `0`, so a cluster runs one ephemeral
+and one persistent instance and *every* redis tenant shares them. The blast
+radius is the whole cluster, not a subset.
+
+### The fix, and what it costs
+
+Dropping `+info` is the obvious move and it is not free: `INFO` is how a
+client library discovers server capabilities, and some drivers call it on
+connect. Removing it blind would break tenants for a metadata leak.
+
+Dragonfly's ACL cannot scope `INFO` to a section or a database, so the
+options are: drop `+info` entirely and document it; grant it and accept the
+disclosure, recorded rather than unnoticed; or wait for upstream to filter
+`INFO KEYSPACE` by the selected DB and pin the version that does.
+
+Worth deciding deliberately rather than inheriting. It should not block
+2.22d, and it should not stay unwritten either.
+
+### Related, same investigation
+
+Dragonfly exempts `/metrics` from HTTP auth by an explicit special case
+(`src/server/main_service.cc:2886-2899`: `if (path == "/metrics") return
+true;`). Today that endpoint is only on the admin port 9999, because
+dragonfly-operator v1.5.0 hardcodes `--primary_port_http_enabled=false`, and
+9999 is not in the operator-created Service. So it is not currently exposed —
+but anyone who flips that flag to reach the metrics publishes every tenant's
+`dragonfly_db_keys{db=…}` unauthenticated on the tenant-facing port. That is
+worth a comment wherever someone would be tempted, which is exactly where
+this platform will be tempted if it ever wants those metrics.
 

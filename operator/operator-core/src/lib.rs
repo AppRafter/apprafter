@@ -10,6 +10,7 @@ pub mod migration;
 pub mod migration_plan;
 pub mod migration_state;
 pub mod platform_stack;
+pub mod promscrape;
 pub mod resourceclaim;
 pub mod retainedclaim;
 pub mod serviceprovider;
@@ -46,7 +47,8 @@ pub use platform_stack::{
     ResourceQuantities,
 };
 pub use resourceclaim::{
-    ClaimCapacity, ResourceClaim, ResourceClaimCondition, ResourceClaimSpec, ResourceClaimStatus,
+    ClaimCapacity, ClaimSize, ResourceClaim, ResourceClaimCondition, ResourceClaimSpec,
+    ResourceClaimStatus,
 };
 pub use retainedclaim::{ClaimRef, RetainedClaim, RetainedClaimSpec};
 pub use serviceprovider::{ServiceProvider, ServiceProviderSpec, ServiceProviderStatus};

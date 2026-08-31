@@ -45,6 +45,32 @@ pub struct ResourceClaimSpec {
     pub persistent: Option<bool>,
 }
 
+/// How much data a claim holds (2.22d / D8).
+///
+/// Two fields because two backends can honestly answer different questions,
+/// and forcing one unit would mean inventing a number. Postgres reports
+/// BYTES — `cnpg_pg_database_size_bytes` is a default CNPG metric. Dragonfly
+/// reports KEYS: per-DB byte accounting exists inside the server but every
+/// emission site sums across databases first, and the only ways to bytes are
+/// per-key `MEMORY USAGE` or `DEBUG OBJHIST`, which walk the keyspace on
+/// shared shard threads and mix tenants respectively.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct ClaimSize {
+    /// On-disk bytes. Postgres only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<i64>,
+    /// Key count. Redis only — NOT bytes, and the CLI must say so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<i64>,
+    /// RFC3339 time of the sample, so a stale figure is visibly stale.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "measuredAt"
+    )]
+    pub measured_at: Option<String>,
+}
+
 /// Bytes used and available on the volume backing a `disk` claim
 /// (2.22d / D8).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -96,6 +122,12 @@ pub struct ResourceClaimStatus {
     /// fullness, not the tenant's slice of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<ClaimCapacity>,
+    /// How much data this claim holds (2.22d / D8) — the "how big is my
+    /// database" question, which is separate from "how full is the disk"
+    /// and useful without a denominator: it sizes a backup, shows growth
+    /// and explains cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<ClaimSize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]

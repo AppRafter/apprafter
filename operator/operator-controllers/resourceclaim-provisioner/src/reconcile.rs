@@ -175,6 +175,12 @@ pub async fn reconcile(
         .transpose()?
         .unwrap_or_else(|| json!({}));
     if !should_provision(&status_json) {
+        // 2.22d (D8): a ready claim never provisions again, so this 60s gate
+        // is the only place a size figure can be kept current. Best-effort
+        // and deadbanded — see `refresh_claim_size`.
+        if status_json.pointer("/ready").and_then(Value::as_bool) == Some(true) {
+            refresh_claim_size(ctx.as_ref(), &claim, &ns, &name).await;
+        }
         info!(%name, %ns, "not yet Scheduled (or already ready) — waiting for scheduler");
         return Ok(Action::requeue(Duration::from_secs(60)));
     }
@@ -1440,6 +1446,125 @@ fn status_apply_body(
 /// `instance` / `dbnum` allocation. Never touches `provider` or
 /// `Scheduled`. See [`status_apply_body`] for why the allocation MUST ride
 /// the terminal apply.
+/// On-disk bytes of a claim's Postgres database (2.22d / D8).
+///
+/// Scraped from the CNPG instance manager's Prometheus exporter, which runs
+/// on every instance pod and exports `cnpg_pg_database_size_bytes{datname}`
+/// among its DEFAULT metrics. No SQL client, and — the part that makes this
+/// better rather than merely cheaper — the exporter holds its own metrics
+/// connection, so the scrape costs nothing from the shared cluster's
+/// `max_connections`, which a client of ours would take from the tenants it
+/// is measuring.
+///
+/// One scrape carries every tenant database on the cluster, so the TTL cache
+/// on `ctx.backend_metrics` means this costs one HTTP GET per cluster per
+/// window however many claims ask.
+///
+/// `None` on any failure — an unreadable Cluster CR, no primary yet, an
+/// unreachable pod, an absent metric. Decorative: it must never fail the
+/// reconcile that called it.
+async fn sample_pg_size_bytes(
+    ctx: &Context,
+    cnpg_ns: &str,
+    cluster: &str,
+    datname: &str,
+) -> Option<i64> {
+    let api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), cnpg_ns, &cluster_ar());
+    let cr = api.get_opt(cluster).await.ok()??;
+    let primary = cr
+        .data
+        .pointer("/status/currentPrimary")
+        .and_then(Value::as_str)?;
+    let body = ctx
+        .backend_metrics
+        .body_for_pod(&ctx.client, cnpg_ns, primary, 9187, "/metrics")
+        .await?;
+    operator_core::promscrape::parse_labelled_gauge(
+        &body,
+        "cnpg_pg_database_size_bytes",
+        "datname",
+        datname,
+    )
+    .map(|v| v as i64)
+}
+
+/// Refresh `status.size` on a claim that is already ready (2.22d / D8).
+///
+/// Runs on the 60s gate rather than the provisioning path, because a ready
+/// claim never provisions again — `should_provision` returns false — and a
+/// size that only ever reflected provisioning time would be a number frozen
+/// at zero.
+///
+/// DEADBAND, and it is load-bearing. Every status write bumps
+/// `resourceVersion` and wakes this controller again, so an unconditional
+/// stamp would write once per claim per window forever and each write would
+/// fire its own reconcile. Only a material move — or a sample older than an
+/// hour — earns a write.
+async fn refresh_claim_size(ctx: &Context, claim: &ResourceClaim, ns: &str, name: &str) {
+    if claim.spec.type_ != "pg" {
+        return;
+    }
+    let cnpg_ns = DEFAULT_CNPG_NAMESPACE;
+    let datname = cnpg::pg_identifier(ns, name);
+    let Some(bytes) = sample_pg_size_bytes(ctx, cnpg_ns, DEFAULT_CNPG_CLUSTER, &datname).await
+    else {
+        return;
+    };
+    let previous = claim.status.as_ref().and_then(|s| s.size.clone());
+    if !size_write_is_worth_it(previous.as_ref(), bytes, &Utc::now().to_rfc3339()) {
+        return;
+    }
+    let api: Api<ResourceClaim> = Api::namespaced(ctx.client.clone(), ns);
+    let body = json!({
+        "apiVersion": "apprafter.io/v1alpha1",
+        "kind": "ResourceClaim",
+        "metadata": { "name": name },
+        "status": { "size": {
+            "bytes": bytes,
+            "measuredAt": Utc::now().to_rfc3339(),
+        }},
+    });
+    if let Err(e) = api
+        .patch_status(name, &apply_params(), &Patch::Apply(&body))
+        .await
+    {
+        tracing::debug!(%name, %ns, %e, "size refresh status write failed (retrying next tick)");
+    }
+}
+
+/// Whether a new size sample is worth a status write (2.22d / D8).
+///
+/// Pure, so the deadband is testable — and it needs to be, because getting
+/// it wrong is not a wrong number but a write loop: each status write wakes
+/// the controller, which samples again, which writes again.
+///
+/// Writes when there is no previous figure, when it moved by more than 1%
+/// or 1 MiB, or when the last sample is over an hour old. The age clause
+/// exists so a database that genuinely stops changing still shows a fresh
+/// `measuredAt` rather than looking abandoned.
+pub fn size_write_is_worth_it(
+    previous: Option<&operator_core::ClaimSize>,
+    bytes: i64,
+    now_rfc3339: &str,
+) -> bool {
+    let Some(prev) = previous else { return true };
+    let Some(prev_bytes) = prev.bytes else {
+        return true;
+    };
+    let delta = (bytes - prev_bytes).abs();
+    if delta > 1_048_576 || (prev_bytes > 0 && delta * 100 / prev_bytes >= 1) {
+        return true;
+    }
+    let stale = prev
+        .measured_at
+        .as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .zip(chrono::DateTime::parse_from_rfc3339(now_rfc3339).ok())
+        .map(|(then, now)| (now - then).num_seconds() > 3600)
+        .unwrap_or(true);
+    stale
+}
+
 /// Used/total bytes of a claim's own PVC, sampled from the kubelet (2.22d / D8).
 ///
 /// Only meaningful for an OWNED disk: it has its own PVC and therefore its
@@ -1848,6 +1973,77 @@ mod tests {
     }
 
     // --- should_provision() ---
+
+    #[test]
+    fn a_first_sample_always_writes() {
+        assert!(size_write_is_worth_it(None, 1000, "2026-08-31T10:00:00Z"));
+    }
+
+    #[test]
+    fn an_unchanged_size_does_not_write() {
+        // The deadband is not a nicety. Every status write bumps
+        // resourceVersion and wakes this controller, which samples again and
+        // writes again — an unconditional stamp is a write loop, not a
+        // chatty log line.
+        let prev = operator_core::ClaimSize {
+            bytes: Some(100_000_000),
+            keys: None,
+            measured_at: Some("2026-08-31T10:00:00+00:00".into()),
+        };
+        assert!(!size_write_is_worth_it(
+            Some(&prev),
+            100_000_100,
+            "2026-08-31T10:05:00+00:00"
+        ));
+    }
+
+    #[test]
+    fn a_material_move_writes() {
+        let prev = operator_core::ClaimSize {
+            bytes: Some(100_000_000),
+            keys: None,
+            measured_at: Some("2026-08-31T10:00:00+00:00".into()),
+        };
+        // > 1 MiB
+        assert!(size_write_is_worth_it(
+            Some(&prev),
+            110_000_000,
+            "2026-08-31T10:05:00+00:00"
+        ));
+    }
+
+    #[test]
+    fn a_small_database_moving_by_a_percent_writes() {
+        // The absolute 1 MiB clause alone would never fire for a small
+        // database, so a 10 MB DB doubling would look static forever.
+        let prev = operator_core::ClaimSize {
+            bytes: Some(10_000_000),
+            keys: None,
+            measured_at: Some("2026-08-31T10:00:00+00:00".into()),
+        };
+        assert!(size_write_is_worth_it(
+            Some(&prev),
+            10_200_000,
+            "2026-08-31T10:05:00+00:00"
+        ));
+    }
+
+    #[test]
+    fn an_hour_old_sample_refreshes_even_when_the_size_is_static() {
+        // Otherwise a database that genuinely stops changing shows a
+        // measuredAt that keeps ageing, and reads as abandoned rather than
+        // steady.
+        let prev = operator_core::ClaimSize {
+            bytes: Some(100_000_000),
+            keys: None,
+            measured_at: Some("2026-08-31T09:00:00+00:00".into()),
+        };
+        assert!(size_write_is_worth_it(
+            Some(&prev),
+            100_000_000,
+            "2026-08-31T11:00:00+00:00"
+        ));
+    }
 
     #[test]
     fn should_provision_true_when_scheduled_provider_set_not_ready() {

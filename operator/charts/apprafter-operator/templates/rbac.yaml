@@ -409,6 +409,18 @@ rules:
       - nodes/proxy
     verbs:
       - get
+  # 2.22d (D8): `pods/proxy` — the provisioner scrapes the CNPG instance
+  # manager's Prometheus exporter (:9187/metrics) to read
+  # `cnpg_pg_database_size_bytes` for each tenant database. This is why the
+  # operator needs no SQL client and takes no connection slot from the shared
+  # cluster: the exporter holds its own. Granted in the same change as the
+  # code that uses it — the ADR 0048 / 0.2.31 lesson.
+  - apiGroups:
+      - ""
+    resources:
+      - pods/proxy
+    verbs:
+      - get
   # Phase 2.4f RetainedClaim CRD — written by the provisioner
   # finalizer (the deletion snapshot: create/patch via SSA) and
   # consumed + deleted by the RetainedClaim GC controller (the

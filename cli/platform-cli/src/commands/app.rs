@@ -1099,6 +1099,9 @@ pub(crate) struct ResourceClaimSummary {
     /// backing cluster otherwise. Answers "what actually got created",
     /// which the ready/scheduled pair does not.
     pub backing: String,
+    /// How much data the claim holds, per-backend (2.22d / D8): used/total
+    /// for a disk, bytes for pg, keys for redis, `—` when unmeasured.
+    pub size: String,
     /// Whether `status.conditions[]` carries
     /// `{type: "Scheduled", status: "True"}` — the provisioner
     /// has placed the claim on a backing cluster.
@@ -1693,7 +1696,62 @@ fn summarise_resource_claim(claim: &Value) -> ResourceClaimSummary {
         secret_ref,
         scheduled,
         backing: backing_resource(claim),
+        size: claim_size_cell(claim),
     }
+}
+
+/// Human bytes, at the precision a size column wants.
+fn human_bytes(n: i64) -> String {
+    const U: [(&str, i64); 4] = [("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10), ("B", 1)];
+    for (unit, div) in U {
+        if n >= div {
+            let v = n as f64 / div as f64;
+            return if *unit == *"B" {
+                format!("{n} B")
+            } else if v >= 10.0 {
+                format!("{v:.0} {unit}")
+            } else {
+                format!("{v:.1} {unit}")
+            };
+        }
+    }
+    "0 B".to_string()
+}
+
+/// How much data this claim holds, rendered per backend (2.22d / D8).
+///
+/// Three shapes, because three backends can honestly answer different
+/// questions and forcing one unit would mean inventing a number:
+///
+///  * a **disk** has its own PVC, so used/total and a percentage;
+///  * **pg** reports on-disk BYTES, read from CNPG's own exporter;
+///  * **redis** reports a KEY COUNT and says so — Dragonfly accounts per-DB
+///    memory internally but sums across databases at every emission point,
+///    and the only routes to bytes walk the keyspace on shared shard threads.
+///
+/// `—` when nothing has been measured. Never a zero: "not sampled" and
+/// "empty" are different, and rendering the first as the second tells a
+/// tenant their database is empty when it is merely unmeasured.
+pub(crate) fn claim_size_cell(claim: &Value) -> String {
+    let used = claim
+        .pointer("/status/capacity/usedBytes")
+        .and_then(Value::as_i64);
+    let cap = claim
+        .pointer("/status/capacity/capacityBytes")
+        .and_then(Value::as_i64);
+    if let (Some(used), Some(cap)) = (used, cap) {
+        if cap > 0 {
+            let pct = (used as f64 / cap as f64 * 100.0).round() as i64;
+            return format!("{} / {} ({pct}%)", human_bytes(used), human_bytes(cap));
+        }
+    }
+    if let Some(bytes) = claim.pointer("/status/size/bytes").and_then(Value::as_i64) {
+        return human_bytes(bytes);
+    }
+    if let Some(keys) = claim.pointer("/status/size/keys").and_then(Value::as_i64) {
+        return format!("{keys} keys");
+    }
+    "—".to_string()
 }
 
 /// The concrete backend resource serving a claim (2.22d / D8).
@@ -1723,24 +1781,6 @@ pub(crate) fn backing_resource(claim: &Value) -> String {
         .pointer("/status/volumeClaimRef")
         .and_then(Value::as_str)
     {
-        // 2.22d (D8): an owned disk is the ONE claim shape with its own
-        // denominator, so a percentage here means something. A pg or redis
-        // claim is a tenant of a shared backend, where a per-tenant byte
-        // count has no per-tenant limit to be read against — those rows name
-        // the backend, and the backend's own fullness is reported where the
-        // backend lives.
-        let used = claim
-            .pointer("/status/capacity/usedBytes")
-            .and_then(Value::as_i64);
-        let cap = claim
-            .pointer("/status/capacity/capacityBytes")
-            .and_then(Value::as_i64);
-        if let (Some(used), Some(cap)) = (used, cap) {
-            if cap > 0 {
-                let pct = (used as f64 / cap as f64 * 100.0).round() as i64;
-                return format!("pvc/{pvc} ({pct}% full)");
-            }
-        }
         return format!("pvc/{pvc}");
     }
     "—".to_string()
@@ -1810,26 +1850,36 @@ fn print_resource_claims(claims: &[ResourceClaimSummary], namespace: &str) {
         .max()
         .unwrap_or(7)
         .max(7);
+    let size_w = claims
+        .iter()
+        .map(|c| c.size.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
     println!(
-        "  {:<name_w$}  {:<provider_w$}  READY  SCHEDULED  {:<backing_w$}  SECRET",
+        "  {:<name_w$}  {:<provider_w$}  READY  SCHEDULED  {:<backing_w$}  {:<size_w$}  SECRET",
         "NAME",
         "PROVIDER",
         "BACKING",
+        "SIZE",
         name_w = name_w,
         provider_w = provider_w,
         backing_w = backing_w,
+        size_w = size_w,
     );
     for c in claims {
         let secret = c.secret_ref.as_deref().unwrap_or("-");
         println!(
-            "  {:<name_w$}  {:<provider_w$}  {:<5}  {:<9}  {:<backing_w$}  {}",
+            "  {:<name_w$}  {:<provider_w$}  {:<5}  {:<9}  {:<backing_w$}  {:<size_w$}  {}",
             c.name,
             c.provider,
             if c.ready { "true" } else { "false" },
             if c.scheduled { "true" } else { "false" },
             c.backing,
+            c.size,
             secret,
             backing_w = backing_w,
+            size_w = size_w,
             name_w = name_w,
             provider_w = provider_w,
         );
@@ -4271,31 +4321,63 @@ mod backing_tests {
     }
 
     #[test]
-    fn a_disk_claim_reports_how_full_its_own_volume_is() {
-        // The one claim shape with its own denominator: an owned PVC has a
-        // capacity of its own, so a percentage is a judgement rather than a
-        // number floating free.
-        let c = json!({ "status": {
-            "volumeClaimRef": "web-disk-data",
-            "capacity": { "usedBytes": 91, "capacityBytes": 100 }
-        }});
-        assert_eq!(backing_resource(&c), "pvc/web-disk-data (91% full)");
-    }
-
-    #[test]
-    fn a_zero_capacity_sample_is_not_rendered_as_a_percentage() {
-        // A capacity of zero is an unusable sample, not an empty disk. The
-        // row falls back to naming the PVC rather than dividing by it.
-        let c = json!({ "status": {
-            "volumeClaimRef": "web-disk-data",
-            "capacity": { "usedBytes": 5, "capacityBytes": 0 }
-        }});
-        assert_eq!(backing_resource(&c), "pvc/web-disk-data");
-    }
-
-    #[test]
     fn an_unprovisioned_claim_shows_a_dash_rather_than_an_empty_cell() {
         assert_eq!(backing_resource(&json!({ "status": {} })), "—");
         assert_eq!(backing_resource(&json!({})), "—");
+    }
+}
+
+#[cfg(test)]
+mod size_cell_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_disk_shows_used_total_and_a_percentage() {
+        // The one claim shape with its own denominator, so a percentage is
+        // a judgement rather than a number floating free.
+        let c = json!({ "status": { "capacity": {
+            "usedBytes": 4_294_967_296i64, "capacityBytes": 8_589_934_592i64 }}});
+        assert_eq!(claim_size_cell(&c), "4.0 GB / 8.0 GB (50%)");
+    }
+
+    #[test]
+    fn postgres_shows_bytes() {
+        let c = json!({ "status": { "size": { "bytes": 12_582_912 }}});
+        assert_eq!(claim_size_cell(&c), "12 MB");
+    }
+
+    #[test]
+    fn redis_shows_keys_and_says_keys() {
+        // Dragonfly cannot give bytes for a logical DB — per-DB memory is
+        // accounted internally but summed across databases at every
+        // emission point. Labelling a key count as a size would be the
+        // invented number this column exists to avoid.
+        let c = json!({ "status": { "size": { "keys": 1234 }}});
+        assert_eq!(claim_size_cell(&c), "1234 keys");
+    }
+
+    #[test]
+    fn an_unmeasured_claim_shows_a_dash_and_never_a_zero() {
+        // "Not sampled" and "empty" are different facts. Rendering the first
+        // as the second tells a tenant their database is empty when it is
+        // merely unmeasured.
+        assert_eq!(claim_size_cell(&json!({ "status": {} })), "—");
+        assert_eq!(claim_size_cell(&json!({})), "—");
+    }
+
+    #[test]
+    fn a_zero_capacity_sample_does_not_become_a_percentage() {
+        // An unusable sample, not an empty disk — and dividing by it would
+        // be a nonsense rather than a crash, which is worse.
+        let c = json!({ "status": { "capacity": { "usedBytes": 5, "capacityBytes": 0 }}});
+        assert_eq!(claim_size_cell(&c), "—");
+    }
+
+    #[test]
+    fn human_bytes_switches_precision_so_columns_stay_narrow() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1536), "1.5 KB");
+        assert_eq!(human_bytes(15 * 1024 * 1024), "15 MB");
     }
 }
