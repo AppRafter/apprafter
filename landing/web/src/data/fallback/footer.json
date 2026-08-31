@@ -19,9 +19,9 @@
         { "label": "Roadmap", "href": "#roadmap", "external": false, "soon": false },
         {
           "label": "Docs",
-          "href": "https://github.com/AppRafter/apprafter#readme",
+          "href": "https://docs.apprafter.dev/",
           "external": true,
-          "soon": true
+          "soon": false
         }
       ]
     },
