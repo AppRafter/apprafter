@@ -1760,6 +1760,46 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.58": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.44"
+	notes: """
+		The operator now DELETES children it no longer declares. Until this release
+		it created and mutated them and removed nothing, so three kinds accumulated
+		forever (2.22b; D4/D12/D13 in the day-2 ledger).
+
+		REMOVING A `needs.*` ENTRY NOW ACTUALLY RELEASES IT. Four documents already
+		said the backing claim is garbage-collected; nothing deleted it, and the
+		operator's RBAC carried no `delete` verb on `resourceclaims` at all, so no
+		code path could have. The delete is what starts the documented retention
+		path — deletionTimestamp, provisioner finalizer, `RetainedClaim` snapshot,
+		seven-day window — none of which had ever run for a removed need. EXPECT
+		SHARED BACKENDS TO SCALE DOWN that previously could not: the reaper vetoes
+		on any live claim, so an orphan pinned its pool instance indefinitely.
+
+		The delete only happens AFTER the MigrationPlan for the removal is approved
+		— `needs-removal` is a detected, `data-migration`-classified trigger, and
+		the gate returns before this code on a pending plan. An unapproved edit
+		still destroys nothing.
+
+		DROPPING `expose` NOW REMOVES THE SERVICE. It previously survived, keeping
+		a ClusterIP and a pod selector for an application that had said stop
+		serving. The HTTPRoute arm for the same transition has existed since 1.83b;
+		the Service was left behind and the omission recorded in a code comment.
+
+		The derived pull-secret copy is now owned and labelled. It carries one
+		non-controller ownerReference per consuming Application, so the apiserver
+		reclaims it when the last one goes, and an `apprafter.io/source-credential`
+		label so deleting the credential revokes every copy — previously it
+		survived deleting the image, the application AND the credential, leaving a
+		working registry token in the namespace.
+
+		change=requires-restart: the operator Deployment rolls, and the first
+		reconcile after it performs the deletions above for anything already
+		undeclared.
+		"""
+}
+
 compatibility: "0.2.57": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.43"
