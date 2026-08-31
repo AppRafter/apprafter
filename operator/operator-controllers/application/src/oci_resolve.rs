@@ -47,7 +47,7 @@ pub enum OciResolveError {
 /// `repo@<digest>` reference. This also rejects the empty string the
 /// `ReqwestHttp` seam yields for a non-UTF-8 header value (which would
 /// otherwise render a broken `repo@` ref).
-fn is_valid_sha256_digest(digest: &str) -> bool {
+pub fn is_valid_sha256_digest(digest: &str) -> bool {
     match digest.strip_prefix("sha256:") {
         Some(hex) => {
             hex.len() == 64

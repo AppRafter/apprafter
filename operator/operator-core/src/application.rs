@@ -499,13 +499,83 @@ pub struct StatusImage {
         rename = "resolvedAt"
     )]
     pub resolved_at: Option<String>,
+    /// The resolution BEFORE the current one — what a rollback rolls back
+    /// *to* (ADR 0059). Absent until the digest has moved at least once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<StatusImagePrevious>,
+    /// Set while the application is held at a digest by `app rollback`
+    /// (ADR 0059). Its presence is what every surface reads to say the
+    /// application is no longer following its tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<StatusImagePin>,
 }
 
-/// `ImageResolved=False` when tag→digest resolution failed this cycle
-/// (registry unreachable, no covering credential for a private image,
-/// malformed reference) — the Deployment falls back to the verbatim
-/// tag; resolution NEVER blocks the rollout (ADR 0040). `True` after a
-/// successful resolution; absent when `imagePolicy.resolve: off`.
+/// The previously resolved image (ADR 0059) — the rollback target.
+///
+/// A RECORD rather than a bare digest, because after a manifest tag change
+/// (`v1`→`v2`) a bare digest cannot say which tag it belonged to, and a
+/// status line offering to roll back to it would read as a claim about the
+/// current tag. Carrying `tag` lets the CLI say "held at the digest `v1`
+/// resolved to" instead.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct StatusImagePrevious {
+    /// `repo@sha256:…` — the reference that was rendered before the current one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<String>,
+    /// The `spec` tag this digest was resolved from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// When it was resolved.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "resolvedAt"
+    )]
+    pub resolved_at: Option<String>,
+}
+
+/// The pin currently in effect (ADR 0059).
+///
+/// Written only when the pin is HONOURED. A rejected pin leaves this absent
+/// on purpose: marking an application pinned when the pin is not in effect
+/// is the assertion that passes in the degenerate case, and every surface
+/// downstream — `app status`, `platform status`, the Argo health script —
+/// reads this one field.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct StatusImagePin {
+    /// `repo@sha256:…` the workload is held at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<String>,
+    /// RFC3339 time the pin was placed, copied from the annotation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+}
+
+/// Annotation carrying the pinned image reference (`repo@sha256:…`),
+/// written by `apprafter app rollback` under the dedicated field manager
+/// `apprafter-cli-pin` and removed by `apprafter app unpin` (ADR 0059).
+pub const ANN_IMAGE_PIN: &str = "apprafter.io/image-pin";
+
+/// Annotation carrying the RFC3339 time the pin was placed (ADR 0059).
+pub const ANN_IMAGE_PINNED_AT: &str = "apprafter.io/image-pinned-at";
+
+/// `ImageResolved` — tri-state since ADR 0059, because "absent" was already
+/// spent on `imagePolicy.resolve: off` and could not carry a fourth meaning.
+///
+///  * `True` / `Resolved` — tag→digest lookup succeeded.
+///  * `True` / `Pinned` — held at a digest by `app rollback`. `True` because
+///    the rendered reference IS a digest, which is what this condition
+///    asserts; `False` would read as a fault to health-gated automation.
+///  * `False` / `PinRejected` — a pin annotation is present but not
+///    honourable (malformed, or naming a different repository), so the
+///    application is still following its tag. Loud, because the user's
+///    stated intent is not in effect.
+///  * `False` / `ResolveFailed` — resolution failed this cycle (registry
+///    unreachable, no covering credential, malformed reference); the
+///    Deployment falls back to the verbatim tag. Resolution NEVER blocks
+///    the rollout (ADR 0040).
+///
+/// Absent when `imagePolicy.resolve: off`.
 pub const COND_IMAGE_RESOLVED: &str = "ImageResolved";
 
 /// `PublicRouteReady` — SOFT, informational condition for a `network: public`

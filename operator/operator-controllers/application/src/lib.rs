@@ -639,9 +639,74 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         .unwrap_or_default();
 
     let mut image_status: Option<StatusImage> = None;
-    let mut image_resolved_cond: Option<(bool, String)> = None; // (ok, reason/msg)
-    let resolved_image: Option<String> = match effective.image.as_deref() {
-        Some(tag) if image_resolution_enabled(&effective) => {
+    let mut image_resolved_cond: Option<ImageResolvedState> = None;
+    // ADR 0059: is this application held at a digest by `app rollback`?
+    // Evaluated before resolution, because the pinned arm must not traverse
+    // any code path that can yield `None` — the renderer falls back to the
+    // verbatim TAG on `None`, so a "resolve then override" shape would
+    // silently un-pin during a registry outage and re-expose the bad build.
+    let pin = read_pin(&app, &effective);
+    let prior_image_owned = app.status.as_ref().and_then(|s| s.image.clone());
+    let resolved_image: Option<String> = match (&pin, effective.image.as_deref()) {
+        (Some(Ok(pinned)), tag) => {
+            // `resolvedAt` deliberately unset: `should_resolve_image` re-arms
+            // on an absent timestamp, so an un-pin resumes tag-following on
+            // the very next reconcile rather than up to a minute later.
+            image_status = Some(StatusImage {
+                tag: tag.map(str::to_string),
+                resolved: Some(pinned.clone()),
+                resolved_at: None,
+                // A hold must never rewrite history.
+                previous: prior_image_owned.as_ref().and_then(|p| p.previous.clone()),
+                pinned: Some(operator_core::StatusImagePin {
+                    resolved: Some(pinned.clone()),
+                    at: pin_placed_at(&app),
+                }),
+            });
+            image_resolved_cond = Some(ImageResolvedState::Pinned {
+                digest: pinned.clone(),
+                tag: tag.unwrap_or("its tag").to_string(),
+                app: name.clone(),
+            });
+            ctx.metrics
+                .image_resolve_total
+                .with_label_values(&["pinned"])
+                .inc();
+            Some(pinned.clone())
+        }
+        (Some(Err(reject)), Some(tag)) if image_resolution_enabled(&effective) => {
+            // The pin is present but not honourable. Fall through to normal
+            // resolution — never freeze the reconcile (the ADR 0048
+            // anchor-403 rule) — but say so loudly, and do NOT mark the
+            // application pinned: claiming a pin that is not in effect is
+            // exactly the assertion that passes in the degenerate case.
+            warn!(app = %name, reason = %reject, "image pin rejected; still following the tag");
+            let prior_image = prior_image_owned.as_ref();
+            let auth = match pick_pull_credential(tag, &source_creds) {
+                Some(cred) => read_cred_auth(&ctx.client, cred, tag).await,
+                None => oci_resolve::RegistryAuth::Anonymous,
+            };
+            let resolved = oci_resolve::resolve_digest(&ctx.oci_http, tag, &auth)
+                .await
+                .ok();
+            image_status = Some(StatusImage {
+                tag: Some(tag.to_string()),
+                resolved: resolved.clone(),
+                resolved_at: resolved.as_ref().map(|_| Utc::now().to_rfc3339()),
+                previous: shift_previous(prior_image, resolved.as_deref()),
+                pinned: None,
+            });
+            image_resolved_cond = Some(ImageResolvedState::PinRejected {
+                why: reject.clone(),
+                tag: tag.to_string(),
+            });
+            ctx.metrics
+                .image_resolve_total
+                .with_label_values(&["pin_rejected"])
+                .inc();
+            resolved
+        }
+        (_, Some(tag)) if image_resolution_enabled(&effective) => {
             // 2.4h Fix 1 (A): throttle the registry HEAD. The controller
             // reconciles on a 60s requeue AND on child-watch events, so a
             // HEAD per reconcile would hammer the registry. Skip the poll
@@ -656,8 +721,12 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
                 MIN_IMAGE_RESOLVE_INTERVAL_SECS,
             ) {
                 let prior = prior_image.expect("should_resolve_image=false implies Some(prior)");
+                // Whole-struct clone, which is what carries `previous`
+                // forward untouched. Rebuilding the struct field-by-field
+                // here would silently drop the rollback target every time
+                // the throttle served a cached digest (ADR 0059).
                 image_status = Some(prior.clone());
-                image_resolved_cond = Some((true, "Resolved".into()));
+                image_resolved_cond = Some(ImageResolvedState::Resolved);
                 ctx.metrics
                     .image_resolve_total
                     .with_label_values(&["cached"])
@@ -674,8 +743,10 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
                             tag: Some(tag.to_string()),
                             resolved: Some(resolved.clone()),
                             resolved_at: Some(Utc::now().to_rfc3339()),
+                            previous: shift_previous(prior_image, Some(&resolved)),
+                            pinned: None,
                         });
-                        image_resolved_cond = Some((true, "Resolved".into()));
+                        image_resolved_cond = Some(ImageResolvedState::Resolved);
                         ctx.metrics
                             .image_resolve_total
                             .with_label_values(&["ok"])
@@ -691,8 +762,16 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
                             tag: Some(tag.to_string()),
                             resolved: None,
                             resolved_at: None,
+                            // NOT `shift_previous(prior, None)` by accident —
+                            // that helper refuses to shift on a `None`
+                            // resolution, which is what stops a second
+                            // consecutive registry outage from overwriting the
+                            // rollback target with nothing (ADR 0059).
+                            previous: shift_previous(prior_image, None),
+                            pinned: None,
                         });
-                        image_resolved_cond = Some((false, format!("ResolveFailed: {e}")));
+                        image_resolved_cond =
+                            Some(ImageResolvedState::ResolveFailed(e.to_string()));
                         ctx.metrics
                             .image_resolve_total
                             .with_label_values(&["failed"])
@@ -704,7 +783,25 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
         }
         // No image, or `resolve: off` — render the verbatim reference,
         // emit no ImageResolved condition.
-        _ => None,
+        //
+        // ADR 0059: keep the retained rollback target even here. `status.image`
+        // is written whole under one forced field manager, so leaving
+        // `image_status` at `None` PRUNES the field — and toggling
+        // `imagePolicy.resolve: off` and back on would silently destroy the
+        // history. Only `previous` survives: `resolved` must not claim a digest
+        // when the verbatim tag is what got rendered.
+        _ => {
+            if let Some(prev) = prior_image_owned.as_ref().and_then(|p| p.previous.clone()) {
+                image_status = Some(StatusImage {
+                    tag: effective.image.clone(),
+                    resolved: None,
+                    resolved_at: None,
+                    previous: Some(prev),
+                    pinned: None,
+                });
+            }
+            None
+        }
     };
 
     // ---- 2.10 (ADR 0045): resolve the egress CNP render inputs ----
@@ -901,8 +998,8 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // (`imagePolicy.resolve` != "off" and an image is set). `resolve: off`
     // leaves both `image_resolved_cond` and `image_status` None → no
     // condition, no status.image.
-    if let Some((ok, reason)) = &image_resolved_cond {
-        conditions.push(image_resolved_condition(*ok, reason, previous_conditions));
+    if let Some(state) = &image_resolved_cond {
+        conditions.push(image_resolved_condition(state, previous_conditions));
     }
     // 1.83b: soft PublicRouteReady condition for a public app — zone coverage
     // + the route's own Accepted/ResolvedRefs. NEVER gates Ready; the route is
@@ -2897,6 +2994,61 @@ fn existing_env_config(app: &Application) -> Option<operator_core::EnvConfigStat
     app.status.as_ref().and_then(|s| s.env_config.clone())
 }
 
+/// The `status.image` already on the object (ADR 0059).
+///
+/// Every pause / failure status builder must carry this forward. `apply_status`
+/// is a whole-object SSA under one forced field manager, so a payload that
+/// OMITS a field makes the apiserver PRUNE it — the same trap this file already
+/// documents for `endpointURL`. Five builders hard-coded `image: None`, which
+/// meant entering a MigrationPlan gate, a claim pause, `EnvSecretMissing` or an
+/// invalid effective spec **deleted `status.image` outright**.
+///
+/// That was benign while nothing read the field. It is fatal once
+/// `status.image.previous` is the only rollback target a developer has, because
+/// it would be destroyed exactly when the application is in trouble — which is
+/// exactly when someone reaches for a rollback.
+fn existing_image(app: &Application) -> Option<StatusImage> {
+    app.status.as_ref().and_then(|s| s.image.clone())
+}
+
+/// Carry `previous` across a fresh resolution (ADR 0059).
+///
+/// Shifts `previous ← prior.resolved` only when this resolution genuinely
+/// MOVED the digest; otherwise carries the prior `previous` forward untouched.
+/// Pure, because each non-shift case is a distinct way to destroy the rollback
+/// target and none of them is obvious from the call site:
+///
+///  * a resolve FAILURE writes `resolved: None`. Shifting unconditionally would
+///    let a second consecutive registry outage overwrite `previous` with
+///    nothing — the target is gone precisely during an incident.
+///  * a same-digest re-resolve, after the 60s throttle expires, would set
+///    `previous = current`, making rollback a no-op onto the build being
+///    escaped.
+///  * a first resolution has nothing to shift.
+///
+/// A manifest tag change (`v1`→`v2`) DOES shift, under the same single rule:
+/// the digest moved, and what was running before is a true thing to offer. The
+/// record carries the tag it came from so the CLI can say so rather than let a
+/// reader assume it was the current tag.
+fn shift_previous(
+    prior: Option<&StatusImage>,
+    new_resolved: Option<&str>,
+) -> Option<operator_core::StatusImagePrevious> {
+    let prior = prior?;
+    let moved = match (prior.resolved.as_deref(), new_resolved) {
+        (Some(p), Some(d)) => p != d,
+        _ => false,
+    };
+    if !moved {
+        return prior.previous.clone();
+    }
+    Some(operator_core::StatusImagePrevious {
+        resolved: prior.resolved.clone(),
+        tag: prior.tag.clone(),
+        resolved_at: prior.resolved_at.clone(),
+    })
+}
+
 fn existing_baseline(app: &Application) -> Option<ApplicationSpec> {
     app.status
         .as_ref()
@@ -2938,7 +3090,10 @@ fn build_paused_status(app: &Application, plan_ns: &str, plan_name: &str) -> App
         observed_generation: app.metadata.generation,
         conditions: Some(vec![ready, pending]),
         endpoint_url: previous_endpoint,
-        image: None,
+        // ADR 0059: carry the resolved-image truth across the pause.
+        // Omitting it makes the whole-object status SSA PRUNE it, which
+        // would destroy the rollback target exactly when an app is stuck.
+        image: existing_image(app),
         environment: app.spec.environment.clone(),
         // 2.16b (walk-found): carry the baseline forward — omitting it under
         // SSA prunes it, self-cancelling the gate. See `existing_baseline`.
@@ -2983,7 +3138,10 @@ fn build_migration_failed_status(app: &Application, plan_name: &str) -> Applicat
         observed_generation: app.metadata.generation,
         conditions: Some(vec![ready, failed]),
         endpoint_url: previous_endpoint,
-        image: None,
+        // ADR 0059: carry the resolved-image truth across the pause.
+        // Omitting it makes the whole-object status SSA PRUNE it, which
+        // would destroy the rollback target exactly when an app is stuck.
+        image: existing_image(app),
         environment: app.spec.environment.clone(),
         // 2.16b: a failed gate does NOT re-stamp the baseline — the app is
         // still on the prior applied spec. CARRY it forward: apply_status is
@@ -3432,7 +3590,10 @@ fn build_resource_claim_paused_status(app: &Application, unready: &[String]) -> 
         observed_generation: app.metadata.generation,
         conditions: Some(vec![ready, pending]),
         endpoint_url: previous_endpoint,
-        image: None,
+        // ADR 0059: carry the resolved-image truth across the pause.
+        // Omitting it makes the whole-object status SSA PRUNE it, which
+        // would destroy the rollback target exactly when an app is stuck.
+        image: existing_image(app),
         environment: app.spec.environment.clone(),
         // 2.16b (walk-found): carry the baseline forward — omitting it under
         // SSA prunes it. See `existing_baseline`.
@@ -3524,7 +3685,10 @@ fn build_env_secret_missing_status(app: &Application, messages: &[String]) -> Ap
         observed_generation: app.metadata.generation,
         conditions: Some(vec![ready]),
         endpoint_url: previous_endpoint,
-        image: None,
+        // ADR 0059: carry the resolved-image truth across the pause.
+        // Omitting it makes the whole-object status SSA PRUNE it, which
+        // would destroy the rollback target exactly when an app is stuck.
+        image: existing_image(app),
         environment: app.spec.environment.clone(),
         // 2.16b (walk-found): carry the baseline forward — omitting it under
         // SSA prunes it. See `existing_baseline`.
@@ -3563,7 +3727,10 @@ fn build_invalid_effective_spec_status(app: &Application, message: &str) -> Appl
         observed_generation: app.metadata.generation,
         conditions: Some(vec![ready]),
         endpoint_url: previous_endpoint,
-        image: None,
+        // ADR 0059: carry the resolved-image truth across the pause.
+        // Omitting it makes the whole-object status SSA PRUNE it, which
+        // would destroy the rollback target exactly when an app is stuck.
+        image: existing_image(app),
         environment: app.spec.environment.clone(),
         last_applied_spec: existing_baseline(app),
         recommended_resources: None,
@@ -3625,37 +3792,163 @@ fn image_resolution_enabled(spec: &ApplicationBaseSpec) -> bool {
     !matches!(resolve, Some("off"))
 }
 
-/// Build the `ImageResolved` condition (2.4h-d). `ok` maps to
-/// `status=True/reason=Resolved` after a successful tag→digest lookup,
-/// or `status=False/reason=ResolveFailed` on a failure that fell back to
-/// the verbatim tag. `lastTransitionTime` follows the same k8s
-/// convention as `ready_condition` — preserved when the prior
-/// `ImageResolved` already carried the same `status`, bumped on a flip.
+/// Read and validate the pin annotation (ADR 0059).
+///
+/// `None` — no pin. `Some(Ok(reference))` — honour it. `Some(Err(why))` — a
+/// pin is present but must not be honoured, and the reason is user-facing.
+///
+/// Validated rather than trusted, because the annotation is hand-writable and
+/// its value is spliced verbatim into the container image field. Two checks:
+///
+///  * it must parse as an OCI reference AND be a digest. A bare `sha256:…`
+///    would render an invalid reference and the workload would not start.
+///  * its repository must match the manifest image's repository. Otherwise a
+///    pin left behind by an earlier manifest keeps pulling from a DIFFERENT
+///    repository after the image path changes — a substitution the migration
+///    classifier grades `security-boundary`, arrived at silently.
+///
+/// Both repositories are normalised through `parse_image_ref` before
+/// comparison: `nginx` and `index.docker.io/library/nginx` are the same
+/// repository, and a string compare would reject every short-name image.
+fn read_pin(app: &Application, effective: &ApplicationBaseSpec) -> Option<Result<String, String>> {
+    let raw = app
+        .metadata
+        .annotations
+        .as_ref()?
+        .get(operator_core::ANN_IMAGE_PIN)?
+        .trim()
+        .to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(validate_pin(&raw, effective.image.as_deref()))
+}
+
+/// The pure half of [`read_pin`], so every rejection is testable without a
+/// cluster — and every rejection is a case where the platform keeps deploying
+/// against the user's stated intent, which is not a thing to leave unproven.
+fn validate_pin(raw: &str, spec_image: Option<&str>) -> Result<String, String> {
+    let parsed = oci_resolve::parse_image_ref(raw)
+        .map_err(|e| format!("`{raw}` is not a valid image reference: {e}"))?;
+    if !parsed.is_digest {
+        return Err(format!(
+            "`{raw}` is not a digest reference — a pin must name `repo@sha256:…`"
+        ));
+    }
+    // `sha512:` is legal OCI, but this platform only ever writes `sha256:`
+    // (ADR 0040), so accepting anything else would mean honouring a reference
+    // no part of the system produced.
+    if !oci_resolve::is_valid_sha256_digest(&parsed.reference) {
+        return Err(format!(
+            "`{}` is not a canonical sha256 digest",
+            parsed.reference
+        ));
+    }
+    let Some(spec_image) = spec_image else {
+        return Err("the manifest declares no image to pin".to_string());
+    };
+    let spec_parsed = oci_resolve::parse_image_ref(spec_image)
+        .map_err(|e| format!("manifest image `{spec_image}` is not a valid reference: {e}"))?;
+    let pin_repo = format!("{}/{}", parsed.host, parsed.repository);
+    let spec_repo = format!("{}/{}", spec_parsed.host, spec_parsed.repository);
+    if pin_repo != spec_repo {
+        return Err(format!(
+            "pin names repository `{pin_repo}` but the manifest names `{spec_repo}`"
+        ));
+    }
+    Ok(raw.to_string())
+}
+
+/// The RFC3339 time the pin was placed, as recorded by the CLI. Best-effort:
+/// a missing or garbage value costs the status a timestamp and nothing else.
+fn pin_placed_at(app: &Application) -> Option<String> {
+    app.metadata
+        .annotations
+        .as_ref()?
+        .get(operator_core::ANN_IMAGE_PINNED_AT)
+        .cloned()
+}
+
+/// What the `ImageResolved` condition should say this reconcile
+/// (2.4h-d, extended to four states by ADR 0059).
+///
+/// An enum rather than the old `(bool, String)` because "absent" was already
+/// spent on `imagePolicy.resolve: off` and could not be stretched to carry a
+/// pin state as well — and because a bare bool cannot distinguish "held on
+/// purpose" from "could not reach the registry", which are opposite facts
+/// that a reader must not have to guess between.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ImageResolvedState {
+    /// Tag→digest lookup succeeded (or the throttle served a cached digest).
+    Resolved,
+    /// Held at a digest by `app rollback` (ADR 0059).
+    Pinned {
+        digest: String,
+        tag: String,
+        app: String,
+    },
+    /// A pin annotation is present but not honourable; still following the tag.
+    PinRejected { why: String, tag: String },
+    /// Resolution failed this cycle; the verbatim tag was rendered.
+    ResolveFailed(String),
+}
+
+impl ImageResolvedState {
+    /// `True` for both `Resolved` and `Pinned`, because in both cases the
+    /// rendered reference IS a digest — which is what this condition asserts.
+    /// A pinned application reporting `False` would read as a fault to
+    /// anything gated on health, and being deliberately held is not a fault.
+    fn ok(&self) -> bool {
+        matches!(self, Self::Resolved | Self::Pinned { .. })
+    }
+
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Resolved => "Resolved",
+            Self::Pinned { .. } => "Pinned",
+            Self::PinRejected { .. } => "PinRejected",
+            Self::ResolveFailed(_) => "ResolveFailed",
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::Resolved => "image tag resolved to a registry digest".to_string(),
+            Self::Pinned { digest, tag, app } => format!(
+                "held at {digest} by rollback; not following {tag} — \
+                 resume with `apprafter app unpin {app}`"
+            ),
+            Self::PinRejected { why, tag } => {
+                format!("image pin ignored ({why}); the app is following {tag}")
+            }
+            Self::ResolveFailed(e) => format!("ResolveFailed: {e}"),
+        }
+    }
+}
+
+/// Build the `ImageResolved` condition from the state above.
+///
+/// `lastTransitionTime` follows the same k8s convention as `ready_condition`,
+/// but keys on `(status, reason)` rather than `status` alone — otherwise a
+/// `Resolved`→`Pinned` move, which keeps `status: True`, would inherit the
+/// older timestamp and the condition could not say when the pin took effect.
 fn image_resolved_condition(
-    ok: bool,
-    reason: &str,
+    state: &ImageResolvedState,
     previous: &[ApplicationCondition],
 ) -> ApplicationCondition {
-    let status = if ok { "True" } else { "False" };
+    let status = if state.ok() { "True" } else { "False" };
+    let reason = state.reason();
     let last_transition_time = previous
         .iter()
-        .find(|c| c.type_ == COND_IMAGE_RESOLVED && c.status == status)
+        .find(|c| c.type_ == COND_IMAGE_RESOLVED && c.status == status && c.reason == reason)
         .map(|c| c.last_transition_time.clone())
         .unwrap_or_else(|| Utc::now().to_rfc3339());
-    let (reason_field, message) = if ok {
-        (
-            "Resolved".to_string(),
-            "image tag resolved to a registry digest".to_string(),
-        )
-    } else {
-        ("ResolveFailed".to_string(), reason.to_string())
-    };
     ApplicationCondition {
         type_: COND_IMAGE_RESOLVED.to_string(),
         status: status.to_string(),
         last_transition_time,
-        reason: reason_field,
-        message,
+        reason: reason.to_string(),
+        message: state.message(),
         observed_generation: None,
     }
 }
@@ -5706,9 +5999,184 @@ mod tests {
         assert!(image_resolution_enabled(&spec));
     }
 
+    // ---- ADR 0059: retained digest + pin ----
+
+    fn img(tag: &str, resolved: Option<&str>, prev: Option<&str>) -> StatusImage {
+        StatusImage {
+            tag: Some(tag.into()),
+            resolved: resolved.map(String::from),
+            resolved_at: resolved.map(|_| "2026-08-31T10:00:00+00:00".to_string()),
+            previous: prev.map(|p| operator_core::StatusImagePrevious {
+                resolved: Some(p.into()),
+                tag: Some("app:old".into()),
+                resolved_at: None,
+            }),
+            pinned: None,
+        }
+    }
+
+    #[test]
+    fn a_moved_digest_becomes_the_rollback_target() {
+        let prior = img("app:latest", Some("app@sha256:aaa"), None);
+        let shifted = shift_previous(Some(&prior), Some("app@sha256:bbb")).unwrap();
+        assert_eq!(shifted.resolved.as_deref(), Some("app@sha256:aaa"));
+        // The tag travels with the digest: after a manifest tag change a bare
+        // digest could not say which tag it belonged to, and a status line
+        // offering it would read as a claim about the CURRENT tag.
+        assert_eq!(shifted.tag.as_deref(), Some("app:latest"));
+    }
+
+    #[test]
+    fn a_registry_outage_does_not_destroy_the_rollback_target() {
+        // The failure arm writes `resolved: None`. Shifting on every write
+        // would mean the SECOND consecutive outage reads `prior.resolved ==
+        // None` and sets previous = None — the target is gone precisely
+        // during the incident someone would roll back because of.
+        let prior = img("app:latest", None, Some("app@sha256:aaa"));
+        let carried = shift_previous(Some(&prior), None).unwrap();
+        assert_eq!(carried.resolved.as_deref(), Some("app@sha256:aaa"));
+    }
+
+    #[test]
+    fn a_same_digest_re_resolve_does_not_make_rollback_a_no_op() {
+        // The 60s throttle expires and the tag still points at the same
+        // build. Shifting here would set previous = current, so `rollback`
+        // would offer to roll back onto the build being escaped.
+        let prior = img("app:latest", Some("app@sha256:bbb"), Some("app@sha256:aaa"));
+        let carried = shift_previous(Some(&prior), Some("app@sha256:bbb")).unwrap();
+        assert_eq!(carried.resolved.as_deref(), Some("app@sha256:aaa"));
+    }
+
+    #[test]
+    fn a_first_resolution_has_nothing_to_roll_back_to() {
+        assert!(shift_previous(None, Some("app@sha256:aaa")).is_none());
+        let fresh = img("app:latest", None, None);
+        assert!(shift_previous(Some(&fresh), Some("app@sha256:aaa")).is_none());
+    }
+
+    // ---- validate_pin ----
+
+    #[test]
+    fn a_well_formed_pin_on_the_same_repository_is_honoured() {
+        let d = format!("ghcr.io/acme/web@sha256:{}", "a".repeat(64));
+        assert_eq!(
+            validate_pin(&d, Some("ghcr.io/acme/web:latest")),
+            Ok(d.clone())
+        );
+    }
+
+    #[test]
+    fn a_short_name_image_is_not_rejected_by_registry_normalisation() {
+        // `nginx` and `index.docker.io/library/nginx` are the same
+        // repository. A string compare would reject every short-name image
+        // — and the rejection would look like a security finding.
+        let d = format!("nginx@sha256:{}", "b".repeat(64));
+        assert!(validate_pin(&d, Some("nginx:1.28")).is_ok());
+        assert!(validate_pin(&d, Some("index.docker.io/library/nginx:1.28")).is_ok());
+    }
+
+    #[test]
+    fn a_pin_naming_another_repository_is_refused() {
+        // A pin outliving an image-path change would keep pulling from a
+        // DIFFERENT repository — the substitution the migration classifier
+        // grades `security-boundary`, arrived at silently.
+        let d = format!("ghcr.io/attacker/web@sha256:{}", "c".repeat(64));
+        let err = validate_pin(&d, Some("ghcr.io/acme/web:latest")).unwrap_err();
+        assert!(err.contains("attacker"), "{err}");
+        assert!(err.contains("acme"), "{err}");
+    }
+
+    #[test]
+    fn a_tag_reference_is_not_a_pin() {
+        // Pinning to a tag would pin to nothing: the tag is the thing that
+        // moved.
+        let err = validate_pin("ghcr.io/acme/web:v1", Some("ghcr.io/acme/web:latest")).unwrap_err();
+        assert!(err.contains("not a digest"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_digest_is_refused_rather_than_rendered() {
+        // The value is spliced verbatim into the container image field, so
+        // a truncated hex string would render a reference the kubelet
+        // cannot pull — a pin that breaks the app instead of holding it.
+        let short = format!("ghcr.io/acme/web@sha256:{}", "a".repeat(63));
+        assert!(validate_pin(&short, Some("ghcr.io/acme/web:latest")).is_err());
+        let upper = format!("ghcr.io/acme/web@sha256:{}", "A".repeat(64));
+        assert!(validate_pin(&upper, Some("ghcr.io/acme/web:latest")).is_err());
+    }
+
+    #[test]
+    fn a_pin_with_no_manifest_image_is_refused() {
+        let d = format!("ghcr.io/acme/web@sha256:{}", "a".repeat(64));
+        assert!(validate_pin(&d, None).is_err());
+    }
+
+    // ---- ImageResolvedState ----
+
+    #[test]
+    fn a_pinned_app_reports_true_not_false() {
+        // The rendered reference IS a digest, which is what this condition
+        // asserts. `False` would read as a fault to health-gated automation,
+        // and being deliberately held is not a fault.
+        let s = ImageResolvedState::Pinned {
+            digest: "app@sha256:aaa".into(),
+            tag: "app:latest".into(),
+            app: "web".into(),
+        };
+        let c = image_resolved_condition(&s, &[]);
+        assert_eq!(c.status, "True");
+        assert_eq!(c.reason, "Pinned");
+        // The message must name the way out. An absent condition is
+        // unreadable by a human; a present one that does not say how to
+        // resume is barely better.
+        assert!(
+            c.message.contains("apprafter app unpin web"),
+            "{}",
+            c.message
+        );
+        assert!(c.message.contains("app:latest"), "{}", c.message);
+    }
+
+    #[test]
+    fn a_rejected_pin_is_loud_and_says_the_app_still_follows_the_tag() {
+        let s = ImageResolvedState::PinRejected {
+            why: "pin names repository `x` but the manifest names `y`".into(),
+            tag: "app:latest".into(),
+        };
+        let c = image_resolved_condition(&s, &[]);
+        assert_eq!(c.status, "False");
+        assert_eq!(c.reason, "PinRejected");
+        assert!(c.message.contains("following app:latest"), "{}", c.message);
+    }
+
+    #[test]
+    fn resolved_to_pinned_stamps_a_new_transition_time() {
+        // Both are `status: True`, so a lookup keyed on status alone would
+        // inherit the older timestamp and the condition could not say when
+        // the pin took effect.
+        let prior = vec![ApplicationCondition {
+            type_: COND_IMAGE_RESOLVED.into(),
+            status: "True".into(),
+            last_transition_time: "2026-06-05T10:00:00+00:00".into(),
+            reason: "Resolved".into(),
+            message: "ok".into(),
+            observed_generation: None,
+        }];
+        let next = image_resolved_condition(
+            &ImageResolvedState::Pinned {
+                digest: "app@sha256:aaa".into(),
+                tag: "app:latest".into(),
+                app: "web".into(),
+            },
+            &prior,
+        );
+        assert_eq!(next.status, "True");
+        assert_ne!(next.last_transition_time, "2026-06-05T10:00:00+00:00");
+    }
+
     #[test]
     fn image_resolved_condition_ok_is_true_resolved() {
-        let c = image_resolved_condition(true, "Resolved", &[]);
+        let c = image_resolved_condition(&ImageResolvedState::Resolved, &[]);
         assert_eq!(c.type_, COND_IMAGE_RESOLVED);
         assert_eq!(c.status, "True");
         assert_eq!(c.reason, "Resolved");
@@ -5718,7 +6186,10 @@ mod tests {
     fn image_resolved_condition_failure_is_false_with_message() {
         // The failure path carries the error string into `message` so
         // `kubectl describe` surfaces WHY the verbatim tag was rendered.
-        let c = image_resolved_condition(false, "ResolveFailed: registry returned status 404", &[]);
+        let c = image_resolved_condition(
+            &ImageResolvedState::ResolveFailed("registry returned status 404".into()),
+            &[],
+        );
         assert_eq!(c.status, "False");
         assert_eq!(c.reason, "ResolveFailed");
         assert!(c.message.contains("404"));
@@ -5738,7 +6209,7 @@ mod tests {
             message: "old".into(),
             observed_generation: None,
         }];
-        let next = image_resolved_condition(true, "Resolved", &prior);
+        let next = image_resolved_condition(&ImageResolvedState::Resolved, &prior);
         assert_eq!(next.last_transition_time, "2026-06-05T10:00:00+00:00");
     }
 
@@ -5755,7 +6226,8 @@ mod tests {
             message: "ok".into(),
             observed_generation: None,
         }];
-        let next = image_resolved_condition(false, "ResolveFailed: timeout", &prior);
+        let next =
+            image_resolved_condition(&ImageResolvedState::ResolveFailed("timeout".into()), &prior);
         assert_eq!(next.status, "False");
         assert_ne!(next.last_transition_time, "2026-06-05T10:00:00+00:00");
     }
@@ -5767,6 +6239,8 @@ mod tests {
             tag: tag.map(String::from),
             resolved: resolved.map(String::from),
             resolved_at: at.map(String::from),
+            previous: None,
+            pinned: None,
         }
     }
 
@@ -6497,6 +6971,8 @@ mod tests {
                 tag: Some("app:v1".into()),
                 resolved: Some("app@sha256:abc".into()),
                 resolved_at: Some("2026-07-01T00:00:00Z".into()),
+                previous: None,
+                pinned: None,
             }),
             environment: Some("prod".into()),
             last_applied_spec: None,
