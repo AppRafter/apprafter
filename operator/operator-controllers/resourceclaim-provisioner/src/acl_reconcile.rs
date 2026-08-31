@@ -70,6 +70,20 @@ const RESYNC_INTERVAL: Duration = Duration::from_secs(300);
 /// ACL user to re-pin.
 const REDIS_TYPE: &str = "redis";
 
+/// How long to wait after a poke before re-deriving, so a burst of claims
+/// provisioned together yields one file write rather than one per claim.
+const POKE_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Field manager for the ACL file Secret and for the `Dragonfly` CR fields
+/// the loop owns (ADR 0042 §10).
+///
+/// Dedicated, for the reason the CLI's `apprafter-cli-egress` is: the
+/// provisioner applies the WHOLE `Dragonfly` CR under
+/// `resourceclaim-provisioner`, so writing `aclFromSecret` under that manager
+/// would make the provisioner's next apply — which does not carry the field —
+/// prune it, and the two would fight in a roll-war.
+const ACL_FIELD_MANAGER: &str = "resourceclaim-provisioner-acl";
+
 /// One claim's per-tick payload, derived purely from a live `ResourceClaim`
 /// (no I/O). The loop turns each of these into an `ACL SETUSER` after it
 /// recovers the password from the connection Secret, and into a `DBSIZE`
@@ -234,7 +248,18 @@ pub async fn run(ctx: Arc<Context>) -> Result<(), ReconcileError> {
         if let Err(err) = resync_all(&ctx).await {
             warn!(%err, "DragonflyAclReconcile resync pass failed — retrying next tick");
         }
-        tokio::time::sleep(RESYNC_INTERVAL).await;
+        // ADR 0042 §10: wake early when the live ACL set changed, so the
+        // durable file catches up in seconds rather than on the next tick.
+        // The periodic arm stays — it is what re-pins a runtime user after a
+        // restart nobody signalled.
+        tokio::select! {
+            _ = tokio::time::sleep(RESYNC_INTERVAL) => {}
+            _ = ctx.acl_dirty.notified() => {
+                // Coalesce a burst: several claims provisioned together
+                // should produce one file derivation, not one per claim.
+                tokio::time::sleep(POKE_DEBOUNCE).await;
+            }
+        }
     }
 }
 
@@ -249,16 +274,60 @@ async fn resync_all(ctx: &Arc<Context>) -> Result<(), ReconcileError> {
         .await?
         .items;
 
-    let instances = allocated_instances(&claims);
-    if instances.is_empty() {
-        return Ok(());
+    let df_ns = redis_namespace(ctx).await?;
+
+    // The instance set is the union of "has a live claim" and "exists as a
+    // CR we manage". Claim-derived alone never visits an instance whose last
+    // tenant was GC'd — so its file would never shrink, and the revoked
+    // tenant's line would survive every restart. That is the revocation
+    // being durable in the wrong direction.
+    //
+    // The CR list is best-effort (the ADR 0048 lesson): on failure, warn and
+    // fall back to the claim-derived set. That misses a tenantless instance,
+    // which delays a shrink; it can never produce a WRONG file.
+    let mut instances = allocated_instances(&claims);
+    match managed_instances(ctx, &df_ns).await {
+        Ok(crs) => {
+            for i in crs {
+                if !instances.contains(&i) {
+                    instances.push(i);
+                }
+            }
+            instances.sort();
+        }
+        Err(err) => warn!(
+            %err,
+            "could not list managed Dragonfly instances — falling back to claim-derived set \
+             (a tenantless instance's file will not shrink this pass)"
+        ),
     }
+
     for instance in instances {
-        if let Err(err) = reconcile_instance_acls(ctx, &instance, &claims).await {
+        if let Err(err) = reconcile_instance_acls(ctx, &instance, &claims, &df_ns).await {
             warn!(%instance, %err, "ACL re-pin for instance failed — skipping; retried next tick");
         }
     }
     Ok(())
+}
+
+/// Names of the `Dragonfly` CRs this platform manages in `df_ns`.
+///
+/// Selected on the same `apprafter.io/managed-by` stamp the reaper uses, so
+/// an instance this operator did not create can never be written to.
+async fn managed_instances(ctx: &Arc<Context>, df_ns: &str) -> Result<Vec<String>, ReconcileError> {
+    let api: Api<DynamicObject> = Api::namespaced_with(
+        ctx.client.clone(),
+        df_ns,
+        &crate::reconcile::dragonfly_cluster_ar(),
+    );
+    let lp = kube::api::ListParams::default().labels("apprafter.io/managed-by=apprafter");
+    Ok(api
+        .list(&lp)
+        .await?
+        .items
+        .into_iter()
+        .filter_map(|o| o.metadata.name)
+        .collect())
 }
 
 /// Re-assert every live ready claim user on a single pool instance.
@@ -281,21 +350,38 @@ pub async fn reconcile_instance_acls(
     ctx: &Arc<Context>,
     instance: &str,
     claims: &[ResourceClaim],
+    df_ns: &str,
 ) -> Result<(), ReconcileError> {
     let to_repin = claims_to_repin(claims, instance);
-    if to_repin.is_empty() {
-        return Ok(());
-    }
+    // NO early return on an empty set. A tenantless instance still needs a
+    // `default`-only file: returning here is exactly how a revoked tenant's
+    // line survives in the file after its last claim is GC'd, and a restart
+    // then re-grants a credential the platform revoked.
 
-    let df_ns = redis_namespace(ctx).await?;
-    let addr = dragonfly::instance_addr(instance, &df_ns);
+    let addr = dragonfly::instance_addr(instance, df_ns);
     let admin_secret_name = dragonfly::admin_secret_name(instance);
-    let admin_pw = read_secret_key(ctx, &df_ns, &admin_secret_name, "password").await?;
+    // Hard `?`, and first. Without the admin password there is no `default`
+    // line, and a file without one turns authentication OFF on this instance
+    // (ADR 0042 §10) — so abort the instance and leave the file untouched.
+    let admin_pw = read_secret_key(ctx, df_ns, &admin_secret_name, "password").await?;
 
     info!(
         %instance, %df_ns, count = to_repin.len(),
         "re-pinning dragonfly claim ACL users (resync)"
     );
+
+    // Whether this pass saw EVERY live tenant. A single unreadable connection
+    // Secret means the derived file would be missing that tenant's line — and
+    // under whole-file derivation, writing it would DELETE a durable grant
+    // over a transient read error. So a `pass` read failure taints the file
+    // and the write is skipped entirely; the runtime user is untouched and
+    // the next tick retries.
+    //
+    // Deliberately NOT tainted by a `DBSIZE` failure (decorative, ADR 0048)
+    // or by an `ACL SETUSER` failure (the credential is still valid — only
+    // the re-pin did not land, and persisting it is still correct).
+    let mut file_complete = true;
+    let mut tenant_lines: Vec<Vec<String>> = Vec::new();
 
     for spec in to_repin {
         // Sample how much this tenant holds, before the ACL half — the two
@@ -305,8 +391,7 @@ pub async fn reconcile_instance_acls(
 
         // Recover this claim's password from its connection Secret's `pass`
         // key (2.12 decomposed format; the Secret is written by
-        // `redis_connection_secret_object`). A missing Secret / key is
-        // non-fatal — skip + retry.
+        // `redis_connection_secret_object`).
         let password = match read_secret_key(
             ctx,
             &spec.claim_namespace,
@@ -319,13 +404,16 @@ pub async fn reconcile_instance_acls(
             Err(err) => {
                 warn!(
                     user = %spec.user, secret = %spec.conn_secret_ref, %err,
-                    "could not read connection Secret `pass` — skipping re-pin this tick"
+                    "could not read connection Secret `pass` — skipping re-pin AND the ACL \
+                     file write this tick (a partial file would delete a durable grant)"
                 );
+                file_complete = false;
                 continue;
             }
         };
 
         let args = dragonfly::acl_setuser_args(&spec.user, &password, spec.dbnum);
+        tenant_lines.push(args.clone());
         if let Err(err) = ctx.redis.acl_setuser(&addr, &admin_pw, &args).await {
             warn!(
                 user = %spec.user, %instance, %err,
@@ -334,7 +422,106 @@ pub async fn reconcile_instance_acls(
             continue;
         }
     }
+
+    if file_complete {
+        persist_acl_file(ctx, instance, df_ns, &admin_pw, &tenant_lines).await;
+    }
     Ok(())
+}
+
+/// Write the instance's durable ACL file, then point the CR at it
+/// (ADR 0042 §10). Best-effort: every failure leaves the previous state and
+/// is retried next pass — this is durability, not the grant path.
+///
+/// ORDER IS LOAD-BEARING. The Secret must exist before the CR names it: the
+/// dragonfly-operator never sets `SecretVolumeSource.Optional`, so a mount of
+/// a missing Secret is REQUIRED and the pod cannot start. Getting this
+/// backwards costs minutes of `FailedMount` backoff, unbounded if the Secret
+/// never appears.
+async fn persist_acl_file(
+    ctx: &Arc<Context>,
+    instance: &str,
+    df_ns: &str,
+    admin_pw: &str,
+    tenants: &[Vec<String>],
+) {
+    let contents = match dragonfly::acl_file_contents(admin_pw, tenants) {
+        Ok(c) => c,
+        Err(err) => {
+            // Refusing is the safe direction: one malformed line rejects the
+            // WHOLE file, so replacing a working file with a broken one would
+            // lock out every tenant at the next restart.
+            warn!(%instance, %err, "refusing to write a damaged ACL file — keeping the previous one");
+            return;
+        }
+    };
+
+    let secret_name = dragonfly::acl_secret_name(instance);
+    let api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), df_ns, &secret_ar());
+
+    // Read-compare-write. A no-op apply every pass forever would churn
+    // resourceVersion and managedFields, and destroy the one cheap signal for
+    // "when did this instance's ACL set last change".
+    let live = api
+        .get_opt(&secret_name)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| {
+            s.data
+                .pointer(&format!("/data/{}", dragonfly::ACL_SECRET_KEY))
+                .and_then(Value::as_str)
+                .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+                .and_then(|v| String::from_utf8(v).ok())
+        });
+
+    if live.as_deref() != Some(contents.as_str()) {
+        let body = dragonfly::acl_secret_object(&secret_name, df_ns, &contents);
+        let pp = kube::api::PatchParams::apply(ACL_FIELD_MANAGER).force();
+        if let Err(err) = api
+            .patch(&secret_name, &pp, &kube::api::Patch::Apply(&body))
+            .await
+        {
+            warn!(%instance, %err, "ACL file Secret write failed — retrying next pass");
+            return;
+        }
+        info!(%instance, tenants = tenants.len(), "wrote durable ACL file");
+    }
+
+    // Only now may the CR name the Secret. Merge-patch, not SSA: the field is
+    // a leaf on a CR the provisioner applies wholesale, and a path-scoped
+    // patch cannot prune a sibling (the 1.83f rule).
+    let df_api: Api<DynamicObject> = Api::namespaced_with(
+        ctx.client.clone(),
+        df_ns,
+        &crate::reconcile::dragonfly_cluster_ar(),
+    );
+    let Ok(Some(cr)) = df_api.get_opt(instance).await else {
+        return;
+    };
+    let already = cr
+        .data
+        .pointer("/spec/aclFromSecret/name")
+        .and_then(Value::as_str)
+        == Some(secret_name.as_str());
+    if already {
+        return;
+    }
+    let patch = serde_json::json!({
+        "spec": { "aclFromSecret": { "name": secret_name, "key": dragonfly::ACL_SECRET_KEY } }
+    });
+    if let Err(err) = df_api
+        .patch(
+            instance,
+            &kube::api::PatchParams::apply(ACL_FIELD_MANAGER),
+            &kube::api::Patch::Merge(&patch),
+        )
+        .await
+    {
+        warn!(%instance, %err, "could not point the Dragonfly CR at its ACL file — retrying next pass");
+    } else {
+        info!(%instance, "Dragonfly CR now loads its ACL file at startup (one-time roll)");
+    }
 }
 
 /// Refresh `status.size.keys` on one ready dragonfly claim (2.22d / D8).

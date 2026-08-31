@@ -822,6 +822,41 @@ async fn sweep_dragonfly(
                 match api.delete(&name, &params).await {
                     Ok(_) => {
                         empty_since.remove(&key);
+                        // ADR 0042 §10: the ACL file Secret DOES go, and this
+                        // is the OPPOSITE decision from `<instance>-admin`
+                        // three comments up — deliberately.
+                        //
+                        // `<instance>-admin` is kept because re-minting it
+                        // would break auth against a pod still Terminating
+                        // behind the Service. The ACL file has no such
+                        // problem and the opposite hazard: keeping it means a
+                        // re-created instance of the same name would boot
+                        // loading a PREVIOUS generation's tenant lines —
+                        // resurrecting credentials for claims that no longer
+                        // exist, on a DB the allocator has since handed to
+                        // someone else.
+                        //
+                        // 404-tolerant: an instance provisioned before this
+                        // shipped has no ACL Secret, and that is not an error.
+                        // Only after the CR delete succeeded, so a failed reap
+                        // never strips a live instance's file.
+                        let acl_secret = crate::dragonfly::acl_secret_name(&name);
+                        let secrets: Api<DynamicObject> = Api::namespaced_with(
+                            ctx.client.clone(),
+                            &df_ns,
+                            &crate::reconcile::secret_ar(),
+                        );
+                        match secrets.delete(&acl_secret, &Default::default()).await {
+                            Ok(_) => {
+                                info!(instance = %name, secret = %acl_secret, "deleted the reaped instance's ACL file")
+                            }
+                            Err(kube::Error::Api(e)) if e.code == 404 => {}
+                            Err(err) => warn!(
+                                instance = %name, secret = %acl_secret, %err,
+                                "could not delete the reaped instance's ACL file — a re-created \
+                                 instance of this name would boot with stale tenant lines"
+                            ),
+                        }
                         // Structurally 0 — `reap_decision` returns `Reap` only
                         // after both vetoes failed to fire. Asserting rather
                         // than logging them: they can only ever catch a

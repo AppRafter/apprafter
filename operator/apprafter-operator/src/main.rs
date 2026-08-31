@@ -281,12 +281,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // status.ready / connectionSecretRef / Ready under its own field
     // manager `resourceclaim-provisioner` (never touching the
     // scheduler-owned status.provider / Scheduled).
+    // ADR 0042 §10: one `acl_dirty` signal shared by the three tasks that
+    // change the set of live Dragonfly ACL users. Each `run*` builds its own
+    // Context, so a per-context Notify would be a signal nobody hears — it is
+    // created here and threaded in. A poke, never content: the resync loop
+    // stays the file's SOLE writer and re-derives from a fresh LIST.
+    let acl_dirty = std::sync::Arc::new(tokio::sync::Notify::new());
+
     let resourceclaim_provisioner_handle = tokio::spawn({
         let client = client.clone();
         let metrics = metrics.clone();
+        let acl_dirty = acl_dirty.clone();
         async move {
             if let Err(err) =
-                operator_controllers_resourceclaim_provisioner::run(client, metrics).await
+                operator_controllers_resourceclaim_provisioner::run(client, metrics, acl_dirty)
+                    .await
             {
                 error!(%err, "ResourceClaimProvisioner controller error");
             }
@@ -305,9 +314,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resourceclaim_gc_handle = tokio::spawn({
         let client = client.clone();
         let metrics = metrics.clone();
+        let acl_dirty = acl_dirty.clone();
         async move {
             if let Err(err) =
-                operator_controllers_resourceclaim_provisioner::gc::run(client, metrics).await
+                operator_controllers_resourceclaim_provisioner::gc::run(client, metrics, acl_dirty)
+                    .await
             {
                 error!(%err, "ResourceClaimGC controller error");
             }
@@ -324,10 +335,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dragonfly_acl_handle = tokio::spawn({
         let client = client.clone();
         let metrics = metrics.clone();
+        let acl_dirty = acl_dirty.clone();
         async move {
-            if let Err(err) =
-                operator_controllers_resourceclaim_provisioner::run_acl_reconcile(client, metrics)
-                    .await
+            if let Err(err) = operator_controllers_resourceclaim_provisioner::run_acl_reconcile(
+                client, metrics, acl_dirty,
+            )
+            .await
             {
                 error!(%err, "DragonflyAclReconcile loop error");
             }

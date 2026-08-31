@@ -89,9 +89,13 @@ const MIN_REQUEUE: Duration = Duration::from_secs(60);
 const ROLE_DROP_REQUEUE: Duration = Duration::from_secs(15);
 
 /// Spawn the RetainedClaim GC Controller (7th controller).
-pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), ReconcileError> {
+pub async fn run(
+    client: Client,
+    metrics: Arc<Metrics>,
+    acl_dirty: Arc<tokio::sync::Notify>,
+) -> Result<(), ReconcileError> {
     let retained: Api<RetainedClaim> = Api::all(client.clone());
-    let ctx = Arc::new(Context::new(client, metrics));
+    let ctx = Arc::new(Context::with_acl_dirty(client, metrics, acl_dirty));
     info!("RetainedClaimGC starting");
     Controller::new(retained, watcher::Config::default())
         .run(reconcile, error_policy, ctx)
@@ -385,6 +389,15 @@ async fn gc_drop_dragonfly(
                         retained = %rc_name, %instance, user = %acl_user, %err,
                         "dragonfly ACL DELUSER failed during GC — tolerating (instance may be gone)"
                     );
+                } else {
+                    // ADR 0042 §10: close the revocation window. The runtime
+                    // user is gone, but until the loop re-derives the file it
+                    // still carries this tenant's line — and a restart inside
+                    // that window would RE-GRANT a credential the platform has
+                    // already revoked. Only on success: a failed DELUSER means
+                    // the user may still exist, and dropping its line while it
+                    // does would make the file disagree with the instance.
+                    ctx.acl_dirty.notify_one();
                 }
             }
             Err(err) => {

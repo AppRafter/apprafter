@@ -130,6 +130,22 @@ pub struct Context {
     /// per-claim size refresh costs one HTTP GET per backend per window
     /// rather than one per claim per reconcile.
     pub backend_metrics: Arc<operator_core::promscrape::MetricsCache>,
+    /// "The set of live ACL users changed" — a POKE, never content
+    /// (ADR 0042 §10).
+    ///
+    /// The ACL file is derived whole by the resync loop, which owns it
+    /// alone. Without this the loop only notices a change on its 300s tick,
+    /// so a claim provisioned at T is not durable until T+300s, and a
+    /// revoked tenant's line survives in the file for the same window — a
+    /// restart inside it re-grants a credential the platform already
+    /// revoked.
+    ///
+    /// It carries no payload on purpose. Sending the content would make the
+    /// provisioner a second writer, which is exactly what the one-writer
+    /// design exists to prevent; a bare wake-up lets the loop re-derive from
+    /// a fresh LIST, and `ListParams::default()` sends no resourceVersion, so
+    /// that LIST is a quorum read which observes any committed prior write.
+    pub acl_dirty: Arc<tokio::sync::Notify>,
 }
 
 impl Context {
@@ -137,12 +153,25 @@ impl Context {
     /// Both controllers ([`run`] + [`gc::run`]) share this so the redis
     /// admin path is wired identically.
     pub fn new(client: Client, metrics: Arc<Metrics>) -> Self {
+        Self::with_acl_dirty(client, metrics, Arc::new(tokio::sync::Notify::new()))
+    }
+
+    /// Construct a [`Context`] sharing an `acl_dirty` signal with the other
+    /// controllers. Each `run*` builds its OWN `Context`, so the `Notify`
+    /// has to be created once in `main` and threaded in — a per-context one
+    /// would be a signal nobody else can hear.
+    pub fn with_acl_dirty(
+        client: Client,
+        metrics: Arc<Metrics>,
+        acl_dirty: Arc<tokio::sync::Notify>,
+    ) -> Self {
         Self {
             client,
             metrics,
             redis: Arc::new(RedisClient),
             capacity: Arc::new(CapacityCache::new()),
             backend_metrics: Arc::new(operator_core::promscrape::MetricsCache::new()),
+            acl_dirty,
         }
     }
 }
@@ -169,10 +198,14 @@ pub enum ReconcileError {
 /// waiting for the scheduler), which is sufficient to pick up a claim
 /// once `status.provider` lands without a watch fan-out over the CNPG
 /// `Cluster` / `Database` CRs. A proper watch is future work.
-pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), ReconcileError> {
+pub async fn run(
+    client: Client,
+    metrics: Arc<Metrics>,
+    acl_dirty: Arc<tokio::sync::Notify>,
+) -> Result<(), ReconcileError> {
     let claims: Api<ResourceClaim> = Api::all(client.clone());
     let shared_volumes: Api<SharedVolume> = Api::all(client.clone());
-    let ctx = Arc::new(Context::new(client, metrics));
+    let ctx = Arc::new(Context::with_acl_dirty(client, metrics, acl_dirty));
     info!(
         field_manager = FIELD_MANAGER,
         "ResourceClaimProvisioner starting"
@@ -270,8 +303,9 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), ReconcileE
 pub async fn run_acl_reconcile(
     client: Client,
     metrics: Arc<Metrics>,
+    acl_dirty: Arc<tokio::sync::Notify>,
 ) -> Result<(), ReconcileError> {
-    let ctx = Arc::new(Context::new(client, metrics));
+    let ctx = Arc::new(Context::with_acl_dirty(client, metrics, acl_dirty));
     acl_reconcile::run(ctx).await
 }
 

@@ -721,6 +721,17 @@ async fn provision_dragonfly(
     )
     .await?;
 
+    // ADR 0042 §10: tell the resync loop the live ACL set changed, so the
+    // durable file catches up in seconds rather than on the next 300s tick.
+    //
+    // AFTER the terminal status apply, deliberately. The loop derives the
+    // file from claims filtered on `status.ready`, which is written by that
+    // apply — poking before it would wake the loop into a LIST that cannot
+    // see this claim yet, and the file would be re-derived WITHOUT its line.
+    //
+    // A poke, not the content: the loop stays the sole writer.
+    ctx.acl_dirty.notify_one();
+
     ctx.metrics
         .claim_provisioned_total
         .with_label_values(&["dragonfly", ns])
