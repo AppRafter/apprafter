@@ -28,10 +28,34 @@ has been pushed.
   override the retention, and both are logged at startup so "aged out" and
   "was never written" stay distinguishable.
 
-  Not covered: `platform status` does not print problems (the ledger is
-  per-Application), and the `app status` rendering is unit-tested rather than
-  walk-tested — the walk builds bare CRs and the command resolves an
-  application through its Argo CD registration.
+- **`apprafter platform status` answers "is anything wrong in this cluster?"**
+  Without it, finding out meant running `app status` once per application. The
+  new section names every application carrying a recent problem, most recent
+  first, by the LOGICAL name `app status` takes — not the CR's `metadata.name`,
+  which is not that argument. An application with problems that is not
+  registered with Argo CD is still listed and labelled unresolvable rather than
+  dropped: those are the ones most likely to be broken.
+
+  It makes three deliberate departures from the pinned roll-up beside it, which
+  is decorative where this is a health signal. It prints when everything is
+  fine (`Applications: 12 checked, none reporting problems (last 24h).`),
+  because an absent section is indistinguishable from a check that did not run.
+  It is loud when it cannot read (`could not read (…) — problem state
+  unknown.`), because rendering an RBAC denial as a clean bill of health is the
+  one output it must never produce. And it collapses to one row per
+  application, capped, so a cluster in trouble does not scroll.
+
+  Both surfaces share one render filter, so the roll-up can never name an
+  application whose own `app status` prints nothing — a unit test asserts that
+  agreement directly, and the walk asserts both the named-broken and the
+  cleared-and-healthy case.
+
+  Not covered: the `app status` rendering is unit-tested rather than
+  walk-tested — the walk builds bare CRs and that command cannot render an
+  application without an Argo CD registration. The roll-up is walk-covered
+  because it does not share that limitation: its problem data comes from a
+  cluster-wide read of the CRs, and Argo CD is consulted only to put a
+  friendlier name on each row.
 
 - **`apprafter app rollback` can roll back an image, and holds it** (ADR 0059).
   `--to sha256:<64 hex>` is an image digest; anything else is a Git revision.

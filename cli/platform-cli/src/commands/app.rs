@@ -42,7 +42,7 @@ use crate::commands::k8s_helpers::{
     kubectl_get_json_by_selector, kubectl_get_json_showing_managed_fields, kubectl_merge_patch,
 };
 
-const ARGOCD_NAMESPACE: &str = "argocd";
+pub(crate) const ARGOCD_NAMESPACE: &str = "argocd";
 const APPRAFTER_MANAGED_LABEL: &str = "apprafter.io/managed-by=apprafter";
 const APPRAFTER_SOURCE_ANNOTATION: &str = "apprafter.io/source";
 /// Argo CD cascade-deletion finalizer (background variant). EXACT string
@@ -3264,17 +3264,60 @@ fn print_status(app: &Value) {
 /// "resolved <age> ago" suffix is deterministic in tests,
 /// mirroring `format_pod_age`'s clock seam. The age suffix is
 /// dropped when `resolvedAt` is missing or unparseable.
-/// Undesigned reconcile failures, as `app status` prints them (2.22h / D16).
+/// One problem entry that survived the render filter, with its age resolved.
 ///
-/// Empty when there is nothing to report — deliberately, and not a
-/// `Problems: none` line. A section that is always present is one people
-/// learn to skip, and then it is worse than absent.
+/// Borrowed from the CR rather than copied: every consumer only formats it.
+pub(crate) struct LiveProblem<'a> {
+    pub(crate) reason: &'a str,
+    pub(crate) message: &'a str,
+    pub(crate) last_seen: &'a str,
+    /// Seconds since `last_seen`, already known to be within the horizon.
+    pub(crate) age: i64,
+    pub(crate) count: i64,
+}
+
+impl LiveProblem<'_> {
+    /// `now` while the entry is fresh enough that the operator would have
+    /// refreshed it, else `<age> ago`.
+    pub(crate) fn when(&self, now: &chrono::DateTime<chrono::Utc>) -> String {
+        if self.age <= PROBLEM_LIVE_SECS {
+            "now".to_string()
+        } else {
+            format!("{} ago", format_pod_age(self.last_seen, now))
+        }
+    }
+
+    /// `, 7x` for a repeated failure, empty for a single sighting.
+    pub(crate) fn times(&self) -> String {
+        if self.count > 1 {
+            format!(", {}x", self.count)
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// THE render filter for `status.recentProblems`, and the only one.
 ///
-/// Entries older than [`PROBLEM_RENDER_HORIZON_SECS`] are not printed at all,
-/// even though the operator may still be carrying them. That is the guard
-/// against the failure mode the defect named: a surface listing what was once
-/// broken is one nobody reads.
-pub(crate) fn format_problem_lines(cr: &Value, now: &chrono::DateTime<chrono::Utc>) -> Vec<String> {
+/// Extracted so `app status` (per application) and `platform status` (the
+/// cluster roll-up) cannot drift apart. If the roll-up re-derived these three
+/// rules, the first retune of the horizon would make it name an application
+/// whose own `app status` prints nothing — which is the worst failure available
+/// to a surface whose entire job is to send you to that command.
+///
+/// The three rules, and why each is a rule rather than a detail:
+///  * absent or non-array `status.recentProblems` — nothing to say;
+///  * an unparseable `lastSeen` is SKIPPED. Note this is deliberately the
+///    opposite of `operator_core::problems::age_out`, which KEEPS one: the
+///    operator must not silently drop state it cannot date, but a reader must
+///    not be shown an undateable claim;
+///  * older than [`PROBLEM_RENDER_HORIZON_SECS`] is dropped even though the
+///    operator still carries it — a surface listing what was ONCE broken is one
+///    people learn not to read.
+pub(crate) fn live_problems<'a>(
+    cr: &'a Value,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> Vec<LiveProblem<'a>> {
     let Some(rows) = cr
         .pointer("/status/recentProblems")
         .and_then(Value::as_array)
@@ -3283,8 +3326,6 @@ pub(crate) fn format_problem_lines(cr: &Value, now: &chrono::DateTime<chrono::Ut
     };
     let mut out = Vec::new();
     for r in rows {
-        let reason = r.get("reason").and_then(Value::as_str).unwrap_or("Problem");
-        let message = r.get("message").and_then(Value::as_str).unwrap_or("");
         let last = r.get("lastSeen").and_then(Value::as_str).unwrap_or("");
         let Some(age) = age_secs(last, now) else {
             continue;
@@ -3292,21 +3333,48 @@ pub(crate) fn format_problem_lines(cr: &Value, now: &chrono::DateTime<chrono::Ut
         if age > PROBLEM_RENDER_HORIZON_SECS {
             continue;
         }
-        let count = r.get("count").and_then(Value::as_i64).unwrap_or(1);
-        let when = if age <= PROBLEM_LIVE_SECS {
-            "now".to_string()
-        } else {
-            format!("{} ago", format_pod_age(last, now))
-        };
-        let times = if count > 1 {
-            format!(", {count}x")
-        } else {
-            String::new()
-        };
-        out.push(format!(
-            "  problem:       {reason} ({when}{times}): {message}"
-        ));
+        out.push(LiveProblem {
+            reason: r.get("reason").and_then(Value::as_str).unwrap_or("Problem"),
+            message: r.get("message").and_then(Value::as_str).unwrap_or(""),
+            last_seen: last,
+            age,
+            count: r.get("count").and_then(Value::as_i64).unwrap_or(1),
+        });
     }
+    out
+}
+
+/// How the render horizon reads to a human, derived from the constant so the
+/// number lives in exactly one place.
+pub(crate) fn problem_window_label() -> String {
+    format!("last {}h", PROBLEM_RENDER_HORIZON_SECS / 3600)
+}
+
+/// Undesigned reconcile failures, as `app status` prints them (2.22h / D16).
+///
+/// Empty when there is nothing to report — deliberately, and not a
+/// `Problems: none` line. A section that is always present is one people
+/// learn to skip, and then it is worse than absent. (The cluster roll-up in
+/// `platform status` makes the OPPOSITE call, for a reason stated there: it is
+/// asked "is anything wrong?", and to that question silence is not an answer.)
+///
+/// Entries older than [`PROBLEM_RENDER_HORIZON_SECS`] are not printed at all,
+/// even though the operator may still be carrying them. That is the guard
+/// against the failure mode the defect named: a surface listing what was once
+/// broken is one nobody reads.
+pub(crate) fn format_problem_lines(cr: &Value, now: &chrono::DateTime<chrono::Utc>) -> Vec<String> {
+    let mut out: Vec<String> = live_problems(cr, now)
+        .iter()
+        .map(|p| {
+            format!(
+                "  problem:       {} ({}{}): {}",
+                p.reason,
+                p.when(now),
+                p.times(),
+                p.message
+            )
+        })
+        .collect();
     if !out.is_empty() {
         out.push(
             "                 these are reconcile failures the platform could not act on; \

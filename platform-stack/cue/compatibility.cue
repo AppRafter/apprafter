@@ -1869,6 +1869,13 @@ compatibility: "0.2.59": {
 		last sighting, so the surface lists what is broken NOW rather than what
 		once was. A healthy application shows nothing and costs zero writes.
 
+		`apprafter platform status` answers the cluster-level question the
+		per-application surface could not: it names every application currently
+		reporting problems, by the LOGICAL name `app status` takes, most recent
+		first. Unlike the per-application section it prints when everything is
+		fine, and says so loudly when it cannot read — an absent section, or one
+		silenced by an RBAC denial, is indistinguishable from a clean cluster.
+
 		Requires a restart: new operator image, plus the one-time Dragonfly roll
 		described above. `spec.backup.timeZone` is a new CRD field, so an OLDER
 		CLI is unaffected and a NEWER CLI against an older operator refuses

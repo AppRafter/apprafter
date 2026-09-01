@@ -990,6 +990,28 @@ esac
 # empty list).
 printf '  NOT COVERED HERE: `apprafter app status` rendering of these entries — needs an Argo-registered app (owed; see the 2.22h closure note)\n'
 
+# THE CLUSTER ROLL-UP, which — unlike `app status` — IS reachable from this
+# fixture. `app status` cannot render an application at all without an Argo CD
+# registration; the roll-up takes its PROBLEM data from a cluster-wide (`-A`)
+# read of the AppRafter CRs and uses Argo CD only to put a friendlier NAME on
+# each row, degrading to the CR's own name when that lookup is unavailable.
+# `--cached` skips the 30s upstream re-check; the roll-up does not depend on it.
+#
+# This app is a bare CR, so it exercises the UNRESOLVABLE arm on purpose: the
+# roll-up cannot map it to a logical name, and must therefore list it as
+# `<ns>/<name>` and say so, rather than drop it. Dropping unregistered
+# applications would make the surface quietest exactly where it should be
+# loudest.
+printf '  checking the cluster roll-up names the broken application ...\n'
+_ps_out=$(apprafter platform status --cached 2>&1 || true)
+case "$_ps_out" in
+    *"reporting problems"*"$APP_NS/$APP"*)
+        printf '  ok: platform status names %s/%s in the problem roll-up\n' "$APP_NS" "$APP" ;;
+    *) printf 'ERROR: platform status did not name the broken application:\n%s\n' "$_ps_out" >&2
+       claims_delete_verb grant >/dev/null 2>&1 || true
+       exit 1 ;;
+esac
+
 # DEDUP. A 30s retry over three minutes must produce ONE entry with a rising
 # count — not one entry per tick, which would be the firehose this replaces.
 printf '  sampling for 180s to prove it deduplicates rather than spams ...\n'
@@ -1027,6 +1049,25 @@ done
     && printf '  ok: the entry aged out once the failure stopped — not a permanent scar\n' \
     || { printf 'ERROR: the problem never aged out; a surface that lists what was once broken is one people learn not to read\n' >&2
          kubectl -n "$APP_NS" get "$APP_RES" "$APP" -o jsonpath='{.status.recentProblems}' >&2; echo >&2; exit 1; }
+
+# THE NEGATIVE CONTROL for the roll-up. Without it the positive assertion above
+# would pass for a section that simply prints the application unconditionally.
+# A healthy cluster must ALSO say so out loud — silence would be
+# indistinguishable from "the check did not run", which is the whole reason
+# this section prints when there is nothing to report.
+printf '  checking the roll-up clears and states the healthy case ...\n'
+_ps_clean=$(apprafter platform status --cached 2>&1 || true)
+case "$_ps_clean" in
+    *"$APP_NS/$APP"*)
+        printf 'ERROR: platform status still names %s/%s after the problem aged out:\n%s\n' \
+            "$APP_NS" "$APP" "$_ps_clean" >&2; exit 1 ;;
+esac
+case "$_ps_clean" in
+    *"none reporting problems"*)
+        printf '  ok: platform status states the healthy case explicitly\n' ;;
+    *) printf 'ERROR: platform status did not state the healthy case — silence reads as "the check did not run":\n%s\n' \
+        "$_ps_clean" >&2; exit 1 ;;
+esac
 
 printf '\n'
 printf '===============================================================\n'

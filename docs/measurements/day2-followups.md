@@ -2169,10 +2169,11 @@ operator 403 on every claim delete, every thirty seconds, and the only place
 that was visible was `kubectl logs deploy/apprafter-operator`.
 
 **Status:** FIXED 2026-09-01 (2.22h). `status.recentProblems[]` + yellow lines
-in `apprafter app status`; walk-proven in `e2e/needs-removal-walk.sh` phase 9.
-Two things the fix did NOT do, both deliberate and both recorded in plan.md:
-Events are unused (the ledger is an in-memory map flushed to the object), and
-`platform status` does not print problems — the ledger is per-Application.
+in `apprafter app status`, plus a cluster-wide roll-up in
+`apprafter platform status` naming every application currently reporting
+problems; walk-proven in `e2e/needs-removal-walk.sh` phase 9. Events are
+deliberately unused (the ledger is an in-memory map flushed to the object) —
+see the correction under "The proposal" below.
 **Severity:** high — not because any single failure is severe, but because it
 makes every future failure cost a log read to find.
 
@@ -2543,3 +2544,36 @@ The walk blamed the wrong subsystem for five minutes because it asserted an
 here — gate opened, before anything that depends on the gate — is the general
 form: **assert the precondition you are about to rely on, at the point you
 start relying on it.**
+
+### The second half, added on request (2026-09-01)
+
+The per-application surface answered "what is wrong with THIS application". It
+did not answer "is anything wrong at all", and finding that out meant running
+`app status` once per application — which is the same log-reading cost this
+defect was opened to remove, wearing a different hat.
+
+`platform status` now carries the roll-up. Three of its design choices are
+deliberate inversions of the `pinned_app_rows` precedent it sits beside,
+because that one is decorative and this one is a health signal:
+
+* **It prints when nothing is wrong.** The per-application surface deliberately
+  does not — there, the surrounding output already proves the command ran. In a
+  cluster roll-up an absent section is indistinguishable from "the check did
+  not run" and "this CLI is too old to have the check". Silence is not an
+  answer to "is anything wrong?".
+* **It is loud when it cannot read.** Copying the precedent's silent
+  `else { return; }` would render an RBAC denial, an apiserver timeout, or a
+  missing CRD as a clean bill of health.
+* **It names applications the way the reader must type them.** The CR's
+  `metadata.name` is author-chosen CUE and is NOT the argument `app status`
+  takes; a row naming it would send the reader to a command that errors. The
+  join is the one `app status` already performs, run backwards. An application
+  that does not resolve through it is listed and labelled, never dropped —
+  those are the ones most likely to be broken.
+
+**The invariant that made this safe to add:** both surfaces call one filter
+(`live_problems`), so the roll-up cannot name an application whose own
+`app status` prints nothing, or stay silent about one that would. Re-deriving
+the horizon in the roll-up would have made the first retune of that constant
+produce exactly that contradiction. A test asserts the agreement across all
+four filter cases and was verified by reintroducing a divergence.
