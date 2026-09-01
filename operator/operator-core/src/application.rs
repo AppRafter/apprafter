@@ -632,6 +632,24 @@ pub struct ApplicationStatus {
         rename = "recommendedResources"
     )]
     pub recommended_resources: Option<RecommendedResources>,
+    /// Recent UNDESIGNED reconcile failures (2.22h / D16).
+    ///
+    /// **Deserialize-only.** `skip_serializing` makes it structurally
+    /// impossible for the whole-status SSA apply under `apprafter-operator` to
+    /// carry this field — and therefore to own it, and therefore to prune it.
+    /// The only writer is the problems flush, under its own field manager.
+    ///
+    /// That is not belt-and-braces: this repository has shipped the same prune
+    /// three times (`envConfig`, `status.image` across five builders, and the
+    /// 2.22d size sampler, which deleted a live claim's whole allocation). A
+    /// carry-forward you must remember is a carry-forward you will eventually
+    /// forget; a field the serializer cannot emit needs no remembering.
+    ///
+    /// No CRD change: the Application CRD carries
+    /// `x-kubernetes-preserve-unknown-fields` on the whole `status` node, and
+    /// five other status fields already ride it.
+    #[serde(default, skip_serializing, rename = "recentProblems")]
+    pub recent_problems: Vec<crate::problems::RecentProblem>,
 }
 
 // `PHASE_AWAITING_MIGRATION_APPROVAL` + `COND_MIGRATION_PENDING` moved to

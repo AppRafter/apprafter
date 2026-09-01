@@ -899,6 +899,12 @@ fn print_app_detail(app: &Value, show_resources: bool, kubeconfig_path: &Path) {
                     if let Some(pin_line) = format_pin_line(&cr) {
                         println!("{}", style::warn(&pin_line));
                     }
+                    // 2.22h / D16: undesigned reconcile failures. Printed
+                    // BEFORE the advisory lines because a failing reconcile
+                    // changes what everything below it means.
+                    for line in format_problem_lines(&cr, &chrono::Utc::now()) {
+                        println!("{}", style::warn(&line));
+                    }
                     // 2.16e: VPA recommendation — only printed when the
                     // operator has written status.recommendedResources.
                     if let Some(reco_line) = format_recommendation_line(&cr) {
@@ -3258,6 +3264,74 @@ fn print_status(app: &Value) {
 /// "resolved <age> ago" suffix is deterministic in tests,
 /// mirroring `format_pod_age`'s clock seam. The age suffix is
 /// dropped when `resolvedAt` is missing or unparseable.
+/// Undesigned reconcile failures, as `app status` prints them (2.22h / D16).
+///
+/// Empty when there is nothing to report — deliberately, and not a
+/// `Problems: none` line. A section that is always present is one people
+/// learn to skip, and then it is worse than absent.
+///
+/// Entries older than [`PROBLEM_RENDER_HORIZON_SECS`] are not printed at all,
+/// even though the operator may still be carrying them. That is the guard
+/// against the failure mode the defect named: a surface listing what was once
+/// broken is one nobody reads.
+pub(crate) fn format_problem_lines(cr: &Value, now: &chrono::DateTime<chrono::Utc>) -> Vec<String> {
+    let Some(rows) = cr
+        .pointer("/status/recentProblems")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for r in rows {
+        let reason = r.get("reason").and_then(Value::as_str).unwrap_or("Problem");
+        let message = r.get("message").and_then(Value::as_str).unwrap_or("");
+        let last = r.get("lastSeen").and_then(Value::as_str).unwrap_or("");
+        let Some(age) = age_secs(last, now) else {
+            continue;
+        };
+        if age > PROBLEM_RENDER_HORIZON_SECS {
+            continue;
+        }
+        let count = r.get("count").and_then(Value::as_i64).unwrap_or(1);
+        let when = if age <= PROBLEM_LIVE_SECS {
+            "now".to_string()
+        } else {
+            format!("{} ago", format_pod_age(last, now))
+        };
+        let times = if count > 1 {
+            format!(", {count}x")
+        } else {
+            String::new()
+        };
+        out.push(format!(
+            "  problem:       {reason} ({when}{times}): {message}"
+        ));
+    }
+    if !out.is_empty() {
+        out.push(
+            "                 these are reconcile failures the platform could not act on; \
+             they clear on their own once they stop"
+                .to_string(),
+        );
+    }
+    out
+}
+
+/// How recent a problem must be to read as happening NOW rather than as a
+/// timestamp. Must exceed the operator's refresh floor, or a live failure
+/// would spend most of every window reading as stale.
+const PROBLEM_LIVE_SECS: i64 = 20 * 60;
+
+/// Beyond this, a problem is not printed even if the object still carries it.
+const PROBLEM_RENDER_HORIZON_SECS: i64 = 24 * 60 * 60;
+
+/// Seconds since an RFC3339 stamp, or `None` if it will not parse.
+fn age_secs(stamp: &str, now: &chrono::DateTime<chrono::Utc>) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(stamp)
+        .ok()
+        .map(|t| (*now - t.with_timezone(&chrono::Utc)).num_seconds())
+}
+
 /// The "this application is held at a digest" line (ADR 0059).
 ///
 /// `None` when the application is not pinned. Reads `status.image.pinned`,
@@ -4459,6 +4533,87 @@ mod tests {
     }
 
     // ---- format_pin_line ----
+
+    // ---- 2.22h / D16: reconcile failures visible without a log read ----
+
+    fn problem_cr(reason: &str, last_seen: &str, count: i64) -> Value {
+        json!({ "status": { "recentProblems": [
+            { "reason": reason,
+              "message": "could not delete claim web-pg: forbidden",
+              "firstSeen": "2026-09-01T10:00:00+00:00",
+              "lastSeen": last_seen,
+              "count": count }
+        ]}})
+    }
+
+    fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn a_live_problem_names_the_reason_and_the_message() {
+        // The whole point of D16: the operator log said "forbidden ... cannot
+        // delete resourceclaims" every thirty seconds for three walk runs, and
+        // `app status` said Ready. This line is what should have been there.
+        let cr = problem_cr("ClaimPruneFailed", "2026-09-01T10:05:00+00:00", 9);
+        let lines = format_problem_lines(&cr, &at("2026-09-01T10:06:00+00:00"));
+        assert!(lines[0].contains("ClaimPruneFailed"), "{lines:?}");
+        assert!(lines[0].contains("forbidden"), "{lines:?}");
+        assert!(lines[0].contains("(now, 9x)"), "{lines:?}");
+    }
+
+    #[test]
+    fn an_older_problem_is_dated_rather_than_reported_as_current() {
+        let cr = problem_cr("ClaimPruneFailed", "2026-09-01T10:00:00+00:00", 3);
+        let lines = format_problem_lines(&cr, &at("2026-09-01T12:00:00+00:00"));
+        assert!(!lines[0].contains("(now"), "{lines:?}");
+        assert!(lines[0].contains("ago"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_problem_past_the_render_horizon_is_not_printed() {
+        // The guard against the failure mode the defect named: a surface
+        // listing what was ONCE broken is one people learn not to read, and
+        // then it is worse than not having it.
+        let cr = problem_cr("ClaimPruneFailed", "2026-08-30T10:00:00+00:00", 3);
+        assert!(format_problem_lines(&cr, &at("2026-09-01T12:00:00+00:00")).is_empty());
+    }
+
+    #[test]
+    fn a_healthy_application_prints_nothing_at_all() {
+        // NOT "Problems: none". A section that is always there is a section
+        // people skip, which would defeat the whole surface.
+        assert!(format_problem_lines(&json!({}), &at("2026-09-01T12:00:00+00:00")).is_empty());
+        let empty = json!({ "status": { "recentProblems": [] }});
+        assert!(format_problem_lines(&empty, &at("2026-09-01T12:00:00+00:00")).is_empty());
+    }
+
+    #[test]
+    fn a_problem_refreshed_at_the_operators_floor_still_reads_as_live() {
+        // The operator only rewrites `lastSeen` every 900s (its write
+        // deadband). If the CLI's "now" window were shorter, a still-failing
+        // application would spend most of every window reading as stale —
+        // telling an operator a live problem is old is a specific way of
+        // being wrong. Asserted through the RENDERING, not on the constants,
+        // so it survives either number being retuned.
+        let cr = problem_cr("ClaimPruneFailed", "2026-09-01T10:00:00+00:00", 30);
+        let just_before_refresh = at("2026-09-01T10:14:59+00:00");
+        let lines = format_problem_lines(&cr, &just_before_refresh);
+        assert!(
+            lines[0].contains("(now"),
+            "a problem the operator has not yet refreshed must still read as current: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_timestamp_is_skipped_rather_than_rendered_as_now() {
+        // Rendering a garbage stamp as "now" would report a problem that may
+        // be ancient as current.
+        let cr = problem_cr("ClaimPruneFailed", "not-a-date", 1);
+        assert!(format_problem_lines(&cr, &at("2026-09-01T12:00:00+00:00")).is_empty());
+    }
 
     #[test]
     fn the_pin_line_names_the_digest_the_tag_and_the_way_out() {

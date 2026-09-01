@@ -62,6 +62,18 @@ const KIND: &str = "Application";
 /// extending Applications) can co-own without conflicts.
 pub const FIELD_MANAGER: &str = "apprafter-operator";
 
+/// Field manager for `status.recentProblems` and NOTHING else (2.22h / D16).
+///
+/// Dedicated for the reason `SIZE_FIELD_MANAGER` is: server-side apply
+/// replaces a manager's owned field-set on every apply, so a partial body
+/// under [`FIELD_MANAGER`] would prune the rest of the status. Measured on a
+/// live apiserver with this repository's own CRD: the two managers coexist,
+/// the whole-status apply leaves `recentProblems` alone, and a problems
+/// refresh leaves the operator's fields alone.
+///
+/// **Nothing else may ever be written under this manager.**
+pub const PROBLEM_FIELD_MANAGER: &str = "apprafter-problems";
+
 /// `reportingController` stamped on the Kubernetes Events this controller
 /// publishes (2.16b `SoftDestructiveChange`). Mirrors the pattern in the
 /// scheduler / provisioner / platform-stack controllers.
@@ -119,6 +131,17 @@ pub struct Context {
     /// nothing, forever, with every gate green. That is the exact shape of
     /// the defect this probe exists to make loud.
     pub in_place_resize_supported: bool,
+    /// Undesigned reconcile failures, kept in memory until the next reconcile
+    /// flushes them onto the object (2.22h / D16).
+    ///
+    /// Shared rather than per-reconcile because `error_policy` — which is
+    /// SYNCHRONOUS and cannot await — records into it, and the async reconcile
+    /// reads it back on its next pass.
+    pub problems: Arc<operator_core::problems::ProblemLedger>,
+    /// How long after its last sighting a problem is dropped from the object.
+    /// Pinned by `APPRAFTER_PROBLEM_TTL_SECS` so a walk can prove ageing
+    /// without waiting an hour.
+    pub problem_ttl_secs: i64,
 }
 
 #[derive(Debug, Error)]
@@ -149,6 +172,7 @@ pub async fn run(
     gateway_api_available: bool,
     vpa_available: std::sync::Arc<std::sync::atomic::AtomicBool>,
     in_place_resize_supported: bool,
+    problem_ttl_secs: i64,
 ) -> Result<(), ReconcileError> {
     let apps: Api<Application> = Api::all(client.clone());
     // 2.4d: watch child ResourceClaims so the provisioner flipping a
@@ -170,6 +194,8 @@ pub async fn run(
         gateway_api_available,
         vpa_available,
         in_place_resize_supported,
+        problems: Arc::new(operator_core::problems::ProblemLedger::new()),
+        problem_ttl_secs,
     });
 
     Controller::new(apps, watcher::Config::default())
@@ -237,8 +263,16 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // for us to reconcile on a dying object.
     if is_deletion_marked(&app) {
         info!(%name, %namespace, "Application is being deleted; skipping reconcile");
+        // Stop tracking a dying object, or its ledger entry would live as long
+        // as the operator does.
+        ctx.problems.evict(&namespace, &name);
         return Ok(Action::await_change());
     }
+
+    // 2.22h / D16: record what went wrong LAST time, before doing anything
+    // that can fail this time. Best-effort by construction — it returns `()`,
+    // so it cannot be `?`-ed and cannot freeze the reconcile.
+    flush_problems(&ctx, &app).await;
 
     let pp = PatchParams::apply(FIELD_MANAGER).force();
 
@@ -549,7 +583,15 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // so none of that ever ran for a removed need.
     let desired: std::collections::BTreeSet<String> =
         payloads.iter().map(|(n, _)| n.clone()).collect();
-    prune_orphaned_claims(&ctx.client, &namespace, &app_uid, &desired).await?;
+    prune_orphaned_claims(
+        &ctx.client,
+        &namespace,
+        &app_uid,
+        &desired,
+        &ctx.problems,
+        &name,
+    )
+    .await?;
 
     if has_needs {
         let claim_api: Api<ResourceClaim> = Api::namespaced(ctx.client.clone(), &namespace);
@@ -1170,10 +1212,98 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
 /// Error policy — logs the error, increments the error counters,
 /// and requeues with a fixed 30s delay. Phase 1.9c will distinguish
 /// transient vs terminal errors and wire up exponential backoff.
+/// Classify a reconcile error into a low-cardinality reason (2.22h / D16).
+///
+/// Low-cardinality on purpose: the reason is the DEDUP KEY, so anything
+/// derived from the message would make every tick a new problem and turn the
+/// surface into the firehose it exists to replace.
+pub(crate) fn reconcile_problem_reason(err: &ReconcileError) -> &'static str {
+    match err {
+        ReconcileError::Kube(kube::Error::Api(e)) => match e.code {
+            401 | 403 => "ReconcileForbidden",
+            404 => "ReconcileNotFound",
+            409 => "ReconcileConflict",
+            422 => "ReconcileInvalid",
+            _ => "ReconcileFailed",
+        },
+        _ => "ReconcileFailed",
+    }
+}
+
+/// Write the ledger's problems onto the object, and age out the ones that
+/// stopped (2.22h / D16).
+///
+/// Returns `()`, not `Result`, so it is structurally impossible to `?` — a
+/// decorative write must never be able to freeze the reconcile it rides on,
+/// which is the ADR 0048 anchor-403 lesson and, note, one of the four
+/// incidents this feature exists to have caught.
+///
+/// # Why it runs at the TOP of the reconcile
+///
+/// The failures this surfaces are precisely the ones that abort the reconcile
+/// before its own status write. A flush on the success path would therefore
+/// never run for the object that needs it. The cost is that the surface lags
+/// the failure by one requeue interval — acceptable for a repeating failure,
+/// which is the class this is for.
+async fn flush_problems(ctx: &Context, app: &Application) {
+    let Some(namespace) = app.namespace() else {
+        return;
+    };
+    let name = app.name_any();
+    let now = Utc::now();
+
+    let written: Vec<operator_core::problems::RecentProblem> = app
+        .status
+        .as_ref()
+        .map(|s| s.recent_problems.clone())
+        .unwrap_or_default();
+    let ledger = ctx.problems.snapshot(&namespace, &name);
+
+    // The object's list is the union, then aged. The ledger is authoritative
+    // for a reason it holds (it has the live count and lastSeen); anything the
+    // object still carries that the ledger has forgotten — after an operator
+    // restart, say — is kept until the TTL retires it, so a restart does not
+    // erase a problem that is still happening.
+    let mut merged = ledger.clone();
+    for w in &written {
+        if !merged.iter().any(|m| m.reason == w.reason) {
+            merged.push(w.clone());
+        }
+    }
+    let computed = operator_core::problems::age_out(&merged, ctx.problem_ttl_secs, now);
+
+    if !operator_core::problems::problems_write_is_worth_it(&written, &computed, now) {
+        return;
+    }
+
+    let api: Api<Application> = Api::namespaced(ctx.client.clone(), &namespace);
+    let body = serde_json::json!({
+        "apiVersion": "apprafter.io/v1alpha1",
+        "kind": "Application",
+        "metadata": { "name": name },
+        "status": { "recentProblems": computed },
+    });
+    let pp = PatchParams::apply(PROBLEM_FIELD_MANAGER).force();
+    if let Err(e) = api.patch_status(&name, &pp, &Patch::Apply(&body)).await {
+        warn!(%name, %namespace, %e, "could not record recent problems (continuing)");
+    }
+}
+
 pub fn error_policy(app: Arc<Application>, err: &ReconcileError, ctx: Arc<Context>) -> Action {
     let name = app.name_any();
     let namespace = app.namespace().unwrap_or_default();
     warn!(%name, %namespace, %err, "reconcile error");
+    // 2.22h / D16: this is the choke point every `?` in the reconcile passes
+    // through, so recording here covers all of them at once. It cannot await —
+    // `error_policy` returns an `Action`, not a future — which is exactly why
+    // the sink is an in-memory ledger the next reconcile flushes.
+    ctx.problems.record(
+        &namespace,
+        &name,
+        reconcile_problem_reason(err),
+        &err.to_string(),
+        Utc::now(),
+    );
     ctx.metrics
         .reconcile_total
         .with_label_values(&[KIND, &namespace, "error"])
@@ -1537,6 +1667,8 @@ async fn prune_orphaned_claims(
     namespace: &str,
     app_uid: &str,
     desired: &std::collections::BTreeSet<String>,
+    problems: &operator_core::problems::ProblemLedger,
+    app_name: &str,
 ) -> Result<(), ReconcileError> {
     if app_uid.is_empty() {
         return Ok(());
@@ -1555,6 +1687,21 @@ async fn prune_orphaned_claims(
             Err(kube::Error::Api(e)) if e.code == 404 => {}
             Err(e) => {
                 warn!(%name, %namespace, %e, "failed to delete orphaned claim; retrying next reconcile");
+                // 2.22h / D16: THE incident that opened this defect. The warn
+                // is correct — a failed decorative delete must not abort the
+                // reconcile (ADR 0048) — but for three walk runs it was the
+                // ONLY trace, while `app status` said Ready and the claim
+                // simply never went away. Record it so it is visible without
+                // a log read. This path never reaches `error_policy`, which
+                // is why hooking only `error_policy` would have shipped D16
+                // without covering D16.
+                problems.record(
+                    namespace,
+                    app_name,
+                    "ClaimPruneFailed",
+                    &format!("could not delete claim {name}: {e}"),
+                    Utc::now(),
+                );
             }
         }
     }
@@ -2294,6 +2441,7 @@ fn build_status(
         // 2.16e: VPA recommendations are written by a later task; None
         // here omits the field from the SSA payload (skip_serializing_if).
         recommended_resources: None,
+        recent_problems: Vec::new(),
     }
 }
 
@@ -3099,6 +3247,7 @@ fn build_paused_status(app: &Application, plan_ns: &str, plan_name: &str) -> App
         // SSA prunes it, self-cancelling the gate. See `existing_baseline`.
         last_applied_spec: existing_baseline(app),
         recommended_resources: None,
+        recent_problems: Vec::new(),
     }
 }
 
@@ -3149,6 +3298,7 @@ fn build_migration_failed_status(app: &Application, plan_name: &str) -> Applicat
         // it untouched. See `existing_baseline`.
         last_applied_spec: existing_baseline(app),
         recommended_resources: None,
+        recent_problems: Vec::new(),
     }
 }
 
@@ -3599,6 +3749,7 @@ fn build_resource_claim_paused_status(app: &Application, unready: &[String]) -> 
         // SSA prunes it. See `existing_baseline`.
         last_applied_spec: existing_baseline(app),
         recommended_resources: None,
+        recent_problems: Vec::new(),
     }
 }
 
@@ -3694,6 +3845,7 @@ fn build_env_secret_missing_status(app: &Application, messages: &[String]) -> Ap
         // SSA prunes it. See `existing_baseline`.
         last_applied_spec: existing_baseline(app),
         recommended_resources: None,
+        recent_problems: Vec::new(),
     }
 }
 
@@ -3734,6 +3886,7 @@ fn build_invalid_effective_spec_status(app: &Application, message: &str) -> Appl
         environment: app.spec.environment.clone(),
         last_applied_spec: existing_baseline(app),
         recommended_resources: None,
+        recent_problems: Vec::new(),
     }
 }
 
@@ -4324,6 +4477,7 @@ mod tests {
             environment: None,
             last_applied_spec: None,
             recommended_resources: None,
+            recent_problems: Vec::new(),
         });
         let status = build_paused_status(&app, "team-a", "web-prod-migration-1");
 
@@ -4401,6 +4555,7 @@ mod tests {
             environment: Some("dev".into()),
             last_applied_spec: Some(baseline.clone()),
             recommended_resources: None,
+            recent_problems: Vec::new(),
         });
 
         // All four production pause/awaiting builders must preserve it.
@@ -5437,6 +5592,7 @@ mod tests {
             environment: None,
             last_applied_spec: None,
             recommended_resources: None,
+            recent_problems: Vec::new(),
         });
         let status = build_resource_claim_paused_status(&app, &["parser-pg".to_string()]);
         assert_eq!(status.phase.as_deref(), Some(PHASE_AWAITING_RESOURCE_CLAIM));
@@ -6613,6 +6769,7 @@ mod tests {
             environment: None,
             last_applied_spec: None,
             recommended_resources: None,
+            recent_problems: Vec::new(),
         });
         let messages = vec![
             "env STRIPE_KEY → secret \"stripe/api-key\": Secret \"stripe\" not found or missing key \"api-key\"".to_string(),
@@ -6674,6 +6831,7 @@ mod tests {
             environment: None,
             last_applied_spec: None,
             recommended_resources: None,
+            recent_problems: Vec::new(),
         });
         let status = build_env_secret_missing_status(
             &app,
@@ -6977,6 +7135,7 @@ mod tests {
             environment: Some("prod".into()),
             last_applied_spec: None,
             recommended_resources: None,
+            recent_problems: Vec::new(),
         };
         let spec = ApplicationSpec {
             base: Some(ApplicationBaseSpec {
@@ -7234,6 +7393,7 @@ mod tests {
                 ..Default::default()
             }),
             recommended_resources: None,
+            recent_problems: Vec::new(),
         });
         let status = build_migration_failed_status(&app, "web-prod-migration-3");
         assert_eq!(

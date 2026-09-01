@@ -10,6 +10,7 @@ pub mod migration;
 pub mod migration_plan;
 pub mod migration_state;
 pub mod platform_stack;
+pub mod problems;
 pub mod promscrape;
 pub mod resourceclaim;
 pub mod retainedclaim;

@@ -198,6 +198,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "probed in-place pod resize support (updateMode: InPlace actuates nothing without it)"
     );
 
+    // 2.22h / D16: how long a recorded reconcile failure stays on the object
+    // after its last sighting. Overridable so a walk can prove ageing without
+    // waiting an hour — the `APPRAFTER_REAP_DWELL_SECS` pattern. LOGGED, so
+    // "aged out" and "was never written" are distinguishable, which is the
+    // same class of ambiguity this whole subphase exists to end.
+    let problem_ttl_secs: i64 = env::var("APPRAFTER_PROBLEM_TTL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(operator_core::problems::DEFAULT_PROBLEM_TTL_SECS);
+    info!(
+        problem_ttl_secs,
+        "recent-problem retention configured (2.22h / D16)"
+    );
+
     // 2.9 (ADR 0044): the active environment is now a PER-CR property
     // (`Application.spec.environment`), resolved inside the reconcile
     // loop — there is no cluster-wide `APPRAFTER_ENV` selector anymore.
@@ -205,9 +219,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let client = client.clone();
         let metrics = metrics.clone();
         async move {
-            if let Err(err) =
-                application_controller::run(client, metrics, cilium, gateway_api, vpa, in_place)
-                    .await
+            if let Err(err) = application_controller::run(
+                client,
+                metrics,
+                cilium,
+                gateway_api,
+                vpa,
+                in_place,
+                problem_ttl_secs,
+            )
+            .await
             {
                 error!(%err, "Application controller error");
             }
