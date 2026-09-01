@@ -102,11 +102,11 @@ Usage: apprafter backup enable [OPTIONS] --bucket <BUCKET>
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
+| `--at` | `<time>` | — | no | Local time of day the nightly backup runs, `HH:MM` on a 24-hour clock. Default `03:00`. Interpreted in `--timezone`, so the time you write is the time it runs |
 | `--bucket` | — | — | yes | Bucket name (with `--endpoint`), or a full restic repo URL (`s3:https://host/bucket`, `b2:...`, a local path, ...). With a bare name, pass `--endpoint` and the CLI builds the `s3:https://<endpoint>/<bucket>` URL for you |
-| `--check-cron` | `<cron>` | — | no | Five-field cron schedule for the periodic `restic check` Job, which verifies repository integrity. Default `0 6 * * 0` — Sundays at 06:00, staggered clear of the nightly backup. The check is metadata-only; it does not re-download the data |
+| `--check` | `<off|time>` | — | no | The weekly repository-integrity check: `off` to disable it, or `HH:MM` for its Sunday run time. Default: three hours after `--at`, so it never starts in the same minute as a backup. The check is metadata-only; it does not re-download the data |
 | `--credential` | — | — | no | Name of the credential Secret in apprafter-system. With --credential-file: the name to create (default: apprafter-backup-s3). Without --credential-file: an existing Secret to read creds from (required) |
 | `--credential-file` | — | — | no | Path to a dotenv file with S3 + restic creds (S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, RESTIC_PASSWORD; optional S3_REGION). AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION accepted as aliases. When given, the creds are probed against the repo and then auto-sealed into the cluster |
-| `--cron` | `<cron>` | — | no | Five-field cron schedule for the full backup Job. Default `0 3 * * *` — nightly at 03:00 |
 | `--endpoint` | — | — | no | S3 endpoint host (e.g. `nbg1.your-objectstorage.com`). With a bare `--bucket` name, the CLI builds the `s3:https://<endpoint>/<bucket>` repo URL for you. Omit when passing a full restic URL in `--bucket` |
 | `--enforce` | — | — | no | `operator` (default, cluster gets scoped creds) or `cluster` (in-cluster prune) |
 | `--failure-webhook` | `<url>` | — | no | URL the runner POSTs a JSON failure report to when a backup or check Job fails. Egress to this host is opened automatically in the platform network policy. No default — unset means failures surface only in `backup status` and the Job logs |
@@ -116,12 +116,15 @@ Usage: apprafter backup enable [OPTIONS] --bucket <BUCKET>
 | `--keep-weekly` | `<count>` | — | no | How many weekly snapshots `restic forget` keeps. Default 4. Applied under the same rule as `--keep-daily` |
 | `--prefix` | — | — | no | Optional path prefix inside the bucket (e.g. `backups/prod`). Only used together with a bare `--bucket` name and `--endpoint`; omit when passing a full restic URL in `--bucket` |
 | `--staging-mode` | — | — | no | `monolithic` (default) or `sequential` |
+| `--timezone` | `<zone>` | — | no | IANA timezone the schedules run in (`Europe/Berlin`, `UTC`), written to the CronJob's `spec.timeZone`. Defaults to this machine's zone; if that cannot be determined the command refuses rather than assume UTC |
 
 Examples:
 
 ```sh
 apprafter backup enable --bucket <bucket> --endpoint <host> --credential-file <dotenv> --i-have-saved-credentials
 apprafter backup enable --bucket s3:https://<host>/<bucket> --credential <secret> --i-have-saved-credentials
+apprafter backup enable --bucket <bucket> --endpoint <host> --credential <secret> --at 22:30 --timezone Europe/Berlin --i-have-saved-credentials
+apprafter backup enable --bucket <bucket> --endpoint <host> --credential <secret> --check off --i-have-saved-credentials
 ```
 
 ## `apprafter backup list`

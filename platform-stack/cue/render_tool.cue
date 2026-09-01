@@ -451,6 +451,11 @@ _backupTemplate: """
 	    apprafter.io/source: platform-stack
 	spec:
 	  schedule: {{ $b.schedule | default "0 3 * * *" | quote }}
+	  {{- with $b.timeZone }}
+	  # 2.22g / D2: without this the schedule runs in the
+	  # kube-controller-manager's zone, and nothing anywhere says which.
+	  timeZone: {{ . | quote }}
+	  {{- end }}
 	  concurrencyPolicy: Forbid
 	  successfulJobsHistoryLimit: 3
 	  failedJobsHistoryLimit: 3
@@ -526,6 +531,13 @@ _backupTemplate: """
 	            emptyDir:
 	              sizeLimit: {{ $b.stagingSizeLimit | default "10Gi" | quote }}
 	---
+	{{- if $b.checkSchedule }}
+	# 2.22g / D2: an EMPTY checkSchedule omits this CronJob entirely — that is
+	# what `apprafter backup --check off` writes. Before this guard there was no
+	# off switch, so the documentation taught `--check-cron "0 6 31 2 *"` — the
+	# 31st of February, a date that never arrives — as the supported answer.
+	# The `| default` below is dead while this guard holds, and is kept only
+	# so a hand-written values file without the key still renders.
 	apiVersion: batch/v1
 	kind: CronJob
 	metadata:
@@ -536,6 +548,9 @@ _backupTemplate: """
 	    apprafter.io/source: platform-stack
 	spec:
 	  schedule: {{ $b.checkSchedule | default "0 6 * * 0" | quote }}
+	  {{- with $b.timeZone }}
+	  timeZone: {{ . | quote }}
+	  {{- end }}
 	  concurrencyPolicy: Forbid
 	  successfulJobsHistoryLimit: 3
 	  failedJobsHistoryLimit: 3
@@ -591,6 +606,7 @@ _backupTemplate: """
 	                memory: 256Mi
 	              limits:
 	                memory: 512Mi
+	{{- end }}
 	---
 	# Egress policy for the backup + check runner pods (m-r3-1). A Cilium FQDN
 	# policy without a DNS-allow rule silently fails to resolve and the backup

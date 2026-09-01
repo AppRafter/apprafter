@@ -204,6 +204,7 @@ dependencies = [
  "cli-providers",
  "cli-state",
  "dirs",
+ "iana-time-zone",
  "indicatif",
  "inquire",
  "miette",

@@ -74,7 +74,20 @@ package v1alpha1
 	backup?: {
 		enabled:  bool | *false
 		schedule: string | *"0 3 * * *"
-		bucket:   string
+
+		// IANA timezone the two schedules are interpreted in, written to
+		// `CronJob.spec.timeZone` (2.22g / D2). Absent means the CronJob
+		// runs in the kube-controller-manager's zone, which is what every
+		// cluster did before this field existed and is exactly the trap:
+		// an operator writing `0 3 * * *` means three in the morning THEIR
+		// time and has no way to learn what the three means.
+		//
+		// The CLI composes it from the machine running the command, so it
+		// is not the operator's problem; a hand-written PlatformStack may
+		// set it directly. Left optional rather than defaulted, because a
+		// default here would be a guess about somebody's location.
+		timeZone?: string
+		bucket:    string
 		credentialRef: {name: string}
 		stagingMode:       "monolithic" | "sequential" | *"monolithic"
 		stagingSizeLimit?: string

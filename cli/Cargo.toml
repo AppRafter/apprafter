@@ -57,6 +57,12 @@ tabled               = "0.15"
 semver               = { version = "1", features = ["serde"] }
 arboard              = { version = "3", default-features = false }
 chrono               = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# 2.22g / D2: the operator's own IANA zone for `backup enable --at`. NOT a new
+# package — chrono's `clock` feature already pulls it (see Cargo.lock); this
+# only promotes it to a direct dependency so the CLI may call it. Hand-rolling
+# `/etc/localtime` was rejected: two of the three release targets are macOS,
+# where there is no `/etc/timezone` and the zoneinfo prefix differs.
+iana-time-zone       = "0.1"
 terminal_size        = "0.4"
 tokio                = { version = "1", features = ["macros", "rt-multi-thread"] }
 kube                 = { version = "0.95", default-features = false, features = ["client", "runtime", "rustls-tls"] }

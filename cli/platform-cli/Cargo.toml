@@ -30,6 +30,7 @@ arboard       = { workspace = true }
 base64        = { workspace = true }
 backup-core   = { path = "../backup-core" }
 chrono        = { workspace = true }
+iana-time-zone = { workspace = true }
 terminal_size = { workspace = true }
 cli-core      = { path = "../cli-core" }
 cli-state     = { path = "../cli-state" }

@@ -97,9 +97,294 @@ pub(crate) const PLATFORMSTACK_NAMESPACE: &str = APPRAFTER_SYSTEM_NAMESPACE;
 /// These MUST stay in sync with `schemas/v1alpha1/platformstack.cue` +
 /// `platform-stack` `#BackupValues` so a bare `enable` reproduces the platform
 /// default exactly.
-const DEFAULT_BACKUP_SCHEDULE: &str = "0 3 * * *";
 const DEFAULT_STAGING_MODE: &str = "monolithic";
+
+/// The two cron expressions the platform shipped before 2.22g, kept as the
+/// REGRESSION ANCHOR for the new composition.
+///
+/// Production no longer reads them: `resolve_schedule` composes the crons from
+/// `--at` (default 03:00) and the derived check time. They exist so one test
+/// can assert the bare default still produces these exact strings — because
+/// the danger in replacing a schedule surface is not that it rejects a value,
+/// it is that it silently MOVES everybody's backup window on upgrade.
+#[cfg(test)]
+const DEFAULT_BACKUP_SCHEDULE: &str = "0 3 * * *";
+#[cfg(test)]
 const DEFAULT_CHECK_SCHEDULE: &str = "0 6 * * 0";
+
+// ---------------------------------------------------------------------------
+// Schedule surface (2.22g / D2)
+// ---------------------------------------------------------------------------
+
+/// A resolved backup schedule: the two cron expressions and the IANA zone they
+/// are to be interpreted in.
+///
+/// Composed by the CLI from `--at` / `--check` / `--timezone` so neither the
+/// cron grammar nor the timezone is ever the operator's problem. An operator
+/// says *when*; steps, ranges and minute-granularity mean nothing for a
+/// nightly backup, and a time without a zone is not a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedSchedule {
+    pub schedule: String,
+    pub check_schedule: String,
+    /// IANA name. Empty only if the caller deliberately omits it, which the
+    /// enable path never does — it refuses instead.
+    pub time_zone: String,
+}
+
+/// Where the timezone came from, so the CLI can say so rather than leaving the
+/// operator to guess whether a zone was chosen or assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ZoneSource {
+    Flag,
+    TzEnv,
+    OperatingSystem,
+}
+
+impl ZoneSource {
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::Flag => "--timezone",
+            Self::TzEnv => "$TZ",
+            Self::OperatingSystem => "this machine",
+        }
+    }
+}
+
+/// Parse `--at HH:MM` on a 24-hour clock.
+///
+/// Strict on purpose. Accepting `3pm` or `03:00:00` would mean carrying two
+/// grammars for one value, and rejecting `3:00` would buy no correctness — so
+/// a single-digit hour is normalised and everything else is refused with a
+/// message that shows the shape.
+pub(crate) fn parse_at(raw: &str) -> Result<(u32, u32)> {
+    let bad = || {
+        CliError::Other(format!(
+            "invalid --at '{raw}': expected a 24-hour time HH:MM between 00:00              and 23:59, e.g. --at 03:00"
+        ))
+    };
+    let (h, m) = raw.split_once(':').ok_or_else(bad)?;
+    if h.is_empty() || h.len() > 2 || m.len() != 2 {
+        return Err(bad());
+    }
+    if !h.bytes().all(|b| b.is_ascii_digit()) || !m.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let (h, m): (u32, u32) = (h.parse().map_err(|_| bad())?, m.parse().map_err(|_| bad())?);
+    if h > 23 || m > 59 {
+        return Err(bad());
+    }
+    Ok((h, m))
+}
+
+/// `HH:MM` → the daily cron for that time.
+pub(crate) fn compose_daily(h: u32, m: u32) -> String {
+    format!("{m} {h} * * *")
+}
+
+/// `HH:MM` → the weekly cron for that time on Sunday.
+///
+/// The day is a product decision, not a flag: the check is weekly, and a
+/// second knob here would be the cron field this change exists to remove.
+pub(crate) fn compose_weekly_sunday(h: u32, m: u32) -> String {
+    format!("{m} {h} * * 0")
+}
+
+/// The check time when `--check` is not given: three hours after the backup,
+/// same minute.
+///
+/// Chosen so the bare default reproduces the platform's historical
+/// `0 3 * * *` / `0 6 * * 0` pair BYTE-IDENTICALLY — upgrading and re-running
+/// `enable` with no schedule flags must not move anybody's window. The point
+/// of the offset is only that the check never starts in the same minute as a
+/// backup; it is not a claim that the check follows the backup (`--at 23:00`
+/// puts the check at 02:00, which is earlier in that Sunday).
+pub(crate) fn derive_check_time(h: u32, m: u32) -> (u32, u32) {
+    ((h + 3) % 24, m)
+}
+
+/// Cheap shape check for an IANA zone name — `Area/Location`, or one of the
+/// handful of single-word zones.
+///
+/// Deliberately NOT a tzdb lookup: carrying a timezone database in the CLI to
+/// validate a string the apiserver validates anyway would be a second source
+/// of truth that goes stale. This rejects the shapes that are definitely not
+/// IANA names — in particular the POSIX `TZ` specs like `CET-1CEST,M3.5.0`
+/// that must never reach `spec.timeZone`.
+pub(crate) fn validate_zone_shape(zone: &str) -> Result<()> {
+    let bad = || {
+        CliError::Other(format!(
+            "invalid timezone '{zone}': expected an IANA name like              `Europe/Berlin` or `UTC`"
+        ))
+    };
+    if zone.is_empty() || zone.len() > 64 {
+        return Err(bad());
+    }
+    let ok_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '+');
+    if !zone.chars().all(ok_char) {
+        return Err(bad());
+    }
+    // A POSIX spec such as `EST5EDT` has no slash and is not one of the known
+    // single-word zones; a leading/trailing slash is malformed either way.
+    if zone.starts_with('/') || zone.ends_with('/') {
+        return Err(bad());
+    }
+    const SINGLE_WORD: &[&str] = &["UTC", "GMT", "UCT", "Zulu", "Universal", "Greenwich"];
+    if !zone.contains('/') && !SINGLE_WORD.contains(&zone) {
+        return Err(bad());
+    }
+    Ok(())
+}
+
+/// Resolve the zone the schedule runs in: the flag, then `$TZ`, then the
+/// operating system — and REFUSE if none of them answers.
+///
+/// Injected rather than reading the environment itself, so the precedence is
+/// testable without mutating process-global state in a parallel test suite.
+///
+/// # Why it refuses instead of defaulting to UTC
+///
+/// A time without a zone is not a time. UTC is a reasonable thing to *ask*
+/// for and a poor thing to *assume*: an operator who types `--at 03:00` means
+/// three in the morning where they are, and silently storing that as 03:00 UTC
+/// produces a backup that runs at the wrong hour with nothing anywhere saying
+/// so. Refusing costs one flag; guessing costs a wrong answer nobody can see.
+///
+/// `$TZ` is consulted because an operator who exports it reasonably expects it
+/// honoured — but only when it looks like an IANA name. POSIX `TZ` specs
+/// (`CET-1CEST,M3.5.0,M10.5.0/3`, `:/etc/localtime`) fall through to the OS
+/// rather than being written into `spec.timeZone`, where they mean nothing.
+pub(crate) fn resolve_time_zone(
+    flag: Option<&str>,
+    tz_env: Option<&str>,
+    os_zone: Option<&str>,
+) -> Result<(String, ZoneSource)> {
+    if let Some(z) = flag {
+        validate_zone_shape(z)?;
+        return Ok((z.to_string(), ZoneSource::Flag));
+    }
+    if let Some(z) = tz_env.filter(|z| validate_zone_shape(z).is_ok()) {
+        return Ok((z.to_string(), ZoneSource::TzEnv));
+    }
+    if let Some(z) = os_zone.filter(|z| validate_zone_shape(z).is_ok()) {
+        return Ok((z.to_string(), ZoneSource::OperatingSystem));
+    }
+    Err(CliError::Other(
+        "could not determine this machine's timezone, and a time of day \
+         without a zone is not a time.\n\n           Tried: --timezone (not given), $TZ, and the operating system.\n\n           Pass the zone explicitly:\n               apprafter backup enable … --at 03:00 --timezone Europe/Berlin\n           Or, to run the schedule in UTC, say so:\n               apprafter backup enable … --at 03:00 --timezone UTC"
+            .into(),
+    ))
+}
+
+/// Turn the `--at` / `--check` / `--timezone` flags into the two crons and the
+/// zone, or fail with a message the operator can act on.
+///
+/// Impure only in that it reads `$TZ` and asks the OS for its zone; everything
+/// it decides with is passed to [`resolve_time_zone`], which is pure.
+pub(crate) fn resolve_schedule(o: &EnableOpts) -> Result<ResolvedSchedule> {
+    let (h, m) = match o.at.as_deref() {
+        Some(raw) => parse_at(raw)?,
+        None => (3, 0),
+    };
+    let check_schedule = match o.check.as_deref() {
+        Some("off") => String::new(),
+        Some(raw) => {
+            let (ch, cm) = parse_at(raw).map_err(|e| {
+                CliError::Other(format!("{e}").replace("--at", "--check") + " (or `--check off`)")
+            })?;
+            compose_weekly_sunday(ch, cm)
+        }
+        None => {
+            let (ch, cm) = derive_check_time(h, m);
+            compose_weekly_sunday(ch, cm)
+        }
+    };
+    let tz_env = std::env::var("TZ").ok();
+    let os_zone = iana_time_zone::get_timezone().ok();
+    let (time_zone, source) =
+        resolve_time_zone(o.timezone.as_deref(), tz_env.as_deref(), os_zone.as_deref())?;
+    if source != ZoneSource::Flag {
+        println!(
+            "  using timezone {time_zone} (from {}); pass --timezone to override",
+            source.describe()
+        );
+    }
+    Ok(ResolvedSchedule {
+        schedule: compose_daily(h, m),
+        check_schedule,
+        time_zone,
+    })
+}
+
+/// One line describing a resolved schedule, for the success message.
+pub(crate) fn describe_schedule(s: &ResolvedSchedule) -> String {
+    let daily = cron_to_at(&s.schedule)
+        .map(|(h, m)| format!("backup daily at {h:02}:{m:02}"))
+        .unwrap_or_else(|| format!("backup on `{}`", s.schedule));
+    let check = if s.check_schedule.is_empty() {
+        "integrity check off".to_string()
+    } else {
+        cron_to_at(&s.check_schedule)
+            .map(|(h, m)| format!("check Sundays at {h:02}:{m:02}"))
+            .unwrap_or_else(|| format!("check on `{}`", s.check_schedule))
+    };
+    format!("{daily}, {check},")
+}
+
+/// `"0 3 * * *"` + `Some("Europe/Berlin")` → `"daily at 03:00 Europe/Berlin"`.
+///
+/// A cron this CLI would not have written is shown VERBATIM — summarising
+/// `*/5 * * * *` as a time would be a confident wrong answer about somebody's
+/// hand-edited schedule.
+pub(crate) fn describe_cron_daily(cron: &str, zone: Option<&str>) -> String {
+    match cron_to_at(cron) {
+        Some((h, m)) => format!("daily at {h:02}:{m:02} {}", zone_label(zone)),
+        None => format!("{cron} {}", zone_label(zone)),
+    }
+}
+
+/// The same for the weekly check, which this CLI always writes on Sunday.
+pub(crate) fn describe_cron_weekly(cron: &str, zone: Option<&str>) -> String {
+    let f: Vec<&str> = cron.split_whitespace().collect();
+    if f.len() == 5 && f[2] == "*" && f[3] == "*" && f[4] == "0" {
+        if let (Ok(m), Ok(h)) = (f[0].parse::<u32>(), f[1].parse::<u32>()) {
+            if h < 24 && m < 60 {
+                return format!("Sundays at {h:02}:{m:02} {}", zone_label(zone));
+            }
+        }
+    }
+    format!("{cron} {}", zone_label(zone))
+}
+
+/// The zone suffix — or a statement that there is none.
+///
+/// NOT silently omitted when absent. A bare `03:00` reads as local time, and
+/// on a cluster without the field it is the kube-controller-manager's zone,
+/// which is precisely the thing nobody could find out.
+fn zone_label(zone: Option<&str>) -> String {
+    match zone {
+        Some(z) if !z.is_empty() => z.to_string(),
+        _ => "(cluster timezone — re-run `backup enable` to pin one)".to_string(),
+    }
+}
+
+/// Render a stored cron back as `HH:MM`, for `backup status`.
+///
+/// `None` for anything this CLI would not have written — a hand-edited
+/// expression stays shown verbatim rather than being mis-summarised as a time
+/// it does not mean.
+pub(crate) fn cron_to_at(cron: &str) -> Option<(u32, u32)> {
+    let f: Vec<&str> = cron.split_whitespace().collect();
+    if f.len() != 5 || f[2] != "*" || f[3] != "*" {
+        return None;
+    }
+    let m: u32 = f[0].parse().ok()?;
+    let h: u32 = f[1].parse().ok()?;
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some((h, m))
+}
 
 // ---------------------------------------------------------------------------
 // Pure helpers (the tested core — some exported pub(crate) for restore.rs)
@@ -287,8 +572,10 @@ pub(crate) struct EnableOpts {
     pub bucket: String,
     /// Cluster credential Secret name → `spec.backup.credentialRef.name`.
     pub credential: String,
-    /// Backup cron → `spec.backup.schedule`.
-    pub cron: Option<String>,
+    /// `--at HH:MM` — the local time of day the backup runs.
+    pub at: Option<String>,
+    /// `--timezone` — IANA zone override; `None` resolves from the machine.
+    pub timezone: Option<String>,
     /// `spec.backup.retention.keepDaily`.
     pub keep_daily: Option<u32>,
     /// `spec.backup.retention.keepWeekly`.
@@ -299,8 +586,8 @@ pub(crate) struct EnableOpts {
     pub enforce: Option<String>,
     /// `spec.backup.stagingMode` (`monolithic` | `sequential`).
     pub staging_mode: Option<String>,
-    /// `spec.backup.checkSchedule` cron.
-    pub check_cron: Option<String>,
+    /// `--check off|HH:MM` — disable the weekly check, or set its time.
+    pub check: Option<String>,
     /// `spec.backup.failureWebhook` URL.
     pub failure_webhook: Option<String>,
 }
@@ -318,7 +605,7 @@ pub(crate) struct EnableOpts {
 ///
 /// Pure: no I/O, no validation of enum values (the impure caller
 /// [`run_backup_enable`] validates `enforce` / `staging_mode` before calling).
-pub(crate) fn backup_enable_patch(o: &EnableOpts) -> serde_json::Value {
+pub(crate) fn backup_enable_patch(o: &EnableOpts, s: &ResolvedSchedule) -> serde_json::Value {
     let mut backup = serde_json::Map::new();
     backup.insert("enabled".to_string(), Value::Bool(true));
     backup.insert("bucket".to_string(), Value::String(o.bucket.clone()));
@@ -335,14 +622,7 @@ pub(crate) fn backup_enable_patch(o: &EnableOpts) -> serde_json::Value {
     // value — the flag when given, else the platform default (identical to the
     // CUE / chart `#BackupValues` defaults, so behaviour is unchanged from
     // "the platform default").
-    backup.insert(
-        "schedule".to_string(),
-        Value::String(
-            o.cron
-                .clone()
-                .unwrap_or_else(|| DEFAULT_BACKUP_SCHEDULE.to_string()),
-        ),
-    );
+    backup.insert("schedule".to_string(), Value::String(s.schedule.clone()));
     backup.insert(
         "stagingMode".to_string(),
         Value::String(
@@ -351,14 +631,16 @@ pub(crate) fn backup_enable_patch(o: &EnableOpts) -> serde_json::Value {
                 .unwrap_or_else(|| DEFAULT_STAGING_MODE.to_string()),
         ),
     );
+    // Always present, and possibly EMPTY: `checkSchedule` is CRD-required, so
+    // an empty string is the only way to say "no weekly check" — which is what
+    // `--check off` writes and what the chart's guard omits the CronJob on.
     backup.insert(
         "checkSchedule".to_string(),
-        Value::String(
-            o.check_cron
-                .clone()
-                .unwrap_or_else(|| DEFAULT_CHECK_SCHEDULE.to_string()),
-        ),
+        Value::String(s.check_schedule.clone()),
     );
+    if !s.time_zone.is_empty() {
+        backup.insert("timeZone".to_string(), Value::String(s.time_zone.clone()));
+    }
     backup.insert("checkReadData".to_string(), Value::Bool(false));
     if let Some(hook) = &o.failure_webhook {
         backup.insert("failureWebhook".to_string(), Value::String(hook.clone()));
@@ -1969,6 +2251,12 @@ pub fn run_backup_enable(
         }
     }
 
+    // 1b. Resolve the schedule and the zone (2.22g / D2). Before the
+    //     kubeconfig, before any prompt, before anything billable — a bad
+    //     `--at` should cost nothing, and an unresolvable zone must fail here
+    //     rather than after the credentials have been sealed.
+    let resolved = resolve_schedule(&opts)?;
+
     // 2. Resolve creds via one of the two paths.
     //    `creds` is always the canonical S3_* map.
     //    `seal_from_file` tracks whether we must seal a new Secret.
@@ -2084,7 +2372,7 @@ pub fn run_backup_enable(
 
     // 7. Merge-patch spec.backup (path-scoped; spec.backup has no required
     //    siblings, so a JSON merge-patch is correct — no SSA field-manager).
-    let patch = backup_enable_patch(&opts);
+    let patch = backup_enable_patch(&opts, &resolved);
     let body = serde_json::to_string(&patch)
         .map_err(|e| CliError::Other(format!("serialize spec.backup patch: {e}")))?;
     kubectl_merge_patch(
@@ -2096,10 +2384,46 @@ pub fn run_backup_enable(
         kc.path(),
     )?;
 
+    // 7b. READ IT BACK. `spec.backup` is fully structural in the CRD — the
+    //     only preserve-unknown-fields markers are on `spec.overrides.*.values`,
+    //     `spec.values` and `status` — so an operator whose CRD predates
+    //     `timeZone` gets HTTP 200, every field it knows stored, and this one
+    //     silently DROPPED. The command would half-succeed: backups genuinely
+    //     enabled, running in the wrong zone, with this CLI reporting the zone
+    //     it thought it set. `kubectl` writes the pruning warning to stderr,
+    //     which `kubectl_merge_patch` reads only on failure — so the write
+    //     looks clean either way and the read-back is the only sound check.
+    if !resolved.time_zone.is_empty() {
+        let stored = kubectl_get_json(
+            "platformstack",
+            Some(PLATFORMSTACK_NAME),
+            Some(PLATFORMSTACK_NAMESPACE),
+            kc.path(),
+        )
+        .ok()
+        .flatten()
+        .and_then(|v| {
+            v.pointer("/spec/backup/timeZone")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+        if stored.as_deref() != Some(resolved.time_zone.as_str()) {
+            return Err(CliError::Other(format!(
+                "the cluster did not store the timezone '{}' (it reads back as {:?}).\n\n                   This operator's PlatformStack CRD predates the `spec.backup.timeZone`                  field, so the apiserver accepted the write and discarded it — the backup                  would run in the cluster's own zone with no sign of it.\n\n                   Upgrade the platform, then re-run this command.",
+                resolved.time_zone, stored
+            )));
+        }
+    }
+
     // 8. Success + GitOps advisory.
     println!(
         "✓ Scheduled off-site backup enabled → {} (credential Secret '{}').",
         opts.bucket, opts.credential
+    );
+    println!(
+        "  schedule: {} {}",
+        describe_schedule(&resolved),
+        resolved.time_zone
     );
     println!("{BACKUP_GITOPS_ADVISORY}");
     Ok(())
@@ -2341,17 +2665,33 @@ pub(crate) fn format_backup_status(
     if let Some(v) = spec.get("bucket").and_then(serde_json::Value::as_str) {
         out.push_str(&format!("  bucket:        {v}\n"));
     }
+    // 2.22g / D2: print the schedule back AS A TIME, in the zone it was given.
+    // A cron expression is not what the operator said, and a time without its
+    // zone is the trap this whole change closes — so if the zone is missing,
+    // say that rather than printing a bare time that reads as local.
+    let zone = spec.get("timeZone").and_then(serde_json::Value::as_str);
     if let Some(v) = spec.get("schedule").and_then(serde_json::Value::as_str) {
-        out.push_str(&format!("  schedule:      {v}\n"));
+        out.push_str(&format!(
+            "  schedule:      {}\n",
+            describe_cron_daily(v, zone)
+        ));
     }
     if let Some(v) = spec.get("stagingMode").and_then(serde_json::Value::as_str) {
         out.push_str(&format!("  stagingMode:   {v}\n"));
     }
-    if let Some(v) = spec
+    match spec
         .get("checkSchedule")
         .and_then(serde_json::Value::as_str)
     {
-        out.push_str(&format!("  checkSchedule: {v}\n"));
+        // Empty is not missing: it is `--check off`, and the chart omits the
+        // whole CronJob for it. Saying "off" is the difference between an
+        // operator believing the check runs and knowing it does not.
+        Some("") => out.push_str("  check:         off\n"),
+        Some(v) => out.push_str(&format!(
+            "  check:         {}\n",
+            describe_cron_weekly(v, zone)
+        )),
+        None => {}
     }
     // Retention sub-block.
     if let Some(ret) = spec.get("retention") {
@@ -2513,6 +2853,139 @@ pub fn run_backup_status() -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ------------------------------------------------------------------
+    // Schedule surface (2.22g / D2)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_bare_default_reproduces_the_historical_window_byte_for_byte() {
+        // THE regression guard for this whole change. An operator who upgrades
+        // and re-runs `enable` with no schedule flags must get the same two
+        // crons they had before — otherwise the fix silently moves everybody's
+        // backup, which is a worse defect than the one it closes.
+        let (h, m) = parse_at("03:00").unwrap();
+        assert_eq!(compose_daily(h, m), DEFAULT_BACKUP_SCHEDULE);
+        let (ch, cm) = derive_check_time(h, m);
+        assert_eq!(compose_weekly_sunday(ch, cm), DEFAULT_CHECK_SCHEDULE);
+    }
+
+    #[test]
+    fn parse_at_takes_a_24_hour_time_and_normalises_a_single_digit_hour() {
+        assert_eq!(parse_at("03:00").unwrap(), (3, 0));
+        assert_eq!(parse_at("3:00").unwrap(), (3, 0));
+        assert_eq!(parse_at("00:00").unwrap(), (0, 0));
+        assert_eq!(parse_at("23:59").unwrap(), (23, 59));
+        assert_eq!(compose_daily(22, 30), "30 22 * * *");
+    }
+
+    #[test]
+    fn parse_at_refuses_every_other_shape_and_says_what_it_wanted() {
+        // One grammar, not two. Accepting `3pm` or seconds would mean the
+        // help text has to describe both, and the operator has to guess.
+        for bad in [
+            "3", "3pm", "03:00:00", "24:00", "03:5", "", ":00", "03:", "0300", "-1:00",
+        ] {
+            let err = parse_at(bad).unwrap_err();
+            assert!(
+                format!("{err}").contains("HH:MM"),
+                "{bad:?} produced a message that does not show the shape: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_check_never_starts_in_the_same_minute_as_a_backup() {
+        // That is the whole claim of the offset — not that the check follows
+        // the backup. `--at 23:00` puts the check at 02:00, EARLIER in that
+        // Sunday, and that is fine.
+        for h in 0..24 {
+            let (ch, _) = derive_check_time(h, 0);
+            assert_ne!(ch, h, "check hour collides with the backup hour at {h}");
+        }
+        assert_eq!(derive_check_time(23, 0), (2, 0));
+        assert_eq!(derive_check_time(22, 30), (1, 30));
+    }
+
+    #[test]
+    fn a_posix_tz_spec_never_reaches_the_cluster() {
+        // `spec.timeZone` takes an IANA name. A POSIX TZ value means nothing
+        // there, and an operator who has `TZ=CET-1CEST,M3.5.0` exported must
+        // not have it written into their CronJob.
+        for posix in [
+            "CET-1CEST,M3.5.0,M10.5.0/3",
+            "EST5EDT",
+            ":/etc/localtime",
+            "GMT+5",
+        ] {
+            assert!(
+                validate_zone_shape(posix).is_err(),
+                "{posix:?} was accepted as an IANA zone"
+            );
+        }
+        for good in [
+            "Europe/Berlin",
+            "America/Argentina/Buenos_Aires",
+            "UTC",
+            "Etc/GMT+5",
+        ] {
+            assert!(validate_zone_shape(good).is_ok(), "{good:?} was rejected");
+        }
+    }
+
+    #[test]
+    fn the_zone_precedence_is_flag_then_env_then_os() {
+        assert_eq!(
+            resolve_time_zone(Some("UTC"), Some("Europe/Berlin"), Some("Asia/Tokyo")).unwrap(),
+            ("UTC".into(), ZoneSource::Flag)
+        );
+        assert_eq!(
+            resolve_time_zone(None, Some("Europe/Berlin"), Some("Asia/Tokyo")).unwrap(),
+            ("Europe/Berlin".into(), ZoneSource::TzEnv)
+        );
+        assert_eq!(
+            resolve_time_zone(None, None, Some("Asia/Tokyo")).unwrap(),
+            ("Asia/Tokyo".into(), ZoneSource::OperatingSystem)
+        );
+        // A POSIX $TZ is not an answer — fall through rather than write it.
+        assert_eq!(
+            resolve_time_zone(None, Some("EST5EDT"), Some("Asia/Tokyo")).unwrap(),
+            ("Asia/Tokyo".into(), ZoneSource::OperatingSystem)
+        );
+    }
+
+    #[test]
+    fn an_unknown_zone_refuses_rather_than_assuming_utc() {
+        // UTC is a reasonable thing to ASK for and a poor thing to ASSUME.
+        // Guessing it produces a backup at the wrong hour with nothing saying
+        // so; refusing costs one flag.
+        let err = resolve_time_zone(None, None, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not a time"), "{msg}");
+        assert!(msg.contains("--timezone Europe/Berlin"), "{msg}");
+        assert!(msg.contains("--timezone UTC"), "{msg}");
+    }
+
+    #[test]
+    fn an_explicitly_bad_zone_flag_is_an_error_not_a_fallback() {
+        // The flag is the operator stating intent. Falling back to $TZ after
+        // they typed something would deploy a schedule they did not ask for.
+        assert!(resolve_time_zone(Some("Mars/Olympus!"), Some("UTC"), Some("UTC")).is_err());
+    }
+
+    #[test]
+    fn cron_to_at_summarises_only_what_this_cli_would_have_written() {
+        assert_eq!(cron_to_at("0 3 * * *"), Some((3, 0)));
+        assert_eq!(cron_to_at("30 22 * * *"), Some((22, 30)));
+        assert_eq!(cron_to_at("0 6 * * 0"), Some((6, 0)));
+        // A hand-edited expression must be shown verbatim, not mis-summarised
+        // as a time it does not mean.
+        assert_eq!(cron_to_at("*/5 * * * *"), None);
+        assert_eq!(cron_to_at("0 3 1 * *"), None);
+        assert_eq!(cron_to_at("0 3 * 6 *"), None);
+        assert_eq!(cron_to_at("bogus"), None);
+        assert_eq!(cron_to_at(""), None);
+    }
 
     // ------------------------------------------------------------------
     // construct_repo_url — pure URL construction
@@ -3011,15 +3484,27 @@ mod tests {
 
     #[test]
     fn enable_patch_sets_spec_backup_fields() {
-        let p = backup_enable_patch(&EnableOpts {
-            bucket: "s3:x".into(),
-            credential: "c".into(),
-            cron: Some("0 2 * * *".into()),
-            enforce: Some("cluster".into()),
-            staging_mode: Some("sequential".into()),
-            keep_daily: Some(5),
-            ..Default::default()
-        });
+        let sched = ResolvedSchedule {
+            schedule: "0 2 * * *".into(),
+            check_schedule: "0 5 * * 0".into(),
+            time_zone: "Europe/Berlin".into(),
+        };
+        let p = backup_enable_patch(
+            &EnableOpts {
+                bucket: "s3:x".into(),
+                credential: "c".into(),
+                enforce: Some("cluster".into()),
+                staging_mode: Some("sequential".into()),
+                keep_daily: Some(5),
+                ..Default::default()
+            },
+            &sched,
+        );
+        assert_eq!(
+            p["spec"]["backup"]["timeZone"],
+            serde_json::json!("Europe/Berlin"),
+            "a schedule without its zone is not a schedule: {p}"
+        );
         assert_eq!(p["spec"]["backup"]["enabled"], serde_json::json!(true));
         assert_eq!(p["spec"]["backup"]["bucket"], serde_json::json!("s3:x"));
         assert_eq!(
@@ -3048,13 +3533,19 @@ mod tests {
     fn enable_patch_omits_retention_when_no_retention_flags() {
         // No keep_*/enforce set → the whole retention block is absent (a bare
         // enable that leaves retention to the operator/chart default).
-        let p = backup_enable_patch(&EnableOpts {
-            bucket: "s3:x".into(),
-            credential: "c".into(),
-            check_cron: Some("0 6 * * 0".into()),
-            failure_webhook: Some("https://hook".into()),
-            ..Default::default()
-        });
+        let p = backup_enable_patch(
+            &EnableOpts {
+                bucket: "s3:x".into(),
+                credential: "c".into(),
+                failure_webhook: Some("https://hook".into()),
+                ..Default::default()
+            },
+            &ResolvedSchedule {
+                schedule: "0 3 * * *".into(),
+                check_schedule: "0 6 * * 0".into(),
+                time_zone: "UTC".into(),
+            },
+        );
         assert!(
             p["spec"]["backup"].get("retention").is_none(),
             "retention must be absent when no retention flag is set: {p}"
@@ -3089,11 +3580,18 @@ mod tests {
         // (no other flags) MUST still produce all of them, else the apiserver
         // rejects the merge-patch ("schedule: Required value") and every
         // enable fails.
-        let p = backup_enable_patch(&EnableOpts {
-            bucket: "s3:b".into(),
-            credential: "cred".into(),
-            ..Default::default()
-        });
+        let p = backup_enable_patch(
+            &EnableOpts {
+                bucket: "s3:b".into(),
+                credential: "cred".into(),
+                ..Default::default()
+            },
+            &ResolvedSchedule {
+                schedule: "0 3 * * *".into(),
+                check_schedule: "0 6 * * 0".into(),
+                time_zone: "UTC".into(),
+            },
+        );
         let b = &p["spec"]["backup"];
         for key in [
             "enabled",
@@ -3119,12 +3617,19 @@ mod tests {
     #[test]
     fn enable_patch_retention_includes_only_set_keys() {
         // Only keep_weekly set → retention present with just keepWeekly.
-        let p = backup_enable_patch(&EnableOpts {
-            bucket: "s3:x".into(),
-            credential: "c".into(),
-            keep_weekly: Some(3),
-            ..Default::default()
-        });
+        let p = backup_enable_patch(
+            &EnableOpts {
+                bucket: "s3:x".into(),
+                credential: "c".into(),
+                keep_weekly: Some(3),
+                ..Default::default()
+            },
+            &ResolvedSchedule {
+                schedule: "0 3 * * *".into(),
+                check_schedule: "0 6 * * 0".into(),
+                time_zone: "UTC".into(),
+            },
+        );
         let ret = &p["spec"]["backup"]["retention"];
         assert_eq!(ret["keepWeekly"], serde_json::json!(3));
         assert!(ret.get("keepDaily").is_none());
@@ -3243,8 +3748,57 @@ mod tests {
         let s = format_backup_status(Some(&spec), &[], None, Some("2026-07-17T03:00:00Z"));
         assert!(s.contains("s3:x"));
         assert!(s.contains("2026-07-17T03:00:00Z"));
-        assert!(s.contains("0 3 * * *"));
+        // 2.22g: rendered as a TIME now, not a cron expression.
+        assert!(s.contains("daily at 03:00"), "{s}");
         assert!(s.contains("monolithic"));
+    }
+
+    #[test]
+    fn status_prints_the_schedule_back_in_the_zone_it_was_given() {
+        let spec = json!({
+            "enabled": true, "bucket": "s3:x", "stagingMode": "monolithic",
+            "schedule": "30 22 * * *", "checkSchedule": "30 1 * * 0",
+            "timeZone": "Europe/Berlin"
+        });
+        let s = format_backup_status(Some(&spec), &[], None, None);
+        assert!(s.contains("daily at 22:30 Europe/Berlin"), "{s}");
+        assert!(s.contains("Sundays at 01:30 Europe/Berlin"), "{s}");
+    }
+
+    #[test]
+    fn status_says_off_rather_than_showing_an_empty_schedule() {
+        // Empty is not missing: it is `--check off`, and the chart omits the
+        // CronJob entirely. An operator must be able to tell "no check" from
+        // "a check I cannot read".
+        let spec = json!({
+            "enabled": true, "bucket": "s3:x", "schedule": "0 3 * * *",
+            "checkSchedule": "", "timeZone": "UTC"
+        });
+        let s = format_backup_status(Some(&spec), &[], None, None);
+        assert!(s.contains("check:         off"), "{s}");
+    }
+
+    #[test]
+    fn status_names_the_missing_zone_instead_of_printing_a_bare_time() {
+        // A cluster enabled before 2.22g has no timeZone. Printing "03:00"
+        // alone reads as local time; it is actually the
+        // kube-controller-manager's zone, which is the trap D2 is about.
+        let spec = json!({"enabled": true, "bucket": "s3:x", "schedule": "0 3 * * *"});
+        let s = format_backup_status(Some(&spec), &[], None, None);
+        assert!(s.contains("cluster timezone"), "{s}");
+        assert!(s.contains("backup enable"), "{s}");
+    }
+
+    #[test]
+    fn status_shows_a_hand_edited_cron_verbatim() {
+        // Summarising `*/5 * * * *` as a time would be a confident wrong
+        // answer about somebody's own schedule.
+        let spec = json!({
+            "enabled": true, "bucket": "s3:x", "schedule": "*/5 * * * *",
+            "timeZone": "UTC"
+        });
+        let s = format_backup_status(Some(&spec), &[], None, None);
+        assert!(s.contains("*/5 * * * * UTC"), "{s}");
     }
 
     #[test]

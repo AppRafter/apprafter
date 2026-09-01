@@ -212,6 +212,11 @@ pub const EXAMPLES: &[CommandExamples] = &[
              --credential-file <dotenv> --i-have-saved-credentials",
             "apprafter backup enable --bucket s3:https://<host>/<bucket> \
              --credential <secret> --i-have-saved-credentials",
+            "apprafter backup enable --bucket <bucket> --endpoint <host> \
+             --credential <secret> --at 22:30 --timezone Europe/Berlin \
+             --i-have-saved-credentials",
+            "apprafter backup enable --bucket <bucket> --endpoint <host> \
+             --credential <secret> --check off --i-have-saved-credentials",
         ],
     },
     CommandExamples {

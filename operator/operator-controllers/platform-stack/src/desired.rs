@@ -133,10 +133,17 @@ mod tests {
             retention: None,
             check_schedule: "@weekly".into(),
             check_read_data: false,
+            time_zone: Some("Europe/Berlin".into()),
             failure_webhook: None,
         });
         let desired = build(&spec, "0.2.31");
         assert_eq!(desired.helm_values["backup"]["enabled"], json!(true));
+        // 2.22g: the zone must reach the chart, or the CronJob runs in the
+        // kube-controller-manager's and nothing says which.
+        assert_eq!(
+            desired.helm_values["backup"]["timeZone"],
+            json!("Europe/Berlin")
+        );
         assert_eq!(
             desired.helm_values["backup"]["bucket"],
             json!("s3:https://ep/b")

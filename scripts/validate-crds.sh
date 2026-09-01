@@ -108,4 +108,64 @@ else
     exit 1
 fi
 
+# 2.22g / D2. `spec.backup` is FULLY STRUCTURAL — the only
+# preserve-unknown-fields markers in this CRD are on spec.overrides.*.values,
+# spec.values and status. So an un-declared key is PRUNED: the apiserver
+# answers 200, stores every field it knows, and silently drops the one it does
+# not. For `timeZone` that failure is invisible and expensive — backups would
+# genuinely run, on a schedule in the wrong zone, with the CLI reporting the
+# zone it thought it had set. Assert the field survives a round trip rather
+# than assuming the CRD carries what crd-check says it carries.
+echo "==> regression: PlatformStack spec.backup.timeZone must round-trip (2.22g / D2)"
+kubectl --context "$CTX" create namespace crd-validate >/dev/null 2>&1 || true
+cat >/tmp/crd-validate-tz.yaml <<'YAML'
+apiVersion: apprafter.io/v1alpha1
+kind: PlatformStack
+metadata:
+  name: crd-validate-tz
+  namespace: crd-validate
+spec:
+  channel: stable
+  autoUpgrade: false
+  source:
+    upstream: oci://ghcr.io/apprafter/charts
+    repoURL: oci://ghcr.io/apprafter/charts
+    checkInterval: 6h
+  values:
+    tier: 1
+  backup:
+    enabled: true
+    bucket: s3:https://example.invalid/bucket
+    credentialRef:
+      name: crd-validate-creds
+    schedule: "30 22 * * *"
+    checkSchedule: ""
+    stagingMode: monolithic
+    checkReadData: false
+    timeZone: Europe/Belgrade
+YAML
+if ! kubectl --context "$CTX" apply -f /tmp/crd-validate-tz.yaml >/dev/null 2>/tmp/crd-tz-err.txt; then
+    echo "==> REGRESSION: apiserver REJECTED spec.backup.timeZone" >&2
+    cat /tmp/crd-tz-err.txt >&2
+    exit 1
+fi
+_tz=$(kubectl --context "$CTX" -n crd-validate get platformstack crd-validate-tz \
+    -o jsonpath='{.spec.backup.timeZone}' 2>/dev/null || true)
+if [ "$_tz" = "Europe/Belgrade" ]; then
+    echo "    OK: spec.backup.timeZone stored (not pruned)"
+else
+    echo "==> REGRESSION: spec.backup.timeZone was PRUNED — read back '${_tz}'." >&2
+    echo "    The apply succeeded and the field vanished, which is how a backup" >&2
+    echo "    ends up running in the wrong zone with the CLI reporting the right one." >&2
+    exit 1
+fi
+_cs=$(kubectl --context "$CTX" -n crd-validate get platformstack crd-validate-tz \
+    -o jsonpath='{.spec.backup.checkSchedule}' 2>/dev/null; echo "|")
+if [ "$_cs" = "|" ]; then
+    echo "    OK: an empty checkSchedule is accepted (the --check off path)"
+else
+    echo "==> REGRESSION: empty checkSchedule did not survive: '${_cs}'" >&2
+    exit 1
+fi
+
 echo "==> CRD apiserver validation PASSED (all CRDs accepted + Established)"

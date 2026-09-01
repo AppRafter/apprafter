@@ -578,11 +578,11 @@ the cluster and enables the scheduled backup in one step, with no separate
 apprafter backup enable --bucket s3:<endpoint>/<bucket>/<prefix> \
                         --credential-file <dotenv> \
                         [--credential apprafter-backup-s3] \
-                        [--cron "0 3 * * *"] \
+                        [--at 03:00] [--timezone Europe/Berlin] \
                         [--staging-mode monolithic|sequential] \
                         [--enforce operator|cluster] \
                         [--keep-daily N] [--keep-weekly N] [--keep-monthly N] \
-                        [--check-cron "0 6 * * 0"] \
+                        [--check off|06:00] \
                         [--failure-webhook <url>] \
                         --i-have-saved-credentials
 ```
@@ -671,10 +671,23 @@ Only after all of these pass does `enable` **merge-patch**
 > your **infra repo** for a durable change. The CLI prints this reminder after
 > a successful `enable`.
 
-Defaults when a flag is omitted: `--cron` `"0 3 * * *"` (daily 03:00),
-`--check-cron` `"0 6 * * 0"` (weekly Sunday 06:00, staggered clear of the
-backup), `--staging-mode` `monolithic`, `--enforce` `operator`, retention
-`--keep-daily 7 --keep-weekly 4 --keep-monthly 6`.
+Defaults when a flag is omitted: `--at` `03:00` (nightly), `--check` three
+hours later on Sunday, `--staging-mode` `monolithic`, `--enforce` `operator`,
+retention `--keep-daily 7 --keep-weekly 4 --keep-monthly 6`.
+
+**`--timezone` defaults to the machine you run the command on.** A time of day
+without a zone is not a time: `03:00` means three in the morning where you are,
+and the CLI records which zone that was so the schedule keeps meaning it. If it
+cannot determine your zone it says so and asks — it will not quietly pick UTC.
+Pass `--timezone UTC` if that is what you want.
+
+`apprafter backup status` prints the schedule back as a time in the same zone,
+so what you read is what you set.
+
+> **One night a year, in some zones.** If your `--at` time falls inside the
+> hour a zone skips when it moves to summer time, that night's backup does not
+> run; the next one does. Choosing a time outside 01:00–03:00 avoids it in most
+> European and North American zones.
 
 ### Disable and status
 
@@ -747,7 +760,7 @@ compensating provider controls (object versioning / object lock).
 > do not. If your provider cannot express it and you decline to hand the cluster
 > full delete, issue a credential with **no** Delete at all: `backup` still
 > works (restic uses non-exclusive locks), but the in-cluster `check` cannot
-> drop its own lock — [park the in-cluster check](#parking-the-in-cluster-check)
+> drop its own lock — [turn the in-cluster check off](#turning-the-in-cluster-check-off)
 > and run `apprafter backup check` operator-side instead. Verify your provider's
 > behavior — the Verify checklist below has a step for confirming it.
 
@@ -841,44 +854,23 @@ the in-cluster **`apprafter-backup-check` CronJob** runs weekly (default
 `0 6 * * 0`). By default it verifies structure only; `--read-data` re-downloads
 and re-hashes **every** pack for a deep verify (slower, bandwidth-heavy). Run the
 operator-side `check` when your provider can't express the scoped-delete policy
-and you have [parked the in-cluster check](#parking-the-in-cluster-check), or any
+and you have [turned the in-cluster check off](#turning-the-in-cluster-check-off), or any
 time you want a manual verification with full credentials.
 
-#### Parking the in-cluster check
+#### Turning the in-cluster check off
 
-There is **no off switch** for the weekly check today. `--check-cron` takes a
-five-field cron and nothing else: whatever you pass is written verbatim to
-`PlatformStack.spec.backup.checkSchedule` (`spec.backup.checkSchedule` is an
-unconstrained string in the CRD) and rendered verbatim into the CronJob's
-`schedule:` field
-(`platform-stack/cue/render_tool.cue:538`). A word like `off` is not handled
-anywhere in the CLI — it reaches the apiserver and is rejected:
+Pass `--check off`:
 
-<!-- docs: check=none reason=third-party-output since=v0.2.51 — the apiserver's own rejection transcript, quoted to show what a bad `schedule:` costs -->
-```console
-$ kubectl apply -f apprafter-backup-check.yaml
-The CronJob "apprafter-backup-check" is invalid: spec.schedule: Invalid value: "off": expected exactly 5 fields, found 1: [off]
+```sh
+apprafter backup enable --bucket s3:… --credential apprafter-backup-s3 \
+                        --check off --i-have-saved-credentials
 ```
 
-which fails the platform-stack sync and leaves the whole backup component
-`OutOfSync` — the opposite of what you wanted.
+The weekly CronJob is then not created at all, and `apprafter backup status`
+reports `check: off` so nobody has to infer it from an absence.
 
-Two things that do work:
-
-- **Give it a schedule that never comes.** The 31st of February is a valid
-  five-field cron and no date ever matches it, so the CronJob exists, is
-  Synced, and never fires:
-
-    ```sh
-    apprafter backup enable --bucket s3:… --credential apprafter-backup-s3 \
-                            --check-cron "0 6 31 2 *" --i-have-saved-credentials
-    ```
-
-    (verified against a Kubernetes apiserver: `schedule: "0 6 31 2 *"` is
-    accepted and stored as written.)
-
-- **Or edit `PlatformStack.spec.backup.checkSchedule` in your infra repo** to
-  the same value, if the backup block is git-managed.
+Or set `PlatformStack.spec.backup.checkSchedule` to `""` in your infra repo, if
+the backup block is git-managed — that is the same thing, expressed durably.
 
 Do **not** reach for `kubectl patch cronjob apprafter-backup-check
 --patch '{"spec":{"suspend":true}}'`. The CronJob is chart-owned and the
@@ -967,7 +959,7 @@ the design's Verify items:
   provider can't express the append-only guarantee — fall back to
   `enforce: cluster` with provider object-lock, or to the no-delete variant
   with the in-cluster check
-  [parked](#parking-the-in-cluster-check).
+  [turned off](#turning-the-in-cluster-check-off).
 - **A minimal end-to-end.** `apprafter backup enable` → wait for (or
   trigger) one backup Job → `apprafter backup status` shows a fresh
   `lastSuccess` → `apprafter restore s3:… --reprovision` into a **throwaway**

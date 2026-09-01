@@ -415,6 +415,13 @@ package platformstack
 	// 06:00 (staggered clear of the daily backup).
 	checkSchedule: string | *"0 6 * * 0"
 
+	// IANA timezone both schedules run in → `CronJob.spec.timeZone`
+	// (2.22g / D2). Empty = omit the field, which means the CronJob runs
+	// in the kube-controller-manager's zone — every cluster's behaviour
+	// before this existed, and exactly the trap: an operator writing
+	// `0 3 * * *` means three in the morning THEIR time.
+	timeZone: string | *""
+
 	// Opt-in full re-download `restic check --read-data`. Default false
 	// (metadata-only structural check).
 	checkReadData: bool | *false

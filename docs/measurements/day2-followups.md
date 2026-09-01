@@ -21,7 +21,7 @@ would otherwise touch the same code three times.
 | | Entry | Status | Planned as |
 | --- | --- | --- | --- |
 | **D1** | VPA in-place right-sizing has never run: wrong feature-gate name | RESOLVED | — |
-| **D2** | `--cron` / `--check-cron` are the wrong surface, not an unvalidated one | open (docs half landed, CLI half did not) | 2.22g |
+| **D2** | `--cron` / `--check-cron` are the wrong surface, not an unvalidated one | RESOLVED 2.22g | 2.22g |
 | **D3** | Two diagnostics whose `help:` text describes a layout that moved | RESOLVED | — |
 | **D4** | Removing a `needs.*` entry orphans its ResourceClaim forever | FIXED 2.22b — walk-verified | 2.22b |
 | **D5** | A Dragonfly restart drops every claim's ACL user | RESOLVED 2.22f — walk GREEN | 2.22f |
@@ -194,14 +194,28 @@ the specific assertion.
 **Reframed:** 2026-08-30 — the original entry proposed adding a
 `value_parser`. That treats the symptom. The flags should not take a cron
 expression at all.
-**Status:** OPEN. **The documentation half landed and the CLI half did
-not**, which is worth stating because that split is how an entry gets
-forgotten: `backup-restore.md` no longer offers `--check-cron off`, says
-plainly that there is no off switch today, and uses a never-firing
-schedule instead — so the symptom stopped being visible while the defect
-stayed. Re-verified 2026-08-30: both flags are still
-`#[arg(long, value_name = "cron")]` with no `value_parser`
-(`cli/platform-cli/src/cli.rs:1560`, `:1588`).
+**Status:** RESOLVED 2026-09-01 (2.22g). The CLI half finally landed, closing
+the split that made this entry nearly forgettable — the symptom had stopped
+being visible while the defect stayed.
+
+`--cron` / `--check-cron` are GONE, replaced by `--at HH:MM` + `--timezone` +
+`--check off|HH:MM`. The CLI composes both crons and writes
+`spec.backup.timeZone`, which the chart renders onto both CronJobs; an empty
+`checkSchedule` now omits the check CronJob entirely, so disabling it no longer
+requires a date that never arrives.
+
+**The design's own load-bearing claim was refuted in a place nobody expected,
+and it decided a feature.** `spec.backup` is FULLY structural in the CRD — the
+only preserve-unknown markers are on `spec.overrides.*.values`, `spec.values`
+and `status` — so an operator whose CRD predates `timeZone` gets HTTP 200,
+every field it knows stored, and this one silently dropped. Worse than
+"nothing happens": `backup_enable_patch` emits all seven CRD-required keys, so
+the command HALF-SUCCEEDS — backups genuinely enabled, running in the wrong
+zone, with the CLI reporting the zone it thought it set. And `kubectl` writes
+the pruning warning to stderr, which `kubectl_merge_patch` reads only on
+failure. So `enable` now READS THE FIELD BACK and fails loudly if it did not
+survive, and `scripts/validate-crds.sh` asserts the round trip on a real
+apiserver.
 
 ### What they do
 

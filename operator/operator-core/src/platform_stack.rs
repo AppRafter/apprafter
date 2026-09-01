@@ -111,6 +111,11 @@ pub struct BackupConfig {
     pub retention: Option<RetentionConfig>,
     #[serde(rename = "checkSchedule")]
     pub check_schedule: String,
+    /// IANA timezone for both schedules → `CronJob.spec.timeZone` (2.22g).
+    /// Absent = the kube-controller-manager's zone, which is what every
+    /// cluster did before this field and is the trap the field closes.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "timeZone")]
+    pub time_zone: Option<String>,
     #[serde(default, rename = "checkReadData")]
     pub check_read_data: bool,
     #[serde(

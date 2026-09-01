@@ -1597,10 +1597,17 @@ pub enum BackupAction {
         /// When given, the creds are probed against the repo and then auto-sealed into the cluster.
         #[arg(long)]
         credential_file: Option<std::path::PathBuf>,
-        /// Five-field cron schedule for the full backup Job.
-        /// Default `0 3 * * *` — nightly at 03:00.
-        #[arg(long, value_name = "cron")]
-        cron: Option<String>,
+        /// Local time of day the nightly backup runs, `HH:MM` on a
+        /// 24-hour clock. Default `03:00`. Interpreted in
+        /// `--timezone`, so the time you write is the time it runs.
+        #[arg(long, value_name = "time")]
+        at: Option<String>,
+        /// IANA timezone the schedules run in (`Europe/Berlin`,
+        /// `UTC`), written to the CronJob's `spec.timeZone`. Defaults
+        /// to this machine's zone; if that cannot be determined the
+        /// command refuses rather than assume UTC.
+        #[arg(long, value_name = "zone")]
+        timezone: Option<String>,
         /// How many daily snapshots `restic forget` keeps. Default 7.
         /// Retention is only APPLIED when `--enforce cluster` is set
         /// or you run `apprafter backup prune`; under the default
@@ -1621,13 +1628,13 @@ pub enum BackupAction {
         /// `monolithic` (default) or `sequential`.
         #[arg(long)]
         staging_mode: Option<String>,
-        /// Five-field cron schedule for the periodic `restic check`
-        /// Job, which verifies repository integrity. Default
-        /// `0 6 * * 0` — Sundays at 06:00, staggered clear of the
-        /// nightly backup. The check is metadata-only; it does not
-        /// re-download the data.
-        #[arg(long, value_name = "cron")]
-        check_cron: Option<String>,
+        /// The weekly repository-integrity check: `off` to disable it,
+        /// or `HH:MM` for its Sunday run time. Default: three hours
+        /// after `--at`, so it never starts in the same minute as a
+        /// backup. The check is metadata-only; it does not re-download
+        /// the data.
+        #[arg(long, value_name = "off|time")]
+        check: Option<String>,
         /// URL the runner POSTs a JSON failure report to when a
         /// backup or check Job fails. Egress to this host is opened
         /// automatically in the platform network policy. No default —

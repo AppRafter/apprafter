@@ -1067,9 +1067,23 @@
       "hidden": false,
       "examples": [
         "apprafter backup enable --bucket <bucket> --endpoint <host> --credential-file <dotenv> --i-have-saved-credentials",
-        "apprafter backup enable --bucket s3:https://<host>/<bucket> --credential <secret> --i-have-saved-credentials"
+        "apprafter backup enable --bucket s3:https://<host>/<bucket> --credential <secret> --i-have-saved-credentials",
+        "apprafter backup enable --bucket <bucket> --endpoint <host> --credential <secret> --at 22:30 --timezone Europe/Berlin --i-have-saved-credentials",
+        "apprafter backup enable --bucket <bucket> --endpoint <host> --credential <secret> --check off --i-have-saved-credentials"
       ],
       "args": [
+        {
+          "id": "at",
+          "long": "at",
+          "short": null,
+          "takes_value": true,
+          "value_name": "time",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Local time of day the nightly backup runs, `HH:MM` on a 24-hour clock. Default `03:00`. Interpreted in `--timezone`, so the time you write is the time it runs"
+        },
         {
           "id": "bucket",
           "long": "bucket",
@@ -1083,16 +1097,16 @@
           "help": "Bucket name (with `--endpoint`), or a full restic repo URL (`s3:https://host/bucket`, `b2:...`, a local path, ...). With a bare name, pass `--endpoint` and the CLI builds the `s3:https://<endpoint>/<bucket>` URL for you"
         },
         {
-          "id": "check_cron",
-          "long": "check-cron",
+          "id": "check",
+          "long": "check",
           "short": null,
           "takes_value": true,
-          "value_name": "cron",
+          "value_name": "off|time",
           "default": null,
           "env": null,
           "required": false,
           "possible_values": [],
-          "help": "Five-field cron schedule for the periodic `restic check` Job, which verifies repository integrity. Default `0 6 * * 0` — Sundays at 06:00, staggered clear of the nightly backup. The check is metadata-only; it does not re-download the data"
+          "help": "The weekly repository-integrity check: `off` to disable it, or `HH:MM` for its Sunday run time. Default: three hours after `--at`, so it never starts in the same minute as a backup. The check is metadata-only; it does not re-download the data"
         },
         {
           "id": "credential",
@@ -1117,18 +1131,6 @@
           "required": false,
           "possible_values": [],
           "help": "Path to a dotenv file with S3 + restic creds (S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, RESTIC_PASSWORD; optional S3_REGION). AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION accepted as aliases. When given, the creds are probed against the repo and then auto-sealed into the cluster"
-        },
-        {
-          "id": "cron",
-          "long": "cron",
-          "short": null,
-          "takes_value": true,
-          "value_name": "cron",
-          "default": null,
-          "env": null,
-          "required": false,
-          "possible_values": [],
-          "help": "Five-field cron schedule for the full backup Job. Default `0 3 * * *` — nightly at 03:00"
         },
         {
           "id": "endpoint",
@@ -1237,6 +1239,18 @@
           "required": false,
           "possible_values": [],
           "help": "`monolithic` (default) or `sequential`"
+        },
+        {
+          "id": "timezone",
+          "long": "timezone",
+          "short": null,
+          "takes_value": true,
+          "value_name": "zone",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "IANA timezone the schedules run in (`Europe/Berlin`, `UTC`), written to the CronJob's `spec.timeZone`. Defaults to this machine's zone; if that cannot be determined the command refuses rather than assume UTC"
         }
       ],
       "positionals": []
