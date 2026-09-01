@@ -1844,9 +1844,21 @@ compatibility: "0.2.59": {
 		whatever the dragonfly-operator's compiled-in default happened to be, and
 		every ACL guarantee above is a property of that tag.
 
+		BACKUP SCHEDULES TAKE A TIME AND A TIMEZONE (2.22g / D2). `apprafter backup
+		enable --cron` / `--check-cron` are REMOVED; use `--at 03:00`,
+		`--timezone Europe/Berlin` and `--check off|HH:MM`. Backup CronJobs
+		previously carried NO timezone at all, so a schedule ran in the
+		kube-controller-manager's zone and nothing said which. Existing clusters
+		keep the schedule they have and carry no zone, so nothing moves until an
+		operator re-runs `backup enable`; `backup status` now says the zone is the
+		cluster's rather than printing a bare time that reads as local. A cluster
+		using the old never-firing check workaround (`0 6 31 2 *`) should re-run
+		with `--check off`, which now removes the CronJob outright.
+
 		Requires a restart: new operator image, plus the one-time Dragonfly roll
-		described above. No CRD change — `status` carries
-		`x-kubernetes-preserve-unknown-fields`.
+		described above. `spec.backup.timeZone` is a new CRD field, so an OLDER
+		CLI is unaffected and a NEWER CLI against an older operator refuses
+		loudly rather than letting the apiserver prune the zone silently.
 		"""
 }
 

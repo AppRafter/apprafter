@@ -960,7 +960,7 @@ else
     apprafter backup enable \
         --endpoint "$S3_HOST" --bucket "$S3_BUCKET_NAME_R" --prefix "$S3_PREFIX" \
         --credential-file "$CRED_FILE" \
-        --cron '*/5 * * * *' \
+        --at 22:30 --timezone UTC \
         --i-have-saved-credentials
     status_out="$(apprafter backup status)"
     printf '%s\n' "$status_out"

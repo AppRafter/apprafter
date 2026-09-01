@@ -588,7 +588,9 @@ apprafter backup enable \
     --credential "$CLUSTER_CRED_SECRET" \
     --credential-file "$CRED_FILE" \
     --staging-mode sequential \
-    --cron '*/5 * * * *' \
+    --at 22:30 \
+    --check off \
+    --timezone Europe/Berlin \
     --i-have-saved-credentials
 
 # Point the runner at the in-cluster bucket + the local runner image (both are
@@ -598,6 +600,24 @@ kubectl -n "$PROVIDER_NS" patch platformstack default --type merge -p \
 
 status_out="$(apprafter backup status)"
 printf '%s\n' "$status_out"
+
+# --- 2.22g / D2: the schedule surface -------------------------------------
+# The assertion that matters is NOT that the flag was accepted — it is that the
+# TIMEZONE reached the rendered CronJob. `spec.backup` is fully structural in
+# the CRD, so an operator predating the field would store everything else and
+# silently drop this one; `backup enable` reads it back, and so does this.
+tz_cr=$(kubectl -n "$PROVIDER_NS" get platformstack default \
+    -o jsonpath='{.spec.backup.timeZone}' 2>/dev/null || true)
+assert_eq "spec.backup.timeZone stored on the PlatformStack" "$tz_cr" "Europe/Berlin"
+sched_cr=$(kubectl -n "$PROVIDER_NS" get platformstack default \
+    -o jsonpath='{.spec.backup.schedule}' 2>/dev/null || true)
+assert_eq "--at 22:30 composed the daily cron" "$sched_cr" "30 22 * * *"
+check_cr=$(kubectl -n "$PROVIDER_NS" get platformstack default \
+    -o jsonpath='{.spec.backup.checkSchedule}'; echo "|")
+assert_eq "--check off wrote an empty checkSchedule" "$check_cr" "|"
+assert_contains "backup status prints the time in the zone it was given" \
+    "$status_out" "daily at 22:30 Europe/Berlin"
+assert_contains "backup status says the check is off" "$status_out" "check:         off"
 assert_eq "spec.backup.stagingMode is sequential" "$(jp platformstack "$PROVIDER_NS" default '{.spec.backup.stagingMode}')" "sequential"
 assert_eq "spec.backup.image points at the local runner build" "$(jp platformstack "$PROVIDER_NS" default '{.spec.backup.image}')" "$RUNNER_IMAGE"
 # The chart-rendered CronJob picks up the new bucket+image on the operator's next

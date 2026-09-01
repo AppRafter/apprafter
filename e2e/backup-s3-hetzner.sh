@@ -16,7 +16,7 @@
 #   `secret:` ref, --env dev) + seed a known pg marker + a known sealed secret
 #   value  ->  seal the CLUSTER S3 credential Secret into apprafter-system  ->
 #   `apprafter backup enable --bucket <s3:> --credential <sealed> --credential-
-#   file <dotenv> --cron ... --i-have-saved-credentials`  ->  assert `backup
+#   file <dotenv> --at ... --i-have-saved-credentials`  ->  assert `backup
 #   status` ENABLED + bucket  ->  trigger the CronJob NOW (kubectl create job
 #   --from=cronjob/apprafter-backup), wait Complete  ->  assert a snapshot
 #   exists off-site (backup status lastSuccess + `restic snapshots` >=1)  ->
@@ -502,9 +502,10 @@ printf '  ok: cluster S3 credential Secret sealed + unsealed in %s\n' "$BACKUP_N
 
 # ---------------------------------------------------------------
 # Phase 4: apprafter backup enable → merge-patch spec.backup + assert status.
-# `--cron '*/5 * * * *'` so a scheduled run would fire soon (we trigger a manual
-# Job in Phase 5 rather than wait). The preflight `restic init` uses the
-# --credential-file creds to reach the real bucket.
+# 2.22g: the schedule surface is `--at HH:MM` + `--timezone`; a scheduled run is
+# not waited for (Phase 5 triggers a manual Job), so the time is arbitrary — what
+# is asserted is that the ZONE reached the CronJob. The preflight `restic init`
+# uses the --credential-file creds to reach the real bucket.
 # ---------------------------------------------------------------
 phase "Phase 4: apprafter backup enable (--bucket $S3_REPO) + status ENABLED"
 { set +x; } 2>/dev/null
@@ -512,7 +513,8 @@ apprafter backup enable \
     --bucket "$S3_REPO" \
     --credential "$CLUSTER_CRED_SECRET" \
     --credential-file "$CRED_FILE" \
-    --cron '*/5 * * * *' \
+    --at 22:30 \
+    --timezone Europe/Berlin \
     --i-have-saved-credentials
 status_out="$(apprafter backup status)"
 printf '%s\n' "$status_out"

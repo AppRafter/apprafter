@@ -9,7 +9,7 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
-## platform-stack 0.2.59 / operator v0.2.45 — day-2 signals, the way back from a bad build, and durable Redis credentials (2.22c–2.22f, unreleased)
+## platform-stack 0.2.59 / operator v0.2.45 — day-2 signals, the way back from a bad build, and durable Redis credentials (2.22c–2.22g, unreleased)
 
 Four defects found by rewriting the guides, and one recovery path that never
 existed. Released as one batch; nothing here has been pushed.
@@ -67,6 +67,12 @@ existed. Released as one batch; nothing here has been pushed.
   whoever sealed it.
 - **The rollback patch body was hand-spliced with `format!`**, so any revision
   containing a quote produced malformed JSON.
+- **Backup CronJobs had no timezone at all**, so a schedule ran in the
+  kube-controller-manager's zone and nothing anywhere said which — not the
+  chart, not the schema, not the CLI, and no page.
+- **There was no way to turn the weekly integrity check off.** An empty
+  `checkSchedule` now omits the CronJob; previously the documentation taught a
+  schedule for the 31st of February as the supported answer.
 - **A Dragonfly restart was a cluster-wide Redis authentication outage.** One
   ephemeral and one persistent instance serve every tenant, so a single pod
   restart locked out every application for up to five minutes. For a
@@ -93,6 +99,22 @@ existed. Released as one batch; nothing here has been pushed.
 
 ### Changed
 
+- **Backup schedules take a time and a timezone, not a cron expression.**
+  `apprafter backup enable --cron` / `--check-cron` are **removed**; use
+  `--at 03:00`, `--timezone Europe/Berlin` and `--check off|HH:MM`. The CLI
+  composes the cron and writes the zone, and `apprafter backup status` prints
+  the schedule back as a time in the same zone.
+
+  `--timezone` defaults to the machine you run the command on, and the command
+  **refuses rather than assuming UTC** if it cannot determine one — a time of
+  day without a zone is not a time.
+
+  Existing clusters keep the schedule they have and carry **no zone**, so they
+  continue to run in the cluster's own timezone exactly as before; `backup
+  status` now says so instead of printing a bare time that reads as local.
+  Re-run `backup enable` to pin a zone. A cluster configured with the old
+  never-firing check workaround (`--check-cron "0 6 31 2 *"`) should re-run
+  with `--check off`, which now removes the CronJob outright.
 - **A bare `apprafter app rollback <name>` now prefers the retained image
   digest** over the previous Git revision when the application has one. For a
   tag-following application the Git path provably does not roll the workload
