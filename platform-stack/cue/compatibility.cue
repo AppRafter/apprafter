@@ -1769,8 +1769,11 @@ compatibility: "0.2.59": {
 	change:          "breaking"
 	operatorVersion: "v0.2.45"
 	notes: """
-		Three day-2 signals that nobody received, and the recovery path for a
-		moving-tag deploy (2.22c/2.22d/2.22e; D6/D8/D10/D9 in the day-2 ledger).
+		The second half of the day-2 defect sweep: signals nobody received, the
+		recovery path for a moving-tag deploy, durable Redis credentials, a
+		backup schedule you can state in local time, and a reconcile failure you
+		can see without reading a log (2.22c–2.22h; D6/D8/D10/D9/D5/D17/D2/D16
+		in the day-2 ledger).
 
 		ROLLING BACK A MOVING TAG NOW WORKS, AND IT PINS (ADR 0059). `apprafter app
 		rollback` used to patch the Git revision only, so after a same-tag push it
@@ -1855,10 +1858,24 @@ compatibility: "0.2.59": {
 		using the old never-firing check workaround (`0 6 31 2 *`) should re-run
 		with `--check off`, which now removes the CronJob outright.
 
+		A FAILING RECONCILE IS NOW VISIBLE WITHOUT READING THE OPERATOR LOG
+		(2.22h / D16). Designed failures already surfaced — `AwaitingResourceClaim`,
+		`EnvSecretMissing`, `ImageResolved`, `MigrationPending` are all conditions.
+		What vanished was the failure nobody planned for, and it cost this project
+		four incidents. `status.recentProblems[]` now carries up to five recent
+		undesigned failures per application, and `apprafter app status` prints them
+		in yellow. Entries deduplicate on their reason with a rising `count`
+		instead of writing status every retry, and they age out an hour after the
+		last sighting, so the surface lists what is broken NOW rather than what
+		once was. A healthy application shows nothing and costs zero writes.
+
 		Requires a restart: new operator image, plus the one-time Dragonfly roll
 		described above. `spec.backup.timeZone` is a new CRD field, so an OLDER
 		CLI is unaffected and a NEWER CLI against an older operator refuses
 		loudly rather than letting the apiserver prune the zone silently.
+		`status.recentProblems` needs no CRD change — the Application status
+		already carries `x-kubernetes-preserve-unknown-fields` — so an older CLI
+		simply does not print it.
 		"""
 }
 

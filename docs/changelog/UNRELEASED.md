@@ -9,12 +9,29 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
-## platform-stack 0.2.59 / operator v0.2.45 — day-2 signals, the way back from a bad build, and durable Redis credentials (2.22c–2.22g, unreleased)
+## platform-stack 0.2.59 / operator v0.2.45 / cli v0.2.52 — day-2 signals, the way back from a bad build, durable Redis credentials, and failures you can see (2.22c–2.22h, unreleased)
 
-Four defects found by rewriting the guides, and one recovery path that never
-existed. Released as one batch; nothing here has been pushed.
+The second half of the day-2 defect sweep. Released as one batch; nothing here
+has been pushed.
 
 ### Added
+
+- **A failing reconcile is visible without reading the operator log** (2.22h /
+  D16). `status.recentProblems[]` carries up to five recent UNDESIGNED failures
+  per application — the ones nobody wrote a condition for — and
+  `apprafter app status` prints them in yellow. Entries deduplicate on their
+  reason with a rising `count` rather than writing status on every retry, and
+  they age out an hour after the last sighting, so the surface lists what is
+  broken now rather than what once was. A healthy application prints nothing
+  and costs zero writes. Needs no CRD change and no new RBAC verb.
+  `APPRAFTER_PROBLEM_TTL_SECS` and `APPRAFTER_PROBLEM_REFRESH_FLOOR_SECS`
+  override the retention, and both are logged at startup so "aged out" and
+  "was never written" stay distinguishable.
+
+  Not covered: `platform status` does not print problems (the ledger is
+  per-Application), and the `app status` rendering is unit-tested rather than
+  walk-tested — the walk builds bare CRs and the command resolves an
+  application through its Argo CD registration.
 
 - **`apprafter app rollback` can roll back an image, and holds it** (ADR 0059).
   `--to sha256:<64 hex>` is an image digest; anything else is a Git revision.

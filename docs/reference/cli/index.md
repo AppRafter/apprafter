@@ -9,7 +9,7 @@ status: stable
 
 # CLI reference
 
-Generated from `cli/platform-cli/src/cli.rs` at **apprafter v0.2.51** — the release
+Generated from `cli/platform-cli/src/cli.rs` at **apprafter v0.2.52** — the release
 this whole reference describes. Every command, flag, default and alias below is
 projected straight from the parser, so this page cannot describe a flag the
 binary does not have. Run `apprafter <command> --help` for the same information

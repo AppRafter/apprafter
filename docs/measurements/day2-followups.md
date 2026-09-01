@@ -2168,7 +2168,11 @@ worth more than the assertion it was aimed at.
 operator 403 on every claim delete, every thirty seconds, and the only place
 that was visible was `kubectl logs deploy/apprafter-operator`.
 
-**Status:** OPEN.
+**Status:** FIXED 2026-09-01 (2.22h). `status.recentProblems[]` + yellow lines
+in `apprafter app status`; walk-proven in `e2e/needs-removal-walk.sh` phase 9.
+Two things the fix did NOT do, both deliberate and both recorded in plan.md:
+Events are unused (the ledger is an in-memory map flushed to the object), and
+`platform status` does not print problems — the ledger is per-Application.
 **Severity:** high — not because any single failure is severe, but because it
 makes every future failure cost a log read to find.
 
@@ -2216,6 +2220,15 @@ the 0.2.31 MigrationPlan GC, D15's plan rejection loop, and this. Every one
 was a repeating error visible only in the log.
 
 ### The proposal
+
+> **Corrected during implementation.** The premise below — that an Event from
+> `error_policy` is the single bottleneck covering every path — is WRONG, and
+> was disproved before any code was written. The incident that opened D16 never
+> reaches `error_policy`: `prune_orphaned_claims` warns and returns `Ok(())`, as
+> ADR 0048 requires, and four other sites share that shape. A design hooked only
+> on `error_policy` would have shipped D16 without covering D16. What shipped is
+> an in-memory ledger callable from BOTH classes — `error_policy` is synchronous
+> and cannot await, but it can mutate memory, which is what a ledger is.
 
 Keep the last few problems on the object, with expiry, and print them where an
 operator already looks — the owner's framing, and it maps onto machinery that
