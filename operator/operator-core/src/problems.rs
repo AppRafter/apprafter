@@ -65,6 +65,28 @@ pub const PROBLEM_REFRESH_FLOOR_SECS: i64 = 900;
 /// startup so a walk can prove ageing without waiting an hour.
 pub const DEFAULT_PROBLEM_TTL_SECS: i64 = 3600;
 
+/// The two retention knobs, together.
+///
+/// A struct rather than two loose `i64` parameters threaded through
+/// `run` → `Context`: they are one policy, they are always set together, and
+/// two adjacent same-typed arguments are the shape that silently swaps.
+#[derive(Clone, Copy, Debug)]
+pub struct ProblemTuning {
+    /// How long after its last sighting a problem is dropped.
+    pub ttl_secs: i64,
+    /// How stale a written `lastSeen` may get before a refresh write.
+    pub refresh_floor_secs: i64,
+}
+
+impl Default for ProblemTuning {
+    fn default() -> Self {
+        Self {
+            ttl_secs: DEFAULT_PROBLEM_TTL_SECS,
+            refresh_floor_secs: PROBLEM_REFRESH_FLOOR_SECS,
+        }
+    }
+}
+
 /// Longest message kept. The full text stays in the log; this is the part a
 /// human reads in `app status`.
 const MAX_MESSAGE_LEN: usize = 512;
@@ -258,10 +280,16 @@ pub fn age_out(rows: &[RecentProblem], ttl_secs: i64, now: DateTime<Utc>) -> Vec
 /// A healthy object costs ZERO writes forever: once both lists are empty,
 /// none of the four clauses can fire, and nothing on the healthy path depends
 /// on `now()`.
+/// `refresh_floor_secs` is [`PROBLEM_REFRESH_FLOOR_SECS`] in production and
+/// overridable at startup for the same reason the TTL is: at the shipped
+/// fifteen minutes, a walk cannot observe `count` accumulate without sampling
+/// for a quarter of an hour, and an assertion that cannot run is an assertion
+/// that cannot fail.
 pub fn problems_write_is_worth_it(
     written: &[RecentProblem],
     computed: &[RecentProblem],
     now: DateTime<Utc>,
+    refresh_floor_secs: i64,
 ) -> bool {
     for c in computed {
         match written.iter().find(|w| w.reason == c.reason) {
@@ -271,9 +299,7 @@ pub fn problems_write_is_worth_it(
                     return true;
                 }
                 let stale = DateTime::parse_from_rfc3339(&w.last_seen)
-                    .map(|t| {
-                        (now - t.with_timezone(&Utc)).num_seconds() >= PROBLEM_REFRESH_FLOOR_SECS
-                    })
+                    .map(|t| (now - t.with_timezone(&Utc)).num_seconds() >= refresh_floor_secs)
                     .unwrap_or(true);
                 if stale {
                     return true;
@@ -401,7 +427,12 @@ mod tests {
             "2026-09-01T10:00:00+00:00",
             1,
         )];
-        assert!(problems_write_is_worth_it(&[], &computed, now));
+        assert!(problems_write_is_worth_it(
+            &[],
+            &computed,
+            now,
+            PROBLEM_REFRESH_FLOOR_SECS
+        ));
     }
 
     #[test]
@@ -424,7 +455,12 @@ mod tests {
             "2026-09-01T10:05:00+00:00",
             11,
         )];
-        assert!(!problems_write_is_worth_it(&written, &computed, now));
+        assert!(!problems_write_is_worth_it(
+            &written,
+            &computed,
+            now,
+            PROBLEM_REFRESH_FLOOR_SECS
+        ));
     }
 
     #[test]
@@ -441,14 +477,16 @@ mod tests {
         assert!(!problems_write_is_worth_it(
             &written,
             &computed,
-            t("2026-09-01T10:00:00+00:00") + Duration::seconds(PROBLEM_REFRESH_FLOOR_SECS - 1)
+            t("2026-09-01T10:00:00+00:00") + Duration::seconds(PROBLEM_REFRESH_FLOOR_SECS - 1),
+            PROBLEM_REFRESH_FLOOR_SECS
         ));
         // At the floor: refresh, so the reader is not told a live failure is
         // fifteen minutes old.
         assert!(problems_write_is_worth_it(
             &written,
             &computed,
-            t("2026-09-01T10:00:00+00:00") + Duration::seconds(PROBLEM_REFRESH_FLOOR_SECS)
+            t("2026-09-01T10:00:00+00:00") + Duration::seconds(PROBLEM_REFRESH_FLOOR_SECS),
+            PROBLEM_REFRESH_FLOOR_SECS
         ));
     }
 
@@ -469,7 +507,12 @@ mod tests {
             "2026-09-01T10:01:00+00:00",
             3,
         )];
-        assert!(problems_write_is_worth_it(&written, &computed, now));
+        assert!(problems_write_is_worth_it(
+            &written,
+            &computed,
+            now,
+            PROBLEM_REFRESH_FLOOR_SECS
+        ));
     }
 
     #[test]
@@ -485,11 +528,11 @@ mod tests {
             1,
         )];
         assert!(
-            problems_write_is_worth_it(&written, &[], now),
+            problems_write_is_worth_it(&written, &[], now, PROBLEM_REFRESH_FLOOR_SECS),
             "the clear is due"
         );
         assert!(
-            !problems_write_is_worth_it(&[], &[], now),
+            !problems_write_is_worth_it(&[], &[], now, PROBLEM_REFRESH_FLOOR_SECS),
             "a healthy object must cost ZERO writes, forever"
         );
     }

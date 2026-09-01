@@ -2476,3 +2476,57 @@ Reading the warning was not enough. The guard that would have helped is a test
 that asserts the *wiring*, which is what shipped with this fix: any
 `patch_status` whose body mentions `size` must use `size_apply_params`. It was
 verified by reintroducing the defect and watching it name the offending line.
+
+---
+
+## D20. An approved migration can sit unexecuted, with no requeue behind it
+
+**Opened:** 2026-09-01, by the second run of the 2.22h `needs-removal` walk.
+**Status:** OPEN, and deliberately not "fixed" — see the evidence gap below.
+**Severity:** low frequency, high confusion. Observed once in five runs; when it
+happens the user's change simply never takes effect and nothing says why.
+
+### What was seen
+
+The walk approved an app-scope `MigrationPlan` and then waited five minutes for
+the gate to open. It never did. Across that window the Application controller
+reconciled the app repeatedly and never logged the prune, so the removed need's
+claim survived and the walk failed downstream — on an absent `RetainedClaim`,
+which is three steps away from the actual stall.
+
+Runs 3, 4 and 5 drove the identical path in **five milliseconds**:
+`pending-approval → approved → executing → completed`.
+
+### The evidence gap, stated plainly
+
+The failing run's diagnostics tail the operator log at 120 lines, and that
+window began *after* the approval. So the MigrationController's own lines for
+that plan — the ones that would say whether it ever saw the approval — are not
+in the record. **The cause is unproven.** What is established is that the gate
+stayed shut for five minutes on a path that normally opens instantly.
+
+### Why it is plausible rather than dismissable
+
+`reconcile.rs`'s `pending-approval` arm returns `Action::await_change()`: no
+requeue, no floor. The only thing that moves a plan out of that state is a watch
+event for the approval patch. If that event is missed, nothing retries it on a
+timer — recovery depends entirely on the watcher's next relist. Every other
+gate in this operator that can strand a user's change carries a requeue.
+
+### What would settle it
+
+A periodic requeue on the `pending-approval` arm (say 60s) would make a missed
+event self-healing and cost one no-op reconcile per plan per minute, for objects
+that are rare and short-lived. That is a small, safe change — but it should be
+made against a reproduction, not against a five-minute observation, or the
+"fix" is unfalsifiable. The walk now fails **at the gate** with the stalled
+phase named, so the next occurrence will be recorded properly instead of
+surfacing as a retention-path timeout.
+
+### The shape worth carrying
+
+The walk blamed the wrong subsystem for five minutes because it asserted an
+*effect* three steps downstream of the thing that stalled. The assertion added
+here — gate opened, before anything that depends on the gate — is the general
+form: **assert the precondition you are about to rely on, at the point you
+start relying on it.**

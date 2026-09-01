@@ -499,10 +499,12 @@ printf '  waiting for the reaper loop to report the pinned dwell ...\n'
 _dwell_seen=""
 _dwell_deadline=$(( $(date +%s) + 180 ))
 while [ "$(date +%s)" -lt "$_dwell_deadline" ]; do
-    if kubectl -n apprafter-system logs deploy/apprafter-operator --tail=-1 2>/dev/null \
-        | strip_ansi \
-        | grep 'SharedBackendReaper loop starting' \
-        | grep -q "dwell_secs=${REAP_DWELL_SECS}"; then
+    # Capture, THEN match — same SIGPIPE-under-pipefail hazard as the TTL probe
+    # in §9. Survivable here only because the inner grep narrows the stream to
+    # one line before `grep -q` sees it; that is luck, not design.
+    _dwell_logs="$(kubectl -n apprafter-system logs deploy/apprafter-operator --tail=-1 2>/dev/null | strip_ansi || true)"
+    if printf '%s\n' "$_dwell_logs" | grep 'SharedBackendReaper loop starting' \
+        | grep -c "dwell_secs=${REAP_DWELL_SECS}" >/dev/null 2>&1; then
         _dwell_seen="ok"
         break
     fi
@@ -707,6 +709,35 @@ phase "Phase 6: approve — removed claim deleted + RetainedClaim, sibling untou
 
 apprafter migration approve "$PLAN"
 
+# Assert the GATE opens before asserting what the gate releases. The app-scope
+# machine proceeds only on `CompletedMatch` (operator-core/migration_state.rs):
+# a plan that is approved but never executed reads as `BlockingMatch`, so the
+# reconcile keeps gating, the removed claim is never pruned, and the symptom is
+# an absent RetainedClaim 300s later — which blames the retention path for a
+# stall in the migration machine. Name the stall where it happens.
+#
+# "completed OR gone", never "== completed": the whole machine ran in 5ms on
+# the run that produced this assertion, and the GC then deleted the terminal
+# plan, so a poll for the phase saw a 404 and read it as `last=''`. That is
+# the 2.6b lesson again — a fast backend cannot be caught in a transient
+# state, so assert the OUTCOME. A stall still fails here, and still names the
+# phase it stalled in.
+_plan_deadline=$(( $(date +%s) + 180 ))
+_plan_phase=""
+while [ "$(date +%s)" -lt "$_plan_deadline" ]; do
+    if ! kubectl -n "$APP_NS" get migrationplan "$PLAN" >/dev/null 2>&1; then
+        _plan_phase="gone"; break
+    fi
+    _plan_phase=$(jp migrationplan "$APP_NS" "$PLAN" '{.status.phase}')
+    [ "$_plan_phase" = "completed" ] && break
+    sleep 5
+done
+case "$_plan_phase" in
+    completed|gone) printf '  ok: gate opened (plan %s)\n' "$_plan_phase" ;;
+    *) printf 'FAILED: plan %s stalled in phase %q — the gate never opened, so nothing below can pass\n' \
+        "$PLAN" "$_plan_phase" >&2; exit 1 ;;
+esac
+
 # The delete is what starts the documented retention path. Until 2.22b it
 # never ran for a removed need: nothing deleted, so no deletionTimestamp, so
 # the finalizer never fired and no snapshot was ever written.
@@ -780,7 +811,224 @@ assert_eq "control app claim survives repeated reconciles" "$ctrl_uid_final" "$C
 retry 3 5 -- kubectl -n "$APP_NS" get deployment "$APP" >/dev/null
 printf '  ok: steady after ~90s of reconciles\n'
 
+# ===============================================================
+# Phase 9 (2.22h / D16): a reconcile failure is visible WITHOUT a log read
+# ===============================================================
+# The fixture reproduces the exact incident that opened D16: during the 2.22b
+# walk the operator 403'd on every claim delete, every thirty seconds, and the
+# only trace was `kubectl logs`. `app status` said Ready and the claim simply
+# never went away — three runs and a log read to find it.
+#
+# It is reproduced by WITHHOLDING ONE VERB. `delete` specifically: the list at
+# the top of `prune_orphaned_claims` propagates normally, so withholding the
+# whole rule would produce a DIFFERENT failure (one that reaches error_policy)
+# and the walk would pass without exercising the swallow path this subphase is
+# about.
+
+phase "Phase 9: an undesigned failure surfaces in app status (2.22h / D16)"
+
+# Pin a short retention so the ageing assertion does not need an hour. The
+# operator LOGS the value at startup, so "aged out" and "was never written"
+# stay distinguishable.
+# Two knobs, both for the same reason: the shipped values (3600s TTL, 900s
+# refresh floor) make the ageing and accumulation assertions below unrunnable
+# inside a walk, and an assertion that cannot run is one that cannot fail.
+printf '  pinning APPRAFTER_PROBLEM_TTL_SECS=120 + APPRAFTER_PROBLEM_REFRESH_FLOOR_SECS=30 and confirming it took ...\n'
+_ttl_pod_before="$(operator_pod)"
+kubectl -n apprafter-system set env deploy/apprafter-operator \
+    APPRAFTER_PROBLEM_TTL_SECS=120 APPRAFTER_PROBLEM_REFRESH_FLOOR_SECS=30
+kubectl -n apprafter-system rollout status deploy/apprafter-operator --timeout=180s
+
+# Read the NEW pod by name, never `logs deploy/...`. A Deployment reference
+# resolves through the selector, which during a roll still matches the old
+# Running-but-terminating pod — and the old pod, by construction, never logged
+# the pinned value. Two runs failed here against a pod that had already logged
+# it correctly; the deployment-level read was the whole defect.
+_ttl_pod=""
+_pod_deadline=$(( $(date +%s) + 120 ))
+while [ "$(date +%s)" -lt "$_pod_deadline" ]; do
+    # Newest Running pod, sorted in the shell: `--sort-by` is not reliably
+    # honoured alongside `-o jsonpath` across kubectl versions.
+    _ttl_pod="$(kubectl -n apprafter-system get pods \
+        -l app.kubernetes.io/name=apprafter-operator \
+        --field-selector=status.phase=Running \
+        -o jsonpath='{range .items[*]}{.metadata.creationTimestamp} {.metadata.name}{"\n"}{end}' \
+        2>/dev/null | sort | tail -1 | awk '{print $2}')"
+    [ -n "$_ttl_pod" ] && [ "$_ttl_pod" != "$_ttl_pod_before" ] && break
+    sleep 5
+done
+[ -n "$_ttl_pod" ] && [ "$_ttl_pod" != "$_ttl_pod_before" ] || {
+    printf 'ERROR: no new operator pod after the env pin (before=%q now=%q)\n' \
+        "$_ttl_pod_before" "$_ttl_pod" >&2; exit 1; }
+
+# 300s: the new pod waits out the previous holder's 30s Lease before it
+# reaches this line, on top of the roll itself.
+_ttl_seen=""
+_ttl_deadline=$(( $(date +%s) + 300 ))
+while [ "$(date +%s)" -lt "$_ttl_deadline" ]; do
+    # Capture, THEN match. `kubectl logs | grep -q` cannot work under
+    # `set -o pipefail` on a large stream: `grep -q` exits on the first match
+    # and closes the pipe, `kubectl` dies of SIGPIPE, and pipefail reports the
+    # pipeline as failed — so a MATCH reads as a miss. Three runs timed out
+    # here against a pod that had logged the value correctly all along; the
+    # failure diagnostic printing `what it logged: problem_ttl_secs=120` is
+    # what finally named it.
+    _ttl_logs="$(kubectl -n apprafter-system logs "$_ttl_pod" --tail=-1 2>/dev/null | strip_ansi || true)"
+    # Two independent substring checks, not one ordered pattern: the field
+    # order in tracing's output is not a contract worth depending on.
+    case "$_ttl_logs" in *problem_ttl_secs=120*)
+        case "$_ttl_logs" in *problem_refresh_floor_secs=30*) _ttl_seen=ok; break ;; esac ;;
+    esac
+    sleep 5
+done
+[ "$_ttl_seen" = ok ] || {
+    printf 'ERROR: pod %s never logged problem_ttl_secs=120 — the pin did not land, so an absent problem below would be unattributable\n' "$_ttl_pod" >&2
+    # Say WHAT it logged instead. "Pinned to another value" and "never got the
+    # env at all" need different fixes, and a bare timeout distinguishes neither.
+    printf '  what it logged: %s\n' \
+        "$(kubectl -n apprafter-system logs "$_ttl_pod" --tail=-1 2>/dev/null | strip_ansi \
+            | grep -o 'problem_ttl_secs=[0-9]*' | tail -1)" >&2
+    printf '  env on the pod: %s\n' \
+        "$(kubectl -n apprafter-system get pod "$_ttl_pod" \
+            -o jsonpath='{range .spec.containers[*].env[?(@.name=="APPRAFTER_PROBLEM_TTL_SECS")]}{.name}={.value}{end}' 2>/dev/null)" >&2
+    exit 1; }
+printf '  ok: operator pod %s running with problem_ttl_secs=120\n' "$_ttl_pod"
+
+# Withhold `delete` on resourceclaims, exactly as the 2.22b harness gap did by
+# accident. Argo owns this ClusterRole, and automated sync was disabled in
+# Phase 1b, so the edit holds.
+#
+# The verb is toggled by re-reading the LIVE role and rewriting its rules, in
+# both directions — never by re-applying a snapshot taken before the change.
+# A snapshot carries the `resourceVersion` it was read at, and `kubectl apply`
+# turns that into an optimistic-concurrency precondition, so the restore fails
+# with a Conflict the moment anything else touches the object. That is exactly
+# how run 8 died, three assertions after the part under test had passed.
+claims_delete_verb() {   # $1 = grant | revoke
+    kubectl get clusterrole apprafter-operator -o json | python3 -c "
+import json,sys
+mode=sys.argv[1]
+r=json.load(sys.stdin)
+for rule in r['rules']:
+    if 'apprafter.io' in rule.get('apiGroups',[]) and 'resourceclaims' in rule.get('resources',[]):
+        verbs=[v for v in rule['verbs'] if v!='delete']
+        if mode=='grant':
+            verbs.append('delete')
+        rule['verbs']=verbs
+# Volatile server-owned metadata: harmless to send, but there is no reason to.
+for k in ('resourceVersion','uid','creationTimestamp','managedFields'):
+    r['metadata'].pop(k, None)
+json.dump(r,sys.stdout)" "$1" | kubectl apply -f - >/dev/null
+}
+
+printf '  withholding the resourceclaims `delete` verb ...\n'
+claims_delete_verb revoke
+retry 12 5 -- sh -c '[ "$(kubectl auth can-i delete resourceclaims.apprafter.io \
+    --as=system:serviceaccount:apprafter-system:apprafter-operator -n demo)" = "no" ]'
+printf '  ok: the operator can no longer delete resourceclaims\n'
+
+# Drop the remaining need, approve its plan, and let the prune fail.
+kubectl apply -f - >/dev/null <<EOF
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata: { name: $APP, namespace: $APP_NS }
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+EOF
+_plan=""; _pd=$(( $(date +%s) + 180 ))
+while [ "$(date +%s)" -lt "$_pd" ]; do
+    _plan=$(kubectl -n "$APP_NS" get migrationplan.apprafter.io -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+    [ -n "$_plan" ] && break
+    sleep 10
+done
+if [ -n "$_plan" ]; then
+    apprafter migration approve "$_plan" --namespace "$APP_NS" >/dev/null 2>&1 || true
+fi
+
+printf '  waiting for the failure to reach app status (one requeue) ...\n'
+_seen=""; _sd=$(( $(date +%s) + 240 ))
+while [ "$(date +%s)" -lt "$_sd" ]; do
+    _reason=$(jp "$APP_RES" "$APP_NS" "$APP" '{.status.recentProblems[0].reason}')
+    [ "$_reason" = "ClaimPruneFailed" ] && { _seen=ok; break; }
+    sleep 10
+done
+if [ "$_seen" != ok ]; then
+    printf 'ERROR: the prune 403 never reached status.recentProblems — this is exactly the invisibility D16 is about\n' >&2
+    kubectl -n "$APP_NS" get "$APP_RES" "$APP" -o jsonpath='{.status}' >&2; echo >&2
+    claims_delete_verb grant >/dev/null 2>&1 || true
+    exit 1
+fi
+
+# NOT just "a problems section exists" — that would pass for any failure, and
+# for none. The message must name what actually went wrong.
+_msg=$(jp "$APP_RES" "$APP_NS" "$APP" '{.status.recentProblems[0].message}')
+case "$_msg" in
+    *forbidden*resourceclaims*|*resourceclaims*forbidden*)
+        printf '  ok: the recorded message names the forbidden resourceclaims delete\n' ;;
+    *) printf 'ERROR: the message does not name the failure: %q\n' "$_msg" >&2
+       claims_delete_verb grant >/dev/null 2>&1 || true
+       exit 1 ;;
+esac
+
+# THE CLI hop is NOT covered here, and this says so out loud rather than
+# letting a green run imply it was. `apprafter app status` resolves an app
+# through its Argo CD registration — `find_apprafter_app_name` reads the inner
+# CR name out of the Argo Application's `status.resources[]`, which only a real
+# sync populates. This walk builds bare Application CRs with kubectl, so there
+# is no Argo app to resolve and the command correctly reports the app as
+# unregistered. Covering it needs the gitops walk's git-daemon + `app add`
+# fixture (~60 lines, host-networking-sensitive) inside a walk whose fixture is
+# a cluster-wide RBAC withdrawal. Fabricating `status.resources` to satisfy the
+# assertion was rejected: Argo owns that field and overwrites it, and an
+# assertion propped up by a forged fixture is the null-case pass this file
+# already warns about twice.
+#
+# What IS covered: the operator half, above and below — the entry reaches the
+# CR, names the real failure, deduplicates, and ages out. The rendering half is
+# unit-covered (`format_problem_lines`, 6 cases incl. the 24h horizon and the
+# empty list).
+printf '  NOT COVERED HERE: `apprafter app status` rendering of these entries — needs an Argo-registered app (owed; see the 2.22h closure note)\n'
+
+# DEDUP. A 30s retry over three minutes must produce ONE entry with a rising
+# count — not one entry per tick, which would be the firehose this replaces.
+printf '  sampling for 180s to prove it deduplicates rather than spams ...\n'
+_first_seen_a=$(jp "$APP_RES" "$APP_NS" "$APP" '{.status.recentProblems[0].firstSeen}')
+sleep 180
+_len=$(kubectl -n "$APP_NS" get "$APP_RES" "$APP" -o jsonpath='{.status.recentProblems[*].reason}' | wc -w | tr -d ' ')
+_first_seen_b=$(jp "$APP_RES" "$APP_NS" "$APP" '{.status.recentProblems[0].firstSeen}')
+_count=$(jp "$APP_RES" "$APP_NS" "$APP" '{.status.recentProblems[0].count}')
+assert_eq "one entry, not one per retry" "$_len" "1"
+assert_eq "firstSeen is stable across retries" "$_first_seen_b" "$_first_seen_a"
+# `a && b || c` cannot fail a script under `set -e` — it always exits 0. The
+# original form printed ERROR and carried on to a GREEN banner, which is the
+# silent pass this suite forbids.
+if [ "${_count:-0}" -ge 2 ]; then
+    printf '  ok: count rose to %s (the retries accumulate)\n' "$_count"
+else
+    printf 'ERROR: count did not rise (%s) — the retries are not being recorded\n' "${_count:-unset}" >&2
+    claims_delete_verb grant >/dev/null 2>&1 || true
+    exit 1
+fi
+
+# AGEING. Restore the verb; the prune succeeds, the problem stops recurring,
+# and the entry must disappear on its own within the pinned 120s TTL.
+printf '  restoring the verb; the entry must age out on its own ...\n'
+claims_delete_verb grant
+retry 12 5 -- sh -c '[ "$(kubectl auth can-i delete resourceclaims.apprafter.io \
+    --as=system:serviceaccount:apprafter-system:apprafter-operator -n demo)" = "yes" ]'
+_gone=""; _gd=$(( $(date +%s) + 300 ))
+while [ "$(date +%s)" -lt "$_gd" ]; do
+    _n=$(kubectl -n "$APP_NS" get "$APP_RES" "$APP" -o jsonpath='{.status.recentProblems[*].reason}' | wc -w | tr -d ' ')
+    [ "${_n:-0}" -eq 0 ] && { _gone=ok; break; }
+    sleep 10
+done
+[ "$_gone" = ok ] \
+    && printf '  ok: the entry aged out once the failure stopped — not a permanent scar\n' \
+    || { printf 'ERROR: the problem never aged out; a surface that lists what was once broken is one people learn not to read\n' >&2
+         kubectl -n "$APP_NS" get "$APP_RES" "$APP" -o jsonpath='{.status.recentProblems}' >&2; echo >&2; exit 1; }
+
 printf '\n'
 printf '===============================================================\n'
-printf '  GREEN — needs-removal walk passed (2.22b / D4 + D12)\n'
+printf '  GREEN — needs-removal walk passed (2.22b / D4 + D12, 2.22h / D16)\n'
 printf '===============================================================\n'

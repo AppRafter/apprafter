@@ -564,7 +564,29 @@ dump_diagnostics() {
         ns="${app%%/*}"; nm="${app##*/}"
         printf '\n=== application.apprafter.io/%s (-n %s) status ===\n' "$nm" "$ns" >&2
         kubectl -n "$ns" get application.apprafter.io "$nm" -o jsonpath=\
-'phase={.status.phase}{"\n"}conditions={range .status.conditions[*]}[{.type}={.status}: {.message}]{end}{"\n"}' \
+'uid={.metadata.uid}{"\n"}phase={.status.phase}{"\n"}needs(base)={.spec.base.needs}{"\n"}conditions={range .status.conditions[*]}[{.type}={.status}: {.message}]{end}{"\n"}' \
+            >&2 2>&1 || true
+    done
+    # The DECLARED need set (above) against the OWNED claim set (below) is the
+    # pair that explains every prune outcome: a claim survives a removal either
+    # because the spec still declares it or because its controller ownerRef uid
+    # does not match the Application's. Both halves were absent from this dump,
+    # so a needs-removal failure could only be guessed at post-mortem.
+    printf '\n--- claim -> controller ownerRef uid ---\n' >&2
+    kubectl get resourceclaims.apprafter.io -A -o jsonpath=\
+'{range .items[*]}{.metadata.namespace}/{.metadata.name} owner={range .metadata.ownerReferences[?(@.controller==true)]}{.kind}/{.name}:{.uid}{end} deleting={.metadata.deletionTimestamp}{"\n"}{end}' \
+        >&2 2>&1 || true
+    # MigrationPlans. A gated change (needs removal, destructive edit) stalls
+    # until its plan is approved AND executed, so the plan state is the first
+    # thing to read when a gated operation "never happened".
+    printf '\n--- migration plans ---\n' >&2
+    kubectl get migrationplans.apprafter.io -A >&2 2>&1 || true
+    for plan in $(kubectl get migrationplans.apprafter.io -A \
+        -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+        ns="${plan%%/*}"; nm="${plan##*/}"
+        printf '\n=== migrationplan/%s (-n %s) ===\n' "$nm" "$ns" >&2
+        kubectl -n "$ns" get migrationplan.apprafter.io "$nm" -o jsonpath=\
+'trigger={.spec.trigger} class={.spec.classification} app={.spec.applicationRef.name}{"\n"}phase={.status.phase} approvedAt={.status.approvedAt} message={.status.message}{"\n"}' \
             >&2 2>&1 || true
     done
     printf '\n--- recent events ---\n' >&2

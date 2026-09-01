@@ -207,9 +207,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(operator_core::problems::DEFAULT_PROBLEM_TTL_SECS);
+    // Same knob class, same reason: at the shipped 900s floor a walk cannot
+    // observe `count` accumulate without sampling for a quarter of an hour.
+    let problem_refresh_floor_secs: i64 = env::var("APPRAFTER_PROBLEM_REFRESH_FLOOR_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(operator_core::problems::PROBLEM_REFRESH_FLOOR_SECS);
     info!(
         problem_ttl_secs,
-        "recent-problem retention configured (2.22h / D16)"
+        problem_refresh_floor_secs, "recent-problem retention configured (2.22h / D16)"
     );
 
     // 2.9 (ADR 0044): the active environment is now a PER-CR property
@@ -226,7 +232,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 gateway_api,
                 vpa,
                 in_place,
-                problem_ttl_secs,
+                operator_core::problems::ProblemTuning {
+                    ttl_secs: problem_ttl_secs,
+                    refresh_floor_secs: problem_refresh_floor_secs,
+                },
             )
             .await
             {

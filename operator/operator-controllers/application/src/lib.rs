@@ -138,10 +138,11 @@ pub struct Context {
     /// SYNCHRONOUS and cannot await — records into it, and the async reconcile
     /// reads it back on its next pass.
     pub problems: Arc<operator_core::problems::ProblemLedger>,
-    /// How long after its last sighting a problem is dropped from the object.
-    /// Pinned by `APPRAFTER_PROBLEM_TTL_SECS` so a walk can prove ageing
-    /// without waiting an hour.
-    pub problem_ttl_secs: i64,
+    /// Retention policy for the ledger above. Both knobs are pinned by env
+    /// (`APPRAFTER_PROBLEM_TTL_SECS`, `APPRAFTER_PROBLEM_REFRESH_FLOOR_SECS`)
+    /// so a walk can prove ageing and accumulation without waiting an hour and
+    /// a quarter respectively.
+    pub problem_tuning: operator_core::problems::ProblemTuning,
 }
 
 #[derive(Debug, Error)]
@@ -172,7 +173,7 @@ pub async fn run(
     gateway_api_available: bool,
     vpa_available: std::sync::Arc<std::sync::atomic::AtomicBool>,
     in_place_resize_supported: bool,
-    problem_ttl_secs: i64,
+    problem_tuning: operator_core::problems::ProblemTuning,
 ) -> Result<(), ReconcileError> {
     let apps: Api<Application> = Api::all(client.clone());
     // 2.4d: watch child ResourceClaims so the provisioner flipping a
@@ -195,7 +196,7 @@ pub async fn run(
         vpa_available,
         in_place_resize_supported,
         problems: Arc::new(operator_core::problems::ProblemLedger::new()),
-        problem_ttl_secs,
+        problem_tuning,
     });
 
     Controller::new(apps, watcher::Config::default())
@@ -1270,9 +1271,14 @@ async fn flush_problems(ctx: &Context, app: &Application) {
             merged.push(w.clone());
         }
     }
-    let computed = operator_core::problems::age_out(&merged, ctx.problem_ttl_secs, now);
+    let computed = operator_core::problems::age_out(&merged, ctx.problem_tuning.ttl_secs, now);
 
-    if !operator_core::problems::problems_write_is_worth_it(&written, &computed, now) {
+    if !operator_core::problems::problems_write_is_worth_it(
+        &written,
+        &computed,
+        now,
+        ctx.problem_tuning.refresh_floor_secs,
+    ) {
         return;
     }
 
