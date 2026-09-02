@@ -2996,3 +2996,82 @@ its first assertion, on any cluster, since that change shipped. That is the
 concrete reason 2.22d recorded the VPA walk as "code ready, never run": it was
 not merely unrun, it was unrunnable. Both now pass the SKU explicitly, with the
 same default and override as `mvp.sh`.
+
+---
+
+## D26. A `sequential` backup restores empty, and says it succeeded
+
+**Opened:** 2026-09-02, by `e2e/backup-s3-sequential-kind.sh` — the first run
+in the walk's life to reach its own subject.
+**Status:** OPEN. Not fixed here: the fix is a feature-sized change to a
+data-integrity path and deserves its own design, not a patch tacked onto a
+test-fixing session.
+**Severity:** high for anyone who sets it, none for anyone who does not.
+`stagingMode` defaults to `monolithic` (`schemas/v1alpha1/platformstack.cue:92`,
+`backup.rs:100`), and monolithic restores correctly — proven end-to-end on real
+Hetzner the same day. But `sequential` is a shipped, documented opt-in
+(`apprafter backup enable --staging-mode sequential`, and an enum value in the
+CRD), and choosing it produces backups that cannot be restored.
+
+### The evidence chain
+
+The BACKUP half is correct, and the walk proves it:
+
+```text
+ok: restic lists 3 snapshots (>=3 for 2 claims + manifest)
+ok: all sequential snapshots share exactly ONE run tag = 1
+ok: the FINAL (latest) snapshot is the manifest/commit snapshot (carries manifest.json)
+```
+
+The RESTORE half never learned the format. `RestoreStep::RestoreArtifact`
+(`restore.rs:240-246`) runs `restic restore` for exactly ONE snapshot — `latest`,
+which is the commit/manifest snapshot — into a temp root, and `LoadData`
+(`restore.rs:296-304` → `load_data` at :747 → `load_pg_dumps` at :761) then reads
+`data/pg/<ns>/<claim>.dump` out of that extracted directory. It never invokes
+restic itself. For a monolithic backup that is right: one snapshot holds
+everything. For a sequential one the per-claim payloads are in the OTHER
+snapshots, so `data/pg` does not exist, `load_pg_dumps` iterates an empty set,
+and the restore finishes reporting success:
+
+```text
+✓ PlatformStack applied
+✓ namespaces ensured: demo
+✓ 1 app(s) applied gated (replicas=0, Argo auto-sync stripped)
+✓ 2 claim(s) ready
+✓ Restored backup of cluster 'platform' into target 'fresh'
+  mode:       full
+```
+
+and the restored database is empty:
+
+```text
+psql said: ERROR:  relation "app_data" does not exist
+```
+
+`grep -rni sequential` over the whole restore path
+(`platform-cli/src/commands/restore.rs`, `backup-core/src/restore.rs`,
+`backup-core/src/extract.rs`) returns **nothing**. The concept does not exist
+there.
+
+### What a fix has to do
+
+Read the manifest (already extracted from the commit snapshot), take its run
+tag, list the snapshots carrying it, and restore each per-claim snapshot into
+the same data root before `LoadData` runs — i.e. make `RestoreArtifact`
+format-aware instead of snapshot-singular. The walk already asserts everything
+needed to verify it: the snapshot set, the single tag, the manifest-last
+ordering, and a known row on both sides.
+
+### Why it took this long to see
+
+The walk that tests it had never once reached Phase 5. It was blocked first by
+an unguarded CiliumNetworkPolicy that wedged the whole platform sync (fixed in
+platform-stack 0.2.60), then by its own fixture declaring the redis claim
+ephemeral while demanding its data survive a restore, then by a psql readiness
+race whose stderr was discarded — each failure masking the next. A backup format
+shipped with a CLI flag and a CRD enum had no working end-to-end test, and the
+first time one ran it found the format unrestorable.
+
+**The pattern is the one this file keeps recording**: not a careless
+implementation — the sequential writer is careful and correct — but an output
+nobody ever read back. Same shape as D10, D18, D19 and D22.

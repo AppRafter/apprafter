@@ -513,8 +513,18 @@ spec:
     needs:
       pg:
         selector: { tier: integrated }
+      # `persistent: true` is LOAD-BEARING here, and its absence made this walk
+      # assert something impossible. An ephemeral redis claim holds nothing
+      # durable by declaration (ADR 0042 §6), so the backup runner correctly
+      # skips it — the first run to reach Phase 5 produced exactly two
+      # snapshots, `claim-0` (pg) and `commit`, against an expectation of
+      # three. Phase 7 then checks that a redis KEY survives the restore, which
+      # an ephemeral claim can never do. The walk's subject is the SEQUENTIAL
+      # format across MULTIPLE claims, so the fix is to give it a second
+      # backable claim rather than to lower the expectation to one.
       redis:
         selector: { tier: integrated }
+        persistent: true
 YAML
 }
 
@@ -868,9 +878,27 @@ else
     # The KNOWN pg row is present (proves the per-claim pg snapshot restored).
     rpg_url=$(kubectl -n "$APP_NS" get secret "$PG_CONN" -o jsonpath='{.data.url}' 2>/dev/null | base64 -d || true)
     [ -n "$rpg_url" ] || { printf 'FAILED: restored pg connection url missing\n' >&2; exit 1; }
-    rpg_count=$(kubectl -n "$APP_NS" exec "$RPOD" -- psql "$rpg_url" -tAc \
-        "SELECT count(*) FROM app_data WHERE payload='s3seq-known-payload';" 2>/dev/null | tr -d '[:space:]' || true)
-    assert_eq "backed-up pg row restored into the fresh cluster (sequential per-claim snapshot)" "$rpg_count" "1"
+    # Wait for Postgres on the RESTORED cluster to accept connections before
+    # asking it anything. A claim goes Ready once its Database CR and Secret
+    # exist, which is well before CNPG finishes bringing the instance up — the
+    # same race Phase 1 hits on the source. Without this the query below fails
+    # to connect and, because its stderr was discarded, reported as an empty
+    # count: indistinguishable from "the restore did not replay the data".
+    printf '  waiting for Postgres on the restored cluster to accept connections ...\n'
+    retry 60 5 -- kubectl -n "$APP_NS" exec "$RPOD" -- psql "$rpg_url" -v ON_ERROR_STOP=1 -c "SELECT 1" >/dev/null
+
+    # stderr KEPT. Swallowing it is what made the previous failure unreadable.
+    rpg_out=$(kubectl -n "$APP_NS" exec "$RPOD" -- psql "$rpg_url" -tAc \
+        "SELECT count(*) FROM app_data WHERE payload='s3seq-known-payload';" 2>&1 || true)
+    rpg_count=$(printf '%s' "$rpg_out" | tr -d '[:space:]')
+    if [ "$rpg_count" != "1" ]; then
+        printf 'FAILED: backed-up pg row restored into the fresh cluster (sequential per-claim snapshot) — got %q, want 1\n' "$rpg_count" >&2
+        printf '  psql said: %s\n' "$rpg_out" >&2
+        printf '  --- tables visible to the restored role ---\n' >&2
+        kubectl -n "$APP_NS" exec "$RPOD" -- psql "$rpg_url" -tAc '\dt' >&2 2>&1 || true
+        exit 1
+    fi
+    printf '  ok: backed-up pg row restored into the fresh cluster (sequential per-claim snapshot) = %s\n' "$rpg_count"
     # The redis claim re-provisioned Ready (its per-claim snapshot restored; a
     # deterministic redis-key round-trip is exercised by the needs-redis walk —
     # here the claim-Ready + pg-row prove the multi-claim sequential set restores).
