@@ -31,6 +31,7 @@ lint:
     ./scripts/docs-check.sh
     ./scripts/check-crd-structural.sh
     ./scripts/check-operator-version-bump.sh
+    ./scripts/check-cli-version-bump.sh
     # cli/ and operator/ are SEPARATE Cargo workspaces (no top-level
     # Cargo.toml), so cargo must run from inside each — matching CI
     # (.github/workflows/lint.yml runs fmt+clippy per workspace). The
