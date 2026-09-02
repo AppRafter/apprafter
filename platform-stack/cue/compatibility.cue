@@ -1760,6 +1760,46 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.61": {
+	change:          "safe"
+	operatorVersion: "v0.2.45"
+	notes: """
+		The scheduled backup runs the runner it is supposed to run.
+
+		`#BackupValues.image` — the literal that decides which published
+		`apprafter-backup` image the nightly CronJob executes — had not moved
+		since 2026-07-17. Fifteen runner images were published past it
+		(v0.2.34..v0.2.53) and eighteen chart versions shipped without touching
+		it (0.2.43..0.2.60), so every cluster with backup enabled kept executing
+		v0.2.33. It is now v0.2.53.
+
+		WHAT THAT COST, CONCRETELY: persistent-Redis extraction shipped in
+		`backup-core` on 2026-08-28 and reached the CLI immediately, because
+		`apprafter backup` is the CLI binary. It never reached the CronJob. A
+		cluster whose `needs.redis` claim is `persistent: true` therefore had its
+		Redis captured when an operator ran a backup by hand, and NOT captured by
+		the scheduled off-site backup that runs every night — while the release
+		notes said the capability had shipped, which it had, to one of the two
+		frontends.
+
+		Nothing failed. That is the whole difficulty of it: a stale runner starts,
+		exits zero, writes a snapshot and reports success. It simply does less
+		than the version you believe you deployed, and every green check agrees
+		with it, because they were all checking the same old binary.
+
+		NO ACTION IS REQUIRED. The next scheduled Job creates its pods from the
+		new image. Existing snapshots stay readable — the repository format did
+		not change, and `restore` has always run from the CLI, never from this
+		image. If a `persistent: true` Redis claim matters to you, the first
+		nightly run after this upgrade is the first one that captures it, so
+		treat any earlier off-site snapshot as not containing it.
+
+		`scripts/check-backup-runner-pin.sh` now fails CI when the runner changes
+		without this pin following it, so this cannot recur quietly.
+		"""
+	references: ["docs/adr/0050-backup-restore.md"]
+}
+
 compatibility: "0.2.60": {
 	change:          "safe"
 	operatorVersion: "v0.2.45"

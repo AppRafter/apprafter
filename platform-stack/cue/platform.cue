@@ -367,11 +367,24 @@ package platformstack
 	enabled: bool | *false
 
 	// Runner container image (the `apprafter-backup` binary + restic +
-	// a shell). Pinned to the released runner image; the
-	// `release-backup-runner.yml` workflow publishes this tag from
-	// `cli/Cargo.toml` `workspace.package.version`, and chart bumps roll
-	// it forward in lockstep with the CLI.
-	image: string | *"ghcr.io/apprafter/apprafter-backup:v0.2.33"
+	// a shell). `release-backup-runner.yml` publishes this tag from
+	// `cli/Cargo.toml` `workspace.package.version` on every master push
+	// touching `cli/apprafter-backup/**` or `cli/backup-core/**`, and
+	// THIS LINE is the only thing that decides which of those published
+	// images a cluster actually runs.
+	//
+	// The lockstep the previous comment asserted was never enforced, and
+	// it broke: the pin sat at v0.2.33 from 2026-07-17 to 2026-09-02,
+	// fifteen runner images were published past it (v0.2.34..v0.2.53) and
+	// eighteen chart versions shipped without moving it (0.2.43..0.2.60).
+	// Across that window `cli/backup-core/src/extract.rs` gained
+	// persistent-Redis extraction (T12, 5cec8c6), so the scheduled CronJob
+	// kept running a binary that could not do what the release notes said
+	// it did — silently, because a stale image is a working image.
+	//
+	// `scripts/check-backup-runner-pin.sh` now fails CI when a published
+	// runner is newer than this line, so the next drift is loud.
+	image: string | *"ghcr.io/apprafter/apprafter-backup:v0.2.53"
 
 	// Cron schedule for the full backup Job. Default nightly 03:00.
 	schedule: string | *"0 3 * * *"
@@ -492,7 +505,7 @@ package platformstack
 // — a bump that forgets the compatibility entry fails `cue vet
 // -c` with an "incomplete value" error pointing at the missing
 // fields, before the publish workflow ever runs.
-currentVersion: #Version & "0.2.60"
+currentVersion: #Version & "0.2.61"
 
 // `_components` is the package-level base set, populated by
 // every `cue/component_<name>.cue` file declaring
