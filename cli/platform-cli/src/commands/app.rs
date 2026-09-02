@@ -885,6 +885,13 @@ fn print_app_detail(app: &Value, show_resources: bool, kubeconfig_path: &Path) {
                     if let Some(phase) = cr.pointer("/status/phase").and_then(Value::as_str) {
                         println!("AppRafter phase: {phase}");
                     }
+                    // D7: the phase is the failure's NAME. Immediately under
+                    // it, its EXPLANATION — the reason and the operator's
+                    // message — because a reader who has to run kubectl to
+                    // learn why is exactly the reader that entry is about.
+                    if let Some(why) = format_not_ready_line(&cr) {
+                        println!("{}", style::warn(&why));
+                    }
                     // ADR 0040: surface the running image digest the
                     // operator resolved from base.image's tag. Omitted
                     // when status.image is absent (resolve: off, or
@@ -3411,6 +3418,65 @@ fn age_secs(stamp: &str, now: &chrono::DateTime<chrono::Utc>) -> Option<i64> {
 /// the repository sees `:latest` and cannot know the cluster is deliberately
 /// holding an older digest. So this is not decoration — it is the only place
 /// the truth exists, which is also why it names the way out.
+/// The `Ready=False` reason and its message, for an application that is not
+/// Ready — `None` while it is.
+///
+/// # Why this exists
+///
+/// Ledger entry D7 is titled "the CLI cannot answer the question its own error
+/// asks", and 2.22c answered only half of it. The operator's diagnostic became
+/// genuinely good — `env STRIPE_KEY → secret "appsecret/token": Secret
+/// "appsecret" exists in namespace "demo" but carries no key "token" (it
+/// carries: api_key, url)` names the cause, the namespace, and the keys that
+/// ARE there, which is what separates "no Secret", "wrong namespace" and
+/// "wrong spelling" without a second command.
+///
+/// It then went nowhere a user looks. `app status` printed
+/// `AppRafter phase: EnvSecretMissing` and stopped; the message lived in
+/// `status.conditions[type=Ready].message`, and no CLI surface read it — not
+/// `app status`, not `app list`, not `platform status`. `secret list` cannot
+/// stand in for it either: it renders key names out of the SealedSecret's own
+/// `spec.encryptedData` without decrypting anything or reading the resulting
+/// Secret, so it answers what was DECLARED, never whether it materialised.
+///
+/// So the fix that made the answer available left the reader exactly where
+/// they started — at `kubectl get application -o yaml`. This prints it.
+///
+/// Deliberately not restricted to `EnvSecretMissing`: every reason the
+/// operator sets carries a message written to be read, and a status command
+/// that shows a failure's NAME while withholding its EXPLANATION is the defect
+/// D7 describes, whatever the reason happens to be.
+pub(crate) fn format_not_ready_line(cr: &Value) -> Option<String> {
+    let conds = cr.pointer("/status/conditions")?.as_array()?;
+    let ready = conds
+        .iter()
+        .find(|c| c.get("type").and_then(Value::as_str) == Some("Ready"))?;
+    if ready.get("status").and_then(Value::as_str) == Some("True") {
+        return None;
+    }
+    let message = ready.get("message").and_then(Value::as_str)?;
+    if message.is_empty() {
+        return None;
+    }
+    // The operator joins per-ref diagnostics with "; " into one line, which is
+    // unreadable at three refs. Split it back out, one per line, under a
+    // heading that names the reason.
+    let reason = ready
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("NotReady");
+    let mut line = format!("  {reason}:");
+    let parts: Vec<&str> = message.split("; ").filter(|p| !p.is_empty()).collect();
+    if parts.len() <= 1 {
+        line.push_str(&format!(" {message}"));
+    } else {
+        for p in parts {
+            line.push_str(&format!("\n                   {p}"));
+        }
+    }
+    Some(line)
+}
+
 pub(crate) fn format_pin_line(cr: &Value) -> Option<String> {
     let pinned = cr.pointer("/status/image/pinned")?;
     let reference = pinned.get("resolved").and_then(Value::as_str)?;
@@ -4699,6 +4765,82 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("apprafter app unpin web"), "{line}");
+    }
+
+    // -----------------------------------------------------------------
+    // D7 — `app status` explains a failure, it does not merely name it
+    // -----------------------------------------------------------------
+
+    fn env_secret_missing_cr(message: &str) -> Value {
+        json!({
+            "status": {
+                "phase": "EnvSecretMissing",
+                "conditions": [
+                    { "type": "Ready", "status": "False",
+                      "reason": "EnvSecretMissing", "message": message }
+                ]
+            }
+        })
+    }
+
+    #[test]
+    fn a_not_ready_app_shows_the_operators_diagnostic_not_just_the_phase() {
+        // The whole of D7: this message names the cause, the namespace and
+        // the keys the Secret DOES carry, and until now the only way to read
+        // it was `kubectl get application -o yaml`.
+        let msg = "env STRIPE_KEY → secret \"appsecret/token\": Secret \"appsecret\" \
+                   exists in namespace \"demo\" but carries no key \"token\" \
+                   (it carries: api_key, url)";
+        let line = format_not_ready_line(&env_secret_missing_cr(msg)).expect("a reason line");
+        assert!(
+            line.contains("EnvSecretMissing"),
+            "names the reason: {line}"
+        );
+        assert!(
+            line.contains("carries no key"),
+            "carries the diagnostic: {line}"
+        );
+        assert!(
+            line.contains("namespace \"demo\""),
+            "names the namespace: {line}"
+        );
+        assert!(line.contains("api_key"), "lists the available keys: {line}");
+    }
+
+    #[test]
+    fn several_unresolved_refs_are_split_one_per_line() {
+        // The operator joins them with "; " into a single line, which at three
+        // refs is a wall. One per line, or the reader skims past the one that
+        // matters.
+        let msg = "env A → secret \"s/a\": missing; env B → secret \"s/b\": missing; \
+                   env C → secret \"s/c\": missing";
+        let line = format_not_ready_line(&env_secret_missing_cr(msg)).expect("a reason line");
+        assert_eq!(
+            line.lines().count(),
+            4,
+            "heading + one line per ref: {line}"
+        );
+        assert!(
+            !line.contains("; "),
+            "the join is undone, not reprinted: {line}"
+        );
+    }
+
+    #[test]
+    fn a_ready_app_prints_no_reason_line() {
+        let ready = json!({
+            "status": { "phase": "Ready", "conditions": [
+                { "type": "Ready", "status": "True", "reason": "Reconciled",
+                  "message": "Reconcile completed; child Deployment applied." }
+            ]}
+        });
+        assert!(
+            format_not_ready_line(&ready).is_none(),
+            "a healthy app must not carry a yellow line explaining its health"
+        );
+        // And the degenerate shapes: no status, no conditions, empty message.
+        assert!(format_not_ready_line(&json!({})).is_none());
+        assert!(format_not_ready_line(&env_secret_missing_cr("")).is_none());
     }
 
     #[test]
