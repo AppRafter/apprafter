@@ -80,22 +80,61 @@ pub fn parse_labelled_gauge(text: &str, metric: &str, label: &str, value: &str) 
 /// called it, which is the lesson the ADR 0048 anchor-403 freeze cost.
 ///
 /// Requires `get` on `pods/proxy`, granted alongside the code that uses it.
+///
+/// Returns the apiserver's own error text on failure rather than swallowing
+/// it. The 2.22 e2e battery spent two runs establishing only that this
+/// produced nothing: the reason was logged at `debug!` and therefore invisible
+/// in every deployment. A scrape that cannot say why it failed is a signal
+/// that cannot be fixed.
 pub async fn scrape_pod(
     client: &kube::Client,
     namespace: &str,
     pod: &str,
     port: u16,
     path: &str,
-) -> Option<String> {
+) -> Result<String, String> {
     let url = format!("/api/v1/namespaces/{namespace}/pods/{pod}:{port}/proxy{path}");
-    let req = http::Request::get(&url).body(Vec::new()).ok()?;
-    match client.request_text(req).await {
-        Ok(body) => Some(body),
-        Err(e) => {
-            tracing::debug!(%namespace, %pod, error = %e, "pod-proxy scrape failed (continuing without it)");
-            None
+    let req = http::Request::get(&url)
+        .body(Vec::new())
+        .map_err(|e| format!("building the pod-proxy request: {e}"))?;
+    client
+        .request_text(req)
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))
+}
+
+/// Every value a given label takes on a given metric, in the scraped body.
+///
+/// The companion to [`parse_labelled_gauge`]: when a lookup misses, this is
+/// what turns "not found" into "found these instead", which is the difference
+/// between a metric that is absent and a label value that is wrong.
+pub fn label_values(body: &str, metric: &str, label: &str) -> Vec<String> {
+    let needle = format!("{label}=\"");
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || !line.starts_with(metric) {
+            continue;
+        }
+        let Some(open) = line.find('{') else { continue };
+        let Some(close) = line.find('}') else {
+            continue;
+        };
+        if close <= open {
+            continue;
+        }
+        for part in line[open + 1..close].split(',') {
+            let part = part.trim();
+            if let Some(rest) = part.strip_prefix(&needle) {
+                if let Some(v) = rest.strip_suffix('"') {
+                    out.push(v.to_string());
+                }
+            }
         }
     }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// TTL cache for scraped metric bodies, keyed by `namespace/pod`.
@@ -122,7 +161,8 @@ impl MetricsCache {
     }
 
     /// Scrape `pod`, serving a cached body while it is younger than the TTL.
-    /// `None` on any failure, never an `Err`.
+    /// Only successes are cached, so a failing endpoint is retried every tick
+    /// rather than having its failure remembered.
     pub async fn body_for_pod(
         &self,
         client: &kube::Client,
@@ -130,12 +170,12 @@ impl MetricsCache {
         pod: &str,
         port: u16,
         path: &str,
-    ) -> Option<String> {
+    ) -> Result<String, String> {
         let key = format!("{namespace}/{pod}");
         if let Ok(map) = self.entries.lock() {
             if let Some((at, body)) = map.get(&key) {
                 if at.elapsed() < self.ttl {
-                    return Some(body.clone());
+                    return Ok(body.clone());
                 }
             }
         }
@@ -143,7 +183,7 @@ impl MetricsCache {
         if let Ok(mut map) = self.entries.lock() {
             map.insert(key, (std::time::Instant::now(), body.clone()));
         }
-        Some(body)
+        Ok(body)
     }
 }
 

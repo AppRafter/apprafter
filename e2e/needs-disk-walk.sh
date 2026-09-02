@@ -463,6 +463,12 @@ for _crd in applications serviceproviders resourceclaims retainedclaims; do
 done
 printf '  branch CRDs applied + Established\n'
 
+# The IMAGE is the branch's; the cluster's RBAC is still the published
+# chart's. A verb added in the same commit as the code that needs it would
+# 403 here and nowhere else — which is exactly how the D8 Postgres sampler
+# read as "inert" for three battery runs.
+apply_branch_operator_rbac
+
 # The released operator ClusterRole predates the 2.6b PVC RBAC (Backend::Disk
 # SSA-applies a PersistentVolumeClaim). Grant it ADDITIVELY via a dedicated
 # ClusterRole — do NOT replace the operator's ClusterRole: a standalone
@@ -874,6 +880,88 @@ assert_eq "${MOUNT_PATH}/probe survived the pod restart" "$survived" "durable-di
 #          PVC survives the grace floor, a redeploy reattaches the SAME PVC
 # ===============================================================
 
+# The sqlite Application, applied identically wherever it is (re)created —
+# Phase 9's reattach and Phase 9b's state restore must not drift apart.
+apply_sqlite_app() {
+kubectl apply -f - <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${APP}
+  namespace: ${APP_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+    replicas: 1
+    expose:
+      port: 80
+    needs:
+      disk:
+        size: 1Gi
+        mountPath: ${MOUNT_PATH}
+YAML
+}
+
+# ---- 2.22d / D8: the sampled disk capacity ----
+#
+# Asserted HERE, not at provision time, and the placement is the point: the
+# kubelet reports volume statistics only for volumes it has MOUNTED, so the
+# figure cannot exist until a pod is running on the PVC. Phase 7 mounted it and
+# Phase 8 just wrote through it, so by now the only thing left to prove is that
+# the operator SAMPLES it.
+#
+# This is the figure `app status` prints and `volume status` reports, and
+# until now NO walk asserted it — so the sampler could have been inert on
+# every cluster we ever ran and the whole suite would still have been green.
+# It was: `status.capacity` was sampled only inside `provision_disk`, which
+# runs once, before any pod exists, and the 60s refresh skipped every
+# non-`pg` type. Built, unit-tested, unreachable — the same shape as D10,
+# D18 and D19.
+# PRECONDITION, probed rather than assumed. The kubelet publishes volume
+# statistics only for volume plugins that implement a metrics provider, and a
+# hostPath-backed volume — what local-path-provisioner hands out on kind — does
+# not. On such a cluster an absent figure is CORRECT, and asserting it would
+# make the walk fail for a property of the environment.
+#
+# So probe the kubelet directly and branch LOUDLY. This is not a silent skip:
+# it prints what it found and what that defers, and the assertion still runs
+# in full wherever the statistics exist (a real node, which is where the
+# figure matters).
+_node=$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+_summary=$(kubectl get --raw "/api/v1/nodes/${_node}/proxy/stats/summary" 2>/dev/null || true)
+case "$_summary" in
+  *pvcRef*)
+    printf '  waiting for the sampled disk capacity to land (60s refresh) ...\n'
+    _cap_deadline=$(( $(date +%s) + 240 ))
+    _used=""; _total=""
+    while [ "$(date +%s)" -lt "$_cap_deadline" ]; do
+        _used=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.status.capacity.usedBytes}')
+        _total=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.status.capacity.capacityBytes}')
+        [ -n "$_total" ] && [ "${_total:-0}" -gt 0 ] 2>/dev/null && break
+        sleep 10
+    done
+    case "$_total" in
+        ''|*[!0-9]*) printf 'ERROR: status.capacity.capacityBytes never became a number (last=%q) — the D8 disk sampler is not reaching the claim\n' "$_total" >&2; exit 1 ;;
+    esac
+    [ "$_total" -gt 0 ] || { printf 'ERROR: capacityBytes is %s — a zero denominator makes the fullness fraction meaningless\n' "$_total" >&2; exit 1; }
+    case "$_used" in
+        ''|*[!0-9]*) printf 'ERROR: status.capacity.usedBytes is not a number (last=%q)\n' "$_used" >&2; exit 1 ;;
+    esac
+    [ "$_used" -le "$_total" ] || { printf 'ERROR: usedBytes %s exceeds capacityBytes %s\n' "$_used" "$_total" >&2; exit 1; }
+    printf '  ok: sampled disk capacity = %s/%s bytes used\n' "$_used" "$_total"
+    ;;
+  *)
+    printf '  SKIP (environment, not a pass): the kubelet on %s publishes no per-volume statistics\n' "$_node"
+    printf '        at all, so status.capacity cannot exist here. local-path hands out hostPath\n'
+    printf '        volumes and the hostPath plugin has no metrics provider. The 60s refresh arm\n'
+    printf '        IS running (see the operator log: "disk usage has never been measured"), and\n'
+    printf '        the figure itself is owed to the real-hardware batch.\n'
+    ;;
+esac
+
+
 phase "Phase 9: delete Application — disk RetainedClaim + PVC survives grace; redeploy reattaches"
 
 # Delete the APPLICATION, not just the ResourceClaim: the claim is owned
@@ -914,25 +1002,7 @@ assert_eq "PVC STILL present during grace (unowned, retained)" "$pvc_floor" "$PV
 #      SAME PVC (idempotent SSA), cancels the RetainedClaim, and the data
 #      written in Phase 8 is STILL there (survives delete + redeploy) -----
 printf '  re-applying the sqlite Application (must reattach the SAME PVC) ...\n'
-kubectl apply -f - <<YAML
-apiVersion: apprafter.io/v1alpha1
-kind: Application
-metadata:
-  name: ${APP}
-  namespace: ${APP_NS}
-  labels:
-    apprafter.io/managed-by: apprafter
-spec:
-  base:
-    image: nginxdemos/hello:plain-text
-    replicas: 1
-    expose:
-      port: 80
-    needs:
-      disk:
-        size: 1Gi
-        mountPath: ${MOUNT_PATH}
-YAML
+apply_sqlite_app
 
 # The re-provision reattaches the SAME PVC name (status.volumeClaimRef
 # unchanged) and cancels the RetainedClaim (cancel-on-reprovision).
@@ -962,6 +1032,71 @@ assert_eq "${MOUNT_PATH}/probe survived delete + redeploy (data reattached)" \
 # Phase 10: force GC (2.6b-5) — re-create the RetainedClaim with a past
 #           retainUntil; gc_drop_disk deletes the PVC + the snapshot
 # ===============================================================
+
+# ===============================================================
+# Phase 9b: a SECOND deletion inside the grace window must not wedge
+# ===============================================================
+
+phase "Phase 9b: delete again while a snapshot survives — the finalizer still releases"
+
+# THE DEADLOCK THIS PINS (found by the 2.22 battery, on this walk).
+#
+# `snapshot_retained_claim` runs BEFORE the provisioner releases its
+# finalizer, and it used to apply the snapshot blind, on the stated assumption
+# that a repeat is "byte-identical". It is not: the snapshot name is
+# deterministic, its spec is IMMUTABLE by admission, and `retainUntil` is
+# derived from THIS deletion timestamp. So a claim deleted, retained,
+# recreated and deleted again inside the grace window applied a different
+# `retainUntil` against the same name, got
+#
+#   RetainedClaim ... is invalid: spec: Invalid value: spec is immutable
+#
+# and never reached the finalizer release. The claim sat in Terminating
+# forever and its Application sat at `paused awaiting ResourceClaim
+# provisioning` forever — recoverable only by a human editing off a finalizer.
+#
+# Reproduced deterministically rather than by racing a re-apply: plant the
+# surviving snapshot explicitly, then delete. Phase 10's own comment already
+# records that this object is immutable, which is exactly why a blind re-apply
+# could never have worked.
+PLANTED_RETAIN="2031-01-01T00:00:00Z"
+printf '  planting a surviving RetainedClaim (retainUntil %s) ...\n' "$PLANTED_RETAIN"
+kubectl apply -f - >/dev/null <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: RetainedClaim
+metadata:
+  name: ${RETAINED}
+  namespace: ${RETAINED_NS}
+spec:
+  claimRef:
+    name: ${CLAIM}
+    namespace: ${APP_NS}
+  provider: ${PROVIDER}
+  backend: disk
+  volumeClaimRef: ${PVC}
+  volumeClaimNamespace: ${APP_NS}
+  retainUntil: "${PLANTED_RETAIN}"
+YAML
+
+kubectl delete "$APP_RES" "$APP" -n "$APP_NS" --wait=true
+
+# THE assertion: the claim actually goes away. Before the fix it stayed in
+# Terminating indefinitely, retrying the same 422 every thirty seconds.
+wait_gone "$CLAIM_RES" "$APP_NS" "$CLAIM" 180
+printf '  ok: the claim finished deleting despite a surviving snapshot\n'
+
+# The grace clock did NOT restart. Re-applying with the newer timestamp —
+# even if admission allowed it — would let a delete/recreate/delete loop
+# extend a seven-day window without bound.
+rc_still=$(jp retainedclaim "$RETAINED_NS" "$RETAINED" '{.spec.retainUntil}')
+assert_eq "grace clock unchanged by the second deletion" "$rc_still" "$PLANTED_RETAIN"
+
+# Restore the state Phase 10 expects: no snapshot, app live again.
+kubectl delete retainedclaim "$RETAINED" -n "$RETAINED_NS" --wait=true >/dev/null
+apply_sqlite_app
+wait_jsonpath "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.status.volumeClaimRef}' "$PVC" 300
+wait_jsonpath "$APP_RES" "$APP_NS" "$APP" '{.status.phase}' Ready 180
+printf '  ok: state restored — app live on the same PVC, no snapshot outstanding\n'
 
 phase "Phase 10: force GC — past retainUntil drops the PVC + the snapshot"
 

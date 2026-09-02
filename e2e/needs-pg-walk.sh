@@ -545,6 +545,12 @@ for _crd in applications serviceproviders resourceclaims retainedclaims; do
 done
 printf '  branch CRDs applied + Established\n'
 
+# The IMAGE is the branch's; the cluster's RBAC is still the published
+# chart's. A verb added in the same commit as the code that needs it would
+# 403 here and nowhere else — which is exactly how the D8 Postgres sampler
+# read as "inert" for three battery runs.
+apply_branch_operator_rbac
+
 # ADR 0042 §9 — pin a SHORT reaper dwell so the §9 phases assert a TERMINAL
 # outcome (reaped / still there) instead of racing the 600s production
 # default. This is the operator's own env seam (main.rs reads
@@ -774,6 +780,78 @@ assert_eq "managed role in Cluster spec.managed.roles" "$role_present" "$PG_ROLE
 # ownerRef cascade.
 conn_ref=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.status.connectionSecretRef}')
 assert_eq "status.connectionSecretRef" "$conn_ref" "$CONN_SECRET"
+
+# POSITIVE CONTROL, and it did not exist before this line.
+#
+# Phase 10 proves the database is GONE after the GC. Nothing proved it was
+# ever THERE — so if the tenant database were never created, that proof would
+# pass vacuously, which is the null-case pass this file warns about twice
+# elsewhere. It is also the difference that decides the D8 size question: a
+# figure missing because the sampler is broken and a figure missing because
+# the database does not exist look identical from outside.
+# Read the primary from the Cluster CR's own status, and WAIT for it. The
+# label selector alone is not enough here: this runs minutes earlier than
+# Phase 10, while the `-initdb` Job pod still carries the cluster label, and a
+# broad fallback selector picks that transient pod and then fails to exec into
+# it. `status.currentPrimary` is what the operator itself reads.
+_pgprimary=""
+_prim_deadline=$(( $(date +%s) + 300 ))
+while [ "$(date +%s)" -lt "$_prim_deadline" ]; do
+    _pgprimary=$(kubectl -n "$CNPG_NS" get cluster.postgresql.cnpg.io "$CNPG_CLUSTER" \
+        -o jsonpath='{.status.currentPrimary}' 2>/dev/null || true)
+    if [ -n "$_pgprimary" ] && \
+       [ "$(kubectl -n "$CNPG_NS" get pod "$_pgprimary" -o jsonpath='{.status.phase}' 2>/dev/null || true)" = "Running" ]; then
+        break
+    fi
+    _pgprimary=""
+    sleep 5
+done
+if [ -z "$_pgprimary" ]; then
+    printf 'ERROR: CNPG cluster %s never reported a Running currentPrimary — cannot prove the tenant database exists\n' \
+        "$CNPG_CLUSTER" >&2
+    kubectl -n "$CNPG_NS" get cluster.postgresql.cnpg.io "$CNPG_CLUSTER" -o yaml >&2 2>&1 || true
+    exit 1
+fi
+_dbrow=""
+_db_deadline=$(( $(date +%s) + 120 ))
+while [ "$(date +%s)" -lt "$_db_deadline" ]; do
+    _dbrow=$(kubectl exec "$_pgprimary" -n "$CNPG_NS" -- \
+        psql -U postgres -tAc \
+        "SELECT 1 FROM pg_database WHERE datname='${PG_ROLE}'" 2>/dev/null || true)
+    [ -n "$_dbrow" ] && break
+    sleep 5
+done
+if [ -z "$_dbrow" ]; then
+    printf 'ERROR: the tenant database %s does not exist in the shared cluster — the claim is Ready and its connection Secret points at nothing\n' \
+        "$PG_ROLE" >&2
+    kubectl exec "$_pgprimary" -n "$CNPG_NS" -- psql -U postgres -tAc \
+        "SELECT datname FROM pg_database ORDER BY 1" >&2 2>&1 || true
+    exit 1
+fi
+printf '  ok: tenant database %s EXISTS in the shared cluster\n' "$PG_ROLE"
+
+# 2.22d / D8: the SAMPLED database size, not the requested `spec.size`. The
+# figure comes from CNPG's own metrics exporter and is what `app status`
+# prints. No walk asserted it before this one, so the sampler could have been
+# inert in production and every gate would still have passed — the same shape
+# as D10 (a hardcoded `false`), D18 (two dead guards) and D19.
+printf '  waiting for the sampled database size to land (60s sampler) ...\n'
+_sz_deadline=$(( $(date +%s) + 240 ))
+_bytes=""; _measured=""
+while [ "$(date +%s)" -lt "$_sz_deadline" ]; do
+    _bytes=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.status.size.bytes}')
+    _measured=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.status.size.measuredAt}')
+    [ -n "$_bytes" ] && break
+    sleep 10
+done
+case "$_bytes" in
+    ''|*[!0-9]*) printf 'ERROR: status.size.bytes never became a number (last=%q) — the D8 pg sampler is not reaching the claim\n' "$_bytes" >&2; exit 1 ;;
+esac
+[ "$_bytes" -gt 0 ] || { printf 'ERROR: sampled size is 0 bytes — an empty database still occupies its catalog, so this is a scrape that found nothing\n' >&2; exit 1; }
+case "$_measured" in
+    [0-9][0-9][0-9][0-9]-*) printf '  ok: sampled database size = %s bytes, measured at %s\n' "$_bytes" "$_measured" ;;
+    *) printf 'ERROR: status.size.measuredAt is not RFC3339 (%q) — a figure with no timestamp cannot be shown as stale\n' "$_measured" >&2; exit 1 ;;
+esac
 conn_key=$(jp secret "$APP_NS" "$CONN_SECRET" '{.data.url}')
 if [ -z "$conn_key" ]; then
     printf 'ERROR: connection Secret %s missing decomposed `url` key\n' "$CONN_SECRET" >&2

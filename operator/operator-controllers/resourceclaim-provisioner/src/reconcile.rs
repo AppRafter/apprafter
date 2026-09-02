@@ -300,6 +300,22 @@ async fn provision_cloudnativepg(
 
     info!(%name, %ns, %cluster, %cnpg_ns, "provisioning cloudnative-pg claim");
 
+    // 0. The monitoring query the platform depends on, applied BEFORE the
+    //    Cluster that references it (2.22d / D8). CNPG resolves
+    //    `customQueriesConfigMap` in the Cluster's own namespace; a Cluster
+    //    pointing at an absent ConfigMap simply exports nothing, which is the
+    //    failure this whole arm exists to end.
+    let cm_api: Api<k8s_openapi::api::core::v1::ConfigMap> =
+        Api::namespaced(ctx.client.clone(), &cnpg_ns);
+    let cm_body = cnpg::metrics_configmap_object(&cnpg_ns);
+    cm_api
+        .patch(
+            cnpg::METRICS_CONFIGMAP,
+            &apply_params(),
+            &Patch::Apply(&cm_body),
+        )
+        .await?;
+
     // 1. Lazily SSA-apply the shared Cluster (sole-owned). First claim
     //    creates `platform-postgres`; later claims no-op the apply.
     let cluster_api: Api<DynamicObject> =
@@ -1326,14 +1342,68 @@ async fn snapshot_retained_claim(
     };
 
     let api: Api<RetainedClaim> = Api::namespaced(ctx.client.clone(), RETAINED_CLAIM_NAMESPACE);
-    api.patch(&object_name, &apply_params(), &Patch::Apply(&payload))
-        .await?;
+
+    // CREATE-IF-ABSENT, never a blind re-apply.
+    //
+    // A snapshot for this claim can already exist: the claim was deleted,
+    // retained, recreated, and deleted AGAIN inside the grace window, faster
+    // than the intervening provision could cancel the first snapshot (the
+    // re-provision arms delete it). The snapshot name is deterministic, and a
+    // `RetainedClaim` spec is IMMUTABLE by admission — while `retainUntil` is
+    // derived from THIS deletion's timestamp. So the second apply is not the
+    // "byte-identical re-apply" this function used to assume: it is a 422, on
+    // the line that runs BEFORE the finalizer is released.
+    //
+    // The consequence was a deadlock with no user-facing recovery. The claim
+    // stays in Terminating forever, its Application sits at
+    // `Ready=False: paused awaiting ResourceClaim provisioning` forever, and
+    // clearing it requires a human editing a finalizer out by hand. Found by
+    // the 2.22 e2e battery on `needs-disk-walk` — two deletions 42 seconds
+    // apart — but nothing about it is disk-specific: the name and the
+    // `retainUntil` derivation are shared by every backend.
+    //
+    // The EXISTING snapshot wins, deliberately. It already points at the same
+    // retained resources (the name is derived from them), and the grace clock
+    // must run from the FIRST deletion — a second delete silently restarting
+    // a seven-day window is how "seven days" becomes unbounded.
+    let already = api.get_opt(&object_name).await?;
+    if let Some(existing) = already {
+        info!(
+            %name, %ns, snapshot = %object_name,
+            kept_retain_until = %existing.spec.retain_until,
+            would_have_been = %retain_until,
+            "RetainedClaim snapshot already exists — keeping it; the grace clock \
+             runs from the first deletion, and its spec is immutable"
+        );
+        return Ok(());
+    }
+
+    if let Err(e) = api
+        .patch(&object_name, &apply_params(), &Patch::Apply(&payload))
+        .await
+    {
+        // Lost a race with a concurrent reconcile that created it between the
+        // GET and this apply. Same outcome as the branch above: the snapshot
+        // exists, which is all the finalizer release requires.
+        match &e {
+            kube::Error::Api(ae) if ae.code == 409 || ae.code == 422 => {
+                info!(
+                    %name, %ns, snapshot = %object_name, code = ae.code,
+                    "RetainedClaim snapshot was created concurrently — treating as done"
+                );
+                return Ok(());
+            }
+            _ => return Err(e.into()),
+        }
+    }
 
     // 2.16b S3: count every RetainedClaim snapshot so the (previously
     // silent) grace-retention creation is observable. Labelled by the
     // claim's backend (empty for a never-scheduled claim → the CNPG-shape
     // default) and its source namespace. The `shared-disk` arm returned
     // above WITHOUT snapshotting, so it is correctly never counted here.
+    // Counted only on an actual create, so the metric stays a count of
+    // snapshots rather than of delete observations.
     let backend_label = if backend.is_empty() {
         "unknown"
     } else {
@@ -1528,22 +1598,38 @@ fn status_apply_body(
 /// `None` on any failure — an unreadable Cluster CR, no primary yet, an
 /// unreachable pod, an absent metric. Decorative: it must never fail the
 /// reconcile that called it.
+///
+/// Returns the STAGE that produced nothing on failure, rather than a bare
+/// `None`. Four stages can each yield nothing and they call for four different
+/// fixes; collapsing them into `None` is why this sampler could be inert on
+/// every cluster we ever ran while the log said nothing either way (2.22d
+/// shipped it that way; the 2.22 e2e battery is what noticed).
 async fn sample_pg_size_bytes(
     ctx: &Context,
     cnpg_ns: &str,
     cluster: &str,
     datname: &str,
-) -> Option<i64> {
+) -> Result<i64, String> {
     let api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), cnpg_ns, &cluster_ar());
-    let cr = api.get_opt(cluster).await.ok()??;
-    let primary = cr
+    let cr = match api.get_opt(cluster).await {
+        Ok(Some(cr)) => cr,
+        Ok(None) => return Err(format!("CNPG Cluster {cnpg_ns}/{cluster} not found")),
+        Err(e) => return Err(format!("reading CNPG Cluster {cnpg_ns}/{cluster}: {e}")),
+    };
+    let Some(primary) = cr
         .data
         .pointer("/status/currentPrimary")
-        .and_then(Value::as_str)?;
+        .and_then(Value::as_str)
+    else {
+        return Err(format!(
+            "CNPG Cluster {cnpg_ns}/{cluster} has no status.currentPrimary yet"
+        ));
+    };
     let body = ctx
         .backend_metrics
         .body_for_pod(&ctx.client, cnpg_ns, primary, 9187, "/metrics")
-        .await?;
+        .await
+        .map_err(|e| format!("scraping {cnpg_ns}/{primary}:9187/metrics: {e}"))?;
     operator_core::promscrape::parse_labelled_gauge(
         &body,
         "cnpg_pg_database_size_bytes",
@@ -1551,6 +1637,25 @@ async fn sample_pg_size_bytes(
         datname,
     )
     .map(|v| v as i64)
+    .ok_or_else(|| {
+        let seen = operator_core::promscrape::label_values(
+            &body,
+            "cnpg_pg_database_size_bytes",
+            "datname",
+        );
+        if seen.is_empty() {
+            format!(
+                "scraped {cnpg_ns}/{primary} but it publishes no \
+                 cnpg_pg_database_size_bytes at all — the metric is not enabled on this cluster"
+            )
+        } else {
+            format!(
+                "scraped {cnpg_ns}/{primary}: cnpg_pg_database_size_bytes exists for \
+                 datname [{}] but not for {datname}",
+                seen.join(", ")
+            )
+        }
+    })
 }
 
 /// Refresh `status.size` on a claim that is already ready (2.22d / D8).
@@ -1566,14 +1671,48 @@ async fn sample_pg_size_bytes(
 /// fire its own reconcile. Only a material move — or a sample older than an
 /// hour — earns a write.
 async fn refresh_claim_size(ctx: &Context, claim: &ResourceClaim, ns: &str, name: &str) {
+    // An OWNED DISK is refreshed here too, and until 2.22 it was not.
+    //
+    // `status.capacity` was sampled in exactly one place — inside
+    // `provision_disk` — which runs once, at a moment when no pod has mounted
+    // the PVC yet, so the kubelet reports no volume stats and the sample is
+    // `None`. A ready claim never provisions again (`should_provision` is
+    // false), and this gate returned early for every non-`pg` type. So the
+    // disk half of D8 — the one figure with a meaningful denominator, the one
+    // `volume status` and the `app status` claims table are supposed to show —
+    // never populated on any cluster. Built, unit-tested, unreachable: the
+    // fourth defect of that exact shape in this subphase.
+    if claim.spec.type_ == "disk" {
+        refresh_claim_capacity(ctx, claim, ns, name).await;
+        return;
+    }
     if claim.spec.type_ != "pg" {
         return;
     }
     let cnpg_ns = DEFAULT_CNPG_NAMESPACE;
     let datname = cnpg::pg_identifier(ns, name);
-    let Some(bytes) = sample_pg_size_bytes(ctx, cnpg_ns, DEFAULT_CNPG_CLUSTER, &datname).await
-    else {
-        return;
+    let bytes = match sample_pg_size_bytes(ctx, cnpg_ns, DEFAULT_CNPG_CLUSTER, &datname).await {
+        Ok(b) => b,
+        Err(why) => {
+            // A sampler that has NEVER produced a figure for this claim is a
+            // different thing from one that missed a tick, and only the first
+            // is worth a human's attention: it means the signal does not work
+            // here AT ALL. Warn once per claim in that state; a claim that
+            // already carries a figure stays at debug so a flapping endpoint
+            // cannot turn the log into a firehose.
+            let never_measured = claim
+                .status
+                .as_ref()
+                .and_then(|s| s.size.as_ref())
+                .and_then(|z| z.bytes)
+                .is_none();
+            if never_measured {
+                warn!(%name, %ns, %why, "database size has never been measured for this claim");
+            } else {
+                tracing::debug!(%name, %ns, %why, "size sample missed a tick");
+            }
+            return;
+        }
     };
     let previous = claim.status.as_ref().and_then(|s| s.size.clone());
     if !size_write_is_worth_it(previous.as_ref(), bytes, &Utc::now().to_rfc3339()) {
@@ -1599,6 +1738,70 @@ async fn refresh_claim_size(ctx: &Context, claim: &ResourceClaim, ns: &str, name
         .await
     {
         tracing::debug!(%name, %ns, %e, "size refresh status write failed (retrying next tick)");
+    }
+}
+
+/// Refresh `status.capacity` on a ready OWNED-disk claim (2.22d / D8).
+///
+/// Separate from the pg arm because the figure, its source and its deadband
+/// all differ: this is the kubelet's own view of a volume THIS claim owns, so
+/// it has a denominator and the useful reading is a fraction.
+///
+/// No staleness clause, deliberately. `ClaimCapacity` carries no `measuredAt`
+/// — there is no timestamp that could read as ancient — so a purely material
+/// deadband is the whole rule. Adding a refresh-on-age would write on a fixed
+/// cadence forever, and every status write wakes this controller again.
+async fn refresh_claim_capacity(ctx: &Context, claim: &ResourceClaim, ns: &str, name: &str) {
+    let Some(pvc) = claim
+        .status
+        .as_ref()
+        .and_then(|s| s.volume_claim_ref.clone())
+        .filter(|p| !p.is_empty())
+    else {
+        return;
+    };
+    let Some((used, cap)) = sample_claim_volume(ctx, &pvc).await else {
+        // Same rule as the pg arm: never-measured is the actionable state.
+        let never_measured = claim
+            .status
+            .as_ref()
+            .and_then(|s| s.capacity.as_ref())
+            .is_none();
+        if never_measured {
+            let why = sample_claim_volume_detailed(ctx, &pvc)
+                .await
+                .err()
+                .unwrap_or_else(|| "unknown".to_string());
+            warn!(
+                %name, %ns, %pvc, %why,
+                "disk usage has never been measured for this claim"
+            );
+        }
+        return;
+    };
+    let previous = claim
+        .status
+        .as_ref()
+        .and_then(|s| s.capacity.as_ref())
+        .map(|c| c.used_bytes);
+    if !figure_moved_materially(previous, used, BYTES_DEADBAND) {
+        return;
+    }
+    let api: Api<ResourceClaim> = Api::namespaced(ctx.client.clone(), ns);
+    let body = json!({
+        "apiVersion": "apprafter.io/v1alpha1",
+        "kind": "ResourceClaim",
+        "metadata": { "name": name },
+        "status": { "capacity": { "usedBytes": used, "capacityBytes": cap } },
+    });
+    // DEDICATED manager, for the reason spelled out on the pg arm: SSA
+    // replaces a manager's whole field-set, so a partial body under the
+    // provisioner's own manager would prune the rest of the claim's status.
+    if let Err(e) = api
+        .patch_status(name, &size_apply_params(), &Patch::Apply(&body))
+        .await
+    {
+        tracing::debug!(%name, %ns, %e, "capacity refresh status write failed (retrying next tick)");
     }
 }
 
@@ -1682,14 +1885,9 @@ fn figure_write_is_worth_it(
     absolute: i64,
     now_rfc3339: &str,
 ) -> bool {
-    let Some(prev) = previous else { return true };
-    let material = if prev == 0 || sample == 0 {
-        prev != sample
-    } else {
-        let delta = (sample - prev).abs();
-        delta > absolute || delta * 100 / prev >= 1
-    };
-    if material {
+    // `figure_moved_materially` already returns true for an absent previous,
+    // so the first-sample case is covered before the staleness clause.
+    if figure_moved_materially(previous, sample, absolute) {
         return true;
     }
     previous_measured_at
@@ -1697,6 +1895,24 @@ fn figure_write_is_worth_it(
         .zip(chrono::DateTime::parse_from_rfc3339(now_rfc3339).ok())
         .map(|(then, now)| (now - then).num_seconds() > 3600)
         .unwrap_or(true)
+}
+
+/// Did the figure move enough to be worth telling anyone about?
+///
+/// Extracted from [`figure_write_is_worth_it`] so the capacity arm can use the
+/// materiality rule WITHOUT the staleness clause — `ClaimCapacity` carries no
+/// timestamp, so "refresh because the sample is old" has nothing to read and
+/// would degrade into an unconditional write on every tick.
+///
+/// An absent previous figure is always material: the first sample is the one
+/// that turns an empty surface into a number.
+fn figure_moved_materially(previous: Option<i64>, sample: i64, absolute: i64) -> bool {
+    let Some(prev) = previous else { return true };
+    if prev == 0 || sample == 0 {
+        return prev != sample;
+    }
+    let delta = (sample - prev).abs();
+    delta > absolute || delta * 100 / prev >= 1
 }
 
 /// Used/total bytes of a claim's own PVC, sampled from the kubelet (2.22d / D8).
@@ -1710,13 +1926,48 @@ fn figure_write_is_worth_it(
 /// alone rather than failing a provision that otherwise succeeded, and the
 /// status writer omits the field so SSA does not prune it.
 async fn sample_claim_volume(ctx: &Context, pvc_name: &str) -> Option<(i64, i64)> {
+    sample_claim_volume_detailed(ctx, pvc_name).await.ok()
+}
+
+/// As [`sample_claim_volume`], but naming the stage that produced nothing.
+///
+/// Three stages can each yield nothing and they mean different things: no
+/// readable node, no kubelet summary (RBAC on `nodes/proxy`), or a summary
+/// that simply carries no entry for this PVC. The last is not necessarily a
+/// defect — the kubelet reports volume statistics only for volume plugins that
+/// implement a metrics provider, and a `hostPath`-backed volume (what
+/// local-path-provisioner hands out on kind) does not. Saying which one it is
+/// keeps "unsupported here" from reading as "broken".
+async fn sample_claim_volume_detailed(ctx: &Context, pvc_name: &str) -> Result<(i64, i64), String> {
     let nodes = Api::<k8s_openapi::api::core::v1::Node>::all(ctx.client.clone())
         .list(&Default::default())
         .await
-        .ok()?;
-    let node = nodes.items.first()?.name_any();
-    let summary = ctx.capacity.summary_for_node(&ctx.client, &node).await?;
-    operator_core::capacity::pvc_usage(&summary, pvc_name)
+        .map_err(|e| format!("listing nodes: {e}"))?;
+    let node = nodes
+        .items
+        .first()
+        .ok_or_else(|| "no nodes readable".to_string())?
+        .name_any();
+    let summary = ctx
+        .capacity
+        .summary_for_node(&ctx.client, &node)
+        .await
+        .ok_or_else(|| format!("no kubelet stats summary for node {node}"))?;
+    operator_core::capacity::pvc_usage(&summary, pvc_name).ok_or_else(|| {
+        let reported = operator_core::capacity::reported_pvc_names(&summary);
+        if reported.is_empty() {
+            format!(
+                "the kubelet on {node} reports NO volume statistics at all — its volume plugin \
+                 has no metrics provider (hostPath-backed volumes, e.g. local-path on kind, \
+                 never report)"
+            )
+        } else {
+            format!(
+                "the kubelet on {node} reports volume stats for [{}] but not for {pvc_name}",
+                reported.join(", ")
+            )
+        }
+    })
 }
 
 async fn patch_status(
@@ -2093,6 +2344,66 @@ async fn find_provider(
 
 #[cfg(test)]
 mod tests {
+
+    // ---- 2.22d / D8: the materiality rule, alone ----
+
+    #[test]
+    fn a_first_sample_is_always_material() {
+        // The one that turns an empty surface into a number.
+        assert!(figure_moved_materially(None, 0, BYTES_DEADBAND));
+        assert!(figure_moved_materially(None, 12_345, BYTES_DEADBAND));
+    }
+
+    #[test]
+    fn a_move_across_zero_is_material_however_small() {
+        // An empty logical DB is a normal steady state, so a tenant's FIRST
+        // key must show up immediately rather than waiting out a deadband it
+        // could never cross.
+        assert!(figure_moved_materially(Some(0), 1, KEYS_DEADBAND));
+        assert!(figure_moved_materially(Some(1), 0, KEYS_DEADBAND));
+        assert!(!figure_moved_materially(Some(0), 0, KEYS_DEADBAND));
+    }
+
+    #[test]
+    fn a_small_relative_move_on_a_large_figure_is_not_material() {
+        // 1 GiB used, one extra byte: not worth a status write, and every
+        // status write wakes this controller again.
+        let gib: i64 = 1_073_741_824;
+        assert!(!figure_moved_materially(Some(gib), gib + 1, BYTES_DEADBAND));
+        // A whole percent is.
+        assert!(figure_moved_materially(
+            Some(gib),
+            gib + gib / 100,
+            BYTES_DEADBAND
+        ));
+        // So is more than the absolute floor, even sub-percent.
+        assert!(figure_moved_materially(
+            Some(gib * 100),
+            gib * 100 + BYTES_DEADBAND + 1,
+            BYTES_DEADBAND
+        ));
+    }
+
+    #[test]
+    fn capacity_uses_materiality_without_a_staleness_clause() {
+        // The distinction that earned the extraction: `figure_write_is_worth_it`
+        // ALSO writes when the previous sample is over an hour old, which needs
+        // a timestamp. `ClaimCapacity` has none, so the capacity arm must use
+        // the materiality rule alone or it would write on every 60s tick.
+        let unchanged = figure_moved_materially(Some(500), 500, BYTES_DEADBAND);
+        assert!(!unchanged, "an unchanged figure must not earn a write");
+        let stale_would_write = figure_write_is_worth_it(
+            Some(500),
+            Some("2026-09-01T10:00:00+00:00"),
+            500,
+            BYTES_DEADBAND,
+            "2026-09-01T12:00:00+00:00",
+        );
+        assert!(
+            stale_would_write,
+            "the size arm DOES refresh on age — that is the behaviour capacity must not inherit"
+        );
+    }
     use super::*;
     use serde_json::json;
 

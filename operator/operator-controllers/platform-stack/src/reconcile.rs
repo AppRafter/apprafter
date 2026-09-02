@@ -1842,13 +1842,28 @@ fn parse_check_interval(s: &str) -> Duration {
         return DEFAULT_REQUEUE;
     };
     let secs = match unit[0] {
+        // `saturating_mul`, not `*`: the value is user data from
+        // `spec.checkInterval`, and a large number times 3600 overflows.
         b's' => value,
-        b'm' => value * 60,
-        b'h' => value * 3600,
+        b'm' => value.saturating_mul(60),
+        b'h' => value.saturating_mul(3600),
         _ => return DEFAULT_REQUEUE,
     };
-    Duration::from_secs(secs)
+    // CLAMPED, and it is a crash guard rather than a tuning knob. kube-runtime
+    // schedules through a tokio `DelayQueue`, which PANICS on a deadline it
+    // cannot represent (`invalid deadline; err=Invalid`) — and that panic takes
+    // the whole operator process down, every controller with it. So a single
+    // mistyped `checkInterval: "999999h"` would crash-loop the platform
+    // controller for every cluster that synced it. The same hazard, found in
+    // the RetainedClaim GC by the 2.22 battery, is fixed there in the same
+    // commit. A day is far beyond any useful poll cadence.
+    Duration::from_secs(secs.min(MAX_CHECK_INTERVAL_SECS))
 }
+
+/// Ceiling on a parsed `checkInterval`. See `parse_check_interval` for why
+/// this exists: an unbounded, data-derived requeue is an operator-wide panic,
+/// not a slow poll.
+const MAX_CHECK_INTERVAL_SECS: u64 = 86_400;
 
 fn error_policy(_: Arc<PlatformStack>, err: &Error, _: Arc<Context>) -> Action {
     warn!(error = %err, "PlatformController reconcile failed");
@@ -2057,6 +2072,35 @@ fn build_platform_migration_plan_cr(
 
 #[cfg(test)]
 mod tests {
+
+    // ---- D23: the same hazard on the platform side ----
+
+    #[test]
+    fn an_absurd_check_interval_is_clamped_not_scheduled() {
+        // One mistyped `checkInterval` would otherwise crash-loop the platform
+        // controller on every cluster that synced it.
+        assert_eq!(
+            parse_check_interval("999999h"),
+            Duration::from_secs(MAX_CHECK_INTERVAL_SECS)
+        );
+        // And the multiplication itself must not overflow on the way there.
+        assert_eq!(
+            parse_check_interval("99999999999999999999h"),
+            DEFAULT_REQUEUE,
+            "an unparseable u64 falls back to the default"
+        );
+        assert_eq!(
+            parse_check_interval(&format!("{}h", u64::MAX)),
+            Duration::from_secs(MAX_CHECK_INTERVAL_SECS)
+        );
+    }
+
+    #[test]
+    fn an_ordinary_check_interval_is_untouched() {
+        assert_eq!(parse_check_interval("30s"), Duration::from_secs(30));
+        assert_eq!(parse_check_interval("15m"), Duration::from_secs(900));
+        assert_eq!(parse_check_interval("6h"), Duration::from_secs(21_600));
+    }
     use super::*;
 
     #[test]

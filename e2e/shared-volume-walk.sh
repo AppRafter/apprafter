@@ -499,6 +499,12 @@ for _crd in applications serviceproviders resourceclaims retainedclaims sharedvo
 done
 printf '  branch CRDs applied + Established\n'
 
+# The IMAGE is the branch's; the cluster's RBAC is still the published
+# chart's. A verb added in the same commit as the code that needs it would
+# 403 here and nowhere else — which is exactly how the D8 Postgres sampler
+# read as "inert" for three battery runs.
+apply_branch_operator_rbac
+
 # The released operator ClusterRole predates the 2.6c RBAC — the SharedVolume
 # reconciler SSA-applies an unowned PVC (persistentvolumeclaims), watches
 # SharedVolume CRs + manages the cleanup finalizer (sharedvolumes,

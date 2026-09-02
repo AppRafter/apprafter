@@ -696,6 +696,12 @@ for _crd in applications serviceproviders resourceclaims retainedclaims; do
 done
 printf '  branch CRDs applied + Established\n'
 
+# The IMAGE is the branch's; the cluster's RBAC is still the published
+# chart's. A verb added in the same commit as the code that needs it would
+# 403 here and nowhere else — which is exactly how the D8 Postgres sampler
+# read as "inert" for three battery runs.
+apply_branch_operator_rbac
+
 # ADR 0042 §9 — pin a SHORT reaper dwell so the §9 phases assert a TERMINAL
 # outcome (reaped / still there) instead of racing the 600s production
 # default. This is the operator's own env seam (main.rs reads
@@ -1243,6 +1249,35 @@ if [ "$acl_ok" != "yes" ]; then
     exit 1
 fi
 printf '  ok: durable ACL file carries USER %s\n' "$ACL_USER"
+
+# 2.22d / D8: the SAMPLED figure for redis is a KEY COUNT, never bytes, and
+# the CLI is required to say so. Per-database bytes are genuinely unreachable
+# in Dragonfly (verified against v1.37.0 and `main`: the per-DB figures are
+# summed away at every point they could reach a client), so the honest number
+# is DBSIZE. Sampled on the 300s ACL resync loop, hence the wide window.
+#
+# Asserted here for the first time: until now nothing in any walk read
+# `status.size`, so an inert sampler was indistinguishable from a working one.
+printf '  waiting for the sampled key count to land (300s resync loop) ...\n'
+_keys_deadline=$(( $(date +%s) + 420 ))
+_keys=""; _kmeasured=""; _kbytes=""
+while [ "$(date +%s)" -lt "$_keys_deadline" ]; do
+    _keys=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.status.size.keys}')
+    _kmeasured=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.status.size.measuredAt}')
+    [ -n "$_keys" ] && break
+    sleep 15
+done
+case "$_keys" in
+    ''|*[!0-9]*) printf 'ERROR: status.size.keys never became a number (last=%q) — the D8 redis sampler is not reaching the claim\n' "$_keys" >&2; exit 1 ;;
+esac
+# NEGATIVE: bytes must stay unset for redis. A bytes figure here would be a
+# fabricated number, which is worse than no number.
+_kbytes=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.status.size.bytes}')
+[ -z "$_kbytes" ] || { printf 'ERROR: status.size.bytes is set for a redis claim (%q) — per-database bytes are not obtainable from Dragonfly, so any value here is invented\n' "$_kbytes" >&2; exit 1; }
+case "$_kmeasured" in
+    [0-9][0-9][0-9][0-9]-*) printf '  ok: sampled key count = %s keys (bytes correctly unset), measured at %s\n' "$_keys" "$_kmeasured" ;;
+    *) printf 'ERROR: status.size.measuredAt is not RFC3339 (%q)\n' "$_kmeasured" >&2; exit 1 ;;
+esac
 
 # The file is only loaded if the CR points at it.
 acl_ref=$(kubectl -n "$DF_NS" get dragonfly "$DF_INSTANCE" \

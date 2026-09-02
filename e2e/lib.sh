@@ -520,6 +520,35 @@ WRAP
 #   (stuck pods, events, helm-hook state) is destroyed with it.
 #   No-op + never fails if KUBECONFIG/kubectl are unavailable.
 # ---------------------------------------------------------------
+# ---------------------------------------------------------------
+# apply_branch_operator_rbac
+#
+# In APPRAFTER_E2E_LOCAL_OPERATOR mode the walks swap the operator IMAGE but
+# leave the cluster's RBAC as the published chart wrote it. So a rule added in
+# the same commit as the code that needs it is invisible to every local walk:
+# the new binary runs against the old ClusterRole and 403s.
+#
+# That is not hypothetical. The 2.22 battery spent three runs establishing that
+# the D8 Postgres size sampler "was not reaching the claim", and the answer was
+# `pods/proxy` forbidden in cnpg-system — a verb granted in the branch chart
+# and absent from the published one. The repo's own recurring lesson is that
+# only a live cluster catches an RBAC/verb mismatch; this makes the local
+# clusters able to catch it too.
+#
+# `-n apprafter-system` is load-bearing: without it `helm template` renders the
+# ClusterRoleBinding subject with the wrong namespace and the binding silently
+# grants nothing (walk-fix 3ac1972).
+# ---------------------------------------------------------------
+apply_branch_operator_rbac() {
+    local chart="${REPO_ROOT}/operator/charts/apprafter-operator"
+    [ -d "$chart" ] || { printf '  (no operator chart at %s — skipping branch RBAC)\n' "$chart"; return 0; }
+    _rbac_yq() { if command -v yq >/dev/null 2>&1; then yq "$@"; else nix run nixpkgs#yq-go -- "$@"; fi; }
+    helm template apprafter-operator "$chart" -n apprafter-system \
+        | _rbac_yq 'select(.kind == "ClusterRole" or .kind == "ClusterRoleBinding" or .kind == "Role" or .kind == "RoleBinding" or .kind == "ServiceAccount")' \
+        | kubectl apply --server-side --force-conflicts -f - >/dev/null
+    printf '  branch operator RBAC applied (ClusterRole/Binding, Role/Binding, SA)\n'
+}
+
 dump_diagnostics() {
     command -v kubectl >/dev/null 2>&1 || return 0
     [ -n "${KUBECONFIG:-}" ] || return 0

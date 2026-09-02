@@ -2577,3 +2577,227 @@ because that one is decorative and this one is a health signal:
 the horizon in the roll-up would have made the first retune of that constant
 produce exactly that contradiction. A test asserts the agreement across all
 four filter cases and was verified by reintroducing a divergence.
+
+---
+
+## D21. A claim deleted twice inside its grace window wedges forever
+
+**Opened:** 2026-09-01, by the 2.22 local e2e battery, on `needs-disk-walk`.
+**Status:** FIXED the same day, with a source-level wiring test and a
+deterministic walk phase (`needs-disk-walk` Phase 9b).
+**Severity:** high. A hard deadlock with no user-facing recovery: the
+Application never becomes Ready again and clearing it requires a human editing
+a finalizer off an object by hand.
+
+### What is wrong
+
+`snapshot_retained_claim` runs on the deletion path, BEFORE the provisioner
+releases its finalizer, and it applied the snapshot blind. Its comment stated
+the assumption plainly:
+
+> an idempotent SSA-apply of a deterministic-named object — a crash before
+> un-finalizing simply re-applies the byte-identical RetainedClaim
+
+Every clause of that is true except the last one, and the last one is the one
+it relies on. The snapshot's name is deterministic per (namespace, claim), a
+`RetainedClaim` spec is **immutable** by admission (CEL `self == oldSelf`), and
+`retainUntil` is derived from **this** deletion's `deletionTimestamp`. So a
+second, genuine deletion is never byte-identical — its timestamp differs by
+construction:
+
+```text
+RetainedClaim.apprafter.io "claim-demo-sqlite-disk" is invalid:
+  spec: Invalid value: RetainedClaim spec is immutable
+```
+
+The apply is upstream of the finalizer release, so the claim never finishes
+deleting. It sits in `Terminating`; its Application sits at
+`Ready=False: paused awaiting ResourceClaim provisioning`; the reconcile
+retries the same 422 every thirty seconds forever.
+
+### How it is reached
+
+A re-provision cancels the surviving snapshot — that is what the
+cancel-on-reprovision arms are for. The window is a deletion that arrives
+before an intervening provision completes: delete, recreate, delete again in
+quick succession. Argo sync churn, a fast `app remove` / `app add`, or a
+rapidly re-applied manifest all produce it.
+
+Observed as two deletions **42 seconds apart**: the claim carried
+`deletionTimestamp: 16:49:55` while the surviving snapshot's `retainUntil` had
+been computed from `16:49:13`.
+
+### Not disk-specific
+
+The disk walk is simply where the churn happened. The deterministic name and
+the `retainUntil` derivation are shared by every backend, so a pg or redis
+claim deleted twice inside grace wedges identically. `needs-pg-walk` and
+`needs-redis-walk` were green throughout because each deletes exactly once.
+
+### Why nothing caught it
+
+`needs-disk-walk` had not been run since 2.6b — the code was last touched in
+2.16b and the walk in the meantime only ever deleted once per run. Neither the
+unit suite nor the CRD gates can see it: the rejection lives in admission, and
+a unit test over the built body passes, because the body is correct. What was
+wrong was *whether the write should happen at all*.
+
+### The fix
+
+Create-if-absent. `GET` first; if a snapshot exists, log it and return without
+applying. A lost creation race (both reconciles see absent) is tolerated on
+409/422 rather than propagated, since the outcome — a snapshot exists — is
+what the finalizer release actually requires.
+
+**The existing snapshot wins deliberately.** It already points at the same
+retained resources, and the grace clock must run from the FIRST deletion: a
+second delete silently restarting a seven-day window is how "seven days"
+becomes unbounded.
+
+### The shape worth carrying
+
+This is the fourth defect in this file whose root is *a write that should not
+have happened*, and the second where a comment asserting idempotence was the
+thing that stopped anyone checking. An SSA apply is idempotent only if every
+input is; `now()` and a deletion timestamp are not inputs you can assume
+stable. Where an object is immutable by design, the write must be
+create-if-absent, not apply-and-hope.
+
+---
+
+## D22. The disk half of D8 never populated, and no local walk could have noticed
+
+**Opened:** 2026-09-01, by the 2.22 local e2e battery.
+**Status:** FIXED the same day — one product fix, one harness fix, and an
+assertion in `needs-disk-walk` that fails without either.
+**Severity:** medium. No data is at risk; a shipped signal simply never
+appeared, and the surface that was supposed to carry it read as "nothing to
+report" rather than "not measured".
+
+### What was wrong, in the product
+
+`refresh_claim_size` opened with `if claim.spec.type_ != "pg" { return; }`. So
+of D8's three figures only two ever refreshed:
+
+* **pg bytes** — the 60s ready-gate. Worked, once its RBAC was in place.
+* **redis keys** — the 300s ACL resync loop, a separate path. Worked.
+* **disk used/total** — sampled in exactly ONE place, inside `provision_disk`.
+
+That call runs once, at provisioning, and the kubelet reports volume statistics
+only for volumes it has **mounted**. At provisioning no pod exists yet — the
+Application is still paused waiting for the claim — so the sample is always
+`None`. A ready claim never provisions again, and the 60s gate returned early
+for every non-`pg` type. `status.capacity` therefore never populated on any
+cluster: the one D8 figure with a meaningful denominator, the one `volume
+status` and the `app status` claims table are built to show.
+
+The fix gives disk its own arm on the same 60s gate, with a materiality-only
+deadband — `ClaimCapacity` carries no `measuredAt`, so the staleness clause the
+size arm uses has nothing to read and would degrade into an unconditional write
+every tick.
+
+### What was wrong, in the harness — and this is the more useful half
+
+The pg figure did not appear either, and the reason was **not** in the product:
+`pods/proxy` was forbidden in `cnpg-system`. The verb is granted in the branch
+chart, in the same commit as the code that needs it. But
+`APPRAFTER_E2E_LOCAL_OPERATOR` swaps the operator **image** while the cluster
+keeps the RBAC the **published** chart installed — and 0.2.59 is not published.
+
+So every local walk ran a new binary against an old ClusterRole. Any rule added
+alongside its code was structurally unverifiable locally, which is precisely
+the class this repository has already been bitten by twice (ADR 0048's anchor
+403, the 0.2.31 MigrationPlan GC 403) and whose lesson was recorded as "only a
+live cluster catches it". It need not have been: the walks apply the branch
+CRDs and simply never applied the branch RBAC.
+
+`e2e/lib.sh` now has `apply_branch_operator_rbac`, wired into all eight walks
+that already apply branch CRDs. `-n apprafter-system` is load-bearing —
+without it `helm template` renders the ClusterRoleBinding subject into the
+wrong namespace and the binding grants nothing (walk-fix `3ac1972`, learned
+once already).
+
+### Why nothing caught it
+
+No walk read `status.size` or `status.capacity`. The pg walk asserted
+`spec.size` — the REQUESTED size — which is a different field with a similar
+name, and it passes whether or not any sampler works. The assertions added
+here read the sampled figures, and the disk one is deliberately placed after
+the pod has mounted the volume, because before that an absent figure is
+correct rather than a defect.
+
+### The shape worth carrying
+
+Three D-entries in this file are now the same sentence: **a signal was built,
+unit-tested, and never reached production** (D10's hardcoded `false`, D18's two
+dead guards, and this). The common cause is not carelessness in the code — each
+was carefully written — it is that nothing downstream ever asserted the
+*output*. A figure that no test reads is indistinguishable from a figure that
+is never produced.
+
+---
+
+## D23. One object's data can crash-loop the entire operator
+
+**Opened:** 2026-09-01, by the 2.22 local e2e battery — a walk FIXTURE
+triggered it, which is the only reason it was seen at all.
+**Status:** FIXED the same day at both sites, with unit tests at each.
+**Severity:** **high.** Not a wrong value, not one broken reconcile: a panic on
+a tokio worker takes the whole process down, so every controller in the
+operator stops — Application, PlatformStack, provisioner, scheduler,
+SourceCredential — for as long as the offending object exists. A cluster
+recovers only when a human finds and edits that object.
+
+### What is wrong
+
+kube-runtime schedules requeues through a tokio `DelayQueue`, which **panics**
+on a deadline it cannot represent:
+
+```text
+thread 'tokio-rt-worker' panicked at kube-runtime-0.95.0/src/scheduler.rs:100:43:
+invalid deadline; err=Invalid
+```
+
+Two places computed a requeue from DATA and handed it over unbounded:
+
+1. **`gc.rs`** — the remaining grace on a `RetainedClaim`, derived from its
+   `retainUntil`. A snapshot dated 2031 produced `requeue_secs=136698895`
+   (4.3 years) and crash-looped the operator: five restarts in seven minutes,
+   `CrashLoopBackOff`.
+2. **`platform-stack/reconcile.rs`** — `parse_check_interval`, which reads
+   `spec.checkInterval` (a user-facing string) and did `value * 3600`. A single
+   mistyped `checkInterval: "999999h"` reaches the same panic, and the
+   multiplication itself overflows before it gets there.
+
+Production values never approach either bound — `retainUntil` is always
+deletion + 7 days, and a sane poll interval is minutes. That is exactly why
+the guard is worth having: the values that DO get here are hand-edited
+objects, clock skew, restores from an old backup, and typos — the situations
+where the operator most needs to stay up.
+
+### How it was found, and what that says
+
+Not by review, and not by any assertion aimed at it. The 2.22 walk phase for
+D21 plants a `RetainedClaim` with a far-future `retainUntil` to prove the
+finalizer still releases; the fixture crashed the operator, and the walk
+reported the symptom three steps downstream ("the claim is still present after
+180s"). The panic was visible only in the pod's previous-instance log.
+
+The general lesson is uncomfortable and worth stating: **an adversarial value
+in a test fixture found a production crash that no amount of reading the code
+had.** The two clamps are one line each; nobody wrote them because nobody
+imagined the number being large, and the type system had nothing to say.
+
+### The fix
+
+A ceiling at each site — one hour for the grace requeue, one day for the check
+interval — plus `saturating_mul` on the interval parse. Both are documented as
+crash guards, not tuning knobs, so a future reader does not "optimise" them
+away. The 2031 fixture stays in `needs-disk-walk` Phase 9b: it now doubles as
+the live regression guard for the clamp.
+
+### Worth auditing next
+
+Every remaining `Action::requeue` whose duration is computed rather than
+constant. Two were found here by grep; the audit is cheap and should be
+repeated whenever a new one is introduced.

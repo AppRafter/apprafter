@@ -192,6 +192,68 @@ pub fn cluster_object(
                     "shared_buffers": res.shared_buffers,
                 },
             },
+            // 2.22d / D8: the per-database size metric this platform reads is
+            // NOT guaranteed by CNPG's own defaults. The 2.22 e2e battery
+            // scraped this exporter across several runs and saw
+            // `cnpg_pg_database_size_bytes` present for `[app, postgres,
+            // template1]` in one and absent entirely in the next — so the
+            // design's assumption that it is "one of CNPG's DEFAULT metrics"
+            // does not hold, and a feature built on it silently reported
+            // nothing. Declare the query we depend on instead of inheriting
+            // whatever the operator happens to attach.
+            "monitoring": {
+                "customQueriesConfigMap": [
+                    {
+                        "name": METRICS_CONFIGMAP,
+                        "key": METRICS_CONFIGMAP_KEY,
+                    }
+                ],
+            },
+        },
+    })
+}
+
+/// Name of the ConfigMap carrying the monitoring query above. Lives in the
+/// CNPG namespace beside the `Cluster`, because CNPG resolves
+/// `customQueriesConfigMap` in the Cluster's OWN namespace.
+pub const METRICS_CONFIGMAP: &str = "apprafter-pg-metrics";
+
+/// The key inside it. CNPG reads one YAML document of queries per key.
+pub const METRICS_CONFIGMAP_KEY: &str = "queries";
+
+/// The monitoring-queries ConfigMap the shared `Cluster` references.
+///
+/// One query, deliberately: the per-database on-disk size, which is the whole
+/// of what `status.size.bytes` reports. CNPG prefixes a custom query's metrics
+/// with `cnpg_`, so the query named `pg_database` with a `size_bytes` column
+/// produces exactly `cnpg_pg_database_size_bytes{datname="…"}` — the metric
+/// `sample_pg_size_bytes` looks for.
+///
+/// `datallowconn` filters `template0`, which cannot be connected to and whose
+/// size nobody asked about. Every other database is included, tenant databases
+/// among them — the reason this exists at all.
+pub fn metrics_configmap_object(ns: &str) -> Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": METRICS_CONFIGMAP,
+            "namespace": ns,
+            "labels": { "apprafter.io/managed-by": "apprafter" },
+        },
+        "data": {
+            METRICS_CONFIGMAP_KEY: concat!(
+                "pg_database:\n",
+                "  query: \"SELECT datname, pg_database_size(datname) AS size_bytes ",
+                "FROM pg_database WHERE datallowconn\"\n",
+                "  metrics:\n",
+                "    - datname:\n",
+                "        usage: \"LABEL\"\n",
+                "        description: \"Name of the database\"\n",
+                "    - size_bytes:\n",
+                "        usage: \"GAUGE\"\n",
+                "        description: \"Disk space used by the database\"\n",
+            ),
         },
     })
 }

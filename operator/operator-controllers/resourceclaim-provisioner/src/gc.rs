@@ -81,6 +81,23 @@ const REQUEUE_AFTER: Duration = Duration::from_secs(300);
 /// seconds away is re-checked promptly without a tight busy-loop.
 const MIN_REQUEUE: Duration = Duration::from_secs(60);
 
+/// CEILING on that requeue, and it is a crash guard rather than a tuning knob.
+///
+/// The remaining grace is computed from `retainUntil`, which is DATA on an
+/// object. kube-runtime schedules a requeue through a tokio `DelayQueue`,
+/// which PANICS on a deadline it cannot represent — `invalid deadline;
+/// err=Invalid` — and that panic takes the whole operator down, not just this
+/// reconcile. A `RetainedClaim` whose `retainUntil` is years out therefore
+/// crash-looped every controller in the process: the 2.22 battery produced
+/// exactly that with a fixture dated 2031 (a 4.3-year requeue).
+///
+/// Production snapshots are always deletion + 7 days, so nothing legitimate
+/// reaches this ceiling. That is precisely why it is worth having: the values
+/// that get here are hand-edited objects, clock skew, and mistakes — the cases
+/// where the operator most needs to stay up. Re-checking a far-future deadline
+/// once an hour costs nothing.
+const MAX_REQUEUE: Duration = Duration::from_secs(3600);
+
 /// Requeue between Phase 2 polls while waiting for CNPG to drop the
 /// `ensure: absent` role (2.4f Fix B2). CNPG drops the DB then the role
 /// over a few reconcile passes; we poll the Cluster `status` until the
@@ -137,7 +154,9 @@ pub async fn reconcile(
 
     // Not yet expired → requeue for the remaining grace (floored).
     if !grace::should_gc(retain_until, now) {
-        let remaining = grace::remaining_grace(retain_until, now).max(MIN_REQUEUE);
+        let remaining = grace::remaining_grace(retain_until, now)
+            .max(MIN_REQUEUE)
+            .min(MAX_REQUEUE);
         info!(
             retained = %rc_name, retain_until = %rc.spec.retain_until,
             requeue_secs = remaining.as_secs(),
@@ -939,6 +958,47 @@ pub fn role_cannot_reconcile_reason(managed_roles_status: &Value, role: &str) ->
 
 #[cfg(test)]
 mod tests {
+
+    // ---- D23: a data-derived requeue must never reach the scheduler raw ----
+
+    #[test]
+    fn a_far_future_retain_until_is_clamped_rather_than_scheduled() {
+        // kube-runtime schedules through a tokio DelayQueue, which PANICS on a
+        // deadline it cannot represent — and that panic takes the whole
+        // operator down, not just this reconcile. A `RetainedClaim` dated 2031
+        // produced a 4.3-year requeue and crash-looped every controller in the
+        // process. Reproduced by the 2.22 battery with exactly that fixture.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let far = "2031-01-01T00:00:00Z";
+        let raw = crate::grace::remaining_grace(
+            chrono::DateTime::parse_from_rfc3339(far)
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            now,
+        );
+        assert!(
+            raw > MAX_REQUEUE,
+            "fixture must exceed the ceiling or it proves nothing"
+        );
+        let scheduled = raw.max(MIN_REQUEUE).min(MAX_REQUEUE);
+        assert_eq!(scheduled, MAX_REQUEUE);
+    }
+
+    #[test]
+    fn a_near_deadline_still_gets_its_floor() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let soon = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:05+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let scheduled = crate::grace::remaining_grace(soon, now)
+            .max(MIN_REQUEUE)
+            .min(MAX_REQUEUE);
+        assert_eq!(scheduled, MIN_REQUEUE, "the floor must still apply");
+    }
     use super::*;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     use operator_core::ResourceClaimSpec;

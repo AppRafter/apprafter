@@ -453,6 +453,12 @@ for _crd in applications serviceproviders resourceclaims retainedclaims; do
         "crd/${_crd}.apprafter.io" --timeout=30s
 done
 printf '  branch CRDs applied + Established\n'
+
+# The IMAGE is the branch's; the cluster's RBAC is still the published
+# chart's. A verb added in the same commit as the code that needs it would
+# 403 here and nowhere else — which is exactly how the D8 Postgres sampler
+# read as "inert" for three battery runs.
+apply_branch_operator_rbac
 fi  # end APPRAFTER_E2E_LOCAL_OPERATOR (Phase 1b)
 
 # ===============================================================

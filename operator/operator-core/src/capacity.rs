@@ -87,6 +87,33 @@ pub fn pvc_usage(summary: &Value, pvc_name: &str) -> Option<(i64, i64)> {
     None
 }
 
+/// Every PVC name the kubelet summary carries volume statistics for.
+///
+/// Used only to turn "no figure" into a sentence a human can act on: an EMPTY
+/// list means this kubelet reports no volume metrics at all (its volume plugin
+/// has no metrics provider — `hostPath`-backed volumes never report), while a
+/// non-empty one that omits the PVC in question means something more specific
+/// is wrong.
+pub fn reported_pvc_names(summary: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(pods) = summary.get("pods").and_then(Value::as_array) else {
+        return out;
+    };
+    for pod in pods {
+        let Some(vols) = pod.get("volume").and_then(Value::as_array) else {
+            continue;
+        };
+        for v in vols {
+            if let Some(n) = v.pointer("/pvcRef/name").and_then(Value::as_str) {
+                out.push(n.to_string());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Whether the node-free fraction is below the warning threshold.
 pub fn is_capacity_warning(node_free_fraction: f64, threshold: f64) -> bool {
     node_free_fraction < threshold
