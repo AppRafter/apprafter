@@ -185,6 +185,36 @@ impl MetricsCache {
         }
         Ok(body)
     }
+
+    /// Scrape ignoring the cache, and refresh it with the result.
+    ///
+    /// For the one case the TTL genuinely gets wrong: a body cached BEFORE an
+    /// object existed does not mention it, and "the metric is absent" then
+    /// looks exactly like "the metric is not published". A newly created
+    /// database would otherwise report no size for up to the full TTL — five
+    /// minutes of a freshly provisioned claim showing nothing, which is
+    /// indistinguishable from the feature being broken. It cost three e2e
+    /// rounds to tell those apart.
+    ///
+    /// Only worth calling once, after a miss: if the fresh body does not carry
+    /// the value either, the value is genuinely not there.
+    pub async fn body_for_pod_uncached(
+        &self,
+        client: &kube::Client,
+        namespace: &str,
+        pod: &str,
+        port: u16,
+        path: &str,
+    ) -> Result<String, String> {
+        let body = scrape_pod(client, namespace, pod, port, path).await?;
+        if let Ok(mut map) = self.entries.lock() {
+            map.insert(
+                format!("{namespace}/{pod}"),
+                (std::time::Instant::now(), body.clone()),
+            );
+        }
+        Ok(body)
+    }
 }
 
 #[cfg(test)]

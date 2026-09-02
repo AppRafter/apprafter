@@ -300,22 +300,6 @@ async fn provision_cloudnativepg(
 
     info!(%name, %ns, %cluster, %cnpg_ns, "provisioning cloudnative-pg claim");
 
-    // 0. The monitoring query the platform depends on, applied BEFORE the
-    //    Cluster that references it (2.22d / D8). CNPG resolves
-    //    `customQueriesConfigMap` in the Cluster's own namespace; a Cluster
-    //    pointing at an absent ConfigMap simply exports nothing, which is the
-    //    failure this whole arm exists to end.
-    let cm_api: Api<k8s_openapi::api::core::v1::ConfigMap> =
-        Api::namespaced(ctx.client.clone(), &cnpg_ns);
-    let cm_body = cnpg::metrics_configmap_object(&cnpg_ns);
-    cm_api
-        .patch(
-            cnpg::METRICS_CONFIGMAP,
-            &apply_params(),
-            &Patch::Apply(&cm_body),
-        )
-        .await?;
-
     // 1. Lazily SSA-apply the shared Cluster (sole-owned). First claim
     //    creates `platform-postgres`; later claims no-op the apply.
     let cluster_api: Api<DynamicObject> =
@@ -1630,14 +1614,31 @@ async fn sample_pg_size_bytes(
         .body_for_pod(&ctx.client, cnpg_ns, primary, 9187, "/metrics")
         .await
         .map_err(|e| format!("scraping {cnpg_ns}/{primary}:9187/metrics: {e}"))?;
-    operator_core::promscrape::parse_labelled_gauge(
-        &body,
-        "cnpg_pg_database_size_bytes",
-        "datname",
-        datname,
-    )
-    .map(|v| v as i64)
-    .ok_or_else(|| {
+    let read = |b: &str| {
+        operator_core::promscrape::parse_labelled_gauge(
+            b,
+            "cnpg_pg_database_size_bytes",
+            "datname",
+            datname,
+        )
+        .map(|v| v as i64)
+    };
+    if let Some(v) = read(&body) {
+        return Ok(v);
+    }
+
+    // MISS — which may only mean the cached body predates this database.
+    // The scrape cache holds a body for 300s and every tenant on this backend
+    // shares it, so a claim provisioned a minute ago is asking about a
+    // database that did not exist when the body was captured. Re-scrape ONCE
+    // before concluding the figure is unavailable; if it is still absent from
+    // a body taken just now, it is genuinely absent.
+    let body = ctx
+        .backend_metrics
+        .body_for_pod_uncached(&ctx.client, cnpg_ns, primary, 9187, "/metrics")
+        .await
+        .map_err(|e| format!("re-scraping {cnpg_ns}/{primary}:9187/metrics: {e}"))?;
+    read(&body).ok_or_else(|| {
         let seen = operator_core::promscrape::label_values(
             &body,
             "cnpg_pg_database_size_bytes",

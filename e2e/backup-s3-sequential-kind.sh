@@ -250,6 +250,20 @@ assert_eq() {
     printf 'FAILED: %s — got %q, want %q\n' "$desc" "$got" "$want" >&2
     return 1
 }
+# Substring assertion. 2.22g added `assert_contains` CALLS to this walk (the
+# `backup status` timezone lines) without the helper itself, which lives in the
+# two Hetzner backup walks — so the walk died with `command not found` the first
+# time it ran that far. Defined here, beside `assert_eq`, in the same shape.
+assert_contains() {
+    local desc="$1" haystack="$2" needle="$3"
+    if printf '%s' "$haystack" | grep -qF -- "$needle"; then
+        printf '  ok: %s (found %q)\n' "$desc" "$needle"
+        return 0
+    fi
+    printf 'FAILED: %s — %q not found in:\n%s\n' "$desc" "$needle" "$haystack" >&2
+    return 1
+}
+
 jp() { kubectl -n "$2" get "$1" "$3" -o jsonpath="$4" 2>/dev/null || true; }
 
 app_pod() {
@@ -527,6 +541,18 @@ printf '  app pod: %s\n' "$POD"
 # Known pg row (via psql over the connection Secret DSN).
 pg_url=$(kubectl -n "$APP_NS" get secret "$PG_CONN" -o jsonpath='{.data.url}' 2>/dev/null | base64 -d || true)
 [ -n "$pg_url" ] || { printf 'FAILED: could not read pg connection url\n' >&2; exit 1; }
+# WAIT for Postgres to accept connections before the first statement. A
+# `ResourceClaim` reports ready once its Database CR and connection Secret are
+# written — which happens while CNPG may still be running initdb, so the `-rw`
+# Service answers "Connection refused" for a while afterwards. The walk hit
+# exactly that and failed on the CREATE TABLE with the claim, the app and the
+# pod all green. (Worth noting on the product side too: an app that starts the
+# instant its claim goes ready will crash-loop briefly. Kubernetes-native
+# workloads retry, so this is an observation rather than a defect — but it is
+# the reason this retry has to exist here.)
+printf '  waiting for Postgres to accept connections ...\n'
+retry 60 5 -- kubectl -n "$APP_NS" exec "$POD" -- psql "$pg_url" -v ON_ERROR_STOP=1 -c "SELECT 1" >/dev/null
+
 kubectl -n "$APP_NS" exec "$POD" -- psql "$pg_url" -v ON_ERROR_STOP=1 \
     -c "CREATE TABLE IF NOT EXISTS app_data (id SERIAL PRIMARY KEY, payload TEXT NOT NULL);" \
     -c "INSERT INTO app_data (payload) VALUES ('s3seq-known-payload');"
@@ -583,6 +609,45 @@ RESTIC_PASSWORD="$RESTIC_PASS" \
 # error. To keep the walk honest AND not depend on host→in-cluster DNS, we
 # enable against the HOST bucket (preflight passes), then merge-patch the CR
 # bucket to the in-cluster endpoint that the RUNNER needs.
+# FREEZE, then override — and only now, with the platform already converged.
+#
+# Ordering is the whole lesson, learned by getting it wrong three ways.
+# Freezing at bootstrap starves the stack: the Dragonfly operator never
+# installs and the redis claim never goes ready. Not freezing at all lets Argo
+# restore the PUBLISHED operator CRDs, which predate `spec.backup.timeZone`
+# (2.22g, unreleased), so the write is silently pruned and `backup enable`
+# refuses. Converge first, freeze second, override third. The CronJob phase
+# below then triggers a one-shot sync, because automation is off from here.
+printf '  freezing Argo CD sync and applying the branch operator manifests ...\n'
+for _app in platform apprafter-operator; do
+    kubectl -n argocd patch applications.argoproj.io "$_app" --type=merge \
+        -p '{"spec":{"syncPolicy":{"automated":null}}}' >/dev/null 2>&1 || true
+done
+apply_branch_operator_crds
+apply_branch_operator_rbac
+
+# PROVE the schema actually carries the field before writing it. A CRD apply
+# returns before the apiserver has adopted the new structural schema, and Argo
+# CD may re-apply the published one underneath — either way the symptom is the
+# same silent prune, and `backup enable`'s read-back guard then refuses. Assert
+# the precondition here so a failure names the CRD rather than the CLI.
+printf '  waiting for the PlatformStack CRD to carry spec.backup.timeZone ...\n'
+_crd_deadline=$(( $(date +%s) + 120 ))
+_crd_ok=""
+while [ "$(date +%s)" -lt "$_crd_deadline" ]; do
+    # Capture, THEN match. `kubectl … | grep -q` cannot work under
+    # `set -o pipefail`: grep exits on the first match and closes the pipe,
+    # kubectl dies of SIGPIPE, and the pipeline reports failure — so a MATCH
+    # reads as a miss. This assertion failed that way for a full round.
+    _crd_json=$(kubectl get crd platformstacks.apprafter.io -o json 2>/dev/null || true)
+    case "$_crd_json" in *'"timeZone"'*) _crd_ok=ok; break ;; esac
+    sleep 5
+done
+[ "$_crd_ok" = ok ] || {
+    printf 'ERROR: the live PlatformStack CRD has no spec.backup.timeZone after applying the branch CRDs — the apply did not stick (Argo CD re-syncing the published chart over it?)\n' >&2
+    exit 1; }
+printf '  ok: the live CRD carries spec.backup.timeZone\n'
+
 apprafter backup enable \
     --bucket "$RESTIC_REPO_HOST" \
     --credential "$CLUSTER_CRED_SECRET" \
@@ -595,8 +660,22 @@ apprafter backup enable \
 
 # Point the runner at the in-cluster bucket + the local runner image (both are
 # dev/fork CR overrides not exposed as CLI flags). Merge-patch, path-scoped.
+#
+# The IMAGE goes to `spec.values.backup.image`, NOT `spec.backup.image`. The
+# latter does not exist: it is absent from the CUE schema, from the generated
+# CRD and from the operator's `BackupConfig`, so the apiserver pruned it and
+# the assertion below read back an empty string. The chart takes the runner
+# image from `.Values.backup.image` (render_tool.cue), and `spec.values` is
+# the passthrough for exactly that — the same route 1.83f used for
+# `gateway.allowedDomains`.
+#
+# Worth stating plainly, because the walk asserted the wrong thing for a
+# reason: until this line the CronJob ran the PUBLISHED runner image while the
+# walk built a local one and believed it was under test. Every local run of
+# the backup runner was exercising a different binary than the one in the
+# working tree.
 kubectl -n "$PROVIDER_NS" patch platformstack default --type merge -p \
-    "{\"spec\":{\"backup\":{\"bucket\":\"${RESTIC_REPO_INCLUSTER}\",\"image\":\"${RUNNER_IMAGE}\"}}}"
+    "{\"spec\":{\"backup\":{\"bucket\":\"${RESTIC_REPO_INCLUSTER}\"},\"values\":{\"backup\":{\"image\":\"${RUNNER_IMAGE}\"}}}}"
 
 status_out="$(apprafter backup status)"
 printf '%s\n' "$status_out"
@@ -619,9 +698,19 @@ assert_contains "backup status prints the time in the zone it was given" \
     "$status_out" "daily at 22:30 Europe/Berlin"
 assert_contains "backup status says the check is off" "$status_out" "check:         off"
 assert_eq "spec.backup.stagingMode is sequential" "$(jp platformstack "$PROVIDER_NS" default '{.spec.backup.stagingMode}')" "sequential"
-assert_eq "spec.backup.image points at the local runner build" "$(jp platformstack "$PROVIDER_NS" default '{.spec.backup.image}')" "$RUNNER_IMAGE"
+assert_eq "the chart values carry the local runner build" "$(jp platformstack "$PROVIDER_NS" default '{.spec.values.backup.image}')" "$RUNNER_IMAGE"
 # The chart-rendered CronJob picks up the new bucket+image on the operator's next
 # reconcile — wait for it to exist + carry the local image.
+# Thaw the PLATFORM app only. Automation is off from the freeze above, so
+# nothing renders the backup CronJobs from the values `backup enable` just
+# wrote. Re-enabling it here is safe in a way that never freezing was not: the
+# operator CRDs are applied by the CHILD `apprafter-operator` Application,
+# which stays frozen, so the branch schema survives while the platform chart
+# converges. (A one-shot `operation` patch was tried first and never fired.)
+printf '  thawing the platform app so it renders the backup CronJobs ...\n'
+kubectl -n argocd patch applications.argoproj.io platform --type=merge \
+    -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}' >/dev/null 2>&1 || true
+
 wait_jsonpath cronjob "$PROVIDER_NS" "$BACKUP_CRONJOB" \
     '{.spec.jobTemplate.spec.template.spec.containers[0].image}' "$RUNNER_IMAGE" 300
 printf '  ok: apprafter-backup CronJob rendered with the sequential runner image\n'

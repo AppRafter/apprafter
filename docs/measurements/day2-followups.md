@@ -2726,6 +2726,34 @@ here read the sampled figures, and the disk one is deliberately placed after
 the pod has mounted the volume, because before that an absent figure is
 correct rather than a defect.
 
+### The pg half: a correction to this entry's own first diagnosis
+
+The Postgres figure did not appear either, and the first two explanations
+written here were both wrong. Recorded because the wrong turns cost four e2e
+rounds and the reasoning is the reusable part.
+
+1. *"`pods/proxy` is forbidden"* — true, and fixed by applying branch RBAC, but
+   it was only the outermost of three layers.
+2. *"`cnpg_pg_database_size_bytes` is not a CNPG default, so declare our own
+   monitoring ConfigMap"* — **wrong, and the fix made things worse.** The
+   evidence for it was that the metric listed `[app, postgres, template1]` in
+   one run and was absent in the next. The custom ConfigMap that followed
+   reused the query name `pg_database`, which collides with CNPG's own default
+   query, and carried no `cnpg.io/reload` label; after it the metric vanished
+   entirely. Reverted.
+
+The actual cause is the **scrape cache**. `MetricsCache` holds a body for 300s
+and every tenant on that backend shares it, so a claim provisioned a minute ago
+asks about a database that did not exist when the body was captured — and a
+cached body that predates an object is indistinguishable from a metric that is
+not published. That is also real user-facing behaviour, not just a test
+artefact: a freshly provisioned database would report no size for up to five
+minutes.
+
+The fix is one re-scrape: on a miss, bypass the cache ONCE and look again. If
+the value is still absent from a body taken just now, it is genuinely absent.
+Live-proven — `sampled database size = 8017599 bytes`.
+
 ### The shape worth carrying
 
 Three D-entries in this file are now the same sentence: **a signal was built,
@@ -2734,6 +2762,11 @@ dead guards, and this). The common cause is not carelessness in the code — eac
 was carefully written — it is that nothing downstream ever asserted the
 *output*. A figure that no test reads is indistinguishable from a figure that
 is never produced.
+
+And a second, sharper one from the wrong turns above: **when a diagnosis is
+built on "the metric is absent", check what else could make it absent before
+changing the producer.** Two of the three layers here were caching and
+permissions — neither of them anything to do with the metric.
 
 ---
 
@@ -2801,3 +2834,54 @@ the live regression guard for the clamp.
 Every remaining `Action::requeue` whose duration is computed rather than
 constant. Two were found here by grep; the audit is cheap and should be
 repeated whenever a new one is introduced.
+
+---
+
+## D24. A walk built an artefact and tested a different one
+
+**Opened:** 2026-09-01, by the 2.22 local e2e battery.
+**Status:** FIXED (harness). No product change — the product was right and the
+walk was pointing at the wrong field.
+**Severity:** low impact, high consequence-if-unnoticed. Nothing was broken;
+the local backup walk simply never exercised the code it spent four minutes
+building.
+
+### What was wrong
+
+`backup-s3-sequential-kind` builds the `apprafter-backup` runner image from the
+working tree and then merge-patched `PlatformStack.spec.backup.image`, with a
+comment describing that field as "the dev/fork escape hatch".
+
+That field does not exist. It is absent from `schemas/v1alpha1/platformstack.cue`,
+from the generated CRD, and from the operator's `BackupConfig`. The apiserver
+accepted the patch and pruned the key, so the CronJob kept running the
+**published** runner image while the walk asserted — against an empty string —
+that it was running the local one.
+
+The chart reads the runner image from `.Values.backup.image`
+(`render_tool.cue`), and `PlatformStack.spec.values` is the passthrough for
+chart values — the same route 1.83f used for `gateway.allowedDomains`. The walk
+now patches there.
+
+### Why it matters more than it looks
+
+Every local run of the backup runner was testing a binary from a published
+release rather than the one in the tree. A change to the runner would have
+passed this walk without ever executing.
+
+That is the same shape as the branch-RBAC gap recorded under D22 — a walk that
+looks like it exercises local code and does not — and the two were found in the
+same afternoon by the same means. Together they suggest a standing check worth
+making explicitly:
+
+> **When a walk builds an artefact, it must assert that the cluster is running
+> THAT artefact** — by digest, tag, or a value the artefact alone produces.
+> "I built it and applied something" is not the same claim.
+
+### Related
+
+The 2.22g read-back guard is what surfaced the neighbouring half of this: when
+the same walk ran against the published CRD, `backup enable --timezone` refused
+with "the cluster did not store the timezone (it reads back as None)" instead
+of silently losing it. The guard worked exactly as designed, on the first
+cluster that could disprove it.

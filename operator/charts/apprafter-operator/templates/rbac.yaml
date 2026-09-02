@@ -150,18 +150,11 @@ rules:
       # ADR 0048 (revised): SSA-stamp/prune the pending-upgrade
       # annotations on the chart-managed platform-migration-anchor
       # ConfigMap so the root App's Argo tile rolls up to Suspended.
-      # The chart owns the anchor; the operator only patches its
-      # annotations (annotation-only SSA, own field manager).
+      # No create/delete — the chart owns the anchor; the operator only
+      # patches its annotations (annotation-only SSA, own field manager).
       - update
       - patch
-      # 2.22d (D8): the provisioner now OWNS a ConfigMap of its own — the
-      # CNPG monitoring query that publishes the per-database size metric
-      # `status.size.bytes` reports. An SSA apply of an object that does not
-      # exist yet is a CREATE, so the verb ships with the code that needs it.
-      # This repository has been bitten three times by the opposite order
-      # (ADR 0048's anchor GET, the 0.2.31 MigrationPlan GC delete, and the
-      # 2.22d pods/proxy grant that the local walks could not even see).
-      - create
+
   # SourceCredential CRD + its derivations (1.79c / ADR 0039).
   # The controller watches SourceCredentials, reads the
   # controller-unsealed material Secret (in apprafter-system),

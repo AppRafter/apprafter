@@ -539,6 +539,37 @@ WRAP
 # ClusterRoleBinding subject with the wrong namespace and the binding silently
 # grants nothing (walk-fix 3ac1972).
 # ---------------------------------------------------------------
+# ---------------------------------------------------------------
+# apply_branch_operator_crds
+#
+# The companion to `apply_branch_operator_rbac`, for the same reason and with
+# the same failure mode: a walk running the branch's operator against the
+# PUBLISHED CRDs cannot exercise a field the branch added. The apiserver
+# accepts the write and prunes the unknown key, so the feature reads as broken
+# with no error anywhere.
+#
+# The 2.22 battery hit exactly that: `backup enable --timezone Europe/Berlin`
+# refused with "the cluster did not store the timezone (it reads back as
+# None)" — 2.22g's own read-back guard working perfectly, against a CRD that
+# predates `spec.backup.timeZone`.
+# ---------------------------------------------------------------
+apply_branch_operator_crds() {
+    local chart="${REPO_ROOT}/operator/charts/apprafter-operator"
+    [ -d "$chart" ] || { printf '  (no operator chart at %s — skipping branch CRDs)\n' "$chart"; return 0; }
+    _crd_yq() { if command -v yq >/dev/null 2>&1; then yq "$@"; else nix run nixpkgs#yq-go -- "$@"; fi; }
+    local out
+    out=$(helm template apprafter-operator "$chart" \
+        | _crd_yq 'select(.kind == "CustomResourceDefinition")' \
+        | kubectl apply --server-side --force-conflicts -f - 2>&1) || {
+        printf 'ERROR: applying branch CRDs failed:\n%s\n' "$out" >&2
+        return 1
+    }
+    # Report the COUNT, not a bare "applied". An unconditional success line
+    # proves nothing, and this helper spent three walk rounds appearing to
+    # work while the field it exists for stayed pruned.
+    printf '  branch CRDs applied (%s object(s))\n' "$(printf '%s\n' "$out" | grep -c .)"
+}
+
 apply_branch_operator_rbac() {
     local chart="${REPO_ROOT}/operator/charts/apprafter-operator"
     [ -d "$chart" ] || { printf '  (no operator chart at %s — skipping branch RBAC)\n' "$chart"; return 0; }
