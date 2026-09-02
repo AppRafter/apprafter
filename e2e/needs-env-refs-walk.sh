@@ -55,7 +55,19 @@
 #        - LOG_LEVEL == info.
 #   5. Delete the `appsecret` Secret; ASSERT the Application flips to
 #      Ready=False reason=EnvSecretMissing (phase EnvSecretMissing).
-#      Re-create it; ASSERT the Application recovers to Ready.
+#      Re-create it under the WRONG KEY; ASSERT the message distinguishes
+#      that from absence and names the namespace, the Secret and the keys it
+#      DOES carry (2.22c / D7 — the error has to answer the question it
+#      raises, or the reader goes to kubectl for all three candidate causes).
+#      Re-create it correctly; ASSERT the Application recovers to Ready.
+#   6. Rotate the VALUE under the same key; ASSERT `status.envConfig.digest`
+#      and `changedAt` both move, that `changedAt` lands NEWER than the
+#      pre-rotation pod's startTime (the comparison `apprafter app status`
+#      renders as `← old config`), and — just as hard — that NOTHING rolled:
+#      same pod, same restart count, same Deployment generation (2.22c / D6).
+#      The automatic roll was explicitly rejected as a Tier-1 default, so a
+#      walk asserting the value reached the pod would be testing the
+#      behaviour that was turned down.
 #
 # CLI state injection
 # -------------------
@@ -321,6 +333,44 @@ cond_reason() {
     kubectl -n "$2" get "$1" "$3" -o \
         jsonpath="{.status.conditions[?(@.type==\"$4\")].reason}" \
         2>/dev/null || true
+}
+
+cond_message() {
+    # $1 kind, $2 ns, $3 name, $4 condition-type
+    kubectl -n "$2" get "$1" "$3" -o \
+        jsonpath="{.status.conditions[?(@.type==\"$4\")].message}" \
+        2>/dev/null || true
+}
+
+# ---------------------------------------------------------------
+# Local helper: assert_contains <description> <haystack> <needle>
+# ---------------------------------------------------------------
+assert_contains() {
+    local desc="$1" hay="$2" needle="$3"
+    case "$hay" in
+        *"$needle"*)
+            printf '  ok: %s (found %q)\n' "$desc" "$needle"
+            return 0
+            ;;
+    esac
+    printf 'ERROR: %s — %q not found in:\n%s\n' "$desc" "$needle" "$hay" >&2
+    return 1
+}
+
+# Wait until a condition's message contains a substring, or time out.
+wait_cond_message() {
+    # $1 kind, $2 ns, $3 name, $4 type, $5 needle, $6 timeout-seconds
+    local deadline msg
+    deadline=$(( $(date +%s) + $6 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        msg="$(cond_message "$1" "$2" "$3" "$4")"
+        case "$msg" in
+            *"$5"*) printf '%s' "$msg"; return 0 ;;
+        esac
+        sleep 3
+    done
+    printf '%s' "$msg"
+    return 1
 }
 
 # ---------------------------------------------------------------
@@ -691,7 +741,37 @@ assert_eq "Ready condition status after secret delete" "$ready" "False"
 reason=$(cond_reason "$APP_RES" "$APP_NS" "$APP" Ready)
 assert_eq "Ready condition reason" "$reason" "EnvSecretMissing"
 
-# Re-create the Secret; the operator recovers the Application to Ready.
+# --- D7: the error answers the question it raises ------------------------
+#
+# Re-create the Secret, but under the WRONG KEY — the `stripe_api_key` versus
+# `stripe-api-key` slip the fix was written for. Before 2.22c the operator said
+# only that a ref was unresolved, which sends the reader to kubectl to find out
+# whether the Secret is missing, in the wrong namespace, or simply spelled
+# differently. Those are three different problems with one message.
+#
+# The Secret now EXISTS, so this also separates the two failures: "no Secret"
+# and "Secret without that key" must not read identically.
+kubectl -n "$APP_NS" create secret generic "$EXT_SECRET" \
+    --from-literal="wrong_key_name=${EXT_VAL}" \
+    --dry-run=client -o yaml | kubectl apply -f -
+printf '  re-created Secret %s/%s under the WRONG key\n' "$APP_NS" "$EXT_SECRET"
+
+msg="$(wait_cond_message "$APP_RES" "$APP_NS" "$APP" Ready "carries no key" 120)" || {
+    printf 'ERROR: the Ready message never named the missing key. Got: %s\n' "$msg" >&2
+    exit 1; }
+assert_contains "the message distinguishes present-but-wrong-key from absent" \
+    "$msg" "carries no key"
+assert_contains "the message names the namespace, so it need not be guessed" \
+    "$msg" "namespace \"${APP_NS}\""
+assert_contains "the message names the Secret" "$msg" "\"${EXT_SECRET}\""
+# The half that turns the message into an answer: the keys that ARE there.
+# Without this line the reader still has to go and look.
+assert_contains "the message lists the key the Secret actually carries" \
+    "$msg" "wrong_key_name"
+reason=$(cond_reason "$APP_RES" "$APP_NS" "$APP" Ready)
+assert_eq "wrong key is still EnvSecretMissing, not a new reason" "$reason" "EnvSecretMissing"
+
+# Re-create the Secret correctly; the operator recovers the Application to Ready.
 kubectl -n "$APP_NS" create secret generic "$EXT_SECRET" \
     --from-literal="${EXT_KEY}=${EXT_VAL}" \
     --dry-run=client -o yaml | kubectl apply -f -
@@ -700,6 +780,92 @@ printf '  re-created Secret %s/%s\n' "$APP_NS" "$EXT_SECRET"
 wait_jsonpath "$APP_RES" "$APP_NS" "$APP" '{.status.phase}' Ready 180
 ready=$(cond_status "$APP_RES" "$APP_NS" "$APP" Ready)
 assert_eq "Ready condition status after secret recreate" "$ready" "True"
+
+# ===============================================================
+# Phase 6: rotating a secret is VISIBLE without being ACTED on (D6)
+# ===============================================================
+phase "Phase 6: rotate the secret value -> envConfig digest + changedAt move, pods do NOT roll"
+
+# D6's decision, and the reason this phase asserts a negative as hard as it
+# asserts a positive: an env var sourced from a Secret is resolved once at pod
+# start and never re-read, so a rotated secret silently does nothing until
+# something restarts the workload. The fix makes that VISIBLE
+# (`status.envConfig.changedAt` versus each pod's startTime) and deliberately
+# does NOT make it ACT — an automatic roll was rejected as a Tier-1 default,
+# because a Secret is not owned by one Application and the blast radius of
+# rolling every consumer is unknowable to whoever sealed it.
+#
+# So a walk that only checked "the value eventually reaches the pod" would be
+# asserting the behaviour that was explicitly turned down.
+
+digest_before=$(jp "$APP_RES" "$APP_NS" "$APP" '{.status.envConfig.digest}')
+changed_before=$(jp "$APP_RES" "$APP_NS" "$APP" '{.status.envConfig.changedAt}')
+assert_nonempty "envConfig.digest is recorded while Ready" "$digest_before"
+assert_nonempty "envConfig.changedAt is recorded while Ready" "$changed_before"
+
+pod_before=$(kubectl -n "$APP_NS" get pods -l "app.kubernetes.io/name=${APP}" \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+restarts_before=$(kubectl -n "$APP_NS" get pods -l "app.kubernetes.io/name=${APP}" \
+    -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}' 2>/dev/null || true)
+gen_before=$(jp deployment "$APP_NS" "$APP" '{.metadata.generation}')
+assert_nonempty "a workload pod exists before the rotation" "$pod_before"
+
+# Rotate the VALUE under the same key — the ordinary credential rotation.
+kubectl -n "$APP_NS" create secret generic "$EXT_SECRET" \
+    --from-literal="${EXT_KEY}=rotated-${EXT_VAL}" \
+    --dry-run=client -o yaml | kubectl apply -f -
+printf '  rotated the value of %s/%s under key %s\n' "$APP_NS" "$EXT_SECRET" "$EXT_KEY"
+
+# The digest is over the RESOLVED values, so a new value must move it.
+_d_deadline=$(( $(date +%s) + 180 ))
+digest_after="$digest_before"
+while [ "$(date +%s)" -lt "$_d_deadline" ]; do
+    digest_after=$(jp "$APP_RES" "$APP_NS" "$APP" '{.status.envConfig.digest}')
+    [ -n "$digest_after" ] && [ "$digest_after" != "$digest_before" ] && break
+    sleep 3
+done
+if [ "$digest_after" = "$digest_before" ]; then
+    printf 'ERROR: envConfig.digest did not move after the value rotation (still %q)\n' \
+        "$digest_before" >&2
+    printf '  the drift signal is the whole of D6 — if it does not move, nothing downstream can see the rotation\n' >&2
+    exit 1
+fi
+printf '  ok: envConfig.digest moved on rotation (%.12s… -> %.12s…)\n' "$digest_before" "$digest_after"
+
+changed_after=$(jp "$APP_RES" "$APP_NS" "$APP" '{.status.envConfig.changedAt}')
+if [ "$changed_after" = "$changed_before" ]; then
+    printf 'ERROR: envConfig.changedAt did not move although the digest did (%s)\n' "$changed_after" >&2
+    exit 1
+fi
+printf '  ok: envConfig.changedAt moved with it (%s -> %s)\n' "$changed_before" "$changed_after"
+
+# changedAt is only usable as a drift boundary if it is NEWER than the pod that
+# predates the change. This is the comparison `apprafter app status` renders as
+# `← old config`.
+pod_started=$(kubectl -n "$APP_NS" get pod "$pod_before" \
+    -o jsonpath='{.status.startTime}' 2>/dev/null || true)
+assert_nonempty "the pre-rotation pod reports a startTime" "$pod_started"
+newer=$(python3 - "$pod_started" "$changed_after" <<'PY'
+import sys
+from datetime import datetime
+def p(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+print("yes" if p(sys.argv[2]) > p(sys.argv[1]) else "no")
+PY
+)
+assert_eq "changedAt is newer than the pod that predates the rotation" "$newer" "yes"
+
+# AND THE NEGATIVE. Nothing rolled: same pod, same restart count, same
+# Deployment generation. If a future change starts stamping the digest onto the
+# pod template, every one of these flips and this phase is what says so.
+pod_after=$(kubectl -n "$APP_NS" get pods -l "app.kubernetes.io/name=${APP}" \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+restarts_after=$(kubectl -n "$APP_NS" get pods -l "app.kubernetes.io/name=${APP}" \
+    -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}' 2>/dev/null || true)
+gen_after=$(jp deployment "$APP_NS" "$APP" '{.metadata.generation}')
+assert_eq "the rotation did NOT replace the pod" "$pod_after" "$pod_before"
+assert_eq "the rotation did NOT restart the container" "$restarts_after" "$restarts_before"
+assert_eq "the rotation did NOT bump the Deployment generation" "$gen_after" "$gen_before"
 
 # ===============================================================
 # Done — tear down on success path
@@ -719,4 +885,4 @@ fi
 rm -rf "$TMPDIR_WORK"
 
 printf '\nneeds-env-refs-walk GREEN in %s\n' "$(elapsed)"
-printf 'Chain proven: provision -> decomposed conn-Secret keys -> resolve_env (literal + claim url/user/pass + external secret) -> resolved pod values -> EnvSecretMissing NotReady -> recover\n'
+printf 'Chain proven: provision -> decomposed conn-Secret keys -> resolve_env (literal + claim url/user/pass + external secret) -> resolved pod values -> EnvSecretMissing NotReady (absent AND wrong-key, message names ns + available keys, D7) -> recover -> rotation moves envConfig digest+changedAt without rolling the pod (D6)\n'

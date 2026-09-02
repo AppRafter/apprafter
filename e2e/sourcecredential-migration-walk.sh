@@ -115,6 +115,10 @@ PROVIDER_NS="apprafter-system"      # operator + webhook + sealed-secrets ns
 # The MigrationPlan CRD kind. Address the full name for clarity.
 PLAN_RES="migrationplan"
 
+# Group-qualified: a bare `application` also resolves to Argo CD's
+# argoproj.io Application, and Argo CD is installed here.
+APP_RES="application.apprafter.io"
+
 # ---------------------------------------------------------------
 # Tool checks (fail loudly, never silently skip)
 # ---------------------------------------------------------------
@@ -808,6 +812,170 @@ assert_eq "no SC-scope plan after widen-back" "$(sc_plan_count)" "0"
 printf 'ok: widen-back GCs the stale plan + un-pauses\n'
 
 # ===============================================================
+# Phase 8: the pull-secret copy is reference-counted, not orphaned (D13)
+# ===============================================================
+phase "Phase 8: two apps share one pull-secret copy -> it dies only when the LAST one does"
+
+# D13: the copy the Application controller projects into the app namespace is
+# named after the CREDENTIAL, so every app in that namespace pulling through it
+# shares one object. Before 2.22b it had no owner at all: a controlling
+# ownerRef from any single Application would cascade-delete a Secret its
+# neighbours still need, that was correctly avoided, and then nobody assigned
+# an owner instead. The Secret outlived every consumer forever.
+#
+# The shipped fix uses the fact that `ownerReferences` is a LIST: one
+# NON-controller entry per consuming Application, and the apiserver's garbage
+# collector removes a dependent only when ALL its owners are gone. Reference
+# counting, executed by the apiserver.
+#
+# ONE app cannot show that. With a single owner, "dies with its owner" and
+# "reference counted" are the same observation — so this phase runs two, and
+# the load-bearing assertion is the MIDDLE one: after the first deletion the
+# Secret must still be there.
+D13_NS="pullref"
+D13_APP_A="puller-a"
+D13_APP_B="puller-b"
+D13_CRED="pullcreds"                       # lives in apprafter-system, see below
+D13_MATERIAL="srccred-${D13_CRED}-material"
+D13_DERIVED="srccred-${D13_CRED}-dockercfg"  # the canonical derived pull-secret
+D13_COPY="srccred-${D13_CRED}-pull"          # app_pull_secret_name(cred_name)
+
+# THE CREDENTIAL MUST LIVE IN apprafter-system, AND THE ONE THIS WALK HAS DOES
+# NOT. `list_source_credentials` reads exactly one namespace —
+# `SOURCECRED_NAMESPACE = "apprafter-system"` (application/src/lib.rs:2111,
+# :2167-2169) — while this walk deliberately keeps its credential in $SC_NS to
+# prove that SC-scope MigrationPlans land in the credential's own namespace.
+#
+# So the Application controller cannot see $SC_NAME at all, and a phase built
+# on it would assert a copy the product has no path to create: green never,
+# and for a reason having nothing to do with reference counting. Found by
+# running it — the apps came up Ready with zero owners on a Secret that was
+# never written.
+#
+# Hence a second, self-contained credential in the namespace the controller
+# actually reads. It shares nothing with the migration-gate fixture above.
+kubectl create namespace "$D13_NS" --dry-run=client -o yaml | kubectl apply -f -
+
+apprafter secret seal "$D13_MATERIAL" \
+    --namespace "$PROVIDER_NS" \
+    --from-literal "username=pullbot" \
+    --from-literal "password=ghp_pull_dummy_token"
+wait_secret_appears "$PROVIDER_NS" "$D13_MATERIAL" 120
+printf '  ok: sealed material %s/%s unsealed\n' "$PROVIDER_NS" "$D13_MATERIAL"
+
+kubectl apply -f - <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: SourceCredential
+metadata:
+  name: ${D13_CRED}
+  namespace: ${PROVIDER_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  registry:
+    backend:
+      sealedSecretRef:
+        name: ${D13_MATERIAL}
+    hosts: ["${HOST_KEEP}"]
+YAML
+
+# The controller derives the canonical pull-secret before any app can consume
+# it; `attach_pull_secret` defers (and logs) while it is absent, so waiting
+# here is what separates "not derived yet" from "not covered at all".
+wait_secret_appears "$PROVIDER_NS" "$D13_DERIVED" 180
+printf '  ok: derived pull-secret %s/%s present\n' "$PROVIDER_NS" "$D13_DERIVED"
+
+# Both images sit under the host the credential still covers after Phase 5's
+# narrowing ($HOST_KEEP), so the controller finds a covering credential. They
+# never need to PULL — the copy is written during reconcile, long before the
+# kubelet tries — so an unpullable tag is fine and keeps the walk offline.
+for _app in "$D13_APP_A" "$D13_APP_B"; do
+    kubectl apply -f - <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${_app}
+  namespace: ${D13_NS}
+spec:
+  base:
+    image: ${HOST_KEEP}${_app}:v1
+    replicas: 1
+YAML
+done
+printf '  applied %s + %s in %s (images under %s)\n' \
+    "$D13_APP_A" "$D13_APP_B" "$D13_NS" "$HOST_KEEP"
+
+# Wait for the copy to appear AND to carry both owners.
+#
+# Read the names FIRST and count second. `kubectl | wc -w` looks harmless and
+# is not: under `set -o pipefail` a kubectl that exits non-zero (which it does
+# for every poll before the Secret exists) makes the whole pipeline non-zero,
+# the assignment inherits that status, and `set -e` kills the walk on the first
+# iteration — one second in, with no error of its own. `2>/dev/null` hides the
+# message and not the status. Same family as the `grep -q` SIGPIPE trap.
+owner_names() {
+    kubectl -n "$D13_NS" get secret "$D13_COPY" \
+        -o jsonpath='{.metadata.ownerReferences[*].name}' 2>/dev/null || true
+}
+_d13_deadline=$(( $(date +%s) + 180 ))
+owners=0
+while [ "$(date +%s)" -lt "$_d13_deadline" ]; do
+    owners=$(owner_names | wc -w | tr -d ' ')
+    [ "${owners:-0}" -ge 2 ] && break
+    sleep 5
+done
+if [ "$owners" -lt 2 ]; then
+    printf 'ERROR: pull-secret copy %s/%s never gathered both owners (saw %s)\n' \
+        "$D13_NS" "$D13_COPY" "$owners" >&2
+    kubectl -n "$D13_NS" get secret "$D13_COPY" -o yaml >&2 2>&1 || true
+    kubectl -n "$D13_NS" get "$APP_RES" -o wide >&2 2>&1 || true
+    exit 1
+fi
+printf '  ok: the copy carries %s ownerReferences, one per consuming Application\n' "$owners"
+
+# Not one of them may be the controller — a controlling ref is exactly the
+# cascade this design refuses.
+controllers=$( { kubectl -n "$D13_NS" get secret "$D13_COPY" \
+    -o jsonpath='{.metadata.ownerReferences[?(@.controller==true)].name}' 2>/dev/null || true; } | wc -w | tr -d ' ')
+assert_eq "no owner is the CONTROLLER (a cascade would evict the neighbour)" "$controllers" "0"
+
+# THE ASSERTION THIS PHASE EXISTS FOR. Delete one app; the Secret must survive,
+# because the other app is still pulling through it.
+kubectl -n "$D13_NS" delete "$APP_RES" "$D13_APP_A" --wait=true
+sleep 10
+if ! kubectl -n "$D13_NS" get secret "$D13_COPY" >/dev/null 2>&1; then
+    printf 'ERROR: the pull-secret copy was deleted with the FIRST app — %s can no longer pull\n' \
+        "$D13_APP_B" >&2
+    printf '  that is the cascade the non-controller ownerRef design exists to prevent\n' >&2
+    exit 1
+fi
+owners_after=$(owner_names | wc -w | tr -d ' ')
+assert_eq "one owner released, the copy survives for the remaining consumer" "$owners_after" "1"
+
+# Delete the last consumer; the apiserver's GC must now reclaim it. This is the
+# half D13 opened on: before the fix it survived here forever, in every
+# namespace that had ever pulled through the credential.
+kubectl -n "$D13_NS" delete "$APP_RES" "$D13_APP_B" --wait=true
+_gc_deadline=$(( $(date +%s) + 120 ))
+gone=0
+while [ "$(date +%s)" -lt "$_gc_deadline" ]; do
+    if ! kubectl -n "$D13_NS" get secret "$D13_COPY" >/dev/null 2>&1; then gone=1; break; fi
+    sleep 5
+done
+if [ "$gone" -ne 1 ]; then
+    printf 'ERROR: the pull-secret copy outlived its LAST consumer — the D13 orphan is back\n' >&2
+    kubectl -n "$D13_NS" get secret "$D13_COPY" -o yaml >&2 2>&1 || true
+    exit 1
+fi
+printf '  ok: the last deletion reclaimed the copy — no dockerconfigjson orphan in %s\n' "$D13_NS"
+
+# The generalised form the ledger asked for: nothing of that type survives.
+leftover=$(kubectl -n "$D13_NS" get secrets \
+    --field-selector type=kubernetes.io/dockerconfigjson \
+    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+assert_eq "no dockerconfigjson Secret survives in the namespace" "$leftover" ""
+
+# ===============================================================
 # Done — tear down on the success path
 # ===============================================================
 
@@ -824,4 +992,4 @@ fi
 rm -rf "$TMPDIR_WORK"
 
 printf '\nsourcecredential-migration-walk GREEN in %s\n' "$(elapsed)"
-printf 'Chain proven: seed SC (2 hosts + 2 prefixes) + sealed material -> derive BOTH halves + baseline stamped -> remove a host -> sourcecredential-scope plan gated + BOTH derivations paused (old Secrets byte-identical) -> plan shape (breaking / coverage-removal / approvedSpecHash / SC ownerRef) -> migration list SCOPE=sourcecredential -> approve (consume + re-derive narrowed + GC + anti-loop) -> raw kubectl edit trips the SAME gate (actor-agnostic) -> widen-back GCs the stale plan + un-pauses\n'
+printf 'Chain proven: seed SC (2 hosts + 2 prefixes) + sealed material -> derive BOTH halves + baseline stamped -> remove a host -> sourcecredential-scope plan gated + BOTH derivations paused (old Secrets byte-identical) -> plan shape (breaking / coverage-removal / approvedSpecHash / SC ownerRef) -> migration list SCOPE=sourcecredential -> approve (consume + re-derive narrowed + GC + anti-loop) -> raw kubectl edit trips the SAME gate (actor-agnostic) -> widen-back GCs the stale plan + un-pauses -> two apps share one pull-secret copy, it survives the first deletion and is reclaimed on the last (D13)\n'
