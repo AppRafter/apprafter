@@ -48,6 +48,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # `cargo test --all` here runs docsgen's recipe_corpus_test,
+          # which builds the same gate `docsgen gate` does — and that
+          # ages every documentation exemption by resolving its
+          # `since=vX.Y.Z` to that tag's commit date. An exemption it
+          # cannot age is VOID (cli/docsgen/src/gate.rs), and the
+          # default `fetch-depth: 1` fetches no tags at all. Without
+          # this the corpus test fails HERE while passing on every
+          # developer's machine, reporting the exempted line rather than
+          # the missing tag — which is exactly what it did. Same reason
+          # docs.yml and release-docs.yml carry it.
+          fetch-depth: 0
       # cli/cli-providers/build.rs shells out to `cue export`
       # at compile time (Track B.1.71). Without cue on PATH
       # the build script panics with NotFound.
