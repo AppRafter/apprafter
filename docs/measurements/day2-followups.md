@@ -35,10 +35,21 @@ would otherwise touch the same code three times.
 | **D13** | A registry credential copy that nothing ever reclaims | FIXED 2.22b — walk step still owed | 2.22b |
 | **D14** | Re-sealing a secret performs a gated change through an ungated door | RESOLVED (decision + disclosure landed 2.22c) |
 | **D15** | The destructive-change gate never engaged for a base-only app | RESOLVED |
-| **D16** | A reconcile that fails leaves no trace outside the operator's log | open — high |
+| **D16** | A reconcile that fails leaves no trace outside the operator's log | FIXED 2.22h — walk-verified | 2.22h |
 | **D17** | A Dragonfly tenant can read every other tenant's key counts | FIXED 2.22f — and it was larger than key counts | 2.22f |
 | **D18** | Two git-ownership guards could never fire: kubectl hides `managedFields` | FIXED 2.22e | 2.22e |
 | **D19** | The 2.22d size sampler deletes a live claim's whole allocation | FIXED 2.22f — same day, self-inflicted | 2.22f |
+| **D20** | An approved migration can sit unexecuted, with no requeue behind it | **OPEN** — unreproduced, cause not proven | — |
+| **D21** | A claim deleted twice inside its grace window wedges forever | FIXED — walk-verified | — |
+| **D22** | The disk half of D8 never populated, and no local walk could have noticed | FIXED — pg half walk-verified, disk figure needs hardware | — |
+| **D23** | One object's data can crash-loop the entire operator | FIXED at both sites | — |
+| **D24** | A walk built an artefact and tested a different one | harness FIXED; **substance open** — no supported way to override the runner image | — |
+| **D25** | The real-Hetzner backup walk is blocked until 0.2.59 publishes | RESOLVED — walk re-ran GREEN | — |
+| **D26** | A `sequential` backup restores empty, and says it succeeded | FIXED 2026-09-02 — walk GREEN, shipped in cli v0.2.53 | — |
+
+The entries below D19 were opened by the validation batch at the 2.22 close
+rather than by the 2.19j walk, which is why they carry no planned-as subphase:
+they were found and fixed inside 2.22 itself.
 
 ## D1. VPA in-place right-sizing has never run: wrong feature-gate name
 
@@ -1455,9 +1466,15 @@ the `Progressing` fall-through; nested under a phase check it would read
 ## D10. The applying half of right-sizing has never been observed to apply anything
 
 **Opened:** 2026-08-30 (re-reading **D1** against the tree).
-**Status:** FIXED 2026-08-31 (2.22d) — code complete, **walk rewritten but not
-yet run**. In-place resize needs a real Hetzner node (kind/k3d cannot do it), so
-the rewritten `e2e/vpa-walk.sh` runs in the batch at the 2.22 close.
+**Status:** RESOLVED. Code complete 2026-08-31 (2.22d); the rewritten
+`e2e/vpa-walk.sh` **ran GREEN on real Hetzner 2026-09-02, FAIL=0** — in-place
+resize needs a real node, which kind and k3d cannot provide. Both halves are
+proven on hardware: a differing pair genuinely differs (the seeded app's
+recommendation came out at 163 MB against a 32Mi seed, so the assertion *can*
+fail), and the resize is observed being applied. Getting there also exposed why
+the walk had never run at all: it called `target add` without `--server-type`,
+which 2.16h-a made mandatory, so it could not reach its first assertion on any
+cluster — not merely unrun, unrunnable (`c9c583f`).
 **Severity:** high. `InPlace` behaves correctly by construction and by
 upstream source; what is missing is any evidence it has ever acted, and any
 signal when it cannot.
