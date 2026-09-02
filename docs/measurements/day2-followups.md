@@ -45,6 +45,7 @@ would otherwise touch the same code three times.
 | **D23** | One object's data can crash-loop the entire operator | FIXED at both sites | — |
 | **D24** | A walk built an artefact and tested a different one | RESOLVED — the walk runs its own build; no product change owed | — |
 | **D27** | The backup runner pin rotted, and the scheduled backup quietly ran an old binary | FIXED — pin moved + CI guard | — |
+| **D28** | `ensure_repo` treats a restic repository reference as a filesystem path | FIXED — found the hour the walk started running local code | — |
 | **D25** | The real-Hetzner backup walk is blocked until 0.2.59 publishes | RESOLVED — walk re-ran GREEN | — |
 | **D26** | A `sequential` backup restores empty, and says it succeeded | FIXED 2026-09-02 — walk GREEN, shipped in cli v0.2.53 | — |
 
@@ -3163,8 +3164,8 @@ nobody ever read back. Same shape as D10, D18, D19 and D22.
 ## D27. The runner pin rotted, and the nightly backup quietly ran an old binary
 
 **Opened:** 2026-09-02, while answering a question about D24 — not by a walk.
-**Status:** FIXED the same day: pin moved to `v0.2.53`, plus a CI guard so the
-next drift is loud.
+**Status:** FIXED the same day: pin moved (to `v0.2.54` — see the last section;
+it was briefly `v0.2.53`), plus a CI guard so the next drift is loud.
 **Severity:** high, and silent by construction. Backups ran, exited zero, wrote
 snapshots and reported success the entire time.
 
@@ -3212,9 +3213,11 @@ Justfile` was empty.
 
 ### The fix
 
-1. The pin moves to `v0.2.53` (verified pullable from ghcr, not merely tagged),
-   shipped as platform-stack `0.2.61` with a `compatibility.cue` entry that
-   states plainly what earlier snapshots do not contain.
+1. The pin moves — to `v0.2.54`, not the `v0.2.53` it first landed on, because
+   pointing the walk at the real runner immediately found a bug IN it (**D28**),
+   and that fix is in `backup-core`, which is both the CLI and the runner.
+   Shipped as platform-stack `0.2.61` with a `compatibility.cue` entry stating
+   plainly what earlier snapshots do not contain.
 2. `scripts/check-backup-runner-pin.sh`, wired into `just lint`, fails when
    runner source changed since the pinned tag, and separately when the pin names
    a tag that was never published (which would be `ImagePullBackOff` at 03:00,
@@ -3237,3 +3240,68 @@ value the system could not produce (D24). The check that would have caught all
 three is the same one — **name the thing you believe is running, then prove the
 cluster is running that thing** — and it is worth more than any individual fix
 here.
+
+---
+
+## D28. `ensure_repo` treats a restic repository reference as a filesystem path
+
+**Opened:** 2026-09-02, by the first run of `e2e/backup-s3-sequential-kind.sh`
+after that walk began executing the runner it builds (D24).
+**Status:** FIXED the same day, shipped in cli/runner **v0.2.54** and pinned by
+platform-stack `0.2.61`.
+**Severity:** high on the path it reaches — it fails somebody's FIRST scheduled
+backup — and invisible everywhere else.
+
+### What is wrong
+
+```text
+backup failed: create repo parent
+  s3:http://127.0.0.1:48913/apprafter-backups: Permission denied (os error 13)
+```
+
+`ensure_repo` called `Path::new(repo).parent()` and `create_dir_all` on the
+restic repository REFERENCE. A reference is not a path. `s3:`, `rest:`, `sftp:`,
+`b2:`, `gs:`, `rclone:` all name a remote, and the "parent directory" of one is a
+nonsense relative path assembled out of a URL.
+
+Creating it is wrong in two ways, and which way depends on who is running:
+
+* **the in-cluster runner** — not root, working directory `/` — fails with
+  EACCES, taking the whole backup down with a message naming an S3 URL as a
+  directory;
+* **the CLI**, where the working directory is writable, **succeeds** — silently
+  creating a junk tree like `./s3:https:/endpoint:9000/bucket` wherever the
+  operator happened to be standing.
+
+### Why it survived this long
+
+It is not a regression. The code is byte-identical in the published `v0.2.33`
+runner and has been there since `e541993`. It is latent: the branch runs only
+when the repository does not exist yet, and `apprafter backup enable` runs a
+host-side `restic init` preflight first, so on the ordinary path the repository
+always exists by the time the runner looks.
+
+It fires on a genuinely fresh repository — a new bucket, a wiped one, or a
+`PlatformStack` edited by hand without the CLI preflight. That is a first
+scheduled backup, which is exactly when nobody is watching and when the operator
+has the least reason to doubt the setup they just completed.
+
+### The fix
+
+`repo_parent_to_create` returns a directory only for a local filesystem repo
+(`local:<path>` or a bare path) and `None` for anything carrying a URL scheme.
+Three tests: every remote backend, both local spellings, and a bare name with no
+parent. Verified by reintroduction — without the fix the remote-backend test
+fails and names the S3 URL it was about to create.
+
+### What this entry is really evidence of
+
+D24 argued that closing it needed new product surface, and closing it correctly
+instead took one string in a shell script. Within a single run of the repaired
+walk, that harness change found a real product defect that eight green runs of
+the unrepaired walk could not have found — because they were all exercising a
+published binary while believing they were testing the working tree.
+
+That is the return on the rule this file keeps restating: **name the artefact
+you believe is running, then prove the cluster is running that one.** It is not
+bookkeeping. It is the difference between a test and a decoration.
