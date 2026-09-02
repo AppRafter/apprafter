@@ -584,15 +584,55 @@ fn capture_non_claim_artifacts(
     })
 }
 
+/// The directory that must exist before `restic init` can create a repository
+/// there — `None` for every backend that is not a local filesystem path.
+///
+/// A restic repository reference is NOT a path. `s3:https://host/bucket`,
+/// `rest:`, `sftp:`, `b2:`, `gs:` and friends name a remote, and asking for the
+/// "parent directory" of one yields a nonsense relative path built out of the
+/// URL. Creating it is wrong in two different ways depending on who runs it:
+///
+///   * in the in-cluster runner, whose container is not root and whose cwd is
+///     `/`, it fails with `Permission denied (os error 13)` and takes the whole
+///     backup down with a message naming an S3 URL as a directory;
+///   * in the CLI, where the cwd is writable, it SUCCEEDS — silently creating a
+///     junk tree like `./s3:https:/minio.example.com:9000/backups` next to
+///     whatever the operator happened to be standing in.
+///
+/// It stayed invisible because the branch only runs when the repository does
+/// not exist yet, and `apprafter backup enable` initialises it host-side first.
+/// It fires on a genuinely fresh repo — a new bucket, a wiped one, or a
+/// `PlatformStack` edited by hand without the CLI preflight — i.e. on somebody's
+/// FIRST scheduled backup. Found by `e2e/backup-s3-sequential-kind.sh` on the
+/// first run after that walk started executing the runner it builds (D24).
+fn repo_parent_to_create(repo: &str) -> Option<&Path> {
+    // `local:` is restic's explicit spelling of a filesystem repo; a bare path
+    // is the implicit one. Everything else carrying a `<scheme>:` is a remote.
+    let path = repo.strip_prefix("local:").unwrap_or(repo);
+    let looks_remote = path
+        .split_once(':')
+        .is_some_and(|(scheme, _)| {
+            !scheme.is_empty()
+                && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+        });
+    if looks_remote {
+        return None;
+    }
+    Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
 /// Init the restic repo iff it does not already exist (probe = `snapshots`).
 fn ensure_repo(r: &dyn ResticRunner, repo: &str, pass: &str) -> Result<()> {
     if !restic_repo_exists(r, repo, pass)? {
-        if let Some(parent) = Path::new(repo).parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    CliError::Other(format!("create repo parent {}: {e}", parent.display()))
-                })?;
-            }
+        if let Some(parent) = repo_parent_to_create(repo) {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                CliError::Other(format!("create repo parent {}: {e}", parent.display()))
+            })?;
         }
         r.run(&restic_init_argv(repo), pass)?;
     }
@@ -747,6 +787,53 @@ mod tests {
     use std::path::Path;
 
     use serde_json::json;
+
+    // -----------------------------------------------------------------------
+    // repo_parent_to_create — a repository reference is not a path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn no_directory_is_created_for_a_remote_repository() {
+        // The case that took a backup Job down: the runner is not root, its cwd
+        // is `/`, and this used to resolve to a relative directory built out of
+        // an S3 URL.
+        for repo in [
+            "s3:http://minio.minio-e2e.svc.cluster.local:9000/apprafter-backups/seq",
+            "s3:https://fsn1.your-objectstorage.com/bucket/prefix",
+            "rest:https://backup.example.com/repo",
+            "sftp:user@host:/srv/restic",
+            "b2:bucket:path",
+            "gs:bucket:/prefix",
+            "rclone:remote:path",
+        ] {
+            assert!(
+                repo_parent_to_create(repo).is_none(),
+                "a parent directory must never be created for the remote repo {repo}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_repository_still_gets_its_parent_created() {
+        assert_eq!(
+            repo_parent_to_create("/var/backups/apprafter/repo"),
+            Some(Path::new("/var/backups/apprafter"))
+        );
+        // restic's explicit spelling of the same thing.
+        assert_eq!(
+            repo_parent_to_create("local:/var/backups/apprafter/repo"),
+            Some(Path::new("/var/backups/apprafter"))
+        );
+        assert_eq!(
+            repo_parent_to_create("relative/repo"),
+            Some(Path::new("relative"))
+        );
+    }
+
+    #[test]
+    fn a_bare_repository_name_has_no_parent_to_create() {
+        assert!(repo_parent_to_create("repo").is_none());
+    }
 
     // -----------------------------------------------------------------------
     // In-crate test doubles — drive the engine end-to-end with NO cluster and

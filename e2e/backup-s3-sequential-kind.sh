@@ -271,6 +271,21 @@ assert_contains() {
 
 jp() { kubectl -n "$2" get "$1" "$3" -o jsonpath="$4" 2>/dev/null || true; }
 
+# Extract the runner's repository URL out of a CronJob JSON on stdin. Kept as a
+# named program so it can be exercised without a cluster.
+CJ_REPO_PY='
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+try:
+    env = d["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0].get("env", [])
+except (KeyError, IndexError, TypeError):
+    sys.exit(0)
+print(next((e.get("value", "") for e in env if e.get("name") == "APPRAFTER_BACKUP_REPO"), ""))
+'
+
 app_pod() {
     local running
     running=$(kubectl -n "$APP_NS" get pod -l "app.kubernetes.io/name=$1" \
@@ -760,15 +775,38 @@ assert_eq "spec.backup.stagingMode is sequential" "$(jp platformstack "$PROVIDER
 # does not trust the tag: it compares the built image's ID against the ID the
 # kubelet reports for the container it actually ran.
 # The chart-rendered CronJob picks up the new bucket on the operator's next
-# reconcile — wait for it to exist and to name a runner image.
+# reconcile — wait for it to exist, to name a runner image, AND to carry the
+# in-cluster bucket.
+#
+# Waiting only for existence is a race, and it is not academic: `backup enable`
+# writes the HOST endpoint (that is the one its preflight can reach), the
+# merge-patch below swaps in the Service DNS, and the CronJob is re-rendered
+# some seconds later. Catch it in between and the Job runs against
+# `127.0.0.1:<forwarded-port>` — which resolves inside the pod to the pod, so
+# restic sees no repository, tries to create one, and fails. The walk then
+# blames the runner. Observed exactly once, on the first run after the walk
+# started executing its own build; the published runner had been getting the
+# same race and surviving it only because the repo already existed.
 _cj_deadline=$(( $(date +%s) + 300 ))
 _cj_image=""
+_cj_repo=""
 while [ "$(date +%s)" -lt "$_cj_deadline" ]; do
     _cj_image=$(jp cronjob "$PROVIDER_NS" "$BACKUP_CRONJOB" \
         '{.spec.jobTemplate.spec.template.spec.containers[0].image}')
-    [ -n "$_cj_image" ] && break
+    # Read the env entry with python rather than a jsonpath filter: the
+    # `[?(@.name=='X')]` dialect is the fragile part of kubectl's jsonpath, and
+    # a misread here reads as "not converged yet" and burns the whole timeout.
+    _cj_repo=$(kubectl -n "$PROVIDER_NS" get cronjob "$BACKUP_CRONJOB" -o json 2>/dev/null \
+        | python3 -c "$CJ_REPO_PY" 2>/dev/null || true)
+    [ -n "$_cj_image" ] && [ "$_cj_repo" = "$RESTIC_REPO_INCLUSTER" ] && break
     sleep 5
 done
+if [ -n "$_cj_image" ] && [ "$_cj_repo" != "$RESTIC_REPO_INCLUSTER" ]; then
+    printf 'ERROR: the CronJob still carries repo %s, expected the in-cluster %s\n' \
+        "${_cj_repo:-<empty>}" "$RESTIC_REPO_INCLUSTER" >&2
+    printf '  the bucket merge-patch never reached the rendered CronJob within 300s\n' >&2
+    exit 1
+fi
 [ -n "$_cj_image" ] || {
     printf 'ERROR: the apprafter-backup CronJob never rendered — the platform chart did not produce it\n' >&2
     kubectl -n argocd get applications.argoproj.io platform \
@@ -793,7 +831,7 @@ if not res:
         print('    condition:', c.get('type'), c.get('message'))
 " >&2 2>&1 || true
     exit 1; }
-printf '  ok: apprafter-backup CronJob rendered (runner image %s)\n' "$_cj_image"
+printf '  ok: apprafter-backup CronJob rendered (runner image %s, repo %s)\n' "$_cj_image" "$_cj_repo"
 
 # Now make that reference resolve to the build from THIS tree, before any Job
 # pod is created from the CronJob. Without this the walk spends four minutes
