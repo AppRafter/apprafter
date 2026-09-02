@@ -607,17 +607,35 @@ _backupTemplate: """
 	              limits:
 	                memory: 512Mi
 	{{- end }}
+	{{- if .Capabilities.APIVersions.Has "cilium.io/v2" }}
 	---
 	# Egress policy for the backup + check runner pods (m-r3-1). A Cilium FQDN
 	# policy without a DNS-allow rule silently fails to resolve and the backup
 	# hangs with no clear symptom, so DNS is MANDATORY. S3 endpoint is not known at
 	# render time (it's a template value), so we open world:443 pragmatically; the
 	# failureWebhook host (also 443) is covered by the same rule.
+	#
+	# GATED ON THE CRD BEING SERVED, and this was the only CRD-dependent resource
+	# in this template emitted without a guard — its siblings (the ServiceProvider
+	# block and the platform Gateway, both above) already carry
+	# `SkipDryRunOnMissingResource`. Emitting it unconditionally makes Argo CD fail
+	# the WHOLE root sync on a cluster whose `cilium.io/v2` is unserved:
+	#
+	#   CiliumNetworkPolicy apprafter-system/apprafter-backup-egress -> SyncFailed
+	#   The Kubernetes API could not find cilium.io/CiliumNetworkPolicy
+	#
+	# and one unappliable policy then takes the backup CronJobs down with it — so
+	# enabling backup would stop the platform converging at all. Found by
+	# `e2e/backup-s3-sequential-kind.sh`, which bootstraps without Cilium; the
+	# annotation additionally covers the CRD-race window on a genuine Cilium
+	# cluster, where the policy can be rendered before Cilium's CRDs land.
 	apiVersion: cilium.io/v2
 	kind: CiliumNetworkPolicy
 	metadata:
 	  name: apprafter-backup-egress
 	  namespace: apprafter-system
+	  annotations:
+	    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
 	  labels:
 	    apprafter.io/managed-by: apprafter
 	    apprafter.io/source: platform-stack
@@ -653,6 +671,7 @@ _backupTemplate: """
 	    - ports:
 	      - port: "443"
 	        protocol: TCP
+	{{- end }}
 	{{- end }}
 
 	"""

@@ -198,11 +198,19 @@ _kind_up() {
 #       kube-proxy replacement (the platform's Cilium values pin
 #       kubeProxyReplacement: true + k8sServiceHost: 127.0.0.1 / k8sServicePort:
 #       6443 — see platform-stack/cue/loader_values.cue).
-#   The apiServerAddress/apiServerPort are pinned to 127.0.0.1:6443 INSIDE the
-#   node so Cilium's k8sServiceHost: 127.0.0.1 / k8sServicePort: 6443 resolve
-#   the apiserver with no kube-proxy. kind always exposes the apiserver on the
-#   node's loopback at the in-config port, so this pin is what makes the
-#   kube-proxy-replacement bootstrap converge.
+#   `apiServerAddress` is pinned to 127.0.0.1 so the apiserver's serving cert
+#   carries it as a SAN — that IS load-bearing for Cilium's
+#   k8sServiceHost: 127.0.0.1.
+#
+#   `apiServerPort` is NOT. It is the HOST-side published port only; inside the
+#   node kind always binds the well-known 6443, which is what Cilium (running in
+#   hostNetwork) actually dials. kind's own kubeadm template says so: "we use a
+#   well known port for making the API server discoverable inside docker network
+#   / from the host machine such port will be accessible via a random local port
+#   instead". An earlier version of this comment claimed the pin was what made
+#   the kube-proxy-replacement bootstrap converge; that was wrong, and it is
+#   worth knowing because the pin is also what stops two Cilium clusters
+#   coexisting on one host.
 #   Cilium-only (k3d does not get a Cilium-on variant): this walk forces
 #   APPRAFTER_E2E_RUNTIME=kind (Cilium's eBPF datapath is pathologically slow
 #   on k3d). The caller asserts `cilium status --wait` before any enforcement.

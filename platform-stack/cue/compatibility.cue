@@ -1760,6 +1760,41 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.60": {
+	change:          "safe"
+	operatorVersion: "v0.2.45"
+	notes: """
+		The backup egress policy is no longer emitted on a cluster that cannot
+		serve it.
+
+		`apprafter-backup-egress` is a `CiliumNetworkPolicy`, and it was the only
+		CRD-dependent resource in the platform template emitted with no guard at
+		all — its siblings (the `ServiceProvider` block and the platform
+		`Gateway`) already carry `SkipDryRunOnMissingResource`. Where
+		`cilium.io/v2` is unserved, Argo CD could not build a sync task for it and
+		failed the WHOLE root sync:
+
+		    CiliumNetworkPolicy apprafter-system/apprafter-backup-egress -> SyncFailed
+		    The Kubernetes API could not find cilium.io/CiliumNetworkPolicy
+
+		One unappliable policy then took the backup CronJobs down with it, so
+		turning backup ON stopped the platform converging at all. It is now gated
+		on the API being served, and additionally carries the same
+		`SkipDryRunOnMissingResource` annotation as its siblings — which covers
+		the race on a genuine Cilium cluster, where the policy can be rendered
+		before Cilium's own CRDs land.
+
+		NO BEHAVIOUR CHANGE ON A NORMAL CLUSTER. Every AppRafter cluster runs
+		Cilium, so `cilium.io/v2` is served and the policy renders exactly as
+		before, byte for byte apart from the added annotation. What changes is a
+		cluster that does not have it — where the platform now converges instead
+		of wedging.
+
+		Found by `e2e/backup-s3-sequential-kind.sh`, which bootstraps without
+		Cilium on purpose and had never passed for this reason.
+		"""
+}
+
 compatibility: "0.2.59": {
 	// `breaking` rather than `requires-restart`: behaviourally the same gate
 	// (both create a platform MigrationPlan and wait for approval), but this

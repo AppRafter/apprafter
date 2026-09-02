@@ -123,7 +123,10 @@ APP_IMAGE="docker.io/library/apprafter-s3seq-app:walk"
 # ---------------------------------------------------------------
 # Tool checks
 # ---------------------------------------------------------------
-for tool in cargo kubectl; do
+# python3 parses the snapshot JSON and picks a free port; curl probes MinIO;
+# helm is used by the branch-manifest helpers. A missing one used to surface as
+# a confusing mid-walk failure rather than the documented exit-2 precondition.
+for tool in cargo kubectl python3 curl helm; do
     command -v "$tool" >/dev/null 2>&1 || { printf 'ERROR: required tool "%s" not found on PATH\n' "$tool" >&2; exit 2; }
 done
 if ! command -v docker >/dev/null 2>&1 && ! command -v podman >/dev/null 2>&1; then
@@ -887,6 +890,19 @@ else
 fi
 rm -rf "$TMPDIR_WORK"
 [ -n "${RESTIC_WRAPPER_BIN_DIR:-}" ] && rm -rf "$RESTIC_WRAPPER_BIN_DIR" || true
+
+# GREEN means GREEN. Every SOFT-SKIP branch above used to fall through to this
+# banner, so a run that never restored anything still announced itself as
+# passing — an outcome nobody could distinguish from the real one by reading
+# the last line. The restore leg is the walk's second half; skipping it is a
+# legitimate resource concession, but it is NOT green, and only the explicit
+# `APPRAFTER_E2E_FORCE_SINGLE_CLUSTER` opt-in may say otherwise.
+if [ "$TWO_CLUSTER_OK" -ne 1 ] && [ -z "${APPRAFTER_E2E_FORCE_SINGLE_CLUSTER:-}" ]; then
+    printf '\nbackup-s3-sequential-kind INCOMPLETE in %s — the restore-into-fresh leg did not run.\n' "$(elapsed)" >&2
+    printf 'The snapshot-SET assertions passed; the second half did not happen. Set\n' >&2
+    printf 'APPRAFTER_E2E_FORCE_SINGLE_CLUSTER=1 to declare that deliberate.\n' >&2
+    exit 1
+fi
 
 printf '\nbackup-s3-sequential-kind GREEN in %s\n' "$(elapsed)"
 if [ "$TWO_CLUSTER_OK" -eq 1 ]; then
