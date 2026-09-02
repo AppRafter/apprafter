@@ -384,7 +384,7 @@ package platformstack
 	//
 	// `scripts/check-backup-runner-pin.sh` now fails CI when a published
 	// runner is newer than this line, so the next drift is loud.
-	image: string | *"ghcr.io/apprafter/apprafter-backup:v0.2.54"
+	image: string | *"ghcr.io/apprafter/apprafter-backup:v0.2.55"
 
 	// Cron schedule for the full backup Job. Default nightly 03:00.
 	schedule: string | *"0 3 * * *"
@@ -505,7 +505,7 @@ package platformstack
 // — a bump that forgets the compatibility entry fails `cue vet
 // -c` with an "incomplete value" error pointing at the missing
 // fields, before the publish workflow ever runs.
-currentVersion: #Version & "0.2.61"
+currentVersion: #Version & "0.2.62"
 
 // `_components` is the package-level base set, populated by
 // every `cue/component_<name>.cue` file declaring

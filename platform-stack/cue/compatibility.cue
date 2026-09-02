@@ -1760,6 +1760,27 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.62": {
+	change:          "safe"
+	operatorVersion: "v0.2.45"
+	notes: """
+		Runner rebuild with no behaviour change: the pin follows cli/runner
+		v0.2.55, which differs from v0.2.55's predecessor by rustfmt output
+		alone.
+
+		Recording it rather than quietly reusing v0.2.54, because the whole
+		point of 0.2.61 was that a published version must name the exact source
+		it was built from. A formatting-only edit does not change the compiled
+		binary, so this upgrade is a no-op for every cluster — but leaving two
+		different trees both claiming v0.2.54 would reintroduce, in miniature,
+		the ambiguity that let the pin rot for six weeks.
+
+		No action required. The next scheduled Job pulls the new tag; snapshots,
+		schedules and credentials are untouched.
+		"""
+	references: ["docs/adr/0050-backup-restore.md"]
+}
+
 compatibility: "0.2.61": {
 	change:          "safe"
 	operatorVersion: "v0.2.45"

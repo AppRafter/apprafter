@@ -29,7 +29,7 @@ would otherwise touch the same code three times.
 | **D7** | The CLI cannot answer the question its own error asks | FIXED 2.22c — walk owed | 2.22c |
 | **D8** | A node-scoped warning published through an optional object | FIXED 2.22d — walk step still owed | 2.22d |
 | **D9** | There is nothing to roll a moving tag back to | RESOLVED 2.22e — walk GREEN | 2.22e |
-| **D10** | The applying half of right-sizing has never been observed to apply anything | FIXED 2.22d — walk rewritten, not yet run | 2.22d |
+| **D10** | The applying half of right-sizing has never been observed to apply anything | RESOLVED 2.22d — walk GREEN on real Hetzner | 2.22d |
 | **D11** | 584 failures share one catch-all, and the cheap checks run last | FIXED 2.22a | 2.22a |
 | **D12** | Removing `expose` leaves the Service behind | FIXED 2.22b — walk-verified | 2.22b |
 | **D13** | A registry credential copy that nothing ever reclaims | FIXED 2.22b — walk step still owed | 2.22b |

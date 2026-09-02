@@ -609,15 +609,13 @@ fn repo_parent_to_create(repo: &str) -> Option<&Path> {
     // `local:` is restic's explicit spelling of a filesystem repo; a bare path
     // is the implicit one. Everything else carrying a `<scheme>:` is a remote.
     let path = repo.strip_prefix("local:").unwrap_or(repo);
-    let looks_remote = path
-        .split_once(':')
-        .is_some_and(|(scheme, _)| {
-            !scheme.is_empty()
-                && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-                && scheme
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
-        });
+    let looks_remote = path.split_once(':').is_some_and(|(scheme, _)| {
+        !scheme.is_empty()
+            && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+    });
     if looks_remote {
         return None;
     }
