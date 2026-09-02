@@ -1796,6 +1796,24 @@ compatibility: "0.2.61": {
 
 		`scripts/check-backup-runner-pin.sh` now fails CI when the runner changes
 		without this pin following it, so this cannot recur quietly.
+
+		THE PIN LANDS ON v0.2.54, NOT v0.2.53, BECAUSE POINTING THE WALK AT THE
+		REAL RUNNER IMMEDIATELY FOUND A BUG IN IT. `ensure_repo` treated the
+		restic repository REFERENCE as a filesystem path and created its
+		"parent directory". For `s3:` — and for `rest:`, `sftp:`, `b2:` — that
+		is a nonsense relative path built out of a URL. In the runner, which is
+		not root and whose working directory is `/`, creating it fails with
+		`Permission denied (os error 13)` and takes the backup down with a
+		message naming an S3 URL as a directory. In the CLI, where the working
+		directory is writable, it SUCCEEDS and silently leaves a junk tree like
+		`./s3:https:/endpoint:9000/bucket` wherever the operator was standing.
+
+		It is not a regression — the code is byte-identical in the v0.2.33
+		runner — but it is reachable: the branch runs only when the repository
+		does not exist yet, and `apprafter backup enable` initialises it
+		host-side first, so it fires on a genuinely fresh repository. A new
+		bucket, a wiped one, or a `PlatformStack` edited by hand without the CLI
+		preflight, i.e. on somebody's FIRST scheduled backup.
 		"""
 	references: ["docs/adr/0050-backup-restore.md"]
 }

@@ -62,14 +62,32 @@ tag="apprafter-backup/v${version}"
 paths=(cli/apprafter-backup cli/backup-core)
 
 if ! git ls-remote --tags --exit-code "$REMOTE" "refs/tags/${tag}" >/dev/null 2>&1; then
+    # Not published (yet). Whether that is fine depends on ONE thing: the runner
+    # version IS `cli/Cargo.toml` `workspace.package.version` — that is what
+    # release-backup-runner.yml publishes from. So a pin naming exactly that
+    # version is an in-flight release (push publishes it, and the chart shipping
+    # in the same push lands pinned to it); a pin naming anything else names a
+    # version nothing will ever publish.
+    #
+    # Without this distinction the guard deadlocks the release it exists to
+    # protect: the pin cannot move before the publish, and the publish cannot
+    # happen before the push that carries the moved pin.
+    cli_version="$(awk '/^\[workspace\.package\]/{f=1} f && /^version/{gsub(/[" ]/,"",$3); print $3; exit}' cli/Cargo.toml)"
+    if [[ -n "${cli_version:-}" && "$cli_version" == "$version" ]]; then
+        echo "OK: ${tag} not yet on ${REMOTE}, and the pin matches cli/Cargo.toml ${cli_version} — release in flight."
+        exit 0
+    fi
     cat >&2 <<EOF
-::error::The chart pins runner image ${pinned_ref}, but ${tag} is not on ${REMOTE}.
-A cluster rendering this chart would try to pull an image that was never
-published, and the backup CronJob would sit in ImagePullBackOff — visible only
-to whoever reads pod status at 03:00.
+::error::The chart pins runner image ${pinned_ref}, but ${tag} is not on ${REMOTE}
+and does not match cli/Cargo.toml (${cli_version:-unreadable}).
 
-Publish the runner first (push the runner change; release-backup-runner.yml tags
-and pushes the image), then move the pin to what it published.
+release-backup-runner.yml publishes from cli/Cargo.toml \`workspace.package.version\`,
+so nothing will ever publish ${tag}. A cluster rendering this chart would try to
+pull an image that does not exist, and the backup CronJob would sit in
+ImagePullBackOff — seen by whoever reads pod status at 03:00, which is nobody.
+
+Either pin the published runner, or pin the version this tree is about to
+publish (${cli_version:-<unreadable>}).
 EOF
     exit 1
 fi
