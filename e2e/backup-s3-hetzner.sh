@@ -448,8 +448,13 @@ phase "Phase 0: setup — register target, build operator S3 credential file"
 build_cred_file
 printf '  ok: operator S3 credential file written (0600): %s\n' "$CRED_FILE"
 { set +x; } 2>/dev/null
+# `--server-type` is REQUIRED since 2.16h-a removed the implicit default
+# (Decision 0): `apply` refuses with `server_type_not_selected` rather than
+# picking a SKU. This walk predates that change, so it could not provision at
+# all. Same default and override as mvp.sh / machine-picker-walk.
 apprafter target add "$BR_TARGET" \
     --provider hetzner-cloud --tier solo --region "$REGION" \
+    --server-type "${APPRAFTER_E2E_SERVER_TYPE:-cpx22}" \
     --token "$HCLOUD_TOKEN" --ssh-key "$SSH_KEY_PATH" \
     --no-interactive --no-ping --force
 printf '  ok: target %s registered\n' "$BR_TARGET"

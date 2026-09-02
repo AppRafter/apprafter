@@ -2885,3 +2885,51 @@ the same walk ran against the published CRD, `backup enable --timezone` refused
 with "the cluster did not store the timezone (it reads back as None)" instead
 of silently losing it. The guard worked exactly as designed, on the first
 cluster that could disprove it.
+
+---
+
+## D25. The real-Hetzner backup walk is blocked until 0.2.59 publishes
+
+**Opened:** 2026-09-02, running the owed Hetzner batch.
+**Status:** NOT A DEFECT — a structural consequence, recorded so the next
+person does not spend an afternoon rediscovering it.
+
+`backup-s3-hetzner.sh` provisions against **published** artifacts on purpose:
+its whole value is validating what a user actually gets from the channel. But
+2.22g's `spec.backup.timeZone` ships in 0.2.59, which is not published, so the
+cluster's PlatformStack CRD does not have the field — and `backup enable
+--timezone` correctly refuses:
+
+```text
+the cluster did not store the timezone 'Europe/Berlin' (it reads back as None).
+This operator's PlatformStack CRD predates the `spec.backup.timeZone` field,
+so the apiserver accepted the write and discarded it.
+Upgrade the platform, then re-run this command.
+```
+
+The walk reached this after eleven minutes with everything before it green:
+target registered, cluster bootstrapped, CMS app deployed with a `secret:` ref,
+pg claim ready, a known marker row written, and the S3 credential Secret sealed
+and unsealed in `apprafter-system`.
+
+So the sequence is fixed: **publish 0.2.59, then run this walk.** On kind the
+same field is reachable because the walks side-load the branch CRDs; on real
+hardware that would defeat the walk's premise.
+
+### What this DOES prove
+
+2.22g's read-back guard fired on the first real cluster that could disprove it,
+in exactly the situation it was written for — a CRD without the field, where
+the apiserver accepts the write and silently discards it. Twice now, in two
+independent walks. Without it, the backup would have been scheduled in the
+kube-controller-manager's zone with nothing anywhere saying so.
+
+### Two walks could not provision at all, for an unrelated reason
+
+Both `vpa-walk.sh` and `backup-s3-hetzner.sh` called `target add` without
+`--server-type`. Since 2.16h-a removed the implicit default (Decision 0),
+`apply` refuses with `server_type_not_selected` — so neither walk could reach
+its first assertion, on any cluster, since that change shipped. That is the
+concrete reason 2.22d recorded the VPA walk as "code ready, never run": it was
+not merely unrun, it was unrunnable. Both now pass the SKU explicitly, with the
+same default and override as `mvp.sh`.

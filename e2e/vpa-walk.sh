@@ -136,7 +136,14 @@ f={'':1/2**20,
 print(int(v*f[u]))" "$1" 2>/dev/null || echo -1; }
 
 printf '=== Phase 1: provision (CLI %s) + bootstrap channel-latest (0.2.56+ InPlace fix) ===\n' "$($APPRAFTER --version 2>/dev/null)"
+# `--server-type` is REQUIRED since 2.16h-a removed the implicit default
+# (Decision 0): `apply` now refuses with `server_type_not_selected` rather than
+# silently picking a SKU. This walk predates that change and had no flag, so it
+# could not provision at all — which is consistent with 2.22d recording it as
+# "code ready, never run". Same default and override as mvp.sh / the machine
+# picker walk.
 "$APPRAFTER" target add e2e --provider hetzner-cloud --tier solo --region "$REGION" \
+    --server-type "${APPRAFTER_E2E_SERVER_TYPE:-cpx22}" \
     --token "$TOKEN" --no-interactive --force || { mark_fail "target add"; exit 1; }
 timeout 1500 "$APPRAFTER" up || { mark_fail "apprafter up"; exit 1; }
 "$APPRAFTER" kubeconfig > "$KUBECONFIG" || { mark_fail "kubeconfig"; exit 1; }
