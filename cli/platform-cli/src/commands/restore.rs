@@ -238,12 +238,67 @@ pub fn run_restore(
         match step {
             RestoreStep::Reprovision => unreachable!("Reprovision handled before the match"),
             RestoreStep::RestoreArtifact => {
+                // Resolve the RUN, not a snapshot. A monolithic backup is one
+                // snapshot carrying everything; a sequential one is N per-claim
+                // snapshots plus a commit point, grouped only by their shared
+                // run tag. Fetching just the commit point — which is what this
+                // did — yields `crs/`, `secrets/` and `manifest.json` and no
+                // `data/`, so the load below found nothing and the restore
+                // reported success over an empty database (D26).
+                let listing = restic_stdout(
+                    &backup_core::restic::restic_snapshots_argv(repo),
+                    &pass,
+                    &creds,
+                )?;
+                let run = backup_core::restore::resolve_run_snapshots(&listing, snap)
+                    .map_err(CliError::Other)?;
+
                 run_restic_restore(
-                    &restic_restore_argv(repo, snap, &restore_root.path().to_string_lossy()),
+                    &restic_restore_argv(repo, &run.commit, &restore_root.path().to_string_lossy()),
                     &pass,
                     &creds,
                 )?;
                 let dd = find_data_dir(restore_root.path())?;
+
+                // Merge each per-claim snapshot's payload into the same data
+                // directory the loader reads. Restic restores a snapshot under
+                // its own absolute source path, so each lands in its own tree
+                // and has to be folded in — the per-claim layout is byte-
+                // identical to the monolithic one (the writer reuses
+                // `run_extraction` on a one-element slice), so a plain merge is
+                // all that is needed.
+                if !run.claims.is_empty() {
+                    println!(
+                        "  sequential backup: merging {} per-claim snapshot(s)",
+                        run.claims.len()
+                    );
+                }
+                for claim_snap in &run.claims {
+                    let claim_root = tempfile::tempdir().map_err(|e| {
+                        CliError::Other(format!("temp dir for a per-claim snapshot: {e}"))
+                    })?;
+                    run_restic_restore(
+                        &restic_restore_argv(
+                            repo,
+                            claim_snap,
+                            &claim_root.path().to_string_lossy(),
+                        ),
+                        &pass,
+                        &creds,
+                    )?;
+                    match find_claim_data_dir(claim_root.path()) {
+                        Some(src) => merge_data_tree(&src, &dd)?,
+                        None => {
+                            // Not fatal: a run can legitimately carry a snapshot
+                            // with no claim payload. Say so rather than
+                            // pretending it merged.
+                            println!(
+                                "  note: snapshot {claim_snap} carries no claim data — skipped"
+                            );
+                        }
+                    }
+                }
+
                 let m = read_backup_manifest(&dd)?;
                 // m8: reject a backup written by a newer CLI — guard before
                 // any further parsing or cluster writes.
@@ -1420,6 +1475,84 @@ pub(crate) fn is_remote_restic_repo(repo: &str) -> bool {
 /// on top so an `s3:` (or other remote) repo is reachable — for a local repo it
 /// is empty and only `RESTIC_PASSWORD` is set. `pass` and any
 /// `creds["RESTIC_PASSWORD"]` are the same value at the call sites.
+/// `restic …` capturing stdout — the listing side of [`run_restic_restore`].
+fn restic_stdout(argv: &[String], pass: &str, creds: &BTreeMap<String, String>) -> Result<String> {
+    let mut cmd = std::process::Command::new("restic");
+    cmd.args(argv).env("RESTIC_PASSWORD", pass);
+    crate::commands::backup::apply_creds_to_command(&mut cmd, creds);
+    let out = cmd
+        .output()
+        .map_err(|e| CliError::Other(format!("spawn restic: {e}")))?;
+    if !out.status.success() {
+        return Err(CliError::Other(format!(
+            "restic {} failed (exit {:?}): {}",
+            argv.first().map(String::as_str).unwrap_or("?"),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The payload directory inside a restored PER-CLAIM snapshot.
+///
+/// Distinct from [`find_data_dir`], which anchors on `manifest.json` — only the
+/// commit point carries one. A per-claim snapshot is recognised by the data
+/// kinds the extractor writes.
+fn find_claim_data_dir(root: &Path) -> Option<PathBuf> {
+    fn search(dir: &Path) -> Option<PathBuf> {
+        let mut subdirs = Vec::new();
+        let mut has_payload = false;
+        for e in std::fs::read_dir(dir).ok()?.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if matches!(
+                    p.file_name().and_then(|n| n.to_str()),
+                    Some("pg") | Some("redis") | Some("disk")
+                ) {
+                    has_payload = true;
+                }
+                subdirs.push(p);
+            }
+        }
+        if has_payload {
+            return Some(dir.to_path_buf());
+        }
+        subdirs.iter().find_map(|sd| search(sd))
+    }
+    search(root)
+}
+
+/// Recursively copy `from` into `into`, creating directories as needed.
+///
+/// Per-claim snapshots hold disjoint trees (one claim each), so a plain merge
+/// cannot collide; an existing file is nonetheless left alone rather than
+/// overwritten, because silently replacing restored data would be the worst
+/// possible way to be wrong here.
+fn merge_data_tree(from: &Path, into: &Path) -> Result<()> {
+    for e in std::fs::read_dir(from)
+        .map_err(|e| CliError::Other(format!("reading {}: {e}", from.display())))?
+        .flatten()
+    {
+        let src = e.path();
+        let dst = into.join(e.file_name());
+        if src.is_dir() {
+            std::fs::create_dir_all(&dst)
+                .map_err(|e| CliError::Other(format!("creating {}: {e}", dst.display())))?;
+            merge_data_tree(&src, &dst)?;
+        } else if !dst.exists() {
+            std::fs::copy(&src, &dst).map_err(|e| {
+                CliError::Other(format!(
+                    "copying {} -> {}: {e}",
+                    src.display(),
+                    dst.display()
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn run_restic_restore(argv: &[String], pass: &str, creds: &BTreeMap<String, String>) -> Result<()> {
     let mut cmd = std::process::Command::new("restic");
     cmd.args(argv).env("RESTIC_PASSWORD", pass);

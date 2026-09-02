@@ -36,6 +36,118 @@ pub enum RestoreStep {
     SuspendWorkloads,
 }
 
+/// The snapshots that together make up ONE backup run.
+///
+/// A `monolithic` run is a single snapshot carrying everything, so `claims` is
+/// empty. A `sequential` run is N per-claim snapshots plus a final commit-point
+/// snapshot that carries `crs/`, `secrets/` and `manifest.json` — all sharing
+/// one `run-<id>` tag, which is the only thing that groups them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunSnapshots {
+    /// The snapshot carrying `manifest.json` — the run's commit point, and the
+    /// one a restore must read first.
+    pub commit: String,
+    /// The per-claim snapshots of the same run, oldest first. Empty for a
+    /// monolithic backup.
+    pub claims: Vec<String>,
+}
+
+/// Group a `restic snapshots --json` listing into the run the caller asked for.
+///
+/// WHY THIS EXISTS. `restore` used to fetch exactly one snapshot and read the
+/// per-claim dumps out of it. For a monolithic backup that is right — one
+/// snapshot holds everything. For a SEQUENTIAL backup the payloads live in the
+/// other snapshots of the run, so the restore extracted only `crs/`, `secrets/`
+/// and `manifest.json`, found no `data/pg`, loaded nothing, and reported
+/// success over an empty database (D26).
+///
+/// The grouping key is the run tag, deliberately, and not a new manifest field:
+/// the tag is already written by the backup engine and is therefore present on
+/// backups ALREADY IN REPOSITORIES. A manifest flag would only have fixed runs
+/// taken after the fix — which is no use to anyone holding a sequential backup
+/// today.
+///
+/// `requested` is the snapshot the user asked to restore: `latest`, or an id /
+/// short-id prefix. The commit point is that snapshot; its siblings are every
+/// other snapshot sharing at least one tag with it.
+pub fn resolve_run_snapshots(
+    snapshots_json: &str,
+    requested: &str,
+) -> Result<RunSnapshots, String> {
+    let snaps: Vec<Value> = serde_json::from_str(snapshots_json)
+        .map_err(|e| format!("parsing `restic snapshots --json`: {e}"))?;
+    if snaps.is_empty() {
+        return Err("the repository has no snapshots".to_string());
+    }
+
+    let id_of = |s: &Value| {
+        s.get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let time_of = |s: &Value| {
+        s.get("time")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let tags_of = |s: &Value| -> Vec<String> {
+        s.get("tags")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // `latest` is restic's own spelling for "newest by time", which is exactly
+    // what the sequential writer makes the commit point: it is written LAST.
+    let commit = if requested == "latest" {
+        snaps
+            .iter()
+            .max_by_key(|s| time_of(s))
+            .ok_or_else(|| "no snapshots to choose from".to_string())?
+    } else {
+        snaps
+            .iter()
+            .find(|s| {
+                let id = id_of(s);
+                id == requested
+                    || id.starts_with(requested)
+                    || s.get("short_id").and_then(Value::as_str) == Some(requested)
+            })
+            .ok_or_else(|| format!("no snapshot matching `{requested}` in this repository"))?
+    };
+
+    let commit_id = id_of(commit);
+    let commit_tags = tags_of(commit);
+
+    // An untagged snapshot cannot be grouped, and must not silently drag in
+    // every other untagged snapshot in the repository.
+    let mut claims: Vec<(String, String)> = Vec::new();
+    if !commit_tags.is_empty() {
+        for s in &snaps {
+            let id = id_of(s);
+            if id == commit_id {
+                continue;
+            }
+            if tags_of(s).iter().any(|t| commit_tags.contains(t)) {
+                claims.push((time_of(s), id));
+            }
+        }
+    }
+    claims.sort();
+
+    Ok(RunSnapshots {
+        commit: commit_id,
+        claims: claims.into_iter().map(|(_, id)| id).collect(),
+    })
+}
+
 /// Decide the ordered restore steps for a mode + `--data-only`.
 pub fn restore_steps(mode: RestoreMode, data_only: bool) -> Vec<RestoreStep> {
     use RestoreStep::*;
@@ -127,6 +239,86 @@ fn ensure_child_object<'a>(
 
 #[cfg(test)]
 mod tests {
+
+    // ---- D26: a sequential run is a SET of snapshots, not one ----
+
+    fn seq_listing() -> &'static str {
+        // Two per-claim snapshots then the commit point, all one run tag —
+        // the exact shape run_backup_sequential_with_summary writes.
+        r#"[
+          {"id":"aaa1","short_id":"aaa1","time":"2026-09-02T19:11:29Z","tags":["platform-run-1"],
+           "paths":["/tmp/apprafter-backup-x/claim-0"]},
+          {"id":"bbb2","short_id":"bbb2","time":"2026-09-02T19:11:30Z","tags":["platform-run-1"],
+           "paths":["/tmp/apprafter-backup-x/claim-1"]},
+          {"id":"ccc3","short_id":"ccc3","time":"2026-09-02T19:11:31Z","tags":["platform-run-1"],
+           "paths":["/tmp/apprafter-backup-x/commit"]}
+        ]"#
+    }
+
+    #[test]
+    fn latest_is_the_commit_point_and_the_rest_are_its_claims() {
+        let r = resolve_run_snapshots(seq_listing(), "latest").unwrap();
+        assert_eq!(r.commit, "ccc3", "the commit point is written LAST");
+        assert_eq!(r.claims, vec!["aaa1", "bbb2"], "oldest first");
+    }
+
+    #[test]
+    fn a_monolithic_run_has_no_claim_snapshots() {
+        let one = r#"[{"id":"solo","short_id":"solo","time":"2026-09-02T19:00:00Z",
+                       "tags":["platform-run-9"],"paths":["/tmp/x"]}]"#;
+        let r = resolve_run_snapshots(one, "latest").unwrap();
+        assert_eq!(r.commit, "solo");
+        assert!(
+            r.claims.is_empty(),
+            "nothing to merge for a single-snapshot run"
+        );
+    }
+
+    #[test]
+    fn a_different_run_is_never_dragged_in() {
+        // THE isolation rule: two runs in one repository must not blend, or a
+        // restore would load another backup's data over this one's.
+        let two_runs = r#"[
+          {"id":"old1","short_id":"old1","time":"2026-09-01T10:00:00Z","tags":["platform-run-0"],"paths":["/a"]},
+          {"id":"new1","short_id":"new1","time":"2026-09-02T10:00:00Z","tags":["platform-run-1"],"paths":["/b"]},
+          {"id":"new2","short_id":"new2","time":"2026-09-02T10:00:01Z","tags":["platform-run-1"],"paths":["/c"]}
+        ]"#;
+        let r = resolve_run_snapshots(two_runs, "latest").unwrap();
+        assert_eq!(r.commit, "new2");
+        assert_eq!(
+            r.claims,
+            vec!["new1"],
+            "the older RUN must not be pulled in"
+        );
+    }
+
+    #[test]
+    fn an_explicit_snapshot_id_selects_its_own_run() {
+        // Restoring an older run by id must bring that run's claims, not the
+        // newest one's.
+        let r = resolve_run_snapshots(seq_listing(), "ccc3").unwrap();
+        assert_eq!(r.commit, "ccc3");
+        assert_eq!(r.claims, vec!["aaa1", "bbb2"]);
+    }
+
+    #[test]
+    fn an_untagged_snapshot_groups_with_nothing() {
+        // Without a tag there is no run to reconstruct, and guessing would
+        // merge unrelated backups.
+        let untagged = r#"[
+          {"id":"u1","short_id":"u1","time":"2026-09-02T10:00:00Z","tags":[],"paths":["/a"]},
+          {"id":"u2","short_id":"u2","time":"2026-09-02T10:00:01Z","tags":[],"paths":["/b"]}
+        ]"#;
+        let r = resolve_run_snapshots(untagged, "latest").unwrap();
+        assert_eq!(r.commit, "u2");
+        assert!(r.claims.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_request_and_an_empty_repo_both_error() {
+        assert!(resolve_run_snapshots(seq_listing(), "zzz9").is_err());
+        assert!(resolve_run_snapshots("[]", "latest").is_err());
+    }
     use super::*;
 
     #[test]

@@ -3003,9 +3003,9 @@ same default and override as `mvp.sh`.
 
 **Opened:** 2026-09-02, by `e2e/backup-s3-sequential-kind.sh` — the first run
 in the walk's life to reach its own subject.
-**Status:** OPEN. Not fixed here: the fix is a feature-sized change to a
-data-integrity path and deserves its own design, not a patch tacked onto a
-test-fixing session.
+**Status:** FIXED 2026-09-02, and the walk that found it is now GREEN
+end-to-end — 33 assertions, both clusters, `merging 2 per-claim snapshot(s)`
+followed by the known row surviving into the fresh cluster.
 **Severity:** high for anyone who sets it, none for anyone who does not.
 `stagingMode` defaults to `monolithic` (`schemas/v1alpha1/platformstack.cue:92`,
 `backup.rs:100`), and monolithic restores correctly — proven end-to-end on real
@@ -3053,14 +3053,32 @@ psql said: ERROR:  relation "app_data" does not exist
 `backup-core/src/extract.rs`) returns **nothing**. The concept does not exist
 there.
 
-### What a fix has to do
+### The fix
 
-Read the manifest (already extracted from the commit snapshot), take its run
-tag, list the snapshots carrying it, and restore each per-claim snapshot into
-the same data root before `LoadData` runs — i.e. make `RestoreArtifact`
-format-aware instead of snapshot-singular. The walk already asserts everything
-needed to verify it: the snapshot set, the single tag, the manifest-last
-ordering, and a known row on both sides.
+`RestoreArtifact` now resolves a RUN rather than a snapshot.
+`backup_core::restore::resolve_run_snapshots` groups a `restic snapshots
+--json` listing by the run tag: the requested snapshot (`latest`, or an id
+prefix) is the commit point, and every other snapshot sharing a tag with it is
+one of its per-claim payloads. The restore fetches the commit point, then each
+sibling into its own temp root, and merges the payload trees into the data
+directory the loader reads.
+
+**Grouped by the run TAG, deliberately, and not by a new manifest field.** The
+tag is already written by the backup engine, so this repairs backups ALREADY
+SITTING IN REPOSITORIES. A manifest flag would only have fixed runs taken after
+the fix — no use to anyone holding a sequential backup today.
+
+Three properties the unit tests pin, because getting them wrong is worse than
+the original defect: a monolithic run yields no siblings (nothing changes for
+the default path); a second run in the same repository is never dragged in (or a
+restore would load another backup's data over this one's); and an untagged
+snapshot groups with nothing rather than guessing. The merge refuses to
+overwrite an existing file for the same reason.
+
+The per-claim payload layout is byte-identical to the monolithic one — the
+writer reuses `run_extraction` on a one-element slice — so a plain merge is all
+that is needed. A per-claim snapshot carries no `manifest.json`, so locating its
+payload needs its own probe (`pg`/`redis`/`disk`) rather than `find_data_dir`.
 
 ### Why it took this long to see
 
