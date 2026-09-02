@@ -43,7 +43,8 @@ would otherwise touch the same code three times.
 | **D21** | A claim deleted twice inside its grace window wedges forever | FIXED — walk-verified | — |
 | **D22** | The disk half of D8 never populated, and no local walk could have noticed | FIXED — pg half walk-verified, disk figure needs hardware | — |
 | **D23** | One object's data can crash-loop the entire operator | FIXED at both sites | — |
-| **D24** | A walk built an artefact and tested a different one | harness FIXED; **substance open** — no supported way to override the runner image | — |
+| **D24** | A walk built an artefact and tested a different one | RESOLVED — the walk runs its own build; no product change owed | — |
+| **D27** | The backup runner pin rotted, and the scheduled backup quietly ran an old binary | FIXED — pin moved + CI guard | — |
 | **D25** | The real-Hetzner backup walk is blocked until 0.2.59 publishes | RESOLVED — walk re-ran GREEN | — |
 | **D26** | A `sequential` backup restores empty, and says it succeeded | FIXED 2026-09-02 — walk GREEN, shipped in cli v0.2.53 | — |
 
@@ -2857,8 +2858,10 @@ repeated whenever a new one is introduced.
 ## D24. A walk built an artefact and tested a different one
 
 **Opened:** 2026-09-01, by the 2.22 local e2e battery.
-**Status:** FIXED (harness). No product change — the product was right and the
-walk was pointing at the wrong field.
+**Status:** RESOLVED 2026-09-02. No product change — the product was right, the
+walk was pointing at the wrong field, and the second conclusion this entry drew
+(that closing it required a new CR field) was also wrong. See the correction at
+the end, which supersedes the one before it.
 **Severity:** low impact, high consequence-if-unnoticed. Nothing was broken;
 the local backup walk simply never exercised the code it spent four minutes
 building.
@@ -2910,12 +2913,56 @@ a component — the platform-stack chart renders it directly.
 
 So the honest statement is stronger than the original finding: **the backup
 runner image cannot be overridden by any supported mechanism.** Not a CLI flag,
-not a CR field, not chart values, not a component override. A fork or a
-locally-built runner cannot be exercised anywhere, which is why no local walk
-can test a change to it. Closing that needs a real `image` field on
-`BackupConfig` (CUE + CRD + Rust), not a harness trick. The walk now asserts
-the CronJob EXISTS and carries some runner image, and says in its own output
-that the local build is not what runs.
+not a CR field, not chart values, not a component override.
+
+### Second correction: that is true, and the conclusion drawn from it was not
+
+The sentence above is accurate about the CR. The sentence that followed it here
+— "a locally-built runner cannot be exercised anywhere … closing that needs a
+real `image` field on `BackupConfig` (CUE + CRD + Rust), not a harness trick" —
+was wrong, and wrong in a way worth keeping on the record, because it proposed
+permanent product surface to solve a problem the repository already knew how to
+solve.
+
+**The kubelet does not resolve images through the CR.** Neither backup container
+sets `imagePullPolicy` (`grep -rn imagePullPolicy platform-stack/cue/` is empty)
+and the pinned tag is not `:latest`, so Kubernetes applies `IfNotPresent`: an
+image already present on the node under that exact reference is the one that
+runs, and nothing re-pulls it. That is precisely the mechanism `build_load_restart`
+has used for the operator image in eight other walks — read the reference off
+the live object, build the working tree under THAT reference, `cluster_load_image`
+it in.
+
+The walk was already 90% of the way there. It built the runner and side-loaded
+it successfully; its only defect was one string — `RUNNER_IMAGE=
+"docker.io/library/apprafter-backup:local"`, a name nothing in the cluster ever
+asks for. It was loading a dead image.
+
+The fix is in the harness, where it belonged: the build is re-tagged with the
+reference the rendered CronJob names and side-loaded before any Job pod exists.
+The technique has a real cost, which is that the tag stops identifying the
+artefact — the exact hazard this entry's own rule warns about — so the assertion
+does not trust the tag. It compares the built image's ID against
+`.status.containerStatuses[].imageID` on the pod that ran, and fails loudly if
+they differ.
+
+**On the product question the discarded conclusion raised.** An `image` field on
+`BackupConfig` would not serve the uses it looks like it serves. The same backup
+Job pulls `postgres:16-alpine`, `busybox:1.36` and `redis:7-alpine` as hard-coded
+Docker Hub short names with no override of any kind (`cli/backup-core/src/images.rs`),
+the CronJobs carry no `imagePullSecrets`, and the runner is not signed — so it
+cannot deliver registry independence, air-gap support or a compliance posture,
+and no such requirement exists anywhere in the spec or the ADR corpus. What
+remains is a genuine but narrow asymmetry: backup is the only platform image
+with nothing between "turn the feature off" and "wait for a chart release",
+because it is rendered directly rather than as a component, so
+`spec.overrides.<c>.values.image.*` — which reaches every other platform image —
+does not reach it. If that ever needs fixing, the uniform answer under ADR 0028
+is to make backup a component, not to grow a bespoke image field on a CR that
+today holds no image reference at all.
+
+The defect this entry was circling was never a missing override. It was a
+missing guard on the pin, and that is **D27**.
 
 ### And the reason that walk had never passed locally
 
@@ -3110,3 +3157,83 @@ first time one ran it found the format unrestorable.
 **The pattern is the one this file keeps recording**: not a careless
 implementation — the sequential writer is careful and correct — but an output
 nobody ever read back. Same shape as D10, D18, D19 and D22.
+
+---
+
+## D27. The runner pin rotted, and the nightly backup quietly ran an old binary
+
+**Opened:** 2026-09-02, while answering a question about D24 — not by a walk.
+**Status:** FIXED the same day: pin moved to `v0.2.53`, plus a CI guard so the
+next drift is loud.
+**Severity:** high, and silent by construction. Backups ran, exited zero, wrote
+snapshots and reported success the entire time.
+
+### What was wrong
+
+`#BackupValues.image` in `platform-stack/cue/platform.cue` is a hard-coded
+string literal, and it is the only thing deciding which published runner a
+cluster executes. Nothing derives it: not the chart `appVersion`, not
+`currentVersion`, not a channel tag, not a digest.
+
+It last moved on 2026-07-17 (`70acef4`, shipped as chart 0.2.42). Between then
+and 2026-09-02, fifteen runner images were published past it
+(`v0.2.34`..`v0.2.53`) and eighteen chart versions shipped without touching it
+(`0.2.43`..`0.2.60`). Every cluster with backup enabled kept running `v0.2.33`.
+
+### What it cost
+
+`release-backup-runner.yml` fires on every master push touching
+`cli/apprafter-backup/**` or `cli/backup-core/**`, so the images existed. They
+were simply never pointed at.
+
+The consequential one is T12. Persistent-Redis extraction landed in
+`cli/backup-core/src/extract.rs` on 2026-08-28 (`5cec8c6`) and reached the CLI
+immediately — `apprafter backup` IS the CLI binary. It never reached the
+CronJob. So a cluster with a `persistent: true` redis claim had its Redis
+captured when an operator ran a backup by hand, and **not** captured by the
+scheduled off-site backup running every night, while `docs/status.md` and the
+release notes recorded the capability as shipped. Both were true of one
+frontend and false of the other, and nothing distinguished them.
+
+### Why every gate passed
+
+Because a stale image is a *working* image. It starts, it exits zero, it writes
+a valid snapshot to the right bucket. There is no error to notice. The walk that
+verified T12 (`e2e/backup-restore-walk.sh`) exercises the host CLI path, so it
+was green and correct and testing the new code; the CronJob path had no test
+that could tell the versions apart — see D24, which is exactly the walk that
+should have caught it and was itself loading a dead image.
+
+The release chain had a guard-shaped hole. The platform-stack chart has a drift
+guard that FORCES a version bump; the operator has `check-operator-version-bump.sh`,
+added after the 0.2.40/0.2.41 double-yank; the CLI got `check-cli-version-bump.sh`
+on 2026-09-02. The runner pin had nothing — `grep -rl apprafter-backup scripts/
+Justfile` was empty.
+
+### The fix
+
+1. The pin moves to `v0.2.53` (verified pullable from ghcr, not merely tagged),
+   shipped as platform-stack `0.2.61` with a `compatibility.cue` entry that
+   states plainly what earlier snapshots do not contain.
+2. `scripts/check-backup-runner-pin.sh`, wired into `just lint`, fails when
+   runner source changed since the pinned tag, and separately when the pin names
+   a tag that was never published (which would be `ImagePullBackOff` at 03:00,
+   visible to nobody). A *newer* published tag with an identical runner is
+   deliberately NOT an error: the runner's version comes from `cli/Cargo.toml`,
+   so an unrelated CLI bump republishes a byte-identical binary under a new
+   number, and demanding a chart release for that is the kind of noise a check
+   does not survive.
+
+Verified by reintroduction: restored to `v0.2.33` it fails and names
+`extract.rs`, `restic_runner.rs` and `restore.rs` as the runner source that
+moved; at `v0.2.53` it passes.
+
+### The generalisation
+
+Three of this file's entries are now the same sentence with different nouns: an
+artefact was built, published, and never pointed at (this one); an output was
+written and never read back (D10, D18, D19, D22, D26); a walk asserted against a
+value the system could not produce (D24). The check that would have caught all
+three is the same one — **name the thing you believe is running, then prove the
+cluster is running that thing** — and it is worth more than any individual fix
+here.

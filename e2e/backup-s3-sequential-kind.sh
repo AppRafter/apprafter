@@ -23,10 +23,12 @@
 #
 #   podman build -t apprafter-backup:local -f cli/apprafter-backup/Dockerfile .
 #
-# (or `docker build`). This walk builds + side-loads it automatically (Phase 0b)
-# and passes it to `apprafter backup enable` via a merge-patch of
-# `spec.backup.image` right after enable (the CLI has no --image flag — the
-# image is chart-owned; overriding the CR field is the dev/fork escape hatch).
+# (or `docker build`). This walk builds it automatically (Phase 0b) and, once
+# the chart has rendered the CronJob, re-tags the build with the reference that
+# CronJob names and side-loads THAT (Phase 4). There is no CR field for the
+# runner image and none is needed: no `imagePullPolicy` is set and the pinned
+# tag is not `:latest`, so `IfNotPresent` makes the side-loaded image the one
+# the kubelet runs. Phase 5 proves it by image ID rather than by tag.
 # The operator + published chart already carry the 2.6c/2.6d surface, so the
 # operator itself does NOT need a local build here (2.6d-4's runner is the only
 # net-new in-cluster binary, and THAT we build).
@@ -369,14 +371,35 @@ DOCKER
 
 # Build + side-load the apprafter-backup RUNNER image from THIS tree. Build
 # context is the repo root; the Dockerfile only needs cli/. Idempotent.
+BUILDER=podman
+command -v podman >/dev/null 2>&1 || BUILDER=docker
 RUNNER_IMAGE_BUILT=0
 build_runner_image() {
     [ "$RUNNER_IMAGE_BUILT" -eq 1 ] && return 0
-    local builder=podman
-    command -v podman >/dev/null 2>&1 || builder=docker
-    printf '  building the apprafter-backup runner image %s from source (%s) — this is slow ...\n' "$RUNNER_IMAGE" "$builder"
-    ( cd "$REPO_ROOT" && "$builder" build -t "$RUNNER_IMAGE" -f cli/apprafter-backup/Dockerfile . )
+    printf '  building the apprafter-backup runner image %s from source (%s) — this is slow ...\n' "$RUNNER_IMAGE" "$BUILDER"
+    ( cd "$REPO_ROOT" && "$BUILDER" build -t "$RUNNER_IMAGE" -f cli/apprafter-backup/Dockerfile . )
     RUNNER_IMAGE_BUILT=1
+}
+
+# The ID of the runner image built above — the one value the tag cannot fake.
+# `imageID` on a container status is the digest/ID the kubelet resolved, so
+# comparing against this proves WHICH binary ran, not merely which name it
+# was asked for.
+runner_local_image_id() {
+    "$BUILDER" inspect --format '{{.Id}}' "$RUNNER_IMAGE" 2>/dev/null | sed 's/^sha256://'
+}
+
+# Make the chart's rendered reference resolve to OUR build on the node.
+# `IfNotPresent` (no imagePullPolicy is set on either backup container, and the
+# pinned tag is not `:latest`) means an image already present under that exact
+# reference is used and never re-pulled — the same technique `build_load_restart`
+# uses for the operator in the other walks.
+impersonate_runner_ref() { # <cluster> <chart-rendered-ref>
+    local cluster="$1" ref="$2"
+    [ -n "$ref" ] || { printf 'FAILED: impersonate_runner_ref got an empty reference\n' >&2; return 1; }
+    "$BUILDER" tag "$RUNNER_IMAGE" "$ref"
+    cluster_load_image "$cluster" "$ref"
+    printf '  ok: local runner build side-loaded as %s (IfNotPresent makes it the one that runs)\n' "$ref"
 }
 
 # Stand up a throwaway single-node MinIO (a real s3: endpoint) in the cluster +
@@ -607,15 +630,15 @@ build_cred_file
 printf '  ok: MinIO ready; host repo %s ; in-cluster repo %s\n' "$RESTIC_REPO_HOST" "$RESTIC_REPO_INCLUSTER"
 
 # ===============================================================
-# Phase 4: backup enable --staging-mode sequential + override the runner image
+# Phase 4: backup enable --staging-mode sequential + side-load the local runner
 # ===============================================================
 phase "Phase 4: apprafter backup enable --staging-mode sequential (bucket=in-cluster MinIO)"
 # The host CLI preflight `restic init` reaches MinIO via the HOST endpoint +
 # --credential-file creds; the CLUSTER bucket must be the in-cluster endpoint
 # (the runner Pod resolves the Service DNS). We enable with the in-cluster
-# bucket, then immediately merge-patch spec.backup.image to the local runner
-# build (the CLI has no --image flag — the image is chart-owned; overriding the
-# CR field is the dev/fork escape hatch). Because the host CLI's preflight init
+# bucket, then — once the chart has rendered the CronJob and named its runner
+# image — tag this tree's build with that same reference and side-load it, so
+# `IfNotPresent` makes our binary the one that runs. Because the host CLI's preflight init
 # uses the same repo/bucket/prefix, we FIRST init the repo host-side so the
 # in-cluster bucket URL enable-preflight can `restic cat config` succeed against
 # the already-initialised repo. (restic keys the repo off bucket+prefix, not the
@@ -677,22 +700,17 @@ apprafter backup enable \
     --timezone Europe/Berlin \
     --i-have-saved-credentials
 
-# Point the runner at the in-cluster bucket + the local runner image (both are
-# dev/fork CR overrides not exposed as CLI flags). Merge-patch, path-scoped.
+# Point the runner at the in-cluster bucket. Merge-patch, path-scoped.
 #
-# The IMAGE goes to `spec.values.backup.image`, NOT `spec.backup.image`. The
-# latter does not exist: it is absent from the CUE schema, from the generated
-# CRD and from the operator's `BackupConfig`, so the apiserver pruned it and
-# the assertion below read back an empty string. The chart takes the runner
-# image from `.Values.backup.image` (render_tool.cue), and `spec.values` is
-# the passthrough for exactly that — the same route 1.83f used for
-# `gateway.allowedDomains`.
-#
-# Worth stating plainly, because the walk asserted the wrong thing for a
-# reason: until this line the CronJob ran the PUBLISHED runner image while the
-# walk built a local one and believed it was under test. Every local run of
-# the backup runner was exercising a different binary than the one in the
-# working tree.
+# ONLY the bucket. The runner IMAGE is deliberately not patched here, and both
+# candidate routes were tried and reverted: `spec.backup.image` does not exist
+# (absent from the CUE, the CRD and `BackupConfig`, so the apiserver prunes it
+# and a read-back returns empty), and `spec.values.backup.image` is worse than
+# useless — it collides with the operator's whole-key projection of
+# `spec.backup` onto `.Values.backup` and hands the chart a backup object with
+# nothing but an image, which fails the entire root sync and renders no CronJob
+# at all. The image is handled after the CronJob exists, by side-loading under
+# the reference the chart itself rendered (Phase 4, `impersonate_runner_ref`).
 kubectl -n "$PROVIDER_NS" patch platformstack default --type merge -p \
     "{\"spec\":{\"backup\":{\"bucket\":\"${RESTIC_REPO_INCLUSTER}\"}}}"
 
@@ -717,29 +735,32 @@ assert_contains "backup status prints the time in the zone it was given" \
     "$status_out" "daily at 22:30 Europe/Berlin"
 assert_contains "backup status says the check is off" "$status_out" "check:         off"
 assert_eq "spec.backup.stagingMode is sequential" "$(jp platformstack "$PROVIDER_NS" default '{.spec.backup.stagingMode}')" "sequential"
-# THE RUNNER IMAGE IS NOT OVERRIDABLE, and this walk stops pretending it is.
+# THE RUNNER IMAGE IS NOT OVERRIDABLE FROM THE CR — and that does not stop this
+# walk from running its own build. Those are two different statements, and D24
+# originally conflated them.
 #
-# The chart takes it from `.Values.backup.image`, which the operator fills by
-# projecting `spec.backup` — and `BackupConfig` has no `image` field, in the
-# CUE, in the CRD or in Rust. `spec.values.backup` is not a way in either: the
-# operator projects `spec.backup` into `.Values.backup` itself, so writing
-# `spec.values.backup.image` COLLIDES with that projection and leaves the chart
-# a `backup` values object with nothing but an image — which is why the platform
-# app went `SyncError: one or more synchronization tasks are not valid` and no
-# CronJob was ever rendered. `spec.overrides` is per-component and backup is not
-# a component; it is rendered by the chart itself.
+# No CR route exists, and all three dead ends are real: `BackupConfig` has no
+# `image` field in the CUE, the CRD or in Rust, so the apiserver prunes one;
+# `spec.values.backup.image` COLLIDES with the operator's own projection of
+# `spec.backup` onto `.Values.backup` (`desired.rs:46` whole-key assignment) and
+# leaves the chart a backup object carrying nothing but an image, which is what
+# took the root sync down with `SyncError: one or more synchronization tasks are
+# not valid`; `spec.overrides` is indexed strictly by a `.Values.components` key
+# and backup is not a component.
 #
-# So the CronJob below runs the runner the CHART ships, not the one this walk
-# built. That is honest coverage of the sequential FORMAT — a real runner, a
-# real repo, real snapshots — and it is NOT coverage of a locally-changed
-# runner. Recorded as D24; closing it needs a real `image` field, not a
-# harness trick.
-printf '  note: the CronJob runs the CHART runner image; the local build is not reachable from the CR (D24)\n'
-# The chart-rendered CronJob picks up the new bucket+image on the operator's next
-# reconcile — wait for it to exist + carry the local image.
-# EXISTS and carries SOME runner image. Pinning the exact tag would re-assert
-# the override that does not exist (see the note above) — and an assertion for
-# a value the system cannot produce is not a test, it is a permanent red.
+# But the kubelet does not resolve images through the CR. Neither backup
+# container sets `imagePullPolicy` and the pinned tag is not `:latest`, so
+# Kubernetes applies `IfNotPresent` — an image already on the node under that
+# exact reference is the one that runs, and nothing re-pulls. So we do what
+# `build_load_restart` does for the operator in eight other walks: read the
+# reference off the live object, tag OUR build with it, side-load it.
+#
+# The cost of the technique is that the tag no longer identifies the artefact,
+# which is precisely what D24's own rule warns about. So the assertion below
+# does not trust the tag: it compares the built image's ID against the ID the
+# kubelet reports for the container it actually ran.
+# The chart-rendered CronJob picks up the new bucket on the operator's next
+# reconcile — wait for it to exist and to name a runner image.
 _cj_deadline=$(( $(date +%s) + 300 ))
 _cj_image=""
 while [ "$(date +%s)" -lt "$_cj_deadline" ]; do
@@ -774,6 +795,18 @@ if not res:
     exit 1; }
 printf '  ok: apprafter-backup CronJob rendered (runner image %s)\n' "$_cj_image"
 
+# Now make that reference resolve to the build from THIS tree, before any Job
+# pod is created from the CronJob. Without this the walk spends four minutes
+# building a runner the cluster never executes — which is exactly what it did
+# until 2026-09-02 (D24): it side-loaded its build under a name nothing asks
+# for, then asserted against the published binary and called it coverage.
+impersonate_runner_ref "$SRC_CLUSTER" "$_cj_image"
+RUNNER_LOCAL_ID="$(runner_local_image_id)"
+[ -n "$RUNNER_LOCAL_ID" ] || {
+    printf 'FAILED: could not read the local runner image ID — the run-what-we-built assertion cannot be made\n' >&2
+    exit 1; }
+printf '  local runner image ID: sha256:%s\n' "$RUNNER_LOCAL_ID"
+
 # ===============================================================
 # Phase 5: trigger a sequential backup run + assert the SNAPSHOT SET
 # ===============================================================
@@ -781,6 +814,27 @@ phase "Phase 5: trigger the sequential backup + assert per-claim snapshots + a f
 MANUAL_JOB="apprafter-backup-manual-$(date +%s)"
 kubectl -n "$PROVIDER_NS" create job --from="cronjob/${BACKUP_CRONJOB}" "$MANUAL_JOB"
 wait_job_complete "$MANUAL_JOB" "$PROVIDER_NS" 600
+
+# THE ASSERTION D24 ASKED FOR: the cluster ran the artefact this walk built.
+# Keyed off the image ID the kubelet resolved, never the tag — the tag is ours
+# by impersonation, so it would agree with itself and prove nothing.
+_ran_pod=$(kubectl -n "$PROVIDER_NS" get pods \
+    -l "job-name=${MANUAL_JOB}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+_ran_id=$(kubectl -n "$PROVIDER_NS" get pod "$_ran_pod" \
+    -o jsonpath='{.status.containerStatuses[0].imageID}' 2>/dev/null | sed 's/^.*sha256://')
+if [ -z "$_ran_id" ]; then
+    printf 'FAILED: could not read imageID off the backup pod %s — cannot prove which runner ran\n' "${_ran_pod:-<none>}" >&2
+    kubectl -n "$PROVIDER_NS" get pod "$_ran_pod" -o yaml >&2 2>&1 || true
+    exit 1
+fi
+if [ "$_ran_id" != "$RUNNER_LOCAL_ID" ]; then
+    printf 'FAILED: the backup Job ran a DIFFERENT runner than this walk built.\n' >&2
+    printf '  built:  sha256:%s\n  ran:    sha256:%s\n' "$RUNNER_LOCAL_ID" "$_ran_id" >&2
+    printf '  The side-load did not take: the node either pulled the published image or never\n' >&2
+    printf '  received the impersonated tag. Everything below would be testing a release, not this tree.\n' >&2
+    exit 1
+fi
+printf '  ok: the backup Job ran the LOCAL build (imageID sha256:%s matches)\n' "$_ran_id"
 
 # Read the snapshot SET host-side. Sequential(2 claims) => 3 snapshots total:
 # 2 per-claim + 1 final manifest/commit snapshot, ALL sharing one run-<id> tag
