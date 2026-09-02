@@ -2878,6 +2878,52 @@ making explicitly:
 > THAT artefact** — by digest, tag, or a value the artefact alone produces.
 > "I built it and applied something" is not the same claim.
 
+### Correction: there is no override at all, and my first fix was worse
+
+Routing the image through `spec.values.backup.image` — the passthrough 1.83f
+used for `gateway.allowedDomains` — does not work either, and actively breaks
+the cluster. The operator projects `spec.backup` into `.Values.backup` itself,
+so writing `spec.values.backup` COLLIDES with that projection and hands the
+chart a `backup` values object carrying nothing but an image. The platform app
+then goes `SyncError: one or more synchronization tasks are not valid` and no
+CronJob is rendered at all. Reverted.
+
+`spec.overrides` is not a route either: it is per-component, and backup is not
+a component — the platform-stack chart renders it directly.
+
+So the honest statement is stronger than the original finding: **the backup
+runner image cannot be overridden by any supported mechanism.** Not a CLI flag,
+not a CR field, not chart values, not a component override. A fork or a
+locally-built runner cannot be exercised anywhere, which is why no local walk
+can test a change to it. Closing that needs a real `image` field on
+`BackupConfig` (CUE + CRD + Rust), not a harness trick. The walk now asserts
+the CronJob EXISTS and carries some runner image, and says in its own output
+that the local build is not what runs.
+
+### And the reason that walk had never passed locally
+
+`backup enable` makes the chart render a **CiliumNetworkPolicy**
+(`apprafter-backup-egress`, gated on `backup.enabled`). The kind walks bootstrap
+with `APPRAFTER_BOOTSTRAP_SKIP_CILIUM=1`, so the CRD does not exist, so the
+resource cannot be applied — and Argo fails the WHOLE root sync over it, taking
+the backup CronJob with it:
+
+```text
+CiliumNetworkPolicy apprafter-system/apprafter-backup-egress -> SyncFailed
+The Kubernetes API could not find cilium.io/CiliumNetworkPolicy
+```
+
+Not a product defect: every AppRafter cluster runs Cilium by construction, and
+the policy is correct. It is a structural incompatibility between this walk and
+the no-Cilium kind bootstrap, and it is why the walk was red before any of my
+changes. The path to green is `kind_up_cilium` + `bootstrap_with_cilium` under
+`sandbox-run` (the recipe `needs-networkpolicy-walk` already uses) — a
+substantial change to a two-cluster walk, and OWED rather than done.
+
+That generic Argo message is worth its own note: "one or more synchronization
+tasks are not valid" names nothing. The per-resource `syncResult` carries the
+real reason, and printing it turned three rounds of guessing into one run.
+
 ### Related
 
 The 2.22g read-back guard is what surfaced the neighbouring half of this: when
@@ -2891,8 +2937,18 @@ cluster that could disprove it.
 ## D25. The real-Hetzner backup walk is blocked until 0.2.59 publishes
 
 **Opened:** 2026-09-02, running the owed Hetzner batch.
-**Status:** NOT A DEFECT — a structural consequence, recorded so the next
-person does not spend an afternoon rediscovering it.
+**Status:** RESOLVED the same day. 0.2.59 published, the walk re-ran, and it is
+**GREEN end-to-end on real Hetzner** — 43 assertions, zero failures. Kept here
+because the reasoning is the reusable part, not the outcome.
+
+The full disaster-recovery loop is now proven on hardware: backup enabled with
+`--at 22:30 --timezone Europe/Berlin`, the CronJob wired and triggered, a
+snapshot written to S3, the **source cluster destroyed**, then
+`restore --reprovision` onto a genuinely new box (server id 164332736 →
+164333316) where the CMS came back Ready, the re-sealed `PAYLOAD_SECRET`
+decrypted to its original value, and the known marker row was identical to the
+one written before the destroy. 2.22g's own content rode along and is visible
+in `backup status`: `daily at 22:30 Europe/Berlin`.
 
 `backup-s3-hetzner.sh` provisions against **published** artifacts on purpose:
 its whole value is validating what a user actually gets from the channel. But
@@ -2912,9 +2968,16 @@ target registered, cluster bootstrapped, CMS app deployed with a `secret:` ref,
 pg claim ready, a known marker row written, and the S3 credential Secret sealed
 and unsealed in `apprafter-system`.
 
-So the sequence is fixed: **publish 0.2.59, then run this walk.** On kind the
-same field is reachable because the walks side-load the branch CRDs; on real
-hardware that would defeat the walk's premise.
+So the sequence was fixed: **publish 0.2.59, then run this walk** — which is
+exactly what happened. On kind the same field is reachable because the walks
+side-load the branch CRDs; on real hardware that would defeat the walk's
+premise, so waiting was the only correct move.
+
+One transient on the way, worth naming so it is not mistaken for a defect next
+time: Argo CD failed to clone the public CMS repo with `could not read Username
+for 'https://github.com'`, which is what GitHub returns to an anonymous request
+it is refusing. The repository is public and `git ls-remote` answered
+anonymously from the same machine minutes later; the next run cloned it fine.
 
 ### What this DOES prove
 

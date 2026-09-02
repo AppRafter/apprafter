@@ -323,6 +323,17 @@ prepare_platform() {
     printf '  waiting for the CNPG operator ...\n'
     retry 30 10 -- kubectl -n cnpg-system rollout status \
         deploy -l app.kubernetes.io/name=cloudnative-pg --timeout=60s
+    # The Deployment being up is NOT the same as the API group being served.
+    # The provisioner reaches `postgresql.cnpg.io` through a dynamic client,
+    # and before the CRDs are Established the apiserver answers a bare
+    # `404 page not found` — which surfaces three steps later as "the pg claim
+    # never became ready", with nothing naming CNPG. Wait for the two kinds it
+    # actually uses.
+    printf '  waiting for the CNPG CRDs to be Established ...\n'
+    for _crd in clusters.postgresql.cnpg.io databases.postgresql.cnpg.io; do
+        retry 30 5 -- kubectl wait --for=condition=Established \
+            "crd/${_crd}" --timeout=30s
+    done
     retry 30 10 -- kubectl -n "$PROVIDER_NS" rollout status deploy admission-webhook --timeout=60s
     printf '  waiting for the sealed-secrets controller ...\n'
     local sdeadline; sdeadline=$(( $(date +%s) + 300 ))
@@ -609,22 +620,17 @@ RESTIC_PASSWORD="$RESTIC_PASS" \
 # error. To keep the walk honest AND not depend on host→in-cluster DNS, we
 # enable against the HOST bucket (preflight passes), then merge-patch the CR
 # bucket to the in-cluster endpoint that the RUNNER needs.
-# FREEZE, then override — and only now, with the platform already converged.
+# NO branch-CRD side-load, and no Argo freeze.
 #
-# Ordering is the whole lesson, learned by getting it wrong three ways.
-# Freezing at bootstrap starves the stack: the Dragonfly operator never
-# installs and the redis claim never goes ready. Not freezing at all lets Argo
-# restore the PUBLISHED operator CRDs, which predate `spec.backup.timeZone`
-# (2.22g, unreleased), so the write is silently pruned and `backup enable`
-# refuses. Converge first, freeze second, override third. The CronJob phase
-# below then triggers a one-shot sync, because automation is off from here.
-printf '  freezing Argo CD sync and applying the branch operator manifests ...\n'
-for _app in platform apprafter-operator; do
-    kubectl -n argocd patch applications.argoproj.io "$_app" --type=merge \
-        -p '{"spec":{"syncPolicy":{"automated":null}}}' >/dev/null 2>&1 || true
-done
-apply_branch_operator_crds
-apply_branch_operator_rbac
+# Both existed only to reach `spec.backup.timeZone` (2.22g) while 0.2.59 was
+# unpublished. It is published now — this cluster bootstraps platform-stack
+# 0.2.59 — so the field ships in the CRD Argo installs, and overriding it was
+# not merely unnecessary but harmful: taking the CRDs over with a server-side
+# apply left the platform app OutOfSync with "one or more synchronization
+# tasks are not valid", and the backup CronJobs it renders never appeared.
+#
+# The precondition assertion below stays. It is cheap, and it now proves the
+# PUBLISHED chart carries the field rather than that a side-load worked.
 
 # PROVE the schema actually carries the field before writing it. A CRD apply
 # returns before the apiserver has adopted the new structural schema, and Argo
@@ -675,7 +681,7 @@ apprafter backup enable \
 # the backup runner was exercising a different binary than the one in the
 # working tree.
 kubectl -n "$PROVIDER_NS" patch platformstack default --type merge -p \
-    "{\"spec\":{\"backup\":{\"bucket\":\"${RESTIC_REPO_INCLUSTER}\"},\"values\":{\"backup\":{\"image\":\"${RUNNER_IMAGE}\"}}}}"
+    "{\"spec\":{\"backup\":{\"bucket\":\"${RESTIC_REPO_INCLUSTER}\"}}}"
 
 status_out="$(apprafter backup status)"
 printf '%s\n' "$status_out"
@@ -698,22 +704,62 @@ assert_contains "backup status prints the time in the zone it was given" \
     "$status_out" "daily at 22:30 Europe/Berlin"
 assert_contains "backup status says the check is off" "$status_out" "check:         off"
 assert_eq "spec.backup.stagingMode is sequential" "$(jp platformstack "$PROVIDER_NS" default '{.spec.backup.stagingMode}')" "sequential"
-assert_eq "the chart values carry the local runner build" "$(jp platformstack "$PROVIDER_NS" default '{.spec.values.backup.image}')" "$RUNNER_IMAGE"
+# THE RUNNER IMAGE IS NOT OVERRIDABLE, and this walk stops pretending it is.
+#
+# The chart takes it from `.Values.backup.image`, which the operator fills by
+# projecting `spec.backup` — and `BackupConfig` has no `image` field, in the
+# CUE, in the CRD or in Rust. `spec.values.backup` is not a way in either: the
+# operator projects `spec.backup` into `.Values.backup` itself, so writing
+# `spec.values.backup.image` COLLIDES with that projection and leaves the chart
+# a `backup` values object with nothing but an image — which is why the platform
+# app went `SyncError: one or more synchronization tasks are not valid` and no
+# CronJob was ever rendered. `spec.overrides` is per-component and backup is not
+# a component; it is rendered by the chart itself.
+#
+# So the CronJob below runs the runner the CHART ships, not the one this walk
+# built. That is honest coverage of the sequential FORMAT — a real runner, a
+# real repo, real snapshots — and it is NOT coverage of a locally-changed
+# runner. Recorded as D24; closing it needs a real `image` field, not a
+# harness trick.
+printf '  note: the CronJob runs the CHART runner image; the local build is not reachable from the CR (D24)\n'
 # The chart-rendered CronJob picks up the new bucket+image on the operator's next
 # reconcile — wait for it to exist + carry the local image.
-# Thaw the PLATFORM app only. Automation is off from the freeze above, so
-# nothing renders the backup CronJobs from the values `backup enable` just
-# wrote. Re-enabling it here is safe in a way that never freezing was not: the
-# operator CRDs are applied by the CHILD `apprafter-operator` Application,
-# which stays frozen, so the branch schema survives while the platform chart
-# converges. (A one-shot `operation` patch was tried first and never fired.)
-printf '  thawing the platform app so it renders the backup CronJobs ...\n'
-kubectl -n argocd patch applications.argoproj.io platform --type=merge \
-    -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}' >/dev/null 2>&1 || true
-
-wait_jsonpath cronjob "$PROVIDER_NS" "$BACKUP_CRONJOB" \
-    '{.spec.jobTemplate.spec.template.spec.containers[0].image}' "$RUNNER_IMAGE" 300
-printf '  ok: apprafter-backup CronJob rendered with the sequential runner image\n'
+# EXISTS and carries SOME runner image. Pinning the exact tag would re-assert
+# the override that does not exist (see the note above) — and an assertion for
+# a value the system cannot produce is not a test, it is a permanent red.
+_cj_deadline=$(( $(date +%s) + 300 ))
+_cj_image=""
+while [ "$(date +%s)" -lt "$_cj_deadline" ]; do
+    _cj_image=$(jp cronjob "$PROVIDER_NS" "$BACKUP_CRONJOB" \
+        '{.spec.jobTemplate.spec.template.spec.containers[0].image}')
+    [ -n "$_cj_image" ] && break
+    sleep 5
+done
+[ -n "$_cj_image" ] || {
+    printf 'ERROR: the apprafter-backup CronJob never rendered — the platform chart did not produce it\n' >&2
+    kubectl -n argocd get applications.argoproj.io platform \
+        -o jsonpath='{.status.sync.status} {.status.operationState.message}' >&2 2>&1 || true
+    echo >&2
+    # NAME the offending resource. "one or more synchronization tasks are not
+    # valid" is Argo's most useless message: it says a task failed to build and
+    # nothing about which. The per-resource sync result carries the reason, and
+    # without it this failure is three guesses deep.
+    printf '  --- per-resource sync result (non-Synced only) ---\n' >&2
+    kubectl -n argocd get applications.argoproj.io platform -o json 2>/dev/null \
+        | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+res=d.get('status',{}).get('operationState',{}).get('syncResult',{}).get('resources',[])
+for r in res:
+    if r.get('status') not in ('Synced', None):
+        print('   ', r.get('kind'), r.get('namespace','-')+'/'+r.get('name'), '->', r.get('status'), r.get('message'))
+if not res:
+    print('    (no syncResult resources — the sync never produced a task list)')
+    for c in d.get('status',{}).get('conditions',[]):
+        print('    condition:', c.get('type'), c.get('message'))
+" >&2 2>&1 || true
+    exit 1; }
+printf '  ok: apprafter-backup CronJob rendered (runner image %s)\n' "$_cj_image"
 
 # ===============================================================
 # Phase 5: trigger a sequential backup run + assert the SNAPSHOT SET
