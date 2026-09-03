@@ -46,6 +46,7 @@ would otherwise touch the same code three times.
 | **D24** | A walk built an artefact and tested a different one | RESOLVED — the walk runs its own build; no product change owed | — |
 | **D27** | The backup runner pin rotted, and the scheduled backup quietly ran an old binary | FIXED — pin moved + CI guard | — |
 | **D28** | `ensure_repo` treats a restic repository reference as a filesystem path | FIXED — found the hour the walk started running local code | — |
+| **D29** | A disk claim reports the NODE filesystem as its own capacity | **OPEN** — measured on hardware, product decision owed | — |
 | **D25** | The real-Hetzner backup walk is blocked until 0.2.59 publishes | RESOLVED — walk re-ran GREEN | — |
 | **D26** | A `sequential` backup restores empty, and says it succeeded | FIXED 2026-09-02 — walk GREEN, shipped in cli v0.2.53 | — |
 
@@ -3305,3 +3306,77 @@ published binary while believing they were testing the working tree.
 That is the return on the rule this file keeps restating: **name the artefact
 you believe is running, then prove the cluster is running that one.** It is not
 bookkeeping. It is the difference between a test and a decoration.
+
+---
+
+## D29. A disk claim reports the node's filesystem as its own capacity
+
+**Opened:** 2026-09-03, by the first run of `e2e/node-disk-pressure-hetzner.sh`
+on real hardware — the run that exists because D22's disk half cannot be
+observed on kind at all.
+**Status:** OPEN. Measured, not fixed: the behaviour is faithful to its inputs
+and the right output is a product decision, not a bug fix.
+**Severity:** low blast radius, high misinformation. Nothing breaks; a number
+that means one thing is presented as meaning another.
+
+### What was measured
+
+A `needs.disk` claim requesting **1Gi**, on a `cpx22`:
+
+```text
+ok: kubelet node.fs present — 67456409600 free of 80279486464 bytes (84.0% free)
+ok: disk claim capacity sampled — usedBytes=9616949248 capacityBytes=80279486464
+```
+
+`capacityBytes` is byte-identical to the node filesystem's capacity, and
+`usedBytes` is the node's used space. So `app status` tells the reader that
+their 1Gi volume holds 80GB and is 12% used. Both halves are the node's.
+
+### Why it happens, and why nobody is at fault
+
+`sample_claim_volume` reads the kubelet's per-PVC entry through
+`capacity::pvc_usage`, which is exactly right. The kubelet, for a local-path
+(hostPath-backed) PersistentVolume, reports the statistics of the **backing
+filesystem**, because a directory on a shared filesystem has no quota to report
+against. There is no per-volume number to be had from that source.
+
+So the operator is honest, the kubelet is honest, and the composition is
+misleading.
+
+### Why it is not simply "print the requested size instead"
+
+D8's own write-up already rejected that, and the reasoning holds:
+
+> Printing a claim's provisioned size alone was considered and rejected: it
+> answers the easy half of the question the column exists for and reads as if
+> it had answered both.
+
+A claim showing `1Gi capacity, 9.6GB used` would be worse than what ships now.
+The two figures come from different worlds and pairing them invents a
+relationship.
+
+### The options, none of them free
+
+1. **Say what it is.** Keep both numbers but label the pair as the backing
+   filesystem's, not the claim's — the reader learns the true fact (this volume
+   shares an 80GB disk that is 12% full), which for a local-path volume is
+   arguably the *more* actionable one.
+2. **Suppress it for unquota'd backends.** Detect that the sampled capacity
+   equals the node's and omit the figure, the way the sampler already omits
+   when the kubelet reports nothing. Costs the signal entirely on tier 1.
+3. **Leave it.** Cheapest, and the one that keeps the misinformation.
+
+(1) looks right, and it is a rendering change rather than a sampling change —
+which is where the defect actually lives.
+
+### How it was found, and what that says
+
+Only real hardware could produce it: on kind the kubelet reports no volume
+statistics at all for local-path, so every local walk SOFT-SKIPS this figure and
+the number had never been seen. The moment a machine could produce it, it was
+wrong — and it was wrong in a way three months of unit tests could not have
+caught, because the unit tests assert the parser, and the parser is correct.
+
+The walk records this rather than asserting it. Failing on it would pin a
+behaviour the product has not chosen, which is the mistake D24 documents from
+the other direction.
