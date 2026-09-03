@@ -1270,6 +1270,34 @@ fn summarise_pod(pod: &Value, now: &chrono::DateTime<chrono::Utc>) -> PodSummary
 /// Deliberately conservative: an unparseable or absent timestamp on either
 /// side reports NOT stale. A false "your pods are stale" teaches the reader
 /// to ignore the column, which costs more than the occasional miss.
+///
+/// # The two sides do not have the same resolution
+///
+/// COMPARED AT WHOLE SECONDS, ON PURPOSE. `pod.status.startTime` is a
+/// Kubernetes `metav1.Time`, which serialises RFC3339 TRUNCATED TO SECONDS —
+/// `2026-09-03T01:18:29Z`. The operator's `changedAt` is
+/// `Utc::now().to_rfc3339()`, which carries nanoseconds —
+/// `2026-09-03T01:18:29.943066898+00:00`. A plain `<` between them therefore
+/// says "the pod is older" for every pod that started in the SAME SECOND as
+/// the change, because the pod's fractional part was thrown away by the
+/// apiserver and reads as `.000000000`.
+///
+/// That is not a corner case. On a first deployment the operator applies the
+/// Deployment and stamps the digest in the same reconcile, so the pod is
+/// created in that same second — and every freshly deployed application
+/// displayed `← old config` and the "still serving the previous values" note
+/// immediately, having changed nothing. Measured: startTime
+/// `01:18:29Z` against changedAt `01:18:29.943066898+00:00`, on a pod seven
+/// seconds old.
+///
+/// Truncating both sides to the resolution the apiserver actually provides
+/// costs at most one second of sensitivity — a change and a pod start inside
+/// the same second read as not-stale — and that is the direction this function
+/// already commits to above.
+///
+/// Found by the negative control in `e2e/secrets-ux-walk.sh`, which exists
+/// only because two independent reviewers refused to accept a positive-only
+/// assertion for this flag.
 pub(crate) fn pod_is_stale(started_at: Option<&str>, changed_at: Option<&str>) -> bool {
     let (Some(started), Some(changed)) = (started_at, changed_at) else {
         return false;
@@ -1280,7 +1308,9 @@ pub(crate) fn pod_is_stale(started_at: Option<&str>, changed_at: Option<&str>) -
     ) else {
         return false;
     };
-    started < changed
+    // `timestamp()` is whole seconds since the epoch — the truncation the
+    // apiserver has already applied to one side, applied to both.
+    started.timestamp() < changed.timestamp()
 }
 
 /// Pure helper — format a duration from `since` to `now` using
@@ -5368,6 +5398,45 @@ mod drift_tests {
         assert!(pod_is_stale(
             Some("2026-08-31T10:00:00Z"),
             Some("2026-08-31T13:00:00+01:00")
+        ));
+    }
+
+    #[test]
+    fn a_pod_started_in_the_same_second_as_the_change_is_not_stale() {
+        // THE FRESH-DEPLOY FALSE POSITIVE. `pod.status.startTime` is a
+        // metav1.Time and arrives TRUNCATED TO SECONDS; the operator's
+        // changedAt carries nanoseconds. A plain `<` therefore flagged every
+        // pod created in the same second as the stamp — which, on a first
+        // deployment, is every pod, because the Deployment apply and the digest
+        // stamp happen in one reconcile.
+        //
+        // These are the exact values measured by e2e/secrets-ux-walk.sh on a
+        // seven-second-old pod that had never seen a rotation.
+        assert!(
+            !pod_is_stale(
+                Some("2026-09-03T01:18:29Z"),
+                Some("2026-09-03T01:18:29.943066898+00:00")
+            ),
+            "a pod whose truncated startTime shares the second with changedAt must not be flagged"
+        );
+    }
+
+    #[test]
+    fn a_genuinely_earlier_pod_is_still_stale_despite_the_truncation() {
+        // The fix must not cost the signal. One second earlier is a different
+        // whole second, so it still registers — as does anything older.
+        assert!(pod_is_stale(
+            Some("2026-09-03T01:18:28Z"),
+            Some("2026-09-03T01:18:29.943066898+00:00")
+        ));
+        assert!(pod_is_stale(
+            Some("2026-09-03T01:10:00Z"),
+            Some("2026-09-03T01:18:29.943066898+00:00")
+        ));
+        // And a pod started in a LATER second is not stale, sub-seconds or not.
+        assert!(!pod_is_stale(
+            Some("2026-09-03T01:18:30Z"),
+            Some("2026-09-03T01:18:29.943066898+00:00")
         ));
     }
 }
