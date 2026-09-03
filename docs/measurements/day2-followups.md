@@ -25,14 +25,14 @@ would otherwise touch the same code three times.
 | **D3** | Two diagnostics whose `help:` text describes a layout that moved | RESOLVED | — |
 | **D4** | Removing a `needs.*` entry orphans its ResourceClaim forever | FIXED 2.22b — walk-verified | 2.22b |
 | **D5** | A Dragonfly restart drops every claim's ACL user | RESOLVED 2.22f — walk GREEN | 2.22f |
-| **D6** | Rotating a secret does not take effect until something else restarts the pods | FIXED 2.22c — walk owed | 2.22c |
-| **D7** | The CLI cannot answer the question its own error asks | FIXED 2.22c — walk owed | 2.22c |
-| **D8** | A node-scoped warning published through an optional object | FIXED 2.22d — walk step still owed | 2.22d |
+| **D6** | Rotating a secret does not take effect until something else restarts the pods | RESOLVED 2.22c — walk-verified both sides | 2.22c |
+| **D7** | The CLI cannot answer the question its own error asks | RESOLVED — the CLI half was still missing; shipped + walk-verified | 2.22c |
+| **D8** | A node-scoped warning published through an optional object | RESOLVED 2.22d — proven on real hardware | 2.22d |
 | **D9** | There is nothing to roll a moving tag back to | RESOLVED 2.22e — walk GREEN | 2.22e |
 | **D10** | The applying half of right-sizing has never been observed to apply anything | RESOLVED 2.22d — walk GREEN on real Hetzner | 2.22d |
 | **D11** | 584 failures share one catch-all, and the cheap checks run last | FIXED 2.22a | 2.22a |
 | **D12** | Removing `expose` leaves the Service behind | FIXED 2.22b — walk-verified | 2.22b |
-| **D13** | A registry credential copy that nothing ever reclaims | FIXED 2.22b — walk step still owed | 2.22b |
+| **D13** | A registry credential copy that nothing ever reclaims | RESOLVED 2.22b — reference counting walk-verified | 2.22b |
 | **D14** | Re-sealing a secret performs a gated change through an ungated door | RESOLVED (decision + disclosure landed 2.22c) |
 | **D15** | The destructive-change gate never engaged for a base-only app | RESOLVED |
 | **D16** | A reconcile that fails leaves no trace outside the operator's log | FIXED 2.22h — walk-verified | 2.22h |
@@ -41,7 +41,7 @@ would otherwise touch the same code three times.
 | **D19** | The 2.22d size sampler deletes a live claim's whole allocation | FIXED 2.22f — same day, self-inflicted | 2.22f |
 | **D20** | An approved migration can sit unexecuted, with no requeue behind it | **OPEN** — unreproduced, cause not proven | — |
 | **D21** | A claim deleted twice inside its grace window wedges forever | FIXED — walk-verified | — |
-| **D22** | The disk half of D8 never populated, and no local walk could have noticed | FIXED — pg half walk-verified, disk figure needs hardware | — |
+| **D22** | The disk half of D8 never populated, and no local walk could have noticed | RESOLVED — both halves verified, the disk one on hardware | — |
 | **D23** | One object's data can crash-loop the entire operator | FIXED at both sites | — |
 | **D24** | A walk built an artefact and tested a different one | RESOLVED — the walk runs its own build; no product change owed | — |
 | **D27** | The backup runner pin rotted, and the scheduled backup quietly ran an old binary | FIXED — pin moved + CI guard | — |
