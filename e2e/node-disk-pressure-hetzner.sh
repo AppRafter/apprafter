@@ -371,16 +371,35 @@ while [ "$(date +%s)" -lt "$_deadline" ]; do
 done
 assert_eq "the ballast pod completed" "$BALLAST_PHASE" "Succeeded"
 
-read -r AVAIL2 CAP2 <<<"$(node_fs)"
-FREE_PCT=$(python3 -c "print(f'{100*int('$AVAIL2')/int('$CAP2'):.1f}')")
-printf '  node is now %s%% free (was %s%%)\n' "$FREE_PCT" \
+# POLL, DO NOT SAMPLE. The kubelet does not recompute filesystem statistics on
+# demand — it refreshes them on its own cadence, and the Summary endpoint serves
+# the last computed set. Reading once immediately after the pod exits returns
+# the PRE-FILL numbers, byte-identical, and reads exactly like a fill that did
+# nothing. That is what happened on the first run against the published
+# operator: 59.3 GB allocated, pod Succeeded, "node is now 83.9% free (was
+# 83.9%)" — the same figure twice, which is the tell.
+_fs_deadline=$(( $(date +%s) + 240 ))
+FREE_PCT=""
+while [ "$(date +%s)" -lt "$_fs_deadline" ]; do
+    read -r AVAIL2 CAP2 <<<"$(node_fs)"
+    if [ -n "${CAP2:-}" ] && [ "${CAP2:-0}" -gt 0 ]; then
+        FREE_PCT=$(python3 -c "print(f'{100*int('$AVAIL2')/int('$CAP2'):.1f}')")
+        python3 -c "import sys; sys.exit(0 if 100*int('$AVAIL2')/int('$CAP2') < 15.0 else 1)" && break
+    fi
+    sleep 10
+done
+printf '  node is now %s%% free (was %s%%)\n' "${FREE_PCT:-?}" \
     "$(python3 -c "print(f'{100*int('$AVAIL')/int('$CAP'):.1f}')")"
-python3 -c "
-import sys
-if 100*int('$AVAIL2')/int('$CAP2') >= 15.0:
-    print('FAILED: the fill did not push the node under the 15% threshold — nothing below can fire', file=sys.stderr)
-    sys.exit(1)
-"
+if [ -z "$FREE_PCT" ] || ! python3 -c "import sys; sys.exit(0 if $FREE_PCT < 15.0 else 1)"; then
+    printf 'FAILED: the fill did not push the node under the 15%% threshold within 240s — nothing below can fire\n' >&2
+    printf '  ballast pod output:\n' >&2
+    kubectl logs "$BALLAST_POD" >&2 2>&1 || true
+    printf '  df on the node, via a fresh privileged pod:\n' >&2
+    kubectl run d8-df --rm -i --restart=Never --image=busybox:1.36 \
+        --overrides='{"spec":{"nodeName":"'"$NODE"'","tolerations":[{"operator":"Exists"}],"containers":[{"name":"df","image":"busybox:1.36","command":["df","-h","/host"],"securityContext":{"privileged":true},"volumeMounts":[{"name":"host","mountPath":"/host"}],"stdin":true,"tty":false}],"volumes":[{"name":"host","hostPath":{"path":"/"}}]}}' \
+        >&2 2>&1 || true
+    exit 1
+fi
 
 # The operator caches a kubelet sample for 30s and the PlatformStack controller
 # writes the condition on its own tick; budget generously.

@@ -180,6 +180,75 @@ jobs:
           echo "is_prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
+      # A chart must never advertise an image that does not exist yet.
+      #
+      # This workflow and `release-operator.yml` are triggered by the SAME push
+      # and run concurrently, with no dependency between them — and they are
+      # wildly different lengths. Measured on the 0.2.63 push: this workflow
+      # finished in 43 seconds, `release-operator` took eleven minutes. For the
+      # ten minutes in between, channel-latest pointed at a chart pinning an
+      # operator image that was not in the registry.
+      #
+      # That is not a CI-only problem. A cluster bootstrapping in that window —
+      # or auto-updating to channel-latest — pulls a tag that 404s and lands in
+      # ImagePullBackOff, and the only sign is a pod nobody is watching. It cost
+      # one red `e2e-k3d` before anyone looked, and the walk it broke had passed
+      # on every previous commit.
+      #
+      # So: wait for the images this chart pins, and fail loudly rather than
+      # publish a chart that points at nothing. A cross-workflow `needs:` is not
+      # expressible here without restructuring both into one workflow, and this
+      # is the smaller, more direct guarantee — it checks the REGISTRY, which is
+      # what a cluster actually pulls from, rather than a job's exit status.
+      #
+      # Only trusted inputs are used below: a secret and the built-in
+      # GITHUB_REPOSITORY, both through `env:`. No event payload is
+      # interpolated.
+      - name: Wait for the operator images this chart pins
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          owner_lc="$(echo "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')"
+          # The version the rendered chart pins for both operator images.
+          op_version="$(grep -oE 'version: "v[0-9]+\.[0-9]+\.[0-9]+"' \
+              platform-stack/cue/component_apprafter-operator.cue \
+              | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')"
+          if [ -z "${op_version:-}" ]; then
+            echo "::error::could not read the pinned operator version from component_apprafter-operator.cue"
+            exit 1
+          fi
+          echo "chart pins operator images at ${op_version}"
+
+          # ghcr's token endpoint issues a pull token with the workflow's own
+          # credentials; a manifest HEAD then answers 200 only once the tag
+          # exists.
+          check_tag() {
+            local image="$1" tag="$2" token
+            token=$(curl -fsSL -u "x:${GHCR_TOKEN}" \
+              "https://ghcr.io/token?scope=repository:${owner_lc}/${image}:pull&service=ghcr.io" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' 2>/dev/null || true)
+            [ -n "${token:-}" ] || return 1
+            curl -fsS -o /dev/null -H "Authorization: Bearer ${token}" \
+              -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json" \
+              "https://ghcr.io/v2/${owner_lc}/${image}/manifests/${tag}" >/dev/null 2>&1
+          }
+
+          deadline=$(( $(date +%s) + 900 ))
+          for image in apprafter-operator apprafter-admission-webhook; do
+            until check_tag "$image" "$op_version"; do
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "::error::${image}:${op_version} is still absent from ghcr after 15 minutes."
+                echo "::error::Publishing this chart would advertise an image nobody can pull."
+                echo "::error::Check release-operator for this same commit — it publishes these tags."
+                exit 1
+              fi
+              echo "  ${image}:${op_version} not in the registry yet — waiting 20s"
+              sleep 20
+            done
+            echo "  ok: ${image}:${op_version} is pullable"
+          done
+
       - name: Compute lowercase owner
         id: owner
         env:

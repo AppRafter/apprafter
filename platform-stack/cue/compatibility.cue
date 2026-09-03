@@ -1760,6 +1760,29 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.64": {
+	change:          "safe"
+	operatorVersion: "v0.2.46"
+	notes: """
+		Republishes the CUE config-management sidecar so its bundled schemas
+		match the tree. No behaviour change.
+
+		The `argocd-cue-cmp` image bundles ALL of `schemas/v1alpha1/`, not just
+		the Application schema, so 0.2.63's one-line addition of
+		`SharedVolume.status.capacity.scope` (D29) changed the image's source
+		without changing its version. The drift guard caught it after the
+		publish, which is exactly what it is for and one release later than it
+		should have been noticed: the same rule bit the 1.83d
+		`infrastructure.cue` edit, and I applied the lesson to that file rather
+		than to the rule.
+
+		cue-cmp 0.1.22 → 0.1.23, and this chart's pin follows it. Nothing in
+		the sidecar's behaviour changes — the added field is a status key the
+		CMP never reads — so an upgrade is a no-op beyond the image tag.
+		"""
+	references: ["docs/adr/0047-crd-codegen-from-cue.md"]
+}
+
 compatibility: "0.2.63": {
 	change:          "safe"
 	operatorVersion: "v0.2.46"
