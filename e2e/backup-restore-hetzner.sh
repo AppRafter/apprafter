@@ -550,6 +550,7 @@ apprafter target add "$OLD_TARGET" \
     --provider hetzner-cloud \
     --tier     solo \
     --region   "$REGION" \
+    --server-type "${APPRAFTER_E2E_SERVER_TYPE:-cpx22}" \
     --token    "$HCLOUD_TOKEN_OLD" \
     --ssh-key  "$APPRAFTER_DR_SSH_PUBLIC_KEY_PATH" \
     --no-interactive --no-ping --force
@@ -557,6 +558,7 @@ apprafter target add "$NEW_TARGET" \
     --provider hetzner-cloud \
     --tier     solo \
     --region   "$REGION" \
+    --server-type "${APPRAFTER_E2E_SERVER_TYPE:-cpx22}" \
     --token    "$HCLOUD_TOKEN_NEW" \
     --ssh-key  "$APPRAFTER_DR_SSH_PUBLIC_KEY_PATH" \
     --no-interactive --no-ping --force

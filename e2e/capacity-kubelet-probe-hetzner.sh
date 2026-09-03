@@ -95,6 +95,7 @@ phase "Provision + bootstrap ONE real Hetzner node ($CAP_TARGET, region $REGION)
 { set +x; } 2>/dev/null
 apprafter target add "$CAP_TARGET" \
     --provider hetzner-cloud --tier solo --region "$REGION" \
+    --server-type "${APPRAFTER_E2E_SERVER_TYPE:-cpx22}" \
     --token "$HCLOUD_TOKEN_OLD" --ssh-key "$APPRAFTER_DR_SSH_PUBLIC_KEY_PATH" \
     --no-interactive --no-ping --force
 CAP_CREATED=1

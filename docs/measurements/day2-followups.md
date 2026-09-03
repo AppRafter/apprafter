@@ -39,7 +39,7 @@ would otherwise touch the same code three times.
 | **D17** | A Dragonfly tenant can read every other tenant's key counts | FIXED 2.22f — and it was larger than key counts | 2.22f |
 | **D18** | Two git-ownership guards could never fire: kubectl hides `managedFields` | FIXED 2.22e | 2.22e |
 | **D19** | The 2.22d size sampler deletes a live claim's whole allocation | FIXED 2.22f — same day, self-inflicted | 2.22f |
-| **D20** | An approved migration can sit unexecuted, with no requeue behind it | **OPEN** — unreproduced, cause not proven | — |
+| **D20** | An approved migration can sit unexecuted, with no requeue behind it | CLOSED unreproduced — not fixed, reopen on a second sighting | — |
 | **D21** | A claim deleted twice inside its grace window wedges forever | FIXED — walk-verified | — |
 | **D22** | The disk half of D8 never populated, and no local walk could have noticed | RESOLVED — both halves verified, the disk one on hardware | — |
 | **D23** | One object's data can crash-loop the entire operator | FIXED at both sites | — |
@@ -970,9 +970,27 @@ deliberately kept out of the 2.20 documentation track for that reason.
 ## D7. The CLI cannot answer the question its own error asks
 
 **Opened:** 2026-08-30 (2.20c, correcting `docs/dev-guide/secrets.md`).
-**Status:** FIXED 2026-08-31 (2.22c). `EnvSecretMissing` names the cause, the
-namespace and the available keys; `apprafter secret list` answers it directly.
-Walk owed at the 2.22 close.
+**Status:** RESOLVED 2026-09-03, and this entry was recorded as fixed a
+release too early. 2.22c did the operator half well — `EnvSecretMissing` names
+the cause, the namespace and the keys the Secret DOES carry — but that message
+went somewhere no CLI read. `app status` printed `AppRafter phase:
+EnvSecretMissing` and stopped. The claim below that "`apprafter secret list`
+answers it directly" was wrong: `secret list` renders key names out of the
+SealedSecret's own `spec.encryptedData` without decrypting anything or reading
+the resulting Secret, so it answers what was DECLARED and where, never whether
+it materialised — a SealedSecret the controller cannot decrypt renders an
+identical, fully populated row.
+
+So the entry's own title stayed true for three more days. `app status` now
+prints the reason and the message under the phase (cli v0.2.56), and BOTH sides
+are walk-verified: the operator message in `needs-env-refs-walk` Phase 5
+(present-but-wrong-key, distinct from absent) and the CLI rendering in
+`secrets-ux-walk` Phase 8.
+
+Worth keeping visible: writing the walk is what found this. The design review
+asked what `app status` would print for a broken binding, and the answer was
+"the phase, and nothing else". A walk written without that question would have
+asserted the phase, gone green, and pinned the gap in place.
 **Severity:** medium. Every diagnosis path for the most common secrets mistake
 leaves the CLI.
 
@@ -2516,7 +2534,17 @@ verified by reintroducing the defect and watching it name the offending line.
 ## D20. An approved migration can sit unexecuted, with no requeue behind it
 
 **Opened:** 2026-09-01, by the second run of the 2.22h `needs-removal` walk.
-**Status:** OPEN, and deliberately not "fixed" — see the evidence gap below.
+**Status:** CLOSED 2026-09-03 as UNREPRODUCED — explicitly NOT as fixed.
+Owner's call, and the right one: it was seen once in five runs on 2026-09-01 and
+has not recurred in any run since, across the 2.22 validation batch, the
+sequential-backup walks, both new walks and two real-hardware runs. Nothing was
+changed to address it, so if the cause is still there it will surface again —
+and this entry, with its evidence gap named, is what the next sighting should be
+read against.
+
+Closing an unreproduced defect as "fixed" would be the lie; closing it as
+"unreproduced" is a decision about where to spend attention. The distinction is
+the whole reason this status line is worded this way.
 **Severity:** low frequency, high confusion. Observed once in five runs; when it
 happens the user's change simply never takes effect and nothing says why.
 
