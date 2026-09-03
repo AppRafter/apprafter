@@ -263,6 +263,46 @@ async fn sample_node_free_fraction(
     operator_core::capacity::node_free_fraction(&summary)
 }
 
+/// The `NodeDiskPressure` verdict for a node-free fraction: `(status, reason,
+/// message)`.
+///
+/// PURE, AND EXTRACTED FOR THAT REASON. This is the entire user-facing surface
+/// of D8 — the sentence an operator reads, and the only warning that a node is
+/// about to stop accepting writes — and it was assembled inline inside a
+/// thousand-line async reconcile where no test could reach it. The only thing
+/// exercising the wording was `e2e/node-disk-pressure-hetzner.sh`, which costs
+/// a provisioned Hetzner node and thirteen minutes, so a regression in the one
+/// sentence users actually read was thirteen minutes and real money away from
+/// being noticed.
+///
+/// The threshold itself lives in `operator_core::capacity` and is asserted
+/// there; what this adds is that the right SIDE of it produces the right
+/// condition, reason and message.
+fn node_disk_pressure_verdict(fraction: f64) -> (&'static str, &'static str, String) {
+    let pct_free = (fraction * 100.0).round() as i64;
+    if operator_core::capacity::is_capacity_warning(
+        fraction,
+        operator_core::capacity::DEFAULT_NODE_FREE_THRESHOLD,
+    ) {
+        (
+            "True",
+            "NodeFilesystemNearlyFull",
+            format!(
+                "the node's filesystem is {}% full ({pct_free}% free). Every workload on \
+                 this node shares it — local-path volumes, database storage, snapshots, \
+                 container images and logs.",
+                100 - pct_free
+            ),
+        )
+    } else {
+        (
+            "False",
+            "SufficientSpace",
+            format!("the node's filesystem has {pct_free}% free"),
+        )
+    }
+}
+
 async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Action, Error> {
     // Filter to the singleton coordinates per webhook contract.
     if stack.name_any() != SINGLETON_NAME {
@@ -1018,30 +1058,14 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     // than flipping it to a false negative. A decorative read must never
     // fail a reconcile — the ADR 0048 anchor-403 lesson.
     if let Some(fraction) = sample_node_free_fraction(&ctx.client, &ctx.capacity).await {
-        let pct_free = (fraction * 100.0).round() as i64;
-        let cond = if operator_core::capacity::is_capacity_warning(
-            fraction,
-            operator_core::capacity::DEFAULT_NODE_FREE_THRESHOLD,
-        ) {
-            condition(
-                COND_NODE_DISK_PRESSURE,
-                "True",
-                "NodeFilesystemNearlyFull",
-                &format!(
-                    "the node's filesystem is {}% full ({pct_free}% free). Every workload on                      this node shares it — local-path volumes, database storage, snapshots,                      container images and logs.",
-                    100 - pct_free
-                ),
-                &prior_conds,
-            )
-        } else {
-            condition(
-                COND_NODE_DISK_PRESSURE,
-                "False",
-                "SufficientSpace",
-                &format!("the node's filesystem has {pct_free}% free"),
-                &prior_conds,
-            )
-        };
+        let (status, reason, message) = node_disk_pressure_verdict(fraction);
+        let cond = condition(
+            COND_NODE_DISK_PRESSURE,
+            status,
+            reason,
+            &message,
+            &prior_conds,
+        );
         upsert_condition(&mut new_status, cond);
     }
 
@@ -2072,6 +2096,54 @@ fn build_platform_migration_plan_cr(
 
 #[cfg(test)]
 mod tests {
+    // -----------------------------------------------------------------
+    // D8 — the sentence an operator actually reads
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_nearly_full_node_warns_and_names_what_shares_the_disk() {
+        // 10% free is under the 0.15 threshold — the state the hardware walk
+        // produces by filling the node.
+        let (status, reason, message) = super::node_disk_pressure_verdict(0.10);
+        assert_eq!(status, "True");
+        assert_eq!(reason, "NodeFilesystemNearlyFull");
+        assert!(message.contains("90% full"), "states fullness: {message}");
+        assert!(
+            message.contains("10% free"),
+            "states the remainder: {message}"
+        );
+        // The message exists to tell the reader the blast radius is not one
+        // volume. Without this half it is just a number.
+        assert!(
+            message.contains("local-path volumes") && message.contains("database storage"),
+            "names what else shares the disk: {message}"
+        );
+    }
+
+    #[test]
+    fn a_healthy_node_reports_false_without_the_alarming_sentence() {
+        let (status, reason, message) = super::node_disk_pressure_verdict(0.84);
+        assert_eq!(status, "False");
+        assert_eq!(reason, "SufficientSpace");
+        assert!(message.contains("84% free"), "states the figure: {message}");
+        // A healthy node must not carry the warning text. The CLI prints the
+        // message only when status is True, but a condition that always reads
+        // alarming is how a banner becomes noise.
+        assert!(
+            !message.contains("Every workload"),
+            "no warning prose on a healthy node: {message}"
+        );
+    }
+
+    #[test]
+    fn the_threshold_boundary_falls_on_the_documented_side() {
+        // `is_capacity_warning` is `fraction < threshold`, so exactly at the
+        // threshold is NOT a warning. Pinned here because the boundary is the
+        // part a refactor gets wrong, and because 0.15 is a bare constant with
+        // no type to protect it.
+        assert_eq!(super::node_disk_pressure_verdict(0.15).0, "False");
+        assert_eq!(super::node_disk_pressure_verdict(0.1499).0, "True");
+    }
 
     // ---- D23: the same hazard on the platform side ----
 

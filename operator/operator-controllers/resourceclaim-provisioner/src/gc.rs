@@ -98,6 +98,24 @@ const MIN_REQUEUE: Duration = Duration::from_secs(60);
 /// once an hour costs nothing.
 const MAX_REQUEUE: Duration = Duration::from_secs(3600);
 
+/// Clamp a computed requeue delay into the representable window (D23).
+///
+/// EXTRACTED SO THE TESTS CAN CALL IT. The two clamp tests used to write
+/// `raw.max(MIN_REQUEUE).min(MAX_REQUEUE)` in their own bodies and assert on
+/// the result — which asserts that the TEST's arithmetic works, and stays
+/// green if the clamp is deleted from the reconcile. That is the same
+/// cannot-fail shape this file's D23 entry exists to prevent, committed while
+/// fixing D23.
+///
+/// The ceiling is not cosmetic: `tokio_util::time::DelayQueue` PANICS on a
+/// deadline it cannot represent, and a panic on a worker takes the whole
+/// operator process down. One `RetainedClaim` carrying an absurd
+/// `retainUntil` is enough, and the data comes from an object a user can
+/// write. The floor keeps a near-deadline claim from spinning the reconcile.
+fn clamp_requeue(raw: Duration) -> Duration {
+    raw.max(MIN_REQUEUE).min(MAX_REQUEUE)
+}
+
 /// Requeue between Phase 2 polls while waiting for CNPG to drop the
 /// `ensure: absent` role (2.4f Fix B2). CNPG drops the DB then the role
 /// over a few reconcile passes; we poll the Cluster `status` until the
@@ -154,9 +172,7 @@ pub async fn reconcile(
 
     // Not yet expired → requeue for the remaining grace (floored).
     if !grace::should_gc(retain_until, now) {
-        let remaining = grace::remaining_grace(retain_until, now)
-            .max(MIN_REQUEUE)
-            .min(MAX_REQUEUE);
+        let remaining = clamp_requeue(grace::remaining_grace(retain_until, now));
         info!(
             retained = %rc_name, retain_until = %rc.spec.retain_until,
             requeue_secs = remaining.as_secs(),
@@ -982,8 +998,11 @@ mod tests {
             raw > MAX_REQUEUE,
             "fixture must exceed the ceiling or it proves nothing"
         );
-        let scheduled = raw.max(MIN_REQUEUE).min(MAX_REQUEUE);
-        assert_eq!(scheduled, MAX_REQUEUE);
+        assert_eq!(
+            clamp_requeue(raw),
+            MAX_REQUEUE,
+            "an unrepresentable deadline must be capped by PRODUCTION code, not by the test"
+        );
     }
 
     #[test]
@@ -994,10 +1013,11 @@ mod tests {
         let soon = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:05+00:00")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let scheduled = crate::grace::remaining_grace(soon, now)
-            .max(MIN_REQUEUE)
-            .min(MAX_REQUEUE);
-        assert_eq!(scheduled, MIN_REQUEUE, "the floor must still apply");
+        assert_eq!(
+            clamp_requeue(crate::grace::remaining_grace(soon, now)),
+            MIN_REQUEUE,
+            "the floor must still apply"
+        );
     }
     use super::*;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;

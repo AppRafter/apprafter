@@ -3436,13 +3436,46 @@ mod tests {
         creds.insert("RESTIC_PASSWORD".to_string(), "testpass".to_string());
         creds.insert("S3_ACCESS_KEY_ID".to_string(), "AKID".to_string());
         creds.insert("S3_SECRET_ACCESS_KEY".to_string(), "SKEY".to_string());
-        // Just construct a Command and call apply_creds_to_command — we can't
-        // easily inspect the env map directly, so we exercise the code path
-        // via a no-op echo (or true) call and verify it doesn't panic.
         let mut cmd = Command::new("true");
         apply_creds_to_command(&mut cmd, &creds);
-        // If we reach here without panic the function is wired correctly.
-        // The translation (S3_*→AWS_*) is covered by translate_creds_for_restic test above.
+
+        // READ THE ENV BACK. This test used to call the function, assert
+        // nothing, and say so: "if we reach here without panic the function is
+        // wired correctly". That passes if `apply_creds_to_command` sets
+        // NOTHING — and a restic subprocess with no credentials fails far from
+        // here, against a bucket, with an authentication error nobody traces to
+        // an empty env map. `Command::get_envs` makes the real assertion cheap.
+        let env: std::collections::BTreeMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+
+        // restic reads AWS_* natively; the canonical S3_* names are ours.
+        assert_eq!(
+            env.get("AWS_ACCESS_KEY_ID").map(String::as_str),
+            Some("AKID")
+        );
+        assert_eq!(
+            env.get("AWS_SECRET_ACCESS_KEY").map(String::as_str),
+            Some("SKEY")
+        );
+        // The passphrase passes through under its own name.
+        assert_eq!(
+            env.get("RESTIC_PASSWORD").map(String::as_str),
+            Some("testpass")
+        );
+        // And the translation is a RENAME, not a copy: leaving the S3_* names
+        // on the subprocess would mean two spellings of one secret in the
+        // child's environment, and a reader could not tell which restic used.
+        assert!(
+            !env.contains_key("S3_ACCESS_KEY_ID") && !env.contains_key("S3_SECRET_ACCESS_KEY"),
+            "canonical S3_* names must not reach the subprocess: {env:?}"
+        );
     }
 
     // ------------------------------------------------------------------

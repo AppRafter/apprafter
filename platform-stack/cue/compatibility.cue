@@ -1760,6 +1760,37 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.65": {
+	change:          "safe"
+	operatorVersion: "v0.2.47"
+	notes: """
+		NO BEHAVIOUR CHANGE. Two behaviour-preserving extractions that exist so
+		tests can reach code that had no way to be tested.
+
+		A coverage audit found two guards that could not fail. The D23 requeue
+		clamp — the one that stops an absurd `retainUntil` from panicking a
+		tokio DelayQueue and taking the operator process down — was asserted by
+		tests that RESTATED the clamp expression in their own bodies, so
+		deleting it from the reconcile left them green. And the whole
+		user-facing text of `NodeDiskPressure`, the sentence an operator reads
+		when a node is about to stop accepting writes, was assembled inline in a
+		thousand-line async reconcile where nothing could reach it: the only
+		thing exercising the wording was a real-Hetzner walk costing thirteen
+		minutes and a provisioned node.
+
+		Both are now pure functions called by both the reconcile and the tests,
+		and both sets of tests were verified to FAIL when the production code is
+		removed. The rendered manifests, the conditions and the messages are
+		byte-identical to 0.2.64.
+
+		This version exists only because the repo holds published version and
+		source in bijection — the invariant whose absence let the backup runner
+		pin rot for six weeks. Upgrading is a no-op; not upgrading is also a
+		no-op.
+		"""
+	references: ["docs/measurements/day2-followups.md"]
+}
+
 compatibility: "0.2.64": {
 	change:          "safe"
 	operatorVersion: "v0.2.46"
