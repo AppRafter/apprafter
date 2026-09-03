@@ -363,15 +363,7 @@ fn prompt_ssh_key(prefill: Option<&PathBuf>, source: &str) -> Result<Option<Path
         return prompt_ssh_key_text_fallback();
     }
 
-    let mut options: Vec<SshKeyChoice> = candidates
-        .into_iter()
-        .map(|p| {
-            let label = ssh_key_label(&p);
-            SshKeyChoice::Path { path: p, label }
-        })
-        .collect();
-    options.push(SshKeyChoice::Other);
-    options.push(SshKeyChoice::Skip);
+    let options = build_ssh_key_choices(candidates);
 
     let selected = Select::new("SSH public key:", options)
         .with_help_message("Used for server provisioning; can be added/changed later.")
@@ -389,26 +381,59 @@ fn prompt_ssh_key_text_fallback() -> Result<Option<PathBuf>> {
     let default = default_ssh_key_hint();
     let answer = Text::new("SSH public key path (leave empty to skip):")
         .with_default(&default)
-        .with_validator(|v: &str| {
-            let trimmed = v.trim();
-            if trimmed.is_empty() {
-                return Ok(Validation::Valid);
-            }
-            let expanded = expand_tilde(trimmed);
-            if !expanded.exists() {
-                return Ok(Validation::Invalid(
-                    format!("path `{}` does not exist", expanded.display()).into(),
-                ));
-            }
-            Ok(Validation::Valid)
+        .with_validator(|v: &str| match validate_ssh_key_path_input(v) {
+            Ok(()) => Ok(Validation::Valid),
+            Err(msg) => Ok(Validation::Invalid(msg.into())),
         })
         .prompt()
         .map_err(map_inquire_err)?;
+    Ok(ssh_key_answer_to_path(&answer))
+}
+
+/// Build the SSH-key picker rows: one `Path` row per scanned key
+/// in scan order, then the two escape hatches pinned to the
+/// bottom (`Other` before `Skip`). Pure — extracted from
+/// `prompt_ssh_key` so the row set and the sentinel placement are
+/// testable without a terminal.
+fn build_ssh_key_choices(candidates: Vec<PathBuf>) -> Vec<SshKeyChoice> {
+    let mut options: Vec<SshKeyChoice> = candidates
+        .into_iter()
+        .map(|p| {
+            let label = ssh_key_label(&p);
+            SshKeyChoice::Path { path: p, label }
+        })
+        .collect();
+    options.push(SshKeyChoice::Other);
+    options.push(SshKeyChoice::Skip);
+    options
+}
+
+/// Accept/reject rule for the free-text SSH-key path: an empty
+/// answer means "skip", anything else must already exist on disk
+/// (after `~/` expansion). Pure — extracted from the `inquire`
+/// validator closure in `prompt_ssh_key_text_fallback`.
+fn validate_ssh_key_path_input(input: &str) -> std::result::Result<(), String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let expanded = expand_tilde(trimmed);
+    if !expanded.exists() {
+        return Err(format!("path `{}` does not exist", expanded.display()));
+    }
+    Ok(())
+}
+
+/// Turn an accepted free-text answer into the wizard's
+/// `Option<PathBuf>`: empty (or whitespace-only) is "no key at
+/// all", not an empty path. Pure — extracted from
+/// `prompt_ssh_key_text_fallback`.
+fn ssh_key_answer_to_path(answer: &str) -> Option<PathBuf> {
     let trimmed = answer.trim();
     if trimmed.is_empty() {
-        Ok(None)
+        None
     } else {
-        Ok(Some(expand_tilde(trimmed)))
+        Some(expand_tilde(trimmed))
     }
 }
 
@@ -519,12 +544,7 @@ fn prompt_region(
             .with_default("nbg1")
             .prompt()
             .map_err(map_inquire_err)?;
-        let trimmed = answer.trim();
-        return Ok(if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        });
+        return Ok(region_text_answer(&answer));
     }
     let regions = fetch_regions(provider, token)?;
     if regions.is_empty() {
@@ -539,6 +559,19 @@ fn prompt_region(
         .prompt()
         .map_err(map_inquire_err)?;
     Ok(Some(selected.info.name))
+}
+
+/// An empty answer at the `--no-ping` region prompt means "leave
+/// the target's region unset" — saving `Some("")` would later be
+/// interpolated into API calls as a real region name. Pure —
+/// extracted from `prompt_region`.
+fn region_text_answer(answer: &str) -> Option<String> {
+    let trimmed = answer.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// `RegionInfo` decorated with a measured TCP latency. `None`
@@ -608,12 +641,26 @@ pub fn measure_region_latencies(
         results.push(r);
     }
 
-    // Synthesize `None`-latency entries for any region that never
-    // reported within the overall timeout — the user still sees
-    // them in the Select picker (sorted to the end), they just
-    // can't compare latency. Without this, an entire run of
-    // hung probes would silently shrink the picker to zero
-    // entries.
+    finalize_latency_rows(originals, results)
+}
+
+/// Reconcile what the probes reported against the full region
+/// list, then sort fastest-first.
+///
+/// Synthesizes a `None`-latency entry for any region that never
+/// reported within the overall timeout — the user still sees it in
+/// the Select picker (sorted to the end), they just can't compare
+/// latency. Without this, a run where every probe hangs would
+/// silently shrink the picker to zero entries and the wizard would
+/// offer the operator no region at all.
+///
+/// Pure — extracted from `measure_region_latencies` so the
+/// reconcile + sort rule is testable without spawning probe
+/// threads or waiting on a real timeout.
+fn finalize_latency_rows(
+    originals: Vec<RegionInfo>,
+    mut results: Vec<RegionWithLatency>,
+) -> Vec<RegionWithLatency> {
     let reported: std::collections::HashSet<String> =
         results.iter().map(|r| r.info.name.clone()).collect();
     for orig in originals {
@@ -767,17 +814,24 @@ fn prompt_tier(prefill: Option<&str>, source: &str) -> Result<Option<String>> {
         eprintln!("  ℹ Default tier: {t} (from {source})");
         return Ok(Some(t.to_string()));
     }
-    let options: Vec<TierChoice> = TIER_CHOICES
+    let options = build_tier_choices();
+    let selected = Select::new("Default tier:", options)
+        .prompt()
+        .map_err(map_inquire_err)?;
+    Ok(Some(selected.key))
+}
+
+/// Materialise the tier picker rows from `TIER_CHOICES`. Pure —
+/// extracted from `prompt_tier` so the offered set and its order
+/// (price ladder, cheapest first) are testable without a terminal.
+fn build_tier_choices() -> Vec<TierChoice> {
+    TIER_CHOICES
         .iter()
         .map(|(k, label)| TierChoice {
             key: (*k).to_string(),
             label: (*label).to_string(),
         })
-        .collect();
-    let selected = Select::new("Default tier:", options)
-        .prompt()
-        .map_err(map_inquire_err)?;
-    Ok(Some(selected.key))
+        .collect()
 }
 
 #[derive(Clone)]
@@ -1224,5 +1278,476 @@ mod tests {
         ];
         let locs = unique_locations(&offers);
         assert_eq!(locs, vec!["nbg1"]);
+    }
+
+    // ---------------------------------------------------------------
+    // Prefill (prompt-skipping) decisions.
+    //
+    // Every prompt in this file starts with a "was it already
+    // supplied?" branch. Those branches are reachable without a
+    // terminal — a prefilled prompt returns the supplied value and
+    // never touches stdin — so they are pinned directly here. Only
+    // the branches that actually open an `inquire` widget are left
+    // to the manual walk.
+    //
+    // Nothing below may reach the network: every call either passes
+    // `no_ping = true` or takes a prefill short-circuit that
+    // returns before the provider client is constructed. A test
+    // that starts hitting the Hetzner API is a regression in the
+    // production short-circuit, not in the test.
+    // ---------------------------------------------------------------
+
+    /// A 64-char ASCII-alphanumeric token — the shape
+    /// `validate_hetzner_token_format` accepts. Not a real
+    /// credential; nothing in these tests pings the API.
+    fn well_formed_token() -> String {
+        "a".repeat(64)
+    }
+
+    fn add_args_fully_supplied() -> AddArgs {
+        AddArgs {
+            name: Some("prod".into()),
+            provider: Some("hetzner-cloud".into()),
+            token: Some(well_formed_token()),
+            ssh_key: Some(PathBuf::from("/home/operator/.ssh/id_ed25519.pub")),
+            region: Some("hel1".into()),
+            tier: Some("team".into()),
+            cluster_name: None,
+            force: false,
+            renew: false,
+            no_interactive: false,
+            no_ping: true,
+            server_type: Some("cx22".into()),
+        }
+    }
+
+    /// The whole-wizard contract for the "operator supplied
+    /// everything on the command line but is still on a TTY" case:
+    /// `run_add_wizard` must return each flag's value untouched and
+    /// open no prompt at all. This is the path `target add` takes on
+    /// every scripted-but-interactive invocation, and it is the one
+    /// place where a mis-wired prompt order (e.g. reading the tier
+    /// into the region) would be silently accepted, since each
+    /// individual prompt still "works".
+    #[test]
+    fn run_add_wizard_returns_every_supplied_flag_unchanged_and_prompts_for_nothing() {
+        let args = add_args_fully_supplied();
+        let out = run_add_wizard(&args).expect("a fully prefilled wizard must not prompt");
+
+        assert_eq!(out.name, "prod");
+        assert_eq!(out.provider, "hetzner-cloud");
+        assert_eq!(out.token, well_formed_token());
+        assert_eq!(
+            out.ssh_key,
+            Some(PathBuf::from("/home/operator/.ssh/id_ed25519.pub"))
+        );
+        assert_eq!(out.region.as_deref(), Some("hel1"));
+        assert_eq!(out.tier.as_deref(), Some("team"));
+        // `--no-ping` skips the machine matrix, so the WIZARD
+        // contributes no SKU even though `--server-type` was
+        // passed. That is deliberate: `run_wizard_into_args` only
+        // adopts `out.server_type` when the flag was absent, so the
+        // operator's `cx22` survives. Returning the prefill here
+        // instead would make the wizard look like it had picked a
+        // SKU it never validated.
+        assert_eq!(out.server_type, None);
+        // No ping ran, so the save-time check must not be told the
+        // token is already verified.
+        assert!(!out.token_already_verified);
+    }
+
+    /// A pre-supplied name is announced and accepted verbatim —
+    /// v0.1.76 re-prompted with the name as the default, which was
+    /// pure noise.
+    #[test]
+    fn prompt_name_accepts_a_supplied_name_verbatim() {
+        let got = prompt_name(Some("staging"), "positional argument")
+            .expect("prefilled name must not prompt");
+        assert_eq!(got, "staging");
+    }
+
+    /// The provider prefill is honoured only when it is a provider
+    /// the wizard can actually drive. An unknown one has to fail
+    /// here, at the flag, rather than later inside a validator that
+    /// has no client wired for it.
+    #[test]
+    fn prompt_provider_accepts_a_supported_prefill_and_rejects_an_unknown_one() {
+        let got = prompt_provider(Some("hetzner-cloud"), "--provider flag")
+            .expect("supported provider must be accepted");
+        assert_eq!(got, "hetzner-cloud");
+
+        let err = prompt_provider(Some("aws"), "--provider flag")
+            .expect_err("unsupported provider must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("aws"), "{msg}");
+        // The error has to name what IS supported, otherwise the
+        // operator is left guessing.
+        assert!(msg.contains("hetzner-cloud"), "{msg}");
+    }
+
+    /// Under `--no-ping` a well-formed prefilled token is accepted
+    /// without a round-trip, and `token_already_verified` stays
+    /// false so the save-time check in `run_add` still runs. All
+    /// three `TokenSource` values take the same accept path — the
+    /// source only changes the acknowledgement line.
+    #[test]
+    fn prompt_token_accepts_a_well_formed_prefill_under_no_ping_without_claiming_verification() {
+        for source in [TokenSource::Env, TokenSource::Flag, TokenSource::Prompt] {
+            let (token, verified) =
+                prompt_token("hetzner-cloud", Some(&well_formed_token()), source, true)
+                    .expect("well-formed prefill must be accepted under --no-ping");
+            assert_eq!(token, well_formed_token(), "source={source:?}");
+            assert!(
+                !verified,
+                "--no-ping ran no API call, so nothing was verified (source={source:?})"
+            );
+        }
+    }
+
+    /// A malformed prefilled token is rejected up front, attached
+    /// to the flag that carried it, instead of surviving into the
+    /// target store or surfacing as a confusing mid-wizard prompt.
+    #[test]
+    fn prompt_token_rejects_a_malformed_prefill_before_any_api_call() {
+        let err = prompt_token("hetzner-cloud", Some("too-short"), TokenSource::Flag, true)
+            .expect_err("a 9-char token is not a Hetzner token");
+        let msg = err.to_string();
+        assert!(msg.contains("64"), "{msg}");
+    }
+
+    /// A supplied SSH key is taken as-is: no `~/.ssh` scan, no
+    /// picker, and crucially no existence probe — `run_add`
+    /// verifies readability later with a better error.
+    #[test]
+    fn prompt_ssh_key_accepts_a_supplied_path_without_scanning() {
+        let p = PathBuf::from("/nowhere/on/this/disk/id_ed25519.pub");
+        let got = prompt_ssh_key(Some(&p), "--ssh-key flag").expect("prefill must not prompt");
+        assert_eq!(got, Some(p));
+    }
+
+    /// The scanned keys come first in scan order and the two escape
+    /// hatches are pinned below them, `Other` before `Skip`. Order
+    /// matters: `Skip` sitting anywhere but last puts "attach no
+    /// key" under the cursor's natural resting place.
+    #[test]
+    fn build_ssh_key_choices_pins_other_then_skip_below_the_scanned_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pub");
+        let b = dir.path().join("b.pub");
+        std::fs::write(&a, "ssh-ed25519 AAAA me@a\n").unwrap();
+        std::fs::write(&b, "ssh-rsa BBBB me@b\n").unwrap();
+
+        let opts = build_ssh_key_choices(vec![a.clone(), b.clone()]);
+        assert_eq!(opts.len(), 4);
+        match &opts[0] {
+            SshKeyChoice::Path { path, .. } => assert_eq!(path, &a),
+            other => panic!("first row must be the first scanned key, got {other}"),
+        }
+        match &opts[1] {
+            SshKeyChoice::Path { path, .. } => assert_eq!(path, &b),
+            other => panic!("second row must be the second scanned key, got {other}"),
+        }
+        assert_eq!(opts[2].to_string(), "Other (type a path)");
+        assert_eq!(opts[3].to_string(), "Skip (don't attach an SSH key now)");
+
+        // With nothing scanned the escape hatches are still the
+        // whole list — an empty Select would trap the operator.
+        let empty = build_ssh_key_choices(Vec::new());
+        assert_eq!(empty.len(), 2);
+        assert_eq!(empty[0].to_string(), "Other (type a path)");
+        assert_eq!(empty[1].to_string(), "Skip (don't attach an SSH key now)");
+    }
+
+    /// The free-text SSH-key path accepts "nothing" (the documented
+    /// way to skip) but refuses a path that isn't there — catching
+    /// the typo at the prompt rather than at provisioning time.
+    #[test]
+    fn validate_ssh_key_path_input_accepts_blank_or_existing_and_rejects_missing() {
+        assert!(validate_ssh_key_path_input("").is_ok());
+        assert!(validate_ssh_key_path_input("   ").is_ok());
+
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("id_ed25519.pub");
+        std::fs::write(&key, "ssh-ed25519 AAAA me@host\n").unwrap();
+        assert!(validate_ssh_key_path_input(key.to_str().unwrap()).is_ok());
+
+        let missing = dir.path().join("absent.pub");
+        let err = validate_ssh_key_path_input(missing.to_str().unwrap())
+            .expect_err("a non-existent path must be rejected");
+        assert!(err.contains("does not exist"), "{err}");
+    }
+
+    /// Blank means "no key", not an empty path; a `~/` answer is
+    /// expanded before it reaches the target store, because nothing
+    /// downstream re-expands it.
+    #[test]
+    fn ssh_key_answer_to_path_maps_blank_to_none_and_expands_tilde() {
+        assert_eq!(ssh_key_answer_to_path(""), None);
+        assert_eq!(ssh_key_answer_to_path("   "), None);
+
+        let home = dirs::home_dir().expect("home_dir resolves in test env");
+        assert_eq!(
+            ssh_key_answer_to_path("  ~/.ssh/id_ed25519.pub  "),
+            Some(home.join(".ssh/id_ed25519.pub"))
+        );
+        assert_eq!(
+            ssh_key_answer_to_path("/etc/ssh/host_key.pub"),
+            Some(PathBuf::from("/etc/ssh/host_key.pub"))
+        );
+    }
+
+    /// Same "blank means unset" rule for the `--no-ping` region
+    /// prompt: an empty answer must not be stored as the region
+    /// `""`, which would later be interpolated into API URLs.
+    #[test]
+    fn region_text_answer_maps_blank_to_none_and_trims_the_rest() {
+        assert_eq!(region_text_answer(""), None);
+        assert_eq!(region_text_answer("  \t "), None);
+        assert_eq!(region_text_answer("  hel1 "), Some("hel1".to_string()));
+    }
+
+    /// `--region` wins over the latency picker. This one is called
+    /// with `no_ping = false` on purpose: the prefill branch has to
+    /// return *before* the region list is fetched, so a supplied
+    /// region works offline too.
+    #[test]
+    fn prompt_region_returns_a_supplied_region_without_fetching_the_region_list() {
+        let got = prompt_region(
+            "hetzner-cloud",
+            "unused-token",
+            Some("hel1"),
+            "--region flag",
+            false,
+        )
+        .expect("prefilled region must short-circuit before the API call");
+        assert_eq!(got, Some("hel1".to_string()));
+    }
+
+    /// Under `--no-ping` the machine matrix is skipped entirely: the
+    /// region still comes back (from the flag, via the text-entry
+    /// fallback) but no SKU is invented, because no catalog was
+    /// fetched to validate one against.
+    #[test]
+    fn prompt_machine_under_no_ping_keeps_the_region_and_leaves_the_sku_unset() {
+        let (region, sku) = prompt_machine(
+            "hetzner-cloud",
+            "unused-token",
+            Some("hel1"),
+            Some("cx22"),
+            true,
+        )
+        .expect("--no-ping must not touch the API");
+        assert_eq!(region, Some("hel1".to_string()));
+        assert_eq!(sku, None, "no catalog was fetched, so no SKU was chosen");
+    }
+
+    /// Both axes supplied → return them and skip the catalog fetch.
+    /// Without this short-circuit the wizard would spend a round-trip
+    /// (and fail offline) building a picker it is about to discard.
+    #[test]
+    fn prompt_machine_returns_both_prefills_without_fetching_the_catalog() {
+        let (region, sku) = prompt_machine(
+            "hetzner-cloud",
+            "unused-token",
+            Some("hel1"),
+            Some("cx22"),
+            false,
+        )
+        .expect("both axes prefilled must short-circuit before the API call");
+        assert_eq!(region, Some("hel1".to_string()));
+        assert_eq!(sku, Some("cx22".to_string()));
+    }
+
+    /// There is no machine catalog for a provider we haven't wired,
+    /// and the error has to hand the operator the escape hatch
+    /// (`--no-ping` → text entry) rather than just saying "no".
+    #[test]
+    fn prompt_machine_refuses_an_unwired_provider_and_points_at_the_escape_hatch() {
+        let err = prompt_machine("aws", "unused-token", None, None, false)
+            .expect_err("no catalog exists for aws");
+        let msg = err.to_string();
+        assert!(msg.contains("aws"), "{msg}");
+        assert!(msg.contains("--no-ping"), "{msg}");
+    }
+
+    /// The tier picker offers all four hardware tiers in price
+    /// order, cheapest first — `<Up>` from the resting cursor is
+    /// meant to land on the next tier up, and `solo` is the
+    /// spec-blessed default.
+    #[test]
+    fn build_tier_choices_offers_all_four_tiers_cheapest_first() {
+        let keys: Vec<String> = build_tier_choices().into_iter().map(|c| c.key).collect();
+        assert_eq!(keys, vec!["solo", "team", "prod", "regulated"]);
+    }
+
+    /// `--tier` skips the picker.
+    #[test]
+    fn prompt_tier_accepts_a_supplied_tier_verbatim() {
+        let got = prompt_tier(Some("regulated"), "--tier flag").expect("prefill must not prompt");
+        assert_eq!(got, Some("regulated".to_string()));
+    }
+
+    // ---------------------------------------------------------------
+    // Error classification + remaining pure helpers.
+    // ---------------------------------------------------------------
+
+    /// A 401 is the operator's problem (rotate the token); anything
+    /// else is the API's (retry / `doctor`). The two land on
+    /// different typed variants because they carry different help
+    /// text — collapsing them would send someone rotating a
+    /// perfectly good token during a Hetzner outage.
+    #[test]
+    fn classify_ping_error_splits_401_from_every_other_failure() {
+        let unauthorized = CliError::Hetzner {
+            endpoint: "GET /v1/locations".into(),
+            status: 401,
+            code: "unauthorized".into(),
+            message: "unable to authenticate".into(),
+        };
+        match classify_ping_error("hetzner-cloud", unauthorized) {
+            CliError::ProviderTokenRejected { provider, .. } => {
+                assert_eq!(provider, "hetzner-cloud")
+            }
+            other => panic!("401 must classify as ProviderTokenRejected, got {other:?}"),
+        }
+
+        let outage = CliError::Hetzner {
+            endpoint: "GET /v1/locations".into(),
+            status: 503,
+            code: "unavailable".into(),
+            message: "try later".into(),
+        };
+        match classify_ping_error("hetzner-cloud", outage) {
+            CliError::ProviderApiUnreachable { provider, .. } => {
+                assert_eq!(provider, "hetzner-cloud")
+            }
+            other => panic!("503 must classify as ProviderApiUnreachable, got {other:?}"),
+        }
+
+        // A non-HTTP failure (DNS, TLS, ...) is also "unreachable",
+        // never "token rejected".
+        match classify_ping_error("hetzner-cloud", CliError::Other("dns failure".into())) {
+            CliError::ProviderApiUnreachable { .. } => {}
+            other => panic!("a transport error must classify as unreachable, got {other:?}"),
+        }
+    }
+
+    /// The non-Hetzner arms of the inline summary: a transport
+    /// error reads as "could not reach", anything else falls back
+    /// to a generic one-liner. Both must stay single-line — a
+    /// multi-line message fights the `inquire` prompt redraw.
+    #[test]
+    fn inline_ping_error_summarises_transport_and_unknown_failures_on_one_line() {
+        let transport = inline_ping_error(&CliError::Other("connection reset".into()));
+        assert!(
+            transport.starts_with("could not reach the provider:"),
+            "{transport}"
+        );
+        assert!(!transport.contains('\n'), "{transport}");
+
+        let unknown = inline_ping_error(&CliError::TargetNotFound {
+            name: "ghost".into(),
+            available: "dev".into(),
+        });
+        assert!(unknown.starts_with("ping failed:"), "{unknown}");
+        assert!(!unknown.contains('\n'), "{unknown}");
+    }
+
+    /// Ping / region lookup for a provider with no client wired must
+    /// fail loudly rather than silently succeeding with nothing —
+    /// a silent `Ok` would save an unvalidated token and an empty
+    /// region list.
+    #[test]
+    fn ping_and_region_lookup_refuse_an_unwired_provider() {
+        let ping = ping_for_provider("aws", "unused-token").expect_err("no client wired for aws");
+        assert!(ping.to_string().contains("aws"), "{ping}");
+
+        let regions = fetch_regions("aws", "unused-token").expect_err("no client wired for aws");
+        assert!(regions.to_string().contains("aws"), "{regions}");
+    }
+
+    /// Esc / Ctrl-C is a user decision, not a crash: it maps to a
+    /// plain "aborted" line. Everything else keeps the underlying
+    /// inquire error so genuine failures stay diagnosable.
+    #[test]
+    fn map_inquire_err_reports_user_abort_separately_from_real_prompt_failures() {
+        assert_eq!(
+            map_inquire_err(InquireError::OperationCanceled).to_string(),
+            "wizard aborted by user"
+        );
+        assert_eq!(
+            map_inquire_err(InquireError::OperationInterrupted).to_string(),
+            "wizard aborted by user"
+        );
+        let other = map_inquire_err(InquireError::NotTTY).to_string();
+        assert!(other.starts_with("wizard prompt failed:"), "{other}");
+    }
+
+    /// The offered default is the modern OpenSSH key name. It is
+    /// the value most operators will accept with a single Return,
+    /// so pointing it at a stale name (`id_rsa.pub`) would push
+    /// people onto a weaker key or an empty prompt.
+    #[test]
+    fn default_ssh_key_hint_offers_the_modern_openssh_key_name() {
+        let hint = default_ssh_key_hint();
+        assert!(hint.ends_with(".ssh/id_ed25519.pub"), "{hint}");
+    }
+
+    /// A key file with no trailing comment renders with the algo
+    /// alone — no dangling ", " separator. A file that isn't in
+    /// OpenSSH layout at all degrades to the bare path instead of
+    /// showing half-parsed junk in the picker.
+    #[test]
+    fn ssh_key_label_omits_the_comment_clause_when_the_key_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let bare = dir.path().join("nocomment.pub");
+        std::fs::write(&bare, "ssh-ed25519 AAAAfakebody\n").unwrap();
+        let label = ssh_key_label(&bare);
+        assert!(label.ends_with("(ssh-ed25519)"), "{label}");
+
+        let junk = dir.path().join("junk.pub");
+        std::fs::write(&junk, "not-a-key\n").unwrap();
+        let junk_label = ssh_key_label(&junk);
+        assert_eq!(junk_label, abbreviate_home_path(&junk));
+    }
+
+    /// Regions whose probe never reported still appear in the
+    /// picker, at the end, with `n/a` latency. Dropping them would
+    /// shrink the picker — in the worst case (every probe hung) to
+    /// nothing at all, leaving the operator no region to choose.
+    #[test]
+    fn finalize_latency_rows_keeps_unreported_regions_and_sorts_them_last() {
+        let region = |n: &str| RegionInfo {
+            name: n.into(),
+            description: n.to_uppercase(),
+        };
+        let originals = vec![region("fsn1"), region("hel1"), region("nbg1")];
+        // Only two of the three probes came back, and the slower
+        // one reported first.
+        let reported = vec![
+            RegionWithLatency {
+                info: region("nbg1"),
+                latency_ms: Some(42),
+            },
+            RegionWithLatency {
+                info: region("hel1"),
+                latency_ms: Some(7),
+            },
+        ];
+
+        let rows = finalize_latency_rows(originals, reported);
+        let order: Vec<(String, Option<u32>)> = rows
+            .into_iter()
+            .map(|r| (r.info.name, r.latency_ms))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("hel1".to_string(), Some(7)),
+                ("nbg1".to_string(), Some(42)),
+                ("fsn1".to_string(), None),
+            ]
+        );
     }
 }

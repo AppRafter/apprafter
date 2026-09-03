@@ -115,9 +115,7 @@ impl LeaderElection {
                 Err(err) => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     warn!(?err, consecutive_failures, "leader election step failed");
-                    if consecutive_failures >= RENEWAL_FAILURE_BUDGET
-                        && self.is_leader.load(Ordering::SeqCst)
-                    {
+                    if must_step_down(consecutive_failures, self.is_leader.load(Ordering::SeqCst)) {
                         self.is_leader.store(false, Ordering::SeqCst);
                         return Err(LeaderError::LostLeadership(consecutive_failures));
                     }
@@ -146,9 +144,9 @@ impl LeaderElection {
                     self.config.lease_duration,
                     now,
                 );
-                if holder == Some(self.config.holder_id.as_str()) || stale {
+                if may_take_lease(holder, stale, &self.config.holder_id) {
                     let mut updated = existing.clone();
-                    updated.spec = Some(self.lease_spec(now, existing.spec.as_ref()));
+                    updated.spec = Some(lease_spec(&self.config, now, existing.spec.as_ref()));
                     api.replace(&self.config.name, &PostParams::default(), &updated)
                         .await?;
                     Ok(true)
@@ -163,26 +161,58 @@ impl LeaderElection {
                         namespace: Some(self.config.namespace.clone()),
                         ..Default::default()
                     },
-                    spec: Some(self.lease_spec(now, None)),
+                    spec: Some(lease_spec(&self.config, now, None)),
                 };
                 api.create(&PostParams::default(), &lease).await?;
                 Ok(true)
             }
         }
     }
+}
 
-    fn lease_spec(&self, now: DateTime<Utc>, prior: Option<&LeaseSpec>) -> LeaseSpec {
-        let acquire_time = prior
-            .and_then(|p| p.acquire_time.clone())
-            .unwrap_or(MicroTime(now));
-        LeaseSpec {
-            holder_identity: Some(self.config.holder_id.clone()),
-            lease_duration_seconds: Some(self.config.lease_duration.as_secs() as i32),
-            acquire_time: Some(acquire_time),
-            renew_time: Some(MicroTime(now)),
-            ..LeaseSpec::default()
-        }
+/// The Lease body this holder writes when it acquires or renews.
+///
+/// A free function over the config rather than a method so it is reachable
+/// without a `Client`: everything it decides is a pure function of the
+/// config, the clock, and whatever spec was already there.
+///
+/// `acquireTime` is carried over from `prior` — it records when the CURRENT
+/// tenure began, so a renewal that reset it would make a leader that has held
+/// the Lease for a week look like it took over a second ago, and would erase
+/// the one field a human uses to tell "stable" from "flapping".
+fn lease_spec(config: &LeaderConfig, now: DateTime<Utc>, prior: Option<&LeaseSpec>) -> LeaseSpec {
+    let acquire_time = prior
+        .and_then(|p| p.acquire_time.clone())
+        .unwrap_or(MicroTime(now));
+    LeaseSpec {
+        holder_identity: Some(config.holder_id.clone()),
+        lease_duration_seconds: Some(config.lease_duration.as_secs() as i32),
+        acquire_time: Some(acquire_time),
+        renew_time: Some(MicroTime(now)),
+        ..LeaseSpec::default()
     }
+}
+
+/// Whether this holder may write itself into an EXISTING Lease.
+///
+/// Two ways in, and only two: the Lease is already ours (a renewal), or its
+/// holder has stopped renewing long enough to be considered gone (a
+/// takeover). A fresh Lease held by somebody else is the whole point of the
+/// mechanism — taking it would put two operators in the same reconcile loop,
+/// both server-side-applying the same objects.
+fn may_take_lease(holder: Option<&str>, stale: bool, me: &str) -> bool {
+    holder == Some(me) || stale
+}
+
+/// Whether repeated apiserver failures must end the process.
+///
+/// Only a HOLDER steps down. Once we cannot renew, our Lease is expiring on a
+/// clock we no longer control, so the safe move is to exit and let the
+/// Deployment restart us. A replica that never became leader is in no such
+/// race: exiting there would turn an apiserver blip into a crash-looping
+/// standby, which is noise on top of an outage.
+fn must_step_down(consecutive_failures: u32, is_leader: bool) -> bool {
+    consecutive_failures >= RENEWAL_FAILURE_BUDGET && is_leader
 }
 
 /// Pure staleness check — extracted for testability. A Lease is
@@ -237,5 +267,123 @@ mod tests {
         let renew = MicroTime(earlier);
         // 31s elapsed > 30s lease duration — stale.
         assert!(is_lease_stale(Some(&renew), Duration::from_secs(30), now));
+    }
+
+    #[test]
+    fn a_lease_renewed_exactly_one_duration_ago_is_not_yet_stale() {
+        // The boundary, and it belongs on the incumbent's side: the renew
+        // period is a third of the duration, so at exactly one duration the
+        // holder has already missed two renewals and a third is in flight.
+        // Declaring it stale one tick early is how two operators end up
+        // applying the same objects at the same time.
+        let now = Utc::now();
+        let renew = MicroTime(now - chrono::Duration::seconds(30));
+        assert!(!is_lease_stale(Some(&renew), Duration::from_secs(30), now));
+    }
+
+    // -----------------------------------------------------------------
+    // may_take_lease — who is allowed to write into an existing Lease
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_fresh_lease_held_by_someone_else_is_left_alone() {
+        // The one case the whole mechanism exists for. Taking it would put
+        // two operators in the same reconcile loop, both server-side-applying
+        // the same objects with the same field manager.
+        assert!(!may_take_lease(Some("operator-b"), false, "operator-a"));
+        // …and an existing Lease with no holder recorded is not an invitation
+        // either, until it goes stale.
+        assert!(!may_take_lease(None, false, "operator-a"));
+    }
+
+    #[test]
+    fn our_own_lease_is_renewable_and_a_stale_one_is_takeable() {
+        assert!(may_take_lease(Some("operator-a"), false, "operator-a"));
+        assert!(may_take_lease(Some("operator-b"), true, "operator-a"));
+    }
+
+    // -----------------------------------------------------------------
+    // must_step_down — when losing the apiserver must end the process
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_leader_steps_down_only_after_the_whole_failure_budget() {
+        // Three attempts, because the renew period is a third of the lease
+        // duration: exiting earlier would restart the operator over a single
+        // blip that the next renewal would have covered.
+        assert!(!must_step_down(RENEWAL_FAILURE_BUDGET - 1, true));
+        assert!(must_step_down(RENEWAL_FAILURE_BUDGET, true));
+    }
+
+    #[test]
+    fn a_replica_that_never_led_does_not_exit_on_apiserver_failures() {
+        // A standby is in no race with an expiring Lease it does not hold.
+        // Exiting here turns an apiserver outage into a crash-looping pod —
+        // noise stacked on top of the real failure.
+        assert!(!must_step_down(RENEWAL_FAILURE_BUDGET, false));
+        assert!(!must_step_down(RENEWAL_FAILURE_BUDGET * 10, false));
+    }
+
+    // -----------------------------------------------------------------
+    // lease_spec — what a renewal writes
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_renewal_moves_renew_time_but_keeps_the_tenures_acquire_time() {
+        // `acquireTime` records when THIS tenure began. Resetting it on every
+        // renewal would make a leader that has held the Lease for a week look
+        // like it took over a second ago, erasing the only field that tells a
+        // human "stable" from "flapping".
+        let cfg = LeaderConfig::for_apprafter_operator("operator-a");
+        let acquired = Utc::now() - chrono::Duration::seconds(600);
+        let prior = LeaseSpec {
+            holder_identity: Some("operator-a".to_string()),
+            acquire_time: Some(MicroTime(acquired)),
+            renew_time: Some(MicroTime(acquired)),
+            ..LeaseSpec::default()
+        };
+        let now = Utc::now();
+        let spec = lease_spec(&cfg, now, Some(&prior));
+        assert_eq!(spec.acquire_time, Some(MicroTime(acquired)));
+        assert_eq!(spec.renew_time, Some(MicroTime(now)));
+    }
+
+    #[test]
+    fn a_takeover_from_a_holder_with_no_acquire_time_stamps_one_now() {
+        // Taking over a Lease whose acquireTime is absent must produce one,
+        // not propagate the absence: the field is what the next holder reads
+        // to decide the tenure it is displacing.
+        let cfg = LeaderConfig::for_apprafter_operator("operator-a");
+        let now = Utc::now();
+        let spec = lease_spec(&cfg, now, Some(&LeaseSpec::default()));
+        assert_eq!(spec.acquire_time, Some(MicroTime(now)));
+    }
+
+    #[test]
+    fn the_written_lease_carries_this_holders_identity_and_duration() {
+        // The identity is what `may_take_lease` compares on the next pass, and
+        // the duration is what every OTHER replica measures staleness against
+        // — a Lease written with someone else's identity, or with a duration
+        // that disagrees with the one this process renews on, hands the Lease
+        // away while we still think we hold it.
+        let cfg = LeaderConfig::for_apprafter_operator("operator-a");
+        let spec = lease_spec(&cfg, Utc::now(), None);
+        assert_eq!(spec.holder_identity.as_deref(), Some("operator-a"));
+        assert_eq!(
+            spec.lease_duration_seconds,
+            Some(cfg.lease_duration.as_secs() as i32)
+        );
+    }
+
+    #[test]
+    fn stepping_down_reports_how_many_renewals_were_lost() {
+        // This message is the only record of why the process exited; the
+        // count is what tells a reader "the apiserver went away" apart from
+        // "another replica took over".
+        let err = LeaderError::LostLeadership(3);
+        assert_eq!(
+            err.to_string(),
+            "lost leadership after 3 consecutive renewal failures"
+        );
     }
 }

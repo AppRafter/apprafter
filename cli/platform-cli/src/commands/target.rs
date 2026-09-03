@@ -192,11 +192,9 @@ fn run_add(mut args: AddArgs) -> Result<()> {
     // `--no-ping` is set (same rationale as the token ping above).
     if let Some(ref sku) = args.server_type {
         if args.no_ping {
-            println!(
-                "server type `{sku}` NOT validated against the Hetzner API (`--no-ping` was passed)"
-            );
+            println!("{}", sku_not_validated_line(sku));
         } else {
-            let resolved_region = args.region.as_deref().unwrap_or("nbg1");
+            let resolved_region = region_for_sku_check(args.region.as_deref());
             let client = HetznerCloudClient::new(hcloud_base_url(), &token);
             let types = client.list_server_types()?.server_types;
             validate_server_type(&types, sku, resolved_region)?;
@@ -222,11 +220,7 @@ fn run_add(mut args: AddArgs) -> Result<()> {
 
     let became_active = ensure_active_target(&paths, &name)?;
 
-    let verified_suffix = if args.no_ping {
-        " (token NOT verified against the API — `--no-ping` was passed)"
-    } else {
-        " (token verified against Hetzner Cloud)"
-    };
+    let verified_suffix = add_verified_suffix(args.no_ping);
     if became_active {
         println!(
             "target `{name}` saved and set as active (first target on fresh store){verified_suffix}"
@@ -237,6 +231,42 @@ fn run_add(mut args: AddArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Same idea as [`add_verified_suffix`], for the `--renew` path — a rotation
+/// that never touched the API has not proved the NEW token works.
+pub(crate) fn renew_verified_suffix(no_ping: bool) -> &'static str {
+    if no_ping {
+        " (token NOT verified — `--no-ping` was passed)"
+    } else {
+        " (token verified against Hetzner Cloud)"
+    }
+}
+
+/// Notice printed when `--no-ping` skipped the SKU check. It has to be loud:
+/// the value lands in the target store either way, and only the next `apply`
+/// will find out it does not exist.
+pub(crate) fn sku_not_validated_line(sku: &str) -> String {
+    format!("server type `{sku}` NOT validated against the Hetzner API (`--no-ping` was passed)")
+}
+
+/// Region a `--server-type` is checked against at `target add` time. Server
+/// types are per-location on Hetzner, so an unset `--region` still needs the
+/// same default the rest of the CLI provisions into.
+pub(crate) fn region_for_sku_check(region: Option<&str>) -> &str {
+    region.unwrap_or(crate::commands::target_machine::DEFAULT_REGION)
+}
+
+/// Suffix on the `target add` confirmation stating whether the token was
+/// actually authenticated. `--no-ping` saves an UNVERIFIED credential, and the
+/// operator has to be told rather than left assuming a green run means a
+/// working token.
+pub(crate) fn add_verified_suffix(no_ping: bool) -> &'static str {
+    if no_ping {
+        " (token NOT verified against the API — `--no-ping` was passed)"
+    } else {
+        " (token verified against Hetzner Cloud)"
+    }
 }
 
 /// Fill `args` from wizard prompts for whatever fields aren't
@@ -255,13 +285,7 @@ fn run_wizard_into_args(args: &mut AddArgs) -> Result<()> {
                     Err(msg) => Ok(inquire::validator::Validation::Invalid(msg.into())),
                 })
                 .prompt()
-                .map_err(|err| match err {
-                    inquire::InquireError::OperationCanceled
-                    | inquire::InquireError::OperationInterrupted => {
-                        CliError::Other("wizard aborted by user".to_string())
-                    }
-                    other => CliError::Other(format!("wizard prompt failed: {other}")),
-                })?;
+                .map_err(map_wizard_prompt_error)?;
             args.name = Some(n);
         }
         let paths = TargetStorePaths::for_root(default_config_root()?);
@@ -271,32 +295,59 @@ fn run_wizard_into_args(args: &mut AddArgs) -> Result<()> {
         args.token = Some(token);
     } else {
         let out = target_wizard::run_add_wizard(args)?;
-        args.name = Some(out.name);
-        args.provider = Some(out.provider);
-        args.token = Some(out.token);
-        if args.ssh_key.is_none() {
-            args.ssh_key = out.ssh_key;
-        }
-        if args.region.is_none() {
-            args.region = out.region;
-        }
-        if args.tier.is_none() {
-            args.tier = out.tier;
-        }
-        // Merge the wizard's machine-matrix choice for server_type.
-        // The flag (`--server-type`) takes precedence; the matrix
-        // result fills the field only when the flag was absent.
-        if args.server_type.is_none() {
-            args.server_type = out.server_type;
-        }
-        // `out.token_already_verified` is collected but currently
-        // unused — the save-time ping below re-verifies (~200ms)
-        // to keep the on-save check authoritative. A future
-        // optimisation can short-circuit when the wizard's ping
-        // already succeeded within the same invocation.
-        let _ = out.token_already_verified;
+        merge_wizard_output(args, out);
     }
     Ok(())
+}
+
+/// Fold the wizard's answers into `args`.
+///
+/// Name / provider / token always come from the wizard (it prefills them from
+/// the flags and re-emits whatever the operator confirmed). Every OPTIONAL
+/// field is flag-wins: an explicitly-passed `--region` / `--tier` /
+/// `--ssh-key` / `--server-type` must survive a wizard run that defaulted it,
+/// or the flag silently does nothing.
+pub(crate) fn merge_wizard_output(
+    args: &mut AddArgs,
+    out: crate::commands::target_wizard::WizardOutput,
+) {
+    args.name = Some(out.name);
+    args.provider = Some(out.provider);
+    args.token = Some(out.token);
+    if args.ssh_key.is_none() {
+        args.ssh_key = out.ssh_key;
+    }
+    if args.region.is_none() {
+        args.region = out.region;
+    }
+    if args.tier.is_none() {
+        args.tier = out.tier;
+    }
+    // Merge the wizard's machine-matrix choice for server_type.
+    // The flag (`--server-type`) takes precedence; the matrix
+    // result fills the field only when the flag was absent.
+    if args.server_type.is_none() {
+        args.server_type = out.server_type;
+    }
+    // `out.token_already_verified` is collected but currently
+    // unused — the save-time ping below re-verifies (~200ms)
+    // to keep the on-save check authoritative. A future
+    // optimisation can short-circuit when the wizard's ping
+    // already succeeded within the same invocation.
+    let _ = out.token_already_verified;
+}
+
+/// Translate an `inquire` prompt failure raised inside the wizard.
+///
+/// A Ctrl-C / Esc is a deliberate abort and must read like one; anything else
+/// keeps its underlying detail so a broken terminal is diagnosable.
+pub(crate) fn map_wizard_prompt_error(err: inquire::InquireError) -> CliError {
+    match err {
+        inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted => {
+            CliError::Other("wizard aborted by user".to_string())
+        }
+        other => CliError::Other(format!("wizard prompt failed: {other}")),
+    }
 }
 
 fn run_renew(paths: &TargetStorePaths, args: AddArgs, name: &str) -> Result<()> {
@@ -313,15 +364,12 @@ fn run_renew(paths: &TargetStorePaths, args: AddArgs, name: &str) -> Result<()> 
     // `--renew` deliberately ignores the config flags (provider,
     // region, tier, etc.). Refusing them up front beats silently
     // dropping a user-provided value.
-    if args.provider.is_some()
-        || args.region.is_some()
-        || args.tier.is_some()
-        || args.cluster_name.is_some()
-    {
-        return Err(CliError::Other(
-            "`--renew` only updates credentials — `--provider`, `--region`, `--tier`, `--cluster-name` are not allowed alongside it. Drop `--renew` if you want to change config too.".to_string(),
-        ));
-    }
+    reject_config_flags_on_renew(
+        args.provider.as_deref(),
+        args.region.as_deref(),
+        args.tier.as_deref(),
+        args.cluster_name.as_deref(),
+    )?;
 
     // Token is required for renew (whole point of the flag);
     // ssh-key path is optional (user may renew only the token).
@@ -334,11 +382,7 @@ fn run_renew(paths: &TargetStorePaths, args: AddArgs, name: &str) -> Result<()> 
     // without anything actually changing in Hetzner. That's the
     // exact opposite of what `--renew` advertises. Match a token
     // by raw bytes so even a single-char drift counts as "new".
-    if existing.credentials.hetzner_token.as_deref() == Some(token.as_str()) {
-        return Err(CliError::Other(format!(
-            "`--renew` requires a NEW token, but the value provided is identical to the one already saved for target `{name}`. Generate a fresh token in the Hetzner Cloud Console → Security → API Tokens, then re-run `apprafter target add {name} --renew` with the new value."
-        )));
-    }
+    reject_identical_token(existing.credentials.hetzner_token.as_deref(), &token, name)?;
 
     if let Some(path) = args.ssh_key.as_ref() {
         verify_ssh_key_readable(path)?;
@@ -353,18 +397,48 @@ fn run_renew(paths: &TargetStorePaths, args: AddArgs, name: &str) -> Result<()> 
     };
     save_target(paths, &existing)?;
 
-    let verified_suffix = if args.no_ping {
-        " (token NOT verified — `--no-ping` was passed)"
-    } else {
-        " (token verified against Hetzner Cloud)"
-    };
-    println!("target `{name}` credentials rotated{verified_suffix}");
+    println!(
+        "target `{name}` credentials rotated{}",
+        renew_verified_suffix(args.no_ping)
+    );
     Ok(())
 }
 
 // ---------------------------------------------------------------
 // Pure validators
 // ---------------------------------------------------------------
+
+/// `--renew` rotates credentials and nothing else. Refusing the config flags
+/// up front beats silently dropping a value the operator clearly meant to
+/// change.
+pub(crate) fn reject_config_flags_on_renew(
+    provider: Option<&str>,
+    region: Option<&str>,
+    tier: Option<&str>,
+    cluster_name: Option<&str>,
+) -> Result<()> {
+    if provider.is_some() || region.is_some() || tier.is_some() || cluster_name.is_some() {
+        return Err(CliError::Other(
+            "`--renew` only updates credentials — `--provider`, `--region`, `--tier`, `--cluster-name` are not allowed alongside it. Drop `--renew` if you want to change config too.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reject an identical-token "rotation" loudly.
+///
+/// The wizard happily accepts whatever the operator types and the CLI happily
+/// accepts the env var — so someone who pastes the OLD token by muscle memory
+/// otherwise gets a green "credentials rotated" with nothing rotated. Compared
+/// by raw bytes: a single-character drift counts as new.
+pub(crate) fn reject_identical_token(existing: Option<&str>, new: &str, name: &str) -> Result<()> {
+    if existing == Some(new) {
+        return Err(CliError::Other(format!(
+            "`--renew` requires a NEW token, but the value provided is identical to the one already saved for target `{name}`. Generate a fresh token in the Hetzner Cloud Console → Security → API Tokens, then re-run `apprafter target add {name} --renew` with the new value."
+        )));
+    }
+    Ok(())
+}
 
 /// Pure target-name validator. Returns `Result<(), String>` so
 /// callers can pick the right error wrapping (CliError for direct
@@ -640,6 +714,152 @@ mod tests {
         assert!(verify_ssh_key_readable(&path).is_ok());
     }
 
+    // ── ping_provider / classify_ping_error ──────────────────────────────
+
+    /// A 401 means the token is wrong and the operator can fix it by rotating;
+    /// anything else means the API could not be reached and rotating would be
+    /// a waste of time. The two must not collapse into one diagnostic.
+    #[test]
+    fn a_401_classifies_as_a_rejected_token_and_everything_else_as_unreachable() {
+        let rejected = classify_ping_error(
+            "hetzner-cloud",
+            CliError::Hetzner {
+                endpoint: "GET /v1/locations".to_string(),
+                status: 401,
+                code: "unauthorized".to_string(),
+                message: "unauthorized".to_string(),
+            },
+        );
+        assert!(
+            matches!(rejected, CliError::ProviderTokenRejected { .. }),
+            "{rejected:?}"
+        );
+
+        let unreachable = classify_ping_error(
+            "hetzner-cloud",
+            CliError::Hetzner {
+                endpoint: "GET /v1/locations".to_string(),
+                status: 503,
+                code: "unavailable".to_string(),
+                message: "maintenance".to_string(),
+            },
+        );
+        assert!(
+            matches!(unreachable, CliError::ProviderApiUnreachable { .. }),
+            "{unreachable:?}"
+        );
+
+        let offline = classify_ping_error("hetzner-cloud", CliError::Other("dns".to_string()));
+        assert!(
+            matches!(offline, CliError::ProviderApiUnreachable { .. }),
+            "{offline:?}"
+        );
+    }
+
+    /// The classified error keeps the original as its `#[source]` cause, so
+    /// miette renders the raw API envelope under the high-level help. Losing
+    /// it would leave the operator with advice and no evidence.
+    #[test]
+    fn a_classified_ping_error_keeps_the_original_as_its_cause() {
+        let classified = classify_ping_error(
+            "hetzner-cloud",
+            CliError::Hetzner {
+                endpoint: "GET /v1/locations".to_string(),
+                status: 401,
+                code: "unauthorized".to_string(),
+                message: "token invalid".to_string(),
+            },
+        );
+        let cause = std::error::Error::source(&classified).expect("a cause chain");
+        assert!(format!("{cause}").contains("token invalid"), "{cause}");
+    }
+
+    /// A provider that slips past the whitelist must surface a typed error
+    /// with a way forward, not panic the operator's shell.
+    #[test]
+    fn an_unwired_provider_errors_instead_of_panicking() {
+        let err = ping_provider("aws", "irrelevant").expect_err("no validator for aws");
+        let msg = format!("{err}");
+        assert!(msg.contains("aws"), "{msg}");
+        assert!(msg.contains("--no-ping"), "{msg}");
+    }
+
+    // ── renew guards ─────────────────────────────────────────────────────
+
+    /// Each config flag on its own is enough to refuse: `--renew` silently
+    /// dropping a `--region` the operator passed is exactly the failure this
+    /// guard exists to prevent.
+    #[test]
+    fn every_config_flag_is_refused_alongside_renew() {
+        assert!(reject_config_flags_on_renew(None, None, None, None).is_ok());
+        for (p, r, t, c) in [
+            (Some("hetzner-cloud"), None, None, None),
+            (None, Some("hel1"), None, None),
+            (None, None, Some("1"), None),
+            (None, None, None, Some("platform-2")),
+        ] {
+            let err = reject_config_flags_on_renew(p, r, t, c)
+                .expect_err("a config flag alongside --renew must be refused");
+            assert!(
+                format!("{err}").contains("only updates credentials"),
+                "{err}"
+            );
+        }
+    }
+
+    /// Re-pasting the SAME token must fail loudly. A green "credentials
+    /// rotated" that rotated nothing is worse than an error — the operator
+    /// believes the old, possibly leaked, token is out of use.
+    #[test]
+    fn re_pasting_the_same_token_is_refused_but_one_char_counts_as_new() {
+        let old = "a".repeat(64);
+        let err = reject_identical_token(Some(&old), &old, "work")
+            .expect_err("an identical token is not a rotation");
+        let msg = format!("{err}");
+        assert!(msg.contains("requires a NEW token"), "{msg}");
+        assert!(msg.contains("work"), "{msg}");
+
+        let nearly = format!("{}b", &old[..63]);
+        assert!(reject_identical_token(Some(&old), &nearly, "work").is_ok());
+        assert!(reject_identical_token(None, &old, "work").is_ok());
+    }
+
+    // ── verification suffixes ────────────────────────────────────────────
+
+    /// A `--no-ping` save must say the token was NOT verified. Rendering it
+    /// like a checked one lets a typo'd credential sit in the store until the
+    /// first `apply` fails.
+    #[test]
+    fn the_unverified_suffixes_say_so_on_both_add_and_renew() {
+        assert!(add_verified_suffix(true).contains("NOT verified"));
+        assert!(!add_verified_suffix(false).contains("NOT"));
+        assert!(add_verified_suffix(false).contains("verified against Hetzner Cloud"));
+
+        assert!(renew_verified_suffix(true).contains("NOT verified"));
+        assert!(!renew_verified_suffix(false).contains("NOT"));
+    }
+
+    /// Same contract for the unvalidated SKU notice.
+    #[test]
+    fn the_unvalidated_sku_notice_names_the_sku_and_the_flag() {
+        let line = sku_not_validated_line("cx42");
+        assert!(line.contains("cx42"), "{line}");
+        assert!(line.contains("NOT validated"), "{line}");
+        assert!(line.contains("--no-ping"), "{line}");
+    }
+
+    /// Server types are per-location, so an unset `--region` must fall back to
+    /// the same default the CLI provisions into — checking against a different
+    /// one would pass here and fail at `apply`.
+    #[test]
+    fn the_sku_check_region_defaults_to_the_provisioning_default() {
+        assert_eq!(region_for_sku_check(Some("hel1")), "hel1");
+        assert_eq!(
+            region_for_sku_check(None),
+            crate::commands::target_machine::DEFAULT_REGION
+        );
+    }
+
     #[test]
     fn token_summary_renders_set_or_not_set_without_leaking_bytes() {
         assert_eq!(token_summary(None), "not set");
@@ -651,6 +871,341 @@ mod tests {
             !summary.contains("aaaaaaaaaaaaaaaa"),
             "summary must not echo the token: {summary}"
         );
+    }
+
+    // ── merge_wizard_output ──────────────────────────────────────────────
+
+    fn wizard_output() -> crate::commands::target_wizard::WizardOutput {
+        crate::commands::target_wizard::WizardOutput {
+            name: "from-wizard".to_string(),
+            provider: "hetzner-cloud".to_string(),
+            token: "wizard-token".to_string(),
+            ssh_key: Some(PathBuf::from("/wizard/id.pub")),
+            region: Some("wizard-region".to_string()),
+            tier: Some("2".to_string()),
+            server_type: Some("wizard-sku".to_string()),
+            token_already_verified: true,
+        }
+    }
+
+    fn empty_args() -> AddArgs {
+        AddArgs {
+            name: None,
+            provider: None,
+            token: None,
+            ssh_key: None,
+            region: None,
+            tier: None,
+            cluster_name: None,
+            force: false,
+            renew: false,
+            no_interactive: false,
+            no_ping: false,
+            server_type: None,
+        }
+    }
+
+    /// Every OPTIONAL field is flag-wins. A `--region` / `--tier` /
+    /// `--ssh-key` / `--server-type` the operator passed explicitly must
+    /// survive a wizard run that defaulted it — otherwise the flag silently
+    /// does nothing.
+    #[test]
+    fn explicit_flags_survive_the_wizard_merge() {
+        let mut args = AddArgs {
+            ssh_key: Some(PathBuf::from("/flag/id.pub")),
+            region: Some("flag-region".to_string()),
+            tier: Some("1".to_string()),
+            server_type: Some("flag-sku".to_string()),
+            ..empty_args()
+        };
+        merge_wizard_output(&mut args, wizard_output());
+        assert_eq!(args.ssh_key, Some(PathBuf::from("/flag/id.pub")));
+        assert_eq!(args.region.as_deref(), Some("flag-region"));
+        assert_eq!(args.tier.as_deref(), Some("1"));
+        assert_eq!(args.server_type.as_deref(), Some("flag-sku"));
+    }
+
+    /// Unset optional fields DO take the wizard's answers — otherwise every
+    /// prompt the operator just answered would be thrown away.
+    #[test]
+    fn unset_fields_take_the_wizards_answers() {
+        let mut args = empty_args();
+        merge_wizard_output(&mut args, wizard_output());
+        assert_eq!(args.ssh_key, Some(PathBuf::from("/wizard/id.pub")));
+        assert_eq!(args.region.as_deref(), Some("wizard-region"));
+        assert_eq!(args.tier.as_deref(), Some("2"));
+        assert_eq!(args.server_type.as_deref(), Some("wizard-sku"));
+    }
+
+    /// Name / provider / token always come from the wizard: it prefills them
+    /// from the flags and re-emits whatever the operator actually confirmed,
+    /// so keeping a stale flag value here would ignore a correction.
+    #[test]
+    fn the_wizard_owns_name_provider_and_token() {
+        let mut args = AddArgs {
+            name: Some("typo".to_string()),
+            provider: Some("stale".to_string()),
+            token: Some("stale-token".to_string()),
+            ..empty_args()
+        };
+        merge_wizard_output(&mut args, wizard_output());
+        assert_eq!(args.name.as_deref(), Some("from-wizard"));
+        assert_eq!(args.provider.as_deref(), Some("hetzner-cloud"));
+        assert_eq!(args.token.as_deref(), Some("wizard-token"));
+    }
+
+    // ── prompt error mapping ─────────────────────────────────────────────
+
+    /// Ctrl-C / Esc is a deliberate abort in both prompts and must read as
+    /// one; a genuine terminal fault keeps its detail. The two prompts word
+    /// their abort differently on purpose (wizard vs removal), so both are
+    /// pinned.
+    #[test]
+    fn cancelling_a_prompt_reads_as_an_abort_in_both_flows() {
+        for cancel in [
+            inquire::InquireError::OperationCanceled,
+            inquire::InquireError::OperationInterrupted,
+        ] {
+            assert_eq!(
+                format!("{}", map_wizard_prompt_error(cancel)),
+                "wizard aborted by user"
+            );
+        }
+        for cancel in [
+            inquire::InquireError::OperationCanceled,
+            inquire::InquireError::OperationInterrupted,
+        ] {
+            assert_eq!(
+                format!("{}", map_remove_prompt_error(cancel)),
+                "remove aborted by user"
+            );
+        }
+    }
+
+    #[test]
+    fn a_genuine_prompt_fault_keeps_its_cause_in_both_flows() {
+        let wizard = format!(
+            "{}",
+            map_wizard_prompt_error(inquire::InquireError::InvalidConfiguration(
+                "no tty".to_string()
+            ))
+        );
+        assert!(wizard.contains("wizard prompt failed"), "{wizard}");
+        assert!(wizard.contains("no tty"), "{wizard}");
+
+        let remove = format!(
+            "{}",
+            map_remove_prompt_error(inquire::InquireError::InvalidConfiguration(
+                "no tty".to_string()
+            ))
+        );
+        assert!(remove.contains("confirmation prompt failed"), "{remove}");
+        assert!(remove.contains("no tty"), "{remove}");
+    }
+
+    // ── destructive-command copy ─────────────────────────────────────────
+
+    /// The removal prompt must enumerate WHAT is destroyed — an operator who
+    /// reads "remove target" alone does not expect the cached kubeconfig and
+    /// credentials to go with it.
+    #[test]
+    fn the_removal_prompt_spells_out_what_is_destroyed() {
+        let p = remove_prompt("prod-eu");
+        assert!(p.contains("prod-eu"), "{p}");
+        assert!(p.contains("credentials"), "{p}");
+        assert!(p.contains("state"), "{p}");
+    }
+
+    #[test]
+    fn declining_a_removal_says_the_target_survived() {
+        let line = remove_aborted_line("prod-eu");
+        assert!(line.contains("prod-eu"), "{line}");
+        assert!(line.contains("left intact"), "{line}");
+    }
+
+    // ── show / rename decisions ──────────────────────────────────────────
+
+    /// `target show` falls back to the active target, and an explicit name
+    /// always wins over it — otherwise `target show other` would silently
+    /// print the active target's credentials summary instead.
+    #[test]
+    fn show_prefers_an_explicit_name_over_the_active_target() {
+        assert_eq!(resolve_show_target(Some("other"), "work").unwrap(), "other");
+        assert_eq!(resolve_show_target(None, "work").unwrap(), "work");
+        // An explicit name works even on a store with no active pointer.
+        assert_eq!(resolve_show_target(Some("other"), "").unwrap(), "other");
+    }
+
+    /// On a fresh store there is nothing to show, and the error has to name
+    /// BOTH ways out — an operator cannot guess "add one first" from a bare
+    /// "not found".
+    #[test]
+    fn show_without_a_name_or_an_active_target_points_at_both_ways_out() {
+        let err = resolve_show_target(None, "").expect_err("nothing to show");
+        let msg = format!("{err}");
+        assert!(msg.contains("apprafter target list"), "{msg}");
+        assert!(msg.contains("apprafter target add"), "{msg}");
+    }
+
+    /// A self-rename is refused rather than performed as a no-op that reports
+    /// success, and the DESTINATION name is shape-checked before the store is
+    /// touched (a rename to `../evil` must never reach the filesystem).
+    #[test]
+    fn rename_refuses_a_self_rename_and_a_malformed_destination() {
+        assert!(check_rename("work", "prod-eu").is_ok());
+
+        let same = check_rename("work", "work").expect_err("a self-rename is a no-op");
+        assert!(format!("{same}").contains("identical"), "{same}");
+
+        for bad in ["../evil", "with space", "-leading", ""] {
+            assert!(
+                check_rename("work", bad).is_err(),
+                "destination `{bad}` must be rejected"
+            );
+        }
+    }
+
+    // ── list / use readouts ──────────────────────────────────────────────
+
+    /// With no active target the footer must SAY so and name the command that
+    /// sets one; an empty `Active:` field reads like a corrupted store.
+    #[test]
+    fn the_list_footer_distinguishes_no_active_target_from_one() {
+        let none = list_summary_line(3, "");
+        assert!(none.contains('3'), "{none}");
+        assert!(none.contains("No active target"), "{none}");
+        assert!(none.contains("apprafter target use"), "{none}");
+
+        let some = list_summary_line(3, "work");
+        assert!(some.contains("work"), "{some}");
+        assert!(!some.contains("No active target"), "{some}");
+    }
+
+    /// Switching away names the target being left behind — walking off a
+    /// production target by accident is exactly what this readout catches.
+    #[test]
+    fn switching_the_active_target_names_the_one_left_behind() {
+        let switched = switched_active_line("prod-eu", "work");
+        assert!(switched.contains("prod-eu"), "{switched}");
+        assert!(switched.contains("work"), "{switched}");
+
+        let first = switched_active_line("", "work");
+        assert!(first.contains("work"), "{first}");
+        assert!(!first.contains("switched"), "{first}");
+    }
+
+    // ── target ip readout ────────────────────────────────────────────────
+
+    /// The IPv4 line is ALWAYS emitted — as a record when Hetzner reported one
+    /// and as an explicit "none reported" otherwise. A silently absent A line
+    /// is indistinguishable from a rendering bug.
+    #[test]
+    fn the_ip_readout_always_accounts_for_ipv4() {
+        let both = ip_report_lines(Some("203.0.113.7"), Some("2a01:db8::1")).join("\n");
+        assert!(both.contains("A    record → 203.0.113.7"), "{both}");
+        assert!(both.contains("AAAA record → 2a01:db8::1"), "{both}");
+
+        let v4_only = ip_report_lines(Some("203.0.113.7"), None).join("\n");
+        assert!(v4_only.contains("203.0.113.7"), "{v4_only}");
+        assert!(!v4_only.contains("AAAA"), "{v4_only}");
+
+        let neither = ip_report_lines(None, None).join("\n");
+        assert!(neither.contains("no IPv4 reported"), "{neither}");
+    }
+
+    /// A node with IPv6 only still gets its AAAA record printed alongside the
+    /// explicit "no IPv4" note — dropping either would leave the operator
+    /// unable to point DNS anywhere.
+    #[test]
+    fn an_ipv6_only_node_still_reports_its_aaaa_record() {
+        let text = ip_report_lines(None, Some("2a01:db8::1")).join("\n");
+        assert!(text.contains("no IPv4 reported"), "{text}");
+        assert!(text.contains("AAAA record → 2a01:db8::1"), "{text}");
+    }
+
+    /// The readout ends by naming the next command — the records are useless
+    /// until a zone is registered against them.
+    #[test]
+    fn the_ip_readout_points_at_the_domain_command() {
+        let text = ip_report_lines(Some("203.0.113.7"), None).join("\n");
+        assert!(text.contains("apprafter target domain add"), "{text}");
+    }
+
+    // ── cert import ──────────────────────────────────────────────────────
+
+    fn at(secs: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(secs, 0).expect("valid timestamp")
+    }
+
+    /// An expired or not-yet-valid cert is refused outright: importing it
+    /// would wire the Gateway to a listener every browser rejects. The error
+    /// carries the offending boundary so the operator can see WHY.
+    #[test]
+    fn an_out_of_window_certificate_is_refused_with_its_boundary() {
+        let expired = check_cert_validity("cf", ExpiryStatus::Expired, at(0), at(1_000))
+            .expect_err("an expired cert must not import");
+        let msg = format!("{expired}");
+        assert!(msg.contains("expired"), "{msg}");
+        assert!(msg.contains(&at(1_000).to_rfc3339()), "{msg}");
+
+        let early = check_cert_validity("cf", ExpiryStatus::NotYetValid, at(2_000), at(9_000))
+            .expect_err("a not-yet-valid cert must not import");
+        let msg = format!("{early}");
+        assert!(msg.contains("not yet valid"), "{msg}");
+        assert!(msg.contains(&at(2_000).to_rfc3339()), "{msg}");
+    }
+
+    /// A near-expiry cert still imports — refusing it would strand an operator
+    /// rotating late — but it must warn, naming the cert and the days left.
+    #[test]
+    fn a_near_expiry_certificate_imports_with_a_warning() {
+        let warning = check_cert_validity(
+            "cf-cert",
+            ExpiryStatus::NearExpiry { days: 5 },
+            at(0),
+            at(9_000),
+        )
+        .expect("a near-expiry cert must still import")
+        .expect("and must warn");
+        assert!(warning.contains("cf-cert"), "{warning}");
+        assert!(warning.contains('5'), "{warning}");
+
+        assert_eq!(
+            check_cert_validity("cf-cert", ExpiryStatus::Ok, at(0), at(9_000)).unwrap(),
+            None,
+            "a healthy cert must not warn"
+        );
+    }
+
+    /// Overwriting a live cert is opt-in, and the refusal names the flag.
+    #[test]
+    fn the_existing_secret_refusal_names_the_replace_flag() {
+        let msg = secret_exists_error("cf-cert", "apprafter-system");
+        assert!(msg.contains("cf-cert"), "{msg}");
+        assert!(msg.contains("apprafter-system"), "{msg}");
+        assert!(msg.contains("--replace"), "{msg}");
+    }
+
+    /// The confirmation echoes the SANs and the expiry: a cert whose SANs do
+    /// not cover the apex fails at handshake time, and this readout is the
+    /// operator's only chance to catch that before registering the zone.
+    #[test]
+    fn the_import_confirmation_echoes_the_sans_and_the_expiry() {
+        let text = cert_import_lines(
+            "cf-cert",
+            "apprafter-system",
+            &["apprafter.dev".to_string(), "*.apprafter.dev".to_string()],
+            at(1_800_000_000),
+        )
+        .join("\n");
+        assert!(text.contains("cf-cert"), "{text}");
+        assert!(text.contains("apprafter-system"), "{text}");
+        assert!(text.contains("apprafter.dev, *.apprafter.dev"), "{text}");
+        assert!(
+            text.contains(&at(1_800_000_000).format("%Y-%m-%d").to_string()),
+            "{text}"
+        );
+        assert!(text.contains("apprafter target domain add"), "{text}");
     }
 }
 
@@ -684,7 +1239,7 @@ fn run_ip() -> Result<()> {
     let state = State::load_or_default(&resolved.paths)?;
 
     let Some(server_id) = state.hetzner_cloud.as_ref().map(|h| h.server_id) else {
-        println!("No provisioned server for the active target — run `apprafter up` first.");
+        println!("{NO_PROVISIONED_SERVER_HINT}");
         return Ok(());
     };
 
@@ -692,17 +1247,36 @@ fn run_ip() -> Result<()> {
     let client = HetznerCloudClient::new(hcloud_base_url(), token);
     let (v4, v6) = cli_providers::node_public_ips(&client, server_id)?;
 
-    match v4 {
-        Some(ip) => println!("  A    record → {ip}"),
-        None => println!("  (no IPv4 reported by Hetzner)"),
+    for line in ip_report_lines(v4.as_deref(), v6.as_deref()) {
+        println!("{line}");
     }
-    if let Some(ip6) = v6 {
-        println!("  AAAA record → {ip6}");
-    }
-    println!();
-    println!("Set these as your domain's DNS records (proxied through Cloudflare), then:");
-    println!("  apprafter target domain add <zone> --cert <name>");
     Ok(())
+}
+
+/// Shown by `target ip` when the active target has never provisioned.
+const NO_PROVISIONED_SERVER_HINT: &str =
+    "No provisioned server for the active target — run `apprafter up` first.";
+
+/// Render the DNS records for `target ip`.
+///
+/// The IPv4 line is ALWAYS emitted — as a record when Hetzner reported one and
+/// as an explicit "none reported" otherwise, because a silently missing A
+/// record is the difference between "no IPv4" and "we forgot to print it".
+/// IPv6 is genuinely optional, so its line only appears when there is one.
+pub(crate) fn ip_report_lines(v4: Option<&str>, v6: Option<&str>) -> Vec<String> {
+    let mut lines = vec![match v4 {
+        Some(ip) => format!("  A    record → {ip}"),
+        None => "  (no IPv4 reported by Hetzner)".to_string(),
+    }];
+    if let Some(ip6) = v6 {
+        lines.push(format!("  AAAA record → {ip6}"));
+    }
+    lines.push(String::new());
+    lines.push(
+        "Set these as your domain's DNS records (proxied through Cloudflare), then:".to_string(),
+    );
+    lines.push("  apprafter target domain add <zone> --cert <name>".to_string());
+    lines
 }
 
 fn run_list() -> Result<()> {
@@ -749,15 +1323,22 @@ fn run_list() -> Result<()> {
     table.with(Style::sharp());
     println!("{table}");
     println!();
-    if active.is_empty() {
-        println!(
-            "{} targets configured. No active target — run `apprafter target use <name>` to pick one.",
-            rows.len()
-        );
-    } else {
-        println!("{} targets configured. Active: '{active}'.", rows.len());
-    }
+    println!("{}", list_summary_line(rows.len(), &active));
     Ok(())
+}
+
+/// Footer under `target list`.
+///
+/// With no active target the line has to say so AND name the command that sets
+/// one — an empty `Active:` field reads like a corrupted store.
+pub(crate) fn list_summary_line(count: usize, active: &str) -> String {
+    if active.is_empty() {
+        format!(
+            "{count} targets configured. No active target — run `apprafter target use <name>` to pick one."
+        )
+    } else {
+        format!("{count} targets configured. Active: '{active}'.")
+    }
 }
 
 fn run_use(name: &str) -> Result<()> {
@@ -775,12 +1356,21 @@ fn run_use(name: &str) -> Result<()> {
     }
     let previous = std::mem::replace(&mut global.active_target, name.to_string());
     save_global_config(&paths, &global)?;
-    if previous.is_empty() {
-        println!("active target set to `{name}`");
-    } else {
-        println!("active target switched: `{previous}` → `{name}`");
-    }
+    println!("{}", switched_active_line(&previous, name));
     Ok(())
+}
+
+/// Confirmation for `target use`.
+///
+/// When there WAS a previous active target the line names it: switching away
+/// from a production target by accident is exactly the mistake this readout
+/// exists to catch.
+pub(crate) fn switched_active_line(previous: &str, name: &str) -> String {
+    if previous.is_empty() {
+        format!("active target set to `{name}`")
+    } else {
+        format!("active target switched: `{previous}` → `{name}`")
+    }
 }
 
 fn run_show(name: Option<&str>) -> Result<()> {
@@ -789,18 +1379,7 @@ fn run_show(name: Option<&str>) -> Result<()> {
         .map(|g| g.active_target)
         .unwrap_or_default();
 
-    let resolved = match name {
-        Some(n) => n.to_string(),
-        None => {
-            if active.is_empty() {
-                return Err(CliError::Other(
-                    "no active target and no name supplied. Run `apprafter target list` to see configured targets, or `apprafter target add` to create one."
-                        .to_string(),
-                ));
-            }
-            active.clone()
-        }
-    };
+    let resolved = resolve_show_target(name, &active)?;
     info!(target = %resolved, "target show invoked");
     let target = load_target(&paths, &resolved)?;
 
@@ -850,18 +1429,39 @@ fn run_show(name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn run_rename(from: &str, to: &str) -> Result<()> {
-    info!(from = %from, to = %to, "target rename invoked");
+/// Which target `target show` displays: the explicit name, else the active
+/// one. With neither, the error has to name BOTH ways out — an operator on a
+/// fresh store has no target to show and no way to guess that from "not
+/// found".
+pub(crate) fn resolve_show_target(name: Option<&str>, active: &str) -> Result<String> {
+    match name {
+        Some(n) => Ok(n.to_string()),
+        None if active.is_empty() => Err(CliError::Other(
+            "no active target and no name supplied. Run `apprafter target list` to see configured targets, or `apprafter target add` to create one."
+                .to_string(),
+        )),
+        None => Ok(active.to_string()),
+    }
+}
+
+/// Pre-flight for `target rename`: the DESTINATION name must be well-formed
+/// (the source is validated by the store lookup), and a self-rename is refused
+/// rather than performed as a no-op that reports success.
+pub(crate) fn check_rename(from: &str, to: &str) -> Result<()> {
     // Validate the destination name shape here (cli_core layer
     // stays IO-pure on names).
-    if let Err(msg) = check_target_name(to) {
-        return Err(CliError::Other(msg));
-    }
+    check_target_name(to).map_err(CliError::Other)?;
     if from == to {
         return Err(CliError::Other(
             "source and destination target names are identical — nothing to rename".to_string(),
         ));
     }
+    Ok(())
+}
+
+fn run_rename(from: &str, to: &str) -> Result<()> {
+    info!(from = %from, to = %to, "target rename invoked");
+    check_rename(from, to)?;
     let paths = TargetStorePaths::for_root(default_config_root()?);
 
     rename_target(&paths, from, to)?;
@@ -894,20 +1494,12 @@ fn run_remove(name: &str, yes: bool) -> Result<()> {
                 "non-interactive invocation: pass `--yes` to confirm removing target `{name}` (refusing silent destruction)"
             )));
         }
-        let confirmed = inquire::Confirm::new(&format!(
-            "Remove target `{name}`? This deletes config + credentials + cached state."
-        ))
-        .with_default(false)
-        .prompt()
-        .map_err(|err| match err {
-            inquire::InquireError::OperationCanceled
-            | inquire::InquireError::OperationInterrupted => {
-                CliError::Other("remove aborted by user".to_string())
-            }
-            other => CliError::Other(format!("confirmation prompt failed: {other}")),
-        })?;
+        let confirmed = inquire::Confirm::new(&remove_prompt(name))
+            .with_default(false)
+            .prompt()
+            .map_err(map_remove_prompt_error)?;
         if !confirmed {
-            println!("aborted; target `{name}` left intact");
+            println!("{}", remove_aborted_line(name));
             return Ok(());
         }
     }
@@ -947,6 +1539,30 @@ fn run_remove(name: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
+/// The removal confirmation. It has to enumerate WHAT is destroyed: an
+/// operator who reads "remove target" alone does not expect the cached
+/// kubeconfig and credentials to go with it.
+pub(crate) fn remove_prompt(name: &str) -> String {
+    format!("Remove target `{name}`? This deletes config + credentials + cached state.")
+}
+
+/// Line printed when the operator declines the removal — it must state that
+/// the target survived intact.
+pub(crate) fn remove_aborted_line(name: &str) -> String {
+    format!("aborted; target `{name}` left intact")
+}
+
+/// Translate an `inquire` failure raised by the removal confirmation. A
+/// Ctrl-C is an abort, not a terminal fault.
+pub(crate) fn map_remove_prompt_error(err: inquire::InquireError) -> CliError {
+    match err {
+        inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted => {
+            CliError::Other("remove aborted by user".to_string())
+        }
+        other => CliError::Other(format!("confirmation prompt failed: {other}")),
+    }
+}
+
 fn run_cert(action: TargetCertCommand) -> Result<()> {
     match action {
         TargetCertCommand::Import {
@@ -978,37 +1594,19 @@ fn run_cert_import(
 
     let imported = parse_and_validate(&cert_pem, &key_pem)?;
 
-    match expiry_status(imported.not_before, imported.not_after, chrono::Utc::now()) {
-        ExpiryStatus::Expired => {
-            return Err(CliError::Other(format!(
-                "certificate expired (notAfter {})",
-                imported.not_after.to_rfc3339()
-            )));
-        }
-        ExpiryStatus::NotYetValid => {
-            return Err(CliError::Other(format!(
-                "certificate not yet valid (notBefore {})",
-                imported.not_before.to_rfc3339()
-            )));
-        }
-        ExpiryStatus::NearExpiry { days } => {
-            eprintln!(
-                "{}",
-                cli_core::style::warn(&format!(
-                    "certificate '{name}' expires in {days} days — import proceeding"
-                ))
-            );
-        }
-        ExpiryStatus::Ok => {}
+    if let Some(warning) = check_cert_validity(
+        name,
+        expiry_status(imported.not_before, imported.not_after, chrono::Utc::now()),
+        imported.not_before,
+        imported.not_after,
+    )? {
+        eprintln!("{}", cli_core::style::warn(&warning));
     }
 
     let kc = ensure_kubeconfig_tempfile()?;
 
     if !replace && kubectl_get_json("secret", Some(name), Some(namespace), kc.path())?.is_some() {
-        return Err(CliError::Other(format!(
-            "Secret '{name}' already exists in {namespace}. \
-             Re-run with --replace to update it in place."
-        )));
+        return Err(CliError::Other(secret_exists_error(name, namespace)));
     }
 
     let secret = build_tls_secret(name, namespace, &imported);
@@ -1017,17 +1615,70 @@ fn run_cert_import(
     // "apprafter-cli" == cli_providers::k8s::kubectl::APPRAFTER_CLI_FIELD_MANAGER.
     kubectl_apply_server_side(&manifest, "apprafter-cli", kc.path())?;
 
-    println!("✓ Certificate '{name}' imported to {namespace}");
-    println!("  SANs:        {}", imported.sans.join(", "));
-    println!(
-        "  Valid until: {}",
-        imported.not_after.format("%Y-%m-%d %H:%M UTC")
-    );
-    println!();
-    println!("Register a domain that uses it:");
-    println!("  apprafter target domain add <zone> --cert {name}");
-    println!("(How to mint a Cloudflare Origin CA cert: docs → Public ingress → Cloudflare Origin CA cert.)");
+    for line in cert_import_lines(name, namespace, &imported.sans, imported.not_after) {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// Gate an import on the certificate's validity window.
+///
+/// An expired or not-yet-valid cert is refused outright — importing it would
+/// wire the Gateway to a listener browsers reject. A near-expiry one still
+/// imports but returns a warning, because refusing it would strand an operator
+/// who is deliberately rotating late.
+pub(crate) fn check_cert_validity(
+    name: &str,
+    status: ExpiryStatus,
+    not_before: chrono::DateTime<chrono::Utc>,
+    not_after: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<String>> {
+    match status {
+        ExpiryStatus::Expired => Err(CliError::Other(format!(
+            "certificate expired (notAfter {})",
+            not_after.to_rfc3339()
+        ))),
+        ExpiryStatus::NotYetValid => Err(CliError::Other(format!(
+            "certificate not yet valid (notBefore {})",
+            not_before.to_rfc3339()
+        ))),
+        ExpiryStatus::NearExpiry { days } => Ok(Some(format!(
+            "certificate '{name}' expires in {days} days — import proceeding"
+        ))),
+        ExpiryStatus::Ok => Ok(None),
+    }
+}
+
+/// Refusal for an import that would clobber an existing Secret. It names the
+/// flag that opts in, because the safe default is to leave the live cert alone.
+pub(crate) fn secret_exists_error(name: &str, namespace: &str) -> String {
+    format!(
+        "Secret '{name}' already exists in {namespace}. \
+         Re-run with --replace to update it in place."
+    )
+}
+
+/// Lines printed after a successful cert import.
+///
+/// The SANs and the expiry are echoed back because they are what the operator
+/// must cross-check against the zone they are about to register — a cert whose
+/// SANs do not cover the apex silently fails at TLS handshake time.
+pub(crate) fn cert_import_lines(
+    name: &str,
+    namespace: &str,
+    sans: &[String],
+    not_after: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    vec![
+        format!("✓ Certificate '{name}' imported to {namespace}"),
+        format!("  SANs:        {}", sans.join(", ")),
+        format!("  Valid until: {}", not_after.format("%Y-%m-%d %H:%M UTC")),
+        String::new(),
+        "Register a domain that uses it:".to_string(),
+        format!("  apprafter target domain add <zone> --cert {name}"),
+        "(How to mint a Cloudflare Origin CA cert: docs → Public ingress → Cloudflare Origin CA cert.)"
+            .to_string(),
+    ]
 }
 
 /// One-line summary of a stored token suitable for `target show`.

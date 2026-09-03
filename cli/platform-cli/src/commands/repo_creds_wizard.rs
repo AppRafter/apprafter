@@ -126,18 +126,7 @@ fn prompt_token(auth_type: &str, no_validate: bool) -> Result<String> {
     // feedback rather than discovering the regex failure
     // after submitting the whole form.
     let auth = parse_auth_type_safe(auth_type);
-    let validator = move |value: &str| {
-        if no_validate {
-            return Ok(Validation::Valid);
-        }
-        if value.is_empty() {
-            return Ok(Validation::Invalid("must not be empty".into()));
-        }
-        match validate_token_format(value, &auth) {
-            Ok(_) => Ok(Validation::Valid),
-            Err(e) => Ok(Validation::Invalid(e.to_string().into())),
-        }
-    };
+    let validator = move |value: &str| Ok(token_validation(value, &auth, no_validate));
     let prompt = Password::new("Token / password:")
         .with_display_mode(PasswordDisplayMode::Masked)
         .without_confirmation()
@@ -148,6 +137,23 @@ fn prompt_token(auth_type: &str, no_validate: bool) -> Result<String> {
             Err(CliError::Other("wizard cancelled".into()))
         }
         Err(e) => Err(CliError::Other(format!("wizard prompt failed: {e}"))),
+    }
+}
+
+/// Pure body of the inline token validator: `--no-validate` disables
+/// the shape check entirely, an empty entry is always rejected, and
+/// anything else is judged by the shared provider-aware format check so
+/// the wizard and the flag path can never disagree.
+fn token_validation(value: &str, auth: &AuthType, no_validate: bool) -> Validation {
+    if no_validate {
+        return Validation::Valid;
+    }
+    if value.is_empty() {
+        return Validation::Invalid("must not be empty".into());
+    }
+    match validate_token_format(value, auth) {
+        Ok(_) => Validation::Valid,
+        Err(e) => Validation::Invalid(e.to_string().into()),
     }
 }
 
@@ -267,5 +273,95 @@ mod tests {
         assert_eq!(parse_auth_type_safe("garbage"), AuthType::Pat);
         assert_eq!(parse_auth_type_safe("basic"), AuthType::Basic);
         assert_eq!(parse_auth_type_safe("pat"), AuthType::Pat);
+    }
+
+    /// The custom message of an `Invalid` verdict, or `None` for `Valid`
+    /// (and for the library's default message, which we never emit).
+    fn invalid_message(v: &Validation) -> Option<&str> {
+        match v {
+            Validation::Invalid(inquire::validator::ErrorMessage::Custom(m)) => Some(m),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn validate_non_empty_rejects_whitespace_only_input() {
+        // The wizard trims before use, so "   " would become "" — reject
+        // it at the prompt instead of writing an empty username.
+        assert!(invalid_message(&validate_non_empty("   ").unwrap()).is_some());
+        assert!(matches!(
+            validate_non_empty(" git ").unwrap(),
+            Validation::Valid
+        ));
+    }
+
+    #[test]
+    fn validate_dns_1123_for_creds_rejects_edge_dashes_and_overlong_names() {
+        // The name becomes a Kubernetes object name; a leading/trailing
+        // dash or a 64th character is rejected by the apiserver, so the
+        // wizard must catch it before four more prompts are answered.
+        assert!(invalid_message(&validate_dns_1123_for_creds("-acme").unwrap()).is_some());
+        assert!(invalid_message(&validate_dns_1123_for_creds("acme-").unwrap()).is_some());
+        assert!(invalid_message(&validate_dns_1123_for_creds(&"a".repeat(64)).unwrap()).is_some());
+        assert!(matches!(
+            validate_dns_1123_for_creds(&"a".repeat(63)).unwrap(),
+            Validation::Valid
+        ));
+        // Trimmed before validating — a stray trailing space is not an
+        // "invalid character".
+        assert!(matches!(
+            validate_dns_1123_for_creds(" acme ").unwrap(),
+            Validation::Valid
+        ));
+    }
+
+    #[test]
+    fn validate_url_prefix_accepts_plain_http_and_trims() {
+        // Self-hosted Gitea over plain http is a supported remote.
+        assert!(matches!(
+            validate_url_prefix("http://git.internal/team").unwrap(),
+            Validation::Valid
+        ));
+        assert!(matches!(
+            validate_url_prefix("  https://github.com/acme  ").unwrap(),
+            Validation::Valid
+        ));
+        assert!(invalid_message(&validate_url_prefix("   ").unwrap()).is_some());
+    }
+
+    #[test]
+    fn token_validation_delegates_to_the_shared_format_check() {
+        // The inline wizard verdict must be the SAME judgement the
+        // non-interactive path applies, or an operator can type a token
+        // the wizard accepts and `add` then rejects.
+        let good = format!("ghp_{}", "a".repeat(36));
+        assert!(matches!(
+            token_validation(&good, &AuthType::Pat, false),
+            Validation::Valid
+        ));
+        let msg = token_validation("ghp_short", &AuthType::Pat, false);
+        let msg = invalid_message(&msg).expect("short classic PAT must be rejected");
+        assert!(msg.contains("40"), "{msg}");
+    }
+
+    #[test]
+    fn token_validation_rejects_empty_but_no_validate_disables_the_shape_check() {
+        assert!(invalid_message(&token_validation("", &AuthType::Pat, false)).is_some());
+        // `--no-validate` is the documented bypass for self-hosted
+        // providers with custom token shapes.
+        assert!(matches!(
+            token_validation("weird-shape", &AuthType::Pat, true),
+            Validation::Valid
+        ));
+        assert!(invalid_message(&token_validation("weird-shape", &AuthType::Pat, false)).is_some());
+    }
+
+    #[test]
+    fn token_validation_accepts_any_non_empty_basic_password() {
+        // Basic-auth passwords have no provider shape to check.
+        assert!(matches!(
+            token_validation("p", &AuthType::Basic, false),
+            Validation::Valid
+        ));
     }
 }

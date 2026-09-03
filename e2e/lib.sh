@@ -292,6 +292,101 @@ cluster_kubeconfig_write() {
 #   side-load it; the node serves it under imagePullPolicy IfNotPresent so
 #   Argo CD does not fight the unchanged image ref).
 # ---------------------------------------------------------------
+# ---------------------------------------------------------------
+# branch_image_build <operator-subdir> <image-ref>
+#   Build an operator-workspace image from the working tree — ONCE PER SUITE,
+#   not once per walk.
+#
+# WHY THIS EXISTS
+#
+# Every walk that sets APPRAFTER_E2E_LOCAL_OPERATOR carried its OWN copy of a
+# `build_load_restart` helper, and every copy rebuilt the same image. Measured
+# on `needs-env-refs-walk`: 8m46s total, of which the cluster is 17s, the
+# bootstrap 2m01, the BUILD 3m04, and the assertions 3m24. Sixteen walks build
+# it. A full suite therefore spends roughly forty minutes producing an artefact
+# that is byte-identical every time.
+#
+# The cache key is the content of everything the image is built from —
+# `operator/` plus the bundled `schemas/v1alpha1/` — so it invalidates exactly
+# when the image would differ, and never when it would not. A dirty working
+# tree is handled by hashing FILE CONTENT rather than the git revision: an
+# uncommitted edit produces a different key, which is the whole point during
+# development.
+#
+# Cache lives under $APPRAFTER_E2E_IMAGE_CACHE (default: a stable path under
+# TMPDIR), so a suite driver gets reuse across walks for free while a single
+# ad-hoc walk still works with no setup.
+# ---------------------------------------------------------------
+branch_image_cache_key() {
+    # Hash the tracked+untracked content of the build context. `find | sort`
+    # keeps it deterministic; -print0/-0 survives odd filenames.
+    { find "${REPO_ROOT}/operator" "${REPO_ROOT}/schemas/v1alpha1" \
+        -type f \( -name '*.rs' -o -name '*.toml' -o -name '*.lock' \
+        -o -name '*.cue' -o -name 'Dockerfile' -o -name '*.yaml' \) -print0 2>/dev/null \
+        | sort -z | xargs -0 sha256sum 2>/dev/null; } | sha256sum | cut -c1-16
+}
+
+BRANCH_IMAGE_CACHE="${APPRAFTER_E2E_IMAGE_CACHE:-${TMPDIR:-/tmp}/apprafter-e2e-images}"
+
+branch_image_build() { # <operator-subdir> <image-ref>
+    local sub="$1" img="$2" builder key tar
+    builder=podman
+    command -v podman >/dev/null 2>&1 || builder=docker
+    key="$(branch_image_cache_key)"
+    mkdir -p "$BRANCH_IMAGE_CACHE"
+    tar="${BRANCH_IMAGE_CACHE}/${sub}-${key}.tar"
+
+    if [ -s "$tar" ]; then
+        printf '  reusing cached %s image (key %s) — no rebuild\n' "$sub" "$key"
+        "$builder" load -i "$tar" >/dev/null
+        # The cached tarball carries whatever ref it was built under; retag to
+        # the ref THIS cluster renders, so a chart version bump between walks
+        # does not force a rebuild of an identical binary.
+        local cached_ref
+        cached_ref="$("$builder" load -i "$tar" 2>&1 | sed -n 's/.*: \(.*\)$/\1/p' | tail -1)"
+        [ -n "$cached_ref" ] && [ "$cached_ref" != "$img" ] && \
+            "$builder" tag "$cached_ref" "$img" 2>/dev/null || true
+        return 0
+    fi
+
+    printf '  building %s from the working tree (%s, cache key %s) ...\n' "$img" "$builder" "$key"
+    "$builder" build -f "${REPO_ROOT}/operator/${sub}/Dockerfile" -t "$img" "${REPO_ROOT}/operator"
+    "$builder" save -o "$tar" "$img" 2>/dev/null \
+        || printf '  (could not cache %s — the next walk rebuilds)\n' "$sub" >&2
+}
+
+# ---------------------------------------------------------------
+# build_load_restart <deployment> <operator-subdir>
+#   The whole local-operator override in one call: wait for the released
+#   Deployment, read the ref IT renders, build (or reuse) that ref from the
+#   working tree, side-load it, and roll.
+#
+#   Reads the ref off the LIVE object rather than hardcoding it, so a chart
+#   version bump never silently side-loads under a name nothing pulls — the
+#   D24 failure, where a walk built an image and tested a different one.
+#
+#   Ten walks carried a byte-identical private copy of this. One copy means one
+#   place to fix when the shape changes again.
+# ---------------------------------------------------------------
+build_load_restart() { # <deployment> <operator-subdir> [cluster-name]
+    local dep="$1" sub="$2" cluster="${3:-$CLUSTER_NAME}" img
+    printf '  waiting for the %s Deployment to appear ...\n' "$dep"
+    for _ in $(seq 1 60); do
+        kubectl -n apprafter-system get deploy "$dep" >/dev/null 2>&1 && break
+        sleep 5
+    done
+    img=$(kubectl -n apprafter-system get deploy "$dep" \
+        -o jsonpath='{.spec.template.spec.containers[0].image}')
+    if [ -z "$img" ]; then
+        printf 'ERROR: %s Deployment never appeared — cannot learn which image to build\n' "$dep" >&2
+        return 1
+    fi
+    branch_image_build "$sub" "$img"
+    cluster_load_image "$cluster" "$img"
+    kubectl -n apprafter-system rollout restart "deploy/${dep}"
+    kubectl -n apprafter-system rollout status "deploy/${dep}" --timeout=180s
+}
+
 cluster_load_image() {
     local cluster_name="$1" image="$2"
     # Load from whichever engine's store actually HAS the image, NOT from the

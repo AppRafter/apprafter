@@ -159,6 +159,23 @@ pub fn pick_runtime_interactive(detections: &[Detection]) -> Result<Runtime> {
         .prompt()
         .map_err(prompt_err)?;
 
+    resolve_runtime_from_label(&labels, &runtimes, selected)
+}
+
+/// Map the label the operator picked back to its `Runtime`.
+///
+/// `inquire::Select` hands back the chosen *string*, so the label
+/// list is the only index we have — which is why
+/// `build_runtime_select_options` must emit one label per runtime,
+/// in the same order, and why duplicate labels would silently
+/// resolve to the wrong runtime. Pure — extracted from
+/// `pick_runtime_interactive` so the mapping (and its
+/// unknown-label guard) is testable without a terminal.
+fn resolve_runtime_from_label(
+    labels: &[String],
+    runtimes: &[Runtime; 12],
+    selected: &str,
+) -> Result<Runtime> {
     let idx = labels
         .iter()
         .position(|l| l.as_str() == selected)
@@ -264,12 +281,28 @@ fn prompt_dns_1123_text(label: &str, default: &str) -> Result<String> {
 }
 
 fn dns_1123_validator(value: &str) -> std::result::Result<Validation, inquire::CustomUserError> {
+    match check_dns_1123(value) {
+        Ok(()) => Ok(Validation::Valid),
+        Err(msg) => Ok(Validation::Invalid(msg.into())),
+    }
+}
+
+/// DNS-1123 label rule for the name / namespace prompts, as a
+/// plain `Result` instead of an `inquire::Validation`.
+///
+/// Both values become Kubernetes object names, so a value that
+/// slips through here is rejected much later by the apiserver (or
+/// by the admission webhook) with a message that no longer points
+/// at the prompt that produced it. Pure — extracted from
+/// `dns_1123_validator` so every rejection reason is testable
+/// without a terminal.
+fn check_dns_1123(value: &str) -> std::result::Result<(), String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Ok(Validation::Invalid("must not be empty".into()));
+        return Err("must not be empty".to_string());
     }
     if trimmed.len() > 63 {
-        return Ok(Validation::Invalid("must be 1-63 characters".into()));
+        return Err("must be 1-63 characters".to_string());
     }
     let ok = trimmed
         .chars()
@@ -277,11 +310,9 @@ fn dns_1123_validator(value: &str) -> std::result::Result<Validation, inquire::C
         && !trimmed.starts_with('-')
         && !trimmed.ends_with('-');
     if !ok {
-        return Ok(Validation::Invalid(
-            "DNS-1123 only: lower-case [a-z0-9-], no leading/trailing dash".into(),
-        ));
+        return Err("DNS-1123 only: lower-case [a-z0-9-], no leading/trailing dash".to_string());
     }
-    Ok(Validation::Valid)
+    Ok(())
 }
 
 fn prompt_err(e: InquireError) -> CliError {
@@ -439,5 +470,150 @@ mod tests {
         // Default lands on Blank even though it's Fallback —
         // it's the only detection AND there's no High.
         assert_eq!(default_idx, 11);
+    }
+
+    /// A detector that reports a match but hands back an empty
+    /// marker string must still render as a plain "(detected)" —
+    /// `"bun (detected via )"` with a dangling preposition looks
+    /// like a truncation bug to the operator staring at the picker.
+    #[test]
+    fn build_runtime_select_options_treats_an_empty_marker_like_a_missing_one() {
+        let detections = [Detection {
+            runtime: Runtime::Bun,
+            confidence: Confidence::High,
+            marker: Some(String::new()),
+        }];
+        let (labels, _, default_idx) = build_runtime_select_options(&detections);
+        assert_eq!(labels[0], "bun (detected)");
+        assert_eq!(default_idx, 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Label → Runtime resolution.
+    //
+    // `inquire::Select` returns the chosen STRING, so the label
+    // list is the only index back to a `Runtime`. Everything the
+    // scaffold then writes (template, port, start command) hangs
+    // off that lookup being exact.
+    // ---------------------------------------------------------------
+
+    /// Every label the picker can display resolves back to the
+    /// runtime that produced it — including the decorated
+    /// "(detected via …)" labels, which is where an off-by-one or a
+    /// prefix match would show up. A wrong answer here scaffolds a
+    /// Go manifest for a Bun repo without any error.
+    #[test]
+    fn resolve_runtime_from_label_round_trips_every_offered_label() {
+        // A detection on a middle entry so the list mixes decorated
+        // and bare labels.
+        let detections = [detection(Runtime::PythonUv, Confidence::High, "uv.lock")];
+        let (labels, runtimes, _) = build_runtime_select_options(&detections);
+        for (i, label) in labels.iter().enumerate() {
+            let got = resolve_runtime_from_label(&labels, &runtimes, label)
+                .expect("a label the picker offered must resolve");
+            assert_eq!(
+                got, runtimes[i],
+                "label {label:?} resolved to the wrong runtime"
+            );
+        }
+    }
+
+    /// A label that isn't in the offered list is an internal
+    /// inconsistency, not operator input — it must surface as an
+    /// error rather than resolving to whatever sits at index 0.
+    #[test]
+    fn resolve_runtime_from_label_errors_on_a_label_that_was_never_offered() {
+        let (labels, runtimes, _) = build_runtime_select_options(&[]);
+        let err = resolve_runtime_from_label(&labels, &runtimes, "cobol")
+            .expect_err("an unoffered label must not resolve");
+        assert!(err.to_string().contains("not found in options"), "{err}");
+    }
+
+    // ---------------------------------------------------------------
+    // DNS-1123 rule for the name / namespace prompts.
+    // ---------------------------------------------------------------
+
+    /// The shapes Kubernetes actually accepts as an object name.
+    /// Digits, internal dashes and the 63-character boundary all
+    /// have to pass — rejecting them would block legitimate names
+    /// at the prompt with no way around it.
+    #[test]
+    fn check_dns_1123_accepts_legal_kubernetes_object_names() {
+        for ok in ["a", "web", "my-app-2", "0", "app2you", &"a".repeat(63)] {
+            assert!(check_dns_1123(ok).is_ok(), "{ok:?} should be accepted");
+        }
+        // Surrounding whitespace is trimmed before judging, matching
+        // what `prompt_dns_1123_text` stores.
+        assert!(check_dns_1123("  web  ").is_ok());
+    }
+
+    /// Each rejection reason is distinct so the prompt can tell the
+    /// operator what to fix. Anything let through here reaches the
+    /// apiserver, which rejects it much later with a message that no
+    /// longer points at this prompt.
+    #[test]
+    fn check_dns_1123_rejects_each_illegal_shape_with_its_own_reason() {
+        assert_eq!(check_dns_1123("").unwrap_err(), "must not be empty");
+        // Whitespace-only is empty after trimming, not a character
+        // violation.
+        assert_eq!(check_dns_1123("   ").unwrap_err(), "must not be empty");
+        assert_eq!(
+            check_dns_1123(&"a".repeat(64)).unwrap_err(),
+            "must be 1-63 characters"
+        );
+
+        let charset = "DNS-1123 only: lower-case [a-z0-9-], no leading/trailing dash";
+        for bad in [
+            "MyApp",  // upper-case
+            "my_app", // underscore
+            "my.app", // dot
+            "my app", // inner space
+            "-web",   // leading dash
+            "web-",   // trailing dash
+            "wéb",    // non-ASCII
+        ] {
+            assert_eq!(
+                check_dns_1123(bad).unwrap_err(),
+                charset,
+                "{bad:?} should be rejected on the charset rule"
+            );
+        }
+    }
+
+    /// The `inquire` adapter must not invert the verdict: a value
+    /// `check_dns_1123` accepts has to reach `Validation::Valid`,
+    /// and a rejected one has to carry the reason through as the
+    /// custom message the prompt shows. A swapped pair here would
+    /// block every legal name while waving illegal ones through.
+    #[test]
+    fn dns_1123_validator_forwards_the_verdict_and_the_reason_to_inquire() {
+        match dns_1123_validator("my-app").expect("validator itself must not fail") {
+            Validation::Valid => {}
+            Validation::Invalid(msg) => panic!("legal name was rejected: {msg:?}"),
+        }
+        match dns_1123_validator("My_App").expect("validator itself must not fail") {
+            Validation::Invalid(inquire::validator::ErrorMessage::Custom(msg)) => {
+                assert_eq!(msg, check_dns_1123("My_App").unwrap_err());
+            }
+            other => panic!("illegal name must carry a custom reason, got {other:?}"),
+        }
+    }
+
+    /// Esc / Ctrl-C at any step-0 prompt is a user decision, not a
+    /// crash: it surfaces as a plain "cancelled" line. Other
+    /// failures keep the underlying inquire error so they stay
+    /// diagnosable.
+    #[test]
+    fn prompt_err_reports_user_cancellation_separately_from_real_failures() {
+        assert_eq!(
+            prompt_err(InquireError::OperationCanceled).to_string(),
+            "wizard cancelled"
+        );
+        assert_eq!(
+            prompt_err(InquireError::OperationInterrupted).to_string(),
+            "wizard cancelled"
+        );
+        let other = prompt_err(InquireError::NotTTY).to_string();
+        assert!(other.starts_with("wizard prompt failed:"), "{other}");
     }
 }

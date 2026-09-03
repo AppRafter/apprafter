@@ -223,23 +223,47 @@ impl CapacityCache {
     /// fresh else fetched. Returns `None` on any error — NEVER an `Err`, so
     /// a caller can treat capacity as simply absent and continue.
     pub async fn summary_for_node(&self, client: &kube::Client, node: &str) -> Option<Value> {
-        if let Some(v) = self.cached_fresh(node) {
-            return Some(v);
-        }
-        match Self::fetch(client, node).await {
-            Some(v) => {
-                self.store(node, v.clone());
-                Some(v)
-            }
-            None => None,
-        }
+        self.summary_for_node_with(node, CACHE_TTL, || Self::fetch(client, node))
+            .await
     }
 
-    /// Return the cached Summary for `node` iff it is younger than the TTL.
-    fn cached_fresh(&self, node: &str) -> Option<Value> {
+    /// The cache policy behind [`Self::summary_for_node`], with the kubelet
+    /// fetch injected.
+    ///
+    /// Two invariants live here and neither is visible from outside: a fresh
+    /// sample must suppress the fetch ENTIRELY — both controllers share one
+    /// cache precisely so a node's kubelet is polled at most once per TTL no
+    /// matter how many claims reconcile in the window — and a FAILED fetch
+    /// must not be stored, or one RBAC hiccup would suppress capacity for
+    /// every reconcile in the next 30 seconds.
+    async fn summary_for_node_with<F, Fut>(
+        &self,
+        node: &str,
+        ttl: Duration,
+        fetch: F,
+    ) -> Option<Value>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Option<Value>>,
+    {
+        if let Some(v) = self.cached_fresh(node, ttl) {
+            return Some(v);
+        }
+        let value = fetch().await?;
+        self.store(node, value.clone());
+        Some(value)
+    }
+
+    /// Return the cached Summary for `node` iff it is younger than `ttl`.
+    ///
+    /// The window is a parameter rather than a read of [`CACHE_TTL`] purely
+    /// so the expiry boundary is reachable from a test: `Instant` cannot be
+    /// constructed in the past portably, so the comparison has to be driven
+    /// from its other side. The single production caller passes `CACHE_TTL`.
+    fn cached_fresh(&self, node: &str, ttl: Duration) -> Option<Value> {
         let entries = self.entries.lock().ok()?;
         let (at, value) = entries.get(node)?;
-        if at.elapsed() < CACHE_TTL {
+        if at.elapsed() < ttl {
             Some(value.clone())
         } else {
             None
@@ -256,7 +280,7 @@ impl CapacityCache {
     /// Best-effort raw fetch of the kubelet Summary API through the
     /// apiserver node-proxy subresource. Any failure ⇒ `None` (logged).
     async fn fetch(client: &kube::Client, node: &str) -> Option<Value> {
-        let path = format!("/api/v1/nodes/{node}/proxy/stats/summary");
+        let path = node_summary_path(node);
         let req = match http::Request::get(&path).body(Vec::new()) {
             Ok(r) => r,
             Err(e) => {
@@ -274,6 +298,17 @@ impl CapacityCache {
             }
         }
     }
+}
+
+/// The apiserver path that proxies to a node's kubelet Summary API.
+///
+/// Split out of [`CapacityCache::fetch`] so the one non-I/O part of it can be
+/// pinned. `nodes/{name}/proxy` is a subresource: an RBAC rule is granted on
+/// `nodes/proxy` and the request must address exactly that path, and because
+/// every failure here is swallowed by design, a wrong path produces silence
+/// rather than an error — capacity would simply never appear anywhere.
+fn node_summary_path(node: &str) -> String {
+    format!("/api/v1/nodes/{node}/proxy/stats/summary")
 }
 
 #[cfg(test)]
@@ -388,5 +423,237 @@ mod tests {
         let s = json!({ "node": { "fs": { "availableBytes": 15_u64, "capacityBytes": 100_u64 } } });
         assert_eq!(node_fs_capacity(&s), Some(100));
         assert_eq!(node_fs_capacity(&json!({})), None);
+    }
+
+    // -----------------------------------------------------------------
+    // reported_pvc_names — the diagnostic that explains a missing figure
+    // -----------------------------------------------------------------
+
+    /// Two pods. The second mounts a PVC the first does not (so a scan that
+    /// stops early loses it) as well as one they share (an RWX volume, or the
+    /// same PVC seen through two pods), plus a volume that is not a PVC.
+    fn two_pod_summary() -> Value {
+        json!({ "pods": [
+            { "volume": [
+                { "pvcRef": { "name": "sv-demo-shared" }, "usedBytes": 40_u64, "capacityBytes": 50_u64 },
+                { "name": "tmp" }
+            ] },
+            { "volume": [
+                { "pvcRef": { "name": "sv-demo-shared" }, "usedBytes": 40_u64, "capacityBytes": 50_u64 },
+                { "pvcRef": { "name": "claim-demo-web-disk" }, "usedBytes": 1_u64, "capacityBytes": 9_u64 }
+            ] }
+        ]})
+    }
+
+    #[test]
+    fn reported_pvc_names_lists_every_pvc_across_every_pod_once() {
+        // Sorted and deduplicated: this list is rendered to a human as "the
+        // kubelet reports these", so the same volume appearing twice because
+        // two pods mount it reads as two volumes.
+        assert_eq!(
+            reported_pvc_names(&two_pod_summary()),
+            vec![
+                "claim-demo-web-disk".to_string(),
+                "sv-demo-shared".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_kubelet_publishing_no_volume_metrics_reports_an_empty_list() {
+        // Emptiness is the whole signal here — it is what separates "this
+        // kubelet has no volume metrics provider at all" (hostPath-backed
+        // volumes never report) from "it reports volumes, just not yours".
+        // A non-PVC volume must not be counted as a nameless PVC, which is
+        // what any `unwrap_or_default()` on the pvcRef would produce.
+        let no_volumes =
+            json!({ "pods": [ { "name": "p1" }, { "volume": [ { "name": "tmp" } ] } ] });
+        assert!(reported_pvc_names(&no_volumes).is_empty());
+        assert!(reported_pvc_names(&json!({})).is_empty());
+        // …and the same function does find them when they are there.
+        assert!(!reported_pvc_names(&two_pod_summary()).is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // pvc_usage — scanning, and refusing to invent numbers
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn pvc_usage_scans_past_the_first_pod() {
+        // The claim's own pod is rarely first in the kubelet's list; stopping
+        // at the first pod would report "no capacity" for every volume but
+        // one, intermittently, depending on pod ordering.
+        let s = json!({ "pods": [
+            { "volume": [ { "pvcRef": { "name": "other" }, "usedBytes": 1_u64, "capacityBytes": 2_u64 } ] },
+            { "volume": [ { "pvcRef": { "name": "wanted" }, "usedBytes": 7_u64, "capacityBytes": 11_u64 } ] }
+        ]});
+        assert_eq!(pvc_usage(&s, "wanted"), Some((7, 11)));
+    }
+
+    #[test]
+    fn a_matched_volume_missing_its_byte_fields_is_unknown_not_zero() {
+        // The volume is present but the kubelet did not report its bytes.
+        // Defaulting either field to 0 would render a full disk as an empty
+        // one — the same "unmeasured is not zero" rule the size scrape keeps.
+        let no_used = json!({ "pods": [ { "volume": [
+            { "pvcRef": { "name": "v" }, "capacityBytes": 50_u64 } ] } ] });
+        assert_eq!(pvc_usage(&no_used, "v"), None);
+        let no_capacity = json!({ "pods": [ { "volume": [
+            { "pvcRef": { "name": "v" }, "usedBytes": 40_u64 } ] } ] });
+        assert_eq!(pvc_usage(&no_capacity, "v"), None);
+    }
+
+    // -----------------------------------------------------------------
+    // node_free_fraction / is_capacity_warning — boundaries
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_non_numeric_summary_field_is_unknown_rather_than_zero_free() {
+        // A kubelet that answers with a string (or an error document shaped
+        // like a Summary) must not read as "0% free", which would fire a
+        // disk-pressure warning on a node nothing is known about.
+        let s = json!({ "node": { "fs": { "availableBytes": "15", "capacityBytes": 100_u64 } } });
+        assert!(node_free_fraction(&s).is_none());
+        let missing_avail = json!({ "node": { "fs": { "capacityBytes": 100_u64 } } });
+        assert!(node_free_fraction(&missing_avail).is_none());
+    }
+
+    #[test]
+    fn a_node_exactly_at_the_threshold_does_not_warn() {
+        // Strictly below, matching `is_volume_warning`'s strictly-above: a
+        // node sitting exactly on 15% free is the boundary, not past it, and
+        // a threshold that fires at its own value makes the number in the
+        // Event look wrong to whoever reads it.
+        assert!(!is_capacity_warning(0.15, 0.15));
+        assert!(is_capacity_warning(0.149, 0.15));
+    }
+
+    #[test]
+    fn a_negative_node_capacity_never_claims_host_scope() {
+        // `capacity_scope` guards on `node > 0`; a negative pair would
+        // otherwise compare equal and relabel a volume's own figure.
+        assert_eq!(capacity_scope(-1, Some(-1)), SCOPE_VOLUME);
+    }
+
+    // -----------------------------------------------------------------
+    // CapacityCache — key isolation and the TTL boundary
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn the_summary_url_addresses_the_node_proxy_subresource() {
+        assert_eq!(
+            node_summary_path("node-1"),
+            "/api/v1/nodes/node-1/proxy/stats/summary"
+        );
+    }
+
+    #[test]
+    fn a_stored_summary_is_served_back_per_node_while_it_is_fresh() {
+        // Per NODE: on a multi-node cluster one node's disk-pressure sample
+        // standing in for another's is a warning attached to the wrong
+        // machine, which sends an operator to drain a healthy node.
+        let cache = CapacityCache::new();
+        cache.store(
+            "node-a",
+            json!({ "node": { "fs": { "capacityBytes": 1_u64 } } }),
+        );
+        cache.store(
+            "node-b",
+            json!({ "node": { "fs": { "capacityBytes": 2_u64 } } }),
+        );
+        assert_eq!(
+            cache
+                .cached_fresh("node-a", CACHE_TTL)
+                .and_then(|v| node_fs_capacity(&v)),
+            Some(1)
+        );
+        assert_eq!(
+            cache
+                .cached_fresh("node-b", CACHE_TTL)
+                .and_then(|v| node_fs_capacity(&v)),
+            Some(2)
+        );
+        assert!(cache.cached_fresh("node-c", CACHE_TTL).is_none());
+    }
+
+    /// A kubelet fetch that records how often it ran, so "did not poll the
+    /// kubelet" is an assertion rather than an assumption.
+    struct CountingFetch {
+        calls: std::cell::Cell<u32>,
+        result: Option<Value>,
+    }
+
+    impl CountingFetch {
+        fn new(result: Option<Value>) -> Self {
+            Self {
+                calls: std::cell::Cell::new(0),
+                result,
+            }
+        }
+        async fn run(&self) -> Option<Value> {
+            self.calls.set(self.calls.get() + 1);
+            self.result.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_sample_suppresses_the_kubelet_poll_entirely() {
+        // Both controllers share one cache so that a node's kubelet is polled
+        // at most once per TTL however many claims reconcile in the window. A
+        // cache that returned the right answer but polled anyway would look
+        // perfectly correct while multiplying kubelet load by the claim count.
+        let cache = CapacityCache::new();
+        cache.store(
+            "node-a",
+            json!({ "node": { "fs": { "capacityBytes": 1_u64 } } }),
+        );
+        let fetch = CountingFetch::new(Some(
+            json!({ "node": { "fs": { "capacityBytes": 2_u64 } } }),
+        ));
+        let got = cache
+            .summary_for_node_with("node-a", CACHE_TTL, || fetch.run())
+            .await;
+        assert_eq!(got.as_ref().and_then(node_fs_capacity), Some(1));
+        assert_eq!(fetch.calls.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_kubelet_poll_is_not_cached() {
+        // Capacity is decorative and every failure is swallowed, so a
+        // remembered failure would be indistinguishable from a node that
+        // simply has no capacity to report — for the whole TTL, on every
+        // reconcile, with nothing in the logs to say why.
+        let cache = CapacityCache::new();
+        let failing = CountingFetch::new(None);
+        assert!(cache
+            .summary_for_node_with("node-a", CACHE_TTL, || failing.run())
+            .await
+            .is_none());
+        assert!(cache.cached_fresh("node-a", CACHE_TTL).is_none());
+
+        // The next reconcile gets a real attempt, and that one IS cached.
+        let ok = CountingFetch::new(Some(
+            json!({ "node": { "fs": { "capacityBytes": 7_u64 } } }),
+        ));
+        let got = cache
+            .summary_for_node_with("node-a", CACHE_TTL, || ok.run())
+            .await;
+        assert_eq!(got.as_ref().and_then(node_fs_capacity), Some(7));
+        assert_eq!(ok.calls.get(), 1);
+        assert_eq!(
+            cache
+                .cached_fresh("node-a", CACHE_TTL)
+                .as_ref()
+                .and_then(node_fs_capacity),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn a_summary_older_than_the_ttl_is_not_served() {
+        // Driven from the TTL side because `Instant` has no portable past.
+        let cache = CapacityCache::new();
+        cache.store("node-a", json!({ "node": {} }));
+        assert!(cache.cached_fresh("node-a", Duration::ZERO).is_none());
     }
 }

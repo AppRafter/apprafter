@@ -36,3 +36,13 @@ base64      = { workspace = true }
 # avoid pulling openssl.
 reqwest          = { workspace = true }
 oci-distribution = { workspace = true }
+
+[dev-dependencies]
+# The unit tests that pin what this controller does when the apiserver
+# cannot be reached build a kube `Client`, which constructs a rustls
+# connector. rustls 0.23 removed its auto-default CryptoProvider, so that
+# panics unless one is installed first — exactly the walk-found bug
+# (v0.1.105 → v0.1.106) that `install_rustls_crypto_provider` fixes in the
+# operator + webhook binaries. Same provider, same explicit install, so the
+# tests match how the binaries actually run.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }

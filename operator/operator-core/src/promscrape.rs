@@ -93,7 +93,7 @@ pub async fn scrape_pod(
     port: u16,
     path: &str,
 ) -> Result<String, String> {
-    let url = format!("/api/v1/namespaces/{namespace}/pods/{pod}:{port}/proxy{path}");
+    let url = pod_proxy_path(namespace, pod, port, path);
     let req = http::Request::get(&url)
         .body(Vec::new())
         .map_err(|e| format!("building the pod-proxy request: {e}"))?;
@@ -101,6 +101,18 @@ pub async fn scrape_pod(
         .request_text(req)
         .await
         .map_err(|e| format!("GET {url}: {e}"))
+}
+
+/// The apiserver path that proxies to `pod`'s HTTP endpoint.
+///
+/// Split out of [`scrape_pod`] so the one part of that function that is not
+/// I/O can be pinned: the pod-proxy subresource is addressed as
+/// `pods/{name}:{port}`, and every plausible slip — proxying to the namespace
+/// instead of the pod, dropping the port, joining `path` without its leading
+/// slash — yields a 404 that reads as "the endpoint is down" rather than "we
+/// asked the wrong question".
+fn pod_proxy_path(namespace: &str, pod: &str, port: u16, path: &str) -> String {
+    format!("/api/v1/namespaces/{namespace}/pods/{pod}:{port}/proxy{path}")
 }
 
 /// Every value a given label takes on a given metric, in the scraped body.
@@ -171,19 +183,56 @@ impl MetricsCache {
         port: u16,
         path: &str,
     ) -> Result<String, String> {
-        let key = format!("{namespace}/{pod}");
-        if let Ok(map) = self.entries.lock() {
-            if let Some((at, body)) = map.get(&key) {
-                if at.elapsed() < self.ttl {
-                    return Ok(body.clone());
-                }
-            }
+        self.body_for_key(cache_key(namespace, pod), || {
+            scrape_pod(client, namespace, pod, port, path)
+        })
+        .await
+    }
+
+    /// Serve `key` from the cache while it is fresh, else `fetch` it and
+    /// remember the result — but only if it succeeded.
+    ///
+    /// The fetch is a parameter rather than a hard-wired [`scrape_pod`] so the
+    /// cache's two load-bearing policies are reachable without an apiserver: a
+    /// fresh entry must suppress the fetch ENTIRELY (one scrape per TTL is
+    /// what keeps a per-claim 60s reconcile from hammering the exporter), and
+    /// a failure must not be cached (remembering one would blind every claim
+    /// on that backend for the rest of the window). Neither is visible from
+    /// the outside — a cache that quietly stopped caching, or one that
+    /// remembered an error, both just look slow.
+    async fn body_for_key<F, Fut>(&self, key: String, fetch: F) -> Result<String, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>>,
+    {
+        if let Some(body) = self.cached_fresh(&key) {
+            return Ok(body);
         }
-        let body = scrape_pod(client, namespace, pod, port, path).await?;
-        if let Ok(mut map) = self.entries.lock() {
-            map.insert(key, (std::time::Instant::now(), body.clone()));
-        }
+        let body = fetch().await?;
+        self.store(key, body.clone());
         Ok(body)
+    }
+
+    /// The cached body for `key` iff it is younger than the TTL.
+    ///
+    /// Separated from the fetch so the cache's whole decision — which key a
+    /// pod maps to, and when a sample stops being servable — is reachable
+    /// without a cluster; the scrape either side of it is not.
+    fn cached_fresh(&self, key: &str) -> Option<String> {
+        let map = self.entries.lock().ok()?;
+        let (at, body) = map.get(key)?;
+        if at.elapsed() < self.ttl {
+            Some(body.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Insert/replace the cached body for `key`, stamped now.
+    fn store(&self, key: String, body: String) {
+        if let Ok(mut map) = self.entries.lock() {
+            map.insert(key, (std::time::Instant::now(), body));
+        }
     }
 
     /// Scrape ignoring the cache, and refresh it with the result.
@@ -206,15 +255,38 @@ impl MetricsCache {
         port: u16,
         path: &str,
     ) -> Result<String, String> {
-        let body = scrape_pod(client, namespace, pod, port, path).await?;
-        if let Ok(mut map) = self.entries.lock() {
-            map.insert(
-                format!("{namespace}/{pod}"),
-                (std::time::Instant::now(), body.clone()),
-            );
-        }
+        self.refresh_key(cache_key(namespace, pod), || {
+            scrape_pod(client, namespace, pod, port, path)
+        })
+        .await
+    }
+
+    /// Fetch `key` unconditionally and replace whatever was cached for it.
+    ///
+    /// The counterpart to [`Self::body_for_key`], with the fetch injected for
+    /// the same reason: what distinguishes this path is that it does NOT
+    /// consult the cache, and a version that quietly started to would
+    /// reintroduce the five-minute blind spot on a freshly created database
+    /// that the doc comment above describes.
+    async fn refresh_key<F, Fut>(&self, key: String, fetch: F) -> Result<String, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<String, String>>,
+    {
+        let body = fetch().await?;
+        self.store(key, body.clone());
         Ok(body)
     }
+}
+
+/// Cache key for one pod's scraped body.
+///
+/// Namespace-qualified because pod names are only unique within a namespace,
+/// and the thing being cached is a body carrying EVERY tenant database's
+/// size: a key collision would serve one namespace's backend metrics as
+/// another's, which is a wrong number rather than a missing one.
+fn cache_key(namespace: &str, pod: &str) -> String {
+    format!("{namespace}/{pod}")
 }
 
 #[cfg(test)]
@@ -299,5 +371,231 @@ cnpg_pg_database_xid_age{datname="claim-demo-web-pg"} 42
     fn a_trailing_timestamp_does_not_become_the_value() {
         let with_ts = "m{d=\"x\"} 1234 1699999999000\n";
         assert_eq!(parse_labelled_gauge(with_ts, "m", "d", "x"), Some(1234.0));
+    }
+
+    #[test]
+    fn a_sample_whose_value_cannot_be_read_does_not_stop_the_scan() {
+        // A truncated line (the scrape raced the exporter mid-write) or a
+        // non-numeric one must be skipped, not treated as the answer for that
+        // label: the reader keeps looking and finds the real sample. Giving up
+        // at the first unreadable line reports "no size" for a database whose
+        // size is right there on the next line.
+        let body = "m{d=\"x\"}\nm{d=\"x\"} not-a-number\nm{d=\"x\"} 42\n";
+        assert_eq!(parse_labelled_gauge(body, "m", "d", "x"), Some(42.0));
+    }
+
+    // -----------------------------------------------------------------
+    // label_values — the "found these instead" miss diagnostic
+    // -----------------------------------------------------------------
+
+    /// A scrape carrying several metrics, only one of which is the one being
+    /// looked up. `claim-zzz` belongs to a DIFFERENT metric and must never be
+    /// reported as a database this metric knows about.
+    const MIXED: &str = r#"
+# HELP cnpg_pg_database_size_bytes Disk space used by the database
+# TYPE cnpg_pg_database_size_bytes gauge
+cnpg_pg_database_size_bytes{datname="postgres"} 8.5e+06
+cnpg_pg_database_size_bytes{datname="claim-a"} 1.0e+06
+cnpg_pg_database_size_bytes{datname="claim-a"} 2.0e+06
+cnpg_pg_replication_slots{datname="claim-zzz"} 1
+cnpg_collector_up 1
+"#;
+
+    #[test]
+    fn label_values_lists_only_the_asked_for_metrics_own_label_values() {
+        // Sorted + deduplicated, scoped to the requested metric. The caller
+        // (resourceclaim-provisioner's pg size read) renders this straight
+        // into a failure message as "exists for datname [...] but not for X",
+        // so a value borrowed from a neighbouring metric sends whoever reads
+        // it looking for a database that this metric never mentioned.
+        assert_eq!(
+            label_values(MIXED, "cnpg_pg_database_size_bytes", "datname"),
+            vec!["claim-a".to_string(), "postgres".to_string()]
+        );
+    }
+
+    #[test]
+    fn label_values_is_empty_when_the_metric_is_not_published_at_all() {
+        // Emptiness is a decision, not a detail: the caller branches on it to
+        // choose between "this cluster does not publish the metric — go
+        // enable it" and "it publishes it, just not for your database". A
+        // list that is never empty would send every operator to enable a
+        // metric that was already on, and one that is always empty would hide
+        // the databases that ARE there.
+        let body = "cnpg_pg_replication_slots{datname=\"claim-zzz\"} 1\ncnpg_collector_up 1\n";
+        assert!(label_values(body, "cnpg_pg_database_size_bytes", "datname").is_empty());
+        assert!(!label_values(MIXED, "cnpg_pg_database_size_bytes", "datname").is_empty());
+    }
+
+    #[test]
+    fn label_values_reads_one_label_out_of_a_multi_label_sample() {
+        // Real CNPG samples carry several labels; the value wanted is the one
+        // label's, not the whole `{...}` block.
+        let body = "m{cluster=\"pg-shared\",datname=\"claim-a\",role=\"primary\"} 3\n";
+        assert_eq!(
+            label_values(body, "m", "datname"),
+            vec!["claim-a".to_string()]
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // pod-proxy addressing + the scrape cache
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn the_scrape_url_addresses_the_pod_proxy_subresource() {
+        // `pods/{name}:{port}/proxy{path}` — the apiserver answers a wrong
+        // shape here with a 404 that reads exactly like a dead endpoint.
+        assert_eq!(
+            pod_proxy_path("cnpg-system", "pg-shared-1", 9187, "/metrics"),
+            "/api/v1/namespaces/cnpg-system/pods/pg-shared-1:9187/proxy/metrics"
+        );
+    }
+
+    #[test]
+    fn a_stored_body_is_served_back_while_it_is_fresh() {
+        let cache = MetricsCache::new();
+        cache.store(cache_key("cnpg-system", "pg-1"), "body".to_string());
+        assert_eq!(
+            cache.cached_fresh(&cache_key("cnpg-system", "pg-1")),
+            Some("body".to_string())
+        );
+        // A pod nothing was stored for is a miss, not someone else's body.
+        assert_eq!(cache.cached_fresh(&cache_key("cnpg-system", "pg-2")), None);
+    }
+
+    #[test]
+    fn the_cache_key_is_namespace_qualified() {
+        // Pod names are unique only within a namespace, and the cached body
+        // carries EVERY tenant database's size on that backend. A collision
+        // would serve one namespace's sizes under another's name — a wrong
+        // number, which is worse than the missing one a cache miss gives.
+        let cache = MetricsCache::new();
+        cache.store(cache_key("tenant-a", "pg-1"), "a".to_string());
+        cache.store(cache_key("tenant-b", "pg-1"), "b".to_string());
+        assert_eq!(
+            cache.cached_fresh(&cache_key("tenant-a", "pg-1")),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            cache.cached_fresh(&cache_key("tenant-b", "pg-1")),
+            Some("b".to_string())
+        );
+    }
+
+    /// A fetch that records how often it ran, so "did not scrape" is an
+    /// assertion rather than an assumption.
+    struct CountingFetch {
+        calls: std::cell::Cell<u32>,
+        result: Result<String, String>,
+    }
+
+    impl CountingFetch {
+        fn ok(body: &str) -> Self {
+            Self {
+                calls: std::cell::Cell::new(0),
+                result: Ok(body.to_string()),
+            }
+        }
+        fn err(msg: &str) -> Self {
+            Self {
+                calls: std::cell::Cell::new(0),
+                result: Err(msg.to_string()),
+            }
+        }
+        async fn run(&self) -> Result<String, String> {
+            self.calls.set(self.calls.get() + 1);
+            self.result.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_cached_body_suppresses_the_scrape_entirely() {
+        // The reason the cache exists: every claim on a backend reconciles on
+        // its own 60s tick and they all read the SAME body. A cache that
+        // served the right answer but still scraped would keep the numbers
+        // correct and quietly multiply load on the exporter by the tenant
+        // count — invisible until the backend is the thing that falls over.
+        let cache = MetricsCache::new();
+        cache.store(cache_key("cnpg-system", "pg-1"), "cached".to_string());
+        let fetch = CountingFetch::ok("scraped");
+        let got = cache
+            .body_for_key(cache_key("cnpg-system", "pg-1"), || fetch.run())
+            .await;
+        assert_eq!(got, Ok("cached".to_string()));
+        assert_eq!(fetch.calls.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_scrape_is_not_remembered() {
+        // Caching a failure would blind every claim on that backend for the
+        // whole 300s window over one unlucky moment, and the claims would
+        // report "no size" rather than "the scrape failed".
+        let cache = MetricsCache::new();
+        let failing = CountingFetch::err("GET …: connection refused");
+        let err = cache
+            .body_for_key(cache_key("cnpg-system", "pg-1"), || failing.run())
+            .await;
+        assert!(err.is_err(), "{err:?}");
+        assert_eq!(cache.cached_fresh(&cache_key("cnpg-system", "pg-1")), None);
+
+        // …and the very next tick gets a real attempt, not the remembered one.
+        let ok = CountingFetch::ok("scraped");
+        let got = cache
+            .body_for_key(cache_key("cnpg-system", "pg-1"), || ok.run())
+            .await;
+        assert_eq!(got, Ok("scraped".to_string()));
+        assert_eq!(ok.calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_miss_scrapes_once_and_the_body_is_then_cached() {
+        let cache = MetricsCache::new();
+        let fetch = CountingFetch::ok("scraped");
+        let got = cache
+            .body_for_key(cache_key("cnpg-system", "pg-1"), || fetch.run())
+            .await;
+        assert_eq!(got, Ok("scraped".to_string()));
+        assert_eq!(fetch.calls.get(), 1);
+        assert_eq!(
+            cache.cached_fresh(&cache_key("cnpg-system", "pg-1")),
+            Some("scraped".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_uncached_read_scrapes_past_a_fresh_body_and_replaces_it() {
+        // The case the TTL gets wrong: a body captured before a database
+        // existed cannot mention it, and "absent from the metric" then looks
+        // exactly like "the metric is not published". Consulting the cache
+        // here would restore the five-minute window in which a freshly
+        // provisioned claim reports nothing — three e2e rounds went into
+        // telling those two apart.
+        let cache = MetricsCache::new();
+        cache.store(cache_key("cnpg-system", "pg-1"), "old".to_string());
+        let fetch = CountingFetch::ok("new");
+        let got = cache
+            .refresh_key(cache_key("cnpg-system", "pg-1"), || fetch.run())
+            .await;
+        assert_eq!(got, Ok("new".to_string()));
+        assert_eq!(fetch.calls.get(), 1);
+        // …and the fresher body replaces the stale one for everybody else.
+        assert_eq!(
+            cache.cached_fresh(&cache_key("cnpg-system", "pg-1")),
+            Some("new".to_string())
+        );
+    }
+
+    #[test]
+    fn a_body_older_than_the_ttl_is_not_served() {
+        // `Instant` cannot be constructed in the past portably, so the TTL
+        // side of the same comparison is driven to zero instead: every stored
+        // sample is then already older than the window.
+        let cache = MetricsCache {
+            entries: Default::default(),
+            ttl: std::time::Duration::ZERO,
+        };
+        cache.store(cache_key("cnpg-system", "pg-1"), "stale".to_string());
+        assert_eq!(cache.cached_fresh(&cache_key("cnpg-system", "pg-1")), None);
     }
 }

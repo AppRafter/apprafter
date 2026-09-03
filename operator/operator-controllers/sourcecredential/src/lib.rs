@@ -64,10 +64,11 @@ use tracing::{info, warn};
 use operator_controllers_migration::SourceCredentialMigrationStrategy;
 use operator_core::migration_state::{decide, plan_state, plan_state_no_change, MigrationDecision};
 use operator_core::{
-    DestructiveChange, Metrics, MigrationPlan, SourceCredential, SourceCredentialCondition,
-    SourceCredentialSpec, SourceCredentialStatus, COND_GIT_PRESENT, COND_GIT_VALID,
-    COND_MIGRATION_PENDING, COND_REGISTRY_PRESENT, COND_REGISTRY_VALID,
-    PHASE_AWAITING_MIGRATION_APPROVAL, REASON_UNVERIFIED,
+    DestructiveChange, Metrics, MigrationPlan, SourceBackend, SourceCredential,
+    SourceCredentialCondition, SourceCredentialSpec, SourceCredentialStatus, SourceGit,
+    SourceRegistry, COND_GIT_PRESENT, COND_GIT_VALID, COND_MIGRATION_PENDING,
+    COND_REGISTRY_PRESENT, COND_REGISTRY_VALID, PHASE_AWAITING_MIGRATION_APPROVAL,
+    REASON_UNVERIFIED,
 };
 
 mod validity;
@@ -181,24 +182,21 @@ pub async fn reconcile(
     // cross-namespace ownerReference cascade is impossible (k8s forbids
     // it). A finalizer lets this controller GC them on delete instead.
     let finalizers = cred.metadata.finalizers.clone().unwrap_or_default();
-    if cred.metadata.deletion_timestamp.is_some() {
+    let deleting = cred.metadata.deletion_timestamp.is_some();
+    if deleting {
+        // GC FIRST — the finalizer is released only after the derived
+        // Secrets are actually gone (a failed sweep returns Err here and
+        // the finalizer keeps the object alive for the retry).
         gc_derived_secrets(&ctx.client, &namespace, &name).await?;
-        if finalizers.iter().any(|f| f == DERIVED_SECRETS_FINALIZER) {
-            set_finalizers(
-                &ctx.client,
-                &namespace,
-                &name,
-                without_finalizer(&finalizers),
-            )
-            .await?;
-        }
+    }
+    if let Some(list) = finalizer_patch(deleting, &finalizers) {
+        // On a live object the patch re-triggers reconcile; derivation
+        // proceeds below anyway so the first pass is not wasted.
+        set_finalizers(&ctx.client, &namespace, &name, list).await?;
+    }
+    if deleting {
         info!(%name, %namespace, "SourceCredential derived Secrets garbage-collected");
         return Ok(Action::await_change());
-    }
-    if !finalizers.iter().any(|f| f == DERIVED_SECRETS_FINALIZER) {
-        set_finalizers(&ctx.client, &namespace, &name, with_finalizer(&finalizers)).await?;
-        // The patch re-triggers reconcile; derivation proceeds below
-        // anyway so the first pass is not wasted.
     }
 
     // ---- 2.16b-sc Task 7: coverage-narrowing migration pause-gate ----
@@ -242,29 +240,73 @@ pub async fn reconcile(
     // the render+stamp (crash-ordering: derive → stamp → delete) — set only by
     // `ConsumeApply`.
     let mut consume_plan: Option<String> = None;
-    match decide(!candidates.is_empty(), state) {
-        MigrationDecision::Render => {
+    match gate_action(decide(!candidates.is_empty(), state), plan.as_ref()) {
+        GateAction::Derive => {
             // No change + no plan → derive normally, stamp the (possibly first)
             // baseline below.
         }
-        MigrationDecision::CreatePlan => {
-            let change = change
-                .clone()
-                .expect("CreatePlan implies a detected change");
-            let sc_uid = sc_uid_or(&cred)?;
-            let mp = SourceCredentialMigrationStrategy::create_plan_for(
-                &candidates,
-                &sc_plan_name(&name, Utc::now()),
-                &namespace,
-                &name,
-                sc_uid,
-            );
-            let plan_name = mp.name_any();
+        GateAction::CleanupThenDerive => {
+            // No change but a plan lingers (the user re-widened the spec → the
+            // destructive delta vanished) → delete the stale plan(s), then
+            // derive normally and re-stamp the baseline below.
             info!(
-                %name, %namespace, plan = %plan_name, trigger = %change.trigger_type,
-                "destructive coverage change detected — creating gating MigrationPlan, pausing both derivation halves"
+                %name, %namespace,
+                "no destructive coverage change but a stale MigrationPlan lingers — cleaning up before derive"
             );
-            ssa_apply_plan(&ctx.client, &namespace, &mp, &name).await?;
+            delete_sc_plans(&ctx.client, &namespace, &name).await?;
+        }
+        GateAction::ConsumeThenDerive { plan: completed } => {
+            // The change's plan completed (operator approved → the
+            // MigrationController drove it to `completed`) → consume: derive
+            // BOTH halves with the narrowed spec, stamp the new baseline, THEN
+            // delete the plan (crash-order derive → stamp → delete).
+            consume_plan = completed;
+            info!(
+                %name, %namespace, plan = ?consume_plan,
+                "MigrationPlan completed — consuming: deriving with narrowed coverage"
+            );
+        }
+        GateAction::Pause {
+            delete_stale,
+            create,
+            existing,
+            reason,
+        } => {
+            // Stay paused: derive NOTHING, so the old wider-coverage Secrets
+            // stay in place and in-flight apps keep clone / pull access.
+            // Resolve the uid BEFORE any write, so a (defensive) missing uid
+            // never leaves a deleted plan behind.
+            let sc_uid = if create {
+                Some(sc_uid_or(&cred)?.to_string())
+            } else {
+                None
+            };
+            if delete_stale {
+                delete_sc_plans(&ctx.client, &namespace, &name).await?;
+            }
+            let plan_name = match sc_uid {
+                Some(uid) => {
+                    let mp = SourceCredentialMigrationStrategy::create_plan_for(
+                        &candidates,
+                        &sc_plan_name(&name, Utc::now()),
+                        &namespace,
+                        &name,
+                        &uid,
+                    );
+                    let plan_name = mp.name_any();
+                    let trigger = change
+                        .as_ref()
+                        .map(|c| c.trigger_type.as_str())
+                        .unwrap_or("");
+                    info!(%name, %namespace, plan = %plan_name, %trigger, "{}", reason);
+                    ssa_apply_plan(&ctx.client, &namespace, &mp, &name).await?;
+                    plan_name
+                }
+                None => {
+                    info!(%name, %namespace, plan = %existing, "{}", reason);
+                    existing
+                }
+            };
             let status = build_paused_status(&cred, &namespace, &plan_name);
             patch_status(&ctx.client, &namespace, &name, &status).await?;
             ctx.metrics
@@ -275,78 +317,10 @@ pub async fn reconcile(
             // stay in place.
             return Ok(Action::requeue(Duration::from_secs(30)));
         }
-        MigrationDecision::NoOp => {
-            // Change + a matching blocking plan already gates → stay paused,
-            // derive nothing.
-            let plan_name = plan.as_ref().map(|p| p.name_any()).unwrap_or_default();
-            info!(
-                %name, %namespace, plan = %plan_name,
-                "coverage change already gated by a matching MigrationPlan — staying paused"
-            );
-            let status = build_paused_status(&cred, &namespace, &plan_name);
-            patch_status(&ctx.client, &namespace, &name, &status).await?;
-            ctx.metrics
-                .reconcile_total
-                .with_label_values(&[KIND, &namespace, "paused"])
-                .inc();
-            return Ok(Action::requeue(Duration::from_secs(30)));
-        }
-        MigrationDecision::DeleteThenCreate => {
-            // A lingering plan gates a DIFFERENT change (stale gate / relic /
-            // approval-hash mismatch) → delete every SC plan, then create the
-            // right one and stay paused.
-            let change = change
-                .clone()
-                .expect("DeleteThenCreate implies a detected change");
-            let sc_uid = sc_uid_or(&cred)?;
-            delete_sc_plans(&ctx.client, &namespace, &name).await?;
-            let mp = SourceCredentialMigrationStrategy::create_plan_for(
-                &candidates,
-                &sc_plan_name(&name, Utc::now()),
-                &namespace,
-                &name,
-                sc_uid,
-            );
-            let plan_name = mp.name_any();
-            info!(
-                %name, %namespace, plan = %plan_name, trigger = %change.trigger_type,
-                "superseding stale/relic MigrationPlan with a fresh gating plan — staying paused"
-            );
-            ssa_apply_plan(&ctx.client, &namespace, &mp, &name).await?;
-            let status = build_paused_status(&cred, &namespace, &plan_name);
-            patch_status(&ctx.client, &namespace, &name, &status).await?;
-            ctx.metrics
-                .reconcile_total
-                .with_label_values(&[KIND, &namespace, "paused"])
-                .inc();
-            return Ok(Action::requeue(Duration::from_secs(30)));
-        }
-        MigrationDecision::ConsumeApply => {
-            // The change's plan completed (operator approved → the
-            // MigrationController drove it to `completed`) → consume: derive
-            // BOTH halves with the narrowed spec, stamp the new baseline, THEN
-            // delete the plan (crash-order derive → stamp → delete).
-            consume_plan = plan.as_ref().and_then(|p| p.metadata.name.clone());
-            info!(
-                %name, %namespace, plan = ?consume_plan,
-                "MigrationPlan completed — consuming: deriving with narrowed coverage"
-            );
-        }
-        MigrationDecision::DeleteThenRender => {
-            // No change but a plan lingers (the user re-widened the spec → the
-            // destructive delta vanished) → delete the stale plan(s), then
-            // derive normally and re-stamp the baseline below.
-            info!(
-                %name, %namespace,
-                "no destructive coverage change but a stale MigrationPlan lingers — cleaning up before derive"
-            );
-            delete_sc_plans(&ctx.client, &namespace, &name).await?;
-        }
-        MigrationDecision::BlockFailed => {
+        GateAction::PauseFailed { plan: plan_name } => {
             // The change's plan is `failed` → keep gating; surface a
             // `MigrationFailed=True` condition requiring manual delete. Derive
             // nothing (both Secrets stay put).
-            let plan_name = plan.as_ref().map(|p| p.name_any()).unwrap_or_default();
             warn!(
                 %name, %namespace, plan = %plan_name,
                 "gating MigrationPlan is in phase=failed — staying paused, manual delete required"
@@ -376,148 +350,59 @@ pub async fn reconcile(
 
     // ---- git half → Argo repo-creds Secret(s) in `argocd` ----
     if let Some(git) = &cred.spec.git {
-        match &git.backend.sealed_secret_ref {
-            None => conditions.push(condition(
-                COND_GIT_PRESENT,
-                "Unknown",
-                REASON_UNVERIFIED,
-                "git backend uses openBaoPath; not derivable on Tier 1",
-                previous,
-            )),
-            Some(sealed_ref) => {
-                let material_ns = sealed_ref.namespace.clone().unwrap_or(namespace.clone());
-                match read_material(&ctx.client, &material_ns, &sealed_ref.name).await? {
-                    None => {
-                        conditions.push(condition(
-                            COND_GIT_PRESENT,
-                            "False",
-                            "MaterialMissing",
-                            &format!(
-                                "unsealed material Secret {material_ns}/{} not found yet",
-                                sealed_ref.name
-                            ),
-                            previous,
-                        ));
-                        pending = true;
-                    }
-                    Some((username, password)) => {
-                        let api: Api<Secret> =
-                            Api::namespaced(ctx.client.clone(), ARGOCD_NAMESPACE);
-                        for (idx, prefix) in git.repo_prefixes.iter().enumerate() {
-                            let url = normalize_repo_url(prefix);
-                            let secret_name = repo_cred_secret_name(&name, idx);
-                            let payload =
-                                repo_cred_payload(&secret_name, &url, &username, &password, &name);
-                            api.patch(&secret_name, &pp, &Patch::Apply(&payload))
-                                .await?;
-                            covered_prefixes.push(prefix.clone());
-                        }
-                        conditions.push(condition(
-                            COND_GIT_PRESENT,
-                            "True",
-                            "Derived",
-                            "Argo repo-creds Secret(s) derived from sealed material",
-                            previous,
-                        ));
-                        // Live reachability probe (S5): find a representative
-                        // repo covered by each prefix (from a matching Argo
-                        // Application) and probe it over git smart-HTTP.
-                        let normalized: Vec<String> = git
-                            .repo_prefixes
-                            .iter()
-                            .map(|p| normalize_repo_url(p))
-                            .collect();
-                        let (verdict, message) = validity::probe_git_half(
-                            &ctx.client,
-                            &normalized,
-                            &username,
-                            &password,
-                        )
-                        .await;
-                        if verdict != Validity::Unverified {
-                            last_validated = Some(Utc::now().to_rfc3339());
-                        }
-                        let (status, reason) = verdict.condition_parts();
-                        conditions.push(condition(
-                            COND_GIT_VALID,
-                            status,
-                            reason,
-                            &message,
-                            previous,
-                        ));
-                    }
-                }
+        let material = resolve_material(&ctx.client, &git.backend, &namespace).await?;
+        let half = git_half_plan(&name, git, &material, previous);
+        let api: Api<Secret> = Api::namespaced(ctx.client.clone(), ARGOCD_NAMESPACE);
+        for (secret_name, payload) in &half.secrets {
+            api.patch(secret_name, &pp, &Patch::Apply(payload)).await?;
+        }
+        covered_prefixes.extend(half.covered);
+        pending |= half.pending;
+        conditions.push(half.condition);
+        if let HalfMaterial::Present { username, password } = &material {
+            // Live reachability probe (S5): find a representative repo
+            // covered by each prefix (from a matching Argo Application) and
+            // probe it over git smart-HTTP.
+            let normalized: Vec<String> = git
+                .repo_prefixes
+                .iter()
+                .map(|p| normalize_repo_url(p))
+                .collect();
+            let (verdict, message) =
+                validity::probe_git_half(&ctx.client, &normalized, username, password).await;
+            let (cond, stamp) =
+                validity_outcome(COND_GIT_VALID, verdict, &message, previous, Utc::now());
+            if stamp.is_some() {
+                last_validated = stamp;
             }
+            conditions.push(cond);
         }
     }
 
     // ---- registry half → canonical dockerconfigjson in this ns ----
     if let Some(registry) = &cred.spec.registry {
-        match &registry.backend.sealed_secret_ref {
-            None => conditions.push(condition(
-                COND_REGISTRY_PRESENT,
-                "Unknown",
-                REASON_UNVERIFIED,
-                "registry backend uses openBaoPath; not derivable on Tier 1",
-                previous,
-            )),
-            Some(sealed_ref) => {
-                let material_ns = sealed_ref.namespace.clone().unwrap_or(namespace.clone());
-                match read_material(&ctx.client, &material_ns, &sealed_ref.name).await? {
-                    None => {
-                        conditions.push(condition(
-                            COND_REGISTRY_PRESENT,
-                            "False",
-                            "MaterialMissing",
-                            &format!(
-                                "unsealed material Secret {material_ns}/{} not found yet",
-                                sealed_ref.name
-                            ),
-                            previous,
-                        ));
-                        pending = true;
-                    }
-                    Some((username, password)) => {
-                        let dockercfg = dockerconfigjson(&registry.hosts, &username, &password);
-                        let secret_name = pull_secret_name(&name);
-                        let payload =
-                            dockercfg_payload(&secret_name, &namespace, &dockercfg, &name);
-                        let api: Api<Secret> = Api::namespaced(ctx.client.clone(), &namespace);
-                        api.patch(&secret_name, &pp, &Patch::Apply(&payload))
-                            .await?;
-                        covered_hosts.extend(registry.hosts.iter().cloned());
-                        conditions.push(condition(
-                            COND_REGISTRY_PRESENT,
-                            "True",
-                            "Derived",
-                            "dockerconfigjson pull-secret derived from sealed material",
-                            previous,
-                        ));
-                        // Live reachability probe (S5): find a representative
-                        // image covered by each host (from a matching
-                        // AppRafter Application) and probe it via a scoped
-                        // registry v2 token exchange.
-                        let (verdict, message) = validity::probe_registry_half(
-                            &ctx.client,
-                            &registry.hosts,
-                            &username,
-                            &password,
-                        )
-                        .await;
-                        if verdict != Validity::Unverified {
-                            last_validated = Some(Utc::now().to_rfc3339());
-                        }
-                        let (status, reason) = verdict.condition_parts();
-                        conditions.push(condition(
-                            COND_REGISTRY_VALID,
-                            status,
-                            reason,
-                            &message,
-                            previous,
-                        ));
-                    }
-                }
+        let material = resolve_material(&ctx.client, &registry.backend, &namespace).await?;
+        let half = registry_half_plan(&name, &namespace, registry, &material, previous);
+        let api: Api<Secret> = Api::namespaced(ctx.client.clone(), &namespace);
+        for (secret_name, payload) in &half.secrets {
+            api.patch(secret_name, &pp, &Patch::Apply(payload)).await?;
+        }
+        covered_hosts.extend(half.covered);
+        pending |= half.pending;
+        conditions.push(half.condition);
+        if let HalfMaterial::Present { username, password } = &material {
+            // Live reachability probe (S5): find a representative image
+            // covered by each host (from a matching AppRafter Application)
+            // and probe it via a scoped registry v2 token exchange.
+            let (verdict, message) =
+                validity::probe_registry_half(&ctx.client, &registry.hosts, username, password)
+                    .await;
+            let (cond, stamp) =
+                validity_outcome(COND_REGISTRY_VALID, verdict, &message, previous, Utc::now());
+            if stamp.is_some() {
+                last_validated = stamp;
             }
+            conditions.push(cond);
         }
     }
 
@@ -531,11 +416,7 @@ pub async fn reconcile(
     // material is still unsealing would move the baseline without the gate ever
     // running its full derivation. Carrying (never `None`) also avoids the
     // SSA-prune self-cancel: the field manager keeps ownership of the field.
-    let stamped_baseline = if pending {
-        old_spec.clone()
-    } else {
-        Some(cred.spec.clone())
-    };
+    let stamped_baseline = stamp_baseline(pending, old_spec.as_ref(), &cred.spec);
     patch_status(
         &ctx.client,
         &namespace,
@@ -564,16 +445,12 @@ pub async fn reconcile(
         }
     }
 
-    let outcome = if pending { "pending" } else { "ok" };
+    let (outcome, requeue) = reconcile_outcome(pending);
     ctx.metrics
         .reconcile_total
         .with_label_values(&[KIND, &namespace, outcome])
         .inc();
-    Ok(Action::requeue(Duration::from_secs(if pending {
-        15
-    } else {
-        60
-    })))
+    Ok(Action::requeue(requeue))
 }
 
 pub fn error_policy(
@@ -625,19 +502,34 @@ async fn gc_derived_secrets(
     // sweep follows the label wherever it went. `cred_namespace` is no
     // longer read for this reason — the selector is namespace-agnostic.
     let _ = cred_namespace;
-    let selector = format!("{SOURCE_CREDENTIAL_LABEL}={name}");
     let all: Api<Secret> = Api::all(client.clone());
-    let lp = ListParams::default().labels(&selector);
-    for secret in all.list(&lp).await? {
-        let (Some(secret_name), Some(ns)) = (secret.metadata.name, secret.metadata.namespace)
-        else {
-            continue;
-        };
+    let lp = ListParams::default().labels(&derived_secret_selector(name));
+    for (ns, secret_name) in secret_delete_targets(all.list(&lp).await?.items) {
         let api: Api<Secret> = Api::namespaced(client.clone(), &ns);
         // ignore "already gone" so re-runs after a partial delete converge
         let _ = api.delete(&secret_name, &DeleteParams::default()).await;
     }
     Ok(())
+}
+
+/// Pure: the cluster-wide label selector for every Secret derived from
+/// this SourceCredential. Namespace-agnostic ON PURPOSE — the Application
+/// controller projects pull-secret copies into workload namespaces this
+/// function cannot enumerate, and deleting the PAT must revoke all of
+/// them.
+fn derived_secret_selector(cred_name: &str) -> String {
+    format!("{SOURCE_CREDENTIAL_LABEL}={cred_name}")
+}
+
+/// Pure: the `(namespace, name)` coordinates to delete from a labelled
+/// Secret list. An entry missing either coordinate cannot be addressed and
+/// is skipped rather than aborting the sweep — one unaddressable Secret
+/// must not leave the remaining derived credentials live.
+fn secret_delete_targets(secrets: Vec<Secret>) -> Vec<(String, String)> {
+    secrets
+        .into_iter()
+        .filter_map(|secret| Some((secret.metadata.namespace?, secret.metadata.name?)))
+        .collect()
 }
 
 /// Merge-patch the SourceCredential's `metadata.finalizers` to `list`.
@@ -652,6 +544,22 @@ async fn set_finalizers(
     api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
         .await?;
     Ok(())
+}
+
+/// Pure: the `metadata.finalizers` list to patch this pass, or `None`
+/// when the list is already what it should be (no patch → no self-inflicted
+/// reconcile). A live SourceCredential must CARRY our finalizer — without
+/// it a delete cascades past this controller and the derived Secrets
+/// (cross-namespace, so no ownerReference can reach them) leak as working
+/// credentials. A deleting one gets it REMOVED, which the caller does only
+/// after the GC sweep succeeded.
+fn finalizer_patch(deleting: bool, finalizers: &[String]) -> Option<Vec<String>> {
+    let ours = finalizers.iter().any(|f| f == DERIVED_SECRETS_FINALIZER);
+    match (deleting, ours) {
+        (true, true) => Some(without_finalizer(finalizers)),
+        (false, false) => Some(with_finalizer(finalizers)),
+        _ => None,
+    }
 }
 
 /// `current` with our finalizer appended (idempotent — caller checks
@@ -684,7 +592,20 @@ async fn read_material(
     let Some(secret) = api.get_opt(name).await? else {
         return Ok(None);
     };
-    let data = secret.data.unwrap_or_default();
+    Ok(Some(material_from_data(&secret.data.unwrap_or_default())))
+}
+
+/// Pure: decode `(username, password)` out of the unsealed material
+/// Secret's `data`. A missing OR EMPTY `username` falls back to
+/// [`DEFAULT_GIT_USERNAME`] — GitHub (and friends) accept any non-empty
+/// username with a PAT password, and Basic auth with an empty username is
+/// rejected outright, so the fallback is what makes a `password`-only
+/// material work. A missing `password` decodes to the empty string rather
+/// than erroring: the derived Secret is still written and the live probe
+/// is what reports the credential as rejected.
+fn material_from_data(
+    data: &std::collections::BTreeMap<String, k8s_openapi::ByteString>,
+) -> (String, String) {
     let username = data
         .get(MATERIAL_USERNAME_KEY)
         .map(|b| String::from_utf8_lossy(&b.0).into_owned())
@@ -694,7 +615,45 @@ async fn read_material(
         .get(MATERIAL_PASSWORD_KEY)
         .map(|b| String::from_utf8_lossy(&b.0).into_owned())
         .unwrap_or_default();
-    Ok(Some((username, password)))
+    (username, password)
+}
+
+/// The credential material one half resolved to, before anything is
+/// derived from it. The three cases are exactly the three `*Present`
+/// conditions the half can report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HalfMaterial {
+    /// The backend points at OpenBao — not derivable on Tier 1.
+    OpenBao,
+    /// The sealed material has not been unsealed into a Secret yet;
+    /// `location` is the `namespace/name` we looked for.
+    Missing { location: String },
+    /// Material read.
+    Present { username: String, password: String },
+}
+
+/// Resolve one half's backend into its [`HalfMaterial`]: no
+/// `sealedSecretRef` means OpenBao (nothing to read), otherwise read the
+/// unsealed Secret from the ref's namespace (defaulting to the
+/// SourceCredential's own).
+async fn resolve_material(
+    client: &Client,
+    backend: &SourceBackend,
+    cred_namespace: &str,
+) -> Result<HalfMaterial, ReconcileError> {
+    let Some(sealed_ref) = &backend.sealed_secret_ref else {
+        return Ok(HalfMaterial::OpenBao);
+    };
+    let material_ns = sealed_ref
+        .namespace
+        .clone()
+        .unwrap_or_else(|| cred_namespace.to_string());
+    match read_material(client, &material_ns, &sealed_ref.name).await? {
+        None => Ok(HalfMaterial::Missing {
+            location: format!("{material_ns}/{}", sealed_ref.name),
+        }),
+        Some((username, password)) => Ok(HalfMaterial::Present { username, password }),
+    }
 }
 
 async fn patch_status(
@@ -817,6 +776,199 @@ fn dockercfg_payload(
     })
 }
 
+/// Everything ONE half derives, decided purely from its spec + the
+/// resolved material. `reconcile` performs exactly the I/O this names and
+/// makes no derivation decision of its own — which is what lets the whole
+/// derivation be tested without a cluster.
+#[derive(Debug, Clone, PartialEq)]
+struct HalfPlan {
+    /// The `*Present` condition to report for this half.
+    condition: SourceCredentialCondition,
+    /// `(secret_name, SSA payload)` to server-side apply, in coverage order.
+    secrets: Vec<(String, Value)>,
+    /// The coverage entries this half actually derived for (empty unless
+    /// the Secrets below were written).
+    covered: Vec<String>,
+    /// The material is still unsealing — nothing was derived, so the caller
+    /// must NOT stamp a new migration baseline and must requeue fast.
+    pending: bool,
+}
+
+/// Pure: the git half's derivation — one Argo CD `repo-creds` Secret per
+/// `repoPrefixes` entry, in spec order. Coverage is only claimed on the
+/// `Present` arm: an unsealed-yet material derives nothing and reports
+/// `pending`, and an OpenBao backend is not derivable on Tier 1 at all
+/// (`Unknown`, never `False` — it is not an error, just out of scope).
+fn git_half_plan(
+    cred_name: &str,
+    git: &SourceGit,
+    material: &HalfMaterial,
+    previous: &[SourceCredentialCondition],
+) -> HalfPlan {
+    match material {
+        HalfMaterial::OpenBao => HalfPlan {
+            condition: condition(
+                COND_GIT_PRESENT,
+                "Unknown",
+                REASON_UNVERIFIED,
+                "git backend uses openBaoPath; not derivable on Tier 1",
+                previous,
+            ),
+            secrets: Vec::new(),
+            covered: Vec::new(),
+            pending: false,
+        },
+        HalfMaterial::Missing { location } => HalfPlan {
+            condition: condition(
+                COND_GIT_PRESENT,
+                "False",
+                "MaterialMissing",
+                &format!("unsealed material Secret {location} not found yet"),
+                previous,
+            ),
+            secrets: Vec::new(),
+            covered: Vec::new(),
+            pending: true,
+        },
+        HalfMaterial::Present { username, password } => {
+            let secrets = git
+                .repo_prefixes
+                .iter()
+                .enumerate()
+                .map(|(idx, prefix)| {
+                    let secret_name = repo_cred_secret_name(cred_name, idx);
+                    let payload = repo_cred_payload(
+                        &secret_name,
+                        &normalize_repo_url(prefix),
+                        username,
+                        password,
+                        cred_name,
+                    );
+                    (secret_name, payload)
+                })
+                .collect();
+            HalfPlan {
+                condition: condition(
+                    COND_GIT_PRESENT,
+                    "True",
+                    "Derived",
+                    "Argo repo-creds Secret(s) derived from sealed material",
+                    previous,
+                ),
+                secrets,
+                covered: git.repo_prefixes.clone(),
+                pending: false,
+            }
+        }
+    }
+}
+
+/// Pure: the registry half's derivation — the single canonical
+/// `dockerconfigjson` Secret in the credential's own namespace, covering
+/// every `hosts` entry. Same three-arm shape as [`git_half_plan`].
+fn registry_half_plan(
+    cred_name: &str,
+    cred_namespace: &str,
+    registry: &SourceRegistry,
+    material: &HalfMaterial,
+    previous: &[SourceCredentialCondition],
+) -> HalfPlan {
+    match material {
+        HalfMaterial::OpenBao => HalfPlan {
+            condition: condition(
+                COND_REGISTRY_PRESENT,
+                "Unknown",
+                REASON_UNVERIFIED,
+                "registry backend uses openBaoPath; not derivable on Tier 1",
+                previous,
+            ),
+            secrets: Vec::new(),
+            covered: Vec::new(),
+            pending: false,
+        },
+        HalfMaterial::Missing { location } => HalfPlan {
+            condition: condition(
+                COND_REGISTRY_PRESENT,
+                "False",
+                "MaterialMissing",
+                &format!("unsealed material Secret {location} not found yet"),
+                previous,
+            ),
+            secrets: Vec::new(),
+            covered: Vec::new(),
+            pending: true,
+        },
+        HalfMaterial::Present { username, password } => {
+            let dockercfg = dockerconfigjson(&registry.hosts, username, password);
+            let secret_name = pull_secret_name(cred_name);
+            let payload = dockercfg_payload(&secret_name, cred_namespace, &dockercfg, cred_name);
+            HalfPlan {
+                condition: condition(
+                    COND_REGISTRY_PRESENT,
+                    "True",
+                    "Derived",
+                    "dockerconfigjson pull-secret derived from sealed material",
+                    previous,
+                ),
+                secrets: vec![(secret_name, payload)],
+                covered: registry.hosts.clone(),
+                pending: false,
+            }
+        }
+    }
+}
+
+/// Pure: the `*Valid` condition for a probe verdict, plus the
+/// `status.lastValidated` stamp it contributes.
+///
+/// Only a CONCLUDED verdict (`Valid` / `Invalid`) stamps the time.
+/// `Unverified` — what a network-less cluster reports for every reconcile,
+/// forever — must NOT move the timestamp, otherwise `lastValidated` would
+/// advance on passes that validated nothing and the operator could no
+/// longer tell when the credential was last actually proven.
+fn validity_outcome(
+    type_: &str,
+    verdict: Validity,
+    message: &str,
+    previous: &[SourceCredentialCondition],
+    now: DateTime<Utc>,
+) -> (SourceCredentialCondition, Option<String>) {
+    let (status, reason) = verdict.condition_parts();
+    let stamp = (verdict != Validity::Unverified).then(|| now.to_rfc3339());
+    (condition(type_, status, reason, message, previous), stamp)
+}
+
+/// Pure: the migration baseline to stamp after a render pass. On a clean
+/// derive the CURRENT spec becomes the baseline; while a half is still
+/// `pending` (material unsealing) nothing was derived, so the PRIOR
+/// baseline is carried forward — stamping the possibly-narrowed new spec
+/// there would move the baseline without the gate ever running, silently
+/// dropping a coverage narrowing past the MigrationPlan. Carrying (never
+/// `None`) also keeps the field manager's ownership so SSA does not prune
+/// the field.
+fn stamp_baseline(
+    pending: bool,
+    old_spec: Option<&SourceCredentialSpec>,
+    current: &SourceCredentialSpec,
+) -> Option<SourceCredentialSpec> {
+    if pending {
+        old_spec.cloned()
+    } else {
+        Some(current.clone())
+    }
+}
+
+/// Pure: the metric outcome label + requeue delay for a render pass. A
+/// half still waiting on its material requeues fast (15s) so rotation /
+/// first unseal is picked up promptly; a settled credential polls at 60s.
+fn reconcile_outcome(pending: bool) -> (&'static str, Duration) {
+    if pending {
+        ("pending", Duration::from_secs(15))
+    } else {
+        ("ok", Duration::from_secs(60))
+    }
+}
+
 fn build_status(
     conditions: Vec<SourceCredentialCondition>,
     covered_prefixes: Vec<String>,
@@ -891,6 +1043,76 @@ fn sc_plan_name(sc_name: &str, now: DateTime<Utc>) -> String {
     out
 }
 
+/// What the migration gate wants done this pass. Separating the DECISION
+/// (pure, below) from its execution (the cluster writes in `reconcile`)
+/// makes every arm — including the three that differ only in whether a
+/// plan is created and whether a stale one is superseded first — testable
+/// without a cluster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GateAction {
+    /// Derive normally and stamp the baseline.
+    Derive,
+    /// No destructive change, but a stale plan lingers: GC every SC-scope
+    /// plan first, then derive.
+    CleanupThenDerive,
+    /// The gating plan completed: derive with the narrowed coverage, stamp,
+    /// THEN delete the named plan (crash-order derive → stamp → delete).
+    ConsumeThenDerive { plan: Option<String> },
+    /// Stay paused, deriving nothing. `create` (re)creates the gating plan;
+    /// `delete_stale` supersedes a mismatched/relic plan first; `existing`
+    /// names the plan already gating when `create` is false.
+    Pause {
+        delete_stale: bool,
+        create: bool,
+        existing: String,
+        reason: &'static str,
+    },
+    /// The gating plan is `failed`: stay paused with `MigrationFailed=True`
+    /// until an operator deletes it by hand.
+    PauseFailed { plan: String },
+}
+
+/// Pure: map the migration state machine's [`MigrationDecision`] onto the
+/// action this controller takes, resolving the gating plan's name from the
+/// live plan. Only `ConsumeApply` and the paused arms need the plan; the
+/// render arms ignore it.
+fn gate_action(decision: MigrationDecision, plan: Option<&MigrationPlan>) -> GateAction {
+    let named = || plan.map(|p| p.name_any()).unwrap_or_default();
+    match decision {
+        MigrationDecision::Render => GateAction::Derive,
+        MigrationDecision::DeleteThenRender => GateAction::CleanupThenDerive,
+        MigrationDecision::ConsumeApply => GateAction::ConsumeThenDerive {
+            plan: plan.and_then(|p| p.metadata.name.clone()),
+        },
+        MigrationDecision::CreatePlan => GateAction::Pause {
+            delete_stale: false,
+            create: true,
+            existing: String::new(),
+            reason: "destructive coverage change detected — creating gating MigrationPlan, pausing both derivation halves",
+        },
+        MigrationDecision::DeleteThenCreate => GateAction::Pause {
+            delete_stale: true,
+            create: true,
+            existing: String::new(),
+            reason: "superseding stale/relic MigrationPlan with a fresh gating plan — staying paused",
+        },
+        MigrationDecision::NoOp => GateAction::Pause {
+            delete_stale: false,
+            create: false,
+            existing: named(),
+            reason: "coverage change already gated by a matching MigrationPlan — staying paused",
+        },
+        MigrationDecision::BlockFailed => GateAction::PauseFailed { plan: named() },
+    }
+}
+
+/// Pure: the label selector narrowing a list to this credential's SC-scope
+/// MigrationPlans. Shared by the finder and the deleter so they can never
+/// drift apart.
+fn sc_plan_selector(sc_name: &str) -> String {
+    format!("{SCOPE_LABEL}={SCOPE_SOURCECREDENTIAL},{SOURCE_CREDENTIAL_LABEL}={sc_name}")
+}
+
 /// Pure: pick the (≤1) SC-scope MigrationPlan for `sc_name` from a list. Matches
 /// on the `sourcecredential` scope discriminator + the plan's
 /// `scope.sourcecredential.ref.name`, ignoring plans for other credentials (or
@@ -920,9 +1142,7 @@ async fn find_sc_plan(
     sc_name: &str,
 ) -> Result<Option<MigrationPlan>, ReconcileError> {
     let api: Api<MigrationPlan> = Api::namespaced(client.clone(), sc_namespace);
-    let selector =
-        format!("{SCOPE_LABEL}={SCOPE_SOURCECREDENTIAL},{SOURCE_CREDENTIAL_LABEL}={sc_name}");
-    let lp = ListParams::default().labels(&selector);
+    let lp = ListParams::default().labels(&sc_plan_selector(sc_name));
     let list = api.list(&lp).await?;
     Ok(pick_sc_plan(list.items, sc_name))
 }
@@ -969,25 +1189,9 @@ async fn delete_sc_plans(
     sc_name: &str,
 ) -> Result<(), ReconcileError> {
     let api: Api<MigrationPlan> = Api::namespaced(client.clone(), sc_namespace);
-    let selector =
-        format!("{SCOPE_LABEL}={SCOPE_SOURCECREDENTIAL},{SOURCE_CREDENTIAL_LABEL}={sc_name}");
-    let lp = ListParams::default().labels(&selector);
-    for plan in api.list(&lp).await?.items {
-        // Belt-and-braces exact scope match — a stray label shouldn't delete a
-        // different credential's plan.
-        if plan
-            .spec
-            .scope
-            .sourcecredential
-            .as_ref()
-            .is_none_or(|s| s.ref_.name != sc_name)
-        {
-            continue;
-        }
-        let Some(plan_name) = plan.metadata.name.as_deref() else {
-            continue;
-        };
-        match api.delete(plan_name, &DeleteParams::default()).await {
+    let lp = ListParams::default().labels(&sc_plan_selector(sc_name));
+    for plan_name in sc_plans_to_delete(api.list(&lp).await?.items, sc_name) {
+        match api.delete(&plan_name, &DeleteParams::default()).await {
             Ok(_) => {
                 info!(%sc_name, plan = %plan_name, "deleted superseded/consumed MigrationPlan")
             }
@@ -996,6 +1200,26 @@ async fn delete_sc_plans(
         }
     }
     Ok(())
+}
+
+/// Pure: the names to delete from a label-selected plan list. Belt-and-braces
+/// exact scope match on top of the selector — a stray
+/// `apprafter.io/source-credential` label (hand-written, or copied from
+/// another credential's plan) must never make this controller delete a
+/// DIFFERENT credential's gate. A plan with no `metadata.name` cannot be
+/// addressed and is skipped.
+fn sc_plans_to_delete(plans: Vec<MigrationPlan>, sc_name: &str) -> Vec<String> {
+    plans
+        .into_iter()
+        .filter(|plan| {
+            plan.spec
+                .scope
+                .sourcecredential
+                .as_ref()
+                .is_some_and(|s| s.ref_.name == sc_name)
+        })
+        .filter_map(|plan| plan.metadata.name)
+        .collect()
 }
 
 /// Build the paused status for the `CreatePlan` / `NoOp` / `DeleteThenCreate`
@@ -1430,6 +1654,26 @@ mod tests {
         assert!(folded.starts_with("team-a-creds-migration-"));
     }
 
+    /// `metadata.name` is capped at 63 characters and may not end in `-`,
+    /// so a long credential name must be TRUNCATED (and re-trimmed after
+    /// truncation) — an over-long name is rejected by the apiserver, which
+    /// would leave a destructive coverage change permanently ungatable.
+    #[test]
+    fn sc_plan_name_truncates_to_a_valid_dns_1123_name() {
+        let now = DateTime::parse_from_rfc3339("2026-07-17T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let long = "a".repeat(80);
+        let name = sc_plan_name(&long, now);
+        assert_eq!(name.len(), 63);
+        assert!(!name.ends_with('-'));
+        // Truncation must cut the SUFFIX, keeping the credential-derived head.
+        assert!(name.starts_with(&"a".repeat(63)));
+        // A name that truncates onto a separator gets the separator trimmed.
+        let trailing = sc_plan_name(&format!("{}-", "b".repeat(62)), now);
+        assert!(!trailing.ends_with('-'));
+    }
+
     #[test]
     fn pick_sc_plan_selects_this_creds_plan_and_ignores_others() {
         let mine = sc_plan(
@@ -1690,6 +1934,589 @@ mod tests {
         assert_eq!(s.covered_repo_prefixes.unwrap(), vec!["github.com/acme/"]);
         assert_eq!(s.covered_hosts.unwrap(), vec!["ghcr.io/acme/"]);
         assert!(s.last_validated.is_some());
+    }
+
+    // ---------------- derivation: what each half writes ----------------
+
+    fn present() -> HalfMaterial {
+        HalfMaterial::Present {
+            username: "git".to_string(),
+            password: "ghp_x".to_string(),
+        }
+    }
+
+    fn git_of(spec: &SourceCredentialSpec) -> SourceGit {
+        spec.git.clone().expect("git half")
+    }
+
+    fn registry_of(spec: &SourceCredentialSpec) -> SourceRegistry {
+        spec.registry.clone().expect("registry half")
+    }
+
+    /// The git half derives ONE Argo `repo-creds` Secret PER prefix — Argo
+    /// matches a clone against a single `url` per Secret, so collapsing two
+    /// prefixes into one Secret would silently drop coverage of the second.
+    /// Pins the per-index naming, the normalised URL, and that the claimed
+    /// coverage is exactly the spec's prefixes.
+    #[test]
+    fn git_half_plan_derives_one_repo_cred_secret_per_prefix() {
+        let spec = sc_spec(&["github.com/acme/", "https://gitlab.com/acme"], &[]);
+        let plan = git_half_plan("acme", &git_of(&spec), &present(), &[]);
+
+        let names: Vec<&str> = plan.secrets.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["srccred-acme-repo-0", "srccred-acme-repo-1"]);
+        assert_eq!(
+            plan.secrets[0].1["stringData"]["url"],
+            "https://github.com/acme"
+        );
+        assert_eq!(
+            plan.secrets[1].1["stringData"]["url"],
+            "https://gitlab.com/acme"
+        );
+        assert_eq!(plan.secrets[0].1["stringData"]["password"], "ghp_x");
+        assert_eq!(
+            plan.covered,
+            vec!["github.com/acme/", "https://gitlab.com/acme"]
+        );
+        assert!(!plan.pending);
+        assert_eq!(plan.condition.type_, COND_GIT_PRESENT);
+        assert_eq!(plan.condition.status, "True");
+        assert_eq!(plan.condition.reason.as_deref(), Some("Derived"));
+    }
+
+    /// Material still unsealing: NOTHING may be derived and NO coverage may
+    /// be claimed — `coveredRepoPrefixes` is what the CLI reports as live
+    /// coverage, and `pending` is what stops the caller from stamping the
+    /// migration baseline for a derive that never happened.
+    #[test]
+    fn git_half_plan_derives_nothing_while_material_is_missing() {
+        let spec = sc_spec(&["github.com/acme/"], &[]);
+        let plan = git_half_plan(
+            "acme",
+            &git_of(&spec),
+            &HalfMaterial::Missing {
+                location: "apprafter-system/srccred-acme-material".to_string(),
+            },
+            &[],
+        );
+        assert!(plan.secrets.is_empty());
+        assert!(plan.covered.is_empty());
+        assert!(plan.pending);
+        assert_eq!(plan.condition.status, "False");
+        assert_eq!(plan.condition.reason.as_deref(), Some("MaterialMissing"));
+        // The message names WHERE we looked, so the operator can fix the ref.
+        assert!(plan
+            .condition
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("apprafter-system/srccred-acme-material"));
+    }
+
+    /// An OpenBao backend is out of scope on Tier 1, not broken: the half
+    /// reports `Unknown`/`Unverified` and — critically — is NOT `pending`,
+    /// so the reconcile still stamps its migration baseline and the
+    /// credential does not requeue at the fast pending interval forever.
+    #[test]
+    fn git_half_plan_openbao_is_unknown_and_not_pending() {
+        let spec = sc_spec(&["github.com/acme/"], &[]);
+        let plan = git_half_plan("acme", &git_of(&spec), &HalfMaterial::OpenBao, &[]);
+        assert!(plan.secrets.is_empty());
+        assert!(plan.covered.is_empty());
+        assert!(!plan.pending);
+        assert_eq!(plan.condition.status, "Unknown");
+        assert_eq!(plan.condition.reason.as_deref(), Some(REASON_UNVERIFIED));
+    }
+
+    /// The registry half derives exactly ONE canonical `dockerconfigjson`
+    /// covering every host (the Application controller projects copies of
+    /// that one Secret), in the credential's OWN namespace — not `argocd`.
+    #[test]
+    fn registry_half_plan_derives_one_dockerconfigjson_for_every_host() {
+        let spec = sc_spec(&[], &["ghcr.io/acme/", "registry.gitlab.com/acme/"]);
+        let plan = registry_half_plan(
+            "acme",
+            "apprafter-system",
+            &registry_of(&spec),
+            &present(),
+            &[],
+        );
+        assert_eq!(plan.secrets.len(), 1);
+        let (name, payload) = &plan.secrets[0];
+        assert_eq!(name, "srccred-acme-dockercfg");
+        assert_eq!(payload["metadata"]["namespace"], "apprafter-system");
+        assert_eq!(payload["type"], "kubernetes.io/dockerconfigjson");
+        let body: serde_json::Value =
+            serde_json::from_str(payload["stringData"][".dockerconfigjson"].as_str().unwrap())
+                .unwrap();
+        let auths = body["auths"].as_object().unwrap();
+        assert_eq!(auths.len(), 2);
+        assert!(auths.contains_key("ghcr.io"));
+        assert!(auths.contains_key("registry.gitlab.com"));
+        assert_eq!(
+            plan.covered,
+            vec!["ghcr.io/acme/", "registry.gitlab.com/acme/"]
+        );
+        assert!(!plan.pending);
+        assert_eq!(plan.condition.type_, COND_REGISTRY_PRESENT);
+        assert_eq!(plan.condition.status, "True");
+    }
+
+    /// Registry half, material still unsealing / OpenBao: same contract as
+    /// the git half — no Secret, no coverage claimed, `pending` only for the
+    /// unsealing case.
+    #[test]
+    fn registry_half_plan_derives_nothing_without_material() {
+        let spec = sc_spec(&[], &["ghcr.io/acme/"]);
+        let missing = registry_half_plan(
+            "acme",
+            "apprafter-system",
+            &registry_of(&spec),
+            &HalfMaterial::Missing {
+                location: "apprafter-system/srccred-acme-material".to_string(),
+            },
+            &[],
+        );
+        assert!(missing.secrets.is_empty());
+        assert!(missing.covered.is_empty());
+        assert!(missing.pending);
+        assert_eq!(missing.condition.status, "False");
+
+        let openbao = registry_half_plan(
+            "acme",
+            "apprafter-system",
+            &registry_of(&spec),
+            &HalfMaterial::OpenBao,
+            &[],
+        );
+        assert!(openbao.secrets.is_empty());
+        assert!(!openbao.pending);
+        assert_eq!(openbao.condition.status, "Unknown");
+    }
+
+    // ---------------- probe verdict → condition + lastValidated ----------------
+
+    /// `status.lastValidated` means "when the credential was last actually
+    /// PROVEN". Only a concluded verdict may stamp it: `Unverified` is the
+    /// steady state of every network-less / restricted-egress cluster, and
+    /// stamping it would make `lastValidated` advance every 60s while
+    /// nothing was ever validated.
+    #[test]
+    fn validity_outcome_stamps_only_a_concluded_verdict() {
+        let now = DateTime::parse_from_rfc3339("2026-07-17T10:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let (cond, stamp) = validity_outcome(COND_GIT_VALID, Validity::Unverified, "m", &[], now);
+        assert_eq!(stamp, None);
+        assert_eq!(cond.status, "Unknown");
+        assert_eq!(cond.reason.as_deref(), Some(REASON_UNVERIFIED));
+
+        let (cond, stamp) = validity_outcome(COND_GIT_VALID, Validity::Valid, "m", &[], now);
+        assert_eq!(stamp.as_deref(), Some("2026-07-17T10:00:00+00:00"));
+        assert_eq!(cond.status, "True");
+
+        let (cond, stamp) = validity_outcome(COND_REGISTRY_VALID, Validity::Invalid, "m", &[], now);
+        assert!(stamp.is_some());
+        assert_eq!(cond.type_, COND_REGISTRY_VALID);
+        assert_eq!(cond.status, "False");
+        assert_eq!(cond.message.as_deref(), Some("m"));
+    }
+
+    // ---------------- render-path tail ----------------
+
+    /// A coverage-narrowing edit made WHILE the material is still unsealing
+    /// must not move the migration baseline: nothing was derived, so
+    /// stamping the narrowed spec would let the narrowing slip past the
+    /// MigrationPlan gate on the next pass (detection compares against the
+    /// baseline). Carrying the prior baseline forward also keeps the SSA
+    /// field manager's ownership so the field is not pruned.
+    #[test]
+    fn stamp_baseline_carries_the_prior_spec_while_pending() {
+        let wide = sc_spec(&["github.com/acme/", "github.com/acme-labs/"], &[]);
+        let narrow = sc_spec(&["github.com/acme/"], &[]);
+        assert_eq!(
+            stamp_baseline(true, Some(&wide), &narrow).as_ref(),
+            Some(&wide)
+        );
+        assert_eq!(
+            stamp_baseline(false, Some(&wide), &narrow).as_ref(),
+            Some(&narrow)
+        );
+        // No prior baseline + still pending → nothing to carry.
+        assert_eq!(stamp_baseline(true, None, &narrow), None);
+    }
+
+    /// A half waiting on its material must be re-checked fast (the sealed
+    /// secret usually materialises within seconds); a settled credential
+    /// polls slowly so rotation is picked up without hammering the
+    /// apiserver.
+    #[test]
+    fn reconcile_outcome_requeues_faster_while_pending() {
+        assert_eq!(
+            reconcile_outcome(true),
+            ("pending", Duration::from_secs(15))
+        );
+        assert_eq!(reconcile_outcome(false), ("ok", Duration::from_secs(60)));
+    }
+
+    /// Basic auth with an empty username is rejected by git hosts, so a
+    /// material carrying only a PAT must fall back to a non-empty username
+    /// — for both the MISSING and the EMPTY-STRING case.
+    #[test]
+    fn material_from_data_falls_back_to_a_non_empty_username() {
+        use k8s_openapi::ByteString;
+        let data = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), ByteString(v.as_bytes().to_vec())))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            material_from_data(&data(&[("username", "acme-bot"), ("password", "ghp_x")])),
+            ("acme-bot".to_string(), "ghp_x".to_string())
+        );
+        assert_eq!(
+            material_from_data(&data(&[("password", "ghp_x")])),
+            (DEFAULT_GIT_USERNAME.to_string(), "ghp_x".to_string())
+        );
+        assert_eq!(
+            material_from_data(&data(&[("username", ""), ("password", "ghp_x")])),
+            (DEFAULT_GIT_USERNAME.to_string(), "ghp_x".to_string())
+        );
+        // A material with no password still decodes — the live probe, not
+        // this decoder, is what reports the credential as rejected.
+        assert_eq!(
+            material_from_data(&data(&[("username", "acme-bot")])),
+            ("acme-bot".to_string(), String::new())
+        );
+    }
+
+    // ---------------- gate action (decision → work) ----------------
+
+    /// Every migration decision maps to exactly one action. The three
+    /// PAUSED decisions differ ONLY in whether a plan is created and
+    /// whether a stale one is superseded first — getting that pair wrong
+    /// either leaves the credential ungated (deriving the narrowed
+    /// coverage without approval) or spams a fresh plan every 30s.
+    #[test]
+    fn gate_action_maps_every_decision() {
+        let plan = sc_plan(
+            "acme",
+            "coverage-removal",
+            "spec.git.repoPrefixes",
+            Some("pending-approval"),
+            None,
+        );
+        assert_eq!(
+            gate_action(MigrationDecision::Render, None),
+            GateAction::Derive
+        );
+        assert_eq!(
+            gate_action(MigrationDecision::DeleteThenRender, Some(&plan)),
+            GateAction::CleanupThenDerive
+        );
+        assert_eq!(
+            gate_action(MigrationDecision::ConsumeApply, Some(&plan)),
+            GateAction::ConsumeThenDerive {
+                plan: Some("acme-migration-1".to_string())
+            }
+        );
+        match gate_action(MigrationDecision::CreatePlan, None) {
+            GateAction::Pause {
+                delete_stale,
+                create,
+                ..
+            } => {
+                assert!(create, "CreatePlan must create the gating plan");
+                assert!(!delete_stale, "there is no stale plan to supersede");
+            }
+            other => panic!("CreatePlan must pause: {other:?}"),
+        }
+        match gate_action(MigrationDecision::DeleteThenCreate, Some(&plan)) {
+            GateAction::Pause {
+                delete_stale,
+                create,
+                ..
+            } => {
+                assert!(delete_stale, "the mismatched plan must be superseded");
+                assert!(create, "…and replaced by a fresh gating plan");
+            }
+            other => panic!("DeleteThenCreate must pause: {other:?}"),
+        }
+        match gate_action(MigrationDecision::NoOp, Some(&plan)) {
+            GateAction::Pause {
+                delete_stale,
+                create,
+                existing,
+                ..
+            } => {
+                assert!(
+                    !create,
+                    "a matching plan already gates — do not create another"
+                );
+                assert!(!delete_stale);
+                assert_eq!(existing, "acme-migration-1");
+            }
+            other => panic!("NoOp must pause: {other:?}"),
+        }
+        assert_eq!(
+            gate_action(MigrationDecision::BlockFailed, Some(&plan)),
+            GateAction::PauseFailed {
+                plan: "acme-migration-1".to_string()
+            }
+        );
+    }
+
+    /// `ConsumeApply` without a live plan (it vanished between the list and
+    /// the decision) must consume nothing rather than name a phantom plan
+    /// for deletion.
+    #[test]
+    fn gate_action_consume_without_a_plan_names_nothing() {
+        assert_eq!(
+            gate_action(MigrationDecision::ConsumeApply, None),
+            GateAction::ConsumeThenDerive { plan: None }
+        );
+    }
+
+    // ---------------- GC selection ----------------
+
+    /// The derived-Secret sweep is CLUSTER-WIDE by label: the Application
+    /// controller projects pull-secret copies into workload namespaces this
+    /// controller cannot enumerate, and deleting the PAT must revoke every
+    /// one of them. Pins the selector to the label alone — adding a
+    /// namespace term would leave working credentials behind.
+    #[test]
+    fn derived_secret_selector_matches_the_label_alone() {
+        assert_eq!(
+            derived_secret_selector("acme"),
+            "apprafter.io/source-credential=acme"
+        );
+    }
+
+    /// The sweep deletes by `(namespace, name)`; an entry missing either
+    /// coordinate cannot be addressed and must be SKIPPED, not abort the
+    /// sweep — one malformed object must never leave the remaining derived
+    /// credentials live in the cluster.
+    #[test]
+    fn secret_delete_targets_skips_unaddressable_entries() {
+        let secret = |name: Option<&str>, ns: Option<&str>| Secret {
+            metadata: kube::core::ObjectMeta {
+                name: name.map(str::to_string),
+                namespace: ns.map(str::to_string),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let targets = secret_delete_targets(vec![
+            secret(Some("srccred-acme-repo-0"), Some("argocd")),
+            secret(None, Some("argocd")),
+            secret(Some("srccred-acme-dockercfg"), None),
+            secret(Some("srccred-acme-dockercfg"), Some("landing")),
+        ]);
+        assert_eq!(
+            targets,
+            vec![
+                ("argocd".to_string(), "srccred-acme-repo-0".to_string()),
+                ("landing".to_string(), "srccred-acme-dockercfg".to_string()),
+            ]
+        );
+    }
+
+    /// The plan selector pins BOTH the scope discriminator and the owning
+    /// credential: dropping either term would let this controller list (and
+    /// then delete) another credential's — or another scope's — plans.
+    #[test]
+    fn sc_plan_selector_pins_scope_and_credential() {
+        assert_eq!(
+            sc_plan_selector("acme"),
+            "apprafter.io/scope=sourcecredential,apprafter.io/source-credential=acme"
+        );
+    }
+
+    /// Belt-and-braces: the label selector is not trusted on its own. A plan
+    /// that carries this credential's label but is scoped to ANOTHER
+    /// credential must not be deleted — that would silently un-gate the
+    /// other credential's coverage narrowing.
+    #[test]
+    fn sc_plans_to_delete_ignores_a_plan_scoped_to_another_credential() {
+        let mine = sc_plan(
+            "acme",
+            "coverage-removal",
+            "spec.git.repoPrefixes",
+            None,
+            None,
+        );
+        let mut theirs = sc_plan(
+            "other",
+            "coverage-removal",
+            "spec.registry.hosts",
+            None,
+            None,
+        );
+        theirs.metadata.name = Some("other-migration-1".to_string());
+        let mut unnamed = sc_plan(
+            "acme",
+            "coverage-removal",
+            "spec.git.repoPrefixes",
+            None,
+            None,
+        );
+        unnamed.metadata.name = None;
+
+        assert_eq!(
+            sc_plans_to_delete(vec![theirs, mine, unnamed], "acme"),
+            vec!["acme-migration-1".to_string()]
+        );
+    }
+
+    /// The finalizer is the ONLY thing standing between a deleted
+    /// SourceCredential and a working PAT left behind in every namespace it
+    /// was projected into (cross-namespace ownerReferences do not exist), so
+    /// a live object must always carry it and a deleting one must have it
+    /// removed. Both no-op cases must return `None` — patching an unchanged
+    /// list would re-trigger reconcile forever.
+    #[test]
+    fn finalizer_patch_adds_on_live_and_removes_on_delete() {
+        let ours = vec![DERIVED_SECRETS_FINALIZER.to_string()];
+        let foreign = vec!["other.io/keep".to_string()];
+        let both = vec![
+            "other.io/keep".to_string(),
+            DERIVED_SECRETS_FINALIZER.to_string(),
+        ];
+
+        assert_eq!(finalizer_patch(false, &[]), Some(ours.clone()));
+        assert_eq!(finalizer_patch(false, &foreign), Some(both.clone()));
+        assert_eq!(finalizer_patch(false, &ours), None);
+
+        assert_eq!(finalizer_patch(true, &both), Some(foreign.clone()));
+        assert_eq!(finalizer_patch(true, &ours), Some(vec![]));
+        // Already released (or never ours) → nothing to patch.
+        assert_eq!(finalizer_patch(true, &foreign), None);
+    }
+
+    // ---------------- cluster-facing contracts (offline client) ----------------
+
+    /// A `Client` aimed at a closed local port: every request it makes fails
+    /// with a connection refusal, so these tests observe what the controller
+    /// does when the apiserver cannot be reached — without a cluster.
+    ///
+    /// The provider install mirrors `install_rustls_crypto_provider` in the
+    /// operator/webhook binaries: rustls 0.23 has no auto-default provider,
+    /// so building the client's TLS connector panics without it.
+    pub(crate) fn unreachable_client() -> Client {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let config = kube::Config::new("http://127.0.0.1:1".parse().unwrap());
+        Client::try_from(config).expect("build an offline kube client")
+    }
+
+    /// An OpenBao backend has no Secret to read, so resolving it must not
+    /// touch the apiserver at all — proven here by resolving it through a
+    /// client that cannot reach anything and still getting `OpenBao` rather
+    /// than a transport error.
+    #[tokio::test]
+    async fn resolve_material_openbao_never_reads_a_secret() {
+        let backend = SourceBackend {
+            sealed_secret_ref: None,
+            open_bao_path: Some("secret/apprafter/gh".to_string()),
+        };
+        let resolved = resolve_material(&unreachable_client(), &backend, "apprafter-system")
+            .await
+            .expect("openBao resolves without any cluster read");
+        assert_eq!(resolved, HalfMaterial::OpenBao);
+    }
+
+    /// A backend WITH a `sealedSecretRef` must read the Secret — and when
+    /// that read fails, the error must PROPAGATE. Silently treating an
+    /// unreachable apiserver as "material missing" would report
+    /// `GitPresent=False/MaterialMissing` (a lie) and, worse, mark the half
+    /// pending forever.
+    #[tokio::test]
+    async fn resolve_material_propagates_a_failed_secret_read() {
+        let backend = sc_backend();
+        let err = resolve_material(&unreachable_client(), &backend, "apprafter-system")
+            .await
+            .expect_err("an unreachable apiserver must not look like a missing Secret");
+        assert!(matches!(err, ReconcileError::Kube(_)));
+    }
+
+    /// The GC sweep must FAIL LOUDLY when it cannot list: `reconcile`
+    /// releases the finalizer only after this returns `Ok`, so swallowing a
+    /// list error would let the SourceCredential finish deleting while its
+    /// derived PATs stayed live in every namespace they were projected into.
+    #[tokio::test]
+    async fn gc_derived_secrets_propagates_a_failed_sweep() {
+        let err = gc_derived_secrets(&unreachable_client(), "apprafter-system", "acme")
+            .await
+            .expect_err("an unlistable cluster must not report a clean sweep");
+        assert!(matches!(err, ReconcileError::Kube(_)));
+    }
+
+    /// A failed plan LIST must propagate, never degrade to "no plan": the
+    /// gate reads `None` as "nothing gating me", so a swallowed error would
+    /// let a coverage narrowing derive without the operator's approval.
+    #[tokio::test]
+    async fn find_sc_plan_propagates_a_list_failure_instead_of_reporting_no_plan() {
+        let err = find_sc_plan(&unreachable_client(), "apprafter-system", "acme")
+            .await
+            .expect_err("an unlistable cluster must not look like an ungated credential");
+        assert!(matches!(err, ReconcileError::Kube(_)));
+    }
+
+    /// `delete_sc_plans` tolerates a 404 (the plan already cascaded) but a
+    /// genuine RBAC / apiserver fault must propagate — a silently-skipped
+    /// delete leaves a stale gate that pauses the credential forever.
+    #[tokio::test]
+    async fn delete_sc_plans_propagates_a_list_failure() {
+        let err = delete_sc_plans(&unreachable_client(), "apprafter-system", "acme")
+            .await
+            .expect_err("a failed list must not report a completed cleanup");
+        assert!(matches!(err, ReconcileError::Kube(_)));
+    }
+
+    /// Every reconcile error must be visible on BOTH metrics — the
+    /// per-kind/namespace outcome counter (for "which credential is
+    /// failing") and the error-only counter alerts fire on — and must be
+    /// retried rather than dropped.
+    // `#[tokio::test]` only because building a kube `Client` needs a
+    // runtime; `error_policy` itself is synchronous and does no I/O.
+    #[tokio::test]
+    async fn error_policy_counts_the_error_on_both_metrics() {
+        let ctx = Arc::new(Context {
+            client: unreachable_client(),
+            metrics: Arc::new(Metrics::new()),
+        });
+        let mut cred = SourceCredential::new("acme", sc_spec(&["github.com/acme/"], &[]));
+        cred.metadata.namespace = Some("apprafter-system".into());
+        let err = ReconcileError::MissingUid("acme".into());
+
+        assert_eq!(
+            ctx.metrics
+                .reconcile_errors
+                .with_label_values(&[KIND])
+                .get(),
+            0.0
+        );
+        let action = error_policy(Arc::new(cred), &err, ctx.clone());
+        assert_eq!(
+            ctx.metrics
+                .reconcile_errors
+                .with_label_values(&[KIND])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_total
+                .with_label_values(&[KIND, "apprafter-system", "error"])
+                .get(),
+            1.0
+        );
+        // The controller must come back to it, not drop the object.
+        assert_eq!(
+            format!("{action:?}"),
+            format!("{:?}", Action::requeue(Duration::from_secs(30)))
+        );
     }
 
     #[test]

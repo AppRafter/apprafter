@@ -21,6 +21,7 @@ use kube::{Client, Resource, ResourceExt};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
+use operator_core::matching::Candidate;
 use operator_core::{ResourceClaim, ResourceClaimCondition, ServiceProvider};
 
 use crate::{Context, ReconcileError, FIELD_MANAGER, KIND};
@@ -70,74 +71,33 @@ pub async fn reconcile(
         .map(operator_core::matching::Candidate::from_provider)
         .collect();
 
-    // 3. Run the matcher.
-    let chosen = operator_core::matching::select_provider(
-        &claim.spec.type_,
-        &claim.spec.selector,
-        &candidates,
-    );
+    // 3. Decide — matcher + condition + patch body, all pure.
+    let decision = decide(&name, &claim, &candidates);
 
-    // 4. Read prior conditions for the timestamp-preservation guard.
-    let prior: Vec<ResourceClaimCondition> = claim
-        .status
-        .as_ref()
-        .and_then(|s| s.conditions.clone())
-        .unwrap_or_default();
+    // 4. Carry the decision out: one status patch either way.
+    let api: Api<ResourceClaim> = Api::namespaced(ctx.client.clone(), &ns);
+    api.patch_status(
+        &name,
+        &PatchParams::apply(FIELD_MANAGER).force(),
+        &Patch::Apply(&decision.patch),
+    )
+    .await?;
 
-    match chosen {
-        Some(ref provider_name) => {
-            // 5a. MATCH — build Scheduled=True condition and SSA-patch.
-            let cond = condition(
-                COND_SCHEDULED,
-                "True",
-                "MatchFound",
-                &format!("matched ServiceProvider {provider_name}"),
-                &prior,
-            );
-            let body = build_status_patch(&name, Some(provider_name), cond);
-            let api: Api<ResourceClaim> = Api::namespaced(ctx.client.clone(), &ns);
-            api.patch_status(
-                &name,
-                &PatchParams::apply(FIELD_MANAGER).force(),
-                &Patch::Apply(&body),
-            )
-            .await?;
-
+    match (&decision.provider, &decision.warning) {
+        (Some(provider_name), _) => {
             info!(%name, %ns, provider = %provider_name, "ResourceClaim scheduled");
             ctx.metrics
                 .reconcile_total
                 .with_label_values(&[KIND, &ns, "ok"])
                 .inc();
         }
-        None => {
-            // 5b. NO MATCH — build Scheduled=False, patch status, emit event.
-            let message = format!(
-                "no ServiceProvider matches type={:?} selector={:?}",
-                claim.spec.type_, claim.spec.selector
-            );
-            let cond = condition(
-                COND_SCHEDULED,
-                "False",
-                "NoMatchingProvider",
-                &message,
-                &prior,
-            );
-            // provider key OMITTED — build_status_patch(name, None, cond)
-            let body = build_status_patch(&name, None, cond);
-            let api: Api<ResourceClaim> = Api::namespaced(ctx.client.clone(), &ns);
-            api.patch_status(
-                &name,
-                &PatchParams::apply(FIELD_MANAGER).force(),
-                &Patch::Apply(&body),
-            )
-            .await?;
-
+        (None, warning) => {
             // Emit a best-effort Kubernetes Warning Event.
             let recorder = build_recorder(&ctx.client, &claim);
             let ev = KubeEvent {
                 type_: EventType::Warning,
                 reason: "NoMatchingServiceProvider".into(),
-                note: Some(message),
+                note: warning.clone(),
                 action: "Schedule".into(),
                 secondary: None,
             };
@@ -181,6 +141,79 @@ pub fn error_policy(claim: Arc<ResourceClaim>, err: &ReconcileError, ctx: Arc<Co
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested without a cluster)
 // ---------------------------------------------------------------------------
+
+/// Everything one reconcile decides about a claim, before any API call.
+struct Decision {
+    /// The winning ServiceProvider, or `None` when nothing matched.
+    provider: Option<String>,
+    /// The SSA body to send to `patch_status` — the only status write this
+    /// controller makes, on either path.
+    patch: Value,
+    /// The note for the Warning Event, present only on the no-match path.
+    /// It is the same sentence the `Scheduled=False` condition carries, so
+    /// `kubectl describe` and the condition cannot disagree about why a
+    /// claim is stuck.
+    warning: Option<String>,
+}
+
+/// Match a claim against the visible providers and build what should be
+/// written about it.
+///
+/// Split out of [`reconcile`] so the decision is reachable without an
+/// apiserver: which provider wins, whether `status.provider` is touched at
+/// all, and whether `lastTransitionTime` moves are the parts that can be
+/// wrong in ways a cluster would only reveal slowly (a hot reconcile loop, a
+/// provider silently unset). The two API calls around it are not.
+fn decide(name: &str, claim: &ResourceClaim, candidates: &[Candidate]) -> Decision {
+    let chosen = operator_core::matching::select_provider(
+        &claim.spec.type_,
+        &claim.spec.selector,
+        candidates,
+    );
+
+    // Prior conditions feed the timestamp-preservation guard.
+    let prior: Vec<ResourceClaimCondition> = claim
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.clone())
+        .unwrap_or_default();
+
+    match chosen {
+        Some(provider_name) => {
+            let cond = condition(
+                COND_SCHEDULED,
+                "True",
+                "MatchFound",
+                &format!("matched ServiceProvider {provider_name}"),
+                &prior,
+            );
+            Decision {
+                patch: build_status_patch(name, Some(&provider_name), cond),
+                provider: Some(provider_name),
+                warning: None,
+            }
+        }
+        None => {
+            let message = format!(
+                "no ServiceProvider matches type={:?} selector={:?}",
+                claim.spec.type_, claim.spec.selector
+            );
+            let cond = condition(
+                COND_SCHEDULED,
+                "False",
+                "NoMatchingProvider",
+                &message,
+                &prior,
+            );
+            // provider key OMITTED — build_status_patch(name, None, cond)
+            Decision {
+                provider: None,
+                patch: build_status_patch(name, None, cond),
+                warning: Some(message),
+            }
+        }
+    }
+}
 
 /// Build a `Recorder` that publishes events against the given
 /// `ResourceClaim`.  Constructing per-reconcile keeps the reconcile
@@ -254,6 +287,36 @@ fn build_status_patch(name: &str, provider: Option<&str>, cond: ResourceClaimCon
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::collections::BTreeMap;
+
+    use operator_core::{ResourceClaimSpec, ResourceClaimStatus};
+
+    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn candidate(name: &str, type_: &str, labels_: &[(&str, &str)]) -> Candidate {
+        Candidate {
+            name: name.to_string(),
+            type_: type_.to_string(),
+            labels: labels(labels_),
+        }
+    }
+
+    fn claim(type_: &str, selector: &[(&str, &str)]) -> ResourceClaim {
+        ResourceClaim::new(
+            "demo-web-pg",
+            ResourceClaimSpec {
+                type_: type_.to_string(),
+                selector: labels(selector),
+                ..Default::default()
+            },
+        )
+    }
 
     fn prev_cond(type_: &str, status: &str, ts: &str) -> ResourceClaimCondition {
         ResourceClaimCondition {
@@ -352,5 +415,165 @@ mod tests {
         // Must NOT include ready or connectionSecretRef (owned by 2.4).
         assert!(patch.pointer("/status/ready").is_none());
         assert!(patch.pointer("/status/connectionSecretRef").is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // decide() — the whole reconcile decision, without an apiserver
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_matching_provider_is_recorded_and_nothing_is_warned_about() {
+        let c = claim("pg", &[("tier", "shared")]);
+        let d = decide(
+            "demo-web-pg",
+            &c,
+            &[candidate("pg-integrated", "pg", &[("tier", "shared")])],
+        );
+        assert_eq!(d.provider.as_deref(), Some("pg-integrated"));
+        assert_eq!(
+            d.patch.pointer("/status/provider").and_then(Value::as_str),
+            Some("pg-integrated")
+        );
+        assert_eq!(
+            d.patch
+                .pointer("/status/conditions/0/status")
+                .and_then(Value::as_str),
+            Some("True")
+        );
+        // A scheduled claim has nothing to warn about; a note here would put
+        // a Warning Event on a claim that is working.
+        assert_eq!(d.warning, None);
+    }
+
+    #[test]
+    fn a_provider_of_the_right_type_but_the_wrong_labels_is_not_a_match() {
+        // The selector has to survive the trip into the matcher. Dropping it
+        // schedules a `tier: dedicated` claim onto the shared backend — a
+        // successful-looking reconcile that puts a tenant on the wrong
+        // machine, which no status field would then contradict.
+        let c = claim("pg", &[("tier", "dedicated")]);
+        let d = decide(
+            "demo-web-pg",
+            &c,
+            &[candidate("pg-integrated", "pg", &[("tier", "shared")])],
+        );
+        assert_eq!(d.provider, None);
+        assert_eq!(
+            d.patch
+                .pointer("/status/conditions/0/status")
+                .and_then(Value::as_str),
+            Some("False")
+        );
+    }
+
+    #[test]
+    fn a_no_match_never_clears_a_provider_a_later_phase_already_set() {
+        // The provisioner (2.4) owns `status.provider` once provisioning is
+        // wired. A scheduler pass that finds nothing — because the
+        // ServiceProvider list came back empty during a blip, say — must omit
+        // the key rather than write null over it: a forced SSA apply carrying
+        // `provider: null` would strip a provisioned claim's binding and send
+        // it back to Pending.
+        let mut c = claim("pg", &[("tier", "shared")]);
+        c.status = Some(ResourceClaimStatus {
+            provider: Some("pg-integrated".to_string()),
+            ready: Some(true),
+            ..Default::default()
+        });
+        let d = decide("demo-web-pg", &c, &[]);
+        assert_eq!(d.provider, None);
+        assert!(d.patch.pointer("/status/provider").is_none());
+        assert!(d.patch.pointer("/status/ready").is_none());
+    }
+
+    #[test]
+    fn the_warning_names_the_type_and_selector_that_matched_nothing() {
+        // This note is the whole of what an operator sees in `kubectl
+        // describe` for a stuck claim. Without the selector in it, every
+        // unmatched `pg` claim produces the same sentence and the actual
+        // reason — a label nothing carries — stays invisible.
+        let c = claim("pg", &[("tier", "dedicated")]);
+        let d = decide("demo-web-pg", &c, &[]);
+        let warning = d.warning.expect("a no-match must carry a note");
+        assert!(warning.contains("pg"), "{warning}");
+        assert!(warning.contains("tier"), "{warning}");
+        assert!(warning.contains("dedicated"), "{warning}");
+        // …and the condition says the same thing, so the two cannot drift.
+        assert_eq!(
+            d.patch
+                .pointer("/status/conditions/0/message")
+                .and_then(Value::as_str),
+            Some(warning.as_str())
+        );
+    }
+
+    #[test]
+    fn a_claim_that_still_matches_keeps_its_transition_timestamp() {
+        // The hot-loop guard, end to end. Every status write bumps
+        // `resourceVersion` and wakes this controller again, so a timestamp
+        // that moves on an unchanged decision makes the controller reconcile
+        // one claim forever at whatever rate the apiserver will take.
+        let ts = "2026-01-01T00:00:00+00:00";
+        let mut c = claim("pg", &[("tier", "shared")]);
+        c.status = Some(ResourceClaimStatus {
+            conditions: Some(vec![prev_cond(COND_SCHEDULED, "True", ts)]),
+            ..Default::default()
+        });
+        let d = decide(
+            "demo-web-pg",
+            &c,
+            &[candidate("pg-integrated", "pg", &[("tier", "shared")])],
+        );
+        assert_eq!(
+            d.patch
+                .pointer("/status/conditions/0/lastTransitionTime")
+                .and_then(Value::as_str),
+            Some(ts)
+        );
+    }
+
+    #[test]
+    fn a_claim_that_stops_matching_gets_a_fresh_transition_timestamp() {
+        // The other side of the same guard: `Scheduled` really did change, so
+        // the timestamp must move. Reusing it would date the failure to
+        // whenever the claim was last healthy.
+        let ts = "2026-01-01T00:00:00+00:00";
+        let mut c = claim("pg", &[("tier", "shared")]);
+        c.status = Some(ResourceClaimStatus {
+            conditions: Some(vec![prev_cond(COND_SCHEDULED, "True", ts)]),
+            ..Default::default()
+        });
+        let d = decide("demo-web-pg", &c, &[]);
+        assert_ne!(
+            d.patch
+                .pointer("/status/conditions/0/lastTransitionTime")
+                .and_then(Value::as_str),
+            Some(ts)
+        );
+    }
+
+    #[test]
+    fn the_alphabetically_first_of_several_matching_providers_wins() {
+        // Two equally valid providers must not make the winner depend on the
+        // order the apiserver happened to list them in: an unstable choice
+        // would move a claim between backends on nothing but a relist.
+        let c = claim("pg", &[]);
+        let candidates = [
+            candidate("pg-zeta", "pg", &[]),
+            candidate("pg-alpha", "pg", &[]),
+        ];
+        assert_eq!(
+            decide("demo-web-pg", &c, &candidates).provider.as_deref(),
+            Some("pg-alpha")
+        );
+        // Reversed input, same winner.
+        let reversed = [
+            candidate("pg-alpha", "pg", &[]),
+            candidate("pg-zeta", "pg", &[]),
+        ];
+        assert_eq!(
+            decide("demo-web-pg", &c, &reversed).provider.as_deref(),
+            Some("pg-alpha")
+        );
     }
 }

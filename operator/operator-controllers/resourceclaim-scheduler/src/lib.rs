@@ -74,3 +74,40 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), ReconcileE
     info!("ResourceClaimScheduler stream ended");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A wrapped apiserver error must still carry the apiserver's own words.
+    ///
+    /// `run`'s stream handler and `error_policy` both render a
+    /// `ReconcileError` with nothing but `%err`, so whatever `Display` omits
+    /// is gone from the operator log for good. An RBAC denial is the case
+    /// that matters: "kube api error" alone is indistinguishable between a
+    /// missing verb and an unreachable apiserver, and this repository has
+    /// twice shipped a controller whose RBAC did not match its code.
+    #[test]
+    fn a_wrapped_apiserver_error_keeps_the_apiservers_own_message() {
+        let denial = kube::Error::Api(kube::core::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "resourceclaims.apprafter.io is forbidden".to_string(),
+            reason: "Forbidden".to_string(),
+            code: 403,
+        });
+        let shown = ReconcileError::from(denial).to_string();
+        assert!(shown.contains("is forbidden"), "{shown}");
+        assert!(shown.contains("Forbidden"), "{shown}");
+    }
+
+    /// The same rule for a deserialization failure: the position and the
+    /// reason come from serde, and dropping them leaves "serde error" on a
+    /// controller that cannot read one specific object.
+    #[test]
+    fn a_wrapped_serde_error_keeps_the_underlying_reason() {
+        let broken = serde_json::from_str::<serde_json::Value>("{oops").unwrap_err();
+        let reason = broken.to_string();
+        let shown = ReconcileError::from(broken).to_string();
+        assert!(shown.contains(&reason), "{shown} does not carry {reason}");
+    }
+}

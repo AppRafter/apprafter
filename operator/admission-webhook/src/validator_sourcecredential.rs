@@ -344,4 +344,109 @@ mod tests {
         let errs = validate_sourcecredential(&json!("nope"));
         assert_eq!(fields(&errs), vec!["object"]);
     }
+
+    #[test]
+    fn rejects_object_without_spec() {
+        let errs = validate_sourcecredential(&json!({"metadata": {"name": "acme"}}));
+        assert_eq!(fields(&errs), vec!["spec"]);
+        assert!(errs[0].message.contains("required"));
+    }
+
+    /// The accept side of the `openBaoPath` discriminator arm — without it
+    /// only the two REJECT paths (empty path, both refs set) were covered,
+    /// so a rule that rejected every OpenBao backend would have passed.
+    #[test]
+    fn accepts_an_open_bao_backend() {
+        let obj = json!({
+            "spec": {
+                "git": {
+                    "backend": {"openBaoPath": "secret/apprafter/gh"},
+                    "repoPrefixes": ["github.com/acme/"]
+                }
+            }
+        });
+        assert!(validate_sourcecredential(&obj).is_empty());
+    }
+
+    /// `backend` is REQUIRED on each present half. The typed struct cannot
+    /// model its absence (`SourceGit.backend` is non-`Option`, so the spec
+    /// fails to deserialize), which is exactly why this diagnostic lives on
+    /// the raw `Value` — and why it needs its own reject test.
+    #[test]
+    fn rejects_half_without_a_backend() {
+        let git = json!({"spec": {"git": {"repoPrefixes": ["github.com/acme/"]}}});
+        let errs = validate_sourcecredential(&git);
+        assert_eq!(fields(&errs), vec!["spec.git.backend"]);
+        assert!(errs[0].message.contains("backend is required"));
+
+        let registry = json!({"spec": {"registry": {"hosts": ["ghcr.io/acme/"]}}});
+        let errs = validate_sourcecredential(&registry);
+        assert_eq!(fields(&errs), vec!["spec.registry.backend"]);
+    }
+
+    /// The coverage list is REQUIRED, not merely non-empty: a half with a
+    /// valid backend and NO `repoPrefixes` / `hosts` key at all must be
+    /// rejected (it would derive a credential covering nothing). Another
+    /// raw-`Value`-only branch — `Vec<String>` cannot model an absent list.
+    #[test]
+    fn rejects_half_without_a_coverage_list() {
+        let git = json!({
+            "spec": {"git": {"backend": {"sealedSecretRef": {"name": "m"}}}}
+        });
+        let errs = validate_sourcecredential(&git);
+        assert_eq!(fields(&errs), vec!["spec.git.repoPrefixes"]);
+        assert!(errs[0].message.contains("repoPrefixes is required"));
+
+        let registry = json!({
+            "spec": {"registry": {"backend": {"sealedSecretRef": {"name": "m"}}}}
+        });
+        let errs = validate_sourcecredential(&registry);
+        assert_eq!(fields(&errs), vec!["spec.registry.hosts"]);
+        assert!(errs[0].message.contains("hosts is required"));
+    }
+
+    #[test]
+    fn rejects_empty_hosts() {
+        let obj = json!({
+            "spec": {"registry": {"backend": {"sealedSecretRef": {"name": "m"}}, "hosts": []}}
+        });
+        let errs = validate_sourcecredential(&obj);
+        assert_eq!(fields(&errs), vec!["spec.registry.hosts"]);
+        assert!(errs[0].message.contains("at least one entry"));
+    }
+
+    /// A non-string coverage entry is rejected PER INDEX, and the valid
+    /// entries around it are still accepted — the index is what tells the
+    /// author which entry to fix. (A non-string entry also makes the spec
+    /// fail to deserialize, so this doubles as the raw-`Value` fallback
+    /// path's test: the backend is still validated correctly.)
+    #[test]
+    fn rejects_a_non_string_coverage_entry_by_index() {
+        let obj = json!({
+            "spec": {"git": {
+                "backend": {"sealedSecretRef": {"name": "m"}},
+                "repoPrefixes": ["github.com/acme/", 42, {"url": "x"}]
+            }}
+        });
+        let errs = validate_sourcecredential(&obj);
+        assert_eq!(
+            fields(&errs),
+            vec!["spec.git.repoPrefixes[1]", "spec.git.repoPrefixes[2]"]
+        );
+        assert!(errs[0].message.contains("non-empty string"));
+    }
+
+    /// A blank / whitespace-only entry is as useless as a missing one — it
+    /// would normalise to a prefix matching everything or nothing.
+    #[test]
+    fn rejects_a_blank_coverage_entry() {
+        let obj = json!({
+            "spec": {"registry": {
+                "backend": {"sealedSecretRef": {"name": "m"}},
+                "hosts": ["ghcr.io/acme/", "   "]
+            }}
+        });
+        let errs = validate_sourcecredential(&obj);
+        assert_eq!(fields(&errs), vec!["spec.registry.hosts[1]"]);
+    }
 }

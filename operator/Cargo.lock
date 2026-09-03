@@ -1666,6 +1666,7 @@ dependencies = [
  "operator-controllers-migration",
  "operator-core",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
