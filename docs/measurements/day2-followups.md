@@ -46,7 +46,7 @@ would otherwise touch the same code three times.
 | **D24** | A walk built an artefact and tested a different one | RESOLVED — the walk runs its own build; no product change owed | — |
 | **D27** | The backup runner pin rotted, and the scheduled backup quietly ran an old binary | FIXED — pin moved + CI guard | — |
 | **D28** | `ensure_repo` treats a restic repository reference as a filesystem path | FIXED — found the hour the walk started running local code | — |
-| **D29** | A disk claim reports the NODE filesystem as its own capacity | **OPEN** — measured on hardware, product decision owed | — |
+| **D29** | A disk claim reports the NODE filesystem as its own capacity | FIXED — the figure now names its scope | — |
 | **D25** | The real-Hetzner backup walk is blocked until 0.2.59 publishes | RESOLVED — walk re-ran GREEN | — |
 | **D26** | A `sequential` backup restores empty, and says it succeeded | FIXED 2026-09-02 — walk GREEN, shipped in cli v0.2.53 | — |
 
@@ -3314,8 +3314,9 @@ bookkeeping. It is the difference between a test and a decoration.
 **Opened:** 2026-09-03, by the first run of `e2e/node-disk-pressure-hetzner.sh`
 on real hardware — the run that exists because D22's disk half cannot be
 observed on kind at all.
-**Status:** OPEN. Measured, not fixed: the behaviour is faithful to its inputs
-and the right output is a product decision, not a bug fix.
+**Status:** FIXED 2026-09-03 (operator v0.2.46 / platform-stack 0.2.63 / cli
+v0.2.56) by option 1 below — the figure now records WHICH THING it measured,
+and the CLI says so.
 **Severity:** low blast radius, high misinformation. Nothing breaks; a number
 that means one thing is presented as meaning another.
 
@@ -3368,6 +3369,31 @@ relationship.
 
 (1) looks right, and it is a rendering change rather than a sampling change —
 which is where the defect actually lives.
+
+### What shipped
+
+`status.capacity.scope` — `"host"` or `"volume"` — decided by
+`capacity_scope()` from the SAME kubelet document the figures come from, so the
+two readings cannot be a poll apart. The detector is equality with the node's
+`node.fs.capacityBytes`: a backend enforcing a real quota reports that quota,
+and matching the root filesystem's byte count exactly has no plausible
+mechanism behind it.
+
+`apprafter app status` renders `1Gi · host disk 12% full` instead of
+`9.0 GB / 74.8 GB (12%)` — the size the claim asked for, and the host's fullness
+named as the host's. `volume status` gained the same treatment; `SharedVolume`
+published the identical pair and had the identical defect.
+
+Three properties are deliberate and each has a test:
+
+  * an UNKNOWN node capacity never yields `host`. Silence about the node is not
+    evidence about the volume, and defaulting the other way would relabel every
+    correct figure on a cluster whose kubelet stopped reporting `node.fs`;
+  * a claim with NO scope — written by an operator predating the field — reads
+    as unknown and keeps the pre-D29 rendering, so a rolling upgrade cannot
+    mislabel correct figures in the window where both versions are live;
+  * a `volume`-scoped figure renders exactly as before. The fix is about
+    mislabelling, not about the pair.
 
 ### How it was found, and what that says
 

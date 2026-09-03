@@ -1760,6 +1760,44 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.63": {
+	change:          "safe"
+	operatorVersion: "v0.2.46"
+	notes: """
+		A disk figure now says which thing it measured.
+
+		A `needs.disk` claim asking for 1Gi reported `capacityBytes` identical
+		to the node's whole root filesystem, and `usedBytes` equal to the node's
+		used space — so `apprafter app status` told operators their 1Gi volume
+		held 80GB and was 12% full. Both halves were the node's.
+
+		Nothing was sampling incorrectly. The kubelet reports volume statistics
+		per PVC, and for a local-path (hostPath-backed) PersistentVolume those
+		statistics ARE the backing filesystem's, because a directory on a shared
+		disk has no quota to report against. The composition was what misled.
+
+		The claim's `status.capacity` now carries `scope: "host" | "volume"`,
+		decided from the same kubelet document the figures come from, and the
+		CLI renders accordingly: `1Gi · host disk 12% full` instead of
+		`9.0 GB / 74.8 GB (12%)`. `SharedVolume` carries and renders the same
+		field — it published the identical pair and had the identical problem.
+
+		NO BEHAVIOUR CHANGE FOR A BACKEND WITH A REAL QUOTA. A CSI volume that
+		enforces and reports its own limit is `scope: volume` and renders
+		exactly as before. And a claim last written by an operator predating the
+		field has NO scope, which readers treat as unknown and render the old
+		way — deliberately, so a rolling upgrade cannot relabel correct figures
+		in the window where both operator versions are live.
+
+		Found on real hardware. It could not have been found anywhere else: on
+		kind the kubelet reports no volume statistics at all for local-path, so
+		the figure never appeared and every local walk skipped it. The unit
+		tests were not at fault either — they assert the parser, and the parser
+		was right.
+		"""
+	references: ["docs/measurements/day2-followups.md"]
+}
+
 compatibility: "0.2.62": {
 	change:          "safe"
 	operatorVersion: "v0.2.45"

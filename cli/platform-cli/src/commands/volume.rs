@@ -207,8 +207,23 @@ fn status(name: &str, namespace: &str) -> Result<()> {
     println!("  Ready:       {ready}");
     println!("  PVC ref:     {pvc_ref}");
     println!("  Ref count:   {ref_count}");
-    match (used, cap) {
-        (Some(u), Some(c)) => println!("  Used/Free:   {u}/{} bytes", c - u),
+    // D29: name what was measured. For a local-path volume the kubelet
+    // reports the BACKING FILESYSTEM — the numbers are the node's, and
+    // labelling them "Used/Free" of this volume is the node's fact wearing
+    // the volume's name. A pre-D29 operator writes no scope; that reads as
+    // unknown and keeps the original line rather than guessing.
+    let scope = sv
+        .pointer("/status/capacity/scope")
+        .and_then(serde_json::Value::as_str);
+    match (used, cap, scope) {
+        (Some(u), Some(c), Some("host")) => {
+            println!(
+                "  Host disk:   {u}/{} bytes used/free (this volume shares it)",
+                c - u
+            );
+            println!("  Used/Free:   — (local-path has no per-volume quota to report)");
+        }
+        (Some(u), Some(c), _) => println!("  Used/Free:   {u}/{} bytes", c - u),
         _ => println!("  Used/Free:   —"),
     }
     // 2.22d (D8): the operator has always sampled these numbers and, until

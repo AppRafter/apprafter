@@ -184,19 +184,39 @@ pub fn ref_count_for(sv_name: &str, claims: &[Value]) -> i64 {
 /// optional. The caller appends the `Ready` condition before sending (see
 /// [`sv_status_apply_body_with_condition`]); this bare form keeps the
 /// field-set the unit tests assert on minimal.
+/// A sampled volume figure and WHICH THING it measured (D29).
+///
+/// Grouped rather than passed as two adjacent parameters: they are one fact,
+/// and clippy's argument-count limit is the honest signal that a widening
+/// parameter list wanted a type. Splitting them also invites the shape where a
+/// caller passes the bytes and forgets the scope, which is precisely the
+/// unlabelled figure this field exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SvCapacity {
+    pub used: i64,
+    pub cap: i64,
+    /// `None` only when the node figure was unreadable — treated as unknown by
+    /// every reader, never as `host`.
+    pub scope: Option<&'static str>,
+}
+
 pub fn sv_status_apply_body(
     sv_name: &str,
     ready: bool,
     pvc_ref: Option<&str>,
     ref_count: i64,
-    capacity: Option<(i64, i64)>, // (usedBytes, capacityBytes)
+    capacity: Option<SvCapacity>,
 ) -> Value {
     let mut status = json!({ "ready": ready, "refCount": ref_count });
     if let Some(p) = pvc_ref {
         status["pvcRef"] = json!(p);
     }
-    if let Some((used, cap)) = capacity {
-        status["capacity"] = json!({ "usedBytes": used, "capacityBytes": cap });
+    if let Some(SvCapacity { used, cap, scope }) = capacity {
+        let mut c = json!({ "usedBytes": used, "capacityBytes": cap });
+        if let Some(scope) = scope {
+            c["scope"] = json!(scope);
+        }
+        status["capacity"] = c;
     }
     json!({
         "apiVersion": "apprafter.io/v1alpha1",
@@ -215,7 +235,7 @@ pub fn sv_status_apply_body_with_condition(
     ready: bool,
     pvc_ref: Option<&str>,
     ref_count: i64,
-    capacity: Option<(i64, i64)>,
+    capacity: Option<SvCapacity>,
     cond: SharedVolumeCondition,
 ) -> Value {
     let mut body = sv_status_apply_body(sv_name, ready, pvc_ref, ref_count, capacity);
@@ -237,7 +257,7 @@ pub fn sv_status_apply_body_with_conditions(
     ready: bool,
     pvc_ref: Option<&str>,
     ref_count: i64,
-    capacity: Option<(i64, i64)>,
+    capacity: Option<SvCapacity>,
     ready_cond: SharedVolumeCondition,
     capacity_cond: Option<SharedVolumeCondition>,
 ) -> Value {
@@ -435,6 +455,20 @@ pub async fn reconcile_shared_volume(
         None => None,
     };
     let capacity: Option<(i64, i64)> = summary.as_ref().and_then(|s| pvc_usage(s, &pvc_name));
+    // D29: the same figure carries the same ambiguity here as on a disk claim
+    // — a local-path PV makes the kubelet report the backing filesystem, so
+    // these can be the node's numbers wearing the volume's name. Decided from
+    // THIS summary, so the two readings cannot be a poll apart.
+    let sv_capacity: Option<SvCapacity> = capacity.map(|(used, cap)| SvCapacity {
+        used,
+        cap,
+        scope: summary.as_ref().map(|s| {
+            operator_core::capacity::capacity_scope(
+                cap,
+                operator_core::capacity::node_fs_capacity(s),
+            )
+        }),
+    });
 
     // 2.22d (D8): `CapacityWarning` on a SharedVolume now means THE VOLUME.
     //
@@ -502,7 +536,7 @@ pub async fn reconcile_shared_volume(
         true,
         Some(&pvc_name),
         ref_count,
-        capacity,
+        sv_capacity,
         ready_cond,
         capacity_cond,
     )
@@ -604,7 +638,7 @@ async fn patch_shared_volume_status(
     ready: bool,
     pvc_ref: Option<&str>,
     ref_count: i64,
-    capacity: Option<(i64, i64)>,
+    capacity: Option<SvCapacity>,
     cond: SharedVolumeCondition,
 ) -> Result<(), ReconcileError> {
     let api: Api<SharedVolume> = Api::namespaced(client.clone(), ns);
@@ -626,7 +660,7 @@ async fn patch_shared_volume_status_with_conditions(
     ready: bool,
     pvc_ref: Option<&str>,
     ref_count: i64,
-    capacity: Option<(i64, i64)>,
+    capacity: Option<SvCapacity>,
     ready_cond: SharedVolumeCondition,
     capacity_cond: Option<SharedVolumeCondition>,
 ) -> Result<(), ReconcileError> {
@@ -844,9 +878,41 @@ mod tests {
 
     #[test]
     fn sv_status_body_carries_capacity_when_set() {
-        let body = sv_status_apply_body("shared", true, Some("sv-demo-shared"), 1, Some((10, 100)));
+        let body = sv_status_apply_body(
+            "shared",
+            true,
+            Some("sv-demo-shared"),
+            1,
+            Some(SvCapacity {
+                used: 10,
+                cap: 100,
+                scope: Some("volume"),
+            }),
+        );
         assert_eq!(body["status"]["capacity"]["usedBytes"], 10);
         assert_eq!(body["status"]["capacity"]["capacityBytes"], 100);
+        assert_eq!(body["status"]["capacity"]["scope"], "volume");
+    }
+
+    #[test]
+    fn sv_status_body_omits_scope_when_the_node_figure_was_unreadable() {
+        // D29: absence is UNKNOWN. Writing `host` on a missing node figure
+        // would relabel a correct volume number on any cluster whose kubelet
+        // stopped reporting node.fs, and readers fall back to the pre-D29
+        // rendering only because the key is genuinely absent.
+        let body = sv_status_apply_body(
+            "shared",
+            true,
+            Some("sv-demo-shared"),
+            1,
+            Some(SvCapacity {
+                used: 10,
+                cap: 100,
+                scope: None,
+            }),
+        );
+        assert_eq!(body["status"]["capacity"]["usedBytes"], 10);
+        assert!(body["status"]["capacity"].get("scope").is_none());
     }
 
     #[test]
@@ -891,7 +957,11 @@ mod tests {
             true,
             Some("sv-demo-shared"),
             1,
-            Some((90, 100)),
+            Some(SvCapacity {
+                used: 90,
+                cap: 100,
+                scope: Some("volume"),
+            }),
             ready,
             Some(cap),
         );

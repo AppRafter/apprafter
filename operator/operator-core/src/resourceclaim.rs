@@ -79,6 +79,17 @@ pub struct ClaimCapacity {
     pub used_bytes: i64,
     #[serde(rename = "capacityBytes")]
     pub capacity_bytes: i64,
+    /// WHICH THING these bytes measure (D29): `"volume"` when the backend
+    /// enforces a real quota and reports it, `"host"` when the figures are the
+    /// backing filesystem's — which is what the kubelet returns for a
+    /// local-path volume, because a directory on a shared disk has no quota to
+    /// report against.
+    ///
+    /// Optional so a claim last written by an operator that predates the field
+    /// still deserialises; readers treat the absence as "unknown" and fall
+    /// back to the pre-D29 rendering rather than guessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]

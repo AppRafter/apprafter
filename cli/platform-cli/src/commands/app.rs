@@ -1799,6 +1799,27 @@ pub(crate) fn claim_size_cell(claim: &Value) -> String {
     if let (Some(used), Some(cap)) = (used, cap) {
         if cap > 0 {
             let pct = (used as f64 / cap as f64 * 100.0).round() as i64;
+            // D29: when the operator measured the HOST DISK rather than this
+            // volume — which is what the kubelet reports for a local-path PV,
+            // because a directory on a shared filesystem has no quota — say
+            // so, and lead with the size the claim actually asked for.
+            //
+            // The alternative of printing the pair unlabelled told an operator
+            // their 1Gi claim held 80GB. The alternative of printing the
+            // requested size alone was rejected when D8 shipped, for answering
+            // the easy half of the question and reading as if it had answered
+            // both. This does neither: two true facts, each named.
+            if claim
+                .pointer("/status/capacity/scope")
+                .and_then(Value::as_str)
+                == Some("host")
+            {
+                let requested = claim
+                    .pointer("/spec/size")
+                    .and_then(Value::as_str)
+                    .unwrap_or("—");
+                return format!("{requested} · host disk {pct}% full");
+            }
             return format!("{} / {} ({pct}%)", human_bytes(used), human_bytes(cap));
         }
     }
@@ -5512,6 +5533,51 @@ mod size_cell_tests {
         // merely unmeasured.
         assert_eq!(claim_size_cell(&json!({ "status": {} })), "—");
         assert_eq!(claim_size_cell(&json!({})), "—");
+    }
+
+    #[test]
+    fn a_host_scoped_figure_names_the_host_and_leads_with_the_request() {
+        // D29, measured on real hardware: a 1Gi claim whose kubelet figures are
+        // the node's whole 74.8 GiB root filesystem. Rendering the pair
+        // unlabelled told the reader their 1Gi volume holds 80GB.
+        let c = json!({
+            "spec": { "size": "1Gi" },
+            "status": { "capacity": {
+                "usedBytes": 9_616_949_248i64,
+                "capacityBytes": 80_279_486_464i64,
+                "scope": "host" }}});
+        let cell = claim_size_cell(&c);
+        assert!(
+            cell.starts_with("1Gi"),
+            "leads with what was asked for: {cell}"
+        );
+        assert!(cell.contains("host disk"), "names whose disk it is: {cell}");
+        assert!(cell.contains("12%"), "keeps the useful fact: {cell}");
+        assert!(
+            !cell.contains("80.3") && !cell.contains(" / "),
+            "must not present the node's capacity as the claim's: {cell}"
+        );
+    }
+
+    #[test]
+    fn a_volume_scoped_figure_is_unchanged_by_d29() {
+        // A backend with a real quota reports its own numbers, and this
+        // rendering must not move — the fix is about mislabelling, not about
+        // the pair itself.
+        let c = json!({ "spec": { "size": "8Gi" }, "status": { "capacity": {
+            "usedBytes": 4_294_967_296i64, "capacityBytes": 8_589_934_592i64,
+            "scope": "volume" }}});
+        assert_eq!(claim_size_cell(&c), "4.0 GB / 8.0 GB (50%)");
+    }
+
+    #[test]
+    fn a_figure_with_no_scope_keeps_the_pre_d29_rendering() {
+        // Written by an operator that predates the field. Absence is unknown,
+        // not "host": guessing would relabel every correct figure in the fleet
+        // during a rolling upgrade.
+        let c = json!({ "status": { "capacity": {
+            "usedBytes": 4_294_967_296i64, "capacityBytes": 8_589_934_592i64 }}});
+        assert_eq!(claim_size_cell(&c), "4.0 GB / 8.0 GB (50%)");
     }
 
     #[test]

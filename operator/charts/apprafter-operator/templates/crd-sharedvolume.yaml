@@ -59,6 +59,11 @@ spec:
                 properties:
                   capacityBytes:
                     type: integer
+                  scope:
+                    enum:
+                    - volume
+                    - host
+                    type: string
                   usedBytes:
                     type: integer
                 type: object

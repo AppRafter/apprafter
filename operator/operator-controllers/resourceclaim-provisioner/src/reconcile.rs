@@ -1501,9 +1501,14 @@ struct ClaimStatusFields<'a> {
     volume_claim_ref: Option<&'a str>,
     /// Dragonfly's `(instance, dbnum)` allocation.
     allocation: Option<(&'a str, u16)>,
-    /// Used/total bytes of the claim's own volume — disk claims only
-    /// (2.22d / D8), and absent when the sample failed.
-    capacity: Option<(i64, i64)>,
+    /// Used/total bytes of the volume behind a disk claim (2.22d / D8), and
+    /// absent when the sample failed.
+    ///
+    /// Carries its SCOPE (D29): for a local-path volume the kubelet reports
+    /// the backing filesystem, so these are the host disk's numbers, not the
+    /// claim's. Recording which one was measured is what stops a 1Gi claim
+    /// from being rendered as an 80GB one.
+    capacity: Option<VolumeSample>,
 }
 
 fn status_apply_body(
@@ -1545,8 +1550,8 @@ fn status_apply_body(
     // kubelet leaves the previous figure alone instead of pruning it to
     // nothing. An absent capacity means "not measured this pass", which is
     // different from "empty" and must not render as it.
-    if let Some((used, cap)) = capacity {
-        status["capacity"] = json!({ "usedBytes": used, "capacityBytes": cap });
+    if let Some(VolumeSample { used, cap, scope }) = capacity {
+        status["capacity"] = json!({ "usedBytes": used, "capacityBytes": cap, "scope": scope });
     }
     if let Some((instance, dbnum)) = allocation {
         status["instance"] = json!(instance);
@@ -1761,7 +1766,7 @@ async fn refresh_claim_capacity(ctx: &Context, claim: &ResourceClaim, ns: &str, 
     else {
         return;
     };
-    let Some((used, cap)) = sample_claim_volume(ctx, &pvc).await else {
+    let Some(VolumeSample { used, cap, scope }) = sample_claim_volume(ctx, &pvc).await else {
         // Same rule as the pg arm: never-measured is the actionable state.
         let never_measured = claim
             .status
@@ -1793,7 +1798,7 @@ async fn refresh_claim_capacity(ctx: &Context, claim: &ResourceClaim, ns: &str, 
         "apiVersion": "apprafter.io/v1alpha1",
         "kind": "ResourceClaim",
         "metadata": { "name": name },
-        "status": { "capacity": { "usedBytes": used, "capacityBytes": cap } },
+        "status": { "capacity": { "usedBytes": used, "capacityBytes": cap, "scope": scope } },
     });
     // DEDICATED manager, for the reason spelled out on the pg arm: SSA
     // replaces a manager's whole field-set, so a partial body under the
@@ -1926,7 +1931,7 @@ fn figure_moved_materially(previous: Option<i64>, sample: i64, absolute: i64) ->
 /// `None` on any failure — an unreadable kubelet leaves the previous figure
 /// alone rather than failing a provision that otherwise succeeded, and the
 /// status writer omits the field so SSA does not prune it.
-async fn sample_claim_volume(ctx: &Context, pvc_name: &str) -> Option<(i64, i64)> {
+async fn sample_claim_volume(ctx: &Context, pvc_name: &str) -> Option<VolumeSample> {
     sample_claim_volume_detailed(ctx, pvc_name).await.ok()
 }
 
@@ -1939,7 +1944,10 @@ async fn sample_claim_volume(ctx: &Context, pvc_name: &str) -> Option<(i64, i64)
 /// implement a metrics provider, and a `hostPath`-backed volume (what
 /// local-path-provisioner hands out on kind) does not. Saying which one it is
 /// keeps "unsupported here" from reading as "broken".
-async fn sample_claim_volume_detailed(ctx: &Context, pvc_name: &str) -> Result<(i64, i64), String> {
+async fn sample_claim_volume_detailed(
+    ctx: &Context,
+    pvc_name: &str,
+) -> Result<VolumeSample, String> {
     let nodes = Api::<k8s_openapi::api::core::v1::Node>::all(ctx.client.clone())
         .list(&Default::default())
         .await
@@ -1954,7 +1962,7 @@ async fn sample_claim_volume_detailed(ctx: &Context, pvc_name: &str) -> Result<(
         .summary_for_node(&ctx.client, &node)
         .await
         .ok_or_else(|| format!("no kubelet stats summary for node {node}"))?;
-    operator_core::capacity::pvc_usage(&summary, pvc_name).ok_or_else(|| {
+    let (used, cap) = operator_core::capacity::pvc_usage(&summary, pvc_name).ok_or_else(|| {
         let reported = operator_core::capacity::reported_pvc_names(&summary);
         if reported.is_empty() {
             format!(
@@ -1968,7 +1976,28 @@ async fn sample_claim_volume_detailed(ctx: &Context, pvc_name: &str) -> Result<(
                 reported.join(", ")
             )
         }
-    })
+    })?;
+    // D29: decide from THIS summary whether the figure is the volume's own or
+    // the host disk's. Both numbers come out of one document, so the comparison
+    // cannot be skewed by two samples taken a poll apart.
+    let scope = operator_core::capacity::capacity_scope(
+        cap,
+        operator_core::capacity::node_fs_capacity(&summary),
+    );
+    Ok(VolumeSample { used, cap, scope })
+}
+
+/// A sampled volume figure, and WHICH THING it measured (D29).
+///
+/// The scope is not decoration. For a local-path volume the kubelet reports
+/// the backing filesystem, so `cap` is the node's disk — and a reader told
+/// "1Gi claim: 74.8 GiB capacity" has been misinformed by a number that is
+/// individually correct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VolumeSample {
+    pub used: i64,
+    pub cap: i64,
+    pub scope: &'static str,
 }
 
 async fn patch_status(

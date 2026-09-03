@@ -68,6 +68,56 @@ pub fn node_free_fraction(summary: &Value) -> Option<f64> {
     Some(avail / cap)
 }
 
+/// The node root filesystem's `capacityBytes`, or `None` when absent.
+///
+/// Read from the same Summary document the per-volume figures come from, so a
+/// caller can tell whether a volume's numbers are the volume's own — see
+/// [`capacity_scope`].
+pub fn node_fs_capacity(summary: &Value) -> Option<i64> {
+    summary.pointer("/node/fs/capacityBytes")?.as_i64()
+}
+
+/// Whether a sampled volume figure describes the VOLUME or the HOST DISK
+/// underneath it (D29).
+///
+/// # The problem this names
+///
+/// The kubelet reports volume statistics per PVC, and for a local-path
+/// (hostPath-backed) PersistentVolume those statistics are the BACKING
+/// FILESYSTEM's: a directory on a shared filesystem has no quota to report
+/// against, so `capacityBytes` comes back as the whole node disk.
+///
+/// Measured on real hardware: a claim requesting 1Gi reported
+/// `capacityBytes = 80279486464`, byte-identical to the node's root
+/// filesystem, and `usedBytes` was the node's used space. Presenting that as
+/// the claim's own capacity tells an operator their 1Gi volume holds 80GB —
+/// the node's fact wearing the claim's name.
+///
+/// Nothing in the sampling is wrong; the composition is. So instead of
+/// discarding the figure (it is genuinely useful — "this volume shares an 80GB
+/// disk that is 12% full" is the actionable fact on a single-node tier) or
+/// dressing it up, record WHICH THING WAS MEASURED and let the reader be told
+/// the truth.
+///
+/// Equality against the node's capacity is the detector. A CSI backend that
+/// enforces a real quota reports that quota, and matching the root
+/// filesystem's byte count exactly would be a coincidence with no plausible
+/// mechanism behind it.
+pub fn capacity_scope(
+    volume_capacity_bytes: i64,
+    node_capacity_bytes: Option<i64>,
+) -> &'static str {
+    match node_capacity_bytes {
+        Some(node) if node > 0 && node == volume_capacity_bytes => SCOPE_HOST,
+        _ => SCOPE_VOLUME,
+    }
+}
+
+/// The figure is the host disk's, not this volume's.
+pub const SCOPE_HOST: &str = "host";
+/// The figure is the volume's own — a backend with a real quota.
+pub const SCOPE_VOLUME: &str = "volume";
+
 /// `(usedBytes, capacityBytes)` for the named PVC, scanning every pod's
 /// `volume[]` for a matching `pvcRef.name`. `None` when the PVC is not
 /// mounted by any pod the kubelet reports, or either byte field is absent.
@@ -296,5 +346,47 @@ mod tests {
         assert!(!should_emit_event(true, true)); // warn→warn → suppress
         assert!(!should_emit_event(true, false)); // recovered → no emit
         assert!(!should_emit_event(false, false)); // OK→OK → no emit
+    }
+
+    // -----------------------------------------------------------------
+    // D29 — a figure must say which thing it measured
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_volume_figure_matching_the_node_disk_is_the_hosts() {
+        // The measured case, from e2e/node-disk-pressure-hetzner.sh: a claim
+        // that asked for 1Gi reported the node's whole root filesystem,
+        // because local-path has no quota for the kubelet to report against.
+        assert_eq!(
+            capacity_scope(80_279_486_464, Some(80_279_486_464)),
+            SCOPE_HOST
+        );
+    }
+
+    #[test]
+    fn a_real_quota_reports_itself_and_stays_volume_scoped() {
+        // A CSI backend enforcing 1Gi reports 1Gi; it does not coincide with
+        // the node byte count, and must not be relabelled.
+        assert_eq!(
+            capacity_scope(1_073_741_824, Some(80_279_486_464)),
+            SCOPE_VOLUME
+        );
+    }
+
+    #[test]
+    fn an_unknown_node_capacity_never_claims_host_scope() {
+        // Silence about the node is not evidence about the volume. Defaulting
+        // to `host` on a missing figure would relabel every correct volume
+        // number on a cluster whose kubelet stopped reporting node.fs.
+        assert_eq!(capacity_scope(1_073_741_824, None), SCOPE_VOLUME);
+        // And a nonsense node figure is treated the same way.
+        assert_eq!(capacity_scope(0, Some(0)), SCOPE_VOLUME);
+    }
+
+    #[test]
+    fn node_fs_capacity_reads_the_same_document_the_volume_figures_come_from() {
+        let s = json!({ "node": { "fs": { "availableBytes": 15_u64, "capacityBytes": 100_u64 } } });
+        assert_eq!(node_fs_capacity(&s), Some(100));
+        assert_eq!(node_fs_capacity(&json!({})), None);
     }
 }

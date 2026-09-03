@@ -279,37 +279,35 @@ if cap <= 0 or used < 0 or used > cap:
 print(f'  ok: the figure is internally consistent ({100*used/cap:.1f}% used)')
 "
 
-# D29 — RECORDED, NOT ASSERTED, AND DELIBERATELY SO.
+# D29 — THE FIGURE MUST SAY WHICH THING IT MEASURED.
 #
-# The claim asked for 1Gi. On the first real-hardware run the figure came back
-# as capacityBytes=80279486464 — byte-identical to the NODE filesystem measured
-# in Phase 1. The operator is not at fault: it reads the kubelet's per-PVC
-# volume entry faithfully (operator-core capacity::pvc_usage), and for a
-# local-path volume the kubelet reports the BACKING FILESYSTEM, because there
-# is no quota to report against.
+# The first run of this walk found the claim reporting capacityBytes identical
+# to the NODE filesystem: a 1Gi claim presented as an 80GB one. Nothing in the
+# sampling is wrong — the kubelet reports the BACKING FILESYSTEM for a
+# local-path PV, because a directory on a shared disk has no quota to report
+# against — but presenting it as the CLAIM's capacity is the node's fact
+# wearing the claim's name, which is D8's own title one layer down.
 #
-# The result is a claim status that says a 1Gi disk is 80GB and 12% used. That
-# is the node's disk wearing the claim's name — the same shape as D8's own
-# title, "a node fact carried by an object that is not the node".
-#
-# This does NOT fail the walk. Failing would assert a behaviour the product has
-# not chosen yet, and D8's write-up already weighed the alternatives (printing
-# the provisioned size alone "answers the easy half of the question and reads as
-# if it had answered both"). So: measure it, name it, print it loudly, and let
-# the decision be made deliberately rather than by a red walk.
-if [ "$CAP_BYTES" = "$CAP" ]; then
-    printf '\n  ############ FINDING (D29) ############\n'
-    printf '  the claim capacity EQUALS the node filesystem capacity (%s bytes).\n' "$CAP_BYTES"
-    printf '  The claim requested 1Gi. A reader of `app status` is told this volume\n'
-    printf '  holds 80GB. The kubelet has no per-volume quota to report for a\n'
-    printf '  local-path PV, so this is what it returns — but presenting it as the\n'
-    printf '  CLAIM'"'"'s capacity is the node fact wearing the claim'"'"'s name.\n'
-    printf '  Recorded as D29; not asserted, because the product has not chosen yet.\n'
-    printf '  ######################################\n\n'
-else
-    printf '  note: claim capacity (%s) differs from node capacity (%s) — D29 may be addressed\n' \
-        "$CAP_BYTES" "$CAP"
+# The fix records the scope rather than discarding a genuinely useful number
+# ("this volume shares an 80GB disk that is 12% full" is the actionable fact on
+# a single-node tier). So on THIS backend the assertion is exact: the figures
+# equal the node's, and the operator must say so.
+assert_eq "the sampled figure equals the node disk (local-path has no quota)" \
+    "$CAP_BYTES" "$CAP"
+SCOPE=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.status.capacity.scope}')
+if [ "$SCOPE" != "host" ]; then
+    printf 'FAILED: the claim reports the node disk but labels it %q, not "host"\n' \
+        "${SCOPE:-<absent>}" >&2
+    printf '  An unlabelled figure tells the reader their 1Gi volume holds 80GB (D29).\n' >&2
+    kubectl -n "$APP_NS" get "$CLAIM_RES" "$CLAIM" -o jsonpath='{.status.capacity}' >&2 2>&1 || true
+    echo >&2
+    exit 1
 fi
+printf '  ok: the figure is labelled scope=host — the node disk, named as such\n'
+# The CLI side (`1Gi · host disk 12%% full` instead of `9.0 GB / 74.8 GB`) is
+# unit-covered in app.rs; it is not asserted here because this walk applies the
+# Application CR directly and `app status` resolves through an Argo CD
+# Application, which a direct CR does not have.
 
 # ===============================================================
 # Phase 3: fill the node past the threshold -> NodeDiskPressure (D8)

@@ -27,6 +27,13 @@ package v1alpha1
 		capacity?: {
 			usedBytes?:     int
 			capacityBytes?: int
+			// WHICH THING those bytes measure (D29). `volume` when the
+			// backend enforces a quota and reports it; `host` when they are
+			// the backing filesystem's, which is what the kubelet returns
+			// for a local-path PV — a directory on a shared disk has no
+			// quota to report against. Absent from anything an operator
+			// predating the field wrote; readers treat that as unknown.
+			scope?: "volume" | "host"
 		}
 		conditions?: [...#SharedVolumeCondition]
 	}
