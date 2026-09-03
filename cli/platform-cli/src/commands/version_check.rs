@@ -51,43 +51,82 @@ struct CachedCheck {
 /// line to stderr if one exists. Best-effort — failures
 /// swallowed silently (logged at debug level).
 pub fn maybe_warn_about_newer_version() {
-    let current = env!("CARGO_PKG_VERSION");
-    if let Some(latest) = resolve_latest_tag() {
-        if newer_than(&latest, current) {
-            eprintln!(
-                "apprafter {latest} is available; you're on {current}. \
-                 Upgrade: https://github.com/apprafter/apprafter/releases/latest"
-            );
-        }
+    if let Some(line) = upgrade_notice(env!("CARGO_PKG_VERSION"), resolve_latest_tag().as_deref()) {
+        eprintln!("{line}");
     }
 }
 
+/// The upgrade line for `(current, latest)`, or `None` when there is nothing
+/// to say.
+///
+/// Split out from the printing so the DECISION can be tested. Fail-quiet is
+/// the rule here — an unknown latest, an equal one, or an older one all mean
+/// silence, because a version notice that fires wrongly is a notice people
+/// learn to ignore, and this one prints before every command.
+fn upgrade_notice(current: &str, latest: Option<&str>) -> Option<String> {
+    let latest = latest?;
+    newer_than(latest, current).then(|| {
+        format!(
+            "apprafter {latest} is available; you're on {current}. \
+             Upgrade: https://github.com/apprafter/apprafter/releases/latest"
+        )
+    })
+}
+
 fn resolve_latest_tag() -> Option<String> {
-    let cache_path = cache_path();
-    if let Some(cached) = read_fresh_cache(&cache_path) {
+    let path = cache_path();
+    resolve_latest_tag_with(
+        || read_fresh_cache(&path),
+        fetch_latest_tag,
+        |entry| {
+            let _ = write_cache(&cache_path(), entry);
+        },
+        now_secs,
+    )
+}
+
+/// Seconds since the epoch, or 0 when the clock is before it.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The cache-or-fetch decision, with every impure part injected.
+///
+/// # Why this seam exists
+///
+/// This function used to read a disk cache, call api.github.com and stamp
+/// `SystemTime::now()` inline. That made its behaviour depend on the network
+/// and on whatever ran before it — and it made the CODE COVERAGE OF THIS FILE
+/// NON-REPRODUCIBLE: two consecutive measurement runs reported 93.31% and
+/// 73.94% for it, with nothing changed in between. A coverage number that
+/// moves on its own cannot be used as a gate, so the seam is not only about
+/// testability.
+///
+/// The order matters and is asserted: a fresh cache must short-circuit
+/// BEFORE the fetch, or every command pays a network round trip.
+fn resolve_latest_tag_with(
+    read_cache: impl FnOnce() -> Option<CachedCheck>,
+    fetch: impl FnOnce() -> Result<String, String>,
+    write: impl FnOnce(&CachedCheck),
+    now: impl FnOnce() -> u64,
+) -> Option<String> {
+    if let Some(cached) = read_cache() {
         return Some(cached.latest_tag);
     }
-
-    let fetched = match fetch_latest_tag() {
+    let fetched = match fetch() {
         Ok(tag) => tag,
         Err(e) => {
             debug!(error = %e, "version check fetch failed");
             return None;
         }
     };
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let _ = write_cache(
-        &cache_path,
-        &CachedCheck {
-            latest_tag: fetched.clone(),
-            fetched_at_secs: now,
-        },
-    );
-
+    write(&CachedCheck {
+        latest_tag: fetched.clone(),
+        fetched_at_secs: now(),
+    });
     Some(fetched)
 }
 
@@ -199,6 +238,96 @@ fn newer_than(candidate: &str, current: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
+    // -----------------------------------------------------------------
+    // The cache-or-fetch decision, with no network and no clock
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_fresh_cache_short_circuits_before_the_network() {
+        // This is the property that keeps a version check off the critical
+        // path of every command. If the fetch runs anyway, the cache is
+        // decoration and each invocation pays a round trip to api.github.com.
+        let fetched = Cell::new(false);
+        let wrote = Cell::new(false);
+        let got = super::resolve_latest_tag_with(
+            || {
+                Some(super::CachedCheck {
+                    latest_tag: "v9.9.9".into(),
+                    fetched_at_secs: 1,
+                })
+            },
+            || {
+                fetched.set(true);
+                Ok("v1.0.0".into())
+            },
+            |_| wrote.set(true),
+            || 42,
+        );
+        assert_eq!(got.as_deref(), Some("v9.9.9"));
+        assert!(!fetched.get(), "a fresh cache must not trigger a fetch");
+        assert!(!wrote.get(), "nothing to rewrite when the cache was used");
+    }
+
+    #[test]
+    fn a_cache_miss_fetches_and_records_the_result_with_the_current_time() {
+        let wrote: Cell<Option<(String, u64)>> = Cell::new(None);
+        let got = super::resolve_latest_tag_with(
+            || None,
+            || Ok("v2.3.4".into()),
+            |e| wrote.set(Some((e.latest_tag.clone(), e.fetched_at_secs))),
+            || 1_700_000_000,
+        );
+        assert_eq!(got.as_deref(), Some("v2.3.4"));
+        // The stamp is what makes the NEXT run's freshness check meaningful;
+        // writing the tag without it would make every cache entry immortal or
+        // instantly stale depending on the default.
+        assert_eq!(wrote.take(), Some(("v2.3.4".to_string(), 1_700_000_000)));
+    }
+
+    #[test]
+    fn a_failed_fetch_is_silent_and_writes_nothing() {
+        // Fail-quiet: a version check that errors must not print, must not
+        // poison the cache with a sentinel, and must not fail the command it
+        // is running in front of.
+        let wrote = Cell::new(false);
+        let got = super::resolve_latest_tag_with(
+            || None,
+            || Err("HTTP: timed out".into()),
+            |_| wrote.set(true),
+            || 42,
+        );
+        assert_eq!(got, None);
+        assert!(!wrote.get(), "a failed fetch must not be cached as success");
+    }
+
+    // -----------------------------------------------------------------
+    // The notice itself
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_newer_release_produces_a_notice_naming_both_versions() {
+        let line = super::upgrade_notice("0.2.58", Some("v0.3.0")).expect("a notice");
+        assert!(
+            line.contains("v0.3.0"),
+            "names the available version: {line}"
+        );
+        assert!(line.contains("0.2.58"), "names the running version: {line}");
+        assert!(line.contains("releases/latest"), "says where to go: {line}");
+    }
+
+    #[test]
+    fn nothing_is_said_when_there_is_nothing_to_say() {
+        // Same version, older version, and no known latest all mean silence.
+        assert_eq!(super::upgrade_notice("0.2.58", Some("v0.2.58")), None);
+        assert_eq!(super::upgrade_notice("0.2.58", Some("v0.2.57")), None);
+        assert_eq!(super::upgrade_notice("0.2.58", None), None);
+        // And an unparseable tag is silence rather than a notice about
+        // garbage — `newer_than` is fail-quiet by design.
+        assert_eq!(super::upgrade_notice("0.2.58", Some("not-a-version")), None);
+    }
+
     use super::*;
     use serde_json::json;
 
