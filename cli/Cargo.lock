@@ -229,11 +229,13 @@ dependencies = [
  "chrono",
  "cli-core",
  "futures",
+ "http",
  "k8s-openapi",
  "kube",
  "serde_json",
  "tempfile",
  "tokio",
+ "tower-service",
  "ureq",
 ]
 

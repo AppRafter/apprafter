@@ -647,6 +647,222 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // Live probes against loopback
+    //
+    // The mapping functions above are pure, but the property that matters —
+    // a blocked egress must never be reported as a rejected credential —
+    // only exists once a real HTTP round trip is involved. These point the
+    // probe at an ephemeral loopback port: nothing leaves the machine, and
+    // "the host said 401" and "nothing answered" are genuinely different
+    // events rather than two branches of a match.
+    // -----------------------------------------------------------------
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use crate::tests::{list_of, scripted_apiserver, Call};
+
+    /// A loopback HTTP/1.1 responder that answers every request with
+    /// `status_line`. Returns its base URL and the task serving it.
+    async fn local_host(status_line: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("loopback address");
+        let serving = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        format!("HTTP/1.1 {status_line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                            .as_bytes(),
+                    )
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), serving)
+    }
+
+    /// An address nothing is listening on — a bound port released before it
+    /// is used, so a connection there is refused rather than hanging.
+    async fn dead_address() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("loopback address");
+        drop(listener);
+        addr.to_string()
+    }
+
+    /// A `Client` whose Argo CD `Application` list holds one app per
+    /// `repo_urls`, and whose AppRafter `Application` list holds one app per
+    /// `images`.
+    fn apps_client(repo_urls: Vec<String>, images: Vec<String>) -> kube::Client {
+        let argo: Vec<serde_json::Value> = repo_urls
+            .iter()
+            .enumerate()
+            .map(|(i, url)| {
+                serde_json::json!({
+                    "apiVersion": "argoproj.io/v1alpha1",
+                    "kind": "Application",
+                    "metadata": { "name": format!("argo-{i}"), "namespace": "argocd" },
+                    "spec": { "source": { "repoURL": url } },
+                })
+            })
+            .collect();
+        let apprafter: Vec<serde_json::Value> = images
+            .iter()
+            .enumerate()
+            .map(|(i, image)| {
+                serde_json::json!({
+                    "apiVersion": "apprafter.io/v1alpha1",
+                    "kind": "Application",
+                    "metadata": { "name": format!("app-{i}"), "namespace": "landing" },
+                    "spec": { "base": { "image": image } },
+                })
+            })
+            .collect();
+        let (client, _log) = scripted_apiserver(move |call: &Call| {
+            if call.uri.contains("argoproj.io/v1alpha1/applications") {
+                return list_of("argoproj.io/v1alpha1", "ApplicationList", argo.clone());
+            }
+            if call.uri.contains("apprafter.io/v1alpha1/applications") {
+                return list_of(
+                    "apprafter.io/v1alpha1",
+                    "ApplicationList",
+                    apprafter.clone(),
+                );
+            }
+            (200, serde_json::Value::Null)
+        });
+        client
+    }
+
+    /// An explicit auth rejection from the git host is the ONE thing that
+    /// condemns the credential. The representative repo comes from a live
+    /// Argo `Application`, is probed over real HTTP, and the 401 has to make
+    /// it all the way into the half verdict.
+    #[tokio::test]
+    async fn a_git_host_that_rejects_the_credential_makes_the_half_invalid() {
+        let (base, serving) = local_host("401 Unauthorized").await;
+        let client = apps_client(vec![format!("{base}/acme/landing")], vec![]);
+
+        let (verdict, message) =
+            probe_git_half(&client, &[format!("{base}/acme")], "acme-bot", "ghp_x").await;
+        serving.abort();
+
+        assert_eq!(verdict, Validity::Invalid);
+        assert!(message.contains("401/403"), "{message}");
+    }
+
+    /// A clean 200 makes the half `Valid` and the message reports how many
+    /// representatives were actually probed — the number is what tells an
+    /// operator the verdict came from somewhere real rather than from an
+    /// empty coverage list.
+    #[tokio::test]
+    async fn a_reachable_git_host_makes_the_half_valid_and_counts_what_it_probed() {
+        let (base, serving) = local_host("200 OK").await;
+        let client = apps_client(
+            vec![
+                format!("{base}/acme/landing"),
+                format!("{base}/acme/api"),
+                // …and one outside the covered prefix, which must NOT be probed.
+                format!("{base}/other/thing"),
+            ],
+            vec![],
+        );
+
+        let (verdict, message) =
+            probe_git_half(&client, &[format!("{base}/acme")], "acme-bot", "ghp_x").await;
+        serving.abort();
+
+        assert_eq!(verdict, Validity::Valid);
+        assert!(
+            message.contains("2 representative"),
+            "only the two covered repos may be probed: {message}"
+        );
+    }
+
+    /// THE safety property, end to end over a real socket: a host that
+    /// cannot be reached leaves the half `Unverified`, and says so with the
+    /// "unreachable" wording rather than the "nothing to probe" one. Mapping
+    /// a refused connection to `Invalid` would fail every application whose
+    /// coverage gate reads this condition the moment egress is restricted.
+    #[tokio::test]
+    async fn a_git_host_that_cannot_be_reached_is_unverified_not_invalid() {
+        let dead = dead_address().await;
+        let client = apps_client(vec![format!("http://{dead}/acme/landing")], vec![]);
+
+        let (verdict, message) = probe_git_half(
+            &client,
+            &[format!("http://{dead}/acme")],
+            "acme-bot",
+            "ghp_x",
+        )
+        .await;
+
+        assert_eq!(verdict, Validity::Unverified);
+        assert!(
+            message.contains("unreachable"),
+            "a probed-but-unreachable host must not read as 'nothing to probe': {message}"
+        );
+    }
+
+    /// The same for the registry half. `oci-distribution` fails the token
+    /// exchange against a dead loopback address with a transport error, and
+    /// a transport error is not a credential verdict.
+    #[tokio::test]
+    async fn a_registry_that_cannot_be_reached_is_unverified_not_invalid() {
+        let dead = dead_address().await;
+        let client = apps_client(vec![], vec![format!("{dead}/acme/landing:v1")]);
+
+        let (verdict, message) =
+            probe_registry_half(&client, &[format!("{dead}/acme")], "acme-bot", "ghp_x").await;
+
+        assert_eq!(verdict, Validity::Unverified);
+        assert!(
+            message.contains("unreachable"),
+            "a probed-but-unreachable registry must not read as 'nothing to probe': {message}"
+        );
+    }
+
+    /// A cluster full of applications that reference NOTHING the credential
+    /// covers must probe nothing at all — and say "no application references
+    /// a covered prefix", not "unreachable". Probing an uncovered repo would
+    /// test a credential this SourceCredential never claimed, and the two
+    /// messages are the operator's only way to tell the states apart.
+    #[tokio::test]
+    async fn applications_outside_the_coverage_are_not_probed_at_all() {
+        let dead = dead_address().await;
+        let client = apps_client(
+            vec![format!("http://{dead}/other/thing")],
+            vec![format!("{dead}/other/thing:v1")],
+        );
+
+        let (verdict, message) = probe_git_half(
+            &client,
+            &[format!("http://{dead}/acme")],
+            "acme-bot",
+            "ghp_x",
+        )
+        .await;
+        assert_eq!(verdict, Validity::Unverified);
+        assert!(
+            message.contains("no Argo Application references"),
+            "{message}"
+        );
+
+        let (verdict, message) =
+            probe_registry_half(&client, &[format!("{dead}/acme")], "acme-bot", "ghp_x").await;
+        assert_eq!(verdict, Validity::Unverified);
+        assert!(
+            message.contains("no Application renders an image"),
+            "{message}"
+        );
+    }
+
     #[test]
     fn condition_parts_map_each_variant() {
         assert_eq!(

@@ -23,3 +23,13 @@ futures     = { workspace = true }
 tokio       = { workspace = true }
 chrono      = { workspace = true }
 serde_json  = { workspace = true }
+
+[dev-dependencies]
+# `reconcile.rs` drives a full reconcile against a scripted in-process
+# apiserver. `kube::Client` is a thin wrapper over a `tower::Service`, so a
+# `tower::service_fn` answering from a script exercises the real client
+# (real URL construction, real 5xx mapping) with no cluster — the only way
+# to assert WHICH calls a reconcile makes, in which order, and that a
+# failed ServiceProvider list writes no status at all.
+tower = { workspace = true }
+http  = { workspace = true }

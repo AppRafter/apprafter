@@ -1644,12 +1644,14 @@ version = "0.1.2"
 dependencies = [
  "chrono",
  "futures",
+ "http",
  "k8s-openapi",
  "kube",
  "operator-core",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tower 0.5.3",
  "tracing",
 ]
 
@@ -1660,6 +1662,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures",
+ "http",
  "k8s-openapi",
  "kube",
  "oci-distribution",
@@ -1671,6 +1674,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tower 0.5.3",
  "tracing",
 ]
 
@@ -1690,6 +1694,7 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "tokio",
+ "tower 0.5.3",
  "tracing",
 ]
 

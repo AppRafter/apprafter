@@ -46,3 +46,15 @@ oci-distribution = { workspace = true }
 # operator + webhook binaries. Same provider, same explicit install, so the
 # tests match how the binaries actually run.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+# The reconcile-level tests drive the whole controller against a scripted
+# in-process apiserver. `kube::Client` is a thin wrapper over a
+# `tower::Service`, so a `tower::service_fn` answering from a script
+# exercises the real client (real URL construction, real 404/5xx mapping)
+# with no cluster — the only way to assert WHICH writes a pass makes, in
+# which order, and that a paused credential makes none.
+tower = { workspace = true }
+http  = { workspace = true }
+# `validity.rs` points the git probe at a one-shot HTTP responder on an
+# ephemeral loopback port. "the host said 401" and "nothing answered" must
+# produce DIFFERENT verdicts, and only a live socket exercises that.
+tokio = { workspace = true, features = ["net", "io-util"] }

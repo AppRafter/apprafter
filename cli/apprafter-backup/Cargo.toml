@@ -35,3 +35,14 @@ kube        = { workspace = true, features = ["ws"] }
 k8s-openapi = { workspace = true }
 futures     = { workspace = true }
 ureq        = { workspace = true }
+
+[dev-dependencies]
+# `kube_rs_exec` tests hand `kube::Client::new` a hand-written stub apiserver
+# instead of a cluster — the kube-rs project's own test idiom (see
+# kube-client's `client::tests::test_mock`). `tower-service` supplies the
+# `Service` trait that constructor is generic over and `http` the
+# request/response types; both are already transitive deps of `kube`, so this
+# adds nothing new to the dependency graph. No sockets, no cluster: the real
+# kube-rs request builder and response/error decoder run against canned bytes.
+http          = "1"
+tower-service = "0.3"

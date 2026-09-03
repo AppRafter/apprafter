@@ -2540,4 +2540,1192 @@ mod tests {
         // prior baseline; carry it forward (SSA-prune guard).
         assert_eq!(s.last_applied_spec.as_ref(), Some(&baseline));
     }
+
+    // ---------------- reconcile against a scripted apiserver ----------------
+    //
+    // Everything above pins what this controller DECIDES. What none of it can
+    // reach is what the controller then does to the cluster: which Secrets it
+    // writes and where, whether the finalizer is in place before any
+    // derivation, whether a paused credential really writes nothing, and
+    // whether a failed sweep still releases the finalizer. Those are the
+    // failure modes that leak a working PAT or silently drop a coverage
+    // narrowing, and they only exist at the I/O boundary.
+    //
+    // `kube::Client` is a thin wrapper over a `tower::Service`, so a service
+    // answering from a script exercises the real client — real URL
+    // construction, real (de)serialisation, real 404/5xx mapping — with no
+    // cluster.
+
+    use std::sync::Mutex;
+
+    use kube::client::Body;
+
+    /// One request, as the apiserver saw it.
+    #[derive(Clone, Debug)]
+    pub(crate) struct Call {
+        pub(crate) method: String,
+        pub(crate) uri: String,
+        pub(crate) body: Value,
+    }
+
+    /// A `Client` that answers from `respond`, plus the ordered log of every
+    /// request it was asked to serve.
+    pub(crate) fn scripted_apiserver<F>(respond: F) -> (Client, Arc<Mutex<Vec<Call>>>)
+    where
+        F: FnMut(&Call) -> (u16, Value) + Send + 'static,
+    {
+        let log = Arc::new(Mutex::new(Vec::<Call>::new()));
+        let sink = log.clone();
+        let respond = Arc::new(Mutex::new(respond));
+        let service = tower::service_fn(move |req: http::Request<Body>| {
+            let sink = sink.clone();
+            let respond = respond.clone();
+            async move {
+                let method = req.method().to_string();
+                let uri = req.uri().to_string();
+                let bytes = req.into_body().collect_bytes().await.expect("request body");
+                let call = Call {
+                    method,
+                    uri,
+                    body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+                };
+                let (code, payload) = (respond.lock().expect("responder"))(&call);
+                sink.lock().expect("log").push(call);
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(code)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&payload).expect("canned response"),
+                        ))
+                        .expect("canned response"),
+                )
+            }
+        });
+        (Client::new(service, "apprafter-system"), log)
+    }
+
+    fn apiserver_unavailable() -> (u16, Value) {
+        (
+            500,
+            json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "message": "etcdserver: request timed out",
+                "reason": "InternalError", "code": 500,
+            }),
+        )
+    }
+
+    fn not_found(what: &str) -> (u16, Value) {
+        (
+            404,
+            json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "message": format!("{what} not found"),
+                "reason": "NotFound", "code": 404,
+            }),
+        )
+    }
+
+    pub(crate) fn list_of(api_version: &str, kind: &str, items: Vec<Value>) -> (u16, Value) {
+        (
+            200,
+            json!({
+                "apiVersion": api_version,
+                "kind": kind,
+                "metadata": { "resourceVersion": "1" },
+                "items": items,
+            }),
+        )
+    }
+
+    /// The unsealed material Secret, with `data` base64-encoded exactly as the
+    /// apiserver returns it.
+    fn material_secret() -> (u16, Value) {
+        (
+            200,
+            json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": { "name": "srccred-acme-material", "namespace": "apprafter-system" },
+                "data": { "username": "YWNtZS1ib3Q=", "password": "Z2hwX3NlY3JldA==" },
+            }),
+        )
+    }
+
+    fn secret_json(name: &str, namespace: &str) -> Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "labels": { SOURCE_CREDENTIAL_LABEL: "acme" },
+            },
+        })
+    }
+
+    fn deleted() -> (u16, Value) {
+        (
+            200,
+            json!({ "apiVersion": "v1", "kind": "Status", "status": "Success" }),
+        )
+    }
+
+    /// The apiserver a settled `acme` credential sees: material unsealed, no
+    /// MigrationPlans, no application referencing a covered prefix (so the
+    /// live validity probes find nothing to probe and never leave the
+    /// process). Tests override only the leg their case is about.
+    fn happy_path(call: &Call) -> (u16, Value) {
+        let uri = call.uri.as_str();
+        match (call.method.as_str(), uri) {
+            (_, u) if u.contains("/migrationplans") && call.method == "PATCH" => {
+                (200, call.body.clone())
+            }
+            (_, u) if u.contains("/migrationplans") && call.method == "DELETE" => deleted(),
+            (_, u) if u.contains("/migrationplans") => {
+                list_of("apprafter.io/v1alpha1", "MigrationPlanList", vec![])
+            }
+            ("GET", u) if u.contains("/secrets/srccred-acme-material") => material_secret(),
+            ("GET", u) if u.contains("argoproj.io/v1alpha1/applications") => {
+                list_of("argoproj.io/v1alpha1", "ApplicationList", vec![])
+            }
+            ("GET", u) if u.contains("apprafter.io/v1alpha1/applications") => {
+                list_of("apprafter.io/v1alpha1", "ApplicationList", vec![])
+            }
+            // Any Secret LIST that is not the cluster-wide sweep comes back
+            // empty — a namespaced sweep would miss the projected copies.
+            ("GET", u) if u.contains("/secrets?") => list_of("v1", "SecretList", vec![]),
+            ("PATCH", u) if u.contains("/secrets/") => (200, secret_json("derived", "argocd")),
+            ("DELETE", u) if u.contains("/secrets/") => deleted(),
+            (_, u) if u.contains("/sourcecredentials/") => (
+                200,
+                json!({
+                    "apiVersion": "apprafter.io/v1alpha1",
+                    "kind": "SourceCredential",
+                    "metadata": { "name": "acme", "namespace": "apprafter-system" },
+                    "spec": {},
+                }),
+            ),
+            _ => (200, Value::Null),
+        }
+    }
+
+    /// A live `acme` credential in `apprafter-system`, both halves declared.
+    fn live_cred() -> SourceCredential {
+        let mut cred =
+            SourceCredential::new("acme", sc_spec(&["github.com/acme/"], &["ghcr.io/acme/"]));
+        cred.metadata.namespace = Some("apprafter-system".to_string());
+        cred.metadata.uid = Some("11111111-2222-3333-4444-555555555555".to_string());
+        cred
+    }
+
+    fn context(client: Client) -> Arc<Context> {
+        Arc::new(Context {
+            client,
+            metrics: Arc::new(Metrics::new()),
+        })
+    }
+
+    fn calls_of(log: &Arc<Mutex<Vec<Call>>>) -> Vec<Call> {
+        log.lock().expect("log").clone()
+    }
+
+    /// Index of the first call matching `method` whose URI contains `needle`.
+    fn position_of(calls: &[Call], method: &str, needle: &str) -> Option<usize> {
+        calls
+            .iter()
+            .position(|c| c.method == method && c.uri.contains(needle))
+    }
+
+    fn call_at<'a>(calls: &'a [Call], method: &str, needle: &str) -> &'a Call {
+        let idx = position_of(calls, method, needle)
+            .unwrap_or_else(|| panic!("no {method} to {needle} in {calls:#?}"));
+        &calls[idx]
+    }
+
+    /// A first derive writes BOTH halves where their consumers read them: the
+    /// Argo `repo-creds` Secret into the `argocd` namespace with the label
+    /// Argo CD selects on, and the canonical `dockerconfigjson` into the
+    /// credential's OWN namespace. Either landing in the wrong namespace, or
+    /// missing its label, silently produces a credential nothing can use —
+    /// the status would still say `Derived`.
+    #[tokio::test]
+    async fn a_first_derive_writes_both_halves_where_their_consumers_read_them() {
+        let (client, log) = scripted_apiserver(happy_path);
+        let ctx = context(client);
+
+        let action = reconcile(Arc::new(live_cred()), ctx.clone())
+            .await
+            .expect("a settled credential derives cleanly");
+        assert_eq!(
+            format!("{action:?}"),
+            format!("{:?}", Action::requeue(Duration::from_secs(60)))
+        );
+
+        let calls = calls_of(&log);
+        let repo_cred = call_at(
+            &calls,
+            "PATCH",
+            "/namespaces/argocd/secrets/srccred-acme-repo-0",
+        );
+        assert_eq!(
+            repo_cred
+                .body
+                .pointer("/metadata/labels/argocd.argoproj.io~1secret-type")
+                .and_then(Value::as_str),
+            Some("repo-creds"),
+            "Argo CD selects repo-creds by this label alone"
+        );
+        assert_eq!(
+            repo_cred
+                .body
+                .pointer("/stringData/url")
+                .and_then(Value::as_str),
+            Some("https://github.com/acme"),
+            "the prefix must be normalised for Argo's prefix match"
+        );
+        // The material really was read out of the unsealed Secret, not
+        // defaulted: a derive that shipped the fallback username with an empty
+        // password would still look `Derived` and fail every clone.
+        assert_eq!(
+            repo_cred
+                .body
+                .pointer("/stringData/username")
+                .and_then(Value::as_str),
+            Some("acme-bot")
+        );
+        assert_eq!(
+            repo_cred
+                .body
+                .pointer("/stringData/password")
+                .and_then(Value::as_str),
+            Some("ghp_secret")
+        );
+
+        let pull = call_at(
+            &calls,
+            "PATCH",
+            "/namespaces/apprafter-system/secrets/srccred-acme-dockercfg",
+        );
+        assert_eq!(
+            pull.body.pointer("/type").and_then(Value::as_str),
+            Some("kubernetes.io/dockerconfigjson"),
+            "a kubelet only honours imagePullSecrets of this type"
+        );
+        let dockercfg: Value = serde_json::from_str(
+            pull.body
+                .pointer("/stringData/.dockerconfigjson")
+                .and_then(Value::as_str)
+                .expect("a dockerconfigjson body"),
+        )
+        .expect("the pull secret must contain parseable JSON");
+        assert_eq!(
+            dockercfg
+                .pointer("/auths/ghcr.io/auth")
+                .and_then(Value::as_str),
+            Some("YWNtZS1ib3Q6Z2hwX3NlY3JldA=="),
+            "the auths key is the registry HOST, and the value is base64(user:pat)"
+        );
+    }
+
+    /// The finalizer goes on BEFORE anything is derived. It is the only thing
+    /// that can reclaim the derived Secrets — a cross-namespace
+    /// ownerReference does not exist — so a credential that derived a PAT
+    /// into `argocd` and only then got its finalizer would leak that PAT if
+    /// it were deleted in between.
+    #[tokio::test]
+    async fn the_finalizer_is_in_place_before_the_first_secret_is_written() {
+        let (client, log) = scripted_apiserver(happy_path);
+
+        reconcile(Arc::new(live_cred()), context(client))
+            .await
+            .expect("a settled credential derives cleanly");
+
+        let calls = calls_of(&log);
+        let finalizer = call_at(&calls, "PATCH", "/sourcecredentials/acme?");
+        assert_eq!(
+            finalizer.body.pointer("/metadata/finalizers"),
+            Some(&json!([DERIVED_SECRETS_FINALIZER])),
+        );
+        let placed = position_of(&calls, "PATCH", "/sourcecredentials/acme?").expect("placed");
+        let first_secret = position_of(&calls, "PATCH", "/secrets/").expect("a secret was written");
+        assert!(
+            placed < first_secret,
+            "the finalizer must precede the first derived Secret: {calls:#?}"
+        );
+    }
+
+    /// The status a first derive publishes: both halves `Present=True`, the
+    /// coverage lists an operator reads in `apprafter app status`, and the
+    /// migration BASELINE. The baseline is load-bearing — `patch_status` is a
+    /// forced single-manager apply, so a status that omitted it would prune
+    /// it, and the next narrowing would sail past the gate with no baseline
+    /// to detect against.
+    #[tokio::test]
+    async fn a_successful_derive_publishes_coverage_and_stamps_the_migration_baseline() {
+        let (client, log) = scripted_apiserver(happy_path);
+
+        reconcile(Arc::new(live_cred()), context(client))
+            .await
+            .expect("a settled credential derives cleanly");
+
+        let calls = calls_of(&log);
+        let status = call_at(&calls, "PATCH", "/sourcecredentials/acme/status");
+        let conditions = status
+            .body
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .expect("conditions");
+        for wanted in [COND_GIT_PRESENT, COND_REGISTRY_PRESENT] {
+            assert!(
+                conditions.iter().any(|c| {
+                    c.get("type").and_then(Value::as_str) == Some(wanted)
+                        && c.get("status").and_then(Value::as_str) == Some("True")
+                }),
+                "{wanted} must be reported True: {conditions:#?}"
+            );
+        }
+        assert_eq!(
+            status.body.pointer("/status/coveredRepoPrefixes"),
+            Some(&json!(["github.com/acme/"]))
+        );
+        assert_eq!(
+            status.body.pointer("/status/coveredHosts"),
+            Some(&json!(["ghcr.io/acme/"]))
+        );
+        assert_eq!(
+            status
+                .body
+                .pointer("/status/lastAppliedSpec")
+                .and_then(|s| s.pointer("/git/repoPrefixes")),
+            Some(&json!(["github.com/acme/"])),
+            "the baseline the next destructive-change detection runs against"
+        );
+        // Nothing was probed (no application references a covered prefix), so
+        // `lastValidated` must NOT move — it is the only record of when the
+        // credential was last actually proven.
+        assert!(
+            status.body.pointer("/status/lastValidated").is_none(),
+            "an unprobed pass must not claim a validation: {}",
+            status.body
+        );
+    }
+
+    /// Material that has not been unsealed yet derives NOTHING and stamps NO
+    /// baseline. Writing an empty repo-cred would break every clone the old
+    /// Secret was still serving; stamping the baseline here would record a
+    /// coverage the controller never actually derived, so a narrowing made
+    /// while the material was unsealing would slip past the migration gate
+    /// forever.
+    #[tokio::test]
+    async fn material_that_is_still_unsealing_derives_nothing_and_stamps_no_baseline() {
+        let (client, log) = scripted_apiserver(|call| {
+            if call.method == "GET" && call.uri.contains("/secrets/srccred-acme-material") {
+                return not_found("secrets \"srccred-acme-material\"");
+            }
+            happy_path(call)
+        });
+        let ctx = context(client);
+
+        let action = reconcile(Arc::new(live_cred()), ctx.clone())
+            .await
+            .expect("an unsealed-yet credential is not an error");
+        assert_eq!(
+            format!("{action:?}"),
+            format!("{:?}", Action::requeue(Duration::from_secs(15))),
+            "a pending half must re-check fast, not on the settled 60s poll"
+        );
+
+        let calls = calls_of(&log);
+        assert!(
+            position_of(&calls, "PATCH", "/secrets/").is_none(),
+            "nothing may be derived from material that does not exist yet: {calls:#?}"
+        );
+        let status = call_at(&calls, "PATCH", "/sourcecredentials/acme/status");
+        assert!(
+            status.body.pointer("/status/lastAppliedSpec").is_none(),
+            "a pending pass must not move the migration baseline: {}",
+            status.body
+        );
+        let conditions = status
+            .body
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .expect("conditions");
+        assert!(
+            conditions.iter().any(|c| {
+                c.get("type").and_then(Value::as_str) == Some(COND_GIT_PRESENT)
+                    && c.get("status").and_then(Value::as_str) == Some("False")
+                    && c.get("reason").and_then(Value::as_str) == Some("MaterialMissing")
+            }),
+            "{conditions:#?}"
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_total
+                .with_label_values(&[KIND, "apprafter-system", "pending"])
+                .get(),
+            1.0
+        );
+    }
+
+    /// Deleting the credential revokes EVERY derivative, wherever it went.
+    /// The Argo repo-cred lives in `argocd` and the canonical pull-secret in
+    /// the credential's namespace, but the Application controller projects
+    /// copies into workload namespaces this controller cannot enumerate — so
+    /// the sweep follows the label cluster-wide. A copy left behind in
+    /// `landing` is a working registry credential after the PAT was
+    /// withdrawn.
+    #[tokio::test]
+    async fn deleting_the_credential_revokes_the_copy_in_a_workload_namespace_too() {
+        let (client, log) = scripted_apiserver(|call| {
+            // Only the CLUSTER-WIDE list carries the derived Secrets; a
+            // namespaced sweep sees nothing, which is the point.
+            if call.method == "GET" && call.uri.starts_with("/api/v1/secrets") {
+                return list_of(
+                    "v1",
+                    "SecretList",
+                    vec![
+                        secret_json("srccred-acme-repo-0", "argocd"),
+                        secret_json("srccred-acme-dockercfg", "landing"),
+                    ],
+                );
+            }
+            happy_path(call)
+        });
+
+        let mut cred = live_cred();
+        cred.metadata.deletion_timestamp = Some(
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Utc::now()),
+        );
+        cred.metadata.finalizers = Some(vec![DERIVED_SECRETS_FINALIZER.to_string()]);
+
+        let action = reconcile(Arc::new(cred), context(client))
+            .await
+            .expect("a clean sweep releases the object");
+        assert_eq!(
+            format!("{action:?}"),
+            format!("{:?}", Action::await_change())
+        );
+
+        let calls = calls_of(&log);
+        let deleted_repo = position_of(
+            &calls,
+            "DELETE",
+            "/namespaces/argocd/secrets/srccred-acme-repo-0",
+        );
+        let deleted_copy = position_of(
+            &calls,
+            "DELETE",
+            "/namespaces/landing/secrets/srccred-acme-dockercfg",
+        );
+        assert!(
+            deleted_repo.is_some(),
+            "the Argo repo-cred survived: {calls:#?}"
+        );
+        assert!(
+            deleted_copy.is_some(),
+            "the projected pull-secret survived in the workload namespace: {calls:#?}"
+        );
+
+        // The finalizer is released only AFTER both deletes, and nothing is
+        // derived on the way out.
+        let released = position_of(&calls, "PATCH", "/sourcecredentials/acme?").expect("released");
+        assert_eq!(
+            calls[released].body.pointer("/metadata/finalizers"),
+            Some(&json!([])),
+        );
+        assert!(
+            released > deleted_repo.expect("repo") && released > deleted_copy.expect("copy"),
+            "the finalizer must outlive the sweep: {calls:#?}"
+        );
+        assert!(
+            position_of(&calls, "PATCH", "/secrets/").is_none(),
+            "a deleting credential must derive nothing: {calls:#?}"
+        );
+        assert!(
+            position_of(&calls, "PATCH", "/status").is_none(),
+            "a deleting credential has no status to publish: {calls:#?}"
+        );
+    }
+
+    /// A sweep that could not even LIST must fail the reconcile with the
+    /// finalizer still on. Releasing it here lets the SourceCredential finish
+    /// deleting while its derived PATs stay live in every namespace they were
+    /// projected into — with the owning object gone, nothing will ever come
+    /// back for them.
+    #[tokio::test]
+    async fn a_failed_sweep_keeps_the_finalizer_on_the_object() {
+        let (client, log) = scripted_apiserver(|call| {
+            if call.method == "GET" && call.uri.starts_with("/api/v1/secrets") {
+                return apiserver_unavailable();
+            }
+            happy_path(call)
+        });
+
+        let mut cred = live_cred();
+        cred.metadata.deletion_timestamp = Some(
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Utc::now()),
+        );
+        cred.metadata.finalizers = Some(vec![DERIVED_SECRETS_FINALIZER.to_string()]);
+
+        let err = reconcile(Arc::new(cred), context(client))
+            .await
+            .expect_err("an unlistable cluster must not report a clean sweep");
+        assert!(matches!(err, ReconcileError::Kube(_)), "{err}");
+        assert!(
+            position_of(&calls_of(&log), "PATCH", "/sourcecredentials/acme?").is_none(),
+            "the finalizer must not be released off a failed sweep"
+        );
+    }
+
+    /// A coverage NARROWING pauses both halves: it creates the gating
+    /// MigrationPlan and derives nothing, so the old wider-coverage Secrets
+    /// stay in place and in-flight apps keep cloning and pulling. Re-deriving
+    /// here — before an operator approved — is exactly the outage the gate
+    /// exists to prevent.
+    #[tokio::test]
+    async fn a_coverage_narrowing_creates_a_gating_plan_and_derives_nothing() {
+        let (client, log) = scripted_apiserver(happy_path);
+        let ctx = context(client);
+
+        let mut cred = live_cred();
+        cred.status = Some(SourceCredentialStatus {
+            last_applied_spec: Some(sc_spec(
+                &["github.com/acme/", "github.com/acme-labs/"],
+                &["ghcr.io/acme/"],
+            )),
+            ..SourceCredentialStatus::default()
+        });
+
+        let action = reconcile(Arc::new(cred), ctx.clone())
+            .await
+            .expect("pausing is not an error");
+        assert_eq!(
+            format!("{action:?}"),
+            format!("{:?}", Action::requeue(Duration::from_secs(30)))
+        );
+
+        let calls = calls_of(&log);
+        let plan = call_at(&calls, "PATCH", "/migrationplans/");
+        assert_eq!(
+            plan.body
+                .pointer("/spec/scope/type")
+                .and_then(Value::as_str),
+            Some(SCOPE_SOURCECREDENTIAL)
+        );
+        assert_eq!(
+            plan.body
+                .pointer("/spec/scope/sourcecredential/ref/name")
+                .and_then(Value::as_str),
+            Some("acme")
+        );
+        assert_eq!(
+            plan.body
+                .pointer("/metadata/ownerReferences/0/uid")
+                .and_then(Value::as_str),
+            Some("11111111-2222-3333-4444-555555555555"),
+            "the plan must cascade with the credential that owns it"
+        );
+        assert!(
+            position_of(&calls, "PATCH", "/secrets/").is_none(),
+            "a paused credential must leave the wider-coverage Secrets alone: {calls:#?}"
+        );
+        let status = call_at(&calls, "PATCH", "/sourcecredentials/acme/status");
+        assert_eq!(
+            status.body.pointer("/status/phase").and_then(Value::as_str),
+            Some(PHASE_AWAITING_MIGRATION_APPROVAL)
+        );
+        assert_eq!(
+            ctx.metrics
+                .reconcile_total
+                .with_label_values(&[KIND, "apprafter-system", "paused"])
+                .get(),
+            1.0
+        );
+    }
+
+    /// A credential the apiserver never assigned a uid to cannot own a plan,
+    /// and the check runs BEFORE any write: an owner-less MigrationPlan would
+    /// outlive its credential and gate a resource that no longer exists.
+    #[tokio::test]
+    async fn a_credential_with_no_uid_pauses_without_writing_an_ownerless_plan() {
+        let (client, log) = scripted_apiserver(happy_path);
+
+        let mut cred = live_cred();
+        cred.metadata.uid = None;
+        cred.status = Some(SourceCredentialStatus {
+            last_applied_spec: Some(sc_spec(
+                &["github.com/acme/", "github.com/acme-labs/"],
+                &["ghcr.io/acme/"],
+            )),
+            ..SourceCredentialStatus::default()
+        });
+
+        let err = reconcile(Arc::new(cred), context(client))
+            .await
+            .expect_err("a plan with no owner must not be created");
+        assert!(
+            matches!(err, ReconcileError::MissingUid(ref n) if n == "acme"),
+            "{err}"
+        );
+        let calls = calls_of(&log);
+        assert!(
+            position_of(&calls, "PATCH", "/migrationplans/").is_none(),
+            "no plan may be written: {calls:#?}"
+        );
+        assert!(
+            position_of(&calls, "PATCH", "/status").is_none(),
+            "no paused status may be published for a plan that was never created: {calls:#?}"
+        );
+    }
+
+    /// Approval consumed: the gating plan reached `completed`, so this pass
+    /// derives with the NARROWED coverage, stamps the new baseline, and only
+    /// THEN deletes the plan. That order is the crash-safety property — a
+    /// crash after the delete but before the stamp would re-gate the same
+    /// change and pause the credential a second time.
+    #[tokio::test]
+    async fn an_approved_narrowing_derives_stamps_and_only_then_deletes_the_plan() {
+        let old = sc_spec(
+            &["github.com/acme/", "github.com/acme-labs/"],
+            &["ghcr.io/acme/"],
+        );
+        let new = sc_spec(&["github.com/acme/"], &["ghcr.io/acme/"]);
+        let change = SourceCredentialMigrationStrategy::detect_destructive(Some(&old), &new)
+            .expect("dropping a prefix is destructive");
+        let completed = sc_plan(
+            "acme",
+            &change.trigger_type,
+            &change.field,
+            Some("completed"),
+            Some(change_hash(std::slice::from_ref(&change))),
+        );
+        let listed = serde_json::to_value(&completed).expect("plan json");
+
+        let (client, log) = scripted_apiserver(move |call| {
+            if call.method == "GET" && call.uri.contains("/migrationplans") {
+                return list_of(
+                    "apprafter.io/v1alpha1",
+                    "MigrationPlanList",
+                    vec![listed.clone()],
+                );
+            }
+            happy_path(call)
+        });
+
+        let mut cred = live_cred();
+        cred.status = Some(SourceCredentialStatus {
+            last_applied_spec: Some(old.clone()),
+            ..SourceCredentialStatus::default()
+        });
+
+        reconcile(Arc::new(cred), context(client))
+            .await
+            .expect("a consumed plan derives");
+
+        let calls = calls_of(&log);
+        let status = position_of(&calls, "PATCH", "/sourcecredentials/acme/status")
+            .expect("the narrowed baseline must be stamped");
+        assert_eq!(
+            calls[status]
+                .body
+                .pointer("/status/lastAppliedSpec")
+                .and_then(|s| s.pointer("/git/repoPrefixes")),
+            Some(&json!(["github.com/acme/"])),
+            "the baseline must move to the narrowed spec, or the gate re-fires forever"
+        );
+        assert!(
+            calls[status].body.pointer("/status/phase").is_none(),
+            "consuming must clear AwaitingMigrationApproval: {}",
+            calls[status].body
+        );
+        let derived = position_of(&calls, "PATCH", "/secrets/")
+            .expect("the narrowed coverage must actually be derived");
+        let deleted = position_of(&calls, "DELETE", "/migrationplans/")
+            .expect("the consumed plan must be cleaned up");
+        assert!(
+            derived < status && status < deleted,
+            "derive → stamp → delete is the crash-safe order: {calls:#?}"
+        );
+    }
+
+    /// A gating plan that FAILED keeps the credential paused and needs a
+    /// human. Deriving here would apply the narrowing whose migration is
+    /// known to have gone wrong; silently deleting the plan would erase the
+    /// only record of it.
+    #[tokio::test]
+    async fn a_failed_gating_plan_keeps_the_credential_paused_and_untouched() {
+        let failed = serde_json::to_value(sc_plan(
+            "acme",
+            "coverage-removal",
+            "spec.git.repoPrefixes",
+            Some("failed"),
+            None,
+        ))
+        .expect("plan json");
+        let (client, log) = scripted_apiserver(move |call| {
+            if call.method == "GET" && call.uri.contains("/migrationplans") {
+                return list_of(
+                    "apprafter.io/v1alpha1",
+                    "MigrationPlanList",
+                    vec![failed.clone()],
+                );
+            }
+            happy_path(call)
+        });
+
+        let mut cred = live_cred();
+        cred.status = Some(SourceCredentialStatus {
+            last_applied_spec: Some(sc_spec(
+                &["github.com/acme/", "github.com/acme-labs/"],
+                &["ghcr.io/acme/"],
+            )),
+            ..SourceCredentialStatus::default()
+        });
+
+        let action = reconcile(Arc::new(cred), context(client))
+            .await
+            .expect("a failed plan is a pause, not a reconcile error");
+        assert_eq!(
+            format!("{action:?}"),
+            format!("{:?}", Action::requeue(Duration::from_secs(30)))
+        );
+
+        let calls = calls_of(&log);
+        let status = call_at(&calls, "PATCH", "/sourcecredentials/acme/status");
+        let conditions = status
+            .body
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .expect("conditions");
+        assert!(
+            conditions.iter().any(|c| {
+                c.get("type").and_then(Value::as_str) == Some("MigrationFailed")
+                    && c.get("status").and_then(Value::as_str) == Some("True")
+            }),
+            "{conditions:#?}"
+        );
+        assert!(
+            position_of(&calls, "PATCH", "/secrets/").is_none(),
+            "a failed gate must derive nothing: {calls:#?}"
+        );
+        assert!(
+            position_of(&calls, "DELETE", "/migrationplans/").is_none(),
+            "the failed plan is the record of what went wrong — it needs a human, not a GC: {calls:#?}"
+        );
+    }
+
+    /// The user re-widened the spec, so the destructive delta is gone but the
+    /// old plan is still sitting there. It must be GC'd and the credential
+    /// derived — leaving the relic would keep matching future narrowings and
+    /// gate them against a change nobody asked for.
+    #[tokio::test]
+    async fn re_widening_the_coverage_clears_the_stale_plan_and_derives() {
+        let stale = serde_json::to_value(sc_plan(
+            "acme",
+            "coverage-removal",
+            "spec.git.repoPrefixes",
+            Some("completed"),
+            None,
+        ))
+        .expect("plan json");
+        let (client, log) = scripted_apiserver(move |call| {
+            if call.method == "GET" && call.uri.contains("/migrationplans") {
+                return list_of(
+                    "apprafter.io/v1alpha1",
+                    "MigrationPlanList",
+                    vec![stale.clone()],
+                );
+            }
+            happy_path(call)
+        });
+
+        // Baseline is the NARROW spec; the live spec re-adds nothing that was
+        // removed, so detection finds no destructive change at all.
+        let mut cred = live_cred();
+        cred.status = Some(SourceCredentialStatus {
+            last_applied_spec: Some(sc_spec(&["github.com/acme/"], &["ghcr.io/acme/"])),
+            ..SourceCredentialStatus::default()
+        });
+
+        reconcile(Arc::new(cred), context(client))
+            .await
+            .expect("a re-widened credential derives");
+
+        let calls = calls_of(&log);
+        let deleted =
+            position_of(&calls, "DELETE", "/migrationplans/").expect("the relic plan must be GC'd");
+        let derived = position_of(&calls, "PATCH", "/secrets/")
+            .expect("derivation must resume once the relic is gone");
+        assert!(
+            deleted < derived,
+            "the stale gate must be cleared before deriving: {calls:#?}"
+        );
+    }
+
+    /// A `MigrationPlan` list that FAILS must abort the whole pass. `None`
+    /// reads as "nothing is gating me", so swallowing the error would let a
+    /// coverage narrowing derive on any apiserver blip — without the
+    /// operator's approval and with no plan ever created.
+    #[tokio::test]
+    async fn a_failed_plan_list_aborts_before_anything_is_derived() {
+        let (client, log) = scripted_apiserver(|call| {
+            if call.method == "GET" && call.uri.contains("/migrationplans") {
+                return apiserver_unavailable();
+            }
+            happy_path(call)
+        });
+
+        let err = reconcile(Arc::new(live_cred()), context(client))
+            .await
+            .expect_err("an unlistable cluster must not look like an ungated credential");
+        assert!(matches!(err, ReconcileError::Kube(_)), "{err}");
+        let calls = calls_of(&log);
+        assert!(
+            position_of(&calls, "PATCH", "/secrets/").is_none(),
+            "nothing may be derived off a failed gate read: {calls:#?}"
+        );
+        assert!(
+            position_of(&calls, "PATCH", "/status").is_none(),
+            "no status may be published off a failed gate read: {calls:#?}"
+        );
+    }
+
+    /// An OpenBao-backed half is not derivable on Tier 1 — but it is not an
+    /// ERROR either. It reports `Unknown`, derives nothing, and (crucially)
+    /// does not mark the pass `pending`, so the settled 60s poll applies and
+    /// the credential still stamps its baseline. Reporting `False` here would
+    /// fail every application whose coverage gate reads this condition.
+    #[tokio::test]
+    async fn an_openbao_backed_half_reports_unknown_without_deriving_or_erroring() {
+        let (client, log) = scripted_apiserver(happy_path);
+        let ctx = context(client);
+
+        let mut cred = live_cred();
+        cred.spec = SourceCredentialSpec {
+            git: Some(SourceGit {
+                backend: SourceBackend {
+                    sealed_secret_ref: None,
+                    open_bao_path: Some("secret/apprafter/gh".to_string()),
+                },
+                repo_prefixes: vec!["github.com/acme/".to_string()],
+            }),
+            registry: None,
+        };
+
+        let action = reconcile(Arc::new(cred), ctx.clone())
+            .await
+            .expect("openBao is out of scope, not an error");
+        assert_eq!(
+            format!("{action:?}"),
+            format!("{:?}", Action::requeue(Duration::from_secs(60))),
+            "an un-derivable half is settled, not pending"
+        );
+
+        let calls = calls_of(&log);
+        assert!(
+            position_of(&calls, "PATCH", "/secrets/").is_none(),
+            "there is no material to derive from: {calls:#?}"
+        );
+        assert!(
+            position_of(&calls, "GET", "/secrets/srccred-acme-material").is_none(),
+            "an openBao backend must not read a sealed Secret at all: {calls:#?}"
+        );
+        let status = call_at(&calls, "PATCH", "/sourcecredentials/acme/status");
+        let conditions = status
+            .body
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .expect("conditions");
+        assert!(
+            conditions.iter().any(|c| {
+                c.get("type").and_then(Value::as_str) == Some(COND_GIT_PRESENT)
+                    && c.get("status").and_then(Value::as_str) == Some("Unknown")
+            }),
+            "an un-derivable half must be Unknown, never False: {conditions:#?}"
+        );
+        assert!(
+            status.body.pointer("/status/coveredRepoPrefixes").is_none(),
+            "coverage may only be claimed for what was actually derived: {}",
+            status.body
+        );
+    }
+
+    /// A narrowing that is ALREADY gated by a matching plan must not create
+    /// another one. The pause requeues every 30s, so a controller that
+    /// re-created the plan each pass would bury the operator in plans and
+    /// throw away any approval already in flight against the previous one.
+    #[tokio::test]
+    async fn a_narrowing_already_gated_by_a_matching_plan_creates_no_second_plan() {
+        let gating = serde_json::to_value(sc_plan(
+            "acme",
+            "coverage-removal",
+            "spec.git.repoPrefixes",
+            Some("pending-approval"),
+            None,
+        ))
+        .expect("plan json");
+        let (client, log) = scripted_apiserver(move |call| {
+            if call.method == "GET" && call.uri.contains("/migrationplans") {
+                return list_of(
+                    "apprafter.io/v1alpha1",
+                    "MigrationPlanList",
+                    vec![gating.clone()],
+                );
+            }
+            happy_path(call)
+        });
+
+        let mut cred = live_cred();
+        cred.status = Some(SourceCredentialStatus {
+            last_applied_spec: Some(sc_spec(
+                &["github.com/acme/", "github.com/acme-labs/"],
+                &["ghcr.io/acme/"],
+            )),
+            ..SourceCredentialStatus::default()
+        });
+
+        reconcile(Arc::new(cred), context(client))
+            .await
+            .expect("staying paused is not an error");
+
+        let calls = calls_of(&log);
+        assert!(
+            position_of(&calls, "PATCH", "/migrationplans/").is_none(),
+            "a matching plan already gates — creating another spams the operator: {calls:#?}"
+        );
+        assert!(
+            position_of(&calls, "DELETE", "/migrationplans/").is_none(),
+            "the plan awaiting approval must not be deleted out from under it: {calls:#?}"
+        );
+        let status = call_at(&calls, "PATCH", "/sourcecredentials/acme/status");
+        let conditions = status
+            .body
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .expect("conditions");
+        assert!(
+            conditions.iter().any(|c| c
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|m| m.contains("acme-migration-1"))),
+            "the paused status must name the plan an operator has to approve: {conditions:#?}"
+        );
+    }
+
+    /// A completed plan whose approval hash covers a DIFFERENT change must
+    /// be superseded, not consumed: deleted first, then replaced by a fresh
+    /// gating plan, with the credential still paused. Consuming it would
+    /// apply a narrowing nobody approved on the strength of an approval for
+    /// something else.
+    #[tokio::test]
+    async fn an_approval_for_a_different_change_is_superseded_rather_than_consumed() {
+        let unrelated = DestructiveChange {
+            trigger_type: "coverage-removal".into(),
+            field: "spec.git.repoPrefixes".into(),
+            from: Some(json!({ "removedRepoPrefixes": ["github.com/somewhere-else/"] })),
+            to: None,
+            classification: "breaking".into(),
+        };
+        let mismatched = serde_json::to_value(sc_plan(
+            "acme",
+            "coverage-removal",
+            "spec.git.repoPrefixes",
+            Some("completed"),
+            Some(change_hash(std::slice::from_ref(&unrelated))),
+        ))
+        .expect("plan json");
+        let (client, log) = scripted_apiserver(move |call| {
+            if call.method == "GET" && call.uri.contains("/migrationplans") {
+                return list_of(
+                    "apprafter.io/v1alpha1",
+                    "MigrationPlanList",
+                    vec![mismatched.clone()],
+                );
+            }
+            happy_path(call)
+        });
+
+        let mut cred = live_cred();
+        cred.status = Some(SourceCredentialStatus {
+            last_applied_spec: Some(sc_spec(
+                &["github.com/acme/", "github.com/acme-labs/"],
+                &["ghcr.io/acme/"],
+            )),
+            ..SourceCredentialStatus::default()
+        });
+
+        reconcile(Arc::new(cred), context(client))
+            .await
+            .expect("superseding is not an error");
+
+        let calls = calls_of(&log);
+        let superseded = position_of(&calls, "DELETE", "/migrationplans/")
+            .expect("the mismatched approval must be revoked");
+        let created = position_of(&calls, "PATCH", "/migrationplans/")
+            .expect("a fresh gating plan must replace it");
+        assert!(
+            superseded < created,
+            "the stale plan must go before its replacement is written: {calls:#?}"
+        );
+        assert!(
+            position_of(&calls, "PATCH", "/secrets/").is_none(),
+            "an approval for another change must not release the derivation: {calls:#?}"
+        );
+    }
+
+    /// A plan that vanished between the list and the delete (a concurrent
+    /// reconcile, an ownerRef cascade) is not a failure. Treating the 404 as
+    /// an error would wedge the credential: the gate is already gone, so
+    /// every retry would hit the same 404 and derivation would never resume.
+    #[tokio::test]
+    async fn a_plan_that_vanished_mid_sweep_does_not_wedge_the_credential() {
+        let stale = serde_json::to_value(sc_plan(
+            "acme",
+            "coverage-removal",
+            "spec.git.repoPrefixes",
+            Some("completed"),
+            None,
+        ))
+        .expect("plan json");
+        let (client, log) = scripted_apiserver(move |call| {
+            if call.uri.contains("/migrationplans") {
+                return match call.method.as_str() {
+                    "DELETE" => not_found("migrationplans \"acme-migration-1\""),
+                    _ => list_of(
+                        "apprafter.io/v1alpha1",
+                        "MigrationPlanList",
+                        vec![stale.clone()],
+                    ),
+                };
+            }
+            happy_path(call)
+        });
+
+        let mut cred = live_cred();
+        cred.status = Some(SourceCredentialStatus {
+            last_applied_spec: Some(sc_spec(&["github.com/acme/"], &["ghcr.io/acme/"])),
+            ..SourceCredentialStatus::default()
+        });
+
+        reconcile(Arc::new(cred), context(client))
+            .await
+            .expect("a plan that already went away must not fail the pass");
+
+        let calls = calls_of(&log);
+        assert!(
+            position_of(&calls, "PATCH", "/secrets/").is_some(),
+            "derivation must resume even though the relic delete 404'd: {calls:#?}"
+        );
+    }
+
+    /// A git host that rejects the derived credential is reported on the
+    /// `GitValid` condition AND stamps `status.lastValidated` — the probe
+    /// concluded something, and the timestamp is the only record of when.
+    /// The derived Secret is still written: presence and validity are
+    /// separate conditions, and withholding the Secret on a probe verdict
+    /// would take down every app that was cloning fine.
+    #[tokio::test]
+    async fn a_rejected_git_credential_is_reported_invalid_and_stamps_last_validated() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("loopback address");
+        let serving = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        let repo = format!("http://{addr}/acme/landing");
+        let prefix = format!("http://{addr}/acme/");
+        let argo_app = json!({
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "Application",
+            "metadata": { "name": "landing", "namespace": "argocd" },
+            "spec": { "source": { "repoURL": repo } },
+        });
+
+        let (client, log) = scripted_apiserver(move |call| {
+            if call.method == "GET" && call.uri.contains("argoproj.io/v1alpha1/applications") {
+                return list_of(
+                    "argoproj.io/v1alpha1",
+                    "ApplicationList",
+                    vec![argo_app.clone()],
+                );
+            }
+            happy_path(call)
+        });
+
+        let mut cred = live_cred();
+        cred.spec = sc_spec(&[prefix.as_str()], &[]);
+
+        reconcile(Arc::new(cred), context(client))
+            .await
+            .expect("a rejected credential is a status, not a reconcile error");
+        serving.abort();
+
+        let calls = calls_of(&log);
+        assert!(
+            position_of(
+                &calls,
+                "PATCH",
+                "/namespaces/argocd/secrets/srccred-acme-repo-0"
+            )
+            .is_some(),
+            "presence and validity are separate — the Secret must still be written: {calls:#?}"
+        );
+        let status = call_at(&calls, "PATCH", "/sourcecredentials/acme/status");
+        let conditions = status
+            .body
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .expect("conditions");
+        assert!(
+            conditions.iter().any(|c| {
+                c.get("type").and_then(Value::as_str) == Some(COND_GIT_VALID)
+                    && c.get("status").and_then(Value::as_str) == Some("False")
+            }),
+            "a 403 from the git host must surface as GitValid=False: {conditions:#?}"
+        );
+        assert!(
+            status.body.pointer("/status/lastValidated").is_some(),
+            "a concluded verdict must record when it was reached: {}",
+            status.body
+        );
+    }
+
+    /// A credential that already carries the finalizer must NOT be patched
+    /// again. Every metadata write bumps `resourceVersion` and wakes this
+    /// controller, so a re-patch of an unchanged list is a reconcile loop
+    /// that never settles.
+    #[tokio::test]
+    async fn an_unchanged_finalizer_list_is_not_re_patched() {
+        let (client, log) = scripted_apiserver(happy_path);
+
+        let mut cred = live_cred();
+        cred.metadata.finalizers = Some(vec![DERIVED_SECRETS_FINALIZER.to_string()]);
+        reconcile(Arc::new(cred), context(client))
+            .await
+            .expect("a settled credential derives cleanly");
+
+        let calls = calls_of(&log);
+        assert!(
+            position_of(&calls, "PATCH", "/sourcecredentials/acme?").is_none(),
+            "nothing changed about the finalizers — patching anyway re-triggers reconcile: {calls:#?}"
+        );
+        assert!(
+            position_of(&calls, "PATCH", "/secrets/").is_some(),
+            "derivation must still happen: {calls:#?}"
+        );
+    }
 }

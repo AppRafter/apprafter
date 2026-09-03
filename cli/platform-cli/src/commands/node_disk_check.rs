@@ -68,21 +68,57 @@ pub fn maybe_warn_about_node_disk() {
 
 fn resolve_pressure() -> Option<String> {
     let path = cache_path();
-    if let Some(cached) = read_fresh_cache(&path) {
-        return cached.message;
-    }
-    let message = probe_cluster();
-    let now = SystemTime::now()
+    resolve_pressure_with(
+        || read_fresh_cache(&path),
+        probe_cluster,
+        |entry| {
+            let _ = write_cache(&cache_path(), entry);
+        },
+        now_secs,
+    )
+}
+
+/// Seconds since the epoch, or 0 when the clock predates it.
+fn now_secs() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let _ = write_cache(
-        &path,
-        &CachedPressure {
-            message: message.clone(),
-            fetched_at_secs: now,
-        },
-    );
+        .unwrap_or(0)
+}
+
+/// The cache-or-probe decision, with every impure part injected.
+///
+/// # Why this seam exists — the same reason as `version_check`, one file later
+///
+/// This function read a five-minute disk cache, shelled out to a real
+/// `kubectl`, and stamped `SystemTime::now()` inline. That made the measured
+/// coverage of this file depend on whether a previous run had warmed the cache:
+/// two consecutive workspace measurements reported 89.89% and 66.85% for it,
+/// with nothing changed in between, because the second run started inside the
+/// TTL and never executed the probe or the write at all.
+///
+/// `version_check.rs` had a byte-for-byte identical defect and was fixed first.
+/// This one was left standing, which is worth recording: the lesson was
+/// learned as a fact about a FILE rather than as a rule about a SHAPE — a
+/// decision welded to a disk cache, a subprocess and a clock — and the sibling
+/// went unnoticed until an independent measurement disagreed with itself.
+///
+/// The ordering is asserted, not assumed: a fresh cache must short-circuit
+/// BEFORE the probe, or every command pays a `kubectl` round trip.
+fn resolve_pressure_with(
+    read_cache: impl FnOnce() -> Option<CachedPressure>,
+    probe: impl FnOnce() -> Option<String>,
+    write: impl FnOnce(&CachedPressure),
+    now: impl FnOnce() -> u64,
+) -> Option<String> {
+    if let Some(cached) = read_cache() {
+        return cached.message;
+    }
+    let message = probe();
+    write(&CachedPressure {
+        message: message.clone(),
+        fetched_at_secs: now(),
+    });
     message
 }
 
@@ -157,6 +193,93 @@ fn write_cache(path: &PathBuf, value: &CachedPressure) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
+    // -----------------------------------------------------------------
+    // The cache-or-probe decision, with no kubectl and no clock
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_fresh_cache_short_circuits_before_kubectl_runs() {
+        // This hook runs before EVERY command. If a warm cache does not
+        // short-circuit, every invocation pays a `kubectl get platformstack`
+        // — which is both slow and, on a machine with no cluster, a guaranteed
+        // failure on the critical path of commands that need no cluster at all.
+        let probed = Cell::new(false);
+        let wrote = Cell::new(false);
+        let got = super::resolve_pressure_with(
+            || {
+                Some(super::CachedPressure {
+                    message: Some("the node's filesystem is 91% full".into()),
+                    fetched_at_secs: 1,
+                })
+            },
+            || {
+                probed.set(true);
+                None
+            },
+            |_| wrote.set(true),
+            || 42,
+        );
+        assert_eq!(got.as_deref(), Some("the node's filesystem is 91% full"));
+        assert!(!probed.get(), "a fresh cache must not shell out to kubectl");
+        assert!(!wrote.get(), "nothing to rewrite when the cache was used");
+    }
+
+    #[test]
+    fn a_cached_absence_is_still_an_answer() {
+        // `message: None` means "checked, and the node is fine". It must be
+        // honoured as a cache HIT, not re-probed — otherwise the healthy case,
+        // which is the common one, never benefits from the cache at all.
+        let probed = Cell::new(false);
+        let got = super::resolve_pressure_with(
+            || {
+                Some(super::CachedPressure {
+                    message: None,
+                    fetched_at_secs: 1,
+                })
+            },
+            || {
+                probed.set(true);
+                Some("stale warning".into())
+            },
+            |_| {},
+            || 42,
+        );
+        assert_eq!(got, None);
+        assert!(!probed.get(), "a cached healthy verdict must not re-probe");
+    }
+
+    #[test]
+    fn a_cache_miss_probes_and_records_the_verdict_with_the_time() {
+        let wrote: Cell<Option<(Option<String>, u64)>> = Cell::new(None);
+        let got = super::resolve_pressure_with(
+            || None,
+            || Some("the node's filesystem is 90% full".into()),
+            |e| wrote.set(Some((e.message.clone(), e.fetched_at_secs))),
+            || 1_700_000_000,
+        );
+        assert_eq!(got.as_deref(), Some("the node's filesystem is 90% full"));
+        assert_eq!(
+            wrote.take(),
+            Some((
+                Some("the node's filesystem is 90% full".to_string()),
+                1_700_000_000
+            ))
+        );
+    }
+
+    #[test]
+    fn a_healthy_probe_is_cached_too_so_the_next_command_stays_quiet() {
+        // Caching only the WARNING would make every command on a healthy
+        // cluster pay the probe — the expensive half of the decision, spent on
+        // the outcome that has nothing to say.
+        let wrote = Cell::new(false);
+        let got = super::resolve_pressure_with(|| None, || None, |_| wrote.set(true), || 7);
+        assert_eq!(got, None);
+        assert!(wrote.get(), "a healthy verdict must be cached as well");
+    }
+
     use super::*;
     use serde_json::json;
 

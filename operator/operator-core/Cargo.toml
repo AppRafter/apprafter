@@ -26,3 +26,12 @@ thiserror    = { workspace = true }
 async-trait  = { workspace = true }
 sha2         = { workspace = true }
 http         = { workspace = true }
+
+[dev-dependencies]
+# `leader.rs` drives leader election against a scripted in-process
+# apiserver: `kube::Client` is a thin wrapper over a `tower::Service`, so a
+# `tower::service_fn` that answers from a script exercises the real client
+# (real URL construction, real 404/5xx mapping) with no cluster. It is the
+# only way to assert WHICH requests the loop makes — and, for the
+# split-brain case, that it makes none.
+tower = { workspace = true }

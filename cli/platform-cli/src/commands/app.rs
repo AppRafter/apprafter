@@ -51,6 +51,53 @@ const APPRAFTER_SOURCE_ANNOTATION: &str = "apprafter.io/source";
 /// Application hangs in `Terminating` forever. `/background` deletes the
 /// managed resources without blocking the delete call on child cleanup.
 const ARGOCD_CASCADE_FINALIZER: &str = "resources-finalizer.argocd.argoproj.io/background";
+/// GROUP-QUALIFIED on purpose — a bare `resourceclaim` collides with the
+/// Kubernetes 1.32+ DRA `resourceclaims.resource.k8s.io`, and kubectl
+/// resolves the collision to the built-in, so `app status` would list
+/// somebody else's objects (or none).
+const RESOURCECLAIM_RESOURCE: &str = "resourceclaim.apprafter.io";
+
+/// Pure helper — the `kubectl get … -o json` arg vector every read in
+/// this module shares. Extracted from the four `Command::new("kubectl")`
+/// sites so the resource name, namespace scoping and `-o json` shape are
+/// pinned in one place rather than re-typed per call.
+pub(crate) fn kubectl_list_args(
+    resource: &str,
+    namespace: &str,
+    selector: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec![
+        "get".to_string(),
+        resource.to_string(),
+        "-n".to_string(),
+        namespace.to_string(),
+    ];
+    if let Some(sel) = selector {
+        args.push("-l".to_string());
+        args.push(sel.to_string());
+    }
+    args.push("-o".to_string());
+    args.push("json".to_string());
+    args
+}
+
+/// Pure helper — the label selector the operator stamps on a workload's
+/// pods and services.
+pub(crate) fn operator_workload_selector(apprafter_app_name: &str) -> String {
+    format!("app.kubernetes.io/name={apprafter_app_name}")
+}
+
+/// Pure helper — the `kubectl delete` arg vector `app remove` runs.
+/// Extracted from [`remove_single_app`].
+pub(crate) fn kubectl_delete_argo_app_args(argo_app_name: &str) -> Vec<String> {
+    vec![
+        "delete".to_string(),
+        "application.argoproj.io".to_string(),
+        argo_app_name.to_string(),
+        "-n".to_string(),
+        ARGOCD_NAMESPACE.to_string(),
+    ]
+}
 
 #[derive(Tabled)]
 struct AppRow {
@@ -282,18 +329,8 @@ pub fn add(
         // works (the operator vouches the env exists upstream).
         match get_manifest_environments(&cwd) {
             Ok(envs) => {
-                if !envs.iter().any(|d| d == e) {
-                    let declared = if envs.is_empty() {
-                        "(none declared)".to_string()
-                    } else {
-                        envs.join(", ")
-                    };
-                    return Err(CliError::Other(format!(
-                        "environment '{e}' is not declared in this app's manifest. \
-                         Declared environments: {declared}. Add a \
-                         `spec.environments.{e}` block to apprafter/Application.cue, \
-                         or pass one of the declared environments to `--env`."
-                    )));
+                if let Some(msg) = undeclared_env_error(e, &envs) {
+                    return Err(CliError::Other(msg));
                 }
             }
             Err(err) => {
@@ -327,19 +364,10 @@ pub fn add(
         kc.path(),
     )?;
     if existing.is_some() {
-        // Post-2.9 UX: `app status` aggregates ALL env-deployments of one
-        // logical app, and `app remove --env` targets a single one — so
-        // suggest the LOGICAL name (+ env), not the `<name>-<env>` Argo
-        // name. A base-only collision (env: None) drops the `--env` hint.
-        let remove_hint = match env.as_deref() {
-            Some(e) => format!("apprafter app remove {derived_name} --env {e}"),
-            None => format!("apprafter app remove {derived_name}"),
-        };
-        return Err(CliError::Other(format!(
-            "Application '{argo_app_name}' is already registered in namespace \
-             {ARGOCD_NAMESPACE}. Run `apprafter app status {derived_name}` to inspect all \
-             environment deployments of this app, `{remove_hint}` to cascade-delete this \
-             one, or pass a different `--name` / `--env`."
+        return Err(CliError::Other(already_registered_error(
+            &argo_app_name,
+            &derived_name,
+            env.as_deref(),
         )));
     }
 
@@ -362,24 +390,23 @@ pub fn add(
     );
     apply_application_manifest(&manifest, kc.path())?;
 
-    println!("✓ Application '{argo_app_name}' registered in AppProject '{project}'.");
-    println!("  Repo:        {repo_url}");
-    println!("  Revision:    {target_revision}");
-    println!("  Path:        {path}");
-    println!("  Destination: {effective_namespace} (created if missing)");
-    match env.as_deref() {
-        Some(e) => println!("  Environment: {e}"),
-        None => {
-            // Surface the cluster's soft default so the operator knows
-            // which env a base-only deploy renders against. Best-effort —
-            // a missing PlatformStack simply omits the line.
-            if let Ok(Some(default_env)) = fetch_platformstack_default_env(kc.path()) {
-                println!(
-                    "  Environment: (base — cluster default is '{default_env}'; \
-                     pass `--env {default_env}` to pin it)"
-                );
-            }
-        }
+    // Best-effort — a missing PlatformStack simply omits the environment
+    // line for a base-only deploy.
+    let cluster_default_env = match env {
+        Some(_) => None,
+        None => fetch_platformstack_default_env(kc.path()).ok().flatten(),
+    };
+    for line in registration_summary_lines(
+        &argo_app_name,
+        project,
+        &repo_url,
+        &target_revision,
+        path,
+        &effective_namespace,
+        env.as_deref(),
+        cluster_default_env.as_deref(),
+    ) {
+        println!("{line}");
     }
     println!();
     warn_if_no_matching_repo_creds(&repo_url, kc.path());
@@ -389,6 +416,97 @@ pub fn add(
     // NOT the per-env Argo app name — mirror the collision-path hint above.
     println!("  apprafter app status {derived_name}");
     Ok(())
+}
+
+/// Pure helper — reject an `--env` the cwd manifest does not declare.
+/// Extracted from [`add`]; `None` means the env is declared and `add`
+/// proceeds.
+///
+/// INVARIANT: a manifest that declares NO environments still produces a
+/// rejection (with `(none declared)` in place of the list), because the
+/// alternative — treating "nothing declared" as "everything allowed" —
+/// registers an Argo CD Application whose environment renders to nothing.
+pub(crate) fn undeclared_env_error(env: &str, declared: &[String]) -> Option<String> {
+    if declared.iter().any(|d| d == env) {
+        return None;
+    }
+    let list = if declared.is_empty() {
+        "(none declared)".to_string()
+    } else {
+        declared.join(", ")
+    };
+    Some(format!(
+        "environment '{env}' is not declared in this app's manifest. \
+         Declared environments: {list}. Add a \
+         `spec.environments.{env}` block to apprafter/Application.cue, \
+         or pass one of the declared environments to `--env`."
+    ))
+}
+
+/// Pure helper — the name-collision refusal `add` raises when the Argo CD
+/// Application already exists. Extracted from [`add`].
+///
+/// INVARIANT (the logical-name UX rule): every suggested command names the
+/// LOGICAL app plus `--env`, never the `<name>-<env>` Argo CD identity —
+/// `app status <name>` aggregates the environments and `app remove
+/// <name> --env <e>` targets one, so echoing the Argo name back would
+/// hand the reader a name none of our verbs accept.
+pub(crate) fn already_registered_error(
+    argo_app_name: &str,
+    logical_name: &str,
+    env: Option<&str>,
+) -> String {
+    let remove_hint = match env {
+        Some(e) => format!("apprafter app remove {logical_name} --env {e}"),
+        None => format!("apprafter app remove {logical_name}"),
+    };
+    format!(
+        "Application '{argo_app_name}' is already registered in namespace \
+         {ARGOCD_NAMESPACE}. Run `apprafter app status {logical_name}` to inspect all \
+         environment deployments of this app, `{remove_hint}` to cascade-delete this \
+         one, or pass a different `--name` / `--env`."
+    )
+}
+
+/// Pure helper — the post-registration summary block. Extracted from
+/// [`add`], with the PlatformStack lookup hoisted to the caller so the
+/// rendering is a function of its arguments.
+///
+/// INVARIANT: a `--env` deploy states its environment flatly; a base-only
+/// deploy either names the cluster's soft default (so the reader learns
+/// which environment their manifest actually renders against) or, when no
+/// PlatformStack answered, omits the line rather than claiming `(base)`
+/// means nothing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn registration_summary_lines(
+    argo_app_name: &str,
+    project: &str,
+    repo_url: &str,
+    target_revision: &str,
+    path: &str,
+    namespace: &str,
+    env: Option<&str>,
+    cluster_default_env: Option<&str>,
+) -> Vec<String> {
+    let mut out = vec![
+        format!("✓ Application '{argo_app_name}' registered in AppProject '{project}'."),
+        format!("  Repo:        {repo_url}"),
+        format!("  Revision:    {target_revision}"),
+        format!("  Path:        {path}"),
+        format!("  Destination: {namespace} (created if missing)"),
+    ];
+    match env {
+        Some(e) => out.push(format!("  Environment: {e}")),
+        None => {
+            if let Some(default_env) = cluster_default_env {
+                out.push(format!(
+                    "  Environment: (base — cluster default is '{default_env}'; \
+                     pass `--env {default_env}` to pin it)"
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// Confirmed-mode coverage gate (1.79c S5). Refuse to register a
@@ -403,10 +521,33 @@ fn enforce_confirmed_coverage(repo_url: &str, kubeconfig_path: &Path) -> Result<
         return Ok(());
     }
     let creds = crate::commands::repo_creds::fetch_source_credentials_public(kubeconfig_path)?;
-    if crate::commands::repo_creds::valid_credential_covers(&creds, repo_url) {
-        return Ok(());
+    match confirmed_coverage_error(
+        repo_url,
+        crate::commands::repo_creds::valid_credential_covers(&creds, repo_url),
+        crate::commands::repo_creds::any_credential_covers(&creds, repo_url),
+    ) {
+        Some(msg) => Err(CliError::Other(msg)),
+        None => Ok(()),
     }
-    let detail = if crate::commands::repo_creds::any_credential_covers(&creds, repo_url) {
+}
+
+/// Pure helper — the confirmed-gate verdict, given what the cluster's
+/// `SourceCredential`s cover. Extracted from
+/// [`enforce_confirmed_coverage`]; `None` admits the repo.
+///
+/// INVARIANT: "covered but unvalidated" and "not covered at all" are
+/// DIFFERENT refusals. Collapsing them would send an operator who already
+/// registered the right credential off to register it a second time,
+/// when what they need is to validate the one they have.
+pub(crate) fn confirmed_coverage_error(
+    repo_url: &str,
+    valid_credential_covers: bool,
+    any_credential_covers: bool,
+) -> Option<String> {
+    if valid_credential_covers {
+        return None;
+    }
+    let detail = if any_credential_covers {
         "a SourceCredential covers it but its status is not GitValid=True \
          (Unverified or Invalid). Validate the credential, or rerun with \
          `--coverage-gate present` (the default) if the cluster has no egress to validate"
@@ -414,9 +555,9 @@ fn enforce_confirmed_coverage(repo_url: &str, kubeconfig_path: &Path) -> Result<
         "no SourceCredential covers it. Register one with `apprafter repo creds add`, \
          or rerun with `--coverage-gate present` (the default) if the repo is public"
     };
-    Err(CliError::Other(format!(
+    Some(format!(
         "coverage gate (confirmed): {repo_url} not admitted — {detail}."
-    )))
+    ))
 }
 
 /// Post-register cred check (walk-fix #1 + #2 post-Part-3b).
@@ -458,33 +599,59 @@ fn warn_if_no_matching_repo_creds(repo_url: &str, kubeconfig_path: &Path) {
         return;
     }
 
-    let suggestion = derive_creds_suggestion(repo_url);
+    for line in creds_notice_lines(repo_url, derive_creds_suggestion(repo_url).as_ref()) {
+        println!("{line}");
+    }
+}
 
-    println!();
-    println!("ℹ {repo_url} is private (no anonymous Git access) and has no");
-    println!("  matching credentials in Argo CD — register one so the repo-server");
-    println!("  can clone it:");
-
-    if let Some(ref s) = suggestion {
-        if let Some(ref pat_url) = s.pat_creation_url {
-            println!("    1. Generate a PAT here:");
-            println!("       {pat_url}");
-            println!("       Required scopes: `repo` for code; add `read:packages`");
-            println!("       if your CI publishes container images to the same provider.");
-            println!("    2. Register it with AppRafter:");
-            println!(
-                "       apprafter repo creds add {} --url-prefix {} --token <paste-the-pat>",
-                s.suggested_name, s.url_prefix
-            );
-        } else {
-            println!(
+/// Pure helper — the "this repo is private and has no credentials"
+/// notice. Extracted from [`warn_if_no_matching_repo_creds`], with the
+/// suggestion derivation hoisted to the caller.
+///
+/// INVARIANT: the notice degrades in two steps rather than one. A
+/// provider we know gets a numbered PAT-creation walkthrough; a provider
+/// we merely parsed gets a one-line `repo creds add` with the name and
+/// prefix pre-filled; an unparseable URL still gets the command shape
+/// with placeholders. The operator is never left with only "register a
+/// credential" and no command.
+pub(crate) fn creds_notice_lines(
+    repo_url: &str,
+    suggestion: Option<&CredsSuggestion>,
+) -> Vec<String> {
+    let mut out = vec![
+        String::new(),
+        format!("ℹ {repo_url} is private (no anonymous Git access) and has no"),
+        "  matching credentials in Argo CD — register one so the repo-server".to_string(),
+        "  can clone it:".to_string(),
+    ];
+    match suggestion {
+        Some(s) => match s.pat_creation_url.as_deref() {
+            Some(pat_url) => {
+                out.push("    1. Generate a PAT here:".to_string());
+                out.push(format!("       {pat_url}"));
+                out.push(
+                    "       Required scopes: `repo` for code; add `read:packages`".to_string(),
+                );
+                out.push(
+                    "       if your CI publishes container images to the same provider."
+                        .to_string(),
+                );
+                out.push("    2. Register it with AppRafter:".to_string());
+                out.push(format!(
+                    "       apprafter repo creds add {} --url-prefix {} --token <paste-the-pat>",
+                    s.suggested_name, s.url_prefix
+                ));
+            }
+            None => out.push(format!(
                 "    apprafter repo creds add {} --url-prefix {} --token <pat>",
                 s.suggested_name, s.url_prefix
-            );
-        }
-    } else {
-        println!("    apprafter repo creds add <name> --url-prefix <prefix> --token <pat>");
+            )),
+        },
+        None => out.push(
+            "    apprafter repo creds add <name> --url-prefix <prefix> --token <pat>".to_string(),
+        ),
     }
+    out
 }
 
 /// Map a git smart-HTTP probe status to a publicness verdict.
@@ -572,6 +739,26 @@ pub(crate) fn derive_creds_suggestion(repo_url: &str) -> Option<CredsSuggestion>
     })
 }
 
+/// Pure helper — the two wizard pickers a parsed manifest feeds:
+/// `(declared environments, manifest namespace)`. Extracted from
+/// [`add_via_wizard`].
+///
+/// INVARIANT: a manifest with NO `spec.environments` yields an EMPTY
+/// list, which the wizard reads as "base-only, hide the env picker" —
+/// distinct from the parse-failure path, which warns. Conflating the two
+/// is what silently hid the picker for every post-2.12 app.
+pub(crate) fn wizard_manifest_pickers(
+    manifest: &cli_core::manifest::ApplicationManifest,
+) -> (Vec<String>, Option<String>) {
+    let envs = manifest
+        .spec
+        .environments
+        .as_ref()
+        .map(|e| e.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    (envs, manifest.metadata.namespace.clone())
+}
+
 /// Wizard entry point — gathers any missing field via inquire
 /// prompts and re-dispatches to the non-interactive `add` with
 /// `no_interactive=true` to avoid recursion. The flag values
@@ -611,15 +798,7 @@ fn add_via_wizard(
     // rather than silently hiding the pickers.
     let (declared_envs, manifest_namespace) =
         match crate::commands::app_validate::parse_application_injected(&cwd.join("apprafter")) {
-            Ok(m) => {
-                let envs = m
-                    .spec
-                    .environments
-                    .as_ref()
-                    .map(|e| e.keys().cloned().collect::<Vec<_>>())
-                    .unwrap_or_default();
-                (envs, m.metadata.namespace)
-            }
+            Ok(m) => wizard_manifest_pickers(&m),
             Err(e) => {
                 eprintln!(
                     "⚠ Could not read apprafter/Application.cue ({e}); the environment \
@@ -712,19 +891,13 @@ fn sanitise_for_dns_1123(raw: &str) -> String {
 pub fn list(project: &str, all_projects: bool, all_managed: bool) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
 
-    let mut cmd = Command::new("kubectl");
-    cmd.arg("get")
-        .arg("application.argoproj.io")
-        .arg("-n")
-        .arg(ARGOCD_NAMESPACE)
-        .arg("-o")
-        .arg("json")
-        .env("KUBECONFIG", kc.path());
-    if !all_managed {
-        cmd.arg("-l").arg(APPRAFTER_MANAGED_LABEL);
-    }
-
-    let out = cmd
+    let out = Command::new("kubectl")
+        .args(kubectl_list_args(
+            "application.argoproj.io",
+            ARGOCD_NAMESPACE,
+            list_label_selector(all_managed),
+        ))
+        .env("KUBECONFIG", kc.path())
         .output()
         .map_err(|e| CliError::Other(format!("spawn kubectl: {e}")))?;
     if !out.status.success() {
@@ -737,37 +910,11 @@ pub fn list(project: &str, all_projects: bool, all_managed: bool) -> Result<()> 
     let parsed: Value = serde_json::from_slice(&out.stdout)
         .map_err(|e| CliError::Other(format!("kubectl JSON parse: {e}")))?;
 
-    let items: Vec<Value> = parsed
-        .get("items")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    let filtered: Vec<Value> = if all_projects {
-        items
-    } else {
-        items
-            .into_iter()
-            .filter(|app| {
-                app.pointer("/spec/project")
-                    .and_then(Value::as_str)
-                    .map(|p| p == project)
-                    .unwrap_or(false)
-            })
-            .collect()
-    };
+    let filtered = filter_apps_for_list(&parsed, project, all_projects);
 
     if filtered.is_empty() {
-        if all_projects {
-            println!("No apprafter-managed Applications in the cluster.");
-        } else {
-            println!("No apprafter-managed Applications in AppProject '{project}'.");
-        }
-        if !all_managed {
-            println!(
-                "Hint: try `--all-managed` to list Applications that were not registered \
-                 through `apprafter app add`."
-            );
+        for line in empty_list_lines(project, all_projects, all_managed) {
+            println!("{line}");
         }
         return Ok(());
     }
@@ -775,6 +922,73 @@ pub fn list(project: &str, all_projects: bool, all_managed: bool) -> Result<()> 
     let rows: Vec<AppRow> = filtered.iter().map(app_row).collect();
     println!("{}", Table::new(&rows));
     Ok(())
+}
+
+/// Pure helper — the label selector `app list` reads with. Extracted
+/// from [`list`].
+///
+/// INVARIANT: the DEFAULT is filtered. Argo CD's `argocd` namespace holds
+/// the platform's own root Application and every component under it;
+/// listing those alongside a developer's apps would bury the answer.
+/// `--all-managed` is the opt-in that drops the filter.
+pub(crate) fn list_label_selector(all_managed: bool) -> Option<&'static str> {
+    (!all_managed).then_some(APPRAFTER_MANAGED_LABEL)
+}
+
+/// Pure helper — narrow a `kubectl get applications -o json` payload to the
+/// rows `app list` shows. Extracted from [`list`] so the AppProject filter
+/// is testable without a cluster.
+///
+/// INVARIANT: without `--all-projects` an Application whose
+/// `spec.project` is absent is DROPPED, not kept — the filter is an
+/// allow-list on an exact match, so an unparseable CR cannot leak into a
+/// project-scoped listing.
+pub(crate) fn filter_apps_for_list(
+    payload: &Value,
+    project: &str,
+    all_projects: bool,
+) -> Vec<Value> {
+    let items: Vec<Value> = payload
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if all_projects {
+        return items;
+    }
+    items
+        .into_iter()
+        .filter(|app| {
+            app.pointer("/spec/project")
+                .and_then(Value::as_str)
+                .map(|p| p == project)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Pure helper — what `app list` says when nothing matched. Extracted
+/// from [`list`]. The `--all-managed` hint is suppressed when that flag
+/// is already set, because suggesting a flag the reader just passed is
+/// how a CLI teaches people to stop reading its hints.
+pub(crate) fn empty_list_lines(
+    project: &str,
+    all_projects: bool,
+    all_managed: bool,
+) -> Vec<String> {
+    let mut out = vec![if all_projects {
+        "No apprafter-managed Applications in the cluster.".to_string()
+    } else {
+        format!("No apprafter-managed Applications in AppProject '{project}'.")
+    }];
+    if !all_managed {
+        out.push(
+            "Hint: try `--all-managed` to list Applications that were not registered \
+             through `apprafter app add`."
+                .to_string(),
+        );
+    }
+    out
 }
 
 pub fn status(name: &str, show_resources: bool) -> Result<()> {
@@ -813,16 +1027,8 @@ pub fn status(name: &str, show_resources: bool) -> Result<()> {
 
     // Deterministic ordering — by environment then Argo name — so the
     // per-env sections render the same way every run.
-    let summaries = summarize_deployments(&apps);
-    if summaries.len() > 1 {
-        println!(
-            "Application '{name}' — {} environment deployments:",
-            summaries.len()
-        );
-        for s in &summaries {
-            println!("  • {} ({})", s.argo_name, s.environment);
-        }
-        println!();
+    for line in env_deployment_index_lines(name, &summarize_deployments(&apps)) {
+        println!("{line}");
     }
 
     let mut sorted: Vec<&Value> = apps.iter().collect();
@@ -839,6 +1045,33 @@ pub fn status(name: &str, show_resources: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Pure helper — the index `app status` prints ahead of the per-env
+/// detail sections. Extracted from [`status`].
+///
+/// INVARIANT: a SINGLE deployment renders NO index. The header would
+/// otherwise announce "1 environment deployments" above the very block it
+/// summarises, and the base-only case — the overwhelming majority — would
+/// grow a section that says nothing.
+pub(crate) fn env_deployment_index_lines(
+    name: &str,
+    summaries: &[DeploymentSummary],
+) -> Vec<String> {
+    if summaries.len() <= 1 {
+        return vec![];
+    }
+    let mut out = vec![format!(
+        "Application '{name}' — {} environment deployments:",
+        summaries.len()
+    )];
+    out.extend(
+        summaries
+            .iter()
+            .map(|s| format!("  • {} ({})", s.argo_name, s.environment)),
+    );
+    out.push(String::new());
+    out
 }
 
 /// Render ONE Argo CD Application's full status block — the Argo CD
@@ -882,40 +1115,12 @@ fn print_app_detail(app: &Value, show_resources: bool, kubeconfig_path: &Path) {
                 kubeconfig_path,
             ) {
                 Ok(Some(cr)) => {
-                    if let Some(phase) = cr.pointer("/status/phase").and_then(Value::as_str) {
-                        println!("AppRafter phase: {phase}");
-                    }
-                    // D7: the phase is the failure's NAME. Immediately under
-                    // it, its EXPLANATION — the reason and the operator's
-                    // message — because a reader who has to run kubectl to
-                    // learn why is exactly the reader that entry is about.
-                    if let Some(why) = format_not_ready_line(&cr) {
-                        println!("{}", style::warn(&why));
-                    }
-                    // ADR 0040: surface the running image digest the
-                    // operator resolved from base.image's tag. Omitted
-                    // when status.image is absent (resolve: off, or
-                    // pre-first-resolve).
-                    if let Some(image_line) = format_image_line(&cr, &chrono::Utc::now()) {
-                        println!("{image_line}");
-                    }
-                    // ADR 0059: a pin is invisible to a reader of the Git
-                    // repository, so this line is the only place the truth
-                    // exists. Yellow, and immediately after the image line
-                    // it qualifies.
-                    if let Some(pin_line) = format_pin_line(&cr) {
-                        println!("{}", style::warn(&pin_line));
-                    }
-                    // 2.22h / D16: undesigned reconcile failures. Printed
-                    // BEFORE the advisory lines because a failing reconcile
-                    // changes what everything below it means.
-                    for line in format_problem_lines(&cr, &chrono::Utc::now()) {
-                        println!("{}", style::warn(&line));
-                    }
-                    // 2.16e: VPA recommendation — only printed when the
-                    // operator has written status.recommendedResources.
-                    if let Some(reco_line) = format_recommendation_line(&cr) {
-                        println!("{reco_line}");
+                    for line in apprafter_cr_advisory_lines(&cr, &chrono::Utc::now()) {
+                        if line.warn {
+                            println!("{}", style::warn(&line.text));
+                        } else {
+                            println!("{}", line.text);
+                        }
                     }
                     apprafter_cr = Some(cr);
                 }
@@ -998,6 +1203,43 @@ pub(crate) struct DeploymentSummary {
     pub destination_namespace: String,
     pub sync: String,
     pub health: String,
+}
+
+/// Pure helper — the AppRafter CR's advisory block inside `app status`.
+/// Extracted from [`print_app_detail`], with the clock injected so the
+/// age-bearing lines are deterministic.
+///
+/// INVARIANT: the ORDER is the message. The phase names the failure, the
+/// not-ready reason explains it directly underneath, the image and pin
+/// lines qualify each other (a pin is invisible in Git, so the pin line
+/// must sit against the digest it holds), and undesigned reconcile
+/// problems precede the recommendation because a failing reconcile
+/// changes what a sizing advisory means. Every line is independently
+/// omitted when its field is absent, so a healthy app renders none.
+pub(crate) fn apprafter_cr_advisory_lines(
+    cr: &Value,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> Vec<RenderedLine> {
+    let mut out = Vec::new();
+    if let Some(phase) = cr.pointer("/status/phase").and_then(Value::as_str) {
+        out.push(RenderedLine::plain(format!("AppRafter phase: {phase}")));
+    }
+    if let Some(why) = format_not_ready_line(cr) {
+        out.push(RenderedLine::warned(why));
+    }
+    if let Some(image_line) = format_image_line(cr, now) {
+        out.push(RenderedLine::plain(image_line));
+    }
+    if let Some(pin_line) = format_pin_line(cr) {
+        out.push(RenderedLine::warned(pin_line));
+    }
+    for line in format_problem_lines(cr, now) {
+        out.push(RenderedLine::warned(line));
+    }
+    if let Some(reco_line) = format_recommendation_line(cr) {
+        out.push(RenderedLine::plain(reco_line));
+    }
+    out
 }
 
 /// Pure helper — resolve an Argo CD Application's environment from
@@ -1151,16 +1393,12 @@ fn list_pods_for_apprafter_app(
     namespace: &str,
     kubeconfig: &Path,
 ) -> Result<Vec<PodSummary>> {
-    let selector = format!("app.kubernetes.io/name={apprafter_app_name}");
     let out = Command::new("kubectl")
-        .arg("get")
-        .arg("pods")
-        .arg("-n")
-        .arg(namespace)
-        .arg("-l")
-        .arg(&selector)
-        .arg("-o")
-        .arg("json")
+        .args(kubectl_list_args(
+            "pods",
+            namespace,
+            Some(&operator_workload_selector(apprafter_app_name)),
+        ))
         .env("KUBECONFIG", kubeconfig)
         .output()
         .map_err(|e| CliError::Other(format!("spawn kubectl get pods: {e}")))?;
@@ -1388,13 +1626,15 @@ pub(crate) fn extract_tracked_resources(app: &Value) -> Vec<TrackedResource> {
         .collect()
 }
 
-fn print_argocd_resources(app: &Value) {
-    let resources = extract_tracked_resources(app);
-    println!();
-    println!("Argo CD tracked resources:");
+/// Pure helper — the `--resources` table, assembled into lines.
+/// Extracted from [`print_argocd_resources`], which is now a `println!`
+/// loop over this: the column-width arithmetic is the part worth
+/// pinning, and it cannot be pinned through stdout.
+pub(crate) fn render_tracked_resource_lines(resources: &[TrackedResource]) -> Vec<String> {
+    let mut out = vec![String::new(), "Argo CD tracked resources:".to_string()];
     if resources.is_empty() {
-        println!("  (none — Application has not yet reported `status.resources[]`)");
-        return;
+        out.push("  (none — Application has not yet reported `status.resources[]`)".to_string());
+        return out;
     }
     let name_w = resources
         .iter()
@@ -1420,7 +1660,7 @@ fn print_argocd_resources(app: &Value) {
         .max()
         .unwrap_or(6)
         .max(6);
-    println!(
+    out.push(format!(
         "  {:<name_w$}  {:<kind_w$}  {:<ns_w$}  {:<status_w$}  HEALTH",
         "NAME",
         "KIND",
@@ -1430,9 +1670,9 @@ fn print_argocd_resources(app: &Value) {
         kind_w = kind_w,
         ns_w = ns_w,
         status_w = status_w,
-    );
-    for r in &resources {
-        println!(
+    ));
+    for r in resources {
+        out.push(format!(
             "  {:<name_w$}  {:<kind_w$}  {:<ns_w$}  {:<status_w$}  {}",
             r.name,
             r.kind,
@@ -1443,25 +1683,64 @@ fn print_argocd_resources(app: &Value) {
             kind_w = kind_w,
             ns_w = ns_w,
             status_w = status_w,
-        );
+        ));
+    }
+    out
+}
+
+fn print_argocd_resources(app: &Value) {
+    for line in render_tracked_resource_lines(&extract_tracked_resources(app)) {
+        println!("{line}");
     }
 }
 
-fn print_pod_summaries(
+/// One rendered output line plus whether the caller paints it as a
+/// warning. Lets the table renderers stay pure: `style::warn` inspects the
+/// terminal, the line assembly must not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenderedLine {
+    pub text: String,
+    pub warn: bool,
+}
+
+impl RenderedLine {
+    fn plain(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            warn: false,
+        }
+    }
+    fn warned(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            warn: true,
+        }
+    }
+}
+
+/// Pure helper — the workload-pod table, assembled into lines.
+/// Extracted from [`print_pod_summaries`] so the drift marking (which
+/// pods get flagged `← old config`, and whether the trailing explanation
+/// appears at all) is testable without a cluster or a terminal.
+pub(crate) fn render_pod_summary_lines(
     pods: &[PodSummary],
     inner_name: &str,
     namespace: &str,
     config_changed_at: Option<&str>,
-) {
-    println!();
-    println!("Workload pods ({namespace}, app.kubernetes.io/name={inner_name}):");
+) -> Vec<RenderedLine> {
+    let mut out = vec![
+        RenderedLine::plain(String::new()),
+        RenderedLine::plain(format!(
+            "Workload pods ({namespace}, app.kubernetes.io/name={inner_name}):"
+        )),
+    ];
     if pods.is_empty() {
-        println!(
+        out.push(RenderedLine::plain(
             "  (none — operator may not have rendered the Deployment yet, or \
              the AppRafter Application's `spec.expose` is omitted so no \
-             workload runs)"
-        );
-        return;
+             workload runs)",
+        ));
+        return out;
     }
     let name_w = pods.iter().map(|p| p.name.len()).max().unwrap_or(4).max(4);
     let status_w = pods
@@ -1470,13 +1749,13 @@ fn print_pod_summaries(
         .max()
         .unwrap_or(6)
         .max(6);
-    println!(
+    out.push(RenderedLine::plain(format!(
         "  {:<name_w$}  READY  {:<status_w$}  RESTARTS  AGE",
         "NAME",
         "STATUS",
         name_w = name_w,
         status_w = status_w,
-    );
+    )));
     let mut any_stale = false;
     for p in pods {
         let stale = pod_is_stale(p.started_at.as_deref(), config_changed_at);
@@ -1496,20 +1775,33 @@ fn print_pod_summaries(
         // PREVIOUS secret values, which is a thing to know rather than an
         // outage — and colouring it as a failure would train the reader to
         // ignore it.
-        if stale {
-            println!("{}", style::warn(&row));
+        out.push(if stale {
+            RenderedLine::warned(row)
         } else {
-            println!("{row}");
-        }
+            RenderedLine::plain(row)
+        });
     }
     if any_stale {
-        println!();
-        println!(
-            "  {}",
-            style::warn(
-                "Some pods started before this application's secrets last changed, \n                   so they are still serving the previous values. An environment \n                   variable from a secret is resolved once at pod start and never \n                   re-read; restarting the workload is what picks up the new one."
-            )
-        );
+        out.push(RenderedLine::plain(String::new()));
+        out.push(RenderedLine::warned(
+            "  Some pods started before this application's secrets last changed, \n                   so they are still serving the previous values. An environment \n                   variable from a secret is resolved once at pod start and never \n                   re-read; restarting the workload is what picks up the new one.",
+        ));
+    }
+    out
+}
+
+fn print_pod_summaries(
+    pods: &[PodSummary],
+    inner_name: &str,
+    namespace: &str,
+    config_changed_at: Option<&str>,
+) {
+    for line in render_pod_summary_lines(pods, inner_name, namespace, config_changed_at) {
+        if line.warn {
+            println!("{}", style::warn(&line.text));
+        } else {
+            println!("{}", line.text);
+        }
     }
 }
 
@@ -1522,16 +1814,12 @@ fn list_services_for_apprafter_app(
     namespace: &str,
     kubeconfig: &Path,
 ) -> Result<Vec<ServiceSummary>> {
-    let selector = format!("app.kubernetes.io/name={apprafter_app_name}");
     let out = Command::new("kubectl")
-        .arg("get")
-        .arg("services")
-        .arg("-n")
-        .arg(namespace)
-        .arg("-l")
-        .arg(&selector)
-        .arg("-o")
-        .arg("json")
+        .args(kubectl_list_args(
+            "services",
+            namespace,
+            Some(&operator_workload_selector(apprafter_app_name)),
+        ))
         .env("KUBECONFIG", kubeconfig)
         .output()
         .map_err(|e| CliError::Other(format!("spawn kubectl get services: {e}")))?;
@@ -1594,15 +1882,25 @@ pub(crate) fn parse_service_summaries(payload: &Value) -> Vec<ServiceSummary> {
         .collect()
 }
 
-fn print_service_summaries(services: &[ServiceSummary], inner_name: &str, namespace: &str) {
-    println!();
-    println!("Workload services ({namespace}, app.kubernetes.io/name={inner_name}):");
+/// Pure helper — the workload-service table, assembled into lines.
+/// Extracted from [`print_service_summaries`] for the same reason as
+/// [`render_tracked_resource_lines`]: the widths are the behaviour.
+pub(crate) fn render_service_lines(
+    services: &[ServiceSummary],
+    inner_name: &str,
+    namespace: &str,
+) -> Vec<String> {
+    let mut out = vec![
+        String::new(),
+        format!("Workload services ({namespace}, app.kubernetes.io/name={inner_name}):"),
+    ];
     if services.is_empty() {
-        println!(
+        out.push(
             "  (none — the AppRafter Application's `spec.expose` may be omitted \
              so the operator renders no Service)"
+                .to_string(),
         );
-        return;
+        return out;
     }
     let name_w = services
         .iter()
@@ -1622,7 +1920,7 @@ fn print_service_summaries(services: &[ServiceSummary], inner_name: &str, namesp
         .max()
         .unwrap_or(10)
         .max(10);
-    println!(
+    out.push(format!(
         "  {:<name_w$}  {:<type_w$}  {:<ip_w$}  PORTS",
         "NAME",
         "TYPE",
@@ -1630,9 +1928,9 @@ fn print_service_summaries(services: &[ServiceSummary], inner_name: &str, namesp
         name_w = name_w,
         type_w = type_w,
         ip_w = ip_w,
-    );
+    ));
     for s in services {
-        println!(
+        out.push(format!(
             "  {:<name_w$}  {:<type_w$}  {:<ip_w$}  {}",
             s.name,
             s.type_,
@@ -1641,7 +1939,14 @@ fn print_service_summaries(services: &[ServiceSummary], inner_name: &str, namesp
             name_w = name_w,
             type_w = type_w,
             ip_w = ip_w,
-        );
+        ));
+    }
+    out
+}
+
+fn print_service_summaries(services: &[ServiceSummary], inner_name: &str, namespace: &str) {
+    for line in render_service_lines(services, inner_name, namespace) {
+        println!("{line}");
     }
 }
 
@@ -1656,12 +1961,7 @@ fn list_resource_claims_for_app(
     kubeconfig: &Path,
 ) -> Result<Vec<ResourceClaimSummary>> {
     let out = Command::new("kubectl")
-        .arg("get")
-        .arg("resourceclaim.apprafter.io")
-        .arg("-n")
-        .arg(namespace)
-        .arg("-o")
-        .arg("json")
+        .args(kubectl_list_args(RESOURCECLAIM_RESOURCE, namespace, None))
         .env("KUBECONFIG", kubeconfig)
         .output()
         .map_err(|e| CliError::Other(format!("spawn kubectl get resourceclaim: {e}")))?;
@@ -1874,41 +2174,64 @@ pub(crate) fn backing_resource(claim: &Value) -> String {
 ///
 /// Prints the SECRET and KEY names only. A key name is not secret material;
 /// the value is, and nothing here reads one.
-fn print_secret_bindings_for_app(app: &Value, name: &str, namespace: &str) {
+/// Pure helper — the `Secrets (<ns>/<app>)` block, assembled into lines.
+/// Extracted from [`print_secret_bindings_for_app`]. An app that binds
+/// nothing renders NOTHING (not an empty header), which is the invariant
+/// worth holding: the block is context, and a header with no rows would
+/// read as "your secrets are missing".
+pub(crate) fn render_secret_binding_lines(app: &Value, name: &str, namespace: &str) -> Vec<String> {
     // parse_secret_bindings takes a LIST shape; wrap the single CR so the
     // one parser serves both callers rather than growing a near-copy.
     let wrapped = serde_json::json!({ "items": [app] });
     let bindings = crate::commands::secret::parse_secret_bindings(&wrapped);
     if bindings.is_empty() {
-        return;
+        return vec![];
     }
-    println!();
-    println!("Secrets ({namespace}/{name}):");
     let var_w = bindings
         .iter()
         .map(|b| b.env_var.len())
         .max()
         .unwrap_or(3)
         .max(3);
-    println!("  {:<var_w$}  SECRET/KEY  (SCOPE)", "ENV", var_w = var_w);
+    let mut out = vec![
+        String::new(),
+        format!("Secrets ({namespace}/{name}):"),
+        format!("  {:<var_w$}  SECRET/KEY  (SCOPE)", "ENV", var_w = var_w),
+    ];
     for b in &bindings {
-        println!(
+        out.push(format!(
             "  {:<var_w$}  {}/{}  ({})",
             b.env_var,
             b.secret,
             b.key,
             b.scope,
             var_w = var_w
-        );
+        ));
+    }
+    out
+}
+
+fn print_secret_bindings_for_app(app: &Value, name: &str, namespace: &str) {
+    for line in render_secret_binding_lines(app, name, namespace) {
+        println!("{line}");
     }
 }
 
-fn print_resource_claims(claims: &[ResourceClaimSummary], namespace: &str) {
-    println!();
-    println!("Resource provisioning ({namespace}):");
+/// Pure helper — the `Resource provisioning (<ns>)` claims table,
+/// assembled into lines. Extracted from [`print_resource_claims`].
+pub(crate) fn render_resource_claim_lines(
+    claims: &[ResourceClaimSummary],
+    namespace: &str,
+) -> Vec<String> {
+    let mut out = vec![
+        String::new(),
+        format!("Resource provisioning ({namespace}):"),
+    ];
     if claims.is_empty() {
-        println!("  (none — the AppRafter Application declares no `needs.*` resources)");
-        return;
+        out.push(
+            "  (none — the AppRafter Application declares no `needs.*` resources)".to_string(),
+        );
+        return out;
     }
     let name_w = claims
         .iter()
@@ -1934,7 +2257,7 @@ fn print_resource_claims(claims: &[ResourceClaimSummary], namespace: &str) {
         .max()
         .unwrap_or(4)
         .max(4);
-    println!(
+    out.push(format!(
         "  {:<name_w$}  {:<provider_w$}  READY  SCHEDULED  {:<backing_w$}  {:<size_w$}  SECRET",
         "NAME",
         "PROVIDER",
@@ -1944,10 +2267,10 @@ fn print_resource_claims(claims: &[ResourceClaimSummary], namespace: &str) {
         provider_w = provider_w,
         backing_w = backing_w,
         size_w = size_w,
-    );
+    ));
     for c in claims {
         let secret = c.secret_ref.as_deref().unwrap_or("-");
-        println!(
+        out.push(format!(
             "  {:<name_w$}  {:<provider_w$}  {:<5}  {:<9}  {:<backing_w$}  {:<size_w$}  {}",
             c.name,
             c.provider,
@@ -1960,7 +2283,14 @@ fn print_resource_claims(claims: &[ResourceClaimSummary], namespace: &str) {
             size_w = size_w,
             name_w = name_w,
             provider_w = provider_w,
-        );
+        ));
+    }
+    out
+}
+
+fn print_resource_claims(claims: &[ResourceClaimSummary], namespace: &str) {
+    for line in render_resource_claim_lines(claims, namespace) {
+        println!("{line}");
     }
 }
 
@@ -2090,28 +2420,9 @@ pub fn logs(
 
     let (app, argo_name) = resolve_app_for_command(name, env.as_deref(), kc.path())?;
 
-    let workload_ns = app
-        .pointer("/spec/destination/namespace")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            CliError::Other(format!(
-                "Application '{argo_name}' does not carry `spec.destination.namespace` — no \
-                 namespace to point kubectl logs at. The CR may have been created outside \
-                 `apprafter app add`."
-            ))
-        })?;
-
-    // The workload pods carry the INNER AppRafter app name
-    // (operator's `app.kubernetes.io/name`), which is the
-    // `Application.cue` metadata.name and can differ from the Argo
-    // CD parent name typed at `app add`. Resolve it from
-    // status.resources[]; fall back to the resolved Argo name
-    // (`<name>-<env>` for an env deploy) for raw-YAML apps that carry
-    // no AppRafter Application CR.
-    let inner = crate::commands::app_open::find_apprafter_app_name(&app)
-        .unwrap_or_else(|| argo_name.clone());
+    let (workload_ns, inner) = resolve_logs_workload(&app, &argo_name)?;
     let target = build_kubectl_logs_target(&inner, pod.as_deref());
-    let args = build_kubectl_logs_args(&target, workload_ns, follow, tail, container.as_deref());
+    let args = build_kubectl_logs_args(&target, &workload_ns, follow, tail, container.as_deref());
 
     let status = Command::new("kubectl")
         .args(&args)
@@ -2125,6 +2436,31 @@ pub fn logs(
         )));
     }
     Ok(())
+}
+
+/// Pure helper — resolve `(workload namespace, pod label value)` for
+/// `app logs` from the Argo CD Application. Extracted from [`logs`].
+///
+/// INVARIANT: the pod label is the INNER AppRafter app name from
+/// `status.resources[]`, which is `Application.cue`'s `metadata.name` and
+/// need not equal the Argo CD parent typed at `app add`. Only when Argo
+/// tracks no AppRafter CR (a raw-YAML app) does it fall back to the
+/// RESOLVED Argo name — `<name>-<env>` for an env deploy, never the bare
+/// logical name.
+pub(crate) fn resolve_logs_workload(app: &Value, argo_name: &str) -> Result<(String, String)> {
+    let workload_ns = app
+        .pointer("/spec/destination/namespace")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CliError::Other(format!(
+                "Application '{argo_name}' does not carry `spec.destination.namespace` — no \
+                 namespace to point kubectl logs at. The CR may have been created outside \
+                 `apprafter app add`."
+            ))
+        })?;
+    let inner = crate::commands::app_open::find_apprafter_app_name(app)
+        .unwrap_or_else(|| argo_name.to_string());
+    Ok((workload_ns.to_string(), inner))
 }
 
 /// `apprafter app rollback <name> [--to <revision|sha256:digest>]`.
@@ -2175,6 +2511,68 @@ fn rollback_to_digest(
     yes: bool,
     kubeconfig: &Path,
 ) -> Result<()> {
+    let plan = plan_pin(argo_app, cr, digest)?;
+
+    if !yes {
+        if !io::stdin().is_terminal() {
+            return Err(CliError::Other(
+                "non-interactive shell — pass `--yes` to skip the confirmation prompt".into(),
+            ));
+        }
+        for line in pin_prompt_lines(&plan) {
+            println!("{line}");
+        }
+        let confirmed = inquire::Confirm::new("Confirm?")
+            .with_default(false)
+            .prompt()
+            .map_err(|e| CliError::Other(format!("confirmation prompt: {e}")))?;
+        if !confirmed {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    let at = chrono::Utc::now().to_rfc3339();
+    let body = pin_manifest(&plan.cr_name, &plan.cr_ns, Some((&plan.reference, &at)));
+    kubectl_apply_server_side(
+        &serde_json::to_string(&body).unwrap_or_default(),
+        APPRAFTER_CLI_PIN_FIELD_MANAGER,
+        kubeconfig,
+    )?;
+
+    println!("{}", cli_core::style::warn(&pin_success_line(&plan)));
+    let _ = argo_name;
+    Ok(())
+}
+
+/// Everything [`rollback_to_digest`] needs to write a pin, resolved from
+/// the two CRs before any prompting or apply happens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PinPlan {
+    /// AppRafter `Application` CR `metadata.name` — the pin's target.
+    pub cr_name: String,
+    /// Namespace to write into.
+    pub cr_ns: String,
+    /// Fully-qualified `repo@sha256:…` reference the pin holds.
+    pub reference: String,
+    /// What the app is running now, `?` when it has resolved nothing.
+    pub current: String,
+}
+
+/// Pure helper — resolve and vet a pin before anything is written.
+/// Extracted from [`rollback_to_digest`]: every refusal below is a
+/// judgement about the two CRs, and none of them needs a cluster.
+///
+/// INVARIANTS:
+/// * a CR whose namespace is absent borrows the Argo CD Application's
+///   `spec.destination.namespace` — the pin must land where the workload
+///   is, and a namespace-less apply would silently target `default`;
+/// * a Git-managed pin is REFUSED rather than written, because the next
+///   Argo sync reverts it and the operator would be left believing a
+///   rollback happened;
+/// * pinning to what is already running is refused as a no-op, so the
+///   reader is not told a rollback succeeded when nothing moved.
+pub(crate) fn plan_pin(argo_app: &Value, cr: &Value, digest: &str) -> Result<PinPlan> {
     let reference = compose_pin_reference(digest, cr)?;
     let cr_name = cr
         .pointer("/metadata/name")
@@ -2207,45 +2605,73 @@ fn rollback_to_digest(
         )));
     }
 
-    if !yes {
-        if !io::stdin().is_terminal() {
-            return Err(CliError::Other(
-                "non-interactive shell — pass `--yes` to skip the confirmation prompt".into(),
-            ));
-        }
-        println!("Roll back '{cr_name}' from {current} to {reference}?");
-        println!(
+    Ok(PinPlan {
+        cr_name: cr_name.to_string(),
+        cr_ns: cr_ns.to_string(),
+        reference,
+        current: current.to_string(),
+    })
+}
+
+/// Pure helper — the pin confirmation preamble. Extracted from
+/// [`rollback_to_digest`]. It names the mode change explicitly (and the
+/// verb that undoes it) because a pin is the one rollback that keeps
+/// acting after it returns.
+pub(crate) fn pin_prompt_lines(plan: &PinPlan) -> Vec<String> {
+    let PinPlan {
+        cr_name,
+        reference,
+        current,
+        ..
+    } = plan;
+    vec![
+        format!("Roll back '{cr_name}' from {current} to {reference}?"),
+        format!(
             "  This PINS the application: it stops following its tag until you run \
              `apprafter app unpin {cr_name}`."
-        );
-        println!("  To roll back a Git revision instead, pass `--to <revision>`.");
-        let confirmed = inquire::Confirm::new("Confirm?")
-            .with_default(false)
-            .prompt()
-            .map_err(|e| CliError::Other(format!("confirmation prompt: {e}")))?;
-        if !confirmed {
-            println!("Cancelled.");
-            return Ok(());
-        }
-    }
+        ),
+        "  To roll back a Git revision instead, pass `--to <revision>`.".to_string(),
+    ]
+}
 
-    let at = chrono::Utc::now().to_rfc3339();
-    let body = pin_manifest(cr_name, cr_ns, Some((&reference, &at)));
-    kubectl_apply_server_side(
-        &serde_json::to_string(&body).unwrap_or_default(),
-        APPRAFTER_CLI_PIN_FIELD_MANAGER,
-        kubeconfig,
-    )?;
-
-    println!(
-        "{}",
-        cli_core::style::warn(&format!(
-            "✓ '{cr_name}' pinned to {reference}. It is no longer following its tag — \
+/// Pure helper — what a completed pin reports. Extracted from
+/// [`rollback_to_digest`]; carries the un-pin verb so the mode change is
+/// never a one-way door the reader has to go looking for.
+pub(crate) fn pin_success_line(plan: &PinPlan) -> String {
+    let PinPlan {
+        cr_name, reference, ..
+    } = plan;
+    format!(
+        "✓ '{cr_name}' pinned to {reference}. It is no longer following its tag — \
          resume with `apprafter app unpin {cr_name}`."
-        ))
-    );
-    let _ = argo_name;
-    Ok(())
+    )
+}
+
+/// Pure helper — the Argo CD Application's current
+/// `spec.source.targetRevision`, or `?` when absent. Extracted from
+/// [`rollback_to_revision`].
+pub(crate) fn current_target_revision(app: &Value) -> String {
+    app.pointer("/spec/source/targetRevision")
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .to_string()
+}
+
+/// Pure helper — refuse a Git rollback that would change nothing.
+/// Extracted from [`rollback_to_revision`]; `None` lets it proceed.
+///
+/// INVARIANT: a no-op is an ERROR, not a silent success. Argo CD would
+/// accept the patch and report a sync, so "rolled back" would be printed
+/// over a workload that never moved — the exact failure a developer
+/// running rollback under pressure cannot afford to be told.
+pub(crate) fn noop_revision_error(target_revision: &str, current_revision: &str) -> Option<String> {
+    if target_revision != current_revision {
+        return None;
+    }
+    Some(format!(
+        "Target revision '{target_revision}' matches the current \
+         `spec.source.targetRevision` — rollback would be a no-op."
+    ))
 }
 
 /// Patch the Argo CD Application's `targetRevision` — the original behaviour.
@@ -2256,17 +2682,9 @@ fn rollback_to_revision(
     yes: bool,
     kubeconfig: &Path,
 ) -> Result<()> {
-    let current_revision = app
-        .pointer("/spec/source/targetRevision")
-        .and_then(Value::as_str)
-        .unwrap_or("?")
-        .to_string();
-
-    if target_revision == current_revision {
-        return Err(CliError::Other(format!(
-            "Target revision '{target_revision}' matches the current \
-             `spec.source.targetRevision` — rollback would be a no-op."
-        )));
+    let current_revision = current_target_revision(app);
+    if let Some(msg) = noop_revision_error(target_revision, &current_revision) {
+        return Err(CliError::Other(msg));
     }
 
     if !yes {
@@ -2328,31 +2746,11 @@ pub fn unpin(name: &str, env: Option<String>, yes: bool) -> Result<()> {
         ))
     })?;
 
-    let cr_name = cr
-        .pointer("/metadata/name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| CliError::Other("AppRafter Application CR has no name".into()))?;
-    let cr_ns = cr
-        .pointer("/metadata/namespace")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            app.pointer("/spec/destination/namespace")
-                .and_then(Value::as_str)
-        })
-        .ok_or_else(|| CliError::Other("cannot determine the application's namespace".into()))?;
-
-    let pinned = cr
-        .pointer("/metadata/annotations/apprafter.io~1image-pin")
-        .and_then(Value::as_str);
-    let Some(pinned) = pinned else {
-        println!("'{cr_name}' is not pinned — nothing to do.");
+    let plan = plan_unpin(&app, &cr)?;
+    if plan.pinned.is_none() {
+        println!("'{}' is not pinned — nothing to do.", plan.cr_name);
         return Ok(());
-    };
-
-    let tag = cr
-        .pointer("/status/image/tag")
-        .and_then(Value::as_str)
-        .unwrap_or("its tag");
+    }
 
     if !yes {
         if !io::stdin().is_terminal() {
@@ -2360,11 +2758,9 @@ pub fn unpin(name: &str, env: Option<String>, yes: bool) -> Result<()> {
                 "non-interactive shell — pass `--yes` to skip the confirmation prompt".into(),
             ));
         }
-        println!("Un-pin '{cr_name}' (currently held at {pinned})?");
-        println!(
-            "  It will resume following {tag} and may roll forward to whatever that now \
-             points at, within one reconcile."
-        );
+        for line in unpin_prompt_lines(&plan) {
+            println!("{line}");
+        }
         let confirmed = inquire::Confirm::new("Confirm?")
             .with_default(false)
             .prompt()
@@ -2375,15 +2771,88 @@ pub fn unpin(name: &str, env: Option<String>, yes: bool) -> Result<()> {
         }
     }
 
-    let body = pin_manifest(cr_name, cr_ns, None);
+    let body = pin_manifest(&plan.cr_name, &plan.cr_ns, None);
     kubectl_apply_server_side(
         &serde_json::to_string(&body).unwrap_or_default(),
         APPRAFTER_CLI_PIN_FIELD_MANAGER,
         kc.path(),
     )?;
 
-    println!("✓ '{cr_name}' un-pinned — following {tag} again.");
+    println!(
+        "✓ '{}' un-pinned — following {} again.",
+        plan.cr_name, plan.tag
+    );
     Ok(())
+}
+
+/// Everything [`unpin`] needs, resolved from the two CRs before anything
+/// is prompted or written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnpinPlan {
+    pub cr_name: String,
+    pub cr_ns: String,
+    /// The reference the pin currently holds; `None` when there is no pin
+    /// and `unpin` is a no-op.
+    pub pinned: Option<String>,
+    /// The tag the app resumes following, or the placeholder `its tag`
+    /// when the CR has resolved none.
+    pub tag: String,
+}
+
+/// Pure helper — resolve the un-pin target. Extracted from [`unpin`].
+///
+/// INVARIANT: the namespace fallback matches [`plan_pin`]'s exactly — the
+/// un-pin re-applies the SAME body under the SAME field manager, so a
+/// namespace that differed by one step would prune nothing and leave the
+/// application pinned while reporting success.
+pub(crate) fn plan_unpin(argo_app: &Value, cr: &Value) -> Result<UnpinPlan> {
+    let cr_name = cr
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::Other("AppRafter Application CR has no name".into()))?;
+    let cr_ns = cr
+        .pointer("/metadata/namespace")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            argo_app
+                .pointer("/spec/destination/namespace")
+                .and_then(Value::as_str)
+        })
+        .ok_or_else(|| CliError::Other("cannot determine the application's namespace".into()))?;
+    Ok(UnpinPlan {
+        cr_name: cr_name.to_string(),
+        cr_ns: cr_ns.to_string(),
+        pinned: cr
+            .pointer("/metadata/annotations/apprafter.io~1image-pin")
+            .and_then(Value::as_str)
+            .map(String::from),
+        tag: cr
+            .pointer("/status/image/tag")
+            .and_then(Value::as_str)
+            .unwrap_or("its tag")
+            .to_string(),
+    })
+}
+
+/// Pure helper — the un-pin confirmation preamble. Extracted from
+/// [`unpin`]: un-pinning can roll the workload FORWARD to whatever the
+/// tag now points at, which is the thing the reader is actually agreeing
+/// to and is not implied by the word "un-pin".
+pub(crate) fn unpin_prompt_lines(plan: &UnpinPlan) -> Vec<String> {
+    let UnpinPlan {
+        cr_name,
+        pinned,
+        tag,
+        ..
+    } = plan;
+    let held = pinned.as_deref().unwrap_or("nothing");
+    vec![
+        format!("Un-pin '{cr_name}' (currently held at {held})?"),
+        format!(
+            "  It will resume following {tag} and may roll forward to whatever that now \
+             points at, within one reconcile."
+        ),
+    ]
 }
 
 /// Fetch the AppRafter `Application` CR behind an Argo CD Application.
@@ -2432,30 +2901,12 @@ pub fn remove(name: &str, yes: bool, keep_data: bool, env: Option<String>) -> Re
         kc.path(),
     )?;
 
-    // Backward-compat: a pre-2.9 / base-only app carries no
-    // `apprafter.io/application` label, so the selector matches nothing.
-    // Fall back to deleting the single `<name>` Application. Exactly one
-    // labelled match also routes here (its own Argo name is `<name>` or
-    // `<name>-<env>` — use the actual metadata.name).
-    if grouped.len() <= 1 {
-        let argo_app_name = grouped
-            .first()
-            .and_then(|a| a.pointer("/metadata/name").and_then(Value::as_str))
-            .map(String::from)
-            .unwrap_or_else(|| name.to_string());
-        return remove_single_app(&argo_app_name, yes, keep_data, kc.path());
-    }
-
-    // Multiple env-deployments. Collect their Argo names for the
-    // confirmation prompt + the delete loop.
-    let argo_names: Vec<String> = grouped
-        .iter()
-        .filter_map(|a| {
-            a.pointer("/metadata/name")
-                .and_then(Value::as_str)
-                .map(String::from)
-        })
-        .collect();
+    let argo_names = match plan_remove(name, &grouped) {
+        RemovePlan::Single(argo_app_name) => {
+            return remove_single_app(&argo_app_name, yes, keep_data, kc.path());
+        }
+        RemovePlan::Batch(names) => names,
+    };
 
     if !yes {
         if !io::stdin().is_terminal() {
@@ -2463,12 +2914,8 @@ pub fn remove(name: &str, yes: bool, keep_data: bool, env: Option<String>) -> Re
                 "non-interactive shell — pass `--yes` to skip the confirmation prompt".into(),
             ));
         }
-        println!(
-            "Delete ALL {} environment deployments of '{name}'?",
-            argo_names.len()
-        );
-        for an in &argo_names {
-            println!("  • {an}");
+        for line in batch_remove_prompt_lines(name, &argo_names) {
+            println!("{line}");
         }
         let confirmed = inquire::Confirm::new("Confirm?")
             .with_default(false)
@@ -2487,6 +2934,95 @@ pub fn remove(name: &str, yes: bool, keep_data: bool, env: Option<String>) -> Re
         remove_single_app(an, true, keep_data, kc.path())?;
     }
     Ok(())
+}
+
+/// What `apprafter app remove <name>` (no `--env`) resolves to once the
+/// logical-app label selector has been read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemovePlan {
+    /// Delete exactly this Argo CD `metadata.name`, confirming as usual.
+    Single(String),
+    /// Delete every one of these, behind ONE batch confirmation.
+    Batch(Vec<String>),
+}
+
+/// Pure helper — decide what a no-`--env` remove deletes. Extracted from
+/// [`remove`] so the pre-2.9 fallback is testable without a cluster.
+///
+/// INVARIANT: an EMPTY selector result falls back to the bare logical
+/// name — a pre-2.9 app carries no `apprafter.io/application` label, so
+/// "the selector matched nothing" must not be read as "there is nothing
+/// to delete". A single match uses that object's OWN `metadata.name`
+/// (which may be `<name>-<env>`), never the logical name, or the delete
+/// would target a non-existent Application.
+pub(crate) fn plan_remove(name: &str, grouped: &[Value]) -> RemovePlan {
+    if grouped.len() <= 1 {
+        return RemovePlan::Single(
+            grouped
+                .first()
+                .and_then(|a| a.pointer("/metadata/name").and_then(Value::as_str))
+                .map(String::from)
+                .unwrap_or_else(|| name.to_string()),
+        );
+    }
+    RemovePlan::Batch(
+        grouped
+            .iter()
+            .filter_map(|a| {
+                a.pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            })
+            .collect(),
+    )
+}
+
+/// Pure helper — the batch-delete confirmation preamble. Extracted from
+/// [`remove`]: the reader is about to destroy several environments at
+/// once, so every Argo name is listed rather than counted.
+pub(crate) fn batch_remove_prompt_lines(name: &str, argo_names: &[String]) -> Vec<String> {
+    let mut out = vec![format!(
+        "Delete ALL {} environment deployments of '{name}'?",
+        argo_names.len()
+    )];
+    out.extend(argo_names.iter().map(|an| format!("  • {an}")));
+    out
+}
+
+/// Pure helper — the single-app delete confirmation line. Extracted from
+/// [`remove_single_app`]; project and repo are quoted back so the reader
+/// can tell two similarly named apps apart before saying yes.
+pub(crate) fn single_remove_prompt_line(argo_app_name: &str, app: &Value) -> String {
+    let project = app
+        .pointer("/spec/project")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let repo = app
+        .pointer("/spec/source/repoURL")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    format!("Delete Application '{argo_app_name}' (project: {project}, repo: {repo})?")
+}
+
+/// Pure helper — what `remove` reports after the delete succeeded.
+/// Extracted from [`remove_single_app`].
+///
+/// INVARIANT: `--keep-data` and a plain remove say OPPOSITE things about
+/// the workload. The finalizer was stripped in the keep-data path, so the
+/// AppRafter CR and its pods survive; reporting the cascade wording there
+/// would tell an operator their data is gone when it is still running.
+pub(crate) fn remove_success_line(argo_app_name: &str, keep_data: bool) -> String {
+    if keep_data {
+        format!(
+            "✓ Application '{argo_app_name}' deleted (Argo CD object only). The workload and its \
+             AppRafter Application CR are preserved — re-register to re-adopt."
+        )
+    } else {
+        format!(
+            "✓ Application '{argo_app_name}' deleted. Argo CD cascade-prunes the synced AppRafter \
+             resources; the operator then removes the workload."
+        )
+    }
 }
 
 /// Delete ONE Argo CD Application by its exact `metadata.name`. Carries
@@ -2524,15 +3060,7 @@ fn remove_single_app(
                 "non-interactive shell — pass `--yes` to skip the confirmation prompt".into(),
             ));
         }
-        let project = app
-            .pointer("/spec/project")
-            .and_then(Value::as_str)
-            .unwrap_or("?");
-        let repo = app
-            .pointer("/spec/source/repoURL")
-            .and_then(Value::as_str)
-            .unwrap_or("?");
-        println!("Delete Application '{argo_app_name}' (project: {project}, repo: {repo})?");
+        println!("{}", single_remove_prompt_line(argo_app_name, &app));
         let confirmed = inquire::Confirm::new("Confirm?")
             .with_default(false)
             .prompt()
@@ -2563,11 +3091,7 @@ fn remove_single_app(
     // Delete the Argo CD Application. It carries the cascade finalizer
     // (set at `app add`), so Argo cascade-prunes the synced AppRafter CR.
     let out = Command::new("kubectl")
-        .arg("delete")
-        .arg("application.argoproj.io")
-        .arg(argo_app_name)
-        .arg("-n")
-        .arg(ARGOCD_NAMESPACE)
+        .args(kubectl_delete_argo_app_args(argo_app_name))
         .env("KUBECONFIG", kubeconfig_path)
         .output()
         .map_err(|e| CliError::Other(format!("spawn kubectl delete: {e}")))?;
@@ -2579,17 +3103,7 @@ fn remove_single_app(
         )));
     }
 
-    if keep_data {
-        println!(
-            "✓ Application '{argo_app_name}' deleted (Argo CD object only). The workload and its \
-             AppRafter Application CR are preserved — re-register to re-adopt."
-        );
-    } else {
-        println!(
-            "✓ Application '{argo_app_name}' deleted. Argo CD cascade-prunes the synced AppRafter \
-             resources; the operator then removes the workload."
-        );
-    }
+    println!("{}", remove_success_line(argo_app_name, keep_data));
     Ok(())
 }
 
@@ -2694,15 +3208,7 @@ fn detect_git_repo_for_cwd(remote: &str) -> Result<(String, Option<String>)> {
             remote_out.status.code()
         )));
     }
-    let raw_url = String::from_utf8_lossy(&remote_out.stdout)
-        .trim()
-        .to_string();
-    if raw_url.is_empty() {
-        return Err(CliError::Other(format!(
-            "git remote {remote} returned an empty URL"
-        )));
-    }
-    let url = normalise_git_url(&raw_url);
+    let url = remote_url_or_error(remote, &String::from_utf8_lossy(&remote_out.stdout))?;
 
     let branch_out = Command::new("git")
         .args(["symbolic-ref", "--short", "HEAD"])
@@ -2712,6 +3218,23 @@ fn detect_git_repo_for_cwd(remote: &str) -> Result<(String, Option<String>)> {
         _ => None,
     };
     Ok((url, branch))
+}
+
+/// Pure helper — turn `git remote get-url <remote>`'s stdout into the
+/// Argo-CD-shaped URL. Extracted from [`detect_git_repo_for_cwd`].
+///
+/// INVARIANT: whitespace-only stdout is an ERROR, not an empty URL. `git`
+/// exits 0 for a remote configured with a blank URL, and letting that
+/// through would register an Application pointing at nothing — a failure
+/// that surfaces much later, in Argo CD, as somebody else's problem.
+pub(crate) fn remote_url_or_error(remote: &str, stdout: &str) -> Result<String> {
+    let raw_url = stdout.trim();
+    if raw_url.is_empty() {
+        return Err(CliError::Other(format!(
+            "git remote {remote} returned an empty URL"
+        )));
+    }
+    Ok(normalise_git_url(raw_url))
 }
 
 /// `git ls-remote` reachability check. Returns `Ok(())` when
@@ -2732,19 +3255,35 @@ fn ensure_repo_reachable(repo_url: &str) -> Result<()> {
     if out.status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    Err(CliError::Other(ls_remote_failure_message(
+        repo_url,
+        &String::from_utf8_lossy(&out.stderr),
+        out.status.code(),
+    )))
+}
+
+/// Pure helper — turn a failed `git ls-remote` into the message `add`
+/// raises. Extracted from [`ensure_repo_reachable`].
+///
+/// INVARIANT: an AUTH failure is routed to `repo creds add` rather than
+/// dumped as a generic exit code, and the match is case-insensitive
+/// because git's wording varies by transport ("Authentication failed",
+/// "fatal: … Permission denied"). Misclassifying it sends the operator
+/// looking for a typo in a URL that is perfectly correct.
+pub(crate) fn ls_remote_failure_message(
+    repo_url: &str,
+    stderr: &str,
+    exit_code: Option<i32>,
+) -> String {
     let lower = stderr.to_lowercase();
     if lower.contains("authentication") || lower.contains("permission denied") {
-        return Err(CliError::Other(format!(
+        return format!(
             "git ls-remote refused access to {repo_url}.\n\
              {stderr}\n\
              Register creds via `apprafter repo creds add` and retry `apprafter app add`."
-        )));
+        );
     }
-    Err(CliError::Other(format!(
-        "git ls-remote {repo_url} failed (exit {:?}): {stderr}",
-        out.status.code()
-    )))
+    format!("git ls-remote {repo_url} failed (exit {exit_code:?}): {stderr}")
 }
 
 /// Build `kubectl logs` arg vector. Pure fn — tests cover
@@ -3288,22 +3827,37 @@ fn status_detail_lines(app: &Value) -> Vec<String> {
     ]
 }
 
+/// Pure helper — the `Recent revisions` tail of the status block.
+/// Extracted from [`print_status`]. Argo CD appends to
+/// `status.history`, so the NEWEST entries are last: the render reverses
+/// and caps at three, and an app with no history renders no header at
+/// all rather than an empty one.
+pub(crate) fn recent_revision_lines(app: &Value) -> Vec<String> {
+    let Some(revs) = app.pointer("/status/history").and_then(Value::as_array) else {
+        return vec![];
+    };
+    if revs.is_empty() {
+        return vec![];
+    }
+    let mut out = vec![
+        String::new(),
+        format!("Recent revisions (last {}):", revs.len().min(3)),
+    ];
+    for rev in revs.iter().rev().take(3) {
+        let id = rev.get("id").and_then(Value::as_u64).unwrap_or(0);
+        let rev_str = rev.get("revision").and_then(Value::as_str).unwrap_or("?");
+        let deployed_at = rev.get("deployedAt").and_then(Value::as_str).unwrap_or("?");
+        out.push(format!("  #{id:>3} {rev_str:<10} {deployed_at}"));
+    }
+    out
+}
+
 fn print_status(app: &Value) {
     for line in status_detail_lines(app) {
         println!("{line}");
     }
-
-    if let Some(revs) = app.pointer("/status/history").and_then(Value::as_array) {
-        if !revs.is_empty() {
-            println!();
-            println!("Recent revisions (last {}):", revs.len().min(3));
-            for rev in revs.iter().rev().take(3) {
-                let id = rev.get("id").and_then(Value::as_u64).unwrap_or(0);
-                let rev_str = rev.get("revision").and_then(Value::as_str).unwrap_or("?");
-                let deployed_at = rev.get("deployedAt").and_then(Value::as_str).unwrap_or("?");
-                println!("  #{id:>3} {rev_str:<10} {deployed_at}");
-            }
-        }
+    for line in recent_revision_lines(app) {
+        println!("{line}");
     }
 }
 
@@ -5593,5 +6147,1200 @@ mod size_cell_tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(1536), "1.5 KB");
         assert_eq!(human_bytes(15 * 1024 * 1024), "15 MB");
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tracked(name: &str, kind: &str, ns: &str, status: &str, health: &str) -> TrackedResource {
+        TrackedResource {
+            name: name.into(),
+            kind: kind.into(),
+            namespace: ns.into(),
+            status: status.into(),
+            health: health.into(),
+        }
+    }
+
+    #[test]
+    fn the_resource_table_widens_every_column_to_its_longest_cell() {
+        // The whole point of a hand-rolled table: a name longer than its
+        // header must not push the next column out of alignment, and the
+        // header row must move with it.
+        let rows = [
+            tracked("web", "Service", "apps", "Synced", "Healthy"),
+            tracked(
+                "web-deployment-long",
+                "Deployment",
+                "production",
+                "OutOfSync",
+                "Progressing",
+            ),
+        ];
+        let lines = render_tracked_resource_lines(&rows);
+        let header = &lines[2];
+        let first = &lines[3];
+        let second = &lines[4];
+        for (head, short, long) in [
+            ("KIND", "Service", "Deployment"),
+            ("NAMESPACE", "apps", "production"),
+            ("STATUS", "Synced", "OutOfSync"),
+            ("HEALTH", "Healthy", "Progressing"),
+        ] {
+            assert_eq!(
+                header.find(head),
+                first.find(short),
+                "{head} must start where its header does: {header:?} / {first:?}"
+            );
+            assert_eq!(
+                first.find(short),
+                second.find(long),
+                "both rows must start {head} at the same offset: {first:?} / {second:?}"
+            );
+        }
+        assert!(
+            first.ends_with("Healthy"),
+            "health is the last, unpadded column: {first:?}"
+        );
+    }
+
+    #[test]
+    fn a_resource_table_of_short_values_still_clears_its_own_headers() {
+        // The width floors: `NAME` is 4, `NAMESPACE` 9, `STATUS` 6, and a
+        // one-row table of short cells would otherwise print HEALTH on top
+        // of the NAMESPACE header.
+        let rows = [tracked("ui", "Pod", "ns", "OK", "Healthy")];
+        let lines = render_tracked_resource_lines(&rows);
+        let header = &lines[2];
+        let row = &lines[3];
+        assert_eq!(
+            header.find("NAMESPACE"),
+            row.find("ns"),
+            "{header:?} / {row:?}"
+        );
+        assert_eq!(
+            header.find("STATUS"),
+            row.find("OK"),
+            "{header:?} / {row:?}"
+        );
+        assert_eq!(
+            header.find("HEALTH"),
+            row.find("Healthy"),
+            "{header:?} / {row:?}"
+        );
+    }
+
+    #[test]
+    fn a_never_synced_application_says_so_instead_of_printing_an_empty_table() {
+        // An empty table under a header reads as "Argo tracks nothing";
+        // the sentence says it is Argo that has not reported yet.
+        let lines = render_tracked_resource_lines(&[]);
+        assert_eq!(lines.len(), 3, "blank, header, sentence: {lines:?}");
+        assert!(lines[2].contains("status.resources[]"), "{:?}", lines[2]);
+    }
+
+    fn pod(name: &str, started_at: Option<&str>) -> PodSummary {
+        PodSummary {
+            name: name.into(),
+            ready: "1/1".into(),
+            status: "Running".into(),
+            restarts: 0,
+            age: "5m".into(),
+            started_at: started_at.map(String::from),
+        }
+    }
+
+    #[test]
+    fn only_the_pods_older_than_the_config_carry_the_drift_marker() {
+        // INVARIANT (2.22c / D6): the marker is PER POD. During a rollout
+        // the old and new replicas coexist, and flagging both would tell an
+        // operator the restart did nothing.
+        let pods = [
+            pod("web-old", Some("2026-08-31T10:00:00Z")),
+            pod("web-new", Some("2026-08-31T12:00:00Z")),
+        ];
+        let lines = render_pod_summary_lines(&pods, "web", "apps", Some("2026-08-31T11:00:00Z"));
+        let old = lines.iter().find(|l| l.text.contains("web-old")).unwrap();
+        let new = lines.iter().find(|l| l.text.contains("web-new")).unwrap();
+        assert!(old.warn && old.text.contains("← old config"), "{old:?}");
+        assert!(!new.warn && !new.text.contains("← old config"), "{new:?}");
+    }
+
+    #[test]
+    fn the_drift_explanation_appears_only_when_some_pod_actually_drifted() {
+        // The paragraph explains a marker. Printing it with no marked row
+        // is an unexplained warning on a healthy app.
+        let pods = [pod("web-new", Some("2026-08-31T12:00:00Z"))];
+        let clean = render_pod_summary_lines(&pods, "web", "apps", Some("2026-08-31T11:00:00Z"));
+        assert!(
+            !clean
+                .iter()
+                .any(|l| l.text.contains("resolved once at pod start")),
+            "{clean:?}"
+        );
+        let pods = [pod("web-old", Some("2026-08-31T10:00:00Z"))];
+        let drifted = render_pod_summary_lines(&pods, "web", "apps", Some("2026-08-31T11:00:00Z"));
+        assert!(
+            drifted
+                .iter()
+                .any(|l| l.warn && l.text.contains("resolved once at pod start")),
+            "{drifted:?}"
+        );
+    }
+
+    #[test]
+    fn a_workload_with_no_pods_names_the_two_reasons_rather_than_showing_a_bare_table() {
+        let lines = render_pod_summary_lines(&[], "web", "apps", None);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[1].text.contains("app.kubernetes.io/name=web"),
+            "{:?}",
+            lines[1]
+        );
+        assert!(lines[2].text.contains("spec.expose"), "{:?}", lines[2]);
+        assert!(!lines.iter().any(|l| l.warn), "an absence is not a warning");
+    }
+
+    fn svc(name: &str, type_: &str, ip: &str, ports: &str) -> ServiceSummary {
+        ServiceSummary {
+            name: name.into(),
+            type_: type_.into(),
+            cluster_ip: ip.into(),
+            ports: ports.into(),
+        }
+    }
+
+    #[test]
+    fn the_service_table_pads_cluster_ip_to_its_header_even_when_every_value_is_shorter() {
+        // `CLUSTER-IP` is 10 chars and an IP can be 8 ("10.0.0.1"). Without
+        // the floor the PORTS column would slide under the IP header.
+        let rows = [svc("web", "ClusterIP", "10.0.0.1", "80/TCP")];
+        let lines = render_service_lines(&rows, "web", "apps");
+        assert_eq!(
+            lines[2].find("PORTS"),
+            lines[3].find("80/TCP"),
+            "{:?} / {:?}",
+            lines[2],
+            lines[3]
+        );
+    }
+
+    #[test]
+    fn a_service_less_app_is_told_expose_may_simply_be_omitted() {
+        let lines = render_service_lines(&[], "web", "apps");
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[2].contains("spec.expose"), "{:?}", lines[2]);
+    }
+
+    fn claim(
+        name: &str,
+        provider: &str,
+        ready: bool,
+        secret: Option<&str>,
+    ) -> ResourceClaimSummary {
+        ResourceClaimSummary {
+            name: name.into(),
+            provider: provider.into(),
+            ready,
+            secret_ref: secret.map(String::from),
+            backing: "pvc/data".into(),
+            size: "1Gi".into(),
+            scheduled: true,
+        }
+    }
+
+    #[test]
+    fn a_claim_row_spells_its_booleans_and_dashes_a_missing_secret() {
+        // A blank READY cell and a blank SECRET cell look identical, and
+        // one of them means "not ready" while the other means "not yet
+        // bound" — both need a token the reader can see.
+        let rows = [claim("web-db", "postgres", false, None)];
+        let lines = render_resource_claim_lines(&rows, "apps");
+        let row = &lines[3];
+        assert!(row.contains("false"), "{row:?}");
+        assert!(row.trim_end().ends_with('-'), "{row:?}");
+        let bound = render_resource_claim_lines(
+            &[claim("web-db", "postgres", true, Some("web-db-conn"))],
+            "apps",
+        );
+        assert!(
+            bound[3].trim_end().ends_with("web-db-conn"),
+            "{:?}",
+            bound[3]
+        );
+        assert!(bound[3].contains("true"), "{:?}", bound[3]);
+    }
+
+    #[test]
+    fn an_app_with_no_needs_is_told_so_rather_than_shown_an_empty_claims_table() {
+        let lines = render_resource_claim_lines(&[], "apps");
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[1].contains("apps"), "{:?}", lines[1]);
+        assert!(lines[2].contains("needs.*"), "{:?}", lines[2]);
+    }
+
+    #[test]
+    fn the_secrets_block_lists_every_binding_with_its_scope() {
+        let cr = json!({
+            "metadata": { "name": "web", "namespace": "apps" },
+            "spec": {
+                "base": { "env": { "DATABASE_URL": { "secret": "db-creds/url" } } },
+                "environments": { "prod": { "env": { "API_KEY": { "secret": "vault/api" } } } }
+            }
+        });
+        let lines = render_secret_binding_lines(&cr, "web", "apps");
+        assert!(lines[1].contains("Secrets (apps/web)"), "{:?}", lines[1]);
+        let body = lines[3..].join("\n");
+        assert!(body.contains("DATABASE_URL"), "{body}");
+        assert!(body.contains("db-creds/url"), "{body}");
+        assert!(body.contains("(base)"), "{body}");
+        assert!(body.contains("API_KEY"), "{body}");
+        assert!(body.contains("vault/api"), "{body}");
+        assert!(body.contains("(prod)"), "{body}");
+    }
+
+    #[test]
+    fn an_app_that_binds_no_secrets_renders_no_secrets_block_at_all() {
+        // INVARIANT: not an empty header. A `Secrets:` heading with nothing
+        // under it reads as "your secrets went missing".
+        let cr = json!({
+            "metadata": { "name": "web", "namespace": "apps" },
+            "spec": { "base": { "env": { "PORT": "8080" } } }
+        });
+        assert!(render_secret_binding_lines(&cr, "web", "apps").is_empty());
+    }
+
+    #[test]
+    fn recent_revisions_shows_the_newest_three_newest_first() {
+        // INVARIANT: Argo CD APPENDS to status.history, so the newest entry
+        // is LAST. Rendering the array as-is would show the three OLDEST
+        // deploys under a heading that says "recent".
+        let app = json!({ "status": { "history": [
+            { "id": 1, "revision": "aaa", "deployedAt": "d1" },
+            { "id": 2, "revision": "bbb", "deployedAt": "d2" },
+            { "id": 3, "revision": "ccc", "deployedAt": "d3" },
+            { "id": 4, "revision": "ddd", "deployedAt": "d4" }
+        ]}});
+        let lines = recent_revision_lines(&app);
+        assert_eq!(lines.len(), 5, "blank + header + 3 rows: {lines:?}");
+        assert!(lines[1].contains("last 3"), "{:?}", lines[1]);
+        assert!(
+            lines[2].contains("ddd") && lines[2].contains("#  4"),
+            "{:?}",
+            lines[2]
+        );
+        assert!(lines[3].contains("ccc"), "{:?}", lines[3]);
+        assert!(lines[4].contains("bbb"), "{:?}", lines[4]);
+        assert!(!lines.iter().any(|l| l.contains("aaa")), "{lines:?}");
+    }
+
+    #[test]
+    fn a_shorter_history_reports_its_own_length_not_three() {
+        let app = json!({ "status": { "history": [
+            { "id": 7, "revision": "aaa", "deployedAt": "d1" }
+        ]}});
+        let lines = recent_revision_lines(&app);
+        assert!(lines[1].contains("last 1"), "{:?}", lines[1]);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+    }
+
+    #[test]
+    fn an_app_with_no_history_renders_no_revision_heading() {
+        assert!(recent_revision_lines(&json!({})).is_empty());
+        assert!(recent_revision_lines(&json!({ "status": { "history": [] } })).is_empty());
+    }
+
+    fn summary(argo_name: &str, env: &str) -> DeploymentSummary {
+        DeploymentSummary {
+            argo_name: argo_name.into(),
+            environment: env.into(),
+            destination_namespace: "apps".into(),
+            sync: "Synced".into(),
+            health: "Healthy".into(),
+        }
+    }
+
+    #[test]
+    fn a_multi_environment_app_gets_an_index_naming_each_deployment() {
+        let lines = env_deployment_index_lines(
+            "web",
+            &[summary("web-dev", "dev"), summary("web-prod", "prod")],
+        );
+        assert!(
+            lines[0].contains("2 environment deployments"),
+            "{:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("web-dev") && lines[1].contains("(dev)"),
+            "{:?}",
+            lines[1]
+        );
+        assert!(lines[2].contains("web-prod"), "{:?}", lines[2]);
+        assert_eq!(lines[3], "", "trailing blank separates index from detail");
+    }
+
+    #[test]
+    fn a_single_deployment_gets_no_index_header() {
+        // INVARIANT: the index summarises a choice. With one deployment
+        // there is none, and "1 environment deployments" above the block it
+        // describes is noise on the common case.
+        assert!(env_deployment_index_lines("web", &[summary("web", "(base)")]).is_empty());
+        assert!(env_deployment_index_lines("web", &[]).is_empty());
+    }
+
+    #[test]
+    fn the_advisory_block_orders_phase_reason_image_pin_and_marks_the_right_ones_yellow() {
+        // INVARIANT: order is the message — the reason must sit directly
+        // under the phase it explains, and the pin under the digest it
+        // qualifies. Colour is a claim about severity: the pin and the
+        // failure reason are advisories, the image line is a fact.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-05T00:05:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let cr = json!({
+            "metadata": { "name": "web" },
+            "status": {
+                "phase": "EnvSecretMissing",
+                "conditions": [
+                    { "type": "Ready", "status": "False",
+                      "reason": "EnvSecretMissing", "message": "secret apps/db-creds not found" }
+                ],
+                "image": {
+                    "tag": "ghcr.io/acme/web:latest",
+                    "resolved": "ghcr.io/acme/web@sha256:abc",
+                    "resolvedAt": "2026-06-05T00:00:00Z",
+                    "pinned": { "resolved": "ghcr.io/acme/web@sha256:abc",
+                                "at": "2026-06-04T00:00:00Z" }
+                }
+            }
+        });
+        let lines = apprafter_cr_advisory_lines(&cr, &now);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines[0].text, "AppRafter phase: EnvSecretMissing");
+        assert!(!lines[0].warn);
+        assert!(
+            lines[1].warn && lines[1].text.contains("db-creds"),
+            "{:?}",
+            lines[1]
+        );
+        assert!(
+            !lines[2].warn && lines[2].text.contains("@sha256:abc"),
+            "{:?}",
+            lines[2]
+        );
+        assert!(
+            lines[3].warn && lines[3].text.contains("unpin"),
+            "{:?}",
+            lines[3]
+        );
+    }
+
+    #[test]
+    fn a_healthy_app_produces_no_advisory_lines_beyond_its_phase() {
+        let now = chrono::Utc::now();
+        let cr = json!({ "status": { "phase": "Ready", "conditions": [
+            { "type": "Ready", "status": "True" }
+        ]}});
+        let lines = apprafter_cr_advisory_lines(&cr, &now);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].text, "AppRafter phase: Ready");
+        assert!(apprafter_cr_advisory_lines(&json!({}), &now).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod add_path_tests {
+    use super::*;
+
+    #[test]
+    fn an_env_the_manifest_declares_is_admitted() {
+        // Both the sole-declaration and the one-among-several case: the
+        // check is membership, not "some other environment also exists".
+        assert_eq!(undeclared_env_error("prod", &["prod".to_string()]), None);
+        assert_eq!(
+            undeclared_env_error("prod", &["dev".to_string(), "prod".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn an_undeclared_env_is_refused_and_the_declared_ones_are_listed() {
+        let msg = undeclared_env_error("stage", &["dev".to_string(), "prod".to_string()])
+            .expect("stage is not declared");
+        assert!(msg.contains("'stage'"), "{msg}");
+        assert!(msg.contains("dev, prod"), "{msg}");
+        assert!(msg.contains("spec.environments.stage"), "{msg}");
+    }
+
+    #[test]
+    fn a_manifest_declaring_no_environments_still_refuses_rather_than_allowing_anything() {
+        // INVARIANT: "nothing declared" must not read as "everything
+        // allowed". Admitting it registers an Argo CD Application whose
+        // environment renders to nothing, and the failure lands later in
+        // Argo CD rather than here.
+        let msg = undeclared_env_error("dev", &[]).expect("nothing is declared");
+        assert!(msg.contains("(none declared)"), "{msg}");
+    }
+
+    #[test]
+    fn the_collision_refusal_suggests_the_logical_name_never_the_argo_identity() {
+        // The logical-name UX rule: `app status` / `app remove` take the
+        // LOGICAL name; echoing back `web-prod` would hand the reader a
+        // name none of our verbs accept.
+        let msg = already_registered_error("web-prod", "web", Some("prod"));
+        assert!(msg.contains("'web-prod' is already registered"), "{msg}");
+        assert!(msg.contains("apprafter app status web"), "{msg}");
+        assert!(
+            !msg.contains("apprafter app status web-prod"),
+            "must not suggest the Argo identity: {msg}"
+        );
+        assert!(msg.contains("apprafter app remove web --env prod"), "{msg}");
+    }
+
+    #[test]
+    fn a_base_only_collision_drops_the_env_flag_from_its_remove_hint() {
+        let msg = already_registered_error("web", "web", None);
+        assert!(msg.contains("`apprafter app remove web`"), "{msg}");
+        assert!(
+            !msg.contains("apprafter app remove web --env"),
+            "there is no environment to name: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_registration_summary_states_an_explicit_environment_flatly() {
+        let lines = registration_summary_lines(
+            "web-prod",
+            "apps",
+            "https://github.com/acme/web",
+            "main",
+            ".",
+            "production",
+            Some("prod"),
+            Some("dev"),
+        );
+        assert!(
+            lines[0].contains("'web-prod'") && lines[0].contains("'apps'"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("https://github.com/acme/web"),
+            "{lines:?}"
+        );
+        assert!(lines[2].contains("main"), "{lines:?}");
+        assert!(lines[4].contains("production"), "{lines:?}");
+        assert_eq!(lines[5], "  Environment: prod");
+        assert!(
+            !lines[5].contains("dev"),
+            "an explicit --env must not mention the cluster default: {:?}",
+            lines[5]
+        );
+    }
+
+    #[test]
+    fn a_base_only_registration_names_the_cluster_default_and_how_to_pin_it() {
+        let lines = registration_summary_lines(
+            "web",
+            "apps",
+            "https://github.com/acme/web",
+            "main",
+            ".",
+            "production",
+            None,
+            Some("dev"),
+        );
+        assert!(
+            lines[5].contains("cluster default is 'dev'"),
+            "{:?}",
+            lines[5]
+        );
+        assert!(lines[5].contains("--env dev"), "{:?}", lines[5]);
+    }
+
+    #[test]
+    fn a_base_only_registration_with_no_platformstack_omits_the_environment_line() {
+        // INVARIANT: silence rather than a claim. Printing `(base)` with no
+        // default would assert the cluster has none, which we did not learn.
+        let lines = registration_summary_lines(
+            "web",
+            "apps",
+            "https://github.com/acme/web",
+            "main",
+            ".",
+            "production",
+            None,
+            None,
+        );
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("Environment")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_validated_credential_admits_the_repo() {
+        assert_eq!(
+            confirmed_coverage_error("https://github.com/acme/web", true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn covered_but_unvalidated_and_not_covered_at_all_are_different_refusals() {
+        // INVARIANT: collapsing them sends an operator who already
+        // registered the right credential off to register a second one,
+        // when what they need is to validate the one they have.
+        let unvalidated =
+            confirmed_coverage_error("https://github.com/acme/web", false, true).expect("refused");
+        assert!(unvalidated.contains("GitValid=True"), "{unvalidated}");
+        assert!(!unvalidated.contains("repo creds add"), "{unvalidated}");
+
+        let uncovered =
+            confirmed_coverage_error("https://github.com/acme/web", false, false).expect("refused");
+        assert!(uncovered.contains("repo creds add"), "{uncovered}");
+        assert!(!uncovered.contains("GitValid=True"), "{uncovered}");
+    }
+
+    #[test]
+    fn a_known_provider_gets_a_numbered_pat_walkthrough_with_the_command_prefilled() {
+        let s = CredsSuggestion {
+            suggested_name: "github-acme".into(),
+            url_prefix: "https://github.com/acme".into(),
+            pat_creation_url: Some("https://github.com/settings/tokens/new".into()),
+        };
+        let lines = creds_notice_lines("https://github.com/acme/web", Some(&s));
+        let body = lines.join("\n");
+        assert!(
+            body.contains("https://github.com/settings/tokens/new"),
+            "{body}"
+        );
+        assert!(body.contains("1. Generate a PAT here"), "{body}");
+        assert!(body.contains("2. Register it with AppRafter"), "{body}");
+        assert!(
+            body.contains(
+                "apprafter repo creds add github-acme --url-prefix https://github.com/acme"
+            ),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_provider_still_gets_a_command_with_its_name_and_prefix_filled_in() {
+        // INVARIANT: the notice degrades in TWO steps. Without a PAT URL
+        // the operator still gets a runnable command, not just advice.
+        let s = CredsSuggestion {
+            suggested_name: "gitea-acme".into(),
+            url_prefix: "https://git.acme.dev/acme".into(),
+            pat_creation_url: None,
+        };
+        let body = creds_notice_lines("https://git.acme.dev/acme/web", Some(&s)).join("\n");
+        assert!(
+            body.contains(
+                "apprafter repo creds add gitea-acme --url-prefix https://git.acme.dev/acme"
+            ),
+            "{body}"
+        );
+        assert!(!body.contains("Generate a PAT here"), "{body}");
+    }
+
+    #[test]
+    fn an_unparseable_url_still_gets_the_command_shape_with_placeholders() {
+        let body = creds_notice_lines("https://weird", None).join("\n");
+        assert!(
+            body.contains("apprafter repo creds add <name> --url-prefix <prefix> --token <pat>"),
+            "{body}"
+        );
+        assert!(body.contains("https://weird is private"), "{body}");
+    }
+
+    #[test]
+    fn a_remote_url_is_trimmed_and_normalised_to_the_https_shape_argo_accepts() {
+        assert_eq!(
+            remote_url_or_error("origin", "git@github.com:acme/web.git\n").unwrap(),
+            "https://github.com/acme/web"
+        );
+    }
+
+    #[test]
+    fn a_blank_remote_url_is_an_error_rather_than_an_empty_repo_url() {
+        // INVARIANT: `git remote get-url` exits 0 for a remote configured
+        // with a blank URL. Letting that through registers an Application
+        // pointing at nothing, and the failure surfaces later in Argo CD.
+        let err = remote_url_or_error("origin", "  \n ").unwrap_err();
+        assert!(
+            format!("{err}").contains("git remote origin returned an empty URL"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_auth_failure_from_ls_remote_is_routed_to_repo_creds_add() {
+        // INVARIANT: git's wording varies by transport, so the match is
+        // case-insensitive. Misclassifying it sends the operator hunting
+        // for a typo in a URL that is perfectly correct.
+        for stderr in [
+            "remote: Authentication failed for 'https://github.com/acme/web'",
+            "git@github.com: Permission denied (publickey).",
+            "fatal: PERMISSION DENIED",
+        ] {
+            let msg = ls_remote_failure_message("https://github.com/acme/web", stderr, Some(128));
+            assert!(msg.contains("refused access"), "{stderr} -> {msg}");
+            assert!(
+                msg.contains("apprafter repo creds add"),
+                "{stderr} -> {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_auth_failure_reports_the_exit_code_and_stays_out_of_the_creds_advice() {
+        let msg = ls_remote_failure_message(
+            "https://github.com/acme/web",
+            "fatal: repository not found",
+            Some(128),
+        );
+        assert!(msg.contains("exit Some(128)"), "{msg}");
+        assert!(msg.contains("repository not found"), "{msg}");
+        assert!(
+            !msg.contains("apprafter repo creds add"),
+            "a missing repo is not a credentials problem: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod list_filter_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn payload() -> Value {
+        json!({ "items": [
+            { "metadata": { "name": "web" },   "spec": { "project": "apps" } },
+            { "metadata": { "name": "infra" }, "spec": { "project": "platform" } },
+            { "metadata": { "name": "orphan" } }
+        ]})
+    }
+
+    #[test]
+    fn a_project_scoped_listing_keeps_only_that_projects_applications() {
+        let kept = filter_apps_for_list(&payload(), "apps", false);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].pointer("/metadata/name").unwrap(), "web");
+    }
+
+    #[test]
+    fn an_application_with_no_project_is_dropped_from_a_scoped_listing() {
+        // INVARIANT: the filter is an allow-list on an exact match, so an
+        // unparseable CR cannot leak into a project-scoped listing.
+        let kept = filter_apps_for_list(&payload(), "apps", false);
+        assert!(
+            !kept
+                .iter()
+                .any(|a| a.pointer("/metadata/name").unwrap() == "orphan"),
+            "{kept:?}"
+        );
+    }
+
+    #[test]
+    fn all_projects_keeps_every_item_including_the_project_less_one() {
+        let kept = filter_apps_for_list(&payload(), "apps", true);
+        assert_eq!(kept.len(), 3, "{kept:?}");
+    }
+
+    #[test]
+    fn a_payload_without_items_yields_no_rows_rather_than_panicking() {
+        assert!(filter_apps_for_list(&json!({}), "apps", false).is_empty());
+        assert!(filter_apps_for_list(&json!({ "items": null }), "apps", true).is_empty());
+    }
+
+    #[test]
+    fn the_default_listing_is_filtered_to_apprafter_managed_applications() {
+        // INVARIANT: `argocd` also holds the platform's own root
+        // Application and every component under it. Listing those next to a
+        // developer's apps buries the answer; `--all-managed` is the opt-in.
+        assert_eq!(
+            list_label_selector(false),
+            Some("apprafter.io/managed-by=apprafter")
+        );
+        assert_eq!(list_label_selector(true), None);
+    }
+
+    #[test]
+    fn the_empty_listing_names_the_project_it_searched() {
+        let lines = empty_list_lines("apps", false, false);
+        assert!(lines[0].contains("AppProject 'apps'"), "{lines:?}");
+        let cluster = empty_list_lines("apps", true, false);
+        assert!(cluster[0].contains("in the cluster"), "{cluster:?}");
+        assert!(!cluster[0].contains("apps"), "{cluster:?}");
+    }
+
+    #[test]
+    fn the_all_managed_hint_is_suppressed_once_that_flag_is_already_set() {
+        // INVARIANT: suggesting a flag the reader just passed is how a CLI
+        // teaches people to stop reading its hints.
+        assert_eq!(empty_list_lines("apps", false, true).len(), 1);
+        let unset = empty_list_lines("apps", false, false);
+        assert_eq!(unset.len(), 2, "{unset:?}");
+        assert!(unset[1].contains("--all-managed"), "{unset:?}");
+    }
+}
+
+#[cfg(test)]
+mod remove_plan_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn argo(name: &str) -> Value {
+        json!({ "metadata": { "name": name } })
+    }
+
+    #[test]
+    fn an_unlabelled_pre_2_9_app_falls_back_to_the_bare_logical_name() {
+        // INVARIANT: a pre-2.9 app carries no `apprafter.io/application`
+        // label, so "the selector matched nothing" must not be read as
+        // "there is nothing to delete".
+        assert_eq!(plan_remove("web", &[]), RemovePlan::Single("web".into()));
+    }
+
+    #[test]
+    fn a_single_labelled_match_targets_its_own_argo_name_not_the_logical_one() {
+        // INVARIANT: the object's own metadata.name may be `<name>-<env>`.
+        // Deleting `<name>` would target an Application that does not exist.
+        assert_eq!(
+            plan_remove("web", &[argo("web-prod")]),
+            RemovePlan::Single("web-prod".into())
+        );
+    }
+
+    #[test]
+    fn several_labelled_matches_become_a_batch_of_every_argo_name() {
+        assert_eq!(
+            plan_remove("web", &[argo("web-dev"), argo("web-prod")]),
+            RemovePlan::Batch(vec!["web-dev".into(), "web-prod".into()])
+        );
+    }
+
+    #[test]
+    fn an_entry_without_a_name_is_skipped_rather_than_deleted_blind() {
+        let plan = plan_remove("web", &[argo("web-dev"), json!({ "metadata": {} })]);
+        assert_eq!(plan, RemovePlan::Batch(vec!["web-dev".into()]));
+    }
+
+    #[test]
+    fn the_batch_prompt_names_every_deployment_rather_than_counting_them() {
+        // A count is not consent. The reader is about to destroy several
+        // environments and must see which.
+        let lines = batch_remove_prompt_lines("web", &["web-dev".into(), "web-prod".into()]);
+        assert!(
+            lines[0].contains("Delete ALL 2 environment deployments of 'web'?"),
+            "{lines:?}"
+        );
+        assert_eq!(lines[1], "  • web-dev");
+        assert_eq!(lines[2], "  • web-prod");
+    }
+
+    #[test]
+    fn the_single_prompt_quotes_the_project_and_repo_back() {
+        let app = json!({
+            "spec": { "project": "apps", "source": { "repoURL": "https://github.com/acme/web" } }
+        });
+        let line = single_remove_prompt_line("web-prod", &app);
+        assert!(line.contains("'web-prod'"), "{line}");
+        assert!(line.contains("project: apps"), "{line}");
+        assert!(line.contains("repo: https://github.com/acme/web"), "{line}");
+    }
+
+    #[test]
+    fn a_prompt_for_an_app_missing_those_fields_shows_a_question_mark_not_an_empty_pair() {
+        let line = single_remove_prompt_line("web", &json!({}));
+        assert!(line.contains("project: ?"), "{line}");
+        assert!(line.contains("repo: ?"), "{line}");
+    }
+
+    #[test]
+    fn keep_data_and_a_plain_remove_say_opposite_things_about_the_workload() {
+        // INVARIANT: the finalizer was stripped on the keep-data path, so
+        // the CR and its pods survive. Reporting the cascade wording there
+        // tells an operator their data is gone while it is still running.
+        let kept = remove_success_line("web", true);
+        assert!(kept.contains("preserved"), "{kept}");
+        assert!(!kept.contains("cascade-prunes"), "{kept}");
+
+        let cascaded = remove_success_line("web", false);
+        assert!(cascaded.contains("cascade-prunes"), "{cascaded}");
+        assert!(!cascaded.contains("preserved"), "{cascaded}");
+    }
+}
+
+#[cfg(test)]
+mod pin_plan_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn cr_with(ns: Option<&str>) -> Value {
+        let mut meta = json!({ "name": "web" });
+        if let Some(ns) = ns {
+            meta["namespace"] = json!(ns);
+        }
+        json!({
+            "metadata": meta,
+            "status": { "image": {
+                "tag": "ghcr.io/acme/web:latest",
+                "resolved": "ghcr.io/acme/web@sha256:current"
+            }}
+        })
+    }
+
+    fn argo_app() -> Value {
+        json!({ "spec": { "destination": { "namespace": "apps" } } })
+    }
+
+    #[test]
+    fn a_pin_plan_resolves_the_reference_from_the_crs_own_repository() {
+        let plan = plan_pin(&argo_app(), &cr_with(Some("prod")), "sha256:older").unwrap();
+        assert_eq!(plan.cr_name, "web");
+        assert_eq!(plan.cr_ns, "prod");
+        assert_eq!(plan.reference, "ghcr.io/acme/web@sha256:older");
+        assert_eq!(plan.current, "ghcr.io/acme/web@sha256:current");
+    }
+
+    #[test]
+    fn a_namespaceless_cr_borrows_the_argo_applications_destination() {
+        // INVARIANT: the pin must land where the workload is. A
+        // namespace-less server-side apply would silently target `default`.
+        let plan = plan_pin(&argo_app(), &cr_with(None), "sha256:older").unwrap();
+        assert_eq!(plan.cr_ns, "apps");
+    }
+
+    #[test]
+    fn a_pin_with_no_namespace_anywhere_is_refused_rather_than_defaulted() {
+        let err = plan_pin(&json!({}), &cr_with(None), "sha256:older").unwrap_err();
+        assert!(
+            format!("{err}").contains("cannot determine the application's namespace"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_git_managed_pin_is_refused_because_the_next_sync_would_revert_it() {
+        // INVARIANT: writing it would report a rollback the operator never
+        // got — Argo owns the annotation and re-syncs it away.
+        let mut cr = cr_with(Some("apps"));
+        cr["metadata"]["managedFields"] = json!([{
+            "manager": "argocd-application-controller",
+            "fieldsV1": { "f:metadata": { "f:annotations": { "f:apprafter.io/image-pin": {} } } }
+        }]);
+        let err = plan_pin(&argo_app(), &cr, "sha256:older").unwrap_err();
+        assert!(format!("{err}").contains("Git owns"), "{err}");
+    }
+
+    #[test]
+    fn pinning_to_what_is_already_running_is_refused_as_a_no_op() {
+        let err = plan_pin(&argo_app(), &cr_with(Some("apps")), "sha256:current").unwrap_err();
+        assert!(format!("{err}").contains("already running"), "{err}");
+    }
+
+    #[test]
+    fn the_pin_prompt_names_the_mode_change_and_the_verb_that_undoes_it() {
+        // A pin is the one rollback that keeps acting after it returns, so
+        // the way back has to be on screen before the reader agrees.
+        let plan = plan_pin(&argo_app(), &cr_with(Some("apps")), "sha256:older").unwrap();
+        let lines = pin_prompt_lines(&plan);
+        assert!(
+            lines[0].contains("from ghcr.io/acme/web@sha256:current"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].contains("to ghcr.io/acme/web@sha256:older"),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("stops following its tag"), "{lines:?}");
+        assert!(lines[1].contains("apprafter app unpin web"), "{lines:?}");
+        assert!(lines[2].contains("--to <revision>"), "{lines:?}");
+    }
+
+    #[test]
+    fn the_pin_success_line_carries_the_un_pin_verb() {
+        let plan = plan_pin(&argo_app(), &cr_with(Some("apps")), "sha256:older").unwrap();
+        let line = pin_success_line(&plan);
+        assert!(
+            line.contains("pinned to ghcr.io/acme/web@sha256:older"),
+            "{line}"
+        );
+        assert!(line.contains("apprafter app unpin web"), "{line}");
+    }
+
+    #[test]
+    fn the_unpin_plan_uses_the_same_namespace_fallback_as_the_pin_plan() {
+        // INVARIANT: un-pin re-applies the SAME body under the SAME field
+        // manager. A namespace that differed by one step would prune
+        // nothing and leave the application pinned while reporting success.
+        let cr = cr_with(None);
+        let pin = plan_pin(&argo_app(), &cr, "sha256:older").unwrap();
+        let unpin = plan_unpin(&argo_app(), &cr).unwrap();
+        assert_eq!(unpin.cr_ns, pin.cr_ns);
+        assert_eq!(unpin.cr_name, pin.cr_name);
+    }
+
+    #[test]
+    fn an_unpinned_cr_reports_no_held_reference() {
+        assert_eq!(
+            plan_unpin(&argo_app(), &cr_with(Some("apps")))
+                .unwrap()
+                .pinned,
+            None
+        );
+    }
+
+    #[test]
+    fn a_pinned_cr_reports_the_reference_the_annotation_holds() {
+        let mut cr = cr_with(Some("apps"));
+        cr["metadata"]["annotations"] =
+            json!({ "apprafter.io/image-pin": "ghcr.io/acme/web@sha256:held" });
+        let plan = plan_unpin(&argo_app(), &cr).unwrap();
+        assert_eq!(plan.pinned.as_deref(), Some("ghcr.io/acme/web@sha256:held"));
+        assert_eq!(plan.tag, "ghcr.io/acme/web:latest");
+    }
+
+    #[test]
+    fn a_cr_with_no_resolved_tag_falls_back_to_a_phrase_that_still_reads() {
+        let cr = json!({ "metadata": { "name": "web", "namespace": "apps" } });
+        assert_eq!(plan_unpin(&argo_app(), &cr).unwrap().tag, "its tag");
+    }
+
+    #[test]
+    fn the_unpin_prompt_warns_that_the_workload_may_roll_forward() {
+        // INVARIANT: "un-pin" does not imply "may deploy something new",
+        // and that is exactly what the reader is agreeing to.
+        let mut cr = cr_with(Some("apps"));
+        cr["metadata"]["annotations"] =
+            json!({ "apprafter.io/image-pin": "ghcr.io/acme/web@sha256:held" });
+        let lines = unpin_prompt_lines(&plan_unpin(&argo_app(), &cr).unwrap());
+        assert!(
+            lines[0].contains("currently held at ghcr.io/acme/web@sha256:held"),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("roll forward"), "{lines:?}");
+        assert!(lines[1].contains("ghcr.io/acme/web:latest"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_revision_rollback_to_the_current_revision_is_an_error_not_a_silent_success() {
+        // INVARIANT: Argo CD would accept the patch and report a sync, so
+        // "rolled back" would be printed over a workload that never moved.
+        let app = json!({ "spec": { "source": { "targetRevision": "main" } } });
+        assert_eq!(current_target_revision(&app), "main");
+        let msg = noop_revision_error("main", &current_target_revision(&app)).expect("refused");
+        assert!(msg.contains("no-op"), "{msg}");
+        assert_eq!(noop_revision_error("v1.2.3", "main"), None);
+    }
+
+    #[test]
+    fn an_application_without_a_target_revision_reads_as_a_question_mark() {
+        assert_eq!(current_target_revision(&json!({})), "?");
+    }
+}
+
+#[cfg(test)]
+mod logs_target_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn the_pod_label_is_the_inner_apprafter_name_not_the_argo_parent() {
+        // INVARIANT: `Application.cue`'s metadata.name need not equal the
+        // name typed at `app add`; the operator labels pods with the former.
+        let app = json!({
+            "spec": { "destination": { "namespace": "apps" } },
+            "status": { "resources": [
+                { "group": "apprafter.io", "kind": "Application",
+                  "name": "storefront", "namespace": "apps" }
+            ]}
+        });
+        let (ns, inner) = resolve_logs_workload(&app, "web-prod").unwrap();
+        assert_eq!(ns, "apps");
+        assert_eq!(inner, "storefront");
+    }
+
+    #[test]
+    fn a_raw_yaml_app_falls_back_to_the_resolved_argo_name_not_the_logical_one() {
+        // INVARIANT: the fallback is `<name>-<env>` — the RESOLVED name the
+        // per-env lookup already produced. Falling back to the logical name
+        // would select pods of no deployment at all.
+        let app = json!({ "spec": { "destination": { "namespace": "apps" } } });
+        let (_, inner) = resolve_logs_workload(&app, "web-prod").unwrap();
+        assert_eq!(inner, "web-prod");
+    }
+
+    #[test]
+    fn an_application_without_a_destination_namespace_is_refused_with_a_reason() {
+        let err = resolve_logs_workload(&json!({}), "web").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("spec.destination.namespace"), "{msg}");
+        assert!(msg.contains("'web'"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn app(name: &str, env: Option<&str>) -> Value {
+        match env {
+            Some(e) => json!({
+                "metadata": { "name": name, "labels": { "apprafter.io/environment": e } }
+            }),
+            None => json!({ "metadata": { "name": name } }),
+        }
+    }
+
+    #[test]
+    fn deployments_sort_by_environment_first_then_argo_name() {
+        // INVARIANT: `app status` renders one section per deployment, and an
+        // unstable order would reshuffle the sections between two runs of
+        // the same command.
+        let mut apps = [
+            app("z-prod", Some("prod")),
+            app("a-prod", Some("prod")),
+            app("m-dev", Some("dev")),
+        ];
+        apps.sort_by_key(deployment_sort_key);
+        let names: Vec<&str> = apps
+            .iter()
+            .map(|a| a.pointer("/metadata/name").unwrap().as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["m-dev", "a-prod", "z-prod"]);
+    }
+
+    #[test]
+    fn an_unlabelled_deployment_sorts_under_the_base_key() {
+        assert_eq!(
+            deployment_sort_key(&app("web", None)),
+            ("(base)".to_string(), "web".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod kubectl_arg_tests {
+    use super::*;
+
+    #[test]
+    fn claims_are_read_group_qualified_so_dra_cannot_shadow_them() {
+        // INVARIANT: a bare `resourceclaim` resolves to the Kubernetes
+        // 1.32+ DRA `resourceclaims.resource.k8s.io`, so `app status`
+        // would list somebody else's objects — or none — with no error.
+        let args = kubectl_list_args(RESOURCECLAIM_RESOURCE, "apps", None);
+        assert_eq!(
+            args,
+            [
+                "get",
+                "resourceclaim.apprafter.io",
+                "-n",
+                "apps",
+                "-o",
+                "json"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_selector_is_passed_as_its_own_argument_not_glued_to_the_flag() {
+        // `-lfoo=bar` and `-l foo=bar` both work for kubectl, but only the
+        // two-argument form survives a label value containing a space.
+        let args = kubectl_list_args("pods", "apps", Some("app.kubernetes.io/name=web"));
+        assert_eq!(
+            args,
+            [
+                "get",
+                "pods",
+                "-n",
+                "apps",
+                "-l",
+                "app.kubernetes.io/name=web",
+                "-o",
+                "json"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_output_flag_is_always_last_and_always_json() {
+        for args in [
+            kubectl_list_args("pods", "apps", None),
+            kubectl_list_args("services", "apps", Some("a=b")),
+        ] {
+            assert_eq!(&args[args.len() - 2..], ["-o", "json"], "{args:?}");
+        }
+    }
+
+    #[test]
+    fn the_workload_selector_uses_the_operators_own_label_key() {
+        assert_eq!(
+            operator_workload_selector("storefront"),
+            "app.kubernetes.io/name=storefront"
+        );
+    }
+
+    #[test]
+    fn the_delete_targets_the_argo_cd_application_in_the_argocd_namespace() {
+        assert_eq!(
+            kubectl_delete_argo_app_args("web-prod"),
+            [
+                "delete",
+                "application.argoproj.io",
+                "web-prod",
+                "-n",
+                "argocd"
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod wizard_picker_tests {
+    use super::*;
+
+    fn manifest(json: serde_json::Value) -> cli_core::manifest::ApplicationManifest {
+        serde_json::from_value(json).expect("manifest fixture")
+    }
+
+    #[test]
+    fn a_manifest_with_environments_offers_them_all_plus_its_namespace() {
+        let m = manifest(serde_json::json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Application",
+            "metadata": { "name": "web", "namespace": "storefront" },
+            "spec": { "environments": {
+                "prod": { "image": "ghcr.io/acme/web:v1" },
+                "dev":  { "image": "ghcr.io/acme/web:dev" }
+            }}
+        }));
+        let (envs, ns) = wizard_manifest_pickers(&m);
+        // BTreeMap keys — deterministic, alphabetical.
+        assert_eq!(envs, ["dev", "prod"]);
+        assert_eq!(ns.as_deref(), Some("storefront"));
+    }
+
+    #[test]
+    fn a_base_only_manifest_offers_no_environments_rather_than_a_placeholder() {
+        // INVARIANT: an empty list is how the wizard learns to HIDE the env
+        // picker. Anything else puts an environment on the screen that the
+        // manifest cannot render.
+        let m = manifest(serde_json::json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Application",
+            "metadata": { "name": "web" },
+            "spec": { "base": { "image": "ghcr.io/acme/web:v1" } }
+        }));
+        let (envs, ns) = wizard_manifest_pickers(&m);
+        assert!(envs.is_empty(), "{envs:?}");
+        assert_eq!(ns, None);
     }
 }

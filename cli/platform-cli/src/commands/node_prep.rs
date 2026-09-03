@@ -435,6 +435,58 @@ impl<'a> SshNodeOps<'a> {
     }
 }
 
+/// The single `daemon-reload && restart k3s` the umbrella (and the rollback)
+/// issue. One const so the retrofit and the rollback can never drift into
+/// restarting k3s two different ways.
+const RESTART_K3S_COMMAND: &str = "systemctl daemon-reload && systemctl restart k3s";
+
+/// Remote command that deletes the kubelet swap drop-in ENTIRELY — this is
+/// what removes the last `failSwapOn:false`, so it is only ever issued after
+/// a successful `swapoff`. Extracted from [`SshNodeOps`] (whose methods are
+/// pure SSH IO) so the command shape is testable without a node.
+fn remove_dropin_command() -> String {
+    format!("rm -f {SWAP_KUBELET_DROPIN_PATH}")
+}
+
+/// Remote `swapoff`, CAPPED BY `timeout` (design decision 5 / P8): `swapoff`
+/// can hang or `ENOMEM` under the very memory pressure that triggered the
+/// rollback, and an unbounded hang would strand the rollback mid-flight. The
+/// cap makes the failure surface as a non-zero exit (124) instead.
+/// Extracted from [`SshNodeOps`] so the cap is unit-testable.
+fn swapoff_command() -> String {
+    format!("timeout 60 swapoff {SWAPFILE_PATH}")
+}
+
+/// Remote command that un-persists swap: delete the exact fstab line + the
+/// swappiness drop-in. Extracted from [`SshNodeOps`] so the two halves — the
+/// fstab line MUST go (a surviving `sw,nofail` silently reactivates swap on
+/// the next boot, undoing the rollback) and the sysctl removal must tolerate
+/// an absent file — are pinned without a node.
+fn remove_fstab_and_sysctl_command() -> String {
+    // `sed -i` with an anchored pattern; `rm -f` tolerates an absent file.
+    format!(
+        "sed -i '\\#^{SWAPFILE_PATH} #d' /etc/fstab; \
+         rm -f /etc/sysctl.d/99-apprafter-swap.conf"
+    )
+}
+
+/// Remote command that deletes the swapfile itself.
+fn remove_swapfile_command() -> String {
+    format!("rm -f {SWAPFILE_PATH}")
+}
+
+/// Remote command that writes `message` into the NODE's journal. Extracted
+/// from [`SshNodeOps::emit_runbook`] so the quoting is testable: the runbook
+/// text carries backticks, quotes and slashes, and an unescaped `'` would
+/// terminate the argument early and truncate (or worse, split) the line the
+/// operator is meant to read.
+fn logger_command(message: &str) -> String {
+    format!(
+        "logger -t apprafter-node-prep {}",
+        shell_single_quote(message)
+    )
+}
+
 impl NodeOps for SshNodeOps<'_> {
     fn write_swap_dropin(&mut self, k8s_ge_134: bool) -> Result<()> {
         self.runner
@@ -444,39 +496,28 @@ impl NodeOps for SshNodeOps<'_> {
 
     fn remove_swap_dropin(&mut self) -> Result<()> {
         self.runner
-            .run(self.host, &format!("rm -f {SWAP_KUBELET_DROPIN_PATH}"))
+            .run(self.host, &remove_dropin_command())
             .map(|_| ())
     }
 
     fn swapoff_with_timeout(&mut self) -> Result<()> {
-        // `timeout` caps a hung `swapoff` (P8). A non-zero exit (incl. the
-        // 124 `timeout` returns on expiry) surfaces as an `Err`.
-        self.runner
-            .run(self.host, &format!("timeout 60 swapoff {SWAPFILE_PATH}"))
-            .map(|_| ())
+        self.runner.run(self.host, &swapoff_command()).map(|_| ())
     }
 
     fn remove_fstab_and_sysctl(&mut self) -> Result<()> {
-        // Delete the exact fstab line + the swappiness drop-in. `sed -i`
-        // with an anchored pattern; `rm -f` tolerates an absent sysctl file.
-        let cmd = format!(
-            "sed -i '\\#^{SWAPFILE_PATH} #d' /etc/fstab; \
-             rm -f /etc/sysctl.d/99-apprafter-swap.conf"
-        );
-        self.runner.run(self.host, &cmd).map(|_| ())
+        self.runner
+            .run(self.host, &remove_fstab_and_sysctl_command())
+            .map(|_| ())
     }
 
     fn restart_k3s_and_wait(&mut self) -> Result<()> {
-        self.runner.run(
-            self.host,
-            "systemctl daemon-reload && systemctl restart k3s",
-        )?;
+        self.runner.run(self.host, RESTART_K3S_COMMAND)?;
         wait_for_recovery(self.runner, self.host)
     }
 
     fn remove_swapfile(&mut self) -> Result<()> {
         self.runner
-            .run(self.host, &format!("rm -f {SWAPFILE_PATH}"))
+            .run(self.host, &remove_swapfile_command())
             .map(|_| ())
     }
 
@@ -484,13 +525,7 @@ impl NodeOps for SshNodeOps<'_> {
         // Echo the runbook line locally AND onto the NODE's journal (so the
         // operator finds it) — the node write is best-effort.
         eprintln!("{message}");
-        let _ = self.runner.run(
-            self.host,
-            &format!(
-                "logger -t apprafter-node-prep {}",
-                shell_single_quote(message)
-            ),
-        );
+        let _ = self.runner.run(self.host, &logger_command(message));
         Ok(())
     }
 }
@@ -581,6 +616,47 @@ pub fn rollback<N: NodeOps>(ops: &mut N) -> Result<RollbackOutcome> {
 /// a pure, unit-tested helper above ([`swap_eligibility`], the idempotency
 /// predicates, [`rollback`]). Not wired into `cli.rs` yet (Task 6); exposed
 /// for [`run`] to dispatch.
+/// The error both `node prep` and `node status` raise when the active target
+/// has no provisioned server. Extracted (and shared by the two IO entries,
+/// which carried byte-identical copies) so the remedy stays one string.
+fn no_provisioned_server_error() -> CliError {
+    CliError::Other("no provisioned server for the active target — run `apprafter up` first".into())
+}
+
+/// The error both `node prep` and `node status` raise when the node exists but
+/// has not been given a public IPv4 yet. Shared for the same reason as
+/// [`no_provisioned_server_error`].
+fn no_public_ipv4_error() -> CliError {
+    CliError::Other("the active target's node has no public IPv4 yet — wait for cloud-init".into())
+}
+
+/// The refusal `node prep` raises when it would have to prompt but stdin is
+/// not a TTY. Extracted so the remedy — the flag that makes the command
+/// scriptable — is pinned; a prompt written to a non-TTY would hang CI.
+fn non_interactive_error() -> CliError {
+    CliError::Other("non-interactive shell — pass `--yes` to skip the confirmation prompt".into())
+}
+
+/// The consent text shown before the (disruptive) k3s restart. Extracted so
+/// the disclosure is testable: this is the operator's ONLY warning that the
+/// API goes away for ~30s, and it must name the host it is about to touch —
+/// with several targets configured, an unnamed prompt is a footgun.
+fn prep_confirmation_message(host: &str) -> String {
+    format!(
+        "This restarts k3s on {host} (~30s, API briefly unavailable) to apply node \
+         reservations (system-reserved=1500Mi, kube-reserved, eviction-hard) and — when the \
+         node is eligible (k8s ≥1.34 + cgroup v2) — provision host swap (NoSwap for pods)."
+    )
+}
+
+/// The error raised when the gate REFUSED the swap step. Design decision 1 /
+/// N6: the reservations DID apply, but the skip is surfaced as a non-zero exit
+/// carrying the gate's hint — never a silent success, which would let an
+/// operator believe swap is on when it is not.
+fn swap_step_skipped_error(hint: &str) -> CliError {
+    CliError::Other(format!("swap step skipped: {hint}"))
+}
+
 pub fn node_prep(yes: bool) -> Result<()> {
     info!(yes, "node prep invoked");
 
@@ -590,32 +666,20 @@ pub fn node_prep(yes: bool) -> Result<()> {
     let state = State::load_or_default(&paths)?;
 
     let Some(server_id) = state.hetzner_cloud.as_ref().map(|h| h.server_id) else {
-        return Err(CliError::Other(
-            "no provisioned server for the active target — run `apprafter up` first".into(),
-        ));
+        return Err(no_provisioned_server_error());
     };
 
     let token = resolve_hetzner_token(None, &store, None)?;
     let client = HetznerCloudClient::new(hcloud_base_url(), token);
     let (v4, _v6) = node_public_ips(&client, server_id)?;
-    let host = v4.ok_or_else(|| {
-        CliError::Other(
-            "the active target's node has no public IPv4 yet — wait for cloud-init".into(),
-        )
-    })?;
+    let host = v4.ok_or_else(no_public_ipv4_error)?;
 
     if !yes {
         use std::io::IsTerminal;
         if !std::io::stdin().is_terminal() {
-            return Err(CliError::Other(
-                "non-interactive shell — pass `--yes` to skip the confirmation prompt".into(),
-            ));
+            return Err(non_interactive_error());
         }
-        println!(
-            "This restarts k3s on {host} (~30s, API briefly unavailable) to apply node \
-             reservations (system-reserved=1500Mi, kube-reserved, eviction-hard) and — when the \
-             node is eligible (k8s ≥1.34 + cgroup v2) — provision host swap (NoSwap for pods)."
-        );
+        println!("{}", prep_confirmation_message(&host));
         let confirmed = inquire::Confirm::new("Continue?")
             .with_default(false)
             .prompt()
@@ -645,10 +709,75 @@ pub fn node_prep(yes: bool) -> Result<()> {
             // The swap step was refused — surface the hint as an Err so the
             // exit code is non-zero and the reason is loud (design decision
             // 1 / N6: never silently skip).
-            Err(CliError::Other(format!("swap step skipped: {hint}")))
+            Err(swap_step_skipped_error(&hint))
         }
         SwapGate::Eligible { k8s_ge_134 } => apply_eligible(&runner, &host, k8s_ge_134),
     }
+}
+
+/// What the apply path must do about whatever swap state is already on the
+/// node (design decision D2 / Q11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreApplyPlan {
+    /// Swap is active AND persisted in fstab — a re-run is a near no-op; the
+    /// reservations + drop-in are still refreshed (cheap, idempotent).
+    AlreadyProvisioned,
+    /// `/swapfile` is an orphan remnant — remove it before re-provisioning so
+    /// the fresh `dd` starts clean rather than writing over a live-but-
+    /// unlisted file.
+    RemoveOrphan,
+    /// Nothing in the way — provision from scratch.
+    FreshProvision,
+}
+
+/// Decides the [`PreApplyPlan`] from the three probed facts. Extracted from
+/// [`apply_eligible`] (which is otherwise SSH IO) so the ORDER is pinned:
+/// `AlreadyProvisioned` is checked FIRST, because an active-and-persisted
+/// swapfile also satisfies "exists on disk", and misreading it as an orphan
+/// would `swapoff` + `rm` a perfectly healthy node's live swap.
+fn pre_apply_plan(swapon_show: &str, fstab: &str, swapfile_exists: bool) -> PreApplyPlan {
+    if swap_already_active(swapon_show) && fstab_has_swap_entry(fstab) {
+        PreApplyPlan::AlreadyProvisioned
+    } else if orphan_swapfile(swapfile_exists, swapon_show, fstab) {
+        PreApplyPlan::RemoveOrphan
+    } else {
+        PreApplyPlan::FreshProvision
+    }
+}
+
+/// The remote command that clears an orphan swapfile. The `swapoff` is
+/// BEST-EFFORT (`2>/dev/null`, no `&&`) because an orphan is by definition not
+/// active — the `rm` must still run when `swapoff` errors, or the orphan
+/// survives and the fresh `dd` writes over it.
+fn orphan_cleanup_command() -> String {
+    format!("swapoff {SWAPFILE_PATH} 2>/dev/null; rm -f {SWAPFILE_PATH}")
+}
+
+/// The line shown when a re-run finds the node already fully provisioned. It
+/// must say the run is a REFRESH, not a fresh provision — an operator who sees
+/// the generic "applying…" line on a healthy node has no way to tell that the
+/// idempotency probes fired.
+fn already_provisioned_notice(host: &str) -> String {
+    format!("Swap already active and persisted; refreshing reservations + drop-in on {host}…")
+}
+
+/// The warning shown before an orphan is removed. Extracted so the notice is
+/// testable: removing a file on the operator's node must never be silent, and
+/// the line has to say WHICH file on WHICH host.
+fn orphan_notice(host: &str) -> String {
+    format!(
+        "⚠ Found an orphan {SWAPFILE_PATH} on {host} (present but not active and not in \
+         fstab) — removing it before a clean re-provision."
+    )
+}
+
+/// The retrofit breadcrumb's swap size in MiB — mirrors the `min(MemTotal_MiB,
+/// 8Gi)` cap [`swap_enable_script`] applies internally (Fix 2). Extracted from
+/// [`apply_eligible`] so the cap is pinned: `node status` reads this number
+/// back, and an uncapped one would claim a 32 GiB swapfile on a 32 GiB node
+/// that actually only got 8 GiB.
+fn retrofit_swap_count_mib(mem_total_kib: u64) -> u64 {
+    (mem_total_kib / 1024).min(SWAP_MAX_MIB)
 }
 
 /// The eligible apply path: write reservations + the swap drop-in + the
@@ -656,27 +785,19 @@ pub fn node_prep(yes: bool) -> Result<()> {
 /// `/readyz`; on timeout, run the whole-step [`rollback`].
 fn apply_eligible(runner: &SshCommandRunner, host: &str, k8s_ge_134: bool) -> Result<()> {
     // --- Idempotency probes (design decision D2 / Q11). ---
-    let swapon_show = runner.run(host, "swapon --show").unwrap_or_default();
-    let fstab = runner.run(host, "cat /etc/fstab").unwrap_or_default();
-    let swapfile_exists = runner
-        .run(host, &format!("test -e {SWAPFILE_PATH}"))
-        .is_ok();
+    let swapon_show = runner.run(host, SWAPON_SHOW_COMMAND).unwrap_or_default();
+    let fstab = runner.run(host, READ_FSTAB_COMMAND).unwrap_or_default();
+    let swapfile_exists = runner.run(host, &swapfile_exists_command()).is_ok();
 
-    if swap_already_active(&swapon_show) && fstab_has_swap_entry(&fstab) {
-        // Fully provisioned already — re-run is a near no-op: still refresh
-        // the drop-in + reservations (cheap, idempotent) then restart.
-        println!("Swap already active and persisted; refreshing reservations + drop-in on {host}…");
-    } else if orphan_swapfile(swapfile_exists, &swapon_show, &fstab) {
-        // A half-provisioned/partially-rolled-back remnant. Surface it and
-        // remove it so the fresh apply's `dd` starts clean (design Q11).
-        println!(
-            "⚠ Found an orphan {SWAPFILE_PATH} on {host} (present but not active and not in \
-             fstab) — removing it before a clean re-provision."
-        );
-        runner.run(
-            host,
-            &format!("swapoff {SWAPFILE_PATH} 2>/dev/null; rm -f {SWAPFILE_PATH}"),
-        )?;
+    match pre_apply_plan(&swapon_show, &fstab, swapfile_exists) {
+        PreApplyPlan::AlreadyProvisioned => {
+            println!("{}", already_provisioned_notice(host));
+        }
+        PreApplyPlan::RemoveOrphan => {
+            println!("{}", orphan_notice(host));
+            runner.run(host, &orphan_cleanup_command())?;
+        }
+        PreApplyPlan::FreshProvision => {}
     }
 
     println!("Applying node reservations + host swap on {host} over SSH…");
@@ -695,22 +816,18 @@ fn apply_eligible(runner: &SshCommandRunner, host: &str, k8s_ge_134: bool) -> Re
     // The retrofit breadcrumb size mirrors `swap_enable_script`'s internal
     // `min(MemTotal_MiB, 8Gi)` count (Fix 2) — recomputed here only for the
     // human-readable status line, not to drive the swapfile size.
-    let swap_count_mib = (mem_total_kib / 1024).min(SWAP_MAX_MIB);
+    let swap_count_mib = retrofit_swap_count_mib(mem_total_kib);
     let swap_steps = swap_enable_script(
         mem_total_kib,
         k8s_ge_134,
         true, // cgroup2 already gated above
     )
-    .ok_or_else(|| {
-        CliError::Other(
-            "internal: swap builder returned None despite passing the eligibility gate".into(),
-        )
-    })?;
+    .ok_or_else(swap_builder_none_error)?;
     runner.run(host, &swap_steps)?;
 
     // (4) Single daemon-reload && restart k3s → /readyz poll.
     println!("k3s restarting to pick up the swap drop-in. Waiting for the API to recover…");
-    runner.run(host, "systemctl daemon-reload && systemctl restart k3s")?;
+    runner.run(host, RESTART_K3S_COMMAND)?;
 
     match wait_for_recovery(runner, host) {
         Ok(()) => {
@@ -720,19 +837,14 @@ fn apply_eligible(runner: &SshCommandRunner, host: &str, k8s_ge_134: bool) -> Re
             // `applied (retrofit)` instead of `unknown` (Fix 2). Best-effort.
             let _ = runner.run(
                 host,
-                &provision_breadcrumb_write_script(&format!(
-                    "applied (retrofit): swap {swap_count_mib} MiB"
-                )),
+                &provision_breadcrumb_write_script(&applied_breadcrumb_state(swap_count_mib)),
             );
             Ok(())
         }
         Err(recovery_err) => {
             // ATOMIC: the k3s API did not come back → the whole swap step is
             // rolled back (design decision 5), `failSwapOn:false` removed LAST.
-            eprintln!(
-                "✗ k3s did not recover after the swap apply ({recovery_err}). \
-                 Rolling the whole swap step back…"
-            );
+            eprintln!("{}", recovery_failed_notice(&recovery_err.to_string()));
             let mut ops = SshNodeOps::new(runner, host);
             match rollback(&mut ops)? {
                 RollbackOutcome::Recovered => {
@@ -740,30 +852,82 @@ fn apply_eligible(runner: &SshCommandRunner, host: &str, k8s_ge_134: bool) -> Re
                     // show a stale `applied` (Fix 2). Best-effort.
                     let _ = runner.run(
                         host,
-                        &provision_breadcrumb_write_script("rolled-back: swap removed"),
+                        &provision_breadcrumb_write_script(ROLLED_BACK_BREADCRUMB),
                     );
-                    Err(CliError::Other(format!(
-                        "swap apply failed and was rolled back cleanly (swap removed, kubelet \
-                         drop-in removed, /swapfile deleted, k3s recovered). Original error: \
-                         {recovery_err}"
-                    )))
+                    Err(rollback_recovered_error(&recovery_err.to_string()))
                 }
                 RollbackOutcome::SwapoffFailedSwapLeft => {
                     // Swap could NOT be turned off — the breadcrumb must say so
                     // (consistent with the runbook: swap left active) (Fix 2).
                     let _ = runner.run(
                         host,
-                        &provision_breadcrumb_write_script("rolled-back-partial: swap left active"),
+                        &provision_breadcrumb_write_script(ROLLED_BACK_PARTIAL_BREADCRUMB),
                     );
-                    Err(CliError::Other(format!(
-                        "swap apply failed; rollback could NOT swapoff (swap + failSwapOn:false \
-                         left in place, /swapfile kept — see the runbook line above). Original \
-                         error: {recovery_err}"
-                    )))
+                    Err(rollback_partial_error(&recovery_err.to_string()))
                 }
             }
         }
     }
+}
+
+/// The error raised if the shared swap builder declines AFTER the eligibility
+/// gate passed. That combination is a contradiction between two pieces of the
+/// same decision, so it is labelled `internal:` — it is a bug report, not
+/// something an operator can act on.
+fn swap_builder_none_error() -> CliError {
+    CliError::Other(
+        "internal: swap builder returned None despite passing the eligibility gate".into(),
+    )
+}
+
+/// The breadcrumb an APPLIED retrofit leaves. `node status` classifies off
+/// this line, so the `applied` prefix is load-bearing.
+fn applied_breadcrumb_state(swap_count_mib: u64) -> String {
+    format!("applied (retrofit): swap {swap_count_mib} MiB")
+}
+
+/// The breadcrumb a CLEANLY rolled-back node is left with. It must NOT read as
+/// an `applied…` state — `node status` would otherwise report swap as provisioned
+/// on a node that has none.
+const ROLLED_BACK_BREADCRUMB: &str = "rolled-back: swap removed";
+
+/// The breadcrumb a PARTIALLY rolled-back node is left with (`swapoff` failed,
+/// swap is still on). Distinct from [`ROLLED_BACK_BREADCRUMB`] because the two
+/// need different operator follow-up.
+const ROLLED_BACK_PARTIAL_BREADCRUMB: &str = "rolled-back-partial: swap left active";
+
+/// The stderr notice printed the moment recovery fails, BEFORE the rollback
+/// runs. Extracted so it is pinned that the operator is told the rollback is
+/// starting — a silent multi-minute rollback looks like a hang on the exact
+/// command that just took their API away.
+fn recovery_failed_notice(recovery_err: &str) -> String {
+    format!(
+        "✗ k3s did not recover after the swap apply ({recovery_err}). \
+         Rolling the whole swap step back…"
+    )
+}
+
+/// The error returned after a CLEAN whole-step rollback. It reports what was
+/// undone AND keeps the original recovery error — the rollback succeeding does
+/// not make the apply a success, so this is still an `Err`.
+fn rollback_recovered_error(recovery_err: &str) -> CliError {
+    CliError::Other(format!(
+        "swap apply failed and was rolled back cleanly (swap removed, kubelet \
+         drop-in removed, /swapfile deleted, k3s recovered). Original error: \
+         {recovery_err}"
+    ))
+}
+
+/// The error returned when the rollback could NOT `swapoff`. It must say that
+/// swap and `failSwapOn:false` were LEFT in place and point at the runbook
+/// line — the node is in a deliberately-not-cleaned state and the operator has
+/// manual work to do.
+fn rollback_partial_error(recovery_err: &str) -> CliError {
+    CliError::Other(format!(
+        "swap apply failed; rollback could NOT swapoff (swap + failSwapOn:false \
+         left in place, /swapfile kept — see the runbook line above). Original \
+         error: {recovery_err}"
+    ))
 }
 
 /// Reads the node's kubelet version via `kubectl get node … jsonpath`. The
@@ -773,11 +937,22 @@ fn apply_eligible(runner: &SshCommandRunner, host: &str, k8s_ge_134: bool) -> Re
 fn probe_kubelet_version(runner: &SshCommandRunner, host: &str) -> Result<String> {
     // `-o jsonpath` over the single node. `$(hostname)` resolves the node
     // name on the node itself; k3s uses the hostname as the node name.
-    let out = runner.run(
-        host,
-        "k3s kubectl get node \"$(hostname)\" \
-         -o jsonpath='{.status.nodeInfo.kubeletVersion}'",
-    )?;
+    let out = runner.run(host, KUBELET_VERSION_PROBE_COMMAND)?;
+    parse_kubelet_version_output(&out)
+}
+
+/// The node-local command that reads the kubelet version. `$(hostname)` is the
+/// k3s node name, resolved ON the node, and `k3s kubectl` is cluster-admin
+/// there — so this probe needs no external credentials.
+const KUBELET_VERSION_PROBE_COMMAND: &str = "k3s kubectl get node \"$(hostname)\" \
+     -o jsonpath='{.status.nodeInfo.kubeletVersion}'";
+
+/// Turns the kubelet-version jsonpath output into the version string.
+/// Extracted from [`probe_kubelet_version`] so the EMPTY case is testable: a
+/// `jsonpath` miss exits ZERO with empty stdout, and an empty version would
+/// flow into [`k8s_ge_134`] as `false` and silently REFUSE the swap step with
+/// a nonsense "<1.34" hint instead of reporting that the probe failed.
+fn parse_kubelet_version_output(out: &str) -> Result<String> {
     let v = out.trim().to_string();
     if v.is_empty() {
         return Err(CliError::Other(
@@ -791,6 +966,14 @@ fn probe_kubelet_version(runner: &SshCommandRunner, host: &str) -> Result<String
 /// pins the swap count at build time from this (design decision 2 / P13).
 fn probe_mem_total_kib(runner: &SshCommandRunner, host: &str) -> Result<u64> {
     let out = runner.run(host, "awk '/^MemTotal:/ {print $2}' /proc/meminfo")?;
+    parse_mem_total_kib(&out)
+}
+
+/// Parses the `awk` MemTotal output into KiB. Extracted from
+/// [`probe_mem_total_kib`] so the failure is testable and LOUD: a
+/// silently-zero MemTotal would size the swapfile at 0 MiB, and the error must
+/// quote what was actually read so an operator can see what the node said.
+fn parse_mem_total_kib(out: &str) -> Result<u64> {
     out.trim().parse::<u64>().map_err(|e| {
         CliError::Other(format!(
             "could not parse MemTotal from /proc/meminfo ('{}'): {e}",
@@ -802,24 +985,52 @@ fn probe_mem_total_kib(runner: &SshCommandRunner, host: &str) -> Result<u64> {
 /// Polls the node until `k3s kubectl get --raw=/readyz` succeeds or the
 /// timeout elapses.
 fn wait_for_recovery(runner: &SshCommandRunner, host: &str) -> Result<()> {
-    let deadline = Instant::now() + RECOVERY_TIMEOUT;
+    wait_for_recovery_with(
+        || runner.run(host, recovery_probe_command()),
+        RECOVERY_TIMEOUT,
+        RECOVERY_INTERVAL,
+    )
+}
+
+/// The recovery poll loop, over an injectable probe + clock budget. Extracted
+/// from [`wait_for_recovery`] so the loop is unit-testable in milliseconds
+/// instead of the 180s the real one budgets. Three things it pins:
+///
+/// - A probe that succeeds on the FIRST attempt returns immediately and never
+///   sleeps — the happy path must not pay the poll interval.
+/// - A probe that succeeds LATER still returns `Ok`; a transient failure while
+///   k3s is coming back is expected, not fatal.
+/// - The deadline is checked AFTER a failed probe, so the node is always
+///   probed at least once, and the timeout error carries the attempt count and
+///   the LAST probe error (the only diagnostic an operator gets for a node
+///   that never came back).
+fn wait_for_recovery_with<F>(mut probe: F, timeout: Duration, interval: Duration) -> Result<()>
+where
+    F: FnMut() -> Result<String>,
+{
+    let deadline = Instant::now() + timeout;
     let mut last_err;
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        match runner.run(host, recovery_probe_command()) {
+        match probe() {
             Ok(_) => return Ok(()),
             Err(e) => last_err = e.to_string(),
         }
         if Instant::now() >= deadline {
-            return Err(CliError::Other(format!(
-                "k3s API did not recover within {}s after restart ({attempt} attempts). \
-                 Last probe error: {last_err}",
-                RECOVERY_TIMEOUT.as_secs()
-            )));
+            return Err(recovery_timeout_error(timeout, attempt, &last_err));
         }
-        std::thread::sleep(RECOVERY_INTERVAL);
+        std::thread::sleep(interval);
     }
+}
+
+/// The timeout error [`wait_for_recovery_with`] returns.
+fn recovery_timeout_error(timeout: Duration, attempts: u32, last_err: &str) -> CliError {
+    CliError::Other(format!(
+        "k3s API did not recover within {}s after restart ({attempts} attempts). \
+         Last probe error: {last_err}",
+        timeout.as_secs()
+    ))
 }
 
 /// Remote command that succeeds once BOTH the k3s apiserver AND the kubelet
@@ -1079,19 +1290,13 @@ pub fn status() -> Result<()> {
     let state = State::load_or_default(&paths)?;
 
     let Some(server_id) = state.hetzner_cloud.as_ref().map(|h| h.server_id) else {
-        return Err(CliError::Other(
-            "no provisioned server for the active target — run `apprafter up` first".into(),
-        ));
+        return Err(no_provisioned_server_error());
     };
 
     let token = resolve_hetzner_token(None, &store, None)?;
     let client = HetznerCloudClient::new(hcloud_base_url(), token);
     let (v4, _v6) = node_public_ips(&client, server_id)?;
-    let host = v4.ok_or_else(|| {
-        CliError::Other(
-            "the active target's node has no public IPv4 yet — wait for cloud-init".into(),
-        )
-    })?;
+    let host = v4.ok_or_else(no_public_ipv4_error)?;
 
     let runner = SshCommandRunner::new(default_ssh_identity_path(), paths.known_hosts_file());
 
@@ -1101,9 +1306,61 @@ pub fn status() -> Result<()> {
     // just leaves the `[api]` fields `Unknown`, it is not a hard error.
     let kubeconfig = ensure_kubeconfig_tempfile().ok();
 
-    let node_state = probe_node_swap_state(&runner, &host, kubeconfig.as_ref().map(|f| f.path()));
+    let shell = SshShell::new(&runner, &host);
+    let node_state = probe_node_swap_state(&shell, kubeconfig.as_ref().map(|f| f.path()));
     print!("{}", render_status(&node_state));
     Ok(())
+}
+
+/// The remote-command seam for the READ-ONLY `node status` probes: one method,
+/// "run this on the node". Introduced so the whole probe pass
+/// ([`probe_node_swap_state`]) is exercisable against a scripted mock instead
+/// of a live SSH session — the graceful-degradation contract (SSH down must
+/// degrade the `[ssh]` fields and nothing else) has no other cheap test.
+pub trait RemoteShell {
+    /// Run `command` on the node, returning its stdout.
+    fn run_remote(&self, command: &str) -> Result<String>;
+}
+
+/// The production [`RemoteShell`]: an SSH session to one host.
+pub struct SshShell<'a> {
+    runner: &'a SshCommandRunner,
+    host: &'a str,
+}
+
+impl<'a> SshShell<'a> {
+    pub fn new(runner: &'a SshCommandRunner, host: &'a str) -> Self {
+        Self { runner, host }
+    }
+}
+
+impl RemoteShell for SshShell<'_> {
+    fn run_remote(&self, command: &str) -> Result<String> {
+        self.runner.run(self.host, command)
+    }
+}
+
+/// `hostname` — doubles as the SSH-reachability probe and the node-name
+/// fallback for the report header.
+const HOSTNAME_PROBE_COMMAND: &str = "hostname";
+/// The live swap listing every idempotency predicate reads.
+const SWAPON_SHOW_COMMAND: &str = "swapon --show";
+/// The fstab read that decides whether swap is PERSISTED.
+const READ_FSTAB_COMMAND: &str = "cat /etc/fstab";
+/// The swappiness sysctl read.
+const SWAPPINESS_PROBE_COMMAND: &str = "sysctl -n vm.swappiness";
+/// The k3s unit environment read that carries `GOMEMLIMIT`.
+const GOMEMLIMIT_PROBE_COMMAND: &str = "systemctl show -p Environment k3s 2>/dev/null";
+
+/// `test -e /swapfile` — the on-disk existence probe. Shared by the apply path
+/// and the status path so the two can never drift onto different files.
+fn swapfile_exists_command() -> String {
+    format!("test -e {SWAPFILE_PATH}")
+}
+
+/// The read of the provision breadcrumb `node status` classifies from.
+fn read_breadcrumb_command() -> String {
+    format!("cat {SWAP_PROVISION_STATUS_PATH}")
 }
 
 /// The IO wrapper (design decision 6 / Q10): probes the kube-API fields + the
@@ -1118,9 +1375,8 @@ pub fn status() -> Result<()> {
 /// of decision 6). When the cached kubeconfig is missing / the API is
 /// unreachable, THOSE fields are `Unknown`; independently, when SSH is down the
 /// `[ssh]` fields are `Unknown`. The two groups stay labelled distinctly.
-fn probe_node_swap_state(
-    runner: &SshCommandRunner,
-    host: &str,
+fn probe_node_swap_state<S: RemoteShell>(
+    shell: &S,
     kubeconfig_path: Option<&Path>,
 ) -> NodeSwapState {
     // --- kube-API fields (out-of-cluster kubeconfig, no SSH). ---
@@ -1139,52 +1395,103 @@ fn probe_node_swap_state(
         "{.status.nodeInfo.kubeletVersion}",
     );
 
-    // A single cheap SSH probe decides SSH reachability up-front (`hostname`
-    // also gives a node-name fallback for the report header when the kube-API
-    // could not answer it).
-    let ssh_node_name = runner
-        .run(host, "hostname")
-        .ok()
-        .map(|s| s.trim().to_string());
-    let ssh_available = ssh_node_name.is_some();
-    let node_name = api_node_name
-        .or(ssh_node_name)
+    assemble_node_swap_state(ProbedFacts {
+        api_node_name,
+        fail_swap_on,
+        swap_behavior,
+        swap_capacity,
+        kubelet_version,
+        // A single cheap SSH probe decides SSH reachability up-front
+        // (`hostname` also gives a node-name fallback for the report header
+        // when the kube-API could not answer it).
+        ssh_node_name: shell
+            .run_remote(HOSTNAME_PROBE_COMMAND)
+            .ok()
+            .map(|s| s.trim().to_string()),
+        swapon_raw: shell.run_remote(SWAPON_SHOW_COMMAND).ok(),
+        fstab_raw: shell.run_remote(READ_FSTAB_COMMAND).unwrap_or_default(),
+        swapfile_exists: shell.run_remote(&swapfile_exists_command()).is_ok(),
+        swappiness_raw: shell.run_remote(SWAPPINESS_PROBE_COMMAND).ok(),
+        gomemlimit: probe_gomemlimit(shell),
+        breadcrumb_raw: shell.run_remote(&read_breadcrumb_command()).ok(),
+        // `APPRAFTER_SKIP_NODE_SWAP` at status time also forces the skipped
+        // verdict (the operator asks "what did I get" with the same hook set).
+        env_skipped: std::env::var_os(SKIP_NODE_SWAP_ENV).is_some(),
+    })
+}
+
+/// The raw facts [`probe_node_swap_state`] gathers from its two sources, before
+/// any interpretation. Splitting them out is what makes
+/// [`assemble_node_swap_state`] — where every degradation decision lives —
+/// testable with no node and no cluster.
+struct ProbedFacts {
+    /// Node name per the kube-API (`None` when the API could not answer).
+    api_node_name: Option<String>,
+    /// `failSwapOn` from `configz`.
+    fail_swap_on: Field,
+    /// `swapBehavior` from `configz`.
+    swap_behavior: Field,
+    /// `status.nodeInfo.swap.capacity` off the Node object.
+    swap_capacity: Field,
+    /// `status.nodeInfo.kubeletVersion` off the Node object.
+    kubelet_version: Field,
+    /// `hostname` over SSH — `None` is the SSH-down signal.
+    ssh_node_name: Option<String>,
+    /// Raw `swapon --show` (`None` when SSH is down).
+    swapon_raw: Option<String>,
+    /// Raw `/etc/fstab` (empty when SSH is down).
+    fstab_raw: String,
+    /// Whether `/swapfile` exists on disk.
+    swapfile_exists: bool,
+    /// Raw `sysctl -n vm.swappiness`.
+    swappiness_raw: Option<String>,
+    /// Already-parsed `GOMEMLIMIT`.
+    gomemlimit: Field,
+    /// Raw provision breadcrumb line.
+    breadcrumb_raw: Option<String>,
+    /// Whether `APPRAFTER_SKIP_NODE_SWAP` is set in THIS process.
+    env_skipped: bool,
+}
+
+/// Assemble the report value from the probed facts — the pure half of
+/// [`probe_node_swap_state`] (design decision 6 / Q10). Extracted so the
+/// graceful-degradation rules are testable with no node and no cluster:
+///
+/// - `ssh_available` is derived SOLELY from the `hostname` probe, so the
+///   `[ssh]` fields degrade together and the `[api]` fields do not degrade
+///   with them.
+/// - The report header prefers the kube-API node name over the SSH hostname,
+///   and falls back to `<unknown>` rather than rendering an empty header.
+/// - `APPRAFTER_SKIP_NODE_SWAP` forces the skipped verdict ONLY when swap is
+///   not actually active — a node with live swap must never be reported as
+///   "skipped" just because the operator happens to have the hook exported.
+fn assemble_node_swap_state(f: ProbedFacts) -> NodeSwapState {
+    let ssh_available = f.ssh_node_name.is_some();
+    let node_name = f
+        .api_node_name
+        .or(f.ssh_node_name)
         .unwrap_or_else(|| "<unknown>".to_string());
 
-    // --- SSH fields (live probes). ---
-    let swapon_raw = runner.run(host, "swapon --show").ok();
-    let fstab_raw = runner.run(host, "cat /etc/fstab").unwrap_or_default();
-    let swapfile_exists = runner
-        .run(host, &format!("test -e {SWAPFILE_PATH}"))
-        .is_ok();
-    let swapon = swapon_summary(swapon_raw.as_deref());
-    let swappiness = field_or_unknown(runner.run(host, "sysctl -n vm.swappiness").ok());
-    let gomemlimit = probe_gomemlimit(runner, host);
-    let provision_breadcrumb = field_or_unknown(
-        runner
-            .run(host, &format!("cat {SWAP_PROVISION_STATUS_PATH}"))
-            .ok(),
-    );
+    let swapon = swapon_summary(f.swapon_raw.as_deref());
+    let swappiness = field_or_unknown(f.swappiness_raw);
+    let provision_breadcrumb = field_or_unknown(f.breadcrumb_raw);
 
-    // --- Classify. ---
-    let swap_active = swapon_raw
+    let swap_active = f
+        .swapon_raw
         .as_deref()
         .map(swap_already_active)
         .unwrap_or(false);
-    let swap_size = swapon_raw.as_deref().and_then(swapfile_size_column);
+    let swap_size = f.swapon_raw.as_deref().and_then(swapfile_size_column);
     let orphan = orphan_swapfile(
-        swapfile_exists,
-        swapon_raw.as_deref().unwrap_or(""),
-        &fstab_raw,
+        f.swapfile_exists,
+        f.swapon_raw.as_deref().unwrap_or(""),
+        &f.fstab_raw,
     );
-    // `APPRAFTER_SKIP_NODE_SWAP` at status time also forces the skipped verdict
-    // (the operator asks "what did I get" with the same hook set).
-    let env_skipped = std::env::var_os(SKIP_NODE_SWAP_ENV).is_some();
-    let api_eligible = match &kubelet_version {
+    let api_eligible = match &f.kubelet_version {
         Field::Known(v) => Some(k8s_ge_134(v)),
         Field::Unknown => None,
     };
-    let state = if env_skipped && !swap_active {
+    let state = if f.env_skipped && !swap_active {
         SwapProvisionState::SkippedByEnv
     } else {
         classify_state(
@@ -1201,13 +1508,13 @@ fn probe_node_swap_state(
         node_name,
         ssh_available,
         state,
-        fail_swap_on,
-        swap_behavior,
-        swap_capacity,
-        kubelet_version,
+        fail_swap_on: f.fail_swap_on,
+        swap_behavior: f.swap_behavior,
+        swap_capacity: f.swap_capacity,
+        kubelet_version: f.kubelet_version,
         swapon,
         swappiness,
-        gomemlimit,
+        gomemlimit: f.gomemlimit,
         provision_breadcrumb,
     }
 }
@@ -1238,6 +1545,16 @@ fn kube_node_name(kubeconfig_path: &Path) -> Option<String> {
         Some(kubeconfig_path),
         &["get", "nodes", "-o", "jsonpath={.items[0].metadata.name}"],
     )?;
+    parse_kube_node_name(&out)
+}
+
+/// Turns the node-name jsonpath output into `Some(name)`. Extracted from
+/// [`kube_node_name`] because the EMPTY case is the one that matters: on a
+/// cluster with no nodes `jsonpath={.items[0]…}` exits ZERO with empty stdout,
+/// and an empty node name would be interpolated into the `configz` URL as
+/// `/api/v1/nodes//proxy/configz` — a request that fails confusingly instead
+/// of the field simply degrading to `unknown`.
+fn parse_kube_node_name(out: &str) -> Option<String> {
     let name = out.trim();
     if name.is_empty() {
         None
@@ -1255,15 +1572,32 @@ fn probe_configz(kubeconfig_path: Option<&Path>, node_name: Option<&str>) -> (Fi
     let Some(node) = node_name else {
         return (Field::Unknown, Field::Unknown);
     };
-    let path = format!("/api/v1/nodes/{node}/proxy/configz");
+    let path = configz_raw_path(node);
     let raw = match kubectl_capture(kubeconfig_path, &["get", "--raw", &path]) {
         Some(r) => r,
         None => return (Field::Unknown, Field::Unknown),
     };
+    configz_fields(&raw)
+}
+
+/// Pull the two kubelet-config scalars `node status` reports out of one
+/// `configz` blob. Extracted from [`probe_configz`] so the pairing is testable:
+/// the two fields must degrade INDEPENDENTLY — a `<1.34` kubelet legitimately
+/// has `failSwapOn` and no `swapBehavior`, and reporting both `unknown` there
+/// would hide the one fact that IS known.
+fn configz_fields(configz_json: &str) -> (Field, Field) {
     (
-        configz_scalar(&raw, "failSwapOn"),
-        configz_scalar(&raw, "swapBehavior"),
+        configz_scalar(configz_json, "failSwapOn"),
+        configz_scalar(configz_json, "swapBehavior"),
     )
+}
+
+/// The apiserver node-proxy path that serves a node's live kubelet config.
+/// Extracted from [`probe_configz`] so the shape is pinned — it must go
+/// through the `nodes/<n>/proxy` node-proxy (the kubelet's own `configz` is
+/// not otherwise reachable from outside the node).
+fn configz_raw_path(node: &str) -> String {
+    format!("/api/v1/nodes/{node}/proxy/configz")
 }
 
 /// Extracts a scalar kubelet-config value from the `configz` JSON blob by
@@ -1300,24 +1634,56 @@ fn probe_node_field(
     let Some(node) = node_name else {
         return Field::Unknown;
     };
-    let jp = format!("jsonpath={jsonpath}");
-    match kubectl_capture(kubeconfig_path, &["get", "node", node, "-o", &jp]) {
-        Some(out) => {
-            let v = out.trim();
-            if v.is_empty() || v == "<unknown>" || v == "<none>" {
-                Field::Unknown
-            } else {
-                Field::Known(v.to_string())
-            }
-        }
+    let args = node_field_args(node, jsonpath);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    match kubectl_capture(kubeconfig_path, &argv) {
+        Some(out) => node_field_from_output(&out),
         None => Field::Unknown,
+    }
+}
+
+/// Build the argv for `kubectl get node <n> -o jsonpath=<expr>`. Extracted
+/// from [`probe_node_field`] so the `-o` / `jsonpath=` split is pinned: kubectl
+/// wants the selector as the VALUE of `-o` (`-o` `jsonpath={…}`), and gluing
+/// them the other way round (`-o=jsonpath…`) or dropping the `jsonpath=`
+/// prefix makes kubectl print the whole object instead of the one field.
+fn node_field_args(node: &str, jsonpath: &str) -> Vec<String> {
+    vec![
+        "get".to_string(),
+        "node".to_string(),
+        node.to_string(),
+        "-o".to_string(),
+        format!("jsonpath={jsonpath}"),
+    ]
+}
+
+/// Maps a Node-object jsonpath result to a [`Field`]. Extracted from
+/// [`probe_node_field`] because the three "kubectl answered, but with nothing"
+/// shapes are the interesting ones: an empty result (the field is absent —
+/// `swap.capacity` is simply missing on a node without swap), and kubectl's
+/// own `<unknown>` / `<none>` placeholders. All three must render as `unknown`
+/// rather than being reported as a literal value like `<none>`.
+fn node_field_from_output(out: &str) -> Field {
+    let v = out.trim();
+    if v.is_empty() || v == "<unknown>" || v == "<none>" {
+        Field::Unknown
+    } else {
+        Field::Known(v.to_string())
     }
 }
 
 /// Reads the effective `GOMEMLIMIT` off the running k3s unit's environment
 /// (`systemctl show -p Environment k3s`). `Unknown` when absent / SSH down.
-fn probe_gomemlimit(runner: &SshCommandRunner, host: &str) -> Field {
-    match runner.run(host, "systemctl show -p Environment k3s 2>/dev/null") {
+fn probe_gomemlimit<S: RemoteShell>(shell: &S) -> Field {
+    gomemlimit_from_probe(shell.run_remote(GOMEMLIMIT_PROBE_COMMAND))
+}
+
+/// Maps the `systemctl show` probe result to a [`Field`]. Extracted from
+/// [`probe_gomemlimit`] so the SSH-failure arm is pinned: a failed probe must
+/// degrade to `Unknown`, never be fed to [`parse_gomemlimit`] (whose input
+/// would then be a stray error string).
+fn gomemlimit_from_probe(probe: Result<String>) -> Field {
+    match probe {
         Ok(o) => parse_gomemlimit(&o),
         Err(_) => Field::Unknown,
     }
@@ -2213,5 +2579,898 @@ mod tests {
         );
         assert_eq!(field_or_unknown(Some("   ".into())), Field::Unknown);
         assert_eq!(field_or_unknown(None), Field::Unknown);
+    }
+
+    // ---- (f) gate: an UNPARSEABLE version is a refusal, not a proceed -----
+
+    #[test]
+    fn gate_refuses_an_unparseable_kubelet_version() {
+        // INVARIANT: `k8s_ge_134` returns false when the version does not
+        // parse, so an unrecognised kubelet string REFUSES the swap step. The
+        // dangerous alternative is defaulting to "probably new enough" and
+        // writing `swapBehavior: NoSwap` onto a kubelet that rejects it —
+        // which bricks the kubelet on restart.
+        assert!(!k8s_ge_134("k3s-dev"));
+        assert!(!k8s_ge_134("v1"));
+        assert!(!k8s_ge_134(""));
+        match swap_eligibility("k3s-dev", "cgroup2fs") {
+            SwapGate::Refuse { hint } => assert!(hint.contains("1.34"), "{hint}"),
+            other => panic!("an unparseable version must REFUSE, got {other:?}"),
+        }
+    }
+
+    // ---- (g) SshNodeOps remote-command builders -------------------------
+
+    #[test]
+    fn swapoff_command_is_capped_by_a_timeout() {
+        // INVARIANT (design decision 5 / P8): `swapoff` can hang or ENOMEM
+        // under the very pressure that triggered the rollback. Without the
+        // `timeout` cap an unbounded hang strands the rollback mid-flight with
+        // swap on and the drop-in half-rewritten.
+        let cmd = swapoff_command();
+        assert!(cmd.starts_with("timeout "), "must be capped: {cmd}");
+        assert!(cmd.contains(&format!("swapoff {SWAPFILE_PATH}")), "{cmd}");
+    }
+
+    #[test]
+    fn dropin_and_swapfile_removals_target_different_files() {
+        // The drop-in removal deletes the kubelet config; the swapfile removal
+        // deletes the backing file. Confusing the two would either leave
+        // `failSwapOn:false` behind or delete a live swapfile.
+        assert_eq!(
+            remove_dropin_command(),
+            format!("rm -f {SWAP_KUBELET_DROPIN_PATH}")
+        );
+        assert_eq!(remove_swapfile_command(), format!("rm -f {SWAPFILE_PATH}"));
+        assert_ne!(remove_dropin_command(), remove_swapfile_command());
+    }
+
+    #[test]
+    fn fstab_removal_is_anchored_and_still_removes_the_sysctl_on_failure() {
+        // INVARIANT: the fstab line MUST go — a surviving `sw,nofail` entry
+        // silently reactivates swap on the next boot, undoing the rollback.
+        // The two halves are joined by `;` not `&&` so an unmatched `sed`
+        // still leaves the swappiness drop-in removed.
+        let cmd = remove_fstab_and_sysctl_command();
+        assert!(cmd.contains("/etc/fstab"), "{cmd}");
+        assert!(
+            cmd.contains(&format!("^{SWAPFILE_PATH} ")),
+            "the sed pattern must be anchored at the NAME column: {cmd}"
+        );
+        assert!(
+            cmd.contains("rm -f /etc/sysctl.d/99-apprafter-swap.conf"),
+            "{cmd}"
+        );
+        assert!(
+            !cmd.contains("&&"),
+            "a failed sed must not skip the sysctl removal: {cmd}"
+        );
+    }
+
+    #[test]
+    fn restart_command_reloads_units_before_restarting_k3s() {
+        // A drop-in written under k3s.service.d is invisible to systemd until
+        // `daemon-reload`, so restarting first would start k3s with the OLD
+        // unit and the apply would look like a silent no-op.
+        let reload = RESTART_K3S_COMMAND
+            .find("daemon-reload")
+            .expect("must daemon-reload");
+        let restart = RESTART_K3S_COMMAND
+            .find("restart k3s")
+            .expect("must restart k3s");
+        assert!(
+            reload < restart,
+            "daemon-reload must precede the restart: {RESTART_K3S_COMMAND}"
+        );
+        assert!(RESTART_K3S_COMMAND.contains("&&"), "{RESTART_K3S_COMMAND}");
+    }
+
+    #[test]
+    fn logger_command_escapes_embedded_single_quotes() {
+        // INVARIANT: the runbook text carries backticks and apostrophes. An
+        // unescaped `'` would terminate the shell argument early, so the node's
+        // journal would get a TRUNCATED (or word-split) runbook — exactly when
+        // the operator most needs the whole line.
+        assert_eq!(shell_single_quote("plain"), "'plain'");
+        assert_eq!(shell_single_quote("it's"), "'it'\\''s'");
+        assert_eq!(
+            logger_command("it's"),
+            "logger -t apprafter-node-prep 'it'\\''s'"
+        );
+        // The real payload: the runbook survives the escaping intact — decode
+        // the quoted word the way `sh` would and it must equal the input.
+        let cmd = logger_command(SWAPOFF_FAILED_RUNBOOK);
+        let quoted = cmd
+            .strip_prefix("logger -t apprafter-node-prep '")
+            .and_then(|s| s.strip_suffix('\''))
+            .expect("the message must be a single-quoted shell word");
+        assert_eq!(
+            quoted.replace("'\\''", "'"),
+            SWAPOFF_FAILED_RUNBOOK,
+            "the runbook must survive the quoting byte-for-byte"
+        );
+    }
+
+    // ---- (h) probe output parsers ---------------------------------------
+
+    #[test]
+    fn kubelet_version_probe_is_node_local_and_reads_the_node_info() {
+        let cmd = KUBELET_VERSION_PROBE_COMMAND;
+        assert!(cmd.contains("k3s kubectl"), "node-local kubectl: {cmd}");
+        assert!(cmd.contains("$(hostname)"), "{cmd}");
+        assert!(cmd.contains(".status.nodeInfo.kubeletVersion"), "{cmd}");
+    }
+
+    #[test]
+    fn kubelet_version_parse_rejects_an_empty_jsonpath_result() {
+        // INVARIANT: a jsonpath miss exits ZERO with empty stdout. Returning
+        // "" here would flow into `k8s_ge_134` as false and REFUSE the swap
+        // step with a nonsense "node kubelet is  (<1.34)" hint instead of
+        // reporting that the probe itself failed.
+        assert_eq!(
+            parse_kubelet_version_output("  v1.35.5+k3s1\n").unwrap(),
+            "v1.35.5+k3s1"
+        );
+        let err = parse_kubelet_version_output("   \n").unwrap_err();
+        assert!(
+            err.to_string().contains("kubeletVersion"),
+            "the empty case must name what could not be read: {err}"
+        );
+        assert!(parse_kubelet_version_output("").is_err());
+    }
+
+    #[test]
+    fn mem_total_parse_quotes_what_the_node_actually_said() {
+        assert_eq!(parse_mem_total_kib(" 16384000 \n").unwrap(), 16_384_000);
+        // A shape surprise must be LOUD and quote the raw text — a silent 0
+        // would size the swapfile at 0 MiB.
+        let err = parse_mem_total_kib("MemTotal:  16384000 kB").unwrap_err();
+        assert!(
+            err.to_string().contains("MemTotal:  16384000 kB"),
+            "the error must quote the unparsed output: {err}"
+        );
+        assert!(parse_mem_total_kib("").is_err());
+    }
+
+    // ---- (i) recovery poll loop ------------------------------------------
+
+    #[test]
+    fn recovery_returns_on_the_first_success_without_sleeping() {
+        // INVARIANT: the happy path must not pay the poll interval. The loop
+        // probes BEFORE sleeping, so a node that is already back returns
+        // immediately — with a 5s interval, sleeping first would add 5s to
+        // every successful `node prep`.
+        let mut calls = 0;
+        let started = Instant::now();
+        wait_for_recovery_with(
+            || {
+                calls += 1;
+                Ok("ok".to_string())
+            },
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+        )
+        .expect("first probe succeeds");
+        assert_eq!(calls, 1, "must not probe twice on success");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "must not sleep before returning: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn recovery_tolerates_transient_failures_then_succeeds() {
+        // k3s refuses connections for the first seconds after a restart, so a
+        // failing probe must NOT abort the wait.
+        let mut calls = 0;
+        wait_for_recovery_with(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(CliError::Other("connection refused".into()))
+                } else {
+                    Ok("ok".to_string())
+                }
+            },
+            Duration::from_secs(30),
+            Duration::from_millis(1),
+        )
+        .expect("recovers on the third attempt");
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn recovery_timeout_reports_the_attempt_count_and_the_last_error() {
+        // INVARIANT: the node is probed at least once even on a spent budget
+        // (the deadline is checked AFTER the probe), and the error carries the
+        // LAST probe error — the only diagnostic an operator gets for a node
+        // that never came back. Reporting the FIRST error would show the
+        // transient "connection refused" instead of the real cause.
+        let mut calls = 0;
+        let err = wait_for_recovery_with(
+            || {
+                calls += 1;
+                Err(CliError::Other(format!("probe failure #{calls}")))
+            },
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(calls > 1, "expected several attempts, got {calls}");
+        assert!(
+            msg.contains(&format!("({calls} attempts)")),
+            "must report the attempt count: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("probe failure #{calls}")),
+            "must carry the LAST probe error, not an earlier one: {msg}"
+        );
+        assert!(
+            !msg.contains("probe failure #1)"),
+            "must not report the first error as the last: {msg}"
+        );
+
+        // A spent budget still probes once.
+        let mut once = 0;
+        let _ = wait_for_recovery_with(
+            || {
+                once += 1;
+                Err(CliError::Other("down".into()))
+            },
+            Duration::ZERO,
+            Duration::from_millis(1),
+        );
+        assert_eq!(once, 1, "the node must be probed even with a zero budget");
+    }
+
+    #[test]
+    fn recovery_timeout_error_names_the_budget_in_seconds() {
+        let err = recovery_timeout_error(Duration::from_secs(180), 7, "connection refused");
+        let msg = err.to_string();
+        assert!(msg.contains("within 180s"), "{msg}");
+        assert!(msg.contains("(7 attempts)"), "{msg}");
+        assert!(msg.contains("connection refused"), "{msg}");
+    }
+
+    // ---- (j) pre-apply idempotency plan ----------------------------------
+
+    const ACTIVE_SWAPON: &str = "NAME      TYPE SIZE USED PRIO\n/swapfile file 4G   0B   -2\n";
+    const OUR_FSTAB: &str = "UUID=x / ext4 defaults 0 1\n/swapfile none swap sw,nofail 0 0\n";
+
+    #[test]
+    fn pre_apply_plan_never_treats_a_live_swapfile_as_an_orphan() {
+        // INVARIANT: `AlreadyProvisioned` is checked FIRST. A fully provisioned
+        // node also satisfies "the file exists on disk", so a reordered check
+        // would `swapoff` + `rm` a healthy node's LIVE swap on every re-run.
+        assert_eq!(
+            pre_apply_plan(ACTIVE_SWAPON, OUR_FSTAB, true),
+            PreApplyPlan::AlreadyProvisioned
+        );
+        // Active but NOT persisted: still not an orphan (it is in use), so the
+        // apply must not delete it either.
+        assert_eq!(
+            pre_apply_plan(ACTIVE_SWAPON, "UUID=x / ext4 defaults 0 1\n", true),
+            PreApplyPlan::FreshProvision
+        );
+    }
+
+    #[test]
+    fn pre_apply_plan_removes_a_true_orphan_and_leaves_a_clean_node_alone() {
+        // Present on disk, not active, not persisted → the half-provisioned
+        // remnant the fresh `dd` must not write over.
+        assert_eq!(
+            pre_apply_plan(
+                "NAME TYPE SIZE USED PRIO\n",
+                "UUID=x / ext4 defaults 0 1\n",
+                true
+            ),
+            PreApplyPlan::RemoveOrphan
+        );
+        // Nothing on disk → nothing to clean up.
+        assert_eq!(
+            pre_apply_plan(
+                "NAME TYPE SIZE USED PRIO\n",
+                "UUID=x / ext4 defaults 0 1\n",
+                false
+            ),
+            PreApplyPlan::FreshProvision
+        );
+    }
+
+    #[test]
+    fn orphan_cleanup_removes_the_file_even_when_swapoff_fails() {
+        // INVARIANT: an orphan is by definition NOT active, so its `swapoff`
+        // is expected to fail. Joining the two with `&&` would skip the `rm`,
+        // the orphan would survive, and the fresh `dd` would write over it.
+        let cmd = orphan_cleanup_command();
+        assert!(cmd.contains(&format!("swapoff {SWAPFILE_PATH}")), "{cmd}");
+        assert!(cmd.contains(&format!("rm -f {SWAPFILE_PATH}")), "{cmd}");
+        assert!(
+            !cmd.contains("&&"),
+            "a failing swapoff must not skip the rm: {cmd}"
+        );
+        assert!(cmd.contains(';'), "{cmd}");
+    }
+
+    #[test]
+    fn orphan_notice_names_the_file_and_the_host_it_is_deleted_from() {
+        // Deleting a file on the operator's node must never be silent.
+        let msg = orphan_notice("203.0.113.7");
+        assert!(msg.contains(SWAPFILE_PATH), "{msg}");
+        assert!(msg.contains("203.0.113.7"), "{msg}");
+        assert!(msg.to_lowercase().contains("orphan"), "{msg}");
+    }
+
+    // ---- (k) retrofit swap size cap --------------------------------------
+
+    #[test]
+    fn retrofit_swap_count_is_capped_at_the_shared_max() {
+        // INVARIANT (Fix 2): the breadcrumb size must mirror
+        // `swap_enable_script`'s internal `min(MemTotal_MiB, 8Gi)`. Reporting
+        // an uncapped size would claim 32 GiB of swap on a 32 GiB node that
+        // actually received 8 GiB.
+        assert_eq!(retrofit_swap_count_mib(4 * 1024 * 1024), 4096);
+        assert_eq!(retrofit_swap_count_mib(32 * 1024 * 1024), SWAP_MAX_MIB);
+        assert_eq!(retrofit_swap_count_mib(8 * 1024 * 1024), SWAP_MAX_MIB);
+        assert_eq!(retrofit_swap_count_mib(0), 0);
+    }
+
+    // ---- (l) breadcrumbs + rollback errors -------------------------------
+
+    #[test]
+    fn breadcrumb_states_distinguish_applied_from_both_rollbacks() {
+        // INVARIANT: `classify_state` reads these lines back. A rollback
+        // breadcrumb that started with `applied` would make `node status`
+        // report swap as provisioned on a node that has none.
+        let applied = applied_breadcrumb_state(4096);
+        assert!(applied.starts_with("applied"), "{applied}");
+        assert!(applied.contains("4096 MiB"), "{applied}");
+        assert_eq!(
+            applied_breadcrumb_state(8192),
+            "applied (retrofit): swap 8192 MiB"
+        );
+
+        assert!(!ROLLED_BACK_BREADCRUMB.starts_with("applied"));
+        assert!(!ROLLED_BACK_PARTIAL_BREADCRUMB.starts_with("applied"));
+        assert_ne!(ROLLED_BACK_BREADCRUMB, ROLLED_BACK_PARTIAL_BREADCRUMB);
+        assert!(
+            ROLLED_BACK_PARTIAL_BREADCRUMB.contains("left active"),
+            "the partial breadcrumb must say swap is STILL ON: \
+             {ROLLED_BACK_PARTIAL_BREADCRUMB}"
+        );
+    }
+
+    #[test]
+    fn rollback_errors_keep_the_original_failure_and_describe_different_states() {
+        // INVARIANT: a successful rollback is still a FAILED apply, and the
+        // original recovery error must survive into the message — it is the
+        // only clue why the node did not come back. The two branches leave the
+        // node in very different states, so their messages must differ.
+        let original = "k3s API did not recover within 180s after restart (36 attempts)";
+        let clean = rollback_recovered_error(original).to_string();
+        let partial = rollback_partial_error(original).to_string();
+
+        assert!(clean.contains(original), "{clean}");
+        assert!(partial.contains(original), "{partial}");
+        assert!(clean.contains("rolled back cleanly"), "{clean}");
+        assert!(clean.contains("/swapfile deleted"), "{clean}");
+        assert!(
+            partial.contains("could NOT swapoff"),
+            "the partial branch must say the swapoff failed: {partial}"
+        );
+        assert!(
+            partial.contains("failSwapOn:false"),
+            "the partial branch must say the drop-in was LEFT: {partial}"
+        );
+        assert_ne!(clean, partial);
+    }
+
+    #[test]
+    fn recovery_failed_notice_announces_the_rollback_is_starting() {
+        // A silent multi-minute rollback looks like a hang on the very command
+        // that just took the operator's API away.
+        let msg = recovery_failed_notice("timed out");
+        assert!(msg.contains("timed out"), "{msg}");
+        assert!(msg.to_lowercase().contains("rolling"), "{msg}");
+    }
+
+    // ---- (m) `node prep` / `node status` entry errors ---------------------
+
+    #[test]
+    fn entry_errors_each_name_their_own_remedy() {
+        // These are the first thing an operator sees when the command cannot
+        // even start; each must say what to run next.
+        let no_server = no_provisioned_server_error().to_string();
+        assert!(no_server.contains("apprafter up"), "{no_server}");
+        let no_ip = no_public_ipv4_error().to_string();
+        assert!(no_ip.contains("cloud-init"), "{no_ip}");
+        let non_tty = non_interactive_error().to_string();
+        assert!(
+            non_tty.contains("--yes"),
+            "the non-TTY refusal must name the flag that makes it scriptable: {non_tty}"
+        );
+    }
+
+    #[test]
+    fn prep_confirmation_discloses_the_restart_and_names_the_host() {
+        // INVARIANT: this is the operator's ONLY warning that the API goes
+        // away. With several targets configured, an unnamed prompt is a
+        // footgun — the message must say WHICH node is about to restart.
+        let msg = prep_confirmation_message("203.0.113.7");
+        assert!(msg.contains("203.0.113.7"), "{msg}");
+        assert!(msg.contains("restarts k3s"), "{msg}");
+        assert!(msg.contains("API briefly unavailable"), "{msg}");
+    }
+
+    #[test]
+    fn refused_gate_becomes_a_loud_error_carrying_the_hint() {
+        // Design decision 1 / N6: never silently skip. The refusal hint the
+        // gate produced must reach the operator through a non-zero exit.
+        let SwapGate::Refuse { hint } = swap_eligibility("v1.33.4+k3s1", "cgroup2fs") else {
+            panic!("v1.33 must refuse");
+        };
+        let err = swap_step_skipped_error(&hint).to_string();
+        assert!(err.contains("swap step skipped"), "{err}");
+        assert!(err.contains(&hint), "the gate's hint must survive: {err}");
+    }
+
+    // ---- (n) status assembly from raw probes ------------------------------
+
+    /// A `ProbedFacts` for a healthy, fully-probed node; tests override the
+    /// one field they are about.
+    fn healthy_facts() -> ProbedFacts {
+        ProbedFacts {
+            api_node_name: Some("api-node".into()),
+            fail_swap_on: Field::Known("false".into()),
+            swap_behavior: Field::Known("NoSwap".into()),
+            swap_capacity: Field::Known("4294967296".into()),
+            kubelet_version: Field::Known("v1.35.5+k3s1".into()),
+            ssh_node_name: Some("ssh-node".into()),
+            swapon_raw: Some(ACTIVE_SWAPON.to_string()),
+            fstab_raw: OUR_FSTAB.to_string(),
+            swapfile_exists: true,
+            swappiness_raw: Some("10\n".into()),
+            gomemlimit: Field::Known("2GiB".into()),
+            breadcrumb_raw: Some("applied: swap 4096 MiB\n".into()),
+            env_skipped: false,
+        }
+    }
+
+    #[test]
+    fn assemble_prefers_the_api_node_name_and_falls_back_in_order() {
+        // The kube-API name is the authoritative one; the SSH hostname is only
+        // a fallback for the header, and `<unknown>` is the last resort — an
+        // empty header would read as a rendering bug.
+        assert_eq!(
+            assemble_node_swap_state(healthy_facts()).node_name,
+            "api-node"
+        );
+
+        let ssh_only = ProbedFacts {
+            api_node_name: None,
+            ..healthy_facts()
+        };
+        assert_eq!(assemble_node_swap_state(ssh_only).node_name, "ssh-node");
+
+        let neither = ProbedFacts {
+            api_node_name: None,
+            ssh_node_name: None,
+            ..healthy_facts()
+        };
+        assert_eq!(assemble_node_swap_state(neither).node_name, "<unknown>");
+    }
+
+    #[test]
+    fn assemble_derives_ssh_availability_solely_from_the_hostname_probe() {
+        // INVARIANT (Q10): SSH being down must degrade ONLY the [ssh] fields.
+        // The [api] fields come from the cached out-of-cluster kubeconfig and
+        // must keep their values.
+        let down = ProbedFacts {
+            ssh_node_name: None,
+            swapon_raw: None,
+            fstab_raw: String::new(),
+            swapfile_exists: false,
+            swappiness_raw: None,
+            gomemlimit: Field::Unknown,
+            breadcrumb_raw: None,
+            ..healthy_facts()
+        };
+        let s = assemble_node_swap_state(down);
+        assert!(!s.ssh_available);
+        assert_eq!(s.swapon, Field::Unknown);
+        assert_eq!(s.swappiness, Field::Unknown);
+        assert_eq!(s.provision_breadcrumb, Field::Unknown);
+        // …while the kube-API fields survive.
+        assert_eq!(s.kubelet_version, Field::Known("v1.35.5+k3s1".into()));
+        assert_eq!(s.fail_swap_on, Field::Known("false".into()));
+
+        // And a reachable node reports available.
+        assert!(assemble_node_swap_state(healthy_facts()).ssh_available);
+    }
+
+    #[test]
+    fn assemble_reads_size_and_swappiness_out_of_the_raw_probe_output() {
+        let s = assemble_node_swap_state(healthy_facts());
+        assert_eq!(
+            s.state,
+            SwapProvisionState::Active {
+                size: Some("4G".into())
+            },
+            "the size column must come from the swapon row"
+        );
+        assert_eq!(s.swapon, Field::Known("/swapfile file 4G 0B -2".into()));
+        assert_eq!(s.swappiness, Field::Known("10".into()));
+    }
+
+    #[test]
+    fn assemble_env_skip_never_masks_live_swap() {
+        // INVARIANT: `APPRAFTER_SKIP_NODE_SWAP` exported in the OPERATOR's
+        // shell says nothing about what the node actually has. Reporting
+        // `skipped` for a node with live swap would be a flat lie.
+        let skipped_but_live = ProbedFacts {
+            env_skipped: true,
+            ..healthy_facts()
+        };
+        assert_eq!(
+            assemble_node_swap_state(skipped_but_live).state,
+            SwapProvisionState::Active {
+                size: Some("4G".into())
+            }
+        );
+
+        // With no swap on the node, the hook DOES pick the skipped verdict.
+        let skipped_and_absent = ProbedFacts {
+            env_skipped: true,
+            swapon_raw: Some("NAME TYPE SIZE USED PRIO\n".into()),
+            fstab_raw: String::new(),
+            swapfile_exists: false,
+            breadcrumb_raw: None,
+            ..healthy_facts()
+        };
+        assert_eq!(
+            assemble_node_swap_state(skipped_and_absent).state,
+            SwapProvisionState::SkippedByEnv
+        );
+    }
+
+    #[test]
+    fn assemble_flags_an_orphan_swapfile_from_the_raw_probes() {
+        let orphan = ProbedFacts {
+            swapon_raw: Some("NAME TYPE SIZE USED PRIO\n".into()),
+            fstab_raw: "UUID=x / ext4 defaults 0 1\n".into(),
+            swapfile_exists: true,
+            breadcrumb_raw: None,
+            ..healthy_facts()
+        };
+        assert_eq!(
+            assemble_node_swap_state(orphan).state,
+            SwapProvisionState::OrphanSwapfile
+        );
+    }
+
+    // ---- (o) classifier branches the earlier tests left open --------------
+
+    #[test]
+    fn classify_reports_ineligible_when_the_api_says_the_kubelet_is_old() {
+        // The kube-API eligibility (not the breadcrumb) is what makes a node
+        // with no breadcrumb at all ineligible.
+        assert_eq!(
+            classify_state(true, false, None, false, &Field::Unknown, Some(false)),
+            SwapProvisionState::Ineligible {
+                detail: "k8s <1.34".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn classify_stays_actionable_when_ssh_is_up_but_the_api_is_silent() {
+        // SSH answered, nothing is provisioned, and the kube-API could not be
+        // read: still tell the operator to run `node prep` rather than
+        // reporting the state as unknowable.
+        assert_eq!(
+            classify_state(true, false, None, false, &Field::Unknown, None),
+            SwapProvisionState::EligibleNotApplied
+        );
+    }
+
+    #[test]
+    fn classify_does_not_trust_an_applied_breadcrumb_over_a_dead_swapfile() {
+        // INVARIANT (the P9 `sw,nofail` trap): the breadcrumb says the swap was
+        // applied, but `swapon` says it is not live — e.g. it silently failed
+        // to reactivate after a reboot. That node must read as NOT applied, or
+        // the operator believes it has a cushion it does not have.
+        assert_eq!(
+            classify_state(
+                true,
+                false,
+                None,
+                false,
+                &Field::Known("applied (retrofit): swap 4096 MiB".into()),
+                Some(true),
+            ),
+            SwapProvisionState::EligibleNotApplied
+        );
+    }
+
+    #[test]
+    fn render_status_active_without_a_size_omits_the_parenthetical() {
+        let out = render_status(&full_state(SwapProvisionState::Active { size: None }));
+        assert!(out.contains("swap active — NoSwap for pods"), "{out}");
+        assert!(
+            !out.contains("swap active ("),
+            "an unknown size must not render an empty parenthetical: {out}"
+        );
+    }
+
+    // ---- (p) kube-API output parsers -------------------------------------
+
+    #[test]
+    fn kube_node_name_parse_rejects_an_empty_result() {
+        // INVARIANT: on a cluster with no nodes the jsonpath exits ZERO with
+        // empty stdout. An empty name would be interpolated into the configz
+        // URL as `/api/v1/nodes//proxy/configz`, which fails confusingly
+        // instead of the field simply degrading to `unknown`.
+        assert_eq!(
+            parse_kube_node_name(" node-1 \n"),
+            Some("node-1".to_string())
+        );
+        assert_eq!(parse_kube_node_name("  \n"), None);
+        assert_eq!(parse_kube_node_name(""), None);
+    }
+
+    #[test]
+    fn node_field_maps_kubectls_placeholders_to_unknown() {
+        // kubectl prints its own `<none>` / `<unknown>` placeholders for absent
+        // jsonpath targets; reporting those verbatim would render
+        // `swap.capacity : <none>` as if it were a value.
+        assert_eq!(node_field_from_output(""), Field::Unknown);
+        assert_eq!(node_field_from_output("  \n"), Field::Unknown);
+        assert_eq!(node_field_from_output("<none>"), Field::Unknown);
+        assert_eq!(node_field_from_output("<unknown>"), Field::Unknown);
+        assert_eq!(
+            node_field_from_output(" 4294967296 \n"),
+            Field::Known("4294967296".into())
+        );
+    }
+
+    #[test]
+    fn configz_path_goes_through_the_apiserver_node_proxy() {
+        // The kubelet's `configz` is not reachable from outside the node; it
+        // has to be proxied through the apiserver's `nodes/<n>/proxy`.
+        assert_eq!(
+            configz_raw_path("node-1"),
+            "/api/v1/nodes/node-1/proxy/configz"
+        );
+    }
+
+    #[test]
+    fn configz_fields_degrade_independently() {
+        // INVARIANT: a <1.34 kubelet legitimately reports `failSwapOn` and no
+        // `swapBehavior`. Reporting both `unknown` there would hide the one
+        // fact that IS known — and it is the fact that says whether the
+        // drop-in landed at all.
+        assert_eq!(
+            configz_fields(r#"{"failSwapOn":false,"swapBehavior":"NoSwap"}"#),
+            (Field::Known("false".into()), Field::Known("NoSwap".into()))
+        );
+        assert_eq!(
+            configz_fields(r#"{"failSwapOn":false}"#),
+            (Field::Known("false".into()), Field::Unknown)
+        );
+        assert_eq!(configz_fields("{}"), (Field::Unknown, Field::Unknown));
+    }
+
+    #[test]
+    fn node_field_args_pass_the_jsonpath_as_the_value_of_dash_o() {
+        // kubectl wants `-o` and `jsonpath={…}` as SEPARATE argv slots; gluing
+        // them (`-o=jsonpath…`) or dropping the `jsonpath=` prefix makes
+        // kubectl print the whole Node object instead of the one field.
+        let args = node_field_args("node-1", "{.status.nodeInfo.kubeletVersion}");
+        assert_eq!(
+            args,
+            vec![
+                "get",
+                "node",
+                "node-1",
+                "-o",
+                "jsonpath={.status.nodeInfo.kubeletVersion}"
+            ]
+        );
+    }
+
+    #[test]
+    fn gomemlimit_probe_failure_degrades_instead_of_parsing_an_error() {
+        // A failed SSH must never be handed to the parser — its error text
+        // could contain anything.
+        assert_eq!(
+            gomemlimit_from_probe(Ok("Environment=GOMEMLIMIT=2GiB".into())),
+            Field::Known("2GiB".into())
+        );
+        assert_eq!(
+            gomemlimit_from_probe(Err(CliError::Other(
+                "ssh root@host command failed: GOMEMLIMIT=bogus".into()
+            ))),
+            Field::Unknown,
+            "a failed probe must degrade, not be parsed"
+        );
+    }
+
+    #[test]
+    fn swap_builder_none_is_labelled_internal() {
+        // The gate passing while the builder declines is a contradiction
+        // between two halves of one decision — a bug report, not operator
+        // guidance.
+        let msg = swap_builder_none_error().to_string();
+        assert!(msg.starts_with("internal:"), "{msg}");
+        assert!(msg.contains("eligibility gate"), "{msg}");
+    }
+
+    #[test]
+    fn already_provisioned_notice_says_refresh_not_provision() {
+        // On a healthy node the operator must be able to tell the idempotency
+        // probes fired — a generic "applying…" line hides that.
+        let msg = already_provisioned_notice("203.0.113.7");
+        assert!(msg.contains("203.0.113.7"), "{msg}");
+        assert!(msg.contains("already active"), "{msg}");
+        assert!(msg.contains("refreshing"), "{msg}");
+    }
+
+    // ---- (q) the full status probe pass over a scripted remote shell ------
+
+    /// A [`RemoteShell`] that answers from a fixed script and records every
+    /// command it was asked to run. An unscripted command is an `Err`, which
+    /// is exactly what a real node does for a command it cannot satisfy — so a
+    /// typo'd probe string shows up as a degraded field rather than passing.
+    struct MockShell {
+        answers: Vec<(&'static str, &'static str)>,
+        asked: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl MockShell {
+        fn new(answers: Vec<(&'static str, &'static str)>) -> Self {
+            Self {
+                answers,
+                asked: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+        fn unreachable() -> Self {
+            Self::new(Vec::new())
+        }
+    }
+
+    impl RemoteShell for MockShell {
+        fn run_remote(&self, command: &str) -> Result<String> {
+            self.asked.borrow_mut().push(command.to_string());
+            match self.answers.iter().find(|(c, _)| *c == command) {
+                Some((_, out)) => Ok((*out).to_string()),
+                None => Err(CliError::Other(format!("no route to host: {command}"))),
+            }
+        }
+    }
+
+    #[test]
+    fn status_probe_reads_every_ssh_field_off_the_node() {
+        // INVARIANT: each `[ssh]` field has its OWN probe command, and every
+        // one of them is issued. The probes are all best-effort
+        // (`.ok()`/`unwrap_or_default()`), so a mistyped command does NOT
+        // error — it silently yields `unknown`, which is why the command set
+        // is pinned here rather than left to the live walk.
+        let shell = MockShell::new(vec![
+            ("hostname", "node-1\n"),
+            (
+                "swapon --show",
+                "NAME      TYPE SIZE USED PRIO\n/swapfile file 4G   0B   -2\n",
+            ),
+            (
+                "cat /etc/fstab",
+                "UUID=x / ext4 defaults 0 1\n/swapfile none swap sw,nofail 0 0\n",
+            ),
+            ("test -e /swapfile", ""),
+            ("sysctl -n vm.swappiness", "10\n"),
+            (
+                "systemctl show -p Environment k3s 2>/dev/null",
+                "Environment=GOMEMLIMIT=2GiB\n",
+            ),
+            (
+                "cat /var/lib/apprafter/swap-provision.status",
+                "applied: swap 4096 MiB\n",
+            ),
+        ]);
+
+        // No cached kubeconfig ⇒ the [api] fields short-circuit to Unknown
+        // without spawning kubectl; the [ssh] half is what is under test.
+        let s = probe_node_swap_state(&shell, None);
+
+        assert!(s.ssh_available);
+        assert_eq!(s.node_name, "node-1");
+        assert_eq!(
+            s.state,
+            SwapProvisionState::Active {
+                size: Some("4G".into())
+            }
+        );
+        assert_eq!(s.swapon, Field::Known("/swapfile file 4G 0B -2".into()));
+        assert_eq!(s.swappiness, Field::Known("10".into()));
+        assert_eq!(s.gomemlimit, Field::Known("2GiB".into()));
+        assert_eq!(
+            s.provision_breadcrumb,
+            Field::Known("applied: swap 4096 MiB".into())
+        );
+        // The kube-API half stays Unknown — it has no kubeconfig to read.
+        assert_eq!(s.kubelet_version, Field::Unknown);
+        assert_eq!(s.swap_behavior, Field::Unknown);
+
+        // Every scripted probe was actually issued (none was dropped).
+        let asked = shell.asked.borrow().clone();
+        for (cmd, _) in &shell.answers {
+            assert!(
+                asked.iter().any(|a| a == cmd),
+                "probe `{cmd}` was never run; ran {asked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_probe_degrades_every_ssh_field_when_the_node_is_unreachable() {
+        // INVARIANT (Q10 / decision 6): an unreachable node must still produce
+        // a report — `ssh_available: false`, every [ssh] field `unknown`, a
+        // `<unknown>` header, and the `Unknown` verdict — rather than failing
+        // the command outright.
+        let shell = MockShell::unreachable();
+        let s = probe_node_swap_state(&shell, None);
+
+        assert!(!s.ssh_available);
+        assert_eq!(s.node_name, "<unknown>");
+        assert_eq!(s.state, SwapProvisionState::Unknown);
+        assert_eq!(s.swapon, Field::Unknown);
+        assert_eq!(s.swappiness, Field::Unknown);
+        assert_eq!(s.gomemlimit, Field::Unknown);
+        assert_eq!(s.provision_breadcrumb, Field::Unknown);
+        // A failed `test -e` must not be read as "the swapfile is there" —
+        // that would report a phantom orphan on an unreachable node.
+        assert_ne!(s.state, SwapProvisionState::OrphanSwapfile);
+
+        let rendered = render_status(&s);
+        assert!(rendered.contains("SSH unavailable"), "{rendered}");
+    }
+
+    #[test]
+    fn status_probe_reports_a_node_whose_swap_never_came_back() {
+        // The P9 `sw,nofail` trap end-to-end: the breadcrumb says applied, the
+        // fstab entry is there, but `swapon` lists nothing and the file is
+        // gone. That node has no cushion and must read as actionable.
+        let shell = MockShell::new(vec![
+            ("hostname", "node-1\n"),
+            ("swapon --show", "NAME TYPE SIZE USED PRIO\n"),
+            (
+                "cat /etc/fstab",
+                "UUID=x / ext4 defaults 0 1\n/swapfile none swap sw,nofail 0 0\n",
+            ),
+            ("sysctl -n vm.swappiness", "10\n"),
+            (
+                "cat /var/lib/apprafter/swap-provision.status",
+                "applied (retrofit): swap 4096 MiB\n",
+            ),
+        ]);
+        let s = probe_node_swap_state(&shell, None);
+        assert!(s.ssh_available);
+        assert_eq!(s.swapon, Field::Unknown);
+        assert_eq!(s.state, SwapProvisionState::EligibleNotApplied);
+    }
+
+    #[test]
+    fn configz_scalar_treats_an_empty_token_as_unknown() {
+        // A present-but-empty value must not be reported as a blank Known —
+        // `swapBehavior : ` reads as "configured to nothing".
+        assert_eq!(
+            configz_scalar(r#"{"swapBehavior":"","failSwapOn":false}"#, "swapBehavior"),
+            Field::Unknown
+        );
+        assert_eq!(
+            configz_scalar(r#"{"swapBehavior":,"x":1}"#, "swapBehavior"),
+            Field::Unknown
+        );
     }
 }

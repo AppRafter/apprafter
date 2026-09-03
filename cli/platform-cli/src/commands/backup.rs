@@ -277,11 +277,18 @@ pub(crate) fn resolve_time_zone(
 }
 
 /// Turn the `--at` / `--check` / `--timezone` flags into the two crons and the
-/// zone, or fail with a message the operator can act on.
+/// zone, given the two ambient zone candidates — PURE.
 ///
-/// Impure only in that it reads `$TZ` and asks the OS for its zone; everything
-/// it decides with is passed to [`resolve_time_zone`], which is pure.
-pub(crate) fn resolve_schedule(o: &EnableOpts) -> Result<ResolvedSchedule> {
+/// Extracted from [`resolve_schedule`] (which is this function plus the two
+/// environment reads and the "where the zone came from" line) so the whole
+/// composition — the `--at` default, the `--check off` sentinel, the `--check`
+/// error rewording, the derived check time — is testable without mutating
+/// process-global state in a parallel test suite.
+pub(crate) fn resolve_schedule_from(
+    o: &EnableOpts,
+    tz_env: Option<&str>,
+    os_zone: Option<&str>,
+) -> Result<(ResolvedSchedule, ZoneSource)> {
     let (h, m) = match o.at.as_deref() {
         Some(raw) => parse_at(raw)?,
         None => (3, 0),
@@ -299,21 +306,34 @@ pub(crate) fn resolve_schedule(o: &EnableOpts) -> Result<ResolvedSchedule> {
             compose_weekly_sunday(ch, cm)
         }
     };
+    let (time_zone, source) = resolve_time_zone(o.timezone.as_deref(), tz_env, os_zone)?;
+    Ok((
+        ResolvedSchedule {
+            schedule: compose_daily(h, m),
+            check_schedule,
+            time_zone,
+        },
+        source,
+    ))
+}
+
+/// Turn the `--at` / `--check` / `--timezone` flags into the two crons and the
+/// zone, or fail with a message the operator can act on.
+///
+/// Impure only in that it reads `$TZ` and asks the OS for its zone; everything
+/// it decides with is passed to [`resolve_schedule_from`], which is pure.
+pub(crate) fn resolve_schedule(o: &EnableOpts) -> Result<ResolvedSchedule> {
     let tz_env = std::env::var("TZ").ok();
     let os_zone = iana_time_zone::get_timezone().ok();
-    let (time_zone, source) =
-        resolve_time_zone(o.timezone.as_deref(), tz_env.as_deref(), os_zone.as_deref())?;
+    let (resolved, source) = resolve_schedule_from(o, tz_env.as_deref(), os_zone.as_deref())?;
     if source != ZoneSource::Flag {
         println!(
-            "  using timezone {time_zone} (from {}); pass --timezone to override",
+            "  using timezone {} (from {}); pass --timezone to override",
+            resolved.time_zone,
             source.describe()
         );
     }
-    Ok(ResolvedSchedule {
-        schedule: compose_daily(h, m),
-        check_schedule,
-        time_zone,
-    })
+    Ok(resolved)
 }
 
 /// One line describing a resolved schedule, for the success message.
@@ -687,24 +707,41 @@ pub(crate) fn list_items(
     kubeconfig: &Path,
 ) -> Result<Vec<Value>> {
     match kubectl_get_json_cluster_wide(resource, namespace, kubeconfig) {
-        Ok(Some(v)) => Ok(v
-            .get("items")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()),
+        Ok(Some(v)) => Ok(items_of(&v)),
         Ok(None) => Ok(Vec::new()),
         Err(e) => {
             // A missing CRD (no `infrastructures` kind) is not a backup failure.
-            let msg = format!("{e}");
-            if msg.contains("the server doesn't have a resource type")
-                || msg.contains("doesn't have a resource type")
-            {
+            if is_missing_resource_kind(&e) {
                 Ok(Vec::new())
             } else {
                 Err(e)
             }
         }
     }
+}
+
+/// `.items[]` of a kubectl list response, or an empty `Vec` when the document
+/// carries no `items` array. Pure — extracted from [`list_items`] and called
+/// from both there and the tests.
+fn items_of(list: &Value) -> Vec<Value> {
+    list.get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Is this kubectl failure the "that kind does not exist on this server" one?
+///
+/// Pure — extracted from [`list_items`] and called from both there and the
+/// tests. INVARIANT: only THIS shape is swallowed into an empty list. Backup
+/// legitimately lists kinds a cluster may not have (`infrastructures` has no
+/// instances at M2), but widening this to any kubectl error would turn a
+/// connection failure mid-backup into a silently empty, restorable-looking
+/// backup.
+fn is_missing_resource_kind(e: &CliError) -> bool {
+    let msg = format!("{e}");
+    msg.contains("the server doesn't have a resource type")
+        || msg.contains("doesn't have a resource type")
 }
 
 /// Read the full `.data` of a Secret (all keys), base64-decoding each value,
@@ -721,6 +758,19 @@ pub(crate) fn read_secret_data(
 ) -> Result<Option<(BTreeMap<String, Vec<u8>>, String)>> {
     let json = kubectl_get_json("secret", Some(name), Some(namespace), kubeconfig)?;
     let Some(json) = json else { return Ok(None) };
+    decode_secret_json(&json, name, namespace).map(Some)
+}
+
+/// Decode a Secret document's `.data` (base64 per value) plus its `.type`.
+///
+/// Pure — extracted from [`read_secret_data`], which is only this function
+/// plus the kubectl fetch, and called from both there and the tests.
+#[allow(clippy::type_complexity)]
+fn decode_secret_json(
+    json: &Value,
+    name: &str,
+    namespace: &str,
+) -> Result<(BTreeMap<String, Vec<u8>>, String)> {
     let secret_type = json
         .pointer("/type")
         .and_then(Value::as_str)
@@ -738,7 +788,7 @@ pub(crate) fn read_secret_data(
             out.insert(k.clone(), bytes);
         }
     }
-    Ok(Some((out, secret_type)))
+    Ok((out, secret_type))
 }
 
 /// Read `PlatformStack/default.status.currentVersion` (the live platform-stack
@@ -753,12 +803,20 @@ pub(crate) fn read_platform_version(kubeconfig: &Path) -> Result<String> {
         Some(APPRAFTER_SYSTEM_NAMESPACE),
         kubeconfig,
     )?;
-    Ok(ps
-        .as_ref()
-        .and_then(|p| p.pointer("/status/currentVersion"))
+    Ok(platform_version_of(ps.as_ref()))
+}
+
+/// `PlatformStack.status.currentVersion`, or `"unknown"`.
+///
+/// Pure — extracted from [`read_platform_version`] and called from both there
+/// and the tests. INVARIANT: the fallback is the literal `"unknown"`, which
+/// `restore --reprovision` treats as "no version to pin"; an empty string here
+/// would be passed on as a version and bootstrap a target at nothing.
+fn platform_version_of(ps: Option<&Value>) -> String {
+    ps.and_then(|p| p.pointer("/status/currentVersion"))
         .and_then(Value::as_str)
         .unwrap_or("unknown")
-        .to_string())
+        .to_string()
 }
 
 /// Build the `ResourceRef`s recorded in `manifest.json` from the captured
@@ -823,14 +881,7 @@ const CNPG_OPERATOR_NS: &str = "cnpg-system";
 /// Without the `status.image` fallback a modern CNPG (PG 18) would silently
 /// mismatch a `postgres:16` `pg_dump` (`pg_dump: server version mismatch`).
 pub(crate) fn first_cnpg_image(namespaces: &[String], kubeconfig: &Path) -> Option<String> {
-    // App namespaces first (per-claim owned clusters, if any), then the shared
-    // integrated cluster's namespace. Dedup so `cnpg-system` isn't scanned
-    // twice when it is already an app namespace.
-    let mut scan: Vec<&str> = namespaces.iter().map(String::as_str).collect();
-    if !scan.contains(&CNPG_OPERATOR_NS) {
-        scan.push(CNPG_OPERATOR_NS);
-    }
-    for ns in scan {
+    for ns in cnpg_scan_namespaces(namespaces) {
         if let Ok(items) = list_items("clusters.postgresql.cnpg.io", Some(ns), kubeconfig) {
             if let Some(img) = items.iter().find_map(cnpg_cluster_image) {
                 return Some(img);
@@ -838,6 +889,24 @@ pub(crate) fn first_cnpg_image(namespaces: &[String], kubeconfig: &Path) -> Opti
         }
     }
     None
+}
+
+/// The namespaces [`first_cnpg_image`] scans, in order: the app namespaces
+/// first (per-claim owned clusters, if any), then the CNPG operator's own
+/// namespace — deduped so `cnpg-system` is not scanned twice when it is itself
+/// an app namespace.
+///
+/// Pure — extracted from [`first_cnpg_image`] and called from both there and
+/// the tests. INVARIANT: `cnpg-system` is ALWAYS in the set. The shared
+/// integrated `platform-postgres` Cluster lives only there, so an app-ns-only
+/// scan structurally misses it and every integrated-tier backup silently falls
+/// back to the default pg major → `pg_dump: server version mismatch`.
+fn cnpg_scan_namespaces(namespaces: &[String]) -> Vec<&str> {
+    let mut scan: Vec<&str> = namespaces.iter().map(String::as_str).collect();
+    if !scan.contains(&CNPG_OPERATOR_NS) {
+        scan.push(CNPG_OPERATOR_NS);
+    }
+    scan
 }
 
 /// Resolve a CNPG `Cluster`'s operand image: `spec.imageName` when set, else the
@@ -882,6 +951,34 @@ fn default_backup_repo(target_name: &str) -> Result<PathBuf> {
     Ok(root.join("backups").join(target_name))
 }
 
+/// The local restic repo a `backup` / `backup list` acts on: the `--repo`
+/// override, else the target's default under the config root.
+///
+/// Extracted from [`run_backup`] / [`run_backup_list`] and called from both
+/// those and the tests. INVARIANT: the default is PER TARGET — two clusters
+/// sharing one repo path would interleave their snapshots and each other's
+/// retention.
+fn backup_repo_path(repo: Option<&str>, target_name: &str) -> Result<PathBuf> {
+    match repo {
+        Some(r) => Ok(PathBuf::from(r)),
+        None => default_backup_repo(target_name),
+    }
+}
+
+/// The refusal when the cluster hosts no AppRafter `Application` at all.
+///
+/// Pure — extracted from [`run_export`] / [`run_backup`] and called from both
+/// those and the tests. INVARIANT: it names where the scope came from. The
+/// scope is the app-namespace set derived from the `Application` CRs, NOT
+/// `kubectl get ns`, and an operator staring at a cluster full of namespaces
+/// needs to be told that is deliberate.
+fn no_applications_error(action: &str) -> CliError {
+    CliError::Other(format!(
+        "no AppRafter Applications found — nothing to {action}. (Scope derives from \
+         `kubectl get applications.apprafter.io -A`.)"
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Concrete KubeExec impl — subprocess kubectl
 // ---------------------------------------------------------------------------
@@ -896,13 +993,25 @@ const STDERR_FLUSH_GRACE_MS: u64 = 100;
 /// `kubectl` with `KUBECONFIG=<path>`.
 pub(crate) struct KubectlExec {
     pub kubeconfig: PathBuf,
+    /// The `kubectl` binary to spawn. Always `"kubectl"` in production (see
+    /// [`KubectlExec::new`]); a seam so the tests can drive these methods
+    /// against a stub binary and actually observe what they do with a child
+    /// process's streams and exit status, rather than leaving the whole
+    /// subprocess layer unexercised.
+    kubectl_bin: PathBuf,
 }
 
 impl KubectlExec {
     pub(crate) fn new(kubeconfig: PathBuf) -> Self {
-        Self { kubeconfig }
+        Self {
+            kubeconfig,
+            kubectl_bin: PathBuf::from(KUBECTL_BIN),
+        }
     }
 }
+
+/// The `kubectl` executable [`KubectlExec`] spawns, resolved through `PATH`.
+const KUBECTL_BIN: &str = "kubectl";
 
 /// Spawn a thread that drains `reader` to EOF, retaining the last
 /// `STDERR_CAPTURE_LIMIT` lines in a shared buffer for error reporting.
@@ -956,7 +1065,7 @@ impl KubeExec for KubectlExec {
         let json_bytes = serde_json::to_vec(spec)
             .map_err(|e| CliError::Other(format!("serialize pod spec: {e}")))?;
 
-        let mut apply_child = Command::new("kubectl")
+        let mut apply_child = Command::new(&self.kubectl_bin)
             .args(["apply", "-f", "-", "-n", ns])
             .env("KUBECONFIG", &self.kubeconfig)
             .stdin(Stdio::piped())
@@ -991,7 +1100,7 @@ impl KubeExec for KubectlExec {
             ));
         }
 
-        let wait_status = Command::new("kubectl")
+        let wait_status = Command::new(&self.kubectl_bin)
             .args([
                 "wait",
                 "--for=condition=Ready",
@@ -1022,7 +1131,7 @@ impl KubeExec for KubectlExec {
         argv: &[&str],
         out_path: &Path,
     ) -> Result<()> {
-        let mut cmd = Command::new("kubectl");
+        let mut cmd = Command::new(&self.kubectl_bin);
         cmd.arg("exec")
             .arg(pod)
             .arg("-n")
@@ -1077,7 +1186,7 @@ impl KubeExec for KubectlExec {
         argv: &[&str],
         in_path: &Path,
     ) -> Result<()> {
-        let mut cmd = Command::new("kubectl");
+        let mut cmd = Command::new(&self.kubectl_bin);
         cmd.arg("exec")
             .arg("-i")
             .arg(pod)
@@ -1134,7 +1243,7 @@ impl KubeExec for KubectlExec {
     }
 
     fn delete_pod_best_effort(&self, name: &str, ns: &str) {
-        let _ = Command::new("kubectl")
+        let _ = Command::new(&self.kubectl_bin)
             .args([
                 "delete",
                 "pod",
@@ -1151,7 +1260,7 @@ impl KubeExec for KubectlExec {
     }
 
     fn get_secret_key(&self, secret: &str, ns: &str, key: &str) -> Result<String> {
-        let out = Command::new("kubectl")
+        let out = Command::new(&self.kubectl_bin)
             .args([
                 "get",
                 "secret",
@@ -1192,7 +1301,7 @@ impl KubeExec for KubectlExec {
     }
 
     fn get_json(&self, args: &[&str]) -> Result<Option<serde_json::Value>> {
-        let mut c = Command::new("kubectl");
+        let mut c = Command::new(&self.kubectl_bin);
         c.args(args).env("KUBECONFIG", &self.kubeconfig);
 
         let out = c
@@ -1240,17 +1349,10 @@ pub fn run_export(namespaces: &[String], select: bool, out: Option<&str>) -> Res
     let apps = list_items("applications.apprafter.io", None, kc.path())?;
     let ns_set = app_namespaces(&apps, subset);
     if ns_set.is_empty() {
-        return Err(CliError::Other(
-            "no AppRafter Applications found — nothing to export. (Scope derives from \
-             `kubectl get applications.apprafter.io -A`.)"
-                .into(),
-        ));
+        return Err(no_applications_error("export"));
     }
 
-    let out_dir = match out {
-        Some(p) => PathBuf::from(p),
-        None => default_export_dir(),
-    };
+    let out_dir = export_out_dir(out);
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| CliError::Other(format!("create export dir {}: {e}", out_dir.display())))?;
 
@@ -1261,28 +1363,64 @@ pub fn run_export(namespaces: &[String], select: bool, out: Option<&str>) -> Res
     run_extraction(&k, &plan, &out_dir, &pg_image)?;
 
     let platform_version = read_platform_version(kc.path())?;
-    let manifest = BackupManifest {
-        manifest_version: backup_core::manifest::MANIFEST_VERSION_CURRENT,
-        cluster_id: cluster_id.clone(),
-        created_at: now_rfc3339(),
-        platform_version,
-        namespaces: ns_set.clone(),
-        resources: resource_refs(&[], &claims),
-    };
+    let manifest = export_manifest(&cluster_id, &platform_version, &ns_set, &claims);
     write_manifest(&manifest, &out_dir)?;
 
-    println!(
-        "✓ Exported {} namespace(s) from cluster '{cluster_id}' → {}",
-        ns_set.len(),
-        out_dir.display()
-    );
-    println!("  namespaces: {}", ns_set.join(", "));
-    println!(
-        "  claims:     {} ({} extractable)",
-        claims.len(),
-        plan.len()
+    print!(
+        "{}",
+        export_summary(&cluster_id, &out_dir, &ns_set, claims.len(), plan.len())
     );
     Ok(())
+}
+
+/// The output directory for `export`: the `--out` path, else
+/// `<cwd>/apprafter-export`.
+///
+/// Extracted from [`run_export`] and called from both there and the tests.
+fn export_out_dir(out: Option<&str>) -> PathBuf {
+    match out {
+        Some(p) => PathBuf::from(p),
+        None => default_export_dir(),
+    }
+}
+
+/// The `manifest.json` body an `export` writes. Pure — extracted from
+/// [`run_export`] and called from both there and the tests.
+///
+/// INVARIANT: `resources` carries the claims and NO config CRs. `export` is
+/// Kind 1 (native data only); a config CR appearing here would advertise
+/// replayable cluster config that the export never actually captured.
+fn export_manifest(
+    cluster_id: &str,
+    platform_version: &str,
+    namespaces: &[String],
+    claims: &[Value],
+) -> BackupManifest {
+    BackupManifest {
+        manifest_version: backup_core::manifest::MANIFEST_VERSION_CURRENT,
+        cluster_id: cluster_id.to_string(),
+        created_at: now_rfc3339(),
+        platform_version: platform_version.to_string(),
+        namespaces: namespaces.to_vec(),
+        resources: resource_refs(&[], claims),
+    }
+}
+
+/// The operator-facing summary `export` prints on success. Pure — extracted
+/// from [`run_export`], which prints exactly this.
+fn export_summary(
+    cluster_id: &str,
+    out_dir: &Path,
+    namespaces: &[String],
+    claim_count: usize,
+    extractable_count: usize,
+) -> String {
+    format!(
+        "✓ Exported {} namespace(s) from cluster '{cluster_id}' → {}\n  namespaces: {}\n  claims:     {claim_count} ({extractable_count} extractable)\n",
+        namespaces.len(),
+        out_dir.display(),
+        namespaces.join(", "),
+    )
 }
 
 /// Parse the local-pull `apprafter backup --staging-mode` flag into a
@@ -1339,17 +1477,10 @@ pub fn run_backup(
     let apps = list_items("applications.apprafter.io", None, kc.path())?;
     let ns_set = app_namespaces(&apps, subset);
     if ns_set.is_empty() {
-        return Err(CliError::Other(
-            "no AppRafter Applications found — nothing to back up. (Scope derives from \
-             `kubectl get applications.apprafter.io -A`.)"
-                .into(),
-        ));
+        return Err(no_applications_error("back up"));
     }
 
-    let repo_path = match repo {
-        Some(r) => PathBuf::from(r),
-        None => default_backup_repo(&cluster_id)?,
-    };
+    let repo_path = backup_repo_path(repo, &cluster_id)?;
     let repo_str = repo_path.to_string_lossy().to_string();
 
     let pg_image = pg_helper_image(first_cnpg_image(&ns_set, kc.path()).as_deref());
@@ -1361,38 +1492,88 @@ pub fn run_backup(
         .tempdir()
         .map_err(|e| CliError::Other(format!("create staging dir: {e}")))?;
 
-    let opts = BackupOpts {
-        repo: repo_str.clone(),
-        passphrase: pass,
-        cluster_id: cluster_id.clone(),
-        created_at: now_rfc3339(),
-        platform_version,
-        namespaces: ns_set.clone(),
-        is_subset: select,
-        staging_root: staging.path().to_path_buf(),
+    let opts = local_pull_backup_opts(
+        &repo_str,
+        pass,
+        &cluster_id,
+        &platform_version,
+        &ns_set,
+        select,
+        staging.path(),
         pg_image,
         staging_mode,
-        // CLI local-pull: keep the machine's hostname as the restic group
-        // (correct per-operator-station grouping). The in-cluster runner
-        // (chunk 2) will set Some("apprafter-backup") for a stable pod-agnostic
-        // host (spec §Retention M-r3-1a).
-        backup_host: None,
-    };
+    );
 
     let r = SubprocessRestic;
     let summary = backup_core::engine::run_backup_with_summary(&k, &r, &opts)?;
 
-    println!("✓ Backed up cluster '{cluster_id}' → {repo_str}");
-    println!("  namespaces: {}", ns_set.join(", "));
-    println!(
-        "  captured:   {} CR(s), {} secret(s), {} claim(s) ({} extracted)",
-        summary.cr_count, summary.secret_count, summary.claim_count, summary.extracted_count,
+    print!(
+        "{}",
+        backup_summary_report(&cluster_id, &repo_str, &ns_set, &summary)
     );
-    println!("  tag:        {}", summary.tag);
-    if let Some(id) = summary.snapshot_id {
-        println!("  snapshot:   {id}");
-    }
     Ok(())
+}
+
+/// Assemble the [`BackupOpts`] the CLI local-pull path hands to the engine.
+///
+/// Pure — extracted from [`run_backup`] and called from both there and the
+/// tests. INVARIANT: `backup_host` is `None`. The CLI pull keeps the operator
+/// workstation's own hostname as the restic group, which is what makes
+/// per-station grouping work; only the in-cluster runner pins
+/// `Some("apprafter-backup")` because its pod name is ephemeral (spec
+/// §Retention M-r3-1a).
+#[allow(clippy::too_many_arguments)]
+fn local_pull_backup_opts(
+    repo: &str,
+    passphrase: String,
+    cluster_id: &str,
+    platform_version: &str,
+    namespaces: &[String],
+    is_subset: bool,
+    staging_root: &Path,
+    pg_image: String,
+    staging_mode: StagingMode,
+) -> BackupOpts {
+    BackupOpts {
+        repo: repo.to_string(),
+        passphrase,
+        cluster_id: cluster_id.to_string(),
+        created_at: now_rfc3339(),
+        platform_version: platform_version.to_string(),
+        namespaces: namespaces.to_vec(),
+        is_subset,
+        staging_root: staging_root.to_path_buf(),
+        pg_image,
+        staging_mode,
+        backup_host: None,
+    }
+}
+
+/// The operator-facing summary `backup` prints on success. Pure — extracted
+/// from [`run_backup`], which prints exactly this.
+///
+/// INVARIANT: the `snapshot:` line is present only when restic reported a
+/// snapshot id. Printing an empty one would read as a stored snapshot that
+/// does not exist.
+fn backup_summary_report(
+    cluster_id: &str,
+    repo: &str,
+    namespaces: &[String],
+    summary: &backup_core::engine::BackupSummary,
+) -> String {
+    let mut out = format!(
+        "✓ Backed up cluster '{cluster_id}' → {repo}\n  namespaces: {}\n  captured:   {} CR(s), {} secret(s), {} claim(s) ({} extracted)\n  tag:        {}\n",
+        namespaces.join(", "),
+        summary.cr_count,
+        summary.secret_count,
+        summary.claim_count,
+        summary.extracted_count,
+        summary.tag,
+    );
+    if let Some(id) = &summary.snapshot_id {
+        out.push_str(&format!("  snapshot:   {id}\n"));
+    }
+    out
 }
 
 /// `apprafter backup list` — list the snapshots in a restic repo.
@@ -1407,26 +1588,40 @@ pub fn run_backup_list(repo: Option<&str>, passphrase: Option<&str>) -> Result<(
     let is_tty = std::io::stdin().is_terminal();
     let pass = backup_passphrase_or_error(passphrase, env_pass.as_deref(), is_tty)?;
 
-    let repo_path = match repo {
-        Some(r) => PathBuf::from(r),
-        None => default_backup_repo(&resolved.target_name)?,
-    };
+    let repo_path = backup_repo_path(repo, &resolved.target_name)?;
     let repo_str = repo_path.to_string_lossy().to_string();
 
     let r = SubprocessRestic;
     let json = r.run_stdout(&restic_snapshots_argv(&repo_str), &pass)?;
-    let snapshots: Value = serde_json::from_str(&json)
+    let snapshots = parse_snapshots_json(&json)?;
+
+    print!("{}", format_snapshot_table(&repo_str, &snapshots));
+    Ok(())
+}
+
+/// Parse `restic snapshots --json` output into the snapshot array.
+///
+/// Pure — extracted from [`run_backup_list`] and called from both there and
+/// the tests. A document that is valid JSON but not an array yields an empty
+/// list (rendered as "no snapshots"), never a panic.
+fn parse_snapshots_json(json: &str) -> Result<Vec<Value>> {
+    let parsed: Value = serde_json::from_str(json)
         .map_err(|e| CliError::Other(format!("parse restic snapshots JSON: {e}")))?;
+    Ok(parsed.as_array().cloned().unwrap_or_default())
+}
 
-    let arr = snapshots.as_array().cloned().unwrap_or_default();
-    if arr.is_empty() {
-        println!("No snapshots in {repo_str}.");
-        return Ok(());
+/// Render the `backup list` snapshot table. Pure — extracted from
+/// [`run_backup_list`], which prints exactly this.
+///
+/// INVARIANT: an absent `short_id` falls back to the full `id` TRUNCATED to 8
+/// characters. `restic` takes either, and printing a full 64-hex id in a
+/// 12-wide column would wreck the table it is supposed to line up.
+fn format_snapshot_table(repo: &str, snapshots: &[Value]) -> String {
+    if snapshots.is_empty() {
+        return format!("No snapshots in {repo}.\n");
     }
-
-    println!("Snapshots in {repo_str}:");
-    println!("{:<12}  {:<25}  TAGS", "ID", "TIME");
-    for s in &arr {
+    let mut out = format!("Snapshots in {repo}:\n{:<12}  {:<25}  TAGS\n", "ID", "TIME");
+    for s in snapshots {
         let id = s
             .pointer("/short_id")
             .or_else(|| s.pointer("/id"))
@@ -1444,9 +1639,9 @@ pub fn run_backup_list(repo: Option<&str>, passphrase: Option<&str>) -> Result<(
                     .join(", ")
             })
             .unwrap_or_default();
-        println!("{id:<12}  {time:<25}  {tags}");
+        out.push_str(&format!("{id:<12}  {time:<25}  {tags}\n"));
     }
-    Ok(())
+    out
 }
 
 fn write_manifest(manifest: &BackupManifest, dir: &Path) -> Result<()> {
@@ -1709,6 +1904,41 @@ impl CredentialedRestic {
     }
 }
 
+/// The error a non-zero `restic` exit becomes. Pure — extracted so both
+/// [`CredentialedRestic::run`] and [`CredentialedRestic::run_stdout`] state it
+/// once, and so the tests can pin it without a restic binary.
+///
+/// INVARIANT: restic's stderr is carried through verbatim. It is the only
+/// place the actual cause (wrong key, no such bucket, locked repo) is named,
+/// and an operator doing disaster recovery has nothing else to go on.
+fn restic_failure_error(argv: &[String], code: Option<i32>, stderr: &[u8]) -> CliError {
+    CliError::Other(format!(
+        "restic {} failed (exit {code:?}): {}",
+        argv.first().map(String::as_str).unwrap_or("?"),
+        String::from_utf8_lossy(stderr)
+    ))
+}
+
+/// The `snapshot_id` of the `summary` line in `restic backup --json` output.
+///
+/// Pure — extracted from [`CredentialedRestic::run_backup`] and called from
+/// both there and the tests. INVARIANT: only the line whose `message_type` is
+/// `summary` counts. restic streams `status` lines carrying other ids, and
+/// taking the first id in the stream would report a snapshot that is not the
+/// one just written.
+fn snapshot_id_from_backup_json(stdout: &str) -> Option<String> {
+    stdout.lines().find_map(|line| {
+        let obj: Value = serde_json::from_str(line.trim()).ok()?;
+        if obj.pointer("/message_type").and_then(Value::as_str) == Some("summary") {
+            obj.pointer("/snapshot_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        } else {
+            None
+        }
+    })
+}
+
 impl ResticRunner for CredentialedRestic {
     fn run(&self, argv: &[String], pass: &str) -> Result<()> {
         let out = self
@@ -1716,12 +1946,7 @@ impl ResticRunner for CredentialedRestic {
             .output()
             .map_err(|e| CliError::Other(format!("spawn restic: {e}")))?;
         if !out.status.success() {
-            return Err(CliError::Other(format!(
-                "restic {} failed (exit {:?}): {}",
-                argv.first().map(String::as_str).unwrap_or("?"),
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr)
-            )));
+            return Err(restic_failure_error(argv, out.status.code(), &out.stderr));
         }
         Ok(())
     }
@@ -1732,12 +1957,7 @@ impl ResticRunner for CredentialedRestic {
             .output()
             .map_err(|e| CliError::Other(format!("spawn restic: {e}")))?;
         if !out.status.success() {
-            return Err(CliError::Other(format!(
-                "restic {} failed (exit {:?}): {}",
-                argv.first().map(String::as_str).unwrap_or("?"),
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr)
-            )));
+            return Err(restic_failure_error(argv, out.status.code(), &out.stderr));
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
@@ -1746,17 +1966,7 @@ impl ResticRunner for CredentialedRestic {
         // Not exercised by prune/check/unlock, but implemented for real (mirrors
         // SubprocessRestic) so the trait stays honest for any future caller.
         let stdout = self.run_stdout(argv, pass)?;
-        let snapshot_id = stdout.lines().find_map(|line| {
-            let obj: Value = serde_json::from_str(line.trim()).ok()?;
-            if obj.pointer("/message_type").and_then(Value::as_str) == Some("summary") {
-                obj.pointer("/snapshot_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            } else {
-                None
-            }
-        });
-        Ok(snapshot_id)
+        Ok(snapshot_id_from_backup_json(&stdout))
     }
 }
 
@@ -2049,11 +2259,7 @@ pub fn run_backup_prune(
     let runner = CredentialedRestic { creds };
     run_prune(&runner, &repo, &pass, &policy)?;
 
-    println!("✓ Pruned {repo}");
-    println!(
-        "  retention: keepDaily={} keepWeekly={} keepMonthly={}",
-        policy.keep_daily, policy.keep_weekly, policy.keep_monthly
-    );
+    print!("{}", prune_summary(&repo, &policy));
 
     // Stamp last-prune so `backup status` can report it. Best-effort ordering:
     // the prune already succeeded, so a merge-patch failure here surfaces as an
@@ -2062,10 +2268,7 @@ pub fn run_backup_prune(
     match &kc {
         Some(kc) => {
             let ts = chrono::Utc::now().to_rfc3339();
-            let body = serde_json::json!({
-                "metadata": { "annotations": { "apprafter.io/last-prune": ts } }
-            })
-            .to_string();
+            let body = last_prune_patch_body(&ts);
             kubectl_merge_patch(
                 "platformstack",
                 PLATFORMSTACK_NAME,
@@ -2084,6 +2287,29 @@ pub fn run_backup_prune(
         }
     }
     Ok(())
+}
+
+/// What `backup prune` prints after a successful prune. Pure — extracted from
+/// [`run_backup_prune`], which prints exactly this.
+fn prune_summary(repo: &str, policy: &RetentionPolicy) -> String {
+    format!(
+        "✓ Pruned {repo}\n  retention: keepDaily={} keepWeekly={} keepMonthly={}\n",
+        policy.keep_daily, policy.keep_weekly, policy.keep_monthly
+    )
+}
+
+/// The merge-patch body stamping `apprafter.io/last-prune`.
+///
+/// Pure — extracted from [`run_backup_prune`] and called from both there and
+/// the tests. INVARIANT: the annotation KEY is `apprafter.io/last-prune`, the
+/// exact string `backup status` reads back (as the escaped JSON pointer
+/// `apprafter.io~1last-prune`); the two spellings must not drift apart or the
+/// stamp is written and never shown.
+fn last_prune_patch_body(ts: &str) -> String {
+    serde_json::json!({
+        "metadata": { "annotations": { "apprafter.io/last-prune": ts } }
+    })
+    .to_string()
 }
 
 /// `apprafter backup check` — verify an off-site restic repo's integrity
@@ -2236,20 +2462,7 @@ pub fn run_backup_enable(
     opts.bucket = construct_repo_url(&opts.bucket, endpoint, prefix)?;
 
     // 1. Validate enum-valued options before touching the cluster.
-    if let Some(enforce) = &opts.enforce {
-        if enforce != "operator" && enforce != "cluster" {
-            return Err(CliError::Other(format!(
-                "invalid --enforce '{enforce}': expected 'operator' or 'cluster'"
-            )));
-        }
-    }
-    if let Some(mode) = &opts.staging_mode {
-        if mode != "monolithic" && mode != "sequential" {
-            return Err(CliError::Other(format!(
-                "invalid --staging-mode '{mode}': expected 'monolithic' or 'sequential'"
-            )));
-        }
-    }
+    validate_enable_enums(&opts)?;
 
     // 1b. Resolve the schedule and the zone (2.22g / D2). Before the
     //     kubeconfig, before any prompt, before anything billable — a bad
@@ -2271,12 +2484,7 @@ pub fn run_backup_enable(
         validate_required_cred_keys(&canonical)?;
 
         // Credential name: explicit --credential, else the platform default.
-        let name = if opts.credential.is_empty() {
-            DEFAULT_BACKUP_CREDENTIAL_NAME.to_string()
-        } else {
-            opts.credential.clone()
-        };
-        (canonical, true, name)
+        (canonical, true, effective_credential_name(&opts.credential))
     } else if !opts.credential.is_empty() {
         // PATH B: read the live Secret from the cluster.
         let secret_data = read_secret_data(&opts.credential, PLATFORMSTACK_NAMESPACE, kc.path())?;
@@ -2289,15 +2497,7 @@ pub fn run_backup_enable(
             )));
         };
         // Base64 has already been decoded by read_secret_data; values are bytes.
-        let raw_str: BTreeMap<String, String> = raw_bytes
-            .into_iter()
-            .filter_map(|(k, v)| {
-                String::from_utf8(v)
-                    .ok()
-                    .map(|s| (k, s.trim_end_matches('\n').to_string()))
-            })
-            .collect();
-        let canonical = normalize_s3_creds(raw_str);
+        let canonical = normalize_s3_creds(secret_bytes_to_strings(raw_bytes));
         validate_required_cred_keys(&canonical)?;
         let name = opts.credential.clone();
         (canonical, false, name)
@@ -2401,32 +2601,118 @@ pub fn run_backup_enable(
             kc.path(),
         )
         .ok()
-        .flatten()
-        .and_then(|v| {
-            v.pointer("/spec/backup/timeZone")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-        if stored.as_deref() != Some(resolved.time_zone.as_str()) {
-            return Err(CliError::Other(format!(
-                "the cluster did not store the timezone '{}' (it reads back as {:?}).\n\n                   This operator's PlatformStack CRD predates the `spec.backup.timeZone`                  field, so the apiserver accepted the write and discarded it — the backup                  would run in the cluster's own zone with no sign of it.\n\n                   Upgrade the platform, then re-run this command.",
-                resolved.time_zone, stored
-            )));
-        }
+        .flatten();
+        check_time_zone_readback(
+            &resolved.time_zone,
+            stored_time_zone(stored.as_ref()).as_deref(),
+        )?;
     }
 
     // 8. Success + GitOps advisory.
-    println!(
-        "✓ Scheduled off-site backup enabled → {} (credential Secret '{}').",
-        opts.bucket, opts.credential
+    print!(
+        "{}",
+        enable_success_report(&opts.bucket, &opts.credential, &resolved)
     );
-    println!(
-        "  schedule: {} {}",
-        describe_schedule(&resolved),
-        resolved.time_zone
-    );
-    println!("{BACKUP_GITOPS_ADVISORY}");
     Ok(())
+}
+
+/// Refuse the two enum-valued `enable` flags before anything is touched.
+///
+/// Pure — extracted from [`run_backup_enable`] and called from both there and
+/// the tests. It runs BEFORE the kubeconfig, the credential seal and the DR
+/// prompt precisely so a typo costs nothing.
+fn validate_enable_enums(o: &EnableOpts) -> Result<()> {
+    if let Some(enforce) = &o.enforce {
+        if enforce != "operator" && enforce != "cluster" {
+            return Err(CliError::Other(format!(
+                "invalid --enforce '{enforce}': expected 'operator' or 'cluster'"
+            )));
+        }
+    }
+    if let Some(mode) = &o.staging_mode {
+        if mode != "monolithic" && mode != "sequential" {
+            return Err(CliError::Other(format!(
+                "invalid --staging-mode '{mode}': expected 'monolithic' or 'sequential'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The Secret name the credential is sealed under: `--credential` when given,
+/// else the platform default. Pure — extracted from [`run_backup_enable`].
+fn effective_credential_name(explicit: &str) -> String {
+    if explicit.is_empty() {
+        DEFAULT_BACKUP_CREDENTIAL_NAME.to_string()
+    } else {
+        explicit.to_string()
+    }
+}
+
+/// Decode a credential Secret's raw values into strings.
+///
+/// Pure — extracted from [`run_backup_enable`]'s path B and called from both
+/// there and the tests.
+///
+/// INVARIANT: a TRAILING NEWLINE is stripped. `kubectl create secret generic
+/// --from-file` stores the file verbatim, newline included, and an
+/// `AWS_SECRET_ACCESS_KEY` with a trailing `\n` fails S3 signing with an
+/// authentication error that names nothing. Non-UTF-8 values are dropped
+/// rather than lossily mangled — a mangled key would also fail to sign, but
+/// silently and with a plausible-looking value.
+fn secret_bytes_to_strings(raw: BTreeMap<String, Vec<u8>>) -> BTreeMap<String, String> {
+    raw.into_iter()
+        .filter_map(|(k, v)| {
+            String::from_utf8(v)
+                .ok()
+                .map(|s| (k, s.trim_end_matches('\n').to_string()))
+        })
+        .collect()
+}
+
+/// `spec.backup.timeZone` as the cluster stores it. Pure — extracted from
+/// [`run_backup_enable`]'s read-back guard.
+fn stored_time_zone(ps: Option<&Value>) -> Option<String> {
+    ps.and_then(|v| v.pointer("/spec/backup/timeZone"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// THE READ-BACK GUARD (2.22g). Compare the zone we asked the cluster to store
+/// against the zone it reads back, and refuse when they differ.
+///
+/// Pure — extracted from [`run_backup_enable`] and called from both there and
+/// the tests.
+///
+/// # Why this exists
+///
+/// `spec.backup` is fully structural in the CRD, so an apiserver whose CRD
+/// predates `timeZone` answers the merge-patch with HTTP 200, stores every
+/// field it recognises, and silently PRUNES this one. kubectl writes its
+/// pruning warning to stderr, which the merge-patch helper reads only on
+/// failure — so the write looks clean from every angle. The command would
+/// half-succeed: backups genuinely enabled, running in the wrong zone, with
+/// this CLI reporting the zone it thought it set. Reading the field back is
+/// the only sound check, and a mismatch must be an ERROR — a warning here is
+/// a wrong backup window nobody notices until they need the backup.
+fn check_time_zone_readback(expected: &str, stored: Option<&str>) -> Result<()> {
+    if expected.is_empty() || stored == Some(expected) {
+        return Ok(());
+    }
+    Err(CliError::Other(format!(
+        "the cluster did not store the timezone '{expected}' (it reads back as {:?}).\n\n                   This operator's PlatformStack CRD predates the `spec.backup.timeZone`                  field, so the apiserver accepted the write and discarded it — the backup                  would run in the cluster's own zone with no sign of it.\n\n                   Upgrade the platform, then re-run this command.",
+        stored.map(str::to_string)
+    )))
+}
+
+/// What a successful `backup enable` prints. Pure — extracted from
+/// [`run_backup_enable`], which prints exactly this.
+fn enable_success_report(bucket: &str, credential: &str, s: &ResolvedSchedule) -> String {
+    format!(
+        "✓ Scheduled off-site backup enabled → {bucket} (credential Secret '{credential}').\n  schedule: {} {}\n{BACKUP_GITOPS_ADVISORY}\n",
+        describe_schedule(s),
+        s.time_zone
+    )
 }
 
 /// Apply a `SealedSecret` manifest via `kubectl apply -f <tempfile>`.
@@ -2515,7 +2801,19 @@ fn preflight_restic_version() -> Result<()> {
         return Ok(());
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    match parse_restic_version(&stdout) {
+    restic_version_gate(&stdout)
+}
+
+/// Decide the restic version gate from `restic version` stdout.
+///
+/// Extracted from [`preflight_restic_version`] (which is this function plus
+/// the subprocess spawn) and called from both there and the tests.
+///
+/// INVARIANT: an UNPARSEABLE version warns and passes; only a confidently
+/// lower one fails. A future restic that reworks its version line must not
+/// make `backup enable` impossible on a perfectly good binary.
+fn restic_version_gate(stdout: &str) -> Result<()> {
+    match parse_restic_version(stdout) {
         Some(v) if restic_version_too_old(v) => Err(CliError::Other(format!(
             "restic >= {MIN_RESTIC_MAJOR}.{MIN_RESTIC_MINOR} required, found {}.{}.{}",
             v.0, v.1, v.2
@@ -2557,14 +2855,28 @@ fn preflight_repo_reachable(bucket: &str, creds: &BTreeMap<String, String>) -> R
         return Ok(());
     }
 
-    let cat_err = String::from_utf8_lossy(&cat_out.stderr);
-    let init_err = String::from_utf8_lossy(&init_out.stderr);
-    Err(CliError::Other(format!(
+    Err(repo_unreachable_error(
+        bucket,
+        &cat_out.stderr,
+        &init_out.stderr,
+    ))
+}
+
+/// The error raised when neither `restic cat config` nor `restic init` could
+/// reach the repo. Pure — extracted from [`preflight_repo_reachable`] and
+/// called from both there and the tests.
+///
+/// INVARIANT: BOTH stderrs are carried. They usually say different things —
+/// `cat config` reports "repository does not exist", `init` reports the real
+/// obstacle (bad key, no such bucket, permission denied) — and dropping either
+/// leaves the operator guessing which of the two problems they have.
+fn repo_unreachable_error(bucket: &str, cat_stderr: &[u8], init_stderr: &[u8]) -> CliError {
+    CliError::Other(format!(
         "backup repo '{bucket}' unreachable / bad credentials — neither `restic cat config` nor \
          `restic init` succeeded.\n  cat config stderr: {}\n  init stderr: {}",
-        cat_err.trim(),
-        init_err.trim()
-    )))
+        String::from_utf8_lossy(cat_stderr).trim(),
+        String::from_utf8_lossy(init_stderr).trim(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2782,6 +3094,33 @@ pub(crate) fn format_backup_status(
     out
 }
 
+/// Read the `apprafter.io/last-prune` stamp off the PlatformStack.
+///
+/// Pure — extracted from [`run_backup_status`] and called from both there and
+/// the tests. INVARIANT: the JSON pointer escapes the `/` in the annotation
+/// key as `~1`. Written unescaped it silently resolves to nothing, and every
+/// pruned cluster reports "Last prune: never".
+fn last_prune_annotation(ps: Option<&Value>) -> Option<String> {
+    ps.and_then(|p| p.pointer("/metadata/annotations/apprafter.io~1last-prune"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// The Jobs `backup status` reports on: `.items[]` of a Jobs listing, narrowed
+/// to the `apprafter-backup` name prefix.
+///
+/// Pure — extracted from [`run_backup_status`] and called from both there and
+/// the tests. INVARIANT: the prefix filter is applied here, so an unrelated
+/// Job in `apprafter-system` never gets reported as somebody's backup.
+fn backup_jobs_of(jobs_list: Option<&Value>) -> Vec<Value> {
+    jobs_list
+        .map(items_of)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|j| job_metadata_name(j).starts_with("apprafter-backup"))
+        .collect()
+}
+
 /// `apprafter backup status` — show the operator's backup configuration, last
 /// Job outcomes, runner self-reported status, and last prune time.
 pub fn run_backup_status() -> Result<()> {
@@ -2800,30 +3139,11 @@ pub fn run_backup_status() -> Result<()> {
         kc.path(),
     )?;
     let spec_backup = ps.as_ref().and_then(|p| p.pointer("/spec/backup")).cloned();
-    let last_prune: Option<String> = ps
-        .as_ref()
-        .and_then(|p| {
-            p.pointer("/metadata/annotations/apprafter.io~1last-prune")
-                .and_then(serde_json::Value::as_str)
-        })
-        .map(str::to_string);
+    let last_prune = last_prune_annotation(ps.as_ref());
 
     // 2. List Jobs in apprafter-system and filter by name prefix.
     let jobs_list = kubectl_get_json("jobs", None, Some(PLATFORMSTACK_NAMESPACE), kc.path())?;
-    let jobs: Vec<serde_json::Value> = jobs_list
-        .as_ref()
-        .and_then(|v| v.get("items"))
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|j| {
-            j.pointer("/metadata/name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .starts_with("apprafter-backup")
-        })
-        .collect();
+    let jobs = backup_jobs_of(jobs_list.as_ref());
 
     // 3. Fetch the runner status ConfigMap.
     let status_cm = kubectl_get_json(
@@ -4073,6 +4393,1289 @@ mod tests {
         // Empty bucket is treated as unconfigured.
         let empty = json!({ "bucket": "" });
         assert!(repo_from_spec_backup(None, Some(&empty)).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Schedule composition — `resolve_schedule_from` (the pure core of
+    // `resolve_schedule`) and the two describers.
+    // ------------------------------------------------------------------
+
+    /// `EnableOpts` carrying only the schedule surface, for the tests below.
+    fn sched_opts(at: Option<&str>, check: Option<&str>, tz: Option<&str>) -> EnableOpts {
+        EnableOpts {
+            bucket: "s3:https://h/b".into(),
+            credential: "c".into(),
+            at: at.map(str::to_string),
+            check: check.map(str::to_string),
+            timezone: tz.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn one_at_flag_composes_both_crons_and_the_check_is_derived_from_it() {
+        // The operator says WHEN once; the daily cron, the weekly check cron
+        // and its Sunday field all follow from that single answer.
+        let (s, source) = resolve_schedule_from(
+            &sched_opts(Some("22:30"), None, Some("Europe/Berlin")),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.schedule, "30 22 * * *");
+        assert_eq!(s.check_schedule, "30 1 * * 0");
+        assert_eq!(s.time_zone, "Europe/Berlin");
+        assert_eq!(source, ZoneSource::Flag);
+    }
+
+    #[test]
+    fn a_bare_enable_keeps_the_historical_window_and_takes_the_zone_from_tz() {
+        // The upgrade case: no schedule flags at all. The window must not
+        // move, and $TZ must be honoured rather than the operator being asked
+        // for something their shell already answered.
+        let (s, source) =
+            resolve_schedule_from(&sched_opts(None, None, None), Some("Europe/Berlin"), None)
+                .unwrap();
+        assert_eq!(s.schedule, DEFAULT_BACKUP_SCHEDULE);
+        assert_eq!(s.check_schedule, DEFAULT_CHECK_SCHEDULE);
+        assert_eq!(s.time_zone, "Europe/Berlin");
+        assert_eq!(source, ZoneSource::TzEnv);
+    }
+
+    #[test]
+    fn check_off_writes_an_empty_check_schedule_not_a_cron() {
+        // `checkSchedule` is CRD-required, so the empty string is the ONLY way
+        // to say "no weekly check"; the chart omits the CronJob on exactly
+        // that value. Writing any cron here would leave the check running
+        // after the operator turned it off.
+        let (s, _) = resolve_schedule_from(
+            &sched_opts(Some("03:00"), Some("off"), Some("UTC")),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.check_schedule, "");
+        assert_eq!(s.schedule, "0 3 * * *");
+
+        // An explicit check time lands on Sunday.
+        let (s, _) = resolve_schedule_from(
+            &sched_opts(Some("03:00"), Some("07:15"), Some("UTC")),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.check_schedule, "15 7 * * 0");
+    }
+
+    #[test]
+    fn a_bad_check_time_is_reported_against_check_not_against_at() {
+        // Both flags share one parser. Reporting a bad `--check` as a bad
+        // `--at` sends the operator to edit the flag that was correct.
+        let err = resolve_schedule_from(
+            &sched_opts(Some("03:00"), Some("25:00"), Some("UTC")),
+            None,
+            None,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("--check"), "{msg}");
+        assert!(
+            msg.contains("--check off"),
+            "the off sentinel is offered: {msg}"
+        );
+        assert!(
+            !msg.contains("--at"),
+            "must not blame the other flag: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_zone_source_is_named_distinctly_so_the_operator_knows_who_chose() {
+        // "assumed" and "asked for" must not read the same in the output.
+        let all = [
+            ZoneSource::Flag.describe(),
+            ZoneSource::TzEnv.describe(),
+            ZoneSource::OperatingSystem.describe(),
+        ];
+        let mut sorted = all.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            3,
+            "zone sources must be distinguishable: {all:?}"
+        );
+        assert!(all[0].contains("timezone"), "{all:?}");
+        assert!(all[1].contains("TZ"), "{all:?}");
+    }
+
+    #[test]
+    fn describe_schedule_reads_the_crons_back_as_times() {
+        let s = describe_schedule(&ResolvedSchedule {
+            schedule: "30 22 * * *".into(),
+            check_schedule: "30 1 * * 0".into(),
+            time_zone: "UTC".into(),
+        });
+        assert!(s.contains("backup daily at 22:30"), "{s}");
+        assert!(s.contains("check Sundays at 01:30"), "{s}");
+    }
+
+    #[test]
+    fn describe_schedule_says_off_and_shows_a_hand_edited_cron_verbatim() {
+        let off = describe_schedule(&ResolvedSchedule {
+            schedule: "0 3 * * *".into(),
+            check_schedule: String::new(),
+            time_zone: "UTC".into(),
+        });
+        assert!(off.contains("integrity check off"), "{off}");
+
+        // A cron this CLI would not have written is never summarised as a
+        // time it does not mean.
+        let odd = describe_schedule(&ResolvedSchedule {
+            schedule: "*/5 * * * *".into(),
+            check_schedule: "0 6 1 * 0".into(),
+            time_zone: "UTC".into(),
+        });
+        assert!(odd.contains("backup on `*/5 * * * *`"), "{odd}");
+        assert!(odd.contains("check on `0 6 1 * 0`"), "{odd}");
+    }
+
+    #[test]
+    fn describe_cron_weekly_only_summarises_a_sunday_cron() {
+        assert_eq!(
+            describe_cron_weekly("0 6 * * 0", Some("UTC")),
+            "Sundays at 06:00 UTC"
+        );
+        // Any other day field, or an out-of-range time, is shown verbatim
+        // rather than being relabelled "Sundays".
+        assert!(describe_cron_weekly("0 6 * * 3", Some("UTC")).starts_with("0 6 * * 3"));
+        assert!(describe_cron_weekly("0 99 * * 0", Some("UTC")).starts_with("0 99 * * 0"));
+        assert!(describe_cron_weekly("nonsense", None).starts_with("nonsense"));
+    }
+
+    #[test]
+    fn an_over_long_zone_name_is_refused() {
+        // The shape check bounds the length too — `spec.timeZone` is not a
+        // free-text field.
+        assert!(validate_zone_shape(&format!("Europe/{}", "x".repeat(70))).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // `backup enable` — the pure decisions, including the 2.22g read-back
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn enable_refuses_an_unknown_enum_before_anything_is_touched() {
+        // These run before the kubeconfig, the seal and the DR prompt, so a
+        // typo costs nothing.
+        let bad_enforce = EnableOpts {
+            enforce: Some("nobody".into()),
+            ..Default::default()
+        };
+        let msg = format!("{}", validate_enable_enums(&bad_enforce).unwrap_err());
+        assert!(msg.contains("operator") && msg.contains("cluster"), "{msg}");
+
+        let bad_mode = EnableOpts {
+            staging_mode: Some("weird".into()),
+            ..Default::default()
+        };
+        let msg = format!("{}", validate_enable_enums(&bad_mode).unwrap_err());
+        assert!(
+            msg.contains("monolithic") && msg.contains("sequential"),
+            "{msg}"
+        );
+
+        assert!(validate_enable_enums(&EnableOpts::default()).is_ok());
+        assert!(validate_enable_enums(&EnableOpts {
+            enforce: Some("operator".into()),
+            staging_mode: Some("sequential".into()),
+            ..Default::default()
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn the_credential_name_defaults_only_when_the_flag_is_absent() {
+        assert_eq!(
+            effective_credential_name(""),
+            DEFAULT_BACKUP_CREDENTIAL_NAME
+        );
+        assert_eq!(effective_credential_name("my-own-creds"), "my-own-creds");
+    }
+
+    #[test]
+    fn a_credential_secrets_trailing_newline_never_reaches_s3_signing() {
+        // `kubectl create secret --from-file` stores the file verbatim,
+        // newline included. An AWS secret key with a trailing `\n` fails S3
+        // signing with an authentication error that names nothing.
+        let raw: BTreeMap<String, Vec<u8>> = [
+            ("S3_SECRET_ACCESS_KEY", b"sk-value\n".to_vec()),
+            ("S3_ACCESS_KEY_ID", b"ak-value".to_vec()),
+            ("BINARY", vec![0xff, 0xfe]),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let out = secret_bytes_to_strings(raw);
+        assert_eq!(
+            out.get("S3_SECRET_ACCESS_KEY").map(String::as_str),
+            Some("sk-value")
+        );
+        assert_eq!(
+            out.get("S3_ACCESS_KEY_ID").map(String::as_str),
+            Some("ak-value")
+        );
+        // Non-UTF-8 is dropped, not lossily mangled into a plausible-looking
+        // credential that fails to sign.
+        assert!(!out.contains_key("BINARY"), "{out:?}");
+    }
+
+    #[test]
+    fn the_readback_guard_refuses_when_the_cluster_silently_dropped_the_zone() {
+        // THE 2.22g defence. `spec.backup` is fully structural, so an
+        // apiserver whose CRD predates `timeZone` answers HTTP 200 and prunes
+        // the field. Nothing else in the write path can see that: kubectl's
+        // pruning warning goes to stderr, which the merge-patch helper reads
+        // only on failure. A mismatch MUST be an error — half-succeeding
+        // leaves backups genuinely enabled in the wrong zone, with this CLI
+        // reporting the zone it thought it set.
+        let dropped = check_time_zone_readback("Europe/Berlin", None).unwrap_err();
+        let msg = format!("{dropped}");
+        assert!(
+            msg.contains("Europe/Berlin"),
+            "names the zone we asked for: {msg}"
+        );
+        assert!(msg.contains("predates"), "explains the cause: {msg}");
+        assert!(
+            msg.contains("Upgrade the platform"),
+            "says what to do: {msg}"
+        );
+
+        // Stored, but as something else — equally a refusal.
+        assert!(check_time_zone_readback("Europe/Berlin", Some("UTC")).is_err());
+
+        // Stored as asked → proceed.
+        assert!(check_time_zone_readback("Europe/Berlin", Some("Europe/Berlin")).is_ok());
+
+        // No zone was asked for → there is nothing to verify.
+        assert!(check_time_zone_readback("", None).is_ok());
+    }
+
+    #[test]
+    fn the_readback_guard_reads_the_very_field_the_enable_patch_writes() {
+        // The guard is only a guard if its reader and the patch builder agree
+        // on the path. Round-trip the real patch through the real reader:
+        // either one drifting to a different key makes the guard fire on
+        // every healthy cluster (or, worse, never fire at all).
+        let patch = backup_enable_patch(
+            &EnableOpts {
+                bucket: "s3:b".into(),
+                credential: "c".into(),
+                ..Default::default()
+            },
+            &ResolvedSchedule {
+                schedule: "0 3 * * *".into(),
+                check_schedule: "0 6 * * 0".into(),
+                time_zone: "Asia/Tokyo".into(),
+            },
+        );
+        assert_eq!(
+            stored_time_zone(Some(&patch)).as_deref(),
+            Some("Asia/Tokyo")
+        );
+        assert!(
+            check_time_zone_readback("Asia/Tokyo", stored_time_zone(Some(&patch)).as_deref())
+                .is_ok()
+        );
+
+        // A patch built with no zone stores no field.
+        let zoneless = backup_enable_patch(
+            &EnableOpts {
+                bucket: "s3:b".into(),
+                credential: "c".into(),
+                ..Default::default()
+            },
+            &ResolvedSchedule {
+                schedule: "0 3 * * *".into(),
+                check_schedule: String::new(),
+                time_zone: String::new(),
+            },
+        );
+        assert_eq!(stored_time_zone(Some(&zoneless)), None);
+        assert_eq!(stored_time_zone(None), None);
+    }
+
+    #[test]
+    fn enable_patch_carries_every_retention_key_that_was_set() {
+        let p = backup_enable_patch(
+            &EnableOpts {
+                bucket: "s3:x".into(),
+                credential: "c".into(),
+                keep_daily: Some(1),
+                keep_weekly: Some(2),
+                keep_monthly: Some(3),
+                enforce: Some("operator".into()),
+                ..Default::default()
+            },
+            &ResolvedSchedule {
+                schedule: "0 3 * * *".into(),
+                check_schedule: "0 6 * * 0".into(),
+                time_zone: "UTC".into(),
+            },
+        );
+        let ret = &p["spec"]["backup"]["retention"];
+        assert_eq!(ret["keepDaily"], json!(1));
+        assert_eq!(ret["keepWeekly"], json!(2));
+        assert_eq!(ret["keepMonthly"], json!(3));
+        assert_eq!(ret["enforce"], json!("operator"));
+    }
+
+    #[test]
+    fn the_enable_success_line_states_the_repo_the_credential_and_the_gitops_caveat() {
+        let report = enable_success_report(
+            "s3:https://nbg1.example/bucket",
+            "apprafter-backup-s3",
+            &ResolvedSchedule {
+                schedule: "0 3 * * *".into(),
+                check_schedule: "0 6 * * 0".into(),
+                time_zone: "Europe/Berlin".into(),
+            },
+        );
+        assert!(
+            report.contains("s3:https://nbg1.example/bucket"),
+            "{report}"
+        );
+        assert!(report.contains("apprafter-backup-s3"), "{report}");
+        assert!(report.contains("backup daily at 03:00"), "{report}");
+        assert!(report.contains("Europe/Berlin"), "{report}");
+        // A live merge-patch is not durable if the field is git-managed —
+        // omitting this is how somebody's backup config silently reverts on
+        // the next Argo sync.
+        assert!(report.contains("Argo CD"), "{report}");
+    }
+
+    // ------------------------------------------------------------------
+    // `backup list` — snapshot table rendering
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_snapshot_table_truncates_a_full_id_when_restic_omits_short_id() {
+        let full = "0123456789abcdef0123456789abcdef";
+        let table = format_snapshot_table(
+            "s3:https://h/b",
+            &[json!({"id": full, "time": "2026-08-01T03:00:00Z", "tags": ["a", "b"]})],
+        );
+        assert!(table.contains("01234567"), "{table}");
+        assert!(
+            !table.contains(full),
+            "a 32-hex id in a 12-wide column wrecks the table: {table}"
+        );
+        assert!(table.contains("a, b"), "tags are joined: {table}");
+        assert!(table.contains("2026-08-01T03:00:00Z"), "{table}");
+    }
+
+    #[test]
+    fn the_snapshot_table_prefers_short_id_and_tolerates_a_bare_snapshot() {
+        let table = format_snapshot_table(
+            "s3:x",
+            &[
+                json!({"short_id": "deadbeef", "id": "ffffffffffff"}),
+                json!({}),
+            ],
+        );
+        assert!(table.contains("deadbeef"), "{table}");
+        assert!(!table.contains("ffffffff"), "short_id wins: {table}");
+        // A snapshot with neither id nor time still renders a row rather than
+        // aborting the listing.
+        assert!(table.contains('?'), "{table}");
+    }
+
+    #[test]
+    fn an_empty_repo_says_so_instead_of_printing_an_empty_table() {
+        let table = format_snapshot_table("s3:https://h/b", &[]);
+        assert!(table.contains("No snapshots in s3:https://h/b"), "{table}");
+        assert!(
+            !table.contains("TAGS"),
+            "a header with no rows reads as a broken listing: {table}"
+        );
+    }
+
+    #[test]
+    fn snapshot_json_that_is_not_a_list_is_an_empty_list_but_garbage_is_an_error() {
+        assert_eq!(parse_snapshots_json("[]").unwrap().len(), 0);
+        assert_eq!(
+            parse_snapshots_json(r#"[{"short_id":"a"},{"short_id":"b"}]"#)
+                .unwrap()
+                .len(),
+            2
+        );
+        // restic printing an object rather than an array is "nothing to show",
+        // not a crash.
+        assert_eq!(parse_snapshots_json("{}").unwrap().len(), 0);
+        // But output that is not JSON at all means restic did something we do
+        // not understand, and must not be reported as an empty repo.
+        let err = parse_snapshots_json("Fatal: unable to open repo").unwrap_err();
+        assert!(format!("{err}").contains("parse restic snapshots JSON"));
+    }
+
+    // ------------------------------------------------------------------
+    // `backup prune` / `backup status` — the last-prune stamp round-trip
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_last_prune_stamp_is_written_under_the_key_status_reads_back() {
+        // prune WRITES `apprafter.io/last-prune`; status READS it through the
+        // escaped pointer `apprafter.io~1last-prune`. If those two spellings
+        // drift, every pruned cluster reports "Last prune: never" and nothing
+        // anywhere errors.
+        let body = last_prune_patch_body("2026-08-01T04:00:00Z");
+        let doc: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            last_prune_annotation(Some(&doc)).as_deref(),
+            Some("2026-08-01T04:00:00Z")
+        );
+        assert_eq!(last_prune_annotation(None), None);
+        assert_eq!(last_prune_annotation(Some(&json!({"metadata": {}}))), None);
+    }
+
+    #[test]
+    fn the_prune_summary_states_the_policy_that_was_applied() {
+        let s = prune_summary(
+            "s3:https://h/b",
+            &RetentionPolicy {
+                keep_daily: 1,
+                keep_weekly: 2,
+                keep_monthly: 3,
+            },
+        );
+        assert!(s.contains("s3:https://h/b"), "{s}");
+        assert!(
+            s.contains("keepDaily=1 keepWeekly=2 keepMonthly=3"),
+            "each number must sit against its own label: {s}"
+        );
+    }
+
+    #[test]
+    fn status_reports_only_apprafter_backup_jobs() {
+        let list = json!({"items": [
+            {"metadata": {"name": "apprafter-backup-1"}},
+            {"metadata": {"name": "apprafter-backup-check-1"}},
+            {"metadata": {"name": "some-other-job"}},
+        ]});
+        let jobs = backup_jobs_of(Some(&list));
+        let names: Vec<&str> = jobs.iter().map(job_metadata_name).collect();
+        assert_eq!(
+            names,
+            vec!["apprafter-backup-1", "apprafter-backup-check-1"]
+        );
+        // No Jobs listing at all (or no items) is "none", not a failure.
+        assert!(backup_jobs_of(None).is_empty());
+        assert!(backup_jobs_of(Some(&json!({}))).is_empty());
+    }
+
+    #[test]
+    fn a_job_that_has_started_but_not_finished_is_neither_succeeded_nor_failed() {
+        let spec = json!({"enabled": true, "bucket": "s3:x"});
+        let running = json!({
+            "metadata": {"name": "apprafter-backup-running"},
+            "status": {"active": 1}
+        });
+        let s = format_backup_status(Some(&spec), std::slice::from_ref(&running), None, None);
+        assert!(s.contains("Running"), "{s}");
+
+        // A Job with no counters at all must not be reported as a success.
+        let bare = json!({"metadata": {"name": "apprafter-backup-bare"}, "status": {}});
+        let s = format_backup_status(Some(&spec), std::slice::from_ref(&bare), None, None);
+        assert!(s.contains("Unknown"), "{s}");
+        assert!(!s.contains("Succeeded"), "{s}");
+    }
+
+    // ------------------------------------------------------------------
+    // `export` / `backup` — manifest, opts and the summary lines
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn resource_refs_keeps_the_kind_of_each_source_and_the_claim_type() {
+        let ps = json!({"metadata": {"name": "default", "namespace": "apprafter-system"}});
+        let claim = json!({
+            "metadata": {"name": "shop-pg", "namespace": "prod"},
+            "spec": {"type": "pg"}
+        });
+        let refs = resource_refs(&[("PlatformStack", &ps)], std::slice::from_ref(&claim));
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].kind, "PlatformStack");
+        assert_eq!(refs[0].name, "default");
+        assert_eq!(refs[0].namespace, "apprafter-system");
+        // A config CR has no claim type — a restore keys its data-load path
+        // off this field, so a spurious one would send it looking for a dump.
+        assert_eq!(refs[0].claim_type, None);
+        assert_eq!(refs[1].kind, "ResourceClaim");
+        assert_eq!(refs[1].name, "shop-pg");
+        assert_eq!(refs[1].claim_type.as_deref(), Some("pg"));
+
+        // Missing metadata degrades to empty strings rather than panicking
+        // mid-backup.
+        let bare = resource_refs(&[], &[json!({})]);
+        assert_eq!(bare[0].name, "");
+        assert_eq!(bare[0].namespace, "");
+        assert_eq!(bare[0].claim_type, None);
+    }
+
+    #[test]
+    fn the_export_manifest_records_claims_and_no_config_crs() {
+        // `export` is Kind 1: native data only. A config CR listed here would
+        // advertise replayable cluster config the export never captured.
+        let claims = vec![json!({
+            "metadata": {"name": "shop-pg", "namespace": "prod"},
+            "spec": {"type": "pg"}
+        })];
+        let m = export_manifest("prod-cluster", "0.2.58", &["prod".to_string()], &claims);
+        assert_eq!(m.cluster_id, "prod-cluster");
+        assert_eq!(m.platform_version, "0.2.58");
+        assert_eq!(m.namespaces, vec!["prod".to_string()]);
+        assert_eq!(
+            m.manifest_version,
+            backup_core::manifest::MANIFEST_VERSION_CURRENT
+        );
+        assert_eq!(m.resources.len(), 1);
+        assert!(
+            m.resources.iter().all(|r| r.kind == "ResourceClaim"),
+            "export must not claim to carry config CRs: {:?}",
+            m.resources
+        );
+    }
+
+    #[test]
+    fn the_manifest_written_to_disk_reads_back_as_the_manifest() {
+        // `restore` parses this file. A serialisation that writes fields the
+        // reader cannot find turns every backup into an unrestorable one, and
+        // nothing before restore-time would notice.
+        let dir = tempfile::tempdir().unwrap();
+        let m = export_manifest(
+            "c1",
+            "0.2.58",
+            &["prod".to_string(), "demo".to_string()],
+            &[json!({"metadata": {"name": "r", "namespace": "prod"}, "spec": {"type": "redis"}})],
+        );
+        write_manifest(&m, dir.path()).unwrap();
+
+        let raw = std::fs::read(dir.path().join("manifest.json")).expect("manifest.json written");
+        let back: BackupManifest = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(back.cluster_id, "c1");
+        assert_eq!(back.platform_version, "0.2.58");
+        assert_eq!(
+            back.namespaces,
+            vec!["prod".to_string(), "demo".to_string()]
+        );
+        assert_eq!(back.resources.len(), 1);
+        assert_eq!(back.resources[0].claim_type.as_deref(), Some("redis"));
+        assert_eq!(back.manifest_version, m.manifest_version);
+    }
+
+    #[test]
+    fn the_export_directory_defaults_beside_the_operator_not_inside_the_repo() {
+        assert_eq!(
+            export_out_dir(Some("/srv/dump")),
+            PathBuf::from("/srv/dump")
+        );
+        let default = export_out_dir(None);
+        assert_eq!(
+            default.file_name().and_then(|s| s.to_str()),
+            Some("apprafter-export")
+        );
+        assert!(default.is_absolute(), "{default:?}");
+    }
+
+    #[test]
+    fn the_export_summary_counts_namespaces_claims_and_extractables_separately() {
+        let s = export_summary(
+            "prod-cluster",
+            Path::new("/srv/dump"),
+            &["demo".to_string(), "prod".to_string()],
+            5,
+            2,
+        );
+        assert!(s.contains("2 namespace(s)"), "{s}");
+        assert!(s.contains("demo, prod"), "{s}");
+        assert!(s.contains("/srv/dump"), "{s}");
+        // "5 claims, 2 of them extractable" — swapping these tells the
+        // operator more data was captured than was.
+        assert!(s.contains("5 (2 extractable)"), "{s}");
+    }
+
+    #[test]
+    fn the_local_pull_keeps_the_operator_stations_hostname_as_the_restic_group() {
+        // spec §Retention M-r3-1a: only the in-cluster runner pins a fixed
+        // host (its pod name is ephemeral). Pinning it here would merge every
+        // operator's snapshots into one retention group.
+        let opts = local_pull_backup_opts(
+            "s3:https://h/b",
+            "pw".into(),
+            "prod-cluster",
+            "0.2.58",
+            &["prod".to_string()],
+            true,
+            Path::new("/staging"),
+            "postgres:18-alpine".into(),
+            StagingMode::Sequential,
+        );
+        assert_eq!(opts.backup_host, None);
+        assert!(opts.is_subset, "--select must reach the tag decoration");
+        assert_eq!(opts.repo, "s3:https://h/b");
+        assert_eq!(opts.cluster_id, "prod-cluster");
+        assert_eq!(opts.platform_version, "0.2.58");
+        assert_eq!(opts.namespaces, vec!["prod".to_string()]);
+        assert_eq!(opts.staging_root, PathBuf::from("/staging"));
+        assert_eq!(opts.pg_image, "postgres:18-alpine");
+        assert!(matches!(opts.staging_mode, StagingMode::Sequential));
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&opts.created_at).is_ok(),
+            "created_at must be RFC3339 — it is the manifest timestamp and the \
+             restic tag: {}",
+            opts.created_at
+        );
+    }
+
+    #[test]
+    fn the_backup_summary_omits_the_snapshot_line_when_restic_reported_none() {
+        let mut summary = backup_core::engine::BackupSummary {
+            snapshot_id: None,
+            cr_count: 3,
+            secret_count: 4,
+            claim_count: 5,
+            extracted_count: 2,
+            tag: "apprafter/prod-cluster/2026-08-01".into(),
+        };
+        let none = backup_summary_report(
+            "prod-cluster",
+            "s3:https://h/b",
+            &["prod".to_string()],
+            &summary,
+        );
+        assert!(
+            none.contains("3 CR(s), 4 secret(s), 5 claim(s) (2 extracted)"),
+            "{none}"
+        );
+        assert!(none.contains("apprafter/prod-cluster/2026-08-01"), "{none}");
+        assert!(
+            !none.contains("snapshot:"),
+            "an empty snapshot id reads as a stored snapshot that does not exist: {none}"
+        );
+
+        summary.snapshot_id = Some("abc123".into());
+        let some = backup_summary_report(
+            "prod-cluster",
+            "s3:https://h/b",
+            &["prod".to_string()],
+            &summary,
+        );
+        assert!(some.contains("snapshot:   abc123"), "{some}");
+    }
+
+    #[test]
+    fn nothing_to_back_up_names_the_action_and_where_the_scope_came_from() {
+        // The scope is the app-namespace set, NOT `kubectl get ns`. An
+        // operator looking at a cluster full of namespaces has to be told
+        // that is deliberate.
+        let export = format!("{}", no_applications_error("export"));
+        assert!(export.contains("nothing to export"), "{export}");
+        let backup = format!("{}", no_applications_error("back up"));
+        assert!(backup.contains("nothing to back up"), "{backup}");
+        for msg in [&export, &backup] {
+            assert!(msg.contains("applications.apprafter.io -A"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn the_default_backup_repo_is_per_target() {
+        assert_eq!(
+            backup_repo_path(Some("/srv/repo"), "ignored").unwrap(),
+            PathBuf::from("/srv/repo")
+        );
+        let alpha = backup_repo_path(None, "alpha").unwrap();
+        let beta = backup_repo_path(None, "beta").unwrap();
+        assert_eq!(alpha.file_name().and_then(|s| s.to_str()), Some("alpha"));
+        assert_eq!(
+            alpha
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|s| s.to_str()),
+            Some("backups")
+        );
+        // Two targets sharing one repo would interleave their snapshots and
+        // each other's retention.
+        assert_ne!(alpha, beta);
+    }
+
+    // ------------------------------------------------------------------
+    // Small pure readers used by the impure fetchers
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_platform_version_falls_back_to_the_literal_unknown() {
+        assert_eq!(
+            platform_version_of(Some(&json!({"status": {"currentVersion": "0.2.58"}}))),
+            "0.2.58"
+        );
+        // A freshly bootstrapped cluster has no stamped status yet.
+        // `restore --reprovision` treats "unknown" as "no version to pin";
+        // an empty string would be passed on AS a version.
+        assert_eq!(platform_version_of(Some(&json!({}))), "unknown");
+        assert_eq!(platform_version_of(None), "unknown");
+    }
+
+    #[test]
+    fn only_a_missing_kind_is_swallowed_into_an_empty_listing() {
+        // `infrastructures` legitimately has no instances at M2, so that one
+        // error becomes an empty list. Widening this would turn a connection
+        // failure mid-backup into a silently empty, restorable-LOOKING backup.
+        assert!(is_missing_resource_kind(&CliError::Other(
+            "error: the server doesn't have a resource type \"infrastructures\"".into()
+        )));
+        assert!(!is_missing_resource_kind(&CliError::Other(
+            "The connection to the server 10.0.0.1:6443 was refused".into()
+        )));
+        assert!(!is_missing_resource_kind(&CliError::Other(
+            "Error from server (Forbidden): applications.apprafter.io is forbidden".into()
+        )));
+    }
+
+    #[test]
+    fn items_of_reads_the_list_body_and_tolerates_its_absence() {
+        assert_eq!(items_of(&json!({"items": [1, 2, 3]})).len(), 3);
+        assert!(items_of(&json!({"items": null})).is_empty());
+        assert!(items_of(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn the_cnpg_scan_always_includes_cnpg_system_exactly_once() {
+        // The shared integrated `platform-postgres` Cluster lives ONLY in
+        // cnpg-system. An app-ns-only scan structurally misses it, falls back
+        // to the default pg major, and every integrated-tier dump dies with
+        // `pg_dump: server version mismatch`.
+        assert_eq!(
+            cnpg_scan_namespaces(&["demo".to_string(), "prod".to_string()]),
+            vec!["demo", "prod", "cnpg-system"]
+        );
+        assert_eq!(cnpg_scan_namespaces(&[]), vec!["cnpg-system"]);
+        // Already an app namespace → not scanned twice.
+        assert_eq!(
+            cnpg_scan_namespaces(&["cnpg-system".to_string()]),
+            vec!["cnpg-system"]
+        );
+    }
+
+    #[test]
+    fn a_secret_document_decodes_every_key_and_defaults_its_type() {
+        let json = json!({
+            "type": "kubernetes.io/tls",
+            "data": {"tls.crt": "aGVsbG8=", "tls.key": "d29ybGQ="}
+        });
+        let (data, kind) = decode_secret_json(&json, "s", "ns").unwrap();
+        assert_eq!(kind, "kubernetes.io/tls");
+        assert_eq!(data.get("tls.crt").map(Vec::as_slice), Some(&b"hello"[..]));
+        assert_eq!(data.get("tls.key").map(Vec::as_slice), Some(&b"world"[..]));
+
+        // A Secret with no explicit type is Opaque — the value the sealing
+        // path round-trips.
+        let (data, kind) = decode_secret_json(&json!({"data": {}}), "s", "ns").unwrap();
+        assert_eq!(kind, "Opaque");
+        assert!(data.is_empty());
+
+        // Undecodable material must be an error, not a silently empty value:
+        // an empty credential fails far away, against a bucket.
+        let err =
+            decode_secret_json(&json!({"data": {"k": "!!not base64!!"}}), "s", "ns").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("ns/s"), "names the secret: {msg}");
+        assert!(msg.contains('k'), "names the key: {msg}");
+    }
+
+    #[test]
+    fn an_empty_passphrase_is_refused_as_loudly_as_a_missing_one() {
+        // The repository holds DECRYPTED secrets. An empty passphrase is not
+        // "no encryption configured", it is a repo anyone can open.
+        let msg = format!(
+            "{}",
+            backup_passphrase_or_error(Some(""), None, false).unwrap_err()
+        );
+        assert!(msg.contains("empty backup passphrase"), "{msg}");
+        assert!(
+            format!(
+                "{}",
+                backup_passphrase_or_error(None, Some(""), false).unwrap_err()
+            )
+            .contains("empty"),
+            "an empty RESTIC_PASSWORD is just as unencrypted"
+        );
+        // Non-interactive with nothing set names both non-interactive inputs.
+        let msg = format!(
+            "{}",
+            backup_passphrase_or_error(None, None, false).unwrap_err()
+        );
+        assert!(
+            msg.contains("--passphrase") && msg.contains("RESTIC_PASSWORD"),
+            "{msg}"
+        );
+        // The flag beats the environment.
+        assert_eq!(
+            backup_passphrase_or_error(Some("flag"), Some("env"), false).unwrap(),
+            "flag"
+        );
+    }
+
+    #[test]
+    fn a_fully_specified_maintenance_verb_never_reaches_for_a_kubeconfig() {
+        // The DR case: the cluster is SUPPOSED to be gone. Asking for a
+        // kubeconfig here is what made `backup check` unusable after
+        // `apprafter destroy` (v0.2.48). `Ok(None)` is the proof it did not
+        // even try — resolving one would fail in this test environment.
+        assert!(
+            kubeconfig_if_cluster_needed("check", Some("s3:x"), RetentionArgs::NotApplicable)
+                .unwrap()
+                .is_none()
+        );
+        assert!(kubeconfig_if_cluster_needed(
+            "prune",
+            Some("s3:x"),
+            prune_keeps(Some(7), Some(4), Some(6))
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // restic invocation: creds on the child, failure text, snapshot id
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_restic_child_gets_aws_names_and_the_explicit_passphrase_wins() {
+        let creds: BTreeMap<String, String> = [
+            ("S3_ACCESS_KEY_ID", "AKID"),
+            ("S3_SECRET_ACCESS_KEY", "SKEY"),
+            ("S3_REGION", "eu-central-1"),
+            ("RESTIC_PASSWORD", "from-creds"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let r = CredentialedRestic { creds };
+        let cmd = r.command(&["check".to_string(), "-r".to_string()], "from-argument");
+
+        let env: BTreeMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            env.get("AWS_ACCESS_KEY_ID").map(String::as_str),
+            Some("AKID")
+        );
+        assert_eq!(
+            env.get("AWS_SECRET_ACCESS_KEY").map(String::as_str),
+            Some("SKEY")
+        );
+        assert_eq!(
+            env.get("AWS_DEFAULT_REGION").map(String::as_str),
+            Some("eu-central-1")
+        );
+        // The trait contract passes the passphrase explicitly; it must be
+        // applied AFTER the credential map, so the caller's value is the one
+        // restic sees.
+        assert_eq!(
+            env.get("RESTIC_PASSWORD").map(String::as_str),
+            Some("from-argument")
+        );
+        assert_eq!(cmd.get_program(), "restic");
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(argv, vec!["check".to_string(), "-r".to_string()]);
+    }
+
+    #[test]
+    fn a_failed_restic_run_names_the_subcommand_and_carries_its_stderr() {
+        // restic's stderr is the ONLY place the actual cause is named, and an
+        // operator doing disaster recovery has nothing else to go on.
+        let e = restic_failure_error(
+            &["check".to_string(), "-r".to_string(), "s3:x".to_string()],
+            Some(1),
+            b"Fatal: wrong password or no key found",
+        );
+        let msg = format!("{e}");
+        assert!(msg.contains("restic check"), "{msg}");
+        assert!(msg.contains("wrong password or no key found"), "{msg}");
+        assert!(msg.contains('1'), "the exit code is stated: {msg}");
+        // An empty argv must not panic on the way to reporting a failure.
+        assert!(format!("{}", restic_failure_error(&[], None, b"")).contains("restic ?"));
+    }
+
+    #[test]
+    fn the_snapshot_id_comes_from_the_summary_line_and_nowhere_else() {
+        // restic streams `status` lines during a backup. Taking the first id
+        // in the stream reports a snapshot that is not the one just written.
+        let stream = concat!(
+            r#"{"message_type":"status","percent_done":0.5,"snapshot_id":"WRONG"}"#,
+            "\n",
+            "not json at all\n",
+            r#"{"message_type":"summary","snapshot_id":"RIGHT"}"#,
+            "\n"
+        );
+        assert_eq!(
+            snapshot_id_from_backup_json(stream).as_deref(),
+            Some("RIGHT")
+        );
+        // No summary line (restic died mid-run) → no snapshot to report.
+        assert_eq!(
+            snapshot_id_from_backup_json(r#"{"message_type":"status"}"#),
+            None
+        );
+        assert_eq!(snapshot_id_from_backup_json(""), None);
+    }
+
+    #[test]
+    fn the_restic_version_gate_fails_low_but_passes_an_unreadable_version() {
+        let err = format!("{}", restic_version_gate("restic 0.13.0").unwrap_err());
+        assert!(err.contains("0.14"), "names the requirement: {err}");
+        assert!(err.contains("0.13.0"), "names what was found: {err}");
+        assert!(restic_version_gate("restic 0.16.4 compiled with go1.21.6").is_ok());
+        // A future restic that reworks its version line must not make
+        // `backup enable` impossible on a perfectly good binary.
+        assert!(restic_version_gate("restic (nightly build)").is_ok());
+    }
+
+    #[test]
+    fn an_unreachable_repo_reports_both_restic_attempts() {
+        // `cat config` says "repository does not exist"; `init` says the real
+        // obstacle. Dropping either leaves the operator guessing which of the
+        // two problems they have.
+        let e = repo_unreachable_error(
+            "s3:https://h/b",
+            b"Fatal: repository does not exist\n",
+            b"Fatal: Access Denied\n",
+        );
+        let msg = format!("{e}");
+        assert!(msg.contains("s3:https://h/b"), "{msg}");
+        assert!(msg.contains("repository does not exist"), "{msg}");
+        assert!(msg.contains("Access Denied"), "{msg}");
+    }
+
+    // ------------------------------------------------------------------
+    // KubectlExec — driven against a stub binary so the subprocess layer
+    // (streams, exit statuses, stderr capture) is actually exercised.
+    // ------------------------------------------------------------------
+
+    /// Write an executable `/bin/sh` stub and hand back a [`KubectlExec`]
+    /// pointed at it. The `TempDir` must outlive the returned exec.
+    ///
+    /// The `__probe` prologue plus the retry loop exist only to drain the
+    /// `ETXTBSY` window: a sibling test thread that forks while this file is
+    /// still open for writing leaves the new process holding a write handle to
+    /// it, and `execve` refuses until that handle is gone. Once a probe
+    /// succeeds nothing writes this inode again, so every later spawn is safe.
+    fn stub_kubectl(dir: &tempfile::TempDir, body: &str) -> KubectlExec {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.path().join("kubectl-stub");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\ncase \"$1\" in __probe) exit 0;; esac\n{body}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for _ in 0..200 {
+            match Command::new(&path).arg("__probe").status() {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                _ => break,
+            }
+        }
+        KubectlExec {
+            kubeconfig: dir.path().join("kubeconfig.yaml"),
+            kubectl_bin: path,
+        }
+    }
+
+    #[test]
+    fn exec_stream_to_file_writes_the_pods_stdout_to_the_target_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv");
+        let k = stub_kubectl(
+            &dir,
+            &format!(
+                "echo \"$@\" > {log}\necho \"KUBECONFIG=$KUBECONFIG\" >> {log}\nprintf 'DUMPBYTES'",
+                log = log.display()
+            ),
+        );
+        let out = dir.path().join("dump.sql");
+        k.exec_stream_to_file("pg-0", "prod", &["pg_dump", "-Fc"], &out)
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "DUMPBYTES");
+        let argv = std::fs::read_to_string(&log).unwrap();
+        // `--` separates kubectl's own flags from the in-pod command; without
+        // it kubectl parses `-Fc` as its own.
+        assert!(argv.contains("exec pg-0 -n prod -- pg_dump -Fc"), "{argv}");
+        assert!(
+            argv.contains(&format!("KUBECONFIG={}", k.kubeconfig.display())),
+            "the child must target the caller's cluster: {argv}"
+        );
+    }
+
+    #[test]
+    fn a_failed_exec_surfaces_the_last_stderr_lines_and_never_the_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = stub_kubectl(&dir, "echo 'pg_dump: server version mismatch' >&2\nexit 7");
+        let err = k
+            .exec_stream_to_file("pg-0", "prod", &["pg_dump"], &dir.path().join("out"))
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("exec_stream_to_file"), "{msg}");
+        assert!(msg.contains('7'), "the exit status is stated: {msg}");
+        assert!(
+            msg.contains("pg_dump: server version mismatch"),
+            "the pod's own error is the only useful part: {msg}"
+        );
+    }
+
+    #[test]
+    fn exec_stream_from_file_feeds_the_file_on_the_childs_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = dir.path().join("received");
+        let log = dir.path().join("argv");
+        let k = stub_kubectl(
+            &dir,
+            &format!(
+                "echo \"$@\" > {log}\ncat > {sink}",
+                log = log.display(),
+                sink = sink.display()
+            ),
+        );
+        let input = dir.path().join("restore.sql");
+        std::fs::write(&input, "RESTORE PAYLOAD").unwrap();
+        k.exec_stream_from_file("pg-0", "prod", &["psql"], &input)
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&sink).unwrap(), "RESTORE PAYLOAD");
+        // `-i` is what keeps stdin attached; without it the payload is
+        // written into a closed pipe and the load silently restores nothing.
+        let argv = std::fs::read_to_string(&log).unwrap();
+        assert!(argv.contains("exec -i pg-0 -n prod -- psql"), "{argv}");
+    }
+
+    #[test]
+    fn a_consumer_that_stops_reading_early_is_not_a_restore_failure() {
+        // `psql` legitimately exits 0 on a `\q` before EOF. The resulting
+        // EPIPE on our side is not an error — reporting one would fail a
+        // restore that actually succeeded.
+        let dir = tempfile::tempdir().unwrap();
+        let k = stub_kubectl(&dir, "head -c 1 >/dev/null\nexit 0");
+        let input = dir.path().join("big.sql");
+        std::fs::write(&input, "x".repeat(4 * 1024 * 1024)).unwrap();
+        k.exec_stream_from_file("pg-0", "prod", &["psql"], &input)
+            .expect("an early-closing consumer that exits 0 is a success");
+    }
+
+    #[test]
+    fn apply_and_wait_pod_ready_pipes_the_spec_in_and_then_waits_for_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv");
+        let seen = dir.path().join("spec.json");
+        let k = stub_kubectl(
+            &dir,
+            &format!(
+                "echo \"$@\" >> {log}\nif [ \"$1\" = apply ]; then cat > {seen}; fi\nexit 0",
+                log = log.display(),
+                seen = seen.display()
+            ),
+        );
+        let spec = json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "helper", "namespace": "prod"},
+            "spec": {"containers": [{"name": "c", "image": "postgres:18-alpine"}]}
+        });
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+
+        // The spec really reached kubectl's stdin, unmodified.
+        let piped: Value = serde_json::from_slice(&std::fs::read(&seen).unwrap()).unwrap();
+        assert_eq!(piped, spec);
+
+        let argv = std::fs::read_to_string(&log).unwrap();
+        assert!(argv.contains("apply -f - -n prod"), "{argv}");
+        // Readiness, not existence: a Pod that exists but is not Ready cannot
+        // be exec'd into, which is the only reason this helper is created.
+        assert!(
+            argv.contains("wait --for=condition=Ready pod/helper -n prod --timeout=300s"),
+            "{argv}"
+        );
+    }
+
+    #[test]
+    fn a_pod_spec_without_an_identity_is_refused_before_kubectl_is_spawned() {
+        let dir = tempfile::tempdir().unwrap();
+        // The stub always succeeds — so if these checks were dropped, the
+        // calls below would wrongly return Ok.
+        let k = stub_kubectl(&dir, "exit 0");
+        let no_name = k
+            .apply_and_wait_pod_ready(&json!({"metadata": {"namespace": "prod"}}))
+            .unwrap_err();
+        assert!(format!("{no_name}").contains("metadata.name"), "{no_name}");
+        let no_ns = k
+            .apply_and_wait_pod_ready(&json!({"metadata": {"name": "helper"}}))
+            .unwrap_err();
+        assert!(format!("{no_ns}").contains("metadata.namespace"), "{no_ns}");
+    }
+
+    #[test]
+    fn a_pod_that_never_becomes_ready_is_reported_as_a_timeout_not_an_apply_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = json!({"metadata": {"name": "helper", "namespace": "prod"}});
+
+        // apply succeeds, wait fails → the message must be about readiness.
+        let waits = stub_kubectl(&dir, "if [ \"$1\" = wait ]; then exit 1; fi\nexit 0");
+        let err = waits.apply_and_wait_pod_ready(&spec).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("did not reach Ready within 300s"), "{msg}");
+        assert!(msg.contains("helper") && msg.contains("prod"), "{msg}");
+
+        // apply itself fails → the apiserver's own complaint is carried.
+        let dir2 = tempfile::tempdir().unwrap();
+        let applies = stub_kubectl(
+            &dir2,
+            "cat >/dev/null\necho 'error: forbidden: pods is forbidden' >&2\nexit 1",
+        );
+        let err = applies.apply_and_wait_pod_ready(&spec).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("apply_and_wait_pod_ready(apply)"), "{msg}");
+        assert!(msg.contains("pods is forbidden"), "{msg}");
+    }
+
+    #[test]
+    fn get_secret_key_base64_decodes_the_jsonpath_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv");
+        // `echo` appends a newline, exactly as a shell pipeline would; the
+        // decoder must trim it or base64 rejects the whole value.
+        let k = stub_kubectl(
+            &dir,
+            &format!(
+                "echo \"$@\" > {log}\necho aGVsbG8gd29ybGQ=",
+                log = log.display()
+            ),
+        );
+        assert_eq!(
+            k.get_secret_key("pg-app", "prod", "password").unwrap(),
+            "hello world"
+        );
+        let argv = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            argv.contains("get secret pg-app -n prod -o jsonpath={.data.password}"),
+            "{argv}"
+        );
+    }
+
+    #[test]
+    fn get_secret_key_reports_a_non_base64_value_rather_than_returning_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = stub_kubectl(&dir, "echo 'this is not base64!!'");
+        let msg = format!("{}", k.get_secret_key("s", "ns", "k").unwrap_err());
+        assert!(msg.contains("not valid base64"), "{msg}");
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let failing = stub_kubectl(&dir2, "echo 'Error from server (NotFound)' >&2\nexit 1");
+        let msg = format!("{}", failing.get_secret_key("s", "ns", "k").unwrap_err());
+        assert!(msg.contains("kubectl get secret s -n ns"), "{msg}");
+        assert!(msg.contains("NotFound"), "carries kubectl's stderr: {msg}");
+    }
+
+    #[test]
+    fn get_json_treats_notfound_as_absence_and_everything_else_as_failure() {
+        // The distinction the whole backup sweep rests on: a Secret that does
+        // not exist is a skipped item; an unreachable apiserver is a failed
+        // backup. Collapsing them yields a backup missing whatever the
+        // network dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = stub_kubectl(
+            &dir,
+            "echo 'Error from server (NotFound): secrets \"x\" not found' >&2\nexit 1",
+        );
+        assert_eq!(missing.get_json(&["get", "secret", "x"]).unwrap(), None);
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let unreachable = stub_kubectl(
+            &dir2,
+            "echo 'The connection to the server was refused' >&2\nexit 1",
+        );
+        let msg = format!(
+            "{}",
+            unreachable.get_json(&["get", "secret", "x"]).unwrap_err()
+        );
+        assert!(
+            msg.contains("connection to the server was refused"),
+            "{msg}"
+        );
+
+        let dir3 = tempfile::tempdir().unwrap();
+        let ok = stub_kubectl(&dir3, r#"echo '{"items":[{"a":1}]}'"#);
+        assert_eq!(
+            ok.get_json(&["get", "pods"]).unwrap(),
+            Some(json!({"items": [{"a": 1}]}))
+        );
+
+        let dir4 = tempfile::tempdir().unwrap();
+        let garbage = stub_kubectl(&dir4, "echo 'not json'");
+        let msg = format!("{}", garbage.get_json(&["get", "pods"]).unwrap_err());
+        assert!(msg.contains("kubectl JSON parse"), "{msg}");
+    }
+
+    #[test]
+    fn deleting_a_helper_pod_does_not_wait_and_does_not_fail_the_run() {
+        // This runs in the cleanup path of a backup that already produced its
+        // data. Blocking on termination would add a minute per claim; failing
+        // would discard a good backup over a leftover Pod.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv");
+        let k = stub_kubectl(
+            &dir,
+            &format!("echo \"$@\" > {log}\nexit 3", log = log.display()),
+        );
+        k.delete_pod_best_effort("helper", "prod");
+        let argv = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            argv.contains("delete pod helper -n prod --ignore-not-found --wait=false"),
+            "{argv}"
+        );
+    }
+
+    #[test]
+    fn the_stderr_capture_keeps_the_last_lines_and_says_so_when_there_were_none() {
+        // A pod that fails after logging thousands of lines must still report
+        // the END of its output — the last lines are where the error is.
+        let noisy: String = (1..=30).map(|i| format!("line{i}\n")).collect();
+        let buf = spawn_capturing_drainer(io::Cursor::new(noisy.into_bytes()));
+        let failed = Command::new("/bin/sh")
+            .args(["-c", "exit 4"])
+            .status()
+            .unwrap();
+        let msg = format!("{}", format_exec_error("ctx", failed, &buf));
+        assert!(msg.contains("ctx"), "{msg}");
+        assert!(msg.contains("line30"), "the tail must survive: {msg}");
+        assert!(msg.contains("line11"), "{msg}");
+        assert!(
+            !msg.contains("line10"),
+            "the buffer is bounded at {STDERR_CAPTURE_LIMIT} lines: {msg}"
+        );
+
+        // No stderr at all is its own diagnosis — "it failed and said nothing"
+        // is different from "it failed and we lost the message".
+        let empty = spawn_capturing_drainer(io::Cursor::new(Vec::new()));
+        let msg = format!("{}", format_exec_error("ctx", failed, &empty));
+        assert!(msg.contains("produced no stderr output"), "{msg}");
     }
 
     #[test]

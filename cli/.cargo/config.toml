@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+
+# Turn off the two startup checks for everything cargo runs.
+#
+# `apprafter` consults api.github.com (new-release courtesy notice) and shells
+# out to `kubectl` (node disk-pressure banner) before dispatching any command,
+# caching each verdict to disk for hours. The integration suite spawns the real
+# binary in nineteen test files, so those checks ran hundreds of times per
+# `cargo test` — slowly, and against whatever the developer's cache happened to
+# hold.
+#
+# That is not only waste. It made COVERAGE MEASUREMENT NON-REPRODUCIBLE: a warm
+# cache short-circuits before the probe, so which branches execute inside the
+# instrumented binary depended on what had run before it. Two consecutive
+# workspace measurements came out 0.14pp apart with nothing changed in between,
+# and a number that moves on its own cannot be the 80% gate it is meant to be.
+#
+# Not `force = true`: a developer who wants the real behaviour can still set the
+# variable to something else in their own environment.
+[env]
+APPRAFTER_SKIP_STARTUP_CHECKS = "1"

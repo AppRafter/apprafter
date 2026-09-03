@@ -839,31 +839,80 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Records every `run_backup` argv so a test can assert the snapshot count,
-    /// the per-call `--tag`, and the staged path of each snapshot. `run` /
-    /// `run_stdout` are no-ops. `run_stdout` returning `Ok` makes
-    /// `restic_repo_exists` report the repo already exists, so the engine skips
-    /// `init` (keeping the recorded calls to just the `backup` snapshots).
+    /// the per-call `--tag`, and the staged path of each snapshot, and every
+    /// non-`backup` argv (i.e. `init`) separately.
+    ///
+    /// By default `run_stdout` returns `Ok`, which makes `restic_repo_exists`
+    /// report the repo already exists so the engine skips `init` (keeping the
+    /// recorded calls to just the `backup` snapshots). [`Self::absent_repo`]
+    /// flips that; [`Self::failing_backup`] makes every snapshot fail.
     #[derive(Default)]
     struct RecordingRestic {
+        /// Every `restic backup` argv, in call order.
         calls: RefCell<Vec<Vec<String>>>,
+        /// Every non-`backup` argv (`init`), in call order.
+        plain_calls: RefCell<Vec<Vec<String>>>,
+        /// When set, the `snapshots` probe fails — the repository does not
+        /// exist yet, so `ensure_repo` must create it.
+        repo_absent: bool,
+        /// Index of the first `restic backup` call that fails; `None` = all
+        /// succeed. Lets a test fail the LAST (commit-point) snapshot of a
+        /// sequential run after every claim snapshot has succeeded.
+        fail_backup_from: Option<usize>,
     }
 
     impl RecordingRestic {
+        /// A runner whose repository does not exist yet.
+        fn absent_repo() -> Self {
+            Self {
+                repo_absent: true,
+                ..Self::default()
+            }
+        }
+
+        /// A runner whose `restic backup` always fails.
+        fn failing_backup() -> Self {
+            Self::failing_backup_from(0)
+        }
+
+        /// A runner whose `restic backup` succeeds `n` times, then fails.
+        fn failing_backup_from(n: usize) -> Self {
+            Self {
+                fail_backup_from: Some(n),
+                ..Self::default()
+            }
+        }
+
         fn calls(&self) -> Vec<Vec<String>> {
             self.calls.borrow().clone()
+        }
+
+        fn plain_calls(&self) -> Vec<Vec<String>> {
+            self.plain_calls.borrow().clone()
         }
     }
 
     impl ResticRunner for RecordingRestic {
-        fn run(&self, _argv: &[String], _passphrase: &str) -> Result<()> {
+        fn run(&self, argv: &[String], _passphrase: &str) -> Result<()> {
+            self.plain_calls.borrow_mut().push(argv.to_vec());
             Ok(())
         }
         fn run_stdout(&self, _argv: &[String], _passphrase: &str) -> Result<String> {
+            if self.repo_absent {
+                // What `restic snapshots` does against a repo that is not there.
+                return Err(CliError::Other(
+                    "Fatal: unable to open config file: <config> does not exist".into(),
+                ));
+            }
             // Ok(..) => restic_repo_exists() == true => engine skips `init`.
             Ok(String::new())
         }
         fn run_backup(&self, argv: &[String], _passphrase: &str) -> Result<Option<String>> {
+            let index = self.calls.borrow().len();
             self.calls.borrow_mut().push(argv.to_vec());
+            if self.fail_backup_from.is_some_and(|n| index >= n) {
+                return Err(CliError::Other("restic backup: exit status 1".into()));
+            }
             Ok(Some("snap".into()))
         }
     }
@@ -881,14 +930,25 @@ mod tests {
         argv.last().cloned()
     }
 
-    /// A `KubeExec` that returns a fixed set of pg ResourceClaims for the
-    /// claim-list probe and empty (`Ok(None)`) for every other list, so the
-    /// engine's CR/secret sweep produces an empty-but-valid artifact. Its
+    /// A scriptable `KubeExec`. `get_json` answers from a table keyed by the
+    /// EXACT args vector the engine builds (`args.join(" ")`), so a test both
+    /// scripts a cluster read-out and pins the argument construction: an engine
+    /// that asked for `secret` instead of `secrets`, or forgot `-n`, misses its
+    /// scripted reply. Unscripted lists report absent (`Ok(None)`), so a sweep
+    /// over a bare cluster still yields an empty-but-valid artifact.
+    ///
     /// `exec_stream_to_file` CREATES the `out` file (a few bytes) so the
     /// sequential stage→backup→delete loop sees a real staged file.
     struct FakeKube {
-        /// The pg claim JSONs returned for the `resourceclaims.apprafter.io` list.
+        /// The claim JSONs returned for any `resourceclaims.apprafter.io` list
+        /// that has no explicit scripted reply.
         claims: Vec<Value>,
+        /// Scripted `get_json` bodies, keyed by the joined args vector.
+        replies: BTreeMap<String, Value>,
+        /// Scripted `get_json` failures (message text), keyed the same way.
+        errors: BTreeMap<String, String>,
+        /// Every `get_json` args vector the engine issued, in order.
+        calls: RefCell<Vec<Vec<String>>>,
     }
 
     impl FakeKube {
@@ -903,7 +963,31 @@ mod tests {
                     })
                 })
                 .collect();
-            Self { claims }
+            Self {
+                claims,
+                replies: BTreeMap::new(),
+                errors: BTreeMap::new(),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// An empty cluster; script it with [`Self::reply`] / [`Self::fail`].
+        fn scripted() -> Self {
+            Self::with_pg_claims(0)
+        }
+
+        fn reply(mut self, args: &[&str], body: Value) -> Self {
+            self.replies.insert(args.join(" "), body);
+            self
+        }
+
+        fn fail(mut self, args: &[&str], message: &str) -> Self {
+            self.errors.insert(args.join(" "), message.to_string());
+            self
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.borrow().clone()
         }
     }
 
@@ -945,10 +1029,20 @@ mod tests {
         }
 
         fn get_json(&self, args: &[&str]) -> Result<Option<Value>> {
+            self.calls
+                .borrow_mut()
+                .push(args.iter().map(|a| (*a).to_string()).collect());
+            let key = args.join(" ");
+            if let Some(message) = self.errors.get(&key) {
+                return Err(CliError::Other(message.clone()));
+            }
+            if let Some(body) = self.replies.get(&key) {
+                return Ok(Some(body.clone()));
+            }
             // The only list the engine needs populated to exercise the
             // per-claim path is the ResourceClaim list; everything else
             // (platformstack, sourcecredentials, applications, argo apps,
-            // sharedvolumes, sealedsecrets, secrets) reports empty so the CR /
+            // sharedvolumes, sealedsecrets, secrets) reports absent so the CR /
             // secret sweep yields an empty-but-valid artifact.
             if args.iter().any(|a| a.starts_with("resourceclaims")) {
                 Ok(Some(json!({ "items": self.claims })))
@@ -1084,5 +1178,927 @@ mod tests {
         assert!(t.contains("2026-06-20"));
         let sub = backup_tag("k3d-demo", "2026-06-20T00:00:00Z", &["prod".to_string()]);
         assert!(sub.contains("prod"));
+    }
+
+    // -----------------------------------------------------------------------
+    // SourceCredential material refs
+    // -----------------------------------------------------------------------
+
+    /// INVARIANT: BOTH backends are followed. A `SourceCredential` whose
+    /// registry material is missed restores as an app that cannot pull its own
+    /// image; one whose git material is missed restores as an app Argo cannot
+    /// sync. An explicit `namespace` on the ref wins over the credential's own.
+    #[test]
+    fn sourcecred_material_refs_follows_the_git_and_registry_backends() {
+        let sc = json!({
+            "metadata": {"name": "gh", "namespace": "apprafter-system"},
+            "spec": {
+                "git": {"backend": {"sealedSecretRef": {"name": "gh-token"}}},
+                "registry": {"backend": {"sealedSecretRef": {
+                    "name": "ghcr-dockercfg", "namespace": "demo"
+                }}}
+            }
+        });
+        assert_eq!(
+            sourcecred_material_refs(&sc),
+            vec![
+                ("apprafter-system".to_string(), "gh-token".to_string()),
+                ("demo".to_string(), "ghcr-dockercfg".to_string()),
+            ]
+        );
+    }
+
+    /// A ref without its own `namespace` resolves against the CREDENTIAL's
+    /// namespace, not a hardcoded one — a team-scoped SourceCredential's sealed
+    /// material lives beside it. Only a credential with no namespace at all
+    /// falls back to `apprafter-system`.
+    #[test]
+    fn sourcecred_material_refs_default_to_the_credentials_own_namespace() {
+        let team = json!({
+            "metadata": {"name": "gh", "namespace": "team-a"},
+            "spec": {"git": {"backend": {"sealedSecretRef": {"name": "gh-token"}}}}
+        });
+        assert_eq!(
+            sourcecred_material_refs(&team),
+            vec![("team-a".to_string(), "gh-token".to_string())]
+        );
+
+        let unscoped = json!({
+            "spec": {"git": {"backend": {"sealedSecretRef": {"name": "gh-token"}}}}
+        });
+        assert_eq!(
+            sourcecred_material_refs(&unscoped),
+            vec![("apprafter-system".to_string(), "gh-token".to_string())]
+        );
+    }
+
+    #[test]
+    fn sourcecred_material_refs_is_empty_without_a_usable_ref() {
+        // No backends configured at all.
+        assert!(sourcecred_material_refs(&json!({"spec": {}})).is_empty());
+        // A ref present but nameless — nothing to read.
+        assert!(sourcecred_material_refs(&json!({
+            "metadata": {"namespace": "demo"},
+            "spec": {"git": {"backend": {"sealedSecretRef": {"namespace": "demo"}}}}
+        }))
+        .is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Manifest resource refs
+    // -----------------------------------------------------------------------
+
+    /// INVARIANT: config CRs and data claims are distinguished by `claim_type`
+    /// — restore uses it to decide which manifest entries have a payload in the
+    /// snapshot. Config CRs must carry `None` (the field is skipped on
+    /// serialize), claims must carry their `spec.type`.
+    #[test]
+    fn resource_refs_lists_crs_then_claims_and_only_claims_carry_a_type() {
+        let app = json!({"metadata": {"name": "alpha", "namespace": "demo"}});
+        let ps = json!({"metadata": {"name": "default"}});
+        let claim = json!({
+            "metadata": {"name": "pg-0", "namespace": "demo"},
+            "spec": {"type": "pg"}
+        });
+
+        let refs = resource_refs(
+            &[("Application", &app), ("PlatformStack", &ps)],
+            std::slice::from_ref(&claim),
+        );
+
+        assert_eq!(
+            refs,
+            vec![
+                ResourceRef {
+                    namespace: "demo".into(),
+                    kind: "Application".into(),
+                    name: "alpha".into(),
+                    claim_type: None,
+                },
+                ResourceRef {
+                    // A cluster-scoped CR records an empty namespace.
+                    namespace: String::new(),
+                    kind: "PlatformStack".into(),
+                    name: "default".into(),
+                    claim_type: None,
+                },
+                ResourceRef {
+                    namespace: "demo".into(),
+                    // NOT the claim's `spec.type` — the Kind is always
+                    // ResourceClaim, the type goes in `claim_type`.
+                    kind: "ResourceClaim".into(),
+                    name: "pg-0".into(),
+                    claim_type: Some("pg".into()),
+                },
+            ]
+        );
+    }
+
+    /// A claim whose `spec.type` is absent still gets an entry — with no type —
+    /// rather than being dropped from the manifest.
+    #[test]
+    fn resource_refs_keeps_a_typeless_claim() {
+        let claim = json!({"metadata": {"name": "mystery", "namespace": "demo"}});
+        let refs = resource_refs(&[], std::slice::from_ref(&claim));
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].kind, "ResourceClaim");
+        assert_eq!(refs[0].claim_type, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // list_items — argument construction + missing-CRD tolerance
+    // -----------------------------------------------------------------------
+
+    /// INVARIANT: the scope flag is built from the namespace argument —
+    /// `-A` for a cluster-wide sweep, `-n <ns>` otherwise — and `-o json` is
+    /// always appended. Getting this wrong silently changes WHICH objects a
+    /// backup captures.
+    #[test]
+    fn list_items_builds_a_cluster_wide_or_namespaced_get() {
+        let k = FakeKube::scripted();
+        list_items(&k, "applications.apprafter.io", None).unwrap();
+        list_items(&k, "secrets", Some("demo")).unwrap();
+        assert_eq!(
+            k.calls(),
+            vec![
+                vec!["get", "applications.apprafter.io", "-A", "-o", "json"],
+                vec!["get", "secrets", "-n", "demo", "-o", "json"],
+            ]
+        );
+    }
+
+    /// INVARIANT: a CRD that is not installed is an EMPTY list — a cluster
+    /// without sealed-secrets or CNPG must still back up. Every OTHER failure
+    /// must propagate: reading "forbidden" as "empty" would produce a backup
+    /// missing real data that still reported success.
+    #[test]
+    fn list_items_treats_a_missing_crd_as_empty_but_propagates_other_failures() {
+        let k = FakeKube::scripted()
+            .fail(
+                &[
+                    "get",
+                    "sealedsecrets.bitnami.com",
+                    "-n",
+                    "demo",
+                    "-o",
+                    "json",
+                ],
+                "error: the server doesn't have a resource type \"sealedsecrets\"",
+            )
+            .fail(
+                &["get", "secrets", "-n", "demo", "-o", "json"],
+                "error: secrets is forbidden: User \"sa\" cannot list resource \"secrets\"",
+            );
+
+        assert_eq!(
+            list_items(&k, "sealedsecrets.bitnami.com", Some("demo")).unwrap(),
+            Vec::<Value>::new()
+        );
+        assert!(
+            list_items(&k, "secrets", Some("demo")).is_err(),
+            "a permission failure must not be swallowed as an empty list"
+        );
+    }
+
+    /// A list that comes back without an `items` key at all is an empty list,
+    /// not a crash.
+    #[test]
+    fn list_items_of_an_itemless_body_is_empty() {
+        let k = FakeKube::scripted().reply(
+            &["get", "applications.apprafter.io", "-A", "-o", "json"],
+            json!({"kind": "ApplicationList"}),
+        );
+        assert!(list_items(&k, "applications.apprafter.io", None)
+            .unwrap()
+            .is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // read_secret_data
+    // -----------------------------------------------------------------------
+
+    /// INVARIANT: the query uses the canonical PLURAL `secrets`. kubectl (the
+    /// CLI path) accepts the singular, but the in-cluster `KubeRsExec` resolves
+    /// resources by exact plural through API discovery — `secret` fails there,
+    /// so every scheduled backup would silently stage zero secrets.
+    ///
+    /// The values arrive base64-encoded and must be DECODED into the staged
+    /// bytes; the Secret's `type` is preserved so restore recreates the same
+    /// kind of Secret.
+    #[test]
+    fn read_secret_data_asks_for_the_plural_and_decodes_every_value() {
+        let k = FakeKube::scripted().reply(
+            &["get", "secrets", "pg-0-conn", "-n", "demo", "-o", "json"],
+            // "s3cr3t" and "app", base64.
+            json!({"type": "kubernetes.io/basic-auth",
+                   "data": {"pass": "czNjcjN0", "user": "YXBw"}}),
+        );
+
+        let (data, secret_type) = read_secret_data(&k, "pg-0-conn", "demo")
+            .expect("read secret")
+            .expect("the secret is present");
+
+        assert_eq!(secret_type, "kubernetes.io/basic-auth");
+        assert_eq!(data.get("pass").map(Vec::as_slice), Some(&b"s3cr3t"[..]));
+        assert_eq!(data.get("user").map(Vec::as_slice), Some(&b"app"[..]));
+        assert_eq!(
+            k.calls(),
+            vec![vec![
+                "get",
+                "secrets",
+                "pg-0-conn",
+                "-n",
+                "demo",
+                "-o",
+                "json"
+            ]]
+        );
+    }
+
+    /// An absent Secret is `Ok(None)` — the sweep skips it rather than failing
+    /// the whole backup. A Secret with no `data` block stages as an empty one.
+    #[test]
+    fn read_secret_data_reports_an_absent_secret_and_an_empty_one_distinctly() {
+        let k = FakeKube::scripted().reply(
+            &["get", "secrets", "blank", "-n", "demo", "-o", "json"],
+            json!({"metadata": {"name": "blank"}}),
+        );
+        assert!(read_secret_data(&k, "gone", "demo").unwrap().is_none());
+
+        let (data, secret_type) = read_secret_data(&k, "blank", "demo").unwrap().unwrap();
+        assert!(data.is_empty());
+        // No `type` on the wire defaults to Opaque, as the apiserver would.
+        assert_eq!(secret_type, "Opaque");
+    }
+
+    /// Undecodable data is a hard error: staging the raw base64 as if it were
+    /// the value would restore a Secret whose contents are double-encoded.
+    #[test]
+    fn read_secret_data_fails_on_undecodable_base64() {
+        let k = FakeKube::scripted().reply(
+            &["get", "secrets", "corrupt", "-n", "demo", "-o", "json"],
+            json!({"data": {"pass": "not valid base64!!"}}),
+        );
+        assert!(read_secret_data(&k, "corrupt", "demo").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // read_platform_version
+    // -----------------------------------------------------------------------
+
+    /// INVARIANT: the manifest's `platform_version` comes from the LIVE
+    /// `PlatformStack/default.status.currentVersion` in `apprafter-system` —
+    /// `restore --reprovision` bootstraps the target at exactly that version so
+    /// the PlatformStack apply is a no-op. When it cannot be read the value is
+    /// the explicit sentinel `unknown`, never an empty string.
+    #[test]
+    fn read_platform_version_reads_the_live_status_or_says_unknown() {
+        let k = FakeKube::scripted().reply(
+            &[
+                "get",
+                "platformstack",
+                "default",
+                "-n",
+                "apprafter-system",
+                "-o",
+                "json",
+            ],
+            json!({"status": {"currentVersion": "0.2.37"}}),
+        );
+        assert_eq!(read_platform_version(&k).unwrap(), "0.2.37");
+
+        // No PlatformStack at all.
+        assert_eq!(
+            read_platform_version(&FakeKube::scripted()).unwrap(),
+            "unknown"
+        );
+
+        // Present but not reconciled yet.
+        let pending = FakeKube::scripted().reply(
+            &[
+                "get",
+                "platformstack",
+                "default",
+                "-n",
+                "apprafter-system",
+                "-o",
+                "json",
+            ],
+            json!({"status": {}}),
+        );
+        assert_eq!(read_platform_version(&pending).unwrap(), "unknown");
+    }
+
+    // -----------------------------------------------------------------------
+    // first_cnpg_image
+    // -----------------------------------------------------------------------
+
+    fn cnpg_list(ns: &str, items: Value) -> (Vec<String>, Value) {
+        (
+            vec![
+                "get".into(),
+                "clusters.postgresql.cnpg.io".into(),
+                "-n".into(),
+                ns.into(),
+                "-o".into(),
+                "json".into(),
+            ],
+            items,
+        )
+    }
+
+    fn kube_with_cnpg(ns: &str, items: Value) -> FakeKube {
+        let (args, body) = cnpg_list(ns, items);
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        FakeKube::scripted().reply(&borrowed, body)
+    }
+
+    /// INVARIANT: the pg_dump helper image must MAJOR-MATCH the running server
+    /// — `pg_dump 16` refuses to dump a pg 17 cluster. The declared
+    /// `spec.imageName` wins over the observed `status.image`, because a
+    /// version bump lands in the spec first.
+    #[test]
+    fn first_cnpg_image_prefers_the_declared_image_over_the_observed_one() {
+        let k = kube_with_cnpg(
+            "demo",
+            json!({"items": [{
+                "spec": {"imageName": "ghcr.io/cloudnative-pg/postgresql:17.2"},
+                "status": {"image": "ghcr.io/cloudnative-pg/postgresql:16.4"}
+            }]}),
+        );
+        assert_eq!(
+            first_cnpg_image(&k, &["demo".to_string()]),
+            Some("ghcr.io/cloudnative-pg/postgresql:17.2".to_string())
+        );
+    }
+
+    /// A Cluster that never declared an image still reports one once running —
+    /// fall back to `status.image`. An EMPTY string in either field is not an
+    /// image and must not be returned as one.
+    #[test]
+    fn first_cnpg_image_falls_back_to_the_status_image_and_ignores_blanks() {
+        let k = kube_with_cnpg(
+            "demo",
+            json!({"items": [{
+                "spec": {"imageName": ""},
+                "status": {"image": "ghcr.io/cloudnative-pg/postgresql:16.4"}
+            }]}),
+        );
+        assert_eq!(
+            first_cnpg_image(&k, &["demo".to_string()]),
+            Some("ghcr.io/cloudnative-pg/postgresql:16.4".to_string())
+        );
+
+        let blank = kube_with_cnpg(
+            "demo",
+            json!({"items": [{"spec": {"imageName": ""}, "status": {"image": ""}}]}),
+        );
+        assert_eq!(first_cnpg_image(&blank, &["demo".to_string()]), None);
+    }
+
+    /// INVARIANT: `cnpg-system` is ALWAYS scanned, even when it is not one of
+    /// the backed-up namespaces — that is where the operator's own Cluster
+    /// lives, and it is the only image source on a cluster whose app
+    /// namespaces hold none.
+    #[test]
+    fn first_cnpg_image_also_scans_the_cnpg_operator_namespace() {
+        let k = kube_with_cnpg(
+            "cnpg-system",
+            json!({"items": [{"spec": {"imageName": "ghcr.io/cloudnative-pg/postgresql:17.2"}}]}),
+        );
+        assert_eq!(
+            first_cnpg_image(&k, &["demo".to_string()]),
+            Some("ghcr.io/cloudnative-pg/postgresql:17.2".to_string())
+        );
+        assert!(
+            k.calls()
+                .iter()
+                .any(|c| c.contains(&"cnpg-system".to_string())),
+            "the operator namespace must be scanned: {:?}",
+            k.calls()
+        );
+    }
+
+    /// No CNPG at all is `None` — the caller then uses the tier-1 default
+    /// image rather than failing the backup.
+    #[test]
+    fn first_cnpg_image_is_none_when_nothing_reports_an_image() {
+        let k = FakeKube::scripted();
+        assert_eq!(first_cnpg_image(&k, &["demo".to_string()]), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // File writers
+    // -----------------------------------------------------------------------
+
+    fn file_names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    /// INVARIANT: each CR is written to its own file whose name carries the
+    /// capture INDEX, so restore replays them in capture order (PlatformStack
+    /// before the Applications that depend on it). The body is SANITIZED: a
+    /// staged `uid` / `resourceVersion` / `status` makes the restore apply
+    /// fail against a fresh cluster.
+    #[test]
+    fn write_crs_writes_one_indexed_sanitized_file_per_cr() {
+        let dir = tempfile::tempdir().unwrap();
+        let crs = vec![
+            (
+                "Application".to_string(),
+                json!({
+                    "metadata": {"name": "alpha", "namespace": "demo",
+                                 "uid": "u-1", "resourceVersion": "42"},
+                    "spec": {"base": {"image": "nginx:1"}},
+                    "status": {"phase": "Ready"}
+                }),
+            ),
+            (
+                "PlatformStack".to_string(),
+                json!({"metadata": {"name": "default"}, "spec": {"tier": 1}}),
+            ),
+        ];
+
+        write_crs(&crs, dir.path()).unwrap();
+
+        assert_eq!(
+            file_names_in(dir.path()),
+            vec![
+                "000-Application-demo-alpha.json".to_string(),
+                // A cluster-scoped CR files under the literal `cluster`.
+                "001-PlatformStack-cluster-default.json".to_string(),
+            ]
+        );
+
+        let body = read_json(&dir.path().join("000-Application-demo-alpha.json"));
+        assert_eq!(body["spec"]["base"]["image"], json!("nginx:1"));
+        assert!(body.get("status").is_none(), "status must be stripped");
+        assert!(
+            body["metadata"].get("uid").is_none(),
+            "uid must be stripped"
+        );
+        assert!(
+            body["metadata"].get("resourceVersion").is_none(),
+            "resourceVersion must be stripped"
+        );
+    }
+
+    /// INVARIANT: the staged envelope keeps the Secret's TYPE and re-encodes
+    /// the decoded bytes, so restore recreates a
+    /// `kubernetes.io/dockerconfigjson` rather than an Opaque — and values that
+    /// are not valid UTF-8 (TLS keys, binary tokens) survive byte-for-byte.
+    /// The destination directory is created on demand (`secrets/<ns>/`).
+    #[test]
+    fn write_secret_json_round_trips_the_type_and_the_raw_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let ns_dir = root.path().join("secrets").join("demo");
+        let mut data = BTreeMap::new();
+        data.insert("pass".to_string(), b"s3cr3t".to_vec());
+        data.insert("blob".to_string(), vec![0x00, 0xFF, 0x10]);
+
+        write_secret_json(&ns_dir, "ghcr", &data, "kubernetes.io/dockerconfigjson").unwrap();
+
+        let v = read_json(&ns_dir.join("ghcr.json"));
+        assert_eq!(v["type"], json!("kubernetes.io/dockerconfigjson"));
+        let decode = |k: &str| {
+            base64::engine::general_purpose::STANDARD
+                .decode(v["data"][k].as_str().unwrap())
+                .unwrap()
+        };
+        assert_eq!(decode("pass"), b"s3cr3t".to_vec());
+        assert_eq!(decode("blob"), vec![0x00, 0xFF, 0x10]);
+    }
+
+    // -----------------------------------------------------------------------
+    // capture_non_claim_artifacts — the whole-cluster CR + secret sweep
+    // -----------------------------------------------------------------------
+
+    /// A cluster with in-scope and out-of-scope objects of every kind the
+    /// sweep touches.
+    fn scripted_cluster() -> FakeKube {
+        FakeKube::scripted()
+            .reply(
+                &[
+                    "get",
+                    "platformstack",
+                    "default",
+                    "-n",
+                    "apprafter-system",
+                    "-o",
+                    "json",
+                ],
+                json!({"kind": "PlatformStack",
+                       "metadata": {"name": "default", "namespace": "apprafter-system"}}),
+            )
+            .reply(
+                &["get", "sourcecredentials.apprafter.io", "-A", "-o", "json"],
+                json!({"items": [{
+                    "kind": "SourceCredential",
+                    "metadata": {"name": "gh", "namespace": "apprafter-system"},
+                    "spec": {"git": {"backend": {"sealedSecretRef": {"name": "gh-token"}}}}
+                }]}),
+            )
+            .reply(
+                &["get", "applications.apprafter.io", "-A", "-o", "json"],
+                json!({"items": [
+                    {"kind": "Application", "metadata": {"name": "alpha", "namespace": "demo"}},
+                    {"kind": "Application",
+                     "metadata": {"name": "elsewhere", "namespace": "not-in-scope"}}
+                ]}),
+            )
+            .reply(
+                &["get", "applications.argoproj.io", "-A", "-o", "json"],
+                json!({"items": [
+                    {"metadata": {"name": "alpha-prod", "namespace": "argocd",
+                                  "labels": {"apprafter.io/managed-by": "apprafter"}}},
+                    {"metadata": {"name": "platform-root", "namespace": "argocd",
+                                  "labels": {"app.kubernetes.io/part-of": "argocd"}}}
+                ]}),
+            )
+            .reply(
+                &[
+                    "get",
+                    "sharedvolumes.apprafter.io",
+                    "-n",
+                    "demo",
+                    "-o",
+                    "json",
+                ],
+                json!({"items": [{"kind": "SharedVolume",
+                                  "metadata": {"name": "assets", "namespace": "demo"}}]}),
+            )
+            .reply(
+                &[
+                    "get",
+                    "sealedsecrets.bitnami.com",
+                    "-n",
+                    "demo",
+                    "-o",
+                    "json",
+                ],
+                json!({"items": [{"metadata": {"name": "stripe", "namespace": "demo"}}]}),
+            )
+            .reply(
+                &["get", "secrets", "-n", "demo", "-o", "json"],
+                json!({"items": [
+                    {"metadata": {"name": "stripe", "namespace": "demo"}},
+                    {"metadata": {"name": "pg-0-conn", "namespace": "demo"}}
+                ]}),
+            )
+            .reply(
+                &["get", "secrets", "stripe", "-n", "demo", "-o", "json"],
+                json!({"type": "Opaque", "data": {"key": "c2s="}}),
+            )
+            // Readable, but NOT sealed — staging it would be a bug, so it must
+            // be readable for the "only sealed secrets" assertion to bite.
+            .reply(
+                &["get", "secrets", "pg-0-conn", "-n", "demo", "-o", "json"],
+                json!({"type": "kubernetes.io/basic-auth", "data": {"pass": "cHc="}}),
+            )
+            .reply(
+                &[
+                    "get",
+                    "secrets",
+                    "gh-token",
+                    "-n",
+                    "apprafter-system",
+                    "-o",
+                    "json",
+                ],
+                json!({"type": "Opaque", "data": {"token": "Z2hw"}}),
+            )
+    }
+
+    /// INVARIANT (the scoping rules the whole backup rests on):
+    /// * Applications are captured only for the namespaces IN SCOPE — an app in
+    ///   another namespace must not leak into a narrowed backup;
+    /// * Argo Applications are captured only when apprafter-managed — capturing
+    ///   the platform's own root app would fight Argo on restore;
+    /// * Secrets are captured only when a SealedSecret exists for them — a
+    ///   provisioner-generated connection Secret is regenerated on restore and
+    ///   staging it would put live credentials in the snapshot for nothing;
+    /// * SourceCredential MATERIAL is captured even though it lives outside the
+    ///   backed-up namespaces.
+    #[test]
+    fn capture_non_claim_artifacts_captures_only_the_in_scope_and_sealed_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = scripted_cluster();
+        let opts = opts_for(StagingMode::Monolithic, dir.path().to_path_buf());
+        let claims = vec![json!({
+            "metadata": {"name": "pg-0", "namespace": "demo"},
+            "spec": {"type": "pg"}
+        })];
+
+        let out = capture_non_claim_artifacts(&k, &opts, &claims, dir.path()).unwrap();
+
+        assert_eq!(
+            out.cr_count, 5,
+            "PlatformStack + SourceCredential + 1 in-scope Application + 1 managed \
+             ArgoApplication + SharedVolume"
+        );
+        assert_eq!(
+            out.secret_count, 2,
+            "the sealed `stripe` and the SourceCredential material only"
+        );
+
+        assert_eq!(
+            file_names_in(&dir.path().join("crs")),
+            vec![
+                "000-PlatformStack-apprafter-system-default.json".to_string(),
+                "001-SourceCredential-apprafter-system-gh.json".to_string(),
+                "002-Application-demo-alpha.json".to_string(),
+                "003-ArgoApplication-argocd-alpha-prod.json".to_string(),
+                "004-SharedVolume-demo-assets.json".to_string(),
+            ]
+        );
+
+        let secrets = dir.path().join("secrets");
+        assert!(secrets.join("demo").join("stripe.json").exists());
+        assert!(
+            !secrets.join("demo").join("pg-0-conn.json").exists(),
+            "an unsealed, provisioner-generated Secret must NOT be staged"
+        );
+        assert!(secrets.join("sourcecred").join("gh-token.json").exists());
+    }
+
+    /// INVARIANT: `manifest.json` is the restore index. It must name every
+    /// captured CR AND every claim, in capture order, under the camelCase keys
+    /// restore reads.
+    #[test]
+    fn capture_non_claim_artifacts_writes_a_manifest_indexing_every_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = scripted_cluster();
+        let opts = opts_for(StagingMode::Monolithic, dir.path().to_path_buf());
+        let claims = vec![json!({
+            "metadata": {"name": "pg-0", "namespace": "demo"},
+            "spec": {"type": "pg"}
+        })];
+
+        capture_non_claim_artifacts(&k, &opts, &claims, dir.path()).unwrap();
+
+        let m = read_json(&dir.path().join("manifest.json"));
+        assert_eq!(m["manifestVersion"], json!(1));
+        assert_eq!(m["clusterId"], json!("k3d-demo"));
+        assert_eq!(m["namespaces"], json!(["demo"]));
+
+        let kinds: Vec<&str> = m["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "PlatformStack",
+                "SourceCredential",
+                "Application",
+                "ArgoApplication",
+                "SharedVolume",
+                "ResourceClaim",
+            ]
+        );
+        assert_eq!(m["resources"][5]["name"], json!("pg-0"));
+        assert_eq!(m["resources"][5]["claim_type"], json!("pg"));
+        assert!(
+            m["resources"][0].get("claim_type").is_none(),
+            "a config CR must not claim a data type"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ensure_repo
+    // -----------------------------------------------------------------------
+
+    /// INVARIANT: `restic init` runs ONLY when the `snapshots` probe says the
+    /// repository is absent — re-initialising a live repo would be
+    /// catastrophic — and for a LOCAL repo its parent directory is created
+    /// first, because restic will not create intermediate directories.
+    #[test]
+    fn ensure_repo_initialises_a_missing_local_repo_and_creates_its_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("nested").join("repo");
+        let r = RecordingRestic::absent_repo();
+
+        ensure_repo(&r, &repo.to_string_lossy(), "pw").unwrap();
+
+        let init = r.plain_calls();
+        assert_eq!(init.len(), 1, "exactly one init: {init:?}");
+        assert_eq!(init[0][0], "init");
+        assert!(
+            init[0].contains(&repo.to_string_lossy().to_string()),
+            "init must target the repo: {init:?}"
+        );
+        assert!(
+            tmp.path().join("nested").is_dir(),
+            "the local repo's parent directory must be created"
+        );
+    }
+
+    #[test]
+    fn ensure_repo_leaves_an_existing_repository_alone() {
+        // The default runner's `snapshots` probe succeeds => the repo exists.
+        let r = RecordingRestic::default();
+        ensure_repo(&r, "s3:https://example.com/bucket/prefix", "pw").unwrap();
+        assert!(
+            r.plain_calls().is_empty(),
+            "an existing repository must NEVER be re-initialised: {:?}",
+            r.plain_calls()
+        );
+    }
+
+    /// D28 REGRESSION GUARD (the other half of
+    /// `no_directory_is_created_for_a_remote_repository`): a FRESH remote
+    /// repository is still initialised — the "do not treat a URL as a path"
+    /// fix must not have turned into "do not init remotes".
+    #[test]
+    fn ensure_repo_initialises_a_fresh_remote_repository() {
+        let r = RecordingRestic::absent_repo();
+        ensure_repo(&r, "s3:http://minio.svc:9000/backups/seq", "pw").unwrap();
+        let init = r.plain_calls();
+        assert_eq!(
+            init.len(),
+            1,
+            "a fresh remote repo must be inited: {init:?}"
+        );
+        assert_eq!(init[0][0], "init");
+    }
+
+    // -----------------------------------------------------------------------
+    // Tagging + failure propagation through a whole run
+    // -----------------------------------------------------------------------
+
+    /// INVARIANT: a NARROWED run (`--namespace` / `--select`) carries the
+    /// covered namespaces in its tag, so a later restore or retention prune
+    /// cannot mistake a partial capture for a whole-cluster one.
+    #[test]
+    fn a_subset_run_tags_its_snapshots_with_the_namespaces_it_covered() {
+        let staging = tempfile::tempdir().unwrap();
+        let k = FakeKube::with_pg_claims(1);
+        let r = RecordingRestic::default();
+        let mut opts = opts_for(StagingMode::Monolithic, staging.path().to_path_buf());
+        opts.is_subset = true;
+        opts.namespaces = vec!["demo".into(), "prod".into()];
+
+        run_backup(&k, &r, &opts).expect("subset backup");
+
+        assert_eq!(
+            tag_of(&r.calls()[0]).as_deref(),
+            Some("k3d-demo-2026-06-20T00:00:00Z-ns-demo_prod")
+        );
+    }
+
+    /// The same run WITHOUT the subset flag must not pick up a namespace
+    /// suffix, even though it covers the very same namespaces.
+    #[test]
+    fn a_whole_cluster_run_is_not_namespace_tagged() {
+        let staging = tempfile::tempdir().unwrap();
+        let k = FakeKube::with_pg_claims(1);
+        let r = RecordingRestic::default();
+        let mut opts = opts_for(StagingMode::Monolithic, staging.path().to_path_buf());
+        opts.namespaces = vec!["demo".into(), "prod".into()];
+
+        run_backup(&k, &r, &opts).expect("whole-cluster backup");
+
+        assert_eq!(
+            tag_of(&r.calls()[0]).as_deref(),
+            Some("k3d-demo-2026-06-20T00:00:00Z")
+        );
+    }
+
+    /// INVARIANT: a fixed `--host` is passed through to every snapshot when the
+    /// caller asks for one — `restic forget` groups by host, so an in-cluster
+    /// runner whose pod name changes every night would otherwise defeat every
+    /// retention policy.
+    #[test]
+    fn the_backup_host_is_applied_to_every_snapshot_of_a_run() {
+        let staging = tempfile::tempdir().unwrap();
+        let k = FakeKube::with_pg_claims(2);
+        let r = RecordingRestic::default();
+        let mut opts = opts_for(StagingMode::Sequential, staging.path().to_path_buf());
+        opts.backup_host = Some("apprafter-backup".into());
+
+        run_backup(&k, &r, &opts).expect("sequential backup");
+
+        let calls = r.calls();
+        assert_eq!(calls.len(), 3);
+        for c in &calls {
+            let i = c
+                .iter()
+                .position(|x| x == "--host")
+                .unwrap_or_else(|| panic!("every snapshot must set --host: {c:?}"));
+            assert_eq!(c[i + 1], "apprafter-backup");
+        }
+    }
+
+    /// INVARIANT: a failed `restic backup` FAILS THE RUN. Returning a summary
+    /// with no snapshot id would be reported to the operator as a success, and
+    /// the retention prune would later delete good snapshots believing a fresh
+    /// one exists.
+    #[test]
+    fn a_failing_restic_backup_fails_the_run_in_both_staging_modes() {
+        for mode in [StagingMode::Monolithic, StagingMode::Sequential] {
+            let staging = tempfile::tempdir().unwrap();
+            let k = FakeKube::with_pg_claims(1);
+            let r = RecordingRestic::failing_backup();
+            let opts = opts_for(mode, staging.path().to_path_buf());
+            assert!(
+                run_backup(&k, &r, &opts).is_err(),
+                "{mode:?}: a failed snapshot must abort the run"
+            );
+        }
+    }
+
+    /// In `Sequential` the commit-point snapshot is the LAST thing written, so
+    /// a claim that fails to snapshot must stop the run BEFORE the manifest
+    /// exists — that is what makes an interrupted run invisible to restore.
+    #[test]
+    fn a_sequential_run_that_fails_on_a_claim_never_writes_a_manifest() {
+        let staging = tempfile::tempdir().unwrap();
+        let k = FakeKube::with_pg_claims(2);
+        let r = RecordingRestic::failing_backup();
+        let opts = opts_for(StagingMode::Sequential, staging.path().to_path_buf());
+
+        assert!(run_backup(&k, &r, &opts).is_err());
+        assert_eq!(
+            r.calls().len(),
+            1,
+            "the run must stop at the first failed claim snapshot"
+        );
+        assert!(
+            !staging.path().join("commit").join("manifest.json").exists(),
+            "no commit point may exist for an aborted run"
+        );
+    }
+
+    /// INVARIANT: the commit-point snapshot is what makes a sequential run
+    /// VISIBLE to restore. If it fails after every claim snapshot succeeded,
+    /// the run must still fail — otherwise the operator is told a backup exists
+    /// that restore will ignore, and the claim snapshots become orphans.
+    #[test]
+    fn a_sequential_run_whose_commit_point_snapshot_fails_fails_the_run() {
+        let staging = tempfile::tempdir().unwrap();
+        let k = FakeKube::with_pg_claims(1);
+        // The one claim snapshot succeeds; the second call — the commit point —
+        // fails.
+        let r = RecordingRestic::failing_backup_from(1);
+        let opts = opts_for(StagingMode::Sequential, staging.path().to_path_buf());
+
+        assert!(
+            run_backup(&k, &r, &opts).is_err(),
+            "a failed commit point must fail the run"
+        );
+        assert_eq!(
+            r.calls().len(),
+            2,
+            "the claim snapshot must have succeeded before the commit point failed"
+        );
+    }
+
+    /// INVARIANT: `run_backup_with_summary` reports what was actually captured
+    /// — the CLI prints these counts and an operator uses them to notice a
+    /// backup that quietly captured nothing.
+    #[test]
+    fn the_summary_counts_what_the_run_actually_captured() {
+        let staging = tempfile::tempdir().unwrap();
+        let k = scripted_cluster().reply(
+            &[
+                "get",
+                "resourceclaims.apprafter.io",
+                "-n",
+                "demo",
+                "-o",
+                "json",
+            ],
+            json!({"items": [
+                {"metadata": {"name": "pg-0", "namespace": "demo"},
+                 "spec": {"type": "pg"},
+                 "status": {"connectionSecretRef": "pg-0-conn"}},
+                // A jetstream claim is out of extraction scope this cycle: it
+                // counts as a claim but yields no extracted artifact.
+                {"metadata": {"name": "bus", "namespace": "demo"},
+                 "spec": {"type": "jetstream"}}
+            ]}),
+        );
+        let r = RecordingRestic::default();
+        let opts = opts_for(StagingMode::Monolithic, staging.path().to_path_buf());
+
+        let s = run_backup_with_summary(&k, &r, &opts).expect("backup");
+
+        assert_eq!(s.snapshot_id, Some("snap".to_string()));
+        assert_eq!(s.cr_count, 5);
+        assert_eq!(s.secret_count, 2);
+        assert_eq!(s.claim_count, 2, "both claims are recorded");
+        assert_eq!(s.extracted_count, 1, "only the pg claim has a payload");
+        assert_eq!(s.tag, "k3d-demo-2026-06-20T00:00:00Z");
     }
 }
