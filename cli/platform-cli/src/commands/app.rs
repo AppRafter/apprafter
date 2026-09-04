@@ -1533,9 +1533,9 @@ fn summarise_pod(pod: &Value, now: &chrono::DateTime<chrono::Utc>) -> PodSummary
 /// the same second read as not-stale — and that is the direction this function
 /// already commits to above.
 ///
-/// Found by the negative control in `e2e/secrets-ux-walk.sh`, which exists
-/// only because two independent reviewers refused to accept a positive-only
-/// assertion for this flag.
+/// Found by the negative control in `e2e/env-and-secrets-walk.sh`, which
+/// exists only because two independent reviewers refused to accept a
+/// positive-only assertion for this flag.
 pub(crate) fn pod_is_stale(started_at: Option<&str>, changed_at: Option<&str>) -> bool {
     let (Some(started), Some(changed)) = (started_at, changed_at) else {
         return false;
@@ -5985,8 +5985,8 @@ mod drift_tests {
         // deployment, is every pod, because the Deployment apply and the digest
         // stamp happen in one reconcile.
         //
-        // These are the exact values measured by e2e/secrets-ux-walk.sh on a
-        // seven-second-old pod that had never seen a rotation.
+        // These are the exact values measured by e2e/env-and-secrets-walk.sh
+        // on a seven-second-old pod that had never seen a rotation.
         assert!(
             !pod_is_stale(
                 Some("2026-09-03T01:18:29Z"),

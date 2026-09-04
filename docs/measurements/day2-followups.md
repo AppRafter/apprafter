@@ -983,9 +983,10 @@ identical, fully populated row.
 
 So the entry's own title stayed true for three more days. `app status` now
 prints the reason and the message under the phase (cli v0.2.56), and BOTH sides
-are walk-verified: the operator message in `needs-env-refs-walk` Phase 5
-(present-but-wrong-key, distinct from absent) and the CLI rendering in
-`secrets-ux-walk` Phase 8.
+are walk-verified in `env-and-secrets-walk`: the operator message in Phase 8
+(present-but-wrong-key, distinct from absent) and the CLI rendering in Phase 9.
+(Those two phases were `needs-env-refs-walk` Phase 5 and `secrets-ux-walk`
+Phase 8 respectively, before the two walks were merged onto one cluster.)
 
 Worth keeping visible: writing the walk is what found this. The design review
 asked what `app status` would print for a broken binding, and the answer was

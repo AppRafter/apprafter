@@ -163,22 +163,33 @@ e2e-redis:
 e2e-disk:
     bash e2e/needs-disk-walk.sh
 
-# Run the needs-env-refs k3d/kind walk (2.12, ADR 0046): the operator
-# resolves an `env` map carrying ALL THREE sources (literal + claim ref
-# {claim:"pg.url"} → decomposed connection-Secret keys url/user/pass + external
-# secret ref {secret:"appsecret/token"}) into container EnvVar/secretKeyRef,
-# the pod sees the resolved values, and deleting the external Secret flips the
-# Application to Ready=False/EnvSecretMissing (then recovers on re-create).
-# 2.12 is UNRELEASED, so this RUNS WITH APPRAFTER_E2E_LOCAL_OPERATOR=1: it
-# builds + side-loads the working-tree operator + admission-webhook and applies
-# the branch CRDs (the published image/CRD predate the `env` value node). It
-# takes the DIRECT-CR marker path (the cue-cmp bare-selector rendering is
-# covered by argocd-cue-cmp/test-inject.sh). Like e2e-pg/e2e-redis/e2e-disk it
-# is NOT a dependency of `e2e`: it boots a CNPG pod and runs on its own nightly
-# cadence via .github/workflows/e2e-env-refs-nightly.yml. Requires a container
-# runtime (docker→k3d / podman→kind), cargo, kubectl.
-e2e-env-refs:
-    APPRAFTER_E2E_LOCAL_OPERATOR=1 bash e2e/needs-env-refs-walk.sh
+# Run the env-and-secrets k3d/kind walk — ONE cluster covering BOTH the 2.12
+# `Application.env` value-reference chain (ADR 0046) and the CLI-facing secrets
+# surface (day-2 D6/D7). `secret seal` into the APP namespace -> `secret list`
+# -> `app add` from a git daemon (needs.pg provisions a claim) -> the rendered
+# env keeps the literal a literal, points the claim refs at the decomposed
+# connection-Secret keys url/user/pass and the external ref at its own
+# Secret+key, with EXACTLY ONE DATABASE_URL entry (2.4e auto-inject removed) ->
+# the pod's resolved values -> re-seal under another key breaks the binding and
+# `app status` explains it (D7) -> recover -> a rotation moves
+# status.envConfig.{digest,changedAt} and shows `← old config` WITHOUT rolling
+# the pod (D6) -> `secret remove`.
+#
+# It REPLACES the former `e2e-env-refs` (e2e/needs-env-refs-walk.sh), which
+# paid for its own cluster + operator build (~5m20) to assert the operator half
+# in isolation via a direct marker-form CR apply. The merged walk reaches the
+# operator through cue-cmp + Argo CD instead; the cue-cmp injection stays
+# covered on its own by argocd-cue-cmp/test-inject.sh. See the walk header.
+#
+# The script FORCES APPRAFTER_E2E_LOCAL_OPERATOR=1 itself: it builds +
+# side-loads the working-tree operator + admission-webhook and applies the
+# branch CRDs/RBAC (the published image/CRD predate 2.22c `status.envConfig`).
+# Like e2e-pg/e2e-redis/e2e-disk it is NOT a dependency of `e2e`: it boots a
+# CNPG pod + Argo CD + a git daemon and runs on its own nightly cadence via
+# .github/workflows/e2e-env-and-secrets-nightly.yml. Requires a container
+# runtime (docker→k3d / podman→kind), git, cargo, kubectl, helm, python3.
+e2e-env-and-secrets:
+    bash e2e/env-and-secrets-walk.sh
 
 # Run the per-environment GitOps-walk k3d/kind e2e (2.9, ADR 0044): the
 # SAME repo deployed per env (app add --env dev|prod) -> two Argo

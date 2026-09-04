@@ -1760,6 +1760,28 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.66": {
+	change:          "safe"
+	operatorVersion: "v0.2.47"
+	notes: """
+		Runner rebuild, no behaviour change: the pin follows cli/runner v0.2.59.
+
+		`cli/backup-core` and `cli/apprafter-backup` gained tests — including the
+		first ever for `kube_rs_exec`, the in-cluster runner's bridge from async
+		kube-rs into the synchronous exec trait, which had 531 regions at zero
+		coverage while running inside the CronJob that backs up production data.
+		The compiled behaviour is unchanged.
+
+		The pin moves because the guard added in 0.2.61 says it must: runner
+		source changed since the pinned tag, so the chart would otherwise
+		advertise an image built from a tree that no longer exists. That guard
+		exists because this pin silently rotted for six weeks, and it has now
+		caught its own author twice — once here, and once on a CLI tag that was
+		published without the last two commits it was supposed to carry.
+		"""
+	references: ["docs/measurements/day2-followups.md"]
+}
+
 compatibility: "0.2.65": {
 	change:          "safe"
 	operatorVersion: "v0.2.47"

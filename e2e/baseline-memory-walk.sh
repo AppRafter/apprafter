@@ -48,6 +48,7 @@ trap cleanup EXIT INT TERM
 
 printf '=== Phase 1: provision + bootstrap published platform (tier=solo, %s) ===\n' "$REGION"
 "$APPRAFTER" target add e2e --provider hetzner-cloud --tier solo --region "$REGION" \
+    --server-type "${APPRAFTER_E2E_SERVER_TYPE:-cpx22}" \
     --token "$TOKEN" --no-interactive --force || { mark_fail "target add"; exit 1; }
 timeout 1500 "$APPRAFTER" up || { mark_fail "apprafter up"; exit 1; }
 "$APPRAFTER" kubeconfig > "$KUBECONFIG" || { mark_fail "kubeconfig"; exit 1; }

@@ -1,81 +1,134 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 #
-# AppRafter secrets-UX walk e2e — the CLI-FACING halves of day-2 ledger
-# entries D6 and D7 (docs/measurements/day2-followups.md), on a local
+# AppRafter env-and-secrets walk e2e — ONE cluster proving BOTH the
+# Phase-2.12 `Application.env` value-reference chain (ADR 0046, operator
+# side) AND the CLI-facing secrets surface (the CLI halves of day-2 ledger
+# entries D6 and D7, docs/measurements/day2-followups.md), on a local
 # kind/k3d cluster.
 #
-# WHY THIS WALK EXISTS
-# ====================
-# D6 ("rotating a secret does not take effect until something else restarts
-# the pods") and D7 ("the CLI cannot answer the question its own error asks")
-# were both fixed in 2.22c and both are recorded as "walk owed". The OPERATOR
-# halves already have one: e2e/needs-env-refs-walk.sh Phase 5 proves the
-# `EnvSecretMissing` condition message distinguishes absent-Secret from
-# present-but-wrong-key and names the namespace + the keys that ARE there, and
-# its Phase 6 proves a rotation moves `status.envConfig.digest`/`changedAt`
-# without rolling the pod. Both read the CR with kubectl.
+# THIS FILE IS A MERGE (and the tradeoff it makes is deliberate)
+# ==============================================================
+# It replaces two walks that each paid for their own cluster:
 #
-# That is precisely the reader D7 is about. The whole complaint is that the
-# answer existed in `status.conditions[type=Ready].message` and no CLI surface
-# printed it, so every diagnosis path left the CLI. So this walk asserts the
-# other end of both fixes — what the PRODUCT SHOWS:
+#   e2e/needs-env-refs-walk.sh  — the ADR-0046 operator chain. It applied the
+#                                 Application CR DIRECTLY in MARKER form
+#                                 (`{claim: "pg.url"}` / `{secret: "n/k"}`),
+#                                 deliberately skipping the git daemon, Argo
+#                                 CD and the cue-cmp sidecar. Its own header
+#                                 called that "the lighter path that proves
+#                                 the operator chain", justified because the
+#                                 cue-cmp bare-selector rendering
+#                                 (`claim.pg.url` → `{claim: "pg.url"}`) is
+#                                 covered separately by the HOST test
+#                                 `argocd-cue-cmp/test-inject.sh`.
+#   e2e/secrets-ux-walk.sh      — the CLI surface: `secret seal|list|remove`,
+#                                 `app add` from a git-daemon fixture,
+#                                 `app status`. Full GitOps path by necessity.
 #
-#   D7 (CLI half)  `apprafter app status` prints the failure's EXPLANATION
-#                  under its NAME: the reason, "carries no key", the namespace
-#                  in quotes, and the key the Secret actually carries
-#                  (cli/platform-cli/src/commands/app.rs :: format_not_ready_line).
-#   D6 (CLI half)  `apprafter app status` flags a pod that predates the last
-#                  config change with `← old config` plus the note explaining
-#                  that a secret-sourced env var is resolved once at pod start
-#                  (app.rs :: pod_is_stale / print_pod_summaries).
+# Both bootstrapped a cluster and both built + side-loaded the working-tree
+# operator image. That build alone measured 3m04 (see e2e/lib.sh's
+# `branch_image_build` note), and the bootstrap ~2m; roughly 5m20 of setup was
+# being paid twice to assert two halves of the SAME feature against the SAME
+# operator.
 #
-# It also covers the two `secret` verbs that exist because of D7 and the
-# namespace footgun around them: `secret list` (where a secret lives + which
-# KEYS it carries + when it was sealed) and `secret remove`.
+# WHAT MERGING COSTS, STATED HONESTLY. The operator-side assertions below now
+# arrive through cue-cmp and Argo CD rather than through a direct `kubectl
+# apply` of the resolved marker form. So a cue-cmp rendering bug or an Argo
+# sync failure can now fail an assertion whose subject is the OPERATOR — the
+# isolation needs-env-refs-walk deliberately bought is gone. That is a
+# CONSIDERED TRADE for ~5m20 of duplicated setup, not an oversight:
 #
-# Nothing here duplicates needs-env-refs-walk: that walk applies a marker-form
-# CR directly and reads conditions with kubectl; this one drives the real
-# product surfaces — `secret seal|list|remove`, `app add`, `app status` — and
-# reads THEIR output.
+#   * the injection itself is still covered independently and cheaply by the
+#     host test `argocd-cue-cmp/test-inject.sh`, which runs the real
+#     entrypoint over fixtures (including the Style-A bare-`claim.pg.url`
+#     fixture this walk's own fixture mirrors) with no cluster at all — so a
+#     rendering regression is caught there first, in seconds;
+#   * when this walk fails, the injected form is one `kubectl get
+#     application.apprafter.io shop -o yaml` away, which distinguishes
+#     "cue-cmp rendered the wrong marker" from "the operator mis-resolved a
+#     correct marker" in a single command;
+#   * and the GitOps path is the path a user is actually on. The direct-CR
+#     form was a test convenience; nobody writes marker JSON by hand.
+#
+# If a future change makes the operator half worth isolating again, split it
+# back out — but split it out knowingly, not by accident.
+#
+# WHAT IS PROVEN HERE
+# ===================
+# ADR 0046 (operator):
+#   provision (2.4c) -> decomposed connection-Secret keys (2.12, ADR 0046 #3)
+#   -> resolve_env: literal | claim ref | secret ref -> EnvVar / secretKeyRef
+#   -> the RESOLVED values on a running pod -> EnvSecretMissing NotReady
+#   -> recover -> a rotation moves `status.envConfig.{digest,changedAt}`
+#      WITHOUT rolling anything.
+#
+# D6/D7 (CLI) — the reader end of the same two fixes:
+#   D7  `apprafter app status` prints the failure's EXPLANATION under its
+#       NAME: the reason, "carries no key", the namespace in quotes, and the
+#       key the Secret actually carries
+#       (cli/platform-cli/src/commands/app.rs :: format_not_ready_line).
+#   D6  `apprafter app status` flags a pod that predates the last config
+#       change with `← old config` plus the note explaining that a
+#       secret-sourced env var is resolved once at pod start
+#       (app.rs :: pod_is_stale / print_pod_summaries).
+#
+# plus the two `secret` verbs that exist because of D7 and the namespace
+# footgun around them: `secret list` (where a secret lives + which KEYS it
+# carries + when it was sealed) and `secret remove`.
 #
 # THE LEGS
 # ========
 #   1. cluster up, CLI state seeded, `cluster-bootstrap`, working-tree
 #      operator + webhook + branch CRDs/RBAC side-loaded.
-#   2. the app namespace created explicitly, BEFORE any seal.
-#   3. `secret seal shop-api -n <app-ns> --from-literal token=v1`
+#   2. platform readiness — including the always-on CNPG operator and the
+#      seeded `pg-integrated` ServiceProvider the `needs.pg` selector matches.
+#   3. the app namespace created explicitly, BEFORE any seal.
+#   4. `secret seal shop-api -n <app-ns> --from-literal token=v1`
 #      -> SealedSecret + unsealed Secret exist IN THE APP NAMESPACE, and
 #         NOTHING of that name exists in apprafter-system.
-#   4. `secret list -n <app-ns>` names the secret, its namespace, its KEY and
+#   5. `secret list -n <app-ns>` names the secret, its namespace, its KEY and
 #      a real sealed-at timestamp.
-#   5. `app add` from a host git daemon; CR Ready; a workload pod Running.
-#   6. break the binding THROUGH A PRODUCT SURFACE: re-seal the SAME name with
+#   6. `app add` from a host git daemon; the ResourceClaim is generated and
+#      provisioned; the connection Secret carries the DECOMPOSED keys and NOT
+#      the dropped composed `DATABASE_URL` key; CR Ready; a pod Running.
+#   7. the RENDERED env wiring on the Deployment (literal stays a literal;
+#      claim refs -> secretKeyRefs into the connection Secret keys
+#      url/user/pass; the external ref -> its own Secret+key; EXACTLY ONE
+#      `DATABASE_URL` entry) and the RESOLVED values read off the pod.
+#   8. break the binding THROUGH A PRODUCT SURFACE: re-seal the SAME name with
 #      a DIFFERENT key (sealing REPLACES, it does not merge) -> the referenced
-#      key is genuinely gone -> CR phase EnvSecretMissing.
-#   7. D7: `apprafter app status` explains it.
-#   8. recover: re-seal the original key with a new value -> CR Ready.
-#   9. D6: rotate again while a pod is running -> `apprafter app status` shows
-#      `← old config` on that pod AND the pod was NOT replaced.
-#  10. `secret remove --yes` -> BOTH the SealedSecret and the Secret are gone.
+#      key is genuinely gone -> CR phase EnvSecretMissing, and the operator's
+#      Ready condition says which of the three causes it is.
+#   9. D7: `apprafter app status` explains it.
+#  10. recover: re-seal the original key with a new value -> CR Ready.
+#  11. D6: rotate again while a pod is running -> `apprafter app status` shows
+#      `← old config` on that pod, `status.envConfig.{digest,changedAt}` both
+#      move, `changedAt` lands NEWER than that pod's startTime — AND nothing
+#      rolled (same pod, same startTime, same restart count, same Deployment
+#      generation).
+#  12. `secret remove --yes` -> BOTH the SealedSecret and the Secret are gone.
 #
 # ORDERING CONSTRAINTS — every one of these is load-bearing
 # =========================================================
-#   * The namespace is the point of legs 2-4. `secret seal`'s `--namespace`
+#   * The namespace is the point of legs 3-5. `secret seal`'s `--namespace`
 #     DEFAULTS to `apprafter-system` (platform credential material), and a
 #     secret sealed there is invisible to an app that references it — the
 #     recorded footgun. Creating the namespace first and asserting the
-#     apprafter-system NEGATIVE is what makes leg 3 mean anything.
-#   * Leg 6 breaks the binding by RE-SEALING, never by `kubectl delete secret`:
+#     apprafter-system NEGATIVE is what makes leg 4 mean anything.
+#   * Leg 7 runs BEFORE leg 8 breaks anything: the resolved-value assertions
+#     need the binding intact, and `kubectl exec` is the only witness that the
+#     secretKeyRef materialised rather than merely being written down.
+#   * Leg 8 breaks the binding by RE-SEALING, never by `kubectl delete secret`:
 #     the sealed-secrets controller re-creates a deleted Secret from the
 #     SealedSecret within seconds, and the walk would lose the race. Re-sealing
 #     under a different key replaces the object's data, which is both durable
 #     and a real product path.
-#   * Leg 6 asserts the referenced key is ACTUALLY gone from the unsealed
+#   * Leg 8 asserts the referenced key is ACTUALLY gone from the unsealed
 #     Secret before asserting anything downstream. Otherwise a walk that timed
 #     out waiting for `EnvSecretMissing` could not say whether the operator or
 #     the controller was at fault.
-#   * Leg 9's `← old config` flag is `pod.startTime < status.envConfig.changedAt`.
+#   * Leg 11's `← old config` flag is `pod.startTime < status.envConfig.changedAt`.
 #     The pod MUST therefore predate the rotation: the walk records the pod
 #     WHILE Ready, and only then rotates. It asserts BOTH halves — the flag
 #     appears AND the pod was not replaced — because D6's decision was that the
@@ -94,15 +147,18 @@
 #     MISS. Everything here captures to a variable or a file and matches with
 #     `case` / `[[ == *needle* ]]`. Likewise no pipeline whose left side may
 #     legitimately fail while polling for an object that does not exist yet.
+#   * There is no Secret watch that fires instantly — the consequences of a
+#     re-seal land on the operator's requeue. Every such transition polls with
+#     a 120-180s budget rather than sampling once.
 #   * No phase waits for the Argo CD Application to be Synced+Healthy while the
 #     CR is not Ready: the health Lua reports Progressing for every non-Ready
 #     phase, so such a wait can only burn its budget. Legs poll the CR.
 #   * The fixture pins `imagePolicy.resolve: "off"` (ADR 0040) so an unrelated
-#     tag re-resolution cannot roll the pod and destroy leg 9.
+#     tag re-resolution cannot roll the pod and destroy leg 11.
 #
 # Local-operator mode (FORCED)
 # ----------------------------
-# The D7 line asserted in leg 7 ships in the WORKING-TREE CLI, which lib.sh's
+# The D7 line asserted in leg 9 ships in the WORKING-TREE CLI, which lib.sh's
 # `apprafter()` already runs from source (`cargo run`), so the CLI half needs
 # no side-load. The OPERATOR halves it depends on — the `EnvSecretMissing`
 # message naming the available keys, and `status.envConfig` — are 2.22c, so the
@@ -114,6 +170,11 @@
 # `status` node carries `x-kubernetes-preserve-unknown-fields: true`, so
 # `status.envConfig` survives against any published CRD version.)
 #
+# The cue-cmp is NOT side-loaded: the published sidecar (0.1.9+) already ships
+# the schema + `claim`-binding injection this fixture's bare `claim.pg.url`
+# selectors need. If a change to `argocd-cue-cmp/` is what is under test, that
+# is `argocd-cue-cmp/test-inject.sh`'s job, not this walk's.
+#
 # CLI state injection
 # -------------------
 # `cluster-bootstrap` / `secret *` / `app *` read the kubeconfig from the CLI's
@@ -121,8 +182,8 @@
 # a tmpdir seeded with config.yaml (active_target: k3d) + a state.json carrying
 # the kubeconfig as plaintext `kubeconfig_yaml` — same as every other walk.
 #
-# Required: docker (or podman), git, cargo, kubectl — all satisfied inside
-# `nix develop` or on a standard CI runner.
+# Required: docker (or podman), git, cargo, kubectl, helm, python3 — all
+# satisfied inside `nix develop` or on a standard CI runner.
 #
 # Judge this walk BY READING THE LOG: every leg prints an `ok:` line, failures
 # print `ERROR:` to stderr, and the final GREEN banner prints ONLY on the
@@ -143,8 +204,9 @@ set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
 # ---------------------------------------------------------------
-# The 2.22c operator surface this walk reads (envConfig, the keys-listing
-# EnvSecretMissing message) is not in the published chart, so local-build
+# The 2.12 + 2.22c operator surface this walk reads (the `env` value node,
+# the decomposed connection-Secret keys, envConfig, the keys-listing
+# EnvSecretMissing message) is not all in the published chart, so local-build
 # mode is MANDATORY — force it rather than requiring the caller to know.
 # ---------------------------------------------------------------
 export APPRAFTER_E2E_LOCAL_OPERATOR=1
@@ -158,38 +220,63 @@ export NO_COLOR=1
 # Constants
 # ---------------------------------------------------------------
 
-CLUSTER_NAME="apprafter-secrets-ux-walk"
-FIXTURE_SRC="${REPO_ROOT}/e2e/fixtures/secrets-ux-app"
+CLUSTER_NAME="apprafter-env-secrets-walk"
+FIXTURE_SRC="${REPO_ROOT}/e2e/fixtures/env-and-secrets-app"
+FIXTURE_REPO="env-and-secrets-app"   # git-daemon path segment
 
 APP="shop"                      # AppRafter CR + Argo CD Application name
-APP_NS="secrets-ux"             # tenant namespace (created explicitly, leg 2)
+APP_NS="env-and-secrets"        # tenant namespace (created explicitly, leg 3)
 PLATFORM_NS="apprafter-system"  # operator + webhook + sealed-secrets live here
                                 # AND it is `secret seal`'s DEFAULT namespace,
-                                # which is exactly the footgun leg 3 asserts.
+                                # which is exactly the footgun leg 4 asserts.
 
 SECRET_NAME="shop-api"          # must match the fixture's secret: payload
 SECRET_KEY="token"              # ditto
-WRONG_KEY="other"               # the key leg 6 re-seals under, replacing token
+WRONG_KEY="other"               # the key leg 8 re-seals under, replacing token
 
-VAL_1="tok-one"                 # sealed in leg 3
-VAL_BREAK="tok-under-wrong-key" # leg 6 (under WRONG_KEY)
-VAL_2="tok-two"                 # leg 8 recovery (under SECRET_KEY)
-VAL_3="tok-three"               # leg 9 rotation (under SECRET_KEY)
+VAL_1="tok-one"                 # sealed in leg 4
+VAL_BREAK="tok-under-wrong-key" # leg 8 (under WRONG_KEY)
+VAL_2="tok-two"                 # leg 10 recovery (under SECRET_KEY)
+VAL_3="tok-three"               # leg 11 rotation (under SECRET_KEY)
 
 ENV_VAR="API_KEY"               # the fixture env name bound to the secret
+
+# ---- the 2.12 env-reference coordinates (ADR 0046) --------------------
+# Derived from the claim's (namespace, name) by the 2.4c provisioner — see
+# operator/operator-controllers/resourceclaim-provisioner/src/{reconcile,cnpg}.rs
+# (connection_secret_name / pg_identifier) and the Application controller's
+# claim_name (`<app>-<type>`).
+CLAIM="${APP}-pg"                          # generated ResourceClaim name
+CONN_SECRET="${CLAIM}-conn"                # provisioned connection Secret
+PG_ROLE="claim_env_and_secrets_shop_pg"    # pg_identifier(env-and-secrets, shop-pg)
+CNPG_NS="cnpg-system"                      # shared CNPG Cluster namespace
+PROVIDER="pg-integrated"                   # seeded ServiceProvider
+
+LITERAL_ENV="LOG_LEVEL"         # the fixture's literal env name
+LITERAL_VAL="info"              # ...and its value
+CLAIM_URL_ENV="DATABASE_URL"    # claim.pg.url  -> conn Secret key `url`
+CLAIM_USER_ENV="DB_USER"        # claim.pg.user -> conn Secret key `user`
+CLAIM_PASS_ENV="DB_PASS"        # claim.pg.pass -> conn Secret key `pass`
 
 GIT_DAEMON_PORT="9422"          # distinct from 9418/9419/9420/9421
 
 # Group-qualify the collision-prone kinds so kubectl never resolves to the
-# wrong API group (Argo CD's argoproj.io Application vs apprafter.io).
+# wrong API group: bare `application` also matches Argo CD's argoproj.io
+# Application, and bare `resourceclaim` matches the k8s 1.32+ DRA
+# resource.k8s.io ResourceClaim.
 ARGO_APP="application.argoproj.io"
 AR_APP="application.apprafter.io"
+CLAIM_RES="resourceclaim.apprafter.io"
 
 # ---------------------------------------------------------------
 # Tool checks (fail loudly, never silently skip)
 # ---------------------------------------------------------------
 
-for tool in git cargo kubectl helm; do
+# python3: leg 11 compares two RFC3339 stamps of DIFFERENT precision
+# (`pod.status.startTime` is a metav1.Time truncated to seconds; the
+# operator's `changedAt` carries nanoseconds), which shell string compare
+# cannot do.
+for tool in git cargo kubectl helm python3; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         printf 'ERROR: required tool "%s" not found on PATH\n' "$tool" >&2
         exit 2
@@ -232,7 +319,7 @@ cleanup() {
     pkill -f "git[ -]daemon.*${GIT_DAEMON_PORT}" 2>/dev/null || true
 
     if [ "$exit_code" -ne 0 ]; then
-        printf '\n!!! secrets-ux-walk FAILED at %s (exit %d) !!!\n' \
+        printf '\n!!! env-and-secrets-walk FAILED at %s (exit %d) !!!\n' \
             "$(elapsed)" "$exit_code" >&2
         if [ "$K3D_CREATED" -eq 1 ]; then
             dump_diagnostics
@@ -316,7 +403,7 @@ STATE
 # Helper: init the fixture git repo and start the host git daemon.
 # ---------------------------------------------------------------
 setup_git_server() {
-    local repo_dst="${GIT_REPOS_DIR}/secrets-ux-app"
+    local repo_dst="${GIT_REPOS_DIR}/${FIXTURE_REPO}"
 
     mkdir -p "${GIT_REPOS_DIR}"
 
@@ -327,7 +414,7 @@ setup_git_server() {
         git config user.email "e2e@apprafter.io"
         git config user.name "AppRafter E2E"
         git add .
-        git commit -m "feat: initial secrets-ux-app fixture"
+        git commit -m "feat: initial env-and-secrets-app fixture"
     )
     touch "${repo_dst}/.git/git-daemon-export-ok"
 
@@ -459,6 +546,29 @@ jp() {  # <kind> <ns> <name> <jsonpath>
     kubectl -n "$2" get "$1" "$3" -o jsonpath="$4" 2>/dev/null || true
 }
 
+# Condition readers: the `.status` / `.reason` / `.message` of a condition
+# selected by `type`, via a jsonpath filter. These read the OPERATOR's own
+# verdict, which is what leg 8 asserts alongside the CLI rendering in leg 9 —
+# a CLI that printed the right words while the operator set the wrong reason
+# would otherwise pass.
+cond_status() {  # <kind> <ns> <name> <condition-type>
+    kubectl -n "$2" get "$1" "$3" -o \
+        jsonpath="{.status.conditions[?(@.type==\"$4\")].status}" \
+        2>/dev/null || true
+}
+
+cond_reason() {  # <kind> <ns> <name> <condition-type>
+    kubectl -n "$2" get "$1" "$3" -o \
+        jsonpath="{.status.conditions[?(@.type==\"$4\")].reason}" \
+        2>/dev/null || true
+}
+
+cond_message() {  # <kind> <ns> <name> <condition-type>
+    kubectl -n "$2" get "$1" "$3" -o \
+        jsonpath="{.status.conditions[?(@.type==\"$4\")].message}" \
+        2>/dev/null || true
+}
+
 # Poll until a jsonpath renders exactly <want>.
 wait_jsonpath() {  # <kind> <ns> <name> <jsonpath> <want> [timeout]
     local kind="$1" ns="$2" name="$3" jsonpath="$4" want="$5"
@@ -520,6 +630,22 @@ wait_absent() {  # <kind> <ns> <name> [timeout]
     return 1
 }
 
+# Wait until a condition's message contains a substring, or time out. Echoes
+# the last message read either way, so the caller can print it on failure.
+wait_cond_message() {  # <kind> <ns> <name> <type> <needle> <timeout>
+    local deadline msg=""
+    deadline=$(( $(date +%s) + $6 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        msg="$(cond_message "$1" "$2" "$3" "$4")"
+        case "$msg" in
+            *"$5"*) printf '%s' "$msg"; return 0 ;;
+        esac
+        sleep 3
+    done
+    printf '%s' "$msg"
+    return 1
+}
+
 # One-shot absence assertion (no polling — used for the apprafter-system
 # NEGATIVE, which must be true the instant the seal returns).
 assert_absent_now() {  # <description> <kind> <ns> <name>
@@ -573,6 +699,41 @@ wait_secret_key_absent() {  # <ns> <name> <key> [timeout]
     return 1
 }
 
+# ---------------------------------------------------------------
+# Rendered-env readers — the secretKeyRef name/key (or the literal value)
+# for a named env var on the Deployment's container[0].
+# ---------------------------------------------------------------
+env_ref_secret_name() {  # <env-name>
+    kubectl -n "$APP_NS" get deployment "$APP" \
+        -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"$1\")].valueFrom.secretKeyRef.name}" \
+        2>/dev/null || true
+}
+env_ref_secret_key() {  # <env-name>
+    kubectl -n "$APP_NS" get deployment "$APP" \
+        -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"$1\")].valueFrom.secretKeyRef.key}" \
+        2>/dev/null || true
+}
+env_literal() {  # <env-name>
+    kubectl -n "$APP_NS" get deployment "$APP" \
+        -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"$1\")].value}" \
+        2>/dev/null || true
+}
+
+# How many env entries on container[0] are named $1. A jsonpath filter selects
+# ALL matches and joins their `.name` with a space, so the token count is the
+# multiplicity — which is how the walk proves there is exactly ONE
+# DATABASE_URL (no auto-inject duplicate beside the explicit ref).
+# `set --` rather than `| wc -w`: capture first, then match.
+env_name_count() {  # <env-name>
+    local names
+    names=$(kubectl -n "$APP_NS" get deployment "$APP" \
+        -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"$1\")].name}" \
+        2>/dev/null || true)
+    # shellcheck disable=SC2086  # deliberate word splitting: counting tokens.
+    set -- $names
+    printf '%d' "$#"
+}
+
 # The single workload pod's name / start time.
 app_pod() {
     kubectl -n "$APP_NS" get pods -l "app.kubernetes.io/name=${APP}" \
@@ -581,6 +742,21 @@ app_pod() {
 pod_start_time() {  # <pod>
     kubectl -n "$APP_NS" get pod "$1" \
         -o jsonpath='{.status.startTime}' 2>/dev/null || true
+}
+pod_restarts() {  # (label-selected first pod)
+    kubectl -n "$APP_NS" get pods -l "app.kubernetes.io/name=${APP}" \
+        -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}' \
+        2>/dev/null || true
+}
+
+# Read a RESOLVED env var off a RUNNING pod. secretKeyRef values are
+# materialised into the container's environment at start, so this proves the
+# resolution end-to-end rather than only the spec wiring. Captured first (no
+# pipeline), then the trailing CR is trimmed in-shell.
+pod_env() {  # <pod> <var>
+    local raw
+    raw=$(kubectl -n "$APP_NS" exec "$1" -- printenv "$2" 2>/dev/null || true)
+    printf '%s' "${raw%$'\r'}"
 }
 
 # Capture `apprafter app status <app>` (NO_COLOR is exported globally) into a
@@ -630,8 +806,8 @@ printf '  cluster-bootstrap complete\n'
 # Why each piece is mandatory rather than defensive:
 #   * IMAGE  — the `EnvSecretMissing` message that names the keys the Secret
 #              DOES carry, and `status.envConfig.{digest,changedAt}`, are
-#              2.22c; the published operator predates both, so leg 7 would
-#              assert against an older message and leg 9 would have no
+#              2.22c; the published operator predates both, so leg 9 would
+#              assert against an older message and leg 11 would have no
 #              changedAt to compare against.
 #   * CRDs   — applied for spec-side parity with the branch operator. NOT for
 #              `status.envConfig`: the Application CRD's `status` node carries
@@ -649,32 +825,21 @@ printf '  cluster-bootstrap complete\n'
 # closes it just before Phase 2.
 # ---------------------------------------------------------------
 if [ -n "${APPRAFTER_E2E_LOCAL_OPERATOR:-}" ]; then
-phase "Phase 1b: build + load local operator + webhook (FORCED for 2.22c)"
+phase "Phase 1b: build + load local operator + webhook (FORCED for 2.12 + 2.22c)"
 builder=podman; command -v podman >/dev/null 2>&1 || builder=docker
 
-build_load_restart() { # <deployment> <operator-subdir>
-    local dep="$1" sub="$2" img
-    printf '  waiting for the %s Deployment to appear ...\n' "$dep"
-    for _ in $(seq 1 60); do
-        kubectl -n "$PLATFORM_NS" get deploy "$dep" >/dev/null 2>&1 && break
-        sleep 5
-    done
-    img=$(kubectl -n "$PLATFORM_NS" get deploy "$dep" \
-        -o jsonpath='{.spec.template.spec.containers[0].image}')
-    printf '  building %s from the working tree (%s) ...\n' "$img" "$builder"
-    "$builder" build -f "${REPO_ROOT}/operator/${sub}/Dockerfile" \
-        -t "$img" "${REPO_ROOT}/operator"
-    cluster_load_image "$CLUSTER_NAME" "$img"
-    kubectl -n "$PLATFORM_NS" rollout restart "deploy/${dep}"
-    kubectl -n "$PLATFORM_NS" rollout status "deploy/${dep}" --timeout=180s
-}
+# `build_load_restart` now lives in e2e/lib.sh — ONE implementation, and it
+# CACHES the built image by the content of operator/ + schemas/v1alpha1/.
+# Thirteen walks carried a private copy that SHADOWED the shared one, so the
+# cache benefited nobody: each still rebuilt the same image (3m04 measured).
 build_load_restart apprafter-operator apprafter-operator
 build_load_restart admission-webhook admission-webhook
 
 # `rollout status` returns once the NEW webhook pod is Ready, but the OLD
 # (released) pod lingers Terminating for its grace period, and during that
-# window an apply can still route to it. Wait until ONLY the branch webhook
-# serves before any branch-typed apply.
+# window an apply can still route to it — whose released validator may lack
+# the branch's env-ref rules. Wait until ONLY the branch webhook serves before
+# any branch-typed apply.
 printf '  waiting for the old (released) webhook pod to fully terminate ...\n'
 _wh_deadline=$(( $(date +%s) + 90 ))
 while [ "$(date +%s)" -lt "$_wh_deadline" ]; do
@@ -707,10 +872,11 @@ apply_branch_operator_rbac
 fi  # end APPRAFTER_E2E_LOCAL_OPERATOR (Phase 1b)
 
 # ===============================================================
-# Phase 2: platform readiness (AppProject, webhook, sealed-secrets)
+# Phase 2: platform readiness (AppProject, webhook, sealed-secrets,
+#          CNPG operator, the seeded pg provider)
 # ===============================================================
 
-phase "Phase 2: platform readiness (apps AppProject, admission-webhook, sealed-secrets)"
+phase "Phase 2: platform readiness (apps AppProject, admission-webhook, sealed-secrets, CNPG, ${PROVIDER})"
 
 printf '  waiting for AppProject apps ...\n'
 deadline=$(( $(date +%s) + 600 ))
@@ -753,6 +919,23 @@ while [ "$(date +%s)" -lt "$_ep_deadline" ]; do
     sleep 5
 done
 assert_nonempty "sealed-secrets-controller has a ready endpoint" "$_ep"
+
+# The CNPG operator Deployment must be Available before any pg claim can be
+# provisioned (the provisioner SSA-applies CNPG Cluster/Database CRs). The
+# fixture's `needs.pg` is what gives the CLAIM-derived env refs something to
+# resolve against, so this is a hard precondition for leg 7, not a nicety.
+printf '  waiting for the CNPG operator Deployment ...\n'
+retry 30 10 -- kubectl -n "$CNPG_NS" rollout status \
+    deploy -l app.kubernetes.io/name=cloudnative-pg --timeout=60s
+
+# ASSERT the `pg-integrated` ServiceProvider is seeded with the
+# tier=integrated label the fixture's needs.pg selector matches. Without this
+# the claim would sit unscheduled and the failure would surface 5 minutes
+# later as an opaque "Application never became Ready".
+retry 30 10 -- kubectl get serviceprovider "$PROVIDER" \
+    -n "$PLATFORM_NS" >/dev/null
+sp_tier=$(jp serviceprovider "$PLATFORM_NS" "$PROVIDER" '{.metadata.labels.tier}')
+assert_eq "ServiceProvider ${PROVIDER} label tier" "$sp_tier" "integrated"
 
 # ===============================================================
 # Phase 3: the app namespace, created EXPLICITLY before any seal
@@ -835,19 +1018,19 @@ else
 fi
 
 # ===============================================================
-# Phase 6: git daemon + `apprafter app add` (the app that consumes it)
+# Phase 6: git daemon + `apprafter app add` -> claim provisioned -> Ready
 # ===============================================================
 
-phase "Phase 6: git daemon + apprafter app add ${APP} (env ${ENV_VAR} -> secret ${SECRET_NAME}/${SECRET_KEY})"
+phase "Phase 6: git daemon + apprafter app add ${APP} (needs.pg + env ${ENV_VAR} -> secret ${SECRET_NAME}/${SECRET_KEY})"
 
 setup_git_server
 
 if [ "$(cluster_runtime)" = "kind" ]; then
-    GIT_REPO_URL="git://$(detect_host_gateway_ip):${GIT_DAEMON_PORT}/secrets-ux-app"
+    GIT_REPO_URL="git://$(detect_host_gateway_ip):${GIT_DAEMON_PORT}/${FIXTURE_REPO}"
 else
-    GIT_REPO_URL="git://host.k3d.internal:${GIT_DAEMON_PORT}/secrets-ux-app"
+    GIT_REPO_URL="git://host.k3d.internal:${GIT_DAEMON_PORT}/${FIXTURE_REPO}"
 fi
-GIT_REPO_URL_HOST="git://127.0.0.1:${GIT_DAEMON_PORT}/secrets-ux-app"
+GIT_REPO_URL_HOST="git://127.0.0.1:${GIT_DAEMON_PORT}/${FIXTURE_REPO}"
 printf '  fixture repo URL (in-cluster): %s\n' "$GIT_REPO_URL"
 
 printf '  verifying the git daemon is up (local clone check) ...\n'
@@ -872,6 +1055,31 @@ apprafter_from_fixture app add \
 # every non-Ready phase, so a Synced+Healthy wait is only safe while the app is
 # Ready — and here it is not Ready yet by definition.)
 wait_exists "$AR_APP" "$APP_NS" "$APP" 600
+
+# The 2.4d gate's load-bearing action: the controller emits a ResourceClaim
+# instead of rendering immediately. Its existence also confirms the cue-cmp
+# rendered `needs.pg` through — if this times out, read the CR
+# (`kubectl get application.apprafter.io shop -o yaml`) before blaming the
+# operator; see the merge note in this file's header.
+wait_jsonpath "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.spec.type}' pg 300
+
+# The claim provisions (lazy CNPG Cluster boot is the slow step).
+wait_jsonpath "$CLAIM_RES" "$APP_NS" "$CLAIM" '{.status.ready}' true 420
+
+# The connection Secret carries the DECOMPOSED keys (ADR 0046 #3): url, user,
+# pass, host, port, db. Prove the three keys `resolve_env` reads exist BEFORE
+# asserting anything about the rendered refs — otherwise a wiring assertion
+# that fails cannot say whether the renderer or the provisioner is at fault.
+for _k in url user pass; do
+    _v=$(jp secret "$APP_NS" "$CONN_SECRET" "{.data.${_k}}")
+    assert_nonempty "connection Secret ${CONN_SECRET} key ${_k}" "$_v"
+done
+# And the old COMPOSED key must be GONE — the 2.4e `DATABASE_URL` key was
+# dropped with the auto-injection it fed (ADR 0046 #5).
+_old=$(jp secret "$APP_NS" "$CONN_SECRET" '{.data.DATABASE_URL}')
+assert_eq "connection Secret has NO DATABASE_URL key (2.4e dropped)" "$_old" ""
+
+# With the claim ready and the external Secret sealed, every env ref resolves.
 wait_jsonpath "$AR_APP" "$APP_NS" "$APP" '{.status.phase}' Ready 300
 
 kubectl -n "$APP_NS" wait --for=condition=Available \
@@ -884,7 +1092,7 @@ assert_nonempty "a workload pod is Running before anything is broken" "$POD_INIT
 printf '  ok: workload pod %s is Running with the sealed value bound to %s\n' \
     "$POD_INITIAL" "$ENV_VAR"
 
-# THE NEGATIVE CONTROL FOR PHASE 10, AND IT HAS TO BE TAKEN HERE.
+# THE NEGATIVE CONTROL FOR PHASE 11, AND IT HAS TO BE TAKEN HERE.
 #
 # `pod_is_stale` is `startTime < envConfig.changedAt`. Right now that is FALSE
 # by construction: the digest is stamped in the same reconcile that applies the
@@ -893,8 +1101,8 @@ printf '  ok: workload pod %s is Running with the sealed value bound to %s\n' \
 # provably exists.
 #
 # Without this line the walk's headline D6 assertion proves nothing. The
-# recovery in Phase 9 is itself a digest change, so it moves `changedAt` past
-# this pod's startTime and the flag is ALREADY set before Phase 10's rotation
+# recovery in Phase 10 is itself a digest change, so it moves `changedAt` past
+# this pod's startTime and the flag is ALREADY set before Phase 11's rotation
 # runs — a `pod_is_stale` that returned true unconditionally would sail through
 # a positive-only check. Two independent reviewers caught this before the walk
 # was ever run; the ordering comment at the top of this file described the
@@ -929,10 +1137,87 @@ if ! assert_file_lacks "a pod that POSTDATES the last config change is not flagg
 fi
 
 # ===============================================================
-# Phase 7: break the binding THROUGH A PRODUCT SURFACE
+# Phase 7: the rendered env wiring + the RESOLVED pod values (ADR 0046)
 # ===============================================================
 
-phase "Phase 7: re-seal ${SECRET_NAME} under key ${WRONG_KEY} — the reference stops resolving"
+phase "Phase 7: rendered env wiring + resolved pod values (literal + claim url/user/pass + external secret)"
+
+# ---- (a) the rendered Deployment container env wiring ----
+
+# The literal stays a LITERAL. Both halves are asserted: the `value` is right
+# AND there is no `valueFrom.secretKeyRef` — a renderer that turned every env
+# entry into a ref would still satisfy the first check alone.
+log_literal=$(env_literal "$LITERAL_ENV")
+assert_eq "${LITERAL_ENV} literal value" "$log_literal" "$LITERAL_VAL"
+log_ref=$(env_ref_secret_name "$LITERAL_ENV")
+assert_eq "${LITERAL_ENV} is NOT a secretKeyRef" "$log_ref" ""
+
+# The CLAIM refs resolve into the PROVISIONED connection Secret, each at its
+# own decomposed key: url / user / pass.
+dburl_name=$(env_ref_secret_name "$CLAIM_URL_ENV")
+assert_eq "${CLAIM_URL_ENV} secretKeyRef.name" "$dburl_name" "$CONN_SECRET"
+dburl_key=$(env_ref_secret_key "$CLAIM_URL_ENV")
+assert_eq "${CLAIM_URL_ENV} secretKeyRef.key" "$dburl_key" "url"
+
+dbuser_name=$(env_ref_secret_name "$CLAIM_USER_ENV")
+assert_eq "${CLAIM_USER_ENV} secretKeyRef.name" "$dbuser_name" "$CONN_SECRET"
+dbuser_key=$(env_ref_secret_key "$CLAIM_USER_ENV")
+assert_eq "${CLAIM_USER_ENV} secretKeyRef.key" "$dbuser_key" "user"
+
+dbpass_name=$(env_ref_secret_name "$CLAIM_PASS_ENV")
+assert_eq "${CLAIM_PASS_ENV} secretKeyRef.name" "$dbpass_name" "$CONN_SECRET"
+dbpass_key=$(env_ref_secret_key "$CLAIM_PASS_ENV")
+assert_eq "${CLAIM_PASS_ENV} secretKeyRef.key" "$dbpass_key" "pass"
+
+# The EXTERNAL secret ref resolves into its own Secret + key — the same
+# binding legs 8-11 break, explain, recover and rotate.
+ext_name=$(env_ref_secret_name "$ENV_VAR")
+assert_eq "${ENV_VAR} secretKeyRef.name" "$ext_name" "$SECRET_NAME"
+ext_key=$(env_ref_secret_key "$ENV_VAR")
+assert_eq "${ENV_VAR} secretKeyRef.key" "$ext_key" "$SECRET_KEY"
+
+# THE NEGATIVE ASSERTION OF ADR 0046 #5. Before 2.12 the operator injected a
+# `DATABASE_URL` for every pg claim; that auto-injection is REMOVED, and the
+# only env entry by that name must be the one the manifest declares. A
+# resurrected auto-inject would show up here as a duplicate and NOWHERE ELSE —
+# the pod would still start, and the second entry would silently win.
+dburl_count=$(env_name_count "$CLAIM_URL_ENV")
+assert_eq "exactly one ${CLAIM_URL_ENV} env entry (no auto-inject)" "$dburl_count" "1"
+
+# ---- (b) the RESOLVED VALUES on the running pod ----
+#
+# The wiring above is what the renderer WROTE DOWN. This is what the kubelet
+# actually materialised: a secretKeyRef naming a key that does not exist keeps
+# the pod out of Running entirely, and a ref into the wrong Secret resolves to
+# the wrong value while looking perfectly well-formed in the spec.
+
+got=$(pod_env "$POD_INITIAL" "$LITERAL_ENV")
+assert_eq "pod ${LITERAL_ENV} resolved (literal)" "$got" "$LITERAL_VAL"
+
+got=$(pod_env "$POD_INITIAL" "$CLAIM_URL_ENV")
+case "$got" in
+    postgres://*|postgresql://*)
+        printf '  ok: pod %s is a postgres DSN: %s\n' "$CLAIM_URL_ENV" "$got" ;;
+    *)
+        printf 'ERROR: pod %s is not a postgres DSN: %q\n' "$CLAIM_URL_ENV" "$got" >&2
+        exit 1 ;;
+esac
+
+got=$(pod_env "$POD_INITIAL" "$CLAIM_USER_ENV")
+assert_eq "pod ${CLAIM_USER_ENV} resolved (the managed role)" "$got" "$PG_ROLE"
+got=$(pod_env "$POD_INITIAL" "$CLAIM_PASS_ENV")
+assert_nonempty "pod ${CLAIM_PASS_ENV} resolved (the role password)" "$got"
+
+got=$(pod_env "$POD_INITIAL" "$ENV_VAR")
+assert_eq "pod ${ENV_VAR} resolved (the sealed external value)" "$got" "$VAL_1"
+
+printf '  ok: all three ADR-0046 env sources resolved on the pod: literal + claim(url/user/pass) + external secret\n'
+
+# ===============================================================
+# Phase 8: break the binding THROUGH A PRODUCT SURFACE
+# ===============================================================
+
+phase "Phase 8: re-seal ${SECRET_NAME} under key ${WRONG_KEY} — the reference stops resolving"
 
 # Sealing REPLACES the object's keys; it does not merge. So re-sealing the same
 # NAME with a different KEY is a real, one-command way for a person to drop the
@@ -961,11 +1246,36 @@ wait_secret_key_present "$APP_NS" "$SECRET_NAME" "$WRONG_KEY" 120
 # instantly), so budget generously.
 wait_jsonpath "$AR_APP" "$APP_NS" "$APP" '{.status.phase}' EnvSecretMissing 180
 
+# --- the OPERATOR's own verdict, asserted separately from the CLI's ---
+#
+# Phase 9 asserts what `app status` PRINTS. These lines assert what the
+# operator WROTE, which is a different claim: a CLI that rendered the right
+# words from a condition carrying the wrong reason would pass Phase 9 alone.
+ready=$(cond_status "$AR_APP" "$APP_NS" "$APP" Ready)
+assert_eq "Ready condition status once the key is gone" "$ready" "False"
+reason=$(cond_reason "$AR_APP" "$APP_NS" "$APP" Ready)
+assert_eq "Ready condition reason" "$reason" "EnvSecretMissing"
+
+# The Secret still EXISTS here (only its key changed), which is what separates
+# the two failures 2.22c had to stop conflating: "no Secret" and "Secret
+# without that key" must not read identically.
+msg="$(wait_cond_message "$AR_APP" "$APP_NS" "$APP" Ready "carries no key" 120)" || {
+    printf 'ERROR: the Ready message never named the missing key. Got: %s\n' "$msg" >&2
+    exit 1; }
+assert_contains "the message distinguishes present-but-wrong-key from absent" \
+    "$msg" "carries no key"
+assert_contains "the message names the namespace, so it need not be guessed" \
+    "$msg" "namespace \"${APP_NS}\""
+assert_contains "the message names the Secret" "$msg" "\"${SECRET_NAME}\""
+# The half that turns the message into an answer: the keys that ARE there.
+assert_contains "the message lists the key the Secret actually carries" \
+    "$msg" "$WRONG_KEY"
+
 # ===============================================================
-# Phase 8: D7 — `apprafter app status` prints the EXPLANATION, not just the name
+# Phase 9: D7 — `apprafter app status` prints the EXPLANATION, not just the name
 # ===============================================================
 
-phase "Phase 8: D7 CLI half — app status explains EnvSecretMissing"
+phase "Phase 9: D7 CLI half — app status explains EnvSecretMissing"
 
 # D7's title is "the CLI cannot answer the question its own error asks". 2.22c
 # made the operator's diagnostic good and then left it in
@@ -1008,10 +1318,10 @@ assert_file_contains "the reason line names the env var whose reference failed" 
 printf '  ok: D7 — the phase, the cause, the namespace, the Secret and its actual keys all come from `app status`\n'
 
 # ===============================================================
-# Phase 9: recover through the same surface
+# Phase 10: recover through the same surface
 # ===============================================================
 
-phase "Phase 9: re-seal ${SECRET_NAME} under ${SECRET_KEY} again -> Ready"
+phase "Phase 10: re-seal ${SECRET_NAME} under ${SECRET_KEY} again -> Ready"
 
 apprafter secret seal "$SECRET_NAME" \
     --namespace "$APP_NS" \
@@ -1020,27 +1330,35 @@ apprafter secret seal "$SECRET_NAME" \
 
 wait_secret_key_present "$APP_NS" "$SECRET_NAME" "$SECRET_KEY" 120
 wait_jsonpath "$AR_APP" "$APP_NS" "$APP" '{.status.phase}' Ready 240
+ready=$(cond_status "$AR_APP" "$APP_NS" "$APP" Ready)
+assert_eq "Ready condition status after the recovery re-seal" "$ready" "True"
 kubectl -n "$APP_NS" wait --for=condition=Available \
     "deployment/${APP}" --timeout=300s
 retry 40 5 -- kubectl -n "$APP_NS" wait --for=condition=Ready \
     pod -l "app.kubernetes.io/name=${APP}" --timeout=20s
 
 # Re-record: the pod from Phase 6 MAY have been replaced in the meantime (a
-# node eviction, an image pull retry), and Phase 10's whole assertion is about
+# node eviction, an image pull retry), and Phase 11's whole assertion is about
 # a specific pod's identity. Reading it fresh here is what makes the ordering
 # constraint hold by construction rather than by hope.
 POD_BEFORE_ROTATION="$(app_pod)"
 assert_nonempty "a workload pod is Running again after recovery" "$POD_BEFORE_ROTATION"
 START_BEFORE_ROTATION="$(pod_start_time "$POD_BEFORE_ROTATION")"
 assert_nonempty "the pod reports a startTime" "$START_BEFORE_ROTATION"
+RESTARTS_BEFORE_ROTATION="$(pod_restarts)"
+assert_nonempty "the pod reports a restartCount" "$RESTARTS_BEFORE_ROTATION"
+GEN_BEFORE_ROTATION="$(jp deployment "$APP_NS" "$APP" '{.metadata.generation}')"
+assert_nonempty "the Deployment reports a generation" "$GEN_BEFORE_ROTATION"
+DIGEST_BEFORE_ROTATION="$(jp "$AR_APP" "$APP_NS" "$APP" '{.status.envConfig.digest}')"
+assert_nonempty "status.envConfig.digest is recorded while Ready" "$DIGEST_BEFORE_ROTATION"
 CHANGED_BEFORE_ROTATION="$(jp "$AR_APP" "$APP_NS" "$APP" '{.status.envConfig.changedAt}')"
 assert_nonempty "status.envConfig.changedAt is recorded while Ready" "$CHANGED_BEFORE_ROTATION"
 
 # ===============================================================
-# Phase 10: D6 — the rotation is VISIBLE in `app status` without being ACTED on
+# Phase 11: D6 — the rotation is VISIBLE in `app status` without being ACTED on
 # ===============================================================
 
-phase "Phase 10: D6 CLI half — rotate the value; app status flags the pod as ← old config"
+phase "Phase 11: D6 — rotate the value; envConfig digest + changedAt move, app status flags ← old config, NOTHING rolls"
 
 # D6's decision: an env var sourced from a Secret is resolved once at pod start
 # and never re-read, so a rotated secret silently does nothing until something
@@ -1049,8 +1367,12 @@ phase "Phase 10: D6 CLI half — rotate the value; app status flags the pod as �
 # Secret is not owned by one Application and the blast radius is unknowable to
 # whoever sealed it.
 #
+# So this phase asserts a NEGATIVE as hard as it asserts the positive. A walk
+# that only checked "the new value eventually reached the pod" would be
+# asserting the behaviour that was explicitly turned down.
+#
 # ORDERING: the flag is `pod.startTime < status.envConfig.changedAt`. The pod
-# was recorded in Phase 9 and is already Running; the rotation happens BELOW
+# was recorded in Phase 10 and is already Running; the rotation happens BELOW
 # it, so `changedAt` is necessarily newer than that pod's start time — the
 # ordering holds by construction, not by timestamp arithmetic.
 apprafter secret seal "$SECRET_NAME" \
@@ -1062,19 +1384,49 @@ wait_secret_key_present "$APP_NS" "$SECRET_NAME" "$SECRET_KEY" 120
 
 # The digest is over the RESOLVED values, so a new value must move it and
 # `changedAt` with it. Poll: the operator notices on requeue.
-printf '  waiting for status.envConfig.changedAt to move ...\n'
+printf '  waiting for status.envConfig.digest to move ...\n'
 _rot_deadline=$(( $(date +%s) + 180 ))
-CHANGED_AFTER_ROTATION="$CHANGED_BEFORE_ROTATION"
+DIGEST_AFTER_ROTATION="$DIGEST_BEFORE_ROTATION"
 while [ "$(date +%s)" -lt "$_rot_deadline" ]; do
-    CHANGED_AFTER_ROTATION="$(jp "$AR_APP" "$APP_NS" "$APP" '{.status.envConfig.changedAt}')"
-    if [ -n "$CHANGED_AFTER_ROTATION" ] && \
-       [ "$CHANGED_AFTER_ROTATION" != "$CHANGED_BEFORE_ROTATION" ]; then
+    DIGEST_AFTER_ROTATION="$(jp "$AR_APP" "$APP_NS" "$APP" '{.status.envConfig.digest}')"
+    if [ -n "$DIGEST_AFTER_ROTATION" ] && \
+       [ "$DIGEST_AFTER_ROTATION" != "$DIGEST_BEFORE_ROTATION" ]; then
         break
     fi
     sleep 5
 done
-assert_ne "status.envConfig.changedAt moved on the rotation" \
+if [ "$DIGEST_AFTER_ROTATION" = "$DIGEST_BEFORE_ROTATION" ]; then
+    printf 'ERROR: status.envConfig.digest did not move after the value rotation (still %q)\n' \
+        "$DIGEST_BEFORE_ROTATION" >&2
+    printf '  the drift signal is the whole of D6 — if it does not move, nothing downstream can see the rotation\n' >&2
+    exit 1
+fi
+printf '  ok: status.envConfig.digest moved on rotation (%.12s… -> %.12s…)\n' \
+    "$DIGEST_BEFORE_ROTATION" "$DIGEST_AFTER_ROTATION"
+
+# `changedAt` moves ONLY when the digest moved (that is what makes it a drift
+# BOUNDARY rather than a heartbeat), so it must have moved with it.
+CHANGED_AFTER_ROTATION="$(jp "$AR_APP" "$APP_NS" "$APP" '{.status.envConfig.changedAt}')"
+assert_ne "status.envConfig.changedAt moved with the digest" \
     "$CHANGED_AFTER_ROTATION" "$CHANGED_BEFORE_ROTATION"
+
+# changedAt is only usable as a drift boundary if it lands NEWER than the pod
+# that predates the change. This is exactly the comparison `apprafter app
+# status` renders as `← old config`, asserted here on the raw stamps so a CLI
+# formatting change cannot mask an operator regression.
+#
+# python3 rather than a string compare: `pod.status.startTime` is a metav1.Time
+# truncated to whole seconds while `changedAt` carries nanoseconds, so the two
+# are not lexicographically comparable.
+newer=$(python3 - "$START_BEFORE_ROTATION" "$CHANGED_AFTER_ROTATION" <<'PY'
+import sys
+from datetime import datetime
+def p(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+print("yes" if p(sys.argv[2]) > p(sys.argv[1]) else "no")
+PY
+)
+assert_eq "changedAt is newer than the pod that predates the rotation" "$newer" "yes"
 
 status_stale="$(capture_app_status stale)"
 cat "$status_stale"
@@ -1094,23 +1446,30 @@ assert_file_contains "app status explains what the flag means" \
 assert_file_contains "app status says the pods still serve the previous values" \
     "$status_stale" "still serving the previous values"
 
-# AND THE NEGATIVE, asserted as hard as the positive: nothing rolled. If a
-# future change starts stamping the digest onto the pod template, this flips
-# and this phase is what says so.
+# AND THE NEGATIVE, asserted as hard as the positive: nothing rolled. Same pod,
+# same start time, same restart count, same Deployment generation. If a future
+# change starts stamping the digest onto the pod template, every one of these
+# flips and this phase is what says so.
 POD_AFTER_ROTATION="$(app_pod)"
 assert_eq "the rotation did NOT replace the pod" \
     "$POD_AFTER_ROTATION" "$POD_BEFORE_ROTATION"
 START_AFTER_ROTATION="$(pod_start_time "$POD_AFTER_ROTATION")"
 assert_eq "the rotation did NOT restart the pod (same startTime)" \
     "$START_AFTER_ROTATION" "$START_BEFORE_ROTATION"
+RESTARTS_AFTER_ROTATION="$(pod_restarts)"
+assert_eq "the rotation did NOT restart the container (same restartCount)" \
+    "$RESTARTS_AFTER_ROTATION" "$RESTARTS_BEFORE_ROTATION"
+GEN_AFTER_ROTATION="$(jp deployment "$APP_NS" "$APP" '{.metadata.generation}')"
+assert_eq "the rotation did NOT bump the Deployment generation" \
+    "$GEN_AFTER_ROTATION" "$GEN_BEFORE_ROTATION"
 
-printf '  ok: D6 — the rotation is visible in `app status` and the workload was left alone\n'
+printf '  ok: D6 — the rotation is visible (digest + changedAt + `app status`) and the workload was left alone\n'
 
 # ===============================================================
-# Phase 11: `apprafter secret remove` deletes BOTH objects
+# Phase 12: `apprafter secret remove` deletes BOTH objects
 # ===============================================================
 
-phase "Phase 11: secret remove ${SECRET_NAME} -n ${APP_NS} --yes"
+phase "Phase 12: secret remove ${SECRET_NAME} -n ${APP_NS} --yes"
 
 # `--yes` is mandatory here too: without it a non-interactive shell errors
 # rather than prompting into the void.
@@ -1128,8 +1487,45 @@ wait_absent sealedsecret "$APP_NS" "$SECRET_NAME" 120
 # no source to re-create the Secret from, so this cannot flap back.
 wait_absent secret "$APP_NS" "$SECRET_NAME" 120
 
-# (The application now has an unresolvable reference again — expected, and
-# beside the point at this stage. The walk tears the cluster down next.)
+# ===============================================================
+# Phase 13: an ABSENT Secret reads differently from a wrong key
+# ===============================================================
+phase "Phase 13: the binding is gone entirely -> a message about absence, not about a key"
+
+# The two failures must not read alike. Phase 8 covered "the Secret is there
+# and carries a different key"; this covers "there is no Secret at all", which
+# is the other half of what D7's message was rewritten to distinguish. A
+# diagnostic that says the same thing for both sends the reader to kubectl for
+# exactly the question it was supposed to answer.
+#
+# THE STATE IS FREE HERE. `secret remove` just deleted both objects, so the
+# app's reference is now unresolvable with nothing behind it — no extra setup,
+# no extra cluster. The merge that produced this file dropped the old
+# `kubectl delete secret` leg for a good reason (the sealed-secrets controller
+# re-creates the Secret from the surviving SealedSecret within seconds and the
+# walk loses the race); after `secret remove` there is no SealedSecret left to
+# re-create it from, so the same coverage is available without the race.
+wait_jsonpath "$AR_APP" "$APP_NS" "$APP" '{.status.phase}' EnvSecretMissing 180
+
+absent_msg="$(cond_message "$AR_APP" "$APP_NS" "$APP" Ready)"
+printf '  Ready message: %s\n' "$absent_msg"
+assert_contains "the message names the env var whose reference failed" \
+    "$absent_msg" "env ${ENV_VAR} →"
+assert_contains "the message names the Secret that is missing" \
+    "$absent_msg" "\"${SECRET_NAME}\""
+# The distinguishing half: absence must NOT be reported as a key problem.
+case "$absent_msg" in
+    *"carries no key"*)
+        printf 'FAILED: an ABSENT Secret is reported as a wrong-key problem\n' >&2
+        printf '  Both failures then read alike, which is the defect D7 exists to fix.\n' >&2
+        printf '  message: %s\n' "$absent_msg" >&2
+        exit 1 ;;
+esac
+printf '  ok: absence is reported as absence, not as a missing key\n'
+
+status_absent="$(capture_app_status absent)"
+assert_file_contains "app status carries the absence reason too" \
+    "$status_absent" "EnvSecretMissing"
 
 # ===============================================================
 # Done — tear down on the success path
@@ -1153,6 +1549,7 @@ fi
 
 rm -rf "$TMPDIR_WORK"
 
-printf '\nsecrets-ux-walk GREEN in %s\n' "$(elapsed)"
-printf 'Proven (CLI halves of D6 + D7): secret seal lands in the APP namespace and nowhere else -> secret list names ns + key + a real sealed-at stamp -> app add binds env %s to %s/%s -> re-sealing under another key breaks the binding -> `app status` prints the reason, "carries no key", the namespace and the keys the Secret DOES carry (D7) -> recover -> a rotation shows `← old config` on the pre-rotation pod WITHOUT replacing it (D6) -> secret remove deletes SealedSecret + Secret\n' \
-    "$ENV_VAR" "$SECRET_NAME" "$SECRET_KEY"
+printf '\nenv-and-secrets-walk GREEN in %s\n' "$(elapsed)"
+printf 'Proven (ADR 0046 operator chain + the CLI halves of D6/D7): secret seal lands in the APP namespace and nowhere else -> secret list names ns + key + a real sealed-at stamp -> app add provisions needs.pg and binds env from all three sources -> the connection Secret carries the DECOMPOSED keys url/user/pass and NO composed DATABASE_URL -> the rendered Deployment keeps %s a literal, points %s/%s/%s at the conn Secret keys url/user/pass, points %s at %s/%s, and carries EXACTLY ONE %s entry -> the pod sees every resolved value -> re-sealing under another key breaks the binding, and both the operator condition AND `app status` name the reason, "carries no key", the namespace and the keys the Secret DOES carry (D7) -> recover -> a rotation moves envConfig digest+changedAt and shows `← old config` on the pre-rotation pod WITHOUT replacing, restarting or re-generating anything (D6) -> secret remove deletes SealedSecret + Secret\n' \
+    "$LITERAL_ENV" "$CLAIM_URL_ENV" "$CLAIM_USER_ENV" "$CLAIM_PASS_ENV" \
+    "$ENV_VAR" "$SECRET_NAME" "$SECRET_KEY" "$CLAIM_URL_ENV"

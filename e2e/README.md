@@ -110,6 +110,75 @@ and runs nightly via
 of the per-push `e2e-k3d.yml` gate (booting a Postgres pod is heavier)
 and is not a dependency of `just e2e`.
 
+## env-and-secrets-walk.sh
+
+Local kind/k3d walk (no cloud spend, no secrets) for **both** the Phase-2.12
+`Application.env` value-reference chain (ADR 0046) **and** the CLI-facing
+secrets surface — the CLI halves of day-2 ledger entries D6 and D7. One
+cluster, twelve phases:
+
+```
+secret seal (into the APP namespace, not apprafter-system) -> secret list ->
+app add from a host git daemon (needs.pg provisions a claim) ->
+rendered env wiring + resolved pod values -> break by re-sealing under
+another key -> app status explains it (D7) -> recover ->
+rotate: digest + changedAt move, `← old config`, NOTHING rolls (D6) ->
+secret remove
+```
+
+The env assertions cover all three ADR-0046 sources at once: a literal stays a
+literal (and is *not* a `secretKeyRef`), the bare `claim.pg.url` / `.user` /
+`.pass` selectors resolve to `secretKeyRef`s into the provisioned connection
+Secret's decomposed keys, the braceless `secret: "shop-api/token"` ref resolves
+to its own Secret+key, and there is **exactly one** `DATABASE_URL` entry (the
+2.4e implicit injection was removed in ADR 0046 #5 — a resurrected auto-inject
+would show up here and nowhere else). `kubectl exec` then reads the values the
+kubelet actually materialised.
+
+### Replaces two walks
+
+It **merges** the former `e2e/needs-env-refs-walk.sh` (operator chain) into the
+former `e2e/secrets-ux-walk.sh` (CLI surface). Both bootstrapped a cluster and
+both built the working-tree operator image — roughly 5m20 of duplicated setup
+to assert two halves of the same feature against the same operator.
+
+The trade is deliberate and is written down in the script header:
+needs-env-refs deliberately applied the CR **directly** in marker form, calling
+that "the lighter path that proves the operator chain" because the cue-cmp
+bare-selector rendering is covered separately by the host test
+`argocd-cue-cmp/test-inject.sh`. Merging means the operator-side assertions now
+also depend on cue-cmp and Argo CD. The injection remains independently covered
+by that host test, and a failure here is one `kubectl get
+application.apprafter.io shop -o yaml` away from telling the two apart — but
+the isolation is genuinely gone, by choice rather than by accident.
+
+### Usage
+
+```sh
+just e2e-env-and-secrets
+# or directly:
+bash e2e/env-and-secrets-walk.sh
+APPRAFTER_E2E_SKIP_DESTROY=1 bash e2e/env-and-secrets-walk.sh   # keep the cluster
+```
+
+The script **forces** `APPRAFTER_E2E_LOCAL_OPERATOR=1` — it builds and
+side-loads the working-tree operator + admission-webhook and applies the branch
+CRDs/RBAC, because the published image predates 2.22c's `status.envConfig` and
+its keys-listing `EnvSecretMissing` message. The cue-cmp sidecar is *not*
+side-loaded: the published one (0.1.9+) already injects the schema and the
+`claim` binding the fixture's bare selectors need.
+
+Requires a container runtime (docker → k3d / podman → kind), `git`, `cargo`,
+`kubectl`, `helm` and `python3`. Like `e2e-pg` / `e2e-redis` / `e2e-disk` it is
+**not** a dependency of `just e2e` (it boots a CNPG pod, Argo CD and a git
+daemon); it runs nightly via
+[`.github/workflows/e2e-env-and-secrets-nightly.yml`](../.github/workflows/e2e-env-and-secrets-nightly.yml)
+(cron 10:00 UTC, `workflow_dispatch`).
+
+Judge a run **by reading the log**: every leg prints an `ok:` line, failures
+print `ERROR:` to stderr, and the final `GREEN` banner prints only on the
+success path (a `sandbox-run` wrapper masks the inner exit code).
+
 ## substrate-upgrade-hetzner.sh
 
 Real-Hetzner proof that a cluster can be moved onto a **bigger machine**

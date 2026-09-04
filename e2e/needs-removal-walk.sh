@@ -418,22 +418,10 @@ printf '  cluster-bootstrap complete\n'
 if [ -n "${APPRAFTER_E2E_LOCAL_OPERATOR:-}" ]; then
 phase "Phase 1b: build + load local operator + webhook (APPRAFTER_E2E_LOCAL_OPERATOR)"
 builder=podman; command -v podman >/dev/null 2>&1 || builder=docker
-build_load_restart() { # <deployment> <operator-subdir>
-    local dep="$1" sub="$2" img
-    printf '  waiting for the %s Deployment to appear ...\n' "$dep"
-    for _ in $(seq 1 60); do
-        kubectl -n apprafter-system get deploy "$dep" >/dev/null 2>&1 && break
-        sleep 5
-    done
-    img=$(kubectl -n apprafter-system get deploy "$dep" \
-        -o jsonpath='{.spec.template.spec.containers[0].image}')
-    printf '  building %s from the working tree (%s) ...\n' "$img" "$builder"
-    "$builder" build -f "${REPO_ROOT}/operator/${sub}/Dockerfile" \
-        -t "$img" "${REPO_ROOT}/operator"
-    cluster_load_image "$CLUSTER_NAME" "$img"
-    kubectl -n apprafter-system rollout restart "deploy/${dep}"
-    kubectl -n apprafter-system rollout status "deploy/${dep}" --timeout=180s
-}
+# `build_load_restart` now lives in e2e/lib.sh — ONE implementation, and it
+# CACHES the built image by the content of operator/ + schemas/v1alpha1/.
+# Thirteen walks carried a private copy that SHADOWED the shared one, so the
+# cache benefited nobody: each still rebuilt the same image (3m04 measured).
 build_load_restart apprafter-operator apprafter-operator
 build_load_restart admission-webhook admission-webhook
 # Wait until ONLY the branch webhook serves before any branch-typed apply: the

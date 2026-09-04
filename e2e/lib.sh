@@ -301,10 +301,12 @@ cluster_kubeconfig_write() {
 #
 # Every walk that sets APPRAFTER_E2E_LOCAL_OPERATOR carried its OWN copy of a
 # `build_load_restart` helper, and every copy rebuilt the same image. Measured
-# on `needs-env-refs-walk`: 8m46s total, of which the cluster is 17s, the
+# on the former `needs-env-refs-walk` (since merged into
+# `env-and-secrets-walk`): 8m46s total, of which the cluster is 17s, the
 # bootstrap 2m01, the BUILD 3m04, and the assertions 3m24. Sixteen walks build
 # it. A full suite therefore spends roughly forty minutes producing an artefact
-# that is byte-identical every time.
+# that is byte-identical every time. (That same duplication is what the
+# needs-env-refs / secrets-ux merge removed for those two specifically.)
 #
 # The cache key is the content of everything the image is built from —
 # `operator/` plus the bundled `schemas/v1alpha1/` — so it invalidates exactly
@@ -384,7 +386,7 @@ build_load_restart() { # <deployment> <operator-subdir> [cluster-name]
     branch_image_build "$sub" "$img"
     cluster_load_image "$cluster" "$img"
     kubectl -n apprafter-system rollout restart "deploy/${dep}"
-    kubectl -n apprafter-system rollout status "deploy/${dep}" --timeout=180s
+    kubectl -n apprafter-system rollout status "deploy/${dep}" --timeout=240s
 }
 
 cluster_load_image() {
