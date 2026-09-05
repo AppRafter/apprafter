@@ -97,4 +97,4 @@ ADRs are never deleted; supersession preserves the historical record.
 `NNNN-kebab-case-slug.md`, where `NNNN` is the next free four-digit
 number. Numbers are assigned sequentially and never reused, even if an
 ADR is later superseded. Start from
-[`0000-template.md`](./0000-template.md).
+[the ADR template](./0000-template.md).

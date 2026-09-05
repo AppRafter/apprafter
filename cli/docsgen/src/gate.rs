@@ -249,6 +249,21 @@ pub const EXEMPTION_UNUSED: &str = "exemption-unused";
 pub const CODE_PATH: &str = "code-path";
 /// A referenced ADR does not exist, or its decision no longer stands.
 pub const ADR_REFERENCE: &str = "adr-reference";
+/// A link whose visible TEXT is a source filename, on a link that
+/// targets another page.
+///
+/// MkDocs rewrites `./foo.md` to `../foo/`, so the `.md` survives to
+/// the reader in exactly one place: the text. The reader is then shown
+/// a filename the published URL does not have, on a site where they
+/// cannot see the repository. The TARGET is not this class's business —
+/// `code-path` and the strict build own that, and both are happy with
+/// a correct href behind a wrong label.
+///
+/// Deliberately narrow. It fires only when the target is itself a
+/// `.md` page, so a link to a file in the repository (an example
+/// manifest, a script) keeps naming that file, which is the one case
+/// where a filename IS the honest label.
+pub const LINK_TEXT_PATH: &str = "link-text-path";
 /// An obligation count fell below the committed census: the corpus
 /// lost documented surface it used to have.
 ///
@@ -360,6 +375,11 @@ fn remedy(code: &str) -> &'static str {
              so a path belonging to someone else's project has to be named as \
              theirs in the sentence rather than exempted, because a reader will \
              otherwise grep this repository for it"
+        }
+        LINK_TEXT_PATH => {
+            "use the target page's nav title as the link text — the reader is on \
+             a website and cannot see the repository, and MkDocs has already \
+             rewritten the `.md` out of the address they will land on"
         }
         ADR_REFERENCE => {
             "cite the decision that stands — a superseded ADR's own `## Status` \
@@ -1493,6 +1513,21 @@ impl Gate {
             findings.push(finding(CODE_PATH, file, reference.line, message));
         }
 
+        // Read off the SOURCE rather than the prose: a link inside a
+        // fence is sample markdown about link syntax, and relabelling
+        // one would change what the sample demonstrates.
+        for (line, text) in link_texts_naming_a_page(source) {
+            findings.push(finding(
+                LINK_TEXT_PATH,
+                file,
+                line,
+                format!(
+                    "`{text}` is a filename, and the link goes to a page — the \
+                     published address has no `.md` in it"
+                ),
+            ));
+        }
+
         // Page-wide and off the source, like the paths above, and for a
         // stronger reason than theirs: an ADR is cited as authority
         // wherever it is written, and the corpus writes one **inside a
@@ -1735,6 +1770,49 @@ fn normalise(dir: &str, target: &str) -> Option<String> {
 }
 
 /// The directory a page sits in, empty for one at the repository root.
+/// Every `[text](target)` on the page whose TARGET is a `.md` page and
+/// whose TEXT names a file rather than the page.
+///
+/// Both halves are load-bearing. Requiring a `.md` target is what keeps
+/// a deliberate reference to a repository file out of the class: there
+/// the filename is the subject. Requiring the text to end in `.md`, or
+/// to be a slash-bearing token with no spaces, is what keeps an
+/// ordinary prose title out of it.
+fn link_texts_naming_a_page(source: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (i, line) in source.lines().enumerate() {
+        let bytes = line.as_bytes();
+        let mut at = 0;
+        while let Some(open) = line[at..].find('[') {
+            let open = at + open;
+            let Some(close) = line[open..].find("](") else {
+                break;
+            };
+            let close = open + close;
+            let Some(end) = line[close..].find(')') else {
+                break;
+            };
+            let end = close + end;
+            at = end + 1;
+            // `![alt](src)` is an image; its alt text is not a label a
+            // reader clicks.
+            if open > 0 && bytes[open - 1] == b'!' {
+                continue;
+            }
+            let text = line[open + 1..close].trim().trim_matches('`').trim();
+            let target = &line[close + 2..end];
+            let path = target.split(['#', ' ']).next().unwrap_or(target);
+            if !path.ends_with(".md") {
+                continue;
+            }
+            if text.ends_with(".md") || (text.contains('/') && !text.contains(' ')) {
+                out.push((i + 1, text.to_string()));
+            }
+        }
+    }
+    out
+}
+
 fn page_directory(file: &str) -> &str {
     file.rsplit_once('/').map_or("", |(dir, _)| dir)
 }

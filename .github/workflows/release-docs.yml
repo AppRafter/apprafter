@@ -85,6 +85,12 @@ on:
       - '!docs/measurements/**'
       # nav, theme, site_url, the `hooks:` registration, exclude_docs.
       - 'mkdocs.yml'
+      # …and the tree `custom_dir: overrides` points at. A partial here
+      # changes every published page's HTML while nothing under docs/
+      # moves, so without this entry such a change would reach
+      # production only when somebody next happened to edit a page —
+      # the same failure this file already spells out for docs-site/**.
+      - 'overrides/**'
       # The toolchain that produces the published bytes. A
       # mkdocs-material bump rewrites every page's HTML and changes the
       # fingerprinted asset filenames the Caddyfile pins for a year;

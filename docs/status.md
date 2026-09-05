@@ -8,16 +8,16 @@ description: "Every user-facing feature, its status, and the phase it lands in."
 cli-check-ignore:
   - span: "apprafter cluster register --token"
     reason: known-broken
-    since: v0.2.50
+    since: v0.2.61
     note: roadmap row (Managed track, ☐) — the hosted cluster-register command is not built yet
   - span: "apprafter migrate-to-tier --to team"
     reason: known-broken
-    since: v0.2.50
+    since: v0.2.61
     note: roadmap row (PL1, ☐) — the Tier-1→Tier-2 migration command is not built yet
 schema-check-ignore:
   - path: "needs.jetstream"
     reason: known-broken
-    since: v0.2.50
+    since: v0.2.61
     note: out-of-scope list — the schema declares this need but no provider ships it
 ---
 
@@ -49,8 +49,16 @@ The foundation everything else builds on. Closed in `plan.md` across the `v0.1.x
 | Shipped | ✅ | Deploy applications via a CUE `Application` manifest + GitOps (Argo CD), including tag→digest auto-deploy and rollback | 1.6–1.9, 1.15, 2.4h, 2.22e | baseline |
 | Shipped | ✅ | Typed config + composition (CUE + admission-webhook validation) | 1.5, 1.14 | baseline |
 | Shipped | ✅ | One manifest for dev/prod (per-environment expansion) | 1.9c | baseline |
-| Shipped | ✅ | Backstage developer portal: app status view + golden-path template (scaffold a Bun HTTP service) | 1.10–1.11 | baseline |
+| Shipped | 🚧 | Backstage developer portal: app status view + golden-path template (scaffold a Bun HTTP service) | 1.10–1.11 | baseline |
 | Shipped | ✅ | App scaffolding (`app open` / `app new`) | 1.79b | baseline |
+
+> **Backstage 🚧, corrected 2026-09-05.** The portal deploys as an opt-in
+> component of the platform-stack chart, and the golden-path template is in
+> the repository — but there is no supported path to it: `apprafter open`
+> handles Argo CD only and says so, and the portal work (the encrypt wizard,
+> the MigrationPlan plugin) is deferred to the post-launch bundle. The row
+> read `✅` while the CLI reference read "not wired up yet"; one of the two
+> had to move, and this is the one that was ahead of the product.
 
 ---
 
@@ -70,7 +78,7 @@ The foundation everything else builds on. Closed in `plan.md` across the `v0.1.x
 |---|---|---|---|---|
 | Shipped | ✅ | MCP-native safety gate: destructive operations are paused (`MigrationPlan` CRD), approve/reject via CLI | 1.72–1.78 condensed, 2.16b, 2.16b-sec | order 2 · CP1 |
 
-> Delivered as a full vertical: `MigrationPlan` CRD + reconciler + admission webhook + `apprafter migration list/approve/reject`. The **hosted MCP endpoint** itself is in the managed section. At launch, approval is available via the CLI and Argo CD buttons; a dedicated Backstage MigrationPlan plugin lands post-launch (PL1). **2.16b (ADR 0051)** turns on **app-scope** auto-detection: a destructive edit to a user `Application` (removing `needs.*`, scale-to-zero, image-repository/domain/network change, env-reference removal) auto-creates an app-scope `MigrationPlan` in the app's own namespace and pauses the app until approved; soft edits emit a `SoftDestructiveChange` Event instead; reject is via Git revert. Validated by a GREEN two-env kind+Argo e2e walk. **2.16b-sec (ADR 0052)** extends the gate along the **security axis** — the inverted threat model, where an actor with manifest write access *adds and escalates* rather than removes: a new `security-boundary` class (severity above `data-migration`) now gates additive/escalation edits (`secret:` env-ref add / downgrade / retarget, `expose.network` escalation to public, public-hostname add, public-port retarget, `imagePolicy.resolve` relaxation; `image-path-change` reclassified to `security-boundary`), and the plan carries a full `classifications[]`/`changes[]` rollup so a dangerous op can't be laundered behind a benign primary. Hardened against disarming: approval is bound to a content hash (`spec.trigger.approvedSpecHash`, re-gates on drift), `Application.status` is write-protected to the operator's SSA field manager, and `spec.environment` is immutable on UPDATE.
+> Delivered as a full vertical: the `MigrationPlan` CRD, its reconciler, the admission webhook, and `apprafter migration list/approve/reject`. At launch, approval is available from the CLI and from Argo CD; a dedicated Backstage plugin lands post-launch. **App-scope** detection (ADR 0051) gates a destructive edit to a user `Application` — removing a `needs.*`, scale-to-zero, an image-repository, domain or network change, an env-reference removal — by creating a plan in the app's own namespace and pausing the app until it is approved; softer edits emit an Event instead, and a reject is a Git revert. The **security axis** (ADR 0052) extends the gate to edits that *add or escalate* rather than remove: a `security-boundary` class above `data-migration`, covering `secret:` reference changes, going public, gaining a public hostname, retargeting a public port, and relaxing `imagePolicy.resolve`. Approval is bound to a content hash, so a plan re-gates if the spec drifts under it. The full trigger table is on [Migration plans](operator-guide/migration-plans.md); the release history is in the changelog.
 
 ---
 
@@ -88,7 +96,7 @@ The foundation everything else builds on. Closed in `plan.md` across the `v0.1.x
 | Shipped | ✅ | Deploy from private repos (`SourceCredential`: git + registry credentials from one source) | 1.79c | order 3 · CP2 |
 
 > Invisible infrastructure in order 3 (auto-`NetworkPolicy` derivation from `needs`, 2.10) is not a tracker row — it shipped alongside `needs.*` as a security default.
-> Caveats: **2.11** ships the seal capability + `apprafter secret seal`; the Backstage encrypt-wizard is deferred to PL1. **1.79c** is `✅` — S0–S4 landed the vertical (CRD + controller + webhook + `apprafter repo creds`), and the S5 acceptance #4 live-wiring shipped as **2.16b-sc**: a destructive coverage-narrowing of a `SourceCredential` (removing a `git.repoPrefixes` / `registry.hosts` entry while a matched app depends on it) now auto-creates a `sourcecredential`-scope `MigrationPlan` in the cred's namespace, pauses BOTH derived-Secret derivations (old wider-coverage Secrets stay in place so in-flight apps keep access), and resumes only on approve (`apprafter migration approve` / Argo node) — actor-agnostic (raw `kubectl edit` trips it too). Walk-verified GREEN on kind+podman (`e2e/sourcecredential-migration-walk.sh`, incl. the kubectl-edit variant); released op/webhook v0.2.36 / cue-cmp v0.1.17 / platform-stack 0.2.45 / cli v0.2.36. **2.6c** — the cross-app SharedVolume path (two apps ref one volume, rolling-update mount survival, `volume rm` refused while referenced) is walk-verified GREEN on kind+podman; the disk **capacity-signal** Warning/condition live-read (kubelet `nodes/stats`) is best-effort; SOFT-skipped on kind but **live-validated GREEN on real Hetzner** (2026-07-16, by a since-removed capacity-kubelet probe walk: kubelet `node.fs` present, `node_free_fraction≈0.887`. That probe was a diagnostic asking whether a real k3s kubelet reports `node.fs` at all; it was deleted on 2026-09-04 once the same question was answered again by `e2e/node-disk-pressure-hetzner.sh`, which asserts the whole signal chain — sample, condition, CLI banner, recovery — rather than merely observing that the field exists). Cross-ns / multi-node shared volumes + intra-app `shareMode: shared` remain T2. **2.6d** is ✅ **verified**: `apprafter export`, `backup` (encrypted restic repo, local-pull default), and `restore` in ALL modes — `--into <fresh-cluster>` + `--data-only` (kind+podman two-cluster walk, run twice) AND `--reprovision` (mode a, clone-to-new — provision a fresh cluster as part of restore) **live-validated end-to-end on real Hetzner** (2026-07-16: provision → backup → destroy → `restore --reprovision` → fresh box, data + secret intact; `e2e/restore-reprovision-hetzner.sh`), which also serves the full-DR (`restore` in <1h) drill. The 2.6d follow-on **automated S3 push** (scheduled off-site backup to a remote bucket) **shipped as 2.6d-4** (opt-in AppRafter CronJob-restic on `PlatformStack.spec.backup`; cli/runner v0.2.33 / operator v0.2.33 / platform-stack 0.2.42 / cue-cmp v0.1.14 / runner image `apprafter-backup:v0.2.33`; 0.2.40+0.2.41 yanked). **Both file AND S3 backup/restore validated GREEN on real Hetzner** — the S3 path took two live-walk fix rounds (1 release-coordination miss + 7 runner bugs — RBAC verb/resource gaps + a singular-`secret` resolution + stderr visibility — all of which passed unit/CRD/review; the full backup wrote a snapshot to Hetzner Object Storage + the restic repo restored cleanly). Row above is `✅` — the confirmation walk on the **published** 0.2.42 ran GREEN end-to-end on real Hetzner (2026-07-17: provision on 0.2.42 → seal scoped Secret → `backup enable` → CronJob backup Job Completed → snapshot in Hetzner Object Storage → `check`+`prune` → `destroy` → `restore --reprovision` from S3 into a fresh box → data + re-sealed secret intact; zero server leak). The scoped-creds security model (V2 branch (a) + V7) is verified on Hetzner OS (see backup-restore.md). local-pull stays the default. **T12 (persistent-redis backup+restore) — SHIPPED 2026-08-28 (cli v0.2.51):** `export`/`backup` capture a `persistent: true` `needs.redis` claim as a whole-instance Dragonfly snapshot and `restore` (`--into` + `--data-only`) live-loads it back via `DFLY LOAD` (no scale, so the claim provisioner never re-provisions/FLUSHes it); `e2e/backup-restore-walk.sh` GREEN on both restore paths. This closes the redis leg the 2.19j walk flagged (the backup table promised a snapshot no code produced). Ephemeral (`persistent: false`) caches stay out by declaration.
+> **Secrets** ship the seal capability and `apprafter secret seal`; the portal encrypt-wizard is post-launch. **`SourceCredential`** is live end to end: narrowing a credential's coverage while an application depends on it gates the change and pauses both derived Secrets, leaving the wider ones in place so in-flight applications keep cloning and pulling. **Shared volumes** carry the cross-application path — two applications referencing one volume, the mount surviving a rolling update, `volume rm` refused while referenced; the disk capacity signal is verified on real hardware. **Backup and restore** are verified on real Hetzner in every mode, including a rebuild from nothing (`restore --reprovision`) and a scheduled off-site push to S3, and a `persistent: true` redis claim travels with them as a whole-instance snapshot. Ephemeral caches stay out by declaration. What each command captures, and what it does not, is on [Back up a cluster](operator-guide/backup-restore.md).
 
 ---
 
@@ -108,12 +116,31 @@ The foundation everything else builds on. Closed in `plan.md` across the `v0.1.x
 
 | Phase | Status | Feature | plan.md | order/CP |
 |---|---|---|---|---|
-| Shipped | 🚧 | Public documentation site (`docs.apprafter.dev`) — generated CLI reference + guides, kept true to the code by a drift gate in `just lint` and CI | 2.19 | order 3.7b · CP1 |
-| Shipped | 🚧 | Presentation-walk program — phase registry + PhaseChip across landing/docs/README; id-derived roadmap anchors (no `phase-phase`); published `/status/` feature page with Phase column; per-phase subscribe control; SYS-3 content gate (live-smoke + schema-test + Payload validate); Tier-A point fixes (operator-quickstart CTA, product-path README, absolute doc links, MVP wording, `llms-guides.txt`, version footer, ADR-index relabel) | 2.19 (order-3.7b) | order 3.7b · CP1 |
+| Shipped | ✅ | Public documentation site (`docs.apprafter.dev`) — generated CLI reference + guides, kept true to the code by a drift gate in `just lint` and CI | 2.19 | order 3.7b · CP1 |
+| Shipped | ✅ | Presentation-walk program — phase registry + PhaseChip across landing/docs/README; id-derived roadmap anchors (no `phase-phase`); published `/status/` feature page with Phase column; per-phase subscribe control; SYS-3 content gate (live-smoke + schema-test + Payload validate); Tier-A point fixes (operator-quickstart CTA, product-path README, absolute doc links, MVP wording, `llms-guides.txt`, version footer, ADR-index relabel) | 2.19 (order-3.7b) | order 3.7b · CP1 |
 
-> **Presentation-walk 🚧:** delivered on `feat/presentation-walk` (PRES-01…09 + SYS-1/2/3); awaiting push + prod promote + live-smoke green.
+> Both rows flipped `✅` on 2026-09-05: `https://docs.apprafter.dev/` serves, and the phase registry, roadmap anchors and per-phase subscribe controls are live on the landing. The build history is in ADR 0057 and the changelog.
 
-> **🚧 — the docs machinery is complete; the site is not yet publicly served.** All ten 2.19 subphases landed: a strict site build, a generated CLI reference drift-gated against the clap tree, `llms.txt` / a per-page markdown twin, and worked `--help` examples + shell completion. The row flips `✅` when `https://docs.apprafter.dev/` returns a page — the remaining steps (DNS, GHCR package visibility, one `apprafter app add`) are operator actions, documented in `docs/operator-guide/publish-the-docs-site.md`. The subphase-by-subphase build history and the closing documentation walk are recorded in ADR 0057 and the changelog.
+---
+
+## order 3.9 — day-2 operability
+
+The 2.20/2.22 program ran as defect fixes rather than as tracked subphases, so
+nothing in the phase loop forced a row for any of it. One row per user-visible
+capability, sourced from `docs/changelog/plan-history.md`.
+
+| Phase | Status | Feature | plan.md | order/CP |
+|---|---|---|---|---|
+| Shipped | ✅ | A failing reconcile is visible without reading the operator log — `status.recentProblems[]` and the yellow lines `apprafter app status` prints from it, deduplicated on reason and self-ageing | 2.22h | order 3.9 · CP1 |
+| Shipped | ✅ | `apprafter status` — the cluster roll-up: target, platform version and available upgrade, unhealthy conditions, applications reporting problems, applications held at a digest, MigrationPlans awaiting approval. Degrades to labelled lines rather than failing when the cluster is unreachable | 2.23a | order 3.9 · CP1 |
+| Shipped | ✅ | Sealed-secret disclosure — `apprafter secret list` names what is sealed where, and `apprafter secret remove` retires it | 2.22c | order 3.9 · CP1 |
+| Shipped | ✅ | The operator deletes the children an Application no longer declares, so removing a `needs.*` releases its claim onto the documented seven-day retention path | 2.22b | order 3.9 · CP1 |
+| Shipped | ✅ | Node disk-pressure signal — sampled from the kubelet, surfaced as a condition and a CLI banner, with recovery | 2.22d | order 3.9 · CP1 |
+| Shipped | ✅ | Digest-pinned rollback — `apprafter app rollback` returns to the previously resolved image and holds the application there until `apprafter app unpin` | 2.22e | order 3.9 · CP1 |
+| Shipped | ✅ | Dragonfly ACL durability — a restart no longer drops every claim's credential | 2.22f | order 3.9 · CP1 |
+| Shipped | ✅ | Backup schedule surface — `apprafter backup enable` takes the schedule, the retention and the integrity check as flags rather than a cron string | 2.22g | order 3.9 · CP1 |
+| Shipped | ✅ | A one-line installer that verifies its own checksum (`apprafter.dev/install.sh`), and a download page. The documented install command previously resolved the version through an endpoint that returns the newest release across all five of this monorepo's tag series | 2.23b | order 3.9 · CP1 |
+| Shipped | ✅ | CI reports which pinned external components are behind, and — where a gate can honestly fail — whether the candidate version still passes it | 2.23g | order 3.9 · CP1 |
 
 ---
 

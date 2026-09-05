@@ -1315,3 +1315,93 @@ fn commit(repo: &Path, message: &str, at: i64) {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ---- link text (2.23f) ------------------------------------------------
+
+#[test]
+fn a_filename_labelling_a_link_to_a_page_is_reported() {
+    // MkDocs rewrites `./foo.md` to `../foo/`, so the `.md` survives to
+    // the reader in exactly one place — the text — and names an address
+    // the published site does not have.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nSee [`target-store.md`](./target-store.md).\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::LINK_TEXT_PATH,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].starts_with("3: "), "{found:?}");
+    assert!(found[0].contains("target-store.md"), "{found:?}");
+}
+
+#[test]
+fn a_repository_path_labelling_a_link_to_a_page_is_reported_too() {
+    // The sibling shape, and the one the corpus actually carried most:
+    // a directory path as the label. A reader on the site cannot see
+    // the repository, so it names something they cannot reach.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\n[`docs/reference/cli/`](../reference/cli/index.md) covers it.\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::LINK_TEXT_PATH,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+#[test]
+fn a_page_title_is_not_reported() {
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nSee [Target store](./target-store.md) and [CLI reference](../reference/cli/index.md).\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::LINK_TEXT_PATH,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_filename_labelling_a_link_to_a_repository_file_is_left_alone() {
+    // THE case that decides the rule's shape. `[`Justfile`](…)` and
+    // `[`examples/app.cue`](…)` point at files, not pages, and there
+    // the filename IS the honest label — the reader is being sent to
+    // that file. Only a `.md` TARGET makes a filename label wrong.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\n[`Justfile`](https://example.invalid/Justfile) and \
+                [`examples/app.cue`](https://example.invalid/app.cue).\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::LINK_TEXT_PATH,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn an_image_alt_text_is_not_a_link_label() {
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\n![diagram.md](./diagram.md)\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::LINK_TEXT_PATH,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_prose_title_containing_a_slash_is_not_a_path() {
+    // "Backup / restore" is a title with a slash in it. The rule asks
+    // for a slash-bearing token with NO spaces, so that a human phrase
+    // cannot be mistaken for a path.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nSee [Backup / restore](./backup-restore.md).\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::LINK_TEXT_PATH,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}

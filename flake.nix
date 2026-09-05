@@ -76,6 +76,24 @@
             ]))
           ];
 
+          # mkdocs-material 9.7.6 prints a red MkDocs-2.0 advocacy banner on
+          # EVERY mkdocs invocation (material/templates/__init__.py gates it
+          # on this variable). It is upstream's opinion of a framework
+          # release this site does not run — the line readers react to,
+          # "Currently unlicensed - unsuitable for production use", is about
+          # MkDocs 2.0 and not about the theme here.
+          #
+          # Silenced in the devShell rather than in the Justfile because
+          # every call site goes through `nix develop`: `just docs-serve`,
+          # `just docs-build`, `scripts/docs-check.sh` and release-docs.yml.
+          # Three prefixed recipes would leave the CI logs noisy and would
+          # miss any future `nix develop --command mkdocs ...` typed by hand.
+          #
+          # It also shrinks a real hazard: scripts/docs-check.sh tees mkdocs
+          # stderr into a file it then pattern-matches, so third-party output
+          # in that stream is one grep collision away from a false failure.
+          NO_MKDOCS_2_WARNING = "1";
+
           shellHook = ''
             echo "AppRafter dev shell ready."
             echo

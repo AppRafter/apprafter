@@ -77,6 +77,18 @@ validation:
 
 theme:
   name: material
+  # The AppRafter mark, not material's stock `material/library` glyph.
+  # Two files rather than one: `partials/logo.html` renders theme.logo
+  # through an <img>, so it cannot inherit the page's colour, and the
+  # header bar is the primary colour in both schemes — hence a
+  # fixed-light variant. The favicon is the landing's file byte for
+  # byte, so a browser tab cannot show two different marks for one
+  # product. Both sit at the docs root rather than under `assets/`:
+  # docs-site/Caddyfile pins `/assets/images/*` for 24h and gives
+  # everything outside `/assets/` a five-minute window, and a file under
+  # `docs/assets/` would match neither rule.
+  logo: apprafter-logo-header.svg
+  favicon: favicon.svg
   # Adds one <link rel="alternate" type="text/markdown"> per page (see
   # overrides/main.html), so an agent on a rendered page can reach the
   # markdown twin without guessing /llms.txt exists.
@@ -107,6 +119,19 @@ theme:
       toggle:
         icon: material/weather-sunny
         name: Switch to light mode
+
+# Plausible, through mkdocs-material's own analytics integration point:
+# partials/integrations/analytics.html includes
+# partials/integrations/analytics/<provider>.html, which `overrides/`
+# supplies. `provider` is not a fixed enum, so no plugin is involved.
+#
+# Cookieless and with no cross-site identifier, so there is no consent
+# banner to gate it behind, and docs-site/Caddyfile sets no CSP to widen.
+# `docs/hooks/llm_export.py` also writes into `extra`, which is why this
+# key is spelled out here rather than assumed absent.
+extra:
+  analytics:
+    provider: plausible
 
 plugins:
   - search

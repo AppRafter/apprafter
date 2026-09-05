@@ -133,7 +133,7 @@ swap on those tiers is deferred and will use a stricter policy. See
   — node swap policy and rationale.
 - [ADR 0053](../adr/0053-resource-governance.md)
   — QoS, reservations, and the `reserve-headroom` → `node prep` history.
-- [`platform-management.md`](./platform-management.md) — managing the platform
+- [Platform management](./platform-management.md) — managing the platform
   stack.
-- [`recovery.md`](./recovery.md) — the Hetzner rescue-mode runbook if a node is
+- [Recovery](./recovery.md) — the Hetzner rescue-mode runbook if a node is
   wedged.

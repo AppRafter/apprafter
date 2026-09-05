@@ -135,7 +135,7 @@ apprafter migration approve <plan-name>
 apprafter migration reject <plan-name>
 ```
 
-See [`migration-plans.md`](./migration-plans.md) for approval
+See [Migration plans](./migration-plans.md) for approval
 semantics and the full CLI reference.
 
 ### Version history and rollback
@@ -242,9 +242,9 @@ yet shipped.
 
 ## Where to look next
 
-- [`migration-plans.md`](./migration-plans.md) — approve and reject
+- [Migration plans](./migration-plans.md) — approve and reject
   destructive-change gates.
-- [`quickstart.md`](./quickstart.md) — initial cluster provisioning.
+- [Operator quickstart](./quickstart.md) — initial cluster provisioning.
 - [ADR 0026](../adr/0026-platformstack-crd.md) — PlatformStack
   design rationale.
 - [ADR 0025](../adr/0025-gitops-control-surface.md) — why the

@@ -130,7 +130,7 @@ on this site today.
 
 - [Reference](../reference/index.md) — the generated CLI pages, the
   environment variables, and the custom resources the platform
-  installs. [`docs/reference/cli/`](../reference/cli/index.md) covers
+  installs. The [CLI reference](../reference/cli/index.md) covers
   every subcommand and flag.
 - [ADR index](../adr/README.md) — the decision behind each behaviour,
   including [ADR 0030](../adr/0030-cli-target-store-and-credential-chain.md)

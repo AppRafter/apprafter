@@ -4,7 +4,7 @@ description: "The on-disk layout of target configuration, the credential resolut
 
 # Target store reference
 
-> Reference companion to [`quickstart.md`](./quickstart.md). The
+> Reference companion to [Operator quickstart](./quickstart.md). The
 > quickstart covers the happy path; this page documents the
 > on-disk layout, the credential resolution chain, the
 > multi-target patterns operators actually use, and the rest of a
@@ -452,9 +452,9 @@ target `dev` removed; no targets left, active pointer cleared
 
 ## See also
 
-- [`troubleshooting.md`](./troubleshooting.md) — diagnostic-code
+- [Troubleshooting](./troubleshooting.md) — diagnostic-code
   catalogue, including every credential-chain failure surface.
-- [`docs/reference/cli/`](../reference/cli/index.md) — full
+- [CLI reference](../reference/cli/index.md) — full
   `apprafter target …` subcommand reference.
 - [ADR 0030](../adr/0030-cli-target-store-and-credential-chain.md)
   — design rationale.

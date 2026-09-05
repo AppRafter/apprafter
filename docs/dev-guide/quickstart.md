@@ -289,7 +289,7 @@ git add . && git commit -m "feat: scaffold apprafter manifest"
 ```
 
 > **No app yet?** The `bun-http` example under
-> [`examples/templates/bun-http/`](https://github.com/apprafter/apprafter/blob/master/examples/templates/bun-http/README.md)
+> [The bun-http template](https://github.com/apprafter/apprafter/blob/master/examples/templates/bun-http/README.md)
 > is a runnable OneBun service (Bun.js + Effect.ts) you can copy as a
 > starting point.
 
@@ -305,7 +305,7 @@ The bun-http Dockerfile is multi-stage — `oven/bun:1-debian` builds,
 the runtime is `distroless/nodejs20-debian12:nonroot`. Final image is
 ~30 MB. Pushing a moved tag re-rolls the deployment automatically; the
 build → push → redeploy iteration loop is covered in
-[`image-iteration.md`](./image-iteration.md).
+[Image iteration](./image-iteration.md).
 
 A **private** image (or a private source repo) needs credentials
 registered first — the token types and scopes differ between Git
@@ -478,7 +478,7 @@ curl --resolve <zone>:443:<node-ip> https://<zone>/   # refused / times out
 ## What you just got
 
 - A container image of your own, rolling out on every push of the tag
-  it names (see [`image-iteration.md`](./image-iteration.md)). If you
+  it names (see [Image iteration](./image-iteration.md)). If you
   started from the `bun-http` example, that is a typed OneBun service
   (`@onebun/core` decorators + DI) that serves Prometheus `/metrics`
   and emits OpenTelemetry traces — the endpoints exist, but the Tier-1
@@ -516,14 +516,14 @@ Drop the `--yes` to be prompted for confirmation first.
 
 ## Where to look next
 
-- [`application-cue.md`](./application-cue.md) — the Application.cue
+- [Writing Application.cue](./application-cue.md) — the Application.cue
   manifest in depth: fields, `needs`, multi-environment patterns.
 - [private repos & registries](./private-repos-and-registries.md) —
   credentials for private source repos and private image pulls, and
   the token-scope gotchas that differ between the two.
-- [`image-iteration.md`](./image-iteration.md) — the build → push →
+- [Image iteration](./image-iteration.md) — the build → push →
   auto-redeploy iteration loop.
-- [`rollback.md`](./rollback.md) — undoing a bad deploy, and releasing
+- [Rolling back a bad deploy](./rollback.md) — undoing a bad deploy, and releasing
   the pin it leaves.
 - [Troubleshooting](../operator-guide/troubleshooting.md) — diagnostic
   codes and common bring-up failures.

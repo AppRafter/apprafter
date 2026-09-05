@@ -9,7 +9,7 @@ This page covers the **three-step CLI flow** that gets you from a
 blank Hetzner account to a self-managing cluster in one session.
 
 For the developer perspective ("I want to deploy my first app"),
-see [`docs/dev-guide/quickstart.md`](../dev-guide/quickstart.md).
+see [Developer quickstart](../dev-guide/quickstart.md).
 
 ## What you will build
 
@@ -163,7 +163,7 @@ apprafter whoami                # one-line identity + active target
 
 Credentials are stored in `~/.config/apprafter/targets/prod/` at
 mode 0600. The CLI never echoes the token value in `show`/`whoami`
-output. See [`target-store.md`](./target-store.md) for the full
+output. See [Target store](./target-store.md) for the full
 file layout and the credential resolution chain (flag → env → store).
 
 ## Step 2 — Bring the cluster up
@@ -195,8 +195,8 @@ This runs three phases under a unified progress display:
 
 ```mermaid
 flowchart TD
-    A["apprafter up"] --> B["apply: SSH key, network, firewall, server, k3s via cloud-init"]
-    B --> C["k3s-ready: poll cloud-init, fetch kubeconfig over SSH"]
+    A["apprafter up"] --> B["apply: SSH key, network, firewall,<br/>server, k3s via cloud-init"]
+    B --> C["k3s-ready: poll cloud-init,<br/>fetch kubeconfig over SSH"]
     C --> D["cluster-bootstrap"]
     subgraph loader["cluster-bootstrap (CLI loader)"]
         D --> E["helm install Cilium (CNI)"]
@@ -204,7 +204,7 @@ flowchart TD
         F --> G["kubectl apply root 'platform' Application"]
     end
     G --> H{"Argo CD reconciles the platform-stack chart"}
-    H --> I["Gateway API CRDs, cert-manager, operator + admission webhook, default-deny NetworkPolicy, self-signed ClusterIssuer; adopts the Cilium release"]
+    H --> I["Gateway API CRDs, cert-manager,<br/>operator + admission webhook,<br/>default-deny NetworkPolicy,<br/>self-signed ClusterIssuer;<br/>adopts the Cilium release"]
 ```
 
 The CLI installs only what the node needs to schedule Argo CD (Cilium,
@@ -360,19 +360,19 @@ byte-identical to the pre-colour baseline.
 
 ## Where to look next
 
-- [`target-store.md`](./target-store.md) — target store layout +
+- [Target store](./target-store.md) — target store layout +
   credential resolution chain reference.
-- [`troubleshooting.md`](./troubleshooting.md) — diagnostic-code
+- [Troubleshooting](./troubleshooting.md) — diagnostic-code
   catalogue, common failures, recovery commands.
 - [Private repos & registries](../dev-guide/private-repos-and-registries.md)
   — `apprafter repo creds add`, the one credential Argo CD clones a
   private repository with and the node pulls a private image with, and
   the token-scope rules that differ between the two.
-- [`platform-management.md`](./platform-management.md) — platform
+- [Platform management](./platform-management.md) — platform
   version lifecycle, release channels, upgrade and freeze.
-- [`docs/reference/cli/`](../reference/cli/index.md) — full subcommand
+- [CLI reference](../reference/cli/index.md) — full subcommand
   reference with every flag + alias.
-- [`docs/dev-guide/quickstart.md`](../dev-guide/quickstart.md) —
+- [Developer quickstart](../dev-guide/quickstart.md) —
   scaffold and deploy a first Application.
 - [The CRD CUE schemas that admission validates
   against](https://github.com/apprafter/apprafter/tree/master/schemas/v1alpha1)

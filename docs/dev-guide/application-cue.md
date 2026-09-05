@@ -125,11 +125,11 @@ want and bind them to claim fields yourself (see *Referencing claims
 and secrets* below).
 
 ```mermaid
-flowchart LR
-    N["needs entry"] --> RC["ResourceClaim (one per entry)"]
-    RC --> P["provisioner creates the backend (Postgres / Redis / disk)"]
-    P --> S["connection Secret (url, user, pass, host, port, db)"]
-    S --> E["env var you declare, bound as claim.&lt;need&gt;.&lt;field&gt;"]
+flowchart TD
+    N["needs entry"] --> RC["ResourceClaim<br/>(one per entry)"]
+    RC --> P["provisioner creates<br/>the backend"]
+    P --> S["connection Secret<br/>(url, user, pass,<br/>host, port, db)"]
+    S --> E["env var bound to<br/>claim.&lt;need&gt;.&lt;field&gt;"]
     E --> C["your container"]
 ```
 
@@ -485,5 +485,5 @@ a running Deployment.
   `secret` env-value references.
 - [`examples/applications/parser.cue`](https://github.com/apprafter/apprafter/blob/master/examples/applications/parser.cue)
   — a worked multi-environment example.
-- [`docs/dev-guide/quickstart.md`](./quickstart.md) — scaffold and
+- [Operator quickstart](./quickstart.md) — scaffold and
   register a first Application end-to-end.

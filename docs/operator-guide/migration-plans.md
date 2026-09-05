@@ -292,7 +292,7 @@ Later approval surface (not yet shipped):
 
 ## Where to look next
 
-- [`platform-management.md`](./platform-management.md) — upgrade
+- [Platform management](./platform-management.md) — upgrade
   strategy and the conditions under which destructive diffs are
   created.
 - [ADR 0027](../adr/0027-migrationplan-unification.md) — design

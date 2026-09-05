@@ -479,10 +479,10 @@ runbooks by code, not by the human-readable summary.
 
 ## See also
 
-- [`quickstart.md`](./quickstart.md) — happy-path setup.
-- [`target-store.md`](./target-store.md) — credential resolution
+- [Operator quickstart](./quickstart.md) — happy-path setup.
+- [Target store](./target-store.md) — credential resolution
   chain reference.
-- [`docs/reference/cli/`](../reference/cli/index.md) — every
+- [CLI reference](../reference/cli/index.md) — every
   subcommand + flag.
 - [ADR 0030](../adr/0030-cli-target-store-and-credential-chain.md)
   — design rationale for the diagnostic-code scheme.

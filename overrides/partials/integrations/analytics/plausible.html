@@ -1,0 +1,37 @@
+{#-
+  Plausible, the same loader the landing runs
+  (landing/web/src/components/layout/BaseLayout.astro). Kept byte-identical
+  to it on purpose: two copies that drift are two properties reporting
+  differently about one product.
+
+  mkdocs-material's partials/integrations/analytics.html includes
+  partials/integrations/analytics/<provider>.html, so `provider: plausible`
+  in mkdocs.yml `extra.analytics` is what selects this file. `provider` is
+  not a fixed enum — the theme ships google.html and resolves any other name
+  through custom_dir, which is what makes this work with no plugin.
+
+  navigation.instant swaps pages with history.pushState, so a head-loaded
+  tracker would see exactly one pageview per full load and none of the
+  in-site navigations. The subscription below is material's own
+  `location$` observable, the same shape the theme's google.html uses.
+  Do NOT also enable history-based pageview capture in the Plausible
+  dashboard for this property: doing both counts every internal
+  navigation twice, and a metric that is quietly 2x is worse than none.
+-#}
+<script defer src="https://plausible.io/js/pa-ObkWGtUzPqv9gmVcgCKLF.js"></script>
+<script>
+  window.plausible =
+    window.plausible ||
+    function () {
+      (plausible.q = plausible.q || []).push(arguments);
+    };
+  plausible.init = plausible.init || function (i) { plausible.o = i || {}; };
+  plausible.init();
+
+  document.addEventListener("DOMContentLoaded", function () {
+    if (typeof location$ === "undefined") return;
+    location$.subscribe(function () {
+      plausible("pageview");
+    });
+  });
+</script>

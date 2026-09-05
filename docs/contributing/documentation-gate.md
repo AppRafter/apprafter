@@ -45,7 +45,7 @@ deliberately names capabilities that do not exist yet.
 
 ## What is checked
 
-Ten classes. The first five resolve a claim about the product, and
+Thirteen classes. The first five resolve a claim about the product, and
 **none of them is selected by a fence's language tag** — obligations
 come from a block's content, so deleting a tag cannot quietly turn a
 finding green. Nor can deleting the fence: an indented block and an
@@ -59,6 +59,7 @@ worth knowing, set out below.
 | `cue-document` | A fence or literal block that is a complete CUE manifest (a `package` clause *and* the schema import) which `cue vet` rejects. Fragments are out of scope. |
 | `code-path` | A repository path the page names — in a code span opening on a real top-level directory, or as a relative link target — that does not exist in the repository. |
 | `adr-reference` | An ADR citation that names no ADR at all, or one whose decision no longer stands: `Superseded`, `Deprecated`, or an `Unused` reserved slot. |
+| `link-text-path` | A link whose visible **text** is a filename or a repository path, on a link that goes to another `.md` page. The href is not this class's business — see below. |
 | `unlabelled-fence` | A fence with no info string. |
 | `unterminated-fence` | A fence that never closes, so everything below it renders as code. |
 | `unclosed-pre` | An HTML `pre` element that never meets its closing tag. The same failure as the row above with a different edit behind it, which is why it is its own class. |
@@ -250,6 +251,39 @@ because a reader will otherwise grep this repository for it.
 
 Links to a `.md` page are not this check's business: the strict MkDocs
 build already resolves those, and their anchors with them.
+
+### `link-text-path`: the reader is on a website
+
+MkDocs rewrites `./target-store.md` to `../target-store/`, so a link's
+**href** never reaches the reader carrying `.md`. Its **text** does, so a
+link written with the filename as its label — `[` `` `target-store.md` ``
+`](./target-store.md)` — shows a reader an address the published site
+does not have, on a site where they cannot see the repository to make
+sense of it.
+
+(That example is written as inline code rather than as a live link on
+purpose: this page would otherwise carry the very finding it describes.
+It is the same reason `mkdocs.yml` names its excluded files in backticks
+and never links them.)
+
+Nothing caught this before. `code-path` explicitly declines `.md`
+targets to the strict build (the paragraph above), and the strict build
+only ever looks at where a link goes. Both were right about the href and
+neither looks at the label.
+
+The rule is deliberately narrow, and both halves of it matter:
+
+- the **target** must be a `.md` page. A link to a file in the
+  repository — one labelled `` `Justfile` `` or `` `examples/app.cue` ``
+  — keeps naming that file, because there the filename is the subject
+  and the reader is being sent to it.
+- the **text** must end in `.md`, or be a slash-bearing token with no
+  spaces. A prose title containing a slash ("Backup / restore") is a
+  title, not a path.
+
+There is no ignore key. The remedy is the target page's nav title, which
+is what the reader sees in the sidebar and therefore what they are
+looking for.
 
 ### `adr-reference`: citing a decision that still stands
 

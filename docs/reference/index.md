@@ -6,7 +6,7 @@ description: "What reference material is published today, what is still only sou
 
 Field-by-field reference for everything the platform exposes:
 
-- **`apprafter` CLI** — [`cli/`](cli/index.md) covers every published
+- **`apprafter` CLI** — the [CLI reference](cli/index.md) covers every published
   subcommand, every flag, every default and every alias. It is
   **generated** from `cli/platform-cli/src/cli.rs` by `docsgen` and
   byte-compared in CI, so it cannot fall behind the binary. The same
@@ -27,10 +27,10 @@ Field-by-field reference for everything the platform exposes:
 - **gRPC plugin contracts** — `ServiceProviderInterface`,
   `InfrastructureProviderInterface`. Not yet published.
 
-For the immediate operator-facing surface, [`cli/`](cli/index.md) is
+For the immediate operator-facing surface, the [CLI reference](cli/index.md) is
 canonical. Cross-reference with `apprafter <subcmd> --help` for
 shell-formatted output, and
-[`operator-guide/troubleshooting.md`](../operator-guide/troubleshooting.md)
+[Troubleshooting](../operator-guide/troubleshooting.md)
 for the diagnostic-code catalogue.
 
 ## Custom resources
