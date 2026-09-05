@@ -320,127 +320,15 @@ Error: apprafter::cli::other
   │ yet.)
 ```
 
-The reason is that a different machine **is** a different machine: the
-cluster is rebuilt on new hardware and its data is replayed into it. The
-same is true of the region — a running machine cannot move between
-regions either.
 
-Both routes below need a backup that lives somewhere other than the
-cluster you are about to take apart, and both have downtime. Read
-[Backup and restore](backup-restore.md) first — it covers what a backup
-captures, the passphrase you must keep, and the extra `--credential-file`
-an `s3:` repository needs.
+The rebuild itself — the two project topologies it can take, the sequence for
+each backup backend, what to verify afterwards and what the outage costs — is
+[Moving to a bigger machine](moving-to-a-bigger-machine.md). It used to be
+documented twice, here and on the backup page, and the two copies had already
+started to disagree about which one was authoritative.
 
-!!! danger "`apprafter destroy` empties a provider project, not a cluster"
-
-    Both routes run `apprafter destroy`, and it is wider than its name
-    suggests. It deletes **every** resource labelled `apprafter=true` in
-    the Hetzner project the token belongs to — servers, floating IPs,
-    firewalls, networks and SSH keys — and it never looks at a cluster
-    name. `--target <name>` chooses only which state file it reads and
-    which token it uses, never which cluster is removed. One AppRafter
-    cluster per Hetzner project and the command means exactly what you
-    expect; **two clusters in one project, and destroying either one
-    destroys both.**
-
-    `HCLOUD_TOKEN` exported in your shell also outranks the target's
-    stored token, so an environment variable — not `--target` — would
-    decide which project is emptied.
-
-### Route A — same target, one machine at a time
-
-Cheapest, and the machine is gone while the new one comes up.
-
-```sh
-apprafter backup create                                    # to an off-cluster repository
-apprafter destroy --yes                                    # releases the machine
-apprafter restore <repo> --reprovision --server-type <sku> # rebuild, then replay
-```
-
-`apprafter destroy` clears the recorded cluster, which is what makes
-`apprafter target machine` available again — it is the same "target with
-no cluster yet" state a freshly registered target is in. You do not need
-it here: `--server-type` on the restore names the machine to build, and
-the target adopts what it actually provisioned, so a later rebuild that
-names no type reproduces the new machine rather than the old one.
-
-[Move a cluster onto a bigger
-machine](backup-restore.md#substrate-upgrade) is this route from the
-backup side: the same three commands with an off-site (`s3:`) variant, what
-to check once the new machine is up, and how long the outage runs. It is
-validated end to end on real Hetzner.
-
-`destroy` names the machine it removed on its way out, so keep the line
-if you may want to go back to it:
-
-```text
-  (destroyed server: type=<sku> region=<region> — note for restore --reprovision)
-```
-
-### Route B — a second target in a second Hetzner project, cut over, then remove the old one
-
-More expensive for as long as both run, and the old cluster stays up
-until you are satisfied with the new one. It asks for one thing Route A
-does not, and the whole route rests on it: **the new target needs its own
-Hetzner project, with an API token issued in that project.**
-
-That is not tidiness. It is what makes the last step — destroying the old
-cluster — a thing you can do at all, per the scope box above: with both
-clusters in one project, `apprafter destroy --target <old-name>` would
-take the new one with it, and nothing in the command or its flags can
-narrow it. A second project is also why the new target needs no
-`--cluster-name` juggling: `platform-1` in the new project is a different
-machine from `platform-1` in the old one.
-
-Create the project in the Hetzner Cloud Console, issue an API token in it
-(Security → API Tokens), and register the new target with that token:
-
-```sh
-apprafter backup create
-apprafter target add <new-name> --provider hetzner-cloud --token <new-project-token> --region <region> --server-type <sku>
-apprafter restore <repo> --reprovision --target <new-name> --server-type <sku>
-```
-
-Then move DNS to the new cluster (see [Connect a
-domain](connect-a-domain.md)), confirm it, and empty the old project:
-
-```sh
-apprafter destroy --yes --target <old-name>
-```
-
-That is safe here for one reason and you should be able to state it: the
-old target's stored token belongs to the old project, and the old project
-now holds nothing you want. Check that `HCLOUD_TOKEN` is **not** exported
-in the shell you run it in — it outranks the stored token and would
-redirect the command at whichever project it names.
-
-`apprafter target use <name>` switches which target the commands without
-`--target` act on.
-
-!!! warning "If the two clusters must share one Hetzner project"
-
-    Then `apprafter destroy` is not the teardown for this: it has no flag
-    that narrows it to one cluster, and running it removes both. Delete
-    the old machine **by ID in the Hetzner Cloud Console** instead — the
-    server first, then its floating IP, firewall and network if nothing
-    else uses them — and then `apprafter target remove <old-name> --yes`
-    to drop the local record that now points at nothing.
-
-    A shared project also brings back the cluster-name collision: the new
-    target needs a **name of its own**, because provisioning looks for a
-    machine by cluster name across the whole project and a second target
-    left on the same name would find the first target's machine and
-    reconcile it instead of creating anything. Read the old name off
-    `apprafter target show` and pass a different one as
-    `--cluster-name <new-cluster>`.
-
-> **What will not work:** running `apprafter restore --reprovision` while
-> a machine under the same cluster name is still there **in the same
-> project**. Provisioning finds that machine, reconciles it, and creates
-> nothing — the `--server-type` you passed is never used and the machine
-> does not change. What makes a rebuild real is that no machine in the
-> project answers to the name: either the old one is gone (Route A), or
-> the new cluster is in a project of its own (Route B).
+The region is the same story: a running machine cannot move between regions
+either, and the move is the same rebuild.
 
 ## Related
 
@@ -450,7 +338,7 @@ redirect the command at whichever project it names.
   on disk, alongside the region and the credentials.
 - [Node preparation](node-prep.md) — the control-plane headroom and swap
   the machine you chose then gets configured with.
-- [Backup and restore](backup-restore.md) — the backup and replay both
+- [Back up a cluster](backup-restore.md) — the backup and replay both
   rebuild routes depend on.
 - [Troubleshooting](troubleshooting.md) — every diagnostic code the CLI
   emits, including both server-type errors above.

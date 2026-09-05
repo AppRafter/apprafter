@@ -232,4 +232,4 @@ route:
   An unsealed `Secret` is skipped, so it will not come back on restore —
   and because sealing is bound to the cluster's own key, a restore
   re-seals every captured secret for the target cluster. See
-  [Backup & restore](backup-restore.md).
+  [Back up a cluster](backup-restore.md).

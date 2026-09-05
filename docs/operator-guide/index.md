@@ -28,9 +28,6 @@ Guide](../dev-guide/index.md) is the shorter path.
 - [Choosing the machine](choosing-the-machine.md) — how to read the
   live machine catalogue, the three ways to supply a server type, and
   why changing the machine of a running cluster is a rebuild.
-- [Node preparation](node-prep.md) — the control-plane reservations and
-  host swap a Tier-1 node needs, what `apprafter node prep` applies, and
-  how to read the result.
 - [Private repos & registries](../dev-guide/private-repos-and-registries.md)
   — `apprafter repo creds add` registers one credential that Argo CD
   clones private repositories with and the node pulls private images
@@ -52,6 +49,21 @@ Guide](../dev-guide/index.md) is the shorter path.
   registered zone covers a subdomain, the Cloudflare record, and the sync
   that follows. The instance is this site, on `docs.apprafter.dev`.
 
+## Make it survivable
+
+- [Back up a cluster](backup-restore.md) — a copy on your own machine,
+  and a copy off-site in S3 on a schedule. **Set this up before you need
+  it**, which is why it is here and not under Day 2.
+- [Restore from a backup](restore.md) — the three target modes, the
+  ordering a restore is safe under, and the disaster-recovery runbook
+  for an off-site repository.
+- [Backup retention, integrity and credentials](backup-maintenance.md) —
+  how long snapshots live, the integrity check and its locks, and how
+  narrow the in-cluster credentials can be. Not a first read.
+- [Moving to a bigger machine](moving-to-a-bigger-machine.md) — a
+  planned rebuild when the node has become too small. Rare, and off the
+  critical path, which is why it is a page rather than a section.
+
 ## Give an application a dependency
 
 An application declares what it needs; the platform provisions it,
@@ -72,12 +84,10 @@ binds the credentials, and opens exactly the egress that need implies.
 
 ## Day 2, and getting out of trouble
 
-- [Backup and restore](backup-restore.md) — what each export and backup
-  command captures, where it lands, and how a backup is replayed into a
-  running cluster. Set this up before you need it. It is also how you
-  [move a cluster onto a bigger
-  machine](backup-restore.md#substrate-upgrade) when the node it runs on
-  has become too small.
+- [Node preparation](node-prep.md) — a cluster provisioned by
+  `apprafter apply` already has the control-plane reservations and the
+  host swap; this is the retrofit for a node that does not, and how to
+  read `apprafter node status`.
 - [Platform management](platform-management.md) — how the platform
   upgrades itself: the `PlatformStack` resource, channels and pins,
   component freezes, and the CLI that edits them.
@@ -112,10 +122,9 @@ on this site today.
   OIDC, Headscale or Tailscale, and uptime checks.
 - **Managing `AccessGrant`s**, and reading audit logs out of JetStream.
 - **Day-2 debugging with k9s, Headlamp and Hubble.**
-- **Disaster-recovery runbooks.** [Backup and
-  restore](backup-restore.md) documents the commands, including
-  rebuilding a cluster from a backup; what is missing is the drill
-  around them.
+- **Disaster-recovery runbooks.** [Restore from a
+  backup](restore.md) documents the commands, including rebuilding a
+  cluster from a backup; what is missing is the drill around them.
 
 ## Where else to look
 

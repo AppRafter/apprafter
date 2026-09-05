@@ -117,6 +117,22 @@ plugins:
   # the first time a command is added.
   - literate-nav:
       nav_file: SUMMARY.md
+  # Provisioned in flake.nix for exactly this and never wired up, so
+  # until now a rename silently 404'd the published URL — nothing in
+  # `just docs-check` can see a URL that used to exist, because the
+  # build only knows the tree it was given.
+  #
+  # An entry goes in the SAME commit that renames or deletes a page,
+  # keyed on the OLD source path. This map is the only record that a URL
+  # existed; there is nowhere else to infer it from.
+  #
+  # What it cannot do: it maps page → page, never anchor → anchor. A
+  # section that moves to another page leaves its `#fragment` behind.
+  # In-repo referrers are caught by `--strict` (`links.anchors: warn`
+  # above); an external deep link lands at the top of the page it named,
+  # and that is the accepted cost of moving a section.
+  - redirects:
+      redirect_maps: {}
 
 # Build hooks. mkdocs loads these by PATH (not as importable modules)
 # and calls the same event API a plugin gets, so a hook can do what no
@@ -180,35 +196,47 @@ nav:
   - Home: index.md
   - Operator Guide:
       - Overview: operator-guide/index.md
+      # Ordered by the sequence the work happens in (plan.md 2.23e), not
+      # by artefact family. Each comment below says which step of that
+      # sequence a page is, and a page that cannot answer that question
+      # is in the wrong place.
+      #
+      # 1-4: stand a cluster up.
       - Quickstart: operator-guide/quickstart.md
       - Target store: operator-guide/target-store.md
-      # Sits with the target pages rather than under "Day 2": the
-      # machine is chosen when the target is set up, and after
+      # The machine is chosen when the target is set up, and after
       # provisioning it can only be changed by rebuilding.
       - Choosing the machine: operator-guide/choosing-the-machine.md
-      - Node preparation: operator-guide/node-prep.md
-      # Public ingress was a top-level section of two pages. Both are
-      # about cluster-owned resources (the zones on the platform Gateway
-      # and the certificate that terminates TLS for them), which is
-      # operator work, so they live in this section rather than holding
-      # a tab of their own.
+      # 5: firewall and domains. Both are about cluster-owned resources
+      # (the zones on the platform Gateway and the certificate that
+      # terminates TLS for them), which is operator work.
       - Connect a domain: operator-guide/connect-a-domain.md
       - Cloudflare Origin CA cert: operator-guide/cloudflare-origin-cert.md
-      # The worked instance of the two pages above: one application on a
-      # subdomain of an already-connected zone. It sits here rather than
-      # under Contributing because its three steps are cluster and DNS
-      # work, which is the operator's, not a contributor's.
-      - Publish the docs site: operator-guide/publish-the-docs-site.md
+      # 6: backup. Moved up nine places. The page tells the reader to set
+      # it up before they need it, and position 15 of 19 under a heading
+      # called "Day 2, and getting out of trouble" is not before.
+      - Back up a cluster: operator-guide/backup-restore.md
+      - Restore from a backup: operator-guide/restore.md
+      - Backup retention & integrity: operator-guide/backup-maintenance.md
+      # A rare operation off the critical path, so it is a page rather
+      # than a tail on the backup page — and it used to be documented
+      # twice, here and on `choosing-the-machine`.
+      - Moving to a bigger machine: operator-guide/moving-to-a-bigger-machine.md
+      # 7: what the operator owns about dependencies.
       - Postgres: operator-guide/postgres.md
       - Redis: operator-guide/redis.md
       - Persistent disk: operator-guide/persistent-disk.md
       - Shared volumes: operator-guide/shared-volumes.md
       - Egress policy: operator-guide/egress-policy.md
       - Secrets: operator-guide/secrets.md
-      - Backup & restore: operator-guide/backup-restore.md
+      # 8-9: reading a failure, then the platform's own lifecycle.
+      - Troubleshooting: operator-guide/troubleshooting.md
+      # Not a setup step: bootstrap already applies the reservations and
+      # the swap (ADR 0055 decision 7), so this is the retrofit for an
+      # older node, a node whose swap step failed, or reading the posture.
+      - Node preparation: operator-guide/node-prep.md
       - Platform management: operator-guide/platform-management.md
       - Migration plans: operator-guide/migration-plans.md
-      - Troubleshooting: operator-guide/troubleshooting.md
       - Recovery: operator-guide/recovery.md
   - How it works:
       # Mechanism, split out of the guides by ADR 0058: a guide is a
@@ -251,6 +279,14 @@ nav:
       - Setup: contributing/setup.md
       - Writing documentation: contributing/documentation.md
       - Documentation gate: contributing/documentation-gate.md
+      # The file stays under operator-guide/ so its eight inbound
+      # references keep resolving, but it is listed here: it is the
+      # runbook for publishing THIS project's documentation, and two of
+      # its five steps edit this repository — the GHCR package visibility
+      # of `apprafter/docs`, and `landing/`. Neither is an operator
+      # action. `llm_export` derives `audience` from the nav group first,
+      # so the machine-readable audience follows this move for free.
+      - Publishing this site: operator-guide/publish-the-docs-site.md
       - License headers: contributing/license-headers.md
       # Which license covers which directory and how the FSL conversion
       # works. It was reachable by URL but absent from the nav, which

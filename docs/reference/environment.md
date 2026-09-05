@@ -64,7 +64,7 @@ These are read only by the backup and restore verbs. They are **not**
 clap `env` declarations — the generated pages mention them inside the
 help text of `--passphrase` and `--credential-file`, which is why they
 do not appear there as `Env:` rows. The full workflow is in
-[Backup & restore](../operator-guide/backup-restore.md).
+[Back up a cluster](../operator-guide/backup-restore.md).
 
 | Variable | What it does | Default | Read at |
 | --- | --- | --- | --- |
@@ -141,7 +141,7 @@ CronJob's container environment, which the platform-stack chart writes.
 - [Target store](../operator-guide/target-store.md) — the on-disk
   layout and the full credential-resolution chain these variables
   slot into.
-- [Backup & restore](../operator-guide/backup-restore.md) — where the
+- [Back up a cluster](../operator-guide/backup-restore.md) — where the
   restic and S3 credentials are used end to end.
 - [Troubleshooting](../operator-guide/troubleshooting.md) — the
   diagnostic-code catalogue.
