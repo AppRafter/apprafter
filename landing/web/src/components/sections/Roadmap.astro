@@ -29,20 +29,22 @@ const anchorFor = (num: string) => phaseAnchor(byLabel.get(num)?.id ?? num);
               <div class="phase-num">{p.num}</div>
               <h3>{p.title}</h3>
             </div>
-            <ul>
-              {(p.items ?? []).map((item) => (
-                <li>{item.text}</li>
-              ))}
-            </ul>
-            {byLabel.get(p.num) && byLabel.get(p.num)!.status !== 'shipped' && (
-              <button
-                type="button"
-                class="roadmap-waitlist"
-                data-preselect={byLabel.get(p.num)!.id}
-              >
-                Get notified when {p.num} ships
-              </button>
-            )}
+            <div class="phase-body">
+              <ul>
+                {(p.items ?? []).map((item) => (
+                  <li>{item.text}</li>
+                ))}
+              </ul>
+              {byLabel.get(p.num) && byLabel.get(p.num)!.status !== 'shipped' && (
+                <button
+                  type="button"
+                  class="roadmap-waitlist"
+                  data-preselect={byLabel.get(p.num)!.id}
+                >
+                  Get notified when {p.num} ships
+                </button>
+              )}
+            </div>
           </div>
         ))
       }
@@ -83,6 +85,17 @@ const anchorFor = (num: string) => phaseAnchor(byLabel.get(num)?.id ?? num);
     top: 88px;
     align-self: start;
   }
+  /* The deliverables and the subscribe button are ONE grid item.
+     Without this wrapper the button auto-places into row 2 / column 1 —
+     the column the sticky heading travels down — and because a sticky
+     box is positioned while the button is static, the heading paints
+     over it on scroll. `z-index` would hide that collision without
+     removing it, and would leave the button in the wrong column.
+     `min-width: 0` lets the column shrink so a long list item can still
+     wrap rather than forcing the grid wider. */
+  .roadmap-phase .phase-body {
+    min-width: 0;
+  }
   .roadmap-phase .phase-num {
     font-family: var(--font-mono);
     font-size: 11px;
@@ -119,8 +132,12 @@ const anchorFor = (num: string) => phaseAnchor(byLabel.get(num)?.id ?? num);
     background: var(--accent);
   }
   .roadmap-waitlist {
+    /* No `justify-self`: inside `.phase-body` this is a block-level
+       child, and a <button> is shrink-to-fit, so it already hugs its
+       label. The declaration was there to stop it filling a grid track
+       it is no longer in. */
+    display: block;
     margin-top: 20px;
-    justify-self: start;
     font-family: var(--font-sans);
     font-size: 13px;
     padding: 8px 12px;

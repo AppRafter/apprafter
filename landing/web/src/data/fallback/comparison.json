@@ -26,7 +26,7 @@
     {
       "label": "Price",
       "selfHtml": "<span class=\"price-cell\">Free<sup>†</sup><span class=\"price-sub\">FSL-1.1-Apache-2.0</span></span>",
-      "managedHtml": "<span class=\"price-cell\">€10/mo per cluster<span class=\"price-sub\">Hosted Services (launch)<br />+ €10/mo Operations add-on (Phase 4.5+)</span></span>",
+      "managedHtml": "<span class=\"price-cell\">€10/mo per cluster<span class=\"price-sub\">Hosted Services (launch)<br />+ €10/mo Operations add-on (Phase 4.5)</span></span>",
       "turnkeyHtml": "<span class=\"price-cell\">From €30/mo (Tier 1)<span class=\"price-sub\">Server cost + reseller markup<br />+ €20/mo per cluster</span></span>"
     },
     {
@@ -57,7 +57,7 @@
       "label": "Exit when you stop paying",
       "selfHtml": "<span class=\"faint\">n/a</span>",
       "managedHtml": "Your cluster keeps running. OSS takes over management. UI/Backstage you can self-host (we ship the tooling). You only lose the thin cloud-native premium layer — AI insights, cross-cluster aggregator, smart bill analysis.",
-      "turnkeyHtml": "Cross-cluster MigrationPlan tooling (<a href=\"#roadmap-phase-federation\">Phase 8+</a>) for orchestrated migration."
+      "turnkeyHtml": "Cross-cluster MigrationPlan tooling (<a class=\"phase-ref\" href=\"/#roadmap-phase-federation\">Phase 8</a>) for orchestrated migration."
     }
   ],
   "footnoteHtml": "<sup>†</sup> FSL-1.1-Apache-2.0 allows any use — personal, internal business, commercial workloads — except offering AppRafter itself as a managed service to third parties. After two years, the license auto-converts to plain Apache 2.0 and that restriction lifts."

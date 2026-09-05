@@ -32,7 +32,7 @@
       ]
     },
     {
-      "num": "Phase 5+",
+      "num": "Phase 5",
       "title": "Production Tier 3 + multi-tenancy",
       "items": [
         { "text": "Tier 3 (Talos + LINSTOR on bare metal)" },
@@ -43,7 +43,7 @@
       ]
     },
     {
-      "num": "Phase 6+",
+      "num": "Phase 6",
       "title": "Confidential workloads",
       "items": [
         { "text": "Tier 4 confidential containers (Kata-CC) in opinionated wrapper" },
@@ -51,7 +51,7 @@
       ]
     },
     {
-      "num": "Phase 8+",
+      "num": "Phase 8",
       "title": "Cross-cluster federation",
       "items": [
         { "text": "Cross-cluster MigrationPlan (Product 2): sub-second cutover between clusters" },

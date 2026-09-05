@@ -237,7 +237,7 @@ describe('content sections (Phase F)', () => {
     }
     expect(bt).toContain('<PhaseChip id={itemPhase[item.name]!} />');
     const btJson = readFileSync(join(ROOT, 'src/data/fallback/boringTech.json'), 'utf8');
-    expect(btJson).not.toContain('Hard multi-tenancy (Phase 5+)');
+    expect(btJson).not.toContain('Hard multi-tenancy (Phase 5)');
   });
 
   test('all section eyebrows are unique (no copy-paste collisions)', () => {
@@ -454,8 +454,12 @@ describe('honesty pass — tiers (2026-06-15)', () => {
     const data = JSON.parse(readFileSync(join(ROOT, 'src/data/fallback/roadmap.json'), 'utf8'));
     expect(data.phases[0].num).toBe('Phase 3');
     expect(data.phases[0].title).toContain('Production multi-node');
-    // existing Phase 8+ entry must still be present (anchor cross-link)
-    expect(JSON.stringify(data)).toContain('Phase 8+');
+    // The federation entry must still be present — comparison.json
+    // cross-links its anchor. 2.23c dropped the `+`; the label and the
+    // registry moved in one commit, so this asserts the new spelling and
+    // would fail on a half-done sweep.
+    expect(JSON.stringify(data)).toContain('Phase 8');
+    expect(JSON.stringify(data)).not.toContain('Phase 8+');
   });
 
   test('waitlist copy carries the 5 phase-keyed interests', () => {

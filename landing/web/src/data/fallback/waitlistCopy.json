@@ -7,8 +7,8 @@
     { "key": "tier2", "label": "Production multi-node — Tier 2 (Phase 3)" },
     { "key": "observability", "label": "Observability — metrics/logs/traces (Phase 3)" },
     { "key": "managed", "label": "Managed offering (Phase 4)" },
-    { "key": "tier3", "label": "Bare metal — Tier 3 (Phase 5+)" },
-    { "key": "tier4", "label": "Confidential — Tier 4 (Phase 6+)" }
+    { "key": "tier3", "label": "Bare metal — Tier 3 (Phase 5)" },
+    { "key": "tier4", "label": "Confidential — Tier 4 (Phase 6)" }
   ],
   "callLabel": "I'd like a short call to discuss my use case.",
   "submitLabel": "Notify me",

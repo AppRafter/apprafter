@@ -20,6 +20,28 @@ describe('PhaseChip + registry', () => {
     expect(src).toContain('class="phase-chip"');
   });
 
+  test('the chip box model is global, and shared with the CMS-reachable class', () => {
+    // Astro scopes a component <style> with a data-astro-cid-* attribute
+    // selector, and content injected through set:html never carries that
+    // attribute — so a chip class a CMS field is allowed to use CANNOT
+    // live in the component. One rule, two selectors, in the global sheet.
+    const css = readFileSync(join(ROOT, 'src/styles/global.css'), 'utf8');
+    const rule = css.match(/\.phase-chip,\s*\n\.phase-ref\s*\{[^}]*\}/)?.[0];
+    expect(rule).toBeDefined();
+    // The declaration that fixes the stretch: the chip is a grid item in
+    // BoringTech and an `auto` width fills the whole 200px track. Read
+    // out of the RULE, not out of the whole sheet — `width: fit-content`
+    // elsewhere in global.css would satisfy a file-wide check while the
+    // chip still stretched.
+    expect(rule).toContain('width: fit-content');
+    expect(css).toMatch(/\.phase-chip:hover,\s*\n\.phase-ref:hover/);
+  });
+
+  test('the component no longer scopes the rule, so the shared half cannot be lost', () => {
+    const src = readFileSync(join(ROOT, 'src/components/PhaseChip.astro'), 'utf8');
+    expect(src).not.toContain('<style>');
+  });
+
   test('registry carries the five stable roadmap ids (+ a shipped labelling entry)', () => {
     const reg = JSON.parse(readFileSync(join(ROOT, 'src/data/phases.json'), 'utf8'));
     const ids = new Set(reg.phases.map((p: { id: string }) => p.id));

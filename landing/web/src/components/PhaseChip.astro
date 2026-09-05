@@ -8,6 +8,13 @@
 // people read, not what they subscribed to. Generalises the
 // Advantages `.phase-tag` visual — it does NOT replace those Today:
 // chips (Part 4 of the presentation design spec).
+//
+// The chip's box model is NOT here. It lives in src/styles/global.css
+// as `.phase-chip, .phase-ref`, shared with the class CMS-authored HTML
+// uses — a scoped component style is emitted behind a
+// `data-astro-cid-*` attribute that `set:html` content never carries,
+// so scoping it would silently un-style every phase reference written
+// in the CMS.
 
 import phaseRegistry from '../data/phases.json';
 
@@ -26,23 +33,3 @@ if (!entry) {
 
 <a class="phase-chip" href={entry.anchor} data-phase-id={entry.id}>{entry.label}</a>
 
-<style>
-  .phase-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    font-family: var(--font-mono);
-    font-size: 11px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--fg-faint);
-    padding: 3px 8px;
-    border: 1px solid var(--border-strong);
-    text-decoration: none;
-    transition: color 120ms ease, border-color 120ms ease;
-  }
-  .phase-chip:hover {
-    color: var(--accent);
-    border-color: var(--accent);
-  }
-</style>

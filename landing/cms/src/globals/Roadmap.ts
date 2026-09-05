@@ -31,7 +31,7 @@ export const Roadmap: GlobalConfig = {
           required: true,
           admin: {
             description:
-              'e.g. "Phase 4", "Phase 8+" — the slug used for the section anchor id is derived from this string.',
+              'e.g. "Phase 4", "Phase 8" — the slug used for the section anchor id is derived from this string. No "+" suffix: the ordering is what is committed, and a bare number says that without the extra mark nobody could explain.',
           },
           validate: (value: string | null | undefined) => {
             if (typeof value !== 'string' || value.length === 0) {

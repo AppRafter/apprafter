@@ -25,7 +25,7 @@
       "price": "Dedicated EPYC",
       "desc": "Bare metal. Dedicated EPYC servers. For when you need a performance ceiling above VPS.",
       "status": "roadmap",
-      "statusText": "Roadmap · Phase 5+"
+      "statusText": "Roadmap · Phase 5"
     },
     {
       "num": "Tier 4",
@@ -33,8 +33,8 @@
       "price": "AWS · GCP · Azure",
       "desc": "Hyperscalers. Primarily for cases where regulation requires these specific providers.",
       "status": "roadmap",
-      "statusText": "Roadmap · Phase 6+"
+      "statusText": "Roadmap · Phase 6"
     }
   ],
-  "orthogonalNoteHtml": "<strong>Confidential containers</strong> — orthogonal capability, not a tier. Available on any hardware that supports TDX or SEV-SNP. Shipping Phase 6+."
+  "orthogonalNoteHtml": "<strong>Confidential containers</strong> — orthogonal capability, not a tier. Available on any hardware that supports TDX or SEV-SNP. Shipping <a class=\"phase-ref\" href=\"/#roadmap-phase-tier4\">Phase 6</a>."
 }

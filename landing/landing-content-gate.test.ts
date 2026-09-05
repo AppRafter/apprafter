@@ -86,6 +86,124 @@ describe('SYS-3 (a) — fallback ⊆ registry', () => {
   });
 });
 
+// 2.23c. Two properties of every phase mention in the published copy,
+// both of which regressed silently before and would again on the next
+// copy edit.
+describe('SYS-3 (b) — how a phase is written', () => {
+  const FALLBACK_FILES = [
+    'advantages.json',
+    'comparison.json',
+    'landingHero.json',
+    'roadmap.json',
+    'scalingJourney.json',
+    'tierLadder.json',
+    'transparency.json',
+    'valueProps.json',
+    'waitlistCopy.json',
+  ];
+
+  test('the "+" suffix is gone from every fallback file', () => {
+    // It meant "phase N or later" and came from an internal design
+    // brief, where it was explained. On the public site it never was,
+    // and it was applied to three of the six phases — so it read as a
+    // typo on some and an unexplained tier marker on others.
+    for (const f of FALLBACK_FILES) {
+      const raw = readFileSync(join(FALLBACK, f), 'utf8');
+      expect({ file: f, hit: /Phase \d+(\.\d+)?\+/.test(raw) }).toEqual({
+        file: f,
+        hit: false,
+      });
+    }
+    const reg = readFileSync(REGISTRY, 'utf8');
+    expect(/Phase \d+\+/.test(reg)).toBe(false);
+  });
+
+  test('a phase mention inside CMS HTML is a label, or is on the list of why not', () => {
+    // Scoped Astro styles cannot reach `set:html` content, so `.phase-ref`
+    // in the global sheet is the ONLY way a CMS-authored mention can look
+    // like a phase label. This asserts the *Html fields use it.
+    //
+    // The allow-list is the record that a mention is known and deferred
+    // rather than overlooked — every entry carries its reason.
+    const ALLOWED: Record<string, string> = {
+      'Phase 1': 'shipped era — no roadmap block exists to anchor to',
+      'Phase 2': 'shipped era — no roadmap block exists to anchor to',
+      'Phase 3': 'in the roadmap prose itself, where a chip would nest inside its own block',
+      'Phase 4': 'in the roadmap prose itself, where a chip would nest inside its own block',
+      'Phase 4.5': 'fractional; the Operations add-on has no registry entry (open under 2.21a)',
+    };
+    // RECURSIVE. The first version walked `Object.entries` of the root
+    // and passed vacuously: `transparency.json` keeps its `bodyHtml`
+    // inside a `cards[]` array, and `comparison.json` inside `rows[]`,
+    // so the two files with the most phase references were the two the
+    // gate could not see. Verified by deliberately un-labelling one and
+    // watching this test stay green — which is why the count assertion
+    // below exists as well.
+    const htmlFields: Array<[string, string, string]> = [];
+    const walk = (file: string, path: string, node: unknown): void => {
+      if (typeof node === 'string') {
+        if (path.toLowerCase().endsWith('html')) htmlFields.push([file, path, node]);
+        return;
+      }
+      if (Array.isArray(node)) {
+        node.forEach((v, i) => walk(file, `${path}[${i}]`, v));
+        return;
+      }
+      if (node && typeof node === 'object') {
+        for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+          walk(file, path ? `${path}.${k}` : k, v);
+        }
+      }
+    };
+    for (const f of FALLBACK_FILES) {
+      walk(f, '', JSON.parse(readFileSync(join(FALLBACK, f), 'utf8')));
+    }
+    expect(htmlFields.length).toBeGreaterThanOrEqual(5);
+
+    let checked = 0;
+    for (const [file, field, value] of htmlFields) {
+      for (const m of value.matchAll(/Phase \d+(\.\d+)?/g)) {
+        const label = m[0];
+        if (ALLOWED[label]) continue;
+        checked += 1;
+        const around = value.slice(Math.max(0, m.index - 140), m.index + label.length + 20);
+        expect({ file, field, label, labelled: around.includes('phase-ref') }).toEqual({
+          file,
+          field,
+          label,
+          labelled: true,
+        });
+      }
+    }
+    // Non-vacuity: if the walk or the regex stops finding mentions, this
+    // test would report success while checking nothing.
+    expect(checked).toBeGreaterThanOrEqual(3);
+  });
+
+  test('every phase-ref anchor points at a registry anchor, root-relative', () => {
+    // Root-relative, not fragment-only: the same copy renders on
+    // /privacy and /terms, where a bare `#roadmap-phase-x` goes nowhere.
+    const reg = readJson(REGISTRY) as { phases: Array<{ anchor: string }> };
+    const anchors = new Set(reg.phases.map((p) => p.anchor));
+    let seen = 0;
+    for (const f of FALLBACK_FILES) {
+      const raw = readFileSync(join(FALLBACK, f), 'utf8');
+      for (const m of raw.matchAll(/class=\\?"phase-ref\\?" href=\\?"([^"\\]+)\\?"/g)) {
+        seen += 1;
+        expect({ file: f, href: m[1], known: anchors.has(m[1]) }).toEqual({
+          file: f,
+          href: m[1],
+          known: true,
+        });
+      }
+    }
+    // Non-vacuity: a regex that stops matching would otherwise pass by
+    // checking nothing, which is the failure mode this whole file exists
+    // to prevent.
+    expect(seen).toBeGreaterThanOrEqual(3);
+  });
+});
+
 // The form posts two independent fields and each has its own select
 // options in WaitlistSignups. A value the site can send that the
 // collection cannot accept is not a visible failure: Payload answers

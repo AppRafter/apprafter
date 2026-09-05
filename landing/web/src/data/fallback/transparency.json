@@ -8,7 +8,7 @@
     {
       "kicker": "4.5.2 / Anti-lock",
       "title": "Architectural, not promised.",
-      "bodyHtml": "<p>In <strong>Managed</strong>, your cluster physically lives on your infrastructure. Cancel — the cluster keeps running, you lose the premium layer (which you can mostly self-host; we ship the tooling). An <strong>architectural fact</strong>, not a service-level promise.</p><p>For <strong>Turnkey</strong>, we invest engineering cycles into your <strong>exit path</strong>. Cross-cluster MigrationPlan is <strong>planned as shipped tooling</strong> (Phase 8+) — <code>apprafter migration plan</code> — for moving to self-host or another provider.</p>"
+      "bodyHtml": "<p>In <strong>Managed</strong>, your cluster physically lives on your infrastructure. Cancel — the cluster keeps running, you lose the premium layer (which you can mostly self-host; we ship the tooling). An <strong>architectural fact</strong>, not a service-level promise.</p><p>For <strong>Turnkey</strong>, we invest engineering cycles into your <strong>exit path</strong>. Cross-cluster MigrationPlan is <strong>planned as shipped tooling</strong> (<a class=\"phase-ref\" href=\"/#roadmap-phase-federation\">Phase 8</a>) — <code>apprafter migration plan</code> — for moving to self-host or another provider.</p>"
     },
     {
       "kicker": "4.5.3 / Alignment",

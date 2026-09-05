@@ -100,6 +100,47 @@ p {
   font-family: var(--font-mono);
 }
 
+/* Roadmap-phase label. Two selectors, one box model: `.phase-chip` is
+   what <PhaseChip> emits from the registry; `.phase-ref` is the same
+   look for a phase reference authored as HTML in the CMS.
+
+   It lives here rather than in the component because it has to. Astro
+   scopes a component <style> with a `data-astro-cid-*` attribute
+   selector, and content injected through `set:html` never carries that
+   attribute — so a class CMS copy is allowed to use cannot be scoped.
+
+   `width: fit-content` is load-bearing, not tidiness: `inline-flex` is
+   blockified to `flex` for a grid item, and an item with an `auto`
+   width and the default `justify-self` stretches to fill its track, so
+   the chip spanned the whole 200px name column in BoringTech. The two
+   `*-self` declarations state the same intent for flex parents and
+   match the convention already in Advantages.astro and
+   TierLadder.astro. */
+.phase-chip,
+.phase-ref {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  justify-self: start;
+  align-self: flex-start;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+  padding: 3px 8px;
+  border: 1px solid var(--border-strong);
+  text-decoration: none;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+
+.phase-chip:hover,
+.phase-ref:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 /* Skip-to-content link — visible only on focus, helps keyboard users
    bypass the sticky header. */
 .skip-to-content {

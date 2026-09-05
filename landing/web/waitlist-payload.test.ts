@@ -23,7 +23,7 @@ const OFFERED = [
 
 describe('waitlistFields', () => {
   test('a preselected phase with no checkbox never becomes an interest', () => {
-    // The "Get notified when Phase 8+ ships" roadmap button. Posting
+    // The "Get notified when Phase 8 ships" roadmap button. Posting
     // `federation` as an interest 400s the whole signup, and the form
     // reports that 400 as success — the signup is lost silently.
     expect(waitlistFields({ federation: true }, OFFERED)).toEqual({

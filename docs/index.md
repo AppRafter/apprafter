@@ -83,9 +83,9 @@ flowchart LR
 Tiers 2–4 are on the roadmap — multi-node and observability land in
 [Phase 3](https://apprafter.dev/#roadmap-phase-tier2),
 bare-metal Tier 3 in
-[Phase 5+](https://apprafter.dev/#roadmap-phase-tier3),
+[Phase 5](https://apprafter.dev/#roadmap-phase-tier3),
 and confidential Tier 4 in
-[Phase 6+](https://apprafter.dev/#roadmap-phase-tier4).
+[Phase 6](https://apprafter.dev/#roadmap-phase-tier4).
 
 ## Status
 
