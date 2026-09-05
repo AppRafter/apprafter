@@ -94,26 +94,24 @@ that the description reached ``llms.txt`` — an entry line rendered
 without its ``: description`` suffix leaves every count in the artefact
 balanced.  That is why the check lives on the other side.
 
-One thing this does not do
---------------------------
+Snippet includes
+----------------
 
 ``pymdownx.snippets`` include lines (``--8<--``) are resolved during the
-markdown-to-HTML conversion, not before it, so a twin carries the
-include line rather than the included file.  That is currently
-academic: no published page uses one.  Re-derive with::
+markdown-to-HTML conversion, not before it, so a twin would carry the
+include line rather than the included file — an artefact that reads as a
+page whose code block is a path.  This used to be recorded as a known
+gap ("currently academic: no published page uses one"); 2.23e added the
+first use site, so the gap is closed here.
 
-    git grep -c -- '--8<--' -- docs ':!docs/hooks' ':!docs/changelog'
-
-(no matches).  The two exclusions are what make that a measurement of
-the *corpus* rather than of this paragraph: this file mentions the
-marker while explaining it, and the plan ledger quotes it while
-recording the explanation — neither is a page, and both would otherwise
-show up as the very use sites the sentence denies.  The extension is
-configured and available but unused, and this is recorded rather than
-pre-solved because the fix (running the real ``snippet`` preprocessor
-over the source) is a handful of lines to add against a real use site,
-and guessing at it now would be untested machinery of exactly the kind
-ADR 0057 set out to stop accumulating.
+``_resolve_snippets`` below applies the rule from ``mkdocs.yml``: the
+base path is the repository root (``!relative $config_dir``), traversal
+above it is refused (``restrict_base_path: true``), and an unresolvable
+path is an error rather than a line passed through
+(``check_paths: true``).  ``scripts/docs-artefacts-check.py`` re-derives
+the same rule independently, for the reason its own comment gives about
+the link rewrite: the byte compare between a page's source and its twin
+has to be source-to-expectation, never this hook vouching for itself.
 """
 
 from __future__ import annotations
@@ -699,9 +697,53 @@ def on_page_content(html: str, page: NavPage, config: MkDocsConfig, files: Files
             page.meta.get("description"), page.file.src_uri, "description"
         ),
         meta_audience=_authored_line(page.meta.get("audience"), page.file.src_uri, "audience"),
-        markdown=page.markdown or "",
+        markdown=_resolve_snippets(page.markdown or "", page.file.src_uri),
     )
     return html
+
+
+_SNIPPET = re.compile(r"^(?P<indent>[ \t]*)--8<--[ \t]+\"(?P<path>[^\"]+)\"[ \t]*$")
+
+
+def _resolve_snippets(markdown: str, src_uri: str, _depth: int = 0) -> str:
+    """Inline every ``--8<-- "path"`` line, the way the build will.
+
+    The rule is ``mkdocs.yml``'s: repo-root base, no traversal above it,
+    and a missing include is a hard failure.  Nested includes resolve
+    too, with a depth cap — the extension supports them, and a cycle
+    would otherwise hang the build rather than fail it.
+    """
+    if "--8<--" not in markdown:
+        return markdown
+    if _depth > 8:
+        raise PluginError(
+            f"{src_uri}: snippet includes nested more than 8 deep — this is a cycle, not a "
+            "document. Break it in the source rather than raising the cap."
+        )
+    root = Path(__file__).resolve().parent.parent.parent
+    out = []
+    for line in markdown.split("\n"):
+        hit = _SNIPPET.match(line)
+        if not hit:
+            out.append(line)
+            continue
+        target = (root / hit.group("path")).resolve()
+        if root not in target.parents:
+            raise PluginError(
+                f"{src_uri}: snippet include {hit.group('path')!r} resolves outside the "
+                "repository. `restrict_base_path: true` refuses this at build time; it is "
+                "refused here too so the twin cannot disagree with the page."
+            )
+        if not target.is_file():
+            raise PluginError(
+                f"{src_uri}: snippet include {hit.group('path')!r} does not exist. "
+                "`check_paths: true` makes this a build failure rather than a literal "
+                "`--8<--` line nobody notices."
+            )
+        indent = hit.group("indent")
+        included = _resolve_snippets(target.read_text(encoding="utf-8"), src_uri, _depth + 1)
+        out.extend(indent + l if l else l for l in included.rstrip("\n").split("\n"))
+    return "\n".join(out)
 
 
 def on_post_build(config: MkDocsConfig) -> None:

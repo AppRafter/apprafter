@@ -252,17 +252,27 @@ nav:
       - Right-sizing an application's requests: how-it-works/resources-and-autoscaling.md
   - Developer Guide:
       - Overview: dev-guide/index.md
+      # Ordered as the work happens (plan.md 2.23e), which for a
+      # developer starts before the manifest exists.
       - Quickstart: dev-guide/quickstart.md
+      # Steps 3-4: the image is the input the platform takes (ADR 0010),
+      # and the moving tag is how a new build reaches it. One page,
+      # because it is one story.
+      - From source to a running image: dev-guide/build-and-push.md
+      # What the platform then does with that tag — read before the
+      # manifest names it, which is why it is above `application-cue`.
+      - Image iteration: dev-guide/image-iteration.md
+      # Step 5, and the three things you reach for while filling it in.
       - Writing Application.cue: dev-guide/application-cue.md
-      # Ordered as the work happens: author the manifest, then the
-      # three things you reach for while filling it in (environments,
-      # sizing, secrets), then the credentials a private source needs,
-      # then the push-to-deploy loop you live in afterwards.
       - Deploying more than one environment: dev-guide/environments.md
       - Resources and autoscaling: dev-guide/resources-and-autoscaling.md
       - Secrets: dev-guide/secrets.md
+      # Steps 6-7: connecting the manifest to the cluster, and the
+      # credentials a private source needs to do it.
       - Private repos & registries: dev-guide/private-repos-and-registries.md
-      - Image iteration: dev-guide/image-iteration.md
+      # Step 10. Split out of `image-iteration` (2.23e): a reader looking
+      # for "undo" does not know to look under "iteration".
+      - Rolling back a bad deploy: dev-guide/rollback.md
   - Reference:
       - Overview: reference/index.md
       # Expanded by literate-nav from reference/cli/SUMMARY.md, which

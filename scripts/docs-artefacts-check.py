@@ -102,6 +102,11 @@ base = config["site_url"] or ""
 # `docs_dir` comes back absolute; git and the paths it prints are
 # relative to the repository root, which is this script's CWD.
 docs_dir = Path(config["docs_dir"]).resolve().relative_to(Path.cwd().resolve())
+# `mkdocs.yml`'s snippet base is `!relative $config_dir` — the directory
+# holding mkdocs.yml, i.e. the repository root — NOT the caller's CWD.
+# This script is run from the root, but pinning it to the config keeps
+# the two definitions from drifting the first time it is not.
+repo_root = Path(config["config_file_path"]).resolve().parent
 problems = []
 lexer_problems = []
 
@@ -150,6 +155,49 @@ def url_for(src_uri):
     if name[: -len(".md")] in ("index", "README"):
         return directory + "/" if directory else ""
     return src_uri[: -len(".md")] + "/"
+
+
+SNIPPET = re.compile(r"^(?P<indent>[ \t]*)--8<--[ \t]+\"(?P<path>[^\"]+)\"[ \t]*$")
+
+
+def resolve_snippets(markdown, src_uri, _depth=0):
+    """Inline every ``--8<-- "path"`` line before anything reads the source.
+
+    RE-DERIVED from `mkdocs.yml`, not imported from `docs/hooks/llm_export.py`,
+    for the same reason the link rewrite below is re-derived: the checks in
+    this file compare a page's committed source against what the build
+    published, and a shared implementation would have the hook vouching for
+    itself. The rule is repo-root base (`!relative $config_dir`), no traversal
+    above it (`restrict_base_path: true`), and a missing include is a hard
+    failure (`check_paths: true`).
+    """
+    if "--8<--" not in markdown:
+        return markdown
+    if _depth > 8:
+        raise SystemExit(
+            f"{src_uri}: snippet includes nested more than 8 deep — a cycle, not a document"
+        )
+    out = []
+    for line in markdown.split("\n"):
+        hit = SNIPPET.match(line)
+        if not hit:
+            out.append(line)
+            continue
+        target = (repo_root / hit.group("path")).resolve()
+        if repo_root not in target.parents:
+            raise SystemExit(
+                f"{src_uri}: snippet include {hit.group('path')!r} resolves outside the "
+                "repository — `restrict_base_path: true` refuses this at build time"
+            )
+        if not target.is_file():
+            raise SystemExit(
+                f"{src_uri}: snippet include {hit.group('path')!r} does not exist — "
+                "`check_paths: true` makes this a build failure"
+            )
+        indent = hit.group("indent")
+        included = resolve_snippets(target.read_text(encoding="utf-8"), src_uri, _depth + 1)
+        out.extend(indent + l if l else l for l in included.rstrip("\n").split("\n"))
+    return "\n".join(out)
 
 
 def twin_for(url):
@@ -343,7 +391,9 @@ for path in tracked:
         titles[src_uri] = " ".join(str(title).split())
     source[url_for(src_uri)] = (
         src_uri,
-        body.strip(),
+        # Snippet includes are resolved here, so every check below reads
+        # what the build will publish rather than a `--8<--` line.
+        resolve_snippets(body, src_uri).strip(),
         " ".join(str(description).split()) if description else "",
     )
 

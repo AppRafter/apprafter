@@ -1936,6 +1936,14 @@ would have put `target use` and `target remove` in different places.
 hatch bullet taught `kubectl rollout undo` as the *only* revert while a
 first-class command shipped. That bullet is corrected in the same change.
 
+**Amended 2.23e (2026-09-05):** that placement has since been undone. The page
+had two reading moments — what the platform does with a mutable tag, read
+*before* the manifest is written, and undoing a bad deploy, read after — and
+nothing connected them but chronology. `app rollback` now has
+`docs/dev-guide/rollback.md`. The reasoning above was sound about the tag
+half; what it did not weigh is that a reader looking for "undo" does not know
+to look under "iteration".
+
 ### The three deliberate absences
 
 `apprafter login`, `apprafter upgrade-tier` and `apprafter plan` are

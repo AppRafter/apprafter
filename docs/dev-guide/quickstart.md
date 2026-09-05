@@ -523,6 +523,8 @@ Drop the `--yes` to be prompted for confirmation first.
   the token-scope gotchas that differ between the two.
 - [`image-iteration.md`](./image-iteration.md) — the build → push →
   auto-redeploy iteration loop.
+- [`rollback.md`](./rollback.md) — undoing a bad deploy, and releasing
+  the pin it leaves.
 - [Troubleshooting](../operator-guide/troubleshooting.md) — diagnostic
   codes and common bring-up failures.
 - [connect a domain](../operator-guide/connect-a-domain.md) and the
