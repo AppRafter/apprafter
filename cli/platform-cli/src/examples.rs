@@ -242,15 +242,8 @@ pub const EXAMPLES: &[CommandExamples] = &[
         lines: &["apprafter backup unlock --credential-file <dotenv>"],
     },
     CommandExamples {
-        path: &["bootstrap-all"],
-        lines: &[
-            "apprafter bootstrap-all --server-type cx22",
-            "apprafter bootstrap-all --dry-run",
-        ],
-    },
-    CommandExamples {
         path: &["cluster-bootstrap"],
-        lines: &["apprafter cluster-bootstrap  # phase 3 of bootstrap-all, on its own"],
+        lines: &["apprafter cluster-bootstrap  # phase 3 of `up`, on its own"],
     },
     // The flag list already names the shells; what it cannot show is
     // where the script has to land, and that is both the whole
@@ -535,6 +528,10 @@ pub const EXAMPLES: &[CommandExamples] = &[
     CommandExamples {
         path: &["target", "use"],
         lines: &["apprafter target use <name>"],
+    },
+    CommandExamples {
+        path: &["up"],
+        lines: &["apprafter up --server-type cx22", "apprafter up --dry-run"],
     },
     CommandExamples {
         path: &["upgrade-tier"],

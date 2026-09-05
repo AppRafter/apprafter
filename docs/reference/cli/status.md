@@ -1,6 +1,6 @@
 ---
 title: "apprafter status"
-description: "Print the current cluster status — SKELETON, it reads local state and never contacts the cluster."
+description: "Is anything wrong with this cluster? Rolls up the active target, the platform's version and any unhealthy condition, the applications reporting problems, the applications held at an image digest, and the MigrationPlans awaiting approval."
 audience: reference
 status: stable
 ---
@@ -9,7 +9,7 @@ status: stable
 
 # `apprafter status`
 
-Print the current cluster status — SKELETON, it reads local state and never contacts the cluster. What it prints: the active target, cluster name, tier and provider recorded in that target's state file, `<config-root>/state/<target>/.apprafter/state.json`. For live state use `apprafter platform status` (platform components and versions) or `apprafter app status <name>` (a workload)
+Is anything wrong with this cluster? Rolls up the active target, the platform's version and any unhealthy condition, the applications reporting problems, the applications held at an image digest, and the MigrationPlans awaiting approval. Every cluster-side section degrades to a labelled line rather than failing, so it still answers when the cluster does not. For one workload use `apprafter app status <name>`; for the platform's full detail — history, component versions — `apprafter platform status`
 
 ```text
 Usage: apprafter status

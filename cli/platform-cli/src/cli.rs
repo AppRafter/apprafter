@@ -130,13 +130,15 @@ pub enum Commands {
     // the overview-table summary and the page description, so a
     // caveat in sentence two is invisible exactly where a reader
     // decides whether the command does what they need.
-    /// Print the current cluster status — SKELETON, it reads local
-    /// state and never contacts the cluster. What it prints: the
-    /// active target, cluster name, tier and provider recorded in that
-    /// target's state file, `<config-root>/state/<target>/.apprafter/state.json`.
-    /// For live state use `apprafter platform status` (platform
-    /// components and versions) or `apprafter app status <name>` (a
-    /// workload).
+    /// Is anything wrong with this cluster? Rolls up the active target,
+    /// the platform's version and any unhealthy condition, the
+    /// applications reporting problems, the applications held at an
+    /// image digest, and the MigrationPlans awaiting approval. Every
+    /// cluster-side section degrades to a labelled line rather than
+    /// failing, so it still answers when the cluster does not. For one
+    /// workload use `apprafter app status <name>`; for the platform's
+    /// full detail — history, component versions — `apprafter platform
+    /// status`.
     Status,
     /// Obtain an OIDC-backed kubeconfig — NOT IMPLEMENTED, it prints
     /// what it would do and writes nothing. The device flow is not
@@ -228,11 +230,16 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         refresh: bool,
     },
-    /// One-command provisioning: runs `apply` → polls for the k3s
-    /// kubeconfig to become SSH-reachable → runs `cluster-bootstrap`
-    /// for a freshly-provisioned cluster. Convenience wrapper —
-    /// each phase still has its own subcommand for re-runs.
-    #[command(name = "bootstrap-all", alias = "up")]
+    /// Stand a cluster up in one command: runs `apply` → polls for the
+    /// k3s kubeconfig to become SSH-reachable → runs
+    /// `cluster-bootstrap`. This is the path for a fresh cluster; each
+    /// phase keeps its own subcommand, which is what a re-run reaches
+    /// for.
+    // `up` is the canonical name as of 2.23a; `bootstrap-all` is kept
+    // as an alias, not deprecated — it is what every script and guide
+    // written before the rename types, and a wrapper this central has
+    // no business breaking them.
+    #[command(name = "up", alias = "bootstrap-all")]
     BootstrapAll {
         /// Override the active target for the credential resolution
         /// chain (see `apprafter apply --target`).
@@ -244,7 +251,7 @@ pub enum Commands {
         #[arg(long = "dry-run", default_value_t = false)]
         dry_run: bool,
         /// Server type (SKU) to provision (e.g. `cx22`, `cx32`). Forwarded
-        /// to the `apply` phase of bootstrap-all. Resolution: this flag >
+        /// to the `apply` phase of `up`. Resolution: this flag >
         /// manifest `spec.nodes[0].type` > recorded state > target default >
         /// `APPRAFTER_SERVER_TYPE`. There is NO implicit default — if none is
         /// set, provisioning fails with

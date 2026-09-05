@@ -119,20 +119,28 @@ fn cb_alias_routes_to_cluster_bootstrap() {
 }
 
 #[test]
-fn up_alias_routes_to_bootstrap_all_dry_run() {
-    // `up --dry-run` MUST succeed in an empty cwd / empty store
-    // exactly like `bootstrap-all --dry-run`. Pinning this proves
-    // the alias hits the same dispatch branch in main.rs.
-    let dir = tempfile::tempdir().unwrap();
-    let cfg_dir = tempfile::tempdir().unwrap();
-    cli()
-        .current_dir(dir.path())
-        .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
-        .args(["up", "--dry-run"])
-        .assert()
-        .success()
-        .stdout(contains("DRY RUN"))
-        .stdout(contains("[1/3] apply"));
+fn bootstrap_all_alias_routes_to_up_dry_run() {
+    // 2.23a inverted the pair: `up` is the canonical command name and
+    // `bootstrap-all` is the alias. Both spellings must keep working —
+    // the rename is a promotion, not a removal, and every script and
+    // guide written against the old spelling has to keep running.
+    //
+    // Asserted in BOTH directions on purpose. A one-directional test
+    // passes just as happily against a clap definition that dropped the
+    // alias entirely, which is the one regression this pair exists to
+    // catch.
+    for spelling in ["up", "bootstrap-all"] {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        cli()
+            .current_dir(dir.path())
+            .env("APPRAFTER_CONFIG_DIR", cfg_dir.path())
+            .args([spelling, "--dry-run"])
+            .assert()
+            .success()
+            .stdout(contains("DRY RUN"))
+            .stdout(contains("[1/3] apply"));
+    }
 }
 
 #[test]

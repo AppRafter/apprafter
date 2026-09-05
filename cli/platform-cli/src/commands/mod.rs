@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod app_open;
+pub mod app_rollup;
 pub mod app_scaffold;
 pub mod app_validate;
 pub mod app_wizard;

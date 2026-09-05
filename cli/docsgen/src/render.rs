@@ -299,10 +299,10 @@ A first cluster, in the order the commands are actually run:
 1. **Register a target** — [`apprafter target add`](target.md#apprafter-target-add)
    saves the provider, region and credentials under a name. Everything
    below resolves against the active one.
-2. **Provision and bootstrap** — [`apprafter bootstrap-all`](bootstrap-all.md)
-   (alias `up`) creates the infrastructure and installs the platform in
-   one command. [`apprafter kubeconfig`](kubeconfig.md) hands you the
-   cluster's kubeconfig afterwards.
+2. **Provision and bootstrap** — [`apprafter up`](up.md)
+   (alias `bootstrap-all`) creates the infrastructure and installs the
+   platform in one command. [`apprafter kubeconfig`](kubeconfig.md) hands
+   you the cluster's kubeconfig afterwards.
 3. **Deploy an application** — [`apprafter app scaffold`](app.md#apprafter-app-scaffold)
    writes an `Application.cue`, [`apprafter app validate`](app.md#apprafter-app-validate)
    checks it, and [`apprafter app add`](app.md#apprafter-app-add)

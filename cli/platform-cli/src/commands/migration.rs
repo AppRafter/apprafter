@@ -57,6 +57,47 @@ pub fn list() -> Result<()> {
     Ok(())
 }
 
+/// The phase a plan sits in while it is waiting for a human. Also the
+/// value [`plan_row`] falls back to when `status` has not been written
+/// yet, because a plan the controller has only just created is waiting
+/// too.
+pub(crate) const PHASE_PENDING_APPROVAL: &str = "pending-approval";
+
+/// The plans still waiting for a decision, one line each, for the
+/// `apprafter status` roll-up.
+///
+/// Filtered rather than counted: "2 plans awaiting approval" sends the
+/// reader to a second command to find out which, and the whole point
+/// of the roll-up is that it is the first command.
+///
+/// Terminal plans (`approved`, `rejected`, `completed`) are dropped.
+/// The operator garbage-collects them, but GC runs on a reconcile, so
+/// a terminal plan is routinely present in the window before it is
+/// pruned and must not be reported as outstanding work.
+pub(crate) fn pending_plan_rows(items: &[Value]) -> Vec<String> {
+    items
+        .iter()
+        .filter(|plan| {
+            plan.pointer("/status/phase")
+                .and_then(Value::as_str)
+                .unwrap_or(PHASE_PENDING_APPROVAL)
+                == PHASE_PENDING_APPROVAL
+        })
+        .map(|plan| {
+            let (name, namespace) = plan_name_ns(plan);
+            let classification = plan
+                .pointer("/spec/risks/classification")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if classification.is_empty() {
+                format!("{namespace}/{name}")
+            } else {
+                format!("{namespace}/{name} ({classification})")
+            }
+        })
+        .collect()
+}
+
 /// Extract `(name, namespace)` from a MigrationPlan JSON object.
 fn plan_name_ns(plan: &Value) -> (String, String) {
     let name = plan
@@ -227,6 +268,60 @@ pub fn reject(name: &str) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ---- 2.23a: the slice `apprafter status` lifts from here ----
+
+    fn plan(name: &str, ns: &str, phase: Option<&str>) -> Value {
+        let mut v = json!({
+            "metadata": { "name": name, "namespace": ns },
+            "spec": { "risks": { "classification": "data-migration" } },
+        });
+        if let Some(phase) = phase {
+            v["status"] = json!({ "phase": phase });
+        }
+        v
+    }
+
+    #[test]
+    fn pending_plan_rows_keeps_only_what_is_still_waiting() {
+        // A mixed list is the whole point: the operator prunes terminal
+        // plans on a reconcile, so `approved` / `rejected` / `completed`
+        // are routinely still present. Reporting one as outstanding sends
+        // an operator to approve something already decided.
+        let items = vec![
+            plan("waiting", "demo", None),
+            plan("also-waiting", "apprafter-system", Some("pending-approval")),
+            plan("done", "demo", Some("completed")),
+            plan("nope", "demo", Some("rejected")),
+            plan("yes", "demo", Some("approved")),
+        ];
+        let rows = pending_plan_rows(&items);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("demo/waiting")), "{rows:?}");
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("apprafter-system/also-waiting")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_pending_row_names_the_plan_and_its_classification() {
+        let rows = pending_plan_rows(&[plan("web-abc", "demo", None)]);
+        assert_eq!(rows, vec!["demo/web-abc (data-migration)".to_string()]);
+    }
+
+    #[test]
+    fn a_pending_row_without_a_classification_still_renders() {
+        let bare = json!({ "metadata": { "name": "p", "namespace": "demo" } });
+        assert_eq!(pending_plan_rows(&[bare]), vec!["demo/p".to_string()]);
+    }
+
+    #[test]
+    fn nothing_pending_is_an_empty_list_not_a_row() {
+        assert!(pending_plan_rows(&[]).is_empty());
+        assert!(pending_plan_rows(&[plan("done", "demo", Some("completed"))]).is_empty());
+    }
 
     #[test]
     fn plan_row_defaults_to_pending_approval_when_status_missing() {

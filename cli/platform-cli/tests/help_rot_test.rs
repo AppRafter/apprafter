@@ -677,16 +677,22 @@ const GUIDE_ALIASES: &[GuideAlias] = &[
         page: "docs/operator-guide/quickstart.md",
         literal: "apprafter t use",
     },
+    // 2.23a inverted this pair: `up` is the canonical name and
+    // `bootstrap-all` is now the alias, so the direction this row
+    // asserts flipped with it. The guides still type BOTH spellings —
+    // 2.23d sweeps the corpus to `up`, and when it does, this row has
+    // to be re-derived (or removed) with the command in the docstring
+    // above rather than deleted on a guess.
     GuideAlias {
-        typed: &["up"],
-        canonical: &["bootstrap-all"],
-        page: "docs/dev-guide/quickstart.md",
-        literal: "apprafter up",
+        typed: &["bootstrap-all"],
+        canonical: &["up"],
+        page: "docs/operator-guide/quickstart.md",
+        literal: "apprafter bootstrap-all",
     },
 ];
 
 /// The alias tokens [`GUIDE_ALIASES`] exercises — `t`, `ls`, `info`,
-/// `rm`, `kc`, `cb`, `up`.
+/// `rm`, `kc`, `cb`, `bootstrap-all`.
 fn alias_tokens() -> Vec<&'static str> {
     let mut tokens: Vec<&'static str> = GUIDE_ALIASES
         .iter()

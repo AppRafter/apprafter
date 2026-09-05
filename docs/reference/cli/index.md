@@ -9,7 +9,7 @@ status: stable
 
 # CLI reference
 
-Generated from `cli/platform-cli/src/cli.rs` at **apprafter v0.2.59** — the release
+Generated from `cli/platform-cli/src/cli.rs` at **apprafter v0.2.60** — the release
 this whole reference describes. Every command, flag, default and alias below is
 projected straight from the parser, so this page cannot describe a flag the
 binary does not have. Run `apprafter <command> --help` for the same information
@@ -22,10 +22,10 @@ A first cluster, in the order the commands are actually run:
 1. **Register a target** — [`apprafter target add`](target.md#apprafter-target-add)
    saves the provider, region and credentials under a name. Everything
    below resolves against the active one.
-2. **Provision and bootstrap** — [`apprafter bootstrap-all`](bootstrap-all.md)
-   (alias `up`) creates the infrastructure and installs the platform in
-   one command. [`apprafter kubeconfig`](kubeconfig.md) hands you the
-   cluster's kubeconfig afterwards.
+2. **Provision and bootstrap** — [`apprafter up`](up.md)
+   (alias `bootstrap-all`) creates the infrastructure and installs the
+   platform in one command. [`apprafter kubeconfig`](kubeconfig.md) hands
+   you the cluster's kubeconfig afterwards.
 3. **Deploy an application** — [`apprafter app scaffold`](app.md#apprafter-app-scaffold)
    writes an `Application.cue`, [`apprafter app validate`](app.md#apprafter-app-validate)
    checks it, and [`apprafter app add`](app.md#apprafter-app-add)
@@ -56,7 +56,6 @@ specific release rather than scraping these pages.
 | [`apprafter apply`](apply.md) | — | Apply the desired state |
 | [`apprafter argocd-password`](argocd-password.md) | — | Print the Argo CD admin password (decrypted), fetching it from the cluster on first use. |
 | [`apprafter backup`](backup.md) | — | Encrypted backup (Kind 2, restic local-pull): native extraction + serialized config/app CRs + decrypted user secrets, all wrapped into a restic repository. |
-| [`apprafter bootstrap-all`](bootstrap-all.md) | `up` | One-command provisioning: runs `apply` → polls for the k3s kubeconfig to become SSH-reachable → runs `cluster-bootstrap` for a freshly-provisioned cluster. |
 | [`apprafter cluster-bootstrap`](cluster-bootstrap.md) | `cb` | GitOps loader for the cluster pointed to by the cached kubeconfig: install Cilium (CNI + kube-proxy replacement), then Argo CD, then apply the single root `platform` Application pointing at the platform-stack chart and wait for it to report Healthy. |
 | [`apprafter completion`](completion.md) | — | Print a shell completion script on stdout |
 | [`apprafter destroy`](destroy.md) | — | Destroy every `apprafter=true`-labelled resource in the provider project the token belongs to — servers, floating IPs, firewalls, networks and SSH keys |
@@ -74,8 +73,9 @@ specific release rather than scraping these pages.
 | [`apprafter repo`](repo.md) | — | Manage the credentials Argo CD uses to clone private user repos (and the workload pull-secrets for the matching registry). |
 | [`apprafter restore`](restore.md) | — | Restore a backup into a target cluster: replays the CRs, secrets and native data (pg, volumes and persistent-redis snapshots) captured by `apprafter backup`. |
 | [`apprafter secret`](secret.md) | — | Seal secret material with the in-cluster sealed-secrets controller's public cert. |
-| [`apprafter status`](status.md) | — | Print the current cluster status — SKELETON, it reads local state and never contacts the cluster. |
+| [`apprafter status`](status.md) | — | Is anything wrong with this cluster? Rolls up the active target, the platform's version and any unhealthy condition, the applications reporting problems, the applications held at an image digest, and the MigrationPlans awaiting approval. |
 | [`apprafter target`](target.md) | `t` | Manage deployment targets — persistent named bundles of `(provider, region, credentials, defaults)`. |
+| [`apprafter up`](up.md) | `bootstrap-all` | Stand a cluster up in one command: runs `apply` → polls for the k3s kubeconfig to become SSH-reachable → runs `cluster-bootstrap`. |
 | [`apprafter upgrade-tier`](upgrade-tier.md) | — | Upgrade the cluster from one tier to the next — NOT IMPLEMENTED, it validates `--to` and prints the move it would make. |
 | [`apprafter volume`](volume.md) | — | Manage SharedVolume CRs — persistent volumes shared across multiple Applications. |
 | [`apprafter whoami`](whoami.md) | — | One-line summary of the operator's current shell context: identity + active target + provider-verified status + key config fields. |
@@ -93,7 +93,6 @@ which is what makes `apprafter t ls` work.
 | [`apprafter app list`](app.md#apprafter-app-list) | `ls` | `apprafter a ls` |
 | [`apprafter app remove`](app.md#apprafter-app-remove) | `rm` | `apprafter a rm` |
 | [`apprafter backup list`](backup.md#apprafter-backup-list) | `ls` | `apprafter backup ls` |
-| [`apprafter bootstrap-all`](bootstrap-all.md#apprafter-bootstrap-all) | `up` | `apprafter up` |
 | [`apprafter cluster-bootstrap`](cluster-bootstrap.md#apprafter-cluster-bootstrap) | `cb` | `apprafter cb` |
 | [`apprafter kubeconfig`](kubeconfig.md#apprafter-kubeconfig) | `kc` | `apprafter kc` |
 | [`apprafter migration list`](migration.md#apprafter-migration-list) | `ls` | `apprafter migration ls` |
@@ -104,6 +103,7 @@ which is what makes `apprafter t ls` work.
 | [`apprafter target list`](target.md#apprafter-target-list) | `ls` | `apprafter t ls` |
 | [`apprafter target remove`](target.md#apprafter-target-remove) | `rm` | `apprafter t rm` |
 | [`apprafter target show`](target.md#apprafter-target-show) | `info` | `apprafter t info` |
+| [`apprafter up`](up.md#apprafter-up) | `bootstrap-all` | `apprafter bootstrap-all` |
 | [`apprafter volume list`](volume.md#apprafter-volume-list) | `ls` | `apprafter volume ls` |
 
 ## See also

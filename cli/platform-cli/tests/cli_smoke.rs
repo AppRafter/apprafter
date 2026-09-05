@@ -174,7 +174,13 @@ fn apply_without_token_reports_missing_token() {
 }
 
 #[test]
-fn status_prints_would_show() {
+fn status_prints_the_target_header_without_a_cluster() {
+    // 2.23a: `status` is the cluster roll-up now, and the contract this
+    // pins is its failure mode. An operator runs it BECAUSE something
+    // looks wrong, and an unreachable cluster is one of the things that
+    // can be wrong — so the local half must still print and the exit
+    // status must stay 0. There is no cluster here at all, which makes
+    // this the degraded path by construction.
     let dir = tempfile::tempdir().unwrap();
     let cfg_dir = tempfile::tempdir().unwrap();
     seed_active_target(cfg_dir.path());
@@ -184,7 +190,8 @@ fn status_prints_would_show() {
         .arg("status")
         .assert()
         .success()
-        .stdout(contains("would show status"));
+        .stdout(contains("Target:"))
+        .stdout(contains("provider:"));
 }
 
 #[test]

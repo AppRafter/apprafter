@@ -2182,6 +2182,63 @@ failure rather than a vacuous pass. Nothing in the dropped staleness gating or
 the deferred `verified-by` bindings is revived; those rejections stand with
 their measurements.
 
+## Amendment — `apprafter status` stops being a skeleton, 2026-09-05
+
+The 2.19i amendment above records, under *"One defect the inventory surfaced"*:
+
+> `apprafter status` was deliberately **not** named: its own `about` says it is
+> a skeleton that never contacts the cluster, so pointing one skeleton at
+> another is no answer.
+
+That reasoning was correct and is now void, because its premise is being
+removed. Subphase 2.23a rewrites `commands/status.rs` into the cluster roll-up
+and moves the two application sections out of `platform status` into it. This
+amendment retracts the sentence so no future reader treats it as standing
+policy.
+
+### What the premise was, and why it expired
+
+The paragraph reasoned about `status` **as a command**, but the property it
+relied on belonged to `status.rs` — a leftover from the original six-subcommand
+clap skeleton (`8f4267e`), never specified. `spec.md` defined
+`apprafter platform status`, so every capability built afterwards was correctly
+built under the `platform` verb, and the unspecified top-level stub was left in
+the tree. In 2.19b it was re-worded caveat-first rather than removed, which
+made the skeleton honest and permanent at the same time.
+
+Two things then accumulated under `platform status` that are not platform
+state: a cluster-wide `application.apprafter.io` read feeding a problem roll-up
+(2.22h), and a pinned-applications list (ADR 0059). Both are cluster-wide
+application reads sitting under a verb whose own doc comment says it inspects
+the PlatformStack. `platform status` was the only command with a cluster-wide
+view, which is a reason to have built the roll-up, not a reason to file it
+under `platform`.
+
+### The decision
+
+`apprafter status` is the roll-up: the active target, the platform's version
+and available upgrade, any condition that is not healthy, applications
+reporting problems, applications held at a digest, and MigrationPlans awaiting
+a decision. `apprafter platform status` returns to what it is named for — the
+PlatformStack's own version state, conditions table, history and component
+versions.
+
+Nothing about the documentation system's own decisions changes. Decision 8 (the
+docs are their own deployable), the drift gate and the generated CLI reference
+are untouched. What changes is one sentence of guidance about which command a
+guide may name, and it changes because the command it described no longer
+exists in that form.
+
+### The constraint that outlives this amendment
+
+The rule the retracted sentence was applying is still right, and is worth
+restating without its expired instance: **a guide may not name a command whose
+`about` disclaims the capability the guide is teaching.** `login`,
+`upgrade-tier` and `plan` remain deliberate absences under exactly that rule
+(the 2.19i amendment's *"three deliberate absences"* section stands unchanged).
+`status` leaves that set by acquiring the capability, not by being documented
+around it.
+
 ## Alternatives considered
 
 - **Port the site to VitePress or Astro Starlight.** Rejected. The 93 existing

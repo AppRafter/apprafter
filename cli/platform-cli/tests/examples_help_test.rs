@@ -100,7 +100,13 @@ fn the_root_help_is_untouched() {
         let help = help_for(&[], flag);
         assert!(!help.contains("\nExamples:"));
         // Still the real root help, so the assertion above is about the
-        // examples and not about a command that failed to render.
-        assert!(help.contains("bootstrap-all"), "{help}");
+        // examples and not about a command that failed to render. Anchored
+        // on the usage line rather than on a command name: the name is the
+        // thing most likely to move (2.23a renamed `bootstrap-all` to `up`
+        // and this assertion is what noticed), and a non-vacuity guard that
+        // breaks on an unrelated rename teaches people to edit it without
+        // reading it.
+        assert!(help.contains("Usage: apprafter <COMMAND>"), "{help}");
+        assert!(help.contains("cluster-bootstrap"), "{help}");
     }
 }

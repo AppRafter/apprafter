@@ -16,12 +16,12 @@ use tabled::{Table, Tabled};
 
 use crate::commands::k8s_helpers::{
     ensure_kubeconfig_tempfile, kubectl_apply_server_side, kubectl_get_json,
-    kubectl_get_json_by_selector, kubectl_get_json_showing_managed_fields, kubectl_merge_patch,
+    kubectl_get_json_showing_managed_fields, kubectl_merge_patch,
 };
 use cli_providers::k8s::kubectl::APPRAFTER_CLI_EGRESS_FIELD_MANAGER;
 
-const PLATFORMSTACK_NAME: &str = "default";
-const PLATFORMSTACK_NAMESPACE: &str = "apprafter-system";
+pub(crate) const PLATFORMSTACK_NAME: &str = "default";
+pub(crate) const PLATFORMSTACK_NAMESPACE: &str = "apprafter-system";
 
 /// Annotation the CLI stamps to ask the operator for an immediate
 /// upstream OCI re-poll (instead of waiting for the operator's 6h
@@ -45,8 +45,8 @@ const RECHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// advance past the request timestamp.
 const RECHECK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-#[derive(Tabled)]
-struct ConditionRow {
+#[derive(Tabled, Debug)]
+pub(crate) struct ConditionRow {
     #[tabled(rename = "TYPE")]
     type_: String,
     #[tabled(rename = "STATUS")]
@@ -91,315 +91,13 @@ pub fn status(cached: bool) -> Result<()> {
         ))
     })?;
 
-    // The platform's own state prints FIRST, before the two cluster-wide
-    // reads below. It is what this command is named for, it is already in
-    // hand, and making it wait behind two more round-trips would delay output
-    // that used to appear immediately.
+    // The PlatformStack, and nothing else. 2.23a moved the two
+    // cluster-wide application roll-ups that used to print here into
+    // `apprafter status` (`commands::app_rollup`): neither reads this
+    // object, and a command named for the platform stack has no business
+    // being the place a reader learns an application is broken.
     print_status(&json, Utc::now());
-
-    // ONE cluster-wide application read, shared by both roll-ups. Two
-    // independent fetches would let the two sections describe two different
-    // instants, and would double the cost on a large cluster for nothing.
-    //
-    // The Results are kept rather than unwrapped: the pinned section stays
-    // silent on a read failure (it is decorative — see its doc comment), and
-    // the problem section must NOT, for the reason stated on its printer.
-    let apps = kubectl_get_json_by_selector("application.apprafter.io", "", None, kc.path());
-    let argo = kubectl_get_json_by_selector(
-        "application.argoproj.io",
-        "",
-        Some(crate::commands::app::ARGOCD_NAMESPACE),
-        kc.path(),
-    );
-
-    if let Ok(items) = &apps {
-        print_pinned_applications(items);
-    }
-    print_problem_applications(apps.as_deref(), argo.as_deref(), &Utc::now());
     Ok(())
-}
-
-/// The cluster's application-health verdict (2.22h / D16), printed LAST.
-///
-/// Placed after everything else because it is the answer to "is anything
-/// wrong?", and the tail of the output is what a terminal leaves on screen.
-///
-/// THREE DELIBERATE INVERSIONS of the pinned roll-up this sits next to. That
-/// one is decorative and says so; this one is a health signal, and a health
-/// signal has the opposite failure asymmetry:
-///
-///  1. It prints when there is nothing to report. `app status` deliberately
-///     prints no problem section for a healthy application, because there the
-///     surrounding output already proves the command ran. Here it does not:
-///     an absent section is indistinguishable from "the check did not run",
-///     "this CLI is too old to have the check", and "everything is fine". The
-///     question being asked is whether anything is wrong, and to that question
-///     silence is not an answer.
-///  2. It is LOUD on a read failure. Copying the precedent's silent
-///     `else { return; }` would render an RBAC denial, an apiserver timeout or
-///     a missing CRD as a clean bill of health — the one output this section
-///     must never produce.
-///  3. It names applications the way the READER must type them: the logical
-///     name `app status` takes, not the CR's `metadata.name`. An application
-///     the roll-up cannot resolve that way is still listed, and labelled as
-///     unresolvable, rather than dropped.
-fn print_problem_applications(
-    crs: std::result::Result<&[Value], &CliError>,
-    argo: std::result::Result<&[Value], &CliError>,
-    now: &DateTime<Utc>,
-) {
-    println!();
-    // ONLY the application read can silence this section. The problem data
-    // lives entirely on the AppRafter CRs; the Argo CD read supplies NAMES.
-    // Discarding a complete problem list because the naming lookup failed
-    // would report "unknown" about state we successfully read, and would make
-    // this section newly dependent on read access to the argocd namespace.
-    let crs = match crs {
-        Ok(c) => c,
-        Err(e) => {
-            println!(
-                "{}",
-                cli_core::style::warn(&format!(
-                    "Applications: could not read ({e}) — problem state unknown."
-                ))
-            );
-            return;
-        }
-    };
-    let (argo, naming_failed) = match argo {
-        Ok(a) => (a, false),
-        Err(_) => (&[][..], true),
-    };
-
-    let live = live_applications(crs);
-    let rows = problem_app_rows(&live, argo, now);
-    if rows.is_empty() {
-        println!(
-            "Applications: {} checked, none reporting problems ({}).",
-            live.len(),
-            crate::commands::app::problem_window_label()
-        );
-        return;
-    }
-
-    let shown = rows.len().min(PROBLEM_ROW_CAP);
-    println!(
-        "{}",
-        cli_core::style::warn(&problem_heading(live.len(), rows.len(), PROBLEM_ROW_CAP))
-    );
-    for row in rows.iter().take(PROBLEM_ROW_CAP) {
-        println!("{}", cli_core::style::warn(&format!("  {row}")));
-    }
-    if rows.len() > shown {
-        println!(
-            "{}",
-            cli_core::style::warn(&format!("  … and {} more", rows.len() - shown))
-        );
-    }
-    if naming_failed {
-        println!(
-            "{}",
-            cli_core::style::warn(
-                "  note: could not read Argo CD registrations — applications are named by their CR"
-            )
-        );
-    }
-    // Printed ONCE, not per row — `format_problem_lines` appends its own
-    // advisory per call, which is right for one application and a wall for N.
-    println!("  run `apprafter app status <name>` for the full ledger");
-}
-
-/// The applications a roll-up may speak about: everything not on its way out.
-///
-/// Deletion-marked CRs are excluded from BOTH the tally and the rows. The
-/// Application controller evicts the in-memory ledger and returns before it
-/// ever flushes again for a dying object, so whatever entries such a CR still
-/// carries can never be updated or cleared — they would be permanent phantom
-/// rows for something already being deleted.
-fn live_applications(crs: &[Value]) -> Vec<&Value> {
-    crs.iter()
-        .filter(|c| c.pointer("/metadata/deletionTimestamp").is_none())
-        .collect()
-}
-
-/// List every application currently held at an image digest (ADR 0059).
-///
-/// Best-effort and silent on failure: this is a decorative addition to a
-/// command whose job is the platform's own version state, and an unreadable
-/// application list must not turn `platform status` into an error.
-///
-/// It exists because a pin is invisible to a reader of the Git repository, so
-/// without a cluster-wide view an operator would have to run `app status` per
-/// application to discover which ones have stopped receiving builds.
-fn print_pinned_applications(items: &[Value]) {
-    // `items` is the caller's single cluster-wide read (`-A`, empty selector —
-    // `kubectl_get_json` with no namespace does NOT pass `-A` and would
-    // silently list only the kubeconfig's default namespace, which reads as
-    // "nothing is pinned"). It is shared with the problem roll-up so both
-    // sections describe one instant.
-    let rows = pinned_app_rows(items);
-    if rows.is_empty() {
-        return;
-    }
-    println!();
-    println!(
-        "{}",
-        cli_core::style::warn(&format!(
-            "Pinned applications ({}) — held at a digest, NOT following their tag:",
-            rows.len()
-        ))
-    );
-    for row in rows {
-        println!("{}", cli_core::style::warn(&format!("  {row}")));
-    }
-}
-
-/// Pure: the heading above the problem rows.
-///
-/// States the TRUE total, never the number of lines about to be printed. The
-/// cap governs display only, and a heading that silently reports the cap both
-/// contradicts the "… and N more" line directly beneath it and understates the
-/// blast radius at exactly the moment the number gets quoted into an incident
-/// channel.
-pub(crate) fn problem_heading(checked: usize, total: usize, cap: usize) -> String {
-    let scope = if total > cap {
-        format!(" (showing the {cap} most recent)")
-    } else {
-        " (most recent first)".to_string()
-    };
-    format!("Applications: {checked} checked, {total} reporting problems{scope}:")
-}
-
-/// Most problem rows printed before the tail is summarised. A roll-up that
-/// scrolls the terminal at exactly the moment something is wrong is one the
-/// reader stops using.
-const PROBLEM_ROW_CAP: usize = 10;
-
-/// Pure: one row per application carrying a problem the reader should see.
-///
-/// Takes BOTH lists because the identity a reader can act on lives on the Argo
-/// CD side. The join is the one `app status` already performs, run backwards:
-/// `find_apprafter_app_name` reads the inner CR's name out of an Argo
-/// Application's `status.resources[]`, and `spec.destination.namespace` gives
-/// the namespace — so `(namespace, cr-name)` maps to the logical name
-/// `apprafter.io/application` and the environment.
-///
-/// An application with problems that does NOT resolve through that join is
-/// still listed, marked unresolvable. Dropping it would hide exactly the
-/// applications most likely to be broken, and `app status` cannot render those
-/// either — saying so is the honest output.
-pub(crate) fn problem_app_rows(crs: &[&Value], argo: &[Value], now: &DateTime<Utc>) -> Vec<String> {
-    // (namespace, inner CR name) -> display identity.
-    let mut index: std::collections::HashMap<(String, String), String> =
-        std::collections::HashMap::new();
-    for a in argo {
-        let Some(ns) = a
-            .pointer("/spec/destination/namespace")
-            .and_then(Value::as_str)
-        else {
-            continue;
-        };
-        let Some(inner) = crate::commands::app_open::find_apprafter_app_name(a) else {
-            continue;
-        };
-        let logical = a
-            .pointer("/metadata/labels/apprafter.io~1application")
-            .and_then(Value::as_str)
-            .or_else(|| a.pointer("/metadata/name").and_then(Value::as_str))
-            .unwrap_or("<unknown>");
-        let env = a
-            .pointer("/metadata/labels/apprafter.io~1environment")
-            .and_then(Value::as_str);
-        let display = match env {
-            Some(e) if !e.is_empty() => format!("{logical} ({e})"),
-            _ => logical.to_string(),
-        };
-        index.insert((ns.to_string(), inner), display);
-    }
-
-    let mut rows: Vec<(i64, String)> = Vec::new();
-    for cr in crs {
-        let problems = crate::commands::app::live_problems(cr, now);
-        // The FRESHEST entry, explicitly — never `problems.first()`. The
-        // operator writes `recentProblems` sorted by `firstSeen` ASCENDING
-        // (`ProblemLedger::snapshot`), so element 0 is the problem that
-        // started earliest, which says nothing about what is burning now. A
-        // row built from it would name a failure that stopped hours ago and
-        // hide the live one behind "(+N more)" — and, because the same entry
-        // is the sort key, would file the whole application in the wrong place
-        // under a heading that promises "most recent first".
-        let Some(newest) = problems.iter().min_by_key(|p| p.age) else {
-            continue;
-        };
-        let ns = cr
-            .pointer("/metadata/namespace")
-            .and_then(Value::as_str)
-            .unwrap_or("<unknown>");
-        let name = cr
-            .pointer("/metadata/name")
-            .and_then(Value::as_str)
-            .unwrap_or("<unknown>");
-        let (identity, suffix) = match index.get(&(ns.to_string(), name.to_string())) {
-            Some(display) => (display.clone(), String::new()),
-            // Deliberately not "not registered with Argo CD": an application
-            // that IS registered but has not synced yet has an empty
-            // `status.resources[]`, so the join misses it too. Say what is
-            // actually known — the name could not be resolved — rather than
-            // asserting a cause that may be false.
-            None => (
-                format!("{ns}/{name}"),
-                " — logical name unresolved; `app status` may not find it under this name"
-                    .to_string(),
-            ),
-        };
-        // The newest surviving entry carries the row; the rest are counted.
-        // A row per entry would put five lines on one application and bury
-        // the other applications that are also broken.
-        let more = if problems.len() > 1 {
-            format!(" (+{} more)", problems.len() - 1)
-        } else {
-            String::new()
-        };
-        rows.push((
-            newest.age,
-            format!(
-                "{identity}  {} ({}{}): {}{more}{suffix}",
-                newest.reason,
-                newest.when(now),
-                newest.times(),
-                newest.message
-            ),
-        ));
-    }
-    // Most recent first; ties broken by the rendered text so the order is
-    // stable across runs rather than dependent on map iteration.
-    rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    rows.into_iter().map(|(_, r)| r).collect()
-}
-
-/// Pure: one line per pinned application in a `kubectl get -o json` list.
-///
-/// Reads `status.image.pinned`, which the operator writes only when the pin
-/// is HONOURED — a rejected pin must not appear here, or an operator would
-/// chase an application that is in fact still following its tag.
-pub(crate) fn pinned_app_rows(items: &[Value]) -> Vec<String> {
-    items
-        .iter()
-        .filter_map(|app| {
-            let reference = app
-                .pointer("/status/image/pinned/resolved")
-                .and_then(Value::as_str)?;
-            let name = app
-                .pointer("/metadata/name")
-                .and_then(Value::as_str)
-                .unwrap_or("<unknown>");
-            let ns = app
-                .pointer("/metadata/namespace")
-                .and_then(Value::as_str)
-                .unwrap_or("<unknown>");
-            Some(format!("{ns}/{name}  {reference}"))
-        })
-        .collect()
 }
 
 /// Stamp the recheck-request annotation on the singleton
@@ -504,6 +202,111 @@ pub(crate) fn recheck_completed(
     }
 }
 
+/// What a condition's `status: "True"` MEANS. Read from the
+/// platform-stack controller, which is the only writer of these.
+///
+/// Polarity is not decoration. `apprafter status` shows the conditions
+/// worth a reader's attention, and the obvious filter — "anything not
+/// `True`" — is exactly backwards for half of this list: `YankedVersion`
+/// and `NodeDiskPressure` are bad news *because* they are `True`, so
+/// that filter hides the two conditions a reader most needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConditionPolarity {
+    /// `True` is healthy — surface when it is anything else.
+    Positive,
+    /// `True` is the problem — surface only when it is `True`.
+    Negative,
+    /// Real, but reported better somewhere else in the same output, so
+    /// surfacing it here would be a second vaguer copy of a fact the
+    /// reader already has a line above.
+    ReportedElsewhere,
+}
+
+/// Classify a condition type, or `None` if this build has never heard
+/// of it.
+///
+/// `None` is not "ignore": an unclassified condition is always
+/// surfaced (see [`unhealthy_condition_rows`]). The operator is a
+/// separate cargo workspace, so this list cannot be derived at compile
+/// time; a unit test asserts it covers every type the controller
+/// writes, so growing one there forces a decision here.
+pub(crate) fn condition_polarity(type_: &str) -> Option<ConditionPolarity> {
+    match type_ {
+        "Synced" | "UpstreamReachable" => Some(ConditionPolarity::Positive),
+        "YankedVersion" | "NodeDiskPressure" => Some(ConditionPolarity::Negative),
+        // On the version line.
+        "UpgradeAvailable" => Some(ConditionPolarity::ReportedElsewhere),
+        // Gets its own section, which names the plans rather than just
+        // asserting that some exist.
+        "MigrationPending" => Some(ConditionPolarity::ReportedElsewhere),
+        _ => None,
+    }
+}
+
+/// Every condition on the stack, as rows. Shared by the full table
+/// `platform status` prints and the filtered view `status` prints.
+fn condition_rows(status: &Value) -> Vec<ConditionRow> {
+    status
+        .pointer("/conditions")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|c| {
+                    let field =
+                        |k: &str| c.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                    ConditionRow {
+                        type_: field("type"),
+                        status: field("status"),
+                        reason: field("reason"),
+                        message: field("message"),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The conditions a reader of `apprafter status` should see, by
+/// [`ConditionPolarity`]. An unclassified type is always kept: this
+/// surface exists to answer "is anything wrong", and a condition this
+/// build cannot interpret is the one case where guessing silently is
+/// the worst available answer.
+pub(crate) fn unhealthy_condition_rows(json: &Value) -> Vec<ConditionRow> {
+    let status = json.get("status").cloned().unwrap_or(Value::Null);
+    condition_rows(&status)
+        .into_iter()
+        .filter(|row| match condition_polarity(&row.type_) {
+            Some(ConditionPolarity::Positive) => row.status != "True",
+            Some(ConditionPolarity::Negative) => row.status == "True",
+            Some(ConditionPolarity::ReportedElsewhere) => false,
+            None => true,
+        })
+        .collect()
+}
+
+/// One line naming the version the cluster is on, and the one it could
+/// move to when that differs.
+///
+/// Deliberately silent in the steady state (`available == current`),
+/// which is where a cluster spends nearly all of its life: a field that
+/// renders "available: the version you are already running" teaches the
+/// reader to skip it on the one day it says something.
+pub(crate) fn version_summary_line(json: &Value) -> String {
+    let status = json.get("status").cloned().unwrap_or(Value::Null);
+    let current = status
+        .pointer("/currentVersion")
+        .and_then(Value::as_str)
+        .unwrap_or("(unset)");
+    let available = status.pointer("/availableVersion").and_then(Value::as_str);
+
+    match available {
+        Some(available) if available != current && available != "(unset)" => {
+            format!("Platform: {current} — upgrade available: {available}")
+        }
+        _ => format!("Platform: {current}"),
+    }
+}
+
 /// Pure formatter — pulled out so unit tests can drive with a
 /// fixture JSON without a cluster. `now` lets tests pin "now"
 /// for deterministic relative-date formatting; production
@@ -559,36 +362,11 @@ fn print_status(json: &Value, now: DateTime<Utc>) {
     println!("  lastCheck: {last_check}");
     println!();
 
-    let conditions: Vec<ConditionRow> = status
-        .pointer("/conditions")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .map(|c| ConditionRow {
-                    type_: c
-                        .get("type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    status: c
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    reason: c
-                        .get("reason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    message: c
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // The full table, unfiltered: this command is the detail view, and
+    // an operator reading it wants to see a condition sitting at
+    // `True` as much as one that is not. `apprafter status` takes the
+    // filtered view (`unhealthy_condition_rows`) off the same rows.
+    let conditions: Vec<ConditionRow> = condition_rows(&status);
 
     if conditions.is_empty() {
         println!("Conditions: (none)");
@@ -617,7 +395,7 @@ fn print_status(json: &Value, now: DateTime<Utc>) {
 /// three columns' max widths plus separator overhead, then
 /// wrap MESSAGE to that budget. Falls back to a sane 60 when
 /// stdout isn't a TTY (CI, pipes — width unknown).
-fn render_conditions_table(conditions: &[ConditionRow]) -> String {
+pub(crate) fn render_conditions_table(conditions: &[ConditionRow]) -> String {
     let terminal_width = terminal_width_or_default();
     // Compute the visible width each non-message column will
     // claim: max(header, cells). Plus 3 separators (` | `) of
@@ -1292,238 +1070,135 @@ mod tests {
 
     use chrono::TimeZone;
 
-    // ---- ADR 0059: pinned-application roll-up ----
+    // ---- 2.23a: the two slices `apprafter status` lifts from here ----
 
     #[test]
-    fn pinned_app_rows_lists_only_honoured_pins() {
-        // The middle app carries a pin ANNOTATION the operator rejected, so
-        // it has no `status.image.pinned` and is still following its tag.
-        // Listing it would send an operator chasing an application that is
-        // not actually held.
-        let items = vec![
-            json!({ "metadata": { "name": "web", "namespace": "demo" },
-                    "status": { "image": { "pinned": { "resolved": "ghcr.io/acme/web@sha256:aaa" }}}}),
-            json!({ "metadata": { "name": "api", "namespace": "demo" },
-                    "status": { "image": { "tag": "ghcr.io/acme/api:latest" }}}),
-            json!({ "metadata": { "name": "worker", "namespace": "other" },
-                    "status": { "image": { "pinned": { "resolved": "ghcr.io/acme/worker@sha256:bbb" }}}}),
-        ];
-        let rows = pinned_app_rows(&items);
-        assert_eq!(rows.len(), 2);
-        assert!(rows[0].contains("demo/web"), "{:?}", rows);
-        assert!(rows[0].contains("sha256:aaa"), "{:?}", rows);
-        assert!(rows[1].contains("other/worker"), "{:?}", rows);
+    fn version_summary_line_names_an_available_upgrade() {
+        let stack = json!({
+            "status": { "currentVersion": "0.2.53", "availableVersion": "0.2.59" }
+        });
+        let line = version_summary_line(&stack);
+        assert!(line.contains("0.2.53"), "{line}");
+        assert!(line.contains("0.2.59"), "{line}");
     }
 
     #[test]
-    fn pinned_app_rows_is_empty_when_nothing_is_pinned() {
-        assert!(pinned_app_rows(&[]).is_empty());
-        assert!(pinned_app_rows(&[json!({ "metadata": { "name": "x" }})]).is_empty());
-    }
-
-    // ---- 2.22h / D16: the cluster-wide problem roll-up ----
-
-    fn t(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
-    }
-
-    /// An AppRafter CR carrying `n` problem entries, all at `last_seen`.
-    fn cr_with_problems(ns: &str, name: &str, reasons: &[&str], last_seen: &str) -> Value {
-        let entries: Vec<Value> = reasons
-            .iter()
-            .map(|r| {
-                json!({ "reason": r, "message": "forbidden: cannot delete resourceclaims",
-                        "firstSeen": "2026-09-01T10:00:00+00:00",
-                        "lastSeen": last_seen, "count": 7 })
-            })
-            .collect();
-        json!({
-            "metadata": { "namespace": ns, "name": name },
-            "status": { "recentProblems": entries }
-        })
-    }
-
-    /// The Argo CD Application that registers `ns/cr_name` as logical `logical`.
-    fn argo_app(logical: &str, env: &str, ns: &str, cr_name: &str) -> Value {
-        json!({
-            "metadata": {
-                "name": format!("{logical}-{env}"),
-                "labels": { "apprafter.io/application": logical,
-                            "apprafter.io/environment": env }
-            },
-            "spec": { "destination": { "namespace": ns } },
-            "status": { "resources": [
-                { "group": "apprafter.io", "kind": "Application",
-                  "name": cr_name, "namespace": ns, "version": "v1alpha1" }
-            ]}
-        })
-    }
-
-    #[test]
-    fn problem_roll_up_names_the_application_the_way_app_status_takes_it() {
-        // The row must be typeable into the command it points at. The CR's
-        // own metadata.name is author-chosen CUE and is NOT that argument —
-        // printing it would send the reader to a command that errors.
-        let cr = cr_with_problems(
-            "demo",
-            "parser-cr",
-            &["ClaimPruneFailed"],
-            "2026-09-01T10:05:00+00:00",
+    fn version_summary_line_is_quiet_when_there_is_nothing_to_upgrade_to() {
+        // `availableVersion` equal to `currentVersion` is the steady state,
+        // and it is the state a cluster is in almost all of the time. A line
+        // that renders "available: <the version you are on>" trains the
+        // reader to skip the field on the one day it differs.
+        let stack = json!({
+            "status": { "currentVersion": "0.2.59", "availableVersion": "0.2.59" }
+        });
+        let line = version_summary_line(&stack);
+        assert!(line.contains("0.2.59"), "{line}");
+        assert!(
+            !line.contains("upgrade"),
+            "steady state must not advertise an upgrade: {line}"
         );
-        let argo = vec![argo_app("parser", "prod", "demo", "parser-cr")];
-        let rows = problem_app_rows(&[&cr], &argo, &t("2026-09-01T10:06:00+00:00"));
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        assert!(rows[0].starts_with("parser (prod)"), "{rows:?}");
-        assert!(rows[0].contains("ClaimPruneFailed"), "{rows:?}");
-        assert!(rows[0].contains("(now, 7x)"), "{rows:?}");
     }
 
     #[test]
-    fn an_unregistered_application_is_listed_and_labelled_rather_than_dropped() {
-        // These are the ones most likely to be broken. Dropping them would
-        // make the roll-up quietest exactly where it should be loudest.
-        let cr = cr_with_problems(
-            "demo",
-            "orphan",
-            &["ReconcileFailed"],
-            "2026-09-01T10:05:00+00:00",
-        );
-        let rows = problem_app_rows(&[&cr], &[], &t("2026-09-01T10:06:00+00:00"));
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        assert!(rows[0].starts_with("demo/orphan"), "{rows:?}");
-        assert!(rows[0].contains("logical name unresolved"), "{rows:?}");
-    }
-
-    /// A CR carrying two entries with DIFFERENT `lastSeen`, in the order the
-    /// operator actually writes them: sorted by `firstSeen` ascending, so the
-    /// entry that started earliest comes first regardless of what is burning.
-    fn cr_two_problems(ns: &str, name: &str) -> Value {
-        json!({
-            "metadata": { "namespace": ns, "name": name },
-            "status": { "recentProblems": [
-                { "reason": "StoppedAgesAgo", "message": "this one ended",
-                  "firstSeen": "2026-09-01T09:00:00+00:00",
-                  "lastSeen": "2026-09-01T09:10:00+00:00", "count": 4 },
-                { "reason": "BurningNow", "message": "this one is live",
-                  "firstSeen": "2026-09-01T11:30:00+00:00",
-                  "lastSeen": "2026-09-01T12:00:00+00:00", "count": 2 }
-            ]}
-        })
+    fn version_summary_line_survives_a_status_that_is_not_there_yet() {
+        // A PlatformStack whose controller has not written status once —
+        // real during bootstrap, and the moment a reader is most likely to
+        // run `status`.
+        let line = version_summary_line(&json!({}));
+        assert!(!line.is_empty());
     }
 
     #[test]
-    fn the_row_names_the_live_failure_not_the_one_that_started_first() {
-        // The operator writes `recentProblems` sorted by firstSeen ASCENDING
-        // (`ProblemLedger::snapshot`), so taking element 0 names whatever
-        // broke earliest — here a failure that stopped three hours ago —
-        // and buries the live one behind "(+1 more)".
-        let cr = cr_two_problems("demo", "web");
-        let rows = problem_app_rows(&[&cr], &[], &t("2026-09-01T12:00:00+00:00"));
+    fn unhealthy_conditions_keep_a_positive_condition_that_is_not_true() {
+        let stack = json!({ "status": { "conditions": [
+            { "type": "Synced", "status": "False", "reason": "SyncError", "message": "boom" },
+            { "type": "UpstreamReachable", "status": "True", "reason": "Ok", "message": "" },
+        ]}});
+        let rows = unhealthy_condition_rows(&stack);
         assert_eq!(rows.len(), 1, "{rows:?}");
-        assert!(rows[0].contains("BurningNow"), "{rows:?}");
-        assert!(!rows[0].contains("StoppedAgesAgo"), "{rows:?}");
-        assert!(rows[0].contains("(now, 2x)"), "{rows:?}");
+        assert_eq!(rows[0].type_, "Synced");
     }
 
     #[test]
-    fn ordering_ranks_applications_by_their_freshest_failure() {
-        // Same trap one level up: `web` must outrank `other` on the strength
-        // of its LIVE entry, not be filed under its oldest one.
-        let web = cr_two_problems("demo", "web");
-        let other = cr_with_problems("demo", "other", &["X"], "2026-09-01T11:00:00+00:00");
-        let rows = problem_app_rows(&[&other, &web], &[], &t("2026-09-01T12:00:00+00:00"));
+    fn unhealthy_conditions_keep_a_negative_condition_that_is_true() {
+        // The case a naive `status != "True"` filter gets exactly backwards:
+        // both of these are bad news precisely BECAUSE they are True, and a
+        // reader who sees neither concludes the cluster is fine.
+        let stack = json!({ "status": { "conditions": [
+            { "type": "YankedVersion", "status": "True", "reason": "Yanked", "message": "0.2.19" },
+            { "type": "NodeDiskPressure", "status": "True", "reason": "Low", "message": "3% left" },
+        ]}});
+        let rows = unhealthy_condition_rows(&stack);
         assert_eq!(rows.len(), 2, "{rows:?}");
-        assert!(rows[0].starts_with("demo/web"), "{rows:?}");
     }
 
     #[test]
-    fn an_application_being_deleted_is_neither_counted_nor_listed() {
-        // Its ledger can never be flushed again — the controller evicts and
-        // returns before the flush — so any entry it still carries would be a
-        // permanent phantom.
-        let mut dying = cr_with_problems("demo", "dying", &["X"], "2026-09-01T11:55:00+00:00");
-        dying["metadata"]["deletionTimestamp"] = json!("2026-09-01T11:00:00+00:00");
-        let healthy = json!({ "metadata": { "namespace": "demo", "name": "ok" }});
-        let all = vec![dying, healthy];
-        let live = live_applications(&all);
-        assert_eq!(live.len(), 1);
-        assert!(problem_app_rows(&live, &[], &t("2026-09-01T12:00:00+00:00")).is_empty());
+    fn unhealthy_conditions_drop_a_negative_condition_that_is_false() {
+        let stack = json!({ "status": { "conditions": [
+            { "type": "YankedVersion", "status": "False", "reason": "Clean", "message": "" },
+            { "type": "NodeDiskPressure", "status": "False", "reason": "Ok", "message": "" },
+        ]}});
+        assert!(unhealthy_condition_rows(&stack).is_empty());
     }
 
     #[test]
-    fn the_heading_states_the_true_total_not_the_number_of_lines_shown() {
-        // 13 broken applications, 10 rows printed, "… and 3 more" beneath.
-        // A heading saying "10 reporting problems" contradicts that line and
-        // understates the incident by three applications.
-        let capped = problem_heading(40, 13, 10);
-        assert!(capped.contains("13 reporting problems"), "{capped}");
-        assert!(capped.contains("showing the 10 most recent"), "{capped}");
-        let uncapped = problem_heading(40, 3, 10);
-        assert!(uncapped.contains("3 reporting problems"), "{uncapped}");
-        assert!(uncapped.contains("most recent first"), "{uncapped}");
+    fn unhealthy_conditions_leave_the_two_that_have_their_own_surface_alone() {
+        // `UpgradeAvailable` is on the version line and `MigrationPending`
+        // gets a section that NAMES the plans. Repeating either here is not
+        // redundancy that costs nothing — it is a second, vaguer report of
+        // the same fact one line above a better one.
+        let stack = json!({ "status": { "conditions": [
+            { "type": "UpgradeAvailable", "status": "True", "reason": "New", "message": "" },
+            { "type": "MigrationPending", "status": "True", "reason": "Await", "message": "" },
+        ]}});
+        assert!(unhealthy_condition_rows(&stack).is_empty());
     }
 
     #[test]
-    fn many_problems_on_one_application_collapse_to_one_row() {
-        // Five reasons on one app must not bury the four other apps that are
-        // also broken. The count rides the row; the detail is one command away.
-        let cr = cr_with_problems(
-            "demo",
-            "parser-cr",
-            &["A", "B", "C"],
-            "2026-09-01T10:05:00+00:00",
-        );
-        let argo = vec![argo_app("parser", "prod", "demo", "parser-cr")];
-        let rows = problem_app_rows(&[&cr], &argo, &t("2026-09-01T10:06:00+00:00"));
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        assert!(rows[0].contains("(+2 more)"), "{rows:?}");
+    fn an_unclassified_condition_is_always_surfaced() {
+        // The failure this defends against is silence, not noise. A
+        // condition type this build has never heard of may be bad news at
+        // `True` or at `False`; guessing either way can hide it forever,
+        // and a stale row a human has to classify is the cheaper mistake.
+        for status in ["True", "False", "Unknown"] {
+            let stack = json!({ "status": { "conditions": [
+                { "type": "SomethingNewShipped", "status": status, "reason": "", "message": "" },
+            ]}});
+            let rows = unhealthy_condition_rows(&stack);
+            assert_eq!(rows.len(), 1, "status={status} rows={rows:?}");
+        }
     }
 
     #[test]
-    fn a_healthy_cluster_yields_no_rows() {
-        assert!(problem_app_rows(&[], &[], &t("2026-09-01T10:06:00+00:00")).is_empty());
-        let healthy = json!({ "metadata": { "namespace": "demo", "name": "web" }});
-        assert!(problem_app_rows(&[&healthy], &[], &t("2026-09-01T10:06:00+00:00")).is_empty());
+    fn unhealthy_conditions_of_a_healthy_stack_are_empty() {
+        let stack = json!({ "status": { "conditions": [
+            { "type": "Synced", "status": "True", "reason": "Ok", "message": "" },
+            { "type": "UpstreamReachable", "status": "True", "reason": "Ok", "message": "" },
+            { "type": "YankedVersion", "status": "False", "reason": "Clean", "message": "" },
+        ]}});
+        assert!(unhealthy_condition_rows(&stack).is_empty());
     }
 
     #[test]
-    fn rows_are_ordered_most_recent_first() {
-        let old = cr_with_problems("demo", "old", &["X"], "2026-09-01T08:00:00+00:00");
-        let fresh = cr_with_problems("demo", "fresh", &["Y"], "2026-09-01T10:05:00+00:00");
-        let rows = problem_app_rows(&[&old, &fresh], &[], &t("2026-09-01T10:06:00+00:00"));
-        assert_eq!(rows.len(), 2, "{rows:?}");
-        assert!(rows[0].starts_with("demo/fresh"), "{rows:?}");
-    }
-
-    #[test]
-    fn the_roll_up_and_app_status_never_disagree() {
-        // THE invariant. A roll-up whose whole job is to send the reader to
-        // `app status` must never name an application whose `app status`
-        // prints nothing, and must never stay silent about one that would.
-        // Both surfaces share `live_problems`; this asserts the sharing holds
-        // through both renderings, across every filter rule.
-        let now = t("2026-09-01T12:00:00+00:00");
-        let cases = vec![
-            // live
-            cr_with_problems("demo", "a", &["R"], "2026-09-01T11:55:00+00:00"),
-            // past the 24h render horizon
-            cr_with_problems("demo", "b", &["R"], "2026-08-30T10:00:00+00:00"),
-            // unparseable lastSeen
-            cr_with_problems("demo", "c", &["R"], "not-a-timestamp"),
-            // no problems array at all
-            json!({ "metadata": { "namespace": "demo", "name": "d" }}),
-            // present but empty
-            json!({ "metadata": { "namespace": "demo", "name": "e" },
-                    "status": { "recentProblems": [] }}),
-        ];
-        for cr in &cases {
-            let in_app_status = !crate::commands::app::format_problem_lines(cr, &now).is_empty();
-            let in_roll_up = !problem_app_rows(&[cr], &[], &now).is_empty();
-            assert_eq!(
-                in_app_status,
-                in_roll_up,
-                "surfaces disagree for {:?}",
-                cr.pointer("/metadata/name")
+    fn every_condition_type_the_operator_writes_is_classified() {
+        // Completeness, not coverage: an operator that grows a seventh
+        // condition type must force a polarity decision here rather than
+        // defaulting into the unclassified bucket unnoticed. The list is
+        // committed on purpose — the operator is a separate cargo
+        // workspace, so it cannot be derived at compile time, and a
+        // hand-written list that nothing checks is folklore.
+        for known in [
+            "Synced",
+            "UpstreamReachable",
+            "YankedVersion",
+            "NodeDiskPressure",
+            "UpgradeAvailable",
+            "MigrationPending",
+        ] {
+            assert!(
+                condition_polarity(known).is_some(),
+                "`{known}` is written by the platform-stack controller and \
+                 this build does not classify it"
             );
         }
     }

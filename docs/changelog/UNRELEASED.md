@@ -9,6 +9,59 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.60 — `up` is the command, `status` is the answer, `platform` is the platform (2.23a, unreleased)
+
+Three renames' worth of honesty, no new capability. Every signal `apprafter
+status` now prints already had a reader; what changed is which command owns it.
+
+### Added
+
+- **`apprafter status` answers "is anything wrong with my cluster?"** It rolls
+  up the active target, the platform's version and any unhealthy condition, the
+  applications reporting problems, the applications held at an image digest, and
+  the MigrationPlans awaiting approval — in that order, from one cluster-wide
+  application read shared by both application sections so they describe one
+  instant.
+
+  Every cluster-side section degrades to a labelled line instead of failing.
+  An operator runs this command *because* something looks wrong, and an
+  unreachable cluster is one of the things that can be wrong; a command that
+  errors out on the first failed read is useless in exactly that case. The
+  local half always prints, and an unreachable cluster is told apart from a
+  cluster with no PlatformStack — different problems, different next steps.
+
+  Exit status stays 0 even when sections are unhealthy. `doctor` owns the
+  "exit non-zero on FAIL" contract, and a second differently-shaped failing
+  contract is a promise this does not make.
+
+### Changed
+
+- **`apprafter up` is the canonical command name**; `bootstrap-all` is now its
+  alias. Both spellings keep working, and a test asserts both directions —
+  a one-directional test passes just as happily against a definition that
+  dropped the alias entirely.
+
+- **`apprafter platform status` prints the platform stack and nothing else.**
+  The pinned-application list and the application problem roll-up moved to
+  `apprafter status`. Neither ever read the PlatformStack; they were built here
+  because this was the only command with a cluster-wide view, which is a reason
+  to have built them and never was a reason to file them under `platform`.
+  Nothing about how they render changed — the move is a move, and the test that
+  pins the roll-up and `app status` to one filter moved with them.
+
+- **`status`'s conditions section shows only what is unhealthy**, by polarity
+  rather than by `status != "True"`. That filter is exactly backwards for
+  `YankedVersion` and `NodeDiskPressure`, which are bad news *because* they are
+  `True` — so it would have hidden the two conditions a reader most needs. A
+  condition type this build does not classify is always surfaced, and a unit
+  test fails when the operator grows a type the CLI has not classified.
+
+### Fixed
+
+- `docs/reference/environment.md` linked to `cli/bootstrap-all.md`, which the
+  rename removes. `docsgen generate` is write-only by design, so the stale page
+  was removed by hand rather than left as a stray for `docsgen check` to find.
+
 ## platform-stack 0.2.59 / operator v0.2.45 / cli v0.2.52 — day-2 signals, the way back from a bad build, durable Redis credentials, and failures you can see (2.22c–2.22h, unreleased)
 
 The second half of the day-2 defect sweep. Released as one batch; nothing here
