@@ -31,6 +31,10 @@ PATTERNS=(
   'argocd-cue-cmp/entrypoint.sh'
   # Scripts
   'scripts/*.sh'
+  # Python gates and readers under scripts/ are source too. Both files that
+  # match today already carry the header; naming the pattern is what stops
+  # the next one from being added without it.
+  'scripts/*.py'
   'e2e/*.sh'
   '.devcontainer/*.sh'
   # Source code

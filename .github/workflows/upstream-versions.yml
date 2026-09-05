@@ -1,0 +1,158 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+name: upstream-versions
+
+# Weekly upstream version watch (plan.md 2.23g).
+#
+# Runs `scripts/upstream-versions.py` over `scripts/upstream-pins.json` and
+# keeps ONE issue current by rewriting its body. Not one issue per package,
+# and no pull requests at all -- the finding asked to be told what is stale,
+# not to be handed thirty branches.
+#
+# WHY THIS AND NOT RENOVATE/DEPENDABOT: recorded in plan.md 2.23g and in the
+# script's header. Short version: a bot reads four of this repo's eight pin
+# syntaxes natively and needs hand-written regexes for the other four, so it
+# buys the same volume of code while taking over the commit format, the
+# schedule and the PR model. And it cannot do the second half of this job --
+# applying the candidate and running a gate, so the report can say "newer
+# exists, gate red" instead of just "newer exists".
+#
+# WHAT IT COSTS: no secrets beyond the automatic GITHUB_TOKEN, which is used
+# for two things -- raising the GitHub API rate limit from 60/h to 5000/h (the
+# run makes ~26 API calls, so an unauthenticated run on a shared runner IP
+# would be flaky), and editing the tracking issue.
+#
+# The job does NOT modify any tracked file. The Stage-2 gates apply the
+# candidate version to the gate INVOCATION (a downloaded binary on PATH, a
+# `--version` flag to `helm template`), never by writing into the tree; the
+# only thing they touch is the gitignored `platform-stack/dist/`.
+#
+# Security note: like nightly.yml, this workflow passes every expression
+# through an `env:` block rather than interpolating into a shell command, and
+# it consumes no `github.event.*` content at all -- so the workflow-injection
+# class does not apply.
+#
+# This workflow is itself inside the inventory's field of view: its `uses:`
+# refs and `with: version:` inputs are read by the same patterns as every
+# other workflow. Keep the pins below equal to the majority values in the
+# tree, or the next run will (correctly) report the drift you just added.
+
+on:
+  schedule:
+    # 05:00 UTC Monday. After the nightlies (04:00) so a red nightly is
+    # already visible, and before the working week starts.
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      gates:
+        description: 'Stage 2: apply candidates and run their gates'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  # The report IS an issue body. Load-bearing even though zero PRs are opened.
+  issues: write
+
+concurrency:
+  # A manual dispatch must not race the schedule into creating a second issue.
+  group: upstream-versions
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    name: report
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # cue and helm are needed by the Stage-2 gates: `cue eval` lifts each
+      # component's values out of platform-stack/cue, and `helm template`
+      # renders the CANDIDATE chart against them. These are the repo's pinned
+      # versions on purpose -- the candidate under test is the chart, not the
+      # tool.
+      - name: Install CUE
+        uses: cue-lang/setup-cue@v1.0.1
+        with:
+          version: v0.10.0
+
+      - name: Install helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      # For the two cargo aggregate entries.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # For the two bun aggregate entries.
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Read the pins and ask upstream
+        id: watch
+        env:
+          # Rate limit only. No write scope is used by the script itself.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # `schedule` supplies no inputs, so this is empty on the cron run --
+          # gates are ON by default and only an explicit dispatch of
+          # `gates: false` turns them off.
+          GATES_INPUT: ${{ inputs.gates }}
+        run: |
+          set -uo pipefail
+          gates=""
+          if [ "${GATES_INPUT:-true}" = "false" ]; then
+            gates="--no-gates"
+          fi
+          # Deliberately NOT `set -e`: a non-zero exit means some entry could
+          # not be checked, and that is precisely the news the issue must
+          # carry. Post the report first, fail the job afterwards.
+          python3 scripts/upstream-versions.py $gates -o report.md
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          if [ ! -s report.md ]; then
+            echo "::error::the watch produced no report at all" >&2
+            exit 1
+          fi
+
+      - name: Keep the single tracking issue current
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: Upstream version watch
+        run: |
+          set -euo pipefail
+          # GitHub caps an issue body at 65536 characters. Truncate loudly
+          # rather than let `gh` fail with the whole report lost.
+          if [ "$(wc -c < report.md)" -gt 60000 ]; then
+            head -c 59000 report.md > body.md
+            printf '\n\n---\n\n**Truncated at 59000 characters.** The full report is in this job'"'"'s step summary.\n' >> body.md
+          else
+            cp report.md body.md
+          fi
+          # Match on the exact title across the open-issue list rather than
+          # `gh issue list --search`: the search index lags a freshly created
+          # issue by minutes, and a stale index would make this open a SECOND
+          # issue every week -- the exact outcome the subphase rules out.
+          num="$(gh issue list --state open --limit 500 --json number,title \
+                  --jq 'map(select(.title == env.TITLE)) | .[0].number // empty')"
+          if [ -z "$num" ]; then
+            gh issue create --title "$TITLE" --body-file body.md
+            echo "created the tracking issue"
+          else
+            gh issue edit "$num" --body-file body.md
+            echo "updated issue #${num}"
+          fi
+
+      - name: Surface the report in the job summary
+        if: always()
+        run: cat report.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Fail if any pin could not be checked
+        # An available upgrade -- even one whose gate went red -- is the
+        # output, not a fault. Only an entry this script could not read or
+        # could not resolve against its upstream fails the job, because an
+        # unchecked pin that reads as "fine" is the failure mode the whole
+        # subphase exists to prevent.
+        env:
+          WATCH_CODE: ${{ steps.watch.outputs.code }}
+        run: exit "${WATCH_CODE:-1}"

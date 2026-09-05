@@ -1,0 +1,811 @@
+{
+  "schemaVersion": 1,
+  "$comment": [
+    "Inventory of every externally-versioned pin this repository writes down by hand.",
+    "",
+    "This file is DATA. `scripts/upstream-versions.py` is the only reader; it must never",
+    "grow a branch per pin. Adding a pin is an entry here, not a code change.",
+    "",
+    "One entry = one LOGICAL decision, however many files it is written in. The `cue`",
+    "toolchain version is one entry with three sources (18 workflow inputs, the devcontainer",
+    "installer, the CMP Dockerfile ARG) because bumping it is one decision -- and because a",
+    "single entry is what makes the reader able to report DRIFT when the copies disagree.",
+    "",
+    "FIRST-PARTY VERSIONS ARE DELIBERATELY ABSENT. platform-stack/cue/component_*.cue for",
+    "our own components, argocd-cue-cmp/version.cue, operator/charts/*/Chart.yaml and",
+    "platform-stack/cue/platform.cue `currentVersion` are moved by the release workflows",
+    "(platform-stack-publish.yml, release-operator.yml, argocd-cue-cmp-publish.yml,",
+    "release-backup-runner.yml). They have no upstream to ask, and a watcher that listed",
+    "them would be reporting our own release cadence back at us.",
+    "",
+    "FIELDS",
+    "  id        stable key; used by --only and by the report.",
+    "  class     grouping for the report and for the test-gap section.",
+    "  title     human name.",
+    "  read      how to get the CURRENT value out of the tree. kind:",
+    "              regex   -- sources[] of {files (git-ls-files glob), pattern}. Group 1 is",
+    "                         the version. Every source must match at least once or the",
+    "                         entry reports UNREADABLE; a pattern that quietly stops",
+    "                         matching is the failure mode this rule exists to prevent.",
+    "              json    -- file + dotted path (flake.lock).",
+    "              command -- argv + cwd + pattern; for package-manager aggregates, where",
+    "                         the native tool is a better reader than anything we would write.",
+    "  upstream  where to ask for the newest value. kind: helm | oci-helm | github-release |",
+    "            github-branch | docker-hub | crates-io | http-text | none.",
+    "  compare   numeric -- compare the digit-runs of both strings, newest wins.",
+    "            major   -- report only when the leading number increases (for `@v4`-style",
+    "                       refs that float within their major on purpose).",
+    "            none    -- floating by design or not semver-comparable; never reported as",
+    "                       behind. Requires `note` saying why.",
+    "  gate      Stage 2. What to run against the CANDIDATE version, and what a green",
+    "            actually proves. null requires `gateGap` -- the reason no cluster-free gate",
+    "            exists. The report prints `proves` beside every pass, so a green can never",
+    "            read as more than it is.",
+    "  note      anything a triager needs that is not obvious from the row."
+  ],
+
+  "notCoveredClasses": [
+    {
+      "class": "mise.toml tool pins",
+      "where": "mise.toml:9-13 (rust=stable, bun=latest, node=lts, just=latest, go=latest)",
+      "why": "Floating by design. flake.nix is the authoritative tool-belt per CLAUDE.md; mise.toml is dev ergonomics. Converting these to concrete versions would buy a new stream of bumps for a file that is not what CI uses."
+    },
+    {
+      "class": "dtolnay/rust-toolchain@stable",
+      "where": "13 workflows",
+      "why": "`stable` is the intended floating ref, not a stale pin. Tracked as a github-action entry with compare:none so it still appears in the report."
+    }
+  ],
+
+  "pins": [
+    {
+      "id": "chart-cert-manager",
+      "class": "upstream-helm-chart",
+      "title": "cert-manager",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "platform-stack/cue/component_cert-manager.cue", "pattern": "(?m)^\\tversion:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "helm", "repo": "https://charts.jetstack.io", "chart": "cert-manager" },
+      "compare": "numeric",
+      "gate": {
+        "kind": "helm-template",
+        "component": "cert-manager",
+        "proves": "the candidate chart accepts the values this repo passes it and renders. It does NOT prove the new controllers work in a cluster -- that is e2e-k3d/nightly territory."
+      },
+      "note": "Reaches real clusters through Argo CD. A bump also needs a platform-stack currentVersion bump + a compatibility.cue entry, so platform-stack-check.yml going red on the bump commit is correct, not broken."
+    },
+    {
+      "id": "chart-cloudnative-pg",
+      "class": "upstream-helm-chart",
+      "title": "CloudNativePG operator",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "platform-stack/cue/component_cloudnative-pg.cue", "pattern": "(?m)^\\tversion:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "helm", "repo": "https://cloudnative-pg.github.io/charts", "chart": "cloudnative-pg" },
+      "compare": "numeric",
+      "gate": {
+        "kind": "helm-template",
+        "component": "cloudnative-pg",
+        "proves": "the candidate chart accepts our values and renders."
+      },
+      "note": "platform-stack/cue/service_providers.cue:32-37 records that CNPG does not pin its data-plane Postgres major, so a chart bump can move the Postgres major customer data lives on. No watcher can see that; it is a product decision."
+    },
+    {
+      "id": "chart-sealed-secrets",
+      "class": "upstream-helm-chart",
+      "title": "sealed-secrets",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "platform-stack/cue/component_sealed-secrets.cue", "pattern": "(?m)^\\tversion:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "helm", "repo": "https://bitnami.github.io/sealed-secrets", "chart": "sealed-secrets" },
+      "compare": "numeric",
+      "gate": {
+        "kind": "helm-template",
+        "component": "sealed-secrets",
+        "proves": "the candidate chart accepts our values and renders."
+      },
+      "note": "Ships the SealedSecret CRD in the chart's crds/. A bump moves a CRD, so run `just crd-validate` before releasing it."
+    },
+    {
+      "id": "chart-vpa",
+      "class": "upstream-helm-chart",
+      "title": "vertical-pod-autoscaler",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "platform-stack/cue/component_vpa.cue", "pattern": "(?m)^\\tversion:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "helm", "repo": "https://kubernetes.github.io/autoscaler", "chart": "vertical-pod-autoscaler" },
+      "compare": "numeric",
+      "gate": {
+        "kind": "helm-template",
+        "component": "vpa",
+        "proves": "the candidate chart accepts our values and renders."
+      },
+      "note": "component_vpa.cue:132 already warns that upstream chart defaults move under this pin; the values block pins behaviour, not the defaults."
+    },
+    {
+      "id": "chart-dragonfly-operator",
+      "class": "upstream-helm-chart",
+      "title": "dragonfly-operator (OCI chart)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "platform-stack/cue/component_dragonfly-operator.cue", "pattern": "(?m)^\\tversion:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "oci-helm", "registry": "ghcr.io", "repository": "dragonflydb/dragonfly-operator/helm/dragonfly-operator" },
+      "compare": "numeric",
+      "gate": {
+        "kind": "helm-template",
+        "component": "dragonfly-operator",
+        "oci": true,
+        "proves": "the candidate chart accepts our values and renders."
+      },
+      "note": "OCI Helm chart -- repoURL is the oci:// registry path, so the version list comes from the registry tag API, not an index.yaml."
+    },
+    {
+      "id": "chart-cilium",
+      "class": "upstream-helm-chart",
+      "title": "Cilium (CNI)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "platform-stack/cue/loader_values.cue", "pattern": "cilium: \\{[\\s\\S]*?chartVersion: \"([^\"]+)\"" },
+          { "files": "e2e/gateway-walk.sh", "pattern": "(?m)^CILIUM_VERSION=\"([^\"]+)\"" },
+          { "files": "cli/cli-providers/src/k8s/loader_values.rs", "pattern": "assert_eq!\\(CILIUM_CHART_VERSION, \"([^\"]+)\"\\)" }
+        ]
+      },
+      "upstream": { "kind": "helm", "repo": "https://helm.cilium.io", "chart": "cilium" },
+      "compare": "numeric",
+      "gate": {
+        "kind": "helm-template",
+        "component": "cilium",
+        "proves": "the candidate chart accepts our values and renders."
+      },
+      "note": "THREE copies by design. loader_values.cue:48 is the source of truth; component_cilium.cue:27 derives from it (not a fourth pin). The Rust assert_eq! is a deliberate tripwire -- a Cilium bump SHOULD fail a test until a human edits it. e2e/gateway-walk.sh:115 is a hand-copy that could be read from CUE the way the same script already does at :437."
+    },
+    {
+      "id": "chart-argocd",
+      "class": "upstream-helm-chart",
+      "title": "Argo CD",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "platform-stack/cue/loader_values.cue", "pattern": "argocd: \\{[\\s\\S]*?chartVersion: \"([^\"]+)\"" },
+          { "files": "cli/cli-providers/src/k8s/loader_values.rs", "pattern": "assert_eq!\\(ARGOCD_CHART_VERSION, \"([^\"]+)\"\\)" }
+        ]
+      },
+      "upstream": { "kind": "helm", "repo": "https://argoproj.github.io/argo-helm", "chart": "argo-cd" },
+      "compare": "numeric",
+      "gate": {
+        "kind": "helm-template",
+        "component": "argocd",
+        "proves": "the candidate chart accepts our values and renders."
+      },
+      "note": "The Rust assert_eq! is the same deliberate tripwire as Cilium's."
+    },
+    {
+      "id": "gateway-api-crds",
+      "class": "upstream-git-crds",
+      "title": "Gateway API CRDs (experimental channel)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "platform-stack/cue/component_gateway-api-crds.cue", "pattern": "(?m)^\\tversion:\\s*\"([^\"]+)\"" },
+          { "files": "e2e/gateway-walk.sh", "pattern": "(?m)^GATEWAY_API_VERSION=\"([^\"]+)\"" },
+          { "files": "cli/cli-providers/src/k8s/kubectl.rs", "pattern": "GATEWAY_API_VERSION: &str = \"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "kubernetes-sigs/gateway-api" },
+      "compare": "numeric",
+      "gate": {
+        "kind": "url-exists",
+        "url": "https://raw.githubusercontent.com/kubernetes-sigs/gateway-api/{version}/config/crd/experimental/kustomization.yaml",
+        "proves": "the `config/crd/experimental` directory this repo Argo-syncs still exists at the candidate tag. It does NOT prove the CRD set still satisfies the pinned Cilium, which is the real coupling -- see component_gateway-api-crds.cue's header."
+      },
+      "note": "Not a Helm chart: Argo CD syncs a git path at a tag. Three copies; component_gateway-api-crds.cue is the source of truth."
+    },
+
+    {
+      "id": "flake-nixpkgs",
+      "class": "nix-flake-input",
+      "title": "nixpkgs (flake input)",
+      "read": { "kind": "json", "file": "flake.lock", "path": "nodes.nixpkgs.locked.lastModified", "format": "unixtime" },
+      "upstream": { "kind": "github-branch", "repo": "NixOS/nixpkgs", "branch": "nixos-unstable" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "A `nix flake update` moves the whole tool-belt at once (cue, helm, kubectl, mkdocs-material, ...). The gate that matters is `just docs-check`, whose byte-comparison is protected by NO pin on mkdocs-material -- so a flake update can silently change the docs toolchain. Running it here would need nix in the watch job and would still not attribute a failure to an input. Bump it in a PR and let crd-check.yml + docs.yml judge.",
+      "note": "flake.nix pins a BRANCH, not a tag, so there is no version to compare -- only lock staleness. crd-check.yml is the only workflow with flake.nix/flake.lock in its pull_request paths."
+    },
+    {
+      "id": "flake-flake-utils",
+      "class": "nix-flake-input",
+      "title": "flake-utils (flake input)",
+      "read": { "kind": "json", "file": "flake.lock", "path": "nodes.flake-utils.locked.lastModified", "format": "unixtime" },
+      "upstream": { "kind": "github-branch", "repo": "numtide/flake-utils", "branch": "main" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "Same as nixpkgs: no per-input gate exists.",
+      "note": "Branch ref; staleness only."
+    },
+
+    {
+      "id": "tool-cue",
+      "class": "ci-tool",
+      "title": "cue (CLI)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".github/workflows/*.yml", "pattern": "cue-lang/setup-cue@[^\\n]*\\n\\s*with:\\s*\\n\\s*version:\\s*'?\"?([^\\s'\"]+)" },
+          { "files": ".devcontainer/post-create.sh", "pattern": "(?m)^CUE_VERSION=\"([^\"]+)\"" },
+          { "files": "argocd-cue-cmp/Dockerfile", "pattern": "(?m)^ARG CUE_VERSION=(\\S+)" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "cue-lang/cue" },
+      "compare": "numeric",
+      "gate": {
+        "kind": "cue-vet",
+        "proves": "the repo's CUE still formats and vets under the candidate cue (scripts/lint-cue.sh + a platform-stack vet). CUE is the config language here, so this is the gate that actually matters for this pin. It does NOT cover crdgen's byte-comparison, which needs cargo."
+      },
+      "note": "ONE decision written in 20 places. The Dockerfile ARG is the one that reaches clusters (the Argo CD CMP sidecar evaluates user manifests with it), so a cue bump is a cue-cmp release, not just a CI change."
+    },
+    {
+      "id": "tool-helm",
+      "class": "ci-tool",
+      "title": "helm (CLI)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".github/workflows/*.yml", "pattern": "azure/setup-helm@[^\\n]*\\n\\s*with:\\s*\\n\\s*version:\\s*'?\"?([^\\s'\"]+)" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "helm/helm" },
+      "compare": "numeric",
+      "gate": {
+        "kind": "helm-lint",
+        "proves": "the platform-stack umbrella chart still renders and passes `helm lint` under the candidate helm."
+      },
+      "note": "Known drift: ten workflows say v3.16.2 and release-operator.yml:311 says v3.16.4. Nothing detects it today; this entry does."
+    },
+    {
+      "id": "tool-kubectl",
+      "class": "ci-tool",
+      "title": "kubectl (CLI)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".github/workflows/*.yml", "pattern": "azure/setup-kubectl@[^\\n]*\\n\\s*with:\\s*\\n\\s*version:\\s*'?\"?([^\\s'\"]+)" }
+        ]
+      },
+      "upstream": { "kind": "http-text", "url": "https://dl.k8s.io/release/stable.txt", "pattern": "^(v\\S+)" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "kubectl is only exercised against a live apiserver. Every workflow that installs it (nightly.yml, e2e-k3d.yml, the seven e2e-*-nightly.yml) needs a cluster -- kind/k3d at minimum, real Hetzner credentials for nightly.yml. A version-watch job must not stand up clusters, so this pin is reported and not tested.",
+      "note": "Must move in lockstep with the k8s-openapi `features = [\"v1_31\"]` flag in BOTH Cargo workspaces (cli/Cargo.toml:69, operator/Cargo.toml:46). Nothing links them; this note is the link."
+    },
+
+    {
+      "id": "tool-kind",
+      "class": "ci-download",
+      "title": "kind",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".github/workflows/*.yml", "pattern": "kind\\.sigs\\.k8s\\.io/dl/(v[^/]+)/kind-linux" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "kubernetes-sigs/kind" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "Testing a kind bump means creating a cluster. Out of scope for a watch job by the same rule as kubectl.",
+      "note": "Eight copies of the same literal, no variable. `.github/workflows/**` is in no path-filter that would gate a change to them beyond the workflow's own trigger."
+    },
+    {
+      "id": "tool-yq",
+      "class": "ci-download",
+      "title": "yq",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".github/workflows/*.yml", "pattern": "mikefarah/yq/releases/download/(v[^/]+)/" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "mikefarah/yq" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "Only used inside two nightly e2e walks that need a cluster.",
+      "note": "e2e-pg-nightly.yml:106 and e2e-env-and-secrets-nightly.yml:107."
+    },
+    {
+      "id": "tool-just",
+      "class": "ci-download",
+      "title": "just",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".github/workflows/*.yml", "pattern": "(?m)^\\s*JUST_VERSION:\\s*(\\S+)" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "casey/just" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "`just` is a command runner; the thing to test is every recipe, i.e. the whole CI matrix. A watch job cannot do that honestly.",
+      "note": "e2e-k3d.yml:202. Upstream tags carry no `v` prefix, so the compare is on digits only."
+    },
+    {
+      "id": "tool-cilium-cli",
+      "class": "ci-download",
+      "title": "cilium-cli",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".github/workflows/*.yml", "pattern": "(?m)^\\s*CILIUM_CLI_VERSION=(\\S+)" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "cilium/cilium-cli" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "Used only by e2e-networkpolicy-nightly.yml, which needs kind + real Cilium (and a rootful runtime -- rootless podman's 8 MB memlock cap kills cilium-agent).",
+      "note": "Must stay compatible with the pinned Cilium chart version, not merely be newest."
+    },
+    {
+      "id": "tool-hubble",
+      "class": "ci-download",
+      "title": "hubble",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".github/workflows/*.yml", "pattern": "(?m)^\\s*HUBBLE_VERSION=(\\S+)" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "cilium/hubble" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "Same as cilium-cli.",
+      "note": "Tracks the Cilium minor by convention (v1.16.x beside chart 1.16.5)."
+    },
+    {
+      "id": "tool-k3d",
+      "class": "ci-download",
+      "title": "k3d (devcontainer)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".devcontainer/post-create.sh", "pattern": "(?m)^K3D_VERSION=\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "k3d-io/k3d" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "Cluster tool; same rule as kind.",
+      "note": ".devcontainer/** is in no workflow's paths: filter, so nothing in CI has ever run this file."
+    },
+    {
+      "id": "tool-cosign",
+      "class": "ci-download",
+      "title": "cosign (devcontainer)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".devcontainer/post-create.sh", "pattern": "(?m)^COSIGN_VERSION=\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "sigstore/cosign" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "Signing tool; verifying a bump means signing and verifying a real artefact against the real transparency log, which belongs in the publish workflows, not here.",
+      "note": "CI uses sigstore/cosign-installer@v3 instead, which floats -- so this devcontainer pin and CI can disagree without anyone noticing."
+    },
+
+    {
+      "id": "image-alpine",
+      "class": "container-base-image",
+      "title": "alpine (base image)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "argocd-cue-cmp/Dockerfile", "pattern": "(?m)^ARG ALPINE_VERSION=(\\S+)" },
+          { "files": "cli/apprafter-backup/Dockerfile", "pattern": "(?m)^FROM alpine:(\\S+)" }
+        ]
+      },
+      "upstream": { "kind": "docker-hub", "repository": "library/alpine", "tagPattern": "^3\\.\\d+$" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "Building the images is the gate, and only one of the ten Dockerfiles in this tree is built on a PR (argocd-cue-cmp-check.yml:71). Wiring a build into the watch job would duplicate that workflow; the honest move is to add pull_request builds for the other images, which is a CI change of its own.",
+      "note": "Known drift: the CMP sidecar is on 3.20, the backup runner on 3.21."
+    },
+    {
+      "id": "image-rust-builder",
+      "class": "container-base-image",
+      "title": "rust builder image",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "operator/apprafter-operator/Dockerfile", "pattern": "FROM docker\\.io/library/rust:(\\S+) AS chef" },
+          { "files": "operator/admission-webhook/Dockerfile", "pattern": "FROM docker\\.io/library/rust:(\\S+) AS chef" },
+          { "files": "cli/apprafter-backup/Dockerfile", "pattern": "FROM docker\\.io/library/rust:(\\S+) AS chef" }
+        ]
+      },
+      "upstream": { "kind": "docker-hub", "repository": "library/rust", "tagPattern": "^1\\.\\d+-alpine3\\.\\d+$" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "A full cargo-chef release build of an operator image is ~10 minutes and is what release-operator.yml already does after merge. Doing it three times a week to answer `is rust 1.9x fine` is the wrong shape -- bump it in a PR.",
+      "note": "Three copies of the same builder tag; they have never drifted, and this entry is what would catch it if they did."
+    },
+    {
+      "id": "image-cargo-chef",
+      "class": "container-base-image",
+      "title": "cargo-chef (build ARG)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "operator/apprafter-operator/Dockerfile", "pattern": "(?m)^ARG CARGO_CHEF_VERSION=(\\S+)" },
+          { "files": "operator/admission-webhook/Dockerfile", "pattern": "(?m)^ARG CARGO_CHEF_VERSION=(\\S+)" }
+        ]
+      },
+      "upstream": { "kind": "crates-io", "crate": "cargo-chef" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "Same as the rust builder: the gate is the image build.",
+      "note": "A Dockerfile ARG, so `docker build --build-arg` can test a candidate without editing the tree."
+    },
+    {
+      "id": "image-node",
+      "class": "container-base-image",
+      "multipleValuesOk": "Two different base flavours on purpose: the Backstage host needs glibc (bookworm-slim), the landing CMS runtime does not (alpine).",
+      "title": "node (Backstage host + landing CMS runtime)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "backstage-plugins/host/Dockerfile", "pattern": "FROM node:(\\S+) AS build" },
+          { "files": "landing/cms/Dockerfile", "pattern": "FROM node:(\\S+) AS runtime" }
+        ]
+      },
+      "upstream": { "kind": "docker-hub", "repository": "library/node", "tagPattern": "^\\d+-(alpine|bookworm-slim)$" },
+      "compare": "none",
+      "gate": null,
+      "gateGap": "Two different base flavours (bookworm-slim vs alpine) with different major pins; a single `newest` is not a meaningful target. Needs a human decision per image.",
+      "note": "The Backstage host is on node 20 (out of upstream LTS support) and the landing CMS on node 24. Reported for review, never as `behind`, because the two are not comparable to one number."
+    },
+    {
+      "id": "image-bun",
+      "class": "container-base-image",
+      "multipleValuesOk": "alpine for the landing builders, debian for the scaffolded user template. Different flavours of the same major, not drift.",
+      "title": "oven/bun (landing + template builders)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "landing/web/Dockerfile", "pattern": "FROM oven/bun:(\\S+) AS builder" },
+          { "files": "landing/cms/Dockerfile", "pattern": "FROM oven/bun:(\\S+) AS builder" },
+          { "files": "examples/templates/bun-http/Dockerfile", "pattern": "FROM oven/bun:(\\S+) AS builder" }
+        ]
+      },
+      "upstream": { "kind": "docker-hub", "repository": "oven/bun", "tagPattern": "^\\d+-(alpine|debian)$" },
+      "compare": "major",
+      "gate": null,
+      "gateGap": "The gate is `bun run build` inside the image, which landing-preview-build.yml already performs on the landing side.",
+      "note": "Pinned to major 1 and floating within it on purpose -- only a major bump is news."
+    },
+    {
+      "id": "image-caddy",
+      "class": "container-base-image",
+      "title": "caddy (landing + docs static runtime)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "landing/web/Dockerfile", "pattern": "FROM caddy:(\\S+) AS runtime" },
+          { "files": "docs-site/Dockerfile", "pattern": "(?m)^FROM caddy:(\\S+)\\s*$" }
+        ]
+      },
+      "upstream": { "kind": "docker-hub", "repository": "library/caddy", "tagPattern": "^\\d+-alpine$" },
+      "compare": "major",
+      "gate": null,
+      "gateGap": "The gate is the site smoke (scripts/landing-site-smoke.sh, scripts/docs-site-smoke.sh), which probes a deployed site rather than a candidate image.",
+      "note": "Pinned to major 2 and floating within it on purpose."
+    },
+    {
+      "id": "image-distroless",
+      "class": "container-base-image",
+      "multipleValuesOk": "Two different distroless images (static for the Rust binaries, nodejs20 for the template), not two values of one pin.",
+      "title": "gcr.io/distroless runtimes",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "operator/apprafter-operator/Dockerfile", "pattern": "FROM (gcr\\.io/distroless/\\S+)" },
+          { "files": "operator/admission-webhook/Dockerfile", "pattern": "FROM (gcr\\.io/distroless/\\S+)" },
+          { "files": "examples/templates/bun-http/Dockerfile", "pattern": "FROM (gcr\\.io/distroless/\\S+)" }
+        ]
+      },
+      "upstream": { "kind": "none" },
+      "compare": "none",
+      "gate": null,
+      "gateGap": "No version to test; the images are rebuilt continuously under the same tag.",
+      "note": "distroless publishes no semver tags -- `:nonroot` is a moving tag and the version information is the Debian base (debian12) and, for the template, the node major (nodejs20). Both are human decisions; this row exists so they are at least visible. nodejs20 is the one worth revisiting."
+    },
+
+    {
+      "id": "action-actions-checkout",
+      "class": "github-action",
+      "title": "actions/checkout",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/checkout@([A-Za-z0-9._-]+)" } ] },
+      "upstream": { "kind": "github-release", "repo": "actions/checkout" },
+      "compare": "major",
+      "gate": null,
+      "gateGap": "An action major bump can only be tested by running the workflows that use it. That is a pull request, not a script -- and it is the one class where opening a PR really is the right tool.",
+      "note": "45 uses -- the most-used action in the tree."
+    },
+    {
+      "id": "action-setup-cue",
+      "class": "github-action",
+      "title": "cue-lang/setup-cue",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: cue-lang/setup-cue@([A-Za-z0-9._-]+)" } ] },
+      "upstream": { "kind": "github-release", "repo": "cue-lang/setup-cue" },
+      "compare": "major",
+      "gate": null,
+      "gateGap": "See actions/checkout.",
+      "note": "Pinned to a full patch tag (v1.0.1), unlike the other actions which float within a major."
+    },
+    {
+      "id": "action-rust-toolchain",
+      "class": "github-action",
+      "title": "dtolnay/rust-toolchain",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: dtolnay/rust-toolchain@([A-Za-z0-9._-]+)" } ] },
+      "upstream": { "kind": "none" },
+      "compare": "none",
+      "gate": null,
+      "gateGap": "Nothing to bump.",
+      "note": "`@stable` is a branch ref and the intended floating pin -- the action publishes a branch per toolchain channel. Listed so it is not mistaken for an unwatched pin."
+    },
+    {
+      "id": "action-setup-helm",
+      "class": "github-action",
+      "title": "azure/setup-helm",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: azure/setup-helm@([A-Za-z0-9._-]+)" } ] },
+      "upstream": { "kind": "github-release", "repo": "Azure/setup-helm" },
+      "compare": "major",
+      "gate": null,
+      "gateGap": "See actions/checkout.",
+      "note": null
+    },
+    {
+      "id": "action-setup-buildx",
+      "class": "github-action",
+      "title": "docker/setup-buildx-action",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: docker/setup-buildx-action@([A-Za-z0-9._-]+)" } ] },
+      "upstream": { "kind": "github-release", "repo": "docker/setup-buildx-action" },
+      "compare": "major",
+      "gate": null,
+      "gateGap": "See actions/checkout.",
+      "note": null
+    },
+    {
+      "id": "action-login",
+      "class": "github-action",
+      "title": "docker/login-action",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: docker/login-action@([A-Za-z0-9._-]+)" } ] },
+      "upstream": { "kind": "github-release", "repo": "docker/login-action" },
+      "compare": "major",
+      "gate": null,
+      "gateGap": "See actions/checkout.",
+      "note": null
+    },
+    {
+      "id": "action-build-push",
+      "class": "github-action",
+      "title": "docker/build-push-action",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: docker/build-push-action@([A-Za-z0-9._-]+)" } ] },
+      "upstream": { "kind": "github-release", "repo": "docker/build-push-action" },
+      "compare": "major",
+      "gate": null,
+      "gateGap": "See actions/checkout.",
+      "note": "Every published image in this repo goes through this action; a major bump touches all five release workflows at once."
+    },
+    {
+      "id": "action-setup-kubectl",
+      "class": "github-action",
+      "title": "azure/setup-kubectl",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: azure/setup-kubectl@([A-Za-z0-9._-]+)" } ] },
+      "upstream": { "kind": "github-release", "repo": "Azure/setup-kubectl" },
+      "compare": "major",
+      "gate": null,
+      "gateGap": "See actions/checkout.",
+      "note": null
+    },
+    {
+      "id": "action-cache",
+      "class": "github-action",
+      "title": "actions/cache",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/cache@([A-Za-z0-9._-]+)" } ] },
+      "upstream": { "kind": "github-release", "repo": "actions/cache" },
+      "compare": "major",
+      "gate": null,
+      "gateGap": "See actions/checkout.",
+      "note": null
+    },
+    {
+      "id": "action-setup-bun",
+      "class": "github-action",
+      "title": "oven-sh/setup-bun",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: oven-sh/setup-bun@([A-Za-z0-9._-]+)" } ] },
+      "upstream": { "kind": "github-release", "repo": "oven-sh/setup-bun" },
+      "compare": "major",
+      "gate": null,
+      "gateGap": "See actions/checkout.",
+      "note": null
+    },
+    {
+      "id": "action-paths-filter",
+      "class": "github-action",
+      "title": "dorny/paths-filter",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: dorny/paths-filter@([A-Za-z0-9._-]+)" } ] },
+      "upstream": { "kind": "github-release", "repo": "dorny/paths-filter" },
+      "compare": "major",
+      "gate": null,
+      "gateGap": "See actions/checkout.",
+      "note": "Decides which of lint.yml/test.yml's jobs run at all; a silent behaviour change here would look like tests passing."
+    },
+    {
+      "id": "action-nix-installer",
+      "class": "github-action",
+      "title": "DeterminateSystems/nix-installer-action",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: DeterminateSystems/nix-installer-action@([A-Za-z0-9._-]+)" } ] },
+      "upstream": { "kind": "github-release", "repo": "DeterminateSystems/nix-installer-action" },
+      "compare": "none",
+      "gate": null,
+      "gateGap": "Nothing to bump while it is pinned to a branch.",
+      "note": "PINNED TO @main IN THREE WORKFLOWS (crd-check.yml:43, docs.yml:118, release-docs.yml:173). That is a floating branch ref on a third-party action that runs in a job with repository write scope. It is the only unpinned action in the tree and the only entry here whose fix is to STOP floating; compare is `none` because there is nothing to compare, not because it is fine. The report shows upstream's newest tag so the hand-pin is a copy-paste."
+    },
+    {
+      "id": "action-rust-cache",
+      "class": "github-action",
+      "title": "Swatinem/rust-cache",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: Swatinem/rust-cache@([A-Za-z0-9._-]+)" } ] },
+      "upstream": { "kind": "github-release", "repo": "Swatinem/rust-cache" },
+      "compare": "major",
+      "gate": null,
+      "gateGap": "See actions/checkout.",
+      "note": null
+    },
+    {
+      "id": "action-cosign-installer",
+      "class": "github-action",
+      "title": "sigstore/cosign-installer",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: sigstore/cosign-installer@([A-Za-z0-9._-]+)" } ] },
+      "upstream": { "kind": "github-release", "repo": "sigstore/cosign-installer" },
+      "compare": "major",
+      "gate": null,
+      "gateGap": "See actions/checkout.",
+      "note": null
+    },
+    {
+      "id": "action-setup-oras",
+      "class": "github-action",
+      "title": "oras-project/setup-oras",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: oras-project/setup-oras@([A-Za-z0-9._-]+)" } ] },
+      "upstream": { "kind": "github-release", "repo": "oras-project/setup-oras" },
+      "compare": "major",
+      "gate": null,
+      "gateGap": "See actions/checkout.",
+      "note": "Carries the channel-tag publish path (ADR 0041)."
+    },
+    {
+      "id": "action-semantic-pr",
+      "class": "github-action",
+      "title": "amannn/action-semantic-pull-request",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: amannn/action-semantic-pull-request@([A-Za-z0-9._-]+)" } ] },
+      "upstream": { "kind": "github-release", "repo": "amannn/action-semantic-pull-request" },
+      "compare": "major",
+      "gate": null,
+      "gateGap": "See actions/checkout.",
+      "note": "One of the two Conventional Commits enforcement points (the other is scripts/check-commit-msg.sh)."
+    },
+    {
+      "id": "action-upload-artifact",
+      "class": "github-action",
+      "title": "actions/upload-artifact",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/upload-artifact@([A-Za-z0-9._-]+)" } ] },
+      "upstream": { "kind": "github-release", "repo": "actions/upload-artifact" },
+      "compare": "major",
+      "gate": null,
+      "gateGap": "See actions/checkout.",
+      "note": null
+    },
+    {
+      "id": "action-download-artifact",
+      "class": "github-action",
+      "title": "actions/download-artifact",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/download-artifact@([A-Za-z0-9._-]+)" } ] },
+      "upstream": { "kind": "github-release", "repo": "actions/download-artifact" },
+      "compare": "major",
+      "gate": null,
+      "gateGap": "See actions/checkout.",
+      "note": "Must move in lockstep with upload-artifact -- v3 and v4 artefacts are not interoperable."
+    },
+
+    {
+      "id": "deps-cargo-cli",
+      "class": "package-manager",
+      "title": "cargo dependencies (cli/ workspace)",
+      "read": {
+        "kind": "command",
+        "cmd": ["cargo", "update", "--dry-run", "--workspace"],
+        "cwd": "cli",
+        "pattern": "(\\d+) unchanged dependencies behind latest",
+        "zeroText": "all dependencies at latest",
+        "unit": "crates behind latest"
+      },
+      "upstream": { "kind": "none" },
+      "compare": "none",
+      "gate": null,
+      "gateGap": "`cargo update` only takes semver-COMPATIBLE upgrades, which the lockfile already allows; the count reported here is the semver-INcompatible remainder, and taking those means editing Cargo.toml ranges per crate. That is a judged change, not a mechanical one -- and CLAUDE.md requires Cargo.toml and Cargo.lock to move in the same commit as a version bump.",
+      "note": "Reported as an aggregate on purpose. cargo has a first-class reader (`cargo update --dry-run`); reimplementing a crates.io walker would produce a worse answer and 300 rows. Requires cargo on PATH and network -- if cargo is missing the entry reports TOOL-MISSING, not zero."
+    },
+    {
+      "id": "deps-cargo-operator",
+      "class": "package-manager",
+      "title": "cargo dependencies (operator/ workspace)",
+      "read": {
+        "kind": "command",
+        "cmd": ["cargo", "update", "--dry-run", "--workspace"],
+        "cwd": "operator",
+        "pattern": "(\\d+) unchanged dependencies behind latest",
+        "zeroText": "all dependencies at latest",
+        "unit": "crates behind latest"
+      },
+      "upstream": { "kind": "none" },
+      "compare": "none",
+      "gate": null,
+      "gateGap": "Same as the cli workspace.",
+      "note": "Separate Cargo workspace -- there is no top-level Cargo.toml, so this genuinely is a second inventory entry and not a duplicate."
+    },
+    {
+      "id": "deps-bun-landing",
+      "class": "package-manager",
+      "title": "bun dependencies (landing/)",
+      "read": {
+        "kind": "command",
+        "cmd": ["bun", "outdated", "--filter", "*"],
+        "cwd": "landing",
+        "pattern": null,
+        "countPattern": "(?m)^\\|\\s+(?!Package\\b)[^|\\s]",
+        "zeroText": "all dependencies at latest",
+        "unit": "packages behind latest"
+      },
+      "upstream": { "kind": "none" },
+      "compare": "none",
+      "gate": null,
+      "gateGap": "`bun update` + `bun test` is a real gate and landing-content-check.yml already runs the tests -- but taking every available major (biome 1 -> 2, typescript 5 -> 7) is a migration, not a bump. Aggregate-report it; migrate deliberately.",
+      "note": "`--filter '*'` covers the workspace root plus web/ and cms/. Requires bun on PATH; reports TOOL-MISSING otherwise."
+    },
+    {
+      "id": "deps-bun-backstage",
+      "class": "package-manager",
+      "title": "bun dependencies (backstage-plugins/)",
+      "read": {
+        "kind": "command",
+        "cmd": ["bun", "outdated"],
+        "cwd": "backstage-plugins/applications-backend",
+        "pattern": null,
+        "countPattern": "(?m)^\\|\\s+(?!Package\\b)[^|\\s]",
+        "zeroText": "all dependencies at latest",
+        "unit": "packages behind latest"
+      },
+      "upstream": { "kind": "none" },
+      "compare": "none",
+      "gate": null,
+      "gateGap": "Backstage plugin dependencies move with the Backstage release train, which is a coordinated upgrade rather than a per-package bump.",
+      "note": "The frontend plugin and examples/templates/bun-http/skeleton are deliberately NOT tracked: the skeleton is a Backstage scaffolder template whose package.json `name` is the literal placeholder ${{ values.name }} and which ships no lockfile, so bumping it silently changes what every scaffolded user project starts from."
+    }
+  ]
+}
