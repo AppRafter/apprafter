@@ -98,7 +98,7 @@ deliberately not covered by the shipped slice.
 
 ## Prerequisites
 
-- A Tier-1 cluster provisioned with `apprafter bootstrap-all` (see the
+- A Tier-1 cluster provisioned with `apprafter up` (see the
   [Quickstart](quickstart.md)). Cilium is the platform's CNI on every tier, so
   the policy machinery is always present.
 - For the verification blocks above only, a kubeconfig, and — to read datapath

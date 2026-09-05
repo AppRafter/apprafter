@@ -178,7 +178,7 @@ apprafter target add prod \
     --ssh-key ~/.ssh/id_ed25519.pub \
     --server-type <sku>
 
-apprafter up          # alias: apprafter bootstrap-all
+apprafter up          # alias for it: apprafter bootstrap-all
 # ↳ provisions the server with cloud-init k3s, waits for the node,
 #   then bootstraps Cilium + Gateway API + Argo CD + the platform
 #   stack (operator, admission webhook, cert-manager). ~3 min.
@@ -193,19 +193,16 @@ apprafter doctor                 # self-diagnostic; exits 1 on FAIL
     `apprafter::provider::server_type_not_selected` rather than
     silently billing you for a class you did not choose.
 
-    Rather than hardcoding a SKU that Hetzner may retire, run the
-    picker — it lists the live `(region × SKU)` catalogue with prices
-    and saves your choice on the target:
+    On a TTY you do not choose it separately: `apprafter target add prod`
+    ends in the live `(region × SKU)` matrix with prices and availability,
+    and saves the choice on the target. The flag form above is for a
+    machine with no TTY.
 
-    ```sh
-    apprafter target machine          # interactive picker
-    ```
-
-    `apprafter target machine` is also the **only** way to change the
-    type later: `target add <existing>` errors, and `--renew` is
-    credentials-only. Non-interactively, set it with `target add
-    --server-type <sku>` as above, `apprafter up --server-type <sku>`
-    for one run, or `APPRAFTER_SERVER_TYPE`.
+    `apprafter target machine` re-opens that matrix on its own, and is the
+    **only** way to change the type later: `target add <existing>` errors,
+    `--renew` is credentials-only, and once a server exists the change is a
+    rebuild rather than an edit. For one run, `apprafter up --server-type
+    <sku>` or `APPRAFTER_SERVER_TYPE`.
 
 `up` runs `apply` → kubeconfig poll → `cluster-bootstrap`
 under one progress display. Preview it first with

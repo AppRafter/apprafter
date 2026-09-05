@@ -273,14 +273,12 @@ to a typed variant with its own help text.
 
 ### "state has no provider — run `apprafter init` first"
 
-Before v0.1.83 this fired after `target add` because the
-operational commands only consulted `state.json` for provider /
-region. v0.1.83 wired the active target's `config.yaml` as a
-fallback. If you still see this on v0.1.83+, your store's
-`config.yaml` for the active target is missing the `provider`
-field — fix by hand or recreate the target.
+The operational commands read the active target's `config.yaml` as a
+fallback when `state.json` carries no provider, so seeing this means that
+`config.yaml` is missing its `provider` field — fix it by hand or recreate
+the target.
 
-### The `k3s-ready` step of `bootstrap-all` takes longer than expected
+### The `k3s-ready` step of `up` takes longer than expected {#the-k3s-ready-step-of-bootstrap-all-takes-longer-than-expected}
 
 The `k3s-ready` phase is **waiting for cloud-init + k3s on the
 new node**, not the kubeconfig fetch itself — that's why the

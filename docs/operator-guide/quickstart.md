@@ -26,7 +26,7 @@ see [`docs/dev-guide/quickstart.md`](../dev-guide/quickstart.md).
 | Application CRD   | `apprafter.io/v1alpha1.Application` (admission-validated).             |
 
 **Important:** the platform does not stop at Argo CD installation. After
-`bootstrap-all` completes, Argo CD adopts the platform stack itself — Cilium,
+`up` completes, Argo CD adopts the platform stack itself — Cilium,
 cert-manager, the AppRafter operator, the admission webhook — and reconciles it
 from a versioned OCI chart. You do not install the operator by hand; the
 platform installs and upgrades itself through GitOps.
@@ -75,8 +75,20 @@ You will also need:
 
 Any command that needs a tool checks for it **before** it prompts for
 anything, contacts a cluster or creates a billable resource, and names
-the install steps when it is absent. Step 3's `apprafter doctor` lists
-all five up front.
+the install steps when it is absent.
+
+Confirm all five now, before step 1 and before anything is billable:
+
+```sh
+apprafter doctor
+```
+
+With no target configured it reports `active target: none configured` as
+a warning and exits 0, and still prints one line per tool —
+`kubectl` `helm` `git` `ssh` `restic` — plus a DNS reachability check. A
+missing `kubectl` is the only FAIL; the rest warn and name the capability
+you would lose. Step 3 runs it a second time, when there is a target for
+its six target-side checks to read.
 
 The rest of this page assumes `apprafter` is on `PATH`.
 
@@ -84,6 +96,19 @@ The rest of this page assumes `apprafter` is on `PATH`.
 
 A **target** bundles `(provider, region, credentials, defaults)`
 under a name. One command saves it; future commands reuse it.
+
+```sh
+apprafter target add prod
+```
+
+On a TTY this runs a wizard: it asks for the name, provider, token, SSH
+key and tier, validates the token against the Hetzner API, and then opens
+the **live machine matrix** — one row per (region × machine type) with
+price and availability — so the region and the server type are chosen
+together and saved on the target. That is the whole of step 1; there is
+nothing to look up first.
+
+Scripted, or on a machine with no TTY, name the same things as flags:
 
 ```sh
 apprafter target add prod \
@@ -95,60 +120,34 @@ apprafter target add prod \
     --server-type <sku>
 ```
 
-The wizard auto-fills any flag you skip. On a TTY without
-`--no-interactive` you can run `apprafter target add prod` alone
-and answer the prompts; the wizard validates the token against
-the Hetzner API before saving.
-
 !!! warning "The server type has no default — step 2 fails without it"
     Provisioning is a spending decision, so AppRafter refuses to guess
     a machine class ([ADR 0056](../adr/0056-machine-picker.md)). The
     resolution chain is `--server-type` flag → manifest
     `spec.nodes[0].type` → recorded state → target default →
     `APPRAFTER_SERVER_TYPE`, and if every rung is empty `apprafter
-    bootstrap-all` aborts with
+    up` aborts with
     `apprafter::provider::server_type_not_selected` before creating
     anything.
 
-    Rather than copying a SKU that Hetzner may retire, run the picker
-    — it crosses the live catalogue with per-region availability and
-    price, and saves the choice on the target:
+    The wizard above already made this choice. `apprafter target machine`
+    is how you set it on a target created non-interactively, or change it
+    later — and it is the only way to change it: `target add <existing>`
+    errors and `--renew` is credentials-only. It refuses once a server has
+    been provisioned, because changing the machine of a live cluster is a
+    rebuild, not an edit.
 
     ```sh
-    apprafter target machine          # interactive picker
+    apprafter target machine          # the same matrix, on its own
     apprafter target machine --server-type <sku>   # non-interactive
     ```
 
-    `target machine` is also the only way to change the type on an
-    existing target: `target add <existing>` errors and `--renew` is
-    credentials-only.
-
-    The declarative rung is an `Infrastructure` manifest, handed to
-    `apprafter apply` through `APPRAFTER_MANIFEST`. It outranks
-    everything except an explicit `--server-type`, which makes it the
-    right place to pin the substrate for a cluster under review:
-
-    ```cue
-    // infra.cue — APPRAFTER_MANIFEST=./infra.cue apprafter apply
-    package infra
-
-    import v1alpha1 "apprafter.io/schemas/v1alpha1"
-
-    infra: v1alpha1.#Infrastructure & {
-        apiVersion: "apprafter.io/v1alpha1"
-        kind:       "Infrastructure"
-        metadata: name: "platform-1"
-        spec: {
-            provider: "hetzner-cloud"
-            region:   "nbg1"
-            nodes: [{
-                role:  "control-plane"
-                type:  "<sku>"
-                count: 1
-            }]
-        }
-    }
-    ```
+    A committed `Infrastructure` manifest is a fourth rung, read from a
+    path on the machine running the CLI and named by `APPRAFTER_MANIFEST`.
+    It is not a cluster object and there is no GitOps path for it; only
+    `apply` reads it. The target store is where the CLI keeps the substrate
+    settings. See [Choosing the machine](./choosing-the-machine.md) and
+    [environment variables](../reference/environment.md).
 
 The first target on a fresh store is auto-activated. To check:
 
@@ -168,7 +167,7 @@ file layout and the credential resolution chain (flag → env → store).
 Run one command to provision and bootstrap the entire tier-1 stack:
 
 ```sh
-apprafter bootstrap-all         # (alias: apprafter up)
+apprafter up                    # (alias: apprafter bootstrap-all)
 ```
 
 This runs three phases under a unified progress display:
@@ -192,7 +191,7 @@ This runs three phases under a unified progress display:
 
 ```mermaid
 flowchart TD
-    A["apprafter bootstrap-all"] --> B["apply: SSH key, network, firewall, server, k3s via cloud-init"]
+    A["apprafter up"] --> B["apply: SSH key, network, firewall, server, k3s via cloud-init"]
     B --> C["k3s-ready: poll cloud-init, fetch kubeconfig over SSH"]
     C --> D["cluster-bootstrap"]
     subgraph loader["cluster-bootstrap (CLI loader)"]
@@ -218,7 +217,7 @@ The dry-run prints the resolved target name, every field from
 `config.yaml`, and the three-phase plan. No provider calls.
 
 Each phase also has its own subcommand for partial re-runs. The
-labels match what `bootstrap-all` prints as it runs:
+labels match what `up` prints as it runs:
 
 ```sh
 apprafter apply                 # [1/3] apply alone
@@ -233,22 +232,26 @@ apprafter cb                    # alias for cluster-bootstrap
 apprafter doctor                # self-diagnostic, exits 1 on FAIL
 ```
 
-`doctor` walks the active target's stored config, credentials, and
-reachability checks plus the surrounding shell environment
-(`kubectl`, `helm`, `ssh`, DNS). Each check reports PASS / WARN /
-FAIL with a hint pointing at the right next command.
+The second run is the one that exercises the six target-side checks the
+Prerequisites run could not: the config file, the credentials file and its
+mode, the provider, the token format, a token ping, and the SSH key. Each
+check reports PASS / WARN / FAIL with a hint pointing at the right next
+command.
 
-Then check the cluster and the platform on it:
+Then ask whether anything is wrong with the cluster:
 
 ```sh
 apprafter status
-apprafter platform status
 ```
 
-`status` reports the node and the cluster's own health; `platform
-status` reports the platform-stack components Argo CD is reconciling,
-which is the half that takes a few minutes to settle after
-`cluster-bootstrap` returns.
+`status` is the roll-up: the target, the platform's version and any
+unhealthy condition, applications reporting problems, applications held at
+a digest, and MigrationPlans awaiting approval. Right after
+`cluster-bootstrap` returns, the platform's components take a few minutes
+to settle, so a condition here that is not yet healthy is expected.
+`apprafter platform status` is the detail view behind that line — version
+history and component versions — and `apprafter node status` reports the
+node's own posture.
 
 ??? note "Reading the same thing with kubectl"
 
@@ -302,16 +305,13 @@ control surface is Git plus the CLI, and a hand-applied CR is drift Argo CD
 will fight with on its next sync. `kubectl apply` against a cluster is
 reserved for emergency overrides.
 
-!!! note "There is no supported opt-out for the operator or webhook"
-    Earlier releases let an `Infrastructure.cue` set
-    `spec.operator.enabled: false` / `spec.admissionWebhook.enabled:
-    false`, because `cluster-bootstrap` installed both with a direct
-    `helm install`. That path was removed: both now arrive as
-    components of the platform-stack chart that Argo CD reconciles, so
-    setting either field has no effect — the CLI reads no
-    `Infrastructure.cue` during `cluster-bootstrap` at all. The fields
-    still parse for backwards compatibility; their removal is tracked
-    in `docs/measurements/schema-followups.md`.
+!!! note "There is no opt-out for the operator or webhook"
+    Both arrive as components of the platform-stack chart that Argo CD
+    reconciles, so `spec.operator.enabled` and
+    `spec.admissionWebhook.enabled` have no effect —
+    `cluster-bootstrap` reads no `Infrastructure.cue` at all. The
+    fields still parse; their removal is tracked in
+    `docs/measurements/schema-followups.md`.
 
 ## Day-2 operations
 

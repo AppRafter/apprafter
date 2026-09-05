@@ -113,7 +113,7 @@ on mode != 0600.
 ## Credential resolution chain
 
 Every operational command (`apply`, `destroy`, `import`,
-`kubeconfig --refresh`, the `k3s-ready` step of `bootstrap-all`)
+`kubeconfig --refresh`, the `k3s-ready` step of `up`)
 resolves the
 Hetzner token in this order:
 

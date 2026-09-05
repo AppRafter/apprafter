@@ -1,10 +1,5 @@
 ---
 description: "Why a Tier-1 node needs control-plane headroom and host swap, what `apprafter node prep` applies, and how to read the resulting posture."
-cli-check-ignore:
-  - span: "apprafter node reserve-headroom"
-    reason: historical
-    since: v0.2.44
-    note: names the removed command so scripts calling it can be migrated
 ---
 
 # Node preparation — reservations and swap
@@ -19,11 +14,6 @@ The design decisions and trade-offs are in
 (swap policy) and
 [ADR 0053](../adr/0053-resource-governance.md)
 (the reservations).
-
-> **`apprafter node reserve-headroom` was removed.** The old command that only
-> applied reservations is replaced by `apprafter node prep`, which applies the
-> same reservations *and* provisions swap. If you have a script that calls
-> `reserve-headroom`, switch it to `node prep`.
 
 ## What `node prep` does
 

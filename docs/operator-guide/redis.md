@@ -149,14 +149,11 @@ The approval gate is covered on [Migration plans](migration-plans.md). Remove
 the `env` bindings in the same edit — `claim.redis.*` is generated from the
 `needs` block, so a binding left behind fails `apprafter app validate`.
 
-!!! warning "Known gap: the claim is left behind"
-
-    Approving the change does not currently release the data. Nothing deletes
-    the claim once its need is undeclared, so the seven-day window never
-    starts and the backing database and its credential stays live — and keeps the shared backend
-    from scaling down. **Retire the application with `apprafter app remove`
-    instead** when you want the retention path; that is the route the platform
-    actually implements today. Tracked as a defect.
+Approving the plan starts the same seven-day retention path described below:
+the new spec is applied, the claim this application no longer declares is
+deleted, and the provisioner's finalizer writes the retention record on its way
+out. The data and the credential are kept for those seven days, then flushed.
+Nothing is deleted while the plan is still pending.
 
 
 **To retire the application and start the retention clock, delete it:**
@@ -221,7 +218,7 @@ window.
 
 ## Prerequisites
 
-- A Tier-1 cluster provisioned with `apprafter bootstrap-all` (see the
+- A Tier-1 cluster provisioned with `apprafter up` (see the
   [Quickstart](quickstart.md)), operator **≥ v0.2.18** — the release that ships
   the always-on dragonfly-operator, the `redis-integrated` provider, and the
   Dragonfly backend in the claim controllers.

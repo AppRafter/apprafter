@@ -458,25 +458,7 @@ minutes rather than seconds, and measure your own before you commit to a
 maintenance window. The walk's phase banners carry an elapsed clock, which
 makes the Phase 5 → Phase 7 span the number to read off a run of your own.
 
-### Two defects the validation runs found
-
-Both were found by the two validation runs of this procedure, and both are
-fixed as of cli v0.2.49. They are recorded here because the fix changed what
-the sequence above looks like, and an operator reading an older copy of this
-page will find two steps that no longer exist.
-
-- **The target now records the machine it provisioned.** A
-  `restore --reprovision --server-type <big>` used to leave the target's saved
-  preference pointing at the old machine, so a later rebuild that named no type
-  would resolve the stale value and reproduce the machine you were leaving. The
-  sequence therefore carried a `apprafter target machine` step in the window
-  between `destroy` and `restore`, which is no longer needed.
-- **`backup check`, `prune` and `unlock` no longer need a live cluster.** All
-  three used to resolve a kubeconfig before doing anything, so between the
-  destroy and the restore they failed — exactly when verifying an off-site
-  repository matters most. `check` and `unlock` now run offline from `--repo`
-  plus the operator's credentials; `prune` also needs all three `--keep-*`
-  flags, because without them it reads the retention policy from the cluster.
+### Reading the repository without AppRafter
 
 If you need to inspect a repository with no AppRafter at all, stock `restic`
 still works — it is a plain restic repository (see [Assumptions and
@@ -565,8 +547,9 @@ The in-cluster backup CronJobs read credentials from a Kubernetes Secret in
 `apprafter-system` via explicit `secretKeyRef` entries. The Secret holds
 **neutral canonical keys** (`S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`,
 `RESTIC_PASSWORD`, optionally `S3_REGION`); the chart template maps them to the
-`AWS_*` names that restic expects. This means the credential format is
-**S3-vendor-neutral** — the key names do not imply any Amazon product.
+`AWS_*` names that restic expects. The canonical keys name the protocol
+rather than a vendor, so the same credential file works against any
+S3-compatible store.
 
 ### Enabling
 
@@ -611,8 +594,8 @@ S3_SECRET_ACCESS_KEY=your-secret-key
 RESTIC_PASSWORD=your-restic-passphrase
 S3_REGION=eu-central-1       # optional — many S3-compatible stores don't need it
 
-# AWS_* aliases are also accepted (any S3-compatible store; these are restic's
-# own env names and do not imply Amazon-specific services):
+# AWS_* aliases are also accepted — they are restic's own env names, and
+# work against any S3-compatible store:
 # AWS_ACCESS_KEY_ID     → same as S3_ACCESS_KEY_ID
 # AWS_SECRET_ACCESS_KEY → same as S3_SECRET_ACCESS_KEY
 # AWS_DEFAULT_REGION    → same as S3_REGION

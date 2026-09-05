@@ -133,14 +133,10 @@ apprafter migration approve <plan-name>
 
 The approval gate is covered on [Migration plans](migration-plans.md).
 
-!!! warning "Known gap: the claim is left behind"
-
-    Approving the change does not currently release the data. Nothing deletes
-    the claim once its need is undeclared, so the seven-day window never
-    starts and the backing volume stays live — and keeps the shared backend
-    from scaling down. **Retire the application with `apprafter app remove`
-    instead** when you want the retention path; that is the route the platform
-    actually implements today. Tracked as a defect.
+Approving the plan deletes the claim this application no longer declares, and
+the volume behind it goes onto the same seven-day path described below — kept,
+not destroyed, and brought back with its data if the dependency is re-declared
+inside the window. Nothing is deleted while the plan is still pending.
 
 
 **To retire the application, delete it:**
@@ -209,7 +205,7 @@ and the deletion after the grace window.
 
 ## Prerequisites
 
-- A Tier-1 cluster provisioned with `apprafter bootstrap-all` (see the
+- A Tier-1 cluster provisioned with `apprafter up` (see the
   [Quickstart](quickstart.md)), operator **≥ v0.2.21** — the release that ships
   the disk provisioner, the `disk-local` provider seed, the renderer and
   webhook rules, and the disk cleanup path.

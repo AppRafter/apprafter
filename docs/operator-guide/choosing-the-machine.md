@@ -17,11 +17,10 @@ cannot be changed in place — with what to do instead.
 
 The design rationale is in [ADR 0056](../adr/0056-machine-picker.md).
 
-> **This changed in `v0.2.43`.** Earlier releases fell back to one
-> hard-coded machine type when you named none, so a cluster could be
-> provisioned — and billed — on a machine nobody chose. That fallback is
-> gone. Existing clusters are unaffected and need no action; see [a cluster
-> created before the default was removed](#older-clusters).
+> There is no default machine type. Naming none is an error, not a
+> fallback — provisioning is a spending decision and the platform will not
+> make it for you. A cluster that predates this rule needs no action; see
+> [a cluster created before the default was removed](#older-clusters).
 
 ## Two constraints before you open the catalogue
 
@@ -120,7 +119,7 @@ temporary — the same row may be selectable an hour later.
 ### 1. Save it on the target — the usual answer
 
 The picker above writes its selection onto the active target, and every
-later `apprafter apply` or `apprafter bootstrap-all` reads it from there.
+later `apprafter apply` or `apprafter up` reads it from there.
 Use `--target <name>` to set it on a target other than the active one:
 
 ```sh
@@ -144,7 +143,7 @@ saved without one and the failure arrives later, at provisioning time.
 
 ```sh
 apprafter apply --server-type <sku>
-apprafter bootstrap-all --server-type <sku>
+apprafter up --server-type <sku>
 apprafter restore <repo> --reprovision --server-type <sku>
 ```
 
@@ -152,7 +151,7 @@ The same value can come from the environment instead, which suits a
 runner with no saved target store:
 
 ```sh
-APPRAFTER_SERVER_TYPE=<sku> apprafter bootstrap-all
+APPRAFTER_SERVER_TYPE=<sku> apprafter up
 ```
 
 The environment variable is deliberately the **weakest** source (see the

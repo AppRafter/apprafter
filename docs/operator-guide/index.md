@@ -19,7 +19,7 @@ Guide](../dev-guide/index.md) is the shorter path.
 
 - [Operator quickstart](quickstart.md) — from a blank Hetzner account to
   a self-managing cluster, with `apprafter target add` and then
-  `apprafter bootstrap-all`. Start here. (The older one-shot
+  `apprafter up`. Start here. (The older one-shot
   `apprafter init` still works and suits scripted setups.)
 - [Target store reference](target-store.md) — where target
   configuration and credentials live on disk, the resolution chain
