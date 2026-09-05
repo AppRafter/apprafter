@@ -9,6 +9,48 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.61 + landing — the documented install command works (2.23b, unreleased)
+
+### Fixed
+
+- **The install command in the README and both quickstarts could not
+  work.** All three resolved the version through GitHub's
+  `/releases/latest`, which returns the newest non-prerelease across
+  **every** tag series this monorepo publishes — five of them. So
+  `VERSION` could come back as `operator/v0.1.134`, and the download URL
+  built from it 404s. The developer quickstart had a fourth route to the
+  same place: `gh release download` with no tag. The CLI already knew
+  this and worked around it in v0.1.151 (`pick_canonical_cli_tag`); the
+  documentation never did.
+
+- **The CLI's own upgrade banner pointed at that same URL.** Fixing the
+  fetch in v0.1.151 and leaving the printed notice on
+  `/releases/latest` fixed half the bug — the reader who followed the
+  banner landed on whichever release was newest across all five series,
+  usually a chart. It now points at `apprafter.dev/download`.
+
+### Added
+
+- **`https://apprafter.dev/install.sh`** — detects the platform, resolves
+  the newest CLI release with an exact `vMAJOR.MINOR.PATCH` filter
+  (stricter than the CLI's own semver check, which accepts the real
+  `v0.1.0-mvp` tag), downloads the archive with its `.sha256`, and
+  **verifies the checksum before installing**. With no checksum tool
+  available it refuses rather than installing unverified: a script that
+  reports success without verifying is worse than one that stops.
+  `APPRAFTER_VERSION` pins, `APPRAFTER_INSTALL_DIR` relocates.
+
+- **A download surface on the landing** — a section on `/` and the page
+  `/download`, from one component. No version is baked into the markup:
+  every asset link is resolved client-side by the same filter, so there
+  is nothing in `dist/` to go stale.
+
+### Changed
+
+- `shasum` and `sha256sum` join the docsgen recipe allowlist. Verifying a
+  release artefact happens before the binary exists — the same
+  pre-install family as `curl` and `tar`, which are already there.
+
 ## cli v0.2.60 — `up` is the command, `status` is the answer, `platform` is the platform (2.23a, unreleased)
 
 Three renames' worth of honesty, no new capability. Every signal `apprafter

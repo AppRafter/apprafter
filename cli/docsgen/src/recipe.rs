@@ -72,6 +72,13 @@ pub const ALLOWLIST: &[(&str, &str)] = &[
         "coreutils; removing a file the platform does not manage",
     ),
     ("chmod", "coreutils in the bootstrap"),
+    (
+        "shasum",
+        "verifies the release artefact before the binary exists — same \
+         pre-install family as `curl` and `tar`, and the one step that \
+         must not be skipped",
+    ),
+    ("sha256sum", "the shasum spelling most Linux images ship"),
     // Somebody else's forge and registry.
     (
         "git",

@@ -25,37 +25,46 @@ minutes of hands-on time, plus DNS-propagation wait at the end.
 Get the `apprafter` CLI onto your `PATH`. The release binary is the
 recommended path; build-from-source is for contributors.
 
-=== "Recommended — release binary"
-
-    Download the prebuilt binary for your platform from
-    [GitHub Releases](https://github.com/AppRafter/apprafter/releases)
-    and drop it on your `PATH`. The asset name carries the tag, so the
-    first line resolves the newest release rather than naming one — a
-    literal tag written here goes stale the next time we cut a release.
-    Substitute an explicit `v0.2.x` if you want to pin.
+=== "Recommended — one-line install"
 
     ```sh
-    VERSION=$(curl -fsSL https://api.github.com/repos/AppRafter/apprafter/releases/latest \
-        | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
-    TARGET=x86_64-unknown-linux-gnu              # or x86_64-apple-darwin / aarch64-apple-darwin
-    curl -fsSL "https://github.com/AppRafter/apprafter/releases/download/${VERSION}/apprafter-${VERSION}-${TARGET}.tar.gz" | tar xz
-    sudo mv apprafter /usr/local/bin/
-    apprafter --version
+    curl -fsSL https://apprafter.dev/install.sh | sh
     ```
 
-    Or, with the GitHub CLI (resolves the latest release for you):
+    It detects your platform, resolves the newest release, downloads the
+    archive with its `.sha256`, and **verifies the checksum before
+    installing**. A download it cannot verify is refused, not installed.
+    To read it first — the better habit, and one line more:
 
     ```sh
-    gh release download --repo AppRafter/apprafter \
-        --pattern 'apprafter-*-x86_64-unknown-linux-gnu.tar.gz'
-    tar xzf apprafter-*-x86_64-unknown-linux-gnu.tar.gz && sudo mv apprafter /usr/local/bin/
+    curl -fsSL https://apprafter.dev/install.sh -o install.sh
+    sh install.sh
     ```
 
-    Each release ships a `.sha256` next to every tarball — verify with
-    `shasum -a 256 -c apprafter-${VERSION}-${TARGET}.tar.gz.sha256`.
+    `APPRAFTER_VERSION=v0.2.x` pins a release instead of resolving one;
+    `APPRAFTER_INSTALL_DIR` chooses where the binary lands (default
+    `/usr/local/bin`).
+
+=== "By hand — release archive"
+
+    [apprafter.dev/download](https://apprafter.dev/download/) lists each
+    archive and its checksum, resolved to the current release. Verify
+    before you install:
+
+    ```sh
+    shasum -a 256 -c apprafter-<version>-<target>.tar.gz.sha256
+    tar xzf apprafter-<version>-<target>.tar.gz && sudo mv apprafter /usr/local/bin/
+    ```
+
     Prebuilt targets are Linux `x86_64`, macOS `x86_64` (Intel), and
     macOS `aarch64` (Apple Silicon). **Linux `aarch64` (ARM) is not
     published yet** — build from source for ARM servers.
+
+    Do not resolve the version through `/releases/latest`, and do not
+    reach for `gh release download` without a tag. This is a monorepo
+    with five release series, and both of those return the newest
+    release across all of them — which is usually a chart, not the CLI,
+    and the download URL built from it 404s.
 
 === "Contributors — build from source"
 

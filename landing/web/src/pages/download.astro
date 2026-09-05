@@ -1,0 +1,29 @@
+---
+// SPDX-FileCopyrightText: 2026 AppRafter contributors
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//
+// `/download` — the same section that appears on `/#download`, given a
+// URL of its own.
+//
+// Both exist on purpose. The section on `/` is where a visitor reading
+// the page top to bottom meets it; the page is what the docs and the
+// CLI's own upgrade notice link to, and it keeps resolving if the
+// section is ever reordered or renamed. One component, so the two can
+// never drift.
+
+import BaseLayout from '../components/layout/BaseLayout.astro';
+import Footer from '../components/layout/Footer.astro';
+import Header from '../components/layout/Header.astro';
+import Download from '../components/sections/Download.astro';
+---
+
+<BaseLayout
+  title="Download AppRafter"
+  description="Install the apprafter CLI: a one-line installer that verifies its own checksum, or the release archives for Linux and macOS."
+>
+  <Header />
+  <main id="main">
+    <Download />
+  </main>
+  <Footer />
+</BaseLayout>

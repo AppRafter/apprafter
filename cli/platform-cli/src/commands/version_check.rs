@@ -20,6 +20,12 @@
 //! (`X.Y.Z[-prerelease]`). All four prefix-tagged series fail
 //! `Version::parse` and get skipped.
 //!
+//! 2.23a/b: the same endpoint was still in the printed banner, which
+//! sent a reader to a page that redirects by the same broken rule the
+//! fetch above works around — usually to a chart release. The notice now
+//! points at `apprafter.dev/download`, which resolves the CLI series and
+//! carries the verifying installer.
+//!
 //! TTL also dropped from 24h → 6h: the project is in active
 //! daily development, so a 6h dial keeps operators current
 //! without paying the GitHub API on every command.
@@ -68,7 +74,7 @@ fn upgrade_notice(current: &str, latest: Option<&str>) -> Option<String> {
     newer_than(latest, current).then(|| {
         format!(
             "apprafter {latest} is available; you're on {current}. \
-             Upgrade: https://github.com/apprafter/apprafter/releases/latest"
+             Upgrade: https://apprafter.dev/download/"
         )
     })
 }
@@ -314,7 +320,20 @@ mod tests {
             "names the available version: {line}"
         );
         assert!(line.contains("0.2.58"), "names the running version: {line}");
-        assert!(line.contains("releases/latest"), "says where to go: {line}");
+        assert!(
+            line.contains("apprafter.dev/download"),
+            "says where to go: {line}"
+        );
+        // NOT `/releases/latest`. This module's own header explains why
+        // that endpoint is wrong for the API call; it is wrong for a
+        // human too, and for the same reason — five tag series share it,
+        // so the page it redirects to is usually a chart release. Fixing
+        // the fetch in v0.1.151 and leaving the banner pointing there
+        // fixed half the bug.
+        assert!(
+            !line.contains("releases/latest"),
+            "must not send a reader to the endpoint this module exists to avoid: {line}"
+        );
     }
 
     #[test]

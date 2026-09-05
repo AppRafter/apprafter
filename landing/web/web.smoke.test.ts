@@ -502,3 +502,87 @@ describe('honesty pass — tiers (2026-06-15)', () => {
     expect(bt).not.toContain('opt-in upgrade on Tier 1');
   });
 });
+
+describe('download surface (2.23b)', () => {
+  const installer = () => readFileSync(join(ROOT, 'public/install.sh'), 'utf8');
+
+  test('the installer is published — public/ is copied verbatim, so this path IS the URL', () => {
+    expect(existsSync(join(ROOT, 'public/install.sh'))).toBe(true);
+    expect(installer()).toContain('SPDX-License-Identifier');
+  });
+
+  test('every published target triple is handled, and the unpublished one is refused by name', () => {
+    // Kept in step with the matrix in .github/workflows/release-cli.yml.
+    const sh = installer();
+    for (const triple of [
+      'x86_64-unknown-linux-gnu',
+      'x86_64-apple-darwin',
+      'aarch64-apple-darwin',
+    ]) {
+      expect(sh).toContain(triple);
+    }
+    // Linux ARM is deliberately not built. Offering a link that 404s is
+    // worse than saying so.
+    expect(sh).toMatch(/Linux\/aarch64/);
+    expect(sh).toMatch(/build from source/i);
+  });
+
+  test('the installer NEVER asks GitHub for /releases/latest', () => {
+    // THE bug this whole surface exists to fix. Five workflows publish
+    // releases into this monorepo, so /releases/latest returns the newest
+    // across ALL series and the download URL built from it 404s. The
+    // filter must be the exact-triple one, stricter than the CLI's semver
+    // check — `v0.1.0-mvp` is a real tag here with real assets.
+    const sh = installer();
+    // Comment lines are excluded: the header explains WHY /releases/latest
+    // is wrong and has to be allowed to name it. A check that cannot tell
+    // an explanation from a call would delete the explanation.
+    const code = sh
+      .split('\n')
+      .filter((l) => !l.trimStart().startsWith('#'))
+      .join('\n');
+    expect(code).not.toContain('releases/latest');
+    expect(code).toContain('releases?per_page=30');
+    expect(code).toContain('^v[0-9]+\\.[0-9]+\\.[0-9]+$');
+  });
+
+  test('nothing is installed that was not verified', () => {
+    const sh = installer();
+    expect(sh).toContain('.sha256');
+    // Both spellings: macOS ships shasum, most Linux images ship sha256sum.
+    expect(sh).toContain('shasum -a 256 -c');
+    expect(sh).toContain('sha256sum -c');
+    // And the branch that matters most: no checksum tool must REFUSE,
+    // never shrug. A script that reports success without verifying is
+    // the one outcome this may not have.
+    expect(sh).toMatch(/neither shasum nor sha256sum/);
+  });
+
+  test('the section is reachable both ways, from one component', () => {
+    expect(existsSync(join(ROOT, 'src/components/sections/Download.astro'))).toBe(true);
+    expect(readFileSync(join(ROOT, 'src/pages/index.astro'), 'utf8')).toContain('<Download />');
+    const page = readFileSync(join(ROOT, 'src/pages/download.astro'), 'utf8');
+    expect(page).toContain('<Download />');
+    expect(readFileSync(join(ROOT, 'src/components/sections/Download.astro'), 'utf8')).toContain(
+      'id="download"',
+    );
+  });
+
+  test('no version is baked into the download markup', () => {
+    // `landingHero.json`'s statusBadge is the cautionary tale: a version
+    // in the source goes stale silently, and the gates around it compare
+    // it to the CMS rather than to reality. Every asset link here is
+    // resolved client-side, so there is nothing to go stale.
+    const section = readFileSync(join(ROOT, 'src/components/sections/Download.astro'), 'utf8');
+    // The rendered element only: the frontmatter and the script carry
+    // comments that NAME the tags this rule is about (`v0.1.0-mvp`,
+    // `operator/v0.1.134`), and a check that cannot tell an explanation
+    // from a claim would force those comments out.
+    const from = section.indexOf('<section');
+    const to = section.indexOf('</section>');
+    expect(from).toBeGreaterThan(-1);
+    expect(to).toBeGreaterThan(from);
+    expect(section.slice(from, to)).not.toMatch(/v\d+\.\d+\.\d+/);
+    expect(section).toContain('releases?per_page=30');
+  });
+});

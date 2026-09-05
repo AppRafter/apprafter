@@ -26,6 +26,9 @@ PATTERNS=(
   'landing/cms/next.config.mjs'
   'landing/cms/apprafter/*.cue'
   'landing/scripts/*.sh'
+  # Served verbatim by Astro, so this IS a published artefact — the
+  # installer at https://apprafter.dev/install.sh.
+  'landing/web/public/*.sh'
 )
 
 # git ls-files honours .gitignore and only returns tracked files.

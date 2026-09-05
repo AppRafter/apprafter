@@ -94,13 +94,15 @@ Get the `apprafter` CLI onto your `PATH` — the release binary is the normal pa
 no repository checkout required:
 
 ```sh
-VERSION=$(curl -fsSL https://api.github.com/repos/AppRafter/apprafter/releases/latest \
-    | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
-TARGET=x86_64-unknown-linux-gnu              # or x86_64-apple-darwin / aarch64-apple-darwin
-curl -fsSL "https://github.com/AppRafter/apprafter/releases/download/${VERSION}/apprafter-${VERSION}-${TARGET}.tar.gz" | tar xz
-sudo mv apprafter /usr/local/bin/
-apprafter --version
+curl -fsSL https://apprafter.dev/install.sh | sh
 ```
+
+The installer picks the build for your platform, verifies the release
+checksum before installing anything, and refuses rather than installing
+something it could not verify. Read it first if you prefer —
+`curl -fsSL https://apprafter.dev/install.sh -o install.sh`, then
+`sh install.sh`. Archives, checksums and the target list are at
+[apprafter.dev/download](https://apprafter.dev/download/).
 
 With a cluster running, shipping an application is three commands and one manifest:
 

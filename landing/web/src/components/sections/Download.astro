@@ -1,0 +1,288 @@
+---
+// SPDX-FileCopyrightText: 2026 AppRafter contributors
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+//
+// The download surface. Rendered both as a section of `/` (anchor
+// `#download`) and as the whole of `/download`, so the docs have a
+// stable URL to link and the anchor keeps working if section order
+// changes.
+//
+// STATIC, NOT CMS-BACKED — a deliberate deviation from every other
+// section, on the precedent of `src/data/phases.json`. What this
+// section says is release mechanics (which triples are published, what
+// the asset is called, how the checksum is verified), and those facts
+// have to move in the same commit as `.github/workflows/release-cli.yml`
+// rather than in an editor's own time. The prose that IS editorial is
+// two lines, and two lines is not worth a Payload global, a migration,
+// a regenerated `payload-types.ts` and a seed entry.
+//
+// NO VERSION IS BAKED IN. Every asset link is resolved client-side by
+// the script at the bottom, for two reasons that both bite here:
+// a build-time fetch would make the image non-hermetic under
+// LANDING_USE_FALLBACK=1, and anything baked into `dist/` goes stale
+// silently — `landingHero.json`'s statusBadge is exactly that failure,
+// pinned by two gates that compare it against the CMS rather than
+// against reality. With no version in the markup there is nothing to
+// go stale: with JS off, the one-liner and the "all releases" link
+// still work.
+
+import Container from '../primitives/Container.astro';
+import SectionHead from '../primitives/SectionHead.astro';
+
+const REPO = 'https://github.com/AppRafter/apprafter';
+
+// Kept in step with the matrix in .github/workflows/release-cli.yml.
+// Linux aarch64 is deliberately absent there, so it is named as absent
+// here rather than offered as a link that 404s.
+const targets = [
+  { label: 'Linux', arch: 'x86_64', triple: 'x86_64-unknown-linux-gnu' },
+  { label: 'macOS', arch: 'Intel', triple: 'x86_64-apple-darwin' },
+  { label: 'macOS', arch: 'Apple Silicon', triple: 'aarch64-apple-darwin' },
+];
+
+const oneLiner = 'curl -fsSL https://apprafter.dev/install.sh | sh';
+const inspectFirst = 'curl -fsSL https://apprafter.dev/install.sh -o install.sh';
+---
+
+<section id="download" class="download">
+  <Container>
+    <SectionHead
+      eyebrow="Download"
+      title="Install the CLI"
+      lede="One binary, no runtime, no repository checkout. It resolves the newest release, verifies the checksum, and stops rather than installing something it could not verify."
+    />
+
+    <div class="install">
+      <div class="codeblock">
+        <div class="codeblock-header">
+          <span class="filename">install</span>
+        </div>
+        <pre><code>{oneLiner}</code></pre>
+      </div>
+      <p class="aside">
+        Prefer to read it first? That is one line more, and the better habit:
+        <code class="mono">{inspectFirst}</code>, then
+        <code class="mono">sh install.sh</code>.
+      </p>
+      <p class="aside">
+        Pin a version with <code class="mono">APPRAFTER_VERSION</code>, or choose
+        where it lands with <code class="mono">APPRAFTER_INSTALL_DIR</code>
+        (default <code class="mono">/usr/local/bin</code>).
+      </p>
+    </div>
+
+    <h3 class="sub">Or take the archive</h3>
+    <table class="targets">
+      <thead>
+        <tr>
+          <th>Platform</th>
+          <th>Target</th>
+          <th>Files</th>
+        </tr>
+      </thead>
+      <tbody>
+        {
+          targets.map((t) => (
+            <tr>
+              <td>
+                {t.label} <span class="dim">{t.arch}</span>
+              </td>
+              <td>
+                <code class="mono">{t.triple}</code>
+              </td>
+              <td class="files">
+                <a class="asset" data-asset="tar" data-triple={t.triple} href={`${REPO}/releases`}>
+                  tar.gz
+                </a>
+                <a
+                  class="asset"
+                  data-asset="sha"
+                  data-triple={t.triple}
+                  href={`${REPO}/releases`}
+                >
+                  .sha256
+                </a>
+              </td>
+            </tr>
+          ))
+        }
+      </tbody>
+    </table>
+
+    <p class="aside">
+      Verify before you install:
+      <code class="mono">shasum -a 256 -c apprafter-&lt;version&gt;-&lt;target&gt;.tar.gz.sha256</code>.
+      Linux <code class="mono">aarch64</code> is not published yet — ARM servers
+      build from source.
+    </p>
+
+    <p class="links">
+      <a href="https://docs.apprafter.dev/operator-guide/quickstart/">Operator quickstart</a>
+      <span class="sep">·</span>
+      <a href="https://docs.apprafter.dev/dev-guide/quickstart/">Developer quickstart</a>
+      <span class="sep">·</span>
+      <a href={`${REPO}/releases`}>All releases on GitHub</a>
+    </p>
+  </Container>
+</section>
+
+<script is:inline>
+  // Resolve the newest CLI release and point the asset links at it.
+  //
+  // The same filter the installer and the CLI itself use, and for the
+  // same reason: this monorepo publishes five release series, so
+  // `/releases/latest` can return `operator/v0.1.134` and every URL
+  // built from it 404s. Stricter than the CLI's semver check, which
+  // accepts a prerelease — `v0.1.0-mvp` is a real tag here.
+  //
+  // Failure is silent BY DESIGN, and only here: the links already point
+  // at the releases page, so a rate-limited or offline visitor keeps a
+  // working destination. Nothing claims a version it did not resolve.
+  (async () => {
+    const rows = document.querySelectorAll('#download a.asset');
+    if (!rows.length) return;
+    try {
+      const res = await fetch(
+        'https://api.github.com/repos/AppRafter/apprafter/releases?per_page=30',
+      );
+      if (!res.ok) return;
+      const releases = await res.json();
+      const tag = releases
+        .map((r) => r.tag_name)
+        .find((t) => /^v\d+\.\d+\.\d+$/.test(t));
+      if (!tag) return;
+      const base = `https://github.com/AppRafter/apprafter/releases/download/${tag}`;
+      for (const a of rows) {
+        const triple = a.dataset.triple;
+        const archive = `apprafter-${tag}-${triple}.tar.gz`;
+        a.href = a.dataset.asset === 'sha' ? `${base}/${archive}.sha256` : `${base}/${archive}`;
+      }
+    } catch {
+      // Offline or blocked: the static links stand.
+    }
+  })();
+</script>
+
+<style>
+  .download {
+    padding: 96px 0;
+    border-top: 1px solid var(--border);
+  }
+
+  .install {
+    max-width: 720px;
+  }
+
+  /* Mirrors .codeblock in HeroCodeBlock.astro. Not imported from it:
+     that component server-renders CUE through cueTokenize and takes a
+     Svelte copy button, neither of which a one-line shell command
+     wants. */
+  .codeblock {
+    border: 1px solid var(--border-strong);
+    background: var(--bg-raised);
+    overflow: hidden;
+  }
+  .codeblock-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fg-faint);
+  }
+  .codeblock pre {
+    margin: 0;
+    padding: 16px 14px;
+    overflow-x: auto;
+    font-family: var(--font-mono);
+    font-size: 14px;
+  }
+
+  .aside {
+    margin-top: 14px;
+    color: var(--fg-muted);
+    font-size: 14px;
+    max-width: 720px;
+    text-wrap: pretty;
+  }
+  .mono {
+    font-family: var(--font-mono);
+    font-size: 0.95em;
+  }
+
+  .sub {
+    margin-top: 56px;
+    margin-bottom: 18px;
+    font-size: 18px;
+  }
+
+  .targets {
+    width: 100%;
+    max-width: 720px;
+    border-collapse: collapse;
+    font-size: 14px;
+  }
+  .targets th,
+  .targets td {
+    text-align: left;
+    padding: 10px 12px 10px 0;
+    border-bottom: 1px solid var(--border);
+    vertical-align: baseline;
+  }
+  .targets th {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fg-faint);
+    font-weight: 400;
+  }
+  .dim {
+    color: var(--fg-faint);
+  }
+  .files {
+    white-space: nowrap;
+  }
+  .files .asset {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    border-bottom: 1px solid var(--border-strong);
+  }
+  .files .asset + .asset {
+    margin-left: 14px;
+  }
+  .files .asset:hover {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+
+  .links {
+    margin-top: 40px;
+    font-size: 14px;
+    color: var(--fg-muted);
+  }
+  .links a {
+    border-bottom: 1px solid var(--border-strong);
+  }
+  .links a:hover {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+  .links .sep {
+    margin: 0 10px;
+    color: var(--fg-faint);
+  }
+
+  @media (max-width: 720px) {
+    .download {
+      padding: 64px 0;
+    }
+    .targets .files {
+      white-space: normal;
+    }
+  }
+</style>

@@ -38,19 +38,23 @@ checkout — the release binary is the normal path, and this page assumes
 nothing else:
 
 ```sh
-VERSION=$(curl -fsSL https://api.github.com/repos/AppRafter/apprafter/releases/latest \
-    | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
-TARGET=x86_64-unknown-linux-gnu              # or x86_64-apple-darwin / aarch64-apple-darwin
-curl -fsSL "https://github.com/AppRafter/apprafter/releases/download/${VERSION}/apprafter-${VERSION}-${TARGET}.tar.gz" | tar xz
-sudo mv apprafter /usr/local/bin/
-apprafter --version
+curl -fsSL https://apprafter.dev/install.sh | sh
 ```
 
-Every release ships a `.sha256` beside each tarball. Prebuilt targets
-are Linux `x86_64`, macOS `x86_64` and macOS `aarch64`; Linux `aarch64`
-is not published yet, so ARM servers need a source build. The
-[developer quickstart](../dev-guide/quickstart.md#install) carries the
-same table with the source and Nix alternatives spelled out.
+The installer detects your platform, resolves the newest release,
+downloads the archive with its `.sha256`, and **verifies the checksum
+before installing** — a download it cannot verify is refused rather than
+installed. To read it before running it:
+`curl -fsSL https://apprafter.dev/install.sh -o install.sh`, then
+`sh install.sh`. `APPRAFTER_VERSION` pins a tag and
+`APPRAFTER_INSTALL_DIR` chooses the destination.
+
+Prebuilt targets are Linux `x86_64`, macOS `x86_64` and macOS `aarch64`;
+Linux `aarch64` is not published yet, so ARM servers need a source
+build. [apprafter.dev/download](https://apprafter.dev/download/) lists
+the archives and their checksums for a manual install, and the
+[developer quickstart](../dev-guide/quickstart.md#install) spells out the
+source and Nix alternatives.
 
 While you are there, install shell completion —
 `apprafter completion <shell>` prints the script and the
