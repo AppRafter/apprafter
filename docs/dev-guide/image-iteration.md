@@ -68,12 +68,12 @@ first resolution, or when resolution is turned off (see below).
 ## Private images
 
 Resolving the digest is a registry read, so a **private** image needs
-credentials. AppRafter reuses the same `SourceCredential` you already
-register for pulling the image: if a `SourceCredential` covers the
-image's registry host, its credential authenticates the digest
-lookup; a public image resolves anonymously. See
-[ADR 0039](../adr/0039-source-credential.md) for how credentials
-cover a registry.
+credentials. There is nothing extra to set up: the same credential you
+register for *pulling* the image authenticates the digest lookup, and a
+public image resolves anonymously. Register one with
+[Private repos & registries](private-repos-and-registries.md) — that page
+also covers which token scopes a registry pull needs, which differ from
+the ones a Git clone needs.
 
 If a private image has **no** covering `SourceCredential`, resolution
 cannot read the registry. It then fails gracefully (next section)

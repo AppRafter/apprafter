@@ -206,13 +206,28 @@ apprafter backup status
 
 ## What a backup captures
 
-The backup distinguishes **user** material from **platform** material — the
-load-bearing discrimination that keeps a restore from clobbering the target's
-own bootstrap:
+### The data behind your `needs`
+
+This is what an operator is usually asking, so it comes first. One entry per
+declared dependency:
+
+| `needs` type | What lands in the repository | Not captured |
+| --- | --- | --- |
+| `pg` | the **database itself** — a `pg_dump` in custom format, one file per claim, taken through a helper pod against the claim's own credentials | a claim with no connection Secret yet, i.e. one that has never finished provisioning |
+| `disk`, and a `SharedVolume` reference | the **volume contents**, as a tar of the bound `PersistentVolumeClaim` | a claim whose volume is not bound yet |
+| `redis` with `persistent: true` | the **whole Dragonfly instance** the claim shares — a `SAVE`, then a tar of its snapshot directory. Backup dedupes by instance, so every persistent claim on it travels together | — |
+| `redis` with `persistent: false` | nothing | a cache by declaration, with no durable volume to snapshot. A restore re-provisions it empty |
+
+**Every other `needs` type is skipped, silently and by design.** `jetstream`,
+`clickhouse`, `s3` and `notifications` have no capture path in this release
+(`cli/backup-core/src/extract.rs`), so a cluster using one of them is **not**
+fully covered by a backup. Nothing warns you at backup time; this table is the
+warning.
+
+### The objects that describe your cluster
 
 The backup distinguishes **user** material from **platform** material — the
-load-bearing discrimination that keeps a restore from clobbering the target's
-own bootstrap:
+discrimination that keeps a restore from clobbering the target's own bootstrap:
 
 - **Config CRs** are captured by kind: the `PlatformStack/default` singleton
   and every `SourceCredential` (cluster-wide). There is no in-cluster
@@ -236,12 +251,7 @@ own bootstrap:
   `spec.registry.backend.sealedSecretRef` and reads the underlying unsealed
   material directly. This is a distinct, cluster-wide capture path.
 
-**Redis:** a `persistent: true` `needs.redis` claim is captured as a
-whole-instance Dragonfly snapshot (a `SAVE`, then a tar of its snapshot
-directory), so backup dedupes by instance and every persistent claim sharing
-that instance travels together. A `persistent: false` claim is **not**
-captured — it is a cache by declaration, with no durable PVC to snapshot. The
-gate is `cli/backup-core/src/extract.rs:101`. How a restore reloads it is on
+How a restore reloads each of these is on
 [Restore from a backup](restore.md).
 
 ## Inspect the data without making a backup

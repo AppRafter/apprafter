@@ -1530,12 +1530,17 @@ impl Gate {
 
         // Page-wide and off the source, like the paths above, and for a
         // stronger reason than theirs: an ADR is cited as authority
-        // wherever it is written, and the corpus writes one **inside a
-        // fence** — in `docs/operator-guide/postgres.md`, a comment
-        // in a shell block reading "(the decomposed fields, ADR
-        // 0046 …)". Restricting this to prose would drop that citation,
-        // and would make "move the sentence into the block" a way to
-        // stop a citation being checked. It is the identifier check's
+        // wherever it is written, so restricting this to prose would
+        // make "move the sentence into a fence" a way to stop a
+        // citation being checked.
+        //
+        // The corpus example this used to name — a shell comment in
+        // `docs/operator-guide/postgres.md` reading "(the decomposed
+        // fields, ADR 0046 …)" — was removed by the 2.20c rewrite, and
+        // there are now ZERO fenced citations anywhere. The rule stays:
+        // it is the identifier check's, not the invocation check's, and
+        // its correctness never depended on the corpus happening to
+        // exercise it. It is the identifier check's
         // rule — a claim is a claim in a fence and in a span alike —
         // rather than the invocation check's, which is fence-scoped only
         // because a fence is what a marker can annotate. The exemption
@@ -1769,7 +1774,6 @@ fn normalise(dir: &str, target: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
-/// The directory a page sits in, empty for one at the repository root.
 /// Every `[text](target)` on the page whose TARGET is a `.md` page and
 /// whose TEXT names a file rather than the page.
 ///
@@ -1813,6 +1817,7 @@ fn link_texts_naming_a_page(source: &str) -> Vec<(usize, String)> {
     out
 }
 
+/// The directory a page sits in, empty for one at the repository root.
 fn page_directory(file: &str) -> &str {
     file.rsplit_once('/').map_or("", |(dir, _)| dir)
 }

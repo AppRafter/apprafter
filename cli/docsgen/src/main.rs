@@ -84,13 +84,15 @@ fn metrics(root: &std::path::Path) -> Result<(), Box<dyn Error>> {
 
 /// Print every foreign command sitting in a guide's recipe path.
 ///
-/// The working instrument for the restructure ADR 0058 asks for: the
-/// list of what to fix, shrinking as pages are rewritten. It **exits 0
-/// whatever it finds** — this is a report, and the check it reports on
-/// is deliberately not part of `gate` until the corpus is green (see
-/// `gate::RECIPE_PURITY`). Wiring a red check into the run that
-/// lefthook and `just lint` call would make the repository
-/// uncommittable for the length of the restructure.
+/// The readable form of a check that IS part of `gate` — it was wired
+/// in during 2.20c once the corpus went green, and `gate::RECIPE_PURITY`
+/// records that. What this adds is grouping by page, which is the shape
+/// you want while rewriting one.
+///
+/// It **exits 0 whatever it finds**, because it is a report. The
+/// held-out-of-`gate` arrangement it was built for is the pattern to
+/// reach for again when a class has to be born red — see
+/// `gate::ADR_CITATION_PLACEMENT` when it lands.
 fn recipe_report(root: &std::path::Path) -> Result<(), Box<dyn Error>> {
     let findings = docsgen::gate::Gate::new(root)?.recipe_findings()?;
     let mut by_page: std::collections::BTreeMap<&str, Vec<&docsgen::gate::Finding>> =

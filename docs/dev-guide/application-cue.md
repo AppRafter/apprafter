@@ -485,5 +485,5 @@ a running Deployment.
   `secret` env-value references.
 - [`examples/applications/parser.cue`](https://github.com/apprafter/apprafter/blob/master/examples/applications/parser.cue)
   — a worked multi-environment example.
-- [Operator quickstart](./quickstart.md) — scaffold and
+- [Developer quickstart](./quickstart.md) — scaffold and
   register a first Application end-to-end.
