@@ -269,3 +269,75 @@ describe('SYS-3 (a) — WaitlistSignups accepts everything the site can send', (
     }
   });
 });
+
+// The feature ledger and the roadmap were built as two halves of one
+// thing and were never joined: no link in either direction, and a Phase
+// column of bare text that happened to match a display LABEL. Labels are
+// the half that moves — the registry carries a stable `id` precisely so
+// a renumber changes what a reader reads and not what they subscribed
+// to. This block is the fence that keeps the join on the stable half.
+describe('SYS-3 (c) — the feature ledger joins on the registry id', () => {
+  const LEDGER = join(ROOT, '../docs/status.md');
+
+  // Every data row's first cell. Separator rows begin `|-`, so `| ` is
+  // enough to skip them; the header cell and empty cells are dropped.
+  const phaseCells = (): string[] =>
+    readFileSync(LEDGER, 'utf8')
+      .split('\n')
+      .filter((l) => l.startsWith('| '))
+      .map((l) => l.split('|')[1].trim())
+      .filter((c) => c !== '' && c !== 'Phase');
+
+  test('every phase link resolves to a registry id', () => {
+    const reg = readJson(REGISTRY) as { phases: Array<{ id: string }> };
+    const ids = new Set(reg.phases.map((p) => p.id));
+    const linked = phaseCells().filter((c) => c.startsWith('['));
+    // Non-vacuity: a ledger that stopped linking would otherwise pass
+    // this by checking nothing.
+    expect(linked.length).toBeGreaterThanOrEqual(5);
+    for (const cell of linked) {
+      const href = cell.match(/\]\(([^)]+)\)/)?.[1];
+      expect({ cell, href: href ?? null }).toEqual({ cell, href: href ?? 'MISSING' });
+      const id = (href ?? '').split('#')[1]?.replace(/^roadmap-phase-/, '');
+      expect({ cell, id, known: ids.has(id ?? '') }).toEqual({ cell, id, known: true });
+    }
+  });
+
+  test('a phase with a subscribe control is linked, and one without is not', () => {
+    // `Roadmap.astro` renders the notify button only where the registry
+    // status is not `shipped`, so those labels are exactly the ones with
+    // something to point at. `Shipped` has a card but no button, and
+    // `Post-launch` is in no registry at all.
+    const reg = readJson(REGISTRY) as {
+      phases: Array<{ id: string; label: string; status: string }>;
+    };
+    const subscribable = new Map(
+      reg.phases.filter((p) => p.status !== 'shipped').map((p) => [p.label, p.id]),
+    );
+    let checked = 0;
+    for (const cell of phaseCells()) {
+      const text = cell.startsWith('[') ? cell.slice(1, cell.indexOf(']')) : cell;
+      const want = subscribable.get(text);
+      checked += 1;
+      expect({ text, linked: cell.startsWith('[') }).toEqual({
+        text,
+        linked: want !== undefined,
+      });
+      if (want !== undefined) {
+        expect({ text, anchored: cell.includes(`#roadmap-phase-${want}`) }).toEqual({
+          text,
+          anchored: true,
+        });
+      }
+    }
+    expect(checked).toBeGreaterThanOrEqual(20);
+  });
+
+  test('the landing links back to the ledger', () => {
+    const roadmap = readFileSync(
+      join(ROOT, 'web/src/components/sections/Roadmap.astro'),
+      'utf8',
+    );
+    expect(roadmap).toContain('docs.apprafter.dev/status/');
+  });
+});

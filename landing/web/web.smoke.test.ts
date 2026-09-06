@@ -351,7 +351,13 @@ describe('Application manifests — prod + preview pair', () => {
   test('Application-preview.cue pins landing-web image + carries preview.apprafter.dev label', () => {
     const m = readFileSync(join(ROOT, 'apprafter/Application-preview.cue'), 'utf8');
     expect(m).toContain('name:      "landing-web-preview"');
-    expect(m).toContain('"ghcr.io/apprafter/landing-web:latest"');
+    // The preview stream, and specifically NOT `:latest`. Production
+    // watches `:latest`, so a preview host pinned there serves what is
+    // already public — and the inspection the promotion flow exists for
+    // would be inspecting the live site. The manifest carried `:latest`
+    // for its whole life and this assertion was what let it.
+    expect(m).toContain('"ghcr.io/apprafter/landing-web:preview"');
+    expect(m).not.toContain('"ghcr.io/apprafter/landing-web:latest"');
     expect(m).toContain('"apprafter.io/hostname": "preview.apprafter.dev"');
     // Same package so `cue vet ./apprafter/` covers both files in
     // one pass.

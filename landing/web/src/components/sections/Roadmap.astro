@@ -50,6 +50,13 @@ const anchorFor = (num: string) => phaseAnchor(byLabel.get(num)?.id ?? num);
       }
     </div>
     <p class="roadmap-closing">{data.closing}</p>
+    <!-- In the component rather than in `data.closing`: the closing line
+         is CMS content, so a link living there would not exist until
+         someone edited production. This one ships with the code. -->
+    <p class="roadmap-status">
+      Every feature, its status and the phase it lands in:
+      <a href="https://docs.apprafter.dev/status/">the feature status page</a>.
+    </p>
   </Container>
 </section>
 
@@ -150,6 +157,15 @@ const anchorFor = (num: string) => phaseAnchor(byLabel.get(num)?.id ?? num);
   }
   .roadmap-waitlist:hover {
     border-color: var(--accent);
+    color: var(--accent);
+  }
+  .roadmap-status {
+    margin-top: 20px;
+    font-size: 15px;
+    color: var(--fg-muted);
+    max-width: 720px;
+  }
+  .roadmap-status a {
     color: var(--accent);
   }
   .roadmap-closing {
