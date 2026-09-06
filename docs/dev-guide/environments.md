@@ -15,7 +15,7 @@ base, how the cluster's default environment behaves, and how to tell
 the two deployments apart afterwards.
 
 The decision behind the model is
-[ADR 0044](../adr/0044-per-environment-deploy.md).
+[Per-environment deploy](../how-it-works/per-environment-deploy.md).
 
 ## What an environment is here
 
@@ -200,39 +200,12 @@ no `--env`.
 
 ## How an override merges onto the base
 
-The operator computes the running spec as `spec.base` with the selected
-environment folded onto it, field by field — so an override that sets
-one subfield does not blank its neighbours. In short: `image` and
-`replicas` replace; `expose` and `imagePolicy` merge per subfield;
-`resources` merges per key inside `requests` and `limits`; `env` merges
-with the environment winning a shared key; `needs` replaces per service
-key.
+`image`, `replicas` and `expose` replace; `env` merges key by key with the
+override winning. `expose` merges by subfield, so an override that sets only
+`network` keeps the base's `port`.
 
-The per-field rule for everything an override may carry is stated once,
-in [Writing
-Application.cue](application-cue.md#multi-environment-patterns) — read
-it there rather than inferring it from the two tables below.
-
-For the manifest example above, the `staging` deployment runs:
-
-| Field | Value | From |
-| --- | --- | --- |
-| `image` | `ghcr.io/acme/parser:1.4.0` | base — staging sets none |
-| `replicas` | `1` | staging replaces base's `2` |
-| `expose.port` | `8080` | base |
-| `expose.network` | `internal` | base |
-| `env.LOG_LEVEL` | `debug` | staging wins the key |
-
-and the `prod` deployment runs:
-
-| Field | Value | From |
-| --- | --- | --- |
-| `image` | `ghcr.io/acme/parser:1.4.0` | base |
-| `replicas` | `4` | prod |
-| `expose.port` | `8080` | base — inherited through the subfield merge |
-| `expose.network` | `public` | prod |
-| `expose.hostname` | `parser.example.com` | prod |
-| `env.LOG_LEVEL` | `info` | base — prod overrides nothing here |
+The full rules, and what the operator does with them before rendering, are
+[Per-environment deploy](../how-it-works/per-environment-deploy.md).
 
 ## The cluster's default environment
 

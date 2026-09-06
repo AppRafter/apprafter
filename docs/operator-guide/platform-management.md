@@ -243,12 +243,10 @@ yet shipped.
 - [Migration plans](./migration-plans.md) — approve and reject
   destructive-change gates.
 - [Operator quickstart](./quickstart.md) — initial cluster provisioning.
-- [ADR 0026](../adr/0026-platformstack-crd.md) — PlatformStack
-  design rationale.
-- [ADR 0025](../adr/0025-gitops-control-surface.md) — why the
-  platform reconciles itself through Argo CD.
-- [ADR 0028](../adr/0028-platform-stack-distribution.md) — OCI
-  chart distribution model.
+- [How the platform upgrades itself](../how-it-works/platform-upgrades.md) —
+  why the platform reconciles through Argo CD rather than through the CLI,
+  where a chart version comes from, and what decides whether an upgrade is
+  applied or held.
 - [The repository's architectural specification](https://github.com/apprafter/apprafter/blob/master/spec.md)
   — §3.11 (PlatformStack), §3.8 (MigrationPlan). A roadmap document,
   not published on this site.

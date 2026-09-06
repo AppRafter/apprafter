@@ -11,7 +11,7 @@ process manager like pm2, where sibling processes wrote to the same folder —
 while preserving AppRafter's single-operator-managed lifecycle.
 
 The full design decisions and trade-offs are in
-[ADR 0049](../adr/0049-cross-app-sharedvolume.md).
+[Cross-application shared volumes](../how-it-works/cross-application-shared-volumes.md).
 
 ## When to use a SharedVolume
 
@@ -80,17 +80,16 @@ which is also how the volume's own `refCount` is computed — so
 apprafter.io/shared-volume=shared-uploads` lists exactly the claims that
 `REFS` counts.
 
-## Trust-group model
+## Who may mount it
 
-SharedVolumes rely on an **explicit opt-in** by the cluster operator: you
-create the SharedVolume, and you list which Applications reference it. There
-is no automatic sharing — an Application gains access only when you add the
-`ref` field pointing to the volume's name.
+Sharing is an explicit opt-in: you create the SharedVolume, and an Application
+gains access only when you add a `ref` pointing at its name. Nothing is shared
+automatically.
 
-All Applications that reference a SharedVolume must belong to the **same
-namespace**. On Tier-1 this is equivalent to "same team / same trust group".
-The platform does not provide additional access-control isolation within a
-namespace beyond what Kubernetes RBAC already enforces.
+All Applications referencing one must be **in the same namespace** — the
+admission webhook rejects a cross-namespace `ref` with a hint. Why that rule
+exists, and what changes when the cluster's storage class does, is
+[Cross-application shared volumes](../how-it-works/cross-application-shared-volumes.md).
 
 ## Managing SharedVolumes with the CLI
 
@@ -224,30 +223,6 @@ kubectl -n apps describe sharedvolume shared-uploads
 `Used/Free` from `apprafter volume status` is the same sample the
 condition is computed from, so an em-dash there means no sample landed
 this cycle and the condition will not have been re-stamped either.
-
-## Tier-1 single-namespace invariant
-
-On Tier-1 (single-node, no NFS) the backing PVC has `accessModes:
-[ReadWriteOnce]`. Because all pods land on the same node, multiple pods
-mounting an RWO volume works correctly at the OS level (node-local
-concurrent access). The invariant is:
-
-> A SharedVolume and all Applications referencing it **must be in the same
-> namespace**.
-
-Cross-namespace sharing requires a `ReadWriteMany` capable storage class
-(NFS, Rook-Ceph, …) available on Tier-2. The admission webhook rejects
-cross-namespace `ref` values on T1 with a descriptive error and a hint to
-upgrade to Tier-2 when needed.
-
-## Provider line and tier upgrades
-
-The `shared-disk` backend is matched by a seeded `shared-local`
-ServiceProvider (Tier-1, `storageClass: local-path`). On Tier-2 the
-provider is swapped to `shared-nfs` (`storageClass: nfs-client`, `RWX`),
-which enables cross-namespace and cross-node sharing. The `ref` field in
-Application manifests is forward-compatible — no manifest changes are
-needed when the cluster tier upgrades from `shared-local` to `shared-nfs`.
 
 ## Example end-to-end
 

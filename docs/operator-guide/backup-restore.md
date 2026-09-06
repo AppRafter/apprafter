@@ -17,7 +17,8 @@ AppRafter's engine is [restic](https://restic.net/), pulled from the operator's
 machine. [Velero](https://velero.io/) was evaluated and rejected: it requires
 an object-storage bucket as its backup location, which forces a purchase into
 the default path, and AppRafter's default is a zero-bucket local pull. The
-design rationale is [ADR 0050](../adr/0050-backup-restore.md).
+design rationale, and the order a restore replays this in, are
+[How a restore replays a backup](../how-it-works/how-a-restore-works.md).
 
 ## Back up to your own machine
 

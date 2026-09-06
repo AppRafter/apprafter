@@ -32,6 +32,17 @@ than taken on faith.
   between `git push` and a running Deployment: the discovery probe, what the
   plugin sidecar writes into your checkout, and why each manifest is exported
   on its own.
+- [How the platform upgrades itself](platform-upgrades.md) — why the CLI is
+  not in the upgrade path, where a chart version comes from, and the four
+  reasons an upgrade can be waiting.
+- [Cross-application shared volumes](cross-application-shared-volumes.md) — why
+  sharing is opt-in, and why the namespace is the boundary on Tier 1.
+- [How a restore replays a backup](how-a-restore-works.md) — the order, and the
+  two invariants that order protects.
+- [Per-environment deploy](per-environment-deploy.md) — how an override merges
+  onto the base, and why the environment belongs to the deployment.
+- [The image digest](the-image-digest.md) — why a re-pushed tag rolls at all,
+  and what happens when the registry cannot be read.
 - [How the approval gate works](the-approval-gate.md) — why a change is held
   instead of applied, why only platform-scope plans can be rejected, and where
   a plan lives.

@@ -16,7 +16,7 @@ when you want a hand-pinned reference. Undoing a roll is
 different moment.
 
 The design rationale lives in
-[ADR 0040](../adr/0040-image-digest-resolution.md).
+[The image digest](../how-it-works/the-image-digest.md).
 
 ## The push → auto-deploy loop
 
@@ -79,62 +79,14 @@ If a private image has **no** covering `SourceCredential`, resolution
 cannot read the registry. It then fails gracefully (next section)
 rather than blocking your rollout.
 
-## Graceful fallback
+## When it cannot read the registry
 
-Resolution is best-effort and **never blocks the rollout**. If it
-fails — the registry is unreachable, the reference is malformed, or a
-private image has no covering credential — the operator renders the
-**verbatim tag** (the pre-resolution behaviour) and records a status
-condition `ImageResolved=False` with the reason. `apprafter app status
-<app-name>` reports the phase; the condition itself reads:
-
-??? note "Reading the condition with kubectl"
-
-    ```sh
-    kubectl -n <namespace> get application.apprafter.io <app-name> \
-      -o jsonpath='{.status.conditions[?(@.type=="ImageResolved")]}'
-    ```
-
-!!! warning "Spell out `.apprafter.io`, and pass the namespace"
-    AppRafter's `applications.apprafter.io` CRD and Argo CD's
-    `applications.argoproj.io` share the plural `applications`, so a
-    bare `kubectl get application` is ambiguous — it can hand you the
-    Argo CD object, which has no `ImageResolved` condition, and you
-    read an empty result as "resolution is fine". The workload CR also
-    lives in your application's own namespace (the one
-    `apprafter app add --namespace` set, `apprafter` by default), never
-    in `default`, so `-n` is required too.
-
-The workload still runs on the tag; you lose the digest pin and the
-auto-roll on same-tag pushes until resolution succeeds again. Fixing
-the cause (for example registering the missing `SourceCredential`)
-restores resolution on the next reconcile.
-
-## Opting out: a hand-pinned reference
-
-Set `spec.base.imagePolicy.resolve: off` to disable resolution for an
-application. The operator then renders the image reference **exactly
-as written** and performs **no** registry poll:
-
-```cue
-spec: {
-    base: {
-        image: "ghcr.io/acme/web@sha256:9f2c…"
-        imagePolicy: {resolve: "off"}
-        // …
-    }
-}
-```
-
-Use this when you manage your own reference — most commonly a
-hand-pinned digest for an environment that requires immutable,
-reviewed image changes. Opting out does **not** force you to write a
-digest; it only turns resolution off. With `resolve: off` there is no
-`status.image` and no `ImageResolved` condition, so `app status` shows
-no image line.
-
-The default (the field absent, or `resolve: digest`) is digest
-resolution as described above.
+A private image with no covering credential, or a registry that is down, means
+the digest cannot be resolved. The rollout is **not** blocked: the platform
+falls back to the tag as written and says so in the application's status. What
+that costs you, and the hand-pinned reference that opts out of resolution
+entirely, are on
+[The image digest](../how-it-works/the-image-digest.md).
 
 ## See also
 

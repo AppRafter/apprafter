@@ -271,7 +271,7 @@ same as the upgrade having worked. Six checks, each earning its place:
 5. **A sealed secret decrypts to its original value.** SealedSecrets are bound
    to the cluster that sealed them, so every one of them was re-sealed against
    the new cluster's key during the replay ([Secrets are re-sealed for the
-   target](restore.md#secrets-are-re-sealed-for-the-target)). Read one back and compare
+   target](../how-it-works/how-a-restore-works.md#secrets-are-re-sealed-not-copied)). Read one back and compare
    it to what you put in. The failure this catches is an application sitting
    at `Ready=False` with `EnvSecretMissing`.
 6. **The data, compared properly.** A marker row is not evidence. A single row
