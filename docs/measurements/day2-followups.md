@@ -3435,3 +3435,52 @@ caught, because the unit tests assert the parser, and the parser is correct.
 The walk records this rather than asserting it. Failing on it would pin a
 behaviour the product has not chosen, which is the mistake D24 documents from
 the other direction.
+
+---
+
+## D30 — the landing preview host previews nothing
+
+Found 2026-09-06 while writing `docs/how-it-works/deploying-the-landing-and-cms.md`
+as a worked example: writing a page from a source is the first time anybody
+reads that source as a whole.
+
+`landing/web/apprafter/Application-preview.cue` pins
+`ghcr.io/apprafter/landing-web:latest`, with a comment dated 2026-05-25 saying
+it is "temporarily pinned to :latest while the promotion workflow hasn't seeded
+:preview yet — switch back to :preview once landing-preview-build.yml fires the
+first publish".
+
+`:latest` is what **production** watches
+(`landing/web/apprafter/Application.cue`), and
+`.github/workflows/landing-promote-to-prod.yml` retags `:preview` → `:prod` +
+`:latest` on promotion. So today the preview host and the production host serve
+the same bytes, and the inspection step the promotion chain is built around
+inspects what is already live.
+
+The consequence is not a broken deploy — both hosts work — but the loss of the
+one property the two-stream design exists for. A content change promoted after
+a look at the preview host was already public before the look.
+
+**Fix:** switch the preview manifest to `:preview` and confirm
+`landing-preview-build.yml` has seeded that tag. If it has not, seeding it is
+the prerequisite, and until then the preview host is production with a
+different hostname.
+
+Not fixed here: it is a change to a live deployment's manifest and belongs with
+someone who can watch the result.
+
+## D31 — `landing/DEPLOY.md` documents a deployment the cluster replaced
+
+Same reading. `landing/DEPLOY.md` describes a systemd + podman single-host
+deploy, while `landing/web/apprafter/Application.cue` and
+`landing/cms/apprafter/Application.cue` deploy both applications onto the
+AppRafter cluster through Argo CD. The two describe different systems and the
+manifests are the ones that run.
+
+It is a tracked file, in English, and it reads as current. A contributor
+following it would configure a host that nothing routes to.
+
+**Fix:** either rewrite it as the local-development recipe it is closest to, or
+delete it and point at
+`docs/how-it-works/deploying-the-landing-and-cms.md`, which now describes what
+actually runs.

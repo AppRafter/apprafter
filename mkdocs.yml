@@ -287,6 +287,11 @@ nav:
       - How a restore replays a backup: how-it-works/how-a-restore-works.md
       - Per-environment deploy: how-it-works/per-environment-deploy.md
       - The image digest: how-it-works/the-image-digest.md
+      # Worked examples: a whole assembly rather than one mechanism.
+      # Both are real deployments in this repository, included from the
+      # manifests they describe rather than copied.
+      - "Worked example: the documentation site": how-it-works/deploying-the-docs-site.md
+      - "Worked example: the landing site and its CMS": how-it-works/deploying-the-landing-and-cms.md
       - Right-sizing an application's requests: how-it-works/resources-and-autoscaling.md
   - Developer Guide:
       - Overview: dev-guide/index.md

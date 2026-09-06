@@ -65,3 +65,15 @@ external tools, and everything else routes by role. Mechanism is one of those
 roles, and this is where it goes. Before that decision the explanations lived
 inline, interleaved with the steps — which made short procedures read as long
 ones and made the platform look like it demanded Kubernetes fluency to use.
+
+## Worked examples
+
+Two real deployments in this repository, assembled — what is responsible for
+what, and what each manifest deliberately leaves out. Read one beside your own
+application.
+
+- [The documentation site](deploying-the-docs-site.md) — a static site: one
+  image, no database, no runtime configuration.
+- [The landing site and its CMS](deploying-the-landing-and-cms.md) — two
+  applications, a declared database, and a change path that does not go through
+  Git.

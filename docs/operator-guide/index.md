@@ -125,6 +125,14 @@ on this site today.
   backup](restore.md) documents the commands, including rebuilding a
   cluster from a backup; what is missing is the drill around them.
 
+## A worked example
+
+- [The documentation site](../how-it-works/deploying-the-docs-site.md) and
+  [the landing site and its CMS](../how-it-works/deploying-the-landing-and-cms.md)
+  — two real deployments on this platform, taken apart: what is responsible for
+  what, where each piece comes from, and what each manifest leaves out on
+  purpose.
+
 ## Where else to look
 
 - [Reference](../reference/index.md) — the generated CLI pages, the

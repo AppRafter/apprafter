@@ -52,8 +52,10 @@ landingCms: v1alpha1.#Application & {
 				pg: {}
 			}
 			env: {
+				// Bound explicitly to the claim's `url` field. There
+				// is no auto-injection: 2.12 removed it, and a
+				// reference is written where it is used.
 				DATABASE_URL: claim.pg.url
-				// DATABASE_URL auto-injected via needs.pg claim
 				PAYLOAD_SECRET: secret: "apprafter-landing-cms-secrets/PAYLOAD_SECRET"
 				// for test via port forwarding
 				LANDING_CMS_CSRF_ORIGINS: "http://localhost:8080"

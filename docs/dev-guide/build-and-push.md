@@ -128,6 +128,15 @@ opt out. If the new build is wrong,
 [Rolling back a bad deploy](rollback.md) is the way back, and it is the
 immutable tag above that makes it possible.
 
+## A worked example
+
+Two real deployments in this repository, assembled end to end — what builds
+each image, what deploys it, and what each manifest deliberately leaves out:
+[the documentation site](../how-it-works/deploying-the-docs-site.md) (static,
+no database) and
+[the landing site and its CMS](../how-it-works/deploying-the-landing-and-cms.md)
+(two applications, a declared database, and a promotion step).
+
 ## See also
 
 - [Writing Application.cue](application-cue.md) — the manifest that names the
