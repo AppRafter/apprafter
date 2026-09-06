@@ -2,7 +2,7 @@
 
 **Known hole — this page carries real drift and the gate reports nothing.**
 
-ADR 0046 replaced the composed `DATABASE_URL` key of a `pg` connection
+[ADR 0046](../../../../docs/adr/0046-env-value-references.md) replaced the composed `DATABASE_URL` key of a `pg` connection
 Secret with the decomposed `url` / `user` / `pass` / `host` / `port` /
 `db`. The command below therefore prints an empty string against a live
 cluster. Nothing here is checkable today: it names no `apprafter`
