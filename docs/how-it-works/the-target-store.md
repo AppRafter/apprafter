@@ -110,8 +110,9 @@ you need the raw bytes for a one-off script.
 
 **Do not commit this file to dotfiles repos.** The token is a
 plaintext credential — the security boundary is filesystem
-permissions. ADR 0030's R1 mitigation: `apprafter doctor` warns
-on mode != 0600.
+permissions. The R1 mitigation in
+[ADR 0030](../adr/0030-cli-target-store-and-credential-chain.md): `apprafter doctor`
+warns on mode != 0600.
 
 ## Credential resolution chain
 

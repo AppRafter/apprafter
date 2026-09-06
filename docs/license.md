@@ -7,9 +7,9 @@ description: "Which license covers which part of the repository, how the two-yea
 This page describes the AppRafter licensing landscape: which license
 covers which code, how the FSL → vanilla-OSS conversion works on a
 per-release basis, and the two-license history left by the
-ADR 0032 base-license migration.
+[ADR 0032](adr/0032-license-fsl-1-1-apache-2-0.md) base-license migration.
 
-## Current state (from ADR 0032 onward)
+## Current state (from [ADR 0032](adr/0032-license-fsl-1-1-apache-2-0.md) onward)
 
 - **Platform core** — `cli/`, `operator/`, `schemas/`, `manifests/`,
   and platform-internal services are licensed under
@@ -47,8 +47,10 @@ eventually becomes fully OSI-open.
 ## Two-license landscape
 
 The base license for the core changed once. Pre-ADR-0032 releases
-were published under **`FSL-1.1-MIT`** per ADR 0001; ADR 0032 (dated
-2026-05-19) migrated the base to **`FSL-1.1-Apache-2.0`**.
+were published under **`FSL-1.1-MIT`** per
+[ADR 0001](adr/0001-license-fsl-1-1-mit.md);
+[ADR 0032](adr/0032-license-fsl-1-1-apache-2-0.md) (dated 2026-05-19) migrated
+the base to **`FSL-1.1-Apache-2.0`**.
 
 The conversion clock is per-release and independent: a release stays
 on the terms it was published under and converts on its own
@@ -66,15 +68,16 @@ releases continue converting to MIT.
 
 ## Why this two-step history
 
-ADR 0001 (2026-05-06) established FSL-1.1-MIT for the core. The FSL
-wrap — protection against cloud-vendor rebranding during the active
-window — was retained when ADR 0032 (2026-05-19) migrated the base.
-The migration's rationale (Apache patent grant + retaliation,
-Kubernetes/CNCF convention alignment, Sentry consistency, explicit
-trademark posture) is documented in ADR 0032.
+[ADR 0001](adr/0001-license-fsl-1-1-mit.md) (2026-05-06) established FSL-1.1-MIT
+for the core. The FSL wrap — protection against cloud-vendor rebranding
+during the active window — was retained when
+[ADR 0032](adr/0032-license-fsl-1-1-apache-2-0.md) (2026-05-19) migrated the base.
+That ADR also carries the migration's rationale: the Apache patent grant
+and retaliation clause, alignment with Kubernetes/CNCF convention,
+consistency with Sentry, and an explicit trademark posture.
 
-ADR 0001's Status field is marked `Superseded` only for the base
-license choice; its FSL wrap rationale and the plugin MIT carve-out
+The Status field of [ADR 0001](adr/0001-license-fsl-1-1-mit.md) is marked
+`Superseded` only for the base license choice; its FSL wrap rationale and the plugin MIT carve-out
 remain authoritative.
 
 ## Source files and SPDX headers

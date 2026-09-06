@@ -429,9 +429,10 @@ never overwritten and must be edited by hand.
 Once this is done, publishing is not a step anyone takes. A
 documentation change merged to the default branch republishes
 `:latest`, and the operator re-resolves that tag to its current registry
-digest on every reconcile ([ADR 0040](../adr/0040-image-digest-resolution.md)),
-so a moved tag rolls the Deployment without a manifest edit, a
-re-registration, or a visit to this page.
+digest on every reconcile
+([how](../how-it-works/the-image-digest.md)), so a moved tag rolls the
+Deployment without a manifest edit, a re-registration, or a visit to this
+page.
 
 To hold the site at a known build instead, point
 `Application.spec.base.image` at the immutable `:<git sha>` the same
@@ -484,6 +485,6 @@ docker build -t docs-local -f docs-site/Dockerfile docs-site/
 scripts/docs-site-smoke.sh docs-local
 ```
 
-The publication decision itself — why the site is built outside the
-Dockerfile, and why these five steps stayed manual — is
-[ADR 0057](../adr/0057-documentation-system.md).
+What each part of the resulting deployment is responsible for, and where
+every value in it comes from, is
+[Worked example: deploying this documentation site](../how-it-works/deploying-the-docs-site.md).

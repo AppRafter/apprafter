@@ -16,9 +16,9 @@ Two identifiers are in use across the monorepo:
 
 Plugins and SDKs are MIT from day one to keep contribution friction
 minimal; the platform core uses FSL-1.1-Apache-2.0 (see `NOTICE` and
-ADR 0032 for the rationale). Releases v0.0.1 through v0.1.96 were
-published under the previous FSL-1.1-MIT base — see ADR 0032 for the
-migration history.
+[ADR 0032](../adr/0032-license-fsl-1-1-apache-2-0.md) for the rationale).
+Releases v0.0.1 through v0.1.96 were published under the previous
+FSL-1.1-MIT base — that ADR carries the migration history too.
 
 ## Per-language syntax
 

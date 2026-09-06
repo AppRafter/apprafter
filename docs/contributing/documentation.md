@@ -218,8 +218,9 @@ Apply the following to each paragraph, in order. The first hit wins.
 
 ### 0. Is it one of the four roles?
 
-Straight out of ADR 0058's table, and it catches most of what does not belong before you have to
-think about it. Walk transcript → **delete**, and let one sentence of prose carry the property
+Straight out of the table in
+[ADR 0058](../adr/0058-public-surfaces-are-written-for-their-reader.md), and it catches most of
+what does not belong before you have to think about it. Walk transcript → **delete**, and let one sentence of prose carry the property
 with the e2e named as its evidence. An independent check → **collapse** into a `???` block, one
 per section outcome and never per step. Failure handling → a **row in the troubleshooting
 table**. Only what survives all three reaches the question below.
@@ -266,8 +267,8 @@ what a reimplementation would revisit. In a guide it therefore has one of two en
 
 - the paragraph around it is mechanism, and the citation **moves with it**;
 - the paragraph is a recipe sentence that merely names a decision, and the citation is **deleted**.
-  "Registering the credential once covers both, by ADR 0031" tells a reader following the recipe
-  nothing they can act on. Drop the clause.
+  `Registering the credential once covers both, by ADR 0031` tells a reader following the
+  recipe nothing they can act on. Drop the clause.
 
 A citation never stays in a guide because it "might be useful". If the mechanism is worth reaching,
 link the mechanism page — that page is where the decision is cited from.
@@ -299,9 +300,9 @@ is whether the sentence tells them something to *do*.
 From `operator-guide/postgres.md`, before the 2.20c rework:
 
 > The provisioner creates one CNPG `Cluster` per tier, lazily, on the first `needs.pg` in the
-> cluster (ADR 0039). Your claim gets a database and a role on it. **The first claim in a fresh
-> cluster takes about a minute longer than the ones after it**, because the shared cluster is
-> being created.
+> cluster ([ADR 0039](../adr/0039-source-credential.md)). Your claim gets a database and a role
+> on it. **The first claim in a fresh cluster takes about a minute longer than the ones after
+> it**, because the shared cluster is being created.
 
 Sentence one fails test 1 and names a platform component: mechanism, and the citation goes with
 it. Sentence two is what the reader gets: recipe. Sentence three survives a reimplementation that

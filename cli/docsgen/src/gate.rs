@@ -264,6 +264,36 @@ pub const ADR_REFERENCE: &str = "adr-reference";
 /// manifest, a script) keeps naming that file, which is the one case
 /// where a filename IS the honest label.
 pub const LINK_TEXT_PATH: &str = "link-text-path";
+/// An ADR cited as bare text where the corpus renders it as a link.
+///
+/// A citation is a pointer, and a pointer a reader cannot follow is a
+/// worse pointer than none — they are left to search a directory of
+/// four-digit filenames for a number. Forty-nine of the corpus's
+/// citations were already links when this landed; this stops the other
+/// spelling coming back.
+///
+/// The target is not checked here — [`ADR_REFERENCE`] owns whether the
+/// decision exists and still stands, and it reads bare text and links
+/// alike, which is exactly why it cannot also enforce the form: it
+/// discards the spelling on the way in.
+pub const ADR_CITATION_FORM: &str = "adr-citation-form";
+/// An ADR cited anywhere in an operator- or developer-guide file.
+///
+/// ADR 0058's 2026-09-06 amendment: a guide links the mechanism page,
+/// and the mechanism page cites the decision. The rule binds the whole
+/// file, trailing link lists included — a citation in the footer of a
+/// recipe is still an invitation to read a design record instead of
+/// finishing the task.
+///
+/// The reasoning is about what an ADR IS. It does not explain how
+/// something works; it records why it was decided to work that way, for
+/// a reader who might change the decision. That is one layer further
+/// out than mechanism, and two further out than a recipe.
+///
+/// Scoped by [`is_guide`], so `how-it-works/`, `contributing/`,
+/// `license.md`, the reference and the ADR corpus are all untouched —
+/// `license.md`'s citations in particular ARE the licence-change record.
+pub const ADR_CITATION_PLACEMENT: &str = "adr-citation-placement";
 /// An obligation count fell below the committed census: the corpus
 /// lost documented surface it used to have.
 ///
@@ -375,6 +405,17 @@ fn remedy(code: &str) -> &'static str {
              so a path belonging to someone else's project has to be named as \
              theirs in the sentence rather than exempted, because a reader will \
              otherwise grep this repository for it"
+        }
+        ADR_CITATION_FORM => {
+            "render the citation as a link to the ADR — a reader who cannot \
+             follow it is left searching a directory of four-digit filenames \
+             for a number"
+        }
+        ADR_CITATION_PLACEMENT => {
+            "a guide does not cite a decision. Link the mechanism page that \
+             explains the behaviour, and let that page carry the citation — or, \
+             where the sentence only name-drops the decision without telling the \
+             reader anything to do, drop the clause"
         }
         LINK_TEXT_PATH => {
             "use the target page's nav title as the link text — the reader is on \
@@ -1528,6 +1569,38 @@ impl Gate {
             findings.push(finding(CODE_PATH, file, reference.line, message));
         }
 
+        // Where a decision may be cited, and in what form.
+        //
+        // Off the masked `prose`, like the citation check further down
+        // and for its reason: an `adr-check-ignore` entry read raw is a
+        // citation that matches its own exemption.
+        //
+        // They part from that check on fences, deliberately. It asks
+        // whether a decision still stands, which is true of a citation
+        // wherever it is written. These two ask whether the reader can
+        // follow it and whether this page should be citing at all —
+        // and inside a fence nothing is followable and the page is
+        // demonstrating rather than citing. See [`adr_citations`].
+        for (line, spelling) in adr_citations(&prose) {
+            if is_guide(file) {
+                findings.push(finding(
+                    ADR_CITATION_PLACEMENT,
+                    file,
+                    line,
+                    format!("`{spelling}` — a guide does not cite a decision"),
+                ));
+            } else if !spelling.linked {
+                findings.push(finding(
+                    ADR_CITATION_FORM,
+                    file,
+                    line,
+                    format!(
+                        "`{spelling}` is written as text; the corpus renders a citation as a link"
+                    ),
+                ));
+            }
+        }
+
         // Read off the SOURCE rather than the prose: a link inside a
         // fence is sample markdown about link syntax, and relabelling
         // one would change what the sample demonstrates.
@@ -1787,6 +1860,95 @@ fn normalise(dir: &str, target: &str) -> Option<String> {
         }
     }
     Some(parts.join("/"))
+}
+
+/// One ADR citation, with the spelling kept.
+///
+/// [`crate::adr::AdrRef`] deliberately discards the form — it answers
+/// "does this decision still stand", for which `ADR 0030` and
+/// `[ADR 0030](…)` are the same question. The two classes here ask
+/// about the form and the file, so they need it back.
+pub(crate) struct Citation {
+    /// As written, for the message.
+    pub text: String,
+    /// Whether the citation is inside a markdown link's text.
+    pub linked: bool,
+}
+
+impl std::fmt::Display for Citation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+/// Every `ADR NNNN` in the source, with its line and whether it is
+/// linked.
+///
+/// A citation counts as linked when it sits inside the TEXT of a
+/// markdown link — `[ADR 0030](../adr/…)`. That is the corpus's own
+/// spelling, and it is what makes the number followable.
+///
+/// `Pre-ADR-0032` and similar hyphenated compounds are not citations
+/// and are skipped: the corpus uses them to name an era, not to point
+/// at a decision.
+///
+/// A citation shown as literal text — inside a fence or an inline code
+/// span — is skipped. There the page is DEMONSTRATING the spelling
+/// rather than citing anything, and linking it would change what the
+/// demonstration shows. The class list on the gate page spells the
+/// forms out that way, and so must go on being able to.
+///
+/// A blockquote is not exempt. This corpus writes callouts as
+/// blockquotes as often as it quotes prose in them, so `>` says nothing
+/// about whether the citation is the page's own.
+fn adr_citations(source: &str) -> Vec<(usize, Citation)> {
+    let mut out = Vec::new();
+    let mut fenced = false;
+    for (i, line) in source.lines().enumerate() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        let mut from = 0;
+        while let Some(rel) = line[from..].find("ADR ") {
+            let at = from + rel;
+            from = at + 4;
+            // `Pre-ADR-0032`: preceded by a hyphen, so not a citation.
+            if at > 0 && bytes[at - 1] == b'-' {
+                continue;
+            }
+            let digits: String = line[at + 4..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if digits.len() != 4 {
+                continue;
+            }
+            let end = at + 4 + digits.len();
+            // An odd number of backticks before it puts the citation
+            // inside an inline code span.
+            if line[..at].matches('`').count() % 2 == 1 {
+                continue;
+            }
+            // Linked when the citation lies inside a `[...](...)` text
+            // span: an unclosed `[` before it, and `](` after it.
+            let opened = line[..at].rfind('[');
+            let linked = opened
+                .is_some_and(|o| line[o..at].find(']').is_none() && line[end..].starts_with("]("));
+            out.push((
+                i + 1,
+                Citation {
+                    text: format!("ADR {digits}"),
+                    linked,
+                },
+            ));
+        }
+    }
+    out
 }
 
 /// Every `[text](target)` on the page whose TARGET is a `.md` page and

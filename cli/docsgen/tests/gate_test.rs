@@ -1405,3 +1405,97 @@ fn a_prose_title_containing_a_slash_is_not_a_path() {
     );
     assert!(found.is_empty(), "{found:?}");
 }
+
+// ---- ADR citation form and placement (2.23o) --------------------------
+
+#[test]
+fn a_bare_citation_is_reported() {
+    // The reader cost is the whole of the rule: a number with nothing
+    // to click leaves them opening a directory of four-digit filenames
+    // to find out what it decided.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nThe base license changed once, per ADR 0032.\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::ADR_CITATION_FORM,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].starts_with("3: "), "{found:?}");
+    assert!(found[0].contains("ADR 0032"), "{found:?}");
+}
+
+#[test]
+fn a_linked_citation_is_silent() {
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nPer [ADR 0032](adr/0032-license-fsl-1-1-apache-2-0.md), it changed.\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::ADR_CITATION_FORM,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_citation_shown_as_literal_text_is_not_a_citation() {
+    // The class list on the gate page spells the accepted forms out in
+    // code spans, and the style guide quotes a fenced specimen. Both
+    // are DEMONSTRATING a citation; linking one would change what the
+    // demonstration shows.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nEvery spelling counts: `ADR 0046`, `ADR-0046`.\n\n\
+                ```text\nby ADR 0031 — drop the clause\n```\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::ADR_CITATION_FORM,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn an_era_name_is_not_a_citation() {
+    // `Pre-ADR-0032` names a period, not a decision, and there is
+    // nothing for a reader to follow.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nPre-ADR-0032 releases shipped under the older base.\n";
+    let found = of(
+        &gate.check_source("docs/t.md", page).unwrap(),
+        gate::ADR_CITATION_FORM,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_citation_in_a_guide_is_reported_however_it_is_written() {
+    // Placement outranks form: on a guide a linked citation is still
+    // the wrong surface, so it is reported once and as placement.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nRun it once, per [ADR 0031](../adr/0031-apprafter-agent-protocol.md).\n";
+    let findings = gate.check_source("docs/operator-guide/t.md", page).unwrap();
+    let placement = of(&findings, gate::ADR_CITATION_PLACEMENT);
+    assert_eq!(placement.len(), 1, "{placement:?}");
+    assert!(placement[0].starts_with("3: "), "{placement:?}");
+    assert!(
+        of(&findings, gate::ADR_CITATION_FORM).is_empty(),
+        "a guide citation is a placement problem, not a form one"
+    );
+}
+
+#[test]
+fn a_citation_on_a_mechanism_page_is_where_it_belongs() {
+    // The other half of the same rule, and the one that makes the
+    // sweep's target reachable: `how-it-works/` is exactly where a
+    // citation moved out of a guide is supposed to land.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nThe gate is [ADR 0027](../adr/0027-migrationplan-unification.md).\n";
+    let found = of(
+        &gate.check_source("docs/how-it-works/t.md", page).unwrap(),
+        gate::ADR_CITATION_PLACEMENT,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}

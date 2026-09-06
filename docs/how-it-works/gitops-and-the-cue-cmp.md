@@ -84,8 +84,8 @@ and the discovery probe above prints a match, the sidecar runs its
    — a workspace-local CUE module holding the exact
    `apprafter.io/schemas/v1alpha1` the sidecar image ships, plus a
    generated `apprafter_claim_gen.cue` that defines the `claim` value
-   your `env` references resolve against (ADR 0046). Both are
-   inject-wins: they overwrite anything you vendored. This is why you
+   your `env` references resolve against
+   ([ADR 0046](../adr/0046-env-value-references.md)). Both are inject-wins: they overwrite anything you vendored. This is why you
    do not vendor the schema yourself, and why bare
    `claim.pg.url` selectors resolve without you declaring them.
 3. **It exports each manifest separately.** A single

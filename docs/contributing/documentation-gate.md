@@ -45,7 +45,7 @@ deliberately names capabilities that do not exist yet.
 
 ## What is checked
 
-Thirteen classes, and two more specified below that are not built yet. The first five resolve a claim about the product, and
+Fifteen classes. The first five resolve a claim about the product, and
 **none of them is selected by a fence's language tag** — obligations
 come from a block's content, so deleting a tag cannot quietly turn a
 finding green. Nor can deleting the fence: an indented block and an
@@ -60,8 +60,8 @@ worth knowing, set out below.
 | `code-path` | A repository path the page names — in a code span opening on a real top-level directory, or as a relative link target — that does not exist in the repository. |
 | `adr-reference` | An ADR citation that names no ADR at all, or one whose decision no longer stands: `Superseded`, `Deprecated`, or an `Unused` reserved slot. |
 | `link-text-path` | A link whose visible **text** is a filename or a repository path, on a link that goes to another `.md` page. The href is not this class's business — see below. |
-| `adr-citation-form` | An ADR cited as bare text where it should be a link. Planned — see [Which surface does this paragraph belong on?](documentation.md#which-surface-does-this-paragraph-belong-on). |
-| `adr-citation-placement` | An ADR cited anywhere in an operator- or developer-guide file. Planned, and it will be born red: the mechanism pages most citations must move to do not exist yet. |
+| `adr-citation-form` | An ADR cited as bare text rather than as a link to it. A citation the reader cannot follow leaves them searching a directory of four-digit filenames. A citation shown as literal text — in a fence or a code span — is demonstrating the spelling, and is not a citation. |
+| `adr-citation-placement` | An ADR cited anywhere in an operator- or developer-guide file. A guide answers *what do I run*; a decision's *why* is two surfaces out. Move the citation to the mechanism page the guide links, and link that. |
 | `unlabelled-fence` | A fence with no info string. |
 | `unterminated-fence` | A fence that never closes, so everything below it renders as code. |
 | `unclosed-pre` | An HTML `pre` element that never meets its closing tag. The same failure as the row above with a different edit behind it, which is why it is its own class. |
@@ -86,7 +86,7 @@ anchor's presence makes the phrase true or false — so the table records
 what to watch and the repository decides the answer. Revert the fix
 behind an entry and the fact flips, the phrase becomes true again, and
 the check stops objecting. That is what keeps it from becoming the
-rotting deny-list ADR 0057 decision 7 would have been.
+rotting deny-list [ADR 0057](../adr/0057-documentation-system.md) decision 7 would have been.
 
 Two properties are load-bearing and both are tested:
 
@@ -142,7 +142,8 @@ page as a clean one:
   command is inside one, not that the block explains anything. A page
   could satisfy it by collapsing everything and saying nothing; that is
   review's job, and the one-block-per-section-outcome rule is stated in
-  ADR 0058 rather than enforced here.
+  [ADR 0058](../adr/0058-public-surfaces-are-written-for-their-reader.md) rather
+  than enforced here.
 
 A block that is a documented workaround for a tracked defect is the
 third way to be silent, and the honest one: mark it

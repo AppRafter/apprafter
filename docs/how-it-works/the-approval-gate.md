@@ -37,11 +37,13 @@ original `MigrationPlan` is superseded automatically.
 
 The admission webhook enforces this model: attempting to patch
 `status.phase=rejected` on an application-scope `MigrationPlan`
-is denied at the API server layer (per ADR 0027). There is no
+is denied at the API server layer (per
+[ADR 0027](../adr/0027-migrationplan-unification.md)). There is no
 `apprafter migration reject` for application scope.
 
 The plan is created in the **application's own namespace** with a
-controlling `ownerReference` back to the `Application` CR (ADR 0051).
+controlling `ownerReference` back to the `Application` CR
+([ADR 0051](../adr/0051-app-scope-migration.md)).
 Kubernetes garbage-collects it if the application is deleted, and it
 renders inside the user's Argo CD application tree without any extra
 anchor resource, so the "Approve" resource action appears on the plan
@@ -106,8 +108,9 @@ application-scope plan, revert the triggering commit in Git; for a
 `sourcecredential` plan, re-widen the credential's spec.
 
 For an application-scope plan the operator **deletes** the plan once it
-applies the approved spec (the plan is a consumed ticket, ADR 0051), so
-an approved application plan does not linger in `completed`. A
+applies the approved spec — the plan is a consumed ticket
+([ADR 0051](../adr/0051-app-scope-migration.md)) — so an approved application plan
+does not linger in `completed`. A
 `sourcecredential` plan is consumed the same way — the controller
 derives both halves with the narrowed spec, stamps the new baseline,
 and then deletes the plan.
