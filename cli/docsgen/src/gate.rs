@@ -1005,23 +1005,18 @@ impl Gate {
                 .unwrap_or(path)
                 .display()
                 .to_string();
-            if !is_guide(&shown) || recipe::break_glass_reason(&shown).is_some() {
-                continue;
-            }
             let source =
                 std::fs::read_to_string(path).map_err(|e| format!("reading {shown}: {e}"))?;
-            // Marker diagnostics belong to `corpus`, which already
-            // reports them; here they are consulted and discarded, so a
-            // malformed marker is not reported twice by two runs.
-            let mut sink = Vec::new();
-            let mut stats = Stats::default();
-            let mut exempt = |line: usize, tag: &Option<String>| {
-                self.fence_marker(&shown, line, tag, &mut sink, &mut stats)
-                    .is_some_and(|(m, ex)| {
-                        m.check == Check::None && ex.as_ref().is_some_and(Exemption::silences)
-                    })
-            };
-            findings.extend(recipe_findings_for(&shown, &source, &mut exempt));
+
+            // TWO SCOPES, and they differ on purpose.
+            //
+            // `behaviour-claim` runs over EVERY in-scope page. A false
+            // sentence is false wherever it is written, and the tree it
+            // would otherwise be blind to is the one ADR 0058 sends
+            // every behavioural claim to: `docs/how-it-works/` exists to
+            // hold exactly the statements this class checks. It was
+            // guarded by `is_guide` until 2.23n, which is to say the
+            // mechanism layer was unchecked for the whole of its life.
             for (claim, line) in behaviour::falsified(&self.repo_root, &source, behaviour::CLAIMS)?
             {
                 findings.push(finding(
@@ -1034,6 +1029,26 @@ impl Gate {
                     ),
                 ));
             }
+
+            // `recipe-purity` runs over guides only, and that guard is
+            // correct: a mechanism page SHOULD show the `kubectl` a
+            // recipe may not, and a break-glass page is where a foreign
+            // command is the whole point.
+            if !is_guide(&shown) || recipe::break_glass_reason(&shown).is_some() {
+                continue;
+            }
+            // Marker diagnostics belong to `corpus`, which already
+            // reports them; here they are consulted and discarded, so a
+            // malformed marker is not reported twice by two runs.
+            let mut sink = Vec::new();
+            let mut stats = Stats::default();
+            let mut exempt = |line: usize, tag: &Option<String>| {
+                self.fence_marker(&shown, line, tag, &mut sink, &mut stats)
+                    .is_some_and(|(m, ex)| {
+                        m.check == Check::None && ex.as_ref().is_some_and(Exemption::silences)
+                    })
+            };
+            findings.extend(recipe_findings_for(&shown, &source, &mut exempt));
         }
         sort(&mut findings);
         Ok(findings)

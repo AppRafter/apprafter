@@ -195,3 +195,51 @@ fn the_exemptions_are_all_typed_and_dated() {
         assert!(m.contains("since=v"), "undated exemption: {m}");
     }
 }
+
+#[test]
+fn the_behaviour_check_reaches_the_mechanism_layer() {
+    // `recipe_findings` carries TWO checks with two scopes, and until
+    // 2.23n the wrong one shared the guard: `behaviour-claim` sat behind
+    // `is_guide`, so `docs/how-it-works/` — the tree ADR 0058 sends every
+    // behavioural claim to — was the one place a false sentence could
+    // never be reported. The whole mechanism layer was unchecked for the
+    // whole of its life.
+    //
+    // Asserted structurally rather than by seeding a claim into the
+    // corpus: the check is driven by `behaviour::CLAIMS`, whose phrases
+    // are absent from a healthy corpus by construction, so there is
+    // nothing to observe on a green tree. What CAN be observed is that
+    // the walk visits the pages at all — and `recipe-purity`'s own guard
+    // must NOT have widened with it, because a mechanism page is
+    // supposed to show the `kubectl` a recipe may not.
+    let root = repo_root();
+    let mechanism = docsgen::scan::in_scope(&root)
+        .expect("list the corpus")
+        .into_iter()
+        .filter(|p| {
+            p.strip_prefix(&root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .starts_with("docs/how-it-works/")
+        })
+        .count();
+    assert!(
+        mechanism >= 5,
+        "only {mechanism} mechanism page(s) in scope — this test would be judging almost nothing"
+    );
+
+    // The negative half, and the reason this is not just a page count:
+    // every how-it-works page carries `kubectl`, and none of them is
+    // reported. That is `recipe-purity` still correctly scoped to
+    // guides, proven on the same tree the check above walks.
+    let found = findings();
+    let reported: Vec<&str> = found
+        .iter()
+        .filter(|f| f.file.starts_with("docs/how-it-works/"))
+        .map(|f| f.file.as_str())
+        .collect();
+    assert!(
+        reported.is_empty(),
+        "recipe-purity widened to the mechanism layer, where a foreign command is correct: {reported:?}"
+    );
+}
