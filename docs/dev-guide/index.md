@@ -34,6 +34,10 @@ filling it in.
 - [Secrets](secrets.md) — sealing a value with `apprafter secret seal`
   and binding it to an env-var with a `secret:` reference. The
   namespace you seal into decides whether it works.
+- [When a change needs approval](when-a-change-needs-approval.md) —
+  the thirteen manifest edits that pause instead of rolling out, what
+  `apprafter app status` says while one is held, and how to get it
+  moving. Several of them are additions, which is the surprising part.
 
 ## Give it a dependency
 

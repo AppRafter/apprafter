@@ -175,84 +175,22 @@ server-side regardless.
 
 ## 1. Register a target and bring the cluster up
 
-A **target** is a named bundle of provider, region, and credentials.
-Save one, then bring the whole tier-1 stack up with a single command:
+If someone has already done this, skip to step 2 — you need nothing from it
+except a cluster that exists.
 
-```sh
-apprafter target add prod \
-    --provider hetzner-cloud \
-    --token  "<your-hcloud-token>" \
-    --region nbg1 \
-    --tier   solo \
-    --ssh-key ~/.ssh/id_ed25519.pub \
-    --server-type <sku>
+Otherwise it is the operator guide's job, in full:
+[Operator quickstart](../operator-guide/quickstart.md) takes a blank Hetzner
+account to a self-managing cluster. Follow it and come back. This page used to
+carry an abridged copy, and the abridgement had already drifted — it ran
+`apprafter doctor` *after* the paid server existed, which is the ordering the
+operator guide fixed.
 
-apprafter up          # alias for it: apprafter bootstrap-all
-# ↳ provisions the server with cloud-init k3s, waits for the node,
-#   then bootstraps Cilium + Gateway API + Argo CD + the platform
-#   stack (operator, admission webhook, cert-manager). ~3 min.
+The short version, so you know what you are being sent to do: register a target
+with `apprafter target add`, then bring the whole tier-1 stack up with
+`apprafter up`. About three minutes.
 
-apprafter doctor                 # self-diagnostic; exits 1 on FAIL
-```
-
-!!! warning "There is no default server type — you must pick one"
-    Provisioning is a spending decision, so AppRafter refuses to guess
-    ([ADR 0056](../adr/0056-machine-picker.md)). If no server type is
-    set anywhere, `apprafter up` fails with
-    `apprafter::provider::server_type_not_selected` rather than
-    silently billing you for a class you did not choose.
-
-    On a TTY you do not choose it separately: `apprafter target add prod`
-    ends in the live `(region × SKU)` matrix with prices and availability,
-    and saves the choice on the target. The flag form above is for a
-    machine with no TTY.
-
-    `apprafter target machine` re-opens that matrix on its own, and is the
-    **only** way to change the type later: `target add <existing>` errors,
-    `--renew` is credentials-only, and once a server exists the change is a
-    rebuild rather than an edit. For one run, `apprafter up --server-type
-    <sku>` or `APPRAFTER_SERVER_TYPE`.
-
-`up` runs `apply` → kubeconfig poll → `cluster-bootstrap`
-under one progress display. Preview it first with
-`apprafter up --dry-run`, or run the phases individually with
-`apprafter apply`, `apprafter kubeconfig --refresh`, and
-`apprafter cluster-bootstrap` (alias `cb`). The full lifecycle and
-day-2 commands are in the
-[operator quickstart](../operator-guide/quickstart.md).
-
-`apprafter doctor` prints one line per check — six for the target,
-four for the environment — then a one-line summary:
-
-```text
-Checking target `prod`...
-  ✓ Config file readable (~/.config/apprafter/targets/prod/config.yaml)
-  ✓ Credentials file present (mode 0600) (~/.config/apprafter/targets/prod/credentials.yaml)
-  ✓ Provider `hetzner-cloud` supported
-  ✓ Token format valid (64 chars, alphanumeric)
-  ✓ Token verified against provider API (Hetzner Cloud /v1/locations, 84 ms)
-  ✓ SSH key readable (~/.ssh/id_ed25519.pub (ssh-ed25519))
-
-Checking environment...
-  ✓ `kubectl` on PATH (Client Version: v1.35.3)
-  ✓ `helm` on PATH (v3.19.1+gv3.19.1)
-  ✓ `ssh` on PATH (OpenSSH_10.2p1, OpenSSL 3.6.1 27 Jan 2026)
-  ✓ DNS resolves `api.hetzner.cloud` (443/tcp)
-
-10 checks for target `prod`: 10 passed. All good — ready for `apprafter init` / `apprafter apply`.
-```
-
-The tool versions in parentheses are whatever you have installed, and
-the API-ping timing varies. `--no-ping` skips the Hetzner round-trip
-(useful offline); the check then reports `⚠ … (skipped — --no-ping)`
-and the summary counts it as a warning.
-
-A non-zero exit (any `✗ FAIL`) means something is broken — see
-[Troubleshooting](../operator-guide/troubleshooting.md).
-
-You do not need `KUBECONFIG` for anything on this page — the
-`apprafter app` commands resolve the cluster from the target store
-themselves.
+You do not need `KUBECONFIG` for anything on this page — the `apprafter app`
+commands resolve the cluster from the target store themselves.
 
 ??? note "If you want a shell against the cluster anyway"
 
@@ -392,88 +330,49 @@ app rollback my-service` reverts to the previous revision.
 
 ## 5. Release to production on a Cloudflare domain
 
-The production path serves your app over HTTPS through Cloudflare:
-TLS terminates at the cluster Gateway on a Cloudflare Origin CA
-certificate, and the node's `80`/`443` are firewalled so the only way
-in is through Cloudflare. This summarizes the
-[connect-a-domain runbook](../operator-guide/connect-a-domain.md) —
-see it for the full DNS detail.
+Two halves, and only the second one is yours.
 
-**5.1 — Lock the origin firewall to Cloudflare (once per cluster):**
+**The cluster half is done once, by whoever operates the cluster**: lock the
+origin firewall to Cloudflare, mint and import an Origin CA certificate, register
+the zone, and point DNS at the node. It is a runbook with real DNS waits and a
+firewall you can lock yourself out behind, so it lives where it belongs —
+[Connect a domain](../operator-guide/connect-a-domain.md), with
+[Cloudflare Origin CA certificate](../operator-guide/cloudflare-origin-cert.md)
+for the certificate. If `apprafter target domain list` already shows your zone,
+it is done.
 
-```sh
-apprafter target firewall cloudflare-origin enable
-# ↳ restricts inbound 80/443 to Cloudflare's published IP ranges.
-#   SSH, the Kubernetes API, and WireGuard keep their access.
-```
-
-**5.2 — Point the domain at Cloudflare and import the origin cert.**
-In the Cloudflare dashboard add the site for `<zone>`, set your
-registrar's nameservers to Cloudflare's, and set **SSL/TLS → Full
-(strict)**. Mint a **Cloudflare Origin CA** certificate for `<zone>`
-+ `*.<zone>` (full steps:
-[Cloudflare Origin CA certificate](../operator-guide/cloudflare-origin-cert.md))
-and import it:
-
-```sh
-apprafter target cert import cf-origin-cert-<sanitized-zone> \
-    --cert ./origin.pem --key ./origin.key
-# ↳ <sanitized-zone> = zone with dots as dashes, e.g.
-#   cf-origin-cert-example-com for example.com.
-```
-
-**5.3 — Register the zone** (adds an apex + wildcard `:443` listener
-pair on the Gateway, both terminating TLS from that cert):
-
-```sh
-apprafter target domain add <zone> --cert cf-origin-cert-<sanitized-zone>
-```
-
-**5.4 — DNS records.** Get the node's public IPs and add **Proxied**
-(orange-cloud) records in Cloudflare's DNS for the zone:
-
-```sh
-apprafter target ip              # prints the A (IPv4) + AAAA (IPv6) values
-```
-
-| Type  | Name  | Value         |
-|-------|-------|---------------|
-| A     | `@`   | `<node-IPv4>` |
-| AAAA  | `@`   | `<node-IPv6>` |
-| CNAME | `www` | `<zone>`      |
-
-**5.5 — Make the application public.** In
-`apprafter/Application.cue`, open up the existing `expose` block. The
-`bun` skeleton scaffolds `port: 3000` with `network` and `hostname`
-present but commented out — uncomment both, set the hostname, and keep
+**Your half is one field.** In `apprafter/Application.cue`, open up the existing
+`expose` block. The `bun` skeleton scaffolds `port: 3000` with `network` and
+`hostname` present but commented out — uncomment both, set the hostname, and keep
 whatever port your process actually binds:
 
 ```cue
 spec: base: expose: {
     port:     3000             // your service's listen port
     network:  "public"         // was commented out; default is "internal"
-    hostname: "<zone>"         // or a subdomain, e.g. "app.<zone>"
+    hostname: "app.<zone>"     // the apex, or a subdomain of a registered zone
 }
 ```
 
-TLS is on by default for public services (the route attaches to
-`:443`). Commit and push — Argo CD re-syncs and the operator renders
-an HTTPRoute binding the host to your Service:
+TLS is on by default for a public service. Commit and push — Argo CD re-syncs
+and your Service picks up a route on the Gateway:
 
 ```sh
-git commit -am "feat: expose my-service on <zone>"
+git commit -am "feat: expose my-service on app.<zone>"
 git push
 apprafter app status my-service  # watch it return to Synced + Healthy
 ```
 
-**5.6 — Verify** the app serves through Cloudflare, and that the
-origin firewall blocks a direct-to-node bypass:
+Then check it serves:
 
 ```sh
-curl -v https://<zone>/                       # served by your app via Cloudflare
-apprafter target domain list                  # registered zones + the apps using each
-curl --resolve <zone>:443:<node-ip> https://<zone>/   # refused / times out
+curl -v https://app.<zone>/
 ```
+
+!!! note "Going public is a gated change"
+    `network: internal` → `public`, and adding a hostname to a public app, are
+    both edits the platform pauses for approval rather than rolling out. See
+    [When a change needs approval](when-a-change-needs-approval.md).
 
 ## What you just got
 
