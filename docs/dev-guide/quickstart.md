@@ -180,10 +180,7 @@ except a cluster that exists.
 
 Otherwise it is the operator guide's job, in full:
 [Operator quickstart](../operator-guide/quickstart.md) takes a blank Hetzner
-account to a self-managing cluster. Follow it and come back. This page used to
-carry an abridged copy, and the abridgement had already drifted — it ran
-`apprafter doctor` *after* the paid server existed, which is the ordering the
-operator guide fixed.
+account to a self-managing cluster. Follow it and come back.
 
 The short version, so you know what you are being sent to do: register a target
 with `apprafter target add`, then bring the whole tier-1 stack up with

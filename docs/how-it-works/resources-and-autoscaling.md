@@ -128,10 +128,10 @@ Three further traps if you do edit them:
   while lowering it below `32Mi` changes nothing and reports no error.
   Recommendations stop at `32Mi` either way.
 
-That last one is a fix, not a quirk: the floor used to sit unpinned at the
-autoscaler's own default of 250Mi, which put it *above* `minAllowed` and made
-the clamp unreachable in the other direction — every application recommending an
-identical 250Mi. platform-stack 0.2.56 pinned it to the seed.
+That last one follows from the floor being pinned to the seed rather than
+left at the autoscaler's own default: an unpinned floor sits *above*
+`minAllowed`, which makes the clamp unreachable from the other direction and
+has every application recommending the same value.
 
 ## Reading a rejected manifest
 

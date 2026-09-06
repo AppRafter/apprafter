@@ -322,9 +322,7 @@ Error: apprafter::cli::other
 
 The rebuild itself — the two project topologies it can take, the sequence for
 each backup backend, what to verify afterwards and what the outage costs — is
-[Moving to a bigger machine](moving-to-a-bigger-machine.md). It used to be
-documented twice, here and on the backup page, and the two copies had already
-started to disagree about which one was authoritative.
+[Moving to a bigger machine](moving-to-a-bigger-machine.md).
 
 The region is the same story: a running machine cannot move between regions
 either, and the move is the same rebuild.

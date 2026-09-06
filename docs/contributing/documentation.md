@@ -272,6 +272,28 @@ what a reimplementation would revisit. In a guide it therefore has one of two en
 A citation never stays in a guide because it "might be useful". If the mechanism is worth reaching,
 link the mechanism page — that page is where the decision is cited from.
 
+### 5. Nothing about what the page used to say
+
+A published page describes the product as it is. It does not describe its own
+history, and it does not describe the product's — not "this used to be
+documented twice", not "the abridged copy had drifted", not "before v0.2.43
+there was a default machine type".
+
+Every one of those is true, and every one of them costs a reader who has never
+seen the old version a paragraph to work out that it does not apply to them. It
+is also self-perpetuating: the retrospective is itself something a later
+retrospective can be written about.
+
+Where it goes instead: the changelog for what changed, an ADR amendment for a
+decision that was overturned, and `docs/measurements/` for a defect being
+tracked. All three have readers who want exactly that, and none of them is
+someone following a recipe.
+
+The one exception is behaviour a reader can still meet — "a cluster provisioned
+before this shipped will not have it, and `apprafter node status` says so". That
+is not history; it is a state their cluster can be in today, and the test for it
+is whether the sentence tells them something to *do*.
+
 ### Worked example
 
 From `operator-guide/postgres.md`, before the 2.20c rework:
