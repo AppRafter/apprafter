@@ -40,7 +40,7 @@
 use cli_core::{CliError, Result, Tier};
 use cli_state::State;
 use serde_json::Value;
-use tracing::info;
+use tracing::debug;
 
 use crate::commands::app_rollup::{
     print_pinned_applications, print_problem_applications, ClusterApplications,
@@ -72,9 +72,22 @@ pub(crate) enum PlatformRead<'a> {
 pub fn run() -> Result<()> {
     let resolved = resolve_state_paths(None)?;
     let state = State::load_or_default(&resolved.paths)?;
-    info!(?state, target = %resolved.target_name, "status invoked");
+    // The target NAME, never the state. `?state` was inherited from the
+    // skeleton this command replaced, where the whole struct was the
+    // output; here it prints the entire store — cluster name, tier,
+    // provider, the Hetzner block — above a report that says all of it
+    // again, more legibly. At `debug` rather than `info` for the same
+    // reason: this is a read-only command whose output IS the answer.
+    debug!(target = %resolved.target_name, "status invoked");
 
-    for line in target_header_lines(&resolved.target_name, &state) {
+    // The target's own configuration, for the fields the state file does
+    // not carry. Best-effort: an unreadable target is not a reason to
+    // withhold the rest of the report.
+    let configured_tier = cli_core::target::load_target(&resolved.store, &resolved.target_name)
+        .ok()
+        .and_then(|t| t.config.default_tier);
+
+    for line in target_header_lines(&resolved.target_name, &state, configured_tier.as_deref()) {
         println!("{line}");
     }
 
@@ -143,15 +156,28 @@ pub fn run() -> Result<()> {
 /// the only part that is true even when nothing else can be read — and
 /// because an operator with several targets needs to know which one the
 /// rest of the output is about before reading it.
-pub(crate) fn target_header_lines(target: &str, state: &State) -> Vec<String> {
+pub(crate) fn target_header_lines(
+    target: &str,
+    state: &State,
+    configured_tier: Option<&str>,
+) -> Vec<String> {
     let text = |v: Option<String>| v.unwrap_or_else(|| "(unset)".to_string());
+    // The tier lives in TWO places and the state file is the one that is
+    // usually empty. `State.tier` is written by `apprafter init`; a
+    // cluster stood up the documented way — `target add` then `up` —
+    // never goes through `init`, so its state carries no tier while its
+    // target config carries `default_tier` and `platform status` prints
+    // "tier 1" off the PlatformStack. Reading only the state reported
+    // `(unset)` for a cluster whose tier three other surfaces knew.
+    let tier = state
+        .tier
+        .as_ref()
+        .map(Tier::to_string)
+        .or_else(|| configured_tier.map(str::to_string));
     vec![
         format!("Target: {target}"),
         format!("  cluster:  {}", text(state.cluster_name.clone())),
-        format!(
-            "  tier:     {}",
-            text(state.tier.as_ref().map(Tier::to_string))
-        ),
+        format!("  tier:     {}", text(tier)),
         format!("  provider: {}", text(state.provider.clone())),
     ]
 }
@@ -235,7 +261,7 @@ mod tests {
 
     #[test]
     fn the_header_names_the_target_the_rest_of_the_output_is_about() {
-        let lines = target_header_lines("prod", &state());
+        let lines = target_header_lines("prod", &state(), None);
         assert!(lines[0].contains("prod"), "{lines:?}");
         assert!(
             lines.iter().any(|l| l.contains("apprafter-prod")),
@@ -252,9 +278,32 @@ mod tests {
         // `target add` writes a target long before `apply` writes a cluster
         // name. The header must still render — this is the state a reader is
         // in the first time they run the command.
-        let lines = target_header_lines("fresh", &State::default());
+        let lines = target_header_lines("fresh", &State::default(), None);
         assert_eq!(lines.len(), 4, "{lines:?}");
         assert!(lines.iter().any(|l| l.contains("(unset)")), "{lines:?}");
+    }
+
+    #[test]
+    fn the_tier_falls_back_to_the_target_when_the_state_file_has_none() {
+        // The live regression. `State.tier` is written by `apprafter
+        // init`; a cluster stood up the documented way — `target add`
+        // then `up` — never runs it, so the header read `(unset)` on a
+        // cluster whose tier `target show` and `platform status` both
+        // printed.
+        let lines = target_header_lines("dev", &State::default(), Some("solo"));
+        let tier = lines.iter().find(|l| l.contains("tier:")).unwrap();
+        assert!(tier.contains("solo"), "{lines:?}");
+    }
+
+    #[test]
+    fn the_state_file_still_wins_when_it_has_a_tier() {
+        // The target's is a DEFAULT for the next provision; the state's
+        // is what was actually provisioned. When they disagree, the
+        // header must report what is running.
+        let lines = target_header_lines("dev", &state(), Some("prod"));
+        let tier = lines.iter().find(|l| l.contains("tier:")).unwrap();
+        assert!(tier.contains("solo"), "{lines:?}");
+        assert!(!tier.contains("prod"), "{lines:?}");
     }
 
     #[test]

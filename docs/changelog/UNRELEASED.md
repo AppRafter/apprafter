@@ -9,6 +9,47 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.62 — four defects a live run found in `apprafter status` (2.23h, unreleased)
+
+The roll-up shipped in v0.2.60 was run against a real cluster for the
+first time. Everything below was invisible to the unit tests, the gates
+and the review that passed it.
+
+### Fixed
+
+- **Two healthy conditions were reported as problems.** A clean cluster
+  read `2 condition(s) not healthy`, naming `Ready=True` (the parent
+  Application *is* healthy) and `UnauthorizedSourceModification=False`
+  (no foreign writer *has* been detected). Both readings were inverted,
+  by one omission: the polarity table classified six condition types and
+  the operator declares **eight**.
+
+  The completeness test that existed to prevent exactly this could not:
+  its list of six came from the same grep that produced the table, so it
+  asserted that the build classified what the build already classified.
+  It now reads the operator's own `COND_*` declarations, with a floor on
+  the count so a renamed prefix cannot leave it judging an empty list.
+  Reverting the fix makes it fail — checked.
+
+- **`apprafter status` printed the whole state store above its report.**
+  An `info!(?state, …)` inherited from the skeleton the command
+  replaced, where the struct *was* the output. The smoke test now
+  asserts the dump is absent.
+
+- **`Node disk:` could print forever from a poisoned cache.** Freshness
+  was `now.saturating_sub(fetched_at)`, which is `0` for a stamp in the
+  future — inside every TTL, so such an entry never expires. A machine
+  here carried a stamp in the year 5138 and printed `Node disk: warm`
+  above every command for two days, on a node with 69% free. A future
+  stamp is now a miss.
+
+- **The tier read `(unset)` on a cluster that has one.** `State.tier` is
+  written by `apprafter init`; a cluster stood up the documented way —
+  `target add` then `up` — never runs it. The header falls back to the
+  target's configured tier, with the state file still winning when it
+  has one: the target's is a default for the next provision, the state's
+  is what was actually provisioned.
+
 ## cli v0.2.61 + landing — the documented install command works (2.23b, unreleased)
 
 ### Fixed

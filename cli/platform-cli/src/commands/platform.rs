@@ -232,8 +232,16 @@ pub(crate) enum ConditionPolarity {
 /// writes, so growing one there forces a decision here.
 pub(crate) fn condition_polarity(type_: &str) -> Option<ConditionPolarity> {
     match type_ {
-        "Synced" | "UpstreamReachable" => Some(ConditionPolarity::Positive),
-        "YankedVersion" | "NodeDiskPressure" => Some(ConditionPolarity::Negative),
+        // `Ready` mirrors the parent platform Application's health, and
+        // `Synced` its agreement with the desired state: True is the
+        // good news on both.
+        "Ready" | "Synced" | "UpstreamReachable" => Some(ConditionPolarity::Positive),
+        // `UnauthorizedSourceModification=True` means a foreign writer
+        // WAS detected on `spec.source`. Reading it as positive is how
+        // the roll-up came to call a clean cluster unhealthy.
+        "YankedVersion" | "NodeDiskPressure" | "UnauthorizedSourceModification" => {
+            Some(ConditionPolarity::Negative)
+        }
         // On the version line.
         "UpgradeAvailable" => Some(ConditionPolarity::ReportedElsewhere),
         // Gets its own section, which names the plans rather than just
@@ -1181,26 +1189,83 @@ mod tests {
 
     #[test]
     fn every_condition_type_the_operator_writes_is_classified() {
-        // Completeness, not coverage: an operator that grows a seventh
-        // condition type must force a polarity decision here rather than
-        // defaulting into the unclassified bucket unnoticed. The list is
-        // committed on purpose — the operator is a separate cargo
-        // workspace, so it cannot be derived at compile time, and a
-        // hand-written list that nothing checks is folklore.
-        for known in [
-            "Synced",
-            "UpstreamReachable",
-            "YankedVersion",
-            "NodeDiskPressure",
-            "UpgradeAvailable",
-            "MigrationPending",
-        ] {
+        // Completeness, DERIVED. The first version of this test carried a
+        // hand-written list of six types taken from a grep, and asserted
+        // that this build classified all six — which it did, because the
+        // grep and the list were the same act. It could not see the two
+        // types the grep had missed (`Ready`,
+        // `UnauthorizedSourceModification`), so the roll-up shipped
+        // reporting both of them as unhealthy on a healthy cluster and
+        // this test stayed green through it.
+        //
+        // It now reads the operator's own declarations. The operator is a
+        // separate cargo workspace, so this cannot be a compile-time
+        // dependency — but it is the same repository, and the file below
+        // is where every PlatformStack condition type is declared. Adding
+        // a ninth there fails this test until somebody decides its
+        // polarity here.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../operator/operator-controllers/platform-stack/src/status.rs");
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "{}: the operator's condition declarations could not be read, so this \
+                 test would have judged nothing: {e}",
+                path.display()
+            )
+        });
+        let declared: Vec<String> = src
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("pub const COND_"))
+            .filter_map(|l| l.split_once("= \""))
+            .filter_map(|(_, rest)| rest.split_once('"'))
+            .map(|(name, _)| name.to_string())
+            .collect();
+        // Non-vacuity: a rename of the `COND_` prefix, or a move of the
+        // file, would otherwise leave this test asserting over an empty
+        // list and reporting success.
+        assert!(
+            declared.len() >= 8,
+            "only {declared:?} parsed out of {} — the declaration shape changed, and an \
+             empty list would have passed",
+            path.display()
+        );
+        for name in &declared {
             assert!(
-                condition_polarity(known).is_some(),
-                "`{known}` is written by the platform-stack controller and \
-                 this build does not classify it"
+                condition_polarity(name).is_some(),
+                "`{name}` is declared by the platform-stack controller and this build \
+                 does not classify it, so `apprafter status` would report it as a problem \
+                 whatever its value"
             );
         }
+    }
+
+    #[test]
+    fn the_two_conditions_a_healthy_cluster_carries_are_not_problems() {
+        // The live regression, as observed: a healthy cluster reported
+        // "2 condition(s) not healthy" naming `Ready=True` (the parent
+        // Application IS healthy) and `UnauthorizedSourceModification=False`
+        // (no foreign writer HAS been detected). Both readings were
+        // inverted, both by the same omission.
+        let stack = json!({ "status": { "conditions": [
+            { "type": "Ready", "status": "True",
+              "reason": "Healthy", "message": "parent platform Application reports Healthy" },
+            { "type": "UnauthorizedSourceModification", "status": "False",
+              "reason": "Clean", "message": "no foreign writer detected on spec.source" },
+        ]}});
+        assert!(unhealthy_condition_rows(&stack).is_empty());
+    }
+
+    #[test]
+    fn the_same_two_conditions_are_problems_when_they_invert() {
+        // The other half, which is what makes the test above a
+        // classification and not a suppression.
+        let stack = json!({ "status": { "conditions": [
+            { "type": "Ready", "status": "False",
+              "reason": "Degraded", "message": "parent platform Application is Degraded" },
+            { "type": "UnauthorizedSourceModification", "status": "True",
+              "reason": "ForeignWriter", "message": "spec.source was written by argocd" },
+        ]}});
+        assert_eq!(unhealthy_condition_rows(&stack).len(), 2);
     }
 
     fn frozen_now() -> DateTime<Utc> {

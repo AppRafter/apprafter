@@ -174,6 +174,31 @@ fn cache_path() -> PathBuf {
     base.join("apprafter").join("node-disk-check.json")
 }
 
+/// Whether an entry stamped `fetched_at_secs` is still within the TTL at
+/// `now`.
+///
+/// Pure, and separated from the read for one reason: a stamp in the
+/// FUTURE must be a miss. `now.saturating_sub(future)` is `0`, which is
+/// inside every TTL there is, so an entry stamped ahead of the clock
+/// never expires — it is cached forever, and the banner it holds prints
+/// before every command until somebody deletes the file by hand.
+///
+/// That is not hypothetical. A machine here carried
+/// `{"message":"warm","fetched_at_secs":99999999999}` — a stamp in the
+/// year 5138, from a hand-written probe that outlived its purpose — and
+/// printed `Node disk: warm` above every command for two days, on a
+/// cluster whose node had 69% free.
+///
+/// The version-check cache next door already refuses a cached value it
+/// cannot make sense of, for the same class of reason. This is that
+/// guard, on the field this cache can be poisoned through.
+fn is_fresh(fetched_at_secs: u64, now: u64) -> bool {
+    if fetched_at_secs > now {
+        return false;
+    }
+    now - fetched_at_secs < CACHE_TTL.as_secs()
+}
+
 fn read_fresh_cache(path: &PathBuf) -> Option<CachedPressure> {
     let raw = fs::read_to_string(path).ok()?;
     let cached: CachedPressure = serde_json::from_str(&raw).ok()?;
@@ -181,7 +206,7 @@ fn read_fresh_cache(path: &PathBuf) -> Option<CachedPressure> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    (now.saturating_sub(cached.fetched_at_secs) < CACHE_TTL.as_secs()).then_some(cached)
+    is_fresh(cached.fetched_at_secs, now).then_some(cached)
 }
 
 fn write_cache(path: &PathBuf, value: &CachedPressure) -> std::io::Result<()> {
@@ -198,6 +223,28 @@ mod tests {
     // -----------------------------------------------------------------
     // The cache-or-probe decision, with no kubectl and no clock
     // -----------------------------------------------------------------
+
+    #[test]
+    fn a_stamp_from_the_future_is_a_miss_not_an_immortal_hit() {
+        // The live defect. `now.saturating_sub(future)` is 0, which is
+        // inside every TTL, so an entry stamped ahead of the clock was
+        // cached forever — and the banner it held printed above every
+        // command until the file was deleted by hand.
+        assert!(!super::is_fresh(99_999_999_999, 1_757_000_000));
+        // Clock skew of a few seconds is the same shape and the same
+        // answer: re-probe rather than trust a stamp we cannot have
+        // written.
+        assert!(!super::is_fresh(1_757_000_010, 1_757_000_000));
+    }
+
+    #[test]
+    fn a_stamp_inside_the_window_is_a_hit_and_one_outside_is_not() {
+        // The ordinary cases, asserted beside the one above so the guard
+        // cannot be "fixed" into refusing everything.
+        assert!(super::is_fresh(1_757_000_000, 1_757_000_000));
+        assert!(super::is_fresh(1_757_000_000, 1_757_000_299));
+        assert!(!super::is_fresh(1_757_000_000, 1_757_000_300));
+    }
 
     #[test]
     fn a_fresh_cache_short_circuits_before_kubectl_runs() {

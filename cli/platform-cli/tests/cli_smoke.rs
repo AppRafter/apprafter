@@ -191,7 +191,14 @@ fn status_prints_the_target_header_without_a_cluster() {
         .assert()
         .success()
         .stdout(contains("Target:"))
-        .stdout(contains("provider:"));
+        .stdout(contains("provider:"))
+        // The command's output IS the answer, so nothing may print the
+        // state struct above it. The skeleton logged `?state` at `info`,
+        // which dumped the whole store — cluster, tier, provider, the
+        // Hetzner block — before the report that says the same things
+        // legibly.
+        .stderr(predicates::str::contains("State {").not())
+        .stderr(predicates::str::contains("HetznerCloudState").not());
 }
 
 #[test]
