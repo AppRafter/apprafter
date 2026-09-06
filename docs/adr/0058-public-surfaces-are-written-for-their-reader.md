@@ -286,6 +286,36 @@ the stricter one costs a reader nothing they cannot reach in one more click.
 unaffected. `license.md`'s citations in particular are the licence-change record and are
 load-bearing where they are.
 
+## Amendment — where the repository may be named, 2026-09-06
+
+The sibling of the citation amendment, one surface in. **A guide does not send its reader into the
+source tree.** A link to a source file, or a path in an implementation tree named as the authority
+for a claim, answers *how does this work* — and for a schema, *what is the implementation of the
+field set*. Both are the mechanism layer's questions. So a guide links the mechanism page, that page
+names the source, and an ADR is better still where one covers it, because the code moves and the
+decision does not.
+
+Two surfaces, judged differently, and the difference is what makes the rule usable:
+
+- **A link** is a destination the reader clicks, and the published site has no address outside
+  `docs/`. Any target that leaves it is wrong on a guide, whatever it points at.
+- **A code span** is a name the reader greps for, and some of those names are legitimately theirs to
+  open. The publishing runbook names the Dockerfile it tells you to edit; the image guide names the
+  template it tells you to copy. A span is wrong only when it opens on a tree a guide's reader has
+  no business in.
+
+Two things this does **not** reach. The issue tracker, releases and pull requests are places a
+reader goes to participate in the project, and telling them where is part of a guide's job. And a
+path the reader creates in their own checkout is not a reference to this repository at all.
+
+What the sweep that produced this rule found is the argument for it. Of twenty-seven references
+across the guide corpus, seventeen were deletions rather than reroutings — the sentence existed only
+to point at the tree. Five sent a manifest author to the CUE schema as "the authoritative field
+list", where the guide's own field table already was that list and the schema additionally declares
+four `needs` types the platform does not ship, so following the link invited writing a key that
+compiles and never provisions. Two sent an operator to `spec.md`, which is deliberately out of the
+published site because it is the roadmap and names capabilities that do not exist yet.
+
 ## Amendment — the feature ledger, 2026-09-06
 
 `docs/status.md` is a fifth public surface, and the three-surface test above does not reach it. It
