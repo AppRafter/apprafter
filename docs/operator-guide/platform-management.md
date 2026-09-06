@@ -56,9 +56,10 @@ status:
       message: "0.2.0 → 0.2.1 (safe)"
 ```
 
-See §3.11 of
-[the repository's architectural specification](https://github.com/apprafter/apprafter/blob/master/spec.md)
-— a roadmap document that is not published on this site.
+What the controller does with `spec.channel`, `spec.pin` and
+`spec.autoUpgrade` — and why `status.availableVersion` can sit ahead of
+`status.currentVersion` with no upgrade happening — is on
+[How the platform upgrades itself](../how-it-works/platform-upgrades.md#where-a-version-comes-from).
 
 ## Release channels
 
@@ -247,6 +248,3 @@ yet shipped.
   why the platform reconciles through Argo CD rather than through the CLI,
   where a chart version comes from, and what decides whether an upgrade is
   applied or held.
-- [The repository's architectural specification](https://github.com/apprafter/apprafter/blob/master/spec.md)
-  — §3.11 (PlatformStack), §3.8 (MigrationPlan). A roadmap document,
-  not published on this site.

@@ -45,7 +45,7 @@ deliberately names capabilities that do not exist yet.
 
 ## What is checked
 
-Fifteen classes. The first five resolve a claim about the product, and
+Sixteen classes. The first five resolve a claim about the product, and
 **none of them is selected by a fence's language tag** — obligations
 come from a block's content, so deleting a tag cannot quietly turn a
 finding green. Nor can deleting the fence: an indented block and an
@@ -62,6 +62,7 @@ worth knowing, set out below.
 | `link-text-path` | A link whose visible **text** is a filename or a repository path, on a link that goes to another `.md` page. The href is not this class's business — see below. |
 | `adr-citation-form` | An ADR cited as bare text rather than as a link to it. A citation the reader cannot follow leaves them searching a directory of four-digit filenames. A citation shown as literal text — in a fence or a code span — is demonstrating the spelling, and is not a citation. |
 | `adr-citation-placement` | An ADR cited anywhere in an operator- or developer-guide file. A guide answers *what do I run*; a decision's *why* is two surfaces out. Move the citation to the mechanism page the guide links, and link that. |
+| `code-link-placement` | A guide page linking to a file in the repository — a GitHub `blob`/`tree` URL, or a relative target that resolves outside `docs/`. A guide links the mechanism page; that page links the source. The issue tracker, releases and third-party documentation are not code. |
 | `unlabelled-fence` | A fence with no info string. |
 | `unterminated-fence` | A fence that never closes, so everything below it renders as code. |
 | `unclosed-pre` | An HTML `pre` element that never meets its closing tag. The same failure as the row above with a different edit behind it, which is why it is its own class. |

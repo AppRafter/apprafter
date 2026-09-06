@@ -110,6 +110,15 @@ spec: base: expose: {
 Apply the application as usual. The operator renders an HTTPRoute that attaches
 the host to the application's Service.
 
+One that is live, if you want the finished shape: this documentation site is
+served from `docs.apprafter.dev`, a subdomain of an already-registered zone, so
+it needed no new zone and no new certificate — and its `expose` block is
+exactly the three fields above
+([worked example](../how-it-works/deploying-the-docs-site.md)).
+[The landing site and its CMS](../how-it-works/deploying-the-landing-and-cms.md)
+is the two-host version of the same thing: the apex on one application and
+`cms.` on another.
+
 ## 3. Verify
 
 - **Per zone** — the page loads through Cloudflare with a Cloudflare edge

@@ -75,6 +75,14 @@ cross-field rule (image must be reachable through `spec.base.image`
 or every `spec.environments[*].image`). The CRD OpenAPI schema
 rejects negative replicas and out-of-range port numbers.
 
+Two complete manifests, if you would rather read one than a field table:
+[this documentation site](../how-it-works/deploying-the-docs-site.md#the-manifest-in-full)
+is little more than `image`, `replicas` and a public `expose`, and
+[the landing site and its CMS](../how-it-works/deploying-the-landing-and-cms.md#the-manifests-in-full)
+adds a `needs.pg`, one `env` value bound to a claim field and another bound to a
+sealed secret. Each page also says what its manifest deliberately leaves out,
+which is the half a field table cannot show you.
+
 ### Declaring dependencies — the `needs` block
 
 `spec.base.needs` declares the backing services and storage your
@@ -389,18 +397,19 @@ a running Deployment.
 
 ## Where to look next
 
-- [`schemas/v1alpha1/application.cue`](https://github.com/apprafter/apprafter/blob/master/schemas/v1alpha1/application.cue)
-  — the CUE schema `#Application` and `#ApplicationSpec` are defined
-  here. This is the authoritative field list.
-- [`operator/operator-core/src/application.rs`](https://github.com/apprafter/apprafter/blob/master/operator/operator-core/src/application.rs)
-  — the Rust mirror of the schema.
-- [`operator/operator-rendering/src/lib.rs`](https://github.com/apprafter/apprafter/blob/master/operator/operator-rendering/src/lib.rs)
-  — `effective_spec()`, where the per-environment merge rules above are
-  implemented.
+- [Per-environment deploy](../how-it-works/per-environment-deploy.md) —
+  what the operator folds onto `spec.base` when it renders, field by
+  field, and why the environment belongs to the deployment rather than
+  to the manifest.
 - [GitOps and the CUE plugin](../how-it-works/gitops-and-the-cue-cmp.md) —
   what happens between the push and a running Deployment, and why the
   `claim` binding resolves without you declaring it.
-- [`examples/applications/parser.cue`](https://github.com/apprafter/apprafter/blob/master/examples/applications/parser.cue)
-  — a worked multi-environment example.
+- [Worked example: the landing site and its CMS](../how-it-works/deploying-the-landing-and-cms.md)
+  — two manifests from this repository in full, with a declared Postgres
+  dependency, per-environment overrides on both, and a second copy of one
+  application at another hostname.
+- [Worked example: this documentation site](../how-it-works/deploying-the-docs-site.md)
+  — the simplest shape there is, and a section on what its manifest
+  deliberately leaves out.
 - [Developer quickstart](./quickstart.md) — scaffold and
   register a first Application end-to-end.

@@ -71,6 +71,11 @@ backend's connection fields — are a different mechanism with no sealing
 step at all. Both are covered together in
 [Writing Application.cue](application-cue.md#referencing-claims-and-secrets).
 
+All three forms in one real manifest: the landing CMS binds `PAYLOAD_SECRET` to
+a sealed secret and `DATABASE_URL` to a claim field, beside plain literals, and
+its `prod` override adds a second sealed reference —
+[Worked example: deploying the landing site and its CMS](../how-it-works/deploying-the-landing-and-cms.md#the-manifests-in-full).
+
 ## Check that it arrived
 
 ```sh

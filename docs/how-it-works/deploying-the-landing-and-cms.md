@@ -79,6 +79,22 @@ The CMS:
 --8<-- "landing/cms/apprafter/Application.cue"
 ```
 
+## Two environments, and a second manifest — not the same thing
+
+Both manifests carry an `environments` block, and the CMS one is the richer of
+the two: its `dev` override turns the host internal and merges four `env`
+values, and its `prod` override adds one more literal and a second sealed
+reference. That is one manifest producing a different spec depending on which
+environment a deployment is registered as — the mechanism is
+[Per-environment deploy](per-environment-deploy.md).
+
+The preview host is **not** that. It is a separate file,
+`landing/web/apprafter/Application-preview.cue`, deployed as its own
+application, because it serves a different image stream rather than the same
+image configured differently. Reading `environments.dev` in the web manifest as
+"the preview host" is the mistake to avoid: they are two mechanisms that happen
+to produce a similar-looking internal deployment.
+
 ## What each one deliberately does not have
 
 **The CMS runs one replica, and that is a constraint rather than a choice.**

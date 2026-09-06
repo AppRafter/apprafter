@@ -56,6 +56,11 @@ are all available. The `claim` binding is generated from your own `needs`
 block, so referencing a field you did not provision fails to compile rather
 than at runtime.
 
+The same pair in a manifest that is actually deployed: the landing CMS declares
+`needs: pg: {}`, binds `DATABASE_URL: claim.pg.url`, and says nothing else about
+its database anywhere —
+[Worked example: deploying the landing site and its CMS](../how-it-works/deploying-the-landing-and-cms.md#the-database-is-declared-not-configured).
+
 Check it before you push:
 
 ```sh

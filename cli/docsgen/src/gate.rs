@@ -294,6 +294,33 @@ pub const ADR_CITATION_FORM: &str = "adr-citation-form";
 /// `license.md`, the reference and the ADR corpus are all untouched —
 /// `license.md`'s citations in particular ARE the licence-change record.
 pub const ADR_CITATION_PLACEMENT: &str = "adr-citation-placement";
+/// A guide page linking to a file in the repository.
+///
+/// The sibling of [`ADR_CITATION_PLACEMENT`], one surface in. A link to
+/// a source file answers *how does this work* — or, for a schema, *what
+/// is the implementation of the field set* — and a guide's reader is
+/// doing a task. So a guide links the mechanism page, the mechanism page
+/// links the source, and an ADR is better still where one exists,
+/// because code moves and a decision does not.
+///
+/// The corpus example that produced the rule: the `Where to look next`
+/// list on `dev-guide/application-cue.md` sent a manifest author to
+/// `operator/operator-rendering/src/lib.rs` for the per-environment
+/// merge rules the page had just finished explaining.
+///
+/// **What counts as the repository.** A GitHub `blob/` or `tree/` URL
+/// into this repository, and a relative link target that resolves
+/// outside `docs/`. Both are ways of leaving the published site for the
+/// source tree, and they are the same defect written twice.
+///
+/// **What does not.** The issue tracker, releases, discussions and pull
+/// requests are project surfaces rather than code — a guide telling a
+/// reader where to report a bug is doing its job. Third-party
+/// documentation is not this repository. And a path the reader creates
+/// in THEIR OWN checkout (`apprafter/Application.cue`) is not a
+/// reference to ours; it is never a link, which is what separates the
+/// two.
+pub const CODE_LINK_PLACEMENT: &str = "code-link-placement";
 /// An obligation count fell below the committed census: the corpus
 /// lost documented surface it used to have.
 ///
@@ -416,6 +443,15 @@ fn remedy(code: &str) -> &'static str {
              explains the behaviour, and let that page carry the citation — or, \
              where the sentence only name-drops the decision without telling the \
              reader anything to do, drop the clause"
+        }
+        CODE_LINK_PLACEMENT => {
+            "send the reader to the page that answers their question instead: a \
+             mechanism page under `how-it-works/` for how it works, the \
+             reference for what the field list is, a worked example for what a \
+             real manifest looks like. That page may link the source — and an \
+             ADR is better where one covers it, because the code moves and the \
+             decision does not. Where the sentence exists only to point at the \
+             tree, drop it"
         }
         LINK_TEXT_PATH => {
             "use the target page's nav title as the link text — the reader is on \
@@ -1569,6 +1605,21 @@ impl Gate {
             findings.push(finding(CODE_PATH, file, reference.line, message));
         }
 
+        // Where the repository may be linked from. A guide's reader is
+        // doing a task, and the source tree answers a different
+        // question — see [`CODE_LINK_PLACEMENT`]. Off the masked
+        // `prose` like the two scans below it, for their reason.
+        if is_guide(file) {
+            for (line, target) in repository_links(&prose, page_directory(file)) {
+                findings.push(finding(
+                    CODE_LINK_PLACEMENT,
+                    file,
+                    line,
+                    format!("`{target}` leaves the site for the repository"),
+                ));
+            }
+        }
+
         // Where a decision may be cited, and in what form.
         //
         // Off the masked `prose`, like the citation check further down
@@ -1988,6 +2039,72 @@ fn link_texts_naming_a_page(source: &str) -> Vec<(usize, String)> {
             }
             if text.ends_with(".md") || (text.contains('/') && !text.contains(' ')) {
                 out.push((i + 1, text.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Whether a link target leaves the published site for the repository.
+///
+/// Two shapes, because there are two ways to write the same thing:
+///
+/// * a GitHub `blob/` or `tree/` URL — the reader is sent to the source
+///   tree in a browser;
+/// * a relative target that resolves outside `docs/` — the same
+///   destination reached through the filesystem. `../../e2e/mvp.sh` from
+///   `docs/dev-guide/` is `e2e/mvp.sh`.
+///
+/// A GitHub URL that is NOT a file is left alone. The issue tracker,
+/// releases, discussions and pull requests are places a reader goes to
+/// participate in the project, and telling them where is part of a
+/// guide's job rather than a leak out of it.
+fn leaves_the_site_for_the_repository(target: &str, page_directory: &str) -> bool {
+    let path = target.split(['#', ' ']).next().unwrap_or(target);
+    if let Some(rest) = path.split_once("github.com/").map(|(_, r)| r) {
+        // `<org>/<repo>/<kind>/…` — the third segment says what the URL
+        // addresses, and only two kinds address a file.
+        let mut parts = rest.split('/').skip(2);
+        return matches!(parts.next(), Some("blob") | Some("tree"));
+    }
+    if path.starts_with("http") || path.starts_with("mailto:") || path.is_empty() {
+        return false;
+    }
+    // Resolve page-relative, the way MkDocs does, and ask where it
+    // landed. Normalised by walking the segments rather than by string
+    // surgery, so `docs/a/../../cli/x` and `../../cli/x` agree.
+    let mut segments: Vec<&str> = page_directory
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    !segments.first().is_some_and(|first| *first == "docs")
+}
+
+/// Every link on the page that leaves the site for the repository, with
+/// its line and its target.
+fn repository_links(source: &str, page_directory: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (i, line) in source.lines().enumerate() {
+        let mut at = 0;
+        while let Some(open) = line[at..].find("](") {
+            let open = at + open;
+            let Some(end) = line[open..].find(')') else {
+                break;
+            };
+            let end = open + end;
+            at = end + 1;
+            let target = &line[open + 2..end];
+            if leaves_the_site_for_the_repository(target, page_directory) {
+                out.push((i + 1, target.to_string()));
             }
         }
     }

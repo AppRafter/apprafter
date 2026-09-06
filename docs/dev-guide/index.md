@@ -39,6 +39,16 @@ filling it in.
   `apprafter app status` says while one is held, and how to get it
   moving. Several of them are additions, which is the surprising part.
 
+## A worked example
+
+- [The documentation site](../how-it-works/deploying-the-docs-site.md) and
+  [the landing site and its CMS](../how-it-works/deploying-the-landing-and-cms.md)
+  — two manifests that are actually deployed, read field by field: what each one
+  declares, and what each deliberately leaves out. The first is `image`,
+  `replicas` and a hostname; the second adds a `needs.pg`, `env` values bound to
+  a claim and to a sealed secret, and a second application in the same
+  namespace.
+
 ## Give it a dependency
 
 - **Platform services** — declaring `needs.{pg, redis, disk}` and
@@ -67,8 +77,6 @@ filling it in.
 
 - [The CLI reference](../reference/cli/index.md) — every
   subcommand + flag.
-- [`schemas/v1alpha1/application.cue`](https://github.com/apprafter/apprafter/blob/master/schemas/v1alpha1/application.cue)
-  — the authoritative `Application` field list.
 - [Reference](../reference/index.md) — the generated CLI pages, the
   environment variables, and where each CRD's field list lives.
 - [ADR index](../adr/README.md) — the decision behind each behaviour.

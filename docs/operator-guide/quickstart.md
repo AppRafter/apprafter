@@ -374,6 +374,3 @@ byte-identical to the pre-colour baseline.
   reference with every flag + alias.
 - [Developer quickstart](../dev-guide/quickstart.md) —
   scaffold and deploy a first Application.
-- [The CRD CUE schemas that admission validates
-  against](https://github.com/apprafter/apprafter/tree/master/schemas/v1alpha1)
-  — `schemas/v1alpha1/` in the AppRafter repository on GitHub.

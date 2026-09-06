@@ -223,10 +223,17 @@ apprafter app validate           # local cue render check (needs cue on PATH)
 git add . && git commit -m "feat: scaffold apprafter manifest"
 ```
 
-> **No app yet?** The `bun-http` example under
-> [The bun-http template](https://github.com/apprafter/apprafter/blob/master/examples/templates/bun-http/README.md)
-> is a runnable OneBun service (Bun.js + Effect.ts) you can copy as a
-> starting point.
+> **No app yet?** The `bun-http` example in the AppRafter repository is a
+> runnable OneBun service (Bun.js + Effect.ts) you can copy as a starting
+> point. [From source to a running image](./build-and-push.md) publishes
+> its Dockerfile in full, included from the file the repository ships.
+
+The scaffold gives you a skeleton; what a finished manifest looks like is
+easier to see in one that is actually running. Two are taken apart line by
+line: [the documentation site you are reading](../how-it-works/deploying-the-docs-site.md)
+— one image, two replicas, one hostname — and
+[the landing site and its CMS](../how-it-works/deploying-the-landing-and-cms.md),
+which adds a declared database and a second application beside it.
 
 ## 3. Build and push the image
 
@@ -428,5 +435,5 @@ Drop the `--yes` to be prompted for confirmation first.
   guide — the full public-ingress runbook.
 - [operator quickstart](../operator-guide/quickstart.md) — the full
   cluster lifecycle and day-2 operations.
-- [`schemas/v1alpha1/application.cue`](https://github.com/apprafter/apprafter/blob/master/schemas/v1alpha1/application.cue) —
-  the Application CRD shape your manifest is validated against.
+- [Worked example: this documentation site](../how-it-works/deploying-the-docs-site.md)
+  — a real application assembled end to end, to read beside your own.

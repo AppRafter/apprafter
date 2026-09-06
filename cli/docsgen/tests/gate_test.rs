@@ -1499,3 +1499,129 @@ fn a_citation_on_a_mechanism_page_is_where_it_belongs() {
     );
     assert!(found.is_empty(), "{found:?}");
 }
+
+// ---- code links on a guide (2.24) --------------------------------------
+
+#[test]
+fn a_guide_linking_a_source_file_is_reported() {
+    // The corpus case: a manifest-writing guide sending its reader to
+    // the renderer's Rust source for the merge rules the page had just
+    // finished explaining.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nSee [`operator-rendering/src/lib.rs`](https://github.com/apprafter/apprafter/blob/master/operator/operator-rendering/src/lib.rs).\n";
+    let found = of(
+        &gate
+            .check_source("docs/dev-guide/application-cue.md", page)
+            .unwrap(),
+        gate::CODE_LINK_PLACEMENT,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].starts_with("3: "), "{found:?}");
+}
+
+#[test]
+fn a_guide_linking_out_of_docs_by_relative_path_is_the_same_defect() {
+    // The other way to write it. `../../e2e/mvp.sh` from a guide is the
+    // same destination as the GitHub URL, reached through the
+    // filesystem, and a rule that saw only one shape would move the
+    // corpus to the other.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nThe harness is [the e2e script](../../e2e/mvp.sh).\n";
+    let found = of(
+        &gate
+            .check_source("docs/operator-guide/quickstart.md", page)
+            .unwrap(),
+        gate::CODE_LINK_PLACEMENT,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+}
+
+#[test]
+fn a_guide_linking_a_docs_page_is_silent() {
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nSee [Per-environment deploy](../how-it-works/per-environment-deploy.md) \
+                and [the reference](../reference/index.md#custom-resources).\n";
+    let found = of(
+        &gate
+            .check_source("docs/dev-guide/environments.md", page)
+            .unwrap(),
+        gate::CODE_LINK_PLACEMENT,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn the_issue_tracker_is_not_code() {
+    // A guide telling a reader where to report a bug is doing its job.
+    // Releases and pull requests are the same shape of thing.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\n[report it](https://github.com/apprafter/apprafter/issues), or read the \
+                [releases](https://github.com/apprafter/apprafter/releases).\n";
+    let found = of(
+        &gate
+            .check_source("docs/operator-guide/postgres.md", page)
+            .unwrap(),
+        gate::CODE_LINK_PLACEMENT,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn third_party_documentation_is_not_this_repository() {
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\n[Docker's Rust guide](https://docs.docker.com/guides/rust/) and \
+                [restic](https://restic.net/).\n";
+    let found = of(
+        &gate
+            .check_source("docs/dev-guide/build-and-push.md", page)
+            .unwrap(),
+        gate::CODE_LINK_PLACEMENT,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_mechanism_page_may_link_the_source() {
+    // The whole point of the rule: the link is not forbidden, it is
+    // RELOCATED. A mechanism page is where it belongs, so the class
+    // must be silent there or the sweep would have nowhere to move to.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nThe renderer is \
+                [`operator-rendering`](https://github.com/apprafter/apprafter/blob/master/operator/operator-rendering/src/lib.rs).\n";
+    for file in [
+        "docs/how-it-works/per-environment-deploy.md",
+        "docs/contributing/documentation.md",
+        "docs/reference/index.md",
+    ] {
+        let found = of(
+            &gate.check_source(file, page).unwrap(),
+            gate::CODE_LINK_PLACEMENT,
+        );
+        assert!(found.is_empty(), "{file}: {found:?}");
+    }
+}
+
+#[test]
+fn a_path_the_reader_creates_in_their_own_repository_is_not_a_link() {
+    // The distinction that decides whether this class is usable. Every
+    // guide names `apprafter/Application.cue` — the file the READER
+    // writes — and none of them links it. The rule reads targets only,
+    // so a code span cannot be mistaken for a reference to our tree.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nCreate `apprafter/Application.cue` in your repository, then commit \
+                `cli/docsgen/src/gate.rs`.\n";
+    let found = of(
+        &gate
+            .check_source("docs/dev-guide/quickstart.md", page)
+            .unwrap(),
+        gate::CODE_LINK_PLACEMENT,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}

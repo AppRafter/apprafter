@@ -108,6 +108,16 @@ public route, and it needs a hostname under a zone the cluster has
 already been given — see [connect a
 domain](../operator-guide/connect-a-domain.md).
 
+A real one, for comparison: the manifest behind this documentation site
+declares a single `dev` override — one replica, and `network: "internal"`,
+because two deployments must not both claim `docs.apprafter.dev` — and records
+why there is deliberately no `prod` entry, since `base` is already the
+production shape:
+[Worked example: deploying this documentation site](../how-it-works/deploying-the-docs-site.md#the-manifest-in-full).
+It is registered as a single base-only deployment, so it still pins
+`metadata.namespace` — the one field the section below tells you to drop before
+you deploy a second environment.
+
 Environment names are DNS-1123 labels — lowercase letters, digits and
 `-`, starting and ending alphanumeric. The admission webhook rejects
 anything else, and so does the CLI, because the name becomes part of the
@@ -403,5 +413,3 @@ fixed at registration time.
 - [`apprafter app`](../reference/cli/app.md) and
   [`apprafter platform`](../reference/cli/platform.md) — the generated
   flag-by-flag reference.
-- [`schemas/v1alpha1/application.cue`](https://github.com/apprafter/apprafter/blob/master/schemas/v1alpha1/application.cue)
-  — the authoritative field list, including the override type.
