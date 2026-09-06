@@ -32,6 +32,9 @@ than taken on faith.
   between `git push` and a running Deployment: the discovery probe, what the
   plugin sidecar writes into your checkout, and why each manifest is exported
   on its own.
+- [Node reservations and swap](node-reservations-and-swap.md) — what the
+  control-plane reservations protect, why pods never swap, and why the tier
+  decides the policy.
 - [The target store on disk](the-target-store.md) — what
   `apprafter target add` writes and where, and the order every later command
   resolves a credential in.

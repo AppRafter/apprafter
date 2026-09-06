@@ -280,6 +280,7 @@ nav:
       - Egress derived from declared dependencies: how-it-works/egress-policy.md
       - The target store on disk: how-it-works/the-target-store.md
       - GitOps and the CUE plugin: how-it-works/gitops-and-the-cue-cmp.md
+      - Node reservations and swap: how-it-works/node-reservations-and-swap.md
       - Right-sizing an application's requests: how-it-works/resources-and-autoscaling.md
   - Developer Guide:
       - Overview: dev-guide/index.md
