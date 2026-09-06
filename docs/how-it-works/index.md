@@ -32,6 +32,9 @@ than taken on faith.
   between `git push` and a running Deployment: the discovery probe, what the
   plugin sidecar writes into your checkout, and why each manifest is exported
   on its own.
+- [How the approval gate works](the-approval-gate.md) — why a change is held
+  instead of applied, why only platform-scope plans can be rejected, and where
+  a plan lives.
 - [Node reservations and swap](node-reservations-and-swap.md) — what the
   control-plane reservations protect, why pods never swap, and why the tier
   decides the policy.

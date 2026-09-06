@@ -1,21 +1,18 @@
 ---
-description: "What the platform treats as a destructive change, how it pauses one behind an approval, and the CLI that approves it."
+description: "What the platform treats as a destructive change, how to see a pending plan, and how to approve or reject one."
 ---
 
 # Migration plans
 
-A `MigrationPlan` is a declarative resource that gates destructive
-changes — to user Applications or to the platform stack — behind
-explicit approval. When a reconciler detects a destructive change
-it creates a `MigrationPlan` and pauses the change; the previous
-version keeps running until you act.
+Some changes — to a user application, to a `SourceCredential`, or to the
+platform stack itself — are held for approval instead of being applied. The
+previous version keeps running until you act.
 
-See [ADR 0027](../adr/0027-migrationplan-unification.md) for the
-unified-CRD design rationale, [ADR 0051](../adr/0051-app-scope-migration.md)
-for application-scope detection and gating, and, for the full field
-reference, §3.8 of
-[the repository's architectural specification](https://github.com/apprafter/apprafter/blob/master/spec.md)
-— a roadmap document that is not published on this site.
+Why the gate exists and why the three scopes behave differently is
+[How the approval gate works](../how-it-works/the-approval-gate.md). The
+developer-facing half — the thirteen manifest edits that hold, written as edits
+rather than as trigger names — is
+[When a change needs approval](../dev-guide/when-a-change-needs-approval.md).
 
 ## What counts as destructive
 
@@ -49,7 +46,7 @@ Platform-stack specific triggers (applied when diffing a
   `#ChangeClass` has no `security-boundary`, which is an
   application- and credential-scope class only.
 
-### Application triggers (ADR 0051)
+### Application triggers
 
 For an application edit, the diff is taken between the last applied
 spec and the new spec, each evaluated under its own environment, so a
@@ -132,99 +129,7 @@ Adding coverage, creating a credential, and rotating the material
 (`apprafter repo creds rotate`, which replaces the sealed material and
 leaves the spec untouched) are **not** destructive and do not gate.
 
-## Approval semantics by scope
-
-`MigrationPlan` carries a `spec.scope.type` discriminator with three
-values — `application`, `platform` and `sourcecredential`. The approval
-semantics differ: only `platform` can be rejected.
-
-### Application scope
-
-**Approve only.** There is no reject action for application-scope
-plans.
-
-The application manifest lives in the user's Git repository. If
-you want to reverse a change, revert the commit in your source repo.
-Argo CD synchronizes the reverted manifest; the operator observes
-it as a non-destructive (or differently-destructive) change and the
-original `MigrationPlan` is superseded automatically.
-
-The admission webhook enforces this model: attempting to patch
-`status.phase=rejected` on an application-scope `MigrationPlan`
-is denied at the API server layer (per ADR 0027). There is no
-`apprafter migration reject` for application scope.
-
-The plan is created in the **application's own namespace** with a
-controlling `ownerReference` back to the `Application` CR (ADR 0051).
-Kubernetes garbage-collects it if the application is deleted, and it
-renders inside the user's Argo CD application tree without any extra
-anchor resource, so the "Approve" resource action appears on the plan
-node.
-
-While a `MigrationPlan` is pending, the application's
-`status.phase` reads `AwaitingMigrationApproval` and a
-`MigrationPending` condition is emitted with the plan name. Child
-resources (Deployment, Service) continue running the previous spec.
-On approval the operator applies the new spec, re-stamps its baseline,
-and deletes the plan — the plan is a one-shot ticket, so approving it
-applies-and-clears rather than re-creating a new gate.
-
-### Platform scope
-
-**Approve or reject.** The platform target lives in the cluster
-(`PlatformStack` CR), not in a user-controlled Git repository.
-
-- **Approve** — the `PlatformController` proceeds with the upgrade:
-  it patches the umbrella Argo CD Application and Argo CD reconciles
-  the new platform-stack version.
-- **Reject** — the controller reverts `PlatformStack.spec.pin` to
-  the value recorded in the plan's previous-spec snapshot. The
-  cluster remains on the current version.
-
-### SourceCredential scope
-
-**Approve only**, on the same reasoning as application scope: the
-gated change is a coverage *removal* on a config object, so there is
-no controller-side state to roll back. The admission webhook denies
-`status.phase=rejected` on a `sourcecredential` plan by any path, with
-the message *"sourcecredential-scope MigrationPlans cannot be
-rejected; … sourcecredential-scope plans are approve-only"*. To back
-out, re-widen the credential's spec — the stale plan is collected and
-derivation resumes with the wider coverage.
-
-The plan lives in the credential's own namespace (`apprafter-system`
-for the credentials `apprafter repo creds add` writes) with a
-controlling `ownerReference` back to the `SourceCredential`, so
-deleting the credential collects the plan too.
-
-## Lifecycle
-
-A `MigrationPlan` moves through these phases:
-
-```mermaid
-flowchart LR
-    P["pending-approval"] -->|"approve"| A["approved"]
-    P -->|"reject (platform scope only)"| R["rejected"]
-    A --> X["executing"]
-    X --> C["completed"]
-    X --> F["failed"]
-```
-
-A plan sits at `pending-approval` until someone acts on it; approval is
-the gate, and nothing downstream runs until it is given.
-
-Plans in `pending-approval` state remain there indefinitely — there
-is no automatic expiration. If you want to dismiss a platform-scope
-plan without approving it, use `apprafter migration reject`. For an
-application-scope plan, revert the triggering commit in Git; for a
-`sourcecredential` plan, re-widen the credential's spec.
-
-For an application-scope plan the operator **deletes** the plan once it
-applies the approved spec (the plan is a consumed ticket, ADR 0051), so
-an approved application plan does not linger in `completed`. A
-`sourcecredential` plan is consumed the same way — the controller
-derives both halves with the narrowed spec, stamps the new baseline,
-and then deletes the plan.
+## Acting on a plan
 
 ## CLI surface
 
@@ -277,10 +182,10 @@ Two approval surfaces ship today:
 - **Argo CD UI** — a Lua-script resource action ("Approve") on the
   `MigrationPlan` node, plus a Degraded health signal on the affected
   resource. A pending **platform** plan surfaces under the
-  platform-stack tree (ADR 0048); a pending **application** plan
+  platform-stack tree; a pending **application** plan
   surfaces on the app node in the user's own Argo application tree,
   and the app's health goes Degraded with an "awaiting MigrationPlan
-  approval" message (ADR 0051). Click "Approve" on the plan node to
+  approval" message. Click "Approve" on the plan node to
   approve without leaving the Argo CD console.
 
 Later approval surface (not yet shipped):
@@ -292,18 +197,9 @@ Later approval surface (not yet shipped):
 
 ## Where to look next
 
-- [Platform management](./platform-management.md) — upgrade
-  strategy and the conditions under which destructive diffs are
-  created.
-- [ADR 0027](../adr/0027-migrationplan-unification.md) — design
-  rationale, including the asymmetric reject semantics and the
-  gate-at-reconciler principle.
-- [ADR 0051](../adr/0051-app-scope-migration.md) — application-scope
-  destructive detection: the baseline, the per-environment diff, the
-  taxonomy, and the app-namespace / ownerRef plan placement.
-- [ADR 0025](../adr/0025-gitops-control-surface.md) — why the gate
-  lives inside the operator/controller rather than at the Argo CD
-  sync layer.
-- [The repository's architectural specification](https://github.com/apprafter/apprafter/blob/master/spec.md),
-  §3.8 — full field reference for the `MigrationPlan` CRD. It is a
-  roadmap document and is not published on this site.
+- [How the approval gate works](../how-it-works/the-approval-gate.md) — the
+  scopes, why only one can be rejected, where a plan lives, and its lifecycle.
+- [When a change needs approval](../dev-guide/when-a-change-needs-approval.md) —
+  the developer's view of the same gate.
+- [Platform management](./platform-management.md) — upgrade strategy, and the
+  conditions under which a destructive platform diff is created.
