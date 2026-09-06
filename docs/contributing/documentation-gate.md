@@ -45,7 +45,7 @@ deliberately names capabilities that do not exist yet.
 
 ## What is checked
 
-Thirteen classes. The first five resolve a claim about the product, and
+Thirteen classes, and two more specified below that are not built yet. The first five resolve a claim about the product, and
 **none of them is selected by a fence's language tag** — obligations
 come from a block's content, so deleting a tag cannot quietly turn a
 finding green. Nor can deleting the fence: an indented block and an
@@ -60,6 +60,8 @@ worth knowing, set out below.
 | `code-path` | A repository path the page names — in a code span opening on a real top-level directory, or as a relative link target — that does not exist in the repository. |
 | `adr-reference` | An ADR citation that names no ADR at all, or one whose decision no longer stands: `Superseded`, `Deprecated`, or an `Unused` reserved slot. |
 | `link-text-path` | A link whose visible **text** is a filename or a repository path, on a link that goes to another `.md` page. The href is not this class's business — see below. |
+| `adr-citation-form` | An ADR cited as bare text where it should be a link. Planned — see [Which surface does this paragraph belong on?](documentation.md#which-surface-does-this-paragraph-belong-on). |
+| `adr-citation-placement` | An ADR cited anywhere in an operator- or developer-guide file. Planned, and it will be born red: the mechanism pages most citations must move to do not exist yet. |
 | `unlabelled-fence` | A fence with no info string. |
 | `unterminated-fence` | A fence that never closes, so everything below it renders as code. |
 | `unclosed-pre` | An HTML `pre` element that never meets its closing tag. The same failure as the row above with a different edit behind it, which is why it is its own class. |

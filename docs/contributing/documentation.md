@@ -199,6 +199,93 @@ site publishes, so indexing them would bury the guides. A model handed
 the whole corpus should have them; a model handed a map should not have
 to walk past them.
 
+## Which surface does this paragraph belong on?
+
+Three surfaces, each one link from the last, each addressed to a different reader:
+
+| Surface | Answers | Reader |
+|---|---|---|
+| A guide (`operator-guide/`, `dev-guide/`) | what do I run, and in what order | someone doing the task |
+| `how-it-works/` | what happens when I run it | someone whose outcome surprised them |
+| An ADR (`adr/`) | why it was decided to work that way | someone who might change the decision |
+
+[ADR 0058](../adr/0058-public-surfaces-are-written-for-their-reader.md) sets the split and its
+2026-09-06 amendment adds the third row: **a guide does not cite an ADR anywhere in the file**,
+trailing link lists included. A guide links the mechanism page; the mechanism page cites the
+decision.
+
+Apply the following to each paragraph, in order. The first hit wins.
+
+### 0. Is it one of the four roles?
+
+Straight out of ADR 0058's table, and it catches most of what does not belong before you have to
+think about it. Walk transcript → **delete**, and let one sentence of prose carry the property
+with the e2e named as its evidence. An independent check → **collapse** into a `???` block, one
+per section outcome and never per step. Failure handling → a **row in the troubleshooting
+table**. Only what survives all three reaches the question below.
+
+### 1. The reimplementation test
+
+> If the implementation were replaced tomorrow — every observable contract identical, same
+> commands, same flags, same resulting state, same timings a reader can perceive — would this
+> paragraph have to be rewritten?
+
+**Yes → mechanism.** **No → recipe.**
+
+This decides almost everything, because it asks the only question that matters: does the sentence
+depend on our internals, or on what the reader can see? It is sharp on the cases that feel
+ambiguous:
+
+- *"The provisioner creates the shared cluster lazily, on the first claim."* Replace the
+  provisioner with an eager one and this is false. **Mechanism.**
+- *"The first `needs.pg` in a fresh cluster takes longer than the second."* Still true of any
+  implementation that shares a backend, and it is what the reader will actually experience.
+  **Recipe.**
+
+### 2. The subject test
+
+Read the sentence's grammatical subject. The reader or the reader's artefact — *you declare*, *run
+`apprafter …`*, *your manifest sets* — is recipe. A platform component — *the operator*, *the
+provisioner*, *the scheduler*, *the admission webhook*, *the finalizer*, *Argo CD reconciles* — is
+mechanism.
+
+Use this to **find** candidates, not to judge them: it is greppable and fast, and it over-fires on
+constraint sentences, where naming a component is the shortest way to state a limit the reader is
+subject to. Confirm every hit with test 1.
+
+### 3. The falsification test
+
+How would a reader check the sentence is true? By running the documented command and reading its
+output → **recipe**, or a `???` verification block. Only by opening `operator/**`, `cli/**` or an
+ADR → **mechanism**.
+
+### 4. The citation corollary
+
+An ADR citation is authority for a decision, so it always fails test 1 — the decision is exactly
+what a reimplementation would revisit. In a guide it therefore has one of two ends:
+
+- the paragraph around it is mechanism, and the citation **moves with it**;
+- the paragraph is a recipe sentence that merely names a decision, and the citation is **deleted**.
+  "Registering the credential once covers both, by ADR 0031" tells a reader following the recipe
+  nothing they can act on. Drop the clause.
+
+A citation never stays in a guide because it "might be useful". If the mechanism is worth reaching,
+link the mechanism page — that page is where the decision is cited from.
+
+### Worked example
+
+From `operator-guide/postgres.md`, before the 2.20c rework:
+
+> The provisioner creates one CNPG `Cluster` per tier, lazily, on the first `needs.pg` in the
+> cluster (ADR 0039). Your claim gets a database and a role on it. **The first claim in a fresh
+> cluster takes about a minute longer than the ones after it**, because the shared cluster is
+> being created.
+
+Sentence one fails test 1 and names a platform component: mechanism, and the citation goes with
+it. Sentence two is what the reader gets: recipe. Sentence three survives a reimplementation that
+shares a backend by any means: recipe, and it is the sentence that was actually worth keeping —
+it tells someone watching a slow first claim that nothing is wrong.
+
 ## What you get for free
 
 Write the page, give it a `description`, put it in the nav, and the

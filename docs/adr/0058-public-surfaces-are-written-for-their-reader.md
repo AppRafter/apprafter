@@ -235,6 +235,57 @@ Two corollaries:
   Mitigation: the completeness test reads the source of truth, so a new predicate forces a
   decision rather than defaulting to unchecked — the property that makes `shipped.rs` work.
 
+## Amendment — where a decision may be cited, 2026-09-06
+
+The routing table in §1 sends **Explain** to a mechanism layer and says nothing about where a
+*decision* may be cited. The gap was not noticed until a sweep of the finished guides was
+attempted and had no rule to be judged against: 53 of the corpus's 90 ADR citations were sitting
+in the two recipe trees, 34 of them in the main flow, and nothing in this ADR made that wrong.
+
+### The clause
+
+A guide does not cite an ADR. Not in its main flow, not in a trailing link list — **the rule binds
+the whole file**, because a citation at the foot of a recipe is still an invitation to read a
+design record instead of finishing the task.
+
+Add a fifth row to §1's table, with the same reading as the other four:
+
+| Role | Destination | Form |
+|---|---|---|
+| **Cite** | the mechanism layer, and the ADR corpus | a guide links the mechanism page; the mechanism page cites the decision. |
+
+### Why the destination is not "move it to `how-it-works/`"
+
+An ADR is not a deeper explanation of *how* something works. It records **why it was decided to
+work that way** — the alternatives weighed, the constraint that settled it, the cost accepted.
+That is one layer further out than mechanism, and it is addressed to whoever might change the
+decision, not to whoever is operating under it.
+
+So the routing of a citation found in a guide is usually **deletion**, not relocation. The reader
+of a recipe needs neither the mechanism nor the rationale; the reader who wants the mechanism
+follows one link and finds it; and only the reader who wants to know why the mechanism is *that*
+mechanism goes on to the ADR, from the mechanism page. Three audiences, three surfaces, each one
+link apart.
+
+Applied to the 53: five are mechanism whose paragraph moves and takes its citation with it,
+thirteen are sentences that merely name a decision and lose nothing when the name goes, and
+thirty-five are pointers that become links to a mechanism page — which is the work, because
+twenty-nine of those pages did not exist when this was written.
+
+### Whole-file, and what that costs
+
+Binding the trailing link lists too is the stricter reading and it is deliberate. The corpus was
+already inconsistent with itself on exactly this point: the four dependency guides reworked in
+2.20c removed even their `Related` citations, while `operator-guide/egress-policy.md` and
+`dev-guide/resources-and-autoscaling.md` kept theirs. One of the two had to become the rule, and
+the stricter one costs a reader nothing they cannot reach in one more click.
+
+### What this does not change
+
+`docs/how-it-works/`, `docs/contributing/`, `docs/license.md` and the ADR corpus itself are
+unaffected. `license.md`'s citations in particular are the licence-change record and are
+load-bearing where they are.
+
 ## Owner
 
 Platform documentation. Amendments follow ADR 0057's convention: the decision text is written
