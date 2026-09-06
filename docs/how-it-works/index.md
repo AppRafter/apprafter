@@ -28,6 +28,10 @@ than taken on faith.
 - [Egress derived from declared dependencies](egress-policy.md) — the per-app
   CiliumNetworkPolicy, which rules each profile emits, and how to tell a policy
   drop from a missing listener.
+- [GitOps and the CUE plugin](gitops-and-the-cue-cmp.md) — what happens
+  between `git push` and a running Deployment: the discovery probe, what the
+  plugin sidecar writes into your checkout, and why each manifest is exported
+  on its own.
 - [The target store on disk](the-target-store.md) — what
   `apprafter target add` writes and where, and the order every later command
   resolves a credential in.

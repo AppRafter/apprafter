@@ -279,6 +279,7 @@ nav:
       - Declared disk dependencies: how-it-works/needs-disk.md
       - Egress derived from declared dependencies: how-it-works/egress-policy.md
       - The target store on disk: how-it-works/the-target-store.md
+      - GitOps and the CUE plugin: how-it-works/gitops-and-the-cue-cmp.md
       - Right-sizing an application's requests: how-it-works/resources-and-autoscaling.md
   - Developer Guide:
       - Overview: dev-guide/index.md

@@ -1,66 +1,27 @@
 ---
 description: "Field-by-field guide to the CUE manifest that describes an application — image, expose, resources, needs, and per-environment overrides."
-schema-check-ignore:
-  - path: "spec.source.path"
-    reason: external-tool
-    since: v0.2.44
-    note: Argo CD's Application CR, whose field set AppRafter does not model
 ---
 
 # Writing Application.cue
 
-AppRafter applications are described by a CUE manifest that lives
-in the `apprafter/` directory of your repository. When you push the
-repository, Argo CD detects the `.cue` files, runs the CUE
-Config-Management-Plugin (CMP) sidecar to compile them, and passes
-the resulting Kubernetes YAML to its sync pipeline. The AppRafter
-operator then reconciles the `Application` CR into a Deployment and
-Service.
-
-You do not maintain a separate rendered-output branch or run a
-local pre-commit step. Edit CUE, commit, push — GitOps handles
-the rest.
+AppRafter applications are described by a CUE manifest that lives in the
+`apprafter/` directory of your repository. Edit it, commit, push — there is no
+rendered-output branch to maintain and no local pre-commit step to run. What
+happens between the push and a running Deployment is
+[GitOps and the CUE plugin](../how-it-works/gitops-and-the-cue-cmp.md).
 
 ## The canonical filename
 
-Place your manifest at `apprafter/Application.cue` in the root
-of your repository (or the repository path you registered with
-`apprafter app add`). The CMP decides whether a repository is CUE by
-running a shell probe from `spec.source.path` and checking whether it
-printed anything:
+Put your manifest at `apprafter/Application.cue`, in the root of your
+repository or in the path you registered with `apprafter app add`.
 
-```yaml
-discover:
-  find:
-    command:
-      - sh
-      - -c
-      - |
-        if [ "$(basename "$PWD")" = "apprafter" ]; then
-          find . -maxdepth 1 -type f -name '*.cue' -print -quit
-        else
-          find . -type f -name '*.cue' \( -path '*/apprafter/*' -o -name 'apprafter*.cue' \) -print -quit
-        fi
-```
+Two things are compiled, not one: **every** `.cue` file under an `apprafter/`
+directory, whatever it is called, and **any** file whose own name starts with
+`apprafter`. So keep stray CUE out of both — an `apprafter-notes.cue` beside
+your source will be compiled and will fail the build. Why it works that way is
+[GitOps and the CUE plugin](../how-it-works/gitops-and-the-cue-cmp.md#what-makes-a-repository-cue).
 
-So a file is picked up when **either** it sits anywhere under an
-`apprafter/` directory — whatever it is called, which is why
-`apprafter/Application.cue` works — **or** its own filename starts
-with `apprafter`. The special case at the top handles a
-`spec.source.path` that already points *at* the `apprafter/`
-directory: there, any `.cue` file directly inside it matches.
-
-The recommended layout is `apprafter/Application.cue`. Bear in mind
-that every `.cue` file under `apprafter/` is compiled, not just the
-one named `Application.cue`, and that a stray `apprafter-notes.cue`
-elsewhere in the repo also matches the second branch.
-
-For a monorepo with multiple services, each service can have its
-own `apprafter/Application.cue`. Control which paths Argo CD
-rescans on each push with the
-`argocd.argoproj.io/manifest-generate-paths` annotation on the
-Argo CD `Application` CR — for example
-`manifest-generate-paths: /parser,/shared-schemas`.
+For a monorepo, each service gets its own `apprafter/Application.cue`.
 
 ## Minimal manifest
 
@@ -349,37 +310,6 @@ With `--env prod`:
 Registered without `--env`, the operator uses `spec.base` directly
 without applying any environment overlay.
 
-## How the CUE CMP works
-
-The CUE plugin runs in a sidecar container named `cue-cmp`, inside
-the Argo CD `argocd-repo-server` pod. When Argo CD clones a repository
-and the discovery probe above prints a match, the sidecar runs its
-`entrypoint.sh`, which does three things worth knowing about:
-
-1. **It changes directory into `apprafter/`** when `spec.source.path`
-   pointed at a parent. Everything below runs from the package
-   directory.
-2. **It writes the schema and the `claim` binding into your checkout**
-   — a workspace-local CUE module holding the exact
-   `apprafter.io/schemas/v1alpha1` the sidecar image ships, plus a
-   generated `apprafter_claim_gen.cue` that defines the `claim` value
-   your `env` references resolve against (ADR 0046). Both are
-   inject-wins: they overwrite anything you vendored. This is why you
-   do not vendor the schema yourself, and why bare
-   `claim.pg.url` selectors resolve without you declaring them.
-3. **It exports each manifest separately.** A single
-   `cue export ./... --out yaml` would emit your named top-level values
-   (`app: …`, `web: …`) as keys of one YAML document, which Argo CD
-   would reject as a manifest with no `apiVersion`. So the sidecar
-   exports to JSON, enumerates the top-level values that look like
-   Kubernetes objects (`apiVersion` + `kind` present), and re-exports
-   each one on its own with `cue export ./... -e <key> --out yaml`,
-   separated by `---`. Top-level helper values that are not Kubernetes
-   objects are skipped rather than emitted.
-
-The sidecar is installed and kept up to date by the platform-stack
-chart; no manual sidecar configuration is required on your part.
-
 ## Troubleshooting compile errors
 
 When CUE compilation fails, Argo CD surfaces the error in the
@@ -393,17 +323,8 @@ badge → expand the error accordion. The CMP wrapper normalizes
 CUE errors to a single-line summary in the badge, with the full
 `cue export` stderr in the expandable details.
 
-??? note "Reading the same thing from a shell"
-
-    ```sh
-    # Argo CD Application sync state.
-    kubectl get applications.argoproj.io <app-name> -n argocd \
-        -o jsonpath='{.status.conditions}'
-
-    # The CMP sidecar's log, for the full cue output. The container is
-    # named `cue-cmp` — `argocd-cue-cmp` is the image, not the container.
-    kubectl logs -n argocd deploy/argocd-repo-server -c cue-cmp --tail=50
-    ```
+Reading the same thing from a shell, including the plugin's own log, is on
+[GitOps and the CUE plugin](../how-it-works/gitops-and-the-cue-cmp.md#reading-it-when-it-goes-wrong).
 
 ### Common errors
 
@@ -412,14 +333,12 @@ CUE errors to a single-line summary in the badge, with the full
 The import path must match exactly. Confirm the `package` directive
 at the top of your file and the import string.
 
-Do **not** vendor the schemas into your repository. The sidecar lays
-its own bundled copy down inject-wins before rendering, so a schema
-you vendored under your own `<your-repo>/cue.mod/pkg/` tree is
-overwritten at sync time and only diverges from what actually renders.
-`apprafter app scaffold` stopped vendoring in ADR 0046 for exactly
-this reason. The one place vendoring still matters is running `cue` by
-hand — use `apprafter app validate`, which lays out the same workspace
-the sidecar does.
+Do **not** vendor the schemas into your repository: whatever you put under
+your own `<your-repo>/cue.mod/pkg/` is overwritten at sync time and only diverges from what
+actually renders
+([why](../how-it-works/gitops-and-the-cue-cmp.md#what-the-sidecar-does-to-your-checkout)).
+To run `cue` by hand, use `apprafter app validate` — it lays out the same
+workspace the sidecar does.
 
 **`field not allowed: <field-name>`**
 
@@ -478,11 +397,9 @@ a running Deployment.
 - [`operator/operator-rendering/src/lib.rs`](https://github.com/apprafter/apprafter/blob/master/operator/operator-rendering/src/lib.rs)
   — `effective_spec()`, where the per-environment merge rules above are
   implemented.
-- [ADR 0029](../adr/0029-cue-cmp.md) — CUE CMP design rationale.
-- [ADR 0044](../adr/0044-per-environment-deploy.md) — why the active
-  environment is a per-deployment property.
-- [ADR 0046](../adr/0046-env-value-references.md) — the `claim` /
-  `secret` env-value references.
+- [GitOps and the CUE plugin](../how-it-works/gitops-and-the-cue-cmp.md) —
+  what happens between the push and a running Deployment, and why the
+  `claim` binding resolves without you declaring it.
 - [`examples/applications/parser.cue`](https://github.com/apprafter/apprafter/blob/master/examples/applications/parser.cue)
   — a worked multi-environment example.
 - [Developer quickstart](./quickstart.md) — scaffold and
