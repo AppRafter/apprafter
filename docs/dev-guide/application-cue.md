@@ -151,7 +151,7 @@ guide: [Postgres](../operator-guide/postgres.md),
 An `env` value is one of three things: a literal string, a **claim
 reference**, or an **external secret reference**. The operator resolves
 the latter two into a Kubernetes `secretKeyRef`, so the value itself
-never appears in your manifest or in Git (ADR 0046).
+never appears in your manifest or in Git.
 
 ```cue
 spec: base: {
@@ -226,7 +226,7 @@ is a property of the deployment, not of the cluster: `apprafter app add
 --env staging` registers a deployment carrying
 `spec.environment: "staging"`, and the operator unifies
 `spec.environments.staging` onto `spec.base` before rendering
-(ADR 0044). Register the same manifest twice with different `--env`
+Register the same manifest twice with different `--env`
 values and you get two independent deployments from one file — [Deploying
 more than one environment](environments.md) covers that end to end,
 including the namespaces the two deployments need.

@@ -106,7 +106,8 @@ deliberately not covered by the shipped slice.
 
 ## Related
 
-- [ADR 0045 — needs → NetworkPolicy egress](../adr/0045-needs-networkpolicy-egress.md)
+- [Egress derived from declared dependencies](../how-it-works/egress-policy.md)
+  — what the operator renders, and the decision behind it.
 - [Declaring dependencies — the `needs` block](../dev-guide/application-cue.md#declaring-dependencies-the-needs-block)
 - [Postgres from a declared dependency](postgres.md),
   [Redis from a declared dependency](redis.md)

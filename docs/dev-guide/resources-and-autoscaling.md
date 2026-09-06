@@ -33,10 +33,9 @@ application.
     tell a dead controller from a healthy quiet one, are in
     [How it works](../how-it-works/resources-and-autoscaling.md#the-defect-this-diagnosis-exists-for).
 
-The design behind the automatic half is
-[ADR 0054](../adr/0054-vpa-vertical-autoscaling.md);
-the values it starts from are
-[ADR 0053](../adr/0053-resource-governance.md).
+Why the automatic half works the way it does, and where its starting values
+come from, is
+[Right-sizing an application's requests](../how-it-works/resources-and-autoscaling.md).
 
 ## If you set nothing
 
@@ -380,8 +379,6 @@ on the next sync — change the mode there instead.
   crash-looping or unschedulable pod.
 - [Platform management](../operator-guide/platform-management.md) — the
   `PlatformStack` resource the cluster-wide mode lives on.
-- [ADR 0053](../adr/0053-resource-governance.md)
-  and
-  [ADR 0054](../adr/0054-vpa-vertical-autoscaling.md)
+- [Right-sizing an application's requests](../how-it-works/resources-and-autoscaling.md)
   — why the starting values are what they are, and why the correction
   happens in place.

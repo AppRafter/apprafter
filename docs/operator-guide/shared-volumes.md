@@ -25,7 +25,7 @@ need to read from or write to the same directory. Examples:
 Do **not** use a SharedVolume when:
 
 - Only one Application ever mounts the volume — use a plain `needs.disk`
-  (owned disk, ADR 0043) instead.
+  (an owned disk) instead.
 - Applications live in different namespaces — cross-namespace sharing
   requires Tier-2 with an NFS-backed `shared-nfs` provider and is not
   available on Tier-1.

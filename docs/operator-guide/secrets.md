@@ -16,8 +16,8 @@ Developers do not run these commands. They write a
 !!! info "What this tool is, and what it is not"
 
     `apprafter secret` is a **Tier-1 primitive**. SealedSecrets stands in
-    for OpenBao on a single node that has no KMS to auto-unseal one, which
-    is a deliberate trade recorded in [ADR 0007](../adr/0007-tier-1-sealedsecrets-tier-2-openbao.md).
+    for OpenBao on a single node that has no KMS to auto-unseal one. That
+    is a deliberate trade, not an oversight: Tier 2 brings OpenBao.
 
     It has **no fine-grained access control and no audit trail**. Anyone
     able to seal here already holds every credential in the cluster, so

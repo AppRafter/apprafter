@@ -43,7 +43,7 @@ filling it in.
 
 - **Platform services** — declaring `needs.{pg, redis, disk}` and
   binding the provisioned credentials into env-vars with `claim`
-  references (ADR 0046). The provisioning guides live in the operator
+  references. The provisioning guides live in the operator
   guide: [Postgres](../operator-guide/postgres.md),
   [Redis](../operator-guide/redis.md),
   [persistent disk](../operator-guide/persistent-disk.md).
@@ -69,8 +69,6 @@ filling it in.
   subcommand + flag.
 - [`schemas/v1alpha1/application.cue`](https://github.com/apprafter/apprafter/blob/master/schemas/v1alpha1/application.cue)
   — the authoritative `Application` field list.
-- [ADR 0046](../adr/0046-env-value-references.md) — how env values
-  reference claim fields and sealed secrets.
 - [Reference](../reference/index.md) — the generated CLI pages, the
   environment variables, and where each CRD's field list lives.
 - [ADR index](../adr/README.md) — the decision behind each behaviour.

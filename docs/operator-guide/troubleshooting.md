@@ -484,5 +484,5 @@ runbooks by code, not by the human-readable summary.
   chain reference.
 - [CLI reference](../reference/cli/index.md) — every
   subcommand + flag.
-- [ADR 0030](../adr/0030-cli-target-store-and-credential-chain.md)
-  — design rationale for the diagnostic-code scheme.
+- [The target store on disk](../how-it-works/the-target-store.md) — where a
+  credential-chain failure comes from, and the decision behind the chain.

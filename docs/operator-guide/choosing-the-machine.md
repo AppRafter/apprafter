@@ -15,7 +15,6 @@ the error means when you supply none, what happens to a cluster created
 before the default was removed, and why the machine of a running cluster
 cannot be changed in place — with what to do instead.
 
-The design rationale is in [ADR 0056](../adr/0056-machine-picker.md).
 
 > There is no default machine type. Naming none is an error, not a
 > fallback — provisioning is a spending decision and the platform will not

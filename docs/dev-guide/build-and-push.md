@@ -9,10 +9,10 @@ application, and pushing the tag the cluster follows. They are one continuous
 story — the image is the input the platform takes, and the tag is how a new
 build reaches it — so they are one page.
 
-Neither half is AppRafter's to own. [ADR 0010](../adr/0010-dockerfile-first-build.md)
-makes the image the user's artefact and the platform's input; your CI is your
-forge's. What AppRafter owns is the contract between them, which is short, and
-this page is mostly about being explicit where it has been implicit.
+Neither half is AppRafter's to own: the image is yours and the platform's
+input, and your CI is your forge's. What AppRafter owns is the contract between
+them, which is short, and this page is mostly about being explicit where it has
+been implicit.
 
 ## What the platform requires of an image
 

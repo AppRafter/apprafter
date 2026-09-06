@@ -131,8 +131,7 @@ on this site today.
   environment variables, and the custom resources the platform
   installs. The [CLI reference](../reference/cli/index.md) covers
   every subcommand and flag.
-- [ADR index](../adr/README.md) — the decision behind each behaviour,
-  including [ADR 0030](../adr/0030-cli-target-store-and-credential-chain.md)
-  for the target store and its credential chain. An ADR describes the
+- [ADR index](../adr/README.md) — the decision behind each behaviour.
+  An ADR describes the
   world as it was when it was ratified, so read it for *why*, and the
   pages above for *what ships*.

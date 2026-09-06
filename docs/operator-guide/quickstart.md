@@ -126,7 +126,7 @@ apprafter target add prod \
 
 !!! warning "The server type has no default — step 2 fails without it"
     Provisioning is a spending decision, so AppRafter refuses to guess
-    a machine class ([ADR 0056](../adr/0056-machine-picker.md)). The
+    a machine class. The
     resolution chain is `--server-type` flag → manifest
     `spec.nodes[0].type` → recorded state → target default →
     `APPRAFTER_SERVER_TYPE`, and if every rung is empty `apprafter

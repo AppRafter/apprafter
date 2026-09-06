@@ -58,9 +58,7 @@ status:
 
 See §3.11 of
 [the repository's architectural specification](https://github.com/apprafter/apprafter/blob/master/spec.md)
-— a roadmap document that is not published on this site — and
-[ADR 0026](../adr/0026-platformstack-crd.md) for the full field
-reference and design rationale.
+— a roadmap document that is not published on this site.
 
 ## Release channels
 
