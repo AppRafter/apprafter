@@ -228,10 +228,7 @@ nav:
       #
       # 1-4: stand a cluster up.
       - Quickstart: operator-guide/quickstart.md
-      - Target store: operator-guide/target-store.md
-      # The machine is chosen when the target is set up, and after
-      # provisioning it can only be changed by rebuilding.
-      - Choosing the machine: operator-guide/choosing-the-machine.md
+      - Managing targets: operator-guide/target-store.md
       # 5: firewall and domains. Both are about cluster-owned resources
       # (the zones on the platform Gateway and the certificate that
       # terminates TLS for them), which is operator work.
@@ -243,17 +240,16 @@ nav:
       - Back up a cluster: operator-guide/backup-restore.md
       - Restore from a backup: operator-guide/restore.md
       - Backup retention & integrity: operator-guide/backup-maintenance.md
-      # A rare operation off the critical path, so it is a page rather
-      # than a tail on the backup page — and it used to be documented
-      # twice, here and on `choosing-the-machine`.
-      - Moving to a bigger machine: operator-guide/moving-to-a-bigger-machine.md
-      # 7: what the operator owns about dependencies.
+      # 7: dependencies. Secrets comes FIRST of them, up eight places:
+      # `backup-restore.md` already sends the reader here, and seals a
+      # SealedSecret on their behalf, before they have met sealing —
+      # and both `postgres` and `redis` assume sealed credentials exist.
+      - Secrets: operator-guide/secrets.md
       - Postgres: operator-guide/postgres.md
       - Redis: operator-guide/redis.md
       - Persistent disk: operator-guide/persistent-disk.md
       - Shared volumes: operator-guide/shared-volumes.md
       - Egress policy: operator-guide/egress-policy.md
-      - Secrets: operator-guide/secrets.md
       # 8-9: reading a failure, then the platform's own lifecycle.
       - Troubleshooting: operator-guide/troubleshooting.md
       # Not a setup step: bootstrap already applies the reservations and
@@ -262,6 +258,14 @@ nav:
       - Node preparation: operator-guide/node-prep.md
       - Platform management: operator-guide/platform-management.md
       - Migration plans: operator-guide/migration-plans.md
+      # Both machine pages sit last on purpose. The `target add` wizard
+      # already makes the choice, so `Choosing the machine` is the
+      # reference for the exceptions — a scripted target, a rejected
+      # SKU, a pre-default cluster — none of which a first-time operator
+      # is doing; and moving a machine is a rare rebuild off the
+      # critical path that used to interrupt the backup block.
+      - Choosing the machine: operator-guide/choosing-the-machine.md
+      - Moving to a bigger machine: operator-guide/moving-to-a-bigger-machine.md
       - Recovery: operator-guide/recovery.md
   - How it works:
       # Mechanism, split out of the guides by ADR 0058: a guide is a
@@ -274,6 +278,7 @@ nav:
       - Declared Redis dependencies: how-it-works/needs-redis.md
       - Declared disk dependencies: how-it-works/needs-disk.md
       - Egress derived from declared dependencies: how-it-works/egress-policy.md
+      - The target store on disk: how-it-works/the-target-store.md
       - Right-sizing an application's requests: how-it-works/resources-and-autoscaling.md
   - Developer Guide:
       - Overview: dev-guide/index.md

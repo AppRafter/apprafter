@@ -21,13 +21,9 @@ Guide](../dev-guide/index.md) is the shorter path.
   a self-managing cluster, with `apprafter target add` and then
   `apprafter up`. Start here. (The older one-shot
   `apprafter init` still works and suits scripted setups.)
-- [Target store reference](target-store.md) — where target
-  configuration and credentials live on disk, the resolution chain
-  between them, multi-target setups, and how to inspect, rename and
-  remove a target without stranding the servers it provisioned.
-- [Choosing the machine](choosing-the-machine.md) — how to read the
-  live machine catalogue, the three ways to supply a server type, and
-  why changing the machine of a running cluster is a rebuild.
+- [Managing targets](target-store.md) — running more than one, and the
+  rest of a target's life: inspecting, renaming, and removing one
+  without stranding the servers it provisioned.
 - [Private repos & registries](../dev-guide/private-repos-and-registries.md)
   — `apprafter repo creds add` registers one credential that Argo CD
   clones private repositories with and the node pulls private images
@@ -60,9 +56,6 @@ Guide](../dev-guide/index.md) is the shorter path.
 - [Backup retention, integrity and credentials](backup-maintenance.md) —
   how long snapshots live, the integrity check and its locks, and how
   narrow the in-cluster credentials can be. Not a first read.
-- [Moving to a bigger machine](moving-to-a-bigger-machine.md) — a
-  planned rebuild when the node has become too small. Rare, and off the
-  critical path, which is why it is a page rather than a section.
 
 ## Give an application a dependency
 
@@ -84,6 +77,12 @@ binds the credentials, and opens exactly the egress that need implies.
 
 ## Day 2, and getting out of trouble
 
+- [Choosing the machine](choosing-the-machine.md) — reading the live
+  machine catalogue and the three ways to supply a server type. The
+  `target add` wizard already makes this choice, so this is the
+  reference for the exceptions.
+- [Moving to a bigger machine](moving-to-a-bigger-machine.md) — a
+  planned rebuild when the node has become too small.
 - [Node preparation](node-prep.md) — a cluster provisioned by
   `apprafter apply` already has the control-plane reservations and the
   host swap; this is the retrofit for a node that does not, and how to

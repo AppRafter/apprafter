@@ -334,7 +334,7 @@ either, and the move is the same rebuild.
 
 - [Operator quickstart](quickstart.md) — registering a target and
   provisioning the cluster, of which the machine choice is one step.
-- [Target store reference](target-store.md) — where the saved type lives
+- [Managing targets](target-store.md) — where the saved type lives
   on disk, alongside the region and the credentials.
 - [Node preparation](node-prep.md) — the control-plane headroom and swap
   the machine you chose then gets configured with.

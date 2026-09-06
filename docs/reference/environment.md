@@ -138,7 +138,7 @@ CronJob's container environment, which the platform-stack chart writes.
 ## See also
 
 - [CLI reference](cli/index.md) — every command, flag and default.
-- [Target store](../operator-guide/target-store.md) — the on-disk
+- [The target store on disk](../how-it-works/the-target-store.md) — the on-disk
   layout and the full credential-resolution chain these variables
   slot into.
 - [Back up a cluster](../operator-guide/backup-restore.md) — where the

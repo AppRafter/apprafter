@@ -112,7 +112,7 @@ which is what makes `apprafter t ls` work.
   reads that are not flag fallbacks, so cannot appear above.
 - [Quickstart](../../operator-guide/quickstart.md) — the "start here"
   path above, with output and explanation.
-- [Target store](../../operator-guide/target-store.md) — the on-disk
-  layout and the credential-resolution chain behind `--target`.
+- [The target store on disk](../../how-it-works/the-target-store.md) — the
+  on-disk layout and the credential-resolution chain behind `--target`.
 - [Troubleshooting](../../operator-guide/troubleshooting.md) — the
   diagnostic-code catalogue.

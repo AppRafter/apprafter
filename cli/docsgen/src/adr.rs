@@ -111,8 +111,9 @@
 //!
 //! # The wrapped reference, and what it must not swallow
 //!
-//! `docs/operator-guide/target-store.md` writes the citation across a
-//! blockquote line break:
+//! `docs/how-it-works/the-target-store.md` writes the citation across a
+//! blockquote line break (it was on `operator-guide/target-store.md`
+//! until 2.23k split the page and sent the mechanism half here):
 //!
 //! ```text
 //! > Authoritative design rationale: [ADR

@@ -708,6 +708,20 @@ else:
         for group, leaves in nav_groups
         if any(url_for(src_uri) in indexable_set for _, src_uri in leaves)
     ]
+    # `source` is built from `git ls-files`, so a NEW page that has been
+    # built but not staged is absent from it and every lookup below is a
+    # bare KeyError with no hint. Say what happened instead: adding a page
+    # and forgetting to `git add` it is the single most common way to
+    # arrive here, and a traceback reads as the gate being broken.
+    missing = sorted(u for u in indexable if u not in source)
+    if missing:
+        raise SystemExit(
+            "these published pages are not tracked by git, so this check cannot read their "
+            "committed source:\n  "
+            + "\n  ".join(missing)
+            + "\n`git add` them and re-run. (`source` is built from `git ls-files`: an untracked "
+            "page is built by mkdocs but invisible here.)"
+        )
     if any(source[u][0] not in nav_label for u in indexable):
         want_headings.append(UNSECTIONED)
     absent = [h for h in want_headings if h not in headings]

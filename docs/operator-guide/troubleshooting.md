@@ -480,7 +480,7 @@ runbooks by code, not by the human-readable summary.
 ## See also
 
 - [Operator quickstart](./quickstart.md) — happy-path setup.
-- [Target store](./target-store.md) — credential resolution
+- [The target store on disk](../how-it-works/the-target-store.md) — credential resolution
   chain reference.
 - [CLI reference](../reference/cli/index.md) — every
   subcommand + flag.

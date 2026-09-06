@@ -163,7 +163,7 @@ apprafter whoami                # one-line identity + active target
 
 Credentials are stored in `~/.config/apprafter/targets/prod/` at
 mode 0600. The CLI never echoes the token value in `show`/`whoami`
-output. See [Target store](./target-store.md) for the full
+output. See [The target store on disk](../how-it-works/the-target-store.md) for the full
 file layout and the credential resolution chain (flag → env → store).
 
 ## Step 2 — Bring the cluster up
@@ -360,7 +360,7 @@ byte-identical to the pre-colour baseline.
 
 ## Where to look next
 
-- [Target store](./target-store.md) — target store layout +
+- [Managing targets](./target-store.md) — target store layout +
   credential resolution chain reference.
 - [Troubleshooting](./troubleshooting.md) — diagnostic-code
   catalogue, common failures, recovery commands.

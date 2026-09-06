@@ -28,6 +28,9 @@ than taken on faith.
 - [Egress derived from declared dependencies](egress-policy.md) — the per-app
   CiliumNetworkPolicy, which rules each profile emits, and how to tell a policy
   drop from a missing listener.
+- [The target store on disk](the-target-store.md) — what
+  `apprafter target add` writes and where, and the order every later command
+  resolves a credential in.
 - [Right-sizing an application's requests](resources-and-autoscaling.md) — the
   VerticalPodAutoscaler the platform renders, why the Deployment and the pod
   permanently disagree, the cluster-wide floors and ceilings, and how to tell a
