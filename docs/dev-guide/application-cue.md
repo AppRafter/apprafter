@@ -53,8 +53,7 @@ app: v1alpha1.#Application & {
 ### Field reference
 
 All fields live under `spec.base` (or `spec.environments.<env>` for
-overrides — see below). The Rust operator mirrors this exactly via
-`ApplicationSpec { base, environments }`.
+overrides — see below).
 
 | Field             | Type                        | Notes                                               |
 | ----------------- | --------------------------- | --------------------------------------------------- |
@@ -350,8 +349,9 @@ workspace the sidecar does.
 
 **`field not allowed: <field-name>`**
 
-The CUE schema uses `close()` semantics in some contexts. Check
-that you are only writing fields declared in `#ApplicationSpec`.
+The CUE schema uses `close()` semantics in some contexts. Check that
+every field you write appears in the [field reference](#field-reference)
+above.
 `needs` is supported (see *Declaring dependencies* above); fields
 from future spec versions (`autoscale`, `confidential`) are not yet
 in v1alpha1 and will produce this error.

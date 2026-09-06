@@ -151,9 +151,8 @@ for seven days and then deleted automatically.
 
 **Re-declaring the dependency inside that window brings the same volume back**,
 with the data still in it: register the application again and the pending
-deletion is cancelled, the original volume reattached. This is the intended way
-to undo an accidental removal, and `e2e/needs-disk-walk.sh` exercises it end to
-end.
+deletion is cancelled, the original volume reattached. This is the intended
+way to undo an accidental removal.
 
 There is no supported way to shorten the seven days, and the retention record
 is deliberately not hand-editable — it is the work order the cleanup executes,

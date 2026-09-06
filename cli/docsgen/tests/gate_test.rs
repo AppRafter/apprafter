@@ -1500,7 +1500,7 @@ fn a_citation_on_a_mechanism_page_is_where_it_belongs() {
     assert!(found.is_empty(), "{found:?}");
 }
 
-// ---- code links on a guide (2.24) --------------------------------------
+// ---- code references on a guide (2.24) ---------------------------------
 
 #[test]
 fn a_guide_linking_a_source_file_is_reported() {
@@ -1514,7 +1514,7 @@ fn a_guide_linking_a_source_file_is_reported() {
         &gate
             .check_source("docs/dev-guide/application-cue.md", page)
             .unwrap(),
-        gate::CODE_LINK_PLACEMENT,
+        gate::CODE_REFERENCE_PLACEMENT,
     );
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].starts_with("3: "), "{found:?}");
@@ -1533,7 +1533,7 @@ fn a_guide_linking_out_of_docs_by_relative_path_is_the_same_defect() {
         &gate
             .check_source("docs/operator-guide/quickstart.md", page)
             .unwrap(),
-        gate::CODE_LINK_PLACEMENT,
+        gate::CODE_REFERENCE_PLACEMENT,
     );
     assert_eq!(found.len(), 1, "{found:?}");
 }
@@ -1548,7 +1548,7 @@ fn a_guide_linking_a_docs_page_is_silent() {
         &gate
             .check_source("docs/dev-guide/environments.md", page)
             .unwrap(),
-        gate::CODE_LINK_PLACEMENT,
+        gate::CODE_REFERENCE_PLACEMENT,
     );
     assert!(found.is_empty(), "{found:?}");
 }
@@ -1565,7 +1565,7 @@ fn the_issue_tracker_is_not_code() {
         &gate
             .check_source("docs/operator-guide/postgres.md", page)
             .unwrap(),
-        gate::CODE_LINK_PLACEMENT,
+        gate::CODE_REFERENCE_PLACEMENT,
     );
     assert!(found.is_empty(), "{found:?}");
 }
@@ -1580,7 +1580,7 @@ fn third_party_documentation_is_not_this_repository() {
         &gate
             .check_source("docs/dev-guide/build-and-push.md", page)
             .unwrap(),
-        gate::CODE_LINK_PLACEMENT,
+        gate::CODE_REFERENCE_PLACEMENT,
     );
     assert!(found.is_empty(), "{found:?}");
 }
@@ -1601,27 +1601,96 @@ fn a_mechanism_page_may_link_the_source() {
     ] {
         let found = of(
             &gate.check_source(file, page).unwrap(),
-            gate::CODE_LINK_PLACEMENT,
+            gate::CODE_REFERENCE_PLACEMENT,
         );
         assert!(found.is_empty(), "{file}: {found:?}");
     }
 }
 
 #[test]
-fn a_path_the_reader_creates_in_their_own_repository_is_not_a_link() {
-    // The distinction that decides whether this class is usable. Every
-    // guide names `apprafter/Application.cue` — the file the READER
-    // writes — and none of them links it. The rule reads targets only,
-    // so a code span cannot be mistaken for a reference to our tree.
+fn a_path_the_reader_creates_in_their_own_repository_is_not_ours() {
+    // Every guide names `apprafter/Application.cue` — the file the
+    // READER writes. It opens on no top-level directory of this
+    // repository, so it is not a claim about our tree and the span half
+    // of the rule never sees it.
     let (repo, now) = tag_repo();
     let gate = gate_with(repo.path(), now);
-    let page = "# Page\n\nCreate `apprafter/Application.cue` in your repository, then commit \
-                `cli/docsgen/src/gate.rs`.\n";
+    let page = "# Page\n\nCreate `apprafter/Application.cue` in your repository, beside your \
+                `Dockerfile`.\n";
     let found = of(
         &gate
             .check_source("docs/dev-guide/quickstart.md", page)
             .unwrap(),
-        gate::CODE_LINK_PLACEMENT,
+        gate::CODE_REFERENCE_PLACEMENT,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_guide_naming_an_implementation_path_in_a_span_is_the_same_defect_unlinked() {
+    // The shape a link rule cannot see, and the one the corpus carried
+    // eleven times: no link, just a backticked path into the operator or
+    // the CLI, standing as the authority for a claim.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page =
+        "# Page\n\nThe flush lives in `operator/operator-controllers/application/src/lib.rs`.\n";
+    let found = of(
+        &gate
+            .check_source("docs/operator-guide/redis.md", page)
+            .unwrap(),
+        gate::CODE_REFERENCE_PLACEMENT,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].starts_with("3: "), "{found:?}");
+}
+
+#[test]
+fn a_span_naming_a_tree_the_reader_works_in_is_left_alone() {
+    // THE case that decides whether the span half is usable. The
+    // publishing runbook names `docs-site/Dockerfile` because the reader
+    // edits it, and the image guide names a template because the reader
+    // copies it. A rule that could not tell those from the operator's
+    // source would be switched off within the week.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nEdit `docs-site/Dockerfile`, copy `examples/templates/bun-http`, \
+                run `scripts/docs-site-smoke.sh`, and push to `landing/**`.\n";
+    let found = of(
+        &gate
+            .check_source("docs/operator-guide/publish-the-docs-site.md", page)
+            .unwrap(),
+        gate::CODE_REFERENCE_PLACEMENT,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_link_text_is_not_reported_beside_its_own_target() {
+    // One defect, one finding. The span is the link's label, so the
+    // target is the claim — the same rule `codepath` applies, and
+    // without it every rerouted bullet would be reported twice.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nSee [`cli/docsgen/src/gate.rs`](https://github.com/apprafter/apprafter/blob/master/cli/docsgen/src/gate.rs).\n";
+    let found = of(
+        &gate.check_source("docs/dev-guide/index.md", page).unwrap(),
+        gate::CODE_REFERENCE_PLACEMENT,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("github.com"), "{found:?}");
+}
+
+#[test]
+fn a_mechanism_page_may_name_the_implementation_too() {
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nThe renderer is `operator/operator-rendering/src/lib.rs`.\n";
+    let found = of(
+        &gate
+            .check_source("docs/how-it-works/per-environment-deploy.md", page)
+            .unwrap(),
+        gate::CODE_REFERENCE_PLACEMENT,
     );
     assert!(found.is_empty(), "{found:?}");
 }

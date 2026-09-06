@@ -72,9 +72,8 @@ the backup block is git-managed — that is the same thing, expressed durably.
 
 Do **not** reach for `kubectl patch cronjob apprafter-backup-check
 --patch '{"spec":{"suspend":true}}'`. The CronJob is chart-owned and the
-platform components sync with `selfHeal: true`
-(`platform-stack/cue/platform.cue:112`), so Argo CD reverts the suspend on
-its next reconcile.
+platform components sync with `selfHeal: true`, so Argo CD reverts the
+suspend on its next reconcile.
 
 Whichever you choose, run `apprafter backup check` operator-side on your own
 cadence — parking the in-cluster check means nothing verifies the repository

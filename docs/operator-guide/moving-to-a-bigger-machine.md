@@ -300,36 +300,18 @@ The cluster is destroyed and rebuilt. This is not a live migration and there
 is no overlap: from `apprafter destroy` until the workloads are back up on the
 new machine, the cluster does not exist and nothing it served is reachable.
 
-Two full runs of the automated walk on real Hetzner took **29m35s** and
-**21m9s** wall-clock. Read that as an order of magnitude, not a budget — it
-covers the whole walk, including standing the original cluster up and seeding
-it, which you are not doing. Your outage is the `destroy` → workloads-`Ready`
-span inside it.
+Two full rebuilds measured on real Hetzner took **29m35s** and **21m9s**
+wall-clock end to end. Read that as an order of magnitude, not a budget — each
+figure covers standing a cluster up and seeding it first, which you are not
+doing. Your outage is the `destroy` → workloads-`Ready` span inside it.
 
 What dominates that span is the rebuild: provisioning the machine and running
 the full bootstrap — Cilium, Argo CD, then the platform stack syncing its
 components — not the data load, which was small at this size and scales with
 your data rather than with anything AppRafter controls. So plan for tens of
-minutes rather than seconds, and measure your own before you commit to a
-maintenance window. The walk's phase banners carry an elapsed clock, which
-makes the Phase 5 → Phase 7 span the number to read off a run of your own.
-
-## The executable version
-
-`e2e/substrate-upgrade-hetzner.sh` is this procedure written as a script, and
-it is the specification the section above describes: it provisions a `cx23`,
-deploys a real application with a `needs.pg` claim and a `secret:` reference,
-fingerprints the database, upgrades to a `cx33` through the sequence above,
-and asserts every item in *What to verify afterwards*. One switch
-(`APPRAFTER_SUBSTRATE_BACKEND=local|s3`) selects the storage backend, so both
-sequences are the same script. Its Phase 7 is where the verification list came
-from.
-
-Unlike the local-cluster harnesses cited elsewhere on this site, it runs
-against **real Hetzner** and spends real money — two short-lived machines, on
-the order of a couple of euro cents — and it calls `apprafter destroy`, which
-empties the whole project its token belongs to. Point it at a project you are
-willing to lose.
+minutes rather than seconds, and time your own rebuild before you commit to a
+maintenance window: the span to measure runs from `apprafter destroy` to your
+workloads reporting `Ready` again.
 
 
 ## See also

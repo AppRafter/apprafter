@@ -220,8 +220,8 @@ declared dependency:
 | `redis` with `persistent: false` | nothing | a cache by declaration, with no durable volume to snapshot. A restore re-provisions it empty |
 
 **Every other `needs` type is skipped, silently and by design.** `jetstream`,
-`clickhouse`, `s3` and `notifications` have no capture path in this release
-(`cli/backup-core/src/extract.rs`), so a cluster using one of them is **not**
+`clickhouse`, `s3` and `notifications` have no capture path in this release,
+so a cluster using one of them is **not**
 fully covered by a backup. Nothing warns you at backup time; this table is the
 warning.
 
@@ -303,5 +303,3 @@ plain tarballs: `tar -tf volumes/demo/shop-disk/data.tar`.
 - [Moving to a bigger machine](moving-to-a-bigger-machine.md) — the planned
   rebuild that a backup makes possible.
 - [Secrets](secrets.md) — sealing, and what re-sealing replaces.
-- `e2e/backup-restore-hetzner.sh` and `e2e/backup-s3-hetzner.sh` — this page as
-  executable specifications, run on real hardware.

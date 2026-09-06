@@ -192,8 +192,7 @@ off or re-register it elsewhere, not to retire one.
 
     Confirming the flush itself needs the shared pool's admin credential and an
     unrestricted client against an instance that hosts other applications'
-    databases, so the guide does not walk it — `e2e/needs-redis-walk.sh`
-    asserts it instead. The reasoning is in
+    databases, so the guide does not walk it. The reasoning is in
     [How it works](../how-it-works/needs-redis.md#the-grace-window-and-the-flush).
 
 ## How it works

@@ -294,7 +294,8 @@ pub const ADR_CITATION_FORM: &str = "adr-citation-form";
 /// `license.md`, the reference and the ADR corpus are all untouched —
 /// `license.md`'s citations in particular ARE the licence-change record.
 pub const ADR_CITATION_PLACEMENT: &str = "adr-citation-placement";
-/// A guide page linking to a file in the repository.
+/// A guide page reaching into the repository — by link, or by naming
+/// an implementation path in a code span.
 ///
 /// The sibling of [`ADR_CITATION_PLACEMENT`], one surface in. A link to
 /// a source file answers *how does this work* — or, for a schema, *what
@@ -308,19 +309,62 @@ pub const ADR_CITATION_PLACEMENT: &str = "adr-citation-placement";
 /// `operator/operator-rendering/src/lib.rs` for the per-environment
 /// merge rules the page had just finished explaining.
 ///
-/// **What counts as the repository.** A GitHub `blob/` or `tree/` URL
-/// into this repository, and a relative link target that resolves
-/// outside `docs/`. Both are ways of leaving the published site for the
-/// source tree, and they are the same defect written twice.
+/// **Two surfaces, and they are not judged alike** — the same split
+/// [`crate::codepath`] documents, for a different reason.
 ///
-/// **What does not.** The issue tracker, releases, discussions and pull
-/// requests are project surfaces rather than code — a guide telling a
-/// reader where to report a bug is doing its job. Third-party
+/// A **link target** is a destination the reader clicks, and the
+/// published site has none outside `docs/`. So any target that leaves
+/// it is reported: a GitHub `blob/`or `tree/` URL into this repository,
+/// or a relative target that resolves out of the tree. Both are the same
+/// defect written twice.
+///
+/// A **code span** is a name the reader greps for, and some of those
+/// names are legitimately theirs to open. `publish-the-docs-site.md`
+/// names `docs-site/Dockerfile` because the reader edits it;
+/// `build-and-push.md` names `examples/templates/bun-http` because the
+/// reader copies it. So a span is reported only when it opens on a tree
+/// a guide's reader has no business in — the implementation. The list
+/// of those is the git listing minus [`READER_FACING_TREES`], so it
+/// closes over the repository rather than over a hand-kept enumeration,
+/// and a directory added tomorrow is covered the day it appears.
+///
+/// **What is never reported.** The issue tracker, releases, discussions
+/// and pull requests are project surfaces rather than code — a guide
+/// telling a reader where to report a bug is doing its job. Third-party
 /// documentation is not this repository. And a path the reader creates
-/// in THEIR OWN checkout (`apprafter/Application.cue`) is not a
-/// reference to ours; it is never a link, which is what separates the
-/// two.
-pub const CODE_LINK_PLACEMENT: &str = "code-link-placement";
+/// in THEIR OWN checkout (`apprafter/Application.cue`) opens on no
+/// top-level directory of ours at all.
+pub const CODE_REFERENCE_PLACEMENT: &str = "code-reference-placement";
+/// The repository trees a guide's reader legitimately opens.
+///
+/// Everything else is implementation, and a guide naming a path in it is
+/// answering the mechanism question. Each entry earned its place from a
+/// real corpus sentence rather than from a guess at what might be
+/// wanted:
+///
+/// * `docs-site/`, `landing/` — the deployments whose runbooks are
+///   themselves guides, where the reader edits exactly these files;
+/// * `examples/` — templates a reader copies;
+/// * `scripts/`, `.github/` — things a reader runs or a workflow whose
+///   behaviour is the reader\'s consequence;
+/// * `.devcontainer/`, `cue.mod/`, `manifests/`, `overrides/`, `docs/` —
+///   checkout furniture and the site itself.
+///
+/// Wrong in the safe direction: an entry that should not be here lets a
+/// finding through, which review catches. Its absence produces a false
+/// positive, which is loud.
+pub const READER_FACING_TREES: &[&str] = &[
+    ".devcontainer",
+    ".github",
+    "cue.mod",
+    "docs",
+    "docs-site",
+    "examples",
+    "landing",
+    "manifests",
+    "overrides",
+    "scripts",
+];
 /// An obligation count fell below the committed census: the corpus
 /// lost documented surface it used to have.
 ///
@@ -444,7 +488,7 @@ fn remedy(code: &str) -> &'static str {
              where the sentence only name-drops the decision without telling the \
              reader anything to do, drop the clause"
         }
-        CODE_LINK_PLACEMENT => {
+        CODE_REFERENCE_PLACEMENT => {
             "send the reader to the page that answers their question instead: a \
              mechanism page under `how-it-works/` for how it works, the \
              reference for what the field list is, a worked example for what a \
@@ -1607,15 +1651,15 @@ impl Gate {
 
         // Where the repository may be linked from. A guide's reader is
         // doing a task, and the source tree answers a different
-        // question — see [`CODE_LINK_PLACEMENT`]. Off the masked
+        // question — see [`CODE_REFERENCE_PLACEMENT`]. Off the masked
         // `prose` like the two scans below it, for their reason.
         if is_guide(file) {
-            for (line, target) in repository_links(&prose, page_directory(file)) {
+            for (line, text) in repository_references(&prose, page_directory(file), &self.tops) {
                 findings.push(finding(
-                    CODE_LINK_PLACEMENT,
+                    CODE_REFERENCE_PLACEMENT,
                     file,
                     line,
-                    format!("`{target}` leaves the site for the repository"),
+                    format!("`{text}` reaches into the repository"),
                 ));
             }
         }
@@ -2089,11 +2133,34 @@ fn leaves_the_site_for_the_repository(target: &str, page_directory: &str) -> boo
     !segments.first().is_some_and(|first| *first == "docs")
 }
 
-/// Every link on the page that leaves the site for the repository, with
-/// its line and its target.
-fn repository_links(source: &str, page_directory: &str) -> Vec<(usize, String)> {
+/// Whether a code span names a path in an implementation tree.
+///
+/// `tops` is the repository's top-level directory set, so the rule
+/// closes over the tree: what is NOT on [`READER_FACING_TREES`] is
+/// implementation by construction. A span that opens on no top-level
+/// directory of ours is not a claim about this repository at all —
+/// `apprafter/Application.cue` is the reader's own file.
+fn names_an_implementation_tree(span: &str, tops: &[String]) -> bool {
+    let Some((head, _)) = span.split_once('/') else {
+        return false;
+    };
+    tops.iter().any(|t| t == head) && !READER_FACING_TREES.contains(&head)
+}
+
+/// Every reference on the page that reaches into the repository, with
+/// its line and the text to report.
+///
+/// Both surfaces in one pass and in reading order, so a finding list is
+/// read against the page the way [`crate::codepath`] does it.
+fn repository_references(
+    source: &str,
+    page_directory: &str,
+    tops: &[String],
+) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     for (i, line) in source.lines().enumerate() {
+        let mut found: Vec<(usize, String)> = Vec::new();
+
         let mut at = 0;
         while let Some(open) = line[at..].find("](") {
             let open = at + open;
@@ -2104,9 +2171,33 @@ fn repository_links(source: &str, page_directory: &str) -> Vec<(usize, String)> 
             at = end + 1;
             let target = &line[open + 2..end];
             if leaves_the_site_for_the_repository(target, page_directory) {
-                out.push((i + 1, target.to_string()));
+                found.push((open, target.to_string()));
             }
         }
+
+        // Spans, skipping any that is a link's TEXT — there the link's
+        // target is the claim, and reporting both would name one defect
+        // twice. Same rule, same reason, as `codepath`.
+        let mut rest = line;
+        let mut base = 0;
+        while let Some(start) = rest.find('`') {
+            let after = start + 1;
+            let Some(len) = rest[after..].find('`') else {
+                break;
+            };
+            let span = &rest[after..after + len];
+            let at = base + start;
+            let ends = base + after + len + 1;
+            let is_link_text = line[..at].ends_with('[') && line[ends..].starts_with("](");
+            if !is_link_text && names_an_implementation_tree(span, tops) {
+                found.push((at, span.to_string()));
+            }
+            base = ends;
+            rest = &line[base..];
+        }
+
+        found.sort_by_key(|(offset, _)| *offset);
+        out.extend(found.into_iter().map(|(_, text)| (i + 1, text)));
     }
     out
 }

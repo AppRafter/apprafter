@@ -88,9 +88,8 @@ reachability.
 
 Provisioning a new machine requires an explicit server type, and
 none was found in the resolution chain (`--server-type` flag >
-`spec.nodes[0].type` in the manifest > `HetznerCloudState.server_type`
-in state > `TargetConfig.server_type` in the target store >
-`APPRAFTER_SERVER_TYPE` env). The error fires only on the **create
+`spec.nodes[0].type` in the manifest > the type recorded in state > the
+type in the target store > `APPRAFTER_SERVER_TYPE` env). The error fires only on the **create
 path** (a new machine is about to be provisioned); `apply` on an
 already-running cluster does not require the type.
 
@@ -332,8 +331,7 @@ you see the value echoed anywhere in v0.1.78+, file an issue.
 
 They do now, and no manual roll is needed. The platform stack sets
 `rollOutCiliumPods`, `operator.rollOutPods` and `envoy.rollOutPods` on the
-Cilium chart (`platform-stack/cue/component_cilium.cue`), which stamps a config
-checksum onto each pod template — so a values change rolls the agent, the
+Cilium chart, which stamps a config checksum onto each pod template — so a values change rolls the agent, the
 operator and Envoy on its own.
 
 If a Cilium pod is genuinely stuck, that is a different problem from a config

@@ -314,8 +314,7 @@ reserved for emergency overrides.
     reconciles, so `spec.operator.enabled` and
     `spec.admissionWebhook.enabled` have no effect —
     `cluster-bootstrap` reads no `Infrastructure.cue` at all. The
-    fields still parse; their removal is tracked in
-    `docs/measurements/schema-followups.md`.
+    fields still parse, and are scheduled for removal.
 
 ## Day-2 operations
 
