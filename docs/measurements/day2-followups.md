@@ -3438,7 +3438,7 @@ the other direction.
 
 ---
 
-## D30 — the landing preview host previews nothing
+## D30 — the landing preview host previews nothing — FIXED 2026-09-06
 
 Found 2026-09-06 while writing `docs/how-it-works/deploying-the-landing-and-cms.md`
 as a worked example: writing a page from a source is the first time anybody
@@ -3466,10 +3466,13 @@ a look at the preview host was already public before the look.
 the prerequisite, and until then the preview host is production with a
 different hostname.
 
-Not fixed here: it is a change to a live deployment's manifest and belongs with
-someone who can watch the result.
+**Fixed 2026-09-06.** The registry was checked first: `:preview` exists and
+carries a `preview-<sha>` history, so the temporary pin's own condition — "once
+landing-preview-build.yml fires the first publish" — had been satisfied and was
+simply never reverted. The manifest now names `:preview`, with a comment saying
+why it must not be `:latest` rather than saying when to change it back.
 
-## D31 — `landing/DEPLOY.md` documents a deployment the cluster replaced
+## D31 — `landing/DEPLOY.md` documents a deployment the cluster replaced — FIXED 2026-09-06
 
 Same reading. `landing/DEPLOY.md` describes a systemd + podman single-host
 deploy, while `landing/web/apprafter/Application.cue` and
@@ -3480,7 +3483,14 @@ manifests are the ones that run.
 It is a tracked file, in English, and it reads as current. A contributor
 following it would configure a host that nothing routes to.
 
-**Fix:** either rewrite it as the local-development recipe it is closest to, or
-delete it and point at
-`docs/how-it-works/deploying-the-landing-and-cms.md`, which now describes what
-actually runs.
+**Fixed 2026-09-06** by keeping the half that was true and deleting the half
+that was not. What stays: the release chain, the four workflows, the three tag
+streams, the promote flow and the post-deploy checks. What went: the Hetzner
+VPS framing, the podman pull loop and its systemd units, the standalone
+Postgres container, the outer Caddyfile, and the `pg_dump` cron — the database
+is a `needs.pg` claim now and rides the platform's own backup. 400 lines to
+221, and it opens by naming the three manifests and pointing at the worked
+example. Two further inaccuracies fell out of the same read: it said Argo CD
+watches `:prod` for production where the manifest names `:latest`, and it told
+the reader to gate a public preview host behind basic-auth when the preview
+application is `network: internal` and has no public route to gate.

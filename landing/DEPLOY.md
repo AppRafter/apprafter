@@ -1,21 +1,20 @@
-# Landing deployment
+# Landing: releasing and content promotion
 
-Target deploy (per Q1 + Q2, 2026-05-22):
+Both landing applications run **on the AppRafter cluster**, deployed by Argo CD
+from the manifests in this repository:
 
-- **Host:** the same Hetzner VPS that runs the rest of the AppRafter
-  community/dev infrastructure.
-- **Reverse proxy:** Caddy.
-- **Two upstreams behind Caddy:**
-  - `apprafter.dev` → static files from `landing/web/dist/` served
-    directly by Caddy with gzip + zstd.
-  - `cms.apprafter.dev` → `next start` from `landing/cms/.next/`,
-    listening on `localhost:${LANDING_CMS_PORT}` (default 3000),
-    behind Caddy as a reverse proxy.
-- **Database:** standalone Postgres 16 container — separate from
-  any future shared platform Postgres; the landing CMS has its own
-  data store and lifecycle.
-- **Mail:** `nodemailer` over an SMTP relay (Resend / Postmark /
-  similar — chosen at deploy time, secret injected via env).
+| | Manifest | Host |
+|---|---|---|
+| Web (production) | `landing/web/apprafter/Application.cue` | `apprafter.dev` |
+| Web (preview) | `landing/web/apprafter/Application-preview.cue` | internal only |
+| CMS | `landing/cms/apprafter/Application.cue` | `cms.apprafter.dev` |
+
+What each piece of that chain is responsible for, and where every value comes
+from, is
+[Worked example: deploying the landing site and its CMS](../docs/how-it-works/deploying-the-landing-and-cms.md).
+
+This file is the operator-side companion: how a release is cut, how a content
+change reaches production, and how to check both afterwards.
 
 ## Releasing
 
@@ -79,36 +78,6 @@ public once via the GitHub UI: Packages → <package> → Settings →
 Change visibility → Public. After that the host (or in-cluster
 runtime) can pull without auth.
 
-## One-time setup
-
-```sh
-# 1) Pull the images on the deploy host (or run via systemd-unit
-#    below which pulls automatically on each restart).
-podman pull ghcr.io/apprafter/landing-web:landing-v0.1.0
-podman pull ghcr.io/apprafter/landing-cms:landing-v0.1.0
-
-# 2) Wire the CMS env + Postgres (see following sections), then
-#    start the systemd units (one for web, one for cms).
-sudo systemctl daemon-reload
-sudo systemctl enable --now apprafter-landing-web apprafter-landing-cms
-
-# 3) Seed the content globals into the running CMS (one-shot;
-#    idempotent — re-run after JSON edits if you want them
-#    mirrored back into Payload). Either:
-#    (a) inside the cms container:
-podman exec apprafter-landing-cms node /app/seed.js
-#    (b) or with a local bun checkout pointed at the prod CMS:
-DATABASE_URI=... PAYLOAD_SECRET=... \
-  bun --filter @apprafter/landing-cms run seed
-```
-
-The web image is content-static — it ships with the JSON
-fallbacks baked in (`LANDING_USE_FALLBACK=1` during image build),
-so it renders without depending on the live CMS at boot. To
-refresh static output after content edits, cut a new
-`landing-v*` tag (or trigger the workflow via `workflow_dispatch`)
-and re-pull.
-
 ## Building from source (fallback path)
 
 If you don't want to tag a release yet, build locally:
@@ -133,99 +102,6 @@ docker run --rm -p 3000:3000 \
   landing-cms:dev
 ```
 
-## Postgres container
-
-```sh
-sudo mkdir -p /srv/apprafter-cms-pg
-sudo podman run -d --name apprafter-cms-pg \
-  --restart=always \
-  -e POSTGRES_DB=apprafter_cms \
-  -e POSTGRES_USER=apprafter \
-  -e POSTGRES_PASSWORD=$(pwgen -s 32 1) \
-  -v /srv/apprafter-cms-pg:/var/lib/postgresql/data \
-  -p 127.0.0.1:5432:5432 \
-  docker.io/library/postgres:16
-```
-
-Keep the password in `/etc/apprafter-cms.env` (mode 0600, root + the
-service user only). Add the matching `DATABASE_URI` there too.
-
-## systemd unit for the CMS
-
-`/etc/systemd/system/apprafter-cms.service`:
-
-```ini
-[Unit]
-Description=AppRafter landing CMS (Payload 3 + Next 15)
-After=network.target podman.socket
-Wants=podman.socket
-
-[Service]
-Type=simple
-User=apprafter-cms
-Group=apprafter-cms
-WorkingDirectory=/opt/apprafter-landing/cms
-EnvironmentFile=/etc/apprafter-cms.env
-ExecStart=/usr/local/bin/bun run start
-Restart=on-failure
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-```
-
-`/etc/apprafter-cms.env` (0600):
-
-```
-PAYLOAD_SECRET=<64+ char random>
-DATABASE_URI=postgres://apprafter:<pw>@127.0.0.1:5432/apprafter_cms
-PAYLOAD_PUBLIC_SERVER_URL=https://cms.apprafter.dev
-LANDING_CMS_PORT=3000
-LANDING_CMS_CORS_ORIGINS=https://apprafter.dev
-
-# Auto-rebuild of the static web image on content changes.
-# Generate a fine-grained PAT at
-#   github.com/settings/personal-access-tokens/new
-# scoped to the apprafter repo with permission
-#   "Repository permissions > Contents: write"
-# (or a classic PAT with `repo` scope).
-GITHUB_DISPATCH_TOKEN=<token>
-GITHUB_REPO=AppRafter/apprafter
-
-# SMTP (Resend example)
-SMTP_HOST=smtp.resend.com
-SMTP_PORT=587
-SMTP_USER=resend
-SMTP_PASS=<resend api key>
-SMTP_FROM=hello@apprafter.dev
-```
-
-## Caddyfile
-
-```caddy
-apprafter.dev {
-  root * /var/www/apprafter.dev
-  file_server
-  encode gzip zstd
-  header /fonts/* Cache-Control "public, max-age=31536000, immutable"
-  header /_astro/* Cache-Control "public, max-age=31536000, immutable"
-  header / Cache-Control "public, max-age=3600"
-  try_files {path} {path}/ /404.html
-  handle_errors {
-    rewrite * /404.html
-    file_server
-  }
-}
-
-cms.apprafter.dev {
-  reverse_proxy localhost:3000
-  encode gzip zstd
-}
-```
-
-The `try_files` line keeps trailing-slash routing working
-(`/privacy` and `/privacy/` both resolve), and the `handle_errors`
-block serves the prebuilt 404 page on misses.
 
 ## Content-driven rebuilds — preview / promote / prod
 
@@ -237,25 +113,18 @@ Three tag streams on `landing-web`:
 | `:prod` + `:latest` | every Publish in admin | `landing-promote-to-prod.yml` — retags `:preview` → `:prod` + `:latest` via `docker buildx imagetools create`, no rebuild |
 | `:landing-vX.Y.Z` | every release tag | `release-landing.yml` — independent pinned-release path |
 
-Argo CD on the cluster watches `:prod` for the production app
+Argo CD on the cluster watches `:latest` for the production app
 (`landing-web` Application — `landing/web/apprafter/Application.cue`)
 and `:preview` for the preview app (`landing-web-preview` Application
 — `landing/web/apprafter/Application-preview.cue`, same package,
 both vet in one `cue vet ./landing/web/apprafter/` pass).
 
-Preview should sit behind basic-auth / IP-allowlist on
-`preview.apprafter.dev`. v1alpha1 doesn't model HTTP middleware,
-so the gating lives at the outer Caddy layer — add to your
-Caddyfile:
+The preview application is `network: internal` — it has no public route at
+all, which is what makes it safe to point at unreviewed content. Reach it
+with a port-forward:
 
-```caddy
-preview.apprafter.dev {
-  basicauth /* {
-    apprafter <bcrypt hash from `caddy hash-password`>
-  }
-  reverse_proxy <preview-pod-ip>:80
-  encode gzip zstd
-}
+```sh
+kubectl -n apprafter port-forward deploy/landing-web-preview 8080:80
 ```
 
 ### Promote flow (admin)
@@ -292,43 +161,10 @@ Failure modes the design covers:
   global re-creates `:preview`, then a second Promote click
   fixes prod.
 
-Recommended setup with podman:
-
-**Option A — podman auto-update (preferred).** Run the web
-container with `--label io.containers.autoupdate=registry`
-and enable the `podman-auto-update.timer` systemd unit:
-
-```sh
-sudo systemctl enable --now podman-auto-update.timer
-```
-
-`podman auto-update` polls each tagged image, pulls the new
-digest, and restarts the container if the digest changed. The
-default timer fires daily; for tighter loops drop a `[Timer]
-OnCalendar=*:0/5` override.
-
-**Option B — explicit pull cycle.** A short systemd timer:
-
-```ini
-# /etc/systemd/system/apprafter-landing-web-pull.timer
-[Unit]
-Description=Periodic pull for landing-web :prod tag
-
-[Timer]
-OnCalendar=*:0/5
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
-
-```ini
-# /etc/systemd/system/apprafter-landing-web-pull.service
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/podman pull ghcr.io/apprafter/landing-web:prod
-ExecStartPost=/bin/systemctl try-restart apprafter-landing-web.service
-```
+Argo CD is what pulls each new digest — there is no timer, no
+`podman auto-update`, and nothing to configure on a host. The operator
+resolves the tag to its current digest on every reconcile, so a retag rolls
+the Deployment by itself.
 
 ### CMS-side wiring
 
@@ -338,8 +174,8 @@ GitHub's `repository_dispatch` API with type
 `landing-content-changed`, which the workflow listens for.
 
 For the hook to fire, set `GITHUB_DISPATCH_TOKEN` and `GITHUB_REPO`
-in `/etc/apprafter-cms.env` (see the env block above). Without
-them the hook logs a warning and skips — useful in dev.
+on the CMS deployment. Without them the hook logs a warning and skips —
+useful in dev.
 
 ### Manual rebuild (escape hatch)
 
@@ -362,16 +198,11 @@ rapid-fire edits coalesce to a single final build.
 
 ## Backups
 
-`pg_dump` cron (root crontab on the host):
+The CMS database is a `needs.pg` claim on the cluster, so it is captured by
+the platform's own backup — `apprafter backup create`, and the scheduled
+off-site push if it is enabled. There is no separate cron for it.
 
-```cron
-15 4 * * * podman exec apprafter-cms-pg pg_dump -U apprafter -d apprafter_cms | gzip > /srv/backups/apprafter-cms/$(date +\%F).sql.gz
-```
-
-Retain 14 days; mirror to off-host storage via the project's
-standard backup pipeline.
-
-## Verification after deploy
+## Verification after a deploy
 
 ```sh
 curl -I https://apprafter.dev/                  # 200, gzip
@@ -380,21 +211,11 @@ curl -I https://apprafter.dev/sitemap-index.xml # 200
 curl -I https://cms.apprafter.dev/admin/        # 200 (login screen)
 curl -X POST -H 'Content-Type: application/json' \
   -d '{"email":"deploy-smoke@apprafter.dev"}' \
-  https://apprafter.dev/api/waitlist-signups    # 201 (proxied via Caddy)
+  https://apprafter.dev/api/waitlist-signups    # 201
 ```
 
-The waitlist POST should land in the admin under `Collections →
-Waitlist Signups`. Delete the test entry afterwards.
+The waitlist POST should land in the admin under `Collections → Waitlist
+Signups`. Delete the test entry afterwards.
 
-## Repo-level CI
-
-Lint + typecheck + smoke tests run on every PR via the existing
-repo workflows (`/.github/workflows/lint.yml`, `test.yml`). The
-Bun workspace-children filter added in commit `dca51b5` skips
-`landing/cms` and `landing/web` and runs everything from the
-`landing/` root once.
-
-If you want a separate workflow scoped to `landing/**` (path
-filtering, separate badge), the template lives at
-`landing/ci/landing-ci.example.yml` once that gets added; until
-then the unified workflows are sufficient.
+`apprafter app status landing-web` and `apprafter app status landing-cms` are
+the cluster-side view of the same question.

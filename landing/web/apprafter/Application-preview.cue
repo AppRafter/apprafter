@@ -50,14 +50,17 @@ landingWebPreview: v1alpha1.#Application & {
 	}
 	spec: {
 		base: {
-			// Rolling preview tag — bumped by
+			// The rolling PREVIEW stream, pushed by
 			// .github/workflows/landing-preview-build.yml on
-			// every Payload content-global save. Temporarily
-			// pinned to :latest while the promotion workflow
-			// hasn't seeded :preview yet (2026-05-25 walk —
-			// switch back to :preview once landing-preview-
-			// build.yml fires the first publish).
-			image:    "ghcr.io/apprafter/landing-web:latest"
+			// every Payload content-global save.
+			//
+			// It must not be :latest. That is the tag production
+			// watches, and pointing this host at it makes the
+			// preview serve exactly what is already public —
+			// which removes the one property the two-stream
+			// design exists for, since the inspection that gates
+			// a promotion would then be inspecting the live site.
+			image:    "ghcr.io/apprafter/landing-web:preview"
 			replicas: 1
 			expose: {
 				port:    80
