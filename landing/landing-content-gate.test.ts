@@ -118,6 +118,23 @@ describe('SYS-3 (b) — how a phase is written', () => {
     expect(/Phase \d+\+/.test(reg)).toBe(false);
   });
 
+  test('published content carries no internal product numbering', () => {
+    // `Product 1` and `Product 2` are this repository's internal names
+    // for the two migration products. Both reached the live roadmap and
+    // nothing was watching. The feature ledger is about to link to that
+    // roadmap, so the leak closes before the link opens.
+    let seen = 0;
+    for (const f of FALLBACK_FILES) {
+      const raw = readFileSync(join(FALLBACK, f), 'utf8');
+      seen += 1;
+      expect({ file: f, hit: /Product [12]\b/.test(raw) }).toEqual({
+        file: f,
+        hit: false,
+      });
+    }
+    expect(seen).toBe(FALLBACK_FILES.length);
+  });
+
   test('a phase mention inside CMS HTML is a label, or is on the list of why not', () => {
     // Scoped Astro styles cannot reach `set:html` content, so `.phase-ref`
     // in the global sheet is the ONLY way a CMS-authored mention can look
@@ -130,7 +147,10 @@ describe('SYS-3 (b) — how a phase is written', () => {
       'Phase 2': 'shipped era — no roadmap block exists to anchor to',
       'Phase 3': 'in the roadmap prose itself, where a chip would nest inside its own block',
       'Phase 4': 'in the roadmap prose itself, where a chip would nest inside its own block',
-      'Phase 4.5': 'fractional; the Operations add-on has no registry entry (open under 2.21a)',
+      'Phase 4.5':
+        'fractional; the Operations add-on has no roadmap card, so a registry entry ' +
+        'would anchor at an id the page never emits — settled under 2.21a, same ' +
+        'evidence as Post-launch',
     };
     // RECURSIVE. The first version walked `Object.entries` of the root
     // and passed vacuously: `transparency.json` keeps its `bodyHtml`

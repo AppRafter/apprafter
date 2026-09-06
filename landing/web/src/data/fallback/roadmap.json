@@ -39,7 +39,7 @@
         { "text": "Hard multi-tenancy via Kamaji + Capsule" },
         { "text": "Turnkey Cloud launches (Tier 1–3)" },
         { "text": "Live platform demo via self-hosted AccessGrant" },
-        { "text": "One-time migration toolkit (Product 1: cloud-foreign → AppRafter)" }
+        { "text": "One-time migration toolkit: cloud-foreign → AppRafter" }
       ]
     },
     {
@@ -54,7 +54,7 @@
       "num": "Phase 8",
       "title": "Cross-cluster federation",
       "items": [
-        { "text": "Cross-cluster MigrationPlan (Product 2): sub-second cutover between clusters" },
+        { "text": "Cross-cluster MigrationPlan: sub-second cutover between clusters" },
         { "text": "DR failover as an orchestrated operation" },
         { "text": "Region migration within Turnkey — invisible to the customer" }
       ]

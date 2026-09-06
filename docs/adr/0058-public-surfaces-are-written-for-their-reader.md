@@ -286,6 +286,33 @@ the stricter one costs a reader nothing they cannot reach in one more click.
 unaffected. `license.md`'s citations in particular are the licence-change record and are
 load-bearing where they are.
 
+## Amendment — the feature ledger, 2026-09-06
+
+`docs/status.md` is a fifth public surface, and the three-surface test above does not reach it. It
+is not a guide, not a mechanism page and not a decision. Its reader asks a fourth question —
+**is this built, and when will it be** — and everything on the page that does not answer that
+question belongs somewhere else.
+
+The page arrived by publishing an internal engineering tracker verbatim, which is the third
+instance of the root cause this ADR was opened for. Four rules follow from its reader:
+
+- **Its columns answer only its own question.** A build-order coordinate, a `plan.md` subphase and
+  a checkpoint name answer *how the work was sequenced*, which is `plan.md`'s question and
+  `plan.md`'s reader. They go back there.
+- **A row's phase is a link, and it joins on the stable id.** The visible text stays the display
+  label; the href carries `roadmap-phase-<registry id>`. A renumber then changes what a reader
+  *reads* and not what they *subscribed to* — the contract the phase registry was built for, and
+  the reason `id` and `label` are separate fields in it.
+- **The ledger never offers a subscribe control that does not exist.** The roadmap renders one card
+  per published roadmap entry and the notify button lives on the card, so a phase with no card has
+  no button and its cell is not a link. This is what settles both open cases: `Post-launch` and the
+  fractional `Phase 4.5` get no registry entry, because an entry with no card would anchor at an id
+  the page never emits.
+- **A mark is a claim about the code.** `✅` means delivered and verified. An architectural property
+  or a published policy has no ship date and takes a second, visually distinct vocabulary, because
+  forcing one into the delivery marks is how a page comes to claim something is built when nothing
+  was built — which is exactly what a survey of the source material caught it doing.
+
 ## Owner
 
 Platform documentation. Amendments follow ADR 0057's convention: the decision text is written
