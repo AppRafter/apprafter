@@ -40,6 +40,9 @@ than taken on faith.
   capacity warning measures.
 - [How a restore replays a backup](how-a-restore-works.md) — the order, and the
   two invariants that order protects.
+- [How retention and the integrity check work](backup-retention-and-checks.md) —
+  why a prune deletes whole runs rather than snapshots, what the weekly check
+  Job runs, and what the cluster's copy of the credential can reach.
 - [Per-environment deploy](per-environment-deploy.md) — how an override merges
   onto the base, and why the environment belongs to the deployment.
 - [The image digest](the-image-digest.md) — why a re-pushed tag rolls at all,

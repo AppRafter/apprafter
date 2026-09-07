@@ -80,3 +80,5 @@ respective namespaces: app user secrets into their app namespace,
   modes and the disaster-recovery runbook.
 - [Back up a cluster](../operator-guide/backup-restore.md) — what the artefact
   this replays actually contains.
+- [How retention and the integrity check work](backup-retention-and-checks.md) —
+  whether the run you are about to replay still exists, and whether it verifies.

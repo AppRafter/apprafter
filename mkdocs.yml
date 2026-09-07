@@ -285,6 +285,7 @@ nav:
       - How the platform upgrades itself: how-it-works/platform-upgrades.md
       - Cross-application shared volumes: how-it-works/cross-application-shared-volumes.md
       - How a restore replays a backup: how-it-works/how-a-restore-works.md
+      - How retention and the integrity check work: how-it-works/backup-retention-and-checks.md
       - Per-environment deploy: how-it-works/per-environment-deploy.md
       - The image digest: how-it-works/the-image-digest.md
       - The public route: how-it-works/the-public-route.md

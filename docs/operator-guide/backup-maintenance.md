@@ -10,12 +10,19 @@ cluster](backup-restore.md) gets you a working backup with defaults that are
 already sensible, and this page is what you come back to when you want to
 change one of them, or when a check has told you something.
 
+What each of these settings does once it is in the cluster — what a prune
+deletes, what the weekly Job runs, what the credential reaches — is [How
+retention and the integrity check
+work](../how-it-works/backup-retention-and-checks.md).
+
 ## Retention and prune
 
-Retention uses **restic's own** snapshot retention — a host- and format-aware
-`forget --prune` keyed by keep-daily / keep-weekly / keep-monthly (built-in
-defaults **7 / 4 / 6**). In the default `enforce: operator` mode you run it
-yourself, outside the cluster, with full credentials:
+Retention keeps whole backup **runs**, not individual snapshots, by keep-daily /
+keep-weekly / keep-monthly counts (defaults **7 / 4 / 6**) — [what a run is, and
+how the three counts
+combine](../how-it-works/backup-retention-and-checks.md#what-retention-counts).
+In the default `enforce: operator` mode you run it yourself, outside the
+cluster, with full credentials:
 
 ```text
 apprafter backup prune [--repo s3:…] \
@@ -31,15 +38,12 @@ Credentials resolve from `--credential-file` then the environment. On success
 dedup makes growth sub-linear, so retention is a rare, deliberate operation, not
 a per-run one.
 
-> **Why not an S3 bucket lifecycle rule?** It is tempting to set a bucket-level
-> "delete objects older than N days" lifecycle rule and skip `prune` entirely.
-> **Do not** — it will corrupt the repository. restic is content-addressed and
-> packs *many* snapshots' data into shared `data/` pack files; a fresh snapshot
-> routinely references pack objects that are physically old. A lifecycle rule
-> deletes objects by *object age*, so it will delete still-referenced packs and
-> leave the repo unrestorable. Retention **must** go through
-> `restic forget --prune` (i.e. `apprafter backup prune`), which walks the
-> reference graph and only removes truly unreferenced packs.
+> **Do not use an S3 bucket lifecycle rule for this.** A "delete objects older
+> than N days" rule deletes by *object age*, and a restic repository routinely
+> references physically old pack objects from its newest snapshot — the rule
+> will delete still-referenced packs and leave the repository unrestorable.
+> Retention must go through `apprafter backup prune`
+> ([why](../how-it-works/backup-retention-and-checks.md#why-a-bucket-lifecycle-rule-is-not-retention)).
 
 ## Integrity checks and locks
 
@@ -47,10 +51,12 @@ a per-run one.
 apprafter backup check [--repo s3:…] [--credential-file <dotenv>] [--read-data]
 ```
 
-`check` runs `restic check` against the repository — the same verification that
-the in-cluster **`apprafter-backup-check` CronJob** runs weekly (default
-`0 6 * * 0`). By default it verifies structure only; `--read-data` re-downloads
-and re-hashes **every** pack for a deep verify (slower, bandwidth-heavy). Run the
+`check` runs `restic check` against the repository — the same verification the
+in-cluster **`apprafter-backup-check` CronJob** runs weekly (default
+`0 6 * * 0`; [what that Job actually
+runs](../how-it-works/backup-retention-and-checks.md#what-the-weekly-check-runs)).
+By default it verifies structure only; `--read-data` re-downloads and re-hashes
+**every** pack for a deep verify (slower, bandwidth-heavy). Run the
 operator-side `check` when your provider can't express the scoped-delete policy
 and you have [turned the in-cluster check off](#turning-the-in-cluster-check-off), or any
 time you want a manual verification with full credentials.
@@ -79,14 +85,13 @@ Whichever you choose, run `apprafter backup check` operator-side on your own
 cadence — parking the in-cluster check means nothing verifies the repository
 until you do.
 
-> **Where check failures surface.** The weekly in-cluster check runs `restic`
-> directly (the runner binary has no check-only mode), so a failed check shows
-> up as a **`Failed` Job** in `apprafter-system` (kept per
-> `failedJobsHistoryLimit`) — it does **not** write the `apprafter-backup-status`
-> ConfigMap (only the backup runner does). So `apprafter backup status` reflects
-> the last *backup* outcome; for the last *check* outcome, look at the
-> `apprafter-backup-check` Job history (`kubectl get jobs -n apprafter-system`)
-> or run `apprafter backup check` yourself.
+> **Where check failures surface.** `apprafter backup status` reports the most
+> recent check Job on its `Last check Job:` line, so a red check is visible
+> there. What it cannot tell you is *why*: the check Job never writes the
+> runner's status ConfigMap, so the `lastError` you see is always a *backup*
+> error, never a check error. For the reason, read the failed Job's pod log — or
+> re-run `apprafter backup check` yourself with full credentials
+> ([why](../how-it-works/backup-retention-and-checks.md#where-the-check-result-shows-up)).
 
 ```text
 apprafter backup unlock [--repo s3:…] [--credential-file <dotenv>]
@@ -102,7 +107,10 @@ in-cluster run died unexpectedly.
 ## The scoped-credentials ladder — `enforce: operator` vs `cluster`
 
 `--enforce` controls **who runs retention** and therefore **how much delete
-power the cluster credential needs.**
+power the cluster credential needs.** What that credential reaches once it is in
+the cluster — the S3 keys it maps to, and the Kubernetes verbs the runner's
+ServiceAccount holds — is [on the mechanism
+page](../how-it-works/backup-retention-and-checks.md#what-the-in-cluster-credential-can-and-cannot-do).
 
 **`enforce: operator` (the default).** The in-cluster Secret should carry S3
 rights scoped to **Put / Get / List on the repository prefix, plus Delete only
@@ -110,7 +118,8 @@ on `locks/*`.** The scheduled backup Job then does `restic backup` only — it
 **cannot** delete `data/`, `index/`, or `snapshots/` objects, so a cluster
 compromise (ransomware) cannot erase the backup history. Retention runs
 **outside** the cluster: you run `apprafter backup prune` with your **full**
-credentials (see Retention below). A minimal bucket/IAM policy shape:
+credentials ([Retention and prune](#retention-and-prune), above). A minimal
+bucket/IAM policy shape:
 
 ```jsonc
 // enforce: operator — cluster credential (scoped, append-only-ish)
@@ -207,6 +216,9 @@ restic -r s3:<endpoint>/<bucket>/<prefix> check
 
 ## See also
 
+- [How retention and the integrity check work](../how-it-works/backup-retention-and-checks.md) —
+  what a prune deletes, what the weekly Job runs, and the two ceilings on the
+  cluster's credential.
 - [Back up a cluster](backup-restore.md) — the two paths these settings apply to.
 - [Restore from a backup](restore.md) — what the repository is for.
 - [Secrets](secrets.md) — sealing the credential Secret this page narrows.
