@@ -163,27 +163,16 @@ step — the rescue/back-to-prod host key swap doesn't trip the
 CLI itself; the manual `ssh root@…` you used during rescue is
 where you'll see the warning.)
 
-## Why we don't ship an emergency root password
+## The console will not let you log in
 
-Setting an emergency root password in cloud-init (`chpasswd`)
-would make the noVNC console useful without Rescue Mode. We
-deliberately chose **not** to do that, for three reasons:
+A node keeps key-only authentication for its whole life, so the
+provider's browser console shows a login prompt with no password
+that opens it. That is deliberate, not a gap: rescue is the
+supported way in, and it is the procedure above.
 
-1. **Key-only auth is the secure default for tier-1.** A
-   password — even one in `state.json` — is a credential
-   surface that grows over time (rotation policy, leakage
-   risk, audit). Hetzner Rescue Mode achieves the same outcome
-   for genuine emergencies without changing our security
-   baseline.
-2. **For tier-1 the right answer is almost always rebuild.**
-   Time-to-recovery via `destroy + apply` is ~3 minutes;
-   chasing a one-off VM bug in noVNC takes longer and ends
-   with the same patch we'd write either way.
-3. **For tier-3/4 (regulated / confidential) we'll revisit.**
-   When those tiers land, the noVNC fallback is the kind of
-   knob that goes behind an explicit opt-in env (e.g.
-   `APPRAFTER_EMERGENCY_ROOT_PASSWORD`) with audit logging on
-   first use, not a default.
+The console is still worth opening for **diagnosis** — boot
+output and kernel messages are most of what the triage step
+needs, and they are there before SSH is.
 
-If you have a use case that genuinely requires noVNC console
-on tier-1, file an issue — we'll discuss adding an opt-in.
+If your situation genuinely needs console login on Tier 1,
+[open an issue](https://github.com/apprafter/apprafter/issues).
