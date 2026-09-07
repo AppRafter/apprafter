@@ -4003,9 +4003,10 @@ Decision 0 (ADR 0056 §d): provisioning — это spending decision, implicit `
 
 - [ ] Обновить `spec.md` §6 M2.
 - [ ] Tag `v0.2.0-services`.
-- [ ] Update `docs/dev-guide/needs.md`.
+- [x] ~~Update `docs/dev-guide/needs.md`~~ — доставлено тремя поверхностями, а не одной страницей;
+      разбор в 2.18.
 
-**Размер:** XS
+**Размер:** XS · оба оставшихся пункта — действия закрытия фазы, и оба ждут 2.25.
 
 ---
 
@@ -4022,15 +4023,20 @@ Decision 0 (ADR 0056 §d): provisioning — это spending decision, implicit `
 
 **Цель:** перед `v0.2.0-services` tag убедиться, что `spec.md` § Known limitations of v0.1.x отражает реальное состояние закрытого Phase 2.
 
-**Поставка:**
-- [ ] Update `spec.md` Known limitations section:
-    - Remove items that landed в Phase 2 (если такие были).
-    - Remove "Platform stack installed imperatively" item (closed by M1.5).
-    - Remove "MigrationPlan reconciler not implemented" item (closed by M1.5).
-    - Add items, что **deferred** к Phase 3+ для honesty.
-- [ ] Update `docs/dev-guide/needs.md` (если такого doc нет — create) с реальным workflow для `needs.{pg,jetstream,redis}`.
-- [ ] Update `e2e/mvp.sh` — extend для проверки `needs.*` flow (apply Application с pg, verify DB provisioned, app connects).
-- [ ] Tag `v0.2.0-services` после всех Phase 2 closures.
+**Поставка** (сверено с деревом 2026-09-07 — боксы отставали от того, что уже сделано):
+- [x] Update `spec.md` Known limitations section — сделано в 2.20c. Секция переписана и теперь
+      прямо называет поля, которых **нет в схеме**, вместо прежнего «accepted by the operator».
+- [x] ~~Update `docs/dev-guide/needs.md`~~ — **доставлено другой формой, и форма из пункта сегодня
+      была бы неверной.** Отдельной `needs.md` нет и не будет: workflow разложен по трём
+      поверхностям, как того требует ADR 0058 — рецепт в `operator-guide/{postgres,redis,
+      persistent-disk}.md`, поля в `dev-guide/application-cue.md`, механика в
+      `how-it-works/needs-{pg,redis,disk}.md`. И `jetstream` из формулировки пункта документировать
+      было бы ложью: схема ключ объявляет, провайдер не отгружен.
+- [x] ~~Update `e2e/mvp.sh` — extend для `needs.*`~~ — **тоже другой формой:** вместо одного
+      разросшегося mvp пять отдельных прогонов, `e2e/needs-{pg,redis,disk,removal,networkpolicy}-walk.sh`.
+      `mvp.sh` не содержит ни одного `needs` и не должен: он про голый провижн-путь.
+- [ ] Tag `v0.2.0-services` после всех Phase 2 closures. **Единственный по-настоящему открытый
+      пункт здесь** — и он не может быть закрыт, пока открыта 2.25.
 
 **Acceptance:** spec.md Known limitations accurate per state; e2e зелёный с pg flow.
 
