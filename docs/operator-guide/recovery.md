@@ -157,11 +157,12 @@ the rescue entry from your local `known_hosts` if needed:
 ssh-keygen -R <public-ip>
 ```
 
-(With v0.1.46+ AppRafter manages a per-cluster
-`.apprafter/known_hosts` for the `apprafter kubeconfig` SSH
-step — the rescue/back-to-prod host key swap doesn't trip the
-CLI itself; the manual `ssh root@…` you used during rescue is
-where you'll see the warning.)
+(The platform keeps its own per-cluster `known_hosts`, so the
+host-key swap does not trip `apprafter kubeconfig` — the manual
+`ssh root@…` you used during rescue is the only place you will
+see the warning. Where that file lives, and what else the target
+directory holds, is
+[The target store on disk](../how-it-works/the-target-store.md).)
 
 ## The console will not let you log in
 
@@ -176,3 +177,13 @@ needs, and they are there before SSH is.
 
 If your situation genuinely needs console login on Tier 1,
 [open an issue](https://github.com/apprafter/apprafter/issues).
+
+## See also
+
+- [The target store on disk](../how-it-works/the-target-store.md) — the
+  per-cluster directory this procedure touches, including the `known_hosts`
+  the host-key swap would otherwise break.
+- [Moving to a bigger machine](moving-to-a-bigger-machine.md) — the planned
+  version of the rebuild this page reaches for.
+- [Restore from a backup](restore.md) — recovering the state a rebuild does
+  not preserve.
