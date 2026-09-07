@@ -139,7 +139,7 @@ on this site today.
   environment variables, and the custom resources the platform
   installs. The [CLI reference](../reference/cli/index.md) covers
   every subcommand and flag.
-- [ADR index](../adr/README.md) — the decision behind each behaviour.
-  An ADR describes the
-  world as it was when it was ratified, so read it for *why*, and the
-  pages above for *what ships*.
+- [How it works](../how-it-works/index.md) — what the platform actually
+  does behind each of the commands above. One page per mechanism, each
+  citing the decision behind it, so *why it was decided this way* is one
+  click past *what happens when I run it*.

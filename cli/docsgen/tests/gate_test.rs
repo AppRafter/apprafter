@@ -1486,6 +1486,40 @@ fn a_citation_in_a_guide_is_reported_however_it_is_written() {
 }
 
 #[test]
+fn a_guide_linking_the_decision_corpus_is_reported_even_with_no_number() {
+    // The shape the citation scanner cannot see: it matches `ADR NNNN`,
+    // and an index pointer carries no number. Both guide index pages
+    // carried one, so the rule read as held while the decision surface
+    // was one click from a recipe.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nSee the [ADR index](../adr/README.md) for why.\n";
+    let found = of(
+        &gate.check_source("docs/dev-guide/index.md", page).unwrap(),
+        gate::ADR_CITATION_PLACEMENT,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].starts_with("3: "), "{found:?}");
+}
+
+#[test]
+fn a_mechanism_page_may_link_the_decision_corpus() {
+    // Where the chain is supposed to end. Every page under
+    // `how-it-works/` cites its own ADR, which is what makes the
+    // guide -> mechanism -> decision route exist at all.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nSee the [ADR index](../adr/README.md) for why.\n";
+    let found = of(
+        &gate
+            .check_source("docs/how-it-works/index.md", page)
+            .unwrap(),
+        gate::ADR_CITATION_PLACEMENT,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
 fn a_citation_on_a_mechanism_page_is_where_it_belongs() {
     // The other half of the same rule, and the one that makes the
     // sweep's target reachable: `how-it-works/` is exactly where a

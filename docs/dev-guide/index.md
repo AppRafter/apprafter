@@ -79,6 +79,7 @@ filling it in.
   subcommand + flag.
 - [Reference](../reference/index.md) — the generated CLI pages, the
   environment variables, and where each CRD's field list lives.
-- [ADR index](../adr/README.md) — the decision behind each behaviour.
-  An ADR describes the world as it was when it was ratified, so read
-  it for *why*, and the pages above for *what ships*.
+- [How it works](../how-it-works/index.md) — what the platform does with
+  a manifest once you have pushed it. One page per mechanism, each
+  citing the decision behind it, so *why it was decided this way* is one
+  click past *what happens when I run it*.

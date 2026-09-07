@@ -290,6 +290,13 @@ pub const ADR_CITATION_FORM: &str = "adr-citation-form";
 /// a reader who might change the decision. That is one layer further
 /// out than mechanism, and two further out than a recipe.
 ///
+/// **A link into `docs/adr/` counts too**, including the index. A
+/// pointer with no number is still a guide handing its reader the
+/// decision surface with the mechanism layer skipped, and it is the
+/// shape the citation scanner cannot see, because that one matches
+/// `ADR NNNN` and an index link carries no number. Both guide index
+/// pages carried one until the rule was extended to reach them.
+///
 /// Scoped by [`is_guide`], so `how-it-works/`, `contributing/`,
 /// `license.md`, the reference and the ADR corpus are all untouched —
 /// `license.md`'s citations in particular ARE the licence-change record.
@@ -1664,6 +1671,22 @@ impl Gate {
             }
         }
 
+        // A link INTO the ADR corpus, which the citation scanner below
+        // cannot see: it matches `ADR NNNN`, and an index pointer
+        // carries no number. Same class, because it is the same
+        // mistake — the decision surface reached without the mechanism
+        // layer in between.
+        if is_guide(file) {
+            for (line, target) in links_into_the_adr_corpus(&prose, page_directory(file)) {
+                findings.push(finding(
+                    ADR_CITATION_PLACEMENT,
+                    file,
+                    line,
+                    format!("`{target}` — a guide does not link the decision corpus"),
+                ));
+            }
+        }
+
         // Where a decision may be cited, and in what form.
         //
         // Off the masked `prose`, like the citation check further down
@@ -1676,7 +1699,14 @@ impl Gate {
         // follow it and whether this page should be citing at all —
         // and inside a fence nothing is followable and the page is
         // demonstrating rather than citing. See [`adr_citations`].
+        //
+        // Only UNLINKED citations reach the placement arm. A linked one
+        // on a guide is already reported by the scan above, through its
+        // target — and one defect earns one finding.
         for (line, spelling) in adr_citations(&prose) {
+            if spelling.linked {
+                continue;
+            }
             if is_guide(file) {
                 findings.push(finding(
                     ADR_CITATION_PLACEMENT,
@@ -1684,7 +1714,7 @@ impl Gate {
                     line,
                     format!("`{spelling}` — a guide does not cite a decision"),
                 ));
-            } else if !spelling.linked {
+            } else {
                 findings.push(finding(
                     ADR_CITATION_FORM,
                     file,
@@ -2083,6 +2113,48 @@ fn link_texts_naming_a_page(source: &str) -> Vec<(usize, String)> {
             }
             if text.ends_with(".md") || (text.contains('/') && !text.contains(' ')) {
                 out.push((i + 1, text.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Every link on the page whose target resolves into `docs/adr/`.
+///
+/// Resolved page-relative the way MkDocs does, so `../adr/README.md`
+/// from a guide and `adr/0058-….md` from the site root are one rule
+/// rather than two spellings of it.
+fn links_into_the_adr_corpus(source: &str, page_directory: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (i, line) in source.lines().enumerate() {
+        let mut at = 0;
+        while let Some(open) = line[at..].find("](") {
+            let open = at + open;
+            let Some(end) = line[open..].find(')') else {
+                break;
+            };
+            let end = open + end;
+            at = end + 1;
+            let target = &line[open + 2..end];
+            let path = target.split(['#', ' ']).next().unwrap_or(target);
+            if path.starts_with("http") {
+                continue;
+            }
+            let mut segments: Vec<&str> = page_directory
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect();
+            for segment in path.split('/') {
+                match segment {
+                    "" | "." => {}
+                    ".." => {
+                        segments.pop();
+                    }
+                    other => segments.push(other),
+                }
+            }
+            if segments.starts_with(&["docs", "adr"]) {
+                out.push((i + 1, target.to_string()));
             }
         }
     }
