@@ -131,7 +131,11 @@ leaves the spec untouched) are **not** destructive and do not gate.
 
 ## Acting on a plan
 
-## CLI surface
+Three commands, and which of them you may use depends on the plan's scope: a
+platform-scope plan can be rejected, and the other two scopes are undone by
+changing what produced them rather than by overriding it from the side.
+
+### CLI surface
 
 ```sh
 # List MigrationPlans across ALL namespaces, with namespace, name,
