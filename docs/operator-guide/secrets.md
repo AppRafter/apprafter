@@ -13,21 +13,22 @@ Developers do not run these commands. They write a
 `secret: "<name>/<key>"` reference in their manifest and read the result
 — see [Secrets](../dev-guide/secrets.md) in the developer guide.
 
+What the seal produces, why the namespace it goes into decides whether
+that reference resolves, and when the value actually reaches a
+container, are in
+[Sealing a secret](../how-it-works/sealing-a-secret.md).
+
 !!! info "What this tool is, and what it is not"
 
-    `apprafter secret` is a **Tier-1 primitive**. SealedSecrets stands in
-    for OpenBao on a single node that has no KMS to auto-unseal one. That
-    is a deliberate trade, not an oversight: Tier 2 brings OpenBao.
-
-    It has **no fine-grained access control and no audit trail**. Anyone
+    `apprafter secret` is a **Tier-1 primitive standing in for OpenBao**,
+    with **no fine-grained access control and no audit trail**. Anyone
     able to seal here already holds every credential in the cluster, so
     the tool draws no boundary and does not pretend to. Tier 2 and above
-    replace it with OpenBao, and the tier upgrade migrates what is sealed.
+    replace it.
 
-    On Tier 1 the operator and the developer are usually the same person.
-    Where a team separates those roles, the separation is enforced by who
-    holds a kubeconfig that can create `SealedSecret` objects — not by
-    anything inside this command.
+    What it stands in for, what it deliberately does not do, and what
+    takes over at Tier 2, are in
+    [Sealing a secret](../how-it-works/sealing-a-secret.md#what-it-does-not-do).
 
 ## The namespace is the whole guide {#the-namespace}
 
@@ -42,14 +43,16 @@ Getting this wrong produces no error at seal time. The command succeeds,
 the controller unseals a perfectly healthy `Secret`, and the app never
 becomes ready with `AppRafter phase: EnvSecretMissing`. The condition
 message names the namespace it searched, so the mistake is visible the
-moment anyone looks.
+moment anyone looks —
+[why the namespace binds twice](../how-it-works/sealing-a-secret.md#the-scope-binding)
+is the mechanism behind both halves of that.
 
 !!! warning "A sealed secret cannot be moved or renamed"
-    The namespace and the name are mixed into the encryption itself —
-    the sealing scope is the literal string `<namespace>/<name>`. A blob
-    sealed for `apprafter-system/checkout-secrets` will not decrypt as
-    `shop/checkout-secrets`, and no edit changes that. Fixing a
-    mis-sealed secret means sealing it again from the original
+    A blob sealed for `apprafter-system/checkout-secrets` will not
+    decrypt as `shop/checkout-secrets`, and no edit changes that — the
+    namespace and the name are part of what it was sealed against
+    ([why](../how-it-works/sealing-a-secret.md#the-scope-binding)).
+    Fixing a mis-sealed secret means sealing it again from the original
     plaintext. There is nothing to copy, so keep the value until you
     have confirmed it arrived.
 
@@ -124,10 +127,9 @@ sealed, and `seal`'s `apprafter-system` default is the single likeliest
 reason a secret is in the wrong place. Narrow it with `--namespace`.
 
 `SEALED` is when this CLI last sealed the object. A dash means it was
-sealed before that record existed, or applied by other means. It is
-**provenance, not attestation**: the value is self-reported by the
-machine that ran the command, so it answers "when did this last change"
-and authenticates nothing.
+sealed before that record existed, or applied by other means. It answers
+"when did this last change" and nothing more — it is
+[provenance, not attestation](../how-it-works/sealing-a-secret.md#what-it-does-not-do).
 
 ## Replace a value
 
@@ -169,12 +171,11 @@ nothing else restarts them. **This matters most in the case you least
 want it to:** re-sealing is what you do to revoke a leaked credential,
 and on its own it revokes nothing on the pods still serving traffic.
 
-That is a decision rather than an oversight. Rolling automatically would
-mean one seal restarting an unknown set of applications, possibly other
-teams', which is why the platform shows you the set instead of acting on
-it. The drift is visible from the application side too —
+The drift is visible from the application side too —
 `apprafter app status` marks pods that started before the secret last
-changed.
+changed. Why the platform shows you that set instead of restarting it,
+and what it compares to decide a pod is stale, are in
+[Sealing a secret](../how-it-works/sealing-a-secret.md#when-the-value-is-read).
 
 Until a first-class verb exists for it, roll the workload yourself after
 a rotation that must take effect:

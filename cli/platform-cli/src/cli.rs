@@ -423,8 +423,9 @@ pub enum SecretCommand {
     /// OpenBao on a single node that has no KMS to auto-unseal
     /// one (ADR 0007). It carries no fine-grained access control
     /// and no audit trail: anyone able to seal here already holds
-    /// every credential in the cluster. Tier 2+ replaces it, and
-    /// `upgrade-tier` migrates what is sealed.
+    /// every credential in the cluster. Tier 2+ replaces it. Tier
+    /// upgrades are not implemented in this release, so nothing
+    /// migrates what is sealed yet.
     ///
     /// Re-sealing an existing name REPLACES its keys — it does not
     /// merge; pass all keys in one command. Use `--yes` to skip the

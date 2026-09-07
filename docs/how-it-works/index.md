@@ -43,6 +43,9 @@ than taken on faith.
   onto the base, and why the environment belongs to the deployment.
 - [The image digest](the-image-digest.md) — why a re-pushed tag rolls at all,
   and what happens when the registry cannot be read.
+- [Sealing a secret](sealing-a-secret.md) — what a seal produces, why the
+  namespace it went into decides whether an application can read it, and why a
+  re-seal changes nothing about a running pod.
 - [How the approval gate works](the-approval-gate.md) — why a change is held
   instead of applied, why only platform-scope plans can be rejected, and where
   a plan lives.
