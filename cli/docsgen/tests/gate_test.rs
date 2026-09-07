@@ -1728,3 +1728,40 @@ fn a_mechanism_page_may_name_the_implementation_too() {
     );
     assert!(found.is_empty(), "{found:?}");
 }
+
+#[test]
+fn a_command_carrying_an_implementation_path_is_a_recipe_step() {
+    // The case that decides whether the span rule can coexist with the
+    // build-from-source tab in the developer quickstart. A contributor
+    // with a checkout runs exactly this, and the path is the argument
+    // that makes it work — deleting it would break the recipe.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nFrom a checkout: `cargo install --path cli/platform-cli`.\n";
+    let found = of(
+        &gate
+            .check_source("docs/dev-guide/quickstart.md", page)
+            .unwrap(),
+        gate::CODE_REFERENCE_PLACEMENT,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_bare_path_beside_a_command_on_the_same_tree_is_still_reported() {
+    // Non-vacuity for the test above: the exemption is about the SHAPE
+    // of the span, not about the tree, so the same `cli/` in a bare
+    // span is reported on the line below.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nRun `cargo install --path cli/platform-cli`.\n\nIt is built from \
+                `cli/platform-cli/src/main.rs`.\n";
+    let found = of(
+        &gate
+            .check_source("docs/dev-guide/quickstart.md", page)
+            .unwrap(),
+        gate::CODE_REFERENCE_PLACEMENT,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].starts_with("5: "), "{found:?}");
+}

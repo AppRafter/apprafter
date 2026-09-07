@@ -2212,7 +2212,16 @@ fn leaves_the_site_for_the_repository(target: &str, page_directory: &str) -> boo
 /// implementation by construction. A span that opens on no top-level
 /// directory of ours is not a claim about this repository at all —
 /// `apprafter/Application.cue` is the reader's own file.
+/// A span carrying whitespace is a COMMAND, not a reference:
+/// `cargo install --path cli/platform-cli` is what a contributor runs
+/// from a checkout, and the path in it is the argument that makes the
+/// command work. Deleting it would break the recipe. The same
+/// no-whitespace rule [`link_texts_naming_a_page`] uses, for the same
+/// reason — a slash-bearing token with no spaces is a path being NAMED.
 fn names_an_implementation_tree(span: &str, tops: &[String]) -> bool {
+    if span.contains(char::is_whitespace) {
+        return false;
+    }
     let Some((head, _)) = span.split_once('/') else {
         return false;
     };
@@ -2230,6 +2239,13 @@ fn repository_references(
     tops: &[String],
 ) -> Vec<(usize, String)> {
     let mut out = Vec::new();
+    // Line by line, and that is a stated scope rather than an
+    // oversight. A span the corpus wraps is a COMMAND by construction:
+    // markdown renders a soft-wrapped span with a space at the break,
+    // so `` `operator/…/src/\nlib.rs` `` would reach the reader as
+    // `operator/…/src/ lib.rs` — nobody writes a path that way, while
+    // `cargo install --path\ncli/platform-cli` reads correctly and is
+    // already exempt for carrying whitespace.
     for (i, line) in source.lines().enumerate() {
         let mut found: Vec<(usize, String)> = Vec::new();
 

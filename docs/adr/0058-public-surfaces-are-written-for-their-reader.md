@@ -308,9 +308,10 @@ Two things this does **not** reach. The issue tracker, releases and pull request
 reader goes to participate in the project, and telling them where is part of a guide's job. And a
 path the reader creates in their own checkout is not a reference to this repository at all.
 
-What the sweep that produced this rule found is the argument for it. Of twenty-seven references
-across the guide corpus, seventeen were deletions rather than reroutings — the sentence existed only
-to point at the tree. Five sent a manifest author to the CUE schema as "the authoritative field
+What the sweep that produced this rule found is the argument for it. Eleven links and fourteen
+prose sites were acted on, and **nineteen of the twenty-five were deletions rather than
+reroutings** — the sentence existed only to point at the tree, so the reader loses nothing when
+both go. Five sent a manifest author to the CUE schema as "the authoritative field
 list", where the guide's own field table already was that list and the schema additionally declares
 four `needs` types the platform does not ship, so following the link invited writing a key that
 compiles and never provisions. Two sent an operator to `spec.md`, which is deliberately out of the
