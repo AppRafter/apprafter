@@ -40,9 +40,16 @@ if [[ -z "${version:-}" ]]; then
 fi
 tag="v${version}"
 
-# Source that changes the shipped binary. `cli/**/*.md` and the generated
-# reference under docs/ are not it.
-paths=(cli ":(exclude)cli/**/*.md")
+# Source that changes the SHIPPED binary, which is the only thing this guard is
+# about. `release-cli.yml` builds `-p apprafter` and nothing else, so two things
+# inside `cli/` are excluded because a change to either ships nowhere:
+#
+#   * `cli/**/*.md` — prose, and the generated reference lives under docs/;
+#   * `cli/docsgen/**` — the documentation generator and drift gate. It is a
+#     build-and-CI tool run by `just lint`; no release workflow packages it.
+#     Without this exclusion a docs-only change that touches the gate demands a
+#     CLI version bump that would ship an identical binary under a new number.
+paths=(cli ":(exclude)cli/**/*.md" ":(exclude)cli/docsgen/**")
 
 if ! git ls-remote --tags --exit-code "$REMOTE" "refs/tags/${tag}" >/dev/null 2>&1; then
     echo "OK: ${tag} not yet on ${REMOTE} — version bump is in flight."

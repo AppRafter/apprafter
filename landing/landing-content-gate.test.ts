@@ -116,6 +116,34 @@ describe('SYS-3 (b) — how a phase is written', () => {
     }
     const reg = readFileSync(REGISTRY, 'utf8');
     expect(/Phase \d+\+/.test(reg)).toBe(false);
+    // README.md too. It is the third surface the feature ledger claims
+    // names the same phases as the other two, and it was the one nothing
+    // read: the `+` sweep covered the fallbacks and the registry, and
+    // left `Phase 5+` / `Phase 6+` standing in the repository's own front
+    // door for weeks.
+    const readme = readFileSync(join(ROOT, '../README.md'), 'utf8');
+    expect({ file: 'README.md', hit: /Phase \d+(\.\d+)?\+/.test(readme) }).toEqual({
+      file: 'README.md',
+      hit: false,
+    });
+  });
+
+  test('a roadmap block whose label still carries the old suffix still joins', () => {
+    // The live CMS is edited by hand and lags the registry. When a block
+    // read `Phase 5+`, the label join missed, the anchor fell back to a
+    // slug of the label, and every inbound link to that phase pointed at
+    // an id the page never emitted — while the notify button, gated on
+    // the same lookup, was skipped. The component normalises the suffix
+    // away; this holds it there.
+    const roadmap = readFileSync(
+      join(ROOT, 'web/src/components/sections/Roadmap.astro'),
+      'utf8',
+    );
+    expect(roadmap).toContain("replace(/\\+$/, '')");
+    expect(roadmap).toContain('const entryFor =');
+    // The button and the anchor must read the SAME lookup, or a phase
+    // can render an anchor with no way to subscribe to it.
+    expect(roadmap).not.toContain('byLabel.get(p.num)');
   });
 
   test('published content carries no internal product numbering', () => {

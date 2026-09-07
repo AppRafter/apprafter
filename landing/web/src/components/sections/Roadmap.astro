@@ -14,8 +14,22 @@ const phases = data.phases ?? [];
 // Map each roadmap block's display label (p.num, e.g. "Phase 3") to
 // the registry entry so the anchor derives from the stable id, not the
 // label. Falls back to the label if a block has no registry twin.
-const byLabel = new Map(phaseRegistry.phases.map((e) => [e.label, e]));
-const anchorFor = (num: string) => phaseAnchor(byLabel.get(num)?.id ?? num);
+//
+// NORMALISED, because the join is by display label and a display label
+// is the half that moves. The `+` suffix was removed from the registry
+// and from every tracked fallback, but the live CMS is edited by hand
+// and lags: a block still reading `Phase 5+` missed the registry
+// entirely, `anchorFor` fell back to slugifying the label — the doubled
+// prefix R2 removed, which the smoke test still guards against by name
+// — and the notify button, gated on the same lookup, was skipped
+// too. Every inbound link to that phase then pointed at an id the page
+// did not emit. Tolerating the variant costs one `replace`; not
+// tolerating it costs a broken anchor on production until someone edits
+// a CMS field by hand.
+const normalise = (label: string) => label.trim().replace(/\+$/, '');
+const byLabel = new Map(phaseRegistry.phases.map((e) => [normalise(e.label), e]));
+const entryFor = (num: string) => byLabel.get(normalise(num));
+const anchorFor = (num: string) => phaseAnchor(entryFor(num)?.id ?? num);
 ---
 
 <section aria-label="Roadmap" id="roadmap" data-screen-label="roadmap">
@@ -35,13 +49,13 @@ const anchorFor = (num: string) => phaseAnchor(byLabel.get(num)?.id ?? num);
                   <li>{item.text}</li>
                 ))}
               </ul>
-              {byLabel.get(p.num) && byLabel.get(p.num)!.status !== 'shipped' && (
+              {entryFor(p.num) && entryFor(p.num)!.status !== 'shipped' && (
                 <button
                   type="button"
                   class="roadmap-waitlist"
-                  data-preselect={byLabel.get(p.num)!.id}
+                  data-preselect={entryFor(p.num)!.id}
                 >
-                  Get notified when {p.num} ships
+                  Get notified when {entryFor(p.num)!.label} ships
                 </button>
               )}
             </div>

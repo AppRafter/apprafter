@@ -59,8 +59,8 @@ The dev-facing API is identical across tiers; moving between tiers is a platform
 | ------------------ | ------------------------------------------ | ------------------------------ | ------------------- |
 | **1 · Solo**       | Single VDS (Hetzner CX/CPX-class)          | Side-projects, solo founders   | **Implemented**     |
 | **2 · Small team** | 3+ heterogeneous nodes (HA)                | Growing teams, production      | In development      |
-| **3 · Production** | Bare metal (dedicated EPYC, Talos)         | Established products           | Roadmap (Phase 5+)  |
-| **4 · Regulated**  | External hyperscalers (AWS / GCP / Azure)  | Regulatory / sovereignty needs | Roadmap (Phase 6+)  |
+| **3 · Production** | Bare metal (dedicated EPYC, Talos)         | Established products           | Roadmap (Phase 5)   |
+| **4 · Regulated**  | External hyperscalers (AWS / GCP / Azure)  | Regulatory / sovereignty needs | Roadmap (Phase 6)   |
 
 **Confidential containers** (Kata-CC on TDX / SEV-SNP hardware) are a planned **orthogonal opt-in capability** — available on any tier whose hardware supports it, not a tier of their own.
 
@@ -69,8 +69,8 @@ The dev-facing API is identical across tiers; moving between tiers is a platform
 Boring, proven components, plus a thin layer of our own code only where no ready solution exists.
 
 - **Components the platform standardizes on (one per slot):** Talos Linux, k3s + Cilium (eBPF networking), Argo CD (GitOps), CloudNativePG, Dragonfly (Redis-compatible), ClickHouse, NATS JetStream, Backstage, cert-manager, external-dns, KEDA. Secrets use SealedSecrets on Tier 1 and OpenBao on Tier 2+; control-plane storage is kine (SQLite on Tier 1), with a NATS JetStream backend and a replayable audit log as the Tier 2+ target.
-- **Written here, shipping today:** the Rust operator on kube-rs (reconciling `Application`, `MigrationPlan`, `PlatformStack`, and `SourceCredential`), a Rust admission webhook enforcing cross-field invariants the CRD schema can't express, the `apprafter` CLI (provisioning, bootstrap, lifecycle), and the `MigrationPlan` reconciler that gates destructive changes behind explicit approval. CUE is the design-time schema layer (`schemas/`), checked with `cue vet`.
-- **Designed, landing per the roadmap:** the `ResourceClaim` / `ServiceProvider` primitives and their reconcilers (Phase 2), the `AccessGrant` access model (Phase 4), and the MCP server with its agentic-safety gate (managed track).
+- **Written here, shipping today:** the Rust operator on kube-rs (reconciling `Application`, `MigrationPlan`, `PlatformStack`, and `SourceCredential`), a Rust admission webhook enforcing cross-field invariants the CRD schema can't express, the `apprafter` CLI (provisioning, bootstrap, lifecycle), the `MigrationPlan` reconciler that gates destructive changes behind explicit approval, and the `ResourceClaim` / `ServiceProvider` primitives with the provisioner behind `needs.pg`, `needs.redis` and `needs.disk`. CUE is the design-time schema layer (`schemas/`), checked with `cue vet`.
+- **Designed, landing per the roadmap:** the MCP server with its agentic-safety gate (managed track), and the `AccessGrant` access model, which is understood but not scheduled — see [Feature status](https://docs.apprafter.dev/status/) for what is built and what each phase carries.
 
 ## Repository layout
 

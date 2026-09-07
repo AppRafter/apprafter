@@ -1,18 +1,11 @@
 ---
 description: "Every user-facing feature, its status, and the phase it lands in."
-# The out-of-scope list names a `needs` type the schema declares and no
-# provider ships, so the drift gate resolves it and (correctly) finds
-# nothing. `since=` is the current release, so the entry ages out and
-# forces its own removal the day a provider lands.
-#
-# No `cli-check-ignore` here, and that is deliberate: an unbuilt row
-# names the capability rather than the command, because a reader cannot
-# run a command that does not exist.
-schema-check-ignore:
-  - path: "needs.jetstream"
-    reason: known-broken
-    since: v0.2.61
-    note: out-of-scope list — the schema declares this need but no provider ships it
+# No exemptions, and that is the rule rather than luck: an unbuilt row
+# names the CAPABILITY, never the command or the schema key that would
+# deliver it. A reader cannot run a command that does not exist, and a
+# `needs` type no provider ships is a claim a manifest cannot make. Both
+# exemptions this page used to carry were retired by applying that rule
+# to the rows that needed them.
 ---
 
 # Feature status
@@ -23,8 +16,8 @@ What AppRafter can do today, what is being built, and which phase each thing lan
 live walk or end-to-end run, not merely committed.
 
 **Properties and policies:** `◆` in force today · `◇` not in force yet. These are architectural
-guarantees and published commitments rather than features. They have no ship date, so they carry no
-delivery mark and no subscribe control.
+guarantees and published commitments rather than features. They have no ship date, so their Phase
+cell is empty: there is no release to subscribe to.
 
 **Phase** links to the roadmap entry on the landing page, where you can subscribe to hear when that
 phase ships. Two kinds of row are not links: those already shipped, and those marked `Post-launch` —
@@ -45,10 +38,12 @@ post-launch work is not a roadmap phase and has no subscribe control.
 | Shipped | ✅ | Roll back to the previously resolved image and hold there until released | [Rolling back a bad deploy](dev-guide/rollback.md) |
 | Shipped | 🚧 | Backstage developer portal — application status and a golden-path template | — |
 
-> **Backstage is partial.** The portal deploys as an opt-in component and the golden-path template
-> ships with the platform, but there is no supported route to it: `apprafter open` reaches Argo CD
-> only. The portal work — the secret-encryption wizard and the approval plugin — is in the
-> post-launch bundle.
+> **Backstage is partial, and further from ready than "opt-in" suggests.** The portal's source and
+> a golden-path template are in the repository, and the platform chart carries a component for it —
+> but the component is off on the only shipped tier, no release publishes a portal image, the
+> template is not registered in any catalogue the platform installs, and `apprafter open` reaches
+> Argo CD only and says so. The portal work — the secret-encryption wizard and the approval plugin —
+> is in the post-launch bundle.
 
 ---
 
@@ -64,7 +59,8 @@ post-launch work is not a roadmap phase and has no subscribe control.
 | Shipped | ✅ | Scheduled off-site backups to S3, opt-in | [Back up a cluster](operator-guide/backup-restore.md) |
 | Shipped | ✅ | A backup schedule set from flags — the interval, the retention and the integrity check | [Backup maintenance](operator-guide/backup-maintenance.md) |
 | Shipped | ✅ | A cache credential survives a restart of the cache | [Redis](operator-guide/redis.md) |
-| Post-launch | ☐ | A replayable audit history of every control-plane operation | — |
+| [Phase 3](https://apprafter.dev/#roadmap-phase-tier2) | ☐ | An analytics store and object storage, declared the same way as the dependencies above | — |
+| [Phase 3](https://apprafter.dev/#roadmap-phase-tier2) | ☐ | An event backbone for control-plane operations. A replayable audit log on top of it is exploratory, and available on request | — |
 
 > A cache is ephemeral by declaration and stays out of a backup unless you mark it otherwise. What
 > each command captures, and what it does not, is on the backup page.
@@ -97,6 +93,7 @@ post-launch work is not a roadmap phase and has no subscribe control.
 | Shipped | ✅ | See what is sealed and where, and retire one when it is no longer needed | [Secrets](operator-guide/secrets.md) |
 | Post-launch | ☐ | Defence in depth against a compromised cluster administrator | — |
 | Post-launch | ☐ | End-to-end identity propagation, so an audit trail names the workload and not just the node | — |
+| [Phase 3](https://apprafter.dev/#roadmap-phase-tier2) | ☐ | A managed secret store on multi-node clusters, in place of sealed secrets | — |
 
 ---
 
@@ -111,6 +108,7 @@ post-launch work is not a roadmap phase and has no subscribe control.
 | Shipped | ✅ | A one-line installer that verifies its own checksum, and a download page | [Quickstart](operator-guide/quickstart.md) |
 | [Phase 3](https://apprafter.dev/#roadmap-phase-tier2) | ☐ | Built-in metrics, traces, logs and network-flow visibility | — |
 | Post-launch | ☐ | A rescue path that does not depend on the platform being healthy | — |
+| [Phase 3](https://apprafter.dev/#roadmap-phase-tier2) | ☐ | Notifications sent by the platform | — |
 
 ---
 
@@ -121,8 +119,15 @@ post-launch work is not a roadmap phase and has no subscribe control.
 | Shipped | ✅ | The platform updates itself through GitOps — no re-bootstrap for a new release | [Platform upgrades](how-it-works/platform-upgrades.md) |
 | Shipped | ✅ | Destructive changes are held until a human approves them, from the CLI or from Argo CD | [When a change needs approval](dev-guide/when-a-change-needs-approval.md) |
 | Shipped | ✅ | A documentation site kept true to the code by a gate that runs on every commit | [Publishing this site](operator-guide/publish-the-docs-site.md) |
-| Shipped | ✅ | The landing, this site and the README name the same phases, and every roadmap phase has a subscribe control | — |
+| Shipped | 🚧 | The landing, this site and the README name the same phases, and every roadmap phase has a subscribe control | — |
 | Post-launch | ☐ | Community migration plugins for platforms we do not cover ourselves | — |
+
+> **Phase naming is `🚧`.** The registry, this site, the README and every
+> tracked landing file agree, and a test holds them there. Three names on the
+> landing still resolve to no registry entry — a fractional `Phase 4.5` for an
+> add-on with no roadmap card, and `Phase 1` / `Phase 2` used as era names for
+> work already shipped. Each is a known exception with its reason recorded
+> beside the check, not a drift nobody noticed.
 
 ---
 
@@ -136,7 +141,7 @@ post-launch work is not a roadmap phase and has no subscribe control.
 | [Phase 8](https://apprafter.dev/#roadmap-phase-federation) | ☐ | Move a running application between clusters with a sub-second cutover | — |
 | Post-launch | ☐ | Grow a single-node cluster into a multi-node one in place | — |
 | Post-launch | ☐ | Approve or reject a held change from the portal, not only the CLI | — |
-| Post-launch | ☐ | A one-time import from another platform, checked before it commits | — |
+| [Phase 5](https://apprafter.dev/#roadmap-phase-tier3) | ☐ | A one-time import from another platform, checked before it commits | — |
 | [Phase 5](https://apprafter.dev/#roadmap-phase-tier3) | ☐ | Bare metal, for workloads that want the whole machine | — |
 | [Phase 5](https://apprafter.dev/#roadmap-phase-tier3) | ☐ | Hard multi-tenancy — many customers on one cluster, isolated from each other | — |
 | [Phase 6](https://apprafter.dev/#roadmap-phase-tier4) | ☐ | Confidential computing — workloads the machine's operator cannot read | — |
@@ -155,7 +160,7 @@ cluster stays an ordinary AppRafter install on your own infrastructure.
 | [Phase 4](https://apprafter.dev/#roadmap-phase-managed) | ☐ | A hosted portal on your own subdomain | — |
 | [Phase 4](https://apprafter.dev/#roadmap-phase-managed) | ☐ | A hosted endpoint for AI clients, proxied to your cluster | — |
 | [Phase 4](https://apprafter.dev/#roadmap-phase-managed) | ☐ | A billing view in the portal | — |
-| Post-launch | ☐ | A live playground for trying the platform without installing it | — |
+| [Phase 5](https://apprafter.dev/#roadmap-phase-tier3) | ☐ | A live playground for trying the platform without installing it | — |
 
 ---
 
@@ -163,11 +168,11 @@ cluster stays an ordinary AppRafter install on your own infrastructure.
 
 | Phase | Status | Feature | Documentation |
 |---|---|---|---|
-| Shipped | ◆ | Open core with no exit cost — cancelling a hosted plan leaves the cluster running, with no migration to perform | [License](license.md) |
-| [Phase 4](https://apprafter.dev/#roadmap-phase-managed) | ◇ | Minimal data exposure — the hosted side sees manifests, status and audit events, never the data your applications hold | — |
-| [Phase 4](https://apprafter.dev/#roadmap-phase-managed) | ◆ | A short, published list of sub-processors | — |
-| Shipped | ◆ | Independent ownership — the roadmap is set by the people running the platform | — |
-| Shipped | ◆ | Pricing anchored to cost and published in full | — |
+| — | ◆ | Open core with no exit cost — cancelling a hosted plan leaves the cluster running, with no migration to perform | [License](license.md) |
+| — | ◇ | Minimal data exposure — the hosted side sees manifests, status and audit events, never the data your applications hold | — |
+| — | ◇ | A short, published list of sub-processors | — |
+| — | ◆ | Independent ownership — the roadmap is set by the people running the platform | — |
+| — | ◆ | Pricing anchored to cost and published in full | — |
 
 ---
 
@@ -182,10 +187,6 @@ built on demand; none is scheduled, and asking is what would move one:
 
 - Horizontal autoscaling driven by a queue depth or a custom metric, rather
   than by CPU.
-- Per-workload identity certificates and a general-purpose secret store, in
-  place of sealed secrets.
-- Deeper observability — a columnar store for high-cardinality metrics, and
-  long-retention query.
 - A fixed outbound IP for your applications, for allow-lists on the other side.
 - Access grants and single sign-on for the cluster's own surfaces.
 - Image vulnerability scanning and a published bill of materials.
@@ -199,7 +200,3 @@ built on demand; none is scheduled, and asking is what would move one:
   own, and the platform integrates with them.
 - **A plugin ecosystem.** Extension exists at the service-provider boundary
   only, and opening more of it would make "one way to do things" untrue.
-- **`needs.jetstream`.** The schema declares the key and no provider ships one,
-  so it cannot be used today.
-- **A notifications service.** Out of scope until something in the platform
-  needs to send more than it does now.
