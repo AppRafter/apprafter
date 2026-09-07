@@ -1,5 +1,5 @@
 ---
-description: "How a re-pushed mutable tag becomes a rollout with no manifest edit, how to confirm it happened, how to opt out, and how to roll a bad deploy back."
+description: "How a re-pushed mutable tag becomes a rollout with no manifest edit, how to confirm it happened, and what changes when the registry cannot be read."
 ---
 
 # Image iteration: push and it deploys
@@ -10,10 +10,11 @@ branch), AppRafter rolls the running workload to the new build for
 you. You do not edit the manifest, and you do not bump a tag — the
 push is the deploy.
 
-This page covers the loop, how to confirm it worked, and how to opt out
-when you want a hand-pinned reference. Undoing a roll is
-[Rolling back a bad deploy](rollback.md) — a different question, asked at a
-different moment.
+This page covers the loop and how to confirm it worked. Undoing a roll is
+[Rolling back a bad deploy](rollback.md), and the hand-pinned reference that
+opts out of resolution entirely is
+[The image digest](../how-it-works/the-image-digest.md) — different questions,
+asked at different moments.
 
 The design rationale lives in
 [The image digest](../how-it-works/the-image-digest.md).
@@ -63,7 +64,8 @@ Git shows the tag; status shows what the cluster is running. If the
 two ever drift, the `resolved` digest and its age are where you look.
 
 The line is omitted when there is nothing to report yet — before the
-first resolution, or when resolution is turned off (see below).
+first resolution, or when resolution is turned off
+([how](../how-it-works/the-image-digest.md)).
 
 ## Private images
 

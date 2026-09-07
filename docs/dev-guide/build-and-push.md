@@ -30,7 +30,7 @@ runtime to write a manifest; it writes no Dockerfile, and there is no build
 step in the platform. That boundary is deliberate — the alternative is
 maintaining an opinion about ten ecosystems' build tooling.
 
-## A worked example
+## A worked Dockerfile
 
 This is the Dockerfile from `examples/templates/bun-http`, included from the
 file the repository actually ships rather than copied — so it cannot drift
@@ -128,7 +128,7 @@ opt out. If the new build is wrong,
 [Rolling back a bad deploy](rollback.md) is the way back, and it is the
 immutable tag above that makes it possible.
 
-## A worked example
+## Two worked deployments
 
 Two real deployments in this repository, assembled end to end — what builds
 each image, what deploys it, and what each manifest deliberately leaves out:

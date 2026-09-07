@@ -15,7 +15,7 @@ on a single €5 server as on confidential bare metal.
 ## An application, described once
 
 ```cue
-package example
+package apprafter
 
 import v1alpha1 "apprafter.io/schemas/v1alpha1"
 
@@ -89,4 +89,7 @@ and confidential Tier 4 in
 
 ## Status
 
-Pre-MVP (managed offering). Active development.
+A single-node cluster is shipped and verified end to end. Multi-node, the
+managed offering and the confidential tiers are on the roadmap, and the
+[feature status page](status.md) says which phase each thing lands in and what
+is built today.

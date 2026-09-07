@@ -62,6 +62,10 @@ Guide](../dev-guide/index.md) is the shorter path.
 An application declares what it needs; the platform provisions it,
 binds the credentials, and opens exactly the egress that need implies.
 
+- [Secrets](secrets.md) — sealing a value into the namespace that will
+  read it, seeing what is sealed where, and retiring one. Two of the
+  dependency pages below send you here first, because a claim's
+  credential and a sealed value are bound the same way.
 - [Postgres](postgres.md) — a `needs.pg` declaration end to end: claim,
   provisioning, credential binding, and the grace window after removal.
 - [Redis](redis.md) — a `needs.redis` declaration end to end, including

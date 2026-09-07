@@ -31,9 +31,10 @@ filling it in.
   container asks for when you set nothing, how to set an explicit
   request and limit, and the in-place right-sizing that runs on your
   behalf until you do.
-- [Secrets](secrets.md) — sealing a value with `apprafter secret seal`
-  and binding it to an env-var with a `secret:` reference. The
-  namespace you seal into decides whether it works.
+- [Secrets](secrets.md) — referencing a sealed value from `env`,
+  confirming it resolved, and reading `EnvSecretMissing` when it did
+  not. Sealing itself is an operator task, and the namespace it was
+  sealed into decides whether your reference works.
 - [When a change needs approval](when-a-change-needs-approval.md) —
   the thirteen manifest edits that pause instead of rolling out, what
   `apprafter app status` says while one is held, and how to get it
@@ -63,6 +64,9 @@ filling it in.
 
 ## Ship it, and keep shipping
 
+- [From source to a running image](build-and-push.md) — what the
+  platform requires of a container image, and pushing the tag your
+  manifest names.
 - [Private repos and registries](private-repos-and-registries.md) —
   source credentials for a private Git repository and image-pull
   secrets for a private registry.

@@ -291,17 +291,15 @@ within a few minutes of `cluster-bootstrap` completing.
 
 The operator and the admission webhook arrive with the platform stack, so
 `platform status` reporting them healthy already says the reconcile path is
-up. To prove it end to end, deploy a real application the way you will
-always deploy one — scaffold a manifest, register it, watch it come up:
+up. To prove it end to end, deploy a real application the way you will always
+deploy one. That is a developer's task and it belongs on the developer's page,
+because the manifest has to reach a repository Argo CD can clone before
+registering it means anything — scaffolding writes a file in your working
+directory, and nothing deploys until it is committed and pushed.
 
-```sh
-apprafter app scaffold --name parser --namespace default
-apprafter app add <git-url> --name parser --namespace default
-apprafter app status parser
-```
-
-The [developer quickstart](../dev-guide/quickstart.md) walks that in full,
-including the repository side.
+The [developer quickstart](../dev-guide/quickstart.md) is the whole of it:
+scaffold, commit, push, register, watch it come up. Come back here when it
+reports `Ready`.
 
 Deploying by `kubectl apply` of an `Application` CR is deliberately not
 shown here. It works, and it is the wrong first habit: the platform's

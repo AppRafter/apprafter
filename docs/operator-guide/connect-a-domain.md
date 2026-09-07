@@ -110,6 +110,22 @@ spec: base: expose: {
 Apply the application as usual. The operator renders an HTTPRoute that attaches
 the host to the application's Service.
 
+!!! warning "This edit waits for an approval"
+
+    Making an application public, and giving a public application its first
+    hostname, are both changes the platform holds rather than rolling out — an
+    address answering as you is worth a second pair of eyes. The application
+    keeps serving whatever it served before, and `apprafter app status` reports
+    `AwaitingMigrationApproval`. You are the person who can release it:
+
+    ```sh
+    apprafter migration list
+    apprafter migration approve <plan>
+    ```
+
+    What else holds, and why, is [When a change needs
+    approval](../dev-guide/when-a-change-needs-approval.md).
+
 One that is live, if you want the finished shape: this documentation site is
 served from `docs.apprafter.dev`, a subdomain of an already-registered zone, so
 it needed no new zone and no new certificate — and its `expose` block is
@@ -132,7 +148,7 @@ is the two-host version of the same thing: the apex on one application and
   serves its own application and presents its own certificate at the edge:
 
   ```bash
-  curl -sI https://apprafter.dev/ ; curl -sI https://apprafter.io/
+  curl -sI https://<zone-a>/ ; curl -sI https://<zone-b>/
   ```
 
 - **The origin firewall blocks a bypass** — hitting the node directly, skipping

@@ -315,18 +315,6 @@ If you see `> 60 s` consistently on `k3s-ready`:
   ready in the Hetzner Cloud Console (the Web Console gives you
   out-of-band access to the boot log).
 
-### Token rotation accepted silently with the same value
-
-Fixed in v0.1.78. `apprafter target add <name> --renew --token
-<x>` byte-compares the new value against the stored one; identical
-input errors with a hint pointing at the Hetzner Cloud Console.
-
-### `apprafter target add` printed plaintext to stderr
-
-Found in an end-to-end run of v0.1.78. The wizard's "✓ Token verified" line is
-fine; the prior "(token bytes: <value>)" debug line is gone. If
-you see the value echoed anywhere in v0.1.78+, file an issue.
-
 ### Cilium pods did not pick up a config change
 
 They do now, and no manual roll is needed. The platform stack sets
@@ -412,7 +400,7 @@ registry without (or with the wrong) credentials:
 
 ### Public domain doesn't resolve or returns 5xx through Cloudflare {#dns}
 
-The step-5 public path has several moving parts; work outward:
+The public-domain path has several moving parts; work outward:
 
 - **DNS not resolving** — give Cloudflare time to propagate the
   nameserver change, and confirm the A/AAAA records match
@@ -506,9 +494,7 @@ runbooks by code, not by the human-readable summary.
 ## See also
 
 - [Operator quickstart](./quickstart.md) — happy-path setup.
-- [The target store on disk](../how-it-works/the-target-store.md) — credential resolution
-  chain reference.
-- [CLI reference](../reference/cli/index.md) — every
-  subcommand + flag.
 - [The target store on disk](../how-it-works/the-target-store.md) — where a
   credential-chain failure comes from, and the decision behind the chain.
+- [CLI reference](../reference/cli/index.md) — every
+  subcommand + flag.
