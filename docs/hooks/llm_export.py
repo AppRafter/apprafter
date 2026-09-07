@@ -697,9 +697,55 @@ def on_page_content(html: str, page: NavPage, config: MkDocsConfig, files: Files
             page.meta.get("description"), page.file.src_uri, "description"
         ),
         meta_audience=_authored_line(page.meta.get("audience"), page.file.src_uri, "audience"),
-        markdown=_resolve_snippets(page.markdown or "", page.file.src_uri),
+        markdown=_strip_gate_directives(
+            _resolve_snippets(page.markdown or "", page.file.src_uri)
+        ),
     )
     return html
+
+
+_GATE_DIRECTIVE = re.compile(r"^[ \t]*<!--[ \t]*docs:.*-->[ \t]*$")
+
+
+def _strip_gate_directives(markdown: str) -> str:
+    """Drop the drift gate's own exemption markers.
+
+    ``<!-- docs: check=none reason=… since=… -->`` annotates the block
+    below it for ``docsgen gate``.  An HTML comment never renders, so the
+    site was always clean — but a markdown twin IS the source, and the
+    bundle is a concatenation of twins, so every one of them reached
+    ``llms-full.txt`` and the per-page ``.md``.  A reader of the export
+    got internal build metadata inside the prose; a model reading the
+    bundle got the same, with no page to explain it.
+
+    Two conditions keep the contributor guide intact, and both are
+    load-bearing rather than defensive.  ``documentation-gate.md`` is the
+    page that TEACHES this syntax, and it shows it twice:
+
+    * inside backticks, as a span — so the rule matches a WHOLE LINE and
+      a span survives;
+    * inside a ``text`` fence, under *"The marker: exempting a fence"* —
+      so a line inside a fence is left alone, exactly as the gate's own
+      citation scan leaves a citation in a fence alone.  There the page
+      is DEMONSTRATING a marker rather than carrying one, and stripping
+      it empties the block that documents the feature.  It is also
+      caught rather than merely wrong: the artefact check compares each
+      page's fenced blocks against the ones it rendered, and this was
+      its first finding.
+
+    ``scripts/docs-artefacts-check.py`` re-derives this rule
+    independently, for the reason its own comment gives: the byte
+    compare is source-to-expectation, never this hook vouching for
+    itself.
+    """
+    kept, fenced = [], False
+    for line in markdown.split("\n"):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        elif not fenced and _GATE_DIRECTIVE.match(line):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
 
 
 _SNIPPET = re.compile(r"^(?P<indent>[ \t]*)--8<--[ \t]+\"(?P<path>[^\"]+)\"[ \t]*$")

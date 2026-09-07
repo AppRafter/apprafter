@@ -160,6 +160,32 @@ def url_for(src_uri):
 SNIPPET = re.compile(r"^(?P<indent>[ \t]*)--8<--[ \t]+\"(?P<path>[^\"]+)\"[ \t]*$")
 
 
+# Re-derived from the rule, NOT imported from the hook. The byte compare
+# below is source-to-expectation: if this file asked `llm_export.py` what
+# it does, the comparison would be the hook agreeing with itself, and a
+# transform it got wrong would look correct here.
+#
+# The rule: a line OUTSIDE A FENCE that is ENTIRELY a `<!-- docs: ... -->`
+# comment is the drift gate's exemption marker, and does not belong in a
+# published artefact. Both conditions exist for one page:
+# `contributing/documentation-gate.md` teaches the syntax and shows it
+# twice -- once inside backticks (a span, so whole-line only) and once
+# inside a `text` fence (so fences are skipped). Strip either and the
+# page that documents the marker stops documenting it.
+GATE_DIRECTIVE = re.compile(r"^[ \t]*<!--[ \t]*docs:.*-->[ \t]*$")
+
+
+def drop_gate_directives(markdown):
+    kept, fenced = [], False
+    for line in markdown.split("\n"):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        elif not fenced and GATE_DIRECTIVE.match(line):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def resolve_snippets(markdown, src_uri, _depth=0):
     """Inline every ``--8<-- "path"`` line before anything reads the source.
 
@@ -391,9 +417,10 @@ for path in tracked:
         titles[src_uri] = " ".join(str(title).split())
     source[url_for(src_uri)] = (
         src_uri,
-        # Snippet includes are resolved here, so every check below reads
-        # what the build will publish rather than a `--8<--` line.
-        resolve_snippets(body, src_uri).strip(),
+        # Snippet includes are resolved here, and the gate's own exemption
+        # markers dropped, so every check below reads what the build will
+        # publish rather than a `--8<--` line or a build directive.
+        drop_gate_directives(resolve_snippets(body, src_uri)).strip(),
         " ".join(str(description).split()) if description else "",
     )
 
