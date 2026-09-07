@@ -18,7 +18,7 @@
           "text": "NATS JetStream event backbone (a kine-backed replayable audit log on top of it is exploratory R&D, available on request)"
         },
         { "text": "OpenBao-backed secrets (Tier 2+)" },
-        { "text": "Automatic DNS (external-dns) + automatic backups to external S3" }
+        { "text": "Automatic DNS (external-dns)" }
       ]
     },
     {
