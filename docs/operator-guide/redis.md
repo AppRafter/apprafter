@@ -13,6 +13,18 @@ Each application gets its own logical database on a shared pool, walled off
 from every other by the credential it is given. You do not create an instance,
 a user, or a password.
 
+## Prerequisites
+
+- A Tier-1 cluster provisioned with `apprafter up` (see the
+  [Quickstart](quickstart.md)), operator **≥ v0.2.18** — the release that ships
+  the always-on dragonfly-operator, the `redis-integrated` provider, and the
+  Dragonfly backend in the claim controllers.
+- For the verification blocks below only, a kubeconfig:
+
+  ```sh
+  apprafter kubeconfig --refresh > /tmp/kc && export KUBECONFIG=/tmp/kc
+  ```
+
 ## Declare the dependency
 
 ```sh
@@ -214,18 +226,6 @@ window.
 | `NOPERM` from `INFO`, or from `PUBSUB CHANNELS` | both are denied to application credentials, deliberately | `INFO KEYSPACE` reports every database on the shared instance, and `PUBSUB CHANNELS` names every other application using pub/sub — neither can be narrowed to one tenant, so both are refused. Publishing and subscribing on your own prefix are unaffected. **BullMQ** calls `INFO` on startup: pass `skipVersionCheck: true` to its connection options. |
 | The application starts but its Redis env-vars are empty or missing | the manifest declares `needs.redis` but binds nothing — nothing is injected automatically | Add both bindings, as above. |
 | Data vanished after a restart | the claim is ephemeral, which is the default | Add `persistent: true` to the need. The claim moves to a persistent instance. |
-
-## Prerequisites
-
-- A Tier-1 cluster provisioned with `apprafter up` (see the
-  [Quickstart](quickstart.md)), operator **≥ v0.2.18** — the release that ships
-  the always-on dragonfly-operator, the `redis-integrated` provider, and the
-  Dragonfly backend in the claim controllers.
-- For the verification blocks above only, a kubeconfig:
-
-  ```sh
-  apprafter kubeconfig --refresh > /tmp/kc && export KUBECONFIG=/tmp/kc
-  ```
 
 ## Cleanup
 

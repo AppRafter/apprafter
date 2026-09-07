@@ -346,32 +346,44 @@ pub const CODE_REFERENCE_PLACEMENT: &str = "code-reference-placement";
 ///
 /// Everything else is implementation, and a guide naming a path in it is
 /// answering the mechanism question. Each entry earned its place from a
-/// real corpus sentence rather than from a guess at what might be
-/// wanted:
+/// real corpus sentence:
 ///
-/// * `docs-site/`, `landing/` — the deployments whose runbooks are
-///   themselves guides, where the reader edits exactly these files;
 /// * `examples/` — templates a reader copies;
-/// * `scripts/`, `.github/` — things a reader runs or a workflow whose
-///   behaviour is the reader\'s consequence;
 /// * `.devcontainer/`, `cue.mod/`, `manifests/`, `overrides/`, `docs/` —
 ///   checkout furniture and the site itself.
+///
+/// **`docs-site/`, `landing/`, `scripts/` and `.github/` are NOT here**,
+/// and that is the correction an audit forced. They were admitted for
+/// one page — the runbook for publishing this project's own
+/// documentation — and a measurement found that page is the ONLY user of
+/// all four. Four trees opened corpus-wide to accommodate one file is a
+/// rule that no longer says what it means, so the page is exempted by
+/// name instead. See [`CONTRIBUTOR_PAGE_IN_A_GUIDE_TREE`].
 ///
 /// Wrong in the safe direction: an entry that should not be here lets a
 /// finding through, which review catches. Its absence produces a false
 /// positive, which is loud.
 pub const READER_FACING_TREES: &[&str] = &[
     ".devcontainer",
-    ".github",
     "cue.mod",
     "docs",
-    "docs-site",
     "examples",
-    "landing",
     "manifests",
     "overrides",
-    "scripts",
 ];
+
+/// The one page under a guide tree that is contributor material.
+///
+/// `publish-the-docs-site.md` is the runbook for publishing THIS
+/// project's documentation: two of its five steps edit this repository.
+/// The nav lists it under Contributing and says so. 2.23e decided
+/// deliberately that the FILE does not move — "not moved, not renamed",
+/// so external references keep resolving — which leaves one contributor
+/// page sitting in a tree this class scopes by path.
+///
+/// Exempted from this class only. It stays a guide for `recipe-purity`
+/// and for the citation rules, and it carries no citation today.
+pub const CONTRIBUTOR_PAGE_IN_A_GUIDE_TREE: &str = "docs/operator-guide/publish-the-docs-site.md";
 /// An obligation count fell below the committed census: the corpus
 /// lost documented surface it used to have.
 ///
@@ -1660,7 +1672,7 @@ impl Gate {
         // doing a task, and the source tree answers a different
         // question — see [`CODE_REFERENCE_PLACEMENT`]. Off the masked
         // `prose` like the two scans below it, for their reason.
-        if is_guide(file) {
+        if is_guide(file) && file != CONTRIBUTOR_PAGE_IN_A_GUIDE_TREE {
             for (line, text) in repository_references(&prose, page_directory(file), &self.tops) {
                 findings.push(finding(
                     CODE_REFERENCE_PLACEMENT,

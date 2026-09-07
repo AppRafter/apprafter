@@ -12,6 +12,18 @@ before dropping it.
 You do not create a database, a user, or a password. You do not connect
 anything to anything.
 
+## Prerequisites
+
+- A Tier-1 cluster provisioned with `apprafter up` (see the
+  [Quickstart](quickstart.md)), operator **≥ v0.2.10** — the release that ships
+  the always-on CloudNativePG operator, the `pg-integrated` provider, and the
+  claim controllers.
+- For the verification blocks below only, a kubeconfig:
+
+  ```sh
+  apprafter kubeconfig --refresh > /tmp/kc && export KUBECONFIG=/tmp/kc
+  ```
+
 ## Declare the dependency
 
 Scaffold the manifest with the dependency in place:
@@ -210,18 +222,6 @@ that proves a database is physically dropped.
 | The manifest is rejected on sync | an unknown `needs` key | Use one of `pg`, `jetstream`, `clickhouse`, `redis`, `s3`, `notifications`, `disk`. Providers ship for `pg`, `redis` and `disk`. |
 | The application starts but its DSN env-var is empty or missing | the manifest declares `needs.pg` but binds nothing — nothing is injected automatically | Add `env: { DATABASE_URL: claim.pg.url }`, as above. |
 | The database is still there long after the grace window | CloudNativePG has not reconciled the drop yet | Give it a few cycles and check the CNPG operator log in `cnpg-system`. If it persists, stop and [report it](https://github.com/apprafter/apprafter/issues) — data you were told was dropped is still on disk. |
-
-## Prerequisites
-
-- A Tier-1 cluster provisioned with `apprafter up` (see the
-  [Quickstart](quickstart.md)), operator **≥ v0.2.10** — the release that ships
-  the always-on CloudNativePG operator, the `pg-integrated` provider, and the
-  claim controllers.
-- For the verification blocks above only, a kubeconfig:
-
-  ```sh
-  apprafter kubeconfig --refresh > /tmp/kc && export KUBECONFIG=/tmp/kc
-  ```
 
 ## Cleanup
 

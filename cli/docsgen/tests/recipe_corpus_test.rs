@@ -180,7 +180,13 @@ fn the_exemptions_are_all_typed_and_dated() {
             "-o",
             "<!-- docs: check=none[^>]*>",
             "--",
-            "docs",
+            // MARKDOWN ONLY. The marker is documentation grammar, and
+            // `docs/hooks/*.py` is code that happens to live under
+            // `docs/` — one of those hooks documents the marker in a
+            // docstring, and an unscoped grep read the placeholder in it
+            // as an undated exemption.
+            "docs/*.md",
+            "docs/**/*.md",
         ])
         .output()
         .expect("git grep");

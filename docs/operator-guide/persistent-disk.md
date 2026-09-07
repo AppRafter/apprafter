@@ -12,6 +12,18 @@ Deleting the application does **not** delete the volume. Nothing does, for
 seven days — and re-declaring the dependency in that window reattaches the same
 volume with the data still in it.
 
+## Prerequisites
+
+- A Tier-1 cluster provisioned with `apprafter up` (see the
+  [Quickstart](quickstart.md)), operator **≥ v0.2.21** — the release that ships
+  the disk provisioner, the `disk-local` provider seed, the renderer and
+  webhook rules, and the disk cleanup path.
+- For the verification blocks below only, a kubeconfig:
+
+  ```sh
+  apprafter kubeconfig --refresh > /tmp/kc && export KUBECONFIG=/tmp/kc
+  ```
+
 ## Declare the dependency
 
 ```sh
@@ -201,18 +213,6 @@ and the deletion after the grace window.
 | The manifest is rejected on sync | `needs.disk` with `replicas > 1`, a duplicate disk name or mount path, or a `size` that is not a Kubernetes quantity | Keep `replicas: 1`; give each disk a unique name and path; write `size` as `"1Gi"`. |
 | Data gone after deleting and recreating the app | the grace window elapsed, or the bare claim was deleted rather than the application | Remove the **application**, not the claim: deleting the claim while the manifest still declares the need makes the controller regenerate it, which cancels the snapshot. |
 | The volume is still there long after the grace window | the source claim is still live — the cleanup skips a volume whose claim exists | Confirm the claim is gone: `kubectl -n demo get resourceclaim.apprafter.io web-disk`, then check the operator log: `kubectl -n apprafter-system logs deploy/apprafter-operator`. |
-
-## Prerequisites
-
-- A Tier-1 cluster provisioned with `apprafter up` (see the
-  [Quickstart](quickstart.md)), operator **≥ v0.2.21** — the release that ships
-  the disk provisioner, the `disk-local` provider seed, the renderer and
-  webhook rules, and the disk cleanup path.
-- For the verification blocks above only, a kubeconfig:
-
-  ```sh
-  apprafter kubeconfig --refresh > /tmp/kc && export KUBECONFIG=/tmp/kc
-  ```
 
 ## Cleanup
 

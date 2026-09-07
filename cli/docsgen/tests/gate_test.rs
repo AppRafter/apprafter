@@ -1681,22 +1681,58 @@ fn a_guide_naming_an_implementation_path_in_a_span_is_the_same_defect_unlinked()
 
 #[test]
 fn a_span_naming_a_tree_the_reader_works_in_is_left_alone() {
-    // THE case that decides whether the span half is usable. The
-    // publishing runbook names `docs-site/Dockerfile` because the reader
-    // edits it, and the image guide names a template because the reader
-    // copies it. A rule that could not tell those from the operator's
-    // source would be switched off within the week.
+    // THE case that decides whether the span half is usable: the image
+    // guide names a template because the reader copies it, and the
+    // developer quickstart names the devcontainer because the reader
+    // opens it.
     let (repo, now) = tag_repo();
     let gate = gate_with(repo.path(), now);
-    let page = "# Page\n\nEdit `docs-site/Dockerfile`, copy `examples/templates/bun-http`, \
-                run `scripts/docs-site-smoke.sh`, and push to `landing/**`.\n";
+    let page = "# Page\n\nCopy `examples/templates/bun-http`, and the `.devcontainer/` \
+                mirrors it.\n";
     let found = of(
         &gate
-            .check_source("docs/operator-guide/publish-the-docs-site.md", page)
+            .check_source("docs/dev-guide/build-and-push.md", page)
             .unwrap(),
         gate::CODE_REFERENCE_PLACEMENT,
     );
     assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn the_one_contributor_page_in_a_guide_tree_is_exempt_by_name() {
+    // `docs-site/`, `landing/`, `scripts/` and `.github/` used to be on
+    // the reader-facing allowlist. A measurement found this page was the
+    // only user of all four — four trees opened corpus-wide for one
+    // file. It is exempted by name instead, so the allowlist says what
+    // it means for every other guide.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nEdit `docs-site/Dockerfile` and push to `landing/**`; the workflow is \
+                `.github/workflows/release-docs.yml`.\n";
+    let found = of(
+        &gate
+            .check_source(gate::CONTRIBUTOR_PAGE_IN_A_GUIDE_TREE, page)
+            .unwrap(),
+        gate::CODE_REFERENCE_PLACEMENT,
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn those_same_trees_are_reported_on_any_other_guide() {
+    // Non-vacuity for the exemption above, and the whole point of
+    // narrowing: the carve-out is one page, not four trees.
+    let (repo, now) = tag_repo();
+    let gate = gate_with(repo.path(), now);
+    let page = "# Page\n\nEdit `docs-site/Dockerfile` and push to `landing/**`; the workflow is \
+                `.github/workflows/release-docs.yml`.\n";
+    let found = of(
+        &gate
+            .check_source("docs/operator-guide/quickstart.md", page)
+            .unwrap(),
+        gate::CODE_REFERENCE_PLACEMENT,
+    );
+    assert_eq!(found.len(), 3, "{found:?}");
 }
 
 #[test]
