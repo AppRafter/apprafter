@@ -333,6 +333,9 @@ either, and the move is the same rebuild.
   provisioning the cluster, of which the machine choice is one step.
 - [Managing targets](target-store.md) — where the saved type lives
   on disk, alongside the region and the credentials.
+- [The target store on disk](../how-it-works/the-target-store.md) — where the
+  type you pick is recorded, and how the rungs of the resolution chain above
+  are read at provision time.
 - [Node preparation](node-prep.md) — the control-plane headroom and swap
   the machine you chose then gets configured with.
 - [Back up a cluster](backup-restore.md) — the backup and replay both

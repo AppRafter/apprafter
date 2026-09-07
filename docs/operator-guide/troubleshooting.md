@@ -429,6 +429,34 @@ The step-5 public path has several moving parts; work outward:
 
 Full runbook: [connect a domain](connect-a-domain.md).
 
+### Every command prints `Node disk: …` {#node-disk}
+
+The node's root filesystem has less than **15% free**, and the platform says
+so above every `apprafter` command until it does not. The banner carries the
+figure and what shares that filesystem:
+
+```text
+warn: Node disk: the node's filesystem is 88% full (12% free). Every workload
+on this node shares it — local-path volumes, database storage, snapshots,
+container images and logs.
+```
+
+It is one filesystem for all of it, which is why the warning is loud: a
+database, a volume and the image store fill the same disk, and the first thing
+to stop working will not be the thing that filled it.
+
+Free space, and the banner clears itself — the condition is re-sampled and goes
+back to `SufficientSpace` on its own, with nothing to acknowledge. The usual
+recoveries, cheapest first: retire snapshots you no longer need
+([Backup retention](backup-maintenance.md)), remove applications you have
+stopped using so their volumes are released, or
+[move to a bigger machine](moving-to-a-bigger-machine.md) if the workload has
+simply outgrown the one it is on.
+
+The sample is best-effort. If the node cannot be reached the previous verdict
+stands rather than flipping to a reassuring one, so a banner that neither
+appears nor clears is a reason to check the node itself.
+
 ### Node shows `NotReady` after bootstrap {#node-not-ready}
 
 A freshly provisioned node stays `NotReady` until the CNI is up.

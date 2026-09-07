@@ -12,7 +12,7 @@ this repository.
 
 Read it beside your own deployment. The
 [operator quickstart](../operator-guide/quickstart.md) and
-[Add your application](../dev-guide/build-and-push.md) are the recipes; this is
+[From source to a running image](../dev-guide/build-and-push.md) are the recipes; this is
 one instance of them, assembled.
 
 ## What is responsible for what

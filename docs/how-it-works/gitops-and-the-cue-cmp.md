@@ -70,8 +70,6 @@ it holds.
 
 ## What the sidecar does to your checkout
 
-## How the CUE CMP works
-
 The CUE plugin runs in a sidecar container named `cue-cmp`, inside
 the Argo CD `argocd-repo-server` pod. When Argo CD clones a repository
 and the discovery probe above prints a match, the sidecar runs its

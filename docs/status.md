@@ -37,12 +37,12 @@ post-launch work is not a roadmap phase and has no subscribe control.
 | Phase | Status | Feature | Documentation |
 |---|---|---|---|
 | Shipped | ✅ | Provision and run a cluster from one CLI (`init` → `apply` → `up` → `destroy`) | [Quickstart](operator-guide/quickstart.md) |
-| Shipped | ✅ | One-command bootstrap: k3s, Cilium, Gateway API, cert-manager, Argo CD, Backstage | [Quickstart](operator-guide/quickstart.md) |
+| Shipped | ✅ | One-command bootstrap: k3s, Cilium, Gateway API, cert-manager and Argo CD | [Quickstart](operator-guide/quickstart.md) |
 | Shipped | ✅ | Deploy from a CUE `Application` manifest through GitOps, including tag→digest auto-deploy | [Writing Application.cue](dev-guide/application-cue.md) |
 | Shipped | ✅ | Typed configuration with composition — CUE plus admission-webhook validation | [Writing Application.cue](dev-guide/application-cue.md) |
 | Shipped | ✅ | One manifest serves several environments | [Per-environment deploy](how-it-works/per-environment-deploy.md) |
-| Shipped | ✅ | Scaffold a starter manifest for an application (`apprafter app scaffold`) | [Add your application](dev-guide/build-and-push.md) |
-| Shipped | ✅ | Roll back to the previously resolved image and hold there until released | [Image iteration](dev-guide/image-iteration.md) |
+| Shipped | ✅ | Scaffold a starter manifest for an application (`apprafter app scaffold`) | [Developer quickstart](dev-guide/quickstart.md) |
+| Shipped | ✅ | Roll back to the previously resolved image and hold there until released | [Rolling back a bad deploy](dev-guide/rollback.md) |
 | Shipped | 🚧 | Backstage developer portal — application status and a golden-path template | — |
 
 > **Backstage is partial.** The portal deploys as an opt-in component and the golden-path template
@@ -106,7 +106,7 @@ post-launch work is not a roadmap phase and has no subscribe control.
 |---|---|---|---|
 | Shipped | ✅ | One command for the state of the cluster — version, upgrades, unhealthy conditions, applications in trouble, changes awaiting approval | [CLI reference](reference/cli/status.md) |
 | Shipped | ✅ | A failing reconcile is visible without reading the operator log | [Troubleshooting](operator-guide/troubleshooting.md) |
-| Shipped | ✅ | Disk pressure on the node is surfaced before it becomes an outage, and clears on its own | [Preparing a node](operator-guide/node-prep.md) |
+| Shipped | ✅ | Disk pressure on the node is surfaced before it becomes an outage, and clears on its own | [Troubleshooting](operator-guide/troubleshooting.md#node-disk) |
 | Shipped | ✅ | Removing a dependency from the manifest releases it onto the documented retention path | [Troubleshooting](operator-guide/troubleshooting.md) |
 | Shipped | ✅ | A one-line installer that verifies its own checksum, and a download page | [Quickstart](operator-guide/quickstart.md) |
 | [Phase 3](https://apprafter.dev/#roadmap-phase-tier2) | ☐ | Built-in metrics, traces, logs and network-flow visibility | — |

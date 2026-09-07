@@ -92,5 +92,8 @@ want to decide them separately.
 - [Writing Application.cue](application-cue.md) — every field named above.
 - [Image iteration](image-iteration.md) — the edits that do not hold, and why a
   moved tag is one of them.
+- [The approval gate](../how-it-works/the-approval-gate.md) — why some changes
+  gate and others do not, where a plan lives, and the lifecycle it moves
+  through.
 - [Migration plans](../operator-guide/migration-plans.md) — the operator's side:
   approving, the plan record, and platform-scope plans.

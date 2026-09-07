@@ -154,6 +154,8 @@ undo lasts until the next reconcile and no longer. Use
 
 ## See also
 
+- [The image digest](../how-it-works/the-image-digest.md) — why a moved tag
+  rolls at all, and what the pin actually holds the application at.
 - [Image iteration](image-iteration.md) — what a re-pushed tag does, and the
   hand-pinned reference that opts out of it.
 - [Deploying more than one environment](environments.md) — `--env` picks which
