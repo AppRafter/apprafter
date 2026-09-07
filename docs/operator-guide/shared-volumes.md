@@ -126,7 +126,7 @@ Prints a table with one row per SharedVolume:
 | SIZE | Requested size from `spec.size` |
 | READY | `true` once the backing PVC exists |
 | REFS | Number of ResourceClaims currently bound to this volume |
-| USED/FREE | Used and **free** bytes from the last kubelet sample — `usedBytes` / `capacityBytes − usedBytes`, not used-over-capacity. An em-dash (`—`) until the first sample lands |
+| USED/FREE | Used and **free** bytes from the last kubelet sample — `usedBytes` / `capacityBytes − usedBytes`, not used-over-capacity. An em-dash (`—`) until a sample lands. Unlike `volume status`, this column does not say when the figures are the host disk's rather than the volume's |
 
 ### Status
 
@@ -134,7 +134,7 @@ Prints a table with one row per SharedVolume:
 apprafter volume status <name> [--namespace <ns>]
 ```
 
-Single-resource detail view — six fixed lines, no conditions:
+Single-resource detail view:
 
 ```text
 SharedVolume:  apps/shared-uploads
@@ -142,16 +142,23 @@ SharedVolume:  apps/shared-uploads
   Ready:       true
   PVC ref:     sv-apps-shared-uploads
   Ref count:   2
-  Used/Free:   41943040/2105540608 bytes
+  Host disk:   12058030080/56163426304 bytes used/free (this volume shares it)
+  Used/Free:   — (local-path has no per-volume quota to report)
 ```
 
 `Size` is `spec.size` echoed back; the rest is status the operator wrote.
-`Ready` is `status.ready`, `PVC ref` is `status.pvcRef`, `Ref count` is
-`status.refCount`, and `Used/Free` is derived from
-`status.capacity.{usedBytes,capacityBytes}` — it prints an em-dash (`—`)
-until the first kubelet sample lands. The `CapacityWarning` condition
-described below is **not** among these lines; read it with `kubectl`
-(see [Capacity signal](#capacity-signal)).
+`Ready` is `status.ready`, `PVC ref` is `status.pvcRef` and `Ref count` is
+`status.refCount`. The last two lines both come from
+`status.capacity.{usedBytes,capacityBytes}`: on Tier 1 the `local-path`
+backend gives the kubelet no per-volume quota to report against, so what got
+measured is the filesystem the volume sits on — the output names it as the
+host disk rather than passing the node's size off as the volume's. A backend
+that does enforce a quota prints `Used/Free:   41943040/2105540608 bytes` and
+no host-disk line, and a volume nothing has measured yet prints
+`Used/Free:   —` on its own.
+
+A further `Capacity:` line appears while the volume is nearly full — see
+[When a volume is running out of room](#when-a-volume-is-running-out-of-room).
 
 ### Remove
 
@@ -174,55 +181,32 @@ On deletion the operator runs the `apprafter.io/sharedvolume-pvc-cleanup`
 finalizer: the backing PVC is deleted (404-tolerant), then the finalizer is
 released.
 
-## Capacity signal
+## When a volume is running out of room
 
-The SharedVolume controller polls the kubelet Summary API
-(`/api/v1/nodes/{node}/proxy/stats/summary`) once per reconcile cycle
-(every 5 minutes by default, with a 30-second TTL cache shared across all
-reconciles in the window). It extracts:
+`apprafter volume status` prints an extra line once the volume passes 85%
+full:
 
-- **Node-free fraction** — `availableBytes / capacityBytes` of the node's
-  root filesystem. When this falls below **15%**, the controller:
-  1. Sets `CapacityWarning=True` on the SharedVolume with reason
-     `NodeNearlyFull`.
-  2. Emits a `Warning` Kubernetes Event (`CapacityWarning` reason) on the
-     SharedVolume object — **edge-triggered**: the event fires only on the
-     transition from OK to warning, not on every reconcile while the node
-     stays nearly full.
-- **PVC used/capacity bytes** — from the pod volume stats for the backing
-  PVC name, surfaced as `status.capacity.{usedBytes,capacityBytes}`.
-
-When the node frees up above 15%, `CapacityWarning` flips to
-`CapacityWarning=False` (reason `SufficientCapacity`).
-
-Capacity sampling is **best-effort**: any failure (RBAC denial, kubelet
-unreachable, parse error, no node) is logged at debug level and the
-reconcile continues with `capacity` absent for that cycle. A CapacityWarning
-is only ever stamped when a fresh sample is available.
-
-### Reading the capacity signal
-
-**No `apprafter` command prints `CapacityWarning` today.** The operator
-stamps the condition on the CR and emits the Event; the CLI does not read
-either. `apprafter volume status` shows the sampled bytes (`Used/Free`)
-and nothing about the warning, and `apprafter app status` says nothing
-about SharedVolumes at all. Until a CLI surface exists, read the
-condition and the Event directly — tracked as a defect:
-
-<!-- docs: check=none reason=known-broken since=v0.2.51 — the workaround for a tracked defect: the operator raises CapacityWarning and no CLI surface reads it -->
-```sh
-kubectl -n apps get sharedvolume shared-uploads -o \
-  jsonpath='{.status.conditions[?(@.type=="CapacityWarning")].status}{" "}{.status.conditions[?(@.type=="CapacityWarning")].reason}{"\n"}'
-# -> True NodeNearlyFull      (or: False SufficientCapacity)
-
-kubectl -n apps describe sharedvolume shared-uploads
-# the Events section carries the edge-triggered Warning, reason
-# `CapacityWarning`
+```text
+  Capacity:    volume 91.2% full (> 85% threshold) — writes will fail when it reaches capacity
 ```
 
-`Used/Free` from `apprafter volume status` is the same sample the
-condition is computed from, so an em-dash there means no sample landed
-this cycle and the condition will not have been re-stamped either.
+The line is absent while the volume has room — and also absent when the
+operator could not measure the volume this cycle, so a missing warning is not
+a promise of space. Check that the same output carries a `Used/Free` or
+`Host disk:` figure rather than an em-dash before you read the silence as good
+news.
+
+There is nothing to configure and nothing to acknowledge. Free space and the
+line clears on the next reconcile, up to five minutes later. On Tier 1, where
+the figures are the host disk's, freeing space means freeing it **on the node**
+— every local-path volume, the databases and the image store share that
+filesystem, and the node reports its own version of this as a banner on every
+`apprafter` command.
+
+What gets sampled, why a Tier-1 volume's figures can be the node's, and where
+the node's own disk is reported are in [Cross-application shared
+volumes](../how-it-works/cross-application-shared-volumes.md#what-capacitywarning-measures).
+
 
 ## Example end-to-end
 

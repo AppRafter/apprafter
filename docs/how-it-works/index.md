@@ -36,7 +36,8 @@ than taken on faith.
   not in the upgrade path, where a chart version comes from, and the four
   reasons an upgrade can be waiting.
 - [Cross-application shared volumes](cross-application-shared-volumes.md) — why
-  sharing is opt-in, and why the namespace is the boundary on Tier 1.
+  sharing is opt-in, why the namespace is the boundary on Tier 1, and what the
+  capacity warning measures.
 - [How a restore replays a backup](how-a-restore-works.md) — the order, and the
   two invariants that order protects.
 - [Per-environment deploy](per-environment-deploy.md) — how an override merges

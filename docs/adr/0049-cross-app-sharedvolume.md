@@ -249,6 +249,37 @@ Negative / neutral:
   refCount on each reconcile. A brief window exists; a follow-up can add a
   finalizer on the ResourceClaim itself pointing to the SharedVolume.
 
+## Amendment — §6 is superseded in part by 2.22d, 2026-09-07
+
+**What §6 above describes is no longer what the code does, and the decision
+text is left standing because that is this corpus's convention: a decision is
+written once, and what measurement later overturns is appended.**
+
+§6 derives `CapacityWarning` on a SharedVolume from the **node's** free
+fraction, below a 15% threshold, with reason `NodeNearlyFull`. That is now
+wrong twice over.
+
+- **The condition is about the volume.** `CapacityWarning=True` is raised when
+  the volume's own usage crosses `DEFAULT_VOLUME_FULL_THRESHOLD` — 85% of its
+  capacity — and the message names the percentage and what happens at 100%.
+  Under §6 a volume at 99% of its own request, on a healthy node, said nothing
+  at all, while a condition named for the volume reported something else
+  entirely.
+- **The node signal was not dropped; it moved to where every cluster has it.**
+  It is `NodeDiskPressure` on the `PlatformStack` singleton, still at 15% free
+  and now with reason `NodeFilesystemNearlyFull` — a cluster with no
+  SharedVolume was never warned about its own disk under the old shape.
+
+The edge-triggering in §6 survives, with one property the original text did not
+anticipate: a reconcile cycle that cannot sample **prunes** the condition, so
+the next successful cycle sees no prior warning and publishes the Event again,
+without the volume having stopped being full.
+
+The mechanism as it now stands is
+[Cross-application shared volumes](../how-it-works/cross-application-shared-volumes.md);
+the node half is [Preparing a node](../operator-guide/node-prep.md) and the
+banner it produces is in the troubleshooting catalogue.
+
 ## Owner
 
 Andrey Ryahovskiy.
