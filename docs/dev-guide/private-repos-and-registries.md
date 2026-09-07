@@ -23,11 +23,12 @@ table below is the whole decision space:
 
 ## Register once, covers both {#register-once}
 
-`apprafter repo creds add` registers **one** credential that the
-operator uses for **both** surfaces. It seals your token client-side
-(the CLI never holds the controller's key) into a `SourceCredential`,
-and the operator derives the Argo CD repo-cred and the workload
-pull-secret from it:
+`apprafter repo creds add` registers **one** credential that covers
+**both** surfaces. Your token is sealed on your machine before it is
+sent, and cannot be read back from the CLI afterwards. What the
+platform then builds out of it — and how it decides which repositories
+and images a credential is for — is
+[Source credentials](../how-it-works/source-credentials.md):
 
 ```sh
 apprafter repo creds add my-org \
@@ -107,9 +108,20 @@ apprafter repo creds rotate my-org  # in-place token swap (no Argo reconnect win
 apprafter repo creds remove my-org  # refuses if apps still depend on the prefix; --force overrides
 ```
 
-`apprafter repo creds show` reports the operator's validity verdict —
-if it isn't `GitValid=True` (and, for a registry, the pull check
-passing), Argo CD or the kubelet will fail at clone/pull time.
+`apprafter repo creds show` reports a validity verdict per half.
+`GitValid=True` means a clone will authenticate, `RegistryValid=True`
+means a pull will. `Unknown` is not a failure: it is what a cluster
+with no outbound access reports, and what a credential nothing
+references yet reports. [What each verdict is measured
+against](../how-it-works/source-credentials.md#gitvalid) tells the
+three apart.
+
+There is no command for *narrowing* a credential: dropping a prefix or
+a registry host is an edit to the credential itself, and the platform
+holds that edit for approval rather than applying it, so applications
+under the removed prefix keep working while you decide. See
+[Narrowing coverage](../how-it-works/source-credentials.md#narrowing)
+and [Migration plans](../operator-guide/migration-plans.md).
 
 ## Troubleshooting
 
