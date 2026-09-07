@@ -4268,6 +4268,14 @@ Decision 0 (ADR 0056 §d): provisioning — это spending decision, implicit `
     так что переименование страницы ломает гейт, а не тихо ссылку.
 - [x] **2.21c** — перенос матрицы killer features под правилами редактуры; девять
   отсутствовавших строк добавлены; каждое не-`☐` проверено против кода.
+  - **Догон 2026-09-07:** секция «Deferred / out of scope» — последний пункт §3 спеки, который
+    первый проход пропустил. Она несла два противоречия, оба внесённые тем же проходом:
+    Kamaji hard multi-tenancy стояла и в списке отложенного, и строкой `Phase 4` (реестр
+    называет Phase 5 «Production Tier 3 + multi-tenancy» — то есть фаза была неверной), а
+    Tier 3 и Tier 4 значились «вне объёма», хотя роадмап лендинга активно их обещает с
+    кнопкой подписки. Три строки уехали в таблицу с корректными `Phase 5` / `Phase 6`;
+    остаток переписан двумя честными списками — «сделаем по запросу» и «сознательно не
+    делаем», по пункту на строку вместо двух прогонов через `·`.
   - Две живые переоценки поправлены попутно: строка safety-gate называла себя **MCP-native**
     (grep по `cli/`+`operator/` — ни крейта, ни зависимости, ни бинаря), строка скаффолда
     называла `apprafter app new`, которой нет.
@@ -7184,7 +7192,7 @@ Decision 0 (ADR 0056 §d): provisioning — это spending decision, implicit `
 - [ ] Каждое нетривиальное архитектурное решение → ADR в `docs/adr/`.
 - [ ] Раз в квартал — ревью устаревших ADR.
 - [ ] Зафиксировать ADR'ы 0014–0029 (исключая 0018 как Unused): добавить в `docs/adr/`, обновить `docs/adr/README.md` index. ADR 0011 mark as `Status: Superseded by 0016`.
-- [ ] **M1.5 carry-over:** ADRs 0025–0029 should be committed to `docs/adr/` during M1.5 (preferably как часть 1.66 — early commit chains decision documents to the work).
+- [x] **M1.5 carry-over:** ADRs 0025–0029 committed to `docs/adr/` (проверено 2026-09-07: все пять на месте — `0025-gitops-control-surface`, `0026-platformstack-crd`, `0027-migrationplan-unification`, `0028-platform-stack-distribution`, `0029-cue-cmp`). Чекбокс отставал от дерева.
 
 ### ∞.2 Dependency hygiene
 

@@ -137,6 +137,9 @@ post-launch work is not a roadmap phase and has no subscribe control.
 | Post-launch | ☐ | Grow a single-node cluster into a multi-node one in place | — |
 | Post-launch | ☐ | Approve or reject a held change from the portal, not only the CLI | — |
 | Post-launch | ☐ | A one-time import from another platform, checked before it commits | — |
+| [Phase 5](https://apprafter.dev/#roadmap-phase-tier3) | ☐ | Bare metal, for workloads that want the whole machine | — |
+| [Phase 5](https://apprafter.dev/#roadmap-phase-tier3) | ☐ | Hard multi-tenancy — many customers on one cluster, isolated from each other | — |
+| [Phase 6](https://apprafter.dev/#roadmap-phase-tier4) | ☐ | Confidential computing — workloads the machine's operator cannot read | — |
 
 ---
 
@@ -152,7 +155,6 @@ cluster stays an ordinary AppRafter install on your own infrastructure.
 | [Phase 4](https://apprafter.dev/#roadmap-phase-managed) | ☐ | A hosted portal on your own subdomain | — |
 | [Phase 4](https://apprafter.dev/#roadmap-phase-managed) | ☐ | A hosted endpoint for AI clients, proxied to your cluster | — |
 | [Phase 4](https://apprafter.dev/#roadmap-phase-managed) | ☐ | A billing view in the portal | — |
-| [Phase 4](https://apprafter.dev/#roadmap-phase-managed) | ☐ | Hard multi-tenancy for running many customers on one cluster | — |
 | Post-launch | ☐ | A live playground for trying the platform without installing it | — |
 
 ---
@@ -169,9 +171,35 @@ cluster stays an ordinary AppRafter install on your own infrastructure.
 
 ---
 
-### Deferred and out of current scope
+## Not on the roadmap
 
-Listed so that "not done" is not confused with "not planned."
+Everything above is either built or planned. These are neither, and they are
+listed so that "no row" is not read as "nobody thought about it". Nothing here
+has a phase or a subscribe control, because nothing here has a date.
 
-- **Deferred (added on demand):** KEDA autoscaling · SPIRE + OpenBao · kine+NATS storage · ClickHouse / VictoriaMetrics (observability depth) · Kamaji hard multi-tenancy (Tier-2 opt-in, [ADR 0038](adr/0038-tier2-kamaji-opt-in.md)) · Cilium Egress Gateway + static IPs · AccessGrant + OIDC SSO · Trivy / SBOM scanning · cost view.
-- **Out of current scope:** Dev Mode (local bootstrap) · `needs.jetstream` · notifications service · self-hosted Forgejo / Harbor / GitLab · Headscale / Tailscale · Tier 3 (Talos / LINSTOR / Kata) · Tier 4 (confidential containers) · plugin ecosystem.
+**Wanted, and waiting for someone to want it.** Each is understood and would be
+built on demand; none is scheduled, and asking is what would move one:
+
+- Horizontal autoscaling driven by a queue depth or a custom metric, rather
+  than by CPU.
+- Per-workload identity certificates and a general-purpose secret store, in
+  place of sealed secrets.
+- Deeper observability — a columnar store for high-cardinality metrics, and
+  long-retention query.
+- A fixed outbound IP for your applications, for allow-lists on the other side.
+- Access grants and single sign-on for the cluster's own surfaces.
+- Image vulnerability scanning and a published bill of materials.
+- A cost view in the portal.
+
+**Deliberately not built.** These are decisions rather than gaps:
+
+- **A local development mode.** The platform targets a real cluster; running it
+  on a laptop would be a second product with its own failure modes.
+- **Self-hosted Git, registry or VPN as platform components.** You bring your
+  own, and the platform integrates with them.
+- **A plugin ecosystem.** Extension exists at the service-provider boundary
+  only, and opening more of it would make "one way to do things" untrue.
+- **`needs.jetstream`.** The schema declares the key and no provider ships one,
+  so it cannot be used today.
+- **A notifications service.** Out of scope until something in the platform
+  needs to send more than it does now.

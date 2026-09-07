@@ -4,7 +4,7 @@
   "identifiers": 341,
   "cue_documents": 6,
   "cue_fences": 26,
-  "code_paths": 126,
-  "adr_references": 55,
+  "code_paths": 127,
+  "adr_references": 54,
   "exemptions": 5
 }
