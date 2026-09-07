@@ -43,6 +43,9 @@ than taken on faith.
   onto the base, and why the environment belongs to the deployment.
 - [The image digest](the-image-digest.md) — why a re-pushed tag rolls at all,
   and what happens when the registry cannot be read.
+- [The public route](the-public-route.md) — what a registered zone puts on the
+  Gateway, how an `expose` block becomes a route that attaches to it, and what
+  the origin firewall does and does not buy.
 - [Source credentials](source-credentials.md) — what one registered credential
   derives into, how a repository or an image is matched to it, and why
   narrowing one pauses everything it derives.

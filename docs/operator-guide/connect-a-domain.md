@@ -12,6 +12,10 @@ The result: each registered zone is served over HTTPS through Cloudflare's edge,
 TLS terminates at the cluster Gateway on a Cloudflare Origin CA certificate, and
 the node's IP is firewalled so the only way in is through Cloudflare.
 
+What each step puts in the cluster — the listener pair a zone creates, the route
+an application's `expose` block becomes, and what the `PublicRouteReady` verdict
+is telling you — is [The public route](../how-it-works/the-public-route.md).
+
 **Prerequisites:** a bootstrapped cluster, the `apprafter` CLI pointed at it
 (`apprafter target list` shows it active), and a domain you can change
 nameservers on.
@@ -25,11 +29,10 @@ bypass Cloudflare by hitting the node directly:
 apprafter target firewall cloudflare-origin enable
 ```
 
-This fetches Cloudflare's published IPv4 + IPv6 ranges and allows inbound
-`80`/`443` only from them (SSH, the Kubernetes API, and WireGuard keep their
-existing access). It's a cluster-wide setting — do it once, not per zone — and it
-survives re-provisioning. Run `apprafter target firewall cloudflare-origin
-disable` to reopen `80`/`443`.
+It's a cluster-wide setting — do it once, not per zone — and it survives
+re-provisioning. Run `apprafter target firewall cloudflare-origin disable` to
+reopen `80`/`443`. What the restriction buys, and what it does not, is
+[The public route](../how-it-works/the-public-route.md#what-the-origin-firewall-buys-and-what-it-does-not).
 
 > Infrastructure-as-code / fork users can instead opt in via the manifest:
 > `spec: firewall: cloudflareOrigin: true` + `apprafter apply` (a manifest value
@@ -92,8 +95,10 @@ apprafter target domain add <zone> --cert cf-origin-cert-<sanitized-zone>
 ```
 
 The Gateway gains an apex + wildcard `:443` listener pair for the zone, both
-terminating TLS from the imported certificate. The command prints the node IP to
-use for the DNS records above.
+terminating TLS from the imported certificate
+([why two](../how-it-works/the-public-route.md#what-registering-a-zone-creates)).
+The command then points you at `apprafter target ip` for the DNS record values
+above.
 
 ### 2.5 Expose an application on the domain
 
@@ -107,8 +112,8 @@ spec: base: expose: {
 }
 ```
 
-Apply the application as usual. The operator renders an HTTPRoute that attaches
-the host to the application's Service.
+Apply the application as usual —
+[the operator turns that block into a route on the Gateway](../how-it-works/the-public-route.md#how-an-expose-block-becomes-a-route).
 
 !!! warning "This edit waits for an approval"
 
@@ -158,7 +163,7 @@ is the two-host version of the same thing: the apex on one application and
   curl --resolve <zone>:443:<node-ip> https://<zone>/
   ```
 
-- **List the registered zones** and the apps using each:
+- **List the registered zones**, with a count of the applications using each:
 
   ```bash
   apprafter target domain list

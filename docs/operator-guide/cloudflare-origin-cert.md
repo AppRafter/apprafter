@@ -40,7 +40,10 @@ apprafter target domain add apprafter.dev --cert cf-origin-cert-apprafter-dev
 
 ## Notes
 
-- One certificate per registrable zone — import once per zone.
+- One certificate per registrable zone — import once per zone. The apex and the
+  wildcard listener that registering a zone creates both reference this one
+  Secret, which is why it has to carry both names:
+  [The public route](../how-it-works/the-public-route.md#what-registering-a-zone-creates).
 - Only RSA keys are supported today (Cloudflare Origin CA is RSA 2048).
 - Set Cloudflare SSL/TLS mode to **Full (strict)** so the edge validates the
   origin certificate.
