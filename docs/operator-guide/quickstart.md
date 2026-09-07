@@ -13,23 +13,24 @@ see [Developer quickstart](../dev-guide/quickstart.md).
 
 ## What you will build
 
-| Component         | Tier-1 baseline                                                        |
-| ----------------- | ---------------------------------------------------------------------- |
-| Substrate         | One Hetzner Cloud server, of the type you pick in step 1, in `nbg1` (or your region). |
-| Network           | Hetzner private network 10.0.0.0/16, subnet 10.0.0.0/24.              |
-| Firewall          | TCP 22 (SSH) + 6443 (kube API) + 80/443 (HTTP/S) + UDP 51820 (WG).    |
-| Kubernetes        | k3s single-node (traefik + servicelb disabled).                        |
-| CNI               | Cilium 1.16.5 (kube-proxy replacement, IPAM kubernetes).               |
-| Gateway           | Gateway API CRDs + Cilium gateway.                                     |
-| GitOps            | Argo CD 7.7.7 (single replicas, Dex off).                              |
-| TLS               | cert-manager 1.16.2 + self-signed `apprafter-selfsigned` issuer.       |
-| Application CRD   | `apprafter.io/v1alpha1.Application` (admission-validated).             |
+One Hetzner Cloud server of the type you pick in step 1, in the region
+you pick with it, on a private network behind a firewall that opens SSH,
+the Kubernetes API, HTTP/S and WireGuard. On the server: single-node
+k3s, with Cilium as its network and Argo CD holding everything else —
+cert-manager and a self-signed issuer, the Gateway API CRDs, the
+AppRafter operator and its admission webhook, a default-deny
+NetworkPolicy, sealed secrets, the vertical autoscaler, and the database
+operators a declared dependency draws on.
 
 **Important:** the platform does not stop at Argo CD installation. After
-`up` completes, Argo CD adopts the platform stack itself — Cilium,
-cert-manager, the AppRafter operator, the admission webhook — and reconciles it
-from a versioned OCI chart. You do not install the operator by hand; the
-platform installs and upgrades itself through GitOps.
+`up` completes, Argo CD adopts the platform stack itself and reconciles
+it from a versioned OCI chart. You do not install the operator by hand,
+and you do not upgrade it by hand either.
+
+Which components those are, which of them are off on Tier 1, and where
+each pinned version is declared so you can check it rather than trust a
+list:
+[What cluster-bootstrap installs](../how-it-works/what-cluster-bootstrap-installs.md).
 
 ## Prerequisites
 
@@ -174,42 +175,20 @@ Run one command to provision and bootstrap the entire tier-1 stack:
 apprafter up                    # (alias: apprafter bootstrap-all)
 ```
 
-This runs three phases under a unified progress display:
+This runs three phases under a unified progress display: **`apply`**
+provisions the SSH key, private network, firewall and the server, and
+hands it a `#cloud-config` user-data block that installs fail2ban + k3s
+(around 30 s on the Hetzner side; cloud-init needs another 90–180 s
+after that); **`k3s-ready`** polls until that finishes and retrieves the
+kubeconfig over SSH, which lands age-encrypted in
+`.apprafter/state.json`; **`cluster-bootstrap`** installs Cilium and
+Argo CD, then hands the rest of the platform to Argo CD.
 
-1. **`apply`** — provisions the SSH key, private network, firewall,
-   the server of the type you chose in step 1, and a `#cloud-config`
-   user-data block that installs fail2ban + k3s. Around 30 s on the
-   Hetzner side;
-   cloud-init needs another 90–180 s after that.
-2. **`k3s-ready` (poll)** — waits for cloud-init + k3s to finish
-   on the new node, then retrieves the kubeconfig over SSH.
-   The kubeconfig lands age-encrypted in `.apprafter/state.json`.
-3. **`cluster-bootstrap`** — installs Argo CD (the bootstrap
-   loader), then applies a root Argo CD `Application` that points
-   at the platform-stack OCI chart. Argo CD reconciles all remaining
-   platform components — Cilium, Gateway API CRDs, the AppRafter
-   Application CRD, default-deny NetworkPolicy, cert-manager,
-   self-signed ClusterIssuer, apprafter-operator, and the
-   admission webhook — from that chart without further CLI
-   intervention.
-
-```mermaid
-flowchart TD
-    A["apprafter up"] --> B["apply: SSH key, network, firewall,<br/>server, k3s via cloud-init"]
-    B --> C["k3s-ready: poll cloud-init,<br/>fetch kubeconfig over SSH"]
-    C --> D["cluster-bootstrap"]
-    subgraph loader["cluster-bootstrap (CLI loader)"]
-        D --> E["helm install Cilium (CNI)"]
-        E --> F["helm install Argo CD"]
-        F --> G["kubectl apply root 'platform' Application"]
-    end
-    G --> H{"Argo CD reconciles the platform-stack chart"}
-    H --> I["Gateway API CRDs, cert-manager,<br/>operator + admission webhook,<br/>default-deny NetworkPolicy,<br/>self-signed ClusterIssuer;<br/>adopts the Cilium release"]
-```
-
-The CLI installs only what the node needs to schedule Argo CD (Cilium,
-then Argo CD itself); everything past the root Application is Argo CD's
-to reconcile from the chart.
+Expect the platform to keep converging for a few minutes after `up`
+returns.
+[What cluster-bootstrap installs](../how-it-works/what-cluster-bootstrap-installs.md)
+is the step-by-step: what the CLI installs, what Argo CD installs, why
+the order cannot change, and what is off by default on Tier 1.
 
 Preview before spending a Hetzner cent:
 
@@ -307,13 +286,6 @@ control surface is Git plus the CLI, and a hand-applied CR is drift Argo CD
 will fight with on its next sync. `kubectl apply` against a cluster is
 reserved for emergency overrides.
 
-!!! note "There is no opt-out for the operator or webhook"
-    Both arrive as components of the platform-stack chart that Argo CD
-    reconciles, so `spec.operator.enabled` and
-    `spec.admissionWebhook.enabled` have no effect —
-    `cluster-bootstrap` reads no `Infrastructure.cue` at all. The
-    fields still parse, and are scheduled for removal.
-
 ## Day-2 operations
 
 | Task                          | Command                                                  |
@@ -367,6 +339,10 @@ byte-identical to the pre-colour baseline.
   the token-scope rules that differ between the two.
 - [Platform management](./platform-management.md) — platform
   version lifecycle, release channels, upgrade and freeze.
+- [What cluster-bootstrap installs](../how-it-works/what-cluster-bootstrap-installs.md)
+  — what the CLI installs versus what Argo CD reconciles, the order and
+  why each step blocks the next, and where every pinned version is
+  declared.
 - [CLI reference](../reference/cli/index.md) — full subcommand
   reference with every flag + alias.
 - [Developer quickstart](../dev-guide/quickstart.md) —

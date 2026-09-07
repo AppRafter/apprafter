@@ -282,6 +282,7 @@ nav:
       - GitOps and the CUE plugin: how-it-works/gitops-and-the-cue-cmp.md
       - Node reservations and swap: how-it-works/node-reservations-and-swap.md
       - How the approval gate works: how-it-works/the-approval-gate.md
+      - What cluster-bootstrap installs: how-it-works/what-cluster-bootstrap-installs.md
       - How the platform upgrades itself: how-it-works/platform-upgrades.md
       - Cross-application shared volumes: how-it-works/cross-application-shared-volumes.md
       - How a restore replays a backup: how-it-works/how-a-restore-works.md

@@ -32,6 +32,10 @@ than taken on faith.
   between `git push` and a running Deployment: the discovery probe, what the
   plugin sidecar writes into your checkout, and why each manifest is exported
   on its own.
+- [What cluster-bootstrap installs](what-cluster-bootstrap-installs.md) — the
+  two Helm releases and three applies the CLI performs, why each step blocks
+  the next, what arrives afterwards as a chart component, and what is off on
+  Tier 1.
 - [How the platform upgrades itself](platform-upgrades.md) — why the CLI is
   not in the upgrade path, where a chart version comes from, and the four
   reasons an upgrade can be waiting.
