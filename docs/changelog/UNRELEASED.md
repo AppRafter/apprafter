@@ -104,6 +104,21 @@ the cluster did.
   disaster-recovery path still works and its hint now names
   `--credential-file` alongside `--repo`.
 
+- **The snapshot table shows times in the reader's zone, and lines up.**
+  `backup list` printed restic's raw `2026-09-10T22:11:39.771675302Z` for
+  a backup the operator had just taken at 23:11 their time — the only
+  UTC value among a CLI that prints the schedule, and everything else,
+  in their own zone. Times now render as `2026-09-10 23:11:39` under a
+  `TIME (Europe/Lisbon)` header, converted through `chrono::Local` so a
+  listing that spans a DST change uses each snapshot's own offset rather
+  than today's. A timestamp that does not parse is still printed
+  verbatim.
+
+  The columns are measured from the rows instead of being fixed: the old
+  header reserved 25 characters for a value that renders 30 wide, so
+  TAGS started somewhere different on every line. Both defects were
+  reported from the same live listing.
+
 - **`backup list` follows the cluster.** With off-site backup enabled, a
   bare `backup list` listed the LOCAL repository and printed nothing,
   which reads as "the backup I just configured did not work" rather than

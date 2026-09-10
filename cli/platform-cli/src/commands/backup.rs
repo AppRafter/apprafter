@@ -2038,6 +2038,18 @@ pub fn run_backup_list(
         None => None,
     };
 
+    // The zone NAME is best-effort and cosmetic — it labels the column.
+    // The conversion itself uses `Local`, which applies the OS rules for
+    // each snapshot's own date rather than today's offset, so a listing
+    // that spans a DST change still reads correctly.
+    let zone = resolve_time_zone(
+        None,
+        std::env::var("TZ").ok().as_deref(),
+        iana_time_zone::get_timezone().ok().as_deref(),
+    )
+    .ok()
+    .map(|(z, _)| z);
+
     match choose_list_repo(repo, local, spec_backup.as_ref()) {
         ListRepo::OffSite(repo_url) => {
             let creds = resolve_verb_creds(
@@ -2049,7 +2061,10 @@ pub fn run_backup_list(
             let runner = CredentialedRestic { creds };
             let json = runner.run_stdout(&restic_snapshots_argv(&repo_url), &pass)?;
             let snapshots = parse_snapshots_json(&json)?;
-            print!("{}", format_snapshot_table(&repo_url, &snapshots));
+            print!(
+                "{}",
+                format_snapshot_table(&repo_url, &snapshots, &chrono::Local, zone.as_deref())
+            );
         }
         chosen => {
             let repo_str = match &chosen {
@@ -2068,7 +2083,10 @@ pub fn run_backup_list(
             let r = SubprocessRestic;
             let json = r.run_stdout(&restic_snapshots_argv(&repo_str), &pass)?;
             let snapshots = parse_snapshots_json(&json)?;
-            print!("{}", format_snapshot_table(&repo_str, &snapshots));
+            print!(
+                "{}",
+                format_snapshot_table(&repo_str, &snapshots, &chrono::Local, zone.as_deref())
+            );
         }
     }
     Ok(())
@@ -2085,36 +2103,102 @@ fn parse_snapshots_json(json: &str) -> Result<Vec<Value>> {
     Ok(parsed.as_array().cloned().unwrap_or_default())
 }
 
+/// Render one snapshot timestamp in the reader's zone.
+///
+/// restic writes RFC3339 UTC to the nanosecond. Every other time this CLI
+/// prints — the schedule above all — is in the operator's own zone, and one
+/// raw UTC value among them reads as a different event than the one they
+/// just caused. A value that does not parse is printed VERBATIM: it is the
+/// only information there is about that snapshot, and a formatted guess
+/// would be worse than the original.
+///
+/// Generic over the zone so production can pass [`chrono::Local`] — which
+/// applies the OS rules for the snapshot's OWN date, not today's offset —
+/// while tests pass a fixed offset and assert against a constant.
+fn format_snapshot_time<Tz>(raw: &str, tz: &Tz) -> String
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    match chrono::DateTime::parse_from_rfc3339(raw) {
+        Ok(t) => t.with_timezone(tz).format("%Y-%m-%d %H:%M:%S").to_string(),
+        Err(_) => raw.to_string(),
+    }
+}
+
 /// Render the `backup list` snapshot table. Pure — extracted from
 /// [`run_backup_list`], which prints exactly this.
 ///
 /// INVARIANT: an absent `short_id` falls back to the full `id` TRUNCATED to 8
-/// characters. `restic` takes either, and printing a full 64-hex id in a
-/// 12-wide column would wreck the table it is supposed to line up.
-fn format_snapshot_table(repo: &str, snapshots: &[Value]) -> String {
+/// characters. `restic` takes either, and printing a full 64-hex id would
+/// wreck the table it is supposed to line up.
+///
+/// Column widths are measured from the rows rather than fixed. The fixed
+/// 25 the header used to reserve for TIME was narrower than the 30-character
+/// timestamp restic writes, so TAGS began in a different place on every line
+/// — the table lined up only for values nobody had.
+fn format_snapshot_table<Tz>(
+    repo: &str,
+    snapshots: &[Value],
+    tz: &Tz,
+    zone_label: Option<&str>,
+) -> String
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
     if snapshots.is_empty() {
         return format!("No snapshots in {repo}.\n");
     }
-    let mut out = format!("Snapshots in {repo}:\n{:<12}  {:<25}  TAGS\n", "ID", "TIME");
-    for s in snapshots {
-        let id = s
-            .pointer("/short_id")
-            .or_else(|| s.pointer("/id"))
-            .and_then(Value::as_str)
-            .map(|i| i.chars().take(8).collect::<String>())
-            .unwrap_or_else(|| "?".to_string());
-        let time = s.pointer("/time").and_then(Value::as_str).unwrap_or("?");
-        let tags = s
-            .pointer("/tags")
-            .and_then(Value::as_array)
-            .map(|t| {
-                t.iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
-        out.push_str(&format!("{id:<12}  {time:<25}  {tags}\n"));
+    let time_header = format!("TIME ({})", zone_label.unwrap_or("local"));
+
+    let rows: Vec<(String, String, String)> = snapshots
+        .iter()
+        .map(|s| {
+            let id = s
+                .pointer("/short_id")
+                .or_else(|| s.pointer("/id"))
+                .and_then(Value::as_str)
+                .map(|i| i.chars().take(8).collect::<String>())
+                .unwrap_or_else(|| "?".to_string());
+            let time = s
+                .pointer("/time")
+                .and_then(Value::as_str)
+                .map(|t| format_snapshot_time(t, tz))
+                .unwrap_or_else(|| "?".to_string());
+            let tags = s
+                .pointer("/tags")
+                .and_then(Value::as_array)
+                .map(|t| {
+                    t.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            (id, time, tags)
+        })
+        .collect();
+
+    let id_w = rows
+        .iter()
+        .map(|(id, _, _)| id.chars().count())
+        .chain(std::iter::once("ID".len()))
+        .max()
+        .unwrap_or(2);
+    let time_w = rows
+        .iter()
+        .map(|(_, t, _)| t.chars().count())
+        .chain(std::iter::once(time_header.chars().count()))
+        .max()
+        .unwrap_or(4);
+
+    let mut out = format!(
+        "Snapshots in {repo}:\n{:<id_w$}  {:<time_w$}  TAGS\n",
+        "ID", time_header
+    );
+    for (id, time, tags) in rows {
+        out.push_str(&format!("{id:<id_w$}  {time:<time_w$}  {tags}\n"));
     }
     out
 }
@@ -5802,12 +5886,101 @@ mod tests {
     // `backup list` — snapshot table rendering
     // ------------------------------------------------------------------
 
+    /// A fixed +09:00, so the zone conversion is asserted against a
+    /// constant rather than against whatever zone the test host is in.
+    fn tokyo() -> chrono::FixedOffset {
+        chrono::FixedOffset::east_opt(9 * 3600).unwrap()
+    }
+
+    #[test]
+    fn a_snapshot_time_is_shown_in_the_readers_own_zone() {
+        // What the operator saw: `2026-09-10T22:11:39.771675302Z` — UTC,
+        // to the nanosecond, for a backup they took at 23:11 their time.
+        // Every other time this CLI prints is in their zone (the schedule
+        // especially), and one raw UTC timestamp in the middle of that
+        // reads as a different backup than the one they just took.
+        let table = format_snapshot_table(
+            "s3:x",
+            &[json!({
+                "short_id": "354fb34e",
+                "time": "2026-09-10T22:11:39.771675302Z",
+                "tags": ["platform-2026-09-10T22:11:34+00:00"]
+            })],
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
+        assert!(table.contains("2026-09-11 07:11:39"), "{table}");
+        assert!(!table.contains("771675302"), "{table}");
+        assert!(
+            table.contains("TIME (Asia/Tokyo)"),
+            "the column says which zone it is in: {table}"
+        );
+    }
+
+    #[test]
+    fn the_columns_line_up_whatever_the_values_are() {
+        // The reported symptom: the header reserved 25 columns for a
+        // timestamp that renders 30 wide, so TAGS started in a different
+        // place on every line.
+        let table = format_snapshot_table(
+            "s3:x",
+            &[
+                json!({"short_id": "354fb34e", "time": "2026-09-10T22:11:39.771675302Z",
+                       "tags": ["one"]}),
+                json!({"short_id": "aa", "time": "not-a-timestamp", "tags": ["two"]}),
+                json!({}),
+            ],
+            &tokyo(),
+            None,
+        );
+        let tag_column: Vec<usize> = table
+            .lines()
+            .filter(|l| l.contains("TAGS") || l.contains("one") || l.contains("two"))
+            .map(|l| {
+                l.rfind("  ")
+                    .map(|i| i + 2)
+                    .expect("every row has a column gap")
+            })
+            .collect();
+        assert!(
+            tag_column.windows(2).all(|w| w[0] == w[1]),
+            "TAGS must start at one column on every line: {table}"
+        );
+    }
+
+    #[test]
+    fn a_timestamp_restic_did_not_write_is_shown_verbatim() {
+        // Conservative: a value this code cannot parse is still the only
+        // information there is about that snapshot, and inventing a
+        // formatted time for it would be worse than showing it raw.
+        let table = format_snapshot_table(
+            "s3:x",
+            &[json!({"short_id": "x", "time": "whenever"})],
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
+        assert!(table.contains("whenever"), "{table}");
+    }
+
+    #[test]
+    fn an_unknown_zone_still_labels_the_column() {
+        let table = format_snapshot_table(
+            "s3:x",
+            &[json!({"short_id": "x", "time": "2026-09-10T22:11:39Z"})],
+            &tokyo(),
+            None,
+        );
+        assert!(table.contains("TIME (local)"), "{table}");
+    }
+
     #[test]
     fn the_snapshot_table_truncates_a_full_id_when_restic_omits_short_id() {
         let full = "0123456789abcdef0123456789abcdef";
         let table = format_snapshot_table(
             "s3:https://h/b",
             &[json!({"id": full, "time": "2026-08-01T03:00:00Z", "tags": ["a", "b"]})],
+            &tokyo(),
+            Some("Asia/Tokyo"),
         );
         assert!(table.contains("01234567"), "{table}");
         assert!(
@@ -5815,7 +5988,8 @@ mod tests {
             "a 32-hex id in a 12-wide column wrecks the table: {table}"
         );
         assert!(table.contains("a, b"), "tags are joined: {table}");
-        assert!(table.contains("2026-08-01T03:00:00Z"), "{table}");
+        // +09:00 of 03:00Z is noon the same day.
+        assert!(table.contains("2026-08-01 12:00:00"), "{table}");
     }
 
     #[test]
@@ -5826,6 +6000,8 @@ mod tests {
                 json!({"short_id": "deadbeef", "id": "ffffffffffff"}),
                 json!({}),
             ],
+            &tokyo(),
+            Some("Asia/Tokyo"),
         );
         assert!(table.contains("deadbeef"), "{table}");
         assert!(!table.contains("ffffffff"), "short_id wins: {table}");
@@ -5836,7 +6012,7 @@ mod tests {
 
     #[test]
     fn an_empty_repo_says_so_instead_of_printing_an_empty_table() {
-        let table = format_snapshot_table("s3:https://h/b", &[]);
+        let table = format_snapshot_table("s3:https://h/b", &[], &tokyo(), Some("Asia/Tokyo"));
         assert!(table.contains("No snapshots in s3:https://h/b"), "{table}");
         assert!(
             !table.contains("TAGS"),
