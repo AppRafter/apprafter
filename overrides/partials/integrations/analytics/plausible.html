@@ -10,13 +10,21 @@
   not a fixed enum — the theme ships google.html and resolves any other name
   through custom_dir, which is what makes this work with no plugin.
 
-  navigation.instant swaps pages with history.pushState, so a head-loaded
-  tracker would see exactly one pageview per full load and none of the
-  in-site navigations. The subscription below is material's own
-  `location$` observable, the same shape the theme's google.html uses.
-  Do NOT also enable history-based pageview capture in the Plausible
-  dashboard for this property: doing both counts every internal
-  navigation twice, and a metric that is quietly 2x is worse than none.
+  navigation.instant swaps pages with history.pushState, and the loader
+  handles that itself: it replaces `history.pushState`, listens for
+  `popstate`, and sends a pageview whenever `location.pathname` changed.
+  This file used to subscribe to material's own `location$` observable and
+  send a second `plausible("pageview")` on top — written when the loader
+  was assumed to capture full loads only. It does not: `autoCapturePageviews`
+  defaults on, so every in-site navigation, and the initial load with it,
+  was counted twice. A metric that is quietly 2x is worse than none, so the
+  subscription is gone rather than the autocapture: one mechanism, and it is
+  the one that dedupes repeat pathnames.
+
+  The site is baked into the script, not passed here — the loader assigns
+  `domain` last and overrides whatever `init()` is given. So which property
+  these pageviews land in is decided entirely by which `pa-*.js` is
+  requested below, and this one says `apprafter.dev`.
 -#}
 <script defer src="https://plausible.io/js/pa-ObkWGtUzPqv9gmVcgCKLF.js"></script>
 <script>
@@ -27,11 +35,4 @@
     };
   plausible.init = plausible.init || function (i) { plausible.o = i || {}; };
   plausible.init();
-
-  document.addEventListener("DOMContentLoaded", function () {
-    if (typeof location$ === "undefined") return;
-    location$.subscribe(function () {
-      plausible("pageview");
-    });
-  });
 </script>
