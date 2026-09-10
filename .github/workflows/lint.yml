@@ -63,6 +63,7 @@ jobs:
             bun:
               - 'landing/**'
               - 'backstage-plugins/**'
+              - 'scripts/check-payload-types.sh'
               - '.github/workflows/lint.yml'
 
   cue:
@@ -162,3 +163,16 @@ jobs:
             (cd "$dir" && bun install --frozen-lockfile && bun run lint)
             echo "::endgroup::"
           done
+      # Runs AFTER the loop above, which is what installs `landing/`'s
+      # workspace dependencies — the generator lives in `landing/cms`'s
+      # node_modules and there is nothing to compare against without them.
+      # Unconditional on which package changed: the loop installs every
+      # detected dir regardless, and a stale generated file is stale
+      # whether or not this push is the one that staled it.
+      #
+      # Needs no secrets and takes no input from the event payload.
+      # `payload generate:types` compiles the schema and writes a file; it
+      # opens no database and reads no environment.
+      - name: payload-types drift
+        if: steps.detect.outputs.found == 'true'
+        run: ./scripts/check-payload-types.sh

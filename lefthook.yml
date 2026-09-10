@@ -138,6 +138,27 @@ pre-commit:
           - name: docs-check
             glob: "{README.md,docs/{*.md,**/*.md},docs/measurements/docs-health.json,mkdocs.yml,docs/hooks/**,scripts/docs-check.sh,scripts/docs-artefacts-check.py,cli/platform-cli/src/**,cli/docsgen/**,cli/Cargo.toml,schemas/v1alpha1/*.cue,operator/charts/apprafter-operator/templates/crd-*.yaml}"
             run: ./scripts/docs-check.sh
+    # There is deliberately NO job here for `landing/cms/payload-types.ts`,
+    # the generated file the `payload-types drift` step in
+    # .github/workflows/lint.yml checks. Both shapes were built and their
+    # failures reproduced before being rejected:
+    #
+    #   - Regenerate-and-stage, mirroring the `docsgen` job above, breaks under
+    #     `git commit -- <paths>`, `--only` and `--amend -- <paths>`. Those run
+    #     hooks against a THROWAWAY index (`.git/next-index-<pid>.lock`) that
+    #     git discards afterwards, so the `git add` reaches the commit but never
+    #     the real index: the artefact stays staged at its pre-hook bytes and
+    #     the next plain commit silently reverts it, between two clean commits.
+    #     `docsgen` shares this exposure; it is not a reason to add a second.
+    #   - Either shape renders from the WORKING TREE while the commit is the
+    #     INDEX. lefthook hides unstaged hunks only for PARTIALLY staged files,
+    #     so a sibling global that is modified but wholly unstaged is baked into
+    #     the artefact anyway — staged into a commit whose sources do not
+    #     contain it, or reported as drift the commit does not have.
+    #
+    # CI is where index, tree and commit are one thing, so that is where the
+    # byte-compare runs. `scripts/check-payload-types.sh` carries the long
+    # version of this reasoning.
 
 commit-msg:
   commands:

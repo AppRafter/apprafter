@@ -290,6 +290,35 @@ landing-smoke base='https://apprafter.dev':
 landing-check:
     cd landing && bun test landing-content-gate.test.ts
 
+# Regenerate `landing/cms/payload-types.ts` from the Payload collections
+# and globals, and commit the result.
+#
+# MUST be run (and the result committed) after ANY change under
+# `landing/cms/src/collections/` or `landing/cms/src/globals/` — a new
+# field, a renamed one, a changed type, an edited `admin.description`
+# (Payload mirrors those into the file as JSDoc). The generator opens no
+# database and needs no configuration values.
+#
+# Nothing regenerates this for you. There is no pre-commit hook, on
+# purpose — `scripts/check-payload-types.sh` explains why a hook cannot
+# be correct here — so forgetting it is caught by the `payload-types
+# drift` step in `.github/workflows/lint.yml`, on the pull request.
+#
+# Regenerate the Payload types after editing a collection or global.
+payload-types:
+    cd landing/cms && bun run generate:types
+
+# Byte-compare `landing/cms/payload-types.ts` against a fresh render
+# without leaving the regenerated file behind. This is what CI runs; run
+# it before pushing if you would rather not wait for the pull request.
+# It needs `landing/cms/node_modules`, which is why it is not in
+# `just lint` — that is meant to work in a fresh checkout, the same
+# boundary CI already draws for the per-package `bun run lint`.
+#
+# Check the committed Payload types against a fresh render.
+payload-types-check:
+    ./scripts/check-payload-types.sh
+
 # Regenerate `docs/reference/cli/**` from the clap definitions.
 #
 # MUST be run (and the result committed) after ANY change to the CLI
