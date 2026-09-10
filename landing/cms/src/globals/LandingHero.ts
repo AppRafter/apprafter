@@ -27,7 +27,7 @@ export const LandingHero: GlobalConfig = {
       localized: true,
       admin: {
         description:
-          'Raw HTML for the footnote under the hero, keyed to the * marker on “Open source” in headlineHtml (add <sup>*</sup> there). Leave empty to hide the footnote.',
+          'Raw HTML for the footnote under the hero, keyed to a * marker in headlineHtml (add <sup>*</sup> beside the licensing phrase). Leave empty to hide the footnote — a footnote with no marker above it is an asterisk pointing at nothing.',
       },
     },
     { name: 'cueFilename', type: 'text', required: true, defaultValue: 'billing-api.cue' },

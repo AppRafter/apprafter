@@ -13,7 +13,7 @@
       "iconName": "bars"
     },
     {
-      "title": "Open source, no vendor lock-in.",
+      "title": "Source available, no vendor lock-in.",
       "bodyHtml": "FSL-1.1-Apache-2.0, auto-converts to Apache 2.0 in two years. Everything runs on your hardware or in your cloud. The managed version is on the way for those who'd rather not run ops themselves. And when you want back to self-host from it — there'll be a CLI command for that. Not a philosophy, an architecture.",
       "iconName": "lock"
     }

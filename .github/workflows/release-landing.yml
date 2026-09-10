@@ -72,11 +72,32 @@ jobs:
           tags: |
             ${{ steps.image-base.outputs.image }}:${{ github.ref_name }}
             ${{ steps.image-base.outputs.image }}:latest
-          # PUBLIC_CMS_URL is baked into the client JS at build
-          # time. Override per environment by editing the workflow
-          # or via workflow_dispatch + a future build-arg input.
+          # BUILT FROM THE LIVE CMS, like the preview build — not from
+          # the repository fallbacks.
+          #
+          # It used to inherit the Dockerfile's `LANDING_USE_FALLBACK=1`
+          # default while also pushing `:latest`, which production
+          # watches. So any push touching `landing/**` republished the
+          # site from the fallback JSONs and silently reverted whatever
+          # copy had been edited in the admin — observed on 2026-09-10,
+          # when a hero/value-props/footer wording change came back to
+          # "Open source" until the owner re-promoted.
+          #
+          # CONTENT_REV must be unique per run for the same reason the
+          # preview build documents: the CMS fetch happens inside the
+          # `bun run build` layer and is invisible to BuildKit, so a
+          # stable value reuses a cached dist and admin edits never
+          # reach the image.
+          #
+          # The cost, accepted deliberately: this build now needs a
+          # reachable CMS. If cms.apprafter.dev is down the release
+          # fails rather than shipping stale copy — which is the safer
+          # of the two failures, because the other one is silent.
           build-args: |
+            LANDING_USE_FALLBACK=0
+            LANDING_CMS_URL=https://cms.apprafter.dev
             PUBLIC_CMS_URL=https://cms.apprafter.dev
+            CONTENT_REV=${{ github.run_id }}-${{ github.run_attempt }}
           # Same x86-only stance as release-operator until the
           # platform learns multi-arch (Hetzner CAX*).
           platforms: linux/amd64

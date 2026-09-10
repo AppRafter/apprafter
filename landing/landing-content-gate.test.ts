@@ -135,10 +135,7 @@ describe('SYS-3 (b) — how a phase is written', () => {
     // an id the page never emitted — while the notify button, gated on
     // the same lookup, was skipped. The component normalises the suffix
     // away; this holds it there.
-    const roadmap = readFileSync(
-      join(ROOT, 'web/src/components/sections/Roadmap.astro'),
-      'utf8',
-    );
+    const roadmap = readFileSync(join(ROOT, 'web/src/components/sections/Roadmap.astro'), 'utf8');
     expect(roadmap).toContain("replace(/\\+$/, '')");
     expect(roadmap).toContain('const entryFor =');
     // The button and the anchor must read the SAME lookup, or a phase
@@ -362,10 +359,7 @@ describe('SYS-3 (c) — the feature ledger joins on the registry id', () => {
   });
 
   test('the landing links back to the ledger', () => {
-    const roadmap = readFileSync(
-      join(ROOT, 'web/src/components/sections/Roadmap.astro'),
-      'utf8',
-    );
+    const roadmap = readFileSync(join(ROOT, 'web/src/components/sections/Roadmap.astro'), 'utf8');
     expect(roadmap).toContain('docs.apprafter.dev/status/');
   });
 });

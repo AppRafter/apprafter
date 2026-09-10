@@ -85,8 +85,8 @@ jobs:
           platforms: linux/amd64
           # Share the cache scope with release-landing.yml's web job so the
           # install/deps layers are reused. The `bun run build` layer is
-          # deliberately NOT reused here (CONTENT_REV differs from the
-          # release build's stable default), so the fallback dist never
-          # leaks into a preview image.
+          # never reused across runs on either side: both builds now pass
+          # a per-run CONTENT_REV, because both fetch the live CMS and
+          # that fetch is invisible to BuildKit.
           cache-from: type=gha,scope=landing-web
           cache-to: type=gha,mode=max,scope=landing-web

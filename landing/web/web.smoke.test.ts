@@ -67,7 +67,15 @@ describe('hero section pieces', () => {
     // landingHero.json fallback (mirroring the Payload global).
     const heroJson = readFileSync(join(ROOT, 'src/data/fallback/landingHero.json'), 'utf8');
     expect(heroJson).toContain('€5 VPS');
-    expect(heroJson).toContain('Open source');
+    // The hero states the licensing posture, and states it accurately.
+    // It used to pin the literal string "Open source", which is what the
+    // owner deliberately moved away from — FSL-1.1-Apache-2.0 is
+    // source-available, not OSI open source, and the hero's own footnote
+    // has always said so. A pin on the old wording is now a guard against
+    // the correction rather than for it, so what is pinned is the claim
+    // the licence supports.
+    expect(heroJson).toContain('Source Available');
+    expect(heroJson.toLowerCase()).not.toContain('open source');
     // ADR 0032 license string — must NOT slip back to FSL-1.1-MIT.
     expect(heroJson).toContain('FSL-1.1-Apache-2.0');
     expect(heroJson).not.toContain('FSL-1.1-MIT');

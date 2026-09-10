@@ -334,6 +334,49 @@ kubectl -n argocd get appproject.argoproj.io apps >/dev/null 2>&1 || {
     exit 1
 }
 
+# The AppProject is NOT a proxy for the CMP being ready, and treating it as
+# one is how this walk failed intermittently (2026-09-03, 2026-09-10) with a
+# message that blamed the CMP for not rendering.
+#
+# Both arrive from the same platform-stack sync but land independently: the
+# `apps` AppProject is one object, while the cue-cmp sidecar is a patch to the
+# `argocd-repo-server` Deployment that triggers a ROLLOUT. Register the fixture
+# in between and Argo CD reconciles it against a repo-server that has no CMP —
+# discovery never runs, Argo falls back to `Source Type: Directory`, and a
+# directory with nothing but a `.cue` file syncs to ZERO resources. The
+# Application reports Synced + Healthy, Phase 5a passes, and Phase 5b then
+# waits out five minutes for a CR that was never going to be rendered.
+#
+# So wait for the template to CARRY the sidecar first — a rollout that
+# finished before the patch arrived is complete and useless — and only then
+# for the rollout itself.
+printf '  waiting for the repo-server template to carry the cue-cmp sidecar ...\n'
+deadline=$(( $(date +%s) + 600 ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    if kubectl -n argocd get deploy argocd-repo-server \
+            -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null \
+            | tr ' ' '\n' | grep -qx 'cue-cmp'; then
+        printf '  repo-server template carries cue-cmp\n'
+        break
+    fi
+    sleep 10
+done
+kubectl -n argocd get deploy argocd-repo-server \
+    -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null \
+    | tr ' ' '\n' | grep -qx 'cue-cmp' || {
+    printf 'ERROR: argocd-repo-server never gained the cue-cmp sidecar\n' >&2
+    kubectl -n argocd get deploy argocd-repo-server -o yaml >&2 2>&1 || true
+    exit 1
+}
+
+printf '  waiting for the repo-server rollout to complete ...\n'
+kubectl -n argocd rollout status deploy/argocd-repo-server --timeout=600s || {
+    printf 'ERROR: argocd-repo-server rollout did not complete\n' >&2
+    kubectl -n argocd get pods -l app.kubernetes.io/name=argocd-repo-server -o wide >&2 2>&1 || true
+    exit 1
+}
+printf '  ok: repo-server is serving with the CMP sidecar\n'
+
 # ---------------------------------------------------------------
 # Phase 3: set up local git server with the fixture repo
 # ---------------------------------------------------------------
@@ -413,7 +456,24 @@ done
 kubectl -n "$APP_NS" get applications.apprafter.io "$APP_NAME" >/dev/null 2>&1 || {
     printf 'ERROR: Application.apprafter.io %s not found after 5 min\n' \
         "$APP_NAME" >&2
-    printf 'CMP may not have rendered or Argo CD sync failed. Argo CD Application:\n' >&2
+    # `sourceType` is the discriminator, so lead with it. `Plugin` means the
+    # CMP ran and something inside it failed. `Directory` means discovery never
+    # matched — Argo CD treated the repo as plain manifests, found none, and
+    # reported Synced + Healthy over zero resources. The old message here said
+    # "CMP may not have rendered", which sent two separate investigations
+    # looking inside a plugin that had never been invoked.
+    _src_type=$(kubectl -n argocd get applications.argoproj.io "$APP_NAME" \
+        -o jsonpath='{.status.sourceType}' 2>/dev/null || true)
+    printf 'Argo CD sourceType=%q\n' "${_src_type:-<absent>}" >&2
+    if [ "$_src_type" = "Directory" ]; then
+        printf 'That is NOT a CMP failure: discovery never matched, so the plugin never ran.\n' >&2
+        printf 'The usual cause is registering before the repo-server rollout carrying the\n' >&2
+        printf 'cue-cmp sidecar completed — Phase 2 waits for exactly that.\n' >&2
+        kubectl -n argocd get deploy argocd-repo-server \
+            -o jsonpath='{.spec.template.spec.containers[*].name}' >&2 2>&1 || true
+        printf '\n' >&2
+        kubectl -n argocd get pods -l app.kubernetes.io/name=argocd-repo-server -o wide >&2 2>&1 || true
+    fi
     kubectl -n argocd describe applications.argoproj.io "$APP_NAME" >&2 || true
     exit 1
 }
