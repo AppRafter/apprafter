@@ -114,6 +114,13 @@ the cluster did.
   repository, with its own init and first backup, so it goes through
   `enable`.
 
+  `set` reads the field back before reporting success. The apiserver
+  prunes fields a structural CRD does not define — patch accepted, 200
+  returned, value gone — so on a cluster whose operator predates
+  `checkReadDataSubset`, `set check-depth 10%` would print a tick and
+  change nothing. It now names the dropped field and says to upgrade the
+  platform first. Same class as the `timeZone` read-back, same remedy.
+
   `check-depth` validates restic's `--read-data-subset` grammar (`10%`,
   `2.5%`, `1/12`, `500M`) in the CLI rather than leaving it to the Job.
   The only place restic would report a bad value is inside the weekly

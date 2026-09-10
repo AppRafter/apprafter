@@ -2666,6 +2666,36 @@ fn snapshot_identity(
     }
 }
 
+/// Compare what `set` wrote against what the cluster stored.
+///
+/// The apiserver PRUNES fields a structural CRD does not define: the patch
+/// is accepted, 200 comes back, and the value is gone. `checkReadDataSubset`
+/// arrived with operator v0.2.48, so on an older cluster `set check-depth`
+/// would print a tick and change nothing — the same silent half-success the
+/// `timeZone` read-back exists for.
+///
+/// `None` when everything the patch wrote is present, or when there was no
+/// CR to read back: the write already succeeded, and a follow-up read that
+/// does not answer is not evidence that it failed.
+fn set_readback_error(key: &str, written: &Value, stored: Option<&Value>) -> Option<CliError> {
+    let stored = stored?;
+    let written = written.as_object()?;
+    let dropped: Vec<&str> = written
+        .iter()
+        .filter(|(k, v)| stored.get(k.as_str()) != Some(*v))
+        .map(|(k, _)| k.as_str())
+        .collect();
+    if dropped.is_empty() {
+        return None;
+    }
+    Some(CliError::Other(format!(
+        "the cluster did not store {} — the write was accepted and the field(s) discarded.\n\n         This cluster's PlatformStack CRD predates them, so the apiserver pruned what it does \
+         not define. `{key}` was NOT changed. Upgrade the platform \
+         (`apprafter platform upgrade`), then re-run this command.",
+        dropped.join(", ")
+    )))
+}
+
 /// `apprafter backup set <key> <value>` — change one field of a configured
 /// backup, leaving every other field exactly as it was.
 ///
@@ -2697,6 +2727,12 @@ pub fn run_backup_set(key: &str, value: &str) -> Result<()> {
         &body,
         kc.path(),
     )?;
+
+    // Read back before claiming success — see `set_readback_error`.
+    let stored = spec_backup_from_cluster(Some(kc.path())).unwrap_or(None);
+    if let Some(e) = set_readback_error(key, &patch["spec"]["backup"], stored.as_ref()) {
+        return Err(e);
+    }
 
     println!("✓ {key} set to {value}.");
     println!("  {BACKUP_GITOPS_ADVISORY}");
@@ -5792,6 +5828,37 @@ mod tests {
     // ------------------------------------------------------------------
     // `backup set` — change one field of a configured backup
     // ------------------------------------------------------------------
+
+    #[test]
+    fn a_field_the_crd_dropped_is_reported_rather_than_celebrated() {
+        // Structural pruning: the apiserver takes a merge-patch carrying
+        // a field its CRD does not define, answers 200, and silently
+        // drops it. `spec.backup.checkReadDataSubset` arrived with
+        // operator v0.2.48, so on any older cluster `set check-depth 10%`
+        // would print a tick and change nothing — the same failure the
+        // timeZone read-back was added for.
+        let patched = json!({"checkReadData": false, "checkReadDataSubset": "10%"});
+        assert!(set_readback_error("check-depth", &patched, Some(&patched)).is_none());
+
+        let pruned = json!({"checkReadData": false});
+        let err = set_readback_error("check-depth", &patched, Some(&pruned))
+            .expect("a dropped field must be reported");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("checkReadDataSubset"),
+            "names the field: {msg}"
+        );
+        assert!(msg.contains("upgrade") || msg.contains("Upgrade"), "{msg}");
+    }
+
+    #[test]
+    fn a_readback_that_cannot_be_taken_does_not_invent_a_failure() {
+        // No CR came back — the write already succeeded, and reporting a
+        // failure because the follow-up read did not answer would be a
+        // wrong answer about a change that landed.
+        let patched = json!({"schedule": "30 4 * * *"});
+        assert!(set_readback_error("at", &patched, None).is_none());
+    }
 
     #[test]
     fn set_check_depth_writes_the_three_shapes_of_verification() {
