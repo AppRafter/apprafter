@@ -9,6 +9,43 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## platform-stack 0.2.68 / argocd-cue-cmp 0.1.24 — the sidecar pin follows its own image (unreleased)
+
+### Fixed
+
+- **A schema edit rebuilt the cue-cmp image and left the chart pinned to
+  the old one.** The sidecar image COPYs `schemas/v1alpha1` (ADR 0046),
+  so 0.2.67's `checkReadDataSubset` addition made it a new image —
+  `argocd-cue-cmp/version.cue` had to move, and `component_argocd-cue-cmp.cue`
+  reads that version for both the component pin and `values.image.tag`.
+  Publishing an image does not re-render a chart, so without this bump
+  clusters would have gone on deploying v0.1.23: the same silent-pin rot
+  the backup runner suffered for six weeks, in the one other place this
+  repo pins an image by literal.
+
+  No behaviour change in the sidecar. The schema it gained is a
+  PlatformStack field; cue-cmp validates Application manifests.
+
+### Changed
+
+- **The cue-cmp drift check is a script now, and `just lint` runs it.**
+  It was inline shell inside `argocd-cue-cmp-check.yml` — the one drift
+  guard in this repo that could not run before a push, while its four
+  siblings (operator bump, CLI bump, runner pin, platform-stack version)
+  are all scripts wired into `just lint`. So it caught this with red CI
+  instead of a red `just lint`, after the push had already fanned out to
+  the publish workflows. `scripts/check-argocd-cue-cmp-drift.sh` mirrors
+  the workflow's rule and pathspec; the workflow keeps its own copy,
+  because CI must not depend on a script the branch under test can edit.
+
+- **`just lint` runs docsgen's property tests.** `docs-check.sh`
+  byte-compares the committed CLI reference against a fresh render, which
+  cannot see a defect present in both: a doc comment that hard-wraps
+  inside a token renders identically twice and passes. `docsgen`'s own
+  tests assert the properties, and they were only in the `test` workflow
+  — so a wrap inside `keep-daily/keep-weekly/keep-monthly` shipped, and
+  CI found it. ~7s from a warm target directory.
+
 ## platform-stack 0.2.67 / operator v0.2.48 — the runner fix reaches clusters, and the weekly check starts reading data (unreleased)
 
 ### Changed

@@ -1550,9 +1550,10 @@ pub enum BackupAction {
     /// adjust a single setting without resetting the others.
     ///
     /// Keys: at <HH:MM>, check <HH:MM|off>, check-depth
-    /// <structure|10%|full>, timezone <IANA>, keep-daily/keep-weekly/
-    /// keep-monthly <n>, enforce <operator|cluster>, staging-mode
-    /// <monolithic|sequential>, failure-webhook <url>.
+    /// <structure|10%|full>, timezone <IANA>, keep-daily <n>,
+    /// keep-weekly <n>, keep-monthly <n>, enforce
+    /// <operator|cluster>, staging-mode <monolithic|sequential>,
+    /// failure-webhook <url>.
     Set {
         /// Field to change (e.g. `check-depth`).
         key: String,

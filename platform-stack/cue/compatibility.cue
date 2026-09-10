@@ -1760,6 +1760,28 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.68": {
+	change:          "safe"
+	operatorVersion: "v0.2.48"
+	notes: """
+		Sidecar rebuild: the cue-cmp pin follows argocd-cue-cmp v0.1.24.
+
+		The image COPYs `schemas/v1alpha1` (ADR 0046), so 0.2.67's
+		`checkReadDataSubset` addition made it a new image. Publishing that
+		image does NOT move the chart's pin — `component_argocd-cue-cmp.cue`
+		reads `argocdcuecmp.version`, and a chart that is not re-rendered
+		goes on deploying the previous sidecar. That is the same silent-pin
+		rot the backup runner suffered for six weeks, in the one other place
+		this repo pins an image by literal.
+
+		No behaviour change in the sidecar itself: the schema it gained is a
+		PlatformStack field, and cue-cmp validates Application manifests.
+		The rebuild is what the drift guard requires, not what the operator
+		needs.
+		"""
+	references: ["docs/adr/0046-env-value-references.md"]
+}
+
 compatibility: "0.2.67": {
 	change:          "safe"
 	operatorVersion: "v0.2.48"

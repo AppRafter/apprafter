@@ -209,7 +209,7 @@ apprafter backup run --timeout 120
 
 Change ONE field of a configured backup, leaving the rest alone. `backup enable` rewrites the whole block, so it cannot be used to adjust a single setting without resetting the others.
 
-Keys: at &lt;HH:MM>, check &lt;HH:MM|off>, check-depth &lt;structure|10%|full>, timezone &lt;IANA>, keep-daily/keep-weekly/ keep-monthly &lt;n>, enforce &lt;operator|cluster>, staging-mode &lt;monolithic|sequential>, failure-webhook &lt;url>.
+Keys: at &lt;HH:MM>, check &lt;HH:MM|off>, check-depth &lt;structure|10%|full>, timezone &lt;IANA>, keep-daily &lt;n>, keep-weekly &lt;n>, keep-monthly &lt;n>, enforce &lt;operator|cluster>, staging-mode &lt;monolithic|sequential>, failure-webhook &lt;url>.
 
 ```text
 Usage: apprafter backup set <KEY> <VALUE>
