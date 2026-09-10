@@ -66,7 +66,7 @@ export const SiteSettings: GlobalConfig = {
       type: 'text',
       required: true,
       localized: true,
-      defaultValue: 'AppRafter — One manifest. From a €5 VPS to production. Open source.',
+      defaultValue: 'AppRafter — One manifest. From a €5 VPS to production. Source Available.',
       admin: { description: 'The <title> for the home page.' },
     },
     {
@@ -75,7 +75,7 @@ export const SiteSettings: GlobalConfig = {
       required: true,
       localized: true,
       defaultValue:
-        'AppRafter is an opinionated PaaS on Kubernetes. Describe your applications in a single CUE manifest — the same one runs from a single VDS to a multi-node production cluster. Open source (FSL-1.1-Apache-2.0).',
+        'AppRafter is an opinionated PaaS on Kubernetes. Describe your applications in a single CUE manifest — the same one runs from a single VDS to a multi-node production cluster. Source available (FSL-1.1-Apache-2.0).',
       admin: { description: 'The meta description for the home page.' },
     },
   ],

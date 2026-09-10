@@ -6,7 +6,7 @@
 // it lands on apprafter.dev.
 
 import { describe, expect, test } from 'bun:test';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { cueTokenize } from './src/lib/cue-highlight';
 
@@ -91,6 +91,21 @@ describe('hero section pieces', () => {
     expect(heroJson).not.toContain('public:  true');
     expect(heroJson).not.toContain('claim.pg.uri');
     expect(heroJson).not.toContain('network: \\"vpn\\"');
+  });
+
+  test('no fallback restates the licence as "open source"', () => {
+    // The correction above is not the hero's alone — the SEO fields, the
+    // value props, the footer and the terms page each state the posture
+    // too. They diverged once: the owner fixed the wording in Payload,
+    // the fallbacks kept the old string, and a fallback-built release
+    // overwrote the CMS-built image, so the site silently said
+    // "Open source" again. The fallbacks are the copy of record whenever
+    // the CMS is unreachable, so the claim is pinned across all of them.
+    const dir = join(ROOT, 'src/data/fallback');
+    const offenders = readdirSync(dir)
+      .filter((f) => f.endsWith('.json'))
+      .filter((f) => /open[- ]source/i.test(readFileSync(join(dir, f), 'utf8')));
+    expect(offenders).toEqual([]);
   });
 
   test('waitlist form POSTs to /api/waitlist-signups + renders interest checkboxes + handles preselect', () => {
