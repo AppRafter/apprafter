@@ -32,7 +32,9 @@ apprafter backup prune [--repo s3:…] \
 
 `--repo` defaults to `PlatformStack.spec.backup.bucket`; the keep-* flags
 override the configured `spec.backup.retention` (else the 7/4/6 defaults).
-Credentials resolve from `--credential-file` then the environment. On success
+Credentials resolve from `--credential-file`, then the environment, then the
+credential Secret the cluster already holds (`spec.backup.credentialRef`) — so
+against a configured cluster this command needs no credential flags at all. On success
 `prune` stamps `apprafter.io/last-prune` on `PlatformStack`, which
 `backup status` then shows. Run it on your own cadence (e.g. monthly) — restic
 dedup makes growth sub-linear, so retention is a rare, deliberate operation, not
@@ -56,7 +58,9 @@ in-cluster **`apprafter-backup-check` CronJob** runs weekly (default
 `0 6 * * 0`; [what that Job actually
 runs](../how-it-works/backup-retention-and-checks.md#what-the-weekly-check-runs)).
 By default it verifies structure only; `--read-data` re-downloads and re-hashes
-**every** pack for a deep verify (slower, bandwidth-heavy). Run the
+**every** pack for a deep verify (slower, bandwidth-heavy). Like `prune`, it
+reads repository and credentials from the cluster when you do not name them,
+so `apprafter backup check` on its own is a complete command. Run the
 operator-side `check` when your provider can't express the scoped-delete policy
 and you have [turned the in-cluster check off](#turning-the-in-cluster-check-off), or any
 time you want a manual verification with full credentials.

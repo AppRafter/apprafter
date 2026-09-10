@@ -191,7 +191,11 @@ pub const EXAMPLES: &[CommandExamples] = &[
     },
     CommandExamples {
         path: &["backup", "check"],
-        lines: &["apprafter backup check --credential-file <dotenv>"],
+        lines: &[
+            "apprafter backup check",
+            "apprafter backup check --read-data",
+            "apprafter backup check --repo <s3-url> --credential-file <dotenv>",
+        ],
     },
     CommandExamples {
         path: &["backup", "create"],
@@ -223,12 +227,22 @@ pub const EXAMPLES: &[CommandExamples] = &[
         path: &["backup", "list"],
         lines: &[
             "apprafter backup list",
+            "apprafter backup list --local",
             "apprafter backup list --repo <path>",
+        ],
+    },
+    CommandExamples {
+        path: &["backup", "run"],
+        lines: &[
+            "apprafter backup run",
+            "apprafter backup run --no-wait",
+            "apprafter backup run --timeout 120",
         ],
     },
     CommandExamples {
         path: &["backup", "prune"],
         lines: &[
+            "apprafter backup prune",
             "apprafter backup prune --credential-file <dotenv>",
             "apprafter backup prune --credential-file <dotenv> --keep-daily 14 --keep-weekly 8",
         ],

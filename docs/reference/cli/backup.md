@@ -21,8 +21,9 @@ Subcommands:
 - [`apprafter backup create`](#apprafter-backup-create) — Create a full encrypted backup of the cluster (default scope: whole cluster).
 - [`apprafter backup disable`](#apprafter-backup-disable) — Disable scheduled backup (sets spec.backup.enabled=false; keeps config)
 - [`apprafter backup enable`](#apprafter-backup-enable) — Enable scheduled off-site S3 backup by patching PlatformStack.spec.backup
-- [`apprafter backup list`](#apprafter-backup-list) — List snapshots stored in a backup repo
+- [`apprafter backup list`](#apprafter-backup-list) — List snapshots stored in a backup repo.
 - [`apprafter backup prune`](#apprafter-backup-prune) — Remove old snapshots from an S3-backed restic repository according to the configured retention policy.
+- [`apprafter backup run`](#apprafter-backup-run) — Run the cluster's scheduled backup NOW, without waiting for its next window.
 - [`apprafter backup status`](#apprafter-backup-status) — Show the current backup configuration, last Job outcomes, runner status, and last prune time (reads PlatformStack.spec.backup + Jobs + the apprafter-backup-status ConfigMap)
 - [`apprafter backup unlock`](#apprafter-backup-unlock) — Remove STALE locks from an S3-backed restic repository (`restic unlock`; live locks are never touched).
 
@@ -36,14 +37,16 @@ Usage: apprafter backup check [OPTIONS]
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--credential-file` | — | — | no | Path to a dotenv credential file (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`, optional `AWS_DEFAULT_REGION`). Falls back to the matching env vars |
+| `--credential-file` | — | — | no | Path to a dotenv credential file (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`, optional `AWS_DEFAULT_REGION`). Falls back to the matching env vars, then to the credential Secret the cluster already holds (`spec.backup.credentialRef`) — so on a configured cluster this flag is not needed at all |
 | `--read-data` | flag | — | no | Deep verify: download and re-hash every pack (`--read-data`) |
 | `--repo` | — | — | no | S3 restic repository URL. Defaults to `PlatformStack.spec.backup.bucket` |
 
 Examples:
 
 ```sh
-apprafter backup check --credential-file <dotenv>
+apprafter backup check
+apprafter backup check --read-data
+apprafter backup check --repo <s3-url> --credential-file <dotenv>
 ```
 
 ## `apprafter backup create`
@@ -114,6 +117,7 @@ Usage: apprafter backup enable [OPTIONS] --bucket <BUCKET>
 | `--keep-daily` | `<count>` | — | no | How many daily snapshots `restic forget` keeps. Default 7. Retention is only APPLIED when `--enforce cluster` is set or you run `apprafter backup prune`; under the default `--enforce operator` the scheduled Job never forgets |
 | `--keep-monthly` | `<count>` | — | no | How many monthly snapshots `restic forget` keeps. Default 6. Applied under the same rule as `--keep-daily` |
 | `--keep-weekly` | `<count>` | — | no | How many weekly snapshots `restic forget` keeps. Default 4. Applied under the same rule as `--keep-daily` |
+| `--no-initial-backup` | flag | — | no | Skip the first backup `enable` normally takes once the schedule is deployed. The schedule still runs at its configured time, and `apprafter backup run` takes one on demand |
 | `--prefix` | — | — | no | Optional path prefix inside the bucket (e.g. `backups/prod`). Only used together with a bare `--bucket` name and `--endpoint`; omit when passing a full restic URL in `--bucket` |
 | `--staging-mode` | — | — | no | `monolithic` (default) or `sequential` |
 | `--timezone` | `<zone>` | — | no | IANA timezone the schedules run in (`Europe/Berlin`, `UTC`), written to the CronJob's `spec.timeZone`. Defaults to this machine's zone; if that cannot be determined the command refuses rather than assume UTC |
@@ -129,7 +133,7 @@ apprafter backup enable --bucket <bucket> --endpoint <host> --credential <secret
 
 ## `apprafter backup list`
 
-List snapshots stored in a backup repo
+List snapshots stored in a backup repo. Defaults to the repository the cluster's schedule writes (`PlatformStack.spec.backup.bucket`) when off-site backup is enabled, else the local `<config>/backups/<target>`
 
 ```text
 Usage: apprafter backup list [OPTIONS]
@@ -139,13 +143,16 @@ Aliases: `ls` — accepted on the command line, not listed in `--help`.
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--passphrase` | — | — | no | Passphrase for the restic repo. Falls back to `RESTIC_PASSWORD`; prompts interactively on a TTY |
-| `--repo` | — | — | no | Path to the restic repository. Defaults to `<config>/backups/<target>` |
+| `--credential-file` | — | — | no | Path to a dotenv credential file for an `s3:` repository. Falls back to the matching env vars, then to the credential Secret the cluster holds (`spec.backup.credentialRef`) |
+| `--local` | flag | — | no | List the LOCAL repository (`<config>/backups/<target>`) that `backup create` writes, even when the cluster has a schedule |
+| `--passphrase` | — | — | no | Passphrase for the restic repo. Falls back to `RESTIC_PASSWORD`; prompts interactively on a TTY. Not used for the cluster's off-site repository, whose passphrase comes with its credentials |
+| `--repo` | — | — | no | Path to the restic repository, or an `s3:` URL. Overrides both the cluster's schedule and `--local` |
 
 Examples:
 
 ```sh
 apprafter backup list
+apprafter backup list --local
 apprafter backup list --repo <path>
 ```
 
@@ -159,7 +166,7 @@ Usage: apprafter backup prune [OPTIONS]
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--credential-file` | — | — | no | Path to a dotenv credential file containing `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD` (and optionally `AWS_DEFAULT_REGION`). Falls back to the matching environment variables |
+| `--credential-file` | — | — | no | Path to a dotenv credential file containing `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD` (and optionally `AWS_DEFAULT_REGION`). Falls back to the matching environment variables, then to the credential Secret the cluster already holds (`spec.backup.credentialRef`) |
 | `--keep-daily` | — | — | no | Keep-daily retention override (else spec.backup.retention, else 7) |
 | `--keep-monthly` | — | — | no | Keep-monthly retention override (else spec.backup.retention, else 6) |
 | `--keep-weekly` | — | — | no | Keep-weekly retention override (else spec.backup.retention, else 4) |
@@ -168,8 +175,30 @@ Usage: apprafter backup prune [OPTIONS]
 Examples:
 
 ```sh
+apprafter backup prune
 apprafter backup prune --credential-file <dotenv>
 apprafter backup prune --credential-file <dotenv> --keep-daily 14 --keep-weekly 8
+```
+
+## `apprafter backup run`
+
+Run the cluster's scheduled backup NOW, without waiting for its next window. Instantiates the platform's backup CronJob as a one-off Job, so it uses the cluster's own credentials — useful before an upgrade, and to prove a freshly enabled schedule works
+
+```text
+Usage: apprafter backup run [OPTIONS]
+```
+
+| Flag | Value | Default | Required | Description |
+| --- | --- | --- | --- | --- |
+| `--no-wait` | flag | — | no | Return as soon as the Job is created instead of waiting for it to finish. The Job runs either way |
+| `--timeout` | — | `60` | no | How long to wait for the Job before handing back control, in minutes. A timeout does not cancel the backup |
+
+Examples:
+
+```sh
+apprafter backup run
+apprafter backup run --no-wait
+apprafter backup run --timeout 120
 ```
 
 ## `apprafter backup status`
@@ -196,7 +225,7 @@ Usage: apprafter backup unlock [OPTIONS]
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--credential-file` | — | — | no | Path to a dotenv credential file (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`, optional `AWS_DEFAULT_REGION`). Falls back to the matching env vars |
+| `--credential-file` | — | — | no | Path to a dotenv credential file (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`, optional `AWS_DEFAULT_REGION`). Falls back to the matching env vars, then to the credential Secret the cluster already holds (`spec.backup.credentialRef`) — so on a configured cluster this flag is not needed at all |
 | `--repo` | — | — | no | S3 restic repository URL. Defaults to `PlatformStack.spec.backup.bucket` |
 
 Examples:

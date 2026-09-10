@@ -33,6 +33,13 @@ under the AppRafter config root; `--repo <path>` puts it elsewhere.
 the tag is `<cluster-id>-<created-at>`, so it identifies the source cluster and
 the moment, never a single namespace.
 
+**`backup list` follows the cluster.** Once off-site backup is enabled, a bare
+`backup list` shows what the *schedule* stored, because those are the cluster's
+backups; `--local` shows this machine's repository instead, and `--repo` names
+one directly. The heading above the table always says which repository you are
+looking at. With no cluster reachable — the disaster-recovery case — it falls
+back to the local repository rather than failing.
+
 ```text
 apprafter backup create [--repo <path>] [--passphrase <value>] \
                         [--namespace <ns> ...] [--select] \
@@ -217,6 +224,40 @@ One night a year, in a zone that observes summer time, an `--at` inside the
 skipped hour means that night's backup does not run and the next one does —
 choosing a time outside 01:00–03:00 avoids it in most European and North
 American zones.
+
+### The first backup runs immediately
+
+`enable` does not leave you waiting until 03:00 to find out whether any of this
+works. Once the platform chart has deployed the schedule, the CLI runs it once
+and reports the outcome, so the command that configures backup is also the
+command that proves it: the cluster's own credentials, the runner's RBAC, and
+egress from the cluster to your bucket are all exercised for real.
+
+Waiting for the chart takes a few minutes — Argo CD reconciles on its own
+cycle. If it has not landed in that window, `enable` says so and stops: backup
+is enabled either way, and `apprafter backup run` takes the first one whenever
+you like. `--no-initial-backup` skips this entirely.
+
+## Back up right now
+
+```sh
+apprafter backup run
+```
+
+Runs the cluster's scheduled backup immediately, without waiting for its
+window — before an upgrade, before a risky migration, or to see a snapshot
+appear after enabling. It instantiates the platform's backup CronJob as a
+one-off Job, so it is the *same* backup the schedule takes, with the same
+image and the same in-cluster credentials; nothing S3-related is needed on
+your machine.
+
+The command waits and reports the result. `--no-wait` returns as soon as the
+Job is created, and `--timeout <minutes>` bounds the wait — neither cancels
+anything, because the Job belongs to the cluster once it exists. Ctrl-C is
+equally safe.
+
+A suspended schedule (`backup disable`) does not block a manual run: taking one
+last backup after turning the schedule off is a normal thing to want.
 
 ## Check on it, and turn it off
 

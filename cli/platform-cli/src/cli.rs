@@ -1496,17 +1496,45 @@ pub enum BackupAction {
         #[arg(long)]
         staging_mode: Option<String>,
     },
-    /// List snapshots stored in a backup repo.
+    /// List snapshots stored in a backup repo. Defaults to the
+    /// repository the cluster's schedule writes
+    /// (`PlatformStack.spec.backup.bucket`) when off-site backup is
+    /// enabled, else the local `<config>/backups/<target>`.
     #[command(alias = "ls")]
     List {
-        /// Path to the restic repository. Defaults to
-        /// `<config>/backups/<target>`.
+        /// Path to the restic repository, or an `s3:` URL. Overrides
+        /// both the cluster's schedule and `--local`.
         #[arg(long)]
         repo: Option<String>,
         /// Passphrase for the restic repo. Falls back to
-        /// `RESTIC_PASSWORD`; prompts interactively on a TTY.
+        /// `RESTIC_PASSWORD`; prompts interactively on a TTY. Not used
+        /// for the cluster's off-site repository, whose passphrase
+        /// comes with its credentials.
         #[arg(long)]
         passphrase: Option<String>,
+        /// List the LOCAL repository (`<config>/backups/<target>`) that
+        /// `backup create` writes, even when the cluster has a schedule.
+        #[arg(long, default_value_t = false, conflicts_with = "repo")]
+        local: bool,
+        /// Path to a dotenv credential file for an `s3:` repository.
+        /// Falls back to the matching env vars, then to the credential
+        /// Secret the cluster holds (`spec.backup.credentialRef`).
+        #[arg(long)]
+        credential_file: Option<std::path::PathBuf>,
+    },
+    /// Run the cluster's scheduled backup NOW, without waiting for its
+    /// next window. Instantiates the platform's backup CronJob as a
+    /// one-off Job, so it uses the cluster's own credentials — useful
+    /// before an upgrade, and to prove a freshly enabled schedule works.
+    Run {
+        /// Return as soon as the Job is created instead of waiting for
+        /// it to finish. The Job runs either way.
+        #[arg(long, default_value_t = false)]
+        no_wait: bool,
+        /// How long to wait for the Job before handing back control, in
+        /// minutes. A timeout does not cancel the backup.
+        #[arg(long, default_value_t = crate::commands::backup::DEFAULT_BACKUP_JOB_TIMEOUT_MINUTES)]
+        timeout: u64,
     },
     /// Remove old snapshots from an S3-backed restic repository
     /// according to the configured retention policy. Run OUTSIDE the
@@ -1519,7 +1547,9 @@ pub enum BackupAction {
         /// Path to a dotenv credential file containing
         /// `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
         /// `RESTIC_PASSWORD` (and optionally `AWS_DEFAULT_REGION`).
-        /// Falls back to the matching environment variables.
+        /// Falls back to the matching environment variables, then to
+        /// the credential Secret the cluster already holds
+        /// (`spec.backup.credentialRef`).
         #[arg(long)]
         credential_file: Option<std::path::PathBuf>,
         /// Keep-daily retention override (else spec.backup.retention, else 7).
@@ -1541,7 +1571,10 @@ pub enum BackupAction {
         repo: Option<String>,
         /// Path to a dotenv credential file (`AWS_ACCESS_KEY_ID`,
         /// `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`, optional
-        /// `AWS_DEFAULT_REGION`). Falls back to the matching env vars.
+        /// `AWS_DEFAULT_REGION`). Falls back to the matching env vars,
+        /// then to the credential Secret the cluster already holds
+        /// (`spec.backup.credentialRef`) — so on a configured cluster
+        /// this flag is not needed at all.
         #[arg(long)]
         credential_file: Option<std::path::PathBuf>,
         /// Deep verify: download and re-hash every pack (`--read-data`).
@@ -1557,7 +1590,10 @@ pub enum BackupAction {
         repo: Option<String>,
         /// Path to a dotenv credential file (`AWS_ACCESS_KEY_ID`,
         /// `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`, optional
-        /// `AWS_DEFAULT_REGION`). Falls back to the matching env vars.
+        /// `AWS_DEFAULT_REGION`). Falls back to the matching env vars,
+        /// then to the credential Secret the cluster already holds
+        /// (`spec.backup.credentialRef`) — so on a configured cluster
+        /// this flag is not needed at all.
         #[arg(long)]
         credential_file: Option<std::path::PathBuf>,
     },
@@ -1653,6 +1689,12 @@ pub enum BackupAction {
         /// Confirm you have saved the restic passphrase + S3 credentials OUTSIDE the cluster.
         #[arg(long)]
         i_have_saved_credentials: bool,
+        /// Skip the first backup `enable` normally takes once the
+        /// schedule is deployed. The schedule still runs at its
+        /// configured time, and `apprafter backup run` takes one on
+        /// demand.
+        #[arg(long, default_value_t = false)]
+        no_initial_backup: bool,
     },
     /// Disable scheduled backup (sets spec.backup.enabled=false; keeps config).
     Disable,

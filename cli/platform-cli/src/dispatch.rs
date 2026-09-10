@@ -256,8 +256,19 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
                 passphrase.as_deref(),
                 staging_mode.as_deref(),
             )?,
-            BackupAction::List { repo, passphrase } => {
-                commands::backup::run_backup_list(repo.as_deref(), passphrase.as_deref())?
+            BackupAction::List {
+                repo,
+                passphrase,
+                local,
+                credential_file,
+            } => commands::backup::run_backup_list(
+                repo.as_deref(),
+                passphrase.as_deref(),
+                local,
+                credential_file.as_deref(),
+            )?,
+            BackupAction::Run { no_wait, timeout } => {
+                commands::backup::run_backup_trigger(!no_wait, timeout)?
             }
             BackupAction::Prune {
                 repo,
@@ -301,6 +312,7 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
                 check,
                 failure_webhook,
                 i_have_saved_credentials,
+                no_initial_backup,
             } => commands::backup::run_backup_enable(
                 commands::backup::EnableOpts {
                     bucket,
@@ -319,6 +331,7 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
                 prefix.as_deref(),
                 credential_file.as_deref(),
                 i_have_saved_credentials,
+                !no_initial_backup,
             )?,
             BackupAction::Disable => commands::backup::run_backup_disable()?,
             BackupAction::Status => commands::backup::run_backup_status()?,

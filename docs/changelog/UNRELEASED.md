@@ -9,6 +9,86 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.64 — backup stops asking for what the cluster already has (unreleased)
+
+Three findings from an operator configuring off-site backup for the first
+time, all of them the same shape: the CLI knew less about the cluster than
+the cluster did.
+
+### Added
+
+- **`apprafter backup run` — take the scheduled backup now.** Before an
+  upgrade, before a risky migration, or to see that a freshly enabled
+  schedule works. It instantiates the platform's backup CronJob as a
+  one-off Job, so it is the *same* backup the schedule takes: same image,
+  same service account, same in-cluster credentials, and nothing
+  S3-related needed on the operator's machine.
+
+  The Job is built from the CronJob's own `jobTemplate` rather than
+  assembled here — a hand-built equivalent would drift from the chart the
+  moment either side changed, and then the command meant to prove the
+  backup works would be proving something else. It carries
+  `cronjob.kubernetes.io/instantiate: manual` (as `kubectl create job
+  --from` does) plus an `apprafter.io/manual` label, so a manual run is
+  distinguishable from a 03:00 one during an incident. No
+  `ownerReferences`: deleting the schedule must not garbage-collect the
+  evidence that the last manual backup succeeded.
+
+  The command waits and reports the outcome, printing the tail of the pod
+  log when the Job fails. `--no-wait` and `--timeout <minutes>` bound the
+  waiting only — the Job belongs to the cluster once it exists, so
+  neither cancels it, and neither does Ctrl-C. A suspended schedule does
+  not block a manual run: one last backup after turning the schedule off
+  is a normal thing to want.
+
+- **`backup enable` takes the first backup itself.** A schedule that has
+  never run is indistinguishable from one that does not work — `backup
+  status` shows no Jobs, `backup list` shows no snapshots, and the
+  operator waits hours to learn which of the two they have. `enable` now
+  waits for the platform chart to deploy the schedule, runs it once, and
+  reports the result, which also exercises what a local preflight cannot:
+  the cluster's own credentials, the runner's RBAC, and egress from the
+  cluster to the bucket.
+
+  It waits for the CronJob that carries the **new** repo, not merely for
+  a CronJob to exist. Between the CR patch and Argo CD's next
+  reconciliation a CronJob is present but still renders the previous
+  `spec.backup`, and firing the first backup at it would send it to the
+  old bucket. A chart that has not synced inside the window is reported
+  as exactly that — backup is enabled either way — rather than as a
+  failure. `--no-initial-backup` opts out.
+
+### Changed
+
+- **The maintenance verbs read the credential the cluster is holding.**
+  `check`, `prune`, `unlock` and off-site `list` resolved credentials
+  from `--credential-file` or the environment and nothing else, so every
+  invocation asked the operator to hand back the credential `backup
+  enable` had already sealed into `apprafter-system` — and to keep a
+  copy of it outside for the purpose.
+
+  They now fall back to `spec.backup.credentialRef` → the Secret,
+  accepting either the canonical `S3_*` or restic's `AWS_*` spelling, and
+  naming the Secret when it turns out to be incomplete. Precedence is
+  unchanged where it existed: an explicit file wins, then a **complete**
+  environment set (a partial one must not beat the cluster's own
+  credential and then fail on the missing key), then the cluster.
+
+  `cluster_need` — the rule that decides whether a verb may run entirely
+  off the cluster — gained credentials as a third reason, so the
+  disaster-recovery path still works and its hint now names
+  `--credential-file` alongside `--repo`.
+
+- **`backup list` follows the cluster.** With off-site backup enabled, a
+  bare `backup list` listed the LOCAL repository and printed nothing,
+  which reads as "the backup I just configured did not work" rather than
+  "you are looking at a different repository". It now lists what the
+  schedule stores; `--local` lists this machine's repository, `--repo`
+  names one directly, and the table heading always says which. No
+  reachable cluster still falls back to local rather than failing — that
+  is the disaster-recovery case, and it is the one where listing a repo
+  matters most.
+
 ## cli v0.2.63 — a broken pipe was hiding kubectl's diagnosis, and a failed `backup enable` wedged the bucket for the next one (unreleased)
 
 Found by a CI flake and swept from there. Three sites wrote a payload

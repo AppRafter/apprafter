@@ -77,8 +77,8 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 
 use crate::commands::k8s_helpers::{
-    ensure_kubeconfig_tempfile, kubectl_get_json, kubectl_get_json_cluster_wide,
-    kubectl_merge_patch,
+    ensure_kubeconfig_tempfile, kubectl_apply_server_side, kubectl_get_json,
+    kubectl_get_json_cluster_wide, kubectl_merge_patch,
 };
 use crate::commands::state_paths::resolve_state_paths;
 
@@ -1593,26 +1593,484 @@ fn backup_summary_report(
     out
 }
 
+// ---------------------------------------------------------------------------
+// `apprafter backup run` — run the scheduled backup NOW
+//
+// The scheduled backup is a CronJob the platform chart deploys. Triggering it
+// means instantiating a Job from that CronJob's own `jobTemplate` — the same
+// image, service account, mounts and credentials the 03:00 run uses — which is
+// what makes a manual run evidence about the scheduled one. Building an
+// equivalent Job here instead would drift from the chart the moment either
+// side changed, and then the command that is supposed to prove the backup
+// works would be proving something else.
+// ---------------------------------------------------------------------------
+
+/// The CronJob the platform chart deploys for scheduled backup.
+pub(crate) const BACKUP_CRONJOB_NAME: &str = "apprafter-backup";
+
+/// Name for a manually triggered backup Job: the CronJob's name, `manual`,
+/// and a UTC stamp, which is what makes two runs in the same minute
+/// distinguishable and any run identifiable in `kubectl get jobs`.
+fn manual_job_name(stamp: &str) -> String {
+    format!("{BACKUP_CRONJOB_NAME}-manual-{stamp}")
+}
+
+/// Build a Job manifest from a CronJob's `spec.jobTemplate`.
+///
+/// Mirrors what `kubectl create job --from=cronjob/<name>` does, including
+/// the `cronjob.kubernetes.io/instantiate: manual` annotation, so a Job
+/// created here is indistinguishable from one created that way. The extra
+/// `apprafter.io/manual` label is ours: it tells an operator reading
+/// `kubectl get jobs -n apprafter-system` during an incident which runs were
+/// asked for and which were the schedule.
+///
+/// No `ownerReferences`: a manual Job outliving its CronJob is the point —
+/// deleting the schedule must not garbage-collect the evidence that the last
+/// manual backup succeeded.
+fn job_from_cronjob(cronjob: &Value, job_name: &str) -> Result<Value> {
+    let template = cronjob.pointer("/spec/jobTemplate").ok_or_else(|| {
+        CliError::Other(format!(
+            "CronJob '{BACKUP_CRONJOB_NAME}' has no spec.jobTemplate — the platform chart \
+             renders one, so this is either a hand-edited object or a chart version that \
+             predates scheduled backup. Re-sync the platform chart and try again."
+        ))
+    })?;
+    let namespace = cronjob
+        .pointer("/metadata/namespace")
+        .and_then(Value::as_str)
+        .unwrap_or(PLATFORMSTACK_NAMESPACE);
+
+    let mut labels = template
+        .pointer("/metadata/labels")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    labels.insert("apprafter.io/manual".to_string(), Value::from("true"));
+
+    let mut annotations = template
+        .pointer("/metadata/annotations")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    annotations.insert(
+        "cronjob.kubernetes.io/instantiate".to_string(),
+        Value::from("manual"),
+    );
+
+    Ok(serde_json::json!({
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": job_name,
+            "namespace": namespace,
+            "labels": Value::Object(labels),
+            "annotations": Value::Object(annotations),
+        },
+        "spec": template.pointer("/spec").cloned().unwrap_or(serde_json::json!({})),
+    }))
+}
+
+/// Where a Job is in its life, as its status reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JobOutcome {
+    /// Not finished — including "not started yet".
+    Running,
+    /// `Complete` condition is True.
+    Succeeded,
+    /// `Failed` condition is True; carries reason + message.
+    Failed(String),
+}
+
+/// Read a Job's outcome from its conditions.
+///
+/// Only `Complete` and `Failed` with `status: "True"` are terminal. Reading
+/// `.status.succeeded`/`.status.failed` counts instead would be wrong in both
+/// directions: a Job with a failed pod and retries left reports
+/// `failed: 1` while still on its way to success.
+fn job_run_outcome(job: &Value) -> JobOutcome {
+    let Some(conds) = job.pointer("/status/conditions").and_then(Value::as_array) else {
+        return JobOutcome::Running;
+    };
+    for c in conds {
+        if c.pointer("/status").and_then(Value::as_str) != Some("True") {
+            continue;
+        }
+        match c.pointer("/type").and_then(Value::as_str) {
+            Some("Complete") => return JobOutcome::Succeeded,
+            Some("Failed") => {
+                let reason = c
+                    .pointer("/reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Failed");
+                let message = c.pointer("/message").and_then(Value::as_str).unwrap_or("");
+                return JobOutcome::Failed(if message.is_empty() {
+                    reason.to_string()
+                } else {
+                    format!("{reason}: {message}")
+                });
+            }
+            _ => {}
+        }
+    }
+    JobOutcome::Running
+}
+
+/// How often the trigger asks the apiserver whether the Job has finished.
+const JOB_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The container env var the platform chart renders the repo URL into.
+/// Reading it back is how the CLI tells a CronJob that has caught up with a
+/// fresh `spec.backup` from one that is still the previous render.
+const BACKUP_REPO_ENV: &str = "APPRAFTER_BACKUP_REPO";
+
+/// The repo a deployed CronJob would write to, read out of its runner
+/// container's env. `None` when the CronJob does not carry the variable —
+/// which must never read as "matches", since acting on it would fire a
+/// backup at whatever the previous render pointed at.
+fn cronjob_repo(cronjob: &Value) -> Option<String> {
+    cronjob
+        .pointer("/spec/jobTemplate/spec/template/spec/containers")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|c| c.pointer("/env").and_then(Value::as_array))
+        .flatten()
+        .find(|e| e.pointer("/name").and_then(Value::as_str) == Some(BACKUP_REPO_ENV))
+        .and_then(|e| e.pointer("/value"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// `apprafter backup run` — instantiate the scheduled backup NOW.
+///
+/// Runs the platform's own CronJob template as a one-off Job, which is the
+/// answer to three separate needs: proving a freshly enabled schedule works
+/// without waiting for 03:00, taking a backup before something risky (an
+/// upgrade, a migration), and giving `backup list` something to show.
+///
+/// The Job runs IN the cluster with the cluster's credentials — the operator
+/// needs no S3 credentials locally, and a failure here is evidence about the
+/// scheduled run rather than about this machine.
+pub fn run_backup_trigger(wait: bool, timeout_minutes: u64) -> Result<()> {
+    preflight_tools(&[&KUBECTL], "apprafter backup run")?;
+    let kc = ensure_kubeconfig_tempfile()?;
+
+    let Some(cronjob) = kubectl_get_json(
+        "cronjob",
+        Some(BACKUP_CRONJOB_NAME),
+        Some(PLATFORMSTACK_NAMESPACE),
+        kc.path(),
+    )?
+    else {
+        return Err(CliError::Other(format!(
+            "no CronJob '{BACKUP_CRONJOB_NAME}' in {PLATFORMSTACK_NAMESPACE} — scheduled backup \
+             is what this command runs, and nothing has deployed it yet. Run `apprafter backup \
+             enable --bucket <name> --endpoint <host> --credential-file <dotenv>` first; if you \
+             just ran it, the platform chart has not synced yet — `apprafter backup status` \
+             shows when it has."
+        )));
+    };
+
+    if cronjob
+        .pointer("/spec/suspend")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        println!(
+            "  note: the schedule is suspended (`apprafter backup disable`) — running it once \
+             anyway, which is what you want before an upgrade."
+        );
+    }
+
+    instantiate_backup_job(&cronjob, wait, timeout_minutes, kc.path())
+}
+
+/// Create a one-off Job from `cronjob` and, unless told not to, wait for it.
+///
+/// Shared by `backup run` and by `backup enable`'s first backup, so both
+/// produce the same object and the same reporting — a first backup that
+/// differed from a manual one would make neither of them evidence about the
+/// other.
+fn instantiate_backup_job(
+    cronjob: &Value,
+    wait: bool,
+    timeout_minutes: u64,
+    kubeconfig: &Path,
+) -> Result<()> {
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let name = manual_job_name(&stamp);
+    let manifest = job_from_cronjob(cronjob, &name)?;
+    let yaml = serde_yaml::to_string(&manifest)
+        .map_err(|e| CliError::Other(format!("serialize Job manifest: {e}")))?;
+    kubectl_apply_server_side(&yaml, "apprafter-cli", kubeconfig)?;
+    println!("  → Job {name} created in {PLATFORMSTACK_NAMESPACE}");
+
+    if !wait {
+        println!(
+            "  not waiting (--no-wait). Follow it with:\n    \
+             kubectl -n {PLATFORMSTACK_NAMESPACE} logs -f job/{name}\n  \
+             or check the outcome later with `apprafter backup status`."
+        );
+        return Ok(());
+    }
+
+    wait_for_backup_job(&name, timeout_minutes, kubeconfig)
+}
+
+/// Default wall-clock ceiling for waiting on a backup Job, shared by
+/// `backup run --timeout` and the first backup `enable` takes.
+pub(crate) const DEFAULT_BACKUP_JOB_TIMEOUT_MINUTES: u64 = 60;
+
+/// How long `backup enable` waits for Argo CD to render the CronJob from the
+/// `spec.backup` it just patched, before giving up on the first backup.
+///
+/// Argo CD's default reconciliation is three minutes, so a shorter wait would
+/// report "not synced" on a perfectly healthy cluster most of the time.
+const CRONJOB_SYNC_WAIT_MINUTES: u64 = 5;
+
+/// Wait until the deployed CronJob writes to `repo` — i.e. until the platform
+/// chart has caught up with the `spec.backup` just written. `Ok(None)` on
+/// timeout: a chart that has not synced yet is a wait, not a failure, and the
+/// `enable` it follows has already succeeded.
+fn wait_for_synced_cronjob(
+    repo: &str,
+    timeout_minutes: u64,
+    kubeconfig: &Path,
+) -> Result<Option<Value>> {
+    let deadline = Duration::from_secs(timeout_minutes * 60);
+    let started = std::time::Instant::now();
+    let mut announced = false;
+    loop {
+        let cj = kubectl_get_json(
+            "cronjob",
+            Some(BACKUP_CRONJOB_NAME),
+            Some(PLATFORMSTACK_NAMESPACE),
+            kubeconfig,
+        )?;
+        if let Some(cj) = cj {
+            if cronjob_repo(&cj).as_deref() == Some(repo) {
+                return Ok(Some(cj));
+            }
+        }
+        if started.elapsed() >= deadline {
+            return Ok(None);
+        }
+        if !announced {
+            println!(
+                "  waiting for the platform chart to deploy the schedule (Argo CD reconciles \
+                 every few minutes)…"
+            );
+            announced = true;
+        }
+        thread::sleep(JOB_POLL_INTERVAL);
+    }
+}
+
+/// Poll a backup Job to its terminal state, reporting progress while it runs.
+///
+/// A timeout is NOT a failure of the backup: the Job keeps running in the
+/// cluster, and saying otherwise would send an operator to clean up after a
+/// backup that is still in progress. The message says so and hands over the
+/// two commands that follow it.
+fn wait_for_backup_job(name: &str, timeout_minutes: u64, kubeconfig: &Path) -> Result<()> {
+    let deadline = Duration::from_secs(timeout_minutes * 60);
+    let started = std::time::Instant::now();
+    let mut last_note = std::time::Instant::now();
+
+    println!(
+        "  waiting for it to finish (up to {timeout_minutes}m; Ctrl-C is safe — the Job \
+              keeps running)"
+    );
+    loop {
+        let job = kubectl_get_json("job", Some(name), Some(PLATFORMSTACK_NAMESPACE), kubeconfig)?;
+        match job.as_ref().map(job_run_outcome) {
+            Some(JobOutcome::Succeeded) => {
+                println!(
+                    "✓ Backup complete in {}.",
+                    format_elapsed(started.elapsed().as_secs())
+                );
+                println!("  `apprafter backup list` shows the new snapshot.");
+                return Ok(());
+            }
+            Some(JobOutcome::Failed(why)) => {
+                print_job_log_tail(name, kubeconfig);
+                return Err(CliError::Other(format!(
+                    "backup Job {name} failed after {}: {why}\n  \
+                     Full log: kubectl -n {PLATFORMSTACK_NAMESPACE} logs job/{name}",
+                    format_elapsed(started.elapsed().as_secs())
+                )));
+            }
+            // A Job that vanished mid-wait was deleted by someone else;
+            // reporting success or failure would both be guesses.
+            None => {
+                return Err(CliError::Other(format!(
+                    "backup Job {name} disappeared while waiting for it — someone or something \
+                     deleted it. `apprafter backup status` shows what the cluster has now."
+                )));
+            }
+            Some(JobOutcome::Running) => {}
+        }
+        if started.elapsed() >= deadline {
+            println!(
+                "  still running after {timeout_minutes}m — no longer waiting. The Job is NOT \
+                 cancelled:\n    kubectl -n {PLATFORMSTACK_NAMESPACE} logs -f job/{name}\n    \
+                 apprafter backup status"
+            );
+            return Ok(());
+        }
+        if last_note.elapsed() >= Duration::from_secs(30) {
+            println!(
+                "  … still running ({})",
+                format_elapsed(started.elapsed().as_secs())
+            );
+            last_note = std::time::Instant::now();
+        }
+        thread::sleep(JOB_POLL_INTERVAL);
+    }
+}
+
+/// `Xm Ys`, or `Ys` under a minute. Pure.
+fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m {}s", secs / 60, secs % 60)
+    }
+}
+
+/// Print the tail of a failed Job's log, best-effort.
+///
+/// Best-effort on purpose: the Job's failure is the finding, and a pod that
+/// was already garbage-collected must not turn a clear "the backup failed"
+/// into an error about fetching logs.
+fn print_job_log_tail(name: &str, kubeconfig: &Path) {
+    let out = Command::new("kubectl")
+        .args([
+            "logs",
+            &format!("job/{name}"),
+            "-n",
+            PLATFORMSTACK_NAMESPACE,
+            "--tail=30",
+        ])
+        .env("KUBECONFIG", kubeconfig)
+        .output();
+    if let Ok(out) = out {
+        let text = String::from_utf8_lossy(&out.stdout);
+        if !text.trim().is_empty() {
+            println!("  --- last 30 log lines ---");
+            for line in text.lines() {
+                println!("  | {line}");
+            }
+        }
+    }
+}
+
+/// Which repository `apprafter backup list` reads.
+///
+/// The default follows the cluster: once a schedule is writing snapshots
+/// off-site, those ARE the cluster's backups, and listing the local
+/// repository instead answers a question nobody asked — the one that made a
+/// freshly-enabled schedule look like it had not worked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ListRepo {
+    /// `--repo <url|path>`, verbatim.
+    Explicit(String),
+    /// The local repository `backup create` writes by default.
+    Local,
+    /// The off-site repository `spec.backup.bucket` names.
+    OffSite(String),
+}
+
+/// Decide which repository to list. Pure — the impure caller supplies
+/// `spec_backup` (`None` when there is no cluster to read it from, which is
+/// the disaster-recovery case and must stay usable).
+fn choose_list_repo(
+    repo_override: Option<&str>,
+    local: bool,
+    spec_backup: Option<&Value>,
+) -> ListRepo {
+    if let Some(r) = repo_override {
+        return ListRepo::Explicit(r.to_string());
+    }
+    if local {
+        return ListRepo::Local;
+    }
+    let enabled = spec_backup
+        .and_then(|s| s.pointer("/enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let bucket = spec_backup
+        .and_then(|s| s.pointer("/bucket"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    match (enabled, bucket) {
+        (true, Some(b)) => ListRepo::OffSite(b.to_string()),
+        _ => ListRepo::Local,
+    }
+}
+
 /// `apprafter backup list` — list the snapshots in a restic repo.
-pub fn run_backup_list(repo: Option<&str>, passphrase: Option<&str>) -> Result<()> {
+///
+/// With no flags it lists whatever the cluster's schedule writes; `--local`
+/// lists the repository `backup create` writes on this machine, and `--repo`
+/// names one directly. A cluster that cannot be reached is not an error —
+/// listing falls back to the local repository and says so, because verifying
+/// a repo when the cluster is gone is the case this command matters in.
+pub fn run_backup_list(
+    repo: Option<&str>,
+    passphrase: Option<&str>,
+    local: bool,
+    credential_file: Option<&Path>,
+) -> Result<()> {
     // D11 / 2.22a: the external binaries this command spawns, checked
     // BEFORE any prompt, kubeconfig or provider call. The reported bug
     // was a passphrase typed into a command that could not have worked.
     preflight_tools(&[&RESTIC], "apprafter backup list")?;
 
-    let resolved = resolve_state_paths(None)?;
-    let env_pass = std::env::var("RESTIC_PASSWORD").ok();
-    let is_tty = std::io::stdin().is_terminal();
-    let pass = backup_passphrase_or_error(passphrase, env_pass.as_deref(), is_tty)?;
+    // Best-effort: no cluster, no target, an unreachable apiserver — all
+    // mean "no schedule to follow", never a failure to list.
+    let kc = if repo.is_some() || local {
+        None
+    } else {
+        ensure_kubeconfig_tempfile().ok()
+    };
+    let spec_backup = match kc.as_ref() {
+        Some(kc) => spec_backup_from_cluster(Some(kc.path())).unwrap_or(None),
+        None => None,
+    };
 
-    let repo_path = backup_repo_path(repo, &resolved.target_name)?;
-    let repo_str = repo_path.to_string_lossy().to_string();
+    match choose_list_repo(repo, local, spec_backup.as_ref()) {
+        ListRepo::OffSite(repo_url) => {
+            let creds = resolve_verb_creds(
+                credential_file,
+                kc.as_ref().map(|f| f.path()),
+                spec_backup.as_ref(),
+            )?;
+            let pass = creds["RESTIC_PASSWORD"].clone();
+            let runner = CredentialedRestic { creds };
+            let json = runner.run_stdout(&restic_snapshots_argv(&repo_url), &pass)?;
+            let snapshots = parse_snapshots_json(&json)?;
+            print!("{}", format_snapshot_table(&repo_url, &snapshots));
+        }
+        chosen => {
+            let repo_str = match &chosen {
+                ListRepo::Explicit(r) => r.clone(),
+                _ => {
+                    let resolved = resolve_state_paths(None)?;
+                    backup_repo_path(None, &resolved.target_name)?
+                        .to_string_lossy()
+                        .to_string()
+                }
+            };
+            let env_pass = std::env::var("RESTIC_PASSWORD").ok();
+            let is_tty = std::io::stdin().is_terminal();
+            let pass = backup_passphrase_or_error(passphrase, env_pass.as_deref(), is_tty)?;
 
-    let r = SubprocessRestic;
-    let json = r.run_stdout(&restic_snapshots_argv(&repo_str), &pass)?;
-    let snapshots = parse_snapshots_json(&json)?;
-
-    print!("{}", format_snapshot_table(&repo_str, &snapshots));
+            let r = SubprocessRestic;
+            let json = r.run_stdout(&restic_snapshots_argv(&repo_str), &pass)?;
+            let snapshots = parse_snapshots_json(&json)?;
+            print!("{}", format_snapshot_table(&repo_str, &snapshots));
+        }
+    }
     Ok(())
 }
 
@@ -2082,9 +2540,86 @@ impl ClusterNeed {
     }
 }
 
+/// Where an operator verb's S3 credentials come from on this invocation.
+///
+/// Ordered by precedence: an explicit file, else a complete set in the
+/// environment, else the Secret the cluster is already holding — the one
+/// `backup enable` sealed. The cluster fallback is what lets `apprafter
+/// backup check` run with no flags at all on a configured cluster; before
+/// it, every maintenance verb asked the operator to hand back credentials
+/// the platform already had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredSource {
+    /// `--credential-file <dotenv>`.
+    File,
+    /// A complete canonical/alias set in the process environment.
+    Env,
+    /// `spec.backup.credentialRef` → a Secret in `apprafter-system`.
+    Cluster,
+}
+
+/// Pick the credential source from what is available locally. Pure.
+pub(crate) fn cred_source(has_file: bool, env_complete: bool) -> CredSource {
+    if has_file {
+        CredSource::File
+    } else if env_complete {
+        CredSource::Env
+    } else {
+        CredSource::Cluster
+    }
+}
+
+/// Is the process environment carrying a COMPLETE credential set?
+///
+/// Partial is not enough and must not count: a stray `RESTIC_PASSWORD`
+/// left over from an earlier command would otherwise beat the cluster's
+/// own Secret and fail on the missing key pair.
+fn env_creds_complete(env_lookup: &dyn Fn(&str) -> Option<String>) -> bool {
+    let raw: BTreeMap<String, String> = ALL_S3_ENV_KEYS
+        .iter()
+        .filter_map(|&k| env_lookup(k).map(|v| (k.to_string(), v)))
+        .collect();
+    validate_required_cred_keys(&normalize_s3_creds(raw)).is_ok()
+}
+
+/// The Secret holding the off-site credentials: `spec.backup.credentialRef.name`
+/// when the CR names one, else the name `backup enable` seals by default. Pure.
+fn credential_secret_name(spec_backup: Option<&Value>) -> String {
+    spec_backup
+        .and_then(|s| s.pointer("/credentialRef/name"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_BACKUP_CREDENTIAL_NAME)
+        .to_string()
+}
+
+/// Turn a credential Secret's decoded `.data` into the canonical `S3_*` map.
+///
+/// Accepts either spelling for the same reason the dotenv path does — the
+/// Secret may have been sealed by `backup enable` (canonical) or by hand
+/// (restic's own `AWS_*`). An incomplete Secret names ITSELF in the error:
+/// the operator has to know which object to go fix, and "missing
+/// RESTIC_PASSWORD" without a name reads like a flag they forgot.
+fn creds_from_secret_bytes(
+    data: BTreeMap<String, Vec<u8>>,
+    secret_name: &str,
+) -> Result<BTreeMap<String, String>> {
+    let canonical = normalize_s3_creds(secret_bytes_to_strings(data));
+    validate_required_cred_keys(&canonical).map_err(|e| {
+        CliError::Other(format!(
+            "credential Secret '{secret_name}' in {PLATFORMSTACK_NAMESPACE} is incomplete: {e}"
+        ))
+    })?;
+    Ok(canonical)
+}
+
 /// State the rule ONCE: which inputs of a maintenance verb cannot be resolved
 /// from the command line alone. Pure — table-tested without a cluster.
-pub(crate) fn cluster_need(repo_override: Option<&str>, retention: RetentionArgs) -> ClusterNeed {
+pub(crate) fn cluster_need(
+    repo_override: Option<&str>,
+    retention: RetentionArgs,
+    creds: CredSource,
+) -> ClusterNeed {
     let mut need = ClusterNeed::default();
     if repo_override.is_none() {
         need.reasons.push("the repository URL (spec.backup.bucket)");
@@ -2097,6 +2632,11 @@ pub(crate) fn cluster_need(repo_override: Option<&str>, retention: RetentionArgs
         need.flags
             .extend(missing.into_iter().map(|f| format!("{f} <n>")));
     }
+    if creds == CredSource::Cluster {
+        need.reasons
+            .push("the S3 credentials (spec.backup.credentialRef)");
+        need.flags.push("--credential-file <dotenv>".to_string());
+    }
     need
 }
 
@@ -2104,12 +2644,14 @@ pub(crate) fn cluster_need(repo_override: Option<&str>, retention: RetentionArgs
 /// cluster?
 ///
 /// `--repo` removes the repo lookup; for prune, explicit retention removes the
-/// other reason. Anything still unresolved must come from the PlatformStack CR.
+/// second reason; a local credential source removes the third. Anything still
+/// unresolved must come from the PlatformStack CR or the Secret it names.
 pub(crate) fn backup_verb_needs_cluster(
     repo_override: Option<&str>,
     retention: RetentionArgs,
+    creds: CredSource,
 ) -> bool {
-    cluster_need(repo_override, retention).is_needed()
+    cluster_need(repo_override, retention, creds).is_needed()
 }
 
 /// Acquire the kubeconfig ONLY on the paths that genuinely need it.
@@ -2123,16 +2665,62 @@ fn kubeconfig_if_cluster_needed(
     verb: &str,
     repo_override: Option<&str>,
     retention: RetentionArgs,
+    creds: CredSource,
 ) -> Result<Option<NamedTempFile>> {
-    if !backup_verb_needs_cluster(repo_override, retention) {
+    if !backup_verb_needs_cluster(repo_override, retention, creds) {
         return Ok(None);
     }
     match ensure_kubeconfig_tempfile() {
         Ok(kc) => Ok(Some(kc)),
         Err(e) => Err(CliError::Other(format!(
             "{e}\n{}",
-            cluster_need(repo_override, retention).hint(verb)
+            cluster_need(repo_override, retention, creds).hint(verb)
         ))),
+    }
+}
+
+/// Resolve an operator verb's S3 credentials from the first source that has
+/// them: `--credential-file`, else a complete env set, else the Secret the
+/// cluster holds.
+///
+/// The cluster read is what makes `apprafter backup check` work with no
+/// flags on a configured cluster. It is deliberately LAST: an operator who
+/// passed a file or exported the variables meant those, and a maintenance
+/// verb must never quietly prefer a different credential to the one they
+/// named.
+///
+/// `spec_backup` is passed in rather than fetched so the caller — which has
+/// already read the CR for the repo URL — does not read it twice.
+fn resolve_verb_creds(
+    credential_file: Option<&Path>,
+    kubeconfig: Option<&Path>,
+    spec_backup: Option<&Value>,
+) -> Result<BTreeMap<String, String>> {
+    let env_lookup = |k: &str| std::env::var(k).ok();
+    match cred_source(credential_file.is_some(), env_creds_complete(&env_lookup)) {
+        CredSource::File | CredSource::Env => {
+            resolve_operator_s3_creds(credential_file, &env_lookup)
+        }
+        CredSource::Cluster => {
+            let Some(kc) = kubeconfig else {
+                return Err(CliError::Other(format!(
+                    "no S3 credentials — none given locally and no cluster to read them from.\n\n\
+                     {CRED_KEYS_HELP}"
+                )));
+            };
+            let name = credential_secret_name(spec_backup);
+            let Some((raw, _)) = read_secret_data(&name, PLATFORMSTACK_NAMESPACE, kc)? else {
+                return Err(CliError::Other(format!(
+                    "credential Secret '{name}' not found in {PLATFORMSTACK_NAMESPACE} — the CR \
+                     names it but the object is not there. Re-seal it with `apprafter backup \
+                     enable --credential-file <dotenv>`, or pass --credential-file to this \
+                     command.\n\n{CRED_KEYS_HELP}"
+                )));
+            };
+            let creds = creds_from_secret_bytes(raw, &name)?;
+            println!("  using credentials from Secret '{name}' in {PLATFORMSTACK_NAMESPACE}");
+            Ok(creds)
+        }
     }
 }
 
@@ -2159,28 +2747,25 @@ fn repo_from_spec_backup(
         })
 }
 
-/// Resolve the target restic repo for an operator maintenance verb.
+/// Read `PlatformStack/default.spec.backup` once, or `None` when there is no
+/// cluster to read it from.
 ///
-/// * `Some(repo)` — use the explicit `--repo` override verbatim; the cluster is
-///   never touched (`kubeconfig` may be `None`).
-/// * `None` — read `PlatformStack/default.spec.backup.bucket`; error when
-///   backup is unconfigured (no `spec.backup.bucket`) or there was no cluster
-///   to read, directing the operator to pass `--repo` or run
-///   `apprafter backup enable`.
-fn resolve_backup_repo(repo_override: Option<&str>, kubeconfig: Option<&Path>) -> Result<String> {
-    if repo_override.is_some() {
-        return repo_from_spec_backup(repo_override, None);
-    }
-    let ps = match kubeconfig {
-        Some(kc) => kubectl_get_json(
-            "platformstack",
-            Some(PLATFORMSTACK_NAME),
-            Some(PLATFORMSTACK_NAMESPACE),
-            kc,
-        )?,
-        None => None,
+/// Every maintenance verb needs the same block for up to three different
+/// inputs — the repo URL, the retention policy, and the name of the credential
+/// Secret — and fetching it once is what keeps a verb to a single CR read.
+/// Returned owned rather than borrowed so callers can hold it across the
+/// credential resolution that follows.
+fn spec_backup_from_cluster(kubeconfig: Option<&Path>) -> Result<Option<Value>> {
+    let Some(kc) = kubeconfig else {
+        return Ok(None);
     };
-    repo_from_spec_backup(None, ps.as_ref().and_then(|p| p.pointer("/spec/backup")))
+    let ps = kubectl_get_json(
+        "platformstack",
+        Some(PLATFORMSTACK_NAME),
+        Some(PLATFORMSTACK_NAMESPACE),
+        kc,
+    )?;
+    Ok(ps.and_then(|p| p.pointer("/spec/backup").cloned()))
 }
 
 /// Compute the retention policy for a prune from the CR's `spec.backup` plus CLI
@@ -2252,23 +2837,21 @@ pub fn run_backup_prune(
         keep_weekly,
         keep_monthly,
     };
-    let kc = kubeconfig_if_cluster_needed("prune", repo_override, retention)?;
-    let creds = resolve_operator_s3_creds(credential_file, &|k| std::env::var(k).ok())?;
-    let pass = creds["RESTIC_PASSWORD"].clone();
+    let source = cred_source(
+        credential_file.is_some(),
+        env_creds_complete(&|k| std::env::var(k).ok()),
+    );
+    let kc = kubeconfig_if_cluster_needed("prune", repo_override, retention, source)?;
+    let kc_path = kc.as_ref().map(|f| f.path());
 
     // Fetch the CR once (when we have a cluster at all): repo fallback
-    // (spec.backup.bucket) + retention defaults (spec.backup.retention) both
-    // read from it.
-    let ps = match &kc {
-        Some(kc) => kubectl_get_json(
-            "platformstack",
-            Some(PLATFORMSTACK_NAME),
-            Some(PLATFORMSTACK_NAMESPACE),
-            kc.path(),
-        )?,
-        None => None,
-    };
-    let spec_backup = ps.as_ref().and_then(|p| p.pointer("/spec/backup"));
+    // (spec.backup.bucket), retention defaults (spec.backup.retention) and the
+    // credential Secret's name (spec.backup.credentialRef) all read from it.
+    let spec_backup = spec_backup_from_cluster(kc_path)?;
+    let spec_backup = spec_backup.as_ref();
+
+    let creds = resolve_verb_creds(credential_file, kc_path, spec_backup)?;
+    let pass = creds["RESTIC_PASSWORD"].clone();
 
     let repo = repo_from_spec_backup(repo_override, spec_backup)?;
     let policy = retention_from_spec_backup(spec_backup, keep_daily, keep_weekly, keep_monthly);
@@ -2347,10 +2930,17 @@ pub fn run_backup_check(
     // was a passphrase typed into a command that could not have worked.
     preflight_tools(&[&RESTIC], "apprafter backup check")?;
 
-    let kc = kubeconfig_if_cluster_needed("check", repo_override, RetentionArgs::NotApplicable)?;
-    let creds = resolve_operator_s3_creds(credential_file, &|k| std::env::var(k).ok())?;
+    let source = cred_source(
+        credential_file.is_some(),
+        env_creds_complete(&|k| std::env::var(k).ok()),
+    );
+    let kc =
+        kubeconfig_if_cluster_needed("check", repo_override, RetentionArgs::NotApplicable, source)?;
+    let kc_path = kc.as_ref().map(|f| f.path());
+    let spec_backup = spec_backup_from_cluster(kc_path)?;
+    let creds = resolve_verb_creds(credential_file, kc_path, spec_backup.as_ref())?;
     let pass = creds["RESTIC_PASSWORD"].clone();
-    let repo = resolve_backup_repo(repo_override, kc.as_ref().map(|f| f.path()))?;
+    let repo = repo_from_spec_backup(repo_override, spec_backup.as_ref())?;
 
     let runner = CredentialedRestic { creds };
     runner.run(&restic_check_argv(&repo, read_data), &pass)?;
@@ -2378,10 +2968,21 @@ pub fn run_backup_unlock(
     // was a passphrase typed into a command that could not have worked.
     preflight_tools(&[&RESTIC], "apprafter backup unlock")?;
 
-    let kc = kubeconfig_if_cluster_needed("unlock", repo_override, RetentionArgs::NotApplicable)?;
-    let creds = resolve_operator_s3_creds(credential_file, &|k| std::env::var(k).ok())?;
+    let source = cred_source(
+        credential_file.is_some(),
+        env_creds_complete(&|k| std::env::var(k).ok()),
+    );
+    let kc = kubeconfig_if_cluster_needed(
+        "unlock",
+        repo_override,
+        RetentionArgs::NotApplicable,
+        source,
+    )?;
+    let kc_path = kc.as_ref().map(|f| f.path());
+    let spec_backup = spec_backup_from_cluster(kc_path)?;
+    let creds = resolve_verb_creds(credential_file, kc_path, spec_backup.as_ref())?;
     let pass = creds["RESTIC_PASSWORD"].clone();
-    let repo = resolve_backup_repo(repo_override, kc.as_ref().map(|f| f.path()))?;
+    let repo = repo_from_spec_backup(repo_override, spec_backup.as_ref())?;
 
     let runner = CredentialedRestic { creds };
     runner.run(&restic_unlock_argv(&repo), &pass)?;
@@ -2474,6 +3075,7 @@ pub fn run_backup_enable(
     prefix: Option<&str>,
     credential_file: Option<&Path>,
     i_have_saved: bool,
+    initial_backup: bool,
 ) -> Result<()> {
     // 0. Build the canonical restic repo URL from bucket + optional endpoint/prefix.
     opts.bucket = construct_repo_url(&opts.bucket, endpoint, prefix)?;
@@ -2630,6 +3232,44 @@ pub fn run_backup_enable(
         "{}",
         enable_success_report(&opts.bucket, &opts.credential, &resolved)
     );
+
+    // 9. Run the first backup, unless told not to.
+    //
+    //    A schedule that has never run is indistinguishable from one that
+    //    does not work: `backup status` shows no Jobs, `backup list` shows
+    //    no snapshots, and the operator has hours to wait before learning
+    //    which of the two they have. Running it once here closes that gap
+    //    and exercises the parts a local preflight cannot — the cluster's
+    //    own credentials, the runner's RBAC, and egress from the cluster to
+    //    the bucket.
+    if !initial_backup {
+        println!(
+            "  first backup skipped (--no-initial-backup) — it runs at the scheduled time, or \
+             now with `apprafter backup run`."
+        );
+        return Ok(());
+    }
+    match wait_for_synced_cronjob(&opts.bucket, CRONJOB_SYNC_WAIT_MINUTES, kc.path())? {
+        Some(cronjob) => {
+            println!("  → running the first backup now");
+            instantiate_backup_job(
+                &cronjob,
+                true,
+                DEFAULT_BACKUP_JOB_TIMEOUT_MINUTES,
+                kc.path(),
+            )?;
+        }
+        None => {
+            // The `enable` itself succeeded. A chart that has not synced
+            // within the window is a slow cluster or a paused Argo CD, and
+            // failing here would report a configured backup as broken.
+            println!(
+                "  the platform chart has not deployed the new schedule yet, so no first backup \
+                 was run. Backup IS enabled; `apprafter backup status` shows when the schedule \
+                 lands, and `apprafter backup run` takes the first one then."
+            );
+        }
+    }
     Ok(())
 }
 
@@ -4342,8 +4982,10 @@ mod tests {
             ),
         ];
         for (repo, expect, why) in table {
+            // Credentials pinned to a local source throughout, so this
+            // table stays about the repo and nothing else.
             assert_eq!(
-                backup_verb_needs_cluster(repo, RetentionArgs::NotApplicable),
+                backup_verb_needs_cluster(repo, RetentionArgs::NotApplicable, CredSource::File),
                 expect,
                 "{why}"
             );
@@ -4394,7 +5036,11 @@ mod tests {
             (None, prune_keeps(None, None, None), true, "nothing given"),
         ];
         for (r, keeps, expect, why) in table {
-            assert_eq!(backup_verb_needs_cluster(r, keeps), expect, "{why}");
+            assert_eq!(
+                backup_verb_needs_cluster(r, keeps, CredSource::File),
+                expect,
+                "{why}"
+            );
         }
     }
 
@@ -4406,17 +5052,310 @@ mod tests {
         let repo = Some("s3:https://h/b");
         assert!(!backup_verb_needs_cluster(
             repo,
-            RetentionArgs::NotApplicable
+            RetentionArgs::NotApplicable,
+            CredSource::File
         ));
         assert!(backup_verb_needs_cluster(
             repo,
-            prune_keeps(Some(7), Some(4), None)
+            prune_keeps(Some(7), Some(4), None),
+            CredSource::File
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // `backup run` — trigger the scheduled backup now
+    // ------------------------------------------------------------------
+
+    /// A CronJob shaped like the platform chart's, trimmed to what the
+    /// trigger reads.
+    fn backup_cronjob() -> Value {
+        json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {"name": "apprafter-backup", "namespace": "apprafter-system"},
+            "spec": {
+                "schedule": "0 3 * * *",
+                "jobTemplate": {
+                    "metadata": {"labels": {"app.kubernetes.io/name": "apprafter-backup"}},
+                    "spec": {
+                        "backoffLimit": 1,
+                        "template": {"spec": {"restartPolicy": "Never", "containers": [
+                            {"name": "backup", "image": "ghcr.io/x/apprafter-backup:1"}
+                        ]}}
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn a_manual_run_reuses_the_schedules_own_job_template() {
+        // The whole point of triggering through the CronJob rather than
+        // building a Job from scratch: image, service account, mounts,
+        // env and resources are whatever the chart deployed. A hand-built
+        // Job would drift from the schedule the moment either changed,
+        // and the manual run would stop proving anything about the real
+        // one.
+        let job = job_from_cronjob(&backup_cronjob(), "apprafter-backup-manual-20260910-215301")
+            .expect("template present");
+        assert_eq!(job["kind"], "Job");
+        assert_eq!(job["apiVersion"], "batch/v1");
+        assert_eq!(
+            job["metadata"]["name"],
+            "apprafter-backup-manual-20260910-215301"
+        );
+        assert_eq!(job["metadata"]["namespace"], "apprafter-system");
+        assert_eq!(
+            job["spec"]["template"]["spec"]["containers"][0]["image"],
+            "ghcr.io/x/apprafter-backup:1"
+        );
+        assert_eq!(job["spec"]["backoffLimit"], 1);
+    }
+
+    #[test]
+    fn a_manual_run_is_labelled_as_one() {
+        let job = job_from_cronjob(&backup_cronjob(), "apprafter-backup-manual-x").unwrap();
+        // The template's own labels survive — `backup status` finds Jobs
+        // by them.
+        assert_eq!(
+            job["metadata"]["labels"]["app.kubernetes.io/name"],
+            "apprafter-backup"
+        );
+        // …and the run is marked, so a manual backup is distinguishable
+        // from a 03:00 one in `kubectl get jobs` and in an incident.
+        assert_eq!(job["metadata"]["labels"]["apprafter.io/manual"], "true");
+        assert_eq!(
+            job["metadata"]["annotations"]["cronjob.kubernetes.io/instantiate"],
+            "manual"
+        );
+    }
+
+    #[test]
+    fn a_cronjob_without_a_template_is_named_in_the_error() {
+        let broken = json!({"metadata": {"name": "apprafter-backup"}, "spec": {}});
+        let err = job_from_cronjob(&broken, "x").unwrap_err().to_string();
+        assert!(err.contains("jobTemplate"), "names what is missing: {err}");
+    }
+
+    #[test]
+    fn the_deployed_cronjob_says_which_repo_it_would_write_to() {
+        // `enable` patches the CR; Argo CD renders the CronJob from it
+        // some minutes later. Between those two moments a CronJob EXISTS
+        // but still carries the previous repo — so "the CronJob is there"
+        // is not the question. This is: does the deployed one already
+        // write where the CR now says?
+        let cj = json!({"spec": {"jobTemplate": {"spec": {"template": {"spec": {
+            "containers": [{"name": "runner", "env": [
+                {"name": "RESTIC_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "s"}}},
+                {"name": "APPRAFTER_BACKUP_REPO", "value": "s3:https://h/b/prod"}
+            ]}]
+        }}}}}});
+        assert_eq!(cronjob_repo(&cj).as_deref(), Some("s3:https://h/b/prod"));
+    }
+
+    #[test]
+    fn a_cronjob_with_no_repo_env_reads_as_unknown_not_as_a_match() {
+        // `None` must not compare equal to the repo we are waiting for,
+        // or `enable` would fire the first backup at whatever the old
+        // CronJob pointed at — the exact mistake this check exists to
+        // prevent.
+        let empty = json!({"spec": {"jobTemplate": {"spec": {"template": {"spec": {
+            "containers": [{"name": "runner"}]
+        }}}}}});
+        assert_eq!(cronjob_repo(&empty), None);
+        assert_eq!(cronjob_repo(&json!({})), None);
+    }
+
+    #[test]
+    fn a_finished_job_is_read_from_its_conditions() {
+        let done = json!({"status": {"succeeded": 1, "conditions": [
+            {"type": "Complete", "status": "True"}
+        ]}});
+        assert_eq!(job_run_outcome(&done), JobOutcome::Succeeded);
+
+        let failed = json!({"status": {"failed": 1, "conditions": [
+            {"type": "Failed", "status": "True", "reason": "BackoffLimitExceeded",
+             "message": "Job has reached the specified backoff limit"}
+        ]}});
+        match job_run_outcome(&failed) {
+            JobOutcome::Failed(why) => {
+                assert!(why.contains("BackoffLimitExceeded"), "{why}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_job_that_has_not_finished_is_still_running() {
+        // A condition list that carries something OTHER than the two
+        // terminal types must not be read as an outcome — `Suspended`
+        // and `FailureTarget` both appear on healthy Jobs, and a false
+        // "succeeded" here would report a backup that never ran.
+        for status in [
+            json!({"status": {"active": 1}}),
+            json!({"status": {}}),
+            json!({}),
+            json!({"status": {"conditions": [{"type": "Suspended", "status": "True"}]}}),
+            json!({"status": {"conditions": [{"type": "Complete", "status": "False"}]}}),
+        ] {
+            assert_eq!(job_run_outcome(&status), JobOutcome::Running, "{status}");
+        }
+    }
+
+    #[test]
+    fn the_manual_job_name_is_a_legal_object_name() {
+        let name = manual_job_name("20260910-215301");
+        assert!(name.len() <= 63, "{name}");
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "{name}"
+        );
+        assert!(name.starts_with("apprafter-backup-"), "{name}");
+    }
+
+    #[test]
+    fn list_follows_the_schedule_when_one_is_configured() {
+        // The complaint this answers: after `backup enable` succeeded,
+        // `backup list` still read the LOCAL repository and printed
+        // nothing, which reads as "the backup I just configured did not
+        // work" rather than "you are looking at a different repository".
+        let on = json!({"enabled": true, "bucket": "s3:https://h/b/prod"});
+        assert_eq!(
+            choose_list_repo(None, false, Some(&on)),
+            ListRepo::OffSite("s3:https://h/b/prod".to_string())
+        );
+    }
+
+    #[test]
+    fn list_stays_local_when_no_schedule_claims_the_cluster() {
+        // Disabled, never configured, and no cluster at all: three ways
+        // of having no off-site repository, one answer.
+        for spec in [
+            Some(json!({"enabled": false, "bucket": "s3:https://h/b"})),
+            Some(json!({})),
+            None,
+        ] {
+            assert_eq!(
+                choose_list_repo(None, false, spec.as_ref()),
+                ListRepo::Local,
+                "{spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_repo_and_local_both_outrank_the_schedule() {
+        let on = json!({"enabled": true, "bucket": "s3:https://h/b/prod"});
+        assert_eq!(
+            choose_list_repo(Some("s3:elsewhere"), false, Some(&on)),
+            ListRepo::Explicit("s3:elsewhere".to_string())
+        );
+        assert_eq!(choose_list_repo(None, true, Some(&on)), ListRepo::Local);
+    }
+
+    #[test]
+    fn credentials_the_cluster_already_holds_are_a_reason_to_reach_it() {
+        // The credential Secret was sealed into the cluster by `backup
+        // enable`. Asking the operator to hand the same credentials back
+        // on every `check` is asking them to keep a copy of a secret the
+        // platform is already holding — so an invocation with no local
+        // credential source has a third reason to read the CR.
+        let repo = Some("s3:https://h/b");
+        assert!(backup_verb_needs_cluster(
+            repo,
+            RetentionArgs::NotApplicable,
+            CredSource::Cluster
+        ));
+        // …and none when the operator DID supply them locally.
+        assert!(!backup_verb_needs_cluster(
+            repo,
+            RetentionArgs::NotApplicable,
+            CredSource::File
+        ));
+        assert!(!backup_verb_needs_cluster(
+            repo,
+            RetentionArgs::NotApplicable,
+            CredSource::Env
         ));
     }
 
     #[test]
+    fn the_offline_hint_asks_for_the_credential_file_too() {
+        // The DR case this hint exists for — cluster gone, verify the
+        // repo before restoring — now needs credentials as well as a
+        // repo, and a hint that lists only `--repo` would leave the
+        // operator one flag short of running offline.
+        let h = cluster_need(None, RetentionArgs::NotApplicable, CredSource::Cluster).hint("check");
+        assert!(h.contains("--repo"), "{h}");
+        assert!(h.contains("--credential-file"), "names the creds flag: {h}");
+    }
+
+    #[test]
+    fn a_local_credential_source_beats_the_cluster_one() {
+        // Precedence, stated once: an explicit file wins over the
+        // environment, and both win over the cluster. The cluster is the
+        // fallback that makes the common case need no flags at all.
+        assert_eq!(cred_source(true, true), CredSource::File);
+        assert_eq!(cred_source(true, false), CredSource::File);
+        assert_eq!(cred_source(false, true), CredSource::Env);
+        assert_eq!(cred_source(false, false), CredSource::Cluster);
+    }
+
+    #[test]
+    fn the_credential_secret_is_the_one_the_cr_names() {
+        let spec = serde_json::json!({"credentialRef": {"name": "my-own-s3"}});
+        assert_eq!(credential_secret_name(Some(&spec)), "my-own-s3");
+        // No CR, or a CR without the ref: the platform default, which is
+        // what `backup enable` seals when `--credential` is omitted.
+        assert_eq!(credential_secret_name(None), DEFAULT_BACKUP_CREDENTIAL_NAME);
+        let bare = serde_json::json!({"enabled": true});
+        assert_eq!(
+            credential_secret_name(Some(&bare)),
+            DEFAULT_BACKUP_CREDENTIAL_NAME
+        );
+    }
+
+    #[test]
+    fn secret_held_credentials_are_normalised_like_a_dotenv() {
+        // The Secret may hold either spelling — `enable --credential-file`
+        // seals the canonical S3_* names, but an operator who sealed it by
+        // hand may well have used restic's own AWS_* ones.
+        let data: BTreeMap<String, Vec<u8>> = [
+            ("AWS_ACCESS_KEY_ID", "AK"),
+            ("AWS_SECRET_ACCESS_KEY", "SK"),
+            ("RESTIC_PASSWORD", "pw"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
+        .collect();
+        let creds = creds_from_secret_bytes(data, "apprafter-backup-s3").unwrap();
+        assert_eq!(creds["S3_ACCESS_KEY_ID"], "AK");
+        assert_eq!(creds["S3_SECRET_ACCESS_KEY"], "SK");
+        assert_eq!(creds["RESTIC_PASSWORD"], "pw");
+    }
+
+    #[test]
+    fn a_secret_missing_the_passphrase_names_the_secret_and_the_key() {
+        // Half a credential is the confusing case: restic would fail on
+        // the passphrase prompt much later, pointing at nothing.
+        let data: BTreeMap<String, Vec<u8>> = [("S3_ACCESS_KEY_ID", "AK")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
+            .collect();
+        let err = creds_from_secret_bytes(data, "apprafter-backup-s3")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("apprafter-backup-s3"),
+            "names the Secret: {err}"
+        );
+        assert!(err.contains("RESTIC_PASSWORD"), "names the key: {err}");
+    }
+
+    #[test]
     fn offline_hint_for_check_points_at_repo_only() {
-        let h = cluster_need(None, RetentionArgs::NotApplicable).hint("check");
+        let h = cluster_need(None, RetentionArgs::NotApplicable, CredSource::File).hint("check");
         assert!(h.contains("backup check"), "names the verb: {h}");
         assert!(h.contains("--repo"), "names --repo: {h}");
         assert!(
@@ -4429,8 +5368,12 @@ mod tests {
     fn offline_hint_for_prune_names_only_the_missing_keep_flags() {
         // --repo and --keep-daily supplied; the hint must ask for exactly the
         // two that are missing and NOT re-ask for what was already given.
-        let h =
-            cluster_need(Some("s3:https://h/b"), prune_keeps(Some(7), None, Some(6))).hint("prune");
+        let h = cluster_need(
+            Some("s3:https://h/b"),
+            prune_keeps(Some(7), None, Some(6)),
+            CredSource::File,
+        )
+        .hint("prune");
         assert!(h.contains("--keep-weekly"), "names the missing flag: {h}");
         assert!(
             !h.contains("--keep-daily"),
@@ -4448,7 +5391,7 @@ mod tests {
 
     #[test]
     fn offline_hint_mentions_disaster_recovery_when_repo_missing() {
-        let h = cluster_need(None, prune_keeps(None, None, None)).hint("prune");
+        let h = cluster_need(None, prune_keeps(None, None, None), CredSource::File).hint("prune");
         assert!(h.contains("--repo"), "{h}");
         assert!(h.contains("--keep-daily"), "{h}");
         assert!(h.contains("--keep-weekly"), "{h}");
@@ -4461,16 +5404,21 @@ mod tests {
     }
 
     #[test]
-    fn resolve_backup_repo_with_override_needs_no_kubeconfig() {
-        // Passing `None` for the kubeconfig proves the override path never
-        // reaches for the cluster (a kubectl shell-out here would fail).
-        let repo = resolve_backup_repo(Some("s3:https://h/b"), None).expect("override honoured");
-        assert_eq!(repo, "s3:https://h/b");
+    fn spec_backup_is_not_read_when_there_is_no_cluster() {
+        // Passing `None` for the kubeconfig proves the offline path never
+        // reaches for the cluster (a kubectl shell-out here would fail),
+        // and that the caller can still honour an explicit --repo on top.
+        let spec = spec_backup_from_cluster(None).expect("no cluster is not an error");
+        assert!(spec.is_none());
+        assert_eq!(
+            repo_from_spec_backup(Some("s3:https://h/b"), spec.as_ref()).unwrap(),
+            "s3:https://h/b"
+        );
     }
 
     #[test]
-    fn resolve_backup_repo_without_override_or_cluster_is_an_error() {
-        let err = resolve_backup_repo(None, None).expect_err("no repo, no cluster → error");
+    fn no_repo_and_no_cluster_points_the_reader_at_the_flag() {
+        let err = repo_from_spec_backup(None, None).expect_err("no repo, no cluster → error");
         let msg = format!("{err}");
         assert!(msg.contains("--repo"), "must point at --repo: {msg}");
     }
@@ -5326,19 +6274,32 @@ mod tests {
         // kubeconfig here is what made `backup check` unusable after
         // `apprafter destroy` (v0.2.48). `Ok(None)` is the proof it did not
         // even try — resolving one would fail in this test environment.
-        assert!(
-            kubeconfig_if_cluster_needed("check", Some("s3:x"), RetentionArgs::NotApplicable)
-                .unwrap()
-                .is_none()
-        );
+        assert!(kubeconfig_if_cluster_needed(
+            "check",
+            Some("s3:x"),
+            RetentionArgs::NotApplicable,
+            CredSource::File
+        )
+        .unwrap()
+        .is_none());
         assert!(kubeconfig_if_cluster_needed(
             "prune",
             Some("s3:x"),
-            prune_keeps(Some(7), Some(4), Some(6))
+            prune_keeps(Some(7), Some(4), Some(6)),
+            CredSource::File
         )
         .unwrap()
         .is_none());
     }
+
+    // The mirror case — a verb with NO local credentials must not take
+    // the offline shortcut — is asserted on `backup_verb_needs_cluster`
+    // and `cluster_need` above, not here. Asserting it through
+    // `kubeconfig_if_cluster_needed` would depend on whether the machine
+    // running the tests happens to have a target configured: on a
+    // developer's laptop the kubeconfig resolves and the call succeeds,
+    // on CI it does not. A guard that reads the environment instead of
+    // the code is worse than no guard.
 
     // ------------------------------------------------------------------
     // restic invocation: creds on the child, failure text, snapshot id
