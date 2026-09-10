@@ -1421,6 +1421,9 @@ fn export_manifest(
         created_at: now_rfc3339(),
         platform_version: platform_version.to_string(),
         namespaces: namespaces.to_vec(),
+        // An export captures native data only — no secrets, so no
+        // secret namespaces to record.
+        secret_namespaces: Vec::new(),
         resources: resource_refs(&[], claims),
     }
 }
@@ -2396,6 +2399,20 @@ where
         .unwrap_or_default();
     if !namespaces.is_empty() {
         out.push_str(&format!("  namespaces:     {}\n", namespaces.join(", ")));
+    }
+    // Secrets follow the SealedSecrets, so they can come from namespaces
+    // that hold no Application. Printed only when it differs — a second
+    // line repeating the first teaches the reader to skip both.
+    let secret_namespaces: Vec<&str> = manifest
+        .pointer("/secretNamespaces")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if !secret_namespaces.is_empty() && secret_namespaces != namespaces {
+        out.push_str(&format!(
+            "  secrets from:   {}\n",
+            secret_namespaces.join(", ")
+        ));
     }
 
     let resources = manifest
@@ -5796,6 +5813,30 @@ mod tests {
             count_secret_files(r#"{"name":"web.json","type":"file","path":"/s/crs/web.json"}"#),
             0
         );
+    }
+
+    #[test]
+    fn show_says_where_the_secrets_came_from_when_it_is_wider() {
+        // The capture follows SealedSecrets, so a backup can hold secrets
+        // from a namespace that has no Application — and a header listing
+        // only the app namespaces would read as if those were missing.
+        let manifest = json!({
+            "clusterId": "c", "createdAt": "t", "platformVersion": "v",
+            "namespaces": ["apprafter", "procvue"],
+            "secretNamespaces": ["apprafter", "apprafter-system", "laundry-assistant"],
+            "resources": []
+        });
+        let s = format_snapshot_contents("id", None, None, &manifest, Some(4), &tokyo(), None);
+        assert!(s.contains("apprafter, procvue"), "{s}");
+        assert!(s.contains("laundry-assistant"), "names the wider set: {s}");
+
+        // Same set on both: one line, not two saying the same thing.
+        let same = json!({
+            "clusterId": "c", "createdAt": "t", "platformVersion": "v",
+            "namespaces": ["shop"], "secretNamespaces": ["shop"], "resources": []
+        });
+        let t = format_snapshot_contents("id", None, None, &same, Some(1), &tokyo(), None);
+        assert_eq!(t.matches("shop").count(), 1, "{t}");
     }
 
     #[test]

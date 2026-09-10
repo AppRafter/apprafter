@@ -359,7 +359,7 @@ pub fn run_restore(
             }
             RestoreStep::EnsureNamespaces => {
                 let m = produced_by_artifact(manifest.as_ref(), "EnsureNamespaces")?;
-                ensure_namespaces(&m.namespaces, kc.path())?;
+                ensure_namespaces_all(&m.namespaces, &m.secret_namespaces, kc.path())?;
             }
             RestoreStep::ApplySourceCredentials => {
                 let dd = produced_by_artifact(data_dir.as_ref(), "ApplySourceCredentials")?;
@@ -664,8 +664,12 @@ fn namespace_object(name: &str) -> Value {
 /// platform namespaces from bootstrap — fails the first namespaced apply with
 /// `namespaces "<ns>" not found`. Idempotent: a server-side apply of an
 /// already-present namespace (including the platform ones) is a no-op.
-fn ensure_namespaces(namespaces: &[String], kubeconfig: &Path) -> Result<()> {
-    let ensured = namespaces_to_ensure(namespaces);
+fn ensure_namespaces_all(
+    app_namespaces: &[String],
+    secret_namespaces: &[String],
+    kubeconfig: &Path,
+) -> Result<()> {
+    let ensured = namespaces_to_ensure_all(app_namespaces, secret_namespaces);
     for ns in &ensured {
         apply_cr(&namespace_object(ns), kubeconfig)?;
     }
@@ -685,6 +689,20 @@ fn namespaces_to_ensure(namespaces: &[String]) -> Vec<&str> {
         .map(String::as_str)
         .filter(|n| !n.is_empty())
         .collect()
+}
+
+/// Every namespace a restore must create: the app namespaces plus the ones
+/// the backup captured SECRETS from.
+///
+/// Sorted and deduplicated so a restore is reproducible. A backup written
+/// before `secretNamespaces` existed passes an empty second list and gets
+/// exactly the old behaviour.
+fn namespaces_to_ensure_all<'a>(apps: &'a [String], secrets: &'a [String]) -> Vec<&'a str> {
+    let mut all: Vec<&str> = namespaces_to_ensure(apps);
+    all.extend(namespaces_to_ensure(secrets));
+    all.sort_unstable();
+    all.dedup();
+    all
 }
 
 /// **ApplyPlatformStack** — apply the sanitized `PlatformStack` from `crs/`,
@@ -2329,6 +2347,7 @@ mod tests {
             created_at: "2026-09-02T00:00:00Z".into(),
             platform_version: "0.2.40".into(),
             namespaces: namespaces.iter().map(|s| s.to_string()).collect(),
+            secret_namespaces: Vec::new(),
             resources,
         }
     }
@@ -2925,6 +2944,28 @@ mod tests {
 
     /// An empty namespace name would render as a `Namespace` object with no
     /// name, failing the apply and taking the whole restore with it.
+    #[test]
+    fn a_namespace_that_only_holds_secrets_is_still_created() {
+        // Restore applies each captured SealedSecret into its namespace,
+        // and `kubectl apply` fails when the namespace is not there. The
+        // app namespaces alone are not enough any more: a secret staged
+        // ahead of a deployment lives in a namespace that no Application
+        // will create, and dropping it would lose exactly the credentials
+        // the widened capture exists to keep.
+        let apps = vec!["shop".to_string()];
+        let secrets = vec!["shop".to_string(), "laundry-assistant".to_string()];
+        assert_eq!(
+            namespaces_to_ensure_all(&apps, &secrets),
+            vec!["laundry-assistant", "shop"]
+        );
+    }
+
+    #[test]
+    fn an_older_backup_without_secret_namespaces_ensures_what_it_always_did() {
+        let apps = vec!["shop".to_string(), "blog".to_string()];
+        assert_eq!(namespaces_to_ensure_all(&apps, &[]), vec!["blog", "shop"]);
+    }
+
     #[test]
     fn namespaces_to_ensure_drops_empty_entries() {
         let namespaces = vec!["demo".to_string(), String::new(), "shop".to_string()];

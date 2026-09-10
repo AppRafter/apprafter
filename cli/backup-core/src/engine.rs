@@ -127,6 +127,29 @@ pub fn is_user_argo_app(argo_app: &Value) -> bool {
         == Some(value)
 }
 
+/// The namespaces a cluster-wide SealedSecret listing covers, sorted and
+/// deduplicated.
+///
+/// The sweep used to look for secrets only in the namespaces that hold an
+/// `Application`, which quietly excluded every sealed secret staged ahead of
+/// a deployment that does not exist yet. Those are exactly the ones an
+/// operator would have to re-create by hand after restoring onto a new
+/// substrate — so the capture follows the SealedSecrets, not the apps.
+pub fn namespaces_with_sealed_secrets(sealed: &[Value]) -> Vec<String> {
+    let mut out: Vec<String> = sealed
+        .iter()
+        .filter_map(|s| {
+            s.pointer("/metadata/namespace")
+                .and_then(Value::as_str)
+                .filter(|ns| !ns.is_empty())
+                .map(str::to_string)
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Of the Secret names present in `ns`, keep only those that have a matching
 /// SealedSecret.
 pub fn secrets_to_back_up(
@@ -531,8 +554,13 @@ fn capture_non_claim_artifacts(
         .map_err(|e| CliError::Other(format!("create secrets dir: {e}")))?;
 
     let mut secret_count = 0usize;
-    for ns in &opts.namespaces {
-        let sealed = list_items(k, "sealedsecrets.bitnami.com", Some(ns))?;
+    // Cluster-wide: a sealed secret is captured wherever it lives, including
+    // a namespace with no Application yet. `secrets_to_back_up` still keeps
+    // only Secrets that have a SealedSecret behind them, so this widens the
+    // SEARCH without widening what counts as ours.
+    let sealed_all = list_items(k, "sealedsecrets.bitnami.com", None)?;
+    let secret_namespaces = namespaces_with_sealed_secrets(&sealed_all);
+    for ns in &secret_namespaces {
         let secret_names: Vec<String> = list_items(k, "secrets", Some(ns))?
             .iter()
             .filter_map(|s| {
@@ -541,7 +569,7 @@ fn capture_non_claim_artifacts(
                     .map(str::to_string)
             })
             .collect();
-        let to_back_up = secrets_to_back_up(&secret_names, &sealed, ns);
+        let to_back_up = secrets_to_back_up(&secret_names, &sealed_all, ns);
         let ns_dir = secrets_dir.join(ns);
         for name in &to_back_up {
             if let Some((data, secret_type)) = read_secret_data(k, name, ns)? {
@@ -574,6 +602,7 @@ fn capture_non_claim_artifacts(
         created_at: opts.created_at.clone(),
         platform_version: opts.platform_version.clone(),
         namespaces: opts.namespaces.clone(),
+        secret_namespaces: secret_namespaces.clone(),
         resources: resource_refs(&manifest_crs, claims),
     };
     write_manifest(&manifest, dest_dir)?;
@@ -1162,6 +1191,32 @@ mod tests {
     }
 
     #[test]
+    fn a_sealed_secret_outside_every_application_namespace_is_still_captured() {
+        // The reported case: credentials sealed ahead of a deployment that
+        // does not exist yet. The namespace holds no Application, so the
+        // app-scoped sweep never looked there — and a substrate migration
+        // through backup/restore would have silently dropped them.
+        let sealed = vec![
+            json!({"metadata": {"name": "api-ai", "namespace": "laundry-assistant"}}),
+            json!({"metadata": {"name": "cms", "namespace": "apprafter"}}),
+            json!({"metadata": {"name": "other", "namespace": "apprafter"}}),
+        ];
+        assert_eq!(
+            namespaces_with_sealed_secrets(&sealed),
+            vec!["apprafter".to_string(), "laundry-assistant".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_sealed_secret_without_a_namespace_is_skipped_rather_than_guessed() {
+        // A cluster-scoped listing can carry an entry with no namespace
+        // (a malformed object, or a kind that is not namespaced). Guessing
+        // one would send the capture at the wrong place.
+        let sealed = vec![json!({"metadata": {"name": "x"}}), json!({})];
+        assert!(namespaces_with_sealed_secrets(&sealed).is_empty());
+    }
+
+    #[test]
     fn secrets_to_back_up_are_those_with_a_sealedsecret() {
         let sealed = vec![json!({"metadata":{"name":"stripe","namespace":"demo"}})];
         let secrets = vec!["stripe".to_string(), "alpha-pg-conn".to_string()];
@@ -1737,15 +1792,24 @@ mod tests {
                                   "metadata": {"name": "assets", "namespace": "demo"}}]}),
             )
             .reply(
-                &[
-                    "get",
-                    "sealedsecrets.bitnami.com",
-                    "-n",
-                    "demo",
-                    "-o",
-                    "json",
-                ],
-                json!({"items": [{"metadata": {"name": "stripe", "namespace": "demo"}}]}),
+                // Cluster-wide now: the sweep follows the SealedSecrets
+                // rather than the Applications, so a secret staged in a
+                // namespace with no app is still captured.
+                &["get", "sealedsecrets.bitnami.com", "-A", "-o", "json"],
+                json!({"items": [
+                    {"metadata": {"name": "stripe", "namespace": "demo"}},
+                    // Staged ahead of a deployment: this namespace holds
+                    // NO Application, and is not in `opts.namespaces`.
+                    {"metadata": {"name": "api-key", "namespace": "staged"}}
+                ]}),
+            )
+            .reply(
+                &["get", "secrets", "-n", "staged", "-o", "json"],
+                json!({"items": [{"metadata": {"name": "api-key", "namespace": "staged"}}]}),
+            )
+            .reply(
+                &["get", "secrets", "api-key", "-n", "staged", "-o", "json"],
+                json!({"type": "Opaque", "data": {"k": "dg=="}}),
             )
             .reply(
                 &["get", "secrets", "-n", "demo", "-o", "json"],
@@ -1806,8 +1870,16 @@ mod tests {
              ArgoApplication + SharedVolume"
         );
         assert_eq!(
-            out.secret_count, 2,
-            "the sealed `stripe` and the SourceCredential material only"
+            out.secret_count, 3,
+            "sealed `stripe`, the SourceCredential material, and `api-key` \
+             staged in a namespace with no Application"
+        );
+        // THE guard for the widened sweep: the file has to be on disk, in
+        // its own namespace directory. Asserting only the count would pass
+        // against a sweep that captured the right number of wrong things.
+        assert_eq!(
+            file_names_in(&dir.path().join("secrets").join("staged")),
+            vec!["api-key.json"]
         );
 
         assert_eq!(
@@ -2096,7 +2168,10 @@ mod tests {
 
         assert_eq!(s.snapshot_id, Some("snap".to_string()));
         assert_eq!(s.cr_count, 5);
-        assert_eq!(s.secret_count, 2);
+        // Three: the sealed secret in the app namespace, the
+        // SourceCredential material, and the one staged in `staged`,
+        // which holds no Application — the sweep follows SealedSecrets.
+        assert_eq!(s.secret_count, 3);
         assert_eq!(s.claim_count, 2, "both claims are recorded");
         assert_eq!(s.extracted_count, 1, "only the pg claim has a payload");
         assert_eq!(s.tag, "k3d-demo-2026-06-20T00:00:00Z");

@@ -352,11 +352,26 @@ discrimination that keeps a restore from clobbering the target's own bootstrap:
   Applications lack the label and are never captured — otherwise the restore
   would double-own the target's own bootstrap Applications.
 - **`SharedVolume` CRs** are captured for the in-scope namespaces.
-- **App user secrets** are captured by a SealedSecret-backed sweep over the
-  in-scope namespaces: a Secret is carried only when a SealedSecret of the
-  same name exists (a secret you sealed). Derived secrets the operator
-  re-creates on restore — connection Secrets, docker pull-secrets — are not
-  carried.
+- **App user secrets** are captured by a SealedSecret-backed sweep across
+  **every** namespace, not only the ones in scope: a Secret is carried when a
+  SealedSecret of the same name exists (a secret you sealed). Derived secrets
+  the operator re-creates on restore — connection Secrets, docker
+  pull-secrets — are not carried.
+
+  The sweep follows the SealedSecrets rather than the applications on
+  purpose. Credentials are routinely sealed *before* the deployment that will
+  use them, into a namespace that holds no `Application` yet; scoping the
+  sweep to application namespaces dropped exactly those, and a substrate
+  migration through backup/restore would have asked the operator to seal them
+  again by hand. `apprafter backup show` prints a `secrets from:` line
+  whenever the secret namespaces are wider than the application ones, and
+  `restore` creates those namespaces before replaying into them.
+
+  One consequence worth stating: the backup credential itself
+  (`apprafter-backup-s3`) is a sealed secret, so it travels in the
+  repository too. The repository is encrypted, and this changes nothing about
+  who can read it — but it does mean a restore hands the new cluster the
+  credentials of the repository it came from.
 - **`SourceCredential` material** lives in `apprafter-system`, **outside** the
   app-namespace set, so the app-ns sweep misses it. The backup instead
   follows each `SourceCredential`'s `spec.git.backend.sealedSecretRef` and

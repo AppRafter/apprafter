@@ -184,6 +184,30 @@ the cluster did.
 
 ### Changed
 
+- **The secret sweep follows the SealedSecrets, not the applications.**
+  Secrets were captured only in namespaces holding an `Application`, so a
+  credential sealed *ahead of* a deployment — the normal way to prepare
+  one — was in no backup at all. It would survive right up until the
+  substrate migration it was supposed to survive, and then be gone, with
+  nothing having said so: `backup show` listed the application
+  namespaces, and the secret count (before this release) read from a
+  manifest that never mentioned secrets.
+
+  The sweep is now cluster-wide and still keeps only Secrets that have a
+  SealedSecret behind them, so what counts as "ours" is unchanged — only
+  where we look. The manifest gained `secretNamespaces` (defaulted, so
+  older backups read as before), `restore` creates those namespaces
+  before replaying into them, and `backup show` prints a `secrets from:`
+  line when they are wider than the application set.
+
+  RBAC needed no change: the runner's ClusterRole already granted
+  cluster-wide `get,list` on secrets and sealedsecrets.
+
+  Consequence worth knowing: `apprafter-backup-s3` is itself a sealed
+  secret, so the repository now carries the credentials to the repository.
+  It is encrypted and this changes nothing about who can read it, but a
+  restore does hand the new cluster the keys to where it came from.
+
 - **The maintenance verbs read the credential the cluster is holding.**
   `check`, `prune`, `unlock` and off-site `list` resolved credentials
   from `--credential-file` or the environment and nothing else, so every

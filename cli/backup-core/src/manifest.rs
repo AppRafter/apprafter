@@ -29,6 +29,21 @@ pub struct BackupManifest {
     /// no-op (no mid-restore component re-render).
     pub platform_version: String,
     pub namespaces: Vec<String>,
+
+    /// Namespaces the run captured SECRETS from.
+    ///
+    /// A superset of `namespaces`: a sealed secret is captured wherever it
+    /// lives, including a namespace with no `Application` yet — someone
+    /// preparing to deploy seals the credentials first, and losing them on
+    /// a substrate migration would mean re-creating them by hand for a
+    /// deployment that was already half done.
+    ///
+    /// `#[serde(default)]` so a manifest written before this field reads as
+    /// an empty list rather than failing — restore falls back to
+    /// `namespaces` there, which is exactly what those backups captured.
+    #[serde(default)]
+    pub secret_namespaces: Vec<String>,
+
     pub resources: Vec<ResourceRef>,
 }
 
@@ -54,6 +69,7 @@ mod tests {
             created_at: "2026-06-20T00:00:00Z".into(),
             platform_version: "0.2.37".into(),
             namespaces: vec!["demo".into()],
+            secret_namespaces: vec!["demo".into(), "staged".into()],
             resources: vec![ResourceRef {
                 namespace: "demo".into(),
                 kind: "Application".into(),
