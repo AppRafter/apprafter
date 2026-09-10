@@ -28,12 +28,18 @@
 #     Programmed + all listeners Programmed) once it passes its startup
 #     required-resources check, which needs tlsroutes. With the standard channel
 #     the controller never starts and the Gateway never reaches Programmed.
-#   * GatewayClass `cilium` Accepted — INFORMATIONAL ONLY: Cilium 1.16.5 does
-#     NOT reliably write the Accepted status back onto the GatewayClass object
-#     (it stays Unknown/"Waiting for controller" even on a fully-working install
-#     where the Gateway IS Programmed — confirmed live 2026-06-12). The Gateway
-#     Programmed status is the real signal, so we read the GatewayClass status
-#     but do NOT gate on it.
+#   * GatewayClass `cilium` Accepted — INFORMATIONAL ONLY, and the reason is a
+#     version skew rather than flakiness. Cilium 1.16.5 vendors gateway-api
+#     v1.1.0 and writes `status.supportedFeatures` as bare strings in the SAME
+#     status update that carries the Accepted condition. The v1.2.1 CRDs this
+#     walk pins want objects under a list-type map, so the apiserver rejects
+#     that update ATOMICALLY and Accepted can never land — deterministically,
+#     not sometimes. The cilium-operator log therefore repeats
+#     `Failed to update GatewayClass status … supportedFeatures[0] … must be of
+#     type object` on every reconcile; it is expected here and unrelated to any
+#     failure being diagnosed. The Gateway Programmed status is the real signal,
+#     so we read the GatewayClass status but do NOT gate on it. This resolves on
+#     its own when Cilium ships a build vendoring gateway-api v1.2.
 #
 # Run STANDARD-channel CRDs instead (APPRAFTER_GW_WALK_NEGATIVE=1) and the walk
 # asserts the F1 SYMPTOM: the Gateway does NOT reach Programmed — proving the
@@ -63,8 +69,12 @@
 #              1.83a catch-all is untouched — the app route attaches to :443).
 #   Phase 8  — apply an internal Application `internal-web`. Assert NO HTTPRoute
 #              is created + its endpointURL is the cluster-DNS form.
-#   Phase 9  — patch `web` public->internal. Assert httproute/web is pruned +
-#              PublicRouteReady disappears from its status.
+#   Phase 9  — patch `web` public->internal. That edit is DESTRUCTIVE (2.16b),
+#              so assert the gate: the app pauses at AwaitingMigrationApproval,
+#              one plan gates BOTH candidates (domain-change +
+#              network-visibility-change), the route keeps SERVING while held,
+#              and only after approval is the plan consumed and the route
+#              pruned.
 #
 # In NEGATIVE mode (Gateway never programs) Phases 6-9 are SKIPPED — there is no
 # working platform Gateway for an HTTPRoute to attach to.
@@ -324,6 +334,74 @@ assert_not_found() {
     done
     printf '  ok: %s/%s NotFound throughout the %ss settle window\n' "$kind" "$name" "$settle"
     return 0
+}
+
+# ---------------------------------------------------------------
+# Local helper: assert_still_present <kind> <ns|-> <name> [settle_secs]
+#   The mirror of assert_not_found, for Phase 9's hold window: the resource
+#   must be there for the WHOLE window, and the moment a GET 404s the
+#   assertion fails. A one-shot GET would pass straight through a
+#   prune-then-recreate race, which is exactly the shape being ruled out —
+#   "the operator had its reconcile chances and chose not to prune".
+# ---------------------------------------------------------------
+assert_still_present() {
+    local kind="$1" ns="$2" name="$3" settle="${4:-30}"
+    local deadline nsargs=()
+    [ "$ns" != "-" ] && nsargs=(-n "$ns")
+    deadline=$(( $(date +%s) + settle ))
+    printf '  assert %s/%s STAYS present for %ss ...\n' "$kind" "$name" "$settle"
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if ! kubectl "${nsargs[@]}" get "$kind" "$name" >/dev/null 2>&1; then
+            printf 'ERROR: %s/%s disappeared during the hold window\n' "$kind" "$name" >&2
+            return 1
+        fi
+        sleep 5
+    done
+    printf '  ok: %s/%s present throughout the %ss hold window\n' "$kind" "$name" "$settle"
+    return 0
+}
+
+# ---------------------------------------------------------------
+# Local helpers: app-scope MigrationPlan discovery (ported from
+# e2e/app-migration-walk.sh, which learned these the hard way).
+#
+#   A plan's name is `<app>-migration-<unix-secs>` — unpredictable at
+#   authoring time — so it is found by the labels `create_plan_for`
+#   stamps, never reconstructed.
+#
+#   wait_plan_appears writes ALL progress to STDERR: its STDOUT is
+#   captured as the plan name, and chatter there would be patched as if
+#   it were one.
+# ---------------------------------------------------------------
+app_scope_plan_name() {
+    kubectl -n "$APP_NS" get migrationplan \
+        -l "apprafter.io/application=$1,apprafter.io/scope=application" \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true
+}
+
+plan_count_for() {
+    kubectl -n "$APP_NS" get migrationplan \
+        -l "apprafter.io/application=$1,apprafter.io/scope=application" \
+        --no-headers 2>/dev/null | grep -c . || true
+}
+
+wait_plan_appears() {
+    local app="$1" timeout="${2:-120}" deadline nm
+    deadline=$(( $(date +%s) + timeout ))
+    printf '  wait an app-scope MigrationPlan for %s to appear (timeout %ss) ...\n' \
+        "$app" "$timeout" >&2
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        nm="$(app_scope_plan_name "$app")"
+        if [ -n "$nm" ]; then
+            printf '  ok: MigrationPlan %s/%s exists for %s\n' "$APP_NS" "$nm" "$app" >&2
+            printf '%s' "$nm"
+            return 0
+        fi
+        sleep 5
+    done
+    printf 'ERROR: no app-scope MigrationPlan for %s appeared within %ss\n' "$app" "$timeout" >&2
+    kubectl -n "$APP_NS" get migrationplan -o wide >&2 2>&1 || true
+    return 1
 }
 
 # ---------------------------------------------------------------
@@ -672,7 +750,7 @@ helm template apprafter-operator "$OPERATOR_CHART" \
     --namespace "$OPERATOR_NS" \
     | _yq 'select(.kind == "CustomResourceDefinition")' \
     | kubectl apply --server-side --force-conflicts -f -
-for _crd in applications platformstacks; do
+for _crd in applications platformstacks migrationplans; do
     retry 12 5 -- kubectl wait --for=condition=Established \
         "crd/${_crd}.apprafter.io" --timeout=30s
 done
@@ -819,7 +897,10 @@ for _i in $(seq 1 18); do
     code=$(_curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
         --resolve "${APP_HOSTNAME}:443:${NODE_IP}" \
         "https://${APP_HOSTNAME}/" 2>/dev/null || true)
-    if [ "$code" = "200" ] && printf '%s' "$body" | grep -q 'Hostname:'; then
+    # `case`, not `printf | grep -q`: the reader exits on the first match and
+    # SIGPIPEs the writer, which under `pipefail` turns a successful match into
+    # a failed pipeline. A small body hides it; the shape is still wrong.
+    if [ "$code" = "200" ] && case "$body" in *Hostname:*) true ;; *) false ;; esac; then
         curl_ok=1
         printf '  ok: HTTPS 200 with a whoami body (try %d)\n' "$_i"
         break
@@ -901,43 +982,157 @@ assert_eq "internal app has NO PublicRouteReady condition" "${int_prr:-<absent>}
 # Phase 9: flip public -> internal prunes the route
 # ===============================================================
 
-phase "Phase 9: flip ${APP_PUBLIC} public->internal — HTTPRoute pruned"
+phase "Phase 9: flip ${APP_PUBLIC} public->internal — HELD, then pruned on approval"
 
-# Merge-patch: set expose.network=internal and DROP the hostname (a public
-# hostname-less app would also lose its route, but flipping to internal is the
-# user-facing op). A strategic/merge patch cannot delete a scalar map key, so
-# set hostname to null explicitly.
+# 2.16b changed what this phase proves, and this walk did not follow: on
+# 2026-07-17 the operator learned to gate a destructive Application edit behind
+# a MigrationPlan, and from the next night this phase failed for 55 consecutive
+# runs waiting for a prune that correctly never came. The product was right and
+# the walk was stale — so the phase now asserts the gate as well as the prune,
+# which is more coverage than it had before.
+#
+# NOTE: this walk deploys no admission webhook (see the Phase 6 note), so the
+# approval below is unguarded. Approval AUTHORITY — who may set the phase, and
+# the F-1b transition guard — is exercised in app-migration-walk.sh, not here.
+
+pre_ep=$(kubectl -n "$APP_NS" get application.apprafter.io "$APP_PUBLIC" \
+    -o jsonpath='{.status.endpointURL}' 2>/dev/null || true)
+# Pinned to its expected value, not just captured: comparing it to the held
+# value later would otherwise pass on two empty strings if the read failed on
+# both sides — an assertion that asserts nothing.
+assert_eq "endpointURL before the flip" "$pre_ep" "https://${APP_HOSTNAME}/"
+
+# ONE merge patch, deliberately: it sets expose.network=internal AND drops the
+# hostname (a merge patch cannot delete a scalar key, hence the explicit null).
+# That fires TWO destructive candidates — `network-visibility-change` and
+# `domain-change` — which the operator rolls into ONE plan carrying both in
+# `spec.changes[]`. `domain-change` wins the headline on an alphabetical
+# tie-break between two severity-1 `requires-restart` candidates, NOT because
+# the network flip was ignored. Splitting the patch would produce two plans and
+# two approve cycles for no extra coverage.
 kubectl -n "$APP_NS" patch application.apprafter.io "$APP_PUBLIC" --type=merge \
     -p '{"spec":{"base":{"expose":{"network":"internal","hostname":null}}}}'
 
-# The operator prunes httproute/web within ~90s.
-wait_not_found httproute "$APP_NS" "$APP_PUBLIC" 120
+# --- (1) the gate fires -----------------------------------------------------
+# 180s: the pause can wait out one full 60s steady-state requeue if the patch
+# lands just after a reconcile.
+wait_jsonpath application.apprafter.io "$APP_NS" "$APP_PUBLIC" \
+    '{.status.phase}' AwaitingMigrationApproval 180
 
-# The PublicRouteReady condition disappears from web's status (no longer public).
-printf '  waiting for PublicRouteReady to disappear from %s status ...\n' "$APP_PUBLIC"
-prr_gone=0
-deadline=$(( $(date +%s) + 120 ))
-while [ "$(date +%s)" -lt "$deadline" ]; do
-    prr=$(kubectl -n "$APP_NS" get application.apprafter.io "$APP_PUBLIC" \
-        -o jsonpath='{.status.conditions[?(@.type=="PublicRouteReady")].status}' 2>/dev/null || true)
-    if [ -z "$prr" ]; then
-        prr_gone=1
-        printf '  ok: PublicRouteReady condition gone from %s\n' "$APP_PUBLIC"
-        break
-    fi
-    printf '    %s: PublicRouteReady still present (=%q), waiting ...\n' "$(date +%H:%M:%S)" "$prr"
+mp_status=$(kubectl -n "$APP_NS" get application.apprafter.io "$APP_PUBLIC" \
+    -o jsonpath='{.status.conditions[?(@.type=="MigrationPending")].status}' 2>/dev/null || true)
+assert_eq "MigrationPending condition while held" "${mp_status:-<absent>}" "True"
+
+# Found by label — a plan's name embeds a unix timestamp and cannot be
+# predicted. NOT by `.status.phase`: a freshly created plan has no status
+# subobject at all (the phase is defaulted on read and never stamped), so
+# waiting for `pending-approval` would hang for the whole timeout and read as
+# "no plan was created".
+PLAN="$(wait_plan_appears "$APP_PUBLIC" 120)"
+
+# The plan carries BOTH candidates, not just the headline. Asserting the set is
+# what would catch a de-dup or set-algebra regression that gated only one op.
+plan_changes_raw=$(kubectl -n "$APP_NS" get migrationplan "$PLAN" \
+    -o jsonpath='{range .spec.changes[*]}{.type}{"\n"}{end}' 2>/dev/null || true)
+plan_triggers=$(printf '%s' "$plan_changes_raw" | sort -u | tr '\n' ',')
+assert_eq "plan gates both candidates" "$plan_triggers" "domain-change,network-visibility-change,"
+assert_eq "plan headline trigger" \
+    "$(kubectl -n "$APP_NS" get migrationplan "$PLAN" -o jsonpath='{.spec.trigger.type}')" \
+    "domain-change"
+
+# --- (2) the previous version keeps serving while held ----------------------
+# The point of the gate: nothing is withdrawn until a human agrees. A settle
+# window rather than one GET, so the operator demonstrably had reconcile
+# chances and chose not to prune.
+assert_still_present httproute "$APP_NS" "$APP_PUBLIC" 45
+
+held_ep=$(kubectl -n "$APP_NS" get application.apprafter.io "$APP_PUBLIC" \
+    -o jsonpath='{.status.endpointURL}' 2>/dev/null || true)
+assert_eq "endpointURL is carried through the pause" "$held_ep" "$pre_ep"
+
+# RETRIED, like the structurally identical probe in Phase 7 — a single shot
+# here would turn any transient into "stopped serving while merely HELD", a
+# false failure reading exactly like a product regression, in the one nightly
+# that already spent 55 runs being misread as one.
+#
+# Code AND body, also like Phase 7: an error page that happened to contain the
+# marker would otherwise pass.
+#
+# Matched with `case`, not `printf | grep -q`: a pipeline whose reader exits on
+# the first match SIGPIPEs the writer, and under `pipefail` that turns a
+# successful match into a failed pipeline. A small body hides it; the shape is
+# still wrong.
+held_ok=0
+for _i in $(seq 1 6); do
+    held_body=$(_curl -sk --max-time 10 --resolve "${APP_HOSTNAME}:443:${NODE_IP}" \
+        "https://${APP_HOSTNAME}/" 2>/dev/null || true)
+    held_code=$(_curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
+        --resolve "${APP_HOSTNAME}:443:${NODE_IP}" \
+        "https://${APP_HOSTNAME}/" 2>/dev/null || true)
+    case "$held_code:$held_body" in
+        200:*Hostname:*)
+            held_ok=1
+            printf '  ok: %s still SERVING over the held route (try %d)\n' "$APP_HOSTNAME" "$_i"
+            break ;;
+    esac
+    printf '    %s: code=%q hostname-marker=no (try %d), retrying ...\n' \
+        "$(date +%H:%M:%S)" "$held_code" "$_i"
     sleep 5
 done
-[ "$prr_gone" -eq 1 ] || { printf 'ERROR: PublicRouteReady condition never disappeared from %s after the internal flip\n' "$APP_PUBLIC" >&2; exit 1; }
+[ "$held_ok" -eq 1 ] || {
+    printf 'ERROR: %s stopped serving while the change was merely HELD (last code=%q)\n' \
+        "$APP_HOSTNAME" "${held_code:-}" >&2
+    exit 1
+}
 
-# And its endpointURL flipped to the internal cluster-DNS form.
+# PublicRouteReady is deliberately NOT asserted here. The paused status write
+# emits exactly two conditions and replaces the whole atomic array, so the
+# condition is gone the instant the gate fires — while the route is still live
+# and serving. Its absence is therefore not evidence about the route, which is
+# why the post-prune check below is annotated the same way.
+
+# --- (3) approve, and only then does the route go --------------------------
+# Raw kubectl, not `apprafter migration approve`: the CLI resolves its
+# kubeconfig through `.apprafter/state.json`, which this bootstrap-less kind
+# walk never creates. `--subresource=status` is mandatory — the CRD declares
+# the status subresource, and without the flag the apiserver drops the stanza,
+# kubectl exits 0, and the plan never moves.
+printf '  approving MigrationPlan %s/%s ...\n' "$APP_NS" "$PLAN"
+kubectl -n "$APP_NS" patch migrationplan "$PLAN" --subresource=status \
+    --type=merge -p '{"status":{"phase":"approved"}}'
+
+# An app-scope plan is a consumed ticket: the Application controller DELETES it
+# after applying the approved spec. Waiting for `completed` would race — the
+# plan sits in it for about one reconcile.
+wait_not_found migrationplan "$APP_NS" "$PLAN" 90
+
+# 120s: a 30s paused-arm backstop plus reconcile slack. The happy path is
+# watch-driven and lands in a second or two.
+wait_not_found httproute "$APP_NS" "$APP_PUBLIC" 120
+
+wait_jsonpath application.apprafter.io "$APP_NS" "$APP_PUBLIC" '{.status.phase}' Ready 120
+
+# THE load-bearing proof that the approved spec actually rendered: endpointURL
+# flips only when the render path ran with the new spec. Exact, and a hard
+# failure — the loose glob and the WARN it used to carry could not tell a flip
+# from a stale value.
 flipped_ep=$(kubectl -n "$APP_NS" get application.apprafter.io "$APP_PUBLIC" \
     -o jsonpath='{.status.endpointURL}' 2>/dev/null || true)
-printf '  post-flip endpointURL=%q\n' "$flipped_ep"
-case "$flipped_ep" in
-    http://*.svc.cluster.local:*) printf '  ok: %s endpointURL flipped to the internal cluster-DNS form\n' "$APP_PUBLIC" ;;
-    *) printf '  WARN: %s endpointURL after the internal flip is %q (expected the cluster-DNS form)\n' "$APP_PUBLIC" "$flipped_ep" >&2 ;;
-esac
+assert_eq "endpointURL flipped to the internal cluster-DNS form" \
+    "$flipped_ep" "http://${APP_PUBLIC}.${APP_NS}.svc.cluster.local:80"
+
+# Trailing sanity only. It went at PAUSE time, not at prune time, so it is not
+# itself proof that the route was withdrawn — the NotFound above and the
+# endpointURL flip carry that.
+post_prr=$(kubectl -n "$APP_NS" get application.apprafter.io "$APP_PUBLIC" \
+    -o jsonpath='{.status.conditions[?(@.type=="PublicRouteReady")].status}' 2>/dev/null || true)
+assert_eq "PublicRouteReady absent after the flip" "${post_prr:-<absent>}" "<absent>"
+
+# Anti-loop: a hash or baseline-stamping regression shows up as the gate
+# immediately re-firing after consumption, which would otherwise look like a
+# clean pass.
+sleep 30
+assert_eq "no plan re-created after consumption" "$(plan_count_for "$APP_PUBLIC")" "0"
 
 fi  # end NEGATIVE != 1 (Phases 6-9)
 
@@ -962,5 +1157,5 @@ if [ "$NEGATIVE" = 1 ]; then
 else
     printf '\ngateway-walk GREEN in %s\n' "$(elapsed)"
     printf 'Proven (1.83a): EXPERIMENTAL Gateway API CRDs (tlsroutes Established) -> Cilium %s gateway controller passes its required-resources check + reconciles -> the chart host-network Gateway platform reaches Programmed=True with all 3 listeners (apex+wildcard 443, http 80) Programmed. The 1.83a F1 fix (0.2.27) validated under real Cilium.\n' "$CILIUM_VERSION"
-    printf 'Proven (1.83b): the working-tree operator renders a per-Application HTTPRoute on :443 for a public app (Accepted + ResolvedRefs; PublicRouteReady=True; endpointURL https://%s/), the app serves HTTP 200 through the Gateway while http://:80 still 301-redirects; an internal app emits NO route (cluster-DNS endpointURL); flipping public->internal prunes the route + drops PublicRouteReady.\n' "$APP_HOSTNAME"
+    printf 'Proven (1.83b + 2.16b): the working-tree operator renders a per-Application HTTPRoute on :443 for a public app (Accepted + ResolvedRefs; PublicRouteReady=True; endpointURL https://%s/), the app serves HTTP 200 through the Gateway while http://:80 still 301-redirects; an internal app emits NO route (cluster-DNS endpointURL); and flipping public->internal is HELD behind a MigrationPlan gating both domain-change and network-visibility-change — the route keeps serving while held, and only approval consumes the plan and prunes it.\n' "$APP_HOSTNAME"
 fi

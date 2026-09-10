@@ -162,6 +162,19 @@ apprafter migration reject <plan-name>
     and the Argo CD button both perform it — so this is a genuine
     break-glass path rather than a second, weaker one. It is here for
     when the CLI is unavailable, not as an everyday alternative:
+
+    **`--subresource=status` is not optional.** The CRD declares the
+    status subresource, so without the flag the API server drops the
+    `status` stanza, `kubectl` prints `patched` and exits 0, and the plan
+    does not move. Silent, on the one path you reach for when nothing
+    else works.
+
+    **This needs a cluster-admin kubeconfig.** A non-admin holding
+    `patch migrationplans/status` is admitted only for a
+    `pending-approval → approved` transition, and a freshly created plan
+    has no status at all until something writes one — so the first write
+    is the one a non-admin cannot make. There is no dedicated approver
+    role yet.
     approving by hand skips nothing, but it also records nothing about
     who approved beyond the Kubernetes audit log.
 
@@ -174,7 +187,7 @@ apprafter migration reject <plan-name>
     kubectl describe migrationplan <plan-name> -n <namespace>
 
     kubectl patch migrationplan <plan-name> -n <namespace> \
-        --type merge -p '{"status":{"phase":"approved"}}'
+        --subresource=status --type=merge -p '{"status":{"phase":"approved"}}'
     ```
 
 ## Approval surfaces — today and later

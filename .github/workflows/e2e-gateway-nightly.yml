@@ -30,9 +30,14 @@ name: e2e-gateway-nightly
 # cilium-agent, so locally the walk runs under `sandbox-run` (rootful microVM) —
 # see e2e/gateway-walk.sh's header.
 #
-# Unlike the networkpolicy nightly this walk needs NO operator/CLI build: it
-# only renders the chart's Gateway (helm template + cue) and asserts the Cilium
-# datapath programs it. No Rust toolchain, no cargo.
+# The walk builds the working-tree operator + admission-webhook images in its
+# Phase 6 and side-loads them into kind (1.83b added the per-Application
+# HTTPRoute assertions, which need an operator to render one), so a Rust
+# toolchain IS on the critical path — roughly half the run's wall-clock. It
+# does NOT build the CLI, which is why Phase 9 approves its MigrationPlan with
+# a raw `kubectl patch --subresource=status` rather than `apprafter migration
+# approve`: the CLI resolves its kubeconfig through a target-store state file
+# this bootstrap-less walk never creates.
 #
 # Security note: no secrets are consumed. Everything runs on a local kind
 # cluster; the only outbound traffic is public image / chart / CRD pulls.
