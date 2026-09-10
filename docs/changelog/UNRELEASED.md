@@ -81,6 +81,20 @@ the cluster did.
   than dropped — a listing that silently omits resources is worse than
   one naming something the reader has to look up.
 
+- **Two defects in the first cut of those, both found on the live
+  cluster they were written for.** `SECRETS` read 0 against a backup
+  holding nine of them: the count came from `manifest.resources`, and
+  `resource_refs` puts CRs and claims there and nothing else — secrets go
+  into the snapshot as `secrets/<ns>/<name>.json`. They are now counted
+  from the tree, which the `ls` call already walks to find the manifest,
+  so it costs nothing extra.
+
+  And every claim reported `unspecified`: `ResourceRef` carries no
+  `rename_all`, so the manifest spells the field `claim_type`, while the
+  reader looked for `claimType` and therefore never found one. Both
+  spellings are accepted now, so a future rename cannot silently bring
+  the wrong answer back.
+
 - **`backup list --details` and a size line on `backup check`.** The
   detail listing adds size and per-snapshot counts so two runs compare
   down the columns, and the row where a count moves is the run where

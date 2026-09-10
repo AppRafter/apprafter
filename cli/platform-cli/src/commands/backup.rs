@@ -2194,9 +2194,9 @@ fn collect_snapshot_details(
                 .unwrap_or("?")
                 .to_string();
             let size = repo_stats(runner, repo, pass, Some(&id)).map(|st| st.total_size);
-            let counts = snapshot_manifest(runner, repo, pass, &id)
+            let counts = read_snapshot_insides(runner, repo, pass, &id)
                 .ok()
-                .map(|m| content_counts(&m));
+                .map(|i| content_counts(&i.manifest, i.secret_files));
             SnapshotDetail {
                 id,
                 time,
@@ -2226,11 +2226,15 @@ pub(crate) struct ContentCounts {
     pub claims: u64,
 }
 
-/// Count Applications, Secrets and ResourceClaims in a manifest. Pure.
-fn content_counts(manifest: &Value) -> ContentCounts {
+/// Count Applications, Secrets and ResourceClaims. Pure.
+///
+/// `secret_files` comes from the snapshot TREE rather than the manifest,
+/// which never lists secrets — counting them there reported 0 for every
+/// backup ever taken.
+fn content_counts(manifest: &Value, secret_files: u64) -> ContentCounts {
     let mut c = ContentCounts {
         apps: 0,
-        secrets: 0,
+        secrets: secret_files,
         claims: 0,
     };
     for r in manifest
@@ -2241,7 +2245,6 @@ fn content_counts(manifest: &Value) -> ContentCounts {
     {
         match r.pointer("/kind").and_then(Value::as_str) {
             Some("Application") => c.apps += 1,
-            Some("Secret") => c.secrets += 1,
             Some("ResourceClaim") => c.claims += 1,
             _ => {}
         }
@@ -2329,6 +2332,26 @@ where
     out
 }
 
+/// Count the secret files a snapshot carries.
+///
+/// The manifest lists CRs and claims and NOTHING else — `resource_refs`
+/// never adds secrets — so a count taken from it reports zero for every
+/// backup ever made. The secrets are in the tree, as
+/// `secrets/<namespace>/<name>.json` plus `secrets/sourcecred/<name>.json`,
+/// and that is where the number has to come from.
+fn count_secret_files(ls_output: &str) -> u64 {
+    ls_output
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|n| n.pointer("/type").and_then(Value::as_str) == Some("file"))
+        .filter(|n| {
+            n.pointer("/path")
+                .and_then(Value::as_str)
+                .is_some_and(|p| p.contains("/secrets/"))
+        })
+        .count() as u64
+}
+
 /// Render what a snapshot contains, from its manifest.
 ///
 /// Counts by `kind`, and breaks `ResourceClaim` down by `claimType` —
@@ -2341,6 +2364,7 @@ fn format_snapshot_contents<Tz>(
     time: Option<&str>,
     size: Option<u64>,
     manifest: &Value,
+    secret_files: Option<u64>,
     tz: &Tz,
     zone_label: Option<&str>,
 ) -> String
@@ -2379,7 +2403,7 @@ where
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if resources.is_empty() {
+    if resources.is_empty() && secret_files.unwrap_or(0) == 0 {
         out.push_str("  (no resources recorded in this snapshot's manifest)\n");
         return out;
     }
@@ -2387,13 +2411,27 @@ where
     // BTreeMap so the order is stable run to run — a listing meant for
     // spotting a change must not reorder itself between two runs.
     let mut by_kind: BTreeMap<&str, u64> = BTreeMap::new();
+    // Secrets come from the tree, never from `resources` — see
+    // `count_secret_files`. Counted first so a manifest that ever starts
+    // listing them cannot double them.
+    if let Some(n) = secret_files {
+        by_kind.insert("Secret", n);
+    }
     let mut claims_by_type: BTreeMap<&str, u64> = BTreeMap::new();
     for r in &resources {
         let kind = r.pointer("/kind").and_then(Value::as_str).unwrap_or("?");
+        if kind == "Secret" && secret_files.is_some() {
+            continue;
+        }
         *by_kind.entry(kind).or_default() += 1;
         if kind == "ResourceClaim" {
+            // `ResourceRef` carries no `rename_all`, so the manifest
+            // spells this `claim_type`. The camelCase form is accepted
+            // too: if the struct ever gains a rename, this keeps
+            // reading rather than quietly reporting "unspecified".
             let t = r
-                .pointer("/claimType")
+                .pointer("/claim_type")
+                .or_else(|| r.pointer("/claimType"))
                 .and_then(Value::as_str)
                 .unwrap_or("unspecified");
             *claims_by_type.entry(t).or_default() += 1;
@@ -2599,7 +2637,7 @@ pub fn run_backup_show(
 
     let runner = CredentialedRestic { creds };
     let id = snapshot.unwrap_or("latest");
-    let manifest = snapshot_manifest(&runner, &repo, &pass, id)?;
+    let inside = read_snapshot_insides(&runner, &repo, &pass, id)?;
 
     // The id and time come from `snapshots`, not from the manifest: the
     // manifest records when the RUN started, and an operator matching this
@@ -2613,7 +2651,8 @@ pub fn run_backup_show(
             &resolved_id,
             time.as_deref(),
             size,
-            &manifest,
+            &inside.manifest,
+            Some(inside.secret_files),
             &chrono::Local,
             readers_zone().as_deref(),
         )
@@ -3742,15 +3781,24 @@ fn repo_stats(
     parse_stats_json(&out)
 }
 
-/// Read a snapshot's `manifest.json` — two restic calls: `ls` to find the
-/// path (the staging directory's name changes every run), `dump` to read it.
-fn snapshot_manifest(
+/// What one `restic ls` of a snapshot tells us: the manifest it carries and
+/// the secrets it holds, which live in the tree rather than in the manifest.
+pub(crate) struct SnapshotInsides {
+    pub manifest: Value,
+    pub secret_files: u64,
+}
+
+/// Read a snapshot's `manifest.json` and count its secret files — two restic
+/// calls: `ls` to walk the tree (the staging directory's name changes every
+/// run, so the manifest can only be found by name), `dump` to read it.
+fn read_snapshot_insides(
     runner: &CredentialedRestic,
     repo: &str,
     pass: &str,
     snapshot: &str,
-) -> Result<Value> {
+) -> Result<SnapshotInsides> {
     let ls = runner.run_stdout(&restic_ls_argv(repo, snapshot), pass)?;
+    let secret_files = count_secret_files(&ls);
     let path = manifest_path_in_snapshot(&ls).ok_or_else(|| {
         CliError::Other(format!(
             "snapshot {snapshot} carries no manifest.json, so it was not written by \
@@ -3759,8 +3807,13 @@ fn snapshot_manifest(
         ))
     })?;
     let raw = runner.run_stdout(&restic_dump_argv(repo, snapshot, &path), pass)?;
-    serde_json::from_str(&raw)
-        .map_err(|e| CliError::Other(format!("parse manifest.json from snapshot {snapshot}: {e}")))
+    let manifest = serde_json::from_str(&raw).map_err(|e| {
+        CliError::Other(format!("parse manifest.json from snapshot {snapshot}: {e}"))
+    })?;
+    Ok(SnapshotInsides {
+        manifest,
+        secret_files,
+    })
 }
 
 /// `apprafter backup unlock` — remove STALE locks from an off-site restic repo
@@ -5706,6 +5759,56 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_type_is_read_from_the_key_the_manifest_actually_uses() {
+        // Live output read `ResourceClaim 1 (unspecified 1)` against a
+        // cluster whose claim has a type. `ResourceRef` carries no
+        // `rename_all`, so it serialises SNAKE_CASE — `claim_type`, not
+        // `claimType`. Reading the camelCase key found nothing and the
+        // breakdown said "unspecified" for every claim there will ever be.
+        let manifest = json!({
+            "clusterId": "c", "createdAt": "t", "platformVersion": "v",
+            "namespaces": ["demo"],
+            "resources": [
+                {"namespace": "demo", "kind": "ResourceClaim", "name": "db", "claim_type": "pg"}
+            ]
+        });
+        let s = format_snapshot_contents("id", None, None, &manifest, None, &tokyo(), None);
+        assert!(s.contains("pg 1"), "{s}");
+        assert!(!s.contains("unspecified"), "{s}");
+    }
+
+    #[test]
+    fn secrets_are_counted_from_the_snapshot_tree_not_the_manifest() {
+        // The manifest lists CRs and claims only — `resource_refs` never
+        // adds secrets — so counting `kind == "Secret"` there reported 0
+        // against a cluster whose backup held nine of them. They are in
+        // the snapshot as `secrets/<ns>/<name>.json`, which is where the
+        // count has to come from.
+        let ls = r#"{"struct_type":"snapshot","paths":["/staging/x"]}
+{"name":"secrets","type":"dir","path":"/staging/x/secrets","struct_type":"node"}
+{"name":"api-ai.json","type":"file","path":"/staging/x/secrets/shop/api-ai.json","struct_type":"node"}
+{"name":"api-s3.json","type":"file","path":"/staging/x/secrets/shop/api-s3.json","struct_type":"node"}
+{"name":"srccred-x.json","type":"file","path":"/staging/x/secrets/sourcecred/srccred-x.json","struct_type":"node"}
+{"name":"web.json","type":"file","path":"/staging/x/crs/web.json","struct_type":"node"}"#;
+        assert_eq!(count_secret_files(ls), 3);
+        // A snapshot with no secrets dir is a real zero, not an unknown.
+        assert_eq!(
+            count_secret_files(r#"{"name":"web.json","type":"file","path":"/s/crs/web.json"}"#),
+            0
+        );
+    }
+
+    #[test]
+    fn the_secret_count_reaches_both_surfaces() {
+        let manifest = json!({
+            "clusterId": "c", "createdAt": "t", "platformVersion": "v",
+            "namespaces": ["demo"], "resources": []
+        });
+        let s = format_snapshot_contents("id", None, None, &manifest, Some(9), &tokyo(), None);
+        assert!(s.contains("Secret") && s.contains('9'), "{s}");
+    }
+
+    #[test]
     fn the_contents_summary_counts_what_an_operator_asks_about() {
         let manifest = json!({
             "manifestVersion": 1,
@@ -5717,7 +5820,6 @@ mod tests {
                 {"namespace": "shop", "kind": "Application", "name": "web"},
                 {"namespace": "shop", "kind": "Application", "name": "api"},
                 {"namespace": "blog", "kind": "Application", "name": "blog"},
-                {"namespace": "shop", "kind": "Secret", "name": "web-env"},
                 {"namespace": "shop", "kind": "ResourceClaim", "name": "db", "claimType": "pg"},
                 {"namespace": "blog", "kind": "ResourceClaim", "name": "db2", "claimType": "pg"},
                 {"namespace": "shop", "kind": "ResourceClaim", "name": "cache", "claimType": "redis"},
@@ -5729,6 +5831,9 @@ mod tests {
             Some("2026-09-10T22:11:39Z"),
             Some(1_234_567),
             &manifest,
+            // Secrets never appear in `resources`; they are counted from
+            // the snapshot tree and passed in.
+            Some(11),
             &tokyo(),
             Some("Asia/Tokyo"),
         );
@@ -5821,7 +5926,7 @@ mod tests {
             "namespaces": [],
             "resources": [{"namespace": "n", "kind": "SomethingNew", "name": "x"}]
         });
-        let s = format_snapshot_contents("id", None, None, &manifest, &tokyo(), None);
+        let s = format_snapshot_contents("id", None, None, &manifest, None, &tokyo(), None);
         assert!(s.contains("SomethingNew"), "{s}");
     }
 
