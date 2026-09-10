@@ -9,7 +9,7 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
-## cli v0.2.63 — a broken pipe was hiding kubectl's diagnosis (unreleased)
+## cli v0.2.63 — a broken pipe was hiding kubectl's diagnosis, and a failed `backup enable` wedged the bucket for the next one (unreleased)
 
 Found by a CI flake and swept from there. Three sites wrote a payload
 into a child process's stdin and propagated the write error immediately,
@@ -49,6 +49,61 @@ before reaping the child.
   `kubectl_apply_server_side` also dropped its child unreaped —
   `Child::drop` does not wait — leaking a zombie per occurrence.
 
+- **`backup enable` blamed the credentials for a bucket its own failed run
+  had wedged.** The repository preflight tries `restic cat config` and then
+  `restic init`, and announced every failure of the pair as `unreachable /
+  bad credentials` through the catch-all `CliError::Other` — whose own help
+  text asks for exactly the promotion this needed.
+
+  The wording is wrong in the case that recurs most, and it recurs by
+  construction. `restic init` writes the master key before it writes the
+  config, so an init that fails in between — a refused `PutObject`, a
+  dropped connection — leaves `keys/` behind with no `config`, and restic
+  then refuses to init over those keys. Every later `enable` against that
+  location fails, including the ones whose credentials are demonstrably
+  fine: restic had just listed the keys with them. Enabling backup could
+  wedge the bucket against enabling backup, and the error pointed away from
+  the only thing that would fix it.
+
+  The probe now raises `CliError::BackupRepoProbe`
+  (`apprafter::backup::repo_probe_failed`), still carrying both stderrs,
+  with help classified from whichever one holds the diagnosis. Three new
+  `ResticFailure` variants carry the remedies: `HalfInitialised` (clear
+  `keys/`, or take a fresh `--prefix` — plus what `data/` and `snapshots/`
+  alongside it would mean, since that is a lost config rather than a dead
+  init), `WriteDenied` (a grant on the prefix, not a bad key — and the
+  leftover key to clear before retrying), and `BadCredentials` (the one
+  case where the old wording was right, and where quoted or space-padded
+  dotenv values are the usual cause).
+
+  `WriteDenied` also offers `--prefix`, because that is what resolved the
+  report: the bucket took the repository one path down and refused
+  `config` at its root. A hint that only says "check your grants"
+  withholds the move that works, and a prefix per cluster is the ordinary
+  arrangement for a shared bucket rather than a workaround.
+
+  Whether the failed run left a key file behind is **stated, not
+  guessed**. restic names the object it was saving, and it writes the
+  master key before the config: `Save(<config/…>)` means the key is
+  already stored and has to be cleared, `Save(<key/…>)` means the
+  location is untouched. Reading it off the stderr also avoids the
+  obvious alternative — re-running `init` and taking "already contains
+  keys" as proof — which costs a round trip and is not consequence-free:
+  an init that failed transiently *before* writing its key can succeed at
+  writing one on the retry, so that probe would sometimes create the
+  leftover it set out to detect. A stderr that names no object claims
+  nothing either way.
+
+  A wrong passphrase is read from the **first** stderr on purpose: there
+  the config exists and opens for nobody, `init` can only ever answer
+  "already initialized", and classifying on it would report an intact
+  repository as a missing one. An unclassified failure now names the four
+  inputs the probe touches and how to reproduce it outside the CLI, rather
+  than the catch-all's "the message above is the only context".
+
+  The operator guide gained the two shapes and their remedies, and the
+  credential-file section now says values are taken verbatim.
+
 ### Testing
 
 - The regression guard pads its spec past the pipe buffer on purpose.
@@ -61,6 +116,16 @@ before reaping the child.
   the test exercises the readiness path it names rather than a race. It
   had passed since landing on 2026-09-03 and never reproduced locally in
   500 runs, including pinned to a single CPU.
+- The probe guards are written against **verbatim operator terminal
+  output** — both the wedged bucket and the refused `PutObject` are real
+  captures, not invented stderr. The `Save(<key/…>)` shape is a capture
+  too, reproduced locally against restic 0.18.1 with a key directory the
+  process could not write to; that run confirmed both halves of the rule
+  — the stderr named the key, and the repository was left empty. One guard asserts the message no longer
+  says "bad credentials" when the credentials just worked; another asserts
+  an unclassified failure does not fall back to the catch-all's help, which
+  is the assertion the first draft was missing (it passed against the
+  un-fixed code, since the catch-all does carry *a* help text).
 
 ## cli v0.2.62 — four defects a live run found in `apprafter status` (2.23h, unreleased)
 

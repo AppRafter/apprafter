@@ -121,6 +121,14 @@ pub enum ResticFailure {
     RepoMissing,
     /// A stale lock from an interrupted run.
     Locked,
+    /// Key files without a config: an `init` that died between writing
+    /// the master key and writing the config. restic refuses to init
+    /// over those keys, so the location is wedged until they are gone.
+    HalfInitialised,
+    /// The store accepted the credentials and refused the write.
+    WriteDenied,
+    /// The store rejected the credentials themselves.
+    BadCredentials,
     /// Unrecognised. Rendered verbatim.
     Other,
 }
@@ -144,6 +152,39 @@ impl ResticFailure {
                  else is using it, `apprafter backup unlock` clears it — that command is \
                  built to work without a cluster, for exactly this situation.",
             ),
+            Self::HalfInitialised => Some(
+                "The location holds restic key files but no repository config — what an \
+                 `init` leaves behind when it dies between writing the master key and \
+                 writing the config. restic will not init over those keys, so every retry \
+                 fails the same way until they are gone. Two ways out: delete the `keys/` \
+                 prefix under the repository path and re-run (an interrupted init has \
+                 nothing else worth keeping), or leave it alone and point `--prefix` at a \
+                 fresh path inside the same bucket. One caveat: if the location also holds \
+                 `data/` and `snapshots/`, this is not an interrupted init but a real \
+                 repository that lost its config — deleting the keys will not bring it \
+                 back, and the snapshots are unreadable without that config.",
+            ),
+            Self::WriteDenied => Some(
+                "The store answered and refused the write. The credentials were accepted, \
+                 so this is a permission problem rather than a wrong key or a wrong \
+                 passphrase: restic needs read, write AND delete on the whole repository \
+                 prefix — it creates `config`, `keys/`, `data/`, `index/` and `snapshots/`, \
+                 and removes them again on prune. Check what the access key is granted and \
+                 whether a bucket policy narrows it, then re-run. When the refusal names \
+                 `config` in particular, the store may be taking writes under a path while \
+                 refusing them at the root of the bucket — `--prefix <path>` puts the whole \
+                 repository one level down, which is a fine permanent arrangement and the \
+                 usual way to keep several clusters in one bucket.",
+            ),
+            Self::BadCredentials => Some(
+                "The store rejected the credentials themselves — an unknown access key or a \
+                 signature that did not match — so nothing was read or written. Check \
+                 `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` in the credential file: the \
+                 values are passed through exactly as written, so surrounding quotes or a \
+                 trailing space become part of the secret. A signature mismatch with a key \
+                 you know is good usually means the endpoint and the key belong to \
+                 different regions.",
+            ),
             Self::Other => None,
         }
     }
@@ -161,6 +202,22 @@ pub fn classify_restic(stderr: &str) -> ResticFailure {
     }
     if s.contains("repository is already locked") || s.contains("unable to create lock") {
         return ResticFailure::Locked;
+    }
+    // Before the missing-repository family on purpose: the three below all
+    // travel inside sentences that also say "does not exist" or "unable to
+    // open config file", and each has a remedy the generic one would hide.
+    if s.contains("already contains keys") {
+        return ResticFailure::HalfInitialised;
+    }
+    if s.contains("invalidaccesskeyid")
+        || s.contains("signaturedoesnotmatch")
+        || s.contains("access key id you provided does not exist")
+        || s.contains("request signature we calculated does not match")
+    {
+        return ResticFailure::BadCredentials;
+    }
+    if s.contains("access denied") || s.contains("accessdenied") {
+        return ResticFailure::WriteDenied;
     }
     if s.contains("unable to open config file")
         || s.contains("no such file or directory")
@@ -248,6 +305,90 @@ mod tests {
     }
 
     #[test]
+    fn an_init_that_died_after_writing_its_key_is_not_a_missing_repository() {
+        // The shape a failed `backup enable` leaves behind: `init` wrote
+        // `keys/<id>`, died before `config`, and every retry from then on
+        // is refused by restic itself. Classifying it as RepoMissing sends
+        // the reader to check their endpoint and credentials, which are
+        // fine — the bucket is wedged, and nothing but deleting those keys
+        // (or moving to a fresh prefix) unwedges it.
+        assert_eq!(
+            classify_restic(
+                "Fatal: create key in repository at s3:https://nbg1.your-objectstorage.com/b \
+                 failed: repository already contains keys"
+            ),
+            ResticFailure::HalfInitialised
+        );
+    }
+
+    #[test]
+    fn the_half_initialised_hint_offers_both_ways_out() {
+        let hint = ResticFailure::HalfInitialised
+            .hint()
+            .expect("a wedged location has a remedy");
+        assert!(hint.contains("keys/"), "names what to delete: {hint}");
+        assert!(
+            hint.contains("--prefix"),
+            "names the no-delete way out: {hint}"
+        );
+    }
+
+    #[test]
+    fn a_refused_write_is_not_a_refused_credential() {
+        // Hetzner Object Storage, real capture: the access key reads and
+        // lists fine — `init` got as far as PutObject and was refused. The
+        // remedy is a grant on the bucket, and saying "bad credentials"
+        // here sends the reader to rotate a key that is not the problem.
+        assert_eq!(
+            classify_restic(
+                "Save(<config/0000000000>) failed: client.PutObject: Access Denied.\n\
+                 Fatal: create key in repository at s3:https://h/b failed: \
+                 client.PutObject: Access Denied."
+            ),
+            ResticFailure::WriteDenied
+        );
+    }
+
+    #[test]
+    fn the_write_denied_hint_offers_the_prefix_that_actually_unblocked_one() {
+        // A bucket that refuses `config` at its root and accepts the same
+        // repository one path down is not hypothetical — that is what the
+        // report this variant came from turned out to be, and `--prefix`
+        // was what fixed it. A hint that only says "check your grants"
+        // withholds the move that works.
+        let hint = ResticFailure::WriteDenied
+            .hint()
+            .expect("a refused write has a remedy");
+        assert!(hint.contains("--prefix"), "offers the way around: {hint}");
+    }
+
+    // Whether a refused `init` left a key file behind is NOT asserted
+    // here. This hint is static, so it could only ever say "may have";
+    // the caller reads the object name out of restic's own stderr and
+    // states it as fact instead (`init_leftover_note`, tested against
+    // both captures in `platform-cli`). Two texts saying the same thing
+    // one confidence apart is how a help block stops being read.
+
+    #[test]
+    fn a_rejected_key_is_told_apart_from_a_refused_write() {
+        // The one case where "bad credentials" is the true answer.
+        assert_eq!(
+            classify_restic(
+                "Fatal: unable to open config file: The Access Key Id you provided does not \
+                 exist in our records.: InvalidAccessKeyId"
+            ),
+            ResticFailure::BadCredentials
+        );
+        assert_eq!(
+            classify_restic(
+                "Fatal: Save(<lock/x>) failed: The request signature we calculated does not \
+                 match the signature you provided.: SignatureDoesNotMatch"
+            ),
+            ResticFailure::BadCredentials
+        );
+    }
+
+    #[test]
     fn the_lock_hint_names_the_command_built_for_it() {
         let hint = ResticFailure::Locked.hint().expect("locked has a remedy");
         assert!(hint.contains("backup unlock"), "{hint}");
@@ -285,6 +426,9 @@ mod tests {
             ResticFailure::WrongPassphrase,
             ResticFailure::RepoMissing,
             ResticFailure::Locked,
+            ResticFailure::HalfInitialised,
+            ResticFailure::WriteDenied,
+            ResticFailure::BadCredentials,
         ] {
             assert!(r.hint().is_some_and(|h| h.len() > 60), "{r:?}");
         }

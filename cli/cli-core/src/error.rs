@@ -122,6 +122,29 @@ pub enum CliError {
         hint: String,
     },
 
+    /// `backup enable`'s repository probe failed: neither `restic cat
+    /// config` (open an existing repo) nor `restic init` (create one)
+    /// succeeded.
+    ///
+    /// Both stderrs are carried because they answer different questions
+    /// — whether a repository is there, and what stopped one from being
+    /// made — and `hint` classifies whichever of the two holds the
+    /// diagnosis. The catch-all this replaced announced "unreachable /
+    /// bad credentials" for every outcome, including the two that recur
+    /// most: a bucket wedged by a previous failed `enable`, and a key
+    /// that may read but not write.
+    #[error(
+        "backup repo '{repo}' could not be opened or created — `restic cat config` and \
+         `restic init` both failed.\n  cat config stderr: {cat_stderr}\n  init stderr: {init_stderr}"
+    )]
+    #[diagnostic(code(apprafter::backup::repo_probe_failed), help("{hint}"))]
+    BackupRepoProbe {
+        repo: String,
+        cat_stderr: String,
+        init_stderr: String,
+        hint: String,
+    },
+
     /// A `kubectl` invocation failed, classified.
     ///
     /// Same shape as [`CliError::Restic`]: `hint` is derived from

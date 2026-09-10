@@ -63,6 +63,7 @@ use backup_core::prune::{run_prune, RetentionPolicy};
 use backup_core::restic::{restic_check_argv, restic_unlock_argv};
 use backup_core::{KubeExec, ResticRunner, StagingMode, SubprocessRestic};
 use base64::Engine as _;
+use cli_core::diagnose::{classify_restic, ResticFailure};
 use cli_core::tools::{preflight_tools, KUBECTL, RESTIC};
 use cli_core::{CliError, Result};
 use cli_providers::backup::extract::run_extraction;
@@ -2887,12 +2888,91 @@ fn preflight_repo_reachable(bucket: &str, creds: &BTreeMap<String, String>) -> R
 /// obstacle (bad key, no such bucket, permission denied) — and dropping either
 /// leaves the operator guessing which of the two problems they have.
 fn repo_unreachable_error(bucket: &str, cat_stderr: &[u8], init_stderr: &[u8]) -> CliError {
-    CliError::Other(format!(
-        "backup repo '{bucket}' unreachable / bad credentials — neither `restic cat config` nor \
-         `restic init` succeeded.\n  cat config stderr: {}\n  init stderr: {}",
-        String::from_utf8_lossy(cat_stderr).trim(),
-        String::from_utf8_lossy(init_stderr).trim(),
-    ))
+    let cat = String::from_utf8_lossy(cat_stderr).trim().to_string();
+    let init = String::from_utf8_lossy(init_stderr).trim().to_string();
+    let hint = repo_probe_hint(&cat, &init);
+    CliError::BackupRepoProbe {
+        repo: bucket.to_string(),
+        cat_stderr: cat,
+        init_stderr: init,
+        hint,
+    }
+}
+
+/// Fallback guidance when neither stderr matches a known shape. Never the
+/// catch-all's "the message above is the only context": a probe that fails
+/// has a fixed, short list of things it can be, and naming them beats
+/// handing back two lines of restic and wishing the reader luck.
+const REPO_PROBE_GENERIC_HINT: &str =
+    "Neither restic call recognised its own failure, so both stderrs above are the evidence. \
+     The probe touches four things and nothing else: the endpoint (`--endpoint`), the bucket \
+     name (`--bucket`), the S3 key pair, and the passphrase — all read from the credential \
+     file. Reproduce it outside the CLI to narrow it down: `restic -r <repo> cat config` with \
+     `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `RESTIC_PASSWORD` exported does exactly \
+     what `enable` just did.";
+
+/// Pick the remedy for a failed repo probe.
+///
+/// Which stderr holds the diagnosis depends on the failure. Normally it is
+/// `init`'s — `cat config` only ever reports that no repository is there,
+/// which is the premise for trying `init` rather than a finding. The
+/// exception is a wrong passphrase: there the config exists and opens for
+/// nobody, `cat config` says so, and `init` can only answer "already
+/// initialized" — classifying on `init` would report an intact repository
+/// as a broken one, so the passphrase reading wins.
+fn repo_probe_hint(cat_stderr: &str, init_stderr: &str) -> String {
+    if classify_restic(cat_stderr) == ResticFailure::WrongPassphrase {
+        return ResticFailure::WrongPassphrase
+            .hint()
+            .unwrap_or(REPO_PROBE_GENERIC_HINT)
+            .to_string();
+    }
+    let mut hint = classify_restic(init_stderr)
+        .hint()
+        .unwrap_or(REPO_PROBE_GENERIC_HINT)
+        .to_string();
+    if let Some(note) = init_leftover_note(init_stderr) {
+        hint.push_str("\n\n");
+        hint.push_str(note);
+    }
+    hint
+}
+
+/// Whether the failed `init` left a key file in the repository, read off
+/// the object it was saving when it gave up.
+///
+/// restic writes the master key first and the config second, and its
+/// stderr names the handle: `Save(<key/…>)` failed on the very first
+/// object it writes, so the location is untouched; `Save(<config/…>)`
+/// failed after the key was already stored, so a key file is sitting
+/// there now — and that key is what makes the *next* `enable` fail with
+/// "repository already contains keys" instead of the real obstacle.
+///
+/// Reading the object out of the stderr is deliberate. The alternative
+/// — running `init` a second time and taking "already contains keys" as
+/// proof — costs another round trip and is not free of consequences: an
+/// init that failed transiently *before* writing its key can succeed at
+/// writing one on the retry, so the probe would sometimes create the
+/// very leftover it set out to detect. `None` when the stderr names no
+/// object, because then there is nothing to conclude.
+fn init_leftover_note(init_stderr: &str) -> Option<&'static str> {
+    let s = init_stderr.to_lowercase();
+    if s.contains("save(<config/") {
+        Some(
+            "This run left a key file behind. restic reported the failure while saving \
+             `config`, which it writes after the master key, so the key is already stored. \
+             Delete the `keys/` prefix under the repository path before retrying — otherwise \
+             the next run reports 'repository already contains keys' and hides the problem \
+             above.",
+        )
+    } else if s.contains("save(<key/") {
+        Some(
+            "Nothing was left behind: the failure came while saving the master key itself, \
+             which is the first object restic writes, so the location is as it was.",
+        )
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5379,6 +5459,180 @@ mod tests {
         assert!(msg.contains("s3:https://h/b"), "{msg}");
         assert!(msg.contains("repository does not exist"), "{msg}");
         assert!(msg.contains("Access Denied"), "{msg}");
+    }
+
+    /// The diagnostic help attached to an error, or a marker when it has none.
+    fn help_of(err: &CliError) -> String {
+        use miette::Diagnostic;
+        err.help()
+            .map(|h| format!("{h}"))
+            .unwrap_or_else(|| "<no help>".to_string())
+    }
+
+    /// The diagnostic code attached to an error.
+    fn code_of(err: &CliError) -> String {
+        use miette::Diagnostic;
+        err.code()
+            .map(|c| format!("{c}"))
+            .unwrap_or_else(|| "<no code>".to_string())
+    }
+
+    #[test]
+    fn a_failure_saving_config_reports_the_key_the_run_left_behind() {
+        // Verbatim from the report. restic names the object it was
+        // saving, and `config` is written AFTER the master key — so this
+        // stderr is proof that a key file is now sitting in the bucket,
+        // which is what wedges the next attempt. The CLI knows this
+        // without asking the store anything.
+        let e = repo_unreachable_error(
+            "s3:https://h/b",
+            b"Fatal: repository does not exist: unable to open config file: Stat: \
+              The specified key does not exist.\n",
+            b"Save(<config/0000000000>) failed: client.PutObject: Access Denied.\n\
+              Fatal: create key in repository at s3:https://h/b failed: \
+              client.PutObject: Access Denied.\n",
+        );
+        let help = help_of(&e);
+        assert!(
+            help.contains("left a key file behind"),
+            "states the leftover as fact: {help}"
+        );
+    }
+
+    #[test]
+    fn a_failure_saving_the_key_itself_says_nothing_was_left() {
+        // Captured from a real `restic 0.18.1 init` against a repository
+        // whose key directory refused the write: the run failed on the
+        // FIRST object it writes, and the location is untouched. Telling
+        // the reader to go delete keys here would send them hunting for
+        // something that is not there.
+        let e = repo_unreachable_error(
+            "/repo",
+            b"Fatal: unable to open config file: <config/> does not exist\n",
+            b"Save(<key/d82a996d80>) failed: open /repo/keys/d82a996d80-tmp-2303320433: \
+              permission denied\nFatal: create key in repository at /repo failed: \
+              open /repo/keys/d82a996d80-tmp-2303320433: permission denied\n",
+        );
+        let help = help_of(&e);
+        assert!(
+            help.contains("Nothing was left behind"),
+            "rules the leftover out: {help}"
+        );
+    }
+
+    #[test]
+    fn a_stderr_that_names_no_object_claims_nothing_either_way() {
+        // The conservative default. "already contains keys" says which
+        // check refused, not which object was being written, so there is
+        // nothing to conclude about what this run did or did not leave.
+        let e = repo_unreachable_error(
+            "s3:https://h/b",
+            b"Fatal: repository does not exist\n",
+            b"Fatal: create key in repository at s3:https://h/b failed: repository \
+              already contains keys\n",
+        );
+        let help = help_of(&e);
+        assert!(!help.contains("left a key file behind"), "{help}");
+        assert!(!help.contains("Nothing was left behind"), "{help}");
+    }
+
+    #[test]
+    fn the_probe_failure_is_typed_rather_than_the_catch_all() {
+        // Verbatim from an operator's terminal. The catch-all's own help
+        // asks for exactly this promotion when a wording recurs, and this
+        // one recurs by construction: a failed `enable` wedges the bucket
+        // so that every following `enable` fails too.
+        let e = repo_unreachable_error(
+            "s3:https://nbg1.your-objectstorage.com/apprafter",
+            b"Fatal: repository does not exist: unable to open config file: Stat: \
+              The specified key does not exist.\n",
+            b"Fatal: create key in repository at s3:https://nbg1.your-objectstorage.com/\
+              apprafter failed: repository already contains keys\n",
+        );
+        assert_eq!(code_of(&e), "apprafter::backup::repo_probe_failed");
+    }
+
+    #[test]
+    fn a_wedged_repo_names_the_leftover_keys_instead_of_the_credentials() {
+        let e = repo_unreachable_error(
+            "s3:https://nbg1.your-objectstorage.com/apprafter",
+            b"Fatal: repository does not exist: unable to open config file: Stat: \
+              The specified key does not exist.\n",
+            b"Fatal: create key in repository at s3:https://nbg1.your-objectstorage.com/\
+              apprafter failed: repository already contains keys\n",
+        );
+        let msg = format!("{e}");
+        // The credentials demonstrably work — restic listed the keys with
+        // them. Saying "bad credentials" here is the CLI guessing wrong.
+        assert!(
+            !msg.contains("bad credentials"),
+            "must not blame working credentials: {msg}"
+        );
+        let help = help_of(&e);
+        assert!(help.contains("keys/"), "names what to clear: {help}");
+        assert!(help.contains("--prefix"), "names the alternative: {help}");
+    }
+
+    #[test]
+    fn a_refused_write_points_at_the_grant_not_the_passphrase() {
+        let e = repo_unreachable_error(
+            "s3:https://nbg1.your-objectstorage.com/apprafter",
+            b"Fatal: repository does not exist: unable to open config file: Stat: \
+              The specified key does not exist.\n",
+            b"Save(<config/0000000000>) failed: client.PutObject: Access Denied.\n\
+              Fatal: create key in repository at s3:https://h/b failed: \
+              client.PutObject: Access Denied.\n",
+        );
+        let help = help_of(&e);
+        assert!(
+            help.contains("permission"),
+            "names the actual obstacle: {help}"
+        );
+        assert!(
+            help.contains("keys/"),
+            "warns that the failed init left one behind: {help}"
+        );
+    }
+
+    #[test]
+    fn a_config_that_will_not_open_is_read_as_a_passphrase_problem() {
+        // The one case where the FIRST stderr carries the diagnosis: the
+        // repository is there and intact, the passphrase is wrong, and
+        // `init` can only ever answer "already initialized" — classifying
+        // on it would report a healthy repository as a broken one.
+        let e = repo_unreachable_error(
+            "s3:https://h/b",
+            b"Fatal: wrong password or no key found\n",
+            b"Fatal: create key in repository at s3:https://h/b failed: repository master \
+              key and config already initialized\n",
+        );
+        let help = help_of(&e);
+        assert!(help.contains("passphrase"), "names the passphrase: {help}");
+        assert!(
+            help.contains("intact"),
+            "says the data is still there: {help}"
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_probe_failure_still_says_what_to_check() {
+        // Conservative classification means most novel failures fall
+        // through — but falling through must not mean falling back to the
+        // catch-all's "the message above is the only context".
+        let e = repo_unreachable_error(
+            "s3:https://h/b",
+            b"Fatal: something entirely new\n",
+            b"Fatal: something entirely new\n",
+        );
+        let help = help_of(&e);
+        assert!(
+            !help.contains("catch-all"),
+            "an unclassified probe is still a probe, not the catch-all: {help}"
+        );
+        assert!(
+            help.contains("restic") && help.len() > 60,
+            "says something actionable: {help}"
+        );
     }
 
     // ------------------------------------------------------------------

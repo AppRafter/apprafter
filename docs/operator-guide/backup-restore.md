@@ -112,6 +112,10 @@ S3_REGION=eu-central-1       # optional — many S3-compatible stores don't need
 # AWS_DEFAULT_REGION    → same as S3_REGION
 ```
 
+Values are taken exactly as written, so surrounding quotes or a trailing space
+become part of the secret — a store that rejects a key you know is good is
+usually reporting one of those.
+
 Required keys: `S3_ACCESS_KEY_ID` (or alias), `S3_SECRET_ACCESS_KEY` (or
 alias), `RESTIC_PASSWORD`. `S3_REGION` is optional. When both the canonical and
 alias form of a key appear, the canonical form wins. The CLI normalises aliases
@@ -151,6 +155,43 @@ stops at the first failure:
 
 Only after all of these pass does `enable` **merge-patch**
 `PlatformStack.spec.backup`.
+
+### When the preflight rejects the repository
+
+Step 3 is the one that fails in the field. The error names the obstacle and
+what to do about it; two of the shapes are worth knowing in advance, because
+the second one causes the first.
+
+**"repository already contains keys."** The location holds restic key files
+but no repository config. `restic init` writes the master key before it writes
+the config, so an init that dies in between leaves exactly this — and restic
+refuses to init over existing keys, so the location is now wedged and every
+later `enable` fails the same way. Two ways out: delete the `keys/` prefix
+under the repository path and re-run, or point `--prefix` at a fresh path
+inside the same bucket and leave the old objects where they are.
+
+One caveat. If the location also holds `data/` and `snapshots/`, this is not
+an interrupted init but a repository that lost its config. Those snapshots
+cannot be read without it, and deleting the keys will not bring them back.
+
+**"Access Denied" on a write.** The store accepted the credentials and refused
+the write, which is a permission problem rather than a wrong key or a wrong
+passphrase. restic needs read, write **and** delete across the whole
+repository prefix: it creates `config`, `keys/`, `data/`, `index/` and
+`snapshots/`, and removes objects again when a backup is pruned. Check what
+the access key is granted and whether a bucket policy narrows it.
+
+The error also says whether that run left a key file behind, and it is not
+guessing: restic names the object it was saving, and `config` is written after
+the master key. A failure on `config` means the key is already stored and has
+to be cleared before retrying; a failure on the key itself means the location
+is untouched.
+
+When the refusal names `config` specifically, the store may be taking writes
+under a path while refusing them at the root of the bucket. `--prefix <path>`
+puts the whole repository one level down and gets past it. That is a fine
+permanent arrangement rather than a workaround — a prefix per cluster is the
+usual way to share one bucket anyway.
 
 > **GitOps advisory.** If `PlatformStack.spec.backup` is git-managed via Argo CD,
 > the next sync will overwrite an imperative patch — set the backup block in
