@@ -605,12 +605,27 @@ pub fn kubectl_apply_server_side(
         .spawn()
         .map_err(|e| CliError::Other(format!("spawn kubectl apply --server-side: {e}")))?;
 
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| CliError::Other("kubectl stdin unavailable".to_string()))?
-        .write_all(manifest_yaml.as_bytes())
-        .map_err(|e| CliError::Other(format!("write manifest to kubectl stdin: {e}")))?;
+    // Held rather than propagated, for the reason spelled out on
+    // `KubectlExec::apply_and_wait_pod_ready` in `backup.rs`: a kubectl that
+    // dies before reading its stdin leaves this write with `EPIPE`, and
+    // returning that jumps straight over the `kubectl_error` formatter below —
+    // discarding the one message that explains the failure in favour of a
+    // broken pipe in the wrong process. It also dropped `child` unreaped,
+    // since `Child::drop` does not wait, leaving a zombie until the CLI exits.
+    //
+    // This path matters more than its sibling: `apply_cr` in `restore.rs`
+    // sends it whole backed-up custom resources, which run to Kubernetes'
+    // 1 MiB object limit. Anything over the 64 KiB pipe buffer makes the write
+    // BLOCK for a reader that is not coming, so on the restore path a dead
+    // kubectl produces the pipe error every time rather than only under load.
+    let write_result = {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| CliError::Other("kubectl stdin unavailable".to_string()))?;
+        stdin.write_all(manifest_yaml.as_bytes())
+        // `stdin` drops here, closing the pipe: kubectl needs that EOF.
+    };
 
     let out = child
         .wait_with_output()
@@ -624,6 +639,10 @@ pub fn kubectl_apply_server_side(
             &stderr,
         ));
     }
+    // Reported even though kubectl exited 0: exit 0 is its claim about what it
+    // did with its input, not evidence the manifest arrived, and a manifest
+    // that was never delivered must not read as applied.
+    write_result.map_err(|e| CliError::Other(format!("write manifest to kubectl stdin: {e}")))?;
     Ok(())
 }
 

@@ -1074,15 +1074,29 @@ impl KubeExec for KubectlExec {
             .spawn()
             .map_err(|e| CliError::Other(format!("spawn kubectl apply: {e}")))?;
 
-        {
+        // The write result is held rather than propagated here, and the order
+        // that follows is the point. A child that dies before reading its
+        // stdin gives the parent `EPIPE`, and returning that immediately
+        // swallows the only useful thing on the failure path: kubectl's own
+        // complaint, already sitting on its stderr. "write pod spec to kubectl
+        // apply: Broken pipe (os error 32)", handed to someone whose actual
+        // problem is an unreadable kubeconfig or a denied RBAC rule, names the
+        // wrong process and tells them nothing.
+        //
+        // So the child is reaped first and its status is answered first. The
+        // pipe error is still reported when the child exited 0 — exit 0 is the
+        // tool's claim about what it did with its input, not evidence that the
+        // input arrived, and an undelivered manifest must never read as
+        // applied.
+        let write_result = {
             let mut stdin = apply_child
                 .stdin
                 .take()
                 .ok_or_else(|| CliError::Other("kubectl apply has no stdin".into()))?;
-            stdin
-                .write_all(&json_bytes)
-                .map_err(|e| CliError::Other(format!("write pod spec to kubectl apply: {e}")))?;
-        }
+            stdin.write_all(&json_bytes)
+            // `stdin` drops here, closing the pipe — the child needs that EOF
+            // to finish, so it must happen before the `wait()` below.
+        };
 
         let apply_stderr = apply_child
             .stderr
@@ -1099,6 +1113,8 @@ impl KubeExec for KubectlExec {
                 &apply_stderr_buf,
             ));
         }
+        write_result
+            .map_err(|e| CliError::Other(format!("write pod spec to kubectl apply: {e}")))?;
 
         let wait_status = Command::new(&self.kubectl_bin)
             .args([
@@ -5537,7 +5553,18 @@ mod tests {
         let spec = json!({"metadata": {"name": "helper", "namespace": "prod"}});
 
         // apply succeeds, wait fails → the message must be about readiness.
-        let waits = stub_kubectl(&dir, "if [ \"$1\" = wait ]; then exit 1; fi\nexit 0");
+        // The apply branch DRAINS stdin, because the real `kubectl apply -f -`
+        // does and a stub that exits without reading is a different scenario
+        // from the one this test names. It is also a race: the parent writes
+        // the spec right after `spawn`, and if the stub has already exited the
+        // write gets `EPIPE` and the assertion below sees "Broken pipe"
+        // instead of the readiness message. That is what turned this test red
+        // on a loaded CI runner (2026-09-10) after passing since it landed —
+        // 500 local runs, including pinned to one CPU, never reproduced it.
+        let waits = stub_kubectl(
+            &dir,
+            "if [ \"$1\" = wait ]; then exit 1; fi\ncat >/dev/null\nexit 0",
+        );
         let err = waits.apply_and_wait_pod_ready(&spec).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("did not reach Ready within 300s"), "{msg}");
@@ -5553,6 +5580,53 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("apply_and_wait_pod_ready(apply)"), "{msg}");
         assert!(msg.contains("pods is forbidden"), "{msg}");
+    }
+
+    #[test]
+    fn a_kubectl_that_dies_before_reading_the_spec_reports_its_own_complaint() {
+        // The failure this guards is a diagnosis being replaced by a symptom.
+        // kubectl that exits before touching stdin — an unreadable kubeconfig,
+        // a denied RBAC rule, a bad flag — leaves the parent's `write_all`
+        // with `EPIPE`. Returning that surfaces "Broken pipe (os error 32)"
+        // and drops the one message that says what actually went wrong, which
+        // is already sitting on the child's stderr. The write result is
+        // therefore held until the child has been reaped.
+        // The padding is what makes the pipe break at all, and without it this
+        // test passes against the defect it exists to catch: a small spec fits
+        // entirely in the pipe buffer, so the parent's `write_all` returns
+        // before the child's exit can be noticed and there is no `EPIPE` to
+        // mishandle. Over the buffer (64 KiB on Linux) the write must block
+        // for a reader that is never coming, and the child's exit delivers
+        // `EPIPE` every time. Verified by reverting the fix: with the small
+        // spec the test still passed, with this one it fails.
+        let dir = tempfile::tempdir().unwrap();
+        let spec = json!({
+            "metadata": {"name": "helper", "namespace": "prod",
+                         "annotations": {"pad": "x".repeat(256 * 1024)}}
+        });
+        let dies = stub_kubectl(
+            &dir,
+            "if [ \"$1\" = apply ]; then echo 'error: Unauthorized' >&2; exit 1; fi\nexit 0",
+        );
+        let msg = format!("{}", dies.apply_and_wait_pod_ready(&spec).unwrap_err());
+        assert!(msg.contains("Unauthorized"), "{msg}");
+        assert!(!msg.contains("Broken pipe"), "{msg}");
+
+        // The other half of the same decision, and the reason the write
+        // result is checked AFTER the status rather than discarded: a child
+        // that exits 0 without consuming the spec still failed us. Exit 0 is
+        // the tool's claim about what it did with its input, and it is not
+        // evidence that the input arrived — so an undelivered manifest is
+        // reported, never quietly treated as applied.
+        //
+        // Padded for the same reason as above, and this half pins the decision
+        // rather than guarding a regression: the old shape reported the pipe
+        // error here too, so it passes either way.
+        let dir2 = tempfile::tempdir().unwrap();
+        let quiet = stub_kubectl(&dir2, "exit 0");
+        let msg = format!("{}", quiet.apply_and_wait_pod_ready(&spec).unwrap_err());
+        assert!(msg.contains("write pod spec to kubectl apply"), "{msg}");
+        assert!(msg.contains("Broken pipe"), "{msg}");
     }
 
     #[test]

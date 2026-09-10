@@ -9,6 +9,59 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.63 — a broken pipe was hiding kubectl's diagnosis (unreleased)
+
+Found by a CI flake and swept from there. Three sites wrote a payload
+into a child process's stdin and propagated the write error immediately,
+before reaping the child.
+
+### Fixed
+
+- **A dead `kubectl` was reported as a broken pipe in the parent.** When a
+  child exits before reading its stdin — an unreadable kubeconfig, a
+  denied RBAC rule, a bad flag — the parent's `write_all` gets `EPIPE`.
+  Returning that at once skips the code that reaps the child and reads its
+  stderr, so the message that explains the failure is collected and then
+  thrown away. What reached the operator was `Broken pipe (os error 32)`,
+  naming the wrong process.
+
+  All three now hold the write result, reap the child, and answer its
+  status first: `KubectlExec::apply_and_wait_pod_ready` and
+  `kubectl_apply_server_side` (`platform-cli`), and
+  `KubeRsExec::exec_stream_from_file` (`apprafter-backup`), whose
+  transport is a websocket rather than a pipe but whose structure is
+  identical.
+
+  The pipe error is still reported when the child exits **0**. Exit 0 is
+  the tool's claim about what it did with its input, not evidence the
+  input arrived, and a manifest or dump that was never delivered must not
+  read as applied.
+
+  **Two of the three are on the restore path, where it is not a rare
+  race.** A payload under the 64 KiB pipe buffer usually completes before
+  the child's exit can be noticed, which is why this stayed invisible;
+  `apply_cr` sends whole backed-up custom resources (Kubernetes objects
+  run to the 1 MiB limit) and `exec_stream_from_file` streams `pg_dump`
+  output and tar archives. Over the buffer the write must block for a
+  reader that is not coming, so there the wrong diagnosis was the only
+  possible outcome.
+
+  `kubectl_apply_server_side` also dropped its child unreaped —
+  `Child::drop` does not wait — leaking a zombie per occurrence.
+
+### Testing
+
+- The regression guard pads its spec past the pipe buffer on purpose.
+  Written first with a small spec, it passed against the un-fixed code;
+  only the padded version fails, which is the same reason the original
+  defect survived review.
+- The flaky test that surfaced this (`a_pod_that_never_becomes_ready_…`)
+  had a stub that exited without draining stdin, unlike the real
+  `kubectl apply -f -` and unlike its own sibling stub. It drains now, so
+  the test exercises the readiness path it names rather than a race. It
+  had passed since landing on 2026-09-03 and never reproduced locally in
+  500 runs, including pinned to a single CPU.
+
 ## cli v0.2.62 — four defects a live run found in `apprafter status` (2.23h, unreleased)
 
 The roll-up shipped in v0.2.60 was run against a real cluster for the

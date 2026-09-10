@@ -390,20 +390,42 @@ impl KubeExec for KubeRsExec {
 
             // Feed the input file's bytes into the process stdin, then close it
             // (EOF) so the remote command sees end-of-input.
-            tokio::io::copy(&mut file, &mut proc_stdin)
-                .await
-                .map_err(|e| {
-                    CliError::Other(format!(
-                        "exec_stream_from_file: copy {} to command stdin: {e}",
-                        input.display()
-                    ))
-                })?;
-            proc_stdin.shutdown().await.map_err(|e| {
-                CliError::Other(format!("exec_stream_from_file: close command stdin: {e}"))
-            })?;
+            //
+            // Neither result is propagated here, for the reason spelled out on
+            // `KubectlExec::apply_and_wait_pod_ready` in platform-cli's
+            // `backup.rs`. `check_exec_status` below is what reads the remote
+            // command's exit status AND its stderr channel; returning early
+            // skips it and reports a transport error instead of the command's
+            // own explanation. The transport is a websocket rather than an OS
+            // pipe, so there is no literal SIGPIPE — the apiserver closes the
+            // stdin channel when the remote command exits, and the write comes
+            // back `BrokenPipe`/`ConnectionReset`. The structure is identical.
+            //
+            // And unlike a pipe, size makes it certain rather than rare: the
+            // callers here stream a `pg_dump` file into `psql` and a tar
+            // archive into `tar` (`restore.rs`), megabytes at least. A `psql`
+            // that exits on a bad password used to surface as "copy … to
+            // command stdin: Broken pipe" with psql's actual complaint thrown
+            // away, on the restore path, where a wrong diagnosis costs most.
+            let copy_result = tokio::io::copy(&mut file, &mut proc_stdin).await;
+            let shutdown_result = proc_stdin.shutdown().await;
             drop(proc_stdin);
 
-            check_exec_status(&mut attached, "exec_stream_from_file", argv, ns, pod).await
+            check_exec_status(&mut attached, "exec_stream_from_file", argv, ns, pod).await?;
+
+            // The command claimed success. That is its claim about what it did
+            // with its input, not evidence the input arrived — a dump that was
+            // never fully delivered must never read as a completed restore.
+            copy_result.map_err(|e| {
+                CliError::Other(format!(
+                    "exec_stream_from_file: copy {} to command stdin: {e}",
+                    input.display()
+                ))
+            })?;
+            shutdown_result.map_err(|e| {
+                CliError::Other(format!("exec_stream_from_file: close command stdin: {e}"))
+            })?;
+            Ok(())
         })
     }
 
