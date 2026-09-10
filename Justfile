@@ -33,7 +33,18 @@ lint:
     ./scripts/check-operator-version-bump.sh
     ./scripts/check-cli-version-bump.sh
     ./scripts/check-backup-runner-pin.sh
+    ./scripts/check-argocd-cue-cmp-drift.sh
     ./scripts/check-plan-checkboxes.sh
+    # `docs-check.sh` byte-compares the generated CLI reference against a
+    # fresh render, which cannot see a defect present in BOTH — a doc
+    # comment that hard-wraps inside a token renders identically twice and
+    # passes. `docsgen`'s own tests assert the properties instead, and they
+    # are the only gate that catches that class, so they belong in `lint`
+    # rather than only in the `test` workflow. ~7s from a warm target dir.
+    if [ -f cli/Cargo.toml ]; then
+        echo "==> docsgen property tests (cli)"
+        ( cd cli && cargo test -q -p docsgen --tests )
+    fi
     # cli/ and operator/ are SEPARATE Cargo workspaces (no top-level
     # Cargo.toml), so cargo must run from inside each — matching CI
     # (.github/workflows/lint.yml runs fmt+clippy per workspace). The

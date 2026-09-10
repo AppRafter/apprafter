@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+#
+# check-argocd-cue-cmp-drift.sh — fail if the cue-cmp sidecar image's source
+# changed since its published version, without bumping `version.cue`.
+#
+# ## Why this exists as a script
+#
+# The check itself is not new: `argocd-cue-cmp-check.yml` has run it on every
+# push since 2.12f. It was written as inline shell INSIDE the workflow, which
+# made it the one drift guard in this repo that could not run locally —
+# `check-operator-version-bump.sh`, `check-cli-version-bump.sh`,
+# `check-backup-runner-pin.sh` and `check-platform-stack-version.sh` are all
+# scripts, all wired into `just lint`, all catchable before a push.
+#
+# So it caught a schema change with red CI instead of a red `just lint`, which
+# is a worse place to learn it: the push has already fanned out to the publish
+# workflows by then. Same rule, same pathspec, now runnable in advance. The
+# workflow keeps its own copy of the logic — CI must not depend on a script the
+# branch under test can edit — and this is the local mirror of it.
+#
+# ## What it checks
+#
+# The image COPYs `schemas/v1alpha1/*.cue` (ADR 0046), so a schema edit IS an
+# image change: the entrypoint injects the schema it ships with, and a sidecar
+# built from an older schema silently validates manifests against it.
+#
+# Usage: check-argocd-cue-cmp-drift.sh [remote]   (default: origin)
+
+set -euo pipefail
+
+REMOTE="${1:-origin}"
+SOURCE="argocd-cue-cmp/version.cue"
+
+# The version, without needing `cue` on PATH: the file is a two-line package
+# with one `version: "x.y.z"` field, and `just lint` must work in a fresh
+# checkout with no dev shell.
+version="$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' "$SOURCE" | head -1)"
+if [[ -z "${version:-}" ]]; then
+    echo "::error::could not read the version from $SOURCE" >&2
+    exit 2
+fi
+tag="argocd-cue-cmp/v${version}"
+
+# The files that end up in the image, plus the schemas it bundles.
+# `version.cue` is deliberately NOT here: editing it IS the bump.
+paths=(
+    'argocd-cue-cmp/Dockerfile'
+    'argocd-cue-cmp/plugin.yaml'
+    'argocd-cue-cmp/entrypoint.sh'
+    'schemas/v1alpha1'
+)
+
+if ! git ls-remote --tags --exit-code "$REMOTE" "refs/tags/${tag}" >/dev/null 2>&1; then
+    echo "OK: ${tag} not yet on ${REMOTE} — version.cue bump is in flight."
+    exit 0
+fi
+
+if ! git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
+    git fetch --quiet "$REMOTE" "refs/tags/${tag}:refs/tags/${tag}" 2>/dev/null || {
+        echo "::warning::could not fetch ${tag} for the diff — skipping the check." >&2
+        exit 0
+    }
+fi
+
+if git diff --quiet "${tag}" HEAD -- "${paths[@]}"; then
+    echo "OK: the cue-cmp image source is unchanged since ${tag}."
+    exit 0
+fi
+
+changed="$(git diff --name-only "${tag}" HEAD -- "${paths[@]}" | head -20)"
+cat >&2 <<EOF
+::error::The cue-cmp sidecar's image source changed since ${tag} was published,
+but ${SOURCE} still says ${version}.
+
+The image bundles schemas/v1alpha1 (ADR 0046), so a schema edit is an image
+change: the entrypoint injects the schema it ships with, and a sidecar built
+from the old one validates manifests against a schema this tree no longer has.
+
+Bump ${SOURCE}, or revert the source change. The bump also moves the chart's
+sidecar pin (component_argocd-cue-cmp.cue reads it), so re-render
+platform-stack after bumping.
+
+Changed since ${tag}:
+${changed}
+EOF
+exit 1
