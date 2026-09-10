@@ -118,6 +118,17 @@ pub struct BackupConfig {
     pub time_zone: Option<String>,
     #[serde(default, rename = "checkReadData")]
     pub check_read_data: bool,
+    /// Deep-verify a random subset each weekly check
+    /// (`--read-data-subset`). `None` on a CR written before the field
+    /// existed, which the chart then fills with its own default —
+    /// optional rather than defaulted here so an absent value stays
+    /// distinguishable from an explicit "structure only" (`""`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "checkReadDataSubset"
+    )]
+    pub check_read_data_subset: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

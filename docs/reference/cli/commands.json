@@ -1463,6 +1463,41 @@
     {
       "path": [
         "backup",
+        "set"
+      ],
+      "aliases": [],
+      "about": "Change ONE field of a configured backup, leaving the rest alone. `backup enable` rewrites the whole block, so it cannot be used to adjust a single setting without resetting the others",
+      "long_about": "Change ONE field of a configured backup, leaving the rest alone. `backup enable` rewrites the whole block, so it cannot be used to adjust a single setting without resetting the others.\n\nKeys: at <HH:MM>, check <HH:MM|off>, check-depth <structure|10%|full>, timezone <IANA>, keep-daily/keep-weekly/ keep-monthly <n>, enforce <operator|cluster>, staging-mode <monolithic|sequential>, failure-webhook <url>.",
+      "usage": "Usage: apprafter backup set <KEY> <VALUE>",
+      "hidden": false,
+      "examples": [
+        "apprafter backup set check-depth full",
+        "apprafter backup set at 04:30",
+        "apprafter backup set keep-daily 14"
+      ],
+      "args": [],
+      "positionals": [
+        {
+          "id": "key",
+          "value_name": "KEY",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Field to change (e.g. `check-depth`)"
+        },
+        {
+          "id": "value",
+          "value_name": "VALUE",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "New value (e.g. `10%`)"
+        }
+      ]
+    },
+    {
+      "path": [
+        "backup",
         "status"
       ],
       "aliases": [],

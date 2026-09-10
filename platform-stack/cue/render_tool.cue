@@ -575,7 +575,7 @@ _backupTemplate: """
 	            args:
 	            - >-
 	              restic -r "$APPRAFTER_BACKUP_REPO" unlock;
-	              restic -r "$APPRAFTER_BACKUP_REPO" check{{ if $b.checkReadData }} --read-data{{ end }}
+	              restic -r "$APPRAFTER_BACKUP_REPO" check{{ if $b.checkReadData }} --read-data{{ else if $b.checkReadDataSubset }} --read-data-subset={{ $b.checkReadDataSubset }}{{ end }}
 	            env:
 	            - name: RESTIC_PASSWORD
 	              valueFrom:
@@ -916,6 +916,7 @@ _valuesSchema: {
 				}
 				checkSchedule: {type: "string"}
 				checkReadData: {type: "boolean"}
+				checkReadDataSubset: {type: "string"}
 				failureWebhook: {type: "string"}
 			}
 		}

@@ -119,6 +119,66 @@ mod tests {
     }
 
     #[test]
+    fn an_unset_check_subset_leaves_the_chart_default_alone() {
+        // The values go to Helm as `serde_json::to_value(backup)`, so a
+        // field without `skip_serializing_if` would arrive as `null` —
+        // and `{{ if $b.checkReadDataSubset }}` reads null as false,
+        // silently turning the platform's 10% deep-verify back into a
+        // structure-only check on every cluster that never set it.
+        let mut spec = base_spec();
+        spec.backup = Some(operator_core::platform_stack::BackupConfig {
+            enabled: true,
+            schedule: "@daily".into(),
+            bucket: "s3:https://ep/b".into(),
+            credential_ref: operator_core::platform_stack::CredentialRef {
+                name: "bkcreds".into(),
+            },
+            staging_mode: "monolithic".into(),
+            staging_size_limit: None,
+            retention: None,
+            check_schedule: "@weekly".into(),
+            check_read_data: false,
+            check_read_data_subset: None,
+            time_zone: None,
+            failure_webhook: None,
+        });
+        let desired = build(&spec, "0.2.67");
+        assert!(
+            desired.helm_values["backup"]
+                .get("checkReadDataSubset")
+                .is_none(),
+            "absent must stay absent: {}",
+            desired.helm_values["backup"]
+        );
+    }
+
+    #[test]
+    fn an_explicit_check_subset_reaches_the_chart() {
+        let mut spec = base_spec();
+        spec.backup = Some(operator_core::platform_stack::BackupConfig {
+            enabled: true,
+            schedule: "@daily".into(),
+            bucket: "s3:https://ep/b".into(),
+            credential_ref: operator_core::platform_stack::CredentialRef {
+                name: "bkcreds".into(),
+            },
+            staging_mode: "monolithic".into(),
+            staging_size_limit: None,
+            retention: None,
+            check_schedule: "@weekly".into(),
+            check_read_data: false,
+            check_read_data_subset: Some("25%".into()),
+            time_zone: None,
+            failure_webhook: None,
+        });
+        let desired = build(&spec, "0.2.67");
+        assert_eq!(
+            desired.helm_values["backup"]["checkReadDataSubset"],
+            json!("25%")
+        );
+    }
+
+    #[test]
     fn backup_config_propagates_to_helm_values() {
         let mut spec = base_spec();
         spec.backup = Some(operator_core::platform_stack::BackupConfig {
@@ -133,6 +193,7 @@ mod tests {
             retention: None,
             check_schedule: "@weekly".into(),
             check_read_data: false,
+            check_read_data_subset: None,
             time_zone: Some("Europe/Berlin".into()),
             failure_webhook: None,
         });

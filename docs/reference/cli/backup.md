@@ -24,6 +24,7 @@ Subcommands:
 - [`apprafter backup list`](#apprafter-backup-list) — List snapshots stored in a backup repo.
 - [`apprafter backup prune`](#apprafter-backup-prune) — Remove old snapshots from an S3-backed restic repository according to the configured retention policy.
 - [`apprafter backup run`](#apprafter-backup-run) — Run the cluster's scheduled backup NOW, without waiting for its next window.
+- [`apprafter backup set`](#apprafter-backup-set) — Change ONE field of a configured backup, leaving the rest alone.
 - [`apprafter backup status`](#apprafter-backup-status) — Show the current backup configuration, last Job outcomes, runner status, and last prune time (reads PlatformStack.spec.backup + Jobs + the apprafter-backup-status ConfigMap)
 - [`apprafter backup unlock`](#apprafter-backup-unlock) — Remove STALE locks from an S3-backed restic repository (`restic unlock`; live locks are never touched).
 
@@ -199,6 +200,29 @@ Examples:
 apprafter backup run
 apprafter backup run --no-wait
 apprafter backup run --timeout 120
+```
+
+## `apprafter backup set`
+
+Change ONE field of a configured backup, leaving the rest alone. `backup enable` rewrites the whole block, so it cannot be used to adjust a single setting without resetting the others.
+
+Keys: at &lt;HH:MM>, check &lt;HH:MM|off>, check-depth &lt;structure|10%|full>, timezone &lt;IANA>, keep-daily/keep-weekly/ keep-monthly &lt;n>, enforce &lt;operator|cluster>, staging-mode &lt;monolithic|sequential>, failure-webhook &lt;url>.
+
+```text
+Usage: apprafter backup set <KEY> <VALUE>
+```
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| `<KEY>` | yes | Field to change (e.g. `check-depth`) |
+| `<VALUE>` | yes | New value (e.g. `10%`) |
+
+Examples:
+
+```sh
+apprafter backup set check-depth full
+apprafter backup set at 04:30
+apprafter backup set keep-daily 14
 ```
 
 ## `apprafter backup status`

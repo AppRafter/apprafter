@@ -9,7 +9,31 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
-## platform-stack 0.2.67 — clusters get the runner fix they were told they had (unreleased)
+## platform-stack 0.2.67 / operator v0.2.48 — the runner fix reaches clusters, and the weekly check starts reading data (unreleased)
+
+### Changed
+
+- **The weekly check now deep-verifies 10% of the packs instead of
+  nothing.** `restic check` without `--read-data` verifies that every
+  reference resolves and every index agrees — without reading a byte of
+  the data it certifies, so bit-rot in a pack was invisible to it
+  permanently. A full read every week finds it and bills a
+  repository-sized egress each time against a fault that is rare.
+
+  `--read-data-subset=10%` finds a rotted pack in five weeks on average,
+  covers the repository in ten, and costs a tenth of the bandwidth. New
+  optional field `spec.backup.checkReadDataSubset` (chart default
+  `"10%"`); `checkReadData: true` still means every pack and wins when
+  both are set.
+
+  The extra egress lands on existing clusters without being asked for —
+  roughly 2 GB a week for a 20 GB repository. `apprafter backup set
+  check-depth structure` restores the previous behaviour.
+
+  The field lives in the PlatformStack CRD, so **operator v0.2.48 ships
+  with this chart**. On the older CRD the apiserver would take the
+  merge-patch, answer 200, and prune the field it does not know —
+  `backup set check-depth` reporting success while changing nothing.
 
 ### Fixed
 
@@ -41,6 +65,29 @@ time, all of them the same shape: the CLI knew less about the cluster than
 the cluster did.
 
 ### Added
+
+- **`apprafter backup set <key> <value>` — change one field of a
+  configured backup.** `backup enable` composes `spec.backup` wholesale:
+  every CRD-required field is written on every run, from a flag or from
+  the platform default. That is right for configuring backup and wrong
+  for changing it — an operator re-running `enable` to move the hour also
+  silently resets the verification depth, the retention, and anything set
+  outside the CLI. There was no other way to reach those fields, which is
+  how `checkReadData` ended up unreachable from the CLI entirely.
+
+  `set` writes a JSON merge-patch of one key, so what it changes is what
+  it says. Keys: `at`, `check`, `check-depth`, `timezone`, `keep-daily`,
+  `keep-weekly`, `keep-monthly`, `enforce`, `staging-mode`,
+  `failure-webhook`. The bucket and credential are deliberately absent:
+  pointing an existing schedule at a different repository is a new
+  repository, with its own init and first backup, so it goes through
+  `enable`.
+
+  `check-depth` validates restic's `--read-data-subset` grammar (`10%`,
+  `2.5%`, `1/12`, `500M`) in the CLI rather than leaving it to the Job.
+  The only place restic would report a bad value is inside the weekly
+  run — 06:00 on a Sunday, as a red Job nobody is watching, with the
+  previous depth still in force.
 
 - **`apprafter backup run` — take the scheduled backup now.** Before an
   upgrade, before a risky migration, or to see that a freshly enabled
@@ -103,6 +150,18 @@ the cluster did.
   off the cluster — gained credentials as a third reason, so the
   disaster-recovery path still works and its hint now names
   `--credential-file` alongside `--repo`.
+
+- **`backup status` prints its timestamps in the reader's zone too.**
+  The same screen reported the schedule as `03:00 Europe/Lisbon` and
+  `lastSuccess` as `2026-09-10T22:11:40.897841299+00:00` — one time in
+  the operator's zone, one in UTC to the nanosecond, with nothing saying
+  which was which. `lastSuccess`, `lastFailure` and the prune stamp now
+  render as `2026-09-10 23:11:40 Europe/Lisbon`.
+
+  Job lines gained the time they ran. "Last backup Job: … — Succeeded"
+  answers whether, never when, so last week's success and this morning's
+  read identically — on the one screen an operator opens to find out
+  whether backup is current.
 
 - **The snapshot table shows times in the reader's zone, and lines up.**
   `backup list` printed restic's raw `2026-09-10T22:11:39.771675302Z` for

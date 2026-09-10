@@ -97,8 +97,29 @@ package v1alpha1
 			keepMonthly?: int & >0
 			enforce:      "operator" | "cluster" | *"operator"
 		}
-		checkSchedule:   string | *"0 6 * * 0"
-		checkReadData:   bool | *false
+		checkSchedule: string | *"0 6 * * 0"
+
+		// Deep verify: re-download and re-hash EVERY pack on each weekly
+		// check. Complete, and proportionally expensive — a full repo's
+		// worth of egress every week. Overrides `checkReadDataSubset`
+		// when both are set, so an operator who asks for the whole thing
+		// gets the whole thing.
+		checkReadData: bool | *false
+
+		// Deep verify a RANDOM SUBSET each week: `"10%"`, `"2.5%"`,
+		// `"n/t"` for a fixed part, or a byte size (`"500M"`) — restic's
+		// own `--read-data-subset` grammar.
+		//
+		// The platform default is 10%, which is not a compromise so much
+		// as an admission: a structural check never reads a byte of the
+		// data it certifies, so bit-rot is invisible to it forever, while
+		// a full read every week bills a repository-sized egress for a
+		// problem that is rare. Ten percent finds a rotted pack in five
+		// weeks on average and covers the repository in ten.
+		//
+		// Empty string means "structure only" — the pre-2.67 behaviour.
+		checkReadDataSubset?: string
+
 		failureWebhook?: string
 	}
 

@@ -2038,17 +2038,7 @@ pub fn run_backup_list(
         None => None,
     };
 
-    // The zone NAME is best-effort and cosmetic — it labels the column.
-    // The conversion itself uses `Local`, which applies the OS rules for
-    // each snapshot's own date rather than today's offset, so a listing
-    // that spans a DST change still reads correctly.
-    let zone = resolve_time_zone(
-        None,
-        std::env::var("TZ").ok().as_deref(),
-        iana_time_zone::get_timezone().ok().as_deref(),
-    )
-    .ok()
-    .map(|(z, _)| z);
+    let zone = readers_zone();
 
     match choose_list_repo(repo, local, spec_backup.as_ref()) {
         ListRepo::OffSite(repo_url) => {
@@ -2103,7 +2093,218 @@ fn parse_snapshots_json(json: &str) -> Result<Vec<Value>> {
     Ok(parsed.as_array().cloned().unwrap_or_default())
 }
 
-/// Render one snapshot timestamp in the reader's zone.
+// ---------------------------------------------------------------------------
+// `apprafter backup set` — change ONE field of a configured backup
+//
+// `backup enable` composes `spec.backup` wholesale: every CRD-required field
+// is written on every run, from flags or from the platform default. That is
+// right for configuring backup and wrong for changing it — an operator who
+// re-runs `enable` to move the hour also silently resets the verification
+// depth, the retention, and anything set outside the CLI. `set` writes one
+// key, so what it changes is what it says.
+// ---------------------------------------------------------------------------
+
+/// The settable keys, in the order the error lists them.
+const BACKUP_SET_KEYS: &[&str] = &[
+    "at",
+    "check",
+    "check-depth",
+    "timezone",
+    "keep-daily",
+    "keep-weekly",
+    "keep-monthly",
+    "enforce",
+    "staging-mode",
+    "failure-webhook",
+];
+
+/// Is this a value restic's `--read-data-subset` would accept?
+///
+/// `x%` / `x.y%`, `n/t`, or a byte size with a k/K/m/M/g/G/t/T suffix.
+/// Checked HERE rather than left to restic because the only place restic
+/// would report it is inside the weekly Job — 06:00 on a Sunday, as a red
+/// Job nobody is watching, with the previous depth still in force.
+fn is_read_data_subset(v: &str) -> bool {
+    if let Some(pct) = v.strip_suffix('%') {
+        return !pct.is_empty()
+            && pct.parse::<f64>().is_ok_and(|n| n > 0.0 && n <= 100.0)
+            && !pct.starts_with('-');
+    }
+    if let Some((n, t)) = v.split_once('/') {
+        return matches!((n.parse::<u64>(), t.parse::<u64>()), (Ok(n), Ok(t)) if t > 0 && n >= 1 && n <= t);
+    }
+    let (digits, suffix) = v.split_at(v.len().saturating_sub(1));
+    matches!(suffix, "k" | "K" | "m" | "M" | "g" | "G" | "t" | "T")
+        && !digits.is_empty()
+        && digits.parse::<u64>().is_ok_and(|n| n > 0)
+}
+
+/// Build the merge-patch for `apprafter backup set <key> <value>`. Pure.
+///
+/// Returns the full `{"spec":{"backup":{…}}}` body so the caller can hand it
+/// straight to a JSON merge-patch — which, unlike SSA, leaves every key it
+/// does not mention exactly as it was.
+fn backup_set_patch(key: &str, value: &str) -> Result<Value> {
+    let mut field = serde_json::Map::new();
+    match key {
+        "at" => {
+            let (h, m) = parse_at(value)?;
+            field.insert("schedule".into(), Value::String(compose_daily(h, m)));
+        }
+        "check" => {
+            // Empty is not missing: it is the value that omits the check
+            // CronJob from the render, and the only way to say "no check".
+            if value.eq_ignore_ascii_case("off") {
+                field.insert("checkSchedule".into(), Value::String(String::new()));
+            } else {
+                let (h, m) = parse_at(value).map_err(|e| {
+                    CliError::Other(format!("{e}").replace("--at", "check") + " (or `off`)")
+                })?;
+                field.insert(
+                    "checkSchedule".into(),
+                    Value::String(compose_weekly_sunday(h, m)),
+                );
+            }
+        }
+        "check-depth" => {
+            // Both fields, every time. Writing only the one that changed
+            // would leave the result depending on what was there before.
+            let (full, subset) = match value {
+                "structure" | "off" | "none" => (false, String::new()),
+                "full" | "all" => (true, String::new()),
+                v if is_read_data_subset(v) => (false, v.to_string()),
+                _ => {
+                    return Err(CliError::Other(format!(
+                        "check-depth takes `structure`, `full`, or a subset restic understands \
+                         (`10%`, `2.5%`, `1/12`, `500M`) — got `{value}`.\n  \
+                         structure: metadata only, reads none of the data it certifies.\n  \
+                         a subset:  re-hashes that share of the packs each week (10% covers the \
+                         repository in ten weeks).\n  \
+                         full:      re-hashes everything, every week."
+                    )))
+                }
+            };
+            field.insert("checkReadData".into(), Value::Bool(full));
+            field.insert("checkReadDataSubset".into(), Value::String(subset));
+        }
+        "timezone" => {
+            validate_zone_shape(value)?;
+            field.insert("timeZone".into(), Value::String(value.to_string()));
+        }
+        "keep-daily" | "keep-weekly" | "keep-monthly" => {
+            let n: u32 = value.parse().map_err(|_| {
+                CliError::Other(format!(
+                    "{key} takes a positive whole number — got `{value}`"
+                ))
+            })?;
+            if n == 0 {
+                return Err(CliError::Other(format!(
+                    "{key} must be greater than 0 — a zero would keep nothing at that tier. \
+                     To stop keeping a tier at all, leave it unset."
+                )));
+            }
+            let cr_key = match key {
+                "keep-daily" => "keepDaily",
+                "keep-weekly" => "keepWeekly",
+                _ => "keepMonthly",
+            };
+            let mut retention = serde_json::Map::new();
+            retention.insert(cr_key.into(), Value::from(n));
+            field.insert("retention".into(), Value::Object(retention));
+        }
+        "enforce" => {
+            if !matches!(value, "operator" | "cluster") {
+                return Err(CliError::Other(format!(
+                    "enforce takes `operator` or `cluster` — got `{value}`"
+                )));
+            }
+            let mut retention = serde_json::Map::new();
+            retention.insert("enforce".into(), Value::String(value.to_string()));
+            field.insert("retention".into(), Value::Object(retention));
+        }
+        "staging-mode" => {
+            if !matches!(value, "monolithic" | "sequential") {
+                return Err(CliError::Other(format!(
+                    "staging-mode takes `monolithic` or `sequential` — got `{value}`"
+                )));
+            }
+            field.insert("stagingMode".into(), Value::String(value.to_string()));
+        }
+        "failure-webhook" => {
+            field.insert("failureWebhook".into(), Value::String(value.to_string()));
+        }
+        _ => {
+            return Err(CliError::Other(format!(
+                "unknown key `{key}`. Settable keys: {}.\n  \
+                 The repository and its credential are not among them: pointing an existing \
+                 schedule at a different bucket is a new repository, with its own init and its \
+                 own first backup, so it goes through `apprafter backup enable`.",
+                BACKUP_SET_KEYS.join(", ")
+            )))
+        }
+    }
+    Ok(serde_json::json!({"spec": {"backup": Value::Object(field)}}))
+}
+
+/// `apprafter backup set <key> <value>` — change one field of a configured
+/// backup, leaving every other field exactly as it was.
+///
+/// Refuses when backup has never been configured: a merge-patch into an
+/// absent `spec.backup` would create a half-object the CRD rejects, and the
+/// operator's real next step is `enable`, which composes the whole block.
+pub fn run_backup_set(key: &str, value: &str) -> Result<()> {
+    preflight_tools(&[&KUBECTL], "apprafter backup set")?;
+    let patch = backup_set_patch(key, value)?;
+
+    let kc = ensure_kubeconfig_tempfile()?;
+    let spec_backup = spec_backup_from_cluster(Some(kc.path()))?;
+    if spec_backup.is_none() {
+        return Err(CliError::Other(
+            "backup is not configured on this cluster, so there is no field to change. \
+             `apprafter backup enable --bucket <name> --endpoint <host> --credential-file \
+             <dotenv>` configures it."
+                .into(),
+        ));
+    }
+
+    let body = serde_json::to_string(&patch)
+        .map_err(|e| CliError::Other(format!("serialize spec.backup patch: {e}")))?;
+    kubectl_merge_patch(
+        "platformstack",
+        PLATFORMSTACK_NAME,
+        Some(PLATFORMSTACK_NAMESPACE),
+        None,
+        &body,
+        kc.path(),
+    )?;
+
+    println!("✓ {key} set to {value}.");
+    println!("  {BACKUP_GITOPS_ADVISORY}");
+    println!(
+        "  The change reaches the CronJob on the platform chart's next sync — \
+              `apprafter backup status` shows what the cluster has."
+    );
+    Ok(())
+}
+
+/// The reader's zone NAME, best-effort: `$TZ`, else what the OS reports.
+///
+/// Cosmetic — it labels a time, it does not convert one. The conversion
+/// goes through [`chrono::Local`], which applies the OS rules for each
+/// timestamp's own date; this only answers "what do we call that zone".
+/// `None` when neither source gives an IANA name, which prints an
+/// unlabelled time rather than a wrong label.
+fn readers_zone() -> Option<String> {
+    resolve_time_zone(
+        None,
+        std::env::var("TZ").ok().as_deref(),
+        iana_time_zone::get_timezone().ok().as_deref(),
+    )
+    .ok()
+    .map(|(z, _)| z)
+}
+
+/// Render a stored RFC3339 timestamp in the reader's zone.
 ///
 /// restic writes RFC3339 UTC to the nanosecond. Every other time this CLI
 /// prints — the schedule above all — is in the operator's own zone, and one
@@ -2115,7 +2316,7 @@ fn parse_snapshots_json(json: &str) -> Result<Vec<Value>> {
 /// Generic over the zone so production can pass [`chrono::Local`] — which
 /// applies the OS rules for the snapshot's OWN date, not today's offset —
 /// while tests pass a fixed offset and assert against a constant.
-fn format_snapshot_time<Tz>(raw: &str, tz: &Tz) -> String
+fn format_timestamp<Tz>(raw: &str, tz: &Tz) -> String
 where
     Tz: chrono::TimeZone,
     Tz::Offset: std::fmt::Display,
@@ -2123,6 +2324,25 @@ where
     match chrono::DateTime::parse_from_rfc3339(raw) {
         Ok(t) => t.with_timezone(tz).format("%Y-%m-%d %H:%M:%S").to_string(),
         Err(_) => raw.to_string(),
+    }
+}
+
+/// [`format_timestamp`] plus the zone name, for lines that carry a single
+/// timestamp rather than a column under a header. Matches how the schedule
+/// line already reads ("daily at 03:00 Europe/Lisbon") — one screen should
+/// not report one time with its zone and another without.
+///
+/// A value that does not parse keeps its original text and gains no zone
+/// label: labelling a string whose zone is unknown would be a claim.
+fn format_timestamp_with_zone<Tz>(raw: &str, tz: &Tz, zone_label: Option<&str>) -> String
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    let rendered = format_timestamp(raw, tz);
+    match zone_label {
+        Some(z) if rendered != raw => format!("{rendered} {z}"),
+        _ => rendered,
     }
 }
 
@@ -2164,7 +2384,7 @@ where
             let time = s
                 .pointer("/time")
                 .and_then(Value::as_str)
-                .map(|t| format_snapshot_time(t, tz))
+                .map(|t| format_timestamp(t, tz))
                 .unwrap_or_else(|| "?".to_string());
             let tags = s
                 .pointer("/tags")
@@ -3767,12 +3987,18 @@ fn job_outcome(j: &serde_json::Value) -> &'static str {
 /// Jobs are selected by their `.metadata.name` prefix `apprafter-backup` (both
 /// CronJob-spawned Jobs share that prefix). For each of the two flavours (with
 /// and without `-check`) the most-recent Job (by `.status.startTime`) is shown.
-pub(crate) fn format_backup_status(
+pub(crate) fn format_backup_status<Tz>(
     spec_backup: Option<&serde_json::Value>,
     jobs: &[serde_json::Value],
     status_cm: Option<&serde_json::Value>,
     last_prune: Option<&str>,
-) -> String {
+    tz: &Tz,
+    zone_label: Option<&str>,
+) -> String
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
     let mut out = String::new();
 
     // --- Config block ---
@@ -3853,21 +4079,30 @@ pub(crate) fn format_backup_status(
         .filter(|j| job_metadata_name(j).contains("apprafter-backup-check"))
         .collect();
 
+    // A Job line that says only WHETHER it succeeded leaves the question the
+    // operator opened this screen with — is the backup current? — unanswered:
+    // last week's success and this morning's read identically.
+    let job_line = |j: &serde_json::Value| -> String {
+        let when = job_start_time(j);
+        let outcome = job_outcome(j);
+        if when.is_empty() {
+            format!("{} — {outcome}", job_metadata_name(j))
+        } else {
+            format!(
+                "{} — {outcome} ({})",
+                job_metadata_name(j),
+                format_timestamp_with_zone(when, tz, zone_label)
+            )
+        }
+    };
+
     out.push_str("\nJobs:\n");
     match most_recent_job(&backup_jobs) {
-        Some(j) => out.push_str(&format!(
-            "  Last backup Job: {} — {}\n",
-            job_metadata_name(j),
-            job_outcome(j)
-        )),
+        Some(j) => out.push_str(&format!("  Last backup Job: {}\n", job_line(j))),
         None => out.push_str("  Last backup Job: none\n"),
     }
     match most_recent_job(&check_jobs) {
-        Some(j) => out.push_str(&format!(
-            "  Last check Job:  {} — {}\n",
-            job_metadata_name(j),
-            job_outcome(j)
-        )),
+        Some(j) => out.push_str(&format!("  Last check Job:  {}\n", job_line(j))),
         None => out.push_str("  Last check Job:  none\n"),
     }
 
@@ -3888,12 +4123,18 @@ pub(crate) fn format_backup_status(
         let last_run_format = get_str("lastRunFormat");
 
         if !last_success.is_empty() {
-            out.push_str(&format!("  lastSuccess:    {last_success}\n"));
+            out.push_str(&format!(
+                "  lastSuccess:    {}\n",
+                format_timestamp_with_zone(last_success, tz, zone_label)
+            ));
         } else {
             out.push_str("  lastSuccess:    never\n");
         }
         if !last_failure.is_empty() {
-            out.push_str(&format!("  lastFailure:    {last_failure}\n"));
+            out.push_str(&format!(
+                "  lastFailure:    {}\n",
+                format_timestamp_with_zone(last_failure, tz, zone_label)
+            ));
         }
         if !last_error.is_empty() {
             out.push_str(&format!("  lastError:      {last_error}\n"));
@@ -3908,7 +4149,9 @@ pub(crate) fn format_backup_status(
     // --- Last prune ---
     out.push_str(&format!(
         "\nLast prune: {}\n",
-        last_prune.unwrap_or("never")
+        last_prune
+            .map(|p| format_timestamp_with_zone(p, tz, zone_label))
+            .unwrap_or_else(|| "never".to_string())
     ));
 
     out
@@ -3980,6 +4223,8 @@ pub fn run_backup_status() -> Result<()> {
             &jobs,
             status_cm.as_ref(),
             last_prune.as_deref(),
+            &chrono::Local,
+            readers_zone().as_deref(),
         )
     );
     Ok(())
@@ -4900,16 +5145,174 @@ mod tests {
     // 3a. format_backup_status
     // ------------------------------------------------------------------
 
+    // ------------------------------------------------------------------
+    // `backup set` — change one field of a configured backup
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn set_check_depth_writes_the_three_shapes_of_verification() {
+        // Structure-only, a subset, and the whole repository. The pair of
+        // fields is written TOGETHER every time: leaving the other one at
+        // its previous value would make the result depend on what was
+        // there before, which is exactly the surprise `set` exists to
+        // remove.
+        let structure = backup_set_patch("check-depth", "structure").unwrap();
+        assert_eq!(structure["spec"]["backup"]["checkReadData"], json!(false));
+        assert_eq!(
+            structure["spec"]["backup"]["checkReadDataSubset"],
+            json!("")
+        );
+
+        let subset = backup_set_patch("check-depth", "10%").unwrap();
+        assert_eq!(subset["spec"]["backup"]["checkReadData"], json!(false));
+        assert_eq!(
+            subset["spec"]["backup"]["checkReadDataSubset"],
+            json!("10%")
+        );
+
+        let full = backup_set_patch("check-depth", "full").unwrap();
+        assert_eq!(full["spec"]["backup"]["checkReadData"], json!(true));
+        // Cleared, not left dangling: `--read-data` wins in the chart, so
+        // a stale subset would sit in the CR meaning nothing.
+        assert_eq!(full["spec"]["backup"]["checkReadDataSubset"], json!(""));
+    }
+
+    #[test]
+    fn set_check_depth_takes_restics_own_subset_grammar() {
+        for ok in ["10%", "2.5%", "1/12", "500M", "2G"] {
+            assert!(backup_set_patch("check-depth", ok).is_ok(), "{ok}");
+        }
+        // Not a percentage, not a fraction, not a size — restic would
+        // reject it INSIDE the weekly Job, at 06:00 on a Sunday, where
+        // the failure is a red Job and no operator.
+        for bad in ["10", "%", "some", "10 %", "1/", "-5%"] {
+            let err = backup_set_patch("check-depth", bad)
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains("check-depth"), "names the key: {err}");
+        }
+    }
+
+    #[test]
+    fn set_writes_only_the_field_it_was_given() {
+        // The whole point: `enable` rewrites `spec.backup` wholesale, so
+        // it cannot be used to change one thing — it resets every field
+        // the operator configured elsewhere. A merge-patch of one key
+        // touches one key.
+        let p = backup_set_patch("at", "04:30").unwrap();
+        let backup = p["spec"]["backup"].as_object().unwrap();
+        assert_eq!(backup.len(), 1, "{backup:?}");
+        assert_eq!(backup["schedule"], json!("30 4 * * *"));
+    }
+
+    #[test]
+    fn set_check_off_writes_the_empty_schedule_that_omits_the_cronjob() {
+        let p = backup_set_patch("check", "off").unwrap();
+        assert_eq!(p["spec"]["backup"]["checkSchedule"], json!(""));
+        let at = backup_set_patch("check", "06:00").unwrap();
+        assert_eq!(at["spec"]["backup"]["checkSchedule"], json!("0 6 * * 0"));
+    }
+
+    #[test]
+    fn set_validates_the_values_it_forwards() {
+        assert!(backup_set_patch("keep-daily", "14").is_ok());
+        assert!(backup_set_patch("keep-daily", "-1").is_err());
+        assert!(backup_set_patch("staging-mode", "sequential").is_ok());
+        assert!(backup_set_patch("staging-mode", "whatever").is_err());
+        assert!(backup_set_patch("enforce", "cluster").is_ok());
+        assert!(backup_set_patch("timezone", "Europe/Lisbon").is_ok());
+        assert!(backup_set_patch("timezone", "CET-1CEST,M3.5.0").is_err());
+    }
+
+    #[test]
+    fn an_unknown_key_lists_the_ones_that_exist() {
+        let err = backup_set_patch("bucket", "s3:elsewhere")
+            .expect_err("bucket is not settable this way")
+            .to_string();
+        assert!(err.contains("check-depth"), "enumerates the keys: {err}");
+        // Moving a repository is not a field edit — it is a new
+        // repository, with its own init and its own first backup.
+        assert!(err.contains("backup enable"), "{err}");
+    }
+
+    #[test]
+    fn status_timestamps_are_in_the_readers_zone_and_name_it() {
+        // Live output the operator pasted:
+        //   lastSuccess:    2026-09-10T22:11:40.897841299+00:00
+        // — the schedule two lines above it says "03:00 Europe/Lisbon",
+        // so the same screen reported one time in their zone and another
+        // in UTC, to the nanosecond, with nothing saying which was which.
+        let spec = json!({
+            "enabled": true, "bucket": "s3:x", "schedule": "0 3 * * *",
+            "stagingMode": "monolithic", "timeZone": "Europe/Lisbon"
+        });
+        let cm = json!({"data": {
+            "lastSuccess": "2026-09-10T22:11:40.897841299+00:00",
+            "lastRunFormat": "monolithic"
+        }});
+        let s = format_backup_status(
+            Some(&spec),
+            &[],
+            Some(&cm),
+            Some("2026-09-09T02:30:00Z"),
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
+        assert!(s.contains("2026-09-11 07:11:40 Asia/Tokyo"), "{s}");
+        assert!(!s.contains("897841299"), "{s}");
+        // The prune stamp is the same kind of value and gets the same
+        // treatment — it read as UTC too.
+        assert!(s.contains("2026-09-09 11:30:00 Asia/Tokyo"), "{s}");
+    }
+
+    #[test]
+    fn a_job_line_says_when_it_ran() {
+        // "Last backup Job: … — Succeeded" answers whether, never when,
+        // so a Job from last week and one from ten minutes ago look the
+        // same — on the one screen an operator opens to find out whether
+        // backup is current.
+        let spec = json!({"enabled": true, "bucket": "s3:x", "schedule": "0 3 * * *"});
+        let job = json!({
+            "metadata": {"name": "apprafter-backup-manual-20260910-221128"},
+            "status": {"startTime": "2026-09-10T22:11:28Z", "succeeded": 1}
+        });
+        let s = format_backup_status(
+            Some(&spec),
+            std::slice::from_ref(&job),
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
+        assert!(s.contains("Succeeded"), "{s}");
+        assert!(s.contains("2026-09-11 07:11:28"), "names when it ran: {s}");
+    }
+
+    #[test]
+    fn a_status_timestamp_that_does_not_parse_is_left_alone() {
+        let spec = json!({"enabled": true, "bucket": "s3:x"});
+        let cm = json!({"data": {"lastSuccess": "some day"}});
+        let s = format_backup_status(
+            Some(&spec),
+            &[],
+            Some(&cm),
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
+        assert!(s.contains("some day"), "{s}");
+    }
+
     #[test]
     fn status_disabled_when_no_spec_backup() {
-        let s = format_backup_status(None, &[], None, None);
+        let s = format_backup_status(None, &[], None, None, &tokyo(), Some("Asia/Tokyo"));
         assert!(s.to_lowercase().contains("disabled"));
     }
 
     #[test]
     fn status_disabled_when_enabled_false() {
         let spec = json!({"enabled": false, "bucket": "s3:x"});
-        let s = format_backup_status(Some(&spec), &[], None, None);
+        let s = format_backup_status(Some(&spec), &[], None, None, &tokyo(), Some("Asia/Tokyo"));
         assert!(s.to_lowercase().contains("disabled"));
         // Config is retained and shown even when disabled.
         assert!(s.contains("s3:x"));
@@ -4918,9 +5321,17 @@ mod tests {
     #[test]
     fn status_renders_enabled_config_and_last_prune() {
         let spec = json!({"enabled": true, "bucket": "s3:x", "schedule": "0 3 * * *", "stagingMode": "monolithic"});
-        let s = format_backup_status(Some(&spec), &[], None, Some("2026-07-17T03:00:00Z"));
+        let s = format_backup_status(
+            Some(&spec),
+            &[],
+            None,
+            Some("2026-07-17T03:00:00Z"),
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
         assert!(s.contains("s3:x"));
-        assert!(s.contains("2026-07-17T03:00:00Z"));
+        // +09:00 of 03:00Z is noon, and the zone is named.
+        assert!(s.contains("2026-07-17 12:00:00 Asia/Tokyo"), "{s}");
         // 2.22g: rendered as a TIME now, not a cron expression.
         assert!(s.contains("daily at 03:00"), "{s}");
         assert!(s.contains("monolithic"));
@@ -4933,7 +5344,7 @@ mod tests {
             "schedule": "30 22 * * *", "checkSchedule": "30 1 * * 0",
             "timeZone": "Europe/Berlin"
         });
-        let s = format_backup_status(Some(&spec), &[], None, None);
+        let s = format_backup_status(Some(&spec), &[], None, None, &tokyo(), Some("Asia/Tokyo"));
         assert!(s.contains("daily at 22:30 Europe/Berlin"), "{s}");
         assert!(s.contains("Sundays at 01:30 Europe/Berlin"), "{s}");
     }
@@ -4947,7 +5358,7 @@ mod tests {
             "enabled": true, "bucket": "s3:x", "schedule": "0 3 * * *",
             "checkSchedule": "", "timeZone": "UTC"
         });
-        let s = format_backup_status(Some(&spec), &[], None, None);
+        let s = format_backup_status(Some(&spec), &[], None, None, &tokyo(), Some("Asia/Tokyo"));
         assert!(s.contains("check:         off"), "{s}");
     }
 
@@ -4957,7 +5368,7 @@ mod tests {
         // alone reads as local time; it is actually the
         // kube-controller-manager's zone, which is the trap D2 is about.
         let spec = json!({"enabled": true, "bucket": "s3:x", "schedule": "0 3 * * *"});
-        let s = format_backup_status(Some(&spec), &[], None, None);
+        let s = format_backup_status(Some(&spec), &[], None, None, &tokyo(), Some("Asia/Tokyo"));
         assert!(s.contains("cluster timezone"), "{s}");
         assert!(s.contains("backup enable"), "{s}");
     }
@@ -4970,7 +5381,7 @@ mod tests {
             "enabled": true, "bucket": "s3:x", "schedule": "*/5 * * * *",
             "timeZone": "UTC"
         });
-        let s = format_backup_status(Some(&spec), &[], None, None);
+        let s = format_backup_status(Some(&spec), &[], None, None, &tokyo(), Some("Asia/Tokyo"));
         assert!(s.contains("*/5 * * * * UTC"), "{s}");
     }
 
@@ -4981,7 +5392,14 @@ mod tests {
             "status": {"succeeded": 1}
         });
         let spec = json!({"enabled": true, "bucket": "s3:x"});
-        let s = format_backup_status(Some(&spec), std::slice::from_ref(&job), None, None);
+        let s = format_backup_status(
+            Some(&spec),
+            std::slice::from_ref(&job),
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
         assert!(s.contains("apprafter-backup-28900000"));
         assert!(s.contains("Succeeded"));
     }
@@ -4999,13 +5417,23 @@ mod tests {
             }
         });
         let spec = json!({"enabled": true, "bucket": "s3:x"});
-        let s = format_backup_status(Some(&spec), &[], Some(&cm), None);
+        let s = format_backup_status(
+            Some(&spec),
+            &[],
+            Some(&cm),
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
+        // Rendered in the reader's zone now (+09:00 of 03:00Z is noon),
+        // which is the whole point of the change; what this test guards
+        // is that BOTH keys survive, not their formatting.
         assert!(
-            s.contains("2026-07-17T03:00:00Z"),
+            s.contains("2026-07-17 12:00:00 Asia/Tokyo"),
             "lastSuccess not rendered: {s}"
         );
         assert!(
-            s.contains("2026-07-16T03:00:00Z"),
+            s.contains("2026-07-16 12:00:00 Asia/Tokyo"),
             "lastFailure not rendered: {s}"
         );
         assert!(
@@ -5018,7 +5446,7 @@ mod tests {
     #[test]
     fn status_last_prune_never_when_absent() {
         let spec = json!({"enabled": true, "bucket": "s3:x"});
-        let s = format_backup_status(Some(&spec), &[], None, None);
+        let s = format_backup_status(Some(&spec), &[], None, None, &tokyo(), Some("Asia/Tokyo"));
         assert!(s.contains("Last prune: never"));
     }
 
@@ -5033,7 +5461,14 @@ mod tests {
             "status": {"startTime": "2026-07-17T03:00:00Z", "succeeded": 1}
         });
         let spec = json!({"enabled": true, "bucket": "s3:x"});
-        let s = format_backup_status(Some(&spec), &[job_old, job_new], None, None);
+        let s = format_backup_status(
+            Some(&spec),
+            &[job_old, job_new],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
         // Most-recent (new) should appear in the "Last backup Job" line.
         assert!(s.contains("apprafter-backup-28900000"));
         assert!(s.contains("Succeeded"));
@@ -6100,12 +6535,26 @@ mod tests {
             "metadata": {"name": "apprafter-backup-running"},
             "status": {"active": 1}
         });
-        let s = format_backup_status(Some(&spec), std::slice::from_ref(&running), None, None);
+        let s = format_backup_status(
+            Some(&spec),
+            std::slice::from_ref(&running),
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
         assert!(s.contains("Running"), "{s}");
 
         // A Job with no counters at all must not be reported as a success.
         let bare = json!({"metadata": {"name": "apprafter-backup-bare"}, "status": {}});
-        let s = format_backup_status(Some(&spec), std::slice::from_ref(&bare), None, None);
+        let s = format_backup_status(
+            Some(&spec),
+            std::slice::from_ref(&bare),
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
         assert!(s.contains("Unknown"), "{s}");
         assert!(!s.contains("Succeeded"), "{s}");
     }
@@ -7154,7 +7603,14 @@ mod tests {
             "status": {"failed": 1}
         });
         let spec = json!({"enabled": true, "bucket": "s3:x"});
-        let s = format_backup_status(Some(&spec), &[backup_job, check_job], None, None);
+        let s = format_backup_status(
+            Some(&spec),
+            &[backup_job, check_job],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
         assert!(s.contains("apprafter-backup-28900000"));
         assert!(s.contains("apprafter-backup-check-28900000"));
         // backup is Succeeded, check is Failed

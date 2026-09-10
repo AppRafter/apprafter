@@ -65,6 +65,26 @@ operator-side `check` when your provider can't express the scoped-delete policy
 and you have [turned the in-cluster check off](#turning-the-in-cluster-check-off), or any
 time you want a manual verification with full credentials.
 
+#### Changing what the weekly check verifies
+
+```sh
+apprafter backup set check-depth 10%          # the default: a random tenth each week
+apprafter backup set check-depth full         # every pack, every week
+apprafter backup set check-depth structure    # metadata only, reads no data
+```
+
+`backup set` changes **one** field and leaves the rest alone. `backup enable`
+composes the whole `spec.backup` block from its flags and the platform
+defaults, so re-running it to adjust one setting resets the others — including
+this one. Use `set` for changes, `enable` for configuring.
+
+The other settable keys are `at`, `check`, `timezone`, `keep-daily`,
+`keep-weekly`, `keep-monthly`, `enforce`, `staging-mode` and
+`failure-webhook`. The bucket and its credential are deliberately not among
+them: pointing an existing schedule at a different repository is a new
+repository, with its own init and its own first backup, so it goes through
+`enable`.
+
 #### Turning the in-cluster check off
 
 Pass `--check off`:

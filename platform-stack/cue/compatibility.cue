@@ -1762,7 +1762,7 @@ compatibility: "0.2.39": {
 
 compatibility: "0.2.67": {
 	change:          "safe"
-	operatorVersion: "v0.2.47"
+	operatorVersion: "v0.2.48"
 	notes: """
 		The runner pin follows cli/runner v0.2.64, and this one carries a fix.
 
@@ -1783,6 +1783,27 @@ compatibility: "0.2.67": {
 		v0.2.64 is published by the same push that ships this chart version
 		(the pin matches `cli/Cargo.toml`, which is what
 		`release-backup-runner.yml` builds from).
+
+		BEHAVIOUR CHANGE, deliberate: the weekly check now deep-verifies a
+		random 10% of the packs (`--read-data-subset=10%`) instead of
+		checking structure only. A structural check never reads a byte of
+		the data it certifies, so bit-rot was invisible to it forever; a
+		full weekly read costs a repository-sized egress against a rare
+		fault. 10% finds a rotted pack in five weeks on average and covers
+		the repository in ten.
+
+		The cost is real and lands without being asked for: a cluster with
+		a 20 GB repository moves ~2 GB more egress per week. `apprafter
+		backup set check-depth structure` restores the old behaviour, and
+		`full` is the every-pack check. New field
+		`spec.backup.checkReadDataSubset` (optional, chart default "10%");
+		`checkReadData: true` still wins when both are set.
+
+		The field is in the CRD, which is why operator v0.2.48 ships with
+		this chart version. On the older CRD the apiserver takes the
+		merge-patch, answers 200, and PRUNES the field it does not know —
+		`apprafter backup set check-depth` would report success and change
+		nothing at all.
 		"""
 	references: ["docs/changelog/UNRELEASED.md#cli-v0263"]
 }

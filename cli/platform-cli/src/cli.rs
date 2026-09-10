@@ -1522,6 +1522,20 @@ pub enum BackupAction {
         #[arg(long)]
         credential_file: Option<std::path::PathBuf>,
     },
+    /// Change ONE field of a configured backup, leaving the rest alone.
+    /// `backup enable` rewrites the whole block, so it cannot be used to
+    /// adjust a single setting without resetting the others.
+    ///
+    /// Keys: at <HH:MM>, check <HH:MM|off>, check-depth
+    /// <structure|10%|full>, timezone <IANA>, keep-daily/keep-weekly/
+    /// keep-monthly <n>, enforce <operator|cluster>, staging-mode
+    /// <monolithic|sequential>, failure-webhook <url>.
+    Set {
+        /// Field to change (e.g. `check-depth`).
+        key: String,
+        /// New value (e.g. `10%`).
+        value: String,
+    },
     /// Run the cluster's scheduled backup NOW, without waiting for its
     /// next window. Instantiates the platform's backup CronJob as a
     /// one-off Job, so it uses the cluster's own credentials — useful

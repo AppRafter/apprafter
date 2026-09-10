@@ -232,6 +232,14 @@ pub const EXAMPLES: &[CommandExamples] = &[
         ],
     },
     CommandExamples {
+        path: &["backup", "set"],
+        lines: &[
+            "apprafter backup set check-depth full",
+            "apprafter backup set at 04:30",
+            "apprafter backup set keep-daily 14",
+        ],
+    },
+    CommandExamples {
         path: &["backup", "run"],
         lines: &[
             "apprafter backup run",

@@ -140,14 +140,32 @@ mode. What it executes is two restic commands in a shell:
 
 ```text
 restic -r "$APPRAFTER_BACKUP_REPO" unlock
-restic -r "$APPRAFTER_BACKUP_REPO" check          # --read-data when checkReadData
+restic -r "$APPRAFTER_BACKUP_REPO" check --read-data-subset=10%
 ```
 
 `restic unlock` is invoked without `--remove-all`, so it removes stale locks
-only and never a live one held by a concurrent run. The check itself verifies
-repository structure and metadata; with `spec.backup.checkReadData: true` it
-additionally re-downloads and re-hashes every pack, which is what catches
-bit-rot and what makes the run slow and expensive in bandwidth.
+only and never a live one held by a concurrent run.
+
+The check itself has three depths, and the platform default is the middle one:
+
+| `spec.backup` | What runs | What it reads |
+| --- | --- | --- |
+| `checkReadDataSubset: "10%"` (default) | `check --read-data-subset=10%` | structure, plus a random tenth of the packs |
+| `checkReadData: true` | `check --read-data` | structure, plus every pack |
+| both empty / false | `check` | structure and metadata only |
+
+The reasoning for the default is worth stating, because before 0.2.67 it was
+"structure only". A structural check verifies that every reference resolves and
+every index agrees — without reading a single byte of the data it is
+certifying. Bit-rot in a pack file is therefore invisible to it, permanently. A
+full read every week finds that, and bills a repository-sized egress each time
+for a fault that is rare.
+
+Ten percent of the packs, chosen at random each week, finds a rotted pack in
+five weeks on average, covers the whole repository in ten, and costs a tenth of
+the bandwidth. `checkReadData: true` still means "all of it, every week" and
+wins when both are set; `apprafter backup set check-depth structure` returns to
+the metadata-only check.
 
 The nightly backup Job opens the same way — an `unlock` first, whose failure is
 logged and does not fail the run — so a lock left behind by a crashed run does

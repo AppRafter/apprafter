@@ -435,9 +435,22 @@ package platformstack
 	// `0 3 * * *` means three in the morning THEIR time.
 	timeZone: string | *""
 
-	// Opt-in full re-download `restic check --read-data`. Default false
-	// (metadata-only structural check).
+	// Opt-in FULL re-download `restic check --read-data`: every pack,
+	// every week. Wins over `checkReadDataSubset` when both are set —
+	// an operator who asks for the whole repository gets it.
 	checkReadData: bool | *false
+
+	// Deep-verify a random SUBSET on each weekly check
+	// (`--read-data-subset`): `"10%"`, `"n/t"`, or a byte size.
+	//
+	// Default 10%, and the reasoning is worth stating because the old
+	// default was "nothing". A structural check never reads a byte of
+	// the data it certifies, so bit-rot stays invisible to it forever;
+	// a full read every week bills a repository-sized egress against a
+	// rare fault. Ten percent finds a rotted pack in five weeks on
+	// average, covers the repository in ten, and costs a tenth of the
+	// bandwidth. Set to `""` for the pre-0.2.68 structure-only check.
+	checkReadDataSubset: string | *"10%"
 
 	// Optional URL the runner POSTs a JSON failure report to. When set,
 	// the CNP also allows egress to its host (folded into world:443).

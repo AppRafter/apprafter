@@ -267,6 +267,7 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
                 local,
                 credential_file.as_deref(),
             )?,
+            BackupAction::Set { key, value } => commands::backup::run_backup_set(&key, &value)?,
             BackupAction::Run { no_wait, timeout } => {
                 commands::backup::run_backup_trigger(!no_wait, timeout)?
             }

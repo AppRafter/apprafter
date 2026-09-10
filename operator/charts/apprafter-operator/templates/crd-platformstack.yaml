@@ -58,6 +58,8 @@ spec:
                     type: string
                   checkReadData:
                     type: boolean
+                  checkReadDataSubset:
+                    type: string
                   checkSchedule:
                     type: string
                   credentialRef:
