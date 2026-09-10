@@ -1284,6 +1284,7 @@
       "examples": [
         "apprafter backup list",
         "apprafter backup list --local",
+        "apprafter backup list --details",
         "apprafter backup list --repo <path>"
       ],
       "args": [
@@ -1298,6 +1299,18 @@
           "required": false,
           "possible_values": [],
           "help": "Path to a dotenv credential file for an `s3:` repository. Falls back to the matching env vars, then to the credential Secret the cluster holds (`spec.backup.credentialRef`)"
+        },
+        {
+          "id": "details",
+          "long": "details",
+          "short": null,
+          "takes_value": false,
+          "value_name": "DETAILS",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Add per-snapshot size and content counts (applications, secrets, claims), so two runs can be compared down the columns. Costs three restic calls per snapshot, which is why it is not the default. Off-site repositories only"
         },
         {
           "id": "local",
@@ -1492,6 +1505,57 @@
           "multiple": false,
           "possible_values": [],
           "help": "New value (e.g. `10%`)"
+        }
+      ]
+    },
+    {
+      "path": [
+        "backup",
+        "show"
+      ],
+      "aliases": [],
+      "about": "Show what a snapshot contains: cluster, platform version, size, namespaces, and a count of the resources it captured broken down by kind (and, for claims, by backend). Reads the manifest the backup itself carries, so the answer comes from the snapshot rather than from the cluster it was taken from",
+      "long_about": null,
+      "usage": "Usage: apprafter backup show [OPTIONS] [SNAPSHOT]",
+      "hidden": false,
+      "examples": [
+        "apprafter backup show",
+        "apprafter backup show <snapshot-id>"
+      ],
+      "args": [
+        {
+          "id": "credential_file",
+          "long": "credential-file",
+          "short": null,
+          "takes_value": true,
+          "value_name": "CREDENTIAL_FILE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Path to a dotenv credential file. Falls back to the matching env vars, then to the credential Secret the cluster holds"
+        },
+        {
+          "id": "repo",
+          "long": "repo",
+          "short": null,
+          "takes_value": true,
+          "value_name": "REPO",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "S3 restic repository URL. Defaults to `PlatformStack.spec.backup.bucket`"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "snapshot",
+          "value_name": "SNAPSHOT",
+          "required": false,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Snapshot id (default: the latest)"
         }
       ]
     },

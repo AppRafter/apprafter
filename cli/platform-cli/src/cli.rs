@@ -1521,6 +1521,29 @@ pub enum BackupAction {
         /// Secret the cluster holds (`spec.backup.credentialRef`).
         #[arg(long)]
         credential_file: Option<std::path::PathBuf>,
+        /// Add per-snapshot size and content counts (applications,
+        /// secrets, claims), so two runs can be compared down the
+        /// columns. Costs three restic calls per snapshot, which is why
+        /// it is not the default. Off-site repositories only.
+        #[arg(long, default_value_t = false)]
+        details: bool,
+    },
+    /// Show what a snapshot contains: cluster, platform version, size,
+    /// namespaces, and a count of the resources it captured broken down
+    /// by kind (and, for claims, by backend). Reads the manifest the
+    /// backup itself carries, so the answer comes from the snapshot
+    /// rather than from the cluster it was taken from.
+    Show {
+        /// Snapshot id (default: the latest).
+        snapshot: Option<String>,
+        /// S3 restic repository URL. Defaults to
+        /// `PlatformStack.spec.backup.bucket`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Path to a dotenv credential file. Falls back to the matching
+        /// env vars, then to the credential Secret the cluster holds.
+        #[arg(long)]
+        credential_file: Option<std::path::PathBuf>,
     },
     /// Change ONE field of a configured backup, leaving the rest alone.
     /// `backup enable` rewrites the whole block, so it cannot be used to

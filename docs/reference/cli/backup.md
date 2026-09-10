@@ -25,6 +25,7 @@ Subcommands:
 - [`apprafter backup prune`](#apprafter-backup-prune) — Remove old snapshots from an S3-backed restic repository according to the configured retention policy.
 - [`apprafter backup run`](#apprafter-backup-run) — Run the cluster's scheduled backup NOW, without waiting for its next window.
 - [`apprafter backup set`](#apprafter-backup-set) — Change ONE field of a configured backup, leaving the rest alone.
+- [`apprafter backup show`](#apprafter-backup-show) — Show what a snapshot contains: cluster, platform version, size, namespaces, and a count of the resources it captured broken down by kind (and, for claims, by backend).
 - [`apprafter backup status`](#apprafter-backup-status) — Show the current backup configuration, last Job outcomes, runner status, and last prune time (reads PlatformStack.spec.backup + Jobs + the apprafter-backup-status ConfigMap)
 - [`apprafter backup unlock`](#apprafter-backup-unlock) — Remove STALE locks from an S3-backed restic repository (`restic unlock`; live locks are never touched).
 
@@ -145,6 +146,7 @@ Aliases: `ls` — accepted on the command line, not listed in `--help`.
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--credential-file` | — | — | no | Path to a dotenv credential file for an `s3:` repository. Falls back to the matching env vars, then to the credential Secret the cluster holds (`spec.backup.credentialRef`) |
+| `--details` | flag | — | no | Add per-snapshot size and content counts (applications, secrets, claims), so two runs can be compared down the columns. Costs three restic calls per snapshot, which is why it is not the default. Off-site repositories only |
 | `--local` | flag | — | no | List the LOCAL repository (`<config>/backups/<target>`) that `backup create` writes, even when the cluster has a schedule |
 | `--passphrase` | — | — | no | Passphrase for the restic repo. Falls back to `RESTIC_PASSWORD`; prompts interactively on a TTY. Not used for the cluster's off-site repository, whose passphrase comes with its credentials |
 | `--repo` | — | — | no | Path to the restic repository, or an `s3:` URL. Overrides both the cluster's schedule and `--local` |
@@ -154,6 +156,7 @@ Examples:
 ```sh
 apprafter backup list
 apprafter backup list --local
+apprafter backup list --details
 apprafter backup list --repo <path>
 ```
 
@@ -223,6 +226,30 @@ Examples:
 apprafter backup set check-depth full
 apprafter backup set at 04:30
 apprafter backup set keep-daily 14
+```
+
+## `apprafter backup show`
+
+Show what a snapshot contains: cluster, platform version, size, namespaces, and a count of the resources it captured broken down by kind (and, for claims, by backend). Reads the manifest the backup itself carries, so the answer comes from the snapshot rather than from the cluster it was taken from
+
+```text
+Usage: apprafter backup show [OPTIONS] [SNAPSHOT]
+```
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| `<SNAPSHOT>` | no | Snapshot id (default: the latest) |
+
+| Flag | Value | Default | Required | Description |
+| --- | --- | --- | --- | --- |
+| `--credential-file` | — | — | no | Path to a dotenv credential file. Falls back to the matching env vars, then to the credential Secret the cluster holds |
+| `--repo` | — | — | no | S3 restic repository URL. Defaults to `PlatformStack.spec.backup.bucket` |
+
+Examples:
+
+```sh
+apprafter backup show
+apprafter backup show <snapshot-id>
 ```
 
 ## `apprafter backup status`

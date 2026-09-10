@@ -48,6 +48,52 @@ pub fn restic_snapshots_argv(repo: &str) -> Vec<String> {
     ]
 }
 
+/// `restic stats --json` argv, in `raw-data` mode.
+///
+/// `raw-data` is the mode that answers "what does this repository cost" —
+/// bytes actually stored after dedup and compression. The default
+/// `restore-size` mode answers a different question (what a restore would
+/// write) and reports a number several times larger for a repository with
+/// any history, which as a "size" line is just misleading.
+///
+/// `snapshot` narrows it to one snapshot; `None` covers the repository.
+pub fn restic_stats_argv(repo: &str, snapshot: Option<&str>) -> Vec<String> {
+    let mut argv = vec![
+        "stats".into(),
+        "--repo".into(),
+        repo.into(),
+        "--json".into(),
+        "--mode".into(),
+        "raw-data".into(),
+    ];
+    if let Some(id) = snapshot {
+        argv.push(id.into());
+    }
+    argv
+}
+
+/// `restic ls --json <snapshot>` argv — one JSON object per line.
+pub fn restic_ls_argv(repo: &str, snapshot: &str) -> Vec<String> {
+    vec![
+        "ls".into(),
+        "--repo".into(),
+        repo.into(),
+        "--json".into(),
+        snapshot.into(),
+    ]
+}
+
+/// `restic dump <snapshot> <path>` argv — one file to stdout.
+pub fn restic_dump_argv(repo: &str, snapshot: &str, path: &str) -> Vec<String> {
+    vec![
+        "dump".into(),
+        "--repo".into(),
+        repo.into(),
+        snapshot.into(),
+        path.into(),
+    ]
+}
+
 /// `restic forget <ids...> --prune` argv (retention prune, spec §M-r3-1b).
 ///
 /// Forgets an explicit set of snapshot ids (the run-aware planner in

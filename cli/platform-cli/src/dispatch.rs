@@ -261,10 +261,21 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
                 passphrase,
                 local,
                 credential_file,
+                details,
             } => commands::backup::run_backup_list(
                 repo.as_deref(),
                 passphrase.as_deref(),
                 local,
+                credential_file.as_deref(),
+                details,
+            )?,
+            BackupAction::Show {
+                snapshot,
+                repo,
+                credential_file,
+            } => commands::backup::run_backup_show(
+                snapshot.as_deref(),
+                repo.as_deref(),
                 credential_file.as_deref(),
             )?,
             BackupAction::Set { key, value } => commands::backup::run_backup_set(&key, &value)?,

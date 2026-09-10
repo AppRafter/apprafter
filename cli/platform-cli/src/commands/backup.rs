@@ -60,7 +60,9 @@ use std::time::Duration;
 use backup_core::engine::BackupOpts;
 use backup_core::extract::plan_extraction;
 use backup_core::prune::{run_prune, RetentionPolicy};
-use backup_core::restic::{restic_check_argv, restic_unlock_argv};
+use backup_core::restic::{
+    restic_check_argv, restic_dump_argv, restic_ls_argv, restic_stats_argv, restic_unlock_argv,
+};
 use backup_core::{KubeExec, ResticRunner, StagingMode, SubprocessRestic};
 use base64::Engine as _;
 use cli_core::diagnose::{classify_restic, ResticFailure};
@@ -2020,6 +2022,7 @@ pub fn run_backup_list(
     passphrase: Option<&str>,
     local: bool,
     credential_file: Option<&Path>,
+    details: bool,
 ) -> Result<()> {
     // D11 / 2.22a: the external binaries this command spawns, checked
     // BEFORE any prompt, kubeconfig or provider call. The reported bug
@@ -2051,10 +2054,18 @@ pub fn run_backup_list(
             let runner = CredentialedRestic { creds };
             let json = runner.run_stdout(&restic_snapshots_argv(&repo_url), &pass)?;
             let snapshots = parse_snapshots_json(&json)?;
-            print!(
-                "{}",
-                format_snapshot_table(&repo_url, &snapshots, &chrono::Local, zone.as_deref())
-            );
+            if details {
+                let rows = collect_snapshot_details(&runner, &repo_url, &pass, &snapshots);
+                print!(
+                    "{}",
+                    format_detail_table(&repo_url, &rows, &chrono::Local, zone.as_deref())
+                );
+            } else {
+                print!(
+                    "{}",
+                    format_snapshot_table(&repo_url, &snapshots, &chrono::Local, zone.as_deref())
+                );
+            }
         }
         chosen => {
             let repo_str = match &chosen {
@@ -2091,6 +2102,321 @@ fn parse_snapshots_json(json: &str) -> Result<Vec<Value>> {
     let parsed: Value = serde_json::from_str(json)
         .map_err(|e| CliError::Other(format!("parse restic snapshots JSON: {e}")))?;
     Ok(parsed.as_array().cloned().unwrap_or_default())
+}
+
+// ---------------------------------------------------------------------------
+// Repository size + snapshot contents
+//
+// "Is the backup working" and "what is in the backup" are different
+// questions, and until now the CLI could only answer the first. A snapshot
+// id and a timestamp say a run happened; they do not say whether it captured
+// the four applications the cluster actually has.
+// ---------------------------------------------------------------------------
+
+/// Bytes at the scale a reader thinks in. Binary units, because that is what
+/// restic counts in and what an object store bills against.
+fn human_size(bytes: u64) -> String {
+    const UNITS: &[(&str, u64)] = &[
+        ("GiB", 1024 * 1024 * 1024),
+        ("MiB", 1024 * 1024),
+        ("KiB", 1024),
+    ];
+    for (unit, scale) in UNITS {
+        if bytes >= *scale {
+            return format!("{:.1} {unit}", bytes as f64 / *scale as f64);
+        }
+    }
+    format!("{bytes} B")
+}
+
+/// What `restic stats --json --mode raw-data` reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResticStats {
+    /// Bytes actually stored, after dedup and compression.
+    pub total_size: u64,
+    /// Snapshots counted — absent when stats was asked about ONE snapshot.
+    pub snapshots_count: Option<u64>,
+}
+
+/// Parse a `restic stats --json` document. `None` when it is not JSON or
+/// carries no size — a stats call that failed to say anything useful must
+/// not render as a repository of zero bytes.
+fn parse_stats_json(raw: &str) -> Option<ResticStats> {
+    let v: Value = serde_json::from_str(raw.trim()).ok()?;
+    Some(ResticStats {
+        total_size: v.pointer("/total_size").and_then(Value::as_u64)?,
+        snapshots_count: v.pointer("/snapshots_count").and_then(Value::as_u64),
+    })
+}
+
+/// Find `manifest.json` in a `restic ls --json` stream.
+///
+/// The runner snapshots a temp staging directory whose name changes every
+/// run, so the manifest has no fixed path — it can only be found by name.
+/// `restic ls --json` emits one object per line: the snapshot first, then
+/// each node.
+fn manifest_path_in_snapshot(ls_output: &str) -> Option<String> {
+    ls_output
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|n| n.pointer("/name").and_then(Value::as_str) == Some("manifest.json"))
+        .and_then(|n| {
+            n.pointer("/path")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+/// Gather per-snapshot size and content counts.
+///
+/// Three restic calls per snapshot (`stats`, `ls`, `dump`), which is why
+/// this is behind a flag rather than the default. A snapshot whose stats or
+/// manifest cannot be read still gets a row with dashes: one unreadable
+/// snapshot in a listing of ten must not take the other nine with it.
+fn collect_snapshot_details(
+    runner: &CredentialedRestic,
+    repo: &str,
+    pass: &str,
+    snapshots: &[Value],
+) -> Vec<SnapshotDetail> {
+    snapshots
+        .iter()
+        .map(|s| {
+            let id = s
+                .pointer("/short_id")
+                .or_else(|| s.pointer("/id"))
+                .and_then(Value::as_str)
+                .map(|i| i.chars().take(8).collect::<String>())
+                .unwrap_or_else(|| "?".to_string());
+            let time = s
+                .pointer("/time")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            let size = repo_stats(runner, repo, pass, Some(&id)).map(|st| st.total_size);
+            let counts = snapshot_manifest(runner, repo, pass, &id)
+                .ok()
+                .map(|m| content_counts(&m));
+            SnapshotDetail {
+                id,
+                time,
+                size,
+                counts,
+            }
+        })
+        .collect()
+}
+
+/// One row of `backup list --details`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SnapshotDetail {
+    pub id: String,
+    pub time: String,
+    /// `None` when restic could not be asked — rendered as a dash, never
+    /// as a zero, because "unknown" and "none" are different answers.
+    pub size: Option<u64>,
+    pub counts: Option<ContentCounts>,
+}
+
+/// The three counts an operator scans a listing for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContentCounts {
+    pub apps: u64,
+    pub secrets: u64,
+    pub claims: u64,
+}
+
+/// Count Applications, Secrets and ResourceClaims in a manifest. Pure.
+fn content_counts(manifest: &Value) -> ContentCounts {
+    let mut c = ContentCounts {
+        apps: 0,
+        secrets: 0,
+        claims: 0,
+    };
+    for r in manifest
+        .pointer("/resources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match r.pointer("/kind").and_then(Value::as_str) {
+            Some("Application") => c.apps += 1,
+            Some("Secret") => c.secrets += 1,
+            Some("ResourceClaim") => c.claims += 1,
+            _ => {}
+        }
+    }
+    c
+}
+
+/// Render `backup list --details`: a row per snapshot with size and the
+/// counts, so two runs can be compared down the columns.
+fn format_detail_table<Tz>(
+    repo: &str,
+    rows: &[SnapshotDetail],
+    tz: &Tz,
+    zone_label: Option<&str>,
+) -> String
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    if rows.is_empty() {
+        return format!("No snapshots in {repo}.\n");
+    }
+    let time_header = format!("TIME ({})", zone_label.unwrap_or("local"));
+
+    /// One row, already rendered to strings — a named struct rather than
+    /// a six-tuple so the column-width helper below stays readable.
+    struct Rendered {
+        id: String,
+        time: String,
+        size: String,
+        apps: String,
+        secrets: String,
+        claims: String,
+    }
+
+    let rendered: Vec<Rendered> = rows
+        .iter()
+        .map(|r| {
+            let (apps, secrets, claims) = match r.counts {
+                Some(c) => (
+                    c.apps.to_string(),
+                    c.secrets.to_string(),
+                    c.claims.to_string(),
+                ),
+                // A dash, never a zero: "unknown" and "none" are
+                // different answers, and a listing read for change must
+                // not invent the second when it means the first.
+                None => ("—".into(), "—".into(), "—".into()),
+            };
+            Rendered {
+                id: r.id.clone(),
+                time: format_timestamp(&r.time, tz),
+                size: r.size.map(human_size).unwrap_or_else(|| "—".into()),
+                apps,
+                secrets,
+                claims,
+            }
+        })
+        .collect();
+
+    let width = |header: &str, pick: &dyn Fn(&Rendered) -> &String| {
+        rendered
+            .iter()
+            .map(|r| pick(r).chars().count())
+            .chain(std::iter::once(header.chars().count()))
+            .max()
+            .unwrap_or(header.len())
+    };
+    let id_w = width("ID", &|r| &r.id);
+    let time_w = width(&time_header, &|r| &r.time);
+    let size_w = width("SIZE", &|r| &r.size);
+    let apps_w = width("APPS", &|r| &r.apps);
+    let sec_w = width("SECRETS", &|r| &r.secrets);
+
+    let mut out = format!(
+        "Snapshots in {repo}:\n{:<id_w$}  {:<time_w$}  {:>size_w$}  {:>apps_w$}  {:>sec_w$}  CLAIMS\n",
+        "ID", time_header, "SIZE", "APPS", "SECRETS"
+    );
+    for r in rendered {
+        out.push_str(&format!(
+            "{:<id_w$}  {:<time_w$}  {:>size_w$}  {:>apps_w$}  {:>sec_w$}  {}\n",
+            r.id, r.time, r.size, r.apps, r.secrets, r.claims
+        ));
+    }
+    out
+}
+
+/// Render what a snapshot contains, from its manifest.
+///
+/// Counts by `kind`, and breaks `ResourceClaim` down by `claimType` —
+/// "ResourceClaims 3" does not answer "which databases are in there", which
+/// is the question that gets asked. An unknown kind is counted under its own
+/// name rather than dropped: a listing that silently omits resources is
+/// worse than one naming something the reader has to look up.
+fn format_snapshot_contents<Tz>(
+    snapshot_id: &str,
+    time: Option<&str>,
+    size: Option<u64>,
+    manifest: &Value,
+    tz: &Tz,
+    zone_label: Option<&str>,
+) -> String
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    let mut out = match time {
+        Some(t) => format!(
+            "Snapshot {snapshot_id} — {}\n",
+            format_timestamp_with_zone(t, tz, zone_label)
+        ),
+        None => format!("Snapshot {snapshot_id}\n"),
+    };
+
+    let field = |k: &str| manifest.pointer(k).and_then(Value::as_str).unwrap_or("?");
+    out.push_str(&format!("  cluster:        {}\n", field("/clusterId")));
+    out.push_str(&format!(
+        "  platform-stack: {}\n",
+        field("/platformVersion")
+    ));
+    if let Some(b) = size {
+        out.push_str(&format!("  size:           {} (raw)\n", human_size(b)));
+    }
+    let namespaces: Vec<&str> = manifest
+        .pointer("/namespaces")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if !namespaces.is_empty() {
+        out.push_str(&format!("  namespaces:     {}\n", namespaces.join(", ")));
+    }
+
+    let resources = manifest
+        .pointer("/resources")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if resources.is_empty() {
+        out.push_str("  (no resources recorded in this snapshot's manifest)\n");
+        return out;
+    }
+
+    // BTreeMap so the order is stable run to run — a listing meant for
+    // spotting a change must not reorder itself between two runs.
+    let mut by_kind: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut claims_by_type: BTreeMap<&str, u64> = BTreeMap::new();
+    for r in &resources {
+        let kind = r.pointer("/kind").and_then(Value::as_str).unwrap_or("?");
+        *by_kind.entry(kind).or_default() += 1;
+        if kind == "ResourceClaim" {
+            let t = r
+                .pointer("/claimType")
+                .and_then(Value::as_str)
+                .unwrap_or("unspecified");
+            *claims_by_type.entry(t).or_default() += 1;
+        }
+    }
+
+    out.push_str("  contents:\n");
+    let width = by_kind.keys().map(|k| k.len()).max().unwrap_or(4);
+    for (kind, n) in &by_kind {
+        if *kind == "ResourceClaim" && !claims_by_type.is_empty() {
+            let breakdown: Vec<String> = claims_by_type
+                .iter()
+                .map(|(t, c)| format!("{t} {c}"))
+                .collect();
+            out.push_str(&format!(
+                "    {kind:<width$}  {n}  ({})\n",
+                breakdown.join(", ")
+            ));
+        } else {
+            out.push_str(&format!("    {kind:<width$}  {n}\n"));
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2244,6 +2570,100 @@ fn backup_set_patch(key: &str, value: &str) -> Result<Value> {
         }
     }
     Ok(serde_json::json!({"spec": {"backup": Value::Object(field)}}))
+}
+
+/// `apprafter backup show [<snapshot>]` — what a snapshot contains.
+///
+/// The question `list` cannot answer: an id and a timestamp say a run
+/// happened, not whether it captured the applications the cluster has. Reads
+/// the manifest the runner wrote into the snapshot, so the answer comes from
+/// the backup itself rather than from the cluster it was taken from.
+pub fn run_backup_show(
+    snapshot: Option<&str>,
+    repo_override: Option<&str>,
+    credential_file: Option<&Path>,
+) -> Result<()> {
+    preflight_tools(&[&RESTIC], "apprafter backup show")?;
+
+    let source = cred_source(
+        credential_file.is_some(),
+        env_creds_complete(&|k| std::env::var(k).ok()),
+    );
+    let kc =
+        kubeconfig_if_cluster_needed("show", repo_override, RetentionArgs::NotApplicable, source)?;
+    let kc_path = kc.as_ref().map(|f| f.path());
+    let spec_backup = spec_backup_from_cluster(kc_path)?;
+    let creds = resolve_verb_creds(credential_file, kc_path, spec_backup.as_ref())?;
+    let pass = creds["RESTIC_PASSWORD"].clone();
+    let repo = repo_from_spec_backup(repo_override, spec_backup.as_ref())?;
+
+    let runner = CredentialedRestic { creds };
+    let id = snapshot.unwrap_or("latest");
+    let manifest = snapshot_manifest(&runner, &repo, &pass, id)?;
+
+    // The id and time come from `snapshots`, not from the manifest: the
+    // manifest records when the RUN started, and an operator matching this
+    // against `backup list` needs the snapshot's own id and timestamp.
+    let (resolved_id, time) = snapshot_identity(&runner, &repo, &pass, id);
+    let size = repo_stats(&runner, &repo, &pass, Some(id)).map(|s| s.total_size);
+
+    print!(
+        "{}",
+        format_snapshot_contents(
+            &resolved_id,
+            time.as_deref(),
+            size,
+            &manifest,
+            &chrono::Local,
+            readers_zone().as_deref(),
+        )
+    );
+    Ok(())
+}
+
+/// The short id and timestamp restic itself reports for a snapshot.
+///
+/// Falls back to the caller's own reference when `snapshots` cannot be read
+/// — the contents are the answer here, and losing the header would be a
+/// worse outcome than losing the exact id.
+fn snapshot_identity(
+    runner: &CredentialedRestic,
+    repo: &str,
+    pass: &str,
+    snapshot: &str,
+) -> (String, Option<String>) {
+    let fallback = (snapshot.to_string(), None);
+    let Ok(json) = runner.run_stdout(&restic_snapshots_argv(repo), pass) else {
+        return fallback;
+    };
+    let Ok(list) = parse_snapshots_json(&json) else {
+        return fallback;
+    };
+    // `latest` is restic's own alias, and the list is chronological.
+    let found = if snapshot == "latest" {
+        list.last()
+    } else {
+        list.iter().find(|s| {
+            [s.pointer("/short_id"), s.pointer("/id")]
+                .iter()
+                .flatten()
+                .filter_map(|v| v.as_str())
+                .any(|v| v.starts_with(snapshot) || snapshot.starts_with(v))
+        })
+    };
+    match found {
+        Some(s) => (
+            s.pointer("/short_id")
+                .or_else(|| s.pointer("/id"))
+                .and_then(Value::as_str)
+                .map(|i| i.chars().take(8).collect())
+                .unwrap_or_else(|| snapshot.to_string()),
+            s.pointer("/time")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        ),
+        None => fallback,
+    }
 }
 
 /// `apprafter backup set <key> <value>` — change one field of a configured
@@ -3254,7 +3674,57 @@ pub fn run_backup_check(
     } else {
         println!("✓ Repository check passed.");
     }
+
+    // Size and snapshot count, best-effort: the check has already passed
+    // and that is the answer. A stats call that fails must not turn a
+    // verified repository into a failed command.
+    if let Some(stats) = repo_stats(&runner, &repo, &pass, None) {
+        let count = stats
+            .snapshots_count
+            .map(|n| format!("{n} snapshot(s), "))
+            .unwrap_or_default();
+        println!(
+            "  {count}{} stored (raw, after dedup and compression)",
+            human_size(stats.total_size)
+        );
+    }
     Ok(())
+}
+
+/// `restic stats` for a repo or one snapshot, or `None` when the call or the
+/// parse fails. Best-effort by construction: every caller has already
+/// answered the question it was asked, and a size line is an extra.
+fn repo_stats(
+    runner: &CredentialedRestic,
+    repo: &str,
+    pass: &str,
+    snapshot: Option<&str>,
+) -> Option<ResticStats> {
+    let out = runner
+        .run_stdout(&restic_stats_argv(repo, snapshot), pass)
+        .ok()?;
+    parse_stats_json(&out)
+}
+
+/// Read a snapshot's `manifest.json` — two restic calls: `ls` to find the
+/// path (the staging directory's name changes every run), `dump` to read it.
+fn snapshot_manifest(
+    runner: &CredentialedRestic,
+    repo: &str,
+    pass: &str,
+    snapshot: &str,
+) -> Result<Value> {
+    let ls = runner.run_stdout(&restic_ls_argv(repo, snapshot), pass)?;
+    let path = manifest_path_in_snapshot(&ls).ok_or_else(|| {
+        CliError::Other(format!(
+            "snapshot {snapshot} carries no manifest.json, so it was not written by \
+             `apprafter backup` — restic repositories can hold anything, and this one \
+             holds something else."
+        ))
+    })?;
+    let raw = runner.run_stdout(&restic_dump_argv(repo, snapshot, &path), pass)?;
+    serde_json::from_str(&raw)
+        .map_err(|e| CliError::Other(format!("parse manifest.json from snapshot {snapshot}: {e}")))
 }
 
 /// `apprafter backup unlock` — remove STALE locks from an off-site restic repo
@@ -5144,6 +5614,180 @@ mod tests {
     // ------------------------------------------------------------------
     // 3a. format_backup_status
     // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // Repository size + snapshot contents
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_size_is_rendered_at_the_scale_a_reader_thinks_in() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1024), "1.0 KiB");
+        assert_eq!(human_size(432 * 1024 * 1024), "432.0 MiB");
+        assert_eq!(
+            human_size(3 * 1024 * 1024 * 1024 + 512 * 1024 * 1024),
+            "3.5 GiB"
+        );
+    }
+
+    #[test]
+    fn repository_stats_come_out_of_resticss_own_json() {
+        // Captured from `restic 0.18.1 stats --json --mode raw-data`.
+        let json = r#"{"total_size":307,"total_uncompressed_size":442,
+                       "compression_ratio":1.43,"total_blob_count":2,"snapshots_count":1}"#;
+        let s = parse_stats_json(json).expect("parsed");
+        assert_eq!(s.total_size, 307);
+        assert_eq!(s.snapshots_count, Some(1));
+        // A single-snapshot stats call omits snapshots_count; the size is
+        // still the answer and must not be discarded with it.
+        let one = parse_stats_json(r#"{"total_size":4096}"#).expect("parsed");
+        assert_eq!(one.total_size, 4096);
+        assert_eq!(one.snapshots_count, None);
+        assert!(parse_stats_json("not json").is_none());
+    }
+
+    #[test]
+    fn the_manifest_is_found_by_its_path_in_the_snapshot() {
+        // `restic ls --json` emits one object per line: the snapshot
+        // first, then every node. The staging directory the runner
+        // snapshots is a temp path that changes every run, so the
+        // manifest can only be found by its NAME, never by a fixed path.
+        let ls = r#"{"time":"2026-09-10T22:11:39Z","paths":["/staging/x"],"struct_type":"snapshot"}
+{"name":"crs","type":"dir","path":"/staging/ar-9f2/crs","struct_type":"node"}
+{"name":"manifest.json","type":"file","path":"/staging/ar-9f2/manifest.json","struct_type":"node"}
+{"name":"web.json","type":"file","path":"/staging/ar-9f2/crs/web.json","struct_type":"node"}"#;
+        assert_eq!(
+            manifest_path_in_snapshot(ls).as_deref(),
+            Some("/staging/ar-9f2/manifest.json")
+        );
+        // A snapshot that carries no manifest is not an AppRafter backup,
+        // and saying so beats dumping a path that does not exist.
+        assert_eq!(
+            manifest_path_in_snapshot(r#"{"name":"f","path":"/f"}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn the_contents_summary_counts_what_an_operator_asks_about() {
+        let manifest = json!({
+            "manifestVersion": 1,
+            "clusterId": "prod",
+            "createdAt": "2026-09-10T22:11:34Z",
+            "platformVersion": "0.2.67",
+            "namespaces": ["shop", "blog"],
+            "resources": [
+                {"namespace": "shop", "kind": "Application", "name": "web"},
+                {"namespace": "shop", "kind": "Application", "name": "api"},
+                {"namespace": "blog", "kind": "Application", "name": "blog"},
+                {"namespace": "shop", "kind": "Secret", "name": "web-env"},
+                {"namespace": "shop", "kind": "ResourceClaim", "name": "db", "claimType": "pg"},
+                {"namespace": "blog", "kind": "ResourceClaim", "name": "db2", "claimType": "pg"},
+                {"namespace": "shop", "kind": "ResourceClaim", "name": "cache", "claimType": "redis"},
+                {"namespace": "shop", "kind": "SharedVolume", "name": "uploads"}
+            ]
+        });
+        let s = format_snapshot_contents(
+            "354fb34e",
+            Some("2026-09-10T22:11:39Z"),
+            Some(1_234_567),
+            &manifest,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
+        assert!(s.contains("354fb34e"), "{s}");
+        assert!(s.contains("2026-09-11 07:11:39 Asia/Tokyo"), "{s}");
+        assert!(s.contains("prod"), "names the cluster: {s}");
+        assert!(s.contains("0.2.67"), "names the platform version: {s}");
+        assert!(s.contains("1.2 MiB"), "{s}");
+        assert!(s.contains("shop, blog"), "{s}");
+        assert!(s.contains("Application") && s.contains('3'), "{s}");
+        assert!(s.contains("Secret"), "{s}");
+        // The claim breakdown is the "which databases" question, and a
+        // bare "ResourceClaim 3" does not answer it.
+        assert!(s.contains("pg 2"), "{s}");
+        assert!(s.contains("redis 1"), "{s}");
+        assert!(s.contains("SharedVolume"), "{s}");
+    }
+
+    #[test]
+    fn the_detail_columns_show_where_the_contents_changed() {
+        // What `--details` is for: two snapshots side by side, and the
+        // row where a count moves is the run where something entered or
+        // left the cluster.
+        let rows = vec![
+            SnapshotDetail {
+                id: "354fb34e".into(),
+                time: "2026-09-10T22:11:39Z".into(),
+                size: Some(432 * 1024 * 1024),
+                counts: Some(ContentCounts {
+                    apps: 4,
+                    secrets: 11,
+                    claims: 3,
+                }),
+            },
+            SnapshotDetail {
+                id: "9c1d0a77".into(),
+                time: "2026-09-11T02:00:04Z".into(),
+                size: Some(433 * 1024 * 1024),
+                counts: Some(ContentCounts {
+                    apps: 5,
+                    secrets: 11,
+                    claims: 3,
+                }),
+            },
+        ];
+        let table = format_detail_table("s3:x", &rows, &tokyo(), Some("Asia/Tokyo"));
+        assert!(table.contains("432.0 MiB"), "{table}");
+        assert!(table.contains("SIZE") && table.contains("APPS"), "{table}");
+        assert!(table.contains("2026-09-11 07:11:39"), "{table}");
+        // Columns line up — this table exists to be read DOWN, and a
+        // count that moves between rows is the whole signal. Measured on
+        // the last column boundary, which only holds if every column
+        // before it holds too.
+        let claims_column: Vec<usize> = table
+            .lines()
+            .filter(|l| l.contains("CLAIMS") || l.contains("354fb34e") || l.contains("9c1d0a77"))
+            .map(|l| l.rfind("  ").map(|i| i + 2).expect("column gap"))
+            .collect();
+        assert_eq!(claims_column.len(), 3, "{table}");
+        assert!(
+            claims_column.windows(2).all(|w| w[0] == w[1]),
+            "CLAIMS must start at one column on every line: {table}"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_whose_manifest_could_not_be_read_still_gets_a_row() {
+        // One unreadable snapshot in a listing of ten must not take the
+        // other nine down with it — and a dash says "not known" where a
+        // zero would say "none", which is a different claim entirely.
+        let rows = vec![SnapshotDetail {
+            id: "deadbeef".into(),
+            time: "2026-09-10T22:11:39Z".into(),
+            size: None,
+            counts: None,
+        }];
+        let table = format_detail_table("s3:x", &rows, &tokyo(), None);
+        assert!(table.contains("deadbeef"), "{table}");
+        assert!(table.contains('—') || table.contains('-'), "{table}");
+        assert!(!table.contains(" 0 "), "a dash is not a zero: {table}");
+    }
+
+    #[test]
+    fn a_manifest_from_a_future_cli_still_renders_what_it_can() {
+        // Unknown kinds are counted under their own name rather than
+        // dropped: a listing that silently omits resources is worse than
+        // one that names something the reader has to look up.
+        let manifest = json!({
+            "clusterId": "c", "createdAt": "t", "platformVersion": "9.9.9",
+            "namespaces": [],
+            "resources": [{"namespace": "n", "kind": "SomethingNew", "name": "x"}]
+        });
+        let s = format_snapshot_contents("id", None, None, &manifest, &tokyo(), None);
+        assert!(s.contains("SomethingNew"), "{s}");
+    }
 
     // ------------------------------------------------------------------
     // `backup set` — change one field of a configured backup

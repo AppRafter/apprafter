@@ -66,6 +66,37 @@ the cluster did.
 
 ### Added
 
+- **`apprafter backup show [<snapshot>]` — what a snapshot contains.**
+  An id and a timestamp say a run happened; they do not say whether it
+  captured the four applications the cluster has. `show` reads the
+  `manifest.json` the runner wrote INTO the snapshot — so the answer
+  describes the backup rather than the cluster it came from — and prints
+  the source cluster, platform version, size, namespaces and a count by
+  kind, with `ResourceClaim` broken down by backend. "3 claims" does not
+  answer "which databases".
+
+  Two restic calls find it: `ls` for the path (the staging directory's
+  name changes every run, so the manifest can only be found by name) and
+  `dump` to read it. An unknown kind is counted under its own name rather
+  than dropped — a listing that silently omits resources is worse than
+  one naming something the reader has to look up.
+
+- **`backup list --details` and a size line on `backup check`.** The
+  detail listing adds size and per-snapshot counts so two runs compare
+  down the columns, and the row where a count moves is the run where
+  something entered or left the cluster. Three restic calls per snapshot,
+  hence the flag. A snapshot whose manifest cannot be read still gets a
+  row with dashes: one unreadable snapshot in a listing of ten must not
+  take the other nine with it, and a dash says "not known" where a zero
+  would say "none".
+
+  `check` now reports the repository's size and snapshot count after a
+  successful verify, in restic's `raw-data` mode — bytes actually stored
+  after dedup and compression, not the several-times-larger
+  `restore-size` figure that would be misleading as a "size" line. Both
+  are best-effort: the check has already passed, and a failed stats call
+  must not turn a verified repository into a failed command.
+
 - **`apprafter backup set <key> <value>` — change one field of a
   configured backup.** `backup enable` composes `spec.backup` wholesale:
   every CRD-required field is written on every run, from a flag or from

@@ -228,7 +228,15 @@ pub const EXAMPLES: &[CommandExamples] = &[
         lines: &[
             "apprafter backup list",
             "apprafter backup list --local",
+            "apprafter backup list --details",
             "apprafter backup list --repo <path>",
+        ],
+    },
+    CommandExamples {
+        path: &["backup", "show"],
+        lines: &[
+            "apprafter backup show",
+            "apprafter backup show <snapshot-id>",
         ],
     },
     CommandExamples {

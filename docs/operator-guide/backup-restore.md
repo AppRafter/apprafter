@@ -33,6 +33,35 @@ under the AppRafter config root; `--repo <path>` puts it elsewhere.
 the tag is `<cluster-id>-<created-at>`, so it identifies the source cluster and
 the moment, never a single namespace.
 
+## What is in a backup
+
+```sh
+apprafter backup show                 # the latest snapshot
+apprafter backup show <snapshot-id>
+```
+
+`show` answers the question a snapshot id and a timestamp cannot: what the
+run actually captured. It prints the source cluster, the platform-stack
+version it ran, the snapshot's size, the namespaces in scope, and a count of
+the captured resources by kind — with `ResourceClaim` broken down by backend,
+because "3 claims" does not tell you which databases are in there.
+
+The numbers come from the `manifest.json` the backup itself carries, so they
+describe the snapshot rather than the cluster it was taken from. That is the
+distinction that matters when you are deciding whether a backup from three
+weeks ago still covers what you have now.
+
+```sh
+apprafter backup list --details
+```
+
+adds size and per-snapshot counts to the listing, so two runs can be compared
+down the columns and the row where a count moves is the run where something
+entered or left the cluster. It costs three restic calls per snapshot, which
+is why it is not the default. A snapshot whose manifest cannot be read still
+gets a row, with dashes rather than zeroes — "unknown" and "none" are
+different answers.
+
 **`backup list` follows the cluster.** Once off-site backup is enabled, a bare
 `backup list` shows what the *schedule* stored, because those are the cluster's
 backups; `--local` shows this machine's repository instead, and `--repo` names
