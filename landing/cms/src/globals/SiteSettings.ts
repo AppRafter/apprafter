@@ -6,8 +6,7 @@ import type { GlobalConfig } from 'payload';
 export const SiteSettings: GlobalConfig = {
   slug: 'site-settings',
   admin: {
-    description:
-      'Cross-page site config: external links exposed in nav/footer + (later) analytics domain.',
+    description: 'Cross-page site config: the external links exposed in nav/footer.',
   },
   access: {
     read: () => true,
@@ -38,7 +37,14 @@ export const SiteSettings: GlobalConfig = {
       name: 'plausibleDomain',
       type: 'text',
       admin: {
-        description: 'Reserved for Phase I+ analytics. Leave empty for v1.',
+        description:
+          'Dead field — a value here changes nothing. Analytics is live, but each ' +
+          'loader bakes its own site into the pa-*.js bundle it requests and ' +
+          'overrides any domain passed to init(), so neither property is ' +
+          'configurable from here: apprafter.dev is hard-coded in ' +
+          'web/src/components/layout/BaseLayout.astro, docs.apprafter.dev in ' +
+          'overrides/partials/integrations/analytics/plausible.html. Kept only ' +
+          'because dropping the column needs a Payload migration.',
       },
     },
     {

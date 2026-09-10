@@ -370,7 +370,7 @@ export interface PayloadMigrationsSelect<T extends boolean = true> {
   createdAt?: T;
 }
 /**
- * Cross-page site config: external links exposed in nav/footer + (later) analytics domain.
+ * Cross-page site config: the external links exposed in nav/footer.
  *
  * This interface was referenced by `Config`'s JSON-Schema
  * via the `definition` "site-settings".
@@ -384,7 +384,7 @@ export interface SiteSetting {
    */
   docsUrl?: string | null;
   /**
-   * Reserved for Phase I+ analytics. Leave empty for v1.
+   * Dead field — a value here changes nothing. Analytics is live, but each loader bakes its own site into the pa-*.js bundle it requests and overrides any domain passed to init(), so neither property is configurable from here: apprafter.dev is hard-coded in web/src/components/layout/BaseLayout.astro, docs.apprafter.dev in overrides/partials/integrations/analytics/plausible.html. Kept only because dropping the column needs a Payload migration.
    */
   plausibleDomain?: string | null;
   /**
@@ -422,7 +422,7 @@ export interface LandingHero {
   subhead: string;
   statusBadge: string;
   /**
-   * Raw HTML for the footnote under the hero, keyed to the * marker on “Open source” in headlineHtml (add <sup>*</sup> there). Leave empty to hide the footnote.
+   * Raw HTML for the footnote under the hero, keyed to a * marker in headlineHtml (add <sup>*</sup> beside the licensing phrase). Leave empty to hide the footnote — a footnote with no marker above it is an asterisk pointing at nothing.
    */
   licenseFootnoteHtml?: string | null;
   cueFilename: string;

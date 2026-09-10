@@ -125,6 +125,10 @@ theme:
 # partials/integrations/analytics/<provider>.html, which `overrides/`
 # supplies. `provider` is not a fixed enum, so no plugin is involved.
 #
+# Which property it reports to is decided in that partial and nowhere
+# else — the site is baked into the `pa-*.js` bundle it requests. This
+# one is `docs.apprafter.dev`, separate from the landing's.
+#
 # Cookieless and with no cross-site identifier, so there is no consent
 # banner to gate it behind, and docs-site/Caddyfile sets no CSP to widen.
 # `docs/hooks/llm_export.py` also writes into `extra`, which is why this

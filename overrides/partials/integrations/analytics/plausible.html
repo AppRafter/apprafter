@@ -1,8 +1,36 @@
 {#-
-  Plausible, the same loader the landing runs
-  (landing/web/src/components/layout/BaseLayout.astro). Kept byte-identical
-  to it on purpose: two copies that drift are two properties reporting
-  differently about one product.
+  Plausible. The loader is the landing's, shape for shape
+  (landing/web/src/components/layout/BaseLayout.astro) — the async tag, the
+  queue shim, the bare `init()` — and the script id is deliberately NOT the
+  landing's.
+
+  The site is baked into the bundle, not passed from here: the loader ends
+  its config merge with `{domain: o.domain}`, so it overrides whatever
+  `init()` is given and the requested `pa-*.js` is the only thing that
+  decides where these pageviews land. `pa-Biax0rNZAgcOwhUTRVxNh` is
+  `docs.apprafter.dev`; the landing's `pa-ObkWGtUzPqv9gmVcgCKLF` is
+  `apprafter.dev`. Fetched and diffed at the time of writing: the two
+  bundles are byte-identical apart from that one string, so anything true
+  of the landing's capture behaviour is true here.
+
+  Until 2026-09-10 this file loaded the LANDING's script, which meant the
+  docs had no property of their own to look at — every docs pageview was
+  written into `apprafter.dev` with only its path to tell it apart. Two
+  properties is the ADR 0057 decision-8 shape: the docs are their own
+  deployable on their own hostname, and mixing them makes both unreadable.
+
+  That split is load-bearing outside the dashboard. The privacy policy
+  scopes itself to both hosts and promises "no identifier that follows you
+  between visits or between sites", and Plausible's daily identifier is
+  `hash(daily_salt + website_domain + ip_address + user_agent)` — its own
+  data policy, verbatim. The reporting site's domain is an input, so two
+  properties give one reader two unrelated ids per day and a single
+  property spanning both hostnames gives them one: the only shape in which
+  the analytics could join a landing visit to a docs visit, and the shape
+  this file had until 2026-09-10. Merging them back means rewriting that
+  promise first, in both places — `landing/web/src/data/fallback/legalPrivacy.json`
+  is the source, and the live page renders the Payload `legal-privacy`
+  global, applied by hand and logged in `CMS_PROD_CHANGES.md`.
 
   mkdocs-material's partials/integrations/analytics.html includes
   partials/integrations/analytics/<provider>.html, so `provider: plausible`
@@ -11,22 +39,30 @@
   through custom_dir, which is what makes this work with no plugin.
 
   navigation.instant swaps pages with history.pushState, and the loader
-  handles that itself: it replaces `history.pushState`, listens for
-  `popstate`, and sends a pageview whenever `location.pathname` changed.
-  This file used to subscribe to material's own `location$` observable and
-  send a second `plausible("pageview")` on top — written when the loader
-  was assumed to capture full loads only. It does not: `autoCapturePageviews`
-  defaults on, so every in-site navigation, and the initial load with it,
-  was counted twice. A metric that is quietly 2x is worse than none, so the
-  subscription is gone rather than the autocapture: one mechanism, and it is
-  the one that dedupes repeat pathnames.
+  handles that itself: `autoCapturePageviews` defaults on, it replaces
+  `history.pushState`, listens for `popstate`, and sends a pageview whenever
+  `location.pathname` changed. This file used to subscribe to material's own
+  `location$` observable and send a second `plausible("pageview")` on top,
+  written when the loader was assumed to capture full loads only. It does
+  not, so every in-site navigation — and the initial load with it — was
+  counted twice. The subscription is gone rather than the autocapture: the
+  loader's path dedupes repeat pathnames and the manual call bypassed that,
+  so keeping the manual half would have kept the weaker of the two.
 
-  The site is baked into the script, not passed here — the loader assigns
-  `domain` last and overrides whatever `init()` is given. So which property
-  these pageviews land in is decided entirely by which `pa-*.js` is
-  requested below, and this one says `apprafter.dev`.
+  Do NOT add a second capture mechanism back, here or in the dashboard. One
+  or the other, never both: a metric that is quietly 2x is worse than none.
+
+  The reason one loader can serve a whole instant-navigated site is that it
+  is initialised exactly once. Material's swap keys `<head>` children by
+  their `outerHTML` and only appends the ones the incoming document has and
+  the current one does not; script re-execution is scoped to
+  `[data-md-component=container]`. These two tags are byte-identical on
+  every page, so they match, stay put, and never re-run. Read out of the
+  built `assets/javascripts/bundle.*.min.js` — if a future release starts
+  interpolating anything per-page into this file, that identity breaks and
+  the loader re-inits on every navigation.
 -#}
-<script defer src="https://plausible.io/js/pa-ObkWGtUzPqv9gmVcgCKLF.js"></script>
+<script async src="https://plausible.io/js/pa-Biax0rNZAgcOwhUTRVxNh.js"></script>
 <script>
   window.plausible =
     window.plausible ||
