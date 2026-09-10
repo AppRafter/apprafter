@@ -28,6 +28,33 @@ patch of each phase.
 
 ### Changed
 
+- **A version-coherence gate, because this failure has a shape.** Five
+  things carry a version here and four of them pin another: the operator
+  and webhook charts declare an `appVersion`, `platform-stack` pins both
+  by literal, `compatibility.cue` records which operator a chart version
+  ships, and `argocd-cue-cmp/version.cue` is read by the chart at render
+  time. Each had a guard for whether IT was bumped; none checked whether
+  they still agreed.
+
+  So the failure was always the same: something publishes, the pin does
+  not move, and clusters keep the previous image while every signal
+  reports success. The backup runner sat six weeks behind its tree that
+  way, and the cue-cmp sidecar would have done it on the next release.
+
+  `scripts/check-version-coherence.sh` asserts the four relations —
+  operator pin == operator appVersion, webhook pin == webhook appVersion,
+  the compatibility entry names the pinned operator, and a sidecar bump
+  since the published chart tag demands a `currentVersion` bump. It runs
+  in `just lint` and as its own step in `platform-stack-check`, whose
+  trigger paths now include the two version files that live outside
+  `platform-stack/` — without them the job that compares the pins never
+  woke when one of them moved.
+
+  Each rule was verified by breaking it: an operator pin one version
+  behind, a compatibility entry naming a different operator, a
+  `currentVersion` with no entry, and the exact sidecar-bump-without-
+  chart-bump state that reached CI.
+
 - **The cue-cmp drift check is a script now, and `just lint` runs it.**
   It was inline shell inside `argocd-cue-cmp-check.yml` — the one drift
   guard in this repo that could not run before a push, while its four

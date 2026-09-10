@@ -36,6 +36,13 @@ on:
   pull_request:
     paths:
       - 'platform-stack/**'
+      # The chart READS argocd-cue-cmp/version.cue at render time and pins
+      # the operator charts by literal, so both are chart source living
+      # outside `platform-stack/` — without these paths a version that
+      # moves on one side never wakes the job that compares the two.
+      - 'argocd-cue-cmp/version.cue'
+      - 'operator/charts/*/Chart.yaml'
+      - 'scripts/check-version-coherence.sh'
       - 'scripts/check-platform-stack-version.sh'
       - 'scripts/check-gateway-render.sh'
       - '.github/workflows/platform-stack-check.yml'
@@ -44,6 +51,9 @@ on:
     branches: [master]
     paths:
       - 'platform-stack/**'
+      - 'argocd-cue-cmp/version.cue'
+      - 'operator/charts/*/Chart.yaml'
+      - 'scripts/check-version-coherence.sh'
       - 'scripts/check-platform-stack-version.sh'
       - 'scripts/check-gateway-render.sh'
       - '.github/workflows/platform-stack-check.yml'
@@ -172,6 +182,18 @@ jobs:
         # dot-free, and no LB-IPAM / L2 objects ship. Resolves its own
         # currentVersion and renders the chart, so it's self-contained.
         run: bash scripts/check-gateway-render.sh
+
+      - name: Version coherence (pins agree, sidecar bump rides a chart bump)
+        # The drift step below compares chart content against its own
+        # published tag. It cannot see the two versions that live OUTSIDE
+        # `platform-stack/` and are pinned from inside it — the operator
+        # charts' appVersion and `argocd-cue-cmp/version.cue`. Those drift
+        # silently: the image publishes, the pin does not move, and a stale
+        # component starts, serves and reports healthy. Twice now.
+        #
+        # No workflow inputs are interpolated here; the script reads the
+        # files in the checkout and asks the remote for published tags.
+        run: bash scripts/check-version-coherence.sh
 
       - name: Drift detection (chart content changed without version bump)
         env:
