@@ -9,6 +9,31 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## platform-stack 0.2.67 — clusters get the runner fix they were told they had (unreleased)
+
+### Fixed
+
+- **The backup CronJob was running a runner from before the broken-pipe
+  fix.** `platform-stack` pinned `apprafter-backup:v0.2.59`, and the
+  newest published runner (`v0.2.63`) is tagged at the commit *before*
+  that fix landed — so every cluster's nightly backup ran a binary whose
+  `exec_stream_from_file` still reported "Broken pipe (os error 32)"
+  instead of the stderr explaining the failure. That path streams
+  `pg_dump` output and tar archives, both far past any buffer, so the
+  wrong diagnosis was the only possible outcome there rather than a rare
+  race.
+
+  The pin now names `v0.2.64`, which the same push publishes — the pin
+  matches `cli/Cargo.toml`, which is what `release-backup-runner.yml`
+  builds from, and the version bump is itself a trigger path for that
+  workflow.
+
+  Nothing else would have surfaced this: a stale runner starts, exits
+  zero and writes a snapshot, so every signal an operator watches stays
+  green while the binary quietly does less than the release notes say.
+  `scripts/check-backup-runner-pin.sh` — added in 0.2.61 after this pin
+  rotted for six weeks — is what caught it, on its third catch.
+
 ## cli v0.2.64 — backup stops asking for what the cluster already has (unreleased)
 
 Three findings from an operator configuring off-site backup for the first

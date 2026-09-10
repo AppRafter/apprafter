@@ -1760,6 +1760,33 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.67": {
+	change:          "safe"
+	operatorVersion: "v0.2.47"
+	notes: """
+		The runner pin follows cli/runner v0.2.64, and this one carries a fix.
+
+		`KubeRsExec::exec_stream_from_file` propagated a stdin write error
+		before reaping the child, so a runner whose exec died early reported
+		"Broken pipe (os error 32)" — naming itself — and threw away the
+		stderr that said why. It streams `pg_dump` output and tar archives,
+		both far past any buffer, so the write must block for a reader that
+		is not coming: on that path the wrong diagnosis was the only possible
+		outcome, not a rare race.
+
+		The pinned v0.2.63 predates the fix. A stale runner still starts,
+		still exits zero and still writes a snapshot, so nothing else would
+		have reported that clusters were backing up with the old binary —
+		`scripts/check-backup-runner-pin.sh`, added in 0.2.61 for exactly
+		this, is what caught it.
+
+		v0.2.64 is published by the same push that ships this chart version
+		(the pin matches `cli/Cargo.toml`, which is what
+		`release-backup-runner.yml` builds from).
+		"""
+	references: ["docs/changelog/UNRELEASED.md#cli-v0263"]
+}
+
 compatibility: "0.2.66": {
 	change:          "safe"
 	operatorVersion: "v0.2.47"
