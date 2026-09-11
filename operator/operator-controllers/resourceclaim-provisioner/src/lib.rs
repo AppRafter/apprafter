@@ -73,6 +73,7 @@ pub mod gc;
 pub mod grace;
 pub mod nats;
 pub mod nats_accounts;
+pub mod nats_client;
 pub mod reaper;
 pub mod reconcile;
 pub mod redis_client;
