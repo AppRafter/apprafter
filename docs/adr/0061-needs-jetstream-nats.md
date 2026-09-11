@@ -593,6 +593,30 @@ that check covers it exactly.
 **Connection Secret** — `#ClaimFieldsFor.jetstream` gains
 `["url", "host", "port", "user", "pass", "account", "subjectPrefix", "inboxPrefix"]`.
 
+**The declarations ride the `ResourceClaim`, which is new.** `ResourceClaimSpec`
+carries five generic fields — `type`, `name`, `selector`, `size`, `persistent` —
+and deliberately nothing else: `needs.disk`'s `mountPath` lives on the
+`Application` and is read by the renderer, never copied onto the claim. That split
+is "the claim carries what the **provisioner** needs; app-side wiring stays on the
+Application", and it has held for every backend so far.
+
+jetstream is the first type where it does not hold, because `streams`, `consume`
+and `dynamicStreams` are not app-side wiring — they are the **input to the
+permission model**. Without them the provisioner cannot build an allow list or a
+deny vector at all, and `JetStreamNeed::as_service_need()`, the only conversion
+toward a claim, discards all three by design.
+
+So `ResourceClaimSpec` gains a **typed, jetstream-scoped sub-block** rather than
+three loose fields, mirroring the way `#Needs` gives `disk` its own `#DiskClaim`
+value type instead of widening `#ServiceNeed`. The generic five stay generic.
+
+Putting them on the claim rather than having the provisioner read `Application`s
+is deliberate: the provisioner **watches** `ResourceClaim`s, so a declaration edit
+updates the claim and triggers a reconcile through the path that already exists.
+Reading declarations from a second Kind would mean new RBAC, new event plumbing,
+and a claim→application resolution whose failure mode is a permission vector
+computed from stale declarations.
+
 **Per-environment overrides replace the whole slot, and for jetstream that is
 loud rather than silent.** Every `needs.<type>` key is replaced wholesale by an
 environment override — [ADR 0044](0044-per-environment-deploy.md)'s override-wins
