@@ -6,10 +6,16 @@
 //! application's deny vector depends on other applications' declarations
 //! — so any claim change anywhere invalidates other users' rules.
 //!
-//! This is the first of three pieces sharing this file (ADR 0061 §3 /
-//! §6): the input view and naming derivations (this task), the allow
-//! list and deny vector (next), and the file renderer (after that). Only
-//! the first is here — the other two are deliberately not anticipated.
+//! Three pieces, built across three tasks and landed in this order: the
+//! input view and naming derivations ([`ClaimView`] and friends,
+//! [`nats_stream_name`], [`nats_durable_name`]), the allow list and deny
+//! vector ([`allow_list`], [`deny_vector`]), and the file renderer
+//! ([`render_accounts_file`]) — which is the only one a caller outside
+//! this module needs; everything else is exported because the tests need
+//! it, not because it is meant to be called independently.
+
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 /// One live jetstream claim, flattened to what the renderer needs.
 #[derive(Clone, Debug, PartialEq)]
@@ -313,6 +319,174 @@ pub fn deny_vector(me: &ClaimView, namespace_claims: &[ClaimView]) -> Vec<String
     list
 }
 
+/// Rendering this file successfully MUST NOT be able to produce an
+/// account whose authentication can be bypassed (ADR 0042 §10, the same
+/// finding this design inherits from the Dragonfly ACL work: the
+/// dangerous failure mode of a credential file is not lockout but
+/// SILENTLY DISABLED authentication — a file that parses while omitting
+/// a user's password leaves the server accepting everyone as that user).
+/// Both variants are refusals, never a partial or best-effort render.
+#[derive(Debug, thiserror::Error)]
+pub enum AccountsFileError {
+    #[error("refusing to render: empty password for user {0}")]
+    EmptyPassword(String),
+    #[error("refusing to render: account {0} would carry no users")]
+    EmptyAccount(String),
+}
+
+/// The account-JetStream memory ceiling (ADR 0061 §3): seeded
+/// conservatively at Tier 1 rather than derived from the namespace's
+/// claims, because — unlike `max_file` — a memory-storage stream lives in
+/// the SERVER's own RSS, not on disk, so its cost is shared with every
+/// other tenant's process instead of being per-account-isolated the way
+/// file storage is. `0` disallows memory storage for the account
+/// entirely; `#JetStreamStream.storage` already defaults to `"file"` in
+/// CUE, so this floor does not change the common case, only forecloses
+/// the uncommon one until a later tier/task revisits it with a real
+/// budget.
+const ACCOUNT_MAX_MEM_BYTES: u64 = 0;
+
+/// One subject list, NATS-config-array-formatted: `["a", "b"]`, or `[]`
+/// for an empty list (valid syntax — an account with no PURGE grants, or
+/// no denials, renders one).
+fn fmt_subject_list(subjects: &[String]) -> String {
+    let quoted: Vec<String> = subjects.iter().map(|s| format!("{s:?}")).collect();
+    format!("[{}]", quoted.join(", "))
+}
+
+/// One namespace's account block: the `jetstream` limits, the management
+/// user (full access, including the SHARED `_INBOX.>` tree — it sets no
+/// custom inbox prefix of its own, ADR 0061 §3, so denying it `_INBOX.>`
+/// would stop it making a single request), then one user per claim in
+/// `peers`, each carrying that claim's own [`allow_list`]/[`deny_vector`]
+/// as its publish permissions and a subscribe grant scoped to its own
+/// subject and inbox prefixes only — never the shared `_INBOX.>` tree,
+/// which would let it read every other claim's in-flight replies.
+///
+/// Takes `peers` rather than the whole file's claims so it is
+/// independently unit-testable against a deliberately empty slice:
+/// [`render_accounts_file`] can never call this with an empty `peers` for
+/// any namespace it derives from `claims` (grouping only ever inserts a
+/// namespace key alongside its first claim), so THIS function's own
+/// `peers.is_empty()` check — before any indexing, before computing
+/// anything that would need `peers[0]` — is otherwise dead code with no
+/// test able to reach it through the public API.
+fn render_account(
+    namespace: &str,
+    peers: &[ClaimView],
+    password: &dyn Fn(&str) -> String,
+) -> Result<String, AccountsFileError> {
+    let account = format!("ns_{}", namespace.replace('-', "_"));
+
+    if peers.is_empty() {
+        return Err(AccountsFileError::EmptyAccount(account));
+    }
+
+    let mgr = mgr_user(namespace);
+    let mgr_pw = password(&mgr);
+    if mgr_pw.is_empty() {
+        // This and the per-claim check below are separate guards over
+        // separate users; a fixture that empties EVERY password at once
+        // (as `refuses_to_render_a_file_that_would_disable_authentication`
+        // does) cannot tell which one fired if the other is broken — each
+        // is isolated by its own test
+        // (`refuses_to_render_when_only_the_manager_password_is_empty` /
+        // `..._a_claim_users_password_is_empty`), found necessary only by
+        // mutation-testing this check on its own.
+        return Err(AccountsFileError::EmptyPassword(mgr));
+    }
+
+    let total_quota: u64 = peers.iter().map(|c| c.quota_bytes).sum();
+
+    let mut out = String::new();
+    writeln!(out, "{account}: {{").unwrap();
+    writeln!(
+        out,
+        "  jetstream: {{ max_mem: {ACCOUNT_MAX_MEM_BYTES}, max_file: {total_quota} }}"
+    )
+    .unwrap();
+    writeln!(out, "  users: [").unwrap();
+    writeln!(out, "    {{").unwrap();
+    writeln!(out, "      user: {mgr:?}").unwrap();
+    writeln!(out, "      password: {mgr_pw:?}").unwrap();
+    writeln!(out, "      permissions: {{").unwrap();
+    writeln!(out, "        publish: {{ allow: [\">\"] }}").unwrap();
+    writeln!(out, "        subscribe: {{ allow: [\">\", \"_INBOX.>\"] }}").unwrap();
+    writeln!(out, "      }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+
+    for c in peers {
+        let user = c.user();
+        let pw = password(&user);
+        if pw.is_empty() {
+            // See the mgr-level check above — same reasoning, isolated by
+            // `refuses_to_render_when_only_a_claim_users_password_is_empty`.
+            return Err(AccountsFileError::EmptyPassword(user));
+        }
+        let allow = allow_list(c);
+        let deny = deny_vector(c, peers);
+        let subscribe_own = format!("{}>", c.subject_prefix());
+        let subscribe_inbox = format!("{}.>", c.inbox_prefix());
+
+        writeln!(out, "    {{").unwrap();
+        writeln!(out, "      user: {user:?}").unwrap();
+        writeln!(out, "      password: {pw:?}").unwrap();
+        writeln!(out, "      permissions: {{").unwrap();
+        writeln!(out, "        publish: {{").unwrap();
+        writeln!(out, "          allow: {}", fmt_subject_list(&allow)).unwrap();
+        writeln!(out, "          deny: {}", fmt_subject_list(&deny)).unwrap();
+        writeln!(out, "        }}").unwrap();
+        writeln!(
+            out,
+            "        subscribe: {{ allow: [{subscribe_own:?}, {subscribe_inbox:?}] }}"
+        )
+        .unwrap();
+        writeln!(out, "      }}").unwrap();
+        writeln!(out, "    }}").unwrap();
+    }
+
+    writeln!(out, "  ]").unwrap();
+    writeln!(out, "}}").unwrap();
+    Ok(out)
+}
+
+/// Renders the WHOLE NATS accounts fragment from the live claim set (ADR
+/// 0061 §3) — one [`render_account`] block per namespace, grouped and
+/// sorted deterministically (`BTreeMap` by namespace, then each
+/// namespace's claims explicitly sorted by app — a `BTreeMap` only
+/// orders its KEYS, not what gets pushed into each value) so an
+/// unchanged derivation produces byte-identical output regardless of
+/// `claims`' input order: the property that lets a caller skip the write
+/// when nothing changed.
+///
+/// Emits no `SYS` account: ADR 0061 §2 puts that in the chart's
+/// statically-owned base `nats.conf`, which `include`s this fragment —
+/// this function's job stops at the accounts the LIVE CLAIM SET
+/// produces.
+///
+/// `password` is injected rather than read (e.g. from a Kubernetes
+/// Secret) so this function stays pure — no client, no network, no clock
+/// — and its tests need no fixtures.
+pub fn render_accounts_file(
+    claims: &[ClaimView],
+    password: &dyn Fn(&str) -> String,
+) -> Result<String, AccountsFileError> {
+    let mut by_namespace: BTreeMap<String, Vec<ClaimView>> = BTreeMap::new();
+    for c in claims {
+        by_namespace
+            .entry(c.namespace.clone())
+            .or_default()
+            .push(c.clone());
+    }
+
+    let mut out = String::new();
+    for (namespace, mut peers) in by_namespace {
+        peers.sort_by(|a, b| a.app.cmp(&b.app));
+        out.push_str(&render_account(&namespace, &peers, password)?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,5 +757,221 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(d, sorted, "output must be byte-stable across runs");
+    }
+
+    #[test]
+    fn renders_one_account_per_namespace_with_a_user_per_claim() {
+        let mut claims = ns_with_two_apps();
+        claims.push(claim("other", "solo"));
+        let out = render_accounts_file(&claims, &|u| format!("pw-{u}")).expect("renders");
+        assert!(out.contains("ns_demo: {"), "{out}");
+        assert!(out.contains("ns_other: {"), "{out}");
+        assert!(
+            out.contains("user: \"claim_demo_feeder_jetstream\""),
+            "{out}"
+        );
+        assert!(
+            out.contains("user: \"claim_demo_indexer_jetstream\""),
+            "{out}"
+        );
+        assert!(out.contains("user: \"mgr_demo\""), "{out}");
+        assert!(out.contains("user: \"mgr_other\""), "{out}");
+    }
+
+    #[test]
+    fn the_management_user_keeps_inbox_access() {
+        // NACK sets no custom inbox prefix; denying it `_INBOX.>` would stop
+        // it making a single request (ADR 0061 §3).
+        let out = render_accounts_file(&ns_with_two_apps(), &|u| format!("pw-{u}")).unwrap();
+        let mgr = out.split("user: \"mgr_demo\"").nth(1).expect("mgr block");
+        assert!(mgr.contains("_INBOX.>"), "mgr must keep _INBOX.>: {mgr}");
+    }
+
+    #[test]
+    fn a_claim_user_subscribes_only_to_its_own_prefixes() {
+        let out = render_accounts_file(&ns_with_two_apps(), &|u| format!("pw-{u}")).unwrap();
+        let block = out
+            .split("user: \"claim_demo_feeder_jetstream\"")
+            .nth(1)
+            .unwrap();
+        let sub = block
+            .split("subscribe")
+            .nth(1)
+            .unwrap()
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(sub.contains("feeder.>"));
+        assert!(sub.contains("_INBOX_demo_feeder.>"));
+        assert!(
+            !sub.contains("\"_INBOX.>\""),
+            "the shared inbox tree must not be granted"
+        );
+    }
+
+    #[test]
+    fn output_is_byte_stable_across_input_order() {
+        let a = ns_with_two_apps();
+        let mut b = a.clone();
+        b.reverse();
+        assert_eq!(
+            render_accounts_file(&a, &|u| format!("pw-{u}")).unwrap(),
+            render_accounts_file(&b, &|u| format!("pw-{u}")).unwrap(),
+            "an unchanged derivation must compare equal so the write can be skipped"
+        );
+    }
+
+    #[test]
+    fn refuses_to_render_a_file_that_would_disable_authentication() {
+        let err = render_accounts_file(&ns_with_two_apps(), &|_| String::new()).unwrap_err();
+        assert!(err.to_string().contains("empty password"), "{err}");
+    }
+
+    #[test]
+    fn refuses_to_render_when_only_the_manager_password_is_empty() {
+        // The mgr-level and per-claim `EmptyPassword` checks are separate
+        // code paths, but the fixture above sets EVERY password empty at
+        // once — bypassing either check alone still leaves the OTHER one
+        // firing, so that test cannot tell them apart (confirmed by
+        // mutation: disabling the mgr-only check turned zero tests red
+        // while that fixture stayed in place). This isolates the mgr-only
+        // check: every claim user gets a real password, only `mgr_demo`'s
+        // is empty.
+        let err = render_accounts_file(&ns_with_two_apps(), &|u| {
+            if u == "mgr_demo" {
+                String::new()
+            } else {
+                format!("pw-{u}")
+            }
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("mgr_demo"),
+            "must name the manager user specifically: {err}"
+        );
+    }
+
+    #[test]
+    fn refuses_to_render_when_only_a_claim_users_password_is_empty() {
+        // Symmetric isolation for the per-claim check: mgr and every OTHER
+        // claim user get a real password, only one claim user's is empty.
+        let err = render_accounts_file(&ns_with_two_apps(), &|u| {
+            if u == "claim_demo_feeder_jetstream" {
+                String::new()
+            } else {
+                format!("pw-{u}")
+            }
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("claim_demo_feeder_jetstream"),
+            "must name the claim user specifically: {err}"
+        );
+    }
+
+    #[test]
+    fn account_quota_is_the_sum_over_the_namespace() {
+        let mut claims = ns_with_two_apps();
+        claims[0].quota_bytes = 1 << 30;
+        claims[1].quota_bytes = 2 << 30;
+        let out = render_accounts_file(&claims, &|u| format!("pw-{u}")).unwrap();
+        assert!(out.contains("max_file: 3221225472"), "{out}");
+    }
+
+    #[test]
+    fn render_account_refuses_an_empty_namespace() {
+        // Not reachable through render_accounts_file's public API: its
+        // BTreeMap grouping only ever inserts a namespace key alongside
+        // its first claim, so `peers.is_empty()` can never be true for
+        // any namespace it derives from `claims`. Tested directly
+        // against `render_account` (this module's own private helper)
+        // instead — the "check emptiness before indexing" guard is
+        // defensive coding for whatever calls this function next, not
+        // dead code no test can reach.
+        let err = render_account("demo", &[], &|u| format!("pw-{u}")).unwrap_err();
+        assert!(err.to_string().contains("no users"), "{err}");
+    }
+
+    /// Unit tests above assert SHAPE (does the output contain the right
+    /// substrings); only `nats-server` itself accepts or rejects GRAMMAR,
+    /// and a file that parses while being wrong is this design's
+    /// characteristic failure (ADR 0042 §10) — so this is the one check
+    /// in the module that actually asks the server, not the string.
+    ///
+    /// Builds a small standalone `nats.conf` around `render_accounts_file`'s
+    /// output in a temp dir and runs `nats-server -t` (config check, no
+    /// actual listen) against it inside a `nats:2-alpine` container.
+    /// `render_accounts_file` emits no `$SYS` account (ADR 0061 §2: that
+    /// is the chart's static `nats.conf`, not this function's job) — this
+    /// test's OWN `nats.conf` supplies a minimal one, by hand, so the
+    /// fragment can stand alone; not via a parameter on
+    /// `render_accounts_file` (no production caller needs one — the
+    /// chart's real `nats.conf` already owns `$SYS`, per the same ADR
+    /// section), and not via `.replace()` surgery on the render's own
+    /// output, which the task this test was written for explicitly
+    /// rejected.
+    ///
+    /// Run: cargo test -p operator-controllers-resourceclaim-provisioner \
+    ///        rendered_file_is_valid_nats_config -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs podman"]
+    fn rendered_file_is_valid_nats_config() {
+        let fragment =
+            render_accounts_file(&ns_with_two_apps(), &|u| format!("pw-{u}")).expect("renders");
+
+        let nats_conf = r#"
+port: 4222
+jetstream: {
+  store_dir: "/tmp/nats-check-store"
+}
+system_account: "$SYS"
+accounts: {
+  "$SYS": {
+    users: [
+      { user: "admin", password: "check-only" }
+    ]
+  }
+  include "accounts.conf"
+}
+"#;
+
+        let dir = std::env::temp_dir().join(format!(
+            "nats-accounts-check-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(dir.join("nats.conf"), nats_conf).expect("write nats.conf");
+        std::fs::write(dir.join("accounts.conf"), &fragment).expect("write accounts.conf");
+
+        let mount = format!("{}:/etc/nats:ro,Z", dir.display());
+        let output = std::process::Command::new("podman")
+            .args([
+                "run",
+                "--rm",
+                "-v",
+                &mount,
+                "nats:2-alpine",
+                "-c",
+                "/etc/nats/nats.conf",
+                "-t",
+            ])
+            .output()
+            .expect("run podman — is it installed?");
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            output.status.success(),
+            "nats-server rejected the rendered config:\n\
+             --- nats.conf ---\n{nats_conf}\n\
+             --- accounts.conf ---\n{fragment}\n\
+             --- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
