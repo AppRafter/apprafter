@@ -328,11 +328,13 @@ impl JetStreamNeed {
 }
 
 /// `Application.spec.*.needs` — an explicit closed struct (2.6b) so
-/// `disk` can carry its own value type and every service key accepts a
-/// scalar **or** an array of named entries. Replaces the former
-/// `BTreeMap<String, ServiceNeed>` pattern-map. Mirrors the `needs`
-/// block in `application.cue` and the OpenAPI v3 CRD. Unknown keys are
-/// rejected at the CUE/CRD layer.
+/// `disk` and `jetstream` can each carry their own value type while
+/// most service keys accept a scalar **or** an array of named entries.
+/// `jetstream` (2.5 / ADR 0061 §6) is the one exception among the
+/// "service" keys: `JetStreamNeed`, scalar-only, no `(type, name)`
+/// identity. Replaces the former `BTreeMap<String, ServiceNeed>`
+/// pattern-map. Mirrors the `needs` block in `application.cue` and the
+/// OpenAPI v3 CRD. Unknown keys are rejected at the CUE/CRD layer.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Needs {
@@ -1036,12 +1038,17 @@ mod tests {
         let needs: Needs = serde_json::from_value(json!({
             "disk": [{ "name": "data", "size": "1Gi", "mountPath": "/data" }],
             "redis": { "selector": { "tier": "integrated" } },
-            "pg": [{ "name": "a" }, { "name": "b" }]
+            "pg": [{ "name": "a" }, { "name": "b" }],
+            "jetstream": {}
         }))
         .unwrap();
         let entries = needs.entries();
         // Deterministic key order: pg, jetstream, clickhouse, redis, s3,
         // notifications, disk — array entries by index within each type.
+        // A populated jetstream entry is in the fixture (not just pg/redis/
+        // disk) so a reordering of the jetstream block in `entries()` goes
+        // red here instead of leaving the whole workspace green (walk-found
+        // gap: the prior fixture never exercised jetstream's position).
         let shape: Vec<(String, Option<String>, bool)> = entries
             .iter()
             .map(|(ty, e)| (ty.clone(), e.name.clone(), e.disk.is_some()))
@@ -1051,6 +1058,7 @@ mod tests {
             vec![
                 ("pg".to_string(), Some("a".to_string()), false),
                 ("pg".to_string(), Some("b".to_string()), false),
+                ("jetstream".to_string(), None, false),
                 ("redis".to_string(), None, false),
                 ("disk".to_string(), Some("data".to_string()), true),
             ]

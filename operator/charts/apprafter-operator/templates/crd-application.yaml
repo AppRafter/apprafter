@@ -140,6 +140,7 @@ spec:
                                 subjects:
                                   items:
                                     type: string
+                                  minItems: 1
                                   type: array
                               required:
                               - name
@@ -275,6 +276,7 @@ spec:
                                   subjects:
                                     items:
                                       type: string
+                                    minItems: 1
                                     type: array
                                 required:
                                 - name

@@ -623,9 +623,17 @@ fn validate_needs_names(
 /// excluded — its identity rules live in `validate_disk_claims`;
 /// `jetstream` is intentionally excluded too — it carries its own type
 /// (`JetStreamNeed`, ADR 0061 §6) and is scalar-only, so the array-name
-/// uniqueness this function checks cannot apply to it. Its `name`/
-/// `persistent` rejection is a separate, dedicated webhook check). A
-/// renamed slot field on `Needs` fails to compile here.
+/// uniqueness this function checks cannot apply to it).
+///
+/// NOT YET IMPLEMENTED, and worth flagging precisely because its absence
+/// is easy to miss: nothing in this webhook rejects `needs.jetstream.name`
+/// or `.persistent` (ADR 0061 §6 says both must be — they're declared in
+/// the CUE/CRD types only so a validating webhook check CAN reject them).
+/// Today `needs.jetstream: {name: "x"}` passes CUE, the CRD, and this
+/// webhook, then `JetStreamNeed::as_service_need()` in
+/// `operator-core::application` silently drops both fields. That
+/// dedicated check is the next task's job, with its own tests. A renamed
+/// slot field on `Needs` fails to compile here.
 fn service_need_slots(needs: &Needs) -> [(&'static str, &Option<OneOrMany<ServiceNeed>>); 5] {
     [
         ("pg", &needs.pg),
@@ -1481,14 +1489,28 @@ fn scope_disk_entries<'a>(
 const PG_FIELDS: &[&str] = &["url", "user", "pass", "host", "port", "db"];
 /// redis connection-Secret field vocabulary (ADR 0046).
 const REDIS_FIELDS: &[&str] = &["url", "user", "pass", "host", "port", "db", "channelPrefix"];
-/// Service types that have a connection Secret at launch (ADR 0046).
-/// `disk` and the deferred types (jetstream, clickhouse, s3, notifications)
-/// do NOT have a connection Secret.
-const CLAIM_SUPPORTED_TYPES: &[(&str, &[&str])] = &[("pg", PG_FIELDS), ("redis", REDIS_FIELDS)];
+/// jetstream connection-Secret field vocabulary (2.5 / ADR 0061 §6).
+const JETSTREAM_FIELDS: &[&str] = &[
+    "url",
+    "host",
+    "port",
+    "user",
+    "pass",
+    "account",
+    "subjectPrefix",
+    "inboxPrefix",
+];
+/// Service types that have a connection Secret at launch (ADR 0046, 2.5 /
+/// ADR 0061 §6). `disk` and the still-deferred types (clickhouse, s3,
+/// notifications) do NOT have a connection Secret.
+const CLAIM_SUPPORTED_TYPES: &[(&str, &[&str])] = &[
+    ("pg", PG_FIELDS),
+    ("redis", REDIS_FIELDS),
+    ("jetstream", JETSTREAM_FIELDS),
+];
 /// Types that exist in the platform but have no connection Secret — any
 /// `claim.<type>.*` ref to them is rejected at the webhook.
-const CLAIM_UNSUPPORTED_TYPES: &[&str] =
-    &["disk", "jetstream", "clickhouse", "s3", "notifications"];
+const CLAIM_UNSUPPORTED_TYPES: &[&str] = &["disk", "clickhouse", "s3", "notifications"];
 
 /// 2.12 (ADR 0046): compute the effective TYPED `needs` for a given scope.
 /// Base scope: just `base.needs`. Per-environment scope: base.needs merged
@@ -1636,26 +1658,36 @@ fn validate_env_refs(
     }
 }
 
-/// The `OneOrMany<ServiceNeed>` slot of a typed `Needs` for a runtime
-/// service-type name, or `None` when the type is absent / not a service
-/// type. `disk` is intentionally not matched — a `claim.disk.*` ref is
-/// rejected earlier by `CLAIM_UNSUPPORTED_TYPES`. `jetstream` is
-/// intentionally not matched either — it is also in
-/// `CLAIM_UNSUPPORTED_TYPES` (no connection Secret yet), so callers
-/// always short-circuit on that check before reaching this function; it
-/// also carries its own type (`JetStreamNeed`), not
-/// `OneOrMany<ServiceNeed>`. A renamed `Needs` slot fails to compile
-/// here.
-fn needs_slot<'a>(needs: &'a Needs, service_type: &str) -> Option<&'a OneOrMany<ServiceNeed>> {
-    let slot = match service_type {
-        "pg" => &needs.pg,
-        "clickhouse" => &needs.clickhouse,
-        "redis" => &needs.redis,
-        "s3" => &needs.s3,
-        "notifications" => &needs.notifications,
-        _ => return None,
-    };
-    slot.as_ref()
+/// The declared `(name)` identities for a runtime service-type under a
+/// typed `Needs` — `None` when the type is absent / not a service type,
+/// else one element per entry (`None` for an unnamed default, `Some` for
+/// a named one). `disk` is intentionally not matched — a `claim.disk.*`
+/// ref is rejected earlier by `CLAIM_UNSUPPORTED_TYPES`.
+///
+/// `jetstream` carries its own type (`JetStreamNeed`, ADR 0061 §6), not
+/// `OneOrMany<ServiceNeed>`, so it can't share the five slots' generic
+/// `&Option<OneOrMany<ServiceNeed>>` shape — hence this function returns
+/// the extracted name list rather than the raw slot (the only thing
+/// `validate_claim_ref` ever did with the slot). jetstream is
+/// scalar-only and has no `(type, name)` identity, so a declared
+/// jetstream need always yields exactly one unnamed entry (`vec![None]`)
+/// — its own `name` field is NOT a claim identity (ADR 0061 §6 reserves
+/// it for a future webhook rejection; see `service_need_slots`'s doc).
+/// A renamed `Needs` slot fails to compile here.
+fn needs_slot(needs: &Needs, service_type: &str) -> Option<Vec<Option<String>>> {
+    fn names(slot: &Option<OneOrMany<ServiceNeed>>) -> Option<Vec<Option<String>>> {
+        slot.as_ref()
+            .map(|s| s.as_slice_vec().into_iter().map(|n| n.name).collect())
+    }
+    match service_type {
+        "pg" => names(&needs.pg),
+        "clickhouse" => names(&needs.clickhouse),
+        "redis" => names(&needs.redis),
+        "s3" => names(&needs.s3),
+        "notifications" => names(&needs.notifications),
+        "jetstream" => needs.jetstream.as_ref().map(|_| vec![None]),
+        _ => None,
+    }
 }
 
 /// Validate a `claim` ref string (`"<type>.<field>"` or
@@ -1689,7 +1721,7 @@ fn validate_claim_ref(
         errors.push(ValidationError::new(
             field_path,
             format!(
-                "claim ref {path:?}: type {service_type:?} has no connection Secret (disk is storage-only; jetstream/clickhouse/s3/notifications are deferred to a future release)"
+                "claim ref {path:?}: type {service_type:?} has no connection Secret (disk is storage-only; clickhouse/s3/notifications are deferred to a future release)"
             ),
         ));
         return;
@@ -1697,7 +1729,7 @@ fn validate_claim_ref(
 
     // Check if the type is declared in the effective needs for this scope
     // (the typed slot is `Some`).
-    let Some(slot) = needs_slot(eff_needs, service_type) else {
+    let Some(entry_names) = needs_slot(eff_needs, service_type) else {
         errors.push(ValidationError::new(
             field_path,
             format!(
@@ -1727,12 +1759,12 @@ fn validate_claim_ref(
     }
 
     // If a name segment is present, validate the named entry exists. The
-    // entry names come from the TYPED slot's `ServiceNeed.name` fields.
+    // entry names come from `needs_slot` — `ServiceNeed.name` for the five
+    // service types, always empty for jetstream (scalar-only, ADR 0061 §6).
     if let Some(name) = name_opt {
-        let named_entries: Vec<String> = slot
-            .as_slice_vec()
+        let named_entries: Vec<String> = entry_names
             .into_iter()
-            .filter_map(|n| n.name)
+            .flatten()
             .filter(|n| !n.is_empty())
             .collect();
         if !named_entries.iter().any(|n| n == name) {
@@ -3294,25 +3326,84 @@ mod tests {
     }
 
     #[test]
-    fn rejects_claim_ref_deferred_type_jetstream() {
-        // A claim ref to a deferred type (jetstream) is rejected even
-        // if declared in needs.
+    fn accepts_claim_ref_to_jetstream_fields() {
+        // 2.5 / ADR 0061 §6: jetstream now has a connection-Secret field
+        // vocabulary (`#ClaimFieldsFor.jetstream` in application.cue), so
+        // every one of its fields must resolve when declared.
+        for field in [
+            "url",
+            "host",
+            "port",
+            "user",
+            "pass",
+            "account",
+            "subjectPrefix",
+            "inboxPrefix",
+        ] {
+            let spec = json!({
+                "base": {
+                    "image": "ghcr.io/acme/web:1.0",
+                    "needs": { "jetstream": {} },
+                    "env": { "U": { "claim": format!("jetstream.{field}") } }
+                }
+            });
+            let errors = validate_application_spec(&spec);
+            let claim_errs: Vec<&ValidationError> = errors
+                .iter()
+                .filter(|e| e.field == "spec.base.env.U")
+                .collect();
+            assert!(
+                claim_errs.is_empty(),
+                "claim.jetstream.{field} must resolve: {claim_errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_jetstream_claim_field() {
         let spec = json!({
             "base": {
                 "image": "ghcr.io/acme/web:1.0",
                 "needs": { "jetstream": {} },
-                "env": { "JS_URL": { "claim": "jetstream.url" } }
+                "env": { "U": { "claim": "jetstream.nosuchfield" } }
             }
         });
         let errors = validate_application_spec(&spec);
         let claim_errs: Vec<&ValidationError> = errors
             .iter()
-            .filter(|e| e.field == "spec.base.env.JS_URL")
+            .filter(|e| e.field == "spec.base.env.U")
             .collect();
         assert_eq!(claim_errs.len(), 1);
         assert!(
-            claim_errs[0].message.contains("deferred")
-                || claim_errs[0].message.contains("no connection Secret")
+            claim_errs[0].message.contains("not valid for"),
+            "{claim_errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_jetstream_claim_ref_without_needs_declared() {
+        // The trap the reviewer found: adding jetstream to
+        // `CLAIM_SUPPORTED_TYPES` without restoring its `needs_slot()` arm
+        // would make every jetstream claim ref — even a correctly declared
+        // one — read as "not declared". Assert the genuinely-undeclared
+        // case still reports that message, so a regression here (the
+        // `needs_slot()` arm going missing again) goes red instead of
+        // silently changing which case produces the message.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "env": { "U": { "claim": "jetstream.url" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        let claim_errs: Vec<&ValidationError> = errors
+            .iter()
+            .filter(|e| e.field == "spec.base.env.U")
+            .collect();
+        assert_eq!(claim_errs.len(), 1);
+        assert!(
+            claim_errs[0].message.contains("not declared in needs"),
+            "{claim_errs:?}"
         );
     }
 

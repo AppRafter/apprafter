@@ -40,6 +40,22 @@ _crdMetas: Application: {
 	schemaPatches: {
 		"base.image": {pattern: "^.+$"}
 		"environments[*].image": {pattern: "^.+$"}
+
+		// `needs.jetstream.streams[].subjects`: the hand-rolled non-empty
+		// rule the CUE type deliberately omits — see the comment on
+		// `#JetStreamStream.subjects` in `schemas/v1alpha1/application.cue`
+		// for why `& [_, ...]` can't live in the CUE type itself (it breaks
+		// `cue export --out openapi`). Same precedent as SourceCredential's
+		// `git.repoPrefixes` below: restore `minItems` here so the
+		// generated CRD enforces "at least one subject" even though CUE
+		// exports a bare `{type: array, items: {type: string}}`. Two
+		// entries because `needs` is duplicated under both `base` and
+		// `environments[*]` in the rendered schema (same reason `image`'s
+		// pattern needs two entries above). `streams[]` descends into the
+		// array's `items`, matching MigrationPlan's `changes[].from`
+		// precedent for a multi-level path.
+		"base.needs.jetstream.streams[].subjects": {minItems: 1}
+		"environments[*].needs.jetstream.streams[].subjects": {minItems: 1}
 	}
 
 	// `status.lastAppliedSpec` is the 2.16b migration baseline — a raw

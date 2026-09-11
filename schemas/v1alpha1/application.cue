@@ -132,7 +132,9 @@ package v1alpha1
 	// name and env var (`<app>-pg` / `DATABASE_URL`); a named entry
 	// gets `<app>-pg-<name>` / `DATABASE_URL_<NAME>`. `disk` is its
 	// own value type (`#DiskClaim`) — claim-backed persistent block
-	// storage mounted into the workload.
+	// storage mounted into the workload. `jetstream` is ALSO its own
+	// value type (`#JetStreamNeed`, 2.5 / ADR 0061) — scalar only, no
+	// array, no `(type, name)` identity.
 	//
 	// This is an explicit CLOSED struct (was a pattern map keyed by
 	// `#PlatformServiceType`): unknown keys are rejected under full
@@ -178,9 +180,10 @@ package v1alpha1
 // secret payload: "<name>/<key>"
 
 // #ClaimFieldsFor — the per-network-need field set (the keys each
-// provisioner writes into the connection Secret). pg + redis only ship
-// connection Secrets today. This is the SINGLE SOURCE OF TRUTH for the
-// claim field vocabulary, shared by:
+// provisioner writes into the connection Secret). pg, redis and
+// jetstream ship connection Secrets today; clickhouse, s3 and
+// notifications don't have an entry here yet. This is the SINGLE
+// SOURCE OF TRUTH for the claim field vocabulary, shared by:
 //   - the operator renderer's secretKeyRef key resolution,
 //   - the admission webhook's enum validation,
 //   - the cue-cmp / `apprafter app validate` generated `claim` binding.
@@ -280,9 +283,10 @@ _mkFields: {
 
 // #Needs — the closed set of declared dependency keys (2.6b /
 // ADR 0043). A definition (closed by default) so an unknown key is
-// rejected under full CUE evaluation. Each service key accepts a
+// rejected under full CUE evaluation. Most service keys accept a
 // scalar `#ServiceNeed` (the unnamed default) or an array of named
-// `#ServiceNeed`s; `disk` carries `#DiskClaim`.
+// `#ServiceNeed`s; `disk` carries `#DiskClaim`; `jetstream` carries its
+// own scalar-only `#JetStreamNeed` (2.5 / ADR 0061 §6).
 #Needs: {
 	pg?: #ServiceNeed | [...#ServiceNeed]
 
@@ -412,11 +416,15 @@ _mkFields: {
 	name: string
 	// Subjects the stream collects. A subject whose FIRST TOKEN is not the
 	// owning application's name is fan-in (ADR 0061 §6) and fires ADR 0052
-	// trigger #16. Non-empty — enforced by the CRD `minItems` + webhook
-	// (a CUE-level `& [_, ...]` non-empty constraint breaks `cue export
-	// --out openapi`: it cannot synthesize a concrete `default` element
-	// for a non-concrete-typed minItems:1 list — same reason
-	// `#SourceCredentialSpec.git.repoPrefixes` takes this route).
+	// trigger #16. Non-empty — enforced by the CRD `minItems: 1`
+	// (`schemas/crdmeta/meta.cue`'s `"…needs.jetstream.streams[].subjects"`
+	// schemaPatches, same route as `#SourceCredentialSpec.git.repoPrefixes`).
+	// NOT yet enforced by the admission webhook — that's a later task
+	// (the `validate_jetstream_need` check doesn't exist yet). A
+	// CUE-level `& [_, ...]` non-empty constraint can't live in the type
+	// itself: it breaks `cue export --out openapi`, which can't
+	// synthesize a concrete `default` element for a non-concrete-typed
+	// minItems:1 list.
 	subjects: [...string]
 	storage?:   "file" | *"file" | "memory"
 	retention?: "limits" | *"limits" | "interest" | "workqueue"
