@@ -565,6 +565,23 @@ that check covers it exactly.
 **Connection Secret** — `#ClaimFieldsFor.jetstream` gains
 `["url", "host", "port", "user", "pass", "account", "subjectPrefix", "inboxPrefix"]`.
 
+**Per-environment overrides replace the whole slot, and for jetstream that is
+loud rather than silent.** Every `needs.<type>` key is replaced wholesale by an
+environment override — [ADR 0044](0044-per-environment-deploy.md)'s override-wins
+model, which 2.16c extended to subfield deep-merge for `expose` and `imagePolicy`
+while deferring `needs` to 2.16i. jetstream inherits that, and the consequence is
+sharper than for any other need: `environments.prod.needs.jetstream: {size: large}`
+drops `base`'s entire `streams` and `consume` block, i.e. the whole producer /
+consumer contract, for one field's sake.
+
+Leaving that silent was rejected. The webhook therefore **refuses** an environment
+override of `needs.jetstream` that omits `streams` or `consume` while `base`
+declares them, and says what was about to be lost. Special-casing jetstream into a
+deep merge was also rejected: it would pre-empt 2.16i and make one need behave
+unlike the other six, which is a worse thing to carry than a rule that tells you
+to repeat yourself. When 2.16i lands the deep merge generally, this rule retires
+with it.
+
 ### 7. Gating — three new ADR 0052 triggers
 
 [ADR 0052](0052-migration-security-axis.md) carve-out #7 justifies not gating

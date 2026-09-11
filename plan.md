@@ -3137,8 +3137,9 @@ instead of carrying parallel definitions.
 **Поставка:**
 - [ ] `component_nats.cue` + `component_nack.cue` (`enabled: false`), namespace `nats-system` отгружается безусловно; провижионер включает компонент merge-патчем `PlatformStack.spec.overrides.nats.enabled` и жнёт по предикату ADR 0042 §9.1.
 - [ ] Сид `jetstream-integrated` ServiceProvider с **пином образа сервера** и tier-aware маппингом `#Size` → квота аккаунта.
-- [ ] `Backend::Nats` в `resourceclaim-provisioner` (новые модули `nats.rs` / `nats_client.rs`): аккаунт `ns_<namespace>`, юзер на claim, `mgr_<ns>`, файл аккаунтов выводится ЦЕЛИКОМ из живого множества claim'ов, единственный писатель.
-- [ ] Deny-вектор: **по позициям, не по именам глаголов** для полностью запрещённых стримов; обе формы `$JS.ACK`/`$JS.FC` (v1 и v2); вектор на **консьюмеров** для разделённых стримов; blanket при `dynamicStreams: false`.
+- [ ] `Backend::Nats` в `resourceclaim-provisioner` (модуль `nats_accounts.rs` — чистый рендер; `nats_client.rs` — I/O): аккаунт `ns_<namespace>`, юзер на claim, `mgr_<ns>`, файл аккаунтов выводится ЦЕЛИКОМ из живого множества claim'ов, единственный писатель.
+- [ ] **Allow-список перечисляет глаголы и ЯВЛЯЕТСЯ границей безопасности**; deny лишь вырезает дыры в том, что он впустил. `dynamicStreams` — решение allow-списка, НЕ blanket-deny (ADR 0061 §4.3: позиционные паттерны полны против замкнутого множества и дырявы против произвольной глубины токенов — измерено).
+- [ ] Deny-вектор: **по позициям, не по именам глаголов** для полностью запрещённых стримов; обе формы `$JS.ACK`/`$JS.FC` (v1 и v2); вектор на **консьюмеров** для разделённых стримов.
 - [ ] `#JetStreamNeed` в схеме: `{selector?, size?, dynamicStreams?, streams?, consume?}` + `name?`/`persistent?` объявлены ТОЛЬКО чтобы вебхук их отклонял (иначе apiserver вырежет их молча). Четыре зеркала + `crdgen` + `just crd-validate`.
 - [ ] Connection-Secret: `url host port user pass account subjectPrefix inboxPrefix`; `jetstream` уходит из `CLAIM_UNSUPPORTED_TYPES`.
 - [ ] Объявленные стримы и дюрейблы через NACK CR в `nats-system` (cross-namespace ownerRef запрещён → удаление явное, как у `needs.disk`).
