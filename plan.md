@@ -3130,19 +3130,27 @@ instead of carrying parallel definitions.
 ---
 
 ### 2.5 needs.jetstream → NATS account/stream
-> 🏁 SR: D — needs.jetstream dropped; reactivate on 2+ explicit requests
+> 🏁 SR: A — **un-dropped из bucket D 2026-09-11**: внешний проект требует JetStream на AppRafter, то есть наступило условие «2+ explicit requests» из самого маркера. **3.2 (kine+NATS) при этом НЕ требуется и остаётся отложенным** — связь была только через прежний план «NATS embedded в kine», от которого дизайн отказался.
+
+**Полный дизайн + измерения + альтернативы + риски — ADR 0061.** Три факта из него переписали исходную постановку ниже: lifecycle-оператора у NATS нет (`nats-operator` заархивирован) → официальный helm-чарт как **лениво включаемый компонент** platform-stack, а не «NATS-кластер embedded в kine»; аккаунт выдаётся **на namespace**, а не на claim, и заводится **config-file-аккаунтами** (`user`/`password`, как у redis), а не JWT/NKEY; персистентность — свойство **стрима** (`storage: file|memory`), поэтому `persistent` для jetstream отклоняется.
 
 **Поставка:**
-- [ ] NATS-кластер как platform-service (в Tier 1 — single node, embedded в kine — 3.2).
-- [ ] `jetstream-integrated` ServiceProvider: создание account, stream, consumer scopes на claim.
-- [ ] Credentials (NKEY/JWT) в Secret.
-- [ ] `Application.needs.jetstream.streams: [...]` создаёт streams декларативно.
+- [ ] `component_nats.cue` + `component_nack.cue` (`enabled: false`), namespace `nats-system` отгружается безусловно; провижионер включает компонент merge-патчем `PlatformStack.spec.overrides.nats.enabled` и жнёт по предикату ADR 0042 §9.1.
+- [ ] Сид `jetstream-integrated` ServiceProvider с **пином образа сервера** и tier-aware маппингом `#Size` → квота аккаунта.
+- [ ] `Backend::Nats` в `resourceclaim-provisioner` (новые модули `nats.rs` / `nats_client.rs`): аккаунт `ns_<namespace>`, юзер на claim, `mgr_<ns>`, файл аккаунтов выводится ЦЕЛИКОМ из живого множества claim'ов, единственный писатель.
+- [ ] Deny-вектор: **по позициям, не по именам глаголов** для полностью запрещённых стримов; обе формы `$JS.ACK`/`$JS.FC` (v1 и v2); вектор на **консьюмеров** для разделённых стримов; blanket при `dynamicStreams: false`.
+- [ ] `#JetStreamNeed` в схеме: `{selector?, size?, dynamicStreams?, streams?, consume?}` + `name?`/`persistent?` объявлены ТОЛЬКО чтобы вебхук их отклонял (иначе apiserver вырежет их молча). Четыре зеркала + `crdgen` + `just crd-validate`.
+- [ ] Connection-Secret: `url host port user pass account subjectPrefix inboxPrefix`; `jetstream` уходит из `CLAIM_UNSUPPORTED_TYPES`.
+- [ ] Объявленные стримы и дюрейблы через NACK CR в `nats-system` (cross-namespace ownerRef запрещён → удаление явное, как у `needs.disk`).
+- [ ] Триггеры ADR 0052 #14/#15/#16 + переформулировка carve-out #7.
+- [ ] Детектор `ForeignSubjectCapture` (`report`/`delete`), условия `QuotaExceeded`, `PrefixPreCaptured`, `NamespaceDrainRisk`, `WorkqueueSubjectOverlap`.
+- [ ] `shipped.rs` `jetstream`: `Declared` → `Shipped`; `operator-guide/jetstream.md`, страница в `how-it-works/`, строка в `docs/status.md`.
 
-**Acceptance:** Application декларирует `streams: ["blocks-head"]`, NATS показывает stream созданным; приложение публикует/подписывается.
+**Acceptance:** приложение объявляет `needs.jetstream` со стримом и `consume` на стрим соседа — оба работают; третье приложение упирается в `NOPERM`; подделка ack и подписка на `_INBOX.>` отклоняются; `dynamicStreams: false` не может создать стрим с `sources` на чужой; удаление claim'а сносит его стримы и не трогает соседские.
 
-**Зависит от:** 2.3
+**Зависит от:** 2.3, ADR 0061
 
-**Размер:** L
+**Размер:** L (координированный релиз operator + platform-stack + **CLI** — `app validate` вшивает схему через `include_str!`)
 
 ---
 

@@ -92,6 +92,7 @@ ADRs are never deleted; supersession preserves the historical record.
 | 0058 | [public surfaces are written for their reader, not derived from our artifacts](./0058-public-surfaces-are-written-for-their-reader.md) | Accepted |
 | 0059 | [rolling back a moving tag pins the application to a digest](./0059-application-image-pin.md) | Accepted |
 | 0060 | [no emergency root password on a Tier-1 node](./0060-no-emergency-root-password.md) | Accepted |
+| 0061 | [`needs.jetstream` → NATS — account per namespace, subject isolation, and what a deny vector can and cannot hold](./0061-needs-jetstream-nats.md) | Accepted |
 
 ## Writing a new record
 

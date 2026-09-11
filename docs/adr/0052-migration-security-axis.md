@@ -2,7 +2,12 @@
 
 ## Status
 
-`Accepted` (2026-08-06).
+`Accepted` (2026-08-06). **Extended by [ADR 0061](0061-needs-jetstream-nats.md)**
+(2026-09-11): three `security-boundary` triggers (#14 `jetstream-consume-add`,
+#15 `jetstream-dynamic-streams-enable`, #16 `jetstream-foreign-subject`), and
+carve-out #7's *categorical* claim — that a `claim.*` construct is self-scoped —
+is narrowed to what it was measured against. The structural hardening, the
+authority model and the §6 ungated set are unaffected.
 
 ADR-first for subphase 2.16b-sec (`plan.md` §2.16b-sec — "App-migration
 security axis"). It extends the application-scope destructive classifier
@@ -81,9 +86,12 @@ is **reclassified** from `requires-restart` to `security-boundary`: a different
 repository can serve entirely different content, so it is a pull-source /
 content-provenance change, not a mere restart.
 
-### 2. Seven additive / escalation triggers (all `security-boundary`)
+### 2. Additive / escalation triggers (all `security-boundary`)
 
-All seven fire on an **addition or escalation** over the effective spec, and all
+> Seven at acceptance (#7–#13); ten since [ADR 0061](0061-needs-jetstream-nats.md)
+> added #14–#16 on 2026-09-11.
+
+All of them fire on an **addition or escalation** over the effective spec, and all
 gate for approval (none is a webhook reject). `from`/`to` carry only string
 sentinels — never a literal env value (see §1.4 below).
 
@@ -96,13 +104,29 @@ sentinels — never a literal env value (see §1.4 below).
 | 11 | `public-hostname-add` | `expose.hostname` | new effective is public && the public hostname set gains a member | `"(none)"` → `"<host>"` |
 | 12 | `public-port-retarget` | `expose.port` | new effective is public && the port differs | `"8080"` → `"9090"` |
 | 13 | `image-policy-relaxation` | `imagePolicy.resolve` | old `resolve == "off"` && new `!= "off"` && the effective image is not already a digest | `"off"` → `"digest"` |
+| 14 | `jetstream-consume-add` | `needs.jetstream.consume[]` | an entry is added whose `from` is another application | `"(none)"` → `"feeder/blocks-head"` |
+| 15 | `jetstream-dynamic-streams-enable` | `needs.jetstream.dynamicStreams` | old effective `false`/absent && new `true` | `"false"` → `"true"` |
+| 16 | `jetstream-foreign-subject` | `needs.jetstream.streams[].subjects`, `…[].allowPurge` | a declared subject is added whose first token is not the application's own name, **or** `allowPurge` is set on a stream whose subjects already contain one | `"shop.orders.>"` → `"billing.orders.>"` |
+
+Triggers 14–16 arrive with [ADR 0061](0061-needs-jetstream-nats.md) (2026-09-11);
+their rationale, including the measurement that makes #15 a `security-boundary`
+change rather than a convenience, lives there.
 
 Deliberate carve-outs, so the security axis does not create approver fatigue on
 benign edits:
 
-- **#7 is secret-only.** A `claim.*` ref is self-scoped (ADR 0046 — the value is
-  provider-derived and namespace-bound), so the common `claim.pg.url` flow is
-  never an exfiltration primitive and is not gated.
+- **#7 is secret-only** — for the claim types that existed when this record was
+  written. A `claim.pg.*` / `claim.redis.*` ref is self-scoped (ADR 0046 — the
+  value is provider-derived and namespace-bound), so the common `claim.pg.url`
+  flow is never an exfiltration primitive and is not gated. **The
+  categorical form of that claim is retracted (2026-09-11, ADR 0061):**
+  `needs.jetstream` introduced the first claim-scoped constructs that reach
+  *another application's* data — `consume`, and a declared stream naming a
+  neighbour's subject prefix — which is exactly the additive/escalation direction
+  this axis exists to gate. They are gated as #14 and #16. The carve-out is
+  therefore a statement about provider-derived connection values, not about
+  `claim.*` as a category, and a future claim type must be checked against it
+  rather than assumed to inherit it.
 - **#10 and #11 co-fire** under the webhook's bidirectional hostname↔public
   coupling (an `internal → public` flip forces a hostname add). The rollup
   (§3) carries both in `changes[]`; they are deliberately **not merged**,
@@ -274,10 +298,14 @@ Negative / neutral:
 - **Merge #10 and #11 into one "public exposure" trigger.** Rejected: a hostname
   can be added to an already-public app without a network escalation, so
   collapsing them would lose a real signal; the rollup carries both cleanly.
-- **Gate `claim.*` env-ref adds as well as `secret:`.** Rejected: `claim.*`
-  values are provider-derived and self-scoped (ADR 0046), not an exfiltration
-  primitive; gating them would fire on the common `claim.pg.url` flow and create
-  approver fatigue for no security gain.
+- **Gate `claim.*` env-ref adds as well as `secret:`.** Rejected: a `claim.*`
+  *value* is provider-derived and self-scoped (ADR 0046), not an exfiltration
+  primitive; gating it would fire on the common `claim.pg.url` flow and create
+  approver fatigue for no security gain. **Narrowed 2026-09-11 (ADR 0061):** this
+  rejects gating the env-reference, and does not license treating every
+  claim-scoped construct as self-scoped. `needs.jetstream.consume` and a declared
+  stream naming a neighbour's subject prefix both reach another application's
+  data and are gated (#14, #16).
 - **Authenticate the status write by userInfo instead of fieldManager.**
   Rejected for the status path: the SSA fieldManager is the operator's root of
   trust for its own writes and is already the mechanism `migrationplans/status`
