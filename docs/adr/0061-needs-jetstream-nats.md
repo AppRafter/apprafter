@@ -95,6 +95,32 @@ justify for one fixed name) → the provisioner writes the `nats-accounts` Secre
 file inside the chart is **not** the fix; it would make chart and provisioner
 two owners of one Secret.
 
+**How the accounts file reaches the reloader — measured on chart `nats` 2.14.6.** The
+reloader is not given a directory to watch; it is given explicit `-config <file>` flags,
+by default just `/etc/nats-config/nats.conf`, and there is no `reloader.extraArgs`. Three
+chart-native values compose to close this without forking anything, and the chain was
+verified by rendering:
+
+- `config.merge` with a key **ending in `$include`** (e.g.
+  `accounts$include: ./accounts-secret/accounts.conf`) emits both the `include` directive
+  in `nats.conf` *and* an extra `-config /etc/nats-config/accounts-secret/accounts.conf`
+  in the reloader's argv — the chart's `nats.reloaderConfig` helper walks the whole
+  `config` tree for exactly this purpose;
+- `podTemplate.patch` (JSON Patch, `add` on `/spec/volumes/-`) adds the
+  provisioner-owned Secret as a volume;
+- `container.patch` (`add` on `/volumeMounts/-`) mounts it at
+  `/etc/nats-config/accounts-secret`, and `reloader.natsVolumeMountPrefixes` — default
+  `["/etc/"]` — mirrors that mount into the reloader container automatically, with no
+  `reloader.patch` needed.
+
+**The mount must be a whole directory, never a `subPath`.** A `subPath` mount of a Secret
+does not receive updates when the Secret changes — kubelet re-syncs whole-directory
+mounts only (`kubernetes/kubernetes#50345`). Mounting the file directly at
+`/etc/nats-config/accounts.conf` with `subPath: accounts.conf` reads as the tidier
+arrangement and would defeat live reload **silently**: the file would simply never
+change. The nested-directory form is the one that works, and the reason is recorded here
+because nothing in the chart or in this design would otherwise explain the indirection.
+
 The `jetstream.nats.io` CRDs arrive with the `nack` component, so stream
 application is gated on the CRD being `Established`. Argo CD's
 `SkipDryRunOnMissingResource` does not help — it governs Argo CD's dry-run, not
@@ -148,16 +174,32 @@ are the equivalents.
 Each application owns the subject prefix `<app>.` unconditionally. The claim
 user `claim_<ns>_<app>_jetstream` gets:
 
+**The allow list enumerates verbs, and that is the security boundary.** `deny` only
+carves holes in what `allow` already admits; it is not, and cannot be, a boundary of its
+own (§4.2). An operation this platform has not listed does not work — which is the
+direction a platform's failures should point.
+
 ```
-publish   allow: <app>.>, $JS.API.>, $JS.ACK.>, $JS.FC.>     ← minimal, see §4.3
+publish   allow: <app>.>
+                 $JS.ACK.>    $JS.FC.>
+                 $JS.API.INFO
+                 $JS.API.STREAM.NAMES
+                 $JS.API.STREAM.INFO.>          $JS.API.STREAM.MSG.GET.>
+                 $JS.API.DIRECT.GET.>
+                 $JS.API.CONSUMER.CREATE.>      $JS.API.CONSUMER.DURABLE.CREATE.>
+                 $JS.API.CONSUMER.INFO.>        $JS.API.CONSUMER.DELETE.>
+                 $JS.API.CONSUMER.LIST.>        $JS.API.CONSUMER.NAMES.>
+                 $JS.API.CONSUMER.MSG.NEXT.>    $JS.API.CONSUMER.PAUSE.>
+                 $JS.API.CONSUMER.RESET.>
+                 $JS.API.STREAM.PURGE.<own stream declared allowPurge: true>   (§6)
+          when `dynamicStreams: true`, additionally:
+                 $JS.API.STREAM.CREATE.>        $JS.API.STREAM.UPDATE.>
+                 $JS.API.STREAM.DELETE.>        $JS.API.STREAM.MSG.DELETE.>
 
-  deny (A) always:      $JS.API.STREAM.LIST
-                        $JS.API.STREAM.SNAPSHOT.>   $JS.API.STREAM.RESTORE.>
-
-  deny (B) every declared stream S in the namespace, INCLUDING THE APP'S OWN:
+  deny (B) every declared stream S in the namespace, INCLUDING THE APP'S OWN —
+           only reachable at all when `dynamicStreams: true`, since the mutating
+           verbs are otherwise absent from the allow list:
                         $JS.API.STREAM.UPDATE.S   .DELETE.S   .MSG.DELETE.S
-                        $JS.API.STREAM.PURGE.S — unless S is the app's own stream
-                                                 declared with `allowPurge: true`
 
   deny (C) every declared stream S the app neither owns nor consumes —
            BY POSITION, never by verb name:
@@ -171,12 +213,20 @@ publish   allow: <app>.>, $JS.API.>, $JS.ACK.>, $JS.FC.>     ← minimal, see §
                         $JS.ACK.S.D.>             $JS.ACK.*.*.S.D.>
                         $JS.FC.S.D.>              $JS.FC.*.*.S.D.>
 
-  deny (E) when `dynamicStreams: false` — blanket:
-                        $JS.API.STREAM.CREATE.>  .UPDATE.>  .DELETE.>  .PURGE.>
-                        $JS.API.STREAM.MSG.DELETE.>         .LEADER.STEPDOWN.>
-
 subscribe allow: <app>.>, <inboxPrefix>.>
 ```
+
+**There is no `subscribe.deny`, and no standalone "always deny" class.** An explicit
+`allow` list is exhaustive — anything absent is denied — so `_INBOX.>`,
+`$JS.API.STREAM.LIST`, `$JS.API.STREAM.SNAPSHOT.>`, `$JS.API.STREAM.RESTORE.>` and
+`$JS.API.STREAM.LEADER.STEPDOWN.>` are all excluded by *not appearing*. Restating them as
+denies would suggest the allow list is not exhaustive, which is the misreading most likely
+to cause someone to widen it.
+
+**`dynamicStreams` is an allow-list decision, not a deny-list one.** The constrained mode
+simply does not receive `STREAM.CREATE`/`UPDATE`/`DELETE`/`MSG.DELETE`. An earlier draft
+expressed it as a blanket deny; that was a worse formulation of the same rule, and it
+concealed that the flag's whole effect is four entries in one list.
 
 There is no `subscribe.deny`: an explicit `allow` list is already exhaustive.
 `_INBOX.>` is excluded by *not appearing*, deliberately and load-bearingly.
@@ -263,13 +313,40 @@ the **same** application, and an application's own streams are never in class
 (C). The webhook closes the remainder by rejecting a declared stream name that
 collides with a declared durable name within one application.
 
-The enumerated form survives only in (B), where the intent is to deny a
-*subset* while allowing reads and `deny` beats `allow` with no way to re-allow.
-That list therefore carries a maintenance obligation: the component upgrade gate
-checks that the server's stream and consumer API verb set has not gained a
-member the enumeration does not name.
+**But the position patterns are NOT complete against arbitrary depth, and no finite
+set can be — measured.** Each pattern pair covers exactly one token depth. Probing
+past the documented surface:
 
-#### 4.3 The allow list's narrowness is itself a control
+| subject | tokens | four patterns | six patterns |
+|---|---|---|---|
+| every documented shape (`STREAM.INFO.S` … `CONSUMER.MSG.NEXT.S.c`) | 5–6 | denied | denied |
+| `$JS.API.STREAM.SOME.FUTURE.THING.S` | 7 | **Published** | denied |
+| `$JS.API.A.B.C.D.E.S` | 8 | **Published** | **Published** |
+
+Adding a depth-7 pair closes depth 7 and nothing else. `>` matches only as a trailing
+token, so NATS has no way to say "any number of tokens, then literally `S`". **Extending
+the set does not generalise; it moves the edge.**
+
+**The resolution is that the deny vector does not have to be complete against all of
+NATS — only against the allow list.** That is what §3's enumerated allow list buys. The
+stream token sits at depth 5 or 6 in *every* operation this platform admits
+(`STREAM.INFO.S` and `CONSUMER.CREATE.S` at 5; `STREAM.MSG.GET.S`,
+`STREAM.MSG.DELETE.S`, `CONSUMER.DURABLE.CREATE.S.c` and `CONSUMER.MSG.NEXT.S.c` at 6),
+so the four patterns are **provably complete against a closed set** — and that
+completeness is a unit test, not an argument: for every subject the allow list admits,
+assert the deny patterns match it when the stream is forbidden.
+
+A future NATS verb at depth 7 does not leak, because it is not in the allow list and
+therefore does not work at all. **The maintenance obligation moves from the deny side to
+the allow side, where its failure is loud**: an application reaching for a new operation
+gets `NOPERM` and says so, rather than silently acquiring reach. The component upgrade
+gate's job changes accordingly — it no longer hunts for verbs the deny list forgot, it
+reports verbs the allow list has not yet granted.
+
+**The naming-collision argument above still holds** for the four patterns, and the
+webhook check that closes it stands.
+
+#### 4.3 The allow list is the control — twice over
 
 Snapshot and restore move their *payload* over `$JS.SNAPSHOT.>`, a tree
 `$JS.API.>` does not cover. Measured: a user carrying only the (E) blanket
@@ -285,6 +362,18 @@ caller, who simply picks one under its own prefix. Measured: the same user
 backed up a stream it had no read right to, and the payload was recoverable from
 the resulting file. Snapshot is `mgr_<ns>`'s job under
 [ADR 0050](0050-backup-restore.md); applications have no use for it.
+
+These two findings arrived from opposite directions and say the same thing.
+`$JS.SNAPSHOT.>` was out of reach because it was **outside the allow list**;
+`STREAM.SNAPSHOT` was reachable because it was **inside** it, under `$JS.API.>`. §4.2's
+depth measurement then showed that no deny list can be made complete on its own. All
+three converge on one rule, which is the most portable thing in this record:
+
+> **The allow list is the boundary. The deny list only carves holes in it.** Anything
+> not listed does not work, and that is the failure direction a platform wants.
+
+Widening the allow list is therefore never a local change, and a reviewer seeing one
+should treat it as a security change regardless of what prompted it.
 
 #### 4.4 The v1 → v2 acknowledgement subject migration
 
@@ -326,6 +415,13 @@ all — both forms are emitted — but decides what **clients parse**: message
 metadata is extracted from the ack subject's tokens and v2 shifts them by two, so
 a client that knows only v1 returns silently wrong metadata. The feature has zero
 users today, so taking v2 now costs nothing and means never migrating anyone.
+
+The condition on that choice was the client, not the server. **`@onebun/nats` —
+and so `nats.js`, the primary client for applications on this platform — parses
+v2** (platform owner, 2026-09-11); the Go client does too, observed on the bench.
+Applications in other languages remain the tenant's concern, and the operator
+guide states the requirement rather than leaving it to be discovered.
+
 The flag is undocumented, so it is trusted only as far as it is observed: the
 component-level verification asserts once per start that the *observed* ack form
 matches the configured one.
@@ -601,10 +697,20 @@ construction; introducing one later is a change to §3, not a values tweak.
 - **`_INBOX` isolation depends on the client.** An application that does not set
   `CustomInboxPrefix` cannot connect at all — a loud failure, which is the right
   direction, but it is friction the guide must pre-empt.
-- **The reloader may not watch the included file.** The oldest open risk and the
-  only one that can invalidate §2 rather than adjust it. *Mitigation in hand:* a
-  projected volume combining the chart's config source and the accounts Secret into
-  one mount, making the watch question moot.
+- ~~**The reloader may not watch the included file.**~~ **Closed by measurement**
+  (§1): the chart composes `config.merge`'s `$include`, `podTemplate.patch` and
+  `container.patch`, and mirrors the mount into the reloader through
+  `natsVolumeMountPrefixes`. The residual is narrower and is recorded in its place: a
+  `subPath` mount would silently never update, so the whole-directory form is a
+  correctness requirement rather than a style choice.
+- **A widened allow list silently restores everything the deny vector cannot catch.**
+  §4.2 measured that no finite deny set is complete against arbitrary token depth, so
+  §3's enumerated allow list is what makes the vector complete. Adding an entry to that
+  list — for a new NATS operation, or to unblock an application — is a security change
+  wearing the clothes of a compatibility fix. *Mitigation:* the allow list is generated
+  from one table in one file with a comment saying this; the upgrade gate reports
+  ungranted verbs rather than hunting for forgotten denies; and a reviewer is told, in
+  §4.3, to treat a widening as a security change regardless of what prompted it.
 - **Quota exhaustion is namespace-wide**, since JetStream quotas are per account.
   *Accepted;* the escape hatch is account-per-application.
 - **GC's dynamic-stream rule is a heuristic** in both directions (§8). *Accepted
@@ -612,14 +718,22 @@ construction; introducing one later is a change to §3, not a values tweak.
 
 ## Pre-merge verification
 
-1. The reloader watches the included accounts file and SIGHUPs on change — before
-   the `include` design is committed.
-2. The remaining API surface by execution, in both directions: the two
-   consumer-create variants, and a generator test asserting that an **invented**
-   verb name is denied by the position patterns.
-3. `nats.js` — the client under `@onebun/nats`, and so the primary client for
-   applications here — parses v2 ack metadata correctly. The only client-side item
-   in this list, and it gates §4.4's choice of `true`.
+1. ~~The reloader watches the included accounts file.~~ **Settled 2026-09-11 by
+   measurement — §1.** The `config.merge` `$include` + `podTemplate.patch` +
+   `container.patch` chain was verified by rendering chart 2.14.6. What remains is the
+   *live* half: that a Secret update actually reaches the container and fires the SIGHUP
+   on a real cluster, which part 2's first integration test covers.
+2. ~~The remaining API surface against the position patterns.~~ **Settled 2026-09-11 by
+   measurement — §4.2**, and it changed the design: the patterns are complete against
+   depths 5–6 and leak at 7 and beyond, which is why §3's allow list enumerates verbs.
+   What remains is the **completeness test against the allow list** — for every subject
+   the allow list admits, assert the deny patterns match it when the stream is
+   forbidden. That is a unit test, not a session.
+3. ~~`nats.js` parses v2 ack metadata.~~ **Settled 2026-09-11 by the platform owner:
+   `@onebun/nats` parses v2.** This was the only client-side item in the list and the
+   last condition on §4.4's choice of `true`; recorded as an owner statement rather
+   than a bench measurement, which is the appropriate standard for a fact about our own
+   client stack. Other languages remain the tenant's concern and are named in the guide.
 4. Reload on an invalid accounts file (expected: rejected, server keeps running)
    and startup on one; `no_auth_user` and an account without `users`.
 5. PVC survival across component disable → enable, and the remanence §8 assumes.
