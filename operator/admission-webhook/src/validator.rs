@@ -399,7 +399,7 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
     }
 
     validate_needs_names(typed_base, typed_envs, base, envs, &mut errors);
-    validate_jetstream_needs(typed_base, typed_envs, envs, &mut errors);
+    validate_jetstream_scopes(typed_base, typed_envs, envs, &mut errors);
     validate_env_refs(typed_base, typed_envs, base, envs, &mut errors);
     validate_disk_claims(typed_base, typed_envs, base, envs, &mut errors);
     validate_expose(typed_base, typed_envs, base, envs, &mut errors);
@@ -528,23 +528,33 @@ fn validate_needs_names(
         }
     }
 
-    // Raw fallback for a scope that did not decode (test / misconfigured
-    // apiserver, but ALSO reachable in production: `expose.hostname` is
-    // preserve-unknown in the CRD but typed in Rust, so an apiserver-valid
-    // `expose: {port: 80, hostname: 5}` fails the typed decode and drops
-    // the whole scope to raw): iterate the raw needs map exactly as
-    // before, skipping disk AND jetstream. jetstream is skipped for the
-    // same reason disk is — this loop's DNS-1123-label / uniqueness check
-    // is about `(type, name)` claim identity, and jetstream has none (it
-    // is scalar-only, ADR 0061 §6): a `needs.jetstream.name` here would
-    // otherwise get "must be a DNS-1123 label … so it folds to a valid
-    // env-var suffix" — impossible advice, since jetstream has no named
-    // claims and complying just gets the field silently dropped anyway.
-    // `validate_jetstream_need` (typed-only) owns jetstream's actual
-    // rejection of `name`/`persistent`; it does not run on this raw path
-    // (see its own doc for why), so a raw-decoded scope's `needs.jetstream`
-    // gets neither check — same gap this file already accepts for disk.
+    // Raw fallback for a scope that did not decode. NOT merely test /
+    // misconfigured-apiserver — reachable in production: `expose.hostname`
+    // is preserve-unknown in the CRD but typed in Rust, so an
+    // apiserver-valid `expose: {port: 80, hostname: 5}` fails the typed
+    // decode and drops the WHOLE scope (not just `expose`) to raw. Every
+    // check below still runs the DNS-1123-label / uniqueness rules for
+    // pg/clickhouse/redis/s3/notifications on that path — `disk` is
+    // skipped (its identity rules live in `validate_disk_claims`, which
+    // DOES run its full rule set on both the typed and raw paths — see
+    // `scope_disk_entries`). `jetstream` gets a NARROWER skip: its
+    // `(type, name)` identity check (this loop's actual subject) is
+    // inapplicable — jetstream is scalar-only (ADR 0061 §6) and a
+    // `needs.jetstream.name` here would otherwise get "must be a
+    // DNS-1123 label … so it folds to a valid env-var suffix", which is
+    // impossible advice for a field with no named-claim meaning at all.
+    // But `persistent`/`name` themselves are still checked, right here,
+    // for PRESENCE — they exist ONLY to be rejected (ADR 0061 §6), and
+    // this raw path is the only place that can reject them when the
+    // scope failed to decode; `validate_jetstream_need` is typed-only
+    // and never runs here. Both messages are shared, word-for-word, with
+    // the typed path via `jetstream_persistent_rejected`/
+    // `jetstream_name_rejected` below. `subjects`/`maxBytes` stay
+    // unchecked on this path — the CRD's `minItems`/`required` already
+    // block them unconditionally, before any webhook runs, typed decode
+    // or not.
     fn check_scope_raw(
+        scope: &str,
         path: &str,
         obj: Option<&serde_json::Map<String, Value>>,
         errors: &mut Vec<ValidationError>,
@@ -553,7 +563,24 @@ fn validate_needs_names(
             return;
         };
         for (service_type, value) in needs {
-            if service_type == "disk" || service_type == "jetstream" {
+            if service_type == "disk" {
+                continue;
+            }
+            if service_type == "jetstream" {
+                if let Some(o) = value.as_object() {
+                    if o.contains_key("persistent") {
+                        errors.push(ValidationError::new(
+                            format!("{path}.jetstream"),
+                            jetstream_persistent_rejected(scope),
+                        ));
+                    }
+                    if o.contains_key("name") {
+                        errors.push(ValidationError::new(
+                            format!("{path}.jetstream"),
+                            jetstream_name_rejected(scope),
+                        ));
+                    }
+                }
                 continue;
             }
             let entries = needs_entry_names(value);
@@ -597,7 +624,13 @@ fn validate_needs_names(
     // Dispatch a scope: typed slots on the happy path, raw map as fallback.
     // The scope's typed `needs` is projected via `ScopeView` before dispatch
     // so ONE closure serves both `ApplicationBaseSpec` and the env override.
-    let check_scope = |path: &str,
+    // `scope` ("base" or the environment name) is threaded through to
+    // `check_scope_raw` purely so ITS jetstream messages can match
+    // `validate_jetstream_need`'s verbatim — the typed path
+    // (`check_typed_slot`) does not need it, it addresses everything by
+    // `path` instead.
+    let check_scope = |scope: &str,
+                       path: &str,
                        typed_needs: Option<&Needs>,
                        raw_scope: Option<&serde_json::Map<String, Value>>,
                        errors: &mut Vec<ValidationError>| {
@@ -609,11 +642,12 @@ fn validate_needs_names(
                     }
                 }
             }
-            None => check_scope_raw(path, raw_scope, errors),
+            None => check_scope_raw(scope, path, raw_scope, errors),
         }
     };
 
     check_scope(
+        "base",
         "spec.base.needs",
         typed_base.and_then(ScopeView::needs),
         base,
@@ -623,6 +657,7 @@ fn validate_needs_names(
         for (env_name, val) in envs_obj {
             let path = format!("spec.environments.{env_name}.needs");
             check_scope(
+                env_name,
                 &path,
                 typed_envs
                     .and_then(|m| m.get(env_name))
@@ -1125,6 +1160,28 @@ pub fn validate_sharedvolume(obj: &serde_json::Value) -> Vec<ValidationError> {
 /// responses in the same account.
 const JS_RESERVED_SUBJECT_ROOTS: &[&str] = &["$JS.", "$SYS.", "_INBOX."];
 
+/// The rejection message for `needs.jetstream.persistent` being set —
+/// shared, word-for-word, between the typed path (`validate_jetstream_need`)
+/// and the raw-fallback path (`check_scope_raw` above) so the two can never
+/// silently drift apart. `persistent` exists ONLY to be rejected (ADR 0061
+/// §6) — a structural schema prunes unknown fields before a validating
+/// webhook runs, so omitting it from the type would drop `persistent: true`
+/// silently instead of rejecting it loudly.
+fn jetstream_persistent_rejected(scope: &str) -> String {
+    format!(
+        "{scope}: needs.jetstream.persistent is not a jetstream option — persistence is per-stream (streams[].storage: file | memory), not per-claim"
+    )
+}
+
+/// The rejection message for `needs.jetstream.name` being set — see
+/// [`jetstream_persistent_rejected`] for why this is a shared function
+/// rather than two copies of the same string.
+fn jetstream_name_rejected(scope: &str) -> String {
+    format!(
+        "{scope}: needs.jetstream.name is not allowed — jetstream is scalar-only (ADR 0061 §6); two named claims on one application would share one subject prefix and be indistinguishable"
+    )
+}
+
 /// 2.5 (ADR 0061 §6): local-only validation of one `needs.jetstream` value —
 /// everything a webhook can decide from the manifest alone, with no lookup
 /// of sibling objects. Cross-object checks (a `consume.from` naming no
@@ -1133,51 +1190,55 @@ const JS_RESERVED_SUBJECT_ROOTS: &[&str] = &["$JS.", "$SYS.", "_INBOX."];
 /// condition on resync (ADR 0061 §5: "detection runs on the provisioner
 /// resync"), not a webhook rejection — this function does not, and must
 /// not, reach for a Kubernetes client. Multi-error: every violation is
-/// collected, no short-circuit, matching this file's convention. `app` is
+/// collected, no short-circuit, matching this file's convention. `scope` is
 /// the scope label ("base" or an environment name) — every message is
 /// prefixed with it because a flattened error list loses which scope it
 /// came from otherwise.
-pub fn validate_jetstream_need(js: &JetStreamNeed, app: &str) -> Vec<String> {
+///
+/// Every field this function checks for emptiness (`max_bytes`, a
+/// `consume` entry's `stream`/`durable`) is a non-`Option` `String` with no
+/// serde default — a JSON payload that OMITS the key fails the typed
+/// decode before this function ever runs, and is the CRD's `required` list
+/// to catch, not this function's. What this function CAN see, and does, is
+/// the key present with an empty string.
+fn validate_jetstream_need(js: &JetStreamNeed, scope: &str) -> Vec<String> {
     let mut errs = Vec::new();
 
-    // `name`/`persistent` exist ONLY to be rejected (ADR 0061 §6) — a
-    // structural schema prunes unknown fields before a validating webhook
-    // runs, so omitting them from the type would drop `persistent: true`
-    // silently instead of rejecting it loudly.
     if js.persistent.is_some() {
-        errs.push(format!(
-            "{app}: needs.jetstream.persistent is not a jetstream option — persistence is per-stream (streams[].storage: file | memory), not per-claim"
-        ));
+        errs.push(jetstream_persistent_rejected(scope));
     }
     if js.name.is_some() {
-        errs.push(format!(
-            "{app}: needs.jetstream.name is not allowed — jetstream is scalar-only (ADR 0061 §6); two named claims on one application would share one subject prefix and be indistinguishable"
-        ));
+        errs.push(jetstream_name_rejected(scope));
     }
 
     // Stream name uniqueness within the application — load-bearing for the
     // consume/durable collision check below, which reads this same set.
     let mut seen_stream_names: Vec<&str> = Vec::new();
-    for stream in &js.streams {
+    for (idx, stream) in js.streams.iter().enumerate() {
         if seen_stream_names.contains(&stream.name.as_str()) {
             errs.push(format!(
-                "{app}: needs.jetstream.streams has a duplicate stream name {:?}; stream names must be unique within the application",
+                "{scope}: needs.jetstream.streams has a duplicate stream name {:?}; stream names must be unique within the application",
                 stream.name
             ));
         } else {
             seen_stream_names.push(&stream.name);
         }
 
+        // `streams[{idx} {name:?}]`, not just `{name:?}`: two streams
+        // sharing a name (the very thing rejected above) would otherwise
+        // make two DIFFERENT array elements' messages read identically,
+        // with nothing to tell a human which one is missing maxBytes and
+        // which is missing subjects.
         if stream.max_bytes.trim().is_empty() {
             errs.push(format!(
-                "{app}: needs.jetstream.streams[{:?}].maxBytes is required — a stream without it silently claims the whole account quota",
+                "{scope}: needs.jetstream.streams[{idx} {:?}].maxBytes must not be empty — a stream without it silently claims the whole account quota",
                 stream.name
             ));
         }
 
         if stream.subjects.is_empty() {
             errs.push(format!(
-                "{app}: needs.jetstream.streams[{:?}].subjects must declare at least one subject",
+                "{scope}: needs.jetstream.streams[{idx} {:?}].subjects must declare at least one subject",
                 stream.name
             ));
         }
@@ -1186,7 +1247,7 @@ pub fn validate_jetstream_need(js: &JetStreamNeed, app: &str) -> Vec<String> {
             let trimmed = subject.trim();
             if trimmed == ">" {
                 errs.push(format!(
-                    "{app}: needs.jetstream.streams[{:?}] declares subject {subject:?} — a bare '>' collects the ENTIRE account, not just this application's traffic",
+                    "{scope}: needs.jetstream.streams[{idx} {:?}] declares subject {subject:?} — a bare '>' collects the ENTIRE account, not just this application's traffic",
                     stream.name
                 ));
                 continue;
@@ -1196,7 +1257,7 @@ pub fn validate_jetstream_need(js: &JetStreamNeed, app: &str) -> Vec<String> {
                 .find(|r| trimmed.starts_with(**r))
             {
                 errs.push(format!(
-                    "{app}: needs.jetstream.streams[{:?}] declares subject {subject:?}, which starts with the reserved root {root:?} (JetStream API / system / inbox subjects — collecting them breaks the platform's own control plane)",
+                    "{scope}: needs.jetstream.streams[{idx} {:?}] declares subject {subject:?}, which starts with the reserved root {root:?} (JetStream API / system / inbox subjects — collecting them breaks the platform's own control plane)",
                     stream.name
                 ));
             }
@@ -1206,16 +1267,16 @@ pub fn validate_jetstream_need(js: &JetStreamNeed, app: &str) -> Vec<String> {
     for (idx, consume) in js.consume.iter().enumerate() {
         if consume.stream.trim().is_empty() {
             errs.push(format!(
-                "{app}: needs.jetstream.consume[{idx}] is missing `stream`"
+                "{scope}: needs.jetstream.consume[{idx}].stream must not be empty"
             ));
         }
         if consume.durable.trim().is_empty() {
             errs.push(format!(
-                "{app}: needs.jetstream.consume[{idx}] is missing `durable`"
+                "{scope}: needs.jetstream.consume[{idx}].durable must not be empty"
             ));
         } else if seen_stream_names.contains(&consume.durable.as_str()) {
             errs.push(format!(
-                "{app}: needs.jetstream.consume[{idx}] durable {:?} collides with a stream name declared by this application — the deny vector's position-pattern grants ($JS.API.*.*.*.S) are safe only because a durable can never share a name with one of this application's own streams; use a different durable name",
+                "{scope}: needs.jetstream.consume[{idx}] durable {:?} collides with a stream name declared by this application — the deny vector's position-pattern grants ($JS.API.*.*.*.S) are safe only because a durable can never share a name with one of this application's own streams; use a different durable name",
                 consume.durable
             ));
         }
@@ -1228,14 +1289,16 @@ pub fn validate_jetstream_need(js: &JetStreamNeed, app: &str) -> Vec<String> {
 /// needs validation, once for `base` and once per declared environment —
 /// same shape as `validate_needs_names`/`validate_disk_claims`. TYPED ONLY:
 /// `validate_jetstream_need` takes a `&JetStreamNeed`, so a scope that
-/// failed to decode (test / misconfigured apiserver — production always
-/// decodes, since a validating webhook runs after the apiserver's
-/// structural CRD validation) is silently skipped here, same as every
-/// other typed-only check in this file. There is no raw-map mirror of
-/// these nine rules; `check_scope_raw` above only skips jetstream's
-/// (inapplicable) name-uniqueness check, it does not reimplement this
-/// function's rules against the untyped `Value`.
-fn validate_jetstream_needs(
+/// failed to decode is silently skipped here. That IS reachable in
+/// production, not just in tests or a misconfigured apiserver — see the
+/// comment above `check_scope_raw` for the `expose.hostname` example —
+/// which is why `persistent`/`name` (the two fields that exist solely to
+/// be rejected) are ALSO checked on the raw path there, via the same
+/// [`jetstream_persistent_rejected`]/[`jetstream_name_rejected`] messages.
+/// `subjects`/`maxBytes` stay typed-only here: the CRD's `minItems`/
+/// `required` cover those unconditionally, before any webhook runs at
+/// all, typed decode or not.
+fn validate_jetstream_scopes(
     typed_base: Option<&ApplicationBaseSpec>,
     typed_envs: Option<&BTreeMap<String, ApplicationEnvOverride>>,
     envs: Option<&serde_json::Map<String, Value>>,
@@ -4170,7 +4233,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_stream_name_colliding_with_a_durable_name() {
+    fn rejects_durable_name_colliding_with_a_declared_stream() {
         // load-bearing: the deny vector's position patterns ($JS.API.*.*.*.S)
         // are safe ONLY because a durable can never share a name with a stream
         // of the same application. streams[{name: "orders"}] +
@@ -4216,11 +4279,15 @@ mod tests {
             .collect();
         assert_eq!(js_errs.len(), 2, "{js_errs:?}");
         assert!(
-            js_errs.iter().any(|e| e.message.contains("`stream`")),
+            js_errs
+                .iter()
+                .any(|e| e.message.contains(".stream must not be empty")),
             "{js_errs:?}"
         );
         assert!(
-            js_errs.iter().any(|e| e.message.contains("`durable`")),
+            js_errs
+                .iter()
+                .any(|e| e.message.contains(".durable must not be empty")),
             "{js_errs:?}"
         );
     }
@@ -4244,7 +4311,7 @@ mod tests {
         // INDEPENDENT violations (persistent + an empty-subjects stream),
         // and a non-exact `!is_empty()` assertion rather than a count — on
         // purpose, so this test proves WIRING (env scope reached, field
-        // path + `{app}:` prefix correct) without being sensitive to
+        // path + `{scope}:` prefix correct) without being sensitive to
         // either individual rule, which already has its own dedicated
         // mutation-tested case above. A count-exact assertion here would
         // make this test go red on EITHER of those two rules' removal too,
@@ -4297,6 +4364,61 @@ mod tests {
         assert!(
             errors.iter().all(|e| !e.message.contains("DNS-1123")),
             "the raw fallback must not name-validate jetstream: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn raw_fallback_still_rejects_jetstream_persistent_and_name() {
+        // I1 (combined review, round 5): the exact probe that found the
+        // gap, widened to also carry a `name` (the probe as given only
+        // set `persistent`; the fix checks both keys, so the regression
+        // test does too — "asserting both messages appear"). Before this
+        // fix, `expose.hostname: 5` (apiserver-legal, serde-fatal) drops
+        // the base scope to `check_scope_raw`, and `persistent: true` +
+        // `name: "x"` both reached the cluster completely unrejected: 0
+        // errors total, where `validate_jetstream_need` would have
+        // produced 2 had the scope decoded. `persistent`/`name` exist
+        // ONLY to be rejected (ADR 0061 §6) — a scope that fails the
+        // typed decode is exactly the case that design has to survive,
+        // not one it is allowed to skip. The `streams`/`subjects`/
+        // `maxBytes` violations in the same manifest are deliberately
+        // NOT asserted here — those stay typed-only (the CRD covers them
+        // unconditionally instead), so this probe proves only what
+        // changed.
+        let spec = json!({
+            "base": {
+                "image": "x",
+                "expose": { "port": 80, "hostname": 5 },
+                "needs": { "jetstream": {
+                    "persistent": true,
+                    "name": "x",
+                    "streams": [
+                        { "name": "s1", "subjects": [], "maxBytes": "" }
+                    ]
+                } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        let js_errs: Vec<&ValidationError> = errors
+            .iter()
+            .filter(|e| e.field == "spec.base.needs.jetstream")
+            .collect();
+        assert_eq!(js_errs.len(), 2, "{js_errs:?}");
+        assert!(
+            js_errs
+                .iter()
+                .any(|e| e.message.contains("needs.jetstream.persistent")),
+            "{js_errs:?}"
+        );
+        assert!(
+            js_errs
+                .iter()
+                .any(|e| e.message.contains("needs.jetstream.name")),
+            "{js_errs:?}"
+        );
+        assert!(
+            js_errs.iter().all(|e| e.message.starts_with("base:")),
+            "{js_errs:?}"
         );
     }
 }

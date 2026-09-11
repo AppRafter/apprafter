@@ -260,4 +260,67 @@ mod tests {
              present"
         );
     }
+
+    /// 2.5 / ADR 0061 (round-5 review, I2): `crdgen`'s own field-comparison
+    /// assertion (`check.rs`, `flatten_leaves`) checks `{path → kind}`
+    /// between the CUE-derived CRD and the Rust types — NOT required-ness.
+    /// A CUE-side relaxation (`maxBytes: string` → `maxBytes?: string`)
+    /// regenerates the CRD, leaves every Rust field untouched, and passes
+    /// `crd-check`'s assertions A and B either way. The
+    /// `examples/applications/jetstream-app.cue` fixture doesn't catch it
+    /// either — it SUPPLIES every field, so `cue vet` can't observe one of
+    /// them becoming optional (verified against real `cue`: relaxing
+    /// `maxBytes`, `subjects`, or `durable` to optional in the CUE type
+    /// left `cue vet ./examples/...` green; dropping an enum value or
+    /// renaming a field turned it red — the fixture guards tightenings and
+    /// renames, not relaxations). This test is the one guard actually
+    /// aimed at required-ness: it reads the generated CRD's `required`
+    /// lists directly, for both `base` and `environments[*]`.
+    ///
+    /// Deliberately narrow — asserts only the three fields ADR 0061 §6
+    /// calls out as required, not a general `{path → required}` diff
+    /// against every leaf `flatten_leaves` already tracks. Generalising
+    /// this into `crdgen::check`'s assertion B would extend it to all 8
+    /// CRDs at once and could surface pre-existing required-ness drift
+    /// anywhere in the repository — real value, but unbounded scope for
+    /// this branch. Follow-up, not done here.
+    #[test]
+    fn jetstream_required_fields_survive_crd_generation() {
+        let crd = committed_crd("crd-application");
+
+        fn assert_jetstream_required(scope: &str, jetstream: &Value) {
+            let streams_required = jetstream["properties"]["streams"]["items"]["required"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                streams_required.contains(&json!("maxBytes")),
+                "{scope}: needs.jetstream.streams[].maxBytes dropped out of the CRD's \
+                 required list — a stream without it silently claims the whole \
+                 account quota, and nothing else in this repository would have \
+                 caught the relaxation: {streams_required:?}"
+            );
+
+            let consume_required = jetstream["properties"]["consume"]["items"]["required"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            for field in ["stream", "durable"] {
+                assert!(
+                    consume_required.contains(&json!(field)),
+                    "{scope}: needs.jetstream.consume[].{field} dropped out of the \
+                     CRD's required list: {consume_required:?}"
+                );
+            }
+        }
+
+        let base_jetstream = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["spec"]["properties"]["base"]["properties"]["needs"]["properties"]["jetstream"];
+        assert_jetstream_required("base", base_jetstream);
+
+        let env_jetstream = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["spec"]["properties"]["environments"]["additionalProperties"]["properties"]["needs"]
+            ["properties"]["jetstream"];
+        assert_jetstream_required("environments[*]", env_jetstream);
+    }
 }

@@ -5,12 +5,20 @@
 // maxBytes/allowPurge, a `consume` entry pulling from another
 // application's stream, and `dynamicStreams`. Used as a `cue vet`
 // fixture for `#JetStreamNeed` / `#JetStreamStream` / `#JetStreamConsume`
-// — `crdgen`'s field comparison checks `{path → kind}`, not
-// required-ness, so a CUE-side relaxation of a required field (e.g.
-// `maxBytes: string` to `maxBytes?: string`) would regenerate the CRD,
-// leave the Rust kind unchanged, and pass `crd-check` on both assertions
-// with no gate going red; this fixture is the layer that notices, by
-// actually evaluating data against the type.
+// — before this fixture, `cue vet ./examples/...` never evaluated real
+// data against any of the three, so a typo'd field path, a dropped enum
+// value (e.g. `"workqueue"` off `retention`), or a renamed field
+// (`allowPurge` → anything else) would pass every other gate silently.
+// Verified (round-5 review): it DOES catch tightenings and renames this
+// way. It does NOT catch the opposite direction — a required field
+// relaxed to optional (`maxBytes: string` → `maxBytes?: string`) still
+// passes `cue vet` here, because a fixture that SUPPLIES a field can't
+// observe that field becoming optional; `crdgen`'s own field comparison
+// checks `{path → kind}`, not required-ness, either. That specific gap
+// is closed instead by `crdgen`'s own
+// `jetstream_required_fields_survive_crd_generation` test
+// (`operator/crdgen/src/main.rs`), which asserts the generated CRD's
+// `required` lists directly.
 package examples
 
 import v1alpha1 "apprafter.io/schemas/v1alpha1"

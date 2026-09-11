@@ -424,7 +424,11 @@ _mkFields: {
 
 	// Present so the admission webhook CAN reject them (ADR 0061 §6) — and
 	// does: `validate_jetstream_need` in admission-webhook/src/validator.rs
-	// rejects either one outright. A manifest setting `persistent: true`
+	// rejects either one outright on the typed path, and `check_scope_raw`
+	// (same file) rejects their mere PRESENCE on the raw-decode-failure
+	// path too — a scope dropping to raw is reachable in production (see
+	// that function's own comment), not just a test/misconfiguration
+	// case, so both paths matter. A manifest setting `persistent: true`
 	// here is rejected before it ever reaches
 	// `JetStreamNeed::as_service_need()` in operator-core, which would
 	// otherwise silently drop it.
@@ -451,13 +455,18 @@ _mkFields: {
 	// `#SourceCredentialSpec.git.repoPrefixes`) is the apiserver-level
 	// gate — it applies unconditionally, before any webhook runs.
 	// `validate_jetstream_need` in admission-webhook/src/validator.rs
-	// enforces the same rule again, redundantly with the CRD in
-	// production, but its message names the offending stream, which the
-	// apiserver's generic structural-schema rejection cannot. A CUE-level
-	// `& [_, ...]` non-empty constraint can't live in the type itself: it
-	// breaks `cue export --out openapi`, which can't synthesize a
-	// concrete `default` element for a non-concrete-typed minItems:1
-	// list.
+	// enforces the same rule again — redundant on a cluster running the
+	// current CRD (schema validation runs before any validating webhook,
+	// so the apiserver rejects `subjects: []` first, every time; the
+	// webhook's more specific message naming the offending stream is
+	// never actually seen). The redundancy is worth keeping anyway: it
+	// protects a cluster whose CRD predates this `minItems` patch — an
+	// operator upgrade landing ahead of the corresponding chart bump is
+	// exactly the gap ADR 0047's CRD/webhook layering exists to catch. A
+	// CUE-level `& [_, ...]` non-empty constraint can't live in the type
+	// itself: it breaks `cue export --out openapi`, which can't
+	// synthesize a concrete `default` element for a non-concrete-typed
+	// minItems:1 list.
 	subjects: [...string]
 	storage?:   "file" | *"file" | "memory"
 	retention?: "limits" | *"limits" | "interest" | "workqueue"
