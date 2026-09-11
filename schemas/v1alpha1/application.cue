@@ -125,7 +125,7 @@ package v1alpha1
 	// may select different providers). `needs: {pg: {}}` is valid
 	// — tier-aware platform defaults supply selector + size.
 	//
-	// Each service key accepts a SCALAR `#ServiceNeed` (the single,
+	// Most service keys accept a SCALAR `#ServiceNeed` (the single,
 	// unnamed default claim — backward-compatible) OR an ARRAY of
 	// named `#ServiceNeed`s. `(type, name)` is the claim identity
 	// (2.6b / ADR 0043): the unnamed default keeps today's claim
@@ -185,8 +185,17 @@ package v1alpha1
 // notifications don't have an entry here yet. This is the SINGLE
 // SOURCE OF TRUTH for the claim field vocabulary, shared by:
 //   - the operator renderer's secretKeyRef key resolution,
-//   - the admission webhook's enum validation,
 //   - the cue-cmp / `apprafter app validate` generated `claim` binding.
+//
+// The admission webhook does NOT read this table (a Rust crate can't
+// `cue export` at compile time, and evaluating CUE at runtime in the
+// validation hot path was rejected as unnecessary weight for a fixed,
+// rarely-changing list). It keeps its own hand copy
+// (PG_FIELDS/REDIS_FIELDS/JETSTREAM_FIELDS in
+// `operator/admission-webhook/src/validator.rs`), GATED against this
+// table by `claim_fields_mirror_the_cue_source_of_truth` — a test that
+// re-reads this file and fails the two copies apart the moment they
+// drift, rather than trusting them to stay hand-synced silently.
 //
 // It is an EXPORTED DEFINITION (`#`), not a hidden field, on purpose: the
 // generated `claim` sibling file lives in the USER'S manifest package and
@@ -400,23 +409,42 @@ _mkFields: {
 
 	// Grant `$JS.API.STREAM.CREATE/UPDATE.>`. Default false. Enabling it
 	// lets the application read every stream in its namespace and drain
-	// every workqueue in it (ADR 0061 §4.1) — it is an ADR 0052
-	// security-boundary change, not a convenience.
+	// every workqueue in it (ADR 0061 §4.1) — ADR 0061 §6 CLASSIFIES
+	// flipping this from false/absent to true as ADR 0052 trigger #15
+	// (`jetstream-dynamic-streams-enable`), a security-boundary change,
+	// not a convenience. That classification is NOT yet wired into any
+	// detector — nothing in the operator inspects a `needs.jetstream`
+	// diff today, so until that lands this change ships with no
+	// approval gate at all, silently.
 	dynamicStreams?: bool | *false
 
 	streams?: [...#JetStreamStream]
 	consume?: [...#JetStreamConsume]
 
-	// Rejected by the webhook. Present so the rejection is possible.
+	// Present so the admission webhook CAN reject them (ADR 0061 §6) —
+	// NOT rejected today; that dedicated check doesn't exist yet (see
+	// `validate_needs_names` in admission-webhook/src/validator.rs).
+	// Until it lands, `persistent: true` here is silently dropped by
+	// `JetStreamNeed::as_service_need()` in operator-core, and a `name`
+	// is simply never read.
 	name?:       string
 	persistent?: bool
 }
 
+// #JetStreamStream — one declared stream under `#JetStreamNeed.streams`
+// (2.5 / ADR 0061 §6). The provisioner creates (or updates) exactly this
+// stream in the application's account; nothing else there is touched
+// unless `dynamicStreams` is also set.
 #JetStreamStream: {
+	// Stream name, unique within the application's account.
 	name: string
 	// Subjects the stream collects. A subject whose FIRST TOKEN is not the
-	// owning application's name is fan-in (ADR 0061 §6) and fires ADR 0052
-	// trigger #16. Non-empty — enforced by the CRD `minItems: 1`
+	// owning application's name is fan-in — ADR 0061 §6 CLASSIFIES that as
+	// ADR 0052 trigger #16 (`jetstream-foreign-subject`), same as
+	// `allowPurge` below, but (same caveat as `dynamicStreams` above) no
+	// detector inspects a subjects diff yet, so today it fires nothing.
+	//
+	// Non-empty — enforced by the CRD `minItems: 1`
 	// (`schemas/crdmeta/meta.cue`'s `"…needs.jetstream.streams[].subjects"`
 	// schemaPatches, same route as `#SourceCredentialSpec.git.repoPrefixes`).
 	// NOT yet enforced by the admission webhook — that's a later task
@@ -433,10 +461,14 @@ _mkFields: {
 	maxBytes: string
 	// Re-grant PURGE on this stream only. Name-scoped, so it can reach only
 	// the declaring application's own data — unless the stream is fan-in,
-	// which trigger #16 covers.
+	// which is also classified under trigger #16 above (not yet detected
+	// either).
 	allowPurge?: bool | *false
 }
 
+// #JetStreamConsume — one declared durable consumer under
+// `#JetStreamNeed.consume` (2.5 / ADR 0061 §6). Grants read + ack on
+// exactly the named stream, via the durable name; nothing else.
 #JetStreamConsume: {
 	// Application in the same namespace that declares `stream`. Omit for
 	// the declaring application's own stream.

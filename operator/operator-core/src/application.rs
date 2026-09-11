@@ -316,7 +316,11 @@ pub struct JetStreamConsume {
 
 impl JetStreamNeed {
     /// The single unnamed claim this need generates. jetstream takes no
-    /// `name` (ADR 0061 §6), so there is exactly one.
+    /// `name` (ADR 0061 §6), so there is exactly one. This is also where
+    /// the raw `self.name`/`self.persistent` are DISCARDED — they exist
+    /// on `JetStreamNeed` only so the admission webhook can reject them
+    /// (that check doesn't exist yet; see `validate_needs_names` in
+    /// `admission-webhook/src/validator.rs`), never as claim identity.
     pub fn as_service_need(&self) -> ServiceNeed {
         ServiceNeed {
             name: None,
@@ -376,7 +380,8 @@ pub enum EnvValue {
 #[serde(rename_all = "lowercase")]
 pub enum EnvRef {
     /// `"<type>.<field>"` or `"<type>.<name>.<field>"` — claim-backed
-    /// connection-Secret field (pg / redis field vocabulary, ADR 0046).
+    /// connection-Secret field (pg / redis / jetstream field vocabulary,
+    /// ADR 0046 / ADR 0061 §6).
     Claim(String),
     /// `"<name>/<key>"` — external Secret in the app namespace.
     Secret(String),
@@ -414,41 +419,32 @@ impl Needs {
     /// emit byte-stable objects under server-side apply.
     pub fn entries(&self) -> Vec<(String, NeedEntry)> {
         let mut out: Vec<(String, NeedEntry)> = Vec::new();
-        if let Some(one_or_many) = &self.pg {
-            for need in one_or_many.as_slice_vec() {
-                out.push((
-                    "pg".to_string(),
-                    NeedEntry {
-                        name: need.name.clone(),
-                        service: Some(need),
-                        disk: None,
-                    },
-                ));
-            }
-        }
-        // jetstream is its own type (`JetStreamNeed`, not
-        // `OneOrMany<ServiceNeed>`) and scalar-only, so it always yields
-        // exactly one unnamed entry when present (ADR 0061 §6) — no `name`
-        // identity, unlike the other five service slots.
-        if let Some(js) = &self.jetstream {
-            out.push((
-                "jetstream".to_string(),
-                NeedEntry {
-                    name: None,
-                    service: Some(js.as_service_need()),
-                    disk: None,
-                },
-            ));
-        }
-        let service_keys: [(&str, &Option<OneOrMany<ServiceNeed>>); 4] = [
-            ("clickhouse", &self.clickhouse),
-            ("redis", &self.redis),
-            ("s3", &self.s3),
-            ("notifications", &self.notifications),
+        // One list of `ServiceNeed`s per service key, in the fixed
+        // declaration order. jetstream is the one special case: its own
+        // type (`JetStreamNeed`, not `OneOrMany<ServiceNeed>`) and
+        // scalar-only, so it always projects to exactly one unnamed
+        // `ServiceNeed` (via `as_service_need()`, ADR 0061 §6) instead of
+        // `OneOrMany::as_slice_vec`'s 0-or-N.
+        let service_keys: [(&str, Option<Vec<ServiceNeed>>); 6] = [
+            ("pg", self.pg.as_ref().map(OneOrMany::as_slice_vec)),
+            (
+                "jetstream",
+                self.jetstream.as_ref().map(|j| vec![j.as_service_need()]),
+            ),
+            (
+                "clickhouse",
+                self.clickhouse.as_ref().map(OneOrMany::as_slice_vec),
+            ),
+            ("redis", self.redis.as_ref().map(OneOrMany::as_slice_vec)),
+            ("s3", self.s3.as_ref().map(OneOrMany::as_slice_vec)),
+            (
+                "notifications",
+                self.notifications.as_ref().map(OneOrMany::as_slice_vec),
+            ),
         ];
         for (ty, slot) in service_keys {
-            if let Some(one_or_many) = slot {
-                for need in one_or_many.as_slice_vec() {
+            if let Some(needs_vec) = slot {
+                for need in needs_vec {
                     out.push((
                         ty.to_string(),
                         NeedEntry {
@@ -1034,21 +1030,76 @@ mod tests {
     }
 
     #[test]
+    fn jetstream_entries_carry_selector_and_size_but_drop_name_and_persistent() {
+        // `Needs::entries()` -> `JetStreamNeed::as_service_need()` is the
+        // only place jetstream's selector/size reach the scheduler (tier
+        // routing) and the only place its raw `name`/`persistent` get
+        // dropped (ADR 0061 §6 — they exist only so the webhook CAN
+        // reject them, not as claim identity). A fixture of `{}` (as
+        // `needs_entries_flatten_is_deterministic` uses) can't tell a
+        // real carry-over from `ServiceNeed::default()` — both are None.
+        let needs: Needs = serde_json::from_value(serde_json::json!({
+            "jetstream": {
+                "selector": {"tier": "integrated"},
+                "size": "small",
+                "name": "x",
+                "persistent": true
+            }
+        }))
+        .unwrap();
+        let entries = needs.entries();
+        assert_eq!(entries.len(), 1);
+        let (ty, entry) = &entries[0];
+        assert_eq!(ty, "jetstream");
+        assert_eq!(entry.name, None, "jetstream has no (type, name) identity");
+        let service = entry
+            .service
+            .as_ref()
+            .expect("jetstream entry carries a ServiceNeed");
+        assert_eq!(
+            service.selector,
+            Some(BTreeMap::from([(
+                "tier".to_string(),
+                "integrated".to_string()
+            )])),
+            "selector must carry over — it drives tier routing"
+        );
+        assert_eq!(
+            service.size.as_deref(),
+            Some("small"),
+            "size must carry over"
+        );
+        assert_eq!(
+            service.name, None,
+            "jetstream's own `name` is not a claim identity — must be dropped"
+        );
+        assert_eq!(
+            service.persistent, None,
+            "jetstream's own `persistent` is not a claim flag — must be dropped"
+        );
+    }
+
+    #[test]
     fn needs_entries_flatten_is_deterministic() {
         let needs: Needs = serde_json::from_value(json!({
             "disk": [{ "name": "data", "size": "1Gi", "mountPath": "/data" }],
             "redis": { "selector": { "tier": "integrated" } },
             "pg": [{ "name": "a" }, { "name": "b" }],
-            "jetstream": {}
+            "jetstream": {},
+            "clickhouse": {},
+            "s3": {},
+            "notifications": {}
         }))
         .unwrap();
         let entries = needs.entries();
         // Deterministic key order: pg, jetstream, clickhouse, redis, s3,
         // notifications, disk — array entries by index within each type.
-        // A populated jetstream entry is in the fixture (not just pg/redis/
-        // disk) so a reordering of the jetstream block in `entries()` goes
-        // red here instead of leaving the whole workspace green (walk-found
-        // gap: the prior fixture never exercised jetstream's position).
+        // ALL SEVEN types are in the fixture (not just pg/redis/disk) so
+        // every position in that order is load-bearing — moving, say,
+        // jetstream to after clickhouse would previously emit a
+        // byte-identical sequence (neither was in the fixture) and stay
+        // green; now it can't (walk-found gap: the prior fixture only
+        // exercised 3 of 7 slots, then 4 of 7).
         let shape: Vec<(String, Option<String>, bool)> = entries
             .iter()
             .map(|(ty, e)| (ty.clone(), e.name.clone(), e.disk.is_some()))
@@ -1059,7 +1110,10 @@ mod tests {
                 ("pg".to_string(), Some("a".to_string()), false),
                 ("pg".to_string(), Some("b".to_string()), false),
                 ("jetstream".to_string(), None, false),
+                ("clickhouse".to_string(), None, false),
                 ("redis".to_string(), None, false),
+                ("s3".to_string(), None, false),
+                ("notifications".to_string(), None, false),
                 ("disk".to_string(), Some("data".to_string()), true),
             ]
         );

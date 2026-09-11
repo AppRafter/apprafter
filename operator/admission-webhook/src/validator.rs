@@ -469,6 +469,20 @@ fn needs_entry_names(value: &Value) -> Vec<Option<&str>> {
 /// and at most one unnamed default is allowed per (scope, type) value.
 /// Multi-error: one error per offending `needs.<type>` field, no
 /// short-circuit (matching the validator contract).
+///
+/// TODO(2.5, jetstream-name-reject): this function is where
+/// `needs.jetstream.name`/`.persistent` rejection belongs (it owns
+/// needs-identity validation) but does NOT implement it yet — worth
+/// flagging precisely because the absence is easy to miss. ADR 0061 §6
+/// says both fields must be rejected; they're declared on
+/// `JetStreamNeed` in the CUE/CRD types only so a validating webhook
+/// check CAN reject them (a structural schema prunes unknown fields
+/// before any webhook runs, so omitting them entirely would drop
+/// `persistent: true` silently instead of rejecting it loudly). Today
+/// `needs.jetstream: {name: "x"}` passes CUE, the CRD, and this webhook,
+/// then `JetStreamNeed::as_service_need()` in `operator-core::application`
+/// silently discards both fields. That dedicated check is the next
+/// task's job, with its own tests.
 fn validate_needs_names(
     typed_base: Option<&ApplicationBaseSpec>,
     typed_envs: Option<&BTreeMap<String, ApplicationEnvOverride>>,
@@ -479,8 +493,9 @@ fn validate_needs_names(
     // Check one (type, OneOrMany<ServiceNeed>) slot's entry names. The
     // `name` of each entry is read from the TYPED `ServiceNeed.name`
     // (compiler-gated). `disk` is NOT a service slot here — its identity
-    // rules live in `validate_disk_claims` — so iterating the six service
-    // slots already excludes it.
+    // rules live in `validate_disk_claims`; `jetstream` isn't one either
+    // (see `service_need_slots`'s doc) — so iterating the five service
+    // slots already excludes both.
     fn check_typed_slot(
         path: &str,
         service_type: &str,
@@ -623,17 +638,8 @@ fn validate_needs_names(
 /// excluded — its identity rules live in `validate_disk_claims`;
 /// `jetstream` is intentionally excluded too — it carries its own type
 /// (`JetStreamNeed`, ADR 0061 §6) and is scalar-only, so the array-name
-/// uniqueness this function checks cannot apply to it).
-///
-/// NOT YET IMPLEMENTED, and worth flagging precisely because its absence
-/// is easy to miss: nothing in this webhook rejects `needs.jetstream.name`
-/// or `.persistent` (ADR 0061 §6 says both must be — they're declared in
-/// the CUE/CRD types only so a validating webhook check CAN reject them).
-/// Today `needs.jetstream: {name: "x"}` passes CUE, the CRD, and this
-/// webhook, then `JetStreamNeed::as_service_need()` in
-/// `operator-core::application` silently drops both fields. That
-/// dedicated check is the next task's job, with its own tests. A renamed
-/// slot field on `Needs` fails to compile here.
+/// uniqueness this function checks cannot apply to it). A renamed slot
+/// field on `Needs` fails to compile here.
 fn service_need_slots(needs: &Needs) -> [(&'static str, &Option<OneOrMany<ServiceNeed>>); 5] {
     [
         ("pg", &needs.pg),
@@ -1672,9 +1678,10 @@ fn validate_env_refs(
 /// scalar-only and has no `(type, name)` identity, so a declared
 /// jetstream need always yields exactly one unnamed entry (`vec![None]`)
 /// — its own `name` field is NOT a claim identity (ADR 0061 §6 reserves
-/// it for a future webhook rejection; see `service_need_slots`'s doc).
-/// A renamed `Needs` slot fails to compile here.
-fn needs_slot(needs: &Needs, service_type: &str) -> Option<Vec<Option<String>>> {
+/// it for a future webhook rejection; see the `TODO(2.5,
+/// jetstream-name-reject)` on `validate_needs_names`). A renamed `Needs`
+/// slot fails to compile here.
+fn declared_need_names(needs: &Needs, service_type: &str) -> Option<Vec<Option<String>>> {
     fn names(slot: &Option<OneOrMany<ServiceNeed>>) -> Option<Vec<Option<String>>> {
         slot.as_ref()
             .map(|s| s.as_slice_vec().into_iter().map(|n| n.name).collect())
@@ -1729,7 +1736,7 @@ fn validate_claim_ref(
 
     // Check if the type is declared in the effective needs for this scope
     // (the typed slot is `Some`).
-    let Some(entry_names) = needs_slot(eff_needs, service_type) else {
+    let Some(entry_names) = declared_need_names(eff_needs, service_type) else {
         errors.push(ValidationError::new(
             field_path,
             format!(
@@ -1759,7 +1766,7 @@ fn validate_claim_ref(
     }
 
     // If a name segment is present, validate the named entry exists. The
-    // entry names come from `needs_slot` — `ServiceNeed.name` for the five
+    // entry names come from `declared_need_names` — `ServiceNeed.name` for the five
     // service types, always empty for jetstream (scalar-only, ADR 0061 §6).
     if let Some(name) = name_opt {
         let named_entries: Vec<String> = entry_names
@@ -1777,6 +1784,17 @@ fn validate_claim_ref(
                     format!(
                         "claim ref {path:?}: no entry named {name:?} in needs.{service_type}; declared names are: {}",
                         named_entries.join(", ")
+                    ),
+                ));
+            } else if service_type == "jetstream" {
+                // jetstream is scalar-only (ADR 0061 §6) — it can NEVER
+                // gain a named entry, so "add a named entry" (the advice
+                // below, correct for the other service types) is
+                // impossible advice here.
+                errors.push(ValidationError::new(
+                    field_path,
+                    format!(
+                        "claim ref {path:?}: named ref (name={name:?}) used but jetstream has no named entries (it is scalar-only, ADR 0061 §6); omit the name segment"
                     ),
                 ));
             } else {
@@ -1975,6 +1993,112 @@ fn is_env_var_name(s: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Reads `#ClaimFieldsFor` out of `schemas/v1alpha1/application.cue`
+    /// and parses each `type: ["field", ...]` line into `(type, fields)`
+    /// pairs. `application.cue` lives in a different cargo workspace
+    /// (`schemas/` is not under `operator/`), so this cannot be a
+    /// compile-time dependency — but it is the same repository, reached
+    /// via `CARGO_MANIFEST_DIR` the same way
+    /// `platform.rs::every_condition_type_the_operator_writes_is_classified`
+    /// reaches across into `operator/`. `std::fs::read_to_string`, not
+    /// `include_str!`: the webhook's container image builds with `context:
+    /// operator`, so `../../schemas/…` is outside that Docker build
+    /// context — a `#[cfg(test)]`-only `fs::read` never runs during the
+    /// image build, whereas relying on `include_str!` being cfg-stripped
+    /// away is a subtler thing to depend on.
+    fn declared_claim_fields() -> Vec<(String, Vec<String>)> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../schemas/v1alpha1/application.cue");
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "{}: the CUE claim field vocabulary could not be read, so this \
+                 test would have judged nothing: {e}",
+                path.display()
+            )
+        });
+        let Some((_, block)) = src.split_once("#ClaimFieldsFor: {") else {
+            panic!(
+                "{}: no `#ClaimFieldsFor: {{` block found — the definition was \
+                 renamed or reshaped, and this test would otherwise have \
+                 compared against nothing",
+                path.display()
+            );
+        };
+        let mut out = Vec::new();
+        for line in block.lines() {
+            let line = line.trim();
+            if line == "}" {
+                break;
+            }
+            let Some((ty, rest)) = line.split_once(':') else {
+                continue;
+            };
+            let Some(inner) = rest
+                .trim()
+                .strip_prefix('[')
+                .and_then(|r| r.strip_suffix(']'))
+            else {
+                continue;
+            };
+            let fields: Vec<String> = inner
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            out.push((ty.trim().to_string(), fields));
+        }
+        out
+    }
+
+    #[test]
+    fn claim_fields_mirror_the_cue_source_of_truth() {
+        // #ClaimFieldsFor in schemas/v1alpha1/application.cue calls itself
+        // the single source of truth for the claim field vocabulary, but
+        // PG_FIELDS/REDIS_FIELDS/JETSTREAM_FIELDS here are hand copies —
+        // a Rust crate can't `cue export` at compile time, and evaluating
+        // CUE at runtime in the webhook's validation hot path was
+        // rejected as unnecessary weight for a fixed, rarely-changing
+        // list. This test is what keeps the copies honest: it re-derives
+        // the expected table from the CUE source and fails the moment a
+        // field is added, removed, renamed, or a type is missing on
+        // either side — completeness and correctness, DERIVED, not
+        // hand-verified (the same shape as
+        // `platform.rs::every_condition_type_the_operator_writes_is_classified`).
+        let declared = declared_claim_fields();
+        // Non-vacuity: a moved file, a renamed `#ClaimFieldsFor`, or a
+        // reformatted block would otherwise leave `declared` empty and
+        // this test comparing {} == {}, reporting success while checking
+        // nothing.
+        assert!(
+            declared.len() >= 3,
+            "only {declared:?} parsed out of schemas/v1alpha1/application.cue's \
+             #ClaimFieldsFor — the block's shape changed, and an empty parse \
+             would have passed vacuously"
+        );
+        let declared: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            declared
+                .into_iter()
+                .map(|(ty, fields)| (ty, fields.into_iter().collect()))
+                .collect();
+        let mirrored: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            CLAIM_SUPPORTED_TYPES
+                .iter()
+                .map(|(ty, fields)| {
+                    (
+                        ty.to_string(),
+                        fields.iter().map(|f| f.to_string()).collect(),
+                    )
+                })
+                .collect();
+        assert_eq!(
+            declared, mirrored,
+            "PG_FIELDS/REDIS_FIELDS/JETSTREAM_FIELDS (validator.rs, gathered into \
+             CLAIM_SUPPORTED_TYPES) drifted from #ClaimFieldsFor \
+             (schemas/v1alpha1/application.cue) — keep the two in sync by hand \
+             whenever either changes"
+        );
+    }
 
     // ── 2.16b-sec F-1: Application.status is operator-owned (userInfo) ────
     #[test]
@@ -3383,12 +3507,13 @@ mod tests {
     #[test]
     fn rejects_jetstream_claim_ref_without_needs_declared() {
         // The trap the reviewer found: adding jetstream to
-        // `CLAIM_SUPPORTED_TYPES` without restoring its `needs_slot()` arm
-        // would make every jetstream claim ref — even a correctly declared
-        // one — read as "not declared". Assert the genuinely-undeclared
-        // case still reports that message, so a regression here (the
-        // `needs_slot()` arm going missing again) goes red instead of
-        // silently changing which case produces the message.
+        // `CLAIM_SUPPORTED_TYPES` without restoring its
+        // `declared_need_names()` arm would make every jetstream claim
+        // ref — even a correctly declared one — read as "not declared".
+        // Assert the genuinely-undeclared case still reports that
+        // message, so a regression here (the `declared_need_names()` arm
+        // going missing again) goes red instead of silently changing
+        // which case produces the message.
         let spec = json!({
             "base": {
                 "image": "ghcr.io/acme/web:1.0",
@@ -3404,6 +3529,40 @@ mod tests {
         assert!(
             claim_errs[0].message.contains("not declared in needs"),
             "{claim_errs:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_named_jetstream_claim_ref_with_advice_that_is_actually_possible() {
+        // `claim.jetstream.foo.url` — a name segment on a type that is
+        // declared but is ALWAYS scalar (ADR 0061 §6, no array form
+        // exists). The generic fall-through message for this shape
+        // ("omit the name segment or add a named entry") is wrong here:
+        // jetstream can never gain a named entry, so half the advice is
+        // impossible. Pin the corrected, jetstream-specific message —
+        // there was no test on this path at all before.
+        let spec = json!({
+            "base": {
+                "image": "ghcr.io/acme/web:1.0",
+                "needs": { "jetstream": {} },
+                "env": { "U": { "claim": "jetstream.foo.url" } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        let claim_errs: Vec<&ValidationError> = errors
+            .iter()
+            .filter(|e| e.field == "spec.base.env.U")
+            .collect();
+        assert_eq!(claim_errs.len(), 1);
+        assert!(
+            claim_errs[0]
+                .message
+                .contains("jetstream has no named entries"),
+            "{claim_errs:?}"
+        );
+        assert!(
+            !claim_errs[0].message.contains("add a named entry"),
+            "the advice must not tell the user to do something impossible: {claim_errs:?}"
         );
     }
 

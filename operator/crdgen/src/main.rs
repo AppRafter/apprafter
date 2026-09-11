@@ -218,4 +218,46 @@ mod tests {
              never fires (re-run `just gen-crds`)"
         );
     }
+
+    /// 2.5 / ADR 0061: `needs.jetstream.streams[].subjects` must stay
+    /// non-empty at the apiserver, same class of guard as
+    /// `application_status_last_applied_spec_is_preserve_unknown` above —
+    /// the CUE type deliberately omits this rule (`cue export --out
+    /// openapi` can't synthesize a `default` for a non-concrete-typed
+    /// `minItems:1` list), so it lives ONLY in the `schemaPatches` entry
+    /// in `schemas/crdmeta/meta.cue`. Nothing else asserts it: `cue vet`
+    /// never sees it, `crd-check`'s CUE↔committed compare is byte-equal
+    /// either way (a dropped patch renders and commits consistently), and
+    /// `crd-validate`'s ephemeral apiserver accepts an empty `subjects`
+    /// list just as happily as a populated one — `minItems` narrows
+    /// acceptance, it doesn't change whether the CRD itself is
+    /// structurally valid. Checked under BOTH `base` and
+    /// `environments[*]` because the patch needs two separate entries
+    /// (`needs` is duplicated under both in the rendered schema).
+    #[test]
+    fn jetstream_stream_subjects_require_at_least_one_entry() {
+        let crd = committed_crd("crd-application");
+        let base_subjects = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["spec"]["properties"]["base"]["properties"]["needs"]["properties"]["jetstream"]
+            ["properties"]["streams"]["items"]["properties"]["subjects"];
+        assert_eq!(
+            base_subjects["minItems"],
+            json!(1),
+            "base.needs.jetstream.streams[].subjects lost its minItems:1 floor \
+             (schemas/crdmeta/meta.cue's schemaPatches entry is missing or the \
+             CRD wasn't regenerated with `just gen-crds`) — a stream with zero \
+             subjects would be accepted"
+        );
+        let env_subjects = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["spec"]["properties"]["environments"]["additionalProperties"]["properties"]["needs"]
+            ["properties"]["jetstream"]["properties"]["streams"]["items"]["properties"]["subjects"];
+        assert_eq!(
+            env_subjects["minItems"],
+            json!(1),
+            "environments[*].needs.jetstream.streams[].subjects lost its \
+             minItems:1 floor — the `base.…` and `environments[*].…` \
+             schemaPatches entries in schemas/crdmeta/meta.cue must both be \
+             present"
+        );
+    }
 }
