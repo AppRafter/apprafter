@@ -1760,6 +1760,58 @@ compatibility: "0.2.39": {
 	references: ["docs/adr/0040-image-digest-resolution.md", "docs/adr/0047-crd-codegen-from-cue.md"]
 }
 
+compatibility: "0.2.69": {
+	change:          "safe"
+	operatorVersion: "v0.2.49"
+	notes: """
+		`needs.jetstream` schema layer — 2.5 part 1 of 4, ADR 0061. The
+		grammar, the CRD, the kube-rs mirror and the admission rules ship;
+		NO provisioner backend does. A jetstream claim still never leaves
+		`AwaitingResourceClaim`, exactly as before this version, and
+		`shipped.rs` still classifies the need `Declared`. Nothing about
+		the delivery path changes.
+
+		ONE NARROWING, and it is the only reason this entry needs reading.
+		`needs.jetstream` was `x-kubernetes-preserve-unknown-fields: true`
+		— the CRD stored any shape under that key — and becomes a typed
+		schema. Keys outside `#JetStreamNeed` are therefore pruned on the
+		next write of an existing object. That is only reachable for an
+		Application that already declares `needs.jetstream`, which has
+		never been provisionable: such an app has been parked unready
+		since it was written, so there is no running workload to disturb.
+		It is classified `safe` on that basis, not because the schema is
+		unchanged.
+
+		Also newly rejected, all confined to `needs.jetstream`:
+		`persistent` and `name` (declared in the schema SOLELY so the
+		webhook can reject them by name — a structural schema prunes
+		unknown fields before a validating webhook runs, so omitting them
+		would drop `persistent: true` silently); a stream without
+		`maxBytes` or with no subjects; a subject under `$JS.`, `$SYS.` or
+		`_INBOX`; a declared name that is not a DNS-1123 label; a durable
+		colliding with one of the same application's stream names; and an
+		Application whose own `metadata.name` is not a DNS-1123 label
+		while it declares `needs.jetstream`.
+
+		Purely additive: `claim.jetstream.<field>` references now resolve
+		— `url`, `host`, `port`, `user`, `pass`, `account`,
+		`subjectPrefix`, `inboxPrefix`. The vocabulary ships here because
+		`apprafter app validate` and the cue-cmp sidecar both generate the
+		user-facing `claim` binding from `#ClaimFieldsFor`; leaving the
+		webhook half behind would have made the local gate STRICTER than
+		the cluster, which teaches developers to stop trusting it.
+
+		The cue-cmp pin follows argocd-cue-cmp v0.1.25 for the same reason
+		0.2.68 followed v0.1.24: the sidecar image COPYs `schemas/v1alpha1`
+		and its entrypoint injects the schema it SHIPS WITH, so a schema
+		edit is an image change. An un-rebuilt sidecar would validate
+		Application manifests against a schema this tree no longer has —
+		here, one that does not know `#JetStreamNeed` — and would reject
+		`needs.jetstream` in Argo CD while the apiserver accepts it.
+		"""
+	references: ["docs/adr/0061-needs-jetstream-nats.md"]
+}
+
 compatibility: "0.2.68": {
 	change:          "safe"
 	operatorVersion: "v0.2.48"
