@@ -295,6 +295,13 @@ mod tests {
     /// claim, runs it in a real `nats:2-alpine` server (podman), and
     /// connects as that claim's user.
     ///
+    /// **The `include` sits at TOP LEVEL** — see
+    /// `nats_accounts::tests::rendered_file_is_valid_nats_config`'s own
+    /// doc for the full reasoning (this harness carried the identical
+    /// divergence from the real chart's placement, walk-found the same
+    /// day: `rendered_file_is_valid_nats_config` failing loudly here would
+    /// have been the earlier signal, but both harnesses had it).
+    ///
     /// Mutation-tested: removing `.custom_inbox_prefix(inbox_prefix)`
     /// from `NatsClient::verify_user` turns exactly this test red (see
     /// the commit message for the actual result).
@@ -325,15 +332,7 @@ port: 4222
 jetstream: {
   store_dir: "/tmp/nats-check-store"
 }
-system_account: "$SYS"
-accounts: {
-  "$SYS": {
-    users: [
-      { user: "admin", password: "check-only" }
-    ]
-  }
-  include "accounts.conf"
-}
+include "accounts.conf"
 "#;
 
         let dir = std::env::temp_dir().join(format!(

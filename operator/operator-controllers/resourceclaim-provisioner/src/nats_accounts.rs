@@ -559,6 +559,22 @@ fn render_account(
 /// this function's job stops at the accounts the LIVE CLAIM SET
 /// produces.
 ///
+/// **The output IS wrapped in `accounts: { ... }`** — walk-found (2.5d
+/// part-2 closure, first live kind cluster run): `component_nats.cue`'s
+/// `config.merge`'s `accounts$include` key splices this fragment's
+/// `include` at the TOP LEVEL of `nats.conf`, sibling to `jetstream` /
+/// `feature_flags` / `port` — confirmed by rendering the actual chart
+/// (`helm template nats nats/nats`), whose OWN rendered config defines no
+/// `accounts: {}` key anywhere. This fragment is therefore the SOLE
+/// source of that key; emitting bare `ns_demo: { ... }` at that spliced
+/// position is a naked, unrecognised top-level field, and nats-server
+/// refuses it outright: `.../accounts.conf:1:0: unknown field "ns_demo"`,
+/// observed verbatim on a real cluster before this wrapper existed.
+/// `the_rendered_file_is_wrapped_in_an_accounts_block` (this module's own
+/// test) pins the shape structurally, independent of any content-only
+/// assertion — see that test's own doc for why a content-only check
+/// could not have caught the miss.
+///
 /// Two ceilings, two different scopes (2.5d Task 8, ADR 0061 §6 and its
 /// round-7 review follow-up — both are values passed in, never read
 /// from anywhere, so this function stays pure):
@@ -610,6 +626,7 @@ pub fn render_accounts_file(
     }
 
     let mut out = String::new();
+    writeln!(out, "accounts: {{").unwrap();
     for (namespace, mut peers) in by_namespace {
         peers.sort_by(|a, b| a.app.cmp(&b.app));
         out.push_str(&render_account(
@@ -619,6 +636,7 @@ pub fn render_accounts_file(
             password,
         )?);
     }
+    writeln!(out, "}}").unwrap();
     Ok(out)
 }
 
@@ -981,6 +999,40 @@ mod tests {
     }
 
     #[test]
+    fn the_rendered_file_is_wrapped_in_an_accounts_block() {
+        // Walk-found bug (2.5d part-2 closure, live kind cluster):
+        // `nats-server: /etc/nats-config/accounts-secret/accounts.conf:1:0:
+        // unknown field "ns_demo"`. The chart's `config.merge`
+        // (`component_nats.cue`) splices this fragment's `include` at the
+        // TOP LEVEL of nats.conf, sibling to `jetstream`/`feature_flags`/
+        // `port` — confirmed by rendering the real chart
+        // (`helm template nats nats/nats`), which emits no `accounts: {}`
+        // key of its own anywhere. So this fragment is the ONLY source of
+        // that key, and a bare `ns_demo: { ... }` at that position is a
+        // naked, unrecognised top-level field — exactly the walk's error.
+        //
+        // A content-only assertion (`.contains("ns_demo: {")`, this
+        // module's own long-standing style, unchanged above) cannot see a
+        // missing WRAPPER — `ns_demo: {` is equally present whether or not
+        // it sits inside `accounts: { ... }`. That is precisely why the
+        // whole existing suite passed while this shipped broken; this is
+        // a STRUCTURAL assertion, deliberately independent of it.
+        let out = render_accounts_file(&ns_with_two_apps(), u64::MAX, u64::MAX, &|u| {
+            format!("pw-{u}")
+        })
+        .unwrap();
+        assert!(
+            out.starts_with("accounts: {"),
+            "the fragment must supply the WHOLE `accounts` key (the chart's \
+             nats.conf defines none of its own) — got:\n{out}"
+        );
+        assert!(
+            out.trim_end().ends_with('}'),
+            "the accounts wrapper must be closed: {out}"
+        );
+    }
+
+    #[test]
     fn the_management_user_keeps_inbox_access() {
         // NACK sets no custom inbox prefix; denying it `_INBOX.>` would stop
         // it making a single request (ADR 0061 §3).
@@ -1258,15 +1310,23 @@ mod tests {
     /// Builds a small standalone `nats.conf` around `render_accounts_file`'s
     /// output in a temp dir and runs `nats-server -t` (config check, no
     /// actual listen) against it inside a `nats:2-alpine` container.
-    /// `render_accounts_file` emits no `$SYS` account (ADR 0061 §2: that
-    /// is the chart's static `nats.conf`, not this function's job) — this
-    /// test's OWN `nats.conf` supplies a minimal one, by hand, so the
-    /// fragment can stand alone; not via a parameter on
-    /// `render_accounts_file` (no production caller needs one — the
-    /// chart's real `nats.conf` already owns `$SYS`, per the same ADR
-    /// section), and not via `.replace()` surgery on the render's own
-    /// output, which the task this test was written for explicitly
-    /// rejected.
+    ///
+    /// **The `include` sits at TOP LEVEL, mirroring `component_nats.cue`'s
+    /// `config.merge`'s `accounts$include` key exactly — it must NOT
+    /// drift from that placement.** Confirmed by rendering the actual
+    /// chart (`helm template nats nats/nats`): its own `nats.conf` has no
+    /// `accounts: {}` key of its own anywhere, and no `system_account`
+    /// either — `include ./accounts-secret/accounts.conf;` is a bare
+    /// top-level statement, sibling to `jetstream`/`feature_flags`/`port`.
+    /// This harness used to nest the include inside its OWN
+    /// `accounts: { "$SYS": {...}, include "..." }` block — which made a
+    /// BARE fragment (no `accounts` wrapper of its own) look valid here
+    /// while being rejected by the real chart's placement
+    /// (`nats-server: .../accounts.conf:1:0: unknown field "ns_demo"`,
+    /// reproduced verbatim on a live kind cluster before this fix). The
+    /// two shapes are each internally consistent and disagree with each
+    /// other, which is exactly how the walk found a bug this test could
+    /// not: whichever one drifts from the chart is the one that lies.
     ///
     /// Run: cargo test -p operator-controllers-resourceclaim-provisioner \
     ///        rendered_file_is_valid_nats_config -- --ignored --nocapture
@@ -1292,15 +1352,7 @@ port: 4222
 jetstream: {
   store_dir: "/tmp/nats-check-store"
 }
-system_account: "$SYS"
-accounts: {
-  "$SYS": {
-    users: [
-      { user: "admin", password: "check-only" }
-    ]
-  }
-  include "accounts.conf"
-}
+include "accounts.conf"
 "#;
 
         let dir = std::env::temp_dir().join(format!(
