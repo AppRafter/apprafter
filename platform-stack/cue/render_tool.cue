@@ -166,6 +166,42 @@ _appProjectsTemplate: """
 
 	"""
 
+// `_namespacesTemplate` — emits one `kind: Namespace` per entry in
+// `.Values.namespaces`, at sync-wave -30 — the same early wave as
+// AppProjects (earliest possible, before even Cilium at -20), because
+// these namespaces must exist before anything mounts into them.
+// UNCONDITIONAL: unlike every other template here, this one is never
+// gated on any `.Values.*.enabled` — see `namespaces.cue` for why
+// (`nats-system` must exist while both `nats` and `nack` still ship
+// `enabled: false`).
+//
+// Note the double-curly braces: this string is itself a Go template
+// Helm executes at install time, so we keep the `{{ }}` literal. CUE
+// ships it verbatim.
+_namespacesTemplate: """
+	{{/*
+	  SPDX-License-Identifier: FSL-1.1-Apache-2.0
+	  Rendered by `cue cmd render`. Do not edit.
+	  Iterates over .Values.namespaces and emits one
+	  kind: Namespace per entry at sync-wave -30 — same
+	  early wave as AppProjects, ahead of anything that
+	  mounts into it (namespaces.cue has the why).
+	*/}}
+	{{- range $name := .Values.namespaces }}
+	---
+	apiVersion: v1
+	kind: Namespace
+	metadata:
+	  name: {{ $name | quote }}
+	  annotations:
+	    argocd.argoproj.io/sync-wave: "-30"
+	  labels:
+	    apprafter.io/managed-by: apprafter
+	    apprafter.io/source: platform-stack
+	{{- end }}
+
+	"""
+
 // `_serviceProvidersTemplate` — emits one `kind: ServiceProvider`
 // (apprafter.io/v1alpha1) per entry in `.Values.serviceProviders`.
 // Seeds the launch-default backends so the 2.3 scheduler has a
@@ -1021,6 +1057,12 @@ command: render: {
 	appProjectsTemplate: file.Create & {
 		filename: "\(_distDir)/templates/appprojects.yaml"
 		contents: _appProjectsTemplate
+		$dep:     mktemplates.$done
+	}
+
+	namespacesTemplate: file.Create & {
+		filename: "\(_distDir)/templates/namespaces.yaml"
+		contents: _namespacesTemplate
 		$dep:     mktemplates.$done
 	}
 

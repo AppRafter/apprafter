@@ -31,6 +31,7 @@ tier2: #PlatformValues & {
 	tier:        2
 	channel:     "stable"
 	appProjects: _appProjects
+	namespaces:  _namespaces
 	serviceProviders: _serviceProviders & {
 		// Team tier runs a 3-instance HA Postgres cluster.
 		"pg-integrated": config: instances: 3

@@ -35,6 +35,7 @@ tier1: #PlatformValues & {
 	tier:             1
 	channel:          "stable"
 	appProjects:      _appProjects
+	namespaces:       _namespaces
 	serviceProviders: _serviceProviders
 	components: _components & {
 		cilium: values: hubble: enabled: false

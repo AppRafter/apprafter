@@ -281,6 +281,20 @@ package platformstack
 	// state, deterministically-ordered on first sync.
 	appProjects: [string]: #AppProjectSpec
 
+	// Plain Kubernetes namespaces shipped as standalone umbrella
+	// manifests at sync-wave -30, same as `appProjects` — earliest
+	// possible, before Cilium. Iterated by
+	// `templates/namespaces.yaml` into one `kind: Namespace` per
+	// entry. Unlike `appProjects`, these are not consumed by any
+	// component's own `enabled` gate — a namespace shipped here
+	// exists regardless of whether the component that will use it is
+	// currently on. See `namespaces.cue` for why (`nats-system` /
+	// ADR 0061 §1, §2.1: a lazily-enabled component's own
+	// `CreateNamespace=true` cannot stand up a namespace something
+	// else needs to write into BEFORE that component is ever
+	// enabled).
+	namespaces: [...string]
+
 	// ServiceProvider CRs seeded by the umbrella so a fresh
 	// cluster has at least the launch-default backends declared.
 	// Iterated by `templates/serviceproviders.yaml` into one
