@@ -140,6 +140,14 @@ const NATS_AUTO_ENABLED_ANNOTATION: &str = "apprafter.io/nats-auto-enabled";
 
 const REASON_AWAITING_NATS_COMPONENT: &str = "AwaitingNatsComponent";
 const REASON_AWAITING_NATS_READY: &str = "AwaitingNatsUserReady";
+/// New reason (2.5d part 2 closure) — no existing member of this file's
+/// `Ready=False` vocabulary covers "the platform cannot yet build what you
+/// declared" (the closest, `REASON_AWAITING_SHARED_VOLUME`, is a
+/// DIFFERENT wait: for a referenced object to exist, not for a whole
+/// feature's implementation to land). The condition TYPE itself is not
+/// new — every backend in this file publishes `Ready=False`/`True` under
+/// [`COND_READY`]; only this REASON string is.
+const REASON_AWAITING_STREAM_CREATION: &str = "AwaitingStreamCreation";
 
 /// Fallback platform-wide `max_file` budget for
 /// [`nats_accounts::render_accounts_file`]'s `global_budget_bytes`
@@ -1226,6 +1234,51 @@ fn nats_override_patch(
 /// does its own GET and errors on a missing SECRET; every call site here
 /// has already fetched the secret as part of a read-or-create /
 /// byte-stable-compare decision and needs to decode what it already has.
+/// Whether a jetstream claim's DECLARED streams are things the platform can
+/// actually deliver today (2.5d part B closure — coordinator finding, NOT
+/// in the original Task 6/9/10/11 brief). A claim's own allow list never
+/// grants `STREAM.CREATE` on any of its own declared, composed stream
+/// names — `nats_accounts::deny_vector` class (B) denies it
+/// UNCONDITIONALLY, `dynamicStreams` or not (it protects an app's
+/// migration-gated declared streams from itself, not just from
+/// neighbours) — so a declared stream can only ever be materialised by a
+/// NACK `Stream` CR the provisioner applies. Nothing under `operator/`
+/// applies one yet (part 3, ADR 0061 §8's fourth sub-step — it needs the
+/// `Account` CR and credential plumbing this task set does not touch).
+///
+/// Marking such a claim `Ready=True` today would be a status lie: a
+/// connection, a subject prefix, and a contract that is not there — worse
+/// than not deploying the application at all, since (with
+/// `dynamicStreams: false`) it cannot self-heal and will fail at runtime
+/// with JetStream errors naming nothing about the real cause.
+///
+/// Takes `&[StreamView]` — the DECLARED list — rather than the whole
+/// `ClaimView`, deliberately: there is no `dynamic_streams` flag for it to
+/// even consult. A bare `needs: {jetstream: {}}` (`streams` empty) and a
+/// `dynamicStreams: true` claim with NOTHING declared both pass unaffected
+/// — this only gates a claim that declared something the platform cannot
+/// yet build, never a claim that only ever creates streams itself.
+///
+/// Self-resolving: once part 3 lands NACK CR application, this guard (and
+/// the call site that checks it) is DELETED, not weakened — the whole
+/// point is that it stops mattering, not that it grows an escape hatch.
+fn nats_declared_streams_deliverable(streams: &[nats_accounts::StreamView]) -> bool {
+    streams.is_empty()
+}
+
+/// The actionable `Ready=False` message for
+/// [`nats_declared_streams_deliverable`]'s guard — names the REAL reason
+/// (the platform has not built what was declared yet, and will) rather
+/// than a bare "not ready" a reader could mistake for a transient stall
+/// like [`REASON_AWAITING_NATS_READY`]'s.
+fn stream_creation_pending_message(declared_stream_count: usize) -> String {
+    format!(
+        "{declared_stream_count} declared jetstream stream(s) are not yet created by the \
+         platform — NACK Stream/Consumer CR application is not implemented yet (ADR 0061 §8); \
+         this claim will go ready automatically once it lands"
+    )
+}
+
 fn decoded_secret_key(secret: &DynamicObject, key: &str) -> Result<Option<String>, ReconcileError> {
     let Some(raw) = secret
         .data
@@ -1520,6 +1573,26 @@ async fn provision_nats(
 
     // Read-or-create this claim's own connection Secret (see this
     // function's own doc for why this precedes the ADR's literal step 2).
+    //
+    // **Deliberate deviation from ADR 0061 §8 ("Lifecycle"), recorded here
+    // so a reader comparing against the ADR does not "fix" it**: §8 orders
+    // the connection Secret LAST — after verify, after the partial status
+    // write, after applying the NACK CRs — not first. This function writes
+    // it here, before verify, because the ADR's own ordering implicitly
+    // assumes the claim's password is decided once (as part of "derive and
+    // write the accounts file") and simply carried forward; this codebase
+    // has no in-memory place to carry a value forward BETWEEN separate
+    // reconcile invocations, so the Kubernetes Secret object itself is
+    // what makes the password durable (read-or-create), and reusing this
+    // object for that means creating it here rather than at the end.
+    //
+    // This is safe despite jumping the §8 order: this object's existence
+    // alone exposes nothing to a consumer — only the TERMINAL status write
+    // (further down, which does not run until after the stream-creation
+    // gate below also passes) sets `status.connectionSecretRef`, which is
+    // the field the renderer actually reads to wire a Secret into a pod.
+    // An unready claim's connection Secret sits in its own namespace,
+    // unreferenced, exactly as it would if this write happened last.
     let conn_secret_name = connection_secret_name(name);
     let conn_api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), ns, &secret_ar());
     let pass = match conn_api.get_opt(&conn_secret_name).await? {
@@ -1630,6 +1703,24 @@ async fn provision_nats(
         );
         patch_status(&ctx.client, ns, name, cond, ClaimStatusFields::default()).await?;
         return Ok(Action::requeue(Duration::from_secs(30)));
+    }
+
+    // Part-2 closure gate: a claim that DECLARED streams cannot reach
+    // ready until something applies the NACK CRs those streams need to
+    // exist — see `nats_declared_streams_deliverable`'s own doc. This is
+    // NOT a transient stall like the two checks above (nothing about it
+    // resolves on its own within seconds); 300s matches this file's
+    // steady-state cadence rather than the 30s used for the genuinely
+    // transient waits above.
+    if !nats_declared_streams_deliverable(&cv.streams) {
+        let cond = ready_condition(
+            "False",
+            REASON_AWAITING_STREAM_CREATION,
+            &stream_creation_pending_message(cv.streams.len()),
+            &prior,
+        );
+        patch_status(&ctx.client, ns, name, cond, ClaimStatusFields::default()).await?;
+        return Ok(Action::requeue(Duration::from_secs(300)));
     }
 
     // Terminal status write.
@@ -3998,6 +4089,52 @@ mod tests {
         // A brand new namespace's FIRST render — nothing to compare
         // against, so there is no "unchanged" to claim.
         assert!(!accounts_file_unchanged(None, "ns_demo: {}\n"));
+    }
+
+    // --- nats_declared_streams_deliverable / stream_creation_pending_message
+    // (part 2 closure — coordinator finding: a claim with declared streams
+    // must not reach Ready=True while nothing applies the NACK CRs those
+    // streams need to actually exist) --------------------------------
+
+    #[test]
+    fn a_claim_with_declared_streams_is_not_deliverable_yet() {
+        let streams = vec![nats_accounts::StreamView {
+            name: "orders".into(),
+            subjects: vec!["shop.orders.>".into()],
+            allow_purge: false,
+        }];
+        assert!(
+            !nats_declared_streams_deliverable(&streams),
+            "a claim that declared a stream must not be reported deliverable \
+             until NACK CR application exists"
+        );
+    }
+
+    #[test]
+    fn a_claim_with_no_declared_streams_is_deliverable() {
+        // Both a bare `needs: {jetstream: {}}` and a `dynamicStreams: true`
+        // claim with nothing DECLARED reach this with an empty streams
+        // list — neither depends on a NACK CR, so neither should be
+        // blocked by this guard. Proven on the empty-list case here; the
+        // scope claim ("dynamicStreams doesn't matter, only `streams`
+        // does") is why this function takes `&[StreamView]` alone and
+        // not the whole `ClaimView` — there is no `dynamic_streams` flag
+        // for it to even look at.
+        assert!(nats_declared_streams_deliverable(&[]));
+    }
+
+    #[test]
+    fn the_pending_message_names_the_real_reason_not_a_generic_not_ready() {
+        let msg = stream_creation_pending_message(2);
+        assert!(msg.contains('2'), "must name the count: {msg}");
+        assert!(
+            msg.contains("not yet created") && msg.contains("platform"),
+            "must say the platform has not created the declared streams yet: {msg}"
+        );
+        assert_ne!(
+            msg, "not ready",
+            "must be actionable, not a bare generic phrase"
+        );
     }
 
     #[test]
