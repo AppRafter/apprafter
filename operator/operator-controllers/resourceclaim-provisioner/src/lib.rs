@@ -71,6 +71,7 @@ pub mod disk;
 pub mod dragonfly;
 pub mod gc;
 pub mod grace;
+pub mod nats;
 pub mod nats_accounts;
 pub mod reaper;
 pub mod reconcile;
