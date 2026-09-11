@@ -18,7 +18,12 @@
 // is closed instead by `crdgen`'s own
 // `jetstream_required_fields_survive_crd_generation` test
 // (`operator/crdgen/src/main.rs`), which asserts the generated CRD's
-// `required` lists directly.
+// `required` lists directly. The same blind spot applies to the
+// `streams[].name` / `consume[].durable` DNS-1123-label `pattern`
+// (round-7 review, ADR 0061 §4.2/§6): this fixture supplies valid names
+// ("orders", "indexer"), so it can't observe that `pattern` disappearing
+// either. `crdgen`'s `jetstream_declared_names_require_dns_1123_pattern`
+// test closes that one the same way.
 package examples
 
 import v1alpha1 "apprafter.io/schemas/v1alpha1"

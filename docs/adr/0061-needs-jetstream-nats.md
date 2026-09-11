@@ -305,13 +305,21 @@ same surface:
 Five forms leaked — including one that appears in no review of this design, and
 one introduced in the very release it pins.
 
-**The naming scheme makes the position patterns provably safe.** The obvious
-objection is that `$JS.API.*.*.*.S` also matches a *consumer* named `S`. It
-cannot bite: stream names are `<owner>-<name>` and durables are
-`<consumer app>-<durable>`, so a durable can only collide with a stream name of
-the **same** application, and an application's own streams are never in class
-(C). The webhook closes the remainder by rejecting a declared stream name that
-collides with a declared durable name within one application.
+**The naming scheme makes the position patterns provably safe — but only because
+the join separator is reserved.** The obvious objection is that
+`$JS.API.*.*.*.S` also matches a *consumer* named `S`. It cannot bite: stream
+names are `<owner>_<name>` and durables are `<consumer app>_<durable>`, and
+because `_` is illegal in both components (§6), a durable can collide with a
+stream name only when the two applications are the **same** one — and an
+application's own streams are never in class (C). The webhook closes the
+remainder by rejecting a declared stream name that collides with a declared
+durable name within one application.
+
+**This argument was broken until 2026-09-11 and the fix is in §6.** With the
+earlier `-` join, a durable of application `a-b` composed to the same string as a
+stream of application `a`, the two applications were different, and the
+within-one-application webhook check did not reach it. The separator is not
+formatting; it is what makes the sentence above true.
 
 **But the position patterns are NOT complete against arbitrary depth, and no finite
 set can be — measured.** Each pattern pair covers exactly one token depth. Probing
@@ -522,14 +530,37 @@ seeded conservatively at Tier 1: memory-storage streams live in the server's RSS
 | account | `ns_<namespace>` | `ns-<namespace>` |
 | claim user | `claim_<ns>_<app>_jetstream` | — |
 | management user | `mgr_<ns>` | — |
-| stream | `<app>-<name>` | `<ns>-<app>-<name>` |
-| durable | `<app>-<durable>` | `<ns>-<app>-<durable>` |
+| stream | `<app>_<name>` | `<ns>-<app>-<name>` |
+| durable | `<app>_<durable>` | `<ns>-<app>-<durable>` |
 | subject prefix | `<app>.` | — |
 | inbox prefix | `_INBOX_<ns>_<app>` | — |
 
 The durable carries the **consuming** application's name: two applications may
 each hold a durable called `indexer` on one shared stream, and without the prefix
 the second would silently attach to the first's cursor and halve its delivery.
+
+**The NATS-side join is `_`, and the separator is load-bearing — corrected
+2026-09-11.** An earlier draft of this record joined with `-` and asserted
+collision-freedom anyway. That was **false**, and measured so: `-` is legal in a
+Kubernetes object name and there was no format rule on `#JetStreamStream.name` or
+`consume[].durable` at all, so `("a", "b-c")` and `("a-b", "c")` both composed to
+`a-b-c`. Two applications in one namespace could be handed the same NATS stream
+name, which is not a cosmetic clash: the deny vector keys on that name, so the
+collision decides who may read what.
+
+The fix is the one that already makes `account()` sound — **reserve a character
+that cannot appear in either component.** Declared stream and durable names are
+constrained to DNS-1123 labels, whose alphabet is `[a-z0-9-]`, so `_` cannot occur
+in them and the join is injective. `_` is legal in a NATS stream name, in a
+consumer name and in a subject token — verified on v2.14.3, since the whole scheme
+would be worthless if the composed name were unusable.
+
+This also repairs §4.2's safety argument for the position patterns, which had
+fallen with it: under a `-` join a durable of application `a-b` could equal a
+stream of application `a`, so "a durable can only collide with a stream name of
+the **same** application" was untrue and the webhook's within-one-application
+check did not cover it. Under `_` the collision again requires `app == owner`, and
+that check covers it exactly.
 
 **Connection Secret** — `#ClaimFieldsFor.jetstream` gains
 `["url", "host", "port", "user", "pass", "account", "subjectPrefix", "inboxPrefix"]`.

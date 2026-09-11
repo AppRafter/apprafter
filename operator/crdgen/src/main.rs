@@ -323,4 +323,56 @@ mod tests {
             ["properties"]["jetstream"];
         assert_jetstream_required("environments[*]", env_jetstream);
     }
+
+    /// 2.5 / ADR 0061 §4.2/§6 (round-7 review): `streams[].name` and
+    /// `consume[].durable` must be DNS-1123 labels, restored via
+    /// `schemas/crdmeta/meta.cue` schemaPatches the same way `subjects`'
+    /// `minItems` is above — CUE can't carry a format rule on a bare
+    /// `string` (this repo's validation philosophy routes those to the
+    /// CRD and the webhook instead), so this `pattern` lives ONLY in
+    /// crdmeta and would vanish from the generated CRD with no other
+    /// gate noticing (same class of silent loss
+    /// `jetstream_required_fields_survive_crd_generation` guards for
+    /// required-ness). The rule matters here specifically because the
+    /// provisioner composes both names into a NATS-side identifier
+    /// joined on `_` — allowing `_` in either would let two different
+    /// applications compose the identical NATS name, which is exactly
+    /// the gap a prior round found and ADR 0061 §4.2 depends on staying
+    /// closed.
+    #[test]
+    fn jetstream_declared_names_require_dns_1123_pattern() {
+        let crd = committed_crd("crd-application");
+        const DNS_1123_PATTERN: &str = "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$";
+
+        fn assert_jetstream_name_patterns(scope: &str, jetstream: &Value) {
+            let stream_name_pattern =
+                &jetstream["properties"]["streams"]["items"]["properties"]["name"]["pattern"];
+            assert_eq!(
+                stream_name_pattern,
+                &json!(DNS_1123_PATTERN),
+                "{scope}: needs.jetstream.streams[].name lost its DNS-1123 pattern — \
+                 a '_' in a declared stream name would let two different applications \
+                 compose the identical NATS stream name (nats_stream_name)"
+            );
+
+            let durable_pattern =
+                &jetstream["properties"]["consume"]["items"]["properties"]["durable"]["pattern"];
+            assert_eq!(
+                durable_pattern,
+                &json!(DNS_1123_PATTERN),
+                "{scope}: needs.jetstream.consume[].durable lost its DNS-1123 pattern — \
+                 a '_' in a declared durable name would let two different applications \
+                 compose the identical NATS durable name (nats_durable_name)"
+            );
+        }
+
+        let base_jetstream = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["spec"]["properties"]["base"]["properties"]["needs"]["properties"]["jetstream"];
+        assert_jetstream_name_patterns("base", base_jetstream);
+
+        let env_jetstream = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+            ["spec"]["properties"]["environments"]["additionalProperties"]["properties"]["needs"]
+            ["properties"]["jetstream"];
+        assert_jetstream_name_patterns("environments[*]", env_jetstream);
+    }
 }

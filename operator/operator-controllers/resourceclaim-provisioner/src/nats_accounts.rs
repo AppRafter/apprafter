@@ -68,23 +68,31 @@ pub fn mgr_user(namespace: &str) -> String {
 
 /// NATS-side stream name.
 ///
-/// NOT proven collision-free, unlike [`ClaimView::account`] — checked and
-/// found wanting: `owner_app` is a Kubernetes object name and `declared`
-/// is `#JetStreamStream.name` (an unconstrained CUE `string` — no
-/// DNS-1123 or other format rule anywhere in CUE/CRD/webhook today), and
-/// BOTH may contain `-`, which is also the join character here. The
-/// encoding is not self-delimiting: `("a", "b-c")` and `("a-b", "c")`
-/// both produce `"a-b-c"`. Two different applications in one
-/// namespace/account could therefore be assigned the same NATS stream
-/// name for two different declared streams — NATS itself has no
-/// per-application sub-namespace, so this is a real collision, not a
-/// cosmetic one. Left exactly as specified for this task: closing it
-/// would mean changing the encoding (a reserved separator, a format
-/// constraint on declared names, or an explicit collision check), which
-/// would also change every string this module's tests pin — a decision
-/// for whichever task owns provisioning, not this one.
+/// Collision-free within a namespace/account, by the SAME argument as
+/// [`ClaimView::account`]: the join character is `_`, and `_` is illegal
+/// in both operands, so the encoding is self-delimiting (there is
+/// exactly one way to read a composed name back into `owner_app` and
+/// `declared`, because no `_` inside either half could ever be mistaken
+/// for the separator). This module does not, and cannot, enforce that
+/// premise on its own — it has no validation of any kind (see the module
+/// doc). The premise holds because `validate_jetstream_need` in
+/// `admission-webhook/src/validator.rs` rejects any `streams[].name`
+/// (the `declared` here) that is not a DNS-1123 label, and DNS-1123's
+/// alphabet (`[a-z0-9-]`) excludes `_` by definition; `owner_app` is a
+/// Kubernetes object name, which is a DNS-1123 subdomain and so is ALSO
+/// `_`-free unconditionally. A reader of this file alone cannot see that
+/// the premise is enforced anywhere — it lives in the webhook, not here.
+///
+/// This was `-`-joined until a review round found the same ambiguity
+/// `account()` was checked against and did not have: `owner_app` and
+/// `declared` could both contain `-`, so `("a", "b-c")` and `("a-b",
+/// "c")` composed to the identical string. That also broke ADR 0061
+/// §4.2's soundness proof for the deny vector's position patterns, which
+/// assumes a durable can collide with a stream name only WITHIN one
+/// application — a `-`-composed collision could cross applications, past
+/// the point the webhook's within-one-application check ever looked.
 pub fn nats_stream_name(owner_app: &str, declared: &str) -> String {
-    format!("{owner_app}-{declared}")
+    format!("{owner_app}_{declared}")
 }
 
 /// NATS-side durable name. Takes the CONSUMING application — the opposite
@@ -96,11 +104,12 @@ pub fn nats_stream_name(owner_app: &str, declared: &str) -> String {
 /// first's and silently attach to its existing cursor — sharing (and
 /// corrupting) its delivery position — instead of getting its own. Do not
 /// "simplify" this to match `nats_stream_name`'s owner-keyed shape; the
-/// asymmetry is the point. Carries the SAME unproven-collision-freedom
-/// caveat as `nats_stream_name` above, for the same reason (both operands
-/// can contain `-`).
+/// asymmetry is the point. Carries the SAME collision-freedom argument as
+/// `nats_stream_name` above, enforced the same way: `validate_jetstream_need`
+/// requires `consume[].durable` (the `declared` here) to be a DNS-1123
+/// label too, for the identical reason.
 pub fn nats_durable_name(consumer_app: &str, declared: &str) -> String {
-    format!("{consumer_app}-{declared}")
+    format!("{consumer_app}_{declared}")
 }
 
 #[cfg(test)]
@@ -132,13 +141,13 @@ mod tests {
     fn stream_and_durable_names_carry_their_owner() {
         assert_eq!(
             nats_stream_name("feeder", "blocks-head"),
-            "feeder-blocks-head"
+            "feeder_blocks-head"
         );
         // the durable carries the CONSUMING application, so two applications
         // may each hold `indexer` on one shared stream without colliding
         assert_eq!(
             nats_durable_name("indexer-app", "indexer"),
-            "indexer-app-indexer"
+            "indexer-app_indexer"
         );
     }
 }

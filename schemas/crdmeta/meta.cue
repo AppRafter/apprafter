@@ -56,6 +56,30 @@ _crdMetas: Application: {
 		// precedent for a multi-level path.
 		"base.needs.jetstream.streams[].subjects": {minItems: 1}
 		"environments[*].needs.jetstream.streams[].subjects": {minItems: 1}
+
+		// `streams[].name` and `consume[].durable`: DNS-1123-label format
+		// rule, restored the same way as `subjects`' `minItems` above and
+		// for the same reason CUE can't carry it (this repo's validation
+		// philosophy routes format rules to the CRD + webhook, never a
+		// half-measure CUE regex — see #JetStreamStream.name's comment).
+		// The rule exists because the provisioner composes each of these
+		// into a NATS-side identifier joined on `_`
+		// (`nats_stream_name`/`nats_durable_name` in
+		// `resourceclaim-provisioner::nats_accounts`) — a `_` in the
+		// declared name would make that join ambiguous and let two
+		// different applications compose the identical NATS name, which
+		// decides who may read/purge a stream or share a consumer's
+		// cursor (ADR 0061 §4.2's soundness proof for the deny vector's
+		// position patterns depends on this). `validate_jetstream_need`
+		// enforces the same rule again — see the `subjects` comment above
+		// for why that redundancy is kept (an older CRD without this
+		// patch). Regex is the standard Kubernetes DNS-1123 label
+		// (`[a-z0-9]` endpoints, `[-a-z0-9]*` between); this repo's own
+		// `is_dns_1123_label` is the same rule, byte-for-byte.
+		"base.needs.jetstream.streams[].name": {pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"}
+		"environments[*].needs.jetstream.streams[].name": {pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"}
+		"base.needs.jetstream.consume[].durable": {pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"}
+		"environments[*].needs.jetstream.consume[].durable": {pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"}
 	}
 
 	// `status.lastAppliedSpec` is the 2.16b migration baseline — a raw

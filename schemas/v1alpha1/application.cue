@@ -441,7 +441,25 @@ _mkFields: {
 // stream in the application's account; nothing else there is touched
 // unless `dynamicStreams` is also set.
 #JetStreamStream: {
-	// Stream name, unique within the application's account.
+	// Stream name. Two rules, neither carried in this CUE type (validation
+	// philosophy — no half-measure CUE stubs; format/cross-field rules go
+	// to the CRD + webhook):
+	//   - Unique within the application — `validate_jetstream_need` in
+	//     admission-webhook/src/validator.rs, webhook-only (a CUE
+	//     cross-array-element uniqueness check isn't expressible here
+	//     either).
+	//   - A DNS-1123 label — restored as a `pattern` on the CRD via
+	//     `schemas/crdmeta/meta.cue`'s `"…needs.jetstream.streams[].name"`
+	//     schemaPatches (same apiserver-unconditional / webhook-redundant
+	//     shape as `subjects`' `minItems` below), and re-enforced by
+	//     `validate_jetstream_need`. This rule is NEW, not a restatement
+	//     of prior behaviour: it exists because the provisioner composes
+	//     this name into a NATS-side identifier joined on `_`
+	//     (`nats_stream_name` in
+	//     `resourceclaim-provisioner::nats_accounts`) — DNS-1123's
+	//     alphabet (`[a-z0-9-]`) excludes `_`, which is what keeps that
+	//     join injective. A `_` here would let two different applications
+	//     compose the identical NATS stream name.
 	name: string
 	// Subjects the stream collects. A subject whose FIRST TOKEN is not the
 	// owning application's name is fan-in — ADR 0061 §6 CLASSIFIES that as
@@ -486,8 +504,16 @@ _mkFields: {
 #JetStreamConsume: {
 	// Application in the same namespace that declares `stream`. Omit for
 	// the declaring application's own stream.
-	from?:   string
-	stream:  string
+	from?:  string
+	stream: string
+	// A DNS-1123 label — same rule, same reason, and the same
+	// CRD-`pattern`-plus-webhook shape as `#JetStreamStream.name` above
+	// (`"…needs.jetstream.consume[].durable"` in
+	// `schemas/crdmeta/meta.cue`): the provisioner composes this into a
+	// NATS-side durable name joined on `_` (`nats_durable_name` in
+	// `resourceclaim-provisioner::nats_accounts`), and a `_` here would
+	// let two different applications compose the identical NATS durable
+	// name — silently sharing one consumer's delivery cursor.
 	durable: string
 }
 

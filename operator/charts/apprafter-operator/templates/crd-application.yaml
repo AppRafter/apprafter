@@ -87,6 +87,7 @@ spec:
                             items:
                               properties:
                                 durable:
+                                  pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                                   type: string
                                 from:
                                   type: string
@@ -125,6 +126,7 @@ spec:
                                 maxBytes:
                                   type: string
                                 name:
+                                  pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                                   type: string
                                 retention:
                                   enum:
@@ -223,6 +225,7 @@ spec:
                               items:
                                 properties:
                                   durable:
+                                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                                     type: string
                                   from:
                                     type: string
@@ -261,6 +264,7 @@ spec:
                                   maxBytes:
                                     type: string
                                   name:
+                                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                                     type: string
                                   retention:
                                     enum:

@@ -1224,6 +1224,24 @@ fn validate_jetstream_need(js: &JetStreamNeed, scope: &str) -> Vec<String> {
             seen_stream_names.push(&stream.name);
         }
 
+        // The provisioner composes this into the NATS-side stream name as
+        // `<app>_<name>` (ADR 0061 §3/§6; `nats_stream_name` in
+        // `resourceclaim-provisioner::nats_accounts`) — `_` is the join
+        // character, so a `_` inside `name` itself would make that
+        // encoding ambiguous. Two different applications could then
+        // compose the IDENTICAL NATS stream name for two different
+        // declared streams, and that composed name is what NATS access
+        // rules are keyed on: it decides which application may read,
+        // publish to, and purge the underlying stream. A DNS-1123 label
+        // (this repo's `is_dns_1123_label`) excludes `_` by construction,
+        // which is what keeps the join injective.
+        if !is_dns_1123_label(&stream.name) {
+            errs.push(format!(
+                "{scope}: needs.jetstream.streams[{idx}] name {:?} must be a DNS-1123 label (lowercase alphanumeric + '-', start and end alphanumeric) — it becomes half of the composed NATS stream name `<app>_<name>`; a '_' in it would let two different applications compose the identical NATS stream name",
+                stream.name
+            ));
+        }
+
         // `streams[{idx} {name:?}]`, not just `{name:?}`: two streams
         // sharing a name (the very thing rejected above) would otherwise
         // make two DIFFERENT array elements' messages read identically,
@@ -1273,6 +1291,18 @@ fn validate_jetstream_need(js: &JetStreamNeed, scope: &str) -> Vec<String> {
         if consume.durable.trim().is_empty() {
             errs.push(format!(
                 "{scope}: needs.jetstream.consume[{idx}].durable must not be empty"
+            ));
+        } else if !is_dns_1123_label(&consume.durable) {
+            // Same reasoning as `streams[].name` above: composed into the
+            // NATS-side durable name as `<app>_<durable>`
+            // (`nats_durable_name` in
+            // `resourceclaim-provisioner::nats_accounts`). A `_` in
+            // `durable` would let two different applications compose the
+            // identical NATS durable name and silently share one
+            // consumer's delivery cursor.
+            errs.push(format!(
+                "{scope}: needs.jetstream.consume[{idx}].durable {:?} must be a DNS-1123 label (lowercase alphanumeric + '-', start and end alphanumeric) — it becomes half of the composed NATS durable name `<app>_<durable>`; a '_' in it would let two different applications compose the identical NATS durable name and silently share one consumer's delivery cursor",
+                consume.durable
             ));
         } else if seen_stream_names.contains(&consume.durable.as_str()) {
             errs.push(format!(
@@ -4230,6 +4260,51 @@ mod tests {
             .collect();
         assert_eq!(js_errs.len(), 1, "{js_errs:?}");
         assert!(js_errs[0].message.contains("duplicate"), "{js_errs:?}");
+    }
+
+    #[test]
+    fn rejects_non_dns_1123_stream_name() {
+        // Round-7 review: `streams[].name` becomes half of the composed
+        // NATS stream name `<app>_<name>` (nats_stream_name, ADR 0061 §3/
+        // §6). A `_` inside the declared name would make that encoding
+        // ambiguous — this is the guard that keeps the join injective.
+        let spec = json!({
+            "base": {
+                "image": "x",
+                "needs": { "jetstream": { "streams": [
+                    { "name": "blocks_head", "subjects": ["shop.orders.>"], "maxBytes": "1Gi" }
+                ] } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        let js_errs: Vec<&ValidationError> = errors
+            .iter()
+            .filter(|e| e.field == "spec.base.needs.jetstream")
+            .collect();
+        assert_eq!(js_errs.len(), 1, "{js_errs:?}");
+        assert!(js_errs[0].message.contains("DNS-1123"), "{js_errs:?}");
+    }
+
+    #[test]
+    fn rejects_non_dns_1123_durable_name() {
+        // The other half of the same guard: `consume[].durable` becomes
+        // half of the composed NATS durable name `<app>_<durable>`
+        // (nats_durable_name).
+        let spec = json!({
+            "base": {
+                "image": "x",
+                "needs": { "jetstream": { "consume": [
+                    { "stream": "blocks-head", "durable": "idx_app" }
+                ] } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        let js_errs: Vec<&ValidationError> = errors
+            .iter()
+            .filter(|e| e.field == "spec.base.needs.jetstream")
+            .collect();
+        assert_eq!(js_errs.len(), 1, "{js_errs:?}");
+        assert!(js_errs[0].message.contains("DNS-1123"), "{js_errs:?}");
     }
 
     #[test]
