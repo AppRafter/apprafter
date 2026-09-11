@@ -5009,19 +5009,32 @@ mod tests {
     /// Build an `ApplicationBaseSpec` from a `type → ServiceNeed` map.
     /// 2.6b: `needs` is a closed struct, so the test-input map is folded
     /// into a `Needs` (each type → a scalar `OneOrMany::One`). Unknown
-    /// keys panic — tests only use the six service types.
+    /// keys panic — tests only use the six service types. `jetstream`
+    /// carries its own type (`JetStreamNeed`, ADR 0061 §6), not
+    /// `OneOrMany<ServiceNeed>` — the caller's `ServiceNeed` fields that
+    /// still apply (`selector`/`size`/`name`/`persistent`) carry over;
+    /// the jetstream-only fields (`dynamicStreams`/`streams`/`consume`)
+    /// default empty, which is fine since no test uses this helper with
+    /// `ty == "jetstream"` today.
     fn base_with_needs(needs: BTreeMap<String, ServiceNeed>) -> ApplicationBaseSpec {
-        use operator_core::{Needs, OneOrMany};
+        use operator_core::{JetStreamNeed, Needs, OneOrMany};
         let mut n = Needs::default();
         for (ty, need) in needs {
-            let one = Some(OneOrMany::One(need));
             match ty.as_str() {
-                "pg" => n.pg = one,
-                "jetstream" => n.jetstream = one,
-                "clickhouse" => n.clickhouse = one,
-                "redis" => n.redis = one,
-                "s3" => n.s3 = one,
-                "notifications" => n.notifications = one,
+                "pg" => n.pg = Some(OneOrMany::One(need)),
+                "jetstream" => {
+                    n.jetstream = Some(JetStreamNeed {
+                        selector: need.selector,
+                        size: need.size,
+                        name: need.name,
+                        persistent: need.persistent,
+                        ..Default::default()
+                    })
+                }
+                "clickhouse" => n.clickhouse = Some(OneOrMany::One(need)),
+                "redis" => n.redis = Some(OneOrMany::One(need)),
+                "s3" => n.s3 = Some(OneOrMany::One(need)),
+                "notifications" => n.notifications = Some(OneOrMany::One(need)),
                 other => panic!("base_with_needs: unknown service type {other}"),
             }
         }

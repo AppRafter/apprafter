@@ -262,6 +262,71 @@ impl DiskClaim {
     }
 }
 
+/// `needs.jetstream` (2.5 / ADR 0061). Mirrors `#JetStreamNeed` in
+/// `schemas/v1alpha1/application.cue`. `name` and `persistent` are
+/// present so the admission webhook can reject them by name — a
+/// structural schema prunes unknown fields before a validating webhook
+/// runs, so omitting them would drop `persistent: true` silently.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct JetStreamNeed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<BTreeMap<String, String>>,
+    /// `nano|small|medium|large|xlarge`. A plain `String` here, an enum in
+    /// the CRD — matching `ServiceNeed.size`, the existing convention in
+    /// this file. There is no `Size` Rust type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    #[serde(default)]
+    pub dynamic_streams: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streams: Vec<JetStreamStream>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consume: Vec<JetStreamConsume>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct JetStreamStream {
+    pub name: String,
+    pub subjects: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age: Option<String>,
+    pub max_bytes: String,
+    #[serde(default)]
+    pub allow_purge: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct JetStreamConsume {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    pub stream: String,
+    pub durable: String,
+}
+
+impl JetStreamNeed {
+    /// The single unnamed claim this need generates. jetstream takes no
+    /// `name` (ADR 0061 §6), so there is exactly one.
+    pub fn as_service_need(&self) -> ServiceNeed {
+        ServiceNeed {
+            name: None,
+            selector: self.selector.clone(),
+            size: self.size.clone(),
+            persistent: None,
+        }
+    }
+}
+
 /// `Application.spec.*.needs` — an explicit closed struct (2.6b) so
 /// `disk` can carry its own value type and every service key accepts a
 /// scalar **or** an array of named entries. Replaces the former
@@ -273,8 +338,10 @@ impl DiskClaim {
 pub struct Needs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pg: Option<OneOrMany<ServiceNeed>>,
+    /// Scalar only — no array (ADR 0061 §6). Its own value type
+    /// (`JetStreamNeed`), not `OneOrMany<ServiceNeed>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub jetstream: Option<OneOrMany<ServiceNeed>>,
+    pub jetstream: Option<JetStreamNeed>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clickhouse: Option<OneOrMany<ServiceNeed>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -345,9 +412,33 @@ impl Needs {
     /// emit byte-stable objects under server-side apply.
     pub fn entries(&self) -> Vec<(String, NeedEntry)> {
         let mut out: Vec<(String, NeedEntry)> = Vec::new();
-        let service_keys: [(&str, &Option<OneOrMany<ServiceNeed>>); 6] = [
-            ("pg", &self.pg),
-            ("jetstream", &self.jetstream),
+        if let Some(one_or_many) = &self.pg {
+            for need in one_or_many.as_slice_vec() {
+                out.push((
+                    "pg".to_string(),
+                    NeedEntry {
+                        name: need.name.clone(),
+                        service: Some(need),
+                        disk: None,
+                    },
+                ));
+            }
+        }
+        // jetstream is its own type (`JetStreamNeed`, not
+        // `OneOrMany<ServiceNeed>`) and scalar-only, so it always yields
+        // exactly one unnamed entry when present (ADR 0061 §6) — no `name`
+        // identity, unlike the other five service slots.
+        if let Some(js) = &self.jetstream {
+            out.push((
+                "jetstream".to_string(),
+                NeedEntry {
+                    name: None,
+                    service: Some(js.as_service_need()),
+                    disk: None,
+                },
+            ));
+        }
+        let service_keys: [(&str, &Option<OneOrMany<ServiceNeed>>); 4] = [
             ("clickhouse", &self.clickhouse),
             ("redis", &self.redis),
             ("s3", &self.s3),
@@ -903,6 +994,41 @@ mod tests {
         assert!(v.get("mountPath").is_some());
         assert!(v.get("readOnly").is_some());
         assert!(v.get("mount_path").is_none());
+    }
+
+    #[test]
+    fn jetstream_need_deserialises_with_streams_and_consume() {
+        let n: Needs = serde_json::from_value(serde_json::json!({
+            "jetstream": {
+                "dynamicStreams": true,
+                "streams": [{
+                    "name": "orders",
+                    "subjects": ["shop.orders.>"],
+                    "maxBytes": "1Gi",
+                    "allowPurge": true
+                }],
+                "consume": [{"from": "feeder", "stream": "blocks-head", "durable": "indexer"}]
+            }
+        }))
+        .expect("jetstream need must deserialise");
+        let js = n.jetstream.expect("jetstream present");
+        assert!(js.dynamic_streams);
+        assert_eq!(js.streams.len(), 1);
+        assert_eq!(js.streams[0].name, "orders");
+        assert_eq!(js.streams[0].max_bytes, "1Gi");
+        assert!(js.streams[0].allow_purge);
+        assert_eq!(js.consume[0].from.as_deref(), Some("feeder"));
+        assert_eq!(js.consume[0].durable, "indexer");
+    }
+
+    #[test]
+    fn bare_jetstream_need_is_valid_and_defaults_to_constrained() {
+        let n: Needs = serde_json::from_value(serde_json::json!({"jetstream": {}}))
+            .expect("bare jetstream need must deserialise");
+        let js = n.jetstream.expect("jetstream present");
+        assert!(!js.dynamic_streams, "dynamicStreams defaults to false");
+        assert!(js.streams.is_empty());
+        assert!(js.consume.is_empty());
     }
 
     #[test]

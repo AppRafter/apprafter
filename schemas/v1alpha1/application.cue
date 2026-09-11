@@ -194,6 +194,7 @@ package v1alpha1
 #ClaimFieldsFor: {
 	pg: ["url", "user", "pass", "host", "port", "db"]
 	redis: ["url", "user", "pass", "host", "port", "db", "channelPrefix"]
+	jetstream: ["url", "host", "port", "user", "pass", "account", "subjectPrefix", "inboxPrefix"]
 }
 
 // Hidden mirror for same-package use inside #MkClaim below.
@@ -284,7 +285,13 @@ _mkFields: {
 // `#ServiceNeed`s; `disk` carries `#DiskClaim`.
 #Needs: {
 	pg?: #ServiceNeed | [...#ServiceNeed]
-	jetstream?: #ServiceNeed | [...#ServiceNeed]
+
+	// Scalar only — no array. Two users of one application would share one
+	// subject prefix and be indistinguishable (ADR 0061 §6). This narrows
+	// ADR 0043's `#ServiceNeed | [...#ServiceNeed]` grammar, which that ADR
+	// records as an amendment.
+	jetstream?: #JetStreamNeed
+
 	clickhouse?: #ServiceNeed | [...#ServiceNeed]
 	redis?: #ServiceNeed | [...#ServiceNeed]
 	s3?: #ServiceNeed | [...#ServiceNeed]
@@ -370,6 +377,64 @@ _mkFields: {
 
 	// Mount the volume read-only (default false).
 	readOnly?: bool | *false
+}
+
+// #JetStreamNeed — `Application.spec.*.needs.jetstream` (2.5 / ADR 0061).
+// A dedicated type rather than `#ServiceNeed`, because jetstream carries
+// declarations (`streams`, `consume`) and a capability flag that no other
+// need has, and because two of `#ServiceNeed`'s fields are meaningless
+// here.
+//
+// `name` and `persistent` are DECLARED IN ORDER TO BE REJECTED by the
+// admission webhook. Omitting them would hand the decision to the
+// apiserver, whose structural schema PRUNES unknown fields before a
+// validating webhook runs — so `persistent: true` would vanish silently
+// and the manifest would appear to work. See ADR 0061 §6.
+#JetStreamNeed: {
+	selector?: [string]: string
+	size?: #Size
+
+	// Grant `$JS.API.STREAM.CREATE/UPDATE.>`. Default false. Enabling it
+	// lets the application read every stream in its namespace and drain
+	// every workqueue in it (ADR 0061 §4.1) — it is an ADR 0052
+	// security-boundary change, not a convenience.
+	dynamicStreams?: bool | *false
+
+	streams?: [...#JetStreamStream]
+	consume?: [...#JetStreamConsume]
+
+	// Rejected by the webhook. Present so the rejection is possible.
+	name?:       string
+	persistent?: bool
+}
+
+#JetStreamStream: {
+	name: string
+	// Subjects the stream collects. A subject whose FIRST TOKEN is not the
+	// owning application's name is fan-in (ADR 0061 §6) and fires ADR 0052
+	// trigger #16. Non-empty — enforced by the CRD `minItems` + webhook
+	// (a CUE-level `& [_, ...]` non-empty constraint breaks `cue export
+	// --out openapi`: it cannot synthesize a concrete `default` element
+	// for a non-concrete-typed minItems:1 list — same reason
+	// `#SourceCredentialSpec.git.repoPrefixes` takes this route).
+	subjects: [...string]
+	storage?:   "file" | *"file" | "memory"
+	retention?: "limits" | *"limits" | "interest" | "workqueue"
+	maxAge?:    string
+	// Required: a stream without it silently claims the whole account quota.
+	maxBytes: string
+	// Re-grant PURGE on this stream only. Name-scoped, so it can reach only
+	// the declaring application's own data — unless the stream is fan-in,
+	// which trigger #16 covers.
+	allowPurge?: bool | *false
+}
+
+#JetStreamConsume: {
+	// Application in the same namespace that declares `stream`. Omit for
+	// the declaring application's own stream.
+	from?:   string
+	stream:  string
+	durable: string
 }
 
 // #Resources — container resource requests/limits (2.16d). Keys are

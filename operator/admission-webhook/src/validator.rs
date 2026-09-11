@@ -618,14 +618,17 @@ fn validate_needs_names(
     }
 }
 
-/// The six connection-secret/env-injected service slots of a typed
+/// The five `OneOrMany<ServiceNeed>`-shaped service slots of a typed
 /// `Needs`, in the fixed declaration order (`disk` is intentionally
-/// excluded — its identity rules live in `validate_disk_claims`). A
+/// excluded — its identity rules live in `validate_disk_claims`;
+/// `jetstream` is intentionally excluded too — it carries its own type
+/// (`JetStreamNeed`, ADR 0061 §6) and is scalar-only, so the array-name
+/// uniqueness this function checks cannot apply to it. Its `name`/
+/// `persistent` rejection is a separate, dedicated webhook check). A
 /// renamed slot field on `Needs` fails to compile here.
-fn service_need_slots(needs: &Needs) -> [(&'static str, &Option<OneOrMany<ServiceNeed>>); 6] {
+fn service_need_slots(needs: &Needs) -> [(&'static str, &Option<OneOrMany<ServiceNeed>>); 5] {
     [
         ("pg", &needs.pg),
-        ("jetstream", &needs.jetstream),
         ("clickhouse", &needs.clickhouse),
         ("redis", &needs.redis),
         ("s3", &needs.s3),
@@ -1636,12 +1639,16 @@ fn validate_env_refs(
 /// The `OneOrMany<ServiceNeed>` slot of a typed `Needs` for a runtime
 /// service-type name, or `None` when the type is absent / not a service
 /// type. `disk` is intentionally not matched — a `claim.disk.*` ref is
-/// rejected earlier by `CLAIM_UNSUPPORTED_TYPES`. A renamed `Needs` slot
-/// fails to compile here.
+/// rejected earlier by `CLAIM_UNSUPPORTED_TYPES`. `jetstream` is
+/// intentionally not matched either — it is also in
+/// `CLAIM_UNSUPPORTED_TYPES` (no connection Secret yet), so callers
+/// always short-circuit on that check before reaching this function; it
+/// also carries its own type (`JetStreamNeed`), not
+/// `OneOrMany<ServiceNeed>`. A renamed `Needs` slot fails to compile
+/// here.
 fn needs_slot<'a>(needs: &'a Needs, service_type: &str) -> Option<&'a OneOrMany<ServiceNeed>> {
     let slot = match service_type {
         "pg" => &needs.pg,
-        "jetstream" => &needs.jetstream,
         "clickhouse" => &needs.clickhouse,
         "redis" => &needs.redis,
         "s3" => &needs.s3,

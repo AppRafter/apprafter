@@ -1684,16 +1684,20 @@ mod tests {
     // (2.4e auto-inject removed — claim-backed env vars must be declared
     // explicitly in spec.*.env as EnvValue::Ref(Claim(…)) entries.)
 
-    use operator_core::{EnvRef, Needs, OneOrMany, ServiceNeed};
+    use operator_core::{EnvRef, JetStreamNeed, Needs, OneOrMany, ServiceNeed};
 
     /// Helper: build a base with a single (unnamed, scalar) need of the
     /// given type (no selector/size). 2.6b: `needs` is a closed struct.
+    /// `jetstream` carries its own type (`JetStreamNeed`, ADR 0061 §6),
+    /// not `OneOrMany<ServiceNeed>` — its bare-default form is
+    /// equivalent for this helper's purposes (no selector/size either
+    /// way).
     fn base_with_need(image: &str, need_type: &str) -> ApplicationBaseSpec {
         let one = Some(OneOrMany::One(ServiceNeed::default()));
         let mut needs = Needs::default();
         match need_type {
             "pg" => needs.pg = one,
-            "jetstream" => needs.jetstream = one,
+            "jetstream" => needs.jetstream = Some(JetStreamNeed::default()),
             "clickhouse" => needs.clickhouse = one,
             "redis" => needs.redis = one,
             "s3" => needs.s3 = one,

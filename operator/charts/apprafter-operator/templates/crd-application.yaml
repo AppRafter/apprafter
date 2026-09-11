@@ -82,7 +82,72 @@ spec:
                       disk:
                         x-kubernetes-preserve-unknown-fields: true
                       jetstream:
-                        x-kubernetes-preserve-unknown-fields: true
+                        properties:
+                          consume:
+                            items:
+                              properties:
+                                durable:
+                                  type: string
+                                from:
+                                  type: string
+                                stream:
+                                  type: string
+                              required:
+                              - stream
+                              - durable
+                              type: object
+                            type: array
+                          dynamicStreams:
+                            type: boolean
+                          name:
+                            type: string
+                          persistent:
+                            type: boolean
+                          selector:
+                            additionalProperties:
+                              type: string
+                            type: object
+                          size:
+                            enum:
+                            - nano
+                            - small
+                            - medium
+                            - large
+                            - xlarge
+                            type: string
+                          streams:
+                            items:
+                              properties:
+                                allowPurge:
+                                  type: boolean
+                                maxAge:
+                                  type: string
+                                maxBytes:
+                                  type: string
+                                name:
+                                  type: string
+                                retention:
+                                  enum:
+                                  - limits
+                                  - interest
+                                  - workqueue
+                                  type: string
+                                storage:
+                                  enum:
+                                  - file
+                                  - memory
+                                  type: string
+                                subjects:
+                                  items:
+                                    type: string
+                                  type: array
+                              required:
+                              - name
+                              - subjects
+                              - maxBytes
+                              type: object
+                            type: array
+                        type: object
                       notifications:
                         x-kubernetes-preserve-unknown-fields: true
                       pg:
@@ -152,7 +217,72 @@ spec:
                         disk:
                           x-kubernetes-preserve-unknown-fields: true
                         jetstream:
-                          x-kubernetes-preserve-unknown-fields: true
+                          properties:
+                            consume:
+                              items:
+                                properties:
+                                  durable:
+                                    type: string
+                                  from:
+                                    type: string
+                                  stream:
+                                    type: string
+                                required:
+                                - stream
+                                - durable
+                                type: object
+                              type: array
+                            dynamicStreams:
+                              type: boolean
+                            name:
+                              type: string
+                            persistent:
+                              type: boolean
+                            selector:
+                              additionalProperties:
+                                type: string
+                              type: object
+                            size:
+                              enum:
+                              - nano
+                              - small
+                              - medium
+                              - large
+                              - xlarge
+                              type: string
+                            streams:
+                              items:
+                                properties:
+                                  allowPurge:
+                                    type: boolean
+                                  maxAge:
+                                    type: string
+                                  maxBytes:
+                                    type: string
+                                  name:
+                                    type: string
+                                  retention:
+                                    enum:
+                                    - limits
+                                    - interest
+                                    - workqueue
+                                    type: string
+                                  storage:
+                                    enum:
+                                    - file
+                                    - memory
+                                    type: string
+                                  subjects:
+                                    items:
+                                      type: string
+                                    type: array
+                                required:
+                                - name
+                                - subjects
+                                - maxBytes
+                                type: object
+                              type: array
+                          type: object
                         notifications:
                           x-kubernetes-preserve-unknown-fields: true
                         pg:
