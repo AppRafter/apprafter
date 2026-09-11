@@ -365,6 +365,21 @@ pub enum AccountsFileError {
     EmptyPassword(String),
     #[error("refusing to render: account {0} would carry no users")]
     EmptyAccount(String),
+    /// 2.5d Task 8b: the per-namespace ceiling (`namespace_ceiling_bytes`
+    /// on [`render_accounts_file`]) bounds ONE account; nothing bounded N
+    /// namespaces together, so N namespaces could jointly promise more
+    /// `max_file` than the server's shared JetStream PVC (or more
+    /// `max_mem` than its `max_memory_store`) actually has — NATS does
+    /// not refuse this itself; the accounts compete for capacity
+    /// promised twice, surfacing as an unattributable allocation failure
+    /// in whoever asks last. REFUSE, not a proportional clamp: a tenant
+    /// that cannot have what it asked for should be told, not silently
+    /// handed less than its manifest says while every OTHER tenant is
+    /// silently handed less too.
+    #[error(
+        "refusing to render: total quota across all namespaces ({total} bytes) exceeds the platform-wide budget ({budget} bytes)"
+    )]
+    GlobalBudgetExceeded { total: u64, budget: u64 },
 }
 
 /// Floor under [`account_max_mem_bytes`]'s fraction: keeps a namespace
@@ -411,6 +426,27 @@ fn fmt_subject_list(subjects: &[String]) -> String {
     format!("[{}]", quoted.join(", "))
 }
 
+/// The clamped per-namespace file quota (2.5d Task 8a, ADR 0061 §6): the
+/// SUM of `peers`' individual `quota_bytes`, clamped at `ceiling_bytes`
+/// — "the tier ceiling clamping the SUM rather than each term". A
+/// namespace whose declared claims sum past the ceiling gets exactly the
+/// ceiling, once, not each claim silently capped before summing (the
+/// wrong semantics a caller outside this module would be forced into —
+/// `render_account` is the only place that sees the whole namespace's
+/// `peers` at once, so this is the only place that CAN sum before
+/// clamping). Also the input `render_accounts_file` sums ACROSS
+/// namespaces for Task 8b's global-budget check, so the two ceilings
+/// compose: this function's return value is exactly what each account's
+/// `max_file` promises, and the global check is a sum of promises, not
+/// of raw requests.
+fn namespace_quota_bytes(peers: &[ClaimView], ceiling_bytes: u64) -> u64 {
+    peers
+        .iter()
+        .map(|c| c.quota_bytes)
+        .sum::<u64>()
+        .min(ceiling_bytes)
+}
+
 /// One namespace's account block: the `jetstream` limits, the management
 /// user (full access, including the SHARED `_INBOX.>` tree — it sets no
 /// custom inbox prefix of its own, ADR 0061 §3, so denying it `_INBOX.>`
@@ -431,6 +467,7 @@ fn fmt_subject_list(subjects: &[String]) -> String {
 fn render_account(
     namespace: &str,
     peers: &[ClaimView],
+    ceiling_bytes: u64,
     password: &dyn Fn(&str) -> String,
 ) -> Result<String, AccountsFileError> {
     let account = account_name(namespace);
@@ -453,7 +490,7 @@ fn render_account(
         return Err(AccountsFileError::EmptyPassword(mgr));
     }
 
-    let total_quota: u64 = peers.iter().map(|c| c.quota_bytes).sum();
+    let total_quota = namespace_quota_bytes(peers, ceiling_bytes);
     let max_mem = account_max_mem_bytes(total_quota);
 
     let mut out = String::new();
@@ -522,11 +559,35 @@ fn render_account(
 /// this function's job stops at the accounts the LIVE CLAIM SET
 /// produces.
 ///
+/// Two ceilings, two different scopes (2.5d Task 8, ADR 0061 §6 and its
+/// round-7 review follow-up — both are values passed in, never read
+/// from anywhere, so this function stays pure):
+///
+/// - `namespace_ceiling_bytes` bounds ONE namespace's account — the
+///   `#Size`-mapping tier ceiling, clamping the SUM of that namespace's
+///   claims (never each term; see [`namespace_quota_bytes`]).
+/// - `global_budget_bytes` bounds the SUM ACROSS EVERY namespace this
+///   call renders — nothing enforced this before Task 8b existed, so N
+///   namespaces could jointly promise more `max_file`/`max_mem` than the
+///   server's shared JetStream PVC / `max_memory_store` actually has.
+///   NATS does not refuse this itself: the accounts compete for
+///   capacity promised twice, surfacing as an unattributable allocation
+///   failure in whoever asks last. This function REFUSES instead — a
+///   tenant that cannot have what it asked for should be told, not
+///   silently handed less than its manifest says (see
+///   [`AccountsFileError::GlobalBudgetExceeded`]'s own doc for why a
+///   proportional clamp was rejected). Checked BEFORE any namespace is
+///   rendered, against the SUM of each namespace's ALREADY-clamped
+///   `namespace_quota_bytes` — the actual promises the file is about to
+///   make, not the raw pre-clamp requests.
+///
 /// `password` is injected rather than read (e.g. from a Kubernetes
 /// Secret) so this function stays pure — no client, no network, no clock
 /// — and its tests need no fixtures.
 pub fn render_accounts_file(
     claims: &[ClaimView],
+    namespace_ceiling_bytes: u64,
+    global_budget_bytes: u64,
     password: &dyn Fn(&str) -> String,
 ) -> Result<String, AccountsFileError> {
     let mut by_namespace: BTreeMap<String, Vec<ClaimView>> = BTreeMap::new();
@@ -537,10 +598,26 @@ pub fn render_accounts_file(
             .push(c.clone());
     }
 
+    let global_total: u64 = by_namespace
+        .values()
+        .map(|peers| namespace_quota_bytes(peers, namespace_ceiling_bytes))
+        .sum();
+    if global_total > global_budget_bytes {
+        return Err(AccountsFileError::GlobalBudgetExceeded {
+            total: global_total,
+            budget: global_budget_bytes,
+        });
+    }
+
     let mut out = String::new();
     for (namespace, mut peers) in by_namespace {
         peers.sort_by(|a, b| a.app.cmp(&b.app));
-        out.push_str(&render_account(&namespace, &peers, password)?);
+        out.push_str(&render_account(
+            &namespace,
+            &peers,
+            namespace_ceiling_bytes,
+            password,
+        )?);
     }
     Ok(out)
 }
@@ -887,7 +964,8 @@ mod tests {
     fn renders_one_account_per_namespace_with_a_user_per_claim() {
         let mut claims = ns_with_two_apps();
         claims.push(claim("other", "solo"));
-        let out = render_accounts_file(&claims, &|u| format!("pw-{u}")).expect("renders");
+        let out = render_accounts_file(&claims, u64::MAX, u64::MAX, &|u| format!("pw-{u}"))
+            .expect("renders");
         assert!(out.contains("ns_demo: {"), "{out}");
         assert!(out.contains("ns_other: {"), "{out}");
         assert!(
@@ -906,14 +984,20 @@ mod tests {
     fn the_management_user_keeps_inbox_access() {
         // NACK sets no custom inbox prefix; denying it `_INBOX.>` would stop
         // it making a single request (ADR 0061 §3).
-        let out = render_accounts_file(&ns_with_two_apps(), &|u| format!("pw-{u}")).unwrap();
+        let out = render_accounts_file(&ns_with_two_apps(), u64::MAX, u64::MAX, &|u| {
+            format!("pw-{u}")
+        })
+        .unwrap();
         let mgr = out.split("user: \"mgr_demo\"").nth(1).expect("mgr block");
         assert!(mgr.contains("_INBOX.>"), "mgr must keep _INBOX.>: {mgr}");
     }
 
     #[test]
     fn a_claim_user_subscribes_only_to_its_own_prefixes() {
-        let out = render_accounts_file(&ns_with_two_apps(), &|u| format!("pw-{u}")).unwrap();
+        let out = render_accounts_file(&ns_with_two_apps(), u64::MAX, u64::MAX, &|u| {
+            format!("pw-{u}")
+        })
+        .unwrap();
         let block = out
             .split("user: \"claim_demo_feeder_jetstream\"")
             .nth(1)
@@ -939,15 +1023,16 @@ mod tests {
         let mut b = a.clone();
         b.reverse();
         assert_eq!(
-            render_accounts_file(&a, &|u| format!("pw-{u}")).unwrap(),
-            render_accounts_file(&b, &|u| format!("pw-{u}")).unwrap(),
+            render_accounts_file(&a, u64::MAX, u64::MAX, &|u| format!("pw-{u}")).unwrap(),
+            render_accounts_file(&b, u64::MAX, u64::MAX, &|u| format!("pw-{u}")).unwrap(),
             "an unchanged derivation must compare equal so the write can be skipped"
         );
     }
 
     #[test]
     fn refuses_to_render_a_file_that_would_disable_authentication() {
-        let err = render_accounts_file(&ns_with_two_apps(), &|_| String::new()).unwrap_err();
+        let err = render_accounts_file(&ns_with_two_apps(), u64::MAX, u64::MAX, &|_| String::new())
+            .unwrap_err();
         assert!(err.to_string().contains("empty password"), "{err}");
     }
 
@@ -961,7 +1046,7 @@ mod tests {
         // while that fixture stayed in place). This isolates the mgr-only
         // check: every claim user gets a real password, only `mgr_demo`'s
         // is empty.
-        let err = render_accounts_file(&ns_with_two_apps(), &|u| {
+        let err = render_accounts_file(&ns_with_two_apps(), u64::MAX, u64::MAX, &|u| {
             if u == "mgr_demo" {
                 String::new()
             } else {
@@ -979,7 +1064,7 @@ mod tests {
     fn refuses_to_render_when_only_a_claim_users_password_is_empty() {
         // Symmetric isolation for the per-claim check: mgr and every OTHER
         // claim user get a real password, only one claim user's is empty.
-        let err = render_accounts_file(&ns_with_two_apps(), &|u| {
+        let err = render_accounts_file(&ns_with_two_apps(), u64::MAX, u64::MAX, &|u| {
             if u == "claim_demo_feeder_jetstream" {
                 String::new()
             } else {
@@ -998,7 +1083,8 @@ mod tests {
         let mut claims = ns_with_two_apps();
         claims[0].quota_bytes = 1 << 30;
         claims[1].quota_bytes = 2 << 30;
-        let out = render_accounts_file(&claims, &|u| format!("pw-{u}")).unwrap();
+        let out =
+            render_accounts_file(&claims, u64::MAX, u64::MAX, &|u| format!("pw-{u}")).unwrap();
         assert!(out.contains("max_file: 3221225472"), "{out}");
     }
 
@@ -1015,7 +1101,8 @@ mod tests {
             c.quota_bytes = 10 * (1 << 30); // 10 GiB each, well above the floor
         }
         let total_quota: u64 = claims.iter().map(|c| c.quota_bytes).sum();
-        let out = render_accounts_file(&claims, &|u| format!("pw-{u}")).unwrap();
+        let out =
+            render_accounts_file(&claims, u64::MAX, u64::MAX, &|u| format!("pw-{u}")).unwrap();
         let max_mem: u64 = out
             .split("max_mem: ")
             .nth(1)
@@ -1040,7 +1127,8 @@ mod tests {
         for c in &mut claims {
             c.quota_bytes = 1024; // tiny — the fraction alone would be ~200 bytes
         }
-        let out = render_accounts_file(&claims, &|u| format!("pw-{u}")).unwrap();
+        let out =
+            render_accounts_file(&claims, u64::MAX, u64::MAX, &|u| format!("pw-{u}")).unwrap();
         let max_mem: u64 = out
             .split("max_mem: ")
             .nth(1)
@@ -1055,6 +1143,68 @@ mod tests {
             max_mem, ACCOUNT_MAX_MEM_FLOOR_BYTES,
             "a tiny file quota must not leave storage: memory unusable: {out}"
         );
+    }
+
+    #[test]
+    fn the_namespace_sum_is_clamped_at_the_ceiling_not_each_claim() {
+        // 2.5d Task 8a (ADR 0061 §6): the tier ceiling clamps the SUM of
+        // a namespace's claims, not each term. render_account computes
+        // that sum internally from `peers`, so a caller could only ever
+        // clamp each `quota_bytes` before passing it in — the wrong
+        // semantics, and not fixable at the call site; the ceiling has
+        // to be threaded through and applied to the sum itself. Three
+        // 1Gi claims under a 2Gi ceiling must render `max_file: 2Gi` —
+        // not 3Gi (unclamped) and not 1Gi (a per-claim clamp would
+        // produce this only if it clamped and then divided, but the
+        // exact-equality assertion below pins the one correct answer
+        // regardless of which wrong formula a bad implementation used).
+        let claims = vec![claim("demo", "a"), claim("demo", "b"), claim("demo", "c")];
+        let ceiling = 2 * (1u64 << 30); // 2Gi; each claim defaults to 1Gi
+        let out = render_accounts_file(&claims, ceiling, u64::MAX, &|u| format!("pw-{u}"))
+            .expect("renders");
+        assert!(out.contains(&format!("max_file: {ceiling}")), "{out}");
+    }
+
+    #[test]
+    fn the_namespace_ceiling_does_not_affect_a_sum_already_under_it() {
+        // The other half of 8a's clamp: a sum that already fits must
+        // pass through unchanged, not always collapse to the ceiling
+        // (which a backwards `max()` instead of `min()` would do
+        // without any of the "exceeds the ceiling" tests noticing —
+        // they only ever check the OVER case).
+        let claims = ns_with_two_apps(); // demo: 2 claims, 1Gi each = 2Gi
+        let out =
+            render_accounts_file(&claims, 10 * (1u64 << 30), u64::MAX, &|u| format!("pw-{u}"))
+                .expect("renders");
+        assert!(
+            out.contains(&format!("max_file: {}", 2 * (1u64 << 30))),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn refuses_to_render_when_the_global_sum_exceeds_the_platform_budget() {
+        // 2.5d Task 8b: the per-namespace ceiling (8a) bounds ONE
+        // account; nothing bounds N namespaces together. Two namespaces
+        // — "demo" (2Gi, unclamped by a generous per-namespace ceiling)
+        // and "other" (3Gi) — sum to 5Gi, over a 4Gi platform budget.
+        let mut claims = ns_with_two_apps(); // demo: 2 claims, 1Gi each = 2Gi
+        let mut solo = claim("other", "solo");
+        solo.quota_bytes = 3 * (1u64 << 30); // 3Gi
+        claims.push(solo);
+        let budget = 4 * (1u64 << 30);
+        let err =
+            render_accounts_file(&claims, u64::MAX, budget, &|u| format!("pw-{u}")).unwrap_err();
+        assert!(err.to_string().contains("platform-wide budget"), "{err}");
+    }
+
+    #[test]
+    fn a_render_that_fits_the_global_budget_is_unaffected() {
+        let claims = ns_with_two_apps(); // demo: 2 claims, 1Gi each = 2Gi
+        let out =
+            render_accounts_file(&claims, u64::MAX, 10 * (1u64 << 30), &|u| format!("pw-{u}"))
+                .expect("renders — the budget is not exceeded");
+        assert!(out.contains("ns_demo: {"), "{out}");
     }
 
     #[test]
@@ -1078,7 +1228,7 @@ mod tests {
         // path independently of whatever `account_name` currently
         // computes.
         let c = claim("demo-ns", "app");
-        let out = render_accounts_file(&[c], &|u| format!("pw-{u}")).unwrap();
+        let out = render_accounts_file(&[c], u64::MAX, u64::MAX, &|u| format!("pw-{u}")).unwrap();
         assert!(
             out.contains("ns_demo_ns: {"),
             "expected key \"ns_demo_ns: {{\" in:\n{out}"
@@ -1095,7 +1245,7 @@ mod tests {
         // instead — the "check emptiness before indexing" guard is
         // defensive coding for whatever calls this function next, not
         // dead code no test can reach.
-        let err = render_account("demo", &[], &|u| format!("pw-{u}")).unwrap_err();
+        let err = render_account("demo", &[], u64::MAX, &|u| format!("pw-{u}")).unwrap_err();
         assert!(err.to_string().contains("no users"), "{err}");
     }
 
@@ -1134,7 +1284,8 @@ mod tests {
         // had been asked to parse before.
         let mut claims = ns_with_two_apps();
         claims.push(claim("other", "solo"));
-        let fragment = render_accounts_file(&claims, &|u| format!("pw-{u}")).expect("renders");
+        let fragment = render_accounts_file(&claims, u64::MAX, u64::MAX, &|u| format!("pw-{u}"))
+            .expect("renders");
 
         let nats_conf = r#"
 port: 4222
