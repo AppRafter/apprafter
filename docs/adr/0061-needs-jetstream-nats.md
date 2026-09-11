@@ -523,6 +523,34 @@ stream and the namespace total is checked before creation, surfacing
 `QuotaExceeded` rather than an opaque server error through NACK. `max_mem` is
 seeded conservatively at Tier 1: memory-storage streams live in the server's RSS.
 
+**A non-zero account `max_mem` requires the chart to enable the server's memory
+store, and the two are fatal apart — measured 2026-09-11.** The chart's default is
+`memoryStore.enabled: false`, which renders `max_memory_store: 0`. With that, a
+server whose *account block* requests any non-zero `max_mem` does not start: it
+**exits 1 at JetStream startup**. Measured on 2.14.3 — explicit `0` exits, `192M`
+reaches `Server is ready`. Note the distinction that makes this easy to
+mis-reproduce: *omitting* `max_memory_store` lets the server pick its own default
+and is harmless; the chart supplies an explicit zero.
+
+So the two halves of this design are individually correct and lethal together. The
+account-level fix — give `max_mem` a real value, because `storage: memory` was
+advertised by the CUE, the CRD and the webhook's own error message while being
+impossible in practice — turns an opaque per-stream `10028` into a **whole-server
+crash-loop on the first jetstream claim** unless `component_nats.cue` enables the
+memory store in the same change. Recorded because the coupling is invisible from
+either side: a later reader looking at the chart sees a memory store nothing
+obviously uses and removes it.
+
+**The ceilings are per-namespace, and nothing yet clamps the global sum.** The
+`#Size` mapping and its tier ceiling bound one namespace's account. N namespaces
+can therefore oversubscribe both the server's `max_memory_store` and the shared
+JetStream PVC. NATS does not crash on this — accounts simply compete for a total
+that was promised twice — which is worse than a refusal because it surfaces as an
+unattributable allocation failure in whichever tenant asks last. The provisioner is
+the right place to close it: it already derives the accounts file from the **whole**
+live claim set, so it can compute the global sum and refuse or clamp before
+writing. Open until part 2 does so.
+
 **Names** are collision-free by construction, in two distinct namespaces:
 
 | | NATS-side | Kubernetes object |
