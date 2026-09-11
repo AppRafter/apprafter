@@ -319,8 +319,9 @@ impl JetStreamNeed {
     /// `name` (ADR 0061 §6), so there is exactly one. This is also where
     /// the raw `self.name`/`self.persistent` are DISCARDED — they exist
     /// on `JetStreamNeed` only so the admission webhook can reject them
-    /// (that check doesn't exist yet; see `validate_needs_names` in
-    /// `admission-webhook/src/validator.rs`), never as claim identity.
+    /// (`validate_jetstream_need` in `admission-webhook/src/validator.rs`
+    /// does exactly that — a manifest setting either never reaches this
+    /// far in production), never as claim identity.
     pub fn as_service_need(&self) -> ServiceNeed {
         ServiceNeed {
             name: None,

@@ -399,10 +399,11 @@ _mkFields: {
 // here.
 //
 // `name` and `persistent` are DECLARED IN ORDER TO BE REJECTED by the
-// admission webhook. Omitting them would hand the decision to the
-// apiserver, whose structural schema PRUNES unknown fields before a
-// validating webhook runs — so `persistent: true` would vanish silently
-// and the manifest would appear to work. See ADR 0061 §6.
+// admission webhook (`validate_jetstream_need` in
+// `admission-webhook/src/validator.rs`). Omitting them would hand the
+// decision to the apiserver, whose structural schema PRUNES unknown
+// fields before a validating webhook runs — so `persistent: true` would
+// vanish silently and the manifest would appear to work. See ADR 0061 §6.
 #JetStreamNeed: {
 	selector?: [string]: string
 	size?: #Size
@@ -421,12 +422,12 @@ _mkFields: {
 	streams?: [...#JetStreamStream]
 	consume?: [...#JetStreamConsume]
 
-	// Present so the admission webhook CAN reject them (ADR 0061 §6) —
-	// NOT rejected today; that dedicated check doesn't exist yet (see
-	// `validate_needs_names` in admission-webhook/src/validator.rs).
-	// Until it lands, `persistent: true` here is silently dropped by
-	// `JetStreamNeed::as_service_need()` in operator-core, and a `name`
-	// is simply never read.
+	// Present so the admission webhook CAN reject them (ADR 0061 §6) — and
+	// does: `validate_jetstream_need` in admission-webhook/src/validator.rs
+	// rejects either one outright. A manifest setting `persistent: true`
+	// here is rejected before it ever reaches
+	// `JetStreamNeed::as_service_need()` in operator-core, which would
+	// otherwise silently drop it.
 	name?:       string
 	persistent?: bool
 }
@@ -444,15 +445,19 @@ _mkFields: {
 	// `allowPurge` below, but (same caveat as `dynamicStreams` above) no
 	// detector inspects a subjects diff yet, so today it fires nothing.
 	//
-	// Non-empty — enforced by the CRD `minItems: 1`
-	// (`schemas/crdmeta/meta.cue`'s `"…needs.jetstream.streams[].subjects"`
-	// schemaPatches, same route as `#SourceCredentialSpec.git.repoPrefixes`).
-	// NOT yet enforced by the admission webhook — that's a later task
-	// (the `validate_jetstream_need` check doesn't exist yet). A
-	// CUE-level `& [_, ...]` non-empty constraint can't live in the type
-	// itself: it breaks `cue export --out openapi`, which can't
-	// synthesize a concrete `default` element for a non-concrete-typed
-	// minItems:1 list.
+	// Non-empty — enforced on BOTH paths, and they must agree: the CRD
+	// `minItems: 1` (`schemas/crdmeta/meta.cue`'s
+	// `"…needs.jetstream.streams[].subjects"` schemaPatches, same route as
+	// `#SourceCredentialSpec.git.repoPrefixes`) is the apiserver-level
+	// gate — it applies unconditionally, before any webhook runs.
+	// `validate_jetstream_need` in admission-webhook/src/validator.rs
+	// enforces the same rule again, redundantly with the CRD in
+	// production, but its message names the offending stream, which the
+	// apiserver's generic structural-schema rejection cannot. A CUE-level
+	// `& [_, ...]` non-empty constraint can't live in the type itself: it
+	// breaks `cue export --out openapi`, which can't synthesize a
+	// concrete `default` element for a non-concrete-typed minItems:1
+	// list.
 	subjects: [...string]
 	storage?:   "file" | *"file" | "memory"
 	retention?: "limits" | *"limits" | "interest" | "workqueue"
