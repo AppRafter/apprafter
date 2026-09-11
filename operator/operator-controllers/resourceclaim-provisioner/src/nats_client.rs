@@ -52,6 +52,33 @@ pub enum NatsAdminError {
 /// are live, not merely that a TCP handshake succeeded.
 const VERIFY_SUBJECT: &str = "$JS.API.INFO";
 
+/// [`NatsClient::verify_user`]'s production request/reply timeout (2.5d
+/// Task 6) — deliberately chosen, NOT the `async-nats` library default
+/// (`Some(Duration::from_secs(10))`, confirmed by reading
+/// `async-nats-0.50.0/src/options.rs`) left in place "by omission."
+///
+/// A NATS permissions violation on the reply inbox delivers NO error
+/// signal — the request simply never gets a reply, so it rides this
+/// timeout on every single denied attempt (this crate's own standing
+/// finding, first measured in the gated `verify_user_needs_the_custom_inbox_prefix`
+/// integration test: a broken client took attempts × 10s to fail before
+/// that test wrapped each attempt in a TEST-ONLY 1s bound). That failure
+/// mode is not hypothetical in production either: `provision_nats`'s
+/// step 5 calls this on the FIRST attempt right after writing a brand new
+/// accounts-file entry, and the server has not necessarily finished its
+/// SIGHUP reload yet — so the common case immediately after a fresh write
+/// is exactly the "no reply" shape this timeout has to bound.
+///
+/// 2 seconds: long enough that a real request/reply round trip over a
+/// cluster-internal Service (normally single-digit milliseconds) has no
+/// realistic chance of a false timeout even under load, short enough that
+/// `provision_nats`'s step 5 is never stalled anywhere near its own 300s
+/// steady-state cadence or even its own 30s not-ready requeue interval —
+/// "long enough not to thrash, short enough that a claim is not stuck
+/// behind a 10s stall per reconcile," the exact two-sided constraint this
+/// value was asked to satisfy.
+const VERIFY_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Imperative NATS admin operations the provisioner drives against the
 /// shared jetstream account model.
 #[async_trait]
@@ -138,6 +165,7 @@ impl NatsAdmin for NatsClient {
         let client = async_nats::ConnectOptions::new()
             .user_and_password(user.to_string(), pass.to_string())
             .custom_inbox_prefix(inbox_prefix)
+            .request_timeout(Some(VERIFY_REQUEST_TIMEOUT))
             .connect(url)
             .await
             .map_err(|source| NatsAdminError::Connect {
@@ -354,16 +382,19 @@ accounts: {
         // Poll until the server actually accepts connections — no fixed
         // sleep; the server typically comes up in well under a second,
         // but a loaded CI host is not guaranteed to. Each ATTEMPT is
-        // itself bounded to 1s: `NatsClient`'s own request timeout
-        // defaults to async-nats' library default (10s), and a
-        // permissions violation on the reply inbox delivers no error
-        // at all — the request simply never gets a reply — so a broken
-        // client (this test's whole reason to exist) would otherwise
-        // take attempts × 10s to fail instead of attempts × 1s. This
-        // per-attempt timeout is a TEST-ONLY bound (wrapping the call,
-        // not changing `NatsClient`'s own default), so the mutation
-        // this test exists to catch still fails for the right reason
-        // (no reply ever arrives), just faster.
+        // itself bounded to 1s: `NatsClient`'s own request timeout is now
+        // the deliberate [`VERIFY_REQUEST_TIMEOUT`] (2s, 2.5d Task 6) —
+        // when this test was written it was still the unset
+        // async-nats library default (10s), and a permissions violation
+        // on the reply inbox delivers no error at all — the request
+        // simply never gets a reply — so a broken client (this test's
+        // whole reason to exist) would otherwise have taken attempts ×
+        // 10s to fail instead of attempts × 1s. The per-attempt 1s bound
+        // here is TEST-ONLY (wrapping the call, tighter than even the
+        // now-2s production default) and stays, so the mutation this
+        // test exists to catch still fails for the right reason (no
+        // reply ever arrives) at the same speed regardless of which
+        // production timeout is configured.
         let mut ready = false;
         for _ in 0..30 {
             let attempt = NatsClient.verify_user(&url, &user, "verify-pw", &inbox);

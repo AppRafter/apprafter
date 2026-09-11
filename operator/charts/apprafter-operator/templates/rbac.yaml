@@ -31,6 +31,16 @@ rules:
   # rule covers both the PlatformController status writes and
   # the strategy's reject patch because RBAC is verb-based,
   # not field-manager-based.
+  #
+  # 2.5d Task 6/11 extension: the resourceclaim-provisioner (same
+  # operator binary) also merge-patches
+  # PlatformStack.spec.overrides.nats.enabled (+ the bidirectional
+  # apprafter.io/nats-auto-enabled annotation) on the first matched
+  # jetstream claim. `patch`/`update` on `platformstacks` (spec, not
+  # /status) are already granted below for the PlatformController —
+  # documented here so the "RBAC matches code verbs" audit finds this
+  # SECOND consumer of the same rule rather than assuming a miss and
+  # adding a duplicate. No new rule needed.
   - apiGroups:
       - apprafter.io
     resources:
@@ -458,6 +468,18 @@ rules:
   # cross-namespace Argo `repo-creds` + canonical
   # `dockerconfigjson` on SourceCredential deletion (no
   # ownerReference cascade is possible across namespaces).
+  #
+  # 2.5d Task 9/10/11 extension: the resourceclaim-provisioner reads/
+  # writes THREE more Secret shapes under this same cluster-wide rule —
+  # the per-claim `<claim>-conn` connection Secret (claim namespace), the
+  # per-namespace `nats-mgr-<namespace>` management-user Secret
+  # (`nats-system`), and the whole-cluster `nats-accounts` Secret
+  # (`nats-system`, `get`/`create`/`replace` — the `update` verb already
+  # covers `replace`, a full-object PUT, the same as every other verb
+  # here that is verb-based not method-based). All already granted
+  # cluster-wide below; documented here so the "RBAC matches code verbs"
+  # audit finds this consumer rather than assuming a miss. No new rule
+  # needed.
   - apiGroups:
       - ""
     resources:
@@ -470,6 +492,22 @@ rules:
       - update
       - patch
       - delete
+  # 2.5d Task 6/11 (ADR 0061 §1 ("Deployment") step 4): the resourceclaim-provisioner
+  # reads (never writes) the `nats` StatefulSet's `.status.readyReplicas`
+  # in `nats-system` to decide when the first-enabled component is ready
+  # to accept connections. Argo CD/the `nats` Helm chart owns creating and
+  # managing the StatefulSet itself — read-only is the whole need. This IS
+  # a genuinely new Kind (`apps/statefulsets`, distinct from the
+  # `apps/deployments` rule above) with no prior rule covering it — unlike
+  # the `platformstacks`/`secrets` extensions above, this one is new.
+  - apiGroups:
+      - apps
+    resources:
+      - statefulsets
+    verbs:
+      - get
+      - list
+      - watch
   - apiGroups:
       - gateway.networking.k8s.io
     resources:

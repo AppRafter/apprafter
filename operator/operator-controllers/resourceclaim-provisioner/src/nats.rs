@@ -165,6 +165,160 @@ fn claim_view(claim: &ResourceClaim, size_bytes: &BTreeMap<String, u64>) -> Opti
     })
 }
 
+/// The per-namespace management user's Secret name in `nats-system`
+/// (2.5d Task 10). `mgr_<namespace>` (`nats_accounts::mgr_user`) is a NATS
+/// username, `_`-joined — not DNS-1123, so it cannot be the Secret name
+/// directly. This just prepends a fixed prefix to the namespace VERBATIM
+/// (no fold, no transform): a Kubernetes namespace name is already
+/// DNS-1123, so the composed name is too, and two different namespaces can
+/// never collide because the namespace itself is never altered, only
+/// prefixed — unlike `nats_accounts::account_name`'s `_`-fold, there is no
+/// separate injectivity argument to make here.
+///
+/// **A gap in the Task 6/9/10 brief, though not in the ADR**: ADR 0061 §1
+/// ("Deployment") names `mgr_<ns>` as living in `nats-system` ("The
+/// accounts Secret, the `mgr_<ns>` credential and the NACK CRs live there
+/// too") but does not say how its password is SOURCED — and
+/// `nats_accounts::render_account` REFUSES to render an account whose
+/// `mgr_<ns>` password is empty (`AccountsFileError::EmptyPassword`, ADR
+/// 0042 §10's "refuse don't clamp" carried over from Dragonfly), so
+/// something durable has to hold it before the FIRST render for a
+/// namespace. This mirrors `dragonfly`'s own admin-Secret precedent
+/// exactly: a shared,
+/// platform-internal credential, read-or-create, un-owned (it is not
+/// claim-scoped — deleting the last claim in a namespace must not delete
+/// the management identity a future claim in the SAME namespace would
+/// need again).
+pub fn mgr_secret_name(namespace: &str) -> String {
+    format!("nats-mgr-{namespace}")
+}
+
+/// Reads `config.sizeBytes` — the `#Size` → bytes map the
+/// `jetstream-integrated` seed carries (`service_providers.cue`) — off a
+/// live `ServiceProvider.spec.config` into the `BTreeMap<String, u64>`
+/// [`claim_views`] wants. Total: an absent `sizeBytes` key, a
+/// non-object value, or a non-numeric entry is SKIPPED rather than
+/// panicking or fabricating a zero map entry — an absent entry already
+/// floors a claim's `quota_bytes` to 0 via `claim_view`'s own
+/// "unrecognised size" path (a visibly-wrong zero), so this function does
+/// not need its own failure mode on top of that one.
+pub fn size_bytes_map(config: &serde_json::Value) -> BTreeMap<String, u64> {
+    config
+        .get("sizeBytes")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The NATS connection Secret for one claim (2.5d Task 9, ADR 0061 §6) —
+/// lands in the claim's OWN namespace, owner-ref'd to the `ResourceClaim`
+/// so it cascades on delete (the pattern at `reconcile.rs`'s
+/// `redis_connection_secret_object` / cnpg's `connection_secret_object`).
+/// Carries EXACTLY the eight keys
+/// `admission_webhook::validator::JETSTREAM_FIELDS` names —
+/// `connection_secret_key_set_matches_the_webhooks_jetstream_fields`
+/// (this module's own test) asserts the SET against that constant rather
+/// than a hand-copy.
+///
+/// `url` embeds `user`/`pass` (`nats://user:pass@host:port`), matching
+/// `redis_connection_secret_object`'s own `redis://user:pass@host:port/db`
+/// convention — this is a STORED credential field, not a log line, so the
+/// leak-safety reasoning in `nats_client.rs` (which deliberately never
+/// embeds a password in a URL it might echo into an error) does not apply
+/// here.
+#[allow(clippy::too_many_arguments)]
+pub fn connection_secret_object(
+    name: &str,
+    ns: &str,
+    cv: &ClaimView,
+    pass: &str,
+    host: &str,
+    port: u16,
+    owner_uid: &str,
+    owner_name: &str,
+) -> serde_json::Value {
+    let user = cv.user();
+    let url = format!("nats://{user}:{pass}@{host}:{port}");
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": name,
+            "namespace": ns,
+            "labels": {
+                "apprafter.io/managed-by": "apprafter",
+            },
+            "ownerReferences": [{
+                "apiVersion": "apprafter.io/v1alpha1",
+                "kind": "ResourceClaim",
+                "name": owner_name,
+                "uid": owner_uid,
+                "controller": true,
+                "blockOwnerDeletion": true,
+            }],
+        },
+        "type": "Opaque",
+        "stringData": {
+            "url":           url,
+            "host":          host,
+            "port":          port.to_string(),
+            "user":          user,
+            "pass":          pass,
+            "account":       cv.account(),
+            "subjectPrefix": cv.subject_prefix(),
+            "inboxPrefix":   cv.inbox_prefix(),
+        },
+    })
+}
+
+/// The whole-cluster accounts fragment Secret (2.5d Task 10, ADR 0061
+/// §2/§3) — UNOWNED (no ownerReference: it is platform-scoped, not
+/// claim-scoped, and must outlive any single claim's lifecycle), single
+/// key `accounts.conf` matching `component_nats.cue`'s own
+/// `"accounts$include": "./accounts-secret/accounts.conf"`.
+pub fn accounts_secret_object(name: &str, ns: &str, accounts_conf: &str) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": name,
+            "namespace": ns,
+            "labels": {
+                "apprafter.io/managed-by": "apprafter",
+            },
+        },
+        "type": "Opaque",
+        "stringData": {
+            "accounts.conf": accounts_conf,
+        },
+    })
+}
+
+/// A per-namespace management user's password Secret (2.5d Task 10) —
+/// UNOWNED, same reasoning as [`accounts_secret_object`]: the identity is
+/// platform-scoped, not tied to any one claim's lifecycle.
+pub fn mgr_secret_object(name: &str, ns: &str, password: &str) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": name,
+            "namespace": ns,
+            "labels": {
+                "apprafter.io/managed-by": "apprafter",
+            },
+        },
+        "type": "Opaque",
+        "stringData": {
+            "password": password,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +548,200 @@ mod tests {
             vec!["shop.orders.>".to_string(), "billing.orders.>".to_string()]
         );
         assert!(v.streams[0].allow_purge);
+    }
+
+    // --- mgr_secret_name (2.5d Task 10) -------------------------------
+
+    #[test]
+    fn mgr_secret_name_is_dns1123_and_injective_by_verbatim_namespace() {
+        // Unlike `account_name`'s `_`-fold (which needs the injectivity
+        // argument on its own doc), this just PREPENDS a fixed prefix to
+        // the namespace verbatim — a Kubernetes namespace name is already
+        // DNS-1123, and two different namespaces can never produce the
+        // same secret name because the namespace itself is never
+        // transformed, only prefixed.
+        assert_eq!(mgr_secret_name("demo"), "nats-mgr-demo");
+        assert_eq!(mgr_secret_name("demo-ns"), "nats-mgr-demo-ns");
+        assert_ne!(mgr_secret_name("a"), mgr_secret_name("b"));
+    }
+
+    // --- size_bytes_map (2.5d Task 10 — reads jetstream-integrated's
+    // config.sizeBytes) ---------------------------------------------
+
+    #[test]
+    fn size_bytes_map_reads_the_seed_shape() {
+        // Mirrors service_providers.cue's own literal `sizeBytes` block
+        // (jetstream-integrated) — nano/small/medium/large/xlarge, each a
+        // bare JSON number of bytes.
+        let cfg = serde_json::json!({
+            "namespace": "nats-system",
+            "sizeBytes": {
+                "nano": 67108864u64,
+                "small": 268435456u64,
+                "medium": 1073741824u64,
+                "large": 2147483648u64,
+                "xlarge": 4294967296u64,
+            },
+            "ceilingBytes": 4294967296u64,
+        });
+        let map = size_bytes_map(&cfg);
+        assert_eq!(map.get("nano"), Some(&67108864));
+        assert_eq!(map.get("small"), Some(&268435456));
+        assert_eq!(map.get("xlarge"), Some(&4294967296));
+        assert_eq!(map.len(), 5, "{map:?}");
+    }
+
+    #[test]
+    fn size_bytes_map_is_empty_when_the_config_key_is_absent() {
+        // A provider config that omits `sizeBytes` entirely (a malformed
+        // seed, or a future non-integrated provider that doesn't offer
+        // sizes) must not panic — every claim then floors to
+        // `quota_bytes: 0` via `claim_view`'s own "unrecognised size"
+        // path, a visibly-wrong zero rather than a fabricated map entry.
+        let map = size_bytes_map(&serde_json::json!({}));
+        assert!(map.is_empty(), "{map:?}");
+    }
+
+    #[test]
+    fn size_bytes_map_skips_a_non_numeric_entry_rather_than_panicking() {
+        // Defensive: a hand-edited or future-drifted config could carry a
+        // string or object where a number belongs. Skipping (not
+        // panicking, not defaulting to 0 silently as a MAP entry — an
+        // absent map entry already floors to 0 via claim_view) keeps this
+        // function total.
+        let cfg = serde_json::json!({"sizeBytes": {"small": "not-a-number", "large": 5u64}});
+        let map = size_bytes_map(&cfg);
+        assert_eq!(map.len(), 1, "{map:?}");
+        assert_eq!(map.get("large"), Some(&5));
+    }
+
+    // --- connection_secret_object (2.5d Task 9, ADR 0061 §6) ----------
+
+    fn sample_view() -> ClaimView {
+        ClaimView {
+            namespace: "demo".into(),
+            app: "feeder".into(),
+            dynamic_streams: false,
+            streams: vec![],
+            consumes: vec![],
+            quota_bytes: 1 << 30,
+        }
+    }
+
+    #[test]
+    fn connection_secret_key_set_matches_the_webhooks_jetstream_fields() {
+        // Round-1 review's standing objection: no fourth hand-copy of the
+        // eight-field vocabulary. Assert the SET (order-independent) of
+        // `stringData` keys against `admission_webhook::validator::JETSTREAM_FIELDS`
+        // — a `[dev-dependencies]`-only cross-crate reference (see this
+        // crate's Cargo.toml), not a literal list re-typed here.
+        let cv = sample_view();
+        let s = connection_secret_object(
+            "feeder-jetstream-conn",
+            "demo",
+            &cv,
+            "pw",
+            "nats.nats-system.svc",
+            4222,
+            "uid-1",
+            "feeder-jetstream",
+        );
+        let got: std::collections::BTreeSet<&str> = s["stringData"]
+            .as_object()
+            .expect("stringData is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let want: std::collections::BTreeSet<&str> = admission_webhook::validator::JETSTREAM_FIELDS
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            got, want,
+            "connection Secret key set must match JETSTREAM_FIELDS exactly"
+        );
+    }
+
+    #[test]
+    fn connection_secret_carries_the_expected_values() {
+        let cv = sample_view();
+        let s = connection_secret_object(
+            "feeder-jetstream-conn",
+            "demo",
+            &cv,
+            "s3cr3t",
+            "nats.nats-system.svc",
+            4222,
+            "uid-1",
+            "feeder-jetstream",
+        );
+        assert_eq!(s["apiVersion"], "v1");
+        assert_eq!(s["kind"], "Secret");
+        assert_eq!(s["metadata"]["name"], "feeder-jetstream-conn");
+        assert_eq!(s["metadata"]["namespace"], "demo");
+        assert_eq!(s["type"], "Opaque");
+        let sd = &s["stringData"];
+        assert_eq!(sd["host"], "nats.nats-system.svc");
+        assert_eq!(sd["port"], "4222");
+        assert_eq!(sd["user"], cv.user());
+        assert_eq!(sd["pass"], "s3cr3t");
+        assert_eq!(sd["account"], cv.account());
+        assert_eq!(sd["subjectPrefix"], cv.subject_prefix());
+        assert_eq!(sd["inboxPrefix"], cv.inbox_prefix());
+        assert_eq!(
+            sd["url"],
+            format!("nats://{}:s3cr3t@nats.nats-system.svc:4222", cv.user())
+        );
+    }
+
+    // --- accounts_secret_object / mgr_secret_object (2.5d Task 10) ----
+
+    #[test]
+    fn accounts_secret_object_carries_the_one_key_the_chart_includes() {
+        let s = accounts_secret_object("nats-accounts", "nats-system", "ns_demo: {}\n");
+        assert_eq!(s["apiVersion"], "v1");
+        assert_eq!(s["kind"], "Secret");
+        assert_eq!(s["metadata"]["name"], "nats-accounts");
+        assert_eq!(s["metadata"]["namespace"], "nats-system");
+        assert_eq!(s["type"], "Opaque");
+        assert_eq!(s["stringData"]["accounts.conf"], "ns_demo: {}\n");
+        // Platform-scoped, not claim-scoped — never owner-ref'd to any one
+        // ResourceClaim (deleting one claim must not cascade-delete the
+        // WHOLE accounts file every other namespace's users depend on).
+        assert!(s["metadata"].get("ownerReferences").is_none());
+    }
+
+    #[test]
+    fn mgr_secret_object_carries_the_password_key() {
+        let s = mgr_secret_object("nats-mgr-demo", "nats-system", "s3cr3t");
+        assert_eq!(s["metadata"]["name"], "nats-mgr-demo");
+        assert_eq!(s["metadata"]["namespace"], "nats-system");
+        assert_eq!(s["stringData"]["password"], "s3cr3t");
+        assert!(s["metadata"].get("ownerReferences").is_none());
+    }
+
+    #[test]
+    fn connection_secret_is_owner_refd_to_the_resourceclaim_for_cascade_delete() {
+        // The pattern at reconcile.rs's redis/cnpg connection-secret
+        // builders: a controller ownerReference so the Secret cascades on
+        // claim delete, never orphaned.
+        let cv = sample_view();
+        let s = connection_secret_object(
+            "feeder-jetstream-conn",
+            "demo",
+            &cv,
+            "pw",
+            "nats.nats-system.svc",
+            4222,
+            "uid-xyz",
+            "feeder-jetstream",
+        );
+        let owner = &s["metadata"]["ownerReferences"][0];
+        assert_eq!(owner["apiVersion"], "apprafter.io/v1alpha1");
+        assert_eq!(owner["kind"], "ResourceClaim");
+        assert_eq!(owner["name"], "feeder-jetstream");
+        assert_eq!(owner["uid"], "uid-xyz");
+        assert_eq!(owner["controller"], true);
+        assert_eq!(owner["blockOwnerDeletion"], true);
     }
 }

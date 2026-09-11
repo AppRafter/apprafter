@@ -1815,8 +1815,16 @@ fn scope_disk_entries<'a>(
 const PG_FIELDS: &[&str] = &["url", "user", "pass", "host", "port", "db"];
 /// redis connection-Secret field vocabulary (ADR 0046).
 const REDIS_FIELDS: &[&str] = &["url", "user", "pass", "host", "port", "db", "channelPrefix"];
-/// jetstream connection-Secret field vocabulary (2.5 / ADR 0061 §6).
-const JETSTREAM_FIELDS: &[&str] = &[
+/// jetstream connection-Secret field vocabulary (2.5 / ADR 0061 §6). `pub`
+/// (2.5d Task 9) so `operator-controllers-resourceclaim-provisioner`'s own
+/// connection-secret-builder test can assert its key SET against this
+/// vocabulary directly, as a `[dev-dependencies]`-only cross-crate
+/// reference, instead of hand-copying the eight names a fourth time — the
+/// round-1 review objection this crate's own `claim_fields_mirror_the_cue_source_of_truth`
+/// test already exists to avoid for THIS list's relationship to the CUE
+/// source; a sibling test in another crate re-typing the same eight
+/// strings would reintroduce exactly that hand-copy, just one crate over.
+pub const JETSTREAM_FIELDS: &[&str] = &[
     "url",
     "host",
     "port",

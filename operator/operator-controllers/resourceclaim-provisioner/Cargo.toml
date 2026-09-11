@@ -30,3 +30,11 @@ async-trait = { workspace = true }
 base64      = { workspace = true }
 redis       = { version = "0.27", default-features = false, features = ["tokio-comp"] }
 async-nats  = "0.50.0"
+
+[dev-dependencies]
+# 2.5d Task 9: asserts the NATS connection Secret's key SET against
+# `admission_webhook::validator::JETSTREAM_FIELDS` rather than a fourth
+# hand-copy of that vocabulary (round-1 review's objection to a third).
+# Dev-only — no admission-webhook dependency in the production build; both
+# crates already depend only on operator-core, so this adds no cycle.
+admission-webhook = { path = "../../admission-webhook" }

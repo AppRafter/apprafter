@@ -16,11 +16,14 @@
 //! or a `Scheduled` condition — those are owned by the scheduler, and
 //! patching them would make the two controllers fight.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
 use chrono::Utc;
-use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams};
+use k8s_openapi::api::apps::v1::StatefulSet;
+use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams};
 use kube::core::GroupVersionKind;
 use kube::runtime::controller::Action;
 use kube::{Client, ResourceExt};
@@ -37,6 +40,8 @@ use crate::cnpg;
 use crate::disk;
 use crate::dragonfly;
 use crate::grace;
+use crate::nats;
+use crate::nats_accounts;
 use crate::{Context, ReconcileError, FIELD_MANAGER, KIND, PROVISIONER_FINALIZER};
 
 /// Condition type this controller owns. The scheduler owns `Scheduled`;
@@ -77,12 +82,91 @@ const REASON_AWAITING_SHARED_VOLUME: &str = "AwaitingSharedVolume";
 const ROLE_RMW_RETRIES: usize = 5;
 
 // ---------------------------------------------------------------------------
+// NATS / jetstream (2.5d, ADR 0061)
+// ---------------------------------------------------------------------------
+
+/// Namespace + name of the singleton `PlatformStack` CR — the CLI's own
+/// `PLATFORMSTACK_NAMESPACE` / `PLATFORMSTACK_NAME`
+/// (`cli/platform-cli/src/commands/platform.rs`) confirm both; duplicated
+/// here rather than shared because the CLI and operator are separate Cargo
+/// workspaces with no common dependency for it.
+const PLATFORMSTACK_NAMESPACE: &str = "apprafter-system";
+const PLATFORMSTACK_NAME: &str = "default";
+
+/// Fallback `nats-system` namespace when the matched ServiceProvider's
+/// `config.namespace` is absent — the `jetstream-integrated` seed
+/// (`service_providers.cue`) always sets it explicitly today, but every
+/// other backend in this file (`DEFAULT_DISK_STORAGE_CLASS`,
+/// `DEFAULT_CNPG_CLUSTER`/`DEFAULT_CNPG_NAMESPACE`) reads its platform
+/// location FROM the provider config with a documented fallback rather
+/// than a bare hardcode, and there is no reason for jetstream to be the
+/// one exception.
+const DEFAULT_NATS_SYSTEM_NAMESPACE: &str = "nats-system";
+
+/// The `nats` Helm chart's StatefulSet resource name — confirmed by
+/// rendering the exact pinned chart (`helm template nats nats/nats
+/// --version 2.14.6`, `component_nats.cue`'s own version) rather than
+/// assumed: the chart names the StatefulSet after the Helm RELEASE name,
+/// which is `nats` (matches `_components.nats.name` in
+/// `component_nats.cue`, and every other component in this codebase's
+/// Argo CD wiring uses the component name as the release name).
+const NATS_STATEFULSET_NAME: &str = "nats";
+
+/// Client-facing (non-headless) NATS Service port — the `nats` chart's
+/// `service.yaml` `port: 4222`, confirmed the same way as
+/// [`NATS_STATEFULSET_NAME`].
+const NATS_CLIENT_PORT: u16 = 4222;
+
+/// The accounts fragment Secret's name AND its one key — both fixed by
+/// `component_nats.cue`'s own `podTemplate.patch` (`secretName:
+/// "nats-accounts"`) and `config.merge`'s `"accounts$include":
+/// "./accounts-secret/accounts.conf"` (the chart mounts the Secret's data
+/// keys as files, so the key name IS the filename `include` names).
+const NATS_ACCOUNTS_SECRET_NAME: &str = "nats-accounts";
+const NATS_ACCOUNTS_SECRET_KEY: &str = "accounts.conf";
+
+/// Bidirectional stamp on the `PlatformStack` — "the provisioner and a
+/// human operator write the same override key. Stamp on enable, clear in
+/// the same patch on disable, and never disable while it is absent — an
+/// operator who turned NATS on by hand keeps it." (2.5d Task 6). The exact
+/// key AND that description come straight from ADR 0061 §1 ("Deployment"):
+/// "The provisioner stamps `PlatformStack` with
+/// `apprafter.io/nats-auto-enabled: \"true\"` when it enables the
+/// component, and disables again only while that annotation is present,
+/// clearing it in the same patch." No `.rs` file anywhere under
+/// `operator/` implements it yet, though (checked before writing this) —
+/// the ADR specifies the CONTRACT, this is its first implementation.
+const NATS_AUTO_ENABLED_ANNOTATION: &str = "apprafter.io/nats-auto-enabled";
+
+const REASON_AWAITING_NATS_COMPONENT: &str = "AwaitingNatsComponent";
+const REASON_AWAITING_NATS_READY: &str = "AwaitingNatsUserReady";
+
+/// Fallback platform-wide `max_file` budget for
+/// [`nats_accounts::render_accounts_file`]'s `global_budget_bytes`
+/// parameter (2.5d Task 8b, already shipped) — **a finding, not part of
+/// the Task 6/9/10/11 brief**: `service_providers.cue`'s own comment on
+/// `jetstream-integrated`'s `ceilingBytes` says outright "nothing enforces
+/// a platform-wide total today; that is a follow-up for ... a later CUE
+/// task" — the seed has NO `config.globalBudgetBytes` key, yet
+/// `render_accounts_file` requires a value unconditionally (it does not
+/// take an `Option`). Rather than inventing an arbitrary number, or
+/// passing `u64::MAX` (which would silently defeat Task 8b's whole
+/// check), this is the ACTUAL physical disk every namespace's `max_file`
+/// promise is carved out of: `component_nats.cue`'s
+/// `config.jetstream.fileStore.pvc.size: "5Gi"` — the one real,
+/// already-committed platform fact available until the seed grows its own
+/// key. Flagged, not solved, the same way that CUE file flags its own
+/// gap between the per-account memory floor and the server-wide memory
+/// ceiling.
+const NATS_GLOBAL_BUDGET_BYTES_FALLBACK: u64 = 5 * 1024 * 1024 * 1024; // 5Gi
+
+// ---------------------------------------------------------------------------
 // Backend dispatch
 // ---------------------------------------------------------------------------
 
 /// The provisioning backends this controller knows how to drive.
-/// `cloudnative-pg` (2.4), `dragonfly` (2.6), and `disk` (2.6b) are
-/// wired; 2.5 adds jetstream.
+/// `cloudnative-pg` (2.4), `dragonfly` (2.6), `disk` (2.6b), and `nats`
+/// (2.5d) are wired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Cloudnativepg,
@@ -92,6 +176,11 @@ pub enum Backend {
     /// `SharedVolume`'s PVC. It provisions nothing and owns no backing, so
     /// it never snapshots a `RetainedClaim`.
     SharedDisk,
+    /// `needs.jetstream` (2.5, ADR 0061). Unlike every other backend here,
+    /// the underlying component starts OFF (`component_nats.cue`'s own
+    /// `enabled: false`) and is turned on by the FIRST matched claim — see
+    /// `provision_nats`.
+    Nats,
 }
 
 impl Backend {
@@ -104,6 +193,7 @@ impl Backend {
             "dragonfly" => Some(Backend::Dragonfly),
             "disk" => Some(Backend::Disk),
             "shared-disk" => Some(Backend::SharedDisk),
+            "nats" => Some(Backend::Nats),
             _ => None,
         }
     }
@@ -211,6 +301,7 @@ pub async fn reconcile(
         Some(Backend::SharedDisk) => {
             provision_shared_disk(&ctx, &claim, &ns, &name, &provider).await
         }
+        Some(Backend::Nats) => provision_nats(&ctx, &claim, &ns, &name, &provider).await,
         None => {
             warn!(
                 %name, %ns, backend = %provider.spec.backend,
@@ -1041,6 +1132,534 @@ async fn provision_shared_disk(
         .with_label_values(&[KIND, ns, "ok"])
         .inc();
     info!(%name, %ns, shared_volume = %sv_name, %pvc_ref, "shared-disk reference-claim bound");
+
+    Ok(Action::requeue(Duration::from_secs(300)))
+}
+
+// ---------------------------------------------------------------------------
+// NATS / jetstream provisioning (2.5d, ADR 0061)
+// ---------------------------------------------------------------------------
+
+/// The ordered steps `provision_nats` executes (ADR 0061 §1 ("Deployment")) — pulled out
+/// as a standalone, pure, fully unit-tested fact (2.5d Task 6: "write a
+/// test that pins the ORDER, not just the end state") independent of any
+/// cluster, rather than trusting that a hand-written imperative sequence
+/// below happens to match a prose description of it. `provision_nats`
+/// consults this at its two REAL branch points (whether to wait on the
+/// StatefulSet, whether to wait on verify) — accounts-secret-write and
+/// component-enable have no branch of their own (both run unconditionally,
+/// every pass, before either check), which is why calling this at those
+/// two points always passes `true` for the two earlier flags: the earlier
+/// steps are guaranteed already-attempted by construction at that point in
+/// the function, and this module's own tests are what prove the ordering
+/// those `true`s encode is actually the right one to guarantee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NatsBootstrapStep {
+    WriteAccountsSecret,
+    EnableComponent,
+    AwaitStatefulSetReady,
+    VerifyUserReady,
+    Done,
+}
+
+fn next_nats_bootstrap_step(
+    accounts_secret_written: bool,
+    component_enabled: bool,
+    statefulset_ready: bool,
+    user_verified: bool,
+) -> NatsBootstrapStep {
+    if !accounts_secret_written {
+        NatsBootstrapStep::WriteAccountsSecret
+    } else if !component_enabled {
+        NatsBootstrapStep::EnableComponent
+    } else if !statefulset_ready {
+        NatsBootstrapStep::AwaitStatefulSetReady
+    } else if !user_verified {
+        NatsBootstrapStep::VerifyUserReady
+    } else {
+        NatsBootstrapStep::Done
+    }
+}
+
+/// The bidirectional `PlatformStack.spec.overrides.nats` decision (2.5d
+/// Task 6): "the provisioner and a human operator write the same override
+/// key. Stamp on enable, clear in the same patch on disable, and never
+/// disable while it is absent — an operator who turned NATS on by hand
+/// keeps it." `None` means no patch is needed at all (already in the
+/// desired state, or a disable the provisioner must not perform).
+///
+/// Only the `desired_enabled: true` direction has a caller in this task
+/// set — `provision_nats` never turns the component back off (there is no
+/// GC/reap path for NATS yet, the same way dragonfly's own shared-backend
+/// reaper (`reaper.rs`, ADR 0042 §9) came well after dragonfly's own first
+/// provisioning task). The `false` direction is implemented and tested
+/// here exactly as specified so the contract exists in one place the day a
+/// reap task needs it, rather than being designed under time pressure
+/// then.
+fn nats_override_patch(
+    desired_enabled: bool,
+    currently_enabled: bool,
+    annotation_present: bool,
+) -> Option<Value> {
+    if desired_enabled {
+        if currently_enabled {
+            None
+        } else {
+            Some(json!({
+                "metadata": {"annotations": {NATS_AUTO_ENABLED_ANNOTATION: "true"}},
+                "spec": {"overrides": {"nats": {"enabled": true}}},
+            }))
+        }
+    } else if currently_enabled && annotation_present {
+        Some(json!({
+            "metadata": {"annotations": {NATS_AUTO_ENABLED_ANNOTATION: Value::Null}},
+            "spec": {"overrides": {"nats": {"enabled": false}}},
+        }))
+    } else {
+        None
+    }
+}
+
+/// Base64-decode `secret.data.<key>` off an ALREADY-FETCHED Secret
+/// `DynamicObject`. `Ok(None)` when the key (or the whole `data` object)
+/// is absent — distinct from [`acl_reconcile::read_secret_key`], which
+/// does its own GET and errors on a missing SECRET; every call site here
+/// has already fetched the secret as part of a read-or-create /
+/// byte-stable-compare decision and needs to decode what it already has.
+fn decoded_secret_key(secret: &DynamicObject, key: &str) -> Result<Option<String>, ReconcileError> {
+    let Some(raw) = secret
+        .data
+        .pointer(&format!("/data/{key}"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .map_err(|e| ReconcileError::Provisioning(format!("Secret key {key} not base64: {e}")))?;
+    Ok(Some(String::from_utf8(decoded).map_err(|e| {
+        ReconcileError::Provisioning(format!("Secret key {key} not UTF-8: {e}"))
+    })?))
+}
+
+/// Idempotently ensure the `nats` platform-stack component is enabled,
+/// stamping [`NATS_AUTO_ENABLED_ANNOTATION`] in the SAME patch (2.5d Task
+/// 6, ADR 0061 §1 ("Deployment") step 3). Reads the `PlatformStack` singleton first so
+/// an already-enabled cluster's steady-state claims never send a spurious
+/// write every reconcile — `nats_override_patch`'s own no-op branch.
+async fn ensure_nats_component_enabled(client: &Client) -> Result<(), ReconcileError> {
+    let ps_api: Api<operator_core::PlatformStack> =
+        Api::namespaced(client.clone(), PLATFORMSTACK_NAMESPACE);
+    let current = ps_api.get(PLATFORMSTACK_NAME).await?;
+    let currently_enabled = current
+        .spec
+        .overrides
+        .as_ref()
+        .and_then(|o| o.get("nats"))
+        .and_then(|o| o.enabled)
+        .unwrap_or(false);
+    let annotation_present = current
+        .metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|a| a.contains_key(NATS_AUTO_ENABLED_ANNOTATION));
+
+    let Some(patch) = nats_override_patch(true, currently_enabled, annotation_present) else {
+        return Ok(());
+    };
+    ps_api
+        .patch(
+            PLATFORMSTACK_NAME,
+            &PatchParams::default(),
+            &Patch::Merge(&patch),
+        )
+        .await?;
+    info!("stamped nats-auto-enabled and enabled the nats platform-stack component");
+    Ok(())
+}
+
+/// Read `.status.readyReplicas` off the `nats` StatefulSet (2.5d Task 6,
+/// ADR 0061 §1 ("Deployment") step 4). `0` both when the StatefulSet does not exist yet
+/// (Argo CD has not synced the newly-enabled component) and when it exists
+/// with zero ready pods — both are "not ready," and `provision_nats`
+/// treats them identically (requeue, never an error: a not-yet-synced
+/// component is an expected transient state on the very first jetstream
+/// claim, not a reconcile failure).
+async fn nats_statefulset_ready_replicas(
+    client: &Client,
+    nats_ns: &str,
+) -> Result<i32, ReconcileError> {
+    let api: Api<StatefulSet> = Api::namespaced(client.clone(), nats_ns);
+    let ready = api
+        .get_opt(NATS_STATEFULSET_NAME)
+        .await?
+        .and_then(|sts| sts.status)
+        .and_then(|s| s.ready_replicas)
+        .unwrap_or(0);
+    Ok(ready)
+}
+
+/// Derive + write the WHOLE `nats-accounts` Secret from the live,
+/// cluster-wide jetstream `ResourceClaim` set (2.5d Task 10, ADR 0061 §3).
+/// Four properties, each with its own test in this module:
+///
+/// - **Sole writer, whole derivation, never patched.** Rebuilt from
+///   scratch every call and written via [`Api::replace`] (full-object
+///   PUT) or [`Api::create`], never `Patch::Merge`/`Patch::Apply` of a
+///   fragment — a partial write could never remove a revoked user's line.
+/// - **Byte-stable — an unchanged derivation performs NO write at all.**
+///   The freshly rendered content is compared against the Secret's own
+///   CURRENT `data.accounts.conf` before any write call; identical
+///   content skips the API call entirely.
+/// - **resourceVersion precondition — a stale writer fails rather than
+///   clobbering.** [`Api::replace`] carries the resourceVersion this
+///   function just read; the apiserver 409s a writer racing a newer one.
+///   Leader election already serializes this controller's own reconciles
+///   (`apprafter-operator/src/main.rs`'s leadership gate, plus
+///   `ControllerConfig::default().concurrency(1)` on this controller in
+///   `lib.rs`, confirmed by reading both before writing this), so this is
+///   defence against a STALE LEADER that has not yet realised it lost
+///   leadership, not against concurrency healthy operation ever produces.
+/// - **Blast radius is the whole cluster, not one namespace.** Every
+///   namespace's accounts live in ONE file — any claim change ANYWHERE
+///   forces a re-render of the WHOLE thing (this function always lists
+///   every jetstream claim cluster-wide). A deny vector's own CONTENTS
+///   still depend only on claims within ITS OWN namespace
+///   (`nats_accounts::deny_vector`) — re-deriving the whole file on every
+///   call is not the same as every namespace's rendered BYTES changing;
+///   most blocks come out byte-identical to before, which is exactly what
+///   the byte-stable property above is protecting.
+///
+/// **Scope note — not in the Task 6/9/10/11 brief**: this only re-derives
+/// when SOME claim's own `provision_nats` pass calls it — a claim
+/// DELETION does not, on its own, trigger a re-render (no periodic or
+/// poke-driven loop exists for NATS the way `acl_reconcile.rs` provides
+/// for dragonfly). A deleted claim's line is dropped from the file only
+/// the next time some OTHER claim's own reconcile calls this function.
+/// Flagged as a follow-up, the same way `component_nats.cue`'s own
+/// comments flag its unenforced gaps rather than leaving them unmentioned.
+/// Task 10's byte-stable property, pulled out as a pure, named comparison:
+/// an unchanged derivation performs NO write at all. `None` (no existing
+/// Secret — a namespace's first render, or the accounts Secret has never
+/// been created) is always "changed" — there is nothing to compare
+/// against, so there is no "unchanged" to claim.
+fn accounts_file_unchanged(existing: Option<&str>, rendered: &str) -> bool {
+    existing == Some(rendered)
+}
+
+async fn reconcile_accounts_secret(
+    ctx: &Arc<Context>,
+    nats_ns: &str,
+    ceiling_bytes: u64,
+    size_bytes: &BTreeMap<String, u64>,
+) -> Result<(), ReconcileError> {
+    let all_claims: Vec<ResourceClaim> = Api::<ResourceClaim>::all(ctx.client.clone())
+        .list(&Default::default())
+        .await?
+        .items;
+
+    // Per-claim views AND their own connection-Secret password, correlated
+    // by calling `claim_views` one claim at a time — a batch call's
+    // `filter_map` does not preserve an index a caller could zip back
+    // against `all_claims`, and each claim's own k8s object name (needed
+    // to find ITS connection Secret) is not part of `ClaimView` at all.
+    let mut claims = Vec::new();
+    let mut passwords: BTreeMap<String, String> = BTreeMap::new();
+    for c in &all_claims {
+        let Some(cv) = nats::claim_views(std::slice::from_ref(c), size_bytes)
+            .into_iter()
+            .next()
+        else {
+            continue;
+        };
+        let conn_ns = c.metadata.namespace.clone().unwrap_or_default();
+        let conn_name = connection_secret_name(&c.name_any());
+        let conn_api: Api<DynamicObject> =
+            Api::namespaced_with(ctx.client.clone(), &conn_ns, &secret_ar());
+        // A claim without a connection Secret yet has not reached that
+        // point in ITS OWN provision_nats pass — omit it from THIS
+        // render; its own reconcile (which always writes its connection
+        // Secret before calling this function — see provision_nats) will
+        // include it the next time this runs.
+        let Some(secret) = conn_api.get_opt(&conn_name).await? else {
+            continue;
+        };
+        let Some(pass) = decoded_secret_key(&secret, "pass")? else {
+            continue;
+        };
+        passwords.insert(cv.user(), pass);
+        claims.push(cv);
+    }
+
+    // The per-namespace management user's password — read-or-create,
+    // shared/platform-scoped, deliberately NOT claim-owned (deleting the
+    // last claim in a namespace must not delete the identity a future
+    // claim there would need again). See `nats::mgr_secret_name`'s own
+    // doc: the ADR names `mgr_<ns>` and its home (`nats-system`) but not
+    // how its password is sourced, and `render_account` refuses to render
+    // ANY account whose mgr password is empty — so this gap had to be
+    // closed one way or another before this function could work at all.
+    let mut namespaces: Vec<String> = claims.iter().map(|c| c.namespace.clone()).collect();
+    namespaces.sort();
+    namespaces.dedup();
+    for namespace in &namespaces {
+        let mgr_user = nats_accounts::mgr_user(namespace);
+        let secret_name = nats::mgr_secret_name(namespace);
+        let mgr_api: Api<DynamicObject> =
+            Api::namespaced_with(ctx.client.clone(), nats_ns, &secret_ar());
+        let pass = match mgr_api.get_opt(&secret_name).await? {
+            Some(existing) => decoded_secret_key(&existing, "password")?.unwrap_or_default(),
+            None => {
+                let fresh = generate_password();
+                let obj = nats::mgr_secret_object(&secret_name, nats_ns, &fresh);
+                mgr_api
+                    .patch(&secret_name, &apply_params(), &Patch::Apply(&obj))
+                    .await?;
+                fresh
+            }
+        };
+        passwords.insert(mgr_user, pass);
+    }
+
+    let rendered = nats_accounts::render_accounts_file(
+        &claims,
+        ceiling_bytes,
+        NATS_GLOBAL_BUDGET_BYTES_FALLBACK,
+        &|user| passwords.get(user).cloned().unwrap_or_default(),
+    )
+    .map_err(|e| ReconcileError::Provisioning(format!("rendering nats-accounts: {e}")))?;
+
+    let secret_api: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), nats_ns, &secret_ar());
+    let existing = secret_api.get_opt(NATS_ACCOUNTS_SECRET_NAME).await?;
+
+    let current_accounts_conf = match &existing {
+        Some(s) => decoded_secret_key(s, NATS_ACCOUNTS_SECRET_KEY)?,
+        None => None,
+    };
+    if accounts_file_unchanged(current_accounts_conf.as_deref(), &rendered) {
+        return Ok(());
+    }
+
+    let mut body = nats::accounts_secret_object(NATS_ACCOUNTS_SECRET_NAME, nats_ns, &rendered);
+    match existing {
+        Some(current) => {
+            // resourceVersion precondition (see this function's own doc):
+            // `replace` is a full-object PUT that the apiserver rejects
+            // with 409 if this resourceVersion is stale — unlike
+            // `Patch::Apply`'s `force()` semantics used everywhere ELSE in
+            // this crate, which carry no such protection.
+            body["metadata"]["resourceVersion"] = json!(current.resource_version());
+            let obj: DynamicObject = serde_json::from_value(body)?;
+            secret_api
+                .replace(NATS_ACCOUNTS_SECRET_NAME, &PostParams::default(), &obj)
+                .await?;
+        }
+        None => {
+            let obj: DynamicObject = serde_json::from_value(body)?;
+            secret_api.create(&PostParams::default(), &obj).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Provision a `nats` (`needs.jetstream`) claim (2.5d Tasks 6/9/10, ADR
+/// 0061).
+///
+/// The literal ADR 0061 §1 ("Deployment") ordering is four steps ("nats-system already
+/// exists — nothing to create; write the nats-accounts Secret;
+/// merge-patch enable + stamp; await StatefulSet readiness") plus
+/// verify-then-ready. This function adds ONE step ahead of "write the
+/// accounts Secret" that is NOT in that literal brief: read-or-create
+/// THIS claim's own connection Secret first, so its password is STABLE
+/// across retries before it is ever fed into the accounts-file render.
+///
+/// Why that addition is necessary, not optional: `provision_cloudnativepg`
+/// (this file) calls `generate_password()` fresh on EVERY not-yet-ready
+/// reconcile pass and unconditionally re-applies the password Secret —
+/// safe there because CNPG's own controller re-syncs the role's actual
+/// password reactively, with no config-reload lag involved. NATS has no
+/// such reactive sync: the server picks up a changed accounts file only
+/// on its own SIGHUP reload, which is asynchronous and exactly what
+/// step 5 below is built to tolerate. If THIS claim's own password
+/// changed on every retry the way CNPG's does, every retry would
+/// invalidate the very credential the PREVIOUS attempt was waiting on the
+/// reload to pick up — and could livelock if the reload ever takes longer
+/// than the retry interval. Dragonfly's admin-Secret read-or-create is
+/// the closer precedent here, not CNPG's blind regenerate.
+async fn provision_nats(
+    ctx: &Arc<Context>,
+    claim: &Arc<ResourceClaim>,
+    ns: &str,
+    name: &str,
+    provider: &ServiceProvider,
+) -> Result<Action, ReconcileError> {
+    let cfg = provider.spec.config.clone().unwrap_or_else(|| json!({}));
+    let nats_ns = cfg
+        .pointer("/namespace")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_NATS_SYSTEM_NAMESPACE)
+        .to_string();
+    let size_bytes = nats::size_bytes_map(&cfg);
+    let ceiling_bytes = cfg
+        .pointer("/ceilingBytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+
+    let cv = nats::claim_views(std::slice::from_ref(claim.as_ref()), &size_bytes)
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            ReconcileError::Provisioning(format!(
+                "{name}: matched to the nats backend but is not a well-formed jetstream claim \
+                 (missing spec.jetstream or its declaring Application ownerReference)"
+            ))
+        })?;
+
+    info!(%name, %ns, %nats_ns, account = %cv.account(), "provisioning nats (jetstream) claim");
+
+    // Read-or-create this claim's own connection Secret (see this
+    // function's own doc for why this precedes the ADR's literal step 2).
+    let conn_secret_name = connection_secret_name(name);
+    let conn_api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), ns, &secret_ar());
+    let pass = match conn_api.get_opt(&conn_secret_name).await? {
+        Some(existing) => decoded_secret_key(&existing, "pass")?.unwrap_or_else(generate_password),
+        None => generate_password(),
+    };
+
+    let host = format!("{NATS_STATEFULSET_NAME}.{nats_ns}.svc");
+    let owner_uid = claim.metadata.uid.clone().unwrap_or_default();
+    let conn_secret = nats::connection_secret_object(
+        &conn_secret_name,
+        ns,
+        &cv,
+        &pass,
+        &host,
+        NATS_CLIENT_PORT,
+        &owner_uid,
+        name,
+    );
+    conn_api
+        .patch(
+            &conn_secret_name,
+            &apply_params(),
+            &Patch::Apply(&conn_secret),
+        )
+        .await?;
+
+    // Step 1 (ADR 0061 §1 ("Deployment")): `nats-system` already exists unconditionally
+    // (2.5c's `namespaces.cue`) — nothing to create.
+
+    // Step 2: derive + write the WHOLE accounts Secret from the live
+    // cluster claim set (Task 10 — see `reconcile_accounts_secret`'s own
+    // doc for the sole-writer / byte-stable / resourceVersion-precondition
+    // / cluster-wide-blast-radius properties). Runs BEFORE the component is
+    // ever enabled: the server `include`s this file at boot, and a
+    // missing/incomplete file is fatal on the very first start.
+    reconcile_accounts_secret(ctx, &nats_ns, ceiling_bytes, &size_bytes).await?;
+
+    // Step 3: merge-patch `PlatformStack.spec.overrides.nats.enabled=true`,
+    // stamping the bidirectional annotation — idempotent no-op once
+    // already on (`nats_override_patch`, `ensure_nats_component_enabled`).
+    ensure_nats_component_enabled(&ctx.client).await?;
+
+    let prior: Vec<ResourceClaimCondition> = claim
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.clone())
+        .unwrap_or_default();
+
+    // Step 4: await StatefulSet readiness. Unlike dragonfly/cnpg (always-on
+    // controllers reacting to a lazy CR within seconds), the FIRST claim
+    // to enable this component is the first time it exists AT ALL — Argo
+    // CD's own sync cadence plus the pod's JetStream store init make an
+    // EXPLICIT wait warranted here in a way it is not for the other
+    // backends.
+    let accounts_secret_written = true; // unconditional, just above
+    let component_enabled = true; // unconditional, just above
+    let ready_replicas = nats_statefulset_ready_replicas(&ctx.client, &nats_ns).await?;
+    let statefulset_ready = ready_replicas > 0;
+    if next_nats_bootstrap_step(
+        accounts_secret_written,
+        component_enabled,
+        statefulset_ready,
+        false,
+    ) == NatsBootstrapStep::AwaitStatefulSetReady
+    {
+        let cond = ready_condition(
+            "False",
+            REASON_AWAITING_NATS_COMPONENT,
+            &format!(
+                "waiting for the {NATS_STATEFULSET_NAME} StatefulSet in {nats_ns} to report a \
+                 ready replica"
+            ),
+            &prior,
+        );
+        patch_status(&ctx.client, ns, name, cond, ClaimStatusFields::default()).await?;
+        return Ok(Action::requeue(Duration::from_secs(30)));
+    }
+
+    // Step 5: verify-then-ready. A NATS permissions violation on the reply
+    // inbox delivers NO error signal — the request simply never gets a
+    // reply, riding `NatsClient`'s own production request timeout (see
+    // `nats_client.rs` for the deliberate value and why) — so the FIRST
+    // attempt right after a fresh accounts-file write will often ride
+    // that stall before requeueing here. Expected, not a bug: the server
+    // may not have finished its SIGHUP reload yet.
+    let user = cv.user();
+    let inbox_prefix = cv.inbox_prefix();
+    let url = format!("nats://{host}:{NATS_CLIENT_PORT}");
+    let user_verified =
+        crate::nats_client::user_is_ready(ctx.nats.as_ref(), &url, &user, &pass, &inbox_prefix)
+            .await;
+    if next_nats_bootstrap_step(
+        accounts_secret_written,
+        component_enabled,
+        statefulset_ready,
+        user_verified,
+    ) == NatsBootstrapStep::VerifyUserReady
+    {
+        let cond = ready_condition(
+            "False",
+            REASON_AWAITING_NATS_READY,
+            &format!(
+                "waiting for {user} to authenticate — the server may not have reloaded the \
+                 accounts file yet"
+            ),
+            &prior,
+        );
+        patch_status(&ctx.client, ns, name, cond, ClaimStatusFields::default()).await?;
+        return Ok(Action::requeue(Duration::from_secs(30)));
+    }
+
+    // Terminal status write.
+    let cond = ready_condition(
+        "True",
+        "Provisioned",
+        &format!("provisioned into account {} ({nats_ns})", cv.account()),
+        &prior,
+    );
+    patch_status(
+        &ctx.client,
+        ns,
+        name,
+        cond,
+        ClaimStatusFields {
+            conn_secret_name: Some(&conn_secret_name),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    ctx.metrics
+        .claim_provisioned_total
+        .with_label_values(&["nats", ns])
+        .inc();
+    ctx.metrics
+        .reconcile_total
+        .with_label_values(&[KIND, ns, "ok"])
+        .inc();
+    info!(%name, %ns, %user, "nats (jetstream) claim provisioned");
 
     Ok(Action::requeue(Duration::from_secs(300)))
 }
@@ -3199,5 +3818,191 @@ mod tests {
             "snapshot name must be DNS-1123: {name}"
         );
         assert!(name.starts_with("claim-"));
+    }
+
+    // --- next_nats_bootstrap_step (2.5d Task 6, ADR 0061 §1 ("Deployment")) ---------
+    //
+    // Pins the ORDER, not just the end state (the coordinator's explicit
+    // ask): every test below holds every LATER precondition true while one
+    // EARLIER one is false, and asserts the function still names the
+    // EARLIER step — proving it cannot be satisfied by short-circuiting on
+    // a downstream flag. `provision_nats` calls this at each of its own
+    // gates instead of re-deriving the same if/else chain inline, so the
+    // production control flow is literally driven by the function these
+    // tests pin (not a hand-written parallel description of it that could
+    // drift).
+
+    #[test]
+    fn nothing_done_yet_writes_the_accounts_secret_first() {
+        assert_eq!(
+            next_nats_bootstrap_step(false, false, false, false),
+            NatsBootstrapStep::WriteAccountsSecret
+        );
+    }
+
+    #[test]
+    fn accounts_secret_missing_wins_even_if_every_later_step_is_already_true() {
+        // The order-pinning case: component enabled, StatefulSet ready,
+        // AND the user already verified — none of that may cause the
+        // function to skip past a missing accounts Secret. A naive
+        // implementation checking each flag independently (rather than an
+        // ordered if/else chain) would pass every OTHER test here and
+        // still fail this one.
+        assert_eq!(
+            next_nats_bootstrap_step(false, true, true, true),
+            NatsBootstrapStep::WriteAccountsSecret
+        );
+    }
+
+    #[test]
+    fn accounts_secret_written_moves_to_enable_component() {
+        assert_eq!(
+            next_nats_bootstrap_step(true, false, false, false),
+            NatsBootstrapStep::EnableComponent
+        );
+    }
+
+    #[test]
+    fn component_not_yet_enabled_wins_even_if_ready_and_verified_are_true() {
+        assert_eq!(
+            next_nats_bootstrap_step(true, false, true, true),
+            NatsBootstrapStep::EnableComponent
+        );
+    }
+
+    #[test]
+    fn component_enabled_moves_to_await_statefulset_ready() {
+        assert_eq!(
+            next_nats_bootstrap_step(true, true, false, false),
+            NatsBootstrapStep::AwaitStatefulSetReady
+        );
+    }
+
+    #[test]
+    fn statefulset_not_ready_wins_even_if_verified_is_true() {
+        // Can only happen for a claim reattaching after the file/component
+        // were reset out from under it — still must not skip the readiness
+        // wait.
+        assert_eq!(
+            next_nats_bootstrap_step(true, true, false, true),
+            NatsBootstrapStep::AwaitStatefulSetReady
+        );
+    }
+
+    #[test]
+    fn statefulset_ready_moves_to_verify_user_ready() {
+        assert_eq!(
+            next_nats_bootstrap_step(true, true, true, false),
+            NatsBootstrapStep::VerifyUserReady
+        );
+    }
+
+    #[test]
+    fn every_precondition_true_is_done() {
+        assert_eq!(
+            next_nats_bootstrap_step(true, true, true, true),
+            NatsBootstrapStep::Done
+        );
+    }
+
+    // --- nats_override_patch (2.5d Task 6, bidirectional annotation
+    // contract) -----------------------------------------------------
+    //
+    // "the provisioner and a human operator write the same override key.
+    // Stamp on enable, clear in the same patch on disable, and never
+    // disable while it is absent — an operator who turned NATS on by hand
+    // keeps it." Only the enable direction has a caller in THIS task set
+    // (provision_nats never turns the component back off — there is no
+    // GC/reap task for it yet); the disable direction is implemented and
+    // tested here as specified, flagged as callerless the same way
+    // `component_nats.cue`'s own comments flag an unenforced gap rather
+    // than silently shipping dead-looking code with no note.
+
+    #[test]
+    fn enable_stamps_the_annotation_when_currently_off() {
+        let patch = nats_override_patch(true, false, false).expect("must patch");
+        assert_eq!(patch["spec"]["overrides"]["nats"]["enabled"], true);
+        assert_eq!(
+            patch["metadata"]["annotations"][NATS_AUTO_ENABLED_ANNOTATION],
+            "true"
+        );
+    }
+
+    #[test]
+    fn enable_is_a_noop_when_already_on_regardless_of_annotation() {
+        assert!(
+            nats_override_patch(true, true, true).is_none(),
+            "already enabled, annotation present — nothing to do"
+        );
+        assert!(
+            nats_override_patch(true, true, false).is_none(),
+            "already enabled by a human (no annotation) — must not restamp or repatch"
+        );
+    }
+
+    #[test]
+    fn disable_clears_the_annotation_when_present() {
+        let patch = nats_override_patch(false, true, true).expect("must patch");
+        assert_eq!(patch["spec"]["overrides"]["nats"]["enabled"], false);
+        assert_eq!(
+            patch["metadata"]["annotations"][NATS_AUTO_ENABLED_ANNOTATION],
+            serde_json::Value::Null,
+            "must clear (JSON Merge Patch null), not merely omit, the annotation"
+        );
+    }
+
+    #[test]
+    fn disable_never_fires_while_the_annotation_is_absent() {
+        // The load-bearing case: a human enabled NATS by hand (no
+        // annotation), a jetstream claim was later deleted, and the
+        // provisioner now wants nats "off" again — it must NEVER touch a
+        // component it did not itself turn on.
+        assert!(
+            nats_override_patch(false, true, false).is_none(),
+            "human-enabled component must survive a provisioner disable decision"
+        );
+    }
+
+    // --- accounts_file_unchanged (2.5d Task 10 byte-stable property) ---
+    //
+    // The I/O half of `reconcile_accounts_secret` (the GET / create /
+    // replace calls) is thin orchestration in the same sense
+    // `provision_cloudnativepg`/`provision_dragonfly`/`provision_disk`
+    // already are in this file — none of THOSE are unit-tested at the
+    // orchestration level either, only via the gated real-cluster smoke
+    // test + the manual walk (this file's own module doc says so). Pulling
+    // the comparison itself out as a named, pure function is what makes
+    // the one property Task 10 actually asked to be pinned — "an
+    // unchanged derivation performs NO write at all" — genuinely
+    // red-green testable without a cluster, rather than leaving the whole
+    // property untestable on the "impractical without a cluster" excuse.
+
+    #[test]
+    fn identical_content_is_unchanged() {
+        assert!(accounts_file_unchanged(
+            Some("ns_demo: {}\n"),
+            "ns_demo: {}\n"
+        ));
+    }
+
+    #[test]
+    fn different_content_is_changed() {
+        assert!(!accounts_file_unchanged(
+            Some("ns_demo: {}\n"),
+            "ns_demo: { jetstream: {} }\n"
+        ));
+    }
+
+    #[test]
+    fn no_existing_secret_is_always_changed() {
+        // A brand new namespace's FIRST render — nothing to compare
+        // against, so there is no "unchanged" to claim.
+        assert!(!accounts_file_unchanged(None, "ns_demo: {}\n"));
+    }
+
+    #[test]
+    fn disable_is_a_noop_when_already_off() {
+        assert!(nats_override_patch(false, false, true).is_none());
+        assert!(nats_override_patch(false, false, false).is_none());
     }
 }

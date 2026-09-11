@@ -79,6 +79,7 @@ pub mod reconcile;
 pub mod redis_client;
 pub mod shared_volume;
 
+use nats_client::{NatsAdmin, NatsClient};
 use operator_core::capacity::CapacityCache;
 use redis_client::{RedisAdmin, RedisClient};
 
@@ -129,6 +130,12 @@ pub struct Context {
     /// is testable with a fake; production is [`RedisClient`]. Unused by
     /// the CNPG path. ADR 0042 §2/§4.
     pub redis: Arc<dyn RedisAdmin>,
+    /// Imperative NATS admin seam for the nats/jetstream backend (2.5d Task
+    /// 6/9/10) — the post-connect permission round trip `provision_nats`
+    /// uses to decide "is this user's account actually usable yet" before
+    /// marking a claim ready. Same injection reasoning as `redis` above;
+    /// production is [`NatsClient`]. Unused by every other backend.
+    pub nats: Arc<dyn NatsAdmin>,
     /// Per-node TTL cache of kubelet Summary documents (2.6c, T11). Shared
     /// across BOTH controllers so a single node's kubelet is sampled at
     /// most once per TTL across all reconciles. Capacity sampling is
@@ -178,6 +185,7 @@ impl Context {
             client,
             metrics,
             redis: Arc::new(RedisClient),
+            nats: Arc::new(NatsClient),
             capacity: Arc::new(CapacityCache::new()),
             backend_metrics: Arc::new(operator_core::promscrape::MetricsCache::new()),
             acl_dirty,
