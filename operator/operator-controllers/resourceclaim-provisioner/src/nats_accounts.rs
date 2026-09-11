@@ -9,10 +9,14 @@
 //! Three pieces, built across three tasks and landed in this order: the
 //! input view and naming derivations ([`ClaimView`] and friends,
 //! [`nats_stream_name`], [`nats_durable_name`]), the allow list and deny
-//! vector ([`allow_list`], [`deny_vector`]), and the file renderer
+//! vector (`allow_list`, `deny_vector`), and the file renderer
 //! ([`render_accounts_file`]) — which is the only one a caller outside
-//! this module needs; everything else is exported because the tests need
-//! it, not because it is meant to be called independently.
+//! this module needs. `mgr_user`/`nats_stream_name`/`nats_durable_name`
+//! stay `pub` for that same future caller (part 2); `allow_list` and
+//! `deny_vector` are private (round-7 review: they were `pub` with the
+//! doc claiming "exported because the tests need it," which was never
+//! true — `mod tests` below is a CHILD module and sees private items via
+//! `use super::*`, the same as every other private helper in this file).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -47,11 +51,24 @@ pub struct ConsumeView {
     pub durable: String,
 }
 
+/// The NATS account name for a namespace. `_` is not legal in a DNS-1123
+/// namespace name, so `-` → `_` is injective and two namespaces can never
+/// fold onto one account. A free function, not inlined at both call sites
+/// ([`ClaimView::account`] and `render_account`, which knows only a
+/// `&str` namespace, not a whole [`ClaimView`]) — Round-7 review found the
+/// two had drifted into independent copies of this same formula, and
+/// deleting `render_account`'s own copy left the whole suite green
+/// because every render-path fixture used a hyphen-free namespace, so the
+/// two never had a chance to disagree
+/// (`the_account_key_matches_claimview_account_for_a_hyphenated_namespace`
+/// closes that gap).
+fn account_name(namespace: &str) -> String {
+    format!("ns_{}", namespace.replace('-', "_"))
+}
+
 impl ClaimView {
-    /// `_` is not legal in a DNS-1123 namespace name, so `-` → `_` is
-    /// injective and two namespaces can never fold onto one account.
     pub fn account(&self) -> String {
-        format!("ns_{}", self.namespace.replace('-', "_"))
+        account_name(&self.namespace)
     }
     pub fn user(&self) -> String {
         format!("claim_{}_{}_jetstream", self.namespace, self.app)
@@ -130,17 +147,22 @@ pub fn nats_durable_name(consumer_app: &str, declared: &str) -> String {
 /// makes these four patterns sufficient is that `allow_list` never admits
 /// anything past depth 6 — see its own doc and
 /// `every_allowed_api_subject_puts_the_stream_at_depth_5_or_6`.
+///
+/// The last four entries are [`ack_fc_patterns`]`(stream, None)` — the
+/// STREAM-ONLY form (no durable), because a total denial has no
+/// consumer to name. Round-7 review: this used to carry its own inline
+/// copy of those same four lines instead of calling that function, which
+/// is why `ack_fc_patterns`'s `None` branch went uncovered — nothing
+/// called it. Delegating here makes the branch live.
 fn total_denial_patterns(stream: &str) -> Vec<String> {
-    vec![
+    let mut list = vec![
         format!("$JS.API.*.*.{stream}"),
         format!("$JS.API.*.*.{stream}.>"),
         format!("$JS.API.*.*.*.{stream}"),
         format!("$JS.API.*.*.*.{stream}.>"),
-        format!("$JS.ACK.{stream}.>"),
-        format!("$JS.ACK.*.*.{stream}.>"),
-        format!("$JS.FC.{stream}.>"),
-        format!("$JS.FC.*.*.{stream}.>"),
-    ]
+    ];
+    list.extend(ack_fc_patterns(stream, None));
+    list
 }
 
 /// Both acknowledgement subject forms, always. v1 puts the stream at token
@@ -149,17 +171,16 @@ fn total_denial_patterns(stream: &str) -> Vec<String> {
 /// measured — and the `*.*` wildcard means the account hash never needs
 /// deriving.
 ///
-/// `deny_vector`'s class (D) is the only caller in this task, always with
-/// `durable: Some(_)` — the `None` (stream-only) branch is unreachable
-/// from anything this task calls. It overlaps, entry for entry, with
-/// `total_denial_patterns`'s own inline `$JS.ACK`/`$JS.FC` lines when it
-/// IS reached, which is between the two FUNCTIONS' possible outputs, not
-/// between anything `deny_vector` emits twice today
-/// (`total_denial_patterns` does not call this function; it carries its
-/// own copy, deliberately, per its own doc). Kept as `Option`, not
-/// narrowed to `&str`, because the signature is shared design surface for
-/// a later task in this same file (§3/§6's file renderer) — not because
-/// this task uses both branches.
+/// Two callers: `deny_vector`'s class (D), always with `durable:
+/// Some(_)` (a specific consumer's cursor), and [`total_denial_patterns`]
+/// class (C), always with `None` (no consumer to name — the whole stream
+/// is denied). Kept as `Option`, not two functions or a narrowed `&str`,
+/// because both shapes are the SAME four-pattern structure over a
+/// different `tail`. This used to be true only in the signature — the
+/// `None` branch had no caller until `total_denial_patterns` was
+/// refactored to call it instead of carrying its own duplicate literals
+/// (round-7 review); both branches are exercised by this module's tests
+/// now.
 fn ack_fc_patterns(stream: &str, durable: Option<&str>) -> Vec<String> {
     let tail = match durable {
         Some(d) => format!("{stream}.{d}"),
@@ -189,7 +210,7 @@ fn ack_fc_patterns(stream: &str, durable: Option<&str>) -> Vec<String> {
 /// file that runs BACKWARDS from the usual "does the code reject bad
 /// input" and instead asks "does the code refuse to ADMIT an operation
 /// the deny vector cannot reach."
-pub fn allow_list(me: &ClaimView) -> Vec<String> {
+fn allow_list(me: &ClaimView) -> Vec<String> {
     let mut list = vec![
         format!("{}>", me.subject_prefix()),
         "$JS.ACK.>".to_string(),
@@ -224,10 +245,15 @@ pub fn allow_list(me: &ClaimView) -> Vec<String> {
     }
 
     // "All my streams are dynamic" (ADR 0061 §6) — a deliberate, reviewed
-    // opt-in, never a default. See `deny_vector`'s class (B) for why this
-    // does not reach a DECLARED stream even once granted here: the grant
-    // is namespace-wide by verb, the carve-out is per-stream and
-    // unconditional.
+    // opt-in, never a default. `deny_vector`'s class (B) carves every
+    // declared stream's exact composed name back out of all four of
+    // these verbs (CREATE included, since round-7 review: CREATE was
+    // missing from that carve-out until then, which let a
+    // dynamic_streams app squat a namespace-mate's declared stream name
+    // ahead of NACK's own create) — the grant here is namespace-wide by
+    // verb, the carve-out there is per-stream and unconditional, so none
+    // of the four ever reaches a stream that went through the migration
+    // gate.
     if me.dynamic_streams {
         list.extend([
             "$JS.API.STREAM.CREATE.>".to_string(),
@@ -250,7 +276,7 @@ pub fn allow_list(me: &ClaimView) -> Vec<String> {
 /// Do NOT restore a blanket deny for the constrained (non-`dynamic_streams`)
 /// mode here. If a test seems to want one, `allow_list` is the thing that
 /// is wrong, not this function.
-pub fn deny_vector(me: &ClaimView, namespace_claims: &[ClaimView]) -> Vec<String> {
+fn deny_vector(me: &ClaimView, namespace_claims: &[ClaimView]) -> Vec<String> {
     let mut list = Vec::new();
 
     // (B) Every declared stream in the NAMESPACE, including `me`'s own —
@@ -263,11 +289,18 @@ pub fn deny_vector(me: &ClaimView, namespace_claims: &[ClaimView]) -> Vec<String
     // migration gate the moment the flag flips — an app can mutate only
     // an UNDECLARED stream it creates dynamically (never in
     // `namespace_claims`, so never denied here), not a declared one.
-    // PURGE is deliberately absent: granted positively, per-stream, in
-    // `allow_list`, not carved out of a blanket deny here.
+    // CREATE is included (round-7 review, H2): its absence let a
+    // dynamic_streams app CREATE a stream under a namespace-mate's
+    // already-declared, not-yet-materialised name — subjects are not
+    // permission-checked at creation, so the squatter's own subjects
+    // would win the race, NACK's later create of the real stream would
+    // fail 10058, and §5's detector could read the squatted stream as
+    // legitimate. PURGE is deliberately absent: granted positively,
+    // per-stream, in `allow_list`, not carved out of a blanket deny here.
     for claim in namespace_claims {
         for stream in &claim.streams {
             let composed = nats_stream_name(&claim.app, &stream.name);
+            list.push(format!("$JS.API.STREAM.CREATE.{composed}"));
             list.push(format!("$JS.API.STREAM.UPDATE.{composed}"));
             list.push(format!("$JS.API.STREAM.DELETE.{composed}"));
             list.push(format!("$JS.API.STREAM.MSG.DELETE.{composed}"));
@@ -334,17 +367,41 @@ pub enum AccountsFileError {
     EmptyAccount(String),
 }
 
-/// The account-JetStream memory ceiling (ADR 0061 §3): seeded
-/// conservatively at Tier 1 rather than derived from the namespace's
-/// claims, because — unlike `max_file` — a memory-storage stream lives in
-/// the SERVER's own RSS, not on disk, so its cost is shared with every
-/// other tenant's process instead of being per-account-isolated the way
-/// file storage is. `0` disallows memory storage for the account
-/// entirely; `#JetStreamStream.storage` already defaults to `"file"` in
-/// CUE, so this floor does not change the common case, only forecloses
-/// the uncommon one until a later tier/task revisits it with a real
-/// budget.
-const ACCOUNT_MAX_MEM_BYTES: u64 = 0;
+/// Floor under [`account_max_mem_bytes`]'s fraction: keeps a namespace
+/// with a small file quota still able to use `storage: memory` AT ALL.
+/// Round-7 review (H3): a flat `0` ceiling made `storage: memory` fail
+/// with an opaque `10028 insufficient memory resources` from
+/// nats-server — despite `#JetStreamStream.storage` offering `file |
+/// memory` in CUE, and the webhook's own rejection message for
+/// `persistent` recommending memory BY NAME
+/// (`streams[].storage: file | memory`) as the per-stream persistence
+/// knob. ADR 0061 §1 makes "one server serves both persistence classes"
+/// a deliberate reason this design did not copy Dragonfly's two-pool
+/// shape, so `memory` staying usable is load-bearing, not incidental.
+const ACCOUNT_MAX_MEM_FLOOR_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+
+/// Denominator of [`account_max_mem_bytes`]'s fraction of the namespace's
+/// FILE quota. `1/10`: a memory-storage stream lives in the SERVER's own
+/// RSS on a ~4 GB Tier-1 node — not on disk — so its cost is shared with
+/// EVERY OTHER tenant's process on that node instead of being
+/// per-account-isolated the way file storage is; granting the full file
+/// quota (or an ungoverned large fraction of it) would be a real OOM
+/// vector.
+const ACCOUNT_MAX_MEM_FRACTION_DIVISOR: u64 = 10;
+
+/// The account-JetStream memory ceiling (ADR 0061 §3): a documented
+/// FRACTION of the namespace's own summed file quota
+/// ([`ACCOUNT_MAX_MEM_FRACTION_DIVISOR`]), floored at
+/// [`ACCOUNT_MAX_MEM_FLOOR_BYTES`] — not the flat `0` this constant
+/// replaced (round-7 review, H3), and not the file quota itself (see
+/// that constant's own doc for why a memory ceiling can't just mirror
+/// `max_file`). Both numbers are a conservative Tier-1 FALLBACK, not a
+/// considered budget: part 2 makes this tier-aware, sourced from the
+/// `jetstream-integrated` seed's own memory reservation, and this
+/// function is what falls back until that lands.
+fn account_max_mem_bytes(total_file_quota_bytes: u64) -> u64 {
+    (total_file_quota_bytes / ACCOUNT_MAX_MEM_FRACTION_DIVISOR).max(ACCOUNT_MAX_MEM_FLOOR_BYTES)
+}
 
 /// One subject list, NATS-config-array-formatted: `["a", "b"]`, or `[]`
 /// for an empty list (valid syntax — an account with no PURGE grants, or
@@ -376,7 +433,7 @@ fn render_account(
     peers: &[ClaimView],
     password: &dyn Fn(&str) -> String,
 ) -> Result<String, AccountsFileError> {
-    let account = format!("ns_{}", namespace.replace('-', "_"));
+    let account = account_name(namespace);
 
     if peers.is_empty() {
         return Err(AccountsFileError::EmptyAccount(account));
@@ -397,12 +454,13 @@ fn render_account(
     }
 
     let total_quota: u64 = peers.iter().map(|c| c.quota_bytes).sum();
+    let max_mem = account_max_mem_bytes(total_quota);
 
     let mut out = String::new();
     writeln!(out, "{account}: {{").unwrap();
     writeln!(
         out,
-        "  jetstream: {{ max_mem: {ACCOUNT_MAX_MEM_BYTES}, max_file: {total_quota} }}"
+        "  jetstream: {{ max_mem: {max_mem}, max_file: {total_quota} }}"
     )
     .unwrap();
     writeln!(out, "  users: [").unwrap();
@@ -604,6 +662,43 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_stream_verbs_and_purge_also_land_at_depth_5_or_6() {
+        // Round-7 review coverage gap: the test above iterates
+        // allow_list(&claim(...)) with dynamic_streams: false and no
+        // streams, so it never walks the four entries gated by
+        // `me.dynamic_streams` or the `allow_purge`-gated
+        // STREAM.PURGE.<name> entry — 17 of 22 possible allow_list
+        // entries, not all 22. Same depth formula as the test above,
+        // applied to a fixture that turns every one of those on, so a
+        // future entry added inside either branch can't slip past
+        // silently the way the ones already there could have.
+        let mut c = claim("demo", "feeder");
+        c.dynamic_streams = true;
+        c.streams = vec![StreamView {
+            name: "blocks-head".into(),
+            subjects: vec!["feeder.blocks.head.>".into()],
+            allow_purge: true,
+        }];
+        for subj in allow_list(&c) {
+            if !subj.starts_with("$JS.API.")
+                || subj == "$JS.API.INFO"
+                || subj == "$JS.API.STREAM.NAMES"
+            {
+                continue;
+            }
+            let depth = match subj.strip_suffix(".>") {
+                Some(prefix) => prefix.split('.').count() + 1,
+                None => subj.split('.').count(),
+            };
+            assert!(
+                depth == 5 || depth == 6,
+                "{subj} puts the stream token at depth {depth}; the deny \
+                 patterns cover 5 and 6 only."
+            );
+        }
+    }
+
+    #[test]
     fn dynamic_streams_is_an_allow_list_decision_not_a_deny_one() {
         let mut c = claim("demo", "feeder");
         let constrained = allow_list(&c);
@@ -691,6 +786,35 @@ mod tests {
         );
         assert!(d.contains(&"$JS.API.STREAM.DELETE.feeder_blocks-head".to_string()));
         assert!(d.contains(&"$JS.API.STREAM.MSG.DELETE.feeder_blocks-head".to_string()));
+    }
+
+    #[test]
+    fn a_declared_streams_create_is_denied_even_under_dynamic_streams() {
+        // Round-7 review (H2, the pre-emption finding, reproduced against
+        // nats-server 2.14.3): allow_list grants $JS.API.STREAM.CREATE.>
+        // under dynamic_streams, and class (B) denied
+        // UPDATE/DELETE/MSG.DELETE on every declared stream but not
+        // CREATE. A dynamic_streams app could therefore squat a
+        // namespace-mate's DECLARED stream name — with subjects of its
+        // own choosing, since subjects are not permission-checked at
+        // creation — before NACK ever created the real one; NACK's later
+        // create then fails 10058 and §5's detector may read the
+        // squatted stream as legitimate. Works on the app's own declared
+        // names too, with no second gate.
+        let mut all = ns_with_two_apps();
+        all[0].dynamic_streams = true; // feeder, the stream's OWNER
+        let allow = allow_list(&all[0]);
+        assert!(
+            allow.contains(&"$JS.API.STREAM.CREATE.>".to_string()),
+            "dynamic_streams must still grant CREATE broadly — the \
+             boundary belongs in the deny vector, not the allow list"
+        );
+        let d = deny_vector(&all[0], &all);
+        assert!(
+            d.contains(&"$JS.API.STREAM.CREATE.feeder_blocks-head".to_string()),
+            "but the declared stream's own composed name must be denied, \
+             same as UPDATE/DELETE/MSG.DELETE: {d:?}"
+        );
     }
 
     #[test]
@@ -879,6 +1003,89 @@ mod tests {
     }
 
     #[test]
+    fn account_max_mem_is_a_nonzero_fraction_of_the_file_quota() {
+        // Round-7 review (H3): ACCOUNT_MAX_MEM_BYTES was a flat 0, making
+        // `storage: memory` fail with an opaque `10028 insufficient
+        // memory resources` from nats-server — despite the CUE type
+        // offering it and the webhook's own rejection message for
+        // `persistent` recommending it BY NAME as the per-stream
+        // persistence knob.
+        let mut claims = ns_with_two_apps();
+        for c in &mut claims {
+            c.quota_bytes = 10 * (1 << 30); // 10 GiB each, well above the floor
+        }
+        let total_quota: u64 = claims.iter().map(|c| c.quota_bytes).sum();
+        let out = render_accounts_file(&claims, &|u| format!("pw-{u}")).unwrap();
+        let max_mem: u64 = out
+            .split("max_mem: ")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(max_mem > 0, "max_mem must be non-zero: {out}");
+        assert_eq!(
+            max_mem,
+            total_quota / 10,
+            "must be exactly the documented fraction of the summed file quota"
+        );
+    }
+
+    #[test]
+    fn account_max_mem_floors_for_a_tiny_quota() {
+        let mut claims = ns_with_two_apps();
+        for c in &mut claims {
+            c.quota_bytes = 1024; // tiny — the fraction alone would be ~200 bytes
+        }
+        let out = render_accounts_file(&claims, &|u| format!("pw-{u}")).unwrap();
+        let max_mem: u64 = out
+            .split("max_mem: ")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            max_mem, ACCOUNT_MAX_MEM_FLOOR_BYTES,
+            "a tiny file quota must not leave storage: memory unusable: {out}"
+        );
+    }
+
+    #[test]
+    fn the_account_key_matches_claimview_account_for_a_hyphenated_namespace() {
+        // Round-7 review coverage gap: render_account independently
+        // re-derived the "ns_<namespace>" fold instead of calling
+        // ClaimView::account() — deleting render_account's OWN
+        // `.replace('-', '_')` left the whole suite green, because every
+        // existing render-path fixture used a hyphen-free namespace
+        // ("demo", "other"), so the two independent implementations never
+        // had a chance to disagree.
+        //
+        // The expected key is HARDCODED, not derived via `c.account()`:
+        // an earlier draft of this test computed `expected_key` by
+        // calling `c.account()`, so a mutation to the shared fold (both
+        // call sites now route through `account_name`) moved BOTH sides
+        // together and this test never went red — caught only because
+        // the mutation-testing pass ran it and got zero failures, the
+        // same shape as the Task 7 `allow_purge` and Task 8 mgr-password
+        // findings. Asserting against a literal locks down the render
+        // path independently of whatever `account_name` currently
+        // computes.
+        let c = claim("demo-ns", "app");
+        let out = render_accounts_file(&[c], &|u| format!("pw-{u}")).unwrap();
+        assert!(
+            out.contains("ns_demo_ns: {"),
+            "expected key \"ns_demo_ns: {{\" in:\n{out}"
+        );
+    }
+
+    #[test]
     fn render_account_refuses_an_empty_namespace() {
         // Not reachable through render_accounts_file's public API: its
         // BTreeMap grouping only ever inserts a namespace key alongside
@@ -916,8 +1123,18 @@ mod tests {
     #[test]
     #[ignore = "needs podman"]
     fn rendered_file_is_valid_nats_config() {
-        let fragment =
-            render_accounts_file(&ns_with_two_apps(), &|u| format!("pw-{u}")).expect("renders");
+        // Round-7 review coverage gap: this used to render only
+        // ns_with_two_apps() (one namespace, two claims, neither with an
+        // empty deny vector). Pushing `other`/`solo` (the same fixture
+        // `renders_one_account_per_namespace_with_a_user_per_claim`
+        // uses) exercises two CONCATENATED account blocks — grammar a
+        // single-account fragment can't check — and `solo`'s own
+        // `deny: []` (it shares no namespace claims with anyone, so
+        // deny_vector has nothing to add), neither of which nats-server
+        // had been asked to parse before.
+        let mut claims = ns_with_two_apps();
+        claims.push(claim("other", "solo"));
+        let fragment = render_accounts_file(&claims, &|u| format!("pw-{u}")).expect("renders");
 
         let nats_conf = r#"
 port: 4222

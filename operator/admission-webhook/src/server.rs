@@ -22,7 +22,9 @@ use axum::{
 use serde_json::{json, Value};
 use tracing::warn;
 
-use crate::validator::{validate_application_spec, ValidationError};
+use crate::validator::{
+    validate_application_name_for_jetstream, validate_application_spec, ValidationError,
+};
 
 /// Build the axum router. Used by main.rs (binding to a port) and
 /// by integration tests (`tower::ServiceExt::oneshot`).
@@ -266,7 +268,19 @@ async fn validate_handler(Json(review): Json<Value>) -> impl IntoResponse {
                 .get("spec")
                 .cloned()
                 .unwrap_or(Value::Object(Default::default()));
-            validate_application_spec(&spec)
+            let mut errs = validate_application_spec(&spec);
+            // H4 (round-7 review): needs `object.metadata`, which
+            // validate_application_spec never sees (it takes `spec`
+            // alone) — this is the one call site that holds both, so the
+            // check is wired here instead of threaded through that
+            // function's ~120 call sites.
+            let name = object
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            errs.extend(validate_application_name_for_jetstream(name, &spec));
+            errs
         }
         "PlatformStack" => crate::validator_platformstack::validate_platformstack(&object),
         "MigrationPlan" => {
@@ -973,6 +987,61 @@ mod tests {
             parsed["response"]["allowed"],
             json!(true),
             "a CREATE carrying an environment must pass (per-env CRs are created once)"
+        );
+    }
+
+    // ── round-7 review (H4): metadata.name must be a label when
+    // needs.jetstream is present — wired here, not in
+    // validate_application_spec, since only this call site holds both
+    // object.metadata and object.spec together (see
+    // validate_application_name_for_jetstream's own doc). ────────────────
+
+    #[tokio::test]
+    async fn rejects_a_dotted_application_name_when_jetstream_is_present() {
+        let body = admission_review_for_kind(
+            "Application",
+            json!({
+                "metadata": { "name": "my.app", "namespace": "demo" },
+                "spec": {
+                    "base": {
+                        "image": "ghcr.io/acme/web:1.0",
+                        "needs": { "jetstream": { "streams": [
+                            { "name": "orders", "subjects": ["orders.>"], "maxBytes": "1Gi" }
+                        ] } }
+                    }
+                }
+            }),
+        );
+        let parsed = post_review(body).await;
+        assert_eq!(parsed["response"]["allowed"], json!(false));
+        let msg = parsed["response"]["status"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("metadata.name") && msg.contains("DNS-1123 label"),
+            "expected a metadata.name/DNS-1123-label rejection, got {msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_a_labelled_application_name_when_jetstream_is_present() {
+        let body = admission_review_for_kind(
+            "Application",
+            json!({
+                "metadata": { "name": "my-app", "namespace": "demo" },
+                "spec": {
+                    "base": {
+                        "image": "ghcr.io/acme/web:1.0",
+                        "needs": { "jetstream": { "streams": [
+                            { "name": "orders", "subjects": ["orders.>"], "maxBytes": "1Gi" }
+                        ] } }
+                    }
+                }
+            }),
+        );
+        let parsed = post_review(body).await;
+        assert_eq!(
+            parsed["response"]["allowed"],
+            json!(true),
+            "a DNS-1123-label name must pass: {parsed:?}"
         );
     }
 

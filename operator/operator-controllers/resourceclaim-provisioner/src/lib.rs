@@ -8,8 +8,14 @@
 //! claim the scheduler marked `Scheduled=True` and materialises the
 //! backing resource:
 //!
-//!   - dispatch on the matched provider's `spec.backend`; only
-//!     `cloudnative-pg` is wired today (2.5/2.6 add jetstream / redis);
+//!   - dispatch on the matched provider's `spec.backend`; `cloudnative-pg`
+//!     (2.4), `dragonfly` (2.6), `disk` (2.6b), and `shared-disk` (2.6c, a
+//!     reference arm that binds to an existing `SharedVolume` and
+//!     provisions nothing) are wired today (round-7 review: this bullet
+//!     was two phases stale — `Backend` in `reconcile.rs` is the source
+//!     of truth). `needs.jetstream` (2.5) has its accounts-file renderer
+//!     (`nats_accounts`) but no `Backend` dispatch arm here yet — wiring
+//!     it into this controller is part 2;
 //!   - for `cloudnative-pg`: lazily SSA-apply the shared
 //!     `platform-postgres` CNPG `Cluster` (created on the first claim,
 //!     so a solo cluster with no pg apps pays no Postgres-pod cost),

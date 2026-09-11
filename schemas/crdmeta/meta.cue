@@ -75,7 +75,11 @@ _crdMetas: Application: {
 		// for why that redundancy is kept (an older CRD without this
 		// patch). Regex is the standard Kubernetes DNS-1123 label
 		// (`[a-z0-9]` endpoints, `[-a-z0-9]*` between); this repo's own
-		// `is_dns_1123_label` is the same rule, byte-for-byte.
+		// `is_dns_1123_label` enforces the same alphabet and anchoring —
+		// NOT byte-for-byte the same rule, though (round-7 review): the
+		// Rust helper ALSO caps the input at 63 characters, which this
+		// regex does not, so the two agree on every string this regex
+		// accepts but the Rust helper is strictly narrower on length.
 		"base.needs.jetstream.streams[].name": {pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"}
 		"environments[*].needs.jetstream.streams[].name": {pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"}
 		"base.needs.jetstream.consume[].durable": {pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"}

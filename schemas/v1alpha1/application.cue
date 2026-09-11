@@ -180,8 +180,13 @@ package v1alpha1
 // secret payload: "<name>/<key>"
 
 // #ClaimFieldsFor — the per-network-need field set (the keys each
-// provisioner writes into the connection Secret). pg, redis and
-// jetstream ship connection Secrets today; clickhouse, s3 and
+// provisioner writes into the connection Secret). pg and redis ship
+// connection Secrets today; jetstream's entry below defines its
+// VOCABULARY only (round-7 review: no provisioner writes a jetstream
+// connection Secret yet — `nats_accounts::render_accounts_file` in
+// resourceclaim-provisioner renders the SERVER-side accounts config, a
+// different artifact, and has no caller wiring it into the reconciler
+// yet either; both are part 2's work); clickhouse, s3 and
 // notifications don't have an entry here yet. This is the SINGLE
 // SOURCE OF TRUTH for the claim field vocabulary, shared by:
 //   - the operator renderer's secretKeyRef key resolution,

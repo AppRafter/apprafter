@@ -1154,11 +1154,26 @@ pub fn validate_sharedvolume(obj: &serde_json::Value) -> Vec<ValidationError> {
 /// Reserved subject roots an application may never declare a stream over
 /// (2.5 / ADR 0061 §6). `$JS.` is the JetStream API itself (ack/flow-control
 /// subjects included — ADR 0061 §4.4); `$SYS.` is the NATS system account
-/// surface; `_INBOX.` is every claim's own reply subject (ADR 0061 §4.5) —
-/// collecting any of them either breaks the platform's own control plane or
-/// reads every other application's in-flight replies and JetStream API
-/// responses in the same account.
-const JS_RESERVED_SUBJECT_ROOTS: &[&str] = &["$JS.", "$SYS.", "_INBOX."];
+/// surface; `_INBOX` (deliberately no trailing dot — see below) is every
+/// reply subject this design mints, both the default NATS inbox tree
+/// (`_INBOX.>`, used only by `mgr_<ns>`, ADR 0061 §3) and this design's
+/// OWN per-claim inbox prefix (`ClaimView::inbox_prefix()` in
+/// `resourceclaim-provisioner::nats_accounts` mints `_INBOX_<ns>_<app>` —
+/// UNDERSCORE-, not dot-joined). Collecting any of these either breaks
+/// the platform's own control plane or reads every other application's
+/// in-flight replies and JetStream API responses in the same account.
+///
+/// Round-7 review (H1): this literal used to be `"_INBOX."` (trailing
+/// dot), which a real per-claim prefix like `_INBOX_demo_feeder.>` does
+/// NOT start with — so only the default dot-form tree was ever caught,
+/// and a stream declared over the underscore-joined form captured a
+/// namespace-mate's JetStream API replies (reproduced against
+/// nats-server 2.14.3). Dropping the trailing dot is deliberately a
+/// WHOLE-STRING prefix widening, not a switch to a first-token check:
+/// `_INBOX` contains no `.`, so it lies entirely within the subject's
+/// first token either way, and the whole-string form matches this
+/// module's existing `starts_with` shape for `$JS.`/`$SYS.` exactly.
+const JS_RESERVED_SUBJECT_ROOTS: &[&str] = &["$JS.", "$SYS.", "_INBOX"];
 
 /// The rejection message for `needs.jetstream.persistent` being set —
 /// shared, word-for-word, between the typed path (`validate_jetstream_need`)
@@ -1358,6 +1373,66 @@ fn validate_jetstream_scopes(
             }
         }
     }
+}
+
+/// Whether `spec` declares `needs.jetstream` ANYWHERE — `base` or any
+/// entry under `environments` — used only to GATE
+/// [`validate_application_name_for_jetstream`], so it needs presence
+/// only, not shape: a raw `Value::pointer` walk, not the typed
+/// decode/raw-fallback split `validate_jetstream_scopes` uses to
+/// validate the need's own FIELDS. That split exists because a scope
+/// that fails typed decode still needs `persistent`/`name` rejected
+/// (reachable in production, not just tests — see the comment above
+/// `check_scope_raw`); this function only asks "is the key there", which
+/// a raw pointer answers unconditionally, typed decode or not.
+fn application_spec_has_jetstream_need(spec: &Value) -> bool {
+    let has_jetstream = |scope: &Value| scope.pointer("/needs/jetstream").is_some();
+    if spec.pointer("/base").is_some_and(has_jetstream) {
+        return true;
+    }
+    spec.get("environments")
+        .and_then(Value::as_object)
+        .is_some_and(|envs| envs.values().any(has_jetstream))
+}
+
+/// Round-7 review (H4): `metadata.name` must be a DNS-1123 LABEL, not
+/// merely the SUBDOMAIN the apiserver's own object-name validation
+/// already guarantees, whenever `needs.jetstream` is present anywhere in
+/// the spec. `nats_stream_name` (resourceclaim-provisioner::nats_accounts)
+/// composes `<app>_<declared>` into a NATS stream name — a single token,
+/// per NATS's own naming rule, so a `.` in `app` makes the composed name
+/// illegal outright — and `ClaimView::subject_prefix()` composes `<app>.`
+/// into the per-app subject partition, where a `.` in `app` nests one
+/// app's partition inside a DIFFERENT, shorter-named app's own prefix
+/// (`my.app.` inside `my.`'s `my.>`), letting that shorter-named app
+/// publish into the dotted one's tree. A label is strictly narrower than
+/// the subdomain the apiserver already enforces, so this only ever
+/// REJECTS what would otherwise be silently accepted — never the
+/// reverse.
+///
+/// Deliberately NOT a `name: Option<&str>` parameter threaded through
+/// [`validate_application_spec`]: that function has roughly 120 call
+/// sites in this file's own test suite alone, all exercising `spec`
+/// alone (the same shape as the metadata-vs-spec split problem found
+/// before). `server.rs`'s `validate_handler` already holds both
+/// `object.metadata` and `object.spec` at the one call site that needs
+/// both — for the "Application" kind, before dispatching to
+/// `validate_application_spec` — so the check is wired in there instead,
+/// as a second, independent call whose errors are merged into the same
+/// response.
+pub fn validate_application_name_for_jetstream(name: &str, spec: &Value) -> Vec<ValidationError> {
+    if !application_spec_has_jetstream_need(spec) {
+        return Vec::new();
+    }
+    if is_dns_1123_label(name) {
+        return Vec::new();
+    }
+    vec![ValidationError::new(
+        "metadata.name",
+        format!(
+            "metadata.name {name:?} must be a DNS-1123 label (lowercase alphanumeric + '-', start and end alphanumeric, max 63 chars) when needs.jetstream is set — it is composed into NATS stream names and subject prefixes, neither of which can contain '.'; a Kubernetes object name alone (a DNS-1123 subdomain) is not narrow enough"
+        ),
+    )]
 }
 
 /// 1.83b: validate the `expose` block in BOTH base and every environment.
@@ -4166,7 +4241,18 @@ mod tests {
 
     #[test]
     fn rejects_reserved_and_wildcard_subjects() {
-        // "$JS.foo.>", "$SYS.x", "_INBOX.y", ">" — each must be rejected
+        // "$JS.foo.>", "$SYS.x", "_INBOX.y", "_INBOX_demo_feeder.>", ">"
+        // — each must be rejected. `_INBOX_demo_feeder.>` is the REAL
+        // shape ClaimView::inbox_prefix() mints (resourceclaim-provisioner
+        // ::nats_accounts) — underscore-, not dot-joined — round-7 review
+        // (H1): the guard's literal was `"_INBOX."` (trailing dot), which
+        // `"_INBOX_demo_feeder.>".starts_with(...)` is FALSE against, so
+        // only the default dot-form inbox (used solely by `mgr_<ns>`) was
+        // ever caught; a stream declared over this exact subject captured
+        // a namespace-mate's JetStream API replies, reproduced against
+        // nats-server 2.14.3. `_INBOX.y` (the dot form) already passed
+        // before this fix — kept here so the fix is proven not to have
+        // narrowed the existing coverage while it widened it.
         let spec = json!({
             "base": {
                 "image": "x",
@@ -4174,7 +4260,8 @@ mod tests {
                     { "name": "s1", "subjects": ["$JS.foo.>"], "maxBytes": "1Gi" },
                     { "name": "s2", "subjects": ["$SYS.x"], "maxBytes": "1Gi" },
                     { "name": "s3", "subjects": ["_INBOX.y"], "maxBytes": "1Gi" },
-                    { "name": "s4", "subjects": [">"], "maxBytes": "1Gi" }
+                    { "name": "s4", "subjects": [">"], "maxBytes": "1Gi" },
+                    { "name": "s5", "subjects": ["_INBOX_demo_feeder.>"], "maxBytes": "1Gi" }
                 ] } }
             }
         });
@@ -4183,8 +4270,14 @@ mod tests {
             .iter()
             .filter(|e| e.field == "spec.base.needs.jetstream")
             .collect();
-        assert_eq!(js_errs.len(), 4, "{js_errs:?}");
-        for subject in ["$JS.foo.>", "$SYS.x", "_INBOX.y", ">"] {
+        assert_eq!(js_errs.len(), 5, "{js_errs:?}");
+        for subject in [
+            "$JS.foo.>",
+            "$SYS.x",
+            "_INBOX.y",
+            ">",
+            "_INBOX_demo_feeder.>",
+        ] {
             assert!(
                 js_errs
                     .iter()
@@ -4192,6 +4285,84 @@ mod tests {
                 "expected a rejection naming {subject:?}: {js_errs:?}"
             );
         }
+    }
+
+    // ── round-7 review (H4): metadata.name must be a DNS-1123 LABEL when
+    // needs.jetstream is present ─────────────────────────────────────────
+    // `nats_stream_name` composes `<app>_<declared>` into a NATS stream
+    // name (a single token — NATS's own rule) and
+    // `ClaimView::subject_prefix()` composes `<app>.` into the per-app
+    // subject partition. `metadata.name` is normally a Kubernetes object
+    // name — a DNS-1123 SUBDOMAIN, which permits '.' — so
+    // `nats_stream_name("my.app", "orders")` composes `my.app_orders`
+    // (illegal: NATS rejects '.' in a stream name outright) and
+    // `subject_prefix()` composes `my.app.`, nesting app `my.app`'s
+    // partition inside a namesake app `my`'s own `my.` prefix, letting
+    // `my` publish into `my.app`'s tree. Masked for any app with
+    // `expose` (the Service name is the app name and Service names are
+    // themselves labels), but a jetstream app WITHOUT `expose` hits it
+    // cleanly. Gated on `needs.jetstream` because the constraint this
+    // adds (label, not subdomain) is strictly narrower than what the
+    // apiserver's own object-name validation already enforces
+    // unconditionally, and only jetstream composes the name this way.
+
+    #[test]
+    fn jetstream_gate_rejects_a_dotted_metadata_name() {
+        let spec = json!({
+            "base": {
+                "image": "x",
+                "needs": { "jetstream": { "streams": [
+                    { "name": "orders", "subjects": ["orders.>"], "maxBytes": "1Gi" }
+                ] } }
+            }
+        });
+        let errs = validate_application_name_for_jetstream("my.app", &spec);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(errs[0].field, "metadata.name");
+        assert!(errs[0].message.contains("DNS-1123 label"), "{:?}", errs[0]);
+    }
+
+    #[test]
+    fn jetstream_gate_allows_a_label_metadata_name() {
+        let spec = json!({
+            "base": {
+                "image": "x",
+                "needs": { "jetstream": { "streams": [
+                    { "name": "orders", "subjects": ["orders.>"], "maxBytes": "1Gi" }
+                ] } }
+            }
+        });
+        assert!(validate_application_name_for_jetstream("my-app", &spec).is_empty());
+    }
+
+    #[test]
+    fn jetstream_gate_ignores_a_dotted_name_without_jetstream() {
+        // The gate is conditional: a dotted metadata.name is otherwise the
+        // apiserver's own business (a DNS-1123 subdomain, which permits
+        // '.'), not this webhook's, unless jetstream is what will compose
+        // it into a NATS identifier.
+        let spec = json!({ "base": { "image": "x" } });
+        assert!(validate_application_name_for_jetstream("my.app", &spec).is_empty());
+    }
+
+    #[test]
+    fn jetstream_gate_checks_environments_too() {
+        // needs.jetstream can live under an environment override instead
+        // of base — the presence check must union both, not just base.
+        let spec = json!({
+            "base": { "image": "x" },
+            "environments": {
+                "prod": {
+                    "image": "x",
+                    "needs": { "jetstream": { "streams": [
+                        { "name": "orders", "subjects": ["orders.>"], "maxBytes": "1Gi" }
+                    ] } }
+                }
+            }
+        });
+        let errs = validate_application_name_for_jetstream("my.app", &spec);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!(errs[0].field, "metadata.name");
     }
 
     #[test]
