@@ -840,6 +840,7 @@ mod tests {
                 selector: Default::default(),
                 size: None,
                 persistent: None,
+                jetstream: None,
             },
         );
         c.status = Some(ResourceClaimStatus {

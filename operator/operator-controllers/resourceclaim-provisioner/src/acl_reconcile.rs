@@ -688,6 +688,7 @@ mod tests {
                 selector: BTreeMap::new(),
                 size: None,
                 persistent: None,
+                jetstream: None,
             },
         );
         c.metadata.namespace = Some(ns.to_string());
@@ -820,6 +821,7 @@ mod tests {
                 selector: BTreeMap::new(),
                 size: None,
                 persistent: None,
+                jetstream: None,
             },
         );
         pg.metadata.namespace = Some("demo".into());

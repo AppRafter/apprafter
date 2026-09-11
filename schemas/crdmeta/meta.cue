@@ -391,14 +391,31 @@ _crdMetas: ResourceClaim: {
 		{name: "Age", type: "date", jsonPath: ".metadata.creationTimestamp"},
 	]
 
-	// CRD-only SPEC constraint CUE omits: the hand-rolled CRD enforced
-	// `selector.minProperties: 1` (a non-empty routing map), but
-	// `selector: [string]: string` in CUE exports no minProperties (an
-	// empty map satisfies the open struct). Restore it so the generated
-	// CRD keeps the same acceptance set; the webhook also enforces it
-	// (clearer message). Paths are relative to `spec`.
+	// CRD-only SPEC constraints CUE omits. Paths are relative to `spec`;
+	// `[]` descends into an array's `items` (matching Application's own
+	// `needs.jetstream.streams[]` precedent — see that CRD's comment for
+	// why the CUE type can't carry these rules itself).
 	schemaPatches: {
+		// The hand-rolled CRD enforced `selector.minProperties: 1` (a
+		// non-empty routing map), but `selector: [string]: string` in
+		// CUE exports no minProperties (an empty map satisfies the open
+		// struct). Restore it so the generated CRD keeps the same
+		// acceptance set; the webhook also enforces it (clearer
+		// message).
 		"selector": {minProperties: 1}
+
+		// 2.5d prerequisite (ADR 0061 §6 amendment): `#ResourceClaimJetStream`
+		// reuses `#JetStreamStream` / `#JetStreamConsume` verbatim, so it
+		// needs the SAME three restored rules Application's own
+		// `needs.jetstream.streams[]` / `.consume[]` do, for the identical
+		// reasons (see that entry's comment above) — just at THIS claim's
+		// own single `jetstream.*` path, not duplicated under `base.`/
+		// `environments[*].` the way Application's is, because a
+		// ResourceClaim carries exactly one effective declaration, not a
+		// base-plus-per-environment tree.
+		"jetstream.streams[].subjects": {minItems: 1}
+		"jetstream.streams[].name": {pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"}
+		"jetstream.consume[].durable": {pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"}
 	}
 
 	// `status.conditions` as a server-side-merged list keyed by `type` (the

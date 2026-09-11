@@ -36,6 +36,12 @@ package v1alpha1
 		// the dragonfly provisioner reads it to pick a persistent vs
 		// ephemeral pool instance (ADR 0042).
 		persistent?: bool
+		// 2.5d prerequisite (ADR 0061 §6 amendment): present only for
+		// `type: "jetstream"` claims. See `#ResourceClaimJetStream`'s own
+		// doc for what this is and why jetstream is the one claim type
+		// that cannot follow `needs.disk`'s `mountPath`-stays-on-the-
+		// Application precedent.
+		jetstream?: #ResourceClaimJetStream
 	}
 
 	status?: {
@@ -57,6 +63,46 @@ package v1alpha1
 		// connectionSecretRef).
 		volumeClaimRef?: string
 	}
+}
+
+// #ResourceClaimJetStream — the jetstream permission model's INPUT,
+// carried on the claim itself (2.5d prerequisite / ADR 0061 §6
+// amendment). This is NOT a copy of the manifest kept for convenience,
+// and it is NOT app-side wiring the way `#DiskClaim.mountPath` is
+// (which stays on the Application; the renderer reads it there,
+// unchanged by this precedent) — `dynamicStreams`, `streams` and
+// `consume` are what the resourceclaim-provisioner's allow list and
+// deny vector are COMPUTED FROM (`nats_accounts::allow_list` /
+// `deny_vector`). Without them on the claim there is no allow list and
+// no deny vector: `JetStreamNeed::as_service_need()` (operator-core)
+// already discards all three when projecting onto the generic
+// `#ServiceNeed`/`ResourceClaimSpec` shape, and nothing else carried
+// them across — a gap 2.5d's `nats.rs` Task 7 investigation found
+// before writing any code against it: as scoped, that task could only
+// ever have produced empty declarations for every claim.
+//
+// Reaches the claim, not a second read of the Application, because the
+// resourceclaim-provisioner already WATCHES `ResourceClaim` — a
+// declaration edit updates the claim and reconciles through the path
+// that already exists. Reading `needs.jetstream` from the Application
+// instead would need new RBAC, new event plumbing, and a
+// claim→application resolution whose failure mode is a permission
+// vector computed from a STALE declaration (the claim says one thing,
+// the Application has already moved on).
+//
+// Reuses `#JetStreamStream` / `#JetStreamConsume` from
+// `application.cue` verbatim rather than duplicating them:
+// `resourceclaim.cue` and `application.cue` are both `package
+// v1alpha1` in this same directory, so both definitions are already
+// visible here with no import. A second, independent pair would have
+// been exactly the drift `#ClaimFieldsFor` (schemas/v1alpha1/
+// application.cue, the hand-synced Rust JETSTREAM_FIELDS mirror) is
+// the one existing instance of in this repo — not a precedent to add
+// to.
+#ResourceClaimJetStream: {
+	dynamicStreams?: bool | *false
+	streams?: [...#JetStreamStream]
+	consume?: [...#JetStreamConsume]
 }
 
 #ResourceClaimCondition: {

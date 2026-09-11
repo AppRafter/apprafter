@@ -13,6 +13,8 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::application::{JetStreamConsume, JetStreamStream};
+
 #[derive(CustomResource, Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[kube(
     group = "apprafter.io",
@@ -43,6 +45,41 @@ pub struct ResourceClaimSpec {
     /// it to route to a persistent vs ephemeral pool instance (ADR 0042).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persistent: Option<bool>,
+    /// 2.5d prerequisite (ADR 0061 §6 amendment): present only for
+    /// `type: "jetstream"` claims — see [`ResourceClaimJetStream`]'s own
+    /// doc for what this is and why jetstream is the one claim type
+    /// that cannot follow `needs.disk`'s `mountPath`-stays-on-the-
+    /// Application precedent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jetstream: Option<ResourceClaimJetStream>,
+}
+
+/// The jetstream permission model's INPUT, carried on the claim itself
+/// (2.5d prerequisite / ADR 0061 §6 amendment). Mirrors
+/// `#ResourceClaimJetStream` in `schemas/v1alpha1/resourceclaim.cue` —
+/// see that type's own doc for the full reasoning. Short version: this
+/// is NOT a copy of the manifest kept for convenience and NOT app-side
+/// wiring like `#DiskClaim.mountPath` (which stays on the Application) —
+/// `dynamic_streams`/`streams`/`consume` are what
+/// `nats_accounts::allow_list`/`deny_vector` are COMPUTED FROM, so they
+/// have to reach the provisioner through the Kind it already watches.
+///
+/// Reuses [`JetStreamStream`]/[`JetStreamConsume`] from
+/// `crate::application` directly rather than duplicating them — same
+/// crate, no import boundary, and the CUE side makes the identical
+/// choice (`resourceclaim.cue` and `application.cue` are both `package
+/// v1alpha1`) for the same reason: a second, independent pair would
+/// have been exactly the drift `#ClaimFieldsFor` already has one
+/// instance of.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceClaimJetStream {
+    #[serde(default)]
+    pub dynamic_streams: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streams: Vec<JetStreamStream>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consume: Vec<JetStreamConsume>,
 }
 
 /// How much data a claim holds (2.22d / D8).
@@ -183,6 +220,7 @@ mod tests {
             selector: BTreeMap::from([("tier".to_string(), "integrated".to_string())]),
             size: None,
             persistent: None,
+            jetstream: None,
         };
         let v = serde_json::to_value(&spec).unwrap();
         assert_eq!(v.get("type"), Some(&json!("redis")));
@@ -280,5 +318,61 @@ mod tests {
         let c = &status.conditions.unwrap()[0];
         assert_eq!(c.type_, "Ready");
         assert_eq!(c.last_transition_time, "2026-06-02T00:00:00Z");
+    }
+
+    #[test]
+    fn jetstream_declarations_round_trip_unchanged() {
+        // 2.5d prerequisite (ADR 0061 §6 amendment): a claim carrying the
+        // jetstream sub-block must deserialise and re-serialise to the
+        // SAME JSON — the permission model reads this back verbatim, so
+        // a lossy round trip (a dropped field, a renamed key) would be a
+        // silently wrong allow list / deny vector, not a loud error.
+        let payload = json!({
+            "type": "jetstream",
+            "selector": { "tier": "integrated" },
+            "jetstream": {
+                "dynamicStreams": true,
+                "streams": [{
+                    "name": "orders",
+                    "subjects": ["shop.orders.>"],
+                    "storage": "file",
+                    "retention": "workqueue",
+                    "maxAge": "24h",
+                    "maxBytes": "1Gi",
+                    "allowPurge": true
+                }],
+                "consume": [{
+                    "from": "feeder",
+                    "stream": "blocks-head",
+                    "durable": "indexer"
+                }]
+            }
+        });
+        let spec: ResourceClaimSpec = serde_json::from_value(payload.clone()).expect("valid spec");
+        let js = spec
+            .jetstream
+            .as_ref()
+            .expect("jetstream sub-block present");
+        assert!(js.dynamic_streams);
+        assert_eq!(js.streams.len(), 1);
+        assert_eq!(js.streams[0].name, "orders");
+        assert_eq!(js.consume[0].from.as_deref(), Some("feeder"));
+        let round_tripped = serde_json::to_value(&spec).expect("serialises");
+        assert_eq!(round_tripped, payload, "must round-trip byte-for-byte");
+    }
+
+    #[test]
+    fn jetstream_is_absent_for_a_non_jetstream_claim() {
+        // The other half of the round-trip guard: a claim that never
+        // carried a jetstream block must not grow one, and must not
+        // serialise a stray `"jetstream": null`.
+        let spec: ResourceClaimSpec = serde_json::from_value(json!({
+            "type": "pg",
+            "selector": { "tier": "integrated" }
+        }))
+        .expect("valid spec");
+        assert!(spec.jetstream.is_none());
+        let v = serde_json::to_value(&spec).unwrap();
+        assert!(v.get("jetstream").is_none(), "{v:?}");
     }
 }

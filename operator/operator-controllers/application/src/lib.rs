@@ -34,8 +34,8 @@ use operator_core::{
     image_repo, resolve_egress_profile, Application, ApplicationBaseSpec, ApplicationCondition,
     ApplicationSpec, ApplicationStatus, ContainerRecommendation, DestructiveChange, DiskClaim,
     EgressProfile, EnvValue, Metrics, MigrationPlan, Needs, PlatformStack, PlatformStackValues,
-    RecommendedResources, ResourceClaim, ServiceProvider, SourceCredential, StatusImage,
-    COND_IMAGE_RESOLVED, COND_MIGRATION_PENDING, COND_PUBLIC_ROUTE_READY,
+    RecommendedResources, ResourceClaim, ResourceClaimJetStream, ServiceProvider, SourceCredential,
+    StatusImage, COND_IMAGE_RESOLVED, COND_MIGRATION_PENDING, COND_PUBLIC_ROUTE_READY,
     COND_RESOURCE_CLAIM_PENDING, PHASE_AWAITING_MIGRATION_APPROVAL, PHASE_AWAITING_RESOURCE_CLAIM,
     PHASE_ENV_SECRET_MISSING, PHASE_INVALID_EFFECTIVE_SPEC,
 };
@@ -3532,6 +3532,34 @@ fn generate_resource_claims(
         if let Some(persistent) = need.persistent {
             claim_spec["persistent"] = json!(persistent);
         }
+        // 2.5d prerequisite (ADR 0061 §6 amendment): the jetstream
+        // permission model's input rides ALONGSIDE the generic `need`
+        // projection, not through it — `JetStreamNeed::as_service_need()`
+        // stays exactly as it is (the generic selector/size/name
+        // projection only) and is NOT widened to carry these. `spec`
+        // here is already the EFFECTIVE per-environment spec (this
+        // function's own caller resolves it via `effective_spec` before
+        // calling in — see the call site), so `spec.needs.jetstream` is
+        // what THIS environment actually declares: an environment
+        // override replaces the WHOLE `needs.jetstream` slot (ADR 0061
+        // §6), so reading `spec.needs` here — not `app.spec.base.needs`
+        // — is what makes the claim carry the right environment's
+        // declarations rather than base's. Guarded on `service_type ==
+        // "jetstream"` so an app declaring BOTH `needs.pg` and
+        // `needs.jetstream` doesn't attach this onto the pg claim too —
+        // `spec.needs.jetstream` is a single field independent of which
+        // claim this loop iteration is currently building.
+        if service_type == "jetstream" {
+            if let Some(js) = spec.needs.as_ref().and_then(|n| n.jetstream.as_ref()) {
+                let view = ResourceClaimJetStream {
+                    dynamic_streams: js.dynamic_streams,
+                    streams: js.streams.clone(),
+                    consume: js.consume.clone(),
+                };
+                claim_spec["jetstream"] =
+                    serde_json::to_value(&view).expect("ResourceClaimJetStream always serializes");
+            }
+        }
         let payload = json!({
             "apiVersion": "apprafter.io/v1alpha1",
             "kind": "ResourceClaim",
@@ -5176,6 +5204,152 @@ mod tests {
     }
 
     #[test]
+    fn generate_resource_claims_puts_jetstream_declarations_only_on_the_jetstream_claim() {
+        // 2.5d prerequisite (ADR 0061 §6 amendment): the jetstream
+        // permission model's input rides ALONGSIDE the generic `need`
+        // projection (`JetStreamNeed::as_service_need()` stays exactly
+        // as it is — the generic selector/size/name projection only).
+        // An app declaring BOTH `needs.pg` and `needs.disk` alongside
+        // `needs.jetstream` must get the sub-block on ONLY the
+        // jetstream claim — never pg, never disk (disk takes a wholly
+        // separate code path in `generate_resource_claims` that can't
+        // reach the new code at all, but asserted explicitly rather
+        // than trusted).
+        use operator_core::{
+            DiskClaim, JetStreamConsume, JetStreamNeed, JetStreamStream, Needs, OneOrMany,
+        };
+
+        let spec = ApplicationBaseSpec {
+            image: Some("ghcr.io/acme/web:1.0".into()),
+            needs: Some(Needs {
+                pg: Some(OneOrMany::One(ServiceNeed::default())),
+                disk: Some(OneOrMany::One(DiskClaim {
+                    size: Some("1Gi".into()),
+                    mount_path: "/data".into(),
+                    ..Default::default()
+                })),
+                jetstream: Some(JetStreamNeed {
+                    dynamic_streams: true,
+                    streams: vec![JetStreamStream {
+                        name: "orders".into(),
+                        subjects: vec!["shop.orders.>".into()],
+                        max_bytes: "1Gi".into(),
+                        ..Default::default()
+                    }],
+                    consume: vec![JetStreamConsume {
+                        from: Some("feeder".into()),
+                        stream: "blocks-head".into(),
+                        durable: "indexer".into(),
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let payloads = generate_resource_claims(&spec, "web", "uid-1", "demo");
+        assert_eq!(payloads.len(), 3, "{payloads:?}");
+
+        let find = |suffix: &str| {
+            payloads
+                .iter()
+                .find(|(n, _)| n.ends_with(suffix))
+                .unwrap_or_else(|| panic!("no claim named *{suffix}: {payloads:?}"))
+                .1
+                .clone()
+        };
+
+        let pg_payload = find("-pg");
+        assert!(
+            pg_payload["spec"].get("jetstream").is_none(),
+            "pg claim must carry no jetstream block: {pg_payload:?}"
+        );
+        let disk_payload = find("-disk");
+        assert!(
+            disk_payload["spec"].get("jetstream").is_none(),
+            "disk claim must carry no jetstream block: {disk_payload:?}"
+        );
+
+        let js_payload = find("-jetstream");
+        let js_spec = &js_payload["spec"]["jetstream"];
+        assert_eq!(js_spec["dynamicStreams"], json!(true));
+        assert_eq!(js_spec["streams"][0]["name"], json!("orders"));
+        assert_eq!(js_spec["streams"][0]["subjects"], json!(["shop.orders.>"]));
+        assert_eq!(js_spec["consume"][0]["durable"], json!("indexer"));
+        assert_eq!(js_spec["consume"][0]["from"], json!("feeder"));
+    }
+
+    #[test]
+    fn generate_resource_claims_uses_the_effective_per_environment_jetstream_declarations() {
+        // ADR 0061 §6: an environment override replaces the WHOLE
+        // `needs.jetstream` slot — so a claim generated for a specific
+        // environment must carry THAT environment's streams, not
+        // base's. Runs the REAL `effective_spec` resolution (not a
+        // hand-simulated "effective" spec) so this exercises the exact
+        // pipeline `generate_resource_claims`'s own production caller
+        // runs (`&effective`, not `&app.spec.base`).
+        use operator_core::{ApplicationEnvOverride, JetStreamNeed, JetStreamStream, Needs};
+
+        let base_spec = ApplicationBaseSpec {
+            image: Some("ghcr.io/acme/web:1.0".into()),
+            needs: Some(Needs {
+                jetstream: Some(JetStreamNeed {
+                    streams: vec![JetStreamStream {
+                        name: "base-stream".into(),
+                        subjects: vec!["web.>".into()],
+                        max_bytes: "1Gi".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut environments = BTreeMap::new();
+        environments.insert(
+            "prod".to_string(),
+            ApplicationEnvOverride {
+                needs: Some(Needs {
+                    jetstream: Some(JetStreamNeed {
+                        streams: vec![JetStreamStream {
+                            name: "prod-stream".into(),
+                            subjects: vec!["web.>".into()],
+                            max_bytes: "2Gi".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let app = Application::new(
+            "web",
+            ApplicationSpec {
+                base: Some(base_spec),
+                environments: Some(environments),
+                environment: Some("prod".into()),
+            },
+        );
+        let effective =
+            effective_spec(&app, app.spec.environment.as_deref()).expect("valid effective spec");
+        let payloads = generate_resource_claims(&effective, "web", "uid-1", "demo");
+        assert_eq!(payloads.len(), 1, "{payloads:?}");
+        let (_, payload) = &payloads[0];
+        let streams = payload["spec"]["jetstream"]["streams"]
+            .as_array()
+            .expect("streams array present");
+        assert_eq!(streams.len(), 1);
+        assert_eq!(
+            streams[0]["name"],
+            json!("prod-stream"),
+            "must carry the ENVIRONMENT's declaration, not base's: {payload:?}"
+        );
+    }
+
+    #[test]
     fn generate_resource_claims_emits_one_claim_per_named_array_entry() {
         // 2.6b: a `needs.pg` array of two named entries → two claims
         // `app-pg-a` + `app-pg-b`, each carrying `spec.type=pg`,
@@ -5513,6 +5687,7 @@ mod tests {
                 selector: BTreeMap::from([("tier".to_string(), "integrated".to_string())]),
                 size: None,
                 persistent: None,
+                jetstream: None,
             },
         );
         c.metadata.namespace = Some("demo".into());
@@ -5559,6 +5734,7 @@ mod tests {
                 selector: BTreeMap::from([("tier".to_string(), "integrated".to_string())]),
                 size: Some("1Gi".into()),
                 persistent: None,
+                jetstream: None,
             },
         );
         c.metadata.namespace = Some("demo".into());
@@ -5689,6 +5865,7 @@ mod tests {
                 selector,
                 size: None,
                 persistent: None,
+                jetstream: None,
             },
         );
         c.metadata.namespace = Some("demo".into());
@@ -5834,6 +6011,7 @@ mod tests {
                 selector: BTreeMap::from([("tier".to_string(), "integrated".to_string())]),
                 size: Some("1Gi".into()),
                 persistent: None,
+                jetstream: None,
             },
         );
         c.metadata.namespace = Some("demo".into());
@@ -6007,6 +6185,7 @@ mod tests {
                 selector: BTreeMap::from([("tier".to_string(), "integrated".to_string())]),
                 size: None,
                 persistent: None,
+                jetstream: None,
             },
         );
         c.metadata.namespace = Some("demo".into());

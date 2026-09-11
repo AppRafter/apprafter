@@ -169,6 +169,7 @@ async fn scheduler_matches_claim_to_alphabetically_first_provider() {
             selector: BTreeMap::from([("tier".to_string(), "integrated".to_string())]),
             size: None,
             persistent: None,
+            jetstream: None,
         },
         status: None,
     };
@@ -216,6 +217,7 @@ async fn scheduler_matches_claim_to_alphabetically_first_provider() {
             selector: BTreeMap::from([("tier".to_string(), "nonexistent".to_string())]),
             size: None,
             persistent: None,
+            jetstream: None,
         },
         status: None,
     };

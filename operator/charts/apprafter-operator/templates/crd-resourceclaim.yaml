@@ -49,6 +49,60 @@ spec:
             type: object
           spec:
             properties:
+              jetstream:
+                properties:
+                  consume:
+                    items:
+                      properties:
+                        durable:
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                          type: string
+                        from:
+                          type: string
+                        stream:
+                          type: string
+                      required:
+                      - stream
+                      - durable
+                      type: object
+                    type: array
+                  dynamicStreams:
+                    type: boolean
+                  streams:
+                    items:
+                      properties:
+                        allowPurge:
+                          type: boolean
+                        maxAge:
+                          type: string
+                        maxBytes:
+                          type: string
+                        name:
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                          type: string
+                        retention:
+                          enum:
+                          - limits
+                          - interest
+                          - workqueue
+                          type: string
+                        storage:
+                          enum:
+                          - file
+                          - memory
+                          type: string
+                        subjects:
+                          items:
+                            type: string
+                          minItems: 1
+                          type: array
+                      required:
+                      - name
+                      - subjects
+                      - maxBytes
+                      type: object
+                    type: array
+                type: object
               name:
                 type: string
               persistent:
