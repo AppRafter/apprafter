@@ -53,7 +53,7 @@ post-launch work is not a roadmap phase and has no subscribe control.
 |---|---|---|---|
 | Shipped | ✅ | On-demand Postgres (`needs.pg`) | [Postgres](operator-guide/postgres.md) |
 | Shipped | ✅ | On-demand Redis-compatible cache (`needs.redis`) | [Redis](operator-guide/redis.md) |
-| Shipped | 🚧 | Message streams and durable consumers, declared in the manifest (`needs.jetstream`) | [JetStream](operator-guide/jetstream.md) |
+| Shipped | ✅ | Message streams and durable consumers, declared in the manifest (`needs.jetstream`) | [JetStream](operator-guide/jetstream.md) |
 | Shipped | ✅ | On-demand block storage (`needs.disk`) | [Persistent disks](operator-guide/persistent-disk.md) |
 | Shipped | ✅ | One volume shared between applications, with removal refused while it is referenced | [Shared volumes](operator-guide/shared-volumes.md) |
 | Shipped | ✅ | Back up and restore a whole cluster, or export one dependency's data | [Back up a cluster](operator-guide/backup-restore.md) |
@@ -66,17 +66,14 @@ post-launch work is not a roadmap phase and has no subscribe control.
 > A cache is ephemeral by declaration and stays out of a backup unless you mark it otherwise. What
 > each command captures, and what it does not, is on the backup page.
 
-> **JetStream is `🚧`, and what remains is verification rather than capability.** The account a
-> namespace shares, the streams and durable consumers declared beside the application, the storage
-> budget, the approval gates on the three edits that widen what an application can reach, and the
-> seven-day reclaim are all in force and exercised end to end on a cluster. The network rule is in
-> force too — a declaration opens the path to the message server the same way it opens one to a
-> database or a cache — and it is now proven on a cluster running Cilium: an application that
-> declares the need reaches the server, one that declares nothing is dropped, and an application
-> that declares a different backend gets no path to this one. One further signal — the warning
-> that an arriving application's subject prefix is already inside a neighbour's stream — has unit
-> coverage only and has never been observed on a live cluster.
-> JetStream stores are also out of scope for backup and restore.
+> A JetStream account belongs to the **namespace**, and applications inside it are separated by
+> subject permissions rather than by an account each — so the namespace is the trust boundary. An
+> application whose subject prefix is already collected by a neighbour's declared stream is told so
+> when it arrives; collecting a neighbour's subjects is a legitimate, approval-gated way to express
+> fan-in, so this is a warning rather than a refusal and the application starts normally.
+> A namespace's memory budget is reserved on the shared message server when its first application
+> arrives, and those reservations are not yet capped cluster-wide — roughly three JetStream
+> namespaces fit on a Solo node today. JetStream stores are out of scope for backup and restore.
 
 ---
 

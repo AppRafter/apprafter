@@ -63,6 +63,16 @@ patch of each phase.
   **before** any stream object is applied, naming the stream and the numbers
   instead of surfacing the server's opaque storage error through a controller.
 
+  All five are now observed on a live cluster. `PrefixPreCaptured` was the last
+  and is the awkward one to test, because it is a report rather than a fault:
+  the claim carrying it still reaches Ready, so "correctly silent" and "the
+  rules never ran" look identical from outside. The walk's sixteenth acceptance
+  check settles that by gating each of its two negative cases on the claim
+  having received an inventory write first — the inventory and the conditions
+  travel in one apply — and then by taking the neighbour's foreign subject back
+  off the declaration and watching the report clear on a claim that was
+  carrying it a moment earlier.
+
 - **Three new approval triggers** (ADR 0052 #14–#16), all `security-boundary`:
   `jetstream-consume-add` when a `consume` entry names another application,
   `jetstream-dynamic-streams-enable`, and `jetstream-foreign-subject` for a
@@ -116,7 +126,10 @@ this version was ever published.
   server pod. The walk could not have caught the original defect twice over: it
   runs without Cilium, and its message traffic comes from a debug pod that is
   not an application. Enforcement itself stays unproven there and is called out
-  at the check.
+  at the check — the Cilium walk carries that half instead, with a
+  `needs.jetstream` leg that probes the server by address from a declaring and
+  a non-declaring application and controls for a dead datapath in both
+  directions.
 
 - **A per-environment override that drops `streams`/`consume` is refused**, as
   ADR 0061 §6 promised and nothing implemented. An override replaces the whole
@@ -151,17 +164,24 @@ this version was ever published.
   Secret only. This is the one divergence of the four left open, and
   deliberately: the Secret is arguably where they belong, and it is recorded so
   the difference is not later read as a loss.
-- **Egress enforcement for jetstream has not been observed on a Cilium
-  cluster.** The rule is applied and its selector demonstrably matches the
-  running server, which is the whole failure surface reachable without a
-  datapath; that the packet is then forwarded is proven for Postgres on
-  `needs-networkpolicy-walk.sh` and not yet for this.
 - **The storage ceiling is per namespace, not per cluster.** Two namespaces
   sized near the ceiling can jointly promise more than the single shared volume
   holds; nothing refuses that today.
-- **JetStream stores are out of scope for backup and restore**, and
-  `PrefixPreCaptured` has unit coverage only — it has never been observed on a
-  live cluster.
+- **The memory ceiling has the sharper version of the same gap, and it is not
+  a promise that is merely over-sold — it takes an account offline.** Each
+  namespace's account reserves `max(file quota / 10, 64Mi)` of the server's
+  memory store, and nothing clamps the sum. Measured on the pinned server while
+  writing the walk's sixteenth check: once a reload overruns the ceiling the
+  server logs `insufficient memory resources available (10028)`, reports
+  `Reloaded server configuration` anyway, and carries on — existing accounts
+  keep working, and the account it could not enable is left **with no JetStream
+  at all** while its users still authenticate normally. The claim then sits
+  forever on "waiting for the server to reload the accounts file", which is the
+  one thing that did not go wrong. About three JetStream namespaces fit under
+  the shipped 192Mi. The chart already flagged the arithmetic as a follow-up
+  and predicted a cold-start crash; the reload path is quieter than that and
+  therefore worse.
+- **JetStream stores are out of scope for backup and restore.**
 
 ## platform-stack 0.2.68 / argocd-cue-cmp 0.1.24 — the sidecar pin follows its own image (unreleased)
 

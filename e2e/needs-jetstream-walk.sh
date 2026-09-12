@@ -87,6 +87,25 @@
 #       its labels. ENFORCEMENT remains unproven here; see the stand-in-CRD
 #       comment in Phase 1b for exactly where that line falls.
 #
+# The sixteenth is the last 2.5 signal that had never been seen outside a
+# unit test, and the only reason `docs/status.md` still read `🚧`:
+#
+#   16. an application ARRIVING into a namespace where a neighbour already
+#       declares a stream collecting its `<app>.` prefix is TOLD so, on its
+#       own claim, with the neighbour's composed stream named — and the
+#       claim still reaches Ready, because a gated fan-in declaration is a
+#       legitimate construct (ADR 0061 §6/§7). The platform is not refusing
+#       anything; it is refusing to let it be a surprise. Two negatives
+#       ride along (the declarer's OWN claim and an uninvolved third app),
+#       and because "the condition is correctly absent" and "the condition
+#       machinery never ran" look identical from outside, each negative is
+#       gated on that claim having received a `status.streams` write first
+#       — the inventory and the conditions travel in ONE server-side apply,
+#       so an `observedAt` is proof the rules ran and chose silence. The
+#       live MUTATION is what makes the negatives mean anything at all:
+#       the foreign subject is taken back off the declaration and the
+#       condition has to CLEAR.
+#
 # UNPUBLISHED-COMPONENT SUBSTITUTION — read this before touching the
 # script
 # -------------------------------------------------------------------
@@ -1309,7 +1328,7 @@ for _c in "$CLAIM3" "$CLAIM4" "$CLAIM5"; do
 done
 assert_nack_healthy "after the declaring claims (streams + consumers) were applied"
 
-phase "Part 3 + 2.5f + 2.5 part-4 + egress acceptance criteria — 15 checks, run independently (see this file's own note above)"
+phase "Part 3 + 2.5f + 2.5 part-4 + egress + prefix-pre-capture acceptance criteria — 16 checks, run independently (see this file's own note above)"
 
 PART3_FAILED=0
 record_part3() {
@@ -2008,11 +2027,323 @@ part3_check_15() {
 if part3_check_15; then record_part3 15 "the egress CNP carries a NATS rule on 4222 whose selector selects the running nats-0" 0
 else record_part3 15 "the per-application egress CiliumNetworkPolicy carries a nats-system rule on port 4222 whose pod selector, taken from the applied object, matches the live nats-0 (enforcement itself is out of reach without a cilium-agent — see Phase 1b)" 1; fi
 
+# --- #16: PrefixPreCaptured — an arriving application is told that its
+#          prefix is already inside a neighbour's declared stream ---
+#
+# The last 2.5 signal with unit coverage only. `prefix_pre_captured`
+# (`resourceclaim-provisioner/src/nats.rs`) is computed from DECLARATIONS,
+# never from observed streams — it is the one rule here that does not need a
+# stream to exist — but the pass that WRITES it does need a live account:
+# `jetstream_signals_for` returns `None` (and writes nothing at all) when the
+# `mgr_<ns>` Secret is unreadable or `STREAM.LIST` fails. So the condition is
+# available on the arriving claim's first reconcile *through the provisioner*,
+# and the cluster is what proves that hop — the unit tests exercise the rule
+# on either side of it.
+#
+# It is a REPORT, not a fault: a neighbour's fan-in stream is the sanctioned
+# exception to the hard `<app>.` publish prefix and is itself approval-gated
+# (ADR 0052 trigger #16). So the claim must reach Ready ALONGSIDE the
+# condition, and that is asserted rather than assumed — a regression that
+# turned this report into a gate would otherwise leave the walk green.
+#
+# IN `demo`, NOT in a namespace of its own — and the reason is a MEASURED
+# constraint of the shipped configuration, not a preference. Criterion #14
+# takes its own namespace because its app declares no needs and therefore
+# opens no account. This fixture opens one, and a fourth account does not fit:
+#
+#   * a namespace's account gets `max_mem = max(file_quota / 10, 64Mi)`
+#     (`account_max_mem_bytes` + `ACCOUNT_MAX_MEM_FLOOR_BYTES`), and
+#     `component_nats.cue` pins the server's `memoryStore.maxSize` at 192Mi,
+#     sized there for "roughly three namespaces each sitting at the 64Mi
+#     floor";
+#   * by the time this criterion runs, `demo` holds six claims at `small`
+#     (6 x 256Mi = 1.5Gi file => 153.6Mi of that 192Mi already reserved), so
+#     ANY new account — even one at the bare 64Mi floor — is 217.6Mi and
+#     overruns the server;
+#   * measured directly (podman, nats-server 2.14.3, the pinned image): a
+#     SIGHUP reload that overruns logs `Error enabling jetstream on
+#     configured accounts: insufficient memory resources available (10028)`
+#     and then reports `Reloaded server configuration` anyway. The server
+#     does NOT die and the existing accounts keep working — but the new
+#     account silently has no JetStream, its users still AUTHENTICATE, and
+#     `$JS.API.INFO` simply never answers. The provisioner's verify step
+#     then loops forever on `AwaitingNatsReady` ("the server may not have
+#     reloaded the accounts file yet"), which is the one thing that did not
+#     happen. The first draft of this criterion took its own namespace and
+#     hit exactly that; the diagnosis is recorded in plan.md's 2.5 open list
+#     because `component_nats.cue`'s own note predicts a cold-start FATAL and
+#     the reload path is quieter and worse than that.
+#
+# So the three fixture applications join `demo`'s existing account and are
+# sized `nano` (64Mi each) to keep it inside the ceiling: 6 x 256Mi + 3 x
+# 64Mi = 1.69Gi file => 172.8Mi < 192Mi, verified against a real nats-server
+# before this was written. Sharing the account costs nothing this criterion
+# needs — `prefix_pre_captured` is a rule about ONE namespace's declarations —
+# and it buys a harder test, because the rule now has to find `feeder` among
+# nine peers instead of among three.
+#
+# Nothing already asserted moves: every criterion above has run and recorded
+# by now, #13's quota verdict was taken against the six-claim budget it saw,
+# and 8Gi still does not fit in 1.69Gi.
+#
+# The fixture, and why each subject is where it is:
+#
+#   feeder     streams: [{inbox, subjects: ["feeder.own.>", "arrival.>"]}]
+#   arrival    needs.jetstream, declares nothing
+#   bystander  needs.jetstream, declares nothing
+#
+#   * `arrival.>` is what fires the condition on `arrival`. (`arrival`
+#     rather than the obvious `latecomer` because `demo` already holds a
+#     `latecomerapp` from criterion #8 — two similar names in one account
+#     would make this log hard to read, and `latecomerapp.` is a different
+#     prefix from `latecomer.` in a way that is easy to misread and easy to
+#     avoid.)
+#   * `feeder.own.>` is NOT decoration. It makes feeder's own stream touch
+#     feeder's own prefix, so feeder's negative actually exercises the
+#     `p.app != me.app` self-filter. Without it there would be nothing for
+#     that filter to remove and the negative would pass for the wrong reason.
+#   * `bystander` shares the namespace and the account and is named by
+#     nothing — not by feeder's declaration, not by `streamapp2.invoices.>`,
+#     not by `hogapp.huge.>` — which separates "fires for the right prefix"
+#     from "fires whenever any neighbour declares a stream".
+#
+# The admission webhook permits `arrival.>`: it rejects a bare `>` and the
+# reserved roots (`$JS.`, `$SYS.`, `_INBOX`) and nothing else, because fan-in
+# is a supported shape. And declaring a foreign subject AT CREATION is not
+# approval-gated — the ADR 0052 triggers diff against `status.lastAppliedSpec`,
+# which a brand-new Application does not have.
+PRE_NS="$APP_NS"     # the SHARED demo account — see the note above for why
+APP9="feeder"        # declares the fan-in stream
+APP10="arrival"      # arrives into a prefix feeder already collects
+APP11="bystander"    # arrives into a prefix nobody collects
+feeder_yaml() {
+    # $1 = the `inbox` stream's subject list, flow-style. The mutation below
+    # rewrites exactly this and nothing else, so the only thing that can
+    # explain the condition changing is the declaration changing.
+    cat <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${APP9}
+  namespace: ${PRE_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+    replicas: 1
+    expose:
+      port: 80
+    needs:
+      jetstream:
+        size: nano
+        selector:
+          tier: integrated
+        streams:
+          - name: inbox
+            subjects: ${1}
+            # Well inside what is left of this account's file budget
+            # (1.69Gi, of which streamapp2_invoices holds 256Mi and
+            # hogapp's 8Gi was refused outright by #13), so nothing here
+            # can be confused with the quota pre-flight.
+            maxBytes: "64Mi"
+YAML
+}
+plain_js_app_yaml() {
+    # $1 = app name. Declares the need and NOTHING else — no streams, no
+    # consume, no dynamicStreams. This is the ARRIVING-application shape,
+    # and it is what makes the fixture's point: the arriving side does
+    # nothing wrong and nothing unusual, and is still told.
+    cat <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${1}
+  namespace: ${PRE_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+    replicas: 1
+    expose:
+      port: 80
+    needs:
+      jetstream:
+        size: nano
+        selector:
+          tier: integrated
+YAML
+}
+# prefix_wait_observed <claim-name>
+#   Block until the claim has a `status.streams.observedAt`. The inventory
+#   and the jetstream conditions are written in ONE server-side apply
+#   (`jetstream_status_body`), so an `observedAt` is positive evidence that
+#   the rules ran against this claim — which is the whole difference between
+#   "PrefixPreCaptured is correctly absent" and "nothing ever looked".
+prefix_wait_observed() {
+    local claim="$1" deadline got
+    deadline=$(( $(date +%s) + 300 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        got=$(jp "$CLAIM_RES" "$PRE_NS" "$claim" '{.status.streams.observedAt}')
+        if [ -n "$got" ]; then
+            printf '    %s status.streams.observedAt = %s\n' "$claim" "$got"
+            return 0
+        fi
+        sleep 5
+    done
+    printf '    %s never received a status.streams write in 300s — the signals pass did not run for it, so any negative below would prove nothing. Claim status:\n%s\n' \
+        "$claim" "$(kubectl -n "$PRE_NS" get "$CLAIM_RES" "$claim" -o jsonpath='{.status}' 2>&1)"
+    return 1
+}
+
+# prefix_claim_diagnosis <claim-name>
+#   What a failing assertion in this criterion has to print. The first run
+#   of #16 printed only the condition TYPES on the claim and cost a whole
+#   20-minute walk to re-diagnose: the claim was not merely missing
+#   `PrefixPreCaptured`, it had never reached Ready at all, and the reason
+#   was on the Ready condition nobody printed. Everything a reader needs to
+#   tell "the rule declined" from "the claim never got that far" goes here.
+prefix_claim_diagnosis() {
+    local claim="$1"
+    printf '    --- %s ---\n' "$claim"
+    printf '      status.ready   = %q\n' "$(jp "$CLAIM_RES" "$PRE_NS" "$claim" '{.status.ready}')"
+    printf '      Ready  reason  = %q\n' "$(cond_reason "$CLAIM_RES" "$PRE_NS" "$claim" Ready)"
+    printf '      Ready  message = %s\n' "$(cond_message "$CLAIM_RES" "$PRE_NS" "$claim" Ready)"
+    printf '      condition types= %s\n' "$(jp "$CLAIM_RES" "$PRE_NS" "$claim" '{.status.conditions[*].type}')"
+    printf '      status.streams = %s\n' "$(jp "$CLAIM_RES" "$PRE_NS" "$claim" '{.status.streams}')"
+    printf '      spec.jetstream = %s\n' "$(jp "$CLAIM_RES" "$PRE_NS" "$claim" '{.spec.jetstream}')"
+}
+part3_check_16() {
+    local st reason msg capture feeder_st bystander_st plans deadline
+    # No namespace to create: this rides the demo account (see the note
+    # above), which has existed since Phase 4.
+
+    # feeder FIRST — and the wait is on its RESOURCECLAIM, not on its
+    # Application. `prefix_pre_captured` reads `peers`, which
+    # `jetstream_signals_for` builds by LISTING ResourceClaims and reading
+    # `spec.jetstream.streams` off each one, so the declaration becomes
+    # visible to a neighbour only once the Application controller has
+    # generated the claim. Waiting on the Application would let `arrival`
+    # reconcile against a namespace where feeder's declaration does not exist
+    # yet — and that flake reads GREEN on the two negatives, which is the
+    # worse direction to flake in.
+    feeder_yaml '["feeder.own.>", "arrival.>"]' | kubectl apply -f - >/dev/null || return 1
+    wait_jsonpath "$CLAIM_RES" "$PRE_NS" "${APP9}-jetstream" \
+        '{.spec.jetstream.streams[0].subjects[*]}' 'feeder.own.> arrival.>' 240 || return 1
+
+    plain_js_app_yaml "$APP10" | kubectl apply -f - >/dev/null || return 1
+    plain_js_app_yaml "$APP11" | kubectl apply -f - >/dev/null || return 1
+
+    deadline=$(( $(date +%s) + 300 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        st=$(cond_status "$CLAIM_RES" "$PRE_NS" "${APP10}-jetstream" PrefixPreCaptured)
+        [ "$st" = "True" ] && break
+        sleep 5
+    done
+    reason=$(cond_reason "$CLAIM_RES" "$PRE_NS" "${APP10}-jetstream" PrefixPreCaptured)
+    msg=$(cond_message "$CLAIM_RES" "$PRE_NS" "${APP10}-jetstream" PrefixPreCaptured)
+    printf '    arrival PrefixPreCaptured = %q reason = %q\n' "${st:-<unset>}" "${reason:-<unset>}"
+    printf '    arrival message: %s\n' "${msg:-<none>}"
+    if [ "$st" != "True" ]; then
+        prefix_claim_diagnosis "${APP10}-jetstream"
+        prefix_claim_diagnosis "${APP9}-jetstream"
+        return 1
+    fi
+    assert_eq "arrival PrefixPreCaptured reason" "$reason" "PrefixDeclaredElsewhere" || return 1
+    # The composed NATS-side name `<owner>_<name>`, not the declaration's
+    # `inbox` — the message has to name the object an operator would go and
+    # look at, and the composition is where an owner/name mix-up would show.
+    assert_contains "arrival PrefixPreCaptured message" "$msg" "feeder_inbox" || return 1
+    assert_contains "arrival PrefixPreCaptured message" "$msg" '"arrival."' || return 1
+
+    # A REPORT, not a fault. If this ever became a gate the two negatives
+    # would still pass and only this line would notice.
+    if ! wait_jsonpath "$CLAIM_RES" "$PRE_NS" "${APP10}-jetstream" '{.status.ready}' true 300; then
+        prefix_claim_diagnosis "${APP10}-jetstream"
+        return 1
+    fi
+    # And the neighbour's DECLARED stream is not a capture: `declared_ns`
+    # excludes it because somebody in the namespace vouches for it. The two
+    # conditions look at the same stream and must disagree about it.
+    capture=$(cond_status "$CLAIM_RES" "$PRE_NS" "${APP10}-jetstream" ForeignSubjectCapture)
+    printf '    arrival ForeignSubjectCapture = %q (a DECLARED fan-in is vouched for, never a capture)\n' \
+        "${capture:-<unset>}"
+    [ -z "$capture" ] || return 1
+
+    # --- the two negatives, each gated on evidence that the rules ran ---
+    prefix_wait_observed "${APP9}-jetstream" || { prefix_claim_diagnosis "${APP9}-jetstream"; return 1; }
+    prefix_wait_observed "${APP11}-jetstream" || { prefix_claim_diagnosis "${APP11}-jetstream"; return 1; }
+    feeder_st=$(cond_status "$CLAIM_RES" "$PRE_NS" "${APP9}-jetstream" PrefixPreCaptured)
+    bystander_st=$(cond_status "$CLAIM_RES" "$PRE_NS" "${APP11}-jetstream" PrefixPreCaptured)
+    printf '    feeder    (its own declaration, over its own prefix too) PrefixPreCaptured = %q\n' \
+        "${feeder_st:-<unset>}"
+    printf '    bystander (nothing names its prefix)                     PrefixPreCaptured = %q\n' \
+        "${bystander_st:-<unset>}"
+    [ -z "$feeder_st" ] || return 1
+    [ -z "$bystander_st" ] || return 1
+
+    # --- the mutation: take the foreign subject back off ---
+    #
+    # Absence is not a measurement. The two negatives above are worth
+    # something only if this condition can be made to STOP on a claim that
+    # was carrying it a moment ago — and after this edit `arrival` is in
+    # exactly `bystander`'s position (a neighbour declares a stream that does
+    # not touch its prefix), observed as a TRANSITION rather than as a
+    # never-was.
+    #
+    # `feeder.own.>` stays, so the stream keeps a subject (the webhook
+    # refuses an empty list) and feeder's own self-filter stays exercised.
+    #
+    # This edit is NOT approval-gated, and that is a property of the
+    # classifier rather than luck: trigger #16 arm 1 fires on a foreign
+    # subject ADDED (`added_foreign` in `migration/src/strategy.rs`), and
+    # taking one away is a narrowing. Asserted below anyway — if a removal
+    # arm were ever added, the app would pause, the claim would never lose
+    # the subject, and this would otherwise surface as an opaque timeout.
+    feeder_yaml '["feeder.own.>"]' | kubectl apply -f - >/dev/null || return 1
+    # Scoped to feeder by label, the way criterion #14 finds its own plan:
+    # this namespace is shared, so an unlabelled listing would report a
+    # neighbour's plan as feeder's.
+    if ! wait_jsonpath "$CLAIM_RES" "$PRE_NS" "${APP9}-jetstream" \
+        '{.spec.jetstream.streams[0].subjects[*]}' 'feeder.own.>' 240; then
+        printf '    feeder-jetstream never lost the foreign subject. MigrationPlans labelled for %s: %s\n' \
+            "$APP9" "$(kubectl -n "$PRE_NS" get migrationplan.apprafter.io -l "apprafter.io/application=${APP9}" -o name 2>/dev/null | tr '\n' ' ')"
+        printf '    feeder Application phase=%q — if it is AwaitingMigrationApproval the classifier gained a removal arm and this criterion needs criterion #14'"'"'s approve/revert pattern\n' \
+            "$(jp "$APP_RES" "$PRE_NS" "$APP9" '{.status.phase}')"
+        return 1
+    fi
+    plans=$(kubectl -n "$PRE_NS" get migrationplan.apprafter.io -l "apprafter.io/application=${APP9}" -o name 2>/dev/null | tr '\n' ' ')
+    printf '    MigrationPlans for %s after the narrowing: %s\n' "$APP9" "${plans:-<none>}"
+    [ -z "${plans// /}" ] || return 1
+
+    deadline=$(( $(date +%s) + 300 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        st=$(cond_status "$CLAIM_RES" "$PRE_NS" "${APP10}-jetstream" PrefixPreCaptured)
+        [ -z "$st" ] && break
+        sleep 5
+    done
+    printf '    after the narrowing: arrival PrefixPreCaptured = %q, status.ready = %q\n' \
+        "${st:-<unset>}" "$(jp "$CLAIM_RES" "$PRE_NS" "${APP10}-jetstream" '{.status.ready}')"
+    if [ -n "$st" ]; then
+        printf '    the condition did not clear — message still: %s\n' \
+            "$(cond_message "$CLAIM_RES" "$PRE_NS" "${APP10}-jetstream" PrefixPreCaptured)"
+        printf '    feeder claim subjects now: %s\n' \
+            "$(jp "$CLAIM_RES" "$PRE_NS" "${APP9}-jetstream" '{.spec.jetstream.streams[0].subjects[*]}')"
+        return 1
+    fi
+    # Ready THROUGHOUT, not merely at the end: the report was never a gate
+    # and clearing it was never a repair.
+    [ "$(jp "$CLAIM_RES" "$PRE_NS" "${APP10}-jetstream" '{.status.ready}')" = "true" ]
+}
+if part3_check_16; then record_part3 16 "an arriving application is told its prefix is already inside a neighbour's declared stream, reaches Ready anyway, and the report clears when the declaration narrows" 0
+else record_part3 16 "PrefixPreCaptured names the neighbour's composed stream on the ARRIVING claim (reason PrefixDeclaredElsewhere) while that claim still reaches Ready, does not fire on the declarer itself or on an uninvolved third application in the same account — each negative gated on a status.streams write proving the rules ran — and CLEARS once the foreign subject is taken back off the declaration" 1; fi
+
 phase "Part 3 acceptance criteria summary"
 if [ "$PART3_FAILED" -gt 0 ]; then
-    printf '  %d of 15 acceptance criteria are RED. Part 3 (NACK CR application), 2.5f (inventory/detector/conditions), 2.5 part 4 (the migration triggers) and the 2.5 egress rule have all landed, so each one is a real defect — not an expected gap.\n' "$PART3_FAILED"
+    printf '  %d of 16 acceptance criteria are RED. Part 3 (NACK CR application), 2.5f (inventory/detector/conditions), 2.5 part 4 (the migration triggers), the 2.5 egress rule and the prefix-pre-capture report have all landed, so each one is a real defect — not an expected gap.\n' "$PART3_FAILED"
 else
-    printf '  ok: all 15 acceptance criteria are GREEN.\n'
+    printf '  ok: all 16 acceptance criteria are GREEN.\n'
 fi
 
 # ===============================================================
@@ -2036,8 +2367,8 @@ printf '  ok: no "forbidden" anywhere in the operator log across the whole walk\
 # ===============================================================
 
 if [ "$PART3_FAILED" -gt 0 ]; then
-    phase "needs-jetstream-walk: part 2 GREEN, acceptance RED (${PART3_FAILED}/15) (elapsed $(elapsed))"
-    printf 'FINAL: ACCEPTANCE-RED (%d/15) — every part-2 capability above stayed green; see the summary above for which of the fifteen criteria are unmet and why.\n' \
+    phase "needs-jetstream-walk: part 2 GREEN, acceptance RED (${PART3_FAILED}/16) (elapsed $(elapsed))"
+    printf 'FINAL: ACCEPTANCE-RED (%d/16) — every part-2 capability above stayed green; see the summary above for which of the sixteen criteria are unmet and why.\n' \
         "$PART3_FAILED"
     exit 1
 fi
