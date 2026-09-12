@@ -258,25 +258,29 @@ Application deletion, not on a manifest edit.
 
 ## Limits in force today
 
-Three properties of this design are not yet delivered, and each is something a
+Two properties of this design are not yet delivered, and each is something a
 reader would otherwise assume from the pages around it.
 
-- **A declared dependency carries no egress rule for the message server.** A
-  declaration normally also opens the path to the thing declared
-  ([Egress policy](egress-policy.md)) — a `needs.pg` application is allowed
-  through to Postgres, a `needs.redis` one to the cache. `needs.jetstream` is
-  given credentials and no route, so on a cluster running the default network
-  profile an application's own pod is refused the connection its claim was
-  given. The guide says so where a reader meets it.
 - **A per-environment override replaces the whole `needs.jetstream` block**, as
   it does for every other dependency
   ([Per-environment deploy](per-environment-deploy.md)). For jetstream that is
   sharper than elsewhere, because the block holds the stream and consumer
-  contract as well as the size: an override setting one field drops the rest.
+  contract as well as the size: an override setting one field would drop the
+  rest. The replacement is still how the merge works — what changed is that it
+  is no longer silent. An override that omits `streams` or `consume` while
+  `base` declares them is refused at admission, and the message names the
+  streams and the consumers that were about to be lost. Repeat them in the
+  override to keep them; write `streams: []` to say the environment
+  deliberately has none.
 - **The storage ceiling is per namespace, not per cluster.** Two namespaces each
   sized near the ceiling can jointly promise more than the single shared volume
   behind them holds. Nothing refuses that today; it surfaces as an allocation
   failure in whichever tenant asks last.
+
+One thing a reader might expect to find in this list is not in it: the network
+path. `needs.jetstream` adds an allow to `nats-system` on 4222, the same way
+`needs.pg` and `needs.redis` open their own paths
+([Egress policy](egress-policy.md)).
 
 ## For contributors
 
@@ -291,5 +295,15 @@ application's streams are reclaimed while its neighbour's are not.
 Two things about that walk are worth knowing before trusting a green run. It
 substitutes a hand-applied render of the NATS charts for the Argo CD sync of a
 component that is not published yet, and it says so at the substitution's own
-call site. And it runs without Cilium, which is why the egress gap named above
-could not have turned it red.
+call site. And it runs without Cilium — which is exactly why the missing egress
+rule stayed invisible for as long as it did: nothing on that cluster enforces a
+network policy, and the walk's own message traffic comes from a debug pod that
+is not an application and carries no policy at all.
+
+The walk now checks what it can from that position: it reads the policy the
+operator applied for a `needs.jetstream` application, takes the selector out of
+the rule for the message server, and asks the cluster whether those labels
+select the running server pod. That catches a missing rule and a rule that
+matches nothing — the whole failure surface reachable without a datapath.
+Whether the packet is then forwarded is proven on the Cilium walk
+(`e2e/needs-networkpolicy-walk.sh`), which covers Postgres today.

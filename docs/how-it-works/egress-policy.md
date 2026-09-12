@@ -29,8 +29,16 @@ Its rules come from two places:
   same-namespace traffic, and the external internet (`toEntities: [world]`).
 - **One rule per declared network need**, always emitted whatever the profile
   says. `needs.pg` adds an allow to `cnpg-system` on 5432; `needs.redis` adds
-  one to `dragonfly-system` on 6379. `needs.disk` adds nothing — a mounted
-  volume has no network target.
+  one to `dragonfly-system` on 6379; `needs.jetstream` adds one to
+  `nats-system` on 4222. `needs.disk` adds nothing — a mounted volume has no
+  network target.
+
+  A need with no rule is not a need with weaker networking: the policy selects
+  the application's pods either way, and selection is what makes them
+  default-deny on egress. So a declared dependency that were to arrive without
+  its rule would leave the application locked out of the very backend it
+  declared — which is what happened to `needs.jetstream` before the rule above
+  existed.
 
 | Profile | Baseline allows | Meaning |
 | --- | --- | --- |

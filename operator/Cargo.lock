@@ -1899,6 +1899,7 @@ version = "0.1.2"
 dependencies = [
  "k8s-openapi",
  "operator-core",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

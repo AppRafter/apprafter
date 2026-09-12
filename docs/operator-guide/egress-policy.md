@@ -6,9 +6,9 @@ description: "The cluster-wide egress posture: what declaring a dependency opens
 
 An application may reach an in-cluster backend only when it has **declared**
 that dependency. `needs.pg` is what opens the path to Postgres; `needs.redis`
-is what opens the path to Redis. Everything else in-cluster — another
-namespace's database, an undeclared service — is denied at the network
-datapath, not by convention.
+is what opens the path to Redis; `needs.jetstream` is what opens the path to
+the message server. Everything else in-cluster — another namespace's database,
+an undeclared service — is denied at the network datapath, not by convention.
 
 There is one knob, cluster-wide: how much the *baseline* allows on top of that.
 
@@ -90,7 +90,7 @@ deliberately not covered by the shipped slice.
 
 | Symptom | Likely cause | Fix |
 | ------- | ------------ | --- |
-| An application cannot reach an in-cluster service it used to reach | the dependency is not declared, and the baseline no longer covers it | Declare it (`needs.pg`, `needs.redis`) — that is what opens the path. Check what the app's own policy allows: `kubectl -n <ns> get ciliumnetworkpolicy <app>-egress -o jsonpath='{.spec.egress}'`. |
+| An application cannot reach an in-cluster service it used to reach | the dependency is not declared, and the baseline no longer covers it | Declare it (`needs.pg`, `needs.redis`, `needs.jetstream`) — that is what opens the path. Check what the app's own policy allows: `kubectl -n <ns> get ciliumnetworkpolicy <app>-egress -o jsonpath='{.spec.egress}'`. |
 | An application cannot reach the internet | the profile is `internal` or `strict` | `apprafter platform egress show`; set `internet` if outbound access is intended. |
 | Two applications in one namespace cannot reach each other | the profile is `strict`, which drops the same-namespace baseline | Either declare the dependency, or move to `internal`. |
 | A connection times out and it is unclear whether policy or the service is at fault | both look identical from inside the pod | Ask the datapath: `hubble observe --pod <ns>/<app> --to-namespace <target-ns> --verdict DROPPED`. A `DROPPED` verdict is the policy; no flow at all is usually DNS or a missing listener. |

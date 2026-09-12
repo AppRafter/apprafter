@@ -181,14 +181,48 @@ pub const CLAIMS: &[Claim] = &[
         anchor: "\"jetstream\" =>",
         truth: Expect::Absent,
         because: "ADR 0061 §1 says the NATS server's coordinates land in the \
-                  needs-derived egress policy, and they do not: \
-                  `default_target` has no jetstream arm, so a `needs.jetstream` \
-                  application gets a default-deny egress policy with nothing \
-                  allowing it through to nats-system. The jetstream guide and \
-                  its mechanism page both say so, and both must retract the \
-                  sentence the day the arm lands. Nothing else would notice: \
-                  the walk runs without Cilium, so the policy is never applied \
-                  there at all.",
+                  needs-derived egress policy, and for one release they did \
+                  not: `default_target` had no jetstream arm, so a \
+                  `needs.jetstream` application got a default-deny egress \
+                  policy with nothing allowing it through to nats-system. The \
+                  arm has since landed (nats-system:4222, selecting \
+                  app.kubernetes.io/{name,component}=nats), and THIS ENTRY IS \
+                  WHAT FORCED THE RETRACTION — the guide and its mechanism \
+                  page both carried the sentence, and this check failed the \
+                  day the arm appeared. It stays to catch the reverse: delete \
+                  the arm and the pages would quietly become right again \
+                  about a cluster that had quietly become broken. Nothing \
+                  else would notice — the jetstream walk runs without Cilium, \
+                  so no policy is ever enforced there.",
+        holds_today: false,
+    },
+    Claim {
+        phrase: "refused at admission",
+        evidence: "operator/admission-webhook/src/validator.rs",
+        // The function that does the refusing, not the message it emits —
+        // the message is prose and will be reworded; the behaviour is what
+        // the sentence is about. (The `prune_orphaned_claims` entry above
+        // records what anchoring on the permitting rule instead cost.)
+        //
+        // The PHRASE is short for a mechanical reason worth knowing before
+        // adding the next entry: matching is a plain `contains` over the
+        // page source, so a phrase that a page line-wraps can never match.
+        // The longer, more distinctive candidate here ("the message names
+        // the streams and the consumers") is split across two lines in
+        // `how-it-works/needs-jetstream.md` and would have watched only one
+        // of the two pages while looking like it watched both.
+        anchor: "fn validate_jetstream_env_overrides",
+        truth: Expect::Present,
+        because: "ADR 0061 §6 promised this refusal and nothing implemented \
+                  it for a release: an environment override that omitted \
+                  `streams`/`consume` dropped the whole producer/consumer \
+                  contract for that environment in silence, because the \
+                  per-env merge replaces a `needs.<type>` slot wholesale. \
+                  The jetstream guide now shows the rejection and quotes the \
+                  message. Delete the check and that section becomes an \
+                  instruction to expect an error that never comes — which is \
+                  worse than the original gap, because a reader would trust \
+                  the manifest that silently dropped their streams.",
         holds_today: true,
     },
 ];

@@ -15,15 +15,11 @@ application in one namespace shares it, and they are kept apart by the subjects
 each is allowed to publish and subscribe to. Put applications that must not
 reach each other's messages in different namespaces.
 
-> **One thing does not work yet, and it is the step after this guide.** A
-> declaration normally also opens the network path to the thing declared — that
-> is what [Egress policy](egress-policy.md) does for Postgres and for the cache.
-> A `needs.jetstream` declaration carries **no egress rule for the message
-> server**, so on a cluster running the default network profile the
-> application's own pod is refused the connection its claim was given, while
-> everything below still reports success. Everything this page describes is in
-> force; the last hop is not. It is named again under
-> [Troubleshooting](#troubleshooting).
+> **Declaring the dependency also opens the network path to it**, the same way
+> it does for Postgres and for the cache — on a cluster running Cilium, a
+> `needs.jetstream` application is allowed through to the message server on
+> port 4222, and to nothing in-cluster it has not declared. See
+> [Egress policy](egress-policy.md).
 
 ## Prerequisites
 
@@ -319,10 +315,23 @@ For jetstream that is sharper than elsewhere, because the block holds your
 stream and consumer contract as well as the size:
 
 ```cue
-environments: prod: needs: jetstream: { size: "large" }   // drops streams AND consume
+environments: prod: needs: jetstream: { size: "large" }   // refused: drops streams AND consume
 ```
 
-Repeat the whole block in the override, or leave the size alone.
+That edit is **refused at admission**, not applied quietly. The message names
+the streams and the consumers the override was about to drop:
+
+```text
+prod: needs.jetstream omits "streams" while base declares 2 of them
+("orders", "events") — a per-environment override REPLACES the whole
+needs.jetstream block, so this environment would lose them entirely.
+Repeat them here, or write "streams: []" to state that this environment
+deliberately has none.
+```
+
+So there are three ways forward, and each says what you mean: repeat the whole
+block in the override, leave the size alone, or write `streams: []` /
+`consume: []` when the environment really is meant to have none.
 
 ## Remove the dependency
 
@@ -389,14 +398,14 @@ derived, and the reclaim after the grace window.
 
 | Symptom | Likely cause | Fix |
 | ------- | ------------ | --- |
-| The application connects and gets its credentials, but every operation times out from inside the pod | the network path to the message server is not opened by the declaration — see the note at the top of this page | There is no supported fix on the platform side yet. [Report it](https://github.com/apprafter/apprafter/issues) if it is blocking you, so it is counted. |
+| The application connects and gets its credentials, but every operation times out from inside the pod | on a Cilium cluster, the egress rule for the message server is missing from the application's policy | Read it back: `kubectl get ciliumnetworkpolicy <application>-egress -n <namespace> -o yaml` should carry a rule for namespace `nats-system` on port 4222. If it does not, the operator is older than the release that added it — see [Egress policy](egress-policy.md). |
 | A client times out after about ten seconds on operations that turn out to have happened anyway | the inbox prefix is not set | Set it from `claim.jetstream.inboxPrefix`, and check what already exists before retrying — a retry is what creates duplicates. See *Set the inbox prefix* above. |
 | The application stays at `AwaitingResourceClaim` and the claim never gets a provider | the `needs.jetstream.selector` matches no provider | Confirm the selector reads `tier=integrated`: `kubectl get serviceprovider jetstream-integrated -n apprafter-system -o yaml`. |
 | The claim stays unready with `AwaitingStreamCreation` | a declared stream has not been created yet, or could not be | Give it a few cycles, then read the claim's `Ready` condition message — it names the object that is not live. |
 | The claim stays unready with `QuotaExceeded` | the namespace's declared streams add up to more than the account may hold | The message names the stream and the numbers. Lower a `maxBytes`, raise a `size`, or move the application to its own namespace. |
 | The manifest is rejected on sync | `persistent` or `name` on the jetstream need, a stream without `maxBytes` or without subjects, a name that is not a DNS-1123 label, or a durable whose name collides with one of your own streams | Each is refused by name in the error. `persistent` does not apply here — durability is a property of each stream's `storage`, not of the claim. |
 | The application's env-vars are empty or missing | the manifest declares `needs.jetstream` but binds nothing — nothing is injected automatically | Add the bindings, as above. |
-| One environment lost its streams and consumers after an override | an environment override replaces the whole `needs.jetstream` block | Repeat the block in the override. See *Per-environment overrides* above. |
+| An override is rejected for omitting `streams` or `consume` | an environment override replaces the whole `needs.jetstream` block, and the omission would drop what `base` declares | Repeat the block in the override, or write `streams: []` / `consume: []` if the environment is meant to have none. See *Per-environment overrides* above. |
 | A stream the platform reports as unattributed appeared under your prefix | a neighbour holding `dynamicStreams` created it — this cannot be prevented, only reported | Find out which application in the namespace holds the flag and why it was approved. The platform does not delete the stream. |
 | Message metadata (sequence numbers, delivery counts) is wrong but messages arrive | the client library reads the older acknowledgement format | Use a client that handles the current form — see *Match your client* above. |
 

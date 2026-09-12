@@ -18,3 +18,11 @@ k8s-openapi   = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
 thiserror     = { workspace = true }
+
+# Test-only. `egress.rs`'s need-type census reads the key set off `Needs`'s
+# own derived JSON schema instead of hand-copying it, so a newly added need
+# type cannot slip past the "has a connection target, or is declared
+# target-less" gate. operator-core already derives `JsonSchema` on every CRD
+# type; this only gives the test a way to read it back.
+[dev-dependencies]
+schemars = { workspace = true }

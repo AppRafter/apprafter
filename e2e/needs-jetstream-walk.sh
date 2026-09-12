@@ -71,6 +71,22 @@
 #       what only a cluster shows is that the edit actually STOPS, with the
 #       plan's approval hash stamped and no claim generated meanwhile.
 #
+# And the fifteenth covers the one hop the other fourteen cannot see,
+# because a documentation pass found it after they were all green:
+#
+#   15. the per-application egress CiliumNetworkPolicy carries a rule for
+#       nats-system:4222, and the selector in that rule — read back off the
+#       APPLIED object, not typed in here — selects the running nats-0.
+#       `default_target` shipped with arms for pg and redis and a catch-all
+#       `_ => None`, so `needs.jetstream` got no rule while the CNP still
+#       made the app's pods egress default-deny: working credentials, no
+#       route. Neither of the two reasons this walk missed it has been
+#       removed (it still runs without a cilium-agent, and its NATS traffic
+#       still comes from nats-box, which is not an Application) — #15 works
+#       around both by reading the object and asking the apiserver to match
+#       its labels. ENFORCEMENT remains unproven here; see the stand-in-CRD
+#       comment in Phase 1b for exactly where that line falls.
+#
 # UNPUBLISHED-COMPONENT SUBSTITUTION — read this before touching the
 # script
 # -------------------------------------------------------------------
@@ -494,6 +510,65 @@ bootstrap_with_retry
 printf '  cluster-bootstrap complete\n'
 
 phase "Phase 1b: build + load local operator + webhook, apply branch CRDs + RBAC"
+
+# ---------------------------------------------------------------
+# A STAND-IN CiliumNetworkPolicy CRD — applied BEFORE the operator
+# restarts, because the operator probes for this CRD exactly once, at
+# leadership acquisition (`cilium_available` in apprafter-operator's
+# main.rs), and skips the egress-CNP apply for the rest of its life when
+# the probe comes back false.
+#
+# WHAT THIS BUYS, precisely: the operator renders and APPLIES the
+# per-Application egress CNP, so acceptance #15 can read the NATS rule
+# the shipped renderer actually produced out of the cluster and match its
+# selector against the labels on the live nats-0. Without the CRD there is
+# no object to read and the rule can only be inspected by reading the
+# source, which is what let the missing `jetstream` arm in
+# `default_target` ship in the first place.
+#
+# WHAT IT DOES NOT BUY, and nothing here should be read as claiming it:
+# ENFORCEMENT. There is no cilium-agent on this cluster (bootstrap runs
+# with APPRAFTER_BOOTSTRAP_SKIP_CILIUM=1 — see lib.sh on why Cilium's
+# datapath is not viable on the k3d/kindnet substrate these walks use), so
+# nothing ever evaluates this policy. A CNP here is an inert object. The
+# schema is `x-kubernetes-preserve-unknown-fields` rather than Cilium's
+# own, so it does not validate the policy either — it only stores it.
+# Proving that a `needs.jetstream` pod's traffic is FORWARDED while an
+# undeclared pod's is DROPPED needs Hubble verdicts on a real Cilium
+# cluster, which is `e2e/needs-networkpolicy-walk.sh`'s job (kind_up_cilium
+# + bootstrap_with_cilium); that walk covers pg today and extending it to
+# jetstream means standing NATS up inside it.
+#
+# So #15 closes the two failure modes reachable without a datapath — "no
+# rule at all" and "a rule whose selector matches nothing" — which between
+# them are the whole of what went wrong here. It does not close "the rule
+# exists, matches, and Cilium still drops the packet".
+printf '  applying a stand-in CiliumNetworkPolicy CRD (storage only, no agent — see this block'"'"'s comment) ...\n'
+kubectl apply -f - <<'YAML'
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: ciliumnetworkpolicies.cilium.io
+spec:
+  group: cilium.io
+  names:
+    kind: CiliumNetworkPolicy
+    listKind: CiliumNetworkPolicyList
+    plural: ciliumnetworkpolicies
+    singular: ciliumnetworkpolicy
+    shortNames: [cnp]
+  scope: Namespaced
+  versions:
+    - name: v2
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+YAML
+retry 12 5 -- kubectl wait --for=condition=Established crd/ciliumnetworkpolicies.cilium.io --timeout=30s
+printf '  stand-in CNP CRD Established (the operator probes for it at startup, which is next)\n'
 
 build_load_restart apprafter-operator apprafter-operator
 build_load_restart admission-webhook admission-webhook
@@ -1234,7 +1309,7 @@ for _c in "$CLAIM3" "$CLAIM4" "$CLAIM5"; do
 done
 assert_nack_healthy "after the declaring claims (streams + consumers) were applied"
 
-phase "Part 3 + 2.5f + 2.5 part-4 acceptance criteria — 14 checks, run independently (see this file's own note above)"
+phase "Part 3 + 2.5f + 2.5 part-4 + egress acceptance criteria — 15 checks, run independently (see this file's own note above)"
 
 PART3_FAILED=0
 record_part3() {
@@ -1852,11 +1927,92 @@ part3_check_14() {
 if part3_check_14; then record_part3 14 "enabling needs.jetstream.dynamicStreams pauses the application behind a security-boundary MigrationPlan, generates no claim while it waits, and reverting clears the gate" 0
 else record_part3 14 "flipping needs.jetstream.dynamicStreams to true creates a MigrationPlan with trigger jetstream-dynamic-streams-enable (ADR 0052 #15), pauses the Application before any child is applied, and taking the flag back off supersedes the plan instead of re-gating" 1; fi
 
+# --- #15: the egress CNP's NATS rule selects the RUNNING nats-0 ---
+#
+# The defect this exists for: `default_target` (operator-rendering's egress
+# builder) had arms for pg and redis and a catch-all `_ => None`, so
+# `needs.jetstream` produced NO egress rule — while the CNP still selected
+# the app's pods, which is what makes them egress default-deny. The app was
+# handed working NATS credentials for a server its own pod could not open a
+# socket to.
+#
+# Nothing in this walk could see it. It runs without a cilium-agent, so no
+# policy is ever enforced; and every byte of NATS traffic the walk sends
+# comes from the nats-box debug pod, which is not an Application and carries
+# no CNP of its own. Two independent reasons — which is why this check is
+# built on neither. It reads the rule the operator APPLIED and asks the
+# apiserver, with the rule's own labels, whether they select the running
+# server. That catches "no rule at all" and "a rule whose selector matches
+# nothing", including the version-bound-label trap (selecting on
+# `app.kubernetes.io/version` or `helm.sh/chart` would pass the day it is
+# written and silently stop matching at the next chart bump).
+#
+# NOT proven here, deliberately and by construction: that Cilium then
+# FORWARDS the packet. See the stand-in-CRD comment in Phase 1b.
+part3_check_15() {
+    local cnp rule port sel matched
+    cnp=$(kubectl -n "$APP_NS" get ciliumnetworkpolicy "${APP1}-egress" -o json 2>&1) || {
+        printf '    no CiliumNetworkPolicy %s/%s-egress — the operator applied none. If the log says "Cilium not detected", the stand-in CRD (Phase 1b) did not land before the operator acquired leadership: %s\n' \
+            "$APP_NS" "$APP1" "$cnp"
+        return 1
+    }
+
+    rule=$(printf '%s' "$cnp" | jq -c --arg ns "$NATS_NS" \
+        '.spec.egress[] | select(.toEndpoints[0].matchLabels["io.kubernetes.pod.namespace"] == $ns)')
+    if [ -z "$rule" ]; then
+        printf '    the CNP carries NO egress rule for namespace %s. This is the original defect: the app is egress default-deny with no path to NATS. Rules present:\n%s\n' \
+            "$NATS_NS" "$(printf '%s' "$cnp" | jq -c '.spec.egress')"
+        return 1
+    fi
+    printf '    NATS egress rule as applied: %s\n' "$rule"
+
+    port=$(printf '%s' "$rule" | jq -r '.toPorts[0].ports[0].port')
+    assert_eq "NATS egress rule port" "$port" "4222" || return 1
+
+    # Turn the rule's OWN matchLabels (minus the namespace pseudo-label,
+    # which is Cilium's and not a pod label) into a label selector and hand
+    # it back to the apiserver. Deriving it from the applied object rather
+    # than repeating it here is the point: a selector typed into this script
+    # would prove only that two copies of the same guess agree.
+    sel=$(printf '%s' "$rule" | jq -r '
+        .toEndpoints[0].matchLabels
+        | to_entries
+        | map(select(.key != "io.kubernetes.pod.namespace"))
+        | map("\(.key)=\(.value)")
+        | join(",")')
+    if [ -z "$sel" ]; then
+        printf '    the rule carries no pod labels at all — it would select every pod in %s\n' "$NATS_NS"
+        return 1
+    fi
+    printf '    selector derived from the applied rule: %s\n' "$sel"
+
+    matched=$(kubectl -n "$NATS_NS" get pods -l "$sel" -o jsonpath='{.items[*].metadata.name}' 2>&1) || {
+        printf '    kubectl rejected the derived selector: %s\n' "$matched"
+        return 1
+    }
+    printf '    pods in %s matching it: %s\n' "$NATS_NS" "${matched:-<none>}"
+    printf '    live labels on %s-0: %s\n' "$NATS_STS" \
+        "$(kubectl -n "$NATS_NS" get pod "${NATS_STS}-0" -o jsonpath='{.metadata.labels}' 2>/dev/null)"
+
+    # Must select the running server itself, by name — "matched something"
+    # is not enough when nats-box and the chart's test pod also live here
+    # and share `app.kubernetes.io/name: nats`.
+    case " $matched " in
+        *" ${NATS_STS}-0 "*) return 0 ;;
+        *)
+            printf '    the rule does NOT select %s-0. The CNP renders, and drops every packet to NATS.\n' "$NATS_STS"
+            return 1
+            ;;
+    esac
+}
+if part3_check_15; then record_part3 15 "the egress CNP carries a NATS rule on 4222 whose selector selects the running nats-0" 0
+else record_part3 15 "the per-application egress CiliumNetworkPolicy carries a nats-system rule on port 4222 whose pod selector, taken from the applied object, matches the live nats-0 (enforcement itself is out of reach without a cilium-agent — see Phase 1b)" 1; fi
+
 phase "Part 3 acceptance criteria summary"
 if [ "$PART3_FAILED" -gt 0 ]; then
-    printf '  %d of 14 acceptance criteria are RED. Part 3 (NACK CR application), 2.5f (inventory/detector/conditions) and 2.5 part 4 (the migration triggers) have all landed, so each one is a real defect — not an expected gap.\n' "$PART3_FAILED"
+    printf '  %d of 15 acceptance criteria are RED. Part 3 (NACK CR application), 2.5f (inventory/detector/conditions), 2.5 part 4 (the migration triggers) and the 2.5 egress rule have all landed, so each one is a real defect — not an expected gap.\n' "$PART3_FAILED"
 else
-    printf '  ok: all 14 acceptance criteria are GREEN.\n'
+    printf '  ok: all 15 acceptance criteria are GREEN.\n'
 fi
 
 # ===============================================================
@@ -1880,8 +2036,8 @@ printf '  ok: no "forbidden" anywhere in the operator log across the whole walk\
 # ===============================================================
 
 if [ "$PART3_FAILED" -gt 0 ]; then
-    phase "needs-jetstream-walk: part 2 GREEN, acceptance RED (${PART3_FAILED}/14) (elapsed $(elapsed))"
-    printf 'FINAL: ACCEPTANCE-RED (%d/14) — every part-2 capability above stayed green; see the summary above for which of the fourteen criteria are unmet and why.\n' \
+    phase "needs-jetstream-walk: part 2 GREEN, acceptance RED (${PART3_FAILED}/15) (elapsed $(elapsed))"
+    printf 'FINAL: ACCEPTANCE-RED (%d/15) — every part-2 capability above stayed green; see the summary above for which of the fifteen criteria are unmet and why.\n' \
         "$PART3_FAILED"
     exit 1
 fi
