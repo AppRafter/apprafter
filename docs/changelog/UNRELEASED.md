@@ -87,19 +87,75 @@ patch of each phase.
   gating that makes `consume` safe existed: a guide may not present a dependency
   as usable while adding a neighbour's stream to it is an un-gated edit.
 
+### Fixed
+
+Three of the four ADR-vs-tree divergences the documentation pass recorded, all
+found by writing the public pages rather than by any gate, and all closed before
+this version was ever published.
+
+- **`needs.jetstream` now opens the network path to the message server.** The
+  connection-target catalog (`default_target`, ADR 0045 §B) had arms for `pg`
+  and `redis` and a catch-all that returned nothing, so a `needs.jetstream`
+  application got a per-application egress policy that selected its pods —
+  making them default-deny — and then allowed nothing through to
+  `nats-system`. It held working credentials for a server it could not open a
+  socket to, on every network profile. The arm is `nats-system:4222`, selecting
+  `app.kubernetes.io/name=nats` + `app.kubernetes.io/component=nats`: the two
+  labels the upstream chart stamps that are not bound to a chart version, read
+  off a live `nats-0` rather than off the chart's documentation, because a
+  selector that renders and matches nothing fails exactly like the missing arm
+  did.
+
+  **Two gates now cover the class, not the instance.** A census test
+  enumerates every `needs.*` key from the `Needs` type's own schema and fails
+  unless each either resolves to a target or is named, with a reason, in an
+  explicit target-less list — so the next need type cannot be added without
+  answering the question. And the jetstream walk gained a fifteenth acceptance
+  check that reads the policy the operator applied, takes the selector out of
+  the NATS rule, and asks the apiserver whether those labels select the running
+  server pod. The walk could not have caught the original defect twice over: it
+  runs without Cilium, and its message traffic comes from a debug pod that is
+  not an application. Enforcement itself stays unproven there and is called out
+  at the check.
+
+- **A per-environment override that drops `streams`/`consume` is refused**, as
+  ADR 0061 §6 promised and nothing implemented. An override replaces the whole
+  `needs.<type>` slot, so `environments.prod.needs.jetstream: {size: small}`
+  used to discard the entire producer/consumer contract for that environment
+  silently. The message names the streams and the consumers that were about to
+  be lost. Key presence is what is checked, not emptiness: an explicit
+  `streams: []` is accepted and is the way to say an environment deliberately
+  has none, which under wholesale replacement is otherwise inexpressible.
+
+- **`apprafter app status` fills in the backing-resource column for a jetstream
+  claim.** It printed `—`. A jetstream claim names no instance and no volume,
+  but the provisioner already records the streams it observed on the server in
+  `status.streams`, so the column now answers its own question — "what actually
+  got created" — from the claim, counting declared and dynamic streams and
+  calling out how many are dynamic. `unattributed` streams are excluded: those
+  are a capture to report, not capacity. A consume-only claim reads `no
+  streams`, which is a measured answer where `—` would have erased the
+  difference. (`pg` still reads `—`, and that is honest: CNPG writes neither an
+  instance nor a volume reference, so nothing on the claim names it. Filling it
+  needs a provisioner-side status write.)
+
 ### Known limits
 
-- **A `needs.jetstream` declaration carries no egress rule for the message
-  server.** A declaration normally opens the path to the thing declared, and a
-  `needs.pg` application is let through to Postgres — but the connection-target
-  catalog has no jetstream entry, so an application is handed working
-  credentials for a server its own pod is refused a connection to on every
-  network profile. Both new pages say so where a reader meets it, and a watched
-  behaviour claim will force the sentence to be retracted the day the entry
-  lands.
 - **A per-environment override replaces the whole `needs.jetstream` block**, as
   it does for every other dependency — which is sharper here, because the block
-  holds the stream and consumer contract as well as the size.
+  holds the stream and consumer contract as well as the size. The replacement
+  is unchanged; what changed is that dropping a declared block is now refused
+  rather than silent (above). The deep merge is 2.16i.
+- **`status.account` / `subjectPrefix` / `inboxPrefix` are not written to the
+  claim**, though ADR 0061 §8 names them. The values live in the connection
+  Secret only. This is the one divergence of the four left open, and
+  deliberately: the Secret is arguably where they belong, and it is recorded so
+  the difference is not later read as a loss.
+- **Egress enforcement for jetstream has not been observed on a Cilium
+  cluster.** The rule is applied and its selector demonstrably matches the
+  running server, which is the whole failure surface reachable without a
+  datapath; that the packet is then forwarded is proven for Postgres on
+  `needs-networkpolicy-walk.sh` and not yet for this.
 - **The storage ceiling is per namespace, not per cluster.** Two namespaces
   sized near the ceiling can jointly promise more than the single shared volume
   holds; nothing refuses that today.
