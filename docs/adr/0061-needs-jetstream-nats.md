@@ -481,25 +481,62 @@ provisioner concludes "not ready" — forever, on every claim.
 
 A stream whose subjects touch `<app>.` is legitimate **iff** it is a declared
 stream of *some* application in the namespace, or a dynamic stream of an
-application whose subjects lie wholly under that application's own prefix.
-Anything else was created by someone who should not have created it. Defining
-legitimacy as "the victim's own declared streams" would have the detector flag a
-neighbour's approved fan-in stream (§6) and, at the `delete` step, have the
-platform destroy a live gated stream.
+application **that holds `dynamicStreams: true`** whose subjects lie wholly under
+that application's own prefix. Anything else was created by someone who should
+not have created it. Defining legitimacy as "the victim's own declared streams"
+would have the detector flag a neighbour's approved fan-in stream (§6) and, at
+the `delete` step, have the platform destroy a live gated stream.
+
+**The `dynamicStreams` clause in the second arm was added 2026-09-11 (2.5f
+implementation) and is not a tightening — it is what makes this section's own
+promise true.** Without it the rule reads "wholly under *some* application's
+prefix," and a stream sitting wholly under the prefix of an application that has
+no `$JS.API.STREAM.CREATE` at all is then accepted as presumptively that
+application's. It cannot be: §3 grants the four mutating stream verbs *only*
+under the flag, so an opted-out application provably did not create it, and the
+stream is either NACK's (covered by the first arm) or a capture. The clause is
+therefore exactly what §3 already claims the flag buys — that it "makes §5's
+capture detection **exact** for every opted-out application" — and the rule
+without it would have let precisely the targeted capture through unseen. Its one
+consequence is the residue case §4.1 already names: flipping the flag from `true`
+to `false` leaves that application's own old dynamic streams reported as
+captures, which is what "§5's `delete` step is what handles residue" means.
 
 Detection runs on the provisioner resync that already lists the account's
-streams. Policy ladder, `report` being the default: `report` (a
+streams. In practice that is the **60-second gate for a ready claim**, not the
+provisioning path: a ready claim never provisions again, so a detector living
+only there would look exactly once — at the moment a claim goes live, before
+there is anything to find. Policy ladder, `report` being the default and the
+value the `jetstream-integrated` seed sets as `config.capturePolicy`: `report` (a
 `ForeignSubjectCapture` condition plus an event), `delete` (remove the offending
 stream; exposure bounded by the resync interval), and `quarantine` (revoke the
 culprit's `STREAM.CREATE`/`UPDATE`) — which needs **attribution** and is
 therefore not promised until a live `$JS.EVENT.ADVISORY.API` subscription is
 verified to identify the requesting user. NATS records no creator on a stream;
-`StreamConfig.metadata` is client-supplied and unenforceable.
+`StreamConfig.metadata` is client-supplied and unenforceable. `quarantine` is
+consequently absent from the implementation's policy enum entirely rather than
+present-and-inert: a name in an enum is a promise, and a config asking for it
+falls back to `report` with a warning.
+
+A **subject-less** stream — a `mirror`, or one built from `sources`, i.e. §4.1's
+read vector — is never flagged. It does not touch `<app>.` by any reading, and
+the `delete` rung acts on the detector's output, so flagging a stream the rule
+has no evidence about would turn a detector into a data-loss primitive. The
+inventory still lists it as `unattributed` (§7), which is the whole difference
+between reporting and acting.
 
 **For an application holding `dynamicStreams: true` there is neither prevention
 nor detection inside the namespace** — its own dynamic streams are
 indistinguishable from a capture without attribution. The gate on turning the
 flag on is the whole control.
+
+**`NamespaceDrainRisk` is narrowed to a neighbour's flag, not any flag.** It
+fires when an application **other than the workqueue stream's own owner** holds
+`dynamicStreams: true`; an application that declares a workqueue and also creates
+streams at will is not a risk to itself, and the un-narrowed rule fires on that
+completely ordinary shape forever. It is surfaced on both parties — the owner,
+who is at risk, and the flag holder, who is the risk — since neither learns it
+from the other otherwise.
 
 ### 6. The user-facing contract
 
@@ -727,6 +764,51 @@ exist before" state — so "clear the account on creation" would fire when the
 **second** application in a namespace arrives. The clear is therefore predicated on
 the same live-claim set: clear only when the namespace has no other ALLOCATED claim
 and no `RetainedClaim`.
+
+### 9. The observed-stream inventory (`status.streams`)
+
+Each resync writes what the provisioner **observed** in the account onto the
+claim: `declared` (this application's own declared streams, seen live), `dynamic`
+(undeclared streams whose subjects lie wholly under `<app>.`), `unattributed`
+(streams touching `<app>.` that no declaration in the namespace accounts for,
+plus subject-less ones) and `observedAt`.
+
+Added to this record 2026-09-11 during 2.5f, because the surface existed in the
+implementation brief and in §8's GC prose but nowhere as a contract. It earns its
+own subsection rather than a line in §8: three consumers depend on it being the
+single mechanism, and each would otherwise grow its own.
+
+- **MigrationPlan enumeration.** The Application controller holds no NATS client,
+  so the claim's status is the only place it can learn what streams exist.
+- **`apprafter app status`**, through the generic `status.size.bytes` path — the
+  bytes this claim's own streams hold. `unattributed` bytes are deliberately
+  excluded: they belong to nobody this code can name, and charging them to
+  whichever claim shares a prefix would make one tenant's figure move when
+  another's stream grew.
+- **The `QuotaExceeded` pre-flight** (§6), which needs to know what an
+  already-existing, undeclared stream has reserved — a figure no declaration
+  carries.
+
+The lists are over the OBSERVED set, never the declared one. A declared stream
+that does not exist yet appears in none of them; that is the
+`AwaitingStreamCreation` gate's job, and a claim whose stream NACK never created
+must not read as though it had one.
+
+**A declared stream is never `unattributed`, including when a *different*
+application in the namespace declared it.** This is the same sentence as §5's
+first legitimacy arm and it is stated twice on purpose: the narrow reading —
+"declared by the claim being reported on" — puts a neighbour's approved fan-in
+stream (§6) into the victim's `unattributed` list, and §8's GC consults exactly
+this classification. The narrow reading therefore ends with the platform
+reporting, and at §5's `delete` rung destroying, a live gated stream.
+
+Written under a **dedicated SSA field manager**, with the conditions of §5/§6/§7.
+`status.conditions` is a list-type map keyed by `type`, so two managers writing
+conditions is well-defined — each owns its own entries. One manager would not
+be: the inventory refreshes on the 60s resync while `ready` /
+`connectionSecretRef` are written by the provisioning path, so every "waiting for
+the StatefulSet" write would erase a live `ForeignSubjectCapture` and every
+inventory refresh would prune `ready`.
 
 ## Scope
 

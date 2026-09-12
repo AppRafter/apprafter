@@ -620,7 +620,7 @@ fn declared_by_composed_name(peers: &[ClaimView]) -> BTreeMap<String, (&str, &St
 }
 
 /// What the provisioner OBSERVED in this application's account, as
-/// `ResourceClaim.status.streams` (ADR 0061 §7).
+/// `ResourceClaim.status.streams` (ADR 0061 §9).
 ///
 /// Three disjoint lists over the OBSERVED set, never over the declared
 /// one: a declared stream that does not exist yet appears in none of them
@@ -648,7 +648,7 @@ pub struct StreamInventory {
     pub observed_at: String,
 }
 
-/// Classify `observed` from `me`'s point of view (ADR 0061 §7).
+/// Classify `observed` from `me`'s point of view (ADR 0061 §9).
 ///
 /// `peers` is every jetstream claim in the namespace **including `me`** —
 /// the same whole-namespace input `render_accounts_file` takes, for the
@@ -2059,7 +2059,7 @@ mod tests {
 
     const NOW: &str = "2026-09-12T00:00:00+00:00";
 
-    // --- Task 5: the status inventory (ADR 0061 §7) -------------------
+    // --- Task 5: the status inventory (ADR 0061 §9) -------------------
 
     #[test]
     fn inventory_splits_declared_dynamic_and_unattributed() {

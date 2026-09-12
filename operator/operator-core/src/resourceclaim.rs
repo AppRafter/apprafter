@@ -177,12 +177,12 @@ pub struct ResourceClaimStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<ClaimSize>,
     /// What the provisioner OBSERVED in this claim's NATS account on its
-    /// last resync (2.5f / ADR 0061 §7). `jetstream` claims only.
+    /// last resync (2.5f / ADR 0061 §9). `jetstream` claims only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub streams: Option<ClaimStreamInventory>,
 }
 
-/// The observed stream inventory for a `jetstream` claim (ADR 0061 §7).
+/// The observed stream inventory for a `jetstream` claim (ADR 0061 §9).
 ///
 /// Three consumers, and this is the ONLY mechanism serving all three:
 /// MigrationPlan enumeration (the Application controller holds no NATS

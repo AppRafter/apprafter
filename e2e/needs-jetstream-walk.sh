@@ -1490,7 +1490,7 @@ else record_part3 8 "a second application arriving does NOT clear the first's st
 
 # ===============================================================
 # 2.5f acceptance criteria (#9-#13) — the observed-stream inventory
-# (ADR 0061 §7), the foreign-subject capture detector (§5) and the
+# (ADR 0061 §9), the foreign-subject capture detector (§5) and the
 # conditions (§5/§6/§7).
 #
 # These run AFTER #1-#8 on purpose. #6 deletes streamapp and #7 tears
@@ -1532,7 +1532,7 @@ part3_check_9() {
     [ -n "$bytes" ] && [ "$bytes" -ge 1 ]
 }
 if part3_check_9; then record_part3 9 "status.streams classifies observed streams (declared/dynamic) and status.size.bytes is real" 0
-else record_part3 9 "the status inventory (ADR 0061 §7) lists walkstream as walkapp's DYNAMIC stream, streamapp2_invoices as streamapp2's DECLARED one, and carries a live observedAt + size" 1; fi
+else record_part3 9 "the status inventory (ADR 0061 §9) lists walkstream as walkapp's DYNAMIC stream, streamapp2_invoices as streamapp2's DECLARED one, and carries a live observedAt + size" 1; fi
 
 # --- #10: a foreign-subject capture is detected on the VICTIM's claim ---
 # walkapp holds `dynamicStreams: true`, so it may create a stream — and
