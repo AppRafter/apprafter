@@ -2297,7 +2297,12 @@ fn jetstream_status_body(name: &str, signals: &nats::JetStreamSignals) -> Value 
 ///
 /// The event rides the same deadband as the write, so a standing capture
 /// is announced when it appears and when it changes — not once a minute
-/// forever.
+/// forever. The consequence, stated rather than engineered around: a
+/// publish that FAILS is not retried, because the next pass finds the
+/// content unchanged and writes nothing. The condition is the durable
+/// signal and the event is the notification — losing the notification
+/// costs a `kubectl describe`, and a retry ledger for it would be more
+/// machinery than the thing it protects.
 async fn write_jetstream_status(
     ctx: &Arc<Context>,
     claim: &ResourceClaim,

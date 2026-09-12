@@ -897,9 +897,32 @@ neg_out=$(nats_run --server "$CONN1_SERVER" --user "$CONN1_USER" --password "$CO
 NEG_T1=$(date +%s%N)
 NEG_MS=$(( (NEG_T1 - NEG_T0) / 1000000 ))
 
-assert_not_contains "stream add without inbox prefix must NOT succeed" "$neg_out" "was created"
-printf '  ok: the missing-inbox-prefix attempt failed as expected, in %d ms\n' "$NEG_MS"
+assert_not_contains "the CLIENT cannot confirm the stream add without an inbox prefix" "$neg_out" "was created"
+printf '  ok: the missing-inbox-prefix attempt failed FROM THE CLIENT'"'"'S SIDE as expected, in %d ms\n' "$NEG_MS"
 printf '  observed failure text: %s\n' "$neg_out"
+
+# MEASURED 2026-09-12, and it corrects what this phase used to imply.
+#
+# The client'"'"'s failure above is an ACKNOWLEDGEMENT failure, not an
+# authorization one. What NATS denies is the REPLY inbox subscription; the
+# request published alongside it is processed normally, so the stream IS
+# created. Queried here as mgr_demo — the identity that can see the account
+# for real rather than through the failing client.
+#
+# 2.5f'"'"'s inventory is what surfaced this: walkapp'"'"'s `status.streams`
+# listed `negstream` as a live dynamic stream long after this phase had
+# reported a failure. Asserted here so the fact is a guard rather than a
+# footnote, and so a later reader does not take "expect failure" to mean
+# "expect refusal" — it is a silent SUCCESS reported to the caller as a
+# timeout, which is worse than either, because the natural response is to
+# retry and the retry is what creates duplicates.
+if mgr_nats_run "$APP_NS" stream info negstream --json >/dev/null 2>&1; then
+    printf '  FINDING (measured): negstream EXISTS in NATS despite the client reporting failure — the missing inbox prefix costs the ACK, not the write.\n'
+else
+    printf 'ERROR: negstream does NOT exist, but this phase measured that it does (2026-09-12): the denied inbox costs only the reply, never the write. Either the client now aborts on the permissions violation before publishing, or the server refuses the create — both change what this phase proves, so re-derive the measurement rather than deleting this assertion.\n' >&2
+    exit 1
+fi
+
 if [ "$NEG_MS" -gt 3000 ]; then
     printf '  FINDING: %d ms is well past what a human would wait before assuming a hang — the NOPERM-delivers-no-error-signal property (nats_client.rs'"'"'s own doc) is a real UX cost here, not just an internal implementation note. The failure text names no permission problem.\n' \
         "$NEG_MS"

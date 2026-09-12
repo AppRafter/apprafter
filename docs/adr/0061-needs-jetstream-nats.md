@@ -906,9 +906,24 @@ construction; introducing one later is a change to §3, not a values tweak.
 - **Ephemeral and dynamically created consumers are unprotected.** Their names are
   unknowable, so (D) cannot name them. *Accepted*, alongside the dynamic stream
   layer.
-- **`_INBOX` isolation depends on the client.** An application that does not set
-  `CustomInboxPrefix` cannot connect at all — a loud failure, which is the right
-  direction, but it is friction the guide must pre-empt.
+- **`_INBOX` isolation depends on the client, and the failure is far quieter
+  than this record first claimed.** The original wording — "cannot connect at
+  all — a loud failure, which is the right direction" — was wrong on both
+  halves, and the 2.5f walk measured it (2026-09-12). Such a client connects
+  fine; what it loses is every REPLY. A `stream add` from a client using the
+  default inbox prefix returned `context deadline exceeded` after **10.2
+  seconds**, and the stream was **created anyway** — it appeared in the owning
+  claim's `status.streams` afterwards, which is how this was found at all. The
+  denied subscription is the reply inbox; the request published alongside it is
+  processed normally. So it is neither loud nor a refusal: it is a **silent
+  success reported to the caller as a timeout**, which is worse than either,
+  because the natural response is to retry and the retry is what creates
+  duplicates. *Mitigation:* `inboxPrefix` ships in the connection Secret, the
+  guide must state it as a connection REQUIREMENT rather than a tuning knob,
+  and §9's inventory is what makes an unobserved mutation visible after the
+  fact. The walk asserts the measurement in both directions, so a client or
+  server that starts refusing the write turns it red rather than silently
+  making this paragraph obsolete.
 - ~~**The reloader may not watch the included file.**~~ **Closed by measurement**
   (§1): the chart composes `config.merge`'s `$include`, `podTemplate.patch` and
   `container.patch`, and mirrors the mount into the reloader through

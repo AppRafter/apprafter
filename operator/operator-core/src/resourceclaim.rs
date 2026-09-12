@@ -93,7 +93,11 @@ pub struct ResourceClaimJetStream {
 /// shared shard threads and mix tenants respectively.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub struct ClaimSize {
-    /// On-disk bytes. Postgres only.
+    /// On-disk bytes. Postgres and, since 2.5f, jetstream — for a
+    /// jetstream claim it is the bytes this application's own streams
+    /// hold, which is a real on-disk figure under the default
+    /// `storage: file`. `apprafter app status` reads this generically
+    /// (`/status/size/bytes`), so no CLI change was needed to render it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<i64>,
     /// Key count. Redis only — NOT bytes, and the CLI must say so.
