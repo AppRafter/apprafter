@@ -418,10 +418,11 @@ _mkFields: {
 	// every workqueue in it (ADR 0061 §4.1) — ADR 0061 §6 CLASSIFIES
 	// flipping this from false/absent to true as ADR 0052 trigger #15
 	// (`jetstream-dynamic-streams-enable`), a security-boundary change,
-	// not a convenience. That classification is NOT yet wired into any
-	// detector — nothing in the operator inspects a `needs.jetstream`
-	// diff today, so until that lands this change ships with no
-	// approval gate at all, silently.
+	// not a convenience. The Application controller's classifier detects
+	// it (`ApplicationMigrationStrategy::detect_all` in
+	// operator-controllers/migration), so enabling the flag now pauses the
+	// application behind a MigrationPlan until a human approves it.
+	// Turning it back off is a narrowing and stays soft.
 	dynamicStreams?: bool | *false
 
 	streams?: [...#JetStreamStream]
@@ -469,8 +470,10 @@ _mkFields: {
 	// Subjects the stream collects. A subject whose FIRST TOKEN is not the
 	// owning application's name is fan-in — ADR 0061 §6 CLASSIFIES that as
 	// ADR 0052 trigger #16 (`jetstream-foreign-subject`), same as
-	// `allowPurge` below, but (same caveat as `dynamicStreams` above) no
-	// detector inspects a subjects diff yet, so today it fires nothing.
+	// `allowPurge` below. The classifier detects it (same detector as
+	// `dynamicStreams` above), so ADDING such a subject pauses the
+	// application for approval; a subject already declared is not
+	// re-gated, and an own-prefix subject never gates.
 	//
 	// Non-empty — enforced on BOTH paths, and they must agree: the CRD
 	// `minItems: 1` (`schemas/crdmeta/meta.cue`'s
@@ -498,8 +501,10 @@ _mkFields: {
 	maxBytes: string
 	// Re-grant PURGE on this stream only. Name-scoped, so it can reach only
 	// the declaring application's own data — unless the stream is fan-in,
-	// which is also classified under trigger #16 above (not yet detected
-	// either).
+	// in which case setting it is trigger #16 too and pauses for approval
+	// (on a stream carrying only this application's own subjects it is
+	// destructive-to-self, which ADR 0051's axis governs, and takes no
+	// security trigger).
 	allowPurge?: bool | *false
 }
 
@@ -508,7 +513,13 @@ _mkFields: {
 // exactly the named stream, via the durable name; nothing else.
 #JetStreamConsume: {
 	// Application in the same namespace that declares `stream`. Omit for
-	// the declaring application's own stream.
+	// the declaring application's own stream. Naming ANOTHER application
+	// shares that stream between the two — stream-level permission denials
+	// key on the stream — so ADR 0052 trigger #14
+	// (`jetstream-consume-add`) pauses the first such entry per
+	// `(from, stream)` pair for approval. An own-stream consume, and a
+	// second durable on a stream already consumed, widen nothing and do
+	// not gate.
 	from?:  string
 	stream: string
 	// A DNS-1123 label — same rule, same reason, and the same

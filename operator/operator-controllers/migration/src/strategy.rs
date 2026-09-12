@@ -36,10 +36,10 @@ use tracing::info;
 use operator_core::migration::{change_hash, classification_severity};
 use operator_core::{
     image_repo, Application, ApplicationBaseSpec, DestructiveChange, EnvRef, EnvValue,
-    MigrationApplicationRef, MigrationApplicationScope, MigrationChange, MigrationError,
-    MigrationPlan, MigrationPlanScope, MigrationPlanSpec, MigrationSourceCredentialRef,
-    MigrationSourceCredentialScope, MigrationStep, MigrationStrategy, MigrationTrigger, Needs,
-    SourceCredentialSpec, StepOutcome,
+    JetStreamNeed, JetStreamStream, MigrationApplicationRef, MigrationApplicationScope,
+    MigrationChange, MigrationError, MigrationPlan, MigrationPlanScope, MigrationPlanSpec,
+    MigrationSourceCredentialRef, MigrationSourceCredentialScope, MigrationStep, MigrationStrategy,
+    MigrationTrigger, Needs, SourceCredentialSpec, StepOutcome,
 };
 
 /// Render-time default for `Application.spec.*.replicas` (application.cue:
@@ -114,11 +114,15 @@ impl ApplicationMigrationStrategy {
     /// need the headline (`spec.trigger`). The MigrationPlan-creation +
     /// consume paths use `detect_all` directly so the approval content hash
     /// and `spec.changes[]` rollup cover EVERY candidate (2.16b S1.2 / S-4).
+    ///
+    /// `app_name` is the Application's `metadata.name` — see
+    /// [`detect_all`](Self::detect_all) for why the classifier needs it.
     pub fn detect_destructive(
         old: &ApplicationBaseSpec,
         new: &ApplicationBaseSpec,
+        app_name: &str,
     ) -> Option<DestructiveChange> {
-        pick_primary(Self::detect_all(old, new))
+        pick_primary(Self::detect_all(old, new, app_name))
     }
 
     /// 2.16b S1.2: EVERY destructive candidate the `old` → `new` edit
@@ -131,9 +135,22 @@ impl ApplicationMigrationStrategy {
     /// complete blast radius (`spec.changes[]`) AND the approval hash binds
     /// the whole candidate set (a lower-severity op can't ride along
     /// unhashed — S-4 gap close).
+    ///
+    /// `app_name` is the Application's `metadata.name`. It is a THIRD pure
+    /// input (the fn stays deterministic and cluster-free, ADR 0051), needed
+    /// by the 2.5 jetstream triggers #14/#16: "another application" and
+    /// "foreign subject" are both defined RELATIVE to the declaring
+    /// application's own name — a subject's first token is this application's
+    /// own partition exactly when it equals `app_name`
+    /// (`ClaimView::subject_prefix()` composes `<app>.`), and a
+    /// `consume[].from` naming this same application is its own stream. It is
+    /// a required parameter rather than an `Option` on purpose: an empty name
+    /// makes EVERY subject and EVERY `from` foreign (over-gate, never
+    /// under-gate), and the compiler forces each call site to state it.
     pub fn detect_all(
         old: &ApplicationBaseSpec,
         new: &ApplicationBaseSpec,
+        app_name: &str,
     ) -> Vec<DestructiveChange> {
         let mut candidates: Vec<DestructiveChange> = Vec::new();
 
@@ -509,6 +526,170 @@ impl ApplicationMigrationStrategy {
             }
         }
 
+        // 2.5 part 4 (#14/#15/#16): `needs.jetstream` security-boundary
+        // triggers (ADR 0061 §7, table in ADR 0052 §2). All three fire on an
+        // ADDITION / ESCALATION over the effective spec and all PAUSE for
+        // approval; none is a webhook reject.
+        //
+        // Why these three are on the SECURITY axis and not the availability
+        // one: none of them destroys the declaring application's own data —
+        // each widens what that application can reach over its NAMESPACE
+        // NEIGHBOURS, and the neighbour is the party who bears the cost.
+        // Removing `needs.jetstream` outright stays the ADR 0051
+        // `needs-removal` data-migration above; these are the edits that keep
+        // the need and widen it.
+        //
+        // A wholly ABSENT `needs.jetstream` on the old side is the same
+        // baseline as a declared-but-empty one (no consume, no stream, no
+        // flag) — so adding the need already carrying a foreign consume, a
+        // foreign subject or `dynamicStreams: true` gates, exactly as #7's
+        // `(absent) → secret:` does. Both sides are EFFECTIVE specs (base ⊕
+        // the pinned environment, `effective_spec`), so an escalation
+        // introduced through `spec.environments.<env>.needs.jetstream` is
+        // classified identically to one written into `base`.
+        let old_js = jetstream(old);
+        let new_js = jetstream(new);
+
+        // #14 jetstream-consume-add: a `consume` entry naming ANOTHER
+        // application's stream. A consume SHARES that stream between the two
+        // applications, and NATS's stream-level permission denials key on the
+        // STREAM, so once shared, each side can delete / pause / reset the
+        // other's durable and forge acks against it (measured on nats-server
+        // 2.14.3, ADR 0061 §4.1). The exposure is created by the SHARE, and it
+        // is the producer's neighbour — not the editor — who bears it.
+        //
+        // The exposure unit is therefore the `(owner, stream)` PAIR, not the
+        // whole `(owner, stream, durable)` entry: a second durable on a stream
+        // this application already consumes reaches nothing it could not
+        // already reach, so it is not a fresh widening and must not re-gate.
+        //
+        // `from` absent means the application's OWN stream (application.cue:
+        // "Omit for the declaring application's own stream"), and an explicit
+        // `from: <app_name>` says the same thing the long way — neither is a
+        // widening, so `foreign_consume_shares` drops both.
+        let old_shares = foreign_consume_shares(old_js, app_name);
+        for (owner, stream) in foreign_consume_shares(new_js, app_name) {
+            if old_shares.contains(&(owner.clone(), stream.clone())) {
+                continue;
+            }
+            candidates.push(DestructiveChange {
+                trigger_type: "jetstream-consume-add".to_string(),
+                field: format!("needs.jetstream.consume.{owner}.{stream}"),
+                from: Some(json!("(none)")),
+                to: Some(json!(format!("{owner}/{stream}"))),
+                classification: "security-boundary".to_string(),
+            });
+        }
+
+        // #15 jetstream-dynamic-streams-enable: the flag grants
+        // `$JS.API.STREAM.CREATE/UPDATE.>`, which literally means "may create
+        // streams at will, and therefore READS EVERY STREAM IN THIS NAMESPACE"
+        // — NATS wildcards are whole-token, so a stream NAME can never be
+        // confined by a permission (ADR 0061 §4.1, measured on 2.14.3). It is
+        // also what makes capture detection EXACT for every application that
+        // has NOT set it: the `allow_list` grants `STREAM.CREATE` only under
+        // the flag, so an opted-out application PROVABLY did not create a
+        // given stream. Turning it on removes that proof for its holder.
+        //
+        // Absent == `false` (the CUE default, and `#[serde(default)]` on
+        // `JetStreamNeed.dynamic_streams`), so absent → `true` gates exactly
+        // like `false` → `true`. The reverse (`true` → `false`) is a
+        // NARROWING — it restores the proof — and is deliberately soft.
+        let old_dynamic = old_js.is_some_and(|j| j.dynamic_streams);
+        let new_dynamic = new_js.is_some_and(|j| j.dynamic_streams);
+        if !old_dynamic && new_dynamic {
+            candidates.push(DestructiveChange {
+                trigger_type: "jetstream-dynamic-streams-enable".to_string(),
+                field: "needs.jetstream.dynamicStreams".to_string(),
+                from: Some(json!("false")),
+                to: Some(json!("true")),
+                classification: "security-boundary".to_string(),
+            });
+        }
+
+        // #16 jetstream-foreign-subject, two arms over `streams[]`.
+        //
+        // A declared stream is the SANCTIONED exception to the hard `<app>.`
+        // publish prefix — it is how fan-in works. Pointing that exception at
+        // a subject tree whose first token is SOMEONE ELSE's name aims it at a
+        // neighbour; `allowPurge` on such a stream escalates it from READING a
+        // neighbour's traffic to DESTROYING it.
+        //
+        // Both arms key per-STREAM (stream names are unique within an
+        // application — `validate_jetstream_need` rejects a duplicate), never
+        // on a flat union of subjects: a stream's OTHER attributes decide the
+        // blast radius, so moving a foreign subject into a different (e.g.
+        // already-purgeable) stream is a fresh escalation and must gate.
+        //
+        // ADR 0061 §7 records the breadth as deliberate: a foreign first token
+        // gates even when no application of that name exists today (narrowing
+        // it to live siblings would need a lookup the classifier must not do
+        // and would reopen pre-positioned capture).
+        for s in new_js.map(|j| j.streams.as_slice()).unwrap_or_default() {
+            let old_s: Option<&JetStreamStream> = old_js
+                .map(|j| j.streams.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .find(|o| o.name == s.name);
+
+            // Arm 1 — a foreign subject ADDED to this stream. `from` is the
+            // stream's PRE-EXISTING subject list (`(none)` when the stream is
+            // new), `to` is the added foreign delta only — the same
+            // pre-existing-set → gained-delta shape #11 `public-hostname-add`
+            // uses, so `"shop.orders.>" → "billing.orders.>"` reads as the ADR
+            // writes it. A foreign subject that was ALREADY on this stream is
+            // not re-gated (it was approved when it landed).
+            let added_foreign: Vec<String> = s
+                .subjects
+                .iter()
+                .filter(|subj| is_foreign_subject(subj, app_name))
+                .filter(|subj| {
+                    !old_s.is_some_and(|o| o.subjects.iter().any(|x| x.trim() == subj.trim()))
+                })
+                .map(|subj| subj.trim().to_string())
+                .collect();
+            if !added_foreign.is_empty() {
+                let from = old_s
+                    .map(subjects_joined)
+                    .filter(|prev| !prev.is_empty())
+                    .unwrap_or_else(|| "(none)".to_string());
+                candidates.push(DestructiveChange {
+                    trigger_type: "jetstream-foreign-subject".to_string(),
+                    field: format!("needs.jetstream.streams.{}.subjects", s.name),
+                    from: Some(json!(from)),
+                    to: Some(json!(added_foreign.join(","))),
+                    classification: "security-boundary".to_string(),
+                });
+            }
+
+            // Arm 2 — `allowPurge` SET on a stream that carries a foreign
+            // subject. CONDITIONAL by design: `allowPurge` on a stream wholly
+            // under this application's own prefix is destructive-to-SELF,
+            // which ADR 0051's availability axis already governs, so it takes
+            // no security trigger. On a fan-in stream the same flag destroys
+            // OTHER applications' messages — "it reaches strictly its own
+            // stream" is true of the object and false of the data (ADR 0061
+            // §7). The condition reads the stream's EFFECTIVE (new) subjects,
+            // so an edit that adds the foreign subject and the flag together
+            // surfaces BOTH facts rather than hiding the purge grant behind
+            // the fan-in. `true → false` is a narrowing: not gated.
+            let old_purge = old_s.is_some_and(|o| o.allow_purge);
+            if s.allow_purge
+                && !old_purge
+                && s.subjects
+                    .iter()
+                    .any(|subj| is_foreign_subject(subj, app_name))
+            {
+                candidates.push(DestructiveChange {
+                    trigger_type: "jetstream-foreign-subject".to_string(),
+                    field: format!("needs.jetstream.streams.{}.allowPurge", s.name),
+                    from: Some(json!("false")),
+                    to: Some(json!("true")),
+                    classification: "security-boundary".to_string(),
+                });
+            }
+        }
+
         sort_candidates(&mut candidates);
         candidates
     }
@@ -793,6 +974,76 @@ fn image_is_digest(image: &str) -> bool {
             .split_once(':')
             .is_some_and(|(algo, hex)| !algo.is_empty() && !hex.is_empty())
     })
+}
+
+/// The effective spec's `needs.jetstream` block, if it declares one.
+/// `None` covers both "no `needs` at all" and "`needs` without jetstream";
+/// the 2.5 triggers treat both as the empty baseline (no consume, no
+/// stream, `dynamicStreams: false`).
+fn jetstream(s: &ApplicationBaseSpec) -> Option<&JetStreamNeed> {
+    s.needs.as_ref().and_then(|n| n.jetstream.as_ref())
+}
+
+/// The FIRST dot-separated token of a NATS subject — the token that
+/// decides whose partition the subject lives in
+/// (`ClaimView::subject_prefix()` composes `<app>.`, so `shop.orders.>`
+/// belongs to `shop`). Trimmed, because the webhook trims before its own
+/// subject checks and a stray space must not change the owner.
+///
+/// A subject with no `.` is its own first token (`orders` → `orders`), and
+/// an empty subject yields `""` — which equals no application name, so it
+/// reads as foreign. That is the safe direction (over-gate, never
+/// under-gate) for a value the webhook would have rejected anyway.
+fn subject_first_token(subject: &str) -> &str {
+    let trimmed = subject.trim();
+    trimmed.split('.').next().unwrap_or(trimmed)
+}
+
+/// #16's predicate: the subject's first token is NOT this application's
+/// own name, i.e. the declared stream collects a NEIGHBOUR's traffic.
+/// A wildcard first token (`*.orders`) is foreign by the same test — `*`
+/// matches every application's partition, which is the widest possible
+/// fan-in.
+fn is_foreign_subject(subject: &str, app_name: &str) -> bool {
+    subject_first_token(subject) != app_name
+}
+
+/// A declared stream's subjects rendered as one stable `from` sentinel
+/// (declared order, trimmed, comma-joined) — the "what this stream
+/// collected before the edit" half of #16's arm 1. Mirrors #11's
+/// `old_hosts.join(",")`.
+fn subjects_joined(s: &JetStreamStream) -> String {
+    s.subjects
+        .iter()
+        .map(|subj| subj.trim())
+        .filter(|subj| !subj.is_empty())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The set of `(owner, stream)` pairs this `needs.jetstream` consumes from
+/// ANOTHER application, in declared order, de-duplicated. `consume[].from`
+/// absent — or naming `app_name` itself — is the application's own stream
+/// and is dropped: #14 gates the act of SHARING a neighbour's stream, and
+/// neither shape shares anything.
+///
+/// The pair, not the whole `(from, stream, durable)` entry, is the unit:
+/// stream-level permission denials key on the stream, so a second durable
+/// on an already-consumed stream widens nothing.
+fn foreign_consume_shares(js: Option<&JetStreamNeed>, app_name: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for c in js.map(|j| j.consume.as_slice()).unwrap_or_default() {
+        let owner = match c.from.as_deref().map(str::trim) {
+            Some(owner) if !owner.is_empty() && owner != app_name => owner.to_string(),
+            // Absent, empty, or this application itself → own stream.
+            _ => continue,
+        };
+        let pair = (owner, c.stream.trim().to_string());
+        if !out.contains(&pair) {
+            out.push(pair);
+        }
+    }
+    out
 }
 
 /// Keys present in `old` but absent from `new` — i.e. the `needs`
@@ -1580,8 +1831,8 @@ mod application_detect_destructive_tests {
 
     #[test]
     fn removing_needs_pg_is_data_migration() {
-        let c =
-            ApplicationMigrationStrategy::detect_destructive(&with_pg(base()), &base()).unwrap();
+        let c = ApplicationMigrationStrategy::detect_destructive(&with_pg(base()), &base(), "app")
+            .unwrap();
         assert_eq!(c.classification, "data-migration");
         assert_eq!(c.trigger_type, "needs-removal");
         assert_eq!(c.field, "needs.pg");
@@ -1593,7 +1844,8 @@ mod application_detect_destructive_tests {
     #[test]
     fn adding_needs_pg_is_not_destructive() {
         assert!(
-            ApplicationMigrationStrategy::detect_destructive(&base(), &with_pg(base())).is_none()
+            ApplicationMigrationStrategy::detect_destructive(&base(), &with_pg(base()), "app")
+                .is_none()
         );
     }
 
@@ -1602,6 +1854,7 @@ mod application_detect_destructive_tests {
         let c = ApplicationMigrationStrategy::detect_destructive(
             &with_named_pg(base(), "main"),
             &base(),
+            "app",
         )
         .unwrap();
         assert_eq!(c.trigger_type, "needs-removal");
@@ -1615,14 +1868,17 @@ mod application_detect_destructive_tests {
     fn unchanged_needs_is_not_destructive() {
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &with_pg(base()),
-            &with_pg(base())
+            &with_pg(base()),
+            "app"
         )
         .is_none());
     }
 
     #[test]
     fn no_needs_either_side_is_not_destructive() {
-        assert!(ApplicationMigrationStrategy::detect_destructive(&base(), &base()).is_none());
+        assert!(
+            ApplicationMigrationStrategy::detect_destructive(&base(), &base(), "app").is_none()
+        );
     }
 
     // ---- Task 3: domain-change (gated on public) + network-visibility ----
@@ -1637,6 +1893,7 @@ mod application_detect_destructive_tests {
         let cs = ApplicationMigrationStrategy::detect_all(
             &with_expose(base(), expose("public", Some("a.example.com"))),
             &with_expose(base(), expose("public", Some("b.example.com"))),
+            "app",
         );
         // #3 domain-change: `a` LOST → `(removed)`.
         let dc = cs
@@ -1659,6 +1916,7 @@ mod application_detect_destructive_tests {
         let primary = ApplicationMigrationStrategy::detect_destructive(
             &with_expose(base(), expose("public", Some("a.example.com"))),
             &with_expose(base(), expose("public", Some("b.example.com"))),
+            "app",
         )
         .unwrap();
         assert_eq!(primary.trigger_type, "public-hostname-add");
@@ -1669,7 +1927,8 @@ mod application_detect_destructive_tests {
     fn hostname_change_on_internal_app_is_soft() {
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &with_expose(base(), expose("internal", Some("a.example.com"))),
-            &with_expose(base(), expose("internal", Some("b.example.com")))
+            &with_expose(base(), expose("internal", Some("b.example.com"))),
+            "app"
         )
         .is_none());
     }
@@ -1683,7 +1942,7 @@ mod application_detect_destructive_tests {
     fn hostname_add_under_internal_is_not_a_security_boundary() {
         let old = with_expose(base(), expose("internal", None));
         let new = with_expose(base(), expose("internal", Some("x.example.com")));
-        let cands = ApplicationMigrationStrategy::detect_all(&old, &new);
+        let cands = ApplicationMigrationStrategy::detect_all(&old, &new, "app");
         assert!(!cands
             .iter()
             .any(|c| c.trigger_type == "public-hostname-add"));
@@ -1697,7 +1956,7 @@ mod application_detect_destructive_tests {
     fn hostname_add_under_public_is_a_security_boundary() {
         let old = with_expose(base(), expose("public", None));
         let new = with_expose(base(), expose("public", Some("x.example.com")));
-        let cands = ApplicationMigrationStrategy::detect_all(&old, &new);
+        let cands = ApplicationMigrationStrategy::detect_all(&old, &new, "app");
         assert!(cands
             .iter()
             .any(|c| c.trigger_type == "public-hostname-add"));
@@ -1708,6 +1967,7 @@ mod application_detect_destructive_tests {
         let c = ApplicationMigrationStrategy::detect_destructive(
             &with_expose(base(), expose("public", Some("a.example.com"))),
             &with_expose(base(), expose("public", None)),
+            "app",
         )
         .unwrap();
         assert_eq!(c.trigger_type, "domain-change");
@@ -1719,6 +1979,7 @@ mod application_detect_destructive_tests {
         let c = ApplicationMigrationStrategy::detect_destructive(
             &with_expose(base(), expose("public", Some("a.example.com"))),
             &with_expose(base(), expose("internal", Some("a.example.com"))),
+            "app",
         )
         .unwrap();
         assert_eq!(c.trigger_type, "network-visibility-change");
@@ -1736,7 +1997,8 @@ mod application_detect_destructive_tests {
         // soft here.
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &with_expose(base(), expose("internal", None)),
-            &with_expose(base(), expose("vpn", None))
+            &with_expose(base(), expose("vpn", None)),
+            "app"
         )
         .is_none());
     }
@@ -1748,6 +2010,7 @@ mod application_detect_destructive_tests {
         let cs = ApplicationMigrationStrategy::detect_all(
             &with_expose(base(), expose("internal", None)),
             &with_expose(base(), expose("public", None)),
+            "app",
         );
         assert!(cs
             .iter()
@@ -1786,6 +2049,7 @@ mod application_detect_destructive_tests {
         let c = ApplicationMigrationStrategy::detect_destructive(
             &with_replicas(base(), Some(3)),
             &with_replicas(base(), Some(0)),
+            "app",
         )
         .unwrap();
         assert_eq!(c.trigger_type, "scale-to-zero");
@@ -1794,12 +2058,14 @@ mod application_detect_destructive_tests {
         assert_eq!(c.to.as_ref().unwrap().as_str().unwrap(), "0");
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &with_replicas(base(), Some(3)),
-            &with_replicas(base(), Some(1))
+            &with_replicas(base(), Some(1)),
+            "app"
         )
         .is_none()); // N->M soft
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &with_replicas(base(), Some(0)),
-            &with_replicas(base(), Some(3))
+            &with_replicas(base(), Some(3)),
+            "app"
         )
         .is_none()); // 0->N soft
     }
@@ -1812,6 +2078,7 @@ mod application_detect_destructive_tests {
         let c = ApplicationMigrationStrategy::detect_destructive(
             &with_replicas(base(), None),
             &with_replicas(base(), Some(0)),
+            "app",
         )
         .unwrap();
         assert_eq!(c.trigger_type, "scale-to-zero");
@@ -1822,7 +2089,8 @@ mod application_detect_destructive_tests {
         // a scale-UP, so it must stay soft.
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &with_replicas(base(), Some(0)),
-            &with_replicas(base(), None)
+            &with_replicas(base(), None),
+            "app"
         )
         .is_none());
     }
@@ -1832,13 +2100,15 @@ mod application_detect_destructive_tests {
         let c = ApplicationMigrationStrategy::detect_destructive(
             &with_image(base(), "ghcr.io/acme/api:v1"),
             &with_image(base(), "ghcr.io/acme/other:v1"),
+            "app",
         )
         .unwrap();
         assert_eq!(c.trigger_type, "image-path-change");
         assert_eq!(c.classification, "security-boundary");
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &with_image(base(), "ghcr.io/acme/api:v1"),
-            &with_image(base(), "ghcr.io/acme/api:v2")
+            &with_image(base(), "ghcr.io/acme/api:v2"),
+            "app"
         )
         .is_none()); // tag soft
     }
@@ -1852,6 +2122,7 @@ mod application_detect_destructive_tests {
         let c = ApplicationMigrationStrategy::detect_destructive(
             &with_image(base(), "ghcr.io/acme/api:v1"),
             &with_image(base(), "ghcr.io/acme/OTHER:v1"),
+            "app",
         )
         .unwrap();
         assert_eq!(c.trigger_type, "image-path-change");
@@ -1864,12 +2135,14 @@ mod application_detect_destructive_tests {
         // scope for image-path-change (Task 4 handles Some↔Some only).
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &base(),
-            &with_image(base(), "ghcr.io/acme/api:v1")
+            &with_image(base(), "ghcr.io/acme/api:v1"),
+            "app"
         )
         .is_none());
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &with_image(base(), "ghcr.io/acme/api:v1"),
-            &base()
+            &base(),
+            "app"
         )
         .is_none());
     }
@@ -1896,6 +2169,7 @@ mod application_detect_destructive_tests {
         let c = ApplicationMigrationStrategy::detect_destructive(
             &with_env(base(), "DB", claim_ref()),
             &base(),
+            "app",
         )
         .unwrap();
         assert_eq!(c.trigger_type, "env-ref-removal");
@@ -1913,6 +2187,7 @@ mod application_detect_destructive_tests {
         let c = ApplicationMigrationStrategy::detect_destructive(
             &with_env(base(), "STRIPE", secret_ref()),
             &base(),
+            "app",
         )
         .unwrap();
         assert_eq!(c.trigger_type, "env-ref-removal");
@@ -1928,7 +2203,8 @@ mod application_detect_destructive_tests {
     fn removing_env_literal_is_soft() {
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &with_env(base(), "X", EnvValue::Literal("hi".into())),
-            &base()
+            &base(),
+            "app"
         )
         .is_none());
     }
@@ -1937,7 +2213,8 @@ mod application_detect_destructive_tests {
     fn adding_env_ref_is_soft() {
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &base(),
-            &with_env(base(), "DB", claim_ref())
+            &with_env(base(), "DB", claim_ref()),
+            "app"
         )
         .is_none());
     }
@@ -1952,7 +2229,8 @@ mod application_detect_destructive_tests {
         // self-scoped-retarget cases remain soft.
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &with_env(base(), "DB", claim_ref()),
-            &with_env(base(), "DB", claim_ref())
+            &with_env(base(), "DB", claim_ref()),
+            "app"
         )
         .is_none());
     }
@@ -1971,6 +2249,7 @@ mod application_detect_destructive_tests {
                 "S",
                 EnvValue::Ref(EnvRef::Secret("stripe/key".into())),
             ),
+            "app",
         )
         .unwrap();
         assert_eq!(c.trigger_type, "env-secret-ref-add");
@@ -1984,7 +2263,8 @@ mod application_detect_destructive_tests {
         // A claim-ref ADD is NOT gated (self-scoped).
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &base(),
-            &with_env(base(), "D", EnvValue::Ref(EnvRef::Claim("pg.url".into())))
+            &with_env(base(), "D", EnvValue::Ref(EnvRef::Claim("pg.url".into()))),
+            "app"
         )
         .is_none());
     }
@@ -2001,7 +2281,7 @@ mod application_detect_destructive_tests {
             "D",
             EnvValue::Literal("postgres://attacker/db".into()),
         );
-        let c = ApplicationMigrationStrategy::detect_destructive(&old, &new).unwrap();
+        let c = ApplicationMigrationStrategy::detect_destructive(&old, &new, "app").unwrap();
         assert_eq!(c.trigger_type, "env-ref-downgrade");
         assert_eq!(c.classification, "security-boundary");
         assert_eq!(c.field, "env.D");
@@ -2014,7 +2294,7 @@ mod application_detect_destructive_tests {
     fn env_secret_ref_to_literal_downgrade_gates() {
         let old = with_env(base(), "K", EnvValue::Ref(EnvRef::Secret("a/k".into())));
         let new = with_env(base(), "K", EnvValue::Literal("hardcoded".into()));
-        let c = ApplicationMigrationStrategy::detect_destructive(&old, &new).unwrap();
+        let c = ApplicationMigrationStrategy::detect_destructive(&old, &new, "app").unwrap();
         assert_eq!(c.trigger_type, "env-ref-downgrade");
         assert_eq!(c.classification, "security-boundary");
         assert_eq!(c.from.as_ref().unwrap().as_str().unwrap(), "secret:a/k");
@@ -2026,7 +2306,8 @@ mod application_detect_destructive_tests {
     fn env_literal_to_literal_is_not_a_downgrade() {
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &with_env(base(), "X", EnvValue::Literal("a".into())),
-            &with_env(base(), "X", EnvValue::Literal("b".into()))
+            &with_env(base(), "X", EnvValue::Literal("b".into())),
+            "app"
         )
         .is_none());
     }
@@ -2041,6 +2322,7 @@ mod application_detect_destructive_tests {
         let c = ApplicationMigrationStrategy::detect_destructive(
             &old,
             &with_env(base(), "K", EnvValue::Ref(EnvRef::Secret("b/k".into()))),
+            "app",
         )
         .unwrap();
         assert_eq!(c.trigger_type, "env-secret-ref-retarget");
@@ -2051,7 +2333,8 @@ mod application_detect_destructive_tests {
         // Same secret target on both sides → soft.
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &old,
-            &with_env(base(), "K", EnvValue::Ref(EnvRef::Secret("a/k".into())))
+            &with_env(base(), "K", EnvValue::Ref(EnvRef::Secret("a/k".into()))),
+            "app"
         )
         .is_none());
     }
@@ -2061,7 +2344,8 @@ mod application_detect_destructive_tests {
     fn claim_ref_retarget_is_soft() {
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &with_env(base(), "D", EnvValue::Ref(EnvRef::Claim("pg.url".into()))),
-            &with_env(base(), "D", EnvValue::Ref(EnvRef::Claim("pg.host".into())))
+            &with_env(base(), "D", EnvValue::Ref(EnvRef::Claim("pg.host".into()))),
+            "app"
         )
         .is_none());
     }
@@ -2078,7 +2362,8 @@ mod application_detect_destructive_tests {
         // (new is still a Ref) → SOFT.
         assert!(ApplicationMigrationStrategy::detect_destructive(
             &with_env(base(), "K", EnvValue::Ref(EnvRef::Secret("a/k".into()))),
-            &with_env(base(), "K", EnvValue::Ref(EnvRef::Claim("pg.url".into())))
+            &with_env(base(), "K", EnvValue::Ref(EnvRef::Claim("pg.url".into()))),
+            "app"
         )
         .is_none());
         // claim → secret (2.16b-sec F-2): the key ACQUIRES an external-secret
@@ -2086,6 +2371,7 @@ mod application_detect_destructive_tests {
         let c = ApplicationMigrationStrategy::detect_destructive(
             &with_env(base(), "K", EnvValue::Ref(EnvRef::Claim("pg.url".into()))),
             &with_env(base(), "K", EnvValue::Ref(EnvRef::Secret("a/k".into()))),
+            "app",
         )
         .unwrap();
         assert_eq!(c.trigger_type, "env-secret-ref-add");
@@ -2114,6 +2400,7 @@ mod application_detect_destructive_tests {
                 "DB",
                 EnvValue::Ref(EnvRef::Secret("stripe-prod/key".into())),
             ),
+            "app",
         )
         .unwrap();
         assert_eq!(c.trigger_type, "env-secret-ref-add");
@@ -2127,6 +2414,7 @@ mod application_detect_destructive_tests {
         let c2 = ApplicationMigrationStrategy::detect_destructive(
             &with_env(base(), "K", EnvValue::Literal("s3cr3t-value".into())),
             &with_env(base(), "K", EnvValue::Ref(EnvRef::Secret("a/b".into()))),
+            "app",
         )
         .unwrap();
         assert_eq!(c2.trigger_type, "env-secret-ref-add");
@@ -2156,7 +2444,7 @@ mod application_detect_destructive_tests {
                 Some(v) => with_env(base(), "K", v.clone()),
             };
             let new = with_env(base(), "K", target.clone());
-            let sec: Vec<_> = ApplicationMigrationStrategy::detect_all(&old, &new)
+            let sec: Vec<_> = ApplicationMigrationStrategy::detect_all(&old, &new, "app")
                 .into_iter()
                 .filter(|c| {
                     c.trigger_type == "env-secret-ref-add"
@@ -2225,7 +2513,7 @@ mod application_detect_destructive_tests {
                 None => base(),
                 Some(v) => with_env(base(), "K", v.clone()),
             };
-            let env_cands: Vec<_> = ApplicationMigrationStrategy::detect_all(&old, &new)
+            let env_cands: Vec<_> = ApplicationMigrationStrategy::detect_all(&old, &new, "app")
                 .into_iter()
                 .filter(|c| c.field == "env.K")
                 .collect();
@@ -2260,11 +2548,11 @@ mod application_detect_destructive_tests {
             "DB",
             EnvValue::Ref(EnvRef::Claim("pg.url".into())),
         );
-        assert!(ApplicationMigrationStrategy::detect_all(&old, &new)
+        assert!(ApplicationMigrationStrategy::detect_all(&old, &new, "app")
             .iter()
             .all(|c| c.classification != "security-boundary"));
         // and nothing gates overall (needs ADD + claim env ADD are both soft).
-        assert!(ApplicationMigrationStrategy::detect_destructive(&old, &new).is_none());
+        assert!(ApplicationMigrationStrategy::detect_destructive(&old, &new, "app").is_none());
     }
 
     // ---- Task 6: finalize the classifier ----
@@ -2275,8 +2563,8 @@ mod application_detect_destructive_tests {
         // remove needs.pg (data-migration) AND scale to zero (requires-restart)
         let old = with_replicas(with_pg(base()), Some(2));
         let new = with_replicas(base(), Some(0));
-        let c1 = ApplicationMigrationStrategy::detect_destructive(&old, &new).unwrap();
-        let c2 = ApplicationMigrationStrategy::detect_destructive(&old, &new).unwrap();
+        let c1 = ApplicationMigrationStrategy::detect_destructive(&old, &new, "app").unwrap();
+        let c2 = ApplicationMigrationStrategy::detect_destructive(&old, &new, "app").unwrap();
         assert_eq!(c1.classification, "data-migration"); // highest severity wins
         assert_eq!(c1, c2); // deterministic
     }
@@ -2292,6 +2580,7 @@ mod application_detect_destructive_tests {
         let cs = ApplicationMigrationStrategy::detect_all(
             &with_expose(base(), expose("public", None)),
             &with_expose(base(), expose("public", Some("a.example.com"))),
+            "app",
         );
         // Fix B: the requires-restart `domain-change` op must NOT fire on an add.
         assert!(!cs.iter().any(|c| c.trigger_type == "domain-change"));
@@ -2309,7 +2598,7 @@ mod application_detect_destructive_tests {
         // Guard against a false pass: the two specs must genuinely differ in
         // the selector (otherwise the None below would be meaningless).
         assert_ne!(old.needs, new.needs);
-        assert!(ApplicationMigrationStrategy::detect_destructive(&old, &new).is_none());
+        assert!(ApplicationMigrationStrategy::detect_destructive(&old, &new, "app").is_none());
     }
 
     // Fix D — needs.*.size change stays soft (provisioner-guarded, V14).
@@ -2322,7 +2611,7 @@ mod application_detect_destructive_tests {
         let new = with_pg_size(base(), "5Gi");
         // Guard against a false pass: the two specs must genuinely differ in size.
         assert_ne!(old.needs, new.needs);
-        assert!(ApplicationMigrationStrategy::detect_destructive(&old, &new).is_none());
+        assert!(ApplicationMigrationStrategy::detect_destructive(&old, &new, "app").is_none());
     }
 
     // ---- Task 8 Part 1: create_plan_for app-ns + controller ownerRef ----
@@ -2369,7 +2658,7 @@ mod application_detect_destructive_tests {
         // (requires-restart) — two distinct destructive candidates.
         let old = with_replicas(with_pg(base()), Some(2));
         let new = with_replicas(base(), Some(0));
-        let candidates = ApplicationMigrationStrategy::detect_all(&old, &new);
+        let candidates = ApplicationMigrationStrategy::detect_all(&old, &new, "app");
         // Two ops detected (needs-removal + scale-to-zero).
         assert_eq!(candidates.len(), 2, "expected both destructive ops");
         let plan = ApplicationMigrationStrategy::create_plan_for(
@@ -2445,7 +2734,7 @@ mod application_detect_destructive_tests {
         // removal keeps a genuine same-severity tie against scale-to-zero.)
         let old = with_replicas(with_env(base(), "DB", claim_ref()), Some(2));
         let new = with_replicas(base(), Some(0));
-        let c = ApplicationMigrationStrategy::detect_destructive(&old, &new).unwrap();
+        let c = ApplicationMigrationStrategy::detect_destructive(&old, &new, "app").unwrap();
         // both requires-restart; "env-ref-removal" < "scale-to-zero"
         // (trigger_type asc) → env-ref-removal wins, stably.
         assert_eq!(c.classification, "requires-restart");
@@ -2453,7 +2742,7 @@ mod application_detect_destructive_tests {
         // and it's stable across calls
         assert_eq!(
             c,
-            ApplicationMigrationStrategy::detect_destructive(&old, &new).unwrap()
+            ApplicationMigrationStrategy::detect_destructive(&old, &new, "app").unwrap()
         );
     }
 
@@ -2467,15 +2756,15 @@ mod application_detect_destructive_tests {
         // (security-boundary).
         let old = with_image(with_pg(base()), "ghcr.io/acme/api:v1");
         let new = with_image(base(), "ghcr.io/acme/other:v1");
-        let candidates = ApplicationMigrationStrategy::detect_all(&old, &new);
+        let candidates = ApplicationMigrationStrategy::detect_all(&old, &new, "app");
         assert_eq!(candidates.len(), 2, "both destructive ops detected");
-        let primary = ApplicationMigrationStrategy::detect_destructive(&old, &new).unwrap();
+        let primary = ApplicationMigrationStrategy::detect_destructive(&old, &new, "app").unwrap();
         assert_eq!(primary.trigger_type, "image-path-change");
         assert_eq!(primary.classification, "security-boundary");
         // stable across calls.
         assert_eq!(
             primary,
-            ApplicationMigrationStrategy::detect_destructive(&old, &new).unwrap()
+            ApplicationMigrationStrategy::detect_destructive(&old, &new, "app").unwrap()
         );
     }
 
@@ -2502,7 +2791,7 @@ mod application_detect_destructive_tests {
         let old_c = with_env(base(), "TOKEN", EnvValue::Ref(EnvRef::Secret("v/k".into())));
         let new_c = with_env(base(), "TOKEN", EnvValue::Literal(secret.into()));
         for (old, new) in [(&old_a, &new_a), (&old_a, &new_b), (&old_c, &new_c)] {
-            for c in ApplicationMigrationStrategy::detect_all(old, new) {
+            for c in ApplicationMigrationStrategy::detect_all(old, new, "app") {
                 let s = format!("{:?}{:?}", c.from, c.to);
                 assert!(
                     !s.contains(secret),
@@ -2522,6 +2811,7 @@ mod application_detect_destructive_tests {
         let cs = ApplicationMigrationStrategy::detect_all(
             &with_expose(base(), expose("internal", None)),
             &with_expose(base(), expose("public", Some("a.example.com"))),
+            "app",
         );
         let esc = cs
             .iter()
@@ -2547,6 +2837,7 @@ mod application_detect_destructive_tests {
         let cs = ApplicationMigrationStrategy::detect_all(
             &with_expose(base(), expose("public", None)),
             &with_expose(base(), expose("public", Some("a.example.com"))),
+            "app",
         );
         assert!(cs.iter().any(|c| c.trigger_type == "public-hostname-add"));
         // No escalation (already public → public).
@@ -2583,6 +2874,7 @@ mod application_detect_destructive_tests {
                 base(),
                 expose_hosts("public", &["a.example.com", "b.example.com"]),
             ),
+            "app",
         );
         let hn = cs
             .iter()
@@ -2604,6 +2896,7 @@ mod application_detect_destructive_tests {
         let cs = ApplicationMigrationStrategy::detect_all(
             &with_expose(base(), expose("public", None)),
             &with_expose(base(), expose("public", Some("a.example.com"))),
+            "app",
         );
         let hn = cs
             .iter()
@@ -2626,6 +2919,7 @@ mod application_detect_destructive_tests {
                 expose_hosts("public", &["a.example.com", "b.example.com"]),
             ),
             &with_expose(base(), expose("public", Some("a.example.com"))),
+            "app",
         );
         // Nothing gained → no #11.
         assert!(!cs.iter().any(|c| c.trigger_type == "public-hostname-add"));
@@ -2650,6 +2944,7 @@ mod application_detect_destructive_tests {
                 expose_hosts("public", &["a.example.com", "b.example.com"]),
             ),
             &with_expose(base(), expose("public", Some("b.example.com"))),
+            "app",
         );
         // `a` lost → domain-change fires.
         let dc = cs
@@ -2675,6 +2970,7 @@ mod application_detect_destructive_tests {
                 base(),
                 expose_hosts("public", &["b.example.com", "c.example.com"]),
             ),
+            "app",
         );
         let dc = cs
             .iter()
@@ -2711,6 +3007,7 @@ mod application_detect_destructive_tests {
             ApplicationMigrationStrategy::detect_all(
                 &with_expose(base(), old),
                 &with_expose(base(), new),
+                "app",
             )
             .into_iter()
             .map(|c| c.trigger_type)
@@ -2728,6 +3025,7 @@ mod application_detect_destructive_tests {
         let p = ApplicationMigrationStrategy::detect_destructive(
             &with_expose(base(), expose("public", Some("a.example.com"))),
             &with_expose(base(), expose("public", Some("b.example.com"))),
+            "app",
         )
         .unwrap();
         assert_eq!(p.trigger_type, "public-hostname-add"); // sev4 primary
@@ -2762,6 +3060,7 @@ mod application_detect_destructive_tests {
                 base(),
                 expose_hosts("public", &["a.example.com", "c.example.com"]),
             ),
+            "app",
         );
         let dc = cs
             .iter()
@@ -2798,6 +3097,7 @@ mod application_detect_destructive_tests {
         let cs = ApplicationMigrationStrategy::detect_all(
             &with_expose(base(), expose("public", Some("a.example.com"))),
             &with_expose(base(), expose("public", Some("b.example.com"))),
+            "app",
         );
         let dc = cs
             .iter()
@@ -2809,6 +3109,7 @@ mod application_detect_destructive_tests {
         let cs = ApplicationMigrationStrategy::detect_all(
             &with_expose(base(), expose("public", Some("a.example.com"))),
             &with_expose(base(), expose("public", None)),
+            "app",
         );
         let dc = cs
             .iter()
@@ -2830,6 +3131,7 @@ mod application_detect_destructive_tests {
                 base(),
                 expose_hosts("internal", &["a.example.com", "b.example.com"]),
             ),
+            "app",
         );
         assert!(cs.is_empty());
     }
@@ -2846,6 +3148,7 @@ mod application_detect_destructive_tests {
         let cs = ApplicationMigrationStrategy::detect_all(
             &with_expose(base(), po(8080)),
             &with_expose(base(), po(9090)),
+            "app",
         );
         let pr = cs
             .iter()
@@ -2863,7 +3166,8 @@ mod application_detect_destructive_tests {
         };
         assert!(!ApplicationMigrationStrategy::detect_all(
             &with_expose(base(), io(8080)),
-            &with_expose(base(), io(9090))
+            &with_expose(base(), io(9090)),
+            "app"
         )
         .iter()
         .any(|c| c.trigger_type == "public-port-retarget"));
@@ -2879,6 +3183,7 @@ mod application_detect_destructive_tests {
         let c = ApplicationMigrationStrategy::detect_all(
             &with_image_policy(base(), "ghcr.io/a/b:v1", "off"),
             &with_image_policy(base(), "ghcr.io/a/b:v1", "digest"),
+            "app",
         );
         let r = c
             .iter()
@@ -2892,14 +3197,16 @@ mod application_detect_destructive_tests {
         let digest = format!("ghcr.io/a/b@sha256:{}", "a".repeat(64));
         assert!(!ApplicationMigrationStrategy::detect_all(
             &with_image_policy(base(), &digest, "off"),
-            &with_image_policy(base(), &digest, "digest")
+            &with_image_policy(base(), &digest, "digest"),
+            "app"
         )
         .iter()
         .any(|c| c.trigger_type == "image-policy-relaxation"));
         // digest → off is HARDENING → soft.
         assert!(!ApplicationMigrationStrategy::detect_all(
             &with_image_policy(base(), "ghcr.io/a/b:v1", "digest"),
-            &with_image_policy(base(), "ghcr.io/a/b:v1", "off")
+            &with_image_policy(base(), "ghcr.io/a/b:v1", "off"),
+            "app"
         )
         .iter()
         .any(|c| c.trigger_type == "image-policy-relaxation"));
@@ -2912,6 +3219,7 @@ mod application_detect_destructive_tests {
         let cs = ApplicationMigrationStrategy::detect_all(
             &with_expose(base(), expose("public", Some("h"))),
             &with_expose(base(), expose("internal", None)),
+            "app",
         );
         assert!(!cs
             .iter()
@@ -2970,9 +3278,519 @@ mod application_detect_destructive_tests {
         assert!(!ApplicationMigrationStrategy::detect_all(
             &with_image_policy(base(), &sha512, "off"),
             &with_image_policy(base(), &sha512, "digest"),
+            "app"
         )
         .iter()
         .any(|c| c.trigger_type == "image-policy-relaxation"));
+    }
+}
+
+/// 2.5 part 4: the three `needs.jetstream` security-boundary triggers
+/// (ADR 0061 §7 / ADR 0052 §2 rows #14–#16).
+///
+/// EVERY trigger here carries BOTH a firing test and the adjacent
+/// NON-firing one (narrowing, self-reference, own-prefix subject,
+/// `allowPurge` on a clean stream). A firing fixture alone proves only
+/// that some code runs — deleting the guard would leave it green — which
+/// is exactly the gap 2.5 found in three earlier guards.
+#[cfg(test)]
+mod application_jetstream_trigger_tests {
+    use super::*;
+    use operator_core::{JetStreamConsume, JetStreamNeed, JetStreamStream, OneOrMany, ServiceNeed};
+
+    /// The declaring application throughout: its own subject partition is
+    /// `shop.` and its own name in a `consume[].from` is `"shop"`.
+    const APP: &str = "shop";
+
+    fn base() -> ApplicationBaseSpec {
+        ApplicationBaseSpec::default()
+    }
+
+    /// A spec whose effective `needs.jetstream` is `js`.
+    fn with_js(js: JetStreamNeed) -> ApplicationBaseSpec {
+        ApplicationBaseSpec {
+            needs: Some(Needs {
+                jetstream: Some(js),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn stream(name: &str, subjects: &[&str], allow_purge: bool) -> JetStreamStream {
+        JetStreamStream {
+            name: name.to_string(),
+            subjects: subjects.iter().map(|s| s.to_string()).collect(),
+            // Required by the webhook; irrelevant to every trigger here.
+            max_bytes: "1Gi".to_string(),
+            allow_purge,
+            ..Default::default()
+        }
+    }
+
+    fn consume(from: Option<&str>, stream: &str, durable: &str) -> JetStreamConsume {
+        JetStreamConsume {
+            from: from.map(str::to_string),
+            stream: stream.to_string(),
+            durable: durable.to_string(),
+        }
+    }
+
+    fn with_streams(streams: Vec<JetStreamStream>) -> ApplicationBaseSpec {
+        with_js(JetStreamNeed {
+            streams,
+            ..Default::default()
+        })
+    }
+
+    fn with_consume(consume: Vec<JetStreamConsume>) -> ApplicationBaseSpec {
+        with_js(JetStreamNeed {
+            consume,
+            ..Default::default()
+        })
+    }
+
+    /// Every candidate of `trigger_type`, in `detect_all`'s canonical order.
+    fn fired(
+        old: &ApplicationBaseSpec,
+        new: &ApplicationBaseSpec,
+        trigger_type: &str,
+    ) -> Vec<DestructiveChange> {
+        ApplicationMigrationStrategy::detect_all(old, new, APP)
+            .into_iter()
+            .filter(|c| c.trigger_type == trigger_type)
+            .collect()
+    }
+
+    fn s(v: &Option<Value>) -> String {
+        v.as_ref().unwrap().as_str().unwrap().to_string()
+    }
+
+    // ---- #14 jetstream-consume-add ----------------------------------
+
+    // FIRES: a consume naming ANOTHER application's stream. The share is
+    // the exposure — stream-level denials key on the stream, so both
+    // sides can then reach each other's durables (nats-server 2.14.3).
+    #[test]
+    fn jetstream_consume_from_another_app_gates() {
+        let cs = fired(
+            &base(),
+            &with_consume(vec![consume(Some("feeder"), "blocks-head", "shop-reader")]),
+            "jetstream-consume-add",
+        );
+        assert_eq!(cs.len(), 1, "{cs:?}");
+        assert_eq!(cs[0].classification, "security-boundary");
+        assert_eq!(cs[0].field, "needs.jetstream.consume.feeder.blocks-head");
+        assert_eq!(s(&cs[0].from), "(none)");
+        // The ADR 0052 row's own sentinel: `<from>/<stream>`.
+        assert_eq!(s(&cs[0].to), "feeder/blocks-head");
+    }
+
+    // DOES NOT FIRE: a consume on the application's OWN stream — both the
+    // `from`-omitted shape (application.cue's documented form) and the
+    // redundant explicit `from: <own name>`. Neither shares anything with
+    // a neighbour, so neither is a widening.
+    #[test]
+    fn jetstream_consume_from_own_stream_is_not_a_widening() {
+        assert!(fired(
+            &base(),
+            &with_consume(vec![consume(None, "orders", "self-reader")]),
+            "jetstream-consume-add"
+        )
+        .is_empty());
+        assert!(
+            fired(
+                &base(),
+                &with_consume(vec![consume(Some(APP), "orders", "self-reader")]),
+                "jetstream-consume-add"
+            )
+            .is_empty(),
+            "an explicit `from: <own app>` is the same own-stream consume the long way"
+        );
+    }
+
+    // DOES NOT FIRE: a SECOND durable on a stream this application already
+    // consumes. The exposure unit is the `(owner, stream)` pair — the
+    // share already existed, and a new durable reaches nothing new.
+    #[test]
+    fn jetstream_second_durable_on_an_already_shared_stream_is_not_a_new_share() {
+        let old = with_consume(vec![consume(Some("feeder"), "blocks-head", "reader-a")]);
+        let new = with_consume(vec![
+            consume(Some("feeder"), "blocks-head", "reader-a"),
+            consume(Some("feeder"), "blocks-head", "reader-b"),
+        ]);
+        assert!(fired(&old, &new, "jetstream-consume-add").is_empty());
+        // …but a DIFFERENT stream of the same neighbour IS a fresh share.
+        let wider = with_consume(vec![
+            consume(Some("feeder"), "blocks-head", "reader-a"),
+            consume(Some("feeder"), "blocks-tail", "reader-b"),
+        ]);
+        let cs = fired(&old, &wider, "jetstream-consume-add");
+        assert_eq!(cs.len(), 1, "{cs:?}");
+        assert_eq!(s(&cs[0].to), "feeder/blocks-tail");
+    }
+
+    // DOES NOT FIRE: dropping a foreign consume is a NARROWING on this
+    // axis. (`needs.jetstream` itself survives, so ADR 0051's
+    // `needs-removal` does not fire either — nothing gates.)
+    #[test]
+    fn jetstream_consume_removal_is_not_a_security_boundary() {
+        let old = with_consume(vec![consume(Some("feeder"), "blocks-head", "reader-a")]);
+        assert!(fired(&old, &with_consume(vec![]), "jetstream-consume-add").is_empty());
+    }
+
+    // ---- #15 jetstream-dynamic-streams-enable -----------------------
+
+    // FIRES: absent/false → true. The flag means "may create streams at
+    // will, and therefore reads every stream in this namespace" — NATS
+    // wildcards are whole-token, so a stream NAME can never be confined by
+    // a permission.
+    #[test]
+    fn jetstream_dynamic_streams_enable_gates_from_absent_and_from_false() {
+        let on = with_js(JetStreamNeed {
+            dynamic_streams: true,
+            ..Default::default()
+        });
+        let off = with_js(JetStreamNeed::default());
+
+        for old in [base(), off.clone()] {
+            let cs = fired(&old, &on, "jetstream-dynamic-streams-enable");
+            assert_eq!(cs.len(), 1, "{cs:?}");
+            assert_eq!(cs[0].classification, "security-boundary");
+            assert_eq!(cs[0].field, "needs.jetstream.dynamicStreams");
+            assert_eq!(s(&cs[0].from), "false");
+            assert_eq!(s(&cs[0].to), "true");
+        }
+    }
+
+    // DOES NOT FIRE: `true → false` is the NARROWING — it restores the
+    // capture-detection proof this application had given up — and
+    // `true → true` / `false → false` are no edits at all.
+    #[test]
+    fn jetstream_dynamic_streams_disable_and_no_change_are_not_gated() {
+        let on = with_js(JetStreamNeed {
+            dynamic_streams: true,
+            ..Default::default()
+        });
+        let off = with_js(JetStreamNeed::default());
+        assert!(
+            fired(&on, &off, "jetstream-dynamic-streams-enable").is_empty(),
+            "true → false is a narrowing"
+        );
+        assert!(fired(&on, &on, "jetstream-dynamic-streams-enable").is_empty());
+        assert!(fired(&off, &off, "jetstream-dynamic-streams-enable").is_empty());
+    }
+
+    // ---- #16 jetstream-foreign-subject, arm 1 (subjects) ------------
+
+    // FIRES: a declared subject whose first token is a NEIGHBOUR's name.
+    // `from` is the stream's pre-existing subject list and `to` the added
+    // delta — the ADR 0052 row's `"shop.orders.>" → "billing.orders.>"`.
+    #[test]
+    fn jetstream_foreign_subject_added_gates() {
+        let old = with_streams(vec![stream("orders", &["shop.orders.>"], false)]);
+        let new = with_streams(vec![stream("orders", &["billing.orders.>"], false)]);
+        let cs = fired(&old, &new, "jetstream-foreign-subject");
+        assert_eq!(cs.len(), 1, "{cs:?}");
+        assert_eq!(cs[0].classification, "security-boundary");
+        assert_eq!(cs[0].field, "needs.jetstream.streams.orders.subjects");
+        assert_eq!(s(&cs[0].from), "shop.orders.>");
+        assert_eq!(s(&cs[0].to), "billing.orders.>");
+    }
+
+    // DOES NOT FIRE: a stream wholly under the application's OWN first
+    // token — the ordinary case, which must never ask for an approval.
+    // Covers a brand-new stream, a subject ADDED to an existing own-prefix
+    // stream, and the bare-name subject that IS the app's own token.
+    #[test]
+    fn jetstream_own_prefix_subjects_are_not_foreign() {
+        let new = with_streams(vec![stream(
+            "orders",
+            &["shop.orders.>", "shop.refunds"],
+            false,
+        )]);
+        assert!(fired(&base(), &new, "jetstream-foreign-subject").is_empty());
+
+        let old = with_streams(vec![stream("orders", &["shop.orders.>"], false)]);
+        assert!(fired(&old, &new, "jetstream-foreign-subject").is_empty());
+
+        let bare = with_streams(vec![stream("orders", &["shop"], false)]);
+        assert!(
+            fired(&base(), &bare, "jetstream-foreign-subject").is_empty(),
+            "a subject that IS the app's own token is its own partition"
+        );
+    }
+
+    // DOES NOT FIRE: a foreign subject already declared (and therefore
+    // already approved) is not re-gated on an unrelated edit to the same
+    // stream.
+    #[test]
+    fn jetstream_pre_existing_foreign_subject_is_not_re_gated() {
+        let old = with_streams(vec![stream("fan-in", &["billing.orders.>"], false)]);
+        let new = with_streams(vec![stream(
+            "fan-in",
+            &["billing.orders.>", "shop.orders.>"],
+            false,
+        )]);
+        assert!(fired(&old, &new, "jetstream-foreign-subject").is_empty());
+    }
+
+    // FIRES: moving a foreign subject to a DIFFERENT stream. The arms key
+    // per-stream, not on a flat union, because the destination stream's
+    // own attributes (`allowPurge`, retention) decide the blast radius —
+    // a union key would let a foreign subject slide into an
+    // already-purgeable stream silently.
+    #[test]
+    fn jetstream_foreign_subject_moved_to_another_stream_gates() {
+        let old = with_streams(vec![
+            stream("fan-in", &["billing.orders.>"], false),
+            stream("purgeable", &["shop.tmp.>"], true),
+        ]);
+        let new = with_streams(vec![
+            stream("fan-in", &["shop.orders.>"], false),
+            stream("purgeable", &["shop.tmp.>", "billing.orders.>"], true),
+        ]);
+        let cs = fired(&old, &new, "jetstream-foreign-subject");
+        assert_eq!(cs.len(), 1, "{cs:?}");
+        assert_eq!(cs[0].field, "needs.jetstream.streams.purgeable.subjects");
+        assert_eq!(s(&cs[0].to), "billing.orders.>");
+    }
+
+    // FIRES: a wildcard first token. `*.orders` matches EVERY
+    // application's partition — the widest possible fan-in, so it can
+    // never be "own".
+    #[test]
+    fn jetstream_wildcard_first_token_is_foreign() {
+        let cs = fired(
+            &base(),
+            &with_streams(vec![stream("orders", &["*.orders"], false)]),
+            "jetstream-foreign-subject",
+        );
+        assert_eq!(cs.len(), 1, "{cs:?}");
+        assert_eq!(s(&cs[0].to), "*.orders");
+    }
+
+    // ---- #16 jetstream-foreign-subject, arm 2 (allowPurge) ----------
+
+    // FIRES: `allowPurge` set on a stream that ALREADY collects a
+    // neighbour's subject — the escalation from READING a neighbour's
+    // traffic to DESTROYING it. Exactly one candidate: the foreign
+    // subject itself is unchanged, so arm 1 stays silent.
+    #[test]
+    fn jetstream_allow_purge_on_a_fan_in_stream_gates() {
+        let old = with_streams(vec![stream("fan-in", &["billing.orders.>"], false)]);
+        let new = with_streams(vec![stream("fan-in", &["billing.orders.>"], true)]);
+        let cs = fired(&old, &new, "jetstream-foreign-subject");
+        assert_eq!(cs.len(), 1, "{cs:?}");
+        assert_eq!(cs[0].classification, "security-boundary");
+        assert_eq!(cs[0].field, "needs.jetstream.streams.fan-in.allowPurge");
+        assert_eq!(s(&cs[0].from), "false");
+        assert_eq!(s(&cs[0].to), "true");
+    }
+
+    // DOES NOT FIRE: `allowPurge` on a stream wholly under the
+    // application's own prefix. That is destructive-to-SELF, which ADR
+    // 0051's availability axis governs; the security axis takes no
+    // trigger, or the common "let me purge my own stream" edit would
+    // pause for an approval it does not need.
+    #[test]
+    fn jetstream_allow_purge_on_an_own_prefix_stream_is_not_gated() {
+        let old = with_streams(vec![stream("orders", &["shop.orders.>"], false)]);
+        let new = with_streams(vec![stream("orders", &["shop.orders.>"], true)]);
+        assert!(fired(&old, &new, "jetstream-foreign-subject").is_empty());
+        // Nor on a brand-new own-prefix stream created with the flag set.
+        assert!(fired(&base(), &new, "jetstream-foreign-subject").is_empty());
+    }
+
+    // DOES NOT FIRE: clearing `allowPurge` on a fan-in stream is the
+    // NARROWING.
+    #[test]
+    fn jetstream_allow_purge_removal_on_a_fan_in_stream_is_not_gated() {
+        let old = with_streams(vec![stream("fan-in", &["billing.orders.>"], true)]);
+        let new = with_streams(vec![stream("fan-in", &["billing.orders.>"], false)]);
+        assert!(fired(&old, &new, "jetstream-foreign-subject").is_empty());
+    }
+
+    // FIRES TWICE: an edit that aims a stream at a neighbour AND grants
+    // purge on it in one go surfaces BOTH facts. Suppressing the purge
+    // grant behind the fan-in row would let the more severe half hide —
+    // the same anti-laundering argument that keeps #3 and #11 separate.
+    #[test]
+    fn jetstream_foreign_subject_plus_allow_purge_surfaces_both_rows() {
+        let old = with_streams(vec![stream("fan-in", &["shop.orders.>"], false)]);
+        let new = with_streams(vec![stream(
+            "fan-in",
+            &["shop.orders.>", "billing.orders.>"],
+            true,
+        )]);
+        let cs = fired(&old, &new, "jetstream-foreign-subject");
+        let fields: Vec<&str> = cs.iter().map(|c| c.field.as_str()).collect();
+        assert_eq!(
+            fields,
+            vec![
+                "needs.jetstream.streams.fan-in.allowPurge",
+                "needs.jetstream.streams.fan-in.subjects",
+            ],
+            "{cs:?}"
+        );
+    }
+
+    // ---- cross-cutting ----------------------------------------------
+
+    // An unchanged `needs.jetstream` — foreign consume, foreign subject,
+    // purge and the flag all already declared and approved — produces NO
+    // candidate at all. Without this, a detector that fired on PRESENCE
+    // rather than on the DELTA would pause every reconcile forever.
+    #[test]
+    fn an_unchanged_jetstream_block_produces_no_candidate() {
+        let js = with_js(JetStreamNeed {
+            dynamic_streams: true,
+            streams: vec![stream("fan-in", &["billing.orders.>"], true)],
+            consume: vec![consume(Some("feeder"), "blocks-head", "reader")],
+            ..Default::default()
+        });
+        assert!(
+            ApplicationMigrationStrategy::detect_all(&js, &js, APP).is_empty(),
+            "{:?}",
+            ApplicationMigrationStrategy::detect_all(&js, &js, APP)
+        );
+    }
+
+    // The classifier's notion of "own" is the APPLICATION's name, not a
+    // constant: the SAME spec is clean for `shop` and a foreign-subject +
+    // foreign-consume escalation for `billing`. This is what the
+    // `app_name` parameter buys, and it fails if a call site ever passes
+    // the wrong identity.
+    #[test]
+    fn ownership_is_relative_to_the_declaring_application() {
+        let new = with_js(JetStreamNeed {
+            streams: vec![stream("orders", &["shop.orders.>"], false)],
+            consume: vec![consume(Some("shop"), "orders", "reader")],
+            ..Default::default()
+        });
+        assert!(ApplicationMigrationStrategy::detect_all(&base(), &new, "shop").is_empty());
+        let as_billing: Vec<String> =
+            ApplicationMigrationStrategy::detect_all(&base(), &new, "billing")
+                .into_iter()
+                .map(|c| c.trigger_type)
+                .collect();
+        assert_eq!(
+            as_billing,
+            vec!["jetstream-consume-add", "jetstream-foreign-subject"],
+            "the same spec read as a different application is an escalation"
+        );
+    }
+
+    // A jetstream trigger is `security-boundary` (severity 4), so it takes
+    // the plan's primary headline over a co-occurring data-migration —
+    // and the whole set still reaches `changes[]`.
+    #[test]
+    fn a_jetstream_trigger_outranks_a_co_occurring_needs_removal() {
+        let old = ApplicationBaseSpec {
+            needs: Some(Needs {
+                pg: Some(OneOrMany::One(ServiceNeed::default())),
+                jetstream: Some(JetStreamNeed::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let new = with_js(JetStreamNeed {
+            dynamic_streams: true,
+            ..Default::default()
+        });
+        let cs = ApplicationMigrationStrategy::detect_all(&old, &new, APP);
+        assert_eq!(cs.len(), 2, "{cs:?}");
+        assert_eq!(cs[0].trigger_type, "jetstream-dynamic-streams-enable");
+        assert_eq!(
+            ApplicationMigrationStrategy::detect_destructive(&old, &new, APP)
+                .unwrap()
+                .trigger_type,
+            "jetstream-dynamic-streams-enable"
+        );
+    }
+
+    // S-4: the approval content hash covers the NEW trigger fields, so an
+    // approval granted for one jetstream diff cannot be replayed against a
+    // different one. Every pair below differs ONLY in a jetstream field
+    // (`from`/`to`/`field`), which is precisely what a hash that ignored
+    // them would collapse.
+    #[test]
+    fn the_approval_hash_distinguishes_two_jetstream_diffs() {
+        let feeder = ApplicationMigrationStrategy::detect_all(
+            &base(),
+            &with_consume(vec![consume(Some("feeder"), "blocks-head", "r")]),
+            APP,
+        );
+        let ledger = ApplicationMigrationStrategy::detect_all(
+            &base(),
+            &with_consume(vec![consume(Some("ledger"), "blocks-head", "r")]),
+            APP,
+        );
+        let billing_subject = ApplicationMigrationStrategy::detect_all(
+            &base(),
+            &with_streams(vec![stream("s", &["billing.orders.>"], false)]),
+            APP,
+        );
+        let ledger_subject = ApplicationMigrationStrategy::detect_all(
+            &base(),
+            &with_streams(vec![stream("s", &["ledger.orders.>"], false)]),
+            APP,
+        );
+        let dynamic = ApplicationMigrationStrategy::detect_all(
+            &base(),
+            &with_js(JetStreamNeed {
+                dynamic_streams: true,
+                ..Default::default()
+            }),
+            APP,
+        );
+        for set in [
+            &feeder,
+            &ledger,
+            &billing_subject,
+            &ledger_subject,
+            &dynamic,
+        ] {
+            assert_eq!(set.len(), 1, "{set:?}");
+        }
+        let hashes: Vec<String> = [
+            &feeder,
+            &ledger,
+            &billing_subject,
+            &ledger_subject,
+            &dynamic,
+        ]
+        .iter()
+        .map(|set| change_hash(set))
+        .collect();
+        let mut distinct = hashes.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), hashes.len(), "{hashes:?}");
+
+        // …and it reaches the PLAN, so a stale approval re-gates
+        // (`plan_state` recomputes this hash at consume time).
+        let plan = ApplicationMigrationStrategy::create_plan_for(
+            &feeder,
+            "shop-migration-1",
+            "team-a",
+            APP,
+            "",
+            "uid-1",
+        );
+        assert_eq!(
+            plan.spec.trigger.approved_spec_hash.as_deref(),
+            Some(change_hash(&feeder).as_str())
+        );
+        assert_ne!(
+            plan.spec.trigger.approved_spec_hash.as_deref(),
+            Some(change_hash(&ledger).as_str())
+        );
+        assert_eq!(plan.spec.trigger.type_, "jetstream-consume-add");
+        assert_eq!(
+            plan.spec.risks.as_ref().unwrap().classification,
+            "security-boundary"
+        );
     }
 }
 

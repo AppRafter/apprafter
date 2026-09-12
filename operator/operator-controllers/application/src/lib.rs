@@ -346,7 +346,15 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     let mut soft_notes: Vec<String> = Vec::new();
     if let Some(baseline_spec) = &baseline_spec {
         let old_eff = effective_baseline(baseline_spec);
-        candidates = ApplicationMigrationStrategy::detect_all(&old_eff, &new_eff);
+        // `name` is the Application's `metadata.name` — the 2.5 jetstream
+        // triggers (#14/#16) classify "another application" / "foreign
+        // subject" RELATIVE to it (the app's own NATS subject partition is
+        // `<name>.`). It is the same `app.name_any()` the generated claim
+        // carries as its controller `ownerReference`, which is exactly what
+        // the provisioner reads back as the declaring app
+        // (`resourceclaim-provisioner::nats::declaring_app`) — so the
+        // classifier's notion of "own" and the NATS-side one cannot drift.
+        candidates = ApplicationMigrationStrategy::detect_all(&old_eff, &new_eff, &name);
         // `detect_all` returns candidates in `pick_primary` order (severity
         // desc, then tuple asc), so the head IS the primary headline — no need
         // to re-run detection via `detect_destructive`.
