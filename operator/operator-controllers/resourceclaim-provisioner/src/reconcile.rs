@@ -26,14 +26,15 @@ use k8s_openapi::api::apps::v1::StatefulSet;
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams, PostParams};
 use kube::core::GroupVersionKind;
 use kube::runtime::controller::Action;
-use kube::{Client, ResourceExt};
+use kube::{Client, Resource as _, ResourceExt};
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use operator_core::{
-    ResourceClaim, ResourceClaimCondition, RetainedClaim, ServiceProvider, SharedVolume,
+    ClaimStreamInventory, ResourceClaim, ResourceClaimCondition, RetainedClaim, ServiceProvider,
+    SharedVolume,
 };
 
 use crate::cnpg;
@@ -42,7 +43,9 @@ use crate::dragonfly;
 use crate::grace;
 use crate::nats;
 use crate::nats_accounts;
-use crate::{Context, ReconcileError, FIELD_MANAGER, KIND, PROVISIONER_FINALIZER};
+use crate::{
+    Context, ReconcileError, FIELD_MANAGER, JETSTREAM_FIELD_MANAGER, KIND, PROVISIONER_FINALIZER,
+};
 
 /// Condition type this controller owns. The scheduler owns `Scheduled`;
 /// this controller owns ONLY `Ready`.
@@ -183,6 +186,38 @@ const REASON_AWAITING_NACK_CRDS: &str = "AwaitingNackCrds";
 /// streams genuinely exist, and red on its own the moment they stop.
 const REASON_AWAITING_STREAM_CREATION: &str = "AwaitingStreamCreation";
 
+/// `Ready=False` reason when the namespace account cannot fit this
+/// claim's declared streams (2.5f, ADR 0061 §6).
+///
+/// A separate reason from [`REASON_AWAITING_STREAM_CREATION`], not a
+/// variant of it, because the two call for opposite responses: that one
+/// resolves itself (wait for NACK), this one never does (edit the
+/// manifest or the namespace's `size`). Collapsing them would tell an
+/// operator to wait for something that is not coming.
+///
+/// The claim is held UNREADY here rather than merely annotated, because
+/// the pre-flight has REFUSED to apply the `Stream` CR — and a claim that
+/// went `Ready=True` with a stream nobody created is the exact status lie
+/// [`REASON_AWAITING_STREAM_CREATION`]'s own doc records at length.
+const REASON_JETSTREAM_QUOTA_EXCEEDED: &str = "QuotaExceeded";
+
+/// Reporter identity stamped onto every Kubernetes Event this controller
+/// publishes (2.5f — the `ForeignSubjectCapture` event ADR 0061 §5 pairs
+/// with the condition). Visible in `kubectl describe resourceclaim` under
+/// Events. Distinct from the scheduler's own reporter so the two
+/// controllers' events are never confused for each other.
+const EVENT_REPORTER_CONTROLLER: &str = "apprafter-resourceclaim-provisioner";
+
+/// How stale an observed inventory may get before it is rewritten even
+/// though nothing in it changed (2.5f).
+///
+/// Every status write bumps `resourceVersion` and wakes this controller
+/// again, so an unconditional stamp on each 60s resync would be a write
+/// loop — the same hazard `size_write_is_worth_it` exists for. Content is
+/// therefore the trigger, and this is only the backstop that keeps
+/// `observedAt` from reading as ancient on a healthy, unchanging account.
+const JETSTREAM_INVENTORY_MAX_AGE: chrono::Duration = chrono::Duration::hours(1);
+
 /// Fallback platform-wide `max_file` budget for
 /// [`nats_accounts::render_accounts_file`]'s `global_budget_bytes`
 /// parameter (2.5d Task 8b, already shipped) — **a finding, not part of
@@ -321,6 +356,15 @@ pub async fn reconcile(
         // and deadbanded — see `refresh_claim_size`.
         if status_json.pointer("/ready").and_then(Value::as_bool) == Some(true) {
             refresh_claim_size(ctx.as_ref(), &claim, &ns, &name).await;
+            // 2.5f (ADR 0061 §5/§7): this gate is where "the provisioner
+            // resync that already lists the account's streams" actually
+            // is. A ready claim never provisions again, so a detector
+            // living only in `provision_nats` would look exactly once —
+            // at the moment a claim goes live, before there is anything
+            // to find. Best-effort; it never fails the reconcile.
+            if claim.spec.type_ == "jetstream" {
+                refresh_jetstream_claim(&ctx, &claim, &ns, &name).await;
+            }
         }
         info!(%name, %ns, "not yet Scheduled (or already ready) — waiting for scheduler");
         return Ok(Action::requeue(Duration::from_secs(60)));
@@ -1550,32 +1594,15 @@ pub(crate) async fn reconcile_accounts_secret(
         let secret_name = nats::mgr_secret_name(namespace);
         let mgr_api: Api<DynamicObject> =
             Api::namespaced_with(ctx.client.clone(), nats_ns, &secret_ar());
+        // Read-or-create. There is deliberately NO "add the missing `user`
+        // key" self-heal branch here (2.5f): 2.5e's `Account` CR points
+        // `spec.user.user` at a `user` KEY inside this Secret, and part 2
+        // wrote the object with `password` only — but `needs.jetstream`
+        // has never been released, so no cluster anywhere holds a Secret
+        // written by that intermediate code. The branch was unreachable
+        // and untested; it was deleted rather than carried.
         let pass = match mgr_api.get_opt(&secret_name).await? {
-            Some(existing) => {
-                let pass = decoded_secret_key(&existing, "password")?.unwrap_or_default();
-                // Self-heal a pre-2.5e Secret. Part 2 wrote this object
-                // with a `password` key ONLY; 2.5e's `Account` CR points
-                // `spec.user.user` at a `user` KEY inside it, so a Secret
-                // written by the older code leaves NACK pointing at a key
-                // that does not exist — and NACK's failure to authenticate
-                // is silent from Kubernetes' side: the Stream CR applies
-                // fine and simply never goes Ready. Re-apply rather than
-                // regenerate: the PASSWORD is carried forward unchanged
-                // (rotating it would invalidate the accounts file the
-                // running server is still serving), only the missing key
-                // is added.
-                if decoded_secret_key(&existing, "user")?.is_none() && !pass.is_empty() {
-                    let obj = nats::mgr_secret_object(&secret_name, nats_ns, &mgr_user, &pass);
-                    mgr_api
-                        .patch(&secret_name, &apply_params(), &Patch::Apply(&obj))
-                        .await?;
-                    info!(
-                        secret = %secret_name, %nats_ns,
-                        "added the missing `user` key to a pre-2.5e nats mgr Secret"
-                    );
-                }
-                pass
-            }
+            Some(existing) => decoded_secret_key(&existing, "password")?.unwrap_or_default(),
             None => {
                 let fresh = generate_password();
                 let obj = nats::mgr_secret_object(&secret_name, nats_ns, &mgr_user, &fresh);
@@ -1871,6 +1898,48 @@ async fn provision_nats(
         return Ok(Action::requeue(Duration::from_secs(30)));
     }
 
+    // Step 6a (2.5f, ADR 0061 §5/§6/§7): observe the account ONCE — the
+    // inventory, the capture detector and the quota pre-flight all run off
+    // this single `STREAM.LIST`. It has to happen HERE, after verify (so
+    // there is a live server to ask) and before the `Stream` CRs below (so
+    // a declaration that cannot fit is refused by us, with the account's
+    // actual numbers, rather than by nats-server with `insufficient
+    // storage resources available (10047)` — which names neither the
+    // quota nor what exhausted it).
+    //
+    // `None` means the observation failed, and the pre-flight then blocks
+    // NOTHING. That is the deliberate direction: an unobservable account
+    // falls back to exactly the pre-2.5f behaviour (apply, and let NACK
+    // report whatever the server says), never to refusing work on a guess.
+    let signals = refresh_jetstream_signals(ctx, claim, ns, name, &cfg).await;
+    let quota_blocked: Vec<String> = signals
+        .as_ref()
+        .map(|s| s.quota.blocked.clone())
+        .unwrap_or_default();
+    if !quota_blocked.is_empty() {
+        let quota = signals
+            .as_ref()
+            .map(|s| s.quota.clone())
+            .unwrap_or_default();
+        let cond = ready_condition(
+            "False",
+            REASON_JETSTREAM_QUOTA_EXCEEDED,
+            &format!(
+                "declared stream(s) {} were not created: the {} account promises {} bytes of \
+                 file quota and {} are already committed. This claim is held unready \
+                 deliberately — creating the rest and reporting Ready would leave the \
+                 application running against streams that do not exist.",
+                quota_blocked.join(", "),
+                cv.account(),
+                quota.budget_bytes,
+                quota.reserved_bytes
+            ),
+            &prior,
+        );
+        patch_status(&ctx.client, ns, name, cond, ClaimStatusFields::default()).await?;
+        return Ok(Action::requeue(Duration::from_secs(60)));
+    }
+
     // Every declared object this claim applied that NACK has NOT yet
     // reported Ready. Collected as the applies happen (SSA returns the
     // stored object, status included) so the gate below costs no extra
@@ -2002,6 +2071,373 @@ async fn provision_nats(
     info!(%name, %ns, %user, "nats (jetstream) claim provisioned");
 
     Ok(Action::requeue(Duration::from_secs(300)))
+}
+
+// ---------------------------------------------------------------------------
+// 2.5f — the observed-stream inventory, the capture detector and the
+// conditions (ADR 0061 §5 "Detection", §7, §6 quota)
+// ---------------------------------------------------------------------------
+//
+// **Where this runs, and why it is not simply the tail of
+// `provision_nats`.** A ready claim never provisions again —
+// `should_provision` returns false the moment `status.ready` is true — so
+// anything living only in the provisioning path is computed once, at the
+// moment a claim goes live, and never again. For a size sample that is a
+// stale number (2.22d's own finding); for a capture detector it would mean
+// the platform stops looking the instant there is something to look at.
+//
+// So this runs from BOTH: the 60s resync gate for a live claim (where ADR
+// 0061 §5's "the provisioner resync that already lists the account's
+// streams" actually is), and once inside `provision_nats`, where the
+// `QuotaExceeded` pre-flight has to run BEFORE any `Stream` CR is applied.
+// One listing per pass either way.
+
+/// Gather one jetstream claim's signals: the namespace's declarations,
+/// ONE `STREAM.LIST` as `mgr_<ns>`, and the pure rules in `nats.rs`.
+///
+/// `None` — never an error — on any missing input: an unreadable
+/// management Secret, an unreachable server, a claim that is not
+/// well-formed. Every caller treats that as "learned nothing this pass,"
+/// which is the correct reading: the detector is an OBSERVER, and an
+/// observer that cannot see must not be allowed to conclude. Returning an
+/// error instead would fail reconciles for a server that is merely
+/// restarting, and — worse — a `None` from `list_streams` must never be
+/// read as "no streams", which would clear a live inventory and make
+/// every capture condition vanish exactly when NATS is unhealthy.
+async fn jetstream_signals_for(
+    ctx: &Arc<Context>,
+    claim: &ResourceClaim,
+    ns: &str,
+    cfg: &Value,
+) -> Option<nats::JetStreamSignals> {
+    let nats_ns = cfg
+        .pointer("/namespace")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_NATS_SYSTEM_NAMESPACE)
+        .to_string();
+    let size_bytes = nats::size_bytes_map(cfg);
+    let ceiling_bytes = cfg
+        .pointer("/ceilingBytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+
+    let me = nats::claim_views(std::slice::from_ref(claim), &size_bytes)
+        .into_iter()
+        .next()?;
+
+    // The whole NAMESPACE's claims, because legitimacy is a property of
+    // the namespace's declarations as a SET, not of any one claim's — the
+    // same input `render_accounts_file` takes, for the same reason.
+    let listed = Api::<ResourceClaim>::namespaced(ctx.client.clone(), ns)
+        .list(&Default::default())
+        .await
+        .ok()?
+        .items;
+    let mut peers = nats::claim_views(&listed, &size_bytes);
+    // `me` MUST be in `peers`. It normally is (the list includes this
+    // claim), but a claim mid-write can be missing from a cached list, and
+    // several rules are wrong rather than merely incomplete without it:
+    // `quota_verdict`'s budget would omit this claim's own `size`, and
+    // `foreign_subject_captures` would stop recognising this
+    // application's OWN dynamic streams as legitimate and report every one
+    // of them as a capture.
+    if !peers.iter().any(|p| p.app == me.app) {
+        peers.push(me.clone());
+    }
+
+    let mgr_user = nats_accounts::mgr_user(ns);
+    let mgr_secret = nats::mgr_secret_name(ns);
+    let mgr_pass = match crate::acl_reconcile::read_secret_key(
+        ctx,
+        &nats_ns,
+        &mgr_secret,
+        "password",
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(%ns, secret = %mgr_secret, %e, "jetstream inventory: no management credential this pass");
+            return None;
+        }
+    };
+    let url = format!("nats://{NATS_STATEFULSET_NAME}.{nats_ns}.svc:{NATS_CLIENT_PORT}");
+    let observed = match ctx.nats.list_streams(&url, &mgr_user, &mgr_pass).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(%ns, %url, %e, "jetstream inventory: STREAM.LIST failed this pass");
+            return None;
+        }
+    };
+
+    let prior = claim
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.clone())
+        .unwrap_or_default();
+    let signals = nats::jetstream_signals(
+        &observed,
+        &me,
+        &peers,
+        ceiling_bytes,
+        &Utc::now().to_rfc3339(),
+        &prior,
+    );
+
+    // ADR 0061 §5's policy ladder. `report` is the default and the only
+    // value the shipped seed sets; `delete` is the operator's escalation,
+    // and there is deliberately no `quarantine` (it needs attribution —
+    // see `nats::CapturePolicy`).
+    let (policy, ignored) = nats::capture_policy(cfg);
+    if let Some(unknown) = ignored {
+        warn!(
+            %ns, policy = %unknown,
+            "unknown jetstream capturePolicy — falling back to `report` (the ladder is \
+             report|delete; `quarantine` needs attribution and is not implemented)"
+        );
+    }
+    if policy == nats::CapturePolicy::Delete {
+        for stream in &signals.captures {
+            match ctx
+                .nats
+                .delete_stream(&url, &mgr_user, &mgr_pass, stream)
+                .await
+            {
+                Ok(()) => warn!(
+                    %ns, %stream, app = %me.app,
+                    "capturePolicy=delete: removed a stream carrying subjects no declaration \
+                     in this namespace accounts for"
+                ),
+                Err(e) => warn!(%ns, %stream, %e, "capturePolicy=delete: STREAM.DELETE failed"),
+            }
+        }
+    }
+
+    Some(signals)
+}
+
+/// Whether the inventory/conditions are worth writing (2.5f).
+///
+/// Content is the trigger, with an age backstop — the same shape
+/// [`size_write_is_worth_it`] uses and for the same reason: every status
+/// write bumps `resourceVersion` and wakes this controller again, so a
+/// stamp on every 60s resync is a write loop. `observedAt` alone must
+/// therefore NEVER be a reason to write, or the deadband would be
+/// self-defeating.
+///
+/// An absent previous inventory is always worth writing: there is nothing
+/// to compare against, so there is no "unchanged" to claim.
+fn jetstream_status_write_is_worth_it(
+    previous: Option<&ClaimStreamInventory>,
+    previous_conditions: &[ResourceClaimCondition],
+    next: &nats::JetStreamSignals,
+    now: &str,
+) -> bool {
+    let Some(prev) = previous else {
+        return true;
+    };
+    if prev.declared != next.inventory.declared
+        || prev.dynamic != next.inventory.dynamic
+        || prev.unattributed != next.inventory.unattributed
+    {
+        return true;
+    }
+    // Compare only the conditions THIS manager owns — `Ready` belongs to
+    // the provisioner's own manager and moves on its own schedule.
+    let mine =
+        |c: &&ResourceClaimCondition| nats::JETSTREAM_CONDITION_TYPES.contains(&c.type_.as_str());
+    let before: Vec<(&str, Option<&str>)> = previous_conditions
+        .iter()
+        .filter(mine)
+        .map(|c| (c.type_.as_str(), c.message.as_deref()))
+        .collect();
+    let after: Vec<(&str, Option<&str>)> = next
+        .conditions
+        .iter()
+        .map(|c| (c.type_.as_str(), c.message.as_deref()))
+        .collect();
+    if before != after {
+        return true;
+    }
+    match (
+        chrono::DateTime::parse_from_rfc3339(&prev.observed_at),
+        chrono::DateTime::parse_from_rfc3339(now),
+    ) {
+        (Ok(then), Ok(current)) => current - then >= JETSTREAM_INVENTORY_MAX_AGE,
+        // An unparseable stored timestamp is written over rather than
+        // trusted: it is the one field a reader uses to decide whether to
+        // believe the rest.
+        _ => true,
+    }
+}
+
+/// The `status.streams` + jetstream-conditions apply body. Carries NOTHING
+/// else — [`crate::JETSTREAM_FIELD_MANAGER`] owns exactly these fields and
+/// SSA replaces a manager's whole field-set on every apply.
+fn jetstream_status_body(name: &str, signals: &nats::JetStreamSignals) -> Value {
+    json!({
+        "apiVersion": "apprafter.io/v1alpha1",
+        "kind": "ResourceClaim",
+        "metadata": { "name": name },
+        "status": {
+            "streams": {
+                "declared": signals.inventory.declared,
+                "dynamic": signals.inventory.dynamic,
+                "unattributed": signals.inventory.unattributed,
+                "observedAt": signals.inventory.observed_at,
+            },
+            "conditions": signals.conditions,
+        },
+    })
+}
+
+/// Write the inventory + conditions under the dedicated manager, and emit
+/// a Warning Event for a capture (ADR 0061 §5: "a `ForeignSubjectCapture`
+/// condition plus an event").
+///
+/// The event rides the same deadband as the write, so a standing capture
+/// is announced when it appears and when it changes — not once a minute
+/// forever.
+async fn write_jetstream_status(
+    ctx: &Arc<Context>,
+    claim: &ResourceClaim,
+    ns: &str,
+    name: &str,
+    signals: &nats::JetStreamSignals,
+) {
+    let status = claim.status.as_ref();
+    let previous = status.and_then(|s| s.streams.as_ref());
+    let previous_conditions = status
+        .and_then(|s| s.conditions.clone())
+        .unwrap_or_default();
+    if !jetstream_status_write_is_worth_it(
+        previous,
+        &previous_conditions,
+        signals,
+        &signals.inventory.observed_at,
+    ) {
+        return;
+    }
+
+    let api: Api<ResourceClaim> = Api::namespaced(ctx.client.clone(), ns);
+    let body = jetstream_status_body(name, signals);
+    if let Err(e) = api
+        .patch_status(
+            name,
+            &PatchParams::apply(JETSTREAM_FIELD_MANAGER).force(),
+            &Patch::Apply(&body),
+        )
+        .await
+    {
+        tracing::debug!(%name, %ns, %e, "jetstream inventory write failed (retrying next tick)");
+        return;
+    }
+
+    if signals.captures.is_empty() {
+        return;
+    }
+    let recorder = {
+        let reporter = kube::runtime::events::Reporter {
+            controller: EVENT_REPORTER_CONTROLLER.into(),
+            instance: std::env::var("POD_NAME").ok(),
+        };
+        let reference: k8s_openapi::api::core::v1::ObjectReference = claim.object_ref(&());
+        kube::runtime::events::Recorder::new(ctx.client.clone(), reporter, reference)
+    };
+    let ev = kube::runtime::events::Event {
+        type_: kube::runtime::events::EventType::Warning,
+        reason: "ForeignSubjectCapture".into(),
+        note: Some(format!(
+            "stream(s) {} carry subjects under this application's prefix that no declaration \
+             in this namespace accounts for",
+            signals.captures.join(", ")
+        )),
+        action: "DetectCapture".into(),
+        secondary: None,
+    };
+    if let Err(e) = recorder.publish(ev).await {
+        warn!(%name, %ns, error = %e, "failed to publish ForeignSubjectCapture event (continuing)");
+    }
+}
+
+/// Write `status.size.bytes` for a jetstream claim — the bytes its own
+/// streams hold (2.5f, the generic path `apprafter app status` already
+/// renders).
+///
+/// Its OWN function, under [`crate::SIZE_FIELD_MANAGER`] and nothing else,
+/// deliberately kept apart from [`write_jetstream_status`]: that manager
+/// may own `status.size` and NOTHING more, and one body carrying both
+/// would prune whichever field the other manager was written under.
+async fn write_jetstream_size(
+    ctx: &Arc<Context>,
+    claim: &ResourceClaim,
+    ns: &str,
+    name: &str,
+    held_bytes: u64,
+) {
+    let bytes = held_bytes.min(i64::MAX as u64) as i64;
+    let previous = claim.status.as_ref().and_then(|s| s.size.clone());
+    let measured_at = Utc::now().to_rfc3339();
+    if !size_write_is_worth_it(previous.as_ref(), bytes, &measured_at) {
+        return;
+    }
+    let api: Api<ResourceClaim> = Api::namespaced(ctx.client.clone(), ns);
+    let body = json!({
+        "apiVersion": "apprafter.io/v1alpha1",
+        "kind": "ResourceClaim",
+        "metadata": { "name": name },
+        "status": { "size": {
+            "bytes": bytes,
+            "measuredAt": measured_at,
+        }},
+    });
+    // DEDICATED manager (see `crate::SIZE_FIELD_MANAGER`) — a size-only
+    // body under the provisioner's own manager prunes `ready`,
+    // `connectionSecretRef` and the allocation.
+    if let Err(e) = api
+        .patch_status(name, &size_apply_params(), &Patch::Apply(&body))
+        .await
+    {
+        tracing::debug!(%name, %ns, %e, "jetstream size write failed (retrying next tick)");
+    }
+}
+
+/// One full 2.5f pass for a jetstream claim: observe, detect, report.
+/// Best-effort throughout — it must never fail the reconcile that called
+/// it. Returns the signals so the provisioning path can consult the quota
+/// verdict it just computed instead of computing it twice.
+pub(crate) async fn refresh_jetstream_signals(
+    ctx: &Arc<Context>,
+    claim: &ResourceClaim,
+    ns: &str,
+    name: &str,
+    cfg: &Value,
+) -> Option<nats::JetStreamSignals> {
+    let signals = jetstream_signals_for(ctx, claim, ns, cfg).await?;
+    write_jetstream_status(ctx, claim, ns, name, &signals).await;
+    write_jetstream_size(ctx, claim, ns, name, signals.held_bytes).await;
+    Some(signals)
+}
+
+/// The resync entry point for a claim that is already ready — the gate
+/// where `should_provision` has already said "nothing to provision".
+/// Resolves this claim's own matched `ServiceProvider` for its config
+/// (the namespace, the ceiling, the capture policy) and runs one pass.
+pub(crate) async fn refresh_jetstream_claim(
+    ctx: &Arc<Context>,
+    claim: &ResourceClaim,
+    ns: &str,
+    name: &str,
+) {
+    let Some(provider_name) = claim.status.as_ref().and_then(|s| s.provider.clone()) else {
+        return;
+    };
+    let provider = match find_provider(&ctx.client, &provider_name).await {
+        Ok(Some(p)) => p,
+        _ => return,
+    };
+    let cfg = provider.spec.config.clone().unwrap_or_else(|| json!({}));
+    refresh_jetstream_signals(ctx, claim, ns, name, &cfg).await;
 }
 
 /// Read the `password` key from a pool instance's admin Secret. The
@@ -4756,5 +5192,207 @@ mod tests {
     fn disable_is_a_noop_when_already_off() {
         assert!(nats_override_patch(false, false, true).is_none());
         assert!(nats_override_patch(false, false, false).is_none());
+    }
+
+    // --- 2.5f: the jetstream inventory deadband + apply body ----------
+
+    fn js_signals(
+        declared: &[&str],
+        conditions: Vec<ResourceClaimCondition>,
+        observed_at: &str,
+    ) -> nats::JetStreamSignals {
+        nats::JetStreamSignals {
+            inventory: nats::StreamInventory {
+                declared: declared.iter().map(|s| s.to_string()).collect(),
+                dynamic: vec![],
+                unattributed: vec![],
+                observed_at: observed_at.to_string(),
+            },
+            captures: vec![],
+            quota: nats::QuotaVerdict::default(),
+            held_bytes: 0,
+            conditions,
+        }
+    }
+
+    fn js_cond(type_: &str, message: &str) -> ResourceClaimCondition {
+        ResourceClaimCondition {
+            type_: type_.to_string(),
+            status: "True".to_string(),
+            reason: Some("R".to_string()),
+            message: Some(message.to_string()),
+            last_transition_time: "2026-09-12T00:00:00+00:00".to_string(),
+        }
+    }
+
+    fn js_previous(declared: &[&str], observed_at: &str) -> ClaimStreamInventory {
+        ClaimStreamInventory {
+            declared: declared.iter().map(|s| s.to_string()).collect(),
+            dynamic: vec![],
+            unattributed: vec![],
+            observed_at: observed_at.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_unchanged_inventory_is_not_written_again() {
+        // The write loop this deadband exists for: every status write bumps
+        // resourceVersion and wakes this controller, which observes again.
+        // `observedAt` moving MUST NOT be a reason to write, or the
+        // deadband defeats itself.
+        let prev = js_previous(&["feeder_orders"], "2026-09-12T00:00:00+00:00");
+        let next = js_signals(&["feeder_orders"], vec![], "2026-09-12T00:00:30+00:00");
+        assert!(!jetstream_status_write_is_worth_it(
+            Some(&prev),
+            &[],
+            &next,
+            &next.inventory.observed_at
+        ));
+    }
+
+    #[test]
+    fn a_changed_inventory_is_written() {
+        let prev = js_previous(&["feeder_orders"], "2026-09-12T00:00:00+00:00");
+        let next = js_signals(
+            &["feeder_orders", "feeder_audit"],
+            vec![],
+            "2026-09-12T00:00:30+00:00",
+        );
+        assert!(jetstream_status_write_is_worth_it(
+            Some(&prev),
+            &[],
+            &next,
+            &next.inventory.observed_at
+        ));
+    }
+
+    #[test]
+    fn a_newly_firing_or_newly_cleared_condition_is_written() {
+        let prev = js_previous(&[], "2026-09-12T00:00:00+00:00");
+        let now = "2026-09-12T00:00:30+00:00";
+
+        // Newly firing.
+        let firing = js_signals(&[], vec![js_cond("ForeignSubjectCapture", "squatter")], now);
+        assert!(jetstream_status_write_is_worth_it(
+            Some(&prev),
+            &[],
+            &firing,
+            now
+        ));
+
+        // Newly cleared — the case a "write when something fires" deadband
+        // would miss, leaving a resolved problem on the object forever.
+        let cleared = js_signals(&[], vec![], now);
+        assert!(jetstream_status_write_is_worth_it(
+            Some(&prev),
+            &[js_cond("ForeignSubjectCapture", "squatter")],
+            &cleared,
+            now
+        ));
+
+        // Same condition, DIFFERENT message (one more stream captured).
+        let grown = js_signals(
+            &[],
+            vec![js_cond("ForeignSubjectCapture", "squatter, squatter2")],
+            now,
+        );
+        assert!(jetstream_status_write_is_worth_it(
+            Some(&prev),
+            &[js_cond("ForeignSubjectCapture", "squatter")],
+            &grown,
+            now
+        ));
+    }
+
+    #[test]
+    fn the_provisioners_own_ready_condition_never_triggers_an_inventory_write() {
+        // `Ready` belongs to a DIFFERENT field manager and moves on its own
+        // schedule. Counting it here would make every provisioning-path
+        // status write trigger an inventory write, which would wake the
+        // controller, which would write again.
+        let prev = js_previous(&[], "2026-09-12T00:00:00+00:00");
+        let now = "2026-09-12T00:00:30+00:00";
+        let next = js_signals(&[], vec![], now);
+        assert!(!jetstream_status_write_is_worth_it(
+            Some(&prev),
+            &[ResourceClaimCondition {
+                type_: COND_READY.to_string(),
+                status: "True".to_string(),
+                reason: Some("Provisioned".to_string()),
+                message: Some("anything at all".to_string()),
+                last_transition_time: now.to_string(),
+            }],
+            &next,
+            now
+        ));
+    }
+
+    #[test]
+    fn a_stale_inventory_is_refreshed_even_when_nothing_changed() {
+        let prev = js_previous(&["feeder_orders"], "2026-09-12T00:00:00+00:00");
+        let next = js_signals(&["feeder_orders"], vec![], "2026-09-12T02:00:00+00:00");
+        assert!(
+            jetstream_status_write_is_worth_it(
+                Some(&prev),
+                &[],
+                &next,
+                &next.inventory.observed_at
+            ),
+            "a healthy, unchanging account must not end up showing an ancient observedAt"
+        );
+    }
+
+    #[test]
+    fn an_absent_or_unparseable_previous_inventory_is_always_written() {
+        let now = "2026-09-12T00:00:30+00:00";
+        let next = js_signals(&[], vec![], now);
+        assert!(jetstream_status_write_is_worth_it(None, &[], &next, now));
+
+        // observedAt is the field a reader uses to decide whether to
+        // believe the rest, so an unreadable one is overwritten rather
+        // than trusted.
+        let broken = js_previous(&[], "not-a-timestamp");
+        assert!(jetstream_status_write_is_worth_it(
+            Some(&broken),
+            &[],
+            &next,
+            now
+        ));
+    }
+
+    #[test]
+    fn the_inventory_body_carries_only_streams_and_conditions() {
+        // SSA replaces a manager's whole field-set on every apply, so this
+        // body must name NOTHING the jetstream manager is not meant to own
+        // — `ready`, `connectionSecretRef`, `instance`, `dbnum`, `size`
+        // all belong to other managers and would be pruned from a live
+        // claim the moment this manager claimed them once.
+        let signals = js_signals(
+            &["feeder_orders"],
+            vec![js_cond("ForeignSubjectCapture", "squatter")],
+            "2026-09-12T00:00:00+00:00",
+        );
+        let body = jetstream_status_body("feeder-jetstream", &signals);
+        assert_eq!(body["metadata"]["name"], "feeder-jetstream");
+        let status = body["status"].as_object().expect("status object");
+        let keys: std::collections::BTreeSet<&str> = status.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["conditions", "streams"].into_iter().collect(),
+            "the jetstream manager owns exactly these two fields"
+        );
+        assert_eq!(
+            body["status"]["streams"]["declared"],
+            json!(["feeder_orders"])
+        );
+        assert_eq!(
+            body["status"]["streams"]["observedAt"],
+            "2026-09-12T00:00:00+00:00"
+        );
+        assert_eq!(
+            body["status"]["conditions"][0]["type"],
+            "ForeignSubjectCapture"
+        );
+        assert_eq!(body["status"]["conditions"][0]["status"], "True");
     }
 }

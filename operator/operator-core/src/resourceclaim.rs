@@ -176,6 +176,43 @@ pub struct ResourceClaimStatus {
     /// and explains cost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<ClaimSize>,
+    /// What the provisioner OBSERVED in this claim's NATS account on its
+    /// last resync (2.5f / ADR 0061 §7). `jetstream` claims only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streams: Option<ClaimStreamInventory>,
+}
+
+/// The observed stream inventory for a `jetstream` claim (ADR 0061 §7).
+///
+/// Three consumers, and this is the ONLY mechanism serving all three:
+/// MigrationPlan enumeration (the Application controller holds no NATS
+/// client, so the claim's status is the only place it can learn what
+/// streams exist), `apprafter app status` through the generic
+/// `status.size.bytes` path, and the provisioner's own `QuotaExceeded`
+/// pre-flight.
+///
+/// Not in `resourceclaim.cue`/the CRD, deliberately and by existing
+/// precedent: `status` carries `x-kubernetes-preserve-unknown-fields:
+/// true` and the CUE describes only the fields 2.2 shipped, which is why
+/// `capacity` and `size` (2.22d) are likewise Rust-side only. The
+/// operator owns `status`; `crdgen check` allowlists it for exactly that
+/// reason.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct ClaimStreamInventory {
+    /// Streams this application declared, observed live.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared: Vec<String>,
+    /// Undeclared streams whose subjects lie wholly under `<app>.`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dynamic: Vec<String>,
+    /// Streams touching `<app>.` that no declaration in the namespace
+    /// accounts for, plus subject-less ones. Reported, never claimed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unattributed: Vec<String>,
+    /// RFC3339 time of the observation, so a stale inventory is visibly
+    /// stale rather than silently current.
+    #[serde(rename = "observedAt")]
+    pub observed_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]

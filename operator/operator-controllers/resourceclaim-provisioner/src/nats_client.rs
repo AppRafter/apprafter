@@ -59,14 +59,31 @@ pub enum NatsAdminError {
     },
 }
 
-/// One JetStream stream as the management identity sees it (2.5e GC).
-/// Name + subjects only: the GC's sweep rule keys on SUBJECTS, never on
-/// names (ADR 0061 §8 — dynamic stream names are unconstrained), so
-/// nothing else about a stream is any of the GC's business.
+/// One JetStream stream as the management identity sees it (2.5e GC,
+/// 2.5f inventory/quota).
+///
+/// Name + subjects are what the GC's sweep rule keys on — SUBJECTS, never
+/// names (ADR 0061 §8 — dynamic stream names are unconstrained).
+///
+/// `max_bytes` and `bytes` are 2.5f additions, and they come from the
+/// SAME listing call rather than a second pass: ADR 0061 §5 says detection
+/// "runs on the provisioner resync that already lists the account's
+/// streams," and the quota pre-flight (§6) has to know what an
+/// already-existing, UNDECLARED stream has reserved — a figure no
+/// declaration carries. `StreamInfo` already ships both on every element
+/// of the list response, so carrying them costs nothing and asking for
+/// them separately would cost one `STREAM.INFO` per stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamSummary {
     pub name: String,
     pub subjects: Vec<String>,
+    /// The stream's own configured ceiling. `-1` (the JetStream
+    /// convention) means UNLIMITED, not "minus one byte" — every
+    /// consumer of this field must treat a negative value as "reserves
+    /// nothing it can promise," never subtract it.
+    pub max_bytes: i64,
+    /// Bytes currently held. The figure `status.size.bytes` reports.
+    pub bytes: u64,
 }
 
 /// The subject every claim user's allow list grants UNCONDITIONALLY
@@ -265,6 +282,8 @@ impl NatsAdmin for NatsClient {
             out.push(StreamSummary {
                 name: info.config.name,
                 subjects: info.config.subjects,
+                max_bytes: info.config.max_bytes,
+                bytes: info.state.bytes,
             });
         }
         Ok(out)

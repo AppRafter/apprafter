@@ -541,22 +541,6 @@ pub struct NatsSweep {
     pub unattributed: Vec<String>,
 }
 
-/// Whether every one of `subjects` lies under `<app>.`.
-///
-/// **Prefix, with the separating dot, and nothing cleverer.** `feeder.`
-/// does not prefix `feederbot.orders`, so two applications whose names
-/// share a prefix cannot sweep each other. A subject equal to the bare
-/// app name, or a bare `>`, is NOT under the prefix.
-///
-/// An EMPTY subject list is `false`, not vacuously true: a stream with no
-/// subjects (a mirror, or one sourced from others) cannot be attributed by
-/// subject at all, and the whole rule is "keys on subjects, never on
-/// names". Treating it as "wholly under" would delete exactly the streams
-/// the rule has no evidence about.
-fn subjects_wholly_under(subjects: &[String], app_prefix: &str) -> bool {
-    !subjects.is_empty() && subjects.iter().all(|s| s.starts_with(app_prefix))
-}
-
 /// The sweep plan for one departing application's account (ADR 0061 §8).
 ///
 /// - `declared` — the departing claim's OWN declared streams (NATS-side
@@ -600,9 +584,9 @@ pub fn nats_sweep_plan(
         if app.is_empty() {
             continue;
         }
-        if subjects_wholly_under(&s.subjects, &app_prefix) {
+        if nats::subjects_wholly_under(&s.subjects, &app_prefix) {
             out.sweep.push(s.name.clone());
-        } else if s.subjects.iter().any(|x| x.starts_with(&app_prefix)) || s.subjects.is_empty() {
+        } else if nats::subjects_touch(&s.subjects, &app_prefix) || s.subjects.is_empty() {
             out.unattributed.push(s.name.clone());
         }
     }
@@ -1733,6 +1717,13 @@ mod tests {
         nats_client::StreamSummary {
             name: name.to_string(),
             subjects: subjects.iter().map(|s| s.to_string()).collect(),
+            // The sweep rule reads NEITHER (it keys on subjects, never on
+            // names, and never on size) — `-1`/`0` are the JetStream
+            // defaults for "unlimited" and "empty", chosen so a fixture
+            // here can never accidentally encode a size the rule under
+            // test is supposed to be blind to.
+            max_bytes: -1,
+            bytes: 0,
         }
     }
 

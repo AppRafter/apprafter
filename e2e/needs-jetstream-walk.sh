@@ -42,6 +42,25 @@
 # the operator log carries no forbidden-verb complaint (the class an RBAC
 # miss manifests as: a reconcile that silently never progresses).
 #
+# 2.5f adds five more (acceptance #9-#13), and they are the half of that
+# subphase no unit test can reach, because each one is a claim about what
+# a REAL nats-server does when nobody is enforcing anything:
+#
+#   9.  the observed-stream inventory lands on the claim, classified —
+#       a dynamic stream as dynamic, a declared one as declared.
+#   10. an application holding `dynamicStreams: true` creates a stream
+#       under a NEIGHBOUR's subject prefix — which no permission refuses,
+#       because a stream's subjects travel in a request body the server
+#       never inspects — and the platform DETECTS it on the victim's
+#       claim without deleting it, while leaving the innocent alone.
+#   11. NamespaceDrainRisk appears on a workqueue's owner while a
+#       dynamicStreams neighbour shares its account, and on nobody else.
+#   12. ConsumeTargetMissing appears once the consumed stream's owning
+#       application has departed.
+#   13. an over-budget declaration is refused BY US, with the account's
+#       numbers, instead of by nats-server as an opaque 10047 through
+#       NACK — and no Stream CR is applied at all.
+#
 # UNPUBLISHED-COMPONENT SUBSTITUTION — read this before touching the
 # script
 # -------------------------------------------------------------------
@@ -153,6 +172,9 @@ CLAIM5="streamapp2-jetstream"
 
 APP6="latecomerapp"                  # arrives AFTER streamapp2 has data — part-3 acceptance #8
 CLAIM6="latecomerapp-jetstream"
+
+APP7="hogapp"                        # declares more than the account holds — 2.5f acceptance #13
+CLAIM7="hogapp-jetstream"
 
 # A separate, minimal namespace for the account-lifecycle checks (part-3
 # acceptance #7) — kept apart from "demo" so tearing these two down does
@@ -522,6 +544,11 @@ spec:
       large: 2147483648
       xlarge: 4294967296
     ceilingBytes: 4294967296
+    # ADR 0061 §5's policy ladder, mirroring service_providers.cue's own
+    # value. `report` is the default and what ships; `delete` would have
+    # the provisioner remove a captured stream, which is exactly what
+    # acceptance #10 below must NOT have happen while it is looking.
+    capturePolicy: report
 YAML
 fi
 sp_tier=$(jp serviceprovider "$RETAINED_NS" "$PROVIDER" '{.metadata.labels.tier}')
@@ -1106,6 +1133,13 @@ spec:
         streams:
           - name: invoices
             subjects: ["streamapp2.invoices.>"]
+            # `workqueue`, and the retention is the POINT, not a detail:
+            # ADR 0061 §4.1's `sources` drain is destructive only against
+            # a workqueue origin, so `NamespaceDrainRisk` (acceptance #11)
+            # has nothing to fire on without one. Also keeps criterion #8
+            # honest — a workqueue deletes a message once ACKED, and
+            # nothing consumes this stream, so the probe message stays.
+            retention: workqueue
             # 256Mi, NOT 1Gi — and the number is arithmetic, not taste.
             # Every claim in this namespace defaults to size `small`
             # (268435456 B, the seeded sizeBytes above), and the account's
@@ -1167,7 +1201,7 @@ for _c in "$CLAIM3" "$CLAIM4" "$CLAIM5"; do
 done
 assert_nack_healthy "after the declaring claims (streams + consumers) were applied"
 
-phase "Part 3 acceptance criteria — 8 checks, run independently (see this file's own note above)"
+phase "Part 3 + 2.5f acceptance criteria — 13 checks, run independently (see this file's own note above)"
 
 PART3_FAILED=0
 record_part3() {
@@ -1454,11 +1488,224 @@ YAML
 if part3_check_8; then record_part3 8 "latecomerapp's arrival left streamapp2_invoices's existing message(s) intact" 0
 else record_part3 8 "a second application arriving does NOT clear the first's streams (ADR 0042 §9.6's clear-on-allocation does NOT transfer verbatim — ADR 0061 §8's own correction)" 1; fi
 
+# ===============================================================
+# 2.5f acceptance criteria (#9-#13) — the observed-stream inventory
+# (ADR 0061 §7), the foreign-subject capture detector (§5) and the
+# conditions (§5/§6/§7).
+#
+# These run AFTER #1-#8 on purpose. #6 deletes streamapp and #7 tears
+# down the whole jslife namespace, so everything below is written against
+# the fixtures that SURVIVE to the end — walkapp (dynamicStreams:true),
+# consumerapp (whose consume target #6 just removed), streamapp2 (the
+# declared workqueue owner) and latecomerapp.
+#
+# Same not-fail-fast contract as #1-#8: each runs regardless of the
+# others' outcome and accumulates into PART3_FAILED.
+# ===============================================================
+
+# --- #9: the status inventory exists and classifies what it observed ---
+part3_check_9() {
+    local deadline dyn decl obs_at bytes
+    deadline=$(( $(date +%s) + 180 ))
+    # The inventory refreshes on the 60s resync gate for a ready claim
+    # (a ready claim never provisions again), so poll rather than sleep.
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        dyn=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM1" '{.status.streams.dynamic}')
+        decl=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM5" '{.status.streams.declared}')
+        if [[ "$dyn" == *walkstream* ]] && [[ "$decl" == *streamapp2_invoices* ]]; then
+            break
+        fi
+        sleep 5
+    done
+    obs_at=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM1" '{.status.streams.observedAt}')
+    bytes=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM1" '{.status.size.bytes}')
+    printf '    walkapp   status.streams.dynamic  = %s\n' "${dyn:-<unset>}"
+    printf '    walkapp   status.streams.observedAt = %q\n' "${obs_at:-}"
+    printf '    walkapp   status.size.bytes       = %q\n' "${bytes:-}"
+    printf '    streamapp2 status.streams.declared = %s\n' "${decl:-<unset>}"
+    # walkstream was created BY walkapp's own user, under its own prefix,
+    # and declared by nobody — the definition of `dynamic`. Its bytes are
+    # what `apprafter app status` renders through the generic size path.
+    [[ "$dyn" == *walkstream* ]] || return 1
+    [[ "$decl" == *streamapp2_invoices* ]] || return 1
+    [ -n "$obs_at" ] || return 1
+    [ -n "$bytes" ] && [ "$bytes" -ge 1 ]
+}
+if part3_check_9; then record_part3 9 "status.streams classifies observed streams (declared/dynamic) and status.size.bytes is real" 0
+else record_part3 9 "the status inventory (ADR 0061 §7) lists walkstream as walkapp's DYNAMIC stream, streamapp2_invoices as streamapp2's DECLARED one, and carries a live observedAt + size" 1; fi
+
+# --- #10: a foreign-subject capture is detected on the VICTIM's claim ---
+# walkapp holds `dynamicStreams: true`, so it may create a stream — and
+# NATS does not permission-check a stream's SUBJECTS at creation (subjects
+# travel in the request body, which the server never inspects while
+# evaluating permissions; ADR 0061's opening constraint). That is the
+# whole reason detection has to exist: this capture cannot be prevented,
+# only observed.
+#
+# streamapp2 does NOT hold the flag, so it provably could not have created
+# a stream under its own prefix — which is what makes the detection EXACT
+# here rather than a guess (ADR 0061 §3).
+#
+# Subjects are `streamapp2.evil.>`, deliberately NOT under
+# `streamapp2.invoices.>`: nats-server refuses to create a stream whose
+# subjects overlap an existing WORKQUEUE stream's, and this check is about
+# the detector, not about that refusal.
+part3_check_10() {
+    local out deadline victim_status victim_msg innocent ev
+    write_pod_file /tmp/capture1.json <<'JSON'
+{"name":"capture1","subjects":["streamapp2.evil.>"],"storage":"file","retention":"limits","max_consumers":-1,"max_msgs":-1,"max_bytes":-1,"max_age":0,"max_msgs_per_subject":-1,"max_msg_size":-1,"discard":"old","num_replicas":1,"duplicate_window":120000000000}
+JSON
+    out=$(nats_run --server "$CONN1_SERVER" --user "$CONN1_USER" --password "$CONN1_PASS" \
+        --inbox-prefix "$CONN1_INBOX_PREFIX" stream add capture1 --config /tmp/capture1.json 2>&1) || {
+        printf '    walkapp could not create the capture stream: %s\n' "$out"
+        return 1
+    }
+    printf '    walkapp (dynamicStreams:true) created a stream over streamapp2 subjects: %s\n' \
+        "$(printf '%s' "$out" | tail -1)"
+
+    deadline=$(( $(date +%s) + 180 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        victim_status=$(cond_status "$CLAIM_RES" "$APP_NS" "$CLAIM5" ForeignSubjectCapture)
+        [ "$victim_status" = "True" ] && break
+        sleep 5
+    done
+    victim_msg=$(cond_message "$CLAIM_RES" "$APP_NS" "$CLAIM5" ForeignSubjectCapture)
+    innocent=$(cond_status "$CLAIM_RES" "$APP_NS" "$CLAIM1" ForeignSubjectCapture)
+    ev=$(kubectl -n "$APP_NS" get events -o json 2>/dev/null \
+        | jq -r '[.items[] | select(.reason=="ForeignSubjectCapture") | .involvedObject.name] | join(",")')
+    printf '    streamapp2 (victim)  ForeignSubjectCapture = %q\n' "${victim_status:-<unset>}"
+    printf '    streamapp2 message: %s\n' "${victim_msg:-<none>}"
+    printf '    walkapp    (its own dynamic stream is legitimate) ForeignSubjectCapture = %q\n' "${innocent:-<unset>}"
+    printf '    ForeignSubjectCapture events on: %s\n' "${ev:-<none>}"
+    # The capture stream must STILL EXIST: the shipped policy is `report`,
+    # and a `report` that quietly deleted would be the worst of both.
+    mgr_nats_run "$APP_NS" stream info capture1 --json >/dev/null 2>&1 || {
+        printf '    capture1 is GONE — capturePolicy=report must not delete\n'
+        return 1
+    }
+    [ "$victim_status" = "True" ] || return 1
+    [[ "$victim_msg" == *capture1* ]] || return 1
+    [ -z "$innocent" ] || return 1
+    [[ "$ev" == *"$CLAIM5"* ]]
+}
+if part3_check_10; then record_part3 10 "a foreign-subject capture raises ForeignSubjectCapture + an Event on the VICTIM's claim, and does not fire on the innocent neighbour" 0
+else record_part3 10 "a stream created under streamapp2's prefix by an application holding dynamicStreams is detected on streamapp2's claim (condition + Event), is left in place under capturePolicy=report, and does NOT flag walkapp's own legitimate dynamic stream" 1; fi
+
+# --- #11: NamespaceDrainRisk fires on the workqueue owner, and the two
+#          conditions that must NOT fire here do not ---
+part3_check_11() {
+    local deadline drain drain_msg bystander overlap
+    deadline=$(( $(date +%s) + 180 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        drain=$(cond_status "$CLAIM_RES" "$APP_NS" "$CLAIM5" NamespaceDrainRisk)
+        [ "$drain" = "True" ] && break
+        sleep 5
+    done
+    drain_msg=$(cond_message "$CLAIM_RES" "$APP_NS" "$CLAIM5" NamespaceDrainRisk)
+    # consumerapp owns no workqueue and holds no dynamicStreams — it is
+    # neither the party at risk nor the risk, so the narrowed rule must
+    # leave it alone. Without this half, a rule that fired on every claim
+    # in the namespace would look identical to a correct one.
+    bystander=$(cond_status "$CLAIM_RES" "$APP_NS" "$CLAIM4" NamespaceDrainRisk)
+    # Nothing in this account carries subjects overlapping
+    # streamapp2.invoices.> (capture1 is streamapp2.evil.>), so the
+    # overlap condition must stay silent even though a workqueue exists.
+    overlap=$(cond_status "$CLAIM_RES" "$APP_NS" "$CLAIM5" WorkqueueSubjectOverlap)
+    printf '    streamapp2 (workqueue owner)     NamespaceDrainRisk = %q\n' "${drain:-<unset>}"
+    printf '    streamapp2 message: %s\n' "${drain_msg:-<none>}"
+    printf '    consumerapp (neither party)      NamespaceDrainRisk = %q\n' "${bystander:-<unset>}"
+    printf '    streamapp2 (no overlapping subjects) WorkqueueSubjectOverlap = %q\n' "${overlap:-<unset>}"
+    [ "$drain" = "True" ] || return 1
+    [[ "$drain_msg" == *streamapp2_invoices* ]] || return 1
+    [ -z "$bystander" ] || return 1
+    [ -z "$overlap" ]
+}
+if part3_check_11; then record_part3 11 "NamespaceDrainRisk fires on the workqueue owner while a dynamicStreams neighbour exists, and fires on nobody else" 0
+else record_part3 11 "NamespaceDrainRisk names streamapp2_invoices on its owner's claim (a dynamicStreams neighbour can drain a workqueue via sources — ADR 0061 §4.1), leaves the uninvolved consumerapp alone, and WorkqueueSubjectOverlap stays silent with no overlapping stream" 1; fi
+
+# --- #12: ConsumeTargetMissing, once the owning application has gone ---
+# Criterion #6 deleted streamapp and its grace GC removed streamapp_orders.
+# consumerapp still declares a durable on it, so its consume entry now
+# names a stream nobody declares and that does not exist.
+part3_check_12() {
+    local deadline missing msg
+    deadline=$(( $(date +%s) + 180 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        missing=$(cond_status "$CLAIM_RES" "$APP_NS" "$CLAIM4" ConsumeTargetMissing)
+        [ "$missing" = "True" ] && break
+        sleep 5
+    done
+    msg=$(cond_message "$CLAIM_RES" "$APP_NS" "$CLAIM4" ConsumeTargetMissing)
+    printf '    consumerapp ConsumeTargetMissing = %q\n' "${missing:-<unset>}"
+    printf '    consumerapp message: %s\n' "${msg:-<none>}"
+    [ "$missing" = "True" ] || return 1
+    [[ "$msg" == *streamapp_orders* ]]
+}
+if part3_check_12; then record_part3 12 "ConsumeTargetMissing fires once the consumed stream's owning application has departed" 0
+else record_part3 12 "consumerapp's durable names streamapp_orders, which criterion #6 removed with its owner — the claim must say so rather than sitting silently on a consumer that can never be created" 1; fi
+
+# --- #13: QuotaExceeded is a PRE-FLIGHT, not an opaque server error ---
+# Every claim in `demo` is size `small` (256Mi), so the account's max_file
+# is a fraction of a gigabyte. A declaration of 8Gi cannot fit, and the
+# point of the pre-flight is WHERE that is reported: on the claim, naming
+# the stream and the numbers — rather than as nats-server's `insufficient
+# storage resources available (10047)` surfacing through NACK, which names
+# neither.
+part3_check_13() {
+    local reason msg stream_cr nats_stream
+    kubectl apply -f - <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${APP7}
+  namespace: ${APP_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+    replicas: 1
+    expose:
+      port: 80
+    needs:
+      jetstream:
+        selector:
+          tier: integrated
+        streams:
+          - name: huge
+            subjects: ["hogapp.huge.>"]
+            maxBytes: "8Gi"
+YAML
+    wait_jsonpath "$CLAIM_RES" "$APP_NS" "$CLAIM7" '{.spec.type}' jetstream 120 || return 1
+    local deadline
+    deadline=$(( $(date +%s) + 240 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        reason=$(cond_reason "$CLAIM_RES" "$APP_NS" "$CLAIM7" Ready)
+        [ "$reason" = "QuotaExceeded" ] && break
+        sleep 5
+    done
+    msg=$(cond_message "$CLAIM_RES" "$APP_NS" "$CLAIM7" Ready)
+    # The Stream CR must never have been applied, and the stream must never
+    # have been asked for — that is what "pre-flight" means here.
+    stream_cr=$(kubectl -n "$NATS_NS" get stream "${APP_NS}-${APP7}-huge" -o name 2>/dev/null || true)
+    nats_stream=1
+    mgr_nats_run "$APP_NS" stream info hogapp_huge --json >/dev/null 2>&1 || nats_stream=0
+    printf '    hogapp Ready reason = %q\n' "${reason:-<unset>}"
+    printf '    hogapp Ready message: %s\n' "${msg:-<none>}"
+    printf '    Stream CR present=%q ; stream exists in NATS=%s (both must be empty/0)\n' \
+        "${stream_cr:-}" "$nats_stream"
+    [ "$reason" = "QuotaExceeded" ] || return 1
+    [ -z "$stream_cr" ] || return 1
+    [ "$nats_stream" = "0" ]
+}
+if part3_check_13; then record_part3 13 "an over-budget declaration is refused by the pre-flight with QuotaExceeded, and no Stream CR or NATS stream is ever created" 0
+else record_part3 13 "a declared stream larger than the namespace account can hold surfaces QuotaExceeded on the claim (ADR 0061 §6) instead of nats-server's opaque 10047 through NACK, and the Stream CR is never applied" 1; fi
+
 phase "Part 3 acceptance criteria summary"
 if [ "$PART3_FAILED" -gt 0 ]; then
-    printf '  %d of 8 part-3 acceptance criteria are RED. Part 3 (NACK CR application) HAS landed, so each one is a real defect — not an expected gap.\n' "$PART3_FAILED"
+    printf '  %d of 13 acceptance criteria are RED. Part 3 (NACK CR application) and 2.5f (inventory/detector/conditions) have both landed, so each one is a real defect — not an expected gap.\n' "$PART3_FAILED"
 else
-    printf '  ok: all 8 part-3 acceptance criteria are GREEN.\n'
+    printf '  ok: all 13 acceptance criteria are GREEN.\n'
 fi
 
 # ===============================================================
@@ -1482,8 +1729,8 @@ printf '  ok: no "forbidden" anywhere in the operator log across the whole walk\
 # ===============================================================
 
 if [ "$PART3_FAILED" -gt 0 ]; then
-    phase "needs-jetstream-walk: part 2 GREEN, part-3 acceptance RED (${PART3_FAILED}/8) (elapsed $(elapsed))"
-    printf 'FINAL: PART-3-ACCEPTANCE-RED (%d/8) — every part-2 capability above stayed green; see the summary above for which of part 3'"'"'s eight criteria are unmet and why.\n' \
+    phase "needs-jetstream-walk: part 2 GREEN, acceptance RED (${PART3_FAILED}/13) (elapsed $(elapsed))"
+    printf 'FINAL: ACCEPTANCE-RED (%d/13) — every part-2 capability above stayed green; see the summary above for which of the thirteen criteria are unmet and why.\n' \
         "$PART3_FAILED"
     exit 1
 fi

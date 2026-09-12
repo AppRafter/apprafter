@@ -117,6 +117,33 @@ pub const FIELD_MANAGER: &str = "resourceclaim-provisioner";
 /// size-only apply would prune that too.
 pub const SIZE_FIELD_MANAGER: &str = "resourceclaim-provisioner-size";
 
+/// Field manager for the **jetstream inventory and its conditions only**
+/// (2.5f / ADR 0061 §5/§7) — `status.streams` plus the condition types in
+/// `nats::JETSTREAM_CONDITION_TYPES`.
+///
+/// A third manager for the same reason there is a second (see
+/// [`SIZE_FIELD_MANAGER`]), and it buys something specific here beyond
+/// avoiding a prune. The detector runs on a DIFFERENT cadence from
+/// provisioning — a ready claim never provisions again
+/// (`should_provision` is false), so the inventory refreshes on the 60s
+/// resync gate — and the provisioning path's own early returns write
+/// `Ready=False` with no inventory at all. Under one manager those two
+/// writers would take turns pruning each other's fields: every
+/// "waiting for the StatefulSet" write would erase a live
+/// `ForeignSubjectCapture`, and every inventory refresh would erase
+/// `ready`/`connectionSecretRef`.
+///
+/// `status.conditions` is an SSA **list-type map keyed by `type`** in the
+/// CRD, which is what makes two managers writing conditions
+/// well-defined: each owns its own entries, so this manager's apply
+/// merges alongside the provisioner's `Ready` instead of replacing the
+/// list. A condition that stops firing is OMITTED from this manager's
+/// next apply and pruned — which is exactly how "the problem went away"
+/// should read.
+///
+/// **Nothing else may ever be written under this manager.**
+pub const JETSTREAM_FIELD_MANAGER: &str = "resourceclaim-provisioner-jetstream";
+
 /// Finalizer the provisioner installs so deletes are observed. On
 /// delete it only logs (role/DB retained for 2.4f) and self-removes.
 pub(crate) const PROVISIONER_FINALIZER: &str = "apprafter.io/resourceclaim-provisioner";

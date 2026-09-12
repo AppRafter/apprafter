@@ -33,11 +33,29 @@ pub struct ClaimView {
 }
 
 /// A stream this application declares.
+///
+/// `retention` and `max_bytes` are carried for 2.5f's conditions, not for
+/// the accounts file — `render_account` reads neither, and deliberately:
+/// `NamespaceDrainRisk` and `WorkqueueSubjectOverlap` are facts about
+/// `retention: workqueue` (ADR 0061 §4.1's drain primitive only bites a
+/// workqueue origin), and `QuotaExceeded` is arithmetic over `maxBytes`
+/// (§6). Both live on the DECLARATION, so the claim view is the only
+/// place they can reach the provisioner; a second flattening pass over
+/// the same claims would be a second thing to keep in step.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StreamView {
     pub name: String,
     pub subjects: Vec<String>,
     pub allow_purge: bool,
+    /// `limits` (the CRD default when absent) | `interest` | `workqueue`.
+    /// `None` means the manifest said nothing, which NACK renders as
+    /// `limits` — so a reader asking "is this a workqueue" must treat
+    /// `None` as "no", never as "unknown".
+    pub retention: Option<String>,
+    /// The declared Kubernetes quantity STRING (`"1Gi"`), not bytes —
+    /// parsed at the use site by [`crate::nats::quantity_bytes`]. Required
+    /// by the CRD, so it is never empty on a claim that reached this far.
+    pub max_bytes: String,
 }
 
 /// A declared durable consumer this application holds on `owner`'s stream.
@@ -445,7 +463,14 @@ fn fmt_subject_list(subjects: &[String]) -> String {
 /// compose: this function's return value is exactly what each account's
 /// `max_file` promises, and the global check is a sum of promises, not
 /// of raw requests.
-fn namespace_quota_bytes(peers: &[ClaimView], ceiling_bytes: u64) -> u64 {
+///
+/// `pub(crate)` for 2.5f: `nats::quota_verdict`'s `QuotaExceeded` pre-flight
+/// (ADR 0061 §6) must check declarations against the SAME number this
+/// renders into the account's `max_file`, or the pre-flight would refuse
+/// streams the server would have accepted (or, worse, pass ones it will
+/// not). One derivation, two readers — never a second copy of the
+/// sum-then-clamp order, which is the part that is easy to get backwards.
+pub(crate) fn namespace_quota_bytes(peers: &[ClaimView], ceiling_bytes: u64) -> u64 {
     peers
         .iter()
         .map(|c| c.quota_bytes)
@@ -691,6 +716,8 @@ mod tests {
             name: "blocks-head".into(),
             subjects: vec!["feeder.blocks.head.>".into()],
             allow_purge: false,
+            retention: None,
+            max_bytes: "1Gi".into(),
         }];
         let mut b = claim("demo", "indexer");
         b.consumes = vec![ConsumeView {
@@ -779,6 +806,8 @@ mod tests {
             name: "blocks-head".into(),
             subjects: vec!["feeder.blocks.head.>".into()],
             allow_purge: true,
+            retention: None,
+            max_bytes: "1Gi".into(),
         }];
         for subj in allow_list(&c) {
             if !subj.starts_with("$JS.API.")

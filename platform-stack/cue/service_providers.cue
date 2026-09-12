@@ -165,6 +165,33 @@ _serviceProviders: {
 			// flagged gap between the per-account memory floor and the
 			// server-wide memory ceiling.
 			ceilingBytes: 4294967296 // 4Gi
+
+			// What the provisioner does about a stream carrying
+			// subjects under an application's prefix that no
+			// declaration in the namespace accounts for (ADR 0061
+			// §5's policy ladder). `report` — a
+			// `ForeignSubjectCapture` condition on the victim's
+			// claim plus a Kubernetes Event — is the default and
+			// what ships; `delete` removes the offending stream,
+			// and is an operator's escalation rather than a
+			// setting to leave on.
+			//
+			// The ladder has exactly these two rungs. ADR 0061 §5
+			// also names `quarantine` (revoke the culprit's
+			// STREAM.CREATE/UPDATE), and it is deliberately NOT
+			// implemented: it needs ATTRIBUTION, NATS records no
+			// creator on a stream, and the advisory subscription
+			// that might supply one is unverified (that ADR's own
+			// pre-merge verification item 6). Setting it here
+			// falls back to `report` with a warning rather than
+			// silently doing nothing under a reassuring name.
+			//
+			// Stated explicitly even though it equals the code's
+			// own default, because this is the file an operator
+			// edits to change it — a knob whose only
+			// documentation is a Rust `Default` impl is a knob
+			// nobody finds.
+			capturePolicy: "report"
 		}
 	}
 
