@@ -61,6 +61,16 @@
 #       numbers, instead of by nats-server as an opaque 10047 through
 #       NACK — and no Stream CR is applied at all.
 #
+# 2.5 part 4 adds the fourteenth, and it is about an edit that is REFUSED
+# rather than about NATS at all:
+#
+#   14. turning `dynamicStreams` on pauses the application behind a
+#       security-boundary MigrationPlan (ADR 0052 trigger #15) before any
+#       child is applied, and taking it back off — a narrowing — clears the
+#       gate instead of asking again. The classification is unit-tested;
+#       what only a cluster shows is that the edit actually STOPS, with the
+#       plan's approval hash stamped and no claim generated meanwhile.
+#
 # UNPUBLISHED-COMPONENT SUBSTITUTION — read this before touching the
 # script
 # -------------------------------------------------------------------
@@ -1224,7 +1234,7 @@ for _c in "$CLAIM3" "$CLAIM4" "$CLAIM5"; do
 done
 assert_nack_healthy "after the declaring claims (streams + consumers) were applied"
 
-phase "Part 3 + 2.5f acceptance criteria — 13 checks, run independently (see this file's own note above)"
+phase "Part 3 + 2.5f + 2.5 part-4 acceptance criteria — 14 checks, run independently (see this file's own note above)"
 
 PART3_FAILED=0
 record_part3() {
@@ -1724,11 +1734,129 @@ YAML
 if part3_check_13; then record_part3 13 "an over-budget declaration is refused by the pre-flight with QuotaExceeded, and no Stream CR or NATS stream is ever created" 0
 else record_part3 13 "a declared stream larger than the namespace account can hold surfaces QuotaExceeded on the claim (ADR 0061 §6) instead of nats-server's opaque 10047 through NACK, and the Stream CR is never applied" 1; fi
 
+# --- #14: turning `dynamicStreams` on PAUSES the application behind a
+#          MigrationPlan (ADR 0052 trigger #15 / ADR 0061 §7) ---
+#
+# The one jetstream gating trigger a live cluster can show end to end in a
+# single field edit, and the only one of the three whose whole chain —
+# classifier → MigrationPlan CR in the app namespace → paused Application →
+# children NOT applied — crosses three controllers and a CRD. A unit test
+# proves the classification; only this proves the edit actually stops.
+#
+# Its OWN namespace, and the baseline app declares NO needs at all. Two
+# reasons, both deliberate:
+#   * `demo`'s account budget is the SUM over its claims (see #13's own
+#     note) — a sixth claim there would move the number criterion #13
+#     measures against.
+#   * the baseline must be STAMPED (`status.lastAppliedSpec`) before the
+#     escalating edit lands, or the classifier has nothing to diff and the
+#     edit sails through un-gated. A needs-free app renders immediately, so
+#     the stamp does not wait on NATS provisioning at all — and the
+#     `(absent) → true` transition is the same trigger-#15 arm as
+#     `false → true` (absent IS the effective false).
+#
+# The revert half is the NEGATIVE, and it is the one that would catch a
+# detector that fired on PRESENCE rather than on the delta: taking the flag
+# back off is a NARROWING, so the plan must be cleaned up and the app must
+# resume — not pause a second time.
+GATE_NS="jsgate"
+APP8="gateapp"
+gate_app_yaml() {
+    # $1 = the needs block ("" for none) — everything else is identical, so
+    # the diff the classifier sees is exactly the one field.
+    cat <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${APP8}
+  namespace: ${GATE_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+    replicas: 1
+    expose:
+      port: 80
+${1}
+YAML
+}
+part3_check_14() {
+    local plan phase_got trigger from to classification hash claims
+    kubectl create namespace "$GATE_NS" 2>/dev/null || true
+    gate_app_yaml "" | kubectl apply -f - >/dev/null || return 1
+    # The stamped baseline is the precondition for ANY detection.
+    # `status.lastAppliedSpec` is the WHOLE `ApplicationSpec` (it stamps
+    # `app.spec`, base + environments), not the effective base — so the
+    # image lives under `.base.image`. The classifier runs
+    # `effective_baseline` over it to get the per-environment effective
+    # spec it diffs against.
+    wait_jsonpath "$APP_RES" "$GATE_NS" "$APP8" \
+        '{.status.lastAppliedSpec.base.image}' 'nginxdemos/hello:plain-text' 180 || return 1
+
+    # The escalation: one field.
+    gate_app_yaml "    needs:
+      jetstream:
+        selector:
+          tier: integrated
+        dynamicStreams: true" | kubectl apply -f - >/dev/null || return 1
+
+    local deadline
+    deadline=$(( $(date +%s) + 180 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        plan=$(kubectl -n "$GATE_NS" get migrationplan.apprafter.io \
+            -l "apprafter.io/application=${APP8}" -o name 2>/dev/null | head -n 1 || true)
+        [ -n "$plan" ] && break
+        sleep 5
+    done
+    if [ -z "${plan:-}" ]; then
+        printf '    no MigrationPlan appeared in %s for %s within 180s\n' "$GATE_NS" "$APP8"
+        kubectl -n "$GATE_NS" get "$APP_RES" "$APP8" -o yaml 2>&1 | tail -40
+        return 1
+    fi
+    plan="${plan#migrationplan.apprafter.io/}"
+    trigger=$(jp migrationplan.apprafter.io "$GATE_NS" "$plan" '{.spec.trigger.type}')
+    from=$(jp migrationplan.apprafter.io "$GATE_NS" "$plan" '{.spec.trigger.from}')
+    to=$(jp migrationplan.apprafter.io "$GATE_NS" "$plan" '{.spec.trigger.to}')
+    classification=$(jp migrationplan.apprafter.io "$GATE_NS" "$plan" '{.spec.risks.classification}')
+    hash=$(jp migrationplan.apprafter.io "$GATE_NS" "$plan" '{.spec.trigger.approvedSpecHash}')
+    printf '    plan %s: trigger=%q %q→%q classification=%q hash=%.12s…\n' \
+        "$plan" "$trigger" "$from" "$to" "$classification" "${hash:-<unset>}"
+    assert_eq "MigrationPlan trigger type" "$trigger" "jetstream-dynamic-streams-enable" || return 1
+    assert_eq "MigrationPlan trigger from" "$from" "false" || return 1
+    assert_eq "MigrationPlan trigger to" "$to" "true" || return 1
+    assert_eq "MigrationPlan classification" "$classification" "security-boundary" || return 1
+    [ -n "$hash" ] || { printf '    approvedSpecHash is empty — a hashless plan can never consume (ADR 0052 §4)\n'; return 1; }
+
+    # Paused, and — the part that matters — the escalation has NOT taken
+    # effect: no jetstream claim was generated while approval is pending.
+    wait_jsonpath "$APP_RES" "$GATE_NS" "$APP8" '{.status.phase}' \
+        'AwaitingMigrationApproval' 120 || return 1
+    claims=$(kubectl -n "$GATE_NS" get "$CLAIM_RES" -o name 2>/dev/null || true)
+    printf '    ResourceClaims in %s while the plan is pending: %s\n' "$GATE_NS" "${claims:-<none>}"
+    [ -z "$claims" ] || return 1
+
+    # Revert — a narrowing. The plan is superseded and the app resumes.
+    gate_app_yaml "" | kubectl apply -f - >/dev/null || return 1
+    wait_gone migrationplan.apprafter.io "$GATE_NS" "$plan" 180 || return 1
+    deadline=$(( $(date +%s) + 120 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        phase_got=$(jp "$APP_RES" "$GATE_NS" "$APP8" '{.status.phase}')
+        [ "$phase_got" != "AwaitingMigrationApproval" ] && break
+        sleep 5
+    done
+    printf '    after the revert: %s/%s phase=%q (must not be AwaitingMigrationApproval)\n' \
+        "$GATE_NS" "$APP8" "${phase_got:-<unset>}"
+    [ "$phase_got" != "AwaitingMigrationApproval" ]
+}
+if part3_check_14; then record_part3 14 "enabling needs.jetstream.dynamicStreams pauses the application behind a security-boundary MigrationPlan, generates no claim while it waits, and reverting clears the gate" 0
+else record_part3 14 "flipping needs.jetstream.dynamicStreams to true creates a MigrationPlan with trigger jetstream-dynamic-streams-enable (ADR 0052 #15), pauses the Application before any child is applied, and taking the flag back off supersedes the plan instead of re-gating" 1; fi
+
 phase "Part 3 acceptance criteria summary"
 if [ "$PART3_FAILED" -gt 0 ]; then
-    printf '  %d of 13 acceptance criteria are RED. Part 3 (NACK CR application) and 2.5f (inventory/detector/conditions) have both landed, so each one is a real defect — not an expected gap.\n' "$PART3_FAILED"
+    printf '  %d of 14 acceptance criteria are RED. Part 3 (NACK CR application), 2.5f (inventory/detector/conditions) and 2.5 part 4 (the migration triggers) have all landed, so each one is a real defect — not an expected gap.\n' "$PART3_FAILED"
 else
-    printf '  ok: all 13 acceptance criteria are GREEN.\n'
+    printf '  ok: all 14 acceptance criteria are GREEN.\n'
 fi
 
 # ===============================================================
@@ -1752,8 +1880,8 @@ printf '  ok: no "forbidden" anywhere in the operator log across the whole walk\
 # ===============================================================
 
 if [ "$PART3_FAILED" -gt 0 ]; then
-    phase "needs-jetstream-walk: part 2 GREEN, acceptance RED (${PART3_FAILED}/13) (elapsed $(elapsed))"
-    printf 'FINAL: ACCEPTANCE-RED (%d/13) — every part-2 capability above stayed green; see the summary above for which of the thirteen criteria are unmet and why.\n' \
+    phase "needs-jetstream-walk: part 2 GREEN, acceptance RED (${PART3_FAILED}/14) (elapsed $(elapsed))"
+    printf 'FINAL: ACCEPTANCE-RED (%d/14) — every part-2 capability above stayed green; see the summary above for which of the fourteen criteria are unmet and why.\n' \
         "$PART3_FAILED"
     exit 1
 fi
