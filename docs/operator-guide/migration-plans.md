@@ -10,7 +10,7 @@ previous version keeps running until you act.
 
 Why the gate exists and why the three scopes behave differently is
 [How the approval gate works](../how-it-works/the-approval-gate.md). The
-developer-facing half — the thirteen manifest edits that hold, written as edits
+developer-facing half — the sixteen manifest edits that hold, written as edits
 rather than as trigger names — is
 [When a change needs approval](../dev-guide/when-a-change-needs-approval.md).
 
@@ -51,7 +51,7 @@ Platform-stack specific triggers (applied when diffing a
 For an application edit, the diff is taken between the last applied
 spec and the new spec, each evaluated under its own environment, so a
 change in one environment gates only that environment's deployment.
-Thirteen edits gate. Read the `security-boundary` half twice: several
+Sixteen edits gate. Read the `security-boundary` half twice: several
 of them are things people think of as additions.
 
 | The edit | Trigger | Class |
@@ -69,6 +69,9 @@ of them are things people think of as additions.
 | An env key becomes a `secret:"name/key"` reference — from absent, from a literal, or from a `claim.…` reference | `env-secret-ref-add` | `security-boundary` |
 | An env key stops being a reference and becomes a literal | `env-ref-downgrade` | `security-boundary` |
 | An env key's `secret:` reference is re-pointed at a different secret | `env-secret-ref-retarget` | `security-boundary` |
+| A `needs.jetstream.consume` entry is added that names **another** application — the two now share that stream | `jetstream-consume-add` | `security-boundary` |
+| `needs.jetstream.dynamicStreams` goes from off (or absent) to **on** — the app can then read every stream in its namespace and drain every work queue in it | `jetstream-dynamic-streams-enable` | `security-boundary` |
+| A declared stream gains a subject outside the application's own prefix, or `allowPurge` is set on a stream that already carries one | `jetstream-foreign-subject` | `security-boundary` |
 
 A hostname swap `{a}` → `{b}` on a public app fires **two** — `a` was
 lost (`domain-change`) and `b` was gained (`public-hostname-add`) —
@@ -87,7 +90,10 @@ ones emit a `SoftDestructiveChange` Kubernetes Event you can see with
 
 - Adding a `needs`, or an env var that is a **literal** or a
   `claim.…` reference. (An added `secret:` reference gates — the row
-  above.)
+  above. So does a first `needs.jetstream` that already carries
+  `dynamicStreams: true`, a foreign `consume` or a foreign subject: the
+  three jetstream rows above are about the capability, not about when it
+  arrived, and absent counts as off.)
 - Any hostname or port edit on a **non-public** app: nothing is routed,
   so nothing changes externally.
 - Scaling from zero (0 → N) or down to a non-zero count.

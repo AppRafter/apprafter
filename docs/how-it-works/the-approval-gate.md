@@ -118,9 +118,9 @@ and then deletes the plan.
 ## See also
 
 - [Migration plans](../operator-guide/migration-plans.md) — approving one, and
-  the thirteen application edits that create one.
+  the sixteen application edits that create one.
 - [When a change needs approval](../dev-guide/when-a-change-needs-approval.md) —
-  the same thirteen, as edits a developer makes.
+  the same sixteen, as edits a developer makes.
 - [The repository's architectural specification](https://github.com/apprafter/apprafter/blob/master/spec.md),
   §3.8 — the full `MigrationPlan` field reference. A roadmap document, not
   published on this site.

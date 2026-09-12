@@ -14,7 +14,7 @@ exactly what you pushed.
 
 ## The edits that hold
 
-Thirteen, and the ones people are surprised by are in the second group —
+Sixteen, and the ones people are surprised by are in the second group —
 adding something feels safe, and some additions change who can reach your
 application or what gets pulled into it.
 
@@ -40,6 +40,9 @@ application or what gets pulled into it.
 | Add a `secret:"name/key"` reference to an `env` key | a secret reaches a container that did not have one |
 | Turn an `env` reference back into a literal | a value that was indirect is now in Git |
 | Re-point an existing `secret:` reference at a different secret | a different secret reaches the same variable |
+| Add a `needs.jetstream.consume` entry naming another application | you and that application now share a stream, and each can disturb the other's consumer on it |
+| Turn `needs.jetstream.dynamicStreams` on | your application can then read every stream in its namespace, and drain every work queue in it |
+| Declare a stream subject outside your own prefix, or set `allowPurge` on a stream that already has one | you collect — or, with `allowPurge`, destroy — messages belonging to another application |
 
 **Changing only the image tag does not hold.** That is the ordinary deploy —
 see [Image iteration](image-iteration.md). Neither does adding a `needs`, adding
