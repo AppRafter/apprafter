@@ -3135,19 +3135,28 @@ instead of carrying parallel definitions.
 **Полный дизайн + измерения + альтернативы + риски — ADR 0061.** Три факта из него переписали исходную постановку ниже: lifecycle-оператора у NATS нет (`nats-operator` заархивирован) → официальный helm-чарт как **лениво включаемый компонент** platform-stack, а не «NATS-кластер embedded в kine»; аккаунт выдаётся **на namespace**, а не на claim, и заводится **config-file-аккаунтами** (`user`/`password`, как у redis), а не JWT/NKEY; персистентность — свойство **стрима** (`storage: file|memory`), поэтому `persistent` для jetstream отклоняется.
 
 **Поставка:**
-- [ ] `component_nats.cue` + `component_nack.cue` (`enabled: false`), namespace `nats-system` отгружается безусловно; провижионер включает компонент merge-патчем `PlatformStack.spec.overrides.nats.enabled` и жнёт по предикату ADR 0042 §9.1.
-- [ ] Сид `jetstream-integrated` ServiceProvider с **пином образа сервера** и tier-aware маппингом `#Size` → квота аккаунта.
-- [ ] `Backend::Nats` в `resourceclaim-provisioner` (модуль `nats_accounts.rs` — чистый рендер; `nats_client.rs` — I/O): аккаунт `ns_<namespace>`, юзер на claim, `mgr_<ns>`, файл аккаунтов выводится ЦЕЛИКОМ из живого множества claim'ов, единственный писатель.
-- [ ] **Allow-список перечисляет глаголы и ЯВЛЯЕТСЯ границей безопасности**; deny лишь вырезает дыры в том, что он впустил. `dynamicStreams` — решение allow-списка, НЕ blanket-deny (ADR 0061 §4.3: позиционные паттерны полны против замкнутого множества и дырявы против произвольной глубины токенов — измерено).
-- [ ] Deny-вектор: **по позициям, не по именам глаголов** для полностью запрещённых стримов; обе формы `$JS.ACK`/`$JS.FC` (v1 и v2); вектор на **консьюмеров** для разделённых стримов.
-- [ ] `#JetStreamNeed` в схеме: `{selector?, size?, dynamicStreams?, streams?, consume?}` + `name?`/`persistent?` объявлены ТОЛЬКО чтобы вебхук их отклонял (иначе apiserver вырежет их молча). Четыре зеркала + `crdgen` + `just crd-validate`.
-- [ ] Connection-Secret: `url host port user pass account subjectPrefix inboxPrefix`; `jetstream` уходит из `CLAIM_UNSUPPORTED_TYPES`.
-- [ ] Объявленные стримы и дюрейблы через NACK CR в `nats-system` (cross-namespace ownerRef запрещён → удаление явное, как у `needs.disk`).
-- [ ] Триггеры ADR 0052 #14/#15/#16 + переформулировка carve-out #7.
-- [ ] Детектор `ForeignSubjectCapture` (`report`/`delete`), условия `QuotaExceeded`, `PrefixPreCaptured`, `NamespaceDrainRisk`, `WorkqueueSubjectOverlap`.
-- [ ] `shipped.rs` `jetstream`: `Declared` → `Shipped`; `operator-guide/jetstream.md`, страница в `how-it-works/`, строка в `docs/status.md`.
+- [x] `component_nats.cue` + `component_nack.cue` (`enabled: false`), namespace `nats-system` отгружается безусловно; провижионер включает компонент merge-патчем `PlatformStack.spec.overrides.nats.enabled` и жнёт по предикату ADR 0042 §9.1.
+- [x] Сид `jetstream-integrated` ServiceProvider с **пином образа сервера** и tier-aware маппингом `#Size` → квота аккаунта.
+- [x] `Backend::Nats` в `resourceclaim-provisioner` (модуль `nats_accounts.rs` — чистый рендер; `nats_client.rs` — I/O): аккаунт `ns_<namespace>`, юзер на claim, `mgr_<ns>`, файл аккаунтов выводится ЦЕЛИКОМ из живого множества claim'ов, единственный писатель.
+- [x] **Allow-список перечисляет глаголы и ЯВЛЯЕТСЯ границей безопасности**; deny лишь вырезает дыры в том, что он впустил. `dynamicStreams` — решение allow-списка, НЕ blanket-deny (ADR 0061 §4.3: позиционные паттерны полны против замкнутого множества и дырявы против произвольной глубины токенов — измерено).
+- [x] Deny-вектор: **по позициям, не по именам глаголов** для полностью запрещённых стримов; обе формы `$JS.ACK`/`$JS.FC` (v1 и v2); вектор на **консьюмеров** для разделённых стримов.
+- [x] `#JetStreamNeed` в схеме: `{selector?, size?, dynamicStreams?, streams?, consume?}` + `name?`/`persistent?` объявлены ТОЛЬКО чтобы вебхук их отклонял (иначе apiserver вырежет их молча). Четыре зеркала + `crdgen` + `just crd-validate`.
+- [x] Connection-Secret: `url host port user pass account subjectPrefix inboxPrefix`; `jetstream` уходит из `CLAIM_UNSUPPORTED_TYPES`.
+- [x] Объявленные стримы и дюрейблы через NACK CR в `nats-system` (cross-namespace ownerRef запрещён → удаление явное, как у `needs.disk`).
+- [x] Триггеры ADR 0052 #14/#15/#16 + переформулировка carve-out #7.
+- [x] Детектор `ForeignSubjectCapture` (`report`/`delete`), условия `QuotaExceeded`, `PrefixPreCaptured`, `NamespaceDrainRisk`, `WorkqueueSubjectOverlap`.
+- [x] `shipped.rs` `jetstream`: `Declared` → `Shipped`; `operator-guide/jetstream.md`, страница в `how-it-works/`, строка в `docs/status.md`.
 
 **Acceptance:** приложение объявляет `needs.jetstream` со стримом и `consume` на стрим соседа — оба работают; третье приложение упирается в `NOPERM`; подделка ack и подписка на `_INBOX.>` отклоняются; `dynamicStreams: false` не может создать стрим с `sources` на чужой; удаление claim'а сносит его стримы и не трогает соседские.
+
+**Открытое после закрытия 2.5** (найдено при написании доксов в part 4; ни один гейт этого не ловит):
+- **Egress-правила для NATS нет.** ADR 0061 §1 обещает, что координаты сервера попадают в needs-derived egress-политику (ADR 0045) как тройка `(namespace, podSelector, port)` — но `default_target` в `operator-rendering/src/egress.rs` арма `jetstream` не имеет. CNP рендерится всегда, egress становится default-deny, `world` не покрывает in-cluster endpoints — то есть под приложения с `needs.jetstream` НЕ дотягивается до `nats-system:4222` на любом профиле. Walk этого показать не мог: он поднимается без Cilium (`k3d_up`, не `kind_up_cilium`), а весь NATS-трафик в нём идёт из `nats-box`, который не Application и никаким CNP не селектится. Доки говорят об этом прямо (guide + how-it-works), и `docsgen behaviour::CLAIMS` заставит их отозвать фразу в тот день, когда арм появится.
+- **Вебхук не отклоняет per-env override, который роняет `streams`/`consume`.** ADR 0061 §6 обещает отказ с указанием того, что теряется; в `validate_jetstream_need` такой проверки нет, а merge в `effective_spec` остаётся per-key whole-object replace. Значит `environments.prod.needs.jetstream: {size: …}` молча сносит весь контракт продьюсера/консьюмера для этого окружения. Документировано как поведение, не как баг — но обещание ADR не выполнено.
+- **`status.account`/`subjectPrefix`/`inboxPrefix` на claim не пишутся** (ADR 0061 §8 их называет) — значения есть только в connection-Secret. Возможно, это правильнее; расхождение с ADR зафиксировано, чтобы не считаться потерей.
+- **`backing_resource` в `app status` для jetstream-claim'а печатает `—`** (нет `instance`/`dbnum`/`volumeClaimRef`). Косметика.
+- **Глобальная сумма квот не зажата** — ADR 0061 §6 сам это помечает открытым; ceiling пер-namespace, PVC один на сервер.
+- **`--needs jetstream` у `app scaffold` нет** (`KNOWN_NEEDS` = pg/redis/disk). Guide учит писать блок руками.
+- **`PrefixPreCaptured` покрыт только юнит-тестами** — на живом кластере не наблюдался ни разу.
 
 **Зависит от:** 2.3, ADR 0061
 

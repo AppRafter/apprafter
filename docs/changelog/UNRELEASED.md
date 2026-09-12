@@ -9,6 +9,104 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## platform-stack 0.2.69 / operator v0.2.49 — `needs.jetstream`: an account per namespace, streams in the manifest (2.5, unreleased)
+
+### Added
+
+- **`needs.jetstream` provisions a NATS account.** An application declares the
+  need and gets an account, a user, a subject prefix of its own, a private
+  reply-inbox prefix, and a connection Secret carrying `url`, `host`, `port`,
+  `user`, `pass`, `account`, `subjectPrefix` and `inboxPrefix` — bindable
+  through `claim.jetstream.<field>` the same way `claim.pg.url` already is.
+
+  The server is a platform component that is **off until the first claim asks
+  for it**, so a cluster with no JetStream application pays for no pod. The
+  provisioner writes the account file before turning the component on — the
+  naive order deadlocks, because the server pulls the file in by reference and
+  a pod mounting a file that is not there never starts — then waits for the
+  server and verifies by **connecting as the new user** rather than by waiting a
+  fixed time.
+
+- **The account belongs to the namespace, and applications inside it are
+  separated by subject permissions.** Each owns `<app>.` and may publish
+  nowhere else. An account per application would be the harder boundary, and
+  sharing a stream would then need cross-account exports and imports of a mapped
+  slice of the JetStream API — a much larger construct than the sharing it buys.
+  It stays the escape hatch for a tenant that needs real isolation. The
+  consequence to hold on to is that **the namespace is the trust boundary**.
+
+- **Streams and durable consumers are declared in the manifest**, not created at
+  runtime, and the claim stays unready until they are reported live. A declared
+  stream may collect subjects **outside** its owner's prefix, which is how a
+  shared work queue is expressed: producers still publish only under their own
+  prefixes, and it is the collector's permissions that widen — which is why the
+  declaration sits in the collector's manifest. That reversal is safe only
+  because a declared stream cannot be altered from the application side.
+
+- **An observed-stream inventory on the claim** — `status.streams` classifies
+  what the provisioner saw in the account as `declared`, `dynamic` or
+  `unattributed`, with an `observedAt`, refreshed on the 60-second resync.
+  `apprafter app status` renders the bytes through the generic size path.
+  Unattributed bytes are deliberately excluded: they belong to nobody the code
+  can name, and charging them to whichever claim shares a prefix would make one
+  tenant's figure move when another's stream grew.
+
+- **Capture detection, because prevention is not available.** NATS never
+  inspects a stream's subjects while evaluating permissions — they travel in the
+  request body — so a stream created over a neighbour's prefix cannot be
+  refused. It raises `ForeignSubjectCapture` on the **victim's** claim plus an
+  Event, and the shipped policy reports without deleting. `NamespaceDrainRisk`
+  tells a work-queue owner when a neighbour holds `dynamicStreams`;
+  `PrefixPreCaptured` tells an arriving application that its prefix is already
+  inside somebody else's stream; `ConsumeTargetMissing` says the stream a
+  durable names has gone; `QuotaExceeded` refuses an over-budget declaration
+  **before** any stream object is applied, naming the stream and the numbers
+  instead of surfacing the server's opaque storage error through a controller.
+
+- **Three new approval triggers** (ADR 0052 #14–#16), all `security-boundary`:
+  `jetstream-consume-add` when a `consume` entry names another application,
+  `jetstream-dynamic-streams-enable`, and `jetstream-foreign-subject` for a
+  declared subject outside the application's own prefix or `allowPurge` on a
+  stream that already carries one. Absent counts as off on all three, so a first
+  `needs.jetstream` that already carries the capability gates on arrival.
+  Trigger #15's approval text states the measured consequence — *read every
+  stream in the namespace, drain every work queue in it* — rather than the field
+  name. Taking any of them back is a narrowing and clears the gate instead of
+  asking again.
+
+- **Documentation:** `docs/operator-guide/jetstream.md` as the recipe and
+  `docs/how-it-works/needs-jetstream.md` as the mechanism, joined both ways,
+  plus the three missing trigger rows on `docs/operator-guide/migration-plans.md`
+  and its developer-side twin.
+
+### Changed
+
+- **`docsgen`'s shipped table classifies `jetstream` as `Shipped`.** It was
+  `Declared` — schema-valid, product-false — and the identifier gate used it as
+  its worked example of exactly that. The flip was deliberately held until the
+  gating that makes `consume` safe existed: a guide may not present a dependency
+  as usable while adding a neighbour's stream to it is an un-gated edit.
+
+### Known limits
+
+- **A `needs.jetstream` declaration carries no egress rule for the message
+  server.** A declaration normally opens the path to the thing declared, and a
+  `needs.pg` application is let through to Postgres — but the connection-target
+  catalog has no jetstream entry, so an application is handed working
+  credentials for a server its own pod is refused a connection to on every
+  network profile. Both new pages say so where a reader meets it, and a watched
+  behaviour claim will force the sentence to be retracted the day the entry
+  lands.
+- **A per-environment override replaces the whole `needs.jetstream` block**, as
+  it does for every other dependency — which is sharper here, because the block
+  holds the stream and consumer contract as well as the size.
+- **The storage ceiling is per namespace, not per cluster.** Two namespaces
+  sized near the ceiling can jointly promise more than the single shared volume
+  holds; nothing refuses that today.
+- **JetStream stores are out of scope for backup and restore**, and
+  `PrefixPreCaptured` has unit coverage only — it has never been observed on a
+  live cluster.
+
 ## platform-stack 0.2.68 / argocd-cue-cmp 0.1.24 — the sidecar pin follows its own image (unreleased)
 
 ### Fixed
