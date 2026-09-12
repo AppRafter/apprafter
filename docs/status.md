@@ -69,13 +69,13 @@ post-launch work is not a roadmap phase and has no subscribe control.
 > **JetStream is `🚧`, and what remains is verification rather than capability.** The account a
 > namespace shares, the streams and durable consumers declared beside the application, the storage
 > budget, the approval gates on the three edits that widen what an application can reach, and the
-> seven-day reclaim are all in force and exercised end to end on a cluster. The network rule is
-> now in force too — a declaration opens the path to the message server the same way it opens one
-> to a database or a cache — but it has been verified only as far as a cluster without Cilium
-> allows: the rule is applied and its selector demonstrably matches the running server. That the
-> traffic is then forwarded is proven for Postgres on the Cilium walk and not yet for this. One
-> further signal — the warning that an arriving application's subject prefix is already inside a
-> neighbour's stream — has unit coverage only and has never been observed on a live cluster.
+> seven-day reclaim are all in force and exercised end to end on a cluster. The network rule is in
+> force too — a declaration opens the path to the message server the same way it opens one to a
+> database or a cache — and it is now proven on a cluster running Cilium: an application that
+> declares the need reaches the server, one that declares nothing is dropped, and an application
+> that declares a different backend gets no path to this one. One further signal — the warning
+> that an arriving application's subject prefix is already inside a neighbour's stream — has unit
+> coverage only and has never been observed on a live cluster.
 > JetStream stores are also out of scope for backup and restore.
 
 ---

@@ -22,13 +22,20 @@
 #      gitops-walk-per-env.sh's Phase 1b) + apply the branch CRDs/RBAC.
 #   2. Apply a needs.pg Application `web` + a needs-LESS Application
 #      `noproxy` in a tenant namespace. Wait both Deployments Ready.
+#   2b. Apply a needs.jetstream Application `jsapp` in the SAME namespace
+#      and let its claim stand a real NATS server up (Phase 3b) — the
+#      second backend this walk gates, see "The jetstream leg" below.
 #   3. CNP emission: the operator emits `web-egress` (pg rule:
 #      cnpg-system + 5432) and `noproxy-egress` (baseline only, no pg rule).
+#   3b. CNP emission, jetstream: `jsapp-egress` carries a nats-system rule
+#      on 4222 whose selector — read back off the APPLIED object — selects
+#      the running `nats-0` and NOT the chart's own `nats-box`.
 #   4. ENFORCEMENT (the 2.10 acceptance): from the `noproxy` pod, a TCP
 #      connect to the shared pg Service is DROPPED (Hubble DROPPED flow +
 #      the connect fails); from the `web` pod the same connect is
 #      FORWARDED (Hubble FORWARDED + the connect succeeds). An app's
 #      reach to pg is gated behind a declared needs.pg.
+#   4b. ENFORCEMENT, jetstream: the same contrast against nats-0:4222.
 #   5. internet: under the default `internet` profile, an external TCP
 #      connect (1.1.1.1:443) from `web` SUCCEEDS (`toEntities: [world]`).
 #   6. CLI + profile switch: `apprafter platform egress set internal`
@@ -36,7 +43,46 @@
 #      FAILS while the pg connect still SUCCEEDS; `… egress show` prints
 #      internal.
 #   7. strict: `set strict` additionally drops the same-namespace rule
-#      (web-egress carries only DNS + the pg need rule).
+#      (web-egress carries only DNS + the pg need rule), and `jsapp` still
+#      reaches NATS — under strict its ONLY in-cluster allow besides DNS
+#      is the jetstream need rule, so that connect can be explained by
+#      nothing else.
+#
+# The jetstream leg (2.5 / ADR 0061)
+# ----------------------------------
+# `default_target` — the ADR 0045 §B connection-target catalog — shipped
+# with arms for `pg` and `redis` and a catch-all `_ => None`. The
+# per-application CNP is rendered unconditionally and SELECTS the app's
+# pods, which is what makes them egress default-deny, so `needs.jetstream`
+# produced a policy that locked the application out of the one backend it
+# had just been handed working credentials for. `e2e/needs-jetstream-walk.sh`
+# acceptance #15 now reads the applied rule and matches its selector against
+# the live `nats-0`, but that walk has no cilium-agent: it proves the POLICY
+# is right, not that the DATAPATH obeys it, and those are different claims.
+# This leg is the datapath half, and it is built to fail in BOTH directions —
+# `jsapp` reaching NATS says nothing on its own, because a cluster with no
+# policy at all would show exactly that. `noproxy` is the control.
+#
+# Both denial probes address the NATS server by IP (the `nats-0` pod IP and,
+# when the Service is not headless, its ClusterIP) rather than by name, so
+# an unresolved DNS lookup cannot be mistaken for a policy drop; `noproxy`
+# reaching the `web` pod in its own namespace over the same datapath, in the
+# same phase, is the liveness control that a denial is a denial and not a
+# broken pod. The allowed side probes the same IPs plus the DNS name the
+# connection Secret actually carries (`nats.nats-system.svc`), which is what
+# exercises Cilium's socket-LB ClusterIP→pod-identity rewrite — the exact
+# hop the rule's pod selector has to survive.
+#
+# NATS is stood up the same way needs-jetstream-walk.sh stands it up, and
+# for the same reason: `component_nats.cue` / `component_nack.cue` / the
+# `jetstream-integrated` ServiceProvider seed have never been PUBLISHED, so
+# `cluster-bootstrap`'s published platform-stack has no nats component for
+# PlatformController to enable. Phase 3b seeds the ServiceProvider by hand
+# (a plain CR the scheduler reads directly — a complete substitute) and
+# hand-applies the `nats` chart's own rendered manifests plus the `nack`
+# chart's CRDs, standing in for the Argo CD sync that would create them.
+# What that substitution does NOT touch is anything this leg asserts: the
+# claim, the accounts Secret, the CNP and the datapath verdict are all real.
 #
 # CLI state injection
 # -------------------
@@ -112,11 +158,32 @@ EXTERNAL_PORT="443"
 
 OPERATOR_NS="apprafter-system"      # operator + webhook + PlatformStack
 
+# --- the jetstream leg (2.5 / ADR 0061) -------------------------------
+APP_JS="jsapp"                      # needs.jetstream Application
+CNP_JS="${APP_JS}-egress"
+JS_CLAIM="${APP_JS}-jetstream"      # <app>-jetstream (ADR 0061 §6)
+CLAIM_RES="resourceclaim.apprafter.io"
+SP_RES="serviceprovider.apprafter.io"
+NATS_PROVIDER="jetstream-integrated"
+NATS_NS="nats-system"
+NATS_STS="nats"                     # the StatefulSet AND its Service
+NATS_SERVICE="${NATS_STS}.${NATS_NS}"   # what the connection Secret names
+NATS_PORT="4222"                    # client port (8222 is monitoring)
+NATS_ACCOUNTS_SECRET="nats-accounts"
+# The chart's own debug shell. It carries `app.kubernetes.io/name: nats`
+# too and differs from the server only by `component`, which is why the
+# rule selects on BOTH labels — Phase 3b asserts it is NOT selected.
+NATS_BOX_COMPONENT="nats-box"
+
 # ---------------------------------------------------------------
 # Tool checks (fail loudly, never silently skip)
 # ---------------------------------------------------------------
 
-for tool in cargo kubectl; do
+# helm: the branch CRD/RBAC render (Phase 1b) and the nats chart (Phase 3b).
+# jq: the jetstream leg derives the CNP's pod selector from the APPLIED
+# object rather than repeating it here — two copies of the same guess
+# agreeing proves nothing, which is how the missing arm shipped.
+for tool in cargo kubectl helm jq; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         printf 'ERROR: required tool "%s" not found on PATH\n' "$tool" >&2
         exit 2
@@ -153,8 +220,64 @@ KUBECONFIG_FILE="${TMPDIR_WORK}/kubeconfig"
 # an e2e must never touch a non-test cluster.
 K3D_CREATED=0
 
+# PID of the progress heartbeat (see heartbeat_start), so cleanup can reap it
+# on any exit path.
+HEARTBEAT_PID=""
+
+# ---------------------------------------------------------------
+# heartbeat_start <label> / heartbeat_stop
+#
+# The two longest steps of this walk — `apprafter cluster-bootstrap` and the
+# operator image build — are SILENT for minutes at a time. The CLI's own waits
+# are bounded (`kubectl wait` with explicit timeouts, see
+# cluster_bootstrap.rs's per-step constants), so a stall there does eventually
+# fail loudly. What the log could not do is tell a stall apart from a DEATH:
+# on 2026-09-12 a run was killed from outside three minutes in, one minute into
+# a bounded ten-minute wait, and its last line was the `kubectl apply` that
+# preceded the wait. Reading that log afterwards, "hung in bootstrap" and
+# "killed mid-bootstrap" looked identical, and they call for opposite responses.
+#
+# So: a 30-second heartbeat that prints elapsed time plus the few fields the
+# bootstrap is actually waiting on. A log that stops between heartbeats was
+# killed; a log that keeps heart-beating with unchanging fields is stuck, and
+# says on which field. This changes nothing about what the CLI does — it only
+# makes the silence legible.
+# ---------------------------------------------------------------
+heartbeat_start() {
+    local label="$1"
+    heartbeat_stop
+    (
+        # Disarm the inherited EXIT trap FIRST. Bash resets traps in an
+        # asynchronous subshell, but relying on that here would mean betting
+        # the test cluster on it: if `cleanup` ran in this subshell when the
+        # heartbeat is killed, it would tear the cluster down mid-walk.
+        trap - EXIT
+        while true; do
+            sleep 30
+            printf '  [heartbeat %s] %s | root app sync=%s health=%s | nodes: %s | cilium: %s\n' \
+                "$label" "$(elapsed)" \
+                "$(kubectl -n argocd get applications.argoproj.io platform -o jsonpath='{.status.sync.status}' 2>/dev/null || true)" \
+                "$(kubectl -n argocd get applications.argoproj.io platform -o jsonpath='{.status.health.status}' 2>/dev/null || true)" \
+                "$(kubectl get nodes --no-headers 2>/dev/null | awk '{printf "%s=%s ", $1, $2}' || true)" \
+                "$(kubectl -n kube-system get pods -l k8s-app=cilium --no-headers 2>/dev/null | awk '{printf "%s=%s ", $1, $3}' || true)"
+        done
+    ) &
+    HEARTBEAT_PID=$!
+}
+
+heartbeat_stop() {
+    if [ -n "${HEARTBEAT_PID:-}" ]; then
+        kill "$HEARTBEAT_PID" 2>/dev/null || true
+        wait "$HEARTBEAT_PID" 2>/dev/null || true
+        HEARTBEAT_PID=""
+    fi
+    return 0
+}
+
 cleanup() {
     local exit_code=$?
+
+    heartbeat_stop
 
     if [ "$exit_code" -ne 0 ]; then
         printf '\n!!! needs-networkpolicy-walk FAILED at %s (exit %d) !!!\n' \
@@ -195,6 +318,12 @@ dump_cilium_diagnostics() {
     kubectl get "$CNP_RES" -A >&2 2>&1 || true
     printf '\n--- web-egress CNP spec.egress ---\n' >&2
     kubectl -n "$APP_NS" get "$CNP_RES" "$CNP_PG" -o jsonpath='{.spec.egress}' >&2 2>&1 || true
+    printf '\n--- jsapp-egress CNP spec.egress ---\n' >&2
+    kubectl -n "$APP_NS" get "$CNP_RES" "$CNP_JS" -o jsonpath='{.spec.egress}' >&2 2>&1 || true
+    printf '\n--- nats-system pods + labels ---\n' >&2
+    kubectl -n "$NATS_NS" get pods --show-labels >&2 2>&1 || true
+    printf '\n--- the jetstream ResourceClaim ---\n' >&2
+    kubectl -n "$APP_NS" describe "$CLAIM_RES" "$JS_CLAIM" >&2 2>&1 || true
     printf '\n--- recent Hubble flows (demo ns) ---\n' >&2
     hubble_cli observe --namespace "$APP_NS" --last 50 >&2 2>&1 || true
     printf '%s\n' '----- end cilium diagnostics -----' >&2
@@ -457,7 +586,9 @@ seed_apprafter_state "$kubeconfig_content"
 export APPRAFTER_CONFIG_DIR
 printf '  APPRAFTER_CONFIG_DIR=%s\n' "$APPRAFTER_CONFIG_DIR"
 
+heartbeat_start cluster-bootstrap
 bootstrap_with_cilium
+heartbeat_stop
 
 printf '  cluster-bootstrap complete; waiting for Cilium to converge ...\n'
 # Cilium's eBPF datapath is slower to converge than a default CNI — give it
@@ -512,8 +643,10 @@ builder=podman; command -v podman >/dev/null 2>&1 || builder=docker
 # CACHES the built image by the content of operator/ + schemas/v1alpha1/.
 # Thirteen walks carried a private copy that SHADOWED the shared one, so the
 # cache benefited nobody: each still rebuilt the same image (3m04 measured).
+heartbeat_start image-build
 build_load_restart apprafter-operator apprafter-operator
 build_load_restart admission-webhook admission-webhook
+heartbeat_stop
 
 # `rollout status` returns once the NEW webhook pod is Ready, but the OLD
 # (released) pod lingers Terminating — wait until ONLY the branch webhook
@@ -662,6 +795,186 @@ kubectl -n "$APP_NS" wait --for=condition=Available \
 printf '  both Deployments Available\n'
 
 # ===============================================================
+# Phase 3b: the jetstream leg — a REAL needs.jetstream Application, and
+#           the NATS server its own claim turns on.
+#
+# The order below is the product's, not a convenience: the accounts
+# Secret is written by the FIRST claim's reconcile and the server
+# `$include`s it at boot, so the claim must exist before the chart is
+# applied. Everything the operator does here (the claim, the accounts
+# Secret, the PlatformStack override flip, the verify handshake) is real;
+# only the arrival of the StatefulSet + the jetstream.nats.io CRDs is
+# hand-applied, standing in for an Argo CD sync of a component
+# platform-stack has not published yet. See this file's header.
+#
+# `nack` itself is deliberately NOT installed — only its CRDs. The claim
+# declares no streams and no consumers, so `pending_objects` is empty by
+# construction and the AwaitingStreamCreation gate never engages; what
+# provision_nats actually requires is that `streams.jetstream.nats.io` be
+# Established. Leaving the controller out removes a pod, a crash mode
+# (its unauthenticated global connection dies the moment an accounts file
+# exists — see component_nack.cue) and several minutes, and costs this
+# walk nothing it asserts.
+# ===============================================================
+
+phase "Phase 3b: needs.jetstream Application '${APP_JS}' + the NATS server it claims"
+
+kubectl create namespace "$NATS_NS" 2>/dev/null || true
+
+# The `jetstream-integrated` ServiceProvider (2.5c, service_providers.cue)
+# is an unpublished chart artifact — seed it by hand, mirroring the branch
+# CUE. A ServiceProvider is a plain CR the scheduler reads directly, so
+# this is a complete substitute with no chart or Argo CD involved. Values
+# mirror e2e/needs-jetstream-walk.sh Phase 1c verbatim.
+if ! kubectl -n "$OPERATOR_NS" get "$SP_RES" "$NATS_PROVIDER" >/dev/null 2>&1; then
+    printf '  seeding ServiceProvider %s (unpublished 2.5c artifact) ...\n' "$NATS_PROVIDER"
+    kubectl apply -f - <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: ServiceProvider
+metadata:
+  name: ${NATS_PROVIDER}
+  namespace: ${OPERATOR_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+    tier: integrated
+    location: in-cluster
+spec:
+  type: jetstream
+  backend: nats
+  config:
+    namespace: ${NATS_NS}
+    serverImage: "nats:2.14.3-alpine"
+    sizeBytes:
+      nano: 67108864
+      small: 268435456
+      medium: 1073741824
+      large: 2147483648
+      xlarge: 4294967296
+    ceilingBytes: 4294967296
+    capturePolicy: report
+YAML
+fi
+sp_tier=$(jp "$SP_RES" "$OPERATOR_NS" "$NATS_PROVIDER" '{.metadata.labels.tier}')
+assert_eq "ServiceProvider ${NATS_PROVIDER} label tier" "$sp_tier" "integrated"
+
+kubectl apply -f - <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${APP_JS}
+  namespace: ${APP_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+    replicas: 1
+    expose:
+      port: 80
+    needs:
+      jetstream:
+        selector:
+          tier: integrated
+        dynamicStreams: true
+YAML
+
+wait_jsonpath "$CLAIM_RES" "$APP_NS" "$JS_CLAIM" '{.spec.type}' jetstream 240
+wait_jsonpath "$CLAIM_RES" "$APP_NS" "$JS_CLAIM" '{.status.provider}' "$NATS_PROVIDER" 240
+
+printf '  waiting for the %s Secret in %s (written by the claim, before any server exists) ...\n' \
+    "$NATS_ACCOUNTS_SECRET" "$NATS_NS"
+deadline=$(( $(date +%s) + 240 ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    kubectl -n "$NATS_NS" get secret "$NATS_ACCOUNTS_SECRET" >/dev/null 2>&1 && break
+    sleep 5
+done
+kubectl -n "$NATS_NS" get secret "$NATS_ACCOUNTS_SECRET" >/dev/null 2>&1 || {
+    printf 'ERROR: %s Secret never appeared in %s — the claim never reconciled. Operator log:\n' \
+        "$NATS_ACCOUNTS_SECRET" "$NATS_NS" >&2
+    kubectl -n "$OPERATOR_NS" logs deploy/apprafter-operator --tail=80 >&2 2>&1 || true
+    exit 1
+}
+printf '  ok: %s exists\n' "$NATS_ACCOUNTS_SECRET"
+
+# The nats chart's own rendered manifests, with component_nats.cue's pinned
+# values (chart 2.14.6, server image 2.14.3-alpine) and the `$include` +
+# volume-mount arrangement that feeds it the provisioner's REAL Secret.
+# The StorageClass is the cluster's actual default (component_nats.cue pins
+# "local-path", the k3s name; kind's is "standard") — a harness-substrate
+# accommodation, not a product deviation.
+DEFAULT_SC=$(kubectl get storageclass \
+    -o jsonpath='{.items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")].metadata.name}')
+if [ -z "$DEFAULT_SC" ]; then
+    DEFAULT_SC=$(kubectl get storageclass -o jsonpath='{.items[0].metadata.name}')
+fi
+printf '  default StorageClass = %q\n' "$DEFAULT_SC"
+
+cat >"${TMPDIR_WORK}/nats-values.yaml" <<VALUES
+container:
+  image:
+    repository: nats
+    tag: 2.14.3-alpine
+  resources:
+    requests: { cpu: 100m, memory: 384Mi }
+    limits: { cpu: 100m, memory: 384Mi }
+  patch:
+    - op: add
+      path: /volumeMounts/-
+      value: { name: accounts-secret, mountPath: /etc/nats-config/accounts-secret, readOnly: true }
+podTemplate:
+  patch:
+    - op: add
+      path: /spec/volumes/-
+      value: { name: accounts-secret, secret: { secretName: ${NATS_ACCOUNTS_SECRET} } }
+config:
+  jetstream:
+    enabled: true
+    fileStore:
+      pvc:
+        size: 5Gi
+        storageClassName: ${DEFAULT_SC}
+    memoryStore:
+      enabled: true
+      maxSize: 192Mi
+  merge:
+    accounts\$include: "./accounts-secret/accounts.conf"
+    feature_flags:
+      js_ack_fc_v2: true
+VALUES
+
+helm repo add nats https://nats-io.github.io/k8s/helm/charts/ >/dev/null 2>&1 || true
+helm repo update nats >/dev/null 2>&1 || true
+helm template "$NATS_STS" nats/nats --version 2.14.6 -n "$NATS_NS" \
+    -f "${TMPDIR_WORK}/nats-values.yaml" \
+    | kubectl apply -n "$NATS_NS" -f -
+printf '  applied the (unpublished) nats component'"'"'s rendered manifests by hand\n'
+
+# nack's CRDs only — `provision_nats` gates Ready on
+# `streams.jetstream.nats.io` being Established, and nothing here declares
+# a stream for the controller to reconcile. `--include-crds` is
+# load-bearing: a plain `helm template` does not render a chart's `crds/`
+# directory at all.
+helm template nack nats/nack --version 0.35.0 --include-crds -n "$NATS_NS" \
+    | _yq 'select(.kind == "CustomResourceDefinition")' \
+    | kubectl apply -f -
+for _crd in streams consumers accounts; do
+    retry 24 5 -- kubectl wait --for=condition=Established \
+        "crd/${_crd}.jetstream.nats.io" --timeout=30s
+done
+printf '  jetstream.nats.io CRDs Established\n'
+
+printf '  waiting for the %s StatefulSet to report a ready replica ...\n' "$NATS_STS"
+wait_jsonpath statefulset "$NATS_NS" "$NATS_STS" '{.status.readyReplicas}' 1 420
+
+# The claim now runs the real verify handshake ($JS.API.INFO as its own
+# user, through the account the server just loaded) before it goes Ready.
+wait_jsonpath "$CLAIM_RES" "$APP_NS" "$JS_CLAIM" '{.status.ready}' true 480
+wait_jsonpath "$APP_RES" "$APP_NS" "$APP_JS" '{.status.phase}' Ready 300
+kubectl -n "$APP_NS" wait --for=condition=Available \
+    "deployment/${APP_JS}" --timeout=300s
+printf '  ok: %s is Ready and its Deployment is Available\n' "$APP_JS"
+
+# ===============================================================
 # Phase 4: CNP emission — web has the pg rule, noproxy does not
 # ===============================================================
 
@@ -708,6 +1021,89 @@ case "$noproxy_egress_json" in
 esac
 
 # ===============================================================
+# Phase 4b: CNP emission, jetstream — the rule exists, on 4222, and its
+#           selector picks the server rather than the chart's debug shell.
+#
+# The selector is DERIVED from the applied object and handed back to the
+# apiserver, never retyped here: a selector written into this script would
+# prove only that two copies of the same guess agree, and "renders but
+# matches nothing" is indistinguishable from correct in every check that
+# does not run a datapath. Phase 5b is what closes that last gap; this
+# phase is what tells you WHICH of the two broke when it does.
+# ===============================================================
+
+phase "Phase 4b: CNP emission, jetstream (jsapp-egress carries the nats-system 4222 rule)"
+
+wait_jsonpath "$CNP_RES" "$APP_NS" "$CNP_JS" '{.metadata.name}' "$CNP_JS" 180
+
+js_cnp_json=$(kubectl -n "$APP_NS" get "$CNP_RES" "$CNP_JS" -o json)
+js_rule=$(printf '%s' "$js_cnp_json" | jq -c --arg ns "$NATS_NS" \
+    '.spec.egress[] | select(.toEndpoints[0].matchLabels["io.kubernetes.pod.namespace"] == $ns)')
+if [ -z "$js_rule" ]; then
+    printf 'ERROR: %s carries NO egress rule for namespace %s — the app is egress default-deny with no path to NATS (the original 2.5 defect). Rules present:\n%s\n' \
+        "$CNP_JS" "$NATS_NS" "$(printf '%s' "$js_cnp_json" | jq -c '.spec.egress')" >&2
+    exit 1
+fi
+printf '  NATS egress rule as applied: %s\n' "$js_rule"
+
+js_port=$(printf '%s' "$js_rule" | jq -r '.toPorts[0].ports[0].port')
+assert_eq "jsapp-egress NATS rule port" "$js_port" "$NATS_PORT"
+js_proto=$(printf '%s' "$js_rule" | jq -r '.toPorts[0].ports[0].protocol')
+assert_eq "jsapp-egress NATS rule protocol" "$js_proto" "TCP"
+
+# Turn the rule's OWN matchLabels (minus the namespace pseudo-label, which
+# is Cilium's and not a pod label) into a label selector.
+JS_SELECTOR=$(printf '%s' "$js_rule" | jq -r '
+    .toEndpoints[0].matchLabels
+    | to_entries
+    | map(select(.key != "io.kubernetes.pod.namespace"))
+    | map("\(.key)=\(.value)")
+    | join(",")')
+if [ -z "$JS_SELECTOR" ]; then
+    printf 'ERROR: the NATS rule carries no pod labels at all — it would select every pod in %s\n' \
+        "$NATS_NS" >&2
+    exit 1
+fi
+printf '  selector derived from the applied rule: %s\n' "$JS_SELECTOR"
+
+js_matched=$(kubectl -n "$NATS_NS" get pods -l "$JS_SELECTOR" \
+    -o jsonpath='{.items[*].metadata.name}' 2>&1) || {
+    printf 'ERROR: kubectl rejected the derived selector: %s\n' "$js_matched" >&2
+    exit 1
+}
+printf '  pods in %s matching it: %s\n' "$NATS_NS" "${js_matched:-<none>}"
+printf '  live labels on %s-0: %s\n' "$NATS_STS" \
+    "$(kubectl -n "$NATS_NS" get pod "${NATS_STS}-0" -o jsonpath='{.metadata.labels}' 2>/dev/null)"
+case " $js_matched " in
+    *" ${NATS_STS}-0 "*) printf '  ok: the rule selects the running %s-0\n' "$NATS_STS" ;;
+    *) printf 'ERROR: the rule does NOT select %s-0 — it renders, and Cilium drops every packet to NATS\n' "$NATS_STS" >&2; exit 1 ;;
+esac
+
+# …and nothing ELSE. The chart's own `nats-box` debug shell and its
+# `test-request-reply` pod both carry `app.kubernetes.io/name: nats` and
+# differ from the server only by `component` — so a rule that selected on
+# `name` alone would still pass the check above while quietly granting
+# egress to a shell. Both are rendered into this namespace by the chart, so
+# an exact-set assertion here has real subjects to reject, not a
+# hypothetical one. (`NATS_BOX_COMPONENT` names the loudest of them for the
+# failure message.)
+js_all_nats_ns=$(kubectl -n "$NATS_NS" get pods \
+    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+if [ "$js_matched" != "${NATS_STS}-0" ]; then
+    printf 'ERROR: the rule selects %q, not exactly %q. It is wider than "the server" — the chart puts %s (component=%s) and a test pod in this namespace under the SAME app.kubernetes.io/name. All pods here: %s\n' \
+        "$js_matched" "${NATS_STS}-0" "$NATS_BOX_COMPONENT" "$NATS_BOX_COMPONENT" "$js_all_nats_ns" >&2
+    exit 1
+fi
+printf '  ok: the rule selects EXACTLY %s-0 (of: %s)\n' "$NATS_STS" "$js_all_nats_ns"
+
+# noproxy-egress must NOT carry a nats-system rule — it is the control for
+# Phase 5b, and a control that quietly acquired the rule proves nothing.
+case "$noproxy_egress_json" in
+    *"$NATS_NS"*) printf 'ERROR: noproxy-egress unexpectedly references %s (it declares no needs): %s\n' "$NATS_NS" "$noproxy_egress_json" >&2; exit 1 ;;
+    *) printf '  ok: noproxy-egress carries NO NATS rule (no nats-system reference)\n' ;;
+esac
+
+# ===============================================================
 # Phase 5: ENFORCEMENT — the 2.10 acceptance (Hubble verdicts)
 # ===============================================================
 
@@ -732,6 +1128,89 @@ assert_connect "web -> pg (declared needs.pg, must be allowed)" \
     "$APP_NS" "$POD_WEB" "$PG_SERVICE" "$PG_PORT" want-ok
 assert_hubble_verdict "web -> cnpg-system" \
     "${APP_NS}/${POD_WEB}" "$CNPG_NS" FORWARDED
+
+# ===============================================================
+# Phase 5b: ENFORCEMENT, jetstream — the datapath half of 2.5's egress
+#           fix, proven in both directions.
+#
+# "jsapp reaches NATS" on its own is worth nothing: a cluster where no
+# policy existed at all would show exactly that. So the phase is built
+# around three controls, and each one closes a different way the pair
+# could be green while measuring nothing:
+#
+#   * `noproxy` — no needs, therefore no NATS rule — must NOT reach the
+#     server. This is the half that proves the policy is doing the work.
+#   * `noproxy` reaching the `web` pod in its own namespace, over the same
+#     datapath, in the same phase: a liveness control, so a denial cannot
+#     be a dead pod or a broken CNI wearing a policy's clothes.
+#   * `web` (needs.pg, so a non-trivial CNP of its own) must not reach
+#     NATS, and `jsapp` must not reach pg. Declaring A must not hand you
+#     B; without this pair, a catalog that resolved every target for every
+#     app would still look green.
+#
+# Both denial probes address NATS by IP, so an unresolved name cannot be
+# mistaken for a drop. The allowed side probes the same IP AND the DNS
+# name the connection Secret actually carries — the ClusterIP path is what
+# exercises Cilium's socket-LB rewrite to a backend pod identity, which is
+# the hop the rule's pod selector has to survive.
+# ===============================================================
+
+phase "Phase 5b: enforcement, jetstream — jsapp FORWARDED to nats-0, noproxy DROPPED"
+
+POD_JS=$(app_pod "$APP_NS" "$APP_JS")
+[ -n "$POD_JS" ] || { printf 'ERROR: no %s pod found\n' "$APP_JS" >&2; exit 1; }
+
+NATS_POD_IP=$(kubectl -n "$NATS_NS" get pod "${NATS_STS}-0" \
+    -o jsonpath='{.status.podIP}' 2>/dev/null || true)
+[ -n "$NATS_POD_IP" ] || { printf 'ERROR: could not read the %s-0 pod IP\n' "$NATS_STS" >&2; exit 1; }
+NATS_CLUSTER_IP=$(kubectl -n "$NATS_NS" get svc "$NATS_STS" \
+    -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
+printf '  jsapp pod: %s | nats-0 podIP: %s | nats Service clusterIP: %s\n' \
+    "$POD_JS" "$NATS_POD_IP" "${NATS_CLUSTER_IP:-<none>}"
+
+# --- allowed: the declaring app reaches the server it declared ---
+# By name first — this is the address the connection Secret hands the
+# application, and it is the path that goes through socket-LB.
+assert_connect "jsapp -> ${NATS_SERVICE} (declared needs.jetstream, by name, must be allowed)" \
+    "$APP_NS" "$POD_JS" "$NATS_SERVICE" "$NATS_PORT" want-ok
+# Then by the very address the denial probes below use, so "allowed" and
+# "denied" are claims about ONE address, not two.
+assert_connect "jsapp -> nats-0 podIP (declared needs.jetstream, must be allowed)" \
+    "$APP_NS" "$POD_JS" "$NATS_POD_IP" "$NATS_PORT" want-ok
+assert_hubble_verdict "jsapp -> nats-system" \
+    "${APP_NS}/${POD_JS}" "$NATS_NS" FORWARDED
+
+# --- liveness control: noproxy's datapath is alive right now ---
+# Same-namespace egress is open under the `internet` profile, so this
+# connect MUST succeed. If it does not, every denial below is meaningless
+# and the walk says so here rather than reporting a false green.
+WEB_POD_IP=$(kubectl -n "$APP_NS" get pod "$POD_WEB" -o jsonpath='{.status.podIP}' 2>/dev/null || true)
+[ -n "$WEB_POD_IP" ] || { printf 'ERROR: could not read the web pod IP for the liveness control\n' >&2; exit 1; }
+assert_connect "noproxy -> web (same-namespace, internet profile — LIVENESS CONTROL, must be allowed)" \
+    "$APP_NS" "$POD_NOPROXY" "$WEB_POD_IP" "80" want-ok
+
+# --- denied: an app that declared nothing cannot reach NATS ---
+assert_connect "noproxy -> nats-0 podIP (undeclared, must be denied)" \
+    "$APP_NS" "$POD_NOPROXY" "$NATS_POD_IP" "$NATS_PORT" want-fail
+assert_hubble_verdict "noproxy -> nats-system" \
+    "${APP_NS}/${POD_NOPROXY}" "$NATS_NS" DROPPED
+
+# The ClusterIP path too, when the Service has one — that is the address a
+# real undeclared app would have been handed, and socket-LB rewrites it to
+# the same pod identity the rule names.
+if [ -n "$NATS_CLUSTER_IP" ] && [ "$NATS_CLUSTER_IP" != "None" ]; then
+    assert_connect "noproxy -> nats ClusterIP (undeclared, must be denied)" \
+        "$APP_NS" "$POD_NOPROXY" "$NATS_CLUSTER_IP" "$NATS_PORT" want-fail
+else
+    printf '  note: the nats Service is headless (clusterIP=%q); the socket-LB denial probe has no address to use\n' \
+        "${NATS_CLUSTER_IP:-}"
+fi
+
+# --- declaring A must not hand you B ---
+assert_connect "web -> nats-0 podIP (declares needs.pg, NOT jetstream — must be denied)" \
+    "$APP_NS" "$POD_WEB" "$NATS_POD_IP" "$NATS_PORT" want-fail
+assert_connect "jsapp -> pg (declares needs.jetstream, NOT pg — must be denied)" \
+    "$APP_NS" "$POD_JS" "$PG_SERVICE" "$PG_PORT" want-fail
 
 # ===============================================================
 # Phase 6: internet — external egress open under the default profile
@@ -828,6 +1307,30 @@ assert_hubble_verdict "noproxy -> web (same-namespace, strict)" \
 assert_connect "web -> pg (strict profile, still allowed)" \
     "$APP_NS" "$POD_WEB" "$PG_SERVICE" "$PG_PORT" want-ok
 
+# jsapp still reaches NATS under strict — and this is the sharpest form of
+# the jetstream claim available anywhere in the walk. Under `strict` the
+# CNP's only rules are DNS and the jetstream need rule: same-namespace is
+# gone and `world` is gone, so nothing else in the policy could possibly
+# account for the packet arriving. If Phase 5b were passing for some
+# ambient reason, this is where that would show.
+# Re-read the address rather than trusting Phase 5b's: a pod that
+# restarted in between would take its IP with it, and a stale address
+# would fail this as if the policy had.
+NATS_POD_IP=$(kubectl -n "$NATS_NS" get pod "${NATS_STS}-0" \
+    -o jsonpath='{.status.podIP}' 2>/dev/null || true)
+[ -n "$NATS_POD_IP" ] || { printf 'ERROR: could not re-read the %s-0 pod IP under strict\n' "$NATS_STS" >&2; exit 1; }
+assert_connect "jsapp -> nats-0 podIP (strict profile, only DNS + the need rule remain — still allowed)" \
+    "$APP_NS" "$POD_JS" "$NATS_POD_IP" "$NATS_PORT" want-ok
+js_strict_egress=$(jp "$CNP_RES" "$APP_NS" "$CNP_JS" '{.spec.egress}')
+case "$js_strict_egress" in
+    *world*) printf 'ERROR: jsapp-egress STILL carries the world rule under strict: %s\n' "$js_strict_egress" >&2; exit 1 ;;
+    *) printf '  ok: jsapp-egress dropped the world rule under strict\n' ;;
+esac
+case "$js_strict_egress" in
+    *"$NATS_NS"*) printf '  ok: jsapp-egress still carries the NATS need rule under strict\n' ;;
+    *) printf 'ERROR: jsapp-egress lost the NATS need rule under strict: %s\n' "$js_strict_egress" >&2; exit 1 ;;
+esac
+
 # ===============================================================
 # Done — tear down on success path
 # ===============================================================
@@ -845,3 +1348,5 @@ rm -rf "$TMPDIR_WORK"
 
 printf '\nneeds-networkpolicy-walk GREEN in %s\n' "$(elapsed)"
 printf 'Chain proven: needs.pg -> web-egress pg-allow (FORWARDED), needs-less noproxy -> pg DROPPED; internet/internal/strict profile gating via apprafter platform egress\n'
+printf 'Also proven (2.5 / ADR 0061): needs.jetstream -> jsapp-egress nats-system:4222 allow, enforced — jsapp reaches nats-0 by name AND by pod IP (and still does under strict, where DNS + that rule are all it has); noproxy reaches neither, while reaching the web pod in the same phase; web cannot reach NATS and jsapp cannot reach pg.\n'
+printf 'NOT proven here: the PUBLISHED delivery path for the nats component — Phase 3b hand-applies the chart'"'"'s rendered manifests, standing in for an Argo CD sync platform-stack does not ship yet.\n'
