@@ -1330,6 +1330,107 @@ fn validate_jetstream_need(js: &JetStreamNeed, scope: &str) -> Vec<String> {
     errs
 }
 
+/// 2.5 (ADR 0061 §6): the rejection message for an environment override of
+/// `needs.jetstream` that silently drops a block `base` declares.
+///
+/// `lost` is rendered into the message because the whole point of the rule is
+/// that the loss is otherwise invisible: the manifest that causes it —
+/// `environments.prod.needs.jetstream: {size: small}` — does not mention
+/// streams or consume at all, so an error that only named the FIELD would
+/// read as pedantry rather than as "prod is about to lose these three
+/// streams".
+fn jetstream_env_override_drops(scope: &str, block: &str, lost: &[String]) -> String {
+    format!(
+        "{scope}: needs.jetstream omits {block:?} while base declares {} of them ({}) — a \
+         per-environment override REPLACES the whole needs.jetstream block (ADR 0061 §6), so \
+         this environment would lose them entirely. Repeat them here, or write \"{block}: []\" \
+         to state that this environment deliberately has none.",
+        lost.len(),
+        lost.join(", "),
+    )
+}
+
+/// 2.5 (ADR 0061 §6): refuse an environment override of `needs.jetstream`
+/// that omits `streams`/`consume` while `base` declares them.
+///
+/// Every `needs.<type>` key is replaced WHOLESALE by an environment override
+/// (`effective_spec` in `operator-rendering`: `if env_needs.jetstream.is_some()
+/// { merged.jetstream = env_needs.jetstream.clone() }` — a clone of the env
+/// value, never a merge into base's). For most needs that costs a `size`; for
+/// jetstream it costs the entire producer/consumer contract, and the
+/// application then runs in that environment publishing to streams that were
+/// never created. ADR 0061 §6 rejected leaving it silent, and rejected
+/// special-casing jetstream into a deep merge (that would pre-empt 2.16i and
+/// make one need behave unlike the other six). This rule retires when 2.16i
+/// lands the deep merge generally.
+///
+/// KEY PRESENCE, not emptiness, is the trigger — read off the RAW override
+/// (`envs`), because the typed `JetStreamNeed.streams`/`.consume` are
+/// `#[serde(default)]` `Vec`s that cannot tell "omitted" from "declared
+/// empty". That distinction is the escape hatch: an environment that
+/// genuinely has no streams writes `streams: []` and says so, which is the
+/// only way to express that intent under wholesale replacement. Rejecting the
+/// explicit empty list too would leave no way to say it at all.
+///
+/// Base-side declarations are read from the TYPED base, matching the rest of
+/// [`validate_jetstream_scopes`]; a base that failed typed decode is skipped
+/// rather than guessed at.
+fn validate_jetstream_env_overrides(
+    typed_base: Option<&ApplicationBaseSpec>,
+    envs: Option<&serde_json::Map<String, Value>>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let Some(base_js) = typed_base
+        .and_then(ScopeView::needs)
+        .and_then(|n| n.jetstream.as_ref())
+    else {
+        return;
+    };
+    if base_js.streams.is_empty() && base_js.consume.is_empty() {
+        return;
+    }
+    let Some(envs_obj) = envs else { return };
+
+    for (env_name, env_value) in envs_obj {
+        // Only an override that DECLARES needs.jetstream replaces base's.
+        // An environment with no `needs` block, or a `needs` block without
+        // the jetstream key, inherits base's whole need under the per-key
+        // merge — nothing is lost and nothing is reported.
+        let Some(js_obj) = env_value
+            .pointer("/needs/jetstream")
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        let field = format!("spec.environments.{env_name}.needs.jetstream");
+
+        if !base_js.streams.is_empty() && !js_obj.contains_key("streams") {
+            let lost: Vec<String> = base_js
+                .streams
+                .iter()
+                .map(|s| format!("{:?}", s.name))
+                .collect();
+            errors.push(ValidationError::new(
+                field.clone(),
+                jetstream_env_override_drops(env_name, "streams", &lost),
+            ));
+        }
+        if !base_js.consume.is_empty() && !js_obj.contains_key("consume") {
+            // `<stream>/<durable>` — a consume entry has no single name, and
+            // the durable alone would not say which stream it reads.
+            let lost: Vec<String> = base_js
+                .consume
+                .iter()
+                .map(|c| format!("{:?}", format!("{}/{}", c.stream, c.durable)))
+                .collect();
+            errors.push(ValidationError::new(
+                field,
+                jetstream_env_override_drops(env_name, "consume", &lost),
+            ));
+        }
+    }
+}
+
 /// 2.5 (ADR 0061 §6): wires [`validate_jetstream_need`] into the per-scope
 /// needs validation, once for `base` and once per declared environment —
 /// same shape as `validate_needs_names`/`validate_disk_claims`. TYPED ONLY:
@@ -1373,6 +1474,9 @@ fn validate_jetstream_scopes(
             }
         }
     }
+    // The cross-scope half: what an override DROPS, which no single-scope
+    // validation can see.
+    validate_jetstream_env_overrides(typed_base, envs, errors);
 }
 
 /// Whether `spec` declares `needs.jetstream` ANYWHERE — `base` or any
@@ -4543,6 +4647,176 @@ mod tests {
                 .iter()
                 .any(|e| e.message.contains(".durable must not be empty")),
             "{js_errs:?}"
+        );
+    }
+
+    // ---- 2.5 (ADR 0061 §6): per-environment override drops ----
+
+    /// A base with both blocks, for the override tests below.
+    fn base_with_streams_and_consume() -> Value {
+        json!({
+            "image": "x",
+            "needs": { "jetstream": {
+                "streams": [
+                    { "name": "orders", "subjects": ["shop.orders.>"], "maxBytes": "1Gi" },
+                    { "name": "events", "subjects": ["shop.events.>"], "maxBytes": "1Gi" }
+                ],
+                "consume": [
+                    { "from": "billing", "stream": "invoices", "durable": "reader" }
+                ]
+            } }
+        })
+    }
+
+    fn jetstream_env_errors<'a>(
+        errors: &'a [ValidationError],
+        env: &str,
+    ) -> Vec<&'a ValidationError> {
+        let field = format!("spec.environments.{env}.needs.jetstream");
+        errors.iter().filter(|e| e.field == field).collect()
+    }
+
+    #[test]
+    fn rejects_an_env_override_that_drops_the_declared_streams() {
+        // THE case ADR 0061 §6 names: one field's sake, and the whole
+        // producer contract is gone for prod.
+        let spec = json!({
+            "base": base_with_streams_and_consume(),
+            "environments": { "prod": { "needs": { "jetstream": { "size": "small" } } } }
+        });
+        let errors = validate_application_spec(&spec);
+        let env_errs = jetstream_env_errors(&errors, "prod");
+        assert_eq!(
+            env_errs.len(),
+            2,
+            "streams AND consume are both lost: {env_errs:?}"
+        );
+
+        let streams_err = env_errs
+            .iter()
+            .find(|e| e.message.contains("\"streams\""))
+            .expect("a streams error");
+        // Names what is lost, not merely the field — the manifest that
+        // caused it never mentions these.
+        assert!(
+            streams_err.message.contains("\"orders\""),
+            "{streams_err:?}"
+        );
+        assert!(
+            streams_err.message.contains("\"events\""),
+            "{streams_err:?}"
+        );
+        assert!(streams_err.message.contains("prod:"), "{streams_err:?}");
+
+        let consume_err = env_errs
+            .iter()
+            .find(|e| e.message.contains("\"consume\""))
+            .expect("a consume error");
+        assert!(
+            consume_err.message.contains("\"invoices/reader\""),
+            "the consume entry is named <stream>/<durable>: {consume_err:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_an_env_override_that_repeats_the_declared_blocks() {
+        // The fix the message asks for. Must be accepted, or the rule has
+        // no way out.
+        let spec = json!({
+            "base": base_with_streams_and_consume(),
+            "environments": { "prod": { "needs": { "jetstream": {
+                "size": "small",
+                "streams": [
+                    { "name": "orders", "subjects": ["shop.orders.>"], "maxBytes": "1Gi" },
+                    { "name": "events", "subjects": ["shop.events.>"], "maxBytes": "1Gi" }
+                ],
+                "consume": [
+                    { "from": "billing", "stream": "invoices", "durable": "reader" }
+                ]
+            } } } }
+        });
+        assert!(
+            jetstream_env_errors(&validate_application_spec(&spec), "prod").is_empty(),
+            "{:?}",
+            validate_application_spec(&spec)
+        );
+    }
+
+    #[test]
+    fn accepts_an_env_override_that_empties_the_blocks_explicitly() {
+        // The escape hatch: an environment that genuinely produces and
+        // consumes nothing. Under wholesale replacement this is the ONLY
+        // way to express that, so rejecting it would leave the intent
+        // inexpressible rather than merely awkward.
+        let spec = json!({
+            "base": base_with_streams_and_consume(),
+            "environments": { "staging": { "needs": { "jetstream": {
+                "streams": [],
+                "consume": []
+            } } } }
+        });
+        assert!(
+            jetstream_env_errors(&validate_application_spec(&spec), "staging").is_empty(),
+            "{:?}",
+            validate_application_spec(&spec)
+        );
+    }
+
+    #[test]
+    fn an_env_that_does_not_override_jetstream_at_all_inherits_it() {
+        // No `needs.jetstream` key in the override → the per-key needs merge
+        // carries base's whole need through. Nothing is lost, so nothing is
+        // reported — including when the override touches a DIFFERENT need.
+        let spec = json!({
+            "base": base_with_streams_and_consume(),
+            "environments": {
+                "prod": { "replicas": 3 },
+                "staging": { "needs": { "pg": {} } }
+            }
+        });
+        let errors = validate_application_spec(&spec);
+        assert!(
+            jetstream_env_errors(&errors, "prod").is_empty(),
+            "{errors:?}"
+        );
+        assert!(
+            jetstream_env_errors(&errors, "staging").is_empty(),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn an_env_override_drops_only_the_block_base_actually_declares() {
+        // base declares streams but NO consume. An override omitting both
+        // must be told about streams only — reporting a lost `consume` that
+        // never existed would train readers to ignore the message.
+        let spec = json!({
+            "base": {
+                "image": "x",
+                "needs": { "jetstream": { "streams": [
+                    { "name": "orders", "subjects": ["shop.orders.>"], "maxBytes": "1Gi" }
+                ] } }
+            },
+            "environments": { "prod": { "needs": { "jetstream": { "size": "small" } } } }
+        });
+        let env_errs_owned = validate_application_spec(&spec);
+        let env_errs = jetstream_env_errors(&env_errs_owned, "prod");
+        assert_eq!(env_errs.len(), 1, "{env_errs:?}");
+        assert!(env_errs[0].message.contains("\"streams\""), "{env_errs:?}");
+    }
+
+    #[test]
+    fn a_base_without_declarations_never_trips_the_override_rule() {
+        // A dynamicStreams-only app: base has no streams/consume, so an
+        // override that omits them loses nothing.
+        let spec = json!({
+            "base": { "image": "x", "needs": { "jetstream": { "dynamicStreams": true } } },
+            "environments": { "prod": { "needs": { "jetstream": { "size": "large" } } } }
+        });
+        assert!(
+            jetstream_env_errors(&validate_application_spec(&spec), "prod").is_empty(),
+            "{:?}",
+            validate_application_spec(&spec)
         );
     }
 
