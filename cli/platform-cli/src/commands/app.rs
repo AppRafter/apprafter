@@ -1361,9 +1361,14 @@ pub(crate) struct ResourceClaimSummary {
     pub secret_ref: Option<String>,
     /// The concrete backend resource serving this claim, when the
     /// provisioner has named one: the pooled instance and logical DB for
-    /// redis, the standalone PVC for a disk, the connection Secret's
-    /// backing cluster otherwise. Answers "what actually got created",
-    /// which the ready/scheduled pair does not.
+    /// redis, the standalone PVC for a disk, the observed streams for
+    /// jetstream (2.5 / ADR 0061), `—` otherwise. Answers "what actually got
+    /// created", which the ready/scheduled pair does not.
+    ///
+    /// `—` is still the honest answer for a `pg` claim: CNPG writes neither
+    /// an instance nor a volumeClaimRef (`reconcile.rs`: "CNPG owns no
+    /// instance/dbnum"), so there is nothing on the claim to name. Filling
+    /// that in needs a provisioner-side status write, not a CLI change.
     pub backing: String,
     /// How much data the claim holds, per-backend (2.22d / D8): used/total
     /// for a disk, bytes for pg, keys for redis, `—` when unmeasured.
@@ -2160,6 +2165,43 @@ pub(crate) fn backing_resource(claim: &Value) -> String {
         .and_then(Value::as_str)
     {
         return format!("pvc/{pvc}");
+    }
+    // 2.5 (ADR 0061): a jetstream claim names neither an instance nor a PVC.
+    // What the provisioner created for it on the shared NATS server is the
+    // set of STREAMS, and it records them in `status.streams` — the
+    // inventory it observed on the server, not the declaration it sent
+    // (`jetstream_status_body` in resourceclaim-provisioner). So the cell
+    // answers this column's question ("what actually got created", not "what
+    // was asked for") from the claim's own status, the same standing as the
+    // instance/PVC arms above and with no extra API call.
+    //
+    // `unattributed` is deliberately NOT counted: those are streams sitting
+    // in the account that no declaration accounts for, so they are not this
+    // claim's backing — they surface as a `ForeignSubjectCapture` condition
+    // instead.
+    //
+    // An empty inventory prints "no streams" rather than falling through to
+    // "—": for a consume-only application it is the permanent, correct
+    // answer, and it is a MEASURED one (the provisioner wrote `observedAt`),
+    // which is exactly the distinction "—" would erase.
+    if let Some(streams) = claim.pointer("/status/streams") {
+        let count = |k: &str| {
+            streams
+                .get(k)
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0)
+        };
+        let (declared, dynamic) = (count("declared"), count("dynamic"));
+        let total = declared + dynamic;
+        if total == 0 {
+            return "no streams".to_string();
+        }
+        let plural = if total == 1 { "stream" } else { "streams" };
+        if dynamic > 0 {
+            return format!("{total} {plural} ({dynamic} dynamic)");
+        }
+        return format!("{total} {plural}");
     }
     "—".to_string()
 }
@@ -6047,6 +6089,105 @@ mod backing_tests {
     fn an_unprovisioned_claim_shows_a_dash_rather_than_an_empty_cell() {
         assert_eq!(backing_resource(&json!({ "status": {} })), "—");
         assert_eq!(backing_resource(&json!({})), "—");
+    }
+
+    // ---- 2.5 (ADR 0061): jetstream ----
+
+    #[test]
+    fn a_jetstream_claim_names_the_streams_it_owns() {
+        // The shape `jetstream_status_body` (resourceclaim-provisioner)
+        // actually writes, observedAt and all.
+        let c = json!({ "status": { "streams": {
+            "declared": ["streamapp_orders", "streamapp_events"],
+            "dynamic": [],
+            "unattributed": [],
+            "observedAt": "2026-09-11T10:00:00Z"
+        }}});
+        assert_eq!(backing_resource(&c), "2 streams");
+    }
+
+    #[test]
+    fn one_stream_is_singular() {
+        let c = json!({ "status": { "streams": {
+            "declared": ["streamapp_orders"], "dynamic": [], "unattributed": []
+        }}});
+        assert_eq!(backing_resource(&c), "1 stream");
+    }
+
+    #[test]
+    fn the_shape_a_live_cluster_actually_writes() {
+        // Copied verbatim off `resourceclaim/walkapp-jetstream` in the
+        // needs-jetstream walk's kind cluster (2026-09-12), a dynamicStreams
+        // application that had created two streams at runtime. Fixtures
+        // elsewhere in this module are hand-written; this one is evidence,
+        // and it is what pins the key names and the timestamp format against
+        // the provisioner rather than against my memory of it.
+        let c = json!({ "status": { "streams": {
+            "declared": [],
+            "dynamic": ["negstream", "walkstream"],
+            "observedAt": "2026-09-12T06:39:28.622117080+00:00",
+            "unattributed": []
+        }}});
+        assert_eq!(backing_resource(&c), "2 streams (2 dynamic)");
+    }
+
+    #[test]
+    fn dynamic_streams_are_counted_in_and_called_out() {
+        // A dynamicStreams app creates streams the manifest never named.
+        // They back the claim just as much, but an operator reading the row
+        // needs to know which half of the number they cannot find in git.
+        let c = json!({ "status": { "streams": {
+            "declared": ["feeder_orders"],
+            "dynamic": ["feeder_adhoc", "feeder_tmp"],
+            "unattributed": []
+        }}});
+        assert_eq!(backing_resource(&c), "3 streams (2 dynamic)");
+    }
+
+    #[test]
+    fn unattributed_streams_do_not_count_as_backing() {
+        // Foreign/captured streams sitting in the account are reported as a
+        // condition, not as this claim's backing — counting them would make
+        // a capture look like capacity.
+        let c = json!({ "status": { "streams": {
+            "declared": ["streamapp_orders"],
+            "dynamic": [],
+            "unattributed": ["someone_elses", "and_another"]
+        }}});
+        assert_eq!(backing_resource(&c), "1 stream");
+    }
+
+    #[test]
+    fn a_consume_only_claim_says_no_streams_rather_than_dash() {
+        // Permanent and correct for a consume-only application, and it is a
+        // MEASURED answer (the provisioner observed the account) — which is
+        // precisely what "—" would erase.
+        let c = json!({ "status": { "streams": {
+            "declared": [], "dynamic": [], "unattributed": [],
+            "observedAt": "2026-09-11T10:00:00Z"
+        }}});
+        assert_eq!(backing_resource(&c), "no streams");
+    }
+
+    #[test]
+    fn a_jetstream_claim_before_its_first_observation_still_dashes() {
+        // No `status.streams` yet → the provisioner has not looked at the
+        // server. That is genuinely unknown, so it keeps the dash.
+        let c = json!({ "status": { "provider": "jetstream-integrated", "ready": false }});
+        assert_eq!(backing_resource(&c), "—");
+    }
+
+    #[test]
+    fn an_instance_still_wins_over_a_stream_inventory() {
+        // Ordering guard: the instance/PVC arms are checked first, so a
+        // future backend that carried both would not have its instance
+        // silently replaced by a stream count.
+        let c = json!({ "status": {
+            "instance": "platform-redis-ephemeral-000",
+            "dbnum": 3,
+            "streams": { "declared": ["x"], "dynamic": [], "unattributed": [] }
+        }});
+        assert_eq!(backing_resource(&c), "platform-redis-ephemeral-000 (db 3)");
     }
 }
 
