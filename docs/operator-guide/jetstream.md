@@ -57,10 +57,11 @@ spec: base: {
 }
 ```
 
-`size` is the storage the account may hold. It is a **namespace** budget: the
-sizes of every claim in the namespace are added together and clamped by a
-per-namespace ceiling, so a second application arriving is what makes the number
-bite rather than your own declaration alone.
+`size` is the storage the account may hold, one of `nano`, `small`, `medium`,
+`large` and `xlarge`. It is a **namespace** budget: the sizes of every claim in
+the namespace are added together and clamped by a per-namespace ceiling, so a
+second application arriving is what makes the number bite rather than your own
+declaration alone.
 
 **Declaring the dependency does not inject anything into your container.** Bind
 the env-vars you want:
@@ -69,7 +70,7 @@ the env-vars you want:
 spec: base: {
     // ... image / replicas / expose / needs ...
     env: {
-        NATS_URL:           claim.jetstream.url
+        NATS_URL:            claim.jetstream.url
         NATS_SUBJECT_PREFIX: claim.jetstream.subjectPrefix
         NATS_INBOX_PREFIX:   claim.jetstream.inboxPrefix
     }
@@ -103,7 +104,7 @@ A stream is declared, not created at runtime:
 needs: {
     jetstream: {
         selector: { tier: "integrated" }
-        size:     "small"
+        size:     "medium"
         streams: [
             {
                 name:      "orders"
@@ -111,7 +112,7 @@ needs: {
                 storage:   "file"
                 retention: "workqueue"
                 maxAge:    "24h"
-                maxBytes:  "1Gi"
+                maxBytes:  "512Mi"
             },
         ]
     }
@@ -119,10 +120,15 @@ needs: {
 ```
 
 `maxBytes` is **required** — a stream without one silently claims the whole
-account budget. `name` must be a DNS-1123 label (lowercase letters, digits and
-hyphens): the platform composes it with your application's name into the
-identifier the access rules are keyed on, and an underscore there would make
-that composition ambiguous.
+account budget — and it is reserved out of the budget the namespace shares,
+alongside every stream your neighbours declare. Ask for more than is left and
+the claim reports `QuotaExceeded`, naming the stream and the numbers, before
+anything is created.
+
+`name` must be a DNS-1123 label (lowercase letters, digits and hyphens): the
+platform composes it with your application's name into the identifier the access
+rules are keyed on, and an underscore there would make that composition
+ambiguous.
 
 The platform creates the stream and holds the application back until it exists.
 That wait is the point — an application that started first would be publishing
@@ -166,7 +172,7 @@ streams: [
     {
         name:     "orders"
         subjects: ["shop.orders.>", "billing.orders.>"]   // other applications' prefixes
-        maxBytes: "1Gi"
+        maxBytes: "512Mi"
     },
 ]
 ```
@@ -181,8 +187,9 @@ one is the one that bites.
 **Subjects: you must prefix them.** Your application may publish only under
 `claim.jetstream.subjectPrefix` — the value is your application's name and a
 dot. This is enforced, not advisory: a publish outside the prefix is refused.
-Subscribing follows the same rule, with the streams and durables you declared as
-the exception.
+Subscribing is narrower still — that same prefix and your own reply inbox, and
+nothing else. Reading a stream you do not own works through the durable you
+declared, which delivers into that inbox, which is the next rule's business.
 
 ### Set the inbox prefix, it is not optional
 
