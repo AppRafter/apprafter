@@ -70,6 +70,9 @@ binds the credentials, and opens exactly the egress that need implies.
   provisioning, credential binding, and the grace window after removal.
 - [Redis](redis.md) — a `needs.redis` declaration end to end, including
   the per-claim logical-database isolation on the shared pool.
+- [JetStream](jetstream.md) — a `needs.jetstream` declaration end to end:
+  the account the namespace shares, the streams and durable consumers
+  declared beside it, and the edits that are held for approval.
 - [Persistent disk](persistent-disk.md) — a `needs.disk` declaration end
   to end, and the single-writer constraint it puts on the workload.
 - [Shared volumes](shared-volumes.md) — one directory mounted by several

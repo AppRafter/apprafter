@@ -172,6 +172,25 @@ pub const CLAIMS: &[Claim] = &[
                   documents wrong again.",
         holds_today: true,
     },
+    Claim {
+        phrase: "no egress rule for the message server",
+        evidence: "operator/operator-rendering/src/egress.rs",
+        // The match arm a fix would add, mirroring `"pg" =>` and
+        // `"redis" =>` beside it. `jetstream` appears nowhere in this file
+        // today, so the anchor cannot match something unrelated.
+        anchor: "\"jetstream\" =>",
+        truth: Expect::Absent,
+        because: "ADR 0061 §1 says the NATS server's coordinates land in the \
+                  needs-derived egress policy, and they do not: \
+                  `default_target` has no jetstream arm, so a `needs.jetstream` \
+                  application gets a default-deny egress policy with nothing \
+                  allowing it through to nats-system. The jetstream guide and \
+                  its mechanism page both say so, and both must retract the \
+                  sentence the day the arm lands. Nothing else would notice: \
+                  the walk runs without Cilium, so the policy is never applied \
+                  there at all.",
+        holds_today: true,
+    },
 ];
 
 /// Whether a claim's phrase is true of the tree right now.

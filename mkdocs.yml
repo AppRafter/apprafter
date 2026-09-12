@@ -251,6 +251,7 @@ nav:
       - Secrets: operator-guide/secrets.md
       - Postgres: operator-guide/postgres.md
       - Redis: operator-guide/redis.md
+      - JetStream: operator-guide/jetstream.md
       - Persistent disk: operator-guide/persistent-disk.md
       - Shared volumes: operator-guide/shared-volumes.md
       - Egress policy: operator-guide/egress-policy.md
@@ -280,6 +281,7 @@ nav:
       - Overview: how-it-works/index.md
       - Declared Postgres dependencies: how-it-works/needs-pg.md
       - Declared Redis dependencies: how-it-works/needs-redis.md
+      - Declared JetStream dependencies: how-it-works/needs-jetstream.md
       - Declared disk dependencies: how-it-works/needs-disk.md
       - Egress derived from declared dependencies: how-it-works/egress-policy.md
       - The target store on disk: how-it-works/the-target-store.md

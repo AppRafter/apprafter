@@ -32,12 +32,13 @@ Scaffold the manifest with the dependency in place:
 apprafter app scaffold --name parser --namespace demo --needs pg
 ```
 
-`--needs` is repeatable, and today it accepts the three types a provider ships
-for — `pg`, `redis` and `disk` — each with a guide in this section. Anything
-else is a clear error naming the supported set. The manifest schema itself
-allows a wider closed set (`jetstream`, `clickhouse`, `s3`, `notifications` as
-well), so a hand-written need of one of those validates but has no provider to
-schedule it.
+`--needs` is repeatable, and today it accepts `pg`, `redis` and `disk`, each
+with a guide in this section. Anything else is a clear error naming the
+supported set. `jetstream` also has a provider and a guide
+([JetStream](jetstream.md)) but no scaffold shorthand yet — write its block by
+hand. The manifest schema allows a wider closed set still (`clickhouse`, `s3`
+and `notifications`), so a hand-written need of one of those validates but has
+no provider to schedule it.
 
 That writes a `needs` block into `apprafter/Application.cue`:
 
@@ -219,7 +220,7 @@ that proves a database is physically dropped.
 | ------- | ------------ | --- |
 | The application stays at `AwaitingResourceClaim` and the claim never gets a provider | the `needs.pg.selector` matches no provider | Confirm the selector reads `tier=integrated`: `kubectl get serviceprovider pg-integrated -n apprafter-system -o yaml`. |
 | The claim never reaches `ready` | the shared Postgres cluster is not up, or the provisioner errored | `kubectl -n cnpg-system get cluster.postgresql.cnpg.io platform-postgres`, then the operator log: `kubectl -n apprafter-system logs deploy/apprafter-operator`. |
-| The manifest is rejected on sync | an unknown `needs` key | Use one of `pg`, `jetstream`, `clickhouse`, `redis`, `s3`, `notifications`, `disk`. Providers ship for `pg`, `redis` and `disk`. |
+| The manifest is rejected on sync | an unknown `needs` key | Use one of `pg`, `jetstream`, `clickhouse`, `redis`, `s3`, `notifications`, `disk`. Providers ship for `pg`, `jetstream`, `redis` and `disk`. |
 | The application starts but its DSN env-var is empty or missing | the manifest declares `needs.pg` but binds nothing — nothing is injected automatically | Add `env: { DATABASE_URL: claim.pg.url }`, as above. |
 | The database is still there long after the grace window | CloudNativePG has not reconciled the drop yet | Give it a few cycles and check the CNPG operator log in `cnpg-system`. If it persists, stop and [report it](https://github.com/apprafter/apprafter/issues) — data you were told was dropped is still on disk. |
 

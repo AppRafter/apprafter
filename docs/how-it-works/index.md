@@ -22,6 +22,10 @@ than taken on faith.
   isolated logical database on a shared pool, what the per-claim credential
   enforces, why channels are the one exception, and the flush after the grace
   window.
+- [Declared JetStream dependencies](needs-jetstream.md) — how `needs.jetstream`
+  becomes a NATS account belonging to the namespace, what keeps two applications
+  in one account apart, what `dynamicStreams` really grants, and the reclaim
+  after the grace window.
 - [Declared disk dependencies](needs-disk.md) — how `needs.disk` becomes a
   mounted volume, why that volume has no owner and what the retention model
   rests on, and what single-writer storage forces on a rollout.

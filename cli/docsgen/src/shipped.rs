@@ -8,11 +8,11 @@
 //! means a claim of that type is ever provisioned: the
 //! `resourceclaim-provisioner`'s `Backend` enum
 //! (`operator/operator-controllers/resourceclaim-provisioner/src/reconcile.rs`)
-//! only has arms for `cloudnative-pg`, `dragonfly`, `disk` and
+//! only has arms for `cloudnative-pg`, `nats`, `dragonfly`, `disk` and
 //! `shared-disk`, and `platform-stack/cue/service_providers.cue` only
-//! seeds `ServiceProvider` CRs for `pg`, `redis` and `disk`. A guide
-//! that shows a reader `needs: jetstream: {}` and calls it usable would
-//! be schema-valid and product-false.
+//! seeds `ServiceProvider` CRs for `pg`, `jetstream`, `redis` and
+//! `disk`. A guide that shows a reader `needs: clickhouse: {}` and
+//! calls it usable would be schema-valid and product-false.
 //!
 //! This table is the identifier check's second gate, after schema
 //! membership: a need must be both declared *and* shipped before a
@@ -53,26 +53,31 @@ pub const SHIPPED: &[(&str, Status)] = &[
     // operator/operator-controllers/resourceclaim-provisioner/src/reconcile.rs
     // provisions a database + role in the shared CNPG cluster.
     ("pg", Status::Shipped),
-    // #Needs declares it and BUILTIN_TYPES (validator_serviceprovider.rs)
-    // accepts it on a ServiceProvider, but service_providers.cue seeds no
-    // "jetstream-*" entry and reconcile.rs's Backend enum has no Jetstream
-    // arm — from_spec_backend() returns None for it, so the provisioner
-    // requeues forever instead of provisioning. providers/jetstream-integrated/
-    // is a README-only stub (no source).
-    ("jetstream", Status::Declared),
-    // Same shape as jetstream: declared + webhook-accepted, no
-    // service_providers.cue seed, no Backend::Clickhouse arm.
-    // providers/clickhouse-integrated/ is a README-only stub.
+    // Seeded as "jetstream-integrated" in service_providers.cue
+    // (backend: "nats"); Backend::Nats in reconcile.rs turns the lazily
+    // enabled NATS component on, writes the namespace's account into the
+    // accounts file it owns, applies the declared streams and durables,
+    // and publishes the connection Secret (2.5 / ADR 0061).
+    //
+    // Flipped in 2.5 part 4, not earlier, and the order was the point: a
+    // guide may not present `needs.jetstream` as usable until the gating
+    // that makes `consume` safe is in place. ADR 0052 triggers #14-#16
+    // are that gating.
+    ("jetstream", Status::Shipped),
+    // Declared + webhook-accepted, no service_providers.cue seed, no
+    // Backend::Clickhouse arm — from_spec_backend() returns None for it,
+    // so the provisioner requeues forever instead of provisioning.
+    // providers/clickhouse-integrated/ is a README-only stub (no source).
     ("clickhouse", Status::Declared),
     // Seeded as "redis-integrated" in service_providers.cue
     // (backend: "dragonfly"); Backend::Dragonfly in reconcile.rs
     // provisions a per-claim logical DB in the shared Dragonfly pool.
     ("redis", Status::Shipped),
-    // Same shape as jetstream: declared + webhook-accepted, no
+    // Same shape as clickhouse: declared + webhook-accepted, no
     // service_providers.cue seed, no Backend::S3 arm.
     // providers/s3-integrated/ is a README-only stub.
     ("s3", Status::Declared),
-    // Same shape as jetstream: declared + webhook-accepted, no
+    // Same shape as clickhouse: declared + webhook-accepted, no
     // service_providers.cue seed, no Backend::Notifications arm, and
     // unlike the other five, no `providers/notifications-*/` directory
     // exists at all — not even a README stub.
@@ -281,15 +286,15 @@ mod tests {
     }
 
     #[test]
-    fn the_three_with_providers_are_shipped() {
-        for need in ["pg", "redis", "disk"] {
+    fn the_four_with_providers_are_shipped() {
+        for need in ["pg", "jetstream", "redis", "disk"] {
             assert_eq!(status(need), Some(Status::Shipped), "{need}");
         }
     }
 
     #[test]
     fn declared_without_a_provider_is_not_shipped() {
-        for need in ["jetstream", "clickhouse"] {
+        for need in ["clickhouse", "s3", "notifications"] {
             assert_eq!(status(need), Some(Status::Declared), "{need}");
         }
     }

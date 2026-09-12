@@ -61,9 +61,10 @@ fn the_drifted_field_is_rejected() {
 #[test]
 fn a_declared_but_unshipped_need_is_flagged_distinctly() {
     let f = fields();
-    // `needs.jetstream` IS in the schema, so membership passes — but it
+    // `needs.clickhouse` IS in the schema, so membership passes — but it
     // has no provider, and a guide telling a reader to use it is wrong.
-    let verdict = resolve_path(&f, "needs.jetstream").expect("declared in the schema");
+    // (`needs.jetstream` held this role until 2.5 part 4 shipped it.)
+    let verdict = resolve_path(&f, "needs.clickhouse").expect("declared in the schema");
     assert!(
         verdict.unshipped,
         "must be reported as declared-not-shipped"

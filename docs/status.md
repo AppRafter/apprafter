@@ -53,6 +53,7 @@ post-launch work is not a roadmap phase and has no subscribe control.
 |---|---|---|---|
 | Shipped | ✅ | On-demand Postgres (`needs.pg`) | [Postgres](operator-guide/postgres.md) |
 | Shipped | ✅ | On-demand Redis-compatible cache (`needs.redis`) | [Redis](operator-guide/redis.md) |
+| Shipped | 🚧 | Message streams and durable consumers, declared in the manifest (`needs.jetstream`) | [JetStream](operator-guide/jetstream.md) |
 | Shipped | ✅ | On-demand block storage (`needs.disk`) | [Persistent disks](operator-guide/persistent-disk.md) |
 | Shipped | ✅ | One volume shared between applications, with removal refused while it is referenced | [Shared volumes](operator-guide/shared-volumes.md) |
 | Shipped | ✅ | Back up and restore a whole cluster, or export one dependency's data | [Back up a cluster](operator-guide/backup-restore.md) |
@@ -64,6 +65,16 @@ post-launch work is not a roadmap phase and has no subscribe control.
 
 > A cache is ephemeral by declaration and stays out of a backup unless you mark it otherwise. What
 > each command captures, and what it does not, is on the backup page.
+
+> **JetStream is `🚧`, and the gap is the last hop.** The account a namespace shares, the streams
+> and durable consumers declared beside the application, the storage budget, the approval gates on
+> the three edits that widen what an application can reach, and the seven-day reclaim are all in
+> force and exercised end to end on a cluster. What is not in force is the network rule: a
+> declaration opens the path to a database or a cache and does not yet open one to the message
+> server, so an application is handed working credentials for a server its own pod is refused a
+> connection to. One further signal — the warning that an arriving application's subject prefix is
+> already inside a neighbour's stream — has unit coverage only and has never been observed on a
+> live cluster. JetStream stores are also out of scope for backup and restore.
 
 ---
 
