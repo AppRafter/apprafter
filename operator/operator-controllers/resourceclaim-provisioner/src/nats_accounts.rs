@@ -62,7 +62,13 @@ pub struct ConsumeView {
 /// two never had a chance to disagree
 /// (`the_account_key_matches_claimview_account_for_a_hyphenated_namespace`
 /// closes that gap).
-fn account_name(namespace: &str) -> String {
+///
+/// `pub` (2.5e Task 2): `nats::account_object` needs the SAME NATS-side
+/// name for the Account CR's `spec.name` — reusing this fold rather than
+/// adding a third independent copy, the exact drift round-7 review
+/// already found once between this function and `render_account`'s own
+/// (now-deleted) copy.
+pub fn account_name(namespace: &str) -> String {
     format!("ns_{}", namespace.replace('-', "_"))
 }
 
@@ -1308,8 +1314,22 @@ mod tests {
     /// in the module that actually asks the server, not the string.
     ///
     /// Builds a small standalone `nats.conf` around `render_accounts_file`'s
-    /// output in a temp dir and runs `nats-server -t` (config check, no
-    /// actual listen) against it inside a `nats:2-alpine` container.
+    /// output in a temp dir and BOOTS a real `nats:2-alpine` server
+    /// against it, waiting for the server's own `Server is ready` banner.
+    ///
+    /// **It boots the server rather than running `nats-server -t`, and
+    /// that is not a stylistic preference.** `-t` is a config-file
+    /// *parse* check; several whole-server invariants are evaluated only
+    /// at startup, so it can pass on a config the deployed server then
+    /// refuses. Measured during 2.5e, on a config shape this module was
+    /// briefly about to produce: a `no_auth_user` naming a user no
+    /// account defines passes `-t` with `configuration file … is valid`
+    /// and then exits 1 at boot with `present, but users/nkeys are not
+    /// defined`. A `-t`-based version of this test stayed GREEN through a
+    /// deliberate mutation that a boot caught immediately — the exact
+    /// class of silently-non-matching check this file's own comments keep
+    /// warning about. Asking the question the deployed server asks is
+    /// this test's entire job.
     ///
     /// **The `include` sits at TOP LEVEL, mirroring `component_nats.cue`'s
     /// `config.merge`'s `accounts$include` key exactly — it must NOT
@@ -1344,54 +1364,114 @@ mod tests {
         // had been asked to parse before.
         let mut claims = ns_with_two_apps();
         claims.push(claim("other", "solo"));
-        let fragment = render_accounts_file(&claims, u64::MAX, u64::MAX, &|u| format!("pw-{u}"))
-            .expect("renders");
+        // Both shapes, in one test: the populated render, and the
+        // ZERO-CLAIM render — the state the file lands in when the
+        // cluster's last jetstream claim goes away, and one the walk
+        // reaches every time it tears its fixtures down. `accounts: {}`
+        // with nothing inside is a shape no unit assertion in this module
+        // has any opinion about; whether a server will BOOT on it is a
+        // question only the server answers.
+        for (label, claims) in [
+            ("populated", claims.as_slice()),
+            ("zero-claim", [].as_slice()),
+        ] {
+            let fragment = render_accounts_file(claims, u64::MAX, u64::MAX, &|u| format!("pw-{u}"))
+                .expect("renders");
 
-        let nats_conf = r#"
+            // Mirrors `component_nats.cue`'s `config.merge` EXACTLY: the
+            // `include` is a bare TOP-LEVEL statement, sibling to
+            // `jetstream`/`feature_flags`/`port`. Nothing else is added
+            // here — in particular NO `no_auth_user`, which ADR 0061 §2
+            // forbids; a harness that quietly added one would make this
+            // test agree with a config the chart does not render, and
+            // would hide the very failure the boot is here to catch.
+            let nats_conf = r#"
 port: 4222
 jetstream: {
   store_dir: "/tmp/nats-check-store"
 }
 include "accounts.conf"
-"#;
+"#
+            .to_string();
 
-        let dir = std::env::temp_dir().join(format!(
-            "nats-accounts-check-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        std::fs::write(dir.join("nats.conf"), nats_conf).expect("write nats.conf");
-        std::fs::write(dir.join("accounts.conf"), &fragment).expect("write accounts.conf");
+            let dir = std::env::temp_dir().join(format!(
+                "nats-accounts-check-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            std::fs::write(dir.join("nats.conf"), &nats_conf).expect("write nats.conf");
+            std::fs::write(dir.join("accounts.conf"), &fragment).expect("write accounts.conf");
 
-        let mount = format!("{}:/etc/nats:ro,Z", dir.display());
-        let output = std::process::Command::new("podman")
-            .args([
-                "run",
-                "--rm",
-                "-v",
-                &mount,
-                "nats:2-alpine",
-                "-c",
-                "/etc/nats/nats.conf",
-                "-t",
-            ])
-            .output()
-            .expect("run podman — is it installed?");
+            let mount = format!("{}:/etc/nats:ro,Z", dir.display());
+            let container = format!("nats-accounts-check-{label}-{}", std::process::id());
+            let _ = std::process::Command::new("podman")
+                .args(["rm", "-f", &container])
+                .output();
+            let run = std::process::Command::new("podman")
+                .args([
+                    "run",
+                    "-d",
+                    "--name",
+                    &container,
+                    "-v",
+                    &mount,
+                    "nats:2-alpine",
+                    "-c",
+                    "/etc/nats/nats.conf",
+                ])
+                .output()
+                .expect("run podman — is it installed?");
+            assert!(
+                run.status.success(),
+                "podman run failed: {}",
+                String::from_utf8_lossy(&run.stderr)
+            );
 
-        let _ = std::fs::remove_dir_all(&dir);
+            // Poll for the server's own readiness banner, or for the
+            // container having exited (a refused config exits 1 almost
+            // immediately — no need to wait out the whole budget).
+            let mut ready = false;
+            let mut logs = String::new();
+            for _ in 0..50 {
+                let out = std::process::Command::new("podman")
+                    .args(["logs", &container])
+                    .output()
+                    .expect("podman logs");
+                logs = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                if logs.contains("Server is ready") {
+                    ready = true;
+                    break;
+                }
+                let state = std::process::Command::new("podman")
+                    .args(["inspect", &container, "--format", "{{.State.Status}}"])
+                    .output()
+                    .expect("podman inspect");
+                if String::from_utf8_lossy(&state.stdout).trim() == "exited" {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
 
-        assert!(
-            output.status.success(),
-            "nats-server rejected the rendered config:\n\
-             --- nats.conf ---\n{nats_conf}\n\
-             --- accounts.conf ---\n{fragment}\n\
-             --- stdout ---\n{}\n--- stderr ---\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+            let _ = std::process::Command::new("podman")
+                .args(["rm", "-f", &container])
+                .output();
+            let _ = std::fs::remove_dir_all(&dir);
+
+            assert!(
+                ready,
+                "nats-server never became ready on the {label} rendered config:\n\
+                 --- nats.conf ---\n{nats_conf}\n\
+                 --- accounts.conf ---\n{fragment}\n\
+                 --- server log ---\n{logs}"
+            );
+        }
     }
 }

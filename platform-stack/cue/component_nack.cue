@@ -34,7 +34,56 @@ _components: "nack": #Component & {
 	}
 	version: "0.35.0"
 	values: {
-		jetstream: nats: url: "nats://nats.nats-system.svc:4222"
+		jetstream: {
+			nats: url: "nats://nats.nats-system.svc:4222"
+
+			// 2.5e walk finding — the flag without which the whole
+			// `Account` CR mechanism ADR 0061 §1 rests on is INERT, and
+			// NACK cannot talk to the server at all once the feature is
+			// used. One flag, two failures:
+			//
+			// 1. `spec.account` on a `Stream`/`Consumer` is IGNORED without
+			//    it. Read in the nack source at v0.24.0:
+			//    `controller.go`'s `getAccountOverrides` opens with
+			//    `if account == "" || !c.opts.CRDConnect { return
+			//    overrides, nil }`, and `runWithJsmc` then uses the GLOBAL
+			//    connection for every object. So the provisioner's
+			//    `Account` CR — the per-namespace `mgr_<ns>` credential the
+			//    ADR describes as "CONNECTION CONFIGURATION for
+			//    Stream/Consumer" — was never consulted, and every declared
+			//    stream came back `Errored`.
+			// 2. WITHOUT it NACK opens a global connection at process start
+			//    (`Run()` — the `!CRDConnect` branch dials and returns
+			//    `failed to connect to nats` on error). A NATS server with
+			//    no `accounts { }` block accepts unauthenticated
+			//    connections; one WITH accounts-and-users rejects them. So
+			//    NACK connected fine at bootstrap and was locked out
+			//    PERMANENTLY the instant the first `needs.jetstream` claim
+			//    made the provisioner write the accounts file:
+			//    `Error: failed to connect to nats: nats: Authorization
+			//    Violation`, CrashLoopBackOff, no `Stream` ever created.
+			//    WITH it, `Run()` takes the other branch and builds a lazy
+			//    connection pool instead — no global connection is opened at
+			//    all, so there is nothing to reject.
+			//
+			// MEASURED both ways (podman, nats-server 2.14.3 +
+			// `natsio/jetstream-controller:0.24.0`, against a server whose
+			// accounts file grants no anonymous access): without the flag,
+			// `Authorization Violation` at startup; with it, the controller
+			// never touches NATS at startup at all.
+			//
+			// The measurement recorded below ("confirmed connected via its
+			// own log line") was real — and taken against a server with no
+			// accounts file, i.e. under exactly the condition that stops
+			// holding the moment the feature is used.
+			//
+			// `jetstream.nats.url` above stays: it is the default `-s` for
+			// an object with no `spec.account`. The provisioner always sets
+			// one, so nothing should take that path — it is a fallback, not
+			// the mechanism.
+			additionalArgs: ["--crd-connect"]
+		}
+
 		// Burstable, NOT Guaranteed — mirrors
 		// `component_dragonfly-operator.cue`'s `manager.resources`
 		// exactly: NACK is a CONTROLLER (ADR 0053 §1's "platform

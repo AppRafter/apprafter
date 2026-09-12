@@ -20,7 +20,9 @@ use std::collections::BTreeMap;
 
 use operator_core::{JetStreamStream as CoreJetStreamStream, ResourceClaim};
 
-use crate::nats_accounts::{ClaimView, ConsumeView, StreamView};
+use crate::nats_accounts::{
+    account_name, nats_durable_name, nats_stream_name, ClaimView, ConsumeView, StreamView,
+};
 
 /// Fallback `#Size` when a claim's `spec.size` is absent (`needs.jetstream`
 /// makes it optional; nothing upstream fills a default today — confirmed
@@ -97,7 +99,7 @@ pub fn claim_views(claims: &[ResourceClaim], size_bytes: &BTreeMap<String, u64>)
 /// shape as `render_account`'s own `peers.is_empty()` guard: cheap
 /// insurance against a caller this module cannot see, not a case
 /// expected to fire.
-fn declaring_app(claim: &ResourceClaim) -> Option<String> {
+pub(crate) fn declaring_app(claim: &ResourceClaim) -> Option<String> {
     claim
         .metadata
         .owner_references
@@ -301,7 +303,15 @@ pub fn accounts_secret_object(name: &str, ns: &str, accounts_conf: &str) -> serd
 /// A per-namespace management user's password Secret (2.5d Task 10) —
 /// UNOWNED, same reasoning as [`accounts_secret_object`]: the identity is
 /// platform-scoped, not tied to any one claim's lifecycle.
-pub fn mgr_secret_object(name: &str, ns: &str, password: &str) -> serde_json::Value {
+///
+/// Carries `user` as well as `password` (2.5e Task 2): NACK's `Account`
+/// CRD (`jetstream.nats.io/v1beta2`, verified against the CRD the `nack`
+/// chart 0.35.0 actually installs) reads BOTH the username and the
+/// password off SECRET KEYS named by `spec.user.user` /
+/// `spec.user.password` — those two CRD fields name KEYS inside this
+/// Secret, not literal value strings — so the Secret has to carry the
+/// username itself for `user.user` to point at anything.
+pub fn mgr_secret_object(name: &str, ns: &str, user: &str, password: &str) -> serde_json::Value {
     serde_json::json!({
         "apiVersion": "v1",
         "kind": "Secret",
@@ -314,7 +324,221 @@ pub fn mgr_secret_object(name: &str, ns: &str, password: &str) -> serde_json::Va
         },
         "type": "Opaque",
         "stringData": {
+            "user": user,
             "password": password,
+        },
+    })
+}
+
+/// The `Account` CR's Kubernetes object name for a namespace (2.5e Task
+/// 2) — `ns-<namespace>`, hyphen-joined and DNS-1123 by construction (a
+/// Kubernetes namespace name already is). Deliberately NOT the same
+/// string as [`nats_accounts::account_name`]'s `ns_<namespace>`
+/// (underscore-joined, the NATS-side account name that lives inside
+/// `render_accounts_file`'s output) — a Kubernetes object name and a
+/// value inside a config file are different worlds, and this function
+/// exists so nothing conflates them by reusing one string for both.
+pub fn account_k8s_name(namespace: &str) -> String {
+    format!("ns-{namespace}")
+}
+
+/// The NACK `Account` CR for one namespace-account (2.5e Task 2, ADR
+/// 0061 §1/§8) — CONNECTION CONFIGURATION telling NACK how to authenticate
+/// as `mgr_<ns>` when it creates/updates `Stream`/`Consumer` objects in
+/// this account, not an account definition of its own (the account
+/// itself is the config-file entry `render_accounts_file` owns).
+///
+/// `spec.name` is the NATS-side account (`nats_accounts::account_name`) —
+/// verified against the real CRD (`jetstream.nats.io/v1beta2`): both
+/// `Account.spec.name` and `Stream.spec.account`/`Consumer.spec.account`
+/// carry the SAME `^[^.*>]*$` NATS-subject-safe pattern, but they are NOT
+/// the same kind of reference — `Account.spec.name` is this account's own
+/// NATS-side identity, while `Stream`/`Consumer`'s `account` field is a
+/// KUBERNETES OBJECT NAME (confirmed by reading the nack controller
+/// source, `controller.go`'s `getAccountOverrides`, which resolves it via
+/// `c.ji.Accounts(ns).Get(ctx, account, ...)` — a Kubernetes API GET by
+/// object name, not a NATS-side lookup). This function's OWN `spec.name`
+/// is the account's NATS identity; [`account_k8s_name`] is what a
+/// `Stream`/`Consumer`'s `account` field must be set to instead.
+///
+/// `spec.user.user` / `spec.user.password` NAME KEYS inside
+/// `mgr_secret_name`'s Secret (see [`mgr_secret_object`]'s own doc) —
+/// fixed at `"user"`/`"password"` because this function and
+/// `mgr_secret_object` are the only producer/consumer pair for this
+/// Secret and choose the key names together.
+pub fn account_object(
+    namespace: &str,
+    nats_ns: &str,
+    server_url: &str,
+    mgr_secret_name: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "jetstream.nats.io/v1beta2",
+        "kind": "Account",
+        "metadata": {
+            "name": account_k8s_name(namespace),
+            "namespace": nats_ns,
+            "labels": {
+                "apprafter.io/managed-by": "apprafter",
+            },
+        },
+        "spec": {
+            "name": account_name(namespace),
+            "servers": [server_url],
+            "user": {
+                "secret": { "name": mgr_secret_name },
+                "user": "user",
+                "password": "password",
+            },
+        },
+    })
+}
+
+/// Parse a Kubernetes resource-quantity string (binary SI `Ki/Mi/Gi/Ti/Pi`,
+/// decimal SI `k/M/G/T/P`, or a bare integer) to a base-unit byte count
+/// (2.5e Task 3) — NACK's `Stream.spec.maxBytes` is a plain `integer`
+/// (confirmed against the CRD the `nack` chart installs), while
+/// `#JetStreamStream.maxBytes` (the CUE/webhook-validated claim field) is
+/// a Kubernetes quantity STRING like `"1Gi"`, so something has to convert
+/// between the two.
+///
+/// A hand-rolled parser, not a shared one: `admission-webhook`'s own
+/// `quantity_to_f64` already solves this identical problem, but pulling
+/// it in would make a validation-only crate a PRODUCTION dependency of
+/// this one — the wrong direction of coupling (mirrors why
+/// `PLATFORMSTACK_NAME`/`PLATFORMSTACK_NAMESPACE` are duplicated between
+/// the CLI and the operator rather than shared: separate workspaces, no
+/// common dependency worth taking on for a few lines). By the time a
+/// claim reaches this code the webhook has ALREADY validated `maxBytes`
+/// is a well-formed quantity, so this function's own `None` return on
+/// malformed input is defensive, not a second gate anything relies on
+/// being reachable.
+pub fn quantity_bytes(q: &str) -> Option<i64> {
+    let q = q.trim();
+    if q.is_empty() {
+        return None;
+    }
+    let idx = q.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(q.len());
+    let (num, unit) = q.split_at(idx);
+    let n: f64 = num.parse().ok()?;
+    let mul: f64 = match unit {
+        "" => 1.0,
+        "k" => 1e3,
+        "M" => 1e6,
+        "G" => 1e9,
+        "T" => 1e12,
+        "P" => 1e15,
+        "Ki" => 1024.0,
+        "Mi" => 1024f64.powi(2),
+        "Gi" => 1024f64.powi(3),
+        "Ti" => 1024f64.powi(4),
+        "Pi" => 1024f64.powi(5),
+        _ => return None,
+    };
+    Some((n * mul).round() as i64)
+}
+
+/// One declared stream's `Stream` CR (2.5e Task 3, ADR 0061 §1/§8) —
+/// object name `<ns>-<owner app>-<declared name>` (Kubernetes, DNS-1123),
+/// `spec.name` the NATS-side name from
+/// [`nats_accounts::nats_stream_name`] — the SAME derivation the
+/// deny-vector/allow-list already use, not a second copy of the join
+/// formula (the whole reason that function's own doc argues the join is
+/// collision-free is worth nothing if a second implementation of it can
+/// drift).
+///
+/// **No `ownerReference` — deliberately, not an oversight.** This object
+/// lives in `nats-system` while the declaring `ResourceClaim` lives in
+/// the application's own namespace, and Kubernetes forbids a
+/// cross-namespace owner reference outright. Deleted EXPLICITLY by the
+/// orchestration that applies this (mirrors exactly how `needs.disk`
+/// deletes its own unowned PVC — same shape, same reason).
+///
+/// `spec.account` is [`account_k8s_name`]'s output — the Kubernetes
+/// object name of the `Account` CR in the SAME namespace, NOT the
+/// NATS-side account name (see [`account_object`]'s own doc for the
+/// verified distinction).
+#[allow(clippy::too_many_arguments)]
+pub fn stream_object(
+    ns: &str,
+    nats_ns: &str,
+    owner_app: &str,
+    declared_name: &str,
+    subjects: &[String],
+    storage: &str,
+    retention: &str,
+    max_age: &str,
+    max_bytes: i64,
+    account_object_name: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "jetstream.nats.io/v1beta2",
+        "kind": "Stream",
+        "metadata": {
+            "name": format!("{ns}-{owner_app}-{declared_name}"),
+            "namespace": nats_ns,
+            "labels": {
+                "apprafter.io/managed-by": "apprafter",
+            },
+        },
+        "spec": {
+            "name": nats_stream_name(owner_app, declared_name),
+            "subjects": subjects,
+            "storage": storage,
+            "retention": retention,
+            "maxAge": max_age,
+            "maxBytes": max_bytes,
+            "account": account_object_name,
+        },
+    })
+}
+
+/// One declared `consume` entry's `Consumer` CR (2.5e Task 3, ADR 0061
+/// §1/§8) — object name `<ns>-<consumer app>-<declared durable>`,
+/// `spec.durableName` from [`nats_accounts::nats_durable_name`]
+/// (consumer-keyed, not owner-keyed — see that function's own doc for
+/// why the asymmetry is the point, not a bug).
+///
+/// **`spec.streamName` is the NATS-SIDE stream name
+/// (`nats_accounts::nats_stream_name(owner, stream)`), NOT the `Stream`
+/// CR's own Kubernetes object name.** Verified against the nack
+/// controller source (`jsmclient.go`'s `LoadConsumer`/`NewConsumer`,
+/// which pass this value straight into the JetStream manager client
+/// library — a NATS protocol call, never a Kubernetes API call) — unlike
+/// `spec.account` on this SAME object, which IS a Kubernetes object name
+/// ([`account_k8s_name`]'s output, resolved via `controller.go`'s
+/// `getAccountOverrides`). The two fields on one CR pointing at two
+/// different KINDS of name is exactly the plausible-looking mistake this
+/// round's own standing instruction ("verify a CRD field, don't inherit
+/// a recollection of it") exists to catch — confirmed by reading both
+/// code paths, not assumed from the field names' surface symmetry.
+///
+/// No `ownerReference`, same reasoning as [`stream_object`].
+pub fn consumer_object(
+    ns: &str,
+    nats_ns: &str,
+    consumer_app: &str,
+    declared_durable: &str,
+    owner_app: &str,
+    owner_declared_stream_name: &str,
+    account_object_name: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "jetstream.nats.io/v1beta2",
+        "kind": "Consumer",
+        "metadata": {
+            "name": format!("{ns}-{consumer_app}-{declared_durable}"),
+            "namespace": nats_ns,
+            "labels": {
+                "apprafter.io/managed-by": "apprafter",
+            },
+        },
+        "spec": {
+            "durableName": nats_durable_name(consumer_app, declared_durable),
+            "streamName": nats_stream_name(owner_app, owner_declared_stream_name),
+            "ackPolicy": "explicit",
+            "deliverPolicy": "all",
+            "account": account_object_name,
         },
     })
 }
@@ -712,12 +936,62 @@ mod tests {
     }
 
     #[test]
-    fn mgr_secret_object_carries_the_password_key() {
-        let s = mgr_secret_object("nats-mgr-demo", "nats-system", "s3cr3t");
+    fn mgr_secret_object_carries_the_user_and_password_keys() {
+        // 2.5e Task 2: NACK's own Account CRD reads the username from a
+        // SECRET KEY (spec.user.user names the KEY, not the literal
+        // value) — so this Secret must carry the username string itself,
+        // not just the password, or the Account CR has nothing to point
+        // `user.user` at.
+        let s = mgr_secret_object("nats-mgr-demo", "nats-system", "mgr_demo", "s3cr3t");
         assert_eq!(s["metadata"]["name"], "nats-mgr-demo");
         assert_eq!(s["metadata"]["namespace"], "nats-system");
+        assert_eq!(s["stringData"]["user"], "mgr_demo");
         assert_eq!(s["stringData"]["password"], "s3cr3t");
         assert!(s["metadata"].get("ownerReferences").is_none());
+    }
+
+    // --- account_k8s_name / account_object (2.5e Task 2, NACK Account CR) ---
+
+    #[test]
+    fn account_k8s_name_is_dns1123_and_distinct_from_the_nats_side_name() {
+        // `ns-<namespace>` (hyphen, DNS-1123) — deliberately NOT the same
+        // string as `nats_accounts::account_name`'s `ns_<namespace>`
+        // (underscore, NATS-side): the two live in different worlds (a
+        // Kubernetes object name vs. a value inside a config file) and
+        // conflating them would be a coincidence, not a design.
+        assert_eq!(account_k8s_name("demo"), "ns-demo");
+        assert_eq!(account_k8s_name("demo-ns"), "ns-demo-ns");
+    }
+
+    #[test]
+    fn account_object_carries_the_nats_side_name_and_servers_and_user_ref() {
+        let a = account_object(
+            "demo",
+            "nats-system",
+            "nats://nats.nats-system.svc:4222",
+            "nats-mgr-demo",
+        );
+        assert_eq!(a["apiVersion"], "jetstream.nats.io/v1beta2");
+        assert_eq!(a["kind"], "Account");
+        assert_eq!(a["metadata"]["name"], "ns-demo");
+        assert_eq!(a["metadata"]["namespace"], "nats-system");
+        // spec.name is the NATS-side account (nats_accounts::account_name),
+        // NOT the Kubernetes object name — verified against the real NACK
+        // CRD/controller (jetstream.nats.io v1beta2, nack v0.35.0): this is
+        // what render_accounts_file's own `ns_demo: { ... }` key IS.
+        assert_eq!(a["spec"]["name"], "ns_demo");
+        assert_eq!(
+            a["spec"]["servers"],
+            serde_json::json!(["nats://nats.nats-system.svc:4222"])
+        );
+        // `user.user`/`user.password` NAME KEYS inside the referenced
+        // Secret (verified against the CRD schema + controller.go's own
+        // getAccountOverrides, which reads secret.Data[user.User] /
+        // secret.Data[user.Password]) — they are not the literal
+        // username/password strings themselves.
+        assert_eq!(a["spec"]["user"]["secret"]["name"], "nats-mgr-demo");
+        assert_eq!(a["spec"]["user"]["user"], "user");
+        assert_eq!(a["spec"]["user"]["password"], "password");
     }
 
     #[test]
@@ -743,5 +1017,141 @@ mod tests {
         assert_eq!(owner["uid"], "uid-xyz");
         assert_eq!(owner["controller"], true);
         assert_eq!(owner["blockOwnerDeletion"], true);
+    }
+
+    // --- quantity_bytes (2.5e Task 3) ---------------------------------
+
+    #[test]
+    fn quantity_bytes_parses_binary_si_suffixes() {
+        assert_eq!(quantity_bytes("1Gi"), Some(1073741824));
+        assert_eq!(quantity_bytes("256Mi"), Some(268435456));
+        assert_eq!(quantity_bytes("1Ki"), Some(1024));
+    }
+
+    #[test]
+    fn quantity_bytes_parses_decimal_si_suffixes_and_bare_numbers() {
+        assert_eq!(quantity_bytes("1G"), Some(1_000_000_000));
+        assert_eq!(quantity_bytes("512"), Some(512));
+    }
+
+    #[test]
+    fn quantity_bytes_rejects_malformed_input() {
+        // The admission webhook (validator.rs's own is_k8s_quantity) has
+        // already rejected a malformed maxBytes before a claim ever
+        // reaches this code — this is defensive, not a second gate the
+        // product relies on being reachable.
+        assert_eq!(quantity_bytes(""), None);
+        assert_eq!(quantity_bytes("not-a-quantity"), None);
+        assert_eq!(quantity_bytes("1Xi"), None);
+    }
+
+    // --- stream_object / consumer_object (2.5e Task 3, NACK CRs) -----
+
+    #[test]
+    fn stream_object_carries_the_nats_side_name_and_declared_shape() {
+        let s = stream_object(
+            "demo",
+            "nats-system",
+            "streamapp",
+            "orders",
+            &["streamapp.orders.>".to_string()],
+            "file",
+            "limits",
+            "",
+            1_073_741_824,
+            "ns-demo",
+        );
+        assert_eq!(s["apiVersion"], "jetstream.nats.io/v1beta2");
+        assert_eq!(s["kind"], "Stream");
+        // Object name: <ns>-<app>-<name> (K8s, DNS-1123).
+        assert_eq!(s["metadata"]["name"], "demo-streamapp-orders");
+        assert_eq!(s["metadata"]["namespace"], "nats-system");
+        // spec.name: the NATS-side name (nats_accounts::nats_stream_name) —
+        // the SAME derivation the deny-vector/allow-list already use, not
+        // a second copy of the join formula.
+        assert_eq!(s["spec"]["name"], "streamapp_orders");
+        assert_eq!(
+            s["spec"]["subjects"],
+            serde_json::json!(["streamapp.orders.>"])
+        );
+        assert_eq!(s["spec"]["storage"], "file");
+        assert_eq!(s["spec"]["retention"], "limits");
+        assert_eq!(s["spec"]["maxBytes"], 1_073_741_824i64);
+        // spec.account: the KUBERNETES OBJECT NAME of the Account CR in
+        // the SAME namespace — verified against controller.go's
+        // getAccountOverrides, which does `c.ji.Accounts(ns).Get(ctx,
+        // account, ...)` (a K8s API GET by object name), NOT the
+        // NATS-side account name (`Account.spec.name`). Getting this
+        // backwards fails only inside a live reconcile, per this
+        // round's own standing instruction to verify rather than
+        // inherit a CRD field's meaning.
+        assert_eq!(s["spec"]["account"], "ns-demo");
+    }
+
+    #[test]
+    fn stream_object_omits_max_age_when_absent() {
+        let s = stream_object(
+            "demo",
+            "nats-system",
+            "streamapp",
+            "orders",
+            &["streamapp.orders.>".to_string()],
+            "file",
+            "limits",
+            "",
+            1_073_741_824,
+            "ns-demo",
+        );
+        assert_eq!(
+            s["spec"]["maxAge"], "",
+            "empty maxAge matches the CRD's own default (\"\")"
+        );
+    }
+
+    #[test]
+    fn stream_object_carries_max_age_when_present() {
+        let s = stream_object(
+            "demo",
+            "nats-system",
+            "streamapp",
+            "orders",
+            &["streamapp.orders.>".to_string()],
+            "file",
+            "limits",
+            "24h",
+            1_073_741_824,
+            "ns-demo",
+        );
+        assert_eq!(s["spec"]["maxAge"], "24h");
+    }
+
+    #[test]
+    fn consumer_object_carries_the_nats_side_durable_and_stream_names() {
+        let c = consumer_object(
+            "demo",
+            "nats-system",
+            "consumerapp",
+            "reader",
+            "streamapp",
+            "orders",
+            "ns-demo",
+        );
+        assert_eq!(c["apiVersion"], "jetstream.nats.io/v1beta2");
+        assert_eq!(c["kind"], "Consumer");
+        // Object name: <ns>-<consumer app>-<durable>.
+        assert_eq!(c["metadata"]["name"], "demo-consumerapp-reader");
+        assert_eq!(c["metadata"]["namespace"], "nats-system");
+        // durableName: nats_durable_name(consumer_app, declared) —
+        // consumer-keyed, NOT owner-keyed (see nats_accounts's own doc on
+        // why the asymmetry is the point).
+        assert_eq!(c["spec"]["durableName"], "consumerapp_reader");
+        // streamName: the NATS-SIDE stream name (nats_stream_name(owner,
+        // stream)) — verified against jsmclient.go's LoadConsumer/
+        // NewConsumer, which pass it straight to the JetStream manager
+        // client, NOT to a Kubernetes API call. This is NOT the Stream
+        // CR's own Kubernetes object name — a plausible-looking mistake
+        // this test exists to pin against.
+        assert_eq!(c["spec"]["streamName"], "streamapp_orders");
+        assert_eq!(c["spec"]["account"], "ns-demo");
     }
 }

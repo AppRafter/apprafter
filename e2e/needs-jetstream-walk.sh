@@ -35,11 +35,12 @@
 #      second claim triggers, and the new user works WITHOUT a pod
 #      restart (the hot reload ADR 0061 §1's `$include` design rests on).
 #
-# Plus, while a cluster exists: a claim declaring `streams: [...]` parks
-# at Ready=False/AwaitingStreamCreation rather than going ready (2.5d part
-# 2's closing fix, observed here rather than only unit-tested), and the
-# operator log carries no forbidden-verb complaint (the class an RBAC miss
-# manifests as: a reconcile that silently never progresses).
+# Plus, while a cluster exists: a claim declaring `streams: [...]` reaches
+# Ready=True only once NACK reports those streams live — the restored
+# AwaitingStreamCreation gate, which is what stops the status lie the
+# first 2.5e run recorded (`part3[1] PASS` beside `part3[2] FAIL`) — and
+# the operator log carries no forbidden-verb complaint (the class an RBAC
+# miss manifests as: a reconcile that silently never progresses).
 #
 # UNPUBLISHED-COMPONENT SUBSTITUTION — read this before touching the
 # script
@@ -69,21 +70,26 @@
 #   REAL, exercised for true:  the provisioner's own merge-patch of
 #     spec.overrides.nats.enabled + the annotation stamp (Phase 4) — code
 #     this branch wrote, observed against the REAL PlatformStack object.
-#   SUBSTITUTED:  the StatefulSet coming into existence. Once (and only
-#     once) the walk has observed the override flip for real, it applies
-#     the `nats`/`nats-io/k8s` chart's OWN rendered manifests by hand
-#     (Phase 4b, using component_nats.cue's exact pinned values) —
-#     standing in for the Argo CD sync that would otherwise create it.
-#     Everything downstream of that point (the StatefulSet mounting the
-#     provisioner's REAL Secret, the reloader picking up its REAL
-#     content, SIGHUP, the provisioner's own verify step) is then
-#     exercised for real, against a REAL nats-server + reloader pair —
-#     this is NOT a stand-in for those questions, only for "does
-#     PlatformController correctly render a nats Application from an
-#     override against a published chart," which is generic
-#     platform-stack plumbing already exercised by every other component
-#     in prior phases of this project, not something 2.5d's own tasks
-#     touched.
+#   SUBSTITUTED:  the StatefulSet AND the nack (jetstream-controller)
+#     Deployment + its jetstream.nats.io CRDs coming into existence.
+#     Once (and only once) the walk has observed the override flip for
+#     real, it applies BOTH the `nats` and `nack` charts' OWN rendered
+#     manifests by hand (Phase 4b, using component_nats.cue's /
+#     component_nack.cue's exact pinned values — `nack` WITH
+#     `--include-crds`, since a plain `helm template` does not render a
+#     chart's `crds/` directory at all) — standing in for the Argo CD
+#     sync that would otherwise create both. Everything downstream of
+#     that point (the StatefulSet mounting the provisioner's REAL
+#     Secret, the reloader picking up its REAL content, SIGHUP, the
+#     provisioner's own verify step, AND — 2.5e — nack actually
+#     reconciling the Stream/Consumer/Account CRs the provisioner
+#     applies) is then exercised for real, against a REAL nats-server +
+#     reloader + nack triple — this is NOT a stand-in for any of THOSE
+#     questions, only for "does PlatformController correctly render a
+#     nats/nack Application from an override against a published
+#     chart," which is generic platform-stack plumbing already
+#     exercised by every other component in prior phases of this
+#     project, not something 2.5d/2.5e's own tasks touched.
 #
 # Put plainly, one more time: a green run of this script proves the
 # BUILT path (the working-tree operator/webhook + a hand-applied render
@@ -136,9 +142,27 @@ APP2="walkapp2"                      # second app, SAME namespace (Phase 5/6)
 CLAIM2="walkapp2-jetstream"
 CONN2="walkapp2-jetstream-conn"
 
-APP3="streamapp"                     # declares streams — must park (part-2 fix)
+APP3="streamapp"                     # declares a stream — part-3 acceptance #1/#2/#5/#6
 CLAIM3="streamapp-jetstream"
 
+APP4="consumerapp"                   # consume-only — part-3 acceptance #3/#4/#5
+CLAIM4="consumerapp-jetstream"
+
+APP5="streamapp2"                    # neighbour declared stream — part-3 acceptance #6/#8
+CLAIM5="streamapp2-jetstream"
+
+APP6="latecomerapp"                  # arrives AFTER streamapp2 has data — part-3 acceptance #8
+CLAIM6="latecomerapp-jetstream"
+
+# A separate, minimal namespace for the account-lifecycle checks (part-3
+# acceptance #7) — kept apart from "demo" so tearing these two down does
+# not disturb the isolation/survival/hot-reload fixtures already standing
+# there (walkapp/walkapp2/streamapp/streamapp2/consumerapp).
+ACCT_NS="jslife"
+ACCTA="accta"
+ACCTB="acctb"
+
+APP_RES="application.apprafter.io"
 CLAIM_RES="resourceclaim.apprafter.io"
 
 PROVIDER="jetstream-integrated"
@@ -156,7 +180,7 @@ NATS_BOX_POD="nats-box"
 # Tool checks (fail loudly, never silently skip)
 # ---------------------------------------------------------------
 
-for tool in cargo kubectl helm; do
+for tool in cargo kubectl helm jq; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         printf 'ERROR: required tool "%s" not found on PATH\n' "$tool" >&2
         exit 2
@@ -365,6 +389,49 @@ write_pod_file() {
 # secret_val <ns> <name> <key> — base64-decoded Secret data key.
 secret_val() {
     kubectl -n "$1" get secret "$2" -o jsonpath="{.data.$3}" 2>/dev/null | base64 -d
+}
+
+# mgr_nats_run <namespace> <nats-args...> — run the `nats` CLI as the
+# per-namespace management user (`mgr_<ns>`, `nats::mgr_secret_name`),
+# whose password lives in `nats-mgr-<ns>` in nats-system. Part-3
+# acceptance criteria #2/#3/#5/#6/#8 query stream/consumer existence THIS
+# way — the management identity, not any one claim's own user — because
+# it is the identity NACK application itself is meant to act as (ADR 0061
+# §2/§8), and it has no subject-prefix restriction of its own.
+mgr_nats_run() {
+    local ns="$1"; shift
+    local mgr_pass
+    mgr_pass=$(secret_val "$NATS_NS" "nats-mgr-${ns}" password)
+    if [ -z "$mgr_pass" ]; then
+        printf 'mgr password for namespace %s not found in nats-mgr-%s\n' "$ns" "$ns" >&2
+        return 1
+    fi
+    nats_run --server "$CONN1_SERVER" --user "mgr_${ns}" --password "$mgr_pass" "$@"
+}
+
+# force_grace_retainedclaim <claim-name> <claim-ns>
+#   Mirrors needs-pg-walk.sh's Phase 9 technique EXACTLY: RetainedClaim is
+#   immutable by admission (CEL self==oldSelf), so an in-place patch of
+#   retainUntil is rejected — delete + recreate the SAME snapshot with a
+#   retainUntil already in the past, so the grace-GC fires on its next
+#   pass instead of after seven real days. This is NOT a shortened grace
+#   period or an injected clock: it is the established, already-audited
+#   mechanism this codebase uses everywhere it needs to force a
+#   grace-gated GC inside a walk, reused verbatim rather than invented.
+#   Generic over the snapshot's own backend-specific fields (read-modify-
+#   write via jq rather than hardcoding a shape) since a jetstream claim's
+#   RetainedClaim shape is not yet decided by this branch.
+force_grace_retainedclaim() {
+    local claim_name="$1" claim_ns="$2" rc_name
+    rc_name="claim-${claim_ns}-${claim_name}"
+    printf '  waiting for RetainedClaim %s to be snapshotted ...\n' "$rc_name"
+    wait_jsonpath retainedclaim "$RETAINED_NS" "$rc_name" '{.spec.claimRef.name}' "$claim_name" 60
+    local patched
+    patched=$(kubectl -n "$RETAINED_NS" get retainedclaim "$rc_name" -o json \
+        | jq '.spec.retainUntil = "2000-01-01T00:00:00Z" | {apiVersion, kind, metadata: {name: .metadata.name, namespace: .metadata.namespace}, spec}')
+    kubectl -n "$RETAINED_NS" delete retainedclaim "$rc_name" --wait=true
+    printf '%s' "$patched" | kubectl apply -f -
+    printf '  ok: forced grace on RetainedClaim %s (past retainUntil, mirrors needs-pg-walk.sh Phase 9)\n' "$rc_name"
 }
 
 # ===============================================================
@@ -610,8 +677,59 @@ helm template nats nats/nats --version 2.14.6 -n "$NATS_NS" -f "${TMPDIR_WORK}/n
     | kubectl apply -n "$NATS_NS" -f -
 printf '  applied the (unpublished) nats component'"'"'s rendered manifests by hand\n'
 
+# nack (2.5e) — the SAME substitution, for the SAME reason
+# (component_nack.cue is equally unpublished). `--include-crds` is
+# load-bearing: a plain `helm template` does NOT render a chart's
+# `crds/` directory at all (confirmed against this exact chart —
+# component_nack.cue's own comment records it), only `helm install` /
+# Argo CD's Helm source handling does — so without this flag the
+# jetstream.nats.io CRDs never appear and every part-3 acceptance check
+# would stay red for a HARNESS reason, not a product one.
+cat >"${TMPDIR_WORK}/nack-values.yaml" <<VALUES
+jetstream:
+  nats:
+    url: "nats://nats.${NATS_NS}.svc:4222"
+  # 2.5e walk finding — mirrors component_nack.cue EXACTLY, and the one
+  # value in this file that the part-3 criteria actually depend on.
+  # Without --crd-connect, nack IGNORES spec.account on every Stream and
+  # Consumer (so the provisioner's Account CR is never consulted and
+  # every declared stream lands `Errored`) AND opens a global connection
+  # at startup that the server rejects the moment an accounts file
+  # exists. See component_nack.cue's own comment for both measurements.
+  additionalArgs:
+    - "--crd-connect"
+resources:
+  requests:
+    cpu: 25m
+    memory: 12Mi
+  limits:
+    memory: 48Mi
+VALUES
+helm template nack nats/nack --version 0.35.0 --include-crds -n "$NATS_NS" -f "${TMPDIR_WORK}/nack-values.yaml" \
+    | kubectl apply -n "$NATS_NS" -f -
+printf '  applied the (unpublished) nack component'"'"'s rendered manifests by hand (CRDs included)\n'
+
 printf '  waiting for the %s StatefulSet to report a ready replica ...\n' "$NATS_STS"
 wait_jsonpath statefulset "$NATS_NS" "$NATS_STS" '{.status.readyReplicas}' 1 300
+
+printf '  waiting for the jetstream.nats.io CRDs to be Established ...\n'
+for _crd in streams consumers accounts; do
+    retry 24 5 -- kubectl wait --for=condition=Established "crd/${_crd}.jetstream.nats.io" --timeout=30s
+done
+printf '  waiting for the nack (jetstream-controller) Deployment ...\n'
+retry 30 10 -- kubectl -n "$NATS_NS" rollout status deploy/nack --timeout=60s
+
+# nack RESTART BASELINE, not an assertion. Both charts are applied
+# together above, so nack normally starts before the nats StatefulSet is
+# listening and exits once or twice with `no servers available for
+# connection` — a benign startup race that has nothing to do with the
+# credential. Measured on a GREEN run: 3 restarts before it settled.
+# Everything the nack assertion below cares about is what happens AFTER
+# this point, so the baseline is what it compares against.
+NACK_POD_BEFORE=$(kubectl -n "$NATS_NS" get pod -l app=nack -o jsonpath='{.items[0].metadata.name}')
+NACK_RESTARTS_BEFORE=$(kubectl -n "$NATS_NS" get pod "$NACK_POD_BEFORE" \
+    -o jsonpath='{.status.containerStatuses[?(@.name=="jsc")].restartCount}')
+printf '  nack baseline: pod=%s restarts=%s\n' "$NACK_POD_BEFORE" "${NACK_RESTARTS_BEFORE:-0}"
 
 NATS_POD="${NATS_STS}-0"
 RESTARTS_BEFORE=$(kubectl -n "$NATS_NS" get pod "$NATS_POD" -o jsonpath='{.status.containerStatuses[?(@.name=="nats")].restartCount}')
@@ -622,6 +740,65 @@ wait_jsonpath "$CLAIM_RES" "$APP_NS" "$CLAIM1" '{.status.ready}' true 240
 conn1_ref=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM1" '{.status.connectionSecretRef}')
 assert_eq "status.connectionSecretRef" "$conn1_ref" "$CONN1"
 printf '  ok: claim %s Ready=True — deployment/verify pipeline (2.5d Task 6) closed the loop for real\n' "$CLAIM1"
+
+# 2.5e: nack is STILL healthy, and has not restarted, now that an
+# accounts file exists and a claim has been provisioned against it.
+#
+# This assertion is here, and hard-fails here, because of what the first
+# 2.5e walk cost: nack was green at the `rollout status` above (an
+# accounts-file-less server accepts anonymous connections), then died the
+# instant the first claim wrote the accounts file — a server WITH
+# accounts-and-users rejects unauthenticated clients, and without
+# --crd-connect nack opens an unauthenticated global connection at
+# startup. It CrashLoopBackOff'd from roughly minute 8
+# and the walk ran another ten minutes before reporting seven red part-3
+# criteria, none of which named the cause. A component that is healthy at
+# bootstrap and dies on first use is exactly what a one-shot early
+# `rollout status` cannot see, so the check has to be repeated AFTER the
+# thing that breaks it.
+#
+# A restart DELTA, not `restartCount == 0`: an absolute-zero check is
+# wrong here and was measured wrong on the very next run — both charts
+# are applied together, so nack normally exits once or twice with
+# `no servers available for connection` before the nats StatefulSet is
+# listening. That is a startup race, not a credential failure, and a
+# check that cannot tell the two apart would be red on every green run.
+# The baseline is captured at the `rollout status` above, and this
+# function ratchets it forward so a later call cannot be satisfied by
+# restarts an earlier one already accepted.
+assert_nack_healthy() {
+    local label="$1" pod phase ready restarts baseline
+    pod=$(kubectl -n "$NATS_NS" get pod -l app=nack \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+    if [ -z "$pod" ]; then
+        printf 'ERROR (%s): no nack pod in %s at all\n' "$label" "$NATS_NS" >&2
+        exit 1
+    fi
+    phase=$(kubectl -n "$NATS_NS" get pod "$pod" -o jsonpath='{.status.phase}')
+    ready=$(kubectl -n "$NATS_NS" get pod "$pod" \
+        -o jsonpath='{.status.containerStatuses[?(@.name=="jsc")].ready}')
+    restarts=$(kubectl -n "$NATS_NS" get pod "$pod" \
+        -o jsonpath='{.status.containerStatuses[?(@.name=="jsc")].restartCount}')
+    # A REPLACED pod restarts its own counter from zero, so the baseline
+    # only applies to the same pod.
+    baseline="${NACK_RESTARTS_BEFORE:-0}"
+    [ "$pod" = "$NACK_POD_BEFORE" ] || baseline=0
+    printf '  nack health (%s): pod=%s phase=%s ready=%s restarts=%s (baseline %s)\n' \
+        "$label" "$pod" "$phase" "$ready" "${restarts:-0}" "$baseline"
+    if [ "$phase" != "Running" ] || [ "$ready" != "true" ] || [ "${restarts:-0}" -gt "$baseline" ]; then
+        printf 'ERROR (%s): nack is not Running/ready, or has restarted SINCE the baseline — it was healthy at bootstrap and broke on first use.\n' \
+            "$label" >&2
+        printf 'The classic cause is the NATS server rejecting nack'"'"'s global connection once an accounts file exists — check that --crd-connect is in its args (see component_nack.cue'"'"'s own comment). nack log:\n' >&2
+        kubectl -n "$NATS_NS" logs "$pod" --tail=40 >&2 2>&1 || true
+        kubectl -n "$NATS_NS" logs "$pod" --previous --tail=40 >&2 2>&1 || true
+        exit 1
+    fi
+    # Ratchet: a LATER call must not be satisfied by restarts an EARLIER
+    # one already tolerated.
+    NACK_POD_BEFORE="$pod"
+    NACK_RESTARTS_BEFORE="${restarts:-0}"
+}
+assert_nack_healthy "after the first jetstream claim was provisioned"
 
 # ===============================================================
 # Phase 5 — coordinator step 3: connect AS THE CLAIM USER from inside
@@ -803,13 +980,38 @@ assert_contains "surviving subscriber received the POST-rewrite message (same co
 printf '  ok: ONE unbroken connection received messages from BEFORE and AFTER the accounts-file rewrite\n'
 
 # ===============================================================
-# Also worth checking (while a cluster exists):
-#   - a claim declaring streams parks at AwaitingStreamCreation
-#   - the operator log carries no forbidden-verb complaint
+# Part 3 acceptance criteria (Task 1, written before any of part 3
+# exists — ADR 0061 §8's Stream/Consumer/Account CR application over
+# NACK, and the account-lifecycle correction over ADR 0042 §9.6).
+#
+# THESE EIGHT CHECKS ARE DELIBERATELY NOT FAIL-FAST. Every other phase in
+# this file uses `set -e` semantics (the first failed assertion aborts
+# the whole walk) because each one is an already-shipped capability: a
+# regression anywhere should stop the walk cold. This section is
+# different in kind — it is the SPECIFICATION for work that does not
+# exist yet, checked incrementally as each of part 3's sub-tasks lands.
+# A fail-fast version would only ever report on whichever criterion is
+# EARLIEST unmet, hiding whether the ones after it have quietly
+# regressed once they start passing. So each check runs regardless of
+# the others' outcomes, results accumulate in PART3_FAILED, and the
+# walk's OWN exit code (set at the very end) reflects the count — red
+# today, meant to go green one sub-task at a time, never edited to match
+# whatever ships.
 # ===============================================================
 
-phase "Also: a claim declaring streams[] parks at AwaitingStreamCreation"
+phase "Part 3 fixtures: streamapp (still applied, no longer asserted here) + consumerapp + streamapp2 + jslife"
 
+# streamapp (APP3/CLAIM3) — SAME app Part 2's AwaitingStreamCreation test
+# used. Its outcome is now checked by acceptance criterion #1 below,
+# which REPLACES that assertion rather than sitting beside it.
+#
+# The gate itself was NOT deleted when part 3 landed, contrary to what
+# this comment used to say. It was rewritten: "a declared stream is never
+# deliverable" became "this claim is not ready until NACK reports its own
+# Stream/Consumer CRs live". So #1 passing means the streams really exist,
+# which is exactly what #2 then goes and checks independently — the first
+# 2.5e run had #1 green and #2 red at the same time, because the gate had
+# been deleted on the promise of a change that had not actually worked.
 kubectl apply -f - <<YAML
 apiVersion: apprafter.io/v1alpha1
 kind: Application
@@ -831,24 +1033,439 @@ spec:
         streams:
           - name: orders
             subjects: ["streamapp.orders.>"]
-            maxBytes: "1Gi"
+            # 256Mi, NOT 1Gi — and the number is arithmetic, not taste.
+            # Every claim in this namespace defaults to size `small`
+            # (268435456 B, the seeded sizeBytes above), and the account's
+            # max_file is the SUM over the namespace: 5 claims in `demo`
+            # => ~1.25Gi. Two 1Gi streams do not both fit, and the second
+            # is refused by nats-server with `insufficient storage
+            # resources available (10047)` — reproduced directly in podman.
+            # The product handles that correctly (the claim stays unready
+            # and now says so with NACK's own reason), but criteria 6 and 8
+            # need BOTH streams to exist, so the fixture must not
+            # over-subscribe the account it shares.
+            maxBytes: "256Mi"
 YAML
 
-wait_jsonpath "$CLAIM_RES" "$APP_NS" "$CLAIM3" '{.spec.type}' jetstream 180
-printf '  waiting for the claim to settle on Ready=False/AwaitingStreamCreation ...\n'
-deadline=$(( $(date +%s) + 240 ))
-reason3=""
-while [ "$(date +%s)" -lt "$deadline" ]; do
-    reason3=$(cond_reason "$CLAIM_RES" "$APP_NS" "$CLAIM3" Ready)
-    [ "$reason3" = "AwaitingStreamCreation" ] && break
-    sleep 5
+# consumerapp (APP4/CLAIM4) — consume-only (no streams/dynamicStreams of
+# its own): declares a durable on streamapp's stream. `dynamicStreams`
+# is irrelevant to a consume declaration — CONSUMER.CREATE/DURABLE.CREATE
+# are already unconditionally in every claim's own allow list
+# (nats_accounts::allow_list); what is NOT there is the STREAM to consume
+# from, which only NACK (part 3) can create for a declared, non-dynamic
+# stream. So this claim is expected to reach Ready=True today (nothing
+# gates on `consume`, only on `streams` — 2.5d part 2's own scope), while
+# the durable it names remains acceptance criterion #3/#4's business.
+kubectl apply -f - <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${APP4}
+  namespace: ${APP_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+    replicas: 1
+    expose:
+      port: 80
+    needs:
+      jetstream:
+        selector:
+          tier: integrated
+        consume:
+          - from: ${APP3}
+            stream: orders
+            durable: reader
+YAML
+
+# streamapp2 (APP5/CLAIM5) — a SECOND, independent declared-stream app in
+# the SAME namespace/account: the "neighbour" acceptance criterion #6
+# needs (delete removes only the deleted app's stream) and the
+# pre-existing data criterion #8 needs (a later arrival must not clear
+# it).
+kubectl apply -f - <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${APP5}
+  namespace: ${APP_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+    replicas: 1
+    expose:
+      port: 80
+    needs:
+      jetstream:
+        selector:
+          tier: integrated
+        streams:
+          - name: invoices
+            subjects: ["streamapp2.invoices.>"]
+            # 256Mi, NOT 1Gi — and the number is arithmetic, not taste.
+            # Every claim in this namespace defaults to size `small`
+            # (268435456 B, the seeded sizeBytes above), and the account's
+            # max_file is the SUM over the namespace: 5 claims in `demo`
+            # => ~1.25Gi. Two 1Gi streams do not both fit, and the second
+            # is refused by nats-server with `insufficient storage
+            # resources available (10047)` — reproduced directly in podman.
+            # The product handles that correctly (the claim stays unready
+            # and now says so with NACK's own reason), but criteria 6 and 8
+            # need BOTH streams to exist, so the fixture must not
+            # over-subscribe the account it shares.
+            maxBytes: "256Mi"
+YAML
+
+wait_jsonpath "$CLAIM_RES" "$APP_NS" "$CLAIM3" '{.spec.type}' jetstream 120
+wait_jsonpath "$CLAIM_RES" "$APP_NS" "$CLAIM4" '{.spec.type}' jetstream 120
+wait_jsonpath "$CLAIM_RES" "$APP_NS" "$CLAIM5" '{.spec.type}' jetstream 120
+
+# jslife — a separate, minimal namespace for the account-lifecycle checks
+# (#7), kept apart from "demo" so tearing these two claims all the way
+# down does not disturb the fixtures still standing there. Plain
+# dynamicStreams:true claims — no NACK dependency — so both are expected
+# to reach Ready=True today; #7 is about what happens to the ACCOUNT once
+# they are deleted, not about whether they can be provisioned.
+kubectl create namespace "$ACCT_NS" 2>/dev/null || true
+for _acct_app in "$ACCTA" "$ACCTB"; do
+kubectl apply -f - <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${_acct_app}
+  namespace: ${ACCT_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+    replicas: 1
+    expose:
+      port: 80
+    needs:
+      jetstream:
+        selector:
+          tier: integrated
+        dynamicStreams: true
+YAML
 done
-assert_eq "ResourceClaim ${CLAIM3} Ready condition reason" "$reason3" "AwaitingStreamCreation"
-ready3=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM3" '{.status.ready}')
-assert_eq "ResourceClaim ${CLAIM3} status.ready" "$ready3" "false"
-msg3=$(cond_message "$CLAIM_RES" "$APP_NS" "$CLAIM3" Ready)
-assert_contains "AwaitingStreamCreation message names the real reason" "$msg3" "not yet created"
-printf '  ok: a declared-streams claim parks with an actionable message: %q\n' "$msg3"
+wait_jsonpath "$CLAIM_RES" "$ACCT_NS" "${ACCTA}-jetstream" '{.status.ready}' true 180
+wait_jsonpath "$CLAIM_RES" "$ACCT_NS" "${ACCTB}-jetstream" '{.status.ready}' true 180
+
+# The declaring claims do not go Ready until NACK reports their Stream/
+# Consumer CRs live (the restored AwaitingStreamCreation gate — see
+# REASON_AWAITING_STREAM_CREATION in reconcile.rs). Wait for that
+# explicitly rather than sleeping a fixed 45s and hoping: a fixed sleep
+# that is too short reads as a product failure, and one that is too long
+# is 45s added to every green run.
+for _c in "$CLAIM3" "$CLAIM4" "$CLAIM5"; do
+    wait_jsonpath "$CLAIM_RES" "$APP_NS" "$_c" '{.status.ready}' true 240 || true
+done
+assert_nack_healthy "after the declaring claims (streams + consumers) were applied"
+
+phase "Part 3 acceptance criteria — 8 checks, run independently (see this file's own note above)"
+
+PART3_FAILED=0
+record_part3() {
+    local num="$1" desc="$2" status="$3"
+    if [ "$status" = "0" ]; then
+        printf '  part3[%s] PASS: %s\n' "$num" "$desc"
+    else
+        printf '  part3[%s] FAIL: %s\n' "$num" "$desc" >&2
+        PART3_FAILED=$((PART3_FAILED + 1))
+    fi
+}
+
+# --- #1: streamapp reaches Ready=True (replaces Part 2's "parks" assertion) ---
+part3_check_1() {
+    local ready reason
+    ready=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM3" '{.status.ready}')
+    reason=$(cond_reason "$CLAIM_RES" "$APP_NS" "$CLAIM3" Ready)
+    printf '    streamapp: status.ready=%q Ready-condition-reason=%q\n' "$ready" "$reason"
+    [ "$ready" = "true" ]
+}
+if part3_check_1; then record_part3 1 "streamapp (declared stream) reaches Ready=True" 0
+else record_part3 1 "streamapp (declared stream) reaches Ready=True" 1; fi
+
+# --- #2: the declared stream exists, with declared subjects/retention/maxBytes, queried as mgr_<ns> ---
+part3_check_2() {
+    local out
+    out=$(mgr_nats_run "$APP_NS" stream info streamapp_orders --json 2>&1) || {
+        printf '    querying stream "streamapp_orders" as mgr_demo failed: %s\n' "$out"
+        return 1
+    }
+    printf '    stream info: %s\n' "$out"
+    printf '%s' "$out" | jq -e '
+        (.config.subjects == ["streamapp.orders.>"]) and
+        (.config.retention == "limits") and
+        (.config.max_bytes == 268435456)
+    ' >/dev/null
+}
+if part3_check_2; then record_part3 2 "the declared stream exists with its declared subjects/retention/maxBytes" 0
+else record_part3 2 "the declared stream (streamapp_orders) exists with its declared subjects/retention/maxBytes, queried as mgr_demo" 1; fi
+
+# --- #3: the declared durable exists, named <consumer app>_<durable> ---
+part3_check_3() {
+    local out
+    out=$(mgr_nats_run "$APP_NS" consumer info streamapp_orders consumerapp_reader --json 2>&1) || {
+        printf '    querying consumer "consumerapp_reader" on stream "streamapp_orders" as mgr_demo failed: %s\n' "$out"
+        return 1
+    }
+    printf '    consumer info: %s\n' "$out"
+    return 0
+}
+if part3_check_3; then record_part3 3 "the declared durable exists, named consumerapp_reader" 0
+else record_part3 3 "the declared durable (consumerapp_reader on streamapp_orders) exists, named <consumer app>_<durable>" 1; fi
+
+# --- #4: a cross-application consume works end to end ---
+part3_check_4() {
+    local s_user s_pass s_inbox c_user c_pass c_inbox pub_out consumed
+    s_user=$(secret_val "$APP_NS" "${CLAIM3}-conn" user)
+    s_pass=$(secret_val "$APP_NS" "${CLAIM3}-conn" pass)
+    s_inbox=$(secret_val "$APP_NS" "${CLAIM3}-conn" inboxPrefix)
+    c_user=$(secret_val "$APP_NS" "${CLAIM4}-conn" user)
+    c_pass=$(secret_val "$APP_NS" "${CLAIM4}-conn" pass)
+    c_inbox=$(secret_val "$APP_NS" "${CLAIM4}-conn" inboxPrefix)
+    if [ -z "$s_user" ] || [ -z "$c_user" ]; then
+        printf '    connection Secret(s) for streamapp/consumerapp missing or empty\n'
+        return 1
+    fi
+    pub_out=$(nats_run --server "$CONN1_SERVER" --user "$s_user" --password "$s_pass" --inbox-prefix "$s_inbox" \
+        pub streamapp.orders.demo "part3-cross-consume-probe" 2>&1)
+    printf '    producer (streamapp) publish: %s\n' "$pub_out"
+    consumed=$(nats_run --server "$CONN1_SERVER" --user "$c_user" --password "$c_pass" --inbox-prefix "$c_inbox" \
+        consumer next streamapp_orders consumerapp_reader --count 1 --raw 2>&1) || {
+        printf '    consumer (consumerapp) pull via its declared durable failed: %s\n' "$consumed"
+        return 1
+    }
+    printf '    consumed via the declared durable: %s\n' "$consumed"
+    [ "$consumed" = "part3-cross-consume-probe" ]
+}
+if part3_check_4; then record_part3 4 "a cross-application consume works end to end (publish -> declared durable -> receive)" 0
+else record_part3 4 "a cross-application consume works end to end: streamapp publishes, consumerapp receives through its declared durable (consumerapp_reader)" 1; fi
+
+# --- #5: the producer cannot delete the consumer's durable (deny class D) ---
+part3_check_5() {
+    local s_user s_pass s_inbox del_out del_rc t0 t1 ms
+    s_user=$(secret_val "$APP_NS" "${CLAIM3}-conn" user)
+    s_pass=$(secret_val "$APP_NS" "${CLAIM3}-conn" pass)
+    s_inbox=$(secret_val "$APP_NS" "${CLAIM3}-conn" inboxPrefix)
+    if [ -z "$s_user" ]; then
+        printf '    streamapp connection Secret missing/empty\n'
+        return 1
+    fi
+    t0=$(date +%s%N)
+    del_out=$(nats_run --server "$CONN1_SERVER" --user "$s_user" --password "$s_pass" --inbox-prefix "$s_inbox" \
+        consumer rm streamapp_orders consumerapp_reader -f 2>&1)
+    del_rc=$?
+    t1=$(date +%s%N)
+    ms=$(( (t1 - t0) / 1000000 ))
+    printf '    producer (streamapp) delete attempt on the durable (%d ms, exit %d): %s\n' \
+        "$ms" "$del_rc" "${del_out:-<no output>}"
+    # Class D is a PUBLISH-permission deny on a request/reply-shaped
+    # JetStream API call — per this project's own established finding
+    # (nats_client.rs), that delivers NO error signal (a timeout, not a
+    # clean "permission denied"), the same shape Phase 6's missing-
+    # inbox-prefix negative already exercises. So the delete attempt's
+    # own exit code/stdout is not reliable evidence either way — what
+    # actually proves the deny is that the TARGET SURVIVES, queried as
+    # mgr_demo (the identity that genuinely has delete rights).
+    mgr_nats_run "$APP_NS" consumer info streamapp_orders consumerapp_reader --json >/dev/null 2>&1
+}
+if part3_check_5; then record_part3 5 "streamapp (the producer) cannot delete consumerapp's durable — it still exists afterward" 0
+else record_part3 5 "the producer cannot delete the consumer's durable (deny class D), observed by the durable surviving a delete attempt" 1; fi
+
+# --- #6: deleting an application removes its declared streams, leaves a neighbour's intact ---
+part3_check_6() {
+    if ! mgr_nats_run "$APP_NS" stream info streamapp_orders --json >/dev/null 2>&1; then
+        printf '    precondition failed: streamapp_orders does not exist yet (see check 2)\n'
+        return 1
+    fi
+    if ! mgr_nats_run "$APP_NS" stream info streamapp2_invoices --json >/dev/null 2>&1; then
+        printf '    precondition failed: streamapp2_invoices (the neighbour) does not exist yet\n'
+        return 1
+    fi
+    # Delete the application, THEN force its grace — a declared stream
+    # holds DATA and goes the same way every other backend's data goes
+    # here: at the seven-day `RetainedClaim` GC, not on delete.
+    #
+    # This check asserted the immediate form until the 2.5e walk measured
+    # what actually happens. NACK's LEGACY controller registers no
+    # finalizer, and its delete branch is gated on the CR having a
+    # deletionTimestamp — so deleting a `Stream` CR removes it from etcd
+    # before NACK ever observes the deletion, and the NATS stream is left
+    # behind. `streamapp_orders gone=0` while the CR was already gone.
+    # Deleting the CR is not a way to delete a stream.
+    #
+    # `gc_drop_nats` is, and ADR 0061 §8 is where it belongs ("GC, after
+    # the seven-day grace, as `mgr_<ns>`"). Forcing the grace is the same
+    # established technique criterion #7 below and needs-pg-walk.sh's
+    # Phase 9 use — not a shortened grace, the audited mechanism for
+    # reaching the GC inside a walk.
+    kubectl delete "$APP_RES" "$APP3" -n "$APP_NS" --wait=true --timeout=120s
+    force_grace_retainedclaim "${APP3}-jetstream" "$APP_NS" || true
+    sleep 20
+    local own_gone=0 neighbour_ok=0
+    mgr_nats_run "$APP_NS" stream info streamapp_orders --json >/dev/null 2>&1 || own_gone=1
+    mgr_nats_run "$APP_NS" stream info streamapp2_invoices --json >/dev/null 2>&1 && neighbour_ok=1
+    printf '    after streamapp'"'"'s grace GC: streamapp_orders gone=%s, streamapp2_invoices (neighbour) still present=%s\n' \
+        "$own_gone" "$neighbour_ok"
+    [ "$own_gone" = "1" ] && [ "$neighbour_ok" = "1" ]
+}
+if part3_check_6; then record_part3 6 "streamapp's grace GC removed streamapp_orders and left streamapp2_invoices intact" 0
+else record_part3 6 "a departed application's declared streams are reclaimed by its grace GC, and a neighbour's are left intact" 1; fi
+
+# --- #7: the account survives while a neighbour remains, goes when the last claim does ---
+# Seeds ONE dynamic stream per jslife app, each with subjects wholly
+# under its OWN app prefix. Both apps are `dynamicStreams: true`, so each
+# may create its own — and `gc_drop_nats`'s sweep keys on SUBJECTS, never
+# on names (ADR 0061 §8), so the names here are deliberately opaque:
+# nothing about "acctadyn" says who owns it, and the GC must work that out
+# from `accta.events.>` alone.
+#
+# This is the ONLY live exercise of the GC's stream arm — the async-nats
+# STREAM.LIST/STREAM.DELETE calls it makes as `mgr_<ns>` against a real
+# server. Checks 2-6 cover NACK-created DECLARED streams, which take a
+# completely different path (NACK deletes those when the provisioner
+# deletes their CRs).
+seed_jslife_dynamic_streams() {
+    local app claim user pass inbox out
+    for app in "$ACCTA" "$ACCTB"; do
+        claim="${app}-jetstream"
+        user=$(secret_val "$ACCT_NS" "${claim}-conn" user)
+        pass=$(secret_val "$ACCT_NS" "${claim}-conn" pass)
+        inbox=$(secret_val "$ACCT_NS" "${claim}-conn" inboxPrefix)
+        if [ -z "$user" ]; then
+            printf '    connection Secret for %s missing/empty\n' "$claim"
+            return 1
+        fi
+        write_pod_file "/tmp/${app}dyn.json" <<JSON
+{"name":"${app}dyn","subjects":["${app}.events.>"],"storage":"file","retention":"limits","max_consumers":-1,"max_msgs":-1,"max_bytes":-1,"max_age":0,"max_msgs_per_subject":-1,"max_msg_size":-1,"discard":"old","num_replicas":1,"duplicate_window":120000000000}
+JSON
+        out=$(nats_run --server "$CONN1_SERVER" --user "$user" --password "$pass" \
+            --inbox-prefix "$inbox" stream add "${app}dyn" --config "/tmp/${app}dyn.json" 2>&1) || {
+            printf '    could not create the %s dynamic stream: %s\n' "$app" "$out"
+            return 1
+        }
+    done
+    printf '    seeded dynamic streams acctadyn (accta.events.>) and acctbdyn (acctb.events.>)\n'
+}
+
+part3_check_7() {
+    local accounts_now survives=0 gone_now=0 own_swept=0 neighbour_kept=0 last_swept=0
+    accounts_now=$(secret_val "$NATS_NS" "$ACCOUNTS_SECRET" 'accounts\.conf')
+    if [[ "$accounts_now" != *"ns_${ACCT_NS}:"* ]]; then
+        printf '    precondition failed: ns_%s does not appear in nats-accounts yet\n' "$ACCT_NS"
+        return 1
+    fi
+    seed_jslife_dynamic_streams || return 1
+
+    kubectl delete "$APP_RES" "$ACCTA" -n "$ACCT_NS" --wait=true --timeout=120s
+    force_grace_retainedclaim "${ACCTA}-jetstream" "$ACCT_NS" || true
+    sleep 20
+    accounts_now=$(secret_val "$NATS_NS" "$ACCOUNTS_SECRET" 'accounts\.conf')
+    [[ "$accounts_now" == *"ns_${ACCT_NS}:"* ]] && survives=1
+    # The sweep: accta's own dynamic stream goes, the neighbour's stays.
+    mgr_nats_run "$ACCT_NS" stream info "${ACCTA}dyn" --json >/dev/null 2>&1 || own_swept=1
+    mgr_nats_run "$ACCT_NS" stream info "${ACCTB}dyn" --json >/dev/null 2>&1 && neighbour_kept=1
+    printf '    after deleting %s (neighbour %s remains): ns_%s still present=%s, %sdyn swept=%s, %sdyn kept=%s\n' \
+        "$ACCTA" "$ACCTB" "$ACCT_NS" "$survives" "$ACCTA" "$own_swept" "$ACCTB" "$neighbour_kept"
+
+    kubectl delete "$APP_RES" "$ACCTB" -n "$ACCT_NS" --wait=true --timeout=120s
+    force_grace_retainedclaim "${ACCTB}-jetstream" "$ACCT_NS" || true
+    sleep 20
+    accounts_now=$(secret_val "$NATS_NS" "$ACCOUNTS_SECRET" 'accounts\.conf')
+    [[ "$accounts_now" != *"ns_${ACCT_NS}:"* ]] && gone_now=1
+    # "The account goes with its store" (ADR 0061 §8). Once the account is
+    # out of the file nothing can query it any more — not even mgr_jslife,
+    # whose own user went with it — so the only remaining evidence that the
+    # last claim took the store too is the GC saying so. Asserted on the
+    # operator's own log line, not inferred from the account's absence.
+    # Captured into a variable, NOT `operator_log | grep -q`: this file
+    # runs under `set -o pipefail`, and `grep -q` exits on its first match
+    # — which SIGPIPEs the upstream `kubectl logs`, making the whole
+    # pipeline exit non-zero on a SUCCESSFUL match. Same shape the
+    # "no forbidden in the operator log" phase at the end of this file
+    # already uses for the same reason.
+    local gc_log
+    gc_log="$(operator_log)"
+    [[ "$gc_log" == *"nats GC: stream deleted"*"${ACCTB}dyn"* ]] && last_swept=1
+    printf '    after deleting %s too (the LAST claim in %s): ns_%s gone=%s, %sdyn swept with the account=%s\n' \
+        "$ACCTB" "$ACCT_NS" "$ACCT_NS" "$gone_now" "$ACCTB" "$last_swept"
+
+    [ "$survives" = "1" ] && [ "$gone_now" = "1" ] && \
+        [ "$own_swept" = "1" ] && [ "$neighbour_kept" = "1" ] && [ "$last_swept" = "1" ]
+}
+if part3_check_7; then record_part3 7 "the ns_jslife account survived one deletion and was removed once the last claim was, and the GC swept exactly the departing app's streams" 0
+else record_part3 7 "the account survives while a neighbour remains and goes when the last claim does, and the GC sweeps the departing application's dynamic streams by SUBJECT while leaving the neighbour's" 1; fi
+
+# --- #8: a second application arriving does NOT clear the first's streams ---
+part3_check_8() {
+    if ! mgr_nats_run "$APP_NS" stream info streamapp2_invoices --json >/dev/null 2>&1; then
+        printf '    precondition failed: streamapp2_invoices does not exist yet (see check 2/6)\n'
+        return 1
+    fi
+    local s2_user s2_pass s2_inbox pub_out info msgs
+    s2_user=$(secret_val "$APP_NS" "${CLAIM5}-conn" user)
+    s2_pass=$(secret_val "$APP_NS" "${CLAIM5}-conn" pass)
+    s2_inbox=$(secret_val "$APP_NS" "${CLAIM5}-conn" inboxPrefix)
+    if [ -z "$s2_user" ]; then
+        printf '    streamapp2 connection Secret missing/empty\n'
+        return 1
+    fi
+    pub_out=$(nats_run --server "$CONN1_SERVER" --user "$s2_user" --password "$s2_pass" --inbox-prefix "$s2_inbox" \
+        pub streamapp2.invoices.probe "part3-clear-on-allocation-probe" 2>&1)
+    printf '    seeded streamapp2_invoices with a probe message: %s\n' "$pub_out"
+
+    kubectl apply -f - <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${APP6}
+  namespace: ${APP_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+    replicas: 1
+    expose:
+      port: 80
+    needs:
+      jetstream:
+        selector:
+          tier: integrated
+        dynamicStreams: true
+YAML
+    wait_jsonpath "$CLAIM_RES" "$APP_NS" "$CLAIM6" '{.status.ready}' true 120 || true
+
+    info=$(mgr_nats_run "$APP_NS" stream info streamapp2_invoices --json 2>&1) || {
+        printf '    streamapp2_invoices vanished after the new arrival: %s\n' "$info"
+        return 1
+    }
+    msgs=$(printf '%s' "$info" | jq -r '.state.messages')
+    printf '    streamapp2_invoices message count after the new arrival (%s): %s\n' "$APP6" "$msgs"
+    [ "${msgs:-0}" -ge 1 ]
+}
+if part3_check_8; then record_part3 8 "latecomerapp's arrival left streamapp2_invoices's existing message(s) intact" 0
+else record_part3 8 "a second application arriving does NOT clear the first's streams (ADR 0042 §9.6's clear-on-allocation does NOT transfer verbatim — ADR 0061 §8's own correction)" 1; fi
+
+phase "Part 3 acceptance criteria summary"
+if [ "$PART3_FAILED" -gt 0 ]; then
+    printf '  %d of 8 part-3 acceptance criteria are RED. Part 3 (NACK CR application) HAS landed, so each one is a real defect — not an expected gap.\n' "$PART3_FAILED"
+else
+    printf '  ok: all 8 part-3 acceptance criteria are GREEN.\n'
+fi
+
+# ===============================================================
+# Also worth checking (while a cluster exists): the operator log
+# carries no forbidden-verb complaint. Runs LAST so it covers every log
+# line the whole walk (part-3 fixtures included) produced.
+# ===============================================================
 
 phase "Also: no forbidden-verb complaint in the operator log"
 
@@ -863,6 +1480,13 @@ printf '  ok: no "forbidden" anywhere in the operator log across the whole walk\
 # ===============================================================
 # Done
 # ===============================================================
+
+if [ "$PART3_FAILED" -gt 0 ]; then
+    phase "needs-jetstream-walk: part 2 GREEN, part-3 acceptance RED (${PART3_FAILED}/8) (elapsed $(elapsed))"
+    printf 'FINAL: PART-3-ACCEPTANCE-RED (%d/8) — every part-2 capability above stayed green; see the summary above for which of part 3'"'"'s eight criteria are unmet and why.\n' \
+        "$PART3_FAILED"
+    exit 1
+fi
 
 phase "needs-jetstream-walk: ALL PHASES GREEN (elapsed $(elapsed))"
 printf 'FINAL: PASS\n'

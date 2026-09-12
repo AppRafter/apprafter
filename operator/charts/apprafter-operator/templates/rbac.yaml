@@ -327,6 +327,34 @@ rules:
       - update
       - patch
       - delete
+  # 2.5e (ADR 0061 §8): the resourceclaim-provisioner SSA-applies the
+  # `Account` CR (one per namespace-account) and, per jetstream claim,
+  # one `Stream` per declared stream and one `Consumer` per declared
+  # `consume` entry — all in `nats-system`, all externally-installed by
+  # the `nack` component (`component_nack.cue`). `delete` is used
+  # explicitly (never via ownerReference cascade — Stream/Consumer live
+  # in a DIFFERENT namespace than the declaring ResourceClaim, and
+  # Kubernetes forbids a cross-namespace owner) when a claim's own
+  # Application is deleted (`delete_nats_declared_objects`). Without
+  # these verbs the very first declared-stream claim 403s the instant
+  # it tries to apply its Stream CR, and the claim sits AwaitingReady
+  # forever with nothing in its own status pointing at why — exactly
+  # the class of miss only a live cluster catches, per this file's own
+  # standing rule.
+  - apiGroups:
+      - jetstream.nats.io
+    resources:
+      - accounts
+      - streams
+      - consumers
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
   # Phase 2.6b disk arm (ADR 0043): the provisioner SSA-applies a
   # standalone ReadWriteOnce PersistentVolumeClaim (group "", core/v1)
   # per `type: disk` claim into the app namespace, and the RetainedClaim

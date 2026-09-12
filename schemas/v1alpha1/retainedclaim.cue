@@ -63,6 +63,27 @@ package v1alpha1
 		volumeClaimRef?:       string
 		volumeClaimNamespace?: string
 
+		// --- NATS/jetstream-backend allocation (optional; absent for every
+		// other backend; 2.5e, ADR 0061 §8) ---
+		// Where nats-system is (the accounts Secret, the mgr_<ns>
+		// credential and the NACK CRs all live there), the DECLARING
+		// application's name, and the stream/durable names it declared.
+		//
+		// The application name is stored rather than derived: the GC needs
+		// it for the `<app>.` subject prefix the dynamic-stream sweep keys
+		// on, and re-deriving it from claimRef.name by stripping a
+		// "-jetstream" suffix would be a second, silently-drifting copy of
+		// the application controller's own claim_name() join.
+		//
+		// The declared names are stored because the GC deletes the NACK
+		// Stream/Consumer CRs for them (object names <ns>-<app>-<declared>)
+		// and EXCLUDES them from the subject-prefix sweep — a declared
+		// stream is not a dynamic one, whatever its subjects look like.
+		natsNamespace?: string
+		natsApp?:       string
+		natsDeclaredStreams?: [...string]
+		natsDeclaredConsumers?: [...string]
+
 		// RFC3339 instant after which the GC drops the backend resources +
 		// password/connection Secret (deletion + 7-day grace).
 		retainUntil: string

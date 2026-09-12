@@ -169,6 +169,36 @@ without `users`. ADR 0042 §10's finding was that the dangerous failure of a
 credential file is not lockout but *silently disabling authentication*; these
 are the equivalents.
 
+**NACK must run with `--crd-connect`** (added after 2.5e's live walks). That
+flag is what makes the `Account` CR above mean anything, and without it the
+design fails in two ways at once. First, `spec.account` on a `Stream`/`Consumer`
+is **ignored**: `getAccountOverrides` returns empty overrides unless
+`CRDConnect` is set, and every object is then reconciled over NACK's global
+connection — so the per-namespace `mgr_<ns>` credential is never consulted and
+declared streams land `Errored`. Second, without it NACK opens that global
+connection at process start, *unauthenticated*. A server with no
+`accounts { }` block accepts such a connection, so NACK comes up happily at
+bootstrap and is locked out **permanently** the instant the first claim makes
+the provisioner write the accounts file — `failed to connect to nats: nats:
+Authorization Violation`, CrashLoopBackOff, no `Stream` ever created. With the
+flag, NACK opens no global connection at all; connections are built lazily, per
+object, from the `Account` CR.
+
+Both were measured against nats-server 2.14.3 and
+`natsio/jetstream-controller:0.24.0` and read in the nack source at v0.24.0.
+The failure is invisible until the feature is *used*, which is why the walk
+now asserts NACK's health again after the first claim is provisioned rather
+than only at rollout.
+
+Two repairs were measured and **rejected** on the way, both recorded here
+because each looks reasonable in isolation. Giving NACK its own credential — an
+`nkey` user in a denied `APPRAFTER_NACK` account, seed in a provisioner-owned
+Secret — works, and is unnecessary: it authenticates a connection that should
+not exist. Pointing `no_auth_user` at the same denied account also works, and is
+ruled out by the paragraph above: re-enabling anonymous access cluster-wide to
+fix a controller's login is exactly the silently-disabled authentication this
+design refuses.
+
 ### 3. Isolation — a prefix, a deny vector, and one flag
 
 Each application owns the subject prefix `<app>.` unconditionally. The claim

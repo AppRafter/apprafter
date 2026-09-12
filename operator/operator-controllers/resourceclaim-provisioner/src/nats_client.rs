@@ -43,6 +43,30 @@ pub enum NatsAdminError {
         #[source]
         source: async_nats::RequestError,
     },
+    /// A JetStream management call ([`NatsAdmin::list_streams`] /
+    /// [`NatsAdmin::delete_stream`]) failed. `message` is the upstream
+    /// error already rendered to a string rather than a typed `#[source]`:
+    /// the two calls return DIFFERENT async-nats error types and neither
+    /// is worth a variant of its own, and rendering at the construction
+    /// site keeps this type's own no-credential guarantee structural (see
+    /// the module doc) — there is no field a password could reach.
+    #[error("nats {op} on {url} as {user} failed: {message}")]
+    Jetstream {
+        url: String,
+        user: String,
+        op: &'static str,
+        message: String,
+    },
+}
+
+/// One JetStream stream as the management identity sees it (2.5e GC).
+/// Name + subjects only: the GC's sweep rule keys on SUBJECTS, never on
+/// names (ADR 0061 §8 — dynamic stream names are unconstrained), so
+/// nothing else about a stream is any of the GC's business.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamSummary {
+    pub name: String,
+    pub subjects: Vec<String>,
 }
 
 /// The subject every claim user's allow list grants UNCONDITIONALLY
@@ -118,6 +142,38 @@ pub trait NatsAdmin: Send + Sync {
         pass: &str,
         inbox_prefix: &str,
     ) -> Result<(), NatsAdminError>;
+
+    /// Every stream in `user`'s account, with its subjects (2.5e GC, ADR
+    /// 0061 §8). Called as `mgr_<ns>` — the one identity whose
+    /// `publish.allow` is `[">"]`, so it can both enumerate and delete.
+    ///
+    /// No `inbox_prefix` parameter, unlike [`verify_user`]: `mgr_<ns>`
+    /// keeps the SHARED `_INBOX.>` subscribe grant precisely so it can
+    /// make ordinary request/reply calls with the client default
+    /// (`nats_accounts::render_account` — "it sets no custom inbox prefix
+    /// of its own, so denying it `_INBOX.>` would stop it making a single
+    /// request"). Passing one here would be ceremony, and a WRONG one
+    /// would silently break every call.
+    ///
+    /// [`verify_user`]: NatsAdmin::verify_user
+    async fn list_streams(
+        &self,
+        url: &str,
+        user: &str,
+        pass: &str,
+    ) -> Result<Vec<StreamSummary>, NatsAdminError>;
+
+    /// Delete one stream (and, with it, its consumers) from `user`'s
+    /// account. Deleting a stream that is already gone is NOT an error —
+    /// the GC is re-entrant after a crash, and a second pass must not
+    /// wedge on work the first pass finished.
+    async fn delete_stream(
+        &self,
+        url: &str,
+        user: &str,
+        pass: &str,
+        stream: &str,
+    ) -> Result<(), NatsAdminError>;
 }
 
 /// Whether `user` can authenticate and complete a permission-scoped
@@ -183,6 +239,94 @@ impl NatsAdmin for NatsClient {
                 source,
             })
     }
+
+    async fn list_streams(
+        &self,
+        url: &str,
+        user: &str,
+        pass: &str,
+    ) -> Result<Vec<StreamSummary>, NatsAdminError> {
+        use futures::TryStreamExt as _;
+
+        let client = connect_as(url, user, pass).await?;
+        let js = async_nats::jetstream::new(client);
+        let mut infos = js.streams();
+        let mut out = Vec::new();
+        while let Some(info) = infos
+            .try_next()
+            .await
+            .map_err(|e| NatsAdminError::Jetstream {
+                url: url.to_string(),
+                user: user.to_string(),
+                op: "STREAM.LIST",
+                message: e.to_string(),
+            })?
+        {
+            out.push(StreamSummary {
+                name: info.config.name,
+                subjects: info.config.subjects,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn delete_stream(
+        &self,
+        url: &str,
+        user: &str,
+        pass: &str,
+        stream: &str,
+    ) -> Result<(), NatsAdminError> {
+        let client = connect_as(url, user, pass).await?;
+        let js = async_nats::jetstream::new(client);
+        match js.delete_stream(stream).await {
+            Ok(_) => Ok(()),
+            // Already gone — the GC is re-entrant after a crash, so this
+            // is success, not an error. Matched on the SERVER's own error
+            // code (`10059 stream not found`), not on a message substring:
+            // `DeleteStreamErrorKind` is a type alias for
+            // `GetStreamErrorKind` and has no NotFound variant of its own,
+            // so the only durable discriminator is the JetStream API code.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    async_nats::jetstream::context::DeleteStreamErrorKind::JetStream(je)
+                        if je.error_code()
+                            == async_nats::jetstream::ErrorCode::STREAM_NOT_FOUND
+                ) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(NatsAdminError::Jetstream {
+                url: url.to_string(),
+                user: user.to_string(),
+                op: "STREAM.DELETE",
+                message: e.to_string(),
+            }),
+        }
+    }
+}
+
+/// Shared connect for the management calls. Uses `.user_and_password(...)`
+/// (never a `user:pass@host` URL) for the same reason
+/// [`NatsClient::verify_user`] does, and sets the SAME deliberate request
+/// timeout — a permissions violation on a JetStream API call delivers no
+/// error signal either, it just never gets a reply.
+async fn connect_as(
+    url: &str,
+    user: &str,
+    pass: &str,
+) -> Result<async_nats::Client, NatsAdminError> {
+    async_nats::ConnectOptions::new()
+        .user_and_password(user.to_string(), pass.to_string())
+        .request_timeout(Some(VERIFY_REQUEST_TIMEOUT))
+        .connect(url)
+        .await
+        .map_err(|source| NatsAdminError::Connect {
+            url: url.to_string(),
+            user: user.to_string(),
+            source,
+        })
 }
 
 /// Test double for [`NatsAdmin`]. Mirrors `redis_client::FakeRedis`.
@@ -197,6 +341,12 @@ pub struct FakeNats {
     /// `Option`-typed "answer" would (there is nothing to answer with;
     /// `verify_user` only ever returns `()` on success).
     pub fails: std::sync::Mutex<bool>,
+    /// What [`NatsAdmin::list_streams`] answers with (2.5e GC).
+    pub streams: std::sync::Mutex<Vec<StreamSummary>>,
+    /// Every stream name [`NatsAdmin::delete_stream`] was asked to drop,
+    /// in call order — the GC's sweep is judged by WHAT it deleted, so
+    /// this is the assertion surface, not a log.
+    pub deleted_streams: std::sync::Mutex<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -222,6 +372,45 @@ impl NatsAdmin for FakeNats {
                 source: async_nats::ConnectError::new(async_nats::ConnectErrorKind::TimedOut),
             });
         }
+        Ok(())
+    }
+
+    async fn list_streams(
+        &self,
+        url: &str,
+        user: &str,
+        _pass: &str,
+    ) -> Result<Vec<StreamSummary>, NatsAdminError> {
+        if *self.fails.lock().unwrap() {
+            return Err(NatsAdminError::Jetstream {
+                url: url.to_string(),
+                user: user.to_string(),
+                op: "STREAM.LIST",
+                message: "fake failure".to_string(),
+            });
+        }
+        Ok(self.streams.lock().unwrap().clone())
+    }
+
+    async fn delete_stream(
+        &self,
+        url: &str,
+        user: &str,
+        _pass: &str,
+        stream: &str,
+    ) -> Result<(), NatsAdminError> {
+        if *self.fails.lock().unwrap() {
+            return Err(NatsAdminError::Jetstream {
+                url: url.to_string(),
+                user: user.to_string(),
+                op: "STREAM.DELETE",
+                message: "fake failure".to_string(),
+            });
+        }
+        self.deleted_streams
+            .lock()
+            .unwrap()
+            .push(stream.to_string());
         Ok(())
     }
 }

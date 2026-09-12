@@ -101,7 +101,7 @@ const PLATFORMSTACK_NAME: &str = "default";
 /// location FROM the provider config with a documented fallback rather
 /// than a bare hardcode, and there is no reason for jetstream to be the
 /// one exception.
-const DEFAULT_NATS_SYSTEM_NAMESPACE: &str = "nats-system";
+pub(crate) const DEFAULT_NATS_SYSTEM_NAMESPACE: &str = "nats-system";
 
 /// The `nats` Helm chart's StatefulSet resource name — confirmed by
 /// rendering the exact pinned chart (`helm template nats nats/nats
@@ -110,12 +110,12 @@ const DEFAULT_NATS_SYSTEM_NAMESPACE: &str = "nats-system";
 /// which is `nats` (matches `_components.nats.name` in
 /// `component_nats.cue`, and every other component in this codebase's
 /// Argo CD wiring uses the component name as the release name).
-const NATS_STATEFULSET_NAME: &str = "nats";
+pub(crate) const NATS_STATEFULSET_NAME: &str = "nats";
 
 /// Client-facing (non-headless) NATS Service port — the `nats` chart's
 /// `service.yaml` `port: 4222`, confirmed the same way as
 /// [`NATS_STATEFULSET_NAME`].
-const NATS_CLIENT_PORT: u16 = 4222;
+pub(crate) const NATS_CLIENT_PORT: u16 = 4222;
 
 /// The accounts fragment Secret's name AND its one key — both fixed by
 /// `component_nats.cue`'s own `podTemplate.patch` (`secretName:
@@ -140,13 +140,47 @@ const NATS_AUTO_ENABLED_ANNOTATION: &str = "apprafter.io/nats-auto-enabled";
 
 const REASON_AWAITING_NATS_COMPONENT: &str = "AwaitingNatsComponent";
 const REASON_AWAITING_NATS_READY: &str = "AwaitingNatsUserReady";
-/// New reason (2.5d part 2 closure) — no existing member of this file's
-/// `Ready=False` vocabulary covers "the platform cannot yet build what you
-/// declared" (the closest, `REASON_AWAITING_SHARED_VOLUME`, is a
-/// DIFFERENT wait: for a referenced object to exist, not for a whole
-/// feature's implementation to land). The condition TYPE itself is not
-/// new — every backend in this file publishes `Ready=False`/`True` under
-/// [`COND_READY`]; only this REASON string is.
+/// 2.5e Task 3: the jetstream.nats.io CRDs (the `nack` component) have
+/// not synced yet — applying a Stream/Consumer CR before they are
+/// Established returns `NoKindMatch`. Transient, the same shape as
+/// [`REASON_AWAITING_NATS_COMPONENT`]: nack's own sync-wave (-5, same as
+/// the server) means this should resolve within the same bootstrap
+/// window, not linger.
+///
+/// 2.5d part 2 shipped `REASON_AWAITING_STREAM_CREATION` here — "the
+/// platform cannot yet build what you declared" — as a placeholder for
+/// exactly this gap. That reason is NOT retired (see it below); this one
+/// is narrower and separate.
+const REASON_AWAITING_NACK_CRDS: &str = "AwaitingNackCrds";
+
+/// A claim DECLARED streams/consumers, the provisioner has applied their
+/// NACK CRs, and NACK has not reported them `Ready` yet (2.5d part-2
+/// closure, restored in 2.5e).
+///
+/// **This guard was deleted once and had to come back, so its reason is
+/// recorded here rather than in a commit message.** Commit `5ad748f`
+/// added it because deploying an application whose declared streams do
+/// not exist is worse than not deploying it at all: with
+/// `dynamicStreams: false` the application cannot self-heal, and it fails
+/// at runtime with JetStream errors that name nothing about the real
+/// cause. The 2.5e plan then instructed deleting the guard, on the
+/// premise that 2.5e makes streams real. 2.5e's first walk did not — NACK
+/// was locked out of NATS entirely, for want of `--crd-connect` (see
+/// `component_nack.cue`) — and the guard had already been deleted, so
+/// the walk recorded
+/// `part3[1] PASS` (the claim reached `Ready=True`) beside
+/// `part3[2] FAIL` (its stream did not exist). That is precisely the
+/// status lie the guard exists to prevent, reintroduced by the change
+/// that intended to make it unnecessary.
+///
+/// What came back is NOT the 2.5d placeholder. That one was
+/// `streams.is_empty()` — "a declared stream is never deliverable" —
+/// which was honest while nothing created streams and would now wedge
+/// every declaring claim at `Ready=False` forever. The restored guard
+/// asks the real question instead: has NACK reported every one of THIS
+/// claim's applied `Stream`/`Consumer` objects `Ready=True`? It therefore
+/// never needs deleting again — it goes green on its own the moment the
+/// streams genuinely exist, and red on its own the moment they stop.
 const REASON_AWAITING_STREAM_CREATION: &str = "AwaitingStreamCreation";
 
 /// Fallback platform-wide `max_file` budget for
@@ -249,6 +283,15 @@ pub async fn reconcile(
             // finalizer. The snapshot is the GC's only handle on the
             // retained role/DB/Secret, so it MUST exist before the
             // finalizer (and thus the only delete observation) is gone.
+            // 2.5e Task 3: a jetstream claim's own declared Stream/
+            // Consumer CRs have no ownerReference (cross-namespace,
+            // Kubernetes forbids one) — delete them explicitly, before
+            // the snapshot+finalizer-drop below, same crash-safety
+            // reasoning ("must exist/complete before the only delete
+            // observation is gone").
+            if claim.spec.type_ == "jetstream" {
+                delete_nats_declared_objects(&ctx, &claim, &ns).await?;
+            }
             snapshot_retained_claim(&ctx, &claim, &ns, &name).await?;
             info!(
                 %name, %ns,
@@ -1167,6 +1210,12 @@ enum NatsBootstrapStep {
     EnableComponent,
     AwaitStatefulSetReady,
     VerifyUserReady,
+    /// 2.5e: the claim's DECLARED `Stream`/`Consumer` CRs are applied but
+    /// NACK has not reported them `Ready` yet. LAST before `Done`, and
+    /// that position is the whole point — see
+    /// [`REASON_AWAITING_STREAM_CREATION`] for why this step was deleted
+    /// once and had to be restored.
+    AwaitDeclaredObjectsReady,
     Done,
 }
 
@@ -1175,6 +1224,7 @@ fn next_nats_bootstrap_step(
     component_enabled: bool,
     statefulset_ready: bool,
     user_verified: bool,
+    declared_objects_ready: bool,
 ) -> NatsBootstrapStep {
     if !accounts_secret_written {
         NatsBootstrapStep::WriteAccountsSecret
@@ -1184,9 +1234,94 @@ fn next_nats_bootstrap_step(
         NatsBootstrapStep::AwaitStatefulSetReady
     } else if !user_verified {
         NatsBootstrapStep::VerifyUserReady
+    } else if !declared_objects_ready {
+        NatsBootstrapStep::AwaitDeclaredObjectsReady
     } else {
         NatsBootstrapStep::Done
     }
+}
+
+/// Whether ONE applied NACK object (`Stream` or `Consumer`) is reported
+/// live by the nack controller: `status.conditions[type=Ready].status ==
+/// "True"`.
+///
+/// Reads the CONDITION, never `observedGeneration` alone or mere
+/// existence of the object. The CR existing proves only that the
+/// provisioner's own apply succeeded — the whole failure this gate exists
+/// for (2.5e's first walk) is a `Stream` CR sitting happily in etcd while
+/// no stream exists in NATS, because the controller that would create it
+/// cannot connect. `Ready` is the only field that distinguishes those.
+///
+/// Absent status → `false`: a freshly applied object has no conditions
+/// yet, and "not observed yet" is exactly "not ready".
+fn nack_object_ready(obj: &DynamicObject) -> bool {
+    obj.data
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .is_some_and(|conds| {
+            conds.iter().any(|c| {
+                c.pointer("/type").and_then(Value::as_str) == Some("Ready")
+                    && c.pointer("/status").and_then(Value::as_str) == Some("True")
+            })
+        })
+}
+
+/// NACK's OWN explanation for a not-yet-ready object, lifted off its
+/// `Ready` condition as `reason: message`. `None` while NACK has not
+/// observed the object at all (no conditions yet — the ordinary first
+/// pass, which needs no explanation beyond "just applied").
+///
+/// **Carried into the claim's own status, not merely logged.** Without
+/// it the gate says "applied but not yet created" and stops, leaving the
+/// actual cause one `kubectl -n nats-system describe stream …` away in a
+/// namespace an application's owner has no reason to look in and may not
+/// be able to read. The 2.5e walk hit exactly this: a declared stream
+/// that NACK refused with `insufficient storage resources available
+/// (10047)` — the namespace account's `max_file` could not fit it —
+/// presented identically to a stream that was simply still being
+/// created.
+fn nack_object_detail(obj: &DynamicObject) -> Option<String> {
+    let conds = obj
+        .data
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)?;
+    let cond = conds
+        .iter()
+        .find(|c| c.pointer("/type").and_then(Value::as_str) == Some("Ready"))?;
+    let reason = cond
+        .pointer("/reason")
+        .and_then(Value::as_str)
+        .unwrap_or("NotReady");
+    match cond.pointer("/message").and_then(Value::as_str) {
+        Some(m) if !m.is_empty() => Some(format!("{reason}: {m}")),
+        _ => Some(reason.to_string()),
+    }
+}
+
+/// One outstanding object as it appears in the claim's status message:
+/// `Kind/name` on its own while NACK has said nothing yet, and
+/// `Kind/name (reason: message)` once it has. Split out so the two call
+/// sites (Stream and Consumer) cannot drift into two formats.
+fn pending_label(kind: &str, name: &str, detail: Option<String>) -> String {
+    match detail {
+        Some(d) => format!("{kind}/{name} ({d})"),
+        None => format!("{kind}/{name}"),
+    }
+}
+
+/// The actionable `Ready=False` message for the
+/// [`REASON_AWAITING_STREAM_CREATION`] gate — names the objects actually
+/// outstanding rather than a bare "not ready" a reader could mistake for
+/// a transient stall like [`REASON_AWAITING_NATS_READY`]'s.
+fn stream_creation_pending_message(pending: &[String]) -> String {
+    format!(
+        "{} declared jetstream object(s) are applied but not yet created in NATS by the nack \
+         controller ({}) — the application is held unready deliberately: with \
+         dynamicStreams disabled it cannot create them itself and would fail at runtime with \
+         JetStream errors naming nothing about the cause",
+        pending.len(),
+        pending.join(", ")
+    )
 }
 
 /// The bidirectional `PlatformStack.spec.overrides.nats` decision (2.5d
@@ -1234,51 +1369,6 @@ fn nats_override_patch(
 /// does its own GET and errors on a missing SECRET; every call site here
 /// has already fetched the secret as part of a read-or-create /
 /// byte-stable-compare decision and needs to decode what it already has.
-/// Whether a jetstream claim's DECLARED streams are things the platform can
-/// actually deliver today (2.5d part B closure — coordinator finding, NOT
-/// in the original Task 6/9/10/11 brief). A claim's own allow list never
-/// grants `STREAM.CREATE` on any of its own declared, composed stream
-/// names — `nats_accounts::deny_vector` class (B) denies it
-/// UNCONDITIONALLY, `dynamicStreams` or not (it protects an app's
-/// migration-gated declared streams from itself, not just from
-/// neighbours) — so a declared stream can only ever be materialised by a
-/// NACK `Stream` CR the provisioner applies. Nothing under `operator/`
-/// applies one yet (part 3, ADR 0061 §8's fourth sub-step — it needs the
-/// `Account` CR and credential plumbing this task set does not touch).
-///
-/// Marking such a claim `Ready=True` today would be a status lie: a
-/// connection, a subject prefix, and a contract that is not there — worse
-/// than not deploying the application at all, since (with
-/// `dynamicStreams: false`) it cannot self-heal and will fail at runtime
-/// with JetStream errors naming nothing about the real cause.
-///
-/// Takes `&[StreamView]` — the DECLARED list — rather than the whole
-/// `ClaimView`, deliberately: there is no `dynamic_streams` flag for it to
-/// even consult. A bare `needs: {jetstream: {}}` (`streams` empty) and a
-/// `dynamicStreams: true` claim with NOTHING declared both pass unaffected
-/// — this only gates a claim that declared something the platform cannot
-/// yet build, never a claim that only ever creates streams itself.
-///
-/// Self-resolving: once part 3 lands NACK CR application, this guard (and
-/// the call site that checks it) is DELETED, not weakened — the whole
-/// point is that it stops mattering, not that it grows an escape hatch.
-fn nats_declared_streams_deliverable(streams: &[nats_accounts::StreamView]) -> bool {
-    streams.is_empty()
-}
-
-/// The actionable `Ready=False` message for
-/// [`nats_declared_streams_deliverable`]'s guard — names the REAL reason
-/// (the platform has not built what was declared yet, and will) rather
-/// than a bare "not ready" a reader could mistake for a transient stall
-/// like [`REASON_AWAITING_NATS_READY`]'s.
-fn stream_creation_pending_message(declared_stream_count: usize) -> String {
-    format!(
-        "{declared_stream_count} declared jetstream stream(s) are not yet created by the \
-         platform — NACK Stream/Consumer CR application is not implemented yet (ADR 0061 §8); \
-         this claim will go ready automatically once it lands"
-    )
-}
-
 fn decoded_secret_key(secret: &DynamicObject, key: &str) -> Result<Option<String>, ReconcileError> {
     let Some(raw) = secret
         .data
@@ -1400,7 +1490,7 @@ fn accounts_file_unchanged(existing: Option<&str>, rendered: &str) -> bool {
     existing == Some(rendered)
 }
 
-async fn reconcile_accounts_secret(
+pub(crate) async fn reconcile_accounts_secret(
     ctx: &Arc<Context>,
     nats_ns: &str,
     ceiling_bytes: u64,
@@ -1461,16 +1551,71 @@ async fn reconcile_accounts_secret(
         let mgr_api: Api<DynamicObject> =
             Api::namespaced_with(ctx.client.clone(), nats_ns, &secret_ar());
         let pass = match mgr_api.get_opt(&secret_name).await? {
-            Some(existing) => decoded_secret_key(&existing, "password")?.unwrap_or_default(),
+            Some(existing) => {
+                let pass = decoded_secret_key(&existing, "password")?.unwrap_or_default();
+                // Self-heal a pre-2.5e Secret. Part 2 wrote this object
+                // with a `password` key ONLY; 2.5e's `Account` CR points
+                // `spec.user.user` at a `user` KEY inside it, so a Secret
+                // written by the older code leaves NACK pointing at a key
+                // that does not exist — and NACK's failure to authenticate
+                // is silent from Kubernetes' side: the Stream CR applies
+                // fine and simply never goes Ready. Re-apply rather than
+                // regenerate: the PASSWORD is carried forward unchanged
+                // (rotating it would invalidate the accounts file the
+                // running server is still serving), only the missing key
+                // is added.
+                if decoded_secret_key(&existing, "user")?.is_none() && !pass.is_empty() {
+                    let obj = nats::mgr_secret_object(&secret_name, nats_ns, &mgr_user, &pass);
+                    mgr_api
+                        .patch(&secret_name, &apply_params(), &Patch::Apply(&obj))
+                        .await?;
+                    info!(
+                        secret = %secret_name, %nats_ns,
+                        "added the missing `user` key to a pre-2.5e nats mgr Secret"
+                    );
+                }
+                pass
+            }
             None => {
                 let fresh = generate_password();
-                let obj = nats::mgr_secret_object(&secret_name, nats_ns, &fresh);
+                let obj = nats::mgr_secret_object(&secret_name, nats_ns, &mgr_user, &fresh);
                 mgr_api
                     .patch(&secret_name, &apply_params(), &Patch::Apply(&obj))
                     .await?;
                 fresh
             }
         };
+
+        // 2.5e Task 2: ensure this namespace's Account CR — the
+        // connection configuration NACK reads to authenticate as
+        // mgr_<ns> when it creates/updates Stream/Consumer objects in
+        // this account (ADR 0061 §1/§8). Idempotent SSA-apply, safe
+        // every pass: fully deterministic given (namespace,
+        // mgr_secret_name), no drift risk from re-applying.
+        //
+        // Soft-gated on the jetstream.nats.io CRDs being Established:
+        // SKIP rather than fail this whole function on a cluster where
+        // NACK has not synced yet — the accounts-file write below must
+        // always complete regardless, and this namespace's Account CR
+        // is retried the next time any claim's reconcile calls this
+        // function (there is no separate resync loop for it, the same
+        // scope note this function's own doc already carries for claim
+        // deletion).
+        if jetstream_crds_established(&ctx.client).await? {
+            let account_api: Api<DynamicObject> =
+                Api::namespaced_with(ctx.client.clone(), nats_ns, &jetstream_account_ar());
+            let server_url =
+                format!("nats://{NATS_STATEFULSET_NAME}.{nats_ns}.svc:{NATS_CLIENT_PORT}");
+            let account_obj = nats::account_object(namespace, nats_ns, &server_url, &secret_name);
+            account_api
+                .patch(
+                    &nats::account_k8s_name(namespace),
+                    &apply_params(),
+                    &Patch::Apply(&account_obj),
+                )
+                .await?;
+        }
+
         passwords.insert(mgr_user, pass);
     }
 
@@ -1657,6 +1802,7 @@ async fn provision_nats(
         component_enabled,
         statefulset_ready,
         false,
+        false,
     ) == NatsBootstrapStep::AwaitStatefulSetReady
     {
         let cond = ready_condition(
@@ -1690,6 +1836,7 @@ async fn provision_nats(
         component_enabled,
         statefulset_ready,
         user_verified,
+        false,
     ) == NatsBootstrapStep::VerifyUserReady
     {
         let cond = ready_condition(
@@ -1705,22 +1852,124 @@ async fn provision_nats(
         return Ok(Action::requeue(Duration::from_secs(30)));
     }
 
-    // Part-2 closure gate: a claim that DECLARED streams cannot reach
-    // ready until something applies the NACK CRs those streams need to
-    // exist — see `nats_declared_streams_deliverable`'s own doc. This is
-    // NOT a transient stall like the two checks above (nothing about it
-    // resolves on its own within seconds); 300s matches this file's
-    // steady-state cadence rather than the 30s used for the genuinely
-    // transient waits above.
-    if !nats_declared_streams_deliverable(&cv.streams) {
+    // Step 6 (2.5e Task 3, ADR 0061 §8): apply this claim's OWN declared
+    // Stream/Consumer CRs via NACK. Gated on the jetstream.nats.io CRDs
+    // being Established — a Stream applied before nack has synced its
+    // CRDs returns NoKindMatch. Runs AFTER verify, matching ADR §8's own
+    // literal order (accounts file -> verify -> NACK CRs -> ready): verify
+    // is a general canary for "is this account healthy at all," and
+    // there is no reason to attempt NACK CR application against an
+    // account that just failed it.
+    if !jetstream_crds_established(&ctx.client).await? {
         let cond = ready_condition(
             "False",
-            REASON_AWAITING_STREAM_CREATION,
-            &stream_creation_pending_message(cv.streams.len()),
+            REASON_AWAITING_NACK_CRDS,
+            "waiting for the jetstream.nats.io CRDs (the nack component) to be Established",
             &prior,
         );
         patch_status(&ctx.client, ns, name, cond, ClaimStatusFields::default()).await?;
-        return Ok(Action::requeue(Duration::from_secs(300)));
+        return Ok(Action::requeue(Duration::from_secs(30)));
+    }
+
+    // Every declared object this claim applied that NACK has NOT yet
+    // reported Ready. Collected as the applies happen (SSA returns the
+    // stored object, status included) so the gate below costs no extra
+    // round trip.
+    let mut pending_objects: Vec<String> = Vec::new();
+
+    let account_obj_name = nats::account_k8s_name(ns);
+    let stream_api: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), &nats_ns, &jetstream_stream_ar());
+    if let Some(js) = claim.spec.jetstream.as_ref() {
+        for stream in &js.streams {
+            let max_bytes = nats::quantity_bytes(&stream.max_bytes).ok_or_else(|| {
+                ReconcileError::Provisioning(format!(
+                    "{name}: streams[{:?}].maxBytes {:?} is not a parseable quantity — the \
+                     admission webhook should have rejected this before the claim was ever \
+                     created",
+                    stream.name, stream.max_bytes
+                ))
+            })?;
+            let stream_body = nats::stream_object(
+                ns,
+                &nats_ns,
+                &cv.app,
+                &stream.name,
+                &stream.subjects,
+                stream.storage.as_deref().unwrap_or("file"),
+                stream.retention.as_deref().unwrap_or("limits"),
+                stream.max_age.as_deref().unwrap_or(""),
+                max_bytes,
+                &account_obj_name,
+            );
+            let applied = stream_api
+                .patch(
+                    &format!("{ns}-{}-{}", cv.app, stream.name),
+                    &apply_params(),
+                    &Patch::Apply(&stream_body),
+                )
+                .await?;
+            if !nack_object_ready(&applied) {
+                pending_objects.push(pending_label(
+                    "Stream",
+                    &nats_accounts::nats_stream_name(&cv.app, &stream.name),
+                    nack_object_detail(&applied),
+                ));
+            }
+        }
+    }
+
+    let consumer_api: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), &nats_ns, &jetstream_consumer_ar());
+    for consume in &cv.consumes {
+        let consumer_body = nats::consumer_object(
+            ns,
+            &nats_ns,
+            &cv.app,
+            &consume.durable,
+            &consume.owner,
+            &consume.stream,
+            &account_obj_name,
+        );
+        let applied = consumer_api
+            .patch(
+                &format!("{ns}-{}-{}", cv.app, consume.durable),
+                &apply_params(),
+                &Patch::Apply(&consumer_body),
+            )
+            .await?;
+        if !nack_object_ready(&applied) {
+            pending_objects.push(pending_label(
+                "Consumer",
+                &nats_accounts::nats_durable_name(&cv.app, &consume.durable),
+                nack_object_detail(&applied),
+            ));
+        }
+    }
+
+    // Step 7 — the status guard (see `REASON_AWAITING_STREAM_CREATION`).
+    // A claim that declared streams/consumers does NOT reach Ready until
+    // NACK reports each of them live. `pending_objects` is empty by
+    // construction for a claim that declared nothing (a bare
+    // `needs: {jetstream: {}}`, or a `dynamicStreams: true` claim with no
+    // declarations), so neither is gated here — this only ever holds back
+    // a claim whose own declarations are not there yet.
+    if next_nats_bootstrap_step(
+        accounts_secret_written,
+        component_enabled,
+        statefulset_ready,
+        user_verified,
+        pending_objects.is_empty(),
+    ) == NatsBootstrapStep::AwaitDeclaredObjectsReady
+    {
+        let cond = ready_condition(
+            "False",
+            REASON_AWAITING_STREAM_CREATION,
+            &stream_creation_pending_message(&pending_objects),
+            &prior,
+        );
+        patch_status(&ctx.client, ns, name, cond, ClaimStatusFields::default()).await?;
+        return Ok(Action::requeue(Duration::from_secs(30)));
     }
 
     // Terminal status write.
@@ -1865,6 +2114,110 @@ async fn upsert_managed_role(
     Err(ReconcileError::Provisioning(format!(
         "managed.roles RMW for {cluster} exhausted {ROLE_RMW_RETRIES} retries on 409 conflict"
     )))
+}
+
+/// Explicitly delete a deleting jetstream claim's OWN declared
+/// Stream/Consumer CRs (2.5e Task 3, ADR 0061 §1's "Namespaces" section:
+/// "`Stream` and `Consumer` live in `nats-system` while the `ResourceClaim`
+/// lives in the application's namespace, and Kubernetes forbids a
+/// cross-namespace `ownerReference`, so there is no cascade — the
+/// provisioner deletes them explicitly, the pattern `needs.disk` already
+/// uses for its own unowned PVC").
+///
+/// **This deletes the CRs, NOT the streams**, and the distinction is the
+/// whole reason the function is worth reading.
+///
+/// NACK's LEGACY controller adds no finalizer of its own (checked: there
+/// is no finalizer handling anywhere in `controllers/jetstream` at
+/// v0.24.0), and its delete branch is gated on
+/// `str.GetDeletionTimestamp() != nil`. A `Stream` CR with no finalizer
+/// is gone from etcd the instant it is deleted, so NACK NEVER OBSERVES
+/// the deletion and the underlying NATS stream survives untouched —
+/// walk-measured: after deleting the declaring Application, the CR was
+/// gone and `streamapp_orders` was still there. Deleting the CR is
+/// therefore not a way to delete a stream, and no amount of waiting makes
+/// it one.
+///
+/// Which is fine, because a stream holds DATA and every other backend
+/// here retains data for the seven-day `RetainedClaim` grace: a Postgres
+/// role+DB, a Dragonfly `$N`, a disk PVC. ADR 0061 §8 puts stream
+/// deletion in exactly the same place — "GC, after the seven-day grace,
+/// as `mgr_<ns>`" — and `gc::gc_drop_nats` is what implements it,
+/// authenticating as the management user and issuing a real
+/// `STREAM.DELETE`.
+///
+/// So this function's job is narrow and immediate: drop the platform's
+/// own declarative objects so nothing re-reconciles them, and leave the
+/// data to the grace window. A redeploy inside that window re-applies the
+/// same CRs and NACK reattaches to the surviving stream — the same
+/// reattach-on-recovery behaviour `needs.disk` gets from its retained
+/// PVC.
+///
+/// 404-tolerant per delete (idempotent: a re-entrant call after a crash,
+/// or a stream that was never actually created because NACK had not
+/// synced yet, must not fail the finalizer).
+async fn delete_nats_declared_objects(
+    ctx: &Arc<Context>,
+    claim: &Arc<ResourceClaim>,
+    ns: &str,
+) -> Result<(), ReconcileError> {
+    let Some(js) = claim.spec.jetstream.as_ref() else {
+        return Ok(());
+    };
+    let Some(app) = nats::declaring_app(claim) else {
+        return Ok(());
+    };
+
+    // The Account CR's own namespace (nats-system) is where Stream/
+    // Consumer objects live too — re-read from the matched provider the
+    // same way provision_nats does, falling back to the documented
+    // default if the provider is gone (mirrors snapshot_retained_claim's
+    // own "a missing provider never stalls the finalizer" tolerance).
+    let provider_name = claim
+        .status
+        .as_ref()
+        .and_then(|s| s.provider.clone())
+        .unwrap_or_default();
+    let nats_ns = match find_provider(&ctx.client, &provider_name).await? {
+        Some(p) => {
+            let cfg = p.spec.config.clone().unwrap_or_else(|| json!({}));
+            cfg.pointer("/namespace")
+                .and_then(Value::as_str)
+                .unwrap_or(DEFAULT_NATS_SYSTEM_NAMESPACE)
+                .to_string()
+        }
+        None => DEFAULT_NATS_SYSTEM_NAMESPACE.to_string(),
+    };
+
+    let stream_api: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), &nats_ns, &jetstream_stream_ar());
+    for stream in &js.streams {
+        let object_name = format!("{ns}-{app}-{}", stream.name);
+        if let Err(e) = stream_api
+            .delete(&object_name, &DeleteParams::default())
+            .await
+        {
+            if !matches!(&e, kube::Error::Api(ae) if ae.code == 404) {
+                warn!(%object_name, %ns, error=%e, "could not delete declared Stream CR on claim deletion");
+            }
+        }
+    }
+
+    let consumer_api: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), &nats_ns, &jetstream_consumer_ar());
+    for consume in &js.consume {
+        let object_name = format!("{ns}-{app}-{}", consume.durable);
+        if let Err(e) = consumer_api
+            .delete(&object_name, &DeleteParams::default())
+            .await
+        {
+            if !matches!(&e, kube::Error::Api(ae) if ae.code == 404) {
+                warn!(%object_name, %ns, error=%e, "could not delete declared Consumer CR on claim deletion");
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Snapshot a deleting `ResourceClaim` into an immutable `RetainedClaim`
@@ -2017,6 +2370,53 @@ async fn snapshot_retained_claim(
                 &retain_until,
             )
         }
+        Some(Backend::Nats) => {
+            // 2.5e (walk-found): without this arm a jetstream claim fell
+            // through to the CNPG shape below and its GC ran the CNPG
+            // role/DB reclaim against `nats-system`, reclaiming nothing
+            // NATS-side — see `retained_claim_nats_object`'s own doc for
+            // the observed log lines.
+            //
+            // `cnpg_ns` was resolved from the SAME `/namespace` key the
+            // nats provider config uses, so it already holds `nats-system`
+            // here — but it is re-read under its own name rather than
+            // reused, because a reader should not have to know that a
+            // variable called `cnpg_ns` is what carries the NATS namespace.
+            let nats_ns = cnpg_ns.clone();
+            let js = claim.spec.jetstream.as_ref();
+            let declared_streams: Vec<String> = js
+                .map(|j| j.streams.iter().map(|s| s.name.clone()).collect())
+                .unwrap_or_default();
+            let declared_consumers: Vec<String> = js
+                .map(|j| j.consume.iter().map(|c| c.durable.clone()).collect())
+                .unwrap_or_default();
+            // A jetstream claim whose declaring Application ownerReference
+            // is already gone cannot name its app — snapshot with an empty
+            // one; `gc_drop_nats` skips the app-scoped sweep rather than
+            // sweeping with a `.` prefix that would match every stream in
+            // the account.
+            let app = nats::declaring_app(claim).unwrap_or_default();
+            if app.is_empty() {
+                warn!(
+                    %name, %ns,
+                    "jetstream claim deleted with no declaring Application ownerReference — \
+                     snapshotting without natsApp; the GC will skip the dynamic-stream sweep"
+                );
+            }
+            retained_claim_nats_object(
+                &object_name,
+                name,
+                ns,
+                &provider_name,
+                &nats_ns,
+                &app,
+                &declared_streams,
+                &declared_consumers,
+                &connection_secret_name(name),
+                ns,
+                &retain_until,
+            )
+        }
         // CNPG (or an unknown/empty backend — legacy snapshots default to
         // the CNPG shape, matching the GC's `gc_backend("")` default).
         _ => retained_claim_object(
@@ -2153,6 +2553,70 @@ pub(crate) fn dragonfly_cluster_ar() -> ApiResource {
         "v1alpha1",
         "Dragonfly",
     ))
+}
+
+/// ApiResources for the externally-installed `nack` CRDs (2.5e Task 2/3;
+/// `component_nack.cue`, group `jetstream.nats.io`). Version confirmed
+/// `v1beta2` against the CRD the `nack` chart 0.35.0 actually installs
+/// (the CRD also serves a legacy `v1beta1` for Stream/Consumer, but
+/// `v1beta2` is the storage version and the one Account is served under
+/// at all) — not assumed from a recollection.
+pub(crate) fn jetstream_account_ar() -> ApiResource {
+    ApiResource::from_gvk(&GroupVersionKind::gvk(
+        "jetstream.nats.io",
+        "v1beta2",
+        "Account",
+    ))
+}
+pub(crate) fn jetstream_stream_ar() -> ApiResource {
+    ApiResource::from_gvk(&GroupVersionKind::gvk(
+        "jetstream.nats.io",
+        "v1beta2",
+        "Stream",
+    ))
+}
+pub(crate) fn jetstream_consumer_ar() -> ApiResource {
+    ApiResource::from_gvk(&GroupVersionKind::gvk(
+        "jetstream.nats.io",
+        "v1beta2",
+        "Consumer",
+    ))
+}
+
+/// Live check: are the `jetstream.nats.io` CRDs (the `nack` component)
+/// Established? `component_nack.cue`'s own comment already promises this
+/// exact gate ("the jetstream.nats.io CRDs... must exist and be
+/// Established before part 2's provisioner — or anything else — applies
+/// a Stream or Consumer object"), so this reads the CRD's own
+/// `status.conditions[type=Established]` rather than the weaker
+/// mere-existence check `apprafter-operator/src/main.rs`'s
+/// cilium/gateway-api/vpa probes use (those are a looser, "good enough"
+/// proxy this codebase already accepts elsewhere; here there is a
+/// specific written promise to keep). Checks ONE of the three CRDs
+/// (`streams.jetstream.nats.io`) as a proxy for all three — they install
+/// and become Established together, as part of the same chart.
+///
+/// A LIVE per-reconcile check, not a startup-cached probe threaded
+/// through `Context` the way the three in `main.rs` are: this crate has
+/// no existing startup-probe/Context-threading convention of its own,
+/// and introducing the first one here would mean touching
+/// `apprafter-operator`'s shared `main.rs` for a single call site. A
+/// cluster-scoped CRD GET is cheap and this reconcile already does
+/// heavier cluster-wide list calls on every pass (`reconcile_accounts_secret`'s
+/// own `Api::<ResourceClaim>::all(...)`), so the cost is not the
+/// concern; scope is.
+async fn jetstream_crds_established(client: &Client) -> Result<bool, ReconcileError> {
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+    let api: Api<CustomResourceDefinition> = Api::all(client.clone());
+    let Some(crd) = api.get_opt("streams.jetstream.nats.io").await? else {
+        return Ok(false);
+    };
+    Ok(crd
+        .status
+        .and_then(|s| s.conditions)
+        .unwrap_or_default()
+        .iter()
+        .any(|c| c.type_ == "Established" && c.status == "True"))
 }
 
 pub(crate) fn apply_params() -> PatchParams {
@@ -3039,6 +3503,62 @@ pub fn retained_claim_disk_object(
     })
 }
 
+/// The `RetainedClaim` snapshot for a deleted jetstream claim (2.5e, ADR
+/// 0061 §8).
+///
+/// **Why this exists at all** — walk-found, 2.5e: `Backend::Nats` had no
+/// arm in `snapshot_retained_claim`'s dispatch, so a jetstream claim fell
+/// through to the CNPG default shape and its GC then ran the CloudNativePG
+/// reclaim against it — writing `ensure: absent` to a CNPG `Database`
+/// object named after the jetstream claim and doing a CNPG role
+/// read-modify-write, both aimed at `nats-system`. Observed verbatim:
+/// `gc: Database set to ensure:absent (CNPG drops the DB)
+/// database=claim-jslife-accta-jetstream cnpg_ns=nats-system`. Nothing
+/// NATS-side was ever reclaimed, so the namespace account outlived its
+/// last claim.
+///
+/// Carries no CNPG/dragonfly/disk field at all: `gc_backend` routes on
+/// `spec.backend`, and every field this snapshot does carry is one
+/// `gc_drop_nats` reads.
+#[allow(clippy::too_many_arguments)]
+pub fn retained_claim_nats_object(
+    snapshot_name: &str,
+    claim_name: &str,
+    claim_ns: &str,
+    provider: &str,
+    nats_namespace: &str,
+    app: &str,
+    declared_streams: &[String],
+    declared_consumers: &[String],
+    connection_secret_ref: &str,
+    connection_secret_namespace: &str,
+    retain_until: &str,
+) -> Value {
+    json!({
+        "apiVersion": "apprafter.io/v1alpha1",
+        "kind": "RetainedClaim",
+        "metadata": {
+            "name": snapshot_name,
+            "namespace": RETAINED_CLAIM_NAMESPACE,
+        },
+        "spec": {
+            "claimRef": {
+                "name": claim_name,
+                "namespace": claim_ns,
+            },
+            "provider": provider,
+            "backend": "nats",
+            "natsNamespace": nats_namespace,
+            "natsApp": app,
+            "natsDeclaredStreams": declared_streams,
+            "natsDeclaredConsumers": declared_consumers,
+            "connectionSecretRef": connection_secret_ref,
+            "connectionSecretNamespace": connection_secret_namespace,
+            "retainUntil": retain_until,
+        },
+    })
+}
+
 /// `current` with the provisioner finalizer appended (idempotent).
 fn with_finalizer(current: &[String]) -> Vec<String> {
     let mut out = current.to_vec();
@@ -3069,7 +3589,7 @@ fn generate_password() -> String {
 /// Find the matched `ServiceProvider` by name across all namespaces.
 /// Providers are seeded into `apprafter-system`, but listing cluster-wide
 /// keeps the controller agnostic to where they live.
-async fn find_provider(
+pub(crate) async fn find_provider(
     client: &Client,
     provider_name: &str,
 ) -> Result<Option<ServiceProvider>, ReconcileError> {
@@ -3926,7 +4446,7 @@ mod tests {
     #[test]
     fn nothing_done_yet_writes_the_accounts_secret_first() {
         assert_eq!(
-            next_nats_bootstrap_step(false, false, false, false),
+            next_nats_bootstrap_step(false, false, false, false, false),
             NatsBootstrapStep::WriteAccountsSecret
         );
     }
@@ -3940,7 +4460,7 @@ mod tests {
         // ordered if/else chain) would pass every OTHER test here and
         // still fail this one.
         assert_eq!(
-            next_nats_bootstrap_step(false, true, true, true),
+            next_nats_bootstrap_step(false, true, true, true, true),
             NatsBootstrapStep::WriteAccountsSecret
         );
     }
@@ -3948,7 +4468,7 @@ mod tests {
     #[test]
     fn accounts_secret_written_moves_to_enable_component() {
         assert_eq!(
-            next_nats_bootstrap_step(true, false, false, false),
+            next_nats_bootstrap_step(true, false, false, false, false),
             NatsBootstrapStep::EnableComponent
         );
     }
@@ -3956,7 +4476,7 @@ mod tests {
     #[test]
     fn component_not_yet_enabled_wins_even_if_ready_and_verified_are_true() {
         assert_eq!(
-            next_nats_bootstrap_step(true, false, true, true),
+            next_nats_bootstrap_step(true, false, true, true, true),
             NatsBootstrapStep::EnableComponent
         );
     }
@@ -3964,7 +4484,7 @@ mod tests {
     #[test]
     fn component_enabled_moves_to_await_statefulset_ready() {
         assert_eq!(
-            next_nats_bootstrap_step(true, true, false, false),
+            next_nats_bootstrap_step(true, true, false, false, false),
             NatsBootstrapStep::AwaitStatefulSetReady
         );
     }
@@ -3975,7 +4495,7 @@ mod tests {
         // were reset out from under it — still must not skip the readiness
         // wait.
         assert_eq!(
-            next_nats_bootstrap_step(true, true, false, true),
+            next_nats_bootstrap_step(true, true, false, true, true),
             NatsBootstrapStep::AwaitStatefulSetReady
         );
     }
@@ -3983,17 +4503,158 @@ mod tests {
     #[test]
     fn statefulset_ready_moves_to_verify_user_ready() {
         assert_eq!(
-            next_nats_bootstrap_step(true, true, true, false),
+            next_nats_bootstrap_step(true, true, true, false, true),
             NatsBootstrapStep::VerifyUserReady
+        );
+    }
+
+    #[test]
+    fn verify_not_done_wins_even_if_the_declared_objects_are_ready() {
+        // Order-pinning for the LAST step, the same shape as every test
+        // above: NACK reporting the declared objects live must not let
+        // the function skip past a user that cannot authenticate.
+        assert_eq!(
+            next_nats_bootstrap_step(true, true, true, false, true),
+            NatsBootstrapStep::VerifyUserReady
+        );
+    }
+
+    #[test]
+    fn verified_but_undelivered_declarations_move_to_await_declared_objects_ready() {
+        // 2.5e: this is the step that stops the status lie the 2.5e walk
+        // recorded (`part3[1] PASS` — claim Ready=True — beside
+        // `part3[2] FAIL` — its stream does not exist).
+        assert_eq!(
+            next_nats_bootstrap_step(true, true, true, true, false),
+            NatsBootstrapStep::AwaitDeclaredObjectsReady
         );
     }
 
     #[test]
     fn every_precondition_true_is_done() {
         assert_eq!(
-            next_nats_bootstrap_step(true, true, true, true),
+            next_nats_bootstrap_step(true, true, true, true, true),
             NatsBootstrapStep::Done
         );
+    }
+
+    // --- nack_object_ready / stream_creation_pending_message
+    // (2.5e: the restored AwaitingStreamCreation gate) -----------------
+
+    fn nack_obj(status: Value) -> DynamicObject {
+        let mut o = DynamicObject::new("s", &jetstream_stream_ar());
+        o.data = json!({ "status": status });
+        o
+    }
+
+    #[test]
+    fn a_nack_object_reporting_ready_true_is_ready() {
+        assert!(nack_object_ready(&nack_obj(json!({
+            "conditions": [{"type": "Ready", "status": "True", "reason": "Created"}]
+        }))));
+    }
+
+    #[test]
+    fn a_nack_object_with_no_status_yet_is_not_ready() {
+        // The case that actually fires in production: the provisioner
+        // has just SSA-applied the object and NACK has not observed it.
+        // "Not observed yet" is "not ready", never "assume fine".
+        let mut o = DynamicObject::new("s", &jetstream_stream_ar());
+        o.data = json!({});
+        assert!(!nack_object_ready(&o));
+        assert!(!nack_object_ready(&nack_obj(json!({ "conditions": [] }))));
+    }
+
+    #[test]
+    fn a_nack_object_reporting_ready_false_is_not_ready() {
+        // The 2.5e walk's shape: the CR exists in etcd, the controller
+        // has seen it, and it CANNOT create the stream. Mere existence of
+        // the object must never satisfy the gate.
+        assert!(!nack_object_ready(&nack_obj(json!({
+            "conditions": [{"type": "Ready", "status": "False", "reason": "Errored"}]
+        }))));
+    }
+
+    #[test]
+    fn a_nack_object_whose_only_true_condition_is_not_ready_is_not_ready() {
+        // Guards against a `.any(|c| c.status == "True")` implementation
+        // that ignores the condition TYPE — it would pass every other
+        // test in this group.
+        assert!(!nack_object_ready(&nack_obj(json!({
+            "conditions": [{"type": "Synced", "status": "True", "reason": "Whatever"}]
+        }))));
+    }
+
+    #[test]
+    fn a_not_ready_object_carries_nacks_own_reason_into_the_claim_status() {
+        // The 2.5e walk's second-order finding: a declared stream that
+        // NACK REFUSED (`insufficient storage resources available
+        // (10047)` — the namespace account's max_file could not fit it)
+        // presented in the claim's status identically to one that was
+        // merely still being created. The cause lived in a Stream CR in
+        // `nats-system`, a namespace the application's owner has no
+        // reason to look in.
+        let obj = nack_obj(json!({
+            "conditions": [{
+                "type": "Ready",
+                "status": "False",
+                "reason": "Errored",
+                "message": "insufficient storage resources available (10047)"
+            }]
+        }));
+        let detail = nack_object_detail(&obj).expect("a reason");
+        assert!(detail.contains("Errored"), "{detail}");
+        assert!(detail.contains("10047"), "{detail}");
+        let msg = stream_creation_pending_message(&[pending_label(
+            "Stream",
+            "streamapp2_invoices",
+            Some(detail),
+        )]);
+        assert!(msg.contains("streamapp2_invoices"), "{msg}");
+        assert!(
+            msg.contains("insufficient storage resources"),
+            "the claim's own status must say WHY, not only WHICH: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_freshly_applied_object_carries_no_reason_yet() {
+        // The ordinary first pass — NACK has not observed the object, so
+        // there is no explanation to give and the label must not invent
+        // one (`Stream/x ()` or `Stream/x (NotReady: )` would both read
+        // as a failure that has not happened).
+        let mut o = DynamicObject::new("s", &jetstream_stream_ar());
+        o.data = json!({});
+        assert_eq!(nack_object_detail(&o), None);
+        assert_eq!(
+            pending_label("Stream", "x", None),
+            "Stream/x",
+            "no parenthetical when there is nothing to say"
+        );
+    }
+
+    #[test]
+    fn a_reason_without_a_message_still_names_the_reason() {
+        let obj = nack_obj(json!({
+            "conditions": [{ "type": "Ready", "status": "False", "reason": "Errored" }]
+        }));
+        assert_eq!(nack_object_detail(&obj).as_deref(), Some("Errored"));
+    }
+
+    #[test]
+    fn the_pending_message_names_the_outstanding_objects_not_a_generic_not_ready() {
+        let msg = stream_creation_pending_message(&[
+            "Stream/streamapp_orders".to_string(),
+            "Consumer/consumerapp_reader".to_string(),
+        ]);
+        assert!(msg.contains('2'), "must name the count: {msg}");
+        assert!(msg.contains("Stream/streamapp_orders"), "{msg}");
+        assert!(msg.contains("Consumer/consumerapp_reader"), "{msg}");
+        assert!(
+            msg.contains("nack"),
+            "must name what the claim is waiting ON: {msg}"
+        );
+        assert_ne!(msg, "not ready");
     }
 
     // --- nats_override_patch (2.5d Task 6, bidirectional annotation
@@ -4089,52 +4750,6 @@ mod tests {
         // A brand new namespace's FIRST render — nothing to compare
         // against, so there is no "unchanged" to claim.
         assert!(!accounts_file_unchanged(None, "ns_demo: {}\n"));
-    }
-
-    // --- nats_declared_streams_deliverable / stream_creation_pending_message
-    // (part 2 closure — coordinator finding: a claim with declared streams
-    // must not reach Ready=True while nothing applies the NACK CRs those
-    // streams need to actually exist) --------------------------------
-
-    #[test]
-    fn a_claim_with_declared_streams_is_not_deliverable_yet() {
-        let streams = vec![nats_accounts::StreamView {
-            name: "orders".into(),
-            subjects: vec!["shop.orders.>".into()],
-            allow_purge: false,
-        }];
-        assert!(
-            !nats_declared_streams_deliverable(&streams),
-            "a claim that declared a stream must not be reported deliverable \
-             until NACK CR application exists"
-        );
-    }
-
-    #[test]
-    fn a_claim_with_no_declared_streams_is_deliverable() {
-        // Both a bare `needs: {jetstream: {}}` and a `dynamicStreams: true`
-        // claim with nothing DECLARED reach this with an empty streams
-        // list — neither depends on a NACK CR, so neither should be
-        // blocked by this guard. Proven on the empty-list case here; the
-        // scope claim ("dynamicStreams doesn't matter, only `streams`
-        // does") is why this function takes `&[StreamView]` alone and
-        // not the whole `ClaimView` — there is no `dynamic_streams` flag
-        // for it to even look at.
-        assert!(nats_declared_streams_deliverable(&[]));
-    }
-
-    #[test]
-    fn the_pending_message_names_the_real_reason_not_a_generic_not_ready() {
-        let msg = stream_creation_pending_message(2);
-        assert!(msg.contains('2'), "must name the count: {msg}");
-        assert!(
-            msg.contains("not yet created") && msg.contains("platform"),
-            "must say the platform has not created the declared streams yet: {msg}"
-        );
-        assert_ne!(
-            msg, "not ready",
-            "must be actionable, not a bare generic phrase"
-        );
     }
 
     #[test]

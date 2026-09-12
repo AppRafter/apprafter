@@ -79,6 +79,18 @@ spec:
                 type: integer
               instance:
                 type: string
+              natsApp:
+                type: string
+              natsDeclaredConsumers:
+                items:
+                  type: string
+                type: array
+              natsDeclaredStreams:
+                items:
+                  type: string
+                type: array
+              natsNamespace:
+                type: string
               passwordSecretName:
                 type: string
               provider:

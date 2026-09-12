@@ -107,6 +107,31 @@ const DRAGONFLY_REQUIRED_STRING_FIELDS: [&str; 4] = [
 /// the empty-instance dragonfly carve-out.
 const DISK_REQUIRED_STRING_FIELDS: [&str; 2] = ["volumeClaimRef", "volumeClaimNamespace"];
 
+/// NATS/jetstream-backend `spec` string fields that must be non-empty —
+/// the GC-load-bearing set for a `nats` snapshot (2.5e, ADR 0061 §8). The
+/// GC reads these to sweep the departing application's streams as
+/// `mgr_<ns>`, delete its NACK CRs, and delete its connection Secret.
+///
+/// `natsDeclaredStreams` / `natsDeclaredConsumers` are deliberately
+/// absent: they are ARRAYS, and an EMPTY one is the common, correct case
+/// (a `dynamicStreams: true` claim declares nothing). A non-empty-string
+/// rule does not apply to them and a presence rule would reject the
+/// majority of real snapshots.
+///
+/// Like the dragonfly and disk sets this is enforced only once `natsApp`
+/// is present + non-empty. A jetstream claim whose declaring Application
+/// ownerReference is already gone snapshots with an empty `natsApp`
+/// (`snapshot_retained_claim` warns and writes one), and its GC skips the
+/// app-scoped sweep. Requiring the set unconditionally would reject the
+/// operator's OWN snapshot CREATE — failurePolicy: Fail → finalizer wedge
+/// → leak — the same carve-out the other two backends already make.
+const NATS_REQUIRED_STRING_FIELDS: [&str; 4] = [
+    "natsNamespace",
+    "natsApp",
+    "connectionSecretRef",
+    "connectionSecretNamespace",
+];
+
 /// Validate a RetainedClaim AdmissionReview. `object` is the request's
 /// `object`; `old_object` is `oldObject` (`None` on CREATE, `Some` on
 /// UPDATE); `user_info` is `request.userInfo`; `operation` is
@@ -233,20 +258,38 @@ pub fn validate_retainedclaim(
     // `volumeClaimRef` is present + non-empty (mirror of the dragonfly carve-out).
     let disk_provisioned =
         typed_or_raw_str(typed.as_ref(), spec, "volumeClaimRef").is_some_and(|s| !s.is_empty());
-    let required_fields: &[&str] = if backend == "dragonfly" {
-        if dragonfly_allocated {
-            &DRAGONFLY_REQUIRED_STRING_FIELDS
-        } else {
-            &[]
-        }
-    } else if backend == "disk" {
-        if disk_provisioned {
-            &DISK_REQUIRED_STRING_FIELDS
-        } else {
-            &[]
-        }
-    } else {
-        &CNPG_REQUIRED_STRING_FIELDS
+    // A nats snapshot's GC-load-bearing set only means anything once the
+    // declaring application is known — see NATS_REQUIRED_STRING_FIELDS.
+    let nats_attributed =
+        typed_or_raw_str(typed.as_ref(), spec, "natsApp").is_some_and(|s| !s.is_empty());
+    // A `match`, not an if/else chain, and every arm named explicitly.
+    //
+    // **This dispatch had no `nats` arm when the 2.5e GC landed**, so every
+    // jetstream snapshot fell into the CNPG default and the operator's own
+    // CREATE was denied with six "spec.cnpgCluster is required"-shaped
+    // errors — failurePolicy: Fail, so the finalizer wedged, no
+    // RetainedClaim was ever written, and the jetstream GC never ran at
+    // all. Walk-found; nothing else could have found it, because the
+    // provisioner and the webhook only meet on a live apiserver.
+    //
+    // The authority for which strings are legal here is
+    // `resourceclaim-provisioner`'s `Backend::from_spec_backend`. It
+    // cannot be imported: a validation-only crate must not become a
+    // production dependency of the provisioner, and the reverse direction
+    // is worse. `every_known_backend_selects_its_own_required_set` pins
+    // the list instead — ADD A BACKEND THERE WHEN YOU ADD ONE HERE.
+    let required_fields: &[&str] = match backend {
+        "dragonfly" if dragonfly_allocated => &DRAGONFLY_REQUIRED_STRING_FIELDS,
+        "disk" if disk_provisioned => &DISK_REQUIRED_STRING_FIELDS,
+        "nats" if nats_attributed => &NATS_REQUIRED_STRING_FIELDS,
+        // The pre-allocation / pre-provision / pre-attribution carve-outs:
+        // the backend is known but its GC-load-bearing set does not exist
+        // yet, so only the base set applies.
+        "dragonfly" | "disk" | "nats" => &[],
+        // `shared-disk` never snapshots at all (the provisioner returns
+        // early), and an absent/empty/unknown backend is a legacy snapshot,
+        // which is always CNPG-shaped.
+        _ => &CNPG_REQUIRED_STRING_FIELDS,
     };
     for field in required_fields {
         // `typed_or_raw_str` reads the TYPED `Option<String>` for this field
@@ -316,6 +359,12 @@ fn typed_or_raw_str<'a>(
             // Disk set + discriminator.
             "volumeClaimRef" => t.volume_claim_ref.as_deref(),
             "volumeClaimNamespace" => t.volume_claim_namespace.as_deref(),
+            // NATS/jetstream set + discriminator (2.5e). The array fields
+            // (`natsDeclaredStreams`/`natsDeclaredConsumers`) are absent on
+            // purpose — they are not string fields and this validator has
+            // no rule for them; see NATS_REQUIRED_STRING_FIELDS.
+            "natsNamespace" => t.nats_namespace.as_deref(),
+            "natsApp" => t.nats_app.as_deref(),
             other => unreachable!("typed_or_raw_str: unmapped field {other:?}"),
         };
     }
@@ -481,6 +530,107 @@ mod tests {
             .remove("passwordSecretName");
         let errors = validate_retainedclaim(&c, None, &operator_user(), "CREATE");
         assert!(errors.iter().any(|e| e.field == "spec.passwordSecretName"));
+    }
+
+    fn retained_nats() -> Value {
+        json!({
+            "metadata": { "name": "claim-demo-streamapp-jetstream", "namespace": "apprafter-system" },
+            "spec": {
+                "claimRef": { "name": "streamapp-jetstream", "namespace": "demo" },
+                "provider": "jetstream-integrated",
+                "backend": "nats",
+                "natsNamespace": "nats-system",
+                "natsApp": "streamapp",
+                "natsDeclaredStreams": ["orders"],
+                "natsDeclaredConsumers": [],
+                "connectionSecretRef": "streamapp-jetstream-conn",
+                "connectionSecretNamespace": "demo",
+                "retainUntil": "2026-09-19T00:00:00+00:00"
+            }
+        })
+    }
+
+    #[test]
+    fn allows_operator_create_nats_snapshot_without_cnpg_fields() {
+        // WALK-FOUND, 2.5e. Before the `nats` arm existed this dispatch
+        // defaulted every jetstream snapshot to the CNPG required set, so
+        // the operator's OWN CREATE was denied with six
+        // "spec.cnpgCluster is required"-shaped errors. failurePolicy is
+        // Fail, so the finalizer wedged, no RetainedClaim was ever
+        // written, and `gc_drop_nats` never ran for any claim. Observed
+        // verbatim in the operator log:
+        //   admission webhook "retainedclaims.apprafter.io" denied the
+        //   request: RetainedClaim is invalid: spec.cnpgCluster:
+        //   spec.cnpgCluster is required; ...
+        let errors = validate_retainedclaim(&retained_nats(), None, &operator_user(), "CREATE");
+        assert!(
+            errors.is_empty(),
+            "nats snapshot must pass the webhook; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_nats_snapshot_missing_its_own_gc_fields() {
+        // The other half: an ATTRIBUTED nats snapshot (natsApp set) must
+        // still carry what `gc_drop_nats` reads, or the GC silently
+        // reclaims nothing.
+        let mut c = retained_nats();
+        c["spec"]["natsNamespace"] = json!("");
+        c["spec"]["connectionSecretRef"] = json!("");
+        let errors = validate_retainedclaim(&c, None, &operator_user(), "CREATE");
+        assert!(
+            errors.iter().any(|e| e.field == "spec.natsNamespace"),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.field == "spec.connectionSecretRef"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn allows_a_nats_snapshot_whose_declaring_application_was_already_gone() {
+        // The pre-attribution carve-out, mirroring dragonfly's
+        // pre-allocation and disk's pre-provision ones. A jetstream claim
+        // deleted after its declaring Application ownerReference vanished
+        // snapshots with an empty `natsApp`; its GC skips the app-scoped
+        // sweep. Rejecting it here would wedge the finalizer — the exact
+        // failure the arm above exists to prevent, on a rarer input.
+        let mut c = retained_nats();
+        c["spec"]["natsApp"] = json!("");
+        let errors = validate_retainedclaim(&c, None, &operator_user(), "CREATE");
+        assert!(
+            errors.is_empty(),
+            "an unattributed nats snapshot must still be accepted; got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn every_known_backend_selects_its_own_required_set() {
+        // The list `resourceclaim-provisioner`'s `Backend::from_spec_backend`
+        // can produce, pinned here because the two crates cannot share the
+        // enum (a validation-only crate must not become a production
+        // dependency of the provisioner). A new backend whose snapshot is
+        // CNPG-validated by accident is exactly the 2.5e walk finding, and
+        // this is the cheapest thing that turns red for it: add the row
+        // when you add the backend, and the missing arm shows up here
+        // rather than on a live apiserver.
+        //
+        // Each fixture is a MINIMAL snapshot for its backend — it carries
+        // none of any other backend's fields — so a row passes only if the
+        // dispatch picked that backend's own set.
+        for (label, obj) in [
+            ("cloudnative-pg", retained()),
+            ("dragonfly", retained_dragonfly()),
+            ("disk", retained_disk()),
+            ("nats", retained_nats()),
+        ] {
+            let errors = validate_retainedclaim(&obj, None, &operator_user(), "CREATE");
+            assert!(
+                errors.is_empty(),
+                "{label} snapshot must pass the webhook; got {errors:?}"
+            );
+        }
     }
 
     fn retained_dragonfly() -> Value {

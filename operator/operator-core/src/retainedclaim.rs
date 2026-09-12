@@ -129,6 +129,44 @@ pub struct RetainedClaimSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub volume_claim_namespace: Option<String>,
+
+    /// NATS/jetstream allocation (2.5e, ADR 0061 §8): the namespace the
+    /// NATS server + accounts Secret + `mgr_<ns>` credential + NACK CRs
+    /// live in. None for every other backend.
+    #[serde(
+        rename = "natsNamespace",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub nats_namespace: Option<String>,
+    /// NATS/jetstream allocation: the DECLARING application's name — the
+    /// `<app>.` subject prefix the GC's dynamic-stream sweep keys on, and
+    /// half of every NACK CR object name (`<ns>-<app>-<declared>`).
+    /// Stored, not re-derived from `claimRef.name`: stripping a
+    /// `-jetstream` suffix would be a second copy of the application
+    /// controller's own `claim_name()` join, free to drift from it.
+    #[serde(rename = "natsApp", default, skip_serializing_if = "Option::is_none")]
+    pub nats_app: Option<String>,
+    /// NATS/jetstream allocation: the stream names this claim DECLARED
+    /// (the manifest-side names, not the composed NATS-side ones). The GC
+    /// deletes their NACK `Stream` CRs and EXCLUDES them from the
+    /// subject-prefix sweep — a declared stream is never a dynamic one.
+    #[serde(
+        rename = "natsDeclaredStreams",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub nats_declared_streams: Option<Vec<String>>,
+    /// NATS/jetstream allocation: the durable names this claim declared
+    /// under `consume` (manifest-side). The GC deletes their NACK
+    /// `Consumer` CRs.
+    #[serde(
+        rename = "natsDeclaredConsumers",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub nats_declared_consumers: Option<Vec<String>>,
+
     /// RFC3339 instant after which the GC drops the backend resources +
     /// password/connection Secret (deletion + 7-day grace).
     #[serde(rename = "retainUntil")]
@@ -230,6 +268,10 @@ mod tests {
             connection_secret_namespace: None,
             volume_claim_ref: None,
             volume_claim_namespace: None,
+            nats_namespace: None,
+            nats_app: None,
+            nats_declared_streams: None,
+            nats_declared_consumers: None,
             retain_until: "2026-06-10T00:00:00+00:00".into(),
         };
         let v = serde_json::to_value(&spec).unwrap();

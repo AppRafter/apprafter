@@ -65,8 +65,14 @@ use crate::acl_reconcile::{read_secret_key, redis_namespace};
 use crate::cnpg;
 use crate::dragonfly;
 use crate::grace;
+use crate::nats;
+use crate::nats_accounts;
+use crate::nats_client;
 use crate::reconcile::{
-    apply_params, cluster_ar, database_ar, pvc_ar, secret_ar, GC_ROLE_RMW_RETRIES,
+    apply_params, cluster_ar, database_ar, find_provider, jetstream_account_ar,
+    jetstream_consumer_ar, jetstream_stream_ar, pvc_ar, reconcile_accounts_secret, secret_ar,
+    Backend, DEFAULT_NATS_SYSTEM_NAMESPACE, GC_ROLE_RMW_RETRIES, NATS_CLIENT_PORT,
+    NATS_STATEFULSET_NAME,
 };
 use crate::{Context, ReconcileError};
 
@@ -228,6 +234,7 @@ pub async fn reconcile(
     match gc_backend(&rc.spec.backend) {
         GcBackend::Dragonfly => return gc_drop_dragonfly(&ctx, &rc, &rc_ns, &rc_name).await,
         GcBackend::Disk => return gc_drop_disk(&ctx, &rc, &rc_ns, &rc_name).await,
+        GcBackend::Nats => return gc_drop_nats(&ctx, &rc, &rc_ns, &rc_name).await,
         GcBackend::Cnpg => { /* fall through to the phased CNPG drop */ }
     }
 
@@ -522,7 +529,376 @@ async fn gc_drop_disk(
     Ok(Action::requeue(REQUEUE_AFTER))
 }
 
-/// Delete the dragonfly connection Secret in the claim's origin namespace.
+/// What the NATS GC may delete for a departing application, and what it
+/// must only REPORT (2.5e, ADR 0061 §8). Pure — no client, no clock — so
+/// the rule is unit-pinned rather than only observable on a live cluster.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NatsSweep {
+    /// NATS-side stream names to delete.
+    pub sweep: Vec<String>,
+    /// NATS-side stream names the rule CANNOT attribute — reported,
+    /// never deleted.
+    pub unattributed: Vec<String>,
+}
+
+/// Whether every one of `subjects` lies under `<app>.`.
+///
+/// **Prefix, with the separating dot, and nothing cleverer.** `feeder.`
+/// does not prefix `feederbot.orders`, so two applications whose names
+/// share a prefix cannot sweep each other. A subject equal to the bare
+/// app name, or a bare `>`, is NOT under the prefix.
+///
+/// An EMPTY subject list is `false`, not vacuously true: a stream with no
+/// subjects (a mirror, or one sourced from others) cannot be attributed by
+/// subject at all, and the whole rule is "keys on subjects, never on
+/// names". Treating it as "wholly under" would delete exactly the streams
+/// the rule has no evidence about.
+fn subjects_wholly_under(subjects: &[String], app_prefix: &str) -> bool {
+    !subjects.is_empty() && subjects.iter().all(|s| s.starts_with(app_prefix))
+}
+
+/// The sweep plan for one departing application's account (ADR 0061 §8).
+///
+/// - `declared` — the departing claim's OWN declared streams (NATS-side
+///   names). Deleted unconditionally: the platform created them for this
+///   application and no other application can have been granted them.
+/// - `protected` — every stream DECLARED by any other live claim in the
+///   same account. Never touched and never reported: it is attributed,
+///   just not to us. ("excluding declared streams, whatever their owner")
+/// - everything else is DYNAMIC, and is judged by SUBJECTS ONLY: wholly
+///   under `<app>.` → delete; some-but-not-all under it → report as
+///   unattributed and leave; none under it → leave silently, it is not
+///   ours in any sense.
+///
+/// **This is a heuristic in BOTH directions and stays one.** ADR 0061 §8
+/// says so plainly: a capture stream over a neighbour's subjects is
+/// missed, and a capture stream over the DEPARTING application's prefix is
+/// swept with it, reassigning ownership. Do not "tighten" this into a
+/// name-based rule — dynamic stream names are unconstrained, which is the
+/// entire reason the rule keys on subjects.
+///
+/// An empty `app` disables the dynamic sweep entirely (returns only the
+/// declared streams): the prefix would be a bare `"."`, which matches
+/// nothing sane, and the failure mode of guessing here is deleting another
+/// tenant's data.
+pub fn nats_sweep_plan(
+    streams: &[nats_client::StreamSummary],
+    app: &str,
+    declared: &[String],
+    protected: &[String],
+) -> NatsSweep {
+    let mut out = NatsSweep::default();
+    let app_prefix = format!("{app}.");
+    for s in streams {
+        if declared.iter().any(|d| d == &s.name) {
+            out.sweep.push(s.name.clone());
+            continue;
+        }
+        if protected.iter().any(|p| p == &s.name) {
+            continue;
+        }
+        if app.is_empty() {
+            continue;
+        }
+        if subjects_wholly_under(&s.subjects, &app_prefix) {
+            out.sweep.push(s.name.clone());
+        } else if s.subjects.iter().any(|x| x.starts_with(&app_prefix)) || s.subjects.is_empty() {
+            out.unattributed.push(s.name.clone());
+        }
+    }
+    out.sweep.sort();
+    out.sweep.dedup();
+    out.unattributed.sort();
+    out.unattributed.dedup();
+    out
+}
+
+/// [`nats_sweep_plan`], plus the one case that overrides it entirely:
+/// **the namespace's LAST claim takes the whole account's contents.**
+///
+/// ADR 0061 §8 — "when the namespace's last claim goes, the account goes
+/// with its store." Removing the account from the accounts file (which
+/// `gc_drop_nats` does a step later) makes every stream still in it
+/// permanently unreachable, but NOT free: the files stay on the shared
+/// JetStream PVC that every other namespace's `max_file` promise is
+/// carved out of, with nothing left that could ever name them again. That
+/// is a silent, unattributable capacity leak — the exact failure class
+/// ADR 0061 §6's global budget exists to prevent on the allocation side.
+///
+/// Safe precisely because it is conditioned on `namespace_still_claimed`
+/// being FALSE. Every attribution rule in [`nats_sweep_plan`] exists to
+/// protect a NEIGHBOUR, and "no live jetstream claim in this namespace"
+/// means there is no neighbour: no other application shares the account,
+/// so nothing in it can belong to anyone else. `unattributed` comes back
+/// empty rather than merely ignored — there is no one left to report it
+/// to.
+fn nats_sweep_for(
+    streams: &[nats_client::StreamSummary],
+    app: &str,
+    declared: &[String],
+    protected: &[String],
+    namespace_still_claimed: bool,
+) -> NatsSweep {
+    if namespace_still_claimed {
+        return nats_sweep_plan(streams, app, declared, protected);
+    }
+    let mut sweep: Vec<String> = streams.iter().map(|s| s.name.clone()).collect();
+    sweep.sort();
+    sweep.dedup();
+    NatsSweep {
+        sweep,
+        unattributed: Vec::new(),
+    }
+}
+
+/// NATS/jetstream reclaim (2.5e, ADR 0061 §8) — the arm whose absence
+/// routed every jetstream snapshot into the CloudNativePG drop (see
+/// [`gc_backend`]'s own doc and `reconcile::retained_claim_nats_object`'s).
+///
+/// Order matters and is not interchangeable:
+///
+/// 1. Delete this claim's NACK `Stream`/`Consumer` CRs. Idempotent and
+///    404-tolerant — `reconcile::delete_nats_declared_objects` already
+///    did this at claim-delete time, so normally every delete here is a
+///    no-op; it runs anyway because a crash between the two is exactly
+///    what a re-entrant GC is for.
+/// 2. Sweep, as `mgr_<ns>`, while the account STILL EXISTS in the
+///    accounts file. Step 4 removes it, so nothing NATS-side can be
+///    reached after that point.
+/// 3. Delete the connection Secret (belt-and-suspenders; it usually
+///    cascaded on the original claim's ownerRef).
+/// 4. Re-derive the whole accounts file from the live claim set. The
+///    departing user's line disappears because the claim is gone, and —
+///    when it was the namespace's LAST claim — so does the whole account
+///    block. That is "drop the user, re-derive the file" and "when the
+///    namespace's last claim goes, the account goes" in one write; there
+///    is no separate account-deletion step because the file IS the
+///    account.
+///
+/// Every NATS-side step is tolerated-on-failure (warn + proceed), the
+/// same posture `gc_drop_dragonfly` takes: an unreachable or torn-down
+/// server must not wedge the snapshot in the GC forever.
+async fn gc_drop_nats(
+    ctx: &Arc<Context>,
+    rc: &RetainedClaim,
+    rc_ns: &str,
+    rc_name: &str,
+) -> Result<Action, ReconcileError> {
+    let claim_ns = rc.spec.claim_ref.namespace.clone();
+    let nats_ns = rc
+        .spec
+        .nats_namespace
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_NATS_SYSTEM_NAMESPACE.to_string());
+    let app = rc.spec.nats_app.clone().unwrap_or_default();
+    let declared_streams = rc.spec.nats_declared_streams.clone().unwrap_or_default();
+    let declared_consumers = rc.spec.nats_declared_consumers.clone().unwrap_or_default();
+
+    // --- 1. the claim's own NACK CRs -----------------------------------
+    if !app.is_empty() {
+        let stream_api: Api<DynamicObject> =
+            Api::namespaced_with(ctx.client.clone(), &nats_ns, &jetstream_stream_ar());
+        for declared in &declared_streams {
+            delete_nack_object(
+                &stream_api,
+                &format!("{claim_ns}-{app}-{declared}"),
+                rc_name,
+            )
+            .await;
+        }
+        let consumer_api: Api<DynamicObject> =
+            Api::namespaced_with(ctx.client.clone(), &nats_ns, &jetstream_consumer_ar());
+        for declared in &declared_consumers {
+            delete_nack_object(
+                &consumer_api,
+                &format!("{claim_ns}-{app}-{declared}"),
+                rc_name,
+            )
+            .await;
+        }
+    }
+
+    // --- 2. the stream sweep, as mgr_<ns> ------------------------------
+    //
+    // Every live jetstream claim, cluster-wide: used twice — to build the
+    // `protected` set (streams DECLARED by this namespace's other claims,
+    // which the sweep must never touch) and, below, to decide whether the
+    // namespace still has any claim at all.
+    let live_claims: Vec<ResourceClaim> = Api::<ResourceClaim>::all(ctx.client.clone())
+        .list(&Default::default())
+        .await?
+        .items;
+    let namespace_still_claimed = live_claims.iter().any(|c| {
+        c.spec.type_ == "jetstream" && c.metadata.namespace.as_deref() == Some(claim_ns.as_str())
+    });
+
+    let mgr_user = nats_accounts::mgr_user(&claim_ns);
+    let mgr_secret = nats::mgr_secret_name(&claim_ns);
+    match read_secret_key(ctx, &nats_ns, &mgr_secret, "password").await {
+        Err(err) => {
+            // The management credential is gone (the namespace was torn
+            // down, or the account never rendered) — there is nothing to
+            // authenticate as, so there is nothing reachable to reclaim.
+            warn!(
+                retained = %rc_name, %nats_ns, secret = %mgr_secret, %err,
+                "nats mgr Secret unreadable during GC — skipping the stream sweep, \
+                 proceeding to Secret + accounts-file cleanup"
+            );
+        }
+        Ok(mgr_pass) => {
+            let url = format!("nats://{NATS_STATEFULSET_NAME}.{nats_ns}.svc:{NATS_CLIENT_PORT}");
+            match ctx.nats.list_streams(&url, &mgr_user, &mgr_pass).await {
+                Err(err) => warn!(
+                    retained = %rc_name, %url, user = %mgr_user, %err,
+                    "nats STREAM.LIST failed during GC — tolerating (server may be gone); \
+                     no streams swept"
+                ),
+                Ok(streams) => {
+                    // This claim's own declared streams, composed to their
+                    // NATS-side names — the same derivation the accounts
+                    // file and the Stream CR use, never a second copy.
+                    let declared_nats: Vec<String> = declared_streams
+                        .iter()
+                        .map(|d| nats_accounts::nats_stream_name(&app, d))
+                        .collect();
+                    let protected = protected_stream_names(&live_claims, &claim_ns);
+                    let plan = nats_sweep_for(
+                        &streams,
+                        &app,
+                        &declared_nats,
+                        &protected,
+                        namespace_still_claimed,
+                    );
+
+                    for name in &plan.unattributed {
+                        warn!(
+                            retained = %rc_name, stream = %name, %app,
+                            "nats GC: stream has subjects both inside and outside the \
+                             departing application's prefix — reported as unattributed and \
+                             LEFT IN PLACE (ADR 0061 §8: the rule keys on subjects, and is a \
+                             heuristic in both directions)"
+                        );
+                    }
+                    for name in &plan.sweep {
+                        if let Err(err) = ctx
+                            .nats
+                            .delete_stream(&url, &mgr_user, &mgr_pass, name)
+                            .await
+                        {
+                            warn!(
+                                retained = %rc_name, stream = %name, %err,
+                                "nats STREAM.DELETE failed during GC — tolerating"
+                            );
+                        } else {
+                            info!(retained = %rc_name, stream = %name, "nats GC: stream deleted");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- 3. the connection Secret --------------------------------------
+    delete_connection_secret(ctx, rc).await?;
+
+    // --- 4. re-derive the accounts file --------------------------------
+    //
+    // Drops the departed user's line, and — when this was the namespace's
+    // last claim — the whole account block with it. Skipped (loudly) when
+    // the matched provider is gone: the render needs that provider's own
+    // `sizeBytes` map and `ceilingBytes` to compute EVERY OTHER
+    // namespace's quota, and re-rendering the shared file with fabricated
+    // defaults would silently rewrite quotas for tenants that have nothing
+    // to do with this GC.
+    match find_provider(&ctx.client, &rc.spec.provider).await? {
+        None => warn!(
+            retained = %rc_name, provider = %rc.spec.provider,
+            "nats GC: matched ServiceProvider is gone — skipping the accounts-file \
+             re-derive rather than re-rendering every other namespace's quota from defaults"
+        ),
+        Some(p) => {
+            let cfg = p.spec.config.clone().unwrap_or_else(|| json!({}));
+            let size_bytes = nats::size_bytes_map(&cfg);
+            let ceiling_bytes = cfg
+                .pointer("/ceilingBytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX);
+            reconcile_accounts_secret(ctx, &nats_ns, ceiling_bytes, &size_bytes).await?;
+        }
+    }
+
+    // The namespace's Account CR is NACK's connection configuration for an
+    // account that no longer exists in the file — delete it, or NACK keeps
+    // retrying a login that can never succeed. The `mgr_<ns>` password
+    // Secret is deliberately KEPT (see `nats::mgr_secret_name`: the
+    // management identity is not claim-scoped, and a future claim in the
+    // same namespace re-renders the account with the same credential).
+    if !namespace_still_claimed {
+        let api: Api<DynamicObject> =
+            Api::namespaced_with(ctx.client.clone(), &nats_ns, &jetstream_account_ar());
+        delete_nack_object(&api, &nats::account_k8s_name(&claim_ns), rc_name).await;
+    }
+
+    // Terminal step: drop the snapshot.
+    delete_retained_claim(&ctx.client, rc_ns, rc_name).await?;
+
+    ctx.metrics
+        .claim_gc_total
+        .with_label_values(&["success", rc_ns])
+        .inc();
+    info!(retained = %rc_name, "nats RetainedClaim GC complete");
+
+    Ok(Action::requeue(REQUEUE_AFTER))
+}
+
+/// Every NATS-side stream name DECLARED by a live jetstream claim in
+/// `namespace` — the sweep's `protected` set. Pure over an
+/// already-fetched claim list so the GC makes exactly one list call.
+///
+/// Reads `spec.jetstream.streams[].name` plus the claim's declaring
+/// application (its `apprafter.io/managed-by` owner) through
+/// `nats::declaring_app`, so the composed name matches what the accounts
+/// file and the `Stream` CR use.
+fn protected_stream_names(live_claims: &[ResourceClaim], namespace: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for c in live_claims {
+        if c.metadata.namespace.as_deref() != Some(namespace) {
+            continue;
+        }
+        let (Some(js), Some(app)) = (c.spec.jetstream.as_ref(), nats::declaring_app(c)) else {
+            continue;
+        };
+        for s in &js.streams {
+            out.push(nats_accounts::nats_stream_name(&app, &s.name));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// 404-tolerant delete of one NACK CR. Never fails the GC: these objects
+/// are normally already gone (the provisioner deletes them at claim-delete
+/// time), and a NACK CRD that was never installed makes the whole Api call
+/// fail with `NoKindMatch` rather than 404 — neither is a reason to wedge
+/// a snapshot in the GC forever.
+async fn delete_nack_object(api: &Api<DynamicObject>, object_name: &str, retained: &str) {
+    match api.delete(object_name, &DeleteParams::default()).await {
+        Ok(_) => info!(%retained, object = %object_name, "nats GC: NACK object deleted"),
+        Err(kube::Error::Api(e)) if e.code == 404 => {}
+        Err(e) => warn!(
+            %retained, object = %object_name, error = %e,
+            "nats GC: could not delete NACK object — tolerating"
+        ),
+    }
+}
+
+/// Delete the claim's connection Secret in its origin namespace. Shared by
+/// the dragonfly and NATS drops (both snapshot `connectionSecretRef` +
+/// `connectionSecretNamespace`); the CNPG path has its own password-Secret
+/// step instead.
+///
 /// Swallows a 404 (it normally cascaded already via its ownerRef on the
 /// original claim delete; this is the recovery-path belt-and-suspenders).
 /// A snapshot missing the ref/namespace (a pre-provision delete) is a no-op.
@@ -539,11 +915,11 @@ async fn delete_connection_secret(
     let api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), ns, &secret_ar());
     match api.delete(secret, &DeleteParams::default()).await {
         Ok(_) => {
-            info!(secret = %secret, %ns, "dragonfly connection Secret deleted");
+            info!(secret = %secret, %ns, "claim connection Secret deleted");
             Ok(())
         }
         Err(kube::Error::Api(e)) if e.code == 404 => {
-            info!(secret = %secret, "dragonfly connection Secret already gone — delete no-op");
+            info!(secret = %secret, "claim connection Secret already gone — delete no-op");
             Ok(())
         }
         Err(e) => Err(e.into()),
@@ -805,19 +1181,39 @@ pub enum GcBackend {
     Dragonfly,
     /// The 2.6b disk drop (delete the unowned RWO PVC + the snapshot).
     Disk,
+    /// The 2.5e NATS/jetstream drop (ADR 0061 §8: sweep the app's streams
+    /// as `mgr_<ns>`, delete its NACK CRs, drop the user, re-derive the
+    /// accounts file, and take the account down with the last claim).
+    Nats,
 }
 
-/// Route a snapshot's `spec.backend` to its reclaim path. Only `dragonfly`
-/// selects the dragonfly drop; EVERYTHING else (including the empty string
-/// on legacy pre-2.6 snapshots that predate the multi-backend split, and
-/// the `cloudnative-pg` value) defaults to the CNPG path — matching the
-/// snapshot writer's default and never mis-routing a CNPG snapshot to the
-/// dragonfly path (which would no-op on the absent dragonfly fields).
+/// Route a snapshot's `spec.backend` to its reclaim path.
+///
+/// **Routed through [`Backend::from_spec_backend`] and matched
+/// EXHAUSTIVELY, deliberately.** This function used to be
+/// `match backend { "dragonfly" => …, "disk" => …, _ => Cnpg }`, and that
+/// catch-all is how a jetstream snapshot (`backend: "nats"`) silently got
+/// the CloudNativePG reclaim: `ensure: absent` written to a CNPG
+/// `Database` named after the jetstream claim, a CNPG role RMW, both
+/// aimed at `nats-system`, and nothing NATS-side reclaimed at all
+/// (observed in the 2.5e walk). Nothing in the old shape distinguished
+/// "deliberately defaults to CNPG" from "nobody added an arm". Going
+/// through the `Backend` enum makes a NEW backend variant a COMPILE
+/// error here rather than a silent CNPG routing — earlier than a test
+/// could catch it, and impossible to miss.
+///
+/// The two cases that genuinely DO default to CNPG stay explicit:
+/// `SharedDisk` (a reference claim that owns no backing and never
+/// snapshots at all, so this is unreachable rather than meaningful) and
+/// `None` — an unknown or empty `spec.backend`, which covers both legacy
+/// pre-2.6 snapshots predating the multi-backend split and the
+/// documented "type, not backend" case (`gc_backend("redis")`).
 pub fn gc_backend(backend: &str) -> GcBackend {
-    match backend {
-        "dragonfly" => GcBackend::Dragonfly,
-        "disk" => GcBackend::Disk,
-        _ => GcBackend::Cnpg,
+    match Backend::from_spec_backend(backend) {
+        Some(Backend::Dragonfly) => GcBackend::Dragonfly,
+        Some(Backend::Disk) => GcBackend::Disk,
+        Some(Backend::Nats) => GcBackend::Nats,
+        Some(Backend::Cloudnativepg) | Some(Backend::SharedDisk) | None => GcBackend::Cnpg,
     }
 }
 
@@ -1294,6 +1690,234 @@ mod tests {
         // mis-routed to the (no-op-on-CNPG-fields) dragonfly path.
         assert_eq!(gc_backend(""), GcBackend::Cnpg);
         assert_eq!(gc_backend("redis"), GcBackend::Cnpg); // type, not backend
+                                                          // 2.5e (walk-found): a jetstream snapshot routes to the NATS drop.
+                                                          // Before this arm existed it hit the `_ => Cnpg` catch-all and got
+                                                          // the CloudNativePG reclaim — `ensure: absent` written to a CNPG
+                                                          // `Database` named after the jetstream claim, and a CNPG role RMW,
+                                                          // both aimed at `nats-system`. Nothing NATS-side was reclaimed.
+        assert_eq!(gc_backend("nats"), GcBackend::Nats);
+    }
+
+    #[test]
+    fn gc_dispatch_is_exhaustive_over_every_known_backend() {
+        // The structural half of the fix, and the reason `gc_backend` now
+        // routes through `Backend::from_spec_backend` instead of matching
+        // raw strings with a `_` arm: a NEW `Backend` variant is a COMPILE
+        // error in `gc_backend`, not a silent CNPG routing. This test
+        // pins the OTHER direction — that every variant that exists today
+        // is genuinely reachable from a `spec.backend` string, so the
+        // exhaustive match is over real inputs rather than over an enum
+        // nothing produces.
+        for (spec_backend, expected) in [
+            ("cloudnative-pg", GcBackend::Cnpg),
+            ("dragonfly", GcBackend::Dragonfly),
+            ("disk", GcBackend::Disk),
+            ("nats", GcBackend::Nats),
+            // `shared-disk` reference claims never snapshot at all
+            // (`snapshot_retained_claim` returns early), so this routing
+            // is unreachable rather than meaningful — pinned so a future
+            // reader does not mistake it for a decision.
+            ("shared-disk", GcBackend::Cnpg),
+        ] {
+            assert_eq!(
+                gc_backend(spec_backend),
+                expected,
+                "{spec_backend} routed wrongly"
+            );
+        }
+    }
+
+    // --- nats_sweep_plan (2.5e, ADR 0061 §8) --------------------------
+
+    fn stream(name: &str, subjects: &[&str]) -> nats_client::StreamSummary {
+        nats_client::StreamSummary {
+            name: name.to_string(),
+            subjects: subjects.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn the_sweep_deletes_the_departing_apps_own_declared_streams() {
+        let streams = vec![stream("feeder_blocks", &["feeder.blocks.>"])];
+        let plan = nats_sweep_plan(&streams, "feeder", &["feeder_blocks".into()], &[]);
+        assert_eq!(plan.sweep, vec!["feeder_blocks".to_string()]);
+        assert!(plan.unattributed.is_empty());
+    }
+
+    #[test]
+    fn the_sweep_deletes_a_dynamic_stream_wholly_under_the_apps_prefix() {
+        let streams = vec![stream("whatever-name", &["feeder.a", "feeder.b.>"])];
+        let plan = nats_sweep_plan(&streams, "feeder", &[], &[]);
+        assert_eq!(
+            plan.sweep,
+            vec!["whatever-name".to_string()],
+            "the rule keys on SUBJECTS — the name is unconstrained and \
+             carries no ownership information at all"
+        );
+    }
+
+    #[test]
+    fn the_sweep_leaves_a_mixed_subject_stream_and_reports_it() {
+        // ADR 0061 §8: "leaving mixed-subject streams reported as
+        // unattributed". This is the half that must NOT be deleted — a
+        // stream capturing a neighbour's subjects alongside ours is not
+        // ours to remove.
+        let streams = vec![stream("capture", &["feeder.a", "indexer.b"])];
+        let plan = nats_sweep_plan(&streams, "feeder", &[], &[]);
+        assert!(plan.sweep.is_empty(), "{plan:?}");
+        assert_eq!(plan.unattributed, vec!["capture".to_string()]);
+    }
+
+    #[test]
+    fn the_sweep_ignores_a_stream_with_no_subject_of_ours_at_all() {
+        // Not ours in any sense — leave it and do NOT report it, or every
+        // GC in a busy namespace logs every neighbour's stream.
+        let streams = vec![stream("neighbour", &["indexer.a", "indexer.b"])];
+        let plan = nats_sweep_plan(&streams, "feeder", &[], &[]);
+        assert_eq!(plan, NatsSweep::default());
+    }
+
+    #[test]
+    fn the_sweep_never_touches_a_neighbours_declared_stream() {
+        // "excluding declared streams, whatever their owner" — and the
+        // case that makes it load-bearing: a neighbour DECLARED a stream
+        // whose subjects happen to sit wholly under the departing app's
+        // prefix (one-sided fan-in, which ADR 0061 explicitly supports).
+        // The subject rule alone would sweep it; `protected` is what
+        // stops that.
+        let streams = vec![stream("indexer_fanin", &["feeder.blocks.>"])];
+        let plan = nats_sweep_plan(&streams, "feeder", &[], &["indexer_fanin".into()]);
+        assert_eq!(plan, NatsSweep::default());
+    }
+
+    #[test]
+    fn the_sweep_does_not_confuse_apps_whose_names_share_a_prefix() {
+        // `feeder.` does not prefix `feederbot.orders`. Without the
+        // separating dot this test is the only thing between a
+        // `feeder` deletion and `feederbot`'s data.
+        let streams = vec![stream("bot", &["feederbot.orders.>"])];
+        let plan = nats_sweep_plan(&streams, "feeder", &[], &[]);
+        assert_eq!(plan, NatsSweep::default());
+    }
+
+    #[test]
+    fn a_subjectless_stream_is_reported_never_swept() {
+        // A mirror or a sourced stream has no subjects of its own. The
+        // rule keys on subjects, so it has no evidence — and "no
+        // evidence" must not collapse to "wholly under our prefix" the
+        // way a naive `.all()` over an empty slice would.
+        let streams = vec![stream("mirror", &[])];
+        let plan = nats_sweep_plan(&streams, "feeder", &[], &[]);
+        assert!(plan.sweep.is_empty(), "{plan:?}");
+        assert_eq!(plan.unattributed, vec!["mirror".to_string()]);
+    }
+
+    #[test]
+    fn an_empty_app_disables_the_dynamic_sweep_entirely() {
+        // A claim deleted after its declaring Application ownerReference
+        // was already gone snapshots with an empty `natsApp`. The prefix
+        // would then be a bare "." — matching nothing useful, but the
+        // failure mode of guessing is deleting another tenant's data, so
+        // the sweep is skipped and only explicitly-declared streams go.
+        let streams = vec![
+            stream("someone", &[".odd.subject"]),
+            stream("declared", &["x.y"]),
+        ];
+        let plan = nats_sweep_plan(&streams, "", &["declared".into()], &[]);
+        assert_eq!(plan.sweep, vec!["declared".to_string()]);
+        assert!(plan.unattributed.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn the_last_claim_in_a_namespace_takes_the_whole_account_with_it() {
+        // ADR 0061 §8: "the account goes with its store." Once the
+        // account is removed from the accounts file, anything left in it
+        // is unreachable forever but still occupies the shared JetStream
+        // PVC — a silent capacity leak with no owner left to attribute it
+        // to. So the last claim sweeps EVERYTHING, including streams the
+        // per-application rules would have left alone: a mixed-subject
+        // stream, and one with no subject of the departing app's at all.
+        let streams = vec![
+            stream("capture", &["feeder.a", "indexer.b"]),
+            stream("orphan", &["indexer.only"]),
+            stream("feeder_blocks", &["feeder.blocks.>"]),
+        ];
+        let plan = nats_sweep_for(&streams, "feeder", &["feeder_blocks".into()], &[], false);
+        assert_eq!(
+            plan.sweep,
+            vec![
+                "capture".to_string(),
+                "feeder_blocks".to_string(),
+                "orphan".to_string()
+            ]
+        );
+        assert!(
+            plan.unattributed.is_empty(),
+            "with no live claim left in the namespace there is no one to \
+             report an unattributed stream TO: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn a_namespace_that_still_has_a_claim_keeps_the_per_application_rules() {
+        // The other half, and the one that makes the override safe: while
+        // ANY live jetstream claim remains in the namespace, a neighbour
+        // may own what is left, so the attribution rules apply unchanged.
+        // Same fixture as above — every assertion here is the opposite of
+        // the one above, which is the point.
+        let streams = vec![
+            stream("capture", &["feeder.a", "indexer.b"]),
+            stream("orphan", &["indexer.only"]),
+            stream("feeder_blocks", &["feeder.blocks.>"]),
+        ];
+        let plan = nats_sweep_for(&streams, "feeder", &["feeder_blocks".into()], &[], true);
+        assert_eq!(plan.sweep, vec!["feeder_blocks".to_string()]);
+        assert_eq!(plan.unattributed, vec!["capture".to_string()]);
+    }
+
+    #[test]
+    fn protected_stream_names_composes_only_this_namespaces_declarations() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
+        use operator_core::{JetStreamStream, ResourceClaimJetStream, ResourceClaimSpec};
+        let mk = |ns: &str, claim: &str, app: &str, stream: &str| ResourceClaim {
+            metadata: ObjectMeta {
+                name: Some(claim.to_string()),
+                namespace: Some(ns.to_string()),
+                owner_references: Some(vec![OwnerReference {
+                    api_version: "apprafter.io/v1alpha1".into(),
+                    kind: "Application".into(),
+                    name: app.into(),
+                    uid: "u".into(),
+                    controller: Some(true),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            spec: ResourceClaimSpec {
+                type_: "jetstream".into(),
+                jetstream: Some(ResourceClaimJetStream {
+                    streams: vec![JetStreamStream {
+                        name: stream.into(),
+                        subjects: vec![format!("{app}.x")],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            status: None,
+        };
+        let claims = vec![
+            mk("demo", "feeder-jetstream", "feeder", "blocks"),
+            mk("demo", "indexer-jetstream", "indexer", "fanin"),
+            mk("other", "solo-jetstream", "solo", "elsewhere"),
+        ];
+        assert_eq!(
+            protected_stream_names(&claims, "demo"),
+            vec!["feeder_blocks".to_string(), "indexer_fanin".to_string()],
+            "another NAMESPACE's declarations are a different account \
+             entirely and must not leak into this one's protected set"
+        );
     }
 
     // --- disk GC live-guard (2.6b-5 / 2.4f Fix A) ---
