@@ -1764,23 +1764,44 @@ compatibility: "0.2.69": {
 	change:          "safe"
 	operatorVersion: "v0.2.49"
 	notes: """
-		`needs.jetstream` schema layer — 2.5 part 1 of 4, ADR 0061. The
-		grammar, the CRD, the kube-rs mirror and the admission rules ship;
-		NO provisioner backend does. A jetstream claim still never leaves
-		`AwaitingResourceClaim`, exactly as before this version, and
-		`shipped.rs` still classifies the need `Declared`. Nothing about
-		the delivery path changes.
+		`needs.jetstream` — the WHOLE 2.5 vertical, ADR 0061. All four
+		parts landed on this one unbumped version, so this entry covers
+		the schema layer, the NATS components, the provisioner backend and
+		the gating together. A jetstream claim provisions and reaches
+		`Ready` on this version; `shipped.rs` classifies the need
+		`Shipped`.
 
-		ONE NARROWING, and it is the only reason this entry needs reading.
-		`needs.jetstream` was `x-kubernetes-preserve-unknown-fields: true`
+		THE DELIVERY PATH CHANGES, which earlier drafts of this entry
+		denied. New in the chart: `nats-system` (namespaces.cue, wave
+		-30, shipped unconditionally); `component_nats.cue` — the ONLY
+		component that ships `enabled: false`, turned on by the
+		resourceclaim-provisioner merge-patching
+		`PlatformStack.spec.overrides.nats.enabled` on the first matched
+		jetstream claim, so a cluster that never declares the need pays
+		nothing; `component_nack.cue` (the JetStream CRD controller); and
+		the `jetstream-integrated` `ServiceProvider` seed
+		(service_providers.cue) carrying the size→bytes table, the
+		per-namespace quota ceiling and the capture policy. The NATS
+		server image is pinned to 2.14.3-alpine independently of the
+		chart pin — ADR 0061 §4.2/§4.4's facts are facts about that one
+		server version.
+
+		A cluster that declares `needs.jetstream` therefore gains a
+		StatefulSet with a 5Gi `local-path` PVC and a 384Mi Guaranteed
+		pod. On a Tier-1 node that is a real reservation, taken only on
+		first use.
+
+		ONE NARROWING, and it is the reason the schema half of this entry
+		needs reading. `needs.jetstream` was
+		`x-kubernetes-preserve-unknown-fields: true`
 		— the CRD stored any shape under that key — and becomes a typed
 		schema. Keys outside `#JetStreamNeed` are therefore pruned on the
 		next write of an existing object. That is only reachable for an
-		Application that already declares `needs.jetstream`, which has
-		never been provisionable: such an app has been parked unready
-		since it was written, so there is no running workload to disturb.
-		It is classified `safe` on that basis, not because the schema is
-		unchanged.
+		Application that already declares `needs.jetstream`, which was
+		never provisionable BEFORE this version: such an app has been
+		parked unready since it was written, so there is no running
+		workload to disturb. It is classified `safe` on that basis, not
+		because the schema is unchanged.
 
 		Also newly rejected, all confined to `needs.jetstream`:
 		`persistent` and `name` (declared in the schema SOLELY so the
@@ -1792,6 +1813,16 @@ compatibility: "0.2.69": {
 		colliding with one of the same application's stream names; and an
 		Application whose own `metadata.name` is not a DNS-1123 label
 		while it declares `needs.jetstream`.
+
+		One more rejection, the only one that can refuse a manifest which
+		was legal and SILENT before: a per-environment override of
+		`needs.jetstream` that omits `streams`/`consume` while `base`
+		declares them. An environment override replaces the whole
+		`needs.<type>` slot, so `environments.prod.needs.jetstream:
+		{size: small}` used to drop the entire producer/consumer contract
+		for prod without a word (ADR 0061 §6). It is now refused, naming
+		what would have been lost; repeating the blocks, or an explicit
+		`streams: []`, expresses either intent.
 
 		Purely additive: `claim.jetstream.<field>` references now resolve
 		— `url`, `host`, `port`, `user`, `pass`, `account`,
