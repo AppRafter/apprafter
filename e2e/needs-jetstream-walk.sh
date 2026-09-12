@@ -671,7 +671,7 @@ spec:
       xlarge: 4294967296
     ceilingBytes: 4294967296
     # ADR 0061 §5's policy ladder, mirroring service_providers.cue's own
-    # value. `report` is the default and what ships; `delete` would have
+    # value. 'report' is the default and what ships; 'delete' would have
     # the provisioner remove a captured stream, which is exactly what
     # acceptance #10 below must NOT have happen while it is looking.
     capturePolicy: report
@@ -846,7 +846,7 @@ jetstream:
   # value in this file that the part-3 criteria actually depend on.
   # Without --crd-connect, nack IGNORES spec.account on every Stream and
   # Consumer (so the provisioner's Account CR is never consulted and
-  # every declared stream lands `Errored`) AND opens a global connection
+  # every declared stream lands 'Errored') AND opens a global connection
   # at startup that the server rejects the moment an accounts file
   # exists. See component_nack.cue's own comment for both measurements.
   additionalArgs:
@@ -1210,12 +1210,12 @@ spec:
           - name: orders
             subjects: ["streamapp.orders.>"]
             # 256Mi, NOT 1Gi — and the number is arithmetic, not taste.
-            # Every claim in this namespace defaults to size `small`
+            # Every claim in this namespace defaults to size 'small'
             # (268435456 B, the seeded sizeBytes above), and the account's
-            # max_file is the SUM over the namespace: 5 claims in `demo`
+            # max_file is the SUM over the namespace: 5 claims in 'demo'
             # => ~1.25Gi. Two 1Gi streams do not both fit, and the second
-            # is refused by nats-server with `insufficient storage
-            # resources available (10047)` — reproduced directly in podman.
+            # is refused by nats-server with 'insufficient storage
+            # resources available (10047)' — reproduced directly in podman.
             # The product handles that correctly (the claim stays unready
             # and now says so with NACK's own reason), but criteria 6 and 8
             # need BOTH streams to exist, so the fixture must not
@@ -1282,20 +1282,20 @@ spec:
         streams:
           - name: invoices
             subjects: ["streamapp2.invoices.>"]
-            # `workqueue`, and the retention is the POINT, not a detail:
-            # ADR 0061 §4.1's `sources` drain is destructive only against
-            # a workqueue origin, so `NamespaceDrainRisk` (acceptance #11)
+            # 'workqueue', and the retention is the POINT, not a detail:
+            # ADR 0061 §4.1's 'sources' drain is destructive only against
+            # a workqueue origin, so 'NamespaceDrainRisk' (acceptance #11)
             # has nothing to fire on without one. Also keeps criterion #8
             # honest — a workqueue deletes a message once ACKED, and
             # nothing consumes this stream, so the probe message stays.
             retention: workqueue
             # 256Mi, NOT 1Gi — and the number is arithmetic, not taste.
-            # Every claim in this namespace defaults to size `small`
+            # Every claim in this namespace defaults to size 'small'
             # (268435456 B, the seeded sizeBytes above), and the account's
-            # max_file is the SUM over the namespace: 5 claims in `demo`
+            # max_file is the SUM over the namespace: 5 claims in 'demo'
             # => ~1.25Gi. Two 1Gi streams do not both fit, and the second
-            # is refused by nats-server with `insufficient storage
-            # resources available (10047)` — reproduced directly in podman.
+            # is refused by nats-server with 'insufficient storage
+            # resources available (10047)' — reproduced directly in podman.
             # The product handles that correctly (the claim stays unready
             # and now says so with NACK's own reason), but criteria 6 and 8
             # need BOTH streams to exist, so the fixture must not

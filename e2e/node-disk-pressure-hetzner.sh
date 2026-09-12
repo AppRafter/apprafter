@@ -229,12 +229,12 @@ spec:
     image: nginxdemos/hello:plain-text
     replicas: 1
     needs:
-      # `mountPath` is REQUIRED and the claim name is derived from its last
-      # segment when `name` is omitted (schemas/v1alpha1/application.cue
-      # #DiskClaim). A first draft of this walk declared `size` alone and the
+      # 'mountPath' is REQUIRED and the claim name is derived from its last
+      # segment when 'name' is omitted (schemas/v1alpha1/application.cue
+      # #DiskClaim). A first draft of this walk declared 'size' alone and the
       # admission webhook rejected it — correctly, and on real hardware five
       # minutes into a paid run. Worth the note: the webhook is the only layer
-      # that enforces this, so `cue vet` would not have caught it either.
+      # that enforces this, so 'cue vet' would not have caught it either.
       disk:
         size: 1Gi
         mountPath: /data

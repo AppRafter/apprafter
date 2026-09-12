@@ -551,11 +551,11 @@ spec:
     needs:
       pg:
         selector: { tier: integrated }
-      # `persistent: true` is LOAD-BEARING here, and its absence made this walk
+      # 'persistent: true' is LOAD-BEARING here, and its absence made this walk
       # assert something impossible. An ephemeral redis claim holds nothing
       # durable by declaration (ADR 0042 §6), so the backup runner correctly
       # skips it — the first run to reach Phase 5 produced exactly two
-      # snapshots, `claim-0` (pg) and `commit`, against an expectation of
+      # snapshots, 'claim-0' (pg) and 'commit', against an expectation of
       # three. Phase 7 then checks that a redis KEY survives the restore, which
       # an ephemeral claim can never do. The walk's subject is the SEQUENTIAL
       # format across MULTIPLE claims, so the fix is to give it a second

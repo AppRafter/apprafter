@@ -28,6 +28,7 @@ lint:
     ./scripts/lint-cue.sh
     ./scripts/check-spdx-headers.sh
     ./scripts/check-no-cyrillic.sh
+    ./scripts/check-heredoc-backticks.sh
     ./scripts/docs-check.sh
     ./scripts/check-crd-structural.sh
     ./scripts/check-operator-version-bump.sh
