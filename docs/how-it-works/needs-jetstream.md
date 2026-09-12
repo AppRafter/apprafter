@@ -275,9 +275,11 @@ reader would otherwise assume from the pages around it.
 - **The storage ceiling is per namespace, not per cluster.** Two namespaces each
   sized near the ceiling can jointly promise more than the single shared volume
   behind them holds. The platform refuses to write an account file that promises
-  more than the volume has, so the over-promise never reaches the server — but
-  that refusal is recorded only in the platform's own log, not on the claims
-  involved.
+  more than the volume has, so the over-promise never reaches the server, and the
+  namespace that would not fit is held unready and told so on its own dependency,
+  naming the budget. Unlike the memory budget below, this one responds to a
+  smaller `size`: the promise is the sum of the live claims' sizes, so lowering
+  one anywhere in the cluster frees room here.
 - **Roughly three namespaces can use JetStream on a Solo node.** An account
   reserves memory on the shared server as well as storage, and the server has a
   fixed amount to give. The reservations are summed against it: a namespace that

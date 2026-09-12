@@ -608,15 +608,42 @@ memory store in the same change. Recorded because the coupling is invisible from
 either side: a later reader looking at the chart sees a memory store nothing
 obviously uses and removes it.
 
-**The ceilings are per-namespace, and nothing yet clamps the global sum.** The
-`#Size` mapping and its tier ceiling bound one namespace's account. N namespaces
-can therefore oversubscribe both the server's `max_memory_store` and the shared
-JetStream PVC. NATS does not crash on this — accounts simply compete for a total
-that was promised twice — which is worse than a refusal because it surfaces as an
-unattributable allocation failure in whichever tenant asks last. The provisioner is
-the right place to close it: it already derives the accounts file from the **whole**
-live claim set, so it can compute the global sum and refuse or clamp before
-writing. Open until part 2 does so.
+~~**The ceilings are per-namespace, and nothing yet clamps the global sum.**~~
+**Closed, both halves.** The `#Size` mapping and its tier ceiling bound one
+namespace's account. N namespaces can therefore oversubscribe both the server's
+`max_memory_store` and the shared JetStream PVC. NATS does not crash on this —
+accounts simply compete for a total that was promised twice — which is worse than
+a refusal because it surfaces as an unattributable allocation failure in whichever
+tenant asks last. The provisioner is the right place to close it: it already
+derives the accounts file from the **whole** live claim set, so it can compute the
+global sum and refuse or clamp before writing. ~~Open until part 2 does so.~~
+
+That is what it now does, on both axes, and the original reasoning above is why it
+refuses rather than clamps. `render_accounts_file` sums each namespace's
+already-clamped promise before rendering anything and returns
+`GlobalBudgetExceeded` (file, against `fileStore.pvc.size`) or
+`GlobalMemoryBudgetExceeded` (memory, against `memoryStore.maxSize`). No partial
+file is ever written, so the file already installed keeps serving every namespace
+on it. The claim that could not be fitted is held `Ready=False` with a reason of
+its own — `NatsStorageBudgetExceeded` or `NatsMemoryBudgetExceeded` — naming the
+budget in bytes.
+
+**Two reasons, deliberately, and the second one arrived late.** The file sum
+landed first and refused correctly but told no claim: it surfaced only in the
+controller's log, which is a milder version of the same unattributable failure
+this item was opened about. The memory sum then shipped with a condition, and the
+gap stopped being merely incomplete — an operator who has learned that an
+over-budget cluster announces itself reads the remaining silent axis as a
+different problem. They stay separate reasons because the remedies differ: a
+namespace's memory reservation is floored, so shrinking a declaration often frees
+none of it, while the file promise is the summed `size` of the live claims and
+lowering one genuinely does.
+
+The numbers themselves (5Gi, 192Mi) are unchanged and remain the Tier-1 fallbacks
+recorded in §3 — this item was about enforcement, not about the budget. What is
+now enforced is gated against its source: both constants are asserted equal to
+`component_nats.cue`'s own values, because an enforced ceiling copied out of a
+chart is strictly worse stale than absent.
 
 **Names** are collision-free by construction, in two distinct namespaces:
 

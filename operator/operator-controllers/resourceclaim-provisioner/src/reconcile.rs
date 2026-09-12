@@ -224,6 +224,34 @@ const REASON_JETSTREAM_QUOTA_EXCEEDED: &str = "QuotaExceeded";
 /// The MESSAGE says which one spoke.
 const REASON_NATS_MEMORY_BUDGET: &str = "NatsMemoryBudgetExceeded";
 
+/// `Ready=False` reason when the CLUSTER is out of JetStream FILE
+/// storage budget: every namespace account promises `max_file` out of the
+/// one shared server's JetStream volume, and their sum has to fit
+/// `component_nats.cue`'s `fileStore.pvc.size`
+/// ([`NATS_GLOBAL_BUDGET_BYTES_FALLBACK`]).
+///
+/// The sibling of [`REASON_NATS_MEMORY_BUDGET`], and deliberately NOT the
+/// same string. The refusal itself is older than that one (2.5d Task 8b)
+/// and shipped without any condition at all, surfacing only as a
+/// `Provisioning` error in the controller's log while the claim kept
+/// whatever reason it last had and never went ready. Once the memory axis
+/// started saying so, that silence became actively misleading rather than
+/// merely incomplete: an operator who has learned that an over-budget
+/// cluster announces itself reads a quiet claim as a different problem.
+///
+/// Two reasons rather than one shared "budget exceeded" because the
+/// remedies differ. Memory is floored per namespace
+/// ([`nats_accounts`]'s `ACCOUNT_MAX_MEM_FLOOR_BYTES`), so shrinking a
+/// declaration often cannot free any; file storage is the summed,
+/// ceiling-clamped `size` of the live claims, so lowering one genuinely
+/// does. A single reason could only ever recommend one of the two.
+///
+/// Also distinct from [`REASON_JETSTREAM_QUOTA_EXCEEDED`], which is ONE
+/// account's own declared streams against ITS OWN quota. This one is
+/// cluster-wide, so — exactly as on the memory axis — the claim carrying
+/// it need not be the claim that pushed the cluster over.
+const REASON_NATS_STORAGE_BUDGET: &str = "NatsStorageBudgetExceeded";
+
 /// Reporter identity stamped onto every Kubernetes Event this controller
 /// publishes (2.5f — the `ForeignSubjectCapture` event ADR 0061 §5 pairs
 /// with the condition). Visible in `kubectl describe resourceclaim` under
@@ -1370,6 +1398,87 @@ fn nats_verify_failure_condition(
     }
 }
 
+/// Classify a REFUSED accounts-file render: which failures the claim gets
+/// told about, and which stay controller-log noise.
+///
+/// Pure, and separate from the `map_err` that calls it, so the mapping is
+/// testable without a cluster — the same reason
+/// [`nats_verify_failure_condition`] is its own function. The pairing
+/// matters: getting the arm wrong (a file overrun classified as the
+/// memory one) produces a claim that names the wrong budget and sends an
+/// operator after the wrong remedy, which is a worse outcome than the
+/// silence this whole change replaces.
+///
+/// Both global-budget refusals map to a variant `provision_nats` turns
+/// into a condition. Everything else — an empty password, an account with
+/// no users — stays [`ReconcileError::Provisioning`]: those are platform
+/// bugs with nothing an operator could do about them from a manifest, and
+/// a condition telling a tenant about one would be noise on their claim.
+fn accounts_render_refusal(e: nats_accounts::AccountsFileError) -> ReconcileError {
+    match e {
+        e @ nats_accounts::AccountsFileError::GlobalMemoryBudgetExceeded { .. } => {
+            ReconcileError::NatsMemoryBudget(e.to_string())
+        }
+        e @ nats_accounts::AccountsFileError::GlobalBudgetExceeded { .. } => {
+            ReconcileError::NatsStorageBudget(e.to_string())
+        }
+        e => ReconcileError::Provisioning(format!("rendering nats-accounts: {e}")),
+    }
+}
+
+/// The `Ready=False` (reason, message) a refused accounts-file render
+/// deserves, or `None` when the error is not one a claim should carry —
+/// in which case the caller propagates it unchanged.
+///
+/// Pure for the same reason [`nats_verify_failure_condition`] is: the
+/// alternative is a choice that can only be checked on a cluster whose
+/// NATS budgets are already exhausted.
+///
+/// The two budgets get two messages, not one parameterised by which
+/// number blew. They share a shape — name the budget, say the file was
+/// not written, say who is unaffected — and differ exactly where the
+/// remedy differs, which is the part an operator acts on. See
+/// [`REASON_NATS_STORAGE_BUDGET`] for why that difference is real rather
+/// than cosmetic.
+fn nats_budget_refusal_condition(e: &ReconcileError) -> Option<(&'static str, String)> {
+    match e {
+        // The cluster is out of JetStream memory budget, so the file the
+        // server would have to load is one it cannot fully honour — and
+        // the render was refused BEFORE it was written, which is what
+        // keeps every namespace already on the installed file working.
+        ReconcileError::NatsMemoryBudget(detail) => Some((
+            REASON_NATS_MEMORY_BUDGET,
+            format!(
+                "the shared NATS server has no JetStream memory budget left for this \
+                 namespace's account: {detail}. Every namespace with a jetstream claim \
+                 reserves memory on the one server, so the remedy is to remove a \
+                 jetstream namespace (or move to a larger tier) — not to change this \
+                 application's declaration. The accounts file was NOT written, so every \
+                 namespace already on the server keeps working."
+            ),
+        )),
+        // The file-storage twin. Same refusal, same preserved-file
+        // guarantee, different remedy: `max_file` is the summed,
+        // ceiling-clamped `size` of the live claims, so lowering a `size`
+        // somewhere in the cluster genuinely frees budget here — which it
+        // frequently cannot on the memory axis, where a per-namespace
+        // floor holds the reservation up.
+        ReconcileError::NatsStorageBudget(detail) => Some((
+            REASON_NATS_STORAGE_BUDGET,
+            format!(
+                "the shared NATS server has no JetStream disk budget left for this \
+                 namespace's account: {detail}. Every namespace with a jetstream claim \
+                 is promised part of the one server's volume, so the namespace named on \
+                 this claim need not be the one that filled it: lower a `size` on a \
+                 jetstream need anywhere in the cluster, remove a jetstream namespace, \
+                 or move to a larger tier. The accounts file was NOT written, so every \
+                 namespace already on the server keeps working."
+            ),
+        )),
+        _ => None,
+    }
+}
+
 /// Whether ONE applied NACK object (`Stream` or `Consumer`) is reported
 /// live by the nack controller: `status.conditions[type=Ready].status ==
 /// "True"`.
@@ -1738,17 +1847,9 @@ pub(crate) async fn reconcile_accounts_secret(
         NATS_MEMORY_BUDGET_BYTES_FALLBACK,
         &|user| passwords.get(user).cloned().unwrap_or_default(),
     )
-    .map_err(|e| match e {
-        // The one render refusal a CLAIM is told about rather than only
-        // the log — see `ReconcileError::NatsMemoryBudget`'s own doc.
-        // Every other variant stays a `Provisioning` error: an empty
-        // password or an empty account is a platform bug with nothing an
-        // operator could do about it from a manifest.
-        e @ nats_accounts::AccountsFileError::GlobalMemoryBudgetExceeded { .. } => {
-            ReconcileError::NatsMemoryBudget(e.to_string())
-        }
-        e => ReconcileError::Provisioning(format!("rendering nats-accounts: {e}")),
-    })?;
+    // Which refusals a CLAIM is told about rather than only the log, and
+    // which stay log-only — see `accounts_render_refusal`'s own doc.
+    .map_err(accounts_render_refusal)?;
 
     let secret_api: Api<DynamicObject> =
         Api::namespaced_with(ctx.client.clone(), nats_ns, &secret_ar());
@@ -1904,29 +2005,17 @@ async fn provision_nats(
         .unwrap_or_default();
 
     if let Err(e) = reconcile_accounts_secret(ctx, &nats_ns, ceiling_bytes, &size_bytes).await {
-        // The cluster is out of JetStream memory budget, so the file the
-        // server would have to load is one it cannot fully honour — and
-        // the render was refused BEFORE it was written, which is what
-        // keeps every namespace already on the installed file working.
-        // Say so on the claim: the alternative (propagating the error)
-        // leaves this claim sitting at whatever reason it last had, with
-        // the real cause visible only in the controller's log.
-        let ReconcileError::NatsMemoryBudget(detail) = &e else {
+        // A global budget is exhausted, so the file the server would have
+        // to load is one it cannot fully honour — and the render was
+        // refused BEFORE it was written, which is what keeps every
+        // namespace already on the installed file working. Say so on the
+        // claim: the alternative (propagating the error) leaves this
+        // claim sitting at whatever reason it last had, with the real
+        // cause visible only in the controller's log.
+        let Some((reason, message)) = nats_budget_refusal_condition(&e) else {
             return Err(e);
         };
-        let cond = ready_condition(
-            "False",
-            REASON_NATS_MEMORY_BUDGET,
-            &format!(
-                "the shared NATS server has no JetStream memory budget left for this \
-                 namespace's account: {detail}. Every namespace with a jetstream claim \
-                 reserves memory on the one server, so the remedy is to remove a \
-                 jetstream namespace (or move to a larger tier) — not to change this \
-                 application's declaration. The accounts file was NOT written, so every \
-                 namespace already on the server keeps working.",
-            ),
-            &prior,
-        );
+        let cond = ready_condition("False", reason, &message, &prior);
         patch_status(&ctx.client, ns, name, cond, ClaimStatusFields::default()).await?;
         return Ok(Action::requeue(Duration::from_secs(60)));
     }
@@ -5145,6 +5234,101 @@ mod tests {
         assert!(
             msg.contains("waiting will not clear this"),
             "a permanent condition must say it is permanent: {msg}"
+        );
+    }
+
+    // --- nats_budget_refusal_condition: which refused render the claim
+    // is told about, and in whose words ------------------------------
+    //
+    // Both axes go through `accounts_render_refusal` first, so these
+    // cover the classification as well as the wording: an arm pointed at
+    // the wrong variant fails here exactly as a wrong reason does.
+
+    #[test]
+    fn a_memory_budget_refusal_names_the_memory_budget_not_the_disk_one() {
+        let err = accounts_render_refusal(
+            nats_accounts::AccountsFileError::GlobalMemoryBudgetExceeded {
+                total: 248_302_796,
+                budget: NATS_MEMORY_BUDGET_BYTES_FALLBACK,
+            },
+        );
+        let (reason, msg) = nats_budget_refusal_condition(&err)
+            .expect("a memory-budget refusal must reach the claim, not only the log");
+        assert_eq!(reason, REASON_NATS_MEMORY_BUDGET);
+        assert!(
+            msg.contains(&NATS_MEMORY_BUDGET_BYTES_FALLBACK.to_string()),
+            "the message must name the budget it is measured against: {msg}"
+        );
+        assert!(
+            !msg.contains("disk"),
+            "the two budgets have different remedies, so neither may be described in \
+             the other's terms: {msg}"
+        );
+        assert!(
+            msg.contains("NOT written"),
+            "the message must say the installed file survived, which is why every \
+             other namespace keeps working: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_file_budget_refusal_names_the_disk_budget_not_the_memory_one() {
+        // The asymmetry this change closes. This refusal shipped first
+        // and had no condition at all: it surfaced as a `Provisioning`
+        // error in the log while the claim sat on a stale reason. Once
+        // the memory axis started announcing itself, that silence stopped
+        // being merely incomplete and became a wrong diagnosis by
+        // omission — the one over-budget cluster that says nothing.
+        let err = accounts_render_refusal(nats_accounts::AccountsFileError::GlobalBudgetExceeded {
+            total: 6_442_450_944,
+            budget: NATS_GLOBAL_BUDGET_BYTES_FALLBACK,
+        });
+        let (reason, msg) = nats_budget_refusal_condition(&err)
+            .expect("a file-budget refusal must reach the claim, not only the log");
+        assert_eq!(reason, REASON_NATS_STORAGE_BUDGET);
+        assert_ne!(
+            reason, REASON_NATS_MEMORY_BUDGET,
+            "a disk overrun reported as a memory overrun sends an operator after \
+             memory it has plenty of: {msg}"
+        );
+        assert!(
+            msg.contains(&NATS_GLOBAL_BUDGET_BYTES_FALLBACK.to_string()),
+            "the message must name the budget it is measured against: {msg}"
+        );
+        assert!(
+            !msg.contains("memory"),
+            "the two budgets have different remedies, so neither may be described in \
+             the other's terms: {msg}"
+        );
+        assert!(
+            msg.contains("size"),
+            "unlike the memory axis, lowering a declared size genuinely frees this \
+             budget — the message is the only place an operator learns that: {msg}"
+        );
+        assert!(
+            msg.contains("NOT written"),
+            "the message must say the installed file survived, which is why every \
+             other namespace keeps working: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_render_refusal_no_operator_can_act_on_stays_out_of_the_claim() {
+        // An empty password is a platform bug, not a budget an operator
+        // provisioned too little of. Putting it on a tenant's claim would
+        // be noise they cannot act on, so it propagates as an error and
+        // stays in the controller's log — the behaviour every non-budget
+        // variant had before either condition existed.
+        let err = accounts_render_refusal(nats_accounts::AccountsFileError::EmptyPassword(
+            "claim_demo_feeder_jetstream".into(),
+        ));
+        assert!(
+            nats_budget_refusal_condition(&err).is_none(),
+            "only the two global-budget refusals are conditions: {err}"
+        );
+        assert!(
+            matches!(err, ReconcileError::Provisioning(_)),
+            "everything else keeps propagating as a provisioning error: {err}"
         );
     }
 

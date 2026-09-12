@@ -125,6 +125,24 @@ criterion turned up, in the same spirit and by the same route.
   finds no JetStream for its account reports the same reason rather than the
   reload message, which is the residual a fork could still reach.
 
+- **A cluster that runs out of JetStream storage budget now says so too.** The
+  file-storage sum has been refused since it shipped, and correctly — an
+  account file the server could only partly honour is never written, so the one
+  already installed keeps serving every namespace on it. But that refusal
+  reached no claim: it surfaced only in the platform's own log, and the claim
+  kept whatever reason it last had and quietly never went ready. Adding the
+  memory condition made that worse rather than leaving it merely incomplete,
+  because an operator who has learned that an over-budget cluster announces
+  itself will read the silent axis as a different problem entirely. The claim
+  is now held unready with `NatsStorageBudgetExceeded`, naming the promise and
+  the budget.
+
+  Two reasons, not one shared "budget exceeded", because the remedies differ: a
+  namespace's memory reservation has a floor, so shrinking a declaration often
+  frees none of it, while the storage promise is the summed `size` of the live
+  claims and lowering one anywhere in the cluster genuinely does. Neither budget
+  number moved.
+
 - **`needs.jetstream` now opens the network path to the message server.** The
   connection-target catalog (`default_target`, ADR 0045 §B) had arms for `pg`
   and `redis` and a catch-all that returned nothing, so a `needs.jetstream`

@@ -243,6 +243,25 @@ pub enum ReconcileError {
     /// condition.
     #[error("nats memory budget: {0}")]
     NatsMemoryBudget(String),
+    /// The same refusal as [`Self::NatsMemoryBudget`], over the OTHER
+    /// budget the accounts file is bounded by: the namespace accounts
+    /// jointly promise more `max_file` than the shared NATS server's
+    /// JetStream volume holds, so `nats_accounts::render_accounts_file`
+    /// refused to produce the file at all.
+    ///
+    /// Its own variant for the same reason that one has one — a claim an
+    /// operator must act on should be TOLD, not left at a stale reason
+    /// while the cause lives in the controller log — and SEPARATE from it
+    /// because the two name different chart facts with different remedies
+    /// (`fileStore.pvc.size` vs `memoryStore.maxSize` in
+    /// `component_nats.cue`). This axis shipped its refusal first
+    /// (2.5d Task 8b) and went a release without a condition; the memory
+    /// axis then added one, which left an operator who had learned that an
+    /// over-budget cluster SAYS SO free to misread this silence as
+    /// something else entirely. Closing that asymmetry is the whole
+    /// content of this variant.
+    #[error("nats storage budget: {0}")]
+    NatsStorageBudget(String),
 }
 
 /// Spawn the ResourceClaim provisioner Controller.
