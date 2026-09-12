@@ -404,6 +404,35 @@ pub enum AccountsFileError {
         "refusing to render: total quota across all namespaces ({total} bytes) exceeds the platform-wide budget ({budget} bytes)"
     )]
     GlobalBudgetExceeded { total: u64, budget: u64 },
+    /// The same refusal as [`Self::GlobalBudgetExceeded`], over the OTHER
+    /// resource each account block promises: `max_mem`
+    /// ([`account_max_mem_bytes`]) against the server's own
+    /// `max_memory_store`. Its own variant rather than a flag on that one
+    /// because the two name different chart facts and have different
+    /// remedies — `fileStore.pvc.size` vs `memoryStore.maxSize` in
+    /// `component_nats.cue`, and the collapsed form could only ever report
+    /// one of them.
+    ///
+    /// `component_nats.cue` predicted this failure would be LOUD: "the
+    /// server would then fail to (re)start on the next accounts-file
+    /// write, cluster-wide." Measured on the SIGHUP RELOAD path (podman,
+    /// nats-server 2.14.3) it is quiet and worse. The server logs
+    /// `Error enabling jetstream on configured accounts: insufficient
+    /// memory resources available (10028)`, prints
+    /// `Reloaded server configuration` anyway, and keeps running — with
+    /// JetStream missing from an ARBITRARY subset of the accounts in the
+    /// file, not merely from the new one: across three cold-reload runs of
+    /// the identical file, the enabling loop aborted at a different point
+    /// each time and left a different ONE of three previously-working
+    /// namespaces with JetStream (the accounts map iterates in Go's
+    /// randomised order). Their users still authenticate, so nothing
+    /// anywhere reports a failure. Refusing the render is what keeps that
+    /// file off the server: the previous file stays installed and every
+    /// namespace already on it keeps working.
+    #[error(
+        "refusing to render: total jetstream memory reservation across all namespaces ({total} bytes) exceeds the server's memory-store budget ({budget} bytes)"
+    )]
+    GlobalMemoryBudgetExceeded { total: u64, budget: u64 },
 }
 
 /// Floor under [`account_max_mem_bytes`]'s fraction: keeps a namespace
@@ -438,6 +467,13 @@ const ACCOUNT_MAX_MEM_FRACTION_DIVISOR: u64 = 10;
 /// considered budget: part 2 makes this tier-aware, sourced from the
 /// `jetstream-integrated` seed's own memory reservation, and this
 /// function is what falls back until that lands.
+///
+/// This is a PER-ACCOUNT figure and bounds nothing on its own. The SUM of
+/// it across every namespace is what has to fit the server's
+/// `max_memory_store`, and that is checked in [`render_accounts_file`]
+/// against its `memory_budget_bytes` — see
+/// [`AccountsFileError::GlobalMemoryBudgetExceeded`] for what the server
+/// does when it does not, which is not what the chart predicted.
 fn account_max_mem_bytes(total_file_quota_bytes: u64) -> u64 {
     (total_file_quota_bytes / ACCOUNT_MAX_MEM_FRACTION_DIVISOR).max(ACCOUNT_MAX_MEM_FLOOR_BYTES)
 }
@@ -627,6 +663,18 @@ fn render_account(
 ///   rendered, against the SUM of each namespace's ALREADY-clamped
 ///   `namespace_quota_bytes` — the actual promises the file is about to
 ///   make, not the raw pre-clamp requests.
+/// - `memory_budget_bytes` bounds the same sum over the OTHER resource
+///   each account block promises — [`account_max_mem_bytes`] against the
+///   server's `max_memory_store`. Deliberately the same SHAPE as the file
+///   budget above, down to refusing rather than clamping, because the
+///   failure it prevents is worse: an over-budget FILE promise is at
+///   least reported by nats-server when an account runs out; an
+///   over-budget MEMORY promise makes the SIGHUP reload leave JetStream
+///   off for an arbitrary subset of accounts while it reports success
+///   (see [`AccountsFileError::GlobalMemoryBudgetExceeded`] for the
+///   measurement). Computed from the SAME ceiling-clamped per-namespace
+///   quota the file check uses, so both budgets bound the promises this
+///   render is about to write, not the raw requests behind them.
 ///
 /// `password` is injected rather than read (e.g. from a Kubernetes
 /// Secret) so this function stays pure — no client, no network, no clock
@@ -635,6 +683,7 @@ pub fn render_accounts_file(
     claims: &[ClaimView],
     namespace_ceiling_bytes: u64,
     global_budget_bytes: u64,
+    memory_budget_bytes: u64,
     password: &dyn Fn(&str) -> String,
 ) -> Result<String, AccountsFileError> {
     let mut by_namespace: BTreeMap<String, Vec<ClaimView>> = BTreeMap::new();
@@ -653,6 +702,22 @@ pub fn render_accounts_file(
         return Err(AccountsFileError::GlobalBudgetExceeded {
             total: global_total,
             budget: global_budget_bytes,
+        });
+    }
+
+    // The memory equivalent, in the same place and the same shape: each
+    // namespace's `max_mem` is `account_max_mem_bytes` OF ITS CLAMPED FILE
+    // QUOTA — exactly what `render_account` is about to write — so this
+    // sums the same promises rather than re-deriving them from the raw
+    // `quota_bytes`.
+    let memory_total: u64 = by_namespace
+        .values()
+        .map(|peers| account_max_mem_bytes(namespace_quota_bytes(peers, namespace_ceiling_bytes)))
+        .sum();
+    if memory_total > memory_budget_bytes {
+        return Err(AccountsFileError::GlobalMemoryBudgetExceeded {
+            total: memory_total,
+            budget: memory_budget_bytes,
         });
     }
 
@@ -1017,8 +1082,10 @@ mod tests {
     fn renders_one_account_per_namespace_with_a_user_per_claim() {
         let mut claims = ns_with_two_apps();
         claims.push(claim("other", "solo"));
-        let out = render_accounts_file(&claims, u64::MAX, u64::MAX, &|u| format!("pw-{u}"))
-            .expect("renders");
+        let out = render_accounts_file(&claims, u64::MAX, u64::MAX, u64::MAX, &|u| {
+            format!("pw-{u}")
+        })
+        .expect("renders");
         assert!(out.contains("ns_demo: {"), "{out}");
         assert!(out.contains("ns_other: {"), "{out}");
         assert!(
@@ -1052,7 +1119,7 @@ mod tests {
         // it sits inside `accounts: { ... }`. That is precisely why the
         // whole existing suite passed while this shipped broken; this is
         // a STRUCTURAL assertion, deliberately independent of it.
-        let out = render_accounts_file(&ns_with_two_apps(), u64::MAX, u64::MAX, &|u| {
+        let out = render_accounts_file(&ns_with_two_apps(), u64::MAX, u64::MAX, u64::MAX, &|u| {
             format!("pw-{u}")
         })
         .unwrap();
@@ -1071,7 +1138,7 @@ mod tests {
     fn the_management_user_keeps_inbox_access() {
         // NACK sets no custom inbox prefix; denying it `_INBOX.>` would stop
         // it making a single request (ADR 0061 §3).
-        let out = render_accounts_file(&ns_with_two_apps(), u64::MAX, u64::MAX, &|u| {
+        let out = render_accounts_file(&ns_with_two_apps(), u64::MAX, u64::MAX, u64::MAX, &|u| {
             format!("pw-{u}")
         })
         .unwrap();
@@ -1081,7 +1148,7 @@ mod tests {
 
     #[test]
     fn a_claim_user_subscribes_only_to_its_own_prefixes() {
-        let out = render_accounts_file(&ns_with_two_apps(), u64::MAX, u64::MAX, &|u| {
+        let out = render_accounts_file(&ns_with_two_apps(), u64::MAX, u64::MAX, u64::MAX, &|u| {
             format!("pw-{u}")
         })
         .unwrap();
@@ -1110,16 +1177,18 @@ mod tests {
         let mut b = a.clone();
         b.reverse();
         assert_eq!(
-            render_accounts_file(&a, u64::MAX, u64::MAX, &|u| format!("pw-{u}")).unwrap(),
-            render_accounts_file(&b, u64::MAX, u64::MAX, &|u| format!("pw-{u}")).unwrap(),
+            render_accounts_file(&a, u64::MAX, u64::MAX, u64::MAX, &|u| format!("pw-{u}")).unwrap(),
+            render_accounts_file(&b, u64::MAX, u64::MAX, u64::MAX, &|u| format!("pw-{u}")).unwrap(),
             "an unchanged derivation must compare equal so the write can be skipped"
         );
     }
 
     #[test]
     fn refuses_to_render_a_file_that_would_disable_authentication() {
-        let err = render_accounts_file(&ns_with_two_apps(), u64::MAX, u64::MAX, &|_| String::new())
-            .unwrap_err();
+        let err = render_accounts_file(&ns_with_two_apps(), u64::MAX, u64::MAX, u64::MAX, &|_| {
+            String::new()
+        })
+        .unwrap_err();
         assert!(err.to_string().contains("empty password"), "{err}");
     }
 
@@ -1133,7 +1202,7 @@ mod tests {
         // while that fixture stayed in place). This isolates the mgr-only
         // check: every claim user gets a real password, only `mgr_demo`'s
         // is empty.
-        let err = render_accounts_file(&ns_with_two_apps(), u64::MAX, u64::MAX, &|u| {
+        let err = render_accounts_file(&ns_with_two_apps(), u64::MAX, u64::MAX, u64::MAX, &|u| {
             if u == "mgr_demo" {
                 String::new()
             } else {
@@ -1151,7 +1220,7 @@ mod tests {
     fn refuses_to_render_when_only_a_claim_users_password_is_empty() {
         // Symmetric isolation for the per-claim check: mgr and every OTHER
         // claim user get a real password, only one claim user's is empty.
-        let err = render_accounts_file(&ns_with_two_apps(), u64::MAX, u64::MAX, &|u| {
+        let err = render_accounts_file(&ns_with_two_apps(), u64::MAX, u64::MAX, u64::MAX, &|u| {
             if u == "claim_demo_feeder_jetstream" {
                 String::new()
             } else {
@@ -1170,8 +1239,10 @@ mod tests {
         let mut claims = ns_with_two_apps();
         claims[0].quota_bytes = 1 << 30;
         claims[1].quota_bytes = 2 << 30;
-        let out =
-            render_accounts_file(&claims, u64::MAX, u64::MAX, &|u| format!("pw-{u}")).unwrap();
+        let out = render_accounts_file(&claims, u64::MAX, u64::MAX, u64::MAX, &|u| {
+            format!("pw-{u}")
+        })
+        .unwrap();
         assert!(out.contains("max_file: 3221225472"), "{out}");
     }
 
@@ -1188,8 +1259,10 @@ mod tests {
             c.quota_bytes = 10 * (1 << 30); // 10 GiB each, well above the floor
         }
         let total_quota: u64 = claims.iter().map(|c| c.quota_bytes).sum();
-        let out =
-            render_accounts_file(&claims, u64::MAX, u64::MAX, &|u| format!("pw-{u}")).unwrap();
+        let out = render_accounts_file(&claims, u64::MAX, u64::MAX, u64::MAX, &|u| {
+            format!("pw-{u}")
+        })
+        .unwrap();
         let max_mem: u64 = out
             .split("max_mem: ")
             .nth(1)
@@ -1214,8 +1287,10 @@ mod tests {
         for c in &mut claims {
             c.quota_bytes = 1024; // tiny — the fraction alone would be ~200 bytes
         }
-        let out =
-            render_accounts_file(&claims, u64::MAX, u64::MAX, &|u| format!("pw-{u}")).unwrap();
+        let out = render_accounts_file(&claims, u64::MAX, u64::MAX, u64::MAX, &|u| {
+            format!("pw-{u}")
+        })
+        .unwrap();
         let max_mem: u64 = out
             .split("max_mem: ")
             .nth(1)
@@ -1247,8 +1322,9 @@ mod tests {
         // regardless of which wrong formula a bad implementation used).
         let claims = vec![claim("demo", "a"), claim("demo", "b"), claim("demo", "c")];
         let ceiling = 2 * (1u64 << 30); // 2Gi; each claim defaults to 1Gi
-        let out = render_accounts_file(&claims, ceiling, u64::MAX, &|u| format!("pw-{u}"))
-            .expect("renders");
+        let out =
+            render_accounts_file(&claims, ceiling, u64::MAX, u64::MAX, &|u| format!("pw-{u}"))
+                .expect("renders");
         assert!(out.contains(&format!("max_file: {ceiling}")), "{out}");
     }
 
@@ -1260,9 +1336,10 @@ mod tests {
         // without any of the "exceeds the ceiling" tests noticing —
         // they only ever check the OVER case).
         let claims = ns_with_two_apps(); // demo: 2 claims, 1Gi each = 2Gi
-        let out =
-            render_accounts_file(&claims, 10 * (1u64 << 30), u64::MAX, &|u| format!("pw-{u}"))
-                .expect("renders");
+        let out = render_accounts_file(&claims, 10 * (1u64 << 30), u64::MAX, u64::MAX, &|u| {
+            format!("pw-{u}")
+        })
+        .expect("renders");
         assert!(
             out.contains(&format!("max_file: {}", 2 * (1u64 << 30))),
             "{out}"
@@ -1280,18 +1357,132 @@ mod tests {
         solo.quota_bytes = 3 * (1u64 << 30); // 3Gi
         claims.push(solo);
         let budget = 4 * (1u64 << 30);
-        let err =
-            render_accounts_file(&claims, u64::MAX, budget, &|u| format!("pw-{u}")).unwrap_err();
+        let err = render_accounts_file(&claims, u64::MAX, budget, u64::MAX, &|u| format!("pw-{u}"))
+            .unwrap_err();
         assert!(err.to_string().contains("platform-wide budget"), "{err}");
     }
 
     #[test]
     fn a_render_that_fits_the_global_budget_is_unaffected() {
         let claims = ns_with_two_apps(); // demo: 2 claims, 1Gi each = 2Gi
-        let out =
-            render_accounts_file(&claims, u64::MAX, 10 * (1u64 << 30), &|u| format!("pw-{u}"))
-                .expect("renders — the budget is not exceeded");
+        let out = render_accounts_file(&claims, u64::MAX, 10 * (1u64 << 30), u64::MAX, &|u| {
+            format!("pw-{u}")
+        })
+        .expect("renders — the budget is not exceeded");
         assert!(out.contains("ns_demo: {"), "{out}");
+    }
+
+    /// Three namespaces of 1Gi each: `max_mem` is 1Gi/10 apiece, so the
+    /// file promises 322122546 bytes of memory-store against a 192Mi
+    /// server ceiling — the exact shape `component_nats.cue`'s own comment
+    /// describes ("a FOURTH concurrent namespace at the floor, or fewer
+    /// namespaces asking for more, exceeds it") and the exact shape
+    /// nothing checked before this test existed.
+    ///
+    /// The assertion is on the NUMBERS, not only on the refusal: a check
+    /// that fired with a `total` computed off the wrong quota (pre-clamp,
+    /// say) would refuse the same renders for the wrong reason and report
+    /// a figure an operator cannot reconcile with the account blocks.
+    #[test]
+    fn refuses_to_render_when_the_summed_account_memory_exceeds_the_server_budget() {
+        let mut claims = Vec::new();
+        for ns in ["a", "b", "c"] {
+            let mut c = claim(ns, "app");
+            c.quota_bytes = 1u64 << 30; // 1Gi → max_mem 107374182
+            claims.push(c);
+        }
+        let budget = 192 * (1u64 << 20); // the chart's memoryStore.maxSize
+        let err = render_accounts_file(&claims, u64::MAX, u64::MAX, budget, &|u| format!("pw-{u}"))
+            .unwrap_err();
+        let AccountsFileError::GlobalMemoryBudgetExceeded { total, budget: got } = &err else {
+            panic!("expected GlobalMemoryBudgetExceeded, got {err:?}");
+        };
+        assert_eq!(*total, 3 * ((1u64 << 30) / 10));
+        assert_eq!(*got, budget);
+        assert!(
+            err.to_string().contains("memory-store budget"),
+            "the message must name the budget that was exceeded, not merely \
+             that something was: {err}"
+        );
+    }
+
+    /// The does-not-fire half. Deleting the memory check entirely leaves
+    /// the test above red and this one green — that asymmetry is the
+    /// point: this one fails instead if the check ever refuses a render
+    /// that fits (an inverted comparison, or a budget applied per-account
+    /// rather than to the sum).
+    #[test]
+    fn a_memory_reservation_that_fits_the_server_budget_is_unaffected() {
+        let mut claims = Vec::new();
+        for ns in ["a", "b", "c"] {
+            let mut c = claim(ns, "app");
+            c.quota_bytes = 1u64 << 30;
+            claims.push(c);
+        }
+        // The same three namespaces, one byte under the total they
+        // promise — the tightest budget that must still render.
+        let budget = 3 * ((1u64 << 30) / 10);
+        let out = render_accounts_file(&claims, u64::MAX, u64::MAX, budget, &|u| format!("pw-{u}"))
+            .expect("a sum EQUAL to the budget is within it, not over it");
+        assert!(out.contains("ns_a: {"), "{out}");
+        assert!(out.contains("ns_c: {"), "{out}");
+    }
+
+    /// The memory sum is taken over `account_max_mem_bytes`, which has a
+    /// FLOOR — so three namespaces too small to reach the fraction still
+    /// reserve 64Mi each, and three of them fill a 192Mi server exactly.
+    ///
+    /// Mutation this exists for: summing `namespace_quota_bytes / 10`
+    /// directly (dropping the floor) makes this fixture promise ~300
+    /// bytes and sail past any budget, while the SERVER still reserves the
+    /// floored figure the account blocks actually carry. Every other
+    /// memory test uses quotas well above the floor and would stay green.
+    #[test]
+    fn the_memory_sum_counts_the_floor_a_tiny_namespace_still_reserves() {
+        let mut claims = Vec::new();
+        for ns in ["a", "b", "c"] {
+            let mut c = claim(ns, "app");
+            c.quota_bytes = 1024; // the fraction alone would be ~100 bytes
+            claims.push(c);
+        }
+        let budget = 128 * (1u64 << 20); // 128Mi — two floors' worth
+        let err = render_accounts_file(&claims, u64::MAX, u64::MAX, budget, &|u| format!("pw-{u}"))
+            .unwrap_err();
+        let AccountsFileError::GlobalMemoryBudgetExceeded { total, .. } = &err else {
+            panic!("expected GlobalMemoryBudgetExceeded, got {err:?}");
+        };
+        assert_eq!(
+            *total,
+            3 * ACCOUNT_MAX_MEM_FLOOR_BYTES,
+            "the sum must count what each account block PROMISES (the floor), \
+             not the fraction the quota alone would buy"
+        );
+    }
+
+    /// And it is taken over the CEILING-CLAMPED quota, the same figure
+    /// `render_account` divides — not the raw `quota_bytes`. Four 10Gi
+    /// claims in one namespace under a 1Gi ceiling promise `max_file: 1Gi`
+    /// and so `max_mem: 1Gi/10`; summing the raw 40Gi instead would make
+    /// this render refuse against a budget it comfortably fits.
+    #[test]
+    fn the_memory_sum_follows_the_clamped_quota_not_the_raw_request() {
+        let claims: Vec<ClaimView> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|app| {
+                let mut c = claim("demo", app);
+                c.quota_bytes = 10 * (1u64 << 30);
+                c
+            })
+            .collect();
+        let ceiling = 1u64 << 30;
+        let budget = 128 * (1u64 << 20);
+        let out = render_accounts_file(&claims, ceiling, u64::MAX, budget, &|u| format!("pw-{u}"))
+            .expect("the clamped namespace promises 1Gi/10 of memory, well inside 128Mi");
+        assert!(
+            out.contains(&format!("max_mem: {}", ceiling / 10)),
+            "the rendered promise and the budgeted figure must be the same \
+             number: {out}"
+        );
     }
 
     #[test]
@@ -1315,7 +1506,8 @@ mod tests {
         // path independently of whatever `account_name` currently
         // computes.
         let c = claim("demo-ns", "app");
-        let out = render_accounts_file(&[c], u64::MAX, u64::MAX, &|u| format!("pw-{u}")).unwrap();
+        let out = render_accounts_file(&[c], u64::MAX, u64::MAX, u64::MAX, &|u| format!("pw-{u}"))
+            .unwrap();
         assert!(
             out.contains("ns_demo_ns: {"),
             "expected key \"ns_demo_ns: {{\" in:\n{out}"
@@ -1404,8 +1596,9 @@ mod tests {
             ("populated", claims.as_slice()),
             ("zero-claim", [].as_slice()),
         ] {
-            let fragment = render_accounts_file(claims, u64::MAX, u64::MAX, &|u| format!("pw-{u}"))
-                .expect("renders");
+            let fragment =
+                render_accounts_file(claims, u64::MAX, u64::MAX, u64::MAX, &|u| format!("pw-{u}"))
+                    .expect("renders");
 
             // Mirrors `component_nats.cue`'s `config.merge` EXACTLY: the
             // `include` is a bare TOP-LEVEL statement, sibling to

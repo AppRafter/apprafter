@@ -106,6 +106,28 @@
 #       the foreign subject is taken back off the declaration and the
 #       condition has to CLEAR.
 #
+# The seventeenth is the budget nobody was counting, found while writing
+# the sixteenth:
+#
+#   17. a namespace whose account would push the cluster past the shared
+#       NATS server's JetStream MEMORY budget is REFUSED, on its own
+#       claim, naming the budget — instead of hanging on
+#       AwaitingNatsUserReady. Each namespace account reserves `max_mem`
+#       on the ONE server (a tenth of its file quota, floored at 64Mi)
+#       against `component_nats.cue`'s `memoryStore.maxSize: 192Mi`, and
+#       nothing summed the reservations against that ceiling. The chart's
+#       own comment predicted a loud failure (a fatal exit at startup);
+#       measured on the RELOAD path — which is the path production takes —
+#       it is silent: nats-server 2.14.3 logs `insufficient memory
+#       resources available (10028)`, reports `Reloaded server
+#       configuration` anyway, keeps serving, and leaves an arbitrary,
+#       run-to-run-varying subset of accounts (previously-working ones
+#       included) with no JetStream while their users still authenticate
+#       normally. The render is now refused before that file can ever be
+#       written, so this criterion is also the proof that the refusal
+#       leaves the INSTALLED file — and every namespace already on it —
+#       untouched.
+#
 # UNPUBLISHED-COMPONENT SUBSTITUTION — read this before touching the
 # script
 # -------------------------------------------------------------------
@@ -1328,7 +1350,7 @@ for _c in "$CLAIM3" "$CLAIM4" "$CLAIM5"; do
 done
 assert_nack_healthy "after the declaring claims (streams + consumers) were applied"
 
-phase "Part 3 + 2.5f + 2.5 part-4 + egress + prefix-pre-capture acceptance criteria — 16 checks, run independently (see this file's own note above)"
+phase "Part 3 + 2.5f + 2.5 part-4 + egress + prefix-pre-capture + memory-budget acceptance criteria — 17 checks, run independently (see this file's own note above)"
 
 PART3_FAILED=0
 record_part3() {
@@ -2339,11 +2361,123 @@ part3_check_16() {
 if part3_check_16; then record_part3 16 "an arriving application is told its prefix is already inside a neighbour's declared stream, reaches Ready anyway, and the report clears when the declaration narrows" 0
 else record_part3 16 "PrefixPreCaptured names the neighbour's composed stream on the ARRIVING claim (reason PrefixDeclaredElsewhere) while that claim still reaches Ready, does not fire on the declarer itself or on an uninvolved third application in the same account — each negative gated on a status.streams write proving the rules ran — and CLEARS once the foreign subject is taken back off the declaration" 1; fi
 
+# --- #17: an out-of-memory-budget namespace is REFUSED, legibly ---
+#
+# THE FIXTURE IS SIZED AGAINST WHAT `demo` ALREADY HOLDS, and that is not
+# incidental — it is the constraint that cost the previous fixture author
+# a whole run. By the time this criterion runs, `demo` holds six claims at
+# `small` (256Mi) and three at `nano` (64Mi): 1.6875Gi of file quota, so
+# 172.8Mi of memory reservation (a tenth, floored per namespace) of the
+# 192Mi the server has. That leaves 19.2Mi — less than the 64Mi FLOOR any
+# new namespace costs however small its claims are. So this app is `nano`,
+# in a namespace of its own, and still cannot fit; `demo` itself does not
+# move, so criteria #1-#16 stand exactly where they were recorded.
+#
+# What is being asserted is not "it fails" but WHERE and HOW it fails:
+#   * on the claim, with its own reason, naming the budget in bytes —
+#     not `AwaitingNatsUserReady`, whose message ("the server may not have
+#     reloaded the accounts file yet") blames the one thing that works;
+#   * with the account never reaching the accounts file at all, which is
+#     what keeps the INSTALLED file — and `demo`, still serving above —
+#     unharmed. That second half is the whole reason the render refuses
+#     rather than writing a file the server would partially reject.
+#
+# While this fixture stands the accounts file is refused CLUSTER-WIDE, so
+# every other not-yet-ready claim reports the same condition. There is
+# exactly one such claim here (hogapp, parked at QuotaExceeded by #13,
+# already recorded), and the fixture is torn down at the end of this
+# check.
+BUDGET_NS="jsbudget"
+APP12="budgetapp"
+CLAIM12="budgetapp-jetstream"
+# component_nats.cue's config.jetstream.memoryStore.maxSize: "192Mi", in
+# bytes — the figure the refusal has to name. The operator holds the same
+# number in NATS_MEMORY_BUDGET_BYTES_FALLBACK, gated against the chart by
+# `the_nats_budget_constants_match_component_nats_cue`; this is a THIRD
+# copy, on purpose, so the walk fails if the delivered behaviour ever
+# stops matching the chart the walk itself installed.
+NATS_MEMORY_BUDGET_BYTES=201326592
+part3_check_17() {
+    local reason msg accounts_now demo_ready demo_account claims_before
+    kubectl create namespace "$BUDGET_NS" 2>/dev/null || true
+    kubectl apply -f - <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${APP12}
+  namespace: ${BUDGET_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+    replicas: 1
+    expose:
+      port: 80
+    needs:
+      jetstream:
+        size: nano
+        selector:
+          tier: integrated
+YAML
+    wait_jsonpath "$CLAIM_RES" "$BUDGET_NS" "$CLAIM12" '{.spec.type}' jetstream 120 || return 1
+
+    local deadline
+    deadline=$(( $(date +%s) + 240 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        reason=$(cond_reason "$CLAIM_RES" "$BUDGET_NS" "$CLAIM12" Ready)
+        [ "$reason" = "NatsMemoryBudgetExceeded" ] && break
+        sleep 5
+    done
+    msg=$(cond_message "$CLAIM_RES" "$BUDGET_NS" "$CLAIM12" Ready)
+    printf '    %s Ready reason = %q\n' "$APP12" "${reason:-<unset>}"
+    printf '    %s Ready message: %s\n' "$APP12" "${msg:-<none>}"
+    if [ "$reason" != "NatsMemoryBudgetExceeded" ]; then
+        printf '    the claim did not report the budget. If it is sitting on AwaitingNatsUserReady, that is the ORIGINAL defect: a server that reloaded the file and gave this account no JetStream, reported as a reload that has not happened yet.\n'
+        return 1
+    fi
+    assert_contains "${APP12} Ready message" "$msg" "$NATS_MEMORY_BUDGET_BYTES" || return 1
+
+    # The account never reached the file — the refusal is a refusal to
+    # WRITE, not a note attached to a file that went out anyway.
+    accounts_now=$(secret_val "$NATS_NS" "$ACCOUNTS_SECRET" 'accounts\.conf')
+    printf '    ns_%s present in the accounts file: %s\n' "$BUDGET_NS" \
+        "$([[ "$accounts_now" == *"ns_${BUDGET_NS}:"* ]] && echo yes || echo no)"
+    [[ "$accounts_now" != *"ns_${BUDGET_NS}:"* ]] || return 1
+
+    # And the file that IS installed still serves: demo's first claim is
+    # still Ready, and its account's JETSTREAM still answers — `account
+    # info` is the `$JS.API.INFO` round trip, which is precisely the call
+    # that goes unanswered for an account the server could not enable.
+    # Asking it of an untouched namespace is how this criterion proves the
+    # refusal protected the incumbents instead of merely failing quietly.
+    demo_ready=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM1" '{.status.ready}')
+    demo_account=$(mgr_nats_run "$APP_NS" account info 2>&1) || {
+        printf '    the %s account stopped answering $JS.API.INFO while the over-budget namespace was pending: %s\n' \
+            "$APP_NS" "$demo_account"
+        return 1
+    }
+    printf '    %s still Ready=%q, and ns_%s still answers account info\n' \
+        "$CLAIM1" "$demo_ready" "$APP_NS"
+    [ "$demo_ready" = "true" ] || return 1
+
+    # Tear the fixture down so the cluster is back under budget for the
+    # phases after this one.
+    claims_before=$(kubectl -n "$BUDGET_NS" get "$CLAIM_RES" -o name 2>/dev/null | tr '\n' ' ')
+    printf '    claims in %s before teardown: %s\n' "$BUDGET_NS" "${claims_before:-<none>}"
+    kubectl delete "$APP_RES" "$APP12" -n "$BUDGET_NS" --wait=true --timeout=120s
+    wait_gone "$CLAIM_RES" "$BUDGET_NS" "$CLAIM12" 180 || return 1
+    printf '    %s deleted — the cluster is back inside its memory budget\n' "$APP12"
+    return 0
+}
+if part3_check_17; then record_part3 17 "a namespace that would overrun the server's JetStream memory budget is refused with NatsMemoryBudgetExceeded, naming the budget, and never reaches the accounts file" 0
+else record_part3 17 "a namespace whose account would push the cluster past component_nats.cue's memoryStore.maxSize is held unready with its OWN reason naming the budget in bytes — not AwaitingNatsUserReady — its account never enters the accounts file, and the file already installed keeps serving the namespaces on it" 1; fi
+
 phase "Part 3 acceptance criteria summary"
 if [ "$PART3_FAILED" -gt 0 ]; then
-    printf '  %d of 16 acceptance criteria are RED. Part 3 (NACK CR application), 2.5f (inventory/detector/conditions), 2.5 part 4 (the migration triggers), the 2.5 egress rule and the prefix-pre-capture report have all landed, so each one is a real defect — not an expected gap.\n' "$PART3_FAILED"
+    printf '  %d of 17 acceptance criteria are RED. Part 3 (NACK CR application), 2.5f (inventory/detector/conditions), 2.5 part 4 (the migration triggers), the 2.5 egress rule, the prefix-pre-capture report and the memory-budget clamp have all landed, so each one is a real defect — not an expected gap.\n' "$PART3_FAILED"
 else
-    printf '  ok: all 16 acceptance criteria are GREEN.\n'
+    printf '  ok: all 17 acceptance criteria are GREEN.\n'
 fi
 
 # ===============================================================
@@ -2367,8 +2501,8 @@ printf '  ok: no "forbidden" anywhere in the operator log across the whole walk\
 # ===============================================================
 
 if [ "$PART3_FAILED" -gt 0 ]; then
-    phase "needs-jetstream-walk: part 2 GREEN, acceptance RED (${PART3_FAILED}/16) (elapsed $(elapsed))"
-    printf 'FINAL: ACCEPTANCE-RED (%d/16) — every part-2 capability above stayed green; see the summary above for which of the sixteen criteria are unmet and why.\n' \
+    phase "needs-jetstream-walk: part 2 GREEN, acceptance RED (${PART3_FAILED}/17) (elapsed $(elapsed))"
+    printf 'FINAL: ACCEPTANCE-RED (%d/17) — every part-2 capability above stayed green; see the summary above for which of the seventeen criteria are unmet and why.\n' \
         "$PART3_FAILED"
     exit 1
 fi

@@ -201,6 +201,29 @@ const REASON_AWAITING_STREAM_CREATION: &str = "AwaitingStreamCreation";
 /// [`REASON_AWAITING_STREAM_CREATION`]'s own doc records at length.
 const REASON_JETSTREAM_QUOTA_EXCEEDED: &str = "QuotaExceeded";
 
+/// `Ready=False` reason when the CLUSTER is out of JetStream memory
+/// budget: every namespace account reserves `max_mem` on the one shared
+/// server ([`nats_accounts`]'s `account_max_mem_bytes`), and their sum has
+/// to fit `component_nats.cue`'s `memoryStore.maxSize`
+/// ([`NATS_MEMORY_BUDGET_BYTES_FALLBACK`]).
+///
+/// Distinct from [`REASON_JETSTREAM_QUOTA_EXCEEDED`], which is about ONE
+/// account's FILE quota against ITS OWN declared streams. This one is
+/// about every namespace's memory reservation against a server-wide
+/// ceiling, so the claim carrying it need not be the claim that pushed
+/// the cluster over — the remedy is to remove a jetstream namespace or
+/// move to a tier with a larger server, not to edit this manifest's
+/// `maxBytes`. Telling an operator to shrink a stream that is not the
+/// problem is exactly the wrong-diagnosis failure this whole change is
+/// about.
+///
+/// ONE reason for both gates that can produce the state (the render
+/// refusal, and the residual live-server probe below) rather than two:
+/// they are the same fact about the cluster, caught at different
+/// distances from the server, and an operator's next action is identical.
+/// The MESSAGE says which one spoke.
+const REASON_NATS_MEMORY_BUDGET: &str = "NatsMemoryBudgetExceeded";
+
 /// Reporter identity stamped onto every Kubernetes Event this controller
 /// publishes (2.5f — the `ForeignSubjectCapture` event ADR 0061 §5 pairs
 /// with the condition). Visible in `kubectl describe resourceclaim` under
@@ -236,6 +259,22 @@ const JETSTREAM_INVENTORY_MAX_AGE: chrono::Duration = chrono::Duration::hours(1)
 /// gap between the per-account memory floor and the server-wide memory
 /// ceiling.
 const NATS_GLOBAL_BUDGET_BYTES_FALLBACK: u64 = 5 * 1024 * 1024 * 1024; // 5Gi
+
+/// Fallback server-wide JetStream MEMORY budget for
+/// [`nats_accounts::render_accounts_file`]'s `memory_budget_bytes`
+/// parameter — a fallback of exactly the same kind as
+/// [`NATS_GLOBAL_BUDGET_BYTES_FALLBACK`] above, and for the same reason:
+/// the `jetstream-integrated` seed has no `config.memoryBudgetBytes` key
+/// to read, so this is the ACTUAL already-committed chart fact every
+/// account's `max_mem` promise is carved out of —
+/// `component_nats.cue`'s `config.jetstream.memoryStore.maxSize: "192Mi"`
+/// — until that seed grows its own key and this becomes tier-aware.
+///
+/// Restating a chart number in Rust is how the enforcement silently
+/// starts guarding the wrong ceiling, so BOTH constants are gated against
+/// their source by `the_nats_budget_constants_match_component_nats_cue`
+/// in this module's tests, which reads `component_nats.cue` itself.
+const NATS_MEMORY_BUDGET_BYTES_FALLBACK: u64 = 192 * 1024 * 1024; // 192Mi
 
 // ---------------------------------------------------------------------------
 // Backend dispatch
@@ -1285,6 +1324,52 @@ fn next_nats_bootstrap_step(
     }
 }
 
+/// The `Ready=False` (reason, message) a FAILED verify deserves — pure,
+/// so the choice is testable without a server, the same way
+/// [`next_nats_bootstrap_step`] makes the step order testable without a
+/// cluster.
+///
+/// Only ever called when the verify did NOT succeed
+/// ([`crate::nats_client::UserReadiness::Ready`] falls through to the
+/// transient message it can never actually reach, rather than this
+/// function taking an un-constructable "failed readiness" type — the
+/// caller's `next_nats_bootstrap_step` gate is what guarantees it).
+///
+/// The split is the whole point. `AwaitingNatsUserReady`'s message says
+/// the server "may not have reloaded the accounts file yet" — true and
+/// useful when the connection itself was refused, and actively
+/// misleading when the server HAS reloaded, HAS this user, and simply
+/// gave its account no JetStream. That second state is permanent: it
+/// resolves only when a human frees memory budget, so a message telling
+/// an operator to wait is a message that never comes true.
+fn nats_verify_failure_condition(
+    readiness: crate::nats_client::UserReadiness,
+    user: &str,
+    account: &str,
+) -> (&'static str, String) {
+    match readiness {
+        crate::nats_client::UserReadiness::NoAccountJetstream => (
+            REASON_NATS_MEMORY_BUDGET,
+            format!(
+                "{user} authenticates against the shared NATS server, but the {account} \
+                 account has no JetStream: the server accepted the accounts file and \
+                 then could not enable JetStream on every account in it, which is what \
+                 it does when the accounts' summed memory reservations exceed its own \
+                 {NATS_MEMORY_BUDGET_BYTES_FALLBACK}-byte memory store. Remove a \
+                 jetstream namespace (or move to a larger tier) to free budget; waiting \
+                 will not clear this."
+            ),
+        ),
+        _ => (
+            REASON_AWAITING_NATS_READY,
+            format!(
+                "waiting for {user} to authenticate — the server may not have reloaded the \
+                 accounts file yet"
+            ),
+        ),
+    }
+}
+
 /// Whether ONE applied NACK object (`Stream` or `Consumer`) is reported
 /// live by the nack controller: `status.conditions[type=Ready].status ==
 /// "True"`.
@@ -1650,9 +1735,20 @@ pub(crate) async fn reconcile_accounts_secret(
         &claims,
         ceiling_bytes,
         NATS_GLOBAL_BUDGET_BYTES_FALLBACK,
+        NATS_MEMORY_BUDGET_BYTES_FALLBACK,
         &|user| passwords.get(user).cloned().unwrap_or_default(),
     )
-    .map_err(|e| ReconcileError::Provisioning(format!("rendering nats-accounts: {e}")))?;
+    .map_err(|e| match e {
+        // The one render refusal a CLAIM is told about rather than only
+        // the log — see `ReconcileError::NatsMemoryBudget`'s own doc.
+        // Every other variant stays a `Provisioning` error: an empty
+        // password or an empty account is a platform bug with nothing an
+        // operator could do about it from a manifest.
+        e @ nats_accounts::AccountsFileError::GlobalMemoryBudgetExceeded { .. } => {
+            ReconcileError::NatsMemoryBudget(e.to_string())
+        }
+        e => ReconcileError::Provisioning(format!("rendering nats-accounts: {e}")),
+    })?;
 
     let secret_api: Api<DynamicObject> =
         Api::namespaced_with(ctx.client.clone(), nats_ns, &secret_ar());
@@ -1801,18 +1897,44 @@ async fn provision_nats(
     // / cluster-wide-blast-radius properties). Runs BEFORE the component is
     // ever enabled: the server `include`s this file at boot, and a
     // missing/incomplete file is fatal on the very first start.
-    reconcile_accounts_secret(ctx, &nats_ns, ceiling_bytes, &size_bytes).await?;
-
-    // Step 3: merge-patch `PlatformStack.spec.overrides.nats.enabled=true`,
-    // stamping the bidirectional annotation — idempotent no-op once
-    // already on (`nats_override_patch`, `ensure_nats_component_enabled`).
-    ensure_nats_component_enabled(&ctx.client).await?;
-
     let prior: Vec<ResourceClaimCondition> = claim
         .status
         .as_ref()
         .and_then(|s| s.conditions.clone())
         .unwrap_or_default();
+
+    if let Err(e) = reconcile_accounts_secret(ctx, &nats_ns, ceiling_bytes, &size_bytes).await {
+        // The cluster is out of JetStream memory budget, so the file the
+        // server would have to load is one it cannot fully honour — and
+        // the render was refused BEFORE it was written, which is what
+        // keeps every namespace already on the installed file working.
+        // Say so on the claim: the alternative (propagating the error)
+        // leaves this claim sitting at whatever reason it last had, with
+        // the real cause visible only in the controller's log.
+        let ReconcileError::NatsMemoryBudget(detail) = &e else {
+            return Err(e);
+        };
+        let cond = ready_condition(
+            "False",
+            REASON_NATS_MEMORY_BUDGET,
+            &format!(
+                "the shared NATS server has no JetStream memory budget left for this \
+                 namespace's account: {detail}. Every namespace with a jetstream claim \
+                 reserves memory on the one server, so the remedy is to remove a \
+                 jetstream namespace (or move to a larger tier) — not to change this \
+                 application's declaration. The accounts file was NOT written, so every \
+                 namespace already on the server keeps working.",
+            ),
+            &prior,
+        );
+        patch_status(&ctx.client, ns, name, cond, ClaimStatusFields::default()).await?;
+        return Ok(Action::requeue(Duration::from_secs(60)));
+    }
+
+    // Step 3: merge-patch `PlatformStack.spec.overrides.nats.enabled=true`,
+    // stamping the bidirectional annotation — idempotent no-op once
+    // already on (`nats_override_patch`, `ensure_nats_component_enabled`).
+    ensure_nats_component_enabled(&ctx.client).await?;
 
     // Step 4: await StatefulSet readiness. Unlike dragonfly/cnpg (always-on
     // controllers reacting to a lazy CR within seconds), the FIRST claim
@@ -1855,9 +1977,10 @@ async fn provision_nats(
     let user = cv.user();
     let inbox_prefix = cv.inbox_prefix();
     let url = format!("nats://{host}:{NATS_CLIENT_PORT}");
-    let user_verified =
-        crate::nats_client::user_is_ready(ctx.nats.as_ref(), &url, &user, &pass, &inbox_prefix)
+    let readiness =
+        crate::nats_client::user_readiness(ctx.nats.as_ref(), &url, &user, &pass, &inbox_prefix)
             .await;
+    let user_verified = readiness == crate::nats_client::UserReadiness::Ready;
     if next_nats_bootstrap_step(
         accounts_secret_written,
         component_enabled,
@@ -1866,15 +1989,8 @@ async fn provision_nats(
         false,
     ) == NatsBootstrapStep::VerifyUserReady
     {
-        let cond = ready_condition(
-            "False",
-            REASON_AWAITING_NATS_READY,
-            &format!(
-                "waiting for {user} to authenticate — the server may not have reloaded the \
-                 accounts file yet"
-            ),
-            &prior,
-        );
+        let (reason, message) = nats_verify_failure_condition(readiness, &user, &cv.account());
+        let cond = ready_condition("False", reason, &message, &prior);
         patch_status(&ctx.client, ns, name, cond, ClaimStatusFields::default()).await?;
         return Ok(Action::requeue(Duration::from_secs(30)));
     }
@@ -4976,6 +5092,153 @@ mod tests {
         assert_eq!(
             next_nats_bootstrap_step(true, true, true, true, true),
             NatsBootstrapStep::Done
+        );
+    }
+
+    // --- nats_verify_failure_condition (the 2.5 memory-budget
+    // follow-up: which failure the claim is actually told about) -------
+
+    #[test]
+    fn a_connection_that_never_opened_still_blames_the_reload() {
+        // The transient case, unchanged and deliberately so: this message
+        // is right, and the first attempt after every fresh accounts-file
+        // write lands here.
+        let (reason, msg) = nats_verify_failure_condition(
+            crate::nats_client::UserReadiness::Unverified,
+            "claim_demo_feeder_jetstream",
+            "ns_demo",
+        );
+        assert_eq!(reason, REASON_AWAITING_NATS_READY);
+        assert!(msg.contains("may not have reloaded"), "{msg}");
+        assert!(
+            !msg.contains("memory"),
+            "a transient wait must not be dressed up as a budget problem: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_account_without_jetstream_names_the_memory_budget_not_the_reload() {
+        // The defect this whole change is about: the account IS in the
+        // file the server reloaded, its user authenticates, and its
+        // JetStream is missing because the reload could not fit every
+        // account's `max_mem`. Saying "the server may not have reloaded
+        // the accounts file yet" names the one thing that demonstrably
+        // worked, and points an operator away from the only remedy.
+        let (reason, msg) = nats_verify_failure_condition(
+            crate::nats_client::UserReadiness::NoAccountJetstream,
+            "claim_demo_feeder_jetstream",
+            "ns_demo",
+        );
+        assert_eq!(reason, REASON_NATS_MEMORY_BUDGET);
+        assert!(
+            msg.contains("ns_demo"),
+            "the message must name the account: {msg}"
+        );
+        assert!(
+            msg.contains(&NATS_MEMORY_BUDGET_BYTES_FALLBACK.to_string()),
+            "the message must name the budget it is measured against: {msg}"
+        );
+        assert!(
+            !msg.contains("may not have reloaded"),
+            "this state is NOT a reload lag and must never say it is: {msg}"
+        );
+        assert!(
+            msg.contains("waiting will not clear this"),
+            "a permanent condition must say it is permanent: {msg}"
+        );
+    }
+
+    // --- the chart-drift gate over the two NATS budget constants ------
+
+    /// Pull one `<key>: "<quantity>"` out of a CUE source, anchored under
+    /// `block` so `size:`/`maxSize:` can't be picked up from some other
+    /// component's stanza. Returns bytes via the same parser the
+    /// provisioner uses on claim quantities.
+    fn cue_quantity_bytes(src: &str, block: &str, key: &str) -> u64 {
+        let (_, after) = src.split_once(block).unwrap_or_else(|| {
+            panic!(
+                "component_nats.cue has no `{block}` — the chart was reshaped, and this \
+                 gate would otherwise compare against nothing"
+            )
+        });
+        let line = after
+            .lines()
+            .find(|l| l.trim_start().starts_with(&format!("{key}:")))
+            .unwrap_or_else(|| panic!("component_nats.cue: no `{key}:` line under `{block}`"));
+        let raw = line
+            .split_once(':')
+            .map(|(_, v)| v.trim().trim_matches('"').to_string())
+            .unwrap_or_default();
+        let bytes = crate::nats::quantity_bytes(&raw).unwrap_or_else(|| {
+            panic!("component_nats.cue: `{key}: {raw}` under `{block}` is not a quantity")
+        });
+        u64::try_from(bytes).unwrap_or_else(|_| {
+            panic!("component_nats.cue: `{key}: {raw}` under `{block}` is negative")
+        })
+    }
+
+    /// `NATS_GLOBAL_BUDGET_BYTES_FALLBACK` and
+    /// `NATS_MEMORY_BUDGET_BYTES_FALLBACK` are Rust restatements of two
+    /// numbers that live in `platform-stack/cue/component_nats.cue`. Both
+    /// are now ENFORCED — the render is refused when a cluster's promises
+    /// exceed them — which makes a stale copy strictly worse than no copy
+    /// at all: the platform would confidently refuse work the server
+    /// could have taken, or admit work it cannot, and every unit test
+    /// here would still pass.
+    ///
+    /// `fs::read_to_string` reached via `CARGO_MANIFEST_DIR`, not
+    /// `include_str!`: `platform-stack/` is outside the operator image's
+    /// Docker build context (`context: operator`), and a `#[cfg(test)]`
+    /// read never runs during that build — the same technique, for the
+    /// same reason, as `admission-webhook`'s `declared_claim_fields()`
+    /// reading `schemas/v1alpha1/application.cue`.
+    ///
+    /// Deliberately asserts the CHART value against the CONSTANT, with a
+    /// message naming both files: the chart is the source of truth, so a
+    /// deliberate chart change is told exactly which constant to follow
+    /// it, and an accidental constant change is told it invented a
+    /// ceiling nothing in the cluster honours.
+    #[test]
+    fn the_nats_budget_constants_match_component_nats_cue() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../platform-stack/cue/component_nats.cue");
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "{}: the chart's own NATS budgets could not be read, so this gate \
+                 would have judged nothing: {e}",
+                path.display()
+            )
+        });
+
+        let chart_file = cue_quantity_bytes(&src, "fileStore: pvc: {", "size");
+        let chart_memory = cue_quantity_bytes(&src, "memoryStore: {", "maxSize");
+
+        // Non-vacuity: a parse that silently produced 0 would make both
+        // comparisons below meaningless in the one direction that
+        // matters (a constant of 0 refuses everything).
+        assert!(
+            chart_file > 0 && chart_memory > 0,
+            "parsed 0 out of the chart"
+        );
+
+        assert_eq!(
+            NATS_GLOBAL_BUDGET_BYTES_FALLBACK, chart_file,
+            "platform-stack/cue/component_nats.cue's \
+             config.jetstream.fileStore.pvc.size is {chart_file} bytes, but \
+             NATS_GLOBAL_BUDGET_BYTES_FALLBACK in this file says \
+             {NATS_GLOBAL_BUDGET_BYTES_FALLBACK}. The chart is the source of truth: \
+             update the constant here to match it (and check whether the tier's \
+             account ceilings still make sense against the new figure)."
+        );
+        assert_eq!(
+            NATS_MEMORY_BUDGET_BYTES_FALLBACK, chart_memory,
+            "platform-stack/cue/component_nats.cue's \
+             config.jetstream.memoryStore.maxSize is {chart_memory} bytes, but \
+             NATS_MEMORY_BUDGET_BYTES_FALLBACK in this file says \
+             {NATS_MEMORY_BUDGET_BYTES_FALLBACK}. The chart is the source of truth: \
+             update the constant here to match it. This one is ENFORCED — \
+             render_accounts_file refuses an accounts file whose accounts jointly \
+             reserve more than it — so a stale copy silently guards the wrong ceiling."
         );
     }
 

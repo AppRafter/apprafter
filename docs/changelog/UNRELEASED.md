@@ -101,7 +101,29 @@ patch of each phase.
 
 Three of the four ADR-vs-tree divergences the documentation pass recorded, all
 found by writing the public pages rather than by any gate, and all closed before
-this version was ever published.
+this version was ever published — plus the memory-budget defect the last walk
+criterion turned up, in the same spirit and by the same route.
+
+- **A cluster that runs out of JetStream memory budget now says so instead of
+  hanging.** Each namespace account reserves memory on the one shared server,
+  and nothing summed those reservations against the server's own 192Mi store —
+  roughly three namespaces fit, and the fourth overran it. The chart's own
+  comment predicted a loud failure (a fatal exit at startup). Measured on the
+  reload path, which is the path production takes, it is silent and worse: the
+  server logs `insufficient memory resources available (10028)`, reports
+  `Reloaded server configuration` anyway, keeps serving — and leaves an
+  arbitrary, run-to-run-varying subset of accounts (previously-working ones
+  included) **with no JetStream at all** while their users still authenticate
+  normally. The claim then sat forever on "the server may not have reloaded the
+  accounts file yet", naming the one thing that had worked.
+
+  The accounts file is now refused before it can be written, exactly as the
+  file-quota sum already was, so the file already installed keeps serving every
+  namespace on it; the claim is held unready with `NatsMemoryBudgetExceeded`,
+  naming the reservation and the budget. The budget is unchanged — this makes
+  it enforced and legible, not larger. A verify that authenticates and then
+  finds no JetStream for its account reports the same reason rather than the
+  reload message, which is the residual a fork could still reach.
 
 - **`needs.jetstream` now opens the network path to the message server.** The
   connection-target catalog (`default_target`, ADR 0045 §B) had arms for `pg`
@@ -164,23 +186,18 @@ this version was ever published.
   Secret only. This is the one divergence of the four left open, and
   deliberately: the Secret is arguably where they belong, and it is recorded so
   the difference is not later read as a loss.
-- **The storage ceiling is per namespace, not per cluster.** Two namespaces
-  sized near the ceiling can jointly promise more than the single shared volume
-  holds; nothing refuses that today.
-- **The memory ceiling has the sharper version of the same gap, and it is not
-  a promise that is merely over-sold — it takes an account offline.** Each
-  namespace's account reserves `max(file quota / 10, 64Mi)` of the server's
-  memory store, and nothing clamps the sum. Measured on the pinned server while
-  writing the walk's sixteenth check: once a reload overruns the ceiling the
-  server logs `insufficient memory resources available (10028)`, reports
-  `Reloaded server configuration` anyway, and carries on — existing accounts
-  keep working, and the account it could not enable is left **with no JetStream
-  at all** while its users still authenticate normally. The claim then sits
-  forever on "waiting for the server to reload the accounts file", which is the
-  one thing that did not go wrong. About three JetStream namespaces fit under
-  the shipped 192Mi. The chart already flagged the arithmetic as a follow-up
-  and predicted a cold-start crash; the reload path is quieter than that and
-  therefore worse.
+- **The storage ceiling is per namespace, and the cluster-wide sum is refused
+  only in the log.** Two namespaces sized near the ceiling can jointly promise
+  more than the single shared volume holds; the render refuses that, so the
+  over-promise never reaches the server — but unlike the memory budget (below)
+  the refusal writes no condition, so the claims involved sit on whatever reason
+  they last carried while the cause is visible only to whoever reads the
+  controller's log.
+- **About three JetStream namespaces fit on a Solo node.** Each namespace's
+  account reserves `max(file quota / 10, 64Mi)` of the shared server's 192Mi
+  memory store. The sum is now enforced and reported rather than silently
+  overrun (above), but the ceiling itself is unchanged and small; a tier-aware
+  budget is the follow-up the chart and `account_max_mem_bytes` both flag.
 - **JetStream stores are out of scope for backup and restore.**
 
 ## platform-stack 0.2.68 / argocd-cue-cmp 0.1.24 — the sidecar pin follows its own image (unreleased)

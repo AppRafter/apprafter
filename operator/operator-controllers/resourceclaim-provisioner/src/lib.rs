@@ -228,6 +228,21 @@ pub enum ReconcileError {
     Serde(#[from] serde_json::Error),
     #[error("provisioning: {0}")]
     Provisioning(String),
+    /// The cluster's namespace accounts jointly reserve more JetStream
+    /// MEMORY than the shared NATS server's `max_memory_store`, so
+    /// `nats_accounts::render_accounts_file` refused to produce the
+    /// accounts file at all (2.5 follow-up).
+    ///
+    /// Its own variant rather than a [`Self::Provisioning`] string
+    /// because `provision_nats` has to TELL the claim about this one: it
+    /// is a standing condition an operator must act on, not a transient
+    /// failure worth retrying silently, and a `Provisioning` error would
+    /// surface only as controller log noise while the claim sat unready
+    /// with a stale reason. Carries the rendered message rather than the
+    /// numbers because the only consumer puts it straight into a
+    /// condition.
+    #[error("nats memory budget: {0}")]
+    NatsMemoryBudget(String),
 }
 
 /// Spawn the ResourceClaim provisioner Controller.

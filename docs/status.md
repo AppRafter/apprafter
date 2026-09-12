@@ -72,8 +72,11 @@ post-launch work is not a roadmap phase and has no subscribe control.
 > when it arrives; collecting a neighbour's subjects is a legitimate, approval-gated way to express
 > fan-in, so this is a warning rather than a refusal and the application starts normally.
 > A namespace's memory budget is reserved on the shared message server when its first application
-> arrives, and those reservations are not yet capped cluster-wide — roughly three JetStream
-> namespaces fit on a Solo node today. JetStream stores are out of scope for backup and restore.
+> arrives, and the server has a fixed amount to give — roughly three JetStream namespaces fit on a
+> Solo node today. The reservations are summed against that limit: a namespace that would not fit is
+> refused and told so on its own dependency, naming the budget, while every namespace already on the
+> server keeps running untouched. A larger per-tier budget is planned.
+> JetStream stores are out of scope for backup and restore.
 
 ---
 

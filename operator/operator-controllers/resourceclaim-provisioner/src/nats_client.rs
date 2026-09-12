@@ -193,26 +193,87 @@ pub trait NatsAdmin: Send + Sync {
     ) -> Result<(), NatsAdminError>;
 }
 
-/// Whether `user` can authenticate and complete a permission-scoped
-/// round trip against the account (ADR 0061 §8.1 step 4). NEVER
-/// propagates an error: a failed verify is exactly the transient
-/// condition (kubelet Secret-projection lag, server reload lag) this
-/// check exists to absorb, so it collapses to `false` — "not ready yet,
-/// requeue" — rather than surfacing `NatsAdminError` as a reconcile
-/// failure. Those are different outcomes and only one requeues
-/// sensibly: a genuine reconcile error trips backoff/event noise for a
-/// condition that resolves itself within seconds on every claim.
-pub async fn user_is_ready(
+/// What a verify attempt says about the account — not merely whether it
+/// worked.
+///
+/// [`Self::NoAccountJetstream`] exists because the two failures it
+/// separates call for OPPOSITE messages: one resolves itself in seconds,
+/// the other never resolves at all. Collapsing them (which this function
+/// did, as a `bool`, until the memory-budget defect) made a claim whose
+/// account had no JetStream sit forever behind "the server may not have
+/// reloaded the accounts file yet" — naming as the suspect the one thing
+/// that had demonstrably worked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserReadiness {
+    /// Authenticated, and the account's JetStream API answered.
+    Ready,
+    /// The verify did not complete, and says nothing more specific than
+    /// that. Two ways in, both of them conditions a caller should WAIT
+    /// on: the connection was refused (the usual one — the projected
+    /// Secret or the server's SIGHUP reload has not caught up with this
+    /// user yet, and it clears itself within seconds), or the request
+    /// never got a reply (a permissions violation on the reply inbox,
+    /// which does not clear itself but is a wiring bug, not a capacity
+    /// one). Deliberately NOT [`Self::NoAccountJetstream`]: see that
+    /// variant for the measurement that separates them.
+    Unverified,
+    /// Authenticated — the accounts file HAS this user — but the
+    /// account's JetStream API has no responder.
+    ///
+    /// Measured (podman, nats-server 2.14.3) on the reload path an
+    /// over-budget accounts file takes: the server logs
+    /// `Error enabling jetstream on configured accounts: insufficient
+    /// memory resources available (10028)`, reports
+    /// `Reloaded server configuration`, keeps serving — and the affected
+    /// accounts' users authenticate normally while `$JS.API.INFO` in
+    /// their account has nobody listening. Three states, three distinct
+    /// client-side shapes, all three measured against a real server:
+    ///
+    /// | account state | client sees |
+    /// |---|---|
+    /// | not in the file yet | `ConnectErrorKind::AuthorizationViolation` |
+    /// | in the file, JetStream enabled | a reply on `$JS.API.INFO` |
+    /// | in the file, JetStream NOT enabled | `RequestErrorKind::NoResponders` |
+    ///
+    /// `NoResponders` specifically, never "any request failure": a WRONG
+    /// inbox prefix — the other way `verify_user`'s request can fail —
+    /// presents as `RequestErrorKind::TimedOut` instead, because the
+    /// server does publish that reply and the client is merely not
+    /// allowed to subscribe where it landed. Measured the same way, on
+    /// the same server, deliberately: the two must not share a
+    /// diagnosis.
+    NoAccountJetstream,
+}
+
+/// What `user` can actually do against the account right now (ADR 0061
+/// §8.1 step 4). NEVER propagates an error: a failed verify is often the
+/// transient condition (kubelet Secret-projection lag, server reload lag)
+/// this check exists to absorb, so it collapses to a [`UserReadiness`]
+/// variant — "not ready yet, requeue," with the reason — rather than
+/// surfacing `NatsAdminError` as a reconcile failure. Those are
+/// different outcomes and only one requeues sensibly: a genuine
+/// reconcile error trips backoff/event noise for a condition that
+/// resolves itself within seconds on every claim.
+pub async fn user_readiness(
     admin: &dyn NatsAdmin,
     url: &str,
     user: &str,
     pass: &str,
     inbox_prefix: &str,
-) -> bool {
-    admin
-        .verify_user(url, user, pass, inbox_prefix)
-        .await
-        .is_ok()
+) -> UserReadiness {
+    match admin.verify_user(url, user, pass, inbox_prefix).await {
+        Ok(()) => UserReadiness::Ready,
+        Err(NatsAdminError::Verify { source, .. })
+            if source.kind() == async_nats::RequestErrorKind::NoResponders =>
+        {
+            UserReadiness::NoAccountJetstream
+        }
+        // Everything else — a refused connection, a timed-out request —
+        // is "not ready yet" and says nothing more specific. A TimedOut
+        // request in particular must NOT land in the arm above: see
+        // [`UserReadiness::NoAccountJetstream`].
+        Err(_) => UserReadiness::Unverified,
+    }
 }
 
 /// Production [`NatsAdmin`] over the `async-nats` crate's client.
@@ -360,6 +421,18 @@ pub struct FakeNats {
     /// `Option`-typed "answer" would (there is nothing to answer with;
     /// `verify_user` only ever returns `()` on success).
     pub fails: std::sync::Mutex<bool>,
+    /// Whether `verify_user` answers with the "authenticated, but this
+    /// account has no JetStream" shape — the over-budget reload state
+    /// ([`UserReadiness::NoAccountJetstream`]). Separate from `fails`,
+    /// and checked BEFORE it, because the whole point of the variant is
+    /// that it is NOT the same failure: a fake that could only answer
+    /// "broken" could not tell the two conditions apart either, which is
+    /// the bug.
+    pub no_account_jetstream: std::sync::Mutex<bool>,
+    /// Whether `verify_user` answers with a TIMED-OUT request — the OTHER
+    /// post-connect failure (a wrong inbox prefix), which must not be
+    /// read as [`UserReadiness::NoAccountJetstream`].
+    pub timed_out: std::sync::Mutex<bool>,
     /// What [`NatsAdmin::list_streams`] answers with (2.5e GC).
     pub streams: std::sync::Mutex<Vec<StreamSummary>>,
     /// Every stream name [`NatsAdmin::delete_stream`] was asked to drop,
@@ -384,6 +457,20 @@ impl NatsAdmin for FakeNats {
             pass.to_string(),
             inbox_prefix.to_string(),
         ));
+        if *self.no_account_jetstream.lock().unwrap() {
+            return Err(NatsAdminError::Verify {
+                url: url.to_string(),
+                user: user.to_string(),
+                source: async_nats::RequestError::new(async_nats::RequestErrorKind::NoResponders),
+            });
+        }
+        if *self.timed_out.lock().unwrap() {
+            return Err(NatsAdminError::Verify {
+                url: url.to_string(),
+                user: user.to_string(),
+                source: async_nats::RequestError::new(async_nats::RequestErrorKind::TimedOut),
+            });
+        }
         if *self.fails.lock().unwrap() {
             return Err(NatsAdminError::Connect {
                 url: url.to_string(),
@@ -441,22 +528,51 @@ mod tests {
     #[tokio::test]
     async fn a_failed_connect_yields_not_ready_not_an_error() {
         // "Not ready" and "error" are different outcomes and only one
-        // requeues sensibly (this module's own doc on `user_is_ready`)
-        // — proved here by the return TYPE being `bool`, not
-        // `Result<bool, _>`: there is no error path to propagate,
-        // which is the property under test, not merely a convenient
-        // signature.
+        // requeues sensibly (this module's own doc on `user_readiness`)
+        // — proved here by the return TYPE being `UserReadiness`, not
+        // `Result<UserReadiness, _>`: there is no error path to
+        // propagate, which is the property under test, not merely a
+        // convenient signature.
         let fake = FakeNats::default();
         *fake.fails.lock().unwrap() = true;
-        let ready = user_is_ready(&fake, "nats://demo:4222", "u", "pw", "_INBOX_demo_app").await;
-        assert!(!ready);
+        let ready = user_readiness(&fake, "nats://demo:4222", "u", "pw", "_INBOX_demo_app").await;
+        assert_eq!(ready, UserReadiness::Unverified);
     }
 
     #[tokio::test]
     async fn a_successful_verify_yields_ready() {
         let fake = FakeNats::default();
-        let ready = user_is_ready(&fake, "nats://demo:4222", "u", "pw", "_INBOX_demo_app").await;
-        assert!(ready);
+        let ready = user_readiness(&fake, "nats://demo:4222", "u", "pw", "_INBOX_demo_app").await;
+        assert_eq!(ready, UserReadiness::Ready);
+    }
+
+    #[tokio::test]
+    async fn an_authenticated_user_whose_account_has_no_jetstream_is_its_own_verdict() {
+        // The over-budget reload state. Measured against a real server
+        // (see `UserReadiness::NoAccountJetstream`): the user
+        // authenticates, and `$JS.API.INFO` in its account has no
+        // responder. Classifying it as `Unverified` — which the
+        // pre-2.5-follow-up `bool` did, for every failure alike — is what
+        // made the claim's condition blame the reload.
+        let fake = FakeNats::default();
+        *fake.no_account_jetstream.lock().unwrap() = true;
+        let ready = user_readiness(&fake, "nats://demo:4222", "u", "pw", "_INBOX_demo_app").await;
+        assert_eq!(ready, UserReadiness::NoAccountJetstream);
+    }
+
+    #[tokio::test]
+    async fn a_request_that_merely_timed_out_is_not_the_no_jetstream_verdict() {
+        // The does-not-fire half, and the reason the classifier matches
+        // on `NoResponders` rather than on "the request failed": a wrong
+        // inbox prefix fails the SAME request with `TimedOut` (measured;
+        // the server publishes the reply, the client may not subscribe
+        // where it lands). A classifier that keyed on the Verify VARIANT
+        // alone would report a permanent memory-budget problem for a
+        // permissions bug.
+        let fake = FakeNats::default();
+        *fake.timed_out.lock().unwrap() = true;
+        let ready = user_readiness(&fake, "nats://demo:4222", "u", "pw", "_INBOX_demo_app").await;
+        assert_eq!(ready, UserReadiness::Unverified);
     }
 
     #[tokio::test]
@@ -529,11 +645,14 @@ mod tests {
             consumes: vec![],
             quota_bytes: 1 << 30,
         };
-        let fragment =
-            render_accounts_file(std::slice::from_ref(&claim), u64::MAX, u64::MAX, &|_| {
-                "verify-pw".to_string()
-            })
-            .expect("renders");
+        let fragment = render_accounts_file(
+            std::slice::from_ref(&claim),
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            &|_| "verify-pw".to_string(),
+        )
+        .expect("renders");
 
         let nats_conf = r#"
 port: 4222
@@ -620,5 +739,202 @@ include "accounts.conf"
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(ready, "verify_user never succeeded against a real server");
+    }
+
+    /// The measurement [`UserReadiness::NoAccountJetstream`] rests on,
+    /// pinned against a real server so a NATS upgrade cannot quietly
+    /// change it: an accounts file whose accounts jointly promise more
+    /// `max_mem` than the server's `max_memory_store`, delivered the way
+    /// production delivers one — by SIGHUP, to a running server — leaves
+    /// the new account's user AUTHENTICATING NORMALLY with no JetStream
+    /// behind it.
+    ///
+    /// The server does not refuse the file and does not exit. It logs
+    /// `Error enabling jetstream on configured accounts: insufficient
+    /// memory resources available (10028)`, then `Reloaded server
+    /// configuration`, and keeps serving. Nothing on the Kubernetes side
+    /// sees a failure; the only client-visible difference is the shape
+    /// this test asserts.
+    ///
+    /// **The fixture deliberately renders with `u64::MAX` budgets**,
+    /// which is the one thing production must never do — that is the
+    /// point. `render_accounts_file`'s memory clamp exists precisely to
+    /// stop this file being written, so the only way to observe what the
+    /// server does with it is to bypass the clamp here, on purpose, in a
+    /// throwaway container.
+    ///
+    /// Both directions, on the same server, because the discriminator is
+    /// a distinction and not a detection: BEFORE the reload the same user
+    /// is `Unverified` (its account is not in the file at all), and
+    /// AFTER it the user is `NoAccountJetstream`. A classifier that
+    /// collapsed the two would pass one half and fail the other.
+    ///
+    /// Run: cargo test -p operator-controllers-resourceclaim-provisioner \
+    ///        an_over_budget_reload_leaves_the_new_account_authenticating_without_jetstream \
+    ///        -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs podman"]
+    async fn an_over_budget_reload_leaves_the_new_account_authenticating_without_jetstream() {
+        use crate::nats_accounts::{render_accounts_file, ClaimView};
+
+        // One claim per namespace, each too small to reach the memory
+        // FRACTION, so each account lands on the 64Mi floor: three fit a
+        // 192Mi server exactly, and the fourth is the overrun.
+        let claim_in = |ns: &str| ClaimView {
+            namespace: ns.to_string(),
+            app: "app".into(),
+            dynamic_streams: false,
+            streams: vec![],
+            consumes: vec![],
+            quota_bytes: 1 << 20,
+        };
+        let fits: Vec<ClaimView> = ["a", "b", "c"].iter().map(|ns| claim_in(ns)).collect();
+        let over: Vec<ClaimView> = ["a", "b", "c", "d"].iter().map(|ns| claim_in(ns)).collect();
+        let render = |claims: &[ClaimView]| {
+            render_accounts_file(claims, u64::MAX, u64::MAX, u64::MAX, &|_| {
+                "budget-pw".to_string()
+            })
+            .expect("renders")
+        };
+
+        // `max_memory_store` mirrors `component_nats.cue`'s
+        // `memoryStore.maxSize: "192Mi"` — the number the whole defect is
+        // measured against.
+        let nats_conf = r#"
+port: 4222
+jetstream: {
+  store_dir: "/tmp/nats-budget-store"
+  max_memory_store: 201326592
+  max_file_store: 5368709120
+}
+include "accounts.conf"
+"#;
+
+        let dir = std::env::temp_dir().join(format!(
+            "nats-budget-check-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(dir.join("nats.conf"), nats_conf).expect("write nats.conf");
+        std::fs::write(dir.join("accounts.conf"), render(&fits)).expect("write accounts.conf");
+
+        let container = format!("nats-budget-{}", std::process::id());
+        let port = 24444;
+        let mount = format!("{}:/etc/nats:ro,Z", dir.display());
+        let publish = format!("127.0.0.1:{port}:4222");
+        let _ = std::process::Command::new("podman")
+            .args(["rm", "-f", &container])
+            .output();
+        let run = std::process::Command::new("podman")
+            .args([
+                "run",
+                "-d",
+                "--name",
+                &container,
+                "-p",
+                &publish,
+                "-v",
+                &mount,
+                // The pinned server, not `2-alpine`: this whole test is a
+                // claim about ONE server version's reload behaviour, and
+                // `component_nats.cue` pins exactly this tag.
+                "nats:2.14.3-alpine",
+                "-c",
+                "/etc/nats/nats.conf",
+            ])
+            .output()
+            .expect("run podman — is it installed?");
+        assert!(
+            run.status.success(),
+            "podman run failed: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+
+        let url = format!("127.0.0.1:{port}");
+        let newcomer = over[3].clone();
+        let (nu, ni) = (newcomer.user(), newcomer.inbox_prefix());
+        let incumbent = fits[0].clone();
+        let (iu, ii) = (incumbent.user(), incumbent.inbox_prefix());
+
+        // Baseline, once the server is up: the three budgeted accounts
+        // work, and the not-yet-existing fourth cannot even connect.
+        let mut before = UserReadiness::Unverified;
+        for _ in 0..50 {
+            if user_readiness(&NatsClient, &url, &iu, "budget-pw", &ii).await
+                == UserReadiness::Ready
+            {
+                before = user_readiness(&NatsClient, &url, &nu, "budget-pw", &ni).await;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert_eq!(
+            before,
+            UserReadiness::Unverified,
+            "an account absent from the file must present as a CONNECT failure — if this \
+             is anything else, the distinction the classifier draws is not the one the \
+             server draws"
+        );
+
+        // The reload production performs: rewrite the file, SIGHUP (what
+        // the chart's reloader sidecar does when the Secret changes).
+        std::fs::write(dir.join("accounts.conf"), render(&over)).expect("rewrite accounts.conf");
+        let hup = std::process::Command::new("podman")
+            .args(["kill", "--signal", "HUP", &container])
+            .output()
+            .expect("podman kill --signal HUP");
+        assert!(
+            hup.status.success(),
+            "SIGHUP failed: {}",
+            String::from_utf8_lossy(&hup.stderr)
+        );
+
+        // Poll until the reload has landed — "landed" meaning the new
+        // user can authenticate, which is exactly the half of this that
+        // DOES work.
+        let mut after = UserReadiness::Unverified;
+        for _ in 0..50 {
+            after = user_readiness(&NatsClient, &url, &nu, "budget-pw", &ni).await;
+            if after != UserReadiness::Unverified {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        let logs = std::process::Command::new("podman")
+            .args(["logs", &container])
+            .output()
+            .expect("podman logs");
+        let logs = format!(
+            "{}{}",
+            String::from_utf8_lossy(&logs.stdout),
+            String::from_utf8_lossy(&logs.stderr)
+        );
+        let _ = std::process::Command::new("podman")
+            .args(["rm", "-f", &container])
+            .output();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            logs.contains("insufficient memory resources available (10028)"),
+            "the server never reported the over-budget accounts — the fixture no longer \
+             overruns anything, so what follows would prove nothing:\n{logs}"
+        );
+        assert!(
+            logs.contains("Reloaded server configuration"),
+            "the server did not report the reload as SUCCESSFUL; the quietness of this \
+             failure is half of what makes it dangerous:\n{logs}"
+        );
+        assert_eq!(
+            after,
+            UserReadiness::NoAccountJetstream,
+            "an account the server could not enable JetStream on must present as \
+             authenticated-without-jetstream, not as a connect failure and not as \
+             ready:\n{logs}"
+        );
     }
 }
