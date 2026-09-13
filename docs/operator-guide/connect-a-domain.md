@@ -42,9 +42,11 @@ disable` to reopen `80`/`443`. What the restriction buys, and what it does not, 
 > Infrastructure-as-code / fork users can instead opt in via the manifest:
 > `spec: firewall: cloudflareOrigin: true` + `apprafter apply` (a manifest value
 > overrides the CLI toggle). That route keeps the intent in your own
-> repository, where a rebuild reads it from the manifest — it is not recorded
-> in the cluster, so a restore onto a machine built without that manifest will
-> not turn the firewall on by itself.
+> repository, and it is recorded in the cluster too, so a backup carries it the
+> same way — a restore onto a machine that does not have your manifest still
+> turns the firewall on. With the manifest in reach it is better still: `apply`
+> is the first phase of a re-provision, so the firewall goes up before the new
+> node serves anything.
 
 ## 2. Per zone (repeat for each domain)
 

@@ -60,6 +60,7 @@
 use std::io::Write;
 use std::path::Path;
 
+use cli_core::manifest::{self, InfrastructureManifest};
 use cli_core::secrets::{decrypt_with_identity, default_age_key_path, load_or_create_identity};
 use cli_core::target::load_active_target_config;
 use cli_core::{CliError, Result};
@@ -246,15 +247,16 @@ pub(crate) fn run_with<H: HelmRunner, K: KubectlRunner>(
 
     // A4: the origin-firewall toggle rides the CR, so that a backup — above
     // all the scheduled in-cluster one, which has no target store to read —
-    // carries it. The local store is the authority when it has an opinion;
-    // when it has none the cluster's own value is carried forward rather than
-    // pruned. See `origin_firewall_for_render` for why neither half is
-    // optional.
+    // carries it. The order mirrors `apply::cf_origin_enabled` (manifest, then
+    // target store), because that is what builds the node's real firewall; when
+    // neither says anything the cluster's own value is carried forward rather
+    // than pruned. See `origin_firewall_for_render` for why no rung is optional.
     let local_origin_firewall = target_config
         .as_ref()
         .and_then(|c| c.firewall.as_ref())
         .map(|f| f.cloudflare_origin);
     let origin_firewall = origin_firewall_for_render(
+        manifest_origin_firewall(),
         local_origin_firewall,
         live_origin_firewall(kubectl, kubeconfig_file.path()),
     );
@@ -760,9 +762,25 @@ spec:
 /// The origin-firewall intent this bootstrap should write into the CR (A4).
 /// Pure.
 ///
-/// `local` is the target store's toggle (`None` = the target never said);
-/// `live` is what the cluster's `PlatformStack` already records (`None` = a
-/// fresh cluster, an older CR, or a read that did not come back).
+/// `manifest` is the Infrastructure manifest's toggle, `local` is the target
+/// store's (`None` = the target never said), and `live` is what the cluster's
+/// `PlatformStack` already records (`None` = a fresh cluster, an older CR, or a
+/// read that did not come back).
+///
+/// **The order is `apply`'s, deliberately.** `apply::cf_origin_enabled` resolves
+/// manifest → target store → `false` when it builds the node's actual firewall,
+/// so anything else here would record an intent the node does not implement.
+///
+/// Without the manifest rung the two authoring routes were asymmetric for no
+/// designed reason: an operator who ran `target firewall cloudflare-origin
+/// enable` got their intent persisted and therefore backed up, while one who
+/// declared it in `Infrastructure` did not. That second operator's restore was
+/// silently unprotected — and silently, since a CR with no field reads as
+/// *unknown*, so the restore had nothing to warn about either. It only bit when
+/// the restore ran without `APPRAFTER_MANIFEST` pointing at their file (from
+/// another machine, mid-incident); with the manifest in reach, `apply` is phase
+/// one of a re-provision and the firewall goes up before the node serves
+/// anything, which is strictly better than this record can manage.
 ///
 /// THE SSA OMISSION TRAP. The render is server-side-applied under field
 /// manager `apprafter-cli`, and under one manager **omitting a field removes
@@ -786,11 +804,59 @@ spec:
 ///   neither a prune nor a rewrite can happen, and the render still only ever
 ///   OMITS when nobody anywhere has an answer.
 ///
-/// The local store wins whenever it has one, in both directions: it is the
-/// authority `apprafter apply` builds the node's real firewall from, so a CR
-/// that disagreed with it would be a record of something untrue.
-pub(crate) fn origin_firewall_for_render(local: Option<bool>, live: Option<bool>) -> Option<bool> {
-    local.or(live)
+/// The manifest wins over the local store, and the local store over the live
+/// value, in both directions: together they are the authority `apprafter apply`
+/// builds the node's real firewall from, so a CR that disagreed with them would
+/// be a record of something untrue. `live` is not an opinion at all — it is the
+/// existing record, consulted only so that having none of our own prunes
+/// nothing.
+pub(crate) fn origin_firewall_for_render(
+    manifest: Option<bool>,
+    local: Option<bool>,
+    live: Option<bool>,
+) -> Option<bool> {
+    manifest.or(local).or(live)
+}
+
+/// The Infrastructure manifest's origin-firewall toggle, read the way
+/// `apply::run` reads it — `APPRAFTER_MANIFEST` or nothing (A4).
+///
+/// Best-effort, like [`live_origin_firewall`]: a bootstrap must never fail over
+/// a field nothing in the cluster reads. An unparseable manifest would already
+/// have failed `apply` before any node existed, so the only route here is a
+/// standalone `cluster-bootstrap` against a cluster that is already up — where
+/// falling through to the target store is the behaviour that shipped. It is
+/// logged rather than swallowed, because falling through silently is how a
+/// wrong value gets recorded as if it were an answer.
+fn manifest_origin_firewall() -> Option<bool> {
+    let path = std::env::var("APPRAFTER_MANIFEST").ok()?;
+    let cwd = std::env::current_dir().ok()?;
+    manifest_origin_firewall_at(&cwd, Path::new(&path))
+}
+
+/// The half of [`manifest_origin_firewall`] that does not touch the process
+/// environment, so it is testable without the cross-test races `set_var` in a
+/// threaded runner invites. Same split `apply` uses for `cf_origin_enabled`.
+fn manifest_origin_firewall_at(cwd: &Path, path: &Path) -> Option<bool> {
+    match manifest::parse_infrastructure(cwd, path) {
+        Ok(m) => origin_firewall_of(&m),
+        Err(e) => {
+            info!(
+                path = %path.display(),
+                error = %e,
+                "APPRAFTER_MANIFEST did not parse — the origin-firewall intent \
+                 recorded in the cluster falls back to the target store"
+            );
+            None
+        }
+    }
+}
+
+/// The toggle an Infrastructure manifest declares, or `None` when it is silent.
+/// The same expression `apply::cf_origin_enabled` uses for its first rung —
+/// deliberately, since the two must not disagree about what a manifest says.
+fn origin_firewall_of(m: &InfrastructureManifest) -> Option<bool> {
+    m.spec.firewall.as_ref().and_then(|f| f.cloudflare_origin)
 }
 
 /// Read the origin-firewall intent already recorded in the cluster, so the
@@ -1605,32 +1671,143 @@ mod tests {
     /// another workstation did). The live value is carried forward for
     /// exactly that case.
     ///
-    /// The local store still wins when it HAS an opinion, in both
-    /// directions: it is what `apprafter apply` builds the node's real
+    /// The local store still wins over the cluster when it HAS an opinion, in
+    /// both directions: it is what `apprafter apply` builds the node's real
     /// firewall from, so a CR that disagreed would be a record of something
     /// untrue.
     #[test]
     fn origin_firewall_for_render_prefers_local_and_preserves_the_live_value() {
         // Nobody knows anything ⇒ write nothing.
-        assert_eq!(origin_firewall_for_render(None, None), None);
+        assert_eq!(origin_firewall_for_render(None, None, None), None);
 
         // The local store says nothing; the cluster does ⇒ carry it forward
         // rather than prune it. BOTH values, because preserving only `true`
         // would turn a recorded `false` into "unknown" on the next bootstrap.
-        assert_eq!(origin_firewall_for_render(None, Some(true)), Some(true));
-        assert_eq!(origin_firewall_for_render(None, Some(false)), Some(false));
+        assert_eq!(
+            origin_firewall_for_render(None, None, Some(true)),
+            Some(true)
+        );
+        assert_eq!(
+            origin_firewall_for_render(None, None, Some(false)),
+            Some(false)
+        );
 
         // The local store has an opinion ⇒ it wins, including when it
         // contradicts the cluster (the operator just ran `disable`).
         assert_eq!(
-            origin_firewall_for_render(Some(false), Some(true)),
+            origin_firewall_for_render(None, Some(false), Some(true)),
             Some(false)
         );
         assert_eq!(
-            origin_firewall_for_render(Some(true), Some(false)),
+            origin_firewall_for_render(None, Some(true), Some(false)),
             Some(true)
         );
-        assert_eq!(origin_firewall_for_render(Some(true), None), Some(true));
+        assert_eq!(
+            origin_firewall_for_render(None, Some(true), None),
+            Some(true)
+        );
+    }
+
+    /// The manifest outranks the target store, matching
+    /// `apply::cf_origin_enabled` — which is the whole point, since that is
+    /// what builds the node's actual firewall. Recording anything else would
+    /// put an intent in the CR that the node does not implement, and every
+    /// later backup would carry that lie.
+    #[test]
+    fn origin_firewall_for_render_lets_the_manifest_outrank_the_target_store() {
+        // The manifest wins in BOTH directions, not just when it says `true`:
+        // an operator who declared `false` in Infrastructure while an old
+        // target-store toggle still said `true` must not have the CR record
+        // a firewall the node does not have.
+        assert_eq!(
+            origin_firewall_for_render(Some(true), Some(false), Some(false)),
+            Some(true)
+        );
+        assert_eq!(
+            origin_firewall_for_render(Some(false), Some(true), Some(true)),
+            Some(false)
+        );
+
+        // With no manifest rung the function must be exactly what it was, or
+        // the CLI-authored route silently changes meaning alongside the fix
+        // for the manifest one.
+        assert_eq!(
+            origin_firewall_for_render(None, Some(true), Some(false)),
+            Some(true)
+        );
+        assert_eq!(
+            origin_firewall_for_render(None, None, Some(true)),
+            Some(true)
+        );
+    }
+
+    fn infra_manifest(value: serde_json::Value) -> InfrastructureManifest {
+        serde_json::from_value(value).expect("valid InfrastructureManifest JSON")
+    }
+
+    /// A manifest that declares the toggle is read, in both directions — a
+    /// declared `false` is an ANSWER, not an absence, or an operator who
+    /// turned the firewall off in Infrastructure would silently inherit an
+    /// old target-store `true` into the CR.
+    #[test]
+    fn a_manifest_that_declares_the_toggle_is_read_in_both_directions() {
+        for declared in [true, false] {
+            let m = infra_manifest(serde_json::json!({
+                "apiVersion": "apprafter.io/v1alpha1",
+                "kind": "Infrastructure",
+                "metadata": {"name": "probe"},
+                "spec": {
+                    "provider": "hetzner-cloud",
+                    "firewall": {"cloudflareOrigin": declared},
+                },
+            }));
+            assert_eq!(
+                origin_firewall_of(&m),
+                Some(declared),
+                "a manifest declaring {declared} must be read as such"
+            );
+        }
+    }
+
+    /// A manifest that says nothing about the firewall leaves the decision to
+    /// the target store. Without this the manifest rung would shadow the CLI
+    /// route for every IaC user, which is the opposite of the fix.
+    #[test]
+    fn a_manifest_silent_on_the_firewall_defers_to_the_target_store() {
+        let silent = infra_manifest(serde_json::json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Infrastructure",
+            "metadata": {"name": "probe"},
+            "spec": {"provider": "hetzner-cloud"},
+        }));
+        assert_eq!(origin_firewall_of(&silent), None);
+
+        // A firewall block carrying only ingress rules is equally silent about
+        // the origin toggle — the two live in the same block, so reading the
+        // block's PRESENCE as an answer would be the easy mistake.
+        let ingress_only = infra_manifest(serde_json::json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "Infrastructure",
+            "metadata": {"name": "probe"},
+            "spec": {
+                "provider": "hetzner-cloud",
+                "firewall": {"ingress": [{"port": "443"}]},
+            },
+        }));
+        assert_eq!(origin_firewall_of(&ingress_only), None);
+    }
+
+    /// A path that does not parse must not become an ANSWER. Falling through
+    /// to the target store is the behaviour that shipped; inventing `false`
+    /// here would record a firewall-less intent for a cluster whose manifest
+    /// may well have asked for one.
+    #[test]
+    fn an_unparseable_manifest_yields_no_opinion_rather_than_false() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            manifest_origin_firewall_at(dir.path(), Path::new("/nonexistent/infra.yaml")),
+            None
+        );
     }
 
     #[test]
