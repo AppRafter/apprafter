@@ -99,6 +99,34 @@ patch of each phase.
 
 ### Fixed
 
+- **A restored cluster serves the domains it brought back.** A backup captured
+  the domains — they live in the `PlatformStack` — but not the certificate
+  serving them: `target cert import` writes a plain TLS Secret, and secret
+  capture only took Secrets with a sealed secret behind them. The Gateway came
+  back pointing at a Secret that was not there, and `target domain list` showed
+  the reference as healthy. Imported certificates are now captured on their own
+  label and re-applied **before** the domains that reference them; a reference
+  with nothing behind it is marked `MISSING` in the listing. The runbook for
+  reconnecting a domain after a restore was also wrong — its second step fails
+  by construction, because the domain is already registered.
+
+- **A restored cluster keeps its origin firewall.** The Cloudflare origin
+  firewall restricts a node's `80`/`443` to Cloudflare's ranges, and its intent
+  lived only in the operator's local target store. `target add` starts a new
+  target with no firewall, so the recommended move-to-a-bigger-machine path —
+  add a target, restore into it with `--reprovision` — brought the new node up
+  **with 80/443 open to the internet**, while the documentation promised the
+  toggle survived re-provisioning.
+
+  The intent is now recorded in the `PlatformStack` as well, so it travels in
+  every backup including the scheduled in-cluster one, and a re-provisioning
+  restore reconciles the destination's firewall from the replayed CR. Note the
+  window this cannot close: the node is provisioned before the snapshot can be
+  read, so its ports are open for the length of the restore. A snapshot taken
+  before this release records no intent, and that reads as *unknown* rather
+  than as *off* — the restore says nothing rather than claiming the source
+  served its ports open.
+
 Three of the four ADR-vs-tree divergences the documentation pass recorded, all
 found by writing the public pages rather than by any gate, and all closed before
 this version was ever published — plus the memory-budget defect the last walk
