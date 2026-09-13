@@ -398,7 +398,7 @@ package platformstack
 	//
 	// `scripts/check-backup-runner-pin.sh` now fails CI when a published
 	// runner is newer than this line, so the next drift is loud.
-	image: string | *"ghcr.io/apprafter/apprafter-backup:v0.2.64"
+	image: string | *"ghcr.io/apprafter/apprafter-backup:v0.2.65"
 
 	// Cron schedule for the full backup Job. Default nightly 03:00.
 	schedule: string | *"0 3 * * *"

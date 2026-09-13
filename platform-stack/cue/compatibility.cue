@@ -1839,8 +1839,41 @@ compatibility: "0.2.69": {
 		Application manifests against a schema this tree no longer has —
 		here, one that does not know `#JetStreamNeed` — and would reject
 		`needs.jetstream` in Argo CD while the apiserver accepts it.
+
+		ALSO ON THIS VERSION, and unrelated to jetstream: the backup
+		findings. Two clusters sharing one restic repository were
+		indistinguishable in it — every snapshot carried the tag
+		`platform-<rfc3339>` on the host `apprafter-backup`, because the
+		cluster id was the parent Argo application's name, a constant.
+		So `restore` without `--snapshot` could roll out a NEIGHBOUR's
+		run, and the nightly `forget --prune`, which listed the whole
+		repository, deleted the neighbour's snapshots — structurally, since
+		prune runs after the clone's own backup and the clone is therefore
+		newest in every retention bucket. Snapshots are now tagged with the
+		`kube-system` namespace UID and carry an operator-chosen
+		cluster-name as the restic host; every listing that feeds a
+		decision is narrowed to the cluster's own. Pre-identity snapshots
+		count as this cluster's and are marked `(legacy)` in `backup list`.
+
+		THE RUNNER IMAGE PIN MOVES to `apprafter-backup:v0.2.65`, and that
+		is load-bearing rather than hygiene: the identity and the prune
+		filter live IN THE RUNNER, so a chart still pinning v0.2.64 would
+		ship the fix's chart half to clusters that keep executing the
+		repo-wide prune. The runner's ClusterRole gains
+		`get namespace/kube-system` (`resourceNames`-scoped) — without it
+		the nightly cannot read the identity it now tags with.
+
+		Restore no longer starts the source's backup schedule. The
+		replayed `PlatformStack` carries `spec.backup` as captured but
+		`enabled` is forced false, so a clone restored beside a LIVING
+		source does not begin writing to that source's repository on its
+		schedule; `--keep-backup-schedule` opts into the inheritance for
+		the disaster-recovery case, where it is what you want.
 		"""
-	references: ["docs/adr/0061-needs-jetstream-nats.md"]
+	references: [
+		"docs/adr/0061-needs-jetstream-nats.md",
+		"docs/adr/0050-backup-restore.md",
+	]
 }
 
 compatibility: "0.2.68": {
