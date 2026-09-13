@@ -605,7 +605,7 @@ wait_jsonpath "$CLAIM_RES" "$APP_NS" "$DISK_CLAIM" '{.status.ready}' true 300
 wait_jsonpath "$CLAIM_RES" "$APP_NS" "$PG_CLAIM" '{.status.ready}' true 360
 wait_jsonpath "$CLAIM_RES" "$APP_NS" "$REDIS_CLAIM" '{.status.ready}' true 360
 wait_jsonpath "$APP_RES" "$APP_NS" "$APP" '{.status.phase}' Ready 300
-kubectl -n "$APP_NS" wait --for=condition=Available "deployment/${APP}" --timeout=300s
+wait_condition "$APP_NS" "deployment/${APP}" Available 300
 retry 40 5 -- kubectl -n "$APP_NS" wait --for=condition=Ready \
     pod -l "app.kubernetes.io/name=${APP}" --timeout=20s
 
@@ -901,7 +901,7 @@ else
     wait_jsonpath "$CLAIM_RES" "$APP_NS" "$DISK_CLAIM" '{.status.ready}' true 360
     wait_jsonpath "$CLAIM_RES" "$APP_NS" "$PG_CLAIM" '{.status.ready}' true 420
     wait_jsonpath "$APP_RES" "$APP_NS" "$APP" '{.status.phase}' Ready 360
-    kubectl -n "$APP_NS" wait --for=condition=Available "deployment/${APP}" --timeout=360s
+    wait_condition "$APP_NS" "deployment/${APP}" Available 360
     retry 40 5 -- kubectl -n "$APP_NS" wait --for=condition=Ready \
         pod -l "app.kubernetes.io/name=${APP}" --timeout=20s
     printf '  ok: restore did not hang — claims ready (R1), app auto-registered + Ready\n'
@@ -1003,7 +1003,7 @@ else
 
     # After a --data-only restore the workloads resume; the marker is back to
     # the backed-up value (the data was reloaded, app re-created on it).
-    kubectl -n "$APP_NS" wait --for=condition=Available "deployment/${APP}" --timeout=360s
+    wait_condition "$APP_NS" "deployment/${APP}" Available 360
     retry 40 5 -- kubectl -n "$APP_NS" wait --for=condition=Ready \
         pod -l "app.kubernetes.io/name=${APP}" --timeout=20s
     RPOD2="$(app_pod "$APP")"

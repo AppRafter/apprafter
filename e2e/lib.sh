@@ -85,6 +85,51 @@ retry() {
 }
 
 # ---------------------------------------------------------------
+# wait_condition <ns> <kind/name> <condition> [timeout-secs]
+#
+# `kubectl wait` does NOT wait for an object to be CREATED. Against a
+# name that does not exist yet it returns immediately with
+# `Error from server (NotFound)`; the --timeout only governs how long it
+# waits for the CONDITION once the object is already there.
+#
+# That makes a bare `kubectl wait --for=condition=Available deployment/X`
+# a race whenever X is created asynchronously by a controller rather than
+# by the walk's own `kubectl apply` — and the race is silent until it is
+# lost. It cost the `needs.redis` nightly two runs (2026-09-06 and
+# 2026-09-12, both `deployments.apps "api" not found` at Phase 14) while
+# reading as a product failure both times: the ResourceClaim had gone
+# ready, but the Application controller had not yet rendered the
+# Deployment. Ten of twelve nights passed, which is exactly why nothing
+# caught it.
+#
+# So: poll for existence first (tolerating NotFound), then hand over to
+# `kubectl wait` for the condition itself. The timeout covers BOTH
+# phases, so a caller's budget means what it says.
+# ---------------------------------------------------------------
+wait_condition() {
+    local ns="$1" ref="$2" cond="$3" timeout="${4:-300}"
+    local deadline
+    deadline=$(( $(date +%s) + timeout ))
+
+    printf '  wait %s -n %s for condition=%s (timeout %ss) ...\n' \
+        "$ref" "$ns" "$cond" "$timeout"
+
+    until kubectl -n "$ns" get "$ref" >/dev/null 2>&1; do
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            printf 'FAILED: %s never appeared in %s within %ss (the controller did not create it)\n' \
+                "$ref" "$ns" "$timeout" >&2
+            kubectl -n "$ns" get all >&2 2>&1 || true
+            return 1
+        fi
+        sleep 2
+    done
+
+    local left=$(( deadline - $(date +%s) ))
+    [ "$left" -lt 5 ] && left=5
+    kubectl -n "$ns" wait --for="condition=${cond}" "$ref" --timeout="${left}s"
+}
+
+# ---------------------------------------------------------------
 # cluster_runtime — which local-cluster tool to use.
 #   "k3d"  when a docker daemon is reachable (CI runners use docker).
 #   "kind" otherwise — the nix-dev default is rootless podman, and kind

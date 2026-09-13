@@ -1028,7 +1028,7 @@ apprafter volume create "$SV" --size "$SV_SIZE" -n "$APP_NS"
 wait_jsonpath "$SV_RES" "$APP_NS" "$SV" '{.status.ready}' true 240
 apply_consumer_app "$APP_A" "cap"
 wait_jsonpath "$APP_RES" "$APP_NS" "$APP_A" '{.status.phase}' Ready 240
-kubectl -n "$APP_NS" wait --for=condition=Available "deployment/${APP_A}" --timeout=300s
+wait_condition "$APP_NS" "deployment/${APP_A}" Available 300
 
 # Capacity is BEST-EFFORT: the operator samples the kubelet Summary API
 # through the apiserver node-proxy. On kind that may not be reachable, so we

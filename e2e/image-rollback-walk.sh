@@ -312,7 +312,7 @@ PREV0=$(cr_jp '{.status.image.previous.resolved}')
 [ -z "$PREV0" ] && ok "P1 no retained digest yet (nothing has moved)" \
     || mark_fail "P1 status.image.previous is already ${PREV0} before anything moved"
 
-kubectl wait --for=condition=Available "deployment/${APP_NAME}" -n "$APP_NS" --timeout=300s >/dev/null
+wait_condition "$APP_NS" "deployment/${APP_NAME}" Available 300 >/dev/null
 ok "P1 workload Available"
 
 # ---------------------------------------------------------------

@@ -594,7 +594,7 @@ apply_test_app
 wait_jsonpath "$CLAIM_RES" "$APP_NS" "$PG_CLAIM" '{.status.ready}' true 360
 wait_jsonpath "$CLAIM_RES" "$APP_NS" "$REDIS_CLAIM" '{.status.ready}' true 360
 wait_jsonpath "$APP_RES" "$APP_NS" "$APP" '{.status.phase}' Ready 300
-kubectl -n "$APP_NS" wait --for=condition=Available "deployment/${APP}" --timeout=300s
+wait_condition "$APP_NS" "deployment/${APP}" Available 300
 retry 40 5 -- kubectl -n "$APP_NS" wait --for=condition=Ready pod -l "app.kubernetes.io/name=${APP}" --timeout=20s
 POD="$(app_pod "$APP")"
 [ -n "$POD" ] || { printf 'FAILED: no app pod\n' >&2; exit 1; }
@@ -963,7 +963,7 @@ else
     wait_jsonpath "$CLAIM_RES" "$APP_NS" "$PG_CLAIM" '{.status.ready}' true 420
     wait_jsonpath "$CLAIM_RES" "$APP_NS" "$REDIS_CLAIM" '{.status.ready}' true 420
     wait_jsonpath "$APP_RES" "$APP_NS" "$APP" '{.status.phase}' Ready 360
-    kubectl -n "$APP_NS" wait --for=condition=Available "deployment/${APP}" --timeout=360s
+    wait_condition "$APP_NS" "deployment/${APP}" Available 360
     retry 40 5 -- kubectl -n "$APP_NS" wait --for=condition=Ready pod -l "app.kubernetes.io/name=${APP}" --timeout=20s
     RPOD="$(app_pod "$APP")"
     [ -n "$RPOD" ] || { printf 'FAILED: no restored app pod\n' >&2; exit 1; }

@@ -645,7 +645,7 @@ wait_cms_ready() {
     claim="$(wait_pg_claim_ready 720)"
     printf '  ok: pg claim resolved to %s\n' "$claim"
     wait_jsonpath "$APP_RES" "$CMS_NS" "$CMS_APP" '{.status.phase}' Ready 600
-    kubectl -n "$CMS_NS" wait --for=condition=Available "deployment/${CMS_APP}" --timeout=600s
+    wait_condition "$CMS_NS" "deployment/${CMS_APP}" Available 600
     retry 40 8 -- kubectl -n "$CMS_NS" wait --for=condition=Ready \
         pod -l "app.kubernetes.io/name=${CMS_APP}" --timeout=20s
 }

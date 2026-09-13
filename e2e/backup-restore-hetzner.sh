@@ -518,7 +518,7 @@ wait_cms_ready() {
     wait_jsonpath "$CLAIM_RES" "$CMS_NS" "$CMS_PG_CLAIM" '{.status.ready}' true 480
     wait_jsonpath "$APP_RES" "$CMS_NS" "$CMS_APP" '{.status.phase}' Ready 480
     # The CMS is deployed via --env dev, so the operator renders one Deployment.
-    kubectl -n "$CMS_NS" wait --for=condition=Available "deployment/${CMS_APP}" --timeout=480s
+    wait_condition "$CMS_NS" "deployment/${CMS_APP}" Available 480
     retry 40 8 -- kubectl -n "$CMS_NS" wait --for=condition=Ready \
         pod -l "app.kubernetes.io/name=${CMS_APP}" --timeout=20s
 }
@@ -681,7 +681,7 @@ PG_DUMP_OLD="${EXPORT_DIR_OLD}/pg/${CMS_NS}/${CMS_PG_CLAIM}.dump"
 toc_pod="dr-toc-$(date +%s%N | tail -c 8)"
 if kubectl -n "$CMS_NS" run "$toc_pod" --restart=Never --image="$PSQL_IMAGE" \
         --command -- sleep 300 >/dev/null 2>&1 \
-   && kubectl -n "$CMS_NS" wait --for=condition=Ready "pod/$toc_pod" --timeout=120s >/dev/null 2>&1 \
+   && wait_condition "$CMS_NS" "pod/$toc_pod" Ready 120 >/dev/null 2>&1 \
    && kubectl -n "$CMS_NS" cp "$PG_DUMP_OLD" "${toc_pod}:/tmp/old.dump" ; then
     toc=$(kubectl -n "$CMS_NS" exec "$toc_pod" -- pg_restore -l /tmp/old.dump 2>/dev/null || true)
     kubectl -n "$CMS_NS" delete pod "$toc_pod" --wait=false >/dev/null 2>&1 || true

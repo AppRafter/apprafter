@@ -231,7 +231,7 @@ wait_platform_ready() {
 wait_cms_ready() {
     wait_jsonpath resourceclaim.apprafter.io "$CMS_NS" "$CMS_PG_CLAIM" '{.status.ready}' true 480
     wait_jsonpath "$APP_RES" "$CMS_NS" "$CMS_APP" '{.status.phase}' Ready 480
-    kubectl -n "$CMS_NS" wait --for=condition=Available "deployment/${CMS_APP}" --timeout=480s
+    wait_condition "$CMS_NS" "deployment/${CMS_APP}" Available 480
     retry 40 8 -- kubectl -n "$CMS_NS" wait --for=condition=Ready \
         pod -l "app.kubernetes.io/name=${CMS_APP}" --timeout=20s
 }

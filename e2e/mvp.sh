@@ -192,8 +192,7 @@ spec:
       targetPort: 80
 EOF
 
-kubectl wait --for=condition=Available deployment/e2e-hello \
-    --namespace default --timeout=180s
+wait_condition default "deployment/e2e-hello" Available 180
 printf '  e2e-hello Deployment -> Available\n'
 
 phase "Step 3c: in-cluster endpoint verification"
@@ -263,8 +262,7 @@ if [ "$phase_val" != "Ready" ]; then
     exit 1
 fi
 
-kubectl wait --for=condition=Available deployment/parser \
-    --namespace default --timeout=60s
+wait_condition default "deployment/parser" Available 60
 printf '  child Deployment parser -> Available\n'
 
 # ---------------------------------------------------------------

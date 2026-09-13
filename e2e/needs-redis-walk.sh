@@ -1031,8 +1031,7 @@ env_pfx_key=$(kubectl -n "$APP_NS" get deployment "$APP" \
     2>/dev/null || true)
 assert_eq "Deployment env REDIS_CHANNEL_PREFIX secretKeyRef.key" "$env_pfx_key" "channelPrefix"
 
-kubectl -n "$APP_NS" wait --for=condition=Available \
-    "deployment/${APP}" --timeout=300s
+wait_condition "$APP_NS" "deployment/${APP}" Available 300
 printf '  Deployment %s -> Available\n' "$APP"
 
 # ===============================================================
@@ -1729,8 +1728,7 @@ admin_pw_2=$(jp secret "$DF_NS" "$DF_ADMIN_SECRET" '{.data.password}')
 assert_eq "admin password is byte-identical after the reap round-trip" \
     "$admin_pw_2" "$EPH_ADMIN_PW_1"
 
-kubectl -n "$APP_NS" wait --for=condition=Available \
-    "deployment/${APP2}" --timeout=300s
+wait_condition "$APP_NS" "deployment/${APP2}" Available 300
 printf '  Deployment %s -> Available on the re-created pool instance\n' "$APP2"
 
 # ===============================================================
