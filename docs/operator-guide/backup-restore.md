@@ -394,11 +394,24 @@ declared dependency:
 | `redis` with `persistent: true` | the **whole Dragonfly instance** the claim shares — a `SAVE`, then a tar of its snapshot directory. Backup dedupes by instance, so every persistent claim on it travels together | — |
 | `redis` with `persistent: false` | nothing | a cache by declaration, with no durable volume to snapshot. A restore re-provisions it empty |
 
-**Every other `needs` type is skipped, silently and by design.** `jetstream`,
-`clickhouse`, `s3` and `notifications` have no capture path in this release,
-so a cluster using one of them is **not**
-fully covered by a backup. Nothing warns you at backup time; this table is the
-warning.
+**Every other `needs` type is captured as configuration only.** `jetstream`,
+`clickhouse`, `s3` and `notifications` have no capture path, so the claim comes
+back on a restore and comes back **empty** — a cluster using one of them is
+**not** fully covered by a backup.
+
+For `jetstream`, the one of those that ships, this is said out loud rather than
+left to this table: `apprafter backup create` names the claims it captured as
+configuration only, and `apprafter backup show` repeats it under the contents of
+the snapshot you are about to restore.
+
+```text
+  ⚠ jetstream: 2 claim(s) captured as configuration only — no jetstream data is
+    in this backup, so a restore brings them back empty: shop/events, shop/audit
+```
+
+The manifest carries the same statement per claim, so a snapshot describes
+itself. Copy anything you need out of a stream yourself before you rely on a
+backup of it.
 
 ### The objects that describe your cluster
 

@@ -321,6 +321,23 @@ criterion turned up, in the same spirit and by the same route.
   function, so `show` and `restore` cannot disagree about which snapshot
   `latest` is.
 
+- **A backup no longer looks complete while holding no JetStream data.** The
+  extraction planner emits work for `pg`, `disk`/`shared-disk` and persistent
+  `redis`; every other claim type fell through a silent arm — while still
+  landing in `manifest.resources`, where `backup show` listed it like any other
+  claim. The snapshot read as complete and was not, and `jetstream` is the type
+  where that matters, because it ships and a cluster can hold real streams
+  today.
+
+  Such a claim is now marked `no_data` in the manifest, and both `backup create`
+  and `backup show` name it: which claims, of which type, and that a restore
+  brings them back empty. `export` says it too — same planner, same manifest,
+  same gap — and the two manifest builders that had drifted apart are now one
+  function. `clickhouse` and `s3` take the same silent arm and are deliberately
+  NOT announced: neither ships, so such a claim provisions nothing and there is
+  no data to miss. Capturing the streams is separate, larger work and is not
+  underway; nothing in the wording suggests otherwise.
+
 ### Added
 
 - **`spec.backup.clusterName`** — the name this cluster's snapshots are listed

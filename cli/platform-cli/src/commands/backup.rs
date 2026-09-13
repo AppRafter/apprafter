@@ -60,8 +60,8 @@ use std::time::Duration;
 use backup_core::cluster::{
     classify_snapshot, identity_read_error, SnapshotOrigin, IDENTITY_NAMESPACE,
 };
-use backup_core::engine::BackupOpts;
-use backup_core::extract::plan_extraction;
+use backup_core::engine::{resource_refs, BackupOpts};
+use backup_core::extract::{claims_without_data_capture, plan_extraction, UncapturedClaim};
 use backup_core::prune::{run_prune, RetentionPolicy};
 use backup_core::restic::{
     restic_check_argv, restic_dump_argv, restic_ls_argv, restic_stats_argv, restic_unlock_argv,
@@ -76,7 +76,6 @@ use cli_providers::backup::extract::run_extraction;
 use cli_providers::backup::images::pg_helper_image;
 use cli_providers::backup::manifest::BackupManifest;
 use cli_providers::backup::restic::restic_snapshots_argv;
-use cli_providers::backup::ResourceRef;
 use cli_providers::k8s::kubectl::KubectlCli;
 use cli_providers::k8s::sealing::{build_sealed_secret, fetch_controller_public_key};
 use serde_json::Value;
@@ -891,49 +890,6 @@ fn platform_version_of(ps: Option<&Value>) -> String {
         .to_string()
 }
 
-/// Build the `ResourceRef`s recorded in `manifest.json` from the captured
-/// config CRs + app CRs + claims. Pure-ish (operates on already-fetched
-/// JSON), kept private since it just shapes the manifest body.
-fn resource_refs(crs: &[(&str, &Value)], claims: &[Value]) -> Vec<ResourceRef> {
-    let mut refs = Vec::new();
-    for (kind, cr) in crs {
-        refs.push(ResourceRef {
-            namespace: cr
-                .pointer("/metadata/namespace")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            kind: (*kind).to_string(),
-            name: cr
-                .pointer("/metadata/name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            claim_type: None,
-        });
-    }
-    for c in claims {
-        refs.push(ResourceRef {
-            namespace: c
-                .pointer("/metadata/namespace")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            kind: "ResourceClaim".to_string(),
-            name: c
-                .pointer("/metadata/name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            claim_type: c
-                .pointer("/spec/type")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        });
-    }
-    refs
-}
-
 /// The CNPG operator's own namespace, where the lazily-provisioned shared
 /// integrated `platform-postgres` Cluster lives (never in an app namespace).
 const CNPG_OPERATOR_NS: &str = "cnpg-system";
@@ -1456,7 +1412,14 @@ pub fn run_export(namespaces: &[String], select: bool, out: Option<&str>) -> Res
 
     print!(
         "{}",
-        export_summary(&cluster_id, &out_dir, &ns_set, claims.len(), plan.len())
+        export_summary(
+            &cluster_id,
+            &out_dir,
+            &ns_set,
+            claims.len(),
+            plan.len(),
+            &claims_without_data_capture(&claims),
+        )
     );
     Ok(())
 }
@@ -1505,13 +1468,54 @@ fn export_summary(
     namespaces: &[String],
     claim_count: usize,
     extractable_count: usize,
+    uncaptured: &[UncapturedClaim],
 ) -> String {
-    format!(
+    let mut out = format!(
         "✓ Exported {} namespace(s) from cluster '{cluster_id}' → {}\n  namespaces: {}\n  claims:     {claim_count} ({extractable_count} extractable)\n",
         namespaces.len(),
         out_dir.display(),
         namespaces.join(", "),
-    )
+    );
+    for line in uncaptured_claims_lines(uncaptured, "export") {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+/// What a summary says about claims it captured as CONFIGURATION ONLY (A6).
+/// One line per claim type, each naming the claims. Pure.
+///
+/// The whole point of the finding: the claim lands in `manifest.resources` and
+/// `backup show` lists it, so the snapshot reads as complete while holding none
+/// of that claim's data. Saying it at capture time is what makes it knowable
+/// before the restore rather than after — so both `backup create` and
+/// `backup show` print this, from the same function, and an `export` does too
+/// because it has exactly the same gap.
+///
+/// Deliberately says nothing about capture arriving later: it is separate,
+/// larger work and is not underway, and a summary that hinted otherwise would
+/// be inviting an operator to wait for it.
+fn uncaptured_claims_lines(uncaptured: &[UncapturedClaim], artifact: &str) -> Vec<String> {
+    let mut by_type: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for c in uncaptured {
+        by_type
+            .entry(c.claim_type.as_str())
+            .or_default()
+            .push(format!("{}/{}", c.namespace, c.name));
+    }
+    by_type
+        .into_iter()
+        .map(|(ty, mut names)| {
+            names.sort();
+            format!(
+                "  ⚠ {ty}: {} claim(s) captured as configuration only — no {ty} data is in this \
+                 {artifact}, so a restore brings them back empty: {}",
+                names.len(),
+                names.join(", ")
+            )
+        })
+        .collect()
 }
 
 /// Parse the local-pull `apprafter backup --staging-mode` flag into a
@@ -1683,6 +1687,13 @@ fn backup_summary_report(
     );
     if let Some(id) = &summary.snapshot_id {
         out.push_str(&format!("  snapshot:   {id}\n"));
+    }
+    // A6, last so it is the line left on screen: the claims this run captured
+    // as configuration only. Absent — and silent — on the clusters that
+    // declare none, which is most of them.
+    for line in uncaptured_claims_lines(&summary.uncaptured_claims, "backup") {
+        out.push_str(&line);
+        out.push('\n');
     }
     out
 }
@@ -2751,7 +2762,56 @@ where
             out.push_str(&format!("    {kind:<width$}  {n}\n"));
         }
     }
+    // A6: the claim counts above say a claim is in the snapshot; they cannot
+    // say whether its DATA is. For the types that have no capture path, this
+    // is the difference between a snapshot that reads complete and one that is
+    // — so it is stated here, under the listing it qualifies.
+    for line in uncaptured_claims_lines(&uncaptured_claims_of(&resources), "snapshot") {
+        out.push_str(&line);
+        out.push('\n');
+    }
     out
+}
+
+/// The claims a snapshot's manifest lists as carrying no data of their own
+/// (A6). Pure.
+///
+/// Reads the manifest's own `no_data` marker first — a snapshot should be able
+/// to describe itself — and falls back to what THIS build knows has no capture
+/// path, so a snapshot taken before the marker existed still gets an honest
+/// answer instead of reading as complete.
+fn uncaptured_claims_of(resources: &[Value]) -> Vec<UncapturedClaim> {
+    resources
+        .iter()
+        .filter(|r| r.pointer("/kind").and_then(Value::as_str) == Some("ResourceClaim"))
+        .filter_map(|r| {
+            let claim_type = r
+                .pointer("/claim_type")
+                .or_else(|| r.pointer("/claimType"))
+                .and_then(Value::as_str)?;
+            let marked = r
+                .pointer("/no_data")
+                .or_else(|| r.pointer("/noData"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !marked && !backup_core::extract::claim_type_has_no_data_capture(claim_type) {
+                return None;
+            }
+            Some(UncapturedClaim {
+                namespace: r
+                    .pointer("/namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                name: r
+                    .pointer("/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                claim_type: claim_type.to_string(),
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -8586,6 +8646,7 @@ mod tests {
             &["demo".to_string(), "prod".to_string()],
             5,
             2,
+            &[],
         );
         assert!(s.contains("2 namespace(s)"), "{s}");
         assert!(s.contains("demo, prod"), "{s}");
@@ -8642,6 +8703,7 @@ mod tests {
             cert_count: 0,
             claim_count: 5,
             extracted_count: 2,
+            uncaptured_claims: Vec::new(),
             tag: "apprafter/prod-cluster/2026-08-01".into(),
         };
         let none = backup_summary_report(
@@ -8684,6 +8746,7 @@ mod tests {
             cert_count: 1,
             claim_count: 5,
             extracted_count: 2,
+            uncaptured_claims: Vec::new(),
             tag: "t".into(),
         };
         let with = backup_summary_report("prod", "s3:https://h/b", &["prod".into()], &summary);
@@ -8698,6 +8761,153 @@ mod tests {
             without.contains("4 secret(s), 5 claim(s)"),
             "no certificate, no clause: {without}"
         );
+    }
+
+    // =======================================================================
+    // A6 — claims captured as configuration only
+    // =======================================================================
+
+    fn jetstream_claim(ns: &str, name: &str) -> UncapturedClaim {
+        UncapturedClaim {
+            namespace: ns.into(),
+            name: name.into(),
+            claim_type: "jetstream".into(),
+        }
+    }
+
+    /// FIRES: the run summary names the type, the count and the claims, and
+    /// says what a restore of them produces. Without this the operator's only
+    /// evidence is a claim count that looks right.
+    #[test]
+    fn the_backup_summary_names_the_claims_it_captured_as_configuration_only() {
+        let summary = backup_core::engine::BackupSummary {
+            snapshot_id: Some("abc123".into()),
+            cr_count: 3,
+            secret_count: 4,
+            cert_count: 0,
+            claim_count: 5,
+            extracted_count: 2,
+            uncaptured_claims: vec![
+                jetstream_claim("demo", "events"),
+                jetstream_claim("demo", "audit"),
+            ],
+            tag: "t".into(),
+        };
+        let s = backup_summary_report("prod", "s3:https://h/b", &["demo".into()], &summary);
+        assert!(s.contains("jetstream: 2 claim(s)"), "{s}");
+        assert!(s.contains("demo/audit, demo/events"), "sorted + named: {s}");
+        assert!(s.contains("brings them back empty"), "{s}");
+        // …and says nothing about capture arriving later: it is separate work
+        // that is not underway, and a hint here invites someone to wait.
+        for tease in ["yet", "coming", "future", "soon", "will be"] {
+            assert!(
+                !s.contains(tease),
+                "must not promise capture ({tease}): {s}"
+            );
+        }
+    }
+
+    /// DOES NOT FIRE on the clusters that declare none — which is most of
+    /// them. A line printed on every backup is a line nobody reads.
+    #[test]
+    fn the_backup_summary_is_silent_when_every_claim_was_captured() {
+        let summary = backup_core::engine::BackupSummary {
+            snapshot_id: Some("abc123".into()),
+            cr_count: 3,
+            secret_count: 4,
+            cert_count: 0,
+            claim_count: 2,
+            extracted_count: 2,
+            uncaptured_claims: Vec::new(),
+            tag: "t".into(),
+        };
+        let s = backup_summary_report("prod", "s3:https://h/b", &["demo".into()], &summary);
+        assert!(!s.contains("configuration only"), "{s}");
+        assert!(!s.contains("jetstream"), "{s}");
+    }
+
+    /// `export` has the same gap and gets the same line: it plans its
+    /// extraction with the same function and writes the same manifest.
+    #[test]
+    fn the_export_summary_says_it_too() {
+        let s = export_summary(
+            "prod",
+            Path::new("/srv/dump"),
+            &["demo".to_string()],
+            3,
+            2,
+            &[jetstream_claim("demo", "events")],
+        );
+        assert!(s.contains("jetstream: 1 claim(s)"), "{s}");
+        assert!(s.contains("demo/events"), "{s}");
+        assert!(
+            s.contains("in this export"),
+            "names the artifact it is: {s}"
+        );
+    }
+
+    /// FIRES: `backup show` reads the marker out of the manifest, so an
+    /// operator deciding what to restore learns it from the snapshot itself.
+    #[test]
+    fn backup_show_says_which_listed_claims_carry_no_data() {
+        let manifest = json!({
+            "clusterId": "prod", "platformVersion": "0.2.65",
+            "namespaces": ["demo"],
+            "resources": [
+                {"namespace": "demo", "kind": "ResourceClaim", "name": "events",
+                 "claim_type": "jetstream", "no_data": true},
+                {"namespace": "demo", "kind": "ResourceClaim", "name": "db",
+                 "claim_type": "pg"},
+            ]
+        });
+        let out =
+            format_snapshot_contents("abc123", None, None, &manifest, Some(0), &chrono::Utc, None);
+        // The listing still says the claim is in the snapshot …
+        assert!(
+            out.contains("ResourceClaim  2  (jetstream 1, pg 1)"),
+            "{out}"
+        );
+        // … and the qualifier says what it is NOT.
+        assert!(out.contains("jetstream: 1 claim(s)"), "{out}");
+        assert!(out.contains("demo/events"), "{out}");
+        assert!(out.contains("in this snapshot"), "{out}");
+        assert!(
+            !out.contains("demo/db"),
+            "the pg claim is not qualified: {out}"
+        );
+    }
+
+    /// A snapshot written before the marker existed still gets an honest
+    /// answer, from what this build knows has no capture path. The alternative
+    /// is a pre-marker snapshot reading as complete forever.
+    #[test]
+    fn backup_show_falls_back_to_the_type_when_the_manifest_predates_the_marker() {
+        let manifest = json!({
+            "clusterId": "prod", "platformVersion": "0.2.64",
+            "resources": [
+                {"namespace": "demo", "kind": "ResourceClaim", "name": "events",
+                 "claim_type": "jetstream"},
+            ]
+        });
+        let out =
+            format_snapshot_contents("abc123", None, None, &manifest, Some(0), &chrono::Utc, None);
+        assert!(out.contains("jetstream: 1 claim(s)"), "{out}");
+    }
+
+    /// DOES NOT FIRE for a snapshot whose claims all carry data.
+    #[test]
+    fn backup_show_is_silent_when_nothing_is_missing() {
+        let manifest = json!({
+            "clusterId": "prod", "platformVersion": "0.2.65",
+            "resources": [
+                {"namespace": "demo", "kind": "ResourceClaim", "name": "db",
+                 "claim_type": "pg"},
+                {"namespace": "demo", "kind": "Application", "name": "shop"},
+            ]
+        });
+        let out =
+            format_snapshot_contents("abc123", None, None, &manifest, Some(0), &chrono::Utc, None);
+        assert!(!out.contains("configuration only"), "{out}");
     }
 
     #[test]

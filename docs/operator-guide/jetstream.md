@@ -387,6 +387,20 @@ off or re-register it elsewhere, not to retire one.
     are in
     [How it works](../how-it-works/needs-jetstream.md#the-grace-window-and-the-reclaim).
 
+## A backup does not carry the messages
+
+`apprafter backup create` captures the **claim** — the account, the streams it
+declares, the connection binding — and none of the data in them. A restore
+brings the claim back and it comes back empty. This is stated at capture time
+rather than left to be discovered: the run summary names the claims it captured
+as configuration only, and `apprafter backup show` repeats it for the snapshot
+you are about to restore. See [What a backup
+captures](backup-restore.md#what-a-backup-captures).
+
+If the messages matter, copy them out yourself — `nats stream backup` against
+the account's own credentials — on whatever schedule matches what losing them
+would cost.
+
 ## How it works
 
 [Declared JetStream dependencies](../how-it-works/needs-jetstream.md) covers why

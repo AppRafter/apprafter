@@ -41,4 +41,23 @@ pub struct ResourceRef {
     /// For ResourceClaims / data artifacts: the claim type (pg/redis/disk/shared-disk). None for config CRs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_type: Option<String>,
+    /// A6. `true` marks a ResourceClaim that IS in this backup while its DATA
+    /// is not: the claim comes back on a restore, empty.
+    ///
+    /// The claim is listed rather than dropped because the restore genuinely
+    /// replays it — what would be dishonest is listing it with no way to tell
+    /// it apart from a claim whose data is there. Written by
+    /// [`extract::claim_type_has_no_data_capture`], so the manifest carries the
+    /// statement rather than leaving every reader to know the rule.
+    ///
+    /// Absent (= `false`) on config CRs and on every claim whose data is
+    /// captured, which is also how a manifest written before this field reads.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub no_data: bool,
+}
+
+/// `skip_serializing_if` for a `bool` that means "not the ordinary case": keeps
+/// the manifest free of a key on every resource that has nothing to declare.
+fn is_false(b: &bool) -> bool {
+    !*b
 }

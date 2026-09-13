@@ -3162,6 +3162,7 @@ mod tests {
             kind: kind.into(),
             name: name.into(),
             claim_type: None,
+            no_data: false,
         }
     }
 

@@ -118,6 +118,7 @@ mod tests {
                 kind: "Application".into(),
                 name: "alpha".into(),
                 claim_type: None,
+                no_data: false,
             }],
         };
         let v = serde_json::to_value(&m).unwrap();

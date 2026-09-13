@@ -11,7 +11,7 @@ use base64::Engine as _;
 use cli_core::{CliError, Result};
 use serde_json::Value;
 
-use crate::extract::{plan_extraction, run_extraction};
+use crate::extract::{claims_without_data_capture, plan_extraction, run_extraction};
 use crate::kube::KubeExec;
 use crate::manifest::BackupManifest;
 use crate::restic::{restic_backup_argv, restic_init_argv, restic_snapshots_argv};
@@ -245,7 +245,12 @@ fn sourcecred_material_refs(sc: &Value) -> Vec<(String, String)> {
 }
 
 /// Build the `ResourceRef`s recorded in `manifest.json`.
-fn resource_refs(crs: &[(&str, &Value)], claims: &[Value]) -> Vec<ResourceRef> {
+///
+/// `pub` because `export` writes the same manifest shape from the CLI side and
+/// used to do it through a byte-identical copy of this function. Two copies of
+/// the rule is how a marker lands in a `backup` manifest and not in an
+/// `export` one, which is the A6 defect in miniature — so there is one.
+pub fn resource_refs(crs: &[(&str, &Value)], claims: &[Value]) -> Vec<ResourceRef> {
     let mut refs = Vec::new();
     for (kind, cr) in crs {
         refs.push(ResourceRef {
@@ -261,9 +266,14 @@ fn resource_refs(crs: &[(&str, &Value)], claims: &[Value]) -> Vec<ResourceRef> {
                 .unwrap_or("")
                 .to_string(),
             claim_type: None,
+            no_data: false,
         });
     }
     for c in claims {
+        let claim_type = c
+            .pointer("/spec/type")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         refs.push(ResourceRef {
             namespace: c
                 .pointer("/metadata/namespace")
@@ -276,10 +286,14 @@ fn resource_refs(crs: &[(&str, &Value)], claims: &[Value]) -> Vec<ResourceRef> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
-            claim_type: c
-                .pointer("/spec/type")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            // A6: the claim is listed either way — what the marker adds is the
+            // ability to tell "restored with its data" from "restored empty"
+            // by reading the snapshot, rather than by knowing which types this
+            // build happens to dump.
+            no_data: claim_type
+                .as_deref()
+                .is_some_and(crate::extract::claim_type_has_no_data_capture),
+            claim_type,
         });
     }
     refs
@@ -544,6 +558,11 @@ pub struct BackupSummary {
     pub cert_count: usize,
     pub claim_count: usize,
     pub extracted_count: usize,
+    /// A6: the claims this run captured as configuration only, because no
+    /// capture path exists for their type. Named rather than counted so the
+    /// summary can say WHICH application is affected — a count alone sends the
+    /// reader back to `backup show` to find out.
+    pub uncaptured_claims: Vec<crate::extract::UncapturedClaim>,
     pub tag: String,
 }
 
@@ -780,6 +799,7 @@ fn imported_cert_refs(certs: &[Value]) -> Vec<ResourceRef> {
                 .unwrap_or("")
                 .to_string(),
             claim_type: None,
+            no_data: false,
         })
         .collect()
 }
@@ -890,6 +910,7 @@ fn run_backup_monolithic_with_summary(
         cert_count: non_claim.cert_count,
         claim_count: claims.len(),
         extracted_count: plan.len(),
+        uncaptured_claims: claims_without_data_capture(&claims),
         tag,
     })
 }
@@ -973,6 +994,7 @@ fn run_backup_sequential_with_summary(
         cert_count: non_claim.cert_count,
         claim_count: claims.len(),
         extracted_count: plan.len(),
+        uncaptured_claims: claims_without_data_capture(&claims),
         tag,
     })
 }
@@ -1574,6 +1596,7 @@ mod tests {
                     kind: "Application".into(),
                     name: "alpha".into(),
                     claim_type: None,
+                    no_data: false,
                 },
                 ResourceRef {
                     // A cluster-scoped CR records an empty namespace.
@@ -1581,6 +1604,7 @@ mod tests {
                     kind: "PlatformStack".into(),
                     name: "default".into(),
                     claim_type: None,
+                    no_data: false,
                 },
                 ResourceRef {
                     namespace: "demo".into(),
@@ -1589,6 +1613,7 @@ mod tests {
                     kind: "ResourceClaim".into(),
                     name: "pg-0".into(),
                     claim_type: Some("pg".into()),
+                    no_data: false,
                 },
             ]
         );
@@ -1603,6 +1628,42 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].kind, "ResourceClaim");
         assert_eq!(refs[0].claim_type, None);
+        assert!(
+            !refs[0].no_data,
+            "an unknown type is not a claim known to hold no data"
+        );
+    }
+
+    /// A6 FIRES: a jetstream claim is listed AND marked, and the marker is in
+    /// the manifest JSON. Listing it unmarked is the finding — a snapshot that
+    /// reads complete while the stream data is not in it.
+    #[test]
+    fn a_jetstream_claim_is_listed_and_marked_as_carrying_no_data() {
+        let claim = json!({
+            "metadata": {"name": "events", "namespace": "demo"},
+            "spec": {"type": "jetstream"}
+        });
+        let refs = resource_refs(&[], std::slice::from_ref(&claim));
+        assert_eq!(refs.len(), 1, "the claim stays in the manifest");
+        assert!(refs[0].no_data);
+        let v = serde_json::to_value(&refs[0]).unwrap();
+        assert_eq!(v["no_data"], json!(true), "{v}");
+    }
+
+    /// DOES NOT FIRE elsewhere, and the key is absent rather than `false`: a
+    /// marker on every resource is a marker nobody reads, and an older reader
+    /// treats the absent key as "data captured", which is correct for these.
+    #[test]
+    fn nothing_else_carries_the_no_data_marker() {
+        let app = json!({"metadata": {"name": "alpha", "namespace": "demo"}});
+        let pg = json!({"metadata": {"name": "db", "namespace": "demo"},
+                        "spec": {"type": "pg"}});
+        let refs = resource_refs(&[("Application", &app)], std::slice::from_ref(&pg));
+        for r in &refs {
+            assert!(!r.no_data, "{r:?}");
+            let v = serde_json::to_value(r).unwrap();
+            assert!(v.get("no_data").is_none(), "{v}");
+        }
     }
 
     // -----------------------------------------------------------------------

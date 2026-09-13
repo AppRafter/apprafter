@@ -39,6 +39,70 @@ use crate::DataKind;
 // Pure data types
 // ---------------------------------------------------------------------------
 
+/// The claim types this build stores NO data for, even though the claim itself
+/// is captured and replayed (A6).
+///
+/// `jetstream` only, and deliberately only. `clickhouse` and `s3` fall through
+/// the same arm of [`plan_extraction`], but neither ships, so a claim of those
+/// types provisions nothing and there is no data to miss — announcing them
+/// would be a warning about a situation that cannot occur. JetStream ships, so
+/// a cluster can hold real streams today, and a snapshot that listed the claim
+/// without saying this reads as complete while being short of the data.
+///
+/// Capturing the streams is separate, larger work (a helper pod running `nats
+/// stream backup`) and is NOT in progress — nothing here should be read as a
+/// promise of it.
+pub const CLAIM_TYPES_WITHOUT_DATA_CAPTURE: &[&str] = &["jetstream"];
+
+/// Whether a claim of this `spec.type` has NO data in the backup. Pure.
+///
+/// The one place the rule lives: the manifest marker, the `backup create`
+/// summary and `backup show` all read it, so they cannot come to different
+/// conclusions about the same claim.
+pub fn claim_type_has_no_data_capture(claim_type: &str) -> bool {
+    CLAIM_TYPES_WITHOUT_DATA_CAPTURE.contains(&claim_type)
+}
+
+/// A claim a run captures as configuration only — the counterpart of an
+/// [`ExtractItem`], and what the summaries name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UncapturedClaim {
+    pub namespace: String,
+    pub name: String,
+    pub claim_type: String,
+}
+
+/// The claims in scope whose native data this build does not capture. Pure.
+///
+/// Walks the same list as [`plan_extraction`] and reports what that planner
+/// passes over, so the two cannot drift: a type added to the planner and left
+/// in [`CLAIM_TYPES_WITHOUT_DATA_CAPTURE`] would be reported as empty while
+/// carrying data, and the test pair asserts they stay disjoint.
+pub fn claims_without_data_capture(claims: &[Value]) -> Vec<UncapturedClaim> {
+    claims
+        .iter()
+        .filter_map(|c| {
+            let ty = c.pointer("/spec/type").and_then(Value::as_str)?;
+            if !claim_type_has_no_data_capture(ty) {
+                return None;
+            }
+            Some(UncapturedClaim {
+                namespace: c
+                    .pointer("/metadata/namespace")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                name: c
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                claim_type: ty.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// One unit of extraction: the data to pull from a single claim.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExtractItem {
@@ -63,10 +127,11 @@ pub struct ExtractItem {
 ///   `status.instance`); source = `status.instance` (the Dragonfly pool
 ///   instance whose snapshot PVC is `df-<instance>-0`).
 /// * `disk` / `shared-disk` → emit a `Volume` item; source = `status.volumeClaimRef`.
-/// * everything else → silently skipped (out of scope this cycle).
+/// * everything else → no item; see [`claims_without_data_capture`], which
+///   reports the shipped ones so the omission is stated rather than silent.
 ///
-/// Claims missing the required `status` reference are also silently skipped:
-/// they were never provisioned successfully and have no data to dump.
+/// Claims missing the required `status` reference are also skipped: they were
+/// never provisioned successfully and have no data to dump.
 pub fn plan_extraction(claims: &[Value]) -> Vec<ExtractItem> {
     let mut items = Vec::new();
     for c in claims {
@@ -130,8 +195,11 @@ pub fn plan_extraction(claims: &[Value]) -> Vec<ExtractItem> {
                 }
             }
             _ => {
-                // jetstream / clickhouse / s3 / notifications — out of scope
-                // this cycle; skip silently.
+                // jetstream / clickhouse / s3 / notifications — no extraction
+                // path. NOT silent for the ones that ship:
+                // `claims_without_data_capture` reports them, the manifest
+                // marks them `no_data`, and both `backup create` and
+                // `backup show` say so.
             }
         }
     }
@@ -530,5 +598,99 @@ mod tests {
         let t = truncate_pod_name(&long);
         assert!(t.len() <= 63, "pod name too long: {}", t.len());
         assert!(!t.ends_with('-'), "trailing dash: {t}");
+    }
+
+    // =======================================================================
+    // A6 — the claims a backup lists but holds no data for
+    // =======================================================================
+
+    /// FIRES: a jetstream claim produces no extraction item AND is reported,
+    /// which together are the finding. Producing no item is the old behaviour;
+    /// being reported is what stops the snapshot reading as complete.
+    #[test]
+    fn a_jetstream_claim_is_extracted_by_nothing_and_reported_by_name() {
+        let claims = vec![json!({
+            "spec": {"type": "jetstream"},
+            "metadata": {"name": "events", "namespace": "demo"},
+            "status": {"ready": true, "account": "demo"}
+        })];
+        assert!(plan_extraction(&claims).is_empty());
+        assert_eq!(
+            claims_without_data_capture(&claims),
+            vec![UncapturedClaim {
+                namespace: "demo".into(),
+                name: "events".into(),
+                claim_type: "jetstream".into(),
+            }]
+        );
+    }
+
+    /// DOES NOT FIRE for the types whose data IS captured — a warning on a pg
+    /// claim would be a lie, and one on every claim is a warning nobody reads.
+    #[test]
+    fn a_claim_whose_data_is_captured_is_never_reported_as_dataless() {
+        let claims = vec![
+            json!({"spec": {"type": "pg"}, "metadata": {"name": "db", "namespace": "demo"},
+                   "status": {"connectionSecretRef": "db-conn"}}),
+            json!({"spec": {"type": "disk"}, "metadata": {"name": "vol", "namespace": "demo"},
+                   "status": {"volumeClaimRef": "pvc"}}),
+            json!({"spec": {"type": "redis", "persistent": true},
+                   "metadata": {"name": "cache", "namespace": "demo"},
+                   "status": {"instance": "platform-redis-persistent-000"}}),
+        ];
+        assert_eq!(plan_extraction(&claims).len(), 3);
+        assert!(claims_without_data_capture(&claims).is_empty());
+    }
+
+    /// The narrowing, stated as a test: `clickhouse` and `s3` fall through the
+    /// same arm, and are deliberately NOT announced — neither ships, so such a
+    /// claim provisions nothing and there is no data to miss. A warning about
+    /// them would be a warning about an impossible situation.
+    #[test]
+    fn only_the_shipped_dataless_type_is_announced() {
+        assert_eq!(CLAIM_TYPES_WITHOUT_DATA_CAPTURE, &["jetstream"]);
+        for ty in ["clickhouse", "s3", "notifications"] {
+            let claims = vec![json!({
+                "spec": {"type": ty},
+                "metadata": {"name": "x", "namespace": "demo"}
+            })];
+            assert!(plan_extraction(&claims).is_empty(), "{ty}");
+            assert!(claims_without_data_capture(&claims).is_empty(), "{ty}");
+        }
+    }
+
+    /// The two lists must stay disjoint: a type the planner learns to extract
+    /// while it is still named here would be reported as empty while its data
+    /// is in the snapshot — the same dishonesty pointing the other way.
+    #[test]
+    fn the_dataless_types_are_disjoint_from_what_the_planner_extracts() {
+        for ty in CLAIM_TYPES_WITHOUT_DATA_CAPTURE {
+            let claims = vec![json!({
+                "spec": {"type": ty, "persistent": true},
+                "metadata": {"name": "x", "namespace": "demo"},
+                // Every source reference the planner could possibly key on,
+                // so the claim fails to extract because of its TYPE and not
+                // because it looks unprovisioned.
+                "status": {"connectionSecretRef": "c", "volumeClaimRef": "p", "instance": "i"}
+            })];
+            assert!(
+                plan_extraction(&claims).is_empty(),
+                "{ty} is announced as dataless but the planner extracts it"
+            );
+        }
+    }
+
+    /// An unprovisioned claim of a captured type is still skipped silently,
+    /// and that is NOT what this reports: it is a different case (the claim
+    /// has no data yet, rather than no capture path) and it is out of scope
+    /// here. Pinned so the two are not later conflated.
+    #[test]
+    fn an_unprovisioned_claim_is_not_reported_as_dataless() {
+        let claims = vec![json!({
+            "spec": {"type": "pg"},
+            "metadata": {"name": "db", "namespace": "demo"}
+        })];
+        assert!(plan_extraction(&claims).is_empty());
+        assert!(claims_without_data_capture(&claims).is_empty());
     }
 }
