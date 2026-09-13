@@ -2154,6 +2154,25 @@ mod tests {
     //     → resolve_precedence(flag, manifest, state, target, env)
     //     → None (when all rungs absent) → ServerTypeNotSelected
     //
+    // That is phase 1 of three, and the chain above stops one frame
+    // before the place `--target` used to be dropped. In full:
+    //
+    //   restore --reprovision --target X
+    //     → bootstrap_all::run(target, …)
+    //         phase 1 → apply::run(target_override, …)
+    //         phase 2 → kubeconfig::fetch_and_cache(true, target_override)
+    //         phase 3 → cluster_bootstrap::run(target_override)
+    //             → resolve_state_paths(target_override)       // kubeconfig
+    //             → load_active_target_config(store, target_override)  // tier
+    //
+    // Phase 3 took no argument until finding C1: it re-resolved the
+    // ACTIVE target, so restoring into X ran helm + server-side apply
+    // against whatever target happened to be active — resetting that
+    // cluster's channel, autoUpgrade and root targetRevision. Both
+    // resolutions inside phase 3 take the override now; the regression
+    // guard is `cluster_bootstrap::tests::
+    // phase_three_bootstraps_the_overridden_target_not_the_active_one`.
+    //
     // The end-to-end cannot be unit-tested without live infrastructure;
     // these tests guard the two pure seams: (a) that `resolve_precedence`
     // returns None when all inputs are absent (no silent cpx22 default), and

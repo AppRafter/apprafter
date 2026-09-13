@@ -88,12 +88,20 @@ pub fn run(target_override: Option<&str>, dry_run: bool, server_type: Option<&st
 
     // Phase 3/3 — cluster-bootstrap. Same rationale as phase 1:
     // helm/kubectl print release notes, would clobber a spinner.
+    //
+    // `target_override` is threaded here for the same reason phases 1
+    // and 2 take it. It used to be omitted (finding C1): phase 3
+    // re-resolved the ACTIVE target and bootstrapped it, so
+    // `apprafter restore --reprovision --target X` provisioned X and
+    // then ran helm + SSA against whatever target was active — see the
+    // `cluster_bootstrap::run` doc comment for the blast radius.
     println!(
         "{} [3/3] bootstrap    installing Cilium + Argo CD + cert-manager + operator…",
         style::info("→")
     );
     let p3_start = Instant::now();
-    cluster_bootstrap::run().map_err(|e| failed(3, "bootstrap", p3_start.elapsed(), e))?;
+    cluster_bootstrap::run(target_override)
+        .map_err(|e| failed(3, "bootstrap", p3_start.elapsed(), e))?;
     let p3 = p3_start.elapsed();
     println!(
         "{} [3/3] bootstrap    done in {}",

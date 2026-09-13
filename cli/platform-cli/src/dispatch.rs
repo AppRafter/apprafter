@@ -45,7 +45,11 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
         Commands::Kubeconfig { refresh, target } => {
             commands::kubeconfig::run(refresh, target.as_deref())?
         }
-        Commands::ClusterBootstrap => commands::cluster_bootstrap::run()?,
+        // `None`: the standalone subcommand carries no `--target` flag,
+        // so it runs against the active target. The parameter exists
+        // for `bootstrap-all --target X`, which must not fall back to
+        // the active pointer at phase 3 (finding C1).
+        Commands::ClusterBootstrap => commands::cluster_bootstrap::run(None)?,
         Commands::ArgocdPassword { refresh } => commands::argocd_password::run(refresh)?,
         Commands::BootstrapAll {
             target,

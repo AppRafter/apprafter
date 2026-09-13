@@ -726,7 +726,15 @@ pub fn rescue(yes: bool) -> Result<()> {
         }
     }
     println!("Re-running cluster-bootstrap chain...");
-    crate::commands::cluster_bootstrap::run()
+    // `None` is correct here and is NOT the C1 defect repeating itself.
+    // `platform rescue` has no `--target` flag; its doc comment above
+    // and the confirmation prompt the operator just accepted both say
+    // "the active target" in so many words. Acting on the active target
+    // is the documented contract, so there is nothing to override.
+    // Threading a target in would need a `--target` flag on `rescue`
+    // and a reworded prompt first — do not "fix" this call site on its
+    // own.
+    crate::commands::cluster_bootstrap::run(None)
 }
 
 pub fn upgrade(to: Option<&str>, cached: bool) -> Result<()> {

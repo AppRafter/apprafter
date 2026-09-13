@@ -7,6 +7,10 @@
 open scheduled-runner decision (K8up vs AppRafter CronJob-restic) is now
 **resolved in favour of an AppRafter CronJob-restic runner** (see the
 off-site-push section under Decision + the K8up entry under Alternatives).
+**Amended 2026-09-13** — the `--reprovision` description under Decision claimed
+the target is honoured for the whole of `bootstrap_all::run`; it was honoured
+for two of its three phases, and the third acted on the active target. The
+correction is inline at that bullet; the decision itself is unchanged.
 
 ## Context
 
@@ -113,6 +117,20 @@ private workloads after restore comes from the **target's own configuration**
   nothing" path. A prepended `Reprovision` step provisions + bootstraps a fresh
   cluster in the target (`bootstrap_all::run` — topology + cloud token from the
   target's local config, R2, exactly as `apprafter up`), then replays as (a).
+  **Correction, 2026-09-13:** that sentence described the intent, not the
+  behaviour, from acceptance until the fix. `bootstrap_all::run` has three
+  phases; only the first two took the target. The third, `cluster_bootstrap`,
+  resolved the **active** target itself, so a `--reprovision --target X` run
+  with a different target active provisioned X and then bootstrapped the active
+  cluster — installing Cilium and Argo CD over it and server-side-applying the
+  root `Application` and `PlatformStack/default` under field manager
+  `apprafter-cli`, which resets a deliberately chosen `spec.channel`,
+  `spec.autoUpgrade`, `spec.source.*`, `spec.values.tier` and the root
+  `targetRevision`. The phase now takes the override for both its state lookup
+  and its target-config lookup, and the sentence above is true as written. It
+  was invisible to the test suite because every DR e2e makes the destination
+  target active before restoring; the guard is now a unit test that drives the
+  whole phase-3 body against fake helm/kubectl runners.
   The kubeconfig is resolved lazily, after the fresh cluster exists; version
   alignment rides the backup's `PlatformStack` (applied in `ApplyPlatformStack`)
   plus the cross-version `version_warning`. `--reprovision` + `--data-only` are

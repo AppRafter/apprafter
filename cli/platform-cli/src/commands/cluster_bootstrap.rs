@@ -149,14 +149,60 @@ const CRD_ESTABLISHED_TIMEOUT_SECS: u64 = 60;
 const PLATFORMSTACK_APPLY_ATTEMPTS: u32 = 30;
 const PLATFORMSTACK_APPLY_BACKOFF_SECS: u64 = 10;
 
-pub fn run() -> Result<()> {
-    info!("cluster-bootstrap invoked (GitOps loader)");
+/// Run the GitOps loader against `target_override`, or against the
+/// active target when it is `None`.
+///
+/// **`target_override` is load-bearing, not decorative.** Up to the fix
+/// for finding C1 this function took no argument and resolved `None`
+/// itself, on the reasoning that the standalone `apprafter
+/// cluster-bootstrap` subcommand has no `--target` flag so the active
+/// target is always the right answer. That reasoning held for the two
+/// direct entry points and broke for the third: `apprafter restore
+/// --reprovision --target X` runs this as phase 3 of
+/// [`bootstrap_all::run`](super::bootstrap_all::run), whose phases 1
+/// (`apply`) and 2 (`kubeconfig`) both honour the override. Phase 3
+/// re-resolving the ACTIVE target meant a restore into `X` bootstrapped
+/// whichever cluster happened to be active — `helm upgrade --install`
+/// of Cilium and Argo CD, plus a server-side apply of the root
+/// `Application` and of `PlatformStack/default` under field manager
+/// `apprafter-cli`, resetting a deliberately chosen `spec.channel`,
+/// `spec.autoUpgrade` and `targetRevision` on a cluster nobody named.
+///
+/// Both target-sensitive resolutions below take the override: the state
+/// directory (which carries the cached kubeconfig) and the target
+/// config (which carries the tier written into `PlatformStack`).
+/// Passing it to one and not the other reintroduces half the bug.
+pub fn run(target_override: Option<&str>) -> Result<()> {
+    run_with(
+        &HelmCli,
+        &KubectlCli,
+        target_override,
+        platform_stack_version,
+    )
+}
 
-    // Per-target state (v0.1.154). `cluster-bootstrap` has no
-    // `--target` flag — it runs against the active target the
-    // preceding `apply` populated, same as `argocd-password` and
-    // the kubeconfig fetch.
-    let resolved = resolve_state_paths(None)?;
+/// `run` with its three outside-world edges injected: the helm runner,
+/// the kubectl runner, and the platform-stack version resolver.
+///
+/// `resolve_platform_version` is a parameter rather than a direct call
+/// to [`platform_stack_version`] because that function performs an HTTP
+/// GET against the GitHub Releases API. Tests that drive the whole
+/// phase-3 body need the state/config resolution, not the network.
+pub(crate) fn run_with<H: HelmRunner, K: KubectlRunner>(
+    helm: &H,
+    kubectl: &K,
+    target_override: Option<&str>,
+    resolve_platform_version: fn() -> String,
+) -> Result<()> {
+    info!(target_override, "cluster-bootstrap invoked (GitOps loader)");
+
+    // Per-target state (v0.1.154). The standalone `cluster-bootstrap`
+    // subcommand has no `--target` flag, so `dispatch` passes `None`
+    // here and the active target the preceding `apply` populated is
+    // used — same as `argocd-password` and the kubeconfig fetch. When
+    // we are phase 3 of `bootstrap-all --target X`, the caller hands
+    // the override down and it wins over the active pointer.
+    let resolved = resolve_state_paths(target_override)?;
     let paths = resolved.paths;
     let target_store = resolved.store;
     let state = State::load_or_default(&paths)?;
@@ -169,12 +215,17 @@ pub fn run() -> Result<()> {
     let plaintext = decrypt_cached_kubeconfig(&hetzner)?;
     let kubeconfig_file = write_tempfile_with("apprafter-kubeconfig-", &plaintext)?;
 
-    // Consult the active target for tier hint. Previously the
-    // store handle was constructed inline (and tolerated a
-    // missing config dir); per-target state resolution already
-    // gives us a known-good `target_store`, so we just read off
-    // it directly.
-    let target_config = load_active_target_config(&target_store, None);
+    // Consult the target for its tier hint. Previously the store
+    // handle was constructed inline (and tolerated a missing config
+    // dir); per-target state resolution already gives us a known-good
+    // `target_store`, so we just read off it directly.
+    //
+    // The override goes here too. `load_active_target_config` re-runs
+    // `resolve_active_target_name` internally, so passing `None` would
+    // read the ACTIVE target's tier even when the kubeconfig above came
+    // from the overridden one — a cluster bootstrapped at someone
+    // else's tier. Second half of the C1 fix.
+    let target_config = load_active_target_config(&target_store, target_override);
 
     let active_tier: u8 = target_config
         .as_ref()
@@ -186,7 +237,7 @@ pub fn run() -> Result<()> {
     let active_domain: Option<&str> = None;
 
     let platform_repo = platform_stack_repo();
-    let platform_version = platform_stack_version();
+    let platform_version = resolve_platform_version();
 
     let root_app_yaml = render_root_application(&platform_repo, &platform_version);
     let root_app_file = write_tempfile_with("apprafter-root-application-", &root_app_yaml)?;
@@ -196,8 +247,8 @@ pub fn run() -> Result<()> {
         write_tempfile_with("apprafter-platformstack-default-", &platformstack_yaml)?;
 
     perform_bootstrap(
-        &HelmCli,
-        &KubectlCli,
+        helm,
+        kubectl,
         kubeconfig_file.path(),
         root_app_file.path(),
         platformstack_file.path(),
@@ -827,6 +878,32 @@ mod tests {
         applies: RefCell<Vec<(ManifestSource, PathBuf)>>,
         ssa_applies: RefCell<Vec<(ManifestSource, PathBuf, String)>>,
         waits: RefCell<Vec<WaitCall>>,
+        /// Every file this runner was handed, slurped AT CALL TIME.
+        ///
+        /// `run_with` writes the kubeconfig and both manifests into
+        /// `NamedTempFile`s that are deleted the moment it returns, so a
+        /// test that recorded only paths would have nothing left to read
+        /// by assertion time. Reading eagerly is what lets the phase-3
+        /// target-resolution tests below assert on CONTENT — which
+        /// target's kubeconfig, which target's tier.
+        slurped: RefCell<Vec<String>>,
+    }
+
+    impl FakeKubectl {
+        /// Record a file's contents. An unreadable path records the
+        /// error rather than skipping: a silent skip would let a
+        /// content assertion pass by finding nothing to contradict it.
+        fn slurp(&self, path: &Path) {
+            let body = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| format!("<unreadable {}: {e}>", path.display()));
+            self.slurped.borrow_mut().push(body);
+        }
+
+        /// Everything slurped, concatenated — the corpus the phase-3
+        /// tests match markers against.
+        fn slurped_corpus(&self) -> String {
+            self.slurped.borrow().join("\n---\n")
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -851,6 +928,9 @@ mod tests {
             kubeconfig_path: &Path,
             field_manager: &str,
         ) -> Result<()> {
+            if let ManifestSource::Path(p) = source {
+                self.slurp(p);
+            }
             self.ssa_applies.borrow_mut().push((
                 source.clone(),
                 kubeconfig_path.to_path_buf(),
@@ -869,6 +949,7 @@ mod tests {
             timeout_seconds: u64,
             kubeconfig_path: &Path,
         ) -> Result<()> {
+            self.slurp(kubeconfig_path);
             self.waits.borrow_mut().push(WaitCall {
                 resource_ref: resource_ref.to_string(),
                 namespace: namespace.map(|s| s.to_string()),
@@ -1456,5 +1537,205 @@ mod tests {
                 inst.release
             );
         }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Phase 3 target resolution (finding C1)
+    //
+    // `apprafter restore --reprovision --target X` runs this module as
+    // phase 3 of `bootstrap_all::run`. Phases 1 and 2 honour the
+    // override; phase 3 used to re-resolve the ACTIVE target and
+    // bootstrap that cluster instead — `helm upgrade --install` of
+    // Cilium and Argo CD plus a server-side apply of the root
+    // `Application` and `PlatformStack/default` under field manager
+    // `apprafter-cli`, resetting channel / autoUpgrade / targetRevision
+    // on a cluster nobody named.
+    //
+    // Nothing caught it. Every test in `tests/bootstrap_all_test.rs` is
+    // `--dry-run` or `--help` and stops before phase 3, and every DR
+    // e2e makes the destination target active BEFORE restoring, with a
+    // comment saying why — so the suite masked the bug rather than
+    // finding it. These two tests run the whole phase-3 body against
+    // fake helm/kubectl runners and assert on CONTENT: which target's
+    // kubeconfig reached the cluster calls, and which target's tier was
+    // written into the applied `PlatformStack`.
+    // ────────────────────────────────────────────────────────────────
+
+    /// Serialises the tests below. Both redirect `APPRAFTER_CONFIG_DIR`,
+    /// which is process-global while `cargo test` runs test functions on
+    /// parallel threads.
+    static CONFIG_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Fixture: a target store holding two fully-populated targets.
+    ///
+    /// * `origin` — the ACTIVE target. Tier `team` (2), kubeconfig body
+    ///   carries the marker `ORIGIN-CLUSTER`.
+    /// * `dest` — the target a `restore --reprovision --target dest`
+    ///   names. Tier `solo` (1), marker `DEST-CLUSTER`.
+    ///
+    /// Both are complete, so neither errors out early; the run reaches
+    /// `perform_bootstrap` either way and the only difference visible to
+    /// the runners is which target's material it carried.
+    fn two_target_store() -> tempfile::TempDir {
+        use cli_core::target::{
+            save_global_config, save_target, GlobalConfig, Target, TargetConfig, TargetCredentials,
+            TargetStorePaths,
+        };
+        use cli_state::{HetznerCloudState, State, StatePaths};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TargetStorePaths::for_root(dir.path().to_path_buf());
+
+        for (name, tier, marker) in [
+            ("origin", "team", "ORIGIN-CLUSTER"),
+            ("dest", "solo", "DEST-CLUSTER"),
+        ] {
+            save_target(
+                &store,
+                &Target {
+                    name: name.to_string(),
+                    config: TargetConfig {
+                        provider: "hetzner-cloud".into(),
+                        default_tier: Some(tier.into()),
+                        ..Default::default()
+                    },
+                    credentials: TargetCredentials::default(),
+                },
+            )
+            .expect("save target");
+
+            // Plaintext kubeconfig, not the age-encrypted field: the
+            // plaintext branch of `decrypt_cached_kubeconfig` needs no
+            // key material, so the fixture never touches the operator's
+            // real `~/.config/apprafter/age.key`.
+            let state = State {
+                hetzner_cloud: Some(HetznerCloudState {
+                    server_id: 1,
+                    server_name: format!("{name}-node"),
+                    server_type: None,
+                    ssh_key_ids: vec![],
+                    network_id: None,
+                    firewall_id: None,
+                    floating_ip_ids: vec![],
+                    kubeconfig_yaml: Some(format!("apiVersion: v1\nkind: Config\n# {marker}\n")),
+                    kubeconfig_age: None,
+                    argocd_admin_password_age: None,
+                }),
+                ..Default::default()
+            };
+            state
+                .save(&StatePaths::for_active_target(&store, name))
+                .expect("save state");
+        }
+
+        save_global_config(
+            &store,
+            &GlobalConfig {
+                active_target: "origin".into(),
+                ..Default::default()
+            },
+        )
+        .expect("save global config");
+
+        dir
+    }
+
+    /// Run `run_with` with `APPRAFTER_CONFIG_DIR` pointed at `root`.
+    ///
+    /// The env var is set and restored under [`CONFIG_DIR_LOCK`], and
+    /// only the call itself runs inside the guard — assertions happen
+    /// after the variable is back, so a failing assertion cannot leave
+    /// the process pointed at a deleted tempdir.
+    fn run_phase_three(
+        root: &Path,
+        target_override: Option<&str>,
+    ) -> (FakeHelm, FakeKubectl, Result<()>) {
+        use cli_core::target::CONFIG_DIR_ENV;
+
+        let helm = FakeHelm::default();
+        let kubectl = FakeKubectl::default();
+
+        let guard = CONFIG_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os(CONFIG_DIR_ENV);
+        std::env::set_var(CONFIG_DIR_ENV, root);
+        let outcome = run_with(&helm, &kubectl, target_override, || {
+            // Stubbed: the real resolver HTTP-GETs the GitHub Releases
+            // API, and phase-3 target resolution has nothing to do with
+            // the network.
+            "0.0.0-test".to_string()
+        });
+        match saved {
+            Some(v) => std::env::set_var(CONFIG_DIR_ENV, v),
+            None => std::env::remove_var(CONFIG_DIR_ENV),
+        }
+        drop(guard);
+
+        (helm, kubectl, outcome)
+    }
+
+    /// THE C1 REGRESSION GUARD. With `origin` active, phase 3 invoked
+    /// with `--target dest` must bootstrap `dest`.
+    ///
+    /// Drop the `target_override` argument anywhere along the chain —
+    /// `resolve_state_paths(None)` or
+    /// `load_active_target_config(&store, None)` — and this goes red:
+    /// the first resolution carries `origin`'s kubeconfig, the second
+    /// writes `origin`'s tier into the `PlatformStack`.
+    #[test]
+    fn phase_three_bootstraps_the_overridden_target_not_the_active_one() {
+        let dir = two_target_store();
+        let (_helm, kubectl, outcome) = run_phase_three(dir.path(), Some("dest"));
+        outcome.expect("bootstrap against dest");
+
+        let corpus = kubectl.slurped_corpus();
+
+        // (1) State resolution — the kubeconfig every cluster call was
+        //     handed came out of `dest`'s state.json.
+        assert!(
+            corpus.contains("DEST-CLUSTER"),
+            "phase 3 must act on the kubeconfig cached for `dest`\n{corpus}"
+        );
+        assert!(
+            !corpus.contains("ORIGIN-CLUSTER"),
+            "phase 3 must NOT touch the active target `origin` (C1)\n{corpus}"
+        );
+
+        // (2) Target-config resolution — the tier written into the
+        //     server-side-applied PlatformStack is `dest`'s (solo = 1),
+        //     not `origin`'s (team = 2).
+        assert!(
+            corpus.contains("tier: 1"),
+            "PlatformStack must carry `dest`'s tier (solo ⇒ 1)\n{corpus}"
+        );
+        assert!(
+            !corpus.contains("tier: 2"),
+            "PlatformStack must not carry `origin`'s tier (team ⇒ 2)\n{corpus}"
+        );
+    }
+
+    /// The mirror image: with no override, phase 3 still resolves the
+    /// active target. Guards the fix against over-correction — a
+    /// signature that took the target by value, or a caller that passed
+    /// something other than `None` for `cluster-bootstrap` / `platform
+    /// rescue`, would show up here.
+    #[test]
+    fn phase_three_without_an_override_still_resolves_the_active_target() {
+        let dir = two_target_store();
+        let (_helm, kubectl, outcome) = run_phase_three(dir.path(), None);
+        outcome.expect("bootstrap against the active target");
+
+        let corpus = kubectl.slurped_corpus();
+        assert!(
+            corpus.contains("ORIGIN-CLUSTER"),
+            "no override ⇒ the active target `origin`\n{corpus}"
+        );
+        assert!(
+            !corpus.contains("DEST-CLUSTER"),
+            "no override must not reach `dest`\n{corpus}"
+        );
+        assert!(
+            corpus.contains("tier: 2"),
+            "PlatformStack must carry `origin`'s tier (team ⇒ 2)\n{corpus}"
+        );
     }
 }
