@@ -172,6 +172,25 @@ Two more things are worth doing while both are up:
 - `apprafter backup list` on either cluster shows only that cluster's snapshots;
   `--all-clusters` shows both, which is the view you want while cutting over.
 
+**The edge configuration comes across too.** The registered zones ride the
+`PlatformStack`, the imported TLS certificate is captured and re-applied with
+them, and the origin-firewall toggle — which lives on the *target*, not in the
+cluster — is carried onto the new target by this restore, so the new machine
+comes up with its `80`/`443` restricted exactly as the old one was rather than
+open to the internet. The restore summary states each of these. Two caveats
+worth knowing before you move DNS:
+
+- A backup taken by the **scheduled in-cluster runner** cannot record the
+  origin-firewall toggle (a CronJob has no target store to read), so the
+  restore stays quiet about it. Either take the backup with `apprafter backup
+  create` as the sequence below does, or run `apprafter target firewall
+  cloudflare-origin enable` on the new target before you cut over.
+- A snapshot taken before imported certificates were captured brings the zones
+  back without the certificate. The restore names it, and `apprafter target
+  domain list` on the new cluster marks it `MISSING`; re-import it with
+  `apprafter target cert import` — do **not** re-run `target domain add`, the
+  zone is already registered.
+
 Then move DNS to the new cluster (see [Connect a
 domain](connect-a-domain.md)), confirm it, and empty the old project:
 

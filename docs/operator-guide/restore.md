@@ -73,6 +73,42 @@ under. When that happens the summary says so and names
 `apprafter backup set cluster-name <name>` — the restored cluster's own
 snapshots are still attributed to it correctly; only the label is inherited.
 
+### Your domains, your certificate, and the origin firewall
+
+The zones you registered with `apprafter target domain add` are part of the
+`PlatformStack`, so they come back with it — and the platform Gateway is
+rendered from them, with `tls.certificateRefs` naming the certificate Secret
+those zones were imported against.
+
+The certificate itself comes back too. It is captured as a whole Secret and
+re-applied **before** the `PlatformStack`, so the Gateway is never rendered
+against a reference that is not there yet. The summary says how many were
+restored.
+
+A backup taken before certificates were captured brings the zones back without
+the certificate. That is the one case where a restored cluster resolves but
+does not serve, so the restore names it explicitly, and so does `apprafter
+target domain list` (a `MISSING` marker on the Cert column). The fix is the
+import alone:
+
+```sh
+apprafter target cert import <name> --cert <file> --key <file>
+```
+
+Do **not** re-run `apprafter target domain add` afterwards. The zone is already
+registered — it came back in the snapshot — so the command refuses with
+`Domain already registered`. The import is the whole repair.
+
+The **Cloudflare origin firewall** is not in the cluster at all; it is a
+per-target setting on the operator's machine. `apprafter backup create` records
+whether it was on, and `restore --reprovision` turns it on for the target it
+provisions — otherwise a rebuild onto a new target would come up with `80`/`443`
+open to the internet while the source had them restricted. It is only ever
+turned **on** by a restore, never off. On the modes that provision nothing the
+restore says the snapshot recorded it and leaves the cluster alone; a backup
+written by the scheduled in-cluster runner records nothing here, and the restore
+stays quiet rather than guessing.
+
 ### Target modes
 
 - **(a) restore-into-running** (the default, validated path): the target was

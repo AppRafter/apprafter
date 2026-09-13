@@ -44,6 +44,25 @@ pub struct BackupManifest {
     #[serde(default)]
     pub secret_namespaces: Vec<String>,
 
+    /// Was the Cloudflare origin firewall on for the captured cluster (A4)?
+    ///
+    /// The toggle lives in the operator's LOCAL target store, never in the
+    /// cluster, so a restore onto a new target had no way to know the source
+    /// restricted its 80/443 — and re-provisioned the node wide open.
+    /// `backup create` runs against a resolved target and records the intent
+    /// here; `restore --reprovision` carries it to the destination target.
+    ///
+    /// Three-valued on purpose. `Some(true)`/`Some(false)` are what the source
+    /// had; `None` is UNKNOWN — a manifest written before this field existed,
+    /// or one written by the in-cluster runner, which has no target store to
+    /// read. Restore must treat `None` as "say nothing", never as "the source
+    /// had it off".
+    ///
+    /// `skip_serializing_if` keeps the key out of a manifest that has nothing
+    /// to say, so an unknown reads as an absent key in the JSON too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_firewall: Option<bool>,
+
     pub resources: Vec<ResourceRef>,
 }
 
@@ -61,6 +80,28 @@ mod tests {
         assert_eq!(MANIFEST_VERSION_CURRENT, 1);
     }
 
+    /// A4: a manifest written before `originFirewall` existed reads as
+    /// UNKNOWN. Defaulting it to `false` would let a restore tell an operator
+    /// the source cluster had its origin firewall off — a claim about a
+    /// cluster the snapshot never recorded anything about.
+    #[test]
+    fn a_manifest_without_the_origin_firewall_key_reads_as_unknown() {
+        let json = r#"{"clusterId":"c","createdAt":"t","platformVersion":"0.2.31","namespaces":[],"resources":[]}"#;
+        let m: BackupManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.origin_firewall, None);
+
+        let off: BackupManifest = serde_json::from_str(
+            r#"{"clusterId":"c","createdAt":"t","platformVersion":"0.2.31","namespaces":[],
+                "originFirewall":false,"resources":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            off.origin_firewall,
+            Some(false),
+            "recorded OFF is not absent"
+        );
+    }
+
     #[test]
     fn manifest_carries_scope_resources_and_platform_version() {
         let m = BackupManifest {
@@ -70,6 +111,7 @@ mod tests {
             platform_version: "0.2.37".into(),
             namespaces: vec!["demo".into()],
             secret_namespaces: vec!["demo".into(), "staged".into()],
+            origin_firewall: Some(true),
             resources: vec![ResourceRef {
                 namespace: "demo".into(),
                 kind: "Application".into(),

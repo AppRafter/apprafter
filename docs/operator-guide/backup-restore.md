@@ -416,6 +416,36 @@ discrimination that keeps a restore from clobbering the target's own bootstrap:
   follows each `SourceCredential`'s `spec.git.backend.sealedSecretRef` and
   `spec.registry.backend.sealedSecretRef` and reads the underlying unsealed
   material directly. This is a distinct, cluster-wide capture path.
+- **Imported TLS certificates** — the Secrets `apprafter target cert import`
+  put in `apprafter-system`, carrying the `apprafter.io/cert-mode: imported`
+  label. They are captured whole, labels and annotations included, by a third
+  path of their own: an imported certificate has no SealedSecret behind it, so
+  the sweep above cannot see it, and no controller can re-issue it — the
+  material only exists because an operator supplied it.
+
+  This is the other half of a connected domain. The zones themselves live in
+  `PlatformStack.spec.values.gateway.allowedDomains`, so they come back with
+  the config CRs; the platform Gateway is rendered from those zones with
+  `tls.certificateRefs` naming the certificate Secret. A backup that carried
+  the zones but not the certificate restored a Gateway pointing at a Secret
+  that was not there — the domains would resolve and the site would not serve.
+  `apprafter backup create` names the certificates it captured in its summary,
+  `apprafter backup show` lists them as `ImportedCert`, and `apprafter target
+  domain list` marks a reference with no Secret behind it as `MISSING`.
+
+  Certificates issued by cert-manager are **not** captured: they are re-issued
+  on the restored cluster, and replaying an old one would be worse than
+  letting it renew.
+- **The Cloudflare origin-firewall toggle** is recorded in the manifest as an
+  intent (`originFirewall`), not as a captured object. It is the one piece of a
+  cluster's edge configuration that lives on the operator's machine — in the
+  target store — rather than in the cluster, so `apprafter backup create`
+  records it from the target it ran against and `apprafter restore
+  --reprovision` carries it to the target it provisions. A backup taken by the
+  **scheduled in-cluster runner** records nothing here: a CronJob has no target
+  store to read, and a restore treats the absent field as unknown rather than
+  as "the source had it off". See
+  [Move to a bigger machine](moving-to-a-bigger-machine.md).
 
 How a restore reloads each of these is on
 [Restore from a backup](restore.md).

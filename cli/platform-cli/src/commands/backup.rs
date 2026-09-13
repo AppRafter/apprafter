@@ -1493,6 +1493,9 @@ fn export_manifest(
         // An export captures native data only — no secrets, so no
         // secret namespaces to record.
         secret_namespaces: Vec::new(),
+        // Same reason: an export replays no cluster configuration, so it has
+        // no business carrying the source's firewall intent either.
+        origin_firewall: None,
         resources: resource_refs(&[], claims),
     }
 }
@@ -1589,6 +1592,12 @@ pub fn run_backup(
         .tempdir()
         .map_err(|e| CliError::Other(format!("create staging dir: {e}")))?;
 
+    // A4: the origin-firewall intent, read off the target this backup is being
+    // taken against. It is the one piece of the cluster's edge configuration
+    // that lives on the operator's machine instead of in the cluster, so this
+    // is the only moment anything can record it.
+    let origin_firewall = origin_firewall_of(&resolved.store, &resolved.target_name);
+
     let opts = local_pull_backup_opts(
         &repo_str,
         pass,
@@ -1600,6 +1609,7 @@ pub fn run_backup(
         staging.path(),
         pg_image,
         staging_mode,
+        origin_firewall,
     );
 
     let r = SubprocessRestic;
@@ -1632,6 +1642,7 @@ fn local_pull_backup_opts(
     staging_root: &Path,
     pg_image: String,
     staging_mode: StagingMode,
+    origin_firewall: Option<bool>,
 ) -> BackupOpts {
     BackupOpts {
         repo: repo.to_string(),
@@ -1646,7 +1657,22 @@ fn local_pull_backup_opts(
         pg_image,
         staging_mode,
         backup_host: None,
+        origin_firewall,
     }
+}
+
+/// Was the Cloudflare origin firewall on for `target` (A4)?
+///
+/// A target with no `firewall:` block at all answers `Some(false)`: the toggle
+/// was never set, which is a real answer to "did the source restrict its
+/// 80/443". `None` is reserved for the target that could not be READ — an
+/// unreadable store is not evidence the firewall was off, and recording
+/// `false` on that basis would have a later restore state something about the
+/// source cluster that nobody established. Best-effort by design: an
+/// unreadable target must never fail a backup whose data is otherwise fine.
+fn origin_firewall_of(store: &cli_core::target::TargetStorePaths, target: &str) -> Option<bool> {
+    let t = cli_core::target::load_target(store, target).ok()?;
+    Some(t.config.firewall.is_some_and(|f| f.cloudflare_origin))
 }
 
 /// The operator-facing summary `backup` prints on success. Pure — extracted
@@ -1655,14 +1681,25 @@ fn local_pull_backup_opts(
 /// INVARIANT: the `snapshot:` line is present only when restic reported a
 /// snapshot id. Printing an empty one would read as a stored snapshot that
 /// does not exist.
+///
+/// The imported certificate is named only when there IS one. It is the one
+/// captured object an operator can check by eye against a `target domain list`
+/// — and the one whose absence used to be invisible until a restore produced a
+/// Gateway pointing at nothing — so when it is in the snapshot the summary
+/// says so, and on the clusters that never connected a domain the line does
+/// not appear at all.
 fn backup_summary_report(
     cluster_id: &str,
     repo: &str,
     namespaces: &[String],
     summary: &backup_core::engine::BackupSummary,
 ) -> String {
+    let certs = match summary.cert_count {
+        0 => String::new(),
+        n => format!(", {n} imported cert(s)"),
+    };
     let mut out = format!(
-        "✓ Backed up cluster '{cluster_id}' → {repo}\n  namespaces: {}\n  captured:   {} CR(s), {} secret(s), {} claim(s) ({} extracted)\n  tag:        {}\n",
+        "✓ Backed up cluster '{cluster_id}' → {repo}\n  namespaces: {}\n  captured:   {} CR(s), {} secret(s){certs}, {} claim(s) ({} extracted)\n  tag:        {}\n",
         namespaces.join(", "),
         summary.cr_count,
         summary.secret_count,
@@ -8600,8 +8637,13 @@ mod tests {
             Path::new("/staging"),
             "postgres:18-alpine".into(),
             StagingMode::Sequential,
+            Some(true),
         );
         assert_eq!(opts.backup_host, None);
+        // A4: the origin-firewall intent of the target this pull ran against
+        // reaches the engine, and from there the manifest — it is the only
+        // moment anything can record local-only state.
+        assert_eq!(opts.origin_firewall, Some(true));
         assert!(opts.is_subset, "--select must reach the tag decoration");
         assert_eq!(opts.repo, "s3:https://h/b");
         assert_eq!(opts.cluster_id, "prod-cluster");
@@ -8628,6 +8670,7 @@ mod tests {
             snapshot_id: None,
             cr_count: 3,
             secret_count: 4,
+            cert_count: 0,
             claim_count: 5,
             extracted_count: 2,
             tag: "apprafter/prod-cluster/2026-08-01".into(),
@@ -8656,6 +8699,36 @@ mod tests {
             &summary,
         );
         assert!(some.contains("snapshot:   abc123"), "{some}");
+    }
+
+    /// A1: the imported certificate is named in the run summary when there is
+    /// one — it is the object an operator can check by eye against their
+    /// `target domain list`, and the one whose absence used to surface only as
+    /// a Gateway pointing at nothing after a restore. Silent on the clusters
+    /// that never connected a domain.
+    #[test]
+    fn the_backup_summary_names_the_imported_certificate_only_when_one_was_captured() {
+        let mut summary = backup_core::engine::BackupSummary {
+            snapshot_id: Some("abc123".into()),
+            cr_count: 3,
+            secret_count: 4,
+            cert_count: 1,
+            claim_count: 5,
+            extracted_count: 2,
+            tag: "t".into(),
+        };
+        let with = backup_summary_report("prod", "s3:https://h/b", &["prod".into()], &summary);
+        assert!(
+            with.contains("4 secret(s), 1 imported cert(s), 5 claim(s)"),
+            "{with}"
+        );
+
+        summary.cert_count = 0;
+        let without = backup_summary_report("prod", "s3:https://h/b", &["prod".into()], &summary);
+        assert!(
+            without.contains("4 secret(s), 5 claim(s)"),
+            "no certificate, no clause: {without}"
+        );
     }
 
     #[test]

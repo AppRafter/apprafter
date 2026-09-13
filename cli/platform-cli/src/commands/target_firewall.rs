@@ -160,8 +160,34 @@ pub(crate) fn no_firewall_warning(cluster: &str) -> String {
     )
 }
 
-fn run_cloudflare_origin(enable: bool) -> Result<()> {
-    let resolved = resolve_state_paths(None)?;
+/// What [`apply_cloudflare_origin`] did, for a caller that reports rather than
+/// prints.
+pub(crate) struct OriginApply {
+    /// The target the toggle was written to — RESOLVED, so a caller reporting
+    /// it names the target that changed rather than the argument it passed.
+    pub target: String,
+    /// The confirmation lines for a reconcile that landed.
+    pub lines: Vec<String>,
+    /// Set when the intent was SAVED but the live firewall was not touched —
+    /// there is no firewall for the cluster yet. The toggle still applies on
+    /// the next `apprafter up` / `apprafter apply`, which is what the warning
+    /// says.
+    pub warning: Option<String>,
+}
+
+/// Persist the origin-firewall toggle on `target_override` (the active target
+/// when `None`) and reconcile that target's live Hetzner firewall.
+///
+/// Target-scoped rather than active-target-only because `restore --reprovision
+/// --target <new>` carries the source cluster's toggle onto the target it just
+/// provisioned (A4), and that target is frequently NOT the active one —
+/// writing the active target's firewall from a restore aimed elsewhere is
+/// exactly the class of bug C1 was.
+pub(crate) fn apply_cloudflare_origin(
+    target_override: Option<&str>,
+    enable: bool,
+) -> Result<OriginApply> {
+    let resolved = resolve_state_paths(target_override)?;
     let store = resolved.store;
 
     // 1. Persist the toggle FIRST (intent survives even if the live reconcile
@@ -176,7 +202,7 @@ fn run_cloudflare_origin(enable: bool) -> Result<()> {
         state.cluster_name.as_deref(),
         target.config.cluster_name.as_deref(),
     );
-    let token = cli_core::resolve_hetzner_token(None, &store, None)?;
+    let token = cli_core::resolve_hetzner_token(None, &store, target_override)?;
     let client = HetznerCloudClient::new(hcloud_base_url(), token);
 
     // 3. Find the live firewall (cached id, else list+label+name).
@@ -186,8 +212,11 @@ fn run_cloudflare_origin(enable: bool) -> Result<()> {
         Ok(client.list_firewalls()?.firewalls)
     })?;
     let Some(firewall_id) = firewall_id else {
-        eprintln!("{}", style::warn(&no_firewall_warning(&cluster)));
-        return Ok(());
+        return Ok(OriginApply {
+            target: resolved.target_name,
+            lines: Vec::new(),
+            warning: Some(no_firewall_warning(&cluster)),
+        });
     };
 
     // 4. Reconcile the live firewall (reuse 1.83d).
@@ -197,7 +226,20 @@ fn run_cloudflare_origin(enable: bool) -> Result<()> {
     let plan = plan_origin_reconcile(&cluster, cf_ips.as_deref(), &fw_name);
     client.set_firewall_rules(firewall_id, &plan.rules)?;
 
-    for line in &plan.lines {
+    Ok(OriginApply {
+        target: resolved.target_name,
+        lines: plan.lines,
+        warning: None,
+    })
+}
+
+fn run_cloudflare_origin(enable: bool) -> Result<()> {
+    let applied = apply_cloudflare_origin(None, enable)?;
+    if let Some(warning) = &applied.warning {
+        eprintln!("{}", style::warn(warning));
+        return Ok(());
+    }
+    for line in &applied.lines {
         println!("{line}");
     }
     Ok(())

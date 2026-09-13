@@ -15,6 +15,16 @@ pub enum RestoreMode {
 pub enum RestoreStep {
     Reprovision,
     RestoreArtifact,
+    /// Re-apply the imported TLS certificates captured under `certs/` — as the
+    /// plain `kubernetes.io/tls` Secrets they were, labels and annotations
+    /// intact (A1).
+    ///
+    /// Ordered BEFORE `ApplyPlatformStack` because that step is what replays
+    /// `gateway.allowedDomains`, and the chart renders the Gateway's
+    /// `tls.certificateRefs` straight out of those domains. Landing the
+    /// certificate first means the reference is never dangling, not even for
+    /// the seconds between the two steps.
+    ApplyImportedCerts,
     ApplyPlatformStack,
     /// Create every namespace named in the backup manifest (idempotent SSA of a
     /// bare `Namespace` object). A fresh restore target has only the platform
@@ -258,6 +268,7 @@ pub fn restore_steps(mode: RestoreMode, data_only: bool) -> Vec<RestoreStep> {
     }
     steps.extend([
         RestoreArtifact,
+        ApplyImportedCerts,
         ApplyPlatformStack,
         EnsureNamespaces,
         ApplySourceCredentials,
@@ -612,6 +623,34 @@ mod tests {
         assert!(i(RestoreStep::LoadData) < i(RestoreStep::ReSealUserSecrets));
         assert_eq!(steps.last(), Some(&RestoreStep::ResumeWorkloads));
         assert!(i(RestoreStep::LoadData) < i(RestoreStep::ResumeWorkloads));
+    }
+
+    /// A1: the certificate has to be in the cluster before the domains that
+    /// reference it are, or the chart renders a Gateway whose
+    /// `tls.certificateRefs` names a Secret that is not there yet.
+    #[test]
+    fn imported_certs_are_applied_before_the_domains_that_reference_them() {
+        for mode in [RestoreMode::IntoRunning, RestoreMode::Reprovision] {
+            let steps = restore_steps(mode, false);
+            let i = |s| steps.iter().position(|x| *x == s).unwrap();
+            assert!(
+                i(RestoreStep::RestoreArtifact) < i(RestoreStep::ApplyImportedCerts),
+                "the certificate is read off the restored artifact ({mode:?})"
+            );
+            assert!(
+                i(RestoreStep::ApplyImportedCerts) < i(RestoreStep::ApplyPlatformStack),
+                "the certificate must land BEFORE gateway.allowedDomains ({mode:?})"
+            );
+        }
+    }
+
+    /// `--data-only` replays no config at all — no CRs, no secrets, and so no
+    /// certificate either. Applying one there would be a config write from the
+    /// mode that exists precisely to make none.
+    #[test]
+    fn a_data_only_restore_applies_no_imported_certs() {
+        let steps = restore_steps(RestoreMode::IntoRunning, true);
+        assert!(!steps.contains(&RestoreStep::ApplyImportedCerts));
     }
 
     #[test]

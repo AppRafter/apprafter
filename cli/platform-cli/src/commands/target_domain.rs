@@ -5,6 +5,7 @@
 //! helpers are unit-tested; the live merge-patch + Gateway generation ride the
 //! track-end manual walk.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 
@@ -396,15 +397,33 @@ pub(crate) struct DomainListRow {
 /// an older CLI simply has no `addedBy`, and a blank column reads like a
 /// rendering bug. The `Apps` count comes from the live Application list, so an
 /// operator can see at a glance what a `remove` would break.
-pub(crate) fn domain_list_rows(domains: &[Value], apps_json: &Value) -> Vec<DomainListRow> {
+///
+/// `missing_certs` names the certificate references that have no Secret behind
+/// them (A2). The column used to print `importedCertRef` straight out of the
+/// CR, which meant a restored cluster showed a healthy Cert column for a
+/// Secret that was not there — the domains come back with the PlatformStack,
+/// and until A1 the certificate did not come back at all. A dangling reference
+/// is not a cosmetic detail: it is the whole reason the site answers with a
+/// TLS error, so it is marked where an operator is already looking.
+pub(crate) fn domain_list_rows(
+    domains: &[Value],
+    apps_json: &Value,
+    missing_certs: &BTreeSet<String>,
+) -> Vec<DomainListRow> {
     let field = |e: &Value, k: &str| e.get(k).and_then(Value::as_str).unwrap_or("-").to_string();
     domains
         .iter()
         .map(|e| {
             let domain = field(e, "domain");
             let apps = apps_using_domain(apps_json, &domain).len().to_string();
+            let cert_ref = field(e, "importedCertRef");
+            let cert = if missing_certs.contains(&cert_ref) {
+                format!("{cert_ref} (MISSING)")
+            } else {
+                cert_ref
+            };
             DomainListRow {
-                cert: field(e, "importedCertRef"),
+                cert,
                 apps,
                 added_at: field(e, "addedAt"),
                 added_by: field(e, "addedBy"),
@@ -412,6 +431,50 @@ pub(crate) fn domain_list_rows(domains: &[Value], apps_json: &Value) -> Vec<Doma
             }
         })
         .collect()
+}
+
+/// The hint printed under a listing that has a dangling certificate. Pure.
+///
+/// It says the same thing the restore summary says, because it is the same
+/// defect seen later: the Secret the Gateway terminates TLS from is gone, and
+/// the domain rows are still there — so the ONLY step is the import. Naming
+/// `target domain add` here would send an operator into a hard
+/// "Domain already registered" failure.
+pub(crate) fn missing_cert_hint(missing: &BTreeSet<String>) -> Option<String> {
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} of the certificate(s) above ({}) has no Secret in {CERT_NAMESPACE}: the platform \
+         Gateway has nothing to terminate TLS with, so those domains will not serve. Re-import \
+         it — apprafter target cert import <name> --cert <file> --key <file> — and that is the \
+         whole fix: the domains are still registered, so nothing needs re-adding.",
+        missing.len(),
+        missing.iter().cloned().collect::<Vec<_>>().join(", "),
+    ))
+}
+
+/// Of the certificates the registered domains name, the ones with no Secret
+/// behind them.
+///
+/// Existence is the question — not "is it still labelled as imported". A
+/// certificate that lost the label is a different (and much narrower) problem
+/// than one that is not in the cluster at all, and only the second one stops
+/// the Gateway from serving.
+fn missing_cert_refs(domains: &[Value], kc: &Path) -> Result<BTreeSet<String>> {
+    let mut refs: BTreeSet<String> = domains
+        .iter()
+        .filter_map(|d| d.get("importedCertRef").and_then(Value::as_str))
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+        .collect();
+    let mut missing = BTreeSet::new();
+    for name in std::mem::take(&mut refs) {
+        if kubectl_get_json("secret", Some(&name), Some(CERT_NAMESPACE), kc)?.is_none() {
+            missing.insert(name);
+        }
+    }
+    Ok(missing)
 }
 
 fn run_domain_list() -> Result<()> {
@@ -422,10 +485,14 @@ fn run_domain_list() -> Result<()> {
         println!("{NO_DOMAINS_HINT}");
         return Ok(());
     }
-    let rows = domain_list_rows(&domains, &list_applications(kc.path())?);
+    let missing = missing_cert_refs(&domains, kc.path())?;
+    let rows = domain_list_rows(&domains, &list_applications(kc.path())?, &missing);
     let mut table = Table::new(&rows);
     table.with(Style::sharp());
     println!("{table}");
+    if let Some(hint) = missing_cert_hint(&missing) {
+        eprintln!("{}", cli_core::style::warn(&hint));
+    }
     Ok(())
 }
 
@@ -739,6 +806,7 @@ mod tests {
         let rows = domain_list_rows(
             &[serde_json::json!({"domain": "apprafter.dev"})],
             &serde_json::json!({"items": []}),
+            &BTreeSet::new(),
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].domain, "apprafter.dev");
@@ -766,6 +834,7 @@ mod tests {
                 build_domain_entry("unused.dev", "u-cert", "2026-06-17", "ci"),
             ],
             &apps,
+            &BTreeSet::new(),
         );
         let counts: Vec<(&str, &str)> = rows
             .iter()
@@ -781,6 +850,51 @@ mod tests {
         );
         assert_eq!(rows[0].cert, "cf-cert");
         assert_eq!(rows[0].added_by, "rem");
+    }
+
+    /// A2, FIRES: the Cert column used to print `importedCertRef` straight out
+    /// of the CR, so a restored cluster — where the domains came back and the
+    /// certificate did not — showed a perfectly healthy Cert column for a
+    /// Secret that was not in the cluster. The one place an operator looks for
+    /// this has to say it.
+    #[test]
+    fn a_certificate_with_no_secret_behind_it_is_marked_missing_in_the_listing() {
+        let missing: BTreeSet<String> = ["gone-cert".to_string()].into_iter().collect();
+        let rows = domain_list_rows(
+            &[
+                build_domain_entry("apprafter.dev", "gone-cert", "2026-06-15", "rem"),
+                build_domain_entry("other.dev", "live-cert", "2026-06-16", "rem"),
+            ],
+            &serde_json::json!({"items": []}),
+            &missing,
+        );
+        assert_eq!(rows[0].cert, "gone-cert (MISSING)");
+        assert_eq!(
+            rows[1].cert, "live-cert",
+            "a certificate that IS there must not acquire a marker — a table \
+             that flags every row teaches the reader to ignore the column"
+        );
+    }
+
+    /// …and the hint under the table names the one command that fixes it.
+    /// NOT `target domain add`: the domain is already registered (it came back
+    /// with the snapshot), so that path hard-fails with "Domain already
+    /// registered" — which is exactly the documented runbook's second step.
+    #[test]
+    fn the_missing_cert_hint_names_the_import_and_not_the_domain_add() {
+        let missing: BTreeSet<String> = ["gone-cert".to_string()].into_iter().collect();
+        let hint = missing_cert_hint(&missing).expect("a missing cert must be explained");
+        assert!(hint.contains("gone-cert"), "{hint}");
+        assert!(hint.contains("apprafter target cert import"), "{hint}");
+        assert!(
+            !hint.contains("target domain add"),
+            "the domain is already registered; add would hard-fail: {hint}"
+        );
+        assert_eq!(
+            missing_cert_hint(&BTreeSet::new()),
+            None,
+            "nothing missing, nothing said"
+        );
     }
 
     // ── operator-facing messages ─────────────────────────────────────────

@@ -22,13 +22,26 @@ object-storage-first design — is
 The full restore is a fixed sequence:
 
 ```text
-RestoreArtifact -> ApplyPlatformStack -> ApplySourceCredentials ->
-ApplyAppsGated -> WaitClaimsBound -> LoadData -> ReSealUserSecrets ->
-ResumeWorkloads
+RestoreArtifact -> ApplyImportedCerts -> ApplyPlatformStack ->
+ApplySourceCredentials -> ApplyAppsGated -> WaitClaimsBound -> LoadData ->
+ReSealUserSecrets -> ResumeWorkloads
 ```
 
-Three behaviours are load-bearing:
+Four behaviours are load-bearing:
 
+- **The certificate lands before the domains that name it.** The registered
+  zones live in the `PlatformStack`, and the platform Gateway is rendered from
+  them with `tls.certificateRefs` pointing at the imported certificate's Secret
+  in `apprafter-system`. `ApplyImportedCerts` therefore runs *before*
+  `ApplyPlatformStack`: replaying the zones first would publish a Gateway whose
+  certificate reference resolves to nothing, if only for the seconds between
+  two steps. The certificates are applied as the plain `kubernetes.io/tls`
+  Secrets they were captured as, labels included — unlike the material under
+  `secrets/`, they are not re-sealed, because nothing sealed them at the source
+  and the import labels are what `apprafter target domain add` and the next
+  backup's capture both key on. A snapshot that carries zones but no
+  certificate — anything taken before certificates were captured — is reported
+  by name in the summary rather than left to surface as a TLS error.
 - **Workloads are gated during the load.** The apps are applied with
   `replicas: 0` (and the user Argo Applications have their `syncPolicy.automated`
   stripped) so the operator provisions fresh claims but **no pod runs yet**.

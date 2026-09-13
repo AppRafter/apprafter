@@ -83,6 +83,22 @@ pub struct BackupOpts {
     /// the machine's own hostname as the group (correct for a per-operator
     /// station grouping).
     pub backup_host: Option<String>,
+    /// Was the Cloudflare origin firewall on for the cluster being captured
+    /// (A4)?
+    ///
+    /// The toggle is LOCAL state — `targets/<name>/config.yaml` on the
+    /// operator's machine — so nothing inside the cluster can be asked about
+    /// it, and a restore onto a NEW target re-provisioned the node with 80/443
+    /// open to the internet while the source had them restricted.
+    /// `backup create` runs against a resolved target and therefore knows;
+    /// recording the intent here is what lets `restore --reprovision` carry it
+    /// over without having to work out which target the snapshot came from.
+    ///
+    /// `None` means UNKNOWN, never "off": it is what a snapshot taken before
+    /// this field existed carries, and what the in-cluster runner records (a
+    /// CronJob has no target store to read). Restore stays silent on it rather
+    /// than claiming the source had the firewall off.
+    pub origin_firewall: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +136,43 @@ pub const APPRAFTER_MANAGED_LABEL: &str = "apprafter.io/managed-by=apprafter";
 const APPRAFTER_SYSTEM_NAMESPACE: &str = "apprafter-system";
 const PLATFORMSTACK_NAME: &str = "default";
 const CNPG_OPERATOR_NS: &str = "cnpg-system";
+
+/// The label `apprafter target cert import` stamps on the `kubernetes.io/tls`
+/// Secret it creates (`cli-providers::cert::build_tls_secret`), and the label
+/// `target domain add` gates on before it will point a domain at the Secret.
+pub const IMPORTED_CERT_LABEL: (&str, &str) = ("apprafter.io/cert-mode", "imported");
+
+/// The artifact subdirectory holding the imported TLS certificates, as WHOLE
+/// Secret objects. Deliberately NOT under `secrets/`: the files there are
+/// `{type, data}` envelopes that restore re-seals into SealedSecrets, and an
+/// imported certificate is neither sealed at the source nor re-sealable here —
+/// it has to come back as the same plain Secret, labels and all.
+pub const CERTS_DIR: &str = "certs";
+
+/// The manifest `kind` an imported certificate is indexed under, so
+/// `apprafter backup show` names what it is carrying instead of implying the
+/// snapshot holds only the five CR kinds.
+pub const IMPORTED_CERT_KIND: &str = "ImportedCert";
+
+/// True iff this Secret JSON is a certificate `apprafter target cert import`
+/// put in the cluster.
+///
+/// # Why the label, and not the Secret's `type`
+///
+/// `kubernetes.io/tls` alone would also match every certificate cert-manager
+/// issues — material that is re-issued on restore rather than replayed, and
+/// that a backup has no business staging. The label is stamped by the import
+/// command and by nothing else, so it means exactly "an operator handed us
+/// this certificate, and nothing in the cluster can regenerate it".
+pub fn is_imported_cert_secret(secret: &Value) -> bool {
+    let (key, value) = IMPORTED_CERT_LABEL;
+    secret
+        .pointer("/metadata/labels")
+        .and_then(Value::as_object)
+        .and_then(|labels| labels.get(key))
+        .and_then(Value::as_str)
+        == Some(value)
+}
 
 /// True iff this Argo `Application` JSON carries the
 /// `apprafter.io/managed-by: apprafter` label.
@@ -499,6 +552,12 @@ pub struct BackupSummary {
     pub snapshot_id: Option<String>,
     pub cr_count: usize,
     pub secret_count: usize,
+    /// Imported TLS certificates staged under [`CERTS_DIR`]. Counted apart
+    /// from `secret_count`, which is the sealed material in `secrets/`: the
+    /// two are captured by different rules and restored by different steps,
+    /// and one number covering both would hide a snapshot that carried the
+    /// domains without the certificate that serves them.
+    pub cert_count: usize,
     pub claim_count: usize,
     pub extracted_count: usize,
     pub tag: String,
@@ -524,6 +583,7 @@ pub fn run_backup_with_summary(
 struct NonClaimArtifacts {
     cr_count: usize,
     secret_count: usize,
+    cert_count: usize,
 }
 
 /// Write the non-claim components (`crs/` serialized CRs + `secrets/` +
@@ -632,6 +692,45 @@ fn capture_non_claim_artifacts(
         }
     }
 
+    // Imported TLS certificates — the THIRD capture path (A1).
+    //
+    // `target domain add` writes its domains into the PlatformStack, which is
+    // the first thing captured above and the first thing a restore replays;
+    // the certificate those domains are served from is a PLAIN
+    // `kubernetes.io/tls` Secret that `target cert import` applies, with no
+    // SealedSecret and no cert-manager `Certificate` behind it. Neither of the
+    // two paths above can see it — the sealed sweep keeps only Secrets that
+    // have a SealedSecret of the same name, and the `SourceCredential` walk
+    // follows `sealedSecretRef`s. So the domains came back from a restore and
+    // the certificate did not, leaving the chart-rendered Gateway pointing at
+    // a Secret that is not there.
+    //
+    // Keyed on the import label rather than on `cert import` additionally
+    // sealing the material, because the label is ALREADY on the certificates
+    // imported on clusters running today — a change to `cert import` would
+    // only have rescued the ones imported after it shipped.
+    //
+    // Scoped to `apprafter-system`: the chart pins the Gateway's
+    // `certificateRefs[].namespace` to it, so a certificate anywhere else
+    // cannot be serving a domain.
+    //
+    // The material lands in the snapshot DECRYPTED, like every other captured
+    // Secret — `read_secret_data` base64-decodes what it stages, so the
+    // snapshot already holds plaintext credentials and this path adds no new
+    // class of exposure (B1 covers that question for the whole artifact).
+    let imported_certs: Vec<Value> = list_items(k, "secrets", Some(APPRAFTER_SYSTEM_NAMESPACE))?
+        .into_iter()
+        .filter(is_imported_cert_secret)
+        .collect();
+    if !imported_certs.is_empty() {
+        let certs_dir = dest_dir.join(CERTS_DIR);
+        std::fs::create_dir_all(&certs_dir)
+            .map_err(|e| CliError::Other(format!("create certs dir: {e}")))?;
+        for cert in &imported_certs {
+            write_imported_cert(cert, &certs_dir)?;
+        }
+    }
+
     // manifest.json (the commit point in `Sequential`).
     let manifest_crs: Vec<(&str, &Value)> =
         captured_crs.iter().map(|(k, v)| (k.as_str(), v)).collect();
@@ -642,14 +741,64 @@ fn capture_non_claim_artifacts(
         platform_version: opts.platform_version.clone(),
         namespaces: opts.namespaces.clone(),
         secret_namespaces: secret_namespaces.clone(),
-        resources: resource_refs(&manifest_crs, claims),
+        origin_firewall: opts.origin_firewall,
+        resources: [
+            resource_refs(&manifest_crs, claims),
+            imported_cert_refs(&imported_certs),
+        ]
+        .concat(),
     };
     write_manifest(&manifest, dest_dir)?;
 
     Ok(NonClaimArtifacts {
         cr_count: captured_crs.len(),
         secret_count,
+        cert_count: imported_certs.len(),
     })
+}
+
+/// Stage one imported certificate as the WHOLE sanitized Secret object.
+///
+/// Not a `{type, data}` envelope like the sealed material: the labels and
+/// annotations `cert import` stamped are load-bearing after a restore. The
+/// import label is what this capture path itself keys on (so a restored
+/// cluster's own backups keep carrying the certificate), what `target domain
+/// add` checks before it will point a domain at the Secret, and what
+/// `target domain list` reads back — a restore that dropped them would leave a
+/// certificate that serves traffic but that no AppRafter command recognises.
+fn write_imported_cert(cert: &Value, certs_dir: &Path) -> Result<()> {
+    let name = cert
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or("unnamed");
+    let body = serde_json::to_vec_pretty(&sanitize_cr(cert))
+        .map_err(|e| CliError::Other(format!("serialize imported cert {name}: {e}")))?;
+    std::fs::write(certs_dir.join(format!("{name}.json")), body)
+        .map_err(|e| CliError::Other(format!("write imported cert {name}.json: {e}")))
+}
+
+/// Index the captured certificates in `manifest.resources`, so `backup show`
+/// says a snapshot is carrying them. A snapshot that holds material it does
+/// not list reads as complete while being short of exactly the thing an
+/// operator would look for.
+fn imported_cert_refs(certs: &[Value]) -> Vec<ResourceRef> {
+    certs
+        .iter()
+        .map(|c| ResourceRef {
+            namespace: c
+                .pointer("/metadata/namespace")
+                .and_then(Value::as_str)
+                .unwrap_or(APPRAFTER_SYSTEM_NAMESPACE)
+                .to_string(),
+            kind: IMPORTED_CERT_KIND.to_string(),
+            name: c
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            claim_type: None,
+        })
+        .collect()
 }
 
 /// The directory that must exist before `restic init` can create a repository
@@ -755,6 +904,7 @@ fn run_backup_monolithic_with_summary(
         snapshot_id,
         cr_count: non_claim.cr_count,
         secret_count: non_claim.secret_count,
+        cert_count: non_claim.cert_count,
         claim_count: claims.len(),
         extracted_count: plan.len(),
         tag,
@@ -837,6 +987,7 @@ fn run_backup_sequential_with_summary(
         snapshot_id,
         cr_count: non_claim.cr_count,
         secret_count: non_claim.secret_count,
+        cert_count: non_claim.cert_count,
         claim_count: claims.len(),
         extracted_count: plan.len(),
         tag,
@@ -1138,6 +1289,7 @@ mod tests {
             pg_image: "postgres:16-alpine".into(),
             staging_mode: mode,
             backup_host: None,
+            origin_firewall: None,
         }
     }
 
@@ -2011,6 +2163,158 @@ mod tests {
             "an unsealed, provisioner-generated Secret must NOT be staged"
         );
         assert!(secrets.join("sourcecred").join("gh-token.json").exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // A1 — the imported TLS certificate, the third capture path
+    // -----------------------------------------------------------------------
+
+    /// `apprafter-system` as an operator with a domain has it: the imported
+    /// certificate the Gateway terminates TLS from, a cert-manager-issued
+    /// certificate of the same `kubernetes.io/tls` TYPE that is re-issued
+    /// rather than replayed, and the backup repository credentials.
+    fn cluster_with_an_imported_cert() -> FakeKube {
+        scripted_cluster().reply(
+            &["get", "secrets", "-n", "apprafter-system", "-o", "json"],
+            json!({"items": [
+                {"kind": "Secret", "type": "kubernetes.io/tls",
+                 "metadata": {"name": "cf-origin", "namespace": "apprafter-system",
+                              "uid": "dead-beef", "resourceVersion": "991",
+                              "labels": {"apprafter.io/managed-by": "apprafter",
+                                         "apprafter.io/cert-mode": "imported",
+                                         "apprafter.io/cert-name": "cf-origin"},
+                              "annotations": {"apprafter.io/cert-not-after": "2027-01-01T00:00:00Z"}},
+                 "data": {"tls.crt": "Q1JU", "tls.key": "S0VZ"}},
+                {"kind": "Secret", "type": "kubernetes.io/tls",
+                 "metadata": {"name": "acme-issued", "namespace": "apprafter-system",
+                              "annotations": {"cert-manager.io/certificate-name": "acme"}},
+                 "data": {"tls.crt": "Q1JU", "tls.key": "S0VZ"}},
+                {"kind": "Secret", "type": "Opaque",
+                 "metadata": {"name": "apprafter-backup-s3", "namespace": "apprafter-system"},
+                 "data": {"RESTIC_PASSWORD": "cHc="}}
+            ]}),
+        )
+    }
+
+    /// THE A1 guard. The domains live in the PlatformStack and come back with
+    /// every restore; before this path the certificate they name came back
+    /// with none of them, because it is a plain Secret with no SealedSecret
+    /// behind it — so the restored Gateway referenced a Secret that did not
+    /// exist and the site did not serve.
+    #[test]
+    fn capture_non_claim_artifacts_captures_the_imported_tls_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = cluster_with_an_imported_cert();
+        let opts = opts_for(StagingMode::Monolithic, dir.path().to_path_buf());
+
+        let out = capture_non_claim_artifacts(&k, &opts, &[], dir.path()).unwrap();
+
+        assert_eq!(out.cert_count, 1);
+        assert_eq!(
+            file_names_in(&dir.path().join("certs")),
+            vec!["cf-origin.json"],
+            "only the IMPORTED certificate: a cert-manager-issued one is \
+             re-issued on the restored cluster, and the repository credentials \
+             are not a certificate at all"
+        );
+
+        // The WHOLE Secret, not a {type,data} envelope: the import labels are
+        // what the next backup keys on and what `target domain add` checks.
+        let staged = read_json(&dir.path().join("certs").join("cf-origin.json"));
+        assert_eq!(staged["type"], json!("kubernetes.io/tls"));
+        assert_eq!(staged["data"]["tls.key"], json!("S0VZ"));
+        assert_eq!(
+            staged["metadata"]["labels"]["apprafter.io/cert-mode"],
+            json!("imported")
+        );
+        assert_eq!(
+            staged["metadata"]["annotations"]["apprafter.io/cert-not-after"],
+            json!("2027-01-01T00:00:00Z")
+        );
+        assert!(
+            staged["metadata"].get("uid").is_none()
+                && staged["metadata"].get("resourceVersion").is_none(),
+            "staged for replay into a DIFFERENT cluster: no stale identity"
+        );
+
+        // It is not sealed, so the sealed sweep must still not have taken it.
+        assert!(!dir
+            .path()
+            .join("secrets")
+            .join("apprafter-system")
+            .join("cf-origin.json")
+            .exists());
+    }
+
+    /// The certificate is indexed in the manifest, so `backup show` names it.
+    /// A snapshot that carries material it does not list reads as complete
+    /// while being short of exactly the thing an operator looks for.
+    #[test]
+    fn the_manifest_indexes_the_imported_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = cluster_with_an_imported_cert();
+        let opts = opts_for(StagingMode::Monolithic, dir.path().to_path_buf());
+
+        capture_non_claim_artifacts(&k, &opts, &[], dir.path()).unwrap();
+
+        let m = read_json(&dir.path().join("manifest.json"));
+        let certs: Vec<&Value> = m["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["kind"] == json!("ImportedCert"))
+            .collect();
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0]["name"], json!("cf-origin"));
+        assert_eq!(certs[0]["namespace"], json!("apprafter-system"));
+    }
+
+    /// A cluster with no imported certificate stages no `certs/` directory and
+    /// records nothing — the path must cost nothing on the clusters that never
+    /// connected a domain.
+    #[test]
+    fn a_cluster_with_no_imported_certificate_stages_no_certs_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = scripted_cluster();
+        let opts = opts_for(StagingMode::Monolithic, dir.path().to_path_buf());
+
+        let out = capture_non_claim_artifacts(&k, &opts, &[], dir.path()).unwrap();
+
+        assert_eq!(out.cert_count, 0);
+        assert!(!dir.path().join("certs").exists());
+        assert!(!read_json(&dir.path().join("manifest.json"))["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["kind"] == json!("ImportedCert")));
+    }
+
+    /// A4: the origin-firewall intent the caller recorded reaches the
+    /// manifest, and an UNKNOWN one leaves the key out of the JSON entirely
+    /// rather than writing `false` — a restore must be able to tell "the
+    /// source had it off" from "nobody asked".
+    #[test]
+    fn the_manifest_records_the_origin_firewall_intent_only_when_it_is_known() {
+        let cases = [
+            (Some(true), Some(json!(true))),
+            (Some(false), Some(json!(false))),
+            (None, None),
+        ];
+        for (recorded, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let k = scripted_cluster();
+            let mut opts = opts_for(StagingMode::Monolithic, dir.path().to_path_buf());
+            opts.origin_firewall = recorded;
+
+            capture_non_claim_artifacts(&k, &opts, &[], dir.path()).unwrap();
+
+            let m = read_json(&dir.path().join("manifest.json"));
+            assert_eq!(
+                m.get("originFirewall").cloned(),
+                expected,
+                "origin_firewall={recorded:?}"
+            );
+        }
     }
 
     /// INVARIANT: `manifest.json` is the restore index. It must name every

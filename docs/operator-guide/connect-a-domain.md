@@ -29,9 +29,11 @@ bypass Cloudflare by hitting the node directly:
 apprafter target firewall cloudflare-origin enable
 ```
 
-It's a cluster-wide setting — do it once, not per zone — and it survives
-re-provisioning. Run `apprafter target firewall cloudflare-origin disable` to
-reopen `80`/`443`. What the restriction buys, and what it does not, is
+It's a cluster-wide setting — do it once, not per zone. The toggle is stored on
+the **target**, not in the cluster, so it survives re-provisioning that target,
+and `apprafter restore --reprovision` carries it onto the new target when you
+rebuild somewhere else. Run `apprafter target firewall cloudflare-origin
+disable` to reopen `80`/`443`. What the restriction buys, and what it does not, is
 [The public route](../how-it-works/the-public-route.md#what-the-origin-firewall-buys-and-what-it-does-not).
 
 > Infrastructure-as-code / fork users can instead opt in via the manifest:
@@ -168,6 +170,34 @@ is the two-host version of the same thing: the apex on one application and
   ```bash
   apprafter target domain list
   ```
+
+  The `Cert` column marks a certificate reference with no Secret behind it as
+  `MISSING`. That is a zone the Gateway cannot serve — see below.
+
+## After a restore
+
+Do **not** replay this page after `apprafter restore`. The zones live in the
+`PlatformStack`, so they come back with the restore, and step 2.4 refuses with
+`Domain already registered` when they do.
+
+There is normally nothing to redo at all: the imported certificate is captured
+and restored too, and the restore summary says how many came back. The one case
+that needs you is a snapshot taken before certificates were captured — it brings
+the zones back without the material. The restore names the certificate, and
+`apprafter target domain list` marks it `MISSING` until you re-import it:
+
+```bash
+apprafter target cert import <name> --cert ./origin.pem --key ./origin.key
+```
+
+That is the whole repair: the zone is still registered and the Gateway picks the
+Secret up.
+
+The origin firewall from step 1 is per-target and lives on your machine, not in
+the cluster. `restore --reprovision` carries it onto the target it provisions;
+a restore into an already-running cluster leaves the firewall alone and says so.
+Either way the restore summary states which happened —
+[Restore from a backup](restore.md).
 
 ## Removing a zone
 

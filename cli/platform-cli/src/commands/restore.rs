@@ -213,6 +213,7 @@ fn restore_summary(
     version_warning: Option<&str>,
     inherited_cluster_name: Option<&str>,
     schedule: BackupSchedule,
+    edge: &EdgeRestore,
 ) -> Vec<String> {
     let mut lines = vec![format!(
         "✓ Restored backup{} into target '{}'",
@@ -230,6 +231,7 @@ fn restore_summary(
     }
     lines.push(format!("  workloads:  {resumed} app(s) resumed"));
     lines.extend(backup_inheritance_lines(schedule, inherited_cluster_name));
+    lines.extend(edge_inheritance_lines(edge));
     if let Some(w) = version_warning {
         lines.push(format!("  ⚠ {w}"));
     }
@@ -291,6 +293,136 @@ fn backup_inheritance_lines(
              identity — the name is only a label. Rename with `apprafter backup set cluster-name \
              <name>`."
         ));
+    }
+    lines
+}
+
+/// What this restore did about the source cluster's EDGE configuration — the
+/// certificate its domains are served from, and its origin firewall.
+///
+/// The two belong with the backup-inheritance block above and are reported in
+/// the same paragraph. They are the same kind of fact: things that came with
+/// the snapshot, that the operator did not ask for by name, and that decide
+/// whether the restored site actually answers. Both used to be silent, and
+/// both failures look identical from outside — after a restore the site does
+/// not work.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct EdgeRestore {
+    /// Imported TLS certificates re-applied from the snapshot (A1).
+    certs_restored: usize,
+    /// Certificate names the restored domains reference that the snapshot did
+    /// NOT carry — every backup taken before the certificate was captured has
+    /// this shape, and it is exactly the dangling Gateway reference (A1/A2).
+    dangling_certs: Vec<String>,
+    /// What happened to the source's origin-firewall intent (A4).
+    origin_firewall: OriginFirewall,
+}
+
+/// What a restore did with the origin-firewall intent the snapshot recorded
+/// (A4).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum OriginFirewall {
+    /// Nothing to carry and nothing to say: the snapshot recorded OFF, or
+    /// recorded nothing at all (an in-cluster run, or one taken before the
+    /// field existed), or the destination target already has the toggle on.
+    #[default]
+    Nothing,
+    /// Recorded ON, and this restore provisioned the node — so the intent was
+    /// written onto the named target and its live firewall reconciled.
+    Carried { target: String },
+    /// Recorded ON, but the carry did not complete. The ports are still open
+    /// and the line says so.
+    ///
+    /// `recorded` is whether the toggle nonetheless reached the target's
+    /// config — the carry persists the intent BEFORE it touches the cloud, so
+    /// a failed reconcile usually leaves it on disk, and a failure to resolve
+    /// or write the target does not. The distinction is checked rather than
+    /// assumed, because "target 'X' records it" decides whether the operator's
+    /// next `apprafter apply` fixes this on its own.
+    CarriedNotEnforced {
+        target: String,
+        why: String,
+        recorded: bool,
+    },
+    /// Recorded ON, but this restore provisioned no node. Nothing was changed
+    /// — a cluster that was already running has whatever firewall it has, and
+    /// writing the target's config here would claim something this restore
+    /// never made true.
+    Announced,
+}
+
+/// What the summary says about the edge configuration. Pure.
+///
+/// Phrased to continue [`backup_inheritance_lines`] rather than to open a new
+/// topic: each line names something of the SOURCE's that came with the restore
+/// (or did not), in the same shape, because to the operator they are one
+/// paragraph — "here is what you inherited, and here is what it means".
+fn edge_inheritance_lines(edge: &EdgeRestore) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    // Stated even though it is good news: the certificate is the half of a
+    // connected domain that a backup used to drop, and an operator who has
+    // been bitten by that needs to see that this restore did not.
+    if edge.certs_restored > 0 {
+        let n = edge.certs_restored;
+        lines.push(format!(
+            "  ✓ the source's imported TLS certificate(s) came with the restore — {n} re-applied \
+             to apprafter-system, so the domains its PlatformStack brought back are served by the \
+             same certificate as before. `apprafter target domain list` shows the zones and the \
+             certificate each of them is served from."
+        ));
+    }
+
+    if !edge.dangling_certs.is_empty() {
+        lines.push(format!(
+            "  ⚠ the restored domains name certificate(s) this snapshot does not carry: {}. A \
+             backup taken before imported certificates were captured looks exactly like this — \
+             the material never left the source cluster, so the platform Gateway has nothing to \
+             terminate TLS with and the domains will not serve. Re-import with `apprafter target \
+             cert import <name> --cert <file> --key <file>`; the domains are already registered, \
+             so there is no `target domain add` to repeat. `apprafter target domain list` marks \
+             the reference MISSING until then.",
+            edge.dangling_certs.join(", ")
+        ));
+    }
+
+    match &edge.origin_firewall {
+        OriginFirewall::Nothing => {}
+        OriginFirewall::Carried { target } => lines.push(format!(
+            "  ✓ the source's Cloudflare origin firewall came with the restore — target \
+             '{target}' records it now, and the node this restore provisioned has its 80/443 \
+             restricted to Cloudflare's IP ranges rather than open to the internet. Nothing else \
+             on that target changed; `apprafter target firewall cloudflare-origin disable` \
+             re-opens them."
+        )),
+        OriginFirewall::CarriedNotEnforced {
+            target,
+            why,
+            recorded,
+        } => lines.push(format!(
+            "  ⚠ the source's Cloudflare origin firewall came with the restore, but {}: {why}. \
+             The node's 80/443 are still open to the internet.{} To close them now, `apprafter \
+             target use {target}` then `apprafter target firewall cloudflare-origin enable`.",
+            if *recorded {
+                format!(
+                    "target '{target}' records it and the live firewall could not be reconciled"
+                )
+            } else {
+                format!("it could not be applied to target '{target}' at all")
+            },
+            if *recorded {
+                " The recorded toggle applies on the next `apprafter apply`."
+            } else {
+                ""
+            },
+        )),
+        OriginFirewall::Announced => lines.push(
+            "  ⚠ the snapshot recorded the source's Cloudflare origin firewall as ON. This \
+             restore provisioned no node, so nothing here was changed — this cluster's 80/443 \
+             are whatever they already were. `apprafter target firewall cloudflare-origin \
+             enable` restricts them to Cloudflare's IP ranges."
+                .to_string(),
+        ),
     }
     lines
 }
@@ -380,6 +512,10 @@ pub fn run_restore(
     // (ApplyAppsGated / SuspendWorkloads) and must re-enable in ResumeWorkloads.
     let mut suspended_argo: Vec<(String, String)> = Vec::new();
     let mut version_warning: Option<String> = None;
+    // What came back of the source's edge configuration — its imported TLS
+    // certificate and its origin firewall (A1/A4). Reported in the summary
+    // alongside the backup-config inheritance.
+    let mut edge = EdgeRestore::default();
     // The source's `spec.backup.clusterName`, when the replayed PlatformStack
     // carried an enabled schedule — reported in the summary (E1).
     let mut inherited_cluster_name: Option<String> = None;
@@ -433,8 +569,23 @@ pub fn run_restore(
                 let target_version = read_platform_version(kc.path())?;
                 version_warning =
                     cross_version_warning(data_only, &target_version, &m.platform_version);
+
+                // A4, at the earliest moment anything can know: the manifest
+                // is the first place the source's origin-firewall intent
+                // appears, and on `--reprovision` the node it applies to is
+                // already up — the rest of a restore takes minutes, and they
+                // are minutes with 80/443 open to the internet.
+                edge.origin_firewall =
+                    settle_origin_firewall(m.origin_firewall, reprovision, target);
+
                 data_dir = Some(dd);
                 manifest = Some(m);
+            }
+            RestoreStep::ApplyImportedCerts => {
+                let dd = produced_by_artifact(data_dir.as_ref(), "ApplyImportedCerts")?;
+                let (restored, dangling) = apply_imported_certs(dd, kc.path())?;
+                edge.certs_restored = restored;
+                edge.dangling_certs = dangling;
             }
             RestoreStep::ApplyPlatformStack => {
                 let dd = produced_by_artifact(data_dir.as_ref(), "ApplyPlatformStack")?;
@@ -488,6 +639,7 @@ pub fn run_restore(
         version_warning.as_deref(),
         inherited_cluster_name.as_deref(),
         schedule,
+        &edge,
     ) {
         println!("{line}");
     }
@@ -791,6 +943,221 @@ fn namespaces_to_ensure_all<'a>(apps: &'a [String], secrets: &'a [String]) -> Ve
     all.sort_unstable();
     all.dedup();
     all
+}
+
+/// What a restore should do with the origin-firewall intent a snapshot
+/// recorded (A4). Pure.
+///
+/// * `recorded` — the manifest's `originFirewall`. `None` is UNKNOWN (a
+///   snapshot from before the field existed, or one the in-cluster runner
+///   wrote), and is treated as "say nothing": claiming the source had its
+///   80/443 open is a statement about a cluster this snapshot never recorded.
+/// * `Some(false)` changes nothing either. The carry is one-directional on
+///   purpose — it can only ever RESTRICT ports, so inheriting it can never
+///   leave a cluster more exposed than doing nothing, and turning a
+///   destination's firewall OFF because the source had none is the one
+///   direction that could.
+/// * `destination_already_on` — the destination target already records the
+///   toggle. Nothing to carry, and nothing worth a line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OriginFirewallAction {
+    /// Change nothing, say nothing.
+    Nothing,
+    /// Write it onto the destination target and reconcile its live firewall —
+    /// only on the mode that provisioned the node.
+    Carry,
+    /// Say the snapshot recorded it; change nothing. The cluster is already
+    /// running with whatever firewall it has, so writing the target's config
+    /// would be a claim this restore has not made true.
+    Announce,
+}
+
+fn origin_firewall_action(
+    recorded: Option<bool>,
+    reprovisioned: bool,
+    destination_already_on: bool,
+) -> OriginFirewallAction {
+    if recorded != Some(true) || destination_already_on {
+        return OriginFirewallAction::Nothing;
+    }
+    if reprovisioned {
+        OriginFirewallAction::Carry
+    } else {
+        OriginFirewallAction::Announce
+    }
+}
+
+/// Is the Cloudflare origin firewall already recorded on the destination
+/// target? A target that cannot be read answers `false`, which downgrades a
+/// carry to a warning rather than skipping it silently.
+fn target_records_origin_firewall(target: Option<&str>) -> bool {
+    crate::commands::state_paths::resolve_state_paths(target)
+        .ok()
+        .and_then(|r| cli_core::target::load_target(&r.store, &r.target_name).ok())
+        .and_then(|t| t.config.firewall)
+        .is_some_and(|f| f.cloudflare_origin)
+}
+
+/// Carry (or announce) the source's origin-firewall intent, and report what
+/// happened for the summary (A4).
+///
+/// The carry is a side effect on the DESTINATION target's local config plus
+/// its live cloud firewall, so it is reported rather than done quietly — and
+/// it is scoped to the named target, never the active one.
+///
+/// A failure here never fails the restore. The data is in the cluster by the
+/// time this can be known; refusing to finish over a firewall the operator can
+/// set with one command afterwards would trade a working restore for a tidier
+/// invariant. It is reported in full instead, ports-still-open and all.
+fn settle_origin_firewall(
+    recorded: Option<bool>,
+    reprovision: bool,
+    target: Option<&str>,
+) -> OriginFirewall {
+    match origin_firewall_action(
+        recorded,
+        reprovision,
+        target_records_origin_firewall(target),
+    ) {
+        OriginFirewallAction::Nothing => OriginFirewall::Nothing,
+        OriginFirewallAction::Announce => OriginFirewall::Announced,
+        OriginFirewallAction::Carry => {
+            match crate::commands::target_firewall::apply_cloudflare_origin(target, true) {
+                Ok(applied) => {
+                    for line in &applied.lines {
+                        println!("  {line}");
+                    }
+                    match applied.warning {
+                        None => OriginFirewall::Carried {
+                            target: applied.target,
+                        },
+                        // The intent IS on disk here: the carry persists it
+                        // before it looks for a firewall to reconcile.
+                        Some(why) => OriginFirewall::CarriedNotEnforced {
+                            target: applied.target,
+                            why,
+                            recorded: true,
+                        },
+                    }
+                }
+                // Anything from "target could not be read" to "the Cloudflare
+                // ranges could not be fetched" lands here, and they differ in
+                // whether the toggle stuck. Ask the target rather than guess.
+                Err(e) => OriginFirewall::CarriedNotEnforced {
+                    target: target.unwrap_or("<active>").to_string(),
+                    why: format!("{e}"),
+                    recorded: target_records_origin_firewall(target),
+                },
+            }
+        }
+    }
+}
+
+/// **ApplyImportedCerts** (A1) — re-apply the imported TLS certificates the
+/// snapshot carries under `certs/`, and report which of the restored domains
+/// still have no certificate to point at.
+///
+/// Applied as the plain `kubernetes.io/tls` Secrets they were captured as —
+/// whole objects, labels and annotations included. They are NOT re-sealed like
+/// the material under `secrets/`: nothing sealed them at the source (an
+/// imported certificate has no SealedSecret behind it, which is exactly why
+/// the capture sweep used to miss it), and the import labels have to survive —
+/// `target domain add` checks them before it will point a domain at the
+/// Secret, and the backup path itself keys on them, so a restored cluster that
+/// lost them would drop the certificate from its own next backup.
+///
+/// Returns `(applied, dangling certificate names)`.
+fn apply_imported_certs(data_dir: &Path, kubeconfig: &Path) -> Result<(usize, Vec<String>)> {
+    let certs = read_imported_certs(data_dir)?;
+    for cert in &certs {
+        apply_cr(cert, kubeconfig)?;
+    }
+    if !certs.is_empty() {
+        println!("  ✓ {} imported TLS certificate(s) restored", certs.len());
+    }
+
+    let restored: Vec<String> = certs.iter().filter_map(object_name).collect();
+    let crs = read_crs(data_dir)?;
+    let referenced = crs
+        .iter()
+        .find(|c| c.kind == "PlatformStack")
+        .map(|ps| referenced_cert_names(&ps.cr))
+        .unwrap_or_default();
+    Ok((certs.len(), dangling_cert_refs(&referenced, &restored)))
+}
+
+/// Read every staged certificate under `data/certs/`, ordered so a restore is
+/// reproducible. A snapshot with no `certs/` directory — every backup taken
+/// before the certificate was captured, and every cluster that never connected
+/// a domain — yields an empty list rather than an error.
+fn read_imported_certs(data_dir: &Path) -> Result<Vec<Value>> {
+    let certs_dir = data_dir.join(backup_core::engine::CERTS_DIR);
+    let Ok(entries) = std::fs::read_dir(&certs_dir) else {
+        return Ok(Vec::new());
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .collect();
+    files.sort();
+    let mut out = Vec::new();
+    for path in files {
+        let body = std::fs::read(&path)
+            .map_err(|e| CliError::Other(format!("read cert {}: {e}", path.display())))?;
+        out.push(
+            serde_json::from_slice(&body)
+                .map_err(|e| CliError::Other(format!("parse cert {}: {e}", path.display())))?,
+        );
+    }
+    Ok(out)
+}
+
+/// `metadata.name` of a captured object.
+fn object_name(o: &Value) -> Option<String> {
+    o.pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Every certificate name the captured `PlatformStack`'s registered domains
+/// point at (`spec.values.gateway.allowedDomains[].importedCertRef`), sorted
+/// and deduplicated. Pure.
+///
+/// This is the reference the chart renders into the Gateway's
+/// `tls.certificateRefs`, so it is the exact question "what does this cluster
+/// need a certificate for".
+fn referenced_cert_names(platformstack: &Value) -> Vec<String> {
+    let mut out: Vec<String> = platformstack
+        .pointer("/spec/values/gateway/allowedDomains")
+        .and_then(Value::as_array)
+        .map(|domains| {
+            domains
+                .iter()
+                .filter_map(|d| d.get("importedCertRef").and_then(Value::as_str))
+                .filter(|r| !r.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The certificate references the restore cannot satisfy: named by a restored
+/// domain, carried by no captured certificate. Pure.
+///
+/// This is the A1 defect seen from the restore side, and it is what EVERY
+/// backup taken before the certificate was captured produces — so the restore
+/// has to be able to name it rather than leave an operator to discover it from
+/// a browser error.
+fn dangling_cert_refs(referenced: &[String], restored: &[String]) -> Vec<String> {
+    referenced
+        .iter()
+        .filter(|r| !restored.contains(r))
+        .cloned()
+        .collect()
 }
 
 /// **ApplyPlatformStack** — apply the sanitized `PlatformStack` from `crs/`,
@@ -2565,6 +2932,7 @@ mod tests {
             platform_version: "0.2.40".into(),
             namespaces: namespaces.iter().map(|s| s.to_string()).collect(),
             secret_namespaces: Vec::new(),
+            origin_firewall: None,
             resources,
         }
     }
@@ -2747,6 +3115,7 @@ mod tests {
             None,
             None,
             BackupSchedule::NotInherited,
+            &EdgeRestore::default(),
         );
         assert_eq!(
             lines,
@@ -2766,6 +3135,7 @@ mod tests {
             Some("mind the gap"),
             None,
             BackupSchedule::NotInherited,
+            &EdgeRestore::default(),
         );
         assert_eq!(
             data_only[0],
@@ -2791,6 +3161,7 @@ mod tests {
             None,
             Some("prod"),
             BackupSchedule::KeptEnabled,
+            &EdgeRestore::default(),
         );
         let joined = lines.join("\n");
         assert!(joined.contains("cluster-name 'prod'"), "{joined}");
@@ -2813,6 +3184,7 @@ mod tests {
             None,
             None,
             BackupSchedule::NotInherited,
+            &EdgeRestore::default(),
         );
         assert!(!lines.join("\n").contains("cluster-name"), "{:?}", lines);
     }
@@ -2852,6 +3224,7 @@ mod tests {
             None,
             None,
             BackupSchedule::NotInherited,
+            &EdgeRestore::default(),
         );
         assert_eq!(
             lines,
@@ -2999,6 +3372,7 @@ mod tests {
             None,
             Some("prod"),
             BackupSchedule::DisabledByDefault,
+            &EdgeRestore::default(),
         )
         .join("\n");
         assert!(joined.contains("DISABLED"), "{joined}");
@@ -3033,6 +3407,7 @@ mod tests {
             None,
             Some("prod"),
             BackupSchedule::KeptEnabled,
+            &EdgeRestore::default(),
         )
         .join("\n");
         assert!(joined.contains("ENABLED"), "{joined}");
@@ -3065,6 +3440,7 @@ mod tests {
             None,
             None,
             BackupSchedule::NotInherited,
+            &EdgeRestore::default(),
         )
         .join("\n");
         assert!(!joined.contains("schedule"), "{joined}");
@@ -3088,6 +3464,334 @@ mod tests {
                 .contains(&RestoreStep::ApplyPlatformStack),
             "--data-only replays no CR and must stay that way"
         );
+    }
+
+    // =======================================================================
+    // A1 / A4 — the edge configuration a restore inherits
+    // =======================================================================
+
+    /// A captured PlatformStack with two registered domains, both pointing at
+    /// the same imported certificate — the shape `target domain add` writes.
+    fn platformstack_with_domains(refs: &[&str]) -> Value {
+        let domains: Vec<Value> = refs
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                serde_json::json!({
+                    "domain": format!("zone{i}.example"),
+                    "certMode": "imported",
+                    "importedCertRef": r,
+                })
+            })
+            .collect();
+        serde_json::json!({"spec": {"values": {"gateway": {"allowedDomains": domains}}}})
+    }
+
+    /// The certificate references come from the DOMAINS, which is what the
+    /// chart renders into the Gateway's `tls.certificateRefs` — so this is
+    /// literally "what does this cluster need a certificate for".
+    #[test]
+    fn referenced_cert_names_reads_the_domains_deduped() {
+        let ps = platformstack_with_domains(&["cf-origin", "cf-origin", "other"]);
+        assert_eq!(
+            referenced_cert_names(&ps),
+            vec!["cf-origin".to_string(), "other".to_string()]
+        );
+
+        // A cluster with no domains needs no certificate — and a
+        // PlatformStack that predates the gateway block must not panic.
+        assert!(referenced_cert_names(&serde_json::json!({"spec": {}})).is_empty());
+        assert!(referenced_cert_names(&platformstack_with_domains(&[])).is_empty());
+    }
+
+    /// THE A1 detector: a domain that came back with the PlatformStack whose
+    /// certificate did NOT come back with the snapshot. Every backup taken
+    /// before certificates were captured has exactly this shape.
+    #[test]
+    fn a_domain_whose_certificate_the_snapshot_lacks_is_reported_dangling() {
+        assert_eq!(
+            dangling_cert_refs(&["cf-origin".into(), "other".into()], &["other".into()]),
+            vec!["cf-origin".to_string()]
+        );
+        // …and nothing is reported when the certificate came back with it.
+        assert!(dangling_cert_refs(&["cf-origin".into()], &["cf-origin".into()]).is_empty());
+        // A cluster with no domains has nothing to dangle, whatever was
+        // restored.
+        assert!(dangling_cert_refs(&[], &["cf-origin".into()]).is_empty());
+    }
+
+    /// The staged certificates are read back as whole objects, in a stable
+    /// order, and a snapshot that carries no `certs/` directory — every backup
+    /// taken before this existed — reads as "none" rather than failing.
+    #[test]
+    fn read_imported_certs_reads_whole_objects_and_tolerates_no_certs_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_imported_certs(dir.path()).unwrap().is_empty());
+
+        let certs = dir.path().join("certs");
+        std::fs::create_dir_all(&certs).unwrap();
+        std::fs::write(
+            certs.join("b-cert.json"),
+            r#"{"kind":"Secret","type":"kubernetes.io/tls",
+                "metadata":{"name":"b-cert","namespace":"apprafter-system",
+                            "labels":{"apprafter.io/cert-mode":"imported"}},
+                "data":{"tls.crt":"Q1JU"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            certs.join("a-cert.json"),
+            r#"{"metadata":{"name":"a-cert"}}"#,
+        )
+        .unwrap();
+        std::fs::write(certs.join("notes.txt"), "not a cert").unwrap();
+
+        let read = read_imported_certs(dir.path()).unwrap();
+        assert_eq!(
+            read.iter().filter_map(object_name).collect::<Vec<_>>(),
+            vec!["a-cert".to_string(), "b-cert".to_string()],
+            "sorted, and only the .json files"
+        );
+        // The import label survives the round trip — `target domain add`
+        // checks it, and the next backup's capture keys on it.
+        assert_eq!(
+            read[1]["metadata"]["labels"]["apprafter.io/cert-mode"],
+            serde_json::json!("imported")
+        );
+        assert_eq!(read[1]["type"], serde_json::json!("kubernetes.io/tls"));
+    }
+
+    /// A4, the whole decision table. The carry is one-directional and only on
+    /// the mode that provisioned the node; an UNKNOWN intent changes nothing
+    /// and says nothing.
+    #[test]
+    fn the_origin_firewall_is_carried_only_when_recorded_on_and_a_node_was_provisioned() {
+        use OriginFirewallAction::*;
+        let cases = [
+            // (recorded, reprovisioned, destination already on) -> action
+            ((Some(true), true, false), Carry),
+            ((Some(true), false, false), Announce),
+            // A snapshot from before the field existed, or from the
+            // in-cluster runner: UNKNOWN, so nothing is claimed either way.
+            ((None, true, false), Nothing),
+            ((None, false, false), Nothing),
+            // Recorded OFF never turns a destination's firewall off — the
+            // carry can only ever RESTRICT ports.
+            ((Some(false), true, false), Nothing),
+            ((Some(false), true, true), Nothing),
+            // Already on: nothing to carry, and nothing worth a line.
+            ((Some(true), true, true), Nothing),
+            ((Some(true), false, true), Nothing),
+        ];
+        for ((recorded, reprovisioned, already), expected) in cases {
+            assert_eq!(
+                origin_firewall_action(recorded, reprovisioned, already),
+                expected,
+                "recorded={recorded:?} reprovisioned={reprovisioned} already_on={already}"
+            );
+        }
+    }
+
+    /// FIRES: the certificate that came back is named, in the same paragraph
+    /// as the backup-config inheritance — it is the same kind of fact, and the
+    /// operator reading it has the same question.
+    #[test]
+    fn the_summary_says_the_imported_certificate_came_with_the_restore() {
+        let m = manifest_of(&["demo"], vec![]);
+        let edge = EdgeRestore {
+            certs_restored: 1,
+            ..Default::default()
+        };
+        let joined = restore_summary(
+            Some(&m),
+            Some("new"),
+            false,
+            1,
+            None,
+            Some("prod"),
+            BackupSchedule::DisabledByDefault,
+            &edge,
+        )
+        .join("\n");
+        assert!(
+            joined.contains("imported TLS certificate(s) came with the restore"),
+            "{joined}"
+        );
+        assert!(joined.contains("apprafter target domain list"), "{joined}");
+        // …and it is not mistaken for a problem.
+        assert!(!joined.contains("MISSING"), "{joined}");
+    }
+
+    /// FIRES: a pre-A1 snapshot brought the domains back without the
+    /// certificate. The summary has to name it and say what to do, because
+    /// nothing else in the cluster will — the Gateway just stops serving TLS.
+    #[test]
+    fn the_summary_names_a_certificate_the_snapshot_did_not_carry() {
+        let m = manifest_of(&["demo"], vec![]);
+        let edge = EdgeRestore {
+            dangling_certs: vec!["cf-origin".into()],
+            ..Default::default()
+        };
+        let joined = restore_summary(
+            Some(&m),
+            Some("new"),
+            false,
+            0,
+            None,
+            None,
+            BackupSchedule::NotInherited,
+            &edge,
+        )
+        .join("\n");
+        assert!(joined.contains("cf-origin"), "{joined}");
+        assert!(
+            joined.contains("apprafter target cert import"),
+            "names the one command that fixes it: {joined}"
+        );
+        assert!(
+            joined.contains("no `target domain add` to repeat"),
+            "A3: the documented runbook's second step HARD-FAILS after a \
+             restore, because the domain came back in the snapshot: {joined}"
+        );
+    }
+
+    /// FIRES: the carried origin firewall is a side effect on ANOTHER target's
+    /// local config plus its live cloud firewall. Said out loud, and it names
+    /// the target it wrote to.
+    #[test]
+    fn the_summary_says_the_origin_firewall_was_carried_to_the_destination_target() {
+        let m = manifest_of(&["demo"], vec![]);
+        let edge = EdgeRestore {
+            origin_firewall: OriginFirewall::Carried {
+                target: "bigger".into(),
+            },
+            ..Default::default()
+        };
+        let joined = restore_summary(
+            Some(&m),
+            Some("bigger"),
+            false,
+            1,
+            None,
+            None,
+            BackupSchedule::NotInherited,
+            &edge,
+        )
+        .join("\n");
+        assert!(joined.contains("Cloudflare origin firewall"), "{joined}");
+        assert!(joined.contains("target 'bigger'"), "{joined}");
+        assert!(
+            joined.contains("cloudflare-origin disable"),
+            "names the way back: {joined}"
+        );
+    }
+
+    /// DOES NOT FIRE THE SAME WAY: on a mode that provisioned nothing the
+    /// summary says the snapshot RECORDED it and that nothing here changed.
+    /// Claiming a cluster's ports were restricted when nothing touched them is
+    /// the failure this whole line exists to prevent.
+    #[test]
+    fn a_restore_that_provisioned_nothing_announces_the_firewall_without_claiming_it() {
+        let m = manifest_of(&["demo"], vec![]);
+        let edge = EdgeRestore {
+            origin_firewall: OriginFirewall::Announced,
+            ..Default::default()
+        };
+        let joined = restore_summary(
+            Some(&m),
+            None,
+            false,
+            1,
+            None,
+            None,
+            BackupSchedule::NotInherited,
+            &edge,
+        )
+        .join("\n");
+        assert!(joined.contains("recorded the source's"), "{joined}");
+        assert!(joined.contains("nothing here was changed"), "{joined}");
+        assert!(
+            joined.contains("cloudflare-origin enable"),
+            "names the way to turn it on: {joined}"
+        );
+    }
+
+    /// A carry whose live reconcile failed must not read like a carry that
+    /// worked. The ports are open, and the line says so.
+    #[test]
+    fn a_carried_but_unenforced_firewall_says_the_ports_are_still_open() {
+        let m = manifest_of(&["demo"], vec![]);
+        let edge = EdgeRestore {
+            origin_firewall: OriginFirewall::CarriedNotEnforced {
+                target: "bigger".into(),
+                why: "no firewall found for 'platform-1'".into(),
+                recorded: true,
+            },
+            ..Default::default()
+        };
+        let joined = restore_summary(
+            Some(&m),
+            Some("bigger"),
+            false,
+            1,
+            None,
+            None,
+            BackupSchedule::NotInherited,
+            &edge,
+        )
+        .join("\n");
+        assert!(joined.contains("still open to the internet"), "{joined}");
+        assert!(joined.contains("no firewall found"), "{joined}");
+        assert!(joined.contains("apprafter target use bigger"), "{joined}");
+        assert!(
+            joined.contains("records it"),
+            "the toggle IS on disk, so the next apply fixes it: {joined}"
+        );
+        assert!(
+            joined.contains("next `apprafter apply`"),
+            "…and the line says so: {joined}"
+        );
+    }
+
+    /// …and a carry that never reached the target's config must not claim it
+    /// did. The two failures differ in whether the operator's next `apprafter
+    /// apply` closes the ports on its own, so the line cannot be the same one.
+    #[test]
+    fn a_carry_that_never_reached_the_target_does_not_claim_it_was_recorded() {
+        let m = manifest_of(&["demo"], vec![]);
+        let edge = EdgeRestore {
+            origin_firewall: OriginFirewall::CarriedNotEnforced {
+                target: "bigger".into(),
+                why: "target `bigger` not found".into(),
+                recorded: false,
+            },
+            ..Default::default()
+        };
+        let joined = restore_summary(
+            Some(&m),
+            Some("bigger"),
+            false,
+            1,
+            None,
+            None,
+            BackupSchedule::NotInherited,
+            &edge,
+        )
+        .join("\n");
+        assert!(joined.contains("could not be applied to target 'bigger' at all"));
+        assert!(
+            !joined.contains("records it"),
+            "nothing was recorded — saying otherwise sends the operator to an \
+             `apprafter apply` that will not close the ports: {joined}"
+        );
+        assert!(!joined.contains("next `apprafter apply`"), "{joined}");
+        assert!(joined.contains("still open to the internet"), "{joined}");
+    }
+
+    /// …and a restore with nothing to report about the edge says NOTHING. A
+    /// paragraph that appears on every restore is a paragraph nobody reads.
+    #[test]
+    fn a_restore_with_no_edge_configuration_says_nothing_about_it() {
+        assert!(edge_inheritance_lines(&EdgeRestore::default()).is_empty());
     }
 
     // =======================================================================
