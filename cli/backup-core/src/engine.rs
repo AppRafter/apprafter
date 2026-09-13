@@ -48,8 +48,16 @@ pub struct BackupOpts {
     pub repo: String,
     /// The restic encryption passphrase.
     pub passphrase: String,
-    /// Cluster identifier (embedded in the manifest + tag).
+    /// HUMAN cluster label (embedded in the manifest's `clusterId` and in the
+    /// failure-webhook payload). The target name for a CLI pull, the
+    /// `spec.backup.clusterName` for a scheduled run. NOT an identity: it is
+    /// replayed by restore, so a clone inherits it.
     pub cluster_id: String,
+    /// MACHINE cluster key: the `kube-system` namespace UID. Leads the restic
+    /// run tag ([`crate::cluster::run_tag`]) and is the only thing every
+    /// repository-wide filter keys on — a restored cluster is a different
+    /// Kubernetes cluster, so it cannot inherit this (E1).
+    pub cluster_uid: String,
     /// RFC-3339 timestamp for the manifest `created_at` field and the tag.
     pub created_at: String,
     /// The live `PlatformStack.status.currentVersion` (embedded in the manifest).
@@ -240,14 +248,45 @@ fn resource_refs(crs: &[(&str, &Value)], claims: &[Value]) -> Vec<ResourceRef> {
     refs
 }
 
-/// The restic snapshot tag.
-pub fn backup_tag(cluster_id: &str, created_at: &str, subset_namespaces: &[String]) -> String {
-    let base = format!("{cluster_id}-{created_at}");
-    if subset_namespaces.is_empty() {
-        base
-    } else {
-        format!("{base}-ns-{}", subset_namespaces.join("_"))
-    }
+/// The restic snapshot tag: see [`crate::cluster::run_tag`], which owns the
+/// format because it also owns the parse ([`crate::cluster::tag_cluster_uid`]).
+///
+/// Takes the cluster's `kube-system` UID, NOT the human cluster label: the
+/// label is replayed by restore and a clone inherits it, so a tag built from
+/// it could not tell two clusters apart in a shared repository (E1).
+pub fn backup_tag(cluster_uid: &str, created_at: &str, subset_namespaces: &[String]) -> String {
+    crate::cluster::run_tag(cluster_uid, created_at, subset_namespaces)
+}
+
+/// Read this cluster's machine key — the `kube-system` namespace UID.
+///
+/// Hard error rather than a fallback when it cannot be read. A snapshot with
+/// no cluster identity is exactly the defect this closes: it would land in a
+/// shared repository as "legacy" and be attributed to whichever cluster
+/// pruned next. The RBAC rule the in-cluster runner needs ships in the same
+/// change as this read, so a failure here means something is genuinely wrong
+/// and must be loud.
+pub fn read_cluster_uid(k: &dyn KubeExec) -> Result<String> {
+    let args = vec![
+        "get",
+        "namespaces",
+        crate::cluster::IDENTITY_NAMESPACE,
+        "-o",
+        "json",
+    ];
+    let ns = k
+        .get_json(&args)
+        .map_err(|e| CliError::Other(crate::cluster::identity_read_error(&format!("{e}"))))?
+        .ok_or_else(|| {
+            CliError::Other(crate::cluster::identity_read_error(
+                "the namespace was not found",
+            ))
+        })?;
+    crate::cluster::cluster_uid_of(&ns).ok_or_else(|| {
+        CliError::Other(crate::cluster::identity_read_error(
+            "the namespace carries no metadata.uid",
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -667,15 +706,16 @@ fn ensure_repo(r: &dyn ResticRunner, repo: &str, pass: &str) -> Result<()> {
 }
 
 /// The `run-<id>` tag every snapshot in a run shares. IS the monolithic tag
-/// (`<cluster_id>-<created_at>[…-ns-…]`) — the run id and the restic tag are
-/// the same value.
+/// (`<cluster_uid>-<created_at>[…-ns-…]`) — the run id and the restic tag are
+/// the same value, and the leading UID is what tells this cluster's runs from
+/// a co-tenant's in a shared repository (E1).
 fn run_tag(opts: &BackupOpts) -> String {
     let subset_ns: Vec<String> = if opts.is_subset {
         opts.namespaces.clone()
     } else {
         vec![]
     };
-    backup_tag(&opts.cluster_id, &opts.created_at, &subset_ns)
+    backup_tag(&opts.cluster_uid, &opts.created_at, &subset_ns)
 }
 
 fn run_backup_monolithic_with_summary(
@@ -1081,11 +1121,15 @@ mod tests {
         }
     }
 
+    /// A stand-in `kube-system` UID — the machine key every run tag leads with.
+    const TEST_UID: &str = "11111111-2222-3333-4444-555555555555";
+
     fn opts_for(mode: StagingMode, staging_root: PathBuf) -> BackupOpts {
         BackupOpts {
             repo: "/tmp/does-not-matter-repo".into(),
             passphrase: "pw".into(),
             cluster_id: "k3d-demo".into(),
+            cluster_uid: TEST_UID.into(),
             created_at: "2026-06-20T00:00:00Z".into(),
             platform_version: "0.2.37".into(),
             namespaces: vec!["demo".into()],
@@ -1137,7 +1181,7 @@ mod tests {
         );
 
         // Every snapshot shares the SAME run-id tag (== the monolithic tag).
-        let run_id = backup_tag(&opts.cluster_id, &opts.created_at, &[]);
+        let run_id = backup_tag(&opts.cluster_uid, &opts.created_at, &[]);
         for c in &calls {
             assert_eq!(
                 tag_of(c).as_deref(),
@@ -1227,12 +1271,79 @@ mod tests {
     }
 
     #[test]
-    fn backup_tag_is_cluster_id_and_timestamp_not_namespace() {
-        let t = backup_tag("k3d-demo", "2026-06-20T00:00:00Z", &[]);
-        assert!(t.contains("k3d-demo"));
+    fn backup_tag_is_cluster_uid_and_timestamp_not_namespace() {
+        let t = backup_tag(TEST_UID, "2026-06-20T00:00:00Z", &[]);
+        assert!(t.contains(TEST_UID));
         assert!(t.contains("2026-06-20"));
-        let sub = backup_tag("k3d-demo", "2026-06-20T00:00:00Z", &["prod".to_string()]);
+        let sub = backup_tag(TEST_UID, "2026-06-20T00:00:00Z", &["prod".to_string()]);
         assert!(sub.contains("prod"));
+        // E1: the tag must be readable back as this cluster's identity — the
+        // whole point of moving the UID into it.
+        assert_eq!(crate::cluster::tag_cluster_uid(&t), Some(TEST_UID));
+        assert_eq!(crate::cluster::tag_cluster_uid(&sub), Some(TEST_UID));
+    }
+
+    #[test]
+    fn read_cluster_uid_returns_the_kube_system_uid() {
+        let mut replies = BTreeMap::new();
+        replies.insert(
+            "get namespaces kube-system -o json".to_string(),
+            json!({"metadata": {"name": "kube-system", "uid": TEST_UID}}),
+        );
+        let k = FakeKube {
+            claims: Vec::new(),
+            replies,
+            errors: BTreeMap::new(),
+            calls: RefCell::new(Vec::new()),
+        };
+        assert_eq!(read_cluster_uid(&k).unwrap(), TEST_UID);
+    }
+
+    #[test]
+    fn read_cluster_uid_fails_loudly_when_rbac_denies_the_namespace() {
+        // The in-cluster runner reads this through its own ServiceAccount, so
+        // a missing ClusterRole line shows up here and NOWHERE else. It must
+        // fail the run, never fall back to an unidentified snapshot.
+        let mut errors = BTreeMap::new();
+        errors.insert(
+            "get namespaces kube-system -o json".to_string(),
+            "namespaces \"kube-system\" is forbidden".to_string(),
+        );
+        let k = FakeKube {
+            claims: Vec::new(),
+            replies: BTreeMap::new(),
+            errors,
+            calls: RefCell::new(Vec::new()),
+        };
+        let e = read_cluster_uid(&k).expect_err("a 403 must not be swallowed");
+        let msg = format!("{e}");
+        assert!(msg.contains("namespaces"), "{msg}");
+        assert!(msg.contains("forbidden"), "{msg}");
+    }
+
+    #[test]
+    fn read_cluster_uid_fails_when_the_namespace_is_absent_or_uidless() {
+        let k = FakeKube {
+            claims: Vec::new(),
+            replies: BTreeMap::new(),
+            errors: BTreeMap::new(),
+            calls: RefCell::new(Vec::new()),
+        };
+        // FakeKube reports absent (Ok(None)) for anything it has no reply for.
+        assert!(read_cluster_uid(&k).is_err());
+
+        let mut replies = BTreeMap::new();
+        replies.insert(
+            "get namespaces kube-system -o json".to_string(),
+            json!({"metadata": {"name": "kube-system"}}),
+        );
+        let k = FakeKube {
+            claims: Vec::new(),
+            replies,
+            errors: BTreeMap::new(),
+            calls: RefCell::new(Vec::new()),
+        };
+        assert!(read_cluster_uid(&k).is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -2025,7 +2136,7 @@ mod tests {
 
         assert_eq!(
             tag_of(&r.calls()[0]).as_deref(),
-            Some("k3d-demo-2026-06-20T00:00:00Z-ns-demo_prod")
+            Some(format!("{TEST_UID}-2026-06-20T00:00:00Z-ns-demo_prod").as_str())
         );
     }
 
@@ -2043,7 +2154,7 @@ mod tests {
 
         assert_eq!(
             tag_of(&r.calls()[0]).as_deref(),
-            Some("k3d-demo-2026-06-20T00:00:00Z")
+            Some(format!("{TEST_UID}-2026-06-20T00:00:00Z").as_str())
         );
     }
 
@@ -2174,6 +2285,6 @@ mod tests {
         assert_eq!(s.secret_count, 3);
         assert_eq!(s.claim_count, 2, "both claims are recorded");
         assert_eq!(s.extracted_count, 1, "only the pg claim has a payload");
-        assert_eq!(s.tag, "k3d-demo-2026-06-20T00:00:00Z");
+        assert_eq!(s.tag, format!("{TEST_UID}-2026-06-20T00:00:00Z"));
     }
 }

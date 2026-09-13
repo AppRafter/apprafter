@@ -1111,6 +1111,18 @@
           "help": "The weekly repository-integrity check: `off` to disable it, or `HH:MM` for its Sunday run time. Default: three hours after `--at`, so it never starts in the same minute as a backup. The check is metadata-only; it does not re-download the data"
         },
         {
+          "id": "cluster_name",
+          "long": "cluster-name",
+          "short": null,
+          "takes_value": true,
+          "value_name": "name",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Name this cluster's snapshots are listed under in the repository (the restic host). Defaults to the target name. Two clusters can share one bucket, and this is what makes a listing readable — it is a label, not an identity: snapshots are attributed by the cluster's own kube-system UID, which a restored copy cannot inherit"
+        },
+        {
           "id": "credential",
           "long": "credential",
           "short": null,
@@ -1288,6 +1300,18 @@
         "apprafter backup list --repo <path>"
       ],
       "args": [
+        {
+          "id": "all_clusters",
+          "long": "all-clusters",
+          "short": null,
+          "takes_value": false,
+          "value_name": "ALL_CLUSTERS",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Include snapshots written by OTHER clusters. A repository can legitimately be shared, and by default the listing shows only this cluster's own snapshots (plus any written before snapshots carried a cluster identity, marked `(legacy)`). Use this to find the id of another cluster's run to pass to `apprafter restore --snapshot`"
+        },
         {
           "id": "credential_file",
           "long": "credential-file",
@@ -1480,7 +1504,7 @@
       ],
       "aliases": [],
       "about": "Change ONE field of a configured backup, leaving the rest alone. `backup enable` rewrites the whole block, so it cannot be used to adjust a single setting without resetting the others",
-      "long_about": "Change ONE field of a configured backup, leaving the rest alone. `backup enable` rewrites the whole block, so it cannot be used to adjust a single setting without resetting the others.\n\nKeys: at <HH:MM>, check <HH:MM|off>, check-depth <structure|10%|full>, timezone <IANA>, keep-daily <n>, keep-weekly <n>, keep-monthly <n>, enforce <operator|cluster>, staging-mode <monolithic|sequential>, failure-webhook <url>.",
+      "long_about": "Change ONE field of a configured backup, leaving the rest alone. `backup enable` rewrites the whole block, so it cannot be used to adjust a single setting without resetting the others.\n\nKeys: at <HH:MM>, check <HH:MM|off>, check-depth <structure|10%|full>, cluster-name <name>, timezone <IANA>, keep-daily <n>, keep-weekly <n>, keep-monthly <n>, enforce <operator|cluster>, staging-mode <monolithic|sequential>, failure-webhook <url>.",
       "usage": "Usage: apprafter backup set <KEY> <VALUE>",
       "hidden": false,
       "examples": [

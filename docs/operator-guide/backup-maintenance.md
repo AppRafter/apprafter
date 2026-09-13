@@ -40,6 +40,13 @@ against a configured cluster this command needs no credential flags at all. On s
 dedup makes growth sub-linear, so retention is a rare, deliberate operation, not
 a per-run one.
 
+`prune` needs a reachable cluster, whatever flags you pass. It forgets by
+explicit snapshot id, one repository can hold more than one cluster's snapshots,
+and the only thing that says which are yours is the cluster's own identity —
+so there is no offline form of this command. It plans over your cluster's runs
+only: a prune here can never delete another cluster's history
+([how](../how-it-works/backup-retention-and-checks.md#which-snapshots-are-yours)).
+
 > **Do not use an S3 bucket lifecycle rule for this.** A "delete objects older
 > than N days" rule deletes by *object age*, and a restic repository routinely
 > references physically old pack objects from its newest snapshot — the rule
@@ -78,12 +85,32 @@ composes the whole `spec.backup` block from its flags and the platform
 defaults, so re-running it to adjust one setting resets the others — including
 this one. Use `set` for changes, `enable` for configuring.
 
-The other settable keys are `at`, `check`, `timezone`, `keep-daily`,
-`keep-weekly`, `keep-monthly`, `enforce`, `staging-mode` and
+The other settable keys are `at`, `check`, `cluster-name`, `timezone`,
+`keep-daily`, `keep-weekly`, `keep-monthly`, `enforce`, `staging-mode` and
 `failure-webhook`. The bucket and its credential are deliberately not among
 them: pointing an existing schedule at a different repository is a new
 repository, with its own init and its own first backup, so it goes through
 `enable`.
+
+#### Renaming the cluster in its repository
+
+```sh
+apprafter backup set cluster-name eu-prod
+```
+
+`cluster-name` is the name this cluster's snapshots are listed under — it
+becomes the restic host on every snapshot and the CLUSTER column of
+`apprafter backup list`. It defaults to the target name at `backup enable`.
+
+Renaming is safe at any time and affects nothing but the label: snapshots are
+attributed by the cluster's own identity, not by this name
+([which snapshots are
+yours](../how-it-works/backup-retention-and-checks.md#which-snapshots-are-yours)).
+Snapshots already in the repository keep the name they were written under.
+
+A cluster restored from a backup inherits the source's name, because the whole
+backup configuration is replayed — the restore summary tells you when that has
+happened, and this is the command it points at.
 
 #### Turning the in-cluster check off
 

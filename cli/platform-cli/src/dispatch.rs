@@ -266,12 +266,14 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
                 local,
                 credential_file,
                 details,
+                all_clusters,
             } => commands::backup::run_backup_list(
                 repo.as_deref(),
                 passphrase.as_deref(),
                 local,
                 credential_file.as_deref(),
                 details,
+                all_clusters,
             )?,
             BackupAction::Show {
                 snapshot,
@@ -317,6 +319,7 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
                 endpoint,
                 prefix,
                 credential,
+                cluster_name,
                 credential_file,
                 at,
                 timezone,
@@ -333,6 +336,7 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
                 commands::backup::EnableOpts {
                     bucket,
                     credential,
+                    cluster_name,
                     at,
                     timezone,
                     keep_daily,

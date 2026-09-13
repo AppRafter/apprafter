@@ -88,6 +88,23 @@ package v1alpha1
 		// default here would be a guess about somebody's location.
 		timeZone?: string
 		bucket:    string
+
+		// Human name this cluster's snapshots are listed under in the
+		// repository — the restic `--host` on every snapshot of every
+		// run. Absent keeps the fixed `apprafter-backup` host every
+		// cluster used before this field existed.
+		//
+		// Two clusters can legitimately share one repository (the
+		// "move to a bigger machine" runbook has both alive at once),
+		// and a listing where every row reads `apprafter-backup`
+		// cannot be read. This is the label that fixes that.
+		//
+		// It is NOT an identity. It lives in `spec.backup`, so a
+		// restore replays it and a clone inherits the source's name.
+		// Snapshots are attributed by the cluster's own `kube-system`
+		// namespace UID, which leads the restic tag and which a clone
+		// cannot inherit; the restore summary says so when it happens.
+		clusterName?: string
 		credentialRef: {name: string}
 		stagingMode:       "monolithic" | "sequential" | *"monolithic"
 		stagingSizeLimit?: string

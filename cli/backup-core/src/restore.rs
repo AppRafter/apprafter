@@ -70,9 +70,36 @@ pub struct RunSnapshots {
 /// `requested` is the snapshot the user asked to restore: `latest`, or an id /
 /// short-id prefix. The commit point is that snapshot; its siblings are every
 /// other snapshot sharing at least one tag with it.
+///
+/// # `latest` in a SHARED repository (E2)
+///
+/// Two clusters can legitimately write to one repository, so "the newest
+/// snapshot" was able to be another cluster's run — which restore would then
+/// replay, PlatformStack, secrets, applications and all. `this_cluster_uid` is
+/// the restore TARGET's `kube-system` UID, and `latest` now resolves like this:
+///
+/// * Snapshots this cluster owns ([`crate::cluster::owned_by_this_cluster`] —
+///   its own UID, plus legacy snapshots that carry no UID) → newest of those.
+///   This is the rollback case: restoring a cluster from its own history.
+/// * Nothing of ours, but the repository holds exactly ONE cluster's snapshots
+///   → newest of those. This is disaster recovery: the target is a freshly
+///   provisioned cluster with a brand-new UID, and there is nothing to confuse
+///   it with.
+/// * Nothing of ours and MORE THAN ONE other cluster present → refuse, naming
+///   them. Picking one would be a guess about which cluster the operator meant
+///   to restore, and the wrong guess replays a stranger's secrets.
+///
+/// `this_cluster_uid` is `None` when the caller has no cluster to ask (a
+/// repository inspected with no target). `latest` then falls back to the
+/// single-cluster / refuse-if-ambiguous rule, which is the safe half.
+///
+/// An EXPLICIT snapshot id is always honoured, whatever cluster it belongs to:
+/// naming an id is the operator saying which run they mean, and it is the
+/// escape hatch the refusal above points at.
 pub fn resolve_run_snapshots(
     snapshots_json: &str,
     requested: &str,
+    this_cluster_uid: Option<&str>,
 ) -> Result<RunSnapshots, String> {
     let snaps: Vec<Value> = serde_json::from_str(snapshots_json)
         .map_err(|e| format!("parsing `restic snapshots --json`: {e}"))?;
@@ -105,10 +132,11 @@ pub fn resolve_run_snapshots(
     };
 
     // `latest` is restic's own spelling for "newest by time", which is exactly
-    // what the sequential writer makes the commit point: it is written LAST.
+    // what the sequential writer makes the commit point: it is written LAST —
+    // but only ever within ONE cluster's snapshots (E2).
     let commit = if requested == "latest" {
-        snaps
-            .iter()
+        let pool = latest_pool(&snaps, this_cluster_uid, &tags_of)?;
+        pool.into_iter()
             .max_by_key(|s| time_of(s))
             .ok_or_else(|| "no snapshots to choose from".to_string())?
     } else {
@@ -146,6 +174,50 @@ pub fn resolve_run_snapshots(
         commit: commit_id,
         claims: claims.into_iter().map(|(_, id)| id).collect(),
     })
+}
+
+/// The snapshots `latest` is allowed to choose between — see
+/// [`resolve_run_snapshots`] for the rule and why each branch exists.
+///
+/// Separated out so the DECISION (which cluster's history is `latest` drawn
+/// from) is a single readable function rather than a condition threaded
+/// through the selection.
+fn latest_pool<'a>(
+    snaps: &'a [Value],
+    this_cluster_uid: Option<&str>,
+    tags_of: &dyn Fn(&Value) -> Vec<String>,
+) -> Result<Vec<&'a Value>, String> {
+    if let Some(uid) = this_cluster_uid {
+        let ours: Vec<&Value> = snaps
+            .iter()
+            .filter(|s| crate::cluster::owned_by_this_cluster(&tags_of(s), uid))
+            .collect();
+        if !ours.is_empty() {
+            return Ok(ours);
+        }
+    }
+
+    // Nothing of ours (or no cluster to ask). Every remaining snapshot carries
+    // a foreign UID — if they all carry the SAME one there is no ambiguity to
+    // resolve, and this is the ordinary disaster-recovery shape: a fresh
+    // cluster restoring the only history the repository holds.
+    let mut others: Vec<String> = snaps
+        .iter()
+        .filter_map(|s| crate::cluster::snapshot_cluster_uid(&tags_of(s)).map(str::to_string))
+        .collect();
+    others.sort();
+    others.dedup();
+    if others.len() > 1 {
+        return Err(format!(
+            "this repository holds snapshots from {} different clusters ({}), and none of them \
+             are this cluster's — so `latest` cannot say which one you meant. Pick the run \
+             explicitly: `apprafter backup list --all-clusters` shows every snapshot with the \
+             cluster it belongs to, then pass `--snapshot <id>`.",
+            others.len(),
+            others.join(", ")
+        ));
+    }
+    Ok(snaps.iter().collect())
 }
 
 /// Decide the ordered restore steps for a mode + `--data-only`.
@@ -240,7 +312,17 @@ fn ensure_child_object<'a>(
 #[cfg(test)]
 mod tests {
 
+    /// The restore target's `kube-system` UID, and a co-tenant's.
+    const MINE: &str = "11111111-2222-3333-4444-555555555555";
+    const THEIRS: &str = "99999999-8888-7777-6666-555555555555";
+
     // ---- D26: a sequential run is a SET of snapshots, not one ----
+    //
+    // These listings deliberately keep the LEGACY tag shape (`platform-run-N`,
+    // no cluster UID): they are what a repository written before cluster
+    // identity existed holds, and the stated rule is that those snapshots stay
+    // restorable as this cluster's. Passing `Some(MINE)` against them is the
+    // legacy path, exercised on every one of these cases.
 
     fn seq_listing() -> &'static str {
         // Two per-claim snapshots then the commit point, all one run tag —
@@ -257,7 +339,7 @@ mod tests {
 
     #[test]
     fn latest_is_the_commit_point_and_the_rest_are_its_claims() {
-        let r = resolve_run_snapshots(seq_listing(), "latest").unwrap();
+        let r = resolve_run_snapshots(seq_listing(), "latest", Some(MINE)).unwrap();
         assert_eq!(r.commit, "ccc3", "the commit point is written LAST");
         assert_eq!(r.claims, vec!["aaa1", "bbb2"], "oldest first");
     }
@@ -266,7 +348,7 @@ mod tests {
     fn a_monolithic_run_has_no_claim_snapshots() {
         let one = r#"[{"id":"solo","short_id":"solo","time":"2026-09-02T19:00:00Z",
                        "tags":["platform-run-9"],"paths":["/tmp/x"]}]"#;
-        let r = resolve_run_snapshots(one, "latest").unwrap();
+        let r = resolve_run_snapshots(one, "latest", Some(MINE)).unwrap();
         assert_eq!(r.commit, "solo");
         assert!(
             r.claims.is_empty(),
@@ -283,7 +365,7 @@ mod tests {
           {"id":"new1","short_id":"new1","time":"2026-09-02T10:00:00Z","tags":["platform-run-1"],"paths":["/b"]},
           {"id":"new2","short_id":"new2","time":"2026-09-02T10:00:01Z","tags":["platform-run-1"],"paths":["/c"]}
         ]"#;
-        let r = resolve_run_snapshots(two_runs, "latest").unwrap();
+        let r = resolve_run_snapshots(two_runs, "latest", Some(MINE)).unwrap();
         assert_eq!(r.commit, "new2");
         assert_eq!(
             r.claims,
@@ -296,7 +378,7 @@ mod tests {
     fn an_explicit_snapshot_id_selects_its_own_run() {
         // Restoring an older run by id must bring that run's claims, not the
         // newest one's.
-        let r = resolve_run_snapshots(seq_listing(), "ccc3").unwrap();
+        let r = resolve_run_snapshots(seq_listing(), "ccc3", Some(MINE)).unwrap();
         assert_eq!(r.commit, "ccc3");
         assert_eq!(r.claims, vec!["aaa1", "bbb2"]);
     }
@@ -309,16 +391,110 @@ mod tests {
           {"id":"u1","short_id":"u1","time":"2026-09-02T10:00:00Z","tags":[],"paths":["/a"]},
           {"id":"u2","short_id":"u2","time":"2026-09-02T10:00:01Z","tags":[],"paths":["/b"]}
         ]"#;
-        let r = resolve_run_snapshots(untagged, "latest").unwrap();
+        let r = resolve_run_snapshots(untagged, "latest", Some(MINE)).unwrap();
         assert_eq!(r.commit, "u2");
         assert!(r.claims.is_empty());
     }
 
     #[test]
     fn an_unknown_request_and_an_empty_repo_both_error() {
-        assert!(resolve_run_snapshots(seq_listing(), "zzz9").is_err());
-        assert!(resolve_run_snapshots("[]", "latest").is_err());
+        assert!(resolve_run_snapshots(seq_listing(), "zzz9", Some(MINE)).is_err());
+        assert!(resolve_run_snapshots("[]", "latest", Some(MINE)).is_err());
     }
+
+    // -----------------------------------------------------------------------
+    // E2: `latest` in a repository two clusters share.
+    // -----------------------------------------------------------------------
+
+    /// A shared repository: the co-tenant wrote LAST, so an unfiltered
+    /// `max_by_key(time)` picks their run — their PlatformStack, their
+    /// secrets, their applications.
+    fn shared_listing() -> String {
+        format!(
+            r#"[
+              {{"id":"mine1","short_id":"mine1","time":"2026-09-02T03:00:00Z",
+                "tags":["{MINE}-2026-09-02T03:00:00Z"],"paths":["/s/data"]}},
+              {{"id":"theirs1","short_id":"theirs1","time":"2026-09-02T04:00:00Z",
+                "tags":["{THEIRS}-2026-09-02T04:00:00Z"],"paths":["/s/data"]}}
+            ]"#
+        )
+    }
+
+    /// FIRES: `latest` must stay inside this cluster's history even when the
+    /// newest snapshot in the repository belongs to the neighbour.
+    #[test]
+    fn latest_never_crosses_into_another_clusters_run() {
+        let r = resolve_run_snapshots(&shared_listing(), "latest", Some(MINE)).unwrap();
+        assert_eq!(
+            r.commit, "mine1",
+            "the newest snapshot is theirs; `latest` must still be OURS"
+        );
+        assert!(r.claims.is_empty(), "and must not drag their run in");
+    }
+
+    /// DOES NOT FIRE: the same listing from the OTHER side resolves to the
+    /// other run. Without this the test above would also pass on a resolver
+    /// that always returned the oldest snapshot.
+    #[test]
+    fn latest_from_the_other_clusters_side_resolves_to_that_clusters_run() {
+        let r = resolve_run_snapshots(&shared_listing(), "latest", Some(THEIRS)).unwrap();
+        assert_eq!(r.commit, "theirs1");
+    }
+
+    /// Disaster recovery: a freshly provisioned target has a UID that has
+    /// never written a snapshot. With ONE cluster in the repository there is
+    /// nothing to confuse, so `latest` still works — a filter that returned
+    /// "no snapshots" here would break every DR restore.
+    #[test]
+    fn a_fresh_target_still_gets_latest_when_the_repo_holds_one_cluster() {
+        let only_theirs = format!(
+            r#"[
+              {{"id":"t1","short_id":"t1","time":"2026-09-01T03:00:00Z",
+                "tags":["{THEIRS}-2026-09-01T03:00:00Z"],"paths":["/s/data"]}},
+              {{"id":"t2","short_id":"t2","time":"2026-09-02T03:00:00Z",
+                "tags":["{THEIRS}-2026-09-02T03:00:00Z"],"paths":["/s/data"]}}
+            ]"#
+        );
+        let fresh = "abcdabcd-0000-0000-0000-abcdabcdabcd";
+        let r = resolve_run_snapshots(&only_theirs, "latest", Some(fresh)).unwrap();
+        assert_eq!(r.commit, "t2");
+    }
+
+    /// …but with TWO foreign clusters and nothing of ours, `latest` is a
+    /// guess. Refuse, and say how to choose.
+    #[test]
+    fn a_fresh_target_refuses_latest_when_the_repo_holds_two_clusters() {
+        let fresh = "abcdabcd-0000-0000-0000-abcdabcdabcd";
+        let err = resolve_run_snapshots(&shared_listing(), "latest", Some(fresh))
+            .expect_err("ambiguous `latest` must refuse, not guess");
+        assert!(err.contains("2 different clusters"), "{err}");
+        assert!(err.contains("--snapshot"), "{err}");
+    }
+
+    /// The escape hatch the refusal names: an explicit id is always honoured,
+    /// whatever cluster wrote it.
+    #[test]
+    fn an_explicit_id_reaches_another_clusters_run_on_purpose() {
+        let r = resolve_run_snapshots(&shared_listing(), "theirs1", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "theirs1");
+    }
+
+    /// Legacy snapshots are ours by the stated assumption, so they are what
+    /// `latest` picks even when an identified foreign run is newer.
+    #[test]
+    fn legacy_snapshots_count_as_ours_for_latest() {
+        let mixed = format!(
+            r#"[
+              {{"id":"old","short_id":"old","time":"2026-09-01T03:00:00Z",
+                "tags":["platform-2026-09-01T03:00:00Z"],"paths":["/s/data"]}},
+              {{"id":"theirs","short_id":"theirs","time":"2026-09-02T03:00:00Z",
+                "tags":["{THEIRS}-2026-09-02T03:00:00Z"],"paths":["/s/data"]}}
+            ]"#
+        );
+        let r = resolve_run_snapshots(&mixed, "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "old");
+    }
+
     use super::*;
 
     #[test]

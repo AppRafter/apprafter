@@ -9,12 +9,25 @@ use std::collections::BTreeMap;
 
 use cli_core::{CliError, Result};
 
+/// The restic `--host` a run uses when the cluster carries no
+/// `spec.backup.clusterName`. Fixed rather than the pod name, which is
+/// ephemeral (spec §Retention M-r3-1a), and unchanged from what every
+/// pre-`clusterName` cluster has been writing.
+pub const DEFAULT_BACKUP_HOST: &str = "apprafter-backup";
+
 /// Full resolved configuration for one backup runner invocation.
 pub struct RunnerConfig {
     /// Restic repository URL, e.g. `s3:https://endpoint/bucket`.
     pub repo: String,
-    /// Logical cluster identifier stamped onto backup tags.
+    /// HUMAN cluster label, stamped into the backup manifest's `clusterId` and
+    /// the failure-webhook payload. `spec.backup.clusterName` when the operator
+    /// set one, else the Helm release name. NOT the snapshot's identity — that
+    /// is the `kube-system` UID the runner reads at run time (E1).
     pub cluster_id: String,
+    /// restic `--host` for every snapshot of the run: the human cluster name,
+    /// so a listing is legible and groupable. Defaults to the fixed
+    /// `apprafter-backup` on a cluster that has not been named.
+    pub backup_host: String,
     /// Restic repository passphrase (from `RESTIC_PASSWORD`).
     pub passphrase: String,
     /// Whether to run claims sequentially or as a single monolithic snapshot.
@@ -36,6 +49,15 @@ impl RunnerConfig {
         let repo = require(e, "APPRAFTER_BACKUP_REPO")?;
         let cluster_id = require(e, "APPRAFTER_CLUSTER_ID")?;
         let passphrase = require(e, "RESTIC_PASSWORD")?;
+
+        // Optional and defaulted rather than required: a cluster whose chart
+        // predates `clusterName` keeps the fixed host it has always used, so
+        // upgrading the runner never silently re-groups an existing repository.
+        let backup_host = e
+            .get("APPRAFTER_BACKUP_HOST")
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_BACKUP_HOST.to_string());
 
         let staging_mode =
             if e.get("APPRAFTER_BACKUP_STAGING_MODE").map(|s| s.as_str()) == Some("sequential") {
@@ -66,6 +88,7 @@ impl RunnerConfig {
         Ok(RunnerConfig {
             repo,
             cluster_id,
+            backup_host,
             passphrase,
             staging_mode,
             enforce_in_cluster,
@@ -121,11 +144,13 @@ mod tests {
             ("APPRAFTER_BACKUP_ENFORCE", "cluster"),
             ("APPRAFTER_BACKUP_KEEP_DAILY", "5"),
             ("RESTIC_PASSWORD", "p"),
+            ("APPRAFTER_BACKUP_HOST", "prod"),
             ("APPRAFTER_BACKUP_FAILURE_WEBHOOK", "https://hook"),
         ]);
         let c = RunnerConfig::from_env_map(&e).unwrap();
         assert_eq!(c.repo, "s3:https://ep/b");
         assert_eq!(c.cluster_id, "c1");
+        assert_eq!(c.backup_host, "prod");
         assert_eq!(c.passphrase, "p");
         assert_eq!(c.staging_mode, backup_core::StagingMode::Sequential);
         assert!(c.enforce_in_cluster);
@@ -142,6 +167,9 @@ mod tests {
         ]);
         let c = RunnerConfig::from_env_map(&e).unwrap();
         assert_eq!(c.staging_mode, backup_core::StagingMode::Monolithic);
+        // An unnamed cluster keeps the host it has always written under —
+        // upgrading the runner must not re-group an existing repository.
+        assert_eq!(c.backup_host, DEFAULT_BACKUP_HOST);
         assert!(!c.enforce_in_cluster);
         assert_eq!(c.retention.keep_daily, 7); // RetentionPolicy::default
         assert_eq!(c.retention.keep_weekly, 4);
@@ -180,6 +208,20 @@ mod tests {
             ("APPRAFTER_BACKUP_KEEP_DAILY", "not-a-number"),
         ]);
         assert!(RunnerConfig::from_env_map(&e).is_err());
+    }
+
+    #[test]
+    fn an_empty_backup_host_falls_back_to_the_fixed_default() {
+        // The chart renders the env unconditionally, so an unnamed cluster
+        // sends an EMPTY string rather than omitting the variable.
+        let e = map(&[
+            ("APPRAFTER_BACKUP_REPO", "s3:x"),
+            ("APPRAFTER_CLUSTER_ID", "c"),
+            ("RESTIC_PASSWORD", "p"),
+            ("APPRAFTER_BACKUP_HOST", ""),
+        ]);
+        let c = RunnerConfig::from_env_map(&e).unwrap();
+        assert_eq!(c.backup_host, DEFAULT_BACKUP_HOST);
     }
 
     #[test]

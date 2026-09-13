@@ -40,6 +40,10 @@ pub struct SnapshotMeta {
     pub time: String,
     /// True iff this snapshot carries `manifest.json` (the run representative).
     pub is_manifest: bool,
+    /// Every tag restic reports for this snapshot — what
+    /// [`crate::cluster::classify_snapshot`] reads to decide whether this
+    /// cluster may forget it.
+    pub tags: Vec<String>,
 }
 
 /// How many representatives to keep per calendar day / ISO week / calendar month.
@@ -76,7 +80,23 @@ struct Run {
 
 /// Decide which snapshot ids to forget, format-aware (spec §Retention M-r3-1b).
 ///
-/// 1. Group snapshots by `run_tag`.
+/// 0. **Drop every snapshot that belongs to ANOTHER cluster** (E3). A restic
+///    repository can legitimately be shared — the documented "move to a bigger
+///    machine" runbook has two clusters alive at once writing to one bucket —
+///    and before this filter existed the planner grouped them all together and
+///    forgot the neighbour's runs. The exclusion lives HERE, in the pure
+///    judgment, rather than only in [`run_prune`]: this is the function that
+///    decides what gets deleted, so every route into it must be covered, not
+///    just the one route that happens to filter first.
+///
+///    "Belongs to another cluster" is decided by
+///    [`crate::cluster::owned_by_this_cluster`]: a snapshot whose run tag
+///    carries a DIFFERENT `kube-system` UID. Legacy snapshots — written before
+///    cluster identity existed, carrying no UID at all — are kept in scope by
+///    the stated, accepted widening, so a repository does not accumulate
+///    snapshots nothing can ever reclaim.
+///
+/// 1. Group the remaining snapshots by `run_tag`.
 /// 2. Each group's REPRESENTATIVE is its `is_manifest == true` member. A group
 ///    with NO manifest member is an ORPHAN (an interrupted sequential run) →
 ///    ALL its snapshot ids are forgotten. (A monolithic run is a single
@@ -89,7 +109,17 @@ struct Run {
 /// 5. Representatives that ARE kept → keep all their group's members.
 ///
 /// Pure + deterministic. Empty input ⇒ empty `forget_ids` (never panics).
-pub fn plan_prune(snapshots: &[SnapshotMeta], policy: &RetentionPolicy) -> PrunePlan {
+pub fn plan_prune(
+    snapshots: &[SnapshotMeta],
+    policy: &RetentionPolicy,
+    this_cluster_uid: &str,
+) -> PrunePlan {
+    // 0. Another cluster's snapshots are never ours to forget (E3).
+    let snapshots: Vec<&SnapshotMeta> = snapshots
+        .iter()
+        .filter(|s| crate::cluster::owned_by_this_cluster(&s.tags, this_cluster_uid))
+        .collect();
+
     // 1. Group by run_tag. BTreeMap keeps grouping deterministic; the final
     //    forget_ids order is derived from a stable sort below regardless.
     let mut runs: BTreeMap<String, Run> = BTreeMap::new();
@@ -230,15 +260,23 @@ fn parse_date(time: &str) -> Option<(i32, u32, u32)> {
 /// The JUDGMENT (what to forget) is entirely in the pure [`plan_prune`]; this
 /// only marshals restic I/O. A no-op prune (nothing to forget) skips the
 /// `forget` call entirely.
+///
+/// `this_cluster_uid` is the caller's `kube-system` namespace UID. The listing
+/// is repository-WIDE (`restic snapshots` has no prefix filter, and the tag
+/// carrying the identity is per-run, so there is no exact `--tag` value to ask
+/// restic for — and legacy snapshots carry no matchable tag at all), so the
+/// narrowing happens in [`plan_prune`], which is where the delete decision is
+/// made and therefore the only place that can be complete.
 pub fn run_prune(
     r: &dyn crate::ResticRunner,
     repo: &str,
     pass: &str,
     policy: &RetentionPolicy,
+    this_cluster_uid: &str,
 ) -> Result<()> {
     let json = r.run_stdout(&restic_snapshots_argv(repo), pass)?;
     let snapshots = parse_snapshots(&json)?;
-    let plan = plan_prune(&snapshots, policy);
+    let plan = plan_prune(&snapshots, policy, this_cluster_uid);
     if plan.forget_ids.is_empty() {
         return Ok(());
     }
@@ -259,6 +297,7 @@ fn parse_snapshots(json: &str) -> Result<Vec<SnapshotMeta>> {
         run_tag: String,
         time: String,
         paths: Vec<String>,
+        tags: Vec<String>,
     }
     let mut raws: Vec<Raw> = Vec::new();
     for s in &arr {
@@ -271,14 +310,19 @@ fn parse_snapshots(json: &str) -> Result<Vec<SnapshotMeta>> {
         if id.is_empty() {
             continue; // a snapshot with no id can't be forgotten by id
         }
-        // Each backup snapshot carries exactly one `--tag` (the shared run tag);
-        // take the first tag as the run_tag.
-        let run_tag = s
+        let tags: Vec<String> = s
             .pointer("/tags")
             .and_then(Value::as_array)
-            .and_then(|t| t.iter().filter_map(Value::as_str).next())
-            .unwrap_or_default()
-            .to_string();
+            .map(|t| {
+                t.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Each backup snapshot carries exactly one `--tag` (the shared run tag);
+        // take the first tag as the run_tag.
+        let run_tag = tags.first().cloned().unwrap_or_default();
         let time = s
             .pointer("/time")
             .and_then(Value::as_str)
@@ -299,6 +343,7 @@ fn parse_snapshots(json: &str) -> Result<Vec<SnapshotMeta>> {
             run_tag,
             time,
             paths,
+            tags,
         });
     }
 
@@ -319,6 +364,7 @@ fn parse_snapshots(json: &str) -> Result<Vec<SnapshotMeta>> {
                 id: r.id,
                 run_tag: r.run_tag,
                 time: r.time,
+                tags: r.tags,
             }
         })
         .collect())
@@ -351,36 +397,71 @@ fn derive_manifest(paths: &[String], alone: bool) -> bool {
 mod tests {
     use super::*;
 
+    /// This cluster's `kube-system` UID, and a co-tenant's.
+    const MINE: &str = "11111111-2222-3333-4444-555555555555";
+    const THEIRS: &str = "99999999-8888-7777-6666-555555555555";
+
     /// Build a sequential run: `claims` per-claim snapshots (is_manifest:false)
     /// plus 1 manifest/commit snapshot (is_manifest:true), all sharing `tag`,
     /// at `{day}T03:00:00Z`.
-    fn seq_run(tag: &str, day: &str, claims: usize) -> Vec<SnapshotMeta> {
+    ///
+    /// `tag` is a LABEL for readable ids; the actual run tag is the real
+    /// production shape (`<uid>-<time>-<label>`) so the cluster filter sees
+    /// what it sees in a repository.
+    fn seq_run_of(uid: &str, tag: &str, day: &str, claims: usize) -> Vec<SnapshotMeta> {
         let time = format!("{day}T03:00:00Z");
+        let run_tag = format!("{uid}-{time}-{tag}");
         let mut out = Vec::new();
         for i in 0..claims {
             out.push(SnapshotMeta {
                 id: format!("{tag}-claim-{i}"),
-                run_tag: tag.to_string(),
+                run_tag: run_tag.clone(),
                 time: time.clone(),
                 is_manifest: false,
+                tags: vec![run_tag.clone()],
             });
         }
         out.push(SnapshotMeta {
             id: format!("{tag}-manifest"),
-            run_tag: tag.to_string(),
+            run_tag: run_tag.clone(),
             time,
             is_manifest: true,
+            tags: vec![run_tag],
         });
         out
     }
 
+    fn seq_run(tag: &str, day: &str, claims: usize) -> Vec<SnapshotMeta> {
+        seq_run_of(MINE, tag, day, claims)
+    }
+
     /// Build a monolithic run: one snapshot (is_manifest:true) at `{day}T03:00:00Z`.
-    fn mono_run(tag: &str, day: &str) -> Vec<SnapshotMeta> {
+    fn mono_run_of(uid: &str, tag: &str, day: &str) -> Vec<SnapshotMeta> {
+        let time = format!("{day}T03:00:00Z");
+        let run_tag = format!("{uid}-{time}-{tag}");
         vec![SnapshotMeta {
             id: format!("{tag}-mono"),
-            run_tag: tag.to_string(),
-            time: format!("{day}T03:00:00Z"),
+            run_tag: run_tag.clone(),
+            time,
             is_manifest: true,
+            tags: vec![run_tag],
+        }]
+    }
+
+    fn mono_run(tag: &str, day: &str) -> Vec<SnapshotMeta> {
+        mono_run_of(MINE, tag, day)
+    }
+
+    /// A run in the PRE-IDENTITY format: `<release-name>-<time>`, no UID.
+    fn legacy_run(tag: &str, day: &str) -> Vec<SnapshotMeta> {
+        let time = format!("{day}T03:00:00Z");
+        let run_tag = format!("platform-{time}-{tag}");
+        vec![SnapshotMeta {
+            id: format!("{tag}-legacy"),
+            run_tag: run_tag.clone(),
+            time,
+            is_manifest: true,
+            tags: vec![run_tag],
         }]
     }
 
@@ -397,7 +478,7 @@ mod tests {
             keep_weekly: 0,
             keep_monthly: 0,
         };
-        let plan = plan_prune(&snaps, &policy);
+        let plan = plan_prune(&snaps, &policy, MINE);
         // The OLDEST run's ALL THREE snapshot ids are forgotten.
         let mut expected = vec![
             "run-a-claim-0".to_string(),
@@ -436,7 +517,7 @@ mod tests {
             keep_weekly: 0,
             keep_monthly: 0,
         };
-        let plan = plan_prune(&snaps, &policy);
+        let plan = plan_prune(&snaps, &policy, MINE);
         assert_eq!(plan.forget_ids, vec!["m-a-mono".to_string()]);
     }
 
@@ -444,22 +525,25 @@ mod tests {
     fn orphan_set_without_a_manifest_is_swept_entirely() {
         // One run_tag group of 2 claim snapshots, both is_manifest:false → an
         // interrupted run: both ids forgotten regardless of policy.
+        let run_tag = format!("{MINE}-2026-07-12T03:00:00Z");
         let snaps = vec![
             SnapshotMeta {
                 id: "orphan-0".into(),
-                run_tag: "run-x".into(),
+                run_tag: run_tag.clone(),
                 time: "2026-07-12T03:00:00Z".into(),
                 is_manifest: false,
+                tags: vec![run_tag.clone()],
             },
             SnapshotMeta {
                 id: "orphan-1".into(),
-                run_tag: "run-x".into(),
+                run_tag: run_tag.clone(),
                 time: "2026-07-12T03:00:00Z".into(),
                 is_manifest: false,
+                tags: vec![run_tag],
             },
         ];
         // Even a generous policy sweeps the orphan (no representative to keep).
-        let plan = plan_prune(&snaps, &RetentionPolicy::default());
+        let plan = plan_prune(&snaps, &RetentionPolicy::default(), MINE);
         assert_eq!(
             plan.forget_ids,
             vec!["orphan-0".to_string(), "orphan-1".to_string()]
@@ -477,7 +561,7 @@ mod tests {
 
     #[test]
     fn empty_input_is_a_no_op() {
-        let plan = plan_prune(&[], &RetentionPolicy::default());
+        let plan = plan_prune(&[], &RetentionPolicy::default(), MINE);
         assert!(plan.forget_ids.is_empty());
     }
 
@@ -494,7 +578,7 @@ mod tests {
             keep_weekly: 1,
             keep_monthly: 0,
         };
-        let plan = plan_prune(&snaps, &policy);
+        let plan = plan_prune(&snaps, &policy, MINE);
         assert_eq!(plan.forget_ids, vec!["w-old-mono".to_string()]);
 
         // Now a monthly bucket rescues an older run in a different month.
@@ -506,7 +590,7 @@ mod tests {
             keep_weekly: 0,
             keep_monthly: 2,
         };
-        let plan = plan_prune(&snaps, &policy);
+        let plan = plan_prune(&snaps, &policy, MINE);
         // daily keeps newest (July); monthly keeps newest-per-month for 2 months
         // → both months kept → nothing forgotten.
         assert!(
@@ -528,7 +612,7 @@ mod tests {
             keep_weekly: 0,
             keep_monthly: 0,
         };
-        let plan = plan_prune(&snaps, &policy);
+        let plan = plan_prune(&snaps, &policy, MINE);
         let mut expected = vec![
             "m-a-mono".to_string(),
             "s-b-claim-0".to_string(),
@@ -580,5 +664,201 @@ mod tests {
     #[test]
     fn parse_snapshots_empty_array_is_empty() {
         assert!(parse_snapshots("[]").unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // E3: a shared repository. The planner must never forget a neighbour's run.
+    // -----------------------------------------------------------------------
+
+    /// FIRES: the neighbour's runs are older and the policy would drop them,
+    /// yet not one of their ids may appear in the forget set.
+    #[test]
+    fn another_clusters_runs_are_never_forgotten_however_old() {
+        // The exact shape of the documented "move to a bigger machine" window:
+        // the source (THEIRS) has three days of history, the clone (MINE) has
+        // just taken its first snapshot, and the clone prunes right after its
+        // own backup — so every one of the source's runs is older than the
+        // clone's in its day ⊂ week ⊂ month.
+        let mut snaps = Vec::new();
+        snaps.extend(mono_run_of(THEIRS, "t-a", "2026-07-10"));
+        snaps.extend(seq_run_of(THEIRS, "t-b", "2026-07-11", 2));
+        snaps.extend(mono_run_of(THEIRS, "t-c", "2026-07-12"));
+        snaps.extend(mono_run_of(MINE, "m-new", "2026-07-13"));
+        let policy = RetentionPolicy {
+            keep_daily: 1,
+            keep_weekly: 0,
+            keep_monthly: 0,
+        };
+        let plan = plan_prune(&snaps, &policy, MINE);
+        assert!(
+            plan.forget_ids.is_empty(),
+            "a co-tenant's snapshots are not ours to delete, and our own single \
+             run is kept by keep_daily=1 — got {:?}",
+            plan.forget_ids
+        );
+        for id in ["t-a-mono", "t-b-manifest", "t-b-claim-0", "t-c-mono"] {
+            assert!(
+                !plan.forget_ids.contains(&id.to_string()),
+                "foreign snapshot {id} must never be forgotten"
+            );
+        }
+    }
+
+    /// DOES NOT FIRE: the same policy, the same ages — but the runs are OURS,
+    /// so they are forgotten exactly as before. Without this pair the test
+    /// above would also pass on a planner that forgot nothing at all.
+    #[test]
+    fn our_own_old_runs_are_still_forgotten_by_the_same_policy() {
+        let mut snaps = Vec::new();
+        snaps.extend(mono_run_of(MINE, "t-a", "2026-07-10"));
+        snaps.extend(seq_run_of(MINE, "t-b", "2026-07-11", 2));
+        snaps.extend(mono_run_of(MINE, "t-c", "2026-07-12"));
+        snaps.extend(mono_run_of(MINE, "m-new", "2026-07-13"));
+        let policy = RetentionPolicy {
+            keep_daily: 1,
+            keep_weekly: 0,
+            keep_monthly: 0,
+        };
+        let plan = plan_prune(&snaps, &policy, MINE);
+        let mut expected = vec![
+            "t-a-mono".to_string(),
+            "t-b-claim-0".to_string(),
+            "t-b-claim-1".to_string(),
+            "t-b-manifest".to_string(),
+            "t-c-mono".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(plan.forget_ids, expected);
+    }
+
+    /// A foreign snapshot must not even be able to influence OUR retention by
+    /// occupying a day bucket: it is dropped before grouping, not scored and
+    /// then spared.
+    #[test]
+    fn a_foreign_run_does_not_consume_one_of_our_keep_slots() {
+        let mut snaps = Vec::new();
+        snaps.extend(mono_run_of(MINE, "m-old", "2026-07-11"));
+        snaps.extend(mono_run_of(THEIRS, "t-new", "2026-07-12"));
+        // keep_daily 1: if the foreign run were scored it would take the only
+        // slot (it is newest) and our run would be forgotten.
+        let policy = RetentionPolicy {
+            keep_daily: 1,
+            keep_weekly: 0,
+            keep_monthly: 0,
+        };
+        let plan = plan_prune(&snaps, &policy, MINE);
+        assert!(
+            plan.forget_ids.is_empty(),
+            "our only run must keep the daily slot: {:?}",
+            plan.forget_ids
+        );
+    }
+
+    /// The stated, accepted widening: a pre-identity snapshot is treated as
+    /// ours, so a repository does not accumulate unreclaimable history.
+    #[test]
+    fn legacy_snapshots_stay_prunable_as_ours() {
+        let mut snaps = Vec::new();
+        snaps.extend(legacy_run("l-old", "2026-07-10"));
+        snaps.extend(mono_run_of(MINE, "m-new", "2026-07-12"));
+        let policy = RetentionPolicy {
+            keep_daily: 1,
+            keep_weekly: 0,
+            keep_monthly: 0,
+        };
+        let plan = plan_prune(&snaps, &policy, MINE);
+        assert_eq!(
+            plan.forget_ids,
+            vec!["l-old-legacy".to_string()],
+            "a legacy run is in scope and rotates out like any other"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // run_prune: the impure seam, with the forget argv actually inspected.
+    // -----------------------------------------------------------------------
+
+    #[derive(Default)]
+    struct FakeRestic {
+        listing: String,
+        calls: std::cell::RefCell<Vec<Vec<String>>>,
+    }
+
+    impl crate::ResticRunner for FakeRestic {
+        fn run(&self, argv: &[String], _p: &str) -> Result<()> {
+            self.calls.borrow_mut().push(argv.to_vec());
+            Ok(())
+        }
+        fn run_stdout(&self, argv: &[String], _p: &str) -> Result<String> {
+            self.calls.borrow_mut().push(argv.to_vec());
+            Ok(self.listing.clone())
+        }
+        fn run_backup(&self, _argv: &[String], _p: &str) -> Result<Option<String>> {
+            unreachable!("prune never takes a backup")
+        }
+    }
+
+    #[test]
+    fn run_prune_forgets_only_our_ids_from_a_shared_repository() {
+        let listing = format!(
+            r#"[
+              {{"id":"theirs-old","time":"2026-07-10T03:00:00Z",
+                "tags":["{THEIRS}-2026-07-10T03:00:00Z"],"paths":["/s/data"]}},
+              {{"id":"mine-old","time":"2026-07-11T03:00:00Z",
+                "tags":["{MINE}-2026-07-11T03:00:00Z"],"paths":["/s/data"]}},
+              {{"id":"mine-new","time":"2026-07-13T03:00:00Z",
+                "tags":["{MINE}-2026-07-13T03:00:00Z"],"paths":["/s/data"]}}
+            ]"#
+        );
+        let r = FakeRestic {
+            listing,
+            calls: Default::default(),
+        };
+        let policy = RetentionPolicy {
+            keep_daily: 1,
+            keep_weekly: 0,
+            keep_monthly: 0,
+        };
+        run_prune(&r, "s3:repo", "pw", &policy, MINE).expect("prune runs");
+
+        let calls = r.calls.borrow();
+        let forget = calls
+            .iter()
+            .find(|c| c.first().map(String::as_str) == Some("forget"))
+            .expect("a forget call was issued");
+        assert!(
+            forget.contains(&"mine-old".to_string()),
+            "our rotated-out run is forgotten: {forget:?}"
+        );
+        assert!(
+            !forget.contains(&"theirs-old".to_string()),
+            "the co-tenant's snapshot must not be in the forget set: {forget:?}"
+        );
+        assert!(!forget.contains(&"mine-new".to_string()), "{forget:?}");
+    }
+
+    #[test]
+    fn run_prune_on_a_repository_of_only_foreign_snapshots_forgets_nothing() {
+        let listing = format!(
+            r#"[{{"id":"theirs","time":"2026-07-10T03:00:00Z",
+                  "tags":["{THEIRS}-2026-07-10T03:00:00Z"],"paths":["/s/data"]}}]"#
+        );
+        let r = FakeRestic {
+            listing,
+            calls: Default::default(),
+        };
+        let policy = RetentionPolicy {
+            keep_daily: 0,
+            keep_weekly: 0,
+            keep_monthly: 0,
+        };
+        run_prune(&r, "s3:repo", "pw", &policy, MINE).expect("prune runs");
+        assert!(
+            !r.calls
+                .borrow()
+                .iter()
+                .any(|c| c.first().map(String::as_str) == Some("forget")),
+            "with nothing of ours to forget, restic forget is never invoked"
+        );
     }
 }

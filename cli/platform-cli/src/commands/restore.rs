@@ -204,6 +204,7 @@ fn restore_summary(
     data_only: bool,
     resumed: usize,
     version_warning: Option<&str>,
+    inherited_cluster_name: Option<&str>,
 ) -> Vec<String> {
     let mut lines = vec![format!(
         "✓ Restored backup{} into target '{}'",
@@ -220,6 +221,19 @@ fn restore_summary(
         ));
     }
     lines.push(format!("  workloads:  {resumed} app(s) resumed"));
+    // The one part of the backup config that is VISIBLE in the repository and
+    // is replayed verbatim. Said out loud because the alternative is an
+    // operator finding two clusters listed under one name and having no idea
+    // why. Its snapshots are still attributed correctly — the identity is the
+    // kube-system UID, which this cluster has its own of — so this is a
+    // labelling matter, and the line says so and says how to change it.
+    if let Some(name) = inherited_cluster_name {
+        lines.push(format!(
+            "  ⚠ backup cluster-name '{name}' was inherited from the source, so this cluster's \
+             snapshots will be listed under it too. Snapshots are still told apart by this \
+             cluster's own identity. Rename with `apprafter backup set cluster-name <name>`."
+        ));
+    }
     if let Some(w) = version_warning {
         lines.push(format!("  ⚠ {w}"));
     }
@@ -310,6 +324,9 @@ pub fn run_restore(
     // (ApplyAppsGated / SuspendWorkloads) and must re-enable in ResumeWorkloads.
     let mut suspended_argo: Vec<(String, String)> = Vec::new();
     let mut version_warning: Option<String> = None;
+    // The source's `spec.backup.clusterName`, when the replayed PlatformStack
+    // carried an enabled schedule — reported in the summary (E1).
+    let mut inherited_cluster_name: Option<String> = None;
 
     let snap = snapshot.unwrap_or("latest");
 
@@ -333,6 +350,12 @@ pub fn run_restore(
         match step {
             RestoreStep::Reprovision => unreachable!("Reprovision handled before the match"),
             RestoreStep::RestoreArtifact => {
+                // The TARGET's machine key, so `latest` cannot silently resolve
+                // to a co-tenant cluster's run in a shared repository (E2).
+                // Best-effort: a target that cannot name itself falls back to
+                // the "one cluster in the repo, or refuse" rule, which is the
+                // half that still refuses to guess.
+                let this_uid = crate::commands::backup::read_cluster_uid(kc.path()).ok();
                 let dd = restore_artifact_tree(
                     &SubprocessRestic {
                         repo,
@@ -341,6 +364,7 @@ pub fn run_restore(
                     },
                     snap,
                     restore_root.path(),
+                    this_uid.as_deref(),
                 )?;
 
                 let m = read_backup_manifest(&dd)?;
@@ -355,7 +379,7 @@ pub fn run_restore(
             }
             RestoreStep::ApplyPlatformStack => {
                 let dd = produced_by_artifact(data_dir.as_ref(), "ApplyPlatformStack")?;
-                apply_platformstack_from_crs(dd, kc.path())?;
+                inherited_cluster_name = apply_platformstack_from_crs(dd, kc.path())?;
             }
             RestoreStep::EnsureNamespaces => {
                 let m = produced_by_artifact(manifest.as_ref(), "EnsureNamespaces")?;
@@ -402,6 +426,7 @@ pub fn run_restore(
         data_only,
         app_replicas.len(),
         version_warning.as_deref(),
+        inherited_cluster_name.as_deref(),
     ) {
         println!("{line}");
     }
@@ -466,10 +491,12 @@ fn restore_artifact_tree(
     restic: &dyn ResticFetch,
     requested_snapshot: &str,
     restore_root: &Path,
+    this_cluster_uid: Option<&str>,
 ) -> Result<PathBuf> {
     let listing = restic.snapshots_json()?;
-    let run = backup_core::restore::resolve_run_snapshots(&listing, requested_snapshot)
-        .map_err(CliError::Other)?;
+    let run =
+        backup_core::restore::resolve_run_snapshots(&listing, requested_snapshot, this_cluster_uid)
+            .map_err(CliError::Other)?;
 
     restic.restore_snapshot(&run.commit, restore_root)?;
     let dd = find_data_dir(restore_root)?;
@@ -708,14 +735,15 @@ fn namespaces_to_ensure_all<'a>(apps: &'a [String], secrets: &'a [String]) -> Ve
 /// **ApplyPlatformStack** — apply the sanitized `PlatformStack` from `crs/`,
 /// mirroring the `cluster_bootstrap` retry loop for the admission-webhook
 /// Endpoints race.
-fn apply_platformstack_from_crs(data_dir: &Path, kubeconfig: &Path) -> Result<()> {
+fn apply_platformstack_from_crs(data_dir: &Path, kubeconfig: &Path) -> Result<Option<String>> {
     let crs = read_crs(data_dir)?;
     let Some(ps) = crs.iter().find(|c| c.kind == "PlatformStack") else {
         // A backup without a PlatformStack (older shape) — nothing to apply;
         // the target's own bootstrap PlatformStack stays in place.
         println!("  (no PlatformStack in backup — keeping target's own)");
-        return Ok(());
+        return Ok(None);
     };
+    let inherited = inherited_backup_cluster_name(&ps.cr);
     let yaml = serde_json::to_string(&ps.cr)
         .map_err(|e| CliError::Other(format!("serialize PlatformStack: {e}")))?;
     apply_with_retry(
@@ -724,7 +752,32 @@ fn apply_platformstack_from_crs(data_dir: &Path, kubeconfig: &Path) -> Result<()
         &mut |_attempt| kubectl_apply_server_side(&yaml, RESTORE_FIELD_MANAGER, kubeconfig),
     )?;
     println!("  ✓ PlatformStack applied");
-    Ok(())
+    Ok(inherited)
+}
+
+/// The backup cluster-name this restore just replayed onto the target, when
+/// the backup schedule came with it. Pure.
+///
+/// `spec.backup.clusterName` is the HUMAN label every snapshot is listed under.
+/// It is part of `spec.backup`, so restore replays it verbatim — meaning a
+/// clone inherits the source's name and its snapshots appear in the repository
+/// under that name. That is cosmetic (every filter keys on the `kube-system`
+/// UID, which a clone cannot inherit) but it must not be a SURPRISE, which is
+/// why the summary prints it.
+///
+/// `None` when the backup was not enabled or carried no name: there is nothing
+/// inherited to warn about, and a line saying so would be noise on the one
+/// screen an operator reads on their worst day.
+fn inherited_backup_cluster_name(platformstack: &Value) -> Option<String> {
+    let backup = platformstack.pointer("/spec/backup")?;
+    if backup.pointer("/enabled").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    backup
+        .pointer("/clusterName")
+        .and_then(Value::as_str)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
 }
 
 /// Retry `apply` up to `attempts` times, sleeping `backoff` between tries, and
@@ -2541,7 +2594,7 @@ mod tests {
     #[test]
     fn restore_summary_reports_scope_mode_and_workloads() {
         let m = manifest_of(&["demo", "shop"], vec![]);
-        let lines = restore_summary(Some(&m), Some("prod"), false, 2, None);
+        let lines = restore_summary(Some(&m), Some("prod"), false, 2, None, None);
         assert_eq!(
             lines,
             vec![
@@ -2552,7 +2605,7 @@ mod tests {
             ]
         );
 
-        let data_only = restore_summary(Some(&m), None, true, 1, Some("mind the gap"));
+        let data_only = restore_summary(Some(&m), None, true, 1, Some("mind the gap"), None);
         assert_eq!(
             data_only[0],
             "✓ Restored backup of cluster 'k3d-demo' into target '<active>'"
@@ -2561,11 +2614,61 @@ mod tests {
         assert_eq!(data_only[4], "  ⚠ mind the gap");
     }
 
+    /// E1: `spec.backup` is replayed verbatim, so a clone inherits the
+    /// source's backup cluster-name and its snapshots appear in the repository
+    /// under it. That is cosmetic — attribution is by the cluster's own
+    /// kube-system UID — but it must not be a SURPRISE, so the summary says it
+    /// and says how to change it.
+    #[test]
+    fn restore_summary_reports_an_inherited_backup_cluster_name() {
+        let m = manifest_of(&["demo"], vec![]);
+        let lines = restore_summary(Some(&m), Some("new"), false, 1, None, Some("prod"));
+        let joined = lines.join("\n");
+        assert!(joined.contains("cluster-name 'prod'"), "{joined}");
+        assert!(joined.contains("inherited"), "{joined}");
+        assert!(
+            joined.contains("apprafter backup set cluster-name"),
+            "the line must say how to change it: {joined}"
+        );
+    }
+
+    /// …and says nothing when there is nothing inherited. A warning on every
+    /// restore is a warning nobody reads.
+    #[test]
+    fn restore_summary_is_silent_when_no_cluster_name_was_inherited() {
+        let m = manifest_of(&["demo"], vec![]);
+        let lines = restore_summary(Some(&m), Some("new"), false, 1, None, None);
+        assert!(!lines.join("\n").contains("cluster-name"), "{:?}", lines);
+    }
+
+    /// The inherited name is read from the replayed CR, and ONLY when the
+    /// backup schedule came with it — a disabled or absent `spec.backup`
+    /// changes nothing about the repository, so there is nothing to warn about.
+    #[test]
+    fn the_inherited_cluster_name_comes_from_an_enabled_backup_block_only() {
+        let with = serde_json::json!({"spec": {"backup": {
+            "enabled": true, "clusterName": "prod", "bucket": "s3:x"}}});
+        assert_eq!(
+            inherited_backup_cluster_name(&with).as_deref(),
+            Some("prod")
+        );
+
+        let disabled = serde_json::json!({"spec": {"backup": {
+            "enabled": false, "clusterName": "prod"}}});
+        assert_eq!(inherited_backup_cluster_name(&disabled), None);
+
+        let unnamed = serde_json::json!({"spec": {"backup": {"enabled": true}}});
+        assert_eq!(inherited_backup_cluster_name(&unnamed), None);
+
+        let none = serde_json::json!({"spec": {}});
+        assert_eq!(inherited_backup_cluster_name(&none), None);
+    }
+
     /// With no manifest (the artifact step never completed) the summary still
     /// prints, but claims nothing about the backup's contents.
     #[test]
     fn restore_summary_without_a_manifest_claims_no_scope() {
-        let lines = restore_summary(None, Some("prod"), false, 0, None);
+        let lines = restore_summary(None, Some("prod"), false, 0, None, None);
         assert_eq!(
             lines,
             vec![
@@ -2578,6 +2681,10 @@ mod tests {
     // =======================================================================
     // RestoreArtifact — the D26 path
     // =======================================================================
+
+    /// The restore target's `kube-system` UID. The listings below use the
+    /// LEGACY tag shape, which by the stated rule counts as this cluster's.
+    const TEST_CLUSTER_UID: &str = "11111111-2222-3333-4444-555555555555";
 
     /// A sequential run's listing: two per-claim snapshots and the commit
     /// point, sharing one run tag (the only thing that groups them).
@@ -2612,7 +2719,8 @@ mod tests {
                 &[("claim-1/data/redis/demo/cache/dump.tar", "TAR-B")],
             );
 
-        let dd = restore_artifact_tree(&restic, "latest", root.path()).unwrap();
+        let dd =
+            restore_artifact_tree(&restic, "latest", root.path(), Some(TEST_CLUSTER_UID)).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(dd.join("pg/demo/db.dump")).unwrap(),
@@ -2652,7 +2760,8 @@ mod tests {
             ],
         );
 
-        let dd = restore_artifact_tree(&restic, "latest", root.path()).unwrap();
+        let dd =
+            restore_artifact_tree(&restic, "latest", root.path(), Some(TEST_CLUSTER_UID)).unwrap();
 
         assert_eq!(*restic.restored.borrow(), vec!["solo".to_string()]);
         assert_eq!(
@@ -2675,7 +2784,8 @@ mod tests {
                 &[("claim-1/data/crs/0-Application-demo-web.json", "{}")],
             );
 
-        let dd = restore_artifact_tree(&restic, "latest", root.path()).unwrap();
+        let dd =
+            restore_artifact_tree(&restic, "latest", root.path(), Some(TEST_CLUSTER_UID)).unwrap();
 
         assert!(dd.join("pg/demo/db.dump").exists());
         assert!(
@@ -2693,7 +2803,8 @@ mod tests {
             r#"[{"id":"solo","short_id":"solo","time":"2026-09-02T19:00:00Z","tags":["t"]}]"#;
         let restic =
             FakeRestic::new(listing).with_tree("solo", &[("staging/data/pg/demo/db.dump", "x")]);
-        let e = restore_artifact_tree(&restic, "latest", root.path()).unwrap_err();
+        let e = restore_artifact_tree(&restic, "latest", root.path(), Some(TEST_CLUSTER_UID))
+            .unwrap_err();
         assert!(format!("{e}").contains("no manifest.json"), "got: {e}");
     }
 

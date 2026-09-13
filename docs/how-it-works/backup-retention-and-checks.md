@@ -24,13 +24,18 @@ we own, and a two-tier credential model — are
 The unit is a **run**, not a snapshot.
 
 Every snapshot a scheduled run writes carries the same restic tag,
-`<cluster-id>-<timestamp>`, where the cluster id is the platform-stack Helm
-release name and the timestamp is the run's start in RFC 3339. In the default
-`monolithic` staging mode a run is one snapshot, taken over a staging tree that
-holds the dumps, the serialized CRs, the captured secrets and `manifest.json`
-together. In `sequential` mode a run is *several* snapshots sharing that one
-tag: one per claim, and then a final **commit snapshot** — written last — that
-carries the CRs, the secrets and `manifest.json`.
+`<cluster-uid>-<timestamp>`, where the cluster uid is the cluster's own
+`kube-system` namespace UID and the timestamp is the run's start in RFC 3339. In
+the default `monolithic` staging mode a run is one snapshot, taken over a staging
+tree that holds the dumps, the serialized CRs, the captured secrets and
+`manifest.json` together. In `sequential` mode a run is *several* snapshots
+sharing that one tag: one per claim, and then a final **commit snapshot** —
+written last — that carries the CRs, the secrets and `manifest.json`.
+
+Because the uid leads the tag, two clusters writing to one repository have
+disjoint tag namespaces — see [Which snapshots are
+yours](#which-snapshots-are-yours) below, which is the property the whole of
+retention rests on.
 
 A local run narrowed to a subset of namespaces appends them to the tag, so its
 snapshots do not group with a whole-cluster run's — which is the intended
@@ -78,11 +83,58 @@ not a sequence. The defaults are **7 / 4 / 6**. Note that the buckets count
 daily budget, and the older of the two is kept only if some other bucket rescues
 it.
 
-The runner pins a fixed restic host, `apprafter-backup`, rather than letting
-the ephemeral pod name become one. It changes nothing here — grouping is by tag
-alone, and the host is never read back — but it keeps the repository's own
-listing legible. A local `apprafter backup create` pulled to your own machine passes no
-host and uses the machine's own.
+The runner pins a stable restic host rather than letting the ephemeral pod name
+become one: `spec.backup.clusterName` when the cluster has been named, and the
+fixed `apprafter-backup` when it has not. It changes nothing about retention —
+grouping is by tag alone — but it is what the CLUSTER column of a listing shows.
+A local `apprafter backup create` pulled to your own machine passes no host and
+uses the machine's own.
+
+## Which snapshots are yours
+
+One restic repository can hold more than one cluster's snapshots, and doing that
+on purpose is a supported shape: [moving to a bigger
+machine](../operator-guide/moving-to-a-bigger-machine.md) has the old and the new
+cluster alive at the same time, both writing to the same bucket.
+
+Attribution is by the **`kube-system` namespace UID**, which leads every run tag.
+It is the de-facto standard cluster identifier: it exists on every cluster, it
+needs no state the platform has to generate and keep, and a restored copy of a
+cluster is a different Kubernetes cluster with a different UID — so a clone
+cannot inherit it. The nightly runner reads it through its own ServiceAccount
+(`get` on the single `kube-system` object; nothing else in the runner's RBAC
+touches namespaces), and a run whose identity cannot be read fails rather than
+writing an unattributable snapshot.
+
+`spec.backup.clusterName` is the other half, and it is a **label, not an
+identity**. It is what the listing shows and what makes a repository readable
+when a UUID alone would not be. Because it lives in `spec.backup`, a restore
+replays it: a restored cluster inherits the source's name and its snapshots are
+listed under it. That is cosmetic — attribution still follows the UID, which the
+clone has its own of — and the restore summary says so and points at
+`apprafter backup set cluster-name <name>`.
+
+Three places narrow a repository-wide listing to this cluster before it decides
+anything:
+
+- **`apprafter backup list`** shows this cluster's snapshots and reports how many
+  it withheld; `--all-clusters` shows the rest.
+- **`restore` without `--snapshot`** resolves `latest` inside this cluster's
+  snapshots. When the target has none of its own and the repository holds more
+  than one cluster, it refuses rather than guessing; when the repository holds
+  exactly one cluster it resolves normally, which is the ordinary
+  disaster-recovery case. An explicit `--snapshot <id>` is always honoured.
+- **prune** plans only over this cluster's runs, so a clone can never delete the
+  source's history.
+
+### Snapshots older than cluster identity
+
+Snapshots written before the tag carried a UID have no identity in them. They
+are treated as **this cluster's**: they take part in `latest` selection and in
+prune, so a repository does not accumulate history nothing can ever reclaim. In
+a repository two clusters already shared, that means the other cluster's old
+snapshots are attributed to whoever asks first. `apprafter backup list` marks
+those rows `(legacy)` so the assumption is visible rather than silent.
 
 ### Why a bucket lifecycle rule is not retention
 
@@ -116,15 +168,14 @@ The operator-side `apprafter backup prune` resolves its policy as CLI flags →
 `PlatformStack` with the current time; that annotation is exactly what
 `apprafter backup status` prints as `Last prune`.
 
-There is one honest gap in that reading. Because prune consults the CR for both
-the repository and the policy, it needs a cluster *unless* you supply `--repo`
-and all three `--keep-*` flags — in which case it runs entirely offline and says
-so, printing that the stamp was skipped. So `Last prune: never` means "no prune
-has stamped this cluster", which is not quite the same as "never pruned".
-`apprafter backup check` and `apprafter backup unlock` read the CR only for the
-repository URL, so `--repo` alone makes either of them work with no cluster at
-all — which matters, because verifying a repository before restoring from it
-tends to happen when the cluster is gone.
+`apprafter backup prune` always needs a reachable cluster, and no combination of
+flags takes that away. It used to go fully offline when `--repo` and all three
+`--keep-*` were supplied; it cannot any more, because it also has to read the
+cluster's identity to know whose snapshots it may forget, and no flag can stand
+in for that. `apprafter backup check` and `apprafter backup unlock` are
+unaffected — they read the CR only for the repository URL, so `--repo` alone
+makes either of them work with no cluster at all, which matters because verifying
+a repository before restoring from it tends to happen when the cluster is gone.
 
 ## What the weekly check runs
 

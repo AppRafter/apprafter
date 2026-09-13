@@ -192,6 +192,59 @@ criterion turned up, in the same spirit and by the same route.
   instance nor a volume reference, so nothing on the claim names it. Filling it
   needs a provisioner-side status write.)
 
+- **Two clusters sharing one backup repository are now told apart.** Every
+  snapshot carried the tag `<helm-release-name>-<timestamp>` on the fixed host
+  `apprafter-backup`, and the release name is the constant `platform` — so two
+  clusters' snapshots in one bucket differed only by their timestamps. Sharing a
+  bucket is not hypothetical: [moving to a bigger
+  machine](../operator-guide/moving-to-a-bigger-machine.md) runs the old and the
+  new cluster at once, and a restore replays the whole backup configuration, so
+  both write to the same repository by construction.
+
+  Three things followed from that, and all three are closed. `restore` without
+  `--snapshot` resolved `latest` over the entire repository, so it could roll out
+  **another cluster's** run — its PlatformStack, its secrets, its applications —
+  even under the default `retention.enforce: operator`. The retention planner saw
+  every snapshot in the repository and forgot by explicit id, and because a prune
+  runs right after the run's own backup, the clone's snapshot was always the
+  newest in its day ⊂ week ⊂ month: the source lost every bucket, structurally.
+  `apprafter backup prune` was a second, manual door into the same planner at any
+  `enforce` setting.
+
+  Identity is now the cluster's own **`kube-system` namespace UID**, which leads
+  every restic tag. It exists on clusters older than this code, needs no
+  generated state, and a restored cluster is a different Kubernetes cluster with
+  a different UID — so a clone cannot inherit it. `backup list` shows this
+  cluster's snapshots and says how many it withheld (`--all-clusters` shows the
+  rest), `latest` resolves inside one cluster's history and refuses rather than
+  guess when a fresh target faces a repository holding several, and prune plans
+  only over this cluster's runs. Prune consequently always needs a reachable
+  cluster: it deletes, so it must know whose snapshots it may delete, and no flag
+  substitutes for an identity.
+
+  **Snapshots written before this are treated as this cluster's** — they stay
+  restorable and prunable rather than accumulating as history nothing can
+  reclaim. In a repository two clusters already shared that means the other
+  cluster's old snapshots are attributed to whoever asks first, so `backup list`
+  marks those rows `(legacy)`.
+
+### Added
+
+- **`spec.backup.clusterName`** — the name this cluster's snapshots are listed
+  under, set by `apprafter backup enable --cluster-name` (default: the target
+  name) and changed by `apprafter backup set cluster-name <name>`. It becomes the
+  restic `--host` on every snapshot and the CLUSTER column of `backup list`,
+  because a repository shared by two clusters is unreadable when every row says
+  `apprafter-backup`.
+
+  It is a label, not an identity: it lives in `spec.backup`, so a restore replays
+  it and a restored cluster inherits the source's name. That is cosmetic —
+  attribution keys on the UID, which the clone has its own of — and the restore
+  summary now says when it has happened and names the command that changes it.
+
+  The nightly runner's ClusterRole gains `get` on the single `kube-system`
+  namespace, which is what lets it read the identity at all.
+
 ### Known limits
 
 - **A per-environment override replaces the whole `needs.jetstream` block**, as

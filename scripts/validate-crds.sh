@@ -143,6 +143,7 @@ spec:
     stagingMode: monolithic
     checkReadData: false
     timeZone: Europe/Belgrade
+    clusterName: crd-validate-cluster
 YAML
 if ! kubectl --context "$CTX" apply -f /tmp/crd-validate-tz.yaml >/dev/null 2>/tmp/crd-tz-err.txt; then
     echo "==> REGRESSION: apiserver REJECTED spec.backup.timeZone" >&2
@@ -157,6 +158,18 @@ else
     echo "==> REGRESSION: spec.backup.timeZone was PRUNED — read back '${_tz}'." >&2
     echo "    The apply succeeded and the field vanished, which is how a backup" >&2
     echo "    ends up running in the wrong zone with the CLI reporting the right one." >&2
+    exit 1
+fi
+# E1, same failure mode. `clusterName` is the restic `--host` every snapshot
+# of this cluster is listed under; pruned, the apply succeeds, the CLI reports
+# the name it set, and the repository goes on listing every row under the
+# anonymous `apprafter-backup` host that made two clusters indistinguishable.
+_cn=$(kubectl --context "$CTX" -n crd-validate get platformstack crd-validate-tz \
+    -o jsonpath='{.spec.backup.clusterName}' 2>/dev/null || true)
+if [ "$_cn" = "crd-validate-cluster" ]; then
+    echo "    OK: spec.backup.clusterName stored (not pruned)"
+else
+    echo "==> REGRESSION: spec.backup.clusterName was PRUNED — read back '${_cn}'." >&2
     exit 1
 fi
 _cs=$(kubectl --context "$CTX" -n crd-validate get platformstack crd-validate-tz \

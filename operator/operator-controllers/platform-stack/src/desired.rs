@@ -133,6 +133,7 @@ mod tests {
             credential_ref: operator_core::platform_stack::CredentialRef {
                 name: "bkcreds".into(),
             },
+            cluster_name: None,
             staging_mode: "monolithic".into(),
             staging_size_limit: None,
             retention: None,
@@ -152,6 +153,33 @@ mod tests {
         );
     }
 
+    /// The human cluster label must reach the chart, which renders it as the
+    /// restic `--host` and as the manifest's `clusterId`. Without it a shared
+    /// repository lists every snapshot under `apprafter-backup` (E1).
+    #[test]
+    fn an_explicit_cluster_name_reaches_the_chart() {
+        let mut spec = base_spec();
+        spec.backup = Some(operator_core::platform_stack::BackupConfig {
+            enabled: true,
+            schedule: "@daily".into(),
+            bucket: "s3:https://ep/b".into(),
+            cluster_name: Some("prod".into()),
+            credential_ref: operator_core::platform_stack::CredentialRef {
+                name: "bkcreds".into(),
+            },
+            staging_mode: "monolithic".into(),
+            staging_size_limit: None,
+            retention: None,
+            check_schedule: "@weekly".into(),
+            check_read_data: false,
+            check_read_data_subset: None,
+            time_zone: None,
+            failure_webhook: None,
+        });
+        let desired = build(&spec, "0.2.69");
+        assert_eq!(desired.helm_values["backup"]["clusterName"], json!("prod"));
+    }
+
     #[test]
     fn an_explicit_check_subset_reaches_the_chart() {
         let mut spec = base_spec();
@@ -162,6 +190,7 @@ mod tests {
             credential_ref: operator_core::platform_stack::CredentialRef {
                 name: "bkcreds".into(),
             },
+            cluster_name: None,
             staging_mode: "monolithic".into(),
             staging_size_limit: None,
             retention: None,
@@ -188,6 +217,7 @@ mod tests {
             credential_ref: operator_core::platform_stack::CredentialRef {
                 name: "bkcreds".into(),
             },
+            cluster_name: None,
             staging_mode: "monolithic".into(),
             staging_size_limit: None,
             retention: None,
@@ -199,6 +229,16 @@ mod tests {
         });
         let desired = build(&spec, "0.2.31");
         assert_eq!(desired.helm_values["backup"]["enabled"], json!(true));
+        // An unset cluster name must stay ABSENT, not arrive as `null`: the
+        // chart's `{{ $b.clusterName | default … }}` would read null as empty
+        // and fall back, which is the same answer — but `skip_serializing_if`
+        // is what keeps the two spellings from diverging the day the default
+        // stops being a `default` pipe.
+        assert!(
+            desired.helm_values["backup"].get("clusterName").is_none(),
+            "absent must stay absent: {}",
+            desired.helm_values["backup"]
+        );
         // 2.22g: the zone must reach the chart, or the CronJob runs in the
         // kube-controller-manager's and nothing says which.
         assert_eq!(

@@ -1467,6 +1467,15 @@ pub enum NodeAction {
 }
 
 /// `apprafter backup …` subcommands.
+///
+/// `Enable` is much the largest variant — it carries the whole `spec.backup`
+/// surface as flags. Boxing it is what clippy suggests and is the wrong trade
+/// here: this enum is constructed exactly once per process, by clap, from
+/// argv, so the "wasted" bytes are one stack frame that exists for the
+/// lifetime of a single dispatch — and `#[derive(Subcommand)]` cannot see
+/// through a `Box`, so the indirection would have to be a hand-written
+/// wrapper struct that buys nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub enum BackupAction {
     /// Create a full encrypted backup of the cluster (default scope:
@@ -1527,6 +1536,14 @@ pub enum BackupAction {
         /// it is not the default. Off-site repositories only.
         #[arg(long, default_value_t = false)]
         details: bool,
+        /// Include snapshots written by OTHER clusters. A repository can
+        /// legitimately be shared, and by default the listing shows only
+        /// this cluster's own snapshots (plus any written before
+        /// snapshots carried a cluster identity, marked `(legacy)`).
+        /// Use this to find the id of another cluster's run to pass to
+        /// `apprafter restore --snapshot`.
+        #[arg(long, default_value_t = false)]
+        all_clusters: bool,
     },
     /// Show what a snapshot contains: cluster, platform version, size,
     /// namespaces, and a count of the resources it captured broken down
@@ -1550,8 +1567,8 @@ pub enum BackupAction {
     /// adjust a single setting without resetting the others.
     ///
     /// Keys: at <HH:MM>, check <HH:MM|off>, check-depth
-    /// <structure|10%|full>, timezone <IANA>, keep-daily <n>,
-    /// keep-weekly <n>, keep-monthly <n>, enforce
+    /// <structure|10%|full>, cluster-name <name>, timezone <IANA>,
+    /// keep-daily <n>, keep-weekly <n>, keep-monthly <n>, enforce
     /// <operator|cluster>, staging-mode <monolithic|sequential>,
     /// failure-webhook <url>.
     Set {
@@ -1673,6 +1690,14 @@ pub enum BackupAction {
         /// Without --credential-file: an existing Secret to read creds from (required).
         #[arg(long, default_value = "")]
         credential: String,
+        /// Name this cluster's snapshots are listed under in the
+        /// repository (the restic host). Defaults to the target name.
+        /// Two clusters can share one bucket, and this is what makes a
+        /// listing readable — it is a label, not an identity: snapshots
+        /// are attributed by the cluster's own kube-system UID, which a
+        /// restored copy cannot inherit.
+        #[arg(long, value_name = "name")]
+        cluster_name: Option<String>,
         /// Path to a dotenv file with S3 + restic creds (S3_ACCESS_KEY_ID,
         /// S3_SECRET_ACCESS_KEY, RESTIC_PASSWORD; optional S3_REGION).
         /// AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION accepted as aliases.

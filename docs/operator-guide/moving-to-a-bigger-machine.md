@@ -132,6 +132,19 @@ apprafter target add <new-name> --provider hetzner-cloud --token <new-project-to
 apprafter restore <repo> --reprovision --target <new-name> --server-type <sku>
 ```
 
+For as long as both clusters run, both carry the same backup configuration —
+the restore replays it — so both write to the same repository. That is supported:
+each cluster's snapshots are attributed to it, so neither cluster's `restore` or
+`prune` can reach the other's ([which snapshots are
+yours](../how-it-works/backup-retention-and-checks.md#which-snapshots-are-yours)).
+Two things are worth doing while both are up:
+
+- The new cluster inherits the old one's backup **name**, so a listing shows two
+  clusters under one label. The restore summary says so; `apprafter backup set
+  cluster-name <new-name>` on the new cluster separates them.
+- `apprafter backup list` on either cluster shows only that cluster's snapshots;
+  `--all-clusters` shows both, which is the view you want while cutting over.
+
 Then move DNS to the new cluster (see [Connect a
 domain](connect-a-domain.md)), confirm it, and empty the old project:
 

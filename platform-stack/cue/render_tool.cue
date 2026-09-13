@@ -362,11 +362,12 @@ _gatewayTemplate: """
 // is `optional: true` — many S3-compatible stores don't need one.
 //
 // RBAC is scoped to the runner's ACTUAL read-set (chunk-2 code:
-// `kube_rs_exec.rs` + `status.rs`): list/get the AppRafter + Argo
-// `Application`s, `SharedVolume`s, `PlatformStack`, `ResourceClaim`s,
-// CNPG `Cluster`s, `SealedSecret`s cluster-wide; get core `Secret`s;
-// create/get/delete helper `pods` + create `pods/exec`; and
-// create/get/update/patch ONLY the `apprafter-backup-status` ConfigMap.
+// `kube_rs_exec.rs` + `status.rs`): `get` the `kube-system` namespace
+// (the cluster's machine key — `engine::read_cluster_uid`, E1); list/get
+// the AppRafter + Argo `Application`s, `SharedVolume`s, `PlatformStack`,
+// `ResourceClaim`s, CNPG `Cluster`s, `SealedSecret`s cluster-wide; get
+// core `Secret`s; create/get/delete helper `pods` + create `pods/exec`;
+// and create/get/update/patch ONLY the `apprafter-backup-status` ConfigMap.
 // It deliberately does NOT grant write on `platformstacks` — a
 // compromised backup pod must never reach the platform upgrade control
 // (k8s has no field-level RBAC; the status write is a ConfigMap, not a
@@ -418,6 +419,15 @@ _backupTemplate: """
 	    apprafter.io/managed-by: apprafter
 	    apprafter.io/source: platform-stack
 	rules:
+	# The cluster's own machine key: `kube-system`'s namespace UID, which the
+	# runner puts at the head of every restic tag so a repository SHARED by two
+	# clusters can tell their snapshots apart (E1) — and so the in-Job prune
+	# under `retention.enforce: cluster` never forgets the co-tenant's runs.
+	# `get` on the one object; nothing here lists or writes namespaces.
+	- apiGroups: [""]
+	  resources: ["namespaces"]
+	  resourceNames: ["kube-system"]
+	  verbs: ["get"]
 	# CRs the engine's list/get sweep reads (serialized into the backup manifest).
 	- apiGroups: ["apprafter.io"]
 	  resources: ["applications", "sharedvolumes", "platformstacks", "resourceclaims", "sourcecredentials"]
@@ -531,8 +541,17 @@ _backupTemplate: """
 	                  optional: true
 	            - name: APPRAFTER_BACKUP_REPO
 	              value: {{ $b.bucket | quote }}
+	            # The HUMAN label, not the identity. The identity is the
+	            # kube-system namespace UID the runner reads at run time and
+	            # writes at the head of every snapshot tag (E1); this names
+	            # the cluster in the manifest and in a failure webhook.
 	            - name: APPRAFTER_CLUSTER_ID
-	              value: {{ .Release.Name | quote }}
+	              value: {{ $b.clusterName | default .Release.Name | quote }}
+	            # restic --host on every snapshot of the run. Defaults to the
+	            # fixed host every cluster wrote before `clusterName` existed,
+	            # so upgrading never re-groups an existing repository.
+	            - name: APPRAFTER_BACKUP_HOST
+	              value: {{ $b.clusterName | default "apprafter-backup" | quote }}
 	            - name: APPRAFTER_BACKUP_STAGING_MODE
 	              value: {{ $b.stagingMode | default "monolithic" | quote }}
 	            - name: APPRAFTER_BACKUP_ENFORCE

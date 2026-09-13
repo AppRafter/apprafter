@@ -110,6 +110,7 @@ Usage: apprafter backup enable [OPTIONS] --bucket <BUCKET>
 | `--at` | `<time>` | — | no | Local time of day the nightly backup runs, `HH:MM` on a 24-hour clock. Default `03:00`. Interpreted in `--timezone`, so the time you write is the time it runs |
 | `--bucket` | — | — | yes | Bucket name (with `--endpoint`), or a full restic repo URL (`s3:https://host/bucket`, `b2:...`, a local path, ...). With a bare name, pass `--endpoint` and the CLI builds the `s3:https://<endpoint>/<bucket>` URL for you |
 | `--check` | `<off|time>` | — | no | The weekly repository-integrity check: `off` to disable it, or `HH:MM` for its Sunday run time. Default: three hours after `--at`, so it never starts in the same minute as a backup. The check is metadata-only; it does not re-download the data |
+| `--cluster-name` | `<name>` | — | no | Name this cluster's snapshots are listed under in the repository (the restic host). Defaults to the target name. Two clusters can share one bucket, and this is what makes a listing readable — it is a label, not an identity: snapshots are attributed by the cluster's own kube-system UID, which a restored copy cannot inherit |
 | `--credential` | — | — | no | Name of the credential Secret in apprafter-system. With --credential-file: the name to create (default: apprafter-backup-s3). Without --credential-file: an existing Secret to read creds from (required) |
 | `--credential-file` | — | — | no | Path to a dotenv file with S3 + restic creds (S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, RESTIC_PASSWORD; optional S3_REGION). AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION accepted as aliases. When given, the creds are probed against the repo and then auto-sealed into the cluster |
 | `--endpoint` | — | — | no | S3 endpoint host (e.g. `nbg1.your-objectstorage.com`). With a bare `--bucket` name, the CLI builds the `s3:https://<endpoint>/<bucket>` repo URL for you. Omit when passing a full restic URL in `--bucket` |
@@ -145,6 +146,7 @@ Aliases: `ls` — accepted on the command line, not listed in `--help`.
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
+| `--all-clusters` | flag | — | no | Include snapshots written by OTHER clusters. A repository can legitimately be shared, and by default the listing shows only this cluster's own snapshots (plus any written before snapshots carried a cluster identity, marked `(legacy)`). Use this to find the id of another cluster's run to pass to `apprafter restore --snapshot` |
 | `--credential-file` | — | — | no | Path to a dotenv credential file for an `s3:` repository. Falls back to the matching env vars, then to the credential Secret the cluster holds (`spec.backup.credentialRef`) |
 | `--details` | flag | — | no | Add per-snapshot size and content counts (applications, secrets, claims), so two runs can be compared down the columns. Costs three restic calls per snapshot, which is why it is not the default. Off-site repositories only |
 | `--local` | flag | — | no | List the LOCAL repository (`<config>/backups/<target>`) that `backup create` writes, even when the cluster has a schedule |
@@ -209,7 +211,7 @@ apprafter backup run --timeout 120
 
 Change ONE field of a configured backup, leaving the rest alone. `backup enable` rewrites the whole block, so it cannot be used to adjust a single setting without resetting the others.
 
-Keys: at &lt;HH:MM>, check &lt;HH:MM|off>, check-depth &lt;structure|10%|full>, timezone &lt;IANA>, keep-daily &lt;n>, keep-weekly &lt;n>, keep-monthly &lt;n>, enforce &lt;operator|cluster>, staging-mode &lt;monolithic|sequential>, failure-webhook &lt;url>.
+Keys: at &lt;HH:MM>, check &lt;HH:MM|off>, check-depth &lt;structure|10%|full>, cluster-name &lt;name>, timezone &lt;IANA>, keep-daily &lt;n>, keep-weekly &lt;n>, keep-monthly &lt;n>, enforce &lt;operator|cluster>, staging-mode &lt;monolithic|sequential>, failure-webhook &lt;url>.
 
 ```text
 Usage: apprafter backup set <KEY> <VALUE>

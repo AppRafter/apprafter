@@ -3,6 +3,7 @@
 //! subprocess) and the in-cluster runner (kube-rs). See
 //! docs/superpowers/specs/2026-07-16-2-6d-4-s3-push-design.md.
 
+pub mod cluster;
 pub mod engine;
 pub mod extract;
 pub mod helper_pod;

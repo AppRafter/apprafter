@@ -29,9 +29,9 @@ apprafter backup list
 
 That is the whole of it. The repository lands at `<config>/backups/<target>`
 under the AppRafter config root; `--repo <path>` puts it elsewhere.
-`backup list` (alias `ls`) prints each snapshot's short id, timestamp and tag —
-the tag is `<cluster-id>-<created-at>`, so it identifies the source cluster and
-the moment, never a single namespace.
+`backup list` (alias `ls`) prints each snapshot's short id, timestamp, cluster
+and tag — the tag is `<cluster-uid>-<created-at>`, so it identifies the source
+cluster and the moment, never a single namespace.
 
 ## What is in a backup
 
@@ -68,6 +68,22 @@ backups; `--local` shows this machine's repository instead, and `--repo` names
 one directly. The heading above the table always says which repository you are
 looking at. With no cluster reachable — the disaster-recovery case — it falls
 back to the local repository rather than failing.
+
+**It also shows only *this* cluster's snapshots.** A repository can hold more
+than one cluster's, and the listing says so at the bottom when it withheld any:
+
+```sh
+apprafter backup list --all-clusters
+```
+
+shows every snapshot with the cluster each belongs to. That is how you find the
+id of another cluster's run when you genuinely want it — `restore --snapshot
+<id>` takes it from there. Rows marked `(legacy)` were written before snapshots
+carried a cluster identity and are being treated as this cluster's by
+assumption; with no cluster reachable, nothing can be narrowed and everything is
+listed. [Which snapshots are
+yours](../how-it-works/backup-retention-and-checks.md#which-snapshots-are-yours)
+is the mechanism.
 
 ```text
 apprafter backup create [--repo <path>] [--passphrase <value>] \
@@ -116,6 +132,7 @@ The full surface, all optional beyond the four above:
 ```text
 apprafter backup enable --bucket <name> --endpoint <host> [--prefix <path>] \
                         --credential-file <dotenv> [--credential <secret-name>] \
+                        [--cluster-name <name>] \
                         [--at 03:00] [--timezone Europe/Berlin] \
                         [--staging-mode monolithic|sequential] \
                         [--enforce operator|cluster] \
@@ -128,6 +145,12 @@ Exactly one credential input is required: `--credential-file <dotenv>` for a
 fresh setup (parsed, probed, then auto-sealed as a `SealedSecret` in
 `apprafter-system`, named by `--credential`, default `apprafter-backup-s3`), or
 `--credential <name>` when the Secret already exists.
+
+`--cluster-name` is the name this cluster's snapshots are listed under, and it
+defaults to the target name, so most setups never pass it. It matters when two
+clusters share one repository: the listing is read by that name. Change it later
+with `apprafter backup set cluster-name <name>` — it is a label, and snapshots
+are attributed by the cluster's own identity rather than by it.
 
 ### The credential file
 
@@ -226,8 +249,17 @@ is untouched.
 When the refusal names `config` specifically, the store may be taking writes
 under a path while refusing them at the root of the bucket. `--prefix <path>`
 puts the whole repository one level down and gets past it. That is a fine
-permanent arrangement rather than a workaround — a prefix per cluster is the
-usual way to share one bucket anyway.
+permanent arrangement rather than a workaround — a prefix per cluster is a
+common way to share one bucket.
+
+A prefix per cluster is no longer *required* for correctness, though: two
+clusters writing to one restic repository are told apart by their own
+identities, so neither can restore or prune the other's snapshots ([which
+snapshots are
+yours](../how-it-works/backup-retention-and-checks.md#which-snapshots-are-yours)).
+Separate prefixes still give you separate repositories, which means separate
+deduplication, separate locks and a separate `restic check` — reasons to keep
+doing it, none of them about safety.
 
 > **GitOps advisory.** If `PlatformStack.spec.backup` is git-managed via Argo CD,
 > the next sync will overwrite an imperative patch — set the backup block in

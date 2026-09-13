@@ -408,6 +408,21 @@ package platformstack
 	// operator enables backup; the guard keys off `enabled`, not this.
 	bucket: string | *""
 
+	// Human name this cluster's snapshots are listed under: the restic
+	// `--host` on every snapshot, and the `clusterId` stamped into the
+	// backup manifest. Empty falls back to the fixed `apprafter-backup`
+	// host (and the Helm release name in the manifest) — what every
+	// cluster wrote before this field existed, so upgrading the chart
+	// never silently re-groups an existing repository.
+	//
+	// A LABEL, not an identity. A repository can be shared by two
+	// clusters, and a listing where every row reads `apprafter-backup`
+	// cannot be read — that is what this fixes. Attribution is by the
+	// cluster's own `kube-system` namespace UID, which the runner reads
+	// at run time and puts at the head of the restic tag; a restored
+	// clone inherits this name but never that UID.
+	clusterName: string | *""
+
 	// Secret in `apprafter-system` carrying `RESTIC_PASSWORD` + `AWS_*`
 	// (+ endpoint/region). Consumed via `envFrom: secretRef`.
 	credentialRef: {

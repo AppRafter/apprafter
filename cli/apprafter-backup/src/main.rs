@@ -151,6 +151,15 @@ fn do_backup(k: &dyn KubeExec, r: &dyn ResticRunner, cfg: &RunnerConfig) -> Resu
         ));
     }
 
+    // b2. THIS cluster's machine key: the `kube-system` namespace UID (E1).
+    //     It leads every snapshot tag, and it is the only thing that tells
+    //     this cluster's runs from a co-tenant's in a repository two clusters
+    //     share. Read before anything is staged so an RBAC gap fails the run
+    //     cheaply rather than after a pg_dump. A hard error on purpose: a
+    //     snapshot with no identity would land as "legacy" and be attributed
+    //     to whichever cluster prunes next.
+    let cluster_uid = backup_core::engine::read_cluster_uid(k)?;
+
     // c. Platform version stamped into the manifest — read straight from
     //    `PlatformStack/default.status.currentVersion` (the engine helper the
     //    CLI also uses), falling back to `"unknown"` internally when absent.
@@ -178,6 +187,7 @@ fn do_backup(k: &dyn KubeExec, r: &dyn ResticRunner, cfg: &RunnerConfig) -> Resu
         repo: cfg.repo.clone(),
         passphrase: cfg.passphrase.clone(),
         cluster_id: cfg.cluster_id.clone(),
+        cluster_uid: cluster_uid.clone(),
         created_at: chrono::Utc::now().to_rfc3339(),
         platform_version,
         namespaces,
@@ -188,9 +198,13 @@ fn do_backup(k: &dyn KubeExec, r: &dyn ResticRunner, cfg: &RunnerConfig) -> Resu
         staging_root: staging.path().to_path_buf(),
         pg_image,
         staging_mode: cfg.staging_mode,
-        // Fixed restic `--host` so `forget` retention policies group across runs
-        // even though the pod name is ephemeral (spec §Retention M-r3-1a).
-        backup_host: Some("apprafter-backup".into()),
+        // Stable restic `--host` — the operator-chosen cluster NAME when there
+        // is one, else the fixed `apprafter-backup`. Never the pod name, which
+        // is ephemeral (spec §Retention M-r3-1a). This is the human label that
+        // makes a listing legible; the identity a filter keys on is the UID in
+        // the tag above, because the name is replayed by restore and a clone
+        // inherits it.
+        backup_host: Some(cfg.backup_host.clone()),
     };
 
     // f. The backup.
@@ -200,8 +214,13 @@ fn do_backup(k: &dyn KubeExec, r: &dyn ResticRunner, cfg: &RunnerConfig) -> Resu
     //    one. UNLIKE the best-effort status/webhook steps, a prune failure DOES
     //    fail the run: a repo whose retention isn't being enforced grows without
     //    bound, and that is a real backup-subsystem fault worth surfacing.
+    //
+    //    Scoped to THIS cluster's snapshots (E3). The repository can be shared,
+    //    and the prune runs immediately after this run's own backup — so our
+    //    snapshot is always the newest in its day, and an unscoped planner
+    //    would make the co-tenant lose every bucket, structurally.
     if cfg.enforce_in_cluster {
-        run_prune(r, &cfg.repo, &cfg.passphrase, &cfg.retention)?;
+        run_prune(r, &cfg.repo, &cfg.passphrase, &cfg.retention, &cluster_uid)?;
     }
 
     // Keep `staging` alive until here (all restic snapshots are committed).

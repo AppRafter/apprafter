@@ -173,6 +173,10 @@ enum GetShape {
         ns: String,
         name: String,
     },
+    /// `get <resource> <name>` with NO `-n` — a CLUSTER-SCOPED single get.
+    /// The engine's one use is `get namespaces kube-system`, the cluster's
+    /// machine key (`engine::read_cluster_uid`).
+    GetClusterScoped { resource: String, name: String },
 }
 
 /// Parse the kubectl-style `args` vector into a [`GetShape`].
@@ -183,6 +187,8 @@ enum GetShape {
 /// * `["get", "<resource>", "-A", "-o", "json"]`
 /// * `["get", "<resource>", "-n", "<ns>", "-o", "json"]`
 /// * `["get", "<resource>", "<name>", "-n", "<ns>", "-o", "json"]`
+/// * `["get", "<resource>", "<name>", "-o", "json"]` — cluster-scoped get
+///   (`namespaces kube-system`, the cluster's machine key)
 ///
 /// The `-o json` tail is ignored (kube-rs returns typed objects we serialize
 /// ourselves). Any other shape is an error — we never silently misbehave.
@@ -244,9 +250,14 @@ fn parse_get_args(args: &[&str]) -> Result<GetShape> {
         (true, _, None) => Ok(GetShape::ListAll { resource }),
         (false, Some(ns), None) => Ok(GetShape::ListNs { resource, ns }),
         (false, Some(ns), Some(name)) => Ok(GetShape::GetNamed { resource, ns, name }),
+        // No `-n`, no `-A`, one positional: a cluster-scoped object. kubectl
+        // reads it the same way, and a namespaced kind asked for like this
+        // fails at the apiserver rather than silently resolving somewhere.
+        (false, None, Some(name)) => Ok(GetShape::GetClusterScoped { resource, name }),
         (_, _, _) => Err(CliError::Other(format!(
             "unsupported get_json args (need `-A` for a cluster list, `-n <ns>` for a namespaced \
-             list, or `-n <ns> <name>` for a single get): {args:?}"
+             list, `-n <ns> <name>` for a single get, or `<name>` for a cluster-scoped get): \
+             {args:?}"
         ))),
     }
 }
@@ -496,6 +507,15 @@ impl KubeExec for KubeRsExec {
                         ))),
                     }
                 }
+                GetShape::GetClusterScoped { resource, name } => {
+                    let ar = self.resolve_resource(&resource).await?;
+                    let api: Api<DynamicObject> = Api::all_with(self.client.clone(), &ar);
+                    match api.get(&name).await {
+                        Ok(obj) => Ok(Some(serde_json::to_value(obj).map_err(CliError::from)?)),
+                        Err(e) if is_not_found(&e) => Ok(None),
+                        Err(e) => Err(CliError::Other(format!("get {resource} {name}: {e}"))),
+                    }
+                }
             }
         })
     }
@@ -727,6 +747,14 @@ mod tests {
             }
             other => panic!("expected a single get, got {other:?}"),
         }
+        // …plus the cluster-scoped get the identity read needs (E1).
+        match shape_of(&["get", "namespaces", "kube-system", "-o", "json"]) {
+            GetShape::GetClusterScoped { resource, name } => {
+                assert_eq!(resource, "namespaces");
+                assert_eq!(name, "kube-system");
+            }
+            other => panic!("expected a cluster-scoped get, got {other:?}"),
+        }
     }
 
     /// The name is a bare positional and may sit on EITHER side of `-n <ns>`
@@ -788,7 +816,8 @@ mod tests {
                 "status.phase=Running",
             ]
             .as_slice(),
-            // neither `-A` nor `-n`: scope is undefined
+            // neither `-A` nor `-n` and NO name: scope is undefined. (With a
+            // name it is a cluster-scoped get, which IS a shape — see above.)
             ["get", "pods", "-o", "json"].as_slice(),
             // a name with `-A`: kubectl has no such shape
             ["get", "pods", "mypod", "-A"].as_slice(),

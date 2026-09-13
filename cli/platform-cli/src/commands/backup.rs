@@ -57,6 +57,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use backup_core::cluster::{
+    classify_snapshot, identity_read_error, SnapshotOrigin, IDENTITY_NAMESPACE,
+};
 use backup_core::engine::BackupOpts;
 use backup_core::extract::plan_extraction;
 use backup_core::prune::{run_prune, RetentionPolicy};
@@ -595,6 +598,14 @@ pub(crate) struct EnableOpts {
     pub bucket: String,
     /// Cluster credential Secret name → `spec.backup.credentialRef.name`.
     pub credential: String,
+    /// `--cluster-name` → `spec.backup.clusterName`: the HUMAN label this
+    /// cluster's snapshots carry as their restic `--host`. `None` resolves to
+    /// the target name ([`resolve_cluster_name`]).
+    ///
+    /// Legibility, not identity: it is replayed by restore, so a clone
+    /// inherits it. Every repository filter keys on the `kube-system` UID,
+    /// which a clone cannot inherit.
+    pub cluster_name: Option<String>,
     /// `--at HH:MM` — the local time of day the backup runs.
     pub at: Option<String>,
     /// `--timezone` — IANA zone override; `None` resolves from the machine.
@@ -636,6 +647,14 @@ pub(crate) fn backup_enable_patch(o: &EnableOpts, s: &ResolvedSchedule) -> serde
         "credentialRef".to_string(),
         serde_json::json!({ "name": o.credential }),
     );
+    // Present on every patch the command builds: `run_backup_enable` resolves
+    // this to the target name before calling. `None` reaches here only from a
+    // test constructing `EnableOpts` directly, and an omitted `clusterName`
+    // then leaves the snapshots under the anonymous `apprafter-backup` host
+    // that made two clusters indistinguishable in a listing.
+    if let Some(name) = &o.cluster_name {
+        backup.insert("clusterName".to_string(), Value::String(name.clone()));
+    }
 
     // The PlatformStack CRD marks schedule / stagingMode / checkSchedule /
     // checkReadData REQUIRED whenever `spec.backup` is present (the CRD drops
@@ -808,6 +827,55 @@ pub(crate) fn read_platform_version(kubeconfig: &Path) -> Result<String> {
     )?;
     Ok(platform_version_of(ps.as_ref()))
 }
+
+/// This cluster's MACHINE key: the `kube-system` namespace UID (E1).
+///
+/// The de-facto standard cluster identifier — it exists on every cluster
+/// including ones older than this code, it needs no generated state, and a
+/// restored cluster is a different Kubernetes cluster with a different UID, so
+/// a clone cannot inherit it. It leads every restic run tag and is the only
+/// thing repository-wide filters key on.
+///
+/// Hard error rather than a fallback: an unidentified snapshot in a shared
+/// repository is precisely the defect, and "the operator's kubeconfig cannot
+/// read `kube-system`" is not a condition to paper over. Callers that only
+/// WANT the identity (the listing) discard the error; callers that need it to
+/// decide something (backup, prune, restore) propagate it.
+///
+/// Spawned with an explicit `--request-timeout` rather than through
+/// [`kubectl_get_json`]. `backup list --local` and `backup list --repo` reached
+/// no cluster at all before this read existed, and an unreachable apiserver
+/// makes an unbounded `kubectl get` sit on TCP retries for minutes — in exactly
+/// the disaster-recovery case where a repository has to be listed with its
+/// cluster gone. A bounded wait keeps the attribution and keeps that fast.
+pub(crate) fn read_cluster_uid(kubeconfig: &Path) -> Result<String> {
+    let out = Command::new("kubectl")
+        .args([
+            "get",
+            "namespace",
+            IDENTITY_NAMESPACE,
+            "-o",
+            "json",
+            IDENTITY_REQUEST_TIMEOUT_ARG,
+        ])
+        .env("KUBECONFIG", kubeconfig)
+        .output()
+        .map_err(|e| CliError::Other(identity_read_error(&format!("spawn kubectl: {e}"))))?;
+    if !out.status.success() {
+        return Err(CliError::Other(identity_read_error(
+            String::from_utf8_lossy(&out.stderr).trim(),
+        )));
+    }
+    let ns: Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| CliError::Other(identity_read_error(&format!("kubectl JSON parse: {e}"))))?;
+    backup_core::cluster::cluster_uid_of(&ns).ok_or_else(|| {
+        CliError::Other(identity_read_error("the namespace carries no metadata.uid"))
+    })
+}
+
+/// How long the identity read waits on the apiserver. Generous for a live
+/// cluster, bounded for a dead one — see [`read_cluster_uid`].
+const IDENTITY_REQUEST_TIMEOUT_ARG: &str = "--request-timeout=10s";
 
 /// `PlatformStack.status.currentVersion`, or `"unknown"`.
 ///
@@ -1505,6 +1573,12 @@ pub fn run_backup(
     let repo_path = backup_repo_path(repo, &cluster_id)?;
     let repo_str = repo_path.to_string_lossy().to_string();
 
+    // The snapshot's identity (E1). A local pull can be aimed at a SHARED
+    // repository with `--repo s3:…`, so it must stamp the same machine key the
+    // scheduled runner does — otherwise it lands as an unidentified snapshot in
+    // a pool two clusters draw from.
+    let cluster_uid = read_cluster_uid(kc.path())?;
+
     let pg_image = pg_helper_image(first_cnpg_image(&ns_set, kc.path()).as_deref());
     let platform_version = read_platform_version(kc.path())?;
 
@@ -1518,6 +1592,7 @@ pub fn run_backup(
         &repo_str,
         pass,
         &cluster_id,
+        &cluster_uid,
         &platform_version,
         &ns_set,
         select,
@@ -1549,6 +1624,7 @@ fn local_pull_backup_opts(
     repo: &str,
     passphrase: String,
     cluster_id: &str,
+    cluster_uid: &str,
     platform_version: &str,
     namespaces: &[String],
     is_subset: bool,
@@ -1560,6 +1636,7 @@ fn local_pull_backup_opts(
         repo: repo.to_string(),
         passphrase,
         cluster_id: cluster_id.to_string(),
+        cluster_uid: cluster_uid.to_string(),
         created_at: now_rfc3339(),
         platform_version: platform_version.to_string(),
         namespaces: namespaces.to_vec(),
@@ -2013,6 +2090,134 @@ fn choose_list_repo(
     }
 }
 
+/// How a listing attributes each snapshot to a cluster (E2).
+///
+/// A restic repository can legitimately be shared, so a listing that shows
+/// everything without saying whose it is answers a different question than the
+/// one asked. `this` is the reader's own `kube-system` UID — `None` when there
+/// was no cluster to ask, in which case nothing can be narrowed and the output
+/// says so rather than pretending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClusterView<'a> {
+    pub this: Option<&'a str>,
+    /// `--all-clusters`: show every cluster's snapshots, not just this one's.
+    pub all: bool,
+}
+
+/// The snapshots a listing shows, and how many it withheld.
+#[derive(Debug)]
+pub(crate) struct ListingScope<'a> {
+    pub shown: Vec<&'a Value>,
+    /// Snapshots belonging to another identified cluster, not displayed.
+    pub hidden: usize,
+}
+
+/// Narrow a repository listing to what this cluster owns. Pure.
+///
+/// INVARIANT: `hidden` counts ONLY snapshots that carry another cluster's UID.
+/// Legacy snapshots (no UID at all) are shown and marked, never hidden — an
+/// operator choosing a snapshot to restore has to be able to see the ones being
+/// attributed to them by assumption.
+pub(crate) fn narrow_to_cluster<'a>(
+    snapshots: &'a [Value],
+    view: ClusterView<'_>,
+) -> ListingScope<'a> {
+    let Some(uid) = view.this.filter(|_| !view.all) else {
+        return ListingScope {
+            shown: snapshots.iter().collect(),
+            hidden: 0,
+        };
+    };
+    let mut shown = Vec::new();
+    let mut hidden = 0;
+    for s in snapshots {
+        if classify_snapshot(&tags_of_snapshot(s), uid) == SnapshotOrigin::OtherCluster {
+            hidden += 1;
+        } else {
+            shown.push(s);
+        }
+    }
+    ListingScope { shown, hidden }
+}
+
+/// The tag list restic reports for a snapshot document.
+fn tags_of_snapshot(s: &Value) -> Vec<String> {
+    s.pointer("/tags")
+        .and_then(Value::as_array)
+        .map(|t| {
+            t.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The CLUSTER cell for one snapshot: its restic host (the human cluster name
+/// `backup enable` set) plus a marker when the attribution is not certain.
+///
+/// `(legacy)` is the load-bearing one. Those snapshots carry no identity, are
+/// treated as this cluster's by a stated assumption, and the operator has to be
+/// able to see WHICH rows that assumption is being applied to — otherwise the
+/// widening is silent, which is the thing it must not be.
+pub(crate) fn cluster_cell(s: &Value, view: ClusterView<'_>) -> String {
+    let host = s
+        .pointer("/hostname")
+        .and_then(Value::as_str)
+        .filter(|h| !h.is_empty())
+        .unwrap_or("?");
+    match view.this {
+        None => host.to_string(),
+        Some(uid) => match classify_snapshot(&tags_of_snapshot(s), uid) {
+            SnapshotOrigin::ThisCluster => host.to_string(),
+            SnapshotOrigin::Legacy => format!("{host} (legacy)"),
+            SnapshotOrigin::OtherCluster => format!("{host} (other)"),
+        },
+    }
+}
+
+/// Render a tag for a column: a leading cluster UID is abbreviated to its first
+/// eight characters. The whole UUID is 36 characters of noise in a table whose
+/// job is comparison, and nothing an operator types takes a tag — restic works
+/// on snapshot ids.
+fn short_tag(tag: &str) -> String {
+    match backup_core::cluster::tag_cluster_uid(tag) {
+        Some(uid) => format!("{}…{}", &uid[..8], &tag[uid.len()..]),
+        None => tag.to_string(),
+    }
+}
+
+/// The lines printed under a listing to explain what it did and did not show.
+/// Pure — extracted so the explanation is pinned by a test rather than a walk.
+pub(crate) fn listing_footnotes(
+    scope: &ListingScope<'_>,
+    view: ClusterView<'_>,
+    any_legacy: bool,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if scope.hidden > 0 {
+        out.push(format!(
+            "  {} snapshot(s) belong to another cluster and are not shown — `--all-clusters` \
+             lists them.",
+            scope.hidden
+        ));
+    }
+    if view.this.is_none() {
+        out.push(
+            "  No cluster to compare against, so every snapshot in the repository is listed."
+                .to_string(),
+        );
+    }
+    if any_legacy {
+        out.push(
+            "  (legacy) — written before snapshots carried a cluster identity; treated as this \
+             cluster's by assumption."
+                .to_string(),
+        );
+    }
+    out
+}
+
 /// `apprafter backup list` — list the snapshots in a restic repo.
 ///
 /// With no flags it lists whatever the cluster's schedule writes; `--local`
@@ -2020,12 +2225,18 @@ fn choose_list_repo(
 /// names one directly. A cluster that cannot be reached is not an error —
 /// listing falls back to the local repository and says so, because verifying
 /// a repo when the cluster is gone is the case this command matters in.
+///
+/// The listing is narrowed to THIS cluster's snapshots (E2): a shared
+/// repository holds runs an operator must not mistake for their own.
+/// `--all-clusters` shows the rest, which is how you find the id to pass to
+/// `restore --snapshot` when you genuinely mean a different cluster's run.
 pub fn run_backup_list(
     repo: Option<&str>,
     passphrase: Option<&str>,
     local: bool,
     credential_file: Option<&Path>,
     details: bool,
+    all_clusters: bool,
 ) -> Result<()> {
     // D11 / 2.22a: the external binaries this command spawns, checked
     // BEFORE any prompt, kubeconfig or provider call. The reported bug
@@ -2033,15 +2244,21 @@ pub fn run_backup_list(
     preflight_tools(&[&RESTIC], "apprafter backup list")?;
 
     // Best-effort: no cluster, no target, an unreachable apiserver — all
-    // mean "no schedule to follow", never a failure to list.
-    let kc = if repo.is_some() || local {
-        None
-    } else {
-        ensure_kubeconfig_tempfile().ok()
+    // mean "no schedule to follow", never a failure to list. Attempted even
+    // for `--repo` / `--local`, which do not NEED a cluster, because the
+    // cluster is also where the identity that narrows the listing comes from.
+    let kc = ensure_kubeconfig_tempfile().ok();
+    let spec_backup = match (repo.is_some() || local, kc.as_ref()) {
+        (false, Some(kc)) => spec_backup_from_cluster(Some(kc.path())).unwrap_or(None),
+        _ => None,
     };
-    let spec_backup = match kc.as_ref() {
-        Some(kc) => spec_backup_from_cluster(Some(kc.path())).unwrap_or(None),
-        None => None,
+    // Best-effort too: a cluster that cannot name itself lists everything and
+    // says so. Refusing to list would take the command away exactly when a
+    // repository has to be inspected without its cluster.
+    let this_uid = kc.as_ref().and_then(|kc| read_cluster_uid(kc.path()).ok());
+    let view = ClusterView {
+        this: this_uid.as_deref(),
+        all: all_clusters,
     };
 
     let zone = readers_zone();
@@ -2057,8 +2274,9 @@ pub fn run_backup_list(
             let runner = CredentialedRestic { creds };
             let json = runner.run_stdout(&restic_snapshots_argv(&repo_url), &pass)?;
             let snapshots = parse_snapshots_json(&json)?;
+            let scope = narrow_to_cluster(&snapshots, view);
             if details {
-                let rows = collect_snapshot_details(&runner, &repo_url, &pass, &snapshots);
+                let rows = collect_snapshot_details(&runner, &repo_url, &pass, &scope.shown, view);
                 print!(
                     "{}",
                     format_detail_table(&repo_url, &rows, &chrono::Local, zone.as_deref())
@@ -2066,9 +2284,16 @@ pub fn run_backup_list(
             } else {
                 print!(
                     "{}",
-                    format_snapshot_table(&repo_url, &snapshots, &chrono::Local, zone.as_deref())
+                    format_snapshot_table(
+                        &repo_url,
+                        &scope.shown,
+                        &chrono::Local,
+                        zone.as_deref(),
+                        view
+                    )
                 );
             }
+            print_listing_footnotes(&scope, view);
         }
         chosen => {
             let repo_str = match &chosen {
@@ -2087,13 +2312,34 @@ pub fn run_backup_list(
             let r = SubprocessRestic;
             let json = r.run_stdout(&restic_snapshots_argv(&repo_str), &pass)?;
             let snapshots = parse_snapshots_json(&json)?;
+            let scope = narrow_to_cluster(&snapshots, view);
             print!(
                 "{}",
-                format_snapshot_table(&repo_str, &snapshots, &chrono::Local, zone.as_deref())
+                format_snapshot_table(
+                    &repo_str,
+                    &scope.shown,
+                    &chrono::Local,
+                    zone.as_deref(),
+                    view
+                )
             );
+            print_listing_footnotes(&scope, view);
         }
     }
     Ok(())
+}
+
+/// Print what [`listing_footnotes`] computed for the rows just rendered.
+fn print_listing_footnotes(scope: &ListingScope<'_>, view: ClusterView<'_>) {
+    let any_legacy = view.this.is_some_and(|uid| {
+        scope
+            .shown
+            .iter()
+            .any(|s| classify_snapshot(&tags_of_snapshot(s), uid) == SnapshotOrigin::Legacy)
+    });
+    for line in listing_footnotes(scope, view, any_legacy) {
+        println!("{line}");
+    }
 }
 
 /// Parse `restic snapshots --json` output into the snapshot array.
@@ -2180,7 +2426,8 @@ fn collect_snapshot_details(
     runner: &CredentialedRestic,
     repo: &str,
     pass: &str,
-    snapshots: &[Value],
+    snapshots: &[&Value],
+    view: ClusterView<'_>,
 ) -> Vec<SnapshotDetail> {
     snapshots
         .iter()
@@ -2203,6 +2450,7 @@ fn collect_snapshot_details(
             SnapshotDetail {
                 id,
                 time,
+                cluster: cluster_cell(s, view),
                 size,
                 counts,
             }
@@ -2215,6 +2463,8 @@ fn collect_snapshot_details(
 pub(crate) struct SnapshotDetail {
     pub id: String,
     pub time: String,
+    /// The CLUSTER cell — see [`cluster_cell`].
+    pub cluster: String,
     /// `None` when restic could not be asked — rendered as a dash, never
     /// as a zero, because "unknown" and "none" are different answers.
     pub size: Option<u64>,
@@ -2277,6 +2527,7 @@ where
     struct Rendered {
         id: String,
         time: String,
+        cluster: String,
         size: String,
         apps: String,
         secrets: String,
@@ -2300,6 +2551,7 @@ where
             Rendered {
                 id: r.id.clone(),
                 time: format_timestamp(&r.time, tz),
+                cluster: r.cluster.clone(),
                 size: r.size.map(human_size).unwrap_or_else(|| "—".into()),
                 apps,
                 secrets,
@@ -2318,18 +2570,20 @@ where
     };
     let id_w = width("ID", &|r| &r.id);
     let time_w = width(&time_header, &|r| &r.time);
+    let cluster_w = width("CLUSTER", &|r| &r.cluster);
     let size_w = width("SIZE", &|r| &r.size);
     let apps_w = width("APPS", &|r| &r.apps);
     let sec_w = width("SECRETS", &|r| &r.secrets);
 
     let mut out = format!(
-        "Snapshots in {repo}:\n{:<id_w$}  {:<time_w$}  {:>size_w$}  {:>apps_w$}  {:>sec_w$}  CLAIMS\n",
-        "ID", time_header, "SIZE", "APPS", "SECRETS"
+        "Snapshots in {repo}:\n{:<id_w$}  {:<time_w$}  {:<cluster_w$}  {:>size_w$}  {:>apps_w$}  \
+         {:>sec_w$}  CLAIMS\n",
+        "ID", time_header, "CLUSTER", "SIZE", "APPS", "SECRETS"
     );
     for r in rendered {
         out.push_str(&format!(
-            "{:<id_w$}  {:<time_w$}  {:>size_w$}  {:>apps_w$}  {:>sec_w$}  {}\n",
-            r.id, r.time, r.size, r.apps, r.secrets, r.claims
+            "{:<id_w$}  {:<time_w$}  {:<cluster_w$}  {:>size_w$}  {:>apps_w$}  {:>sec_w$}  {}\n",
+            r.id, r.time, r.cluster, r.size, r.apps, r.secrets, r.claims
         ));
     }
     out
@@ -2489,6 +2743,7 @@ where
 const BACKUP_SET_KEYS: &[&str] = &[
     "at",
     "check",
+    "cluster-name",
     "check-depth",
     "timezone",
     "keep-daily",
@@ -2567,6 +2822,17 @@ fn backup_set_patch(key: &str, value: &str) -> Result<Value> {
             };
             field.insert("checkReadData".into(), Value::Bool(full));
             field.insert("checkReadDataSubset".into(), Value::String(subset));
+        }
+        "cluster-name" => {
+            // The label every snapshot is listed under. Changing it does NOT
+            // change this cluster's identity — that is the kube-system UID in
+            // the tag — so it is safe to rename at any time, and it is the
+            // answer a restored clone needs when it finds it inherited the
+            // source's name.
+            field.insert(
+                "clusterName".into(),
+                Value::String(resolve_cluster_name(Some(value), value)?),
+            );
         }
         "timezone" => {
             validate_zone_shape(value)?;
@@ -2871,9 +3137,10 @@ where
 /// — the table lined up only for values nobody had.
 fn format_snapshot_table<Tz>(
     repo: &str,
-    snapshots: &[Value],
+    snapshots: &[&Value],
     tz: &Tz,
     zone_label: Option<&str>,
+    view: ClusterView<'_>,
 ) -> String
 where
     Tz: chrono::TimeZone,
@@ -2884,7 +3151,7 @@ where
     }
     let time_header = format!("TIME ({})", zone_label.unwrap_or("local"));
 
-    let rows: Vec<(String, String, String)> = snapshots
+    let rows: Vec<(String, String, String, String)> = snapshots
         .iter()
         .map(|s| {
             let id = s
@@ -2898,39 +3165,42 @@ where
                 .and_then(Value::as_str)
                 .map(|t| format_timestamp(t, tz))
                 .unwrap_or_else(|| "?".to_string());
-            let tags = s
-                .pointer("/tags")
-                .and_then(Value::as_array)
-                .map(|t| {
-                    t.iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .unwrap_or_default();
-            (id, time, tags)
+            let tags = tags_of_snapshot(s)
+                .iter()
+                .map(|t| short_tag(t))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (id, time, cluster_cell(s, view), tags)
         })
         .collect();
 
     let id_w = rows
         .iter()
-        .map(|(id, _, _)| id.chars().count())
+        .map(|(id, _, _, _)| id.chars().count())
         .chain(std::iter::once("ID".len()))
         .max()
         .unwrap_or(2);
     let time_w = rows
         .iter()
-        .map(|(_, t, _)| t.chars().count())
+        .map(|(_, t, _, _)| t.chars().count())
         .chain(std::iter::once(time_header.chars().count()))
         .max()
         .unwrap_or(4);
+    let cluster_w = rows
+        .iter()
+        .map(|(_, _, c, _)| c.chars().count())
+        .chain(std::iter::once("CLUSTER".len()))
+        .max()
+        .unwrap_or(7);
 
     let mut out = format!(
-        "Snapshots in {repo}:\n{:<id_w$}  {:<time_w$}  TAGS\n",
-        "ID", time_header
+        "Snapshots in {repo}:\n{:<id_w$}  {:<time_w$}  {:<cluster_w$}  TAGS\n",
+        "ID", time_header, "CLUSTER"
     );
-    for (id, time, tags) in rows {
-        out.push_str(&format!("{id:<id_w$}  {time:<time_w$}  {tags}\n"));
+    for (id, time, cluster, tags) in rows {
+        out.push_str(&format!(
+            "{id:<id_w$}  {time:<time_w$}  {cluster:<cluster_w$}  {tags}\n"
+        ));
     }
     out
 }
@@ -3329,6 +3599,9 @@ pub(crate) struct ClusterNeed {
     reasons: Vec<&'static str>,
     /// The flags that would resolve them locally, in `--flag <value>` form.
     flags: Vec<String>,
+    /// At least one reason has NO local substitute, so the verb cannot be made
+    /// to run off the cluster however many flags are supplied.
+    unavoidable: bool,
 }
 
 impl ClusterNeed {
@@ -3344,6 +3617,15 @@ impl ClusterNeed {
     fn hint(&self, verb: &str) -> String {
         if !self.is_needed() {
             return format!("`apprafter backup {verb}` does not need a cluster.");
+        }
+        if self.unavoidable {
+            return format!(
+                "`apprafter backup {verb}` needs {}, so it cannot run without a reachable \
+                 cluster — there is no flag that substitutes for it. A repository can be shared \
+                 by two clusters, and a prune that cannot tell them apart deletes the other \
+                 one's history.",
+                self.reasons.join(" and ")
+            );
         }
         format!(
             "`apprafter backup {verb}` reads {} from the PlatformStack CR, so it needs a \
@@ -3447,6 +3729,19 @@ pub(crate) fn cluster_need(
             .push("the retention policy (spec.backup.retention)");
         need.flags
             .extend(missing.into_iter().map(|f| format!("{f} <n>")));
+    }
+    // A prune DELETES, and a repository can be shared, so it must know whose
+    // snapshots it is allowed to forget (E3/E4). That answer is the cluster's
+    // own `kube-system` UID and there is no flag that substitutes for it — so
+    // unlike the reasons above, this one is never cleared. Before this, a
+    // fully-specified `backup prune --repo … --keep-*` ran with no cluster at
+    // all and planned across every snapshot in the bucket.
+    if matches!(retention, RetentionArgs::Prune { .. }) {
+        need.reasons.push(
+            "this cluster's identity (the kube-system namespace UID), which decides whose \
+             snapshots may be forgotten",
+        );
+        need.unavoidable = true;
     }
     if creds == CredSource::Cluster {
         need.reasons
@@ -3627,15 +3922,18 @@ fn retention_from_spec_backup(
 /// `apprafter.io/last-prune` annotation with the current RFC3339 time so
 /// `apprafter backup status` can surface when the repo was last pruned.
 ///
-/// ## Cluster access is LAZY (v0.2.49)
+/// ## Prune ALWAYS needs a cluster (E3/E4)
 ///
-/// The CR is read for TWO things — the repo fallback and the retention defaults
-/// — so prune needs a cluster unless `--repo` AND all three `--keep-*` flags
-/// are supplied ([`backup_verb_needs_cluster`]). In that fully-specified case
-/// the prune runs entirely off the cluster and the `last-prune` stamp (a
-/// cluster-side audit annotation) is skipped with a printed note: there is no
-/// CR to stamp, and a prune that already succeeded must not be reported as a
-/// failure.
+/// It used to be lazy: `--repo` plus all three `--keep-*` flags let it run with
+/// no cluster at all. That is no longer possible, and the reason is the point
+/// of this command's blast radius. A restic repository can legitimately be
+/// shared by two clusters — the documented "move to a bigger machine" runbook
+/// has both alive at once — and the planner deletes by explicit snapshot id.
+/// Without the cluster's `kube-system` UID there is nothing to tell one
+/// cluster's runs from the other's, so an "offline" prune planned across the
+/// whole bucket and forgot the neighbour's history. There is no flag that
+/// substitutes for an identity, so the lazy path is gone rather than made
+/// optional.
 pub fn run_backup_prune(
     repo_override: Option<&str>,
     credential_file: Option<&Path>,
@@ -3672,36 +3970,34 @@ pub fn run_backup_prune(
     let repo = repo_from_spec_backup(repo_override, spec_backup)?;
     let policy = retention_from_spec_backup(spec_backup, keep_daily, keep_weekly, keep_monthly);
 
+    // Whose snapshots this prune may forget. `cluster_need` makes the
+    // kubeconfig unconditional for prune, so this is always available.
+    let kc_path = kc_path.ok_or_else(|| {
+        CliError::Other(identity_read_error(
+            "prune resolved no kubeconfig, which `cluster_need` should have made impossible",
+        ))
+    })?;
+    let cluster_uid = read_cluster_uid(kc_path)?;
+
     let runner = CredentialedRestic { creds };
-    run_prune(&runner, &repo, &pass, &policy)?;
+    run_prune(&runner, &repo, &pass, &policy, &cluster_uid)?;
 
     print!("{}", prune_summary(&repo, &policy));
 
     // Stamp last-prune so `backup status` can report it. Best-effort ordering:
     // the prune already succeeded, so a merge-patch failure here surfaces as an
     // error (the annotation is the audit trail — we don't want to swallow it).
-    // With no cluster there is nothing to stamp; say so rather than failing.
-    match &kc {
-        Some(kc) => {
-            let ts = chrono::Utc::now().to_rfc3339();
-            let body = last_prune_patch_body(&ts);
-            kubectl_merge_patch(
-                "platformstack",
-                PLATFORMSTACK_NAME,
-                Some(PLATFORMSTACK_NAMESPACE),
-                None,
-                &body,
-                kc.path(),
-            )?;
-            println!("  last-prune stamped: {ts}");
-        }
-        None => {
-            println!(
-                "  last-prune NOT stamped — ran without a cluster (repo and retention were \
-                 fully specified on the command line)"
-            );
-        }
-    }
+    let ts = chrono::Utc::now().to_rfc3339();
+    let body = last_prune_patch_body(&ts);
+    kubectl_merge_patch(
+        "platformstack",
+        PLATFORMSTACK_NAME,
+        Some(PLATFORMSTACK_NAMESPACE),
+        None,
+        &body,
+        kc_path,
+    )?;
+    println!("  last-prune stamped: {ts}");
     Ok(())
 }
 
@@ -3963,6 +4259,15 @@ pub fn run_backup_enable(
     // 1. Validate enum-valued options before touching the cluster.
     validate_enable_enums(&opts)?;
 
+    // 1a. The human cluster label the snapshots are grouped under. Defaults to
+    //     the target name, which is the name the operator already thinks of
+    //     this cluster by — the alternative was an anonymous shared host, and
+    //     a repository where every row reads `apprafter-backup` cannot be read.
+    opts.cluster_name = Some(resolve_cluster_name(
+        opts.cluster_name.as_deref(),
+        &resolve_state_paths(None)?.target_name,
+    )?);
+
     // 1b. Resolve the schedule and the zone (2.22g / D2). Before the
     //     kubeconfig, before any prompt, before anything billable — a bad
     //     `--at` should cost nothing, and an unresolvable zone must fail here
@@ -4110,7 +4415,12 @@ pub fn run_backup_enable(
     // 8. Success + GitOps advisory.
     print!(
         "{}",
-        enable_success_report(&opts.bucket, &opts.credential, &resolved)
+        enable_success_report(
+            &opts.bucket,
+            &opts.credential,
+            opts.cluster_name.as_deref().unwrap_or(""),
+            &resolved
+        )
     );
 
     // 9. Run the first backup, unless told not to.
@@ -4151,6 +4461,31 @@ pub fn run_backup_enable(
         }
     }
     Ok(())
+}
+
+/// The cluster label to store: `--cluster-name` when given, else the target
+/// name. Pure — extracted from [`run_backup_enable`].
+///
+/// Validated as a restic host: it becomes `--host` on every snapshot, and a
+/// value with whitespace or a comma in it would make a listing unreadable and
+/// a `--host` filter unusable. Deliberately permissive otherwise — this is a
+/// human label, not a DNS name.
+pub(crate) fn resolve_cluster_name(explicit: Option<&str>, target_name: &str) -> Result<String> {
+    let name = explicit.unwrap_or(target_name).trim().to_string();
+    if name.is_empty() {
+        return Err(CliError::Other(
+            "--cluster-name cannot be empty — it is the label every snapshot of this cluster is \
+             listed under."
+                .into(),
+        ));
+    }
+    if name.chars().any(|c| c.is_whitespace() || c == ',') {
+        return Err(CliError::Other(format!(
+            "--cluster-name '{name}' cannot contain whitespace or commas — it becomes the restic \
+             `--host` on every snapshot."
+        )));
+    }
+    Ok(name)
 }
 
 /// Refuse the two enum-valued `enable` flags before anything is touched.
@@ -4244,9 +4579,15 @@ fn check_time_zone_readback(expected: &str, stored: Option<&str>) -> Result<()> 
 
 /// What a successful `backup enable` prints. Pure — extracted from
 /// [`run_backup_enable`], which prints exactly this.
-fn enable_success_report(bucket: &str, credential: &str, s: &ResolvedSchedule) -> String {
+fn enable_success_report(
+    bucket: &str,
+    credential: &str,
+    cluster_name: &str,
+    s: &ResolvedSchedule,
+) -> String {
     format!(
-        "✓ Scheduled off-site backup enabled → {bucket} (credential Secret '{credential}').\n  schedule: {} {}\n{BACKUP_GITOPS_ADVISORY}\n",
+        "✓ Scheduled off-site backup enabled → {bucket} (credential Secret '{credential}').\n  schedule: {} {}\n  cluster:  {cluster_name} (the name this cluster's snapshots are listed under; \
+         `apprafter backup set cluster-name <name>` changes it)\n{BACKUP_GITOPS_ADVISORY}\n",
         describe_schedule(s),
         s.time_zone
     )
@@ -5902,6 +6243,7 @@ mod tests {
             SnapshotDetail {
                 id: "354fb34e".into(),
                 time: "2026-09-10T22:11:39Z".into(),
+                cluster: "prod".into(),
                 size: Some(432 * 1024 * 1024),
                 counts: Some(ContentCounts {
                     apps: 4,
@@ -5912,6 +6254,7 @@ mod tests {
             SnapshotDetail {
                 id: "9c1d0a77".into(),
                 time: "2026-09-11T02:00:04Z".into(),
+                cluster: "prod".into(),
                 size: Some(433 * 1024 * 1024),
                 counts: Some(ContentCounts {
                     apps: 5,
@@ -5948,6 +6291,7 @@ mod tests {
         let rows = vec![SnapshotDetail {
             id: "deadbeef".into(),
             time: "2026-09-10T22:11:39Z".into(),
+            cluster: "prod".into(),
             size: None,
             counts: None,
         }];
@@ -6368,6 +6712,13 @@ mod tests {
         }
     }
 
+    /// E3/E4: prune ALWAYS needs a cluster, whatever is on the command line.
+    ///
+    /// It used to go fully offline with `--repo` + all three `--keep-*`. A
+    /// prune deletes by explicit snapshot id, and a repository can be shared,
+    /// so without the cluster's `kube-system` UID it planned across every
+    /// snapshot in the bucket and forgot the co-tenant's runs. No flag can
+    /// stand in for an identity, so the offline path is gone.
     #[test]
     fn needs_cluster_table_prune() {
         let repo = Some("s3:https://h/b");
@@ -6376,8 +6727,8 @@ mod tests {
             (
                 repo,
                 prune_keeps(Some(7), Some(4), Some(6)),
-                false,
-                "--repo + all three --keep-* → nothing left to read from the CR",
+                true,
+                "--repo + all three --keep-* still needs the cluster's identity (E3)",
             ),
             (
                 repo,
@@ -6740,38 +7091,36 @@ mod tests {
         );
     }
 
+    /// The prune hint no longer offers an offline escape, because there is
+    /// none — so it must SAY why rather than list flags that would not help.
     #[test]
-    fn offline_hint_for_prune_names_only_the_missing_keep_flags() {
-        // --repo and --keep-daily supplied; the hint must ask for exactly the
-        // two that are missing and NOT re-ask for what was already given.
+    fn offline_hint_for_prune_explains_that_no_flag_replaces_the_identity() {
         let h = cluster_need(
             Some("s3:https://h/b"),
-            prune_keeps(Some(7), None, Some(6)),
+            prune_keeps(Some(7), Some(4), Some(6)),
             CredSource::File,
         )
         .hint("prune");
-        assert!(h.contains("--keep-weekly"), "names the missing flag: {h}");
+        assert!(
+            h.contains("kube-system"),
+            "names the identity it needs: {h}"
+        );
+        assert!(
+            h.contains("no flag that substitutes"),
+            "says the offline path does not exist rather than implying one: {h}"
+        );
         assert!(
             !h.contains("--keep-daily"),
-            "--keep-daily was supplied — must not be re-asked: {h}"
-        );
-        assert!(
-            !h.contains("--keep-monthly"),
-            "--keep-monthly was supplied — must not be re-asked: {h}"
-        );
-        assert!(
-            !h.contains("--repo <"),
-            "--repo was supplied — must not be re-asked: {h}"
+            "must not offer a flag that would not help: {h}"
         );
     }
 
+    /// check / unlock keep the offline path, and keep naming the DR case: the
+    /// operator's cluster is SUPPOSED to be gone when they verify a repo.
     #[test]
     fn offline_hint_mentions_disaster_recovery_when_repo_missing() {
-        let h = cluster_need(None, prune_keeps(None, None, None), CredSource::File).hint("prune");
+        let h = cluster_need(None, RetentionArgs::NotApplicable, CredSource::File).hint("check");
         assert!(h.contains("--repo"), "{h}");
-        assert!(h.contains("--keep-daily"), "{h}");
-        assert!(h.contains("--keep-weekly"), "{h}");
-        assert!(h.contains("--keep-monthly"), "{h}");
         assert!(
             h.to_lowercase().contains("no longer exists")
                 || h.to_lowercase().contains("disaster recovery"),
@@ -7155,6 +7504,7 @@ mod tests {
         let report = enable_success_report(
             "s3:https://nbg1.example/bucket",
             "apprafter-backup-s3",
+            "prod",
             &ResolvedSchedule {
                 schedule: "0 3 * * *".into(),
                 check_schedule: "0 6 * * 0".into(),
@@ -7184,6 +7534,32 @@ mod tests {
         chrono::FixedOffset::east_opt(9 * 3600).unwrap()
     }
 
+    /// This cluster's `kube-system` UID, and a co-tenant's, for the
+    /// attribution tests below.
+    const MINE: &str = "11111111-2222-3333-4444-555555555555";
+    const THEIRS: &str = "99999999-8888-7777-6666-555555555555";
+
+    /// A view with no cluster to compare against — what the rendering tests
+    /// (which are about columns, not attribution) ask for.
+    fn anon_view() -> ClusterView<'static> {
+        ClusterView {
+            this: None,
+            all: false,
+        }
+    }
+
+    /// [`format_snapshot_table`] over owned values, so the rendering tests
+    /// keep reading as a list of snapshots rather than a list of references.
+    fn render_table(
+        repo: &str,
+        snaps: &[Value],
+        tz: &chrono::FixedOffset,
+        zone: Option<&str>,
+    ) -> String {
+        let refs: Vec<&Value> = snaps.iter().collect();
+        format_snapshot_table(repo, &refs, tz, zone, anon_view())
+    }
+
     #[test]
     fn a_snapshot_time_is_shown_in_the_readers_own_zone() {
         // What the operator saw: `2026-09-10T22:11:39.771675302Z` — UTC,
@@ -7191,7 +7567,7 @@ mod tests {
         // Every other time this CLI prints is in their zone (the schedule
         // especially), and one raw UTC timestamp in the middle of that
         // reads as a different backup than the one they just took.
-        let table = format_snapshot_table(
+        let table = render_table(
             "s3:x",
             &[json!({
                 "short_id": "354fb34e",
@@ -7214,7 +7590,7 @@ mod tests {
         // The reported symptom: the header reserved 25 columns for a
         // timestamp that renders 30 wide, so TAGS started in a different
         // place on every line.
-        let table = format_snapshot_table(
+        let table = render_table(
             "s3:x",
             &[
                 json!({"short_id": "354fb34e", "time": "2026-09-10T22:11:39.771675302Z",
@@ -7245,7 +7621,7 @@ mod tests {
         // Conservative: a value this code cannot parse is still the only
         // information there is about that snapshot, and inventing a
         // formatted time for it would be worse than showing it raw.
-        let table = format_snapshot_table(
+        let table = render_table(
             "s3:x",
             &[json!({"short_id": "x", "time": "whenever"})],
             &tokyo(),
@@ -7256,7 +7632,7 @@ mod tests {
 
     #[test]
     fn an_unknown_zone_still_labels_the_column() {
-        let table = format_snapshot_table(
+        let table = render_table(
             "s3:x",
             &[json!({"short_id": "x", "time": "2026-09-10T22:11:39Z"})],
             &tokyo(),
@@ -7268,7 +7644,7 @@ mod tests {
     #[test]
     fn the_snapshot_table_truncates_a_full_id_when_restic_omits_short_id() {
         let full = "0123456789abcdef0123456789abcdef";
-        let table = format_snapshot_table(
+        let table = render_table(
             "s3:https://h/b",
             &[json!({"id": full, "time": "2026-08-01T03:00:00Z", "tags": ["a", "b"]})],
             &tokyo(),
@@ -7286,7 +7662,7 @@ mod tests {
 
     #[test]
     fn the_snapshot_table_prefers_short_id_and_tolerates_a_bare_snapshot() {
-        let table = format_snapshot_table(
+        let table = render_table(
             "s3:x",
             &[
                 json!({"short_id": "deadbeef", "id": "ffffffffffff"}),
@@ -7304,12 +7680,209 @@ mod tests {
 
     #[test]
     fn an_empty_repo_says_so_instead_of_printing_an_empty_table() {
-        let table = format_snapshot_table("s3:https://h/b", &[], &tokyo(), Some("Asia/Tokyo"));
+        let table = render_table("s3:https://h/b", &[], &tokyo(), Some("Asia/Tokyo"));
         assert!(table.contains("No snapshots in s3:https://h/b"), "{table}");
         assert!(
             !table.contains("TAGS"),
             "a header with no rows reads as a broken listing: {table}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // E2: `backup list` in a repository two clusters share
+    // ------------------------------------------------------------------
+
+    fn mine_snapshot(id: &str, host: &str) -> Value {
+        json!({"short_id": id, "time": "2026-09-11T03:00:00Z", "hostname": host,
+               "tags": [format!("{MINE}-2026-09-11T03:00:00Z")]})
+    }
+
+    fn their_snapshot(id: &str, host: &str) -> Value {
+        json!({"short_id": id, "time": "2026-09-11T04:00:00Z", "hostname": host,
+               "tags": [format!("{THEIRS}-2026-09-11T04:00:00Z")]})
+    }
+
+    fn legacy_snapshot(id: &str) -> Value {
+        json!({"short_id": id, "time": "2026-09-10T03:00:00Z", "hostname": "apprafter-backup",
+               "tags": ["platform-2026-09-10T03:00:00+00:00"]})
+    }
+
+    fn my_view() -> ClusterView<'static> {
+        ClusterView {
+            this: Some(MINE),
+            all: false,
+        }
+    }
+
+    /// FIRES: another cluster's snapshots are withheld and counted, and the
+    /// legacy one stays in scope — which is exactly the stated rule.
+    #[test]
+    fn a_listing_shows_this_clusters_snapshots_and_withholds_a_co_tenants() {
+        let snaps = vec![
+            mine_snapshot("aaaa1111", "prod"),
+            their_snapshot("bbbb2222", "staging"),
+            legacy_snapshot("cccc3333"),
+        ];
+        let scope = narrow_to_cluster(&snaps, my_view());
+        let shown: Vec<&str> = scope
+            .shown
+            .iter()
+            .map(|s| s.pointer("/short_id").unwrap().as_str().unwrap())
+            .collect();
+        assert_eq!(shown, vec!["aaaa1111", "cccc3333"]);
+        assert_eq!(scope.hidden, 1);
+    }
+
+    /// DOES NOT FIRE: `--all-clusters` shows everything and hides nothing.
+    /// Paired with the test above so "narrowed" is proved to be a decision
+    /// rather than a listing that always drops rows.
+    #[test]
+    fn all_clusters_shows_the_co_tenants_snapshots_too() {
+        let snaps = vec![
+            mine_snapshot("aaaa1111", "prod"),
+            their_snapshot("bbbb2222", "staging"),
+        ];
+        let scope = narrow_to_cluster(
+            &snaps,
+            ClusterView {
+                this: Some(MINE),
+                all: true,
+            },
+        );
+        assert_eq!(scope.shown.len(), 2);
+        assert_eq!(scope.hidden, 0);
+    }
+
+    /// With no cluster to compare against nothing can be narrowed — and the
+    /// listing must show everything rather than silently emptying itself,
+    /// which is the case where a repository has to be read without its
+    /// cluster (disaster recovery).
+    #[test]
+    fn without_a_cluster_every_snapshot_is_listed() {
+        let snaps = vec![
+            mine_snapshot("aaaa1111", "prod"),
+            their_snapshot("bbbb2222", "staging"),
+        ];
+        let scope = narrow_to_cluster(&snaps, anon_view());
+        assert_eq!(scope.shown.len(), 2);
+        assert_eq!(scope.hidden, 0);
+    }
+
+    /// A legacy snapshot is being attributed to this cluster by ASSUMPTION,
+    /// and the row has to say so — that is the whole difference between a
+    /// stated widening and a silent one.
+    #[test]
+    fn the_cluster_column_marks_a_legacy_row_and_leaves_ours_plain() {
+        assert_eq!(cluster_cell(&mine_snapshot("a", "prod"), my_view()), "prod");
+        assert_eq!(
+            cluster_cell(&legacy_snapshot("b"), my_view()),
+            "apprafter-backup (legacy)"
+        );
+        assert_eq!(
+            cluster_cell(&their_snapshot("c", "staging"), my_view()),
+            "staging (other)"
+        );
+        // With nothing to compare against, no marker is claimed.
+        assert_eq!(
+            cluster_cell(&legacy_snapshot("b"), anon_view()),
+            "apprafter-backup"
+        );
+    }
+
+    #[test]
+    fn the_footnotes_say_what_was_withheld_and_what_was_assumed() {
+        let snaps = [mine_snapshot("a", "prod")];
+        let scope = ListingScope {
+            shown: snaps.iter().collect(),
+            hidden: 3,
+        };
+        let notes = listing_footnotes(&scope, my_view(), true);
+        let joined = notes.join("\n");
+        assert!(
+            joined.contains("3 snapshot(s) belong to another cluster"),
+            "{joined}"
+        );
+        assert!(joined.contains("--all-clusters"), "{joined}");
+        assert!(joined.contains("(legacy)"), "{joined}");
+
+        // Nothing withheld, nothing assumed, a cluster present → silence.
+        let quiet = listing_footnotes(
+            &ListingScope {
+                shown: snaps.iter().collect(),
+                hidden: 0,
+            },
+            my_view(),
+            false,
+        );
+        assert!(quiet.is_empty(), "{quiet:?}");
+    }
+
+    #[test]
+    fn a_tag_is_rendered_with_its_cluster_uid_abbreviated() {
+        let tag = format!("{MINE}-2026-09-11T03:00:00Z");
+        let short = short_tag(&tag);
+        assert!(short.starts_with("11111111…"), "{short}");
+        assert!(short.ends_with("-2026-09-11T03:00:00Z"), "{short}");
+        // A legacy tag has no UID to abbreviate and is shown verbatim.
+        assert_eq!(
+            short_tag("platform-2026-09-10T03:00:00Z"),
+            "platform-2026-09-10T03:00:00Z"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // The human cluster label
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_cluster_name_defaults_to_the_target_name_and_an_explicit_one_wins() {
+        assert_eq!(resolve_cluster_name(None, "prod").unwrap(), "prod");
+        assert_eq!(resolve_cluster_name(Some("eu-1"), "prod").unwrap(), "eu-1");
+        // Surrounding whitespace is a typo, not a name.
+        assert_eq!(
+            resolve_cluster_name(Some("  eu-1 "), "prod").unwrap(),
+            "eu-1"
+        );
+    }
+
+    #[test]
+    fn a_cluster_name_that_would_wreck_a_listing_is_refused() {
+        // It becomes the restic `--host`; a space or a comma there makes a
+        // listing unreadable and a `--host` filter unusable.
+        assert!(resolve_cluster_name(Some("eu west"), "prod").is_err());
+        assert!(resolve_cluster_name(Some("a,b"), "prod").is_err());
+        assert!(resolve_cluster_name(Some("   "), "prod").is_err());
+        assert!(resolve_cluster_name(None, "").is_err());
+    }
+
+    #[test]
+    fn the_enable_patch_carries_the_cluster_name() {
+        let p = backup_enable_patch(
+            &EnableOpts {
+                bucket: "s3:x".into(),
+                credential: "c".into(),
+                cluster_name: Some("prod".into()),
+                ..Default::default()
+            },
+            &ResolvedSchedule {
+                schedule: "0 3 * * *".into(),
+                check_schedule: "".into(),
+                time_zone: "UTC".into(),
+            },
+        );
+        assert_eq!(p["spec"]["backup"]["clusterName"], json!("prod"));
+    }
+
+    #[test]
+    fn set_cluster_name_patches_only_that_field() {
+        let p = backup_set_patch("cluster-name", "eu-1").unwrap();
+        assert_eq!(p["spec"]["backup"]["clusterName"], json!("eu-1"));
+        assert_eq!(
+            p["spec"]["backup"].as_object().unwrap().len(),
+            1,
+            "a single-field edit must not rewrite the block: {p}"
+        );
+        assert!(backup_set_patch("cluster-name", "eu west").is_err());
     }
 
     #[test]
@@ -7538,6 +8111,7 @@ mod tests {
             "s3:https://h/b",
             "pw".into(),
             "prod-cluster",
+            MINE,
             "0.2.58",
             &["prod".to_string()],
             true,
@@ -7549,6 +8123,10 @@ mod tests {
         assert!(opts.is_subset, "--select must reach the tag decoration");
         assert_eq!(opts.repo, "s3:https://h/b");
         assert_eq!(opts.cluster_id, "prod-cluster");
+        // …and the local pull carries the SAME machine key the scheduled
+        // runner writes, so a `--repo s3:…` pull into a shared repository is
+        // attributable rather than landing as an unidentified snapshot (E1).
+        assert_eq!(opts.cluster_uid, MINE);
         assert_eq!(opts.platform_version, "0.2.58");
         assert_eq!(opts.namespaces, vec!["prod".to_string()]);
         assert_eq!(opts.staging_root, PathBuf::from("/staging"));
@@ -7764,14 +8342,24 @@ mod tests {
         )
         .unwrap()
         .is_none());
-        assert!(kubeconfig_if_cluster_needed(
-            "prune",
-            Some("s3:x"),
-            prune_keeps(Some(7), Some(4), Some(6)),
-            CredSource::File
-        )
-        .unwrap()
-        .is_none());
+        // …but NOT prune (E3): it deletes, so it must know whose snapshots it
+        // may delete, and only the cluster can say. Asserted as "not Ok(None)"
+        // rather than a concrete value, because whether the kubeconfig then
+        // RESOLVES depends on the machine — the point is that it was reached
+        // for at all. `Ok(None)` would be an offline prune planning across a
+        // shared bucket.
+        assert!(
+            !matches!(
+                kubeconfig_if_cluster_needed(
+                    "prune",
+                    Some("s3:x"),
+                    prune_keeps(Some(7), Some(4), Some(6)),
+                    CredSource::File
+                ),
+                Ok(None)
+            ),
+            "prune must never take the offline shortcut"
+        );
     }
 
     // The mirror case — a verb with NO local credentials must not take

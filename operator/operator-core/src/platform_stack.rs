@@ -97,6 +97,17 @@ pub struct BackupConfig {
     pub enabled: bool,
     pub schedule: String,
     pub bucket: String,
+    /// Human name this cluster's snapshots are listed under (the restic
+    /// `--host`). `None` on a CR written before the field existed, which the
+    /// chart then fills with the fixed `apprafter-backup` host every cluster
+    /// used before. NOT an identity: it is replayed by restore, so a clone
+    /// inherits it — snapshots are attributed by the `kube-system` UID.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "clusterName"
+    )]
+    pub cluster_name: Option<String>,
     #[serde(rename = "credentialRef")]
     pub credential_ref: CredentialRef,
     #[serde(rename = "stagingMode")]

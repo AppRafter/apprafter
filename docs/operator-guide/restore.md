@@ -25,6 +25,22 @@ bootstrapped** target cluster. The target defaults to the active target; pass
 `--target <name>` to pick another registered target. `--snapshot` selects a
 specific snapshot (default `latest`).
 
+`latest` stays inside one cluster's history. When the target has snapshots of
+its own in the repository, `latest` is the freshest of **those**. When it does
+not — a freshly provisioned cluster, which is the ordinary disaster-recovery
+shape — `latest` is the freshest run in the repository, unless the repository
+holds more than one cluster's snapshots, in which case `restore` refuses rather
+than guess which one you meant. `apprafter backup list --all-clusters` shows
+every run with the cluster it came from, and `--snapshot <id>` then says exactly
+which to replay. [Which snapshots are
+yours](../how-it-works/backup-retention-and-checks.md#which-snapshots-are-yours)
+explains the attribution.
+
+A restore replays the whole backup configuration, including the name the source
+cluster's snapshots are listed under. When that happens the summary says so and
+names `apprafter backup set cluster-name <name>` — the restored cluster's own
+snapshots are still attributed to it correctly; only the label is inherited.
+
 ### Target modes
 
 - **(a) restore-into-running** (the default, validated path): the target was
@@ -125,8 +141,9 @@ The DR steps:
 4. Restore **auto-detects the backup format** — monolithic (the default, one
    snapshot per run) vs sequential (a versioned snapshot-set) — by reading the
    manifest version, so you don't specify the format. `latest` resolves to the
-   freshest run of **either** format. Both staging formats restore identically
-   from the operator's side; the only difference is on the write path.
+   freshest run of **either** format, within one cluster's snapshots as above.
+   Both staging formats restore identically from the operator's side; the only
+   difference is on the write path.
 
 The restore ordering, the gating and replay-order invariants, and the secret re-sealing behavior
 are identical to the local-pull restore documented above — the only difference
