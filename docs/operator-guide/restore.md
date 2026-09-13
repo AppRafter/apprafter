@@ -18,7 +18,7 @@ bootstrapped** cluster. Nothing here rebuilds a machine on its own except
 ```text
 apprafter restore <repo> [--target <name>] [--snapshot <id>] \
                   [--data-only] [--passphrase <value>] [--reprovision] \
-                  [--keep-backup-schedule]
+                  [--keep-backup-schedule | --discard-backup-schedule]
 ```
 
 `restore` replays a `backup create` artifact into a **running, already
@@ -37,16 +37,36 @@ which to replay. [Which snapshots are
 yours](../how-it-works/backup-retention-and-checks.md#which-snapshots-are-yours)
 explains the attribution.
 
-### The backup schedule comes with the restore, switched off
+### The backup schedule comes with the restore, and you are asked about it
 
 A restore replays the whole backup configuration — bucket, credential
 reference, schedule, timezone, retention counts and `enforce`, because all of it
-lives in the one `PlatformStack` the restore replays. Left alone, the restored
-cluster would start backing up to the **source's** repository on the source's
-schedule, without being asked.
+lives in the one `PlatformStack` the restore replays. Inherited unchanged, the
+restored cluster starts backing up to the **source's** repository on the
+source's schedule.
 
-So the block is restored exactly as captured but **left disabled**, and the
-summary says so. Turning it on changes that one field and nothing else:
+Whether that is what you want depends on something the snapshot does not
+record. There are three restores and inheriting is right in two of them:
+
+| Situation | Inherit? |
+| --- | --- |
+| A second cluster that should not touch the old destination | No |
+| [Moving to a bigger machine](moving-to-a-bigger-machine.md) — the old cluster is retired once the new one proves out | Yes |
+| Disaster recovery — the cluster died and this one replaces it | Yes |
+
+Nothing in the artifact distinguishes them, so when the replayed block carries
+an **enabled** schedule, `restore` asks:
+
+```text
+This backup carries the source cluster's backup schedule, and it is ENABLED.
+  repository: s3:https://nbg1.your-objectstorage.com/prod-backups
+  schedule:   0 3 * * * (Europe/Berlin)
+...
+Inherit the source's backup schedule? [y/N]
+```
+
+Answering **no** restores the block exactly as captured but switched off.
+Turning it on later changes that one field and nothing else:
 
 ```sh
 apprafter backup set enabled true
@@ -56,17 +76,26 @@ Not `apprafter backup enable` — that composes the whole `spec.backup` block
 from its flags, so it would reset the schedule, timezone, retention and staging
 mode the restore just carried across.
 
-Pass `--keep-backup-schedule` to inherit it already enabled. That is the right
-choice in **disaster recovery**, where the source cluster is gone and the
-restored one is legitimately the repository's new writer — the case the flag
-exists for. It is the wrong choice while the source is still running, which is
-[moving to a bigger machine](moving-to-a-bigger-machine.md) Route B: two live
-clusters on one schedule, both writing to one bucket. Nothing in the restore
-path can tell those two situations apart, which is why the reversible one is the
-default. Either way the summary states which happened.
+Two flags answer the question up front, and either one skips the prompt:
 
-`--data-only` is unaffected — it replays no custom resources, so the target's
-own backup configuration is not touched at all.
+| Flag | Effect |
+| --- | --- |
+| `--keep-backup-schedule` | Inherit it enabled: this cluster becomes the repository's writer |
+| `--discard-backup-schedule` | Replay the block as captured but switched off |
+
+**A non-interactive restore must pass one of them.** With no terminal to ask
+on, `restore` stops and names both rather than pick a side: a scripted restore
+that silently inherited would redirect a still-running cluster's backups, and a
+scripted restore that silently discarded would leave a disaster-recovery
+replacement unbacked. Either way, the summary states what happened.
+
+`--data-only` is unaffected — it replays no custom resources, so nothing is
+asked and the target's own backup configuration is not touched at all.
+
+Inheriting while the source cluster is still running and still backing up puts
+two live clusters on one repository. They are told apart by identity, but they
+share its retention, and a prune run by either can remove the other's
+snapshots.
 
 The inherited block includes the name the source cluster's snapshots are listed
 under. When that happens the summary says so and names

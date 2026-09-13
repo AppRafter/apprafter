@@ -24,9 +24,12 @@
 //!
 //! Every mode that replays the `PlatformStack` — that is, every mode except
 //! `--data-only` — lands the source's whole `spec.backup` on the target, so the
-//! restored cluster would start writing to the SOURCE's repository. The
-//! schedule is therefore replayed but forced OFF unless
-//! `--keep-backup-schedule` says otherwise; see [`apply_backup_schedule_policy`].
+//! restored cluster can start writing to the SOURCE's repository. Whether it
+//! should is a question only the operator can answer, so when the replayed
+//! block is enabled the restore ASKS: `--keep-backup-schedule` /
+//! `--discard-backup-schedule` answer it up front, a terminal is prompted, and
+//! a non-interactive run without either flag is refused. See
+//! [`schedule_decision`] and [`apply_backup_schedule_policy`].
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -253,26 +256,27 @@ fn backup_inheritance_lines(
     let mut lines = Vec::new();
     match schedule {
         BackupSchedule::NotInherited => {}
-        // The default. Stated as a thing that was DONE, not a thing that was
-        // withheld: the schedule is in the cluster, complete, and one command
-        // away from running.
-        BackupSchedule::DisabledByDefault => lines.push(
-            "  ⚠ the source's backup schedule came with the restore and was left DISABLED. It \
-             points at the source's repository, and nothing here can tell whether that cluster \
-             is still alive and writing to it. Bucket, credential, schedule, timezone and \
-             retention are restored exactly as captured, so `apprafter backup set enabled true` \
-             turns it back on unchanged — or restore with `--keep-backup-schedule` to inherit it \
-             already enabled (the disaster-recovery case, where this cluster is the repository's \
-             new writer)."
+        // Stated as a thing that was DONE, not a thing that was withheld: the
+        // schedule is in the cluster, complete, and one command away from
+        // running.
+        BackupSchedule::Disabled => lines.push(
+            "  ⚠ the source's backup schedule came with the restore and was left DISABLED, as \
+             you asked. It points at the source's repository, and nothing here can tell whether \
+             that cluster is still alive and writing to it. Bucket, credential, schedule, \
+             timezone and retention are restored exactly as captured, so `apprafter backup set \
+             enabled true` turns it back on unchanged — or restore with `--keep-backup-schedule` \
+             to inherit it already enabled."
                 .to_string(),
         ),
-        // Asked for explicitly, and still said out loud: a silent inheritance
-        // is exactly what the default exists to stop, and the flag does not
-        // make the consequence less worth knowing.
+        // Asked for explicitly — at the prompt or with the flag — and still
+        // said out loud: the answer was given before the restore ran, and this
+        // is the line that records what it did.
         BackupSchedule::KeptEnabled => lines.push(
-            "  ⚠ --keep-backup-schedule: the source's backup schedule was restored ENABLED, so \
-             this cluster now backs up to the source's repository on the source's schedule. \
-             `apprafter backup status` shows where and when; `apprafter backup disable` stops it."
+            "  ⚠ the source's backup schedule was restored ENABLED, as you asked, so this \
+             cluster now backs up to the source's repository on the source's schedule. If the \
+             source cluster is still running and still backing up, both are now writing to that \
+             one repository. `apprafter backup status` shows where and when; `apprafter backup \
+             disable` stops it."
                 .to_string(),
         ),
     }
@@ -284,7 +288,7 @@ fn backup_inheritance_lines(
     // labelling matter, and the line says so and says how to change it.
     if let Some(name) = inherited_cluster_name {
         let when = match schedule {
-            BackupSchedule::DisabledByDefault => "once you enable it",
+            BackupSchedule::Disabled => "once you enable it",
             _ => "from now on",
         };
         lines.push(format!(
@@ -460,6 +464,7 @@ pub fn run_restore(
     credential_file: Option<&Path>,
     server_type: Option<&str>,
     keep_backup_schedule: bool,
+    discard_backup_schedule: bool,
 ) -> Result<()> {
     reject_conflicting_modes(reprovision, data_only)?;
 
@@ -523,8 +528,15 @@ pub fn run_restore(
     // carried an enabled schedule — reported in the summary (E1).
     let mut inherited_cluster_name: Option<String> = None;
     // What ApplyPlatformStack did to the replayed schedule (D1/D2). Stays
-    // `NotInherited` on `--data-only`, which replays no CR at all.
+    // `NotInherited` on `--data-only`, which replays no CR at all — so that
+    // mode neither prompts nor refuses, because it never reaches the step that
+    // asks.
     let mut schedule = BackupSchedule::NotInherited;
+    let schedule_flags = ScheduleFlags {
+        keep: keep_backup_schedule,
+        discard: discard_backup_schedule,
+        is_tty,
+    };
 
     let snap = snapshot.unwrap_or("latest");
 
@@ -584,7 +596,7 @@ pub fn run_restore(
             }
             RestoreStep::ApplyPlatformStack => {
                 let dd = produced_by_artifact(data_dir.as_ref(), "ApplyPlatformStack")?;
-                let replay = apply_platformstack_from_crs(dd, kc.path(), keep_backup_schedule)?;
+                let replay = apply_platformstack_from_crs(dd, kc.path(), schedule_flags)?;
                 inherited_cluster_name = replay.inherited_cluster_name;
                 schedule = replay.schedule;
 
@@ -1200,16 +1212,18 @@ struct PlatformStackReplay {
 /// mirroring the `cluster_bootstrap` retry loop for the admission-webhook
 /// Endpoints race.
 ///
-/// `keep_backup_schedule` carries `--keep-backup-schedule` down to
-/// [`apply_backup_schedule_policy`], which is the ONLY thing that rewrites the
-/// captured CR before it is applied.
+/// `flags` carries the schedule flags and the terminal state down to
+/// [`resolve_schedule_choice`], which ASKS when neither flag answered the
+/// question. The question is settled here, BEFORE the apply: the operator
+/// reconciles the backup CronJob straight out of `spec.backup`, so by the time
+/// the apply returns the answer is already in effect.
 ///
 /// The origin-firewall intent is read off the SAME CR this step applies, so
 /// what the caller acts on is exactly what landed in the cluster.
 fn apply_platformstack_from_crs(
     data_dir: &Path,
     kubeconfig: &Path,
-    keep_backup_schedule: bool,
+    flags: ScheduleFlags,
 ) -> Result<PlatformStackReplay> {
     let crs = read_crs(data_dir)?;
     let Some(ps) = crs.iter().find(|c| c.kind == "PlatformStack") else {
@@ -1220,7 +1234,7 @@ fn apply_platformstack_from_crs(
     };
     let inherited = inherited_backup_cluster_name(&ps.cr);
     let origin_firewall = crate::commands::target_firewall::recorded_origin_firewall(&ps.cr);
-    let (yaml, schedule) = platformstack_apply_payload(&ps.cr, keep_backup_schedule)?;
+    let (yaml, schedule) = platformstack_apply_payload(&ps.cr, flags)?;
     apply_with_retry(
         PLATFORMSTACK_APPLY_ATTEMPTS,
         std::time::Duration::from_secs(PLATFORMSTACK_APPLY_BACKOFF_SECS),
@@ -1235,17 +1249,20 @@ fn apply_platformstack_from_crs(
 }
 
 /// The exact bytes `ApplyPlatformStack` hands to `kubectl apply`, and what the
-/// schedule policy decided. Pure.
+/// schedule question decided. Impure only in the branch that has to ask (see
+/// [`resolve_schedule_choice`]); everything else about it is a pure transform.
 ///
-/// Extracted so the policy is testable where it MATTERS — on the payload that
-/// reaches the apiserver, not only on the decision that preceded it. A
-/// correctly-disabling [`apply_backup_schedule_policy`] whose result the caller
-/// then failed to serialize would be the whole defect back, with every unit
-/// test still green.
+/// The question and the bytes live in ONE function so they are testable
+/// together, which is where it matters: a correctly-refusing
+/// [`schedule_decision`] next to a payload builder that went on to serialize
+/// the captured CR anyway would be the whole defect back, with every
+/// decision-level test still green. For the same reason the refusal is
+/// returned as an `Err` from here — before the caller has anything to apply.
 fn platformstack_apply_payload(
     captured: &Value,
-    keep_backup_schedule: bool,
+    flags: ScheduleFlags,
 ) -> Result<(String, BackupSchedule)> {
+    let keep_backup_schedule = resolve_schedule_choice(captured, flags)?;
     let (cr, schedule) = apply_backup_schedule_policy(captured, keep_backup_schedule);
     let yaml = serde_json::to_string(&cr)
         .map_err(|e| CliError::Other(format!("serialize PlatformStack: {e}")))?;
@@ -1258,14 +1275,10 @@ fn platformstack_apply_payload(
 /// credential, schedule, timezone, retention, `enforce` — migrates with it, and
 /// the operator reconciles the CronJob straight out of `spec.backup` outside
 /// the upgrade-approval gate. The restored cluster therefore starts writing to
-/// the SOURCE's repository, on the source's schedule, with no opt-out and
-/// nothing said.
+/// the SOURCE's repository, on the source's schedule.
 ///
-/// That inheritance is right in disaster recovery — the clone legitimately
-/// becomes the repository's writer — and wrong when the source is still alive,
-/// which is the documented "move to a bigger machine" Route B: two clusters up
-/// at once, both writing to one repository. Nothing in the restore path knows
-/// or asks which of the two this is, so the default is the reversible half.
+/// Whether that is right depends on something no code here can see — see
+/// [`schedule_decision`], which is where the question gets asked.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BackupSchedule {
     /// The backup carried no enabled schedule, so nothing was inherited and
@@ -1274,10 +1287,169 @@ enum BackupSchedule {
     /// nothing, by construction.
     #[default]
     NotInherited,
-    /// The default: the schedule was replayed as captured but forced OFF.
-    DisabledByDefault,
-    /// `--keep-backup-schedule`: replayed enabled, on purpose.
+    /// The schedule was replayed as captured but forced OFF.
+    Disabled,
+    /// Replayed enabled, on purpose.
     KeptEnabled,
+}
+
+/// What to do about a replayed backup schedule, before anything is applied.
+/// Pure (no I/O) — the prompt and the refusal are wired in
+/// [`resolve_schedule_choice`]; this type is factored out so all four branches
+/// are unit-testable without a terminal, exactly as `secret.rs`'s
+/// `overwrite_decision` is.
+#[derive(Debug, PartialEq, Eq)]
+enum ScheduleChoice {
+    /// Nothing to decide: the replayed block carries no enabled schedule.
+    NothingToInherit,
+    /// Replay it enabled — `--keep-backup-schedule`.
+    Inherit,
+    /// Replay it switched off — `--discard-backup-schedule`.
+    Disable,
+    /// Ask on the terminal before applying anything.
+    Prompt,
+    /// No terminal and no flag: refuse, naming both flags.
+    ErrorNonInteractive,
+}
+
+/// Decide what a restore does with the backup schedule it is about to replay.
+/// Pure: takes whether the captured block is enabled, the two flags and the TTY
+/// state, and returns the action.
+///
+/// There are THREE restore paths and inheriting is right in two of them: a new
+/// cluster that should not touch the old destination (off), a move to a bigger
+/// machine whose old cluster is retired shortly after (on), and re-provisioning
+/// a target whose cluster died (on). Nothing in the artifact distinguishes
+/// them. The tempting heuristic — "are there snapshots from this cluster newer
+/// than the one being restored, so the source kept writing?" — fails in the
+/// unsafe direction on the ordinary move flow, which takes a backup and
+/// restores it immediately: no newer snapshot exists and the source is very
+/// much alive. So the tool does not guess; it asks, and without a terminal to
+/// ask on it stops instead of picking a side.
+///
+/// `keep` and `discard` are mutually exclusive at the clap layer
+/// (`conflicts_with`), so both-at-once cannot reach here from the CLI; should
+/// another caller pass both, `discard` wins because it is the reversible half.
+fn schedule_decision(enabled: bool, keep: bool, discard: bool, is_tty: bool) -> ScheduleChoice {
+    if !enabled {
+        return ScheduleChoice::NothingToInherit;
+    }
+    if discard {
+        return ScheduleChoice::Disable;
+    }
+    if keep {
+        return ScheduleChoice::Inherit;
+    }
+    if is_tty {
+        ScheduleChoice::Prompt
+    } else {
+        ScheduleChoice::ErrorNonInteractive
+    }
+}
+
+/// The flags and terminal state the schedule question is answered from,
+/// carried from the command entry point down to the step that applies the CR.
+#[derive(Clone, Copy, Debug)]
+struct ScheduleFlags {
+    keep: bool,
+    discard: bool,
+    is_tty: bool,
+}
+
+/// How the repository the inherited schedule points at is named to the
+/// operator. Pure.
+///
+/// The bucket is the whole point of the question — "shall this cluster write
+/// there" is unanswerable without knowing where "there" is — so it is quoted
+/// verbatim from the captured CR. A block with no bucket is a misconfigured
+/// source rather than a normal one, and the fallback keeps the sentence
+/// readable instead of printing an empty pair of quotes.
+fn inherited_repo_label(platformstack: &Value) -> String {
+    match platformstack
+        .pointer("/spec/backup/bucket")
+        .and_then(Value::as_str)
+        .filter(|b| !b.is_empty())
+    {
+        Some(b) => format!("'{b}'"),
+        None => "the source's repository (the captured block names no bucket)".to_string(),
+    }
+}
+
+/// What the terminal prompt says before the schedule is applied. Pure, so the
+/// consequence an operator is asked to accept is pinned by a test.
+///
+/// Names the repository and says what two live writers means, because that is
+/// the only part of this an operator cannot reconstruct from the summary
+/// afterwards — by then the CronJob is already reconciled.
+fn schedule_prompt_text(platformstack: &Value) -> String {
+    let repo = inherited_repo_label(platformstack);
+    let backup = platformstack.pointer("/spec/backup");
+    let when = backup
+        .and_then(|b| b.pointer("/schedule"))
+        .and_then(Value::as_str)
+        .unwrap_or("(no schedule recorded)");
+    let zone = backup
+        .and_then(|b| b.pointer("/timeZone"))
+        .and_then(Value::as_str)
+        .unwrap_or("UTC");
+    format!(
+        "This backup carries the source cluster's backup schedule, and it is ENABLED.\n  \
+         repository: {repo}\n  \
+         schedule:   {when} ({zone})\n\
+         Inheriting it makes THIS cluster back up to that repository on that schedule. If the \
+         source cluster is still running and still backing up, both clusters will then be \
+         writing to the one repository: they are told apart by identity, but they share its \
+         retention, and a prune run by either can remove the other's snapshots.\n\
+         Answer no to restore the block exactly as captured but switched off — bucket, \
+         credential, schedule, timezone and retention are kept, and `apprafter backup set \
+         enabled true` turns it on later."
+    )
+}
+
+/// What a non-interactive restore is told when it did not answer the question.
+/// Pure.
+///
+/// It names both flags and what each one means, because the operator reading
+/// this is reading it out of a CI log with no terminal to explain it: a
+/// scripted restore that silently redirected a live cluster's backups would be
+/// far worse than one that stops here.
+fn non_interactive_schedule_error(platformstack: &Value) -> CliError {
+    let repo = inherited_repo_label(platformstack);
+    CliError::Other(format!(
+        "this restore would inherit the source cluster's backup schedule, pointed at {repo}, and \
+         there is no terminal to ask on. Re-run with exactly one of:\n  \
+         --keep-backup-schedule     — inherit it ENABLED: this cluster becomes that repository's \
+         writer (disaster recovery, or a move whose old cluster is being retired).\n  \
+         --discard-backup-schedule  — replay the block exactly as captured but switched off; \
+         `apprafter backup set enabled true` turns it on later.\n\
+         Neither can be chosen for you: if the source cluster is still running, inheriting \
+         silently puts two clusters on one repository."
+    ))
+}
+
+/// Answer the schedule question — the thin impure half of
+/// [`schedule_decision`]. Returns whether to replay the block ENABLED.
+///
+/// Called from `ApplyPlatformStack`, which is the first moment the captured
+/// `spec.backup` is readable and the last moment before it is applied.
+fn resolve_schedule_choice(platformstack: &Value, flags: ScheduleFlags) -> Result<bool> {
+    let enabled = platformstack
+        .pointer("/spec/backup/enabled")
+        .and_then(Value::as_bool)
+        == Some(true);
+    match schedule_decision(enabled, flags.keep, flags.discard, flags.is_tty) {
+        ScheduleChoice::NothingToInherit => Ok(false),
+        ScheduleChoice::Inherit => Ok(true),
+        ScheduleChoice::Disable => Ok(false),
+        ScheduleChoice::Prompt => {
+            println!("{}", schedule_prompt_text(platformstack));
+            inquire::Confirm::new("Inherit the source's backup schedule?")
+                .with_default(false)
+                .prompt()
+                .map_err(|e| CliError::Other(format!("backup-schedule prompt: {e}")))
+        }
+        ScheduleChoice::ErrorNonInteractive => Err(non_interactive_schedule_error(platformstack)),
+    }
 }
 
 /// Apply the replayed-schedule policy to a captured `PlatformStack` CR, and
@@ -1288,9 +1460,10 @@ enum BackupSchedule {
 /// a one-word `apprafter backup enable` rather than a re-entry of bucket,
 /// credential, retention, timezone and schedule.
 ///
-/// `keep == true` returns the CR untouched: in DR the inheritance is the point.
-/// A backup that was not enabled at capture time is [`NotInherited`] in both
-/// directions — there is no schedule to disable and none to keep.
+/// `keep == true` returns the CR untouched: when the answer was "inherit", the
+/// inheritance is the point. A backup that was not enabled at capture time is
+/// [`NotInherited`] in both directions — there is no schedule to disable and
+/// none to keep.
 ///
 /// [`NotInherited`]: BackupSchedule::NotInherited
 fn apply_backup_schedule_policy(platformstack: &Value, keep: bool) -> (Value, BackupSchedule) {
@@ -1311,7 +1484,7 @@ fn apply_backup_schedule_policy(platformstack: &Value, keep: bool) -> (Value, Ba
     {
         backup.insert("enabled".to_string(), Value::Bool(false));
     }
-    (out, BackupSchedule::DisabledByDefault)
+    (out, BackupSchedule::Disabled)
 }
 
 /// The backup cluster-name this restore just replayed onto the target, when
@@ -3307,20 +3480,20 @@ mod tests {
         })
     }
 
-    /// FIRES: by default the replayed schedule is forced off. Without this the
+    /// FIRES: a "no" answer forces the replayed schedule off. Without this the
     /// restored cluster starts writing to the SOURCE's repository on the
     /// source's schedule, with the source possibly still alive and writing to
     /// it too (`moving-to-a-bigger-machine`, Route B).
     #[test]
-    fn a_replayed_backup_schedule_is_disabled_by_default() {
+    fn a_declined_backup_schedule_is_replayed_switched_off() {
         let (cr, schedule) = apply_backup_schedule_policy(&captured_with_backup(true), false);
-        assert_eq!(schedule, BackupSchedule::DisabledByDefault);
+        assert_eq!(schedule, BackupSchedule::Disabled);
         assert_eq!(cr["spec"]["backup"]["enabled"], serde_json::json!(false));
     }
 
-    /// DOES NOT FIRE: `--keep-backup-schedule` inherits it enabled. This is
-    /// the disaster-recovery case the default must not take away — the source
-    /// is gone and the clone is legitimately the repository's new writer.
+    /// DOES NOT FIRE: a "yes" answer inherits it enabled. This is the
+    /// disaster-recovery case — the source is gone and the clone is
+    /// legitimately the repository's new writer.
     #[test]
     fn keep_backup_schedule_inherits_the_source_schedule_enabled() {
         let captured = captured_with_backup(true);
@@ -3360,9 +3533,9 @@ mod tests {
         assert_eq!(cr["metadata"], captured["metadata"]);
     }
 
-    /// The payload that actually reaches the apiserver carries the decision.
+    /// The payload that actually reaches the apiserver carries the answer.
     ///
-    /// FIRES on the default; the `--keep-backup-schedule` half below is what
+    /// FIRES on the declining half; the inheriting half below is what
     /// stops this passing on a payload builder that hard-codes `false`. The
     /// pair exists because the policy being right is not the same claim as the
     /// bytes being right — an `apply` of the CAPTURED CR next to a correct
@@ -3370,9 +3543,14 @@ mod tests {
     #[test]
     fn the_applied_payload_carries_the_schedule_decision() {
         let captured = captured_with_backup(true);
+        let flags = |keep, discard| ScheduleFlags {
+            keep,
+            discard,
+            is_tty: false,
+        };
 
-        let (yaml, schedule) = platformstack_apply_payload(&captured, false).unwrap();
-        assert_eq!(schedule, BackupSchedule::DisabledByDefault);
+        let (yaml, schedule) = platformstack_apply_payload(&captured, flags(false, true)).unwrap();
+        assert_eq!(schedule, BackupSchedule::Disabled);
         let sent: Value = serde_json::from_str(&yaml).expect("the payload is JSON (valid YAML)");
         assert_eq!(sent["spec"]["backup"]["enabled"], serde_json::json!(false));
         assert_eq!(
@@ -3380,11 +3558,47 @@ mod tests {
             "the rest of the block still goes to the cluster"
         );
 
-        let (yaml, schedule) = platformstack_apply_payload(&captured, true).unwrap();
+        let (yaml, schedule) = platformstack_apply_payload(&captured, flags(true, false)).unwrap();
         assert_eq!(schedule, BackupSchedule::KeptEnabled);
         let sent: Value = serde_json::from_str(&yaml).unwrap();
         assert_eq!(sent["spec"]["backup"]["enabled"], serde_json::json!(true));
-        assert_eq!(sent, captured, "the flag replays the CR verbatim");
+        assert_eq!(sent, captured, "inheriting replays the CR verbatim");
+    }
+
+    /// …and an UNANSWERED question yields no payload at all.
+    ///
+    /// This is the one that stops the refusal being decided correctly and then
+    /// ignored: `ApplyPlatformStack` has nothing to send when this errors, so
+    /// a non-interactive restore cannot reach the apiserver with either answer
+    /// it did not give. The `--data-only` half is the same claim from the
+    /// other side — that mode never calls this at all (see
+    /// `every_mode_that_replays_the_platformstack_goes_through_the_policy`).
+    #[test]
+    fn an_unanswered_schedule_question_produces_no_payload() {
+        let err = platformstack_apply_payload(
+            &captured_with_backup(true),
+            ScheduleFlags {
+                keep: false,
+                discard: false,
+                is_tty: false,
+            },
+        )
+        .expect_err("there is nothing safe to apply until the question is answered");
+        assert!(err.to_string().contains("--keep-backup-schedule"), "{err}");
+
+        // …while a backup that never had a schedule still builds one, because
+        // there was never a question to answer.
+        let (yaml, schedule) = platformstack_apply_payload(
+            &captured_with_backup(false),
+            ScheduleFlags {
+                keep: false,
+                discard: false,
+                is_tty: false,
+            },
+        )
+        .expect("no enabled schedule, no question, no refusal");
+        assert_eq!(schedule, BackupSchedule::NotInherited);
+        assert!(yaml.contains("\"enabled\":false"), "{yaml}");
     }
 
     /// A backup that was already off, or absent, is not an inheritance — in
@@ -3404,9 +3618,10 @@ mod tests {
         }
     }
 
-    /// FIRES: the default is announced. A schedule silently switched off is
-    /// the same class of surprise as one silently switched on — an operator
-    /// who believes the clone is backing itself up has an unbacked cluster.
+    /// FIRES: a declined schedule is announced. A schedule silently switched
+    /// off is the same class of surprise as one silently switched on — an
+    /// operator who believes the clone is backing itself up has an unbacked
+    /// cluster.
     #[test]
     fn the_summary_says_the_schedule_was_restored_disabled() {
         let m = manifest_of(&["demo"], vec![]);
@@ -3417,7 +3632,7 @@ mod tests {
             1,
             None,
             Some("prod"),
-            BackupSchedule::DisabledByDefault,
+            BackupSchedule::Disabled,
             &EdgeRestore::default(),
         )
         .join("\n");
@@ -3439,11 +3654,13 @@ mod tests {
         );
     }
 
-    /// DOES NOT FIRE THE SAME WAY: with the flag, the summary says the
-    /// opposite thing. A silent `--keep-backup-schedule` is as surprising as
-    /// the silent inheritance the default replaced.
+    /// DOES NOT FIRE THE SAME WAY: when the answer was "inherit", the summary
+    /// says the opposite thing. A silent inheritance is exactly what the
+    /// question exists to stop, and an answered one is no less worth recording
+    /// — including the consequence, which is what the operator was warned
+    /// about at the prompt and has to recognise here.
     #[test]
-    fn the_summary_says_the_schedule_was_kept_when_the_flag_was_passed() {
+    fn the_summary_says_the_schedule_was_kept_when_it_was_inherited() {
         let m = manifest_of(&["demo"], vec![]);
         let joined = restore_summary(
             Some(&m),
@@ -3457,7 +3674,14 @@ mod tests {
         )
         .join("\n");
         assert!(joined.contains("ENABLED"), "{joined}");
-        assert!(joined.contains("--keep-backup-schedule"), "{joined}");
+        assert!(
+            joined.contains("as you asked"),
+            "an inheritance is only acceptable because it was answered for: {joined}"
+        );
+        assert!(
+            joined.contains("both are now writing to that one repository"),
+            "names the two-writer consequence: {joined}"
+        );
         assert!(
             joined.contains("apprafter backup disable"),
             "names the way back off: {joined}"
@@ -3493,10 +3717,155 @@ mod tests {
         assert!(!joined.contains("DISABLED"), "{joined}");
     }
 
-    /// D2: the default covers `--data-only` by exclusion and both replaying
-    /// modes by inclusion. `ApplyPlatformStack` is what carries `spec.backup`,
-    /// and `Reprovision` only PREPENDS a step — so restore-into-running is
-    /// exposed to exactly the same inheritance as a rebuild.
+    /// FIRES on all four combinations of (flag given / not) × (TTY / not),
+    /// which is the whole decision. The interesting cell is the last one: a
+    /// non-interactive restore with no flag must REFUSE rather than pick a
+    /// side, because the side it would pick silently is the one that redirects
+    /// a live cluster's backups.
+    #[test]
+    fn the_schedule_decision_covers_flags_times_tty() {
+        // No flag.
+        assert_eq!(
+            schedule_decision(true, false, false, true),
+            ScheduleChoice::Prompt
+        );
+        assert_eq!(
+            schedule_decision(true, false, false, false),
+            ScheduleChoice::ErrorNonInteractive
+        );
+        // A flag — the answer is already given, so neither branch asks, on a
+        // terminal or off one.
+        for tty in [true, false] {
+            assert_eq!(
+                schedule_decision(true, true, false, tty),
+                ScheduleChoice::Inherit,
+                "tty={tty}"
+            );
+            assert_eq!(
+                schedule_decision(true, false, true, tty),
+                ScheduleChoice::Disable,
+                "tty={tty}"
+            );
+        }
+    }
+
+    /// DOES NOT FIRE: a backup with no enabled schedule asks nothing, refuses
+    /// nothing, and says nothing — on a terminal or off one, with or without a
+    /// flag. Most clusters have never configured a backup, and a restore that
+    /// interrogated them about a schedule that does not exist would be a
+    /// question with no right answer.
+    #[test]
+    fn a_backup_with_no_enabled_schedule_is_never_asked_about() {
+        for (keep, discard, tty) in [
+            (false, false, true),
+            (false, false, false),
+            (true, false, false),
+            (false, true, true),
+        ] {
+            assert_eq!(
+                schedule_decision(false, keep, discard, tty),
+                ScheduleChoice::NothingToInherit,
+                "keep={keep} discard={discard} tty={tty}"
+            );
+        }
+    }
+
+    /// Both flags at once cannot come from the CLI (clap `conflicts_with`),
+    /// and if it ever did, the reversible half wins. Pinned so a later
+    /// re-ordering of the branches cannot silently make "keep" the tiebreak.
+    #[test]
+    fn both_flags_at_once_resolve_to_the_reversible_half() {
+        assert_eq!(
+            schedule_decision(true, true, true, false),
+            ScheduleChoice::Disable
+        );
+    }
+
+    /// The prompt has to state the consequence CONCRETELY: which repository,
+    /// and what happens if the source cluster is still alive. An operator
+    /// answering "is this the DR case or the move case" needs the bucket in
+    /// front of them — it is the one fact that distinguishes the two.
+    #[test]
+    fn the_prompt_names_the_repository_and_the_two_writer_consequence() {
+        let text = schedule_prompt_text(&captured_with_backup(true));
+        assert!(
+            text.contains("'s3:https://nbg1.your-objectstorage.com/prod-backups'"),
+            "{text}"
+        );
+        assert!(text.contains("0 3 * * *"), "{text}");
+        assert!(text.contains("Europe/Berlin"), "{text}");
+        assert!(
+            text.contains("still running") && text.contains("both clusters"),
+            "the prompt must name what two live writers means: {text}"
+        );
+        assert!(
+            text.contains("apprafter backup set enabled true"),
+            "and what answering no leaves behind: {text}"
+        );
+    }
+
+    /// A source that recorded no bucket still produces a readable question
+    /// rather than an empty pair of quotes.
+    #[test]
+    fn the_prompt_survives_a_backup_block_with_no_bucket() {
+        let bare = serde_json::json!({"spec": {"backup": {"enabled": true}}});
+        let text = schedule_prompt_text(&bare);
+        assert!(text.contains("the source's repository"), "{text}");
+        assert!(!text.contains("''"), "{text}");
+    }
+
+    /// The wrapper the apply path actually calls turns each decision into the
+    /// answer `apply_backup_schedule_policy` consumes — and turns the refusal
+    /// into an ERROR rather than a quiet `false`. Every branch except `Prompt`,
+    /// which needs a terminal; a decision function that is right next to a
+    /// caller that swallowed it would be the defect back with the four
+    /// combinations above still green.
+    #[test]
+    fn resolve_schedule_choice_answers_every_branch_it_can_without_a_terminal() {
+        let enabled = captured_with_backup(true);
+        let off = captured_with_backup(false);
+        let flags = |keep, discard, is_tty| ScheduleFlags {
+            keep,
+            discard,
+            is_tty,
+        };
+
+        assert!(resolve_schedule_choice(&enabled, flags(true, false, false)).unwrap());
+        assert!(!resolve_schedule_choice(&enabled, flags(false, true, false)).unwrap());
+        assert!(!resolve_schedule_choice(&off, flags(false, false, true)).unwrap());
+
+        let err = resolve_schedule_choice(&enabled, flags(false, false, false))
+            .expect_err("no terminal and no flag must STOP the restore, not pick a side");
+        assert!(
+            err.to_string().contains("--discard-backup-schedule"),
+            "{err}"
+        );
+    }
+
+    /// The refusal names BOTH flags and what each does. It is read out of a CI
+    /// log by someone with no terminal to experiment on, so "pass a flag" is
+    /// not enough — which flag, and what it means, has to be in the message.
+    #[test]
+    fn the_non_interactive_refusal_names_both_flags_and_the_repository() {
+        let err = non_interactive_schedule_error(&captured_with_backup(true)).to_string();
+        assert!(err.contains("--keep-backup-schedule"), "{err}");
+        assert!(err.contains("--discard-backup-schedule"), "{err}");
+        assert!(
+            err.contains("'s3:https://nbg1.your-objectstorage.com/prod-backups'"),
+            "{err}"
+        );
+        assert!(
+            err.contains("two clusters on one repository"),
+            "says why it will not guess: {err}"
+        );
+    }
+
+    /// D2: the question covers `--data-only` by exclusion and both replaying
+    /// modes by inclusion. `ApplyPlatformStack` is what carries `spec.backup`
+    /// AND the only step that asks, and `Reprovision` only PREPENDS a step —
+    /// so restore-into-running is exposed to exactly the same inheritance as a
+    /// rebuild, and `--data-only` neither prompts nor refuses because it never
+    /// reaches the step that would.
     #[test]
     fn every_mode_that_replays_the_platformstack_goes_through_the_policy() {
         for mode in [RestoreMode::IntoRunning, RestoreMode::Reprovision] {
@@ -3707,7 +4076,7 @@ mod tests {
             1,
             None,
             Some("prod"),
-            BackupSchedule::DisabledByDefault,
+            BackupSchedule::Disabled,
             &edge,
         )
         .join("\n");

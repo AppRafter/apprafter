@@ -395,21 +395,33 @@ pub enum Commands {
         /// Restore the source's backup schedule already ENABLED.
         ///
         /// A restore replays the whole `spec.backup` block — bucket,
-        /// credential, schedule, timezone, retention — so without this
-        /// flag the restored cluster would begin backing up to the
-        /// SOURCE's repository on its own. By default the block is
-        /// restored exactly as captured but left disabled, and
-        /// `apprafter backup enable` turns it on unchanged.
+        /// credential, schedule, timezone, retention — so the restored
+        /// cluster can begin backing up to the SOURCE's repository. When
+        /// the replayed block is enabled and neither this flag nor
+        /// `--discard-backup-schedule` is given, `restore` ASKS on a
+        /// terminal and refuses to guess without one.
         ///
-        /// Pass this in disaster recovery, where the source is gone and
-        /// the restored cluster is legitimately the repository's new
-        /// writer. Do NOT pass it while the source cluster is still
-        /// running (see the "moving to a bigger machine" runbook), where
-        /// it would put two live clusters on one schedule.
+        /// Pass this when the restored cluster should be the repository's
+        /// writer: disaster recovery, where the source is gone, or a move
+        /// to a bigger machine whose old cluster you are about to retire.
+        /// While the source is still running and still backing up, this
+        /// puts two live clusters on one repository.
         ///
         /// Has no effect with `--data-only`, which replays no CRs.
         #[arg(long, default_value_t = false)]
         keep_backup_schedule: bool,
+        /// Restore the source's backup schedule switched OFF.
+        ///
+        /// The counterpart of `--keep-backup-schedule`, and the answer
+        /// for a scripted restore that must not touch the source's
+        /// repository. The block is replayed exactly as captured —
+        /// bucket, credential, schedule, timezone, retention — with
+        /// `enabled` forced to false, so `apprafter backup set enabled
+        /// true` turns it on later without re-entering any of it.
+        ///
+        /// Has no effect with `--data-only`, which replays no CRs.
+        #[arg(long, default_value_t = false, conflicts_with = "keep_backup_schedule")]
+        discard_backup_schedule: bool,
     },
     /// Print a shell completion script on stdout.
     ///

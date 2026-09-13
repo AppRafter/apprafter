@@ -2890,6 +2890,18 @@
           "help": "Replay only native data (pg + volumes); skip CR + secret replay. Useful when the cluster is already configured"
         },
         {
+          "id": "discard_backup_schedule",
+          "long": "discard-backup-schedule",
+          "short": null,
+          "takes_value": false,
+          "value_name": "DISCARD_BACKUP_SCHEDULE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Restore the source's backup schedule switched OFF"
+        },
+        {
           "id": "keep_backup_schedule",
           "long": "keep-backup-schedule",
           "short": null,

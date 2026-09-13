@@ -123,9 +123,10 @@ apprafter backup set enabled true # back on, unchanged
 ```
 
 Two things leave a cluster holding a complete, correct, switched-off backup
-configuration: `backup disable`, and a `restore`, which replays the source
-cluster's whole block and leaves it disabled unless you passed
-`--keep-backup-schedule` ([why](restore.md#the-backup-schedule-comes-with-the-restore-switched-off)).
+configuration: `backup disable`, and a `restore` that was told not to inherit
+the source's schedule — with `--discard-backup-schedule`, or by answering no
+when it asked
+([why](restore.md#the-backup-schedule-comes-with-the-restore-and-you-are-asked-about-it)).
 `backup set enabled true` is the way back in both cases. Re-running `backup
 enable` is not: it composes the whole block from its flags, so it would reset
 the schedule, timezone, retention and staging mode you were trying to keep.

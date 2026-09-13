@@ -55,24 +55,33 @@ Five behaviours are load-bearing:
   `volumeClaimRef` is set; on a `WaitForFirstConsumer` StorageClass the PVC
   only binds when its first consumer pod schedules — and the restore's own
   load helper is that first consumer. Waiting for `Bound` would deadlock.
-- **The replayed backup schedule arrives switched off.** `ApplyPlatformStack`
-  replays the captured `PlatformStack`, and `spec.backup` is part of it — the
-  bucket, the credential reference, the schedule, the timezone, the retention
-  counts and `enforce`. The operator projects that block straight into the
-  platform chart's values, so the restored cluster would begin backing up to the
-  **source's** repository on its own. The restore therefore sets
-  `spec.backup.enabled: false` on the CR it applies, and says so in its summary;
-  everything else in the block is replayed exactly as captured, so
-  `apprafter backup set enabled true` turns it back on unchanged.
-  `--keep-backup-schedule`
-  inherits it already enabled, which is what disaster recovery wants — there the
-  source is gone and the restored cluster is legitimately the repository's new
-  writer. The default is for the other shape, [moving to a bigger
-  machine](../operator-guide/moving-to-a-bigger-machine.md) Route B, where both
-  clusters are alive at once; nothing in the restore path can tell the two apart,
-  so the reversible half is the default. This applies to every mode that replays
-  the CR — `--reprovision` only prepends a provisioning step — and not to
-  `--data-only`, which replays no CRs at all.
+- **The replayed backup schedule is a question, asked before it is applied.**
+  `ApplyPlatformStack` replays the captured `PlatformStack`, and `spec.backup`
+  is part of it — the bucket, the credential reference, the schedule, the
+  timezone, the retention counts and `enforce`. The operator projects that block
+  straight into the platform chart's values, so a restored cluster that inherits
+  it begins backing up to the **source's** repository on its own. That is
+  correct in two of the three restores — [disaster
+  recovery](../operator-guide/restore.md), and [moving to a bigger
+  machine](../operator-guide/moving-to-a-bigger-machine.md) once the old cluster
+  is retired — and wrong for a second cluster that should leave the old
+  destination alone. Nothing in the artifact distinguishes them, so when the
+  replayed block is enabled the restore asks, naming the repository and what two
+  live writers would mean. `--keep-backup-schedule` and
+  `--discard-backup-schedule` answer it up front; a run with no terminal and no
+  flag stops rather than pick a side. A discarded schedule is replayed exactly
+  as captured with `spec.backup.enabled: false`, so `apprafter backup set
+  enabled true` turns it on unchanged. The summary states the answer either way.
+  This applies to every mode that replays the CR — `--reprovision` only prepends
+  a provisioning step — and not to `--data-only`, which replays no CRs at all
+  and so is never asked.
+
+  The tempting shortcut is to detect the dangerous case instead of asking: look
+  in the repository for snapshots newer than the one being restored, and treat
+  them as proof the source kept writing. It fails in the unsafe direction on the
+  most ordinary flow there is — take a backup now, restore it into the new
+  machine immediately. No newer snapshot exists, and the source is very much
+  alive.
 - **The origin firewall is reconciled from the CR, one step late by
   construction.** The Cloudflare origin firewall is a cloud object, not a
   Kubernetes one: it is reconciled against the provider API from the target on

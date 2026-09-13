@@ -612,16 +612,19 @@ phase "Phase 9: apprafter restore <s3:> --reprovision --target $BR_TARGET (clone
 { set +x; } 2>/dev/null
 restore_log="${TMPDIR_WORK}/restore.log"
 apprafter restore "$S3_REPO" --reprovision --target "$BR_TARGET" \
-    --credential-file "$CRED_FILE" \
+    --credential-file "$CRED_FILE" --discard-backup-schedule \
     > "$restore_log" 2>&1 || { printf 'FAILED: restore --reprovision returned non-zero:\n'; sed 's/^/    /' "$restore_log" >&2; exit 1; }
 # BR_CREATED stays 1 — a FRESH cluster now exists in the target; teardown destroys it.
 grep -qE 'provisioning a fresh cluster' "$restore_log" || { printf 'FAILED: restore did not run the reprovision step\n'; sed 's/^/    /' "$restore_log" >&2; exit 1; }
 grep -qE 'Restored backup' "$restore_log" || { printf 'FAILED: restore did not report completion\n'; sed 's/^/    /' "$restore_log" >&2; exit 1; }
 # D1: the source's whole `spec.backup` migrates with the CR, so a restore that
 # left it enabled would point a second cluster at this repository on the
-# source's schedule. The default replays the block DISABLED and says so; the
-# assertion on the CR itself is two phases down. No `--keep-backup-schedule`
-# here on purpose — the default is what a nightly must keep proving.
+# source's schedule. The restore ASKS which of those is wanted, and a
+# non-interactive run has to answer with a flag or it stops — so this walk
+# answers `--discard-backup-schedule` and asserts the block came back complete
+# but switched off (the CR assertion is two phases down). Not
+# `--keep-backup-schedule`: the disabling half is the one whose blast radius is
+# a live source cluster, so it is the one a nightly must keep proving.
 grep -qE 'backup schedule came with the restore and was left DISABLED' "$restore_log" \
     || { printf 'FAILED: restore did not report what it did with the replayed backup schedule (D1)\n'; sed 's/^/    /' "$restore_log" >&2; exit 1; }
 printf '  ok: restore --reprovision provisioned a fresh cluster + replayed from the S3 repo\n'

@@ -276,15 +276,23 @@ criterion turned up, in the same spirit and by the same route.
   cluster up "until you are satisfied with the new one", which is two live
   clusters carrying one backup configuration.
 
-  The block is now replayed **exactly as captured but with `enabled` forced to
-  `false`**, and the summary says so — in both directions, because a silent
-  `--keep-backup-schedule` would be as surprising as the silent inheritance it
-  replaced. Only `enabled` is touched, so turning it back on is `apprafter
-  backup set enabled true` and not a re-entry of the bucket, the retention and
-  the schedule. `--data-only` was never affected and still is not: it replays no
-  custom resources at all. Nothing was added that takes a backup right after a
-  restore, and nothing should be — the first write of a restored cluster stays a
-  deliberate act.
+  The restore now **asks**, and the summary states the answer — in both
+  directions, because a silent inheritance and a silent discard are equally
+  surprising. There are three restores and inheriting is right in two of them (a
+  second cluster that must not touch the old destination; a move to a bigger
+  machine whose old cluster is retired shortly after; a target re-provisioned
+  after its cluster died), and nothing in the artifact tells them apart — the
+  tempting heuristic, "is there a snapshot newer than the one being restored",
+  fails in the unsafe direction on the ordinary move flow, which backs up and
+  restores immediately. `--keep-backup-schedule` and `--discard-backup-schedule`
+  answer up front; a terminal is prompted, naming the repository and what two
+  live writers means; a run with neither flag and no terminal **stops**, naming
+  both. When the answer is discard, only `enabled` is touched, so turning it back
+  on is `apprafter backup set enabled true` and not a re-entry of the bucket, the
+  retention and the schedule. `--data-only` was never affected and still is not:
+  it replays no custom resources at all, so it is never asked. Nothing was added
+  that takes a backup right after a restore, and nothing should be — the first
+  write of a restored cluster stays a deliberate act.
 
 - **`apprafter backup prune` has an offline form again, with an explicit
   identity.** This revises the sentence above: prune needs an identity, not
@@ -330,11 +338,12 @@ criterion turned up, in the same spirit and by the same route.
   The nightly runner's ClusterRole gains `get` on the single `kube-system`
   namespace, which is what lets it read the identity at all.
 
-- **`apprafter restore --keep-backup-schedule`** — inherit the source's backup
-  schedule already enabled, instead of the new default of replaying it disabled.
-  Pass it in disaster recovery, where the source is gone and the restored
-  cluster is legitimately the repository's new writer. Do not pass it while the
-  source is still running.
+- **`apprafter restore --keep-backup-schedule` / `--discard-backup-schedule`** —
+  the two answers to the question above, given up front. Keep it when the
+  restored cluster is the repository's writer (the source is gone, or is about
+  to be); discard it when the source is still running and still owns the
+  repository. Either flag skips the prompt, and a non-interactive restore of a
+  backup carrying an enabled schedule must pass one of them.
 
 - **`apprafter backup prune --cluster-uid <uid>`** — prune the snapshots of the
   cluster with that `kube-system` namespace UID, for a repository whose cluster

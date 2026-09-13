@@ -90,13 +90,14 @@ apprafter restore <repo> --reprovision --server-type <sku> \
     --keep-backup-schedule                                  # rebuild, then replay
 ```
 
-`--keep-backup-schedule` is right on this route and only on this route. A
-restore replays the source's whole backup configuration and, by default, leaves
-it switched off — because a restored cluster is usually a *second* cluster and
-must not start writing into a repository its source may still be using. Here the
-source machine is already gone, there is one cluster at the end, and it is the
-repository's rightful writer; the flag says so. Route B is the opposite case and
-takes the default.
+`--keep-backup-schedule` answers a question the restore would otherwise ask. A
+restore replays the source's whole backup configuration, and whether the new
+cluster should inherit its schedule depends on something no snapshot records —
+so when the replayed block is enabled, `restore` asks on a terminal and refuses
+to guess without one. Here the answer is yes: the source machine is already
+gone, there is one cluster at the end, and it is the repository's rightful
+writer. Route B is the case where the answer is no, until the old cluster is
+retired.
 
 `apprafter destroy` clears the recorded cluster, which is what makes
 `apprafter target machine` available again — it is the same "target with
@@ -138,20 +139,22 @@ Create the project in the Hetzner Cloud Console, issue an API token in it
 ```sh
 apprafter backup create
 apprafter target add <new-name> --provider hetzner-cloud --token <new-project-token> --region <region> --server-type <sku>
-apprafter restore <repo> --reprovision --target <new-name> --server-type <sku>
+apprafter restore <repo> --reprovision --target <new-name> --server-type <sku> \
+    --discard-backup-schedule
 ```
 
 The restore replays the old cluster's whole backup configuration onto the new
-one — that is what makes this route the case the default guards against, and the
-default is why nothing surprising happens here.
+one — this is the route where inheriting it is the wrong answer, and
+`--discard-backup-schedule` is that answer given up front. Without it (or its
+opposite) the restore asks, and a non-interactive run stops.
 
 **The new cluster's backup schedule arrives switched off.** The bucket, the
 credential, the schedule, the timezone and the retention counts all come across
-exactly as captured, but `enabled` is forced to `false` and the restore summary
-says so. Left on, the new cluster would begin writing to the same repository as
-the old one from its first night, while the old one is still running and before
-you have decided the move worked. Do **not** pass `--keep-backup-schedule` on
-this route; it exists for disaster recovery, where the source is gone.
+exactly as captured, but `enabled` is `false` and the restore summary says so.
+Left on, the new cluster would begin writing to the same repository as the old
+one from its first night, while the old one is still running and before you have
+decided the move worked. Do **not** pass `--keep-backup-schedule` on this route
+until the old cluster is gone.
 
 Turn the new cluster's schedule on when you are satisfied with it — a good
 moment is just before you move DNS:
@@ -300,12 +303,12 @@ is down, neither could a real recovery.
 
 Scheduled backup survives the move. `PlatformStack.spec.backup` is part of the
 captured configuration, so the rebuilt cluster comes back with the same bucket,
-schedule and retention — but a restore leaves that block **switched off** unless
-you say otherwise, because a restored cluster is usually a second cluster and
-must not start writing into a repository its source may still be using. On this
-route the source machine is gone, so `--keep-backup-schedule` above is what
-brings the schedule back enabled, and `apprafter backup status` reports it
-without you re-running `apprafter backup enable`. Leave the flag off and the
+schedule and retention — but whether that block comes back **enabled** is asked,
+not assumed, because a restored cluster is often a second cluster and must not
+start writing into a repository its source may still be using. On this route the
+source machine is gone, so `--keep-backup-schedule` above answers yes, and
+`apprafter backup status` reports the schedule without you re-running `apprafter
+backup enable`. Answer no instead (`--discard-backup-schedule`) and the
 configuration is still all there — `apprafter backup set enabled true` turns it
 on whenever you are ready.
 

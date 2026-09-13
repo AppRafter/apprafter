@@ -938,7 +938,15 @@ elif ( set -e; k3d_up "$DST_CLUSTER" ); then
         # host-side `apprafter restore` shells to `restic` on the HOST with the
         # HOST endpoint (the port-forward to the source's MinIO), so no
         # cross-cluster networking is needed. Restore into `fresh`.
-        if apprafter restore "$RESTIC_REPO_HOST" --target fresh --credential-file "$CRED_FILE"; then
+        # `--discard-backup-schedule` is REQUIRED here, not decoration: the
+        # source cluster enabled a schedule in phase 4, that block replays with
+        # the PlatformStack, and a non-interactive restore refuses to guess
+        # whether the clone should inherit it. Discard is the right answer on
+        # this walk — the source cluster is still up and still owns the
+        # repository. Without the flag the restore fails and the branch below
+        # would file it as a resource limit.
+        if apprafter restore "$RESTIC_REPO_HOST" --target fresh --credential-file "$CRED_FILE" \
+            --discard-backup-schedule; then
             TWO_CLUSTER_OK=1
             printf '  ok: restore into the fresh cluster returned success\n'
         else

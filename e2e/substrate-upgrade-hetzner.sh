@@ -1116,7 +1116,14 @@ fi
 phase "Phase 6: apprafter restore <repo> --reprovision --server-type $SKU_BIG --target $TARGET"
 { set +x; } 2>/dev/null
 restore_log="${TMPDIR_WORK}/restore.log"
-restore_args=( "$RESTORE_REPO" --reprovision --server-type "$SKU_BIG" --target "$TARGET" )
+# `--keep-backup-schedule` answers the question the restore asks when the
+# replayed `spec.backup` is enabled (leg B enables one in phase 4). It is the
+# right answer HERE and the reason is phase 5: the old box is destroyed before
+# this runs, so the cluster this restore builds is the repository's only
+# writer. A non-interactive restore that answered neither flag would stop.
+# Leg A never enables a schedule, so the flag is inert there.
+restore_args=( "$RESTORE_REPO" --reprovision --server-type "$SKU_BIG" --target "$TARGET"
+               --keep-backup-schedule )
 if [ "$BACKEND" = "local" ]; then
     restore_args+=( --passphrase "$RESTIC_PASS" )
 else

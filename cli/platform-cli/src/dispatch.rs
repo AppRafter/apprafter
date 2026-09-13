@@ -368,6 +368,7 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
             credential_file,
             server_type,
             keep_backup_schedule,
+            discard_backup_schedule,
         } => commands::restore::run_restore(
             &repo,
             target.as_deref(),
@@ -378,6 +379,7 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
             credential_file.as_deref(),
             server_type.as_deref(),
             keep_backup_schedule,
+            discard_backup_schedule,
         )?,
         Commands::Completion { shell } => commands::completions::run(shell)?,
     }
