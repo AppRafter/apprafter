@@ -174,22 +174,29 @@ Two more things are worth doing while both are up:
 
 **The edge configuration comes across too.** The registered zones ride the
 `PlatformStack`, the imported TLS certificate is captured and re-applied with
-them, and the origin-firewall toggle — which lives on the *target*, not in the
-cluster — is carried onto the new target by this restore, so the new machine
-comes up with its `80`/`443` restricted exactly as the old one was rather than
-open to the internet. The restore summary states each of these. Two caveats
-worth knowing before you move DNS:
+them, and so does the origin-firewall intent — `apprafter target firewall
+cloudflare-origin enable` records it in the `PlatformStack` as well as on your
+target, so the restore reads it back and restricts the new machine's `80`/`443`
+rather than leaving them open to the internet. It works the same from any
+backup, including the scheduled in-cluster one. The restore summary states each
+of these. Two things worth knowing before you move DNS:
 
-- A backup taken by the **scheduled in-cluster runner** cannot record the
-  origin-firewall toggle (a CronJob has no target store to read), so the
-  restore stays quiet about it. Either take the backup with `apprafter backup
-  create` as the sequence below does, or run `apprafter target firewall
-  cloudflare-origin enable` on the new target before you cut over.
+- **The new node's `80`/`443` are open while the restore runs.** The machine is
+  provisioned at the start and the firewall intent only becomes readable once
+  the `PlatformStack` has been replayed, several steps later — the snapshot is
+  behind a kubeconfig that does not exist until the cluster does. The window is
+  the length of the restore. The old cluster is still serving throughout, so
+  leave DNS where it is until the summary confirms the firewall.
 - A snapshot taken before imported certificates were captured brings the zones
   back without the certificate. The restore names it, and `apprafter target
   domain list` on the new cluster marks it `MISSING`; re-import it with
   `apprafter target cert import` — do **not** re-run `target domain add`, the
   zone is already registered.
+
+A cluster whose operator never ran the origin-firewall command — or ran it
+before this field existed — records no answer, and the restore says nothing
+rather than guessing. If you are unsure, `apprafter target firewall
+cloudflare-origin enable` on the new target is idempotent.
 
 Then move DNS to the new cluster (see [Connect a
 domain](connect-a-domain.md)), confirm it, and empty the old project:

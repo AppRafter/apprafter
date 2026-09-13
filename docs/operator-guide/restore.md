@@ -99,15 +99,26 @@ Do **not** re-run `apprafter target domain add` afterwards. The zone is already
 registered — it came back in the snapshot — so the command refuses with
 `Domain already registered`. The import is the whole repair.
 
-The **Cloudflare origin firewall** is not in the cluster at all; it is a
-per-target setting on the operator's machine. `apprafter backup create` records
-whether it was on, and `restore --reprovision` turns it on for the target it
-provisions — otherwise a rebuild onto a new target would come up with `80`/`443`
-open to the internet while the source had them restricted. It is only ever
-turned **on** by a restore, never off. On the modes that provision nothing the
-restore says the snapshot recorded it and leaves the cluster alone; a backup
-written by the scheduled in-cluster runner records nothing here, and the restore
-stays quiet rather than guessing.
+The **Cloudflare origin firewall** comes back too. The firewall is a cloud
+object, reconciled from the target on your machine, but the *intent* is
+recorded in the `PlatformStack` (`spec.firewall.cloudflareOrigin`) — so every
+backup carries it, including the scheduled in-cluster one. `restore
+--reprovision` reads it off the restored CR and turns the firewall on for the
+target it provisioned; otherwise a rebuild onto a new target would come up with
+`80`/`443` open to the internet while the source had them restricted. It is
+only ever turned **on** by a restore, never off. On the modes that provision
+nothing, the restored CR still carries the intent but no firewall is touched,
+and the summary says so. A snapshot of a cluster that never recorded an answer
+is *unknown*, not "off", and the restore stays quiet rather than guessing.
+
+There is a window here, and it is not papered over. The node is provisioned at
+the start of the restore and the intent only becomes readable once the
+`PlatformStack` has been replayed a few steps later, so the new node's
+`80`/`443` are open for the length of the restore. That is inherent: the
+snapshot lives behind a kubeconfig that does not exist until the cluster does.
+If it matters for your cutover, keep DNS pointed at the old cluster until the
+restore finishes and the summary confirms the firewall — which is what
+[Move to a bigger machine](moving-to-a-bigger-machine.md) has you do anyway.
 
 ### Target modes
 

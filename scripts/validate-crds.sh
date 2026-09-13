@@ -181,4 +181,29 @@ else
     exit 1
 fi
 
+# A4, the same pruning failure mode one level up. `spec.firewall` is the ONLY
+# record of the Cloudflare origin-firewall intent that a backup can see — the
+# toggle itself is a cloud object the CLI reconciles from the operator's local
+# target store. Pruned, every write succeeds, every read says "the cluster
+# never recorded one", and a restore onto a new machine brings the node up
+# with 80/443 open to the internet without a word. Nothing else in the
+# repository would catch it: the CRD stays structurally valid either way.
+echo "==> regression: PlatformStack spec.firewall.cloudflareOrigin must round-trip (A4)"
+kubectl --context "$CTX" -n crd-validate patch platformstack crd-validate-tz \
+    --type=merge -p '{"spec":{"firewall":{"cloudflareOrigin":true}}}' >/dev/null 2>/tmp/crd-fw-err.txt || {
+    echo "==> REGRESSION: apiserver REJECTED spec.firewall.cloudflareOrigin" >&2
+    cat /tmp/crd-fw-err.txt >&2
+    exit 1
+}
+_fw=$(kubectl --context "$CTX" -n crd-validate get platformstack crd-validate-tz \
+    -o jsonpath='{.spec.firewall.cloudflareOrigin}' 2>/dev/null || true)
+if [ "$_fw" = "true" ]; then
+    echo "    OK: spec.firewall.cloudflareOrigin stored (not pruned)"
+else
+    echo "==> REGRESSION: spec.firewall.cloudflareOrigin was PRUNED — read back '${_fw}'." >&2
+    echo "    The patch succeeded and the field vanished, which is how a restored" >&2
+    echo "    cluster comes up with its 80/443 open while the source had them shut." >&2
+    exit 1
+fi
+
 echo "==> CRD apiserver validation PASSED (all CRDs accepted + Established)"

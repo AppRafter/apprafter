@@ -205,13 +205,6 @@ fn do_backup(k: &dyn KubeExec, r: &dyn ResticRunner, cfg: &RunnerConfig) -> Resu
         // the tag above, because the name is replayed by restore and a clone
         // inherits it.
         backup_host: Some(cfg.backup_host.clone()),
-        // A4: UNKNOWN, and deliberately not `false`. The Cloudflare
-        // origin-firewall toggle lives in the operator's local target store;
-        // this runner is a CronJob in the cluster and has none, so it has
-        // nothing to record. A restore reads the absent field as "the
-        // snapshot cannot say" and stays quiet, rather than telling an
-        // operator the source cluster had its 80/443 open.
-        origin_firewall: None,
     };
 
     // f. The backup.

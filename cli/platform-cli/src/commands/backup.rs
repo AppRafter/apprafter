@@ -1493,9 +1493,6 @@ fn export_manifest(
         // An export captures native data only — no secrets, so no
         // secret namespaces to record.
         secret_namespaces: Vec::new(),
-        // Same reason: an export replays no cluster configuration, so it has
-        // no business carrying the source's firewall intent either.
-        origin_firewall: None,
         resources: resource_refs(&[], claims),
     }
 }
@@ -1592,12 +1589,6 @@ pub fn run_backup(
         .tempdir()
         .map_err(|e| CliError::Other(format!("create staging dir: {e}")))?;
 
-    // A4: the origin-firewall intent, read off the target this backup is being
-    // taken against. It is the one piece of the cluster's edge configuration
-    // that lives on the operator's machine instead of in the cluster, so this
-    // is the only moment anything can record it.
-    let origin_firewall = origin_firewall_of(&resolved.store, &resolved.target_name);
-
     let opts = local_pull_backup_opts(
         &repo_str,
         pass,
@@ -1609,7 +1600,6 @@ pub fn run_backup(
         staging.path(),
         pg_image,
         staging_mode,
-        origin_firewall,
     );
 
     let r = SubprocessRestic;
@@ -1642,7 +1632,6 @@ fn local_pull_backup_opts(
     staging_root: &Path,
     pg_image: String,
     staging_mode: StagingMode,
-    origin_firewall: Option<bool>,
 ) -> BackupOpts {
     BackupOpts {
         repo: repo.to_string(),
@@ -1657,22 +1646,7 @@ fn local_pull_backup_opts(
         pg_image,
         staging_mode,
         backup_host: None,
-        origin_firewall,
     }
-}
-
-/// Was the Cloudflare origin firewall on for `target` (A4)?
-///
-/// A target with no `firewall:` block at all answers `Some(false)`: the toggle
-/// was never set, which is a real answer to "did the source restrict its
-/// 80/443". `None` is reserved for the target that could not be READ — an
-/// unreadable store is not evidence the firewall was off, and recording
-/// `false` on that basis would have a later restore state something about the
-/// source cluster that nobody established. Best-effort by design: an
-/// unreadable target must never fail a backup whose data is otherwise fine.
-fn origin_firewall_of(store: &cli_core::target::TargetStorePaths, target: &str) -> Option<bool> {
-    let t = cli_core::target::load_target(store, target).ok()?;
-    Some(t.config.firewall.is_some_and(|f| f.cloudflare_origin))
 }
 
 /// The operator-facing summary `backup` prints on success. Pure — extracted
@@ -8637,13 +8611,8 @@ mod tests {
             Path::new("/staging"),
             "postgres:18-alpine".into(),
             StagingMode::Sequential,
-            Some(true),
         );
         assert_eq!(opts.backup_host, None);
-        // A4: the origin-firewall intent of the target this pull ran against
-        // reaches the engine, and from there the manifest — it is the only
-        // moment anything can record local-only state.
-        assert_eq!(opts.origin_firewall, Some(true));
         assert!(opts.is_subset, "--select must reach the tag decoration");
         assert_eq!(opts.repo, "s3:https://h/b");
         assert_eq!(opts.cluster_id, "prod-cluster");

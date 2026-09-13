@@ -83,22 +83,6 @@ pub struct BackupOpts {
     /// the machine's own hostname as the group (correct for a per-operator
     /// station grouping).
     pub backup_host: Option<String>,
-    /// Was the Cloudflare origin firewall on for the cluster being captured
-    /// (A4)?
-    ///
-    /// The toggle is LOCAL state — `targets/<name>/config.yaml` on the
-    /// operator's machine — so nothing inside the cluster can be asked about
-    /// it, and a restore onto a NEW target re-provisioned the node with 80/443
-    /// open to the internet while the source had them restricted.
-    /// `backup create` runs against a resolved target and therefore knows;
-    /// recording the intent here is what lets `restore --reprovision` carry it
-    /// over without having to work out which target the snapshot came from.
-    ///
-    /// `None` means UNKNOWN, never "off": it is what a snapshot taken before
-    /// this field existed carries, and what the in-cluster runner records (a
-    /// CronJob has no target store to read). Restore stays silent on it rather
-    /// than claiming the source had the firewall off.
-    pub origin_firewall: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -741,7 +725,6 @@ fn capture_non_claim_artifacts(
         platform_version: opts.platform_version.clone(),
         namespaces: opts.namespaces.clone(),
         secret_namespaces: secret_namespaces.clone(),
-        origin_firewall: opts.origin_firewall,
         resources: [
             resource_refs(&manifest_crs, claims),
             imported_cert_refs(&imported_certs),
@@ -1289,7 +1272,6 @@ mod tests {
             pg_image: "postgres:16-alpine".into(),
             staging_mode: mode,
             backup_host: None,
-            origin_firewall: None,
         }
     }
 
@@ -2289,32 +2271,89 @@ mod tests {
             .any(|r| r["kind"] == json!("ImportedCert")));
     }
 
-    /// A4: the origin-firewall intent the caller recorded reaches the
-    /// manifest, and an UNKNOWN one leaves the key out of the JSON entirely
-    /// rather than writing `false` — a restore must be able to tell "the
-    /// source had it off" from "nobody asked".
+    /// A4: the origin-firewall intent rides the `PlatformStack` CR, so it is
+    /// captured by whatever is running the backup — with NOTHING passed in.
+    ///
+    /// This is the whole reason the field moved out of the manifest. The
+    /// manifest version could only be filled from the operator's local target
+    /// store, which the scheduled in-cluster runner does not have: the
+    /// default, recommended backup mode is a CronJob, and it wrote nothing.
+    /// This path has no such input — the intent is read off the cluster with
+    /// the rest of the CR — so every mode carries it identically.
+    ///
+    /// Asserted on the staged bytes, not on an intermediate: `sanitize_cr`
+    /// strips `status` and seven metadata keys on the way out, and a `spec`
+    /// field that did not survive that would be exactly as invisible as the
+    /// bug being fixed.
     #[test]
-    fn the_manifest_records_the_origin_firewall_intent_only_when_it_is_known() {
-        let cases = [
-            (Some(true), Some(json!(true))),
-            (Some(false), Some(json!(false))),
-            (None, None),
-        ];
-        for (recorded, expected) in cases {
-            let dir = tempfile::tempdir().unwrap();
-            let k = scripted_cluster();
-            let mut opts = opts_for(StagingMode::Monolithic, dir.path().to_path_buf());
-            opts.origin_firewall = recorded;
-
-            capture_non_claim_artifacts(&k, &opts, &[], dir.path()).unwrap();
-
-            let m = read_json(&dir.path().join("manifest.json"));
-            assert_eq!(
-                m.get("originFirewall").cloned(),
-                expected,
-                "origin_firewall={recorded:?}"
+    fn the_captured_platformstack_carries_the_origin_firewall_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = FakeKube::scripted()
+            .reply(
+                &[
+                    "get",
+                    "platformstack",
+                    "default",
+                    "-n",
+                    "apprafter-system",
+                    "-o",
+                    "json",
+                ],
+                json!({"kind": "PlatformStack",
+                       "metadata": {"name": "default", "namespace": "apprafter-system"},
+                       "spec": {"firewall": {"cloudflareOrigin": true}},
+                       "status": {"currentVersion": "0.2.68"}}),
+            )
+            .reply(
+                &["get", "sourcecredentials.apprafter.io", "-A", "-o", "json"],
+                json!({"items": []}),
+            )
+            .reply(
+                &["get", "applications.apprafter.io", "-A", "-o", "json"],
+                json!({"items": []}),
+            )
+            .reply(
+                &["get", "applications.argoproj.io", "-A", "-o", "json"],
+                json!({"items": []}),
+            )
+            .reply(
+                &[
+                    "get",
+                    "sharedvolumes.apprafter.io",
+                    "-n",
+                    "demo",
+                    "-o",
+                    "json",
+                ],
+                json!({"items": []}),
+            )
+            .reply(
+                &["get", "sealedsecrets.bitnami.com", "-A", "-o", "json"],
+                json!({"items": []}),
+            )
+            .reply(
+                &["get", "secrets", "-n", "apprafter-system", "-o", "json"],
+                json!({"items": []}),
             );
-        }
+        let opts = opts_for(StagingMode::Monolithic, dir.path().to_path_buf());
+
+        capture_non_claim_artifacts(&k, &opts, &[], dir.path()).unwrap();
+
+        let staged = std::fs::read_dir(dir.path().join("crs"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.to_string_lossy().contains("PlatformStack"))
+            .expect("the PlatformStack is the first CR every backup captures");
+        let cr = read_json(&staged);
+        assert_eq!(
+            cr.pointer("/spec/firewall/cloudflareOrigin"),
+            Some(&json!(true)),
+            "the origin-firewall intent must survive capture + sanitize: {cr}"
+        );
+        assert!(
+            cr.get("status").is_none(),
+            "sanitize still strips status — which is why the field lives in spec"
+        );
     }
 
     /// INVARIANT: `manifest.json` is the restore index. It must name every

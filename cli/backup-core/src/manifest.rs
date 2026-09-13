@@ -44,25 +44,6 @@ pub struct BackupManifest {
     #[serde(default)]
     pub secret_namespaces: Vec<String>,
 
-    /// Was the Cloudflare origin firewall on for the captured cluster (A4)?
-    ///
-    /// The toggle lives in the operator's LOCAL target store, never in the
-    /// cluster, so a restore onto a new target had no way to know the source
-    /// restricted its 80/443 — and re-provisioned the node wide open.
-    /// `backup create` runs against a resolved target and records the intent
-    /// here; `restore --reprovision` carries it to the destination target.
-    ///
-    /// Three-valued on purpose. `Some(true)`/`Some(false)` are what the source
-    /// had; `None` is UNKNOWN — a manifest written before this field existed,
-    /// or one written by the in-cluster runner, which has no target store to
-    /// read. Restore must treat `None` as "say nothing", never as "the source
-    /// had it off".
-    ///
-    /// `skip_serializing_if` keeps the key out of a manifest that has nothing
-    /// to say, so an unknown reads as an absent key in the JSON too.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin_firewall: Option<bool>,
-
     pub resources: Vec<ResourceRef>,
 }
 
@@ -80,25 +61,46 @@ mod tests {
         assert_eq!(MANIFEST_VERSION_CURRENT, 1);
     }
 
-    /// A4: a manifest written before `originFirewall` existed reads as
-    /// UNKNOWN. Defaulting it to `false` would let a restore tell an operator
-    /// the source cluster had its origin firewall off — a claim about a
-    /// cluster the snapshot never recorded anything about.
+    /// A4: the origin-firewall intent is NOT a manifest field. It briefly was
+    /// — an unreleased tree recorded it here from the operator's target store —
+    /// and that could only ever work for a hand-run `backup create`: the
+    /// scheduled in-cluster runner, which is the default and the recommended
+    /// mode, is a CronJob with no target store to read and wrote nothing. The
+    /// intent lives in `PlatformStack.spec.firewall.cloudflareOrigin` instead,
+    /// which every backup mode captures as a CR.
+    ///
+    /// A snapshot from that intervening tree still carries the key. Reading one
+    /// must not error — a stray field in the manifest is not a reason to refuse
+    /// a restore of the data underneath it.
     #[test]
-    fn a_manifest_without_the_origin_firewall_key_reads_as_unknown() {
-        let json = r#"{"clusterId":"c","createdAt":"t","platformVersion":"0.2.31","namespaces":[],"resources":[]}"#;
-        let m: BackupManifest = serde_json::from_str(json).unwrap();
-        assert_eq!(m.origin_firewall, None);
-
-        let off: BackupManifest = serde_json::from_str(
+    fn a_manifest_carrying_the_retired_origin_firewall_key_still_parses() {
+        let m: BackupManifest = serde_json::from_str(
             r#"{"clusterId":"c","createdAt":"t","platformVersion":"0.2.31","namespaces":[],
-                "originFirewall":false,"resources":[]}"#,
+                "originFirewall":true,"resources":[]}"#,
         )
-        .unwrap();
-        assert_eq!(
-            off.origin_firewall,
-            Some(false),
-            "recorded OFF is not absent"
+        .expect("a retired key must be ignored, not rejected");
+        assert_eq!(m.cluster_id, "c");
+        assert!(m.resources.is_empty());
+    }
+
+    /// The key is not written back either: a round trip through the struct
+    /// must not resurrect it into the JSON under a field that no longer exists.
+    #[test]
+    fn the_retired_origin_firewall_key_is_never_written() {
+        let m = BackupManifest {
+            manifest_version: MANIFEST_VERSION_CURRENT,
+            cluster_id: "c".into(),
+            created_at: "t".into(),
+            platform_version: "0.2.31".into(),
+            namespaces: vec![],
+            secret_namespaces: vec![],
+            resources: vec![],
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        assert!(
+            v.get("originFirewall").is_none(),
+            "the manifest must not carry a second source of truth for the \
+             origin-firewall intent: {v}"
         );
     }
 
@@ -111,7 +113,6 @@ mod tests {
             platform_version: "0.2.37".into(),
             namespaces: vec!["demo".into()],
             secret_namespaces: vec!["demo".into(), "staged".into()],
-            origin_firewall: Some(true),
             resources: vec![ResourceRef {
                 namespace: "demo".into(),
                 kind: "Application".into(),

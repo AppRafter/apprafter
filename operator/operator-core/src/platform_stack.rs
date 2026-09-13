@@ -37,6 +37,8 @@ pub struct PlatformStackSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firewall: Option<EdgeFirewallConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<BackupConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourceGovernanceConfig>,
@@ -75,6 +77,27 @@ pub struct NetworkConfig {
 pub struct EgressConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<EgressProfile>,
+}
+
+/// Edge-firewall posture of the node this cluster runs on (A4). Mirrors
+/// `schemas/v1alpha1/platformstack.cue#PlatformStackSpec`'s `firewall?` block.
+///
+/// No operator code reads this: the firewall is a CLOUD object the CLI
+/// reconciles out-of-cluster. The field exists so the intent — which used to
+/// live ONLY in the operator's local target store — rides the CR into every
+/// backup, including the scheduled in-cluster runner's, and can be replayed
+/// onto the target a restore provisions.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct EdgeFirewallConfig {
+    /// Is the node's 80/443 restricted to Cloudflare's IP ranges? `None` is
+    /// UNKNOWN — a CR written before this field existed — and must never be
+    /// read as "off".
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "cloudflareOrigin"
+    )]
+    pub cloudflare_origin: Option<bool>,
 }
 
 /// Resolve the effective egress profile from a PlatformStack spec. Field

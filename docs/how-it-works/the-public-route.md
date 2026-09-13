@@ -198,11 +198,25 @@ fate: it says where the application *would* answer.
 
 ## What the origin firewall buys, and what it does not
 
-`apprafter target firewall cloudflare-origin enable` does two things, in this
+`apprafter target firewall cloudflare-origin enable` does three things, in this
 order. It records the toggle on the active target in the local target store
 first, so the intent survives even if everything after it fails
-([the target store on disk](the-target-store.md)); then it reconciles the live
-cloud firewall.
+([the target store on disk](the-target-store.md)); it records the same intent
+in the cluster, as `PlatformStack.spec.firewall.cloudflareOrigin`; then it
+reconciles the live cloud firewall.
+
+The two records answer different questions. The target store is what
+`apprafter apply` reads when it builds the node's firewall, at a moment when
+there may be no cluster to ask. The CR is what a **backup** can read: the
+firewall is a cloud object, so nothing about it would otherwise appear in a
+snapshot, and a restore onto a new machine would bring the node up with
+`80`/`443` open while the source had them shut. `PlatformStack/default` is the
+first object every backup captures — including the scheduled in-cluster
+runner's, which has no target store to read — so that is where the intent has
+to live for a restore to find it. The cluster write is best-effort: it is
+legitimate to set the toggle before a cluster exists, so an unreachable
+apiserver warns (naming what a backup would then be missing) rather than
+failing the command.
 
 The reconcile fetches Cloudflare's published ranges from
 `https://www.cloudflare.com/ips-v4` and `https://www.cloudflare.com/ips-v6` at

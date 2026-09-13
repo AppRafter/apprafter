@@ -79,6 +79,7 @@ mod tests {
             auto_upgrade: false,
             default_environment: None,
             network: None,
+            firewall: None,
             backup: None,
             resources: None,
             source: PlatformStackSource::default(),

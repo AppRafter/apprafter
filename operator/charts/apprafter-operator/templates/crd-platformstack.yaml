@@ -125,6 +125,11 @@ spec:
                 type: string
               defaultEnvironment:
                 type: string
+              firewall:
+                properties:
+                  cloudflareOrigin:
+                    type: boolean
+                type: object
               network:
                 properties:
                   egress:

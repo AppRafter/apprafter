@@ -43,11 +43,11 @@ pub use migration_state::{
     PHASE_AWAITING_MIGRATION_APPROVAL,
 };
 pub use platform_stack::{
-    resolve_egress_profile, AutoscaleConfig, AutoscaleMode, EgressConfig, EgressProfile,
-    NetworkConfig, PlatformStack, PlatformStackComponent, PlatformStackComponentOverride,
-    PlatformStackCondition, PlatformStackSource, PlatformStackSpec, PlatformStackStatus,
-    PlatformStackValues, PlatformStackVersionHistoryEntry, ResourceGovernanceConfig,
-    ResourceQuantities,
+    resolve_egress_profile, AutoscaleConfig, AutoscaleMode, EdgeFirewallConfig, EgressConfig,
+    EgressProfile, NetworkConfig, PlatformStack, PlatformStackComponent,
+    PlatformStackComponentOverride, PlatformStackCondition, PlatformStackSource, PlatformStackSpec,
+    PlatformStackStatus, PlatformStackValues, PlatformStackVersionHistoryEntry,
+    ResourceGovernanceConfig, ResourceQuantities,
 };
 pub use resourceclaim::{
     ClaimCapacity, ClaimSize, ClaimStreamInventory, ResourceClaim, ResourceClaimCondition,

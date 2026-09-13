@@ -436,15 +436,21 @@ discrimination that keeps a restore from clobbering the target's own bootstrap:
   Certificates issued by cert-manager are **not** captured: they are re-issued
   on the restored cluster, and replaying an old one would be worse than
   letting it renew.
-- **The Cloudflare origin-firewall toggle** is recorded in the manifest as an
-  intent (`originFirewall`), not as a captured object. It is the one piece of a
-  cluster's edge configuration that lives on the operator's machine — in the
-  target store — rather than in the cluster, so `apprafter backup create`
-  records it from the target it ran against and `apprafter restore
-  --reprovision` carries it to the target it provisions. A backup taken by the
-  **scheduled in-cluster runner** records nothing here: a CronJob has no target
-  store to read, and a restore treats the absent field as unknown rather than
-  as "the source had it off". See
+- **The Cloudflare origin-firewall toggle** rides the `PlatformStack` like the
+  zones do, in `spec.firewall.cloudflareOrigin`. The firewall itself is a cloud
+  object the CLI reconciles from your machine, so the cluster is not what
+  enforces it — but the cluster is what a backup can read, which is why the
+  intent is recorded there. `apprafter target firewall cloudflare-origin
+  enable` writes both: your target's config, which `apprafter apply` builds the
+  node's firewall from, and the CR, which every backup captures. That includes
+  the scheduled in-cluster runner, which has no target store to read and so
+  could never have recorded it otherwise.
+
+  `apprafter restore --reprovision` reads the field back off the restored CR
+  and turns the firewall on for the target it provisioned. A snapshot of a
+  cluster that never recorded an answer — anything taken before this field
+  existed — is treated as *unknown*, not as "the source had it off": the
+  restore says nothing rather than guessing. See
   [Move to a bigger machine](moving-to-a-bigger-machine.md).
 
 How a restore reloads each of these is on

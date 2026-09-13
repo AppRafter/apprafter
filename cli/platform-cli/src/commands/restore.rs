@@ -344,10 +344,12 @@ enum OriginFirewall {
         why: String,
         recorded: bool,
     },
-    /// Recorded ON, but this restore provisioned no node. Nothing was changed
-    /// — a cluster that was already running has whatever firewall it has, and
-    /// writing the target's config here would claim something this restore
-    /// never made true.
+    /// Recorded ON, but this restore provisioned no node. The replayed
+    /// `PlatformStack` carries the intent into THIS cluster's CR — so its own
+    /// next backup keeps it — but no cloud firewall was touched: a cluster
+    /// that was already running has whatever firewall it has, and writing the
+    /// target's config here would claim something this restore never made
+    /// true.
     Announced,
 }
 
@@ -417,10 +419,11 @@ fn edge_inheritance_lines(edge: &EdgeRestore) -> Vec<String> {
             },
         )),
         OriginFirewall::Announced => lines.push(
-            "  ⚠ the snapshot recorded the source's Cloudflare origin firewall as ON. This \
-             restore provisioned no node, so nothing here was changed — this cluster's 80/443 \
-             are whatever they already were. `apprafter target firewall cloudflare-origin \
-             enable` restricts them to Cloudflare's IP ranges."
+            "  ⚠ the snapshot recorded the source's Cloudflare origin firewall as ON, and the \
+             restored PlatformStack now records it here too. This restore provisioned no node, \
+             so no firewall was changed — this cluster's 80/443 are whatever they already were. \
+             `apprafter target firewall cloudflare-origin enable` restricts them to Cloudflare's \
+             IP ranges."
                 .to_string(),
         ),
     }
@@ -570,14 +573,6 @@ pub fn run_restore(
                 version_warning =
                     cross_version_warning(data_only, &target_version, &m.platform_version);
 
-                // A4, at the earliest moment anything can know: the manifest
-                // is the first place the source's origin-firewall intent
-                // appears, and on `--reprovision` the node it applies to is
-                // already up — the rest of a restore takes minutes, and they
-                // are minutes with 80/443 open to the internet.
-                edge.origin_firewall =
-                    settle_origin_firewall(m.origin_firewall, reprovision, target);
-
                 data_dir = Some(dd);
                 manifest = Some(m);
             }
@@ -589,8 +584,20 @@ pub fn run_restore(
             }
             RestoreStep::ApplyPlatformStack => {
                 let dd = produced_by_artifact(data_dir.as_ref(), "ApplyPlatformStack")?;
-                (inherited_cluster_name, schedule) =
-                    apply_platformstack_from_crs(dd, kc.path(), keep_backup_schedule)?;
+                let replay = apply_platformstack_from_crs(dd, kc.path(), keep_backup_schedule)?;
+                inherited_cluster_name = replay.inherited_cluster_name;
+                schedule = replay.schedule;
+
+                // A4, at the first moment anything can know: the source's
+                // origin-firewall intent travels in the CR this step just
+                // applied, so it is readable here and nowhere earlier. On
+                // `--reprovision` the node is already up — every minute
+                // between the provision at step 1 and this line is a minute
+                // with 80/443 open to the internet, which is why this sits
+                // immediately after the apply rather than at the end of the
+                // run.
+                edge.origin_firewall =
+                    settle_origin_firewall(replay.origin_firewall, reprovision, target);
             }
             RestoreStep::EnsureNamespaces => {
                 let m = produced_by_artifact(manifest.as_ref(), "EnsureNamespaces")?;
@@ -948,9 +955,10 @@ fn namespaces_to_ensure_all<'a>(apps: &'a [String], secrets: &'a [String]) -> Ve
 /// What a restore should do with the origin-firewall intent a snapshot
 /// recorded (A4). Pure.
 ///
-/// * `recorded` — the manifest's `originFirewall`. `None` is UNKNOWN (a
-///   snapshot from before the field existed, or one the in-cluster runner
-///   wrote), and is treated as "say nothing": claiming the source had its
+/// * `recorded` — the replayed `PlatformStack`'s
+///   `spec.firewall.cloudflareOrigin`. `None` is UNKNOWN (a snapshot of a
+///   cluster from before the field existed, or one whose operator never ran
+///   the toggle), and is treated as "say nothing": claiming the source had its
 ///   80/443 open is a statement about a cluster this snapshot never recorded.
 /// * `Some(false)` changes nothing either. The carry is one-directional on
 ///   purpose — it can only ever RESTRICT ports, so inheriting it can never
@@ -1009,11 +1017,20 @@ fn target_records_origin_firewall(target: Option<&str>) -> bool {
 /// time this can be known; refusing to finish over a firewall the operator can
 /// set with one command afterwards would trade a working restore for a tidier
 /// invariant. It is reported in full instead, ports-still-open and all.
+///
+/// The cluster-side record is NOT rewritten ([`ClusterRecord::Skip`]): the
+/// value being carried was just read out of the `PlatformStack` this restore
+/// applied a moment ago, so patching it back would be a round trip whose only
+/// possible outcome is a spurious warning about a record that demonstrably
+/// exists.
+///
+/// [`ClusterRecord::Skip`]: crate::commands::target_firewall::ClusterRecord::Skip
 fn settle_origin_firewall(
     recorded: Option<bool>,
     reprovision: bool,
     target: Option<&str>,
 ) -> OriginFirewall {
+    use crate::commands::target_firewall::ClusterRecord;
     match origin_firewall_action(
         recorded,
         reprovision,
@@ -1022,7 +1039,11 @@ fn settle_origin_firewall(
         OriginFirewallAction::Nothing => OriginFirewall::Nothing,
         OriginFirewallAction::Announce => OriginFirewall::Announced,
         OriginFirewallAction::Carry => {
-            match crate::commands::target_firewall::apply_cloudflare_origin(target, true) {
+            match crate::commands::target_firewall::apply_cloudflare_origin(
+                target,
+                true,
+                ClusterRecord::Skip,
+            ) {
                 Ok(applied) => {
                     for line in &applied.lines {
                         println!("  {line}");
@@ -1160,6 +1181,21 @@ fn dangling_cert_refs(referenced: &[String], restored: &[String]) -> Vec<String>
         .collect()
 }
 
+/// What the replayed `PlatformStack` told this restore about the source
+/// cluster — everything the CR carries that the summary or a later step needs.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PlatformStackReplay {
+    /// The source's `spec.backup.clusterName`, when the replayed CR carried an
+    /// enabled schedule (E1).
+    inherited_cluster_name: Option<String>,
+    /// What the schedule policy did to the replayed `spec.backup` (D1/D2).
+    schedule: BackupSchedule,
+    /// The source's `spec.firewall.cloudflareOrigin` (A4). `None` is UNKNOWN —
+    /// a snapshot of a cluster that never recorded one — and must never be
+    /// read as "the source had it off".
+    origin_firewall: Option<bool>,
+}
+
 /// **ApplyPlatformStack** — apply the sanitized `PlatformStack` from `crs/`,
 /// mirroring the `cluster_bootstrap` retry loop for the admission-webhook
 /// Endpoints race.
@@ -1167,19 +1203,23 @@ fn dangling_cert_refs(referenced: &[String], restored: &[String]) -> Vec<String>
 /// `keep_backup_schedule` carries `--keep-backup-schedule` down to
 /// [`apply_backup_schedule_policy`], which is the ONLY thing that rewrites the
 /// captured CR before it is applied.
+///
+/// The origin-firewall intent is read off the SAME CR this step applies, so
+/// what the caller acts on is exactly what landed in the cluster.
 fn apply_platformstack_from_crs(
     data_dir: &Path,
     kubeconfig: &Path,
     keep_backup_schedule: bool,
-) -> Result<(Option<String>, BackupSchedule)> {
+) -> Result<PlatformStackReplay> {
     let crs = read_crs(data_dir)?;
     let Some(ps) = crs.iter().find(|c| c.kind == "PlatformStack") else {
         // A backup without a PlatformStack (older shape) — nothing to apply;
         // the target's own bootstrap PlatformStack stays in place.
         println!("  (no PlatformStack in backup — keeping target's own)");
-        return Ok((None, BackupSchedule::NotInherited));
+        return Ok(PlatformStackReplay::default());
     };
     let inherited = inherited_backup_cluster_name(&ps.cr);
+    let origin_firewall = crate::commands::target_firewall::recorded_origin_firewall(&ps.cr);
     let (yaml, schedule) = platformstack_apply_payload(&ps.cr, keep_backup_schedule)?;
     apply_with_retry(
         PLATFORMSTACK_APPLY_ATTEMPTS,
@@ -1187,7 +1227,11 @@ fn apply_platformstack_from_crs(
         &mut |_attempt| kubectl_apply_server_side(&yaml, RESTORE_FIELD_MANAGER, kubeconfig),
     )?;
     println!("  ✓ PlatformStack applied");
-    Ok((inherited, schedule))
+    Ok(PlatformStackReplay {
+        inherited_cluster_name: inherited,
+        schedule,
+        origin_firewall,
+    })
 }
 
 /// The exact bytes `ApplyPlatformStack` hands to `kubectl apply`, and what the
@@ -1222,10 +1266,13 @@ fn platformstack_apply_payload(
 /// which is the documented "move to a bigger machine" Route B: two clusters up
 /// at once, both writing to one repository. Nothing in the restore path knows
 /// or asks which of the two this is, so the default is the reversible half.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BackupSchedule {
     /// The backup carried no enabled schedule, so nothing was inherited and
-    /// there is nothing to say.
+    /// there is nothing to say. Also the default: a `PlatformStackReplay`
+    /// built for a snapshot with no PlatformStack in it has inherited
+    /// nothing, by construction.
+    #[default]
     NotInherited,
     /// The default: the schedule was replayed as captured but forced OFF.
     DisabledByDefault,
@@ -2932,7 +2979,6 @@ mod tests {
             platform_version: "0.2.40".into(),
             namespaces: namespaces.iter().map(|s| s.to_string()).collect(),
             secret_namespaces: Vec::new(),
-            origin_firewall: None,
             resources,
         }
     }
@@ -3560,6 +3606,59 @@ mod tests {
         assert_eq!(read[1]["type"], serde_json::json!("kubernetes.io/tls"));
     }
 
+    /// A4: the intent a restore acts on comes out of the replayed
+    /// `PlatformStack` — the object every backup mode captures — and NOT out
+    /// of the manifest, which only a hand-run `backup create` could fill.
+    ///
+    /// This asserts the read on the CR shape the capture actually stages
+    /// (`sanitize_cr` keeps `spec` whole and drops `status`), including the
+    /// two absences that must stay UNKNOWN: a cluster whose operator never
+    /// ran the toggle, and a snapshot from the intervening tree that recorded
+    /// the intent in the manifest instead — where the CR looks like any other
+    /// pre-change CR.
+    #[test]
+    fn the_replayed_platformstack_is_where_the_origin_firewall_comes_from() {
+        use crate::commands::target_firewall::recorded_origin_firewall;
+
+        let captured = serde_json::json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "PlatformStack",
+            "metadata": {"name": "default", "namespace": "apprafter-system"},
+            "spec": {
+                "channel": "stable",
+                "firewall": {"cloudflareOrigin": true},
+                "values": {"tier": 1}
+            }
+        });
+        assert_eq!(recorded_origin_firewall(&captured), Some(true));
+
+        let pre_change = serde_json::json!({
+            "kind": "PlatformStack",
+            "spec": {"channel": "stable", "values": {"tier": 1}}
+        });
+        assert_eq!(
+            recorded_origin_firewall(&pre_change),
+            None,
+            "a snapshot that never recorded an answer must stay UNKNOWN — \
+             `Some(false)` here would have the summary claim the source \
+             served its 80/443 open"
+        );
+    }
+
+    /// The carry hangs off `ApplyPlatformStack`, so the modes that replay no
+    /// configuration cannot carry it: `--data-only` exists precisely to make
+    /// no config writes, and reconciling a cloud firewall from it would be
+    /// one.
+    #[test]
+    fn a_data_only_restore_has_no_platformstack_step_to_carry_the_firewall_from() {
+        let steps = restore_steps(RestoreMode::IntoRunning, true);
+        assert!(!steps.contains(&RestoreStep::ApplyPlatformStack));
+
+        for mode in [RestoreMode::IntoRunning, RestoreMode::Reprovision] {
+            assert!(restore_steps(mode, false).contains(&RestoreStep::ApplyPlatformStack));
+        }
+    }
+
     /// A4, the whole decision table. The carry is one-directional and only on
     /// the mode that provisioned the node; an UNKNOWN intent changes nothing
     /// and says nothing.
@@ -3708,7 +3807,7 @@ mod tests {
         )
         .join("\n");
         assert!(joined.contains("recorded the source's"), "{joined}");
-        assert!(joined.contains("nothing here was changed"), "{joined}");
+        assert!(joined.contains("no firewall was changed"), "{joined}");
         assert!(
             joined.contains("cloudflare-origin enable"),
             "names the way to turn it on: {joined}"

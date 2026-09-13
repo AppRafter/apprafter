@@ -27,7 +27,7 @@ ApplySourceCredentials -> ApplyAppsGated -> WaitClaimsBound -> LoadData ->
 ReSealUserSecrets -> ResumeWorkloads
 ```
 
-Four behaviours are load-bearing:
+Five behaviours are load-bearing:
 
 - **The certificate lands before the domains that name it.** The registered
   zones live in the `PlatformStack`, and the platform Gateway is rendered from
@@ -73,6 +73,26 @@ Four behaviours are load-bearing:
   so the reversible half is the default. This applies to every mode that replays
   the CR — `--reprovision` only prepends a provisioning step — and not to
   `--data-only`, which replays no CRs at all.
+- **The origin firewall is reconciled from the CR, one step late by
+  construction.** The Cloudflare origin firewall is a cloud object, not a
+  Kubernetes one: it is reconciled against the provider API from the target on
+  the operator's machine. What travels in the snapshot is the *intent*, in
+  `PlatformStack.spec.firewall.cloudflareOrigin` — recorded there rather than
+  in the backup manifest so that the scheduled in-cluster runner, which has no
+  target store to read, captures it like any other field. Immediately after
+  `ApplyPlatformStack`, a `--reprovision` restore reads the field back off the
+  CR it just applied and, if it says `true`, writes the toggle onto the
+  destination target and reconciles that target's live firewall.
+
+  The order means the node exists from step one and the intent is only readable
+  at step four, so the new node's `80`/`443` are open for the length of the
+  restore. That is inherent rather than an oversight: the snapshot is behind a
+  kubeconfig that does not exist until the cluster does. The carry is
+  one-directional — a recorded `true` restricts ports, a recorded `false`
+  changes nothing — so inheriting can never leave a cluster more exposed than
+  doing nothing. An absent field is *unknown*, not "off", and produces no claim
+  either way. A failure to apply the firewall never fails the restore; the
+  summary reports it and says the ports are still open.
 
 ## How the data is loaded
 

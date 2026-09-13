@@ -149,6 +149,14 @@ const CRD_ESTABLISHED_TIMEOUT_SECS: u64 = 60;
 const PLATFORMSTACK_APPLY_ATTEMPTS: u32 = 30;
 const PLATFORMSTACK_APPLY_BACKOFF_SECS: u64 = 10;
 
+/// Raw API path of the `PlatformStack` singleton — read before the render so
+/// the apply can carry forward a field the local store has no opinion about
+/// (see [`origin_firewall_for_render`]). `get_raw` rather than a typed get:
+/// the CRD may not exist yet on a fresh cluster, and a 404 body is exactly the
+/// "nothing to preserve" answer.
+const PLATFORMSTACK_DEFAULT_RAW_PATH: &str =
+    "/apis/apprafter.io/v1alpha1/namespaces/apprafter-system/platformstacks/default";
+
 /// Run the GitOps loader against `target_override`, or against the
 /// active target when it is `None`.
 ///
@@ -236,13 +244,29 @@ pub(crate) fn run_with<H: HelmRunner, K: KubectlRunner>(
 
     let active_domain: Option<&str> = None;
 
+    // A4: the origin-firewall toggle rides the CR, so that a backup — above
+    // all the scheduled in-cluster one, which has no target store to read —
+    // carries it. The local store is the authority when it has an opinion;
+    // when it has none the cluster's own value is carried forward rather than
+    // pruned. See `origin_firewall_for_render` for why neither half is
+    // optional.
+    let local_origin_firewall = target_config
+        .as_ref()
+        .and_then(|c| c.firewall.as_ref())
+        .map(|f| f.cloudflare_origin);
+    let origin_firewall = origin_firewall_for_render(
+        local_origin_firewall,
+        live_origin_firewall(kubectl, kubeconfig_file.path()),
+    );
+
     let platform_repo = platform_stack_repo();
     let platform_version = resolve_platform_version();
 
     let root_app_yaml = render_root_application(&platform_repo, &platform_version);
     let root_app_file = write_tempfile_with("apprafter-root-application-", &root_app_yaml)?;
 
-    let platformstack_yaml = render_platformstack_default(active_tier, active_domain);
+    let platformstack_yaml =
+        render_platformstack_default(active_tier, active_domain, origin_firewall);
     let platformstack_file =
         write_tempfile_with("apprafter-platformstack-default-", &platformstack_yaml)?;
 
@@ -733,6 +757,58 @@ spec:
     )
 }
 
+/// The origin-firewall intent this bootstrap should write into the CR (A4).
+/// Pure.
+///
+/// `local` is the target store's toggle (`None` = the target never said);
+/// `live` is what the cluster's `PlatformStack` already records (`None` = a
+/// fresh cluster, an older CR, or a read that did not come back).
+///
+/// THE SSA OMISSION TRAP. The render is server-side-applied under field
+/// manager `apprafter-cli`, and under one manager **omitting a field removes
+/// it**. So the three candidate behaviours for an unknown local toggle are not
+/// interchangeable:
+///
+/// * emitting `false` would REWRITE the cluster's answer. A restore lands
+///   `cloudflareOrigin: true` from the snapshot onto a target whose local
+///   store is still `None` (a fresh `target add`, exactly the "move to a
+///   bigger machine" route) — and the operator's very next `apprafter apply`
+///   would flip it back to `false`, teaching every later backup that the
+///   source had its ports open. That is the worst of the three: it does not
+///   lose an answer, it manufactures a wrong one.
+/// * omitting BLINDLY is safe only while `apprafter-cli` does not own the
+///   field. Once a bootstrap has written it (this machine's store said
+///   `true`), a later bootstrap from a store that says nothing — a second
+///   workstation, a re-`target add` — would prune the value back out of the
+///   CR. Silent, and it takes the backup trail with it.
+/// * carrying the live value forward when the local store has no opinion
+///   keeps both hands off: the field stays exactly as the cluster had it, so
+///   neither a prune nor a rewrite can happen, and the render still only ever
+///   OMITS when nobody anywhere has an answer.
+///
+/// The local store wins whenever it has one, in both directions: it is the
+/// authority `apprafter apply` builds the node's real firewall from, so a CR
+/// that disagreed with it would be a record of something untrue.
+pub(crate) fn origin_firewall_for_render(local: Option<bool>, live: Option<bool>) -> Option<bool> {
+    local.or(live)
+}
+
+/// Read the origin-firewall intent already recorded in the cluster, so the
+/// bootstrap render can carry it forward rather than prune it (see
+/// [`origin_firewall_for_render`]).
+///
+/// Best-effort by construction: on a fresh provision the CRD is not installed
+/// yet (Argo CD applies it during this very bootstrap), so the read fails and
+/// the answer is `None` — which is correct, there is nothing to preserve. A
+/// bootstrap must never fail over a field nothing in the cluster reads.
+fn live_origin_firewall<K: KubectlRunner>(kubectl: &K, kubeconfig_path: &Path) -> Option<bool> {
+    let body = kubectl
+        .get_raw(PLATFORMSTACK_DEFAULT_RAW_PATH, kubeconfig_path)
+        .ok()?;
+    let stack: serde_json::Value = serde_json::from_str(&body).ok()?;
+    crate::commands::target_firewall::recorded_origin_firewall(&stack)
+}
+
 /// Render the default `PlatformStack` CR YAML the loader applies
 /// once the platform Application reports Healthy. Singleton —
 /// name=default, namespace=apprafter-system. Webhook enforces
@@ -741,9 +817,25 @@ spec:
 /// `tier` is the active CLI target's tier (1..=4). `domain`
 /// is optional — tier 1 deployments without a public domain
 /// omit the field entirely and rely on the chart's defaults.
-pub(crate) fn render_platformstack_default(tier: u8, domain: Option<&str>) -> String {
+///
+/// `origin_firewall` is the resolved intent from
+/// [`origin_firewall_for_render`] — `None` emits NO `firewall:` block at all,
+/// which is what keeps this apply from claiming (and then pruning) a field
+/// nobody has an opinion about.
+pub(crate) fn render_platformstack_default(
+    tier: u8,
+    domain: Option<&str>,
+    origin_firewall: Option<bool>,
+) -> String {
     let domain_line = match domain {
         Some(d) => format!("    domain: \"{d}\"\n"),
+        None => String::new(),
+    };
+    // Absent, NOT `false`: the CR's three-valued field is the record a backup
+    // carries, and "the operator never said" is a different fact from "the
+    // operator said no".
+    let firewall_block = match origin_firewall {
+        Some(on) => format!("  firewall:\n    cloudflareOrigin: {on}\n"),
         None => String::new(),
     };
     // Tier-1 auto-upgrade is the OPT-OUT default at bootstrap because
@@ -770,7 +862,7 @@ metadata:
 spec:
   channel: stable
   autoUpgrade: {auto_upgrade}
-  source:
+{firewall_block}  source:
     upstream: "oci://{repo}/{chart}"
     repoURL: "oci://{repo}/{chart}"
     checkInterval: 6h
@@ -778,6 +870,7 @@ spec:
     tier: {tier}
 {domain_line}"#,
         auto_upgrade = auto_upgrade,
+        firewall_block = firewall_block,
         repo = APPRAFTER_PLATFORM_STACK_DEFAULT_REPO,
         chart = APPRAFTER_PLATFORM_STACK_CHART_NAME,
         tier = tier,
@@ -887,6 +980,14 @@ mod tests {
         /// target-resolution tests below assert on CONTENT — which
         /// target's kubeconfig, which target's tier.
         slurped: RefCell<Vec<String>>,
+        /// Body `get_raw` answers with. `None` (the default) errors, which
+        /// is what a FRESH cluster does: the `platformstacks` CRD is applied
+        /// by this very bootstrap, so the pre-render read of the existing CR
+        /// cannot succeed there. Set it to stand in for a re-bootstrap of a
+        /// cluster that already carries a PlatformStack.
+        raw_body: RefCell<Option<String>>,
+        /// Raw paths this runner was asked for.
+        raw_gets: RefCell<Vec<String>>,
     }
 
     impl FakeKubectl {
@@ -959,8 +1060,14 @@ mod tests {
             });
             Ok(())
         }
-        fn get_raw(&self, _: &str, _: &Path) -> Result<String> {
-            unreachable!("cluster-bootstrap never reads raw API paths")
+        fn get_raw(&self, path: &str, _: &Path) -> Result<String> {
+            self.raw_gets.borrow_mut().push(path.to_string());
+            match self.raw_body.borrow().clone() {
+                Some(body) => Ok(body),
+                None => Err(cli_core::CliError::Other(
+                    "the server doesn't have a resource type \"platformstacks\"".to_string(),
+                )),
+            }
         }
     }
 
@@ -1425,7 +1532,7 @@ mod tests {
 
     #[test]
     fn render_platformstack_default_includes_tier_and_domain() {
-        let yaml = render_platformstack_default(2, Some("example.com"));
+        let yaml = render_platformstack_default(2, Some("example.com"), None);
         assert!(yaml.contains("name: default"));
         assert!(yaml.contains("namespace: apprafter-system"));
         assert!(yaml.contains("channel: stable"));
@@ -1438,23 +1545,106 @@ mod tests {
 
     #[test]
     fn render_platformstack_default_omits_domain_when_unset() {
-        let yaml = render_platformstack_default(1, None);
+        let yaml = render_platformstack_default(1, None, None);
         assert!(yaml.contains("tier: 1"));
         assert!(!yaml.contains("domain:"));
+    }
+
+    /// A4, the WRITE half: a target that records the origin firewall puts it
+    /// in the CR, which is the only place a backup can see it. Both values,
+    /// because `false` is a real answer — an operator who turned the toggle
+    /// off has said something, and a restore reading that must not treat it
+    /// as "unknown".
+    #[test]
+    fn render_platformstack_default_writes_the_recorded_origin_firewall() {
+        let on = render_platformstack_default(1, None, Some(true));
+        assert!(
+            on.contains("  firewall:\n    cloudflareOrigin: true\n"),
+            "{on}"
+        );
+        let off = render_platformstack_default(1, None, Some(false));
+        assert!(
+            off.contains("  firewall:\n    cloudflareOrigin: false\n"),
+            "{off}"
+        );
+        // The block is a sibling of `source:`/`values:`, not swallowed by
+        // either — a wrongly-indented block would be a `source` sub-field and
+        // the apiserver would reject the whole apply.
+        assert!(on.contains("cloudflareOrigin: true\n  source:\n"), "{on}");
+    }
+
+    /// THE SSA OMISSION DECISION (A4). An unknown intent emits NO `firewall:`
+    /// block — it does NOT emit `false`.
+    ///
+    /// This apply is server-side, under field manager `apprafter-cli`, and it
+    /// runs on every `apprafter apply`. The sequence that matters: `restore
+    /// --reprovision --target new` lands `cloudflareOrigin: true` from the
+    /// snapshot onto a target whose local store is still empty (`target add`
+    /// writes `firewall: None`). If the next bootstrap rendered `false` here,
+    /// it would overwrite the restored answer with a wrong one, and every
+    /// backup afterwards would carry "the source had its ports open".
+    /// Omitting leaves the field to whoever owns it.
+    #[test]
+    fn render_platformstack_default_emits_no_firewall_block_when_unknown() {
+        let yaml = render_platformstack_default(1, None, None);
+        assert!(
+            !yaml.contains("firewall"),
+            "an unknown toggle must write NOTHING, not `false`: {yaml}"
+        );
+        assert!(
+            !yaml.contains("cloudflareOrigin"),
+            "an unknown toggle must write NOTHING, not `false`: {yaml}"
+        );
+    }
+
+    /// The other half of the same trap: omitting is only safe while nobody
+    /// has an answer. `apprafter-cli` owns this field the moment it writes
+    /// it, and under one field manager omission is REMOVAL — so a second
+    /// bootstrap from a machine whose target store says nothing would prune
+    /// a value the cluster legitimately holds (a restore put it there, or
+    /// another workstation did). The live value is carried forward for
+    /// exactly that case.
+    ///
+    /// The local store still wins when it HAS an opinion, in both
+    /// directions: it is what `apprafter apply` builds the node's real
+    /// firewall from, so a CR that disagreed would be a record of something
+    /// untrue.
+    #[test]
+    fn origin_firewall_for_render_prefers_local_and_preserves_the_live_value() {
+        // Nobody knows anything ⇒ write nothing.
+        assert_eq!(origin_firewall_for_render(None, None), None);
+
+        // The local store says nothing; the cluster does ⇒ carry it forward
+        // rather than prune it. BOTH values, because preserving only `true`
+        // would turn a recorded `false` into "unknown" on the next bootstrap.
+        assert_eq!(origin_firewall_for_render(None, Some(true)), Some(true));
+        assert_eq!(origin_firewall_for_render(None, Some(false)), Some(false));
+
+        // The local store has an opinion ⇒ it wins, including when it
+        // contradicts the cluster (the operator just ran `disable`).
+        assert_eq!(
+            origin_firewall_for_render(Some(false), Some(true)),
+            Some(false)
+        );
+        assert_eq!(
+            origin_firewall_for_render(Some(true), Some(false)),
+            Some(true)
+        );
+        assert_eq!(origin_firewall_for_render(Some(true), None), Some(true));
     }
 
     #[test]
     fn render_platformstack_default_tier1_auto_upgrade_is_opt_out() {
         // Tier-1 bootstrap default is opt-out auto-upgrade (true): the
         // MigrationPlan gate makes auto-advance safe (ADR 0026).
-        let yaml = render_platformstack_default(1, None);
+        let yaml = render_platformstack_default(1, None, None);
         assert!(yaml.contains("autoUpgrade: true"));
         assert!(!yaml.contains("autoUpgrade: false"));
     }
 
     #[test]
     fn render_platformstack_default_uses_apprafter_oci_repo() {
-        let yaml = render_platformstack_default(1, None);
+        let yaml = render_platformstack_default(1, None, None);
         assert!(yaml.contains("oci://ghcr.io/apprafter/platform-stack"));
     }
 
@@ -1650,10 +1840,20 @@ mod tests {
         root: &Path,
         target_override: Option<&str>,
     ) -> (FakeHelm, FakeKubectl, Result<()>) {
+        run_phase_three_with(root, target_override, FakeKubectl::default())
+    }
+
+    /// [`run_phase_three`] with a pre-armed kubectl — used by the tests that
+    /// need the pre-render read of the live `PlatformStack` to answer with
+    /// something other than "no such resource".
+    fn run_phase_three_with(
+        root: &Path,
+        target_override: Option<&str>,
+        kubectl: FakeKubectl,
+    ) -> (FakeHelm, FakeKubectl, Result<()>) {
         use cli_core::target::CONFIG_DIR_ENV;
 
         let helm = FakeHelm::default();
-        let kubectl = FakeKubectl::default();
 
         let guard = CONFIG_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var_os(CONFIG_DIR_ENV);
@@ -1736,6 +1936,143 @@ mod tests {
         assert!(
             corpus.contains("tier: 2"),
             "PlatformStack must carry `origin`'s tier (team ⇒ 2)\n{corpus}"
+        );
+    }
+
+    /// A single complete target whose local config records `firewall`
+    /// exactly as `local` says — `None` is a target that never ran the
+    /// toggle, which is what `target add` writes.
+    fn one_target_store(local: Option<bool>) -> tempfile::TempDir {
+        use cli_core::target::{
+            save_global_config, save_target, FirewallConfig, GlobalConfig, Target, TargetConfig,
+            TargetCredentials, TargetStorePaths,
+        };
+        use cli_state::{HetznerCloudState, State, StatePaths};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TargetStorePaths::for_root(dir.path().to_path_buf());
+        save_target(
+            &store,
+            &Target {
+                name: "solo".into(),
+                config: TargetConfig {
+                    provider: "hetzner-cloud".into(),
+                    default_tier: Some("solo".into()),
+                    firewall: local.map(|cloudflare_origin| FirewallConfig { cloudflare_origin }),
+                    ..Default::default()
+                },
+                credentials: TargetCredentials::default(),
+            },
+        )
+        .expect("save target");
+        State {
+            hetzner_cloud: Some(HetznerCloudState {
+                server_id: 1,
+                server_name: "solo-node".into(),
+                server_type: None,
+                ssh_key_ids: vec![],
+                network_id: None,
+                firewall_id: None,
+                floating_ip_ids: vec![],
+                kubeconfig_yaml: Some("apiVersion: v1\nkind: Config\n# SOLO-CLUSTER\n".into()),
+                kubeconfig_age: None,
+                argocd_admin_password_age: None,
+            }),
+            ..Default::default()
+        }
+        .save(&StatePaths::for_active_target(&store, "solo"))
+        .expect("save state");
+        save_global_config(
+            &store,
+            &GlobalConfig {
+                active_target: "solo".into(),
+                ..Default::default()
+            },
+        )
+        .expect("save global config");
+        dir
+    }
+
+    /// END TO END (A4): the toggle an operator set on this target reaches the
+    /// `PlatformStack` the bootstrap applies — which is what puts it inside
+    /// every future backup, including the scheduled in-cluster one that has
+    /// no target store to read.
+    ///
+    /// Asserted on the SLURPED APPLY, not on the render: a render that got it
+    /// right and a caller that passed the wrong target's config (or none)
+    /// would leave this red, which is the same seam the C1 guard above uses.
+    #[test]
+    fn phase_three_carries_the_targets_origin_firewall_into_the_platformstack() {
+        let dir = one_target_store(Some(true));
+        let (_helm, kubectl, outcome) = run_phase_three(dir.path(), None);
+        outcome.expect("bootstrap against the active target");
+
+        let corpus = kubectl.slurped_corpus();
+        assert!(
+            corpus.contains("cloudflareOrigin: true"),
+            "the target's origin-firewall toggle must reach the applied \
+             PlatformStack — nothing else can put it in a backup\n{corpus}"
+        );
+    }
+
+    /// THE PRUNE GUARD (A4). A target that says nothing must not erase what
+    /// the cluster already recorded.
+    ///
+    /// This is the "restore put it there, the local store never heard about
+    /// it" shape: `restore --reprovision --target new` applies
+    /// `cloudflareOrigin: true` from the snapshot, and a fresh `target add`
+    /// wrote `firewall: None`. The PlatformStack apply is server-side under
+    /// `apprafter-cli`, so an omitted field is a REMOVED field once this
+    /// manager owns it — the render therefore reads the live value first and
+    /// carries it forward.
+    #[test]
+    fn phase_three_preserves_an_origin_firewall_the_target_does_not_know_about() {
+        let dir = one_target_store(None);
+        let kubectl = FakeKubectl {
+            raw_body: RefCell::new(Some(
+                r#"{"kind":"PlatformStack","spec":{"firewall":{"cloudflareOrigin":true}}}"#
+                    .to_string(),
+            )),
+            ..Default::default()
+        };
+        let (_helm, kubectl, outcome) = run_phase_three_with(dir.path(), None, kubectl);
+        outcome.expect("bootstrap against the active target");
+
+        assert_eq!(
+            kubectl.raw_gets.borrow().as_slice(),
+            &[PLATFORMSTACK_DEFAULT_RAW_PATH.to_string()],
+            "the live PlatformStack must be read exactly once, before the apply"
+        );
+        let corpus = kubectl.slurped_corpus();
+        assert!(
+            corpus.contains("cloudflareOrigin: true"),
+            "the cluster's own value must be carried forward, not pruned\n{corpus}"
+        );
+        assert!(
+            !corpus.contains("cloudflareOrigin: false"),
+            "and never rewritten to `false`\n{corpus}"
+        );
+    }
+
+    /// The same shape on a FRESH cluster, where the read cannot succeed (the
+    /// `platformstacks` CRD is applied by this very bootstrap): nobody has an
+    /// answer, so the apply carries no `firewall` block at all — rather than
+    /// a `false` that a later restore would have to argue with.
+    #[test]
+    fn phase_three_writes_no_firewall_block_when_nobody_has_an_answer() {
+        let dir = one_target_store(None);
+        let (_helm, kubectl, outcome) = run_phase_three(dir.path(), None);
+        outcome.expect("bootstrap against the active target");
+
+        let corpus = kubectl.slurped_corpus();
+        assert!(
+            corpus.contains("kind: PlatformStack"),
+            "sanity: the PlatformStack apply is in the corpus\n{corpus}"
+        );
+        assert!(
+            !corpus.contains("cloudflareOrigin"),
+            "an unreadable/absent live value plus an empty target store means \
+             UNKNOWN, and unknown writes nothing\n{corpus}"
         );
     }
 }

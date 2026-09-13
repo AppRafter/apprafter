@@ -29,16 +29,22 @@ bypass Cloudflare by hitting the node directly:
 apprafter target firewall cloudflare-origin enable
 ```
 
-It's a cluster-wide setting — do it once, not per zone. The toggle is stored on
-the **target**, not in the cluster, so it survives re-provisioning that target,
-and `apprafter restore --reprovision` carries it onto the new target when you
-rebuild somewhere else. Run `apprafter target firewall cloudflare-origin
+It's a cluster-wide setting — do it once, not per zone. The command records it
+in two places: on the **target** on your machine, which is what `apprafter
+apply` builds the node's firewall from, and in the cluster's `PlatformStack`,
+which is what a backup can see. So it survives re-provisioning that target, and
+`apprafter restore --reprovision` reads it back out of the restored
+`PlatformStack` and turns it on for the new target when you rebuild somewhere
+else. Run `apprafter target firewall cloudflare-origin
 disable` to reopen `80`/`443`. What the restriction buys, and what it does not, is
 [The public route](../how-it-works/the-public-route.md#what-the-origin-firewall-buys-and-what-it-does-not).
 
 > Infrastructure-as-code / fork users can instead opt in via the manifest:
 > `spec: firewall: cloudflareOrigin: true` + `apprafter apply` (a manifest value
-> overrides the CLI toggle).
+> overrides the CLI toggle). That route keeps the intent in your own
+> repository, where a rebuild reads it from the manifest — it is not recorded
+> in the cluster, so a restore onto a machine built without that manifest will
+> not turn the firewall on by itself.
 
 ## 2. Per zone (repeat for each domain)
 
@@ -193,11 +199,13 @@ apprafter target cert import <name> --cert ./origin.pem --key ./origin.key
 That is the whole repair: the zone is still registered and the Gateway picks the
 Secret up.
 
-The origin firewall from step 1 is per-target and lives on your machine, not in
-the cluster. `restore --reprovision` carries it onto the target it provisions;
-a restore into an already-running cluster leaves the firewall alone and says so.
-Either way the restore summary states which happened —
-[Restore from a backup](restore.md).
+The origin firewall from step 1 comes back on its own: the intent is part of
+the `PlatformStack`, so the restore reads it back and turns the firewall on for
+the target it provisioned. A restore into an already-running cluster leaves the
+firewall alone and says so. Either way the restore summary states which
+happened — and note that on a `--reprovision` the new node's `80`/`443` are
+open until the restore reaches that point, so move DNS after it finishes, not
+before. [Restore from a backup](restore.md).
 
 ## Removing a zone
 

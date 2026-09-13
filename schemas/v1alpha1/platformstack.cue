@@ -56,6 +56,31 @@ package v1alpha1
 		}
 	}
 
+	// Edge-firewall posture of the node this cluster runs on (A4).
+	//
+	// Nothing in the cluster reads this. The firewall itself is a CLOUD
+	// object the CLI reconciles out-of-cluster from the operator's target
+	// store, which is the only place the intent used to live — so a backup
+	// could not see it, a restore onto a new target re-provisioned the node
+	// with 80/443 open to the internet, and nothing said so.
+	//
+	// Recording it HERE is what makes it travel: `PlatformStack/default` is
+	// the first object every backup captures, including the scheduled
+	// in-cluster runner's, which has no target store to read. A restore
+	// replays the CR and reconciles the destination target's firewall from
+	// it.
+	//
+	// `cloudflareOrigin` is deliberately three-valued: absent means the
+	// cluster never recorded an answer (a CR written before this field
+	// existed), NOT "the firewall was off". A reader that collapses the two
+	// tells an operator the source had its ports open when the snapshot
+	// simply never said.
+	firewall?: {
+		// Is the node's 80/443 restricted to Cloudflare's IP ranges
+		// (`apprafter target firewall cloudflare-origin`, 1.83d)?
+		cloudflareOrigin?: bool
+	}
+
 	// Cluster-wide vertical-autoscaling posture (2.16e / ADR 0054). Absent =
 	// operator uses compiled-in tier defaults (read-with-fallback; the operator
 	// never writes this back). `mode` selects the VPA update policy the operator
