@@ -115,6 +115,31 @@ repository encrypted with an empty key.
 **The passphrase is yours to keep.** AppRafter does not store it. Lose it and
 the backup is unrecoverable. The same goes for the S3 credentials below.
 
+### The passphrase also protects the repository's own credentials
+
+The secret sweep captures every sealed secret in the cluster, `apprafter-system`
+included, and stages each one decoded — so the backup's own S3 keys and
+`RESTIC_PASSWORD` sit in the snapshot's file tree like any other secret. That
+tree is inside a restic repository, so nothing is lying in the open and
+[re-enabling a restored schedule](restore.md) is the feature it pays for. What
+it does mean is that the passphrase is the whole boundary. Three consequences
+worth acting on:
+
+- **Hand the passphrase only to people you would trust with write and delete on
+  that bucket.** Anyone who can open a snapshot to restore from it can also read
+  the S3 credentials inside it, and keep them.
+- **Scope the S3 credential to the one bucket.** Then what is inside a snapshot
+  reaches no further than the repository it came from. [Backup
+  maintenance](backup-maintenance.md) narrows it further still: under the
+  default `enforce: operator`, the credential the *cluster* holds need not carry
+  delete rights at all.
+- **Rotating the S3 credential does not remove it from the snapshots already
+  taken.** They still hold the old keys, readable with the same passphrase — so
+  a rotation stops the old keys working, and re-keying the repository with stock
+  restic (`restic key add`, then `restic key remove` the old one) is what makes
+  the existing snapshots unreadable to whoever held the old passphrase. Doing
+  only one of the two leaves the other half open.
+
 ## Back up off-site, on a schedule
 
 One command seals the credentials into the cluster and turns the scheduled
@@ -408,9 +433,11 @@ discrimination that keeps a restore from clobbering the target's own bootstrap:
 
   One consequence worth stating: the backup credential itself
   (`apprafter-backup-s3`) is a sealed secret, so it travels in the
-  repository too. The repository is encrypted, and this changes nothing about
-  who can read it — but it does mean a restore hands the new cluster the
-  credentials of the repository it came from.
+  repository too — which is what lets a restore hand the new cluster the
+  configuration of the repository it came from, schedule included. It also
+  means the repository's own S3 keys are inside it; the passphrase is what
+  keeps them there, and [what that costs](#the-passphrase-also-protects-the-repositorys-own-credentials)
+  is worth reading before you share it.
 - **`SourceCredential` material** lives in `apprafter-system`, **outside** the
   app-namespace set, so the app-ns sweep misses it. The backup instead
   follows each `SourceCredential`'s `spec.git.backend.sealedSecretRef` and

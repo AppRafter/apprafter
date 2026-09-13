@@ -292,6 +292,13 @@ compensating provider controls (object versioning / object lock).
 > the passphrase must be saved **outside** the cluster and, in the spirit of the
 > `operator` model, kept off the cluster wherever the workflow allows. Do not
 > read "survives a compromise" as "the history is secret."
+>
+> The same boundary runs the other way, and it is the reason to be deliberate
+> about who gets the passphrase: the snapshots contain the repository's **own**
+> S3 credentials, because the sweep captures `apprafter-system` like every other
+> namespace. Whoever you hand the passphrase to for a restore can read them —
+> see [the passphrase also protects the repository's own
+> credentials](backup-restore.md#the-passphrase-also-protects-the-repositorys-own-credentials).
 
 ## Reading the repository without AppRafter
 
