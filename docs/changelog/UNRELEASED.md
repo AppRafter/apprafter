@@ -338,6 +338,42 @@ criterion turned up, in the same spirit and by the same route.
   no data to miss. Capturing the streams is separate, larger work and is not
   underway; nothing in the wording suggests otherwise.
 
+- **A second attempt at an interrupted `restore --data-only` no longer resumes
+  the application to zero.** The mode suspends the running workload before
+  loading data over it, and read the replica count to come back to off the live
+  object, keeping it only in memory. A run that scaled an app from 3 to 0 and
+  then failed at the load — a timeout, a lost connection, a `Ctrl-C` — took
+  that number with it; the obvious re-run read the live count, which was now
+  the `0` the first run had written, "resumed" the app to `0` and reported
+  success over an application that stayed down. The in-run guard against
+  exactly this mistake could not span two processes.
+
+  The count is now recorded **on the application**, as the
+  `apprafter.io/pre-restore-replicas` annotation, in the same merge-patch that
+  scales it to zero — so there is no instant in which an app is down with no
+  record of its size. A later run prefers the annotation over the live field
+  (including a recorded `0`, which is a deliberately stopped app rather than
+  damage), and the resume clears it. An operator who abandons the restore
+  entirely can read it and recover by hand, which the in-memory list never
+  allowed. The full restore was never affected: it reads its counts from the
+  backup artifact, which says the same thing every time.
+
+- **A restore that stops partway now says what it left behind.** Both modes
+  hold every workload at zero replicas with Argo CD auto-sync off for the
+  middle of the run and only resume them in the last step, so a failed or
+  interrupted restore leaves a deliberately-down cluster — and said nothing
+  about it beyond the error. It now names each application it left scaled to
+  zero and each Argo CD Application whose auto-sync it disabled, states that
+  re-running the same command is the way to continue, and prints the patches
+  to put them back by hand instead.
+
+  It also states the limit plainly rather than implying otherwise: **there is
+  no resume.** The restore has no checkpoints and no `--continue`, so a re-run
+  replays every step from the first, re-fetching the snapshot and re-loading
+  the data. The hint is on the error path only — a `Ctrl-C` kills the process
+  without running it — which is precisely why the replica count is recorded in
+  the cluster rather than in the process.
+
 ### Added
 
 - **`spec.backup.clusterName`** — the name this cluster's snapshots are listed

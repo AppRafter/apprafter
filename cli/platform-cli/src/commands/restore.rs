@@ -19,6 +19,14 @@
 //!   disable its Argo auto-sync) → `LoadData` → `ResumeWorkloads`.
 //!   No CR/secret replay.
 //!
+//! Both modes hold every workload at zero replicas for the middle of the run
+//! and only resume it in the last step, so a run that STOPS partway leaves a
+//! deliberately-down cluster. Two things exist for that: each suspended app
+//! carries its pre-restore replica count in the
+//! [`PRE_RESTORE_REPLICAS_ANNOTATION`] (so the count outlives the process and
+//! a re-run cannot mistake the zero it wrote for the app's real size), and
+//! [`interrupted_restore_lines`] names what was left down on the way out.
+//!
 //! `--reprovision` (mode a) provisions a FRESH cluster in the target first
 //! (`bootstrap_all::run`), then replays as restore-into-running.
 //!
@@ -76,6 +84,21 @@ const RESTORE_FIELD_MANAGER: &str = "apprafter-restore";
 /// for service "admission-webhook"`. 30 × 10s = 5 min.
 const PLATFORMSTACK_APPLY_ATTEMPTS: u32 = 30;
 const PLATFORMSTACK_APPLY_BACKOFF_SECS: u64 = 10;
+
+/// Annotation `SuspendWorkloads` stamps on an AppRafter `Application` carrying
+/// the replica count it had BEFORE the restore scaled it to zero — in the SAME
+/// merge-patch that scales it, so the record cannot lag the write it describes.
+///
+/// WHY IT IS ON THE OBJECT (H5). `--data-only` reads the count to resume to off
+/// the LIVE Application, and kept it only in a local `Vec`. A run that scaled an
+/// app to 0 and then died at `LoadData` — a timeout, a severed connection, a
+/// Ctrl-C — left that vec with the process; the obvious re-run then read the
+/// live count, which was now the `0` the first run had written, "resumed" to 0
+/// and reported success over an application that stayed down. The in-run guard
+/// in [`apps_to_suspend`] cannot see across two processes; an annotation can,
+/// because it lives where the damage does. It is also readable by hand, which
+/// is what makes an ABANDONED restore recoverable at all.
+const PRE_RESTORE_REPLICAS_ANNOTATION: &str = "apprafter.io/pre-restore-replicas";
 
 /// Poll budget for `WaitClaimsBound`: wait for every regenerated ResourceClaim
 /// to report `status.ready == true` (NOT PVC Bound — R1: 2.6b marks disk ready
@@ -237,6 +260,108 @@ fn restore_summary(
     lines.extend(edge_inheritance_lines(edge));
     if let Some(w) = version_warning {
         lines.push(format!("  ⚠ {w}"));
+    }
+    lines
+}
+
+/// What a FAILED or interrupted restore says on its way out: which
+/// applications it left down, whose Argo CD auto-sync it left off, and what to
+/// do about it. Pure — printed to stderr just before the error itself.
+///
+/// WHY. Both restore modes hold every workload at zero replicas for the middle
+/// of the run and only resume it in the last step. A run that dies before that
+/// step is therefore a dead cluster BY DESIGN, and the operator staring at it
+/// had no way to tell that from a cluster the restore broke. Naming the apps is
+/// most of the answer; the rest is saying that re-running is the way forward.
+///
+/// It says plainly that there is NO resume. The restore has no checkpoints and
+/// no `--continue`: a re-run replays every step from the first, re-fetching the
+/// snapshot and re-loading the data. Implying otherwise would be worse than
+/// saying nothing, because an operator who believes work is being skipped will
+/// not budget the time for it.
+///
+/// Empty when the run wrote nothing — a failure at `RestoreArtifact` has left
+/// no state to describe, and the error alone is the whole story.
+fn interrupted_restore_lines(
+    data_only: bool,
+    suspended_apps: &[((String, String), i64)],
+    suspended_argo: &[(String, String)],
+) -> Vec<String> {
+    if suspended_apps.is_empty() && suspended_argo.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = vec![
+        String::new(),
+        "✗ The restore stopped before it finished, and it did not undo what it had already done."
+            .to_string(),
+    ];
+
+    if !suspended_apps.is_empty() {
+        lines.push(if data_only {
+            format!(
+                "  {} application(s) were scaled to 0 replicas for the load and are still down:",
+                suspended_apps.len()
+            )
+        } else {
+            format!(
+                "  {} application(s) were applied from the backup at 0 replicas — a restore \
+                 holds every workload down until its last step — and are still down:",
+                suspended_apps.len()
+            )
+        });
+        for ((ns, name), replicas) in suspended_apps {
+            lines.push(format!(
+                "    - {ns}/{name} ({replicas} replica(s) when it comes back up)"
+            ));
+        }
+    }
+
+    if !suspended_argo.is_empty() {
+        lines.push(format!(
+            "  Argo CD auto-sync is switched OFF on {} Application(s), so GitOps will not put \
+             any of this back on its own:",
+            suspended_argo.len()
+        ));
+        for (ns, name) in suspended_argo {
+            lines.push(format!("    - {ns}/{name}"));
+        }
+    }
+
+    lines.push(
+        "  Re-running the SAME command is the way to continue: its last step is the one that \
+         puts the replica counts and auto-sync back."
+            .to_string(),
+    );
+    lines.push(
+        "  There is no resume — the restore has no checkpoints and no --continue, so a re-run \
+         replays EVERY step from the first, including re-fetching the snapshot and re-loading \
+         the data."
+            .to_string(),
+    );
+    lines.push(if data_only {
+        format!(
+            "  The counts above are recorded on the applications themselves (the \
+             {PRE_RESTORE_REPLICAS_ANNOTATION} annotation), so a re-run resumes each app to its \
+             real count and not to the 0 this run left behind."
+        )
+    } else {
+        "  The counts above come from the backup, so a re-run reads them from the artifact again \
+         and does not depend on anything this run remembered."
+            .to_string()
+    });
+    lines.push("  To put them back by hand instead, without finishing the restore:".to_string());
+    for ((ns, name), replicas) in suspended_apps {
+        lines.push(format!(
+            "    kubectl -n {ns} patch applications.apprafter.io {name} --type=merge -p '{}'",
+            resume_patch_body(*replicas)
+        ));
+    }
+    for (ns, name) in suspended_argo {
+        lines.push(format!(
+            "    kubectl -n {ns} patch applications.argoproj.io {name} --type=merge -p '{}'",
+            argo_autosync_patch_body(true)
+        ));
     }
     lines
 }
@@ -540,114 +665,145 @@ pub fn run_restore(
 
     let snap = snapshot.unwrap_or("latest");
 
-    for step in &steps {
-        // The Reprovision step provisions + bootstraps a fresh cluster in the
-        // target (topology + cloud token come from the target's local config,
-        // exactly as `apprafter up` — R2), then resolves the now-cached
-        // kubeconfig. It is always first, and every later step needs kc.
-        if let RestoreStep::Reprovision = step {
-            println!(
-                "→ --reprovision: provisioning a fresh cluster in target '{}' before replay",
-                target.unwrap_or("<active>")
-            );
-            crate::commands::bootstrap_all::run(target, false, server_type)?;
-            kc = Some(ensure_kubeconfig_tempfile_for_target(target)?);
-            continue;
+    // Every step runs inside this closure so the whole run has ONE exit: the
+    // interruption hint below then sees the partial state the steps already
+    // wrote into the cluster, whichever of them failed.
+    //
+    // THE ERROR PATH ONLY — signals are deliberately NOT handled. A default
+    // Ctrl-C kills the process without unwinding, so neither this hint nor any
+    // `Drop` guard runs. A SIGINT handler could print the same lines, but it
+    // could not safely undo a half-issued kubectl from another thread, so it
+    // would buy a message and a second exit path. The durable half of the
+    // answer is the [`PRE_RESTORE_REPLICAS_ANNOTATION`] instead: it is in the
+    // cluster before the scale-to-zero it describes, so the recorded count
+    // survives a signal, a severed connection and a kill -9 alike, and the
+    // re-run recovers with or without anything having been printed.
+    let outcome = (|| -> Result<()> {
+        for step in &steps {
+            // The Reprovision step provisions + bootstraps a fresh cluster in the
+            // target (topology + cloud token come from the target's local config,
+            // exactly as `apprafter up` — R2), then resolves the now-cached
+            // kubeconfig. It is always first, and every later step needs kc.
+            if let RestoreStep::Reprovision = step {
+                println!(
+                    "→ --reprovision: provisioning a fresh cluster in target '{}' before replay",
+                    target.unwrap_or("<active>")
+                );
+                crate::commands::bootstrap_all::run(target, false, server_type)?;
+                kc = Some(ensure_kubeconfig_tempfile_for_target(target)?);
+                continue;
+            }
+            let kc = kc.as_ref().ok_or_else(|| {
+                CliError::Other("internal: kubeconfig unresolved before a restore step".into())
+            })?;
+            match step {
+                RestoreStep::Reprovision => unreachable!("Reprovision handled before the match"),
+                RestoreStep::RestoreArtifact => {
+                    // The TARGET's machine key, so `latest` cannot silently resolve
+                    // to a co-tenant cluster's run in a shared repository (E2).
+                    // Best-effort: a target that cannot name itself falls back to
+                    // the "one cluster in the repo, or refuse" rule, which is the
+                    // half that still refuses to guess.
+                    let this_uid = crate::commands::backup::read_cluster_uid(kc.path()).ok();
+                    let dd = restore_artifact_tree(
+                        &SubprocessRestic {
+                            repo,
+                            pass: &pass,
+                            creds: &creds,
+                        },
+                        snap,
+                        restore_root.path(),
+                        this_uid.as_deref(),
+                    )?;
+
+                    let m = read_backup_manifest(&dd)?;
+                    // m8: reject a backup written by a newer CLI — guard before
+                    // any further parsing or cluster writes.
+                    check_manifest_version(m.manifest_version)?;
+                    let target_version = read_platform_version(kc.path())?;
+                    version_warning =
+                        cross_version_warning(data_only, &target_version, &m.platform_version);
+
+                    data_dir = Some(dd);
+                    manifest = Some(m);
+                }
+                RestoreStep::ApplyImportedCerts => {
+                    let dd = produced_by_artifact(data_dir.as_ref(), "ApplyImportedCerts")?;
+                    let (restored, dangling) = apply_imported_certs(dd, kc.path())?;
+                    edge.certs_restored = restored;
+                    edge.dangling_certs = dangling;
+                }
+                RestoreStep::ApplyPlatformStack => {
+                    let dd = produced_by_artifact(data_dir.as_ref(), "ApplyPlatformStack")?;
+                    let replay = apply_platformstack_from_crs(dd, kc.path(), schedule_flags)?;
+                    inherited_cluster_name = replay.inherited_cluster_name;
+                    schedule = replay.schedule;
+
+                    // A4, at the first moment anything can know: the source's
+                    // origin-firewall intent travels in the CR this step just
+                    // applied, so it is readable here and nowhere earlier. On
+                    // `--reprovision` the node is already up — every minute
+                    // between the provision at step 1 and this line is a minute
+                    // with 80/443 open to the internet, which is why this sits
+                    // immediately after the apply rather than at the end of the
+                    // run.
+                    edge.origin_firewall =
+                        settle_origin_firewall(replay.origin_firewall, reprovision, target);
+                }
+                RestoreStep::EnsureNamespaces => {
+                    let m = produced_by_artifact(manifest.as_ref(), "EnsureNamespaces")?;
+                    ensure_namespaces_all(&m.namespaces, &m.secret_namespaces, kc.path())?;
+                }
+                RestoreStep::ApplySourceCredentials => {
+                    let dd = produced_by_artifact(data_dir.as_ref(), "ApplySourceCredentials")?;
+                    apply_source_credentials(dd, kc.path())?;
+                }
+                RestoreStep::ApplyAppsGated => {
+                    let dd = produced_by_artifact(data_dir.as_ref(), "ApplyAppsGated")?;
+                    apply_apps_gated(dd, kc.path(), &mut suspended_argo, &mut app_replicas)?;
+                }
+                RestoreStep::WaitClaimsBound => {
+                    let m = produced_by_artifact(manifest.as_ref(), "WaitClaimsBound")?;
+                    wait_claims_bound(m, kc.path())?;
+                }
+                RestoreStep::LoadData => {
+                    let dd = produced_by_artifact(data_dir.as_ref(), "LoadData")?;
+                    let m = produced_by_artifact(manifest.as_ref(), "LoadData")?;
+                    load_data(dd, m, kc.path())?;
+                }
+                RestoreStep::ReSealUserSecrets => {
+                    let dd = produced_by_artifact(data_dir.as_ref(), "ReSealUserSecrets")?;
+                    reseal_user_secrets(dd, kc.path())?;
+                }
+                RestoreStep::SuspendWorkloads => {
+                    // --data-only: scale the running app(s) to 0 + disable Argo
+                    // auto-sync so the load doesn't race a live pod. We derive the
+                    // target apps from the backed-up artifact's data/ layout
+                    // (the namespaces/claims that have data to load).
+                    let m = produced_by_artifact(manifest.as_ref(), "SuspendWorkloads")?;
+                    suspend_running_workloads(
+                        m,
+                        kc.path(),
+                        &mut suspended_argo,
+                        &mut app_replicas,
+                    )?;
+                }
+                RestoreStep::ResumeWorkloads => {
+                    resume_workloads(&app_replicas, &suspended_argo, kc.path())?;
+                }
+            }
         }
-        let kc = kc.as_ref().ok_or_else(|| {
-            CliError::Other("internal: kubeconfig unresolved before a restore step".into())
-        })?;
-        match step {
-            RestoreStep::Reprovision => unreachable!("Reprovision handled before the match"),
-            RestoreStep::RestoreArtifact => {
-                // The TARGET's machine key, so `latest` cannot silently resolve
-                // to a co-tenant cluster's run in a shared repository (E2).
-                // Best-effort: a target that cannot name itself falls back to
-                // the "one cluster in the repo, or refuse" rule, which is the
-                // half that still refuses to guess.
-                let this_uid = crate::commands::backup::read_cluster_uid(kc.path()).ok();
-                let dd = restore_artifact_tree(
-                    &SubprocessRestic {
-                        repo,
-                        pass: &pass,
-                        creds: &creds,
-                    },
-                    snap,
-                    restore_root.path(),
-                    this_uid.as_deref(),
-                )?;
+        Ok(())
+    })();
 
-                let m = read_backup_manifest(&dd)?;
-                // m8: reject a backup written by a newer CLI — guard before
-                // any further parsing or cluster writes.
-                check_manifest_version(m.manifest_version)?;
-                let target_version = read_platform_version(kc.path())?;
-                version_warning =
-                    cross_version_warning(data_only, &target_version, &m.platform_version);
-
-                data_dir = Some(dd);
-                manifest = Some(m);
-            }
-            RestoreStep::ApplyImportedCerts => {
-                let dd = produced_by_artifact(data_dir.as_ref(), "ApplyImportedCerts")?;
-                let (restored, dangling) = apply_imported_certs(dd, kc.path())?;
-                edge.certs_restored = restored;
-                edge.dangling_certs = dangling;
-            }
-            RestoreStep::ApplyPlatformStack => {
-                let dd = produced_by_artifact(data_dir.as_ref(), "ApplyPlatformStack")?;
-                let replay = apply_platformstack_from_crs(dd, kc.path(), schedule_flags)?;
-                inherited_cluster_name = replay.inherited_cluster_name;
-                schedule = replay.schedule;
-
-                // A4, at the first moment anything can know: the source's
-                // origin-firewall intent travels in the CR this step just
-                // applied, so it is readable here and nowhere earlier. On
-                // `--reprovision` the node is already up — every minute
-                // between the provision at step 1 and this line is a minute
-                // with 80/443 open to the internet, which is why this sits
-                // immediately after the apply rather than at the end of the
-                // run.
-                edge.origin_firewall =
-                    settle_origin_firewall(replay.origin_firewall, reprovision, target);
-            }
-            RestoreStep::EnsureNamespaces => {
-                let m = produced_by_artifact(manifest.as_ref(), "EnsureNamespaces")?;
-                ensure_namespaces_all(&m.namespaces, &m.secret_namespaces, kc.path())?;
-            }
-            RestoreStep::ApplySourceCredentials => {
-                let dd = produced_by_artifact(data_dir.as_ref(), "ApplySourceCredentials")?;
-                apply_source_credentials(dd, kc.path())?;
-            }
-            RestoreStep::ApplyAppsGated => {
-                let dd = produced_by_artifact(data_dir.as_ref(), "ApplyAppsGated")?;
-                app_replicas = apply_apps_gated(dd, kc.path(), &mut suspended_argo)?;
-            }
-            RestoreStep::WaitClaimsBound => {
-                let m = produced_by_artifact(manifest.as_ref(), "WaitClaimsBound")?;
-                wait_claims_bound(m, kc.path())?;
-            }
-            RestoreStep::LoadData => {
-                let dd = produced_by_artifact(data_dir.as_ref(), "LoadData")?;
-                let m = produced_by_artifact(manifest.as_ref(), "LoadData")?;
-                load_data(dd, m, kc.path())?;
-            }
-            RestoreStep::ReSealUserSecrets => {
-                let dd = produced_by_artifact(data_dir.as_ref(), "ReSealUserSecrets")?;
-                reseal_user_secrets(dd, kc.path())?;
-            }
-            RestoreStep::SuspendWorkloads => {
-                // --data-only: scale the running app(s) to 0 + disable Argo
-                // auto-sync so the load doesn't race a live pod. We derive the
-                // target apps from the backed-up artifact's data/ layout
-                // (the namespaces/claims that have data to load).
-                let m = produced_by_artifact(manifest.as_ref(), "SuspendWorkloads")?;
-                app_replicas = suspend_running_workloads(m, kc.path(), &mut suspended_argo)?;
-            }
-            RestoreStep::ResumeWorkloads => {
-                resume_workloads(&app_replicas, &suspended_argo, kc.path())?;
-            }
+    // A restore that stopped partway leaves the cluster mid-restore, and until
+    // now said nothing about it: the operator saw one error and a dead
+    // application. Name what is down and what puts it back, on the way out.
+    if let Err(err) = outcome {
+        for line in interrupted_restore_lines(data_only, &app_replicas, &suspended_argo) {
+            eprintln!("{line}");
         }
+        return Err(err);
     }
 
     for line in restore_summary(
@@ -1603,26 +1759,31 @@ fn sourcecred_material_files(sc: &Value, sourcecred_dir: &Path) -> Vec<(String, 
 /// (`(ns, name) → replicas`) for `ResumeWorkloads`, and the logical name of
 /// each gated user Argo Application (`(ns, name)`) whose auto-sync to re-enable.
 ///
-/// Returns the recorded `((ns, name), replicas)` list.
-#[allow(clippy::type_complexity)]
+/// Both lists are the caller's and are filled in BEFORE the applies run, not
+/// after: an apply that fails halfway leaves gated, zero-replica apps behind,
+/// and the interruption hint has to be able to name them. The plan is known in
+/// full before the first write, so recording it up front is the honest set —
+/// an app whose apply had not yet run is named too, which over-lists rather
+/// than under-lists, and a re-run fixes both alike.
 fn apply_apps_gated(
     data_dir: &Path,
     kubeconfig: &Path,
     suspended_argo: &mut Vec<(String, String)>,
-) -> Result<Vec<((String, String), i64)>> {
+    app_replicas: &mut Vec<((String, String), i64)>,
+) -> Result<()> {
     let crs = read_crs(data_dir)?;
     let plan = gated_apply_plan(&crs);
+
+    let gated = plan.app_replicas.len();
+    app_replicas.extend(plan.app_replicas);
+    suspended_argo.extend(plan.argo_apps);
 
     for object in &plan.objects {
         apply_cr(object, kubeconfig)?;
     }
-    suspended_argo.extend(plan.argo_apps);
 
-    println!(
-        "  ✓ {} app(s) applied gated (replicas=0, Argo auto-sync stripped)",
-        plan.app_replicas.len()
-    );
-    Ok(plan.app_replicas)
+    println!("  ✓ {gated} app(s) applied gated (replicas=0, Argo auto-sync stripped)");
+    Ok(())
 }
 
 /// What [`apply_apps_gated`] applies, and what it must remember to undo.
@@ -2443,7 +2604,7 @@ fn resume_patches(
             resource: "applications.apprafter.io",
             namespace: ns.clone(),
             name: name.clone(),
-            body: replicas_patch_body(*replicas),
+            body: resume_patch_body(*replicas),
         })
         .collect();
     out.extend(suspended_argo.iter().map(|(ns, name)| MergePatch {
@@ -2455,9 +2616,64 @@ fn resume_patches(
     out
 }
 
-/// Merge-patch body setting an AppRafter Application's base replica count.
-fn replicas_patch_body(replicas: i64) -> String {
-    format!(r#"{{"spec":{{"base":{{"replicas":{replicas}}}}}}}"#)
+/// The patches that quiesce ONE application for a `--data-only` load — the
+/// pure seam of the write half of [`suspend_running_workloads`], mirroring
+/// [`resume_patches`] on the way back up.
+///
+/// Argo CD auto-sync goes off BEFORE the scale-to-zero, because self-heal
+/// would otherwise put the replica count straight back and the load would run
+/// under a live pod — which is the entire reason this step exists. The
+/// application's own patch is [`suspend_patch_body`]: the record and the scale
+/// in one write.
+fn suspend_patches(
+    ns: &str,
+    name: &str,
+    argo: &[(String, String)],
+    replicas: i64,
+) -> Vec<MergePatch> {
+    let mut out: Vec<MergePatch> = argo
+        .iter()
+        .map(|(argo_ns, argo_name)| MergePatch {
+            resource: "applications.argoproj.io",
+            namespace: argo_ns.clone(),
+            name: argo_name.clone(),
+            body: argo_autosync_patch_body(false),
+        })
+        .collect();
+    out.push(MergePatch {
+        resource: "applications.apprafter.io",
+        namespace: ns.to_string(),
+        name: name.to_string(),
+        body: suspend_patch_body(replicas),
+    });
+    out
+}
+
+/// Merge-patch body that SUSPENDS an AppRafter Application: scale to zero and
+/// record, in the same write, the count to come back to (H5).
+///
+/// One patch, not two, and deliberately so — an app at zero replicas with no
+/// record of what it was is precisely the state a re-run cannot recover from,
+/// and two patches would open a window onto it.
+fn suspend_patch_body(pre_restore_replicas: i64) -> String {
+    format!(
+        r#"{{"metadata":{{"annotations":{{"{PRE_RESTORE_REPLICAS_ANNOTATION}":"{pre_restore_replicas}"}}}},"spec":{{"base":{{"replicas":0}}}}}}"#
+    )
+}
+
+/// Merge-patch body that RESUMES an AppRafter Application: the recorded replica
+/// count back, and the pre-restore annotation removed.
+///
+/// The `null` is how a JSON merge-patch DELETES a key. Clearing it is the last
+/// half of the record's life-cycle: a leftover annotation would win over the
+/// live count on the NEXT restore, and pin an app to a number that stopped
+/// being true the moment this one finished. Removing a key that was never
+/// there is a no-op, so the gated (non-`--data-only`) resume — which reads its
+/// counts from the backup artifact and never annotates — uses the same body.
+fn resume_patch_body(replicas: i64) -> String {
+    format!(
+        r#"{{"metadata":{{"annotations":{{"{PRE_RESTORE_REPLICAS_ANNOTATION}":null}}}},"spec":{{"base":{{"replicas":{replicas}}}}}}}"#
+    )
 }
 
 /// Merge-patch body enabling or disabling an Argo Application's auto-sync.
@@ -2475,56 +2691,79 @@ fn argo_autosync_patch_body(enabled: bool) -> String {
 }
 
 /// **SuspendWorkloads** (`--data-only`) — for each AppRafter Application that
-/// owns a backed-up data artifact, read its CURRENT replica count, disable its
-/// Argo auto-sync, and scale it to 0 so the load doesn't race a running pod.
-/// Returns the recorded `((ns, name), replicas)` list for `ResumeWorkloads`.
+/// owns a backed-up data artifact, record its pre-restore replica count ON THE
+/// OBJECT, disable its Argo auto-sync, and scale it to 0 so the load doesn't
+/// race a running pod.
 ///
 /// The set of apps to suspend is derived from the claims recorded in the
 /// manifest (those whose data we are about to load): we suspend the Application
 /// that lives in the same namespace as each claim. (In practice the data-only
 /// flow targets a single app's claim; suspending its namespace's Application is
 /// the conservative, correct move.)
-#[allow(clippy::type_complexity)]
+///
+/// `recorded` is the caller's list and is appended to AS EACH APP IS SUSPENDED,
+/// not returned at the end: a failure halfway through this step leaves apps
+/// scaled to zero, and the interruption hint can only name them if the caller
+/// already holds them. Same reason `suspended_argo` has always been a `&mut`.
+///
+/// The annotation and the scale-to-zero go out as ONE merge-patch
+/// ([`suspend_patch_body`]), so there is no instant in which an app is at zero
+/// with no record of what it was.
 fn suspend_running_workloads(
     manifest: &BackupManifest,
     kubeconfig: &Path,
     suspended_argo: &mut Vec<(String, String)>,
-) -> Result<Vec<((String, String), i64)>> {
+    recorded: &mut Vec<((String, String), i64)>,
+) -> Result<()> {
     let claim_namespaces = claim_namespaces(manifest);
 
-    let mut recorded: Vec<((String, String), i64)> = Vec::new();
+    let before = recorded.len();
     for ns in &claim_namespaces {
         let apps = list_items("applications.apprafter.io", Some(ns), kubeconfig)?;
-        for (name, replicas) in apps_to_suspend(&apps, ns, &recorded) {
-            recorded.push(((ns.to_string(), name.clone()), replicas));
+        for decision in apps_to_suspend(&apps, ns, recorded) {
+            let SuspendDecision {
+                name,
+                replicas,
+                source,
+            } = decision;
+            match &source {
+                ReplicaSource::Live => {}
+                ReplicaSource::Annotation => println!(
+                    "  ↻ {ns}/{name} still carries a pre-restore record of {replicas} replica(s) \
+                     from an earlier restore that did not finish — resuming to that, not to its \
+                     current count"
+                ),
+                ReplicaSource::UnusableAnnotation(raw) => eprintln!(
+                    "  ⚠ {ns}/{name} has a {PRE_RESTORE_REPLICAS_ANNOTATION} annotation that is \
+                     not a replica count ({raw:?}); using its current count ({replicas}) instead \
+                     — check it is what you want the app resumed to"
+                ),
+            }
+            let argo = argo_apps_for(&name, kubeconfig)?;
 
-            // Disable Argo auto-sync for this app's Argo Application(s) so the
-            // scale-to-0 isn't reverted, then scale to 0.
-            for (argo_ns, argo_name) in argo_apps_for(&name, kubeconfig)? {
+            // Both records go in BEFORE the writes they describe, for the same
+            // reason the annotation does: a patch that fails halfway through
+            // must still leave the caller able to name what is down.
+            recorded.push(((ns.to_string(), name.clone()), replicas));
+            suspended_argo.extend(argo.iter().cloned());
+
+            for patch in suspend_patches(ns, &name, &argo, replicas) {
                 kubectl_merge_patch(
-                    "applications.argoproj.io",
-                    &argo_name,
-                    Some(&argo_ns),
+                    patch.resource,
+                    &patch.name,
+                    Some(&patch.namespace),
                     None,
-                    &argo_autosync_patch_body(false),
+                    &patch.body,
                     kubeconfig,
                 )?;
-                suspended_argo.push((argo_ns, argo_name));
             }
-            kubectl_merge_patch(
-                "applications.apprafter.io",
-                &name,
-                Some(ns),
-                None,
-                &replicas_patch_body(0),
-                kubeconfig,
-            )?;
         }
     }
-    if !recorded.is_empty() {
-        println!("  ✓ {} app(s) suspended for data-only load", recorded.len());
+    let suspended = recorded.len() - before;
+    if suspended > 0 {
+        println!("  ✓ {suspended} app(s) suspended for data-only load");
     }
-    Ok(recorded)
+    Ok(())
 }
 
 /// The namespaces a `--data-only` restore must quiesce: the distinct namespaces
@@ -2543,8 +2782,36 @@ fn claim_namespaces(manifest: &BackupManifest) -> Vec<String> {
     out
 }
 
-/// The `(name, current replicas)` of each Application in one namespace that
-/// still needs suspending — the pure seam of [`suspend_running_workloads`].
+/// One Application a `--data-only` restore is about to quiesce, and the count
+/// it must be resumed to.
+#[derive(Debug, Clone, PartialEq)]
+struct SuspendDecision {
+    /// `metadata.name` of the AppRafter Application.
+    name: String,
+    /// The replica count to record now and patch back at `ResumeWorkloads`.
+    replicas: i64,
+    /// Where `replicas` came from — reported, because "we are using a count
+    /// left by an earlier run" is not something to do silently.
+    source: ReplicaSource,
+}
+
+/// Where a [`SuspendDecision`]'s replica count was read from.
+#[derive(Debug, Clone, PartialEq)]
+enum ReplicaSource {
+    /// The live object's `spec.base.replicas` — the ordinary first run.
+    Live,
+    /// The [`PRE_RESTORE_REPLICAS_ANNOTATION`] an earlier, interrupted run
+    /// left behind. This is the count that run read BEFORE it scaled the app
+    /// to zero, so it is the truth and the live value is the damage.
+    Annotation,
+    /// The annotation was present but not a usable count (the string is what
+    /// it said). The live value was used instead.
+    UnusableAnnotation(String),
+}
+
+/// Each Application in one namespace that still needs suspending, with the
+/// replica count to resume it to — the pure seam of
+/// [`suspend_running_workloads`].
 ///
 /// An Application with no name is skipped (there is nothing to patch), and one
 /// already present in `already_recorded` is skipped so a second pass over the
@@ -2552,29 +2819,82 @@ fn claim_namespaces(manifest: &BackupManifest) -> Vec<String> {
 /// the count to resume, which would leave the app scaled to zero after a
 /// successful restore. An absent `spec.base.replicas` reads as 1, the
 /// operator's own default.
+///
+/// # The count a PREVIOUS run left (H5)
+///
+/// `already_recorded` guards one run against itself and dies with the process,
+/// so the identical mistake spanning two runs — read `3`, scale to `0`, fail;
+/// re-run, read the `0` we wrote, "resume" to `0` — was wide open. The
+/// [`PRE_RESTORE_REPLICAS_ANNOTATION`] is that record made durable, and it
+/// WINS over the live field whenever it parses:
+///
+/// * absent → the live count (first run, nothing to recover from);
+/// * a number, INCLUDING `0` → that number. A `0` there is a deliberately
+///   scaled-down app faithfully recorded by an earlier run, not damage, and
+///   resuming it to 1 would start a workload its operator had stopped;
+/// * anything else (hand-edited, truncated) → the live count, and the caller
+///   says so out loud rather than guessing a number out of a broken string.
+///
+/// The annotation winning is unconditional, not "only when the live count is
+/// 0": the rule has to be one sentence an operator can hold. The cost is that
+/// scaling an app up BY HAND between an interrupted run and its re-run is
+/// superseded by the recorded count — remove the annotation first if that is
+/// what you meant, or let the restore finish and scale afterwards.
 fn apps_to_suspend(
     apps: &[Value],
     ns: &str,
     already_recorded: &[((String, String), i64)],
-) -> Vec<(String, i64)> {
-    let mut out: Vec<(String, i64)> = Vec::new();
+) -> Vec<SuspendDecision> {
+    let mut out: Vec<SuspendDecision> = Vec::new();
     for app in apps {
         let name = cr_string(app, "/metadata/name", "");
         if name.is_empty()
             || already_recorded
                 .iter()
                 .any(|((n, a), _)| n == ns && a == &name)
-            || out.iter().any(|(a, _)| a == &name)
+            || out.iter().any(|d| d.name == name)
         {
             continue;
         }
-        let replicas = app
+        let live = app
             .pointer("/spec/base/replicas")
             .and_then(Value::as_i64)
             .unwrap_or(1);
-        out.push((name, replicas));
+        let (replicas, source) = match recorded_replicas(app) {
+            None => (live, ReplicaSource::Live),
+            Some(Ok(n)) => (n, ReplicaSource::Annotation),
+            Some(Err(raw)) => (live, ReplicaSource::UnusableAnnotation(raw)),
+        };
+        out.push(SuspendDecision {
+            name,
+            replicas,
+            source,
+        });
     }
     out
+}
+
+/// The replica count an earlier run recorded on this Application:
+/// `None` when there is no annotation, `Some(Err(raw))` when there is one that
+/// is not a count. Annotation values are strings by definition, so a
+/// non-string value is as unusable as `"three"` and is reported the same way.
+fn recorded_replicas(app: &Value) -> Option<std::result::Result<i64, String>> {
+    // Addressed key-by-key, not with a JSON pointer: the annotation key holds a
+    // `/`, which a pointer would read as a path separator.
+    let raw = app
+        .get("metadata")?
+        .get("annotations")?
+        .get(PRE_RESTORE_REPLICAS_ANNOTATION)?;
+    // Only a JSON string is even a candidate: the apiserver's annotations are
+    // `map[string]string`, so anything else came from somewhere that was not
+    // the API and is reported rather than coerced.
+    let Some(text) = raw.as_str() else {
+        return Some(Err(raw.to_string()));
+    };
+    Some(match text.trim().parse::<i64>() {
+        Ok(n) if n >= 0 => Ok(n),
+        _ => Err(text.to_string()),
+    })
 }
 
 /// Find the user Argo Application(s) that manage an AppRafter Application by
@@ -4741,11 +5061,114 @@ mod tests {
         assert_eq!(patches[0].name, "web");
         let body: Value = serde_json::from_str(&patches[0].body).unwrap();
         assert_eq!(body["spec"]["base"]["replicas"], 3);
+        // `contains_key` and not `is_null()`: indexing an ABSENT key also
+        // yields null, so the cheap spelling of this assertion passes on a
+        // patch that clears nothing at all.
+        assert!(
+            body["metadata"]["annotations"]
+                .as_object()
+                .is_some_and(|a| a.get(PRE_RESTORE_REPLICAS_ANNOTATION) == Some(&Value::Null)),
+            "the resume also retires the pre-restore record it is acting on"
+        );
         let argo_body: Value = serde_json::from_str(&patches[1].body).unwrap();
         assert_eq!(
             argo_body["spec"]["syncPolicy"]["automated"]["selfHeal"],
             true
         );
+    }
+
+    // =======================================================================
+    // H5: what a restore says when it stops partway
+    // =======================================================================
+
+    /// A run that had already suspended workloads must say so. Both halves of
+    /// the damage are named — the apps at zero and the Argo Applications whose
+    /// auto-sync is off — because an operator looking at a dead cluster cannot
+    /// tell an expected mid-restore state from a broken one.
+    #[test]
+    fn interrupted_restore_names_every_app_and_argo_app_it_left_down() {
+        let apps = vec![
+            (("demo".to_string(), "web".to_string()), 3),
+            (("shop".to_string(), "api".to_string()), 1),
+        ];
+        let argo = vec![("argocd".to_string(), "web-prod".to_string())];
+        let out = interrupted_restore_lines(true, &apps, &argo).join("\n");
+
+        assert!(
+            out.contains("demo/web (3 replica(s) when it comes back up)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("shop/api (1 replica(s) when it comes back up)"),
+            "{out}"
+        );
+        assert!(out.contains("argocd/web-prod"), "{out}");
+        // And the way out, both of them: finish the restore, or patch by hand.
+        assert!(out.contains("Re-running the SAME command"), "{out}");
+        assert!(
+            out.contains("kubectl -n demo patch applications.apprafter.io web --type=merge"),
+            "{out}"
+        );
+        assert!(
+            out.contains("kubectl -n argocd patch applications.argoproj.io web-prod"),
+            "{out}"
+        );
+    }
+
+    /// The honest limit, stated rather than implied: a re-run is not a resume.
+    /// An operator who thinks the finished steps will be skipped budgets the
+    /// wrong amount of time and reads the repeated work as a bug.
+    #[test]
+    fn interrupted_restore_says_there_is_no_resume() {
+        let apps = vec![(("demo".to_string(), "web".to_string()), 3)];
+        for data_only in [true, false] {
+            let out = interrupted_restore_lines(data_only, &apps, &[]).join("\n");
+            assert!(out.contains("There is no resume"), "{out}");
+            assert!(out.contains("--continue"), "{out}");
+            assert!(out.contains("EVERY step from the first"), "{out}");
+        }
+    }
+
+    /// The hint applies to BOTH modes, and says the right thing in each about
+    /// why a re-run recovers the real counts: `--data-only` reads them off the
+    /// annotation it stamped, a full restore off the backup artifact.
+    #[test]
+    fn interrupted_restore_explains_the_right_recovery_per_mode() {
+        let apps = vec![(("demo".to_string(), "web".to_string()), 3)];
+
+        let data_only = interrupted_restore_lines(true, &apps, &[]).join("\n");
+        assert!(
+            data_only.contains("scaled to 0 replicas for the load"),
+            "{data_only}"
+        );
+        assert!(
+            data_only.contains(PRE_RESTORE_REPLICAS_ANNOTATION),
+            "the data-only remedy IS the annotation: {data_only}"
+        );
+
+        let full = interrupted_restore_lines(false, &apps, &[]).join("\n");
+        assert!(
+            full.contains("applied from the backup at 0 replicas"),
+            "{full}"
+        );
+        assert!(
+            full.contains("come from the backup"),
+            "a full restore recovers from the artifact, not from an annotation: {full}"
+        );
+        assert!(
+            !full.contains("recorded on the applications themselves"),
+            "the gated path never annotates — promising it would be a lie: {full}"
+        );
+    }
+
+    /// DOES NOT FIRE: a run that failed before it touched anything (a bad
+    /// passphrase, an unreachable repository) has nothing to confess. Printing
+    /// a scary "the cluster is left mid-restore" block there would send an
+    /// operator hunting for damage that does not exist.
+    #[test]
+    fn interrupted_restore_says_nothing_when_nothing_was_suspended() {
+        assert!(interrupted_restore_lines(true, &[], &[]).is_empty());
+        assert!(interrupted_restore_lines(false, &[], &[]).is_empty());
     }
 
     /// Disabling auto-sync writes an explicit `null` — that is how a JSON
@@ -4761,11 +5184,78 @@ mod tests {
         assert_eq!(on["spec"]["syncPolicy"]["automated"]["selfHeal"], true);
     }
 
+    /// The write path of the suspend, asserted where the unit tests of the
+    /// bodies cannot reach: the app's patch is the one that CARRIES the record
+    /// (a plain scale-to-zero here would leave every body test green and the
+    /// defect alive), and auto-sync is switched off before it, or Argo self-heal
+    /// undoes the scale while the data loads.
     #[test]
-    fn replicas_patch_body_is_a_valid_merge_patch_on_base_replicas() {
-        let body: Value = serde_json::from_str(&replicas_patch_body(0)).unwrap();
+    fn suspend_patches_disable_autosync_before_the_recorded_scale_to_zero() {
+        let argo = vec![("argocd".to_string(), "web-prod".to_string())];
+        let patches = suspend_patches("demo", "web", &argo, 3);
+
+        assert_eq!(
+            patches.iter().map(|p| p.resource).collect::<Vec<&str>>(),
+            vec!["applications.argoproj.io", "applications.apprafter.io"],
+            "auto-sync off FIRST, then the scale"
+        );
+        let off: Value = serde_json::from_str(&patches[0].body).unwrap();
+        assert!(off["spec"]["syncPolicy"]["automated"].is_null());
+
+        assert_eq!(patches[1].namespace, "demo");
+        assert_eq!(patches[1].name, "web");
+        let app: Value = serde_json::from_str(&patches[1].body).unwrap();
+        assert_eq!(app["spec"]["base"]["replicas"], 0);
+        assert_eq!(
+            app["metadata"]["annotations"][PRE_RESTORE_REPLICAS_ANNOTATION], "3",
+            "the scale-to-zero must carry the count to come back to"
+        );
+    }
+
+    /// An app with no Argo Application of its own is still suspended — the
+    /// record and the scale do not depend on GitOps being involved.
+    #[test]
+    fn suspend_patches_still_suspend_an_app_with_no_argo_application() {
+        let patches = suspend_patches("demo", "web", &[], 2);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].resource, "applications.apprafter.io");
+    }
+
+    /// The suspend write carries BOTH halves: the app goes to zero and the
+    /// count to come back to is stamped on it, in one patch. Two patches would
+    /// leave a window in which the app is down with no record of what it was —
+    /// exactly the state a re-run cannot recover from.
+    #[test]
+    fn suspend_patch_body_records_the_count_in_the_same_patch_that_zeroes_it() {
+        let body: Value = serde_json::from_str(&suspend_patch_body(3)).unwrap();
         assert_eq!(body["spec"]["base"]["replicas"], 0);
         assert_eq!(body["spec"]["base"].as_object().unwrap().len(), 1);
+        assert_eq!(
+            body["metadata"]["annotations"][PRE_RESTORE_REPLICAS_ANNOTATION], "3",
+            "annotation values are strings — a bare number would be rejected"
+        );
+    }
+
+    /// The resume write is the other half of the record's life-cycle: the count
+    /// back, and the annotation DELETED (a merge-patch `null`). A leftover
+    /// annotation would win over the live count on the next restore and pin the
+    /// app to a number that stopped being true when this restore finished.
+    #[test]
+    fn resume_patch_body_restores_the_count_and_clears_the_record() {
+        let body: Value = serde_json::from_str(&resume_patch_body(3)).unwrap();
+        assert_eq!(body["spec"]["base"]["replicas"], 3);
+        assert_eq!(body["spec"]["base"].as_object().unwrap().len(), 1);
+        assert!(
+            body["metadata"]["annotations"][PRE_RESTORE_REPLICAS_ANNOTATION].is_null(),
+            "null is how a JSON merge-patch removes a key"
+        );
+        assert!(
+            body["metadata"]["annotations"]
+                .as_object()
+                .unwrap()
+                .contains_key(PRE_RESTORE_REPLICAS_ANNOTATION),
+            "the key must be PRESENT and null — an absent key removes nothing"
+        );
     }
 
     /// A `--data-only` restore suspends the apps of the namespaces whose claims
@@ -4781,22 +5271,131 @@ mod tests {
             json!({"spec":{"base":{"replicas":9}}}),
         ];
         assert_eq!(
-            apps_to_suspend(&apps, "demo", &[]),
+            counts(apps_to_suspend(&apps, "demo", &[])),
             vec![("web".to_string(), 2), ("api".to_string(), 1)],
             "an unnamed app is unpatchable and a repeated one keeps its FIRST count"
         );
 
         let already = vec![(("demo".to_string(), "web".to_string()), 2)];
         assert_eq!(
-            apps_to_suspend(&apps, "demo", &already),
+            counts(apps_to_suspend(&apps, "demo", &already)),
             vec![("api".to_string(), 1)],
             "an app recorded on an earlier pass must not be re-read at replicas 0"
         );
         assert_eq!(
-            apps_to_suspend(&apps, "other-ns", &already),
+            counts(apps_to_suspend(&apps, "other-ns", &already)),
             vec![("web".to_string(), 2), ("api".to_string(), 1)],
             "the record is per (namespace, name) — a same-named app elsewhere still counts"
         );
+    }
+
+    /// `(name, replicas)` of each decision — the shape the pre-H5 seam
+    /// returned, so the cases that are only about the COUNT stay readable.
+    fn counts(decisions: Vec<SuspendDecision>) -> Vec<(String, i64)> {
+        decisions
+            .into_iter()
+            .map(|d| (d.name, d.replicas))
+            .collect()
+    }
+
+    /// An app suspended by an earlier run, exactly as that run left it.
+    fn interrupted_app(name: &str, live: i64, recorded: Value) -> Value {
+        json!({"metadata":{"name":name,
+                           "annotations":{PRE_RESTORE_REPLICAS_ANNOTATION: recorded}},
+               "spec":{"base":{"replicas":live}}})
+    }
+
+    /// THE defect (H5), in the shape it actually happens in: run 1 read 3,
+    /// scaled the app to 0 and died at `LoadData`; run 2 reads the live object
+    /// and finds the 0 that run 1 wrote. Recording that 0 would "resume" the
+    /// app to zero and report success over an application that never came back.
+    ///
+    /// The in-memory `already_recorded` guard cannot help — it is empty, this
+    /// being a different process — so the annotation is the only thing standing
+    /// between a second attempt and a permanently dead app.
+    #[test]
+    fn apps_to_suspend_prefers_an_earlier_runs_record_over_the_live_zero() {
+        let apps = vec![interrupted_app("web", 0, json!("3"))];
+        let d = apps_to_suspend(&apps, "demo", &[]);
+
+        assert_eq!(
+            d,
+            vec![SuspendDecision {
+                name: "web".to_string(),
+                replicas: 3,
+                source: ReplicaSource::Annotation,
+            }],
+            "the live 0 is the previous run's damage, not the app's replica count"
+        );
+    }
+
+    /// The pair to the above: with no annotation the live value is what counts,
+    /// so the rule above is not a resolver that ignores the cluster.
+    #[test]
+    fn apps_to_suspend_uses_the_live_count_when_no_run_recorded_one() {
+        let apps = vec![json!({"metadata":{"name":"web"},"spec":{"base":{"replicas":4}}})];
+        assert_eq!(
+            apps_to_suspend(&apps, "demo", &[]),
+            vec![SuspendDecision {
+                name: "web".to_string(),
+                replicas: 4,
+                source: ReplicaSource::Live,
+            }]
+        );
+    }
+
+    /// A recorded `0` is honoured. It is not damage — it is an app an operator
+    /// had deliberately scaled down, faithfully recorded by the run that
+    /// suspended it, and resuming it to 1 would start a workload that was
+    /// stopped on purpose. The annotation is the record; its value is not
+    /// second-guessed.
+    #[test]
+    fn apps_to_suspend_honours_a_recorded_zero() {
+        let apps = vec![interrupted_app("web", 0, json!("0"))];
+        assert_eq!(
+            apps_to_suspend(&apps, "demo", &[]),
+            vec![SuspendDecision {
+                name: "web".to_string(),
+                replicas: 0,
+                source: ReplicaSource::Annotation,
+            }]
+        );
+    }
+
+    /// An annotation that is not a count — hand-edited, truncated, negative,
+    /// or written as a number rather than the string an annotation must be —
+    /// falls back to the live value and is REPORTED, never parsed into a guess.
+    #[test]
+    fn apps_to_suspend_falls_back_to_live_for_an_unreadable_record() {
+        for bad in [json!("three"), json!(""), json!("-1"), json!("2.5")] {
+            let apps = vec![interrupted_app("web", 5, bad.clone())];
+            assert_eq!(
+                apps_to_suspend(&apps, "demo", &[]),
+                vec![SuspendDecision {
+                    name: "web".to_string(),
+                    replicas: 5,
+                    source: ReplicaSource::UnusableAnnotation(
+                        bad.as_str().unwrap_or_default().to_string()
+                    ),
+                }],
+                "bad annotation: {bad}"
+            );
+        }
+
+        // A non-string value cannot be written through the API but can arrive
+        // in a hand-crafted object; it is reported the same way, not parsed.
+        let apps = vec![interrupted_app("web", 5, json!(3))];
+        let d = apps_to_suspend(&apps, "demo", &[]);
+        assert_eq!(d[0].replicas, 5);
+        assert!(matches!(d[0].source, ReplicaSource::UnusableAnnotation(_)));
+    }
+
+    /// Whitespace around an otherwise fine count is not a reason to leave an
+    /// app down.
+    #[test]
+    fn apps_to_suspend_tolerates_whitespace_in_the_record() {
+        let apps = vec![interrupted_app("web", 0, json!(" 2 "))];
+        assert_eq!(apps_to_suspend(&apps, "demo", &[])[0].replicas, 2);
     }
 
     /// The namespaces to quiesce come from the manifest's ResourceClaims only,

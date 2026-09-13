@@ -49,6 +49,18 @@ Five behaviours are load-bearing:
   then are the workloads resumed at their original replica count (and Argo
   auto-sync re-enabled). This is what lets a framework-style tracked migration
   see the restored state and **skip** on boot, instead of racing the load.
+- **The count to come back to outlives the process.** A full restore reads each
+  application's replica count from the backup artifact, so a second attempt
+  reads the same number as the first. A `--data-only` restore has no artifact to
+  read it from — the applications are already in the cluster and it replays no
+  custom resources — so it reads the count off the live object, and the live
+  object is exactly what it is about to overwrite with a zero. A run that dies
+  between the two would leave the next run reading its own zero as the app's
+  size. The count is therefore written **to the application**, as the
+  `apprafter.io/pre-restore-replicas` annotation, in the same merge-patch that
+  scales it down; a later run prefers the annotation over the live field, and
+  the resume clears it. It is also the only record an operator who abandons a
+  restore has, which is why it is on the object rather than in the process.
 - **Wait for the claim, not for the volume to bind.** `WaitClaimsBound`
   polls each regenerated `ResourceClaim` until `status.ready == true`, **not**
   until the PVC is `Bound`. A disk claim reports ready as soon as its

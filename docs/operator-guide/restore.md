@@ -197,6 +197,83 @@ workloads. The order is load-bearing and the reasons are on
 it before a restore that matters, because two of the steps exist to stop a
 workload writing to a database that is not there yet.
 
+### If a restore stops partway
+
+Both modes hold your workloads **down** for the middle of the run — a restore
+must not let a pod write to a database it is still loading — and bring them
+back in the last step. A restore that fails, times out, loses its connection or
+is interrupted with `Ctrl-C` therefore leaves a cluster whose applications are
+scaled to zero with Argo CD auto-sync switched off. That is expected, and it is
+recoverable.
+
+The restore says so on the way out, naming every application it left down and
+every Argo CD Application whose auto-sync it disabled:
+
+```text
+✗ The restore stopped before it finished, and it did not undo what it had already done.
+  1 application(s) were scaled to 0 replicas for the load and are still down:
+    - demo/web → 3 replica(s)
+  Argo CD auto-sync is switched OFF on 1 Application(s), so GitOps will not put
+  any of this back on its own:
+    - argocd/web-prod
+  Re-running the SAME command is the way to continue: its last step is the one
+  that puts the replica counts and auto-sync back.
+```
+
+**Re-running the same command is the remedy.** Its final step is the one that
+restores the replica counts and re-enables auto-sync, so a second run that
+reaches the end leaves the cluster correct.
+
+**There is no resume.** The restore has no checkpoints and no `--continue`: a
+re-run replays every step from the first, re-fetching the snapshot and
+re-loading the data. Budget the same time as the first attempt.
+
+A `--data-only` restore records each application's replica count **on the
+application itself**, in the `apprafter.io/pre-restore-replicas` annotation,
+in the same write that scales it to zero. That is what makes a second run
+safe: it reads the recorded count rather than the zero the first run wrote, so
+the app comes back at its real size instead of staying down. The annotation is
+removed when the restore finishes. A full restore needs no such record — it
+reads the counts from the backup artifact every time.
+
+One caveat if you scale a suspended application up by hand and then re-run a
+`--data-only` restore: the recorded count wins over the count you set, because
+the recorded one is what the app had before any of this started. Remove the
+annotation first if you meant the new number to stick.
+
+??? note "Bringing the workloads back without finishing the restore"
+
+    The interrupted run prints these commands with your own names and
+    counts filled in; they are repeated here for when the output has
+    scrolled away. Reach for them only if you have decided **not** to
+    complete the restore — they bring the workloads up on whatever data
+    is in the cluster right now, and if the run died during the load,
+    that is a partly-loaded backend.
+
+    The recorded count is readable on the application:
+
+    ```sh
+    kubectl -n demo get applications.apprafter.io web \
+      -o jsonpath='{.metadata.annotations.apprafter\.io/pre-restore-replicas}'
+    ```
+
+    Putting it back is one patch, which also clears the record — leaving
+    it in place would let it win over the live count on the *next*
+    restore:
+
+    ```sh
+    kubectl -n demo patch applications.apprafter.io web --type=merge \
+      -p '{"metadata":{"annotations":{"apprafter.io/pre-restore-replicas":null}},"spec":{"base":{"replicas":3}}}'
+    ```
+
+    Auto-sync is a separate object and has to be re-enabled on each Argo
+    CD Application the run named:
+
+    ```sh
+    kubectl -n argocd patch applications.argoproj.io web-prod --type=merge \
+      -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}'
+    ```
+
 ## Assumptions and portability
 
 - **GitOps survives.** The restore replays the Argo CD `Application` CRs, which
