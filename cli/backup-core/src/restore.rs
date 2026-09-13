@@ -101,44 +101,13 @@ pub fn resolve_run_snapshots(
     requested: &str,
     this_cluster_uid: Option<&str>,
 ) -> Result<RunSnapshots, String> {
-    let snaps: Vec<Value> = serde_json::from_str(snapshots_json)
-        .map_err(|e| format!("parsing `restic snapshots --json`: {e}"))?;
-    if snaps.is_empty() {
-        return Err("the repository has no snapshots".to_string());
-    }
-
-    let id_of = |s: &Value| {
-        s.get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    };
-    let time_of = |s: &Value| {
-        s.get("time")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    };
-    let tags_of = |s: &Value| -> Vec<String> {
-        s.get("tags")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
+    let snaps = parse_snapshot_list(snapshots_json)?;
 
     // `latest` is restic's own spelling for "newest by time", which is exactly
     // what the sequential writer makes the commit point: it is written LAST —
     // but only ever within ONE cluster's snapshots (E2).
     let commit = if requested == "latest" {
-        let pool = latest_pool(&snaps, this_cluster_uid, &tags_of)?;
-        pool.into_iter()
-            .max_by_key(|s| time_of(s))
-            .ok_or_else(|| "no snapshots to choose from".to_string())?
+        choose_latest(&snaps, this_cluster_uid)?
     } else {
         snaps
             .iter()
@@ -152,7 +121,7 @@ pub fn resolve_run_snapshots(
     };
 
     let commit_id = id_of(commit);
-    let commit_tags = tags_of(commit);
+    let commit_tags = crate::cluster::snapshot_tags(commit);
 
     // An untagged snapshot cannot be grouped, and must not silently drag in
     // every other untagged snapshot in the repository.
@@ -163,7 +132,10 @@ pub fn resolve_run_snapshots(
             if id == commit_id {
                 continue;
             }
-            if tags_of(s).iter().any(|t| commit_tags.contains(t)) {
+            if crate::cluster::snapshot_tags(s)
+                .iter()
+                .any(|t| commit_tags.contains(t))
+            {
                 claims.push((time_of(s), id));
             }
         }
@@ -176,6 +148,61 @@ pub fn resolve_run_snapshots(
     })
 }
 
+/// The snapshot id `latest` means for THIS cluster, for a caller that wants
+/// one snapshot rather than a whole run.
+///
+/// Deliberately the SAME rule as [`resolve_run_snapshots`] — both go through
+/// [`choose_latest`] — because `backup show latest` feeds an operator's
+/// restore decision, and a second rule would let the two disagree about which
+/// snapshot `latest` is. `show` inspects; `restore` replays; they must be
+/// looking at the same thing (E2).
+pub fn resolve_latest_snapshot(
+    snapshots_json: &str,
+    this_cluster_uid: Option<&str>,
+) -> Result<String, String> {
+    let snaps = parse_snapshot_list(snapshots_json)?;
+    Ok(id_of(choose_latest(&snaps, this_cluster_uid)?))
+}
+
+/// Parse `restic snapshots --json` into a non-empty snapshot list.
+fn parse_snapshot_list(snapshots_json: &str) -> Result<Vec<Value>, String> {
+    let snaps: Vec<Value> = serde_json::from_str(snapshots_json)
+        .map_err(|e| format!("parsing `restic snapshots --json`: {e}"))?;
+    if snaps.is_empty() {
+        return Err("the repository has no snapshots".to_string());
+    }
+    Ok(snaps)
+}
+
+/// A snapshot's restic id, or the empty string when the document has none.
+fn id_of(s: &Value) -> String {
+    s.get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A snapshot's RFC-3339 time, or the empty string — which sorts first, so an
+/// undated snapshot never wins a `max_by_key`.
+fn time_of(s: &Value) -> String {
+    s.get("time")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The newest snapshot of [`latest_pool`] — THE definition of `latest` here,
+/// in one place so `restore` and `backup show` cannot drift apart.
+fn choose_latest<'a>(
+    snaps: &'a [Value],
+    this_cluster_uid: Option<&str>,
+) -> Result<&'a Value, String> {
+    latest_pool(snaps, this_cluster_uid)?
+        .into_iter()
+        .max_by_key(|s| time_of(s))
+        .ok_or_else(|| "no snapshots to choose from".to_string())
+}
+
 /// The snapshots `latest` is allowed to choose between — see
 /// [`resolve_run_snapshots`] for the rule and why each branch exists.
 ///
@@ -185,12 +212,13 @@ pub fn resolve_run_snapshots(
 fn latest_pool<'a>(
     snaps: &'a [Value],
     this_cluster_uid: Option<&str>,
-    tags_of: &dyn Fn(&Value) -> Vec<String>,
 ) -> Result<Vec<&'a Value>, String> {
     if let Some(uid) = this_cluster_uid {
         let ours: Vec<&Value> = snaps
             .iter()
-            .filter(|s| crate::cluster::owned_by_this_cluster(&tags_of(s), uid))
+            .filter(|s| {
+                crate::cluster::owned_by_this_cluster(&crate::cluster::snapshot_tags(s), uid)
+            })
             .collect();
         if !ours.is_empty() {
             return Ok(ours);
@@ -201,18 +229,14 @@ fn latest_pool<'a>(
     // a foreign UID — if they all carry the SAME one there is no ambiguity to
     // resolve, and this is the ordinary disaster-recovery shape: a fresh
     // cluster restoring the only history the repository holds.
-    let mut others: Vec<String> = snaps
-        .iter()
-        .filter_map(|s| crate::cluster::snapshot_cluster_uid(&tags_of(s)).map(str::to_string))
-        .collect();
-    others.sort();
-    others.dedup();
+    let others = crate::cluster::cluster_uids_in(snaps);
     if others.len() > 1 {
         return Err(format!(
             "this repository holds snapshots from {} different clusters ({}), and none of them \
-             are this cluster's — so `latest` cannot say which one you meant. Pick the run \
-             explicitly: `apprafter backup list --all-clusters` shows every snapshot with the \
-             cluster it belongs to, then pass `--snapshot <id>`.",
+             are this cluster's — so `latest` cannot say which one you meant. \
+             `apprafter backup list --all-clusters` shows every snapshot with the cluster it \
+             belongs to; then name the run explicitly — `--snapshot <id>` for a restore, \
+             `apprafter backup show <id>` to look inside one first.",
             others.len(),
             others.join(", ")
         ));
@@ -477,6 +501,58 @@ mod tests {
     fn an_explicit_id_reaches_another_clusters_run_on_purpose() {
         let r = resolve_run_snapshots(&shared_listing(), "theirs1", Some(MINE)).unwrap();
         assert_eq!(r.commit, "theirs1");
+    }
+
+    // -----------------------------------------------------------------------
+    // `backup show latest` resolves through the SAME rule (E2, loose end 2).
+    // -----------------------------------------------------------------------
+
+    /// FIRES: the read-only inspector must not display the co-tenant's newest
+    /// snapshot — it is what an operator reads before deciding what to
+    /// restore, so a foreign answer here becomes a foreign restore.
+    #[test]
+    fn resolve_latest_snapshot_stays_inside_this_clusters_history() {
+        let id = resolve_latest_snapshot(&shared_listing(), Some(MINE)).unwrap();
+        assert_eq!(id, "mine1", "the newest in the repository is theirs");
+    }
+
+    /// DOES NOT FIRE: from the other side the same listing resolves to the
+    /// other run — so the test above is not passing on a resolver that simply
+    /// returns the oldest snapshot.
+    #[test]
+    fn resolve_latest_snapshot_from_the_other_side_resolves_to_that_cluster() {
+        let id = resolve_latest_snapshot(&shared_listing(), Some(THEIRS)).unwrap();
+        assert_eq!(id, "theirs1");
+    }
+
+    /// The two entry points agree BY CONSTRUCTION — the property that makes
+    /// `show` a trustworthy input to a `restore` decision. A second rule would
+    /// let an operator inspect one snapshot and replay another.
+    #[test]
+    fn show_and_restore_resolve_latest_to_the_same_snapshot() {
+        for uid in [Some(MINE), Some(THEIRS), None] {
+            let shown = resolve_latest_snapshot(&shared_listing(), uid);
+            let restored =
+                resolve_run_snapshots(&shared_listing(), "latest", uid).map(|r| r.commit);
+            assert_eq!(shown, restored, "uid={uid:?}");
+        }
+    }
+
+    /// Ambiguity refuses here too, and names both spellings of "say which one"
+    /// — the inspector's is a positional argument, not `--snapshot`.
+    #[test]
+    fn resolve_latest_snapshot_refuses_an_ambiguous_repository() {
+        let fresh = "abcdabcd-0000-0000-0000-abcdabcdabcd";
+        let err = resolve_latest_snapshot(&shared_listing(), Some(fresh))
+            .expect_err("two foreign clusters and none of ours is a guess");
+        assert!(err.contains("2 different clusters"), "{err}");
+        assert!(err.contains("--snapshot"), "{err}");
+        assert!(err.contains("apprafter backup show <id>"), "{err}");
+    }
+
+    #[test]
+    fn resolve_latest_snapshot_reports_an_empty_repository() {
+        assert!(resolve_latest_snapshot("[]", Some(MINE)).is_err());
     }
 
     /// Legacy snapshots are ours by the stated assumption, so they are what

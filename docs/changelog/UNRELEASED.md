@@ -228,6 +228,63 @@ criterion turned up, in the same spirit and by the same route.
   cluster's old snapshots are attributed to whoever asks first, so `backup list`
   marks those rows `(legacy)`.
 
+- **A restore no longer switches the source's backup schedule on in the cluster
+  it restored into.** `spec.backup` lives in the `PlatformStack`, and a restore
+  replays the whole CR — so bucket, credential reference, schedule, timezone,
+  retention counts and `enforce` all migrated, the sealed credential was
+  re-sealed for the target alongside them, and the operator projects that block
+  straight into the platform chart's values, outside the upgrade-approval gate.
+  The restored cluster began backing up to the **source's** repository at the
+  source's hour. There was no opt-out, no warning, and no line in the summary.
+
+  It was not only a disaster-recovery concern, where the inheritance is what you
+  want: the step list replays the CR for **restore-into-running** too
+  (`--reprovision` merely prepends a provisioning step), so `apprafter restore
+  <repo> --target prod` into an already-live cluster silently repointed *that*
+  cluster's bucket, credential, schedule, timezone and retention at the
+  source's, under `--force-conflicts`. And the clone-beside-a-living-source case
+  is the documented recommended path: [moving to a bigger
+  machine](../operator-guide/moving-to-a-bigger-machine.md) Route B keeps the old
+  cluster up "until you are satisfied with the new one", which is two live
+  clusters carrying one backup configuration.
+
+  The block is now replayed **exactly as captured but with `enabled` forced to
+  `false`**, and the summary says so — in both directions, because a silent
+  `--keep-backup-schedule` would be as surprising as the silent inheritance it
+  replaced. Only `enabled` is touched, so turning it back on is `apprafter
+  backup set enabled true` and not a re-entry of the bucket, the retention and
+  the schedule. `--data-only` was never affected and still is not: it replays no
+  custom resources at all. Nothing was added that takes a backup right after a
+  restore, and nothing should be — the first write of a restored cluster stays a
+  deliberate act.
+
+- **`apprafter backup prune` has an offline form again, with an explicit
+  identity.** This revises the sentence above: prune needs an identity, not
+  necessarily a *cluster*. The lazy path that `--repo` plus all three `--keep-*`
+  used to open — planning across every snapshot in the bucket — stays closed;
+  what replaces it is `--cluster-uid <uid>`, the operator naming whose snapshots
+  may be forgotten. That is the case the closure took away by accident: the
+  cluster is gone, the repository is still being paid for, and its snapshots
+  should be reclaimable.
+
+  The claim is checked against the repository before anything is forgotten. A
+  UID that has never written there is refused, naming the identities that have,
+  because a mistyped UID does not fail loudly — it matches nothing, spares every
+  identified snapshot, and leaves the planner holding only the pre-identity ones,
+  which it would forget by policy. A repository holding *only* pre-identity
+  snapshots is allowed and says so. `apprafter backup list --all-clusters` now
+  prints the cluster identities a repository holds under the listing, which is
+  where the UID is read off; nothing is stamped on `PlatformStack` on the offline
+  path, because there is no CR to stamp.
+
+- **`apprafter backup show` with no snapshot named no longer resolves through
+  restic's own `latest`.** In a shared repository that displayed whichever
+  cluster wrote last. It is read-only, but it is what an operator reads before
+  deciding what to restore, so a foreign answer here becomes a foreign restore.
+  It now goes through the same `latest` rule as `restore`, deliberately the same
+  function, so `show` and `restore` cannot disagree about which snapshot
+  `latest` is.
+
 ### Added
 
 - **`spec.backup.clusterName`** — the name this cluster's snapshots are listed
@@ -244,6 +301,25 @@ criterion turned up, in the same spirit and by the same route.
 
   The nightly runner's ClusterRole gains `get` on the single `kube-system`
   namespace, which is what lets it read the identity at all.
+
+- **`apprafter restore --keep-backup-schedule`** — inherit the source's backup
+  schedule already enabled, instead of the new default of replaying it disabled.
+  Pass it in disaster recovery, where the source is gone and the restored
+  cluster is legitimately the repository's new writer. Do not pass it while the
+  source is still running.
+
+- **`apprafter backup prune --cluster-uid <uid>`** — prune the snapshots of the
+  cluster with that `kube-system` namespace UID, for a repository whose cluster
+  no longer exists. With `--repo` and all three `--keep-*` it needs no cluster
+  at all.
+
+- **`apprafter backup set enabled <true|false>`** — the switch on its own. Two
+  things leave a cluster holding a complete but switched-off backup
+  configuration: `backup disable`, and now a restore. `backup enable` cannot be
+  the way back from either — it composes the whole `spec.backup` block from its
+  flags, so it resets the schedule, timezone, retention and staging mode it was
+  meant to preserve. `backup disable`'s closing line pointed at `backup enable`
+  and now points here.
 
 ### Known limits
 

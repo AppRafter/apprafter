@@ -164,7 +164,9 @@ apprafter backup list --repo <path>
 
 ## `apprafter backup prune`
 
-Remove old snapshots from an S3-backed restic repository according to the configured retention policy. Run OUTSIDE the cluster with the operator's full S3 credentials
+Remove old snapshots from an S3-backed restic repository according to the configured retention policy. Run OUTSIDE the cluster with the operator's full S3 credentials.
+
+A prune forgets by explicit snapshot id and one repository can hold several clusters' runs, so it must know whose snapshots it may forget. Normally that is the cluster's own `kube-system` namespace UID, read from the kubeconfig. When the cluster is gone and only the repository is left, `--cluster-uid <uid>` names the identity explicitly and the command runs with no cluster at all.
 
 ```text
 Usage: apprafter backup prune [OPTIONS]
@@ -172,6 +174,7 @@ Usage: apprafter backup prune [OPTIONS]
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
+| `--cluster-uid` | — | — | no | Prune the snapshots of the cluster with this `kube-system` namespace UID, instead of reading the identity off a live cluster. The offline form: the cluster is gone, the repository remains, and its snapshots should be reclaimable |
 | `--credential-file` | — | — | no | Path to a dotenv credential file containing `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD` (and optionally `AWS_DEFAULT_REGION`). Falls back to the matching environment variables, then to the credential Secret the cluster already holds (`spec.backup.credentialRef`) |
 | `--keep-daily` | — | — | no | Keep-daily retention override (else spec.backup.retention, else 7) |
 | `--keep-monthly` | — | — | no | Keep-monthly retention override (else spec.backup.retention, else 6) |
@@ -211,7 +214,9 @@ apprafter backup run --timeout 120
 
 Change ONE field of a configured backup, leaving the rest alone. `backup enable` rewrites the whole block, so it cannot be used to adjust a single setting without resetting the others.
 
-Keys: at &lt;HH:MM>, check &lt;HH:MM|off>, check-depth &lt;structure|10%|full>, cluster-name &lt;name>, timezone &lt;IANA>, keep-daily &lt;n>, keep-weekly &lt;n>, keep-monthly &lt;n>, enforce &lt;operator|cluster>, staging-mode &lt;monolithic|sequential>, failure-webhook &lt;url>.
+Keys: enabled &lt;true|false>, at &lt;HH:MM>, check &lt;HH:MM|off>, check-depth &lt;structure|10%|full>, cluster-name &lt;name>, timezone &lt;IANA>, keep-daily &lt;n>, keep-weekly &lt;n>, keep-monthly &lt;n>, enforce &lt;operator|cluster>, staging-mode &lt;monolithic|sequential>, failure-webhook &lt;url>.
+
+`enabled` is the switch on its own, and it is how a configured but switched-off schedule comes back: after `backup disable`, or after a `restore`, which replays the source's whole backup block disabled. `backup enable` cannot do that job — it composes the whole block from its flags, so it would reset everything the restore just carried across.
 
 ```text
 Usage: apprafter backup set <KEY> <VALUE>

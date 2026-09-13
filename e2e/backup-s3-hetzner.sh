@@ -617,7 +617,15 @@ apprafter restore "$S3_REPO" --reprovision --target "$BR_TARGET" \
 # BR_CREATED stays 1 — a FRESH cluster now exists in the target; teardown destroys it.
 grep -qE 'provisioning a fresh cluster' "$restore_log" || { printf 'FAILED: restore did not run the reprovision step\n'; sed 's/^/    /' "$restore_log" >&2; exit 1; }
 grep -qE 'Restored backup' "$restore_log" || { printf 'FAILED: restore did not report completion\n'; sed 's/^/    /' "$restore_log" >&2; exit 1; }
+# D1: the source's whole `spec.backup` migrates with the CR, so a restore that
+# left it enabled would point a second cluster at this repository on the
+# source's schedule. The default replays the block DISABLED and says so; the
+# assertion on the CR itself is two phases down. No `--keep-backup-schedule`
+# here on purpose — the default is what a nightly must keep proving.
+grep -qE 'backup schedule came with the restore and was left DISABLED' "$restore_log" \
+    || { printf 'FAILED: restore did not report what it did with the replayed backup schedule (D1)\n'; sed 's/^/    /' "$restore_log" >&2; exit 1; }
 printf '  ok: restore --reprovision provisioned a fresh cluster + replayed from the S3 repo\n'
+printf '  ok: the replayed backup schedule was reported as restored-but-disabled\n'
 
 # ---------------------------------------------------------------
 # Phase 10: verify the reprovisioned cluster — data + secret survive, NEW box.
@@ -647,6 +655,15 @@ wait_for_appdb "$NEW_APPDB"
 new_marker=$(psql_super "$NEW_APPDB" "SELECT note FROM ${DR_MARKER_TABLE} WHERE id=1;" | tr -d '[:space:]')
 assert_eq "known marker row restored from the S3 backup into the reprovisioned cluster's pg" "$new_marker" "$DR_MARKER_VALUE"
 assert_eq "source/reprovisioned equivalence — marker identical" "$new_marker" "$old_marker"
+
+# D1, on the CR rather than on the log: the block came across complete but
+# switched off. Both halves matter — `enabled: false` is the fix, and the
+# bucket still being there is what makes `backup set enabled true` a one-word
+# change instead of a re-entry of the whole configuration.
+new_backup_enabled=$(jp platformstack "$BACKUP_NS" default '{.spec.backup.enabled}')
+assert_eq "restored spec.backup.enabled is false (schedule replayed, not started)" "$new_backup_enabled" "false"
+new_backup_bucket=$(jp platformstack "$BACKUP_NS" default '{.spec.backup.bucket}')
+assert_eq "restored spec.backup.bucket is the source's, unchanged" "$new_backup_bucket" "$S3_REPO"
 
 printf '\n=== GREEN: 2.6d-4 off-site S3 backup validated end-to-end on real Hetzner ===\n'
 printf 'provision -> CMS+seed -> seal S3 creds -> backup enable -> manual Job -> off-site snapshot -> check+prune -> DESTROY (source dead) -> restore --reprovision (fresh box %s) from S3 -> data+secret intact\n' "$NEW_SERVER_ID"

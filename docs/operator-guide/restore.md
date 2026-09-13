@@ -17,7 +17,8 @@ bootstrapped** cluster. Nothing here rebuilds a machine on its own except
 
 ```text
 apprafter restore <repo> [--target <name>] [--snapshot <id>] \
-                  [--data-only] [--passphrase <value>] [--reprovision]
+                  [--data-only] [--passphrase <value>] [--reprovision] \
+                  [--keep-backup-schedule]
 ```
 
 `restore` replays a `backup create` artifact into a **running, already
@@ -36,9 +37,40 @@ which to replay. [Which snapshots are
 yours](../how-it-works/backup-retention-and-checks.md#which-snapshots-are-yours)
 explains the attribution.
 
-A restore replays the whole backup configuration, including the name the source
-cluster's snapshots are listed under. When that happens the summary says so and
-names `apprafter backup set cluster-name <name>` — the restored cluster's own
+### The backup schedule comes with the restore, switched off
+
+A restore replays the whole backup configuration — bucket, credential
+reference, schedule, timezone, retention counts and `enforce`, because all of it
+lives in the one `PlatformStack` the restore replays. Left alone, the restored
+cluster would start backing up to the **source's** repository on the source's
+schedule, without being asked.
+
+So the block is restored exactly as captured but **left disabled**, and the
+summary says so. Turning it on changes that one field and nothing else:
+
+```sh
+apprafter backup set enabled true
+```
+
+Not `apprafter backup enable` — that composes the whole `spec.backup` block
+from its flags, so it would reset the schedule, timezone, retention and staging
+mode the restore just carried across.
+
+Pass `--keep-backup-schedule` to inherit it already enabled. That is the right
+choice in **disaster recovery**, where the source cluster is gone and the
+restored one is legitimately the repository's new writer — the case the flag
+exists for. It is the wrong choice while the source is still running, which is
+[moving to a bigger machine](moving-to-a-bigger-machine.md) Route B: two live
+clusters on one schedule, both writing to one bucket. Nothing in the restore
+path can tell those two situations apart, which is why the reversible one is the
+default. Either way the summary states which happened.
+
+`--data-only` is unaffected — it replays no custom resources, so the target's
+own backup configuration is not touched at all.
+
+The inherited block includes the name the source cluster's snapshots are listed
+under. When that happens the summary says so and names
+`apprafter backup set cluster-name <name>` — the restored cluster's own
 snapshots are still attributed to it correctly; only the label is inherited.
 
 ### Target modes

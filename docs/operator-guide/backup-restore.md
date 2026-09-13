@@ -76,14 +76,21 @@ than one cluster's, and the listing says so at the bottom when it withheld any:
 apprafter backup list --all-clusters
 ```
 
-shows every snapshot with the cluster each belongs to. That is how you find the
-id of another cluster's run when you genuinely want it — `restore --snapshot
-<id>` takes it from there. Rows marked `(legacy)` were written before snapshots
-carried a cluster identity and are being treated as this cluster's by
-assumption; with no cluster reachable, nothing can be narrowed and everything is
-listed. [Which snapshots are
+shows every snapshot with the cluster each belongs to, and names the cluster
+identities the repository holds under the table. That is how you find the id of
+another cluster's run when you genuinely want it — `restore --snapshot <id>`
+takes it from there — and how you read off the UID that `backup prune
+--cluster-uid` needs when a cluster is gone. Rows marked `(legacy)` were written
+before snapshots carried a cluster identity and are being treated as this
+cluster's by assumption; with no cluster reachable, nothing can be narrowed and
+everything is listed. [Which snapshots are
 yours](../how-it-works/backup-retention-and-checks.md#which-snapshots-are-yours)
 is the mechanism.
+
+`apprafter backup show` with no snapshot named follows the same rule: it shows
+**this** cluster's latest run, not the repository's. It is read-only, but it is
+what you read before deciding what to restore, so it has to be looking at the
+snapshot a restore would replay.
 
 ```text
 apprafter backup create [--repo <path>] [--passphrase <value>] \

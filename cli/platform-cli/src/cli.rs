@@ -392,6 +392,24 @@ pub enum Commands {
         /// `apprafter::provider::server_type_not_selected`.
         #[arg(long = "server-type")]
         server_type: Option<String>,
+        /// Restore the source's backup schedule already ENABLED.
+        ///
+        /// A restore replays the whole `spec.backup` block — bucket,
+        /// credential, schedule, timezone, retention — so without this
+        /// flag the restored cluster would begin backing up to the
+        /// SOURCE's repository on its own. By default the block is
+        /// restored exactly as captured but left disabled, and
+        /// `apprafter backup enable` turns it on unchanged.
+        ///
+        /// Pass this in disaster recovery, where the source is gone and
+        /// the restored cluster is legitimately the repository's new
+        /// writer. Do NOT pass it while the source cluster is still
+        /// running (see the "moving to a bigger machine" runbook), where
+        /// it would put two live clusters on one schedule.
+        ///
+        /// Has no effect with `--data-only`, which replays no CRs.
+        #[arg(long, default_value_t = false)]
+        keep_backup_schedule: bool,
     },
     /// Print a shell completion script on stdout.
     ///
@@ -1566,11 +1584,18 @@ pub enum BackupAction {
     /// `backup enable` rewrites the whole block, so it cannot be used to
     /// adjust a single setting without resetting the others.
     ///
-    /// Keys: at <HH:MM>, check <HH:MM|off>, check-depth
-    /// <structure|10%|full>, cluster-name <name>, timezone <IANA>,
-    /// keep-daily <n>, keep-weekly <n>, keep-monthly <n>, enforce
-    /// <operator|cluster>, staging-mode <monolithic|sequential>,
-    /// failure-webhook <url>.
+    /// Keys: enabled <true|false>, at <HH:MM>, check <HH:MM|off>,
+    /// check-depth <structure|10%|full>, cluster-name <name>, timezone
+    /// <IANA>, keep-daily <n>, keep-weekly <n>, keep-monthly <n>,
+    /// enforce <operator|cluster>, staging-mode
+    /// <monolithic|sequential>, failure-webhook <url>.
+    ///
+    /// `enabled` is the switch on its own, and it is how a configured
+    /// but switched-off schedule comes back: after `backup disable`, or
+    /// after a `restore`, which replays the source's whole backup block
+    /// disabled. `backup enable` cannot do that job — it composes the
+    /// whole block from its flags, so it would reset everything the
+    /// restore just carried across.
     Set {
         /// Field to change (e.g. `check-depth`).
         key: String,
@@ -1594,6 +1619,13 @@ pub enum BackupAction {
     /// Remove old snapshots from an S3-backed restic repository
     /// according to the configured retention policy. Run OUTSIDE the
     /// cluster with the operator's full S3 credentials.
+    ///
+    /// A prune forgets by explicit snapshot id and one repository can
+    /// hold several clusters' runs, so it must know whose snapshots it
+    /// may forget. Normally that is the cluster's own `kube-system`
+    /// namespace UID, read from the kubeconfig. When the cluster is gone
+    /// and only the repository is left, `--cluster-uid <uid>` names the
+    /// identity explicitly and the command runs with no cluster at all.
     Prune {
         /// S3 restic repository URL (e.g. `s3:s3.amazonaws.com/my-bucket/prefix`).
         /// Defaults to `PlatformStack.spec.backup.bucket`.
@@ -1616,6 +1648,22 @@ pub enum BackupAction {
         /// Keep-monthly retention override (else spec.backup.retention, else 6).
         #[arg(long)]
         keep_monthly: Option<u32>,
+        /// Prune the snapshots of the cluster with this `kube-system`
+        /// namespace UID, instead of reading the identity off a live
+        /// cluster. The offline form: the cluster is gone, the
+        /// repository remains, and its snapshots should be reclaimable.
+        ///
+        /// This is a claim about WHOSE history may be deleted — a
+        /// repository can hold several clusters' runs, and the wrong UID
+        /// reclaims the wrong one. It is checked against the repository
+        /// before anything is forgotten: a UID that has never written
+        /// here is refused, naming the ones that have.
+        ///
+        /// With `--repo` and all three `--keep-*` flags this makes the
+        /// command need no cluster at all. Nothing is stamped on
+        /// `PlatformStack` in that case — there is no CR to stamp.
+        #[arg(long = "cluster-uid")]
+        cluster_uid: Option<String>,
     },
     /// Verify the structural integrity of an S3-backed restic repository
     /// (`restic check`). Run OUTSIDE the cluster with the operator's full

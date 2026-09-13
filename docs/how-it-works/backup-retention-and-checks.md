@@ -114,16 +114,21 @@ listed under it. That is cosmetic — attribution still follows the UID, which t
 clone has its own of — and the restore summary says so and points at
 `apprafter backup set cluster-name <name>`.
 
-Three places narrow a repository-wide listing to this cluster before it decides
+Four places narrow a repository-wide listing to this cluster before it decides
 anything:
 
 - **`apprafter backup list`** shows this cluster's snapshots and reports how many
-  it withheld; `--all-clusters` shows the rest.
+  it withheld; `--all-clusters` shows the rest, and names the cluster identities
+  the repository holds.
 - **`restore` without `--snapshot`** resolves `latest` inside this cluster's
   snapshots. When the target has none of its own and the repository holds more
   than one cluster, it refuses rather than guessing; when the repository holds
   exactly one cluster it resolves normally, which is the ordinary
   disaster-recovery case. An explicit `--snapshot <id>` is always honoured.
+- **`apprafter backup show`** with no snapshot named resolves `latest` through
+  that same rule, deliberately the same code. `show` is read-only, but it is
+  what you read before choosing what to restore, so it must be looking at the
+  same snapshot the restore would.
 - **prune** plans only over this cluster's runs, so a clone can never delete the
   source's history.
 
@@ -168,14 +173,27 @@ The operator-side `apprafter backup prune` resolves its policy as CLI flags →
 `PlatformStack` with the current time; that annotation is exactly what
 `apprafter backup status` prints as `Last prune`.
 
-`apprafter backup prune` always needs a reachable cluster, and no combination of
-flags takes that away. It used to go fully offline when `--repo` and all three
-`--keep-*` were supplied; it cannot any more, because it also has to read the
-cluster's identity to know whose snapshots it may forget, and no flag can stand
-in for that. `apprafter backup check` and `apprafter backup unlock` are
-unaffected — they read the CR only for the repository URL, so `--repo` alone
-makes either of them work with no cluster at all, which matters because verifying
-a repository before restoring from it tends to happen when the cluster is gone.
+`apprafter backup prune` needs an **identity**, and that is the one input it
+will not infer. With a live cluster it reads the `kube-system` UID off the
+kubeconfig. It used to go fully offline when `--repo` and all three `--keep-*`
+were supplied and nothing else, which planned across every snapshot in the
+bucket; that form is gone. The offline form that replaced it says whose history
+it means: `--cluster-uid <uid>`, with `--repo` and the three `--keep-*`, runs
+with no cluster at all. That is the real offline case — the cluster is gone, the
+repository remains, and its snapshots should be reclaimable.
+
+The claim is checked against the repository before anything is forgotten. A UID
+that has never written there is refused, naming the identities that have, rather
+than matching nothing and quietly forgetting the pre-identity snapshots instead.
+A repository that holds *only* pre-identity snapshots is allowed and says so —
+there is no identity in it to contradict. Nothing is stamped on `PlatformStack`
+on that path, because there is no CR to stamp.
+
+`apprafter backup check` and `apprafter backup unlock` never needed an identity —
+they delete nothing. They read the CR only for the repository URL, so `--repo`
+alone makes either of them work with no cluster at all, which matters because
+verifying a repository before restoring from it tends to happen when the cluster
+is gone.
 
 ## What the weekly check runs
 

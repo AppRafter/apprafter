@@ -27,7 +27,7 @@ ApplyAppsGated -> WaitClaimsBound -> LoadData -> ReSealUserSecrets ->
 ResumeWorkloads
 ```
 
-Two behaviours are load-bearing:
+Three behaviours are load-bearing:
 
 - **Workloads are gated during the load.** The apps are applied with
   `replicas: 0` (and the user Argo Applications have their `syncPolicy.automated`
@@ -42,6 +42,24 @@ Two behaviours are load-bearing:
   `volumeClaimRef` is set; on a `WaitForFirstConsumer` StorageClass the PVC
   only binds when its first consumer pod schedules — and the restore's own
   load helper is that first consumer. Waiting for `Bound` would deadlock.
+- **The replayed backup schedule arrives switched off.** `ApplyPlatformStack`
+  replays the captured `PlatformStack`, and `spec.backup` is part of it — the
+  bucket, the credential reference, the schedule, the timezone, the retention
+  counts and `enforce`. The operator projects that block straight into the
+  platform chart's values, so the restored cluster would begin backing up to the
+  **source's** repository on its own. The restore therefore sets
+  `spec.backup.enabled: false` on the CR it applies, and says so in its summary;
+  everything else in the block is replayed exactly as captured, so
+  `apprafter backup set enabled true` turns it back on unchanged.
+  `--keep-backup-schedule`
+  inherits it already enabled, which is what disaster recovery wants — there the
+  source is gone and the restored cluster is legitimately the repository's new
+  writer. The default is for the other shape, [moving to a bigger
+  machine](../operator-guide/moving-to-a-bigger-machine.md) Route B, where both
+  clusters are alive at once; nothing in the restore path can tell the two apart,
+  so the reversible half is the default. This applies to every mode that replays
+  the CR — `--reprovision` only prepends a provisioning step — and not to
+  `--data-only`, which replays no CRs at all.
 
 ## How the data is loaded
 

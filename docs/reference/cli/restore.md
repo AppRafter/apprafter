@@ -23,6 +23,7 @@ Usage: apprafter restore [OPTIONS] <REPO>
 | --- | --- | --- | --- | --- |
 | `--credential-file` | — | — | no | Path to a dotenv credential file containing the operator's S3 credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `RESTIC_PASSWORD`, optional `AWS_DEFAULT_REGION`). REQUIRED to restore from a remote `s3:`/`b2:`/`gs:`/`azure:` repo (falls back to the matching env vars); the operator's full creds are read locally, NEVER from the cluster |
 | `--data-only` | flag | — | no | Replay only native data (pg + volumes); skip CR + secret replay. Useful when the cluster is already configured |
+| `--keep-backup-schedule` | flag | — | no | Restore the source's backup schedule already ENABLED |
 | `--passphrase` | — | — | no | Passphrase for the restic repo. Falls back to `RESTIC_PASSWORD`; prompts interactively on a TTY |
 | `--reprovision` | flag | — | no | Re-provision the target cluster before replaying data |
 | `--server-type` | — | — | no | Server type (SKU) to use when `--reprovision` is set (e.g. `cx22`, `cx32`). Forwarded to the `apply` phase. Resolution: this flag > manifest `spec.nodes[0].type` > recorded state > target default > `APPRAFTER_SERVER_TYPE`. There is NO implicit default — if none is set, provisioning fails with `apprafter::provider::server_type_not_selected` |

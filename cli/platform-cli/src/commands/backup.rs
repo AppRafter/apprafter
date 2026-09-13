@@ -66,6 +66,7 @@ use backup_core::prune::{run_prune, RetentionPolicy};
 use backup_core::restic::{
     restic_check_argv, restic_dump_argv, restic_ls_argv, restic_stats_argv, restic_unlock_argv,
 };
+use backup_core::restore::resolve_latest_snapshot;
 use backup_core::{KubeExec, ResticRunner, StagingMode, SubprocessRestic};
 use base64::Engine as _;
 use cli_core::diagnose::{classify_restic, ResticFailure};
@@ -2208,6 +2209,20 @@ pub(crate) fn listing_footnotes(
                 .to_string(),
         );
     }
+    // With `--all-clusters` the listing is the whole repository, so this is
+    // the one place that can answer "which clusters are in here" in full. The
+    // TAGS column abbreviates each UID to eight characters (36 characters of
+    // UUID in a comparison table is noise), and `backup prune --cluster-uid`
+    // needs the whole thing — this is where an operator reads it off.
+    if view.all {
+        let uids = backup_core::cluster::cluster_uids_in(scope.shown.iter().copied());
+        if !uids.is_empty() {
+            out.push(format!(
+                "  cluster identities in this repository: {}.",
+                uids.join(", ")
+            ));
+        }
+    }
     if any_legacy {
         out.push(
             "  (legacy) — written before snapshots carried a cluster identity; treated as this \
@@ -2741,6 +2756,7 @@ where
 
 /// The settable keys, in the order the error lists them.
 const BACKUP_SET_KEYS: &[&str] = &[
+    "enabled",
     "at",
     "check",
     "cluster-name",
@@ -2783,6 +2799,26 @@ fn is_read_data_subset(v: &str) -> bool {
 fn backup_set_patch(key: &str, value: &str) -> Result<Value> {
     let mut field = serde_json::Map::new();
     match key {
+        // The switch, on its own. `backup enable` composes the WHOLE block
+        // from its flags, so it cannot flip this without also resetting
+        // schedule, timezone, retention and staging mode to whatever the
+        // command line and the platform defaults say. Two paths leave a
+        // cluster holding a complete, correct, switched-off configuration —
+        // `backup disable`, and a restore, which replays the source's block
+        // disabled — and both of them need a way back on that changes exactly
+        // this one field.
+        "enabled" => {
+            let on = match value {
+                "true" | "on" | "yes" => true,
+                "false" | "off" | "no" => false,
+                _ => {
+                    return Err(CliError::Other(format!(
+                        "enabled takes `true` or `false` — got `{value}`"
+                    )))
+                }
+            };
+            field.insert("enabled".into(), Value::Bool(on));
+        }
         "at" => {
             let (h, m) = parse_at(value)?;
             field.insert("schedule".into(), Value::String(compose_daily(h, m)));
@@ -2899,6 +2935,15 @@ fn backup_set_patch(key: &str, value: &str) -> Result<Value> {
 /// happened, not whether it captured the applications the cluster has. Reads
 /// the manifest the runner wrote into the snapshot, so the answer comes from
 /// the backup itself rather than from the cluster it was taken from.
+///
+/// ## The default is not restic's `latest` (E2)
+///
+/// It used to be, and in a shared repository that displayed whichever cluster
+/// wrote last. Read-only, but this is what an operator reads before deciding
+/// what to restore, so a foreign answer here becomes a foreign restore. The
+/// default now resolves through [`resolve_latest_snapshot`] — the same rule
+/// `restore` uses, deliberately the same function — so `show` and `restore`
+/// cannot disagree about which snapshot `latest` is.
 pub fn run_backup_show(
     snapshot: Option<&str>,
     repo_override: Option<&str>,
@@ -2910,16 +2955,41 @@ pub fn run_backup_show(
         credential_file.is_some(),
         env_creds_complete(&|k| std::env::var(k).ok()),
     );
-    let kc =
-        kubeconfig_if_cluster_needed("show", repo_override, RetentionArgs::NotApplicable, source)?;
+    let kc = kubeconfig_if_cluster_needed(
+        "show",
+        repo_override,
+        RetentionArgs::NotApplicable,
+        source,
+        None,
+    )?;
     let kc_path = kc.as_ref().map(|f| f.path());
     let spec_backup = spec_backup_from_cluster(kc_path)?;
     let creds = resolve_verb_creds(credential_file, kc_path, spec_backup.as_ref())?;
     let pass = creds["RESTIC_PASSWORD"].clone();
     let repo = repo_from_spec_backup(repo_override, spec_backup.as_ref())?;
 
+    // The identity that narrows `latest`, acquired even on the paths that
+    // needed no cluster for anything else (`--repo` + local credentials) —
+    // exactly as `backup list` does, and best-effort for the same reason: a
+    // repository must stay inspectable when its cluster is gone. With no
+    // identity, `resolve_latest_snapshot` falls back to the single-cluster /
+    // refuse-if-ambiguous rule, which is the half that still refuses to guess.
+    let kc = match kc {
+        Some(kc) => Some(kc),
+        None => ensure_kubeconfig_tempfile().ok(),
+    };
+    let this_uid = kc.as_ref().and_then(|kc| read_cluster_uid(kc.path()).ok());
+
     let runner = CredentialedRestic { creds };
-    let id = snapshot.unwrap_or("latest");
+    // The repository listing is fetched ONLY for the default; naming a
+    // snapshot must not cost a `restic snapshots` call, and must keep working
+    // when the listing is what is broken.
+    let listing = match snapshot {
+        Some(_) => None,
+        None => Some(runner.run_stdout(&restic_snapshots_argv(&repo), &pass)?),
+    };
+    let id = snapshot_to_show(snapshot, listing.as_deref(), this_uid.as_deref())?;
+    let id = id.as_str();
     let inside = read_snapshot_insides(&runner, &repo, &pass, id)?;
 
     // The id and time come from `snapshots`, not from the manifest: the
@@ -2943,11 +3013,39 @@ pub fn run_backup_show(
     Ok(())
 }
 
+/// Which snapshot `backup show` inspects: the one the operator named, or —
+/// for the default — `latest` resolved inside THIS cluster's history. Pure.
+///
+/// The seam exists so the default is pinned by a test rather than by a walk
+/// against a shared repository, which is the one shape that shows the defect
+/// and the one nobody has lying around. `listing` is `None` exactly when a
+/// snapshot was named, because then no listing is fetched at all.
+fn snapshot_to_show(
+    requested: Option<&str>,
+    listing: Option<&str>,
+    this_cluster_uid: Option<&str>,
+) -> Result<String> {
+    if let Some(id) = requested {
+        return Ok(id.to_string());
+    }
+    let listing = listing.ok_or_else(|| {
+        CliError::Other(
+            "internal: `backup show` needs the repository listing to resolve `latest`".into(),
+        )
+    })?;
+    resolve_latest_snapshot(listing, this_cluster_uid).map_err(CliError::Other)
+}
+
 /// The short id and timestamp restic itself reports for a snapshot.
 ///
 /// Falls back to the caller's own reference when `snapshots` cannot be read
 /// — the contents are the answer here, and losing the header would be a
 /// worse outcome than losing the exact id.
+///
+/// `snapshot` is always a concrete id: `run_backup_show` resolves `latest`
+/// itself, through this cluster's own history (E2). There is deliberately no
+/// `latest` branch here — restic's alias means "newest in the repository",
+/// which in a shared one is whoever wrote last.
 fn snapshot_identity(
     runner: &CredentialedRestic,
     repo: &str,
@@ -2961,18 +3059,13 @@ fn snapshot_identity(
     let Ok(list) = parse_snapshots_json(&json) else {
         return fallback;
     };
-    // `latest` is restic's own alias, and the list is chronological.
-    let found = if snapshot == "latest" {
-        list.last()
-    } else {
-        list.iter().find(|s| {
-            [s.pointer("/short_id"), s.pointer("/id")]
-                .iter()
-                .flatten()
-                .filter_map(|v| v.as_str())
-                .any(|v| v.starts_with(snapshot) || snapshot.starts_with(v))
-        })
-    };
+    let found = list.iter().find(|s| {
+        [s.pointer("/short_id"), s.pointer("/id")]
+            .iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .any(|v| v.starts_with(snapshot) || snapshot.starts_with(v))
+    });
     match found {
         Some(s) => (
             s.pointer("/short_id")
@@ -3599,9 +3692,11 @@ pub(crate) struct ClusterNeed {
     reasons: Vec<&'static str>,
     /// The flags that would resolve them locally, in `--flag <value>` form.
     flags: Vec<String>,
-    /// At least one reason has NO local substitute, so the verb cannot be made
-    /// to run off the cluster however many flags are supplied.
-    unavoidable: bool,
+    /// One of the unresolved inputs is the cluster's own IDENTITY (prune).
+    /// `--cluster-uid` substitutes for it, but unlike a repo URL or a retention
+    /// count it is a claim about whose data may be deleted, so the hint spells
+    /// out what is being claimed.
+    identity: bool,
 }
 
 impl ClusterNeed {
@@ -3618,23 +3713,26 @@ impl ClusterNeed {
         if !self.is_needed() {
             return format!("`apprafter backup {verb}` does not need a cluster.");
         }
-        if self.unavoidable {
-            return format!(
-                "`apprafter backup {verb}` needs {}, so it cannot run without a reachable \
-                 cluster — there is no flag that substitutes for it. A repository can be shared \
-                 by two clusters, and a prune that cannot tell them apart deletes the other \
-                 one's history.",
-                self.reasons.join(" and ")
-            );
-        }
-        format!(
-            "`apprafter backup {verb}` reads {} from the PlatformStack CR, so it needs a \
-             reachable cluster. If the cluster no longer exists (disaster recovery — verifying \
-             an off-site repo before restoring into a new cluster), pass {} and the command runs \
-             entirely off the cluster.",
+        let mut msg = format!(
+            "`apprafter backup {verb}` needs {}, which it reads from the cluster — so it needs a \
+             reachable one. If the cluster no longer exists (disaster recovery — verifying an \
+             off-site repo before restoring into a new cluster, or reclaiming what a destroyed \
+             cluster left in one), pass {} and the command runs entirely off the cluster.",
             self.reasons.join(" and "),
             self.flags.join(" ")
-        )
+        );
+        if self.identity {
+            msg.push_str(
+                "\n\n`--cluster-uid` is not a convenience: it is a claim about WHOSE snapshots \
+                 may be forgotten. A prune deletes by explicit snapshot id and one repository \
+                 can hold several clusters' runs, so the wrong UID reclaims the wrong history. \
+                 It is the gone cluster's `kube-system` namespace UID, which leads every restic \
+                 tag its snapshots carry — `apprafter backup list --repo <repo> --all-clusters` \
+                 names the identities a repository holds, and a prune against one it has never \
+                 seen refuses instead of falling back to everything.",
+            );
+        }
+        msg
     }
 }
 
@@ -3717,6 +3815,7 @@ pub(crate) fn cluster_need(
     repo_override: Option<&str>,
     retention: RetentionArgs,
     creds: CredSource,
+    cluster_uid_override: Option<&str>,
 ) -> ClusterNeed {
     let mut need = ClusterNeed::default();
     if repo_override.is_none() {
@@ -3731,17 +3830,18 @@ pub(crate) fn cluster_need(
             .extend(missing.into_iter().map(|f| format!("{f} <n>")));
     }
     // A prune DELETES, and a repository can be shared, so it must know whose
-    // snapshots it is allowed to forget (E3/E4). That answer is the cluster's
-    // own `kube-system` UID and there is no flag that substitutes for it — so
-    // unlike the reasons above, this one is never cleared. Before this, a
-    // fully-specified `backup prune --repo … --keep-*` ran with no cluster at
-    // all and planned across every snapshot in the bucket.
-    if matches!(retention, RetentionArgs::Prune { .. }) {
+    // snapshots it is allowed to forget (E3/E4). The cluster answers that with
+    // its own `kube-system` UID; with the cluster gone, `--cluster-uid` is the
+    // operator answering it EXPLICITLY, which is the only other honest form —
+    // the offline path this replaced simply planned across every snapshot in
+    // the bucket, which is the defect and not the capability.
+    if matches!(retention, RetentionArgs::Prune { .. }) && cluster_uid_override.is_none() {
         need.reasons.push(
-            "this cluster's identity (the kube-system namespace UID), which decides whose \
-             snapshots may be forgotten",
+            "an identity for the snapshots it may forget (this cluster's kube-system namespace \
+             UID)",
         );
-        need.unavoidable = true;
+        need.flags.push("--cluster-uid <uid>".to_string());
+        need.identity = true;
     }
     if creds == CredSource::Cluster {
         need.reasons
@@ -3761,8 +3861,9 @@ pub(crate) fn backup_verb_needs_cluster(
     repo_override: Option<&str>,
     retention: RetentionArgs,
     creds: CredSource,
+    cluster_uid_override: Option<&str>,
 ) -> bool {
-    cluster_need(repo_override, retention, creds).is_needed()
+    cluster_need(repo_override, retention, creds, cluster_uid_override).is_needed()
 }
 
 /// Acquire the kubeconfig ONLY on the paths that genuinely need it.
@@ -3777,15 +3878,16 @@ fn kubeconfig_if_cluster_needed(
     repo_override: Option<&str>,
     retention: RetentionArgs,
     creds: CredSource,
+    cluster_uid_override: Option<&str>,
 ) -> Result<Option<NamedTempFile>> {
-    if !backup_verb_needs_cluster(repo_override, retention, creds) {
+    if !backup_verb_needs_cluster(repo_override, retention, creds, cluster_uid_override) {
         return Ok(None);
     }
     match ensure_kubeconfig_tempfile() {
         Ok(kc) => Ok(Some(kc)),
         Err(e) => Err(CliError::Other(format!(
             "{e}\n{}",
-            cluster_need(repo_override, retention, creds).hint(verb)
+            cluster_need(repo_override, retention, creds, cluster_uid_override).hint(verb)
         ))),
     }
 }
@@ -3922,29 +4024,49 @@ fn retention_from_spec_backup(
 /// `apprafter.io/last-prune` annotation with the current RFC3339 time so
 /// `apprafter backup status` can surface when the repo was last pruned.
 ///
-/// ## Prune ALWAYS needs a cluster (E3/E4)
+/// ## Prune needs an identity, from the cluster or from the operator (E3/E4)
 ///
 /// It used to be lazy: `--repo` plus all three `--keep-*` flags let it run with
-/// no cluster at all. That is no longer possible, and the reason is the point
-/// of this command's blast radius. A restic repository can legitimately be
-/// shared by two clusters — the documented "move to a bigger machine" runbook
-/// has both alive at once — and the planner deletes by explicit snapshot id.
-/// Without the cluster's `kube-system` UID there is nothing to tell one
-/// cluster's runs from the other's, so an "offline" prune planned across the
-/// whole bucket and forgot the neighbour's history. There is no flag that
-/// substitutes for an identity, so the lazy path is gone rather than made
-/// optional.
+/// no cluster at all. That form is gone, and the reason is the point of this
+/// command's blast radius. A restic repository can legitimately be shared by
+/// two clusters — the documented "move to a bigger machine" runbook has both
+/// alive at once — and the planner deletes by explicit snapshot id. Without a
+/// cluster's `kube-system` UID there is nothing to tell one cluster's runs from
+/// the other's, so an "offline" prune planned across the whole bucket and
+/// forgot the neighbour's history.
+///
+/// What the identity may NOT be is implicit. A prune with a live cluster reads
+/// the UID off `kube-system`; a prune whose cluster is gone — the real offline
+/// need, where the repository outlived the machine and its snapshots should be
+/// reclaimable — takes `--cluster-uid <uid>`, the operator saying WHOSE history
+/// this is. The repository checks that claim before anything is forgotten: a
+/// UID it has never seen is refused, naming the ones it holds, rather than
+/// falling through to the pre-identity snapshots.
 pub fn run_backup_prune(
     repo_override: Option<&str>,
     credential_file: Option<&Path>,
     keep_daily: Option<u32>,
     keep_weekly: Option<u32>,
     keep_monthly: Option<u32>,
+    cluster_uid_override: Option<&str>,
 ) -> Result<()> {
     // D11 / 2.22a: the external binaries this command spawns, checked
     // BEFORE any prompt, kubeconfig or provider call. The reported bug
     // was a passphrase typed into a command that could not have worked.
     preflight_tools(&[&RESTIC], "apprafter backup prune")?;
+
+    // A typo here selects a different cluster's history, so it is rejected at
+    // the flag rather than at the planner: every identity in a repository is a
+    // Kubernetes namespace UID, and nothing else can ever match one.
+    if let Some(uid) = cluster_uid_override {
+        if !backup_core::cluster::is_uuid(uid) {
+            return Err(CliError::Other(format!(
+                "--cluster-uid '{uid}' is not a Kubernetes namespace UID. It must be the gone \
+                 cluster's `kube-system` UID in canonical UUID form \
+                 (8-4-4-4-12 hex), which is what leads every restic tag its snapshots carry."
+            )));
+        }
+    }
 
     let retention = RetentionArgs::Prune {
         keep_daily,
@@ -3955,7 +4077,13 @@ pub fn run_backup_prune(
         credential_file.is_some(),
         env_creds_complete(&|k| std::env::var(k).ok()),
     );
-    let kc = kubeconfig_if_cluster_needed("prune", repo_override, retention, source)?;
+    let kc = kubeconfig_if_cluster_needed(
+        "prune",
+        repo_override,
+        retention,
+        source,
+        cluster_uid_override,
+    )?;
     let kc_path = kc.as_ref().map(|f| f.path());
 
     // Fetch the CR once (when we have a cluster at all): repo fallback
@@ -3970,16 +4098,33 @@ pub fn run_backup_prune(
     let repo = repo_from_spec_backup(repo_override, spec_backup)?;
     let policy = retention_from_spec_backup(spec_backup, keep_daily, keep_weekly, keep_monthly);
 
-    // Whose snapshots this prune may forget. `cluster_need` makes the
-    // kubeconfig unconditional for prune, so this is always available.
-    let kc_path = kc_path.ok_or_else(|| {
-        CliError::Other(identity_read_error(
-            "prune resolved no kubeconfig, which `cluster_need` should have made impossible",
-        ))
-    })?;
-    let cluster_uid = read_cluster_uid(kc_path)?;
-
     let runner = CredentialedRestic { creds };
+
+    // Whose snapshots this prune may forget: the operator's explicit claim, or
+    // the cluster's own UID. `cluster_need` guarantees one of the two is
+    // available — with no `--cluster-uid` the kubeconfig is unconditional.
+    let cluster_uid = match cluster_uid_override {
+        Some(uid) => {
+            // Check the claim against the repository before deleting anything.
+            // This costs a second `restic snapshots` (run_prune lists again),
+            // which is the right trade for a rare, deliberate, destructive
+            // command that cannot ask a cluster to confirm its own identity.
+            let json = runner.run_stdout(&restic_snapshots_argv(&repo), &pass)?;
+            let snapshots = parse_snapshots_json(&json)?;
+            println!("  {}", offline_prune_scope(&snapshots, uid)?);
+            uid.to_string()
+        }
+        None => {
+            let kc_path = kc_path.ok_or_else(|| {
+                CliError::Other(identity_read_error(
+                    "prune resolved no kubeconfig, which `cluster_need` should have made \
+                     impossible",
+                ))
+            })?;
+            read_cluster_uid(kc_path)?
+        }
+    };
+
     run_prune(&runner, &repo, &pass, &policy, &cluster_uid)?;
 
     print!("{}", prune_summary(&repo, &policy));
@@ -3987,6 +4132,15 @@ pub fn run_backup_prune(
     // Stamp last-prune so `backup status` can report it. Best-effort ordering:
     // the prune already succeeded, so a merge-patch failure here surfaces as an
     // error (the annotation is the audit trail — we don't want to swallow it).
+    // An offline prune has no CR to stamp; it says so rather than failing,
+    // because the cluster being gone is the whole premise of that path.
+    let Some(kc_path) = kc_path else {
+        println!(
+            "  (no cluster to stamp `apprafter.io/last-prune` on — offline prune by \
+             --cluster-uid)"
+        );
+        return Ok(());
+    };
     let ts = chrono::Utc::now().to_rfc3339();
     let body = last_prune_patch_body(&ts);
     kubectl_merge_patch(
@@ -3999,6 +4153,50 @@ pub fn run_backup_prune(
     )?;
     println!("  last-prune stamped: {ts}");
     Ok(())
+}
+
+/// Check an offline prune's `--cluster-uid` against the repository it is about
+/// to forget snapshots in, and describe what it will plan over. Pure.
+///
+/// With no cluster to read an identity from, the REPOSITORY is the only thing
+/// that can check the operator's claim — and it must, because a mistyped UID
+/// does not fail loudly. It matches nothing identified, every identified
+/// snapshot becomes another cluster's and is spared, and the planner is left
+/// holding only the pre-identity ones, which it would forget by policy. That
+/// is a silent delete of the wrong history, so a UID this repository has never
+/// seen is refused with the ones it has.
+///
+/// A repository holding ONLY pre-identity snapshots is not that mistake: there
+/// is no identity in it to match, every snapshot is attributed by the stated
+/// assumption, and reclaiming such a repository after its cluster is gone is
+/// exactly what this flag restores. Allowed, and named so it is not a surprise.
+fn offline_prune_scope(snapshots: &[Value], uid: &str) -> Result<String> {
+    let present = backup_core::cluster::cluster_uids_in(snapshots);
+    if present.iter().any(|p| p == uid) {
+        return Ok(format!(
+            "pruning the snapshots of cluster {uid} ({} cluster(s) in this repository)",
+            present.len()
+        ));
+    }
+    if present.is_empty() {
+        return Ok(format!(
+            "no snapshot in this repository carries a cluster identity — they predate it, and \
+             are pruned as {uid}'s by the stated assumption"
+        ));
+    }
+    Err(CliError::Other(format!(
+        "--cluster-uid {uid} has never written a snapshot to this repository, which holds \
+         {}: {}.\n\nRefusing rather than pruning: a UID that matches nothing would spare every \
+         identified snapshot and forget only the ones written before cluster identity existed. \
+         Pass one of the identities above, or `apprafter backup list --repo <repo> \
+         --all-clusters` to see the runs behind them.",
+        if present.len() == 1 {
+            "one cluster".to_string()
+        } else {
+            format!("{} clusters", present.len())
+        },
+        present.join(", ")
+    )))
 }
 
 /// What `backup prune` prints after a successful prune. Pure — extracted from
@@ -4046,8 +4244,13 @@ pub fn run_backup_check(
         credential_file.is_some(),
         env_creds_complete(&|k| std::env::var(k).ok()),
     );
-    let kc =
-        kubeconfig_if_cluster_needed("check", repo_override, RetentionArgs::NotApplicable, source)?;
+    let kc = kubeconfig_if_cluster_needed(
+        "check",
+        repo_override,
+        RetentionArgs::NotApplicable,
+        source,
+        None,
+    )?;
     let kc_path = kc.as_ref().map(|f| f.path());
     let spec_backup = spec_backup_from_cluster(kc_path)?;
     let creds = resolve_verb_creds(credential_file, kc_path, spec_backup.as_ref())?;
@@ -4153,6 +4356,7 @@ pub fn run_backup_unlock(
         repo_override,
         RetentionArgs::NotApplicable,
         source,
+        None,
     )?;
     let kc_path = kc.as_ref().map(|f| f.path());
     let spec_backup = spec_backup_from_cluster(kc_path)?;
@@ -4641,8 +4845,13 @@ pub fn run_backup_disable() -> Result<()> {
         &body,
         kc.path(),
     )?;
+    // Names `set enabled true` and not `enable`: the config IS retained, and
+    // `backup enable` would recompose the whole block from its flags, quietly
+    // resetting the schedule, timezone, retention and staging mode this
+    // command just promised to keep.
     println!(
-        "✓ Scheduled backup disabled (config retained; re-enable with `apprafter backup enable`)."
+        "✓ Scheduled backup disabled (config retained; re-enable with \
+         `apprafter backup set enabled true`)."
     );
     Ok(())
 }
@@ -6414,6 +6623,29 @@ mod tests {
         assert_eq!(at["spec"]["backup"]["checkSchedule"], json!("0 6 * * 0"));
     }
 
+    /// The switch, settable on its own — the way back from a `backup disable`
+    /// and from a restore, both of which leave a COMPLETE configuration
+    /// switched off. FIRES on the patch shape: one key, a real JSON boolean
+    /// (the CRD field is `boolean`, so the string `"true"` would be rejected
+    /// or pruned), and nothing else touched.
+    #[test]
+    fn set_enabled_flips_only_the_switch() {
+        let on = backup_set_patch("enabled", "true").unwrap();
+        let backup = on["spec"]["backup"].as_object().unwrap();
+        assert_eq!(backup.len(), 1, "only the switch: {backup:?}");
+        assert_eq!(backup["enabled"], json!(true));
+
+        let off = backup_set_patch("enabled", "false").unwrap();
+        assert_eq!(off["spec"]["backup"]["enabled"], json!(false));
+
+        // DOES NOT FIRE on nonsense: a typo must not silently read as `false`
+        // and switch a schedule off.
+        let err = backup_set_patch("enabled", "yes please")
+            .expect_err("an unparseable value must refuse, not default")
+            .to_string();
+        assert!(err.contains("true"), "{err}");
+    }
+
     #[test]
     fn set_validates_the_values_it_forwards() {
         assert!(backup_set_patch("keep-daily", "14").is_ok());
@@ -6705,20 +6937,29 @@ mod tests {
             // Credentials pinned to a local source throughout, so this
             // table stays about the repo and nothing else.
             assert_eq!(
-                backup_verb_needs_cluster(repo, RetentionArgs::NotApplicable, CredSource::File),
+                backup_verb_needs_cluster(
+                    repo,
+                    RetentionArgs::NotApplicable,
+                    CredSource::File,
+                    None
+                ),
                 expect,
                 "{why}"
             );
         }
     }
 
-    /// E3/E4: prune ALWAYS needs a cluster, whatever is on the command line.
+    /// A cluster UID shaped like the ones `kube-system` carries, for the
+    /// offline-prune rows below.
+    const OFFLINE_UID: &str = "11111111-2222-3333-4444-555555555555";
+
+    /// E3/E4: prune needs an IDENTITY, and without `--cluster-uid` the only
+    /// place one comes from is a live cluster.
     ///
-    /// It used to go fully offline with `--repo` + all three `--keep-*`. A
-    /// prune deletes by explicit snapshot id, and a repository can be shared,
-    /// so without the cluster's `kube-system` UID it planned across every
-    /// snapshot in the bucket and forgot the co-tenant's runs. No flag can
-    /// stand in for an identity, so the offline path is gone.
+    /// It used to go fully offline with `--repo` + all three `--keep-*` and
+    /// nothing else. A prune deletes by explicit snapshot id, and a repository
+    /// can be shared, so without a cluster's `kube-system` UID it planned
+    /// across every snapshot in the bucket and forgot the co-tenant's runs.
     #[test]
     fn needs_cluster_table_prune() {
         let repo = Some("s3:https://h/b");
@@ -6728,7 +6969,7 @@ mod tests {
                 repo,
                 prune_keeps(Some(7), Some(4), Some(6)),
                 true,
-                "--repo + all three --keep-* still needs the cluster's identity (E3)",
+                "--repo + all three --keep-* still needs an identity (E3)",
             ),
             (
                 repo,
@@ -6764,11 +7005,60 @@ mod tests {
         ];
         for (r, keeps, expect, why) in table {
             assert_eq!(
-                backup_verb_needs_cluster(r, keeps, CredSource::File),
+                backup_verb_needs_cluster(r, keeps, CredSource::File, None),
                 expect,
                 "{why}"
             );
         }
+    }
+
+    /// …and `--cluster-uid` is the one thing that clears the identity reason.
+    ///
+    /// The real offline need: the cluster is gone, the repository remains, and
+    /// its snapshots should be reclaimable. FIRES with the flag; the table
+    /// above is the same rows without it, so the pair pins that the flag is
+    /// what changed the answer and not the repo or the keeps.
+    #[test]
+    fn cluster_uid_is_the_offline_identity_and_nothing_else_substitutes() {
+        let repo = Some("s3:https://h/b");
+        let full = prune_keeps(Some(7), Some(4), Some(6));
+        assert!(
+            !backup_verb_needs_cluster(repo, full, CredSource::File, Some(OFFLINE_UID)),
+            "--repo + --keep-* + --cluster-uid + local creds → fully offline"
+        );
+        // Every other input still has to come from somewhere: the flag buys
+        // the identity and only the identity.
+        assert!(
+            backup_verb_needs_cluster(None, full, CredSource::File, Some(OFFLINE_UID)),
+            "no --repo → the bucket still comes from the CR"
+        );
+        assert!(
+            backup_verb_needs_cluster(
+                repo,
+                prune_keeps(Some(7), None, Some(6)),
+                CredSource::File,
+                Some(OFFLINE_UID)
+            ),
+            "a missing --keep-* still comes from the CR"
+        );
+        assert!(
+            backup_verb_needs_cluster(repo, full, CredSource::Cluster, Some(OFFLINE_UID)),
+            "credentials held only by the cluster still need it"
+        );
+    }
+
+    /// `--cluster-uid` belongs to prune alone. check / unlock / show never
+    /// delete, so they have no identity to claim and must not acquire one.
+    #[test]
+    fn the_identity_reason_exists_only_for_prune() {
+        let need = cluster_need(
+            Some("s3:https://h/b"),
+            RetentionArgs::NotApplicable,
+            CredSource::Cluster,
+            None,
+        );
+        assert!(!need.identity);
+        assert!(!need.flags.iter().any(|f| f.contains("--cluster-uid")));
     }
 
     #[test]
@@ -6780,13 +7070,137 @@ mod tests {
         assert!(!backup_verb_needs_cluster(
             repo,
             RetentionArgs::NotApplicable,
-            CredSource::File
+            CredSource::File,
+            None
         ));
         assert!(backup_verb_needs_cluster(
             repo,
             prune_keeps(Some(7), Some(4), None),
-            CredSource::File
+            CredSource::File,
+            None
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // `backup show` — which snapshot the default inspects (E2)
+    // ------------------------------------------------------------------
+
+    /// A repository two clusters share, with the CO-TENANT having written
+    /// last: the shape where restic's own `latest` displays a stranger's run.
+    fn shared_show_listing() -> String {
+        let theirs = "99999999-8888-7777-6666-555555555555";
+        format!(
+            r#"[
+              {{"id":"mine1","short_id":"mine1","time":"2026-09-02T03:00:00Z",
+                "tags":["{OFFLINE_UID}-2026-09-02T03:00:00Z"]}},
+              {{"id":"theirs1","short_id":"theirs1","time":"2026-09-02T04:00:00Z",
+                "tags":["{theirs}-2026-09-02T04:00:00Z"]}}
+            ]"#
+        )
+    }
+
+    /// FIRES: the default inspects THIS cluster's newest snapshot, not the
+    /// repository's. `show` is read-only, but it is what an operator reads
+    /// before choosing what to restore — a foreign answer here becomes a
+    /// foreign restore.
+    #[test]
+    fn show_defaults_to_this_clusters_latest_not_the_repositorys() {
+        let id = snapshot_to_show(None, Some(&shared_show_listing()), Some(OFFLINE_UID)).unwrap();
+        assert_eq!(
+            id, "mine1",
+            "the newest snapshot in the repository is theirs"
+        );
+    }
+
+    /// DOES NOT FIRE: a named snapshot is honoured exactly as given, whatever
+    /// cluster wrote it and without fetching a listing at all. That is the
+    /// escape hatch the ambiguity refusal points at, and narrowing must not
+    /// take it away.
+    #[test]
+    fn show_honours_a_named_snapshot_without_reading_the_repository() {
+        assert_eq!(
+            snapshot_to_show(Some("theirs1"), None, Some(OFFLINE_UID)).unwrap(),
+            "theirs1"
+        );
+        // …including with no identity at all.
+        assert_eq!(
+            snapshot_to_show(Some("abc123"), None, None).unwrap(),
+            "abc123"
+        );
+    }
+
+    /// And the ambiguous case refuses rather than displaying a guess: a fresh
+    /// target facing two foreign clusters cannot be shown "the" latest.
+    #[test]
+    fn show_refuses_latest_when_the_repository_is_ambiguous() {
+        let fresh = "abcdabcd-0000-0000-0000-abcdabcdabcd";
+        let err = snapshot_to_show(None, Some(&shared_show_listing()), Some(fresh))
+            .expect_err("two foreign clusters and none of ours is a guess")
+            .to_string();
+        assert!(err.contains("different clusters"), "{err}");
+        assert!(err.contains("apprafter backup show <id>"), "{err}");
+    }
+
+    // ------------------------------------------------------------------
+    // The offline prune's claim, checked against the repository (E3)
+    // ------------------------------------------------------------------
+
+    /// A repository listing: `uids` are the clusters that wrote into it, plus
+    /// `legacy` pre-identity snapshots.
+    fn repo_listing(uids: &[&str], legacy: usize) -> Vec<Value> {
+        let mut out: Vec<Value> = uids
+            .iter()
+            .enumerate()
+            .map(|(i, u)| json!({"id": format!("s{i}"), "tags": [format!("{u}-2026-09-11T03:00:0{i}Z")]}))
+            .collect();
+        for i in 0..legacy {
+            out.push(json!({"id": format!("l{i}"), "tags": ["platform-2026-09-11T03:00:00Z"]}));
+        }
+        out
+    }
+
+    /// FIRES: a UID this repository has never seen is refused, and the refusal
+    /// NAMES the ones it holds — otherwise the operator has no way to find the
+    /// right one with the cluster gone.
+    ///
+    /// This is the dangerous direction, and it is dangerous quietly: a
+    /// mistyped UID matches nothing, spares every identified snapshot, and
+    /// leaves the planner holding only the pre-identity ones, which it forgets
+    /// by policy. Falling through would delete the wrong history in silence.
+    #[test]
+    fn an_offline_prune_refuses_a_uid_the_repository_has_never_seen() {
+        let theirs = "99999999-8888-7777-6666-555555555555";
+        let snaps = repo_listing(&[theirs], 2);
+        let err = offline_prune_scope(&snaps, OFFLINE_UID)
+            .expect_err("a UID matching nothing must not fall through to the legacy snapshots")
+            .to_string();
+        assert!(err.contains(theirs), "names the identity it holds: {err}");
+        assert!(err.contains(OFFLINE_UID), "names what was asked for: {err}");
+        assert!(err.contains("--all-clusters"), "{err}");
+    }
+
+    /// DOES NOT FIRE: the UID that DID write here is accepted. Without this
+    /// the test above would also pass on a check that refused everything.
+    #[test]
+    fn an_offline_prune_accepts_a_uid_that_wrote_into_the_repository() {
+        let snaps = repo_listing(&[OFFLINE_UID, "99999999-8888-7777-6666-555555555555"], 0);
+        let note = offline_prune_scope(&snaps, OFFLINE_UID).expect("its own history is prunable");
+        assert!(note.contains(OFFLINE_UID), "{note}");
+        assert!(note.contains("2 cluster(s)"), "{note}");
+    }
+
+    /// …and a repository holding ONLY pre-identity snapshots is allowed, not
+    /// refused: nothing in it carries an identity to match, every snapshot is
+    /// attributed by the stated assumption, and reclaiming such a repository
+    /// after its cluster is gone is exactly what the flag restores. Named in
+    /// the output so the assumption is visible rather than silent.
+    #[test]
+    fn an_offline_prune_over_a_pre_identity_repository_is_allowed_and_says_so() {
+        let snaps = repo_listing(&[], 3);
+        let note =
+            offline_prune_scope(&snaps, OFFLINE_UID).expect("a legacy repository is reclaimable");
+        assert!(note.contains("predate"), "{note}");
+        assert!(note.contains(OFFLINE_UID), "{note}");
     }
 
     // ------------------------------------------------------------------
@@ -6992,18 +7406,21 @@ mod tests {
         assert!(backup_verb_needs_cluster(
             repo,
             RetentionArgs::NotApplicable,
-            CredSource::Cluster
+            CredSource::Cluster,
+            None
         ));
         // …and none when the operator DID supply them locally.
         assert!(!backup_verb_needs_cluster(
             repo,
             RetentionArgs::NotApplicable,
-            CredSource::File
+            CredSource::File,
+            None
         ));
         assert!(!backup_verb_needs_cluster(
             repo,
             RetentionArgs::NotApplicable,
-            CredSource::Env
+            CredSource::Env,
+            None
         ));
     }
 
@@ -7013,7 +7430,13 @@ mod tests {
         // repo before restoring — now needs credentials as well as a
         // repo, and a hint that lists only `--repo` would leave the
         // operator one flag short of running offline.
-        let h = cluster_need(None, RetentionArgs::NotApplicable, CredSource::Cluster).hint("check");
+        let h = cluster_need(
+            None,
+            RetentionArgs::NotApplicable,
+            CredSource::Cluster,
+            None,
+        )
+        .hint("check");
         assert!(h.contains("--repo"), "{h}");
         assert!(h.contains("--credential-file"), "names the creds flag: {h}");
     }
@@ -7082,7 +7505,8 @@ mod tests {
 
     #[test]
     fn offline_hint_for_check_points_at_repo_only() {
-        let h = cluster_need(None, RetentionArgs::NotApplicable, CredSource::File).hint("check");
+        let h =
+            cluster_need(None, RetentionArgs::NotApplicable, CredSource::File, None).hint("check");
         assert!(h.contains("backup check"), "names the verb: {h}");
         assert!(h.contains("--repo"), "names --repo: {h}");
         assert!(
@@ -7091,35 +7515,57 @@ mod tests {
         );
     }
 
-    /// The prune hint no longer offers an offline escape, because there is
-    /// none — so it must SAY why rather than list flags that would not help.
+    /// The prune hint names the identity it is missing, the flag that supplies
+    /// it, and what supplying it CLAIMS — an operator reaching for
+    /// `--cluster-uid` is about to delete by explicit id in a repository that
+    /// may hold someone else's runs, and the hint is where they learn that.
     #[test]
-    fn offline_hint_for_prune_explains_that_no_flag_replaces_the_identity() {
+    fn offline_hint_for_prune_names_the_identity_and_what_claiming_it_means() {
         let h = cluster_need(
             Some("s3:https://h/b"),
             prune_keeps(Some(7), Some(4), Some(6)),
             CredSource::File,
+            None,
         )
         .hint("prune");
         assert!(
             h.contains("kube-system"),
             "names the identity it needs: {h}"
         );
+        assert!(h.contains("--cluster-uid"), "names the flag: {h}");
         assert!(
-            h.contains("no flag that substitutes"),
-            "says the offline path does not exist rather than implying one: {h}"
+            h.contains("WHOSE snapshots may be forgotten"),
+            "says what the flag claims, not just that it exists: {h}"
         );
         assert!(
             !h.contains("--keep-daily"),
-            "must not offer a flag that would not help: {h}"
+            "those were supplied — must not ask for them again: {h}"
         );
+    }
+
+    /// …and once the identity IS supplied, the hint stops selling it. A hint
+    /// listing `--cluster-uid` to an operator who already passed it would send
+    /// them looking for a flag they are holding.
+    #[test]
+    fn the_prune_hint_drops_the_identity_once_cluster_uid_is_given() {
+        let h = cluster_need(
+            None,
+            prune_keeps(Some(7), Some(4), Some(6)),
+            CredSource::File,
+            Some(OFFLINE_UID),
+        )
+        .hint("prune");
+        assert!(h.contains("--repo"), "the bucket is still unresolved: {h}");
+        assert!(!h.contains("--cluster-uid"), "{h}");
+        assert!(!h.contains("kube-system"), "{h}");
     }
 
     /// check / unlock keep the offline path, and keep naming the DR case: the
     /// operator's cluster is SUPPOSED to be gone when they verify a repo.
     #[test]
     fn offline_hint_mentions_disaster_recovery_when_repo_missing() {
-        let h = cluster_need(None, RetentionArgs::NotApplicable, CredSource::File).hint("check");
+        let h =
+            cluster_need(None, RetentionArgs::NotApplicable, CredSource::File, None).hint("check");
         assert!(h.contains("--repo"), "{h}");
         assert!(
             h.to_lowercase().contains("no longer exists")
@@ -7714,6 +8160,14 @@ mod tests {
         }
     }
 
+    /// The same reader, with `--all-clusters`.
+    fn all_clusters_view() -> ClusterView<'static> {
+        ClusterView {
+            this: Some(MINE),
+            all: true,
+        }
+    }
+
     /// FIRES: another cluster's snapshots are withheld and counted, and the
     /// legacy one stays in scope — which is exactly the stated rule.
     #[test]
@@ -7815,6 +8269,34 @@ mod tests {
             false,
         );
         assert!(quiet.is_empty(), "{quiet:?}");
+    }
+
+    /// FIRES: `--all-clusters` names the identities the repository holds, in
+    /// full. This is the one place the whole UID is printed — the TAGS column
+    /// abbreviates it to eight characters — and it is where an operator reads
+    /// off the one `backup prune --cluster-uid` needs after a cluster is gone.
+    #[test]
+    fn all_clusters_names_the_identities_the_repository_holds() {
+        let snaps = [
+            mine_snapshot("a", "prod"),
+            their_snapshot("c", "staging"),
+            legacy_snapshot("b"),
+        ];
+        let scope = ListingScope {
+            shown: snaps.iter().collect(),
+            hidden: 0,
+        };
+        let joined = listing_footnotes(&scope, all_clusters_view(), true).join("\n");
+        assert!(
+            joined.contains(MINE),
+            "the whole UID, not the short tag: {joined}"
+        );
+        assert!(joined.contains(THEIRS), "{joined}");
+
+        // DOES NOT FIRE on the narrowed default: that listing is this
+        // cluster's by construction, so naming identities would be noise.
+        let quiet = listing_footnotes(&scope, my_view(), false).join("\n");
+        assert!(!quiet.contains("cluster identities"), "{quiet}");
     }
 
     #[test]
@@ -8338,7 +8820,8 @@ mod tests {
             "check",
             Some("s3:x"),
             RetentionArgs::NotApplicable,
-            CredSource::File
+            CredSource::File,
+            None
         )
         .unwrap()
         .is_none());
@@ -8354,7 +8837,8 @@ mod tests {
                     "prune",
                     Some("s3:x"),
                     prune_keeps(Some(7), Some(4), Some(6)),
-                    CredSource::File
+                    CredSource::File,
+                    None
                 ),
                 Ok(None)
             ),

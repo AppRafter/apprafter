@@ -84,10 +84,19 @@ clusters at once — safer, and more expensive for as long as both are up.
 Cheapest, and the machine is gone while the new one comes up.
 
 ```sh
-apprafter backup create                                    # to an off-cluster repository
-apprafter destroy --yes                                    # releases the machine
-apprafter restore <repo> --reprovision --server-type <sku> # rebuild, then replay
+apprafter backup create                                     # to an off-cluster repository
+apprafter destroy --yes                                     # releases the machine
+apprafter restore <repo> --reprovision --server-type <sku> \
+    --keep-backup-schedule                                  # rebuild, then replay
 ```
+
+`--keep-backup-schedule` is right on this route and only on this route. A
+restore replays the source's whole backup configuration and, by default, leaves
+it switched off — because a restored cluster is usually a *second* cluster and
+must not start writing into a repository its source may still be using. Here the
+source machine is already gone, there is one cluster at the end, and it is the
+repository's rightful writer; the flag says so. Route B is the opposite case and
+takes the default.
 
 `apprafter destroy` clears the recorded cluster, which is what makes
 `apprafter target machine` available again — it is the same "target with
@@ -132,12 +141,30 @@ apprafter target add <new-name> --provider hetzner-cloud --token <new-project-to
 apprafter restore <repo> --reprovision --target <new-name> --server-type <sku>
 ```
 
-For as long as both clusters run, both carry the same backup configuration —
-the restore replays it — so both write to the same repository. That is supported:
-each cluster's snapshots are attributed to it, so neither cluster's `restore` or
-`prune` can reach the other's ([which snapshots are
+The restore replays the old cluster's whole backup configuration onto the new
+one — that is what makes this route the case the default guards against, and the
+default is why nothing surprising happens here.
+
+**The new cluster's backup schedule arrives switched off.** The bucket, the
+credential, the schedule, the timezone and the retention counts all come across
+exactly as captured, but `enabled` is forced to `false` and the restore summary
+says so. Left on, the new cluster would begin writing to the same repository as
+the old one from its first night, while the old one is still running and before
+you have decided the move worked. Do **not** pass `--keep-backup-schedule` on
+this route; it exists for disaster recovery, where the source is gone.
+
+Turn the new cluster's schedule on when you are satisfied with it — a good
+moment is just before you move DNS:
+
+```sh
+apprafter backup set enabled true
+```
+
+Two clusters writing to one repository is supported, and from that point that is
+what you have: each cluster's snapshots are attributed to it, so neither
+cluster's `restore` or `prune` can reach the other's ([which snapshots are
 yours](../how-it-works/backup-retention-and-checks.md#which-snapshots-are-yours)).
-Two things are worth doing while both are up:
+Two more things are worth doing while both are up:
 
 - The new cluster inherits the old one's backup **name**, so a listing shows two
   clusters under one label. The restore summary says so; `apprafter backup set
@@ -201,7 +228,8 @@ apprafter destroy --yes --target prod
 
 # 4 — provision the bigger machine and replay the backup into it
 RESTIC_PASSWORD=<passphrase> apprafter restore /backups/prod-repo \
-    --reprovision --server-type cx33 --target prod
+    --reprovision --server-type cx33 --target prod \
+    --keep-backup-schedule
 ```
 
 `--server-type` on the restore is the whole answer: the target records the
@@ -227,7 +255,8 @@ apprafter destroy --yes --target prod
 # 3 — provision the bigger machine and replay from off-site
 apprafter restore s3:<endpoint>/<bucket>/<prefix> \
     --reprovision --server-type cx33 --target prod \
-    --credential-file ./operator-s3.env
+    --credential-file ./operator-s3.env \
+    --keep-backup-schedule
 ```
 
 Step 1 is worth doing before the destroy regardless — a repository you verify
@@ -244,9 +273,15 @@ if the operator-side credentials cannot reach the repository while the cluster
 is down, neither could a real recovery.
 
 Scheduled backup survives the move. `PlatformStack.spec.backup` is part of the
-captured configuration, so the rebuilt cluster comes back with the same
-bucket, schedule and retention, and `apprafter backup status` reports it
-enabled again without you re-running `apprafter backup enable`.
+captured configuration, so the rebuilt cluster comes back with the same bucket,
+schedule and retention — but a restore leaves that block **switched off** unless
+you say otherwise, because a restored cluster is usually a second cluster and
+must not start writing into a repository its source may still be using. On this
+route the source machine is gone, so `--keep-backup-schedule` above is what
+brings the schedule back enabled, and `apprafter backup status` reports it
+without you re-running `apprafter backup enable`. Leave the flag off and the
+configuration is still all there — `apprafter backup set enabled true` turns it
+on whenever you are ready.
 
 ## What to verify afterwards
 

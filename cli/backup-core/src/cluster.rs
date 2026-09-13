@@ -112,6 +112,46 @@ pub enum SnapshotOrigin {
     Legacy,
 }
 
+/// The tag list restic reports for one snapshot document.
+///
+/// Every narrowing decision here keys on tags, so there is exactly one answer
+/// to "what does an untagged snapshot look like": an empty list, never a
+/// missing field that a caller might treat differently.
+pub fn snapshot_tags(snapshot: &Value) -> Vec<String> {
+    snapshot
+        .pointer("/tags")
+        .and_then(Value::as_array)
+        .map(|t| {
+            t.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every cluster UID a `restic snapshots --json` listing carries, sorted and
+/// deduplicated.
+///
+/// The answer to "whose snapshots are in this repository". Two commands refuse
+/// rather than guess and then have to NAME the candidates: `latest` when none
+/// of the snapshots are this cluster's and more than one other cluster is
+/// present, and an offline `backup prune --cluster-uid` whose UID this
+/// repository has never seen. Legacy snapshots contribute nothing — they carry
+/// no identity, which is precisely why they are attributed by assumption.
+pub fn cluster_uids_in<'a>(snapshots: impl IntoIterator<Item = &'a Value>) -> Vec<String> {
+    let mut uids: Vec<String> = snapshots
+        .into_iter()
+        .filter_map(|s| {
+            let tags = snapshot_tags(s);
+            snapshot_cluster_uid(&tags).map(str::to_string)
+        })
+        .collect();
+    uids.sort();
+    uids.dedup();
+    uids
+}
+
 /// Classify one snapshot's tag set against this cluster's UID.
 pub fn classify_snapshot(tags: &[String], this_cluster_uid: &str) -> SnapshotOrigin {
     match snapshot_cluster_uid(tags) {
@@ -270,6 +310,38 @@ mod tests {
         // …and the relation is symmetric: from B's side, A's is foreign.
         assert!(!owned_by_this_cluster(&mine, B));
         assert!(owned_by_this_cluster(&theirs, B));
+    }
+
+    #[test]
+    fn the_uids_a_listing_carries_are_sorted_deduplicated_and_never_legacy() {
+        let snaps = vec![
+            serde_json::json!({"id":"1","tags":[format!("{B}-2026-09-11T03:00:00Z")]}),
+            serde_json::json!({"id":"2","tags":[format!("{A}-2026-09-11T03:00:00Z")]}),
+            serde_json::json!({"id":"3","tags":[format!("{A}-2026-09-12T03:00:00Z")]}),
+            // Legacy and untagged carry no identity and must not appear as a
+            // cluster: they are the ones attributed BY ASSUMPTION.
+            serde_json::json!({"id":"4","tags":["platform-2026-09-11T03:00:00Z"]}),
+            serde_json::json!({"id":"5"}),
+        ];
+        assert_eq!(cluster_uids_in(&snaps), vec![A.to_string(), B.to_string()]);
+        assert!(cluster_uids_in(&[]).is_empty());
+        // Borrowed entries too — the listing reaches this from a narrowed
+        // `Vec<&Value>` as well as from the parsed `Vec<Value>`.
+        let borrowed: Vec<&Value> = snaps.iter().collect();
+        assert_eq!(
+            cluster_uids_in(borrowed.iter().copied()),
+            vec![A.to_string(), B.to_string()]
+        );
+    }
+
+    #[test]
+    fn snapshot_tags_reads_a_listing_entry_and_survives_a_missing_field() {
+        let s = serde_json::json!({"tags":["a","b"]});
+        assert_eq!(snapshot_tags(&s), vec!["a".to_string(), "b".to_string()]);
+        // A snapshot restic wrote with no tags at all, and one whose `tags`
+        // is null — both are "no tags", never a panic or a missing answer.
+        assert!(snapshot_tags(&serde_json::json!({})).is_empty());
+        assert!(snapshot_tags(&serde_json::json!({"tags":null})).is_empty());
     }
 
     #[test]

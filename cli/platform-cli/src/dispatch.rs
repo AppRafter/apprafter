@@ -294,12 +294,14 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
                 keep_daily,
                 keep_weekly,
                 keep_monthly,
+                cluster_uid,
             } => commands::backup::run_backup_prune(
                 repo.as_deref(),
                 credential_file.as_deref(),
                 keep_daily,
                 keep_weekly,
                 keep_monthly,
+                cluster_uid.as_deref(),
             )?,
             BackupAction::Check {
                 repo,
@@ -365,6 +367,7 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
             passphrase,
             credential_file,
             server_type,
+            keep_backup_schedule,
         } => commands::restore::run_restore(
             &repo,
             target.as_deref(),
@@ -374,6 +377,7 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
             passphrase.as_deref(),
             credential_file.as_deref(),
             server_type.as_deref(),
+            keep_backup_schedule,
         )?,
         Commands::Completion { shell } => commands::completions::run(shell)?,
     }

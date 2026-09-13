@@ -1382,7 +1382,7 @@
       ],
       "aliases": [],
       "about": "Remove old snapshots from an S3-backed restic repository according to the configured retention policy. Run OUTSIDE the cluster with the operator's full S3 credentials",
-      "long_about": null,
+      "long_about": "Remove old snapshots from an S3-backed restic repository according to the configured retention policy. Run OUTSIDE the cluster with the operator's full S3 credentials.\n\nA prune forgets by explicit snapshot id and one repository can hold several clusters' runs, so it must know whose snapshots it may forget. Normally that is the cluster's own `kube-system` namespace UID, read from the kubeconfig. When the cluster is gone and only the repository is left, `--cluster-uid <uid>` names the identity explicitly and the command runs with no cluster at all.",
       "usage": "Usage: apprafter backup prune [OPTIONS]",
       "hidden": false,
       "examples": [
@@ -1391,6 +1391,18 @@
         "apprafter backup prune --credential-file <dotenv> --keep-daily 14 --keep-weekly 8"
       ],
       "args": [
+        {
+          "id": "cluster_uid",
+          "long": "cluster-uid",
+          "short": null,
+          "takes_value": true,
+          "value_name": "CLUSTER_UID",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Prune the snapshots of the cluster with this `kube-system` namespace UID, instead of reading the identity off a live cluster. The offline form: the cluster is gone, the repository remains, and its snapshots should be reclaimable"
+        },
         {
           "id": "credential_file",
           "long": "credential-file",
@@ -1504,7 +1516,7 @@
       ],
       "aliases": [],
       "about": "Change ONE field of a configured backup, leaving the rest alone. `backup enable` rewrites the whole block, so it cannot be used to adjust a single setting without resetting the others",
-      "long_about": "Change ONE field of a configured backup, leaving the rest alone. `backup enable` rewrites the whole block, so it cannot be used to adjust a single setting without resetting the others.\n\nKeys: at <HH:MM>, check <HH:MM|off>, check-depth <structure|10%|full>, cluster-name <name>, timezone <IANA>, keep-daily <n>, keep-weekly <n>, keep-monthly <n>, enforce <operator|cluster>, staging-mode <monolithic|sequential>, failure-webhook <url>.",
+      "long_about": "Change ONE field of a configured backup, leaving the rest alone. `backup enable` rewrites the whole block, so it cannot be used to adjust a single setting without resetting the others.\n\nKeys: enabled <true|false>, at <HH:MM>, check <HH:MM|off>, check-depth <structure|10%|full>, cluster-name <name>, timezone <IANA>, keep-daily <n>, keep-weekly <n>, keep-monthly <n>, enforce <operator|cluster>, staging-mode <monolithic|sequential>, failure-webhook <url>.\n\n`enabled` is the switch on its own, and it is how a configured but switched-off schedule comes back: after `backup disable`, or after a `restore`, which replays the source's whole backup block disabled. `backup enable` cannot do that job — it composes the whole block from its flags, so it would reset everything the restore just carried across.",
       "usage": "Usage: apprafter backup set <KEY> <VALUE>",
       "hidden": false,
       "examples": [
@@ -2876,6 +2888,18 @@
           "required": false,
           "possible_values": [],
           "help": "Replay only native data (pg + volumes); skip CR + secret replay. Useful when the cluster is already configured"
+        },
+        {
+          "id": "keep_backup_schedule",
+          "long": "keep-backup-schedule",
+          "short": null,
+          "takes_value": false,
+          "value_name": "KEEP_BACKUP_SCHEDULE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Restore the source's backup schedule already ENABLED"
         },
         {
           "id": "passphrase",

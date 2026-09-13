@@ -21,6 +21,12 @@
 //!
 //! `--reprovision` (mode a) provisions a FRESH cluster in the target first
 //! (`bootstrap_all::run`), then replays as restore-into-running.
+//!
+//! Every mode that replays the `PlatformStack` — that is, every mode except
+//! `--data-only` — lands the source's whole `spec.backup` on the target, so the
+//! restored cluster would start writing to the SOURCE's repository. The
+//! schedule is therefore replayed but forced OFF unless
+//! `--keep-backup-schedule` says otherwise; see [`apply_backup_schedule_policy`].
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -198,6 +204,7 @@ fn cross_version_warning(
 
 /// The closing summary, as printable lines. Pure so the report a user reads on
 /// their worst day is pinned by tests rather than by a walk.
+#[allow(clippy::too_many_arguments)]
 fn restore_summary(
     manifest: Option<&BackupManifest>,
     target: Option<&str>,
@@ -205,6 +212,7 @@ fn restore_summary(
     resumed: usize,
     version_warning: Option<&str>,
     inherited_cluster_name: Option<&str>,
+    schedule: BackupSchedule,
 ) -> Vec<String> {
     let mut lines = vec![format!(
         "✓ Restored backup{} into target '{}'",
@@ -221,6 +229,51 @@ fn restore_summary(
         ));
     }
     lines.push(format!("  workloads:  {resumed} app(s) resumed"));
+    lines.extend(backup_inheritance_lines(schedule, inherited_cluster_name));
+    if let Some(w) = version_warning {
+        lines.push(format!("  ⚠ {w}"));
+    }
+    lines
+}
+
+/// What the summary says about the backup configuration this restore
+/// inherited: the schedule first, then the name it is written under. Pure.
+///
+/// The two belong together and are written together. They are ONE fact about
+/// the replayed `spec.backup` seen from two sides — whether this cluster will
+/// write to the source's repository, and what its rows will be labelled when
+/// it does — so the name line is phrased against whatever the schedule line
+/// just said rather than restating an inheritance warning from scratch.
+fn backup_inheritance_lines(
+    schedule: BackupSchedule,
+    inherited_cluster_name: Option<&str>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    match schedule {
+        BackupSchedule::NotInherited => {}
+        // The default. Stated as a thing that was DONE, not a thing that was
+        // withheld: the schedule is in the cluster, complete, and one command
+        // away from running.
+        BackupSchedule::DisabledByDefault => lines.push(
+            "  ⚠ the source's backup schedule came with the restore and was left DISABLED. It \
+             points at the source's repository, and nothing here can tell whether that cluster \
+             is still alive and writing to it. Bucket, credential, schedule, timezone and \
+             retention are restored exactly as captured, so `apprafter backup set enabled true` \
+             turns it back on unchanged — or restore with `--keep-backup-schedule` to inherit it \
+             already enabled (the disaster-recovery case, where this cluster is the repository's \
+             new writer)."
+                .to_string(),
+        ),
+        // Asked for explicitly, and still said out loud: a silent inheritance
+        // is exactly what the default exists to stop, and the flag does not
+        // make the consequence less worth knowing.
+        BackupSchedule::KeptEnabled => lines.push(
+            "  ⚠ --keep-backup-schedule: the source's backup schedule was restored ENABLED, so \
+             this cluster now backs up to the source's repository on the source's schedule. \
+             `apprafter backup status` shows where and when; `apprafter backup disable` stops it."
+                .to_string(),
+        ),
+    }
     // The one part of the backup config that is VISIBLE in the repository and
     // is replayed verbatim. Said out loud because the alternative is an
     // operator finding two clusters listed under one name and having no idea
@@ -228,14 +281,16 @@ fn restore_summary(
     // kube-system UID, which this cluster has its own of — so this is a
     // labelling matter, and the line says so and says how to change it.
     if let Some(name) = inherited_cluster_name {
+        let when = match schedule {
+            BackupSchedule::DisabledByDefault => "once you enable it",
+            _ => "from now on",
+        };
         lines.push(format!(
-            "  ⚠ backup cluster-name '{name}' was inherited from the source, so this cluster's \
-             snapshots will be listed under it too. Snapshots are still told apart by this \
-             cluster's own identity. Rename with `apprafter backup set cluster-name <name>`."
+            "    The backup cluster-name '{name}' came with it, so {when} this cluster's \
+             snapshots are listed under it too. They are still told apart by this cluster's own \
+             identity — the name is only a label. Rename with `apprafter backup set cluster-name \
+             <name>`."
         ));
-    }
-    if let Some(w) = version_warning {
-        lines.push(format!("  ⚠ {w}"));
     }
     lines
 }
@@ -269,6 +324,7 @@ pub fn run_restore(
     passphrase: Option<&str>,
     credential_file: Option<&Path>,
     server_type: Option<&str>,
+    keep_backup_schedule: bool,
 ) -> Result<()> {
     reject_conflicting_modes(reprovision, data_only)?;
 
@@ -327,6 +383,9 @@ pub fn run_restore(
     // The source's `spec.backup.clusterName`, when the replayed PlatformStack
     // carried an enabled schedule — reported in the summary (E1).
     let mut inherited_cluster_name: Option<String> = None;
+    // What ApplyPlatformStack did to the replayed schedule (D1/D2). Stays
+    // `NotInherited` on `--data-only`, which replays no CR at all.
+    let mut schedule = BackupSchedule::NotInherited;
 
     let snap = snapshot.unwrap_or("latest");
 
@@ -379,7 +438,8 @@ pub fn run_restore(
             }
             RestoreStep::ApplyPlatformStack => {
                 let dd = produced_by_artifact(data_dir.as_ref(), "ApplyPlatformStack")?;
-                inherited_cluster_name = apply_platformstack_from_crs(dd, kc.path())?;
+                (inherited_cluster_name, schedule) =
+                    apply_platformstack_from_crs(dd, kc.path(), keep_backup_schedule)?;
             }
             RestoreStep::EnsureNamespaces => {
                 let m = produced_by_artifact(manifest.as_ref(), "EnsureNamespaces")?;
@@ -427,6 +487,7 @@ pub fn run_restore(
         app_replicas.len(),
         version_warning.as_deref(),
         inherited_cluster_name.as_deref(),
+        schedule,
     ) {
         println!("{line}");
     }
@@ -735,24 +796,108 @@ fn namespaces_to_ensure_all<'a>(apps: &'a [String], secrets: &'a [String]) -> Ve
 /// **ApplyPlatformStack** — apply the sanitized `PlatformStack` from `crs/`,
 /// mirroring the `cluster_bootstrap` retry loop for the admission-webhook
 /// Endpoints race.
-fn apply_platformstack_from_crs(data_dir: &Path, kubeconfig: &Path) -> Result<Option<String>> {
+///
+/// `keep_backup_schedule` carries `--keep-backup-schedule` down to
+/// [`apply_backup_schedule_policy`], which is the ONLY thing that rewrites the
+/// captured CR before it is applied.
+fn apply_platformstack_from_crs(
+    data_dir: &Path,
+    kubeconfig: &Path,
+    keep_backup_schedule: bool,
+) -> Result<(Option<String>, BackupSchedule)> {
     let crs = read_crs(data_dir)?;
     let Some(ps) = crs.iter().find(|c| c.kind == "PlatformStack") else {
         // A backup without a PlatformStack (older shape) — nothing to apply;
         // the target's own bootstrap PlatformStack stays in place.
         println!("  (no PlatformStack in backup — keeping target's own)");
-        return Ok(None);
+        return Ok((None, BackupSchedule::NotInherited));
     };
     let inherited = inherited_backup_cluster_name(&ps.cr);
-    let yaml = serde_json::to_string(&ps.cr)
-        .map_err(|e| CliError::Other(format!("serialize PlatformStack: {e}")))?;
+    let (yaml, schedule) = platformstack_apply_payload(&ps.cr, keep_backup_schedule)?;
     apply_with_retry(
         PLATFORMSTACK_APPLY_ATTEMPTS,
         std::time::Duration::from_secs(PLATFORMSTACK_APPLY_BACKOFF_SECS),
         &mut |_attempt| kubectl_apply_server_side(&yaml, RESTORE_FIELD_MANAGER, kubeconfig),
     )?;
     println!("  ✓ PlatformStack applied");
-    Ok(inherited)
+    Ok((inherited, schedule))
+}
+
+/// The exact bytes `ApplyPlatformStack` hands to `kubectl apply`, and what the
+/// schedule policy decided. Pure.
+///
+/// Extracted so the policy is testable where it MATTERS — on the payload that
+/// reaches the apiserver, not only on the decision that preceded it. A
+/// correctly-disabling [`apply_backup_schedule_policy`] whose result the caller
+/// then failed to serialize would be the whole defect back, with every unit
+/// test still green.
+fn platformstack_apply_payload(
+    captured: &Value,
+    keep_backup_schedule: bool,
+) -> Result<(String, BackupSchedule)> {
+    let (cr, schedule) = apply_backup_schedule_policy(captured, keep_backup_schedule);
+    let yaml = serde_json::to_string(&cr)
+        .map_err(|e| CliError::Other(format!("serialize PlatformStack: {e}")))?;
+    Ok((yaml, schedule))
+}
+
+/// What this restore did to the backup schedule it replayed (D1/D2).
+///
+/// A restore replays the WHOLE `PlatformStack`, so `spec.backup` — bucket,
+/// credential, schedule, timezone, retention, `enforce` — migrates with it, and
+/// the operator reconciles the CronJob straight out of `spec.backup` outside
+/// the upgrade-approval gate. The restored cluster therefore starts writing to
+/// the SOURCE's repository, on the source's schedule, with no opt-out and
+/// nothing said.
+///
+/// That inheritance is right in disaster recovery — the clone legitimately
+/// becomes the repository's writer — and wrong when the source is still alive,
+/// which is the documented "move to a bigger machine" Route B: two clusters up
+/// at once, both writing to one repository. Nothing in the restore path knows
+/// or asks which of the two this is, so the default is the reversible half.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackupSchedule {
+    /// The backup carried no enabled schedule, so nothing was inherited and
+    /// there is nothing to say.
+    NotInherited,
+    /// The default: the schedule was replayed as captured but forced OFF.
+    DisabledByDefault,
+    /// `--keep-backup-schedule`: replayed enabled, on purpose.
+    KeptEnabled,
+}
+
+/// Apply the replayed-schedule policy to a captured `PlatformStack` CR, and
+/// say what it did. Pure — the impure caller applies the returned CR.
+///
+/// ONLY `spec.backup.enabled` is touched. Everything else in the block is
+/// restored exactly as captured, so turning the schedule back on afterwards is
+/// a one-word `apprafter backup enable` rather than a re-entry of bucket,
+/// credential, retention, timezone and schedule.
+///
+/// `keep == true` returns the CR untouched: in DR the inheritance is the point.
+/// A backup that was not enabled at capture time is [`NotInherited`] in both
+/// directions — there is no schedule to disable and none to keep.
+///
+/// [`NotInherited`]: BackupSchedule::NotInherited
+fn apply_backup_schedule_policy(platformstack: &Value, keep: bool) -> (Value, BackupSchedule) {
+    let enabled = platformstack
+        .pointer("/spec/backup/enabled")
+        .and_then(Value::as_bool)
+        == Some(true);
+    if !enabled {
+        return (platformstack.clone(), BackupSchedule::NotInherited);
+    }
+    if keep {
+        return (platformstack.clone(), BackupSchedule::KeptEnabled);
+    }
+    let mut out = platformstack.clone();
+    if let Some(backup) = out
+        .pointer_mut("/spec/backup")
+        .and_then(Value::as_object_mut)
+    {
+        backup.insert("enabled".to_string(), Value::Bool(false));
+    }
+    (out, BackupSchedule::DisabledByDefault)
 }
 
 /// The backup cluster-name this restore just replayed onto the target, when
@@ -2594,7 +2739,15 @@ mod tests {
     #[test]
     fn restore_summary_reports_scope_mode_and_workloads() {
         let m = manifest_of(&["demo", "shop"], vec![]);
-        let lines = restore_summary(Some(&m), Some("prod"), false, 2, None, None);
+        let lines = restore_summary(
+            Some(&m),
+            Some("prod"),
+            false,
+            2,
+            None,
+            None,
+            BackupSchedule::NotInherited,
+        );
         assert_eq!(
             lines,
             vec![
@@ -2605,7 +2758,15 @@ mod tests {
             ]
         );
 
-        let data_only = restore_summary(Some(&m), None, true, 1, Some("mind the gap"), None);
+        let data_only = restore_summary(
+            Some(&m),
+            None,
+            true,
+            1,
+            Some("mind the gap"),
+            None,
+            BackupSchedule::NotInherited,
+        );
         assert_eq!(
             data_only[0],
             "✓ Restored backup of cluster 'k3d-demo' into target '<active>'"
@@ -2622,10 +2783,17 @@ mod tests {
     #[test]
     fn restore_summary_reports_an_inherited_backup_cluster_name() {
         let m = manifest_of(&["demo"], vec![]);
-        let lines = restore_summary(Some(&m), Some("new"), false, 1, None, Some("prod"));
+        let lines = restore_summary(
+            Some(&m),
+            Some("new"),
+            false,
+            1,
+            None,
+            Some("prod"),
+            BackupSchedule::KeptEnabled,
+        );
         let joined = lines.join("\n");
         assert!(joined.contains("cluster-name 'prod'"), "{joined}");
-        assert!(joined.contains("inherited"), "{joined}");
         assert!(
             joined.contains("apprafter backup set cluster-name"),
             "the line must say how to change it: {joined}"
@@ -2637,7 +2805,15 @@ mod tests {
     #[test]
     fn restore_summary_is_silent_when_no_cluster_name_was_inherited() {
         let m = manifest_of(&["demo"], vec![]);
-        let lines = restore_summary(Some(&m), Some("new"), false, 1, None, None);
+        let lines = restore_summary(
+            Some(&m),
+            Some("new"),
+            false,
+            1,
+            None,
+            None,
+            BackupSchedule::NotInherited,
+        );
         assert!(!lines.join("\n").contains("cluster-name"), "{:?}", lines);
     }
 
@@ -2668,13 +2844,249 @@ mod tests {
     /// prints, but claims nothing about the backup's contents.
     #[test]
     fn restore_summary_without_a_manifest_claims_no_scope() {
-        let lines = restore_summary(None, Some("prod"), false, 0, None, None);
+        let lines = restore_summary(
+            None,
+            Some("prod"),
+            false,
+            0,
+            None,
+            None,
+            BackupSchedule::NotInherited,
+        );
         assert_eq!(
             lines,
             vec![
                 "✓ Restored backup into target 'prod'".to_string(),
                 "  workloads:  0 app(s) resumed".to_string(),
             ]
+        );
+    }
+
+    // =======================================================================
+    // D1 / D2 — the replayed backup schedule
+    // =======================================================================
+
+    /// A captured PlatformStack carrying the source's complete, ENABLED
+    /// backup configuration: the whole block a restore replays.
+    fn captured_with_backup(enabled: bool) -> Value {
+        serde_json::json!({
+            "apiVersion": "apprafter.io/v1alpha1",
+            "kind": "PlatformStack",
+            "metadata": {"name": "default", "namespace": "apprafter-system"},
+            "spec": {"backup": {
+                "enabled": enabled,
+                "schedule": "0 3 * * *",
+                "timeZone": "Europe/Berlin",
+                "bucket": "s3:https://nbg1.your-objectstorage.com/prod-backups",
+                "clusterName": "prod",
+                "credentialRef": {"name": "apprafter-backup-s3"},
+                "stagingMode": "sequential",
+                "checkSchedule": "0 6 * * 0",
+                "failureWebhook": "https://hooks.example/backup",
+                "retention": {"keepDaily": 14, "keepWeekly": 8,
+                              "keepMonthly": 12, "enforce": "cluster"}}}
+        })
+    }
+
+    /// FIRES: by default the replayed schedule is forced off. Without this the
+    /// restored cluster starts writing to the SOURCE's repository on the
+    /// source's schedule, with the source possibly still alive and writing to
+    /// it too (`moving-to-a-bigger-machine`, Route B).
+    #[test]
+    fn a_replayed_backup_schedule_is_disabled_by_default() {
+        let (cr, schedule) = apply_backup_schedule_policy(&captured_with_backup(true), false);
+        assert_eq!(schedule, BackupSchedule::DisabledByDefault);
+        assert_eq!(cr["spec"]["backup"]["enabled"], serde_json::json!(false));
+    }
+
+    /// DOES NOT FIRE: `--keep-backup-schedule` inherits it enabled. This is
+    /// the disaster-recovery case the default must not take away — the source
+    /// is gone and the clone is legitimately the repository's new writer.
+    #[test]
+    fn keep_backup_schedule_inherits_the_source_schedule_enabled() {
+        let captured = captured_with_backup(true);
+        let (cr, schedule) = apply_backup_schedule_policy(&captured, true);
+        assert_eq!(schedule, BackupSchedule::KeptEnabled);
+        assert_eq!(cr["spec"]["backup"]["enabled"], serde_json::json!(true));
+        assert_eq!(cr, captured, "the CR must be replayed byte-for-byte");
+    }
+
+    /// ONLY `enabled` is forced. Re-enabling afterwards has to be one word,
+    /// not a re-entry of bucket, credential, retention, timezone and schedule
+    /// — which an operator restoring at 3am does not have to hand.
+    #[test]
+    fn disabling_the_schedule_preserves_every_other_backup_field() {
+        let captured = captured_with_backup(true);
+        let (cr, _) = apply_backup_schedule_policy(&captured, false);
+        let before = &captured["spec"]["backup"];
+        let after = &cr["spec"]["backup"];
+        for key in [
+            "schedule",
+            "timeZone",
+            "bucket",
+            "clusterName",
+            "credentialRef",
+            "stagingMode",
+            "checkSchedule",
+            "failureWebhook",
+            "retention",
+        ] {
+            assert_eq!(after[key], before[key], "{key} must survive the restore");
+        }
+        // Including the retention sub-fields, `enforce` above all: a source
+        // pruning with `enforce: cluster` hands that to the clone.
+        assert_eq!(after["retention"]["enforce"], serde_json::json!("cluster"));
+        assert_eq!(after["retention"]["keepDaily"], serde_json::json!(14));
+        // …and nothing outside spec.backup is touched.
+        assert_eq!(cr["metadata"], captured["metadata"]);
+    }
+
+    /// The payload that actually reaches the apiserver carries the decision.
+    ///
+    /// FIRES on the default; the `--keep-backup-schedule` half below is what
+    /// stops this passing on a payload builder that hard-codes `false`. The
+    /// pair exists because the policy being right is not the same claim as the
+    /// bytes being right — an `apply` of the CAPTURED CR next to a correct
+    /// decision is the defect back with every other test green.
+    #[test]
+    fn the_applied_payload_carries_the_schedule_decision() {
+        let captured = captured_with_backup(true);
+
+        let (yaml, schedule) = platformstack_apply_payload(&captured, false).unwrap();
+        assert_eq!(schedule, BackupSchedule::DisabledByDefault);
+        let sent: Value = serde_json::from_str(&yaml).expect("the payload is JSON (valid YAML)");
+        assert_eq!(sent["spec"]["backup"]["enabled"], serde_json::json!(false));
+        assert_eq!(
+            sent["spec"]["backup"]["bucket"], captured["spec"]["backup"]["bucket"],
+            "the rest of the block still goes to the cluster"
+        );
+
+        let (yaml, schedule) = platformstack_apply_payload(&captured, true).unwrap();
+        assert_eq!(schedule, BackupSchedule::KeptEnabled);
+        let sent: Value = serde_json::from_str(&yaml).unwrap();
+        assert_eq!(sent["spec"]["backup"]["enabled"], serde_json::json!(true));
+        assert_eq!(sent, captured, "the flag replays the CR verbatim");
+    }
+
+    /// A backup that was already off, or absent, is not an inheritance — in
+    /// EITHER direction. A flag that invented a warning here would make
+    /// `--keep-backup-schedule` look like it did something.
+    #[test]
+    fn a_backup_that_was_not_enabled_is_never_reported_as_inherited() {
+        for keep in [true, false] {
+            let (cr, schedule) = apply_backup_schedule_policy(&captured_with_backup(false), keep);
+            assert_eq!(schedule, BackupSchedule::NotInherited, "keep={keep}");
+            assert_eq!(cr["spec"]["backup"]["enabled"], serde_json::json!(false));
+
+            let bare = serde_json::json!({"spec": {}});
+            let (cr, schedule) = apply_backup_schedule_policy(&bare, keep);
+            assert_eq!(schedule, BackupSchedule::NotInherited, "keep={keep}");
+            assert_eq!(cr, bare, "nothing to rewrite, so nothing is invented");
+        }
+    }
+
+    /// FIRES: the default is announced. A schedule silently switched off is
+    /// the same class of surprise as one silently switched on — an operator
+    /// who believes the clone is backing itself up has an unbacked cluster.
+    #[test]
+    fn the_summary_says_the_schedule_was_restored_disabled() {
+        let m = manifest_of(&["demo"], vec![]);
+        let joined = restore_summary(
+            Some(&m),
+            Some("new"),
+            false,
+            1,
+            None,
+            Some("prod"),
+            BackupSchedule::DisabledByDefault,
+        )
+        .join("\n");
+        assert!(joined.contains("DISABLED"), "{joined}");
+        assert!(
+            joined.contains("apprafter backup set enabled true"),
+            "names the way back on — and the one that changes ONLY this field, since \
+             `backup enable` recomposes the whole block from its flags: {joined}"
+        );
+        assert!(
+            joined.contains("--keep-backup-schedule"),
+            "names the opt-out: {joined}"
+        );
+        // …and the cluster-name line is phrased against it, so the two read as
+        // one paragraph rather than two unrelated warnings.
+        assert!(
+            joined.contains("came with it, so once you enable it"),
+            "the name line must follow from the schedule line: {joined}"
+        );
+    }
+
+    /// DOES NOT FIRE THE SAME WAY: with the flag, the summary says the
+    /// opposite thing. A silent `--keep-backup-schedule` is as surprising as
+    /// the silent inheritance the default replaced.
+    #[test]
+    fn the_summary_says_the_schedule_was_kept_when_the_flag_was_passed() {
+        let m = manifest_of(&["demo"], vec![]);
+        let joined = restore_summary(
+            Some(&m),
+            Some("new"),
+            false,
+            1,
+            None,
+            Some("prod"),
+            BackupSchedule::KeptEnabled,
+        )
+        .join("\n");
+        assert!(joined.contains("ENABLED"), "{joined}");
+        assert!(joined.contains("--keep-backup-schedule"), "{joined}");
+        assert!(
+            joined.contains("apprafter backup disable"),
+            "names the way back off: {joined}"
+        );
+        assert!(
+            !joined.contains("DISABLED"),
+            "must not also claim it was disabled: {joined}"
+        );
+        assert!(
+            joined.contains("came with it, so from now on"),
+            "the name line follows the KEPT phrasing: {joined}"
+        );
+    }
+
+    /// `--data-only` replays no CR at all, so there is no schedule to disable
+    /// and nothing to report. The summary must stay quiet — the mode is
+    /// already unaffected by the defect and must not acquire a warning.
+    #[test]
+    fn a_data_only_restore_says_nothing_about_the_backup_schedule() {
+        let m = manifest_of(&["demo"], vec![]);
+        let joined = restore_summary(
+            Some(&m),
+            Some("new"),
+            true,
+            1,
+            None,
+            None,
+            BackupSchedule::NotInherited,
+        )
+        .join("\n");
+        assert!(!joined.contains("schedule"), "{joined}");
+        assert!(!joined.contains("DISABLED"), "{joined}");
+    }
+
+    /// D2: the default covers `--data-only` by exclusion and both replaying
+    /// modes by inclusion. `ApplyPlatformStack` is what carries `spec.backup`,
+    /// and `Reprovision` only PREPENDS a step — so restore-into-running is
+    /// exposed to exactly the same inheritance as a rebuild.
+    #[test]
+    fn every_mode_that_replays_the_platformstack_goes_through_the_policy() {
+        for mode in [RestoreMode::IntoRunning, RestoreMode::Reprovision] {
+            assert!(
+                restore_steps(mode, false).contains(&RestoreStep::ApplyPlatformStack),
+                "{mode:?} replays the CR, so it must be gated"
+            );
+        }
+        assert!(
+            !restore_steps(RestoreMode::IntoRunning, true)
+                .contains(&RestoreStep::ApplyPlatformStack),
+            "--data-only replays no CR and must stay that way"
         );
     }
 

@@ -27,7 +27,8 @@ cluster, with full credentials:
 ```text
 apprafter backup prune [--repo s3:…] \
                        [--credential-file <dotenv>] \
-                       [--keep-daily N] [--keep-weekly N] [--keep-monthly N]
+                       [--keep-daily N] [--keep-weekly N] [--keep-monthly N] \
+                       [--cluster-uid <uid>]
 ```
 
 `--repo` defaults to `PlatformStack.spec.backup.bucket`; the keep-* flags
@@ -40,12 +41,34 @@ against a configured cluster this command needs no credential flags at all. On s
 dedup makes growth sub-linear, so retention is a rare, deliberate operation, not
 a per-run one.
 
-`prune` needs a reachable cluster, whatever flags you pass. It forgets by
-explicit snapshot id, one repository can hold more than one cluster's snapshots,
-and the only thing that says which are yours is the cluster's own identity —
-so there is no offline form of this command. It plans over your cluster's runs
-only: a prune here can never delete another cluster's history
+`prune` needs an **identity**. It forgets by explicit snapshot id, one
+repository can hold more than one cluster's snapshots, and something has to say
+which are yours — so it plans over your cluster's runs only, and a prune here
+can never delete another cluster's history
 ([how](../how-it-works/backup-retention-and-checks.md#which-snapshots-are-yours)).
+Normally the identity is the cluster's own, read from your kubeconfig, and you
+never think about it.
+
+#### Pruning a repository whose cluster is gone
+
+When the cluster no longer exists and only the repository is left, name the
+identity yourself:
+
+```sh
+apprafter backup prune --repo s3:<endpoint>/<bucket>/<prefix> \
+                       --credential-file ./operator-s3.env \
+                       --keep-daily 7 --keep-weekly 4 --keep-monthly 6 \
+                       --cluster-uid <kube-system-uid>
+```
+
+With `--repo`, all three `--keep-*` and the operator's credentials, that runs
+with no cluster at all. `--cluster-uid` is the destroyed cluster's `kube-system`
+namespace UID, and passing it is a claim about **whose** history may be deleted
+— `apprafter backup list --repo <repo> --all-clusters` prints the identities a
+repository holds, under the listing. The claim is checked before anything is
+forgotten: a UID that has never written to this repository is refused, naming
+the ones that have. Nothing is stamped on `PlatformStack` on this path, because
+there is no `PlatformStack` left to stamp.
 
 > **Do not use an S3 bucket lifecycle rule for this.** A "delete objects older
 > than N days" rule deletes by *object age*, and a restic repository routinely
@@ -85,12 +108,27 @@ composes the whole `spec.backup` block from its flags and the platform
 defaults, so re-running it to adjust one setting resets the others — including
 this one. Use `set` for changes, `enable` for configuring.
 
-The other settable keys are `at`, `check`, `cluster-name`, `timezone`,
-`keep-daily`, `keep-weekly`, `keep-monthly`, `enforce`, `staging-mode` and
-`failure-webhook`. The bucket and its credential are deliberately not among
-them: pointing an existing schedule at a different repository is a new
-repository, with its own init and its own first backup, so it goes through
-`enable`.
+The other settable keys are `enabled`, `at`, `check`, `cluster-name`,
+`timezone`, `keep-daily`, `keep-weekly`, `keep-monthly`, `enforce`,
+`staging-mode` and `failure-webhook`. The bucket and its credential are
+deliberately not among them: pointing an existing schedule at a different
+repository is a new repository, with its own init and its own first backup, so
+it goes through `enable`.
+
+#### Switching a configured schedule on and off
+
+```sh
+apprafter backup disable          # config retained, nothing runs
+apprafter backup set enabled true # back on, unchanged
+```
+
+Two things leave a cluster holding a complete, correct, switched-off backup
+configuration: `backup disable`, and a `restore`, which replays the source
+cluster's whole block and leaves it disabled unless you passed
+`--keep-backup-schedule` ([why](restore.md#the-backup-schedule-comes-with-the-restore-switched-off)).
+`backup set enabled true` is the way back in both cases. Re-running `backup
+enable` is not: it composes the whole block from its flags, so it would reset
+the schedule, timezone, retention and staging mode you were trying to keep.
 
 #### Renaming the cluster in its repository
 
