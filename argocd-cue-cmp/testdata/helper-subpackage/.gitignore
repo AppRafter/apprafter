@@ -1,0 +1,10 @@
+# Injected by entrypoint.sh at render time (2.12f / ADR 0046),
+# ephemeral on a real cluster. test-inject.sh scrubs these after each
+# run; gitignore is a belt-and-suspenders guard so an interrupted run
+# can't leave them staged.
+#
+# `cue.mod/pkg/` only — NOT `cue.mod/`: this fixture commits its own
+# cue.mod/module.cue (the manifest imports its `lib` sibling by module
+# path), and the entrypoint injects the bundled schema into pkg/ beside it.
+cue.mod/pkg/
+apprafter_claim_gen.cue

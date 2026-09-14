@@ -137,9 +137,19 @@ the reader what happened. Per [ADR 0062](0062-manifest-package-is-a-bundle.md)
 one registration is one package, so more than one package under one path is a
 registration mistake, and the CMP is the only layer that can see it.
 
+Only *siblings* are ambiguous. A candidate directory nested inside another —
+the shared-CUE helper package ADR 0029 contemplates for monorepos — is part of
+that package's tree, and the marker grep cannot tell such a helper from a
+second bundle without evaluating it, so a nested candidate is folded into its
+enclosing package rather than refused, and is named on stderr when it carries
+something that would itself have rendered, so that "my workload never appeared"
+is answerable from the sync log.
+
 Rendering each directory in its own working directory also retires the
-module-boundary poisoning entirely: `cue export ./...` is never again invoked
-from a parent.
+module-boundary poisoning entirely: the render targets the cwd package instance
+(`cue export .`), so `./...` is never invoked from a parent — nor across a
+helper sub-package, which it would otherwise load as a second instance and then
+fail with `reference "<key>" not found`.
 
 ### 4. `spec.source.path` pointing at a file is not supported
 

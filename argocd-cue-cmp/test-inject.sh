@@ -68,7 +68,7 @@ fail=0
 
 assert_contains() {
     local haystack=$1 needle=$2 label=$3
-    if printf '%s\n' "$haystack" | grep -Fq "$needle"; then
+    if printf '%s\n' "$haystack" | grep -Fq -- "$needle"; then
         echo "PASS: $label"
         pass=$((pass + 1))
     else
@@ -81,7 +81,7 @@ assert_contains() {
 
 assert_absent() {
     local haystack=$1 needle=$2 label=$3
-    if printf '%s\n' "$haystack" | grep -Fq "$needle"; then
+    if printf '%s\n' "$haystack" | grep -Fq -- "$needle"; then
         echo "FAIL: $label — did not expect '$needle'"
         echo "--- stdout was ---" >&2
         printf '%s\n' "$haystack" >&2
@@ -95,7 +95,7 @@ assert_absent() {
 assert_count() {
     local haystack=$1 needle=$2 want=$3 label=$4
     local got
-    got=$(printf '%s\n' "$haystack" | grep -Fc "$needle" || true)
+    got=$(printf '%s\n' "$haystack" | grep -Fc -- "$needle" || true)
     if [[ "$got" -eq "$want" ]]; then
         echo "PASS: $label (found $got)"
         pass=$((pass + 1))
@@ -263,6 +263,232 @@ else
     echo "PASS: 2.12f Style-A: top-level claim binding stripped from the CR"
     pass=$((pass + 1))
 fi
+
+# ── ADR 0063 §Decision 3: a bundle may span directories ────
+#
+# `split-bundle/` holds TWO independent bundles, `services/api/apprafter/`
+# and `services/web/apprafter/`. Registered one at a time each must
+# render on its own; registered TOGETHER at the repository root they are
+# an ambiguous path and the render must REFUSE.
+#
+# Before this change the single greedy `cd ./apprafter` at
+# entrypoint.sh:84-88 saw no `./apprafter` at the repository root, left
+# cwd there, and `cue export ./... -e api` evaluated against BOTH
+# package instances → `reference "api" not found`. Non-zero, but the
+# message names nothing the reader can act on.
+split_fx="$script_dir/testdata/split-bundle"
+# This fixture is rendered from THREE working directories (services/api,
+# services/web, and the ambiguous root), so the injected artefacts can
+# land at any of them — a pre-ADR-0063 entrypoint stayed at the root and
+# injected there. Scrub by search rather than by a fixed list.
+scrub_split_fixture() {
+    find "$split_fx" \( -name cue.mod -type d -o -name apprafter_claim_gen.cue -type f \) \
+        -prune -exec rm -rf {} +
+}
+trap 'cleanup; scrub_claim_fixture; scrub_claima_fixture; scrub_split_fixture' EXIT
+scrub_split_fixture
+
+# Capture stdout, stderr AND the exit code without aborting the harness
+# (`set -e` would kill us on the expected non-zero run). stdout goes to a
+# FILE, not a `$(…)` capture, so "empty" is measured in BYTES — `$(…)`
+# strips trailing newlines and would read a stream of bare `---`
+# separators as empty.
+ep_rc=0; ep_out=""; ep_err=""; ep_out_bytes=0
+run_entrypoint_capture() {  # $1 fixture root, $2 schema_src, $3 ARGOCD_APP_SOURCE_PATH ("" = unset)
+    local root=$1 schema_src=${2:-} source_path=${3:-} out_file err_file
+    out_file=$(mktemp)
+    err_file=$(mktemp)
+    set +e
+    if [[ -n "$source_path" ]]; then
+        ( cd "$root" \
+            && unset APPRAFTER_APP_ENV ARGOCD_ENV_APPRAFTER_APP_ENV \
+            && APPRAFTER_SCHEMA_SRC="$schema_src" ARGOCD_APP_SOURCE_PATH="$source_path" \
+               bash "$entrypoint" ) \
+            >"$out_file" 2>"$err_file"
+    else
+        ( cd "$root" \
+            && unset APPRAFTER_APP_ENV ARGOCD_ENV_APPRAFTER_APP_ENV ARGOCD_APP_SOURCE_PATH \
+            && APPRAFTER_SCHEMA_SRC="$schema_src" bash "$entrypoint" ) \
+            >"$out_file" 2>"$err_file"
+    fi
+    ep_rc=$?
+    set -e
+    ep_out=$(cat "$out_file")
+    ep_err=$(cat "$err_file")
+    ep_out_bytes=$(wc -c < "$out_file" | tr -d '[:space:]')
+    rm -f "$out_file" "$err_file"
+}
+
+assert_rc() {  # $1 got, $2 want-shape (zero|nonzero), $3 label
+    local got=$1 want=$2 label=$3
+    if [[ "$want" == "zero" && "$got" -eq 0 ]] || [[ "$want" == "nonzero" && "$got" -ne 0 ]]; then
+        echo "PASS: $label (rc=$got)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL: $label — expected $want exit, got rc=$got"
+        fail=$((fail + 1))
+    fi
+}
+
+# ── ADR 0063: `services/api` registered alone renders ──────
+run_entrypoint_capture "$split_fx/services/api" "$schema_src"
+scrub_split_fixture
+assert_rc "$ep_rc" zero "ADR 0063: services/api alone renders (exit 0)"
+assert_count "$ep_out" "---" 1 "ADR 0063: services/api alone emits exactly ONE document"
+assert_contains "$ep_out" "name: split-api" "ADR 0063: services/api alone emits the api manifest"
+assert_absent "$ep_out" "split-web" "ADR 0063: services/api alone does not drag in the web sibling"
+
+# ── ADR 0063: `services/web` registered alone renders ──────
+run_entrypoint_capture "$split_fx/services/web" "$schema_src"
+scrub_split_fixture
+assert_rc "$ep_rc" zero "ADR 0063: services/web alone renders (exit 0)"
+assert_count "$ep_out" "---" 1 "ADR 0063: services/web alone emits exactly ONE document"
+assert_contains "$ep_out" "name: split-web" "ADR 0063: services/web alone emits the web manifest"
+
+# ── ADR 0063: the repository root is an AMBIGUOUS path ─────
+#
+# All THREE assertions matter, though not for the reason the 0-byte one
+# might suggest. Argo CD does NOT read stdout when generate exits
+# non-zero (v2.13.1 `cmpserver/plugin/plugin.go` discards it on error),
+# so a partial stream BEHIND a non-zero exit is not itself the pruning
+# vector — rc=0 with an empty stream is, and the rc assertion covers
+# that. What the 0-byte assertion pins is narrower and more durable:
+# that the refusal happens BEFORE anything is emitted, so the guarantee
+# holds on this side of the contract and does not depend on Argo CD's
+# error handling staying as it is.
+#
+# Stated asymmetry, so the gap is on the record rather than implied: the
+# per-key export failure path is NOT held to this and nothing asserts
+# against it. It emits `---`, then every document that preceded the
+# failure, then exits 1 — measured at 164 bytes on the
+# inject-fixture-multi layout with the second key's export forced to
+# fail. That is safe only because rc≠0, i.e. it leans on exactly the
+# Argo CD behaviour the refusal path deliberately does not lean on.
+run_entrypoint_capture "$split_fx" "$schema_src"
+scrub_split_fixture
+assert_rc "$ep_rc" nonzero "ADR 0063: repository root holding two bundles REFUSES"
+if [[ "$ep_out_bytes" -eq 0 ]]; then
+    echo "PASS: ADR 0063: ambiguous path writes NOTHING to stdout (0 bytes)"
+    pass=$((pass + 1))
+else
+    echo "FAIL: ADR 0063: ambiguous path wrote $ep_out_bytes bytes to stdout — a partial stream prunes"
+    printf '%s\n' "$ep_out" >&2
+    fail=$((fail + 1))
+fi
+assert_contains "$ep_err" "manifest packages" "ADR 0063: the refusal names the ambiguity on stderr"
+
+# ── ADR 0063: a helper SUB-package is not a second bundle ──
+#
+# `helper-subpackage/apprafter/` holds the manifest and
+# `helper-subpackage/apprafter/lib/` the shared CUE it imports. The
+# helper imports the schema, so it carries the marker and the search
+# returns BOTH directories — but `lib/` is nested inside the package
+# directory, so it is part of that bundle's tree, not a sibling. ADR
+# 0029 contemplates this layout for monorepos with shared CUE.
+#
+# Both registrations must render the SAME single manifest. Before the
+# nesting rule the root registration refused outright, and `--path
+# apprafter` failed with `reference "helperApp" not found` — that second
+# one because `cue export ./...` spans the sub-package as a second
+# instance and `-e` then evaluates against the wrong one, which is why
+# the render targets `.` rather than `./...`.
+helper_fx="$script_dir/testdata/helper-subpackage"
+scrub_helper_fixture() {
+    find "$helper_fx" \( -name pkg -type d -path '*/cue.mod/*' -o -name apprafter_claim_gen.cue -type f \) \
+        -prune -exec rm -rf {} +
+}
+trap 'cleanup; scrub_claim_fixture; scrub_claima_fixture; scrub_split_fixture; scrub_helper_fixture' EXIT
+scrub_helper_fixture
+
+run_entrypoint_capture "$helper_fx" "$schema_src"
+scrub_helper_fixture
+assert_rc "$ep_rc" zero "ADR 0063: helper sub-package at the repo root renders (exit 0)"
+assert_count "$ep_out" "---" 1 "ADR 0063: helper sub-package at the repo root emits exactly ONE document"
+assert_contains "$ep_out" "name: helper-app" "ADR 0063: helper sub-package at the repo root emits the bundle manifest"
+assert_contains "$ep_out" "namespace: helper-demo" "ADR 0063: the helper package's shared values resolved"
+
+run_entrypoint_capture "$helper_fx/apprafter" "$schema_src" "helper-subpackage/apprafter"
+scrub_helper_fixture
+assert_rc "$ep_rc" zero "ADR 0063: helper sub-package at --path apprafter renders (exit 0)"
+assert_count "$ep_out" "---" 1 "ADR 0063: helper sub-package at --path apprafter emits exactly ONE document"
+assert_contains "$ep_out" "name: helper-app" "ADR 0063: helper sub-package at --path apprafter emits the bundle manifest"
+
+# ── ADR 0063: a nested BUNDLE is folded, but never in silence ──
+#
+# The dual of the helper case, and identical to it on disk: a package
+# directory with a marker-bearing directory inside it. `extra/` holds a
+# second real Application rather than shared CUE, so folding it in means
+# `inner-bundle` never deploys.
+#
+# Not a prune vector — every revision before this one failed outright on
+# this layout, so no cluster can have had `inner-bundle` applied from
+# this registration, and the surprise is "it never deployed" rather than
+# "it was deleted". But ADR 0063 §Decision 3's own argument is that a
+# silent partial render is the worse state, so one line on stderr is the
+# difference between an operator finding the cause in the sync log and
+# not finding it at all.
+#
+# The negative assertion on the helper layout below is the other half:
+# the notice is gated on whether the folded directory would itself have
+# RENDERED something, so the case we just fixed stays quiet.
+nested_fx="$script_dir/testdata/nested-bundle"
+scrub_nested_fixture() {
+    find "$nested_fx" \( -name cue.mod -type d -o -name apprafter_claim_gen.cue -type f \) \
+        -prune -exec rm -rf {} +
+}
+trap 'cleanup; scrub_claim_fixture; scrub_claima_fixture; scrub_split_fixture; scrub_helper_fixture; scrub_nested_fixture' EXIT
+scrub_nested_fixture
+
+run_entrypoint_capture "$nested_fx" "$schema_src"
+scrub_nested_fixture
+assert_rc "$ep_rc" zero "ADR 0063: nested bundle — the enclosing package still renders (exit 0)"
+assert_count "$ep_out" "---" 1 "ADR 0063: nested bundle — exactly ONE document emitted"
+assert_contains "$ep_out" "name: outer-bundle" "ADR 0063: nested bundle — the enclosing package's manifest is emitted"
+assert_absent "$ep_out" "inner-bundle" "ADR 0063: nested bundle — the nested manifest is NOT emitted"
+assert_contains "$ep_err" "folded into their enclosing package" "ADR 0063: nested bundle — the fold is announced on stderr"
+assert_contains "$ep_err" "./apprafter/extra" "ADR 0063: nested bundle — stderr NAMES the directory that was folded away"
+
+# The negative: the helper layout folds a directory too, but that
+# directory renders nothing, so announcing it would be pure noise on the
+# layout this change exists to support.
+run_entrypoint_capture "$helper_fx" "$schema_src"
+scrub_helper_fixture
+assert_absent "$ep_err" "folded into their enclosing package" "ADR 0063: helper sub-package — folding shared CUE is SILENT (no notice)"
+assert_absent "$ep_err" "./apprafter/lib" "ADR 0063: helper sub-package — the helper directory is not named on stderr"
+
+# ── ADR 0063 §Decision 2: the ARGOCD_APP_SOURCE_PATH arm ───
+#
+# The part of the registered path AT or ABOVE the working directory is
+# invisible to `find .`; ARGOCD_APP_SOURCE_PATH is the only signal for
+# it, and argocd-repo-server supplies it to generate as well as to
+# discover. `${PWD##*/}` covers only the case where the working
+# directory ITSELF is named `apprafter`, so for `--path apprafter/api`
+# — working directory basename `api` — the variable is the whole gate.
+#
+# The fixture makes the arm observable: a depth-1 `Application.cue`
+# (matches `-name '*.cue'`, so ONLY the ancestor arm finds it) and a
+# `helpers/apprafter-shared.cue` (matches `apprafter*.cue`, so only the
+# other arm finds it), each emitting a differently-named manifest. The
+# assertion names the manifest, so it can pass only if the arm fired.
+#
+# Mutation-tested: deleting the `case "/${ar_sp#/}/" in */apprafter/*)`
+# line flips the SET case to `ancestor-fallback`.
+anc_fx="$script_dir/testdata/ancestor-arm/apprafter/api"
+
+run_entrypoint_capture "$anc_fx" "" "apprafter/api"
+assert_rc "$ep_rc" zero "ADR 0063: ancestor arm — ARGOCD_APP_SOURCE_PATH set renders (exit 0)"
+assert_contains "$ep_out" "name: ancestor-registered" "ADR 0063: ancestor arm — an apprafter component in ARGOCD_APP_SOURCE_PATH selects the registered directory"
+assert_absent "$ep_out" "ancestor-fallback" "ADR 0063: ancestor arm — the registered directory short-circuits the deeper candidate"
+# `helpers/` holds a real manifest that this registration does not
+# render, so the fold notice must name it — the same guarantee the
+# nested-bundle case asserts, reached through the depth-1 short-circuit
+# rather than through a sibling directory.
+assert_contains "$ep_err" "./helpers" "ADR 0063: ancestor arm — the deeper manifest directory is named on stderr, not dropped silently"
+
+run_entrypoint_capture "$anc_fx" "" ""
+assert_rc "$ep_rc" zero "ADR 0063: ancestor arm — ARGOCD_APP_SOURCE_PATH unset renders (exit 0)"
+assert_contains "$ep_out" "name: ancestor-fallback" "ADR 0063: ancestor arm — without the variable the depth-1 manifest is NOT claimed"
+assert_absent "$ep_out" "ancestor-registered" "ADR 0063: ancestor arm — the two arms select different directories (the arm is live)"
 
 echo ""
 echo "Summary: $pass passed, $fail failed"

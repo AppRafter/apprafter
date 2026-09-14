@@ -1,0 +1,13 @@
+# Injected by entrypoint.sh at render time (2.12f / ADR 0046),
+# ephemeral on a real cluster. test-inject.sh scrubs these after each
+# run; gitignore is a belt-and-suspenders guard so an interrupted run
+# can't leave them staged.
+#
+# One file at the fixture ROOT with UNANCHORED patterns, rather than one
+# per package directory as the single-bundle fixtures use: this fixture
+# is deliberately rendered from three different working directories
+# (services/api, services/web, and the ambiguous root), and a pre-ADR-0063
+# entrypoint — which stayed at the root and injected there — drops them
+# at the root too.
+cue.mod/
+apprafter_claim_gen.cue
