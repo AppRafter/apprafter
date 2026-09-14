@@ -577,6 +577,16 @@ trap 'rm -f "$json_out" "$err_out"' EXIT
 # the helper's own non-zero return before the explicit `return` runs,
 # and the helper body is echo/printf only, so nothing inside it needs
 # `set -e` to stay armed.
+#
+# Deliberately NO "check locally with <tool>" line. `apprafter app
+# validate` carries none of these four checks yet — that is plan 2.27b —
+# so today it prints `✓ valid` for every bundle refused here. Pointing
+# the reader at a tool that CONTRADICTS the refusal in front of them is
+# worse than pointing them nowhere, and the CLI and the chart publish
+# through separate workflows, so no release ordering guarantees the
+# check exists by the time this message reaches a cluster. Each caller's
+# detail block already states its own remedy. When 2.27b lands the
+# local twins, add the line back and it will be true.
 bundle_refuse() {  # $1 = one-line summary (the Argo CD tile message), $2 = detail block
     echo "::cue-cmp:: bundle is inconsistent: $1" >&2
     echo "" >&2
@@ -584,7 +594,7 @@ bundle_refuse() {  # $1 = one-line summary (the Argo CD tile message), $2 = deta
     printf '%s\n' "$2" >&2
     echo "" >&2
     echo "Nothing from this path was applied; the resources already running" >&2
-    echo "are untouched. Check locally with \`apprafter app validate\`." >&2
+    echo "are untouched." >&2
     return 1
 }
 

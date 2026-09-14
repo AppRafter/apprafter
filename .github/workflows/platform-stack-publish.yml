@@ -204,7 +204,7 @@ jobs:
       # Only trusted inputs are used below: a secret and the built-in
       # GITHUB_REPOSITORY, both through `env:`. No event payload is
       # interpolated.
-      - name: Wait for the operator images this chart pins
+      - name: Wait for the images this chart pins
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -248,6 +248,35 @@ jobs:
             done
             echo "  ok: ${image}:${op_version} is pullable"
           done
+
+          # The chart pins the cue-cmp sidecar tag at render time
+          # (component_argocd-cue-cmp.cue:50,59 — `v` + the bare semver
+          # from argocd-cue-cmp/version.cue, which is why this reads the
+          # SoT file rather than the component file: the component only
+          # holds the CUE interpolation). It is NOT covered by
+          # op_version above — the sidecar has its own version series.
+          # Publishing the chart before the image exists leaves the
+          # repo-server sidecar in ImagePullBackOff, which presents as
+          # "Argo CD stopped syncing" rather than as a bad release.
+          cmp_version="$(grep -oE '^version: "[0-9]+\.[0-9]+\.[0-9]+"' \
+              argocd-cue-cmp/version.cue \
+              | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+          if [ -z "${cmp_version:-}" ]; then
+            echo "::error::could not read the sidecar version from argocd-cue-cmp/version.cue"
+            exit 1
+          fi
+          echo "chart pins the cue-cmp sidecar at v${cmp_version}"
+          until check_tag "argocd-cue-cmp" "v${cmp_version}"; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::argocd-cue-cmp:v${cmp_version} is still absent from ghcr after 15 minutes."
+              echo "::error::Publishing this chart would advertise a sidecar image nobody can pull."
+              echo "::error::Check argocd-cue-cmp-publish for this same commit — it publishes that tag."
+              exit 1
+            fi
+            echo "  argocd-cue-cmp:v${cmp_version} not in the registry yet — waiting 20s"
+            sleep 20
+          done
+          echo "  ok: argocd-cue-cmp:v${cmp_version} is pullable"
 
       - name: Compute lowercase owner
         id: owner

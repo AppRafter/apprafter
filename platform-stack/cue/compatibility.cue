@@ -1876,6 +1876,85 @@ compatibility: "0.2.69": {
 	]
 }
 
+compatibility: "0.2.72": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.49"
+	notes: """
+		cue-cmp 0.1.26 (ADR 0063). Discovery changed in both
+		directions, and the render gained two refusals. All of it
+		reaches every cluster through the argocd-repo-server sidecar,
+		and all of it can change what an already-registered path does.
+		The sidecar image tag moves, so repo-server is replaced on
+		upgrade.
+
+		**Discovery now confirms intent by file CONTENT.** A `.cue`
+		must carry `apprafter.io/v1alpha1` or
+		`apprafter.io/schemas/v1alpha1` for its path to be claimed. A
+		path claimed only because a directory happened to be named
+		`apprafter`, or because an earlier render left an
+		`apprafter_claim_gen.cue` behind, stops being claimed and falls
+		through to Argo CD's directory mode — which reads only
+		`.yaml`/`.yml`/`.json`, so a CUE-only path there renders
+		nothing and prunes. If a path you expect us to render stops
+		syncing after this upgrade, its manifest is missing that
+		marker.
+
+		**Discovery also reaches layouts it used to miss.** The
+		above-cwd half of the convention is now the registered
+		`spec.source.path` — which Argo CD hands the plugin as
+		ARGOCD_APP_SOURCE_PATH — rather than the working directory's
+		basename alone, and it matches at any depth below that. Two
+		layouts the old snippet left unclaimed — and which therefore
+		fell through to directory mode, rendered nothing and were
+		pruned — are both safe now, but they do NOT land in the same
+		place, so read the two apart before concluding this release
+		misbehaved. Measured on the shipped snippet:
+		`apprafter/api/Application.cue` registered at `apprafter/api`
+		now RENDERS (rc=0, one document);
+		`apprafter/{api,web}/Application.cue` registered at
+		`apprafter` now REFUSES (rc=1, nothing on stdout, nothing
+		applied) — it is two packages under one registration, so point
+		`spec.source.path` at one of them, or register each with its
+		own `apprafter app add --path`. A red tile there is the silent
+		prune having become visible, not a regression. Nothing that was
+		claimed before and still carries the marker is un-claimed by
+		this half.
+
+		**A path holding more than one manifest package is refused,
+		loudly.** Before, that rendered one package and silently
+		discarded the rest, or — for two unwrapped packages — exited 0
+		with an empty manifest stream, which prunes under
+		`syncPolicy.automated.prune`. A registration in that shape
+		turns red on this upgrade. That is the intent: point
+		`spec.source.path` at a single package, or register each with
+		its own `apprafter app add --path`. A directory NESTED inside a
+		package is not a second package — it is folded in, and named on
+		stderr when it carries something that would itself have
+		rendered.
+
+		**A bundle that contradicts itself is refused at render.**
+		Workloads in one package that declare different namespaces,
+		different `spec.environment`, or the same `(namespace, name)`,
+		and a package-scope manifest mixed with named wrappers, all
+		abort with a `::cue-cmp::` summary on the Argo CD tile and the
+		whole finding in the sync log. On the environment check an
+		ABSENT `spec.environment` counts as a value of its own — it is
+		the base-only deploy, not a blank — so a package where one
+		workload declares an environment and its sibling does not is
+		refused as well; all-absent is the ordinary case and still
+		renders. Nothing is applied on a refusal, so workloads already
+		running are untouched.
+
+		No operator change, no CRD change, no CLI change.
+		"""
+	references: [
+		"docs/adr/0063-manifest-discovery.md",
+		"docs/adr/0062-manifest-package-is-a-bundle.md",
+		"argocd-cue-cmp/plugin.yaml",
+		"argocd-cue-cmp/entrypoint.sh",
+	]
+}
+
 compatibility: "0.2.71": {
 	change:          "safe"
 	operatorVersion: "v0.2.49"

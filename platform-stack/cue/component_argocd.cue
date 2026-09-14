@@ -515,24 +515,30 @@ _components: argocd: #Component & {
 			}
 			data: "plugin.yaml": """
 				# SPDX-License-Identifier: FSL-1.1-Apache-2.0
-				# Walk-fix #10 post-B.1.79a (chart 0.1.46, cue-cmp
-				# v0.1.5): drop the `| grep -q .` filter from the
-				# discover shell snippet. `grep -q` is silent, so
-				# the command exited 0 on match but printed nothing
-				# to stdout. Argo CD's CMP MatchRepository treats
-				# the command as a match only when stdout is non-
-				# empty (the `runCommand` return value, not the
-				# exit code) — so every discover returned the
-				# warning `Plugin command returned zero output` and
-				# the sidecar fell back to default directory mode,
-				# choking on `package.json` in landing/cms/ exactly
-				# as before walk-fix #8.
 				#
-				# Fix: `find -print -quit` itself prints the first
-				# matched path on success and nothing on miss; both
-				# code paths exit 0. Stdout emptiness IS the signal.
-				# Regression-guarded by `argocd-cue-cmp/test-
-				# discover.sh` running in CI.
+				# MIRROR of `argocd-cue-cmp/plugin.yaml`, from its
+				# `apiVersion:` line down. Argo CD mounts this ConfigMap OVER
+				# the copy baked into the sidecar image (the `subPath:
+				# plugin.yaml` mount above), so THIS is what actually runs in
+				# a cluster: the file is the source of truth, this block is
+				# the delivery vehicle. Editing only the file ships the old
+				# snippet to every cluster.
+				#
+				# Guarded by `scripts/check-cue-cmp-mirror.sh` (wired into
+				# `just lint` and the `cue` job of `.github/workflows/
+				# lint.yml`). It renders this value and diffs the PARSED
+				# document against the file, so this prose preamble may
+				# differ from the file's, but nothing that reaches the CMP at
+				# runtime can.
+				#
+				# Every backslash below is DOUBLED. A CUE multi-line block
+				# reads `\\(` as interpolation and rejects a bare `\\;` with
+				# `unknown escape sequence`; both are `cue vet` errors, not
+				# silent diffs.
+				#
+				# Snippet semantics: ADR 0063 — discovery is convention AND
+				# content, and the above-cwd signal is ARGOCD_APP_SOURCE_PATH,
+				# never the absolute $PWD — amending ADR 0029.
 				apiVersion: argoproj.io/v1alpha1
 				kind: ConfigManagementPlugin
 				metadata:
@@ -544,11 +550,59 @@ _components: argocd: #Component & {
 				        - sh
 				        - -c
 				        - |
-				          if [ "$(basename "$PWD")" = "apprafter" ]; then
-				            find . -maxdepth 1 -type f -name '*.cue' -print -quit
+				          # Convention gate (ADR 0029, amended by ADR 0063). This
+				          # repository is ours iff the REPO-RELATIVE path to a `.cue`
+				          # file carries an `apprafter` DIRECTORY component, or the
+				          # file's name starts with `apprafter` — AND that file
+				          # actually contains an AppRafter manifest marker.
+				          #
+				          # The path splits in two:
+				          #   * BELOW cwd — visible to `find .`.
+				          #   * AT or ABOVE cwd — the registered `spec.source.path`,
+				          #     which argocd-repo-server hands the discover command as
+				          #     ARGOCD_APP_SOURCE_PATH.
+				          #
+				          # NEVER glob the absolute $PWD. The CMP workdir is
+				          # `${ARGOCD_CMP_WORKDIR:-os.TempDir()}/_cmp_server/<uuid>/<path>`
+				          # and its base is set by TWO environment variables —
+				          # ARGOCD_CMP_WORKDIR and, since Argo calls os.TempDir(),
+				          # TMPDIR. An `apprafter` component in the BASE stops the
+				          # convention half of the gate applying, for every path in the
+				          # repository. `${PWD##*/}` is safe (exactly one component:
+				          # the last component of source.path, or the uuid at the repo
+				          # root) and is kept for direct, off-cluster invocation.
+				          #
+				          # Argo CD reads STDOUT, not the exit code (walk-fix #10), and
+				          # `find -exec grep -l … +` exits non-zero when the last grep
+				          # matched nothing — hence the explicit `exit 0`.
+				          RE='apprafter\\.io/(schemas/)?v1alpha1'
+				          sp="${ARGOCD_APP_SOURCE_PATH:-}"
+				          # A `..` component would let a crafted source.path
+				          # (`apprafter/../apps/api`) satisfy the gate while Argo
+				          # resolves the cwd elsewhere. Drop it; the below-cwd arm
+				          # still decides.
+				          case "/$sp/" in */../*) sp="" ;; esac
+				          above=0
+				          case "/${sp#/}/" in */apprafter/*) above=1 ;; esac
+				          case "${PWD##*/}" in apprafter) above=1 ;; esac
+				          if [ "$above" = 1 ]; then
+				            set -- -name '*.cue'
 				          else
-				            find . -type f -name '*.cue' \\( -path '*/apprafter/*' -o -name 'apprafter*.cue' \\) -print -quit
+				            set -- -name '*.cue' \\( -path '*/apprafter/*' -o -name 'apprafter*.cue' \\)
 				          fi
+				          # `cue.mod/` holds the schema this sidecar injects on every
+				          # render, and `apprafter_claim_gen.cue` is its generated
+				          # binding — both carry the marker, so an already-rendered
+				          # checkout would otherwise self-match forever.
+				          find . -type f ! -path '*/cue.mod/*' ! -name 'apprafter_claim_gen.cue' "$@" \\
+				            -exec grep -lE "$RE" {} + 2>/dev/null \\
+				            | head -n 1
+				          exit 0
+				  # Render command. `entrypoint.sh` lives in the sidecar
+				  # image and wraps `cue export` so CUE compile errors
+				  # surface as structured single-line summaries in the
+				  # Argo CD UI (full stderr remains available in the sync
+				  # log). Sync details: see ADR 0029 §Rationale.
 				  generate:
 				    command: [sh, "-c"]
 				    args:
