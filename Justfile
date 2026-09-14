@@ -35,6 +35,7 @@ lint:
     ./scripts/check-cli-version-bump.sh
     ./scripts/check-backup-runner-pin.sh
     ./scripts/check-argocd-cue-cmp-drift.sh
+    ./scripts/check-cue-cmp-mirror.sh
     ./scripts/check-version-coherence.sh
     ./scripts/check-plan-checkboxes.sh
     # `docs-check.sh` byte-compares the generated CLI reference against a

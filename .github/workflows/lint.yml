@@ -51,8 +51,10 @@ jobs:
               - 'examples/**'
               - 'platform-stack/cue/**'
               - 'argocd-cue-cmp/version.cue'
+              - 'argocd-cue-cmp/plugin.yaml'
               - 'cue.mod/**'
               - 'scripts/lint-cue.sh'
+              - 'scripts/check-cue-cmp-mirror.sh'
               - '.github/workflows/lint.yml'
             rust_cli:
               - 'cli/**'
@@ -78,6 +80,11 @@ jobs:
           version: v0.10.0
       - name: lint-cue.sh
         run: ./scripts/lint-cue.sh
+      # Why this guard exists: see the header of
+      # scripts/check-cue-cmp-mirror.sh. Wired here as well as in
+      # `just lint` because no workflow runs `just lint`. ADR 0063 §Risks.
+      - name: check-cue-cmp-mirror.sh
+        run: ./scripts/check-cue-cmp-mirror.sh
 
   rust-cli:
     name: Rust cli/ (fmt + clippy)

@@ -247,6 +247,9 @@ convention buys, and nobody has needed it.
 ## Risks
 
 **The `plugin.yaml` mirror has no automated guard.**
+**Resolved by `scripts/check-cue-cmp-mirror.sh` (2026-09-14)**, wired into
+both `just lint` and the `cue` job in `.github/workflows/lint.yml` — the
+workflow half matters because no workflow runs `just lint`.
 `platform-stack/cue/component_argocd.cue:546-551` holds a copy of the snippet
 in a ConfigMap that is mounted **over** the image's baked copy, so the mirror
 is what actually runs. Nothing in `scripts/` or `.github/workflows/` compares
