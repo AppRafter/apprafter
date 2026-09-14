@@ -9,6 +9,138 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## platform-stack 0.2.72 / argocd-cue-cmp 0.1.26 — the manifest package is found where it lives, and a bundle that contradicts itself is refused (2.27a, unreleased)
+
+### Fixed
+
+- **Two registered layouts were never claimed by the plugin at all, and Argo
+  CD pruned the workloads.** `apprafter/{api,web}/Application.cue` registered
+  at `--path apprafter`, and `apprafter/api/Application.cue` registered at
+  `--path apprafter/api`. Discovery matched on the working directory's
+  basename plus a `*/apprafter/*` glob, and neither shape puts an `apprafter`
+  component *below* the registered path — the first has it *at* the path, the
+  second *above* it.
+
+  "No match" is not a safe default once an Application exists. Argo CD falls
+  back to directory mode, which reads only `.yaml`/`.yml`/`.json`, so a
+  CUE-only path renders an **empty manifest set** into a registration carrying
+  `syncPolicy.automated.prune` — and the running workloads are deleted. This
+  is the data-loss fix in the release.
+
+  The above-cwd half of the convention is now the repo-relative
+  `spec.source.path` Argo CD hands the plugin as `ARGOCD_APP_SOURCE_PATH`,
+  and it matches at any depth below that. Deliberately **not** the absolute
+  `$PWD`: the CMP working directory's base is environment-controlled by two
+  variables — `ARGOCD_CMP_WORKDIR` and, because Argo calls `os.TempDir()`,
+  `TMPDIR` — and with an `apprafter` component in that base a `$PWD` glob
+  claims `apps/api/App.cue`, which the rule must reject. `${PWD##*/}`, exactly
+  one path component and so uncontaminable by the base, stays as the
+  direct-invocation arm.
+
+- **Two unwrapped package directories under one path exited 0 with an empty
+  manifest stream** — the same prune, reached from the other side. The render
+  evaluated `cue export ./...` across both instances, the top-level-manifest
+  probe read the two-line string `yes\nyes` rather than `yes`, fell through to
+  the named-wrapper branch, selected no key, and wrote nothing to stdout with
+  a zero exit. Nothing in the pipeline said a word.
+
+- **A repo-root `apprafter/` beside a `services/web/apprafter/` rendered one
+  document of two, `rc=0`, no warning.** The entrypoint's single greedy `cd
+  ./apprafter` took the first and dropped the rest. A registered path is now
+  reduced to the set of package directories under it, and a path holding more
+  than one is **refused** — one registration is one package (ADR 0062), so
+  two packages under one path is a registration mistake, and the CMP is the
+  only layer positioned to see it. Point `spec.source.path` at a single
+  package, or register each with its own `apprafter app add --path`. A
+  directory *nested* inside a package is not a second package: it is folded
+  in, and named on stderr when it carries something that would itself have
+  rendered, so "my workload never appeared" is answerable from the sync log.
+
+- **A directory that merely happened to be called `apprafter` was claimed,
+  and so was a checkout carrying a leftover `apprafter_claim_gen.cue`.** The
+  convention was a filename rule with no content behind it, so
+  `apprafter/settings.cue` holding `owner: "team-apprafter"` claimed the
+  repository; worse, the sidecar's own injected artefacts — the vendored
+  schema under `cue.mod/pkg/` and the generated claim bindings — carry the
+  marker, so one render made a checkout self-match forever. Discovery now
+  confirms intent by file **content**, matching `apprafter\.io/(schemas/)?v1alpha1`
+  — anchored, so a `.cue` that merely mentions the domain in a string is not
+  ours — and excludes the sidecar's artefacts by path and by name.
+
+### Added
+
+- **Four ways a bundle can contradict itself are now refused at render.** The
+  whole package is one JSON document at this point, which is the only place in
+  the pipeline where every workload of a bundle is visible at once, so all
+  four are `jq`/`awk` over data already in hand: no extra `cue` invocation, no
+  cluster access.
+
+  - **A package-scope manifest mixed with named wrappers in one package.**
+    The style dispatch took the package-scope branch and returned; the named
+    wrapper was not dropped by any validator — it rode out as a stray
+    top-level key of the emitted document, which the apiserver prunes without
+    an error. A whole workload silently gone, with nothing downstream left to
+    inspect. This is the one inconsistency the render layer is the only
+    possible place to catch.
+  - **Two workloads with the same `(namespace, name)`.** Two documents into
+    one apiserver identity: whichever applied last overwrote the other. Below
+    the render layer the admission webhook sees CREATE-then-UPDATE and cannot
+    tell it from an edit.
+  - **Workloads declaring different `metadata.namespace`.** Rendered anyway,
+    scattering one bundle across namespaces.
+  - **Workloads declaring different `spec.environment`.** Checked *before*
+    `inject_env`, which sets `.spec.environment` on every document
+    unconditionally — after it the divergence reads as agreement.
+
+  A refusal writes **zero bytes** to stdout and exits non-zero, so nothing is
+  applied and the resources already running are untouched; a partial stream
+  under `syncPolicy.automated.prune` is the destructive shape, and the test
+  asserts the byte count for that reason. Argo CD shows a one-line
+  `::cue-cmp::` summary on the tile and the whole finding in the sync log.
+
+  The refusal deliberately does **not** tell the reader to check locally with
+  `apprafter app validate`: that command carries none of these four checks yet
+  — it is plan 2.27b — so today it answers `✓ valid` for exactly the bundles
+  this refuses, and a tool that contradicts the refusal in front of the
+  operator is worse than no tool reference at all.
+
+### Changed
+
+- **The chart's copy of `plugin.yaml` is compared against the image's, by a
+  gate.** `component_argocd.cue` holds the discover snippet in a ConfigMap
+  that is mounted **over** the copy baked into the sidecar image, so the
+  mirror is what actually runs in a cluster — and nothing compared the two.
+  Editing `argocd-cue-cmp/plugin.yaml` alone passed `test-discover.sh`, passed
+  both drift guards after the version bumps, published an image, and shipped
+  the old snippet to every cluster. `scripts/check-cue-cmp-mirror.sh` now
+  compares them, wired into `just lint` **and** into the `cue` job of
+  `.github/workflows/lint.yml` — the workflow half matters because no workflow
+  runs `just lint`. (The CUE `"""` block requires every backslash doubled,
+  including `\;`, which is otherwise an `unknown escape sequence`.)
+
+- **The chart publish waits for the sidecar image it pins.**
+  `platform-stack-publish.yml` waited for `apprafter-operator` and
+  `apprafter-admission-webhook` but not for `argocd-cue-cmp`, even though the
+  chart pins its tag. A chart winning that race leaves clusters with a
+  repo-server sidecar in `ImagePullBackOff`, which presents as "Argo CD
+  stopped syncing" rather than as a bad release. This is the first cue-cmp
+  bump where correctness depends on it.
+
+- **The discover fixtures are real manifests, and both suites grew.** Fixtures
+  1–3 of `test-discover.sh` were `package app` stubs with no `apiVersion` and
+  no schema import — they matched only because the old snippet looked at
+  filenames, and under the content gate they correctly stop matching, which
+  would have read as a regression. `test-discover.sh` went 5 → 20 cases and
+  `test-inject.sh` 43 → 105 assertions. The contaminated-workdir case is the
+  mutation test for the whole change: revert the snippet to globbing `$PWD`
+  and it must flip from `nomatch` to `match`. Everything was verified on host
+  `bash` and in an `alpine:3.20` image built with the sidecar's exact package
+  set (`ca-certificates bash jq`, no gawk) under **busybox ash 1.36.1**.
+
+- **platform-stack 0.2.72** ships the sidecar at `0.1.26` with
+  `change: "requires-restart"` — the image tag moves, so repo-server is
+  replaced on upgrade. No operator change, no CRD change, no CLI change.
+
 ## cli v0.2.66 / platform-stack 0.2.71 — a bootstrap that reported success over a dead ingress (unreleased)
 
 ### Fixed
