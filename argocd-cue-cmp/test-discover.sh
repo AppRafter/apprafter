@@ -78,18 +78,53 @@ fi
 tmp_root=$(mktemp -d)
 trap 'rm -rf "$tmp_root"' EXIT
 
+# Fixtures must be REAL manifests: the discover gate confirms intent by
+# file CONTENT (ADR 0063), so a `package app` stub with no apiVersion and
+# no schema import is correctly not ours. Before this, fixtures 1-3 were
+# stubs — they matched only because the old snippet looked at filenames.
+write_styleB() {  # $1 = file path, $2 = metadata.name
+    mkdir -p "$(dirname "$1")"
+    cat > "$1" <<EOF
+package apprafter
+
+import v1alpha1 "apprafter.io/schemas/v1alpha1"
+
+app: v1alpha1.#Application & {
+	metadata: name: "$2"
+	spec: base: image: "nginxdemos/hello:plain-text"
+}
+EOF
+}
+
+write_styleA() {  # $1 = file path, $2 = metadata.name
+    mkdir -p "$(dirname "$1")"
+    cat > "$1" <<EOF
+package apprafter
+
+apiVersion: "apprafter.io/v1alpha1"
+kind:       "Application"
+metadata: name: "$2"
+spec: base: image: "nginxdemos/hello:plain-text"
+EOF
+}
+
 pass=0
 fail=0
 
 # Run the discover script in $1, assert stdout non-empty
 # (expected="match") or empty (expected="nomatch"). $3 is
-# a human-readable label for the test output.
+# a human-readable label for the test output. $4 is the
+# repo-relative source path `argocd-repo-server` exports as
+# ARGOCD_APP_SOURCE_PATH (i.e. the Application's
+# `spec.source.path`); it defaults to `.`, which is what a
+# source registered at the repository root looks like.
 run_case() {
     local cwd=$1
     local expected=$2
     local label=$3
     local stdout
-    stdout=$(cd "$cwd" && sh -c "$script_body")
+    local source_path=${4:-.}
+    stdout=$(cd "$cwd" && ARGOCD_APP_SOURCE_PATH="$source_path" sh -c "$script_body")
     local empty
     if [[ -z "$stdout" ]]; then empty=1; else empty=0; fi
     case "$expected" in
@@ -123,28 +158,20 @@ run_case() {
 # cue` lives one level down. Operator's
 # `apprafter app add --path landing/web` ends up with Argo
 # CD's discover running here.
-mkdir -p "$tmp_root/landing/web/apprafter"
-cat > "$tmp_root/landing/web/apprafter/Application.cue" <<EOF
-package app
-metadata: name: "landing-web"
-EOF
-run_case "$tmp_root/landing/web" match "parent-dir convention: apprafter/Application.cue"
+write_styleB "$tmp_root/landing/web/apprafter/Application.cue" "landing-web"
+run_case "$tmp_root/landing/web" match "parent-dir convention: apprafter/Application.cue" "landing/web"
 
 # Fixture 2: cwd basename IS `apprafter` — operator's `path`
 # already points at the convention directory. The discover
 # snippet's depth-1 branch fires here.
-run_case "$tmp_root/landing/web/apprafter" match "cwd-is-apprafter: Application.cue at depth 1"
+run_case "$tmp_root/landing/web/apprafter" match "cwd-is-apprafter: Application.cue at depth 1" "landing/web/apprafter"
 
 # Fixture 3: filename-prefix convention — `apprafter-foo.
 # cue` at the path root, no `apprafter/` subdirectory.
 # Per spec.md §3.2 the operator may keep the rendered file
 # next to the app code rather than in a subdirectory.
-mkdir -p "$tmp_root/landing/cms"
-cat > "$tmp_root/landing/cms/apprafter-app.cue" <<EOF
-package app
-metadata: name: "landing-cms"
-EOF
-run_case "$tmp_root/landing/cms" match "filename-prefix convention: apprafter-app.cue at root"
+write_styleB "$tmp_root/landing/cms/apprafter-app.cue" "landing-cms"
+run_case "$tmp_root/landing/cms" match "filename-prefix convention: apprafter-app.cue at root" "landing/cms"
 
 # Fixture 4: a repo with no `apprafter*.cue` files anywhere
 # — discover MUST return empty stdout so Argo CD falls
@@ -154,7 +181,7 @@ mkdir -p "$tmp_root/raw-yaml"
 cat > "$tmp_root/raw-yaml/package.json" <<'EOF'
 { "name": "not-an-apprafter-app" }
 EOF
-run_case "$tmp_root/raw-yaml" nomatch "no apprafter files: stdout must stay empty"
+run_case "$tmp_root/raw-yaml" nomatch "no apprafter files: stdout must stay empty" "raw-yaml"
 
 # Fixture 5: regression guard for a near-miss — a `.cue`
 # file at depth 1 with no `apprafter` prefix AND no
@@ -166,7 +193,7 @@ cat > "$tmp_root/random-cue/main.cue" <<EOF
 package x
 foo: "bar"
 EOF
-run_case "$tmp_root/random-cue" nomatch "plain main.cue (no apprafter prefix): stdout must stay empty"
+run_case "$tmp_root/random-cue" nomatch "plain main.cue (no apprafter prefix): stdout must stay empty" "random-cue"
 
 echo ""
 echo "Summary: $pass passed, $fail failed"
