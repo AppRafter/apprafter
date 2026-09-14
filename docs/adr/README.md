@@ -93,6 +93,9 @@ ADRs are never deleted; supersession preserves the historical record.
 | 0059 | [rolling back a moving tag pins the application to a digest](./0059-application-image-pin.md) | Accepted |
 | 0060 | [no emergency root password on a Tier-1 node](./0060-no-emergency-root-password.md) | Accepted |
 | 0061 | [`needs.jetstream` → NATS — account per namespace, subject isolation, and what a deny vector can and cannot hold](./0061-needs-jetstream-nats.md) | Accepted |
+| 0062 | [a manifest package is a bundle — one registration, one namespace, one environment](./0062-manifest-package-is-a-bundle.md) | Accepted |
+| 0063 | [manifest discovery is convention plus content, and a bundle may span directories](./0063-manifest-discovery.md) | Accepted |
+| 0064 | [`apprafter app restart` — an explicit roll, because the platform cannot know when a rotation is finished](./0064-app-restart.md) | Accepted |
 
 ## Writing a new record
 

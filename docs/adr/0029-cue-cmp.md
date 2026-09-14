@@ -4,6 +4,19 @@
 
 Draft.
 
+**Amended by [ADR 0063](0063-manifest-discovery.md) (2026-09-14).** Two parts
+of the Decision below no longer describe what ships:
+
+- the `discover.find.glob: "**/apprafter*.cue"` was replaced by a shell
+  snippet, and ADR 0063 replaces that in turn with a rule that gates on the
+  repo-relative path **and** on file content, renders every matched package
+  directory, and refuses an ambiguous registration;
+- the `argocd.argoproj.io/manifest-generate-paths` monorepo story was never
+  implemented — the annotation appears nowhere in the tree.
+
+The rationale below — why a CMP, and why compilation is server-side —
+stands unchanged.
+
 ## Context
 
 ADRs 0025–0028 address the platform-stack side: platform manifests originate from our CUE source, are rendered into a Helm chart, distributed via OCI, and pulled by Argo CD without user-side rendering. CUE is invisible to users on the platform side.
