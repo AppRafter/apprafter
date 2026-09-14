@@ -9,6 +9,57 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.66 / platform-stack 0.2.71 — a bootstrap that reported success over a dead ingress (unreleased)
+
+### Fixed
+
+- **`apprafter cluster-bootstrap` no longer reports success over an ingress
+  that cannot serve a request.** An operator's restored cluster answered every
+  request with a Cloudflare 521 while every check the product had said it was
+  fine: all Argo CD Applications `Synced`/`Healthy`, the root platform
+  Application healthy, `cluster-bootstrap` exit 0 — and no Gateway ever
+  programmed, nothing listening on the node's 80/443.
+
+  The bootstrap now ends with a bounded ingress-readiness gate: the Gateway API
+  CRDs must be Established, a `cilium` GatewayClass object must exist, and — if
+  the cluster has a public domain, so the chart rendered a platform `Gateway` —
+  that Gateway must report `Programmed=True`. A cluster with no domain has no
+  ingress to be dead and is not asked for one; a `--skip-cilium` bootstrap (the
+  k3d e2e) is not gated at all. Failure is an **error**, not a warning: the
+  exit code is what `bootstrap-all`, `restore` and `platform rescue` read, and
+  a warning in several hundred lines of output is the original complaint
+  restated. The message names the cause and the commands that clear it.
+
+  Note what is deliberately NOT gated: `GatewayClass cilium` `Accepted=True`.
+  Cilium 1.16.5 vendors gateway-api v1.1.0 and writes `status.supportedFeatures`
+  as bare strings in the same status update that carries `Accepted`, which the
+  v1.2.1 CRDs reject atomically — so a fully working cluster sits at
+  `Accepted=Unknown` forever. Gating on it would fail every install.
+
+### Changed
+
+- **`e2e/gateway-walk.sh` runs the production install order.** It used to apply
+  the Gateway API CRDs and then do a single `helm install cilium` with
+  `gatewayAPI.enabled: true` already set. Production cannot do that: the loader
+  installs Cilium from values carrying no gatewayAPI key (the CRDs do not exist
+  yet), Argo CD lands the CRDs at wave -25, and only then re-applies Cilium at
+  wave -20 with gatewayAPI on — at the same chart version. Since Cilium runs its
+  Gateway API required-resources check at process startup, everything about this
+  failure mode lives in whether that second apply RESTARTS the cilium pods, and
+  a one-shot install could not observe it. The walk is now Phase 1 (loader
+  values) → Phase 2 (CRDs) → Phase 2b (upgrade), and Phase 2b asserts every
+  cilium agent and operator pod was replaced. Verified by mutation: strip the
+  pod-roll knobs from `component_cilium.cue` and the walk goes red at Phase 2b
+  and again at the Gateway gate.
+
+- **platform-stack 0.2.71** corrects the comment on those knobs. No component
+  values changed — `templates/` and every component's values render identical
+  to 0.2.70 — so the upgrade restarts nothing. The comment claimed "fresh
+  installs are unaffected — purely upgrade-correctness", which is false: a
+  fresh install is exactly the two-phase case, and those three keys are the
+  whole mechanism by which a fresh cluster's cilium pods ever see the Gateway
+  API. The comment argued for deleting the keys it annotated.
+
 ## platform-stack 0.2.69 / operator v0.2.49 — `needs.jetstream`: an account per namespace, streams in the manifest (2.5, unreleased)
 
 ### Added

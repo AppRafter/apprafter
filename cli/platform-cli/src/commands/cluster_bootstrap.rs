@@ -72,7 +72,7 @@ use cli_providers::k8s::{
 };
 use cli_state::State;
 use tempfile::NamedTempFile;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::commands::state_paths::resolve_state_paths;
 
@@ -157,6 +157,63 @@ const PLATFORMSTACK_APPLY_BACKOFF_SECS: u64 = 10;
 /// "nothing to preserve" answer.
 const PLATFORMSTACK_DEFAULT_RAW_PATH: &str =
     "/apis/apprafter.io/v1alpha1/namespaces/apprafter-system/platformstacks/default";
+
+/// Raw API path of the platform `Gateway`. The chart renders it only when
+/// `gateway.allowedDomains` is non-empty (`templates/gateway.yaml`), so a
+/// 404 here is the ordinary answer on a cluster with no public domain — it
+/// is an EXISTENCE probe, not a health read (see [`wait_for_ingress_datapath`]).
+const PLATFORM_GATEWAY_RAW_PATH: &str =
+    "/apis/gateway.networking.k8s.io/v1/namespaces/apprafter-system/gateways/platform";
+
+/// The ingress-readiness gate's budget for "the `cilium` GatewayClass object
+/// appears". It is created by the chart's wave -20 cilium sync, which has
+/// already run by the time the root Application reports Healthy, so this only
+/// bridges the false-positive-Healthy window step 4c's comment describes —
+/// not a full chart pull. 300s.
+const GATEWAY_CLASS_CREATE_TIMEOUT_SECS: u64 = 300;
+
+/// The ingress-readiness gate's budget for "the platform `Gateway` reports
+/// `Programmed=True`". Cilium programs a Gateway in about a second once its
+/// Gateway API controller is registered (measured on the 1.83a T8 live walk);
+/// the whole point of the window is to distinguish "slow" from "never", and
+/// never is what a stale cilium-agent produces. 300s.
+const GATEWAY_PROGRAMMED_TIMEOUT_SECS: u64 = 300;
+
+/// Raw API paths the pod-age half of the ingress gate reads: the
+/// `gatewayclasses` CRD (when did the Gateway API arrive in this cluster) and
+/// the two cilium workloads whose PROCESS START is what matters (the agent
+/// serves the CiliumEnvoyConfig, the operator runs the Gateway API
+/// controller). `cilium-envoy` is deliberately not read — it binds the host
+/// ports but reads no gateway flag.
+const GATEWAYCLASS_CRD_RAW_PATH: &str =
+    "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/gatewayclasses.gateway.networking.k8s.io";
+const CILIUM_AGENT_PODS_RAW_PATH: &str =
+    "/api/v1/namespaces/kube-system/pods?labelSelector=k8s-app%3Dcilium";
+const CILIUM_OPERATOR_PODS_RAW_PATH: &str =
+    "/api/v1/namespaces/kube-system/pods?labelSelector=io.cilium%2Fapp%3Doperator";
+
+/// How long the pod-age check waits before it accuses. The wave -20 cilium
+/// rollout can still be in flight when the `cilium` GatewayClass appears, so
+/// an outgoing pod is not yet evidence of anything.
+///
+/// A parameter rather than a bare constant purely so a test can exercise the
+/// accusing branch without sleeping through the real budget — the production
+/// call site passes [`IngressPodAgeRetry::DEFAULT`] and nothing else may.
+#[derive(Debug, Clone, Copy)]
+struct IngressPodAgeRetry {
+    attempts: u32,
+    backoff_secs: u64,
+}
+
+impl IngressPodAgeRetry {
+    /// 12 × 10s = 2 min, comfortably longer than a single-node agent +
+    /// operator roll (~20s measured in `e2e/gateway-walk.sh` Phase 2b)
+    /// without turning a genuine never into a long wait.
+    const DEFAULT: Self = Self {
+        attempts: 12,
+        backoff_secs: 10,
+    };
+}
 
 /// Run the GitOps loader against `target_override`, or against the
 /// active target when it is `None`.
@@ -536,8 +593,290 @@ pub(crate) fn perform_bootstrap<H: HelmRunner, K: KubectlRunner>(
         }
     }
 
+    // 6. Ingress-readiness gate — the last thing before this function
+    //    reports success. See `wait_for_ingress_datapath`.
+    wait_for_ingress_datapath(
+        kubectl,
+        kubeconfig_path,
+        bootstrap_skip_cilium(),
+        IngressPodAgeRetry::DEFAULT,
+    )?;
+
     Ok(())
 }
+
+/// Bounded gate: refuse to report a successful bootstrap over an ingress
+/// datapath that cannot serve a single request.
+///
+/// **The defect this exists for.** Cilium's Gateway API controller runs a
+/// required-resources check at PROCESS STARTUP. The production install order
+/// puts the `gateway.networking.k8s.io` CRDs (chart wave -25) AFTER the
+/// loader's own `helm install cilium` at step 0 — deliberately, because
+/// Cilium's chart only creates its `cilium` GatewayClass once those CRDs are
+/// discoverable. So the cilium pods that the loader starts have no Gateway
+/// API view at all, and everything depends on the wave -20 cilium sync
+/// RESTARTING them (`rollOutCiliumPods` / `operator.rollOutPods` /
+/// `envoy.rollOutPods` in `component_cilium.cue` are what force that; the
+/// reordered `e2e/gateway-walk.sh` is their regression guard). When that
+/// restart does not happen the cluster reaches a state where every Argo CD
+/// Application is `Synced`/`Healthy` — the ConfigMap really was updated —
+/// while no Gateway is ever programmed and nothing listens on the node's
+/// 80/443. An operator met this as a Cloudflare 521 over a cluster whose
+/// every health check said it was fine.
+///
+/// **Why these three checks and not `GatewayClass cilium` `Accepted=True`.**
+/// That condition is the obvious one and it is unusable: Cilium 1.16.5
+/// vendors gateway-api v1.1.0 and writes `status.supportedFeatures` as bare
+/// strings in the same status update that carries `Accepted`, which the
+/// v1.2.1 CRDs reject atomically. The GatewayClass therefore sits at the CRD
+/// default `Accepted=Unknown` on a FULLY WORKING cluster — confirmed on the
+/// live 1.83a T8 Hetzner walk and again here in `e2e/gateway-walk.sh`, whose
+/// Phase 5 reads it for context and explicitly refuses to gate on it.
+/// Gating bootstrap on it would fail every single install. What IS reachable:
+///
+///   a. the `gatewayclasses` CRD is Established — the wave -25 component
+///      landed at all;
+///   b. a `cilium` GatewayClass OBJECT exists — the wave -20 cilium sync
+///      rendered it, which the Cilium chart does only when the CRDs were
+///      already discoverable, so (b) proves the -25 → -20 ordering held;
+///   c. every cilium agent + operator pod is YOUNGER than the `gatewayclasses`
+///      CRD. A pod that started first cannot have registered the controller,
+///      whatever `cilium-config` says now. This is the operator's own
+///      diagnosis — "agent started 12:39, tlsroutes CRD created 12:44:09" —
+///      and it is the only check that fires on a cluster with no public
+///      domain, where (d) has nothing to read;
+///   d. IF a platform `Gateway` exists, it reports `Programmed=True` — the
+///      end-to-end fact that traffic can be served.
+///
+/// (d) is conditional because the chart emits the Gateway only for a cluster
+/// with `gateway.allowedDomains` set. A fresh single-node install has no
+/// public domain yet, so there is no Gateway to program; a cluster that DOES
+/// serve traffic — the restore case, and every re-bootstrap or `platform
+/// rescue` of a live cluster — has one, and gets the end-to-end assertion on
+/// top of (c).
+///
+/// What this still cannot see: `apprafter restore` runs the bootstrap as its
+/// phase 3 and only then replays the cluster's objects, so on a
+/// `restore --reprovision` the platform Gateway does not exist yet when (d)
+/// runs. (c) is what covers that path, which is why it is here and not left
+/// to the Gateway check alone.
+///
+/// **Fail, not warn.** `cluster-bootstrap`'s exit code is what
+/// `bootstrap_all`, `apprafter restore` and `platform rescue` gate on, and a
+/// zero from it is read downstream and by the operator as "the platform is
+/// serving". A warning printed into several hundred lines of bootstrap output
+/// is precisely the failure mode being fixed — everything looked healthy. The
+/// error names the cause and the commands that clear it, so a false positive
+/// costs a re-run while a false negative costs a silent outage.
+///
+/// `skip_cilium` is [`bootstrap_skip_cilium`]'s answer, passed in rather than
+/// read here so the skip branch is testable without the cross-test races
+/// `set_var` in a parallel test binary causes.
+fn wait_for_ingress_datapath<K: KubectlRunner>(
+    kubectl: &K,
+    kubeconfig_path: &Path,
+    skip_cilium: bool,
+    pod_age_retry: IngressPodAgeRetry,
+) -> Result<()> {
+    // `APPRAFTER_BOOTSTRAP_SKIP_CILIUM` leaves the cluster on its existing CNI
+    // and disables the chart's cilium component (see `render_root_application`),
+    // so there is no `cilium` GatewayClass to wait for and no host-network
+    // Envoy to program a Gateway. The k3d e2e runs this way on purpose.
+    if skip_cilium {
+        info!("skip-Cilium bootstrap — not gating on the Cilium ingress datapath");
+        return Ok(());
+    }
+
+    // (a) Two-stage, for the reason step 4c documents: `kubectl wait` errors
+    //     out instantly on a resource that does not exist yet rather than
+    //     polling for it, so `--for=create` has to bridge the gap first.
+    let gatewayclass_crd = "crd/gatewayclasses.gateway.networking.k8s.io";
+    kubectl
+        .wait_for_condition(
+            gatewayclass_crd,
+            None,
+            "create",
+            CRD_CREATE_TIMEOUT_SECS,
+            kubeconfig_path,
+        )
+        .map_err(|e| {
+            CliError::Other(format!(
+                "the Gateway API CRDs never appeared, so this cluster has no ingress \
+                 datapath: {e}\n\
+                 The `gateway-api-crds` component (chart sync-wave -25) is what installs \
+                 them. Check `kubectl -n argocd get application gateway-api-crds`."
+            ))
+        })?;
+    kubectl.wait_for_condition(
+        gatewayclass_crd,
+        None,
+        "condition=Established",
+        CRD_ESTABLISHED_TIMEOUT_SECS,
+        kubeconfig_path,
+    )?;
+
+    // (b) The GatewayClass object itself.
+    kubectl
+        .wait_for_condition(
+            "gatewayclasses.gateway.networking.k8s.io/cilium",
+            None,
+            "create",
+            GATEWAY_CLASS_CREATE_TIMEOUT_SECS,
+            kubeconfig_path,
+        )
+        .map_err(|e| CliError::Other(format!("{e}\n{INGRESS_DATAPATH_REMEDY}")))?;
+
+    // (c) Every cilium agent + operator pod must have STARTED AFTER the
+    //     Gateway API CRDs existed. This is the operator's own two numbers
+    //     from the incident — "agent started 12:39, tlsroutes CRD created
+    //     12:44:09" — turned into an assertion, and it is the only check here
+    //     that fires on a cluster with no public domain, where (d) has no
+    //     Gateway to read and the cluster looks green all the way down.
+    //
+    //     A pod older than the CRD cannot have registered the Gateway API
+    //     controller, no matter what `cilium-config` says now. Bounded
+    //     retries because the wave -20 rollout may still be in flight when
+    //     the GatewayClass appears.
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match cilium_pods_older_than_gateway_crds(kubectl, kubeconfig_path) {
+            // Could not judge (a read failed). Not evidence of breakage, and
+            // a bootstrap must not fail over a diagnostic it could not take.
+            None => {
+                warn!(
+                    "could not read cilium pod ages vs the Gateway API CRDs — skipping that check"
+                );
+                break;
+            }
+            Some(stale) if stale.is_empty() => break,
+            Some(stale) if attempt < pod_age_retry.attempts => {
+                info!(
+                    attempt,
+                    pods = %stale.join(", "),
+                    "cilium pods still predate the Gateway API CRDs; waiting for the rollout"
+                );
+                std::thread::sleep(std::time::Duration::from_secs(pod_age_retry.backoff_secs));
+            }
+            Some(stale) => {
+                return Err(CliError::Other(format!(
+                    "these cilium pods started BEFORE the Gateway API CRDs existed, so they \
+                     never registered the Gateway API controller: {}\n{INGRESS_DATAPATH_REMEDY}",
+                    stale.join(", ")
+                )));
+            }
+        }
+    }
+
+    // (d) Existence probe, then the real assertion. A 404 (no public domain
+    //     configured) is the ordinary answer and ends the gate.
+    if kubectl
+        .get_raw(PLATFORM_GATEWAY_RAW_PATH, kubeconfig_path)
+        .is_err()
+    {
+        info!("no platform Gateway in this cluster (no public domain) — ingress gate satisfied");
+        return Ok(());
+    }
+    kubectl
+        .wait_for_condition(
+            "gateways.gateway.networking.k8s.io/platform",
+            Some("apprafter-system"),
+            "condition=Programmed",
+            GATEWAY_PROGRAMMED_TIMEOUT_SECS,
+            kubeconfig_path,
+        )
+        .map_err(|e| {
+            CliError::Other(format!(
+                "the platform Gateway never reached Programmed=True, so nothing is \
+                 listening on this node's 80/443: {e}\n{INGRESS_DATAPATH_REMEDY}"
+            ))
+        })?;
+
+    info!("ingress datapath ready (GatewayClass present, platform Gateway Programmed)");
+    Ok(())
+}
+
+/// Names of the cilium agent + operator pods that are OLDER than the
+/// `gatewayclasses` CRD, i.e. that started before the Gateway API existed in
+/// this cluster and therefore could not have registered Cilium's Gateway API
+/// controller at startup. Empty vector = every pod is younger, which is what a
+/// correct wave -20 rollout produces.
+///
+/// `None` means the question could not be answered — a read failed or a
+/// timestamp did not parse. That is deliberately distinct from `Some(vec![])`:
+/// the caller must not read "I could not look" as "all clear", and equally
+/// must not fail a bootstrap over a diagnostic it was unable to take.
+///
+/// Terminating pods (`metadata.deletionTimestamp` set) are skipped: during a
+/// rollout the outgoing pod is still listed, is genuinely older than the CRD,
+/// and is on its way out — counting it would make the check fire on the exact
+/// moment it is supposed to be waiting through.
+fn cilium_pods_older_than_gateway_crds<K: KubectlRunner>(
+    kubectl: &K,
+    kubeconfig_path: &Path,
+) -> Option<Vec<String>> {
+    let crd: serde_json::Value = serde_json::from_str(
+        &kubectl
+            .get_raw(GATEWAYCLASS_CRD_RAW_PATH, kubeconfig_path)
+            .ok()?,
+    )
+    .ok()?;
+    let crd_created = parse_k8s_timestamp(crd.pointer("/metadata/creationTimestamp")?.as_str()?)?;
+
+    let mut stale = Vec::new();
+    let mut seen = 0usize;
+    for path in [CILIUM_AGENT_PODS_RAW_PATH, CILIUM_OPERATOR_PODS_RAW_PATH] {
+        let list: serde_json::Value =
+            serde_json::from_str(&kubectl.get_raw(path, kubeconfig_path).ok()?).ok()?;
+        for pod in list.get("items")?.as_array()? {
+            let meta = pod.get("metadata")?;
+            if meta.get("deletionTimestamp").is_some() {
+                continue;
+            }
+            seen += 1;
+            let created = parse_k8s_timestamp(meta.get("creationTimestamp")?.as_str()?)?;
+            if created < crd_created {
+                stale.push(meta.get("name")?.as_str()?.to_string());
+            }
+        }
+    }
+    // A cluster running Cilium always has an agent pod. Zero matches means the
+    // label selectors stopped matching, not that every pod is young — and that
+    // reads as `all clear` unless it is called out. Measured against a real
+    // apiserver: a selector that matches nothing returns HTTP 200 with
+    // `items: []`, indistinguishable from a healthy answer at the JSON level.
+    if seen == 0 {
+        return None;
+    }
+    Some(stale)
+}
+
+/// Kubernetes emits `creationTimestamp` as RFC 3339 UTC. Parsed rather than
+/// string-compared: the two values are compared for ORDER, and a lexicographic
+/// comparison silently stops being an ordering the day either side is emitted
+/// in a different offset or precision.
+fn parse_k8s_timestamp(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// The operator-facing half of a failed [`wait_for_ingress_datapath`]: what is
+/// wrong and the single command that clears it. Kept next to the gate rather
+/// than inlined twice so the two failure paths cannot drift apart.
+const INGRESS_DATAPATH_REMEDY: &str = "\
+Cilium reads `enable-gateway-api` only when its process starts, so a cilium \
+agent/operator pod that was started BEFORE the Gateway API CRDs landed never \
+registers the Gateway API controller — and every Argo CD Application still \
+reports Synced/Healthy, because the ConfigMap itself was updated correctly.\n\
+Remedy:\n\
+  kubectl -n kube-system rollout restart ds/cilium\n\
+  kubectl -n kube-system rollout restart deploy/cilium-operator\n\
+  kubectl -n kube-system rollout restart ds/cilium-envoy\n\
+then re-run `apprafter cluster-bootstrap`. If this recurs on a fresh install, \
+the chart's pod-roll knobs (`rollOutCiliumPods` / `operator.rollOutPods` / \
+`envoy.rollOutPods` in platform-stack `component_cilium.cue`) have regressed — \
+`e2e/gateway-walk.sh` Phase 2b is the guard for exactly that.";
 
 /// `helm upgrade --install` the release UNLESS it is already deployed at
 /// the desired fingerprint (a true-no-op re-run). Logs the skip.
@@ -1054,6 +1393,30 @@ mod tests {
         raw_body: RefCell<Option<String>>,
         /// Raw paths this runner was asked for.
         raw_gets: RefCell<Vec<String>>,
+        /// Does [`PLATFORM_GATEWAY_RAW_PATH`] resolve? `false` (the default)
+        /// is the fresh single-node shape — no public domain, so the chart
+        /// renders no Gateway and the ingress gate's (c) is a no-op. Keyed on
+        /// the PATH rather than reusing `raw_body`, because the two reads ask
+        /// different questions and a single shared body would have the
+        /// PlatformStack fixture answer the Gateway probe.
+        gateway_exists: bool,
+        /// `(gatewayclasses CRD created, cilium pod created)` for the pod-age
+        /// half of the ingress gate. `None` (the default) makes those three
+        /// reads FAIL, which the gate treats as "could not judge" and skips —
+        /// the right shape for every test that is not about pod ages.
+        pod_ages: Option<(&'static str, &'static str)>,
+        /// Stamp `deletionTimestamp` on the pods `pod_ages` synthesises — the
+        /// mid-rollout shape, where the outgoing pod is still listed and IS
+        /// older than the CRD.
+        pods_terminating: bool,
+        /// Answer the pod lists with `items: []` — what a label selector that
+        /// matches nothing returns (HTTP 200, measured against a real
+        /// apiserver), and therefore what a stale selector would return.
+        pods_absent: bool,
+        /// `resource_ref` substrings whose `wait_for_condition` must FAIL —
+        /// how a test stands in for "this never converged". The recorded
+        /// `waits` still capture the call, so ordering assertions keep working.
+        failing_waits: Vec<String>,
     }
 
     impl FakeKubectl {
@@ -1124,10 +1487,57 @@ mod tests {
                 timeout_seconds,
                 kubeconfig_path: kubeconfig_path.to_path_buf(),
             });
+            if self.failing_waits.iter().any(|f| resource_ref.contains(f)) {
+                return Err(cli_core::CliError::Other(format!(
+                    "timed out waiting for the condition on {resource_ref}"
+                )));
+            }
             Ok(())
         }
         fn get_raw(&self, path: &str, _: &Path) -> Result<String> {
             self.raw_gets.borrow_mut().push(path.to_string());
+            if path == GATEWAYCLASS_CRD_RAW_PATH {
+                return match self.pod_ages {
+                    Some((crd, _)) => {
+                        Ok(format!(r#"{{"metadata":{{"creationTimestamp":"{crd}"}}}}"#))
+                    }
+                    None => Err(cli_core::CliError::Other(
+                        "the server could not find the requested resource".to_string(),
+                    )),
+                };
+            }
+            if path == CILIUM_AGENT_PODS_RAW_PATH || path == CILIUM_OPERATOR_PODS_RAW_PATH {
+                let who = if path == CILIUM_AGENT_PODS_RAW_PATH {
+                    "cilium-abcde"
+                } else {
+                    "cilium-operator-abcde"
+                };
+                let deleting = if self.pods_terminating {
+                    r#","deletionTimestamp":"2026-09-11T12:46:00Z""#
+                } else {
+                    ""
+                };
+                if self.pods_absent {
+                    return Ok(r#"{"items":[]}"#.to_string());
+                }
+                return match self.pod_ages {
+                    Some((_, pod)) => Ok(format!(
+                        r#"{{"items":[{{"metadata":{{"name":"{who}","creationTimestamp":"{pod}"{deleting}}}}}]}}"#
+                    )),
+                    None => Err(cli_core::CliError::Other(
+                        "the server could not find the requested resource".to_string(),
+                    )),
+                };
+            }
+            if path == PLATFORM_GATEWAY_RAW_PATH {
+                return if self.gateway_exists {
+                    Ok(r#"{"kind":"Gateway","metadata":{"name":"platform"}}"#.to_string())
+                } else {
+                    Err(cli_core::CliError::Other(
+                        "gateways.gateway.networking.k8s.io \"platform\" not found".to_string(),
+                    ))
+                };
+            }
             match self.raw_body.borrow().clone() {
                 Some(body) => Ok(body),
                 None => Err(cli_core::CliError::Other(
@@ -1212,7 +1622,7 @@ mod tests {
         // children) while Sync=Unknown on chart-pull failure.
         // Walk-found false-positive v0.1.99 → v0.1.100.
         let waits = kubectl.waits.borrow();
-        assert_eq!(waits.len(), 10, "{waits:?}");
+        assert_eq!(waits.len(), 13, "{waits:?}");
         assert_eq!(waits[0].resource_ref, "node --all");
         assert_eq!(waits[0].namespace, None);
         assert_eq!(waits[0].condition_expr, "condition=Ready");
@@ -1282,6 +1692,33 @@ mod tests {
         assert_eq!(waits[9].namespace, None);
         assert_eq!(waits[9].condition_expr, "condition=Established");
         assert_eq!(waits[9].timeout_seconds, CRD_ESTABLISHED_TIMEOUT_SECS);
+
+        // The ingress-readiness gate closes the bootstrap (see
+        // `wait_for_ingress_datapath`): the Gateway API CRDs, then the
+        // `cilium` GatewayClass object. This fake has no platform Gateway
+        // (`gateway_exists: false` — the fresh, domain-less cluster), so the
+        // third check is a no-op and the sequence ends here.
+        assert_eq!(
+            waits[10].resource_ref,
+            "crd/gatewayclasses.gateway.networking.k8s.io"
+        );
+        assert_eq!(waits[10].namespace, None);
+        assert_eq!(waits[10].condition_expr, "create");
+        assert_eq!(waits[10].timeout_seconds, CRD_CREATE_TIMEOUT_SECS);
+
+        assert_eq!(
+            waits[11].resource_ref,
+            "crd/gatewayclasses.gateway.networking.k8s.io"
+        );
+        assert_eq!(waits[11].condition_expr, "condition=Established");
+
+        assert_eq!(
+            waits[12].resource_ref,
+            "gatewayclasses.gateway.networking.k8s.io/cilium"
+        );
+        assert_eq!(waits[12].namespace, None);
+        assert_eq!(waits[12].condition_expr, "create");
+        assert_eq!(waits[12].timeout_seconds, GATEWAY_CLASS_CREATE_TIMEOUT_SECS);
     }
 
     #[test]
@@ -1305,16 +1742,23 @@ mod tests {
             .expect("bootstrap");
 
         let waits = kubectl.waits.borrow();
+        // Scoped to the OPERATOR chart's CRDs (`*.apprafter.io`): the
+        // ingress-readiness gate at the end of the bootstrap waits on
+        // `crd/gatewayclasses.gateway.networking.k8s.io` too, and that pair
+        // belongs to a different invariant (it runs AFTER the PlatformStack
+        // apply, not before it).
         let crd_wait_positions: Vec<usize> = waits
             .iter()
             .enumerate()
-            .filter(|(_, w)| w.resource_ref.starts_with("crd/"))
+            .filter(|(_, w)| {
+                w.resource_ref.starts_with("crd/") && w.resource_ref.ends_with(".apprafter.io")
+            })
             .map(|(i, _)| i)
             .collect();
         assert_eq!(
             crd_wait_positions.len(),
             6,
-            "expected exactly six CRD waits (2 per CRD × 3 CRDs), got {crd_wait_positions:?}"
+            "expected exactly six operator-CRD waits (2 per CRD × 3 CRDs), got {crd_wait_positions:?}"
         );
         // All CRD waits must come AFTER the App Healthy wait.
         assert!(
@@ -1345,6 +1789,273 @@ mod tests {
         // perform_bootstrap snapshot pins the ordering. Count is 3:
         // AppProjects, root Application, then PlatformStack default.
         assert_eq!(kubectl.ssa_applies.borrow().len(), 3);
+    }
+
+    /// Pod-age retry budget for the gate tests: accuse on the FIRST look.
+    /// The production budget is [`IngressPodAgeRetry::DEFAULT`] (2 minutes of
+    /// sleeps); a test that used it would spend them.
+    const NO_WAIT: IngressPodAgeRetry = IngressPodAgeRetry {
+        attempts: 1,
+        backoff_secs: 0,
+    };
+
+    // ---------------------------------------------------------------
+    // The ingress-readiness gate (`wait_for_ingress_datapath`).
+    //
+    // The defect: a cilium agent/operator started BEFORE the Gateway API
+    // CRDs landed never registers the Gateway API controller, so no Gateway
+    // is ever Programmed and nothing listens on 80/443 — while every Argo CD
+    // Application reports Synced/Healthy. Bootstrap used to report success
+    // over exactly that. These pin that it no longer can, and that the gate
+    // stays out of the way when there is no ingress to promise.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn a_cluster_with_a_platform_gateway_must_prove_it_is_programmed() {
+        // The restore / live-cluster shape: `gateway.allowedDomains` is set,
+        // so the chart rendered a Gateway and traffic is supposed to flow.
+        let kubectl = FakeKubectl {
+            gateway_exists: true,
+            ..Default::default()
+        };
+        let kc = PathBuf::from("/tmp/kubeconfig");
+
+        wait_for_ingress_datapath(&kubectl, &kc, false, NO_WAIT).expect("gate");
+
+        let waits = kubectl.waits.borrow();
+        let gw = waits.last().expect("the gate must issue at least one wait");
+        assert_eq!(
+            gw.resource_ref,
+            "gateways.gateway.networking.k8s.io/platform"
+        );
+        assert_eq!(gw.namespace, Some("apprafter-system".to_string()));
+        assert_eq!(gw.condition_expr, "condition=Programmed");
+        assert_eq!(gw.timeout_seconds, GATEWAY_PROGRAMMED_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn a_gateway_that_never_programs_fails_the_bootstrap_with_the_remedy() {
+        // THE REGRESSION GUARD. This is the operator's cluster: Argo CD all
+        // green, Cloudflare 521. A warning here would reproduce the original
+        // complaint — "every health check said the cluster was fine" — so the
+        // gate must return Err, and the message must carry the diagnosis and
+        // the command that clears it.
+        //
+        // Driven through `perform_bootstrap`, NOT through the gate directly.
+        // A direct call proves the gate returns Err and says nothing about
+        // whether the bootstrap ACTS on it — and "the bootstrap swallowed the
+        // failure and exited 0" is the entire defect. Mutation-checked:
+        // replacing the `?` at the call site with a log line leaves a direct
+        // test green and turns this one red.
+        let helm = FakeHelm::default();
+        let kubectl = FakeKubectl {
+            gateway_exists: true,
+            failing_waits: vec!["gateways.gateway.networking.k8s.io/platform".to_string()],
+            ..Default::default()
+        };
+        let kc = PathBuf::from("/tmp/kubeconfig");
+        let root_app = PathBuf::from("/tmp/root-app.yaml");
+        let platformstack = tempfile::NamedTempFile::new().unwrap();
+
+        let err = perform_bootstrap(&helm, &kubectl, &kc, &root_app, platformstack.path())
+            .expect_err("a Gateway that never programs must fail the bootstrap");
+
+        // Everything else succeeded: the gate is the ONLY thing standing
+        // between this cluster and a green bootstrap over a dead ingress.
+        assert_eq!(
+            kubectl.ssa_applies.borrow().len(),
+            3,
+            "the bootstrap must have run to completion and failed at the gate"
+        );
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("never reached Programmed=True"),
+            "the error must name what did not happen: {msg}"
+        );
+        assert!(
+            msg.contains("kubectl -n kube-system rollout restart ds/cilium"),
+            "the error must carry the remedy: {msg}"
+        );
+        assert!(
+            msg.contains("Synced/Healthy"),
+            "the error must say why every other signal looked fine: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_cilium_pod_older_than_the_gateway_crds_fails_the_gate() {
+        // THE OPERATOR'S TWO NUMBERS, as an assertion. Their cluster ran a
+        // cilium agent started at 12:39 against Gateway API CRDs created at
+        // 12:44:09 — a process that cannot have registered the Gateway API
+        // controller, whatever `cilium-config` said by the time anyone looked.
+        // This is the only check in the gate that fires on a cluster with no
+        // public domain, where there is no Gateway to read.
+        let kubectl = FakeKubectl {
+            pod_ages: Some(("2026-09-11T12:44:09Z", "2026-09-11T12:39:00Z")),
+            ..Default::default()
+        };
+        let kc = PathBuf::from("/tmp/kubeconfig");
+
+        let err = wait_for_ingress_datapath(&kubectl, &kc, false, NO_WAIT)
+            .expect_err("a pod that predates the CRDs must fail the gate");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("started BEFORE the Gateway API CRDs existed"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("cilium-abcde") && msg.contains("cilium-operator-abcde"),
+            "the error must NAME the offending pods, agent and operator both: {msg}"
+        );
+        assert!(
+            msg.contains("kubectl -n kube-system rollout restart ds/cilium"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn cilium_pods_started_after_the_crds_pass_the_gate() {
+        // The correct wave -20 rollout: the CRDs land, the cilium sync
+        // replaces every pod, and the replacements start with the Gateway API
+        // already present. Without this the test above would pass equally
+        // against a check that accuses unconditionally.
+        let kubectl = FakeKubectl {
+            pod_ages: Some(("2026-09-11T12:44:09Z", "2026-09-11T12:45:30Z")),
+            ..Default::default()
+        };
+        let kc = PathBuf::from("/tmp/kubeconfig");
+
+        wait_for_ingress_datapath(&kubectl, &kc, false, NO_WAIT).expect("gate");
+    }
+
+    #[test]
+    fn a_terminating_pod_is_not_evidence_of_a_stale_cilium() {
+        // Mid-rollout the outgoing pod is still listed and IS older than the
+        // CRD — it is the pod being replaced. Counting it would make the check
+        // fire during the very rollout it exists to wait for, and with
+        // NO_WAIT (accuse on the first look) that misfire is immediate.
+        let kubectl = FakeKubectl {
+            pod_ages: Some(("2026-09-11T12:44:09Z", "2026-09-11T12:39:00Z")),
+            pods_terminating: true,
+            ..Default::default()
+        };
+        let kc = PathBuf::from("/tmp/kubeconfig");
+
+        wait_for_ingress_datapath(&kubectl, &kc, false, NO_WAIT)
+            .expect("a terminating pod must not be counted");
+    }
+
+    #[test]
+    fn an_unreadable_pod_age_is_not_read_as_all_clear() {
+        // `None` from the probe means "could not look", which must be
+        // distinct from `Some(vec![])`. A bootstrap may not fail over a
+        // diagnostic it could not take — but the distinction has to exist in
+        // the code, or the day a read starts failing the check goes silently
+        // vacuous. Pinned on the helper, where the two answers are visible;
+        // the gate's own behaviour on `None` is to continue.
+        let kubectl = FakeKubectl::default(); // pod_ages: None → the reads fail
+        let kc = PathBuf::from("/tmp/kubeconfig");
+        assert_eq!(
+            cilium_pods_older_than_gateway_crds(&kubectl, &kc),
+            None,
+            "an unreadable cluster must answer `could not judge`, not `all clear`"
+        );
+
+        let readable = FakeKubectl {
+            pod_ages: Some(("2026-09-11T12:44:09Z", "2026-09-11T12:45:30Z")),
+            ..Default::default()
+        };
+        assert_eq!(
+            cilium_pods_older_than_gateway_crds(&readable, &kc),
+            Some(Vec::new()),
+            "a readable, healthy cluster must answer `all clear`"
+        );
+    }
+
+    #[test]
+    fn a_pod_list_that_matches_nothing_is_not_read_as_all_clear() {
+        // A label selector that matches nothing returns HTTP 200 with
+        // `items: []` — measured against a real apiserver, and at the JSON
+        // level indistinguishable from "every pod is young". A cluster running
+        // Cilium always has an agent pod, so zero matches means the selectors
+        // stopped matching (a chart rename, a typo) and the check has to say
+        // it could not judge rather than wave the bootstrap through.
+        let kubectl = FakeKubectl {
+            pod_ages: Some(("2026-09-11T12:44:09Z", "2026-09-11T12:39:00Z")),
+            pods_absent: true,
+            ..Default::default()
+        };
+        let kc = PathBuf::from("/tmp/kubeconfig");
+        assert_eq!(
+            cilium_pods_older_than_gateway_crds(&kubectl, &kc),
+            None,
+            "an empty pod list must answer `could not judge`, not `all clear`"
+        );
+    }
+
+    #[test]
+    fn a_missing_cilium_gateway_class_fails_the_bootstrap() {
+        // The ingress stack never installed at all: the wave -20 cilium sync
+        // did not render a GatewayClass, which the Cilium chart only does
+        // when the wave -25 CRDs were already discoverable.
+        let kubectl = FakeKubectl {
+            failing_waits: vec!["gatewayclasses.gateway.networking.k8s.io/cilium".to_string()],
+            ..Default::default()
+        };
+        let kc = PathBuf::from("/tmp/kubeconfig");
+
+        let err = wait_for_ingress_datapath(&kubectl, &kc, false, NO_WAIT)
+            .expect_err("a missing GatewayClass must fail the bootstrap");
+        assert!(
+            err.to_string()
+                .contains("kubectl -n kube-system rollout restart ds/cilium"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_cluster_without_a_public_domain_passes_the_gate_without_a_gateway_wait() {
+        // A fresh single-node install has no domain, so the chart renders no
+        // Gateway. There is no ingress to be dead and nothing is promised —
+        // the gate must not invent a resource to wait for and time out.
+        let kubectl = FakeKubectl::default(); // gateway_exists: false
+        let kc = PathBuf::from("/tmp/kubeconfig");
+
+        wait_for_ingress_datapath(&kubectl, &kc, false, NO_WAIT).expect("gate");
+
+        let waits = kubectl.waits.borrow();
+        assert!(
+            !waits
+                .iter()
+                .any(|w| w.resource_ref.starts_with("gateways.")),
+            "no Gateway wait may be issued when no Gateway exists: {waits:?}"
+        );
+        assert_eq!(
+            kubectl.raw_gets.borrow().as_slice(),
+            &[
+                // (c) could not be judged — this fake has no pod ages — so the
+                // pod-list reads never happen.
+                GATEWAYCLASS_CRD_RAW_PATH.to_string(),
+                PLATFORM_GATEWAY_RAW_PATH.to_string(),
+            ],
+            "the gate probes for the Gateway exactly once"
+        );
+    }
+
+    #[test]
+    fn a_skip_cilium_bootstrap_does_not_gate_on_the_cilium_ingress_datapath() {
+        // `APPRAFTER_BOOTSTRAP_SKIP_CILIUM` (the k3d e2e) leaves the cluster
+        // on its own CNI and disables the chart's cilium component, so there
+        // is no `cilium` GatewayClass to wait for. Gating anyway would turn
+        // the e2e red on a cluster that is behaving exactly as configured.
+        let kubectl = FakeKubectl::default();
+        let kc = PathBuf::from("/tmp/kubeconfig");
+
+        wait_for_ingress_datapath(&kubectl, &kc, true, NO_WAIT).expect("gate");
+
+        assert!(kubectl.waits.borrow().is_empty(), "no waits expected");
+        assert!(kubectl.raw_gets.borrow().is_empty(), "no reads expected");
     }
 
     #[test]
@@ -1864,7 +2575,8 @@ mod tests {
         // (AppProjects, root App, PlatformStack) and the full wait
         // sequence run regardless of the helm skip.
         assert_eq!(kubectl.ssa_applies.borrow().len(), 3);
-        assert_eq!(kubectl.waits.borrow().len(), 10);
+        // 10 loader/CRD waits + the 3 of the ingress-readiness gate.
+        assert_eq!(kubectl.waits.borrow().len(), 13);
     }
 
     #[test]
@@ -2217,7 +2929,12 @@ mod tests {
 
         assert_eq!(
             kubectl.raw_gets.borrow().as_slice(),
-            &[PLATFORMSTACK_DEFAULT_RAW_PATH.to_string()],
+            &[
+                PLATFORMSTACK_DEFAULT_RAW_PATH.to_string(),
+                // The ingress gate's reads, after the apply.
+                GATEWAYCLASS_CRD_RAW_PATH.to_string(),
+                PLATFORM_GATEWAY_RAW_PATH.to_string(),
+            ],
             "the live PlatformStack must be read exactly once, before the apply"
         );
         let corpus = kubectl.slurped_corpus();
