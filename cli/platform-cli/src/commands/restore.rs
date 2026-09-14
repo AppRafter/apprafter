@@ -112,6 +112,7 @@ const CLAIM_READY_BACKOFF_SECS: u64 = 10;
 // ---------------------------------------------------------------------------
 
 /// A captured CR read back off disk during restore.
+#[derive(Debug)]
 struct LoadedCr {
     /// The backup's kind tag (`PlatformStack` / `SourceCredential` /
     /// `Application` / `ArgoApplication` / `SharedVolume`).
@@ -958,6 +959,11 @@ fn read_backup_manifest(data_dir: &Path) -> Result<BackupManifest> {
 /// is read from the file BODY's `kind` field is unreliable for the backup's
 /// internal `ArgoApplication` tag (the on-disk CR has `kind: Application`), so
 /// we recover the backup's kind tag from the FILENAME segment instead.
+///
+/// Every object is type-stamped on the way out (see [`stamp_cr_type`]) so the
+/// callers that apply it hand `kubectl` a well-formed document — snapshots
+/// written by the in-cluster runner before the capture-side fix carry no
+/// `apiVersion`/`kind` at all.
 fn read_crs(data_dir: &Path) -> Result<Vec<LoadedCr>> {
     let crs_dir = data_dir.join("crs");
     let mut out = Vec::new();
@@ -980,11 +986,99 @@ fn read_crs(data_dir: &Path) -> Result<Vec<LoadedCr>> {
         let kind = stem.split('-').nth(1).unwrap_or_default().to_string();
         let body = std::fs::read(&path)
             .map_err(|e| CliError::Other(format!("read CR {}: {e}", path.display())))?;
-        let cr: Value = serde_json::from_slice(&body)
+        let mut cr: Value = serde_json::from_slice(&body)
             .map_err(|e| CliError::Other(format!("parse CR {}: {e}", path.display())))?;
+        stamp_cr_type(&mut cr, &kind, &path)?;
         out.push(LoadedCr { kind, cr });
     }
     Ok(out)
+}
+
+/// The `(apiVersion, kind)` a staged CR must be applied as, keyed on the
+/// backup's own kind tag — the 2nd filename segment `write_crs` puts there.
+///
+/// `ArgoApplication` is the backup's INTERNAL tag for a user Argo CD
+/// `Application`: the tag distinguishes it from an AppRafter `Application` in
+/// the same directory, but the object itself is `argoproj.io/v1alpha1`,
+/// `kind: Application` — which is how `gated_apply_plan` applies it and how
+/// `cluster_bootstrap` writes one. Everything else the capture sweep stages
+/// (`capture_non_claim_artifacts`) is an `apprafter.io/v1alpha1` CR whose kind
+/// IS the tag.
+fn known_cr_type(kind_tag: &str) -> Option<(&'static str, &str)> {
+    match kind_tag {
+        "ArgoApplication" => Some(("argoproj.io/v1alpha1", "Application")),
+        "Application" | "PlatformStack" | "SharedVolume" | "SourceCredential" => {
+            Some(("apprafter.io/v1alpha1", kind_tag))
+        }
+        _ => None,
+    }
+}
+
+/// True iff `obj` already states its own type — both fields present as
+/// non-empty strings.
+fn carries_object_type(obj: &Value) -> bool {
+    ["apiVersion", "kind"].iter().all(|f| {
+        obj.get(f)
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.is_empty())
+    })
+}
+
+/// Fill in whichever of `apiVersion` / `kind` the staged object is missing.
+/// Never overwrites one the body carries.
+fn fill_object_type(obj: &mut Value, api_version: &str, kind: &str, path: &Path) -> Result<()> {
+    let map = obj.as_object_mut().ok_or_else(|| {
+        CliError::Other(format!(
+            "backup object {} is not a JSON object, so it cannot be applied",
+            path.display()
+        ))
+    })?;
+    for (field, value) in [("apiVersion", api_version), ("kind", kind)] {
+        let present = map
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|v| !v.is_empty());
+        if !present {
+            map.insert(field.to_string(), Value::from(value));
+        }
+    }
+    Ok(())
+}
+
+/// Give a staged CR back its `apiVersion` + `kind` when the snapshot does not
+/// carry them.
+///
+/// Snapshots written by the IN-CLUSTER runner before the capture-side fix hold
+/// objects with neither field: kube-rs lists return items whose type is implied
+/// by the List, and the runner staged them verbatim. Nothing internal noticed —
+/// the restore's own routing takes the kind from the FILENAME — but
+/// `kubectl apply --server-side` rejects such a body outright
+/// (`[apiVersion not set, kind not set]`), so the first `apply_cr` of every
+/// restore of such a snapshot died. The type is knowable here, from the same
+/// filename tag the routing already uses, so the restore repairs what it reads
+/// rather than leaving those snapshots unrestorable.
+///
+/// A body that already states its type is left alone, tag lookup included — a
+/// snapshot from the CLI (`kubectl get -o json` carries the types) or from a
+/// fixed runner restores exactly as before, and a future kind this restore has
+/// no mapping for still loads.
+///
+/// A body that needs the repair and whose tag is unknown is an ERROR naming the
+/// file. Skipping it would apply part of a cluster and call it a restore.
+fn stamp_cr_type(cr: &mut Value, kind_tag: &str, path: &Path) -> Result<()> {
+    if carries_object_type(cr) {
+        return Ok(());
+    }
+    let (api_version, kind) = known_cr_type(kind_tag).ok_or_else(|| {
+        CliError::Other(format!(
+            "backup CR {} states no apiVersion/kind, and its kind tag {kind_tag:?} is not one \
+             this restore can type ({}). Refusing to apply an object whose kind is unknown — \
+             restoring part of a cluster is worse than not starting.",
+            path.display(),
+            "Application, ArgoApplication, PlatformStack, SharedVolume, SourceCredential"
+        ))
+    })?;
+    fill_object_type(cr, api_version, kind, path)
 }
 
 /// Read one backed-up secret JSON and return the decoded `key → bytes` map
@@ -1279,6 +1373,14 @@ fn apply_imported_certs(data_dir: &Path, kubeconfig: &Path) -> Result<(usize, Ve
 /// reproducible. A snapshot with no `certs/` directory — every backup taken
 /// before the certificate was captured, and every cluster that never connected
 /// a domain — yields an empty list rather than an error.
+///
+/// Type-stamped on the way out, like [`read_crs`]: an imported certificate is a
+/// plain `v1`/`Secret` BY CONSTRUCTION (`target cert import` applies it as one
+/// and the capture sweep keys on its label), so there is nothing to look up —
+/// but a snapshot from the in-cluster runner before the capture-side fix
+/// carries the object with neither field, and `ApplyImportedCerts` is the FIRST
+/// step of a restore that applies a captured object, so that snapshot died
+/// here.
 fn read_imported_certs(data_dir: &Path) -> Result<Vec<Value>> {
     let certs_dir = data_dir.join(backup_core::engine::CERTS_DIR);
     let Ok(entries) = std::fs::read_dir(&certs_dir) else {
@@ -1294,10 +1396,10 @@ fn read_imported_certs(data_dir: &Path) -> Result<Vec<Value>> {
     for path in files {
         let body = std::fs::read(&path)
             .map_err(|e| CliError::Other(format!("read cert {}: {e}", path.display())))?;
-        out.push(
-            serde_json::from_slice(&body)
-                .map_err(|e| CliError::Other(format!("parse cert {}: {e}", path.display())))?,
-        );
+        let mut cert: Value = serde_json::from_slice(&body)
+            .map_err(|e| CliError::Other(format!("parse cert {}: {e}", path.display())))?;
+        fill_object_type(&mut cert, "v1", "Secret", &path)?;
+        out.push(cert);
     }
     Ok(out)
 }
@@ -4296,6 +4398,49 @@ mod tests {
         assert_eq!(read[1]["type"], serde_json::json!("kubernetes.io/tls"));
     }
 
+    /// INVARIANT: a certificate staged WITHOUT its type gets `v1`/`Secret`
+    /// back. `ApplyImportedCerts` is the FIRST step of a restore that applies a
+    /// captured object, so on a cluster with an imported certificate this is
+    /// exactly where a snapshot from the old in-cluster runner died:
+    ///
+    /// ```text
+    /// error validating "STDIN": error validating data:
+    /// [apiVersion not set, kind not set]
+    /// ```
+    ///
+    /// Nothing is looked up: an imported certificate is a plain
+    /// `kubernetes.io/tls` Secret by construction — `target cert import`
+    /// applies it as one and the capture sweep keys on its label.
+    #[test]
+    fn read_imported_certs_types_a_certificate_a_broken_snapshot_staged_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let certs = dir.path().join("certs");
+        std::fs::create_dir_all(&certs).unwrap();
+        // Byte-for-byte the shape the old runner staged.
+        std::fs::write(
+            certs.join("cf-cert.json"),
+            r#"{"data":{"tls.crt":"eA=="},
+                "metadata":{"name":"cf-cert","namespace":"apprafter-system"},
+                "type":"kubernetes.io/tls"}"#,
+        )
+        .unwrap();
+        // …and one that already states its type, which must not be rewritten.
+        std::fs::write(
+            certs.join("zz-cert.json"),
+            r#"{"apiVersion":"v1","kind":"Secret","metadata":{"name":"zz-cert"}}"#,
+        )
+        .unwrap();
+
+        let read = read_imported_certs(dir.path()).unwrap();
+        assert_eq!(read[0]["apiVersion"], serde_json::json!("v1"));
+        assert_eq!(read[0]["kind"], serde_json::json!("Secret"));
+        // The material and the Secret type are untouched.
+        assert_eq!(read[0]["type"], serde_json::json!("kubernetes.io/tls"));
+        assert_eq!(read[0]["data"]["tls.crt"], serde_json::json!("eA=="));
+        assert_eq!(read[1]["apiVersion"], serde_json::json!("v1"));
+        assert_eq!(read[1]["kind"], serde_json::json!("Secret"));
+    }
+
     /// A4: the intent a restore acts on comes out of the replayed
     /// `PlatformStack` — the object every backup mode captures — and NOT out
     /// of the manifest, which only a hand-run `backup create` could fill.
@@ -4840,6 +4985,158 @@ mod tests {
         let dd = tempfile::tempdir().unwrap();
         write_at(dd.path(), "crs/0-Application-demo-web.json", "{not json");
         assert!(read_crs(dd.path()).is_err());
+    }
+
+    /// INVARIANT: a CR staged WITHOUT `apiVersion`/`kind` gets them back before
+    /// anything tries to apply it.
+    ///
+    /// Every snapshot the in-cluster runner wrote before the capture-side fix
+    /// is in this shape — kube-rs list items carry no type, and the runner
+    /// staged them verbatim. The restore's own routing never noticed (it takes
+    /// the kind from the FILENAME), but `kubectl apply --server-side` rejects
+    /// such a body with `[apiVersion not set, kind not set]`, so those
+    /// snapshots were unrestorable. New backups being correct does not help
+    /// anyone already holding one, so the repair happens on the READ.
+    #[test]
+    fn read_crs_types_an_object_a_broken_snapshot_staged_without_one() {
+        let dd = tempfile::tempdir().unwrap();
+        // Exactly what the old runner staged: body, no type.
+        write_at(
+            dd.path(),
+            "crs/0-PlatformStack-apprafter-system-default.json",
+            r#"{"metadata":{"name":"default"},"spec":{"channel":"stable"}}"#,
+        );
+        write_at(
+            dd.path(),
+            "crs/1-SourceCredential-apprafter-system-gh.json",
+            r#"{"metadata":{"name":"gh"}}"#,
+        );
+        write_at(
+            dd.path(),
+            "crs/2-Application-demo-web.json",
+            r#"{"metadata":{"name":"web"}}"#,
+        );
+        write_at(
+            dd.path(),
+            "crs/3-ArgoApplication-argocd-web-prod.json",
+            r#"{"metadata":{"name":"web-prod"}}"#,
+        );
+        write_at(
+            dd.path(),
+            "crs/4-SharedVolume-demo-assets.json",
+            r#"{"metadata":{"name":"assets"}}"#,
+        );
+
+        let crs = read_crs(dd.path()).unwrap();
+        let typed: Vec<(&str, &str)> = crs
+            .iter()
+            .map(|c| {
+                (
+                    c.cr["apiVersion"].as_str().unwrap_or("<missing>"),
+                    c.cr["kind"].as_str().unwrap_or("<missing>"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            typed,
+            vec![
+                ("apprafter.io/v1alpha1", "PlatformStack"),
+                ("apprafter.io/v1alpha1", "SourceCredential"),
+                ("apprafter.io/v1alpha1", "Application"),
+                // The backup's `ArgoApplication` tag is a FILENAME convention;
+                // the object is an argoproj.io `Application` and must be
+                // applied as one, or it lands on the wrong CRD.
+                ("argoproj.io/v1alpha1", "Application"),
+                ("apprafter.io/v1alpha1", "SharedVolume"),
+            ]
+        );
+        // The routing tag is unchanged — the repair must not renumber which
+        // step picks the object up.
+        assert_eq!(crs[3].kind, "ArgoApplication");
+        // …and the body is untouched.
+        assert_eq!(crs[0].cr["spec"]["channel"], serde_json::json!("stable"));
+    }
+
+    /// INVARIANT: the repair only ever FILLS IN. A snapshot taken by the CLI
+    /// (whose `kubectl get -o json` does carry the types) restores byte-for-byte
+    /// as before — including a body whose `kind` deliberately differs from the
+    /// filename tag, which is the `ArgoApplication` case and the one a
+    /// filename-derived overwrite would corrupt.
+    #[test]
+    fn read_crs_never_overwrites_a_type_the_snapshot_carries() {
+        let dd = tempfile::tempdir().unwrap();
+        write_at(
+            dd.path(),
+            "crs/0-ArgoApplication-argocd-web.json",
+            r#"{"apiVersion":"argoproj.io/v1alpha1","kind":"Application",
+                "metadata":{"name":"web"}}"#,
+        );
+        // A future kind this restore has no mapping for still LOADS, because a
+        // body that states its own type needs no lookup.
+        write_at(
+            dd.path(),
+            "crs/1-FutureThing-demo-x.json",
+            r#"{"apiVersion":"apprafter.io/v1beta9","kind":"FutureThing",
+                "metadata":{"name":"x"}}"#,
+        );
+
+        let crs = read_crs(dd.path()).unwrap();
+        assert_eq!(
+            crs[0].cr["apiVersion"],
+            serde_json::json!("argoproj.io/v1alpha1")
+        );
+        assert_eq!(crs[0].cr["kind"], serde_json::json!("Application"));
+        assert_eq!(
+            crs[1].cr["apiVersion"],
+            serde_json::json!("apprafter.io/v1beta9")
+        );
+        assert_eq!(crs[1].cr["kind"], serde_json::json!("FutureThing"));
+    }
+
+    /// A HALF-typed body is completed, not left half-applied: `kubectl` rejects
+    /// on either field alone.
+    #[test]
+    fn read_crs_fills_in_only_the_half_of_the_type_that_is_missing() {
+        let dd = tempfile::tempdir().unwrap();
+        write_at(
+            dd.path(),
+            "crs/0-Application-demo-web.json",
+            r#"{"kind":"Application","metadata":{"name":"web"}}"#,
+        );
+        write_at(
+            dd.path(),
+            "crs/1-SharedVolume-demo-assets.json",
+            r#"{"apiVersion":"apprafter.io/v1alpha1","metadata":{"name":"assets"}}"#,
+        );
+        let crs = read_crs(dd.path()).unwrap();
+        assert_eq!(
+            crs[0].cr["apiVersion"],
+            serde_json::json!("apprafter.io/v1alpha1")
+        );
+        assert_eq!(crs[1].cr["kind"], serde_json::json!("SharedVolume"));
+    }
+
+    /// INVARIANT: an untypeable object is LOUD, never skipped. A restore that
+    /// quietly dropped a CR it could not name would leave a half-restored
+    /// cluster that reported success — the one outcome worse than failing.
+    #[test]
+    fn read_crs_refuses_an_untyped_object_whose_kind_it_cannot_determine() {
+        let dd = tempfile::tempdir().unwrap();
+        write_at(
+            dd.path(),
+            "crs/0-Mystery-demo-thing.json",
+            r#"{"metadata":{"name":"thing"}}"#,
+        );
+        let err = read_crs(dd.path()).expect_err("an unknown kind tag must fail the restore");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("0-Mystery-demo-thing.json"),
+            "the message must name the file: {msg}"
+        );
+        assert!(
+            msg.contains("Mystery"),
+            "…and the tag it could not type: {msg}"
+        );
     }
 
     #[test]

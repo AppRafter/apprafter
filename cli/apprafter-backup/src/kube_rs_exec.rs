@@ -36,7 +36,7 @@ use k8s_openapi::api::core::v1::{Pod, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
 use kube::api::{
     Api, AttachParams, AttachedProcess, DeleteParams, DynamicObject, ListParams, ObjectList, Patch,
-    PatchParams,
+    PatchParams, TypeMeta,
 };
 use kube::discovery::{self, ApiResource};
 use serde_json::Value;
@@ -269,13 +269,51 @@ fn is_not_found(err: &kube::Error) -> bool {
     matches!(err, kube::Error::Api(ae) if ae.code == 404)
 }
 
+/// Stamp `apiVersion` + `kind` onto an object the apiserver returned WITHOUT
+/// them, taking the identity from the [`ApiResource`] the `Api` was built with.
+///
+/// A List response does not repeat the type on its items — they are implied by
+/// the List's own kind — so `DynamicObject::types` decodes as `None` and a
+/// plain `serde_json::to_value` emits neither field. Everything inside this
+/// process reads such an object fine (the engine goes at `/spec`, `/metadata`;
+/// the restore recovers the kind from the staged FILENAME), so it stayed
+/// invisible until a snapshot's objects were piped to `kubectl apply
+/// --server-side`, which needs the real fields and answers
+/// `[apiVersion not set, kind not set]`.
+///
+/// The identity comes from the `ApiResource` rather than from the requested
+/// resource string: it is the exact GVK the request was issued at — discovered,
+/// so a third-party CRD's served version is right by construction.
+///
+/// Only ever FILLS IN. An item that carried its own type (a mixed `List`)
+/// keeps it, or every object in such a list would be applied as the wrong kind.
+fn stamp_types(mut o: DynamicObject, ar: &ApiResource) -> DynamicObject {
+    if o.types.is_none() {
+        o.types = Some(TypeMeta {
+            api_version: ar.api_version.clone(),
+            kind: ar.kind.clone(),
+        });
+    }
+    o
+}
+
+/// Serialize ONE `DynamicObject` the way the engine stages it: type-stamped
+/// (see [`stamp_types`]), so what lands in a snapshot is a document
+/// `kubectl apply` accepts.
+fn object_to_value(o: DynamicObject, ar: &ApiResource) -> Result<Value> {
+    serde_json::to_value(stamp_types(o, ar)).map_err(CliError::from)
+}
+
 /// Serialize a kube-rs `ObjectList<DynamicObject>` into the `{"items":[...]}`
 /// shape kubectl emits, so `engine::list_items` can read `.items[]` unchanged.
-fn list_to_value(list: ObjectList<DynamicObject>) -> Result<Value> {
+///
+/// `ar` is the resource the list was issued against; every item is stamped with
+/// its type (see [`stamp_types`]).
+fn list_to_value(list: ObjectList<DynamicObject>, ar: &ApiResource) -> Result<Value> {
     let items = list
         .items
         .into_iter()
-        .map(|o| serde_json::to_value(o).map_err(CliError::from))
+        .map(|o| object_to_value(o, ar))
         .collect::<Result<Vec<Value>>>()?;
     Ok(serde_json::json!({ "items": items }))
 }
@@ -480,7 +518,7 @@ impl KubeExec for KubeRsExec {
                     let ar = self.resolve_resource(&resource).await?;
                     let api: Api<DynamicObject> = Api::all_with(self.client.clone(), &ar);
                     match api.list(&ListParams::default()).await {
-                        Ok(list) => Ok(Some(list_to_value(list)?)),
+                        Ok(list) => Ok(Some(list_to_value(list, &ar)?)),
                         Err(e) if is_not_found(&e) => Ok(None),
                         Err(e) => Err(CliError::Other(format!("list {resource} -A: {e}"))),
                     }
@@ -490,7 +528,7 @@ impl KubeExec for KubeRsExec {
                     let api: Api<DynamicObject> =
                         Api::namespaced_with(self.client.clone(), &ns, &ar);
                     match api.list(&ListParams::default()).await {
-                        Ok(list) => Ok(Some(list_to_value(list)?)),
+                        Ok(list) => Ok(Some(list_to_value(list, &ar)?)),
                         Err(e) if is_not_found(&e) => Ok(None),
                         Err(e) => Err(CliError::Other(format!("list {resource} -n {ns}: {e}"))),
                     }
@@ -500,7 +538,7 @@ impl KubeExec for KubeRsExec {
                     let api: Api<DynamicObject> =
                         Api::namespaced_with(self.client.clone(), &ns, &ar);
                     match api.get(&name).await {
-                        Ok(obj) => Ok(Some(serde_json::to_value(obj).map_err(CliError::from)?)),
+                        Ok(obj) => Ok(Some(object_to_value(obj, &ar)?)),
                         Err(e) if is_not_found(&e) => Ok(None),
                         Err(e) => Err(CliError::Other(format!(
                             "get {resource} {name} -n {ns}: {e}"
@@ -511,7 +549,7 @@ impl KubeExec for KubeRsExec {
                     let ar = self.resolve_resource(&resource).await?;
                     let api: Api<DynamicObject> = Api::all_with(self.client.clone(), &ar);
                     match api.get(&name).await {
-                        Ok(obj) => Ok(Some(serde_json::to_value(obj).map_err(CliError::from)?)),
+                        Ok(obj) => Ok(Some(object_to_value(obj, &ar)?)),
                         Err(e) if is_not_found(&e) => Ok(None),
                         Err(e) => Err(CliError::Other(format!("get {resource} {name}: {e}"))),
                     }
@@ -860,18 +898,34 @@ mod tests {
         assert!(!is_not_found(&kube::Error::TlsRequired));
     }
 
+    /// The `ApiResource` an `Api` is built with — the type identity kube-rs
+    /// already holds for every list it issues, and the one this file stamps
+    /// back onto the items the apiserver returns without it.
+    fn claim_resource() -> ApiResource {
+        ApiResource {
+            group: "apprafter.io".into(),
+            version: "v1alpha1".into(),
+            api_version: "apprafter.io/v1alpha1".into(),
+            kind: "ResourceClaim".into(),
+            plural: "resourceclaims".into(),
+        }
+    }
+
     /// INVARIANT: the value handed to `engine::list_items` must be the kubectl
     /// `{"items":[…]}` envelope AND each item must survive the round-trip with
     /// its arbitrary CR body intact — the engine reads `/spec/type`,
     /// `/status/connectionSecretRef` and friends straight off these objects.
+    ///
+    /// The fixture is the REAL apiserver List shape: `apiVersion`/`kind` appear
+    /// once, on the List, and NOT on each item — they are implied by the List's
+    /// own kind. A fixture that repeated them per item would pre-supply exactly
+    /// what [`list_to_value`] is responsible for adding, and could never fail.
     #[test]
     fn list_to_value_wraps_items_and_preserves_each_object_verbatim() {
         let list: ObjectList<DynamicObject> = serde_json::from_value(json!({
             "apiVersion": "apprafter.io/v1alpha1",
             "kind": "ResourceClaimList",
             "items": [{
-                "apiVersion": "apprafter.io/v1alpha1",
-                "kind": "ResourceClaim",
                 "metadata": {"name": "pg-0", "namespace": "demo"},
                 "spec": {"type": "pg"},
                 "status": {"connectionSecretRef": "pg-0-conn"}
@@ -879,7 +933,7 @@ mod tests {
         }))
         .expect("decode a claim list");
 
-        let v = list_to_value(list).expect("serialize list");
+        let v = list_to_value(list, &claim_resource()).expect("serialize list");
         let items = v["items"].as_array().expect("an items array");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["metadata"]["name"], json!("pg-0"));
@@ -891,12 +945,77 @@ mod tests {
         );
     }
 
+    /// INVARIANT (the D-restore defect): every item leaves here carrying
+    /// `apiVersion` + `kind`.
+    ///
+    /// A real apiserver List does NOT repeat the type on its items, so
+    /// `DynamicObject::types` decodes as `None` and a plain
+    /// `serde_json::to_value` emits neither field. Objects staged from such a
+    /// list reached `kubectl apply --server-side` during a restore as
+    /// `{"data":…,"metadata":…}` and were rejected with
+    /// `[apiVersion not set, kind not set]` — every snapshot the in-cluster
+    /// runner ever wrote was unrestorable. The identity is not re-derived from
+    /// the requested resource string: it comes from the `ApiResource` the `Api`
+    /// was constructed with, which is the same GVK the request was issued at.
+    #[test]
+    fn list_to_value_stamps_the_type_the_apiserver_left_off_its_items() {
+        let list: ObjectList<DynamicObject> = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "SecretList",
+            "items": [{
+                "metadata": {"name": "cf-cert", "namespace": "apprafter-system"},
+                "type": "kubernetes.io/tls",
+                "data": {"tls.crt": "eA=="}
+            }]
+        }))
+        .expect("decode a secret list");
+
+        let secrets = ApiResource {
+            group: String::new(),
+            version: "v1".into(),
+            api_version: "v1".into(),
+            kind: "Secret".into(),
+            plural: "secrets".into(),
+        };
+        let v = list_to_value(list, &secrets).expect("serialize list");
+        assert_eq!(v["items"][0]["apiVersion"], json!("v1"));
+        assert_eq!(v["items"][0]["kind"], json!("Secret"));
+        // …and the body is untouched.
+        assert_eq!(v["items"][0]["type"], json!("kubernetes.io/tls"));
+        assert_eq!(v["items"][0]["data"]["tls.crt"], json!("eA=="));
+    }
+
+    /// INVARIANT: stamping only ever FILLS IN. An item that carried its own
+    /// type keeps it verbatim — a `List` of mixed kinds (kubectl's `-o json`
+    /// over several resources) would otherwise be rewritten to the collection's
+    /// kind and every object applied as the wrong type.
+    #[test]
+    fn list_to_value_never_overwrites_a_type_the_item_already_carries() {
+        let list: ObjectList<DynamicObject> = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "List",
+            "items": [{
+                "apiVersion": "cert-manager.io/v1",
+                "kind": "Certificate",
+                "metadata": {"name": "star", "namespace": "apprafter-system"}
+            }]
+        }))
+        .expect("decode a mixed list");
+
+        let v = list_to_value(list, &claim_resource()).expect("serialize list");
+        assert_eq!(v["items"][0]["apiVersion"], json!("cert-manager.io/v1"));
+        assert_eq!(v["items"][0]["kind"], json!("Certificate"));
+    }
+
     #[test]
     fn list_to_value_of_an_empty_list_is_an_empty_items_array() {
         let list: ObjectList<DynamicObject> =
             serde_json::from_value(json!({"apiVersion": "v1", "kind": "List", "items": []}))
                 .expect("decode an empty list");
-        assert_eq!(list_to_value(list).unwrap(), json!({"items": []}));
+        assert_eq!(
+            list_to_value(list, &claim_resource()).unwrap(),
+            json!({"items": []})
+        );
     }
 
     fn pod_from(status: Value) -> Pod {
@@ -1521,6 +1640,9 @@ mod tests {
             .is_err());
     }
 
+    /// The list body is the REAL apiserver shape — the type on the List, not on
+    /// each item — so the round-trip proves what actually reaches the engine,
+    /// discovered GVK and all.
     #[test]
     fn get_json_lists_cluster_wide_in_the_kubectl_items_shape() {
         let mut routes = apprafter_discovery_routes();
@@ -1530,7 +1652,6 @@ mod tests {
             json!({
                 "apiVersion": "apprafter.io/v1alpha1", "kind": "ApplicationList",
                 "items": [{
-                    "apiVersion": "apprafter.io/v1alpha1", "kind": "Application",
                     "metadata": {"name": "alpha", "namespace": "demo"},
                     "spec": {"base": {"image": "nginx:1"}}
                 }]
@@ -1548,6 +1669,10 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["metadata"]["name"], json!("alpha"));
         assert_eq!(items[0]["spec"]["base"]["image"], json!("nginx:1"));
+        // The type the apiserver left off the item, restored from the
+        // DISCOVERED resource — without it the object is unappliable.
+        assert_eq!(items[0]["apiVersion"], json!("apprafter.io/v1alpha1"));
+        assert_eq!(items[0]["kind"], json!("Application"));
 
         // `-A` must hit the CLUSTER-WIDE collection URL, not a namespaced one.
         assert!(
@@ -1570,7 +1695,6 @@ mod tests {
             json!({
                 "apiVersion": "v1", "kind": "SecretList",
                 "items": [{
-                    "apiVersion": "v1", "kind": "Secret",
                     "metadata": {"name": "stripe", "namespace": "demo"}
                 }]
             }),
@@ -1583,6 +1707,8 @@ mod tests {
             .expect("list secrets")
             .expect("a list is always present");
         assert_eq!(got["items"][0]["metadata"]["name"], json!("stripe"));
+        assert_eq!(got["items"][0]["apiVersion"], json!("v1"));
+        assert_eq!(got["items"][0]["kind"], json!("Secret"));
 
         let seen = h.seen();
         assert!(
@@ -1639,6 +1765,331 @@ mod tests {
             h.seen().is_empty(),
             "unparseable args must not reach the apiserver: {:?}",
             h.seen()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // End-to-end: the bytes a scheduled run actually stages
+    // -----------------------------------------------------------------------
+    //
+    // Every test above stops at `get_json`'s return value. The defect it
+    // missed lived one layer further out: the engine wrote those values to
+    // disk, restic snapshotted them, and a restore piped them to
+    // `kubectl apply --server-side` — which is the ONLY consumer that needs
+    // `apiVersion`/`kind`, and the only one that was not in any test. So the
+    // gate below runs the REAL engine over `KubeRsExec` against a stub
+    // apiserver serving REAL list bodies, and reads the staged files back.
+
+    /// A [`ResticRunner`] that runs nothing. The gate is about the staged
+    /// TREE, which is complete before restic is invoked; `run_stdout` answering
+    /// `Ok` makes `ensure_repo` treat the repository as already present.
+    struct NoopRestic;
+
+    impl backup_core::ResticRunner for NoopRestic {
+        fn run(&self, _argv: &[String], _pass: &str) -> Result<()> {
+            Ok(())
+        }
+        fn run_stdout(&self, _argv: &[String], _pass: &str) -> Result<String> {
+            Ok("[]".to_string())
+        }
+        fn run_backup(&self, _argv: &[String], _pass: &str) -> Result<Option<String>> {
+            Ok(Some("stub-snapshot".to_string()))
+        }
+    }
+
+    /// Discovery + collection routes for a one-namespace cluster carrying one
+    /// of every CR the capture sweep stages, plus one imported certificate.
+    ///
+    /// The LIST bodies are the real apiserver shape: the type appears once, on
+    /// the List, and NOT on the items. The single-object GET (`PlatformStack`)
+    /// carries its own type, because a real single GET does — which is also why
+    /// that one path was never broken.
+    fn full_capture_routes() -> Vec<Route> {
+        let groups = json!({
+            "kind": "APIGroupList", "apiVersion": "v1",
+            "groups": [
+                {"name": "apprafter.io",
+                 "versions": [{"groupVersion": "apprafter.io/v1alpha1", "version": "v1alpha1"}],
+                 "preferredVersion": {"groupVersion": "apprafter.io/v1alpha1", "version": "v1alpha1"}},
+                {"name": "argoproj.io",
+                 "versions": [{"groupVersion": "argoproj.io/v1alpha1", "version": "v1alpha1"}],
+                 "preferredVersion": {"groupVersion": "argoproj.io/v1alpha1", "version": "v1alpha1"}},
+                {"name": "bitnami.com",
+                 "versions": [{"groupVersion": "bitnami.com/v1alpha1", "version": "v1alpha1"}],
+                 "preferredVersion": {"groupVersion": "bitnami.com/v1alpha1", "version": "v1alpha1"}}
+            ]
+        });
+        let apprafter_resources = json!({
+            "kind": "APIResourceList", "apiVersion": "v1",
+            "groupVersion": "apprafter.io/v1alpha1",
+            "resources": [
+                {"name": "applications", "singularName": "application", "namespaced": true,
+                 "kind": "Application", "verbs": ["get", "list"]},
+                {"name": "platformstacks", "singularName": "platformstack", "namespaced": true,
+                 "kind": "PlatformStack", "verbs": ["get", "list"]},
+                {"name": "resourceclaims", "singularName": "resourceclaim", "namespaced": true,
+                 "kind": "ResourceClaim", "verbs": ["get", "list"]},
+                {"name": "sharedvolumes", "singularName": "sharedvolume", "namespaced": true,
+                 "kind": "SharedVolume", "verbs": ["get", "list"]},
+                {"name": "sourcecredentials", "singularName": "sourcecredential",
+                 "namespaced": true, "kind": "SourceCredential", "verbs": ["get", "list"]}
+            ]
+        });
+        let argo_resources = json!({
+            "kind": "APIResourceList", "apiVersion": "v1",
+            "groupVersion": "argoproj.io/v1alpha1",
+            "resources": [{"name": "applications", "singularName": "application",
+                           "namespaced": true, "kind": "Application", "verbs": ["get", "list"]}]
+        });
+        let sealed_resources = json!({
+            "kind": "APIResourceList", "apiVersion": "v1",
+            "groupVersion": "bitnami.com/v1alpha1",
+            "resources": [{"name": "sealedsecrets", "singularName": "sealedsecret",
+                           "namespaced": true, "kind": "SealedSecret", "verbs": ["get", "list"]}]
+        });
+
+        // `list_of` builds a real List body: typed collection, UNTYPED items.
+        let list_of = |api_version: &str, kind: &str, items: Value| json!({"apiVersion": api_version, "kind": kind, "items": items});
+
+        vec![
+            ok_route("GET", "/apis", groups),
+            ok_route("GET", "/apis/apprafter.io/v1alpha1", apprafter_resources),
+            ok_route("GET", "/apis/argoproj.io/v1alpha1", argo_resources),
+            ok_route("GET", "/apis/bitnami.com/v1alpha1", sealed_resources),
+            ok_route("GET", "/api", core_version_list()),
+            ok_route("GET", "/api/v1", core_resource_list()),
+            // No claims — the extraction plan is empty, so no helper pod (and
+            // therefore no WebSocket) is needed for the sweep to complete.
+            ok_route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/namespaces/demo/resourceclaims",
+                list_of("apprafter.io/v1alpha1", "ResourceClaimList", json!([])),
+            ),
+            // PlatformStack: a single GET, which DOES carry its own type.
+            ok_route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/namespaces/apprafter-system/platformstacks/default",
+                json!({
+                    "apiVersion": "apprafter.io/v1alpha1", "kind": "PlatformStack",
+                    "metadata": {"name": "default", "namespace": "apprafter-system"},
+                    "spec": {"channel": "stable"}
+                }),
+            ),
+            ok_route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/sourcecredentials",
+                list_of(
+                    "apprafter.io/v1alpha1",
+                    "SourceCredentialList",
+                    json!([{
+                        "metadata": {"name": "gh", "namespace": "apprafter-system"},
+                        "spec": {"git": {"backend": {"type": "github"}}}
+                    }]),
+                ),
+            ),
+            ok_route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/applications",
+                list_of(
+                    "apprafter.io/v1alpha1",
+                    "ApplicationList",
+                    json!([{
+                        "metadata": {"name": "web", "namespace": "demo"},
+                        "spec": {"base": {"image": "nginx:1", "replicas": 2}}
+                    }]),
+                ),
+            ),
+            ok_route(
+                "GET",
+                "/apis/argoproj.io/v1alpha1/applications",
+                list_of(
+                    "argoproj.io/v1alpha1",
+                    "ApplicationList",
+                    json!([{
+                        "metadata": {
+                            "name": "web-prod", "namespace": "argocd",
+                            "labels": {"apprafter.io/managed-by": "apprafter"}
+                        },
+                        "spec": {"syncPolicy": {"automated": {}}}
+                    }]),
+                ),
+            ),
+            ok_route(
+                "GET",
+                "/apis/apprafter.io/v1alpha1/namespaces/demo/sharedvolumes",
+                list_of(
+                    "apprafter.io/v1alpha1",
+                    "SharedVolumeList",
+                    json!([{"metadata": {"name": "assets", "namespace": "demo"},
+                            "spec": {"size": "5Gi"}}]),
+                ),
+            ),
+            // No sealed secrets — the sealed sweep has nothing to read, which
+            // keeps this gate on the CR + certificate paths.
+            ok_route(
+                "GET",
+                "/apis/bitnami.com/v1alpha1/sealedsecrets",
+                list_of("bitnami.com/v1alpha1", "SealedSecretList", json!([])),
+            ),
+            // The imported TLS certificate, captured off a LIST — the object
+            // that reached `kubectl apply` as `{"data":…,"metadata":…,"type":…}`
+            // and blew up `ApplyImportedCerts` on the operator's restore.
+            ok_route(
+                "GET",
+                "/api/v1/namespaces/apprafter-system/secrets",
+                list_of(
+                    "v1",
+                    "SecretList",
+                    json!([{
+                        "metadata": {
+                            "name": "cf-cert", "namespace": "apprafter-system",
+                            "labels": {"apprafter.io/cert-mode": "imported"}
+                        },
+                        "type": "kubernetes.io/tls",
+                        "data": {"tls.crt": "eA==", "tls.key": "eQ=="}
+                    }]),
+                ),
+            ),
+        ]
+    }
+
+    /// Every `*.json` staged under `dir`, as `(relative path, parsed body)`.
+    fn staged_objects(dir: &Path) -> Vec<(String, Value)> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let body = std::fs::read(&p).expect("read a staged object");
+            out.push((
+                p.file_name().unwrap().to_string_lossy().into_owned(),
+                serde_json::from_slice(&body).expect("a staged object is JSON"),
+            ));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// INVARIANT (the gate that did not exist): every object the IN-CLUSTER
+    /// runner stages is a document `kubectl apply` will accept — it carries a
+    /// non-empty `apiVersion` AND `kind`.
+    ///
+    /// This is the whole defect, end to end. `restore` pipes these exact bytes
+    /// to `kubectl apply --server-side`, which rejects a body without them:
+    ///
+    /// ```text
+    /// error validating "STDIN": error validating data:
+    /// [apiVersion not set, kind not set]
+    /// ```
+    ///
+    /// Nothing inside the process ever needed the fields — the engine reads
+    /// `/spec` and `/metadata`, and the restore recovers the kind from the
+    /// staged FILENAME — so the whole pipeline was green while every snapshot
+    /// the scheduled CronJob wrote was unrestorable. The assertion is therefore
+    /// made on the FILES, not on a return value.
+    #[test]
+    fn every_object_the_runner_stages_carries_its_apiversion_and_kind() {
+        let h = Harness::new(full_capture_routes());
+        let staging = tempfile::tempdir().expect("staging tempdir");
+
+        let summary = backup_core::engine::run_backup_with_summary(
+            &h.exec,
+            &NoopRestic,
+            &backup_core::engine::BackupOpts {
+                repo: "/tmp/does-not-matter/repo".to_string(),
+                passphrase: "pw".to_string(),
+                cluster_id: "demo-cluster".to_string(),
+                cluster_uid: "11111111-2222-3333-4444-555555555555".to_string(),
+                created_at: "2026-09-14T00:00:00Z".to_string(),
+                platform_version: "0.2.65".to_string(),
+                namespaces: vec!["demo".to_string()],
+                is_subset: false,
+                staging_root: staging.path().to_path_buf(),
+                pg_image: "postgres:16-alpine".to_string(),
+                staging_mode: backup_core::StagingMode::Monolithic,
+                backup_host: Some("apprafter-backup".to_string()),
+            },
+        )
+        .expect("the capture sweep completes against the stub apiserver");
+
+        // The sweep really did capture everything, or an empty tree would pass
+        // the invariant vacuously.
+        assert_eq!(
+            (summary.cr_count, summary.cert_count),
+            (5, 1),
+            "expected PlatformStack + SourceCredential + Application + \
+             ArgoApplication + SharedVolume, and one imported certificate"
+        );
+
+        let data = staging.path().join("data");
+        let crs = staged_objects(&data.join("crs"));
+        let certs = staged_objects(&data.join(backup_core::engine::CERTS_DIR));
+        assert_eq!(crs.len(), 5, "staged CRs: {crs:?}");
+        assert_eq!(certs.len(), 1, "staged certificates: {certs:?}");
+
+        for (file, obj) in crs.iter().chain(certs.iter()) {
+            let api_version = obj.get("apiVersion").and_then(Value::as_str);
+            let kind = obj.get("kind").and_then(Value::as_str);
+            assert!(
+                api_version.is_some_and(|v| !v.is_empty()),
+                "staged {file} has no apiVersion — `kubectl apply` rejects it: {obj}"
+            );
+            assert!(
+                kind.is_some_and(|v| !v.is_empty()),
+                "staged {file} has no kind — `kubectl apply` rejects it: {obj}"
+            );
+        }
+
+        // And the identities are the RIGHT ones, not merely present: a wrong
+        // apiVersion is applied to the wrong CRD (or to nothing).
+        let typed: Vec<(&str, &str, &str)> = crs
+            .iter()
+            .chain(certs.iter())
+            .map(|(f, o)| {
+                (
+                    f.as_str(),
+                    o["apiVersion"].as_str().unwrap(),
+                    o["kind"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            typed,
+            vec![
+                (
+                    "000-PlatformStack-apprafter-system-default.json",
+                    "apprafter.io/v1alpha1",
+                    "PlatformStack"
+                ),
+                (
+                    "001-SourceCredential-apprafter-system-gh.json",
+                    "apprafter.io/v1alpha1",
+                    "SourceCredential"
+                ),
+                (
+                    "002-Application-demo-web.json",
+                    "apprafter.io/v1alpha1",
+                    "Application"
+                ),
+                (
+                    // The backup's own `ArgoApplication` tag is a FILENAME
+                    // convention; the object itself is an argoproj.io
+                    // `Application`, and that is what must be applied.
+                    "003-ArgoApplication-argocd-web-prod.json",
+                    "argoproj.io/v1alpha1",
+                    "Application"
+                ),
+                (
+                    "004-SharedVolume-demo-assets.json",
+                    "apprafter.io/v1alpha1",
+                    "SharedVolume"
+                ),
+                ("cf-cert.json", "v1", "Secret"),
+            ]
         );
     }
 }
