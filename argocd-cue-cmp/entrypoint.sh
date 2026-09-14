@@ -253,7 +253,13 @@ fi
 
 ar_ndirs=$(printf '%s\n' "$ar_dirs" | grep -c . || true)
 if [ "${ar_ndirs:-0}" -gt 1 ]; then
-    echo "::cue-cmp:: this path holds ${ar_ndirs} manifest packages; one registration is one package" >&2
+    # The FIRST line is what Argo CD truncates onto the Application tile,
+    # so it has to carry the whole finding — the directory list below is
+    # off-tile. This is the refusal most likely to fire on upgrade, and
+    # "2 manifest packages" without naming them sends the reader hunting.
+    # Same contract the four bundle_refuse summaries hold to.
+    ar_dirlist=$(printf '%s\n' "$ar_dirs" | tr '\n' ' ' | sed 's/  */, /g; s/, *$//')
+    echo "::cue-cmp:: this path holds ${ar_ndirs} manifest packages — ${ar_dirlist} — one registration is one package" >&2
     echo "" >&2
     echo "--- apprafter bundle check ---" >&2
     printf '%s\n' "$ar_dirs" | sed 's|^|  |' >&2

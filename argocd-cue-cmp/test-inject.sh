@@ -391,6 +391,12 @@ else
     fail=$((fail + 1))
 fi
 assert_contains "$ep_err" "manifest packages" "ADR 0063: the refusal names the ambiguity on stderr"
+# Argo CD truncates stderr onto the Application tile at the first line, so
+# the directory list on line 4 is off-tile. This is the refusal most likely
+# to fire on upgrade — it has to be actionable from line 1 alone, the same
+# contract the four bundle_refuse summaries hold to.
+assert_contains "$(printf '%s\n' "$ep_err" | head -1)" "./services/api/apprafter" \
+    "ADR 0063: the ambiguity refusal NAMES the packages on its first (tile) line"
 
 # ── ADR 0063: a helper SUB-package is not a second bundle ──
 #
