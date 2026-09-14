@@ -330,6 +330,21 @@ assert_rc() {  # $1 got, $2 want-shape (zero|nonzero), $3 label
     fi
 }
 
+# Reads `ep_out_bytes` from the last run_entrypoint_capture. Measured in
+# BYTES, not via `[[ -z "$ep_out" ]]`: a `$(…)` capture strips trailing
+# newlines and would read a stream of bare `---` separators as empty.
+assert_stdout_empty() {  # $1 label
+    local label=$1
+    if [[ "$ep_out_bytes" -eq 0 ]]; then
+        echo "PASS: $label (0 bytes)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL: $label — wrote $ep_out_bytes bytes to stdout; a partial stream prunes"
+        printf '%s\n' "$ep_out" >&2
+        fail=$((fail + 1))
+    fi
+}
+
 # ── ADR 0063: `services/api` registered alone renders ──────
 run_entrypoint_capture "$split_fx/services/api" "$schema_src"
 scrub_split_fixture
@@ -489,6 +504,192 @@ run_entrypoint_capture "$anc_fx" "" ""
 assert_rc "$ep_rc" zero "ADR 0063: ancestor arm — ARGOCD_APP_SOURCE_PATH unset renders (exit 0)"
 assert_contains "$ep_out" "name: ancestor-fallback" "ADR 0063: ancestor arm — without the variable the depth-1 manifest is NOT claimed"
 assert_absent "$ep_out" "ancestor-registered" "ADR 0063: ancestor arm — the two arms select different directories (the arm is live)"
+
+# ── ADR 0063 §Decision 5: intra-bundle consistency ─────────
+#
+# A manifest package is a BUNDLE (ADR 0062): one registration, one
+# namespace, one environment, every workload added/synced/removed
+# together. Four ways a bundle can contradict itself were undetected
+# before this change, and each was silently destructive. Measured on
+# these fixtures against the pre-guard entrypoint:
+#
+#   bundle-split-ns      rc=0, 2 documents — both rendered, and Argo CD's
+#                        single destination.namespace plus the CLI's
+#                        namespace picker each disagree with one of them.
+#   bundle-dup-name      rc=0, 2 documents — but ONE apiserver identity;
+#                        whichever is applied last silently wins.
+#   bundle-mixed-style   rc=0, 1 document — the Style-A branch returns
+#                        before the Style-B enumeration is reached, so
+#                        `mixed-wrapped` rides out as a stray top-level
+#                        key that the apiserver PRUNES without an error.
+#                        The discarded manifest never becomes an API
+#                        object, which is why no layer below this one
+#                        could ever have caught it.
+#   bundle-split-env     rc=0, 2 documents — and with a registered env,
+#                        `inject_env` overwrites `.spec.environment` on
+#                        both, erasing the divergence before anything
+#                        downstream could see it.
+#   bundle-env-partial   rc=0, 2 documents — the partial form: one
+#                        workload declares an environment, its sibling
+#                        deploys base-only.
+#
+# NONE of these is reachable from the admission webhook: it receives one
+# object per AdmissionReview and has no kube client, so it has no sibling
+# to compare against (ADR 0063 §Decision 5 records why giving it one is
+# worse than the gap).
+#
+# Each case asserts ALL THREE of:
+#   1. non-zero exit;
+#   2. stdout EMPTY — the exit code alone would also pass for a run that
+#      had already flushed a partial stream, which is the pruning shape;
+#   3. the specific summary on stderr, since that first line is what Argo
+#      CD shows on the Application tile.
+bundlens_fx="$script_dir/testdata/bundle-split-ns"
+bundledup_fx="$script_dir/testdata/bundle-dup-name"
+bundlemixed_fx="$script_dir/testdata/bundle-mixed-style"
+bundleenv_fx="$script_dir/testdata/bundle-split-env"
+bundleenvp_fx="$script_dir/testdata/bundle-env-partial"
+bundleforeign_fx="$script_dir/testdata/bundle-foreign-kind"
+
+scrub_bundle_fixtures() {
+    find "$bundlens_fx" "$bundledup_fx" "$bundlemixed_fx" "$bundleenv_fx" "$bundleenvp_fx" \
+        "$bundleforeign_fx" \
+        \( -name cue.mod -type d -o -name apprafter_claim_gen.cue -type f \) \
+        -prune -exec rm -rf {} +
+}
+trap 'cleanup; scrub_claim_fixture; scrub_claima_fixture; scrub_split_fixture; scrub_helper_fixture; scrub_nested_fixture; scrub_bundle_fixtures' EXIT
+scrub_bundle_fixtures
+
+# ── §5: two namespaces in one package ──────────────────────
+run_entrypoint_capture "$bundlens_fx" "$schema_src"
+scrub_bundle_fixtures
+assert_rc "$ep_rc" nonzero "ADR 0063 §5: two namespaces in one package REFUSE"
+assert_stdout_empty "ADR 0063 §5: two namespaces write NOTHING to stdout"
+assert_contains "$ep_err" "bundle is inconsistent" "ADR 0063 §5: namespaces — the refusal marker is on stderr"
+assert_contains "$ep_err" "2 different namespaces" "ADR 0063 §5: namespaces — the summary names the divergence"
+assert_contains "$ep_err" 'nsOne -> "one"' "ADR 0063 §5: namespaces — the summary names the first workload AND its value"
+assert_contains "$ep_err" 'nsTwo -> "two"' "ADR 0063 §5: namespaces — the summary names the second workload AND its value"
+assert_absent "$ep_err" "spec.environment:" "ADR 0063 §5: namespaces — the environment check does not also fire"
+
+# ── §5: duplicate (namespace, name) ────────────────────────
+run_entrypoint_capture "$bundledup_fx" "$schema_src"
+scrub_bundle_fixtures
+assert_rc "$ep_rc" nonzero "ADR 0063 §5: duplicate (namespace, name) REFUSES"
+assert_stdout_empty "ADR 0063 §5: duplicate identity writes NOTHING to stdout"
+assert_contains "$ep_err" "share one (namespace, name)" "ADR 0063 §5: identity — the summary names the rule"
+assert_contains "$ep_err" "dup-demo/dup-app" "ADR 0063 §5: identity — the summary names the colliding identity"
+assert_contains "$ep_err" "dupOne, dupTwo" "ADR 0063 §5: identity — the summary names both workloads that declared it"
+
+# ── §5: Style A mixed with Style B ─────────────────────────
+run_entrypoint_capture "$bundlemixed_fx" "$schema_src"
+scrub_bundle_fixtures
+assert_rc "$ep_rc" nonzero "ADR 0063 §5: mixed Style A / Style B REFUSES"
+assert_stdout_empty "ADR 0063 §5: mixed style writes NOTHING to stdout"
+assert_contains "$ep_err" "package-scope manifest mixed with named wrapper" "ADR 0063 §5: mixed style — the summary names the finding"
+assert_contains "$ep_err" "wrapped" "ADR 0063 §5: mixed style — the summary names the wrapper that would have been dropped"
+# The whole point of this one: before the guard the wrapped manifest was
+# silently discarded by the Style-A dispatch, so the package-scope
+# document rendered ALONE with rc=0.
+assert_absent "$ep_out" "mixed-package-scope" "ADR 0063 §5: mixed style — the package-scope manifest is NOT emitted either"
+
+# ── §5: two environments in one package ────────────────────
+run_entrypoint_capture "$bundleenv_fx" "$schema_src"
+scrub_bundle_fixtures
+assert_rc "$ep_rc" nonzero "ADR 0063 §5: two environments in one package REFUSE"
+assert_stdout_empty "ADR 0063 §5: two environments write NOTHING to stdout"
+assert_contains "$ep_err" "2 different environments" "ADR 0063 §5: environments — the summary names the divergence"
+assert_contains "$ep_err" 'envOne -> "dev"' "ADR 0063 §5: environments — the summary names the first workload AND its value"
+assert_contains "$ep_err" 'envTwo -> "prod"' "ADR 0063 §5: environments — the summary names the second workload AND its value"
+
+# The guard must run BEFORE inject_env, which sets `.spec.environment`
+# on every document unconditionally — after it, the divergence reads as
+# agreement. Registering an env is exactly the case where that erasure
+# happens, so the refusal has to survive it.
+run_entrypoint_capture_env() {  # $1 fixture root, $2 schema_src, $3 env value
+    local root=$1 schema_src=$2 env_val=$3 out_file err_file
+    out_file=$(mktemp)
+    err_file=$(mktemp)
+    set +e
+    ( cd "$root" && unset APPRAFTER_APP_ENV ARGOCD_APP_SOURCE_PATH \
+        && APPRAFTER_SCHEMA_SRC="$schema_src" ARGOCD_ENV_APPRAFTER_APP_ENV="$env_val" \
+           bash "$entrypoint" ) >"$out_file" 2>"$err_file"
+    ep_rc=$?
+    set -e
+    ep_out=$(cat "$out_file")
+    ep_err=$(cat "$err_file")
+    ep_out_bytes=$(wc -c < "$out_file" | tr -d '[:space:]')
+    rm -f "$out_file" "$err_file"
+}
+run_entrypoint_capture_env "$bundleenv_fx" "$schema_src" "staging"
+scrub_bundle_fixtures
+assert_rc "$ep_rc" nonzero "ADR 0063 §5: environments — the refusal survives a REGISTERED env (guard runs before inject_env)"
+assert_stdout_empty "ADR 0063 §5: environments — nothing on stdout with a registered env either"
+assert_contains "$ep_err" "2 different environments" "ADR 0063 §5: environments — inject_env has not erased the divergence"
+
+# ── §5: one workload declares an environment, its sibling does not ──
+#
+# The decision the guard makes, tested rather than merely commented: an
+# absent `spec.environment` is the BASE-ONLY deploy, a deployment
+# semantic of its own and not a blank waiting for a registration-level
+# default (there is no `destination.environment`). So "declared on one,
+# absent on the other" counts as a divergence. All-absent is the normal
+# case and is covered by the Style-B fixture at the top of this file,
+# which must keep rendering both documents.
+run_entrypoint_capture "$bundleenvp_fx" "$schema_src"
+scrub_bundle_fixtures
+assert_rc "$ep_rc" nonzero "ADR 0063 §5: declared-vs-absent environment REFUSES"
+assert_stdout_empty "ADR 0063 §5: declared-vs-absent environment writes NOTHING to stdout"
+assert_contains "$ep_err" "2 different environments" "ADR 0063 §5: declared-vs-absent — absent counts as its own value"
+assert_contains "$ep_err" "(not declared)" "ADR 0063 §5: declared-vs-absent — the summary spells out the absent side"
+
+# ── §5: `kind: Application` from a FOREIGN apiVersion is not a workload ──
+#
+# The cross-workload checks key on apiVersion AND kind, never kind alone.
+# Argo CD's own CRD is `argoproj.io/v1alpha1, kind: Application` — the one
+# foreign apiVersion that collides exactly with ours — and a package may
+# legitimately ship one beside the workload it registers. It lives in the
+# `argocd` namespace and carries no spec.environment, so a kind-only
+# filter reads this package as two namespaces AND two environments and
+# refuses a bundle that is not inconsistent.
+#
+# Measured on the kind-only filter this fixture was written against:
+# `rc=1 … 2 different namespaces — web -> "apprafter", argoApp ->
+# "argocd"`, where the revision before the guards rendered BOTH documents
+# at rc=0 — i.e. a behaviour change, and broader than ADR 0063
+# §Decision 5, whose table speaks of WORKLOADS. Safe in direction (a loud
+# refusal applies nothing) but wrong.
+#
+# Mutation-tested: dropping the `startswith("apprafter.io/")` predicate
+# flips exactly this case and leaves all five inconsistent fixtures red.
+run_entrypoint_capture "$bundleforeign_fx" "$schema_src"
+scrub_bundle_fixtures
+assert_rc "$ep_rc" zero "ADR 0063 §5: a foreign Application-kind object does NOT make the bundle inconsistent (exit 0)"
+assert_count "$ep_out" "---" 2 "ADR 0063 §5: foreign kind — BOTH documents are still emitted"
+assert_contains "$ep_out" "name: foreign-web" "ADR 0063 §5: foreign kind — the AppRafter workload is emitted"
+assert_contains "$ep_out" "name: foreign-argo" "ADR 0063 §5: foreign kind — the argoproj.io object is emitted"
+assert_absent "$ep_err" "bundle is inconsistent" "ADR 0063 §5: foreign kind — no refusal (the apiVersion predicate is live)"
+
+# ── §5: the consistent bundles must be UNAFFECTED ──────────
+#
+# The strongest non-regression signal available off-cluster: a package
+# with TWO workloads that agree on everything the guards check must still
+# render BOTH documents, silently. `inject-fixture-multi` is exactly that
+# (one namespace — neither declares any — distinct names, no environment
+# on either), so it is re-run here through the refusal-aware capture so
+# rc and stderr are asserted, not just the stdout the cases above check.
+run_entrypoint_capture "$style_b" ""
+assert_rc "$ep_rc" zero "ADR 0063 §5: a CONSISTENT two-workload bundle still renders (exit 0)"
+assert_count "$ep_out" "---" 2 "ADR 0063 §5: a consistent two-workload bundle still emits BOTH documents"
+assert_absent "$ep_err" "bundle is inconsistent" "ADR 0063 §5: a consistent bundle triggers no refusal"
+
+# A Style-A (unwrapped) package renders exactly ONE row into the guards'
+# table, so all three cross-workload checks are no-ops on it. That is
+# what keeps every single-manifest layout working; assert it rather than
+# assume it.
+run_entrypoint_capture "$style_a" ""
+assert_rc "$ep_rc" zero "ADR 0063 §5: a Style-A package still renders (exit 0)"
+assert_contains "$ep_out" "name: inject-fixture" "ADR 0063 §5: the Style-A manifest is still emitted"
+assert_absent "$ep_err" "bundle is inconsistent" "ADR 0063 §5: a Style-A package triggers no refusal"
 
 echo ""
 echo "Summary: $pass passed, $fail failed"

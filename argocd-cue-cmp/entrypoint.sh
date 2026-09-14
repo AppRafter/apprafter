@@ -562,6 +562,32 @@ json_out=$(mktemp)
 err_out=$(mktemp)
 trap 'rm -f "$json_out" "$err_out"' EXIT
 
+# ── bundle_refuse — one shape for every intra-bundle refusal ──
+#
+# ADR 0063 §Decision 5. The FIRST line is what Argo CD puts on the
+# Application tile, and the tile is usually all the operator reads, so it
+# carries the whole finding — which workloads, and which values they
+# disagree on — not a category name. The block below it is for the sync
+# log, where there is room to say what the rule is and what to change.
+#
+# Returns 1 rather than exiting: render_package's contract is that it
+# never exits in its own shell (the driver's bare `( … )` turns a
+# non-zero return into the script's status). Call it as
+# `bundle_refuse … || return 1` — the `||` keeps `set -e` from firing on
+# the helper's own non-zero return before the explicit `return` runs,
+# and the helper body is echo/printf only, so nothing inside it needs
+# `set -e` to stay armed.
+bundle_refuse() {  # $1 = one-line summary (the Argo CD tile message), $2 = detail block
+    echo "::cue-cmp:: bundle is inconsistent: $1" >&2
+    echo "" >&2
+    echo "--- apprafter bundle check ---" >&2
+    printf '%s\n' "$2" >&2
+    echo "" >&2
+    echo "Nothing from this path was applied; the resources already running" >&2
+    echo "are untouched. Check locally with \`apprafter app validate\`." >&2
+    return 1
+}
+
 # ── render_package — render ONE package directory ──────────
 #
 # Runs with cwd already set to the package directory by the driver at
@@ -606,6 +632,263 @@ render_package() {
         echo "--- full cue export stderr ---" >&2
         cat "$err_out" >&2
         return 1
+    fi
+
+    # ── Intra-bundle consistency (ADR 0063 §Decision 5) ────────
+    #
+    # `$json_out` now holds the WHOLE package as one JSON document. This
+    # is the only point in the pipeline where every workload of a bundle
+    # is visible at once, so the four ways a bundle can contradict itself
+    # are checked here — all as `jq`/`awk` over data already in hand: no
+    # extra `cue` invocation, no cluster access.
+    #
+    # Not at the admission webhook, and that is a decision rather than a
+    # convenience. It receives ONE object per `AdmissionReview` and is
+    # given no kube client, so it has no sibling to compare against; ADR
+    # 0063 §Decision 5 records why giving it one is worse than the gap —
+    # the first workload of a bundle is admitted while the rest are
+    # rejected, so the bundle lands HALF-APPLIED with the error attributed
+    # to innocent members, and `failurePolicy: Fail` with no
+    # `namespaceSelector` takes the cluster's own recovery writes down
+    # with it.
+    #
+    # Placement inside render_package is load-bearing twice over:
+    #
+    #   * BEFORE the Style-A/Style-B dispatch below. The dispatch is what
+    #     DISCARDS a mixed-style package's named wrappers — after it,
+    #     there is nothing left to see.
+    #   * BEFORE `inject_env`, which sets `.spec.environment` on every
+    #     document unconditionally. After it, an environment divergence
+    #     reads as agreement.
+    #
+    # Every refusal exits non-zero having written NOTHING to stdout. Argo
+    # CD discards a failed generate's stdout anyway (v2.13.1
+    # `cmpserver/plugin/plugin.go`), but the guarantee is kept on THIS
+    # side of the contract rather than leased from that behaviour: a
+    # partial stream under `syncPolicy.automated.prune` is the
+    # destructive shape, and the test asserts 0 bytes for exactly that
+    # reason.
+
+    # (1) Style A mixed with Style B — a package-scope manifest that ALSO
+    # carries k8s-shaped named children. Checked FIRST, because the row
+    # table below cannot see past it: for a mixed package the table takes
+    # the package-scope branch and the wrappers are invisible to it.
+    #
+    # This is the one inconsistency the render layer is the ONLY possible
+    # place to catch. The dispatch takes the Style-A branch and returns;
+    # the named wrapper is not dropped by any validator, it rides out as a
+    # stray top-level key of the emitted document, and the apiserver
+    # PRUNES an unknown top-level key without an error. The discarded
+    # manifest never becomes an API object at all, so there is nothing
+    # downstream left to inspect it.
+    mixed=$(jq -r '
+        if (type=="object" and has("apiVersion") and has("kind")) then
+            [to_entries[] | select(.value|type=="object" and has("apiVersion") and has("kind")) | .key]
+            | if length > 0 then join(", ") else "" end
+        else "" end' "$json_out")
+    if [ -n "$mixed" ]; then
+        bundle_detail=$(cat <<MIXEDEOF
+This package declares a manifest at PACKAGE SCOPE (bare apiVersion /
+kind / metadata / spec) and ALSO these named wrappers:
+
+  ${mixed}
+
+Only one of the two layouts is rendered. The package-scope manifest
+wins, and each named wrapper rides out as an extra top-level key inside
+it — which the apiserver removes without reporting anything. The
+wrapped workload would simply never appear, and nothing would say why.
+
+Pick one layout for the whole package: either move the package-scope
+apiVersion/kind/metadata/spec into a named wrapper of its own, or fold
+the wrapped manifests into the package scope (only one manifest fits
+there, so several wrappers means the first option).
+MIXEDEOF
+)
+        bundle_refuse \
+            "package-scope manifest mixed with named wrapper(s) ${mixed} — only one layout renders, the rest are silently dropped" \
+            "$bundle_detail" || return 1
+    fi
+
+    # The other three checks compare across the package's AppRafter
+    # `Application` values. ONE tab-separated table, derived once:
+    #
+    #   field 1  the top-level key (or "(package scope)" when unwrapped)
+    #   field 2  metadata.namespace   ("" when not declared)
+    #   field 3  metadata.name        ("" when not declared)
+    #   field 4  spec.environment     ("" when not declared)
+    #
+    # The filter is `apiVersion` AND `kind`, never `kind` alone. `kind:
+    # "Application"` does not by itself make an object a workload of this
+    # bundle: Argo CD's own CRD is `argoproj.io/v1alpha1, kind:
+    # Application` — the one foreign apiVersion that collides exactly with
+    # ours — and a package may legitimately ship one beside the workload
+    # it registers. Keyed on `kind` alone, such a package reads as two
+    # namespaces (`argocd` is where Argo CD's Applications must live) and
+    # two environments, and is refused though nothing about it is
+    # inconsistent. Measured on `testdata/bundle-foreign-kind/`: without
+    # the apiVersion predicate, `rc=1 … 2 different namespaces — web ->
+    # "apprafter", argoApp -> "argocd"`, where the revision before these
+    # guards rendered both documents at rc=0. The refusal direction is
+    # safe — nothing is applied — but ADR 0063 §Decision 5's table speaks
+    # of WORKLOADS, and this is broader than that.
+    #
+    # The mixed-style check at (1) deliberately does NOT carry this
+    # predicate, and the asymmetry is the point: a foreign apiVersion+kind
+    # CHILD really would ride out as a stray top-level key and be pruned
+    # in silence, whoever's API group it belongs to. There the question is
+    # "will this document survive the render", which is group-agnostic;
+    # here it is "is this a workload of this bundle", which is not.
+    #
+    # For an UNWRAPPED (Style A) package this yields exactly ONE row, so
+    # all three checks below are no-ops by construction — which is what
+    # keeps every Style-A layout rendering exactly as it did before.
+    bundle_rows=$(jq -r '
+        if (type=="object" and has("apiVersion") and has("kind")) then [{k:"(package scope)",v:.}]
+        else [to_entries[] | select(.value|type=="object" and has("apiVersion") and has("kind")) | {k:.key,v:.value}]
+        end
+        | map(select(.v.kind == "Application"
+                     and (.v.apiVersion | tostring | startswith("apprafter.io/"))))
+        | .[] | "\(.k)\t\(.v.metadata.namespace // "")\t\(.v.metadata.name // "")\t\(.v.spec.environment // "")"
+        ' "$json_out")
+
+    # (2) Divergent `metadata.namespace`.
+    #
+    # Divergent means TWO OR MORE DISTINCT NON-EMPTY values. An absent
+    # namespace is deliberately NOT counted as a third value here: Argo CD
+    # fills it in from the registration's `destination.namespace`, which
+    # this layer cannot see, so an absent one may well resolve to the same
+    # namespace its sibling declares and refusing would be a guess. (The
+    # environment check at (4) reasons the opposite way, for a reason
+    # stated there — the two are not inconsistent, they differ because one
+    # field has a registration-level default and the other does not.)
+    #
+    # `grep -c` exits NON-ZERO on a zero count, and under `set -e` a
+    # failing command substitution in an assignment aborts the script —
+    # with no stdout and no stderr, indistinguishable from a successful
+    # empty render, which prunes. `|| true` is the same hardening the
+    # package-location block above applies for the same reason.
+    ns_n=$(printf '%s\n' "$bundle_rows" | cut -f2 | sed -n '/./p' | sort -u | grep -c . || true)
+    if [ "${ns_n:-0}" -gt 1 ]; then
+        ns_pairs=$(printf '%s\n' "$bundle_rows" \
+            | awk -F'\t' 'NF && $2 != "" { printf "%s%s -> \"%s\"", (n++ ? ", " : ""), $1, $2 }')
+        ns_lines=$(printf '%s\n' "$bundle_rows" \
+            | awk -F'\t' 'NF { printf "  %-24s metadata.namespace: %s\n", $1, ($2 == "" ? "(not declared)" : $2) }')
+        bundle_detail=$(cat <<NSEOF
+${ns_lines}
+
+One manifest package is one bundle: one registration, one namespace.
+Argo CD applies every document this render emits into the single
+destination namespace of the registration, so a second namespace
+declared here cannot be honoured — the workload would land somewhere
+nobody registered, or not at all.
+
+Give every workload in this package the same metadata.namespace. If they
+genuinely belong to different namespaces they are different bundles: put
+them in separate directories and register each with its own
+\`apprafter app add --path\`.
+NSEOF
+)
+        bundle_refuse \
+            "workloads declare ${ns_n} different namespaces — ${ns_pairs}" \
+            "$bundle_detail" || return 1
+    fi
+
+    # (3) Duplicate identity — `(namespace, name)` TOGETHER, never either
+    # alone. Two workloads may share a name in different namespaces, and
+    # must share a namespace to be a bundle at all; it is the pair that
+    # names one object.
+    #
+    # An absent namespace participates in the key as its own value: two
+    # workloads that both omit it and share a name resolve to one object
+    # under whatever destination namespace the registration carries, which
+    # is the same collision.
+    dup_lines=$(printf '%s\n' "$bundle_rows" | awk -F'\t' '
+        NF {
+            id = ($2 == "" ? "(no namespace)" : $2) "/" $3
+            if (!(id in n)) { order[++c] = id }
+            n[id]++
+            who[id] = (who[id] == "" ? $1 : who[id] ", " $1)
+        }
+        END {
+            for (i = 1; i <= c; i++)
+                if (n[order[i]] > 1)
+                    printf "  %-28s declared by: %s\n", order[i], who[order[i]]
+        }')
+    if [ -n "$dup_lines" ]; then
+        dup_pairs=$(printf '%s\n' "$dup_lines" \
+            | awk 'NF { sub(/^ +/, ""); gsub(/  +/, " "); printf "%s%s", (n++ ? "; " : ""), $0 }')
+        bundle_detail=$(cat <<DUPEOF
+${dup_lines}
+
+Two CUE values, two rendered documents — but ONE object. Kubernetes
+identifies an Application by (namespace, name), so whichever document is
+applied last overwrites the other in place. One of these workloads would
+never run, and neither the render nor the sync would report that a
+choice had been made.
+
+Rename one of them (metadata.name), or move it to a namespace of its own
+— in which case it is a separate bundle and wants its own directory and
+its own \`apprafter app add --path\`.
+DUPEOF
+)
+        bundle_refuse \
+            "two workloads share one (namespace, name) — ${dup_pairs}" \
+            "$bundle_detail" || return 1
+    fi
+
+    # (4) Divergent `spec.environment`.
+    #
+    # Here an ABSENT value IS counted, as its own distinct value, and that
+    # is a deliberate choice rather than an inconsistency with (2).
+    #
+    # Rationale: an absent `spec.environment` is not "unspecified pending a
+    # default", it is the BASE-ONLY deploy — a different deployment
+    # semantic from `environment: "dev"`, documented as such in
+    # schemas/v1alpha1/application.cue. Unlike a namespace there is no
+    # `destination.environment` on the registration to fill it in, so
+    # "declared on one workload, absent on its sibling" is a real
+    # divergence the reader can act on, not a guess this layer is making.
+    # Every workload absent is therefore ONE distinct value, which is the
+    # normal single-environment bundle and stays silent.
+    #
+    # The counter-argument, on the record because it is not weightless:
+    # when the registration DOES carry an environment
+    # (`apprafter app add --env`), `inject_env` overwrites every document
+    # with that one value, so neither divergence survives to the cluster.
+    # It is refused anyway, for the same reason ADR 0063 refuses the
+    # dev-vs-prod case it lists explicitly: the manifest says something
+    # its author believes, the injection silently contradicts it, and this
+    # is the last layer that can tell them.
+    env_n=$(printf '%s\n' "$bundle_rows" \
+        | awk -F'\t' 'NF { print ($4 == "" ? "(not declared)" : $4) }' | sort -u | grep -c . || true)
+    if [ "${env_n:-0}" -gt 1 ]; then
+        env_pairs=$(printf '%s\n' "$bundle_rows" \
+            | awk -F'\t' 'NF { printf "%s%s -> %s", (n++ ? ", " : ""), $1, ($4 == "" ? "(not declared)" : "\"" $4 "\"") }')
+        env_lines=$(printf '%s\n' "$bundle_rows" \
+            | awk -F'\t' 'NF { printf "  %-24s spec.environment: %s\n", $1, ($4 == "" ? "(not declared — base-only deploy)" : $4) }')
+        bundle_detail=$(cat <<ENVEOF
+${env_lines}
+
+One manifest package is one bundle: one registration, one environment.
+The environment belongs to the REGISTRATION (\`apprafter app add --env\`),
+which stamps the same value onto every document of the package — so a
+per-workload spec.environment that disagrees with its siblings either
+splits one bundle across two environments, or is quietly overwritten and
+never takes effect.
+
+A workload with no spec.environment deploys its base only, which is its
+own environment as far as this check is concerned — so "declared on one,
+absent on the other" counts too.
+
+Either give every workload in this package the same spec.environment (or
+drop it from all of them and select the environment at registration
+time), or split them into separate directories and register each with
+its own \`--env\`.
+ENVEOF
+)
+        bundle_refuse \
+            "workloads declare ${env_n} different environments — ${env_pairs}" \
+            "$bundle_detail" || return 1
     fi
 
     # Two source-layout conventions are accepted:
