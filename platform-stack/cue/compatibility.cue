@@ -1881,27 +1881,31 @@ compatibility: "0.2.70": {
 	operatorVersion: "v0.2.49"
 	notes: """
 		Moves the backup-runner image pin to
-		`apprafter-backup:v0.2.66`, and that is the whole point of the
-		version: v0.2.65 — what 0.2.69 pinned — writes snapshots that
-		CANNOT BE RESTORED.
+		`apprafter-backup:v0.2.66`. Take it if this cluster has an
+		IMPORTED TLS CERTIFICATE: on v0.2.65 the scheduled runner stages
+		that certificate without its `apiVersion`/`kind`, and a restore
+		from such a snapshot dies at its first apply with
+		`error validating data: [apiVersion not set, kind not set]` —
+		after the replacement cluster has already been provisioned and
+		bootstrapped.
 
-		The in-cluster runner lists objects through kube-rs, and a real
-		apiserver does not repeat `apiVersion`/`kind` on the items of a
-		List (they are implied by the List's own kind). So every object
-		the runner staged carried neither, and a restore from such a
-		snapshot dies at its first apply with `error validating data:
-		[apiVersion not set, kind not set]` — after the new cluster has
-		been provisioned and bootstrapped. Snapshots taken by the CLI
-		are unaffected: kubectl's own `-o json` carries the fields, which
-		is why every harness-captured backup restored cleanly and this
-		reached an operator instead of a gate.
+		The mechanism is narrow and worth stating exactly, because the
+		obvious wider reading is wrong. The runner lists through kube-rs,
+		which reads the apiserver's List response verbatim. Measured
+		against a real apiserver: items of a CUSTOM-resource list DO
+		carry `apiVersion`/`kind`, while items of a CORE list (Secrets)
+		do NOT — kubectl adds them client-side, which is why a backup
+		taken with `apprafter backup create` was never affected. So
+		Applications, SourceCredentials and SharedVolumes were always
+		staged complete; the imported certificate, captured from a core
+		Secret listing, was the one object that was not. A cluster with
+		no imported certificate has nothing to repair.
 
-		This is the DEFAULT backup mode. A cluster on 0.2.69 or earlier
-		holds scheduled snapshots that will fail this way, so the pin
-		move is not an improvement but a repair. The CLI half of the fix
-		also teaches a restore to supply the missing fields from what it
-		already knows — the kind is in the staged filename — so snapshots
-		ALREADY WRITTEN become restorable without being re-taken.
+		The CLI half of the same fix supplies a missing type from what a
+		restore already knows — the kind is in the staged filename — so a
+		snapshot ALREADY written becomes restorable without being
+		re-taken, and this pin move only stops new ones being written
+		that way.
 
 		No CRD, schema or component change; the operator chart is
 		unchanged at v0.2.49.
