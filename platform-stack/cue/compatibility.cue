@@ -1876,6 +1876,39 @@ compatibility: "0.2.69": {
 	]
 }
 
+compatibility: "0.2.70": {
+	change:          "safe"
+	operatorVersion: "v0.2.49"
+	notes: """
+		Moves the backup-runner image pin to
+		`apprafter-backup:v0.2.66`, and that is the whole point of the
+		version: v0.2.65 — what 0.2.69 pinned — writes snapshots that
+		CANNOT BE RESTORED.
+
+		The in-cluster runner lists objects through kube-rs, and a real
+		apiserver does not repeat `apiVersion`/`kind` on the items of a
+		List (they are implied by the List's own kind). So every object
+		the runner staged carried neither, and a restore from such a
+		snapshot dies at its first apply with `error validating data:
+		[apiVersion not set, kind not set]` — after the new cluster has
+		been provisioned and bootstrapped. Snapshots taken by the CLI
+		are unaffected: kubectl's own `-o json` carries the fields, which
+		is why every harness-captured backup restored cleanly and this
+		reached an operator instead of a gate.
+
+		This is the DEFAULT backup mode. A cluster on 0.2.69 or earlier
+		holds scheduled snapshots that will fail this way, so the pin
+		move is not an improvement but a repair. The CLI half of the fix
+		also teaches a restore to supply the missing fields from what it
+		already knows — the kind is in the staged filename — so snapshots
+		ALREADY WRITTEN become restorable without being re-taken.
+
+		No CRD, schema or component change; the operator chart is
+		unchanged at v0.2.49.
+		"""
+	references: ["docs/adr/0050-backup-restore.md"]
+}
+
 compatibility: "0.2.68": {
 	change:          "safe"
 	operatorVersion: "v0.2.48"
