@@ -1876,6 +1876,54 @@ compatibility: "0.2.69": {
 	]
 }
 
+compatibility: "0.2.71": {
+	change:          "safe"
+	operatorVersion: "v0.2.49"
+	notes: """
+		Comment-only correction in `component_cilium.cue`, at the
+		three keys a fresh cluster's public ingress depends on.
+		**No component values changed**: `templates/` and every
+		component's values render identical to 0.2.70 (verified
+		by diffing the two renders — only the version stamp and
+		this compatibility row differ), so the upgrade restarts
+		nothing and is not a datapath event. Taking it is
+		optional; it carries no fix, only the reason one
+		already-shipped fix must stay.
+
+		`rollOutCiliumPods` / `operator.rollOutPods` /
+		`envoy.rollOutPods` were added in 0.2.32 and annotated
+		"Fresh installs are unaffected — purely
+		upgrade-correctness." That is false, and it argued for
+		deleting the keys it annotated.
+
+		A fresh install is two-phase by construction:
+		`cluster-bootstrap` helm-installs Cilium from the loader
+		values, which carry no gatewayAPI key because the Gateway
+		API CRDs do not exist yet; Argo CD then lands those CRDs
+		at wave -25 and re-applies Cilium at wave -20 with
+		gatewayAPI on, at the SAME chart version. Cilium reads
+		`enable-gateway-api` only at process start, and nothing in
+		a same-version upgrade forces a rollout except a pod
+		template difference — which is exactly what these three
+		keys produce. Without them the wave -20 apply rewrites
+		`cilium-config` and stops: the Gateway API controller
+		never registers, no Gateway reaches Programmed, nothing
+		listens on 80/443, and every Argo CD Application still
+		reports Synced/Healthy.
+
+		`e2e/gateway-walk.sh` now installs Cilium WITHOUT
+		gatewayAPI, lands the CRDs, then upgrades — the
+		production order — and asserts every cilium agent and
+		operator pod was replaced. Until this release it did a
+		single gateway-enabled `helm install` and could not
+		observe the keys at all.
+		"""
+	references: [
+		"platform-stack/cue/component_cilium.cue",
+		"e2e/gateway-walk.sh",
+	]
+}
+
 compatibility: "0.2.70": {
 	change:          "safe"
 	operatorVersion: "v0.2.49"

@@ -114,10 +114,45 @@ _components: cilium: #Component & {
 		// pod when the `cilium-config` ConfigMap changes (a config checksum is
 		// stamped on the pod template). This SUPERSEDES the earlier
 		// `operator.podAnnotations.cilium-config-rev` rev-bump (which rolled
-		// ONLY the operator). Fresh installs are unaffected (pods start with
-		// the final config) — purely upgrade-correctness. Docs: cilium "many
-		// configuration changes require an agent restart"; the Gateway API
-		// enable guide literally rolls cilium-operator + ds/cilium.
+		// ONLY the operator). Docs: cilium "many configuration changes require
+		// an agent restart"; the Gateway API enable guide literally rolls
+		// cilium-operator + ds/cilium.
+		//
+		// CORRECTION (0.2.71, 2026-09-14). The line above used to end "Fresh
+		// installs are unaffected (pods start with the final config) — purely
+		// upgrade-correctness." That is FALSE, and it argued for deleting the
+		// very keys it annotated. A FRESH install is the same case, because
+		// the install is two-phase by construction:
+		//
+		//   1.  `cluster-bootstrap` helm-installs Cilium from
+		//       `_loaderValues.cilium.values`, which carry NO gatewayAPI key
+		//       (the Gateway API CRDs do not exist yet — see
+		//       `component_gateway-api-crds.cue`). Those pods therefore start
+		//       with gateway-api OFF.
+		//   2.  Argo CD applies `gateway-api-crds` at wave -25.
+		//   2b. Argo CD applies THIS component at wave -20, gatewayAPI ON, at
+		//       the SAME chart version — so the image never changes and
+		//       NOTHING about the upgrade forces a rollout except a pod
+		//       template difference.
+		//
+		// So on a fresh cluster these three keys are the entire mechanism by
+		// which the cilium pods ever see the Gateway API. Without them the
+		// wave -20 apply rewrites `cilium-config` and stops there: the pods
+		// keep the pre-CRD view forever, the Gateway API controller never
+		// registers, no Gateway reaches Programmed, nothing listens on the
+		// node's 80/443 — and every Argo CD Application still reports
+		// Synced/Healthy, because the ConfigMap really was updated. An
+		// operator met that as a Cloudflare 521 over a cluster whose every
+		// health check said it was fine.
+		//
+		// `e2e/gateway-walk.sh` now runs that two-phase sequence (Phases 1 →
+		// 2 → 2b) instead of a single gateway-enabled `helm install`, and its
+		// Phase 2b asserts every agent + operator pod was REPLACED by the
+		// upgrade. It is the regression guard for these three keys; the old
+		// one-shot order could not observe them at all.
+		//
+		// Do not "simplify" the loader and this component into one values
+		// set to remove the duplication: the difference IS the mechanism.
 		rollOutCiliumPods: true
 		operator: {
 			rollOutPods: true
