@@ -88,13 +88,21 @@ pub struct RunSnapshots {
 /// replay, PlatformStack, secrets, applications and all. `this_cluster_uid` is
 /// the restore TARGET's `kube-system` UID, and `latest` now resolves like this:
 ///
-/// * Snapshots this cluster owns ([`crate::cluster::owned_by_this_cluster`] —
-///   its own UID, plus legacy snapshots that carry no UID) → newest of those.
-///   This is the rollback case: restoring a cluster from its own history.
-/// * Nothing of ours, but the repository holds exactly ONE cluster's snapshots
-///   → newest of those. This is disaster recovery: the target is a freshly
+/// * This cluster has snapshots carrying its OWN UID → newest of those plus any
+///   legacy ones ([`crate::cluster::owned_by_this_cluster`]). This is the
+///   rollback case: restoring a cluster from its own history.
+/// * Nothing carrying our UID, but the repository holds at most ONE identified
+///   cluster → newest of EVERYTHING, legacy and identified alike. This is
+///   disaster recovery and the upgrade shape: the target is a freshly
 ///   provisioned cluster with a brand-new UID, and there is nothing to confuse
 ///   it with.
+///
+///   Note what the first rule must NOT be: legacy snapshots count as owned, so
+///   testing ownership alone reports a history this cluster does not have. A
+///   repository holding legacy runs plus one new identified run would then
+///   collapse the pool to the legacy ones and restore the newest of THOSE,
+///   silently passing over the run just taken — observed in the field after an
+///   upgrade.
 /// * Nothing of ours and MORE THAN ONE other cluster present → refuse, naming
 ///   them. Picking one would be a guess about which cluster the operator meant
 ///   to restore, and the wrong guess replays a stranger's secrets.
@@ -224,14 +232,37 @@ fn latest_pool<'a>(
     this_cluster_uid: Option<&str>,
 ) -> Result<Vec<&'a Value>, String> {
     if let Some(uid) = this_cluster_uid {
-        let ours: Vec<&Value> = snaps
-            .iter()
-            .filter(|s| {
-                crate::cluster::owned_by_this_cluster(&crate::cluster::snapshot_tags(s), uid)
-            })
-            .collect();
-        if !ours.is_empty() {
-            return Ok(ours);
+        // A pool of ONLY legacy snapshots is not a history of our own.
+        //
+        // `owned_by_this_cluster` is true for pre-identity snapshots as well as
+        // ours — the accepted widening, and the right rule for prune, which must
+        // not orphan them. Used as the gate HERE it reports a history this
+        // cluster does not have: a `--reprovision` into a fresh target has no
+        // snapshots carrying its own UID, so the pool collapsed to the legacy
+        // ones and `latest` picked the newest of THOSE — silently passing over
+        // the identified snapshot the operator had just taken. Found on a live
+        // repository that held legacy snapshots plus one new identified run.
+        //
+        // So require at least one snapshot actually carrying our UID before
+        // treating the pool as ours. Legacy still joins it once we have a
+        // history — it just may not constitute one. When we have none, the
+        // branch below is already correct: `cluster_uids_in` ignores legacy, so
+        // a repository holding legacy plus ONE identified cluster is
+        // unambiguous and every snapshot, legacy and identified alike, competes
+        // for newest.
+        let have_our_own = snaps.iter().any(|s| {
+            matches!(
+                crate::cluster::classify_snapshot(&crate::cluster::snapshot_tags(s), uid),
+                crate::cluster::SnapshotOrigin::ThisCluster
+            )
+        });
+        if have_our_own {
+            return Ok(snaps
+                .iter()
+                .filter(|s| {
+                    crate::cluster::owned_by_this_cluster(&crate::cluster::snapshot_tags(s), uid)
+                })
+                .collect());
         }
     }
 
@@ -566,10 +597,20 @@ mod tests {
         assert!(resolve_latest_snapshot("[]", Some(MINE)).is_err());
     }
 
-    /// Legacy snapshots are ours by the stated assumption, so they are what
-    /// `latest` picks even when an identified foreign run is newer.
+    /// A repository holding legacy snapshots plus ONE identified cluster's is
+    /// unambiguous, and `latest` means the newest of all of them.
+    ///
+    /// This is the upgrade shape, and it was wrong in the field: a cluster
+    /// upgrades, takes a new (identified) backup, then `restore --reprovision`
+    /// into a fresh target — which has no snapshots of its own — silently
+    /// restored the newest LEGACY snapshot and passed over the run the operator
+    /// had just taken. The pool collapsed to legacy-only because legacy counts
+    /// as owned, and a legacy-only pool was being read as a history of our own.
+    ///
+    /// The test that stood here asserted the defect as the contract, which is
+    /// why nothing caught it.
     #[test]
-    fn legacy_snapshots_count_as_ours_for_latest() {
+    fn latest_prefers_the_identified_run_over_an_older_legacy_one() {
         let mixed = format!(
             r#"[
               {{"id":"old","short_id":"old","time":"2026-09-01T03:00:00Z",
@@ -579,7 +620,35 @@ mod tests {
             ]"#
         );
         let r = resolve_run_snapshots(&mixed, "latest", Some(MINE)).unwrap();
-        assert_eq!(r.commit, "old");
+        assert_eq!(
+            r.commit, "theirs",
+            "a fresh target must restore the newest run in an unambiguous \
+             repository, not the newest pre-identity one"
+        );
+    }
+
+    /// The other direction, so the fix cannot be read as "legacy never wins":
+    /// once this cluster HAS a history of its own, legacy snapshots are still
+    /// in the pool and a legacy run that is genuinely newest still wins. That
+    /// is the accepted widening, and only the "legacy alone constitutes a
+    /// history" reading was wrong.
+    #[test]
+    fn legacy_still_wins_for_a_cluster_that_has_its_own_history() {
+        let mixed = format!(
+            r#"[
+              {{"id":"mine","short_id":"mine","time":"2026-09-01T03:00:00Z",
+                "tags":["{MINE}-2026-09-01T03:00:00Z"],"paths":["/s/data"]}},
+              {{"id":"old","short_id":"old","time":"2026-09-02T03:00:00Z",
+                "tags":["platform-2026-09-02T03:00:00Z"],"paths":["/s/data"]}},
+              {{"id":"theirs","short_id":"theirs","time":"2026-09-03T03:00:00Z",
+                "tags":["{THEIRS}-2026-09-03T03:00:00Z"],"paths":["/s/data"]}}
+            ]"#
+        );
+        let r = resolve_run_snapshots(&mixed, "latest", Some(MINE)).unwrap();
+        assert_eq!(
+            r.commit, "old",
+            "legacy stays selectable; the foreign run is still excluded"
+        );
     }
 
     use super::*;
