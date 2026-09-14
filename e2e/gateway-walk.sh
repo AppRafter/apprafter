@@ -463,19 +463,95 @@ K3D_CREATED=1
 printf '  KUBECONFIG=%s\n' "$KUBECONFIG_FILE"
 
 # ===============================================================
-# Phase 1: install Gateway API CRDs (EXPERIMENTAL channel) + assert TLSRoute
+# Phase 1: install Cilium 1.16.5 with the LOADER values (gatewayAPI OFF)
 # ===============================================================
 #
-# The CRDs MUST exist before Cilium reconciles its gateway controller (the
-# component syncs at -25, strictly before cilium at -20). We install them
-# first, exactly as the chart's gateway-api-crds component does — the
-# experimental channel artifact is the equivalent of `config/crd/experimental`.
-# In NEGATIVE mode install the STANDARD channel instead (which LACKS TLSRoute)
-# to reproduce the F1 symptom.
+# ORDER (2026-09-14 — F5). Phases 1/2/2b reproduce the PRODUCTION install
+# sequence, which is two-phase and CANNOT be collapsed into one helm install:
+#
+#   1.  `cluster-bootstrap` helm-installs Cilium from the LOADER values
+#       (`_loaderValues.cilium.values`, lifted into the CLI by build.rs).
+#       Those carry NO gatewayAPI key — deliberately: the Gateway API CRDs do
+#       not exist yet on a fresh cluster, and Cilium's chart only creates its
+#       `cilium` GatewayClass when `gateway.networking.k8s.io/v1` is already
+#       discoverable (`gatewayClass.create: "auto"`).
+#   2.  Argo CD syncs `gateway-api-crds` at wave -25 — the CRDs land.
+#   2b. Argo CD syncs `cilium` at wave -20, now WITH `gatewayAPI.enabled: true`
+#       (`_components.cilium.values`) — at the SAME chart version, so the image
+#       and most of the pod template are unchanged.
+#
+# Until 2026-09-14 this walk did 2 → 1+2b as a SINGLE `helm install` that
+# already had gatewayAPI on, so it could not observe anything about step 2b at
+# all. That is the harness encoding a different assumption than the product:
+# Cilium runs its Gateway API required-resources check at PROCESS STARTUP, so
+# everything about this failure mode lives in whether step 2b restarts the
+# cilium pods. A one-shot install starts them once, after the CRDs, and is
+# green by construction.
+#
+# The live symptom when step 2b does NOT roll the pods: the `cilium`
+# GatewayClass never Accepts, no Gateway ever reaches Programmed, nothing
+# listens on the node's 80/443 — while every Argo Application reports
+# Synced/Healthy, because the ConfigMap really was updated. `kubectl -n
+# kube-system rollout restart ds/cilium` clears it instantly.
+# ===============================================================
+
+phase "Phase 1: install Cilium ${CILIUM_VERSION} with the LOADER values (gatewayAPI OFF)"
+
+CILIUM_LOADER_VALUES="${TMPDIR_WORK}/cilium-loader-values.yaml"
+( cd "$REPO_STACK_DIR" && _cue export ./cue -e '_loaderValues.cilium.values' --out yaml ) >"$CILIUM_LOADER_VALUES"
+printf '  loader cilium values -> %s\n' "$CILIUM_LOADER_VALUES"
+sed 's/^/    /' "$CILIUM_LOADER_VALUES"
+
+# The loader subset MUST NOT mention gatewayAPI — that absence is the whole
+# premise of this phase. If someone ever folds the gateway keys into the loader
+# export, this walk would silently stop testing the two-phase sequence.
+if grep -qi 'gatewayapi' "$CILIUM_LOADER_VALUES"; then
+    printf 'ERROR: _loaderValues.cilium.values mentions gatewayAPI — the loader is supposed to install Cilium WITHOUT it (see component_gateway-api-crds.cue)\n' >&2
+    exit 1
+fi
+printf '  ok: loader values carry NO gatewayAPI key (the pre-CRD install)\n'
+
+helm repo add cilium "$CILIUM_REPO" >/dev/null 2>&1 || true
+helm repo update cilium >/dev/null 2>&1 || helm repo update >/dev/null 2>&1 || true
+
+# Install Cilium with the loader values. kind_up_cilium already pinned the
+# apiserver to 127.0.0.1:6443 inside the node, matching the loader's
+# k8sServiceHost/k8sServicePort, so kube-proxy replacement converges.
+helm install cilium cilium/cilium \
+    --version "$CILIUM_VERSION" \
+    --namespace kube-system \
+    -f "$CILIUM_LOADER_VALUES" \
+    --wait --timeout 8m
+
+printf '  waiting for cilium-operator + cilium-agent Ready ...\n'
+kubectl -n kube-system rollout status deploy/cilium-operator --timeout=300s
+kubectl -n kube-system rollout status ds/cilium --timeout=300s
+
+# Node must flip Ready now that Cilium owns the CNI.
+kubectl wait --for=condition=Ready node --all --timeout=180s
+printf '  node Ready (Cilium CNI converged, gateway-api OFF)\n'
+
+# The GatewayClass must NOT exist yet: no CRDs, so the chart's
+# `gatewayClass.create: "auto"` guard rendered nothing. Recording it here makes
+# the Phase 2b transition unambiguous in the log.
+if kubectl get gatewayclass cilium >/dev/null 2>&1; then
+    printf '  WARN: gatewayclass cilium already exists before the CRDs — unexpected\n' >&2
+else
+    printf '  ok: no `cilium` GatewayClass yet (Gateway API CRDs absent)\n'
+fi
+
+# ===============================================================
+# Phase 2: install Gateway API CRDs (EXPERIMENTAL channel) + assert TLSRoute
+# ===============================================================
+#
+# Wave -25 — AFTER Cilium is already running (Phase 1), strictly BEFORE the
+# cilium upgrade that turns gatewayAPI on (Phase 2b). In NEGATIVE mode install
+# the STANDARD channel instead (which LACKS TLSRoute) to reproduce the F1
+# symptom.
 # ===============================================================
 
 if [ "$NEGATIVE" = 1 ]; then
-    phase "Phase 1: install Gateway API STANDARD CRDs ${GATEWAY_API_VERSION} (NEGATIVE — F1 repro)"
+    phase "Phase 2: install Gateway API STANDARD CRDs ${GATEWAY_API_VERSION} (NEGATIVE — F1 repro)"
     printf '  applying %s ...\n' "$GW_API_STANDARD_URL"
     retry 5 5 -- kubectl apply -f "$GW_API_STANDARD_URL"
     # The standard channel must NOT carry tlsroutes — that absence IS the F1
@@ -486,7 +562,7 @@ if [ "$NEGATIVE" = 1 ]; then
     fi
     printf '  ok: standard channel has NO %s (the F1 condition)\n' "$TLSROUTE_CRD"
 else
-    phase "Phase 1: install Gateway API EXPERIMENTAL CRDs ${GATEWAY_API_VERSION} + assert TLSRoute"
+    phase "Phase 2: install Gateway API EXPERIMENTAL CRDs ${GATEWAY_API_VERSION} + assert TLSRoute"
     printf '  applying %s ...\n' "$GW_API_EXPERIMENTAL_URL"
     # The experimental install manifest is large; --server-side avoids the
     # last-applied-annotation size limit some CRDs blow.
@@ -499,17 +575,26 @@ else
 fi
 
 # ===============================================================
-# Phase 2: install Cilium 1.16.5 with the chart's host-network gateway values
+# Phase 2b: upgrade Cilium to the chart's host-network gateway values
 # ===============================================================
 #
-# Get the values straight from the chart source so the walk validates the
-# SAME config the platform ships: `_components.cilium.values` carries
-# gatewayAPI.{enabled,hostNetwork.enabled}, the envoy NET_BIND_SERVICE
-# capabilities, the cilium-config-rev annotation, kube-proxy replacement +
-# k8sServiceHost/Port (matching the kind_up_cilium apiserver pin), IPAM, etc.
+# The Argo wave -20 step. Values come straight from the chart source so the
+# walk validates the SAME config the platform ships: `_components.cilium.values`
+# carries gatewayAPI.{enabled,hostNetwork.enabled}, the envoy NET_BIND_SERVICE
+# capabilities, the rollOut* knobs, kube-proxy replacement + k8sServiceHost/Port
+# (matching the kind_up_cilium apiserver pin), IPAM, etc.
+#
+# THE GATE (F5): the cilium AGENT and OPERATOR pods must be REPLACED by this
+# upgrade. Cilium reads `enable-gateway-api` from cilium-config at process
+# start, so a pod that survives the upgrade keeps the pre-CRD view forever: the
+# operator's Gateway API controller never registers and the agent never serves
+# the CiliumEnvoyConfig. Same chart version in and out, so nothing about the
+# image forces a rollout — only a deliberate pod-template difference does.
+# Asserting the replacement here (rather than only the downstream Gateway
+# status in Phase 5) localises a regression to its cause in one line.
 # ===============================================================
 
-phase "Phase 2: install Cilium ${CILIUM_VERSION} with the chart's host-network gateway values"
+phase "Phase 2b: upgrade Cilium to the chart values (gatewayAPI ON) — must roll the pods"
 
 CILIUM_VALUES="${TMPDIR_WORK}/cilium-values.yaml"
 ( cd "$REPO_STACK_DIR" && _cue export ./cue -e '_components.cilium.values' --out yaml ) >"$CILIUM_VALUES"
@@ -517,21 +602,28 @@ printf '  rendered chart cilium values -> %s\n' "$CILIUM_VALUES"
 printf '  --- cilium values (gateway-relevant) ---\n'
 grep -iE 'gatewayAPI|hostNetwork|enabled|NET_BIND_SERVICE|keepCapNetBindService|kubeProxyReplacement|k8sService' "$CILIUM_VALUES" | sed 's/^/    /'
 
-helm repo add cilium "$CILIUM_REPO" >/dev/null 2>&1 || true
-helm repo update cilium >/dev/null 2>&1 || helm repo update >/dev/null 2>&1 || true
+# Pod identities BEFORE the upgrade. UIDs, not names: a DaemonSet pod is
+# recreated under a fresh name, but a Deployment pod could in principle reuse
+# one, and a UID never repeats.
+cilium_pod_uids() {
+    kubectl -n kube-system get pods -l "$1" \
+        -o jsonpath='{range .items[*]}{.metadata.uid}{"\n"}{end}' 2>/dev/null | sort || true
+}
+AGENT_UIDS_BEFORE="$(cilium_pod_uids 'k8s-app=cilium')"
+OPERATOR_UIDS_BEFORE="$(cilium_pod_uids 'io.cilium/app=operator')"
+printf '  agent pod UIDs before:    %s\n' "$(printf '%s' "$AGENT_UIDS_BEFORE" | tr '\n' ' ')"
+printf '  operator pod UIDs before: %s\n' "$(printf '%s' "$OPERATOR_UIDS_BEFORE" | tr '\n' ' ')"
 
-# Install Cilium with the chart values. kind_up_cilium already pinned the
-# apiserver to 127.0.0.1:6443 inside the node, matching the chart's
-# k8sServiceHost/k8sServicePort, so kube-proxy replacement converges.
-helm install cilium cilium/cilium \
+helm upgrade cilium cilium/cilium \
     --version "$CILIUM_VERSION" \
     --namespace kube-system \
     -f "$CILIUM_VALUES" \
     --wait --timeout 8m
 
 printf '  waiting for cilium-operator + cilium-agent + cilium-envoy Ready ...\n'
-# cilium-operator runs the gateway controller; the agent owns the datapath;
-# the STANDALONE cilium-envoy DaemonSet binds the host 80/443 listeners.
+# cilium-operator runs the gateway controller; the agent owns the datapath and
+# serves the CiliumEnvoyConfig to Envoy over xDS; the STANDALONE cilium-envoy
+# DaemonSet binds the host 80/443 listeners.
 kubectl -n kube-system rollout status deploy/cilium-operator --timeout=300s
 kubectl -n kube-system rollout status ds/cilium --timeout=300s
 # The standalone envoy DaemonSet (envoy.enabled: true). Name is `cilium-envoy`.
@@ -542,9 +634,35 @@ else
     printf '  WARN: no cilium-envoy DaemonSet found (embedded-envoy mode?)\n' >&2
 fi
 
-# Node must flip Ready now that Cilium owns the CNI.
 kubectl wait --for=condition=Ready node --all --timeout=180s
-printf '  node Ready (Cilium CNI converged)\n'
+printf '  node Ready (Cilium CNI reconverged after the upgrade)\n'
+
+AGENT_UIDS_AFTER="$(cilium_pod_uids 'k8s-app=cilium')"
+OPERATOR_UIDS_AFTER="$(cilium_pod_uids 'io.cilium/app=operator')"
+printf '  agent pod UIDs after:     %s\n' "$(printf '%s' "$AGENT_UIDS_AFTER" | tr '\n' ' ')"
+printf '  operator pod UIDs after:  %s\n' "$(printf '%s' "$OPERATOR_UIDS_AFTER" | tr '\n' ' ')"
+
+# `comm -12` on two sorted lists yields the survivors. Any survivor is a pod
+# still running the pre-CRD config — the F5 defect.
+agent_survivors="$(comm -12 <(printf '%s\n' "$AGENT_UIDS_BEFORE") <(printf '%s\n' "$AGENT_UIDS_AFTER") | grep -c . || true)"
+operator_survivors="$(comm -12 <(printf '%s\n' "$OPERATOR_UIDS_BEFORE") <(printf '%s\n' "$OPERATOR_UIDS_AFTER") | grep -c . || true)"
+if [ "${agent_survivors:-0}" -ne 0 ] || [ "${operator_survivors:-0}" -ne 0 ]; then
+    printf 'ERROR: the gatewayAPI upgrade did NOT roll the cilium pods (%s agent + %s operator pod(s) survived).\n' \
+        "$agent_survivors" "$operator_survivors" >&2
+    printf '       Cilium reads enable-gateway-api at process START, so a surviving pod keeps the\n' >&2
+    printf '       pre-CRD view: the Gateway API controller never registers and no Gateway is ever\n' >&2
+    printf '       Programmed, while every Argo Application still reports Synced/Healthy.\n' >&2
+    printf '       Cause: the wave -20 values no longer differ from the loader values in the POD\n' >&2
+    printf '       TEMPLATE (only in the ConfigMap). component_cilium.cue sets rollOutCiliumPods /\n' >&2
+    printf '       operator.rollOutPods / envoy.rollOutPods precisely to force this rollout — they\n' >&2
+    printf '       stamp the cilium-config checksum onto each pod template. If one was dropped, or\n' >&2
+    printf '       the loader and chart values were merged into one set, this is the consequence.\n' >&2
+    kubectl -n kube-system get pods -l k8s-app=cilium -o wide >&2 2>&1 || true
+    kubectl -n kube-system get pods -l 'io.cilium/app=operator' -o wide >&2 2>&1 || true
+    exit 1
+fi
+printf '  ok: every cilium agent + operator pod was replaced by the gatewayAPI upgrade\n'
+printf '      (they now start with the Gateway API CRDs already present)\n'
 
 # ===============================================================
 # Phase 3: the platform Gateway prerequisites — namespace + self-signed TLS Secret
