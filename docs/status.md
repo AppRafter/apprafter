@@ -57,7 +57,7 @@ post-launch work is not a roadmap phase and has no subscribe control.
 | Shipped | ✅ | Message streams and durable consumers, declared in the manifest (`needs.jetstream`) | [JetStream](operator-guide/jetstream.md) |
 | Shipped | 🚧 | Redelivery, acknowledgement and retention tuned per stream and per consumer, with a dead-letter queue | — |
 | Shipped | 🚧 | One Postgres database or cache shared between applications, each consumer with its own credential | — |
-| Shipped | 🚧 | PostgreSQL extensions requested from the manifest, from a bounded list | — |
+| Shipped | ✅ | PostgreSQL extensions requested from the manifest, from a bounded list | — |
 | Shipped | ✅ | On-demand block storage (`needs.disk`) | [Persistent disks](operator-guide/persistent-disk.md) |
 | Shipped | ✅ | One volume shared between applications, with removal refused while it is referenced | [Shared volumes](operator-guide/shared-volumes.md) |
 | Shipped | ✅ | Back up and restore a whole cluster, or export one dependency's data | [Back up a cluster](operator-guide/backup-restore.md) |
@@ -82,14 +82,19 @@ post-launch work is not a roadmap phase and has no subscribe control.
 > server keeps running untouched. A larger per-tier budget is planned.
 > JetStream stores are out of scope for backup and restore.
 
-> **What the three `🚧` rows above are missing, precisely.** The JetStream tuning surface and the
+> **What the two `🚧` rows above are missing, precisely.** The JetStream tuning surface and the
 > dead-letter queue are built and gated — every field is accepted and stored by the message
 > controller's own schema, and the server behaviours they rely on were measured on the pinned
 > server — but the chain from a manifest through to a dead-letter queue actually filling has not
-> been run end to end on a cluster. Shared databases and manifest-requested extensions are further
-> back: the manifest surface, the validation and the SQL are in place and the SQL is proven against
-> a real PostgreSQL, but nothing provisions a shared database yet, so there is no way to use one.
-> None of the three is `✅` and none will be until a walk says so.
+> been run end to end on a cluster. Shared databases are further back: the manifest surface, the
+> validation and the SQL are in place and the SQL is proven against a real PostgreSQL, but nothing
+> provisions a shared database yet, so there is no way to use one. Neither is `✅` and neither will
+> be until a walk says so.
+
+> An extension request is checked against the database server that is actually running, not against
+> the allow list alone. Whether a given extension exists is a property of the image, and an
+> application asking for one the image does not carry is told so on its own dependency, naming the
+> extension, rather than waiting on a dependency that never becomes ready.
 
 ---
 
