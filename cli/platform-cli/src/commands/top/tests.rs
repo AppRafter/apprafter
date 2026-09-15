@@ -29,7 +29,15 @@ fn node(name: &str, cordoned: bool, ready: bool) -> Value {
                 "pods": "110"
             },
             "allocatable": {
-                "cpu": "2",
+                // NOT equal to capacity, and deliberately in the
+                // fractional-core spelling. Every AppRafter node ships
+                // `kube-reserved=cpu=100m` (2.16d, `user_data.rs`), so a
+                // 2-vCPU node really does report `1900m` here. While this
+                // read `"2"`, reading `capacity` instead of `allocatable`
+                // for CPU was a mutation the whole suite passed — the one
+                // resource whose two numbers were identical was the one
+                // nothing could catch.
+                "cpu": "1900m",
                 "memory": "3383820Ki",
                 // k3s writes this one as a bare byte count.
                 "ephemeral-storage": "39492531133",
@@ -172,7 +180,10 @@ fn a_node_yields_capacity_and_allocatable_for_all_three_resources() {
     let n = &parse_nodes(&node_list())[0];
     assert_eq!(n.name, "solo-1");
     assert_eq!(n.cpu_capacity_milli, 2000);
-    assert_eq!(n.cpu_allocatable_milli, 2000);
+    assert_eq!(
+        n.cpu_allocatable_milli, 1900,
+        "allocatable is NOT capacity: the node reserves 100m for the kubelet"
+    );
     assert_eq!(n.mem_capacity_bytes, 4_002_426_880);
     assert_eq!(n.mem_allocatable_bytes, 3_465_031_680);
     assert_eq!(n.disk_capacity_bytes, 41_567_956_992);
@@ -447,9 +458,9 @@ fn schedulable_is_allocatable_minus_requested_and_free_is_allocatable_minus_in_u
     let r = report(&all_measured());
     let n = &r.nodes[0];
     assert_eq!(n.cpu.requested, 425); // 100 + 250 + 50 + 25
-    assert_eq!(n.cpu.schedulable(), 2000 - 425);
+    assert_eq!(n.cpu.schedulable(), 1900 - 425);
     assert_eq!(n.cpu.in_use, Some(413));
-    assert_eq!(n.cpu.free(), Some(2000 - 413));
+    assert_eq!(n.cpu.free(), Some(1900 - 413));
     assert_eq!(n.disk.in_use, Some(11_567_756_288));
     assert_eq!(n.disk.free(), Some(39_492_531_133 - 11_567_756_288));
 }

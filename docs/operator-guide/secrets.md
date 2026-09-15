@@ -177,13 +177,21 @@ changed. Why the platform shows you that set instead of restarting it,
 and what it compares to decide a pod is stale, are in
 [Sealing a secret](../how-it-works/sealing-a-secret.md#when-the-value-is-read).
 
-Until a first-class verb exists for it, roll the workload yourself after
-a rotation that must take effect:
+Roll the workload once the rotation is complete:
 
-<!-- docs: check=none reason=known-broken since=v0.2.51 — no first-class verb rolls a workload yet; the platform now SHOWS the drift (app status marks stale pods) but cannot act on it, tracked as D6 -->
 ```sh
-kubectl -n shop rollout restart deployment -l apprafter.io/application=checkout
+apprafter app restart checkout
 ```
+
+It replaces the pods with the pod template already applied, so it picks
+up the new value and changes nothing else — no new image, no new
+configuration. It rolls every workload of the application; add
+`--workload <name>` for one of them.
+
+Restarting is deliberate rather than automatic because the platform
+cannot see where your editing sequence ends. Rotating three keys is
+three seals, and a roll fired after the first would deploy a state you
+never intended.
 
 ## Remove it
 

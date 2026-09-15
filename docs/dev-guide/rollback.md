@@ -137,15 +137,15 @@ apprafter app rollback <app-name> --to main --yes
 
 One case the auto-deploy loop deliberately does not cover: you re-pushed
 the same tag to the same digest — nothing moved — and you want fresh pods
-anyway. There is nothing for the platform to act on, so roll the
-`Deployment` by hand. It carries your manifest's `metadata.name` and
-lives in your manifest's `metadata.namespace`, so pass `-n` exactly as
-above:
+anyway. There is nothing for the platform to act on, so ask for the roll
+directly:
 
-<!-- docs: check=none reason=external-tool since=v0.2.51 — a manual re-pull the auto-deploy loop deliberately does not cover: a tag that has not moved has nothing for the platform to act on -->
 ```sh
-kubectl -n <namespace> rollout restart deployment/<app-name>
+apprafter app restart <app-name>
 ```
+
+It takes the application's name, not the `Deployment`'s, and finds the
+namespace itself.
 
 `kubectl rollout undo` is **not** the way to revert a bad build. The
 operator owns the `Deployment` and re-resolves on its next pass, so an

@@ -2893,7 +2893,12 @@ pub(crate) fn render_pod_summary_lines(
     if any_stale {
         out.push(RenderedLine::plain(String::new()));
         out.push(RenderedLine::warned(
-            "  Some pods started before this application's secrets last changed, \n                   so they are still serving the previous values. An environment \n                   variable from a secret is resolved once at pod start and never \n                   re-read; restarting the workload is what picks up the new one.",
+            // Names the verb, not an invocation: this function knows the
+            // WORKLOAD's name, and `app restart`'s positional argument is
+            // the registration (ADR 0062). Printing the workload name there
+            // would be a command that does not resolve for any bundle with
+            // more than one workload.
+            "  Some pods started before this application's secrets last changed, \n                   so they are still serving the previous values. An environment \n                   variable from a secret is resolved once at pod start and never \n                   re-read; `apprafter app restart` replaces them once the \n                   rotation is complete.",
         ));
     }
     out
@@ -10245,6 +10250,36 @@ mod public_endpoint_tests {
         assert!(public_endpoint_line(&c)
             .unwrap()
             .contains("base.example.com"));
+    }
+
+    #[test]
+    fn an_environment_may_take_a_public_app_private_and_the_url_goes_with_it() {
+        // The direction that is LIVE in this repository:
+        // `docs-site/apprafter/Application.cue` and
+        // `landing/web/apprafter/Application.cue` both declare a public
+        // base with a hostname and override `environments.dev.expose.
+        // network: "internal"`; `examples/applications/parser.cue`
+        // overrides to `"vpn"`. The inherited hostname is inert there — the
+        // operator reads it only when the effective network is public, and
+        // emits no HTTPRoute — so advertising it would hand the reader the
+        // PRODUCTION url for a deployment that does not answer on it.
+        //
+        // The opposite direction had a test and this one did not, which is
+        // the coverage gap that let the original defect ship.
+        for private in ["internal", "vpn"] {
+            let c = cr(
+                json!({ "expose": { "network": "public", "port": 80,
+                                    "hostname": "docs.apprafter.dev" } }),
+                json!({ "dev": { "expose": { "network": private } } }),
+                Some("dev"),
+            );
+            assert_eq!(
+                public_endpoint_line(&c),
+                None,
+                "a {private} dev deployment must not advertise the public hostname \
+                 it inherits but does not serve"
+            );
+        }
     }
 
     #[test]

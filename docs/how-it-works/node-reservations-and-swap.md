@@ -70,7 +70,7 @@ Roll workloads through their managed restart path — **do not
   plugin. Deleting a CNPG primary directly triggers a failover and an unclean
   shutdown.
 - **Redis (Dragonfly):** use the Dragonfly operator's restart path.
-- **Application Deployments:** `kubectl rollout restart deployment/<name>`.
+- **Application Deployments:** `apprafter app restart <name>`.
 
 
 ## Live state, not intended state
