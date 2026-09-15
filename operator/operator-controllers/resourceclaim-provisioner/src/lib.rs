@@ -83,6 +83,7 @@ pub mod shared_volume;
 
 use nats_client::{NatsAdmin, NatsClient};
 use operator_core::capacity::CapacityCache;
+use pg_client::{PgAdmin, PgClient};
 use redis_client::{RedisAdmin, RedisClient};
 
 pub(crate) const KIND: &str = "ResourceClaim";
@@ -165,6 +166,12 @@ pub struct Context {
     /// marking a claim ready. Same injection reasoning as `redis` above;
     /// production is [`NatsClient`]. Unused by every other backend.
     pub nats: Arc<dyn NatsAdmin>,
+    /// Imperative Postgres admin seam (2.29 / ADR 0066 §3.1). Used by the
+    /// CNPG path to ask the LIVE server whether a declared extension exists
+    /// before reporting a claim ready, and — once the shared-database
+    /// controller lands — to run the role model's statements. Same injection
+    /// reasoning as `redis` and `nats`; production is [`PgClient`].
+    pub pg: Arc<dyn PgAdmin>,
     /// Per-node TTL cache of kubelet Summary documents (2.6c, T11). Shared
     /// across BOTH controllers so a single node's kubelet is sampled at
     /// most once per TTL across all reconciles. Capacity sampling is
@@ -214,6 +221,7 @@ impl Context {
             client,
             metrics,
             redis: Arc::new(RedisClient),
+            pg: Arc::new(PgClient),
             nats: Arc::new(NatsClient),
             capacity: Arc::new(CapacityCache::new()),
             backend_metrics: Arc::new(operator_core::promscrape::MetricsCache::new()),

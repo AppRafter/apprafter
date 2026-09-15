@@ -629,13 +629,60 @@ async fn provision_cloudnativepg(
         )
         .await?;
 
-    // 7. Write status — ONLY ready / connectionSecretRef / Ready
-    //    condition, under our own field manager.
     let prior: Vec<ResourceClaimCondition> = claim
         .status
         .as_ref()
         .and_then(|s| s.conditions.clone())
         .unwrap_or_default();
+
+    // 6b. 2.29 (ADR 0066 §4.2): ASK the running server whether each declared
+    //     extension exists, rather than trusting the allow list to imply it.
+    //     Whether `vector` is present is a property of the operand IMAGE, the
+    //     image is not pinned, and a CNPG bump can take one away under a live
+    //     database. CNPG reports its own failure in `Database.status`, but
+    //     that surfaces as a Database that never reconciles — the claim would
+    //     sit `Ready=False` with nothing naming the cause.
+    //
+    //     Best-effort on the CONNECTION: a server we cannot reach is not the
+    //     same finding as an extension that does not exist, and failing the
+    //     claim on a transient dial would turn a network blip into a
+    //     provisioning error. An unreachable server simply skips the check and
+    //     the next reconcile asks again.
+    if !extensions.is_empty() {
+        let probe_dsn = cnpg::dsn(&role, &password, &db, &cluster, &cnpg_ns);
+        let mut missing: Vec<String> = Vec::new();
+        let mut reachable = true;
+        for ext in &extensions {
+            match ctx.pg.extension_available(&probe_dsn, &ext.name).await {
+                Ok(true) => {}
+                Ok(false) => missing.push(ext.name.clone()),
+                Err(e) => {
+                    warn!(%name, %ns, error = %e, "could not check extension availability; skipping the check this reconcile");
+                    reachable = false;
+                    break;
+                }
+            }
+        }
+        if reachable && !missing.is_empty() {
+            let cond = ready_condition(
+                "False",
+                operator_core::shareddatabase::COND_EXTENSION_UNAVAILABLE,
+                &format!(
+                    "the running PostgreSQL image does not provide {}. The extension list is \
+                     bounded by the platform's allow list, but whether a given extension EXISTS \
+                     is a property of the operand image — check the image the shared cluster runs \
+                     and either drop the extension or raise it with the platform operator.",
+                    missing.join(", ")
+                ),
+                &prior,
+            );
+            patch_status(&ctx.client, ns, name, cond, ClaimStatusFields::default()).await?;
+            return Ok(Action::requeue(Duration::from_secs(60)));
+        }
+    }
+
+    // 7. Write status — ONLY ready / connectionSecretRef / Ready
+    //    condition, under our own field manager.
     let cond = ready_condition(
         "True",
         "Provisioned",
