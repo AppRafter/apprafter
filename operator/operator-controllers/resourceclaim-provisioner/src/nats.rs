@@ -19,7 +19,8 @@
 use std::collections::BTreeMap;
 
 use operator_core::{
-    JetStreamStream as CoreJetStreamStream, ResourceClaim, ResourceClaimCondition,
+    JetStreamConsume as CoreJetStreamConsume, JetStreamStream as CoreJetStreamStream,
+    ResourceClaim, ResourceClaimCondition, ResourceClaimJetStream,
 };
 
 use crate::nats_accounts::{
@@ -112,6 +113,87 @@ pub(crate) fn declaring_app(claim: &ResourceClaim) -> Option<String> {
         .map(|r| r.name.clone())
 }
 
+/// The application that OWNS the stream a consume entry names.
+///
+/// `from` omitted means the declaring application's own stream. One formula
+/// with three callers — [`claim_view`], [`materialised_streams`] and the
+/// reconciler — rather than three copies: getting it wrong composes a
+/// deny-class-(D) pattern against a stream that does not exist, silently, so
+/// the protection never fires (ADR 0061 §4, and the L1 note on `claim_view`).
+pub fn consume_owner(app: &str, consume: &CoreJetStreamConsume) -> String {
+    consume.from.clone().unwrap_or_else(|| app.to_string())
+}
+
+/// The advisory subject a dead-letter queue collects (2.28 / ADR 0065 §2.4).
+///
+/// **Exact, never a wildcard.** The DLQ stream for one `(stream, durable)`
+/// pair must be able to carry that pair's failures and nothing else: a
+/// `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.>` subject would collect every
+/// neighbour's failures in the same account, which is a disclosure the whole
+/// deny vector exists to prevent.
+///
+/// Both halves are the COMPOSED NATS-side names, not the declared ones —
+/// `nats_stream_name(owner, stream)` and `nats_durable_name(consumer, durable)`
+/// — because that is what the server puts in the subject. The asymmetry is the
+/// same one [`nats_accounts::nats_durable_name`] documents: a stream is keyed
+/// by its OWNER, a durable by its CONSUMER.
+///
+/// Subject and payload measured on nats-server 2.14.3
+/// (`docs/measurements/2.28-jetstream-2026-09-15.md`).
+pub fn dead_letter_subject(
+    consumer_app: &str,
+    owner_app: &str,
+    owner_stream: &str,
+    declared_durable: &str,
+) -> String {
+    format!(
+        "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.{}.{}",
+        nats_stream_name(owner_app, owner_stream),
+        nats_durable_name(consumer_app, declared_durable)
+    )
+}
+
+/// Every stream this claim materialises: the ones it declares, plus one per
+/// `consume[].deadLetter` (2.28 / ADR 0065 §2.4).
+///
+/// **One list, two consumers, so a DLQ can never be half-provisioned.**
+/// [`claim_view`] builds `ClaimView.streams` from this, and the reconciler
+/// applies NACK `Stream` objects from it. If the two computed their own lists
+/// the DLQ could exist in NATS without appearing in the allow list, the deny
+/// vector, the quota sum or the capture detector — which is precisely the
+/// class of half-state ADR 0061 §5 calls unattributable.
+///
+/// A DLQ is an ORDINARY declared stream owned by the consuming application.
+/// Its `retention` is fixed to `limits` and its `storage` to `file`: it is a
+/// log to be read, not a workqueue to be drained, and a workqueue DLQ would
+/// delete its own evidence on the first ack. Its subjects are platform-composed
+/// (see [`dead_letter_subject`]) and never user-supplied.
+pub fn materialised_streams(app: &str, js: &ResourceClaimJetStream) -> Vec<CoreJetStreamStream> {
+    let mut out = js.streams.clone();
+    for consume in &js.consume {
+        let Some(dlq) = consume.dead_letter.as_ref() else {
+            continue;
+        };
+        let owner = consume_owner(app, consume);
+        out.push(CoreJetStreamStream {
+            name: dlq.stream.clone(),
+            subjects: vec![dead_letter_subject(
+                app,
+                &owner,
+                &consume.stream,
+                &consume.durable,
+            )],
+            storage: Some("file".to_string()),
+            retention: Some("limits".to_string()),
+            max_age: dlq.max_age.clone(),
+            max_bytes: dlq.max_bytes.clone(),
+            allow_purge: false,
+            ..Default::default()
+        });
+    }
+    out
+}
+
 /// One claim's view, or `None` if `claim` is not a jetstream claim (a
 /// different `spec.type`, or `spec.jetstream` absent) or is missing its
 /// declaring Application (see [`declaring_app`]).
@@ -130,8 +212,11 @@ fn claim_view(claim: &ResourceClaim, size_bytes: &BTreeMap<String, u64>) -> Opti
     // safer than a plausible-looking wrong number.
     let quota_bytes = size_bytes.get(size).copied().unwrap_or(0);
 
-    let streams: Vec<StreamView> = js
-        .streams
+    // 2.28: the DECLARED streams plus the DLQ-derived ones, from the single
+    // `materialised_streams` list the reconciler also applies from — so the
+    // allow list, the deny vector, the quota sum and the capture detector all
+    // see a dead-letter queue exactly as they see any other declared stream.
+    let streams: Vec<StreamView> = materialised_streams(&app, js)
         .iter()
         .map(|s: &CoreJetStreamStream| StreamView {
             name: s.name.clone(),
@@ -158,7 +243,7 @@ fn claim_view(claim: &ResourceClaim, size_bytes: &BTreeMap<String, u64>) -> Opti
         .consume
         .iter()
         .map(|c| ConsumeView {
-            owner: c.from.clone().unwrap_or_else(|| app.clone()),
+            owner: consume_owner(&app, c),
             stream: c.stream.clone(),
             durable: c.durable.clone(),
         })
@@ -465,19 +550,73 @@ pub fn quantity_bytes(q: &str) -> Option<i64> {
 /// object name of the `Account` CR in the SAME namespace, NOT the
 /// NATS-side account name (see [`account_object`]'s own doc for the
 /// verified distinction).
-#[allow(clippy::too_many_arguments)]
+/// Takes the DECLARED stream rather than a dozen positional arguments (2.28):
+/// the tuning surface makes the flat form unreadable, and passing the typed
+/// value means a renamed field fails to compile instead of silently landing in
+/// the wrong slot.
+///
+/// `max_bytes` stays a separate parsed `i64` — the declaration carries a
+/// Kubernetes quantity STRING, and the caller has already parsed it for the
+/// quota pre-flight, so re-parsing here would be a second chance to disagree.
 pub fn stream_object(
     ns: &str,
     nats_ns: &str,
     owner_app: &str,
-    declared_name: &str,
-    subjects: &[String],
-    storage: &str,
-    retention: &str,
-    max_age: &str,
+    stream: &CoreJetStreamStream,
     max_bytes: i64,
     account_object_name: &str,
 ) -> serde_json::Value {
+    let declared_name = stream.name.as_str();
+    let mut spec = serde_json::json!({
+        "name": nats_stream_name(owner_app, declared_name),
+        "subjects": stream.subjects,
+        "storage": stream.storage.as_deref().unwrap_or("file"),
+        "retention": stream.retention.as_deref().unwrap_or("limits"),
+        "maxAge": stream.max_age.as_deref().unwrap_or(""),
+        "maxBytes": max_bytes,
+        "account": account_object_name,
+    });
+
+    // 2.28 tuning. Each field is emitted ONLY when the declaration set it, so
+    // an omitted knob leaves NACK's own default alone rather than pinning it
+    // to a value this code invented — and the rendered object stays
+    // byte-stable across reconciles, which keeps the server-side apply a
+    // no-op. The isolation-breaking fields (`sources`, `mirror`, `republish`,
+    // `subjectTransform`, `placement`, `replicas`) are deliberately NOT
+    // threaded: the webhook rejects them, and nothing here should be capable
+    // of emitting one even if a claim somehow carried it.
+    let obj = spec.as_object_mut().expect("spec is an object");
+    macro_rules! put {
+        ($key:expr, $value:expr) => {
+            if let Some(v) = $value {
+                obj.insert($key.to_string(), serde_json::json!(v));
+            }
+        };
+    }
+    put!("maxMsgs", stream.max_msgs);
+    put!("maxMsgsPerSubject", stream.max_msgs_per_subject);
+    put!("maxMsgSize", stream.max_msg_size);
+    put!("maxConsumers", stream.max_consumers);
+    put!("discard", stream.discard.as_deref());
+    put!("discardPerSubject", stream.discard_per_subject);
+    put!("duplicateWindow", stream.duplicate_window.as_deref());
+    put!("compression", stream.compression.as_deref());
+    put!("allowDirect", stream.allow_direct);
+    put!("allowRollup", stream.allow_rollup);
+    put!("description", stream.description.as_deref());
+    if let Some(limits) = stream.consumer_limits.as_ref() {
+        let mut cl = serde_json::Map::new();
+        if let Some(v) = limits.inactive_threshold.as_deref() {
+            cl.insert("inactiveThreshold".into(), serde_json::json!(v));
+        }
+        if let Some(v) = limits.max_ack_pending {
+            cl.insert("maxAckPending".into(), serde_json::json!(v));
+        }
+        if !cl.is_empty() {
+            obj.insert("consumerLimits".into(), serde_json::Value::Object(cl));
+        }
+    }
+
     serde_json::json!({
         "apiVersion": "jetstream.nats.io/v1beta2",
         "kind": "Stream",
@@ -488,15 +627,7 @@ pub fn stream_object(
                 "apprafter.io/managed-by": "apprafter",
             },
         },
-        "spec": {
-            "name": nats_stream_name(owner_app, declared_name),
-            "subjects": subjects,
-            "storage": storage,
-            "retention": retention,
-            "maxAge": max_age,
-            "maxBytes": max_bytes,
-            "account": account_object_name,
-        },
+        "spec": spec,
     })
 }
 
@@ -521,15 +652,63 @@ pub fn stream_object(
 /// code paths, not assumed from the field names' surface symmetry.
 ///
 /// No `ownerReference`, same reasoning as [`stream_object`].
+/// Takes the DECLARED consume entry (2.28) for the same reasons
+/// [`stream_object`] does. `owner_app` stays separate because it is RESOLVED,
+/// not declared: `from` omitted means the declaring application itself, and
+/// that resolution belongs to the caller that knows which application this is.
 pub fn consumer_object(
     ns: &str,
     nats_ns: &str,
     consumer_app: &str,
-    declared_durable: &str,
+    consume: &CoreJetStreamConsume,
     owner_app: &str,
-    owner_declared_stream_name: &str,
     account_object_name: &str,
 ) -> serde_json::Value {
+    let declared_durable = consume.durable.as_str();
+    let mut spec = serde_json::json!({
+        "durableName": nats_durable_name(consumer_app, declared_durable),
+        "streamName": nats_stream_name(owner_app, &consume.stream),
+        // Defaults, overridable below. `explicit` + `all` is what every
+        // consumer got before 2.28 and stays the behaviour of a consume entry
+        // that tunes nothing.
+        "ackPolicy": consume.ack_policy.as_deref().unwrap_or("explicit"),
+        "deliverPolicy": consume.deliver_policy.as_deref().unwrap_or("all"),
+        "account": account_object_name,
+    });
+
+    // As in `stream_object`: emit only what was declared, so an omitted knob
+    // leaves NACK's default alone and the object stays byte-stable. The push
+    // surface (`deliverSubject`/`deliverGroup`/`flowControl`/
+    // `heartbeatInterval`) and `replicas` are deliberately not threaded —
+    // the webhook rejects them and this function must not be able to emit one.
+    let obj = spec.as_object_mut().expect("spec is an object");
+    macro_rules! put {
+        ($key:expr, $value:expr) => {
+            if let Some(v) = $value {
+                obj.insert($key.to_string(), serde_json::json!(v));
+            }
+        };
+    }
+    put!("ackWait", consume.ack_wait.as_deref());
+    put!("maxDeliver", consume.max_deliver);
+    put!("backoff", consume.backoff.as_ref());
+    put!("maxAckPending", consume.max_ack_pending);
+    put!("filterSubject", consume.filter_subject.as_deref());
+    put!("filterSubjects", consume.filter_subjects.as_ref());
+    put!("optStartSeq", consume.opt_start_seq);
+    put!("optStartTime", consume.opt_start_time.as_deref());
+    put!("replayPolicy", consume.replay_policy.as_deref());
+    put!("maxWaiting", consume.max_waiting);
+    put!("maxRequestBatch", consume.max_request_batch);
+    put!("maxRequestExpires", consume.max_request_expires.as_deref());
+    put!("maxRequestMaxBytes", consume.max_request_max_bytes);
+    put!("inactiveThreshold", consume.inactive_threshold.as_deref());
+    put!("rateLimitBps", consume.rate_limit_bps);
+    put!("headersOnly", consume.headers_only);
+    put!("memStorage", consume.mem_storage);
+    put!("sampleFreq", consume.sample_freq.as_deref());
+    put!("description", consume.description.as_deref());
+
     serde_json::json!({
         "apiVersion": "jetstream.nats.io/v1beta2",
         "kind": "Consumer",
@@ -540,13 +719,7 @@ pub fn consumer_object(
                 "apprafter.io/managed-by": "apprafter",
             },
         },
-        "spec": {
-            "durableName": nats_durable_name(consumer_app, declared_durable),
-            "streamName": nats_stream_name(owner_app, owner_declared_stream_name),
-            "ackPolicy": "explicit",
-            "deliverPolicy": "all",
-            "account": account_object_name,
-        },
+        "spec": spec,
     })
 }
 
@@ -1690,6 +1863,124 @@ mod tests {
 
     // --- connection_secret_object (2.5d Task 9, ADR 0061 §6) ----------
 
+    // ── 2.28 dead-letter queues (ADR 0065 §2.4) ──────────────────────
+
+    fn js_with_dlq(from: Option<&str>) -> ResourceClaimJetStream {
+        ResourceClaimJetStream {
+            dynamic_streams: false,
+            streams: vec![JetStreamStream {
+                name: "orders".into(),
+                subjects: vec!["indexer.orders.>".into()],
+                max_bytes: "1Gi".into(),
+                ..Default::default()
+            }],
+            consume: vec![JetStreamConsume {
+                from: from.map(str::to_string),
+                stream: "blocks-head".into(),
+                durable: "reader".into(),
+                max_deliver: Some(5),
+                dead_letter: Some(operator_core::JetStreamDeadLetter {
+                    stream: "reader-dlq".into(),
+                    max_bytes: "64Mi".into(),
+                    max_age: Some("168h".into()),
+                }),
+                ..Default::default()
+            }],
+        }
+    }
+
+    #[test]
+    fn a_dead_letter_subject_names_exactly_one_pair() {
+        // A wildcard here would collect every neighbour's failures in the
+        // same account — the disclosure the deny vector exists to prevent.
+        let s = dead_letter_subject("indexer", "feeder", "blocks-head", "reader");
+        assert_eq!(
+            s,
+            "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.feeder_blocks-head.indexer_reader"
+        );
+        assert!(!s.contains('>'), "never a wildcard: {s}");
+        assert!(!s.contains('*'), "never a wildcard: {s}");
+    }
+
+    #[test]
+    fn the_dead_letter_subject_keys_the_stream_by_owner_and_the_durable_by_consumer() {
+        // The asymmetry is the point (ADR 0061): two applications may each
+        // hold a durable called `reader` on one shared stream, so the durable
+        // half must carry the CONSUMER's name while the stream half carries
+        // the OWNER's. Swapping them would make both applications' DLQs
+        // subscribe to the same subject.
+        let a = dead_letter_subject("app-a", "feeder", "blocks-head", "reader");
+        let b = dead_letter_subject("app-b", "feeder", "blocks-head", "reader");
+        assert_ne!(
+            a, b,
+            "two consumers of one stream must not share a DLQ subject"
+        );
+        assert!(a.ends_with("app-a_reader"), "{a}");
+        assert!(a.contains("feeder_blocks-head"), "{a}");
+    }
+
+    #[test]
+    fn a_dead_letter_materialises_an_ordinary_declared_stream() {
+        let streams = materialised_streams("indexer", &js_with_dlq(Some("feeder")));
+        assert_eq!(streams.len(), 2, "the declared stream plus the DLQ");
+        let dlq = streams
+            .iter()
+            .find(|s| s.name == "reader-dlq")
+            .expect("dlq");
+        assert_eq!(
+            dlq.subjects,
+            vec![
+                "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.feeder_blocks-head.indexer_reader"
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            dlq.max_bytes, "64Mi",
+            "it counts against the namespace quota"
+        );
+        assert_eq!(dlq.max_age.as_deref(), Some("168h"));
+        assert_eq!(
+            dlq.retention.as_deref(),
+            Some("limits"),
+            "a DLQ is a log to be read, not a workqueue that deletes its own evidence on ack"
+        );
+        assert_eq!(dlq.storage.as_deref(), Some("file"));
+        assert!(!dlq.allow_purge, "a DLQ is never purgeable by the app");
+    }
+
+    #[test]
+    fn an_own_stream_dead_letter_keys_the_stream_by_the_declaring_app() {
+        // `from` omitted means the application's own stream, so the owner
+        // half of the subject is the declaring app itself.
+        let streams = materialised_streams("indexer", &js_with_dlq(None));
+        let dlq = streams
+            .iter()
+            .find(|s| s.name == "reader-dlq")
+            .expect("dlq");
+        assert!(
+            dlq.subjects[0].contains("indexer_blocks-head.indexer_reader"),
+            "{:?}",
+            dlq.subjects
+        );
+    }
+
+    #[test]
+    fn a_dead_letter_reaches_the_claim_view_like_any_declared_stream() {
+        // This is what buys the whole design: the allow list, the deny
+        // vector, the quota sum and the capture detector all read
+        // ClaimView.streams, so a DLQ that appeared only at apply time would
+        // exist in NATS while being invisible to every one of them.
+        let claims = vec![jetstream_claim(
+            "demo",
+            "indexer",
+            js_with_dlq(Some("feeder")),
+        )];
+        let views = claim_views(&claims, &size_map());
+        let names: Vec<&str> = views[0].streams.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"reader-dlq"), "{names:?}");
+        assert!(names.contains(&"orders"), "{names:?}");
+    }
+
     fn sample_view() -> ClaimView {
         ClaimView {
             namespace: "demo".into(),
@@ -1896,17 +2187,26 @@ mod tests {
 
     // --- stream_object / consumer_object (2.5e Task 3, NACK CRs) -----
 
+    /// The minimal declared stream the object-builder tests render.
+    fn decl_stream(max_age: Option<&str>) -> JetStreamStream {
+        JetStreamStream {
+            name: "orders".into(),
+            subjects: vec!["streamapp.orders.>".into()],
+            storage: Some("file".into()),
+            retention: Some("limits".into()),
+            max_age: max_age.map(str::to_string),
+            max_bytes: "1Gi".into(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn stream_object_carries_the_nats_side_name_and_declared_shape() {
         let s = stream_object(
             "demo",
             "nats-system",
             "streamapp",
-            "orders",
-            &["streamapp.orders.>".to_string()],
-            "file",
-            "limits",
-            "",
+            &decl_stream(None),
             1_073_741_824,
             "ns-demo",
         );
@@ -1938,16 +2238,243 @@ mod tests {
     }
 
     #[test]
+    fn every_declared_stream_knob_reaches_the_nack_object() {
+        // Taking a typed struct is not the same as carrying its fields. This
+        // asserts the rendered spec, key by key, because a missed `put!` line
+        // compiles and silently drops a setting the manifest asked for.
+        let s = stream_object(
+            "demo",
+            "nats-system",
+            "streamapp",
+            &JetStreamStream {
+                name: "orders".into(),
+                subjects: vec!["streamapp.orders.>".into()],
+                max_bytes: "1Gi".into(),
+                max_msgs: Some(1000),
+                max_msgs_per_subject: Some(100),
+                max_msg_size: Some(4096),
+                max_consumers: Some(8),
+                discard: Some("new".into()),
+                discard_per_subject: Some(true),
+                duplicate_window: Some("2m".into()),
+                compression: Some("s2".into()),
+                allow_direct: Some(true),
+                allow_rollup: Some(true),
+                description: Some("orders ingest".into()),
+                consumer_limits: Some(operator_core::JetStreamConsumerLimits {
+                    inactive_threshold: Some("5m".into()),
+                    max_ack_pending: Some(42),
+                }),
+                ..Default::default()
+            },
+            1_073_741_824,
+            "ns-demo",
+        );
+        let spec = &s["spec"];
+        assert_eq!(spec["maxMsgs"], 1000);
+        assert_eq!(spec["maxMsgsPerSubject"], 100);
+        assert_eq!(spec["maxMsgSize"], 4096);
+        assert_eq!(spec["maxConsumers"], 8);
+        assert_eq!(spec["discard"], "new");
+        assert_eq!(spec["discardPerSubject"], true);
+        assert_eq!(spec["duplicateWindow"], "2m");
+        assert_eq!(spec["compression"], "s2");
+        assert_eq!(spec["allowDirect"], true);
+        assert_eq!(spec["allowRollup"], true);
+        assert_eq!(spec["description"], "orders ingest");
+        assert_eq!(spec["consumerLimits"]["inactiveThreshold"], "5m");
+        assert_eq!(spec["consumerLimits"]["maxAckPending"], 42);
+    }
+
+    #[test]
+    fn an_undeclared_stream_knob_is_omitted_rather_than_pinned() {
+        // An omitted knob must leave NACK's own default alone. Emitting a
+        // value this code invented would pin every stream to it forever, and
+        // would also make the rendered object differ from reconcile to
+        // reconcile if the invented default ever changed.
+        let s = stream_object(
+            "demo",
+            "nats-system",
+            "streamapp",
+            &decl_stream(None),
+            1_073_741_824,
+            "ns-demo",
+        );
+        for key in [
+            "maxMsgs",
+            "maxMsgsPerSubject",
+            "compression",
+            "allowDirect",
+            "allowRollup",
+            "consumerLimits",
+            "discard",
+        ] {
+            assert!(
+                s["spec"].get(key).is_none(),
+                "{key} was emitted without being declared: {}",
+                s["spec"]
+            );
+        }
+    }
+
+    #[test]
+    fn the_isolation_breaking_stream_fields_can_never_be_emitted() {
+        // The webhook rejects them, but this function must not be CAPABLE of
+        // emitting one even if a claim somehow carried it — a claim can be
+        // written directly, and a webhook can be unavailable.
+        let mut stream = decl_stream(None);
+        stream.mirror = Some(std::collections::BTreeMap::from([(
+            "name".to_string(),
+            serde_json::json!("victim"),
+        )]));
+        stream.sources = Some(vec![std::collections::BTreeMap::from([(
+            "name".to_string(),
+            serde_json::json!("victim"),
+        )])]);
+        stream.replicas = Some(3);
+        let s = stream_object(
+            "demo",
+            "nats-system",
+            "streamapp",
+            &stream,
+            1_073_741_824,
+            "ns-demo",
+        );
+        for key in [
+            "mirror",
+            "sources",
+            "republish",
+            "subjectTransform",
+            "placement",
+            "replicas",
+        ] {
+            assert!(
+                s["spec"].get(key).is_none(),
+                "{key} reached the NACK object: {}",
+                s["spec"]
+            );
+        }
+    }
+
+    #[test]
+    fn every_declared_consumer_knob_reaches_the_nack_object() {
+        let c = consumer_object(
+            "demo",
+            "nats-system",
+            "consumerapp",
+            &JetStreamConsume {
+                from: Some("streamapp".into()),
+                stream: "orders".into(),
+                durable: "reader".into(),
+                ack_policy: Some("all".into()),
+                ack_wait: Some("30s".into()),
+                max_deliver: Some(5),
+                backoff: Some(vec!["1s".into(), "5s".into()]),
+                max_ack_pending: Some(100),
+                filter_subject: Some("streamapp.orders.eu".into()),
+                deliver_policy: Some("byStartSequence".into()),
+                opt_start_seq: Some(42),
+                replay_policy: Some("original".into()),
+                max_waiting: Some(64),
+                max_request_batch: Some(16),
+                max_request_expires: Some("10s".into()),
+                max_request_max_bytes: Some(1024),
+                inactive_threshold: Some("1h".into()),
+                rate_limit_bps: Some(2048),
+                headers_only: Some(true),
+                mem_storage: Some(true),
+                sample_freq: Some("10%".into()),
+                description: Some("eu reader".into()),
+                ..Default::default()
+            },
+            "streamapp",
+            "ns-demo",
+        );
+        let spec = &c["spec"];
+        assert_eq!(spec["ackPolicy"], "all");
+        assert_eq!(spec["ackWait"], "30s");
+        assert_eq!(spec["maxDeliver"], 5);
+        assert_eq!(spec["backoff"], serde_json::json!(["1s", "5s"]));
+        assert_eq!(spec["maxAckPending"], 100);
+        assert_eq!(spec["filterSubject"], "streamapp.orders.eu");
+        assert_eq!(spec["deliverPolicy"], "byStartSequence");
+        assert_eq!(spec["optStartSeq"], 42);
+        assert_eq!(spec["replayPolicy"], "original");
+        assert_eq!(spec["maxWaiting"], 64);
+        assert_eq!(spec["maxRequestBatch"], 16);
+        assert_eq!(spec["maxRequestExpires"], "10s");
+        assert_eq!(spec["maxRequestMaxBytes"], 1024);
+        assert_eq!(spec["inactiveThreshold"], "1h");
+        assert_eq!(spec["rateLimitBps"], 2048);
+        assert_eq!(spec["headersOnly"], true);
+        assert_eq!(spec["memStorage"], true);
+        assert_eq!(spec["sampleFreq"], "10%");
+        assert_eq!(spec["description"], "eu reader");
+    }
+
+    #[test]
+    fn the_push_surface_can_never_be_emitted_on_a_consumer() {
+        let c = consumer_object(
+            "demo",
+            "nats-system",
+            "consumerapp",
+            &JetStreamConsume {
+                from: Some("streamapp".into()),
+                stream: "orders".into(),
+                durable: "reader".into(),
+                deliver_subject: Some("victim.inbox".into()),
+                deliver_group: Some("g".into()),
+                flow_control: Some(true),
+                heartbeat_interval: Some("5s".into()),
+                replicas: Some(3),
+                ..Default::default()
+            },
+            "streamapp",
+            "ns-demo",
+        );
+        for key in [
+            "deliverSubject",
+            "deliverGroup",
+            "flowControl",
+            "heartbeatInterval",
+            "replicas",
+        ] {
+            assert!(
+                c["spec"].get(key).is_none(),
+                "{key} reached the NACK object — push delivery is performed by the server, \
+                 outside the application's publish permissions: {}",
+                c["spec"]
+            );
+        }
+    }
+
+    #[test]
+    fn a_consumer_that_tunes_nothing_keeps_the_pre_2_28_defaults() {
+        let c = consumer_object(
+            "demo",
+            "nats-system",
+            "consumerapp",
+            &JetStreamConsume {
+                stream: "orders".into(),
+                durable: "reader".into(),
+                ..Default::default()
+            },
+            "consumerapp",
+            "ns-demo",
+        );
+        assert_eq!(c["spec"]["ackPolicy"], "explicit");
+        assert_eq!(c["spec"]["deliverPolicy"], "all");
+        assert!(c["spec"].get("ackWait").is_none());
+        assert!(c["spec"].get("maxDeliver").is_none());
+    }
+
+    #[test]
     fn stream_object_omits_max_age_when_absent() {
         let s = stream_object(
             "demo",
             "nats-system",
             "streamapp",
-            "orders",
-            &["streamapp.orders.>".to_string()],
-            "file",
-            "limits",
-            "",
+            &decl_stream(None),
             1_073_741_824,
             "ns-demo",
         );
@@ -1963,11 +2490,7 @@ mod tests {
             "demo",
             "nats-system",
             "streamapp",
-            "orders",
-            &["streamapp.orders.>".to_string()],
-            "file",
-            "limits",
-            "24h",
+            &decl_stream(Some("24h")),
             1_073_741_824,
             "ns-demo",
         );
@@ -1980,9 +2503,13 @@ mod tests {
             "demo",
             "nats-system",
             "consumerapp",
-            "reader",
+            &JetStreamConsume {
+                from: Some("streamapp".into()),
+                stream: "orders".into(),
+                durable: "reader".into(),
+                ..Default::default()
+            },
             "streamapp",
-            "orders",
             "ns-demo",
         );
         assert_eq!(c["apiVersion"], "jetstream.nats.io/v1beta2");

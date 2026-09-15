@@ -2155,7 +2155,12 @@ async fn provision_nats(
     let stream_api: Api<DynamicObject> =
         Api::namespaced_with(ctx.client.clone(), &nats_ns, &jetstream_stream_ar());
     if let Some(js) = claim.spec.jetstream.as_ref() {
-        for stream in &js.streams {
+        // 2.28: the DECLARED streams plus the DLQ-derived ones, from the same
+        // `materialised_streams` list `claim_view` builds `ClaimView.streams`
+        // from. Iterating `js.streams` here instead would create a DLQ in NATS
+        // that the allow list, the deny vector, the quota sum and the capture
+        // detector never heard of.
+        for stream in &nats::materialised_streams(&cv.app, js) {
             let max_bytes = nats::quantity_bytes(&stream.max_bytes).ok_or_else(|| {
                 ReconcileError::Provisioning(format!(
                     "{name}: streams[{:?}].maxBytes {:?} is not a parseable quantity — the \
@@ -2164,18 +2169,8 @@ async fn provision_nats(
                     stream.name, stream.max_bytes
                 ))
             })?;
-            let stream_body = nats::stream_object(
-                ns,
-                &nats_ns,
-                &cv.app,
-                &stream.name,
-                &stream.subjects,
-                stream.storage.as_deref().unwrap_or("file"),
-                stream.retention.as_deref().unwrap_or("limits"),
-                stream.max_age.as_deref().unwrap_or(""),
-                max_bytes,
-                &account_obj_name,
-            );
+            let stream_body =
+                nats::stream_object(ns, &nats_ns, &cv.app, stream, max_bytes, &account_obj_name);
             let applied = stream_api
                 .patch(
                     &format!("{ns}-{}-{}", cv.app, stream.name),
@@ -2195,16 +2190,21 @@ async fn provision_nats(
 
     let consumer_api: Api<DynamicObject> =
         Api::namespaced_with(ctx.client.clone(), &nats_ns, &jetstream_consumer_ar());
-    for consume in &cv.consumes {
-        let consumer_body = nats::consumer_object(
-            ns,
-            &nats_ns,
-            &cv.app,
-            &consume.durable,
-            &consume.owner,
-            &consume.stream,
-            &account_obj_name,
-        );
+    // 2.28: iterate the DECLARED entries, not the `ConsumeView`s — the view
+    // carries only what the permission model needs, while the Consumer object
+    // needs the whole tuning surface. The owner is resolved through the same
+    // `consume_owner` the view uses, so the two cannot disagree about which
+    // application's stream a `from`-less entry names.
+    let declared_consumes: Vec<operator_core::JetStreamConsume> = claim
+        .spec
+        .jetstream
+        .as_ref()
+        .map(|js| js.consume.clone())
+        .unwrap_or_default();
+    for consume in &declared_consumes {
+        let owner = nats::consume_owner(&cv.app, consume);
+        let consumer_body =
+            nats::consumer_object(ns, &nats_ns, &cv.app, consume, &owner, &account_obj_name);
         let applied = consumer_api
             .patch(
                 &format!("{ns}-{}-{}", cv.app, consume.durable),
