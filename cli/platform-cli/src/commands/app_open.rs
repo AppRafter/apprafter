@@ -199,6 +199,33 @@ pub(crate) struct CrRef {
     pub(crate) name: String,
 }
 
+/// Is this one of Argo CD's `status.resources[]` entries an AppRafter
+/// **workload** (ADR 0062) — i.e. an `apprafter.io` `Application` CR?
+///
+/// The GROUP, not the kind alone: an app-of-apps child is an
+/// `argoproj.io` `Application` and must not be counted as a workload.
+/// `status.resources[]` records group and version in separate fields, so
+/// the bare group is the exact discriminator.
+///
+/// It lives HERE, beside [`apprafter_app_refs`], rather than in `app.rs`
+/// or in a new module, because this file already owns the
+/// registration→workload projection and `app.rs` already depends on it
+/// (`use crate::commands::app_open`). Every one of the three callers —
+/// this function, `app::workload_count_cell` and
+/// `app::workload_health_cell` — therefore reaches it over an edge that
+/// already existed; nothing new points anywhere new. The leaf
+/// alternative, `k8s_helpers`, is about *spawning kubectl*, and a pure
+/// predicate over a decoded CR is not that.
+///
+/// Note this is deliberately the predicate only, NOT
+/// [`apprafter_app_refs`]: the display cells in `app.rs` must not be
+/// wired to a resolution helper that drops nameless entries and resolves
+/// a namespace per entry for `app open`'s reasons.
+pub(crate) fn is_apprafter_workload(entry: &Value) -> bool {
+    entry.get("group").and_then(Value::as_str) == Some("apprafter.io")
+        && entry.get("kind").and_then(Value::as_str) == Some("Application")
+}
+
 /// Every AppRafter `Application` CR a registration deploys, in the order
 /// Argo CD records them.
 ///
@@ -226,10 +253,7 @@ pub(crate) fn apprafter_app_refs(argocd_app: &Value) -> Vec<CrRef> {
         .and_then(Value::as_array)
         .map(|rs| {
             rs.iter()
-                .filter(|r| {
-                    r.get("group").and_then(Value::as_str) == Some("apprafter.io")
-                        && r.get("kind").and_then(Value::as_str) == Some("Application")
-                })
+                .filter(|r| is_apprafter_workload(r))
                 .filter_map(|r| {
                     Some(CrRef {
                         namespace: r

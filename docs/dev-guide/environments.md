@@ -262,6 +262,7 @@ apprafter app list
 +----------------+---------+----------------+-----------+----------------------------+--------+---------+
 | parser-staging | staging | parser-staging | 1         | github.com/acme/parser.git | Synced | Healthy |
 +----------------+---------+----------------+-----------+----------------------------+--------+---------+
+HEALTH is Argo CD's verdict on the Application CRs; it does not see pod state — run `apprafter app status <name>`.
 ```
 
 `WORKLOADS` is how many workloads that one registration deploys — a
@@ -269,6 +270,15 @@ manifest package is a bundle, and `1` here says each of these two is a
 single-workload one. The repo URL drops its `https://` for width;
 `PROJECT` and `REV` are not in the list, but `apprafter app status`
 still prints both.
+
+`HEALTH` is folded over all of a registration's workloads. When they
+agree it is the single word above; when they do not, the cell names the
+worst one and how many are in it — `Degraded 1/3` is a different
+situation from `Degraded 3/3`. A workload held at a digest by `apprafter
+app rollback` adds `· 1 pinned`, because a pin is otherwise invisible
+next to a sibling that is still rolling. As the footer says, this column
+is a verdict on the `Application` CRs and does not look at pods — for
+that, run `apprafter app status <name>`.
 
 **Read the logical name off that table by stripping the `ENV` suffix**,
 because no column carries it: `NAME` is the per-environment identity

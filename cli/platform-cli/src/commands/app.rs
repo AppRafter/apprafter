@@ -134,6 +134,11 @@ struct AppRow {
     repo: String,
     #[tabled(rename = "SYNC")]
     sync: String,
+    /// Argo CD's health verdict, folded over the bundle's workloads by
+    /// [`workload_health_cell`] rather than read off the registration —
+    /// see that function for why a single word is not enough at N > 1.
+    /// It is a verdict on the `Application` CRs and does NOT see pod
+    /// state; the footer [`HEALTH_COLUMN_NOTE`] says so under the table.
     #[tabled(rename = "HEALTH")]
     health: String,
 }
@@ -942,8 +947,27 @@ pub fn list(project: &str, all_projects: bool, all_managed: bool) -> Result<()> 
 
     let rows: Vec<AppRow> = filtered.iter().map(app_row).collect();
     println!("{}", Table::new(&rows));
+    // Printed once, under the table, and only when there is a table —
+    // the early return above owns the empty case. `app_rollup`'s
+    // single trailing `run \`apprafter app status <name>\`` line is the
+    // house shape for this.
+    println!("{HEALTH_COLUMN_NOTE}");
     Ok(())
 }
+
+/// The one-line footer under `app list`'s table.
+///
+/// The `HEALTH` column reads like pod health and is not: the chart's
+/// `apprafter.io_Application` health script keys on `status.phase`,
+/// which the operator sets to `Ready` the moment it applies the
+/// Deployment, so a CrashLooping application renders `Healthy` here.
+/// This change does not fix that — it is older and lives in the chart —
+/// but a column that quietly implies a guarantee it does not give is
+/// worse than one that names its own limit and points at the command
+/// that does look at pods.
+pub(crate) const HEALTH_COLUMN_NOTE: &str =
+    "HEALTH is Argo CD's verdict on the Application CRs; it does not see pod state — \
+     run `apprafter app status <name>`.";
 
 /// Pure helper — the label selector `app list` reads with. Extracted
 /// from [`list`].
@@ -3236,18 +3260,126 @@ pub(crate) fn workload_count_cell(app: &Value) -> String {
     let Some(resources) = app.pointer("/status/resources").and_then(Value::as_array) else {
         return "—".to_string();
     };
-    // The GROUP, not the kind alone: an app-of-apps child is an
-    // `argoproj.io` `Application` and must not be counted as a workload.
-    // `status.resources[]` records group and version in separate fields,
-    // so the bare group is the exact discriminator.
     resources
         .iter()
-        .filter(|r| {
-            r.get("group").and_then(Value::as_str) == Some("apprafter.io")
-                && r.get("kind").and_then(Value::as_str) == Some("Application")
-        })
+        .filter(|r| app_open::is_apprafter_workload(r))
         .count()
         .to_string()
+}
+
+/// Argo CD's health codes, **healthiest first**.
+///
+/// Two sources, and they agree. gitops-engine's `pkg/health/health.go`
+/// declares `healthOrder = [Healthy, Suspended, Progressing, Missing,
+/// Degraded, Unknown]` and its `IsWorse` compares positions in exactly
+/// that slice. `platform-stack/cue/component_argocd.cue` (the
+/// `resource.customizations.health.apprafter.io_Application` block)
+/// depends on position 1 by name:
+///
+/// > `Suspended` is the SECOND-healthiest code, so it overrides
+/// > `Healthy` and nothing else — the pin is invisible on the tile
+/// > whenever a sibling managed resource is `Progressing`, including a
+/// > repository that renders several apps into one Argo Application.
+///
+/// That masking note is why [`workload_health_cell`] exists. Anyone
+/// reordering this slice is changing which workload a multi-workload row
+/// speaks for, and must read that chart block first.
+const HEALTH_ORDER: &[&str] = &[
+    "Healthy",
+    "Suspended",
+    "Progressing",
+    "Missing",
+    "Degraded",
+    "Unknown",
+];
+
+/// Position in [`HEALTH_ORDER`]; higher is worse.
+///
+/// An unrecognised code sorts **worst of all** — one past the end of the
+/// slice. This is a deliberate divergence from gitops-engine's
+/// `IsWorse`, which leaves an unmatched code at index `0` and so treats
+/// a status it has never heard of as the HEALTHIEST thing in the set.
+/// Here that would be the exact failure this cell was written to end: a
+/// fold that silently renders a word it does recognise while a workload
+/// sits in a state this table cannot name. Sorting it worst makes it the
+/// word the cell prints, verbatim, so the reader learns of it.
+fn health_rank(status: &str) -> usize {
+    HEALTH_ORDER
+        .iter()
+        .position(|h| *h == status)
+        .unwrap_or(HEALTH_ORDER.len())
+}
+
+/// The `HEALTH` cell folded over every workload the registration
+/// deploys, or `None` when it tracks no AppRafter workload at all.
+///
+/// `None` — not `"Unknown"`, not `"—"` — so the caller falls back to the
+/// registration's own `/status/health/status`. Two real cases land
+/// there: a registration Argo CD has not synced yet, and a raw
+/// YAML/Helm/Kustomize app surfaced by `--all-managed`, which deploys no
+/// AppRafter CR and whose only health verdict IS the registration's.
+///
+/// When every workload agrees the cell is that word **verbatim**, which
+/// is what keeps today's entire (N=1) fleet byte-identical to the
+/// pre-fold table. Disagreement renders `"<worst> <k>/<n>"`, because
+/// `Degraded` alone cannot distinguish 1-of-3 from 3-of-3, and the
+/// difference is the difference between a bad deploy and an outage.
+///
+/// The `· <k> pinned` suffix exists because of the masking note on
+/// [`HEALTH_ORDER`]: `Suspended` outranks `Healthy` and nothing else, so
+/// a single `Progressing` sibling hides a rollback pin on the Argo CD
+/// tile — and `app list` is the only listing in the product where a pin
+/// surfaces at all. The suffix is omitted when the aggregate is itself
+/// `Suspended`, which already says it.
+///
+/// NOT what this fixes: `health.status` here is Argo CD's verdict on the
+/// **CRs**, and the chart's health script reads only `status.phase`,
+/// which the operator sets to `Ready` as soon as it applies the
+/// Deployment. A CrashLooping app reads `Healthy` in every one of these
+/// cells. That is older and separate; the footer under the table says so
+/// rather than letting the column imply pod visibility.
+pub(crate) fn workload_health_cell(app: &Value) -> Option<String> {
+    let resources = app.pointer("/status/resources").and_then(Value::as_array)?;
+    let healths: Vec<&str> = resources
+        .iter()
+        .filter(|r| app_open::is_apprafter_workload(r))
+        // An entry Argo CD has not yet health-checked has no `health`
+        // key at all; `Unknown` is what the rest of this file calls that.
+        .map(|r| {
+            r.pointer("/health/status")
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown")
+        })
+        .collect();
+    let (first, rest) = healths.split_first()?;
+
+    if rest.iter().all(|h| h == first) {
+        return Some((*first).to_string());
+    }
+
+    // `max_by_key` would keep the LAST maximum, and two *different*
+    // unrecognised codes tie at the bottom rank — naming the later one
+    // would be arbitrary. Strictly-greater keeps the first, i.e. the
+    // order Argo CD records the resources in.
+    let worst = healths
+        .iter()
+        .copied()
+        .reduce(|acc, h| {
+            if health_rank(h) > health_rank(acc) {
+                h
+            } else {
+                acc
+            }
+        })
+        .unwrap_or("Unknown");
+    let worst_count = healths.iter().filter(|h| **h == worst).count();
+    let mut cell = format!("{worst} {worst_count}/{}", healths.len());
+
+    let pinned = healths.iter().filter(|h| **h == "Suspended").count();
+    if pinned > 0 && worst != "Suspended" {
+        cell.push_str(&format!(" · {pinned} pinned"));
+    }
+    Some(cell)
 }
 
 /// Derive a sane Application name from a normalised repo URL.
@@ -3860,11 +3992,18 @@ fn app_row(app: &Value) -> AppRow {
         .and_then(Value::as_str)
         .unwrap_or("Unknown")
         .to_string();
-    let health = app
-        .pointer("/status/health/status")
-        .and_then(Value::as_str)
-        .unwrap_or("Unknown")
-        .to_string();
+    // ADR 0062: fold the verdict over every workload in the bundle, so a
+    // minority `Degraded` cannot hide behind a majority `Healthy` and a
+    // rollback pin cannot be masked by a `Progressing` sibling. Falls
+    // back to the registration's own health when it tracks no AppRafter
+    // workload — an unsynced registration, or a raw-YAML app under
+    // `--all-managed`.
+    let health = workload_health_cell(app).unwrap_or_else(|| {
+        app.pointer("/status/health/status")
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown")
+            .to_string()
+    });
     // ADR 0044 (1.83j): which environment this deployment targets. Reuses
     // the same label → status → `(base)` resolution as the `app status`
     // per-env aggregation so the two surfaces never disagree.
@@ -6074,6 +6213,166 @@ mod tests {
             {"group": "apprafter.io", "kind": "ServiceProvider", "name": "pg"}
         ]}});
         assert_eq!(app_row(&app).workloads, "1");
+    }
+
+    /// A registration deploying one workload per entry in `healths`.
+    ///
+    /// The top-level `status.health.status` is set to a value no fold can
+    /// produce (`REGISTRATION-LEVEL`), so every assertion below proves the
+    /// cell came from the WORKLOADS rather than coincidentally agreeing
+    /// with the registration Argo CD would have reported.
+    fn argo_with_workload_health(healths: &[&str]) -> Value {
+        let resources: Vec<Value> = healths
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                json!({"group": "apprafter.io", "kind": "Application",
+                       "name": format!("w{i}"), "namespace": "shop",
+                       "health": {"status": h}})
+            })
+            .collect();
+        json!({
+            "metadata": {"name": "shop"},
+            "spec": {"source": {"repoURL": "https://github.com/acme/shop"},
+                     "destination": {"namespace": "shop"}},
+            "status": {"health": {"status": "REGISTRATION-LEVEL"},
+                       "resources": resources}
+        })
+    }
+
+    #[test]
+    fn health_cell_is_unchanged_when_every_workload_agrees() {
+        // N=1 is today's entire fleet. It must render exactly as before, or
+        // this is a cosmetic change to every existing user's table.
+        for h in ["Healthy", "Degraded", "Progressing", "Missing"] {
+            assert_eq!(app_row(&argo_with_workload_health(&[h])).health, h);
+        }
+        let three_agreeing = argo_with_workload_health(&["Healthy", "Healthy", "Healthy"]);
+        assert_eq!(app_row(&three_agreeing).health, "Healthy");
+    }
+
+    #[test]
+    fn health_cell_is_cardinal_when_workloads_disagree() {
+        let app = argo_with_workload_health(&["Healthy", "Degraded", "Healthy"]);
+        assert_eq!(app_row(&app).health, "Degraded 1/3");
+    }
+
+    #[test]
+    fn health_cell_surfaces_a_pin_a_sibling_would_otherwise_mask() {
+        // component_argocd.cue — Suspended overrides Healthy and nothing
+        // else, so a Progressing sibling hides the pin on the Argo tile. The
+        // cell must say it anyway; this listing is the only place a pin
+        // shows up at all.
+        let cell = app_row(&argo_with_workload_health(&["Suspended", "Progressing"])).health;
+        assert!(cell.contains("1 pinned"), "got {cell}");
+        // …and NOT when the aggregate is already the word `Suspended`
+        // (it outranks Healthy, so it wins that pair): the suffix would
+        // only repeat what the cell already says.
+        assert_eq!(
+            app_row(&argo_with_workload_health(&["Suspended", "Healthy"])).health,
+            "Suspended 1/2"
+        );
+    }
+
+    #[test]
+    fn health_cell_falls_back_to_the_registration_when_no_workload_is_tracked() {
+        // Before the first sync, and for a raw-YAML app surfaced by
+        // --all-managed, there is no apprafter.io workload to fold.
+        let app = json!({"metadata": {"name": "x"},
+                         "spec": {"source": {"repoURL": "https://x/y"}},
+                         "status": {"health": {"status": "Progressing"}}});
+        assert_eq!(app_row(&app).health, "Progressing");
+    }
+
+    #[test]
+    fn health_cell_names_the_worst_by_the_charts_ordering_not_by_count() {
+        // gitops-engine's healthOrder, which component_argocd.cue's
+        // "SECOND-healthiest" note is keyed to: Healthy < Suspended <
+        // Progressing < Missing < Degraded < Unknown. The MINORITY status
+        // is the one that leads the cell whenever it is the worse one —
+        // "2/3 fine" is not the sentence a reader needs.
+        // Deliberately no `Suspended` anywhere in here: the pin suffix is
+        // the previous test's subject, and duplicating it would make both
+        // tests flip on one defect.
+        let one_degraded = argo_with_workload_health(&["Degraded", "Missing", "Missing"]);
+        assert_eq!(app_row(&one_degraded).health, "Degraded 1/3");
+        let one_missing = argo_with_workload_health(&["Missing", "Progressing", "Progressing"]);
+        assert_eq!(app_row(&one_missing).health, "Missing 1/3");
+        assert_eq!(
+            app_row(&argo_with_workload_health(&["Progressing", "Healthy"])).health,
+            "Progressing 1/2"
+        );
+    }
+
+    #[test]
+    fn health_cell_sorts_an_unrecognised_status_worst_not_healthiest() {
+        // gitops-engine's own IsWorse leaves a code it cannot find at index
+        // 0 — the HEALTHIEST slot — so an unheard-of status would vanish
+        // behind the majority word. This fold puts it last instead, so the
+        // reader is told a workload is in a state the table cannot name.
+        assert_eq!(
+            app_row(&argo_with_workload_health(&["Healthy", "Quiesced"])).health,
+            "Quiesced 1/2"
+        );
+        // Including against Degraded, the worst code that is recognised.
+        assert_eq!(
+            app_row(&argo_with_workload_health(&["Degraded", "Quiesced"])).health,
+            "Quiesced 1/2"
+        );
+    }
+
+    #[test]
+    fn health_cell_calls_an_unchecked_workload_unknown() {
+        // An entry Argo CD has recorded but not yet health-checked carries
+        // no `health` key. It is still a tracked workload, so the fold must
+        // not drop it (that would misreport the denominator) — `Unknown` is
+        // what the rest of this file calls an absent health.
+        let app = json!({
+            "metadata": {"name": "shop"},
+            "spec": {"source": {"repoURL": "https://x/y"}},
+            "status": {"health": {"status": "REGISTRATION-LEVEL"}, "resources": [
+                {"group": "apprafter.io", "kind": "Application", "name": "a",
+                 "health": {"status": "Healthy"}},
+                {"group": "apprafter.io", "kind": "Application", "name": "b"}
+            ]}
+        });
+        assert_eq!(app_row(&app).health, "Unknown 1/2");
+    }
+
+    #[test]
+    fn health_cell_ignores_non_workload_resources() {
+        // A Degraded Namespace or an app-of-apps child is not a workload of
+        // this bundle and must not colour its verdict — the same GROUP
+        // discriminator `WORKLOADS` counts by.
+        let app = json!({
+            "metadata": {"name": "shop"},
+            "spec": {"source": {"repoURL": "https://x/y"}},
+            "status": {"health": {"status": "REGISTRATION-LEVEL"}, "resources": [
+                {"group": "", "kind": "Namespace", "name": "shop",
+                 "health": {"status": "Degraded"}},
+                {"group": "argoproj.io", "kind": "Application", "name": "theirs",
+                 "health": {"status": "Missing"}},
+                {"group": "apprafter.io", "kind": "Application", "name": "ours",
+                 "health": {"status": "Healthy"}}
+            ]}
+        });
+        let row = app_row(&app);
+        assert_eq!(row.workloads, "1");
+        // `starts_with`, not equality: whether one agreeing workload
+        // renders verbatim is the subject of
+        // `health_cell_is_unchanged_when_every_workload_agrees`, and
+        // asserting it here too would make both flip on one defect. What
+        // this test owns is that neither non-workload's status leaked in.
+        assert!(row.health.starts_with("Healthy"), "got {}", row.health);
+    }
+
+    #[test]
+    fn health_column_note_does_not_promise_pod_visibility() {
+        // The footer is the whole apology for a column that reads like pod
+        // health and is not. If it stops naming the command that DOES look
+        // at pods, the column is back to implying something it cannot give.
+        assert!(HEALTH_COLUMN_NOTE.contains("does not see pod state"));
+        assert!(HEALTH_COLUMN_NOTE.contains("apprafter app status"));
     }
 
     #[test]
