@@ -168,7 +168,43 @@ pub fn instance_addr(instance: &str, ns: &str) -> String {
 /// / pub-sub workloads never need them. `SWAPDB` stays denied via
 /// `@dangerous`.
 pub fn acl_setuser_args(user: &str, password: &str, dbnum: u16) -> Vec<String> {
-    vec![
+    acl_setuser_args_scoped(user, password, dbnum, None, SharedAccess::ReadWrite)
+}
+
+/// Which privilege level a consumer of a SHARED cache binds at (2.29 /
+/// ADR 0066 §3.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedAccess {
+    ReadWrite,
+    ReadOnly,
+}
+
+/// The ACL for one user, with the two things a SHARED `$N` changes.
+///
+/// `channel_prefix_override` — **the load-bearing one.** An owned claim's
+/// channels are keyed by its own user (`&<user>:*`), which correctly isolates
+/// it. Channels are NOT database-scoped, so applying that rule to two
+/// consumers of one shared cache would leave them unable to see each other's
+/// pub/sub: the feature would look provisioned and simply not work. A shared
+/// binding therefore passes the SHARED prefix, and every consumer of that
+/// database reports it through `claim.redis.channelPrefix`.
+///
+/// `access` — `ReadOnly` drops the write categories, **and denies `publish` /
+/// `spublish` explicitly.** That is not belt-and-braces: measured on Dragonfly
+/// v1.37.0, `-@write` leaves both ALLOWED, so without them a "read-only"
+/// consumer could publish into the shared channel prefix every other consumer
+/// subscribes to. This is ADR 0042 §2's lesson repeating — `MOVE` and `COPY`
+/// were assumed to be in `@dangerous` and are not — which is why the
+/// categories here are verified rather than reasoned about.
+pub fn acl_setuser_args_scoped(
+    user: &str,
+    password: &str,
+    dbnum: u16,
+    channel_prefix_override: Option<&str>,
+    access: SharedAccess,
+) -> Vec<String> {
+    let channel = channel_prefix_override.unwrap_or(user);
+    let mut args = vec![
         user.to_string(),
         "on".into(),
         format!(">{password}"),
@@ -176,7 +212,7 @@ pub fn acl_setuser_args(user: &str, password: &str, dbnum: u16) -> Vec<String> {
         "resetkeys".into(),
         "~*".into(),
         "resetchannels".into(),
-        format!("&{user}:*"),
+        format!("&{channel}:*"),
         "+@all".into(),
         "-@admin".into(),
         "-@dangerous".into(),
@@ -211,7 +247,17 @@ pub fn acl_setuser_args(user: &str, password: &str, dbnum: u16) -> Vec<String> {
         // already leaves CLIENT SETNAME/SETINFO/GETNAME/ID available, so a
         // client library's connection init works (verified on Dragonfly
         // v1.37.0). EVAL and the `$N` keyspace pin are likewise retained.
-    ]
+    ];
+
+    if access == SharedAccess::ReadOnly {
+        // `-@write` first, then the two commands MEASURED to survive it.
+        args.extend([
+            "-@write".to_string(),
+            "-publish".to_string(),
+            "-spublish".to_string(),
+        ]);
+    }
+    args
 }
 
 /// DB-pinned connection URL. The `/N` selects DB N; the `$N` ACL pins the
@@ -1188,6 +1234,76 @@ mod tests {
     }
 
     // --- acl_setuser_args() ---
+
+    #[test]
+    #[test]
+    fn a_shared_binding_uses_the_shared_channel_prefix() {
+        // Channels are NOT database-scoped, so the per-user prefix that
+        // correctly isolates an OWNED claim would leave two consumers of one
+        // shared cache unable to see each other's pub/sub — provisioned and
+        // silently useless.
+        let args = acl_setuser_args_scoped(
+            "claim_apps_web_redis",
+            "pw",
+            7,
+            Some("shd_apps_cache"),
+            SharedAccess::ReadWrite,
+        );
+        assert!(args.contains(&"&shd_apps_cache:*".to_string()), "{args:?}");
+        assert!(
+            !args.contains(&"&claim_apps_web_redis:*".to_string()),
+            "the per-user prefix must not survive a shared binding: {args:?}"
+        );
+    }
+
+    #[test]
+    fn an_owned_claim_keeps_its_own_channel_prefix() {
+        // The other direction: the shared path must not have widened the
+        // ordinary one. An owned claim's channels stay keyed by its own user.
+        let args = acl_setuser_args("claim_apps_web_redis", "pw", 7);
+        assert!(
+            args.contains(&"&claim_apps_web_redis:*".to_string()),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn a_read_only_shared_consumer_is_denied_publish_explicitly() {
+        // MEASURED on v1.37.0: `-@write` leaves PUBLISH and SPUBLISH ALLOWED.
+        // Without the explicit denials a "read-only" consumer could publish
+        // into the shared channel prefix every other consumer subscribes to.
+        // This is ADR 0042 §2's MOVE/COPY lesson repeating, so the assertion
+        // names the commands rather than trusting the category.
+        let args = acl_setuser_args_scoped(
+            "claim_apps_rep_redis",
+            "pw",
+            7,
+            Some("shd_apps_cache"),
+            SharedAccess::ReadOnly,
+        );
+        for denial in ["-@write", "-publish", "-spublish"] {
+            assert!(
+                args.contains(&denial.to_string()),
+                "{denial} missing from a read-only ACL: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_write_shared_consumer_keeps_publish() {
+        // The denials must be scoped to `ro` — a rw consumer of a shared cache
+        // publishes as a matter of course.
+        let args = acl_setuser_args_scoped(
+            "claim_apps_web_redis",
+            "pw",
+            7,
+            Some("shd_apps_cache"),
+            SharedAccess::ReadWrite,
+        );
+        for denial in ["-@write", "-publish", "-spublish"] {
+            assert!(!args.contains(&denial.to_string()), "{denial}: {args:?}");
+        }
+    }
 
     #[test]
     fn acl_setuser_args_pin_db_and_keyspace() {
