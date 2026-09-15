@@ -137,8 +137,23 @@ one deliberate exception noted where it happens.
   closes. The one deliberate difference is the closing line: the sidecar
   says nothing was applied, this says the sidecar would refuse it too.
 
-  `✓ valid` now also prints the workload roster, in declaration order and
-  at one workload too. A bare `✓ valid` cannot answer "how many workloads
+  The bare command resolves the manifest **package directory**, not one
+  file of it. Resolving `apprafter/Application.cue` — the rule since
+  2.12 — is invisible at one file per package and silently halves a
+  bundle spread over several: the siblings never reach the checks, all
+  four compare N=1, and none can fire. This repository's own
+  `landing/web` is such a bundle, and measured there the local twin
+  returned the **opposite** verdict from the sidecar on its default
+  invocation. The `N *.cue files — pass the manifest explicitly` error
+  is gone rather than reworded, because following that advice literally
+  is what produced the half-read. A directory holding several `.cue` is
+  not ambiguous; it is a package.
+
+  `✓ valid` now also prints the workload roster, in the order the
+  sidecar emits — read from the exported JSON's own text, since `cue`
+  has no single rule here (measured on v0.16.0: a single-file package
+  exports in declaration order, a multi-file package sorted, and `cue
+  def` follows file order in both) — and at one workload too. A bare `✓ valid` cannot answer "how many workloads
   is this?" — the first question a bundle raises, and the one that makes
   "my workload never appeared" answerable: a wrapper with a mistyped
   `apiVersion` is not a workload but an inert struct, and its only
