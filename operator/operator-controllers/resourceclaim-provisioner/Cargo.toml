@@ -30,6 +30,16 @@ async-trait = { workspace = true }
 base64      = { workspace = true }
 redis       = { version = "0.27", default-features = false, features = ["tokio-comp"] }
 async-nats  = "0.50.0"
+# 2.29 (ADR 0066 §3.1): the third imperative client, after redis and nats, and
+# for the same kind of reason — CNPG's managed.roles cannot create the roles a
+# shared database needs, because a CREATEROLE role without superuser may
+# administer only what it created (measured).
+#
+# Default features, which for this crate are just `runtime` (the tokio socket)
+# and carry NO TLS backend — that is what we want. `default-features = false`
+# was tried first and removes `runtime` along with it, taking `connect` with
+# it; the minimal-looking spelling was the wrong one.
+tokio-postgres = "0.7"
 
 [dev-dependencies]
 # 2.5d Task 9: asserts the NATS connection Secret's key SET against

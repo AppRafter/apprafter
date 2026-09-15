@@ -33,6 +33,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="docker.io/library/postgres:18-alpine"
 CTR="apprafter-shared-pg-check"
+PGPORT_HOST="${APPRAFTER_PG_CHECK_PORT:-15433}"
 PW="p'w\$\$q"
 
 BUILDER=podman
@@ -52,7 +53,7 @@ psql_as() { # <role> <db> <sql>
         < /dev/null 2>&1
 }
 
-printf '=== 1/5  the statements, from the module itself ===\n'
+printf '=== 1/6  the statements, from the module itself ===\n'
 SQL=$(cd "${REPO_ROOT}/operator" && cargo test -q -p operator-controllers-resourceclaim-provisioner \
     print_statements_for_the_live_sql_check -- --ignored --nocapture 2>/dev/null \
     | sed -n '/-- @@SETUP/,/-- @@END/p')
@@ -62,9 +63,12 @@ INDB=$(printf '%s\n' "$SQL" | sed -n '/-- @@INDB/,/-- @@END/p' | grep -v '^-- @@
 printf '  ok: %s setup statement(s), %s in-database statement(s)\n' \
     "$(printf '%s\n' "$SETUP" | grep -c .)" "$(printf '%s\n' "$INDB" | grep -c .)"
 
-printf '\n=== 2/5  a PostgreSQL of the operand major ===\n'
+printf '\n=== 2/6  a PostgreSQL of the operand major ===\n'
 "$BUILDER" rm -f "$CTR" >/dev/null 2>&1 || true
-"$BUILDER" run -d --name "$CTR" -e POSTGRES_PASSWORD=x "$IMAGE" >/dev/null
+# The port is published for step 6: rootless podman gives the container no
+# address of its own that the host can dial, so `inspect .IPAddress` is empty
+# and a published port is the only route in.
+"$BUILDER" run -d --name "$CTR" -p "${PGPORT_HOST}:5432" -e POSTGRES_PASSWORD=x "$IMAGE" >/dev/null
 for _ in $(seq 1 30); do
     "$BUILDER" exec "$CTR" pg_isready -q 2>/dev/null && break
     sleep 2
@@ -72,14 +76,14 @@ done
 VER=$(psql_as postgres postgres "SELECT version()" | head -1)
 printf '  ok: %s\n' "${VER:0:40}"
 
-printf '\n=== 3/5  the platform role, as CNPG managed.roles would create it ===\n'
+printf '\n=== 3/6  the platform role, as CNPG managed.roles would create it ===\n'
 # The ONE role CNPG creates. Not a superuser — that is the point of the whole
 # arrangement, and step 5 asserts it again at the end.
 psql_as postgres postgres "CREATE ROLE apprafter_admin LOGIN PASSWORD 'a' CREATEROLE CREATEDB;" >/dev/null \
     || fail "creating the platform role"
 printf '  ok: apprafter_admin created with CREATEROLE CREATEDB, no superuser\n'
 
-printf '\n=== 4/5  the builders run, as apprafter_admin ===\n'
+printf '\n=== 4/6  the builders run, as apprafter_admin ===\n'
 printf '%s\n' "$SETUP" | while IFS= read -r stmt; do
     [ -n "$stmt" ] || continue
     out=$(psql_as apprafter_admin postgres "$stmt") || {
@@ -98,7 +102,7 @@ printf '%s\n' "$INDB" | while IFS= read -r stmt; do
 done || fail "in-database statements"
 printf '  ok: reader grants applied, three consumers bound\n'
 
-printf '\n=== 5/5  the property the role model exists for ===\n'
+printf '\n=== 5/6  the property the role model exists for ===\n'
 OWNER=$("$BUILDER" exec -e PGPASSWORD="$PW" "$CTR" psql -U claim_apps_web_pg -d shd_apps_orders \
     -h 127.0.0.1 -v ON_ERROR_STOP=1 -tAc \
     "CREATE TABLE orders(id int primary key, note text); INSERT INTO orders VALUES (1,'from-web'); \
@@ -131,4 +135,20 @@ SUPER=$(psql_as postgres postgres "SELECT rolsuper FROM pg_roles WHERE rolname='
 [ "$SUPER" = "f" ] || fail "the platform role ended up a superuser (${SUPER})"
 printf '  ok: the platform role is still not a superuser\n'
 
-printf '\nGREEN — the shared-database SQL builders execute and produce the intended privileges.\n'
+printf '\n=== 6/6  the Rust client drives the same sequence ===\n'
+# The steps above prove the STATEMENTS, by piping them through psql. This
+# proves the CLIENT: that execute_all sequences a batch the way psql does, that
+# a failure is attributed to the right statement INDEX, and that the error
+# carries no statement text — which matters because a bind statement in that
+# same batch shape carries a password. psql cannot observe any of those.
+CLIENT_OUT=$(cd "${REPO_ROOT}/operator" \
+    && APPRAFTER_PG_SMOKE_DSN="postgresql://postgres:x@127.0.0.1:${PGPORT_HOST}/postgres" \
+       cargo test -q -p operator-controllers-resourceclaim-provisioner \
+       --test pg_client_smoke_test -- --ignored 2>&1 || true)
+case "$CLIENT_OUT" in
+    *"1 passed"*) printf '  ok: execute_all, extension_available and the indexed failure all behave\n' ;;
+    *) printf '%s\n' "$CLIENT_OUT" | tail -20 >&2
+       fail "the Postgres client smoke test did not pass" ;;
+esac
+
+printf '\nGREEN — the shared-database SQL builders and the client both execute.\n'
