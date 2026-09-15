@@ -813,13 +813,19 @@ pub enum AppCommand {
         /// `<git-url>` without cwd context.
         #[arg(long)]
         branch: Option<String>,
-        /// Path under the repo to render. Defaults to `/`, which
-        /// lets the cue-cmp plugin walk the whole repository: its
-        /// discovery command matches any `.cue` file under an
-        /// `apprafter/` directory, or any file named
-        /// `apprafter*.cue` anywhere. Both shapes work — the
-        /// scaffolded `apprafter/Application.cue` is matched by the
-        /// first.
+        /// Directory under the repo to render — never a file, which
+        /// is refused (Argo CD rejects a `spec.source.path` naming
+        /// one, and only after the registration exists). Under it
+        /// the cue-cmp plugin claims a `.cue` file whose path has an
+        /// `apprafter/` component or whose name starts with
+        /// `apprafter`, AND which carries an
+        /// `apprafter.io/…v1alpha1` marker; the scaffolded
+        /// `apprafter/Application.cue` satisfies both. One
+        /// registration is one manifest package: if the path holds
+        /// two sibling package directories the render refuses and
+        /// names them, so the `/` default fits a repository with a
+        /// single package — in a monorepo pass the package's parent
+        /// (`--path services/api`).
         #[arg(long, default_value = "/")]
         path: String,
         /// AppProject the Application joins. Default `apps`

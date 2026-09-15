@@ -4588,6 +4588,24 @@ pub(crate) fn name_the_application_lines(workload: &str, registration: &str) -> 
 /// the git steps that really remove one workload, and the command that
 /// removes the whole bundle, which is the other thing they may have
 /// meant.
+///
+/// # The git step names the workload, never the CUE key or the file
+///
+/// `workload` is the CR's `metadata.name`, which is all this command
+/// has: it resolved the string from cluster state, and the manifest that
+/// produced it is in a git repository the CLI has not read. The CUE
+/// binding above that `metadata.name` is the author's choice and is
+/// routinely different — this repository's own bundle declares
+/// `landingWebPreview:` for a CR named `landing-web-preview`, and
+/// `landing-web-preview:` is not even valid unquoted CUE. So is the
+/// FILE: the bundle is a package, its workloads may be spread over any
+/// number of `.cue` files, and that same CR lives in
+/// `Application-preview.cue`, not the `Application.cue` this used to
+/// name.
+///
+/// Naming either would be a guess printed in the imperative, which is
+/// worse than generality on the one path where the reader is being told
+/// to go edit their repository by hand.
 pub(crate) fn refuse_workload_lines(
     workload: &str,
     registration: &str,
@@ -4604,9 +4622,12 @@ pub(crate) fn refuse_workload_lines(
         String::new(),
         "To remove just this workload:".to_string(),
         format!(
-            "  1. delete the `{workload}:` block from the bundle's manifest \
-             (apprafter/Application.cue)"
+            "  1. in the bundle's manifest package, delete the block that declares \
+             `metadata.name: {workload}`"
         ),
+        "     (a bundle may spread its workloads over several `.cue` files, and the CUE key \
+         above the block need not match the name)"
+            .to_string(),
         "  2. commit and push — Argo CD prunes it on the next sync".to_string(),
         String::new(),
         format!("To remove the application and ALL {bundle_size} workloads:"),
@@ -10309,9 +10330,25 @@ mod remove_plan_tests {
         // WHY it is refused. This will be reported as a missing feature;
         // the message has to say it is GitOps, not an unimplemented verb.
         assert!(msg.contains("self-heal"), "{msg}");
-        // The route that actually works.
-        assert!(msg.contains("Application.cue"), "{msg}");
+        // The route that actually works — named by what the CLI KNOWS,
+        // which is the CR's `metadata.name`.
+        assert!(msg.contains("metadata.name: api"), "{msg}");
         assert!(msg.contains("commit and push"), "{msg}");
+        // And NOT by what it is only guessing at. The CUE binding above
+        // the block is the author's choice (`landingWebPreview:` for a
+        // CR named `landing-web-preview`, in this repository's own
+        // bundle — and the hyphenated form is not valid unquoted CUE),
+        // and a bundle spreads over as many files as it likes (that same
+        // CR is in `Application-preview.cue`). Both were asserted here
+        // as fact until 2.27b.
+        assert!(
+            !msg.contains("`api:` block"),
+            "the refusal must not claim to know the CUE key; got:\n{msg}"
+        );
+        assert!(
+            !msg.contains("Application.cue"),
+            "the refusal must not claim to know which file declares the workload; got:\n{msg}"
+        );
         // And the other thing they might have meant, as a command.
         assert!(msg.contains("ALL 3 workloads"), "{msg}");
         assert!(msg.contains("apprafter app remove shop-reg"), "{msg}");
