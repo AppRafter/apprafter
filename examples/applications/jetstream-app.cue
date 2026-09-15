@@ -82,11 +82,12 @@ jetstreamApp: v1alpha1.#Application & {
 							compression:       "s2"
 							allowDirect:       true
 							description:       "order events, fanned in from shop and billing"
-							consumerLimits: {
-								inactiveThreshold: "24h"
-								maxAckPending:     512
-							}
 						},
+						// NO `consumerLimits` — the webhook refuses it. The
+						// shipped JetStream controller runs its legacy
+						// reconciler, which never forwards stream-level
+						// consumer limits to the server. `maxAckPending` on
+						// the `consume` entry below is the way that works.
 					]
 					// Reads another application's stream via its own durable,
 					// with the redelivery contract the manifest could not

@@ -45,10 +45,13 @@ a shared database yet.
   [ADR 0065] §1.
 
 - **JetStream redelivery, acknowledgement and retention, tuned from the
-  manifest.** Twelve stream fields and twenty-one consumer fields, each
+  manifest.** Eleven stream fields and twenty-one consumer fields, each
   mapping one-for-one onto the message controller's own field of the same
   name — `ackWait`, `maxDeliver`, `backoff`, `maxAckPending`, filters,
-  delivery policies, `discard`, `compression`, `consumerLimits` and the rest.
+  delivery policies, `discard`, `compression` and the rest. Each was checked
+  against the reconciler the platform actually runs, not only against what
+  the schema accepts: `consumerLimits` is refused for failing that check, and
+  `maxAckPending` on a `consume` entry is the way to express it.
 
   Before this, none of them was reachable: an application can create its own
   consumers, but the controller owns a declared durable and re-asserts its

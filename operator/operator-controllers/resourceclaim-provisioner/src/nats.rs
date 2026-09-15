@@ -604,18 +604,13 @@ pub fn stream_object(
     put!("allowDirect", stream.allow_direct);
     put!("allowRollup", stream.allow_rollup);
     put!("description", stream.description.as_deref());
-    if let Some(limits) = stream.consumer_limits.as_ref() {
-        let mut cl = serde_json::Map::new();
-        if let Some(v) = limits.inactive_threshold.as_deref() {
-            cl.insert("inactiveThreshold".into(), serde_json::json!(v));
-        }
-        if let Some(v) = limits.max_ack_pending {
-            cl.insert("maxAckPending".into(), serde_json::json!(v));
-        }
-        if !cl.is_empty() {
-            obj.insert("consumerLimits".into(), serde_json::Value::Object(cl));
-        }
-    }
+    // NO `consumerLimits`, deliberately. The webhook refuses it on the
+    // Application (ADR 0065 §2.3), and a hand-written ResourceClaim carrying
+    // one must not be luckier: the pinned NACK runs its legacy reconciler,
+    // which never forwards stream-level consumer limits, so emitting it would
+    // put a field in the Stream CR that reads as configuration and is inert.
+    // The walk that found this saw exactly that shape — CR field present,
+    // running stream reporting `consumer_limits: {}`.
 
     serde_json::json!({
         "apiVersion": "jetstream.nats.io/v1beta2",
@@ -2262,6 +2257,8 @@ mod tests {
                 allow_direct: Some(true),
                 allow_rollup: Some(true),
                 description: Some("orders ingest".into()),
+                // DECLARED on the input and expected NOT to appear on the
+                // output — see the assertion at the end of this test.
                 consumer_limits: Some(operator_core::JetStreamConsumerLimits {
                     inactive_threshold: Some("5m".into()),
                     max_ack_pending: Some(42),
@@ -2283,8 +2280,17 @@ mod tests {
         assert_eq!(spec["allowDirect"], true);
         assert_eq!(spec["allowRollup"], true);
         assert_eq!(spec["description"], "orders ingest");
-        assert_eq!(spec["consumerLimits"]["inactiveThreshold"], "5m");
-        assert_eq!(spec["consumerLimits"]["maxAckPending"], 42);
+        // `consumerLimits` is the one declared field that must NOT reach the
+        // Stream CR. The pinned NACK runs its legacy reconciler, which never
+        // forwards stream-level consumer limits, so a CR carrying it reads as
+        // configuration and is inert — which is precisely how it shipped for
+        // one cycle before a live walk read `consumer_limits: {}` off the
+        // running stream. The webhook refuses it on the Application; this
+        // keeps a hand-written ResourceClaim from being luckier.
+        assert!(
+            spec.get("consumerLimits").is_none(),
+            "consumerLimits reached the Stream CR: {spec}"
+        );
     }
 
     #[test]

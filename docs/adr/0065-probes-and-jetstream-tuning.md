@@ -196,7 +196,10 @@ causes ungated. Recorded as an explicit decision so it is not re-argued.
 `Stream.spec` field of the same name: `maxMsgs`, `maxMsgsPerSubject`,
 `maxMsgSize`, `maxConsumers`, `discard` (`old` default | `new`),
 `discardPerSubject`, `duplicateWindow`, `compression` (`none` default |
-`s2`), `allowDirect`, `allowRollup`, `consumerLimits`, `description`.
+`s2`), `allowDirect`, `allowRollup`, `description`.
+
+`consumerLimits` was in that list and is not any more — see §2.3's last row
+and measurement (f).
 
 `allowDirect` defaults to `false`, which is today's behaviour, even though
 `$JS.API.DIRECT.GET.>` is already granted: the grant is inert until a stream
@@ -234,7 +237,7 @@ both rather than letting NACK surface a server error with no field name.
 A filter only ever narrows what a durable sees, including on a foreign
 stream, so no filter field touches the permission model.
 
-#### 2.3 What stays closed, and why the schema declares seven of them
+#### 2.3 What stays closed, and why the schema declares eight of them
 
 Permanently closed, with the reason attached:
 
@@ -247,18 +250,26 @@ Permanently closed, with the reason attached:
 | `sealed`, `preventDelete`, `preventUpdate`, `denyDelete`, `denyPurge` | platform-owned lifecycle; the last two are already expressed positively through the allow list |
 | `account`, `creds`, `nkey`, `servers`, `tls`, `tlsFirst` | provisioner-owned connection plumbing |
 | `jsDomain` | ADR 0061's design constraint: a domain shifts every pattern in §3 by one token and silently unmatches the whole deny vector |
+| `consumerLimits` | **not delivered by the controller this platform ships** — see measurement (f). Refused rather than accepted-and-inert; `maxAckPending` per `consume` entry is the working expression |
 | `pauseUntil`, `priorityGroups`, `priorityPolicy`, `pinnedTtl`, `allowMsgTtl`, `allowMsgCounter`, `allowAtomicPublish`, `allowMsgSchedules`, `allowBatched`, `persistMode`, `firstSequence`, `mirrorDirect`, `noAck`, `metadata` | deferred, not refused — the pinned server's support for each is unverified, and `allowMsgSchedules` needs the same foreign-subject analysis `republish` got before it could be considered |
 
-**Seven of these — `sources`, `mirror`, `republish`, `subjectTransform`,
-`deliverSubject`, `placement`, `replicas` — are declared in the CUE type in
-order to be rejected by the webhook**, the pattern ADR 0061 §6 established
-for `#JetStreamNeed.name` / `persistent`. The reason is unchanged and still
-load-bearing: a structural schema *prunes* unknown fields before a
+**Eight of these — `sources`, `mirror`, `republish`, `subjectTransform`,
+`deliverSubject`, `placement`, `replicas`, `consumerLimits` — are declared in
+the CUE type in order to be rejected by the webhook**, the pattern ADR 0061 §6
+established for `#JetStreamNeed.name` / `persistent`. The reason is unchanged
+and still load-bearing: a structural schema *prunes* unknown fields before a
 validating webhook runs, so a manifest setting `mirror:` would have it
-vanish silently and appear to work. These seven are the ones a user
-plausibly writes, because they are prominent in NATS's own documentation.
-The remainder are provider plumbing nobody types into an application
-manifest, and pruning them costs nothing.
+vanish silently and appear to work. These are the ones a user plausibly
+writes, because they are prominent in NATS's own documentation. The remainder
+are provider plumbing nobody types into an application manifest, and pruning
+them costs nothing.
+
+`consumerLimits` is in that set for a different reason from the other seven,
+and the difference is worth keeping visible. Those are refused because they
+are wrong for this platform. This one is refused because the platform's own
+delivery path drops it, so accepting it would mean storing a setting nothing
+reads — which is the failure this whole declare-to-reject pattern exists to
+prevent, arriving one layer further down than the pattern was aimed at.
 
 #### 2.4 Dead-letter routing
 
@@ -420,10 +431,34 @@ owed because it cannot be answered honestly on a laptop.
   defaults. It needs a loaded Tier-1 node, so it is left open rather than
   answered badly.
 - **(e) Settled.** `compression: s2`, `consumerLimits`, `discardPerSubject`
-  and `allowDirect` are all honoured and stored by 2.14.3.
+  and `allowDirect` are all honoured and stored by nats-server 2.14.3.
   `discardPerSubject` additionally requires `discard: new` and
   `maxMsgsPerSubject > 0` (error 10052) — a cross-field rule now mirrored in
-  the webhook.
+  the webhook. Read this row precisely: it measured the SERVER, by setting a
+  raw stream config, and the server was never the doubtful party. See (f).
+- **(f) Settled, and it reversed a decision.** `consumerLimits` never reaches
+  the server through this platform, and the gap is in NACK rather than in
+  nats-server. The shipped `natsio/jetstream-controller:0.24.0` runs its
+  LEGACY reconciler — `--control-loop` defaults to false — and
+  `controllers/jetstream/stream.go` maps forty-odd `spec.*` fields to `jsm`
+  options with zero occurrences of `ConsumerLimits`. The controller-runtime
+  implementation at `internal/controller/stream_controller.go:487` does
+  handle it, under the flag NACK's own startup log calls experimental.
+
+  Every other field of the eleven §2.1 added appears in that legacy builder,
+  and so does every consumer field §2.2 added; `consumerLimits` is the single
+  exception. It is therefore refused rather than accepted (§2.3), and
+  `maxAckPending` per `consume` entry — which the walk observes on the live
+  consumer — is the way to say it.
+
+  **What let it ship, and what caught it.** Three gates passed it: the CRD
+  stored it, the NACK CRD stored it (`e2e/jetstream-nack-shape-check.sh`
+  asserted exactly that), and NACK answered 200. All three answer "is this
+  field accepted", and none answers "does anything read it". The live walk
+  reading `consumer_limits: {}` off the running stream is what closed the
+  gap, which is the argument for the walk existing in the form it does. The
+  shape-check now records what it cannot prove, so the next field added there
+  is checked against the reconciler the chart actually runs.
 
 ## References
 

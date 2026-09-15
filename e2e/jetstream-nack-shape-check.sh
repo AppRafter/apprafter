@@ -101,21 +101,34 @@ spec:
   allowDirect: true
   allowRollup: true
   description: "order events"
-  consumerLimits:
-    inactiveThreshold: "24h"
-    maxAckPending: 512
 YAML
+# NO `consumerLimits`. It was in this list, and this list passing is exactly
+# why it shipped: the NACK CRD stores it happily, so a round-trip assertion
+# says yes forever while nothing downstream ever reads it.
+#
+# WHAT THIS FILE CAN AND CANNOT PROVE. It answers one question — does the NACK
+# CRD accept and keep the body the provisioner renders — which is worth
+# answering, because a rejected or silently-pruned field is a provisioner that
+# emits into a void. It does NOT answer whether NACK ACTS on a stored field.
+# The shipped `natsio/jetstream-controller:0.24.0` runs its legacy reconciler
+# (`--control-loop` defaults to false), and that reconciler maps forty-odd
+# stream fields with no mention of ConsumerLimits — so the CR carried the
+# limit, the apiserver stored it, and the running stream reported
+# `consumer_limits: {}`. Only `e2e/needs-jetstream-walk.sh`, which reads the
+# live server, could catch that; the field is now refused by the webhook.
+#
+# Before adding a field here, check it in the reconciler the chart actually
+# runs — `controllers/jetstream/stream.go` in nack, not `internal/controller`.
 for pair in \
     "maxMsgs=1000000" "maxMsgsPerSubject=1000" "maxMsgSize=1048576" "maxConsumers=16" \
     "discard=new" "discardPerSubject=true" "duplicateWindow=2m" "compression=s2" \
-    "allowDirect=true" "allowRollup=true" "consumerLimits.maxAckPending=512" \
-    "consumerLimits.inactiveThreshold=24h"; do
+    "allowDirect=true" "allowRollup=true"; do
     key=${pair%%=*}; want=${pair#*=}
     got=$(kubectl -n nats-system get stream demo-streamapp-orders \
         -o "jsonpath={.spec.${key}}" 2>/dev/null || true)
     [ "$got" = "$want" ] || fail "stream field ${key} did not round-trip: wanted '${want}', read back '${got}' — the provisioner would emit a setting the apiserver silently drops"
 done
-printf '  ok: 12 stream fields stored exactly as emitted\n'
+printf '  ok: 10 stream fields stored exactly as emitted\n'
 
 printf '\n=== 4/4  every consumer field the provisioner emits ===\n'
 kubectl apply -f - >/dev/null <<'YAML' || fail "the NACK Consumer CRD REJECTED a body the provisioner renders"

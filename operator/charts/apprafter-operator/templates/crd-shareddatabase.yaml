@@ -50,7 +50,7 @@ spec:
                 items:
                   properties:
                     name:
-                      pattern: ^[a-z_][a-z0-9_]*$
+                      pattern: ^[a-z_][a-z0-9_-]*$
                       type: string
                     schema:
                       type: string

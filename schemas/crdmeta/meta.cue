@@ -416,11 +416,24 @@ _crdMetas: SharedDatabase: {
 	// load-bearing rather than cosmetic: the allow list is matched against
 	// this string, and anything that could carry a quote or a semicolon
 	// would be matching one thing and executing another. A PostgreSQL
-	// extension name is an identifier — lowercase letters, digits and
+	// extension name is an identifier — lowercase letters, digits,
 	// underscores — and this is the one place in the schema where `_` is
-	// legal and `-` is not, which is the opposite of every DNS-1123 rule
-	// above. The webhook re-states it, same reason as the jetstream
-	// patterns: a cluster whose CRD predates this patch is still covered.
+	// legal, the opposite of every DNS-1123 rule above.
+	//
+	// `-` IS legal inside one, and the first draft of this pattern forbade
+	// it. That was not a theoretical narrowing: `uuid-ossp` sits in the
+	// webhook's own allow list two files away, so the two gates disagreed
+	// about a standard contrib extension — the apiserver refusing, with a
+	// pattern error naming no reason, what the platform elsewhere says is
+	// permitted. The alphabet is load-bearing because the name is composed
+	// into a `CREATE EXTENSION` the platform runs as a privileged role, and
+	// what that requires is the exclusion of quotes, semicolons and spaces,
+	// which this still does. A leading `-` stays out so the name cannot fold
+	// into something argument-shaped.
+	//
+	// The webhook is stricter again — it matches allow-list MEMBERSHIP, not
+	// an alphabet — so this patch is the outer of two gates, kept for the
+	// cluster whose webhook is unreachable.
 	//
 	// ASYMMETRY WORTH KNOWING: the SAME field on the Application side
 	// (`needs.pg.extensions[].name`) gets NO apiserver-level check, because
@@ -430,7 +443,7 @@ _crdMetas: SharedDatabase: {
 	// the ONLY gate, which is also why the allow list is re-checked in the
 	// provisioner: a `ResourceClaim` can be written directly.
 	schemaPatches: {
-		"extensions[].name": {pattern: "^[a-z_][a-z0-9_]*$"}
+		"extensions[].name": {pattern: "^[a-z_][a-z0-9_-]*$"}
 	}
 
 	statusSchemaPatches: {

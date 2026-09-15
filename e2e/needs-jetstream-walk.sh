@@ -1793,6 +1793,331 @@ part3_check_12() {
 if part3_check_12; then record_part3 12 "ConsumeTargetMissing fires once the consumed stream's owning application has departed" 0
 else record_part3 12 "consumerapp's durable names streamapp_orders, which criterion #6 removed with its owner — the claim must say so rather than sitting silently on a consumer that can never be created" 1; fi
 
+# NOTE THE POSITION. This block runs BEFORE acceptance #13, and must.
+#
+# #13 proves the quota pre-flight by declaring an 8Gi stream in `demo` that
+# cannot fit. The declaration is refused, but it stays DECLARED, and the
+# pre-flight sums declarations: from that point on the namespace reports
+# 8.31Gi committed against a 1.75Gi budget and EVERY later claim in it is
+# refused with QuotaExceeded, whatever it asks for.
+#
+# That is not a deduction. This block sat after #13 for two runs; the second
+# printed the arithmetic and it was 8925478912 against 1879048192 — five
+# times over, with this fixture asking for 12Mi. Shrinking the streams could
+# never have helped, and the first two attempts to fix it by sizing were
+# treating the wrong number.
+#
+# It also has to stay before #17, which exhausts the SERVER's memory budget
+# the same way and leaves it exhausted.
+# ===============================================================
+# 2.28 (ADR 0065 §2): the tuning surface and the dead-letter queue.
+#
+# Everything about 2.28-B up to this point is proved in PIECES — the field
+# NAMES against the real NACK CRD (e2e/jetstream-nack-shape-check.sh), the
+# SERVER behaviours on the pinned server
+# (docs/measurements/2.28-jetstream-2026-09-15.md), the provisioner's
+# EMISSION by unit test. None of them joins the chain. These four do:
+# manifest → claim → NACK CR → live NATS config, and then a dead-letter
+# queue that actually receives something.
+#
+# SIZED `nano`, AND THE NUMBER IS ARITHMETIC. A namespace's account gets
+# `max_mem = max(file_quota / 10, 64Mi)` and the server's memoryStore is
+# 192Mi (see acceptance #17's own note for the derivation). By the time this
+# block runs, `demo` holds six `small` claims plus #16's three `nano` ones:
+# 6 x 256Mi + 3 x 64Mi = 1728Mi of file => 172.8Mi reserved of the 192Mi.
+# One more `nano` takes it to 1792Mi => 179.2Mi, which fits with 12.8Mi to
+# spare; the DEFAULT `small` would take it to 1984Mi => 198.4Mi and overrun
+# the server.
+#
+# That is not hypothetical — it is what the first run of this block did. The
+# claim came back NatsMemoryBudgetExceeded, nothing was created, and the four
+# checks below reported product failures against streams that never existed.
+# The streams here are correspondingly small (32Mi + 8Mi) for the same
+# reason streamapp asks for 256Mi rather than 1Gi: a fixture must not
+# over-subscribe the account it shares.
+#
+# #17 still overruns after this, which is what it needs: it opens a NEW
+# namespace, and 179.2Mi + the 64Mi floor is 243.2Mi.
+# ===============================================================
+
+phase "2.28 fixture: tuneapp — a tuned stream, a tuned durable, and a DLQ"
+
+TUNE_APP="tuneapp"
+TUNE_CLAIM="tuneapp-jetstream"
+
+kubectl apply -f - <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${TUNE_APP}
+  namespace: ${APP_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+    replicas: 1
+    expose:
+      port: 80
+    needs:
+      jetstream:
+        selector:
+          tier: integrated
+        size: nano
+        streams:
+          - name: work
+            subjects: ["tuneapp.work.>"]
+            maxBytes: "8Mi"
+            retention: workqueue
+            compression: s2
+            discard: new
+            maxMsgsPerSubject: 100
+        consume:
+          - stream: work
+            durable: worker
+            ackWait: "1s"
+            maxDeliver: 2
+            maxAckPending: 10
+            deadLetter:
+              stream: worker-dlq
+              maxBytes: "4Mi"
+YAML
+
+printf '  waiting for %s to reach Ready ...\n' "$TUNE_CLAIM"
+for _ in $(seq 1 60); do
+    [ "$(jp "$CLAIM_RES" "$APP_NS" "$TUNE_CLAIM" '{.status.ready}')" = "true" ] && break
+    sleep 5
+done
+TUNE_READY=$(jp "$CLAIM_RES" "$APP_NS" "$TUNE_CLAIM" '{.status.ready}')
+TUNE_REASON=$(cond_reason "$CLAIM_RES" "$APP_NS" "$TUNE_CLAIM" Ready)
+printf '    %s status.ready=%q reason=%q\n' "$TUNE_CLAIM" "$TUNE_READY" "$TUNE_REASON"
+if [ "$TUNE_READY" != "true" ]; then
+    # Fail HERE, with the reason, rather than letting the four checks below
+    # run against streams that were never created. That is how this first
+    # ran: four FAILs whose messages described product behaviour, when the
+    # actual finding was one refused claim several phases earlier.
+    printf 'ERROR: the 2.28 fixture never became Ready (reason=%s) — the four checks below would judge nothing.\n' \
+        "$TUNE_REASON" >&2
+    # The MESSAGE, not just the reason: both refusals this fixture has hit
+    # (NatsMemoryBudgetExceeded, QuotaExceeded) carry their arithmetic in the
+    # message, and without it the next reader re-derives the budget by hand
+    # exactly as I did.
+    printf '       message: %s\n' \
+        "$(kubectl -n "$APP_NS" get "$CLAIM_RES" "$TUNE_CLAIM" \
+            -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}' 2>/dev/null)" >&2
+    printf '       NatsMemoryBudgetExceeded => this block moved after acceptance #17; put it back before.\n' >&2
+    printf '       QuotaExceeded => the declared streams do not fit the namespace file budget; shrink them or the claim size.\n' >&2
+    exit 1
+fi
+
+# --- #18: the CONSUMER tuning reaches the live consumer config ---
+part3_check_18() {
+    local out
+    out=$(mgr_nats_run "$APP_NS" consumer info tuneapp_work tuneapp_worker --json 2>&1) || {
+        printf '    querying consumer tuneapp_work/tuneapp_worker failed: %s\n' "$out"
+        return 1
+    }
+    printf '    consumer config: %s\n' "$(printf '%s' "$out" | jq -c '.config | {ack_wait, max_deliver, max_ack_pending}' 2>/dev/null)"
+    # ack_wait is nanoseconds on the wire: 1s == 1000000000.
+    printf '%s' "$out" | jq -e '
+        (.config.ack_wait == 1000000000) and
+        (.config.max_deliver == 2) and
+        (.config.max_ack_pending == 10)
+    ' >/dev/null
+}
+if part3_check_18; then record_part3 18 "a consume entry's ackWait/maxDeliver/maxAckPending reach the LIVE consumer" 0
+else record_part3 18 "the tuning declared on consume[] reaches the live NATS consumer config — the link no unit test can see, because NACK owns the durable and re-asserts its own config" 1; fi
+
+# --- #19: the STREAM tuning reaches the live stream config ---
+part3_check_19() {
+    local out
+    out=$(mgr_nats_run "$APP_NS" stream info tuneapp_work --json 2>&1) || {
+        printf '    querying stream tuneapp_work failed: %s\n' "$out"
+        return 1
+    }
+    printf '    stream config: %s\n' "$(printf '%s' "$out" | jq -c '.config | {compression, discard, max_msgs_per_subject, consumer_limits}' 2>/dev/null)"
+    # The three that this check originally shipped asserting, plus a FOURTH
+    # clause that is the check's own history.
+    #
+    # `consumerLimits` was in this fixture and in this assertion, and the
+    # first run that reached here read `consumer_limits: {}` off the live
+    # stream. The pinned NACK runs its legacy reconciler, which maps forty-odd
+    # stream fields and never that one; the newer controller-runtime
+    # implementation does, but only under a flag NACK's own log calls
+    # experimental. The field is now refused by the webhook, so the fixture
+    # cannot carry it — and the assertion is inverted to pin WHY, because the
+    # cheap mistake here is to re-add the knob, see the CR store it happily,
+    # and never look at the running stream again.
+    printf '%s' "$out" | jq -e '
+        (.config.compression == "s2") and
+        (.config.discard == "new") and
+        (.config.max_msgs_per_subject == 100) and
+        ((.config.consumer_limits // {}) | keys | length) == 0
+    ' >/dev/null
+}
+if part3_check_19; then record_part3 19 "a stream's compression/discard/maxMsgsPerSubject reach the LIVE stream, and consumerLimits stays absent (the legacy NACK reconciler never forwards it)" 0
+else record_part3 19 "the tuning declared on streams[] reaches the live NATS stream config" 1; fi
+
+# --- #20: the DLQ exists, and collects EXACTLY one advisory subject ---
+part3_check_20() {
+    local out subjects want
+    out=$(mgr_nats_run "$APP_NS" stream info "tuneapp_worker-dlq" --json 2>&1) || {
+        printf '    querying the DLQ stream failed: %s\n' "$out"
+        return 1
+    }
+    subjects=$(printf '%s' "$out" | jq -c '.config.subjects' 2>/dev/null)
+    want='["$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.tuneapp_work.tuneapp_worker"]'
+    printf '    DLQ subjects: %s\n' "$subjects"
+    # EXACTLY this pair's advisory. A wildcard here would collect every
+    # neighbour's failures in the same account — the disclosure the deny
+    # vector exists to prevent — so the assertion is equality, not a match.
+    [ "$subjects" = "$want" ] || return 1
+    printf '%s' "$out" | jq -e '(.config.retention == "limits")' >/dev/null
+}
+if part3_check_20; then record_part3 20 "the dead-letter queue is an ordinary declared stream collecting exactly this pair's advisory" 0
+else record_part3 20 "deadLetter materialises a declared stream whose single subject is the exact MAX_DELIVERIES advisory for (composed stream, composed durable), with limits retention" 1; fi
+
+# --- #21: the DLQ actually FILLS when redelivery is exhausted ---
+part3_check_21() {
+    local pub i before after
+    pub=$(mgr_nats_run "$APP_NS" pub tuneapp.work.one 'poison' 2>&1) || {
+        printf '    publishing to the tuned stream failed: %s\n' "$pub"
+        return 1
+    }
+    before=$(mgr_nats_run "$APP_NS" stream info "tuneapp_worker-dlq" --json 2>&1 \
+        | jq -r '.state.messages // 0' 2>/dev/null)
+    # maxDeliver is 2, so two NAKs exhaust redelivery and the server emits
+    # the advisory. `|| true` on each: a NAK'd fetch is a normal outcome
+    # here, and `set -e` would otherwise end the walk on the thing we want.
+    for i in 1 2 3; do
+        mgr_nats_run "$APP_NS" consumer next tuneapp_work tuneapp_worker \
+            --count 1 --timeout 3s --nak >/dev/null 2>&1 || true
+        sleep 2
+    done
+    for i in $(seq 1 15); do
+        after=$(mgr_nats_run "$APP_NS" stream info "tuneapp_worker-dlq" --json 2>&1 \
+            | jq -r '.state.messages // 0' 2>/dev/null)
+        [ "${after:-0}" -gt "${before:-0}" ] && break
+        sleep 2
+    done
+    printf '    DLQ messages before=%s after=%s\n' "${before:-0}" "${after:-0}"
+    [ "${after:-0}" -gt "${before:-0}" ]
+}
+if part3_check_21; then record_part3 21 "the DLQ RECEIVES an advisory once redelivery is exhausted" 0
+else record_part3 21 "a message NAK'd past maxDeliver produces an advisory that lands in the declared dead-letter queue — the end of the chain, and the only check here that proves the DLQ is not merely a correctly-shaped empty stream" 1; fi
+
+# --- #17: an out-of-memory-budget namespace is REFUSED, legibly ---
+#
+# THE FIXTURE IS SIZED AGAINST WHAT `demo` ALREADY HOLDS, and that is not
+# incidental — it is the constraint that cost the previous fixture author
+# a whole run. By the time this criterion runs, `demo` holds six claims at
+# `small` (256Mi) and three at `nano` (64Mi): 1.6875Gi of file quota, so
+# 172.8Mi of memory reservation (a tenth, floored per namespace) of the
+# 192Mi the server has. That leaves 19.2Mi — less than the 64Mi FLOOR any
+# new namespace costs however small its claims are. So this app is `nano`,
+# in a namespace of its own, and still cannot fit; `demo` itself does not
+# move, so criteria #1-#16 stand exactly where they were recorded.
+#
+# What is being asserted is not "it fails" but WHERE and HOW it fails:
+#   * on the claim, with its own reason, naming the budget in bytes —
+#     not `AwaitingNatsUserReady`, whose message ("the server may not have
+#     reloaded the accounts file yet") blames the one thing that works;
+#   * with the account never reaching the accounts file at all, which is
+#     what keeps the INSTALLED file — and `demo`, still serving above —
+#     unharmed. That second half is the whole reason the render refuses
+#     rather than writing a file the server would partially reject.
+#
+# While this fixture stands the accounts file is refused CLUSTER-WIDE, so
+# every other not-yet-ready claim reports the same condition. There is
+# exactly one such claim here (hogapp, parked at QuotaExceeded by #13,
+# already recorded), and the fixture is torn down at the end of this
+# check.
+BUDGET_NS="jsbudget"
+APP12="budgetapp"
+CLAIM12="budgetapp-jetstream"
+# component_nats.cue's config.jetstream.memoryStore.maxSize: "192Mi", in
+# bytes — the figure the refusal has to name. The operator holds the same
+# number in NATS_MEMORY_BUDGET_BYTES_FALLBACK, gated against the chart by
+# `the_nats_budget_constants_match_component_nats_cue`; this is a THIRD
+# copy, on purpose, so the walk fails if the delivered behaviour ever
+# stops matching the chart the walk itself installed.
+NATS_MEMORY_BUDGET_BYTES=201326592
+part3_check_17() {
+    local reason msg accounts_now demo_ready demo_account claims_before
+    kubectl create namespace "$BUDGET_NS" 2>/dev/null || true
+    kubectl apply -f - <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${APP12}
+  namespace: ${BUDGET_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+    replicas: 1
+    expose:
+      port: 80
+    needs:
+      jetstream:
+        size: nano
+        selector:
+          tier: integrated
+YAML
+    wait_jsonpath "$CLAIM_RES" "$BUDGET_NS" "$CLAIM12" '{.spec.type}' jetstream 120 || return 1
+
+    local deadline
+    deadline=$(( $(date +%s) + 240 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        reason=$(cond_reason "$CLAIM_RES" "$BUDGET_NS" "$CLAIM12" Ready)
+        [ "$reason" = "NatsMemoryBudgetExceeded" ] && break
+        sleep 5
+    done
+    msg=$(cond_message "$CLAIM_RES" "$BUDGET_NS" "$CLAIM12" Ready)
+    printf '    %s Ready reason = %q\n' "$APP12" "${reason:-<unset>}"
+    printf '    %s Ready message: %s\n' "$APP12" "${msg:-<none>}"
+    if [ "$reason" != "NatsMemoryBudgetExceeded" ]; then
+        printf '    the claim did not report the budget. If it is sitting on AwaitingNatsUserReady, that is the ORIGINAL defect: a server that reloaded the file and gave this account no JetStream, reported as a reload that has not happened yet.\n'
+        return 1
+    fi
+    assert_contains "${APP12} Ready message" "$msg" "$NATS_MEMORY_BUDGET_BYTES" || return 1
+
+    # The account never reached the file — the refusal is a refusal to
+    # WRITE, not a note attached to a file that went out anyway.
+    accounts_now=$(secret_val "$NATS_NS" "$ACCOUNTS_SECRET" 'accounts\.conf')
+    printf '    ns_%s present in the accounts file: %s\n' "$BUDGET_NS" \
+        "$([[ "$accounts_now" == *"ns_${BUDGET_NS}:"* ]] && echo yes || echo no)"
+    [[ "$accounts_now" != *"ns_${BUDGET_NS}:"* ]] || return 1
+
+    # And the file that IS installed still serves: demo's first claim is
+    # still Ready, and its account's JETSTREAM still answers — `account
+    # info` is the `$JS.API.INFO` round trip, which is precisely the call
+    # that goes unanswered for an account the server could not enable.
+    # Asking it of an untouched namespace is how this criterion proves the
+    # refusal protected the incumbents instead of merely failing quietly.
+    demo_ready=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM1" '{.status.ready}')
+    demo_account=$(mgr_nats_run "$APP_NS" account info 2>&1) || {
+        printf '    the %s account stopped answering $JS.API.INFO while the over-budget namespace was pending: %s\n' \
+            "$APP_NS" "$demo_account"
+        return 1
+    }
+    printf '    %s still Ready=%q, and ns_%s still answers account info\n' \
+        "$CLAIM1" "$demo_ready" "$APP_NS"
+    [ "$demo_ready" = "true" ] || return 1
+
+    # Tear the fixture down so the cluster is back under budget for the
+    # phases after this one.
+    claims_before=$(kubectl -n "$BUDGET_NS" get "$CLAIM_RES" -o name 2>/dev/null | tr '\n' ' ')
+    printf '    claims in %s before teardown: %s\n' "$BUDGET_NS" "${claims_before:-<none>}"
+    kubectl delete "$APP_RES" "$APP12" -n "$BUDGET_NS" --wait=true --timeout=120s
+    wait_gone "$CLAIM_RES" "$BUDGET_NS" "$CLAIM12" 180 || return 1
+    printf '    %s deleted — the cluster is back inside its memory budget\n' "$APP12"
+    return 0
+}
+if part3_check_17; then record_part3 17 "a namespace that would overrun the server's JetStream memory budget is refused with NatsMemoryBudgetExceeded, naming the budget, and never reaches the accounts file" 0
+else record_part3 17 "a namespace whose account would push the cluster past component_nats.cue's memoryStore.maxSize is held unready with its OWN reason naming the budget in bytes — not AwaitingNatsUserReady — its account never enters the accounts file, and the file already installed keeps serving the namespaces on it" 1; fi
+
 # --- #13: QuotaExceeded is a PRE-FLIGHT, not an opaque server error ---
 # Every claim in `demo` is size `small` (256Mi), so the account's max_file
 # is a fraction of a gigabyte. A declaration of 8Gi cannot fit, and the
@@ -2360,273 +2685,6 @@ part3_check_16() {
 }
 if part3_check_16; then record_part3 16 "an arriving application is told its prefix is already inside a neighbour's declared stream, reaches Ready anyway, and the report clears when the declaration narrows" 0
 else record_part3 16 "PrefixPreCaptured names the neighbour's composed stream on the ARRIVING claim (reason PrefixDeclaredElsewhere) while that claim still reaches Ready, does not fire on the declarer itself or on an uninvolved third application in the same account — each negative gated on a status.streams write proving the rules ran — and CLEARS once the foreign subject is taken back off the declaration" 1; fi
-
-# --- #17: an out-of-memory-budget namespace is REFUSED, legibly ---
-#
-# THE FIXTURE IS SIZED AGAINST WHAT `demo` ALREADY HOLDS, and that is not
-# incidental — it is the constraint that cost the previous fixture author
-# a whole run. By the time this criterion runs, `demo` holds six claims at
-# `small` (256Mi) and three at `nano` (64Mi): 1.6875Gi of file quota, so
-# 172.8Mi of memory reservation (a tenth, floored per namespace) of the
-# 192Mi the server has. That leaves 19.2Mi — less than the 64Mi FLOOR any
-# new namespace costs however small its claims are. So this app is `nano`,
-# in a namespace of its own, and still cannot fit; `demo` itself does not
-# move, so criteria #1-#16 stand exactly where they were recorded.
-#
-# What is being asserted is not "it fails" but WHERE and HOW it fails:
-#   * on the claim, with its own reason, naming the budget in bytes —
-#     not `AwaitingNatsUserReady`, whose message ("the server may not have
-#     reloaded the accounts file yet") blames the one thing that works;
-#   * with the account never reaching the accounts file at all, which is
-#     what keeps the INSTALLED file — and `demo`, still serving above —
-#     unharmed. That second half is the whole reason the render refuses
-#     rather than writing a file the server would partially reject.
-#
-# While this fixture stands the accounts file is refused CLUSTER-WIDE, so
-# every other not-yet-ready claim reports the same condition. There is
-# exactly one such claim here (hogapp, parked at QuotaExceeded by #13,
-# already recorded), and the fixture is torn down at the end of this
-# check.
-BUDGET_NS="jsbudget"
-APP12="budgetapp"
-CLAIM12="budgetapp-jetstream"
-# component_nats.cue's config.jetstream.memoryStore.maxSize: "192Mi", in
-# bytes — the figure the refusal has to name. The operator holds the same
-# number in NATS_MEMORY_BUDGET_BYTES_FALLBACK, gated against the chart by
-# `the_nats_budget_constants_match_component_nats_cue`; this is a THIRD
-# copy, on purpose, so the walk fails if the delivered behaviour ever
-# stops matching the chart the walk itself installed.
-NATS_MEMORY_BUDGET_BYTES=201326592
-part3_check_17() {
-    local reason msg accounts_now demo_ready demo_account claims_before
-    kubectl create namespace "$BUDGET_NS" 2>/dev/null || true
-    kubectl apply -f - <<YAML
-apiVersion: apprafter.io/v1alpha1
-kind: Application
-metadata:
-  name: ${APP12}
-  namespace: ${BUDGET_NS}
-  labels:
-    apprafter.io/managed-by: apprafter
-spec:
-  base:
-    image: nginxdemos/hello:plain-text
-    replicas: 1
-    expose:
-      port: 80
-    needs:
-      jetstream:
-        size: nano
-        selector:
-          tier: integrated
-YAML
-    wait_jsonpath "$CLAIM_RES" "$BUDGET_NS" "$CLAIM12" '{.spec.type}' jetstream 120 || return 1
-
-    local deadline
-    deadline=$(( $(date +%s) + 240 ))
-    while [ "$(date +%s)" -lt "$deadline" ]; do
-        reason=$(cond_reason "$CLAIM_RES" "$BUDGET_NS" "$CLAIM12" Ready)
-        [ "$reason" = "NatsMemoryBudgetExceeded" ] && break
-        sleep 5
-    done
-    msg=$(cond_message "$CLAIM_RES" "$BUDGET_NS" "$CLAIM12" Ready)
-    printf '    %s Ready reason = %q\n' "$APP12" "${reason:-<unset>}"
-    printf '    %s Ready message: %s\n' "$APP12" "${msg:-<none>}"
-    if [ "$reason" != "NatsMemoryBudgetExceeded" ]; then
-        printf '    the claim did not report the budget. If it is sitting on AwaitingNatsUserReady, that is the ORIGINAL defect: a server that reloaded the file and gave this account no JetStream, reported as a reload that has not happened yet.\n'
-        return 1
-    fi
-    assert_contains "${APP12} Ready message" "$msg" "$NATS_MEMORY_BUDGET_BYTES" || return 1
-
-    # The account never reached the file — the refusal is a refusal to
-    # WRITE, not a note attached to a file that went out anyway.
-    accounts_now=$(secret_val "$NATS_NS" "$ACCOUNTS_SECRET" 'accounts\.conf')
-    printf '    ns_%s present in the accounts file: %s\n' "$BUDGET_NS" \
-        "$([[ "$accounts_now" == *"ns_${BUDGET_NS}:"* ]] && echo yes || echo no)"
-    [[ "$accounts_now" != *"ns_${BUDGET_NS}:"* ]] || return 1
-
-    # And the file that IS installed still serves: demo's first claim is
-    # still Ready, and its account's JETSTREAM still answers — `account
-    # info` is the `$JS.API.INFO` round trip, which is precisely the call
-    # that goes unanswered for an account the server could not enable.
-    # Asking it of an untouched namespace is how this criterion proves the
-    # refusal protected the incumbents instead of merely failing quietly.
-    demo_ready=$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM1" '{.status.ready}')
-    demo_account=$(mgr_nats_run "$APP_NS" account info 2>&1) || {
-        printf '    the %s account stopped answering $JS.API.INFO while the over-budget namespace was pending: %s\n' \
-            "$APP_NS" "$demo_account"
-        return 1
-    }
-    printf '    %s still Ready=%q, and ns_%s still answers account info\n' \
-        "$CLAIM1" "$demo_ready" "$APP_NS"
-    [ "$demo_ready" = "true" ] || return 1
-
-    # Tear the fixture down so the cluster is back under budget for the
-    # phases after this one.
-    claims_before=$(kubectl -n "$BUDGET_NS" get "$CLAIM_RES" -o name 2>/dev/null | tr '\n' ' ')
-    printf '    claims in %s before teardown: %s\n' "$BUDGET_NS" "${claims_before:-<none>}"
-    kubectl delete "$APP_RES" "$APP12" -n "$BUDGET_NS" --wait=true --timeout=120s
-    wait_gone "$CLAIM_RES" "$BUDGET_NS" "$CLAIM12" 180 || return 1
-    printf '    %s deleted — the cluster is back inside its memory budget\n' "$APP12"
-    return 0
-}
-if part3_check_17; then record_part3 17 "a namespace that would overrun the server's JetStream memory budget is refused with NatsMemoryBudgetExceeded, naming the budget, and never reaches the accounts file" 0
-else record_part3 17 "a namespace whose account would push the cluster past component_nats.cue's memoryStore.maxSize is held unready with its OWN reason naming the budget in bytes — not AwaitingNatsUserReady — its account never enters the accounts file, and the file already installed keeps serving the namespaces on it" 1; fi
-
-# ===============================================================
-# 2.28 (ADR 0065 §2): the tuning surface and the dead-letter queue.
-#
-# Everything about 2.28-B up to this point is proved in PIECES — the field
-# NAMES against the real NACK CRD (e2e/jetstream-nack-shape-check.sh), the
-# SERVER behaviours on the pinned server
-# (docs/measurements/2.28-jetstream-2026-09-15.md), the provisioner's
-# EMISSION by unit test. None of them joins the chain. These four do:
-# manifest → claim → NACK CR → live NATS config, and then a dead-letter
-# queue that actually receives something.
-#
-# The fixture is deliberately small in quota terms. The account's max_file
-# is the SUM over the namespace's claims, so a sixth claim raises the
-# budget by one 'small' (256Mi) while this app's two streams together ask
-# for 80Mi — comfortably inside it, for the same reason streamapp asks for
-# 256Mi rather than 1Gi (see its own note above).
-# ===============================================================
-
-phase "2.28 fixture: tuneapp — a tuned stream, a tuned durable, and a DLQ"
-
-APP7="tuneapp"
-CLAIM7="tuneapp-jetstream"
-
-kubectl apply -f - <<YAML
-apiVersion: apprafter.io/v1alpha1
-kind: Application
-metadata:
-  name: ${APP7}
-  namespace: ${APP_NS}
-  labels:
-    apprafter.io/managed-by: apprafter
-spec:
-  base:
-    image: nginxdemos/hello:plain-text
-    replicas: 1
-    expose:
-      port: 80
-    needs:
-      jetstream:
-        selector:
-          tier: integrated
-        streams:
-          - name: work
-            subjects: ["tuneapp.work.>"]
-            maxBytes: "64Mi"
-            retention: workqueue
-            compression: s2
-            discard: new
-            maxMsgsPerSubject: 100
-            consumerLimits:
-              maxAckPending: 64
-        consume:
-          - stream: work
-            durable: worker
-            ackWait: "1s"
-            maxDeliver: 2
-            maxAckPending: 10
-            deadLetter:
-              stream: worker-dlq
-              maxBytes: "16Mi"
-YAML
-
-printf '  waiting for %s to reach Ready ...\n' "$CLAIM7"
-for _ in $(seq 1 60); do
-    [ "$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM7" '{.status.ready}')" = "true" ] && break
-    sleep 5
-done
-printf '    %s status.ready=%q reason=%q\n' "$CLAIM7" \
-    "$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM7" '{.status.ready}')" \
-    "$(cond_reason "$CLAIM_RES" "$APP_NS" "$CLAIM7" Ready)"
-
-# --- #18: the CONSUMER tuning reaches the live consumer config ---
-part3_check_18() {
-    local out
-    out=$(mgr_nats_run "$APP_NS" consumer info tuneapp_work tuneapp_worker --json 2>&1) || {
-        printf '    querying consumer tuneapp_work/tuneapp_worker failed: %s\n' "$out"
-        return 1
-    }
-    printf '    consumer config: %s\n' "$(printf '%s' "$out" | jq -c '.config | {ack_wait, max_deliver, max_ack_pending}' 2>/dev/null)"
-    # ack_wait is nanoseconds on the wire: 1s == 1000000000.
-    printf '%s' "$out" | jq -e '
-        (.config.ack_wait == 1000000000) and
-        (.config.max_deliver == 2) and
-        (.config.max_ack_pending == 10)
-    ' >/dev/null
-}
-if part3_check_18; then record_part3 18 "a consume entry's ackWait/maxDeliver/maxAckPending reach the LIVE consumer" 0
-else record_part3 18 "the tuning declared on consume[] reaches the live NATS consumer config — the link no unit test can see, because NACK owns the durable and re-asserts its own config" 1; fi
-
-# --- #19: the STREAM tuning reaches the live stream config ---
-part3_check_19() {
-    local out
-    out=$(mgr_nats_run "$APP_NS" stream info tuneapp_work --json 2>&1) || {
-        printf '    querying stream tuneapp_work failed: %s\n' "$out"
-        return 1
-    }
-    printf '    stream config: %s\n' "$(printf '%s' "$out" | jq -c '.config | {compression, discard, max_msgs_per_subject, consumer_limits}' 2>/dev/null)"
-    printf '%s' "$out" | jq -e '
-        (.config.compression == "s2") and
-        (.config.discard == "new") and
-        (.config.max_msgs_per_subject == 100) and
-        (.config.consumer_limits.max_ack_pending == 64)
-    ' >/dev/null
-}
-if part3_check_19; then record_part3 19 "a stream's compression/discard/maxMsgsPerSubject/consumerLimits reach the LIVE stream" 0
-else record_part3 19 "the tuning declared on streams[] reaches the live NATS stream config" 1; fi
-
-# --- #20: the DLQ exists, and collects EXACTLY one advisory subject ---
-part3_check_20() {
-    local out subjects want
-    out=$(mgr_nats_run "$APP_NS" stream info "tuneapp_worker-dlq" --json 2>&1) || {
-        printf '    querying the DLQ stream failed: %s\n' "$out"
-        return 1
-    }
-    subjects=$(printf '%s' "$out" | jq -c '.config.subjects' 2>/dev/null)
-    want='["$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.tuneapp_work.tuneapp_worker"]'
-    printf '    DLQ subjects: %s\n' "$subjects"
-    # EXACTLY this pair's advisory. A wildcard here would collect every
-    # neighbour's failures in the same account — the disclosure the deny
-    # vector exists to prevent — so the assertion is equality, not a match.
-    [ "$subjects" = "$want" ] || return 1
-    printf '%s' "$out" | jq -e '(.config.retention == "limits")' >/dev/null
-}
-if part3_check_20; then record_part3 20 "the dead-letter queue is an ordinary declared stream collecting exactly this pair's advisory" 0
-else record_part3 20 "deadLetter materialises a declared stream whose single subject is the exact MAX_DELIVERIES advisory for (composed stream, composed durable), with limits retention" 1; fi
-
-# --- #21: the DLQ actually FILLS when redelivery is exhausted ---
-part3_check_21() {
-    local pub i before after
-    pub=$(mgr_nats_run "$APP_NS" pub tuneapp.work.one 'poison' 2>&1) || {
-        printf '    publishing to the tuned stream failed: %s\n' "$pub"
-        return 1
-    }
-    before=$(mgr_nats_run "$APP_NS" stream info "tuneapp_worker-dlq" --json 2>&1 \
-        | jq -r '.state.messages // 0' 2>/dev/null)
-    # maxDeliver is 2, so two NAKs exhaust redelivery and the server emits
-    # the advisory. `|| true` on each: a NAK'd fetch is a normal outcome
-    # here, and `set -e` would otherwise end the walk on the thing we want.
-    for i in 1 2 3; do
-        mgr_nats_run "$APP_NS" consumer next tuneapp_work tuneapp_worker \
-            --count 1 --timeout 3s --nak >/dev/null 2>&1 || true
-        sleep 2
-    done
-    for i in $(seq 1 15); do
-        after=$(mgr_nats_run "$APP_NS" stream info "tuneapp_worker-dlq" --json 2>&1 \
-            | jq -r '.state.messages // 0' 2>/dev/null)
-        [ "${after:-0}" -gt "${before:-0}" ] && break
-        sleep 2
-    done
-    printf '    DLQ messages before=%s after=%s\n' "${before:-0}" "${after:-0}"
-    [ "${after:-0}" -gt "${before:-0}" ]
-}
-if part3_check_21; then record_part3 21 "the DLQ RECEIVES an advisory once redelivery is exhausted" 0
-else record_part3 21 "a message NAK'd past maxDeliver produces an advisory that lands in the declared dead-letter queue — the end of the chain, and the only check here that proves the DLQ is not merely a correctly-shaped empty stream" 1; fi
 
 phase "Part 3 acceptance criteria summary"
 if [ "$PART3_FAILED" -gt 0 ]; then

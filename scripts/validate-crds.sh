@@ -351,4 +351,76 @@ else
     exit 1
 fi
 
+# NOTE on consumerLimits, which this block asserts is STORED while the webhook
+# REFUSES it. Both are correct and the pair is the point: a structural schema
+# prunes an unknown field BEFORE any validating webhook runs, so a field that
+# is meant to be refused has to survive the apiserver first or the refusal
+# never reaches the author and the manifest appears to work. This assertion is
+# what keeps the declare-to-reject path intact.
+#
+# It is NOT evidence that the field does anything. That distinction is the
+# whole finding behind the refusal: the field stored here, round-tripped
+# through the NACK CRD, and the running stream still reported
+# `consumer_limits: {}`, because the shipped controller's legacy reconciler
+# never forwards it. Storage is not delivery, and only e2e/needs-jetstream-walk.sh
+# reads the live server.
+
+# 2.29 / ADR 0066 §4. The SharedDatabase extension-name pattern and the
+# webhook's allow list are two gates on ONE string, and they have to agree
+# about which names exist. The first draft of the pattern forbade `-` while
+# the allow list carried `uuid-ossp`, so the apiserver refused a standard
+# contrib extension the platform elsewhere permits — and refused it with a
+# bare pattern error naming no reason. Both directions are asserted: an
+# allow-listed name with a hyphen is ACCEPTED, and a name carrying a
+# semicolon is REJECTED, because the reason the alphabet is bounded at all is
+# that this string is composed into a `CREATE EXTENSION` run as a privileged
+# role.
+echo "==> regression: SharedDatabase extension names — uuid-ossp in, injection out (2.29)"
+
+if kubectl --context "$CTX" apply --dry-run=server -f - >/dev/null 2>/tmp/crd-shdb-ok.txt <<'YAML'
+apiVersion: apprafter.io/v1alpha1
+kind: SharedDatabase
+metadata:
+  name: crd-validate-shdb
+  namespace: crd-validate
+spec:
+  type: pg
+  extensions:
+    - name: uuid-ossp
+    - name: vector
+    - name: pg_trgm
+YAML
+then
+    echo "    OK: an allow-listed extension name with a hyphen is accepted"
+else
+    echo "==> REGRESSION: the apiserver REJECTED 'uuid-ossp'." >&2
+    echo "    It is in the webhook's ALLOWED_PG_EXTENSIONS, so the two gates now" >&2
+    echo "    disagree about a standard contrib extension and the apiserver wins," >&2
+    echo "    with a pattern error that names no reason. Server said:" >&2
+    sed 's/^/      /' /tmp/crd-shdb-ok.txt >&2
+    exit 1
+fi
+
+if kubectl --context "$CTX" apply --dry-run=server -f - >/dev/null 2>/tmp/crd-shdb-bad.txt <<'YAML'
+apiVersion: apprafter.io/v1alpha1
+kind: SharedDatabase
+metadata:
+  name: crd-validate-shdb-bad
+  namespace: crd-validate
+spec:
+  type: pg
+  extensions:
+    - name: "vector; DROP DATABASE postgres"
+YAML
+then
+    echo "==> REGRESSION: the apiserver ACCEPTED an extension name carrying a" >&2
+    echo "    semicolon. The name is composed into a CREATE EXTENSION statement" >&2
+    echo "    the platform runs as a privileged role, so the alphabet bound in" >&2
+    echo "    schemas/crdmeta/meta.cue is the outer of the two gates that stop" >&2
+    echo "    one thing being matched and another executed." >&2
+    exit 1
+else
+    echo "    OK: an extension name carrying a semicolon is rejected by the apiserver"
+fi
+
 echo "==> CRD apiserver validation PASSED (all CRDs accepted + Established)"

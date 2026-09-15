@@ -1367,6 +1367,30 @@ fn validate_jetstream_need(js: &JetStreamNeed, scope: &str) -> Vec<String> {
             }
         }
 
+        // `consumerLimits` is refused for a different reason from the six
+        // above, so it gets its own message rather than that loop's shared
+        // "not supported — isolation/topology" suffix. Those are wrong for
+        // this platform; this one is simply not delivered by the controller
+        // the platform ships.
+        //
+        // `natsio/jetstream-controller:0.24.0` runs its LEGACY reconciler by
+        // default (`--control-loop` is false), and that reconciler maps no
+        // `ConsumerLimits` at all. The field was accepted for one development
+        // cycle and the live walk is what caught it — CRD stored it,
+        // provisioner emitted it, NACK answered 200, running stream reported
+        // `consumer_limits: {}`. So the refusal names the working alternative
+        // rather than leaving the reader to find it.
+        if stream.consumer_limits.is_some() {
+            errs.push(format!(
+                "{scope}: needs.jetstream.streams[{idx} {:?}].consumerLimits is not supported — \
+                 the JetStream controller this platform ships runs its legacy reconciler, which \
+                 never forwards stream-level consumer limits to the server. Accepting it would \
+                 store a setting nothing reads. Set `maxAckPending` on each `consume` entry \
+                 instead; that reaches the live consumer.",
+                stream.name
+            ));
+        }
+
         // `discardPerSubject` carries two server-side preconditions (error
         // 10052, measured on 2.14.3). Stated here so the refusal names a
         // field, rather than surfacing through NACK as an opaque stream
@@ -3137,6 +3161,28 @@ mod tests {
         }
         let errs = validate_application_spec(&js_stream_spec(json!({"replicas": 3})));
         assert!(msgs(&errs).contains("replicas"), "{errs:?}");
+    }
+
+    #[test]
+    fn stream_consumer_limits_is_refused_and_names_the_working_alternative() {
+        // Not an isolation rule — a delivery one. The pinned NACK runs its
+        // legacy reconciler, which never forwards stream-level consumer
+        // limits, so this field shipped for one cycle as a knob that stored
+        // fine and did nothing. A live walk read `consumer_limits: {}` off the
+        // running stream; nothing short of the live read could have.
+        //
+        // The refusal must carry the remedy, because the field name a user
+        // reaches for next is not obvious from "unsupported".
+        let errs = validate_application_spec(&js_stream_spec(
+            json!({"consumerLimits": {"maxAckPending": 64}}),
+        ));
+        let m = msgs(&errs);
+        assert!(m.contains("consumerLimits"), "{errs:?}");
+        assert!(
+            m.contains("maxAckPending") && m.contains("consume"),
+            "the refusal must point at `maxAckPending` on a `consume` entry, \
+             which is the way that DOES reach the live consumer: {m}"
+        );
     }
 
     #[test]

@@ -578,9 +578,8 @@ _mkFields: {
 	// stream carrying only its owner's subjects this is destructive-to-self
 	// (ADR 0051's axis, no security trigger); on a fan-in stream it deletes
 	// a NEIGHBOUR's data, and is ADR 0052 trigger #16.
-	allowRollup?:    bool | *false
-	consumerLimits?: #JetStreamConsumerLimits
-	description?:    string
+	allowRollup?: bool | *false
+	description?: string
 
 	// ── Declared in order to be REJECTED (ADR 0065 §2.3) ────────────
 	// `sources` and `mirror` were MEASURED to defeat the read half of the
@@ -593,7 +592,7 @@ _mkFields: {
 	// unknown field BEFORE a validating webhook runs — a manifest setting
 	// `mirror:` would have it vanish silently and appear to work, which is
 	// exactly the failure ADR 0061 §6 established this pattern against.
-	// These are the six a user plausibly writes, because they are prominent
+	// These are the ones a user plausibly writes, because they are prominent
 	// in NATS's own documentation; the rest of NACK's surface is provider
 	// plumbing nobody types into an application manifest and costs nothing
 	// to prune. `validate_jetstream_need` rejects each one outright.
@@ -603,6 +602,27 @@ _mkFields: {
 	subjectTransform?: {...}
 	placement?: {...}
 	replicas?: int
+
+	// `consumerLimits` is rejected for a DIFFERENT reason from the six
+	// above, and the difference is worth keeping visible: those are refused
+	// because they are wrong for this platform, this one because the
+	// delivery vehicle does not implement it.
+	//
+	// The pinned `natsio/jetstream-controller:0.24.0` runs its LEGACY
+	// reconciler — `--control-loop` defaults to false — and that reconciler
+	// maps forty-odd stream fields to server options with no mention of
+	// `ConsumerLimits`. The newer controller-runtime implementation does
+	// handle it, but only under the flag NACK's own log calls experimental.
+	//
+	// This shipped as an accepted field first, and the live walk is what
+	// caught it: the CRD stored it, the provisioner emitted it, NACK
+	// answered 200, and the running stream reported `consumer_limits: {}`.
+	// The NACK shape-check passed throughout, because it asserted the CR
+	// round-trips and not that anything ACTS on it — a knob is not delivered
+	// until something downstream reads it. The refusal is what makes the
+	// gap legible instead of silent; `maxAckPending` on each `consume` entry
+	// reaches the live consumer and is the working way to say this.
+	consumerLimits?: #JetStreamConsumerLimits
 }
 
 // #JetStreamConsumerLimits — per-stream defaults NACK applies to consumers
