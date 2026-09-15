@@ -119,6 +119,8 @@ post-launch work is not a roadmap phase and has no subscribe control.
 | Shipped | ✅ | Disk pressure on the node is surfaced before it becomes an outage, and clears on its own | [Troubleshooting](operator-guide/troubleshooting.md#node-disk) |
 | Shipped | ✅ | Removing a dependency from the manifest releases it onto the documented retention path | [Troubleshooting](operator-guide/troubleshooting.md) |
 | Shipped | ✅ | A one-line installer that verifies its own checksum, and a download page | [Quickstart](operator-guide/quickstart.md) |
+| Shipped | 🚧 | Replace an application's pods without changing anything else, so a rotated credential takes effect | [Secrets](operator-guide/secrets.md) |
+| Shipped | 🚧 | See where the cluster's CPU, memory and disk have gone — per node, and split across the platform, the data services and your applications | [CLI reference](reference/cli/top.md) |
 | [Phase 3](https://apprafter.dev/#roadmap-phase-tier2) | ☐ | Built-in metrics, traces, logs and network-flow visibility | — |
 | Post-launch | ☐ | A rescue path that does not depend on the platform being healthy | — |
 | [Phase 3](https://apprafter.dev/#roadmap-phase-tier2) | ☐ | Notifications sent by the platform | — |
