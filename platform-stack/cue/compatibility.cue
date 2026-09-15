@@ -1876,6 +1876,49 @@ compatibility: "0.2.69": {
 	]
 }
 
+compatibility: "0.2.73": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.49"
+	notes: """
+		cue-cmp 0.1.27 — a bundle's workloads are rendered in one
+		stable ORDER. The sidecar image tag moves, so repo-server is
+		replaced on upgrade.
+
+		A manifest package holding several workloads (ADR 0062, ADR
+		0063 §Decision 5) rendered its documents in whatever order
+		`cue export . --out json` happened to return its top-level
+		keys, and the refusal summary named the workloads in that same
+		order. That is not a property CUE holds still: over the four
+		keys of `argocd-cue-cmp/testdata/bundle-key-order/`, cue
+		v0.10.0 returns `cacheTier webTier jobsTier apiTier` and cue
+		v0.16.0 returns `cacheTier jobsTier webTier apiTier`.
+
+		Both layers now sort by top-level CUE key — the sidecar here,
+		and `apprafter app validate`, which lists the same bundle
+		locally. They matter together because they do not run the same
+		cue: this one runs the version baked into the sidecar image,
+		`app validate` runs whatever the developer has installed. So
+		the sequence on the Argo CD tile and the sequence in the
+		terminal used to agree only when the two versions happened to
+		match, and ADR 0063 §Decision 5 asks them to agree always.
+
+		What changes in a cluster: for a package with two or more
+		workloads, the documents in `argocd app manifests` and the
+		workload list in a refusal message may come out in a different
+		sequence than on 0.2.72. Nothing about WHICH documents are
+		emitted changes, and Argo CD applies a manifest stream by its
+		own resource ordering, not by document position — so a
+		single-workload package (every layout that predates bundles)
+		renders byte-identically.
+
+		Rendered chart vs 0.2.72: the cue-cmp image tag only.
+		"""
+	references: [
+		"docs/adr/0063-manifest-discovery.md",
+		"docs/changelog/UNRELEASED.md#cue-cmp-0127",
+	]
+}
+
 compatibility: "0.2.72": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.49"

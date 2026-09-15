@@ -9,6 +9,56 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cue-cmp 0.1.27 / platform-stack 0.2.73 / cli v0.2.71 — one sequence for a bundle's workloads (unreleased)
+
+### Fixed
+
+- **A bundle's workloads are listed in one stable order, by top-level CUE
+  key** — in the rendered manifest stream, in the sidecar's refusal
+  summary, and in `apprafter app validate`'s roster.
+
+  [ADR 0063] §Decision 5 asks the render layer and its local twin to
+  report a finding the same way, so that one problem reads as one
+  problem. Both derived their sequence from `cue export . --out json`'s
+  own key order, on the belief that it was a property of the document.
+  It is a property of the evaluator: over the four keys of
+  `argocd-cue-cmp/testdata/bundle-key-order/`, cue v0.10.0 returns
+  `cacheTier webTier jobsTier apiTier` and cue v0.16.0 returns
+  `cacheTier jobsTier webTier apiTier`, and neither is sorted.
+
+  The two layers cannot share an observation like that, because they do
+  not share a cue: the sidecar runs the version baked into its image
+  (v0.10.0), `app validate` runs whatever the developer installed. The
+  sequences agreed only when the two happened to match. A sort is a rule
+  both can hold, so both now sort — `jq to_entries | sort_by(.key)` in
+  the entrypoint, an explicit sort in the CLI, and jq's code-point order
+  and Rust's UTF-8 byte order are the same order for every key CUE
+  accepts.
+
+  Found by CI going red on a commit that touched neither layer: the
+  assertions had been written against a developer shell's cue v0.16.0
+  and CI installs the pinned v0.10.0. `bundle-key-order/` and
+  `bundle-key-order-split-ns/` are the fixtures that cannot be satisfied
+  by accident — the sorted sequence and both evaluators' export orders
+  are three different sequences over their keys, and `metadata.name` runs
+  opposite to the key order, so a roster sorted by what it prints is red
+  too. Mutation-tested on both cue versions.
+
+  In a cluster: for a package with two or more workloads the document
+  order in `argocd app manifests` and the workload order in a refusal
+  message may differ from 0.2.72. Which documents are emitted does not
+  change, and a single-workload package — every layout that predates
+  bundles — renders byte-identically.
+
+### Removed
+
+- `json_top_level_keys`, the hand-rolled JSON text scanner the CLI used
+  to recover the export's key order before `serde_json` sorted it into a
+  `BTreeMap`. The order it recovered is the one no longer used; the sort
+  the `BTreeMap` was working around is now the rule.
+
+[ADR 0063]: ../adr/0063-manifest-discovery.md
+
 ## cli v0.2.70 — a verb for rotations, a screen for capacity, and columns that stopped hiding their answer (2.27c–f, unreleased)
 
 CLI-only: no operator, chart or CRD change, so nothing has to reach a

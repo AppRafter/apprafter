@@ -256,20 +256,24 @@ pub fn validate_manifest(manifest: &Path) -> std::result::Result<(), Vec<String>
 /// need of `run_validate` alone — nothing else should have to skip past
 /// it.
 ///
-/// Returned in the order the SIDECAR reads, taken from the exported
-/// JSON's own text ([`json_top_level_keys`]) — the same document, in the
-/// same sequence, that `entrypoint.sh` hands `jq to_entries`. Printing a
-/// different sequence from the Argo CD tile makes one finding read as
-/// two different problems, which is precisely what this subphase exists
-/// to remove.
+/// Returned SORTED BY TOP-LEVEL KEY — the same rule
+/// `entrypoint.sh`'s `jq to_entries | sort_by(.key)` applies, so a
+/// finding reads as one finding in the roster and on the Argo CD tile.
+///
+/// Sorted rather than "in the order the sidecar reads", which is what
+/// this did until the two layers were measured against each other: both
+/// derived their sequence from `cue export . --out json`'s own key
+/// order, and that order is an evaluator detail. Over
+/// `argocd-cue-cmp/testdata/bundle-key-order/`'s four keys, cue v0.10.0
+/// and cue v0.16.0 export two different sequences and neither is
+/// sorted. The layers cannot share an observation like that: this one
+/// runs whatever `cue` the developer has, the sidecar runs the version
+/// baked into its image, so agreement on the export order is agreement
+/// by coincidence. A sort is a rule both can hold.
 ///
 /// `cue def` — which [`top_level_names`] reads, for the claim-binding
-/// scopes — is NOT that order and cannot be substituted for it. Measured
-/// on a two-FILE package: `cue export` emits the keys sorted while
-/// `cue def` follows file order, and `Application-preview.cue` sorts
-/// before `Application.cue`, so the two disagree on every bundle shaped
-/// like this repository's own `landing/web/apprafter/`. Reading the text
-/// sidesteps having to know either rule.
+/// scopes — follows FILE order and is a third sequence again; it is not
+/// a substitute for either.
 fn validate_manifest_workloads(
     manifest: &Path,
 ) -> std::result::Result<Vec<BundleWorkload>, Vec<String>> {
@@ -302,16 +306,12 @@ fn validate_manifest_workloads(
     // either pipeline where every workload of a bundle is visible at
     // once. No extra `cue` concept: `cue export .` evaluates exactly the
     // package instance in cwd, which is what the sidecar renders.
-    //
-    // The key ORDER comes off the same call, read from the raw text
-    // before `serde_json` sorts it into a `BTreeMap` — see
-    // `json_top_level_keys`.
-    let (doc, order) = cue_export_package(root)?;
+    let doc = cue_export_package(root)?;
 
-    if let Some(refusal) = check_bundle_consistency(&doc, &order) {
+    if let Some(refusal) = check_bundle_consistency(&doc) {
         return Err(vec![refusal]);
     }
-    Ok(bundle_rows(&doc, &order))
+    Ok(bundle_rows(&doc))
 }
 
 /// Parse the manifest's Application doc with the CURRENT shipped schema
@@ -749,84 +749,7 @@ struct BundleWorkload {
     environments: Vec<String>,
 }
 
-/// Top-level keys of a JSON object, in the order its TEXT declares
-/// them.
-///
-/// The sidecar's `jq to_entries` walks the exported document in exactly
-/// this sequence, so the text is what the two layers have to agree on.
-/// Nothing downstream of `serde_json` can supply it: objects parse into
-/// a `BTreeMap` unless the `preserve_order` feature is enabled, and it
-/// deliberately is not — [ADR 0062](../../../../docs/adr/0062-manifest-package-is-a-bundle.md)
-/// records the alphabetical "first wins" defects that property caused,
-/// and turning it on globally would also reorder every map this CLI
-/// serialises, `.apprafter/state.json` included.
-///
-/// Reading the text also means not having to model `cue`'s own rule,
-/// which is not one rule: measured on cue v0.16.0, a single-FILE package
-/// exports its keys in declaration order while a multi-FILE package
-/// exports them sorted, and `cue def` follows file order in both cases.
-///
-/// A key is a string token at depth 1 immediately followed by `:`.
-/// Non-object roots, and any input malformed enough to run off the end,
-/// yield an empty vec — which [`ordered_keys`] treats as "sequence
-/// nothing", falling back to the parsed object's own key set rather than
-/// dropping a workload.
-fn json_top_level_keys(raw: &str) -> Vec<String> {
-    let b = raw.as_bytes();
-    let mut keys: Vec<String> = Vec::new();
-    let mut depth: i32 = 0;
-    let mut i = 0usize;
-    while i < b.len() {
-        match b[i] {
-            b'{' | b'[' => {
-                depth += 1;
-                i += 1;
-            }
-            b'}' | b']' => {
-                depth -= 1;
-                i += 1;
-            }
-            b'"' => {
-                // Scan to the closing quote. A backslash escapes the
-                // next byte, and every byte JSON allows after one is
-                // ASCII, so stepping two never lands mid-character.
-                let start = i;
-                let mut j = i + 1;
-                while j < b.len() {
-                    match b[j] {
-                        b'\\' => j += 2,
-                        b'"' => break,
-                        _ => j += 1,
-                    }
-                }
-                if j >= b.len() {
-                    break; // unterminated string — give up, do not guess
-                }
-                let token = &raw[start..=j];
-                i = j + 1;
-                // A KEY is a string followed by `:`; a string VALUE is
-                // not. Both occur at depth 1 (Style A's `apiVersion` is
-                // a top-level value).
-                let mut k = i;
-                while k < b.len() && b[k].is_ascii_whitespace() {
-                    k += 1;
-                }
-                if depth == 1 && k < b.len() && b[k] == b':' {
-                    if let Ok(name) = serde_json::from_str::<String>(token) {
-                        if !keys.contains(&name) {
-                            keys.push(name);
-                        }
-                    }
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    keys
-}
-
-/// Export the WHOLE package as one JSON document, plus its top-level
-/// keys in the document's own textual order.
+/// Export the WHOLE package as one JSON document.
 ///
 /// `.`, not `./...`, mirroring `entrypoint.sh:644` — `./...` matches
 /// every package instance BELOW cwd as well, which would emit two
@@ -836,19 +759,18 @@ fn json_top_level_keys(raw: &str) -> Vec<String> {
 /// `.cue` files), so the two are equivalent here; `.` is the request
 /// that stays correct if that ever changes.
 ///
-/// The order rides along with the value rather than being recovered by a
-/// second call, because it is a property of THIS invocation's output —
-/// re-deriving it from a separate `cue` run would be a second opinion
-/// about a document nobody re-exported.
+/// The document's own key order is deliberately NOT carried out of here.
+/// It used to be — read off the raw text, since `serde_json` sorts into
+/// a `BTreeMap` — on the belief that it was the sequence the sidecar
+/// reads. It is not a sequence anything can rely on: see
+/// [`sorted_keys`].
 ///
 /// A failure is an ERROR, never a silent skip. `cue vet -c ./...` has
 /// already passed by the time this runs, so an export that then fails is
 /// a genuine anomaly — and swallowing it would turn the four checks into
 /// a guard that quietly stops guarding, which is the failure mode the
 /// whole subphase is about.
-fn cue_export_package(
-    root: &Path,
-) -> std::result::Result<(serde_json::Value, Vec<String>), Vec<String>> {
+fn cue_export_package(root: &Path) -> std::result::Result<serde_json::Value, Vec<String>> {
     let out = match Command::new(cue_bin())
         .current_dir(root)
         .args(["export", ".", "--out", "json"])
@@ -879,8 +801,7 @@ fn cue_export_package(
     let raw = String::from_utf8_lossy(&out.stdout);
     let doc: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| vec![format!("could not read the exported package as JSON: {e}")])?;
-    let order = json_top_level_keys(&raw);
-    Ok((doc, order))
+    Ok(doc)
 }
 
 /// jq's `has("apiVersion") and has("kind")` on an object — the shape
@@ -915,32 +836,35 @@ fn field_or_empty(v: &serde_json::Value, path: &[&str]) -> String {
     }
 }
 
-/// Top-level keys of `doc` in the order the sidecar reads them.
+/// Top-level keys of `doc`, sorted — the sequence both layers list a
+/// bundle's workloads in.
 ///
-/// `order` comes from [`json_top_level_keys`] — the exported document's
-/// own text, which is the sequence `entrypoint.sh`'s `jq to_entries`
-/// walks. The key SET is taken from the parsed JSON, which is
-/// authoritative; `order` only sequences it. Anything the parse carries
-/// that the scan did not name — including the case where the scan
-/// returns nothing at all — still appears, appended in the parsed
-/// object's own (sorted) order. A check that silently sees zero
-/// workloads because a helper returned an empty vec is a guard that
-/// stopped guarding.
-fn ordered_keys(doc: &serde_json::Value, order: &[String]) -> Vec<String> {
+/// `entrypoint.sh` applies the same rule with `jq to_entries |
+/// sort_by(.key)`, and jq sorts strings by code point while a Rust
+/// `String` compares by UTF-8 byte; for UTF-8 those are the same order,
+/// so the two agree on any key CUE accepts.
+///
+/// The rule is a SORT rather than the exported document's own key order,
+/// which is what both layers read until the pair was measured against
+/// each other. That order is an evaluator detail: over
+/// `argocd-cue-cmp/testdata/bundle-key-order/`'s four keys, cue v0.10.0
+/// emits `cacheTier webTier jobsTier apiTier` and cue v0.16.0 emits
+/// `cacheTier jobsTier webTier apiTier` — and the sidecar runs the cue
+/// its image pins while this runs the developer's, so neither layer can
+/// see what the other's cue did. Asserting either sequence is asserting
+/// a coincidence, which is how the same two assertions came to pass
+/// locally and fail in CI.
+///
+/// `serde_json` parses objects into a `BTreeMap` and so hands them over
+/// sorted already; the explicit sort states the rule rather than
+/// inheriting it from a map type, and would survive `preserve_order`
+/// being turned on for some unrelated reason.
+fn sorted_keys(doc: &serde_json::Value) -> Vec<String> {
     let Some(obj) = doc.as_object() else {
         return Vec::new();
     };
-    let mut out: Vec<String> = Vec::new();
-    for k in order {
-        if obj.contains_key(k) && !out.contains(k) {
-            out.push(k.clone());
-        }
-    }
-    for k in obj.keys() {
-        if !out.contains(k) {
-            out.push(k.clone());
-        }
-    }
+    let mut out: Vec<String> = obj.keys().cloned().collect();
+    out.sort();
     out
 }
 
@@ -984,17 +908,17 @@ fn workload_row(key: &str, v: &serde_json::Value) -> Option<BundleWorkload> {
     })
 }
 
-/// The bundle's workloads, in declaration order.
+/// The bundle's workloads, sorted by top-level key ([`sorted_keys`]).
 ///
 /// An unwrapped (Style A) package yields exactly ONE row by
 /// construction, which is what keeps every single-manifest layout —
 /// i.e. every manifest written before bundles existed — behaving
 /// identically: all three cross-workload checks are no-ops on one row.
-fn bundle_rows(doc: &serde_json::Value, order: &[String]) -> Vec<BundleWorkload> {
+fn bundle_rows(doc: &serde_json::Value) -> Vec<BundleWorkload> {
     if is_k8s_shaped(doc) {
         return workload_row(PACKAGE_SCOPE_KEY, doc).into_iter().collect();
     }
-    ordered_keys(doc, order)
+    sorted_keys(doc)
         .iter()
         .filter_map(|k| {
             let v = doc.get(k)?;
@@ -1015,11 +939,11 @@ fn bundle_rows(doc: &serde_json::Value, order: &[String]) -> Vec<BundleWorkload>
 /// "will this document survive the render", which is group-agnostic;
 /// in the row table it is "is this a workload of this bundle", which is
 /// not.
-fn mixed_style_wrappers(doc: &serde_json::Value, order: &[String]) -> Vec<String> {
+fn mixed_style_wrappers(doc: &serde_json::Value) -> Vec<String> {
     if !is_k8s_shaped(doc) {
         return Vec::new();
     }
-    ordered_keys(doc, order)
+    sorted_keys(doc)
         .into_iter()
         .filter(|k| doc.get(k).map(is_k8s_shaped).unwrap_or(false))
         .collect()
@@ -1051,7 +975,7 @@ fn bundle_refusal(summary: &str, detail: &str) -> String {
 /// a mixed package's named wrappers, so the row table below it cannot
 /// see past a package-scope manifest — for a mixed package the table
 /// takes the package-scope branch and the wrappers are invisible to it.
-fn check_bundle_consistency(doc: &serde_json::Value, order: &[String]) -> Option<String> {
+fn check_bundle_consistency(doc: &serde_json::Value) -> Option<String> {
     // (1) Style A mixed with Style B. The one inconsistency the render
     // layer is the ONLY possible place to catch: the dispatch takes the
     // Style-A branch, the named wrapper rides out as a stray top-level
@@ -1059,7 +983,7 @@ fn check_bundle_consistency(doc: &serde_json::Value, order: &[String]) -> Option
     // top-level key without an error. The discarded manifest never
     // becomes an API object at all, so there is nothing downstream left
     // to inspect it.
-    let mixed = mixed_style_wrappers(doc, order);
+    let mixed = mixed_style_wrappers(doc);
     if !mixed.is_empty() {
         let mixed = mixed.join(", ");
         return Some(bundle_refusal(
@@ -1086,7 +1010,7 @@ there, so several wrappers means the first option)."
         ));
     }
 
-    let rows = bundle_rows(doc, order);
+    let rows = bundle_rows(doc);
 
     // (2) Divergent `metadata.namespace`.
     //
@@ -1575,66 +1499,46 @@ mod tests {
         assert_eq!(state["pg"]["names"], serde_json::json!(["main"]));
     }
 
-    // ── json_top_level_keys — the sidecar's key order, from the text ──
+    // ── sorted_keys — the one sequence both layers can hold ──
 
     #[test]
-    fn json_top_level_keys_reads_declaration_order_not_sorted_order() {
-        // The property the parsed `Value` cannot supply: `serde_json`
-        // builds objects on a `BTreeMap`, so by the time anything can
-        // read them `zeta` has moved behind `alpha`.
+    fn sorted_keys_sorts_regardless_of_the_documents_own_order() {
+        // The text order the export produced is irrelevant: whatever
+        // sequence `cue` wrote, the rule is the sort. This is the
+        // property that makes the CLI and the sidecar agree while
+        // running two different cue binaries.
         let raw = r#"{
     "zeta": {"apiVersion": "apprafter.io/v1alpha1"},
-    "alpha": {"apiVersion": "apprafter.io/v1alpha1"}
+    "alpha": {"apiVersion": "apprafter.io/v1alpha1"},
+    "mid": {"apiVersion": "apprafter.io/v1alpha1"}
 }"#;
-        assert_eq!(json_top_level_keys(raw), vec!["zeta", "alpha"]);
-        let parsed: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(sorted_keys(&doc), vec!["alpha", "mid", "zeta"]);
+    }
+
+    #[test]
+    fn sorted_keys_agrees_with_jq_sort_by_key_on_byte_order() {
+        // jq sorts strings by code point, a Rust `String` by UTF-8 byte;
+        // the two coincide, and the keys that could tell them apart are
+        // the ones worth pinning: digits before letters, upper before
+        // lower, `-` (0x2D) before `.` (0x2E) before `_` (0x5F).
+        let doc: serde_json::Value = serde_json::from_str(
+            r#"{"web_a": {}, "web-a": {}, "Web": {}, "web.a": {}, "0web": {}}"#,
+        )
+        .unwrap();
         assert_eq!(
-            parsed
-                .as_object()
-                .unwrap()
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>(),
-            vec!["alpha", "zeta"],
-            "if this ever matches the text order, `preserve_order` was turned on and the \
-             ordering comment above is stale"
+            sorted_keys(&doc),
+            vec!["0web", "Web", "web-a", "web.a", "web_a"]
         );
     }
 
     #[test]
-    fn json_top_level_keys_ignores_nested_keys_and_string_values() {
-        let raw = r#"{
-    "apiVersion": "apprafter.io/v1alpha1",
-    "kind": "Application",
-    "metadata": {"name": "demo", "namespace": "apprafter"},
-    "spec": {"base": {"image": "x"}}
-}"#;
-        assert_eq!(
-            json_top_level_keys(raw),
-            vec!["apiVersion", "kind", "metadata", "spec"],
-            "only depth-1 strings followed by `:` are keys — `\"Application\"` is a value and \
-             `name` is nested"
-        );
-    }
-
-    #[test]
-    fn json_top_level_keys_survives_escapes_and_colons_in_values() {
-        // A `:` inside a string value, and an escaped quote, must not be
-        // mistaken for structure by a hand-rolled scanner.
-        let raw = r#"{
-    "one": {"note": "a \"quoted\" url: https://x/y"},
-    "two": {}
-}"#;
-        assert_eq!(json_top_level_keys(raw), vec!["one", "two"]);
-    }
-
-    #[test]
-    fn json_top_level_keys_of_a_non_object_is_empty() {
-        // `ordered_keys` then sequences nothing and falls back to the
-        // parsed object's own keys — it never drops a workload.
-        assert!(json_top_level_keys("[1, 2, 3]").is_empty());
-        assert!(json_top_level_keys("").is_empty());
-        assert!(json_top_level_keys(r#"{"unterminated: 1"#).is_empty());
+    fn sorted_keys_of_a_non_object_is_empty() {
+        // Style A's document IS the manifest, so `bundle_rows` never
+        // asks for its keys — but a helper that returns rows for a
+        // non-object would be inventing workloads.
+        assert!(sorted_keys(&serde_json::json!([1, 2, 3])).is_empty());
+        assert!(sorted_keys(&serde_json::json!("string")).is_empty());
     }
 
     #[test]
@@ -1848,7 +1752,7 @@ landing: v1alpha1.#Application & {
     // sets of fixtures drift silently, and the drift shows up as a
     // manifest that validates clean and then reddens an Argo CD tile,
     // which is exactly the inverted promise 2.27b exists to restore.
-    // The sidecar half of the pair asserts the same seven directories in
+    // The sidecar half of the pair asserts the same directories in
     // `argocd-cue-cmp/test-inject.sh` §5; sharing the fixtures is what
     // makes the two halves one gate rather than two.
 
@@ -2135,14 +2039,17 @@ landing: v1alpha1.#Application & {
         );
     }
 
-    // Workload ORDER, which a multi-file bundle is also the only local
-    // shape that can test. `cue export . --out json` — the document the
-    // sidecar hands `jq to_entries` — emits a multi-file package's keys
-    // sorted, while `cue def ./...` follows FILE order. Measured on this
-    // fixture (and on `landing/web/apprafter`, which has the same file
-    // names): `Application-preview.cue` sorts before `Application.cue`,
-    // so the two disagree and the CLI printed the sidecar's findings in
-    // the reverse sequence from the Argo CD tile.
+    // Workload ORDER on the fixture shaped like this repository's own
+    // `landing/web/apprafter/` — prod in `Application.cue`, preview in
+    // `Application-preview.cue`. Both layers sort by top-level key, so
+    // `multiFileWeb` leads `multiFileWebPreview` here whatever cue each
+    // end is running. `cue def ./...` — which `top_level_names` reads —
+    // follows FILE order and puts the preview first, which is the
+    // reverse sequence the CLI printed until 2.27b.
+    //
+    // The rule itself is pinned by
+    // `validate_orders_workloads_by_top_level_key`; this case is the
+    // real-world shape it has to hold on.
     #[test]
     fn validate_orders_workloads_the_way_the_sidecar_does() {
         let (_guard, _resolved, outcome) = bare_validate("bundle-multi-file");
@@ -2154,8 +2061,9 @@ landing: v1alpha1.#Application & {
                 "  • multi-file-web  namespace multi-file".to_string(),
                 "  • multi-file-web-preview  namespace multi-file".to_string(),
             ],
-            "the roster must follow the exported JSON's own key order — the sequence the \
-             sidecar's `jq to_entries` walks — so one finding reads as one finding in both places"
+            "the roster must follow the sorted key order — the sequence the sidecar's `jq \
+             to_entries | sort_by(.key)` walks — so one finding reads as one finding in both \
+             places"
         );
 
         // And the same order in a REFUSAL, which is the line Argo CD
@@ -2174,6 +2082,71 @@ landing: v1alpha1.#Application & {
             web < preview,
             "the refusal must list the workloads in the sidecar's order; got:\n{msg}"
         );
+    }
+
+    // The ORDER RULE itself, on the fixture built to break every other
+    // candidate rule.
+    //
+    // `validate_orders_workloads_the_way_the_sidecar_does` above is
+    // satisfied by anything that happens to put `multiFileWeb` first, and
+    // `cue export`'s own key order is one such rule on SOME cue versions.
+    // That is how it became the rule here: measured on a developer
+    // shell's cue v0.16.0, asserted, and then red in CI, which installs
+    // the v0.10.0 the sidecar image pins. The export order is an
+    // evaluator detail, not a CUE contract — and the two layers do not
+    // even run the same binary, since this one uses whatever `cue` the
+    // developer has and the sidecar uses the one baked into its image.
+    //
+    // `bundle-key-order/` pins the rule instead of an observation: over
+    // its four keys the sorted sequence, cue v0.10.0's export and cue
+    // v0.16.0's export are three different sequences, and `metadata.name`
+    // runs opposite to the key order, so sorting by what is printed is
+    // red too.
+    #[test]
+    fn validate_orders_workloads_by_top_level_key() {
+        let (_guard, _resolved, outcome) = bare_validate("bundle-key-order");
+        let workloads = outcome.unwrap_or_else(|msgs| {
+            panic!(
+                "the four-workload order fixture is consistent and must validate; got:\n{}",
+                msgs.join("\n")
+            )
+        });
+        assert_eq!(
+            workloads.iter().map(|w| w.key.as_str()).collect::<Vec<_>>(),
+            vec!["apiTier", "cacheTier", "jobsTier", "webTier"],
+            "workloads are ordered by TOP-LEVEL KEY — the one sequence no cue version gets to \
+             move, and therefore the only one this layer and the sidecar can both hold"
+        );
+        assert_eq!(
+            format_roster(&workloads),
+            vec![
+                "✓ valid — 4 workloads".to_string(),
+                "  • keyorder-zulu  namespace keyorder".to_string(),
+                "  • keyorder-yankee  namespace keyorder".to_string(),
+                "  • keyorder-xray  namespace keyorder".to_string(),
+                "  • keyorder-whiskey  namespace keyorder".to_string(),
+            ],
+            "the printed roster carries that order through — the names run opposite to it on \
+             purpose, so a roster sorted by what it displays fails here"
+        );
+
+        // And the same order in a REFUSAL, which is the line Argo CD
+        // truncates onto the Application tile.
+        let (_g2, _r2, refused) = bare_validate("bundle-key-order-split-ns");
+        let msg = refused
+            .expect_err("the split-namespace order fixture must be refused")
+            .join("\n");
+        let mut prev = 0usize;
+        for key in ["apiTier ->", "cacheTier ->", "jobsTier ->", "webTier ->"] {
+            let at = msg
+                .find(key)
+                .unwrap_or_else(|| panic!("the refusal must name '{key}'; got:\n{msg}"));
+            assert!(
+                at >= prev,
+                "the refusal summary must be sorted by key — '{key}' came too early; got:\n{msg}"
+            );
+            prev = at;
+        }
     }
 
     // A Style-A (unwrapped) package renders exactly ONE row into the

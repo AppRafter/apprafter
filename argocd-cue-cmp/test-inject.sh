@@ -122,6 +122,41 @@ assert_before() {
     fi
 }
 
+# `assert_before` over a whole ROSTER: every needle present, each one
+# strictly after the one before it.
+#
+# Pairwise `assert_before` calls would cover the same ground, but a
+# four-workload sequence is one rule, and reporting it as one PASS (or
+# as the single pair that broke) is what makes a reordering readable.
+# Same `awk index` offsets, for the same reason stated there.
+assert_sequence() {
+    local haystack=$1 label=$2
+    shift 2
+    local prev_at=0 prev="" needle at why=""
+    for needle in "$@"; do
+        at=$(printf '%s\n' "$haystack" | awk -v n="$needle" '{b = b $0 "\n"} END {print index(b, n)}')
+        if [[ "$at" -eq 0 ]]; then
+            why="'$needle' is absent"
+            break
+        fi
+        if [[ "$at" -le "$prev_at" ]]; then
+            why="'$needle' (at ${at}) does not follow '$prev' (at ${prev_at})"
+            break
+        fi
+        prev_at=$at
+        prev=$needle
+    done
+    if [[ -z "$why" ]]; then
+        echo "PASS: $label ($# in sequence)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL: $label — $why"
+        echo "--- stdout was ---" >&2
+        printf '%s\n' "$haystack" >&2
+        fail=$((fail + 1))
+    fi
+}
+
 assert_count() {
     local haystack=$1 needle=$2 want=$3 label=$4
     local got
@@ -588,10 +623,13 @@ bundleenvp_fx="$script_dir/testdata/bundle-env-partial"
 bundleforeign_fx="$script_dir/testdata/bundle-foreign-kind"
 bundlemfile_fx="$script_dir/testdata/bundle-multi-file"
 bundlemfilens_fx="$script_dir/testdata/bundle-multi-file-split-ns"
+bundleorder_fx="$script_dir/testdata/bundle-key-order"
+bundleorderns_fx="$script_dir/testdata/bundle-key-order-split-ns"
 
 scrub_bundle_fixtures() {
     find "$bundlens_fx" "$bundledup_fx" "$bundlemixed_fx" "$bundleenv_fx" "$bundleenvp_fx" \
         "$bundleforeign_fx" "$bundlemfile_fx" "$bundlemfilens_fx" \
+        "$bundleorder_fx" "$bundleorderns_fx" \
         \( -name cue.mod -type d -o -name apprafter_claim_gen.cue -type f \) \
         -prune -exec rm -rf {} +
 }
@@ -755,7 +793,39 @@ assert_contains "$ep_err" "2 different namespaces" "ADR 0063 §5: two files — 
 assert_contains "$ep_err" 'splitFileWeb -> "prod"' "ADR 0063 §5: two files — the summary names the workload from Application.cue"
 assert_contains "$ep_err" 'splitFileWebPreview -> "preview"' "ADR 0063 §5: two files — the summary names the workload from Application-preview.cue"
 assert_before "$ep_err" 'splitFileWeb -> "prod"' 'splitFileWebPreview -> "preview"' \
-    "ADR 0063 §5: two files — the refusal summary is in the exported document's order"
+    "ADR 0063 §5: two files — the refusal summary is sorted by key"
+
+# ── §5: the order rule itself — sorted by TOP-LEVEL KEY ────
+#
+# The two assertions above pass under any rule that happens to put
+# `splitFileWeb` before `splitFileWebPreview`, and the export's own key
+# order is one such rule on some cue versions. That is how it came to be
+# the rule: it was measured on a developer shell's cue v0.16.0, and the
+# same two assertions went red in CI, which installs the v0.10.0 the
+# sidecar image pins. Same script, same fixture, opposite verdict —
+# because the export order is an evaluator detail, not a CUE contract.
+#
+# `bundle-key-order/` is the fixture that cannot be satisfied by
+# accident: over its four keys the sorted sequence, cue v0.10.0's export
+# and cue v0.16.0's export are three DIFFERENT sequences (measured in
+# the fixture's own header), and `metadata.name` runs opposite to the
+# key order, so sorting the rows by what is printed fails too.
+#
+# Mutation-tested: dropping `sort_by(.key)` from the entrypoint's key
+# enumeration turns both assertions below red on either cue.
+run_entrypoint_capture "$bundleorder_fx" "$schema_src"
+scrub_bundle_fixtures
+assert_rc "$ep_rc" zero "ADR 0063 §5: the four-workload order fixture renders (exit 0)"
+assert_count "$ep_out" "---" 4 "ADR 0063 §5: order — all FOUR documents are emitted"
+assert_sequence "$ep_out" "ADR 0063 §5: order — documents are emitted sorted by top-level key" \
+    "name: keyorder-zulu" "name: keyorder-yankee" "name: keyorder-xray" "name: keyorder-whiskey"
+
+run_entrypoint_capture "$bundleorderns_fx" "$schema_src"
+scrub_bundle_fixtures
+assert_rc "$ep_rc" nonzero "ADR 0063 §5: order — the split-namespace half REFUSES"
+assert_stdout_empty "ADR 0063 §5: order — the refusing half writes NOTHING to stdout"
+assert_sequence "$ep_err" "ADR 0063 §5: order — the refusal summary is sorted by top-level key" \
+    'apiTier -> "prod"' 'cacheTier -> "preview"' 'jobsTier -> "preview"' 'webTier -> "prod"'
 
 # ── §5: the consistent bundles must be UNAFFECTED ──────────
 #

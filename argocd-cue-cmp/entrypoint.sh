@@ -699,7 +699,8 @@ render_package() {
     # downstream left to inspect it.
     mixed=$(jq -r '
         if (type=="object" and has("apiVersion") and has("kind")) then
-            [to_entries[] | select(.value|type=="object" and has("apiVersion") and has("kind")) | .key]
+            [to_entries | sort_by(.key) | .[]
+             | select(.value|type=="object" and has("apiVersion") and has("kind")) | .key]
             | if length > 0 then join(", ") else "" end
         else "" end' "$json_out")
     if [ -n "$mixed" ]; then
@@ -760,7 +761,8 @@ MIXEDEOF
     # keeps every Style-A layout rendering exactly as it did before.
     bundle_rows=$(jq -r '
         if (type=="object" and has("apiVersion") and has("kind")) then [{k:"(package scope)",v:.}]
-        else [to_entries[] | select(.value|type=="object" and has("apiVersion") and has("kind")) | {k:.key,v:.value}]
+        else [to_entries | sort_by(.key) | .[]
+              | select(.value|type=="object" and has("apiVersion") and has("kind")) | {k:.key,v:.value}]
         end
         | map(select(.v.kind == "Application"
                      and (.v.apiVersion | tostring | startswith("apprafter.io/"))))
@@ -961,15 +963,24 @@ ENVEOF
     fi
 
     # Style B — enumerate top-level keys whose value is a k8s-
-    # shaped object (`apiVersion` + `kind` set). Unsorted
-    # iteration preserves CUE's declaration order, which
-    # matches operator expectations when scanning the rendered
-    # manifest stream.
+    # shaped object (`apiVersion` + `kind` set), SORTED by key.
+    #
+    # Sorted, not the export's own order, because the export's
+    # own order is an evaluator detail rather than a CUE
+    # contract: over `testdata/bundle-key-order/`'s four keys,
+    # cue v0.10.0 and cue v0.16.0 produce two different
+    # sequences, and neither is the sorted one. This layer and
+    # `apprafter app validate` both list a bundle's workloads
+    # (ADR 0063 §Decision 5 asks them to agree), and they run
+    # DIFFERENT cue binaries — this one is the version the image
+    # pins, the CLI's is whatever the developer has. Agreeing on
+    # the export order therefore means agreeing only by
+    # coincidence; `sort_by(.key)` is a rule both can hold.
     #
     # `--raw-output` strips JSON quoting so each line is a bare
     # key the `for` loop reads cleanly.
     keys=$(jq --raw-output \
-        'to_entries[]
+        'to_entries | sort_by(.key) | .[]
          | select(.value | type == "object" and has("apiVersion") and has("kind"))
          | .key' "$json_out")
 
