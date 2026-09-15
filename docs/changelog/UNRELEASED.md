@@ -9,6 +9,109 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## Unreleased — health checks, JetStream tuning, and the start of shared databases (plan 2.28 + 2.29)
+
+Not yet cut: 2.28 and 2.29 ship as one release pack, because both change the
+`Application` CRD and two CRD upgrades back to back at a live cluster is risk
+with no upside. 2.29's runtime is unfinished, so nothing below lets you create
+a shared database yet.
+
+### Added
+
+- **Health checks in the manifest — `probes.liveness` / `readiness` /
+  `startup`.** The form is discriminated by `path`: present means an HTTP GET,
+  absent means a TCP connect. Timings are integer seconds under Kubernetes'
+  own field names, so `"500ms"` — which a Kubernetes probe cannot express — is
+  not writable. Every timing has a default, so a path is enough to start.
+
+  Two behaviours are supplied beyond what the manifest says, and both are
+  breaking on upgrade. **An exposed workload that declares no readiness probe
+  gets a TCP connect on its own `expose.port`**: nothing is guessed, the port
+  is the manifest's, and without it every rolling update has a window in which
+  the new pod is Ready while its process is still binding. Every existing
+  Deployment therefore rolls once when the operator upgrades, and an
+  application whose `expose.port` is wrong becomes NotReady for the first time
+  — that is a fix, and it will be reported as a regression. Opt out with
+  `probes: {readiness: {enabled: false}}`.
+
+  **A declared liveness probe with no startup probe derives one** against the
+  same target with a five-minute budget, so adding a single liveness probe
+  cannot CrashLoop an application that takes forty seconds to warm a cache.
+
+  `apprafter app status` prints the effective configuration, including the two
+  probes that appear in no manifest, because the platform's timing defaults
+  are applied by the renderer and never reach the stored object.
+
+  [ADR 0065] §1.
+
+- **JetStream redelivery, acknowledgement and retention, tuned from the
+  manifest.** Twelve stream fields and twenty-one consumer fields, each
+  mapping one-for-one onto the message controller's own field of the same
+  name — `ackWait`, `maxDeliver`, `backoff`, `maxAckPending`, filters,
+  delivery policies, `discard`, `compression`, `consumerLimits` and the rest.
+
+  Before this, none of them was reachable: an application can create its own
+  consumers, but the controller owns a declared durable and re-asserts its
+  configuration on the next pass, so a client-side `ackWait` was reverted. The
+  setting was neither client-owned nor git-owned.
+
+- **A dead-letter queue for messages that exhaust redelivery** —
+  `consume[].deadLetter`. NATS has no dead-letter queue; what it has is an
+  advisory published when a consumer gives up, carrying the stream, the
+  consumer and the message's sequence. This makes that advisory addressable as
+  an ordinary declared stream, so the quota, the permissions and the cleanup
+  treat it like any other.
+
+  **The queue holds metadata, not message bodies.** The body is one fetch away
+  by sequence, and — measured on the pinned server — that holds under
+  `retention: workqueue` too, where an exhausted message is not removed and
+  the consumer moves past it. The corollary is worth planning for: nothing
+  removes such a message until age or size limits do, so a workqueue
+  accumulates the messages it could not deliver.
+
+  [ADR 0065] §2.
+
+- **PostgreSQL extensions requested from the manifest** —
+  `needs.pg.extensions`, and the same field on a shared database. Bounded by
+  an allow list rather than a deny list: the Postgres cluster is shared by
+  every tenant and extension creation runs with superuser rights, so anything
+  that reaches the network, the server's filesystem or runs untrusted code is
+  refused. Extensions needing a server-wide preload are refused separately,
+  with their own reason. The operand image already provides `vector`,
+  `pg_trgm` and `pgcrypto`.
+
+  Removing an entry never cascades. Dropping an extension that other objects
+  depend on fails and names the dependency, which is the outcome to surface —
+  a silent cascade would delete a column default because somebody tidied a
+  list.
+
+  [ADR 0066] §4.
+
+- **`SharedDatabase` — the manifest surface only, so far.** A database several
+  applications may bind, created explicitly and outliving any of them, bound
+  through `needs.<type>.ref` with a per-consumer `access` of `rw` or `ro`.
+  Every consumer gets its own credential, so revocation is per application —
+  which is the whole reason it is not simply a copied connection secret.
+
+  The schema, the validation and the SQL are in place and the SQL is proven
+  against a real PostgreSQL. **Nothing provisions a shared database yet**, so
+  there is no way to use one; the runtime is the rest of plan item 2.29.
+
+  [ADR 0066] §1–§3.
+
+### Changed
+
+- **`apprafter app scaffold` stops handing out two broken examples.** The
+  per-environment example used `expose: public: false`, a field that has not
+  existed since public exposure moved to `expose.network` — uncommenting the
+  block produced two validation errors. The environment-variable comment said
+  secret and config references were still years away; they shipped with the
+  reference model. Both are corrected, and the template now names health
+  checks.
+
+[ADR 0065]: ../adr/0065-probes-and-jetstream-tuning.md
+[ADR 0066]: ../adr/0066-shared-database.md
+
 ## cue-cmp 0.1.27 / platform-stack 0.2.73 / cli v0.2.71 — one sequence for a bundle's workloads (unreleased)
 
 ### Fixed

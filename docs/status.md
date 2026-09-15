@@ -36,6 +36,7 @@ post-launch work is not a roadmap phase and has no subscribe control.
 | Shipped | ✅ | One manifest serves several environments | [Per-environment deploy](how-it-works/per-environment-deploy.md) |
 | Shipped | ✅ | Scaffold a starter manifest for an application (`apprafter app scaffold`) | [Developer quickstart](dev-guide/quickstart.md) |
 | Shipped | ✅ | Roll back to the previously resolved image and hold there until released | [Rolling back a bad deploy](dev-guide/rollback.md) |
+| Shipped | ✅ | Health checks declared in the manifest, with a readiness check by default on an exposed port | — |
 | Shipped | 🚧 | Backstage developer portal — application status and a golden-path template | — |
 
 > **Backstage is partial, and further from ready than "opt-in" suggests.** The portal's source and
@@ -54,6 +55,9 @@ post-launch work is not a roadmap phase and has no subscribe control.
 | Shipped | ✅ | On-demand Postgres (`needs.pg`) | [Postgres](operator-guide/postgres.md) |
 | Shipped | ✅ | On-demand Redis-compatible cache (`needs.redis`) | [Redis](operator-guide/redis.md) |
 | Shipped | ✅ | Message streams and durable consumers, declared in the manifest (`needs.jetstream`) | [JetStream](operator-guide/jetstream.md) |
+| Shipped | 🚧 | Redelivery, acknowledgement and retention tuned per stream and per consumer, with a dead-letter queue | — |
+| Shipped | 🚧 | One Postgres database or cache shared between applications, each consumer with its own credential | — |
+| Shipped | 🚧 | PostgreSQL extensions requested from the manifest, from a bounded list | — |
 | Shipped | ✅ | On-demand block storage (`needs.disk`) | [Persistent disks](operator-guide/persistent-disk.md) |
 | Shipped | ✅ | One volume shared between applications, with removal refused while it is referenced | [Shared volumes](operator-guide/shared-volumes.md) |
 | Shipped | ✅ | Back up and restore a whole cluster, or export one dependency's data | [Back up a cluster](operator-guide/backup-restore.md) |
@@ -77,6 +81,15 @@ post-launch work is not a roadmap phase and has no subscribe control.
 > refused and told so on its own dependency, naming the budget, while every namespace already on the
 > server keeps running untouched. A larger per-tier budget is planned.
 > JetStream stores are out of scope for backup and restore.
+
+> **What the three `🚧` rows above are missing, precisely.** The JetStream tuning surface and the
+> dead-letter queue are built and gated — every field is accepted and stored by the message
+> controller's own schema, and the server behaviours they rely on were measured on the pinned
+> server — but the chain from a manifest through to a dead-letter queue actually filling has not
+> been run end to end on a cluster. Shared databases and manifest-requested extensions are further
+> back: the manifest surface, the validation and the SQL are in place and the SQL is proven against
+> a real PostgreSQL, but nothing provisions a shared database yet, so there is no way to use one.
+> None of the three is `✅` and none will be until a walk says so.
 
 ---
 
