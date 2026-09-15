@@ -3333,6 +3333,7 @@ mod application_jetstream_trigger_tests {
             from: from.map(str::to_string),
             stream: stream.to_string(),
             durable: durable.to_string(),
+            ..Default::default()
         }
     }
 

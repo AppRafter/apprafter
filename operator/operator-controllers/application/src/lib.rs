@@ -5248,6 +5248,7 @@ mod tests {
                         from: Some("feeder".into()),
                         stream: "blocks-head".into(),
                         durable: "indexer".into(),
+                        ..Default::default()
                     }],
                     ..Default::default()
                 }),

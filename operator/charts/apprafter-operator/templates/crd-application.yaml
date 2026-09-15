@@ -86,10 +86,92 @@ spec:
                           consume:
                             items:
                               properties:
+                                ackPolicy:
+                                  enum:
+                                  - explicit
+                                  - all
+                                  - none
+                                  type: string
+                                ackWait:
+                                  type: string
+                                backoff:
+                                  items:
+                                    type: string
+                                  type: array
+                                deadLetter:
+                                  properties:
+                                    maxAge:
+                                      type: string
+                                    maxBytes:
+                                      type: string
+                                    stream:
+                                      type: string
+                                  required:
+                                  - stream
+                                  - maxBytes
+                                  type: object
+                                deliverGroup:
+                                  type: string
+                                deliverPolicy:
+                                  enum:
+                                  - all
+                                  - last
+                                  - new
+                                  - byStartSequence
+                                  - byStartTime
+                                  - lastPerSubject
+                                  type: string
+                                deliverSubject:
+                                  type: string
+                                description:
+                                  type: string
                                 durable:
                                   pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                                   type: string
+                                filterSubject:
+                                  type: string
+                                filterSubjects:
+                                  items:
+                                    type: string
+                                  type: array
+                                flowControl:
+                                  type: boolean
                                 from:
+                                  type: string
+                                headersOnly:
+                                  type: boolean
+                                heartbeatInterval:
+                                  type: string
+                                inactiveThreshold:
+                                  type: string
+                                maxAckPending:
+                                  type: integer
+                                maxDeliver:
+                                  type: integer
+                                maxRequestBatch:
+                                  type: integer
+                                maxRequestExpires:
+                                  type: string
+                                maxRequestMaxBytes:
+                                  type: integer
+                                maxWaiting:
+                                  type: integer
+                                memStorage:
+                                  type: boolean
+                                optStartSeq:
+                                  type: integer
+                                optStartTime:
+                                  type: string
+                                rateLimitBps:
+                                  type: integer
+                                replayPolicy:
+                                  enum:
+                                  - instant
+                                  - original
+                                  type: string
+                                replicas:
+                                  type: integer
+                                sampleFreq:
                                   type: string
                                 stream:
                                   type: string
@@ -119,26 +201,75 @@ spec:
                           streams:
                             items:
                               properties:
+                                allowDirect:
+                                  type: boolean
                                 allowPurge:
                                   type: boolean
+                                allowRollup:
+                                  type: boolean
+                                compression:
+                                  enum:
+                                  - none
+                                  - s2
+                                  type: string
+                                consumerLimits:
+                                  properties:
+                                    inactiveThreshold:
+                                      type: string
+                                    maxAckPending:
+                                      type: integer
+                                  type: object
+                                description:
+                                  type: string
+                                discard:
+                                  enum:
+                                  - old
+                                  - new
+                                  type: string
+                                discardPerSubject:
+                                  type: boolean
+                                duplicateWindow:
+                                  type: string
                                 maxAge:
                                   type: string
                                 maxBytes:
                                   type: string
+                                maxConsumers:
+                                  type: integer
+                                maxMsgSize:
+                                  type: integer
+                                maxMsgs:
+                                  type: integer
+                                maxMsgsPerSubject:
+                                  type: integer
+                                mirror:
+                                  type: object
                                 name:
                                   pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                                   type: string
+                                placement:
+                                  type: object
+                                replicas:
+                                  type: integer
+                                republish:
+                                  type: object
                                 retention:
                                   enum:
                                   - limits
                                   - interest
                                   - workqueue
                                   type: string
+                                sources:
+                                  items:
+                                    type: object
+                                  type: array
                                 storage:
                                   enum:
                                   - file
                                   - memory
                                   type: string
+                                subjectTransform:
+                                  type: object
                                 subjects:
                                   items:
                                     type: string
@@ -350,10 +481,92 @@ spec:
                             consume:
                               items:
                                 properties:
+                                  ackPolicy:
+                                    enum:
+                                    - explicit
+                                    - all
+                                    - none
+                                    type: string
+                                  ackWait:
+                                    type: string
+                                  backoff:
+                                    items:
+                                      type: string
+                                    type: array
+                                  deadLetter:
+                                    properties:
+                                      maxAge:
+                                        type: string
+                                      maxBytes:
+                                        type: string
+                                      stream:
+                                        type: string
+                                    required:
+                                    - stream
+                                    - maxBytes
+                                    type: object
+                                  deliverGroup:
+                                    type: string
+                                  deliverPolicy:
+                                    enum:
+                                    - all
+                                    - last
+                                    - new
+                                    - byStartSequence
+                                    - byStartTime
+                                    - lastPerSubject
+                                    type: string
+                                  deliverSubject:
+                                    type: string
+                                  description:
+                                    type: string
                                   durable:
                                     pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                                     type: string
+                                  filterSubject:
+                                    type: string
+                                  filterSubjects:
+                                    items:
+                                      type: string
+                                    type: array
+                                  flowControl:
+                                    type: boolean
                                   from:
+                                    type: string
+                                  headersOnly:
+                                    type: boolean
+                                  heartbeatInterval:
+                                    type: string
+                                  inactiveThreshold:
+                                    type: string
+                                  maxAckPending:
+                                    type: integer
+                                  maxDeliver:
+                                    type: integer
+                                  maxRequestBatch:
+                                    type: integer
+                                  maxRequestExpires:
+                                    type: string
+                                  maxRequestMaxBytes:
+                                    type: integer
+                                  maxWaiting:
+                                    type: integer
+                                  memStorage:
+                                    type: boolean
+                                  optStartSeq:
+                                    type: integer
+                                  optStartTime:
+                                    type: string
+                                  rateLimitBps:
+                                    type: integer
+                                  replayPolicy:
+                                    enum:
+                                    - instant
+                                    - original
+                                    type: string
+                                  replicas:
+                                    type: integer
+                                  sampleFreq:
                                     type: string
                                   stream:
                                     type: string
@@ -383,26 +596,75 @@ spec:
                             streams:
                               items:
                                 properties:
+                                  allowDirect:
+                                    type: boolean
                                   allowPurge:
                                     type: boolean
+                                  allowRollup:
+                                    type: boolean
+                                  compression:
+                                    enum:
+                                    - none
+                                    - s2
+                                    type: string
+                                  consumerLimits:
+                                    properties:
+                                      inactiveThreshold:
+                                        type: string
+                                      maxAckPending:
+                                        type: integer
+                                    type: object
+                                  description:
+                                    type: string
+                                  discard:
+                                    enum:
+                                    - old
+                                    - new
+                                    type: string
+                                  discardPerSubject:
+                                    type: boolean
+                                  duplicateWindow:
+                                    type: string
                                   maxAge:
                                     type: string
                                   maxBytes:
                                     type: string
+                                  maxConsumers:
+                                    type: integer
+                                  maxMsgSize:
+                                    type: integer
+                                  maxMsgs:
+                                    type: integer
+                                  maxMsgsPerSubject:
+                                    type: integer
+                                  mirror:
+                                    type: object
                                   name:
                                     pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                                     type: string
+                                  placement:
+                                    type: object
+                                  replicas:
+                                    type: integer
+                                  republish:
+                                    type: object
                                   retention:
                                     enum:
                                     - limits
                                     - interest
                                     - workqueue
                                     type: string
+                                  sources:
+                                    items:
+                                      type: object
+                                    type: array
                                   storage:
                                     enum:
                                     - file
                                     - memory
                                     type: string
+                                  subjectTransform:
+                                    type: object
                                   subjects:
                                     items:
                                       type: string

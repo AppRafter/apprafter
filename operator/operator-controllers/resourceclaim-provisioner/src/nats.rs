@@ -1465,6 +1465,7 @@ mod tests {
                         from: None,
                         stream: "x".into(),
                         durable: "d".into(),
+                        ..Default::default()
                     }],
                 },
             ),
@@ -1494,6 +1495,7 @@ mod tests {
                     from: Some("feeder".into()),
                     stream: "blocks-head".into(),
                     durable: "idx".into(),
+                    ..Default::default()
                 }],
             },
         )];
@@ -1603,6 +1605,7 @@ mod tests {
                 max_age: Some("24h".into()),
                 max_bytes: "1Gi".into(),
                 allow_purge: true,
+                ..Default::default()
             }],
             consume: vec![],
         };

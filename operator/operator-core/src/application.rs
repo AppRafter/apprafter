@@ -390,6 +390,80 @@ pub struct JetStreamStream {
     pub max_bytes: String,
     #[serde(default)]
     pub allow_purge: bool,
+
+    // 2.28 tuning (ADR 0065 §2.1). Each maps 1:1 onto the NACK
+    // `Stream.spec` field of the same name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_msgs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_msgs_per_subject: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_msg_size: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_consumers: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discard: Option<String>,
+    /// Requires `discard: "new"` AND `max_msgs_per_subject > 0` — a server
+    /// rule (10052) measured on 2.14.3 and re-stated by the webhook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discard_per_subject: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplicate_window: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_direct: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_rollup: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer_limits: Option<JetStreamConsumerLimits>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    // Declared in order to be REJECTED (ADR 0065 §2.3) — a structural
+    // schema prunes an unknown field before the webhook runs, so omitting
+    // these would make `mirror:` vanish silently and appear to work.
+    // Opaque MAPS, not bare `serde_json::Value`: the shapes are NACK's and
+    // we only ever need to know whether the user wrote one — but a bare
+    // `Value` renders in schemars as the any-schema `true`, which the
+    // Rust↔CUE gate reads as `unknown` against the CUE's `object`. A map
+    // keeps the kind honest on both sides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<Vec<BTreeMap<String, serde_json::Value>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub republish: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_transform: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<i64>,
+}
+
+/// Per-stream defaults NACK applies to consumers created on it (2.28).
+/// Mirrors `#JetStreamConsumerLimits`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct JetStreamConsumerLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inactive_threshold: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ack_pending: Option<i64>,
+}
+
+/// Where a message goes when a consumer exhausts `maxDeliver` (2.28 /
+/// ADR 0065 §2.4). Materialises an ORDINARY declared stream owned by the
+/// application, collecting one exact advisory subject — see
+/// `#JetStreamDeadLetter` in `application.cue` for the full argument.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct JetStreamDeadLetter {
+    pub stream: String,
+    pub max_bytes: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, JsonSchema)]
@@ -399,6 +473,71 @@ pub struct JetStreamConsume {
     pub from: Option<String>,
     pub stream: String,
     pub durable: String,
+
+    // 2.28 tuning (ADR 0065 §2.2). Durations are Go duration strings, as
+    // NACK expects — unlike `Probe`, whose timings are integer seconds
+    // because that is what a Kubernetes probe is specified in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_wait: Option<String>,
+    /// `max_deliver > backoff.len()`, STRICTLY (server error 10116).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_deliver: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ack_pending: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_subjects: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliver_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opt_start_seq: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opt_start_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_waiting: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_batch: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_expires: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_max_bytes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inactive_threshold: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_bps: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_storage: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_freq: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Rejected without `max_deliver > 0`: with no ceiling the advisory
+    /// never fires and the DLQ is permanently empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dead_letter: Option<JetStreamDeadLetter>,
+
+    // Declared in order to be REJECTED (ADR 0065 §2.3) — the push surface.
+    // Push delivery is performed by the SERVER, outside the application's
+    // publish permissions: a write channel into a neighbour's prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliver_subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliver_group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_control: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_interval: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<i64>,
 }
 
 impl JetStreamNeed {

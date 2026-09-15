@@ -518,6 +518,102 @@ _mkFields: {
 	// destructive-to-self, which ADR 0051's axis governs, and takes no
 	// security trigger).
 	allowPurge?: bool | *false
+
+	// ── Tuning (2.28 / ADR 0065 §2.1) ───────────────────────────────
+	// Each maps 1:1 onto the NACK `Stream.spec` field of the same name.
+	// The enums below are NACK's own spellings, verified against the
+	// pinned chart's CRD — not a re-invention, because these values are
+	// passed through verbatim.
+	maxMsgs?:           int
+	maxMsgsPerSubject?: int
+	maxMsgSize?:        int
+	maxConsumers?:      int
+	discard?:           "old" | *"old" | "new"
+	// Requires `discard: "new"` AND `maxMsgsPerSubject > 0` — a server-side
+	// rule (error 10052), measured on 2.14.3 and re-stated by the webhook so
+	// the refusal names a field instead of surfacing through NACK.
+	discardPerSubject?: bool
+	duplicateWindow?:   string
+	compression?:       "none" | *"none" | "s2"
+	// Serve `$JS.API.DIRECT.GET` on this stream. Defaults OFF — today's
+	// behaviour. The grant is already in the account's allow list and is
+	// inert until a stream opts in, so flipping the default would change
+	// every existing stream on upgrade for no asked-for reason.
+	allowDirect?: bool | *false
+	// Let a publisher collapse a subject with the `Nats-Rollup` header.
+	// Same shape as `allowPurge` above, and for the same reason: on a
+	// stream carrying only its owner's subjects this is destructive-to-self
+	// (ADR 0051's axis, no security trigger); on a fan-in stream it deletes
+	// a NEIGHBOUR's data, and is ADR 0052 trigger #16.
+	allowRollup?:    bool | *false
+	consumerLimits?: #JetStreamConsumerLimits
+	description?:    string
+
+	// ── Declared in order to be REJECTED (ADR 0065 §2.3) ────────────
+	// `sources` and `mirror` were MEASURED to defeat the read half of the
+	// deny vector (ADR 0061 §4.1); `republish` and `subjectTransform` are
+	// the same class, re-emitting a stream's traffic under a subject the
+	// application could not publish to; `placement` and `replicas` are
+	// clustered topology (Tier 2+).
+	//
+	// Named here rather than omitted because a structural schema PRUNES an
+	// unknown field BEFORE a validating webhook runs — a manifest setting
+	// `mirror:` would have it vanish silently and appear to work, which is
+	// exactly the failure ADR 0061 §6 established this pattern against.
+	// These are the six a user plausibly writes, because they are prominent
+	// in NATS's own documentation; the rest of NACK's surface is provider
+	// plumbing nobody types into an application manifest and costs nothing
+	// to prune. `validate_jetstream_need` rejects each one outright.
+	sources?: [...{...}]
+	mirror?: {...}
+	republish?: {...}
+	subjectTransform?: {...}
+	placement?: {...}
+	replicas?: int
+}
+
+// #JetStreamConsumerLimits — per-stream defaults NACK applies to consumers
+// created on it (2.28). Durations are Go duration strings, as NACK expects.
+#JetStreamConsumerLimits: {
+	inactiveThreshold?: string
+	maxAckPending?:     int
+}
+
+// #JetStreamDeadLetter — where a message goes when a consumer exhausts
+// `maxDeliver` (2.28 / ADR 0065 §2.4).
+//
+// NATS has no dead-letter queue. What it has is an advisory published on
+// `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.<stream>.<consumer>` carrying
+// the stream, the consumer, the stream sequence and the delivery count —
+// METADATA, NOT THE MESSAGE BODY. This block makes that advisory
+// addressable and the documentation says so plainly.
+//
+// The body is one fetch away: `$JS.API.STREAM.MSG.GET` at the advised
+// `stream_seq` returns it, the grant is already in the allow list, and —
+// measured on 2.14.3 — this holds under `retention: workqueue` too, where
+// an exhausted message is NOT removed. It stays at its sequence while the
+// consumer moves on, which also means nothing ever removes it until
+// `maxAge`/`maxBytes` does: a workqueue accumulates its poison messages.
+//
+// MECHANISM, deliberately not new machinery: this materialises an ORDINARY
+// DECLARED STREAM owned by the application, entering the provisioner's
+// `ClaimView.streams` exactly as an entry of `streams[]` does — so the
+// allow list, the deny vector, the quota pre-flight, the capture detector
+// and the GC all treat it identically, with no new code path and no new
+// permission. The only difference is that its `subjects` are composed by
+// the platform: one exact advisory subject for this (stream, durable) pair,
+// never a wildcard, so it can carry nothing but this application's own
+// failures. Read it with an ordinary `consume` entry naming it.
+#JetStreamDeadLetter: {
+	// DLQ stream name. A DNS-1123 label, unique across this application's
+	// `streams[].name` and its other `deadLetter.stream` values — it enters
+	// the same `nats_stream_name(app, name)` namespace and inherits that
+	// rule (webhook-enforced, same as `#JetStreamStream.name`).
+	stream: string
+	// Required, for the same reason it is required on a declared stream:
+	// the DLQ counts against the namespace quota like any other.
+	maxBytes: string
+	maxAge?:  string
 }
 
 // #JetStreamConsume — one declared durable consumer under
@@ -543,6 +639,70 @@ _mkFields: {
 	// let two different applications compose the identical NATS durable
 	// name — silently sharing one consumer's delivery cursor.
 	durable: string
+
+	// ── Tuning (2.28 / ADR 0065 §2.2) ───────────────────────────────
+	// Each maps 1:1 onto the NACK `Consumer.spec` field of the same name;
+	// the enums are NACK's own spellings, verified against the pinned
+	// chart's CRD. Durations are Go duration strings ("30s"), as NACK
+	// expects — unlike `#Probe`, whose timings are integer seconds because
+	// that is what a Kubernetes probe is specified in.
+	//
+	// These are not merely a convenience. An application CAN create its own
+	// consumers, but NACK owns a declared durable and re-asserts its own
+	// config on the next pass, so a client-side `ackWait` is reverted. Until
+	// these fields existed the setting was neither client-owned nor
+	// git-owned: it was unreachable.
+	ackPolicy?: "explicit" | *"explicit" | "all" | "none"
+	ackWait?:   string
+	// `maxDeliver > len(backoff)`, STRICTLY — a server rule (error 10116),
+	// measured on 2.14.3 and enforced by the webhook.
+	maxDeliver?: int
+	backoff?: [...string]
+	maxAckPending?: int
+	// Narrowing only — a filter can never widen what a durable sees, on an
+	// own stream or a foreign one, so neither touches the permission model.
+	// Mutually exclusive (the server rejects both), webhook-enforced.
+	filterSubject?: string
+	filterSubjects?: [...string]
+	deliverPolicy?: "all" | *"all" | "last" | "new" | "byStartSequence" | "byStartTime" | "lastPerSubject"
+	// Each requires its own `deliverPolicy`, and is REJECTED rather than
+	// ignored under any other — an ignored start position is a consumer
+	// that silently reads from the wrong place.
+	optStartSeq?:        int
+	optStartTime?:       string
+	replayPolicy?:       "instant" | *"instant" | "original"
+	maxWaiting?:         int
+	maxRequestBatch?:    int
+	maxRequestExpires?:  string
+	maxRequestMaxBytes?: int
+	inactiveThreshold?:  string
+	rateLimitBps?:       int
+	headersOnly?:        bool
+	memStorage?:         bool
+	sampleFreq?:         string
+	description?:        string
+
+	// Rejected without `maxDeliver` > 0: with no delivery ceiling the
+	// advisory never fires and the DLQ is permanently empty — a manifest
+	// that looks like it works and says nothing, which is the failure class
+	// the declare-to-reject pattern exists for.
+	deadLetter?: #JetStreamDeadLetter
+
+	// ── Declared in order to be REJECTED (ADR 0065 §2.3) ────────────
+	// Push-mode delivery is performed by the SERVER, outside the
+	// application's publish permissions — a write channel into a
+	// neighbour's prefix. These four are the push surface, and they are
+	// named here rather than omitted for the reason ADR 0061 §6 gives: a
+	// structural schema PRUNES an unknown field before a validating webhook
+	// runs, so a manifest setting `deliverSubject` would have it vanish
+	// silently and appear to work. `validate_jetstream_need` rejects each
+	// one outright.
+	deliverSubject?:    string
+	deliverGroup?:      string
+	flowControl?:       bool
+	heartbeatInterval?: string
+	// Clustered topology, Tier 2+. Declared for the same reason.
+	replicas?: int
 }
 
 // #Resources — container resource requests/limits (2.16d). Keys are
