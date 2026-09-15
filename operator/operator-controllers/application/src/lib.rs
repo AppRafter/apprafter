@@ -3540,6 +3540,29 @@ fn generate_resource_claims(
         if let Some(persistent) = need.persistent {
             claim_spec["persistent"] = json!(persistent);
         }
+        // 2.29 (ADR 0066 §2): a reference need rides the SAME claim as an
+        // owned one — unlike `needs.disk.ref`, which generates none. The
+        // provisioner branches on `spec.sharedRef`: present means bind a
+        // consumer to an existing database (a role, a password, a Secret),
+        // absent means the pre-2.29 provision path verbatim. Keeping it on
+        // the claim is what leaves `claim.<type>.*` references, the egress
+        // rule, the readiness gate and GC working unchanged.
+        //
+        // `access` and `extensions` ride alongside rather than being folded
+        // into one shape: the webhook has already refused every combination
+        // that would make them ambiguous (access without ref, extensions
+        // with ref, extensions off pg), so this passthrough can stay literal.
+        if let Some(reference) = need.ref_.as_deref() {
+            claim_spec["sharedRef"] = json!(reference);
+        }
+        if let Some(access) = need.access.as_deref() {
+            claim_spec["access"] = json!(access);
+        }
+        if let Some(extensions) = need.extensions.as_ref() {
+            if !extensions.is_empty() {
+                claim_spec["extensions"] = json!(extensions);
+            }
+        }
         // 2.5d prerequisite (ADR 0061 §6 amendment): the jetstream
         // permission model's input rides ALONGSIDE the generic `need`
         // projection, not through it — `JetStreamNeed::as_service_need()`
@@ -5181,6 +5204,76 @@ mod tests {
         let (_, payload) = &payloads[0];
         assert_eq!(payload["spec"]["selector"], json!({ "tier": "managed" }));
         assert_eq!(payload["spec"]["size"], json!("small"));
+    }
+
+    #[test]
+    fn generate_resource_claims_passes_through_the_shared_database_binding() {
+        // 2.29 (ADR 0066 §2): a reference need rides the SAME claim as an
+        // owned one, carrying the three fields the provisioner branches on.
+        // Generating no claim — the `needs.disk.ref` shape — would leave a
+        // consumer with no role, no password and no connection Secret.
+        let mut needs = BTreeMap::new();
+        needs.insert(
+            "pg".to_string(),
+            ServiceNeed {
+                ref_: Some("orders-db".into()),
+                access: Some("ro".into()),
+                ..Default::default()
+            },
+        );
+        let spec = base_with_needs(needs);
+        let payloads = generate_resource_claims(&spec, "parser", "uid-1", "demo");
+        assert_eq!(
+            payloads.len(),
+            1,
+            "a reference need still generates a claim"
+        );
+        let (name, payload) = &payloads[0];
+        assert_eq!(name, "parser-pg", "and keeps the ordinary claim name");
+        assert_eq!(payload["spec"]["sharedRef"], json!("orders-db"));
+        assert_eq!(payload["spec"]["access"], json!("ro"));
+        assert_eq!(payload["spec"]["type"], json!("pg"));
+    }
+
+    #[test]
+    fn generate_resource_claims_omits_the_binding_fields_on_an_owned_need() {
+        // The provisioner branches on the PRESENCE of sharedRef, so an owned
+        // claim must not carry the key at all — an empty string would route
+        // it down the binding path looking for a SharedDatabase called "".
+        let mut needs = BTreeMap::new();
+        needs.insert("pg".to_string(), ServiceNeed::default());
+        let spec = base_with_needs(needs);
+        let payloads = generate_resource_claims(&spec, "parser", "uid-1", "demo");
+        let pg = &payloads[0].1;
+        assert!(pg["spec"].get("sharedRef").is_none());
+        assert!(pg["spec"].get("access").is_none());
+        assert!(pg["spec"].get("extensions").is_none());
+    }
+
+    #[test]
+    fn generate_resource_claims_passes_through_extensions() {
+        let mut needs = BTreeMap::new();
+        needs.insert(
+            "pg".to_string(),
+            ServiceNeed {
+                extensions: Some(vec![operator_core::PgExtension {
+                    name: "vector".into(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+        );
+        let spec = base_with_needs(needs);
+        let payloads = generate_resource_claims(&spec, "parser", "uid-1", "demo");
+        assert_eq!(
+            payloads[0].1["spec"]["extensions"][0]["name"],
+            json!("vector")
+        );
+        // An absent `version` must not serialize as null — CNPG would read
+        // that as an explicit request for the null version.
+        assert!(payloads[0].1["spec"]["extensions"][0]
+            .get("version")
+            .is_none());
     }
 
     #[test]
