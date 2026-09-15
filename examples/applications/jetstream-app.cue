@@ -24,6 +24,14 @@
 // ("orders", "indexer"), so it can't observe that `pattern` disappearing
 // either. `crdgen`'s `jetstream_declared_names_require_dns_1123_pattern`
 // test closes that one the same way.
+//
+// EXTENDED for 2.28 (ADR 0065 §2): the tuning surface and a dead-letter
+// queue. Two of the combinations here are deliberate worked examples of
+// rules the SERVER enforces and the webhook mirrors — `discardPerSubject`
+// alongside `discard: "new"` and a positive `maxMsgsPerSubject` (error
+// 10052), and `maxDeliver: 5` against a 3-step `backoff`, which the server
+// requires to be strictly greater (error 10116). Both were measured on
+// 2.14.3; see `docs/measurements/2.28-jetstream-2026-09-15.md`.
 package examples
 
 import v1alpha1 "apprafter.io/schemas/v1alpha1"
@@ -57,11 +65,60 @@ jetstreamApp: v1alpha1.#Application & {
 							maxAge:     "24h"
 							maxBytes:   "1Gi"
 							allowPurge: true
+
+							// 2.28 tuning (ADR 0065 §2.1). `discardPerSubject`
+							// is supplied together with the two fields the
+							// server requires alongside it — `discard: "new"`
+							// and a positive `maxMsgsPerSubject` (error 10052,
+							// measured) — so this fixture is also the worked
+							// example of that combination.
+							maxMsgs:           1000000
+							maxMsgsPerSubject: 1000
+							maxMsgSize:        1048576
+							maxConsumers:      16
+							discard:           "new"
+							discardPerSubject: true
+							duplicateWindow:   "2m"
+							compression:       "s2"
+							allowDirect:       true
+							description:       "order events, fanned in from shop and billing"
+							consumerLimits: {
+								inactiveThreshold: "24h"
+								maxAckPending:     512
+							}
 						},
 					]
-					// Reads another application's stream via its own durable.
+					// Reads another application's stream via its own durable,
+					// with the redelivery contract the manifest could not
+					// express before 2.28 — and a dead-letter queue for the
+					// messages that exhaust it.
+					//
+					// `maxDeliver` is 5 and `backoff` has 3 steps: the server
+					// requires maxDeliver to be STRICTLY greater than the
+					// number of steps (error 10116, measured), so this is also
+					// the worked example of that rule.
 					consume: [
-						{from: "feeder", stream: "blocks-head", durable: "indexer"},
+						{
+							from:       "feeder"
+							stream:     "blocks-head"
+							durable:    "indexer"
+							ackPolicy:  "explicit"
+							ackWait:    "30s"
+							maxDeliver: 5
+							backoff: ["1s", "5s", "30s"]
+							maxAckPending: 100
+							filterSubject: "blocks.head.eu"
+							deliverPolicy: "all"
+							replayPolicy:  "instant"
+							deadLetter: {
+								stream:   "indexer-dlq"
+								maxBytes: "128Mi"
+								maxAge:   "168h"
+							}
+						},
+						// Reading the DLQ is an ordinary consume entry naming
+						// it — no new permission, no new machinery.
+						{stream: "indexer-dlq", durable: "dlq-reader"},
 					]
 				}
 			}

@@ -289,4 +289,66 @@ else
     echo "    OK: a probe path without a leading '/' is rejected by the apiserver"
 fi
 
+# 2.28 / ADR 0065 §2. The JetStream tuning surface is fully structural and
+# NESTED two and three levels deep (`needs.jetstream.consume[].deadLetter`,
+# `streams[].consumerLimits`). A pruning boundary anywhere along that path
+# answers 200 and drops the block, which for a dead-letter queue means the
+# manifest declares one, the apply succeeds, and no DLQ is ever created.
+echo "==> regression: JetStream tuning + deadLetter must round-trip (2.28)"
+kubectl --context "$CTX" create namespace crd-validate >/dev/null 2>&1 || true
+cat >/tmp/crd-validate-js.yaml <<'YAML'
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: crd-validate-js
+  namespace: crd-validate
+spec:
+  base:
+    image: example.com/app:latest
+    needs:
+      jetstream:
+        streams:
+          - name: orders
+            subjects: ["app.orders.>"]
+            maxBytes: "1Gi"
+            discard: new
+            discardPerSubject: true
+            maxMsgsPerSubject: 1000
+            compression: s2
+            consumerLimits:
+              inactiveThreshold: "24h"
+              maxAckPending: 512
+        consume:
+          - stream: orders
+            durable: reader
+            ackWait: "30s"
+            maxDeliver: 5
+            backoff: ["1s", "5s", "30s"]
+            deadLetter:
+              stream: reader-dlq
+              maxBytes: "128Mi"
+              maxAge: "168h"
+YAML
+if ! kubectl --context "$CTX" apply -f /tmp/crd-validate-js.yaml \
+    >/dev/null 2>/tmp/crd-js-err.txt; then
+    echo "==> REGRESSION: apiserver REJECTED a valid JetStream tuning block" >&2
+    cat /tmp/crd-js-err.txt >&2
+    exit 1
+fi
+_js_dlq=$(kubectl --context "$CTX" -n crd-validate get application crd-validate-js \
+    -o jsonpath='{.spec.base.needs.jetstream.consume[0].deadLetter.stream}' 2>/dev/null || true)
+_js_backoff=$(kubectl --context "$CTX" -n crd-validate get application crd-validate-js \
+    -o jsonpath='{.spec.base.needs.jetstream.consume[0].backoff[2]}' 2>/dev/null || true)
+_js_cl=$(kubectl --context "$CTX" -n crd-validate get application crd-validate-js \
+    -o jsonpath='{.spec.base.needs.jetstream.streams[0].consumerLimits.maxAckPending}' 2>/dev/null || true)
+if [ "$_js_dlq" = "reader-dlq" ] && [ "$_js_backoff" = "30s" ] && [ "$_js_cl" = "512" ]; then
+    echo "    OK: deadLetter, backoff and consumerLimits stored (not pruned)"
+else
+    echo "==> REGRESSION: a nested JetStream field was PRUNED — read back" >&2
+    echo "    deadLetter.stream='${_js_dlq}', backoff[2]='${_js_backoff}', maxAckPending='${_js_cl}'." >&2
+    echo "    A pruned deadLetter means the manifest declares a dead-letter queue," >&2
+    echo "    the apply succeeds, and no DLQ is ever created." >&2
+    exit 1
+fi
+
 echo "==> CRD apiserver validation PASSED (all CRDs accepted + Established)"
