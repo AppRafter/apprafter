@@ -347,19 +347,19 @@ PG_ADMIN_PW=$(kubectl -n "$CNPG_NS" get secret "${PG_CLUSTER}-apprafter-admin" \
     -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
 [ -n "$PG_ADMIN_PW" ] || die "the platform role's password Secret was never created"
 GROUPS=$(psql_as apprafter_admin "$PG_ADMIN_PW" postgres \
-    "SELECT rolname FROM pg_roles WHERE rolname IN ('${PG_GROUP}','${PG_READER_GROUP}') ORDER BY 1;")
+    "SELECT rolname FROM pg_roles WHERE rolname IN ('${PG_GROUP}','${PG_READER_GROUP}') ORDER BY 1;" || true)
 contains "the owning group exists on the server" "$GROUPS" "$PG_GROUP"
 contains "the reader group exists on the server" "$GROUPS" "$PG_READER_GROUP"
 
 DB_OWNER=$(psql_as apprafter_admin "$PG_ADMIN_PW" postgres \
-    "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname='${PG_DB_NAME}';")
+    "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname='${PG_DB_NAME}';" || true)
 check "the database is owned by the GROUP, not by a consumer" "$DB_OWNER" "$PG_GROUP"
 
 # The platform role must NOT be a superuser: it creates roles, and that is all
 # it is allowed to do. A superuser here would also mean CREATE EXTENSION ran
 # for anything a manifest named rather than only the allow list.
 IS_SUPER=$(psql_as apprafter_admin "$PG_ADMIN_PW" postgres \
-    "SELECT rolsuper FROM pg_roles WHERE rolname='apprafter_admin';")
+    "SELECT rolsuper FROM pg_roles WHERE rolname='apprafter_admin';" || true)
 check "the platform role is not a superuser" "$IS_SUPER" "f"
 
 # ===============================================================
@@ -406,12 +406,12 @@ check "no claim is generated while the gate is pending" "$CLAIMS_WHILE_GATED" ""
 check "refCount stays 0 while the bind waits for approval" \
     "$(jp "$SHDB_RES" "$APP_NS" "$PG_DB" '{.status.refCount}')" "0"
 
-printf '  approving the plan ...\n'
-kubectl -n "$APP_NS" patch "$PLAN_RES" "$PLAN_NAME" --type=merge --subresource=status \
-    -p '{"status":{"phase":"Approved"}}' >/dev/null 2>&1 \
-    || kubectl -n "$APP_NS" patch "$PLAN_RES" "$PLAN_NAME" --type=merge \
-        -p '{"spec":{"approved":true}}' >/dev/null 2>&1 \
-        || die "could not approve the MigrationPlan"
+# Through the CLI, which is both the shipped way and the only one that is
+# right: the operator matches the phase `approved` in LOWER case and there is
+# no `spec.approved` field at all, so a hand-rolled patch of `Approved` writes
+# a value nothing reads and the plan sits pending until the walk times out.
+printf '  approving %s via apprafter migration approve ...\n' "$PLAN_NAME"
+apprafter migration approve "$PLAN_NAME" || die "apprafter migration approve"
 
 # ===============================================================
 phase "Phase 5: the rw consumer binds — claim, role, Secret"
@@ -479,11 +479,7 @@ done
 RO_PLAN_NAME="${RO_PLAN#*/}"
 contains "the ro bind's plan records the access level" \
     "$(jp "$PLAN_RES" "$APP_NS" "$RO_PLAN_NAME" '{.spec.trigger.to}')" "ro"
-kubectl -n "$APP_NS" patch "$PLAN_RES" "$RO_PLAN_NAME" --type=merge --subresource=status \
-    -p '{"status":{"phase":"Approved"}}' >/dev/null 2>&1 \
-    || kubectl -n "$APP_NS" patch "$PLAN_RES" "$RO_PLAN_NAME" --type=merge \
-        -p '{"spec":{"approved":true}}' >/dev/null 2>&1 \
-        || die "could not approve the ro MigrationPlan"
+apprafter migration approve "$RO_PLAN_NAME" || die "approving the ro MigrationPlan"
 
 wait_jsonpath "$CLAIM_RES" "$APP_NS" "${APP_RO}-pg" '{.status.ready}' true 300 \
     || die "the ro claim never bound: $(cond_message "$CLAIM_RES" "$APP_NS" "${APP_RO}-pg" Ready)"
@@ -500,10 +496,10 @@ psql_as "$RW_ROLE" "$RW_PW" "$PG_DB_NAME" \
     || die "the rw consumer could not insert"
 
 TBL_OWNER=$(psql_as "$RW_ROLE" "$RW_PW" "$PG_DB_NAME" \
-    "SELECT tableowner FROM pg_tables WHERE tablename='shared_orders';")
+    "SELECT tableowner FROM pg_tables WHERE tablename='shared_orders';" || true)
 check "a table created by a consumer is owned by the GROUP" "$TBL_OWNER" "$PG_GROUP"
 
-RO_READ=$(psql_as "$RO_ROLE" "$RO_PW" "$PG_DB_NAME" "SELECT note FROM shared_orders WHERE id=1;")
+RO_READ=$(psql_as "$RO_ROLE" "$RO_PW" "$PG_DB_NAME" "SELECT note FROM shared_orders WHERE id=1;" || true)
 check "the ro consumer READS the rw consumer's row" "$RO_READ" "from-web"
 
 RO_WRITE=$(psql_as "$RO_ROLE" "$RO_PW" "$PG_DB_NAME" \
@@ -514,7 +510,7 @@ contains "the ro consumer's INSERT is refused" "$RO_WRITE" "permission denied"
 phase "Phase 8: pgvector in the SHARED database"
 # ===============================================================
 VEC=$(psql_as "$RW_ROLE" "$RW_PW" "$PG_DB_NAME" \
-    "SELECT extname FROM pg_extension WHERE extname IN ('vector','pg_trgm') ORDER BY 1;")
+    "SELECT extname FROM pg_extension WHERE extname IN ('vector','pg_trgm') ORDER BY 1;" || true)
 contains "vector is installed in the shared database" "$VEC" "vector"
 contains "pg_trgm is installed in the shared database" "$VEC" "pg_trgm"
 # Usable, not merely present: `CREATE EXTENSION` can succeed and the type
@@ -560,7 +556,7 @@ wait_jsonpath "$SHDB_RES" "$APP_NS" "$PG_DB" '{.status.refCount}' 0 240 \
 # ...and the DATA is still there. This is the property the whole CRD exists
 # for: a consumer's lifecycle never touches the shared database.
 STILL=$(psql_as apprafter_admin "$PG_ADMIN_PW" "$PG_DB_NAME" \
-    "SELECT note FROM shared_orders WHERE id=1;")
+    "SELECT note FROM shared_orders WHERE id=1;" || true)
 check "the shared data survived both consumers being deleted" "$STILL" "from-web"
 
 # REVOCATION, which is the guide's own promise and the reason a consumer gets
@@ -573,7 +569,7 @@ printf '  waiting for the consumer roles to be revoked ...\n'
 _deadline=$(( $(date +%s) + 180 ))
 while [ "$(date +%s)" -lt "$_deadline" ]; do
     LEFT=$(psql_as apprafter_admin "$PG_ADMIN_PW" postgres \
-        "SELECT count(*) FROM pg_roles WHERE rolname IN ('${RW_ROLE}','${RO_ROLE}');")
+        "SELECT count(*) FROM pg_roles WHERE rolname IN ('${RW_ROLE}','${RO_ROLE}');" || true)
     [ "$LEFT" = "0" ] && break
     sleep 5
 done
@@ -581,7 +577,7 @@ check "both consumer roles are gone from the server" "$LEFT" "0"
 # ...and the GROUPS are still there, because the database is. Dropping a
 # consumer must not take the shared structure with it.
 GROUPS_LEFT=$(psql_as apprafter_admin "$PG_ADMIN_PW" postgres \
-    "SELECT count(*) FROM pg_roles WHERE rolname IN ('${PG_GROUP}','${PG_READER_GROUP}');")
+    "SELECT count(*) FROM pg_roles WHERE rolname IN ('${PG_GROUP}','${PG_READER_GROUP}');" || true)
 check "the shared database's groups survive a consumer leaving" "$GROUPS_LEFT" "2"
 
 apprafter db rm "$PG_DB" -n "$APP_NS" --yes >/dev/null || die "db rm at refCount 0"
@@ -593,7 +589,7 @@ printf '  waiting for the groups to be dropped ...\n'
 _deadline=$(( $(date +%s) + 240 ))
 while [ "$(date +%s)" -lt "$_deadline" ]; do
     GROUPS_NOW=$(psql_as apprafter_admin "$PG_ADMIN_PW" postgres \
-        "SELECT count(*) FROM pg_roles WHERE rolname IN ('${PG_GROUP}','${PG_READER_GROUP}');")
+        "SELECT count(*) FROM pg_roles WHERE rolname IN ('${PG_GROUP}','${PG_READER_GROUP}');" || true)
     [ "$GROUPS_NOW" = "0" ] && break
     sleep 5
 done
@@ -640,10 +636,9 @@ while [ "$(date +%s)" -lt "$_deadline" ]; do
     _pending=$(kubectl -n "$APP_NS" get "$PLAN_RES" -o name 2>/dev/null || true)
     [ -z "$_pending" ] && { sleep 5; continue; }
     for _p in $_pending; do
-        kubectl -n "$APP_NS" patch "$PLAN_RES" "${_p#*/}" --type=merge --subresource=status \
-            -p '{"status":{"phase":"Approved"}}' >/dev/null 2>&1 \
-            || kubectl -n "$APP_NS" patch "$PLAN_RES" "${_p#*/}" --type=merge \
-                -p '{"spec":{"approved":true}}' >/dev/null 2>&1 || true
+        # Tolerated failure: the loop re-runs while the two claims settle, so
+        # a plan already approved on a previous pass returns nonzero.
+        apprafter migration approve "${_p#*/}" >/dev/null 2>&1 || true
     done
     _a=$(jp "$CLAIM_RES" "$APP_NS" "${APP_CACHE_A}-redis" '{.status.ready}')
     _b=$(jp "$CLAIM_RES" "$APP_NS" "${APP_CACHE_B}-redis" '{.status.ready}')
