@@ -206,3 +206,44 @@ webhooks:
         resources:
           - sharedvolumes
         scope: Namespaced
+  - name: shareddatabases.apprafter.io
+    sideEffects: None
+    failurePolicy: {{ .Values.webhook.failurePolicy }}
+    admissionReviewVersions:
+      - v1
+    timeoutSeconds: {{ .Values.webhook.timeoutSeconds }}
+    clientConfig:
+      service:
+        name: {{ include "apprafter-admission-webhook.fullname" . }}
+        namespace: {{ .Release.Namespace }}
+        path: /validate
+        port: 443
+    rules:
+      # 2.29 SharedDatabase (ADR 0066 §6). DELETE is the operation that
+      # matters here, which makes this rule unlike every other one in this
+      # file: the validator refuses a delete while `status.refCount` says
+      # applications are still bound, reading the count off the object under
+      # deletion (`oldObject`) so it needs no client of its own.
+      #
+      # Without the rule the delete is ADMITTED and the controller's finalizer
+      # holds the object in Terminating indefinitely — the operator sees a
+      # command that succeeded followed by an object that never goes away,
+      # which is a worse outcome than a refusal because nothing says why.
+      #
+      # CREATE and UPDATE are listed too, and validate nothing today: the CRD
+      # already bounds the type enum, the extension-name alphabet and the
+      # quantity shapes, and every cross-field rule lives on the Application
+      # side where the binding is written. They are registered so that adding
+      # one later is a validator change and not also a chart change — which is
+      # the kind of second step that gets forgotten.
+      - apiGroups:
+          - apprafter.io
+        apiVersions:
+          - v1alpha1
+        operations:
+          - CREATE
+          - UPDATE
+          - DELETE
+        resources:
+          - shareddatabases
+        scope: Namespaced

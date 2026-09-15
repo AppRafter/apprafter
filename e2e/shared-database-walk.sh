@@ -274,8 +274,12 @@ apply_branch_operator_rbac
 phase "Phase 2: platform readiness (CNPG, dragonfly, providers)"
 # ===============================================================
 kubectl create namespace "$APP_NS" >/dev/null 2>&1 || true
-retry 30 10 -- kubectl -n "$CNPG_NS" rollout status deploy/cnpg-cloudnative-pg --timeout=60s \
-    || retry 30 10 -- kubectl -n "$CNPG_NS" rollout status deploy/cnpg-controller-manager --timeout=60s \
+# By LABEL, not by a guessed Deployment name. The first version of this walk
+# named `cnpg-cloudnative-pg` and then `cnpg-controller-manager`, and spent
+# five minutes retrying a 404 — the chart's release name is not a thing to
+# guess at. The label is what env-and-secrets-walk has always used.
+retry 30 10 -- kubectl -n "$CNPG_NS" rollout status \
+    deploy -l app.kubernetes.io/name=cloudnative-pg --timeout=60s \
     || die "the CNPG operator never became Available"
 printf '  ok: CNPG operator Available\n'
 retry 30 10 -- kubectl get serviceprovider pg-integrated -n "$PLATFORM_NS" >/dev/null \
@@ -497,6 +501,19 @@ phase "Phase 9: db rm is refused while bound, and names the binders"
 # ===============================================================
 check "refCount counts both consumers" \
     "$(jp "$SHDB_RES" "$APP_NS" "$PG_DB" '{.status.refCount}')" "2"
+
+# The APISERVER refuses it too, not only the CLI. Without a webhook rule the
+# delete is admitted, the finalizer holds the object in Terminating, and an
+# operator sees a command that succeeded followed by an object that never goes
+# away — a worse outcome than a refusal, because nothing says why. `kubectl`
+# is the only way to reach that path; the CLI's own guard runs first.
+KUBECTL_RM=$(kubectl -n "$APP_NS" delete "$SHDB_RES" "$PG_DB" 2>&1 || true)
+contains "a raw kubectl delete is refused by the apiserver" "$KUBECTL_RM" "bound application"
+contains "the apiserver's refusal points at the command that names them" \
+    "$KUBECTL_RM" "apprafter db status"
+STILL_THERE=$(kubectl -n "$APP_NS" get "$SHDB_RES" "$PG_DB" \
+    -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || true)
+check "the refused delete left no deletionTimestamp behind" "$STILL_THERE" ""
 
 RM_OUT=$(apprafter db rm "$PG_DB" -n "$APP_NS" --yes 2>&1 || true)
 contains "the refusal says the database is still bound" "$RM_OUT" "still has 2 bound"

@@ -298,6 +298,17 @@ async fn validate_handler(Json(review): Json<Value>) -> impl IntoResponse {
             operation,
         ),
         "SharedVolume" => crate::validator::validate_sharedvolume(&object),
+        // A DELETE carries the object under deletion as `oldObject` and an
+        // EMPTY `object`, so this arm must read the former — validating
+        // `object` would see nothing and allow every delete.
+        "SharedDatabase" if operation == "DELETE" => {
+            crate::validator::validate_shareddatabase_delete(old_object.as_ref())
+        }
+        // CREATE/UPDATE of a SharedDatabase is bounded by the CRD (the type
+        // enum, the extension-name alphabet, the quantity shapes). Nothing
+        // cross-field is left for the webhook on this Kind — the cross-field
+        // rules are all on the Application side, where the binding is written.
+        "SharedDatabase" => Vec::new(),
         _ => {
             // Webhook registered for an unrecognised kind — allow,
             // log once for operator visibility. The

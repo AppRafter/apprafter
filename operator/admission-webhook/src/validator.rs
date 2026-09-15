@@ -1146,6 +1146,61 @@ fn validate_disk_claims(
 /// be a Kubernetes quantity and `spec.class` (when set) must be `local`
 /// (replicated/shared classes are T2-deferred, matching the owned-disk
 /// class rule). EXISTENCE / capacity-fit against referencing Applications
+/// Refuse a `SharedDatabase` DELETE while applications are still bound
+/// (2.29 / ADR 0066 §6).
+///
+/// Reads `status.refCount` off the object UNDER DELETION — the apiserver
+/// supplies it as `oldObject` on a DELETE — so the webhook needs no cluster
+/// read and no client of its own. The count is derived and refreshed by the
+/// controller on every reconcile and on every claim event, which makes it the
+/// right thing to read and also the reason this is not the only gate.
+///
+/// **Two gates, each covering the other's failure mode.** A STALE non-zero
+/// count refuses a delete that would have been fine; the operator re-runs it a
+/// moment later. A stale ZERO lets the delete through, and the controller's
+/// finalizer recounts from the live claims before dropping anything. The
+/// expensive direction is covered by the accurate gate.
+///
+/// Without this the delete is admitted, the finalizer holds the object in
+/// `Terminating` indefinitely, and the operator sees a successful command
+/// followed by an object that never goes away — which is a worse refusal than
+/// no refusal, because nothing says why.
+///
+/// The binders are not named here. The names live in the claims, and reading
+/// them would need a client; `apprafter db status` already lists them from the
+/// same source the controller counts, so the message points there rather than
+/// keeping a second copy in the status for the webhook's benefit.
+pub fn validate_shareddatabase_delete(
+    old_object: Option<&serde_json::Value>,
+) -> Vec<ValidationError> {
+    let Some(old) = old_object else {
+        // No `oldObject` on a DELETE means an apiserver that predates
+        // AdmissionReview v1's guarantee of one. Allow rather than refuse: the
+        // finalizer still recounts, and refusing every delete on a cluster
+        // whose apiserver is merely old would be the wrong trade.
+        return Vec::new();
+    };
+    let ref_count = old
+        .pointer("/status/refCount")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    if ref_count <= 0 {
+        return Vec::new();
+    }
+    let name = old
+        .pointer("/metadata/name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("this database");
+    vec![ValidationError::new(
+        "status.refCount",
+        format!(
+            "{name} still has {ref_count} bound application(s). Deleting it would take their \
+             data with it. Remove `ref` from each application's `needs` block first — \
+             `apprafter db status {name}` names them."
+        ),
+    )]
+}
+
 /// is the controller's responsibility, not the webhook's.
 ///
 /// Multi-error: one message per offending field, no short-circuit.
@@ -3161,6 +3216,46 @@ mod tests {
         }
         let errs = validate_application_spec(&js_stream_spec(json!({"replicas": 3})));
         assert!(msgs(&errs).contains("replicas"), "{errs:?}");
+    }
+
+    // ---- 2.29 SharedDatabase delete guard (ADR 0066 §6) -------------
+
+    fn shdb(name: &str, ref_count: Option<i64>) -> serde_json::Value {
+        let mut o = json!({"metadata": {"name": name}, "spec": {"type": "pg"}});
+        if let Some(n) = ref_count {
+            o["status"] = json!({"refCount": n});
+        }
+        o
+    }
+
+    #[test]
+    fn deleting_a_bound_shared_database_is_refused_and_says_how_to_find_the_binders() {
+        let errs = validate_shareddatabase_delete(Some(&shdb("orders", Some(2))));
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        let m = msgs(&errs);
+        assert!(m.contains("2 bound application"), "{m}");
+        // The refusal has to be actionable. A count alone tells an operator
+        // they are blocked without telling them by whom, and for a database
+        // the binding is one line inside a `needs` block in somebody's file.
+        assert!(m.contains("apprafter db status orders"), "{m}");
+        assert!(m.contains("take their data with it"), "{m}");
+    }
+
+    #[test]
+    fn deleting_an_unbound_shared_database_is_allowed() {
+        assert!(validate_shareddatabase_delete(Some(&shdb("orders", Some(0)))).is_empty());
+        // Never reconciled — no status at all. Absent is not "bound".
+        assert!(validate_shareddatabase_delete(Some(&shdb("orders", None))).is_empty());
+    }
+
+    #[test]
+    fn a_delete_with_no_old_object_is_allowed_rather_than_refused() {
+        // An apiserver that supplies no `oldObject` on DELETE is old, not
+        // hostile. The controller's finalizer recounts from the live claims
+        // before dropping anything, so allowing here loses no safety —
+        // whereas refusing would make every delete impossible on that
+        // cluster, including the correct ones.
+        assert!(validate_shareddatabase_delete(None).is_empty());
     }
 
     #[test]
