@@ -2473,11 +2473,166 @@ YAML
 if part3_check_17; then record_part3 17 "a namespace that would overrun the server's JetStream memory budget is refused with NatsMemoryBudgetExceeded, naming the budget, and never reaches the accounts file" 0
 else record_part3 17 "a namespace whose account would push the cluster past component_nats.cue's memoryStore.maxSize is held unready with its OWN reason naming the budget in bytes — not AwaitingNatsUserReady — its account never enters the accounts file, and the file already installed keeps serving the namespaces on it" 1; fi
 
+# ===============================================================
+# 2.28 (ADR 0065 §2): the tuning surface and the dead-letter queue.
+#
+# Everything about 2.28-B up to this point is proved in PIECES — the field
+# NAMES against the real NACK CRD (e2e/jetstream-nack-shape-check.sh), the
+# SERVER behaviours on the pinned server
+# (docs/measurements/2.28-jetstream-2026-09-15.md), the provisioner's
+# EMISSION by unit test. None of them joins the chain. These four do:
+# manifest → claim → NACK CR → live NATS config, and then a dead-letter
+# queue that actually receives something.
+#
+# The fixture is deliberately small in quota terms. The account's max_file
+# is the SUM over the namespace's claims, so a sixth claim raises the
+# budget by one 'small' (256Mi) while this app's two streams together ask
+# for 80Mi — comfortably inside it, for the same reason streamapp asks for
+# 256Mi rather than 1Gi (see its own note above).
+# ===============================================================
+
+phase "2.28 fixture: tuneapp — a tuned stream, a tuned durable, and a DLQ"
+
+APP7="tuneapp"
+CLAIM7="tuneapp-jetstream"
+
+kubectl apply -f - <<YAML
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: ${APP7}
+  namespace: ${APP_NS}
+  labels:
+    apprafter.io/managed-by: apprafter
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+    replicas: 1
+    expose:
+      port: 80
+    needs:
+      jetstream:
+        selector:
+          tier: integrated
+        streams:
+          - name: work
+            subjects: ["tuneapp.work.>"]
+            maxBytes: "64Mi"
+            retention: workqueue
+            compression: s2
+            discard: new
+            maxMsgsPerSubject: 100
+            consumerLimits:
+              maxAckPending: 64
+        consume:
+          - stream: work
+            durable: worker
+            ackWait: "1s"
+            maxDeliver: 2
+            maxAckPending: 10
+            deadLetter:
+              stream: worker-dlq
+              maxBytes: "16Mi"
+YAML
+
+printf '  waiting for %s to reach Ready ...\n' "$CLAIM7"
+for _ in $(seq 1 60); do
+    [ "$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM7" '{.status.ready}')" = "true" ] && break
+    sleep 5
+done
+printf '    %s status.ready=%q reason=%q\n' "$CLAIM7" \
+    "$(jp "$CLAIM_RES" "$APP_NS" "$CLAIM7" '{.status.ready}')" \
+    "$(cond_reason "$CLAIM_RES" "$APP_NS" "$CLAIM7" Ready)"
+
+# --- #18: the CONSUMER tuning reaches the live consumer config ---
+part3_check_18() {
+    local out
+    out=$(mgr_nats_run "$APP_NS" consumer info tuneapp_work tuneapp_worker --json 2>&1) || {
+        printf '    querying consumer tuneapp_work/tuneapp_worker failed: %s\n' "$out"
+        return 1
+    }
+    printf '    consumer config: %s\n' "$(printf '%s' "$out" | jq -c '.config | {ack_wait, max_deliver, max_ack_pending}' 2>/dev/null)"
+    # ack_wait is nanoseconds on the wire: 1s == 1000000000.
+    printf '%s' "$out" | jq -e '
+        (.config.ack_wait == 1000000000) and
+        (.config.max_deliver == 2) and
+        (.config.max_ack_pending == 10)
+    ' >/dev/null
+}
+if part3_check_18; then record_part3 18 "a consume entry's ackWait/maxDeliver/maxAckPending reach the LIVE consumer" 0
+else record_part3 18 "the tuning declared on consume[] reaches the live NATS consumer config — the link no unit test can see, because NACK owns the durable and re-asserts its own config" 1; fi
+
+# --- #19: the STREAM tuning reaches the live stream config ---
+part3_check_19() {
+    local out
+    out=$(mgr_nats_run "$APP_NS" stream info tuneapp_work --json 2>&1) || {
+        printf '    querying stream tuneapp_work failed: %s\n' "$out"
+        return 1
+    }
+    printf '    stream config: %s\n' "$(printf '%s' "$out" | jq -c '.config | {compression, discard, max_msgs_per_subject, consumer_limits}' 2>/dev/null)"
+    printf '%s' "$out" | jq -e '
+        (.config.compression == "s2") and
+        (.config.discard == "new") and
+        (.config.max_msgs_per_subject == 100) and
+        (.config.consumer_limits.max_ack_pending == 64)
+    ' >/dev/null
+}
+if part3_check_19; then record_part3 19 "a stream's compression/discard/maxMsgsPerSubject/consumerLimits reach the LIVE stream" 0
+else record_part3 19 "the tuning declared on streams[] reaches the live NATS stream config" 1; fi
+
+# --- #20: the DLQ exists, and collects EXACTLY one advisory subject ---
+part3_check_20() {
+    local out subjects want
+    out=$(mgr_nats_run "$APP_NS" stream info "tuneapp_worker-dlq" --json 2>&1) || {
+        printf '    querying the DLQ stream failed: %s\n' "$out"
+        return 1
+    }
+    subjects=$(printf '%s' "$out" | jq -c '.config.subjects' 2>/dev/null)
+    want='["$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.tuneapp_work.tuneapp_worker"]'
+    printf '    DLQ subjects: %s\n' "$subjects"
+    # EXACTLY this pair's advisory. A wildcard here would collect every
+    # neighbour's failures in the same account — the disclosure the deny
+    # vector exists to prevent — so the assertion is equality, not a match.
+    [ "$subjects" = "$want" ] || return 1
+    printf '%s' "$out" | jq -e '(.config.retention == "limits")' >/dev/null
+}
+if part3_check_20; then record_part3 20 "the dead-letter queue is an ordinary declared stream collecting exactly this pair's advisory" 0
+else record_part3 20 "deadLetter materialises a declared stream whose single subject is the exact MAX_DELIVERIES advisory for (composed stream, composed durable), with limits retention" 1; fi
+
+# --- #21: the DLQ actually FILLS when redelivery is exhausted ---
+part3_check_21() {
+    local pub i before after
+    pub=$(mgr_nats_run "$APP_NS" pub tuneapp.work.one 'poison' 2>&1) || {
+        printf '    publishing to the tuned stream failed: %s\n' "$pub"
+        return 1
+    }
+    before=$(mgr_nats_run "$APP_NS" stream info "tuneapp_worker-dlq" --json 2>&1 \
+        | jq -r '.state.messages // 0' 2>/dev/null)
+    # maxDeliver is 2, so two NAKs exhaust redelivery and the server emits
+    # the advisory. `|| true` on each: a NAK'd fetch is a normal outcome
+    # here, and `set -e` would otherwise end the walk on the thing we want.
+    for i in 1 2 3; do
+        mgr_nats_run "$APP_NS" consumer next tuneapp_work tuneapp_worker \
+            --count 1 --timeout 3s --nak >/dev/null 2>&1 || true
+        sleep 2
+    done
+    for i in $(seq 1 15); do
+        after=$(mgr_nats_run "$APP_NS" stream info "tuneapp_worker-dlq" --json 2>&1 \
+            | jq -r '.state.messages // 0' 2>/dev/null)
+        [ "${after:-0}" -gt "${before:-0}" ] && break
+        sleep 2
+    done
+    printf '    DLQ messages before=%s after=%s\n' "${before:-0}" "${after:-0}"
+    [ "${after:-0}" -gt "${before:-0}" ]
+}
+if part3_check_21; then record_part3 21 "the DLQ RECEIVES an advisory once redelivery is exhausted" 0
+else record_part3 21 "a message NAK'd past maxDeliver produces an advisory that lands in the declared dead-letter queue — the end of the chain, and the only check here that proves the DLQ is not merely a correctly-shaped empty stream" 1; fi
+
 phase "Part 3 acceptance criteria summary"
 if [ "$PART3_FAILED" -gt 0 ]; then
-    printf '  %d of 17 acceptance criteria are RED. Part 3 (NACK CR application), 2.5f (inventory/detector/conditions), 2.5 part 4 (the migration triggers), the 2.5 egress rule, the prefix-pre-capture report and the memory-budget clamp have all landed, so each one is a real defect — not an expected gap.\n' "$PART3_FAILED"
+    printf '  %d of 21 acceptance criteria are RED. Part 3 (NACK CR application), 2.5f (inventory/detector/conditions), 2.5 part 4 (the migration triggers), the 2.5 egress rule, the prefix-pre-capture report, the memory-budget clamp and the 2.28 tuning + dead-letter queue have all landed, so each one is a real defect — not an expected gap.\n' "$PART3_FAILED"
 else
-    printf '  ok: all 17 acceptance criteria are GREEN.\n'
+    printf '  ok: all 21 acceptance criteria are GREEN.\n'
 fi
 
 # ===============================================================
@@ -2501,8 +2656,8 @@ printf '  ok: no "forbidden" anywhere in the operator log across the whole walk\
 # ===============================================================
 
 if [ "$PART3_FAILED" -gt 0 ]; then
-    phase "needs-jetstream-walk: part 2 GREEN, acceptance RED (${PART3_FAILED}/17) (elapsed $(elapsed))"
-    printf 'FINAL: ACCEPTANCE-RED (%d/17) — every part-2 capability above stayed green; see the summary above for which of the seventeen criteria are unmet and why.\n' \
+    phase "needs-jetstream-walk: part 2 GREEN, acceptance RED (${PART3_FAILED}/21) (elapsed $(elapsed))"
+    printf 'FINAL: ACCEPTANCE-RED (%d/21) — every part-2 capability above stayed green; see the summary above for which of the twenty-one criteria are unmet and why.\n' \
         "$PART3_FAILED"
     exit 1
 fi

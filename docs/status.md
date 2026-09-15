@@ -86,7 +86,7 @@ post-launch work is not a roadmap phase and has no subscribe control.
 > dead-letter queue are built and gated — every field is accepted and stored by the message
 > controller's own schema, and the server behaviours they rely on were measured on the pinned
 > server — but the chain from a manifest through to a dead-letter queue actually filling has not
-> been run end to end on a cluster. Shared databases are further back: the manifest surface, the
+> been run end to end on a cluster yet. Shared databases are further back: the manifest surface, the
 > validation and the SQL are in place and the SQL is proven against a real PostgreSQL, but nothing
 > provisions a shared database yet, so there is no way to use one. Neither is `✅` and neither will
 > be until a walk says so.
