@@ -782,10 +782,14 @@ pub fn parse_sealed_secret_summaries(v: &Value) -> Vec<SealedSecretSummary> {
                 .map(|m| m.keys().cloned().collect())
                 .unwrap_or_default();
             keys.sort();
+            // Rendered here rather than in `render_secret_list`, because
+            // the column width is computed from this string and a width
+            // measured on the raw form would leave the table padded for
+            // characters it no longer prints.
             let sealed_at = item
                 .pointer("/metadata/annotations/apprafter.io~1sealed-at")
                 .and_then(Value::as_str)
-                .map(str::to_string);
+                .map(cli_core::timefmt::format_timestamp);
             Some(SealedSecretSummary {
                 namespace,
                 name,
@@ -978,15 +982,26 @@ mod list_tests {
     }
 
     #[test]
-    fn a_stamped_seal_shows_its_timestamp() {
+    fn a_stamped_seal_shows_its_timestamp_rendered_not_raw() {
+        // The annotation is stored RFC3339 and used to reach the SEALED
+        // column that way. "When was this last rotated?" is the question
+        // the column exists for, and the stored form is the one that hides
+        // the answer.
         let mut item = sealed("shop", "new", &["k"]);
         item["metadata"]["annotations"] =
             json!({ "apprafter.io/sealed-at": "2026-08-31T09:00:00+00:00" });
         let rows = parse_sealed_secret_summaries(&json!({ "items": [item] }));
-        assert_eq!(
-            rows[0].sealed_at.as_deref(),
-            Some("2026-08-31T09:00:00+00:00")
-        );
+        assert_eq!(rows[0].sealed_at.as_deref(), Some("2026-08-31 09:00 UTC"));
+    }
+
+    #[test]
+    fn a_seal_stamped_by_something_else_keeps_whatever_it_wrote() {
+        // Provenance this cannot parse is still the only record of what
+        // stamped it, and the annotation is user-editable by design.
+        let mut item = sealed("shop", "odd", &["k"]);
+        item["metadata"]["annotations"] = json!({ "apprafter.io/sealed-at": "yesterday" });
+        let rows = parse_sealed_secret_summaries(&json!({ "items": [item] }));
+        assert_eq!(rows[0].sealed_at.as_deref(), Some("yesterday"));
     }
 
     #[test]

@@ -6501,7 +6501,15 @@ pub(crate) fn recent_revision_lines(app: &Value) -> Vec<String> {
     for rev in revs.iter().rev().take(3) {
         let id = rev.get("id").and_then(Value::as_u64).unwrap_or(0);
         let rev_str = rev.get("revision").and_then(Value::as_str).unwrap_or("?");
-        let deployed_at = rev.get("deployedAt").and_then(Value::as_str).unwrap_or("?");
+        // Rendered, not raw. This list exists to answer "which revision do
+        // I roll back to?", and the column that dates each one was the
+        // machine form. The absolute-only rendering keeps the three rows
+        // aligned; `?` and anything unparseable pass through untouched.
+        let deployed_at = rev
+            .get("deployedAt")
+            .and_then(Value::as_str)
+            .map(cli_core::timefmt::format_timestamp)
+            .unwrap_or_else(|| "?".to_string());
         out.push(format!("  #{id:>3} {rev_str:<10} {deployed_at}"));
     }
     out
@@ -6753,7 +6761,14 @@ pub(crate) fn format_pin_line(cr: &Value) -> Option<String> {
          \x20                resume with `apprafter app unpin {name}`"
     );
     if let Some(at) = pinned.get("at").and_then(Value::as_str) {
-        line.push_str(&format!("\n                 pinned at {at}"));
+        // A pin is invisible in Git, so how long it has been held is the
+        // part that matters — the relative rendering answers "is this a
+        // deliberate hold or something forgotten months ago?" without the
+        // reader doing the subtraction.
+        line.push_str(&format!(
+            "\n                 pinned at {}",
+            cli_core::timefmt::format_timestamp_with_relative(at, chrono::Utc::now())
+        ));
     }
     Some(line)
 }
@@ -12685,7 +12700,7 @@ Application argocd/landing-web
   health:        Healthy
 
 Recent revisions (last 1):
-  #  6 a1b2c3d    2026-09-14T10:00:00Z
+  #  6 a1b2c3d    2026-09-14 10:00 UTC
 AppRafter phase: Ready
   image:         ghcr.io/acme/landing-web:1.9 -> @sha256:beef (resolved 5m ago)
 
