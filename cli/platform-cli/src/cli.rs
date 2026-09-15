@@ -1111,6 +1111,13 @@ pub enum AppCommand {
     },
     /// Delete an Application and cascade-remove the Argo CD CR
     /// (which Argo CD then tears down child resources for).
+    /// Operates on the WHOLE bundle: a manifest package may hold
+    /// several workloads, and removing the application removes
+    /// every one of them together with the data their
+    /// `ResourceClaim`s hold — the confirmation names them all
+    /// (ADR 0062). Removing ONE workload of several is not
+    /// something this command can do; delete its block from the
+    /// manifest and push, and Argo CD prunes it on the next sync.
     /// Interactive: prompts for confirmation; non-interactive
     /// requires `--yes` to skip the prompt. `--env <env>` removes
     /// ONE per-environment deployment (`<name>-<env>`); without
@@ -1119,7 +1126,8 @@ pub enum AppCommand {
     /// confirmation covers the batch).
     #[command(alias = "rm")]
     Remove {
-        /// LOGICAL application name. Without `--env` this removes every
+        /// LOGICAL application name — the registration, NEVER a
+        /// workload name (ADR 0062). Without `--env` this removes every
         /// environment deployment of the app; with `--env` just the one.
         name: String,
         /// Skip confirmation prompt. Required in non-interactive

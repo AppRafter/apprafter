@@ -18,31 +18,24 @@
 //! backward-compatibility story (ADR 0062 §Risks), are table-tested
 //! without a cluster.
 
-// The whole module is built for the b-2 (read surfaces) and b-3 (write
-// surfaces) plans; nothing calls it yet, and `-D warnings` makes an
-// uncalled `pub(crate)` item an error. DELETE THIS ATTRIBUTE IN b-3, when
-// the write surfaces become the callers — inventing a caller here to
-// satisfy the lint would be worse than saying so.
+// The module-wide `#![expect(dead_code)]` this file carried until 2.27b
+// is GONE, and its removal is the point. It named the b-3 write-surfaces
+// plan as its owner, and that plan landed: `app::resolve_missing_registration`
+// calls [`AppIndex::read`], [`AppIndex::resolve`] and
+// [`AppIndex::workloads_of`] on the `app remove` error path, which is
+// exactly the direction the note predicted the write surfaces would need
+// — given a string the user typed, decide whether it named a
+// registration or a workload of one. `expect` rather than `allow` is
+// what made that a machine check instead of a promise: with the callers
+// in place the expectation goes unfulfilled and
+// `unfulfilled_lint_expectations` fires under `-D warnings`, so the
+// suppression could not quietly outlive its reason.
 //
-// b-2 is now DONE and did not become that caller, which is a correction
-// to the sentence above rather than a slip. `app list` and `app status`
-// each hold the registration they are already rendering, and
-// `app_open::apprafter_app_refs` projects its workloads straight out of
-// the `status.resources[]` they fetched — so neither needs the join, and
-// neither should pay a second cluster-wide read to get it. What the
-// write surfaces need is the OTHER direction: given a string the user
-// typed, decide whether it named a registration or a workload, which is
-// exactly `AppIndex::resolve` and exactly what a read surface never asks
-// (it is handed a registration by the same resolution `status` already
-// does).
-//
-// `expect`, not `allow`, and the first use of it in this repository:
-// once b-2 supplies the callers the expectation goes unfulfilled and
-// `unfulfilled_lint_expectations` fires under `-D warnings`. That turns
-// the sentence above from a promise into a machine check — an `allow`
-// left behind is invisible forever, which is how a temporary suppression
-// becomes permanent.
-#![expect(dead_code)]
+// (The b-2 read surfaces did NOT become callers, as the note itself
+// recorded: `app list` and `app status` each hold the registration they
+// are already rendering and project its workloads out of the
+// `status.resources[]` they fetched, so neither needs the join nor
+// should pay a second cluster-wide read for it.)
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -63,6 +56,28 @@ const GROUPING_LABEL: &str = "/metadata/labels/apprafter.io~1application";
 /// One AppRafter `Application` CR, with the registration that deploys it.
 #[derive(Debug, Clone)]
 pub(crate) struct WorkloadEntry {
+    /// The decoded CR itself.
+    ///
+    /// Unread outside the tests today. Its owner is the remaining half
+    /// of ADR 0062 §Write surfaces — `app rollback` / `app unpin`, which
+    /// "require an unambiguous workload" and then read the image pin off
+    /// the CR they resolved. `app.rs`'s `read_apprafter_cr` spends a
+    /// THIRD `kubectl get` for that object today, which is the read this
+    /// field exists to retire; carrying the CR is what makes the index
+    /// worth two cluster reads rather than one name lookup.
+    ///
+    /// `expect`, not `allow`: the moment a pin verb reads it, this
+    /// expectation goes unfulfilled and `unfulfilled_lint_expectations`
+    /// fires under `-D warnings`, so the suppression cannot outlive its
+    /// reason — the same machine check the module-wide attribute
+    /// provided before 2.27b fulfilled it.
+    ///
+    /// `not(test)` because this module's own tests DO read the field, so
+    /// `dead_code` never fires in the test build and a bare `expect`
+    /// would itself be unfulfilled there. The claim being made is
+    /// precisely "no production caller reads this", and that is the
+    /// configuration the attribute is asserted in.
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) cr: Value,
     pub(crate) name: String,
     pub(crate) namespace: String,
@@ -97,6 +112,24 @@ pub(crate) struct AppIndex {
 }
 
 /// What the string a user typed turned out to name.
+///
+/// Four of the payloads below carry a per-variant
+/// `#[cfg_attr(not(test), expect(dead_code))]` because `app remove` —
+/// the first caller, and the only one as of 2.27b — decides on the
+/// variant and, for `Workload`, on its name and registration. It never
+/// needs a candidate LIST: it refuses on ambiguity rather than picking,
+/// and it re-derives a bundle's workloads from
+/// [`AppIndex::workloads_of`] on the one arm that wants them.
+///
+/// Their owner is the remaining half of ADR 0062 §Write surfaces —
+/// `app rollback` / `app unpin`, which "require an unambiguous workload"
+/// and so must print the candidates a reader is being asked to choose
+/// between. Each attribute is on its own variant rather than on the
+/// enum: a blanket one would stay silently fulfilled until the LAST
+/// payload found a reader, which is exactly the drift `expect` is here
+/// to prevent. `not(test)` scopes the claim to where it is true — the
+/// resolver tests read every payload, so `dead_code` fires only in the
+/// production build (see [`WorkloadEntry::cr`]).
 #[derive(Debug)]
 pub(crate) enum Resolution {
     /// Exactly one workload, addressed by its own CR name.
@@ -105,8 +138,15 @@ pub(crate) enum Resolution {
     /// entries — a one-element "ambiguity" is a disambiguation prompt
     /// with nothing to disambiguate, so the single case resolves as
     /// [`Resolution::Workload`] instead.
+    #[cfg_attr(not(test), expect(dead_code))]
     AmbiguousWorkload(Vec<WorkloadEntry>),
     /// One registration and every workload it deploys.
+    ///
+    /// The workload list is unread today: `app remove` takes the
+    /// registration name out of field 0 and re-reads the bundle through
+    /// [`AppIndex::workloads_of`], because the registration it acts on
+    /// is not always the one this variant resolved.
+    #[cfg_attr(not(test), expect(dead_code))]
     Registration(String, Vec<WorkloadEntry>),
     /// Two or more registrations share the typed grouping label — the
     /// pre-2.9 per-environment shape — carried as `(registration,
@@ -122,10 +162,12 @@ pub(crate) enum Resolution {
     /// list rather than dropped: it is a registration the reader asked
     /// about, and omitting it would silently shrink the fleet the
     /// aggregate describes.
+    #[cfg_attr(not(test), expect(dead_code))]
     AmbiguousRegistration(Vec<(String, Vec<WorkloadEntry>)>),
     /// A registration that has never synced — `status.resources[]` names
     /// no workload at all. NOT the same as having none in the index; see
     /// [`AppIndex::resolve_registration`].
+    #[cfg_attr(not(test), expect(dead_code))]
     PendingRegistration(String),
     NotFound,
 }
@@ -272,7 +314,7 @@ impl AppIndex {
     /// `app status <loser>` print fewer workloads than the registration
     /// actually deploys, which is the exact failure ADR 0062 exists to
     /// end.
-    fn workloads_of(&self, registration: &str) -> Vec<WorkloadEntry> {
+    pub(crate) fn workloads_of(&self, registration: &str) -> Vec<WorkloadEntry> {
         let Some(argo_app) = self.registrations.get(registration) else {
             return Vec::new();
         };

@@ -143,7 +143,7 @@ apprafter app open <name> --port 3000 --no-browser
 
 ## `apprafter app remove`
 
-Delete an Application and cascade-remove the Argo CD CR (which Argo CD then tears down child resources for). Interactive: prompts for confirmation; non-interactive requires `--yes` to skip the prompt. `--env <env>` removes ONE per-environment deployment (`<name>-<env>`); without `--env`, ALL environment deployments grouped under `apprafter.io/application=<name>` are removed (a single confirmation covers the batch)
+Delete an Application and cascade-remove the Argo CD CR (which Argo CD then tears down child resources for). Operates on the WHOLE bundle: a manifest package may hold several workloads, and removing the application removes every one of them together with the data their `ResourceClaim`s hold — the confirmation names them all (ADR 0062). Removing ONE workload of several is not something this command can do; delete its block from the manifest and push, and Argo CD prunes it on the next sync. Interactive: prompts for confirmation; non-interactive requires `--yes` to skip the prompt. `--env <env>` removes ONE per-environment deployment (`<name>-<env>`); without `--env`, ALL environment deployments grouped under `apprafter.io/application=<name>` are removed (a single confirmation covers the batch)
 
 ```text
 Usage: apprafter app remove [OPTIONS] <NAME>
@@ -153,7 +153,7 @@ Aliases: `rm` — accepted on the command line, not listed in `--help`.
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `<NAME>` | yes | LOGICAL application name. Without `--env` this removes every environment deployment of the app; with `--env` just the one |
+| `<NAME>` | yes | LOGICAL application name — the registration, NEVER a workload name (ADR 0062). Without `--env` this removes every environment deployment of the app; with `--env` just the one |
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |

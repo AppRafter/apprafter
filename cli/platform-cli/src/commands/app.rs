@@ -37,6 +37,7 @@ use tabled::{Table, Tabled};
 
 use cli_providers::k8s::kubectl::APPRAFTER_CLI_PIN_FIELD_MANAGER;
 
+use crate::commands::app_index::{AppIndex, Resolution};
 use crate::commands::app_open;
 use crate::commands::app_open::CrRef;
 use crate::commands::k8s_helpers::{
@@ -2581,6 +2582,17 @@ fn list_resource_claims_for_app(
     namespace: &str,
     kubeconfig: &Path,
 ) -> Result<Vec<ResourceClaimSummary>> {
+    let parsed = list_resource_claim_payload(namespace, kubeconfig)?;
+    Ok(parse_resource_claim_summaries(&parsed, owner))
+}
+
+/// The raw `kubectl get resourceclaim.apprafter.io -n <ns> -o json`
+/// payload. Split out of [`list_resource_claims_for_app`] so a caller
+/// that needs a DIFFERENT filter over the same namespace-wide list —
+/// `app remove`'s blast-radius enumeration, which is owned by any
+/// workload of the bundle rather than by one — spends one read rather
+/// than one per workload.
+fn list_resource_claim_payload(namespace: &str, kubeconfig: &Path) -> Result<Value> {
     let out = Command::new("kubectl")
         .args(kubectl_list_args(RESOURCECLAIM_RESOURCE, namespace, None))
         .env("KUBECONFIG", kubeconfig)
@@ -2593,9 +2605,8 @@ fn list_resource_claims_for_app(
             String::from_utf8_lossy(&out.stderr)
         )));
     }
-    let parsed: Value = serde_json::from_slice(&out.stdout)
-        .map_err(|e| CliError::Other(format!("kubectl JSON parse: {e}")))?;
-    Ok(parse_resource_claim_summaries(&parsed, owner))
+    serde_json::from_slice(&out.stdout)
+        .map_err(|e| CliError::Other(format!("kubectl JSON parse: {e}")))
 }
 
 /// Pure helper — parse `kubectl get resourceclaim.apprafter.io
@@ -3647,9 +3658,455 @@ pub(crate) fn batch_remove_prompt_lines(name: &str, argo_names: &[String]) -> Ve
     out
 }
 
+/// What `app remove <name>` does with a string that names no Argo CD
+/// `Application` — once [`AppIndex`] has said what it DID name (ADR 0062
+/// §Write surfaces).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoveTarget {
+    /// Tear down this registration: the bundle and every workload in it.
+    ///
+    /// The ONLY variant that deletes anything, and it is reachable from
+    /// exactly one place — a string that is a registration's own
+    /// `metadata.name`, which the pre-flight read happened to miss. No
+    /// workload name produces it at any bundle size; see
+    /// [`plan_remove_target`].
+    Bundle(String),
+    /// The string named ONE workload of a `bundle_size`-workload (> 1)
+    /// bundle that `registration` deploys. Refused — see
+    /// [`refuse_workload_lines`].
+    RefuseWorkload {
+        workload: String,
+        registration: String,
+        bundle_size: usize,
+    },
+    /// The string named the SOLE workload of `registration`. Also
+    /// refused, but for a different reason and with a different message:
+    /// nothing about it is unsupported, the caller simply named the
+    /// wrong object. See [`name_the_application_lines`].
+    NameTheApplication {
+        workload: String,
+        registration: String,
+    },
+    /// The index cannot attribute the string to any registration. Keep
+    /// the plain "not found" — `remove` operates on registrations, and
+    /// for this string there is none.
+    Unknown,
+}
+
+/// Pure — the whole `app remove` targeting decision, so the rule that
+/// decides whether a destructive verb runs is table-tested without a
+/// cluster.
+///
+/// `bundle_size` is how many workloads the registration deploys IN TOTAL
+/// (the resolved workload included, so 1 means "it is the only one"),
+/// and is consulted on the workload arm ONLY.
+///
+/// **A workload name never deletes anything, at any bundle size.** ADR
+/// 0062 §Addressing: the positional argument of every `app` verb is the
+/// registration name, and when it fails to resolve, the error resolves
+/// it as a workload and names the command that would have worked. So the
+/// two workload arms differ only in what they SAY:
+///
+/// - `bundle_size > 1` — the git steps, because removing one workload of
+///   several is genuinely not something the CLI can do. `app add` writes
+///   `syncPolicy.automated.selfHeal: true`, so deleting that CR here is
+///   undone on the next reconcile and the command would report a success
+///   that does not survive a sync.
+/// - `bundle_size <= 1` — just the application's name, because there is
+///   nothing unsupported about the intent; the caller named the workload
+///   when the verb takes the application.
+///
+/// The second case USED to proceed, on the reasoning that at N = 1
+/// removing the registration is removing the workload. That was wrong in
+/// the direction that matters: `apprafter app remove <workload> --yes`
+/// previously failed safe, and making it destroy a registration is a
+/// silent escalation on a positional the ADR says is never a workload
+/// name — and the caller who typed a workload name did not know N was 1.
+///
+/// `typed` is compared against the resolved registration on the
+/// `Registration` arm and nowhere else. That arm is reachable only as a
+/// race (the pre-flight read missed an object the index then saw), and
+/// the retry is allowed ONLY when the index resolved the very string the
+/// caller typed — so the object deleted is always the one they named.
+pub(crate) fn plan_remove_target(
+    typed: &str,
+    resolution: &Resolution,
+    bundle_size: usize,
+) -> RemoveTarget {
+    match resolution {
+        Resolution::Workload(w) => match w.registration.as_deref() {
+            Some(registration) if bundle_size > 1 => RemoveTarget::RefuseWorkload {
+                workload: w.name.clone(),
+                registration: registration.to_string(),
+                bundle_size,
+            },
+            Some(registration) => RemoveTarget::NameTheApplication {
+                workload: w.name.clone(),
+                registration: registration.to_string(),
+            },
+            // Claimed by nobody: a CR applied by hand, or one left behind
+            // by a removed registration. There is no registration to tear
+            // down, and inventing one would delete somebody else's.
+            None => RemoveTarget::Unknown,
+        },
+        // A race, and only a race: retry the read against the name the
+        // caller typed. A registration the index reached by some OTHER
+        // string (its grouping label) is deliberately not actioned here
+        // — `remove`'s own label selector already covers that path on the
+        // happy side, and honouring it here would re-open the escalation
+        // by a rarer door.
+        Resolution::Registration(registration, _) if registration == typed => {
+            RemoveTarget::Bundle(registration.clone())
+        }
+        // Every remaining shape is a question `remove` must not answer by
+        // guessing: two namespaces, two environments, or nothing at all.
+        Resolution::Registration(_, _)
+        | Resolution::AmbiguousWorkload(_)
+        | Resolution::AmbiguousRegistration(_)
+        | Resolution::PendingRegistration(_)
+        | Resolution::NotFound => RemoveTarget::Unknown,
+    }
+}
+
+/// Pure — what `app remove` says when the string named the SOLE workload
+/// of a registration.
+///
+/// Distinct from [`refuse_workload_lines`] on purpose. Nothing here is
+/// unsupported: the caller wants exactly what `app remove` does, they
+/// just named the workload instead of the application that deploys it.
+/// So the message states the distinction once and hands over the command
+/// — no git steps, because git is not the route to what they asked for.
+///
+/// It is an ERROR, not a redirect. `--yes` skips the confirmation, so
+/// acting on the caller's behalf here would turn an invocation that
+/// failed safe into one that destroys a registration.
+pub(crate) fn name_the_application_lines(workload: &str, registration: &str) -> Vec<String> {
+    vec![
+        format!(
+            "'{workload}' is not an application; it is the only workload of application \
+             '{registration}'."
+        ),
+        "To remove that application (and this workload with it):".to_string(),
+        format!("  apprafter app remove {registration}"),
+    ]
+}
+
+/// Pure — the refusal for ONE workload of a multi-workload bundle.
+///
+/// This **will** be reported as a missing feature, so the message has to
+/// say plainly that it is GitOps and not an unimplemented verb: the CR
+/// delete is not refused because the code cannot do it, it is refused
+/// because Argo CD self-heal restores the object within one reconcile
+/// and the command would report a success that does not survive a sync.
+///
+/// A bare refusal leaves the reader stuck, so both routes are printed —
+/// the git steps that really remove one workload, and the command that
+/// removes the whole bundle, which is the other thing they may have
+/// meant.
+pub(crate) fn refuse_workload_lines(
+    workload: &str,
+    registration: &str,
+    bundle_size: usize,
+) -> Vec<String> {
+    vec![
+        format!(
+            "'{workload}' is 1 of {bundle_size} workloads deployed by application \
+             '{registration}'."
+        ),
+        "Deleting its Application CR from here is undone by Argo CD self-heal on the next \
+         sync, so `app remove` does not do it."
+            .to_string(),
+        String::new(),
+        "To remove just this workload:".to_string(),
+        format!(
+            "  1. delete the `{workload}:` block from the bundle's manifest \
+             (apprafter/Application.cue)"
+        ),
+        "  2. commit and push — Argo CD prunes it on the next sync".to_string(),
+        String::new(),
+        format!("To remove the application and ALL {bundle_size} workloads:"),
+        format!("  apprafter app remove {registration}"),
+    ]
+}
+
+/// What the confirmation knows about the data a cascade-prune destroys.
+///
+/// Two states, and the distinction is the whole point: "we looked and
+/// there is none" and "we could not look" must never render the same
+/// way. The same discipline as `app status`'s `—`-never-blank rule — an
+/// unmeasured cell says so rather than printing a value it does not
+/// have. On a destructive confirmation the stakes are higher: an
+/// unavailable enumeration rendering as an empty one reads as "no data
+/// is at risk", which is the one thing this section exists to prevent
+/// anybody concluding by accident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaimInventory {
+    /// The read succeeded. Every entry is a rendered bullet line; an
+    /// empty vector means the bundle really holds nothing.
+    Known(Vec<String>),
+    /// The read failed, or was never made. Carries the command to run by
+    /// hand so the reader can check before consenting.
+    Unavailable(String),
+}
+
+/// `apprafter.io` kinds in `status.resources[]` whose prune destroys
+/// DATA rather than a re-creatable object.
+///
+/// `RetainedClaim` is excluded on purpose: it is the object whose entire
+/// purpose is that the data SURVIVES its claim, so naming it here would
+/// invert what it means.
+const DATA_BEARING_KINDS: &[&str] = &["ResourceClaim", "SharedVolume"];
+
+/// The data-bearing resources a registration's own `status.resources[]`
+/// declares, as prompt bullet lines.
+///
+/// This is the MANIFEST-declared half only — a `ResourceClaim` or
+/// `SharedVolume` the user wrote in CUE, which the cue-cmp sidecar
+/// renders and Argo CD therefore tracks. The claims the operator
+/// generates from `spec.needs` are its own owner-ref'd children, never
+/// synced by Argo CD, and so never appear here. Those are the
+/// databases, which is why the other half of the enumeration
+/// ([`read_claim_inventory`]) spends a cluster read rather than
+/// settling for this list.
+fn data_bearing_lines(app: &Value) -> Vec<String> {
+    let dest = app
+        .pointer("/spec/destination/namespace")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    app.pointer("/status/resources")
+        .and_then(Value::as_array)
+        .map(|resources| {
+            resources
+                .iter()
+                .filter_map(|r| {
+                    let kind = r.get("kind").and_then(Value::as_str)?;
+                    if r.get("group").and_then(Value::as_str) != Some("apprafter.io")
+                        || !DATA_BEARING_KINDS.contains(&kind)
+                    {
+                        return None;
+                    }
+                    let name = r.get("name").and_then(Value::as_str)?;
+                    match r
+                        .get("namespace")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .or(dest)
+                    {
+                        Some(ns) => Some(format!("    • {kind} {name} (namespace: {ns})")),
+                        None => Some(format!("    • {kind} {name}")),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Pure helper — the bullet lines for every `ResourceClaim` in a
+/// namespace-wide payload that ANY workload of the bundle owns.
+///
+/// The owner set is the bundle's, not one workload's, which is why this
+/// cannot reuse `parse_resource_claim_summaries`: that one filters to a
+/// single owner, and `app remove` is tearing down all of them at once.
+/// A namespace may hold a second registration's apps — the
+/// shared-volumes guide registers `writer` and `reader` into one
+/// namespace — so filtering by namespace alone would name another
+/// application's database in this one's blast radius.
+///
+/// Ownership is the same `ownerReferences[] {kind: Application, name}`
+/// test `claim_owned_by` applies, reused verbatim so the two surfaces
+/// cannot disagree about what a workload owns.
+pub(crate) fn owned_claim_lines(
+    payload: &Value,
+    owners: &[String],
+    namespace: &str,
+) -> Vec<String> {
+    payload
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|c| owners.iter().any(|o| claim_owned_by(c, o)))
+                .filter_map(|c| c.pointer("/metadata/name").and_then(Value::as_str))
+                .map(|name| format!("    • ResourceClaim {name} (namespace: {namespace})"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Enumerate the data a cascade-prune of this bundle destroys.
+///
+/// ONE extra cluster read, scoped to the bundle's namespace — ADR 0062
+/// makes a bundle one namespace, so a namespace-wide list is both
+/// sufficient and bounded, and it is filtered back to this bundle's own
+/// workloads by [`owned_claim_lines`]. It is spent only on a path that
+/// was already stopping to prompt a human, which is what makes it
+/// affordable where `app list`'s doubled read had to be argued for.
+///
+/// It covers what `status.resources[]` structurally cannot: the claims
+/// the operator generated from `spec.needs`, i.e. the databases. A
+/// blast-radius line that omits the databases is not doing the job the
+/// confirmation exists for.
+///
+/// Every failure path returns [`ClaimInventory::Unavailable`], never an
+/// empty [`ClaimInventory::Known`] — including a workload whose
+/// namespace could not be resolved, because an enumeration that silently
+/// skipped one workload is indistinguishable from a complete one.
+fn read_claim_inventory(
+    app: &Value,
+    workloads: &[CrRef],
+    kubeconfig_path: &Path,
+) -> ClaimInventory {
+    let dest = app
+        .pointer("/spec/destination/namespace")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let probe = |ns: &str| format!("kubectl get {RESOURCECLAIM_RESOURCE} -n {ns}");
+
+    // One namespace by ADR 0062, but derived rather than assumed: if the
+    // workloads disagree, or any of them cannot be placed, we cannot
+    // claim to have enumerated the bundle.
+    let mut namespaces: Vec<&str> = Vec::new();
+    for w in workloads {
+        let Some(ns) = w.namespace.as_deref().or(dest) else {
+            return ClaimInventory::Unavailable(probe(dest.unwrap_or("<namespace>")));
+        };
+        if !namespaces.contains(&ns) {
+            namespaces.push(ns);
+        }
+    }
+
+    let owners: Vec<String> = workloads.iter().map(|w| w.name.clone()).collect();
+    let mut lines: Vec<String> = data_bearing_lines(app);
+    for ns in &namespaces {
+        let Ok(payload) = list_resource_claim_payload(ns, kubeconfig_path) else {
+            return ClaimInventory::Unavailable(probe(ns));
+        };
+        lines.extend(owned_claim_lines(&payload, &owners, ns));
+    }
+    // A manifest-declared claim is ALSO owner-ref'd once the operator
+    // adopts it, so the two halves overlap. Sort then dedup — the order
+    // is the reader's, not Argo CD's.
+    lines.sort();
+    lines.dedup();
+    ClaimInventory::Known(lines)
+}
+
+/// Pure helper — the delete confirmation for ONE registration.
+///
+/// ADR 0062: a registration is a BUNDLE of 1..N workloads. Before 2.27b
+/// this surface printed [`single_remove_prompt_line`] and nothing else —
+/// one line, in the singular, naming the Argo CD object, as the entire
+/// consent for tearing down however many production workloads it
+/// deployed and whatever data they held. At N > 1 the block below names
+/// every workload and every data-bearing resource the cascade prunes; a
+/// count is not consent, which is the rule
+/// [`batch_remove_prompt_lines`] already follows for environments.
+///
+/// At N <= 1 it returns exactly [`single_remove_prompt_line`], by
+/// CALLING it rather than by re-deriving its wording — so today's fleet,
+/// every registration of which deploys one workload, is byte-identical
+/// by construction. A registration that has never synced tracks no
+/// workload at all and lands in the same arm: a list it cannot fill, or
+/// a count of zero, would read as "broken" for an application that is
+/// merely new.
+///
+/// INVARIANT: `keep_data` and a plain remove say OPPOSITE things about
+/// survival, exactly as [`remove_success_line`] does. The keep-data path
+/// strips the cascade finalizer before the delete, so nothing is pruned
+/// — naming the data there would threaten what is not at risk.
+///
+/// `claims` is [`read_claim_inventory`]'s answer. `None` means the
+/// caller did not consult it, which is correct on every path that
+/// renders no data section (N <= 1, or `--keep-data`) and a bug
+/// anywhere else — so the data section treats `None` as
+/// [`ClaimInventory::Unavailable`] rather than as an empty list. A
+/// forgotten read then reads as "could not check", never as "nothing to
+/// lose".
+pub(crate) fn remove_prompt_lines(
+    argo_app_name: &str,
+    app: &Value,
+    keep_data: bool,
+    claims: Option<&ClaimInventory>,
+) -> Vec<String> {
+    let workloads = app_open::apprafter_app_refs(app);
+    if workloads.len() <= 1 {
+        return vec![single_remove_prompt_line(argo_app_name, app)];
+    }
+    let n = workloads.len();
+    let project = app
+        .pointer("/spec/project")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let repo = app
+        .pointer("/spec/source/repoURL")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let mut out = if keep_data {
+        vec![
+            format!("Delete application '{argo_app_name}' (Argo CD object only)?"),
+            format!("  project: {project}, repo: {repo}"),
+            format!("  All {n} workloads and their data are preserved — re-register to re-adopt:"),
+        ]
+    } else {
+        vec![
+            format!("Delete application '{argo_app_name}' and ALL {n} workloads it deploys?"),
+            format!("  project: {project}, repo: {repo}"),
+            "  Workloads:".to_string(),
+        ]
+    };
+    out.extend(workloads.iter().map(|w| match &w.namespace {
+        Some(ns) => format!("    • {} (namespace: {ns})", w.name),
+        // `apprafter_app_refs` reports an unresolvable namespace as
+        // `None` rather than dropping the entry. A workload we cannot
+        // place is still a workload about to be destroyed, so it is
+        // listed without one — never under a guessed namespace.
+        None => format!("    • {}", w.name),
+    }));
+    if !keep_data {
+        // An unconsulted inventory fails SAFE. See the `claims` note
+        // above: "we could not look" and "there is nothing" must never
+        // render the same way.
+        let unconsulted = ClaimInventory::Unavailable(format!(
+            "kubectl get {RESOURCECLAIM_RESOURCE} -n {}",
+            app.pointer("/spec/destination/namespace")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("<namespace>")
+        ));
+        match claims.unwrap_or(&unconsulted) {
+            ClaimInventory::Known(data) if data.is_empty() => out.push(
+                "  Data destroyed: none — these workloads hold no ResourceClaim or SharedVolume."
+                    .to_string(),
+            ),
+            ClaimInventory::Known(data) => {
+                out.push(
+                    "  Data destroyed — every ResourceClaim and SharedVolume these workloads \
+                     hold, and it does not come back:"
+                        .to_string(),
+                );
+                out.extend(data.iter().cloned());
+            }
+            ClaimInventory::Unavailable(command) => {
+                out.push(
+                    "  Data destroyed: every ResourceClaim and SharedVolume these workloads \
+                     hold. The list could NOT be read — check it by hand before confirming:"
+                        .to_string(),
+                );
+                out.push(format!("    {command}"));
+            }
+        }
+    }
+    out
+}
+
 /// Pure helper — the single-app delete confirmation line. Extracted from
 /// [`remove_single_app`]; project and repo are quoted back so the reader
 /// can tell two similarly named apps apart before saying yes.
+///
+/// Since 2.27b this is the N <= 1 arm of [`remove_prompt_lines`], kept as
+/// its own function so the byte-identity of the single-workload case is
+/// guaranteed by the call rather than by a copied format string.
 pub(crate) fn single_remove_prompt_line(argo_app_name: &str, app: &Value) -> String {
     let project = app
         .pointer("/spec/project")
@@ -3669,24 +4126,45 @@ pub(crate) fn single_remove_prompt_line(argo_app_name: &str, app: &Value) -> Str
 /// the workload. The finalizer was stripped in the keep-data path, so the
 /// AppRafter CR and its pods survive; reporting the cascade wording there
 /// would tell an operator their data is gone when it is still running.
-pub(crate) fn remove_success_line(argo_app_name: &str, keep_data: bool) -> String {
-    if keep_data {
-        format!(
+///
+/// `workloads` is how many the registration deployed (ADR 0062). At
+/// `<= 1` both arms are the pre-2.27b wording verbatim; above it they
+/// stop saying "the workload", which after removing three is as wrong
+/// about what happened as the keep-data arm would be about survival.
+pub(crate) fn remove_success_line(
+    argo_app_name: &str,
+    keep_data: bool,
+    workloads: usize,
+) -> String {
+    match (keep_data, workloads) {
+        (true, n) if n > 1 => format!(
+            "✓ Application '{argo_app_name}' deleted (Argo CD object only). All {n} workloads and \
+             their AppRafter Application CRs are preserved — re-register to re-adopt."
+        ),
+        (true, _) => format!(
             "✓ Application '{argo_app_name}' deleted (Argo CD object only). The workload and its \
              AppRafter Application CR are preserved — re-register to re-adopt."
-        )
-    } else {
-        format!(
+        ),
+        (false, n) if n > 1 => format!(
+            "✓ Application '{argo_app_name}' deleted. Argo CD cascade-prunes the synced AppRafter \
+             resources; the operator then removes all {n} workloads."
+        ),
+        (false, _) => format!(
             "✓ Application '{argo_app_name}' deleted. Argo CD cascade-prunes the synced AppRafter \
              resources; the operator then removes the workload."
-        )
+        ),
     }
 }
 
-/// Delete ONE Argo CD Application by its exact `metadata.name`. Carries
-/// the confirm / finalizer-strip / kubectl-delete / report flow that
-/// both `remove` paths reuse. `--keep-data` strips the cascade finalizer
-/// so the synced AppRafter CR (and its workload) is preserved.
+/// Delete ONE Argo CD Application — one registration, the whole bundle
+/// it deploys (ADR 0062) — by its exact `metadata.name`. Carries the
+/// confirm / finalizer-strip / kubectl-delete / report flow that both
+/// `remove` paths reuse. `--keep-data` strips the cascade finalizer so
+/// the synced AppRafter CRs (and their workloads) are preserved.
+///
+/// When the name matches nothing, [`resolve_missing_registration`]
+/// decides what to say — which is where a workload name gets the ADR
+/// 0062 refusal instead of a bare "not found".
 fn remove_single_app(
     argo_app_name: &str,
     yes: bool,
@@ -3703,11 +4181,90 @@ fn remove_single_app(
         Some(ARGOCD_NAMESPACE),
         kubeconfig_path,
     )?;
-    let app = existing.ok_or_else(|| {
+    let (argo_app_name, app) = match existing {
+        Some(app) => (argo_app_name.to_string(), app),
+        None => resolve_missing_registration(argo_app_name, kubeconfig_path)?,
+    };
+    delete_registration(&argo_app_name, &app, yes, keep_data, kubeconfig_path)
+}
+
+/// The string named no Argo CD `Application`. Before reporting that, ask
+/// the index what it DID name.
+///
+/// ADR 0062 §Addressing: *"when the positional fails to resolve, the
+/// error resolves it as a workload and names the command that would have
+/// worked — the courtesy lives on the error path, not in the grammar."*
+/// Doing the index read HERE and nowhere else is what keeps that true:
+/// the happy path pays nothing, and the two cluster-wide reads are spent
+/// only on an invocation that was already going to fail.
+///
+/// Best-effort on the read itself. A failed index read must not REPLACE
+/// the real answer with a read error — the Application genuinely is not
+/// there, and that is what the user needs to be told.
+fn resolve_missing_registration(typed: &str, kubeconfig_path: &Path) -> Result<(String, Value)> {
+    let not_found = || {
         CliError::Other(format!(
-            "Application '{argo_app_name}' not found in namespace {ARGOCD_NAMESPACE}."
+            "Application '{typed}' not found in namespace {ARGOCD_NAMESPACE}."
         ))
-    })?;
+    };
+    let Ok(index) = AppIndex::read(kubeconfig_path) else {
+        return Err(not_found());
+    };
+    let resolution = index.resolve(typed, None);
+    let bundle_size = match &resolution {
+        Resolution::Workload(w) => w
+            .registration
+            .as_deref()
+            .map_or(0, |r| index.workloads_of(r).len()),
+        _ => 0,
+    };
+    match plan_remove_target(typed, &resolution, bundle_size) {
+        RemoveTarget::RefuseWorkload {
+            workload,
+            registration,
+            bundle_size,
+        } => Err(CliError::Other(
+            refuse_workload_lines(&workload, &registration, bundle_size).join("\n"),
+        )),
+        // An ERROR, not a redirect — see [`plan_remove_target`]. Acting
+        // here would make `app remove <workload> --yes`, which fails
+        // safe today, destroy a registration.
+        RemoveTarget::NameTheApplication {
+            workload,
+            registration,
+        } => Err(CliError::Other(
+            name_the_application_lines(&workload, &registration).join("\n"),
+        )),
+        // The race arm, and the only one that acts: the index resolved
+        // the very string the caller typed, so the object re-read here
+        // is the one they named.
+        RemoveTarget::Bundle(registration) => {
+            let app = kubectl_get_json(
+                "application.argoproj.io",
+                Some(&registration),
+                Some(ARGOCD_NAMESPACE),
+                kubeconfig_path,
+            )?
+            .ok_or_else(not_found)?;
+            Ok((registration, app))
+        }
+        RemoveTarget::Unknown => Err(not_found()),
+    }
+}
+
+/// Confirm, then delete ONE registration whose object is already in hand.
+/// Split out of [`remove_single_app`] so the pre-flight read has exactly
+/// one place to redirect to, and so the delete flow is written once.
+fn delete_registration(
+    argo_app_name: &str,
+    app: &Value,
+    yes: bool,
+    keep_data: bool,
+    kubeconfig_path: &Path,
+) -> Result<()> {
+    // ADR 0062: which workloads this registration deploys. No extra
+    // cluster read — the pre-flight `status.resources[]` already says.
+    let workloads = app_open::apprafter_app_refs(app);
 
     if !yes {
         // Interactive confirm: refuse silently without a TTY
@@ -3718,7 +4275,16 @@ fn remove_single_app(
                 "non-interactive shell — pass `--yes` to skip the confirmation prompt".into(),
             ));
         }
-        println!("{}", single_remove_prompt_line(argo_app_name, &app));
+        // The blast-radius read, scoped as tightly as it can be: only an
+        // interactive removal of a multi-workload bundle that will
+        // actually prune reaches it. Every other path renders no data
+        // section, so consulting the cluster for one would be a read
+        // nobody reads.
+        let claims = (workloads.len() > 1 && !keep_data)
+            .then(|| read_claim_inventory(app, &workloads, kubeconfig_path));
+        for line in remove_prompt_lines(argo_app_name, app, keep_data, claims.as_ref()) {
+            println!("{line}");
+        }
         let confirmed = inquire::Confirm::new("Confirm?")
             .with_default(false)
             .prompt()
@@ -3761,7 +4327,10 @@ fn remove_single_app(
         )));
     }
 
-    println!("{}", remove_success_line(argo_app_name, keep_data));
+    println!(
+        "{}",
+        remove_success_line(argo_app_name, keep_data, workloads.len())
+    );
     Ok(())
 }
 
@@ -8363,10 +8932,368 @@ mod list_filter_tests {
 #[cfg(test)]
 mod remove_plan_tests {
     use super::*;
+    use crate::commands::app_index::{Resolution, WorkloadEntry};
     use serde_json::json;
 
     fn argo(name: &str) -> Value {
         json!({ "metadata": { "name": name } })
+    }
+
+    /// One registration whose `status.resources[]` lists `workloads` as
+    /// `apprafter.io` `Application` CRs in `shop`, plus any `extra`
+    /// entries verbatim — the exact JSON `remove` already holds after its
+    /// pre-flight read.
+    fn bundle(workloads: &[&str], extra: Vec<Value>) -> Value {
+        let mut resources: Vec<Value> = workloads
+            .iter()
+            .map(|w| {
+                json!({ "group": "apprafter.io", "kind": "Application",
+                        "version": "v1alpha1", "name": w, "namespace": "shop" })
+            })
+            .collect();
+        resources.extend(extra);
+        json!({
+            "metadata": { "name": "shop-reg" },
+            "spec": {
+                "project": "apps",
+                "source": { "repoURL": "https://github.com/acme/shop" },
+                "destination": { "namespace": "shop" },
+            },
+            "status": { "resources": resources },
+        })
+    }
+
+    /// One indexed workload, as `AppIndex::resolve` hands it back.
+    fn workload(name: &str, namespace: &str, registration: Option<&str>) -> WorkloadEntry {
+        WorkloadEntry {
+            cr: json!({ "apiVersion": "apprafter.io/v1alpha1", "kind": "Application",
+                        "metadata": { "name": name, "namespace": namespace } }),
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+            registration: registration.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn removing_one_workload_of_a_bundle_is_refused_with_the_git_steps() {
+        // ADR 0062 §Write surfaces. `app add` writes
+        // `syncPolicy.automated.selfHeal: true`, so deleting ONE CR from
+        // the CLI is undone within a reconcile. Performing that delete
+        // would report success for a change that does not survive the
+        // next sync, so the only honest plan is a refusal.
+        assert_eq!(
+            plan_remove_target(
+                "api",
+                &Resolution::Workload(workload("api", "shop", Some("shop-reg"))),
+                3,
+            ),
+            RemoveTarget::RefuseWorkload {
+                workload: "api".into(),
+                registration: "shop-reg".into(),
+                bundle_size: 3,
+            },
+        );
+    }
+
+    #[test]
+    fn removing_the_sole_workload_of_a_registration_names_the_application_instead() {
+        // At N = 1 nothing about the intent is unsupported — the caller
+        // named the workload when the verb takes the application — so
+        // this is not the git-steps refusal. It is still an ERROR, not a
+        // redirect: ADR 0062 §Addressing makes the positional always the
+        // registration, and the error path's job is to name the command
+        // that would have worked. The shape that reaches here is the
+        // pre-2.9 name mismatch this module's own test already asserts is
+        // supported — registration `cms-prod` renders a CR `landing-cms`.
+        assert_eq!(
+            plan_remove_target(
+                "landing-cms",
+                &Resolution::Workload(workload("landing-cms", "cms", Some("cms-prod"))),
+                1,
+            ),
+            RemoveTarget::NameTheApplication {
+                workload: "landing-cms".into(),
+                registration: "cms-prod".into(),
+            },
+        );
+        let msg = name_the_application_lines("landing-cms", "cms-prod").join("\n");
+        assert!(msg.contains("'landing-cms' is not an application"), "{msg}");
+        assert!(
+            msg.contains("only workload of application 'cms-prod'"),
+            "{msg}"
+        );
+        assert!(msg.contains("apprafter app remove cms-prod"), "{msg}");
+        // NOT the git steps: deleting the block is not the route to what
+        // this caller asked for, and offering it would be noise.
+        assert!(!msg.contains("commit and push"), "{msg}");
+    }
+
+    #[test]
+    fn yes_cannot_make_a_workload_name_reach_the_delete_path() {
+        // `--yes` skips the CONFIRMATION, and the confirmation is the
+        // only thing standing between a `Bundle` plan and a `kubectl
+        // delete`. So the guarantee that `--yes` cannot turn a workload
+        // name destructive is exactly this: a workload resolution never
+        // yields `Bundle`, at ANY bundle size. `plan_remove_target` takes
+        // no `yes` argument for the same reason — the flag cannot reach
+        // this decision at all.
+        //
+        // This is the regression guard for a real escalation: an earlier
+        // cut of 2.27b proceeded at N = 1, which turned `apprafter app
+        // remove <workload> --yes` from a safe failure into a registration
+        // delete.
+        for size in [0, 1, 2, 3, 17] {
+            let plan = plan_remove_target(
+                "landing-cms",
+                &Resolution::Workload(workload("landing-cms", "cms", Some("cms-prod"))),
+                size,
+            );
+            assert!(
+                !matches!(plan, RemoveTarget::Bundle(_)),
+                "bundle_size {size} reached the delete path: {plan:?}"
+            );
+        }
+        // The one arm that DOES act only ever names the string the caller
+        // typed — never a registration reached by some other name.
+        assert_eq!(
+            plan_remove_target("blog", &Resolution::Registration("blog".into(), vec![]), 0),
+            RemoveTarget::Bundle("blog".into()),
+        );
+        assert_eq!(
+            plan_remove_target(
+                "cms",
+                &Resolution::Registration("cms-prod".into(), vec![]),
+                0
+            ),
+            RemoveTarget::Unknown,
+        );
+    }
+
+    #[test]
+    fn a_workload_no_registration_claims_gets_the_plain_not_found() {
+        // A CR applied by hand, or one left behind by a removed
+        // registration. There is no registration to tear down and no
+        // self-heal to undo a delete, so neither the refusal nor the
+        // bundle plan is true of it — `remove` operates on registrations,
+        // and for this string there is none.
+        assert_eq!(
+            plan_remove_target(
+                "legacy",
+                &Resolution::Workload(workload("legacy", "legacy-ns", None)),
+                1
+            ),
+            RemoveTarget::Unknown,
+        );
+        assert_eq!(
+            plan_remove_target("nope", &Resolution::NotFound, 0),
+            RemoveTarget::Unknown,
+        );
+    }
+
+    #[test]
+    fn the_refusal_names_the_git_steps_and_the_whole_bundle_alternative() {
+        let msg = refuse_workload_lines("api", "shop-reg", 3).join("\n");
+        // WHAT was typed and what it turned out to be.
+        assert!(msg.contains("'api' is 1 of 3 workloads"), "{msg}");
+        assert!(msg.contains("'shop-reg'"), "{msg}");
+        // WHY it is refused. This will be reported as a missing feature;
+        // the message has to say it is GitOps, not an unimplemented verb.
+        assert!(msg.contains("self-heal"), "{msg}");
+        // The route that actually works.
+        assert!(msg.contains("Application.cue"), "{msg}");
+        assert!(msg.contains("commit and push"), "{msg}");
+        // And the other thing they might have meant, as a command.
+        assert!(msg.contains("ALL 3 workloads"), "{msg}");
+        assert!(msg.contains("apprafter app remove shop-reg"), "{msg}");
+    }
+
+    #[test]
+    fn the_whole_bundle_prompt_names_every_workload_not_a_count() {
+        // A count is not consent — the same rule
+        // `batch_remove_prompt_lines` already follows for environments.
+        // Pre-2.27b this rendered ONE line, in the singular, before
+        // tearing down three production workloads.
+        let app = bundle(&["api", "web", "worker"], vec![]);
+        let lines = remove_prompt_lines(
+            "shop-reg",
+            &app,
+            false,
+            Some(&ClaimInventory::Known(Vec::new())),
+        );
+        let joined = lines.join("\n");
+        for w in ["api", "web", "worker"] {
+            assert!(
+                lines.iter().any(|l| l.contains(&format!("• {w}"))),
+                "{joined}"
+            );
+        }
+        assert!(joined.contains("'shop-reg'"), "{joined}");
+        assert!(joined.contains("3 workloads"), "{joined}");
+        // The source is still quoted back — it is how a reader tells two
+        // similarly named applications apart before saying yes.
+        assert!(joined.contains("https://github.com/acme/shop"), "{joined}");
+    }
+
+    #[test]
+    fn the_whole_bundle_prompt_names_a_claim_whose_data_dies() {
+        // The claim that matters is the one the OPERATOR generated from
+        // `needs.pg` — the database. It is an owner-ref'd child of the
+        // workload CR, never synced by Argo CD, so it is absent from
+        // `status.resources[]` and only the scoped cluster read finds it.
+        // A blast-radius line that omits the databases is not doing the
+        // job the confirmation exists for.
+        let app = bundle(&["api", "web"], vec![]);
+        let inventory = ClaimInventory::Known(vec![
+            "    • ResourceClaim api-pg (namespace: shop)".to_string()
+        ]);
+        let joined = remove_prompt_lines("shop-reg", &app, false, Some(&inventory)).join("\n");
+        assert!(joined.contains("ResourceClaim api-pg"), "{joined}");
+        assert!(joined.contains("does not come back"), "{joined}");
+        // A claim is not a workload — it must not inflate the count the
+        // reader is consenting to.
+        assert!(joined.contains("2 workloads"), "{joined}");
+        // INVARIANT: `--keep-data` strips the cascade finalizer, so
+        // NOTHING is pruned. Threatening data that is not at risk is the
+        // same defect as the success line's keep-data arm.
+        let kept = remove_prompt_lines("shop-reg", &app, true, Some(&inventory)).join("\n");
+        assert!(!kept.contains("api-pg"), "{kept}");
+        assert!(kept.contains("preserved"), "{kept}");
+    }
+
+    #[test]
+    fn the_enumeration_covers_operator_generated_claims_and_only_this_bundle_s() {
+        // The namespace-wide read is filtered by ownerReference to the
+        // bundle's OWN workloads. A namespace may hold a second
+        // registration — the shared-volumes guide puts `writer` and
+        // `reader` in one — and naming another application's database in
+        // this one's blast radius is its own kind of wrong.
+        let payload = json!({ "items": [
+            { "metadata": { "name": "api-pg", "ownerReferences": [
+                { "kind": "Application", "name": "api" }]}},
+            { "metadata": { "name": "web-redis", "ownerReferences": [
+                { "kind": "Application", "name": "web" }]}},
+            { "metadata": { "name": "other-pg", "ownerReferences": [
+                { "kind": "Application", "name": "somebody-else" }]}},
+            // No owner at all — cannot be attributed, so not claimed.
+            { "metadata": { "name": "orphan" }},
+        ]});
+        let owners = vec!["api".to_string(), "web".to_string()];
+        let lines = owned_claim_lines(&payload, &owners, "shop");
+        assert_eq!(
+            lines,
+            vec![
+                "    • ResourceClaim api-pg (namespace: shop)",
+                "    • ResourceClaim web-redis (namespace: shop)",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_failed_claim_read_never_renders_as_no_data_at_risk() {
+        // The `—`-never-blank rule, on a destructive path. "We looked and
+        // there is none" and "we could not look" must never render the
+        // same way; collapsing them would let a failed read read as
+        // consent to destroy a database.
+        let app = bundle(&["api", "web"], vec![]);
+        let cmd = "kubectl get resourceclaim.apprafter.io -n shop";
+        let unavailable = remove_prompt_lines(
+            "shop-reg",
+            &app,
+            false,
+            Some(&ClaimInventory::Unavailable(cmd.to_string())),
+        )
+        .join("\n");
+        assert!(unavailable.contains("could NOT be read"), "{unavailable}");
+        assert!(unavailable.contains(cmd), "{unavailable}");
+        assert!(!unavailable.contains("none —"), "{unavailable}");
+
+        // An inventory the caller never consulted fails the SAME way, so
+        // a forgotten read cannot silently become a clean bill of health.
+        let unconsulted = remove_prompt_lines("shop-reg", &app, false, None).join("\n");
+        assert!(unconsulted.contains("could NOT be read"), "{unconsulted}");
+        assert!(unconsulted.contains(cmd), "{unconsulted}");
+
+        // And a read that genuinely found nothing says so positively —
+        // it is a different sentence, backed by an actual look.
+        let empty = remove_prompt_lines(
+            "shop-reg",
+            &app,
+            false,
+            Some(&ClaimInventory::Known(vec![])),
+        )
+        .join("\n");
+        assert!(empty.contains("none —"), "{empty}");
+        assert!(!empty.contains("could NOT be read"), "{empty}");
+    }
+
+    #[test]
+    fn removing_a_registration_by_name_is_unchanged_at_one_workload() {
+        // The regression guard for today's entire fleet: every existing
+        // registration deploys exactly one workload. Prompt and BOTH
+        // success arms must render what they rendered before 2.27b, and
+        // the `--env` axis must be untouched.
+        let app = json!({
+            "metadata": { "name": "web-prod" },
+            "spec": {
+                "project": "apps",
+                "source": { "repoURL": "https://github.com/acme/web" },
+                "destination": { "namespace": "web" },
+            },
+            "status": { "resources": [
+                { "group": "apprafter.io", "kind": "Application", "version": "v1alpha1",
+                  "name": "web", "namespace": "web" }
+            ]},
+        });
+        // Byte-identical by CALLING the old function, not by copying its
+        // wording — the technique ADR 0062 mandates for `app status`.
+        // `None` for the inventory is not an omission: at N <= 1 no data
+        // section is rendered, and the caller correspondingly spends no
+        // cluster read.
+        assert_eq!(
+            remove_prompt_lines("web-prod", &app, false, None),
+            vec![single_remove_prompt_line("web-prod", &app)]
+        );
+        assert_eq!(
+            remove_prompt_lines("web-prod", &app, true, None),
+            vec![single_remove_prompt_line("web-prod", &app)]
+        );
+        assert_eq!(
+            single_remove_prompt_line("web-prod", &app),
+            "Delete Application 'web-prod' (project: apps, repo: https://github.com/acme/web)?"
+        );
+        // A registration that has never synced tracks no workload at all.
+        // It must keep the one-line prompt, not grow a list it cannot
+        // fill or a count of zero that reads as "broken".
+        let unsynced = json!({ "metadata": { "name": "web-prod" }, "spec": {} });
+        assert_eq!(
+            remove_prompt_lines("web-prod", &unsynced, false, None),
+            vec![single_remove_prompt_line("web-prod", &unsynced)]
+        );
+        // Both success arms, verbatim.
+        assert_eq!(
+            remove_success_line("web-prod", false, 1),
+            "✓ Application 'web-prod' deleted. Argo CD cascade-prunes the synced AppRafter \
+             resources; the operator then removes the workload."
+        );
+        assert_eq!(
+            remove_success_line("web-prod", true, 1),
+            "✓ Application 'web-prod' deleted (Argo CD object only). The workload and its \
+             AppRafter Application CR are preserved — re-register to re-adopt."
+        );
+        // The `--env` batch axis is orthogonal to bundles (ADR 0062) and
+        // resolves exactly as before.
+        assert_eq!(
+            plan_remove("web", &[argo("web-prod")]),
+            RemovePlan::Single("web-prod".into())
+        );
+        assert_eq!(
+            plan_remove("web", &[argo("web-dev"), argo("web-prod")]),
+            RemovePlan::Batch(vec!["web-dev".into(), "web-prod".into()])
+        );
+        assert_eq!(
+            batch_remove_prompt_lines("web", &["web-dev".into(), "web-prod".into()])[0],
+            "Delete ALL 2 environment deployments of 'web'?"
+        );
     }
 
     #[test]
@@ -8437,13 +9364,26 @@ mod remove_plan_tests {
         // INVARIANT: the finalizer was stripped on the keep-data path, so
         // the CR and its pods survive. Reporting the cascade wording there
         // tells an operator their data is gone while it is still running.
-        let kept = remove_success_line("web", true);
-        assert!(kept.contains("preserved"), "{kept}");
-        assert!(!kept.contains("cascade-prunes"), "{kept}");
+        //
+        // It has to keep holding at N > 1, where BOTH arms are reworded:
+        // a line that says "the workload" after removing three is just as
+        // wrong about what happened.
+        for n in [1, 3] {
+            let kept = remove_success_line("web", true, n);
+            assert!(kept.contains("preserved"), "{kept}");
+            assert!(!kept.contains("cascade-prunes"), "{kept}");
 
-        let cascaded = remove_success_line("web", false);
-        assert!(cascaded.contains("cascade-prunes"), "{cascaded}");
-        assert!(!cascaded.contains("preserved"), "{cascaded}");
+            let cascaded = remove_success_line("web", false, n);
+            assert!(cascaded.contains("cascade-prunes"), "{cascaded}");
+            assert!(!cascaded.contains("preserved"), "{cascaded}");
+        }
+        // And at N > 1 neither arm speaks in the singular.
+        let many = remove_success_line("shop-reg", false, 3);
+        assert!(many.contains("all 3 workloads"), "{many}");
+        assert!(!many.contains("the workload"), "{many}");
+        let many_kept = remove_success_line("shop-reg", true, 3);
+        assert!(many_kept.contains("All 3 workloads"), "{many_kept}");
+        assert!(!many_kept.contains("The workload"), "{many_kept}");
     }
 }
 
