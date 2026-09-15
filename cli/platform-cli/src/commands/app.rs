@@ -99,18 +99,39 @@ pub(crate) fn kubectl_delete_argo_app_args(argo_app_name: &str) -> Vec<String> {
     ]
 }
 
+/// One `app list` row = one REGISTRATION (one Argo CD `Application`),
+/// which ADR 0062 defines as a bundle of 1..N workloads. `tabled` emits
+/// the columns in declaration order.
+///
+/// `PROJECT` and `REV` are deliberately absent: `project` is near-always
+/// `apps` and `targetRevision` near-always the default branch, so both
+/// cost width without informing. They are removed from the *list*, not
+/// from the product — `app status` still prints them
+/// ([`status_detail_lines`]'s `project:` and `revision:` lines).
+///
+/// There is no time column, by the same reasoning.
 #[derive(Tabled)]
 struct AppRow {
     #[tabled(rename = "NAME")]
     name: String,
     #[tabled(rename = "ENV")]
     env: String,
-    #[tabled(rename = "PROJECT")]
-    project: String,
+    /// `spec.destination.namespace` — the namespace Argo CD creates
+    /// (`CreateNamespace=true`) and applies every namespaced child into.
+    /// The same field [`status_detail_lines`] prints as `destination:`,
+    /// down to the `?` fallback, so the two surfaces cannot disagree.
+    /// ADR 0062 makes this a property of the whole registration.
+    #[tabled(rename = "NAMESPACE")]
+    namespace: String,
+    /// How many `apprafter.io/Application` CRs this registration
+    /// deploys. Not decoration: with one row per bundle, a 3-workload
+    /// manifest and a single app are otherwise indistinguishable, and
+    /// every `apprafter app <verb> <name>` hint the CLI prints is
+    /// silently ambiguous for half the table.
+    #[tabled(rename = "WORKLOADS")]
+    workloads: String,
     #[tabled(rename = "REPO")]
     repo: String,
-    #[tabled(rename = "REV")]
-    revision: String,
     #[tabled(rename = "SYNC")]
     sync: String,
     #[tabled(rename = "HEALTH")]
@@ -3180,6 +3201,55 @@ pub(crate) fn normalise_git_url(url: &str) -> String {
     url.to_string()
 }
 
+/// The repo URL as `app list` shows it: the `https://` (or `http://`)
+/// scheme stripped for column width, everything else verbatim.
+///
+/// The contrast with [`normalise_git_url`] directly above is the point.
+/// That one REWRITES — `ssh://` and SCP-style become `https://` — which
+/// is correct on the WRITE path, because Argo CD's repo-server wants the
+/// HTTPS form. Here it would be a lie: `--all-managed` surfaces
+/// registrations this CLI never wrote, and rendering an `ssh://` remote
+/// as `https://` tells the reader their Argo CD clones over a protocol
+/// it does not. So anything that is not an HTTP(S) scheme passes
+/// through untouched, `.git` suffix included.
+pub(crate) fn display_repo_url(repo: &str) -> String {
+    repo.strip_prefix("https://")
+        .or_else(|| repo.strip_prefix("http://"))
+        .unwrap_or(repo)
+        .to_string()
+}
+
+/// The `WORKLOADS` cell — how many `apprafter.io/Application` CRs this
+/// registration deploys, out of Argo CD's `status.resources[]`.
+///
+/// Counted here rather than via `app_open::apprafter_app_refs`: that
+/// helper DROPS an entry whose `name` is missing and resolves a
+/// namespace per entry, neither of which a count needs, and wiring a
+/// display cell to a resolution helper would couple this column to
+/// changes made for `app open`'s reasons.
+///
+/// `status.resources` is absent until Argo CD has synced once, and the
+/// answer there is the em-dash — the unmeasured marker this repo already
+/// uses — never `0`, which would read as "broken" for an application
+/// that is merely new.
+pub(crate) fn workload_count_cell(app: &Value) -> String {
+    let Some(resources) = app.pointer("/status/resources").and_then(Value::as_array) else {
+        return "—".to_string();
+    };
+    // The GROUP, not the kind alone: an app-of-apps child is an
+    // `argoproj.io` `Application` and must not be counted as a workload.
+    // `status.resources[]` records group and version in separate fields,
+    // so the bare group is the exact discriminator.
+    resources
+        .iter()
+        .filter(|r| {
+            r.get("group").and_then(Value::as_str) == Some("apprafter.io")
+                && r.get("kind").and_then(Value::as_str) == Some("Application")
+        })
+        .count()
+        .to_string()
+}
+
 /// Derive a sane Application name from a normalised repo URL.
 /// `https://github.com/foo/my-app` → `my-app`. Strips trailing
 /// `.git` defensively (in case the URL slipped through
@@ -3775,21 +3845,16 @@ fn app_row(app: &Value) -> AppRow {
         .and_then(Value::as_str)
         .unwrap_or("?")
         .to_string();
-    let project = app
-        .pointer("/spec/project")
+    let namespace = app
+        .pointer("/spec/destination/namespace")
         .and_then(Value::as_str)
         .unwrap_or("?")
         .to_string();
-    let repo = app
-        .pointer("/spec/source/repoURL")
-        .and_then(Value::as_str)
-        .unwrap_or("?")
-        .to_string();
-    let revision = app
-        .pointer("/spec/source/targetRevision")
-        .and_then(Value::as_str)
-        .unwrap_or("?")
-        .to_string();
+    let repo = display_repo_url(
+        app.pointer("/spec/source/repoURL")
+            .and_then(Value::as_str)
+            .unwrap_or("?"),
+    );
     let sync = app
         .pointer("/status/sync/status")
         .and_then(Value::as_str)
@@ -3804,12 +3869,16 @@ fn app_row(app: &Value) -> AppRow {
     // the same label → status → `(base)` resolution as the `app status`
     // per-env aggregation so the two surfaces never disagree.
     let env = deployment_environment(app);
+    // ADR 0062: the row stands for a BUNDLE of 1..N workloads, so it has
+    // to say how many. No extra cluster read — `list` already fetched
+    // `status.resources[]`.
+    let workloads = workload_count_cell(app);
     AppRow {
         name,
         env,
-        project,
+        namespace,
+        workloads,
         repo,
-        revision,
         sync,
         health,
     }
@@ -5947,6 +6016,64 @@ mod tests {
             "spec": { "project": "apps" }
         });
         assert_eq!(app_row(&base_only).env, "(base)");
+    }
+
+    #[test]
+    fn app_row_counts_the_workloads_a_registration_deploys() {
+        let app = serde_json::json!({
+            "metadata": {"name": "shop"},
+            "spec": {"source": {"repoURL": "https://github.com/acme/shop"},
+                     "destination": {"namespace": "shop"}},
+            "status": {"resources": [
+                {"group": "", "kind": "Namespace", "name": "shop"},
+                {"group": "apprafter.io", "kind": "Application", "name": "api", "namespace": "shop"},
+                {"group": "apprafter.io", "kind": "Application", "name": "web", "namespace": "shop"}
+            ]}
+        });
+        let row = app_row(&app);
+        assert_eq!(row.workloads, "2", "the Namespace is not a workload");
+        assert_eq!(row.namespace, "shop");
+        assert_eq!(
+            row.repo, "github.com/acme/shop",
+            "the scheme is stripped for width"
+        );
+    }
+
+    #[test]
+    fn app_row_reports_an_unsynced_registration_as_unmeasured() {
+        // status.resources is absent until the first sync. `0` would read as
+        // "broken" for an application that is merely new; the em-dash is this
+        // repo's unmeasured marker.
+        let app = serde_json::json!({"metadata": {"name": "fresh"},
+                         "spec": {"source": {"repoURL": "https://x/y"}}});
+        assert_eq!(app_row(&app).workloads, "\u{2014}");
+    }
+
+    #[test]
+    fn app_row_keeps_a_non_https_repo_url_verbatim() {
+        // DELIBERATELY not normalise_git_url: that REWRITES ssh:// to
+        // https://, which is right on the write path and a lie here —
+        // `--all-managed` surfaces registrations this CLI never wrote, and
+        // showing an ssh remote as https tells the reader their Argo CD
+        // clones over a protocol it does not.
+        let app = serde_json::json!({"metadata": {"name": "x"},
+                         "spec": {"source": {"repoURL": "ssh://git@github.com/acme/x"}}});
+        assert_eq!(app_row(&app).repo, "ssh://git@github.com/acme/x");
+    }
+
+    #[test]
+    fn app_row_counts_only_apprafter_applications() {
+        // An app-of-apps child is an `argoproj.io` Application. The group is
+        // recorded separately from the version in status.resources[], so the
+        // group alone is the right discriminator here.
+        let app = serde_json::json!({"metadata": {"name": "x"},
+                         "spec": {"source": {"repoURL": "https://x/y"}},
+                         "status": {"resources": [
+            {"group": "apprafter.io", "kind": "Application", "name": "ours"},
+            {"group": "argoproj.io", "kind": "Application", "name": "theirs"},
+            {"group": "apprafter.io", "kind": "ServiceProvider", "name": "pg"}
+        ]}});
+        assert_eq!(app_row(&app).workloads, "1");
     }
 
     #[test]

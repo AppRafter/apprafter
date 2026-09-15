@@ -255,14 +255,20 @@ apprafter app list
 ```
 
 ```text
-+----------------+---------+---------+------------------------------------+--------+--------+---------+
-| NAME           | ENV     | PROJECT | REPO                               | REV    | SYNC   | HEALTH  |
-+----------------+---------+---------+------------------------------------+--------+--------+---------+
-| parser-prod    | prod    | apps    | https://github.com/acme/parser.git | v1.4.0 | Synced | Healthy |
-+----------------+---------+---------+------------------------------------+--------+--------+---------+
-| parser-staging | staging | apps    | https://github.com/acme/parser.git | main   | Synced | Healthy |
-+----------------+---------+---------+------------------------------------+--------+--------+---------+
++----------------+---------+----------------+-----------+----------------------------+--------+---------+
+| NAME           | ENV     | NAMESPACE      | WORKLOADS | REPO                       | SYNC   | HEALTH  |
++----------------+---------+----------------+-----------+----------------------------+--------+---------+
+| parser-prod    | prod    | parser-prod    | 1         | github.com/acme/parser.git | Synced | Healthy |
++----------------+---------+----------------+-----------+----------------------------+--------+---------+
+| parser-staging | staging | parser-staging | 1         | github.com/acme/parser.git | Synced | Healthy |
++----------------+---------+----------------+-----------+----------------------------+--------+---------+
 ```
+
+`WORKLOADS` is how many workloads that one registration deploys — a
+manifest package is a bundle, and `1` here says each of these two is a
+single-workload one. The repo URL drops its `https://` for width;
+`PROJECT` and `REV` are not in the list, but `apprafter app status`
+still prints both.
 
 **Read the logical name off that table by stripping the `ENV` suffix**,
 because no column carries it: `NAME` is the per-environment identity
