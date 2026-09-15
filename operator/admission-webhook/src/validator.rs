@@ -1252,6 +1252,7 @@ fn validate_jetstream_need(js: &JetStreamNeed, scope: &str) -> Vec<String> {
     // Stream name uniqueness within the application — load-bearing for the
     // consume/durable collision check below, which reads this same set.
     let mut seen_stream_names: Vec<&str> = Vec::new();
+
     for (idx, stream) in js.streams.iter().enumerate() {
         if seen_stream_names.contains(&stream.name.as_str()) {
             errs.push(format!(
@@ -1318,6 +1319,106 @@ fn validate_jetstream_need(js: &JetStreamNeed, scope: &str) -> Vec<String> {
                 ));
             }
         }
+
+        // 2.28 (ADR 0065 §2.3): the isolation-breaking fields, declared in
+        // the type ONLY so this rejection is reachable. A structural schema
+        // prunes an unknown field before any webhook runs, so omitting them
+        // would make `mirror:` vanish silently and the manifest appear to
+        // work — the failure ADR 0061 §6 established the pattern against.
+        for (field, present, why) in [
+            (
+                "sources",
+                stream.sources.is_some(),
+                "a source copies another stream's messages into this one, which ADR 0061 §4.1 MEASURED as defeating the read half of the deny vector",
+            ),
+            (
+                "mirror",
+                stream.mirror.is_some(),
+                "a mirror copies another stream wholesale, which ADR 0061 §4.1 MEASURED as defeating the read half of the deny vector",
+            ),
+            (
+                "republish",
+                stream.republish.is_some(),
+                "republish re-emits this stream's traffic under a subject the application itself could not publish to",
+            ),
+            (
+                "subjectTransform",
+                stream.subject_transform.is_some(),
+                "a subject transform rewrites messages onto subjects outside this application's prefix",
+            ),
+            (
+                "placement",
+                stream.placement.is_some(),
+                "placement is clustered topology, which arrives with Tier 2",
+            ),
+            (
+                "replicas",
+                stream.replicas.is_some(),
+                "replication is clustered topology, which arrives with Tier 2",
+            ),
+        ] {
+            if present {
+                errs.push(format!(
+                    "{scope}: needs.jetstream.streams[{idx} {:?}].{field} is not supported — {why}. It is declared in the schema only so this refusal reaches you: an undeclared field would be pruned by the apiserver before this webhook ran, and the manifest would appear to work.",
+                    stream.name
+                ));
+            }
+        }
+
+        // `discardPerSubject` carries two server-side preconditions (error
+        // 10052, measured on 2.14.3). Stated here so the refusal names a
+        // field, rather than surfacing through NACK as an opaque stream
+        // creation failure with no path attached.
+        if stream.discard_per_subject == Some(true) {
+            if stream.discard.as_deref() != Some("new") {
+                errs.push(format!(
+                    "{scope}: needs.jetstream.streams[{idx} {:?}].discardPerSubject requires discard: \"new\" (the server rejects it otherwise)",
+                    stream.name
+                ));
+            }
+            if stream.max_msgs_per_subject.unwrap_or(0) <= 0 {
+                errs.push(format!(
+                    "{scope}: needs.jetstream.streams[{idx} {:?}].discardPerSubject requires maxMsgsPerSubject > 0 — there is no per-subject ceiling to discard against otherwise (the server rejects it)",
+                    stream.name
+                ));
+            }
+        }
+    }
+
+    // 2.28: a `deadLetter` materialises an ORDINARY declared stream owned by
+    // this application (ADR 0065 §2.4), so its name shares the declared-stream
+    // namespace and must be collected BEFORE the durable-collision check runs.
+    // Collected in a pre-pass rather than inside the consume loop: a durable
+    // in an EARLIER entry must still collide with a DLQ declared in a LATER
+    // one, and an in-loop collection would only ever see the DLQs before it.
+    for (idx, consume) in js.consume.iter().enumerate() {
+        let Some(dlq) = consume.dead_letter.as_ref() else {
+            continue;
+        };
+        if dlq.stream.trim().is_empty() {
+            errs.push(format!(
+                "{scope}: needs.jetstream.consume[{idx}].deadLetter.stream must not be empty"
+            ));
+            continue;
+        }
+        if !is_dns_1123_label(&dlq.stream) {
+            errs.push(format!(
+                "{scope}: needs.jetstream.consume[{idx}].deadLetter.stream {:?} must be a DNS-1123 label — it composes into the NATS-side stream name `<app>_<name>` exactly as a declared stream does, and a '_' in it would make that join ambiguous",
+                dlq.stream
+            ));
+        } else if seen_stream_names.contains(&dlq.stream.as_str()) {
+            errs.push(format!(
+                "{scope}: needs.jetstream.consume[{idx}].deadLetter.stream {:?} collides with a stream this application already declares; a dead-letter queue IS a declared stream and shares that namespace",
+                dlq.stream
+            ));
+        } else {
+            seen_stream_names.push(&dlq.stream);
+        }
+        if dlq.max_bytes.trim().is_empty() {
+            errs.push(format!(
+                "{scope}: needs.jetstream.consume[{idx}].deadLetter.maxBytes must not be empty — the dead-letter queue counts against the namespace quota like any other declared stream"
+            ));
+        }
     }
 
     for (idx, consume) in js.consume.iter().enumerate() {
@@ -1346,6 +1447,78 @@ fn validate_jetstream_need(js: &JetStreamNeed, scope: &str) -> Vec<String> {
             errs.push(format!(
                 "{scope}: needs.jetstream.consume[{idx}] durable {:?} collides with a stream name declared by this application — the deny vector's position-pattern grants ($JS.API.*.*.*.S) are safe only because a durable can never share a name with one of this application's own streams; use a different durable name",
                 consume.durable
+            ));
+        }
+
+        // 2.28 (ADR 0065 §2.3): the push surface, declared to be rejected.
+        // Push delivery is performed by the SERVER, outside the
+        // application's publish permissions — a write channel into a
+        // neighbour's prefix, which is why none of these four can be
+        // offered at all rather than merely constrained.
+        for (field, present) in [
+            ("deliverSubject", consume.deliver_subject.is_some()),
+            ("deliverGroup", consume.deliver_group.is_some()),
+            ("flowControl", consume.flow_control.is_some()),
+            ("heartbeatInterval", consume.heartbeat_interval.is_some()),
+        ] {
+            if present {
+                errs.push(format!(
+                    "{scope}: needs.jetstream.consume[{idx}].{field} is not supported — it selects PUSH delivery, which the server performs outside this application's publish permissions and can therefore deliver into a neighbour's subject tree. Pull consumers carry no such channel. Declared in the schema only so this refusal reaches you rather than the field being pruned."
+                ));
+            }
+        }
+        if consume.replicas.is_some() {
+            errs.push(format!(
+                "{scope}: needs.jetstream.consume[{idx}].replicas is not supported — consumer replication is clustered topology, which arrives with Tier 2"
+            ));
+        }
+
+        // The server rejects both filter forms together; say so here, where
+        // the field names are visible.
+        if consume.filter_subject.is_some() && consume.filter_subjects.is_some() {
+            errs.push(format!(
+                "{scope}: needs.jetstream.consume[{idx}] sets both filterSubject and filterSubjects; they are mutually exclusive — use one"
+            ));
+        }
+
+        // A start position under the wrong policy is REJECTED, not ignored:
+        // an ignored start position is a consumer that silently reads from
+        // the wrong place, which looks like data loss.
+        let policy = consume.deliver_policy.as_deref();
+        if consume.opt_start_seq.is_some() && policy != Some("byStartSequence") {
+            errs.push(format!(
+                "{scope}: needs.jetstream.consume[{idx}].optStartSeq requires deliverPolicy: \"byStartSequence\" (got {policy:?}); under any other policy the server ignores it and the consumer silently starts somewhere else"
+            ));
+        }
+        if consume.opt_start_time.is_some() && policy != Some("byStartTime") {
+            errs.push(format!(
+                "{scope}: needs.jetstream.consume[{idx}].optStartTime requires deliverPolicy: \"byStartTime\" (got {policy:?}); under any other policy the server ignores it and the consumer silently starts somewhere else"
+            ));
+        }
+
+        // Measured on 2.14.3: `max deliver is required to be > length of
+        // backoff values` (10116) — STRICTLY greater. The equal case is the
+        // one a loose reading of the rule admits.
+        if let Some(backoff) = consume.backoff.as_ref() {
+            if !backoff.is_empty() {
+                let max_deliver = consume.max_deliver.unwrap_or(0);
+                if max_deliver <= backoff.len() as i64 {
+                    errs.push(format!(
+                        "{scope}: needs.jetstream.consume[{idx}] declares {} backoff step(s) but maxDeliver {}; the server requires maxDeliver to be STRICTLY greater than the number of backoff steps",
+                        backoff.len(),
+                        consume.max_deliver.map_or("unset".to_string(), |v| v.to_string())
+                    ));
+                }
+            }
+        }
+
+        // A dead-letter queue with no delivery ceiling never receives
+        // anything: the advisory it collects fires only when redelivery is
+        // exhausted. Rejected rather than warned, because the failure is
+        // a manifest that looks like it works and stays silent forever.
+        if consume.dead_letter.is_some() && consume.max_deliver.unwrap_or(0) <= 0 {
+            errs.push(format!(
+                "{scope}: needs.jetstream.consume[{idx}].deadLetter requires maxDeliver > 0 — the dead-letter queue collects the advisory the server publishes when redelivery is EXHAUSTED, so with no ceiling it would stay empty forever"
             ));
         }
     }
@@ -2591,6 +2764,211 @@ fn is_env_var_name(s: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── 2.28 JetStream tuning + DLQ (ADR 0065 §2) ─────────────────────
+
+    /// Build a spec with one jetstream stream carrying `extra` JSON fields.
+    fn js_stream_spec(extra: serde_json::Value) -> Value {
+        let mut stream = json!({"name": "orders", "subjects": ["app.orders.>"], "maxBytes": "1Gi"});
+        for (k, v) in extra.as_object().unwrap() {
+            stream[k] = v.clone();
+        }
+        json!({"base": {"image": "img", "expose": {"port": 8080},
+            "needs": {"jetstream": {"streams": [stream]}}}})
+    }
+
+    /// Build a spec with one consume entry carrying `extra` JSON fields.
+    fn js_consume_spec(extra: serde_json::Value) -> Value {
+        let mut c = json!({"stream": "orders", "durable": "reader"});
+        for (k, v) in extra.as_object().unwrap() {
+            c[k] = v.clone();
+        }
+        json!({"base": {"image": "img", "expose": {"port": 8080},
+            "needs": {"jetstream": {
+                "streams": [{"name": "orders", "subjects": ["app.orders.>"], "maxBytes": "1Gi"}],
+                "consume": [c]}}}})
+    }
+
+    fn msgs(errs: &[ValidationError]) -> String {
+        errs.iter()
+            .map(|e| e.message.clone())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    #[test]
+    fn every_isolation_breaking_stream_field_is_rejected_rather_than_pruned() {
+        // A structural schema prunes an unknown field BEFORE the webhook
+        // runs, so these are declared in the type precisely so that this
+        // rejection is reachable. If the type ever drops one, it starts
+        // vanishing silently and the manifest appears to work.
+        for field in [
+            "sources",
+            "mirror",
+            "republish",
+            "subjectTransform",
+            "placement",
+        ] {
+            let payload = if field == "sources" {
+                json!({field: [{"name": "other"}]})
+            } else {
+                json!({field: {"name": "other"}})
+            };
+            let errs = validate_application_spec(&js_stream_spec(payload));
+            assert!(
+                msgs(&errs).contains(field),
+                "{field} was accepted: {errs:?}"
+            );
+        }
+        let errs = validate_application_spec(&js_stream_spec(json!({"replicas": 3})));
+        assert!(msgs(&errs).contains("replicas"), "{errs:?}");
+    }
+
+    #[test]
+    fn the_whole_push_surface_is_rejected_on_a_consumer() {
+        // Push delivery is performed by the server, outside the
+        // application's publish permissions — a write channel into a
+        // neighbour's prefix.
+        for (field, payload) in [
+            ("deliverSubject", json!({"deliverSubject": "victim.inbox"})),
+            ("deliverGroup", json!({"deliverGroup": "g"})),
+            ("flowControl", json!({"flowControl": true})),
+            ("heartbeatInterval", json!({"heartbeatInterval": "5s"})),
+            ("replicas", json!({"replicas": 3})),
+        ] {
+            let errs = validate_application_spec(&js_consume_spec(payload));
+            assert!(
+                msgs(&errs).contains(field),
+                "{field} was accepted: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn discard_per_subject_needs_discard_new_and_a_per_subject_ceiling() {
+        // Both halves are server rules (10052), measured on 2.14.3. Without
+        // them NACK surfaces a server error with no field name attached.
+        let errs = validate_application_spec(&js_stream_spec(
+            json!({"discardPerSubject": true, "discard": "old", "maxMsgsPerSubject": 100}),
+        ));
+        assert!(msgs(&errs).contains("discard"), "{errs:?}");
+        let errs = validate_application_spec(&js_stream_spec(
+            json!({"discardPerSubject": true, "discard": "new"}),
+        ));
+        assert!(msgs(&errs).contains("maxMsgsPerSubject"), "{errs:?}");
+        // Both satisfied: accepted.
+        let errs = validate_application_spec(&js_stream_spec(
+            json!({"discardPerSubject": true, "discard": "new", "maxMsgsPerSubject": 100}),
+        ));
+        assert!(
+            !msgs(&errs).contains("discardPerSubject"),
+            "a valid combination was rejected: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn the_two_filter_forms_are_mutually_exclusive() {
+        let errs = validate_application_spec(&js_consume_spec(
+            json!({"filterSubject": "a.b", "filterSubjects": ["a.c"]}),
+        ));
+        assert!(msgs(&errs).contains("filterSubject"), "{errs:?}");
+    }
+
+    #[test]
+    fn a_start_position_requires_its_own_deliver_policy() {
+        // Rejected rather than ignored: an ignored start position is a
+        // consumer that silently reads from the wrong place.
+        let errs = validate_application_spec(&js_consume_spec(json!({"optStartSeq": 42})));
+        assert!(msgs(&errs).contains("optStartSeq"), "{errs:?}");
+        let errs = validate_application_spec(&js_consume_spec(
+            json!({"optStartSeq": 42, "deliverPolicy": "byStartSequence"}),
+        ));
+        assert!(!msgs(&errs).contains("optStartSeq"), "{errs:?}");
+        let errs = validate_application_spec(&js_consume_spec(
+            json!({"optStartTime": "2026-01-01T00:00:00Z", "deliverPolicy": "byStartSequence"}),
+        ));
+        assert!(msgs(&errs).contains("optStartTime"), "{errs:?}");
+    }
+
+    #[test]
+    fn max_deliver_must_exceed_the_backoff_length_strictly() {
+        // Measured: `max deliver is required to be > length of backoff
+        // values` (10116). The equal case is the one a loose reading of the
+        // rule would have allowed.
+        let errs = validate_application_spec(&js_consume_spec(
+            json!({"maxDeliver": 2, "backoff": ["1s", "2s"]}),
+        ));
+        assert!(
+            msgs(&errs).contains("backoff"),
+            "equal was accepted: {errs:?}"
+        );
+        let errs = validate_application_spec(&js_consume_spec(
+            json!({"maxDeliver": 3, "backoff": ["1s", "2s"]}),
+        ));
+        assert!(!msgs(&errs).contains("backoff"), "{errs:?}");
+    }
+
+    #[test]
+    fn a_dead_letter_without_a_delivery_ceiling_is_rejected() {
+        // Without maxDeliver the advisory never fires and the DLQ is
+        // permanently empty — a manifest that looks like it works and says
+        // nothing.
+        let errs = validate_application_spec(&js_consume_spec(
+            json!({"deadLetter": {"stream": "dlq", "maxBytes": "64Mi"}}),
+        ));
+        assert!(msgs(&errs).contains("maxDeliver"), "{errs:?}");
+        let errs = validate_application_spec(&js_consume_spec(
+            json!({"maxDeliver": 5, "deadLetter": {"stream": "dlq", "maxBytes": "64Mi"}}),
+        ));
+        assert!(
+            !msgs(&errs).contains("deadLetter"),
+            "a valid DLQ was rejected: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_dead_letter_stream_name_shares_the_declared_stream_namespace() {
+        // It composes through the same nats_stream_name(app, name), so it
+        // must be a DNS-1123 label and must not collide with a declared
+        // stream or another DLQ.
+        let errs = validate_application_spec(&js_consume_spec(
+            json!({"maxDeliver": 5, "deadLetter": {"stream": "orders", "maxBytes": "64Mi"}}),
+        ));
+        assert!(
+            msgs(&errs).contains("orders"),
+            "a DLQ colliding with a declared stream was accepted: {errs:?}"
+        );
+        let errs = validate_application_spec(&js_consume_spec(
+            json!({"maxDeliver": 5, "deadLetter": {"stream": "bad_name", "maxBytes": "64Mi"}}),
+        ));
+        assert!(msgs(&errs).contains("DNS-1123"), "{errs:?}");
+        let errs = validate_application_spec(&js_consume_spec(
+            json!({"maxDeliver": 5, "deadLetter": {"stream": "dlq", "maxBytes": ""}}),
+        ));
+        assert!(msgs(&errs).contains("maxBytes"), "{errs:?}");
+    }
+
+    #[test]
+    fn a_durable_may_not_collide_with_a_dead_letter_stream_declared_later() {
+        // The durable-vs-stream collision check is what makes the deny
+        // vector's position patterns sound. A DLQ declared in a LATER
+        // consume entry is still a stream of this application, so the check
+        // must see it — which means collecting DLQ names before the durable
+        // loop runs, not during it.
+        let spec = json!({"base": {"image": "img", "expose": {"port": 8080},
+        "needs": {"jetstream": {
+            "streams": [{"name": "orders", "subjects": ["app.orders.>"], "maxBytes": "1Gi"}],
+            "consume": [
+                {"stream": "orders", "durable": "dlq"},
+                {"stream": "orders", "durable": "other", "maxDeliver": 5,
+                 "deadLetter": {"stream": "dlq", "maxBytes": "64Mi"}}
+            ]}}}});
+        let errs = validate_application_spec(&spec);
+        assert!(
+            msgs(&errs).contains("dlq"),
+            "the durable/DLQ collision was missed: {errs:?}"
+        );
+    }
 
     // ── 2.28 probes (ADR 0065 §1.5) ───────────────────────────────────
 
