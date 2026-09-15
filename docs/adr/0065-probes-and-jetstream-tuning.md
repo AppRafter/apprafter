@@ -13,10 +13,13 @@ list or deny vector.
 
 The provider field sets quoted in §2 were read out of the pinned `nack`
 0.35.0 chart's CRDs (`jetstream.nats.io/v1beta2`) on 2026-09-15, not
-recalled. The facts §2.4 depends on are **owed measurements**, listed in §5,
-and are to be taken on nats-server v2.14.3 — the image
+recalled. The server-behaviour facts §2 depends on were **measured** the same
+day on nats-server v2.14.3 — the image
 `platform-stack/cue/component_nats.cue` pins deliberately below its own
-chart's default.
+chart's default — and are recorded in
+`docs/measurements/2.28-jetstream-2026-09-15.md`. §5 lists what each one
+settled, including the one that came back opposite to the expectation, and
+the single measurement still owed.
 
 ## Context
 
@@ -218,8 +221,15 @@ neighbour's subjects it deletes a neighbour's data, and is ADR 0052 trigger
 Cross-field rules, webhook-enforced: `filterSubject` and `filterSubjects`
 are mutually exclusive; `optStartSeq` requires `deliverPolicy:
 by_start_sequence` and `optStartTime` requires `by_start_time`, either one
-under any other policy being rejected rather than ignored; and `backoff`'s
-length is bounded by `maxDeliver` per §5(c).
+under any other policy being rejected rather than ignored; and
+**`maxDeliver > len(backoff)`, strictly** — measured, error 10116 `max
+deliver is required to be > length of backoff values`. An earlier draft of
+this paragraph said only that the length was "bounded by `maxDeliver`",
+which would have admitted the equal case the server refuses.
+
+`discardPerSubject` carries its own measured rule: it requires `discard:
+new` **and** `maxMsgsPerSubject > 0` (error 10052), so the webhook enforces
+both rather than letting NACK surface a server error with no field name.
 
 A filter only ever narrows what a durable sees, including on a foreign
 stream, so no filter field touches the permission model.
@@ -290,9 +300,18 @@ its own it may subscribe to. The application never subscribes to the
 advisory subject directly, and could not.
 
 Recovering the original body is `$JS.API.STREAM.MSG.GET` by `stream_seq`,
-already granted, **if the message is still in the stream**. Under
-`retention: workqueue` it may not be — §5(b) settles it, and the answer
-becomes a documented limitation rather than a feature.
+already granted — **and it works, including under `retention: workqueue`**.
+That was measured rather than assumed, and it came back the opposite way
+from the expectation: a workqueue message that exhausts redelivery is *not*
+removed. It stays at its sequence, the body is fetchable, and the consumer
+moves on to the next message rather than blocking behind it. So the DLQ
+contract is "metadata in the DLQ, body one fetch away", not "metadata only".
+
+The same measurement produced an operational fact that belongs in the
+documentation rather than in a surprise: because an exhausted message is
+never acknowledged, nothing removes it until `maxAge` or `maxBytes` evicts
+it. A workqueue accumulates its poison messages, and its quota has to
+tolerate that.
 
 `deadLetter` without `maxDeliver > 0` on the same entry is **rejected**:
 without a delivery ceiling the advisory never fires and the DLQ is
@@ -378,24 +397,33 @@ Andrey Ryahovskiy.
   point the advisory composition becomes an implementation detail to
   replace rather than a contract.
 
-## 5. Measurements owed before implementation
+## 5. Measurements
 
-Each is a claim this record depends on that no gate in this repository
-would catch if it were wrong. Recorded under `docs/measurements/`.
+Each was a claim this record depends on that no gate in this repository would
+catch if it were wrong. **Four of the five were taken on 2026-09-15** and are
+recorded in `docs/measurements/2.28-jetstream-2026-09-15.md`; the fifth stays
+owed because it cannot be answered honestly on a laptop.
 
-- **(a)** The exact advisory subject for exhausted `maxDeliver` and its
-  payload fields, on nats-server v2.14.3. §2.4's DLQ subject is composed
-  from it.
-- **(b)** Whether a message that exhausts `maxDeliver` under `retention:
-  workqueue` remains fetchable by `STREAM.MSG.GET` at the advised sequence.
-- **(c)** The server's actual constraint between `backoff` length and
-  `maxDeliver`, before it is written as a webhook rule.
-- **(d)** Whether a 1-second probe timeout produces false failures on a
-  Tier-1 node under load.
-- **(e)** Which of `compression`, `consumerLimits`, `discardPerSubject` and
-  `allowDirect` the pinned server honours. The NACK CRD carrying a field
-  does not mean the server implements it, and a field that silently does
-  nothing is worse than an absent one.
+- **(a) Settled.** The advisory subject is
+  `$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.<stream>.<consumer>`, and its
+  payload carries `stream` / `consumer` / `stream_seq` / `deliveries` — no
+  body, and not even the original message's subject.
+- **(b) Settled, opposite to the expectation.** A `workqueue` message that
+  exhausts `maxDeliver` is NOT removed: it stays at its sequence, the body is
+  fetchable by `STREAM.MSG.GET`, and the consumer proceeds to the next
+  message. §2.4 is written against that. The corollary — nothing ever removes
+  it, so a workqueue accumulates poison messages until `maxAge`/`maxBytes` —
+  is documentation, not a defect.
+- **(c) Settled.** `maxDeliver > len(backoff)`, strictly (error 10116).
+- **(d) Still owed.** Whether a 1-second probe timeout produces false failures
+  on a Tier-1 node under load — §1.2's single deviation from the Kubernetes
+  defaults. It needs a loaded Tier-1 node, so it is left open rather than
+  answered badly.
+- **(e) Settled.** `compression: s2`, `consumerLimits`, `discardPerSubject`
+  and `allowDirect` are all honoured and stored by 2.14.3.
+  `discardPerSubject` additionally requires `discard: new` and
+  `maxMsgsPerSubject > 0` (error 10052) — a cross-field rule now mirrored in
+  the webhook.
 
 ## References
 
