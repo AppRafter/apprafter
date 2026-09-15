@@ -206,4 +206,87 @@ else
     exit 1
 fi
 
+# 2.28 / ADR 0065 §1. `spec.base.probes` is FULLY STRUCTURAL, so an
+# undeclared key is PRUNED: the apiserver answers 200, stores what it knows
+# and silently drops the rest. For a probe that failure is the expensive kind
+# — the pod comes up with no health check at all while `kubectl apply` said
+# nothing — so assert the fields survive a round trip rather than trusting
+# that crd-check's field comparison implies the apiserver stores them.
+#
+# The same block also proves the `^/` pattern is LIVE. Both halves are needed:
+# a round-trip test alone passes against a CRD whose pattern was dropped, and
+# a pattern test alone passes against one that prunes every probe field.
+echo "==> regression: Application probes must round-trip and enforce ^/ (2.28)"
+kubectl --context "$CTX" create namespace crd-validate >/dev/null 2>&1 || true
+cat >/tmp/crd-validate-probes.yaml <<'YAML'
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: crd-validate-probes
+  namespace: crd-validate
+spec:
+  base:
+    image: example.com/app:latest
+    expose:
+      port: 8080
+    probes:
+      readiness:
+        path: /healthz
+        periodSeconds: 3
+      liveness:
+        path: /livez
+        scheme: https
+        headers:
+          X-Probe: apprafter
+      startup:
+        port: 8080
+        failureThreshold: 60
+YAML
+if ! kubectl --context "$CTX" apply -f /tmp/crd-validate-probes.yaml \
+    >/dev/null 2>/tmp/crd-probe-err.txt; then
+    echo "==> REGRESSION: apiserver REJECTED a valid probes block" >&2
+    cat /tmp/crd-probe-err.txt >&2
+    exit 1
+fi
+_probe_path=$(kubectl --context "$CTX" -n crd-validate get application crd-validate-probes \
+    -o jsonpath='{.spec.base.probes.readiness.path}' 2>/dev/null || true)
+_probe_period=$(kubectl --context "$CTX" -n crd-validate get application crd-validate-probes \
+    -o jsonpath='{.spec.base.probes.readiness.periodSeconds}' 2>/dev/null || true)
+_probe_header=$(kubectl --context "$CTX" -n crd-validate get application crd-validate-probes \
+    -o jsonpath='{.spec.base.probes.liveness.headers.X-Probe}' 2>/dev/null || true)
+if [ "$_probe_path" = "/healthz" ] && [ "$_probe_period" = "3" ] && [ "$_probe_header" = "apprafter" ]; then
+    echo "    OK: probe path, timing and headers stored (not pruned)"
+else
+    echo "==> REGRESSION: a probe field was PRUNED — read back path='${_probe_path}'," >&2
+    echo "    periodSeconds='${_probe_period}', header='${_probe_header}'." >&2
+    echo "    The apply succeeded and the field vanished, which is how a workload" >&2
+    echo "    comes up unchecked while its manifest says otherwise." >&2
+    exit 1
+fi
+
+if kubectl --context "$CTX" apply --dry-run=server -f - >/dev/null 2>/tmp/crd-probe-bad.txt <<'YAML'
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata:
+  name: crd-validate-probes-bad
+  namespace: crd-validate
+spec:
+  base:
+    image: example.com/app:latest
+    expose:
+      port: 8080
+    probes:
+      readiness:
+        path: healthz
+YAML
+then
+    echo "==> REGRESSION: the apiserver ACCEPTED a probe path with no leading '/'." >&2
+    echo "    The ^/ pattern in schemas/crdmeta/meta.cue is not reaching the CRD," >&2
+    echo "    so the only thing rejecting it is the webhook — and a cluster whose" >&2
+    echo "    webhook is unavailable would take it." >&2
+    exit 1
+else
+    echo "    OK: a probe path without a leading '/' is rejected by the apiserver"
+fi
+
 echo "==> CRD apiserver validation PASSED (all CRDs accepted + Established)"
