@@ -107,6 +107,7 @@ Usage: apprafter app logs [OPTIONS] <NAME>
 | `--follow`, `-f` | flag | — | no | Stream new log lines as they appear (`kubectl logs -f`) |
 | `--pod` | — | — | no | Narrow to a single pod instead of all matching the app's destination namespace |
 | `--tail` | — | `-1` | no | Show only the last `N` lines per pod / container (`kubectl logs --tail`). `-1` means no limit (`kubectl`'s default) |
+| `--workload` | `<NAME>` | — | no | Stream only this workload of the application instead of all of them. A manifest package may hold several; the positional argument is always the application (the registration), never a workload — this is how you address one inside it. ADR 0062 |
 
 Examples:
 
@@ -133,6 +134,7 @@ Usage: apprafter app open [OPTIONS] <NAME>
 | `--env` | — | — | no | Target a specific environment's deployment (`<name>-<env>`). Optional — a single-env app resolves without it; needed only to disambiguate when the app is deployed to several environments |
 | `--no-browser` | flag | — | no | Skip opening the browser; just print the URL and block on the port-forward. Useful for CI / scripts that want to forward in the background |
 | `--port` | — | — | no | Local port to bind. Defaults to 8080; if busy, the command probes 8081…8090 before giving up |
+| `--workload` | `<NAME>` | — | no | Forward this workload of the application. A manifest package may hold several; the positional argument is always the application (the registration), never a workload — this is how you address one inside it. ADR 0062. Without it, an application deploying more than one workload prompts for the choice |
 
 Examples:
 
@@ -184,6 +186,7 @@ Usage: apprafter app rollback [OPTIONS] <NAME>
 | --- | --- | --- | --- | --- |
 | `--env` | — | — | no | Select the env-deployment `<name>-<env>`. Omit for a base/single-env app; if the app is deployed per-env and `--env` is omitted, the command errors with the available environments |
 | `--to` | `<revision|sha256:digest>` | — | no | What to roll back to. `sha256:<64 hex>` is an IMAGE digest and pins the app to it (it stops following its tag until `apprafter app unpin`); anything else is a Git revision (commit SHA / tag / branch). Without the flag: the previously resolved image digest when the app has one, else the previous `status.history` entry |
+| `--workload` | `<NAME>` | — | no | Pin this workload of the application. A manifest package may hold several; the positional argument is always the application (the registration), never a workload — this is how you address one inside it. ADR 0062. Required when the application deploys more than one workload. It selects an IMAGE pin only: any rollback that resolves to a Git revision moves EVERY workload of the application, so naming one is refused rather than silently ignored — that applies both to `--to <revision>` and to a bare `rollback` whose workload has no image to roll back to |
 | `--yes` | flag | — | no | Skip confirmation prompt. Required in non-interactive shells |
 
 Examples:
@@ -257,6 +260,7 @@ Usage: apprafter app unpin [OPTIONS] <NAME>
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--env` | — | — | no | Select the env-deployment `<name>-<env>`. Omit for a base/single-env app; if the app is deployed per-env and `--env` is omitted, the command errors with the available environments |
+| `--workload` | `<NAME>` | — | no | Un-pin this workload of the application. A manifest package may hold several; the positional argument is always the application (the registration), never a workload — this is how you address one inside it. ADR 0062. Required when the application deploys more than one workload: a pin lives on one workload's CR, and this command will not choose which |
 | `--yes` | flag | — | no | Skip confirmation prompt. Required in non-interactive shells |
 
 Examples:

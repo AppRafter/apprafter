@@ -218,29 +218,29 @@ pub(crate) fn problem_heading(checked: usize, total: usize, cap: usize) -> Strin
 ///
 /// Takes BOTH lists because the identity a reader can act on lives on the Argo
 /// CD side. The join is the one `app status` already performs, run backwards:
-/// `find_apprafter_app_name` reads the inner CR's name out of an Argo
-/// Application's `status.resources[]`, and `spec.destination.namespace` gives
-/// the namespace — so `(namespace, cr-name)` maps to the logical name
-/// `apprafter.io/application` and the environment.
+/// `apprafter_app_refs` reads EVERY workload out of an Argo Application's
+/// `status.resources[]`, each with its own namespace — so `(namespace,
+/// cr-name)` maps to the logical name `apprafter.io/application` and the
+/// environment.
 ///
-/// An application with problems that does NOT resolve through that join is
-/// still listed, marked unresolvable. Dropping it would hide exactly the
-/// applications most likely to be broken, and `app status` cannot render those
-/// either — saying so is the honest output.
+/// ADR 0062: a registration is a bundle of 1..N workloads. Until 2.27b this
+/// indexed `find_apprafter_app_name` — the FIRST workload only — so a bundle's
+/// second and later workloads never resolved, and a broken sibling rendered as
+/// `shop/worker — logical name unresolved`. That suffix was true when it was
+/// written and stopped being true the moment `app status <registration>`
+/// learned to find every workload; a roll-up whose job is to name what is
+/// burning must not disclaim the name of the thing that is burning.
+///
+/// An application with problems that does NOT resolve through the join is
+/// still listed, marked unclaimed. Dropping it would hide exactly the
+/// applications most likely to be broken, and no positional argument reaches
+/// those — saying so is the honest output.
 pub(crate) fn problem_app_rows(crs: &[&Value], argo: &[Value], now: &DateTime<Utc>) -> Vec<String> {
-    // (namespace, inner CR name) -> display identity.
+    // (namespace, inner CR name) -> display identity, for EVERY workload of
+    // every registration.
     let mut index: std::collections::HashMap<(String, String), String> =
         std::collections::HashMap::new();
     for a in argo {
-        let Some(ns) = a
-            .pointer("/spec/destination/namespace")
-            .and_then(Value::as_str)
-        else {
-            continue;
-        };
-        let Some(inner) = crate::commands::app_open::find_apprafter_app_name(a) else {
-            continue;
-        };
         let logical = a
             .pointer("/metadata/labels/apprafter.io~1application")
             .and_then(Value::as_str)
@@ -253,7 +253,16 @@ pub(crate) fn problem_app_rows(crs: &[&Value], argo: &[Value], now: &DateTime<Ut
             Some(e) if !e.is_empty() => format!("{logical} ({e})"),
             _ => logical.to_string(),
         };
-        index.insert((ns.to_string(), inner), display);
+        for r in crate::commands::app_open::apprafter_app_refs(a) {
+            // `CrRef::namespace` is `None` when neither the entry nor the
+            // registration names one. That cannot be keyed, so it cannot be
+            // matched — and must not be defaulted, which would file the
+            // workload under some other namespace's identity. It falls
+            // through to the unclaimed row below, which is the honest
+            // answer: we cannot prove which CR it is.
+            let Some(ns) = r.namespace else { continue };
+            index.insert((ns, r.name), display.clone());
+        }
     }
 
     let mut rows: Vec<(i64, String)> = Vec::new();
@@ -283,12 +292,19 @@ pub(crate) fn problem_app_rows(crs: &[&Value], argo: &[Value], now: &DateTime<Ut
             // Deliberately not "not registered with Argo CD": an application
             // that IS registered but has not synced yet has an empty
             // `status.resources[]`, so the join misses it too. Say what is
-            // actually known — the name could not be resolved — rather than
+            // actually known — no registration claims it — rather than
             // asserting a cause that may be false.
+            //
+            // The old wording, "`app status` may not find it under this
+            // name", was a statement about the COMMAND and it went stale:
+            // since 2.27b `app status <registration>` finds every workload
+            // of a bundle, so for the far commoner case that reached here
+            // before — a bundle's second workload — it was simply wrong.
+            // What remains true of the rows that still reach here is that
+            // nothing claims them, and no positional argument names them.
             None => (
                 format!("{ns}/{name}"),
-                " — logical name unresolved; `app status` may not find it under this name"
-                    .to_string(),
+                " — claimed by no registered application (it may not have synced yet)".to_string(),
             ),
         };
         // The newest surviving entry carries the row; the rest are counted.
@@ -445,7 +461,64 @@ mod tests {
         let rows = problem_app_rows(&[&cr], &[], &t("2026-09-01T10:06:00+00:00"));
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert!(rows[0].starts_with("demo/orphan"), "{rows:?}");
-        assert!(rows[0].contains("logical name unresolved"), "{rows:?}");
+        assert!(
+            rows[0].contains("claimed by no registered application"),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn every_workload_of_a_bundle_resolves_to_the_application_that_deploys_it() {
+        // ADR 0062. The index was built from `find_apprafter_app_name` —
+        // the FIRST workload of a registration — so a bundle's second and
+        // later workloads fell to the unclaimed row and rendered as
+        // `shop/worker — logical name unresolved; 'app status' may not find
+        // it under this name`. Every clause of that was wrong by 2.27b: the
+        // name resolves, and `app status shop` does find it.
+        //
+        // The worker is the one carrying problems here precisely because
+        // that is the row a reader is being asked to act on.
+        let api = cr_with_problems(
+            "shop",
+            "api",
+            &["ReconcileFailed"],
+            "2026-09-01T10:05:00+00:00",
+        );
+        let worker = cr_with_problems(
+            "shop",
+            "worker",
+            &["ClaimPruneFailed"],
+            "2026-09-01T10:05:00+00:00",
+        );
+        let bundle = json!({
+            "metadata": {
+                "name": "shop-prod",
+                "labels": { "apprafter.io/application": "shop",
+                            "apprafter.io/environment": "prod" }
+            },
+            "spec": { "destination": { "namespace": "shop" } },
+            "status": { "resources": [
+                { "group": "apprafter.io", "kind": "Application",
+                  "name": "api", "namespace": "shop", "version": "v1alpha1" },
+                { "group": "apprafter.io", "kind": "Application",
+                  "name": "worker", "namespace": "shop", "version": "v1alpha1" }
+            ]}
+        });
+
+        let rows = problem_app_rows(
+            &[&api, &worker],
+            std::slice::from_ref(&bundle),
+            &t("2026-09-01T10:06:00+00:00"),
+        );
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        for row in &rows {
+            assert!(row.starts_with("shop (prod)"), "{rows:?}");
+            assert!(
+                !row.contains("claimed by no registered application"),
+                "{rows:?}"
+            );
+            assert!(!row.contains("unresolved"), "{rows:?}");
+        }
     }
 
     /// A CR carrying two entries with DIFFERENT `lastSeen`, in the order the

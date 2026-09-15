@@ -346,6 +346,18 @@
           "required": false,
           "possible_values": [],
           "help": "Show only the last `N` lines per pod / container (`kubectl logs --tail`). `-1` means no limit (`kubectl`'s default)"
+        },
+        {
+          "id": "workload",
+          "long": "workload",
+          "short": null,
+          "takes_value": true,
+          "value_name": "NAME",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Stream only this workload of the application instead of all of them. A manifest package may hold several; the positional argument is always the application (the registration), never a workload — this is how you address one inside it. ADR 0062"
         }
       ],
       "positionals": [
@@ -421,6 +433,18 @@
           "required": false,
           "possible_values": [],
           "help": "Local port to bind. Defaults to 8080; if busy, the command probes 8081…8090 before giving up"
+        },
+        {
+          "id": "workload",
+          "long": "workload",
+          "short": null,
+          "takes_value": true,
+          "value_name": "NAME",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Forward this workload of the application. A manifest package may hold several; the positional argument is always the application (the registration), never a workload — this is how you address one inside it. ADR 0062. Without it, an application deploying more than one workload prompts for the choice"
         }
       ],
       "positionals": [
@@ -538,6 +562,18 @@
           "required": false,
           "possible_values": [],
           "help": "What to roll back to. `sha256:<64 hex>` is an IMAGE digest and pins the app to it (it stops following its tag until `apprafter app unpin`); anything else is a Git revision (commit SHA / tag / branch). Without the flag: the previously resolved image digest when the app has one, else the previous `status.history` entry"
+        },
+        {
+          "id": "workload",
+          "long": "workload",
+          "short": null,
+          "takes_value": true,
+          "value_name": "NAME",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Pin this workload of the application. A manifest package may hold several; the positional argument is always the application (the registration), never a workload — this is how you address one inside it. ADR 0062. Required when the application deploys more than one workload. It selects an IMAGE pin only: any rollback that resolves to a Git revision moves EVERY workload of the application, so naming one is refused rather than silently ignored — that applies both to `--to <revision>` and to a bare `rollback` whose workload has no image to roll back to"
         },
         {
           "id": "yes",
@@ -730,6 +766,18 @@
           "required": false,
           "possible_values": [],
           "help": "Select the env-deployment `<name>-<env>`. Omit for a base/single-env app; if the app is deployed per-env and `--env` is omitted, the command errors with the available environments"
+        },
+        {
+          "id": "workload",
+          "long": "workload",
+          "short": null,
+          "takes_value": true,
+          "value_name": "NAME",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Un-pin this workload of the application. A manifest package may hold several; the positional argument is always the application (the registration), never a workload — this is how you address one inside it. ADR 0062. Required when the application deploys more than one workload: a pin lives on one workload's CR, and this command will not choose which"
         },
         {
           "id": "yes",

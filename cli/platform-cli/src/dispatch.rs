@@ -140,18 +140,29 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
                 tail,
                 container,
                 pod,
-            } => commands::app::logs(&name, env, follow, tail, container, pod)?,
-            AppCommand::Rollback { name, env, to, yes } => {
-                commands::app::rollback(&name, env, to, yes)?
-            }
-            AppCommand::Unpin { name, env, yes } => commands::app::unpin(&name, env, yes)?,
+                workload,
+            } => commands::app::logs(&name, env, follow, tail, container, pod, workload)?,
+            AppCommand::Rollback {
+                name,
+                env,
+                to,
+                yes,
+                workload,
+            } => commands::app::rollback(&name, env, to, yes, workload)?,
+            AppCommand::Unpin {
+                name,
+                env,
+                yes,
+                workload,
+            } => commands::app::unpin(&name, env, yes, workload)?,
             AppCommand::Open {
                 name,
                 env,
                 port,
                 container_port,
                 no_browser,
-            } => commands::app_open::open(&name, env, port, container_port, no_browser)?,
+                workload,
+            } => commands::app_open::open(&name, env, port, container_port, no_browser, workload)?,
             AppCommand::Scaffold {
                 runtime,
                 name,

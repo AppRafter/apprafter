@@ -1458,6 +1458,287 @@ pub(crate) fn status_render_plan(refs: &[CrRef], workload: Option<&str>) -> Stat
     }
 }
 
+/// What a verb does with a bundle of several workloads when the caller
+/// named none (ADR 0062 §Write surfaces).
+///
+/// The three arms are the whole of this subphase. They are carried as
+/// one enum, and every rule below is table-tested across all three,
+/// because what has to stay true is not any single verb's behaviour but
+/// the DIFFERENCE between them — a difference that would otherwise drift
+/// one verb at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkloadDemand {
+    /// `app rollback --to <digest>` and `app unpin` — a write against
+    /// ONE workload's CR. Refuses ambiguity: picking the first is how a
+    /// pin lands on a workload nobody named, and nothing downstream can
+    /// tell that from a pin the operator meant.
+    Write,
+    /// `app open` — one workload's Service. Port-forwarding an arbitrary
+    /// one is wrong too (it puts a different application on
+    /// localhost:8080 than the reader named), just not destructive, so
+    /// this asks instead of refusing.
+    ReadOne,
+    /// `app logs` — every workload at once.
+    ///
+    /// Defensible for this verb ALONE. `kubectl logs -l` is already a
+    /// multiplexer over pods; before 2.27 it just happened to be scoped
+    /// to one workload's pod set by the first-wins shim. A bundle is
+    /// deployed, synced and removed together, so its workloads' lines
+    /// interleave into one story — the API 500 and the worker exception
+    /// that caused it. Showing more than asked costs a reader nothing
+    /// they cannot filter; the other three verbs each ACT on their
+    /// resolution, so for them the same generosity is a wrong write or a
+    /// wrong forward.
+    ReadEvery,
+}
+
+/// A workload that can be handed to `kubectl -n`.
+///
+/// `namespace` is a plain `String`, not [`CrRef`]'s `Option<String>`,
+/// and that is the point: the only constructor is [`workload_for`],
+/// which answers [`WorkloadChoice::Unplaceable`] rather than defaulting
+/// an unknown namespace. `kubectl -n ""` does not error — it falls
+/// through to the kubeconfig's default namespace — so a defaulted write
+/// would land, successfully and silently, on whatever object shares the
+/// name there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlacedWorkload {
+    pub name: String,
+    pub namespace: String,
+}
+
+/// Which workload(s) of a bundle a verb acts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorkloadChoice {
+    /// Act on exactly this one — the sole workload of a bundle, or the
+    /// one `--workload` named.
+    One(PlacedWorkload),
+    /// Act on all of these at once. Only [`WorkloadDemand::ReadEvery`]
+    /// produces it, and it always carries 2+: at N = 1 the answer is
+    /// [`WorkloadChoice::One`], so a caller cannot accidentally render
+    /// the multi-workload shape for today's fleet.
+    Every(Vec<PlacedWorkload>),
+    /// N > 1, no `--workload`, and the verb WRITES. Carries every
+    /// candidate, because a refusal that does not name them leaves the
+    /// reader with no next command — see [`ambiguous_write_lines`].
+    Refuse(Vec<String>),
+    /// N > 1, no `--workload`, and the verb reads ONE. Carries every
+    /// candidate for the same reason; the caller prompts with them in a
+    /// TTY and prints them otherwise.
+    Ask(Vec<String>),
+    /// `--workload` named something this bundle does not deploy. The
+    /// likeliest cause is a typo and the candidate list is what corrects
+    /// it — rendered by [`unknown_workload_message`], shared verbatim
+    /// with `app status`.
+    Unknown {
+        asked: String,
+        available: Vec<String>,
+    },
+    /// The registration tracks no workload at all — `status.resources[]`
+    /// is empty until Argo CD's first sync. NOT an error by itself:
+    /// `logs` falls back to the raw-YAML selector and `rollback` falls
+    /// through to the Git-revision branch, both exactly as before 2.27.
+    NoWorkloads,
+    /// The chosen workload cannot be placed in a namespace. A refusal
+    /// for every verb, including the multiplexing read: a stream missing
+    /// one workload reads exactly like a workload that logged nothing.
+    Unplaceable(String),
+}
+
+/// Pure — the addressing decision `app logs`, `app open`, `app rollback`
+/// and `app unpin` share. No IO, no clock.
+///
+/// ADR 0062 §Addressing: the positional argument is ALWAYS the
+/// registration, and `selector` — `--workload <name>` — is the only way
+/// to address one workload inside it, a disambiguator in the same sense
+/// as `--env`. `refs` is what that registration deploys, in Argo CD's
+/// own order.
+///
+/// Rule order, and why:
+///
+/// 1. **Nothing synced beats everything else.** With no workloads there
+///    is neither a target to resolve nor a set of names to correct
+///    `--workload` against, and "there is no workload `api`" would be a
+///    narrower and wronger claim than "nothing has synced yet". Same
+///    first rule as [`status_render_plan`].
+/// 2. **An explicit selector is checked even at N = 1.** Accepting any
+///    name when there is only one workload would let a typo act on a
+///    different object than the reader asked for — and at N = 1 the
+///    application name and the workload name are usually the same
+///    string, so the typo is both easy to make and invisible.
+/// 3. **N = 1 resolves outright, for every demand.** That is today's
+///    entire fleet, and it must not grow a prompt, a refusal or a
+///    multiplexed selector.
+/// 4. **Only then does the demand matter** — and it is the only place it
+///    matters, which is what keeps the read/write asymmetry to one
+///    `match` instead of scattering it across four commands.
+pub(crate) fn workload_for(
+    refs: &[CrRef],
+    selector: Option<&str>,
+    demand: WorkloadDemand,
+) -> WorkloadChoice {
+    if refs.is_empty() {
+        return WorkloadChoice::NoWorkloads;
+    }
+    if let Some(asked) = selector {
+        return match refs.iter().find(|r| r.name == asked) {
+            Some(r) => place(r),
+            None => WorkloadChoice::Unknown {
+                asked: asked.to_string(),
+                available: refs.iter().map(|r| r.name.clone()).collect(),
+            },
+        };
+    }
+    if refs.len() == 1 {
+        return place(&refs[0]);
+    }
+    let names: Vec<String> = refs.iter().map(|r| r.name.clone()).collect();
+    match demand {
+        WorkloadDemand::Write => WorkloadChoice::Refuse(names),
+        WorkloadDemand::ReadOne => WorkloadChoice::Ask(names),
+        WorkloadDemand::ReadEvery => {
+            let mut placed = Vec::with_capacity(refs.len());
+            for r in refs {
+                match r.namespace.as_deref() {
+                    Some(ns) => placed.push(PlacedWorkload {
+                        name: r.name.clone(),
+                        namespace: ns.to_string(),
+                    }),
+                    None => return WorkloadChoice::Unplaceable(r.name.clone()),
+                }
+            }
+            WorkloadChoice::Every(placed)
+        }
+    }
+}
+
+/// The one [`CrRef`] → [`PlacedWorkload`] conversion, so the refusal on
+/// an unknown namespace exists in exactly one place.
+fn place(r: &CrRef) -> WorkloadChoice {
+    match r.namespace.as_deref() {
+        Some(ns) => WorkloadChoice::One(PlacedWorkload {
+            name: r.name.clone(),
+            namespace: ns.to_string(),
+        }),
+        None => WorkloadChoice::Unplaceable(r.name.clone()),
+    }
+}
+
+/// Pure — the `--env` the caller typed, echoed back into a quoted
+/// command, or the empty string.
+///
+/// Every command this module prints for a reader to run is re-entered
+/// through `resolve_app_for_command`, which on a registration with two
+/// or more environments needs the flag to pick one — without it the
+/// retry errors on `per_env_guidance_message`. Echoing what was typed
+/// (rather than inferring one) is what makes the quoted command
+/// re-resolve to the SAME deployment the caller was just looking at.
+pub(crate) fn env_echo(env: Option<&str>) -> String {
+    env.map(|e| format!(" --env {e}")).unwrap_or_default()
+}
+
+/// Pure — what a WRITE verb says when it will not choose for the caller
+/// (ADR 0062 §Write surfaces).
+///
+/// `suffix` is the flags the caller already typed, appended verbatim to
+/// each quoted command — without it the retry silently loses the `--to`
+/// the operator was in the middle of, which turns a refusal into a
+/// second mistake.
+///
+/// One line per candidate rather than a comma list, because the point is
+/// that the next command is COPY-PASTEABLE: a reader under rollback
+/// pressure should not have to assemble it. The positional stays the
+/// application in every one of them — quoting `apprafter app rollback
+/// api` would teach the exact collapse ADR 0062 §Addressing exists to
+/// prevent.
+pub(crate) fn ambiguous_write_lines(
+    verb: &str,
+    application: &str,
+    candidates: &[String],
+    suffix: &str,
+) -> Vec<String> {
+    let mut out = vec![
+        format!(
+            "Application '{application}' deploys {} workloads, and `app {verb}` writes to one \
+             of them.",
+            candidates.len()
+        ),
+        "Name it with `--workload` — this command will not choose for you:".to_string(),
+    ];
+    out.extend(
+        candidates
+            .iter()
+            .map(|w| format!("  apprafter app {verb} {application} --workload {w}{suffix}")),
+    );
+    out
+}
+
+/// Pure — `rollback`'s ambiguity refusal, which is
+/// [`ambiguous_write_lines`] plus the branch that is NOT ambiguous.
+///
+/// A bare refusal would leave the reader believing `rollback` is
+/// unavailable on a bundle, and it is not: the Git-revision branch moves
+/// every workload at once and therefore takes no `--workload` and
+/// refuses nothing. Printing both routes is the same courtesy
+/// [`refuse_workload_lines`] already pays, and here it doubles as the
+/// place a reader learns the two branches differ in cardinality at all.
+pub(crate) fn rollback_refusal_lines(
+    application: &str,
+    candidates: &[String],
+    suffix: &str,
+) -> Vec<String> {
+    let mut out = ambiguous_write_lines("rollback", application, candidates, suffix);
+    out.push(String::new());
+    out.push(format!(
+        "To roll ALL {} workloads back to a Git revision instead — one revision for the whole \
+         application, no `--workload`:",
+        candidates.len()
+    ));
+    out.push(format!(
+        "  apprafter app rollback {application} --to <revision>"
+    ));
+    out
+}
+
+/// Pure — what `app open` says when it cannot ask (no TTY) and will not
+/// pick.
+///
+/// A read, so the wording is a question rather than a refusal — but the
+/// candidate list and the copy-pasteable command are the same courtesy a
+/// write owes, for the same reason: forwarding an arbitrary Service puts
+/// a different application on localhost than the reader named, and they
+/// would have no way to tell.
+pub(crate) fn ambiguous_read_message(
+    application: &str,
+    candidates: &[String],
+    env: Option<&str>,
+) -> String {
+    format!(
+        "Application '{application}' deploys {} workloads ({}), and `app open` forwards one \
+         of them. Re-run in a TTY to choose, or pass `apprafter app open {application} \
+         --workload <name>{}`.",
+        candidates.len(),
+        candidates.join(", "),
+        env_echo(env)
+    )
+}
+
+/// Pure — what every verb says about a workload it cannot place.
+///
+/// Deliberately NOT "not synced yet", which is what the pre-2.27 code
+/// degraded this state to: the registration HAS synced (it tracks the
+/// workload), we simply cannot say where the workload lives, and telling
+/// an operator to wait for a sync that already finished sends them to
+/// watch the wrong thing.
+pub(crate) fn unplaceable_workload_message(application: &str, workload: &str) -> String {
+    format!(
+        "Workload '{workload}' of application '{application}' names no namespace — neither \
+         its own `status.resources[]` entry nor the application's \
+         `spec.destination.namespace` places it, so there is nothing safe to point kubectl \
+         at. Inspect with `apprafter app status {application}`."
+    )
+}
+
 /// One row of the bundle summary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkloadSummary {
@@ -3077,6 +3358,11 @@ pub(crate) fn resolve_app_for_command(
 /// from the Argo CD parent name typed at `app add`, so we resolve
 /// it from `status.resources[]` before building the selector.
 /// `--pod` overrides the selector with a direct pod name.
+///
+/// ADR 0062: `name` is the REGISTRATION, which deploys 1..N workloads,
+/// and this verb multiplexes across every one of them — see
+/// [`WorkloadDemand::ReadEvery`] for why that is the right default here
+/// and nowhere else. `--workload` narrows to one.
 pub fn logs(
     name: &str,
     env: Option<String>,
@@ -3084,12 +3370,16 @@ pub fn logs(
     tail: i64,
     container: Option<String>,
     pod: Option<String>,
+    workload: Option<String>,
 ) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
 
     let (app, argo_name) = resolve_app_for_command(name, env.as_deref(), kc.path())?;
 
-    let (workload_ns, inner) = resolve_logs_workload(&app, &argo_name)?;
+    let (workload_ns, inner) = resolve_logs_workload(&app, &argo_name, workload.as_deref())?;
+    if let Some(banner) = multiplex_banner(name, &inner, pod.as_deref()) {
+        eprintln!("{banner}");
+    }
     let target = build_kubectl_logs_target(&inner, pod.as_deref());
     let args = build_kubectl_logs_args(&target, &workload_ns, follow, tail, container.as_deref());
 
@@ -3107,16 +3397,62 @@ pub fn logs(
     Ok(())
 }
 
-/// Pure helper — resolve `(workload namespace, pod label value)` for
+/// Pure — the line `app logs` prints before an interleaved stream, or
+/// `None` when the stream is not interleaved.
+///
+/// An interleaved stream is only readable if the reader knows it is one.
+/// `--prefix=true` names the pod on every line and the operator names
+/// each Deployment after its workload, but that answers "which workload
+/// is this line", not "which workloads am I watching".
+///
+/// It is a CLAIM about the command that follows, so it has to be true of
+/// it. `--pod` makes [`build_kubectl_logs_target`] return
+/// [`KubectlLogsTarget::Pod`] regardless of how many workloads resolved,
+/// so announcing three and then streaming one pod would be a false
+/// statement — the same distinction this module keeps everywhere else
+/// between what was looked at and what was found. Hence the predicate is
+/// `--pod` absent AND more than one workload, not the workload count
+/// alone.
+pub(crate) fn multiplex_banner(
+    application: &str,
+    workloads: &[String],
+    pod: Option<&str>,
+) -> Option<String> {
+    if pod.is_some() || workloads.len() <= 1 {
+        return None;
+    }
+    Some(format!(
+        "ℹ Streaming all {} workloads of '{application}' ({}). Narrow with \
+         `--workload <name>`.",
+        workloads.len(),
+        workloads.join(", ")
+    ))
+}
+
+/// Pure helper — resolve `(workload namespace, pod label values)` for
 /// `app logs` from the Argo CD Application. Extracted from [`logs`].
 ///
-/// INVARIANT: the pod label is the INNER AppRafter app name from
-/// `status.resources[]`, which is `Application.cue`'s `metadata.name` and
-/// need not equal the Argo CD parent typed at `app add`. Only when Argo
-/// tracks no AppRafter CR (a raw-YAML app) does it fall back to the
+/// INVARIANT: the pod labels are the INNER AppRafter app names from
+/// `status.resources[]`, which are `Application.cue`'s `metadata.name`
+/// and need not equal the Argo CD parent typed at `app add`. Only when
+/// Argo tracks no AppRafter CR (a raw-YAML app) does it fall back to the
 /// RESOLVED Argo name — `<name>-<env>` for an env deploy, never the bare
 /// logical name.
-pub(crate) fn resolve_logs_workload(app: &Value, argo_name: &str) -> Result<(String, String)> {
+///
+/// Since 2.27b the return is a LIST: a registration deploys 1..N
+/// workloads and this verb streams all of them ([`WorkloadDemand::ReadEvery`]).
+/// One name is the pre-2.27b answer exactly, so today's fleet is
+/// unchanged down to the argv.
+///
+/// The namespace still comes from the registration's
+/// `spec.destination.namespace` rather than from the chosen workloads —
+/// a bundle is one namespace (ADR 0062 §Decision), and this is the read
+/// that has always refused when there is none rather than defaulting.
+pub(crate) fn resolve_logs_workload(
+    app: &Value,
+    argo_name: &str,
+    workload: Option<&str>,
+) -> Result<(String, Vec<String>)> {
     let workload_ns = app
         .pointer("/spec/destination/namespace")
         .and_then(Value::as_str)
@@ -3127,8 +3463,28 @@ pub(crate) fn resolve_logs_workload(app: &Value, argo_name: &str) -> Result<(Str
                  `apprafter app add`."
             ))
         })?;
-    let inner = crate::commands::app_open::find_apprafter_app_name(app)
-        .unwrap_or_else(|| argo_name.to_string());
+    let refs = crate::commands::app_open::apprafter_app_refs(app);
+    let inner = match workload_for(&refs, workload, WorkloadDemand::ReadEvery) {
+        WorkloadChoice::One(w) => vec![w.name],
+        WorkloadChoice::Every(ws) => ws.into_iter().map(|w| w.name).collect(),
+        // The raw-YAML fallback, unchanged: Argo CD tracks no AppRafter
+        // CR at all, so the Argo object's own name is the best selector
+        // value available.
+        WorkloadChoice::NoWorkloads => vec![argo_name.to_string()],
+        WorkloadChoice::Unknown { asked, available } => {
+            return Err(CliError::Other(unknown_workload_message(
+                argo_name, &asked, &available,
+            )));
+        }
+        WorkloadChoice::Unplaceable(w) => {
+            return Err(CliError::Other(unplaceable_workload_message(argo_name, &w)));
+        }
+        // `ReadEvery` never asks and never refuses — that is the whole
+        // of the `logs` decision.
+        WorkloadChoice::Ask(_) | WorkloadChoice::Refuse(_) => {
+            unreachable!("WorkloadDemand::ReadEvery resolves every workload; see `workload_for`")
+        }
+    };
     Ok((workload_ns.to_string(), inner))
 }
 
@@ -3146,16 +3502,124 @@ pub(crate) fn resolve_logs_workload(app: &Value, argo_name: &str) -> Result<(Str
 ///
 /// Bare `rollback` prefers the retained digest when the CR has one; see
 /// [`classify_rollback_target`].
-pub fn rollback(name: &str, env: Option<String>, to: Option<String>, yes: bool) -> Result<()> {
+///
+/// **The two branches have OPPOSITE cardinality** (ADR 0062 §Write
+/// surfaces), and that is what shapes the function below:
+///
+/// * `--to <git-rev>` patches the REGISTRATION's `targetRevision`, which
+///   Argo CD re-renders the whole package from — every workload in the
+///   bundle moves. It therefore needs no workload selector and must not
+///   refuse on ambiguity: there is nothing ambiguous about it.
+/// * every other form writes ONE workload's CR, so it goes through
+///   [`WorkloadDemand::Write`] and refuses rather than picking.
+///
+/// Bare `rollback` is on the second side even though it may END on the
+/// first: whether it resolves to the retained digest is a fact of a
+/// workload's CR, and at N > 1 choosing whose CR to read is exactly the
+/// choice this verb will not make for the caller.
+pub fn rollback(
+    name: &str,
+    env: Option<String>,
+    to: Option<String>,
+    yes: bool,
+    workload: Option<String>,
+) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
     let (app, argo_name) = resolve_app_for_command(name, env.as_deref(), kc.path())?;
+    let refs = app_open::apprafter_app_refs(&app);
+
+    // Which branch an EXPLICIT `--to` takes is decided syntactically:
+    // with `to = Some(_)`, `classify_rollback_target` returns before it
+    // reads either CR, so passing `None` for the AppRafter one here
+    // reaches the identical verdict — including its refusals for a
+    // malformed digest or a refname carrying a colon. Deciding it this
+    // early is what lets the Git branch skip the workload resolution
+    // entirely, which it must: it moves the whole bundle, so there is
+    // nothing for `--workload` to select and nothing to refuse over.
+    if to.is_some() {
+        let target = classify_rollback_target(to.as_deref(), None, &app)?;
+        if let RollbackTarget::GitRevision(rev) = &target {
+            // Site (a): the caller may have named a workload this branch
+            // cannot honour. Refuse BEFORE the write rather than
+            // disclosing it in a prompt `--yes` skips.
+            vet_rollback_scope(
+                name,
+                workload.as_deref(),
+                to.as_deref(),
+                &target,
+                refs.len(),
+            )?;
+            return rollback_to_revision(&app, &argo_name, rev, refs.len(), yes, kc.path());
+        }
+    }
 
     // The AppRafter CR is where a pin lives and where the retained digest is
     // recorded. Absent on an application Argo CD has not synced yet, which
     // is a refusal rather than a fallback: a pin write cannot create the CR.
-    let cr = read_apprafter_cr(&app, kc.path());
+    let scope = BundleScope {
+        application: name.to_string(),
+        size: refs.len(),
+        env: env.clone(),
+    };
+    // Every flag the caller typed that the retry needs, in the order a
+    // reader would have typed them: `--env` selects the deployment,
+    // `--to` selects what to roll back to.
+    let suffix = format!(
+        "{}{}",
+        env_echo(env.as_deref()),
+        to.as_deref()
+            .map(|t| format!(" --to {t}"))
+            .unwrap_or_default()
+    );
+    let cr = match workload_for(&refs, workload.as_deref(), WorkloadDemand::Write) {
+        WorkloadChoice::One(w) => read_apprafter_cr(&w, kc.path()),
+        // Nothing synced. With no `--workload` this is the pre-2.27b
+        // behaviour exactly — no CR, so a bare rollback falls through to
+        // the Git-revision branch and an explicit digest is refused
+        // below for want of a CR. WITH one, the named workload does not
+        // exist yet, and saying that is more use than the downstream
+        // "no image to roll back to", which would blame the workload for
+        // the registration's state.
+        WorkloadChoice::NoWorkloads => {
+            if let Some(w) = workload.as_deref() {
+                return Err(CliError::Other(format!(
+                    "Application '{name}' has not synced yet, so it deploys no workload \
+                     '{w}' to roll back. Wait for the first sync, then retry."
+                )));
+            }
+            None
+        }
+        WorkloadChoice::Refuse(candidates) => {
+            return Err(CliError::Other(
+                rollback_refusal_lines(name, &candidates, &suffix).join("\n"),
+            ));
+        }
+        WorkloadChoice::Unknown { asked, available } => {
+            return Err(CliError::Other(unknown_workload_message(
+                name, &asked, &available,
+            )));
+        }
+        WorkloadChoice::Unplaceable(w) => {
+            return Err(CliError::Other(unplaceable_workload_message(name, &w)));
+        }
+        WorkloadChoice::Ask(_) | WorkloadChoice::Every(_) => {
+            unreachable!("WorkloadDemand::Write neither asks nor multiplexes")
+        }
+    };
 
-    match classify_rollback_target(to.as_deref(), cr.as_ref(), &app)? {
+    let target = classify_rollback_target(to.as_deref(), cr.as_ref(), &app)?;
+    // Site (b): a BARE `rollback --workload api` whose workload has no
+    // retained digest falls through to a Git revision here, and that
+    // moves every workload. Nothing the caller typed hints at it — this
+    // is the shape reached by accident.
+    vet_rollback_scope(
+        name,
+        workload.as_deref(),
+        to.as_deref(),
+        &target,
+        refs.len(),
+    )?;
+    match target {
         RollbackTarget::Digest(digest) => {
             let cr = cr.ok_or_else(|| {
                 CliError::Other(format!(
@@ -3163,10 +3627,10 @@ pub fn rollback(name: &str, env: Option<String>, to: Option<String>, yes: bool) 
                      image to pin. Wait for the first sync, then retry."
                 ))
             })?;
-            rollback_to_digest(&app, &argo_name, &cr, &digest, yes, kc.path())
+            rollback_to_digest(&app, &argo_name, &cr, &digest, scope, yes, kc.path())
         }
         RollbackTarget::GitRevision(rev) => {
-            rollback_to_revision(&app, &argo_name, &rev, yes, kc.path())
+            rollback_to_revision(&app, &argo_name, &rev, refs.len(), yes, kc.path())
         }
     }
 }
@@ -3177,10 +3641,11 @@ fn rollback_to_digest(
     argo_name: &str,
     cr: &Value,
     digest: &str,
+    scope: BundleScope,
     yes: bool,
     kubeconfig: &Path,
 ) -> Result<()> {
-    let plan = plan_pin(argo_app, cr, digest)?;
+    let plan = plan_pin(argo_app, cr, digest, scope)?;
 
     if !yes {
         if !io::stdin().is_terminal() {
@@ -3214,6 +3679,87 @@ fn rollback_to_digest(
     Ok(())
 }
 
+/// The bundle a write verb is acting INSIDE (ADR 0062).
+///
+/// Carried into the plans rather than passed to the renderers, because
+/// the cardinality is part of what the plan resolved: a pin moves one
+/// workload of `size`, and both the prompt and the success line have to
+/// say so — and both have to quote a way back that is addressable, which
+/// needs `application` as well as the workload's own name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BundleScope {
+    /// The positional the caller typed — the registration, never a
+    /// workload name.
+    pub application: String,
+    /// How many workloads that registration deploys. `1` is today's
+    /// entire fleet and renders exactly as before 2.27b.
+    pub size: usize,
+    /// The `--env` the caller typed, if any, echoed back into every
+    /// command this scope quotes.
+    ///
+    /// Not decoration: on a registration with two or more environments,
+    /// a quoted command without it re-enters `resolve_app_for_command`
+    /// with `env: None`, matches several deployments and errors on
+    /// `per_env_guidance_message`. Echoing exactly what the caller
+    /// passed is both sufficient and precise — their invocation
+    /// resolved, so the same flags resolve again — where inferring one
+    /// would be guessing at which environment they meant.
+    pub env: Option<String>,
+}
+
+impl BundleScope {
+    /// The command that addresses this plan's workload, at any bundle
+    /// size.
+    ///
+    /// **The positional is the APPLICATION on both branches** — ADR 0062
+    /// §Addressing, which admits no other form. Only the `--workload`
+    /// disambiguator is conditional, and only because at `size <= 1`
+    /// there is nothing to disambiguate.
+    ///
+    /// The `size <= 1` branch used to quote the WORKLOAD's own name,
+    /// which is the pre-2.27b spelling and is a defect wherever the two
+    /// names differ: `apprafter app unpin <workload>` re-enters
+    /// `resolve_app_for_command`, finds no Argo object of that name and
+    /// no registration carrying it as an `apprafter.io/application`
+    /// label, and fails with `not found`. That is not a hypothetical
+    /// configuration — it is the one this module's own tests pin as
+    /// supported (registration `cms-prod`, grouping label `cms`,
+    /// rendering a CR called `landing-cms`), and a pin is precisely the
+    /// operation whose way back must work, since it keeps acting until
+    /// somebody runs it.
+    ///
+    /// The 2.27b byte-identity rule is not weakened by this: the two
+    /// strings coincide for every bundle whose application and workload
+    /// share a name — the scaffolded default, and so nearly the whole
+    /// fleet — so the output changes only where the old one was already
+    /// broken or resolving by coincidence.
+    fn verb_for(&self, verb: &str, workload: &str) -> String {
+        let env = env_echo(self.env.as_deref());
+        if self.size <= 1 {
+            format!("apprafter app {verb} {}{env}", self.application)
+        } else {
+            format!(
+                "apprafter app {verb} {} --workload {workload}{env}",
+                self.application
+            )
+        }
+    }
+
+    /// "This moves one of N, and leaves the other N-1 alone" — or
+    /// nothing at all when there is no other.
+    fn one_of_many_line(&self, workload: &str) -> Option<String> {
+        (self.size > 1).then(|| {
+            format!(
+                "  '{workload}' is 1 of the {} workloads application '{}' deploys; the other \
+                 {} are not touched.",
+                self.size,
+                self.application,
+                self.size - 1
+            )
+        })
+    }
+}
+
 /// Everything [`rollback_to_digest`] needs to write a pin, resolved from
 /// the two CRs before any prompting or apply happens.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3226,6 +3772,8 @@ pub(crate) struct PinPlan {
     pub reference: String,
     /// What the app is running now, `?` when it has resolved nothing.
     pub current: String,
+    /// Which bundle this one workload belongs to.
+    pub scope: BundleScope,
 }
 
 /// Pure helper — resolve and vet a pin before anything is written.
@@ -3241,7 +3789,12 @@ pub(crate) struct PinPlan {
 ///   rollback happened;
 /// * pinning to what is already running is refused as a no-op, so the
 ///   reader is not told a rollback succeeded when nothing moved.
-pub(crate) fn plan_pin(argo_app: &Value, cr: &Value, digest: &str) -> Result<PinPlan> {
+pub(crate) fn plan_pin(
+    argo_app: &Value,
+    cr: &Value,
+    digest: &str,
+    scope: BundleScope,
+) -> Result<PinPlan> {
     let reference = compose_pin_reference(digest, cr)?;
     let cr_name = cr
         .pointer("/metadata/name")
@@ -3279,6 +3832,7 @@ pub(crate) fn plan_pin(argo_app: &Value, cr: &Value, digest: &str) -> Result<Pin
         cr_ns: cr_ns.to_string(),
         reference,
         current: current.to_string(),
+        scope,
     })
 }
 
@@ -3286,33 +3840,75 @@ pub(crate) fn plan_pin(argo_app: &Value, cr: &Value, digest: &str) -> Result<Pin
 /// [`rollback_to_digest`]. It names the mode change explicitly (and the
 /// verb that undoes it) because a pin is the one rollback that keeps
 /// acting after it returns.
+///
+/// Since 2.27b it also names the CARDINALITY, which is the sharpest
+/// thing about this verb: `--to <digest>` pins ONE workload and
+/// `--to <git-rev>` moves EVERY workload of the bundle, and a prompt
+/// that read the same for both would be consent for the wrong
+/// operation. See [`revision_prompt_lines`] for the other half — each
+/// points at the other, because the reader reaching for one may have
+/// wanted the other and nothing in the flag itself says which is which.
+///
+/// At `scope.size <= 1` the lines are exactly the pre-2.27b three: there
+/// is no cardinality to disclose, and today's entire fleet is that case.
 pub(crate) fn pin_prompt_lines(plan: &PinPlan) -> Vec<String> {
     let PinPlan {
         cr_name,
         reference,
         current,
+        scope,
         ..
     } = plan;
-    vec![
-        format!("Roll back '{cr_name}' from {current} to {reference}?"),
+    let mut out = vec![format!(
+        "Roll back '{cr_name}' from {current} to {reference}?"
+    )];
+    out.extend(scope.one_of_many_line(cr_name));
+    // "the application" is the pre-2.27b wording and is right at N = 1,
+    // where the bundle and the workload are the same thing. At N > 1 it
+    // is wrong in the direction that matters — a pin is per workload, and
+    // saying "the application" over a three-workload bundle claims a
+    // blast radius three times the real one.
+    out.push(if scope.size > 1 {
         format!(
-            "  This PINS the application: it stops following its tag until you run \
-             `apprafter app unpin {cr_name}`."
-        ),
-        "  To roll back a Git revision instead, pass `--to <revision>`.".to_string(),
-    ]
+            "  This PINS it: '{cr_name}' stops following its tag until you run `{}`.",
+            scope.verb_for("unpin", cr_name)
+        )
+    } else {
+        format!(
+            "  This PINS the application: it stops following its tag until you run `{}`.",
+            scope.verb_for("unpin", cr_name)
+        )
+    });
+    out.push(if scope.size > 1 {
+        format!(
+            "  To roll back a Git revision instead, pass `--to <revision>` — that moves ALL \
+             {} workloads together.",
+            scope.size
+        )
+    } else {
+        "  To roll back a Git revision instead, pass `--to <revision>`.".to_string()
+    });
+    out
 }
 
 /// Pure helper — what a completed pin reports. Extracted from
 /// [`rollback_to_digest`]; carries the un-pin verb so the mode change is
 /// never a one-way door the reader has to go looking for.
+///
+/// The quoted verb goes through [`BundleScope::verb_for`], so on a
+/// bundle it is a command that actually resolves — `apprafter app unpin
+/// <workload>` would not, the positional being the application.
 pub(crate) fn pin_success_line(plan: &PinPlan) -> String {
     let PinPlan {
-        cr_name, reference, ..
+        cr_name,
+        reference,
+        scope,
+        ..
     } = plan;
     format!(
         "✓ '{cr_name}' pinned to {reference}. It is no longer following its tag — \
-         resume with `apprafter app unpin {cr_name}`."
+         resume with `{}`.",
+        scope.verb_for("unpin", cr_name)
     )
 }
 
@@ -3343,11 +3939,131 @@ pub(crate) fn noop_revision_error(target_revision: &str, current_revision: &str)
     ))
 }
 
+/// Pure — refuse a `--workload` that the resolved rollback branch would
+/// silently discard (ADR 0062 §Write surfaces).
+///
+/// The exact inverse of [`workload_for`]'s refusal, and the same defect
+/// with the sign flipped. That one stops a write acting on a workload
+/// nobody named; this one stops a write acting on MORE than the workload
+/// the caller did name — which is what `--to <git-rev> --workload api`
+/// was doing, and what a bare `rollback --workload api` was doing
+/// whenever that workload had no image to roll back to.
+///
+/// Two shapes reach here and they must not render alike:
+///
+/// * an EXPLICIT `--to <git-rev>`: the caller named the revision, so the
+///   message names their flag;
+/// * a BARE `rollback` that fell through for want of a retained image:
+///   the caller named no revision at all, so blaming a `--to` they never
+///   typed would be a false statement about their own command. This is
+///   the shape reached by accident, and the one `--help` never described.
+///
+/// **No size exception.** `--workload` means "act on this workload", and
+/// a Git-revision rollback does not act on a workload at any N — it
+/// patches the registration's `targetRevision`. Accepting it at N = 1
+/// because the blast radius coincides would teach a mental model that
+/// becomes a silent N-fold write the day the bundle grows a second
+/// workload.
+///
+/// The prompt DOES disclose the cardinality, but `--yes` skips the
+/// prompt, and a disclosure that arrives after the write is not one.
+pub(crate) fn vet_rollback_scope(
+    application: &str,
+    workload: Option<&str>,
+    to: Option<&str>,
+    target: &RollbackTarget,
+    workloads: usize,
+) -> Result<()> {
+    let RollbackTarget::GitRevision(revision) = target else {
+        return Ok(());
+    };
+    let Some(w) = workload else {
+        return Ok(());
+    };
+    let scope = if workloads > 1 {
+        format!("all {workloads} workloads of '{application}'")
+    } else {
+        format!("the whole application '{application}'")
+    };
+    let cause = match to {
+        Some(raw) => format!(
+            "`--to {}` is a Git revision, which moves the application's `targetRevision` — \
+             {scope} roll back together, not just '{w}'.",
+            raw.trim()
+        ),
+        None => format!(
+            "'{w}' has no image to roll back to, so `rollback` falls through to Git revision \
+             '{revision}' — which moves the application's `targetRevision`, and {scope} with \
+             it, not just '{w}'."
+        ),
+    };
+    Err(CliError::Other(format!(
+        "{cause}\n\
+         Either drop `--workload {w}` to roll the whole application back, or pass \
+         `--to <sha256:digest>` to pin just '{w}'."
+    )))
+}
+
+/// Pure helper — the Git-revision confirmation preamble (ADR 0062).
+///
+/// The twin of [`pin_prompt_lines`], and the reason both exist as pure
+/// functions: the two branches of one verb have OPPOSITE cardinality.
+/// This one patches the registration's `targetRevision`, which Argo CD
+/// then re-renders the whole package from — so every workload in the
+/// bundle moves, whether or not the reader was thinking about more than
+/// one of them.
+///
+/// Line 0 is byte-identical to the pre-2.27b `println!`, at every bundle
+/// size; the disclosure is an ADDED line, so a single-workload bundle —
+/// today's entire fleet — reads exactly as it did.
+pub(crate) fn revision_prompt_lines(
+    argo_name: &str,
+    current_revision: &str,
+    target_revision: &str,
+    workloads: usize,
+) -> Vec<String> {
+    let mut out = vec![format!(
+        "Roll back Application '{argo_name}' from revision '{current_revision}' to \
+         '{target_revision}'?"
+    )];
+    if workloads > 1 {
+        out.push(format!(
+            "  This moves the application's Git revision, so ALL {workloads} workloads it \
+             deploys roll back together. To roll back ONE workload's image instead, pass \
+             `--to <sha256:digest> --workload <name>`."
+        ));
+    }
+    out
+}
+
+/// Pure helper — what a completed Git-revision rollback reports.
+///
+/// "the workload", singular, is what this line said before 2.27b — the
+/// same defect `delete_success_line` already carries a fix for. After
+/// moving three of them it is simply false, and the reader has no other
+/// signal that three moved.
+pub(crate) fn revision_success_line(
+    argo_name: &str,
+    target_revision: &str,
+    workloads: usize,
+) -> String {
+    let what = if workloads > 1 {
+        format!("all {workloads} workloads")
+    } else {
+        "the workload".to_string()
+    };
+    format!(
+        "✓ Application '{argo_name}' rolled back to revision '{target_revision}'. Argo CD \
+         will sync {what} within a reconcile cycle."
+    )
+}
+
 /// Patch the Argo CD Application's `targetRevision` — the original behaviour.
 fn rollback_to_revision(
     app: &Value,
     argo_name: &str,
     target_revision: &str,
+    workloads: usize,
     yes: bool,
     kubeconfig: &Path,
 ) -> Result<()> {
@@ -3362,10 +4078,10 @@ fn rollback_to_revision(
                 "non-interactive shell — pass `--yes` to skip the confirmation prompt".into(),
             ));
         }
-        println!(
-            "Roll back Application '{argo_name}' from revision '{current_revision}' to \
-             '{target_revision}'?"
-        );
+        for line in revision_prompt_lines(argo_name, &current_revision, target_revision, workloads)
+        {
+            println!("{line}");
+        }
         let confirmed = inquire::Confirm::new("Confirm?")
             .with_default(false)
             .prompt()
@@ -3390,8 +4106,8 @@ fn rollback_to_revision(
     )?;
 
     println!(
-        "✓ Application '{argo_name}' rolled back to revision '{target_revision}'. Argo CD will \
-         sync the workload within a reconcile cycle."
+        "{}",
+        revision_success_line(argo_name, target_revision, workloads)
     );
     Ok(())
 }
@@ -3406,16 +4122,49 @@ fn rollback_to_revision(
 /// Removes the pin by re-applying the SAME body under the SAME field manager
 /// with the annotations omitted, so server-side apply prunes exactly the two
 /// keys that manager owns.
-pub fn unpin(name: &str, env: Option<String>, yes: bool) -> Result<()> {
+/// ADR 0062: `name` is the REGISTRATION. A pin lives on ONE workload's
+/// CR, so at N > 1 this refuses rather than un-pinning whichever sorts
+/// first — the mirror of [`rollback`]'s digest branch, and refused for
+/// the same reason: nothing downstream can tell an un-pin nobody asked
+/// for from one they did.
+pub fn unpin(name: &str, env: Option<String>, yes: bool, workload: Option<String>) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
     let (app, argo_name) = resolve_app_for_command(name, env.as_deref(), kc.path())?;
-    let cr = read_apprafter_cr(&app, kc.path()).ok_or_else(|| {
+    let refs = app_open::apprafter_app_refs(&app);
+    let scope = BundleScope {
+        application: name.to_string(),
+        size: refs.len(),
+        env: env.clone(),
+    };
+
+    let cr = match workload_for(&refs, workload.as_deref(), WorkloadDemand::Write) {
+        WorkloadChoice::One(w) => read_apprafter_cr(&w, kc.path()),
+        WorkloadChoice::NoWorkloads => None,
+        WorkloadChoice::Refuse(candidates) => {
+            return Err(CliError::Other(
+                ambiguous_write_lines("unpin", name, &candidates, &env_echo(env.as_deref()))
+                    .join("\n"),
+            ));
+        }
+        WorkloadChoice::Unknown { asked, available } => {
+            return Err(CliError::Other(unknown_workload_message(
+                name, &asked, &available,
+            )));
+        }
+        WorkloadChoice::Unplaceable(w) => {
+            return Err(CliError::Other(unplaceable_workload_message(name, &w)));
+        }
+        WorkloadChoice::Ask(_) | WorkloadChoice::Every(_) => {
+            unreachable!("WorkloadDemand::Write neither asks nor multiplexes")
+        }
+    };
+    let cr = cr.ok_or_else(|| {
         CliError::Other(format!(
             "Application '{argo_name}' has not synced yet — there is nothing pinned."
         ))
     })?;
 
-    let plan = plan_unpin(&app, &cr)?;
+    let plan = plan_unpin(&app, &cr, scope)?;
     if plan.pinned.is_none() {
         println!("'{}' is not pinned — nothing to do.", plan.cr_name);
         return Ok(());
@@ -3466,6 +4215,8 @@ pub(crate) struct UnpinPlan {
     /// The tag the app resumes following, or the placeholder `its tag`
     /// when the CR has resolved none.
     pub tag: String,
+    /// Which bundle this one workload belongs to.
+    pub scope: BundleScope,
 }
 
 /// Pure helper — resolve the un-pin target. Extracted from [`unpin`].
@@ -3474,7 +4225,7 @@ pub(crate) struct UnpinPlan {
 /// un-pin re-applies the SAME body under the SAME field manager, so a
 /// namespace that differed by one step would prune nothing and leave the
 /// application pinned while reporting success.
-pub(crate) fn plan_unpin(argo_app: &Value, cr: &Value) -> Result<UnpinPlan> {
+pub(crate) fn plan_unpin(argo_app: &Value, cr: &Value, scope: BundleScope) -> Result<UnpinPlan> {
     let cr_name = cr
         .pointer("/metadata/name")
         .and_then(Value::as_str)
@@ -3500,6 +4251,7 @@ pub(crate) fn plan_unpin(argo_app: &Value, cr: &Value) -> Result<UnpinPlan> {
             .and_then(Value::as_str)
             .unwrap_or("its tag")
             .to_string(),
+        scope,
     })
 }
 
@@ -3512,37 +4264,45 @@ pub(crate) fn unpin_prompt_lines(plan: &UnpinPlan) -> Vec<String> {
         cr_name,
         pinned,
         tag,
+        scope,
         ..
     } = plan;
     let held = pinned.as_deref().unwrap_or("nothing");
-    vec![
-        format!("Un-pin '{cr_name}' (currently held at {held})?"),
-        format!(
-            "  It will resume following {tag} and may roll forward to whatever that now \
-             points at, within one reconcile."
-        ),
-    ]
+    let mut out = vec![format!("Un-pin '{cr_name}' (currently held at {held})?")];
+    // Same disclosure as the pin, for the same reason: this is a write
+    // against one workload of a bundle, and the reader is agreeing to it
+    // without having named the other N-1 anywhere.
+    out.extend(scope.one_of_many_line(cr_name));
+    out.push(format!(
+        "  It will resume following {tag} and may roll forward to whatever that now points \
+         at, within one reconcile."
+    ));
+    out
 }
 
-/// Fetch the AppRafter `Application` CR behind an Argo CD Application.
+/// Fetch ONE workload's AppRafter `Application` CR.
 ///
-/// `None` when Argo CD has not synced the application yet (no
-/// `status.resources`), or the repository renders no AppRafter CR at all.
-/// Best-effort on the read itself; the CALLERS decide whether absence is
-/// fatal, and for both pin verbs it is.
-fn read_apprafter_cr(argo_app: &Value, kubeconfig: &Path) -> Option<Value> {
-    let cr_name = app_open::find_apprafter_app_name(argo_app)?;
-    let ns = argo_app
-        .pointer("/spec/destination/namespace")
-        .and_then(Value::as_str)?;
+/// `None` when the object is simply not there. Best-effort on the read
+/// itself; the CALLERS decide whether absence is fatal, and for both pin
+/// verbs it is.
+///
+/// Takes a [`PlacedWorkload`] rather than the registration, which is the
+/// 2.27b change: WHICH workload is a decision [`workload_for`] makes and
+/// refuses to guess at, not one this read may make by taking the first
+/// entry of `status.resources[]`. The namespace arrives as a plain
+/// `String` for the same reason — `kubectl -n ""` silently means the
+/// kubeconfig's default namespace.
+fn read_apprafter_cr(workload: &PlacedWorkload, kubeconfig: &Path) -> Option<Value> {
     // The managed-fields variant: `pin_appears_git_managed` reads
     // `metadata.managedFields`, and kubectl STRIPS that from `get -o json`
     // unless asked. Without the flag the guard sees an empty list, concludes
-    // nobody owns the annotation, and can never fire.
+    // nobody owns the annotation, and can never fire. It is also why the
+    // pin verbs cannot be served by `AppIndex`'s cached CRs — that read
+    // does not pass the flag.
     kubectl_get_json_showing_managed_fields(
         "application.apprafter.io",
-        Some(&cr_name),
-        Some(ns),
+        Some(&workload.name),
+        Some(&workload.namespace),
         kubeconfig,
     )
     .ok()
@@ -4682,7 +5442,7 @@ pub(crate) fn build_kubectl_logs_args(
     let mut args = vec!["logs".to_string()];
     match target {
         KubectlLogsTarget::Pod(name) => args.push(name.clone()),
-        KubectlLogsTarget::Selector(selector) => {
+        KubectlLogsTarget::Selector { selector, .. } => {
             args.push("-l".into());
             args.push(selector.clone());
         }
@@ -4703,14 +5463,21 @@ pub(crate) fn build_kubectl_logs_args(
     // so explicitly prefix lines with the pod name for the
     // multi-pod case. The single-pod target stays prefix-free
     // — lines already arrive in natural order there.
-    if matches!(target, KubectlLogsTarget::Selector(_)) {
+    if let KubectlLogsTarget::Selector { workloads, .. } = target {
         args.push("--prefix=true".into());
         // On a large scale-out the stream from many pods could
         // overwhelm the terminal; --max-log-requests=N caps
         // kubectl's parallel streaming in selector mode. 10 is
         // kubectl's documented default ceiling; we pass it
         // explicitly for predictability.
-        args.push("--max-log-requests=10".into());
+        //
+        // Since 2.27b the selector may span several WORKLOADS
+        // (ADR 0062), so the budget is per workload rather than
+        // per command: a three-workload bundle with four replicas
+        // each is twelve streams, and a shared ceiling of 10
+        // would fail `-f` with an error naming a flag this CLI
+        // does not expose. One workload still gets exactly 10.
+        args.push(format!("--max-log-requests={}", 10 * (*workloads).max(1)));
     }
     args
 }
@@ -4722,18 +5489,44 @@ pub(crate) fn build_kubectl_logs_args(
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum KubectlLogsTarget {
     Pod(String),
-    Selector(String),
+    /// A label selector plus how many WORKLOADS it spans (ADR 0062).
+    ///
+    /// The count is carried rather than re-derived from the selector
+    /// string, because it decides `--max-log-requests` and parsing it
+    /// back out of `in (…)` would be a second source of truth for a fact
+    /// the caller already had.
+    Selector {
+        selector: String,
+        workloads: usize,
+    },
 }
 
 /// Resolve the `kubectl logs` target. Without `--pod` — a label
 /// selector via the AppRafter operator's `app.kubernetes.io/name:
 /// <inner workload name>` label (the same label `app status`
-/// selects workload pods by). `app_name` is the already-resolved
-/// INNER name, not the Argo CD parent.
-pub(crate) fn build_kubectl_logs_target(app_name: &str, pod: Option<&str>) -> KubectlLogsTarget {
-    match pod {
-        Some(name) => KubectlLogsTarget::Pod(name.to_string()),
-        None => KubectlLogsTarget::Selector(format!("app.kubernetes.io/name={app_name}")),
+/// selects workload pods by). `workloads` are the already-resolved
+/// INNER names, not the Argo CD parent.
+///
+/// ADR 0062: one registration deploys 1..N workloads, and `app logs`
+/// multiplexes across all of them (see [`WorkloadDemand::ReadEvery`]).
+/// One name keeps the pre-2.27b equality selector byte-for-byte —
+/// today's entire fleet — and several use a set-based requirement,
+/// which `kubectl logs` parses with the same `labels.Parse` every other
+/// `-l` goes through.
+pub(crate) fn build_kubectl_logs_target(
+    workloads: &[String],
+    pod: Option<&str>,
+) -> KubectlLogsTarget {
+    if let Some(name) = pod {
+        return KubectlLogsTarget::Pod(name.to_string());
+    }
+    let selector = match workloads {
+        [one] => operator_workload_selector(one),
+        many => format!("app.kubernetes.io/name in ({})", many.join(",")),
+    };
+    KubectlLogsTarget::Selector {
+        selector,
+        workloads: workloads.len(),
     }
 }
 
@@ -6246,10 +7039,13 @@ mod tests {
 
     #[test]
     fn build_kubectl_logs_target_defaults_to_selector() {
-        let target = build_kubectl_logs_target("payments", None);
+        let target = build_kubectl_logs_target(&["payments".to_string()], None);
         assert_eq!(
             target,
-            KubectlLogsTarget::Selector("app.kubernetes.io/name=payments".to_string())
+            KubectlLogsTarget::Selector {
+                selector: "app.kubernetes.io/name=payments".to_string(),
+                workloads: 1,
+            }
         );
     }
 
@@ -6262,23 +7058,27 @@ mod tests {
         // resolved inner name, or it finds no pods.
         let app = serde_json::json!({
             "metadata": { "name": "cms" },
+            "spec": { "destination": { "namespace": "landing" } },
             "status": { "resources": [
                 { "group": "apprafter.io", "kind": "Application", "name": "landing-cms" }
             ] }
         });
-        let inner = crate::commands::app_open::find_apprafter_app_name(&app)
-            .unwrap_or_else(|| "cms".to_string());
-        assert_eq!(inner, "landing-cms");
+        let (_, inner) = resolve_logs_workload(&app, "cms", None).unwrap();
+        assert_eq!(inner, vec!["landing-cms".to_string()]);
         let target = build_kubectl_logs_target(&inner, None);
         assert_eq!(
             target,
-            KubectlLogsTarget::Selector("app.kubernetes.io/name=landing-cms".to_string())
+            KubectlLogsTarget::Selector {
+                selector: "app.kubernetes.io/name=landing-cms".to_string(),
+                workloads: 1,
+            }
         );
     }
 
     #[test]
     fn build_kubectl_logs_target_uses_pod_name_when_provided() {
-        let target = build_kubectl_logs_target("payments", Some("payments-7f9c-xyz"));
+        let target =
+            build_kubectl_logs_target(&["payments".to_string()], Some("payments-7f9c-xyz"));
         assert_eq!(
             target,
             KubectlLogsTarget::Pod("payments-7f9c-xyz".to_string())
@@ -6292,7 +7092,10 @@ mod tests {
         // and --max-log-requests to cap fan-out. Both are
         // load-bearing for real usability on multi-pod apps.
         let args = build_kubectl_logs_args(
-            &KubectlLogsTarget::Selector("app.kubernetes.io/name=payments".to_string()),
+            &KubectlLogsTarget::Selector {
+                selector: "app.kubernetes.io/name=payments".to_string(),
+                workloads: 1,
+            },
             "payments",
             false,
             -1,
@@ -9410,9 +10213,19 @@ mod pin_plan_tests {
         json!({ "spec": { "destination": { "namespace": "apps" } } })
     }
 
+    /// The single-workload bundle every pre-2.27b assertion in this
+    /// module was written against — application `web`, one workload.
+    fn solo() -> BundleScope {
+        BundleScope {
+            application: "web".into(),
+            size: 1,
+            env: None,
+        }
+    }
+
     #[test]
     fn a_pin_plan_resolves_the_reference_from_the_crs_own_repository() {
-        let plan = plan_pin(&argo_app(), &cr_with(Some("prod")), "sha256:older").unwrap();
+        let plan = plan_pin(&argo_app(), &cr_with(Some("prod")), "sha256:older", solo()).unwrap();
         assert_eq!(plan.cr_name, "web");
         assert_eq!(plan.cr_ns, "prod");
         assert_eq!(plan.reference, "ghcr.io/acme/web@sha256:older");
@@ -9423,13 +10236,13 @@ mod pin_plan_tests {
     fn a_namespaceless_cr_borrows_the_argo_applications_destination() {
         // INVARIANT: the pin must land where the workload is. A
         // namespace-less server-side apply would silently target `default`.
-        let plan = plan_pin(&argo_app(), &cr_with(None), "sha256:older").unwrap();
+        let plan = plan_pin(&argo_app(), &cr_with(None), "sha256:older", solo()).unwrap();
         assert_eq!(plan.cr_ns, "apps");
     }
 
     #[test]
     fn a_pin_with_no_namespace_anywhere_is_refused_rather_than_defaulted() {
-        let err = plan_pin(&json!({}), &cr_with(None), "sha256:older").unwrap_err();
+        let err = plan_pin(&json!({}), &cr_with(None), "sha256:older", solo()).unwrap_err();
         assert!(
             format!("{err}").contains("cannot determine the application's namespace"),
             "{err}"
@@ -9445,13 +10258,19 @@ mod pin_plan_tests {
             "manager": "argocd-application-controller",
             "fieldsV1": { "f:metadata": { "f:annotations": { "f:apprafter.io/image-pin": {} } } }
         }]);
-        let err = plan_pin(&argo_app(), &cr, "sha256:older").unwrap_err();
+        let err = plan_pin(&argo_app(), &cr, "sha256:older", solo()).unwrap_err();
         assert!(format!("{err}").contains("Git owns"), "{err}");
     }
 
     #[test]
     fn pinning_to_what_is_already_running_is_refused_as_a_no_op() {
-        let err = plan_pin(&argo_app(), &cr_with(Some("apps")), "sha256:current").unwrap_err();
+        let err = plan_pin(
+            &argo_app(),
+            &cr_with(Some("apps")),
+            "sha256:current",
+            solo(),
+        )
+        .unwrap_err();
         assert!(format!("{err}").contains("already running"), "{err}");
     }
 
@@ -9459,7 +10278,7 @@ mod pin_plan_tests {
     fn the_pin_prompt_names_the_mode_change_and_the_verb_that_undoes_it() {
         // A pin is the one rollback that keeps acting after it returns, so
         // the way back has to be on screen before the reader agrees.
-        let plan = plan_pin(&argo_app(), &cr_with(Some("apps")), "sha256:older").unwrap();
+        let plan = plan_pin(&argo_app(), &cr_with(Some("apps")), "sha256:older", solo()).unwrap();
         let lines = pin_prompt_lines(&plan);
         assert!(
             lines[0].contains("from ghcr.io/acme/web@sha256:current"),
@@ -9476,7 +10295,7 @@ mod pin_plan_tests {
 
     #[test]
     fn the_pin_success_line_carries_the_un_pin_verb() {
-        let plan = plan_pin(&argo_app(), &cr_with(Some("apps")), "sha256:older").unwrap();
+        let plan = plan_pin(&argo_app(), &cr_with(Some("apps")), "sha256:older", solo()).unwrap();
         let line = pin_success_line(&plan);
         assert!(
             line.contains("pinned to ghcr.io/acme/web@sha256:older"),
@@ -9491,8 +10310,8 @@ mod pin_plan_tests {
         // manager. A namespace that differed by one step would prune
         // nothing and leave the application pinned while reporting success.
         let cr = cr_with(None);
-        let pin = plan_pin(&argo_app(), &cr, "sha256:older").unwrap();
-        let unpin = plan_unpin(&argo_app(), &cr).unwrap();
+        let pin = plan_pin(&argo_app(), &cr, "sha256:older", solo()).unwrap();
+        let unpin = plan_unpin(&argo_app(), &cr, solo()).unwrap();
         assert_eq!(unpin.cr_ns, pin.cr_ns);
         assert_eq!(unpin.cr_name, pin.cr_name);
     }
@@ -9500,7 +10319,7 @@ mod pin_plan_tests {
     #[test]
     fn an_unpinned_cr_reports_no_held_reference() {
         assert_eq!(
-            plan_unpin(&argo_app(), &cr_with(Some("apps")))
+            plan_unpin(&argo_app(), &cr_with(Some("apps")), solo())
                 .unwrap()
                 .pinned,
             None
@@ -9512,7 +10331,7 @@ mod pin_plan_tests {
         let mut cr = cr_with(Some("apps"));
         cr["metadata"]["annotations"] =
             json!({ "apprafter.io/image-pin": "ghcr.io/acme/web@sha256:held" });
-        let plan = plan_unpin(&argo_app(), &cr).unwrap();
+        let plan = plan_unpin(&argo_app(), &cr, solo()).unwrap();
         assert_eq!(plan.pinned.as_deref(), Some("ghcr.io/acme/web@sha256:held"));
         assert_eq!(plan.tag, "ghcr.io/acme/web:latest");
     }
@@ -9520,7 +10339,7 @@ mod pin_plan_tests {
     #[test]
     fn a_cr_with_no_resolved_tag_falls_back_to_a_phrase_that_still_reads() {
         let cr = json!({ "metadata": { "name": "web", "namespace": "apps" } });
-        assert_eq!(plan_unpin(&argo_app(), &cr).unwrap().tag, "its tag");
+        assert_eq!(plan_unpin(&argo_app(), &cr, solo()).unwrap().tag, "its tag");
     }
 
     #[test]
@@ -9530,7 +10349,7 @@ mod pin_plan_tests {
         let mut cr = cr_with(Some("apps"));
         cr["metadata"]["annotations"] =
             json!({ "apprafter.io/image-pin": "ghcr.io/acme/web@sha256:held" });
-        let lines = unpin_prompt_lines(&plan_unpin(&argo_app(), &cr).unwrap());
+        let lines = unpin_prompt_lines(&plan_unpin(&argo_app(), &cr, solo()).unwrap());
         assert!(
             lines[0].contains("currently held at ghcr.io/acme/web@sha256:held"),
             "{lines:?}"
@@ -9554,6 +10373,218 @@ mod pin_plan_tests {
     fn an_application_without_a_target_revision_reads_as_a_question_mark() {
         assert_eq!(current_target_revision(&json!({})), "?");
     }
+
+    /// The three-workload bundle `shop`, whose second workload is the
+    /// `web` CR every fixture in this module already builds.
+    fn trio() -> BundleScope {
+        BundleScope {
+            application: "shop".into(),
+            size: 3,
+            env: None,
+        }
+    }
+
+    #[test]
+    fn the_two_rollback_branches_do_not_read_the_same_on_a_bundle() {
+        // THE defect this subphase is about. `--to <digest>` pins ONE
+        // workload; `--to <git-rev>` moves the registration's
+        // targetRevision and with it EVERY workload. A prompt that reads
+        // identically for "pin this one image" and "roll all three
+        // workloads back to last Tuesday" is consent for the wrong
+        // operation.
+        let pin = pin_prompt_lines(
+            &plan_pin(&argo_app(), &cr_with(Some("apps")), "sha256:older", trio()).unwrap(),
+        )
+        .join("\n");
+        let rev = revision_prompt_lines("shop", "main", "v1.2.3", 3).join("\n");
+
+        // The pin says one of three, and which two it leaves alone —
+        // and stops calling its target "the application", which over a
+        // three-workload bundle claims triple the real blast radius.
+        assert!(pin.contains("1 of the 3 workloads"), "{pin}");
+        assert!(pin.contains("other 2 are not touched"), "{pin}");
+        assert!(!pin.contains("PINS the application"), "{pin}");
+        assert!(pin.contains("This PINS it: 'web'"), "{pin}");
+        // The revision says all three, in the same breath as the verb.
+        assert!(rev.contains("ALL 3 workloads"), "{rev}");
+        assert!(
+            !rev.contains("not touched"),
+            "the revision branch touches every workload: {rev}"
+        );
+
+        // Each points at the other, because the reader reaching for one
+        // may have wanted the other — and the difference is cardinality,
+        // which is invisible in the flag itself.
+        assert!(pin.contains("--to <revision>"), "{pin}");
+        assert!(rev.contains("--to <sha256:digest>"), "{rev}");
+
+        // The un-pin route quoted on a bundle must be addressable: the
+        // positional is the APPLICATION and the workload rides
+        // `--workload` (ADR 0062 §Addressing). `apprafter app unpin web`
+        // would be the collapse the whole rule prevents.
+        assert!(
+            pin.contains("apprafter app unpin shop --workload web"),
+            "{pin}"
+        );
+    }
+
+    #[test]
+    fn a_single_workload_bundle_renders_both_branches_exactly_as_before() {
+        // N = 1 is today's entire fleet. Neither prompt grows a line —
+        // the cardinality clause is added ONLY where cardinality exists.
+        //
+        // `solo()` is the coincident case, where the application and its
+        // one workload are both called `web`, which is what the scaffold
+        // produces and so what nearly every real bundle is. There the
+        // quoted un-pin is byte-identical to pre-2.27b. The ONE N = 1
+        // output that deliberately changed is the divergent case, pinned
+        // by `the_un_pin_route_names_the_application_when_the_names_diverge`.
+        let pin = pin_prompt_lines(
+            &plan_pin(&argo_app(), &cr_with(Some("apps")), "sha256:older", solo()).unwrap(),
+        );
+        assert_eq!(pin.len(), 3, "{pin:?}");
+        assert!(pin[1].contains("apprafter app unpin web"), "{pin:?}");
+        assert!(!pin.join("\n").contains("workloads"), "{pin:?}");
+
+        assert_eq!(
+            revision_prompt_lines("web", "main", "v1.2.3", 1),
+            vec!["Roll back Application 'web' from revision 'main' to 'v1.2.3'?".to_string()],
+        );
+        assert_eq!(
+            revision_success_line("web", "v1.2.3", 1),
+            "✓ Application 'web' rolled back to revision 'v1.2.3'. Argo CD will sync the \
+             workload within a reconcile cycle."
+        );
+    }
+
+    #[test]
+    fn the_un_pin_route_names_the_application_when_the_names_diverge() {
+        // A pin is the one rollback that keeps acting after the command
+        // returns, so the way back is not decoration — it is the whole
+        // reason the prompt names a verb at all. Handing over a command
+        // that errors leaves the reader pinned with no printed route out.
+        //
+        // The shape is the one this repository already pins as supported
+        // (`remove_plan_tests`, and `app.rs`'s own Argo-CD-app-`cms`
+        // assertion): registration `cms-prod`, grouping label `cms`,
+        // rendering ONE workload called `landing-cms`. N = 1 — so before
+        // this fix the pre-2.27b spelling applied and quoted
+        // `apprafter app unpin landing-cms`, which re-enters
+        // `resolve_app_for_command`, matches no Argo object and no
+        // `apprafter.io/application` label, and fails `not found`.
+        //
+        // ADR 0062 §Addressing has one rule and no size exception: the
+        // positional is the application. At N = 1 that is the whole
+        // command; `--workload` joins only when there is something to
+        // disambiguate.
+        let scope = BundleScope {
+            application: "cms".into(),
+            size: 1,
+            env: None,
+        };
+        let mut cr = cr_with(Some("cms"));
+        cr["metadata"]["name"] = json!("landing-cms");
+        let plan = plan_pin(&argo_app(), &cr, "sha256:older", scope).unwrap();
+
+        for line in [pin_prompt_lines(&plan)[1].clone(), pin_success_line(&plan)] {
+            assert!(
+                line.contains("apprafter app unpin cms"),
+                "the route out must name the application the caller typed: {line}"
+            );
+            assert!(
+                !line.contains("apprafter app unpin landing-cms"),
+                "quoting the workload name is the command that fails `not found`: {line}"
+            );
+            // No `--workload` at N = 1: there is nothing to
+            // disambiguate, and the flag would imply there is.
+            assert!(!line.contains("--workload"), "{line}");
+        }
+
+        // The block still names the WORKLOAD as the thing being pinned —
+        // the application is the address, not the target.
+        assert!(pin_prompt_lines(&plan)[0].contains("'landing-cms'"));
+    }
+
+    #[test]
+    fn every_quoted_command_carries_the_env_the_caller_typed() {
+        // A printed next-command is re-entered through
+        // `resolve_app_for_command`. On a registration with two or more
+        // environments, dropping `--env` makes that resolve to several
+        // deployments and error on `per_env_guidance_message` — so the
+        // handed-over command fails for a reason the reader did not
+        // cause. Not a safety bug (it fails loudly rather than acting
+        // wrongly), but a route out that does not work is not a route.
+        let scope = BundleScope {
+            application: "shop".into(),
+            size: 3,
+            env: Some("prod".into()),
+        };
+        let mut cr = cr_with(Some("shop"));
+        cr["metadata"]["name"] = json!("api");
+        let plan = plan_pin(&argo_app(), &cr, "sha256:older", scope).unwrap();
+        for line in [pin_prompt_lines(&plan)[2].clone(), pin_success_line(&plan)] {
+            assert!(
+                line.contains("apprafter app unpin shop --workload api --env prod"),
+                "{line}"
+            );
+        }
+
+        // The write refusal and the read prompt quote commands too, and
+        // they re-enter the same resolver.
+        let refusal = ambiguous_write_lines(
+            "rollback",
+            "shop",
+            &["api".to_string()],
+            &format!("{} --to sha256:beef", env_echo(Some("prod"))),
+        )
+        .join("\n");
+        assert!(
+            refusal
+                .contains("apprafter app rollback shop --workload api --env prod --to sha256:beef"),
+            "{refusal}"
+        );
+        assert!(
+            ambiguous_read_message("shop", &["api".to_string()], Some("prod"))
+                .contains("--workload <name> --env prod"),
+        );
+
+        // …and nothing is appended when the caller passed none, so the
+        // single-environment case — nearly every one — is untouched.
+        assert_eq!(env_echo(None), "");
+    }
+
+    #[test]
+    fn the_revision_success_line_stops_saying_the_workload_on_a_bundle() {
+        // The same defect `delete_success_line` already fixed: "the
+        // workload", after moving three of them, is simply false.
+        let line = revision_success_line("shop", "v1.2.3", 3);
+        assert!(line.contains("all 3 workloads"), "{line}");
+    }
+
+    #[test]
+    fn the_pin_success_line_quotes_an_addressable_un_pin_on_a_bundle() {
+        // A pin keeps acting after the command returns, so the way back
+        // has to be a command that works — at N > 1 that means the
+        // application plus `--workload`, not the workload alone.
+        let plan = plan_pin(&argo_app(), &cr_with(Some("apps")), "sha256:older", trio()).unwrap();
+        let line = pin_success_line(&plan);
+        assert!(
+            line.contains("apprafter app unpin shop --workload web"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn the_unpin_prompt_says_which_workload_of_how_many_it_moves() {
+        let mut cr = cr_with(Some("apps"));
+        cr["metadata"]["annotations"] =
+            json!({ "apprafter.io/image-pin": "ghcr.io/acme/web@sha256:held" });
+        let lines = unpin_prompt_lines(&plan_unpin(&argo_app(), &cr, trio()).unwrap()).join("\n");
+        assert!(lines.contains("1 of the 3 workloads"), "{lines}");
+        // …and adds nothing at N = 1.
+        let solo_lines = unpin_prompt_lines(&plan_unpin(&argo_app(), &cr, solo()).unwrap());
+        assert_eq!(solo_lines.len(), 2, "{solo_lines:?}");
+    }
 }
 
 #[cfg(test)]
@@ -9572,9 +10603,9 @@ mod logs_target_tests {
                   "name": "storefront", "namespace": "apps" }
             ]}
         });
-        let (ns, inner) = resolve_logs_workload(&app, "web-prod").unwrap();
+        let (ns, inner) = resolve_logs_workload(&app, "web-prod", None).unwrap();
         assert_eq!(ns, "apps");
-        assert_eq!(inner, "storefront");
+        assert_eq!(inner, vec!["storefront".to_string()]);
     }
 
     #[test]
@@ -9583,16 +10614,503 @@ mod logs_target_tests {
         // per-env lookup already produced. Falling back to the logical name
         // would select pods of no deployment at all.
         let app = json!({ "spec": { "destination": { "namespace": "apps" } } });
-        let (_, inner) = resolve_logs_workload(&app, "web-prod").unwrap();
-        assert_eq!(inner, "web-prod");
+        let (_, inner) = resolve_logs_workload(&app, "web-prod", None).unwrap();
+        assert_eq!(inner, vec!["web-prod".to_string()]);
     }
 
     #[test]
     fn an_application_without_a_destination_namespace_is_refused_with_a_reason() {
-        let err = resolve_logs_workload(&json!({}), "web").unwrap_err();
+        let err = resolve_logs_workload(&json!({}), "web", None).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("spec.destination.namespace"), "{msg}");
         assert!(msg.contains("'web'"), "{msg}");
+    }
+
+    #[test]
+    fn one_workload_still_selects_by_equality() {
+        // N = 1 must be byte-identical to pre-2.27b, argv included: the
+        // set form would be a gratuitous change to the command every
+        // existing user runs, and `--max-log-requests` must not move
+        // either.
+        assert_eq!(
+            build_kubectl_logs_target(&["storefront".to_string()], None),
+            KubectlLogsTarget::Selector {
+                selector: "app.kubernetes.io/name=storefront".to_string(),
+                workloads: 1,
+            }
+        );
+        let args = build_kubectl_logs_args(
+            &build_kubectl_logs_target(&["storefront".to_string()], None),
+            "apps",
+            true,
+            -1,
+            None,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "logs",
+                "-l",
+                "app.kubernetes.io/name=storefront",
+                "-n",
+                "apps",
+                "-f",
+                "--prefix=true",
+                "--max-log-requests=10",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bundle_multiplexes_every_workload_into_one_stream() {
+        // The `logs` decision (ADR 0062): a bundle is deployed together,
+        // so its workloads' lines interleave into one story. A set-based
+        // selector is what turns `kubectl logs -l` — already a
+        // multiplexer over pods — into one over workloads too.
+        let target = build_kubectl_logs_target(
+            &["api".to_string(), "web".to_string(), "worker".to_string()],
+            None,
+        );
+        assert_eq!(
+            target,
+            KubectlLogsTarget::Selector {
+                selector: "app.kubernetes.io/name in (api,web,worker)".to_string(),
+                workloads: 3,
+            }
+        );
+
+        let args = build_kubectl_logs_args(&target, "shop", true, -1, None);
+        // `--prefix=true` is what makes a multiplexed stream readable:
+        // every line arrives as `[pod/<pod>/<container>]`, and the
+        // operator names each Deployment after its workload, so the
+        // prefix carries the workload name.
+        assert!(args.contains(&"--prefix=true".to_string()), "{args:?}");
+        // The per-workload stream budget stays what it was; three
+        // workloads get three times the ceiling rather than sharing one,
+        // or `-f` on a replicated bundle fails with a flag this CLI does
+        // not expose.
+        assert!(
+            args.contains(&"--max-log-requests=30".to_string()),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn the_multiplex_banner_is_silent_whenever_the_stream_is_not_multiplexed() {
+        // The banner is an output CLAIM, and this file elsewhere keeps
+        // "we looked and found none" distinct from "we could not look"
+        // to the letter. `--pod` makes `build_kubectl_logs_target`
+        // return `Pod(..)` two lines later, so announcing three
+        // workloads and then streaming one pod is simply a false
+        // statement about what the reader is watching.
+        let trio = ["api".to_string(), "web".to_string(), "worker".to_string()];
+        assert_eq!(
+            multiplex_banner("shop", &trio, Some("api-7f9c-xyz")),
+            None,
+            "a --pod stream is one pod, whatever the bundle holds"
+        );
+        assert_eq!(
+            multiplex_banner("blog", &["blog".to_string()], None),
+            None,
+            "one workload is not a multiplex and needs no announcement"
+        );
+
+        let banner = multiplex_banner("shop", &trio, None).expect("three workloads, no --pod");
+        assert!(banner.contains("all 3 workloads of 'shop'"), "{banner}");
+        assert!(banner.contains("api, web, worker"), "{banner}");
+        assert!(banner.contains("--workload"), "{banner}");
+    }
+
+    #[test]
+    fn an_explicit_pod_still_overrides_the_selector_at_any_bundle_size() {
+        // `--pod` is strictly narrower than `--workload`, so it wins —
+        // and a direct pod name is not a multiplexed stream, so it keeps
+        // its prefix-free, ceiling-free argv.
+        let target = build_kubectl_logs_target(
+            &["api".to_string(), "web".to_string()],
+            Some("api-7f9c-xyz"),
+        );
+        assert_eq!(target, KubectlLogsTarget::Pod("api-7f9c-xyz".to_string()));
+        let args = build_kubectl_logs_args(&target, "shop", false, -1, None);
+        assert!(!args.iter().any(|a| a.starts_with("--prefix")), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a.starts_with("--max-log-requests")),
+            "{args:?}"
+        );
+    }
+}
+
+/// The addressing decision the four remaining `app` verbs share (ADR
+/// 0062 §Write surfaces) — `logs`, `open`, `rollback`, `unpin`.
+///
+/// Every test here runs the SAME fixture through all three
+/// [`WorkloadDemand`]s, because the thing being pinned is not any one
+/// verb's behaviour but the *difference* between them: at N > 1 with no
+/// `--workload`, a write refuses, a single-target read asks, and a
+/// multiplexing read takes every workload. A test per verb would let
+/// that difference drift one verb at a time.
+#[cfg(test)]
+mod workload_for_tests {
+    use super::*;
+
+    /// Every demand, so a rule that must hold for all of them is written
+    /// once and cannot be updated for two verbs out of three.
+    const EVERY_DEMAND: [WorkloadDemand; 3] = [
+        WorkloadDemand::Write,
+        WorkloadDemand::ReadOne,
+        WorkloadDemand::ReadEvery,
+    ];
+
+    fn placed(name: &str, namespace: &str) -> CrRef {
+        CrRef {
+            namespace: Some(namespace.to_string()),
+            name: name.to_string(),
+        }
+    }
+
+    /// A workload Argo CD tracks but that neither its own
+    /// `status.resources[]` entry nor the registration's
+    /// `spec.destination.namespace` places — the state
+    /// `apprafter_app_refs_reports_an_unknown_namespace_as_none`
+    /// documents as real.
+    fn unplaced(name: &str) -> CrRef {
+        CrRef {
+            namespace: None,
+            name: name.to_string(),
+        }
+    }
+
+    /// The three-workload bundle: one registration, one namespace.
+    fn bundle() -> Vec<CrRef> {
+        vec![
+            placed("api", "shop"),
+            placed("web", "shop"),
+            placed("worker", "shop"),
+        ]
+    }
+
+    #[test]
+    fn every_verb_is_unchanged_on_a_single_workload_bundle() {
+        // N = 1 is today's entire fleet, so this is the regression guard
+        // for the whole change: with one workload and no selector there
+        // is nothing to disambiguate, and every verb must resolve it
+        // outright — no prompt, no refusal, no multiplexing. Asserted
+        // across all three demands because "unchanged at N = 1" is a
+        // claim about the verbs collectively.
+        for demand in EVERY_DEMAND {
+            assert_eq!(
+                workload_for(&[placed("blog", "blog")], None, demand),
+                WorkloadChoice::One(PlacedWorkload {
+                    name: "blog".into(),
+                    namespace: "blog".into(),
+                }),
+                "{demand:?} changed the single-workload path",
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_verb_refuses_ambiguity_rather_than_picking_one() {
+        // The defect this subphase exists to end. Picking the first is
+        // how a pin lands on a workload nobody named — a silent mutation
+        // of the wrong object, which no later command can distinguish
+        // from a pin the operator meant.
+        let choice = workload_for(&bundle(), None, WorkloadDemand::Write);
+        assert_eq!(
+            choice,
+            WorkloadChoice::Refuse(vec!["api".into(), "web".into(), "worker".into()]),
+            "a write must refuse, and must name every candidate it refused to choose between",
+        );
+
+        // The refusal is only useful if the next command is
+        // copy-pasteable, so it quotes one per candidate — carrying the
+        // flags the caller already typed, or the retry loses them.
+        let lines = ambiguous_write_lines(
+            "rollback",
+            "shop",
+            &["api".to_string(), "web".to_string(), "worker".to_string()],
+            " --to sha256:beef",
+        );
+        let msg = lines.join("\n");
+        for w in ["api", "web", "worker"] {
+            assert!(
+                msg.contains(&format!(
+                    "apprafter app rollback shop --workload {w} --to sha256:beef"
+                )),
+                "{msg}",
+            );
+        }
+        // The positional stays the APPLICATION in every quoted command —
+        // ADR 0062 §Addressing. `apprafter app rollback api` would be
+        // the collapse this whole rule exists to prevent.
+        assert!(!msg.contains("app rollback api"), "{msg}");
+
+        // …and `rollback`'s refusal also names the branch that is not
+        // ambiguous, or the reader concludes the verb is unavailable on
+        // a bundle when in fact one of its two branches is bundle-wide
+        // by construction.
+        let full = rollback_refusal_lines(
+            "shop",
+            &["api".to_string(), "web".to_string(), "worker".to_string()],
+            " --to sha256:beef",
+        )
+        .join("\n");
+        assert!(full.contains("To roll ALL 3 workloads back"), "{full}");
+        assert!(
+            full.contains("apprafter app rollback shop --to <revision>"),
+            "{full}"
+        );
+        // `unpin` gets no such tail — it has no bundle-wide branch, and
+        // inventing one would be a route that does not exist.
+        let unpin = ambiguous_write_lines("unpin", "shop", &["api".to_string()], "").join("\n");
+        assert!(!unpin.contains("To roll ALL"), "{unpin}");
+    }
+
+    #[test]
+    fn a_read_verb_on_a_multi_workload_bundle_does_not_silently_pick_the_first() {
+        // Port-forwarding an arbitrary Service is wrong too — it puts a
+        // different application on localhost:8080 than the one the
+        // reader named — it is just not destructive, so `open` ASKS
+        // where a write refuses.
+        assert_eq!(
+            workload_for(&bundle(), None, WorkloadDemand::ReadOne),
+            WorkloadChoice::Ask(vec!["api".into(), "web".into(), "worker".into()]),
+        );
+
+        // `logs` multiplexes instead: `kubectl logs -l` already fans out
+        // across pods, a bundle is deployed together, and its workloads'
+        // lines interleave into one story. EVERY workload, not the first.
+        assert_eq!(
+            workload_for(&bundle(), None, WorkloadDemand::ReadEvery),
+            WorkloadChoice::Every(vec![
+                PlacedWorkload {
+                    name: "api".into(),
+                    namespace: "shop".into()
+                },
+                PlacedWorkload {
+                    name: "web".into(),
+                    namespace: "shop".into()
+                },
+                PlacedWorkload {
+                    name: "worker".into(),
+                    namespace: "shop".into()
+                },
+            ]),
+        );
+
+        // Stated as its own assertion because it is the actual
+        // regression: the pre-2.27 shim returned `refs[0].name` and
+        // every one of these verbs acted on it.
+        for demand in [WorkloadDemand::ReadOne, WorkloadDemand::ReadEvery] {
+            assert!(
+                !matches!(
+                    workload_for(&bundle(), None, demand),
+                    WorkloadChoice::One(_)
+                ),
+                "{demand:?} silently resolved one workload of three",
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_selector_wins_for_every_verb() {
+        // `--workload` is the disambiguator, in the same sense `--env`
+        // is: it answers the question the verb would otherwise have to
+        // refuse or ask. It answers it identically for all three, and it
+        // never resolves to the first.
+        for demand in EVERY_DEMAND {
+            assert_eq!(
+                workload_for(&bundle(), Some("web"), demand),
+                WorkloadChoice::One(PlacedWorkload {
+                    name: "web".into(),
+                    namespace: "shop".into(),
+                }),
+                "{demand:?} ignored an explicit --workload",
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_selector_names_the_workloads_that_exist() {
+        // Validated even at N = 1: accepting any name when there is only
+        // one workload would let a typo act on a different object than
+        // the reader asked for, and at N = 1 the application name and
+        // the workload name are usually the same string — so the typo is
+        // easy to make and invisible to catch. Same invariant
+        // `status_render_plan` already carries.
+        for refs in [bundle(), vec![placed("blog", "blog")]] {
+            for demand in EVERY_DEMAND {
+                let available: Vec<String> = refs.iter().map(|r| r.name.clone()).collect();
+                assert_eq!(
+                    workload_for(&refs, Some("wbe"), demand),
+                    WorkloadChoice::Unknown {
+                        asked: "wbe".into(),
+                        available: available.clone(),
+                    },
+                    "{demand:?} accepted a workload the bundle does not deploy",
+                );
+            }
+        }
+
+        // The candidate list is what corrects the typo, so it has to
+        // reach the reader.
+        let msg = unknown_workload_message("shop", "wbe", &["api".into(), "web".into()]);
+        assert!(msg.contains("api, web"), "{msg}");
+        assert!(msg.contains("'wbe'"), "{msg}");
+    }
+
+    #[test]
+    fn a_workload_whose_namespace_is_unknown_is_refused_not_passed_to_kubectl() {
+        // `CrRef::namespace` is `Option<String>` precisely so this case
+        // cannot be defaulted. `kubectl -n ""` does NOT error: it falls
+        // through to the kubeconfig's default namespace, so a pin would
+        // land — successfully, silently — on whatever object happens to
+        // share the name there. [`PlacedWorkload`] carries a plain
+        // `String`, so the only way out of this arm is a refusal.
+        for demand in EVERY_DEMAND {
+            assert_eq!(
+                workload_for(&[unplaced("api")], None, demand),
+                WorkloadChoice::Unplaceable("api".into()),
+                "{demand:?} accepted a workload it cannot place",
+            );
+            // …and by an explicit selector, which is the likelier route:
+            // a reader who typed `--workload api` gets the same refusal
+            // rather than a write into the default namespace.
+            assert_eq!(
+                workload_for(
+                    &[placed("web", "shop"), unplaced("api")],
+                    Some("api"),
+                    demand
+                ),
+                WorkloadChoice::Unplaceable("api".into()),
+            );
+        }
+
+        // The multiplexing read cannot quietly drop the one it could not
+        // place either: a stream missing a workload reads exactly like a
+        // workload that logged nothing.
+        assert_eq!(
+            workload_for(
+                &[placed("web", "shop"), unplaced("api")],
+                None,
+                WorkloadDemand::ReadEvery
+            ),
+            WorkloadChoice::Unplaceable("api".into()),
+        );
+    }
+}
+
+/// `--workload` must never be accepted and then thrown away.
+///
+/// The mirror image of [`workload_for_tests`], and the same defect with
+/// the sign flipped: those tests stop a write acting on a workload
+/// nobody named, these stop one acting on MORE than the workload the
+/// caller did name. Both are about the gap between what the operator
+/// addressed and what the command moves.
+#[cfg(test)]
+mod rollback_scope_tests {
+    use super::*;
+
+    #[test]
+    fn an_explicit_git_revision_refuses_a_workload_it_would_discard() {
+        // Shape (a): `apprafter app rollback shop --to v1.2.3 --workload api`.
+        // `--to <git-rev>` patches the registration's `targetRevision`,
+        // so Argo CD re-renders the whole package — all three workloads
+        // move. Accepting the flag and ignoring it hands the caller 3x
+        // the blast radius they addressed, and under `--yes` the prompt
+        // that would have disclosed it never prints.
+        let err = vet_rollback_scope(
+            "shop",
+            Some("api"),
+            Some("v1.2.3"),
+            &RollbackTarget::GitRevision("v1.2.3".into()),
+            3,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`--to v1.2.3` is a Git revision"), "{err}");
+        assert!(err.contains("all 3 workloads of 'shop'"), "{err}");
+        // Both ways out, because either may be what they meant.
+        assert!(err.contains("--to <sha256:digest>"), "{err}");
+        assert!(err.contains("drop `--workload api`"), "{err}");
+    }
+
+    #[test]
+    fn a_bare_rollback_that_falls_through_to_git_refuses_a_named_workload() {
+        // Shape (b), and the one a user reaches BY ACCIDENT: no `--to` at
+        // all. `apprafter app rollback shop --workload api` where `api`'s
+        // CR carries no `status.image.previous.resolved` —
+        // `classify_rollback_target` falls through to the previous
+        // `status.history` revision, and `rollback_to_revision` moves all
+        // three. Nothing the caller typed hints at that, and `--help`
+        // documents only the explicit-`--to` case.
+        let err = vet_rollback_scope(
+            "shop",
+            Some("api"),
+            None,
+            &RollbackTarget::GitRevision("abc123".into()),
+            3,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("'api' has no image to roll back to"), "{err}");
+        assert!(err.contains("Git revision 'abc123'"), "{err}");
+        assert!(err.contains("all 3 workloads of 'shop'"), "{err}");
+        assert!(err.contains("--to <sha256:digest>"), "{err}");
+        // The two shapes must not render the same: this caller never
+        // asked for a Git revision, so blaming their `--to` would be a
+        // false statement about what they typed.
+        assert!(!err.contains("is a Git revision"), "{err}");
+    }
+
+    #[test]
+    fn the_refusal_holds_at_every_bundle_size() {
+        // No size exception, for the same reason `BundleScope::verb_for`
+        // has none: `--workload` means "act on this workload", and a
+        // Git-revision rollback does not act on a workload at any N — it
+        // acts on the registration. Accepting it at N = 1 because the
+        // blast radius happens to coincide teaches a mental model that
+        // silently becomes a 3x write the day somebody adds a second
+        // workload to the bundle.
+        for size in [0, 1, 2, 3, 17] {
+            assert!(
+                vet_rollback_scope(
+                    "shop",
+                    Some("api"),
+                    None,
+                    &RollbackTarget::GitRevision("abc123".into()),
+                    size,
+                )
+                .is_err(),
+                "bundle_size {size} discarded the named workload",
+            );
+        }
+        // …and at N = 1 it does not claim a plurality it does not have.
+        let err = vet_rollback_scope(
+            "web",
+            Some("web"),
+            None,
+            &RollbackTarget::GitRevision("abc123".into()),
+            1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("the whole application 'web'"), "{err}");
+        assert!(!err.contains("workloads"), "{err}");
+    }
+
+    #[test]
+    fn everything_that_is_not_a_discarded_workload_proceeds() {
+        // The guard must not become a refusal machine: a digest target
+        // is per-workload and is exactly what `--workload` addresses, and
+        // a Git revision with no `--workload` is the bundle-wide branch
+        // working as designed.
+        let digest = RollbackTarget::Digest("sha256:beef".into());
+        let git = RollbackTarget::GitRevision("v1.2.3".into());
+        assert!(vet_rollback_scope("shop", Some("api"), None, &digest, 3).is_ok());
+        assert!(vet_rollback_scope("shop", Some("api"), Some("sha256:beef"), &digest, 3).is_ok());
+        assert!(vet_rollback_scope("shop", None, Some("v1.2.3"), &git, 3).is_ok());
+        assert!(vet_rollback_scope("shop", None, None, &git, 3).is_ok());
     }
 }
 

@@ -67,12 +67,21 @@ pub(crate) struct ServiceInfo {
 }
 
 /// Entry point for `apprafter app open <name>`.
+///
+/// ADR 0062: `name` is the REGISTRATION, which deploys 1..N workloads,
+/// and this verb forwards ONE of their Services. At N > 1 with no
+/// `--workload` it asks — see [`app::WorkloadDemand::ReadOne`]. A read,
+/// so it is a question rather than a refusal; but still a question,
+/// because forwarding whichever workload sorts first puts a different
+/// application on localhost:8080 than the reader named and nothing on
+/// screen would say so.
 pub fn open(
     name: &str,
     env: Option<String>,
     local_port: Option<u16>,
     container_port: Option<u16>,
     no_browser: bool,
+    workload: Option<String>,
 ) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
 
@@ -96,17 +105,8 @@ pub fn open(
 
     confirm_or_proceed_on_unhealthy(&app, name)?;
 
-    let apprafter_app_name = find_apprafter_app_name(&app).ok_or_else(|| {
-        CliError::Other(format!(
-            "Could not determine the AppRafter Application name from Argo CD's \
-             `status.resources[]` for '{name}'. The Argo CD Application's CMP \
-             output should declare exactly one `apprafter.io/Application` \
-             resource. If your manifest renders only raw Kubernetes resources \
-             (Deployment/Service direct), `app open` doesn't know which \
-             Service is primary yet — port-forward manually until walk-fix \
-             support for non-AppRafter apps lands."
-        ))
-    })?;
+    let apprafter_app_name =
+        resolve_open_workload(&app, name, workload.as_deref(), env.as_deref())?;
 
     let services = list_services_for_apprafter_app(&apprafter_app_name, &dest_ns, kc.path())?;
     let service = select_service(&services, &apprafter_app_name)?;
@@ -146,6 +146,58 @@ pub fn open(
 
     let _ = child.wait();
     Ok(())
+}
+
+/// Which workload's Service `open` forwards (ADR 0062).
+///
+/// The one arm that is not a straight resolution is
+/// [`app::WorkloadChoice::Ask`]: N > 1 and no `--workload`. In a TTY it
+/// prompts, which is the whole "reads ask, writes refuse" asymmetry —
+/// port-forwarding the wrong workload is recoverable (stop it and start
+/// another), so demanding a re-run with a flag would be a cost with no
+/// safety to buy. Outside a TTY there is nobody to ask, so it prints the
+/// candidates and the command that answers, exactly as
+/// [`confirm_or_proceed_on_unhealthy`] already degrades.
+fn resolve_open_workload(
+    app: &Value,
+    name: &str,
+    workload: Option<&str>,
+    env: Option<&str>,
+) -> Result<String> {
+    use crate::commands::app::{
+        ambiguous_read_message, unknown_workload_message, unplaceable_workload_message,
+        workload_for, WorkloadChoice, WorkloadDemand,
+    };
+
+    let refs = apprafter_app_refs(app);
+    match workload_for(&refs, workload, WorkloadDemand::ReadOne) {
+        WorkloadChoice::One(w) => Ok(w.name),
+        WorkloadChoice::Ask(candidates) => {
+            inquire::Select::new("Which workload?", candidates.clone())
+                .prompt()
+                .map_err(|_| CliError::Other(ambiguous_read_message(name, &candidates, env)))
+        }
+        // Unchanged: the raw-YAML / not-yet-synced diagnostic this
+        // command has always raised when Argo CD tracks no AppRafter CR.
+        WorkloadChoice::NoWorkloads => Err(CliError::Other(format!(
+            "Could not determine the AppRafter Application name from Argo CD's \
+             `status.resources[]` for '{name}'. The Argo CD Application's CMP \
+             output should declare exactly one `apprafter.io/Application` \
+             resource. If your manifest renders only raw Kubernetes resources \
+             (Deployment/Service direct), `app open` doesn't know which \
+             Service is primary yet — port-forward manually until walk-fix \
+             support for non-AppRafter apps lands."
+        ))),
+        WorkloadChoice::Unknown { asked, available } => Err(CliError::Other(
+            unknown_workload_message(name, &asked, &available),
+        )),
+        WorkloadChoice::Unplaceable(w) => {
+            Err(CliError::Other(unplaceable_workload_message(name, &w)))
+        }
+        WorkloadChoice::Refuse(_) | WorkloadChoice::Every(_) => {
+            unreachable!("WorkloadDemand::ReadOne neither refuses nor multiplexes")
+        }
+    }
 }
 
 /// Argo CD Application's `status.sync.status` + `status.
@@ -270,36 +322,11 @@ pub(crate) fn apprafter_app_refs(argocd_app: &Value) -> Vec<CrRef> {
         .unwrap_or_default()
 }
 
-/// Pure helper — walk Argo CD's `status.resources[]` to find
-/// the AppRafter Application CR it owns. Returns the inner
-/// `metadata.name` (which is the value the operator uses for
-/// `app.kubernetes.io/name` labels on rendered Service +
-/// Deployment) or `None` if no `apprafter.io/Application`
-/// entry exists in the array (raw-helm/kustomize apps without a
-/// CMP-rendered AppRafter CR).
-///
-/// Walk-fix #1 post-B.1.79b: original v0.1.161 implementation
-/// keyed off Argo CD's standard `app.kubernetes.io/instance`
-/// label, but Argo CD only stamps that on resources it
-/// directly applies — operator-rendered children carry a
-/// different label set. This helper bridges from outer (Argo
-/// CD) to inner (AppRafter) naming.
-///
-/// Since 2.27 this is the singular view of [`apprafter_app_refs`], kept
-/// as a shim so the callers that still speak about one workload keep
-/// working unchanged; they migrate to the plural form in a later plan.
-pub(crate) fn find_apprafter_app_name(argocd_app: &Value) -> Option<String> {
-    apprafter_app_refs(argocd_app)
-        .into_iter()
-        .next()
-        .map(|r| r.name)
-}
-
 /// Shell out to `kubectl get svc -n <ns> -l app.kubernetes.io/
 /// name=<apprafter-app-name> -o json`. The label is stamped
 /// by `operator-rendering::make_labels`; its value is the
 /// AppRafter Application CR's `metadata.name` (NOT the Argo
-/// CD parent name) — see `find_apprafter_app_name` for the
+/// CD parent name) — see [`apprafter_app_refs`] for the
 /// mapping.
 fn list_services_for_apprafter_app(
     apprafter_app_name: &str,
@@ -521,73 +548,26 @@ mod tests {
     }
 
     #[test]
-    fn find_apprafter_app_name_picks_application_entry_from_status_resources() {
-        // Walk-fix #1 post-B.1.79b regression guard.
-        // Real-world `kubectl get application -o json` shape:
-        // status.resources lists every resource Argo CD
-        // tracks. The first apprafter.io/Application entry
-        // is the inner app name we need for the operator's
-        // label selector.
+    fn apprafter_app_refs_is_empty_for_a_raw_yaml_app() {
+        // An app registered with raw helm / kustomize content: Argo CD HAS
+        // synced and `status.resources[]` is populated, but none of it is an
+        // `apprafter.io` Application. Distinct from the not-yet-synced case
+        // below, and the reason the group filter must not fall back to
+        // matching on kind or name — a Deployment called `my-app` must not be
+        // mistaken for the workload.
+        //
+        // `app open` turns this into its raw-YAML diagnostic and `app logs`
+        // into its fall-back-to-the-Argo-name selector, so what is pinned here
+        // is the input both of those branch on.
         let app = json!({
             "status": {
                 "resources": [
-                    {
-                        "group": "",
-                        "kind": "Namespace",
-                        "name": "apprafter",
-                        "version": "v1"
-                    },
-                    {
-                        "group": "apprafter.io",
-                        "kind": "Application",
-                        "name": "landing-web",
-                        "namespace": "apprafter",
-                        "version": "v1alpha1"
-                    }
+                    {"group": "apps", "kind": "Deployment", "name": "my-app", "version": "v1"},
+                    {"group": "", "kind": "Service", "name": "my-app", "version": "v1"}
                 ]
             }
         });
-        assert_eq!(
-            find_apprafter_app_name(&app),
-            Some("landing-web".to_string())
-        );
-    }
-
-    #[test]
-    fn find_apprafter_app_name_returns_none_for_raw_yaml_apps() {
-        // App registered with raw helm / kustomize content
-        // (no AppRafter Application CR in the rendered
-        // manifests). `app open` errors with a clear
-        // diagnostic; this test pins that the helper
-        // returns None rather than misidentifying e.g. a
-        // Deployment as the inner app name.
-        let app = json!({
-            "status": {
-                "resources": [
-                    {
-                        "group": "apps",
-                        "kind": "Deployment",
-                        "name": "my-app",
-                        "version": "v1"
-                    },
-                    {
-                        "group": "",
-                        "kind": "Service",
-                        "name": "my-app",
-                        "version": "v1"
-                    }
-                ]
-            }
-        });
-        assert_eq!(find_apprafter_app_name(&app), None);
-    }
-
-    #[test]
-    fn find_apprafter_app_name_returns_none_when_status_missing() {
-        // Fresh Application CR without a status block yet —
-        // Argo CD not yet reconciled. Helper must not panic.
-        let app = json!({ "spec": { "destination": { "namespace": "x" } } });
-        assert_eq!(find_apprafter_app_name(&app), None);
+        assert!(apprafter_app_refs(&app).is_empty());
     }
 
     #[test]
@@ -674,18 +654,6 @@ mod tests {
         // status.resources is absent until Argo has synced once. Empty is the
         // honest answer; callers must not read it as "not registered".
         assert!(apprafter_app_refs(&json!({"metadata": {"name": "fresh"}})).is_empty());
-    }
-
-    #[test]
-    fn find_apprafter_app_name_still_returns_the_first() {
-        // The singular shim stays until its callers migrate. Pinning it here
-        // means a change to the plural form cannot silently alter what the
-        // not-yet-migrated callers see.
-        let app = json!({"status": {"resources": [
-            {"group": "apprafter.io", "kind": "Application", "name": "api"},
-            {"group": "apprafter.io", "kind": "Application", "name": "web"}
-        ]}});
-        assert_eq!(find_apprafter_app_name(&app).as_deref(), Some("api"));
     }
 
     #[test]

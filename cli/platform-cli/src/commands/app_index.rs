@@ -58,19 +58,35 @@ const GROUPING_LABEL: &str = "/metadata/labels/apprafter.io~1application";
 pub(crate) struct WorkloadEntry {
     /// The decoded CR itself.
     ///
-    /// Unread outside the tests today. Its owner is the remaining half
-    /// of ADR 0062 §Write surfaces — `app rollback` / `app unpin`, which
-    /// "require an unambiguous workload" and then read the image pin off
-    /// the CR they resolved. `app.rs`'s `read_apprafter_cr` spends a
-    /// THIRD `kubectl get` for that object today, which is the read this
-    /// field exists to retire; carrying the CR is what makes the index
-    /// worth two cluster reads rather than one name lookup.
+    /// Unread outside the tests today. The owner this field was written
+    /// for — `app rollback` / `app unpin`, ADR 0062 §Write surfaces —
+    /// landed in 2.27b and did NOT become a reader, for a reason worth
+    /// recording rather than re-discovering:
     ///
-    /// `expect`, not `allow`: the moment a pin verb reads it, this
-    /// expectation goes unfulfilled and `unfulfilled_lint_expectations`
-    /// fires under `-D warnings`, so the suppression cannot outlive its
-    /// reason — the same machine check the module-wide attribute
-    /// provided before 2.27b fulfilled it.
+    /// * the pin verbs' git-ownership guard (`pin_appears_git_managed`)
+    ///   reads the field-ownership metadata kubectl strips from
+    ///   `get -o json` unless `--show-managed-fields` is passed — the
+    ///   D18 defect. [`AppIndex::read`] goes through
+    ///   `kubectl_get_json_by_selector`, which does not pass it
+    ///   (`kubectl_list_args`), so a pin served off this field would see
+    ///   an empty ownership list, conclude nobody owns the annotation,
+    ///   and silently never fire the guard — writing a pin the next Argo
+    ///   sync reverts;
+    /// * and there is no read to retire anyway. Those verbs resolve
+    ///   their workload out of the registration they are already
+    ///   holding (`app_open::apprafter_app_refs` + `app::workload_for`),
+    ///   exactly as the b-2 read surfaces do, so the index's two
+    ///   cluster-wide reads would be spent to replace one targeted
+    ///   `get`.
+    ///
+    /// The field stays because the tests read it and because the join it
+    /// completes is the module's subject; the attribute stays with it.
+    ///
+    /// `expect`, not `allow`: the moment any production caller reads it,
+    /// this expectation goes unfulfilled and
+    /// `unfulfilled_lint_expectations` fires under `-D warnings`, so the
+    /// suppression cannot outlive its reason — the same machine check
+    /// the module-wide attribute provided before 2.27b fulfilled it.
     ///
     /// `not(test)` because this module's own tests DO read the field, so
     /// `dead_code` never fires in the test build and a bare `expect`
@@ -121,13 +137,21 @@ pub(crate) struct AppIndex {
 /// and it re-derives a bundle's workloads from
 /// [`AppIndex::workloads_of`] on the one arm that wants them.
 ///
-/// Their owner is the remaining half of ADR 0062 §Write surfaces —
-/// `app rollback` / `app unpin`, which "require an unambiguous workload"
-/// and so must print the candidates a reader is being asked to choose
-/// between. Each attribute is on its own variant rather than on the
-/// enum: a blanket one would stay silently fulfilled until the LAST
-/// payload found a reader, which is exactly the drift `expect` is here
-/// to prevent. `not(test)` scopes the claim to where it is true — the
+/// They were written for the remaining half of ADR 0062 §Write surfaces
+/// — `app rollback` / `app unpin`, which "require an unambiguous
+/// workload" and so must print the candidates a reader is being asked to
+/// choose between. Those verbs landed in 2.27b and print exactly that,
+/// but out of `app::workload_for` over the registration they already
+/// hold, not out of this resolver: the string they are disambiguating is
+/// a `--workload` VALUE inside one bundle, whereas `resolve` answers
+/// "what did this POSITIONAL name", which for those verbs is settled
+/// before the question arises. See [`WorkloadEntry::cr`] for the second
+/// reason (`--show-managed-fields`).
+///
+/// Each attribute is on its own variant rather than on the enum: a
+/// blanket one would stay silently fulfilled until the LAST payload
+/// found a reader, which is exactly the drift `expect` is here to
+/// prevent. `not(test)` scopes the claim to where it is true — the
 /// resolver tests read every payload, so `dead_code` fires only in the
 /// production build (see [`WorkloadEntry::cr`]).
 #[derive(Debug)]

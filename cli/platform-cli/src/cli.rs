@@ -978,6 +978,12 @@ pub enum AppCommand {
         /// app's destination namespace.
         #[arg(long)]
         pod: Option<String>,
+        /// Stream only this workload of the application instead of all of
+        /// them. A manifest package may hold several; the positional argument
+        /// is always the application (the registration), never a workload —
+        /// this is how you address one inside it. ADR 0062.
+        #[arg(long, value_name = "NAME")]
+        workload: Option<String>,
     },
     /// Roll back to a previous revision. Reads
     /// `status.history` from the Argo CD `Application`,
@@ -1006,6 +1012,17 @@ pub enum AppCommand {
         /// shells.
         #[arg(long, default_value_t = false)]
         yes: bool,
+        /// Pin this workload of the application. A manifest package may hold
+        /// several; the positional argument is always the application (the
+        /// registration), never a workload — this is how you address one
+        /// inside it. ADR 0062. Required when the application deploys more
+        /// than one workload. It selects an IMAGE pin only: any rollback
+        /// that resolves to a Git revision moves EVERY workload of the
+        /// application, so naming one is refused rather than silently
+        /// ignored — that applies both to `--to <revision>` and to a bare
+        /// `rollback` whose workload has no image to roll back to.
+        #[arg(long, value_name = "NAME")]
+        workload: Option<String>,
     },
     /// Resume following the image tag after `app rollback` pinned
     /// the application to a digest. The app may roll forward to
@@ -1023,6 +1040,14 @@ pub enum AppCommand {
         /// shells.
         #[arg(long, default_value_t = false)]
         yes: bool,
+        /// Un-pin this workload of the application. A manifest package may
+        /// hold several; the positional argument is always the application
+        /// (the registration), never a workload — this is how you address one
+        /// inside it. ADR 0062. Required when the application deploys more
+        /// than one workload: a pin lives on one workload's CR, and this
+        /// command will not choose which.
+        #[arg(long, value_name = "NAME")]
+        workload: Option<String>,
     },
     /// Generate a starter `apprafter/Application.cue` based
     /// on the cwd's runtime markers (bun.lock / Cargo.toml /
@@ -1108,6 +1133,13 @@ pub enum AppCommand {
         /// that want to forward in the background.
         #[arg(long = "no-browser", default_value_t = false)]
         no_browser: bool,
+        /// Forward this workload of the application. A manifest package may
+        /// hold several; the positional argument is always the application
+        /// (the registration), never a workload — this is how you address one
+        /// inside it. ADR 0062. Without it, an application deploying more
+        /// than one workload prompts for the choice.
+        #[arg(long, value_name = "NAME")]
+        workload: Option<String>,
     },
     /// Delete an Application and cascade-remove the Argo CD CR
     /// (which Argo CD then tears down child resources for).
