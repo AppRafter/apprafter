@@ -1086,6 +1086,10 @@ async fn remove_database(ctx: &Arc<Context>, rc: &RetainedClaim) -> Result<(), R
         rc.spec.database.as_deref().unwrap_or_default(),
         rc.spec.role.as_deref().unwrap_or_default(),
         "absent",
+        // No extensions on the DROP body: the database itself is going, so
+        // naming what should live in it would be noise — and CNPG is being
+        // told to remove the whole thing, not to reconcile its contents.
+        &[],
     );
     match api
         .patch(db_object, &apply_params(), &Patch::Apply(&body))

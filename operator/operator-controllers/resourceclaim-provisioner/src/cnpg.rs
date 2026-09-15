@@ -206,7 +206,49 @@ pub fn database_object(
     db: &str,
     owner: &str,
     ensure: &str,
+    extensions: &[operator_core::PgExtension],
 ) -> Value {
+    let mut spec = json!({
+        "cluster": { "name": cluster },
+        "name": db,
+        "owner": owner,
+        // `present` (provision) or `absent` (GC drop). The GC re-sends
+        // the FULL body with `ensure: absent` — NOT a partial SSA apply,
+        // which would strip cluster/name/owner that this same field
+        // manager owns and break the drop.
+        "ensure": ensure,
+    });
+
+    // 2.29 (ADR 0066 §4): declarative extensions, emitted only when the
+    // claim asks for any — an empty list would be a statement that the
+    // database should have NO extensions, which is a different claim from
+    // "this manifest does not manage extensions" and would fight anything a
+    // user created by hand.
+    //
+    // `ensure` is not set per entry: the platform expresses removal by
+    // dropping the entry from the list, and CNPG's own default is `present`.
+    // Nothing here ever asks for a CASCADE — `DROP EXTENSION` failing on a
+    // dependent object is the outcome we want surfaced (measured: it names
+    // the dependency), because a silent cascade would delete a column
+    // default on a manifest edit whose author was tidying a list.
+    if !extensions.is_empty() {
+        let list: Vec<Value> = extensions
+            .iter()
+            .map(|e| {
+                let mut o = serde_json::Map::new();
+                o.insert("name".into(), json!(e.name));
+                if let Some(v) = e.version.as_deref() {
+                    o.insert("version".into(), json!(v));
+                }
+                if let Some(s) = e.schema.as_deref() {
+                    o.insert("schema".into(), json!(s));
+                }
+                Value::Object(o)
+            })
+            .collect();
+        spec["extensions"] = Value::Array(list);
+    }
+
     json!({
         "apiVersion": "postgresql.cnpg.io/v1",
         "kind": "Database",
@@ -214,16 +256,7 @@ pub fn database_object(
             "name": name,
             "namespace": ns,
         },
-        "spec": {
-            "cluster": { "name": cluster },
-            "name": db,
-            "owner": owner,
-            // `present` (provision) or `absent` (GC drop). The GC re-sends
-            // the FULL body with `ensure: absent` — NOT a partial SSA apply,
-            // which would strip cluster/name/owner that this same field
-            // manager owns and break the drop.
-            "ensure": ensure,
-        },
+        "spec": spec,
     })
 }
 
@@ -497,6 +530,7 @@ mod tests {
             "appdb",
             "approle",
             "present",
+            &[],
         );
         assert_eq!(d["apiVersion"], "postgresql.cnpg.io/v1");
         assert_eq!(d["kind"], "Database");
@@ -506,6 +540,60 @@ mod tests {
         assert_eq!(d["spec"]["name"], "appdb");
         assert_eq!(d["spec"]["owner"], "approle");
         assert_eq!(d["spec"]["ensure"], "present");
+    }
+
+    #[test]
+    fn database_object_carries_declared_extensions() {
+        let d = database_object(
+            "claim-db",
+            "cnpg-system",
+            "platform-postgres",
+            "appdb",
+            "approle",
+            "present",
+            &[
+                operator_core::PgExtension {
+                    name: "vector".into(),
+                    ..Default::default()
+                },
+                operator_core::PgExtension {
+                    name: "pg_trgm".into(),
+                    version: Some("1.6".into()),
+                    schema: Some("public".into()),
+                },
+            ],
+        );
+        assert_eq!(d["spec"]["extensions"][0]["name"], "vector");
+        // An absent version must not serialize: CNPG would read a null as a
+        // request rather than as "whatever the control file says".
+        assert!(d["spec"]["extensions"][0].get("version").is_none());
+        assert_eq!(d["spec"]["extensions"][1]["version"], "1.6");
+        assert_eq!(d["spec"]["extensions"][1]["schema"], "public");
+        // `ensure` is never set per entry — removal is expressed by dropping
+        // the entry, and CNPG's own default is `present`.
+        assert!(d["spec"]["extensions"][0].get("ensure").is_none());
+    }
+
+    #[test]
+    fn database_object_omits_extensions_entirely_when_none_are_declared() {
+        // An empty LIST is a different statement from an ABSENT key: it says
+        // this database should have no extensions, which would fight anything
+        // a user created by hand. Absent says the manifest does not manage
+        // them.
+        let d = database_object(
+            "claim-db",
+            "cnpg-system",
+            "platform-postgres",
+            "appdb",
+            "approle",
+            "present",
+            &[],
+        );
+        assert!(
+            d["spec"].get("extensions").is_none(),
+            "an empty declaration must not become an empty list: {}",
+            d["spec"]
+        );
     }
 
     #[test]
@@ -520,6 +608,7 @@ mod tests {
             "appdb",
             "approle",
             "absent",
+            &[],
         );
         assert_eq!(d["spec"]["ensure"], "absent");
         assert_eq!(d["spec"]["cluster"]["name"], "platform-postgres");

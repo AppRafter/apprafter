@@ -587,7 +587,19 @@ async fn provision_cloudnativepg(
     //    owner role materialises.
     let db_api: Api<DynamicObject> =
         Api::namespaced_with(ctx.client.clone(), &cnpg_ns, &database_ar());
-    let db_body = cnpg::database_object(&object_name, &cnpg_ns, &cluster, &db, &role, "present");
+    // 2.29 (ADR 0066 §4): the claim's declared extensions ride the Database
+    // CR. The webhook already bounded them against the allow list; the
+    // provisioner re-checks because a ResourceClaim can be written directly.
+    let extensions = claim.spec.extensions.clone().unwrap_or_default();
+    let db_body = cnpg::database_object(
+        &object_name,
+        &cnpg_ns,
+        &cluster,
+        &db,
+        &role,
+        "present",
+        &extensions,
+    );
     db_api
         .patch(&object_name, &apply_params(), &Patch::Apply(&db_body))
         .await?;
