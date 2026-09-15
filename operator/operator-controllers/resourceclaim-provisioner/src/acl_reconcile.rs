@@ -689,6 +689,7 @@ mod tests {
                 size: None,
                 persistent: None,
                 jetstream: None,
+                ..Default::default()
             },
         );
         c.metadata.namespace = Some(ns.to_string());
@@ -822,6 +823,7 @@ mod tests {
                 size: None,
                 persistent: None,
                 jetstream: None,
+                ..Default::default()
             },
         );
         pg.metadata.namespace = Some("demo".into());

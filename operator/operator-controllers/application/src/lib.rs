@@ -5173,6 +5173,7 @@ mod tests {
                 )])),
                 size: Some("small".into()),
                 persistent: None,
+                ..Default::default()
             },
         );
         let spec = base_with_needs(needs);
@@ -5195,6 +5196,7 @@ mod tests {
                 selector: None,
                 size: None,
                 persistent: Some(true),
+                ..Default::default()
             },
         );
         // A second need WITHOUT persistent must omit the key entirely.
@@ -5697,6 +5699,7 @@ mod tests {
                 size: None,
                 persistent: None,
                 jetstream: None,
+                ..Default::default()
             },
         );
         c.metadata.namespace = Some("demo".into());
@@ -5744,6 +5747,7 @@ mod tests {
                 size: Some("1Gi".into()),
                 persistent: None,
                 jetstream: None,
+                ..Default::default()
             },
         );
         c.metadata.namespace = Some("demo".into());
@@ -5875,6 +5879,7 @@ mod tests {
                 size: None,
                 persistent: None,
                 jetstream: None,
+                ..Default::default()
             },
         );
         c.metadata.namespace = Some("demo".into());
@@ -6021,6 +6026,7 @@ mod tests {
                 size: Some("1Gi".into()),
                 persistent: None,
                 jetstream: None,
+                ..Default::default()
             },
         );
         c.metadata.namespace = Some("demo".into());
@@ -6195,6 +6201,7 @@ mod tests {
                 size: None,
                 persistent: None,
                 jetstream: None,
+                ..Default::default()
             },
         );
         c.metadata.namespace = Some("demo".into());

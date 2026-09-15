@@ -1600,6 +1600,7 @@ mod tests {
                 size: None,
                 persistent: None,
                 jetstream: Some(js),
+                ..Default::default()
             },
             status: None,
         }

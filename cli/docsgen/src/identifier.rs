@@ -170,7 +170,7 @@ pub const STRUCTURE_ROOTS: [&str; 5] = ["base", "environments", "expose", "needs
 /// one: [`extract_paths`] is a pure lexer with no schema in the room,
 /// which is what lets its grammar be tested without a repository.
 /// `kind_roots_match_the_shipped_schemas` is what keeps it honest.
-pub const KIND_ROOTS: [&str; 13] = [
+pub const KIND_ROOTS: [&str; 14] = [
     "AccessGrant",
     "Application",
     "ExternalSurface",
@@ -182,6 +182,7 @@ pub const KIND_ROOTS: [&str; 13] = [
     "RetainedClaim",
     "ServiceProvider",
     "ServiceProviderPlugin",
+    "SharedDatabase",
     "SharedVolume",
     "SourceCredential",
 ];

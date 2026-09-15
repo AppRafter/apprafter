@@ -49,6 +49,24 @@ spec:
             type: object
           spec:
             properties:
+              access:
+                enum:
+                - rw
+                - ro
+                type: string
+              extensions:
+                items:
+                  properties:
+                    name:
+                      type: string
+                    schema:
+                      type: string
+                    version:
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
               jetstream:
                 properties:
                   consume:
@@ -243,6 +261,8 @@ spec:
                   type: string
                 minProperties: 1
                 type: object
+              sharedRef:
+                type: string
               size:
                 type: string
               type:

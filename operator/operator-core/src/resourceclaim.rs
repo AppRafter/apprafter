@@ -52,6 +52,20 @@ pub struct ResourceClaimSpec {
     /// Application precedent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jetstream: Option<ResourceClaimJetStream>,
+    /// 2.29 (ADR 0066 §2): bind an existing `SharedDatabase` in the same
+    /// namespace instead of provisioning a new resource. The provisioner
+    /// branches on this — present means bind a consumer (a role, a password,
+    /// a Secret), absent means the pre-2.29 provision path verbatim.
+    #[serde(default, rename = "sharedRef", skip_serializing_if = "Option::is_none")]
+    pub shared_ref: Option<String>,
+    /// `rw` (default) or `ro`. Meaningful only with `shared_ref`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+    /// pg only: extensions to create in the database this claim OWNS. Never
+    /// set together with `shared_ref` — a shared database's extensions belong
+    /// to the `SharedDatabase`, or two consumers could ask for different sets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Vec<crate::shareddatabase::PgExtension>>,
 }
 
 /// The jetstream permission model's INPUT, carried on the claim itself
@@ -262,6 +276,9 @@ mod tests {
             size: None,
             persistent: None,
             jetstream: None,
+            shared_ref: None,
+            access: None,
+            extensions: None,
         };
         let v = serde_json::to_value(&spec).unwrap();
         assert_eq!(v.get("type"), Some(&json!("redis")));

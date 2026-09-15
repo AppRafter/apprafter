@@ -170,6 +170,7 @@ async fn scheduler_matches_claim_to_alphabetically_first_provider() {
             size: None,
             persistent: None,
             jetstream: None,
+            ..Default::default()
         },
         status: None,
     };
@@ -218,6 +219,7 @@ async fn scheduler_matches_claim_to_alphabetically_first_provider() {
             size: None,
             persistent: None,
             jetstream: None,
+            ..Default::default()
         },
         status: None,
     };

@@ -1756,12 +1756,14 @@ mod tests {
                 selector: None,
                 size: Some("small".into()),
                 persistent: None,
+                ..Default::default()
             })),
             redis: Some(OneOrMany::One(ServiceNeed {
                 name: None,
                 selector: None,
                 size: Some("nano".into()),
                 persistent: None,
+                ..Default::default()
             })),
             ..Default::default()
         };
@@ -1774,6 +1776,7 @@ mod tests {
                 )])),
                 size: None,
                 persistent: None,
+                ..Default::default()
             })),
             ..Default::default()
         };

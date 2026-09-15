@@ -536,6 +536,17 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
          subtree constrains no user input.",
     ),
     (
+        "SharedDatabase",
+        "status",
+        "operator-written status, same shape and same reason as SharedVolume above: the \
+         CUE-derived CRD marks it x-kubernetes-preserve-unknown-fields (opaque), the kube-rs \
+         type declares the concrete fields (ready, refCount, database, instance, dbnum, \
+         conditions). The status subtree constrains no user input. Note what is NOT there and \
+         must not appear: a connectionSecretRef — every consumer of a shared database holds \
+         its own credential (ADR 0066 §1), so a shared Secret in the status would be the \
+         thing that CRD exists to avoid.",
+    ),
+    (
         "PlatformStack",
         "spec.overrides.[*].values",
         "free-form per-component values merge: the CUE-derived CRD marks it \
@@ -561,6 +572,7 @@ fn rust_crd(component: &str) -> Option<Value> {
         "SourceCredential" => operator_core::SourceCredential::crd(),
         "PlatformStack" => operator_core::PlatformStack::crd(),
         "SharedVolume" => operator_core::SharedVolume::crd(),
+        "SharedDatabase" => operator_core::SharedDatabase::crd(),
         _ => return None,
     };
     serde_json::to_value(crd).ok()
@@ -634,6 +646,30 @@ fn assertion_b(rendered: &[crate::Rendered]) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn every_generated_crd_has_a_rust_type_for_assertion_b_to_compare() {
+        // `rust_crd` returns None for a component with no arm, and assertion
+        // B SKIPS those — which is correct for a schema-only CRD and silently
+        // wrong for a new one that simply has not been wired up. Adding
+        // SharedDatabase to `CRDS` without this test would have made the
+        // Rust↔CUE axis quietly stop covering it while `crd-check` kept
+        // reporting OK, which is worse than a red gate.
+        //
+        // If a genuinely schema-only CRD ever lands, add it to an explicit
+        // exemption list HERE with its reason, the way ALLOWLIST does — do
+        // not delete the test.
+        let missing: Vec<&str> = crate::CRDS
+            .iter()
+            .map(|c| c.component)
+            .filter(|c| rust_crd(c).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these generated CRDs have no `rust_crd` arm, so assertion B is \
+             silently not checking them: {missing:?}"
+        );
+    }
 
     fn kinds(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs

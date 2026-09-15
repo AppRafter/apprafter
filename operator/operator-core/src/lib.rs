@@ -15,6 +15,7 @@ pub mod promscrape;
 pub mod resourceclaim;
 pub mod retainedclaim;
 pub mod serviceprovider;
+pub mod shareddatabase;
 pub mod sharedvolume;
 pub mod sourcecredential;
 
@@ -55,6 +56,13 @@ pub use resourceclaim::{
 };
 pub use retainedclaim::{ClaimRef, RetainedClaim, RetainedClaimSpec};
 pub use serviceprovider::{ServiceProvider, ServiceProviderSpec, ServiceProviderStatus};
+// `COND_READY` is re-exported from `sharedvolume` (both modules define the
+// same "Ready" literal); SharedDatabase's is reached as
+// `shareddatabase::COND_READY` where the distinction matters.
+pub use shareddatabase::{
+    PgExtension, SharedDatabase, SharedDatabaseCondition, SharedDatabaseSpec, SharedDatabaseStatus,
+    COND_EXTENSION_UNAVAILABLE,
+};
 pub use sharedvolume::{
     SharedVolume, SharedVolumeCapacity, SharedVolumeCondition, SharedVolumeSpec,
     SharedVolumeStatus, COND_CAPACITY_WARNING, COND_READY,

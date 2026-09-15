@@ -136,6 +136,7 @@ async fn provisioner_provisions_a_scheduled_pg_claim() {
             size: None,
             persistent: None,
             jetstream: None,
+            ..Default::default()
         },
         status: None,
     };

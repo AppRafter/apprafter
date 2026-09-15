@@ -255,6 +255,21 @@ pub struct ServiceNeed {
     /// pool instance (snapshot→PVC) instead of an ephemeral one (ADR 0042).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persistent: Option<bool>,
+    /// 2.29 (ADR 0066 §2): bind an existing `SharedDatabase` in this
+    /// application's own namespace instead of provisioning a new resource.
+    /// Mutually exclusive with `size`, `persistent` and `selector`
+    /// (webhook-enforced) — the SharedDatabase already made those decisions.
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub ref_: Option<String>,
+    /// `rw` (default) or `ro` — this application's own privilege level on the
+    /// shared database. Rejected without `ref`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+    /// pg only: extensions for the OWNED database this need provisions.
+    /// Rejected together with `ref`, because a shared database's extensions
+    /// belong to the `SharedDatabase` and not to one of its consumers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Vec<crate::shareddatabase::PgExtension>>,
 }
 
 /// A `needs.<type>` value that is either a single (scalar) entry or an
@@ -554,6 +569,16 @@ impl JetStreamNeed {
             selector: self.selector.clone(),
             size: self.size.clone(),
             persistent: None,
+            // 2.29: `#JetStreamNeed` has no `ref`/`access`/`extensions` and
+            // never will — a shared JetStream account is ADR 0066's explicit
+            // out-of-scope, and extensions are a PostgreSQL concept. Written
+            // out rather than `..Default::default()` so that adding a field
+            // to `ServiceNeed` makes this conversion fail to compile and a
+            // human decides, which is the whole reason this struct literal is
+            // exhaustive.
+            ref_: None,
+            access: None,
+            extensions: None,
         }
     }
 }

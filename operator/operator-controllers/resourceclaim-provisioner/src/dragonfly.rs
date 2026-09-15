@@ -841,6 +841,7 @@ mod tests {
                 size: None,
                 persistent: None,
                 jetstream: None,
+                ..Default::default()
             },
         );
         c.status = Some(ResourceClaimStatus {

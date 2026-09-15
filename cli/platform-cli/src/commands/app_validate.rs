@@ -69,8 +69,15 @@ macro_rules! workspace_schemas {
 ///
 /// `pub` because `docsgen`'s CUE-document check lays the SAME
 /// bundle (through `docs_api`) to vet the manifests printed in the
-/// documentation. Two embeddings of the same fourteen files would
-/// be two things to keep in step; one is one.
+/// documentation. Two embeddings of the same files would be two
+/// things to keep in step; one is one.
+///
+/// The list is hand-written and the directory is not, so
+/// `the_workspace_bundle_mirrors_the_schema_directory` below asserts
+/// they match. A file missing here is not a missing file: the bundle
+/// still lays, `cue vet` still runs, and it fails with an
+/// unresolved-reference error about OUR workspace that reads like a
+/// problem with the user's manifest.
 pub const WORKSPACE_SCHEMAS: &[(&str, &str)] = workspace_schemas![
     "accessgrant.cue",
     "application.cue",
@@ -83,6 +90,7 @@ pub const WORKSPACE_SCHEMAS: &[(&str, &str)] = workspace_schemas![
     "retainedclaim.cue",
     "serviceprovider.cue",
     "serviceproviderplugin.cue",
+    "shareddatabase.cue",
     "sharedvolume.cue",
     "sourcecredential.cue",
     "types.cue",
@@ -1306,6 +1314,39 @@ mod tests {
     use std::collections::HashSet;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn the_workspace_bundle_mirrors_the_schema_directory() {
+        // WORKSPACE_SCHEMAS is hand-written; `schemas/v1alpha1/` is not. A
+        // file added there and forgotten here does NOT fail to build — the
+        // bundle lays, `cue vet` runs, and it reports an unresolved reference
+        // that reads like a problem with the user's manifest rather than with
+        // our workspace. (Measured: adding `shareddatabase.cue` without this
+        // line broke the docs gate with `reference "#PgExtension" not found`
+        // pointing at our own injected copy.)
+        //
+        // Read from disk rather than from the include_str! list, because the
+        // list is the thing under test.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../schemas/v1alpha1");
+        let mut on_disk: Vec<String> = fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".cue"))
+            .collect();
+        on_disk.sort();
+        let mut bundled: Vec<String> = WORKSPACE_SCHEMAS
+            .iter()
+            .map(|(n, _)| (*n).to_string())
+            .collect();
+        bundled.sort();
+        assert_eq!(
+            bundled, on_disk,
+            "WORKSPACE_SCHEMAS has drifted from schemas/v1alpha1/. Every file in that \
+             directory must be bundled: a partial bundle fails as an error about the \
+             USER'S manifest."
+        );
+    }
 
     // ── resolve_manifest_path — pure discovery rules ──────────
 

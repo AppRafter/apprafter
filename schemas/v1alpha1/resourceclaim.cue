@@ -42,6 +42,30 @@ package v1alpha1
 		// that cannot follow `needs.disk`'s `mountPath`-stays-on-the-
 		// Application precedent.
 		jetstream?: #ResourceClaimJetStream
+
+		// 2.29 (ADR 0066 §2): this claim BINDS an existing `SharedDatabase`
+		// in the same namespace instead of provisioning a new resource.
+		// Copied from the originating `needs.<type>.ref` by the Application
+		// controller.
+		//
+		// The claim is generated either way — unlike `needs.disk.ref`, which
+		// generates none — because a database binding has something
+		// per-consumer to provision (a role, a password, a Secret), and
+		// reusing the claim keeps `claim.<type>.*` references, the egress
+		// rule, the readiness gate and GC working unchanged. The provisioner
+		// branches on this field: present means bind a consumer, absent means
+		// provision a new resource, which is the pre-2.29 path verbatim.
+		sharedRef?: string
+
+		// Privilege level of THIS consumer's credential on the shared
+		// database. Meaningful only with `sharedRef`.
+		access?: "rw" | *"rw" | "ro"
+
+		// pg only: extensions to create in the database this claim owns.
+		// Never set together with `sharedRef` — a shared database's
+		// extensions belong to the `SharedDatabase`, or two consumers could
+		// ask for different sets of them.
+		extensions?: [...#PgExtension]
 	}
 
 	status?: {

@@ -357,6 +357,39 @@ _mkFields: {
 	// (default false). redis: routes to a persistent pool instance
 	// (snapshot→PVC) instead of an ephemeral one (ADR 0042).
 	persistent?: bool
+
+	// Bind an EXISTING `SharedDatabase` in this application's own namespace
+	// instead of provisioning a new resource (2.29 / ADR 0066 §2).
+	//
+	// Mutually exclusive with `size`, `persistent` and `selector` — the
+	// SharedDatabase already made those decisions — and webhook-enforced,
+	// mirroring `#DiskClaim`'s owned/ref disjunction. This is the `ref`
+	// axis ADR 0049 §2 named as the intended cross-cutting generalisation,
+	// which is why it lives on the shared `#ServiceNeed` rather than in a
+	// per-type union; the webhook rejects it on the need types that have no
+	// SharedDatabase implementation (clickhouse, s3, notifications).
+	//
+	// A reference need STILL generates a `ResourceClaim`, unlike
+	// `needs.disk.ref`: a database binding has something per-consumer to
+	// provision — a role, a password, a Secret — and reusing the claim keeps
+	// `claim.<type>.*` references, the egress rule, the readiness gate and
+	// GC working unchanged.
+	ref?: string
+
+	// Privilege level of THIS application's own credential on the shared
+	// database. Ignored — and rejected — without `ref`.
+	//
+	// `rw` members create objects as the owning group, so a table one
+	// consumer's migration creates is readable and writable by the next;
+	// `ro` reads and is refused every write, including PUBLISH on redis
+	// (measured: `-@write` alone does not deny it).
+	access?: "rw" | *"rw" | "ro"
+
+	// pg only: extensions to create in the OWNED database this need
+	// provisions (2.29 / ADR 0066 §4). Rejected together with `ref` — a
+	// shared database's extensions belong to the `SharedDatabase`, not to
+	// one of its consumers, or two consumers could ask for different sets.
+	extensions?: [...#PgExtension]
 }
 
 // #DiskClaim — one declared persistent-disk dependency under

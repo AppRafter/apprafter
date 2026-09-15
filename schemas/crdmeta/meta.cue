@@ -391,6 +391,56 @@ _crdMetas: SharedVolume: {
 	}
 }
 
+_crdMetas: SharedDatabase: {
+	group:   "apprafter.io"
+	version: "v1alpha1"
+	scope:   "Namespaced"
+	names: {
+		plural:   "shareddatabases"
+		singular: "shareddatabase"
+		kind:     "SharedDatabase"
+		listKind: "SharedDatabaseList"
+		shortNames: ["shdb"]
+	}
+	annotations: _syncWave
+	subresources: status: {}
+	printerColumns: [
+		{name: "Type", type: "string", jsonPath: ".spec.type"},
+		{name: "Ready", type: "string", jsonPath: ".status.ready"},
+		{name: "Refs", type: "integer", jsonPath: ".status.refCount"},
+		{name: "Age", type: "date", jsonPath: ".metadata.creationTimestamp"},
+	]
+
+	// `extensions[].name` is composed into a `CREATE EXTENSION` statement
+	// the platform executes as a privileged role, so its alphabet is
+	// load-bearing rather than cosmetic: the allow list is matched against
+	// this string, and anything that could carry a quote or a semicolon
+	// would be matching one thing and executing another. A PostgreSQL
+	// extension name is an identifier — lowercase letters, digits and
+	// underscores — and this is the one place in the schema where `_` is
+	// legal and `-` is not, which is the opposite of every DNS-1123 rule
+	// above. The webhook re-states it, same reason as the jetstream
+	// patterns: a cluster whose CRD predates this patch is still covered.
+	//
+	// ASYMMETRY WORTH KNOWING: the SAME field on the Application side
+	// (`needs.pg.extensions[].name`) gets NO apiserver-level check, because
+	// `needs.pg` is a `#ServiceNeed | [...#ServiceNeed]` union and crdgen
+	// collapses a union to x-kubernetes-preserve-unknown-fields — everything
+	// under it is unvalidated by the structural schema. There the webhook is
+	// the ONLY gate, which is also why the allow list is re-checked in the
+	// provisioner: a `ResourceClaim` can be written directly.
+	schemaPatches: {
+		"extensions[].name": {pattern: "^[a-z_][a-z0-9_]*$"}
+	}
+
+	statusSchemaPatches: {
+		"conditions": {
+			"x-kubernetes-list-type": "map"
+			"x-kubernetes-list-map-keys": ["type"]
+		}
+	}
+}
+
 _crdMetas: ResourceClaim: {
 	group:   "apprafter.io"
 	version: "v1alpha1"
