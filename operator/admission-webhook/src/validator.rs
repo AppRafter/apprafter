@@ -1146,6 +1146,90 @@ fn validate_disk_claims(
 /// be a Kubernetes quantity and `spec.class` (when set) must be `local`
 /// (replicated/shared classes are T2-deferred, matching the owned-disk
 /// class rule). EXISTENCE / capacity-fit against referencing Applications
+/// Validate a `SharedDatabase` on CREATE / UPDATE (2.29 / ADR 0066).
+///
+/// Three rules the CRD cannot express, all of them cross-field between
+/// `spec.type` and something else:
+///
+///   * `extensions` is a PostgreSQL concept and is refused on a cache.
+///   * `persistent` is a cache concept and is refused on a database. Refused
+///     rather than ignored, because a silently dropped durability request is
+///     the kind noticed after a restart.
+///   * the extension ALLOW LIST.
+///
+/// The allow list is the load-bearing one, and its absence here was a real
+/// hole rather than a tidiness point. It was enforced on the Application side
+/// (`needs.pg.extensions`) from the start, and a `SharedDatabase` reaches the
+/// same `CREATE EXTENSION` — run by the database operator with superuser
+/// rights, on a cluster every tenant shares — through a different object that
+/// nothing checked. `apprafter db create x --type pg --extension dblink` was
+/// accepted.
+///
+/// The list itself is shared with the Application-side check rather than
+/// copied: two lists would eventually disagree, and the direction they would
+/// disagree in is the one that admits something.
+pub fn validate_shareddatabase(obj: &serde_json::Value) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    let type_ = obj
+        .pointer("/spec/type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+
+    if obj.pointer("/spec/persistent").is_some() && type_ != "redis" {
+        errors.push(ValidationError::new(
+            "spec.persistent",
+            format!(
+                "a shared database of type {type_:?} does not take `persistent` — durability of \
+                 a PostgreSQL database is a property of the cluster, not of one database on it. \
+                 It is refused rather than ignored, because a dropped durability request is the \
+                 kind that is noticed after a restart."
+            ),
+        ));
+    }
+
+    let extensions = obj
+        .pointer("/spec/extensions")
+        .and_then(serde_json::Value::as_array);
+    if let Some(list) = extensions {
+        if !list.is_empty() && type_ != "pg" {
+            errors.push(ValidationError::new(
+                "spec.extensions",
+                format!("a shared database of type {type_:?} does not take `extensions` — they are a PostgreSQL concept"),
+            ));
+        }
+        for ext in list {
+            let name = ext
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if PRELOAD_REQUIRING_EXTENSIONS.contains(&name) {
+                errors.push(ValidationError::new(
+                    "spec.extensions",
+                    format!(
+                        "extension {name:?} requires shared_preload_libraries, which is \
+                         server-wide configuration on a cluster shared by every tenant, plus a \
+                         restart — it cannot be enabled per database"
+                    ),
+                ));
+            } else if !ALLOWED_PG_EXTENSIONS.contains(&name) {
+                errors.push(ValidationError::new(
+                    "spec.extensions",
+                    format!(
+                        "extension {name:?} is not in the platform's allow list. CREATE \
+                         EXTENSION runs as superuser on a Postgres cluster shared by every \
+                         tenant, so an extension that reaches the network (dblink, \
+                         postgres_fdw), the server's filesystem (file_fdw, adminpack) or runs \
+                         untrusted code (plpython3u, plperlu) would hand this database a \
+                         privilege its own roles do not have. Allowed: {}",
+                        ALLOWED_PG_EXTENSIONS.join(", ")
+                    ),
+                ));
+            }
+        }
+    }
+    errors
+}
+
 /// Refuse a `SharedDatabase` DELETE while applications are still bound
 /// (2.29 / ADR 0066 §6).
 ///
@@ -3216,6 +3300,78 @@ mod tests {
         }
         let errs = validate_application_spec(&js_stream_spec(json!({"replicas": 3})));
         assert!(msgs(&errs).contains("replicas"), "{errs:?}");
+    }
+
+    // ---- 2.29 SharedDatabase create/update (ADR 0066 §4) ------------
+
+    #[test]
+    fn a_shared_database_may_not_ask_for_an_extension_outside_the_allow_list() {
+        // THE hole this validator was added for. The allow list was enforced
+        // on `needs.pg.extensions` from the start, and a SharedDatabase
+        // reaches the same superuser `CREATE EXTENSION` through a different
+        // object that nothing checked — `db create x --type pg --extension
+        // dblink` was accepted.
+        let errs = validate_shareddatabase(&json!({
+            "spec": {"type": "pg", "extensions": [{"name": "dblink"}]}
+        }));
+        let m = msgs(&errs);
+        assert!(m.contains("dblink"), "{m}");
+        assert!(m.contains("allow list"), "{m}");
+    }
+
+    #[test]
+    fn an_allow_listed_extension_is_accepted_including_the_hyphenated_one() {
+        // `uuid-ossp` is the entry whose hyphen the CRD pattern forbade on
+        // its first draft, so it is the one worth naming in a test.
+        assert!(validate_shareddatabase(&json!({
+            "spec": {"type": "pg", "extensions": [
+                {"name": "vector"}, {"name": "pg_trgm"}, {"name": "uuid-ossp"}
+            ]}
+        }))
+        .is_empty());
+    }
+
+    #[test]
+    fn a_preload_requiring_extension_is_refused_for_its_own_reason() {
+        let m = msgs(&validate_shareddatabase(&json!({
+            "spec": {"type": "pg", "extensions": [{"name": "pg_cron"}]}
+        })));
+        assert!(m.contains("shared_preload_libraries"), "{m}");
+        // NOT the allow-list message: the two refusals have different
+        // remedies, and merging them would send an operator to argue about
+        // the wrong list.
+        assert!(!m.contains("allow list"), "{m}");
+    }
+
+    #[test]
+    fn extensions_are_refused_on_a_cache() {
+        let m = msgs(&validate_shareddatabase(&json!({
+            "spec": {"type": "redis", "extensions": [{"name": "vector"}]}
+        })));
+        assert!(m.contains("PostgreSQL concept"), "{m}");
+    }
+
+    #[test]
+    fn persistence_is_refused_on_a_database_rather_than_ignored() {
+        // Including `persistent: false`, which is the redis default said out
+        // loud and still means the author believed pg had the knob.
+        for value in [json!(true), json!(false)] {
+            let m = msgs(&validate_shareddatabase(&json!({
+                "spec": {"type": "pg", "persistent": value}
+            })));
+            assert!(m.contains("does not take `persistent`"), "{m}");
+        }
+    }
+
+    #[test]
+    fn a_plain_cache_and_a_plain_database_pass() {
+        assert!(
+            validate_shareddatabase(&json!({"spec": {"type": "redis", "persistent": true}}))
+                .is_empty()
+        );
+        assert!(
+            validate_shareddatabase(&json!({"spec": {"type": "pg", "size": "small"}})).is_empty()
+        );
     }
 
     // ---- 2.29 SharedDatabase delete guard (ADR 0066 §6) -------------

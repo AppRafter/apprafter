@@ -310,6 +310,15 @@ check "an unbound database reports refCount 0" \
 check "the status publishes no shared connection Secret" \
     "$(jp "$SHDB_RES" "$APP_NS" "$PG_DB" '{.status.connectionSecretRef}')" ""
 
+# The allow list applies to a SharedDatabase too, and did not for a while: it
+# was enforced on `needs.pg.extensions` from the start while a SharedDatabase
+# reached the same superuser CREATE EXTENSION through an object nothing
+# checked. Tried through the CLI, because that is the path an operator takes.
+DBLINK_OUT=$(apprafter db create evil --type pg --extension dblink -n "$APP_NS" 2>&1 || true)
+contains "an extension outside the allow list is refused" "$DBLINK_OUT" "allow list"
+EVIL=$(kubectl -n "$APP_NS" get "$SHDB_RES" evil -o name 2>/dev/null || true)
+check "the refused database was never created" "$EVIL" ""
+
 # The groups exist ON THE SERVER, created by the controller over SQL because
 # CNPG cannot create them (a CREATEROLE non-superuser administers only what it
 # created — measured, ADR 0066 §3.1).
