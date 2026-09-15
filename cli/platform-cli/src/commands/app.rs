@@ -262,6 +262,31 @@ pub fn add(
     // guaranteed to exist for the wizard / non-interactive
     // flow below.
     let cwd = std::env::current_dir().map_err(|e| CliError::Other(format!("cwd: {e}")))?;
+
+    // ADR 0063 §Decision 4 — refuse a `--path` that points at a FILE
+    // before anything observable happens. Deliberately the FIRST gate in
+    // `add`: step 0 below can scaffold files, and every path after it
+    // reaches the network or the cluster, so a refusal raised later would
+    // leave side effects behind for a registration that was never going
+    // to work. Checked on the NORMALISED form so `--path /apps/api/App.cue`
+    // and `--path apps/api/App.cue` are judged identically.
+    //
+    // This is the only chokepoint that covers BOTH entry points: the
+    // wizard prompt bypasses clap entirely and re-enters `add` with
+    // `no_interactive = true`, so a clap `value_parser` on `--path` would
+    // miss everything a user types at the prompt. `normalise_argocd_source_path`
+    // was likewise rejected as the site — it is a total `String -> String`
+    // helper whose only caller is the pure `build_application_manifest`,
+    // and threading a `Result` through that would make a pure manifest
+    // builder fallible without gaining any reach.
+    let normalised_for_check = normalise_argocd_source_path(path);
+    if let Some(msg) = source_path_file_refusal(
+        &normalised_for_check,
+        classify_source_path_in_local_checkout(&normalised_for_check),
+    ) {
+        return Err(CliError::Other(msg));
+    }
+
     let scaffold_target = cwd.join("apprafter").join("Application.cue");
     let decision = crate::commands::scaffold_wizard::decide_scaffold_step(
         scaffold_target.exists(),
@@ -5873,6 +5898,130 @@ pub(crate) fn normalise_argocd_source_path(path: &str) -> String {
     }
 }
 
+/// Suffixes that mean "this is a file, not a directory" when the local
+/// filesystem has no answer (a remote-only `app add <git-url>` from
+/// outside the repository).
+///
+/// The list is CLOSED on purpose. A generic "last component looks like
+/// it has an extension" rule would refuse a directory legitimately named
+/// `v1.0` or `my.app`; these four are the shapes an operator actually
+/// mis-registers — our own manifest (`.cue`) and the three file types
+/// Argo CD's directory mode reads (`.yaml` / `.yml` / `.json`,
+/// `util/app/path`).
+const ARGOCD_SOURCE_PATH_FILE_SUFFIXES: &[&str] = &["cue", "yaml", "yml", "json"];
+
+/// What the local checkout says about a registered
+/// `spec.source.path`. Only two answers matter; "absent" is the
+/// `None` of the enclosing `Option`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalPathKind {
+    File,
+    Directory,
+}
+
+/// Classify a repo-relative `spec.source.path` against a local
+/// checkout rooted at `root`. `None` when the path is not present
+/// there at all.
+///
+/// `metadata()` follows symlinks, matching Argo CD's own `os.Stat` in
+/// `util/app/path/path.go`, so a symlink to a file classifies as `File`
+/// exactly as it would in the repo-server.
+fn classify_source_path_under(root: &Path, normalised: &str) -> Option<LocalPathKind> {
+    let candidate = root.join(normalised);
+    let meta = std::fs::metadata(candidate).ok()?;
+    if meta.is_dir() {
+        Some(LocalPathKind::Directory)
+    } else {
+        Some(LocalPathKind::File)
+    }
+}
+
+/// Classify the registered path against the checkout the CLI is being
+/// run from. `None` whenever there is no answer to be had — cwd outside
+/// a git work tree, git missing, or (the common remote case) the path
+/// simply not present locally.
+///
+/// The local checkout is not guaranteed to BE the repository being
+/// registered — `app add <git-url>` can name a different one — but every
+/// in-repo invocation, which is the overwhelming majority and the one
+/// every wizard default is built around, resolves exactly.
+fn classify_source_path_in_local_checkout(normalised: &str) -> Option<LocalPathKind> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if root.is_empty() {
+        return None;
+    }
+    classify_source_path_under(Path::new(&root), normalised)
+}
+
+/// Pure predicate — `Some(message)` when the registered `spec.source.path`
+/// points at a file rather than a directory (ADR 0063 §Decision 4).
+///
+/// Argo CD refuses a file path in `util/app/path/path.go` (v2.13.1) with
+/// `"%s: app path is not a directory"`, called on the plugin manifest path
+/// at `reposerver/repository/repository.go:444` / `:620`. That is
+/// MANIFEST-GENERATION time, not admission time — the apiserver accepts
+/// the `Application` object and it then sits in `ComparisonError`
+/// permanently. No later gate exists, so this refusal is the only one.
+///
+/// Two arms, in order:
+///
+/// 1. **The local filesystem**, when it has an answer. Exact, and it wins
+///    in BOTH directions: a directory named `manifest.yaml` is accepted,
+///    a file named `Dockerfile` is refused.
+/// 2. **[`ARGOCD_SOURCE_PATH_FILE_SUFFIXES`]** otherwise, for the
+///    remote-only registration where nothing is on disk to consult.
+///
+/// The residual miss is deliberate: a remote-only `--path apps/api/Dockerfile`
+/// is accepted and does produce the broken object. That object is visible
+/// (a red tile carrying Argo CD's own message) and removable with
+/// `apprafter app remove` + re-add; a wrong refusal of `--path releases/v1.0`
+/// would be an unrecoverable block on a legitimate directory with no
+/// escape hatch. We err toward the recoverable failure.
+fn source_path_file_refusal(normalised: &str, local: Option<LocalPathKind>) -> Option<String> {
+    let looks_like_a_file = match local {
+        // The filesystem is authoritative wherever it speaks.
+        Some(LocalPathKind::Directory) => false,
+        Some(LocalPathKind::File) => true,
+        None => {
+            let last = normalised.rsplit('/').next().unwrap_or(normalised);
+            match last.rsplit_once('.') {
+                Some((stem, ext)) if !stem.is_empty() => ARGOCD_SOURCE_PATH_FILE_SUFFIXES
+                    .iter()
+                    .any(|known| ext.eq_ignore_ascii_case(known)),
+                _ => false,
+            }
+        }
+    };
+    if !looks_like_a_file {
+        return None;
+    }
+    let parent = match normalised.rsplit_once('/') {
+        Some((head, _)) if !head.is_empty() => head.to_string(),
+        // A file at the repository root: its directory is the root, which
+        // `--path` spells `/` (normalised to `.` on the way out).
+        _ => "/".to_string(),
+    };
+    Some(format!(
+        "--path {normalised} points at a file. Argo CD's `spec.source.path` \
+         must be a DIRECTORY: manifest generation fails with \
+         `{normalised}: app path is not a directory`, and because that check \
+         runs when manifests are generated — not when the object is admitted \
+         — the Application would be accepted by the apiserver and then sit in \
+         ComparisonError forever, with nothing else to catch it.\n\n\
+         Register the directory that holds the manifest instead:\n\
+         \x20   --path {parent}\n\n\
+         The cue-cmp plugin discovers the manifest inside it, so the file \
+         name never needs to be spelled out."
+    ))
+}
+
 fn apply_application_manifest(manifest: &Value, kubeconfig_path: &Path) -> Result<()> {
     use std::io::Write as _;
     let mut file = tempfile::Builder::new()
@@ -6753,6 +6902,264 @@ mod tests {
         assert_eq!(normalise_argocd_source_path("."), ".");
         assert_eq!(normalise_argocd_source_path("./apps/x"), "./apps/x");
         assert_eq!(normalise_argocd_source_path("apps/x"), "apps/x");
+    }
+
+    // ------------------------------------------------------------------
+    // ADR 0063 §Decision 4 — `spec.source.path` pointing at a FILE.
+    //
+    // Argo CD's `util/app/path/path.go` (v2.13.1) returns
+    // "<p>: app path is not a directory", and the check runs at
+    // MANIFEST-GENERATION time — the apiserver accepts the Application
+    // and it then sits in ComparisonError permanently. There is no
+    // admission-time gate, so the CLI is the only layer that can refuse.
+    //
+    // The predicate is a COMBINATION, in this order:
+    //   1. the local checkout, when the path resolves there — exact, and
+    //      it OVERRIDES the heuristic in both directions;
+    //   2. otherwise a closed extension list (`.cue .yaml .yml .json`)
+    //      for the remote-only registration, where nothing is on disk.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn source_path_pointing_at_a_cue_file_is_refused() {
+        // The shape ADR 0063 §4 names verbatim: the operator points
+        // `--path` at the manifest instead of the directory holding it.
+        let msg = source_path_file_refusal("apps/api/Application.cue", None)
+            .expect("a .cue file path must be refused");
+        assert!(msg.contains("apps/api/Application.cue"), "msg: {msg}");
+    }
+
+    #[test]
+    fn source_path_pointing_at_a_yaml_file_is_refused() {
+        for p in [
+            "deploy/manifest.yaml",
+            "deploy/manifest.yml",
+            "deploy/manifest.json",
+        ] {
+            assert!(
+                source_path_file_refusal(p, None).is_some(),
+                "{p} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn source_path_extension_match_is_case_insensitive() {
+        assert!(source_path_file_refusal("apps/api/Application.CUE", None).is_some());
+        assert!(source_path_file_refusal("deploy/Manifest.YAML", None).is_some());
+    }
+
+    #[test]
+    fn source_path_pointing_at_a_plain_directory_is_accepted() {
+        assert_eq!(source_path_file_refusal("docs-site", None), None);
+        assert_eq!(source_path_file_refusal("apprafter", None), None);
+    }
+
+    #[test]
+    fn source_path_pointing_at_a_nested_directory_is_accepted() {
+        assert_eq!(source_path_file_refusal("landing/web", None), None);
+        assert_eq!(
+            source_path_file_refusal("landing/cms/apprafter", None),
+            None
+        );
+        assert_eq!(
+            source_path_file_refusal("services/api/apprafter", None),
+            None
+        );
+    }
+
+    #[test]
+    fn source_path_gate_accepts_this_repositorys_own_registrations() {
+        // The real registrations this repository makes: `--path docs-site`,
+        // `--path landing/web`, `--path landing/cms`, plus the `/`-default
+        // that every e2e walk passes. None may be refused.
+        for p in ["docs-site", "landing/web", "landing/cms", "."] {
+            assert_eq!(
+                source_path_file_refusal(p, None),
+                None,
+                "{p} is a live registration and must stay registerable"
+            );
+        }
+    }
+
+    #[test]
+    fn source_path_gate_leaves_slash_and_empty_normalising_to_dot() {
+        // The gate runs on the NORMALISED form, so the documented
+        // "whole repo" idiom must survive it untouched.
+        assert_eq!(normalise_argocd_source_path("/"), ".");
+        assert_eq!(normalise_argocd_source_path(""), ".");
+        assert_eq!(
+            source_path_file_refusal(&normalise_argocd_source_path("/"), None),
+            None
+        );
+        assert_eq!(
+            source_path_file_refusal(&normalise_argocd_source_path(""), None),
+            None
+        );
+        assert_eq!(
+            source_path_file_refusal(".", Some(LocalPathKind::Directory)),
+            None
+        );
+    }
+
+    #[test]
+    fn dot_named_directory_absent_from_disk_is_accepted_because_the_suffix_is_not_a_manifest_extension(
+    ) {
+        // THE DECISION, stated as a test: a remote-only `--path releases/v1.0`
+        // or `--path services/my.app` is ACCEPTED. The extension list is
+        // closed on purpose so a legitimately dot-named directory stays
+        // registerable when nothing is on disk to consult.
+        assert_eq!(source_path_file_refusal("releases/v1.0", None), None);
+        assert_eq!(source_path_file_refusal("services/my.app", None), None);
+        assert_eq!(source_path_file_refusal("charts/v2.1", None), None);
+    }
+
+    #[test]
+    fn dot_named_directory_present_on_disk_is_accepted_by_the_filesystem_arm() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("releases/v1.0")).expect("mkdir");
+        assert_eq!(
+            classify_source_path_under(tmp.path(), "releases/v1.0"),
+            Some(LocalPathKind::Directory)
+        );
+        assert_eq!(
+            source_path_file_refusal("releases/v1.0", Some(LocalPathKind::Directory)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_directory_on_disk_overrides_the_extension_heuristic() {
+        // A directory literally named `manifest.yaml` is pathological but
+        // legal. On disk the filesystem is authoritative and wins over the
+        // suffix — this is the whole point of combining the two arms.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("deploy/manifest.yaml")).expect("mkdir");
+        assert_eq!(
+            classify_source_path_under(tmp.path(), "deploy/manifest.yaml"),
+            Some(LocalPathKind::Directory)
+        );
+        assert_eq!(
+            source_path_file_refusal("deploy/manifest.yaml", Some(LocalPathKind::Directory)),
+            None,
+            "the filesystem is exact; it must override the suffix guess"
+        );
+    }
+
+    #[test]
+    fn a_file_on_disk_with_an_unlisted_extension_is_refused_by_the_filesystem_arm() {
+        // The coverage the extension list alone cannot give: a real file
+        // whose name carries no recognised manifest suffix.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("apps/api")).expect("mkdir");
+        std::fs::write(tmp.path().join("apps/api/Dockerfile"), b"FROM scratch\n").expect("write");
+        assert_eq!(
+            classify_source_path_under(tmp.path(), "apps/api/Dockerfile"),
+            Some(LocalPathKind::File)
+        );
+        assert!(
+            source_path_file_refusal("apps/api/Dockerfile", Some(LocalPathKind::File)).is_some()
+        );
+    }
+
+    #[test]
+    fn add_refuses_a_file_source_path_before_the_scaffold_step_runs() {
+        // Guards the WIRING, not just the predicate: `add` must raise the
+        // file-path refusal as its FIRST gate. Deliberately shaped so that
+        // removing the gate makes the call stop at step 0's "not found"
+        // refusal instead — `git_url: None` + `no_interactive` +
+        // no `--scaffold` is `ScaffoldDecision::Refuse`, which returns
+        // before any kubeconfig is resolved or any file is written. The
+        // test therefore never reaches a cluster in either state.
+        let err = add(
+            None,
+            Some("demo".into()),
+            Some("main".into()),
+            "apps/api/Application.cue",
+            "apps",
+            "apprafter",
+            "origin",
+            true, // no_ping
+            CoverageGate::Present,
+            None,
+            true,  // no_interactive
+            false, // scaffold_flag
+        )
+        .expect_err("a file `--path` must be refused by `add`");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("app path is not a directory"),
+            "the gate must fire before step 0, not after; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_file_path_absent_from_disk_with_an_unlisted_extension_is_accepted_documented_miss() {
+        // The case the filename heuristic ALONE would have caught and this
+        // predicate does not: a remote-only registration pointing at a file
+        // outside the closed extension list. Erring toward acceptance is
+        // deliberate — the result is a visible, removable ComparisonError,
+        // where the alternative error (refusing `releases/v1.0`) is an
+        // unrecoverable block on a legitimate directory.
+        assert_eq!(source_path_file_refusal("apps/api/Dockerfile", None), None);
+        assert_eq!(source_path_file_refusal("apps/api/values.toml", None), None);
+    }
+
+    #[test]
+    fn classify_source_path_under_returns_none_when_the_path_is_not_on_disk() {
+        // The remote-only registration: `--path` names a path in a repository
+        // that is not the local checkout, so the filesystem has no answer.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(classify_source_path_under(tmp.path(), "apps/api"), None);
+        assert_eq!(
+            classify_source_path_under(tmp.path(), "apps/api/Application.cue"),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_source_path_under_resolves_the_repo_root_itself_for_dot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            classify_source_path_under(tmp.path(), "."),
+            Some(LocalPathKind::Directory)
+        );
+    }
+
+    #[test]
+    fn source_path_refusal_message_names_the_argo_cd_directory_constraint() {
+        // "invalid" is not enough. A user who typed a file path did so
+        // believing it addressable; the message has to say that Argo CD
+        // addresses the DIRECTORY, quote the error they would otherwise
+        // have met, explain why no later gate catches it, and hand back
+        // the corrected flag.
+        let msg = source_path_file_refusal("apps/api/Application.cue", Some(LocalPathKind::File))
+            .expect("refusal");
+        assert!(
+            msg.contains("app path is not a directory"),
+            "must quote Argo CD's own error; msg: {msg}"
+        );
+        assert!(
+            msg.contains("ComparisonError"),
+            "must say what the broken object looks like; msg: {msg}"
+        );
+        assert!(
+            msg.contains("--path apps/api"),
+            "must hand back the corrected flag; msg: {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("invalid path"),
+            "a bare 'invalid' is exactly the message this replaces; msg: {msg}"
+        );
+    }
+
+    #[test]
+    fn source_path_refusal_suggests_the_repo_root_when_the_file_sits_at_top_level() {
+        let msg = source_path_file_refusal("Application.cue", None).expect("refusal");
+        assert!(
+            msg.contains("--path /"),
+            "a top-level file's parent is the repo root; msg: {msg}"
+        );
     }
 
     #[test]
