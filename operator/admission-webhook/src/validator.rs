@@ -427,6 +427,8 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
     validate_resources(typed_base, typed_envs, base, envs, &mut errors);
     // 2.28: the five probe rules the structural schema cannot state.
     validate_probes(typed_base, typed_envs, &mut errors);
+    // 2.29: the SharedDatabase binding rules (ref / access / extensions).
+    validate_shared_database_refs(typed_base, typed_envs, &mut errors);
 
     errors
 }
@@ -1861,6 +1863,196 @@ fn validate_expose(
     }
 }
 
+/// Need types that can honour a `ref` — i.e. the ones a `SharedDatabase`
+/// exists for (ADR 0066 §1). `ref` sits on the shared `#ServiceNeed` because
+/// it is the cross-cutting axis ADR 0049 §2 named, so the syntax reaches
+/// every service key; this is what stops a manifest declaring one the
+/// platform would silently ignore.
+const REF_CAPABLE_NEEDS: &[&str] = &["pg", "redis"];
+
+/// PostgreSQL extensions a manifest may ask for (ADR 0066 §4.1).
+///
+/// An ALLOW list, not a deny list, and that direction is the decision:
+/// `platform-postgres` is ONE cluster shared by every tenant in the
+/// Kubernetes cluster, and CNPG executes `CREATE EXTENSION` with superuser
+/// rights — so enabling one on a manifest's say-so hands the application a
+/// privilege its own role categorically does not have. A deny list would be
+/// a promise to have thought of everything.
+///
+/// The three measured present in the operand image
+/// (`docs/measurements/2.29-shared-database-2026-09-15.md`) plus the
+/// contrib extensions that are pure data types and functions. A platform
+/// operator extends this through the `pg-integrated` ServiceProvider seed's
+/// `config.allowedExtensions`; this constant is the fallback when the seed
+/// says nothing.
+const ALLOWED_PG_EXTENSIONS: &[&str] = &[
+    "vector",
+    "pg_trgm",
+    "pgcrypto",
+    "citext",
+    "hstore",
+    "uuid-ossp",
+    "unaccent",
+    "btree_gin",
+    "btree_gist",
+    "intarray",
+    "ltree",
+];
+
+/// Extensions that are refused for a DIFFERENT reason from the allow list:
+/// they need `shared_preload_libraries`, which is server-wide configuration
+/// on a cluster serving every tenant, plus a restart.
+///
+/// Separate from the allow-list refusal because the remedies differ and so
+/// does the argument. A reader told that `pg_cron` is "not allowed" goes
+/// looking for a security reason that is not the reason.
+const PRELOAD_REQUIRING_EXTENSIONS: &[&str] = &[
+    "pg_cron",
+    "pg_stat_statements",
+    "auto_explain",
+    "pg_prewarm",
+];
+
+/// 2.29 (ADR 0066 §2, §4): the `ref` / `access` / `extensions` rules.
+///
+/// Walks the flattened `needs` entries of every scope, so an environment
+/// override gets the same treatment as `base` — an override is where a
+/// second, different `ref` would most plausibly be introduced.
+fn validate_shared_database_refs(
+    typed_base: Option<&ApplicationBaseSpec>,
+    typed_envs: Option<&BTreeMap<String, ApplicationEnvOverride>>,
+    errors: &mut Vec<ValidationError>,
+) {
+    fn check_scope(prefix: &str, needs: Option<&Needs>, errors: &mut Vec<ValidationError>) {
+        let Some(needs) = needs else { return };
+        for (ty, entry) in needs.entries() {
+            let Some(service) = entry.service.as_ref() else {
+                continue; // a disk entry; `needs.disk.ref` is ADR 0049's own
+            };
+            let field = |f: &str| format!("{prefix}.needs.{ty}.{f}");
+
+            if let Some(reference) = service.ref_.as_deref() {
+                if !REF_CAPABLE_NEEDS.contains(&ty.as_str()) {
+                    errors.push(ValidationError::new(
+                        field("ref"),
+                        format!(
+                            "needs.{ty} cannot bind a SharedDatabase — only {} are implemented. \
+                             The field exists on every service need because `ref` is a \
+                             cross-cutting axis, which is exactly why declaring one here has to \
+                             be refused rather than ignored.",
+                            REF_CAPABLE_NEEDS.join(" and ")
+                        ),
+                    ));
+                }
+                if reference.contains('/') {
+                    errors.push(ValidationError::new(
+                        field("ref"),
+                        format!(
+                            "ref {reference:?} names another namespace. A SharedDatabase is bound \
+                             from its OWN namespace only: the consumer's pod reads the connection \
+                             Secret from there, and the egress policy is written per namespace. \
+                             Cross-namespace sharing is not implemented."
+                        ),
+                    ));
+                } else if !is_dns_1123_label(reference) {
+                    errors.push(ValidationError::new(
+                        field("ref"),
+                        format!(
+                            "ref {reference:?} must be a DNS-1123 label — it names a \
+                             SharedDatabase object in this namespace"
+                        ),
+                    ));
+                }
+                // The SharedDatabase already decided each of these, so
+                // accepting both would make the manifest say two things while
+                // the provisioner silently honours one.
+                for (name, present) in [
+                    ("size", service.size.is_some()),
+                    ("persistent", service.persistent.is_some()),
+                    ("selector", service.selector.is_some()),
+                ] {
+                    if present {
+                        errors.push(ValidationError::new(
+                            field(name),
+                            format!(
+                                "needs.{ty} sets both `ref` and `{name}`; they are mutually \
+                                 exclusive — the SharedDatabase named by `ref` already decided it"
+                            ),
+                        ));
+                    }
+                }
+                if service.extensions.is_some() {
+                    errors.push(ValidationError::new(
+                        field("extensions"),
+                        format!(
+                            "needs.{ty} sets both `ref` and `extensions`; a shared database's \
+                             extensions belong to the SharedDatabase, or two consumers could ask \
+                             for different sets of them"
+                        ),
+                    ));
+                }
+            } else if service.access.is_some() {
+                // An ignored access level is an application that believes it
+                // is read-only and is not.
+                errors.push(ValidationError::new(
+                    field("access"),
+                    format!(
+                        "needs.{ty} sets `access` without `ref`. `access` is this application's \
+                         privilege level on a SHARED database; an owned one has no other consumer \
+                         to be restricted from."
+                    ),
+                ));
+            }
+
+            if let Some(extensions) = service.extensions.as_ref() {
+                if ty != "pg" {
+                    errors.push(ValidationError::new(
+                        field("extensions"),
+                        format!(
+                            "needs.{ty} does not take `extensions` — they are a PostgreSQL concept"
+                        ),
+                    ));
+                    continue;
+                }
+                for ext in extensions {
+                    let name = ext.name.as_str();
+                    if PRELOAD_REQUIRING_EXTENSIONS.contains(&name) {
+                        errors.push(ValidationError::new(
+                            field("extensions"),
+                            format!(
+                                "extension {name:?} requires shared_preload_libraries, which is \
+                                 server-wide configuration on a cluster shared by every tenant, \
+                                 plus a restart — it cannot be enabled per database"
+                            ),
+                        ));
+                    } else if !ALLOWED_PG_EXTENSIONS.contains(&name) {
+                        errors.push(ValidationError::new(
+                            field("extensions"),
+                            format!(
+                                "extension {name:?} is not in the platform's allow list. \
+                                 CREATE EXTENSION runs as superuser on a Postgres cluster shared \
+                                 by every tenant, so an extension that reaches the network \
+                                 (dblink, postgres_fdw), the server's filesystem (file_fdw, \
+                                 adminpack) or runs untrusted code (plpython3u, plperlu) would \
+                                 hand this application a privilege its own role does not have. \
+                                 Allowed: {}",
+                                ALLOWED_PG_EXTENSIONS.join(", ")
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    check_scope("spec.base", typed_base.and_then(ScopeView::needs), errors);
+    if let Some(envs) = typed_envs {
+        for (name, env) in envs {
+            check_scope(&format!("spec.environments.{name}"), env.needs(), errors);
+        }
+    }
+}
+
 /// 2.28 (ADR 0065 §1.5): validate `spec.base.probes` AND every
 /// `spec.environments.*.probes`.
 ///
@@ -2764,6 +2956,129 @@ fn is_env_var_name(s: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── 2.29 SharedDatabase binding (ADR 0066 §2, §4) ─────────────────
+
+    /// A spec whose `needs.<type>` is the given JSON value.
+    fn need_spec(ty: &str, need: serde_json::Value) -> Value {
+        json!({"base": {"image": "img", "expose": {"port": 8080},
+            "needs": {ty: need}}})
+    }
+
+    #[test]
+    fn a_ref_and_an_owned_size_are_mutually_exclusive() {
+        // The SharedDatabase already decided size, persistence and provider.
+        // Accepting both would make the manifest say two things and the
+        // provisioner silently honour one.
+        for (field, val) in [
+            ("size", json!("small")),
+            ("persistent", json!(true)),
+            ("selector", json!({"tier": "integrated"})),
+        ] {
+            let errs = validate_application_spec(&need_spec(
+                "pg",
+                json!({"ref": "orders-db", field: val}),
+            ));
+            assert!(
+                msgs(&errs).contains(field),
+                "{field} was accepted beside ref: {errs:?}"
+            );
+        }
+        // ref alone is fine.
+        let errs = validate_application_spec(&need_spec("pg", json!({"ref": "orders-db"})));
+        assert!(msgs(&errs).is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn access_without_a_ref_is_rejected_rather_than_ignored() {
+        // An ignored access level is an application that believes it is
+        // read-only and is not.
+        let errs = validate_application_spec(&need_spec("pg", json!({"access": "ro"})));
+        assert!(msgs(&errs).contains("access"), "{errs:?}");
+    }
+
+    #[test]
+    fn a_ref_is_rejected_on_a_need_type_with_no_implementation() {
+        for ty in ["clickhouse", "s3", "notifications"] {
+            let errs = validate_application_spec(&need_spec(ty, json!({"ref": "x"})));
+            assert!(
+                msgs(&errs).contains("ref"),
+                "{ty} accepted a ref it cannot honour: {errs:?}"
+            );
+        }
+        for ty in ["pg", "redis"] {
+            let errs = validate_application_spec(&need_spec(ty, json!({"ref": "x"})));
+            assert!(msgs(&errs).is_empty(), "{ty}: {errs:?}");
+        }
+    }
+
+    #[test]
+    fn a_ref_must_be_a_dns_1123_label_and_name_no_other_namespace() {
+        // It names a SharedDatabase object in THIS namespace. A slash is the
+        // shape someone reaches for when they want a neighbour's — and the
+        // refusal has to say that rather than just "invalid".
+        let errs = validate_application_spec(&need_spec("pg", json!({"ref": "other-ns/orders"})));
+        assert!(msgs(&errs).contains("namespace"), "{errs:?}");
+        let errs = validate_application_spec(&need_spec("pg", json!({"ref": "Orders_DB"})));
+        assert!(msgs(&errs).contains("DNS-1123"), "{errs:?}");
+    }
+
+    #[test]
+    fn extensions_are_bounded_by_the_allow_list() {
+        // The shared cluster serves every tenant and CNPG runs CREATE
+        // EXTENSION as superuser, so this is a refusal and not a preference.
+        for bad in [
+            "dblink",
+            "postgres_fdw",
+            "file_fdw",
+            "plpython3u",
+            "adminpack",
+        ] {
+            let errs =
+                validate_application_spec(&need_spec("pg", json!({"extensions": [{"name": bad}]})));
+            assert!(msgs(&errs).contains(bad), "{bad} was accepted: {errs:?}");
+        }
+        for good in ["vector", "pg_trgm", "pgcrypto"] {
+            let errs = validate_application_spec(&need_spec(
+                "pg",
+                json!({"extensions": [{"name": good}]}),
+            ));
+            assert!(msgs(&errs).is_empty(), "{good}: {errs:?}");
+        }
+    }
+
+    #[test]
+    fn a_preload_requiring_extension_is_refused_with_its_own_reason() {
+        // Distinct from the allow list: these are not dangerous, they are
+        // server-wide configuration on a cluster serving every tenant, plus a
+        // restart. A reader who sees the allow-list message for pg_cron would
+        // go looking for a security argument that is not the reason.
+        let errs = validate_application_spec(&need_spec(
+            "pg",
+            json!({"extensions": [{"name": "pg_cron"}]}),
+        ));
+        assert!(msgs(&errs).contains("shared_preload_libraries"), "{errs:?}");
+    }
+
+    #[test]
+    fn extensions_and_a_ref_cannot_be_declared_together() {
+        // A shared database's extensions belong to the SharedDatabase, or two
+        // consumers could ask for different sets of them.
+        let errs = validate_application_spec(&need_spec(
+            "pg",
+            json!({"ref": "orders-db", "extensions": [{"name": "vector"}]}),
+        ));
+        assert!(msgs(&errs).contains("extensions"), "{errs:?}");
+    }
+
+    #[test]
+    fn extensions_are_rejected_on_a_non_postgres_need() {
+        let errs = validate_application_spec(&need_spec(
+            "redis",
+            json!({"extensions": [{"name": "vector"}]}),
+        ));
+        assert!(msgs(&errs).contains("extensions"), "{errs:?}");
+    }
 
     // ── 2.28 JetStream tuning + DLQ (ADR 0065 §2) ─────────────────────
 
