@@ -36,7 +36,7 @@ post-launch work is not a roadmap phase and has no subscribe control.
 | Shipped | ✅ | One manifest serves several environments | [Per-environment deploy](how-it-works/per-environment-deploy.md) |
 | Shipped | ✅ | Scaffold a starter manifest for an application (`apprafter app scaffold`) | [Developer quickstart](dev-guide/quickstart.md) |
 | Shipped | ✅ | Roll back to the previously resolved image and hold there until released | [Rolling back a bad deploy](dev-guide/rollback.md) |
-| Shipped | ✅ | Health checks declared in the manifest, with a readiness check by default on an exposed port | — |
+| Shipped | ✅ | Health checks declared in the manifest, with a readiness check by default on an exposed port | [Health checks](dev-guide/health-checks.md) |
 | Shipped | 🚧 | Backstage developer portal — application status and a golden-path template | — |
 
 > **Backstage is partial, and further from ready than "opt-in" suggests.** The portal's source and

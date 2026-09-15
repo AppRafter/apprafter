@@ -304,6 +304,7 @@ nav:
       - "Worked example: the documentation site": how-it-works/deploying-the-docs-site.md
       - "Worked example: the landing site and its CMS": how-it-works/deploying-the-landing-and-cms.md
       - Right-sizing an application's requests: how-it-works/resources-and-autoscaling.md
+      - Health checks on a running application: how-it-works/health-checks.md
   - Developer Guide:
       - Overview: dev-guide/index.md
       # Ordered as the work happens (plan.md 2.23e), which for a
@@ -320,6 +321,7 @@ nav:
       - Writing Application.cue: dev-guide/application-cue.md
       - Deploying more than one environment: dev-guide/environments.md
       - Resources and autoscaling: dev-guide/resources-and-autoscaling.md
+      - Health checks: dev-guide/health-checks.md
       - Secrets: dev-guide/secrets.md
       # Last of the "describe your application" run: the reader has now
       # met every field that can hold a change for approval, and has not

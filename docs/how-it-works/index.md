@@ -93,6 +93,11 @@ Two real deployments in this repository, assembled — what is responsible for
 what, and what each manifest deliberately leaves out. Read one beside your own
 application.
 
+- [Health checks on a running application](health-checks.md) — the two
+  probes the platform supplies that no manifest contains, why their numbers
+  live in the operator rather than in the stored object, and the single
+  rollout an upgrade causes.
+
 - [The documentation site](deploying-the-docs-site.md) — a static site: one
   image, no database, no runtime configuration.
 - [The landing site and its CMS](deploying-the-landing-and-cms.md) — two
