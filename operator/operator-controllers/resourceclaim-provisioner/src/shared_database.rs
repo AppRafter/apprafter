@@ -222,9 +222,19 @@ pub struct Backing {
 }
 
 impl Backing {
-    pub fn pg(database: impl Into<String>) -> Self {
+    /// A pg database records BOTH the database name and the cluster it lives
+    /// on.
+    ///
+    /// The cluster is not cosmetic. The shared-backend reaper deletes a CNPG
+    /// `Cluster` nothing points at, and "points at" was defined entirely in
+    /// terms of claims — so a cluster whose only occupant was a
+    /// `SharedDatabase` read as empty and was on a dwell to be deleted, with
+    /// the data underneath it. Recording the instance lets the reaper veto on
+    /// an exact name match, the same way it does for a claim.
+    pub fn pg(database: impl Into<String>, cluster: impl Into<String>) -> Self {
         Self {
             database: Some(database.into()),
+            instance: Some(cluster.into()),
             ..Default::default()
         }
     }
@@ -746,7 +756,7 @@ async fn reconcile_pg(
         ns,
         name,
         true,
-        Some(&Backing::pg(&database)),
+        Some(&Backing::pg(&database, &cluster)),
         ref_count,
         cond,
         ext_cond,
@@ -1799,11 +1809,23 @@ mod tests {
 
     #[test]
     fn a_pg_status_body_carries_the_database_and_no_redis_fields() {
-        let body = sd_status_apply_body("orders", true, &Backing::pg("shd_apps_orders"), 2);
+        let body = sd_status_apply_body(
+            "orders",
+            true,
+            &Backing::pg("shd_apps_orders", "platform-postgres"),
+            2,
+        );
         assert_eq!(body["status"]["ready"], json!(true));
         assert_eq!(body["status"]["refCount"], json!(2));
         assert_eq!(body["status"]["database"], json!("shd_apps_orders"));
-        assert!(body["status"].get("instance").is_none());
+        // The CLUSTER rides in `instance` for pg too. The reaper vetoes on an
+        // exact instance-name match, and before this field was recorded a
+        // cluster whose only occupant was a shared database read as empty and
+        // went on a dwell to be deleted with the data underneath it.
+        assert_eq!(body["status"]["instance"], json!("platform-postgres"));
+        // `dbnum` stays redis-only: there is no logical database number in
+        // Postgres, and inventing one would put a meaningless integer in the
+        // same field the allocator reads.
         assert!(body["status"].get("dbnum").is_none());
         // The absence is the design (ADR 0066 §1) — asserted here too so the
         // status WRITER and the status TYPE each carry the rule.
@@ -1877,7 +1899,7 @@ mod tests {
         let body = sd_status_apply_body_with_conditions(
             "orders",
             false,
-            &Backing::pg("shd_apps_orders"),
+            &Backing::pg("shd_apps_orders", "platform-postgres"),
             0,
             ready_condition("False", "ExtensionUnavailable", "missing", &[]),
             Some(ext),
@@ -1901,6 +1923,7 @@ mod tests {
             ready: Some(true),
             ref_count: Some(2),
             database: Some(database.into()),
+            instance: Some("platform-postgres".into()),
             ..Default::default()
         });
         sd
@@ -1913,7 +1936,10 @@ mod tests {
         // body instead, and passed happily when the default was mutated back
         // to an empty backing — it was pinning the builder, not the choice.
         let sd = provisioned("shd_shop_orders");
-        assert_eq!(backing_for_write(None, &sd), Backing::pg("shd_shop_orders"));
+        assert_eq!(
+            backing_for_write(None, &sd),
+            Backing::pg("shd_shop_orders", "platform-postgres")
+        );
     }
 
     #[test]

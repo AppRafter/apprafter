@@ -61,7 +61,7 @@ use crate::acl_reconcile::redis_namespace_from;
 use crate::dragonfly::{class_of_instance, PoolClass};
 use crate::reconcile::{cluster_ar, dragonfly_cluster_ar, pvc_ar, Backend};
 use crate::{Context, ReconcileError};
-use operator_core::{ResourceClaim, RetainedClaim, ServiceProvider};
+use operator_core::{ResourceClaim, RetainedClaim, ServiceProvider, SharedDatabase};
 
 /// `ResourceClaim.spec.type` of a Redis claim (the Dragonfly backend's
 /// service type — `platform-stack/cue/service_providers.cue`).
@@ -140,6 +140,13 @@ pub enum VetoReason {
     Intent,
     /// A `RetainedClaim` snapshot still names this instance.
     Retained,
+    /// A `SharedDatabase` occupies this instance (2.29 / ADR 0066).
+    ///
+    /// Its own veto rather than folding into [`Self::Live`]: a shared
+    /// database is not a claim and outlives every claim that binds it, so a
+    /// log line saying "a live claim holds this" would be false and would
+    /// send an operator looking for a claim that does not exist.
+    SharedDatabase,
 }
 
 /// The fate of one candidate.
@@ -372,12 +379,41 @@ fn is_retained_for(snapshot: &RetainedClaim, target: &Target) -> bool {
 /// providers. `empty_for` is how long the caller has observed this
 /// instance with no tenants (`None` = not yet observed empty, e.g. the
 /// first sweep after an operator restart), and `dwell` is how long that
+/// Whether `sd` occupies `target`.
+///
+/// An exact name match on `status.instance`, for both types: a redis shared
+/// database records the pool instance there, and a pg one records the CNPG
+/// cluster (see `Backing::pg`). Matching on a name the controller itself
+/// wrote keeps this in step with what was actually provisioned, rather than
+/// re-deriving it from the spec's selector and hoping the two agree.
+///
+/// A database under deletion does NOT veto: its own cleanup is what removes
+/// the backing's last occupant, and vetoing on it would mean the backend
+/// could never be reclaimed.
+fn is_shared_on(sd: &SharedDatabase, target: &Target) -> bool {
+    if sd.metadata.deletion_timestamp.is_some() {
+        return false;
+    }
+    let Some(instance) = sd.status.as_ref().and_then(|s| s.instance.as_deref()) else {
+        // Not yet provisioned anywhere. It cannot be holding this backend —
+        // and the provisioning path applies the backend before it writes the
+        // status, so the ordinary race is covered by the `Intent` veto's
+        // sibling reasoning rather than by guessing here.
+        return false;
+    };
+    match target {
+        Target::Cnpg { name } => instance == name,
+        Target::Dragonfly { name, .. } => instance == name,
+    }
+}
+
 /// must hold before a reap. The clock is the caller's: nothing in here
 /// reads the current time, so every row of the table test is exact.
 pub fn reap_decision(
     target: &Target,
     live: &[ResourceClaim],
     retained: &[RetainedClaim],
+    shared: &[SharedDatabase],
     idx: &ProviderIndex,
     empty_for: Option<Duration>,
     dwell: Duration,
@@ -394,6 +430,23 @@ pub fn reap_decision(
     }
     if retained.iter().any(|r| is_retained_for(r, target)) {
         return Decision::Veto(VetoReason::Retained);
+    }
+    // 2.29 (ADR 0066). A `SharedDatabase` occupies a backend and is NOT a
+    // claim — its consumers' claims carry a `sharedRef` and no allocation of
+    // their own, and the database outlives all of them by design.
+    //
+    // Walk-found, and it is the most destructive member of a family this
+    // track hit three times: every inventory that answers "is anything using
+    // this" had been written in terms of claims. The `$N` allocator was one,
+    // the RetainedClaim snapshot another, and this one deletes a live
+    // PostgreSQL cluster or Dragonfly instance with the data still in it. The
+    // walk's operator log said `shared CNPG cluster has no tenants — starting
+    // dwell` while a ready shared database sat on it.
+    //
+    // `shared` is a REQUIRED parameter, like the allocator's: a future caller
+    // has to answer the question rather than omit it.
+    if shared.iter().any(|sd| is_shared_on(sd, target)) {
+        return Decision::Veto(VetoReason::SharedDatabase);
     }
     // `None` = never yet observed empty (a fresh sweep, or the operator just
     // restarted), which starts the dwell rather than skipping it.
@@ -434,6 +487,7 @@ fn veto_label(reason: VetoReason) -> &'static str {
         VetoReason::Live => "veto_live",
         VetoReason::Intent => "veto_intent",
         VetoReason::Retained => "veto_retained",
+        VetoReason::SharedDatabase => "veto_shared_database",
     }
 }
 
@@ -479,6 +533,9 @@ fn list_truncated(meta: &ListMeta) -> bool {
 struct SweepInputs {
     live: Vec<ResourceClaim>,
     retained: Vec<RetainedClaim>,
+    /// Every `SharedDatabase`, cluster-wide (2.29). A fourth LIST per tick,
+    /// and the cheapest possible insurance against deleting a live backend.
+    shared: Vec<SharedDatabase>,
     providers: Vec<ServiceProvider>,
     idx: ProviderIndex,
     /// The instant the pass began — the clock every candidate in it is
@@ -545,6 +602,9 @@ async fn sweep(
     let retained = Api::<RetainedClaim>::all(ctx.client.clone())
         .list(&Default::default())
         .await?;
+    let shared = Api::<SharedDatabase>::all(ctx.client.clone())
+        .list(&Default::default())
+        .await?;
     let providers = Api::<ServiceProvider>::all(ctx.client.clone())
         .list(&Default::default())
         .await?;
@@ -585,6 +645,7 @@ async fn sweep(
     let inputs = SweepInputs {
         live: live.items,
         retained: retained.items,
+        shared: shared.items,
         providers: providers.items,
         idx,
         // One clock reading for the whole pass, so every candidate in it is
@@ -735,6 +796,7 @@ async fn sweep_dragonfly(
             &target,
             &inputs.live,
             &inputs.retained,
+            &inputs.shared,
             &inputs.idx,
             empty_for,
             dwell,
@@ -1234,6 +1296,7 @@ async fn sweep_cnpg(
             &target,
             &inputs.live,
             &inputs.retained,
+            &inputs.shared,
             &inputs.idx,
             empty_for,
             dwell,
@@ -1623,6 +1686,126 @@ mod tests {
     }
 
     /// The platform's seeded pair (`platform-stack/cue/service_providers.cue`).
+    /// A `SharedDatabase` recorded as occupying `instance`.
+    fn shared_on(name: &str, type_: &str, instance: Option<&str>) -> SharedDatabase {
+        let mut sd = SharedDatabase::new(
+            name,
+            operator_core::SharedDatabaseSpec {
+                type_: type_.into(),
+                ..Default::default()
+            },
+        );
+        sd.status = Some(operator_core::SharedDatabaseStatus {
+            ready: Some(true),
+            instance: instance.map(str::to_string),
+            ..Default::default()
+        });
+        sd
+    }
+
+    // ---- 2.29: a SharedDatabase occupies a backend and is not a claim ----
+
+    #[test]
+    fn a_shared_pg_database_vetoes_reaping_its_cluster() {
+        // THE walk finding. Every veto was written in terms of claims, and a
+        // shared database's consumers carry a `sharedRef` and no allocation of
+        // their own — so a cluster whose only occupant was a shared database
+        // read as empty and went on a dwell to be DELETED, data included. The
+        // walk's operator log said "shared CNPG cluster has no tenants" while
+        // a ready shared database sat on it.
+        let shared = vec![shared_on("orders", "pg", Some("platform-postgres"))];
+        assert_eq!(
+            reap_decision(
+                &cnpg_target("platform-postgres"),
+                &[],
+                &[],
+                &shared,
+                &seeded_index(),
+                LONG_EMPTY,
+                DWELL,
+            ),
+            Decision::Veto(VetoReason::SharedDatabase)
+        );
+    }
+
+    #[test]
+    fn a_shared_cache_vetoes_reaping_its_pool_instance() {
+        let shared = vec![shared_on("events", "redis", Some(EPHEMERAL_000))];
+        assert_eq!(
+            reap_decision(
+                &dragonfly_target(EPHEMERAL_000, PoolClass::Ephemeral),
+                &[],
+                &[],
+                &shared,
+                &seeded_index(),
+                LONG_EMPTY,
+                DWELL,
+            ),
+            Decision::Veto(VetoReason::SharedDatabase)
+        );
+    }
+
+    #[test]
+    fn a_shared_database_on_another_backend_vetoes_nothing() {
+        // The veto is an exact name match, so an empty instance stays
+        // reapable while a busy one does not — the point of recording the
+        // instance in the status rather than vetoing on existence.
+        let shared = vec![shared_on("orders", "pg", Some("some-other-cluster"))];
+        assert_eq!(
+            reap_decision(
+                &cnpg_target("platform-postgres"),
+                &[],
+                &[],
+                &shared,
+                &seeded_index(),
+                LONG_EMPTY,
+                DWELL,
+            ),
+            Decision::Reap
+        );
+    }
+
+    #[test]
+    fn an_unprovisioned_shared_database_vetoes_nothing() {
+        let shared = vec![shared_on("orders", "pg", None)];
+        assert_eq!(
+            reap_decision(
+                &cnpg_target("platform-postgres"),
+                &[],
+                &[],
+                &shared,
+                &seeded_index(),
+                LONG_EMPTY,
+                DWELL,
+            ),
+            Decision::Reap
+        );
+    }
+
+    #[test]
+    fn a_shared_database_under_deletion_releases_its_backend() {
+        // Its own cleanup is what removes the backend's last occupant, so
+        // vetoing on it would mean the backend could never be reclaimed —
+        // the reaper would hold a dwell open against an object that is
+        // itself waiting to go.
+        let mut sd = shared_on("orders", "pg", Some("platform-postgres"));
+        sd.metadata.deletion_timestamp = Some(
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(chrono::Utc::now()),
+        );
+        assert_eq!(
+            reap_decision(
+                &cnpg_target("platform-postgres"),
+                &[],
+                &[],
+                &[sd],
+                &seeded_index(),
+                LONG_EMPTY,
+                DWELL,
+            ),
+            Decision::Reap
+        );
+    }
+
     fn seeded_index() -> ProviderIndex {
         provider_index(&[
             provider(
@@ -1650,6 +1833,7 @@ mod tests {
                 &dragonfly_target(EPHEMERAL_000, PoolClass::Ephemeral),
                 &live,
                 &[],
+                &[],
                 &seeded_index(),
                 LONG_EMPTY,
                 DWELL,
@@ -1675,6 +1859,7 @@ mod tests {
                 &dragonfly_target(EPHEMERAL_000, PoolClass::Ephemeral),
                 &live,
                 &[],
+                &[],
                 &seeded_index(),
                 LONG_EMPTY,
                 DWELL,
@@ -1698,6 +1883,7 @@ mod tests {
                 &dragonfly_target(EPHEMERAL_000, PoolClass::Ephemeral),
                 &live,
                 &[],
+                &[],
                 &seeded_index(),
                 LONG_EMPTY,
                 DWELL,
@@ -1718,6 +1904,7 @@ mod tests {
                 &dragonfly_target(EPHEMERAL_000, PoolClass::Ephemeral),
                 &live,
                 &[],
+                &[],
                 &seeded_index(),
                 LONG_EMPTY,
                 DWELL,
@@ -1733,6 +1920,7 @@ mod tests {
             reap_decision(
                 &dragonfly_target(EPHEMERAL_000, PoolClass::Ephemeral),
                 &live,
+                &[],
                 &[],
                 &seeded_index(),
                 LONG_EMPTY,
@@ -1750,6 +1938,7 @@ mod tests {
             reap_decision(
                 &dragonfly_target(EPHEMERAL_000, PoolClass::Ephemeral),
                 &live,
+                &[],
                 &[],
                 &seeded_index(),
                 LONG_EMPTY,
@@ -1772,6 +1961,7 @@ mod tests {
                 &dragonfly_target(PERSISTENT_000, PoolClass::Persistent),
                 &live,
                 &[],
+                &[],
                 &seeded_index(),
                 LONG_EMPTY,
                 DWELL,
@@ -1790,6 +1980,7 @@ mod tests {
             reap_decision(
                 &dragonfly_target(PERSISTENT_000, PoolClass::Persistent),
                 &live,
+                &[],
                 &[],
                 &seeded_index(),
                 LONG_EMPTY,
@@ -1811,6 +2002,7 @@ mod tests {
                 &dragonfly_target(EPHEMERAL_000, PoolClass::Ephemeral),
                 &[c],
                 &[],
+                &[],
                 &seeded_index(),
                 LONG_EMPTY,
                 DWELL,
@@ -1829,6 +2021,7 @@ mod tests {
                 &dragonfly_target(PERSISTENT_000, PoolClass::Persistent),
                 &[],
                 &retained,
+                &[],
                 &seeded_index(),
                 LONG_EMPTY,
                 DWELL,
@@ -1848,6 +2041,7 @@ mod tests {
                 &dragonfly_target(EPHEMERAL_000, PoolClass::Ephemeral),
                 &[],
                 &retained,
+                &[],
                 &seeded_index(),
                 LONG_EMPTY,
                 DWELL,
@@ -1865,6 +2059,7 @@ mod tests {
             reap_decision(
                 &cnpg_target(CLUSTER),
                 &live,
+                &[],
                 &[],
                 &seeded_index(),
                 LONG_EMPTY,
@@ -1884,6 +2079,7 @@ mod tests {
                 &cnpg_target(CLUSTER),
                 &live,
                 &[],
+                &[],
                 &seeded_index(),
                 LONG_EMPTY,
                 DWELL,
@@ -1900,6 +2096,7 @@ mod tests {
                 &cnpg_target(CLUSTER),
                 &[],
                 &retained,
+                &[],
                 &seeded_index(),
                 LONG_EMPTY,
                 DWELL,
@@ -1916,6 +2113,7 @@ mod tests {
                 &cnpg_target(CLUSTER),
                 &[],
                 &retained,
+                &[],
                 &seeded_index(),
                 LONG_EMPTY,
                 DWELL,
@@ -1933,7 +2131,7 @@ mod tests {
             cnpg_target(CLUSTER),
         ] {
             assert_eq!(
-                reap_decision(&target, &[], &[], &seeded_index(), None, DWELL),
+                reap_decision(&target, &[], &[], &[], &seeded_index(), None, DWELL),
                 Decision::Dwell,
                 "target {target:?}"
             );
@@ -1948,7 +2146,7 @@ mod tests {
             cnpg_target(CLUSTER),
         ] {
             assert_eq!(
-                reap_decision(&target, &[], &[], &seeded_index(), just_under, DWELL),
+                reap_decision(&target, &[], &[], &[], &seeded_index(), just_under, DWELL),
                 Decision::Dwell,
                 "target {target:?}"
             );
@@ -1962,7 +2160,7 @@ mod tests {
             cnpg_target(CLUSTER),
         ] {
             assert_eq!(
-                reap_decision(&target, &[], &[], &seeded_index(), Some(DWELL), DWELL),
+                reap_decision(&target, &[], &[], &[], &seeded_index(), Some(DWELL), DWELL),
                 Decision::Reap,
                 "target {target:?}"
             );
@@ -2117,6 +2315,7 @@ mod tests {
             reap_decision(
                 &cnpg_target("tenant-postgres"),
                 &live,
+                &[],
                 &[],
                 &idx,
                 LONG_EMPTY,

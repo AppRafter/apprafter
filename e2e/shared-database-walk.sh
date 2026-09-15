@@ -24,9 +24,15 @@
 #      provisions, and that the consumer's connection Secret is the same shape
 #      an owned claim's is — which is what lets `claim.pg.*`, the egress rule
 #      and the readiness gate stay unaware the database is shared.
-#   3. That the ADR 0052 gate fires on the FIRST bind of a pair and not on the
-#      second reconcile of the same one. A gate that re-fires is a gate nobody
-#      can leave switched on.
+#   3. That the ADR 0052 gate fires when an application ACQUIRES a binding it
+#      did not have, and not on the second reconcile of the same one. A gate
+#      that re-fires is a gate nobody can leave switched on.
+#
+#      Each fixture is therefore created UNBOUND and then edited. That is not
+#      ceremony: detection runs only against a stamped baseline, so an
+#      application whose first spec already carries the `ref` is not gated at
+#      all — a real gap, shared by every ADR 0052 trigger, recorded in ADR 0066
+#      §5.1 rather than papered over here.
 #   4. That `refCount` is derived and the `db rm` guard reads it — including
 #      the half no unit test reaches, that the refusal NAMES the binders.
 #   5. That a shared Redis keyspace's consumers can publish to each other.
@@ -270,6 +276,23 @@ done
 printf '  branch CRDs applied + Established (including shareddatabases)\n'
 apply_branch_operator_rbac
 
+# The branch ValidatingWebhookConfiguration. `build_load_restart` rebuilds the
+# webhook IMAGE and nothing else, so a rule added on a branch — here, the whole
+# `shareddatabases` entry — is simply not registered and every new refusal
+# silently does not happen. Run 5 of this walk passed a `--extension dblink`
+# create for exactly that reason and blamed the validator.
+#
+# Safe to apply: `caBundle` is injected by cert-manager through the
+# `cert-manager.io/inject-ca-from` annotation the template carries, so a
+# re-apply does not strip it — cert-manager puts it back.
+_wh_yq() { if command -v yq >/dev/null 2>&1; then yq "$@"; else nix run nixpkgs#yq-go -- "$@"; fi; }
+helm template apprafter-admission-webhook \
+    "${REPO_ROOT}/operator/charts/apprafter-admission-webhook" -n "$PLATFORM_NS" \
+    | _wh_yq 'select(.kind == "ValidatingWebhookConfiguration")' \
+    | kubectl apply --server-side --force-conflicts -f - >/dev/null \
+    || die "applying the branch ValidatingWebhookConfiguration"
+printf '  branch ValidatingWebhookConfiguration applied\n'
+
 # ===============================================================
 phase "Phase 2: platform readiness (CNPG, dragonfly, providers)"
 # ===============================================================
@@ -285,6 +308,21 @@ printf '  ok: CNPG operator Available\n'
 retry 30 10 -- kubectl get serviceprovider pg-integrated -n "$PLATFORM_NS" >/dev/null \
     || die "the pg-integrated ServiceProvider was never seeded"
 printf '  ok: pg-integrated ServiceProvider present\n'
+# RBAC, ASSERTED rather than assumed — and re-applied first, because run 5
+# provisioned the database and then 403'd on the very same resource: something
+# (Argo CD re-syncing the operator Application is the candidate) restores the
+# published ClusterRole between phases, and a 403 on a watch surfaces as a
+# controller that has simply stopped, with nothing in any object to say so.
+#
+# `kubectl auth can-i --as` asks the apiserver the exact question the operator
+# will ask, which is stronger than grepping the ClusterRole for a string.
+apply_branch_operator_rbac
+_sa="system:serviceaccount:${PLATFORM_NS}:apprafter-operator"
+for _verb in list watch patch; do
+    _can=$(kubectl auth can-i "$_verb" shareddatabases.apprafter.io --as="$_sa" -A 2>/dev/null || true)
+    check "the operator may ${_verb} shareddatabases cluster-wide" "$_can" "yes"
+done
+
 PG_CLUSTER=$(jp serviceprovider "$PLATFORM_NS" pg-integrated '{.spec.config.cluster}')
 [ -n "$PG_CLUSTER" ] || PG_CLUSTER="platform-postgres"
 printf '  shared CNPG cluster: %s\n' "$PG_CLUSTER"
@@ -331,6 +369,20 @@ check "an unbound database reports refCount 0" \
 check "the status publishes no shared connection Secret" \
     "$(jp "$SHDB_RES" "$APP_NS" "$PG_DB" '{.status.connectionSecretRef}')" ""
 
+# THE REAPER MUST NOT CONSIDER THE CLUSTER EMPTY. Run 6's operator log said
+# `shared CNPG cluster has no tenants — starting dwell` while this database
+# was ready on it; after the dwell it would have DELETED the cluster with the
+# data in it. Every veto had been written in terms of claims, and a shared
+# database's consumers carry a `sharedRef` and no allocation of their own.
+#
+# Asserted from the log rather than by waiting out a ten-minute dwell: the
+# dwell STARTING is already the bug, and it is announced exactly once.
+check "the database records the cluster it lives on (the reaper vetoes on it)" \
+    "$(jp "$SHDB_RES" "$APP_NS" "$PG_DB" '{.status.instance}')" "$PG_CLUSTER"
+REAPER_LOG=$(kubectl -n "$PLATFORM_NS" logs deploy/apprafter-operator --tail=2000 2>/dev/null \
+    | grep -c "has no tenants" || true)
+check "the reaper never called the occupied cluster tenant-less" "$REAPER_LOG" "0"
+
 # The allow list applies to a SharedDatabase too, and did not for a while: it
 # was enforced on `needs.pg.extensions` from the start while a SharedDatabase
 # reached the same superuser CREATE EXTENSION through an object nothing
@@ -346,6 +398,23 @@ check "the refused database was never created" "$EVIL" ""
 PG_ADMIN_PW=$(kubectl -n "$CNPG_NS" get secret "${PG_CLUSTER}-apprafter-admin" \
     -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
 [ -n "$PG_ADMIN_PW" ] || die "the platform role's password Secret was never created"
+
+# PREFLIGHT the psql seam before any assertion depends on it. Run 6 returned
+# the three characters `100` from a role query, which is not a role list and
+# not an error anyone can read — and the assertion that reported it was about
+# groups, so it pointed at the controller. One trivial query first turns the
+# next such surprise into a named failure with the pod list attached.
+PG_PROBE=$(psql_as apprafter_admin "$PG_ADMIN_PW" postgres "SELECT 1;" || true)
+if [ "$PG_PROBE" != "1" ]; then
+    printf '    raw psql output: %q\n' "$PG_PROBE" >&2
+    printf '    pods in %s:\n' "$CNPG_NS" >&2
+    kubectl -n "$CNPG_NS" get pods -o wide >&2 2>&1 || true
+    printf '    containers in %s-1: %s\n' "$PG_CLUSTER" \
+        "$(kubectl -n "$CNPG_NS" get pod "${PG_CLUSTER}-1" \
+            -o jsonpath='{.spec.containers[*].name}' 2>&1 || true)" >&2
+    die "the psql seam does not work — every SQL assertion below would be noise"
+fi
+printf '  ok: psql reaches the shared cluster as the platform role\n'
 GROUPS=$(psql_as apprafter_admin "$PG_ADMIN_PW" postgres \
     "SELECT rolname FROM pg_roles WHERE rolname IN ('${PG_GROUP}','${PG_READER_GROUP}') ORDER BY 1;" || true)
 contains "the owning group exists on the server" "$GROUPS" "$PG_GROUP"
@@ -365,7 +434,32 @@ check "the platform role is not a superuser" "$IS_SUPER" "f"
 # ===============================================================
 phase "Phase 4: the FIRST bind is gated (ADR 0052 trigger #17)"
 # ===============================================================
-kubectl apply -f - >/dev/null <<YAML || die "applying ${APP_RW}"
+# THE APPLICATION IS CREATED UNBOUND FIRST, and that is not ceremony.
+#
+# Destructive-change detection runs only against a stamped
+# `status.lastAppliedSpec` baseline (`detect_all` is called under `if let
+# Some(baseline_spec)`), so a brand-new Application whose first spec already
+# carries the `ref` binds with NO approval. That gap is real, is a property of
+# the whole ADR 0052 axis rather than of this trigger, and is recorded in ADR
+# 0066 §5.1 and in the guide — it is not what this phase is testing.
+#
+# What this phase tests is the gate that does exist: an application ACQUIRING
+# reach it did not have. Same two-step shape acceptance #14 uses for
+# `dynamicStreams`, and for the same reason.
+kubectl apply -f - >/dev/null <<YAML || die "applying ${APP_RW} unbound"
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata: {name: ${APP_RW}, namespace: ${APP_NS}}
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+YAML
+wait_jsonpath "$AR_APP" "$APP_NS" "$APP_RW" \
+    '{.status.lastAppliedSpec.base.image}' nginxdemos/hello:plain-text 240 \
+    || die "${APP_RW} never stamped a baseline to diff against"
+
+printf '  adding the bind ...\n'
+kubectl apply -f - >/dev/null <<YAML || die "binding ${APP_RW}"
 apiVersion: apprafter.io/v1alpha1
 kind: Application
 metadata: {name: ${APP_RW}, namespace: ${APP_NS}}
@@ -453,7 +547,18 @@ check "no new MigrationPlan on a re-reconcile of an existing binding" \
 # ===============================================================
 phase "Phase 7: a second application binds ro — and the data is SHARED"
 # ===============================================================
-kubectl apply -f - >/dev/null <<YAML || die "applying ${APP_RO}"
+kubectl apply -f - >/dev/null <<YAML || die "applying ${APP_RO} unbound"
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata: {name: ${APP_RO}, namespace: ${APP_NS}}
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+YAML
+wait_jsonpath "$AR_APP" "$APP_NS" "$APP_RO" \
+    '{.status.lastAppliedSpec.base.image}' nginxdemos/hello:plain-text 240 \
+    || die "${APP_RO} never stamped a baseline"
+kubectl apply -f - >/dev/null <<YAML || die "binding ${APP_RO}"
 apiVersion: apprafter.io/v1alpha1
 kind: Application
 metadata: {name: ${APP_RO}, namespace: ${APP_NS}}
@@ -617,7 +722,20 @@ CACHE_DBNUM=$(jp "$SHDB_RES" "$APP_NS" "$CACHE_DB" '{.status.dbnum}')
 printf '  shared cache: %s $%s\n' "$CACHE_INSTANCE" "$CACHE_DBNUM"
 
 for _app in "$APP_CACHE_A" "$APP_CACHE_B"; do
-    kubectl apply -f - >/dev/null <<YAML || die "applying ${_app}"
+    kubectl apply -f - >/dev/null <<YAML || die "applying ${_app} unbound"
+apiVersion: apprafter.io/v1alpha1
+kind: Application
+metadata: {name: ${_app}, namespace: ${APP_NS}}
+spec:
+  base:
+    image: nginxdemos/hello:plain-text
+YAML
+    wait_jsonpath "$AR_APP" "$APP_NS" "$_app" \
+        '{.status.lastAppliedSpec.base.image}' nginxdemos/hello:plain-text 240 \
+        || die "${_app} never stamped a baseline"
+done
+for _app in "$APP_CACHE_A" "$APP_CACHE_B"; do
+    kubectl apply -f - >/dev/null <<YAML || die "binding ${_app}"
 apiVersion: apprafter.io/v1alpha1
 kind: Application
 metadata: {name: ${_app}, namespace: ${APP_NS}}
