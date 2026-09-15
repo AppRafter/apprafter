@@ -88,6 +88,13 @@ package v1alpha1
 	// quantities. Quantity format + request<=limit are webhook-enforced.
 	resources?: #Resources
 
+	// Liveness / readiness / startup probes (2.28 / ADR 0065). An absent
+	// block still yields a default TCP-connect readiness probe when
+	// `expose.port` is set — see `#Probes`. Every timing default lives in
+	// `operator-rendering/src/probes.rs`, not here; a CUE `*x` default
+	// would not reach the CRD anyway (crdgen strips them, R4-M2).
+	probes?: #Probes
+
 	// Replica count. Zero is valid (scale-to-zero); negative is
 	// rejected by CUE.
 	replicas?: int & >=0
@@ -159,7 +166,12 @@ package v1alpha1
 	image?:       string
 	imagePolicy?: #ImagePolicy
 	resources?:   #Resources
-	replicas?:    int & >=0
+	// 2.28: reused verbatim from the base type. Every field of `#Probes`
+	// and `#Probe` is already optional, so it is its own partial-override
+	// type — the same reason `#Resources` and `#ImagePolicy` are reused
+	// here rather than mirrored.
+	probes?:   #Probes
+	replicas?: int & >=0
 	expose?: {
 		port?:    int & >0 & <=65535
 		network?: "public" | "internal" | "vpn"
@@ -541,6 +553,75 @@ _mkFields: {
 #Resources: {
 	requests?: [string]: string
 	limits?: [string]:   string
+}
+
+// #Probes — the three Kubernetes probes, each optional and each
+// independently disableable (2.28 / ADR 0065 §1).
+//
+// An absent `readiness` with a declared `expose.port` renders a TCP-connect
+// readiness probe on that port. Nothing is guessed — the port is the
+// manifest's own — and without it every rolling update has a window in
+// which the new pod is Ready and taking traffic while its process is still
+// binding. Opt out with `readiness: {enabled: false}`.
+//
+// A declared, enabled `liveness` with no `startup` derives a startup probe
+// against the same target with a long failure budget (ADR 0065 §1.4), so
+// that adding one liveness probe cannot CrashLoop a slow-starting
+// application. An explicit `startup` wins outright — there is no
+// field-level merge between the two.
+#Probes: {
+	liveness?:  #Probe
+	readiness?: #Probe
+	startup?:   #Probe
+}
+
+// #Probe — one probe. The FORM is discriminated by `path`: present means an
+// HTTP GET, absent means a TCP connect. There is no `httpGet` / `tcpSocket`
+// nesting — the Kubernetes shape exists to carry five action kinds and this
+// surface carries two (ADR 0065 §1.1).
+//
+// `path`'s leading `/`, the port-resolution rule and every cross-field
+// invariant live in the CRD + the admission webhook, not here: a regex stub
+// in CUE would hint at validation this type does not actually perform — the
+// same policy `#ApplicationSpec.image` records above.
+//
+// Timings are integer SECONDS under Kubernetes' own field names, NOT the
+// duration strings `#JetStreamStream.maxAge` uses. The inconsistency is
+// deliberate: a Kubernetes probe is specified in whole seconds, so a string
+// field would accept "500ms" and we would then have to reject it. Better
+// that the wrong thing cannot be written down.
+//
+// EVERY default this type implies is applied by the renderer
+// (`operator-rendering/src/probes.rs`), including the `*true` and `*"http"`
+// written below. A CUE `*x` default does not reach the generated CRD —
+// crdgen's `structural::resolve` strips it and the R4-M2 assertion fails
+// the build if one survives, because behaviour belongs to the renderer and
+// not to the apiserver (ADR 0047) — and `cue export` omits an optional
+// field regardless. The markers below therefore document intent to a reader
+// and to `cue vet`; they are not a second mechanism.
+#Probe: {
+	// Render this probe. `false` keeps the declaration in git while taking
+	// the probe off the pod — the reason it is a field and not an omission.
+	// Declaring it alongside a full probe body is NOT a contradiction.
+	enabled?: bool | *true
+
+	// HTTP request path ("/healthz"). Present => HTTP probe; absent => TCP.
+	path?: string
+
+	// Target port. Default: this scope's effective `expose.port`. A probe
+	// with neither is rejected by the webhook, naming which probe.
+	port?: int & >0 & <=65535
+
+	// HTTP only — the webhook rejects either without `path` rather than
+	// ignoring it, so a typo is not silently dropped.
+	scheme?: "http" | *"http" | "https"
+	headers?: [string]: string
+
+	initialDelaySeconds?: int & >=0
+	periodSeconds?:       int & >0
+	timeoutSeconds?:      int & >0
+	failureThreshold?:    int & >0
+	successThreshold?:    int & >0
 }
 
 // #ImagePolicy — image-reference resolution policy under

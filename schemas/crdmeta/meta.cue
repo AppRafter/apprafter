@@ -84,6 +84,27 @@ _crdMetas: Application: {
 		"environments[*].needs.jetstream.streams[].name": {pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"}
 		"base.needs.jetstream.consume[].durable": {pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"}
 		"environments[*].needs.jetstream.consume[].durable": {pattern: "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"}
+
+		// `probes.*.path` (2.28 / ADR 0065 §1.5): the leading-slash rule the
+		// `#Probe` type deliberately omits, same validation policy as every
+		// format rule above. `^/` is the WHOLE rule — the rest of an HTTP
+		// path has no grammar worth asserting at the apiserver, and a
+		// tighter regex here would start rejecting legitimate paths
+		// (matrix parameters, percent-encoding) for no gain.
+		// `validate_probes` in the admission webhook re-states it, kept for
+		// the same reason as the jetstream rules above: a cluster whose CRD
+		// predates this patch is still covered.
+		// Six entries — `probes` is rendered under both `base` and
+		// `environments[*]`, times the three probe slots. There is no
+		// wildcard for "any key of this object": `[*]` descends into a MAP's
+		// additionalProperties, and `#Probes` is a closed struct with three
+		// named fields, not a map.
+		"base.probes.liveness.path": {pattern: "^/"}
+		"base.probes.readiness.path": {pattern: "^/"}
+		"base.probes.startup.path": {pattern: "^/"}
+		"environments[*].probes.liveness.path": {pattern: "^/"}
+		"environments[*].probes.readiness.path": {pattern: "^/"}
+		"environments[*].probes.startup.path": {pattern: "^/"}
 	}
 
 	// `status.lastAppliedSpec` is the 2.16b migration baseline — a raw

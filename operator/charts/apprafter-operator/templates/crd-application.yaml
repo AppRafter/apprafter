@@ -160,6 +160,132 @@ spec:
                       s3:
                         x-kubernetes-preserve-unknown-fields: true
                     type: object
+                  probes:
+                    properties:
+                      liveness:
+                        properties:
+                          enabled:
+                            type: boolean
+                          failureThreshold:
+                            exclusiveMinimum: true
+                            minimum: 0
+                            type: integer
+                          headers:
+                            additionalProperties:
+                              type: string
+                            type: object
+                          initialDelaySeconds:
+                            minimum: 0
+                            type: integer
+                          path:
+                            pattern: ^/
+                            type: string
+                          periodSeconds:
+                            exclusiveMinimum: true
+                            minimum: 0
+                            type: integer
+                          port:
+                            exclusiveMinimum: true
+                            maximum: 65535
+                            minimum: 0
+                            type: integer
+                          scheme:
+                            enum:
+                            - http
+                            - https
+                            type: string
+                          successThreshold:
+                            exclusiveMinimum: true
+                            minimum: 0
+                            type: integer
+                          timeoutSeconds:
+                            exclusiveMinimum: true
+                            minimum: 0
+                            type: integer
+                        type: object
+                      readiness:
+                        properties:
+                          enabled:
+                            type: boolean
+                          failureThreshold:
+                            exclusiveMinimum: true
+                            minimum: 0
+                            type: integer
+                          headers:
+                            additionalProperties:
+                              type: string
+                            type: object
+                          initialDelaySeconds:
+                            minimum: 0
+                            type: integer
+                          path:
+                            pattern: ^/
+                            type: string
+                          periodSeconds:
+                            exclusiveMinimum: true
+                            minimum: 0
+                            type: integer
+                          port:
+                            exclusiveMinimum: true
+                            maximum: 65535
+                            minimum: 0
+                            type: integer
+                          scheme:
+                            enum:
+                            - http
+                            - https
+                            type: string
+                          successThreshold:
+                            exclusiveMinimum: true
+                            minimum: 0
+                            type: integer
+                          timeoutSeconds:
+                            exclusiveMinimum: true
+                            minimum: 0
+                            type: integer
+                        type: object
+                      startup:
+                        properties:
+                          enabled:
+                            type: boolean
+                          failureThreshold:
+                            exclusiveMinimum: true
+                            minimum: 0
+                            type: integer
+                          headers:
+                            additionalProperties:
+                              type: string
+                            type: object
+                          initialDelaySeconds:
+                            minimum: 0
+                            type: integer
+                          path:
+                            pattern: ^/
+                            type: string
+                          periodSeconds:
+                            exclusiveMinimum: true
+                            minimum: 0
+                            type: integer
+                          port:
+                            exclusiveMinimum: true
+                            maximum: 65535
+                            minimum: 0
+                            type: integer
+                          scheme:
+                            enum:
+                            - http
+                            - https
+                            type: string
+                          successThreshold:
+                            exclusiveMinimum: true
+                            minimum: 0
+                            type: integer
+                          timeoutSeconds:
+                            exclusiveMinimum: true
+                            minimum: 0
+                            type: integer
+                        type: object
+                    type: object
                   replicas:
                     minimum: 0
                     type: integer
@@ -297,6 +423,132 @@ spec:
                           x-kubernetes-preserve-unknown-fields: true
                         s3:
                           x-kubernetes-preserve-unknown-fields: true
+                      type: object
+                    probes:
+                      properties:
+                        liveness:
+                          properties:
+                            enabled:
+                              type: boolean
+                            failureThreshold:
+                              exclusiveMinimum: true
+                              minimum: 0
+                              type: integer
+                            headers:
+                              additionalProperties:
+                                type: string
+                              type: object
+                            initialDelaySeconds:
+                              minimum: 0
+                              type: integer
+                            path:
+                              pattern: ^/
+                              type: string
+                            periodSeconds:
+                              exclusiveMinimum: true
+                              minimum: 0
+                              type: integer
+                            port:
+                              exclusiveMinimum: true
+                              maximum: 65535
+                              minimum: 0
+                              type: integer
+                            scheme:
+                              enum:
+                              - http
+                              - https
+                              type: string
+                            successThreshold:
+                              exclusiveMinimum: true
+                              minimum: 0
+                              type: integer
+                            timeoutSeconds:
+                              exclusiveMinimum: true
+                              minimum: 0
+                              type: integer
+                          type: object
+                        readiness:
+                          properties:
+                            enabled:
+                              type: boolean
+                            failureThreshold:
+                              exclusiveMinimum: true
+                              minimum: 0
+                              type: integer
+                            headers:
+                              additionalProperties:
+                                type: string
+                              type: object
+                            initialDelaySeconds:
+                              minimum: 0
+                              type: integer
+                            path:
+                              pattern: ^/
+                              type: string
+                            periodSeconds:
+                              exclusiveMinimum: true
+                              minimum: 0
+                              type: integer
+                            port:
+                              exclusiveMinimum: true
+                              maximum: 65535
+                              minimum: 0
+                              type: integer
+                            scheme:
+                              enum:
+                              - http
+                              - https
+                              type: string
+                            successThreshold:
+                              exclusiveMinimum: true
+                              minimum: 0
+                              type: integer
+                            timeoutSeconds:
+                              exclusiveMinimum: true
+                              minimum: 0
+                              type: integer
+                          type: object
+                        startup:
+                          properties:
+                            enabled:
+                              type: boolean
+                            failureThreshold:
+                              exclusiveMinimum: true
+                              minimum: 0
+                              type: integer
+                            headers:
+                              additionalProperties:
+                                type: string
+                              type: object
+                            initialDelaySeconds:
+                              minimum: 0
+                              type: integer
+                            path:
+                              pattern: ^/
+                              type: string
+                            periodSeconds:
+                              exclusiveMinimum: true
+                              minimum: 0
+                              type: integer
+                            port:
+                              exclusiveMinimum: true
+                              maximum: 65535
+                              minimum: 0
+                              type: integer
+                            scheme:
+                              enum:
+                              - http
+                              - https
+                              type: string
+                            successThreshold:
+                              exclusiveMinimum: true
+                              minimum: 0
+                              type: integer
+                            timeoutSeconds:
+                              exclusiveMinimum: true
+                              minimum: 0
+                              type: integer
+                          type: object
                       type: object
                     replicas:
                       minimum: 0

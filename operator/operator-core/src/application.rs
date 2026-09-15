@@ -54,6 +54,11 @@ pub struct ApplicationBaseSpec {
     pub image_policy: Option<ImagePolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<AppResources>,
+    /// Liveness / readiness / startup probes (2.28 / ADR 0065). Absent still
+    /// yields a default TCP readiness probe when `expose` is set — see
+    /// `operator-rendering::probes::resolve_probes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probes: Option<Probes>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -124,6 +129,11 @@ pub struct ApplicationEnvOverride {
     pub image_policy: Option<ImagePolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<AppResources>,
+    /// 2.28: the per-environment probe override. `Probes` is reused from the
+    /// base scope — every field is optional, so it is already partial — and
+    /// `merge_probes` folds it on per probe AND per field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probes: Option<Probes>,
 }
 
 /// Container resource requests/limits (2.16d). NOT k8s_openapi::ResourceRequirements
@@ -137,6 +147,83 @@ pub struct AppResources {
     pub requests: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<BTreeMap<String, String>>,
+}
+
+/// The three Kubernetes probes (2.28 / ADR 0065 §1). Mirrors `#Probes` in
+/// `schemas/v1alpha1/application.cue`.
+///
+/// Reused verbatim as the per-environment partial override — every field is
+/// already optional, so it is its own override type, the same reason
+/// `AppResources` and `ImagePolicy` are reused rather than mirrored.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct Probes {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liveness: Option<Probe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<Probe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<Probe>,
+}
+
+/// One probe. `path` present => HTTP GET; absent => TCP connect — the form
+/// is discriminated by the field, not by a nested action object (ADR 0065
+/// §1.1). Mirrors `#Probe` in `schemas/v1alpha1/application.cue`.
+///
+/// Every field is `Option` and `None` means "apply the renderer's default"
+/// — NOT zero, and NOT the CUE marker's value. The defaults live in
+/// `operator-rendering::probes`; nothing stamps them into the stored object,
+/// because crdgen strips CUE defaults out of the CRD by standing rule
+/// (R4-M2), so this type is the exact shape of what the user wrote.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct Probe {
+    /// Render this probe. `false` keeps the declaration in git while taking
+    /// the probe off the pod, which is why it is a field and not an
+    /// omission; declaring it beside a full probe body is not a
+    /// contradiction and the webhook accepts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Absent => this scope's effective `expose.port`. A probe with neither
+    /// is rejected by the webhook, naming which probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<i32>,
+    /// `http` (default) or `https`; HTTP form only. Lowercase on the wire,
+    /// uppercased by the renderer because Kubernetes wants `HTTP`/`HTTPS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "initialDelaySeconds"
+    )]
+    pub initial_delay_seconds: Option<i32>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "periodSeconds"
+    )]
+    pub period_seconds: Option<i32>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "timeoutSeconds"
+    )]
+    pub timeout_seconds: Option<i32>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "failureThreshold"
+    )]
+    pub failure_threshold: Option<i32>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "successThreshold"
+    )]
+    pub success_threshold: Option<i32>,
 }
 
 /// One declared platform-service dependency under
@@ -795,6 +882,61 @@ mod tests {
     use super::*;
     use kube::Resource;
     use serde_json::json;
+
+    #[test]
+    fn a_probe_round_trips_through_its_wire_shape() {
+        // The wire names are Kubernetes' own (camelCase seconds fields), and an
+        // absent field must NOT serialize: an omitted `port` means "inherit the
+        // scope's expose.port", which is not the same statement as `port: null`,
+        // and an omitted `enabled` must stay None rather than becoming
+        // Some(true) — the renderer, not this type, applies the default
+        // (ADR 0065 §1.2; crdgen strips CUE defaults, R4-M2).
+        let json = json!({
+            "readiness": {"path": "/healthz", "periodSeconds": 5},
+            "liveness": {"path": "/livez", "port": 9000, "scheme": "https"},
+        });
+        let p: Probes = serde_json::from_value(json.clone()).expect("probes decode");
+        let r = p.readiness.as_ref().expect("readiness");
+        assert_eq!(r.path.as_deref(), Some("/healthz"));
+        assert_eq!(r.period_seconds, Some(5));
+        assert_eq!(r.port, None);
+        assert_eq!(
+            r.enabled, None,
+            "absent `enabled` stays None, not Some(true)"
+        );
+        assert_eq!(
+            p.liveness.as_ref().unwrap().scheme.as_deref(),
+            Some("https")
+        );
+        assert_eq!(p.startup, None);
+        assert_eq!(
+            serde_json::to_value(&p).unwrap(),
+            json,
+            "re-serialize is byte-identical"
+        );
+    }
+
+    #[test]
+    fn probes_ride_both_the_base_spec_and_the_env_override() {
+        // `probes` must exist on BOTH scopes: it is a partial per-environment
+        // override (2.16c), so a field present on base but absent from the
+        // override type would silently drop an env's probe tuning.
+        let base: ApplicationBaseSpec =
+            serde_json::from_value(json!({"probes": {"liveness": {"path": "/livez"}}}))
+                .expect("base decode");
+        assert!(base.probes.expect("base probes").liveness.is_some());
+        let over: ApplicationEnvOverride =
+            serde_json::from_value(json!({"probes": {"readiness": {"periodSeconds": 3}}}))
+                .expect("override decode");
+        assert_eq!(
+            over.probes
+                .expect("override probes")
+                .readiness
+                .expect("readiness")
+                .period_seconds,
+            Some(3)
+        );
+    }
 
     #[test]
     fn status_roundtrips_last_applied_spec() {

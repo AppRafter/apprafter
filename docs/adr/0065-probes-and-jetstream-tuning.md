@@ -91,17 +91,33 @@ failure. This is recorded as a **choice, not a measurement** — §5 owes the
 measurement, and if a 1-second timeout shows no false failures under load we
 take Kubernetes' number.
 
-**Booleans and enums carry CUE defaults and therefore reach the generated
-CRD as `default:`; the numeric knobs deliberately do not.** A CRD default is
-stamped into the stored object at admission, so it freezes at whatever the
-operator believed on the day that object was written: revising
-`periodSeconds` later would leave every existing `Application` carrying the
-old number invisibly, and the fleet would silently disagree about what "the
-default" is. Renderer-side constants move with the operator. `enabled` and
-`scheme` are exempt because their semantics can never change, so a stamped
-value is harmless. The cost is that `cue export` of a manifest does not show
-the effective numbers, which is what the `apprafter app status` probes line
-is for.
+**Every one of those defaults is applied by the renderer, and none of them
+reaches the CRD.** That is not a choice made for probes; it is this
+repository's standing rule, and `crdgen` enforces it: `structural::resolve`
+strips a CUE `*x` default and the R4-M2 assertion
+(`operator/crdgen/src/check.rs`) fails the build if any `default:` survives
+into a rendered CRD, on the grounds that behaviour belongs to the renderer
+and not to the apiserver ([ADR 0047](0047-crd-codegen-from-cue.md)). The
+`*true` on `#Probe.enabled` and the `*"http"` on `#Probe.scheme` therefore
+document intent to a reader of the schema and to `cue vet`; they are not a
+second mechanism, and `cue export` does not materialise them either, because
+an optional CUE field with a default is simply omitted.
+
+The rule is worth keeping for exactly the reason it would matter here if it
+did not exist: a CRD default is stamped into the stored object at admission,
+so it would freeze at whatever the operator believed on the day that object
+was written, and revising `periodSeconds` later would leave every existing
+`Application` carrying the old number invisibly. The consequence to plan
+around is that neither the manifest nor the stored object shows the
+effective numbers — which is what the `apprafter app status` probes line is
+for.
+
+*(Corrected 2026-09-15, before release: an earlier draft of this section
+claimed booleans and enums do reach the CRD as `default:` while the numeric
+knobs deliberately do not. They do not either — checked by generating the
+CRD and finding zero `default:` keys in it, and then finding the gate that
+forbids them. The design outcome is unchanged; the reason for it is
+repository-wide rather than specific to this field set.)*
 
 #### 1.3 A default readiness probe, and what it costs
 
@@ -316,9 +332,10 @@ neighbour's.
   out of scope, and the nesting exists to discriminate between them.
 - **Duration strings for probe timings**, for consistency with `maxAge`.
   Rejected: it would make `"500ms"` writable and unimplementable.
-- **CRD defaults for the probe timings.** Rejected for the freezing
-  behaviour described in §1.2. This is the reverse of the decision taken for
-  `enabled` and `scheme`, and the split is the point.
+- **CRD defaults for the probe timings.** Not available: §1.2's rule is
+  enforced by `crdgen`, so choosing this would mean changing a
+  repository-wide invariant for one field set. The freezing behaviour
+  described there is why that invariant exists.
 - **No default readiness probe** — probes strictly opt-in, as first
   proposed. Rejected: the 502 window is real, closing it guesses nothing
   (the port is declared), and an opt-out field costs one line.
