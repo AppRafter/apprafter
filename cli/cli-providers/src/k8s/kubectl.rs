@@ -46,6 +46,31 @@ pub const APPRAFTER_CLI_EGRESS_FIELD_MANAGER: &str = "apprafter-cli-egress";
 /// mistakes our own previous write for a git owner.
 pub const APPRAFTER_CLI_PIN_FIELD_MANAGER: &str = "apprafter-cli-pin";
 
+/// Dedicated field manager for `apprafter app restart` (ADR 0064).
+///
+/// It owns two things, on two different objects: the pod-template
+/// annotation on the rendered `Deployment`, whose change is what makes
+/// Kubernetes roll the pods, and the restart record on the AppRafter
+/// `Application` CR.
+///
+/// Separate from [`APPRAFTER_CLI_PIN_FIELD_MANAGER`] because that one
+/// "must own exactly the two pin annotations and nothing else, ever" —
+/// `unpin` re-applies its body with the keys omitted and server-side
+/// apply prunes whatever it owned. Writing a restart record under it
+/// would make the next `app unpin` silently delete the record too.
+///
+/// **It must never carry a field it does not intend to own.** The apply
+/// body is a partial `Deployment` naming one annotation key, measured to
+/// register as `f:annotations` → that key alone, leaving `replicas` and
+/// the operator's image untouched. A body naming `spec.replicas` would
+/// make this manager an owner of the replica count and put it in
+/// conflict with the operator on every reconcile.
+///
+/// Deliberately not Argo-CD-shaped, for the same reason as its
+/// neighbours: an ownership guard must never mistake our own previous
+/// write for a git owner.
+pub const APPRAFTER_CLI_RESTART_FIELD_MANAGER: &str = "apprafter-cli-restart";
+
 /// URL of the upstream "standard install" YAML — Gateway, HTTPRoute,
 /// GRPCRoute, ReferenceGrant CRDs (the conformance baseline).
 pub fn gateway_api_crds_url() -> String {

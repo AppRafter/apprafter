@@ -98,7 +98,15 @@ const PLATFORMSTACK_APPLY_BACKOFF_SECS: u64 = 10;
 /// in [`apps_to_suspend`] cannot see across two processes; an annotation can,
 /// because it lives where the damage does. It is also readable by hand, which
 /// is what makes an ABANDONED restore recoverable at all.
-const PRE_RESTORE_REPLICAS_ANNOTATION: &str = "apprafter.io/pre-restore-replicas";
+///
+/// `pub(crate)` since ADR 0064: `app restart` refuses on a workload at
+/// zero replicas and names this annotation as the cause when it is
+/// present. Sharing the constant rather than re-typing the key is what
+/// keeps the refusal pointing at the annotation this module actually
+/// writes — a second spelling would go stale silently, and it would go
+/// stale on the one message whose job is to explain an otherwise
+/// inexplicable zero.
+pub(crate) const PRE_RESTORE_REPLICAS_ANNOTATION: &str = "apprafter.io/pre-restore-replicas";
 
 /// Poll budget for `WaitClaimsBound`: wait for every regenerated ResourceClaim
 /// to report `status.ready == true` (NOT PVC Bound — R1: 2.6b marks disk ready

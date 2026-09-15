@@ -1486,8 +1486,8 @@ pub(crate) fn status_render_plan(refs: &[CrRef], workload: Option<&str>) -> Stat
 /// What a verb does with a bundle of several workloads when the caller
 /// named none (ADR 0062 §Write surfaces).
 ///
-/// The three arms are the whole of this subphase. They are carried as
-/// one enum, and every rule below is table-tested across all three,
+/// The arms are the whole of this decision. They are carried as one
+/// enum, and every rule below is table-tested across all of them,
 /// because what has to stay true is not any single verb's behaviour but
 /// the DIFFERENCE between them — a difference that would otherwise drift
 /// one verb at a time.
@@ -1515,6 +1515,23 @@ pub(crate) enum WorkloadDemand {
     /// resolution, so for them the same generosity is a wrong write or a
     /// wrong forward.
     ReadEvery,
+    /// `app restart` — a write against every workload at once (ADR
+    /// 0064).
+    ///
+    /// Resolves identically to [`WorkloadDemand::ReadEvery`] and is a
+    /// separate arm anyway, because the reason it may be generous is
+    /// different and the two must not be able to inherit each other's
+    /// licence. `ReadEvery` is defensible for `logs` alone — it shows
+    /// more than was asked and a reader can filter. This one ACTS on
+    /// every workload, which is the thing `ReadEvery`'s note says the
+    /// other verbs must never do; what makes it right here is not
+    /// generosity but ADR 0062 §Scope: a bundle is deployed, synced and
+    /// removed together, so a restart of the application IS a restart of
+    /// its workloads. The caller is shown every one of them and
+    /// confirms, or passes `--yes` having read `--help`; `--workload`
+    /// narrows. Spelling that as `ReadEvery` would file a fan-out write
+    /// under a rule written for a read.
+    WriteEvery,
 }
 
 /// A workload that can be handed to `kubectl -n`.
@@ -1539,9 +1556,10 @@ pub(crate) enum WorkloadChoice {
     /// one `--workload` named.
     One(PlacedWorkload),
     /// Act on all of these at once. Only [`WorkloadDemand::ReadEvery`]
-    /// produces it, and it always carries 2+: at N = 1 the answer is
-    /// [`WorkloadChoice::One`], so a caller cannot accidentally render
-    /// the multi-workload shape for today's fleet.
+    /// and [`WorkloadDemand::WriteEvery`] produce it, and it always
+    /// carries 2+: at N = 1 the answer is [`WorkloadChoice::One`], so a
+    /// caller cannot accidentally render the multi-workload shape for
+    /// today's fleet.
     Every(Vec<PlacedWorkload>),
     /// N > 1, no `--workload`, and the verb WRITES. Carries every
     /// candidate, because a refusal that does not name them leaves the
@@ -1570,8 +1588,8 @@ pub(crate) enum WorkloadChoice {
     Unplaceable(String),
 }
 
-/// Pure — the addressing decision `app logs`, `app open`, `app rollback`
-/// and `app unpin` share. No IO, no clock.
+/// Pure — the addressing decision `app logs`, `app open`, `app rollback`,
+/// `app unpin` and `app restart` share. No IO, no clock.
 ///
 /// ADR 0062 §Addressing: the positional argument is ALWAYS the
 /// registration, and `selector` — `--workload <name>` — is the only way
@@ -1596,7 +1614,7 @@ pub(crate) enum WorkloadChoice {
 ///    multiplexed selector.
 /// 4. **Only then does the demand matter** — and it is the only place it
 ///    matters, which is what keeps the read/write asymmetry to one
-///    `match` instead of scattering it across four commands.
+///    `match` instead of scattering it across five commands.
 pub(crate) fn workload_for(
     refs: &[CrRef],
     selector: Option<&str>,
@@ -1621,7 +1639,7 @@ pub(crate) fn workload_for(
     match demand {
         WorkloadDemand::Write => WorkloadChoice::Refuse(names),
         WorkloadDemand::ReadOne => WorkloadChoice::Ask(names),
-        WorkloadDemand::ReadEvery => {
+        WorkloadDemand::ReadEvery | WorkloadDemand::WriteEvery => {
             let mut placed = Vec::with_capacity(refs.len());
             for r in refs {
                 match r.namespace.as_deref() {
@@ -11184,25 +11202,27 @@ mod logs_target_tests {
     }
 }
 
-/// The addressing decision the four remaining `app` verbs share (ADR
-/// 0062 §Write surfaces) — `logs`, `open`, `rollback`, `unpin`.
+/// The addressing decision the five remaining `app` verbs share (ADR
+/// 0062 §Write surfaces) — `logs`, `open`, `rollback`, `unpin`,
+/// `restart`.
 ///
-/// Every test here runs the SAME fixture through all three
+/// Every test here runs the SAME fixture through all four
 /// [`WorkloadDemand`]s, because the thing being pinned is not any one
 /// verb's behaviour but the *difference* between them: at N > 1 with no
-/// `--workload`, a write refuses, a single-target read asks, and a
-/// multiplexing read takes every workload. A test per verb would let
-/// that difference drift one verb at a time.
+/// `--workload`, a single-workload write refuses, a single-target read
+/// asks, and the two fan-out demands take every workload. A test per
+/// verb would let that difference drift one verb at a time.
 #[cfg(test)]
 mod workload_for_tests {
     use super::*;
 
     /// Every demand, so a rule that must hold for all of them is written
-    /// once and cannot be updated for two verbs out of three.
-    const EVERY_DEMAND: [WorkloadDemand; 3] = [
+    /// once and cannot be updated for three verbs out of four.
+    const EVERY_DEMAND: [WorkloadDemand; 4] = [
         WorkloadDemand::Write,
         WorkloadDemand::ReadOne,
         WorkloadDemand::ReadEvery,
+        WorkloadDemand::WriteEvery,
     ];
 
     fn placed(name: &str, namespace: &str) -> CrRef {
@@ -11344,8 +11364,12 @@ mod workload_for_tests {
 
         // Stated as its own assertion because it is the actual
         // regression: the pre-2.27 shim returned `refs[0].name` and
-        // every one of these verbs acted on it.
-        for demand in [WorkloadDemand::ReadOne, WorkloadDemand::ReadEvery] {
+        // every one of these verbs acted on it. `Write` is excluded
+        // because it refuses outright, which is already asserted above.
+        for demand in EVERY_DEMAND
+            .into_iter()
+            .filter(|d| *d != WorkloadDemand::Write)
+        {
             assert!(
                 !matches!(
                     workload_for(&bundle(), None, demand),
@@ -11354,6 +11378,43 @@ mod workload_for_tests {
                 "{demand:?} silently resolved one workload of three",
             );
         }
+    }
+
+    #[test]
+    fn a_fan_out_write_takes_every_workload_of_the_bundle() {
+        // ADR 0064: `app restart <application>` rolls the bundle, so it
+        // resolves like `logs` and unlike the two single-workload
+        // writes. Pinned separately from `ReadEvery` rather than folded
+        // into it: the two arms agree here by DESIGN, not by
+        // implementation, and a future `ReadEvery` that stopped
+        // fanning out must not be able to take `restart` with it.
+        assert_eq!(
+            workload_for(&bundle(), None, WorkloadDemand::WriteEvery),
+            WorkloadChoice::Every(vec![
+                PlacedWorkload {
+                    name: "api".into(),
+                    namespace: "shop".into()
+                },
+                PlacedWorkload {
+                    name: "web".into(),
+                    namespace: "shop".into()
+                },
+                PlacedWorkload {
+                    name: "worker".into(),
+                    namespace: "shop".into()
+                },
+            ]),
+        );
+        // …and it is NOT the single-workload write: refusing here would
+        // make `app restart shop` unusable on the shape ADR 0062 exists
+        // to support.
+        assert!(
+            !matches!(
+                workload_for(&bundle(), None, WorkloadDemand::WriteEvery),
+                WorkloadChoice::Refuse(_)
+            ),
+            "a fan-out write must not inherit the single-workload refusal",
+        );
     }
 
     #[test]
@@ -11430,17 +11491,17 @@ mod workload_for_tests {
             );
         }
 
-        // The multiplexing read cannot quietly drop the one it could not
-        // place either: a stream missing a workload reads exactly like a
-        // workload that logged nothing.
-        assert_eq!(
-            workload_for(
-                &[placed("web", "shop"), unplaced("api")],
-                None,
-                WorkloadDemand::ReadEvery
-            ),
-            WorkloadChoice::Unplaceable("api".into()),
-        );
+        // Neither fan-out demand may quietly drop the one it could not
+        // place: a stream missing a workload reads exactly like a
+        // workload that logged nothing, and a restart that skipped one
+        // reads exactly like a restart that rolled it.
+        for demand in [WorkloadDemand::ReadEvery, WorkloadDemand::WriteEvery] {
+            assert_eq!(
+                workload_for(&[placed("web", "shop"), unplaced("api")], None, demand),
+                WorkloadChoice::Unplaceable("api".into()),
+                "{demand:?} dropped a workload it could not place",
+            );
+        }
     }
 }
 

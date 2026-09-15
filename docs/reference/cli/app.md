@@ -24,6 +24,7 @@ Subcommands:
 - [`apprafter app logs`](#apprafter-app-logs) — Stream logs from the app's workload pods.
 - [`apprafter app open`](#apprafter-app-open) — Port-forward the app's primary Service to localhost and open it in a browser.
 - [`apprafter app remove`](#apprafter-app-remove) — Delete an Application and cascade-remove the Argo CD CR (which Argo CD then tears down child resources for).
+- [`apprafter app restart`](#apprafter-app-restart) — Replace the application's running pods with a rolling update, preserving the pod template that is already applied.
 - [`apprafter app rollback`](#apprafter-app-rollback) — Roll back to a previous revision.
 - [`apprafter app scaffold`](#apprafter-app-scaffold) — Generate a starter `apprafter/Application.cue` based on the cwd's runtime markers (bun.lock / Cargo.toml / pyproject.toml / etc.).
 - [`apprafter app status`](#apprafter-app-status) — Show detail view for one Application: sync state, health, source repo + revision, destinations, recent sync history (last 3 revisions).
@@ -168,6 +169,32 @@ Examples:
 ```sh
 apprafter app remove <name> --yes  # removes EVERY environment of <name>
 apprafter app remove <name> --env prod --keep-data  # one env, data kept
+```
+
+## `apprafter app restart`
+
+Replace the application's running pods with a rolling update, preserving the pod template that is already applied. Nothing else changes: it deploys no new image and no new configuration. Use it after rotating a credential — an environment variable sourced from a Secret is read once at pod start and never re-read, so running pods keep serving the previous value until they are replaced. It is not a remedy for failing probes: a pod that crashes on the current template will crash again on it
+
+```text
+Usage: apprafter app restart [OPTIONS] <NAME>
+```
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| `<NAME>` | yes | Application name |
+
+| Flag | Value | Default | Required | Description |
+| --- | --- | --- | --- | --- |
+| `--env` | — | — | no | Select the env-deployment `<name>-<env>`. Omit for a base/single-env app; if the app is deployed per-env and `--env` is omitted, the command errors with the available environments |
+| `--workload` | `<NAME>` | — | no | Restart only this workload of the application. A manifest package is a bundle whose workloads are deployed, synced and removed together, so without this flag every workload in it restarts; the positional argument is always the application (the registration), never a workload — this is how you address one inside it. ADR 0062 |
+| `--yes` | flag | — | no | Skip confirmation prompt. Required in non-interactive shells |
+
+Examples:
+
+```sh
+apprafter app restart <name>  # replace its pods; picks up rotated secrets
+apprafter app restart <name> --workload <workload>  # one workload of the bundle
+apprafter app restart <name> --env prod --yes
 ```
 
 ## `apprafter app rollback`

@@ -155,6 +155,12 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
                 yes,
                 workload,
             } => commands::app::unpin(&name, env, yes, workload)?,
+            AppCommand::Restart {
+                name,
+                env,
+                yes,
+                workload,
+            } => commands::app_restart::restart(&name, env, yes, workload)?,
             AppCommand::Open {
                 name,
                 env,

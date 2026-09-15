@@ -4,6 +4,7 @@
 pub mod app;
 pub(crate) mod app_index;
 pub mod app_open;
+pub mod app_restart;
 pub mod app_rollup;
 pub mod app_scaffold;
 pub mod app_validate;

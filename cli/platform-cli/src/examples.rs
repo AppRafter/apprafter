@@ -155,6 +155,14 @@ pub const EXAMPLES: &[CommandExamples] = &[
         ],
     },
     CommandExamples {
+        path: &["app", "restart"],
+        lines: &[
+            "apprafter app restart <name>  # replace its pods; picks up rotated secrets",
+            "apprafter app restart <name> --workload <workload>  # one workload of the bundle",
+            "apprafter app restart <name> --env prod --yes",
+        ],
+    },
+    CommandExamples {
         path: &["app", "scaffold"],
         lines: &[
             "apprafter app scaffold --runtime bun --name <name> --namespace <ns>",

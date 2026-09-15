@@ -1055,6 +1055,38 @@ pub enum AppCommand {
         #[arg(long, value_name = "NAME")]
         workload: Option<String>,
     },
+    /// Replace the application's running pods with a rolling
+    /// update, preserving the pod template that is already
+    /// applied. Nothing else changes: it deploys no new image
+    /// and no new configuration. Use it after rotating a
+    /// credential — an environment variable sourced from a
+    /// Secret is read once at pod start and never re-read, so
+    /// running pods keep serving the previous value until they
+    /// are replaced. It is not a remedy for failing probes: a
+    /// pod that crashes on the current template will crash
+    /// again on it.
+    Restart {
+        /// Application name.
+        name: String,
+        /// Select the env-deployment `<name>-<env>`.
+        /// Omit for a base/single-env app; if the app is deployed
+        /// per-env and `--env` is omitted, the command errors with the
+        /// available environments.
+        #[arg(long)]
+        env: Option<String>,
+        /// Skip confirmation prompt. Required in non-interactive
+        /// shells.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+        /// Restart only this workload of the application. A manifest
+        /// package is a bundle whose workloads are deployed, synced and
+        /// removed together, so without this flag every workload in it
+        /// restarts; the positional argument is always the application
+        /// (the registration), never a workload — this is how you address
+        /// one inside it. ADR 0062.
+        #[arg(long, value_name = "NAME")]
+        workload: Option<String>,
+    },
     /// Generate a starter `apprafter/Application.cue` based
     /// on the cwd's runtime markers (bun.lock / Cargo.toml /
     /// pyproject.toml / etc.). Writes to

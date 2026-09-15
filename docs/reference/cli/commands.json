@@ -526,6 +526,70 @@
     {
       "path": [
         "app",
+        "restart"
+      ],
+      "aliases": [],
+      "about": "Replace the application's running pods with a rolling update, preserving the pod template that is already applied. Nothing else changes: it deploys no new image and no new configuration. Use it after rotating a credential — an environment variable sourced from a Secret is read once at pod start and never re-read, so running pods keep serving the previous value until they are replaced. It is not a remedy for failing probes: a pod that crashes on the current template will crash again on it",
+      "long_about": null,
+      "usage": "Usage: apprafter app restart [OPTIONS] <NAME>",
+      "hidden": false,
+      "examples": [
+        "apprafter app restart <name>  # replace its pods; picks up rotated secrets",
+        "apprafter app restart <name> --workload <workload>  # one workload of the bundle",
+        "apprafter app restart <name> --env prod --yes"
+      ],
+      "args": [
+        {
+          "id": "env",
+          "long": "env",
+          "short": null,
+          "takes_value": true,
+          "value_name": "ENV",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Select the env-deployment `<name>-<env>`. Omit for a base/single-env app; if the app is deployed per-env and `--env` is omitted, the command errors with the available environments"
+        },
+        {
+          "id": "workload",
+          "long": "workload",
+          "short": null,
+          "takes_value": true,
+          "value_name": "NAME",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Restart only this workload of the application. A manifest package is a bundle whose workloads are deployed, synced and removed together, so without this flag every workload in it restarts; the positional argument is always the application (the registration), never a workload — this is how you address one inside it. ADR 0062"
+        },
+        {
+          "id": "yes",
+          "long": "yes",
+          "short": null,
+          "takes_value": false,
+          "value_name": "YES",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip confirmation prompt. Required in non-interactive shells"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "Application name"
+        }
+      ]
+    },
+    {
+      "path": [
+        "app",
         "rollback"
       ],
       "aliases": [],
