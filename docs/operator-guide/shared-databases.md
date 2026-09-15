@@ -83,6 +83,12 @@ Not gated: re-deploying an application that is already bound, and narrowing a
 binding from read-write to read-only. Gated: widening read-only to
 read-write, which is a different exposure from the one that was approved.
 
+Also not gated, and worth knowing: a **brand-new** application whose first
+version already declares the `ref`. The gate watches for an application
+acquiring reach it did not have, and a new application has no previous state
+to compare against. Creating one still requires the ability to deploy into the
+namespace that holds the data.
+
 ## What sharing a Postgres database actually gives you
 
 A table created by one consumer belongs to a **group** that every consumer of

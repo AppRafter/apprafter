@@ -318,6 +318,35 @@ existing binding, as an escalation.
 Unbinding is a `needs.*` removal, which the existing app-scope classifier
 already treats as destructive, so it inherits that gate with no new rule.
 
+#### 5.1 The gate covers an EDIT, and a first apply is not one
+
+Destructive-change detection runs only when the application already carries a
+stamped `status.lastAppliedSpec` baseline — `detect_all` is called under `if
+let Some(baseline_spec)`. A brand-new `Application` whose very first spec
+already declares `ref: "orders"` therefore binds without approval.
+
+This is a property of the whole ADR 0052 axis rather than of this trigger:
+#14 (`jetstream-consume-add`) has it too, and a new application consuming a
+neighbour's stream from day one is likewise ungated. It is recorded here
+because §5's own wording — "binding for the first time" — reads as covering
+it, and does not.
+
+**Why it is not fixed here.** Gating a first apply means gating the creation
+of every application, since a first apply has nothing to diff against and the
+only available rule is "does the new spec contain a gated construct". That
+changes the behaviour of every existing trigger and turns the ordinary
+create-an-application flow into an approval, which is a platform-wide UX
+decision and not one to make as a side effect of a database feature. It
+belongs with the two named-approver gaps ADR 0052 already defers to the
+managed offering.
+
+**What still holds without it.** The namespace remains the boundary: a `ref`
+can only name a `SharedDatabase` in the application's own namespace, so
+creating an ungated binding requires the ability to create workloads in the
+namespace that already holds the data. The gate is what stops an EXISTING
+application from quietly acquiring reach it did not have; it was never the
+thing standing between a namespace and its own contents.
+
 ### 6. Lifecycle
 
 - `SharedDatabase` delete with `refCount > 0` → refused by the webhook, naming
