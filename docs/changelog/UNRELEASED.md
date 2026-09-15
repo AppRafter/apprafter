@@ -98,9 +98,19 @@ cluster for any of it except the new command's two read grants.
   knows which side is the mistake.
 
 - **`app status` hid the application's own address.** An app exposed
-  publicly answers on a URL that appeared nowhere in its status. It is
-  read from `status.lastAppliedSpec`, so it reports what is serving
-  rather than what the manifest would produce.
+  publicly answers on a URL that appeared nowhere in its status.
+
+  It is read from `status.lastAppliedSpec` — the last spec the operator
+  successfully applied, so during a gated migration it is what is
+  serving while `spec` is what awaits approval — with the selected
+  environment's `expose` folded on the way `operator-rendering` folds it
+  (subfield override-wins, unset fields inheriting base). The first
+  version of this assumed the operator stamped an already-effective spec
+  there; it stamps the raw one, so the lookup never resolved and an
+  application whose environment overrides its hostname was shown the one
+  it does not answer on. The test that should have caught it built the
+  flattened shape by hand and was green against a document the cluster
+  never produces.
 
 - **The VPA recommendation printed a raw byte count** — the reported line
   was `limits.memory: 183046954` — and its uncapped hint named
