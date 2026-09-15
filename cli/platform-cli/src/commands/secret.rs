@@ -14,7 +14,9 @@ use cli_providers::k8s::kubectl::KubectlCli;
 use cli_providers::k8s::sealing::{build_sealed_secret, fetch_controller_public_key};
 use serde_json::Value;
 
-use crate::commands::k8s_helpers::{ensure_kubeconfig_tempfile, kubectl_get_json};
+use crate::commands::k8s_helpers::{
+    ensure_kubeconfig_tempfile, kubectl_get_json, namespace_confirmed_missing,
+};
 
 /// What the caller should do when a secret with the same name already exists.
 /// Pure (no I/O) — the interactive prompt + cluster check are wired in
@@ -43,6 +45,75 @@ pub fn overwrite_decision(exists: bool, yes: bool, is_tty: bool) -> OverwriteDec
     } else {
         OverwriteDecision::ErrorNonInteractive
     }
+}
+
+/// What to do when the namespace a seal targets does not exist yet.
+///
+/// Sealing into a fresh namespace is a normal step, not an anomaly: the
+/// order that avoids a new application crash-looping on startup is to seal
+/// its environment first and deploy second, and at that point nothing has
+/// created the namespace. Refusing would push the reader to a bare
+/// `kubectl create namespace` for a step the platform owns.
+///
+/// **But it is never done silently, with or without `--yes`.** A
+/// `SealedSecret` is encrypted under its namespace and name, so the blob
+/// this command is about to write can only ever be decrypted in the
+/// namespace it names — a mistyped `-n` does not produce a recoverable
+/// mistake to be fixed by moving something, it produces a namespace nobody
+/// wanted holding ciphertext nobody can read, and the application still
+/// waiting for the secret it never got. Creating that namespace without
+/// saying so removes the last place the typo was visible.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NamespaceDecision {
+    /// It is already there — nothing to do, nothing to say.
+    Exists,
+    /// Create it, and print that it was created (`--yes`).
+    CreateAnnounced,
+    /// Ask on a TTY before creating.
+    Prompt,
+    /// Non-interactive and unauthorised — refuse and name both ways out.
+    ErrorNonInteractive,
+}
+
+/// Decide how to handle a missing target namespace. Pure: takes `exists`,
+/// `yes`, `is_tty`. Deliberately shaped like [`overwrite_decision`] — both
+/// gate a write the reader may not have meant, and one shape means one thing
+/// to learn.
+pub fn namespace_decision(exists: bool, yes: bool, is_tty: bool) -> NamespaceDecision {
+    if exists {
+        return NamespaceDecision::Exists;
+    }
+    if yes {
+        return NamespaceDecision::CreateAnnounced;
+    }
+    if is_tty {
+        NamespaceDecision::Prompt
+    } else {
+        NamespaceDecision::ErrorNonInteractive
+    }
+}
+
+/// `kubectl create namespace <ns>`. Only reached once a
+/// [`NamespaceDecision`] has authorised it.
+fn create_namespace(namespace: &str, kubeconfig_path: &Path) -> Result<()> {
+    let out = Command::new("kubectl")
+        .args(["create", "namespace", namespace])
+        .env("KUBECONFIG", kubeconfig_path)
+        .output()
+        .map_err(|e| CliError::Other(format!("spawn kubectl create namespace: {e}")))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // A namespace that appeared between the probe and here is the
+        // outcome we wanted, not a failure.
+        if stderr.contains("AlreadyExists") || stderr.contains("already exists") {
+            return Ok(());
+        }
+        return Err(CliError::Other(format!(
+            "create namespace '{namespace}' failed (exit {:?}): {stderr}",
+            out.status.code()
+        )));
+    }
+    Ok(())
 }
 
 /// Parse repeatable `KEY=VALUE` literals into a byte map. The value may
@@ -90,6 +161,46 @@ pub fn run_seal(
     // Existence check — only relevant when we are about to apply to the
     // cluster. `--stdout` is a local rendering path; skip the network check.
     if !stdout {
+        // The namespace comes first: the overwrite check below asks whether
+        // a secret is in it, and in a namespace that does not exist the
+        // answer is a truthful "no" to a question the reader is not asking.
+        match namespace_decision(
+            !namespace_confirmed_missing(namespace, kc.path()),
+            yes,
+            std::io::stdin().is_terminal(),
+        ) {
+            NamespaceDecision::Exists => {}
+            NamespaceDecision::CreateAnnounced => {
+                create_namespace(namespace, kc.path())?;
+                println!("created namespace '{namespace}'");
+            }
+            NamespaceDecision::Prompt => {
+                println!(
+                    "Namespace '{namespace}' does not exist. A SealedSecret is \
+                     encrypted under its namespace, so this blob will only ever \
+                     decrypt in '{namespace}' — if that is a typo, the secret is \
+                     unreadable and the application never receives it."
+                );
+                let confirmed = inquire::Confirm::new(&format!("Create namespace '{namespace}'?"))
+                    .with_default(false)
+                    .prompt()
+                    .map_err(|e| CliError::Other(format!("confirmation prompt: {e}")))?;
+                if !confirmed {
+                    println!("Aborted — no namespace created, nothing sealed.");
+                    return Ok(());
+                }
+                create_namespace(namespace, kc.path())?;
+                println!("created namespace '{namespace}'");
+            }
+            NamespaceDecision::ErrorNonInteractive => {
+                return Err(CliError::Other(format!(
+                    "namespace '{namespace}' does not exist. A SealedSecret is \
+                     encrypted under its namespace and decrypts nowhere else, so \
+                     this is not created silently. Re-run with --yes to create it, \
+                     or create it yourself first — and check the spelling either way"
+                )));
+            }
+        }
         let exists = secret_exists(name, namespace, kc.path())?;
         match overwrite_decision(exists, yes, std::io::stdin().is_terminal()) {
             OverwriteDecision::Proceed => {
@@ -179,12 +290,18 @@ fn report_consumers(name: &str, namespace: &str, kubeconfig_path: &Path) {
         "  {n} {plural} in '{namespace}' resolve this secret: {}",
         consumers.join(", ")
     );
-    // Deliberately NOT naming a command to restart them: no such verb ships
-    // today, and inventing one in a message is the defect D3 recorded — help
-    // text describing a layout that does not exist.
+    // This used to stop short of naming a command, because none shipped and
+    // inventing one in a message is the defect D3 recorded. `app restart`
+    // (ADR 0064) is that command, and this is the exact moment a reader
+    // needs it: they have just rotated a credential and the pods are still
+    // serving the old one.
     println!(
-        "  Their running pods keep the PREVIOUS value: an environment variable \n           from a secret is resolved once at pod start and never re-read. They \n           pick this value up when they next restart."
+        "  Their running pods keep the PREVIOUS value: an environment variable \n           from a secret is resolved once at pod start and never re-read."
     );
+    println!("  Roll them when the rotation is complete:");
+    for app in &consumers {
+        println!("      apprafter app restart {app}");
+    }
 }
 
 /// Record who sealed this and when (2.22c / D14).
@@ -269,6 +386,54 @@ fn delete_args<'a>(kind: &'a str, name: &'a str, namespace: &'a str) -> [&'a str
     ["delete", kind, name, "-n", namespace, "--ignore-not-found"]
 }
 
+/// What `secret remove` found at the address it was given, decided BEFORE
+/// anything is deleted.
+///
+/// The check has to happen first for two reasons. The confirmation prompt
+/// must not ask the reader to authorise destroying an object that is not
+/// there — a `y` typed at that prompt teaches them the address was right.
+/// And `kubectl delete --ignore-not-found` exits 0 whether or not it deleted
+/// anything, so after the fact the two outcomes are indistinguishable
+/// without parsing kubectl's prose.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RemoveTarget {
+    /// A `SealedSecret` and/or a `Secret` by that name is in that namespace.
+    Present,
+    /// The namespace exists; nothing by that name is in it.
+    SecretAbsent,
+    /// The namespace itself does not exist — so the address is wrong,
+    /// rather than the work being already done.
+    NamespaceAbsent,
+}
+
+/// What to say when there was nothing to remove, and whether that is an
+/// error. Pure, so both branches are asserted without a cluster.
+///
+/// The two absences are NOT the same event and do not get the same exit
+/// code. A missing secret in a real namespace means the delete already
+/// happened — `remove` documents itself as idempotent and a script that
+/// runs it twice must not fail the second time. A missing namespace means
+/// the reader is addressing somewhere that does not exist, which is a typo
+/// often enough that reporting "nothing to remove" would be the same lie in
+/// a quieter voice.
+pub fn render_nothing_to_remove(name: &str, namespace: &str, target: &RemoveTarget) -> String {
+    match target {
+        RemoveTarget::Present => String::new(),
+        RemoveTarget::SecretAbsent => format!(
+            "Nothing to remove — no SealedSecret or Secret named '{name}' in \
+             namespace '{namespace}'.\n\
+             \n  `apprafter secret list` shows every sealed secret and the \
+             namespace each one lives in.\n"
+        ),
+        RemoveTarget::NamespaceAbsent => format!(
+            "namespace '{namespace}' does not exist, so nothing named '{name}' \
+             can be removed from it. Check the namespace — \
+             `apprafter secret list` shows every sealed secret and where each \
+             one lives."
+        ),
+    }
+}
+
 /// `apprafter secret remove <name>` — delete the `SealedSecret` and the
 /// `Secret` the controller unsealed from it, in `namespace`. Saves a manual
 /// `kubectl delete sealedsecret,secret`. The SealedSecret is the source of
@@ -276,7 +441,35 @@ fn delete_args<'a>(kind: &'a str, name: &'a str, namespace: &'a str) -> [&'a str
 /// FIRST — cascade-removing its owned Secret — and the Secret is then deleted
 /// explicitly to also cover a plain Secret that has no SealedSecret.
 /// Idempotent via `--ignore-not-found`.
+///
+/// Reports what it actually did. It used to print `✓ Removed '<name>' …`
+/// unconditionally, because `--ignore-not-found` makes the delete succeed
+/// against an empty namespace exactly as it does against a real one — so a
+/// mistyped `-n` produced a tick and a sentence naming a namespace the
+/// reader had never populated, and the secret they meant to delete was
+/// still live somewhere else.
 pub fn run_remove(name: &str, namespace: &str, yes: bool) -> Result<()> {
+    let probe = ensure_kubeconfig_tempfile()?;
+    let target = if namespace_confirmed_missing(namespace, probe.path()) {
+        RemoveTarget::NamespaceAbsent
+    } else if secret_exists(name, namespace, probe.path())? {
+        RemoveTarget::Present
+    } else {
+        RemoveTarget::SecretAbsent
+    };
+    match target {
+        RemoveTarget::NamespaceAbsent => {
+            return Err(CliError::Other(render_nothing_to_remove(
+                name, namespace, &target,
+            )));
+        }
+        RemoveTarget::SecretAbsent => {
+            print!("{}", render_nothing_to_remove(name, namespace, &target));
+            return Ok(());
+        }
+        RemoveTarget::Present => {}
+    }
+
     if !yes {
         if !std::io::stdin().is_terminal() {
             return Err(CliError::Other(
@@ -294,13 +487,13 @@ pub fn run_remove(name: &str, namespace: &str, yes: bool) -> Result<()> {
         }
     }
 
-    let kc = ensure_kubeconfig_tempfile()?;
     // SealedSecret first (source of truth — its deletion cascade-removes the
     // owned Secret), then the Secret explicitly for a plain/un-owned one.
+    let mut deleted_any = false;
     for kind in ["sealedsecret", "secret"] {
         let out = Command::new("kubectl")
             .args(delete_args(kind, name, namespace))
-            .env("KUBECONFIG", kc.path())
+            .env("KUBECONFIG", probe.path())
             .output()
             .map_err(|e| CliError::Other(format!("spawn kubectl delete {kind}: {e}")))?;
         if !out.status.success() {
@@ -313,11 +506,135 @@ pub fn run_remove(name: &str, namespace: &str, yes: bool) -> Result<()> {
         let stdout = String::from_utf8_lossy(&out.stdout);
         let trimmed = stdout.trim();
         if !trimmed.is_empty() {
+            deleted_any = true;
             println!("  {trimmed}");
         }
     }
-    println!("✓ Removed '{name}' (SealedSecret + Secret) from namespace '{namespace}'.");
+    // The pre-check said something was there, so an empty stdout here means
+    // it went away between the two calls — a concurrent delete, or the
+    // controller reaping the Secret as the SealedSecret's owner. Claiming a
+    // removal this command did not perform would be the same false tick in a
+    // narrower window.
+    if deleted_any {
+        println!("✓ Removed '{name}' (SealedSecret + Secret) from namespace '{namespace}'.");
+    } else {
+        println!(
+            "Nothing was removed — '{name}' disappeared from namespace \
+             '{namespace}' between the check and the delete."
+        );
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod namespace_and_absence_tests {
+    use super::*;
+
+    // ── namespace_decision ────────────────────────────────────────
+
+    #[test]
+    fn an_existing_namespace_is_not_touched_or_mentioned() {
+        for yes in [false, true] {
+            for tty in [false, true] {
+                assert_eq!(
+                    namespace_decision(true, yes, tty),
+                    NamespaceDecision::Exists,
+                    "exists=true must short-circuit regardless of yes={yes} tty={tty}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn yes_authorises_creation_without_making_it_silent() {
+        // `--yes` is the only non-interactive way to create, and it lands on
+        // the arm whose name is the requirement. The silence half is
+        // structural rather than assertable here: the enum has no arm that
+        // creates without printing, so `run_seal` has none to fall into.
+        assert_eq!(
+            namespace_decision(false, true, false),
+            NamespaceDecision::CreateAnnounced
+        );
+        assert_eq!(
+            namespace_decision(false, true, true),
+            NamespaceDecision::CreateAnnounced,
+            "a TTY with --yes must not downgrade to a prompt"
+        );
+    }
+
+    #[test]
+    fn a_tty_is_asked_and_a_pipe_is_refused() {
+        assert_eq!(
+            namespace_decision(false, false, true),
+            NamespaceDecision::Prompt
+        );
+        assert_eq!(
+            namespace_decision(false, false, false),
+            NamespaceDecision::ErrorNonInteractive
+        );
+    }
+
+    #[test]
+    fn it_gates_the_same_way_the_overwrite_check_does() {
+        // Two guards on the same command, both standing between the reader
+        // and a write they may not have meant. A reader who has learned one
+        // has learned the other; a divergence here is a second thing to learn
+        // for no reason.
+        for (exists, yes, tty) in [
+            (true, false, true),
+            (false, true, false),
+            (false, false, true),
+            (false, false, false),
+        ] {
+            // The two take `exists` with opposite polarity — a namespace
+            // gates when it is ABSENT, a secret when it is PRESENT — so the
+            // comparable call negates it.
+            let ns = namespace_decision(exists, yes, tty);
+            let ow = overwrite_decision(!exists, yes, tty);
+            let ns_blocks = matches!(ns, NamespaceDecision::ErrorNonInteractive);
+            let ow_blocks = matches!(ow, OverwriteDecision::ErrorNonInteractive);
+            assert_eq!(
+                ns_blocks, ow_blocks,
+                "exists={exists} yes={yes} tty={tty}: the two guards refuse in \
+                 different circumstances"
+            );
+        }
+    }
+
+    // ── render_nothing_to_remove ──────────────────────────────────
+
+    #[test]
+    fn an_absent_secret_says_nothing_was_removed() {
+        let msg = render_nothing_to_remove("stripe", "shop", &RemoveTarget::SecretAbsent);
+        assert!(msg.contains("Nothing to remove"), "{msg}");
+        assert!(msg.contains("stripe") && msg.contains("shop"), "{msg}");
+        assert!(
+            !msg.contains('✓'),
+            "the tick is what made this a false claim: {msg}"
+        );
+        assert!(
+            msg.contains("secret list"),
+            "the reader needs the next command: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_absent_namespace_blames_the_namespace_not_the_secret() {
+        // The reported case was a mistyped `-n`. A message that leads with
+        // the secret sends the reader hunting for an object that was never
+        // misplaced.
+        let msg = render_nothing_to_remove("stripe", "shopp", &RemoveTarget::NamespaceAbsent);
+        assert!(msg.starts_with("namespace 'shopp' does not exist"), "{msg}");
+        assert!(msg.contains("Check the namespace"), "{msg}");
+    }
+
+    #[test]
+    fn the_two_absences_do_not_read_alike() {
+        let secret_gone = render_nothing_to_remove("a", "ns", &RemoveTarget::SecretAbsent);
+        let ns_gone = render_nothing_to_remove("a", "ns", &RemoveTarget::NamespaceAbsent);
+        assert_ne!(secret_gone, ns_gone);
+        assert!(render_nothing_to_remove("a", "ns", &RemoveTarget::Present).is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -540,6 +857,20 @@ pub fn render_secret_list(rows: &[SealedSecretSummary], scope: &str) -> String {
 /// error rather than after.
 pub fn run_list(namespace: Option<&str>) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
+    // A LIST in a namespace that does not exist comes back empty and exit 0,
+    // so without this the answer to `-n prdo` is the same "no sealed secrets"
+    // the reader would get from a correctly spelled, genuinely empty one —
+    // and this command's whole job is to answer "is it in the namespace I
+    // think it is?".
+    if let Some(ns) = namespace {
+        if namespace_confirmed_missing(ns, kc.path()) {
+            return Err(CliError::Other(format!(
+                "namespace '{ns}' does not exist — so this is not an empty list, \
+                 it is the wrong address. Run `apprafter secret list` with no \
+                 `-n` to see every sealed secret and the namespace each lives in"
+            )));
+        }
+    }
     let json = match namespace {
         Some(ns) => kubectl_get_json("sealedsecrets", None, Some(ns), kc.path())?,
         None => crate::commands::k8s_helpers::kubectl_get_json_cluster_wide(

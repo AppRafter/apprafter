@@ -11,6 +11,7 @@
 //! * `rm`     — delete a SharedVolume; refused while still referenced.
 
 use std::io::IsTerminal;
+use std::path::Path;
 
 use cli_core::{CliError, Result};
 use serde_json::Value;
@@ -19,7 +20,7 @@ use tabled::{settings::Style, Table, Tabled};
 use crate::cli::VolumeCommand;
 use crate::commands::k8s_helpers::{
     ensure_kubeconfig_tempfile, kubectl_apply_json, kubectl_delete, kubectl_get_json,
-    kubectl_get_json_cluster_wide,
+    kubectl_get_json_cluster_wide, namespace_confirmed_missing,
 };
 
 const RESOURCE: &str = "sharedvolume.apprafter.io";
@@ -140,6 +141,19 @@ fn create(name: &str, size: &str, namespace: &str) -> Result<()> {
 
 fn list(namespace: Option<&str>) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
+    // "No SharedVolumes found in shopp." is a true sentence about a
+    // namespace that does not exist and a false answer to the question
+    // being asked, because a LIST does not validate its namespace — it
+    // returns the same empty set either way.
+    if let Some(ns) = namespace {
+        if namespace_confirmed_missing(ns, kc.path()) {
+            return Err(CliError::Other(format!(
+                "namespace '{ns}' does not exist — so this is not an empty list, \
+                 it is the wrong address. Run `apprafter volume list` with no \
+                 `-n` to see every SharedVolume and the namespace each lives in"
+            )));
+        }
+    }
     let json = kubectl_get_json_cluster_wide(RESOURCE, namespace, kc.path())?;
     let items = json
         .as_ref()
@@ -172,12 +186,33 @@ fn list(namespace: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// The error for a `SharedVolume` a GET did not return — naming whichever
+/// of the two things is actually missing.
+///
+/// "SharedVolume 'data' not found in shopp" reads as a missing volume and
+/// sends the reader looking for one, when what is missing is the namespace
+/// they named. Both `status` and `remove` reached the same GET and printed
+/// the same misdirection, so they share the repair.
+fn volume_not_found(name: &str, namespace: &str, kubeconfig_path: &Path) -> CliError {
+    if namespace_confirmed_missing(namespace, kubeconfig_path) {
+        CliError::Other(format!(
+            "namespace '{namespace}' does not exist, so '{name}' is not missing \
+             from it — check the namespace. `apprafter volume list` shows every \
+             SharedVolume and where each one lives"
+        ))
+    } else {
+        CliError::Other(format!(
+            "SharedVolume '{name}' not found in namespace '{namespace}'"
+        ))
+    }
+}
+
 fn status(name: &str, namespace: &str) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
-    let sv =
-        kubectl_get_json(RESOURCE, Some(name), Some(namespace), kc.path())?.ok_or_else(|| {
-            CliError::Other(format!("SharedVolume '{name}' not found in {namespace}"))
-        })?;
+    let sv = match kubectl_get_json(RESOURCE, Some(name), Some(namespace), kc.path())? {
+        Some(sv) => sv,
+        None => return Err(volume_not_found(name, namespace, kc.path())),
+    };
 
     let ready = sv
         .pointer("/status/ready")
@@ -259,10 +294,10 @@ fn rm(name: &str, namespace: &str, yes: bool) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
 
     // Fetch the resource to check refCount before deleting.
-    let sv =
-        kubectl_get_json(RESOURCE, Some(name), Some(namespace), kc.path())?.ok_or_else(|| {
-            CliError::Other(format!("SharedVolume '{name}' not found in {namespace}"))
-        })?;
+    let sv = match kubectl_get_json(RESOURCE, Some(name), Some(namespace), kc.path())? {
+        Some(sv) => sv,
+        None => return Err(volume_not_found(name, namespace, kc.path())),
+    };
 
     let ref_count = sv
         .pointer("/status/refCount")

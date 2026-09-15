@@ -255,6 +255,39 @@ fn kubectl_get_json_inner(
     )
 }
 
+/// `true` only when the apiserver definitively reports that `namespace` is
+/// not there.
+///
+/// **A LIST is not an existence check.** `kubectl get <anything> -n <ns>`
+/// against a namespace that was never created exits 0 with an empty item
+/// list, exactly like a namespace that exists and holds nothing: the
+/// apiserver does not validate the namespace on a LIST. So every command
+/// that lists within a `-n` the user typed reads a typo as "you have
+/// nothing here" — a wrong answer that looks like a correct one. Only a GET
+/// on the namespace itself tells the two apart, which is what this does.
+///
+/// **"Cannot tell" answers `false`, and that asymmetry is the point.** A
+/// Namespace is cluster-scoped, so this GET needs a permission that reading
+/// secrets inside one does not: a reader whose kubeconfig is namespace-bound
+/// gets an RBAC refusal here while every command they are entitled to run
+/// still works. The guards built on this REFUSE when it says `true`, so
+/// propagating that refusal — or reading it as "missing" — would take a
+/// working command away from exactly the restricted reader it is meant to
+/// serve, on the strength of a probe that is a courtesy rather than the
+/// operation. An unreachable apiserver reads the same way, and is about to
+/// fail the real call with a better message than this one could give.
+///
+/// Distinct from a resource 404 on purpose: callers report the missing
+/// namespace as its own finding, because it is almost always a typo and
+/// naming it saves the reader from hunting for an object that was never
+/// misplaced.
+pub fn namespace_confirmed_missing(namespace: &str, kubeconfig_path: &Path) -> bool {
+    matches!(
+        kubectl_get_json("namespace", Some(namespace), None, kubeconfig_path),
+        Ok(None)
+    )
+}
+
 /// Build the args for `kubectl get <resource> -l <selector> -n <ns> -o json`.
 /// Factored out so the arg shape is unit-testable without spawning kubectl.
 /// When `namespace` is `None` the listing is cluster-wide (`-A`).
