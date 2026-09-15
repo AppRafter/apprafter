@@ -55,7 +55,7 @@ post-launch work is not a roadmap phase and has no subscribe control.
 | Shipped | ✅ | On-demand Postgres (`needs.pg`) | [Postgres](operator-guide/postgres.md) |
 | Shipped | ✅ | On-demand Redis-compatible cache (`needs.redis`) | [Redis](operator-guide/redis.md) |
 | Shipped | ✅ | Message streams and durable consumers, declared in the manifest (`needs.jetstream`) | [JetStream](operator-guide/jetstream.md) |
-| Shipped | 🚧 | Redelivery, acknowledgement and retention tuned per stream and per consumer, with a dead-letter queue | — |
+| Shipped | ✅ | Redelivery, acknowledgement and retention tuned per stream and per consumer, with a dead-letter queue | — |
 | Shipped | 🚧 | One Postgres database or cache shared between applications, each consumer with its own credential | — |
 | Shipped | ✅ | PostgreSQL extensions requested from the manifest, from a bounded list | — |
 | Shipped | ✅ | On-demand block storage (`needs.disk`) | [Persistent disks](operator-guide/persistent-disk.md) |
@@ -82,14 +82,16 @@ post-launch work is not a roadmap phase and has no subscribe control.
 > server keeps running untouched. A larger per-tier budget is planned.
 > JetStream stores are out of scope for backup and restore.
 
-> **What the two `🚧` rows above are missing, precisely.** The JetStream tuning surface and the
-> dead-letter queue are built and gated — every field is accepted and stored by the message
-> controller's own schema, and the server behaviours they rely on were measured on the pinned
-> server — but the chain from a manifest through to a dead-letter queue actually filling has not
-> been run end to end on a cluster yet. Shared databases are further back: the manifest surface, the
-> validation and the SQL are in place and the SQL is proven against a real PostgreSQL, but nothing
-> provisions a shared database yet, so there is no way to use one. Neither is `✅` and neither will
-> be until a walk says so.
+> **What the `🚧` row above is missing, precisely.** A shared database can be created and bound —
+> the manifest surface, the validation, the SQL, the controller and the per-consumer credential are
+> all in place, and the SQL is proven against a real PostgreSQL — but the chain has not yet been run
+> end to end on a cluster. It stays `🚧` until a walk says otherwise.
+
+> **One tuning field is refused rather than accepted:** a stream-level ceiling on unacknowledged
+> messages. The message controller this platform ships never forwards it to the server, so accepting
+> it would store a setting nothing reads. The same ceiling set on each consumer does reach the
+> server and is the way to express it. Everything else in the tuning surface is confirmed on a
+> running server, not merely accepted by a schema.
 
 > An extension request is checked against the database server that is actually running, not against
 > the allow list alone. Whether a given extension exists is a property of the image, and an

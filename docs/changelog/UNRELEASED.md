@@ -90,17 +90,39 @@ a shared database yet.
 
   [ADR 0066] §4.
 
-- **`SharedDatabase` — the manifest surface only, so far.** A database several
-  applications may bind, created explicitly and outliving any of them, bound
-  through `needs.<type>.ref` with a per-consumer `access` of `rw` or `ro`.
-  Every consumer gets its own credential, so revocation is per application —
-  which is the whole reason it is not simply a copied connection secret.
+- **One database, several applications, a credential each** —
+  `SharedDatabase`, and `needs.<type>.ref` to bind it. Works for a PostgreSQL
+  database and for a Redis keyspace. The database is created explicitly
+  (`apprafter db create`) and outlives every application bound to it, because
+  a database the first application to name it would own is one that goes away
+  when that application does.
 
-  The schema, the validation and the SQL are in place and the SQL is proven
-  against a real PostgreSQL. **Nothing provisions a shared database yet**, so
-  there is no way to use one; the runtime is the rest of plan item 2.29.
+  Each consumer binds at `rw` or `ro` and gets its OWN login. Revocation is
+  therefore per application, and read-only is a real restriction rather than
+  an agreement — on PostgreSQL it is group membership, and a read-only
+  consumer's `INSERT` is refused by the server.
 
-  [ADR 0066] §1–§3.
+  **A table one consumer creates belongs to the group, not to its creator.**
+  Without that, the classic shared-database failure shows up as "my
+  neighbour's migration broke my app" rather than as a permission error
+  anyone recognises.
+
+  On Redis, consumers of one shared keyspace share a channel prefix as well as
+  the keyspace, so they can publish to each other. A per-consumer prefix would
+  have left them unable to.
+
+  **Binding for the first time is approval-gated**, per (application,
+  database) pair, and so is widening an existing binding from read-only to
+  read-write. Re-binding an approved pair is not, and narrowing is not.
+  Without the gate, one line in an application's own file attaches it to a
+  neighbour's data.
+
+  Deleting a shared database is refused while anything is bound, and the
+  refusal names the applications. Removing a consumer drops that consumer's
+  credential and nothing else — the shared data is never touched by a
+  consumer's lifecycle, which is the property the whole thing exists for.
+
+  [ADR 0066].
 
 ### Changed
 
