@@ -104,7 +104,7 @@ docs: v1alpha1.#Application & {
 			// single-node tier-1 cluster that is pod-level
 			// resilience only; losing the node loses both. Cheap
 			// either way: the container is Caddy plus a static tree.
-			replicas: 2
+			replicas: 1
 
 			expose: {
 				// Caddy listens on :80 inside the image

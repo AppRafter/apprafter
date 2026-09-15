@@ -44,7 +44,7 @@ landingWeb: v1alpha1.#Application & {
 			// releases. Pin to :landing-vX.Y.Z for full
 			// determinism in regulated rollouts.
 			image:    "ghcr.io/apprafter/landing-web:latest"
-			replicas: 2
+			replicas: 1
 			expose: {
 				port:    80
 				network:  "public"
@@ -66,7 +66,7 @@ landingWeb: v1alpha1.#Application & {
 			// a window of unavailability. Astro output is static,
 			// so the floor can stay low.
 			prod: {
-				replicas: 2
+				replicas: 1
 			}
 		}
 	}
