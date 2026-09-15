@@ -272,6 +272,33 @@ pub fn unbind_consumer(consumer_role: &str) -> Vec<String> {
     ]
 }
 
+/// Statements that drop a shared database's two groups, for the delete of
+/// the `SharedDatabase` itself at `refCount == 0`.
+///
+/// Run AFTER the database is gone. A role that owns a database cannot be
+/// dropped — Postgres refuses with `role "…" cannot be dropped because some
+/// objects depend on it` — and the owning group owns this one by design, so
+/// the order is not a preference.
+///
+/// Guarded on existence, like every other builder here, because a controller
+/// re-runs its cleanup: a second pass after a partial failure must complete
+/// rather than fail on the half already done.
+pub fn drop_groups(namespace: &str, name: &str) -> Vec<String> {
+    let owner = shared_group(namespace, name);
+    let reader = shared_reader_group(namespace, name);
+    [reader, owner]
+        .iter()
+        .map(|role| {
+            format!(
+                "DO $apprafter$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = {lit}) \
+                 THEN EXECUTE format('DROP OWNED BY %I', {lit}); \
+                 EXECUTE format('DROP ROLE %I', {lit}); END IF; END $apprafter$;",
+                lit = quote_literal(role)
+            )
+        })
+        .collect()
+}
+
 /// The query that answers whether the running operand image provides an
 /// extension (ADR 0066 §4.2). `$1` is the extension name.
 ///
@@ -284,6 +311,32 @@ pub const EXTENSION_AVAILABLE_QUERY: &str = "SELECT 1 FROM pg_available_extensio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_the_groups_takes_the_reader_first() {
+        // The owning group owns the database by design, and Postgres refuses
+        // to drop a role that owns one. The reader owns nothing, so it can go
+        // either way — but the OWNER must be last, after the database itself
+        // is gone, and pinning the order here is what keeps a later "tidy the
+        // list" edit from reversing it.
+        let stmts = drop_groups("apps", "orders");
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("'shd_apps_orders_ro'"), "{stmts:?}");
+        assert!(stmts[1].contains("'shd_apps_orders'"), "{stmts:?}");
+        // Matched on the QUOTED literal, not on a bare substring: the
+        // statement body says `FROM pg_roles`, which contains `_ro` and made
+        // the first version of this assertion fail against correct output.
+        assert!(!stmts[1].contains("'shd_apps_orders_ro'"), "{stmts:?}");
+    }
+
+    #[test]
+    fn dropping_a_group_that_is_already_gone_is_a_no_op() {
+        // A controller re-runs its cleanup; a second pass after a partial
+        // failure must complete rather than fail on the half already done.
+        for stmt in drop_groups("apps", "orders") {
+            assert!(stmt.contains("IF EXISTS"), "{stmt}");
+        }
+    }
 
     #[test]
     fn a_shared_group_cannot_collide_with_a_claim_role() {

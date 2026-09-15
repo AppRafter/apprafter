@@ -433,13 +433,14 @@ pub async fn reconcile_shared_database(
             );
             write_status(
                 &ctx,
+                &sd,
                 &ns,
                 &name,
                 false,
-                &backing_of(&sd),
+                None,
                 binders.len() as i64,
                 cond,
-                extension_condition_of(&sd, &prior),
+                extension_condition_of(&prior),
             )
             .await?;
             return Ok(Action::requeue(Duration::from_secs(30)));
@@ -474,10 +475,11 @@ pub async fn reconcile_shared_database(
             );
             write_status(
                 &ctx,
+                &sd,
                 &ns,
                 &name,
                 false,
-                &Backing::default(),
+                None,
                 current_ref_count(&ctx.client, &ns, &name).await?,
                 cond,
                 None,
@@ -515,10 +517,11 @@ async fn reconcile_pg(
         );
         write_status(
             ctx,
+            sd,
             ns,
             name,
             false,
-            &Backing::default(),
+            None,
             current_ref_count(&ctx.client, ns, name).await?,
             cond,
             None,
@@ -596,10 +599,11 @@ async fn reconcile_pg(
         );
         write_status(
             ctx,
+            sd,
             ns,
             name,
             false,
-            &Backing::default(),
+            None,
             current_ref_count(&ctx.client, ns, name).await?,
             cond,
             None,
@@ -654,10 +658,11 @@ async fn reconcile_pg(
         );
         write_status(
             ctx,
+            sd,
             ns,
             name,
             false,
-            &Backing::default(),
+            None,
             current_ref_count(&ctx.client, ns, name).await?,
             cond,
             None,
@@ -699,10 +704,11 @@ async fn reconcile_pg(
     );
     write_status(
         ctx,
+        sd,
         ns,
         name,
         true,
-        &Backing::pg(&database),
+        Some(&Backing::pg(&database)),
         ref_count,
         cond,
         ext_cond,
@@ -740,10 +746,11 @@ async fn reconcile_redis(
         );
         write_status(
             ctx,
+            sd,
             ns,
             name,
             false,
-            &Backing::default(),
+            None,
             current_ref_count(&ctx.client, ns, name).await?,
             cond,
             None,
@@ -806,10 +813,11 @@ async fn reconcile_redis(
                 );
                 write_status(
                     ctx,
+                    sd,
                     ns,
                     name,
                     false,
-                    &Backing::default(),
+                    None,
                     current_ref_count(&ctx.client, ns, name).await?,
                     cond,
                     None,
@@ -846,10 +854,11 @@ async fn reconcile_redis(
     );
     write_status(
         ctx,
+        sd,
         ns,
         name,
         true,
-        &Backing::redis(&pool.instance, i64::from(dbnum)),
+        Some(&Backing::redis(&pool.instance, i64::from(dbnum))),
         ref_count,
         cond,
         None,
@@ -860,49 +869,165 @@ async fn reconcile_redis(
 
 /// Drop the backing resource at `refCount == 0`.
 ///
-/// pg: declare the CNPG `Database` absent, then drop the two groups. In that
-/// order — a role that owns a database cannot be dropped, and CNPG records
-/// `cannotReconcile: owner of database` if asked.
+/// This is the one place in 2.29 that destroys data, and it runs only behind
+/// two gates — the webhook's refusal and the finalizer's own recount — so what
+/// it must not do is half the job silently. Both arms therefore resolve the
+/// provider rather than assuming a namespace: a provider seed that moves the
+/// CNPG cluster or the Dragonfly pool would otherwise leave the backing
+/// orphaned while the CR disappeared, and nothing would ever mention it again.
+///
+/// pg: declare the CNPG `Database` absent, wait for CNPG to act on it, THEN
+/// drop the two groups. The order is forced — the owning group owns the
+/// database, and Postgres refuses to drop a role that does.
+///
+/// redis: flush the `$N`. The number itself needs no release: the allocator
+/// derives the reserved set from live objects, so it frees when the CR goes.
+/// The flush is what makes `db rm` mean what its prompt says.
 async fn drop_backing(
     ctx: &Arc<Context>,
     sd: &SharedDatabase,
     ns: &str,
     name: &str,
 ) -> Result<(), ReconcileError> {
-    if sd.spec.type_ != "pg" {
-        return Ok(());
-    }
-    let Some(cnpg_ns) = sd
-        .status
-        .as_ref()
-        .and_then(|s| s.database.as_ref())
-        .map(|_| DEFAULT_CNPG_NAMESPACE.to_string())
-    else {
-        // Never provisioned — nothing to drop, and guessing a namespace to
-        // delete from would be worse than doing nothing.
-        return Ok(());
-    };
-    let object_name = shd_k8s_name(ns, name);
-    let db_api: Api<DynamicObject> = Api::namespaced_with(
-        ctx.client.clone(),
-        &cnpg_ns,
-        &crate::reconcile::database_ar(),
-    );
-    if let Some(existing) = db_api.get_opt(&object_name).await? {
-        let mut body = existing.data.clone();
-        body["spec"]["ensure"] = json!("absent");
-        let full = json!({
-            "apiVersion": "postgresql.cnpg.io/v1",
-            "kind": "Database",
-            "metadata": { "name": object_name, "namespace": cnpg_ns },
-            "spec": body["spec"],
-        });
-        db_api
-            .patch(&object_name, &apply_params(), &Patch::Apply(&full))
-            .await?;
-        info!(%name, %ns, %object_name, "declared the shared Database absent");
+    let providers: Vec<ServiceProvider> = Api::<ServiceProvider>::all(ctx.client.clone())
+        .list(&Default::default())
+        .await?
+        .items;
+    let candidates: Vec<Candidate> = providers.iter().map(Candidate::from_provider).collect();
+    let selector = sd.spec.selector.clone().unwrap_or_default();
+    let cfg = select_provider(&sd.spec.type_, &selector, &candidates)
+        .and_then(|n| providers.iter().find(|p| p.name_any() == n))
+        .and_then(|p| p.spec.config.clone())
+        .unwrap_or_else(|| json!({}));
+
+    match sd.spec.type_.as_str() {
+        "pg" => {
+            // Never provisioned → nothing to drop. Checked against the
+            // STATUS rather than by probing, because a probe that failed for
+            // a network reason would read the same as "absent" and the
+            // groups would be dropped out from under a live database.
+            if sd
+                .status
+                .as_ref()
+                .and_then(|s| s.database.as_ref())
+                .is_none()
+            {
+                return Ok(());
+            }
+            let cluster = cfg
+                .pointer("/cluster")
+                .and_then(Value::as_str)
+                .unwrap_or(DEFAULT_CNPG_CLUSTER)
+                .to_string();
+            let cnpg_ns = cfg
+                .pointer("/namespace")
+                .and_then(Value::as_str)
+                .unwrap_or(DEFAULT_CNPG_NAMESPACE)
+                .to_string();
+            let object_name = shd_k8s_name(ns, name);
+            let db_api: Api<DynamicObject> = Api::namespaced_with(
+                ctx.client.clone(),
+                &cnpg_ns,
+                &crate::reconcile::database_ar(),
+            );
+            if let Some(existing) = db_api.get_opt(&object_name).await? {
+                // The FULL body with `ensure: absent`, not a partial apply:
+                // SSA replaces this manager's field-set, and a body carrying
+                // only `ensure` would strip the `cluster`/`name`/`owner` it
+                // also owns and leave CNPG unable to act on the drop.
+                let mut spec = existing.data["spec"].clone();
+                spec["ensure"] = json!("absent");
+                let full = json!({
+                    "apiVersion": "postgresql.cnpg.io/v1",
+                    "kind": "Database",
+                    "metadata": { "name": object_name, "namespace": cnpg_ns },
+                    "spec": spec,
+                });
+                db_api
+                    .patch(&object_name, &apply_params(), &Patch::Apply(&full))
+                    .await?;
+                info!(%name, %ns, %object_name, "declared the shared Database absent");
+            }
+
+            // The groups. Best-effort on the CONNECTION, like every other SQL
+            // step here: a cluster that is down must not wedge the delete
+            // forever, and the statements are existence-guarded so the next
+            // pass completes what this one could not.
+            let pw_secret = cnpg::platform_role_secret_name(&cluster);
+            match crate::acl_reconcile::read_secret_key(ctx, &cnpg_ns, &pw_secret, "password").await
+            {
+                Ok(pw) => {
+                    let dsn = cnpg::dsn(cnpg::PLATFORM_ROLE, &pw, "postgres", &cluster, &cnpg_ns);
+                    if let Err(e) = ctx
+                        .pg
+                        .execute_all(&dsn, &shared_pg::drop_groups(ns, name))
+                        .await
+                    {
+                        // Expected on the first pass: CNPG has not dropped the
+                        // database yet, so its owner cannot go. The requeue
+                        // picks it up.
+                        warn!(%name, %ns, error = %e, "could not drop the groups yet");
+                    } else {
+                        info!(%name, %ns, "dropped the shared database's groups");
+                    }
+                }
+                Err(e) => {
+                    warn!(%name, %ns, error = %e, "platform role secret unreadable; groups left")
+                }
+            }
+        }
+        "redis" => {
+            let st = sd.status.as_ref();
+            let (Some(instance), Some(dbnum)) = (
+                st.and_then(|s| s.instance.clone()),
+                st.and_then(|s| s.dbnum).and_then(|n| u16::try_from(n).ok()),
+            ) else {
+                return Ok(());
+            };
+            let df_ns = cfg
+                .pointer("/namespace")
+                .and_then(Value::as_str)
+                .unwrap_or("dragonfly-system")
+                .to_string();
+            let addr = crate::dragonfly::instance_addr(&instance, &df_ns);
+            match crate::acl_reconcile::read_secret_key(
+                ctx,
+                &df_ns,
+                &crate::dragonfly::admin_secret_name(&instance),
+                "password",
+            )
+            .await
+            {
+                Ok(admin_pw) => {
+                    if let Err(e) = ctx.redis.flushdb(&addr, &admin_pw, dbnum).await {
+                        warn!(%name, %ns, error = %e, "could not flush the shared keyspace");
+                    } else {
+                        info!(%name, %ns, %instance, dbnum, "flushed the shared keyspace");
+                    }
+                }
+                Err(e) => {
+                    warn!(%name, %ns, error = %e, "instance admin secret unreadable; keyspace left")
+                }
+            }
+        }
+        _ => {}
     }
     Ok(())
+}
+
+/// Which backing a status write carries: the caller's override, or — when
+/// there is none — whatever the object already reports.
+///
+/// Extracted from [`write_status`] so the CHOICE is testable. Asserting the
+/// composed body directly did not cover it: a test that calls the body builder
+/// with `backing_of(sd)` passes whether or not `write_status` actually
+/// consults `backing_of`, which is precisely what a mutation of this default
+/// demonstrated.
+fn backing_for_write(override_: Option<&Backing>, sd: &SharedDatabase) -> Backing {
+    match override_ {
+        Some(b) => b.clone(),
+        None => backing_of(sd),
+    }
 }
 
 /// The backing recorded in the CR's own status, for a status write that must
@@ -923,11 +1048,7 @@ fn backing_of(sd: &SharedDatabase) -> Backing {
 /// The `ExtensionUnavailable` condition already on the object, carried
 /// forward by a path that did not re-probe. Same prune rule as
 /// [`backing_of`].
-fn extension_condition_of(
-    sd: &SharedDatabase,
-    prior: &[SharedDatabaseCondition],
-) -> Option<SharedDatabaseCondition> {
-    let _ = sd;
+fn extension_condition_of(prior: &[SharedDatabaseCondition]) -> Option<SharedDatabaseCondition> {
     prior
         .iter()
         .find(|c| c.type_ == COND_EXTENSION_UNAVAILABLE && c.status == "True")
@@ -1359,21 +1480,38 @@ async fn current_binders(
 }
 
 /// SSA-write the terminal status under the provisioner field manager.
+///
+/// `backing` is an OVERRIDE, and `None` — carry forward whatever the object
+/// already reports — is the default on purpose.
+///
+/// SSA replaces this manager's owned field-set on every apply, so a body that
+/// omits `status.database` DELETES it. The first version of this controller
+/// passed a freshly-defaulted `Backing` on each failure path, which meant a
+/// CNPG hiccup erased the database name from a provisioned object: `db status`
+/// showed no backing, every consumer's bind refused with "not ready", and —
+/// the serious half — a delete arriving during the outage read the now-absent
+/// name as "never provisioned" and skipped dropping the database entirely.
+///
+/// Making the safe thing the default is the repair. Erasing the backing is
+/// still possible, and still what the provisioning paths do, but it now takes
+/// saying so.
 #[allow(clippy::too_many_arguments)]
 async fn write_status(
     ctx: &Arc<Context>,
+    sd: &SharedDatabase,
     ns: &str,
     name: &str,
     ready: bool,
-    backing: &Backing,
+    backing: Option<&Backing>,
     ref_count: i64,
     ready_cond: SharedDatabaseCondition,
     extension_cond: Option<SharedDatabaseCondition>,
 ) -> Result<(), ReconcileError> {
+    let backing = backing_for_write(backing, sd);
     let body = sd_status_apply_body_with_conditions(
         name,
         ready,
-        backing,
+        &backing,
         ref_count,
         ready_cond,
         extension_cond,
@@ -1586,6 +1724,100 @@ mod tests {
         assert_eq!(conds.len(), 2);
         assert_eq!(conds[0]["type"], json!(COND_READY));
         assert_eq!(conds[1]["type"], json!(COND_EXTENSION_UNAVAILABLE));
+    }
+
+    /// A `SharedDatabase` that already reports a provisioned backing.
+    fn provisioned(database: &str) -> SharedDatabase {
+        let mut sd = SharedDatabase::new(
+            "orders",
+            operator_core::SharedDatabaseSpec {
+                type_: "pg".into(),
+                ..Default::default()
+            },
+        );
+        sd.status = Some(operator_core::SharedDatabaseStatus {
+            ready: Some(true),
+            ref_count: Some(2),
+            database: Some(database.into()),
+            ..Default::default()
+        });
+        sd
+    }
+
+    #[test]
+    fn a_write_with_no_override_carries_the_backing_forward() {
+        // THE regression, tested at the function that DECIDES rather than at
+        // the body builder. A first version of this test asserted the composed
+        // body instead, and passed happily when the default was mutated back
+        // to an empty backing — it was pinning the builder, not the choice.
+        let sd = provisioned("shd_shop_orders");
+        assert_eq!(backing_for_write(None, &sd), Backing::pg("shd_shop_orders"));
+    }
+
+    #[test]
+    fn an_explicit_override_wins_over_what_the_object_reports() {
+        // The provisioning paths state their backing, and must be able to
+        // change it — a redis database that moved instance says so.
+        let sd = provisioned("shd_shop_orders");
+        let fresh = Backing::redis("platform-redis-ephemeral-000", 4);
+        assert_eq!(backing_for_write(Some(&fresh), &sd), fresh);
+    }
+
+    #[test]
+    fn a_failure_path_status_write_keeps_the_backing_it_found() {
+        // THE regression. SSA replaces this manager's field-set on each apply,
+        // so a body that omits `status.database` deletes it. An earlier
+        // version defaulted the backing on every failure path, which meant a
+        // CNPG hiccup erased the database name from a provisioned object — and
+        // a delete arriving during the outage then read the absence as "never
+        // provisioned" and skipped dropping the database.
+        let sd = provisioned("shd_shop_orders");
+        let body = sd_status_apply_body_with_conditions(
+            "orders",
+            false,
+            &backing_of(&sd),
+            2,
+            ready_condition("False", "AwaitingCluster", "not answering", &[]),
+            None,
+        );
+        assert_eq!(body["status"]["database"], json!("shd_shop_orders"));
+        assert_eq!(body["status"]["ready"], json!(false));
+    }
+
+    #[test]
+    fn an_unprovisioned_object_carries_forward_nothing() {
+        let sd = SharedDatabase::new(
+            "orders",
+            operator_core::SharedDatabaseSpec {
+                type_: "pg".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(backing_of(&sd), Backing::default());
+    }
+
+    #[test]
+    fn a_carried_extension_warning_is_not_dropped_by_a_path_that_did_not_reprobe() {
+        // Same prune rule, one condition further in: a body carrying only
+        // `Ready` deletes the `ExtensionUnavailable` a previous apply set, and
+        // an operator watching for it sees it blink out with nothing having
+        // changed.
+        let prior = vec![SharedDatabaseCondition {
+            type_: COND_EXTENSION_UNAVAILABLE.into(),
+            status: "True".into(),
+            last_transition_time: "2026-01-01T00:00:00+00:00".into(),
+            reason: Some("NotInOperandImage".into()),
+            message: Some("the running PostgreSQL image does not provide: vector".into()),
+        }];
+        let carried = extension_condition_of(&prior).expect("carried forward");
+        assert_eq!(carried.type_, COND_EXTENSION_UNAVAILABLE);
+        assert_eq!(carried.last_transition_time, "2026-01-01T00:00:00+00:00");
+        // ...and a condition that had CLEARED is not resurrected.
+        let cleared = vec![SharedDatabaseCondition {
+            status: "False".into(),
+            ..prior[0].clone()
+        }];
+        assert!(extension_condition_of(&cleared).is_none());
     }
 
     #[test]
