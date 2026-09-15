@@ -132,23 +132,51 @@ path verbatim.
 
 #### 3.1 Postgres
 
-On `SharedDatabase` creation: a `NOLOGIN` group role `shd_<ns>_<name>` that
-owns the database, a second `NOLOGIN` group `shd_<ns>_<name>_ro` for readers,
-and a CNPG `Database` CR owned by the first and carrying `extensions` (§4).
+**Corrected 2026-09-15 by measurement**
+(`docs/measurements/2.29-shared-database-2026-09-15.md`). This section first
+had CNPG's declarative `managed.roles` create the group roles and the
+per-consumer roles, with the provisioner running four statements against them.
+That does not work, and it fails twice for one underlying reason: **a
+`CREATEROLE` role without superuser may administer only the roles it holds
+ADMIN OPTION on, and it obtains ADMIN OPTION by CREATING them.** Neither
+`ALTER ROLE <consumer> … SET ROLE` nor `CREATE ROLE … IN ROLE <group>` is
+permitted against roles somebody else created.
 
-On each consumer bind: a `LOGIN` role `claim_<ns>_<app>_pg` with its own
-password, created through CNPG's declarative `managed.roles` — which supports
-`inRoles`, so **membership is declarative** — a member of the owner group for
-`rw` or the reader group for `ro`. Then, for `rw`, one statement:
+So `managed.roles` creates exactly **one** role — the platform's own
+`apprafter_admin`, `LOGIN CREATEROLE CREATEDB`, not a superuser — and the
+provisioner owns the rest.
+
+On `SharedDatabase` creation, as `apprafter_admin`: the `NOLOGIN` group
+`shd_<ns>_<name>` that owns the database, the `NOLOGIN` reader group
+`shd_<ns>_<name>_ro`, **a grant of each group back to `apprafter_admin` WITH
+SET** (owning a database as a group additionally requires membership with SET,
+not merely admin), and the database itself.
+
+On each consumer bind, also as `apprafter_admin`: `CREATE ROLE
+claim_<ns>_<app>_pg LOGIN PASSWORD … IN ROLE <group>`, followed for `rw` by
 
 ```sql
 ALTER ROLE <consumer> IN DATABASE <db> SET ROLE <owner group>;
 ```
 
-and for `ro`, a fixed idempotent block: `GRANT CONNECT`, `GRANT USAGE ON
+and for `ro` by a fixed idempotent block: `GRANT CONNECT`, `GRANT USAGE ON
 SCHEMA public`, `GRANT SELECT ON ALL TABLES IN SCHEMA public`, and `ALTER
 DEFAULT PRIVILEGES FOR ROLE <owner group> IN SCHEMA public GRANT SELECT ON
-TABLES`.
+TABLES`. That last statement was the one half of the original design the
+measurement confirmed outright: a member of the group may issue it, no
+superuser required.
+
+**The consequence worth naming: password management for a shared-database
+consumer moves from CNPG to the provisioner**, which already generates and
+stores passwords for owned claims. The statement set is still small, fixed and
+idempotent — it is simply larger than four lines, and it now includes role
+creation.
+
+The end-to-end property was measured, not assumed: a table created by one `rw`
+consumer comes out owned by the GROUP, a second `rw` consumer reads and writes
+it, and the `ro` consumer reads it while its `INSERT` is refused — with no
+per-table grant anywhere, because the single `ALTER DEFAULT PRIVILEGES FOR
+ROLE <group>` covers tables created later by somebody else.
 
 **The `SET ROLE` line is the whole design, not a detail.** Without it a table
 created by application A's migration is owned by A's own role, and application
@@ -168,12 +196,11 @@ statement set is small, fixed and idempotent, and that is what makes it
 acceptable; if it ever needs to grow into arbitrary SQL, that is the signal to
 revisit this decision rather than to extend it.
 
-It connects as a dedicated platform `LOGIN` role created through
-`managed.roles` with membership in each shared owner group — membership is
-what `ALTER DEFAULT PRIVILEGES FOR ROLE <owner>` requires. **Not the CNPG
-superuser**: `enableSuperuserAccess` is off by default, and turning it on to
-run four statements would be a far larger grant than the job needs. §7(a)
-verifies the privilege set is actually sufficient before this is built.
+It connects as `apprafter_admin`. **Not the CNPG superuser**:
+`enableSuperuserAccess` is off by default, and turning it on would be a far
+larger grant than the job needs. §7(a) confirmed `CREATEROLE` plus
+self-created groups is sufficient — and, in the same measurement, that a
+plain member without ADMIN OPTION is not.
 
 #### 3.2 Redis
 
@@ -188,8 +215,12 @@ per `spec.persistent`. Each consumer gets its own ACL user pinned to that same
   feature would look provisioned and not work. `claim.redis.channelPrefix`
   reports the shared prefix to every consumer.
 - **`ro` drops the write categories**: `+@all -@write -@admin -@dangerous
-  -move -copy -pubsub +sort_ro`, plus an explicit denial of `publish` /
-  `spublish`, because a publish is not a member of `@write`.
+  -move -copy -pubsub -publish -spublish +sort_ro`. The last two are not
+  belt-and-braces: **measured on v1.37.0, `-@write` leaves `PUBLISH` and
+  `SPUBLISH` allowed**, so without them a "read-only" consumer could publish
+  into the shared channel prefix every other consumer subscribes to. With
+  them, the `ro` user is refused and the `rw` user still publishes — both
+  directions checked.
 
 Everything else — the `$N` pin, `~*`, `resetkeys` / `resetchannels`, the
 `-move` / `-copy` cross-DB denials and the `-pubsub` disclosure denial — is
@@ -381,19 +412,28 @@ Andrey Ryahovskiy.
 - Revisit §4.2 when the operand image is pinned, at which point
   `ExtensionUnavailable` stops being the only defence.
 
-## 7. Measurements owed before implementation
+## 7. Measurements
 
-- **(a)** That a `managed.roles`-created role with membership in the owner
-  group, and without superuser, can execute the §3.1 statement set — in
-  particular `ALTER DEFAULT PRIVILEGES FOR ROLE <owner>` and `ALTER ROLE … IN
-  DATABASE … SET ROLE`. Measured against CNPG 1.29.1 on `kind`.
-- **(b)** Dragonfly's category membership for `publish` / `spublish` and for
-  the write commands, before `ro` is written as an ACL string. ADR 0042 §2 is
-  the precedent: `MOVE` and `COPY` were assumed to be in `@dangerous` and are
-  not, which would have left a cross-DB escape.
-- **(c)** That `Database.spec.extensions` with `ensure: absent` drops the
-  extension rather than erroring when dependent objects exist — it is how a
-  removed manifest entry behaves.
+All three were taken on 2026-09-15 and are recorded in
+`docs/measurements/2.29-shared-database-2026-09-15.md`. One of them changed
+the decision, which is what they were for.
+
+- **(a) Answered, AGAINST the design as first written.** A `CREATEROLE` role
+  without superuser may administer only roles it holds ADMIN OPTION on, and
+  it gets that by creating them — so neither `ALTER ROLE <consumer> … SET
+  ROLE` nor `CREATE ROLE … IN ROLE <group>` works against roles CNPG created.
+  §3.1 is rewritten accordingly: `managed.roles` creates one role and the
+  provisioner owns the rest. The end-to-end property (a table created by one
+  consumer, owned by the group, readable and writable by a second, read-only
+  to a third) was then measured on the corrected chain.
+- **(b) Answered, confirming the concern.** On Dragonfly v1.37.0 `-@write`
+  leaves `PUBLISH` and `SPUBLISH` allowed; the `ro` ACL denies them
+  explicitly. ADR 0042 §2's lesson repeating.
+- **(c) Answered.** `DROP EXTENSION` without `CASCADE` fails when dependent
+  objects exist, naming the dependency. The platform therefore never issues
+  `CASCADE`: removing an `extensions` entry must fail loudly, because a
+  silent cascade would drop a column default on a manifest edit whose author
+  was tidying a list.
 
 ## References
 
