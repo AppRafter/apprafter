@@ -4635,7 +4635,7 @@ fn status_detail_lines(app: &Value) -> Vec<String> {
         .unwrap_or("Unknown");
     let environment = deployment_environment(app);
 
-    vec![
+    let mut out = vec![
         format!("Application {ARGOCD_NAMESPACE}/{name}"),
         format!("  project:       {project}"),
         format!("  repo:          {repo}"),
@@ -4645,7 +4645,160 @@ fn status_detail_lines(app: &Value) -> Vec<String> {
         format!("  environment:   {environment}"),
         format!("  sync state:    {sync}"),
         format!("  health:        {health}"),
-    ]
+    ];
+    // Directly under `health:`, because a condition is the REASON the two
+    // lines above read the way they do — a 2.27a bundle refusal leaves the
+    // sync `Unknown` and says why only here.
+    out.extend(condition_lines(app));
+    out
+}
+
+/// Pure helper — `status.conditions[]` of one Argo CD `Application`,
+/// rendered as the tail of [`status_detail_lines`].
+///
+/// Argo CD writes a condition whenever it cannot do what the registration
+/// asked: a manifest-generation failure becomes `ComparisonError` carrying
+/// whatever the generate command put on stderr. The 2.27a cue-cmp refusals
+/// (contradicting namespaces, a duplicate `(namespace, name)`, a
+/// package-scope manifest mixed with named wrappers, divergent
+/// `spec.environment`, two packages under one path) land here verbatim —
+/// and *only* here, since the sync itself just goes `Unknown`.
+///
+/// **Folding rule: the first line rides the `<Type>:` line, every
+/// remaining line is re-indented underneath it, and nothing is dropped
+/// or counted.** The sidecar's first line is a self-contained summary
+/// because Argo CD truncates it onto a UI tile, but a terminal has no
+/// tile: what the reader must act on — *which* workloads disagree, what
+/// each declared, and the remedy — lives in the detail block below that
+/// summary. Printing the summary alone, or the summary plus an "(+12
+/// more lines)" count, would re-create the trip to the Argo CD UI that
+/// surfacing the condition here exists to remove.
+///
+/// The one thing dropped is the transport framing ahead of our own
+/// [`CUE_CMP_SENTINEL`] — see [`strip_transport_prefix`].
+///
+/// Two details the fold does not take liberties with. The message is
+/// never re-wrapped — `bundle_refuse` writes a column-aligned table of
+/// offending workloads, and wrapping would destroy it. And interior
+/// blank lines are kept (runs collapsed to one, leading/trailing
+/// dropped) — measured on a real namespace-divergence refusal, deleting
+/// them fuses the offending-workload table, the "why" paragraph and the
+/// "how to fix it" paragraph into one wall, which is exactly the part a
+/// red-deploy reader skims.
+///
+/// Every condition is rendered, not just the first: Argo CD reports them
+/// as a set, and a `ComparisonError` sitting next to an
+/// `OrphanedResourceWarning` is two different things to fix.
+///
+/// Returns an empty `Vec` when there are no conditions — a healthy app
+/// pays nothing for this block, not even a header (pinned by the N=1
+/// golden detail block).
+///
+/// Deliberately unstyled: [`status_detail_lines`] colours nothing today,
+/// and `RenderedLine`'s doctrine is that line assembly must not inspect
+/// the terminal. Painting these `warn` means moving that whole function
+/// to `Vec<RenderedLine>` — its callers and the N=1 golden included —
+/// which is a bigger change than surfacing the data, so it is not made
+/// here.
+fn condition_lines(app: &Value) -> Vec<String> {
+    let conditions = app
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for cond in conditions {
+        let kind = cond
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown");
+        let message = cond.get("message").and_then(Value::as_str).unwrap_or("");
+        let body = fold_condition_message(strip_transport_prefix(message));
+        if out.is_empty() {
+            out.push(String::new());
+            out.push("Argo CD conditions:".to_string());
+        }
+        let mut body = body.into_iter();
+        match body.next() {
+            Some(first) => out.push(format!("  {kind}: {first}")),
+            // A condition with no message is still worth naming: the type
+            // alone tells the reader which surface to look at.
+            None => out.push(format!("  {kind}")),
+        }
+        out.extend(body.map(|l| {
+            // An interior blank stays blank rather than becoming four
+            // spaces of trailing whitespace.
+            if l.is_empty() {
+                l
+            } else {
+                format!("    {l}")
+            }
+        }));
+    }
+    out
+}
+
+/// The marker `argocd-cue-cmp/entrypoint.sh` opens every one of its own
+/// stderr lines with. Ours, not Argo CD's — which is the whole reason
+/// [`strip_transport_prefix`] is safe.
+const CUE_CMP_SENTINEL: &str = "::cue-cmp::";
+
+/// Drop whatever precedes the first [`CUE_CMP_SENTINEL`] in a condition
+/// message; return the message untouched when there is none.
+///
+/// Argo CD delivers a CMP failure as a Go error chain with our sidecar's
+/// stderr appended to the end of it, so the rendered first line opens
+/// with ~180 characters of `Failed to load target state: failed to
+/// generate manifest for source 1 of 1: rpc error: code = Unknown desc =
+/// … exit status 1:` before the one sentence `bundle_refuse` wrote to BE
+/// the whole finding. First line is what a reader sees first, and that
+/// made it the least useful line in the block.
+///
+/// **This deliberately does not parse Argo CD's wrapper.** It searches
+/// for a marker WE emit, so Argo CD may reshape, translate or extend its
+/// error chain freely and this keeps working — there is no shape here to
+/// break. And a condition Argo CD raises on its own (`SyncError`,
+/// `OrphanedResourceWarning`, `InvalidSpecError`, …) carries no sentinel
+/// and so falls through byte-for-byte, which is the behaviour that must
+/// not regress: those messages have no marker and no transport framing,
+/// and are entirely their own content.
+///
+/// The cut is the FIRST occurrence in the whole message rather than a
+/// first-line-only match, because the sidecar can write several sentinel
+/// lines before the fatal one (the nested-manifest-directory notices at
+/// `entrypoint.sh:248`) and every one of them is content worth keeping;
+/// anything ahead of the earliest of them is framing by construction,
+/// since a sentinel is the first thing the sidecar writes.
+///
+/// The sentinel stays in the output. It names which layer refused — the
+/// manifest renderer, not the apiserver, not the operator — and it is
+/// greppable in a pasted terminal scrollback.
+fn strip_transport_prefix(message: &str) -> &str {
+    match message.find(CUE_CMP_SENTINEL) {
+        Some(at) => &message[at..],
+        None => message,
+    }
+}
+
+/// The line-level half of [`condition_lines`]' folding rule: trailing
+/// whitespace stripped, leading and trailing blank lines dropped, runs of
+/// interior blanks collapsed to one. Returns the message's own lines,
+/// un-indented — the caller owns the indent, since the first one is
+/// spliced onto the `<Type>:` line and the rest sit under it.
+fn fold_condition_message(message: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in message.lines().map(str::trim_end) {
+        let blank = line.is_empty();
+        // Leading blanks never open the block; a run never widens it.
+        if blank && out.last().is_none_or(String::is_empty) {
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    while out.last().is_some_and(String::is_empty) {
+        out.pop();
+    }
+    out
 }
 
 /// Pure helper — the `Recent revisions` tail of the status block.
@@ -5696,6 +5849,185 @@ mod tests {
             env_line.contains("(base)"),
             "base-only deployment must show (base); got {env_line:?}"
         );
+    }
+
+    #[test]
+    fn status_detail_lines_surface_an_argo_condition() {
+        // 2.27a taught the cue-cmp sidecar to REFUSE a self-contradicting
+        // bundle. Argo CD lands that refusal on
+        // `status.conditions[].message` and leaves the sync Unknown, so a
+        // detail block that reads only `status.sync` tells the operator
+        // their deploy is broken and nothing about why.
+        let app = serde_json::json!({
+            "metadata": {"name": "shop"},
+            "status": {
+                "sync": {"status": "Unknown"},
+                "conditions": [{
+                    "type": "ComparisonError",
+                    "message": "::cue-cmp:: bundle is inconsistent: workloads declare 2 different namespaces — api -> \"one\", web -> \"two\""
+                }]
+            }
+        });
+        let joined = status_detail_lines(&app).join("\n");
+        assert!(joined.contains("ComparisonError"), "{joined}");
+        assert!(joined.contains("2 different namespaces"), "{joined}");
+    }
+
+    #[test]
+    fn status_detail_lines_say_nothing_when_there_are_no_conditions() {
+        // A healthy app must not pay for the refusing one: no header, no
+        // empty section. The N=1 golden block pins this too.
+        let app = serde_json::json!({
+            "metadata": {"name": "ok"},
+            "status": {"sync": {"status": "Synced"}}
+        });
+        let joined = status_detail_lines(&app).join("\n");
+        assert!(!joined.to_lowercase().contains("condition"), "{joined}");
+    }
+
+    #[test]
+    fn status_detail_lines_surface_every_condition_not_just_the_first() {
+        let app = serde_json::json!({"metadata": {"name": "shop"}, "status": {"conditions": [
+            {"type": "ComparisonError", "message": "first"},
+            {"type": "OrphanedResourceWarning", "message": "second"}
+        ]}});
+        let joined = status_detail_lines(&app).join("\n");
+        assert!(
+            joined.contains("first") && joined.contains("second"),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn status_detail_lines_fold_a_multi_line_condition_message() {
+        // Argo stores what the generate command put on stderr. The cue-cmp
+        // refusals are multi-line by design: a one-line tile summary, then a
+        // detail block. A raw embed would break the aligned block this
+        // function renders.
+        let app = serde_json::json!({"metadata": {"name": "shop"}, "status": {"conditions": [
+            {"type": "ComparisonError", "message": "summary line\n\n--- apprafter bundle check ---\n  api  -> \"one\"\n  web  -> \"two\""}
+        ]}});
+        let lines = status_detail_lines(&app);
+        // The folding rule: the FIRST line rides the `<Type>:` line and
+        // every remaining line is re-indented underneath it, paragraph
+        // breaks and all. See `condition_lines` for why the tail is kept
+        // rather than counted or dropped.
+        assert!(
+            lines.iter().any(|l| l.contains("summary line")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("api  -> \"one\"")),
+            "the detail block names WHICH workloads disagree — that is the \
+             fix instruction, it must survive the fold; got {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| !l.contains('\n')),
+            "a folded message must not smuggle a raw newline back into a \
+             single Vec element; got {lines:?}"
+        );
+        assert!(
+            !lines.last().is_some_and(|l| l.trim().is_empty()),
+            "a message's trailing blank must not dangle into whatever \
+             section follows; got {lines:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.trim().is_empty()).count(),
+            2,
+            "exactly two blanks: the one opening the conditions section, \
+             and the message's own paragraph break — no run, no dangle; \
+             got {lines:?}"
+        );
+    }
+
+    /// Exactly what Argo CD v2.13 wraps a failed CMP generate in before
+    /// it stores the plugin's stderr on the condition: a Go error chain,
+    /// our sidecar's output appended to the tail of it.
+    fn argo_cmp_wrapped(stderr: &str) -> String {
+        format!(
+            "Failed to load target state: failed to generate manifest for \
+             source 1 of 1: rpc error: code = Unknown desc = error generating \
+             manifests in cmp: rpc error: code = Unknown desc = error \
+             generating manifests: exit status 1: {stderr}"
+        )
+    }
+
+    #[test]
+    fn condition_lines_render_from_our_own_sentinel_not_argos_wrapper() {
+        // The finding the sidecar wrote to BE the whole finding must be
+        // the first thing on the first line — not ~180 characters of RPC
+        // plumbing followed by it.
+        let app = serde_json::json!({
+            "metadata": {"name": "shop"},
+            "status": {"sync": {"status": "Unknown"}, "conditions": [{
+                "type": "ComparisonError",
+                "message": argo_cmp_wrapped(
+                    "::cue-cmp:: bundle is inconsistent: workloads declare 2 \
+                     different namespaces — api -> \"one\", web -> \"two\"\n\n\
+                     --- apprafter bundle check ---\n  \
+                     api                      metadata.namespace: one\n  \
+                     web                      metadata.namespace: two"
+                )
+            }]}
+        });
+        let lines = status_detail_lines(&app);
+        let first = lines
+            .iter()
+            .find(|l| l.contains("ComparisonError"))
+            .expect("the condition must render at all");
+        assert_eq!(
+            first,
+            "  ComparisonError: ::cue-cmp:: bundle is inconsistent: workloads \
+             declare 2 different namespaces — api -> \"one\", web -> \"two\"",
+            "the first line must open at OUR sentinel"
+        );
+        let joined = lines.join("\n");
+        for framing in ["Failed to load target state", "rpc error", "exit status 1"] {
+            assert!(
+                !joined.contains(framing),
+                "transport framing {framing:?} survived the cut; got {joined}"
+            );
+        }
+        // The cut removes the framing only — the detail block that names
+        // which workloads disagree is still the point of the block.
+        assert!(
+            joined.contains("api                      metadata.namespace: one"),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn condition_lines_leave_a_condition_without_our_sentinel_whole() {
+        // Argo CD raises plenty of conditions on its own. Those carry no
+        // sentinel, have no transport framing wrapped around them, and are
+        // entirely their own content — the cut must not touch them.
+        let message = "one or more objects failed to apply, reason: \
+                       Operation cannot be fulfilled on deployments.apps \
+                       \"web\": the object has been modified; please apply \
+                       your changes to the latest version and try again";
+        let app = serde_json::json!({
+            "metadata": {"name": "shop"},
+            "status": {"conditions": [{"type": "SyncError", "message": message}]}
+        });
+        let lines = status_detail_lines(&app);
+        assert!(
+            lines.contains(&format!("  SyncError: {message}")),
+            "a sentinel-free condition must render byte-for-byte; got {lines:?}"
+        );
+        // And the same at the helper, where a stray cut would be silent.
+        assert_eq!(strip_transport_prefix(message), message);
+    }
+
+    #[test]
+    fn fold_condition_message_collapses_blank_runs_and_trims_the_ends() {
+        assert_eq!(
+            fold_condition_message("\n\n  a  \n\n\n\nb\n  \n\n"),
+            vec!["  a", "", "b"],
+            "leading and trailing blanks dropped, an interior run collapsed \
+             to one, trailing whitespace stripped, indentation preserved"
+        );
+        assert!(fold_condition_message("").is_empty());
+        assert!(fold_condition_message("\n  \n\n").is_empty());
     }
 
     #[test]
