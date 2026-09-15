@@ -57,32 +57,47 @@ import v1alpha1 "apprafter.io/schemas/v1alpha1"
 			// then renders the Gateway-API HTTPRoute automatically.
 			// network:  "public"           // also "internal" (default) / "vpn"
 			// hostname: "app.example.com"  // required when network: public
-		}{{needs_block}}
+		}
 
-		// Literal env values only in v1alpha1. Secret /
-		// ConfigMap references land in 4.x with OpenBao and
-		// 2.x with ResourceClaim respectively. Uncomment
-		// and replace placeholders when needed:
+		// Health checks. Without a `readiness` block the platform
+		// still waits for something to accept a TCP connection on
+		// the port above before sending traffic — point these at
+		// your own endpoints to check more than that. Every timing
+		// has a default (10s period, 2s timeout, 3 failures), so a
+		// path is enough to start.
+		//
+		// probes: {
+		//     readiness: path: "/health"
+		//     liveness:  path: "/health"
+		// }{{needs_block}}
+
+		// Environment variables. A value is a literal string, a
+		// reference to a declared dependency's connection secret
+		// (`claim.<type>.<field>`), or a reference to a secret you
+		// sealed yourself (`secret: "<name>/<key>"`). Uncomment and
+		// replace placeholders when needed:
 		//
 		// env: {
-		//     "LOG_LEVEL": "info"
-		//     "APP_PORT":  "{{primary_port}}"
+		//     "LOG_LEVEL":    "info"
+		//     "APP_PORT":     "{{primary_port}}"
+		//     "DATABASE_URL": claim.pg.url
 		// }
 	}
 
-	// Per-environment overrides — CUE unification merges the
-	// chosen environment onto `spec.base` at render time
-	// (`APPRAFTER_ENV=dev` / `=prod`). Uncomment and tune as
-	// you grow beyond a single environment:
+	// Per-environment overrides. The environment is chosen at
+	// deploy time (`apprafter app add --env dev`) and its block
+	// deep-merges onto `spec.base`, field by field — so an
+	// environment carries only its diff and inherits the rest.
+	// Uncomment and tune as you grow beyond a single environment:
 	//
 	// spec: environments: {
 	//     dev: {
 	//         replicas: 1
-	//         expose: public: false
+	//         probes: readiness: periodSeconds: 3
 	//     }
 	//     prod: {
 	//         replicas: 3
-	//         // expose: { public: true, network: "public" }
+	//         // expose: network: "public"
 	//     }
 	// }
 }
