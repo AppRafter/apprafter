@@ -188,6 +188,64 @@ fn confirm_or_proceed_on_unhealthy(app: &Value, name: &str) -> Result<()> {
     }
 }
 
+/// One AppRafter `Application` CR that Argo CD tracks for a registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CrRef {
+    /// `None` when neither the `status.resources[]` entry nor the
+    /// registration's `spec.destination.namespace` names one — that is
+    /// *unknown*, never "default" and never the empty string. See
+    /// [`apprafter_app_refs`] for what a caller owes this case.
+    pub(crate) namespace: Option<String>,
+    pub(crate) name: String,
+}
+
+/// Every AppRafter `Application` CR a registration deploys, in the order
+/// Argo CD records them.
+///
+/// Replaces the pre-2.27 `Option<String>`, in which N was not
+/// representable — the old helper returned the first and every caller
+/// silently operated on one workload of however many (ADR 0062
+/// §Context). `status.resources[]` is empty until the first sync; that
+/// is NOT the same as "not registered", and callers must not conflate
+/// them.
+///
+/// An entry whose namespace is unknown is still returned, with
+/// `CrRef::namespace` = `None` — dropping it would silently lose a
+/// workload, which is the bug class this function exists to close. A
+/// caller must **refuse** on `None` rather than pass anything to
+/// `kubectl -n`: that is what `app.rs`'s `read_apprafter_cr` does today
+/// (it `?`s on the absent destination namespace), and migrating it to
+/// this function must preserve the refusal.
+pub(crate) fn apprafter_app_refs(argocd_app: &Value) -> Vec<CrRef> {
+    let dest = argocd_app
+        .pointer("/spec/destination/namespace")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    argocd_app
+        .pointer("/status/resources")
+        .and_then(Value::as_array)
+        .map(|rs| {
+            rs.iter()
+                .filter(|r| {
+                    r.get("group").and_then(Value::as_str) == Some("apprafter.io")
+                        && r.get("kind").and_then(Value::as_str) == Some("Application")
+                })
+                .filter_map(|r| {
+                    Some(CrRef {
+                        namespace: r
+                            .get("namespace")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .or(dest)
+                            .map(str::to_string),
+                        name: r.get("name").and_then(Value::as_str)?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Pure helper — walk Argo CD's `status.resources[]` to find
 /// the AppRafter Application CR it owns. Returns the inner
 /// `metadata.name` (which is the value the operator uses for
@@ -202,16 +260,15 @@ fn confirm_or_proceed_on_unhealthy(app: &Value, name: &str) -> Result<()> {
 /// directly applies — operator-rendered children carry a
 /// different label set. This helper bridges from outer (Argo
 /// CD) to inner (AppRafter) naming.
+///
+/// Since 2.27 this is the singular view of [`apprafter_app_refs`], kept
+/// as a shim so the callers that still speak about one workload keep
+/// working unchanged; they migrate to the plural form in a later plan.
 pub(crate) fn find_apprafter_app_name(argocd_app: &Value) -> Option<String> {
-    let resources = argocd_app.pointer("/status/resources")?.as_array()?;
-    for r in resources {
-        let group = r.get("group").and_then(Value::as_str).unwrap_or("");
-        let kind = r.get("kind").and_then(Value::as_str).unwrap_or("");
-        if group == "apprafter.io" && kind == "Application" {
-            return r.get("name").and_then(Value::as_str).map(String::from);
-        }
-    }
-    None
+    apprafter_app_refs(argocd_app)
+        .into_iter()
+        .next()
+        .map(|r| r.name)
 }
 
 /// Shell out to `kubectl get svc -n <ns> -l app.kubernetes.io/
@@ -510,31 +567,101 @@ mod tests {
     }
 
     #[test]
-    fn find_apprafter_app_name_picks_first_when_multiple_apprafter_applications() {
-        // Defensive — if a manifest somehow renders two
-        // apprafter.io/Application CRs, the helper picks
-        // the first. Walk-fix #2 post-B.1.79b territory if
-        // operators actually do this; for now, take the
-        // first deterministic-order entry.
+    fn apprafter_app_refs_returns_every_application_with_its_namespace() {
+        // Inverts the pre-2.27 test that pinned first-wins. Argo CD records a
+        // per-entry namespace in status.resources[], which is NOT necessarily
+        // spec.destination.namespace — a workload's own metadata.namespace
+        // wins when it declares one.
+        // The `argoproj.io` entry is the load-bearing one: an app-of-apps
+        // child renders `kind: Application` into status.resources[] too, so
+        // the filter must key on the GROUP, not the kind alone.
         let app = json!({
-            "status": {
-                "resources": [
-                    {
-                        "group": "apprafter.io",
-                        "kind": "Application",
-                        "name": "first",
-                        "version": "v1alpha1"
-                    },
-                    {
-                        "group": "apprafter.io",
-                        "kind": "Application",
-                        "name": "second",
-                        "version": "v1alpha1"
-                    }
-                ]
-            }
+            "spec": {"destination": {"namespace": "fallback"}},
+            "status": {"resources": [
+                {"group": "", "kind": "Namespace", "name": "shop"},
+                {"group": "apprafter.io", "kind": "Application", "name": "api", "namespace": "shop"},
+                {"group": "argoproj.io", "kind": "Application", "name": "child", "namespace": "argocd"},
+                {"group": "apprafter.io", "kind": "Application", "name": "web", "namespace": "shop"},
+                {"group": "apprafter.io", "kind": "ServiceProvider", "name": "pg", "namespace": "shop"}
+            ]}
         });
-        assert_eq!(find_apprafter_app_name(&app), Some("first".to_string()));
+        let refs = apprafter_app_refs(&app);
+        assert_eq!(
+            refs.len(),
+            2,
+            "both apprafter.io Applications, and none of the Namespace, the \
+             argoproj.io Application or the ServiceProvider"
+        );
+        assert_eq!(refs[0].name, "api");
+        assert_eq!(refs[0].namespace.as_deref(), Some("shop"));
+        assert_eq!(refs[1].name, "web");
+    }
+
+    #[test]
+    fn apprafter_app_refs_falls_back_to_the_destination_namespace() {
+        // An entry without its own namespace takes the registration's
+        // destination — the shape Argo writes before it has reconciled the
+        // object's own metadata. An explicitly empty string is the same
+        // "absent" case, not a namespace named "".
+        let app = json!({
+            "spec": {"destination": {"namespace": "fallback"}},
+            "status": {"resources": [
+                {"group": "apprafter.io", "kind": "Application", "name": "solo"},
+                {"group": "apprafter.io", "kind": "Application", "name": "blank", "namespace": ""}
+            ]}
+        });
+        let refs = apprafter_app_refs(&app);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].namespace.as_deref(), Some("fallback"));
+        assert_eq!(
+            refs[1].namespace.as_deref(),
+            Some("fallback"),
+            "an empty namespace string is absent, not a namespace named \"\""
+        );
+    }
+
+    #[test]
+    fn apprafter_app_refs_reports_an_unknown_namespace_as_none() {
+        // Neither the entry nor the registration names a namespace. The
+        // workload is still reported — dropping it would silently lose a
+        // workload, the bug class this whole function closes — but its
+        // namespace is None, and a caller must refuse rather than hand
+        // anything to `kubectl -n`. Both the absent and the empty
+        // destination are unknown.
+        for dest in [json!({}), json!({"destination": {"namespace": ""}})] {
+            let app = json!({
+                "spec": dest,
+                "status": {"resources": [
+                    {"group": "apprafter.io", "kind": "Application", "name": "orphan"}
+                ]}
+            });
+            let refs = apprafter_app_refs(&app);
+            assert_eq!(refs.len(), 1, "the workload is reported, never dropped");
+            assert_eq!(refs[0].name, "orphan");
+            assert_eq!(
+                refs[0].namespace, None,
+                "unknown must not collapse to \"\" or to a default"
+            );
+        }
+    }
+
+    #[test]
+    fn apprafter_app_refs_is_empty_before_the_first_sync() {
+        // status.resources is absent until Argo has synced once. Empty is the
+        // honest answer; callers must not read it as "not registered".
+        assert!(apprafter_app_refs(&json!({"metadata": {"name": "fresh"}})).is_empty());
+    }
+
+    #[test]
+    fn find_apprafter_app_name_still_returns_the_first() {
+        // The singular shim stays until its callers migrate. Pinning it here
+        // means a change to the plural form cannot silently alter what the
+        // not-yet-migrated callers see.
+        let app = json!({"status": {"resources": [
+            {"group": "apprafter.io", "kind": "Application", "name": "api"},
+            {"group": "apprafter.io", "kind": "Application", "name": "web"}
+        ]}});
+        assert_eq!(find_apprafter_app_name(&app).as_deref(), Some("api"));
     }
 
     #[test]
