@@ -9,6 +9,115 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.68 — `app status` speaks for every workload in the bundle (2.27b, unreleased)
+
+A manifest package is a **bundle**: one registration, 1..N workloads.
+The read surfaces collapsed that N to 1, so a second workload was
+invisible from the CLI — in this repository, `landing/web/apprafter/`
+deploys two (`landing-web`, `landing-web-preview`) and by name ordering
+the preview one could not be reached at all. This is the second of the
+three 2.27b plans; the plan gate stays open until b-3 lands.
+
+### Fixed
+
+- **`apprafter app status` reported only the FIRST workload of a bundle,
+  and said nothing about the rest.** It resolved the registration, took
+  whichever workload sorted first, and scoped every downstream read to
+  it — pods, services, claims, secret bindings, advisories. A sibling in
+  `CrashLoopBackOff` therefore printed as a clean healthy block and the
+  command gave no hint that a second workload existed.
+
+  At one workload the output is **byte-identical** to before — the same
+  function renders it, so there is nothing to re-learn for a
+  single-workload application. Above one, `status` prints a table of
+  every workload with its phase, pod counts and image, then a roll-up
+  line naming how many are not Ready and the exact command for one of
+  them.
+
+  That roll-up reads the **pod count**, not only `status.phase`. The
+  operator writes `phase: Ready` the moment it applies the Deployment,
+  so on the phase alone a CrashLooping workload still reads Ready and
+  the roll-up would have stayed silent on the very case it exists for.
+  A count that did not read is also not Ready: nothing unobserved
+  renders as fine. `0/0` is left alone, so a scaled-to-zero workload
+  does not nag.
+
+  A workload is addressed with the new **`--workload <name>`**. The
+  positional argument of `app status` is always the *application* — the
+  registration — and never a workload; `--workload` is the
+  disambiguator, in the same sense as `--env`. Both `app add` and the
+  scaffold default a registration's name to the repository basename, so
+  "the registration is named after one of its workloads" is the normal
+  state rather than an edge case, and any rule resolving the two against
+  each other would be ambiguous exactly where it is used most. A
+  selector that names nothing is an error that lists the workloads that
+  do exist; one present in prod and absent in dev annotates the dev
+  section instead of aborting the command.
+
+- **A bundle Argo CD refused rendered as `sync state: Unknown` and
+  nothing else.** Every consistency refusal the cue-cmp sidecar gained
+  in 2.27a — workloads declaring different namespaces, a duplicate
+  (namespace, name), a package-scope manifest mixed with named wrappers,
+  divergent `spec.environment`, two packages under one registration —
+  reaches the cluster as a `ComparisonError` condition. `app status`
+  never read `status.conditions[]`, so the reader was told the deploy
+  was broken and had to open the Argo CD UI or reach for `kubectl` to
+  learn why.
+
+  Conditions now render under `health:`, whole: the sidecar writes a
+  summary line plus a block naming which workloads disagree and how to
+  fix it, and the block's alignment survives. The render starts at our
+  own `::cue-cmp::` sentinel, so Argo CD's ~180-character transport
+  wrapper (`Failed to load target state: … rpc error: … exit status 1:`)
+  no longer buries the one sentence written to be the whole finding. A
+  condition Argo CD raises itself carries no sentinel and passes through
+  byte-for-byte. An application with no conditions prints nothing at
+  all, not even a header.
+
+### Changed
+
+- **`apprafter app list` shows `NAMESPACE` and `WORKLOADS`, and no
+  longer shows `PROJECT` or `REV`.** One row is still one registration —
+  a manifest with three services *is* one application — so the row now
+  says how many things it stands for; without that a 3-workload bundle
+  and a single app render identically, and every `apprafter app <verb>
+  <name>` hint the CLI prints is silently ambiguous for half the table.
+  The count needs no extra cluster read. Before the first sync it is the
+  em-dash, never `0`, which would read as "broken" for an application
+  that is merely new.
+
+  `PROJECT` is near-always `apps` and `REV` near-always the default
+  branch, so both cost width without informing. They are gone from the
+  *list*, not from the product — `app status` still prints both. `REPO`
+  drops a leading `https://` for width and is otherwise verbatim; an
+  `ssh://` remote is **not** rewritten to `https://`, because
+  `--all-managed` surfaces registrations this CLI never wrote and
+  showing one over a protocol its Argo CD does not use would be a lie.
+
+- **`app list`'s `HEALTH` now folds over every workload, and surfaces a
+  rollback pin the Argo CD tile hides.** When the workloads agree the
+  cell is that single word, exactly as before — which is today's entire
+  fleet, so nothing changes for a single-workload application. When they
+  disagree it reads `Degraded 1/3`, because `Degraded` alone cannot tell
+  1-of-3 from 3-of-3 and the difference is a bad deploy versus an
+  outage. A `· 1 pinned` suffix is added when a workload is held at a
+  digest by `apprafter app rollback` and the pin is not already the
+  aggregate: `Suspended` is the second-healthiest of Argo CD's codes, so
+  it overrides `Healthy` and nothing else, and a single `Progressing`
+  sibling hides the pin on the Argo CD tile. `app list` is the only
+  listing in the product where a pin surfaces at all. A code the ranking
+  does not recognise sorts **worst**, so it is the word printed rather
+  than something hidden behind a majority.
+
+  **`HEALTH` still does not see pod state**, and this release does not
+  change that. It is Argo CD's verdict on the `Application` CRs, and the
+  chart's health script reads only `status.phase` — which the operator
+  sets to `Ready` as soon as it applies the Deployment, so a
+  CrashLooping application has always rendered `Healthy` here and still
+  does. That limit is older, lives in the chart, and is out of scope
+  here. A one-line footer under the table now says so and names the
+  command that does read pods: `apprafter app status <name>`.
+
 ## cli v0.2.67 — a `--data-only` restore no longer loads a database under live pods (2.27b, unreleased)
 
 One data-integrity fix, and three internal changes that change no
