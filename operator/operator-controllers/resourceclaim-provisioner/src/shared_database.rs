@@ -459,16 +459,17 @@ pub async fn reconcile_shared_database(
 
     match sd.spec.type_.as_str() {
         "pg" => reconcile_pg(&sd, &ctx, &ns, &name, &prior).await,
+        "redis" => reconcile_redis(&sd, &ctx, &ns, &name, &prior).await,
         other => {
-            // Not an error to requeue on: the spec is fixed until a human
-            // changes it, so say what is missing and wait for the change.
-            // `redis` lands with the rest of 2.29e; the CRD enum already
-            // bounds this to the two, so `other` is `redis` today.
-            warn!(%name, %ns, type_ = %other, "SharedDatabase type not yet wired");
+            // Unreachable through the CRD, whose enum bounds the field to the
+            // two above — but a controller that pattern-matches a string must
+            // still say something when the string is neither, and "not
+            // provisioned yet" is more use than a silent requeue.
+            warn!(%name, %ns, type_ = %other, "SharedDatabase type not wired");
             let cond = ready_condition(
                 "False",
                 "UnsupportedType",
-                &format!("shared databases of type {other:?} are not provisioned yet"),
+                &format!("shared databases of type {other:?} are not provisioned"),
                 prior.as_slice(),
             );
             write_status(
@@ -705,6 +706,153 @@ async fn reconcile_pg(
         ref_count,
         cond,
         ext_cond,
+    )
+    .await?;
+    Ok(Action::requeue(Duration::from_secs(300)))
+}
+
+/// The redis arm: pool instance → a `$N` of its own → status.
+///
+/// No ACL user is created here. A shared cache's consumers each get their own
+/// (`bind_redis_consumer`), all pinned to this one `$N` and all sharing one
+/// channel prefix — the prefix is per DATABASE rather than per user because
+/// Dragonfly channels are not `$N`-scoped, so a per-user prefix would leave
+/// two consumers of one cache unable to pub/sub to each other.
+async fn reconcile_redis(
+    sd: &SharedDatabase,
+    ctx: &Arc<Context>,
+    ns: &str,
+    name: &str,
+    prior: &[SharedDatabaseCondition],
+) -> Result<Action, ReconcileError> {
+    let providers: Vec<ServiceProvider> = Api::<ServiceProvider>::all(ctx.client.clone())
+        .list(&Default::default())
+        .await?
+        .items;
+    let candidates: Vec<Candidate> = providers.iter().map(Candidate::from_provider).collect();
+    let selector = sd.spec.selector.clone().unwrap_or_default();
+    let Some(provider_name) = select_provider("redis", &selector, &candidates) else {
+        let cond = ready_condition(
+            "False",
+            "NoProvider",
+            "no redis ServiceProvider matches this SharedDatabase's selector",
+            prior,
+        );
+        write_status(
+            ctx,
+            ns,
+            name,
+            false,
+            &Backing::default(),
+            current_ref_count(&ctx.client, ns, name).await?,
+            cond,
+            None,
+        )
+        .await?;
+        return Ok(Action::requeue(Duration::from_secs(60)));
+    };
+    let Some(provider) = providers
+        .into_iter()
+        .find(|p| p.name_any() == provider_name)
+    else {
+        return Ok(Action::requeue(Duration::from_secs(60)));
+    };
+
+    let persistent = sd.spec.persistent.unwrap_or(false);
+    let pool = crate::reconcile::ensure_dragonfly_instance(ctx, &provider, persistent).await?;
+
+    // Reuse this database's OWN allocation before consulting the allocator.
+    // Without the short-circuit a re-reconcile would see its own `$N` in the
+    // reserved set, call it taken, and move the database to a different one —
+    // leaving every bound consumer pinned to a keyspace nobody writes to.
+    let existing = sd
+        .status
+        .as_ref()
+        .and_then(|st| match (st.instance.as_deref(), st.dbnum) {
+            (Some(i), Some(n)) if i == pool.instance => u16::try_from(n).ok(),
+            _ => None,
+        });
+
+    let dbnum = match existing {
+        Some(n) => n,
+        None => {
+            let live: Vec<ResourceClaim> = Api::<ResourceClaim>::all(ctx.client.clone())
+                .list(&Default::default())
+                .await?
+                .items;
+            let retained: Vec<operator_core::RetainedClaim> =
+                Api::<operator_core::RetainedClaim>::namespaced(
+                    ctx.client.clone(),
+                    crate::reconcile::RETAINED_CLAIM_NAMESPACE,
+                )
+                .list(&Default::default())
+                .await?
+                .items;
+            let shared: Vec<SharedDatabase> = Api::<SharedDatabase>::all(ctx.client.clone())
+                .list(&Default::default())
+                .await?
+                .items;
+            let used = crate::dragonfly::used_dbnums(&live, &retained, &shared, &pool.instance);
+            let Some(n) = crate::dragonfly::allocate_dbnum(&used, pool.dbnum_max) else {
+                let cond = ready_condition(
+                    "False",
+                    "InsufficientCapacity",
+                    &format!(
+                        "every one of {}'s {} logical databases is taken — the pool needs \
+                         another instance",
+                        pool.instance, pool.dbnum_max
+                    ),
+                    prior,
+                );
+                write_status(
+                    ctx,
+                    ns,
+                    name,
+                    false,
+                    &Backing::default(),
+                    current_ref_count(&ctx.client, ns, name).await?,
+                    cond,
+                    None,
+                )
+                .await?;
+                return Ok(Action::requeue(Duration::from_secs(120)));
+            };
+            // Recycle-safety (ADR 0042 §3): a reused `$N` must start empty, or
+            // the first consumer of this shared cache reads a departed
+            // tenant's keys. Only on a FRESH allocation — flushing an existing
+            // one would wipe the data this database exists to hold.
+            let addr = crate::dragonfly::instance_addr(&pool.instance, &pool.df_ns);
+            let admin_pw = crate::acl_reconcile::read_secret_key(
+                ctx,
+                &pool.df_ns,
+                &crate::dragonfly::admin_secret_name(&pool.instance),
+                "password",
+            )
+            .await?;
+            ctx.redis
+                .flushdb(&addr, &admin_pw, n)
+                .await
+                .map_err(|e| ReconcileError::Provisioning(format!("flushdb ${n}: {e}")))?;
+            n
+        }
+    };
+
+    let ref_count = current_ref_count(&ctx.client, ns, name).await?;
+    let cond = ready_condition(
+        "True",
+        "Provisioned",
+        &format!("${dbnum} on {} ({})", pool.instance, pool.df_ns),
+        prior,
+    );
+    write_status(
+        ctx,
+        ns,
+        name,
+        true,
+        &Backing::redis(&pool.instance, i64::from(dbnum)),
+        ref_count,
+        cond,
+        None,
     )
     .await?;
     Ok(Action::requeue(Duration::from_secs(300)))
@@ -996,6 +1144,171 @@ pub async fn bind_pg_consumer(
         cond,
         crate::reconcile::ClaimStatusFields {
             conn_secret_name: Some(&conn_secret_name),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(Action::requeue(Duration::from_secs(300)))
+}
+
+/// Bind ONE consumer claim to an existing shared redis keyspace
+/// (ADR 0066 §3.2).
+///
+/// The consumer gets its own ACL user, pinned to the database's `$N` and
+/// scoped to the database's SHARED channel prefix — not its own. Dragonfly
+/// channels are not `$N`-scoped, so a per-user prefix (what an owned claim
+/// gets) would leave two consumers of one cache unable to publish to each
+/// other, which is most of what sharing a cache is for.
+pub async fn bind_redis_consumer(
+    ctx: &Arc<Context>,
+    claim: &Arc<ResourceClaim>,
+    ns: &str,
+    name: &str,
+    provider: &ServiceProvider,
+) -> Result<Action, ReconcileError> {
+    let prior: Vec<operator_core::ResourceClaimCondition> = claim
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.clone())
+        .unwrap_or_default();
+    let shared_name = claim
+        .spec
+        .shared_ref
+        .as_deref()
+        .ok_or_else(|| ReconcileError::Provisioning("bind called without sharedRef".into()))?;
+
+    let sd_api: Api<SharedDatabase> = Api::namespaced(ctx.client.clone(), ns);
+    let Some(sd) = sd_api.get_opt(shared_name).await? else {
+        let cond = crate::reconcile::ready_condition(
+            "False",
+            REASON_AWAITING_SHARED_DATABASE,
+            &format!("no SharedDatabase {shared_name:?} in namespace {ns}"),
+            &prior,
+        );
+        crate::reconcile::patch_status(&ctx.client, ns, name, cond, Default::default()).await?;
+        return Ok(Action::requeue(Duration::from_secs(30)));
+    };
+    let st = sd.status.as_ref();
+    let (Some(true), Some(instance), Some(dbnum)) = (
+        st.and_then(|s| s.ready),
+        st.and_then(|s| s.instance.clone()),
+        st.and_then(|s| s.dbnum).and_then(|n| u16::try_from(n).ok()),
+    ) else {
+        let cond = crate::reconcile::ready_condition(
+            "False",
+            REASON_AWAITING_SHARED_DATABASE,
+            &format!("SharedDatabase {shared_name:?} is not ready yet"),
+            &prior,
+        );
+        crate::reconcile::patch_status(&ctx.client, ns, name, cond, Default::default()).await?;
+        return Ok(Action::requeue(Duration::from_secs(20)));
+    };
+
+    let cfg = provider.spec.config.clone().unwrap_or_else(|| json!({}));
+    let df_ns = cfg
+        .pointer("/namespace")
+        .and_then(Value::as_str)
+        .unwrap_or("dragonfly-system")
+        .to_string();
+
+    let user = crate::dragonfly::acl_user(ns, name);
+    let conn_secret_name = crate::reconcile::connection_secret_name(name);
+    let conn_api: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), ns, &crate::reconcile::secret_ar());
+    // Same read-or-generate as the pg bind, and for the same reason: an
+    // owned claim can regenerate per reconcile because it also rewrites its
+    // Secret in the same pass with nobody else reading the old value, whereas
+    // here the re-pin and the Secret write are two steps with a window
+    // between them.
+    let password = match conn_api.get_opt(&conn_secret_name).await? {
+        Some(existing) => read_secret_string(&existing, "pass")
+            .unwrap_or_else(crate::reconcile::generate_password),
+        None => crate::reconcile::generate_password(),
+    };
+
+    let access = match claim.spec.access.as_deref() {
+        // Anything unrecognised is the LESSER privilege, matching
+        // `shared_pg::Access::from_spec`: the webhook bounds the field to the
+        // two, so an unexpected value means something upstream is wrong, and
+        // the safe reading of that is read-only.
+        Some("rw") | None => crate::dragonfly::SharedAccess::ReadWrite,
+        Some(_) => crate::dragonfly::SharedAccess::ReadOnly,
+    };
+    let channel_prefix = shd_database_name(ns, shared_name);
+    let args = crate::dragonfly::acl_setuser_args_scoped(
+        &user,
+        &password,
+        dbnum,
+        Some(&channel_prefix),
+        access,
+    );
+
+    let addr = crate::dragonfly::instance_addr(&instance, &df_ns);
+    let admin_pw = crate::acl_reconcile::read_secret_key(
+        ctx,
+        &df_ns,
+        &crate::dragonfly::admin_secret_name(&instance),
+        "password",
+    )
+    .await?;
+    if let Err(e) = ctx.redis.acl_setuser(&addr, &admin_pw, &args).await {
+        warn!(%name, %ns, error = %e, "binding the cache consumer failed");
+        let cond = crate::reconcile::ready_condition(
+            "False",
+            REASON_AWAITING_SHARED_DATABASE,
+            &format!("could not bind to {shared_name:?}: {e}"),
+            &prior,
+        );
+        crate::reconcile::patch_status(&ctx.client, ns, name, cond, Default::default()).await?;
+        return Ok(Action::requeue(Duration::from_secs(20)));
+    }
+
+    let redis_host = format!("{instance}.{df_ns}.svc");
+    let owner_uid = claim.metadata.uid.clone().unwrap_or_default();
+    let conn_secret = crate::reconcile::redis_connection_secret_object(
+        &conn_secret_name,
+        ns,
+        &user,
+        &password,
+        &redis_host,
+        6379,
+        dbnum,
+        // The SHARED prefix, so what the application is told to prefix its
+        // channels with is the same thing the ACL above actually allows.
+        &format!("{channel_prefix}:"),
+        &owner_uid,
+        name,
+    );
+    conn_api
+        .patch(
+            &conn_secret_name,
+            &apply_params(),
+            &Patch::Apply(&conn_secret),
+        )
+        .await?;
+
+    let level = match access {
+        crate::dragonfly::SharedAccess::ReadWrite => "rw",
+        crate::dragonfly::SharedAccess::ReadOnly => "ro",
+    };
+    info!(%name, %ns, %shared_name, %user, dbnum, %level, "bound consumer to shared cache");
+    let cond = crate::reconcile::ready_condition(
+        "True",
+        "Provisioned",
+        &format!("bound to shared cache {shared_name:?} (${dbnum} on {instance}) as {level}"),
+        &prior,
+    );
+    crate::reconcile::patch_status(
+        &ctx.client,
+        ns,
+        name,
+        cond,
+        crate::reconcile::ClaimStatusFields {
+            conn_secret_name: Some(&conn_secret_name),
+            // The consumer does NOT own this allocation — the SharedDatabase
+            // does. Publishing it on the claim would put the same `$N` in two
+            // places the allocator reads, and a claim that outlived its
+            // database would then reserve a keyspace nothing owns.
             ..Default::default()
         },
     )

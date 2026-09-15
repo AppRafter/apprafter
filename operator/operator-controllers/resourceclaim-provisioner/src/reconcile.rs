@@ -56,7 +56,7 @@ const COND_READY: &str = "Ready";
 /// 7-day-grace GC always fires even if the app's own namespace is torn
 /// down (Phase 2.4f, decision 1). The lineage is preserved in
 /// `spec.claimRef`.
-const RETAINED_CLAIM_NAMESPACE: &str = "apprafter-system";
+pub(crate) const RETAINED_CLAIM_NAMESPACE: &str = "apprafter-system";
 
 /// CNPG cluster + namespace the finalizer snapshot falls back to when
 /// the matched provider config is missing them. Mirrors the
@@ -470,6 +470,10 @@ pub async fn reconcile(
             Some(Backend::Cloudnativepg) => {
                 crate::shared_database::bind_pg_consumer(&ctx, &claim, &ns, &name, &provider).await
             }
+            Some(Backend::Dragonfly) => {
+                crate::shared_database::bind_redis_consumer(&ctx, &claim, &ns, &name, &provider)
+                    .await
+            }
             other => {
                 warn!(
                     %name, %ns, backend = %provider.spec.backend,
@@ -499,6 +503,170 @@ pub async fn reconcile(
             Ok(Action::requeue(Duration::from_secs(300)))
         }
     }
+}
+
+/// A Dragonfly pool instance, brought up and ready to allocate a `$N` on.
+pub(crate) struct DragonflyPool {
+    pub instance: String,
+    pub df_ns: String,
+    /// The allocator's upper bound, from the provider config.
+    pub dbnum_max: u16,
+}
+
+/// Lazily bring up the pool instance for `persistent` and return its
+/// coordinates (ADR 0042 §3).
+///
+/// Extracted from `provision_dragonfly` when the `SharedDatabase` controller
+/// needed the same thing (2.29 / ADR 0066): a shared cache takes a `$N` on the
+/// SAME pool instances an owned claim does, so if the two paths brought an
+/// instance up differently, whichever ran second would apply a `Dragonfly` CR
+/// contradicting the first and roll the StatefulSet under a live tenant.
+///
+/// Idempotent, and deliberately not uniformly so: the CR apply is an
+/// unconditional SSA (a re-apply of identical content is a no-op), while both
+/// Secrets are CREATE-IF-ABSENT because their contents are generated and an
+/// apply would rotate them on every reconcile.
+pub(crate) async fn ensure_dragonfly_instance(
+    ctx: &Arc<Context>,
+    provider: &ServiceProvider,
+    persistent: bool,
+) -> Result<DragonflyPool, ReconcileError> {
+    let cfg = provider.spec.config.clone().unwrap_or_else(|| json!({}));
+    let df_ns = cfg
+        .pointer("/namespace")
+        .and_then(Value::as_str)
+        .unwrap_or("dragonfly-system")
+        .to_string();
+    let dbnum_max = cfg
+        .pointer("/dbnum")
+        .and_then(Value::as_u64)
+        .unwrap_or(1024) as u16;
+    let num_shards = cfg
+        .pointer("/numShards")
+        .and_then(Value::as_u64)
+        .unwrap_or(1) as u16;
+    // Instance replica count. MUST be >= 1 — the dragonfly-operator does not
+    // default it, so 0 means no instance pod (see dragonfly_object). Tier-1 =
+    // single instance; HA tiers raise it via the provider config `replicas`.
+    let replicas = cfg
+        .pointer("/replicas")
+        .and_then(Value::as_u64)
+        .filter(|n| *n >= 1)
+        .unwrap_or(1) as u16;
+
+    // Guaranteed backend resources (2.16d): per-field override from the
+    // provider config (`/resources/*`), else the T1 Guaranteed baseline
+    // (cpu 50m, memory 320Mi req==limit above the ADR-0042 ~287MB floor).
+    // `dragonfly_object` emits `spec.resources` (requests==limits) and the
+    // `--maxmemory` RSS cap; `shared_buffers` on `BackendResources` is a
+    // Postgres-ism Dragonfly ignores and is left at its default.
+    let default_res = cnpg::BackendResources::dragonfly_t1();
+    let res = cnpg::BackendResources {
+        cpu: cfg
+            .pointer("/resources/cpu")
+            .and_then(Value::as_str)
+            .unwrap_or(&default_res.cpu)
+            .to_string(),
+        memory: cfg
+            .pointer("/resources/memory")
+            .and_then(Value::as_str)
+            .unwrap_or(&default_res.memory)
+            .to_string(),
+        ephemeral_storage: cfg
+            .pointer("/resources/ephemeralStorage")
+            .and_then(Value::as_str)
+            .unwrap_or(&default_res.ephemeral_storage)
+            .to_string(),
+        shared_buffers: default_res.shared_buffers.clone(),
+    };
+
+    let instance = dragonfly::pool_instance_name(persistent, POOL_INSTANCE_INDEX);
+
+    // 1. Lazily SSA-apply the per-instance admin Secret then the shared
+    //    `Dragonfly` CR. First claim of a class creates both; later claims
+    //    no-op the apply. `generate_password()` returns a fresh random
+    //    value on every call, so an unconditional `Patch::Apply` would
+    //    clobber any existing `stringData.password` (SSA overwrites whatever
+    //    the field manager sends). Hence read-or-create: only apply the
+    //    admin Secret when it is absent, so an established password survives
+    //    re-reconciles.
+    let admin_secret_name = dragonfly::admin_secret_name(&instance);
+    let secret_api: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), &df_ns, &secret_ar());
+    if secret_api.get_opt(&admin_secret_name).await?.is_none() {
+        let admin_pw = generate_password();
+        let admin_secret = dragonfly::admin_secret_object(&admin_secret_name, &df_ns, &admin_pw);
+        secret_api
+            .patch(
+                &admin_secret_name,
+                &apply_params(),
+                &Patch::Apply(&admin_secret),
+            )
+            .await?;
+        info!(%instance, %df_ns, "created Dragonfly admin password Secret");
+    }
+
+    // 1b. Seed the ACL file BEFORE the CR names it, so a new instance is BORN
+    //     loading one (ADR 0042 §10).
+    //
+    //     WHY THIS IS NOT "the loop writes it": if the CR is created without
+    //     `aclFromSecret` and the loop adds the field a moment later, the
+    //     dragonfly-operator rolls the StatefulSet — so the FIRST claim on a
+    //     fresh instance would be handed a connection Secret and then have its
+    //     instance restarted out from under it, seconds later. The walk caught
+    //     exactly that. Seeding here means a fresh instance never rolls for
+    //     this reason at all; the one-time roll is left where it belongs, on
+    //     instances that predate the feature.
+    //
+    //     CREATE-IF-ABSENT, never overwrite. The resync loop owns the file's
+    //     CONTENTS and is still its only writer — this seeds a default-only
+    //     file so the mount has something to point at, and the loop adds the
+    //     tenant lines on its next pass. Overwriting here would make the
+    //     provisioner a second content writer, which is what one-writer
+    //     exists to prevent.
+    //
+    //     Ordering is not cosmetic: the operator never sets
+    //     `SecretVolumeSource.Optional`, so a CR naming a Secret that does not
+    //     exist yields a pod that cannot start.
+    let acl_secret_name = dragonfly::acl_secret_name(&instance);
+    if secret_api.get_opt(&acl_secret_name).await?.is_none() {
+        let admin_pw =
+            crate::acl_reconcile::read_secret_key(ctx, &df_ns, &admin_secret_name, "password")
+                .await?;
+        match dragonfly::acl_file_contents(&admin_pw, &[]) {
+            Ok(contents) => {
+                let obj = dragonfly::acl_secret_object(&acl_secret_name, &df_ns, &contents);
+                secret_api
+                    .patch(&acl_secret_name, &apply_params(), &Patch::Apply(&obj))
+                    .await?;
+                info!(%instance, %df_ns, "seeded the instance ACL file (default line only)");
+            }
+            Err(err) => {
+                // Cannot happen with a generated password, but a file without
+                // a `default` line would DISABLE authentication on the shared
+                // instance — so refuse to create the CR rather than create one
+                // pointing at a Secret we could not build.
+                return Err(ReconcileError::Provisioning(format!(
+                    "refusing to seed the ACL file for {instance}: {err}"
+                )));
+            }
+        }
+    }
+
+    let df_api: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), &df_ns, &dragonfly_cluster_ar());
+    let df_body = dragonfly::dragonfly_object(
+        &instance, &df_ns, dbnum_max, num_shards, replicas, persistent, &res,
+    );
+    df_api
+        .patch(&instance, &apply_params(), &Patch::Apply(&df_body))
+        .await?;
+
+    Ok(DragonflyPool {
+        instance,
+        df_ns,
+        dbnum_max,
+    })
 }
 
 /// Error policy: increment error metrics and requeue after 30 seconds.
@@ -787,141 +955,18 @@ async fn provision_dragonfly(
     name: &str,
     provider: &ServiceProvider,
 ) -> Result<Action, ReconcileError> {
-    let cfg = provider.spec.config.clone().unwrap_or_else(|| json!({}));
-    let df_ns = cfg
-        .pointer("/namespace")
-        .and_then(Value::as_str)
-        .unwrap_or("dragonfly-system")
-        .to_string();
-    let dbnum_max = cfg
-        .pointer("/dbnum")
-        .and_then(Value::as_u64)
-        .unwrap_or(1024) as u16;
-    let num_shards = cfg
-        .pointer("/numShards")
-        .and_then(Value::as_u64)
-        .unwrap_or(1) as u16;
-    // Instance replica count. MUST be >= 1 — the dragonfly-operator does not
-    // default it, so 0 means no instance pod (see dragonfly_object). Tier-1 =
-    // single instance; HA tiers raise it via the provider config `replicas`.
-    let replicas = cfg
-        .pointer("/replicas")
-        .and_then(Value::as_u64)
-        .filter(|n| *n >= 1)
-        .unwrap_or(1) as u16;
-
-    // Guaranteed backend resources (2.16d): per-field override from the
-    // provider config (`/resources/*`), else the T1 Guaranteed baseline
-    // (cpu 50m, memory 320Mi req==limit above the ADR-0042 ~287MB floor).
-    // `dragonfly_object` emits `spec.resources` (requests==limits) and the
-    // `--maxmemory` RSS cap; `shared_buffers` on `BackendResources` is a
-    // Postgres-ism Dragonfly ignores and is left at its default.
-    let default_res = cnpg::BackendResources::dragonfly_t1();
-    let res = cnpg::BackendResources {
-        cpu: cfg
-            .pointer("/resources/cpu")
-            .and_then(Value::as_str)
-            .unwrap_or(&default_res.cpu)
-            .to_string(),
-        memory: cfg
-            .pointer("/resources/memory")
-            .and_then(Value::as_str)
-            .unwrap_or(&default_res.memory)
-            .to_string(),
-        ephemeral_storage: cfg
-            .pointer("/resources/ephemeralStorage")
-            .and_then(Value::as_str)
-            .unwrap_or(&default_res.ephemeral_storage)
-            .to_string(),
-        shared_buffers: default_res.shared_buffers.clone(),
-    };
-
-    // Persistence class is carried on the claim (the Application controller
-    // copies `needs.<type>.persistent` onto the generated claim spec, 2.4d).
+    // Steps 1 / 1b / the CR apply live in `ensure_dragonfly_instance`, shared
+    // with the SharedDatabase controller (2.29): a shared cache occupies a
+    // `$N` on the SAME pool instances, so both paths must bring an instance up
+    // the same way or the second one to run would apply a CR that disagrees
+    // with the first.
     let persistent = claim.spec.persistent.unwrap_or(false);
-    let instance = dragonfly::pool_instance_name(persistent, POOL_INSTANCE_INDEX);
-
+    let DragonflyPool {
+        instance,
+        df_ns,
+        dbnum_max,
+    } = ensure_dragonfly_instance(ctx, provider, persistent).await?;
     info!(%name, %ns, %instance, %df_ns, persistent, "provisioning dragonfly claim");
-
-    // 1. Lazily SSA-apply the per-instance admin Secret then the shared
-    //    `Dragonfly` CR. First claim of a class creates both; later claims
-    //    no-op the apply. `generate_password()` returns a fresh random
-    //    value on every call, so an unconditional `Patch::Apply` would
-    //    clobber any existing `stringData.password` (SSA overwrites whatever
-    //    the field manager sends). Hence read-or-create: only apply the
-    //    admin Secret when it is absent, so an established password survives
-    //    re-reconciles.
-    let admin_secret_name = dragonfly::admin_secret_name(&instance);
-    let secret_api: Api<DynamicObject> =
-        Api::namespaced_with(ctx.client.clone(), &df_ns, &secret_ar());
-    if secret_api.get_opt(&admin_secret_name).await?.is_none() {
-        let admin_pw = generate_password();
-        let admin_secret = dragonfly::admin_secret_object(&admin_secret_name, &df_ns, &admin_pw);
-        secret_api
-            .patch(
-                &admin_secret_name,
-                &apply_params(),
-                &Patch::Apply(&admin_secret),
-            )
-            .await?;
-        info!(%instance, %df_ns, "created Dragonfly admin password Secret");
-    }
-
-    // 1b. Seed the ACL file BEFORE the CR names it, so a new instance is BORN
-    //     loading one (ADR 0042 §10).
-    //
-    //     WHY THIS IS NOT "the loop writes it": if the CR is created without
-    //     `aclFromSecret` and the loop adds the field a moment later, the
-    //     dragonfly-operator rolls the StatefulSet — so the FIRST claim on a
-    //     fresh instance would be handed a connection Secret and then have its
-    //     instance restarted out from under it, seconds later. The walk caught
-    //     exactly that. Seeding here means a fresh instance never rolls for
-    //     this reason at all; the one-time roll is left where it belongs, on
-    //     instances that predate the feature.
-    //
-    //     CREATE-IF-ABSENT, never overwrite. The resync loop owns the file's
-    //     CONTENTS and is still its only writer — this seeds a default-only
-    //     file so the mount has something to point at, and the loop adds the
-    //     tenant lines on its next pass. Overwriting here would make the
-    //     provisioner a second content writer, which is what one-writer
-    //     exists to prevent.
-    //
-    //     Ordering is not cosmetic: the operator never sets
-    //     `SecretVolumeSource.Optional`, so a CR naming a Secret that does not
-    //     exist yields a pod that cannot start.
-    let acl_secret_name = dragonfly::acl_secret_name(&instance);
-    if secret_api.get_opt(&acl_secret_name).await?.is_none() {
-        let admin_pw =
-            crate::acl_reconcile::read_secret_key(ctx, &df_ns, &admin_secret_name, "password")
-                .await?;
-        match dragonfly::acl_file_contents(&admin_pw, &[]) {
-            Ok(contents) => {
-                let obj = dragonfly::acl_secret_object(&acl_secret_name, &df_ns, &contents);
-                secret_api
-                    .patch(&acl_secret_name, &apply_params(), &Patch::Apply(&obj))
-                    .await?;
-                info!(%instance, %df_ns, "seeded the instance ACL file (default line only)");
-            }
-            Err(err) => {
-                // Cannot happen with a generated password, but a file without
-                // a `default` line would DISABLE authentication on the shared
-                // instance — so refuse to create the CR rather than create one
-                // pointing at a Secret we could not build.
-                return Err(ReconcileError::Provisioning(format!(
-                    "refusing to seed the ACL file for {instance}: {err}"
-                )));
-            }
-        }
-    }
-
-    let df_api: Api<DynamicObject> =
-        Api::namespaced_with(ctx.client.clone(), &df_ns, &dragonfly_cluster_ar());
-    let df_body = dragonfly::dragonfly_object(
-        &instance, &df_ns, dbnum_max, num_shards, replicas, persistent, &res,
-    );
-    df_api
-        .patch(&instance, &apply_params(), &Patch::Apply(&df_body))
-        .await?;
 
     // 2. Allocate a numbered logical DB.
     //
@@ -1034,7 +1079,11 @@ async fn provision_dragonfly(
     //    data we are recovering), then ACL SETUSER the `$N`-pinned,
     //    keyspace-isolated user with a fresh password.
     let addr = dragonfly::instance_addr(&instance, &df_ns);
-    let admin_pw = read_admin_password(ctx, &df_ns, &admin_secret_name).await?;
+    // Derived rather than threaded out of `ensure_dragonfly_instance`: the
+    // name is a pure function of the instance, so recomputing it cannot drift
+    // from what that function created, while an extra returned field could.
+    let admin_pw =
+        read_admin_password(ctx, &df_ns, &dragonfly::admin_secret_name(&instance)).await?;
     let user = dragonfly::acl_user(ns, name);
     let claim_pw = generate_password();
 
