@@ -298,6 +298,27 @@ phase "Phase 3: apprafter db create — a shared pg database with pgvector"
 apprafter db create "$PG_DB" --type pg --extension vector --extension pg_trgm \
     -n "$APP_NS" || die "apprafter db create"
 
+# BEFORE readiness: the object must SAY something. A reconcile that fails and
+# returns a bare error leaves a SharedDatabase carrying a finalizer and no
+# status at all — neither ready nor explained, with the reason living only in
+# the operator's log. That is exactly how this walk's first run failed, and a
+# readiness wait alone reports it as "never became ready: / " with two empty
+# fields. Assert the condition exists on its own, so the next regression of
+# this shape is named rather than inferred.
+printf '  waiting for the database to report SOMETHING ...\n'
+_deadline=$(( $(date +%s) + 120 ))
+while [ "$(date +%s)" -lt "$_deadline" ]; do
+    FIRST_REASON=$(cond_reason "$SHDB_RES" "$APP_NS" "$PG_DB" Ready)
+    [ -n "$FIRST_REASON" ] && break
+    sleep 5
+done
+if [ -z "$FIRST_REASON" ]; then
+    printf '    object as stored: %s\n' \
+        "$(kubectl -n "$APP_NS" get "$SHDB_RES" "$PG_DB" -o jsonpath='{.status}' 2>/dev/null)" >&2
+    die "the database carries no Ready condition — it is neither ready nor explained"
+fi
+printf '  ok: the database reports a Ready condition (%s) while it works\n' "$FIRST_REASON"
+
 wait_jsonpath "$SHDB_RES" "$APP_NS" "$PG_DB" '{.status.ready}' true 420 \
     || die "the shared pg database never became ready: $(cond_reason "$SHDB_RES" "$APP_NS" "$PG_DB" Ready) / $(cond_message "$SHDB_RES" "$APP_NS" "$PG_DB" Ready)"
 

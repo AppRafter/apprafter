@@ -545,6 +545,13 @@ async fn reconcile_pg(
         .unwrap_or(DEFAULT_CNPG_NAMESPACE)
         .to_string();
 
+    // The shared CNPG Cluster, lazily. This line is the walk's first finding:
+    // without it the next step's GET on the Cluster 404s on any cluster where
+    // no owned pg claim has ever run, and the database never provisions. It
+    // WORKED wherever an owned claim had already created it, which is why
+    // nothing short of a fresh-cluster walk distinguishes the two.
+    crate::reconcile::ensure_cnpg_cluster(ctx, &cfg, &cluster, &cnpg_ns).await?;
+
     // The platform role. One per CLUSTER, created through CNPG's
     // `managed.roles` so its password lives in a Secret CNPG reloads — and
     // NOT through SQL, because something has to be able to run the first
@@ -564,7 +571,38 @@ async fn reconcile_pg(
             .await?;
         info!(%cluster, %cnpg_ns, "created the platform role password Secret");
     }
-    crate::reconcile::upsert_platform_role(ctx, &cnpg_ns, &cluster, &pw_secret_name).await?;
+    // A failure here is reported ON THE OBJECT rather than returned.
+    //
+    // The walk's second finding: when this was `?`, a `Cluster` that did not
+    // yet exist produced an error the reconcile loop logged and retried, and
+    // the SharedDatabase carried a finalizer and NO STATUS AT ALL. An operator
+    // saw an object that was neither ready nor explained, and the only place
+    // the reason existed was the operator's log — which is precisely the
+    // shape this project treats as a bug rather than as terseness.
+    if let Err(e) =
+        crate::reconcile::upsert_platform_role(ctx, &cnpg_ns, &cluster, &pw_secret_name).await
+    {
+        warn!(%name, %ns, error = %e, "the shared cluster is not ready for the platform role yet");
+        let cond = ready_condition(
+            "False",
+            REASON_AWAITING_CLUSTER,
+            &format!("waiting for the shared PostgreSQL cluster {cluster} in {cnpg_ns} to come up"),
+            prior,
+        );
+        write_status(
+            ctx,
+            sd,
+            ns,
+            name,
+            false,
+            None,
+            current_ref_count(&ctx.client, ns, name).await?,
+            cond,
+            None,
+        )
+        .await?;
+        return Ok(Action::requeue(Duration::from_secs(20)));
+    }
 
     // The cluster must be answering before any SQL runs. Read the password
     // back rather than reusing the one generated above: on every reconcile

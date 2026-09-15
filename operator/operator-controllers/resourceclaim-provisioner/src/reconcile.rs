@@ -526,6 +526,68 @@ pub async fn reconcile(
     }
 }
 
+/// Lazily SSA-apply the shared CNPG `Cluster`, sole-owned by this operator.
+///
+/// The first pg claim on a cluster creates `platform-postgres`; every later
+/// apply is a no-op. Extracted from `provision_cloudnativepg` when the
+/// `SharedDatabase` controller turned out to need it too — and it turned out
+/// to need it the hard way.
+///
+/// The shared path originally went straight to creating the platform role,
+/// which does a GET on the Cluster. On a cluster where an owned pg claim had
+/// already run that GET succeeds and everything works; on a fresh one it
+/// 404s and the database never provisions. A walk on a fresh cluster is the
+/// only thing that distinguishes those two, which is the argument for running
+/// one.
+pub(crate) async fn ensure_cnpg_cluster(
+    ctx: &Arc<Context>,
+    cfg: &Value,
+    cluster: &str,
+    cnpg_ns: &str,
+) -> Result<(), ReconcileError> {
+    let instances = cfg
+        .pointer("/instances")
+        .and_then(Value::as_i64)
+        .unwrap_or(1);
+    let storage = cfg
+        .pointer("/storage")
+        .and_then(Value::as_str)
+        .unwrap_or("10Gi")
+        .to_string();
+    // Guaranteed backend resources (2.16d): per-field override from the
+    // provider config, else the T1 Guaranteed baseline. requests==limits and
+    // `shared_buffers` coherent with `memory` — CNPG >=1.19's webhook rejects
+    // an incoherent pair.
+    let default_res = cnpg::BackendResources::cnpg_t1();
+    let res = cnpg::BackendResources {
+        cpu: cfg
+            .pointer("/resources/cpu")
+            .and_then(Value::as_str)
+            .unwrap_or(&default_res.cpu)
+            .to_string(),
+        memory: cfg
+            .pointer("/resources/memory")
+            .and_then(Value::as_str)
+            .unwrap_or(&default_res.memory)
+            .to_string(),
+        ephemeral_storage: cfg
+            .pointer("/resources/ephemeralStorage")
+            .and_then(Value::as_str)
+            .unwrap_or(&default_res.ephemeral_storage)
+            .to_string(),
+        shared_buffers: cfg
+            .pointer("/resources/sharedBuffers")
+            .and_then(Value::as_str)
+            .unwrap_or(&default_res.shared_buffers)
+            .to_string(),
+    };
+    let api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), cnpg_ns, &cluster_ar());
+    let body = cnpg::cluster_object(cluster, cnpg_ns, instances, &storage, &res);
+    api.patch(cluster, &apply_params(), &Patch::Apply(&body))
+        .await?;
+    Ok(())
+}
+
 /// A Dragonfly pool instance, brought up and ready to allocate a `$N` on.
 pub(crate) struct DragonflyPool {
     pub instance: String,
@@ -729,54 +791,14 @@ async fn provision_cloudnativepg(
         .and_then(Value::as_str)
         .unwrap_or("cnpg-system")
         .to_string();
-    let instances = cfg
-        .pointer("/instances")
-        .and_then(Value::as_i64)
-        .unwrap_or(1);
-    let storage = cfg
-        .pointer("/storage")
-        .and_then(Value::as_str)
-        .unwrap_or("10Gi")
-        .to_string();
-    // Guaranteed backend resources (2.16d). Read tier-aware overrides from
-    // the ServiceProvider `config.resources` (each field independent), else
-    // fall back to the T1 Guaranteed baseline. requests==limits (Guaranteed
-    // QoS) and `shared_buffers` must stay coherent with `memory` — CNPG
-    // >=1.19's webhook rejects an incoherent pair.
-    let default_res = cnpg::BackendResources::cnpg_t1();
-    let res = cnpg::BackendResources {
-        cpu: cfg
-            .pointer("/resources/cpu")
-            .and_then(Value::as_str)
-            .unwrap_or(&default_res.cpu)
-            .to_string(),
-        memory: cfg
-            .pointer("/resources/memory")
-            .and_then(Value::as_str)
-            .unwrap_or(&default_res.memory)
-            .to_string(),
-        ephemeral_storage: cfg
-            .pointer("/resources/ephemeralStorage")
-            .and_then(Value::as_str)
-            .unwrap_or(&default_res.ephemeral_storage)
-            .to_string(),
-        shared_buffers: cfg
-            .pointer("/resources/sharedBuffers")
-            .and_then(Value::as_str)
-            .unwrap_or(&default_res.shared_buffers)
-            .to_string(),
-    };
-
+    // `instances`, `storage` and the tier-aware resource overrides are all
+    // read inside `ensure_cnpg_cluster`, which is the only thing that uses
+    // them.
     info!(%name, %ns, %cluster, %cnpg_ns, "provisioning cloudnative-pg claim");
 
     // 1. Lazily SSA-apply the shared Cluster (sole-owned). First claim
     //    creates `platform-postgres`; later claims no-op the apply.
-    let cluster_api: Api<DynamicObject> =
-        Api::namespaced_with(ctx.client.clone(), &cnpg_ns, &cluster_ar());
-    let cluster_body = cnpg::cluster_object(&cluster, &cnpg_ns, instances, &storage, &res);
-    cluster_api
-        .patch(&cluster, &apply_params(), &Patch::Apply(&cluster_body))
-        .await?;
+    ensure_cnpg_cluster(ctx, &cfg, &cluster, &cnpg_ns).await?;
 
     // 2. Derive Postgres identifiers (role/db — `_` is valid inside
     //    Postgres) AND a DNS-1123 Kubernetes object name (`-` — for the
