@@ -1878,7 +1878,7 @@ fn apply_apps_gated(
 
     let gated = plan.app_replicas.len();
     app_replicas.extend(plan.app_replicas);
-    suspended_argo.extend(plan.argo_apps);
+    record_suspended_argo(suspended_argo, plan.argo_apps);
 
     for object in &plan.objects {
         apply_cr(object, kubeconfig)?;
@@ -2841,13 +2841,19 @@ fn suspend_running_workloads(
                      — check it is what you want the app resumed to"
                 ),
             }
-            let argo = argo_apps_for(&name, kubeconfig)?;
+            // `ns` — the loop's own namespace — is the workload's namespace:
+            // `apps_to_suspend` is fed a listing scoped to it. It is NOT
+            // carried on `SuspendDecision`, which describes only what to do
+            // with ONE already-located Application; copying the loop variable
+            // onto every decision would give the same fact two sources of
+            // truth that a later edit could let drift.
+            let argo = argo_apps_for(&name, ns, kubeconfig)?;
 
             // Both records go in BEFORE the writes they describe, for the same
             // reason the annotation does: a patch that fails halfway through
             // must still leave the caller able to name what is down.
             recorded.push(((ns.to_string(), name.clone()), replicas));
-            suspended_argo.extend(argo.iter().cloned());
+            record_suspended_argo(suspended_argo, argo.iter().cloned());
 
             for patch in suspend_patches(ns, &name, &argo, replicas) {
                 kubectl_merge_patch(
@@ -2999,25 +3005,87 @@ fn recorded_replicas(app: &Value) -> Option<std::result::Result<i64, String>> {
     })
 }
 
-/// Find the user Argo Application(s) that manage an AppRafter Application by
-/// the `apprafter.io/application=<name>` label. Returns `(namespace, name)`
-/// pairs. Used by the data-only suspend path.
-fn argo_apps_for(app_name: &str, kubeconfig: &Path) -> Result<Vec<(String, String)>> {
-    let items = crate::commands::k8s_helpers::kubectl_get_json_by_selector(
-        "applications.argoproj.io",
-        &argo_app_selector(app_name),
-        None,
-        kubeconfig,
-    )?;
-    Ok(argo_app_refs(&items))
+/// Record the Argo registrations a step has just gated, keeping the
+/// accumulator DISTINCT and in first-seen order.
+///
+/// `suspended_argo` is ONE accumulator with two writers — [`apply_apps_gated`]
+/// on the full path and [`suspend_running_workloads`] on `--data-only` — so
+/// the distinctness has to be a property of the list, not of one call site.
+/// Every consumer wants a set: [`resume_patches`] issues one merge-patch per
+/// entry, and [`interrupted_restore_lines`] both COUNTS the list ("auto-sync
+/// is switched OFF on N Application(s)") and prints one recovery command per
+/// entry. A repeat makes that count wrong and hands an operator who is already
+/// mid-incident the same `kubectl` line twice, to wonder how the two differ.
+///
+/// Duplicates stopped being hypothetical when the suspend path started joining
+/// on what a registration DEPLOYS: every workload of a multi-workload bundle
+/// in one namespace resolves to the SAME registration, so an N-workload bundle
+/// offers it N times. First-seen order is preserved so the recovery lines read
+/// the same way on a re-run.
+fn record_suspended_argo(
+    into: &mut Vec<(String, String)>,
+    found: impl IntoIterator<Item = (String, String)>,
+) {
+    for entry in found {
+        if !into.contains(&entry) {
+            into.push(entry);
+        }
+    }
 }
 
-/// The label selector that ties a user Argo Application back to the AppRafter
-/// Application it manages. Per-environment Argo apps are named
-/// `<app>-<env>`, so selecting by NAME would miss them — the label is what
-/// makes the match environment-independent.
-fn argo_app_selector(app_name: &str) -> String {
-    format!("apprafter.io/application={app_name}")
+/// Find the user Argo Application(s) that deploy one AppRafter Application.
+/// Returns `(namespace, name)` pairs. Used by the data-only suspend path.
+///
+/// One cluster read of the registrations, then the pure join in
+/// [`argo_apps_for_cr`]. The registrations all live in the `argocd`
+/// namespace — same list `app_index::AppIndex::read` and
+/// `app_rollup::ClusterApplications::read` take.
+fn argo_apps_for(
+    cr_name: &str,
+    cr_namespace: &str,
+    kubeconfig: &Path,
+) -> Result<Vec<(String, String)>> {
+    let items = crate::commands::k8s_helpers::kubectl_get_json_by_selector(
+        "application.argoproj.io",
+        "",
+        Some(crate::commands::app::ARGOCD_NAMESPACE),
+        kubeconfig,
+    )?;
+    Ok(argo_apps_for_cr(cr_name, cr_namespace, &items))
+}
+
+/// The registrations that deploy a given workload, found by what each
+/// one DEPLOYS (`status.resources[]`) rather than by a label.
+///
+/// The label `apprafter.io/application` on an Argo object carries the
+/// REGISTRATION name, and `app.rs:4756-4776` asserts it legitimately
+/// differs from the CR's own name. Selecting on it therefore missed —
+/// and a miss here is not benign: `suspend_patches` still emits the
+/// scale-to-zero, so Argo self-heals the replicas and the data-only
+/// load runs under live pods writing to the database.
+///
+/// EVERY matching registration is returned, not the first: `app add`'s
+/// duplicate guard keys on the Argo object name alone, so two
+/// registrations can claim one workload, and leaving one of them
+/// auto-syncing reproduces the whole defect.
+fn argo_apps_for_cr(cr_name: &str, cr_namespace: &str, argo: &[Value]) -> Vec<(String, String)> {
+    let deploying: Vec<Value> = argo
+        .iter()
+        .filter(|a| {
+            crate::commands::app_open::apprafter_app_refs(a)
+                .iter()
+                .any(|r| {
+                    // `CrRef::namespace == None` is UNKNOWN, never a wildcard: a
+                    // ref we cannot place must NOT match, because matching it
+                    // would disable auto-sync on a registration that may deploy a
+                    // same-named workload in an entirely different namespace —
+                    // quiescing a stranger's app while leaving ours running.
+                    r.name == cr_name && r.namespace.as_deref() == Some(cr_namespace)
+                })
+        })
+        .cloned()
+        .collect();
+    argo_app_refs(&deploying)
 }
 
 /// `(namespace, name)` of each Argo Application item. An item missing either
@@ -5715,12 +5783,146 @@ mod tests {
         );
     }
 
-    /// Per-environment Argo apps are named `<app>-<env>`, so the suspend path
-    /// finds them by LABEL — matching on name would miss every environment but
-    /// the bare one.
     #[test]
-    fn argo_app_selector_matches_by_label_not_by_name() {
-        assert_eq!(argo_app_selector("web"), "apprafter.io/application=web");
+    fn argo_apps_for_cr_finds_the_registration_when_its_name_differs_from_the_cr() {
+        // The live defect: the selector compared a CR name against a label
+        // whose value is the REGISTRATION name. app.rs:4756-4776 asserts that
+        // shape is supported — Argo app "cms" rendering CR "landing-cms" —
+        // and on a mismatch suspend emitted the scale-to-zero WITHOUT the
+        // auto-sync-disable, so Argo self-healed the replicas and the
+        // data-only load ran under live pods writing to the database.
+        let argo = vec![json!({
+            "metadata": {"name": "cms", "namespace": "argocd",
+                         "labels": {"apprafter.io/application": "cms"}},
+            "spec": {"destination": {"namespace": "web"}},
+            "status": {"resources": [
+                {"group": "apprafter.io", "kind": "Application",
+                 "name": "landing-cms", "namespace": "web"}
+            ]}
+        })];
+        assert_eq!(
+            argo_apps_for_cr("landing-cms", "web", &argo),
+            vec![("argocd".to_string(), "cms".to_string())],
+            "the registration must be found by what it DEPLOYS, not by a label that names it"
+        );
+    }
+
+    #[test]
+    fn argo_apps_for_cr_ignores_a_registration_that_deploys_a_different_workload() {
+        let argo = vec![json!({
+            "metadata": {"name": "other", "namespace": "argocd"},
+            "status": {"resources": [
+                {"group": "apprafter.io", "kind": "Application",
+                 "name": "someone-else", "namespace": "web"}
+            ]}
+        })];
+        assert!(argo_apps_for_cr("landing-cms", "web", &argo).is_empty());
+    }
+
+    /// A ref whose namespace is UNKNOWN (`CrRef::namespace == None`: the
+    /// `status.resources[]` entry names none and the registration has no
+    /// `spec.destination.namespace`) must NOT match. Unknown is not a
+    /// wildcard — treating it as one would disable auto-sync on a
+    /// registration that may deploy a same-named workload somewhere else
+    /// entirely, quiescing a stranger's app while leaving ours running
+    /// under the load.
+    #[test]
+    fn argo_apps_for_cr_refuses_a_ref_whose_namespace_is_unknown() {
+        let argo = vec![json!({
+            "metadata": {"name": "placeless", "namespace": "argocd"},
+            "status": {"resources": [
+                {"group": "apprafter.io", "kind": "Application", "name": "api"}
+            ]}
+        })];
+        assert!(argo_apps_for_cr("api", "prod", &argo).is_empty());
+    }
+
+    #[test]
+    fn argo_apps_for_cr_distinguishes_the_same_name_in_two_namespaces() {
+        let argo = vec![
+            json!({"metadata": {"name": "prod-reg", "namespace": "argocd"},
+                   "status": {"resources": [{"group": "apprafter.io", "kind": "Application",
+                                             "name": "api", "namespace": "prod"}]}}),
+            json!({"metadata": {"name": "stg-reg", "namespace": "argocd"},
+                   "status": {"resources": [{"group": "apprafter.io", "kind": "Application",
+                                             "name": "api", "namespace": "staging"}]}}),
+        ];
+        assert_eq!(
+            argo_apps_for_cr("api", "prod", &argo),
+            vec![("argocd".to_string(), "prod-reg".to_string())]
+        );
+    }
+
+    /// A bundle's N workloads share ONE registration, so the suspend loop
+    /// offers that registration to the accumulator once per workload. It must
+    /// land once: `resume_patches` would otherwise emit N identical patches,
+    /// and the interruption hint would count wrong and print the same manual
+    /// recovery command N times at an operator who is already mid-incident.
+    #[test]
+    fn a_bundles_shared_registration_is_recorded_once() {
+        let argo = vec![json!({
+            "metadata": {"name": "shop", "namespace": "argocd"},
+            "status": {"resources": [
+                {"group": "apprafter.io", "kind": "Application",
+                 "name": "shop-web", "namespace": "shop"},
+                {"group": "apprafter.io", "kind": "Application",
+                 "name": "shop-worker", "namespace": "shop"}
+            ]}
+        })];
+
+        // Exactly what `suspend_running_workloads` does: one join per
+        // workload of the namespace, each recorded as it is suspended.
+        let mut suspended_argo: Vec<(String, String)> = Vec::new();
+        for workload in ["shop-web", "shop-worker"] {
+            record_suspended_argo(
+                &mut suspended_argo,
+                argo_apps_for_cr(workload, "shop", &argo),
+            );
+        }
+        assert_eq!(
+            suspended_argo,
+            vec![("argocd".to_string(), "shop".to_string())],
+            "one registration, recorded once however many of its workloads are suspended"
+        );
+
+        let recovery = interrupted_restore_lines(
+            true,
+            &[
+                (("shop".to_string(), "shop-web".to_string()), 2),
+                (("shop".to_string(), "shop-worker".to_string()), 1),
+            ],
+            &suspended_argo,
+        );
+        assert_eq!(
+            recovery
+                .iter()
+                .filter(|l| l.contains("patch applications.argoproj.io"))
+                .count(),
+            1,
+            "one registration to re-enable ⇒ exactly one manual recovery command"
+        );
+
+        assert_eq!(
+            resume_patches(&[], &suspended_argo).len(),
+            1,
+            "the resume reads the same list and must not re-enable the same app twice"
+        );
+    }
+
+    #[test]
+    fn argo_apps_for_cr_returns_every_registration_that_claims_the_workload() {
+        // `app add`'s duplicate guard keys only on the Argo object name, so
+        // two registrations CAN claim one CR. Suspending only one of them
+        // leaves the other's self-heal live — the whole defect, again.
+        let argo = vec![
+            json!({"metadata": {"name": "aaa", "namespace": "argocd"},
+                   "status": {"resources": [{"group": "apprafter.io", "kind": "Application",
+                                             "name": "shop", "namespace": "shop"}]}}),
+            json!({"metadata": {"name": "zzz", "namespace": "argocd"},
+                   "status": {"resources": [{"group": "apprafter.io", "kind": "Application",
+                                             "name": "shop", "namespace": "shop"}]}}),
+        ];
+        assert_eq!(argo_apps_for_cr("shop", "shop", &argo).len(), 2);
     }
 
     /// An Argo item missing either coordinate is dropped: patching it would
