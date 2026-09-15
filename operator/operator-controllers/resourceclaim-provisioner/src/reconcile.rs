@@ -454,6 +454,33 @@ pub async fn reconcile(
         }
     };
 
+    // 2.29 (ADR 0066 §2). A claim carrying `sharedRef` BINDS an existing
+    // SharedDatabase rather than provisioning its own. Branching here rather
+    // than inside each backend arm keeps the rule in one place: presence of
+    // the field decides, and the backend only decides HOW to bind.
+    //
+    // The claim is otherwise unchanged — same connection Secret, same
+    // `claim.<type>.*` references, same egress rule, same readiness gate,
+    // same GC. That is why a reference need generates a claim at all, where
+    // `needs.disk.ref` generates none: a database binding has something to
+    // provision per consumer (a role, a password, a Secret), and a volume
+    // binding does not.
+    if claim.spec.shared_ref.is_some() {
+        return match Backend::from_spec_backend(&provider.spec.backend) {
+            Some(Backend::Cloudnativepg) => {
+                crate::shared_database::bind_pg_consumer(&ctx, &claim, &ns, &name, &provider).await
+            }
+            other => {
+                warn!(
+                    %name, %ns, backend = %provider.spec.backend,
+                    "sharedRef on a backend with no bind path — requeue"
+                );
+                let _ = other;
+                Ok(Action::requeue(Duration::from_secs(300)))
+            }
+        };
+    }
+
     match Backend::from_spec_backend(&provider.spec.backend) {
         Some(Backend::Cloudnativepg) => {
             provision_cloudnativepg(&ctx, &claim, &ns, &name, &provider).await
@@ -650,20 +677,12 @@ async fn provision_cloudnativepg(
     //     the next reconcile asks again.
     if !extensions.is_empty() {
         let probe_dsn = cnpg::dsn(&role, &password, &db, &cluster, &cnpg_ns);
-        let mut missing: Vec<String> = Vec::new();
-        let mut reachable = true;
-        for ext in &extensions {
-            match ctx.pg.extension_available(&probe_dsn, &ext.name).await {
-                Ok(true) => {}
-                Ok(false) => missing.push(ext.name.clone()),
-                Err(e) => {
-                    warn!(%name, %ns, error = %e, "could not check extension availability; skipping the check this reconcile");
-                    reachable = false;
-                    break;
-                }
-            }
+        let probe =
+            crate::pg_client::probe_extensions(ctx.pg.as_ref(), &probe_dsn, &extensions).await;
+        if probe == crate::pg_client::ExtensionProbe::Unreachable {
+            warn!(%name, %ns, "could not check extension availability; skipping the check this reconcile");
         }
-        if reachable && !missing.is_empty() {
+        if let crate::pg_client::ExtensionProbe::Missing(missing) = probe {
             let cond = ready_condition(
                 "False",
                 operator_core::shareddatabase::COND_EXTENSION_UNAVAILABLE,
@@ -2782,8 +2801,45 @@ async fn upsert_managed_role(
     role: &str,
     pw_secret_name: &str,
 ) -> Result<(), ReconcileError> {
+    upsert_role_entry(
+        ctx,
+        cnpg_ns,
+        cluster,
+        cnpg::managed_role_entry(role, pw_secret_name),
+    )
+    .await
+}
+
+/// Upsert the platform's own `apprafter_admin` entry (2.29 / ADR 0066 §3.1).
+///
+/// Same read-modify-write as [`upsert_managed_role`] and deliberately routed
+/// through the same helper: the list is unkeyed, so two writers with two
+/// implementations of "preserve the foreign entries" is exactly how one of
+/// them ends up not doing it.
+pub(crate) async fn upsert_platform_role(
+    ctx: &Arc<Context>,
+    cnpg_ns: &str,
+    cluster: &str,
+    pw_secret_name: &str,
+) -> Result<(), ReconcileError> {
+    upsert_role_entry(
+        ctx,
+        cnpg_ns,
+        cluster,
+        cnpg::platform_role_entry(pw_secret_name),
+    )
+    .await
+}
+
+/// The shared read-modify-write of the Cluster's unkeyed
+/// `spec.managed.roles`, retried on the 409 a concurrent writer causes.
+async fn upsert_role_entry(
+    ctx: &Arc<Context>,
+    cnpg_ns: &str,
+    cluster: &str,
+    entry: Value,
+) -> Result<(), ReconcileError> {
     let api: Api<DynamicObject> = Api::namespaced_with(ctx.client.clone(), cnpg_ns, &cluster_ar());
-    let entry = cnpg::managed_role_entry(role, pw_secret_name);
 
     for attempt in 0..ROLE_RMW_RETRIES {
         let current = api.get(cluster).await?;
@@ -3385,13 +3441,13 @@ pub(crate) const GC_ROLE_RMW_RETRIES: usize = ROLE_RMW_RETRIES;
 /// which a miscount compiles cleanly and writes the wrong field. Named
 /// fields make each site say which half of the claim it is publishing.
 #[derive(Default, Clone, Copy)]
-struct ClaimStatusFields<'a> {
+pub(crate) struct ClaimStatusFields<'a> {
     /// CNPG / dragonfly publish this; the disk backends do not.
-    conn_secret_name: Option<&'a str>,
+    pub(crate) conn_secret_name: Option<&'a str>,
     /// The disk backends publish this; CNPG / dragonfly do not.
-    volume_claim_ref: Option<&'a str>,
+    pub(crate) volume_claim_ref: Option<&'a str>,
     /// Dragonfly's `(instance, dbnum)` allocation.
-    allocation: Option<(&'a str, u16)>,
+    pub(crate) allocation: Option<(&'a str, u16)>,
     /// Used/total bytes of the volume behind a disk claim (2.22d / D8), and
     /// absent when the sample failed.
     ///
@@ -3399,7 +3455,7 @@ struct ClaimStatusFields<'a> {
     /// the backing filesystem, so these are the host disk's numbers, not the
     /// claim's. Recording which one was measured is what stops a 1Gi claim
     /// from being rendered as an 80GB one.
-    capacity: Option<VolumeSample>,
+    pub(crate) capacity: Option<VolumeSample>,
 }
 
 fn status_apply_body(
@@ -3891,7 +3947,7 @@ pub(crate) struct VolumeSample {
     pub scope: &'static str,
 }
 
-async fn patch_status(
+pub(crate) async fn patch_status(
     client: &Client,
     ns: &str,
     name: &str,
@@ -4295,7 +4351,7 @@ fn without_finalizer(current: &[String]) -> Vec<String> {
 }
 
 /// Generate a random alphanumeric password for a managed role.
-fn generate_password() -> String {
+pub(crate) fn generate_password() -> String {
     rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(PASSWORD_LEN)

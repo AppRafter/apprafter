@@ -58,6 +58,7 @@ specific release rather than scraping these pages.
 | [`apprafter backup`](backup.md) | — | Encrypted backup (Kind 2, restic local-pull): native extraction + serialized config/app CRs + decrypted user secrets, all wrapped into a restic repository. |
 | [`apprafter cluster-bootstrap`](cluster-bootstrap.md) | `cb` | GitOps loader for the cluster pointed to by the cached kubeconfig: install Cilium (CNI + kube-proxy replacement), then Argo CD, then apply the single root `platform` Application pointing at the platform-stack chart and wait for it to report Healthy. |
 | [`apprafter completion`](completion.md) | — | Print a shell completion script on stdout |
+| [`apprafter db`](db.md) | — | Manage SharedDatabase CRs — a PostgreSQL database or a Redis keyspace several Applications bind, each with its own credential and its own access level. |
 | [`apprafter destroy`](destroy.md) | — | Destroy every `apprafter=true`-labelled resource in the provider project the token belongs to — servers, floating IPs, firewalls, networks and SSH keys |
 | [`apprafter doctor`](doctor.md) | — | Self-diagnostic over the active target's config, credentials and reachability plus the surrounding shell environment (kubectl, helm, ssh, DNS). |
 | [`apprafter export`](export.md) | — | Native data export (Kind 1) — pull pg dumps, volume tars and persistent-redis snapshots to a plain local folder + `manifest.json`. |
@@ -95,6 +96,7 @@ which is what makes `apprafter t ls` work.
 | [`apprafter app remove`](app.md#apprafter-app-remove) | `rm` | `apprafter a rm` |
 | [`apprafter backup list`](backup.md#apprafter-backup-list) | `ls` | `apprafter backup ls` |
 | [`apprafter cluster-bootstrap`](cluster-bootstrap.md#apprafter-cluster-bootstrap) | `cb` | `apprafter cb` |
+| [`apprafter db list`](db.md#apprafter-db-list) | `ls` | `apprafter db ls` |
 | [`apprafter kubeconfig`](kubeconfig.md#apprafter-kubeconfig) | `kc` | `apprafter kc` |
 | [`apprafter migration list`](migration.md#apprafter-migration-list) | `ls` | `apprafter migration ls` |
 | [`apprafter repo creds list`](repo.md#apprafter-repo-creds-list) | `ls` | `apprafter repo creds ls` |

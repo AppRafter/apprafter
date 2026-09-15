@@ -423,6 +423,35 @@ rules:
       - get
       - patch
       - update
+  # 2.29 (ADR 0066): the SharedDatabase controller, whose verb set is the
+  # SharedVolume one above for the same reasons — the operator reconciles
+  # these and never creates or deletes them (`apprafter db create/rm` does),
+  # and the finalizer only declares the backing CNPG `Database` absent and
+  # then drops its own entry via patch.
+  #
+  # Granted in the SAME change as the controller that needs them: a new Kind
+  # in operator code without its rbac.yaml line 403s on the first list/watch
+  # and the controller stalls with nothing in the object to say why — a class
+  # of miss only a live cluster catches.
+  - apiGroups:
+      - apprafter.io
+    resources:
+      - shareddatabases
+      - shareddatabases/finalizers
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+      - patch
+  - apiGroups:
+      - apprafter.io
+    resources:
+      - shareddatabases/status
+    verbs:
+      - get
+      - patch
+      - update
   # Phase 2.6c capacity-signal (ADR 0049, Task 11): the SharedVolume
   # reconciler samples the kubelet Summary API per-reconcile via the
   # apiserver node-proxy subresource

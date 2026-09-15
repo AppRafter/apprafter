@@ -581,6 +581,52 @@ impl ApplicationMigrationStrategy {
             });
         }
 
+        // #17 shared-database-bind: the FIRST binding of this application to
+        // a given SharedDatabase (2.29 / ADR 0066 §5).
+        //
+        // Structurally the mirror of #14. Under ADR 0052's inverted threat
+        // model the attacker is whoever can write the manifest, and without
+        // this gate one line in an application's own file — `ref: "orders"` —
+        // attaches it to a neighbour's data. The exposure is borne by the
+        // applications already bound, not by the editor, which is exactly the
+        // shape that makes a gate the right instrument.
+        //
+        // The exposure unit is the `(type, database)` PAIR, so a second need
+        // of the same type against a database this application already binds
+        // is not a fresh widening and must not re-gate.
+        //
+        // An `rw` → `ro` narrowing is deliberately soft — it reduces reach —
+        // while `ro` → `rw` gates as an escalation: read access to a
+        // neighbour's data and write access to it are different exposures,
+        // and the second was never approved by the first.
+        let old_binds = shared_database_binds(old);
+        for (ty, db, access) in shared_database_binds(new) {
+            let previous = old_binds
+                .iter()
+                .find(|(t, d, _)| *t == ty && *d == db)
+                .map(|(_, _, a)| a.clone());
+            match previous.as_deref() {
+                // Already bound at rw: nothing here reaches further.
+                Some("rw") => continue,
+                // Already bound at ro: only a move to rw is a widening.
+                Some(_) if access != "rw" => continue,
+                Some(_) => candidates.push(DestructiveChange {
+                    trigger_type: "shared-database-access-widen".to_string(),
+                    field: format!("needs.{ty}.ref.{db}"),
+                    from: Some(json!("ro")),
+                    to: Some(json!("rw")),
+                    classification: "security-boundary".to_string(),
+                }),
+                None => candidates.push(DestructiveChange {
+                    trigger_type: "shared-database-bind".to_string(),
+                    field: format!("needs.{ty}.ref.{db}"),
+                    from: Some(json!("(none)")),
+                    to: Some(json!(format!("{db} ({access})"))),
+                    classification: "security-boundary".to_string(),
+                }),
+            }
+        }
+
         // #15 jetstream-dynamic-streams-enable: the flag grants
         // `$JS.API.STREAM.CREATE/UPDATE.>`, which literally means "may create
         // streams at will, and therefore READS EVERY STREAM IN THIS NAMESPACE"
@@ -1041,6 +1087,50 @@ fn foreign_consume_shares(js: Option<&JetStreamNeed>, app_name: &str) -> Vec<(St
         let pair = (owner, c.stream.trim().to_string());
         if !out.contains(&pair) {
             out.push(pair);
+        }
+    }
+    out
+}
+
+/// Every `(service type, SharedDatabase name, access)` this spec binds.
+///
+/// Deduplicated on the `(type, database)` pair, keeping the WIDEST access
+/// seen: two needs of one type against one database expose the application
+/// to that database once, at whichever level is higher, and gating the pair
+/// twice would ask an operator to approve the same exposure again.
+///
+/// A need with no `ref` provisions its own database and is not a binding at
+/// all, so it is dropped here rather than being carried as a special case
+/// into the comparison.
+fn shared_database_binds(s: &ApplicationBaseSpec) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let Some(needs) = s.needs.as_ref() else {
+        return out;
+    };
+    for (ty, entry) in needs.entries() {
+        let Some(service) = entry.service.as_ref() else {
+            continue;
+        };
+        let Some(db) = service.ref_.as_deref().map(str::trim) else {
+            continue;
+        };
+        if db.is_empty() {
+            continue;
+        }
+        // Absent access is `rw` — the manifest default, and the wider of the
+        // two. Reading it as `ro` would let an unannotated bind skip the
+        // escalation gate on its way to write access.
+        let access = match service.access.as_deref().map(str::trim) {
+            Some("ro") => "ro",
+            _ => "rw",
+        };
+        match out.iter_mut().find(|(t, d, _)| t == &ty && d == db) {
+            Some(existing) => {
+                if access == "rw" {
+                    existing.2 = "rw".to_string();
+                }
+            }
+            None => out.push((ty.clone(), db.to_string(), access.to_string())),
         }
     }
     out
@@ -3438,6 +3528,121 @@ mod application_jetstream_trigger_tests {
     fn jetstream_consume_removal_is_not_a_security_boundary() {
         let old = with_consume(vec![consume(Some("feeder"), "blocks-head", "reader-a")]);
         assert!(fired(&old, &with_consume(vec![]), "jetstream-consume-add").is_empty());
+    }
+
+    // ---- #17 shared-database-bind -----------------------------------
+
+    /// A spec whose `needs.pg` is a single entry with the given ref/access.
+    fn with_pg_ref(reference: Option<&str>, access: Option<&str>) -> ApplicationBaseSpec {
+        let mut need = operator_core::ServiceNeed {
+            ref_: reference.map(str::to_string),
+            access: access.map(str::to_string),
+            ..Default::default()
+        };
+        if reference.is_none() {
+            need.size = Some("small".into());
+        }
+        ApplicationBaseSpec {
+            needs: Some(operator_core::Needs {
+                pg: Some(operator_core::OneOrMany::One(need)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    // FIRES: the first bind to a shared database. One line in this
+    // application's own file attaches it to a neighbour's data, and the
+    // neighbour is the one who bears it.
+    #[test]
+    fn a_first_bind_to_a_shared_database_gates() {
+        let cs = fired(
+            &base(),
+            &with_pg_ref(Some("orders"), None),
+            "shared-database-bind",
+        );
+        assert_eq!(cs.len(), 1, "{cs:?}");
+        assert_eq!(cs[0].classification, "security-boundary");
+        assert_eq!(cs[0].field, "needs.pg.ref.orders");
+        assert_eq!(s(&cs[0].from), "(none)");
+        // Access rides the `to` value so the approval names what is being
+        // approved — `orders` alone would not distinguish read from write.
+        assert_eq!(s(&cs[0].to), "orders (rw)");
+    }
+
+    // An absent `access` is `rw`, the manifest default and the WIDER of the
+    // two. Reading it as `ro` would let an unannotated bind slip past the
+    // escalation gate on its way to write access.
+    #[test]
+    fn an_unannotated_bind_is_recorded_as_read_write() {
+        let cs = fired(
+            &base(),
+            &with_pg_ref(Some("orders"), None),
+            "shared-database-bind",
+        );
+        assert_eq!(s(&cs[0].to), "orders (rw)");
+    }
+
+    #[test]
+    fn a_read_only_bind_says_so() {
+        let cs = fired(
+            &base(),
+            &with_pg_ref(Some("orders"), Some("ro")),
+            "shared-database-bind",
+        );
+        assert_eq!(s(&cs[0].to), "orders (ro)");
+    }
+
+    // SILENT: an own database is not a binding. The whole point of `ref` is
+    // that it names something somebody else may already be using.
+    #[test]
+    fn an_owned_database_does_not_gate() {
+        assert!(fired(&base(), &with_pg_ref(None, None), "shared-database-bind").is_empty());
+    }
+
+    // SILENT: re-approving an existing binding. The pair is the exposure
+    // unit, so an unchanged spec must not re-gate on every reconcile.
+    #[test]
+    fn an_existing_binding_does_not_re_gate() {
+        let bound = with_pg_ref(Some("orders"), None);
+        assert!(fired(&bound, &bound, "shared-database-bind").is_empty());
+    }
+
+    // SILENT: narrowing rw → ro reduces reach.
+    #[test]
+    fn narrowing_to_read_only_is_not_gated() {
+        let rw = with_pg_ref(Some("orders"), Some("rw"));
+        let ro = with_pg_ref(Some("orders"), Some("ro"));
+        assert!(fired(&rw, &ro, "shared-database-bind").is_empty());
+        assert!(fired(&rw, &ro, "shared-database-access-widen").is_empty());
+    }
+
+    // FIRES, under its own trigger: ro → rw. Read access to a neighbour's
+    // data and write access to it are different exposures, and the second
+    // was never approved by the first.
+    #[test]
+    fn widening_read_only_to_read_write_gates_as_an_escalation() {
+        let ro = with_pg_ref(Some("orders"), Some("ro"));
+        let rw = with_pg_ref(Some("orders"), Some("rw"));
+        let cs = fired(&ro, &rw, "shared-database-access-widen");
+        assert_eq!(cs.len(), 1, "{cs:?}");
+        assert_eq!(cs[0].classification, "security-boundary");
+        assert_eq!(s(&cs[0].from), "ro");
+        assert_eq!(s(&cs[0].to), "rw");
+        // ...and NOT as a fresh bind, which would read as a new exposure and
+        // lose the fact that this application already had access.
+        assert!(fired(&ro, &rw, "shared-database-bind").is_empty());
+    }
+
+    // Binding a DIFFERENT database is a fresh exposure even when this
+    // application already binds one.
+    #[test]
+    fn binding_a_second_database_gates_on_its_own() {
+        let one = with_pg_ref(Some("orders"), None);
+        let two = with_pg_ref(Some("reporting"), None);
+        let cs = fired(&one, &two, "shared-database-bind");
+        assert_eq!(cs.len(), 1, "{cs:?}");
+        assert_eq!(cs[0].field, "needs.pg.ref.reporting");
     }
 
     // ---- #15 jetstream-dynamic-streams-enable -----------------------

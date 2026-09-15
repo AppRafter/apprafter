@@ -45,16 +45,53 @@
 //! carries ALL status fields this controller owns — a body that omits one
 //! PRUNES it.
 
-use chrono::Utc;
-use serde_json::{json, Value};
+use std::sync::Arc;
+use std::time::Duration;
 
+use chrono::Utc;
+use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
+use kube::core::GroupVersionKind;
+use kube::runtime::controller::Action;
 use kube::runtime::reflector::{ObjectRef, Store};
+use kube::{Client, ResourceExt};
+use serde_json::{json, Value};
+use tracing::{info, warn};
+
+use operator_core::matching::{select_provider, Candidate};
 use operator_core::{
-    ResourceClaim, SharedDatabase, SharedDatabaseCondition, COND_EXTENSION_UNAVAILABLE, COND_READY,
+    PgExtension, ResourceClaim, ServiceProvider, SharedDatabase, SharedDatabaseCondition,
+    COND_EXTENSION_UNAVAILABLE, COND_READY,
 };
 
-use crate::cnpg::{k8s_name, pg_identifier};
-use crate::shared_pg::shared_group;
+use crate::cnpg::{self, k8s_name, pg_identifier};
+use crate::shared_pg::{self, shared_group};
+use crate::{Context, ReconcileError, FIELD_MANAGER};
+
+/// Metric label + log identity for this controller.
+const KIND: &str = "SharedDatabase";
+
+/// Held so a delete is OBSERVED rather than racing the apiserver's own
+/// cascade. Without it a `SharedDatabase` vanishes and the backing database
+/// survives with nothing left pointing at it — an orphan holding real data
+/// that no longer appears in any inventory.
+const SD_FINALIZER: &str = "apprafter.io/shareddatabase-cleanup";
+
+/// `Ready=False` reason while the shared Postgres cluster is not yet
+/// answering. Distinct from a provisioning failure: it clears by itself.
+const REASON_AWAITING_CLUSTER: &str = "AwaitingCluster";
+
+/// `Ready=False` reason while CNPG has not yet reported the `Database` CR
+/// reconciled.
+const REASON_AWAITING_DATABASE: &str = "AwaitingDatabase";
+
+/// `Ready=False` reason on a delete held open by live consumers.
+const REASON_IN_USE: &str = "InUse";
+
+/// Fallbacks when the matched `ServiceProvider` config omits them — the same
+/// two the owned-pg arm reads, and deliberately the same spelling so a
+/// provider seed that moves the cluster moves BOTH paths at once.
+const DEFAULT_CNPG_CLUSTER: &str = "platform-postgres";
+const DEFAULT_CNPG_NAMESPACE: &str = "cnpg-system";
 
 // ---------------------------------------------------------------------------
 // Naming
@@ -318,28 +355,754 @@ pub fn extension_unavailable_condition(
     ))
 }
 
-/// The extensions a spec declares that the server does not offer.
+// ---------------------------------------------------------------------------
+// Dynamic ApiResources + apply params
+// ---------------------------------------------------------------------------
+
+fn resourceclaim_ar() -> ApiResource {
+    ApiResource::from_gvk(&GroupVersionKind::gvk(
+        "apprafter.io",
+        "v1alpha1",
+        "ResourceClaim",
+    ))
+}
+
+fn apply_params() -> PatchParams {
+    PatchParams::apply(FIELD_MANAGER).force()
+}
+
+// ---------------------------------------------------------------------------
+// Async reconcile
+// ---------------------------------------------------------------------------
+
+/// Reconcile one `SharedDatabase`.
 ///
-/// Compared case-insensitively because PostgreSQL folds unquoted identifiers
-/// to lower case and `pg_available_extensions` reports the folded name, while
-/// a manifest may well spell `pgVector`. The allow list already bounds what
-/// can be asked for; this decides only whether the ASKED-FOR thing is present.
-pub fn missing_extensions(
-    declared: &[operator_core::PgExtension],
-    available: &[String],
-) -> Vec<String> {
-    let have: Vec<String> = available.iter().map(|a| a.to_ascii_lowercase()).collect();
-    declared
+/// 1. Under deletion → refuse while `refCount > 0`, else drop the backing and
+///    release the finalizer.
+/// 2. Ensure the finalizer, so a delete is observed at all.
+/// 3. Branch on `spec.type`. Only `pg` is wired; `redis` reports why.
+/// 4. Write the terminal status — `ready`, the backing, `refCount`, and BOTH
+///    owned conditions in one body.
+pub async fn reconcile_shared_database(
+    sd: Arc<SharedDatabase>,
+    ctx: Arc<Context>,
+) -> Result<Action, ReconcileError> {
+    let ns = sd.namespace().unwrap_or_default();
+    let name = sd.name_any();
+    let _timer = ctx
+        .metrics
+        .reconcile_duration
+        .with_label_values(&[KIND])
+        .start_timer();
+
+    let prior: Vec<SharedDatabaseCondition> = sd
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.clone())
+        .unwrap_or_default();
+
+    // 1. Deletion.
+    let finalizers = sd.metadata.finalizers.clone().unwrap_or_default();
+    if sd.metadata.deletion_timestamp.is_some() {
+        if !finalizers.iter().any(|f| f == SD_FINALIZER) {
+            return Ok(Action::await_change());
+        }
+        let binders = current_binders(&ctx.client, &ns, &name).await?;
+        if !binders.is_empty() {
+            // The webhook refuses this delete, so reaching here means the CR
+            // was deleted by something that bypassed it — a force-delete, or a
+            // cluster whose webhook was unavailable. Holding the finalizer is
+            // the second gate, and the one that cannot be bypassed: the object
+            // stays in Terminating with a condition naming the binders, and
+            // the database keeps serving them.
+            warn!(
+                %name, %ns, binders = %binders.join(","),
+                "SharedDatabase delete held: consumers are still bound"
+            );
+            let cond = ready_condition(
+                "False",
+                REASON_IN_USE,
+                &format!(
+                    "deletion is held while {} consumer(s) are still bound: {}. Remove \
+                     `needs.<type>.ref` from each application first; this database and its \
+                     data are untouched.",
+                    binders.len(),
+                    binders.join(", ")
+                ),
+                &prior,
+            );
+            write_status(
+                &ctx,
+                &ns,
+                &name,
+                false,
+                &backing_of(&sd),
+                binders.len() as i64,
+                cond,
+                extension_condition_of(&sd, &prior),
+            )
+            .await?;
+            return Ok(Action::requeue(Duration::from_secs(30)));
+        }
+        drop_backing(&ctx, &sd, &ns, &name).await?;
+        set_finalizers(&ctx.client, &ns, &name, without_finalizer(&finalizers)).await?;
+        info!(%name, %ns, "SharedDatabase deleted — backing dropped, finalizer released");
+        return Ok(Action::await_change());
+    }
+
+    // 2. Ensure the finalizer BEFORE provisioning anything. The other order
+    //    leaves a window in which a database exists and a delete would not be
+    //    observed, which is how an orphan carrying real data is made.
+    if !finalizers.iter().any(|f| f == SD_FINALIZER) {
+        set_finalizers(&ctx.client, &ns, &name, with_finalizer(&finalizers)).await?;
+    }
+
+    match sd.spec.type_.as_str() {
+        "pg" => reconcile_pg(&sd, &ctx, &ns, &name, &prior).await,
+        other => {
+            // Not an error to requeue on: the spec is fixed until a human
+            // changes it, so say what is missing and wait for the change.
+            // `redis` lands with the rest of 2.29e; the CRD enum already
+            // bounds this to the two, so `other` is `redis` today.
+            warn!(%name, %ns, type_ = %other, "SharedDatabase type not yet wired");
+            let cond = ready_condition(
+                "False",
+                "UnsupportedType",
+                &format!("shared databases of type {other:?} are not provisioned yet"),
+                prior.as_slice(),
+            );
+            write_status(
+                &ctx,
+                &ns,
+                &name,
+                false,
+                &Backing::default(),
+                current_ref_count(&ctx.client, &ns, &name).await?,
+                cond,
+                None,
+            )
+            .await?;
+            Ok(Action::requeue(Duration::from_secs(300)))
+        }
+    }
+}
+
+/// The pg arm: shared cluster → platform role → groups → database →
+/// reader grants → extension probe → status.
+async fn reconcile_pg(
+    sd: &SharedDatabase,
+    ctx: &Arc<Context>,
+    ns: &str,
+    name: &str,
+    prior: &[SharedDatabaseCondition],
+) -> Result<Action, ReconcileError> {
+    // Provider selection uses the SharedDatabase's own selector, so a
+    // namespace can be pinned to a particular pg provider exactly as a claim
+    // can. An absent selector matches any pg provider.
+    let providers: Vec<ServiceProvider> = Api::<ServiceProvider>::all(ctx.client.clone())
+        .list(&Default::default())
+        .await?
+        .items;
+    let candidates: Vec<Candidate> = providers.iter().map(Candidate::from_provider).collect();
+    let selector = sd.spec.selector.clone().unwrap_or_default();
+    let Some(provider_name) = select_provider("pg", &selector, &candidates) else {
+        let cond = ready_condition(
+            "False",
+            "NoProvider",
+            "no pg ServiceProvider matches this SharedDatabase's selector",
+            prior,
+        );
+        write_status(
+            ctx,
+            ns,
+            name,
+            false,
+            &Backing::default(),
+            current_ref_count(&ctx.client, ns, name).await?,
+            cond,
+            None,
+        )
+        .await?;
+        return Ok(Action::requeue(Duration::from_secs(60)));
+    };
+    let cfg = providers
         .iter()
-        .filter(|e| !have.contains(&e.name.to_ascii_lowercase()))
-        .map(|e| e.name.clone())
+        .find(|p| p.name_any() == provider_name)
+        .and_then(|p| p.spec.config.clone())
+        .unwrap_or_else(|| json!({}));
+    let cluster = cfg
+        .pointer("/cluster")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_CNPG_CLUSTER)
+        .to_string();
+    let cnpg_ns = cfg
+        .pointer("/namespace")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_CNPG_NAMESPACE)
+        .to_string();
+
+    // The platform role. One per CLUSTER, created through CNPG's
+    // `managed.roles` so its password lives in a Secret CNPG reloads — and
+    // NOT through SQL, because something has to be able to run the first
+    // statement and this is that something.
+    let pw_secret_name = cnpg::platform_role_secret_name(&cluster);
+    let secret_api: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), &cnpg_ns, &crate::reconcile::secret_ar());
+    // READ-OR-CREATE, never an unconditional apply: `generate_password()`
+    // returns a fresh value each call, so re-applying would rotate the
+    // platform password on every reconcile of every shared database and break
+    // whichever connection was open at the time.
+    if secret_api.get_opt(&pw_secret_name).await?.is_none() {
+        let pw = crate::reconcile::generate_password();
+        let body = cnpg::basic_auth_secret(&pw_secret_name, &cnpg_ns, cnpg::PLATFORM_ROLE, &pw);
+        secret_api
+            .patch(&pw_secret_name, &apply_params(), &Patch::Apply(&body))
+            .await?;
+        info!(%cluster, %cnpg_ns, "created the platform role password Secret");
+    }
+    crate::reconcile::upsert_platform_role(ctx, &cnpg_ns, &cluster, &pw_secret_name).await?;
+
+    // The cluster must be answering before any SQL runs. Read the password
+    // back rather than reusing the one generated above: on every reconcile
+    // after the first there is no generated one, and the Secret is the single
+    // source either way.
+    let platform_pw =
+        crate::acl_reconcile::read_secret_key(ctx, &cnpg_ns, &pw_secret_name, "password").await?;
+    let database = shd_database_name(ns, name);
+    let owner = shared_group(ns, name);
+
+    // Connect to the DEFAULT database to create the groups: the shared
+    // database does not exist yet on the first pass, and the groups must,
+    // because CNPG will not create a `Database` whose owner is missing.
+    let admin_dsn = cnpg::dsn(
+        cnpg::PLATFORM_ROLE,
+        &platform_pw,
+        "postgres",
+        &cluster,
+        &cnpg_ns,
+    );
+    let groups = shared_pg::create_groups(ns, name, cnpg::PLATFORM_ROLE);
+    if let Err(e) = ctx.pg.execute_all(&admin_dsn, &groups).await {
+        // Not a hard error: a cluster still starting is the common case on a
+        // fresh install, and the reason says so rather than surfacing a dial
+        // failure as a provisioning fault.
+        warn!(%name, %ns, error = %e, "shared cluster not answering yet");
+        let cond = ready_condition(
+            "False",
+            REASON_AWAITING_CLUSTER,
+            &format!("the shared PostgreSQL cluster {cluster} is not answering yet"),
+            prior,
+        );
+        write_status(
+            ctx,
+            ns,
+            name,
+            false,
+            &Backing::default(),
+            current_ref_count(&ctx.client, ns, name).await?,
+            cond,
+            None,
+        )
+        .await?;
+        return Ok(Action::requeue(Duration::from_secs(20)));
+    }
+
+    // The database itself, owned by the group. Declarative through CNPG so
+    // the extension list is CNPG's to apply and this controller never runs
+    // `CREATE EXTENSION` as a privileged role itself.
+    let object_name = shd_k8s_name(ns, name);
+    let extensions: Vec<PgExtension> = sd.spec.extensions.clone().unwrap_or_default();
+    let db_api: Api<DynamicObject> = Api::namespaced_with(
+        ctx.client.clone(),
+        &cnpg_ns,
+        &crate::reconcile::database_ar(),
+    );
+    let db_body = cnpg::database_object(
+        &object_name,
+        &cnpg_ns,
+        &cluster,
+        &database,
+        &owner,
+        "present",
+        &extensions,
+    );
+    db_api
+        .patch(&object_name, &apply_params(), &Patch::Apply(&db_body))
+        .await?;
+
+    // The reader grants run against the shared database, so they need it to
+    // exist — which is CNPG's job and takes a moment.
+    let db_dsn = cnpg::dsn(
+        cnpg::PLATFORM_ROLE,
+        &platform_pw,
+        &database,
+        &cluster,
+        &cnpg_ns,
+    );
+    if let Err(e) = ctx
+        .pg
+        .execute_all(&db_dsn, &shared_pg::grant_reader(ns, name, &database))
+        .await
+    {
+        warn!(%name, %ns, error = %e, "shared database not ready for reader grants yet");
+        let cond = ready_condition(
+            "False",
+            REASON_AWAITING_DATABASE,
+            &format!("waiting for CNPG to create {database} in {cluster}"),
+            prior,
+        );
+        write_status(
+            ctx,
+            ns,
+            name,
+            false,
+            &Backing::default(),
+            current_ref_count(&ctx.client, ns, name).await?,
+            cond,
+            None,
+        )
+        .await?;
+        return Ok(Action::requeue(Duration::from_secs(20)));
+    }
+
+    // Extensions: ask the running server, never infer from the allow list.
+    // Whether `vector` exists is a property of the operand IMAGE, and the
+    // image is not pinned (ADR 0066 §4.2).
+    let probe = crate::pg_client::probe_extensions(ctx.pg.as_ref(), &db_dsn, &extensions).await;
+    let missing = match &probe {
+        crate::pg_client::ExtensionProbe::Missing(m) => m.clone(),
+        // An unreachable server says nothing about extensions. Carry the
+        // PREVIOUS finding forward rather than clearing it: a warning that
+        // blinks out on a network hiccup and returns is worse than one that
+        // stays until something actually contradicts it.
+        crate::pg_client::ExtensionProbe::Unreachable => prior
+            .iter()
+            .find(|c| c.type_ == COND_EXTENSION_UNAVAILABLE)
+            .and(Some(previously_missing(prior)))
+            .unwrap_or_default(),
+        crate::pg_client::ExtensionProbe::AllPresent => Vec::new(),
+    };
+    let ext_cond = extension_unavailable_condition(&missing, prior);
+
+    let ref_count = current_ref_count(&ctx.client, ns, name).await?;
+    // A missing extension leaves the database usable — it exists, it accepts
+    // connections, and every consumer already bound keeps working. So this is
+    // a WARNING condition beside a Ready=True, not a Ready=False: reporting
+    // the database as not ready would make an existing binding look broken
+    // because a NEW extension was added to the list and is not in the image.
+    let cond = ready_condition(
+        "True",
+        "Provisioned",
+        &format!("{database} in {cluster} ({cnpg_ns}), owned by {owner}"),
+        prior,
+    );
+    write_status(
+        ctx,
+        ns,
+        name,
+        true,
+        &Backing::pg(&database),
+        ref_count,
+        cond,
+        ext_cond,
+    )
+    .await?;
+    Ok(Action::requeue(Duration::from_secs(300)))
+}
+
+/// Drop the backing resource at `refCount == 0`.
+///
+/// pg: declare the CNPG `Database` absent, then drop the two groups. In that
+/// order — a role that owns a database cannot be dropped, and CNPG records
+/// `cannotReconcile: owner of database` if asked.
+async fn drop_backing(
+    ctx: &Arc<Context>,
+    sd: &SharedDatabase,
+    ns: &str,
+    name: &str,
+) -> Result<(), ReconcileError> {
+    if sd.spec.type_ != "pg" {
+        return Ok(());
+    }
+    let Some(cnpg_ns) = sd
+        .status
+        .as_ref()
+        .and_then(|s| s.database.as_ref())
+        .map(|_| DEFAULT_CNPG_NAMESPACE.to_string())
+    else {
+        // Never provisioned — nothing to drop, and guessing a namespace to
+        // delete from would be worse than doing nothing.
+        return Ok(());
+    };
+    let object_name = shd_k8s_name(ns, name);
+    let db_api: Api<DynamicObject> = Api::namespaced_with(
+        ctx.client.clone(),
+        &cnpg_ns,
+        &crate::reconcile::database_ar(),
+    );
+    if let Some(existing) = db_api.get_opt(&object_name).await? {
+        let mut body = existing.data.clone();
+        body["spec"]["ensure"] = json!("absent");
+        let full = json!({
+            "apiVersion": "postgresql.cnpg.io/v1",
+            "kind": "Database",
+            "metadata": { "name": object_name, "namespace": cnpg_ns },
+            "spec": body["spec"],
+        });
+        db_api
+            .patch(&object_name, &apply_params(), &Patch::Apply(&full))
+            .await?;
+        info!(%name, %ns, %object_name, "declared the shared Database absent");
+    }
+    Ok(())
+}
+
+/// The backing recorded in the CR's own status, for a status write that must
+/// not lose it. SSA prunes an omitted field, so a refusal path that rebuilt
+/// an empty [`Backing`] would erase the database name from a CR that still
+/// has one.
+fn backing_of(sd: &SharedDatabase) -> Backing {
+    let Some(st) = sd.status.as_ref() else {
+        return Backing::default();
+    };
+    Backing {
+        database: st.database.clone(),
+        instance: st.instance.clone(),
+        dbnum: st.dbnum,
+    }
+}
+
+/// The `ExtensionUnavailable` condition already on the object, carried
+/// forward by a path that did not re-probe. Same prune rule as
+/// [`backing_of`].
+fn extension_condition_of(
+    sd: &SharedDatabase,
+    prior: &[SharedDatabaseCondition],
+) -> Option<SharedDatabaseCondition> {
+    let _ = sd;
+    prior
+        .iter()
+        .find(|c| c.type_ == COND_EXTENSION_UNAVAILABLE && c.status == "True")
+        .cloned()
+}
+
+/// The extension names named by a previous `ExtensionUnavailable` message.
+///
+/// Parsed back out rather than stored separately: the condition IS the record,
+/// and a second copy in the status would be one more field to keep in step.
+fn previously_missing(prior: &[SharedDatabaseCondition]) -> Vec<String> {
+    prior
+        .iter()
+        .find(|c| c.type_ == COND_EXTENSION_UNAVAILABLE && c.status == "True")
+        .and_then(|c| c.message.as_deref())
+        .and_then(|m| m.rsplit_once(": "))
+        .map(|(_, list)| {
+            list.split(", ")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn error_policy_sd(sd: Arc<SharedDatabase>, err: &ReconcileError, ctx: Arc<Context>) -> Action {
+    let name = sd.name_any();
+    let namespace = sd.namespace().unwrap_or_default();
+    warn!(%name, %namespace, %err, "SharedDatabase reconcile error");
+    ctx.metrics
+        .reconcile_total
+        .with_label_values(&[KIND, &namespace, "error"])
+        .inc();
+    ctx.metrics
+        .reconcile_errors
+        .with_label_values(&[KIND])
+        .inc();
+    Action::requeue(Duration::from_secs(30))
+}
+
+// ---------------------------------------------------------------------------
+// The consumer bind path (claim side)
+// ---------------------------------------------------------------------------
+
+/// `Ready=False` reason while the referenced `SharedDatabase` is absent or
+/// not yet ready.
+const REASON_AWAITING_SHARED_DATABASE: &str = "AwaitingSharedDatabase";
+
+/// Bind ONE consumer claim to an existing shared pg database (ADR 0066 §3.1).
+///
+/// Provisions nothing shared: the database, the groups and the reader grants
+/// belong to [`reconcile_shared_database`]. What this creates is the
+/// consumer's own identity — a login role, a password, a connection Secret —
+/// and it drops exactly those and nothing else when the claim goes.
+///
+/// The connection Secret has the SAME shape the owned-pg arm writes, which is
+/// what lets `claim.pg.*` references, the egress rule and the readiness gate
+/// stay unaware that the database is shared.
+pub async fn bind_pg_consumer(
+    ctx: &Arc<Context>,
+    claim: &Arc<ResourceClaim>,
+    ns: &str,
+    name: &str,
+    provider: &ServiceProvider,
+) -> Result<Action, ReconcileError> {
+    let prior: Vec<operator_core::ResourceClaimCondition> = claim
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.clone())
+        .unwrap_or_default();
+    let shared_name = claim
+        .spec
+        .shared_ref
+        .as_deref()
+        .ok_or_else(|| ReconcileError::Provisioning("bind called without sharedRef".into()))?;
+
+    // The SharedDatabase must exist, in THIS namespace, and be ready. Not
+    // ready is the ordinary case on a fresh cluster (the database is being
+    // created right now), so it requeues rather than failing.
+    let sd_api: Api<SharedDatabase> = Api::namespaced(ctx.client.clone(), ns);
+    let Some(sd) = sd_api.get_opt(shared_name).await? else {
+        let cond = crate::reconcile::ready_condition(
+            "False",
+            REASON_AWAITING_SHARED_DATABASE,
+            &format!(
+                "no SharedDatabase {shared_name:?} in namespace {ns}. A shared database is \
+                 created out of band (`apprafter db create`) and is never created by an \
+                 application that references it — otherwise the first application to mention \
+                 a name would own a database everybody else inherits."
+            ),
+            &prior,
+        );
+        crate::reconcile::patch_status(&ctx.client, ns, name, cond, Default::default()).await?;
+        return Ok(Action::requeue(Duration::from_secs(30)));
+    };
+    let (Some(true), Some(database)) = (
+        sd.status.as_ref().and_then(|s| s.ready),
+        sd.status.as_ref().and_then(|s| s.database.clone()),
+    ) else {
+        let cond = crate::reconcile::ready_condition(
+            "False",
+            REASON_AWAITING_SHARED_DATABASE,
+            &format!("SharedDatabase {shared_name:?} is not ready yet"),
+            &prior,
+        );
+        crate::reconcile::patch_status(&ctx.client, ns, name, cond, Default::default()).await?;
+        return Ok(Action::requeue(Duration::from_secs(20)));
+    };
+
+    let cfg = provider.spec.config.clone().unwrap_or_else(|| json!({}));
+    let cluster = cfg
+        .pointer("/cluster")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_CNPG_CLUSTER)
+        .to_string();
+    let cnpg_ns = cfg
+        .pointer("/namespace")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_CNPG_NAMESPACE)
+        .to_string();
+
+    let role = consumer_role(ns, name);
+    let conn_secret_name = crate::reconcile::connection_secret_name(name);
+    let conn_api: Api<DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), ns, &crate::reconcile::secret_ar());
+
+    // READ-OR-GENERATE the password, rather than a fresh one per reconcile.
+    //
+    // The owned-pg arm regenerates every pass and lets CNPG reset the role to
+    // match. That works because CNPG owns both ends. Here the two ends are the
+    // SQL this controller runs and the Secret it writes, and between them
+    // there is a window in which the server has the new password and the
+    // Secret still has the old one — an application restarting in that window
+    // gets an auth failure, on a reconcile that changed nothing it asked for.
+    // Reusing the stored password closes the window in steady state: the bind
+    // is then an ALTER to the value already in the Secret, which is a no-op
+    // the server accepts.
+    let password = match conn_api.get_opt(&conn_secret_name).await? {
+        Some(existing) => read_secret_string(&existing, "pass")
+            .unwrap_or_else(crate::reconcile::generate_password),
+        None => crate::reconcile::generate_password(),
+    };
+
+    let access = shared_pg::Access::from_spec(claim.spec.access.as_deref());
+    let platform_pw = crate::acl_reconcile::read_secret_key(
+        ctx,
+        &cnpg_ns,
+        &cnpg::platform_role_secret_name(&cluster),
+        "password",
+    )
+    .await?;
+    let admin_dsn = cnpg::dsn(
+        cnpg::PLATFORM_ROLE,
+        &platform_pw,
+        &database,
+        &cluster,
+        &cnpg_ns,
+    );
+    let statements = shared_pg::bind_consumer(ns, shared_name, &role, &database, &password, access);
+    // NOTHING from `statements` may be logged: `bind_consumer` interpolates
+    // the password, because `CREATE ROLE` is a utility statement PostgreSQL
+    // will not parameterise. `PgAdminError` carries only an index, which is
+    // what makes this error safe to surface at all.
+    if let Err(e) = ctx.pg.execute_all(&admin_dsn, &statements).await {
+        warn!(%name, %ns, error = %e, "binding the consumer failed");
+        let cond = crate::reconcile::ready_condition(
+            "False",
+            REASON_AWAITING_SHARED_DATABASE,
+            &format!("could not bind to {shared_name:?}: {e}"),
+            &prior,
+        );
+        crate::reconcile::patch_status(&ctx.client, ns, name, cond, Default::default()).await?;
+        return Ok(Action::requeue(Duration::from_secs(20)));
+    }
+
+    // The connection Secret, identical in shape to the owned-pg arm's.
+    let pg_host = format!("{cluster}-rw.{cnpg_ns}.svc");
+    let owner_uid = claim.metadata.uid.clone().unwrap_or_default();
+    let conn_secret = crate::reconcile::connection_secret_object(
+        &conn_secret_name,
+        ns,
+        &role,
+        &password,
+        &pg_host,
+        5432,
+        &database,
+        &owner_uid,
+        name,
+    );
+    conn_api
+        .patch(
+            &conn_secret_name,
+            &apply_params(),
+            &Patch::Apply(&conn_secret),
+        )
+        .await?;
+
+    let level = match access {
+        shared_pg::Access::ReadWrite => "rw",
+        shared_pg::Access::ReadOnly => "ro",
+    };
+    info!(%name, %ns, %shared_name, %role, %level, "bound consumer to shared database");
+    let cond = crate::reconcile::ready_condition(
+        "True",
+        "Provisioned",
+        &format!("bound to shared database {shared_name:?} ({database}) as {level}"),
+        &prior,
+    );
+    crate::reconcile::patch_status(
+        &ctx.client,
+        ns,
+        name,
+        cond,
+        crate::reconcile::ClaimStatusFields {
+            conn_secret_name: Some(&conn_secret_name),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(Action::requeue(Duration::from_secs(300)))
+}
+
+/// Read one `data` key off a Secret object, base64-decoded.
+///
+/// `stringData` is write-only — the apiserver folds it into `data` — so a
+/// read-back always goes through `data`.
+fn read_secret_string(secret: &DynamicObject, key: &str) -> Option<String> {
+    use base64::Engine as _;
+    let encoded = secret.data.pointer(&format!("/data/{key}"))?.as_str()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Status + finalizer I/O
+// ---------------------------------------------------------------------------
+
+/// The namespace's claims, as raw JSON, for the pure `refCount` helpers.
+async fn namespace_claims(client: &Client, ns: &str) -> Result<Vec<Value>, ReconcileError> {
+    Ok(
+        Api::<DynamicObject>::namespaced_with(client.clone(), ns, &resourceclaim_ar())
+            .list(&Default::default())
+            .await?
+            .items
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<_, _>>()?,
+    )
+}
+
+async fn current_ref_count(client: &Client, ns: &str, name: &str) -> Result<i64, ReconcileError> {
+    Ok(ref_count_for(name, &namespace_claims(client, ns).await?))
+}
+
+async fn current_binders(
+    client: &Client,
+    ns: &str,
+    name: &str,
+) -> Result<Vec<String>, ReconcileError> {
+    Ok(binders_of(name, &namespace_claims(client, ns).await?))
+}
+
+/// SSA-write the terminal status under the provisioner field manager.
+#[allow(clippy::too_many_arguments)]
+async fn write_status(
+    ctx: &Arc<Context>,
+    ns: &str,
+    name: &str,
+    ready: bool,
+    backing: &Backing,
+    ref_count: i64,
+    ready_cond: SharedDatabaseCondition,
+    extension_cond: Option<SharedDatabaseCondition>,
+) -> Result<(), ReconcileError> {
+    let body = sd_status_apply_body_with_conditions(
+        name,
+        ready,
+        backing,
+        ref_count,
+        ready_cond,
+        extension_cond,
+    );
+    let api: Api<SharedDatabase> = Api::namespaced(ctx.client.clone(), ns);
+    api.patch_status(name, &apply_params(), &Patch::Apply(&body))
+        .await?;
+    Ok(())
+}
+
+async fn set_finalizers(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    list: Vec<String>,
+) -> Result<(), ReconcileError> {
+    let api: Api<SharedDatabase> = Api::namespaced(client.clone(), ns);
+    let patch = json!({ "metadata": { "finalizers": list } });
+    api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await?;
+    Ok(())
+}
+
+fn with_finalizer(current: &[String]) -> Vec<String> {
+    let mut out = current.to_vec();
+    if !out.iter().any(|f| f == SD_FINALIZER) {
+        out.push(SD_FINALIZER.to_string());
+    }
+    out
+}
+
+fn without_finalizer(current: &[String]) -> Vec<String> {
+    current
+        .iter()
+        .filter(|f| *f != SD_FINALIZER)
+        .cloned()
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use operator_core::PgExtension;
 
     fn claim_json(name: &str, shared_ref: Option<&str>) -> Value {
         let mut c = json!({
@@ -515,50 +1278,5 @@ mod tests {
     #[test]
     fn no_extension_condition_when_nothing_is_missing() {
         assert!(extension_unavailable_condition(&[], &[]).is_none());
-    }
-
-    // --- extension availability ---
-
-    #[test]
-    fn a_declared_extension_the_image_lacks_is_reported() {
-        let declared = vec![
-            PgExtension {
-                name: "vector".into(),
-                ..Default::default()
-            },
-            PgExtension {
-                name: "pg_trgm".into(),
-                ..Default::default()
-            },
-        ];
-        let available = vec!["pg_trgm".to_string(), "pgcrypto".to_string()];
-        assert_eq!(missing_extensions(&declared, &available), vec!["vector"]);
-    }
-
-    #[test]
-    fn availability_is_compared_case_insensitively() {
-        // Postgres folds unquoted identifiers to lower case and
-        // `pg_available_extensions` reports the folded name; a manifest may
-        // spell it otherwise. Reporting `pgVector` missing while the server
-        // offers `pgvector` would be a false alarm nobody could act on.
-        let declared = vec![PgExtension {
-            name: "pgVector".into(),
-            ..Default::default()
-        }];
-        assert!(missing_extensions(&declared, &["pgvector".to_string()]).is_empty());
-    }
-
-    #[test]
-    fn the_reported_name_is_the_one_the_manifest_used() {
-        // Not the folded one: the operator has to find this string in their
-        // own file.
-        let declared = vec![PgExtension {
-            name: "pgVector".into(),
-            ..Default::default()
-        }];
-        assert_eq!(
-            missing_extensions(&declared, &["pg_trgm".to_string()]),
-            vec!["pgVector"]
-        );
     }
 }

@@ -78,6 +78,52 @@ pub trait PgAdmin: Send + Sync {
     async fn extension_available(&self, dsn: &str, extension: &str) -> Result<bool, PgAdminError>;
 }
 
+/// The outcome of asking a live server about a set of declared extensions.
+///
+/// Three states rather than a `Vec<String>`, because "the server says none
+/// are missing" and "the server did not answer" must not collapse into the
+/// same empty list. They call for opposite actions: the first is a clean
+/// result, the second is a reason to say nothing and ask again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionProbe {
+    /// Every declared extension is available — or none was declared.
+    AllPresent,
+    /// The server answered, and these are absent. Never empty.
+    Missing(Vec<String>),
+    /// The server could not be reached. NOT a finding about extensions.
+    Unreachable,
+}
+
+/// Ask `dsn` which of `declared` it provides (ADR 0066 §4.2).
+///
+/// Shared by the owned-database arm and the `SharedDatabase` controller so
+/// that one definition fixes what best-effort means here. A server we cannot
+/// reach is not the same finding as an extension that does not exist, and
+/// failing a claim on a transient dial would turn a network blip into a
+/// provisioning error — so the first connection failure ends the probe as
+/// [`ExtensionProbe::Unreachable`] and the next reconcile asks again.
+pub async fn probe_extensions(
+    pg: &dyn PgAdmin,
+    dsn: &str,
+    declared: &[operator_core::PgExtension],
+) -> ExtensionProbe {
+    let mut missing: Vec<String> = Vec::new();
+    for ext in declared {
+        match pg.extension_available(dsn, &ext.name).await {
+            Ok(true) => {}
+            // The name reported is the one the MANIFEST used, not a folded
+            // copy: the reader has to find this string in their own file.
+            Ok(false) => missing.push(ext.name.clone()),
+            Err(_) => return ExtensionProbe::Unreachable,
+        }
+    }
+    if missing.is_empty() {
+        ExtensionProbe::AllPresent
+    } else {
+        ExtensionProbe::Missing(missing)
+    }
+}
+
 /// The host part of a DSN, for error messages. Never the whole DSN — that
 /// carries the password.
 fn host_of(dsn: &str) -> String {
@@ -210,5 +256,87 @@ mod tests {
             )
         }
         assert!(_assert_no_statement_field(&err));
+    }
+
+    // --- probe_extensions: the three states must stay distinguishable ---
+
+    /// A `PgAdmin` that answers from a fixed availability list, and can be
+    /// told to fail the connection instead.
+    struct FakePg {
+        available: Vec<&'static str>,
+        reachable: bool,
+    }
+
+    #[async_trait]
+    impl PgAdmin for FakePg {
+        async fn execute_all(&self, _dsn: &str, _s: &[String]) -> Result<(), PgAdminError> {
+            Ok(())
+        }
+        async fn extension_available(
+            &self,
+            _dsn: &str,
+            extension: &str,
+        ) -> Result<bool, PgAdminError> {
+            if !self.reachable {
+                return Err(PgAdminError::ConnectionLost {
+                    host: "h:5432".into(),
+                });
+            }
+            Ok(self.available.contains(&extension))
+        }
+    }
+
+    fn ext(name: &str) -> operator_core::PgExtension {
+        operator_core::PgExtension {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn every_declared_extension_present_is_all_present() {
+        let pg = FakePg {
+            available: vec!["vector", "pg_trgm"],
+            reachable: true,
+        };
+        let got = probe_extensions(&pg, "dsn", &[ext("vector"), ext("pg_trgm")]).await;
+        assert_eq!(got, ExtensionProbe::AllPresent);
+    }
+
+    #[tokio::test]
+    async fn declaring_nothing_is_all_present_not_a_probe() {
+        let pg = FakePg {
+            available: vec![],
+            reachable: true,
+        };
+        assert_eq!(
+            probe_extensions(&pg, "dsn", &[]).await,
+            ExtensionProbe::AllPresent
+        );
+    }
+
+    #[tokio::test]
+    async fn an_absent_extension_is_reported_by_the_name_the_manifest_used() {
+        let pg = FakePg {
+            available: vec!["pg_trgm"],
+            reachable: true,
+        };
+        let got = probe_extensions(&pg, "dsn", &[ext("vector"), ext("pg_trgm")]).await;
+        assert_eq!(got, ExtensionProbe::Missing(vec!["vector".into()]));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_server_is_not_an_empty_missing_list() {
+        // THE distinction this enum exists for. Collapsing these two into
+        // `Vec<String>` makes a network blip indistinguishable from a clean
+        // result, and the caller then writes `Ready=True` on a database it
+        // never actually asked about.
+        let pg = FakePg {
+            available: vec![],
+            reachable: false,
+        };
+        let got = probe_extensions(&pg, "dsn", &[ext("vector")]).await;
+        assert_eq!(got, ExtensionProbe::Unreachable);
+        assert_ne!(got, ExtensionProbe::AllPresent);
     }
 }

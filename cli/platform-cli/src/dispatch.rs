@@ -261,6 +261,7 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
             } => commands::secret::run_remove(&name, &namespace, yes)?,
         },
         Commands::Volume { action } => commands::volume::run(action)?,
+        Commands::Db { action } => commands::db::run(action)?,
         Commands::Node { action } => commands::node_prep::run(action)?,
         Commands::Top => commands::top::run()?,
         Commands::Export {

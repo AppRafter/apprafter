@@ -314,6 +314,15 @@ pub enum Commands {
         #[command(subcommand)]
         action: VolumeCommand,
     },
+    /// Manage SharedDatabase CRs — a PostgreSQL database or a Redis
+    /// keyspace several Applications bind, each with its own
+    /// credential and its own access level. Databases are namespaced
+    /// and outlive every application bound to them; `rm` is refused
+    /// while any application is still bound.
+    Db {
+        #[command(subcommand)]
+        action: DbCommand,
+    },
     /// Node-level operations on the active target's cluster node.
     /// `prep` retrofits the kubelet node reservations + k3s
     /// OOM-protection AND provisions host swap (NoSwap for pods) over
@@ -1568,6 +1577,61 @@ pub enum VolumeCommand {
         name: String,
         /// Namespace. Defaults to `apprafter-system`.
         #[arg(long, short = 'n', default_value = "apprafter-system")]
+        namespace: String,
+        /// Skip the confirmation prompt.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+/// `apprafter db …` subcommands.
+pub enum DbCommand {
+    /// Create a SharedDatabase CR in the cluster.
+    Create {
+        /// SharedDatabase `metadata.name` (DNS-1123).
+        name: String,
+        /// `pg` or `redis`.
+        #[arg(long, value_parser = ["pg", "redis"])]
+        r#type: String,
+        /// Size class passed through to the backend (e.g. `small`).
+        #[arg(long)]
+        size: Option<String>,
+        /// PostgreSQL extension to create in the database. Repeatable.
+        /// Bounded by the platform's allow list; `pg` only.
+        #[arg(long = "extension")]
+        extensions: Vec<String>,
+        /// Keep the data across the CR's deletion. `redis` only.
+        #[arg(long)]
+        persistent: bool,
+        /// Target namespace. Applications may only bind a database in
+        /// their OWN namespace, so this is the namespace of the
+        /// applications that will share it.
+        #[arg(long, short = 'n', default_value = "default")]
+        namespace: String,
+    },
+    /// List SharedDatabases with their type, refCount and backing.
+    #[command(alias = "ls")]
+    List {
+        /// Namespace to list. Omit for cluster-wide listing.
+        #[arg(long, short = 'n')]
+        namespace: Option<String>,
+    },
+    /// Show detail for one SharedDatabase, including who is bound to it.
+    Status {
+        /// SharedDatabase `metadata.name`.
+        name: String,
+        /// Namespace.
+        #[arg(long, short = 'n', default_value = "default")]
+        namespace: String,
+    },
+    /// Delete a SharedDatabase and its data. Refused while any
+    /// application is still bound.
+    Rm {
+        /// SharedDatabase `metadata.name`.
+        name: String,
+        /// Namespace.
+        #[arg(long, short = 'n', default_value = "default")]
         namespace: String,
         /// Skip the confirmation prompt.
         #[arg(long, default_value_t = false)]

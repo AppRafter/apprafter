@@ -63,7 +63,7 @@ use kube::Client;
 use thiserror::Error;
 use tracing::{info, warn};
 
-use operator_core::{Metrics, ResourceClaim, SharedVolume};
+use operator_core::{Metrics, ResourceClaim, SharedDatabase, SharedVolume};
 
 pub mod acl_reconcile;
 pub mod cnpg;
@@ -294,6 +294,7 @@ pub async fn run(
 ) -> Result<(), ReconcileError> {
     let claims: Api<ResourceClaim> = Api::all(client.clone());
     let shared_volumes: Api<SharedVolume> = Api::all(client.clone());
+    let shared_databases: Api<SharedDatabase> = Api::all(client.clone());
     let ctx = Arc::new(Context::with_acl_dirty(client, metrics, acl_dirty));
     info!(
         field_manager = FIELD_MANAGER,
@@ -334,6 +335,8 @@ pub async fn run(
     // delete-guard would read a stale refCount=0 and wrongly allow deletion of
     // an in-use volume — a correctness bug, walk-found. The 300s requeue stays
     // as the safety net.
+    // Cloned BEFORE controller 2's `run()` takes `ctx` by value.
+    let sd_ctx = ctx.clone();
     let sv_claims: Api<ResourceClaim> = Api::all(ctx.client.clone());
     let sv_controller = Controller::new(shared_volumes, watcher::Config::default())
         .with_config(ControllerConfig::default().concurrency(1));
@@ -367,13 +370,45 @@ pub async fn run(
             }
         });
 
-    // Drive BOTH controllers for the binary's lifetime. `tokio::join!` runs
-    // both stream-drive futures concurrently and returns only if both ever
+    // Controller 3 — SharedDatabase (2.29 / ADR 0066). Same shape as
+    // controller 2 and for the same reasons, with one difference worth
+    // naming: the watch mapper reads `spec.sharedRef` off the claim rather
+    // than a label. `ResourceClaim` is typed here and the field is part of
+    // its schema, so a label would be a second copy that can disagree with
+    // the first — and `refCount` gates a destructive `db rm`, so it reads the
+    // field the provisioner acts on.
+    //
+    // The store filter is carried over verbatim: an orphan consumer claim
+    // whose `sharedRef` names a database that is gone would otherwise make
+    // the runtime error and requeue forever. That storm is SharedVolume's
+    // walk-found Bug C, and it costs one line not to repeat it.
+    let sd_claims: Api<ResourceClaim> = Api::all(sd_ctx.client.clone());
+    let sd_controller = Controller::new(shared_databases, watcher::Config::default())
+        .with_config(ControllerConfig::default().concurrency(1));
+    let sd_store = sd_controller.store();
+    let sd_drive = sd_controller
+        .watches(sd_claims, watcher::Config::default(), move |claim| {
+            shared_database::shared_database_refs_in_store(&claim, &sd_store).into_iter()
+        })
+        .run(
+            shared_database::reconcile_shared_database,
+            shared_database::error_policy_sd,
+            sd_ctx,
+        )
+        .for_each(|res| async move {
+            match res {
+                Ok((obj_ref, _)) => info!(shared_database = %obj_ref.name, "reconciled"),
+                Err(e) => warn!(error = %e, "SharedDatabase reconcile failed"),
+            }
+        });
+
+    // Drive ALL THREE controllers for the binary's lifetime. `tokio::join!`
+    // runs the stream-drive futures concurrently and returns only if all ever
     // complete (the kube-rs `Controller` streams run forever in practice).
-    // NOTE: if one stream terminates, `run()` stays pending on the other and
+    // NOTE: if one stream terminates, `run()` stays pending on the others and
     // the ended controller is NOT restarted — a future improvement would
     // drive each under its own `tokio::spawn` with a restart-on-exit policy.
-    tokio::join!(claim_drive, sv_drive);
+    tokio::join!(claim_drive, sv_drive, sd_drive);
     info!("ResourceClaimProvisioner streams ended");
     Ok(())
 }

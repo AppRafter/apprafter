@@ -1827,6 +1827,219 @@
     },
     {
       "path": [
+        "db"
+      ],
+      "aliases": [],
+      "about": "Manage SharedDatabase CRs — a PostgreSQL database or a Redis keyspace several Applications bind, each with its own credential and its own access level. Databases are namespaced and outlive every application bound to them; `rm` is refused while any application is still bound",
+      "long_about": null,
+      "usage": "Usage: apprafter db <COMMAND>",
+      "hidden": false,
+      "examples": [],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
+        "db",
+        "create"
+      ],
+      "aliases": [],
+      "about": "Create a SharedDatabase CR in the cluster",
+      "long_about": null,
+      "usage": "Usage: apprafter db create [OPTIONS] --type <TYPE> <NAME>",
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "extensions",
+          "long": "extension",
+          "short": null,
+          "takes_value": true,
+          "value_name": "EXTENSIONS",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "PostgreSQL extension to create in the database. Repeatable. Bounded by the platform's allow list; `pg` only"
+        },
+        {
+          "id": "namespace",
+          "long": "namespace",
+          "short": "n",
+          "takes_value": true,
+          "value_name": "NAMESPACE",
+          "default": "default",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Target namespace. Applications may only bind a database in their OWN namespace, so this is the namespace of the applications that will share it"
+        },
+        {
+          "id": "persistent",
+          "long": "persistent",
+          "short": null,
+          "takes_value": false,
+          "value_name": "PERSISTENT",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Keep the data across the CR's deletion. `redis` only"
+        },
+        {
+          "id": "size",
+          "long": "size",
+          "short": null,
+          "takes_value": true,
+          "value_name": "SIZE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Size class passed through to the backend (e.g. `small`)"
+        },
+        {
+          "id": "type",
+          "long": "type",
+          "short": null,
+          "takes_value": true,
+          "value_name": "TYPE",
+          "default": null,
+          "env": null,
+          "required": true,
+          "possible_values": [
+            "pg",
+            "redis"
+          ],
+          "help": "`pg` or `redis`"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "SharedDatabase `metadata.name` (DNS-1123)"
+        }
+      ]
+    },
+    {
+      "path": [
+        "db",
+        "list"
+      ],
+      "aliases": [
+        "ls"
+      ],
+      "about": "List SharedDatabases with their type, refCount and backing",
+      "long_about": null,
+      "usage": "Usage: apprafter db list [OPTIONS]",
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "namespace",
+          "long": "namespace",
+          "short": "n",
+          "takes_value": true,
+          "value_name": "NAMESPACE",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Namespace to list. Omit for cluster-wide listing"
+        }
+      ],
+      "positionals": []
+    },
+    {
+      "path": [
+        "db",
+        "rm"
+      ],
+      "aliases": [],
+      "about": "Delete a SharedDatabase and its data. Refused while any application is still bound",
+      "long_about": null,
+      "usage": "Usage: apprafter db rm [OPTIONS] <NAME>",
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "namespace",
+          "long": "namespace",
+          "short": "n",
+          "takes_value": true,
+          "value_name": "NAMESPACE",
+          "default": "default",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Namespace"
+        },
+        {
+          "id": "yes",
+          "long": "yes",
+          "short": null,
+          "takes_value": false,
+          "value_name": "YES",
+          "default": null,
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Skip the confirmation prompt"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "SharedDatabase `metadata.name`"
+        }
+      ]
+    },
+    {
+      "path": [
+        "db",
+        "status"
+      ],
+      "aliases": [],
+      "about": "Show detail for one SharedDatabase, including who is bound to it",
+      "long_about": null,
+      "usage": "Usage: apprafter db status [OPTIONS] <NAME>",
+      "hidden": false,
+      "examples": [],
+      "args": [
+        {
+          "id": "namespace",
+          "long": "namespace",
+          "short": "n",
+          "takes_value": true,
+          "value_name": "NAMESPACE",
+          "default": "default",
+          "env": null,
+          "required": false,
+          "possible_values": [],
+          "help": "Namespace"
+        }
+      ],
+      "positionals": [
+        {
+          "id": "name",
+          "value_name": "NAME",
+          "required": true,
+          "multiple": false,
+          "possible_values": [],
+          "help": "SharedDatabase `metadata.name`"
+        }
+      ]
+    },
+    {
+      "path": [
         "destroy"
       ],
       "aliases": [],
