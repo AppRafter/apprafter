@@ -533,7 +533,41 @@ STILL=$(psql_as apprafter_admin "$PG_ADMIN_PW" "$PG_DB_NAME" \
     "SELECT note FROM shared_orders WHERE id=1;")
 check "the shared data survived both consumers being deleted" "$STILL" "from-web"
 
+# REVOCATION, which is the guide's own promise and the reason a consumer gets
+# its own login at all. The connection Secret cascades with the claim either
+# way, so its disappearance proves nothing — what has to be gone is the ROLE
+# on the server. Without this assertion a leaked role is invisible: the
+# database keeps working, refCount falls to 0, and a credential somebody may
+# have captured goes on working against the shared data forever.
+printf '  waiting for the consumer roles to be revoked ...\n'
+_deadline=$(( $(date +%s) + 180 ))
+while [ "$(date +%s)" -lt "$_deadline" ]; do
+    LEFT=$(psql_as apprafter_admin "$PG_ADMIN_PW" postgres \
+        "SELECT count(*) FROM pg_roles WHERE rolname IN ('${RW_ROLE}','${RO_ROLE}');")
+    [ "$LEFT" = "0" ] && break
+    sleep 5
+done
+check "both consumer roles are gone from the server" "$LEFT" "0"
+# ...and the GROUPS are still there, because the database is. Dropping a
+# consumer must not take the shared structure with it.
+GROUPS_LEFT=$(psql_as apprafter_admin "$PG_ADMIN_PW" postgres \
+    "SELECT count(*) FROM pg_roles WHERE rolname IN ('${PG_GROUP}','${PG_READER_GROUP}');")
+check "the shared database's groups survive a consumer leaving" "$GROUPS_LEFT" "2"
+
 apprafter db rm "$PG_DB" -n "$APP_NS" --yes >/dev/null || die "db rm at refCount 0"
+
+# The delete drops the groups too — they exist for this database and nothing
+# else. Asserted because `drop_backing`'s own doc comment claimed to do this
+# for a while before any builder existed to do it with.
+printf '  waiting for the groups to be dropped ...\n'
+_deadline=$(( $(date +%s) + 240 ))
+while [ "$(date +%s)" -lt "$_deadline" ]; do
+    GROUPS_NOW=$(psql_as apprafter_admin "$PG_ADMIN_PW" postgres \
+        "SELECT count(*) FROM pg_roles WHERE rolname IN ('${PG_GROUP}','${PG_READER_GROUP}');")
+    [ "$GROUPS_NOW" = "0" ] && break
+    sleep 5
+done
+check "the groups are dropped with the database" "$GROUPS_NOW" "0"
 _deadline=$(( $(date +%s) + 180 ))
 while [ "$(date +%s)" -lt "$_deadline" ]; do
     kubectl -n "$APP_NS" get "$SHDB_RES" "$PG_DB" >/dev/null 2>&1 || break

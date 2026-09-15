@@ -394,6 +394,27 @@ pub async fn reconcile(
             if claim.spec.type_ == "jetstream" {
                 delete_nats_declared_objects(&ctx, &claim, &ns).await?;
             }
+            // 2.29 (ADR 0066 §6). A consumer of a SHARED database owns no
+            // backing and must not be snapshotted — but it does own one thing
+            // that has to go: its credential.
+            //
+            // Two failures if this is skipped, and the second is the one that
+            // matters. The snapshot would carry the CNPG shape derived from
+            // the claim's own coordinates — a role and a database this
+            // consumer never owned — and the grace-GC would later try to drop
+            // them. And the consumer's role would simply stay on the server
+            // with its password intact, so "revocation is per application"
+            // would be false: the Secret cascades out of the cluster while
+            // the login it held keeps working against the shared data.
+            if claim.spec.shared_ref.is_some() {
+                crate::shared_database::revoke_consumer(&ctx, &claim, &ns, &name).await;
+                info!(
+                    %name, %ns,
+                    "shared-database consumer deleted — credential revoked, no RetainedClaim snapshot"
+                );
+                set_finalizers(&ctx.client, &ns, &name, without_finalizer(&finalizers)).await?;
+                return Ok(Action::await_change());
+            }
             snapshot_retained_claim(&ctx, &claim, &ns, &name).await?;
             info!(
                 %name, %ns,

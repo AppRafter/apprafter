@@ -1437,6 +1437,130 @@ pub async fn bind_redis_consumer(
     Ok(Action::requeue(Duration::from_secs(300)))
 }
 
+/// Revoke ONE consumer's credential when its claim is deleted (ADR 0066 §6).
+///
+/// Drops that consumer's role or ACL user and nothing else. The shared
+/// database and its data are never touched by a consumer's lifecycle — the
+/// property the whole CRD exists to provide — so this is deliberately the
+/// smallest possible cleanup.
+///
+/// BEST-EFFORT, and it returns no error on purpose. This runs inside the
+/// finalizer, and a backend that is momentarily unreachable must not wedge a
+/// delete forever: an application stuck in Terminating because a database is
+/// restarting is a worse outcome than a role that outlives its Secret by a
+/// few minutes. The cost is bounded — the connection Secret cascades with the
+/// claim either way, so the password stops being readable from the cluster at
+/// the same moment regardless, and what survives a failure here is a login
+/// nobody holds.
+///
+/// It is not silent, though: a failure is logged at WARN with the role named,
+/// which is what an operator needs in order to drop it by hand.
+pub async fn revoke_consumer(ctx: &Arc<Context>, claim: &Arc<ResourceClaim>, ns: &str, name: &str) {
+    let Some(shared_name) = claim.spec.shared_ref.as_deref() else {
+        return;
+    };
+    let sd_api: Api<SharedDatabase> = Api::namespaced(ctx.client.clone(), ns);
+    let sd = match sd_api.get_opt(shared_name).await {
+        Ok(Some(sd)) => sd,
+        // The database is gone too — its own delete drops the groups, and a
+        // consumer role inside a dropped database goes with `DROP OWNED`.
+        Ok(None) => return,
+        Err(e) => {
+            warn!(%name, %ns, error = %e, "could not read the shared database to revoke a consumer");
+            return;
+        }
+    };
+
+    let providers: Vec<ServiceProvider> = match Api::<ServiceProvider>::all(ctx.client.clone())
+        .list(&Default::default())
+        .await
+    {
+        Ok(l) => l.items,
+        Err(e) => {
+            warn!(%name, %ns, error = %e, "could not list providers to revoke a consumer");
+            return;
+        }
+    };
+    let candidates: Vec<Candidate> = providers.iter().map(Candidate::from_provider).collect();
+    let selector = sd.spec.selector.clone().unwrap_or_default();
+    let cfg = select_provider(&sd.spec.type_, &selector, &candidates)
+        .and_then(|n| providers.iter().find(|p| p.name_any() == n))
+        .and_then(|p| p.spec.config.clone())
+        .unwrap_or_else(|| json!({}));
+
+    match sd.spec.type_.as_str() {
+        "pg" => {
+            let Some(database) = sd.status.as_ref().and_then(|s| s.database.clone()) else {
+                return;
+            };
+            let cluster = cfg
+                .pointer("/cluster")
+                .and_then(Value::as_str)
+                .unwrap_or(DEFAULT_CNPG_CLUSTER)
+                .to_string();
+            let cnpg_ns = cfg
+                .pointer("/namespace")
+                .and_then(Value::as_str)
+                .unwrap_or(DEFAULT_CNPG_NAMESPACE)
+                .to_string();
+            let role = consumer_role(ns, name);
+            let pw_secret = cnpg::platform_role_secret_name(&cluster);
+            let Ok(pw) =
+                crate::acl_reconcile::read_secret_key(ctx, &cnpg_ns, &pw_secret, "password").await
+            else {
+                warn!(%name, %ns, %role, "platform role secret unreadable; consumer role NOT dropped");
+                return;
+            };
+            // Connected to the SHARED database, not to `postgres`: `DROP
+            // OWNED BY` is per-database, and running it elsewhere would drop
+            // the role while leaving whatever it owns here behind.
+            let dsn = cnpg::dsn(cnpg::PLATFORM_ROLE, &pw, &database, &cluster, &cnpg_ns);
+            if let Err(e) = ctx
+                .pg
+                .execute_all(&dsn, &shared_pg::unbind_consumer(&role))
+                .await
+            {
+                warn!(%name, %ns, %role, error = %e, "consumer role NOT dropped — drop it by hand");
+            } else {
+                info!(%name, %ns, %role, "revoked the consumer's role");
+            }
+        }
+        "redis" => {
+            let Some(instance) = sd.status.as_ref().and_then(|s| s.instance.clone()) else {
+                return;
+            };
+            let df_ns = cfg
+                .pointer("/namespace")
+                .and_then(Value::as_str)
+                .unwrap_or("dragonfly-system")
+                .to_string();
+            let user = crate::dragonfly::acl_user(ns, name);
+            let addr = crate::dragonfly::instance_addr(&instance, &df_ns);
+            let Ok(admin_pw) = crate::acl_reconcile::read_secret_key(
+                ctx,
+                &df_ns,
+                &crate::dragonfly::admin_secret_name(&instance),
+                "password",
+            )
+            .await
+            else {
+                warn!(%name, %ns, %user, "instance admin secret unreadable; ACL user NOT dropped");
+                return;
+            };
+            // DELUSER only. NOT flushdb — the keyspace belongs to the shared
+            // database and its other consumers are still using it. That one
+            // line is the difference between removing an application and
+            // wiping everybody's cache.
+            if let Err(e) = ctx.redis.acl_deluser(&addr, &admin_pw, &user).await {
+                warn!(%name, %ns, %user, error = %e, "ACL user NOT dropped — drop it by hand");
+            } else {
+                info!(%name, %ns, %user, "revoked the consumer's ACL user");
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Read one `data` key off a Secret object, base64-decoded.
 ///
 /// `stringData` is write-only — the apiserver folds it into `data` — so a
