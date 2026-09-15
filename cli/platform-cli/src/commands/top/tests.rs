@@ -683,6 +683,41 @@ fn an_unmeasurable_cluster_does_not_also_report_every_pod_as_unsampled() {
 }
 
 #[test]
+fn a_pending_pod_is_unscheduled_not_unsampled() {
+    // A pod with no node can never have a metrics sample and is also using
+    // nothing, so counting it as "not sampled yet" blames the scrape
+    // interval for a pod the scrape was right to skip — and the footnote
+    // then claims the USE columns under-count by an amount that is zero.
+    // It is already reported on its own, as `unscheduled`.
+    let mut pods = pod_list();
+    pods["items"].as_array_mut().unwrap().push(pod(
+        "apprafter",
+        "waiting-for-room",
+        None,
+        json!({ "apprafter.io/application": "shop" }),
+        "50m",
+        "64Mi",
+    ));
+    let r = build_report(
+        &parse_nodes(&node_list()),
+        &parse_pods(&pods),
+        &all_measured(),
+    );
+    assert_eq!(
+        r.unscheduled, 1,
+        "the Pending pod is reported as unscheduled"
+    );
+    assert_eq!(
+        r.unsampled_usage, 0,
+        "a Pending pod must not be counted as awaiting a scrape"
+    );
+    assert_eq!(r.unsampled_disk, 0);
+    let text = render(&r);
+    assert!(!text.contains("had no CPU / memory sample"), "{text}");
+    assert!(!text.contains("under-count"), "{text}");
+}
+
+#[test]
 fn a_fully_sampled_cluster_says_nothing_about_sampling() {
     let r = report(&all_measured());
     assert_eq!(r.unsampled_usage, 0);

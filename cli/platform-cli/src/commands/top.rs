@@ -662,11 +662,18 @@ pub fn build_report(
         .map(|p| p.namespace.clone())
         .collect();
 
+    // Only SCHEDULED pods can be counted as "not sampled yet". A pod with
+    // no node is Pending, can never have a sample, and is using nothing —
+    // folding it in here would blame the scrape interval for a pod the
+    // scrape was right to skip, and the footnote would claim the USE
+    // columns under-count by an amount that is zero. Pending pods are
+    // already reported on their own, as `unscheduled`.
     let missing = |present: bool, held: &dyn Fn(&(String, String)) -> bool| {
         if !present {
             return 0;
         }
         pods.iter()
+            .filter(|p| p.node.is_some())
             .filter(|p| !held(&(p.namespace.clone(), p.name.clone())))
             .count()
     };
