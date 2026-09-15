@@ -9,6 +9,7 @@
 //! binary.
 
 use chrono::{DateTime, Utc};
+use cli_core::timefmt::format_timestamp_with_relative;
 use cli_core::{CliError, Result};
 use serde_json::Value;
 use tabled::settings::{object::Columns, Modify, Width};
@@ -500,71 +501,13 @@ fn collect_history_rows(status: &Value, now: DateTime<Utc>, take: usize) -> Vec<
         .collect()
 }
 
-/// Render an RFC3339 timestamp as `2026-05-24 14:30 UTC
-/// (2 hours ago)` style. Operators don't think in raw RFC3339
-/// — the relative suffix surfaces "is this recent?" at a
-/// glance, the absolute prefix keeps the exact moment
-/// available for audit.
-///
-/// Returns the original string verbatim when parsing fails so
-/// we never lose information operators may need; the only cost
-/// of a parse failure is the missing relative suffix.
-pub(crate) fn format_timestamp_with_relative(raw: &str, now: DateTime<Utc>) -> String {
-    let Ok(parsed) = DateTime::parse_from_rfc3339(raw) else {
-        return raw.to_string();
-    };
-    let utc = parsed.with_timezone(&Utc);
-    let absolute = utc.format("%Y-%m-%d %H:%M UTC");
-    let delta = now.signed_duration_since(utc);
-    let relative = humanise_relative(delta);
-    format!("{absolute} ({relative})")
-}
-
-/// Render a signed duration relative to "now" as a short
-/// English phrase: `just now`, `2 minutes ago`, `3 hours ago`,
-/// `5 days ago`, `in 3 minutes`, etc. Granularity matches
-/// what operators actually care about — sub-minute precision
-/// is noise on platform-level events.
-fn humanise_relative(delta: chrono::Duration) -> String {
-    let secs = delta.num_seconds();
-    let abs = secs.unsigned_abs();
-    let in_past = secs >= 0;
-
-    let (unit, value) = if abs < 45 {
-        return if in_past {
-            "just now".to_string()
-        } else {
-            "in a few seconds".to_string()
-        };
-    } else if abs < 90 {
-        ("minute", 1u64)
-    } else if abs < 60 * 60 {
-        ("minute", (abs as f64 / 60.0).round() as u64)
-    } else if abs < 60 * 60 * 2 {
-        ("hour", 1u64)
-    } else if abs < 60 * 60 * 24 {
-        ("hour", (abs as f64 / 3600.0).round() as u64)
-    } else if abs < 60 * 60 * 24 * 2 {
-        ("day", 1u64)
-    } else if abs < 60 * 60 * 24 * 30 {
-        ("day", (abs as f64 / 86_400.0).round() as u64)
-    } else if abs < 60 * 60 * 24 * 60 {
-        ("month", 1u64)
-    } else if abs < 60 * 60 * 24 * 365 {
-        ("month", (abs as f64 / 2_592_000.0).round() as u64)
-    } else if abs < 60 * 60 * 24 * 365 * 2 {
-        ("year", 1u64)
-    } else {
-        ("year", (abs as f64 / 31_536_000.0).round() as u64)
-    };
-
-    let plural = if value == 1 { "" } else { "s" };
-    if in_past {
-        format!("{value} {unit}{plural} ago")
-    } else {
-        format!("in {value} {unit}{plural}")
-    }
-}
+// The absolute-plus-relative timestamp rendering used to live here, and
+// was the only copy of it in the CLI — so the surfaces that did not import
+// it from this module printed raw RFC3339 instead. It now lives in
+// `cli_core::timefmt`, reachable from every crate. The tests below stayed
+// behind deliberately: they pinned the shipped phrasing before the move and
+// still pass against the moved implementation, which is what makes the move
+// a move rather than a rewrite.
 
 /// `apprafter platform freeze <component> [--version <v>]`
 /// patches `PlatformStack.spec.overrides.<component>.pin`.

@@ -19,6 +19,10 @@ serde              = { workspace = true }
 serde_json         = { workspace = true }
 serde_yaml         = { workspace = true }
 age                = { workspace = true }
+# `timefmt` renders the one absolute-plus-relative timestamp form every
+# surface prints; the `clock` feature is unused here (callers pass `now`)
+# but the workspace entry carries it.
+chrono             = { workspace = true }
 dirs               = { workspace = true }
 # Used both in production (target::atomic_write builds tempfiles in
 # the destination dir for safe replace) and in tests (per-test root).

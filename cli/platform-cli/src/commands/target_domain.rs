@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 
+use cli_core::timefmt::format_timestamp;
 use cli_core::{CliError, Result};
 use serde_json::{json, Value};
 use tabled::{settings::Style, Table, Tabled};
@@ -425,7 +426,12 @@ pub(crate) fn domain_list_rows(
             DomainListRow {
                 cert,
                 apps,
-                added_at: field(e, "addedAt"),
+                // Rendered, not raw. `addedAt` is stored RFC3339 and used to
+                // reach the column that way, which is the one form a reader
+                // has to decode by hand. `format_timestamp` returns anything
+                // unparseable verbatim, so the `-` from a missing field and
+                // an entry written by some other tool both survive.
+                added_at: format_timestamp(&field(e, "addedAt")),
                 added_by: field(e, "addedBy"),
                 domain,
             }
@@ -813,6 +819,39 @@ mod tests {
         assert_eq!(rows[0].cert, "-");
         assert_eq!(rows[0].added_at, "-");
         assert_eq!(rows[0].added_by, "-");
+    }
+
+    /// `Added At` is rendered, not passed through. The column carried the
+    /// stored RFC3339 verbatim, so the one column in this table a reader
+    /// scans for "when did this happen?" was the one written in the form
+    /// that hides it.
+    #[test]
+    fn the_added_at_column_is_rendered_not_raw_rfc3339() {
+        let rows = domain_list_rows(
+            &[serde_json::json!({
+                "domain": "apprafter.dev",
+                "addedAt": "2026-06-15T09:04:31+00:00",
+            })],
+            &serde_json::json!({"items": []}),
+            &BTreeSet::new(),
+        );
+        assert_eq!(rows[0].added_at, "2026-06-15 09:04 UTC");
+        assert_ne!(
+            rows[0].added_at, "2026-06-15T09:04:31+00:00",
+            "the stored form reached the column unchanged"
+        );
+    }
+
+    /// A value this cannot parse is still the only record of whatever wrote
+    /// it, so it survives intact rather than becoming a placeholder.
+    #[test]
+    fn an_unparseable_added_at_is_shown_rather_than_swallowed() {
+        let rows = domain_list_rows(
+            &[serde_json::json!({ "domain": "d", "addedAt": "last tuesday" })],
+            &serde_json::json!({"items": []}),
+            &BTreeSet::new(),
+        );
+        assert_eq!(rows[0].added_at, "last tuesday");
     }
 
     /// The `Apps` cell counts the apps actually serving on that zone — it is

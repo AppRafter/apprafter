@@ -2135,7 +2135,40 @@ pub(crate) struct ListingScope<'a> {
     pub hidden: usize,
 }
 
-/// Narrow a repository listing to what this cluster owns. Pure.
+/// Sort a listing newest-first, in place.
+///
+/// restic returns its snapshots oldest-first, and every listing passed that
+/// order straight through — so the snapshot an operator wants first, the
+/// most recent one, was the one furthest from the prompt, and on a
+/// repository with months of history it was off the screen entirely. The
+/// question a listing answers is almost always "what is the latest?".
+///
+/// Times are parsed rather than compared as strings: restic writes an
+/// offset, and `2026-09-11T03:00:00+02:00` sorts before
+/// `2026-09-11T02:00:00Z` lexically while being the later instant.
+///
+/// A snapshot whose `time` will not parse keeps its relative order and goes
+/// last — it cannot be placed, and dropping or hoisting it would both be
+/// worse than showing it at the end.
+fn sort_newest_first(shown: &mut [&Value]) {
+    shown.sort_by(|a, b| {
+        let key = |s: &Value| {
+            s.pointer("/time")
+                .and_then(Value::as_str)
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|d| d.with_timezone(&chrono::Utc))
+        };
+        match (key(a), key(b)) {
+            (Some(x), Some(y)) => y.cmp(&x),
+            // `None` is "unplaceable", which sorts after everything placeable.
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
+}
+
+/// Narrow a repository listing to what this cluster owns, newest first. Pure.
 ///
 /// INVARIANT: `hidden` counts ONLY snapshots that carry another cluster's UID.
 /// Legacy snapshots (no UID at all) are shown and marked, never hidden — an
@@ -2146,10 +2179,9 @@ pub(crate) fn narrow_to_cluster<'a>(
     view: ClusterView<'_>,
 ) -> ListingScope<'a> {
     let Some(uid) = view.this.filter(|_| !view.all) else {
-        return ListingScope {
-            shown: snapshots.iter().collect(),
-            hidden: 0,
-        };
+        let mut shown: Vec<&Value> = snapshots.iter().collect();
+        sort_newest_first(&mut shown);
+        return ListingScope { shown, hidden: 0 };
     };
     let mut shown = Vec::new();
     let mut hidden = 0;
@@ -2160,6 +2192,7 @@ pub(crate) fn narrow_to_cluster<'a>(
             shown.push(s);
         }
     }
+    sort_newest_first(&mut shown);
     ListingScope { shown, hidden }
 }
 
@@ -2200,14 +2233,49 @@ pub(crate) fn cluster_cell(s: &Value, view: ClusterView<'_>) -> String {
 }
 
 /// Render a tag for a column: a leading cluster UID is abbreviated to its first
-/// eight characters. The whole UUID is 36 characters of noise in a table whose
+/// eight characters, and a trailing RFC3339 stamp is rendered the way the TIME
+/// column renders one. The whole UUID is 36 characters of noise in a table whose
 /// job is comparison, and nothing an operator types takes a tag — restic works
 /// on snapshot ids.
-fn short_tag(tag: &str) -> String {
-    match backup_core::cluster::tag_cluster_uid(tag) {
-        Some(uid) => format!("{}…{}", &uid[..8], &tag[uid.len()..]),
-        None => tag.to_string(),
+///
+/// Both halves of a tag were machine text. `<uuid>-2026-09-11T03:00:00Z` put a
+/// second, differently-formatted timestamp on the same row as the TIME column,
+/// in the one format a reader has to decode — so one line reported one moment
+/// twice and disagreed with itself about how a moment looks.
+///
+/// The stamp is reformatted rather than dropped: it is the backup run's own
+/// stamp, not restic's write time, and the two can differ on a slow run.
+fn short_tag<Tz>(tag: &str, tz: &Tz) -> String
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    let rendered = render_trailing_timestamp(tag, tz);
+    match backup_core::cluster::tag_cluster_uid(&rendered) {
+        Some(uid) => format!("{}…{}", &uid[..8], &rendered[uid.len()..]),
+        None => rendered,
     }
+}
+
+/// Reformat an RFC3339 stamp embedded at the end of `text`, leaving the rest
+/// untouched. Returns `text` unchanged when there is none.
+///
+/// Scans `-` boundaries left to right and takes the first suffix that parses.
+/// Left to right is correct even though a date is full of hyphens: the first
+/// one that parses is the start of the date, and anything earlier fails on the
+/// prefix before it.
+fn render_trailing_timestamp<Tz>(text: &str, tz: &Tz) -> String
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    for (i, _) in text.match_indices('-') {
+        let suffix = &text[i + 1..];
+        if chrono::DateTime::parse_from_rfc3339(suffix).is_ok() {
+            return format!("{}-{}", &text[..i], format_timestamp(suffix, tz));
+        }
+    }
+    text.to_string()
 }
 
 /// The lines printed under a listing to explain what it did and did not show.
@@ -3331,7 +3399,7 @@ where
                 .unwrap_or_else(|| "?".to_string());
             let tags = tags_of_snapshot(s)
                 .iter()
-                .map(|t| short_tag(t))
+                .map(|t| short_tag(t, tz))
                 .collect::<Vec<_>>()
                 .join(", ");
             (id, time, cluster_cell(s, view), tags)
@@ -8258,6 +8326,92 @@ mod tests {
         assert_eq!(scope.hidden, 1);
     }
 
+    /// A listing answers "what is the latest?", so the latest goes first.
+    /// restic hands them over oldest-first and every listing passed that
+    /// order through, which put the most useful row furthest from the
+    /// prompt — and off the screen on a repository with real history.
+    #[test]
+    fn a_listing_puts_the_newest_snapshot_first() {
+        let at = |id: &str, t: &str| {
+            json!({"short_id": id, "time": t, "hostname": "h",
+                   "tags": [format!("{MINE}-{t}")]})
+        };
+        // Handed over oldest-first, the way restic emits them.
+        let snaps = vec![
+            at("old00000", "2026-09-01T03:00:00Z"),
+            at("mid00000", "2026-09-05T03:00:00Z"),
+            at("new00000", "2026-09-11T03:00:00Z"),
+        ];
+        let ids = |scope: &ListingScope| -> Vec<String> {
+            scope
+                .shown
+                .iter()
+                .map(|s| {
+                    s.pointer("/short_id")
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
+        assert_eq!(
+            ids(&narrow_to_cluster(&snaps, my_view())),
+            vec!["new00000", "mid00000", "old00000"]
+        );
+        // The unnarrowed path is a separate early return and sorts too.
+        assert_eq!(
+            ids(&narrow_to_cluster(&snaps, all_clusters_view())),
+            vec!["new00000", "mid00000", "old00000"]
+        );
+    }
+
+    /// Offsets are compared as instants, not as text. `+02:00` sorts before
+    /// `Z` lexically while being the later moment, so a string comparison
+    /// puts the newer snapshot second.
+    #[test]
+    fn an_offset_timestamp_is_ordered_by_instant_not_by_spelling() {
+        let at = |id: &str, t: &str| {
+            json!({"short_id": id, "time": t, "hostname": "h",
+                   "tags": [format!("{MINE}-x")]})
+        };
+        let snaps = vec![
+            at("earlier0", "2026-09-11T02:00:00Z"),
+            at("later000", "2026-09-11T03:00:00+00:20"),
+        ];
+        let scope = narrow_to_cluster(&snaps, my_view());
+        let first = scope.shown[0]
+            .pointer("/short_id")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            first, "later000",
+            "02:40Z is later than 02:00Z; a lexical sort reads it as earlier"
+        );
+    }
+
+    /// A snapshot whose time will not parse is still shown — it goes last
+    /// because it cannot be placed, never dropped.
+    #[test]
+    fn an_unparseable_time_sorts_last_and_is_not_dropped() {
+        let snaps = vec![
+            json!({"short_id": "broken00", "time": "??", "tags": [format!("{MINE}-x")]}),
+            json!({"short_id": "fine0000", "time": "2026-09-01T03:00:00Z",
+                   "tags": [format!("{MINE}-x")]}),
+        ];
+        let scope = narrow_to_cluster(&snaps, my_view());
+        assert_eq!(scope.shown.len(), 2, "a row was dropped");
+        assert_eq!(
+            scope.shown[1]
+                .pointer("/short_id")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "broken00"
+        );
+    }
+
     /// DOES NOT FIRE: `--all-clusters` shows everything and hides nothing.
     /// Paired with the test above so "narrowed" is proved to be a decision
     /// rather than a listing that always drops rows.
@@ -8373,13 +8527,48 @@ mod tests {
     #[test]
     fn a_tag_is_rendered_with_its_cluster_uid_abbreviated() {
         let tag = format!("{MINE}-2026-09-11T03:00:00Z");
-        let short = short_tag(&tag);
+        let short = short_tag(&tag, &chrono::Utc);
         assert!(short.starts_with("11111111…"), "{short}");
-        assert!(short.ends_with("-2026-09-11T03:00:00Z"), "{short}");
-        // A legacy tag has no UID to abbreviate and is shown verbatim.
+        // Both halves are rendered now: the UID is abbreviated AND the stamp
+        // reads the way the TIME column on the same row reads.
+        assert!(short.ends_with("-2026-09-11 03:00:00"), "{short}");
+        assert!(
+            !short.contains("T03:00:00Z"),
+            "the machine stamp survived into the column: {short}"
+        );
+        // A legacy tag has no UID to abbreviate; its stamp is still rendered.
         assert_eq!(
-            short_tag("platform-2026-09-10T03:00:00Z"),
-            "platform-2026-09-10T03:00:00Z"
+            short_tag("platform-2026-09-10T03:00:00Z", &chrono::Utc),
+            "platform-2026-09-10 03:00:00"
+        );
+    }
+
+    #[test]
+    fn a_tag_stamp_is_shown_in_the_readers_zone_like_the_time_column() {
+        // One row must not report one moment in two zones.
+        let tz = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
+        assert_eq!(
+            short_tag("platform-2026-09-10T03:00:00Z", &tz),
+            format!("platform-{}", format_timestamp("2026-09-10T03:00:00Z", &tz))
+        );
+    }
+
+    #[test]
+    fn a_tag_without_a_timestamp_is_left_alone() {
+        assert_eq!(short_tag("platform", &chrono::Utc), "platform");
+        assert_eq!(
+            short_tag("some-hyphenated-tag", &chrono::Utc),
+            "some-hyphenated-tag"
+        );
+        assert_eq!(short_tag("", &chrono::Utc), "");
+    }
+
+    #[test]
+    fn an_unparseable_stamp_in_a_tag_survives_verbatim() {
+        // Losing it would delete the only record of whatever wrote the tag.
+        assert_eq!(
+            short_tag("platform-not-a-date", &chrono::Utc),
+            "platform-not-a-date"
         );
     }
 

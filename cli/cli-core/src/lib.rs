@@ -7,11 +7,13 @@ pub mod diagnose;
 pub mod error;
 pub mod logging;
 pub mod manifest;
+pub mod quantity;
 pub mod resolve;
 pub mod secrets;
 pub mod style;
 pub mod target;
 pub mod tier;
+pub mod timefmt;
 pub mod tools;
 
 pub use credentials::{
