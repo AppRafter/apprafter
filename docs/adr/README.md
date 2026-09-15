@@ -96,6 +96,7 @@ ADRs are never deleted; supersession preserves the historical record.
 | 0062 | [a manifest package is a bundle — one registration, one namespace, one environment](./0062-manifest-package-is-a-bundle.md) | Accepted |
 | 0063 | [manifest discovery is convention plus content, and a bundle may span directories](./0063-manifest-discovery.md) | Accepted |
 | 0064 | [`apprafter app restart` — an explicit roll, because the platform cannot know when a rotation is finished](./0064-app-restart.md) | Accepted |
+| 0065 | [two gaps in the manifest — probes, and JetStream tuning](./0065-probes-and-jetstream-tuning.md) | Accepted |
 
 ## Writing a new record
 
