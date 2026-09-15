@@ -208,6 +208,52 @@ fn get_manifest_environments(cwd: &std::path::Path) -> Result<Vec<String>> {
         .unwrap_or_default())
 }
 
+/// The namespace the cwd manifest declares, or `None` when it declares
+/// none (the CR then inherits the registration's destination namespace,
+/// which is agreement by definition).
+///
+/// Reads the bundle's first workload: under [ADR 0062] every workload in a
+/// package must declare the same namespace, and both `app validate` and the
+/// render sidecar refuse a package where they do not — so one is the whole
+/// answer, and reading them all here would only re-implement a check that
+/// has already run by the time a manifest can be registered at all.
+fn get_manifest_namespace(cwd: &std::path::Path) -> Result<Option<String>> {
+    let manifest =
+        crate::commands::app_validate::parse_application_injected(&cwd.join("apprafter"))?;
+    Ok(manifest.metadata.namespace.filter(|n| !n.is_empty()))
+}
+
+/// Refuse a registration whose destination namespace is not the one its
+/// manifest declares. `None` when they agree. Pure.
+///
+/// It refuses rather than adopting either side. Adopting the manifest's
+/// would override a `--namespace` the operator typed on purpose; adopting
+/// the flag's would silently move every workload. The two are a question
+/// only the operator can answer, and the shape of the answer is one word in
+/// one of two files.
+pub(crate) fn namespace_disagreement(
+    manifest_ns: &str,
+    destination_ns: &str,
+    app: &str,
+) -> Option<String> {
+    if manifest_ns == destination_ns {
+        return None;
+    }
+    Some(format!(
+        "the manifest declares namespace '{manifest_ns}', but this would register \
+         '{app}' with destination namespace '{destination_ns}'.\n\n\
+         Argo CD creates the DESTINATION namespace and applies each workload into \
+         the namespace its own metadata names, and it never reconciles the two: \
+         registering this way would create an empty '{destination_ns}' and leave the \
+         workloads landing in '{manifest_ns}' — which nothing here would have \
+         created.\n\n\
+         Make them the same:\n  \
+         • register where the manifest says:  apprafter app add --namespace {manifest_ns} …\n  \
+         • or change `metadata.namespace` in apprafter/Application.cue to \
+         '{destination_ns}' and commit"
+    ))
+}
+
 /// List the cluster's namespace names via `kubectl get namespaces`
 /// (ADR 0044 / 2.9). Feeds the wizard's destination-namespace picker.
 /// `Ok(vec![])` when no namespaces are returned; the caller treats a
@@ -393,6 +439,37 @@ pub fn add(
                      ({err}). Proceeding — ensure `spec.environments.{e}` exists upstream."
                 );
             }
+        }
+    }
+
+    // The registration's destination namespace has to be the one the
+    // manifest declares. Argo CD raises the DESTINATION namespace
+    // (`CreateNamespace=true`), applies namespaced children that declare
+    // their own namespace into THAT one instead, and never reconciles the
+    // two — so a disagreement here creates an empty namespace nobody asked
+    // for and leaves the workloads trying to land somewhere that may not
+    // exist. The wizard path already preselects `metadata.namespace` and
+    // returns above; this is the flag/non-interactive path, which had no
+    // check at all.
+    //
+    // Degrades the same way the `--env` check above does, and for the same
+    // reason: a remote-only `app add <git-url>` from outside the repo has no
+    // manifest to read, and that has to keep working.
+    match get_manifest_namespace(&cwd) {
+        Ok(Some(manifest_ns)) => {
+            if let Some(msg) =
+                namespace_disagreement(&manifest_ns, &effective_namespace, &derived_name)
+            {
+                return Err(CliError::Other(msg));
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!(
+                "⚠ Could not render apprafter/Application.cue to check the destination \
+                 namespace ({err}). Proceeding with '{effective_namespace}' — ensure the \
+                 manifest declares the same one."
+            );
         }
     }
 
@@ -1338,6 +1415,11 @@ fn print_workload_detail(inner_name: &str, dest_ns: &str, kubeconfig_path: &Path
         kubeconfig_path,
     ) {
         Ok(Some(cr)) => {
+            // Identity before diagnosis: the advisories below qualify a
+            // workload the reader has to be able to locate first.
+            if let Some(url) = public_endpoint_line(&cr) {
+                println!("{url}");
+            }
             for line in apprafter_cr_advisory_lines(&cr, &chrono::Utc::now()) {
                 if line.warn {
                     println!("{}", style::warn(&line.text));
@@ -2181,6 +2263,55 @@ pub(crate) fn apprafter_cr_advisory_lines(
         out.push(RenderedLine::plain(reco_line));
     }
     out
+}
+
+/// The public URL(s) this workload answers on, or `None` when it is not
+/// publicly exposed.
+///
+/// Deliberately NOT one of [`apprafter_cr_advisory_lines`]: that function's
+/// invariant is that a healthy application renders nothing, and a bound
+/// domain is an identity fact rather than an advisory. It is printed above
+/// them, because "where does this answer?" is what the reader came for and
+/// the advisories qualify a thing they must already be able to see.
+///
+/// **Read from `status.lastAppliedSpec` first.** That is the operator's
+/// stamped record of the *effective* spec — base with the selected
+/// environment already unified onto it — so this does not re-implement the
+/// merge, and it reports what is actually serving rather than what the
+/// manifest would produce. It falls back to `spec.base.expose` before the
+/// first reconcile stamps one, where base IS the effective spec.
+///
+/// `hostname` is `string | [...string]` in the schema (the 2.6b OneOrMany
+/// union), so both shapes are read. A `public` app with no hostname renders
+/// nothing: the operator does not emit an HTTPRoute for one either, and the
+/// admission webhook refuses it — inventing a URL for it would be the only
+/// place in the product claiming it is reachable.
+pub(crate) fn public_endpoint_line(cr: &Value) -> Option<String> {
+    let expose = cr
+        .pointer("/status/lastAppliedSpec/expose")
+        .or_else(|| cr.pointer("/spec/base/expose"))?;
+    if expose.get("network").and_then(Value::as_str)? != "public" {
+        return None;
+    }
+    let raw = expose.get("hostname")?;
+    let hosts: Vec<&str> = match raw {
+        Value::String(s) => vec![s.as_str()],
+        Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+        _ => return None,
+    };
+    let hosts: Vec<&str> = hosts.into_iter().filter(|h| !h.is_empty()).collect();
+    if hosts.is_empty() {
+        return None;
+    }
+    // `tls` absent is not "no TLS": the platform terminates TLS on the
+    // Gateway by default, and printing `http://` for a site that answers on
+    // https would send the reader to a redirect and read as a misconfiguration.
+    let scheme = match expose.get("tls").and_then(Value::as_bool) {
+        Some(false) => "http",
+        _ => "https",
+    };
+    let urls: Vec<String> = hosts.iter().map(|h| format!("{scheme}://{h}")).collect();
+    Some(format!("Public URL:      {}", urls.join(", ")))
 }
 
 /// Pure helper — resolve an Argo CD Application's environment from
@@ -6659,6 +6790,29 @@ pub(crate) fn format_image_line(cr: &Value, now: &chrono::DateTime<chrono::Utc>)
     Some(line)
 }
 
+/// Render a resource quantity the way that resource is read: memory and
+/// storage in binary units, CPU in millicores or cores.
+///
+/// VPA writes its recommendation as a serialised `resource.Quantity`, and a
+/// computed value serialises WITHOUT a suffix — the reported line was
+/// `limits.memory: 183046954`, which asks the reader to divide by 1024
+/// twice before knowing whether it is large. A declared value like `512Mi`
+/// round-trips unchanged, so the two shapes stop looking like different
+/// kinds of number.
+///
+/// Anything that will not parse is returned verbatim: it is still the only
+/// record of what VPA actually said, and a placeholder would delete it.
+fn render_resource_quantity(resource: &str, raw: &str) -> String {
+    match resource {
+        "cpu" => cli_core::quantity::parse_millicores(raw)
+            .map(cli_core::quantity::humanise_millicores)
+            .unwrap_or_else(|| raw.to_string()),
+        _ => cli_core::quantity::parse_bytes(raw)
+            .map(cli_core::quantity::humanise_bytes)
+            .unwrap_or_else(|| raw.to_string()),
+    }
+}
+
 /// Pure helper — format the VPA recommendation line from
 /// `Application.status.recommendedResources` for display in `app status`.
 ///
@@ -6689,7 +6843,10 @@ pub(crate) fn format_recommendation_line(cr: &Value) -> Option<String> {
             "cpu" => "limits.cpu".to_string(),
             other => other.to_string(),
         };
-        let mut entry = format!("{display_key}: {target_val}");
+        let mut entry = format!(
+            "{display_key}: {}",
+            render_resource_quantity(resource, target_val)
+        );
 
         // Append uncapped hint when it differs from the capped target.
         if let Some(uncapped_val) = uncapped
@@ -6697,8 +6854,12 @@ pub(crate) fn format_recommendation_line(cr: &Value) -> Option<String> {
             .and_then(Value::as_str)
         {
             if uncapped_val != target_val {
+                // Name THIS resource. The hint used to say
+                // `resources.limits.memory` for every entry, so a capped CPU
+                // recommendation told the reader to raise a memory limit.
                 entry.push_str(&format!(
-                    " · uncapped {uncapped_val} — raise `resources.limits.memory`"
+                    " · uncapped {} — raise `resources.{display_key}`",
+                    render_resource_quantity(resource, uncapped_val)
                 ));
             }
         }
@@ -8531,6 +8692,68 @@ mod tests {
     }
 
     #[test]
+    fn a_suffixless_recommendation_is_made_readable() {
+        // The reported line was `VPA reco:      limits.cpu: 25m,
+        // limits.memory: 183046954`. A computed Quantity serialises without
+        // a suffix, and the raw byte count was reaching the screen.
+        let cr = serde_json::json!({ "status": { "recommendedResources": {
+            "recommendation": { "target": { "cpu": "25m", "memory": "183046954" } }
+        }}});
+        let line = format_recommendation_line(&cr).unwrap();
+        assert!(line.contains("limits.memory: 175Mi"), "{line}");
+        assert!(
+            !line.contains("183046954"),
+            "the raw byte count survived: {line}"
+        );
+        // CPU was already readable and must not change.
+        assert!(line.contains("limits.cpu: 25m"), "{line}");
+    }
+
+    #[test]
+    fn a_declared_quantity_round_trips_unchanged() {
+        // `512Mi` in, `512Mi` out — rendering must not make a value that was
+        // already fine look different from the manifest that declared it.
+        let cr = serde_json::json!({ "status": { "recommendedResources": {
+            "recommendation": { "target": { "memory": "512Mi" } }
+        }}});
+        assert!(format_recommendation_line(&cr)
+            .unwrap()
+            .contains("limits.memory: 512Mi"));
+    }
+
+    #[test]
+    fn a_capped_cpu_does_not_tell_the_reader_to_raise_memory() {
+        // The uncapped hint hardcoded `resources.limits.memory` inside the
+        // loop over resources, so a CPU recommendation pointed at the wrong
+        // knob — and the reader would have raised a limit that was not the
+        // one being capped.
+        let cr = serde_json::json!({ "status": { "recommendedResources": {
+            "recommendation": {
+                "target": { "cpu": "500m" },
+                "uncappedTarget": { "cpu": "1500m" }
+            }
+        }}});
+        let line = format_recommendation_line(&cr).unwrap();
+        assert!(line.contains("raise `resources.limits.cpu`"), "{line}");
+        assert!(
+            !line.contains("limits.memory"),
+            "a cpu-only recommendation named memory: {line}"
+        );
+        assert!(line.contains("uncapped 1.5"), "{line}");
+    }
+
+    #[test]
+    fn a_quantity_that_will_not_parse_survives_verbatim() {
+        // It is still the only record of what VPA said.
+        let cr = serde_json::json!({ "status": { "recommendedResources": {
+            "recommendation": { "target": { "memory": "not-a-quantity" } }
+        }}});
+        assert!(format_recommendation_line(&cr)
+            .unwrap()
+            .contains("not-a-quantity"));
+    }
+
+    #[test]
     fn format_reco_line_not_applied() {
         // When notApplied is set the reason must appear in the line
         // (e.g. operator chose not to apply due to node-capacity safety).
@@ -9837,6 +10060,166 @@ mod render_tests {
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert_eq!(lines[0].text, "AppRafter phase: Ready");
         assert!(apprafter_cr_advisory_lines(&json!({}), &now).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod public_endpoint_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_public_app_shows_where_it_answers() {
+        let cr = json!({ "status": { "lastAppliedSpec": {
+            "expose": { "network": "public", "hostname": "shop.example.com" }
+        }}});
+        assert_eq!(
+            public_endpoint_line(&cr).unwrap(),
+            "Public URL:      https://shop.example.com"
+        );
+    }
+
+    #[test]
+    fn several_hostnames_are_all_shown() {
+        // `hostname` is `string | [...string]`; a list is the apex+www case
+        // and dropping all but one would send the reader to the wrong site.
+        let cr = json!({ "status": { "lastAppliedSpec": { "expose": {
+            "network": "public",
+            "hostname": ["example.com", "www.example.com"]
+        }}}});
+        let line = public_endpoint_line(&cr).unwrap();
+        assert!(line.contains("https://example.com"), "{line}");
+        assert!(line.contains("https://www.example.com"), "{line}");
+    }
+
+    #[test]
+    fn an_internal_app_shows_nothing() {
+        for network in ["internal", "vpn"] {
+            let cr = json!({ "status": { "lastAppliedSpec": { "expose": {
+                "network": network, "hostname": "not-served.example.com"
+            }}}});
+            assert_eq!(
+                public_endpoint_line(&cr),
+                None,
+                "{network} must not advertise a URL"
+            );
+        }
+        assert_eq!(public_endpoint_line(&json!({})), None);
+        assert_eq!(
+            public_endpoint_line(&json!({ "spec": { "base": {} } })),
+            None
+        );
+    }
+
+    #[test]
+    fn a_public_app_without_a_hostname_invents_nothing() {
+        // The operator emits no HTTPRoute for one and the webhook refuses
+        // it, so a URL here would be the only claim in the product that it
+        // is reachable.
+        let cr = json!({ "status": { "lastAppliedSpec": {
+            "expose": { "network": "public" }
+        }}});
+        assert_eq!(public_endpoint_line(&cr), None);
+        let empty = json!({ "status": { "lastAppliedSpec": {
+            "expose": { "network": "public", "hostname": "" }
+        }}});
+        assert_eq!(public_endpoint_line(&empty), None);
+    }
+
+    #[test]
+    fn the_effective_spec_wins_over_the_manifest_base() {
+        // An environment override that changes the hostname must be what is
+        // shown: base is what the manifest says, `lastAppliedSpec` is what
+        // is actually serving.
+        let cr = json!({
+            "spec": { "base": { "expose": {
+                "network": "public", "hostname": "base.example.com" } } },
+            "status": { "lastAppliedSpec": { "expose": {
+                "network": "public", "hostname": "prod.example.com" } } }
+        });
+        let line = public_endpoint_line(&cr).unwrap();
+        assert!(line.contains("prod.example.com"), "{line}");
+        assert!(!line.contains("base.example.com"), "{line}");
+    }
+
+    #[test]
+    fn before_the_first_reconcile_the_base_spec_answers() {
+        // No `lastAppliedSpec` yet — base IS the effective spec, and
+        // showing nothing would hide the URL exactly while the reader is
+        // waiting for the deploy to come up.
+        let cr = json!({ "spec": { "base": { "expose": {
+            "network": "public", "hostname": "new.example.com"
+        }}}});
+        assert!(public_endpoint_line(&cr)
+            .unwrap()
+            .contains("https://new.example.com"));
+    }
+
+    #[test]
+    fn tls_false_is_the_only_thing_that_makes_it_http() {
+        // Absent `tls` means the Gateway terminates TLS, so `http://` would
+        // send the reader to a redirect and read as a misconfiguration.
+        let with = |tls: Value| {
+            json!({ "status": { "lastAppliedSpec": { "expose": {
+                "network": "public", "hostname": "h.example.com", "tls": tls
+            }}}})
+        };
+        assert!(public_endpoint_line(&with(json!(false)))
+            .unwrap()
+            .contains("http://h.example.com"));
+        assert!(public_endpoint_line(&with(json!(true)))
+            .unwrap()
+            .contains("https://"));
+    }
+}
+
+#[cfg(test)]
+mod namespace_agreement_tests {
+    use super::*;
+
+    #[test]
+    fn agreement_is_silent() {
+        assert_eq!(namespace_disagreement("shop", "shop", "checkout"), None);
+        assert_eq!(
+            namespace_disagreement("apprafter", "apprafter", "web"),
+            None,
+            "the default on both sides is the common path and must not warn"
+        );
+    }
+
+    #[test]
+    fn a_disagreement_names_both_namespaces_and_both_repairs() {
+        let msg = namespace_disagreement("shop", "apprafter", "checkout")
+            .expect("a mismatch must be refused");
+        assert!(msg.contains("'shop'"), "{msg}");
+        assert!(msg.contains("'apprafter'"), "{msg}");
+        // Both ways out, because only the operator knows which side is the
+        // mistake.
+        assert!(msg.contains("--namespace shop"), "{msg}");
+        assert!(msg.contains("metadata.namespace"), "{msg}");
+        assert!(msg.contains("checkout"), "the app is named: {msg}");
+    }
+
+    #[test]
+    fn it_explains_the_consequence_rather_than_only_the_rule() {
+        // "namespaces must match" teaches nothing. The reason is that Argo
+        // CD creates one namespace and applies into another, and a reader
+        // who knows that can diagnose the next one themselves.
+        let msg = namespace_disagreement("shop", "apprafter", "x").unwrap();
+        assert!(msg.contains("creates the DESTINATION namespace"), "{msg}");
+        assert!(msg.contains("never reconciles"), "{msg}");
+    }
+
+    #[test]
+    fn the_direction_of_the_mismatch_is_not_lost() {
+        // The two namespaces are not interchangeable in the message: the
+        // repair commands differ by which side is which, so a symmetric
+        // rendering would hand out the wrong fix half the time.
+        let a = namespace_disagreement("shop", "apprafter", "x").unwrap();
+        let b = namespace_disagreement("apprafter", "shop", "x").unwrap();
+        assert_ne!(a, b);
+        assert!(a.contains("--namespace shop"), "{a}");
+        assert!(b.contains("--namespace apprafter"), "{b}");
     }
 }
 
