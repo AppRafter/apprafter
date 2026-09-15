@@ -185,13 +185,37 @@ fn list_cue_files(dir: &Path) -> Vec<PathBuf> {
 
 /// Validate the manifest at `manifest` (a file path or a
 /// directory holding `*.cue`). Reproduces the cue-cmp's
-/// render-time injection in a fresh temp dir and runs `cue vet`.
+/// render-time injection in a fresh temp dir, runs `cue vet`, and
+/// then applies the four intra-bundle consistency checks the
+/// render layer refuses on (ADR 0063 §Decision 5).
 ///
 /// On success → `Ok(())`. On a non-zero `cue` exit → `Err` with
 /// the captured stderr split into lines (each a diagnostic). If
 /// `cue` is absent → `Err` carrying [`CliError::CueNotFound`]'s
 /// message so the caller can surface the install hint.
 pub fn validate_manifest(manifest: &Path) -> std::result::Result<(), Vec<String>> {
+    validate_manifest_workloads(manifest).map(|_| ())
+}
+
+/// [`validate_manifest`] plus the bundle's workload roster.
+///
+/// Split out rather than folded in because `validate_manifest` is a
+/// `docs_api` export with a `Result<(), Vec<String>>` contract that
+/// `lib_surface_test.rs` pins, and because the roster is a *presentation*
+/// need of `run_validate` alone — nothing else should have to skip past
+/// it.
+///
+/// Returned in the package's DECLARATION order, which is what
+/// `top_level_names` reads out of `cue def`. Deriving the order from the
+/// exported JSON instead would sort it: `serde_json` builds objects on a
+/// `BTreeMap` unless the `preserve_order` feature is on, and it is not.
+/// The sidecar's `jq to_entries` preserves declaration order, so sorting
+/// here would print the same finding with its workloads in a different
+/// sequence from the Argo CD tile — which is precisely the kind of "two
+/// different problems" appearance this subphase exists to remove.
+fn validate_manifest_workloads(
+    manifest: &Path,
+) -> std::result::Result<Vec<BundleWorkload>, Vec<String>> {
     let workdir =
         tempfile::tempdir().map_err(|e| vec![format!("could not create temp workspace: {e}")])?;
     // CUE's `./...` SKIPS any directory whose name begins with `.`
@@ -210,7 +234,24 @@ pub fn validate_manifest(manifest: &Path) -> std::result::Result<(), Vec<String>
     // still run `cue vet`, which surfaces the real error.
     generate_claim_binding(root);
 
-    run_cue_vet(root)
+    // `cue vet` FIRST, and the ordering is load-bearing: a package that
+    // does not compile has no workloads to compare, and its real
+    // diagnostic is the compile error, not a derived complaint about a
+    // table we could not build.
+    run_cue_vet(root)?;
+
+    // The whole package as ONE JSON document — the same shape
+    // `entrypoint.sh:644` hands its `jq` programs, and the only point in
+    // either pipeline where every workload of a bundle is visible at
+    // once. No extra `cue` concept: `cue export .` evaluates exactly the
+    // package instance in cwd, which is what the sidecar renders.
+    let doc = cue_export_package(root)?;
+    let order = top_level_names(root);
+
+    if let Some(refusal) = check_bundle_consistency(&doc, &order) {
+        return Err(vec![refusal]);
+    }
+    Ok(bundle_rows(&doc, &order))
 }
 
 /// Parse the manifest's Application doc with the CURRENT shipped schema
@@ -589,24 +630,593 @@ fn cue_bin() -> String {
     std::env::var("CUE_BIN").unwrap_or_else(|_| "cue".to_string())
 }
 
+// ─────────────────────────────────────────────────────────────
+// Intra-bundle consistency — the LOCAL TWIN of the render layer
+// (ADR 0063 §Decision 5, subphase 2.27b)
+// ─────────────────────────────────────────────────────────────
+//
+// ADR 0063 §Decision 5's enforcement table puts four inconsistencies on
+// one row each: "cue-cmp `exit 1` + `validate`". 2.27a shipped the
+// cue-cmp half (`argocd-cue-cmp/entrypoint.sh`, the block above the
+// Style-A/Style-B dispatch and the `bundle_refuse` helper); this is the
+// `validate` half, and it is a MIRROR rather than a reimplementation.
+//
+// Mirror down to the wording, deliberately. An operator meets these
+// findings twice — once here, on a laptop, before committing, and once
+// on an Argo CD Application tile if they commit anyway — and the second
+// encounter has to read as the SAME finding. A paraphrase reads as a
+// second, unrelated problem, and the reader then has two mysteries
+// instead of one. So the summary lines, the detail prose, and even the
+// column widths below are the entrypoint's, verbatim. The one
+// deliberate difference is the closing paragraph: the sidecar says
+// nothing was applied (true of a sync), this says the sidecar would
+// refuse it too (true of a laptop).
+//
+// The promise this restores, stated plainly: before 2.27b a manifest
+// the sidecar refuses validated clean locally, and the operator learned
+// about it from a red tile. `validate` answering `✓ valid` for exactly
+// what the cluster refuses inverts the point of having a local
+// validator at all — which is why `bundle_refuse`'s own comment
+// refuses to name this command until it is true.
+//
+// Every check here is pure over the exported JSON plus a declaration
+// order: no second `cue` invocation, no cluster access. That is the
+// same property ADR 0063 §Decision 5 claims for the render layer.
+
+/// The key the checks use for an unwrapped (Style A) package, whose
+/// manifest IS the package scope and so has no top-level name of its
+/// own. Byte-identical to the entrypoint's, because it is printed.
+const PACKAGE_SCOPE_KEY: &str = "(package scope)";
+
+/// One row of the intra-bundle table — the CLI's mirror of
+/// `entrypoint.sh`'s tab-separated `$bundle_rows`.
+///
+/// `environments` has no counterpart there: the sidecar never prints a
+/// roster, so it never needs `spec.environments`. It rides along here
+/// because the same filtered row set is exactly what the success roster
+/// should list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BundleWorkload {
+    /// Top-level CUE key, or [`PACKAGE_SCOPE_KEY`] when unwrapped.
+    key: String,
+    /// `metadata.namespace` — empty string when not declared.
+    namespace: String,
+    /// `metadata.name` — empty string when not declared.
+    name: String,
+    /// `spec.environment` — empty string when not declared.
+    environment: String,
+    /// `spec.environments` keys, sorted; empty when none are declared.
+    environments: Vec<String>,
+}
+
+/// Export the WHOLE package as one JSON document.
+///
+/// `.`, not `./...`, mirroring `entrypoint.sh:644` — `./...` matches
+/// every package instance BELOW cwd as well, which would emit two
+/// concatenated JSON documents for a package holding a helper
+/// sub-package and leave this parse failing on trailing input. The temp
+/// workspace is flat today (`lay_out_workspace` copies only top-level
+/// `.cue` files), so the two are equivalent here; `.` is the request
+/// that stays correct if that ever changes.
+///
+/// A failure is an ERROR, never a silent skip. `cue vet -c ./...` has
+/// already passed by the time this runs, so an export that then fails is
+/// a genuine anomaly — and swallowing it would turn the four checks into
+/// a guard that quietly stops guarding, which is the failure mode the
+/// whole subphase is about.
+fn cue_export_package(root: &Path) -> std::result::Result<serde_json::Value, Vec<String>> {
+    let out = match Command::new(cue_bin())
+        .current_dir(root)
+        .args(["export", ".", "--out", "json"])
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(vec![CliError::CueNotFound.to_string()]);
+        }
+        Err(e) => return Err(vec![format!("running cue export: {e}")]),
+    };
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let mut msgs: Vec<String> = stderr
+            .lines()
+            .map(|l| l.trim_end())
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect();
+        if msgs.is_empty() {
+            msgs.push(format!(
+                "cue export failed (exit {})",
+                out.status.code().unwrap_or(-1)
+            ));
+        }
+        return Err(msgs);
+    }
+    serde_json::from_slice(&out.stdout)
+        .map_err(|e| vec![format!("could not read the exported package as JSON: {e}")])
+}
+
+/// jq's `has("apiVersion") and has("kind")` on an object — the shape
+/// probe both layers dispatch on. `has` is true for a declared-but-null
+/// field, and `.get(..).is_some()` matches that.
+fn is_k8s_shaped(v: &serde_json::Value) -> bool {
+    v.is_object() && v.get("apiVersion").is_some() && v.get("kind").is_some()
+}
+
+/// jq's `tostring`: a string passes through unquoted, anything else
+/// becomes its JSON text.
+fn jq_tostring(v: &serde_json::Value) -> String {
+    match v.as_str() {
+        Some(s) => s.to_string(),
+        None => v.to_string(),
+    }
+}
+
+/// Follow `path` and render the leaf as jq's `… // ""` would: absent,
+/// `null` and `false` all read as the empty string.
+fn field_or_empty(v: &serde_json::Value, path: &[&str]) -> String {
+    let mut cur = v;
+    for seg in path {
+        match cur.get(seg) {
+            Some(next) => cur = next,
+            None => return String::new(),
+        }
+    }
+    match cur {
+        serde_json::Value::Null | serde_json::Value::Bool(false) => String::new(),
+        other => jq_tostring(other),
+    }
+}
+
+/// Top-level keys of `doc` in declaration order.
+///
+/// `order` comes from `top_level_names` (i.e. from `cue def`, which
+/// preserves declaration order). The key SET is taken from the exported
+/// JSON, which is authoritative; `order` only sequences it. Anything the
+/// JSON carries that `cue def` did not name — including the cases where
+/// `cue def` fails outright and `top_level_names` returns nothing —
+/// still appears, appended in the JSON's own (sorted) order. A check
+/// that silently sees zero workloads because a helper returned an empty
+/// vec is a guard that stopped guarding.
+fn ordered_keys(doc: &serde_json::Value, order: &[String]) -> Vec<String> {
+    let Some(obj) = doc.as_object() else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for k in order {
+        if obj.contains_key(k) && !out.contains(k) {
+            out.push(k.clone());
+        }
+    }
+    for k in obj.keys() {
+        if !out.contains(k) {
+            out.push(k.clone());
+        }
+    }
+    out
+}
+
+/// Build one row, or `None` when the value is not a workload of THIS
+/// bundle.
+///
+/// The filter is `apiVersion` AND `kind`, never `kind` alone — the
+/// entrypoint's row-table comment argues this at length and
+/// `testdata/bundle-foreign-kind/` pins it. Argo CD's own CRD is
+/// `argoproj.io/v1alpha1, kind: Application`, the one foreign apiVersion
+/// that collides exactly with ours, and a package may legitimately ship
+/// one beside the workload it registers. Keyed on `kind` alone, such a
+/// package reads as two namespaces (`argocd` is where Argo CD's
+/// Applications must live) and two environments, and is refused though
+/// nothing about it is inconsistent.
+fn workload_row(key: &str, v: &serde_json::Value) -> Option<BundleWorkload> {
+    if v.get("kind").and_then(|k| k.as_str()) != Some("Application") {
+        return None;
+    }
+    if !v
+        .get("apiVersion")
+        .map(jq_tostring)
+        .unwrap_or_default()
+        .starts_with("apprafter.io/")
+    {
+        return None;
+    }
+    let mut environments: Vec<String> = v
+        .get("spec")
+        .and_then(|s| s.get("environments"))
+        .and_then(|e| e.as_object())
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    environments.sort();
+    Some(BundleWorkload {
+        key: key.to_string(),
+        namespace: field_or_empty(v, &["metadata", "namespace"]),
+        name: field_or_empty(v, &["metadata", "name"]),
+        environment: field_or_empty(v, &["spec", "environment"]),
+        environments,
+    })
+}
+
+/// The bundle's workloads, in declaration order.
+///
+/// An unwrapped (Style A) package yields exactly ONE row by
+/// construction, which is what keeps every single-manifest layout —
+/// i.e. every manifest written before bundles existed — behaving
+/// identically: all three cross-workload checks are no-ops on one row.
+fn bundle_rows(doc: &serde_json::Value, order: &[String]) -> Vec<BundleWorkload> {
+    if is_k8s_shaped(doc) {
+        return workload_row(PACKAGE_SCOPE_KEY, doc).into_iter().collect();
+    }
+    ordered_keys(doc, order)
+        .iter()
+        .filter_map(|k| {
+            let v = doc.get(k)?;
+            if !is_k8s_shaped(v) {
+                return None;
+            }
+            workload_row(k, v)
+        })
+        .collect()
+}
+
+/// The named children of a package-scope manifest — check (1)'s subject.
+///
+/// Deliberately withOUT the `apprafter.io/` predicate `workload_row`
+/// carries, and the asymmetry is the point: a foreign apiVersion+kind
+/// CHILD really would ride out as a stray top-level key and be pruned in
+/// silence, whoever's API group it belongs to. There the question is
+/// "will this document survive the render", which is group-agnostic;
+/// in the row table it is "is this a workload of this bundle", which is
+/// not.
+fn mixed_style_wrappers(doc: &serde_json::Value, order: &[String]) -> Vec<String> {
+    if !is_k8s_shaped(doc) {
+        return Vec::new();
+    }
+    ordered_keys(doc, order)
+        .into_iter()
+        .filter(|k| doc.get(k).map(is_k8s_shaped).unwrap_or(false))
+        .collect()
+}
+
+/// One shape for every intra-bundle refusal — the CLI's `bundle_refuse`.
+///
+/// The FIRST line carries the whole finding (which workloads, which
+/// values they disagree on), exactly as the sidecar's does, because on
+/// the Argo CD side that line is the tile and is usually all anyone
+/// reads. Keeping it identical here is what lets a reader recognise the
+/// tile they see later.
+fn bundle_refusal(summary: &str, detail: &str) -> String {
+    format!(
+        "bundle is inconsistent: {summary}\n\
+         \n\
+         --- apprafter bundle check ---\n\
+         {detail}\n\
+         \n\
+         The cue-cmp render sidecar runs this same check at sync time, so a\n\
+         commit of this bundle would be refused there too — with nothing\n\
+         applied and the resources already running left untouched."
+    )
+}
+
+/// The four checks, in the entrypoint's order, first hit wins.
+///
+/// Order is load-bearing for (1): the Style-A/Style-B dispatch DISCARDS
+/// a mixed package's named wrappers, so the row table below it cannot
+/// see past a package-scope manifest — for a mixed package the table
+/// takes the package-scope branch and the wrappers are invisible to it.
+fn check_bundle_consistency(doc: &serde_json::Value, order: &[String]) -> Option<String> {
+    // (1) Style A mixed with Style B. The one inconsistency the render
+    // layer is the ONLY possible place to catch: the dispatch takes the
+    // Style-A branch, the named wrapper rides out as a stray top-level
+    // key of the emitted document, and the apiserver PRUNES an unknown
+    // top-level key without an error. The discarded manifest never
+    // becomes an API object at all, so there is nothing downstream left
+    // to inspect it.
+    let mixed = mixed_style_wrappers(doc, order);
+    if !mixed.is_empty() {
+        let mixed = mixed.join(", ");
+        return Some(bundle_refusal(
+            &format!(
+                "package-scope manifest mixed with named wrapper(s) {mixed} \
+                 — only one layout renders, the rest are silently dropped"
+            ),
+            &format!(
+                "This package declares a manifest at PACKAGE SCOPE (bare apiVersion /
+kind / metadata / spec) and ALSO these named wrappers:
+
+  {mixed}
+
+Only one of the two layouts is rendered. The package-scope manifest
+wins, and each named wrapper rides out as an extra top-level key inside
+it — which the apiserver removes without reporting anything. The
+wrapped workload would simply never appear, and nothing would say why.
+
+Pick one layout for the whole package: either move the package-scope
+apiVersion/kind/metadata/spec into a named wrapper of its own, or fold
+the wrapped manifests into the package scope (only one manifest fits
+there, so several wrappers means the first option)."
+            ),
+        ));
+    }
+
+    let rows = bundle_rows(doc, order);
+
+    // (2) Divergent `metadata.namespace`.
+    //
+    // Divergent means TWO OR MORE DISTINCT NON-EMPTY values. An absent
+    // namespace is deliberately NOT counted as a third value: Argo CD
+    // fills it in from the registration's `destination.namespace`, which
+    // neither layer can see, so an absent one may well resolve to the
+    // same namespace its sibling declares and refusing would be a guess.
+    // Check (4) reasons the opposite way, for the reason stated there —
+    // the two are not inconsistent, they differ because one field has a
+    // registration-level default and the other does not.
+    let namespaces = distinct(
+        rows.iter()
+            .filter(|r| !r.namespace.is_empty())
+            .map(|r| r.namespace.clone()),
+    );
+    if namespaces.len() > 1 {
+        let pairs = join_pairs(
+            rows.iter()
+                .filter(|r| !r.namespace.is_empty())
+                .map(|r| format!("{} -> \"{}\"", r.key, r.namespace)),
+            ", ",
+        );
+        let lines = rows
+            .iter()
+            .map(|r| {
+                let v = if r.namespace.is_empty() {
+                    "(not declared)"
+                } else {
+                    &r.namespace
+                };
+                format!("  {:<24} metadata.namespace: {v}", r.key)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Some(bundle_refusal(
+            &format!(
+                "workloads declare {} different namespaces — {pairs}",
+                namespaces.len()
+            ),
+            &format!(
+                "{lines}
+
+One manifest package is one bundle: one registration, one namespace.
+Argo CD applies every document this render emits into the single
+destination namespace of the registration, so a second namespace
+declared here cannot be honoured — the workload would land somewhere
+nobody registered, or not at all.
+
+Give every workload in this package the same metadata.namespace. If they
+genuinely belong to different namespaces they are different bundles: put
+them in separate directories and register each with its own
+`apprafter app add --path`."
+            ),
+        ));
+    }
+
+    // (3) Duplicate identity — `(namespace, name)` TOGETHER, never
+    // either alone. Two workloads may share a name in different
+    // namespaces, and must share a namespace to be a bundle at all; it
+    // is the pair that names one object. An absent namespace
+    // participates in the key as its own value: two workloads that both
+    // omit it and share a name resolve to one object under whatever
+    // destination namespace the registration carries, the same
+    // collision.
+    let mut ids: Vec<(String, Vec<String>)> = Vec::new();
+    for r in &rows {
+        let ns = if r.namespace.is_empty() {
+            "(no namespace)"
+        } else {
+            &r.namespace
+        };
+        let id = format!("{ns}/{}", r.name);
+        match ids.iter_mut().find(|(k, _)| *k == id) {
+            Some((_, who)) => who.push(r.key.clone()),
+            None => ids.push((id, vec![r.key.clone()])),
+        }
+    }
+    let dups: Vec<&(String, Vec<String>)> = ids.iter().filter(|(_, who)| who.len() > 1).collect();
+    if !dups.is_empty() {
+        let lines = dups
+            .iter()
+            .map(|(id, who)| format!("  {:<28} declared by: {}", id, who.join(", ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The entrypoint derives this by stripping the leading indent
+        // off `$dup_lines` and collapsing its runs of spaces; building
+        // it directly from the same parts is the same string.
+        let pairs = join_pairs(
+            dups.iter()
+                .map(|(id, who)| format!("{id} declared by: {}", who.join(", "))),
+            "; ",
+        );
+        return Some(bundle_refusal(
+            &format!("two workloads share one (namespace, name) — {pairs}"),
+            &format!(
+                "{lines}
+
+Two CUE values, two rendered documents — but ONE object. Kubernetes
+identifies an Application by (namespace, name), so whichever document is
+applied last overwrites the other in place. One of these workloads would
+never run, and neither the render nor the sync would report that a
+choice had been made.
+
+Rename one of them (metadata.name), or move it to a namespace of its own
+— in which case it is a separate bundle and wants its own directory and
+its own `apprafter app add --path`."
+            ),
+        ));
+    }
+
+    // (4) Divergent `spec.environment`.
+    //
+    // Here an ABSENT value IS counted, as its own distinct value, and
+    // that is a deliberate choice rather than an inconsistency with (2).
+    // An absent `spec.environment` is not "unspecified pending a
+    // default", it is the BASE-ONLY deploy — a different deployment
+    // semantic from `environment: "dev"`, documented as such in
+    // `schemas/v1alpha1/application.cue`. Unlike a namespace there is no
+    // `destination.environment` on the registration to fill it in, so
+    // "declared on one workload, absent on its sibling" is a real
+    // divergence the reader can act on, not a guess. Every workload
+    // absent is therefore ONE distinct value, which is the normal
+    // single-environment bundle and stays silent.
+    let env_label = |r: &BundleWorkload| -> String {
+        if r.environment.is_empty() {
+            "(not declared)".to_string()
+        } else {
+            r.environment.clone()
+        }
+    };
+    let environments = distinct(rows.iter().map(env_label));
+    if environments.len() > 1 {
+        let pairs = join_pairs(
+            rows.iter().map(|r| {
+                if r.environment.is_empty() {
+                    format!("{} -> (not declared)", r.key)
+                } else {
+                    format!("{} -> \"{}\"", r.key, r.environment)
+                }
+            }),
+            ", ",
+        );
+        let lines = rows
+            .iter()
+            .map(|r| {
+                let v = if r.environment.is_empty() {
+                    "(not declared — base-only deploy)"
+                } else {
+                    &r.environment
+                };
+                format!("  {:<24} spec.environment: {v}", r.key)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Some(bundle_refusal(
+            &format!(
+                "workloads declare {} different environments — {pairs}",
+                environments.len()
+            ),
+            &format!(
+                "{lines}
+
+One manifest package is one bundle: one registration, one environment.
+The environment belongs to the REGISTRATION (`apprafter app add --env`),
+which stamps the same value onto every document of the package — so a
+per-workload spec.environment that disagrees with its siblings either
+splits one bundle across two environments, or is quietly overwritten and
+never takes effect.
+
+A workload with no spec.environment deploys its base only, which is its
+own environment as far as this check is concerned — so \"declared on one,
+absent on the other\" counts too.
+
+Either give every workload in this package the same spec.environment (or
+drop it from all of them and select the environment at registration
+time), or split them into separate directories and register each with
+its own `--env`."
+            ),
+        ));
+    }
+
+    None
+}
+
+/// Distinct values in first-seen order — `sort -u | grep -c .` without
+/// the sort, since only the COUNT is ever read from it.
+fn distinct<I: IntoIterator<Item = String>>(values: I) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for v in values {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Join an iterator of already-rendered pairs with `sep`.
+fn join_pairs<I: IntoIterator<Item = String>>(items: I, sep: &str) -> String {
+    items.into_iter().collect::<Vec<_>>().join(sep)
+}
+
+/// The success output: `✓ valid` plus the bundle's roster.
+///
+/// A bare `✓ valid` cannot answer "how many workloads is this?", which
+/// is the first question a bundle raises and the one that makes "my
+/// workload never appeared" answerable — a wrapper whose `apiVersion` is
+/// mistyped is not a workload, it is an inert struct, and the only
+/// visible symptom is a roster one line shorter than expected.
+///
+/// The roster DOES appear at N=1, and that is the decision: one workload
+/// prints two lines, which is still terse, and the count is exactly as
+/// load-bearing there — a two-workload package whose second workload
+/// silently failed to parse as one reports `1 workload`, and printing
+/// nothing in that case would hide the only evidence. N=0 stays the bare
+/// `✓ valid`: a package with no workloads at all is supporting CUE, and
+/// an empty bulleted list under a "0 workloads" header says less than
+/// the line above it.
+fn format_roster(workloads: &[BundleWorkload]) -> Vec<String> {
+    if workloads.is_empty() {
+        return vec!["✓ valid".to_string()];
+    }
+    let mut out = vec![format!(
+        "✓ valid — {} workload{}",
+        workloads.len(),
+        if workloads.len() == 1 { "" } else { "s" }
+    )];
+    for w in workloads {
+        let name = if w.name.is_empty() {
+            "(no metadata.name)"
+        } else {
+            &w.name
+        };
+        let ns = if w.namespace.is_empty() {
+            "(not declared)"
+        } else {
+            &w.namespace
+        };
+        let mut line = format!("  • {name}  namespace {ns}");
+        if !w.environments.is_empty() {
+            line.push_str(&format!("  envs: {}", w.environments.join(", ")));
+        }
+        out.push(line);
+    }
+    out
+}
+
 /// Entry point for `apprafter app validate [manifest]`. Resolves
 /// the manifest path, runs the cue-cmp-equivalent validation,
-/// and prints `✓ valid` or the diagnostics. Returns `Err` (so
+/// and prints the roster or the diagnostics. Returns `Err` (so
 /// the process exits non-zero) on validation failure.
 pub fn run_validate(arg: Option<PathBuf>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let manifest = resolve_manifest_path(arg.as_deref(), &cwd, &|p| p.exists())?;
 
     println!("Validating {} …", manifest.display());
-    match validate_manifest(&manifest) {
-        Ok(()) => {
-            println!("✓ valid");
+    match validate_manifest_workloads(&manifest) {
+        Ok(workloads) => {
+            for line in format_roster(&workloads) {
+                println!("{line}");
+            }
             Ok(())
         }
         Err(msgs) => {
             eprintln!("✗ validation failed:");
+            // One element is ONE finding, and a bundle refusal is a
+            // multi-line one — so indent per LINE rather than per
+            // element, and leave blank lines bare rather than emitting
+            // two trailing spaces. The count below then reports findings
+            // (a refusal is 1), not the lines it happens to occupy.
             for m in &msgs {
-                eprintln!("  {m}");
+                for line in m.lines() {
+                    if line.is_empty() {
+                        eprintln!();
+                    } else {
+                        eprintln!("  {line}");
+                    }
+                }
             }
             Err(CliError::Other(format!(
                 "manifest {} failed validation ({} error{}).",
@@ -962,6 +1572,353 @@ landing: v1alpha1.#Application & {
             envs,
             vec!["dev".to_string(), "prod".to_string()],
             "wizard env picker (via get_manifest_environments) must see the declared envs"
+        );
+    }
+
+    // ── Intra-bundle consistency: the LOCAL TWIN of the render-layer
+    //    guards (ADR 0063 §Decision 5, subphase 2.27b) ──────────────
+    //
+    // 2.27a taught `argocd-cue-cmp/entrypoint.sh` to REFUSE four ways a
+    // manifest package can contradict itself. ADR 0063 §Decision 5 puts
+    // `apprafter app validate` on the same row of its enforcement table
+    // ("cue-cmp `exit 1` + `validate`"), so a bundle the sidecar refuses
+    // at sync must be refused here, on the laptop, first.
+    //
+    // These tests drive `validate_manifest` from the SIDECAR'S OWN
+    // FIXTURES — `argocd-cue-cmp/testdata/bundle-*`, built and
+    // mutation-tested in 2.27a — rather than from private copies. That is
+    // the whole point: two layers asserting the same rule against two
+    // sets of fixtures drift silently, and the drift shows up as a
+    // manifest that validates clean and then reddens an Argo CD tile,
+    // which is exactly the inverted promise 2.27b exists to restore.
+    // The sidecar half of the pair asserts the same seven directories in
+    // `argocd-cue-cmp/test-inject.sh` §5; sharing the fixtures is what
+    // makes the two halves one gate rather than two.
+
+    /// Repository root, derived from this crate's manifest directory.
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("cli/platform-cli is two levels below the repo root")
+            .to_path_buf()
+    }
+
+    /// Copy `argocd-cue-cmp/testdata/<name>/apprafter/` into a fresh
+    /// temp dir and return the guard plus the copied directory.
+    ///
+    /// COPIED, never validated in place. `validate_manifest` itself only
+    /// reads, but its sibling layer — the real `entrypoint.sh` the parity
+    /// script runs over these same directories — writes `cue.mod/` and
+    /// `apprafter_claim_gen.cue` into whatever it renders, and these
+    /// fixtures are committed. One rule for both layers is cheaper than
+    /// remembering which one is safe.
+    ///
+    /// Only top-level files are copied, which is what `lay_out_workspace`
+    /// would have taken anyway — `inject-fixture-multi/` ships a
+    /// `cue.mod/` of its own and the temp workspace supplies that.
+    fn sidecar_fixture(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let src = repo_root()
+            .join("argocd-cue-cmp")
+            .join("testdata")
+            .join(name)
+            .join("apprafter");
+        assert!(
+            src.is_dir(),
+            "cue-cmp fixture '{name}' is missing at {} — the CLI checks and the \
+             sidecar checks share these fixtures on purpose; do not fork a copy",
+            src.display()
+        );
+        let tmp = tempdir().unwrap();
+        let dst = tmp.path().join("apprafter");
+        fs::create_dir_all(&dst).unwrap();
+        for entry in fs::read_dir(&src).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_file() {
+                fs::copy(&p, dst.join(p.file_name().unwrap())).unwrap();
+            }
+        }
+        (tmp, dst)
+    }
+
+    const CUE_REQUIRED: &str = "`cue` not runnable — the intra-bundle checks ARE the local twin \
+         of the render layer and a skipped run is a silently missing guard; \
+         run under `nix develop` (or ensure the ~/bin/cue shim is present).";
+
+    /// Validate a sidecar fixture and return the refusal, joined.
+    fn refuse(name: &str) -> String {
+        assert!(cue_available(), "{CUE_REQUIRED}");
+        let (_guard, dir) = sidecar_fixture(name);
+        let Err(err) = validate_manifest(&dir) else {
+            panic!(
+                "ADR 0063 §5: the cue-cmp sidecar REFUSES fixture '{name}' at render; \
+                 `app validate` is its local twin and must refuse it too, not answer `✓ valid`"
+            )
+        };
+        err.join("\n")
+    }
+
+    /// Validate a sidecar fixture that must stay VALID.
+    fn accept(name: &str) {
+        assert!(cue_available(), "{CUE_REQUIRED}");
+        let (_guard, dir) = sidecar_fixture(name);
+        if let Err(msgs) = validate_manifest(&dir) {
+            panic!(
+                "ADR 0063 §5: the cue-cmp sidecar renders fixture '{name}' at rc=0; \
+                 `app validate` must not refuse what the cluster accepts. Got:\n{}",
+                msgs.join("\n")
+            );
+        }
+    }
+
+    // (1) Style A mixed with Style B.
+    #[test]
+    fn validate_refuses_a_bundle_mixing_package_scope_with_named_wrappers() {
+        let msg = refuse("bundle-mixed-style");
+        assert!(
+            msg.contains("bundle is inconsistent"),
+            "the refusal must carry the sidecar's own marker so one finding reads as \
+             one finding in both places; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("package-scope manifest mixed with named wrapper"),
+            "mixed style — the summary must name the finding in the sidecar's words; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("wrapped"),
+            "mixed style — the summary must name the wrapper that would be dropped; got:\n{msg}"
+        );
+    }
+
+    // (2) Divergent metadata.namespace.
+    #[test]
+    fn validate_refuses_a_bundle_whose_workloads_declare_two_namespaces() {
+        let msg = refuse("bundle-split-ns");
+        assert!(
+            msg.contains("2 different namespaces"),
+            "namespaces — the summary must name the divergence; got:\n{msg}"
+        );
+        assert!(
+            msg.contains(r#"nsOne -> "one""#) && msg.contains(r#"nsTwo -> "two""#),
+            "namespaces — the summary must name BOTH workloads and their values; got:\n{msg}"
+        );
+        assert!(
+            !msg.contains("spec.environment:"),
+            "namespaces — the environment check must not also fire; got:\n{msg}"
+        );
+    }
+
+    // (3) Duplicate (namespace, name).
+    #[test]
+    fn validate_refuses_a_bundle_with_a_duplicate_namespace_name_pair() {
+        let msg = refuse("bundle-dup-name");
+        assert!(
+            msg.contains("share one (namespace, name)"),
+            "identity — the summary must name the rule; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("dup-demo/dup-app"),
+            "identity — the summary must name the colliding identity; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("dupOne, dupTwo"),
+            "identity — the summary must name both workloads that declared it; got:\n{msg}"
+        );
+    }
+
+    // (4) Divergent spec.environment — both declared.
+    #[test]
+    fn validate_refuses_a_bundle_whose_workloads_declare_two_environments() {
+        let msg = refuse("bundle-split-env");
+        assert!(
+            msg.contains("2 different environments"),
+            "environments — the summary must name the divergence; got:\n{msg}"
+        );
+        assert!(
+            msg.contains(r#"envOne -> "dev""#) && msg.contains(r#"envTwo -> "prod""#),
+            "environments — the summary must name BOTH workloads and their values; got:\n{msg}"
+        );
+    }
+
+    // (4) Divergent spec.environment — the PARTIAL form. The sidecar
+    // counts an ABSENT `spec.environment` as its own distinct value
+    // (`entrypoint.sh` check (4)): absent is not "unspecified pending a
+    // default", it is the BASE-ONLY deploy, and unlike a namespace there
+    // is no `destination.environment` on the registration to fill it in.
+    // The two layers must agree on that or the local twin is a different
+    // rule wearing the same name.
+    #[test]
+    fn validate_counts_an_absent_environment_as_its_own_value() {
+        let msg = refuse("bundle-env-partial");
+        assert!(
+            msg.contains("2 different environments"),
+            "declared-vs-absent — absent must count as its own value; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("(not declared)"),
+            "declared-vs-absent — the summary must spell out the absent side; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("partialDeclared") && msg.contains("partialAbsent"),
+            "declared-vs-absent — the summary must name both workloads; got:\n{msg}"
+        );
+    }
+
+    // NEGATIVE: the row filter carries an apiVersion predicate, never
+    // `kind == "Application"` alone. Argo CD's own CRD is
+    // `argoproj.io/v1alpha1, kind: Application` — the one foreign
+    // apiVersion that collides exactly with ours — and it lives in
+    // `argocd` with no `spec.environment`, so a kind-only filter reads
+    // this package as two namespaces AND two environments and refuses a
+    // bundle that is not inconsistent at all.
+    #[test]
+    fn validate_accepts_a_foreign_application_kind_beside_a_workload() {
+        accept("bundle-foreign-kind");
+    }
+
+    // NEGATIVE: the strongest non-regression signal available locally —
+    // two workloads that agree on everything the checks look at must
+    // still validate clean and silently.
+    #[test]
+    fn validate_accepts_a_consistent_two_workload_bundle() {
+        accept("inject-fixture-multi");
+    }
+
+    // A Style-A (unwrapped) package renders exactly ONE row into the
+    // table, so all three cross-workload checks are no-ops on it. That
+    // is what keeps every pre-bundle single-manifest layout working;
+    // assert it rather than assume it.
+    #[test]
+    fn validate_still_accepts_an_unwrapped_style_a_manifest() {
+        assert!(cue_available(), "{CUE_REQUIRED}");
+        let dir = tempdir().unwrap();
+        let manifest = write_manifest(
+            dir.path(),
+            "package apprafter\n\
+             \n\
+             apiVersion: \"apprafter.io/v1alpha1\"\n\
+             kind:       \"Application\"\n\
+             metadata: {\n\
+             \tname:      \"style-a\"\n\
+             \tnamespace: \"apprafter\"\n\
+             }\n\
+             spec: base: image: \"nginxdemos/hello:plain-text\"\n",
+        );
+        let workloads = validate_manifest_workloads(&manifest)
+            .expect("an unwrapped Style-A manifest must still validate");
+        assert_eq!(
+            workloads.len(),
+            1,
+            "Style A is exactly one row — got {workloads:?}"
+        );
+        assert_eq!(workloads[0].key, PACKAGE_SCOPE_KEY);
+        assert_eq!(workloads[0].name, "style-a");
+    }
+
+    // ── the success roster ────────────────────────────────────
+
+    fn wl(key: &str, name: &str, ns: &str, envs: &[&str]) -> BundleWorkload {
+        BundleWorkload {
+            key: key.to_string(),
+            namespace: ns.to_string(),
+            name: name.to_string(),
+            environment: String::new(),
+            environments: envs.iter().map(|e| e.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn validate_roster_names_every_workload_of_a_bundle() {
+        let ws = vec![
+            wl("api", "acme-api", "acme", &["dev", "prod"]),
+            wl("web", "acme-web", "acme", &["dev", "prod"]),
+        ];
+        assert_eq!(
+            format_roster(&ws),
+            vec![
+                "✓ valid — 2 workloads".to_string(),
+                "  • acme-api  namespace acme  envs: dev, prod".to_string(),
+                "  • acme-web  namespace acme  envs: dev, prod".to_string(),
+            ],
+            "the roster answers 'how many workloads is this?', which a bare `✓ valid` cannot"
+        );
+    }
+
+    #[test]
+    fn validate_roster_at_one_workload_is_two_lines() {
+        // The decision, pinned: the roster DOES appear at N=1. The count
+        // is as load-bearing there as anywhere — a package whose second
+        // workload silently failed to parse as one reports `1 workload`,
+        // and printing nothing would hide the only evidence of that.
+        assert_eq!(
+            format_roster(&[wl("app", "solo", "apprafter", &[])]),
+            vec![
+                "✓ valid — 1 workload".to_string(),
+                "  • solo  namespace apprafter".to_string(),
+            ],
+            "N=1 prints the count and one bullet — and NO `envs:` segment when none are declared"
+        );
+    }
+
+    #[test]
+    fn validate_roster_with_no_workloads_stays_bare() {
+        assert_eq!(
+            format_roster(&[]),
+            vec!["✓ valid".to_string()],
+            "a package with no workloads is supporting CUE; a '0 workloads' header plus an \
+             empty list says less than the line above it"
+        );
+    }
+
+    #[test]
+    fn validate_roster_spells_out_an_undeclared_namespace() {
+        assert_eq!(
+            format_roster(&[wl("app", "nsless", "", &[])]),
+            vec![
+                "✓ valid — 1 workload".to_string(),
+                "  • nsless  namespace (not declared)".to_string(),
+            ],
+            "an absent namespace is filled in by the registration's destination.namespace, \
+             which this layer cannot see — say so rather than print an empty field"
+        );
+    }
+
+    #[test]
+    fn validate_roster_reads_a_real_two_workload_fixture() {
+        // End-to-end: the roster comes off the SAME filtered row set the
+        // checks use, against the sidecar's own consistent fixture.
+        assert!(cue_available(), "{CUE_REQUIRED}");
+        let (_guard, dir) = sidecar_fixture("inject-fixture-multi");
+        let workloads =
+            validate_manifest_workloads(&dir).expect("the consistent bundle must validate");
+        assert_eq!(
+            format_roster(&workloads),
+            vec![
+                "✓ valid — 2 workloads".to_string(),
+                "  • inject-multi-one  namespace (not declared)".to_string(),
+                "  • inject-multi-two  namespace (not declared)".to_string(),
+            ],
+            "declaration order, both workloads, no invented namespace"
+        );
+    }
+
+    #[test]
+    fn validate_roster_omits_the_foreign_kind_object() {
+        // The roster is a roster of WORKLOADS. `bundle-foreign-kind`
+        // ships an `argoproj.io` Application beside one, and the row
+        // filter's apiVersion predicate is what keeps it out of both the
+        // checks and this list.
+        assert!(cue_available(), "{CUE_REQUIRED}");
+        let (_guard, dir) = sidecar_fixture("bundle-foreign-kind");
+        let workloads =
+            validate_manifest_workloads(&dir).expect("the foreign-kind fixture must validate");
+        assert_eq!(
+            workloads
+                .iter()
+                .map(|w| w.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["foreign-web"],
+            "only the apprafter.io workload is a workload of this bundle"
         );
     }
 }
