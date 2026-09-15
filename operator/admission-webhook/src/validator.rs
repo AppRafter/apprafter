@@ -49,7 +49,7 @@ use std::sync::OnceLock;
 
 use operator_core::{
     AppResources, ApplicationBaseSpec, ApplicationEnvOverride, ApplicationSpec, DiskClaim, EnvRef,
-    EnvValue, JetStreamNeed, Needs, OneOrMany, ServiceNeed,
+    EnvValue, JetStreamNeed, Needs, OneOrMany, Probe, Probes, ServiceNeed,
 };
 use serde_json::Value;
 
@@ -75,6 +75,13 @@ trait ScopeView {
     fn expose_hostname(&self) -> Option<&OneOrMany<String>>;
     fn expose_tls(&self) -> Option<bool>;
     fn resources(&self) -> Option<&AppResources>;
+    /// 2.28: the scope's declared probes.
+    fn probes(&self) -> Option<&Probes>;
+    /// 2.28: the port this scope DECLARES, not the merged one. The base's
+    /// `expose.port` is required by the CRD so it is an `i32` there; an env
+    /// override's is optional (2.16c), and `validate_probes` is what combines
+    /// them — a scope that omits it inherits the base's.
+    fn expose_port(&self) -> Option<i32>;
 }
 
 impl ScopeView for ApplicationBaseSpec {
@@ -102,6 +109,12 @@ impl ScopeView for ApplicationBaseSpec {
     fn resources(&self) -> Option<&AppResources> {
         self.resources.as_ref()
     }
+    fn probes(&self) -> Option<&Probes> {
+        self.probes.as_ref()
+    }
+    fn expose_port(&self) -> Option<i32> {
+        self.expose.as_ref().map(|e| e.port)
+    }
 }
 
 impl ScopeView for ApplicationEnvOverride {
@@ -128,6 +141,14 @@ impl ScopeView for ApplicationEnvOverride {
     }
     fn resources(&self) -> Option<&AppResources> {
         self.resources.as_ref()
+    }
+    fn probes(&self) -> Option<&Probes> {
+        self.probes.as_ref()
+    }
+    fn expose_port(&self) -> Option<i32> {
+        // An env override's `port` is itself optional (2.16c), so `None` here
+        // means "inherit the base's", not "this scope has no port".
+        self.expose.as_ref().and_then(|e| e.port)
     }
 }
 
@@ -404,6 +425,8 @@ pub fn validate_application_spec(spec: &Value) -> Vec<ValidationError> {
     validate_disk_claims(typed_base, typed_envs, base, envs, &mut errors);
     validate_expose(typed_base, typed_envs, base, envs, &mut errors);
     validate_resources(typed_base, typed_envs, base, envs, &mut errors);
+    // 2.28: the five probe rules the structural schema cannot state.
+    validate_probes(typed_base, typed_envs, &mut errors);
 
     errors
 }
@@ -1665,6 +1688,149 @@ fn validate_expose(
     }
 }
 
+/// 2.28 (ADR 0065 §1.5): validate `spec.base.probes` AND every
+/// `spec.environments.*.probes`.
+///
+/// Five rules, each of them something the CRD's structural schema cannot
+/// state:
+///   1. `path` starts with `/`. Also a CRD `pattern` (`schemas/crdmeta`),
+///      restated here for the same reason the jetstream format rules are —
+///      a cluster whose CRD predates that patch is still covered.
+///   2. `scheme` / `headers` require `path`. Silently ignoring them would
+///      hide a typo'd path: the user wrote an HTTP probe and got a TCP one.
+///   3. Every probe resolves a port — its own, or the scope's effective
+///      `expose.port`. Without this the renderer would emit nothing (it
+///      refuses to invent a port-0 probe) and the pod would simply be
+///      unprobed with nothing saying why.
+///   4. `successThreshold` is 1 on liveness and startup. Kubernetes requires
+///      it; rejecting here names the field, whereas letting it through means
+///      the apiserver rejects the *Deployment* far from its cause.
+///   5. `timeoutSeconds < periodSeconds`. Kubernetes permits the overlap; we
+///      do not, because overlapping probe attempts are always a mistake and
+///      the refusal costs one edit.
+///
+/// **Typed-only, with no raw fallback**, unlike `validate_resources` and the
+/// `image` rules. A probe is a nested structure whose raw re-implementation
+/// would be a second parser to keep in sync, and the scopes that fail to
+/// deserialize are exactly the ones the apiserver's structural validation
+/// has already rejected.
+///
+/// The port in rule 3 is resolved PER SCOPE: an environment uses its own
+/// `expose.port` when it sets one and inherits the base's otherwise (2.16c
+/// deep-merge). A single whole-object check would pass every scope or fail
+/// every scope.
+fn validate_probes(
+    typed_base: Option<&ApplicationBaseSpec>,
+    typed_envs: Option<&BTreeMap<String, ApplicationEnvOverride>>,
+    errors: &mut Vec<ValidationError>,
+) {
+    fn check_one(
+        prefix: &str,
+        name: &str,
+        p: &Probe,
+        port: Option<i32>,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        let field = |f: &str| format!("{prefix}.probes.{name}.{f}");
+
+        match p.path.as_deref() {
+            Some(path) => {
+                if !path.starts_with('/') {
+                    errors.push(ValidationError::new(
+                        field("path"),
+                        format!("probe path {path:?} must start with '/'"),
+                    ));
+                }
+            }
+            None => {
+                if p.scheme.is_some() {
+                    errors.push(ValidationError::new(
+                        field("scheme"),
+                        "`scheme` applies to an HTTP probe; this probe declares no `path`, so it is a TCP connect",
+                    ));
+                }
+                if p.headers.is_some() {
+                    errors.push(ValidationError::new(
+                        field("headers"),
+                        "`headers` applies to an HTTP probe; this probe declares no `path`, so it is a TCP connect",
+                    ));
+                }
+            }
+        }
+
+        if p.port.is_none() && port.is_none() {
+            errors.push(ValidationError::new(
+                field("port"),
+                format!(
+                    "probe {name:?} declares no `port` and this scope has no `expose.port` to inherit"
+                ),
+            ));
+        }
+
+        if matches!(name, "liveness" | "startup") {
+            if let Some(st) = p.success_threshold {
+                if st != 1 {
+                    errors.push(ValidationError::new(
+                        field("successThreshold"),
+                        format!(
+                            "a {name} probe must have successThreshold 1 (Kubernetes rejects any \
+                             other value on the Deployment); got {st}"
+                        ),
+                    ));
+                }
+            }
+        }
+
+        if let (Some(t), Some(period)) = (p.timeout_seconds, p.period_seconds) {
+            if t >= period {
+                errors.push(ValidationError::new(
+                    field("timeoutSeconds"),
+                    format!(
+                        "timeoutSeconds {t} must be less than periodSeconds {period}; otherwise \
+                         probe attempts overlap"
+                    ),
+                ));
+            }
+        }
+    }
+
+    fn check_scope(
+        prefix: &str,
+        probes: Option<&Probes>,
+        port: Option<i32>,
+        errors: &mut Vec<ValidationError>,
+    ) {
+        let Some(pr) = probes else { return };
+        for (name, probe) in [
+            ("liveness", pr.liveness.as_ref()),
+            ("readiness", pr.readiness.as_ref()),
+            ("startup", pr.startup.as_ref()),
+        ] {
+            if let Some(p) = probe {
+                check_one(prefix, name, p, port, errors);
+            }
+        }
+    }
+
+    let base_port = typed_base.and_then(ScopeView::expose_port);
+    check_scope(
+        "spec.base",
+        typed_base.and_then(ScopeView::probes),
+        base_port,
+        errors,
+    );
+    if let Some(envs) = typed_envs {
+        for (name, env) in envs {
+            check_scope(
+                &format!("spec.environments.{name}"),
+                env.probes(),
+                env.expose_port().or(base_port),
+                errors,
+            );
+        }
+    }
+}
+
 /// 2.16d: validate `spec.base.resources` AND every
 /// `spec.environments.*.resources`. This is value-INDEPENDENT — a purely
 /// syntactic check, mirroring `validate_expose`:
@@ -2425,6 +2591,166 @@ fn is_env_var_name(s: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── 2.28 probes (ADR 0065 §1.5) ───────────────────────────────────
+
+    #[test]
+    fn a_probe_path_must_start_with_a_slash() {
+        let spec = json!({"base": {
+            "image": "img", "expose": {"port": 8080},
+            "probes": {"readiness": {"path": "healthz"}}
+        }});
+        let errs = validate_application_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.field == "spec.base.probes.readiness.path"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn scheme_and_headers_are_rejected_without_a_path() {
+        // A TCP connect has no scheme and no headers. Ignoring them silently
+        // would hide a typo'd `path` — the user wrote an HTTP probe and got a
+        // TCP one.
+        let spec = json!({"base": {
+            "image": "img", "expose": {"port": 8080},
+            "probes": {"readiness": {"scheme": "https", "headers": {"X": "y"}}}
+        }});
+        let errs = validate_application_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.field == "spec.base.probes.readiness.scheme"),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.field == "spec.base.probes.readiness.headers"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_probe_with_no_port_and_no_expose_is_rejected_naming_the_probe() {
+        let spec = json!({"base": {
+            "image": "img",
+            "probes": {"liveness": {"path": "/livez"}}
+        }});
+        let errs = validate_application_spec(&spec);
+        let e = errs
+            .iter()
+            .find(|e| e.field == "spec.base.probes.liveness.port")
+            .unwrap_or_else(|| panic!("{errs:?}"));
+        assert!(e.message.contains("expose.port"), "{}", e.message);
+    }
+
+    #[test]
+    fn a_probe_with_its_own_port_needs_no_expose() {
+        let spec = json!({"base": {
+            "image": "img",
+            "probes": {"liveness": {"path": "/livez", "port": 9000}}
+        }});
+        assert!(
+            validate_application_spec(&spec)
+                .iter()
+                .all(|e| !e.field.contains("probes")),
+            "a worker with no Service can still probe itself"
+        );
+    }
+
+    #[test]
+    fn liveness_and_startup_reject_a_success_threshold_other_than_one() {
+        for probe in ["liveness", "startup"] {
+            let spec = json!({"base": {
+                "image": "img", "expose": {"port": 8080},
+                "probes": {probe: {"path": "/x", "successThreshold": 2}}
+            }});
+            let errs = validate_application_spec(&spec);
+            assert!(
+                errs.iter()
+                    .any(|e| e.field == format!("spec.base.probes.{probe}.successThreshold")),
+                "{probe}: {errs:?}"
+            );
+        }
+        // Readiness legitimately allows it, so the rule must be probe-specific
+        // rather than a blanket one.
+        let spec = json!({"base": {
+            "image": "img", "expose": {"port": 8080},
+            "probes": {"readiness": {"path": "/x", "successThreshold": 2}}
+        }});
+        assert!(validate_application_spec(&spec)
+            .iter()
+            .all(|e| !e.field.contains("successThreshold")));
+    }
+
+    #[test]
+    fn a_timeout_at_or_above_the_period_is_rejected() {
+        // Kubernetes permits the overlap; we do not. Equal counts: at
+        // timeout == period the next attempt starts as the previous one
+        // gives up, which is the same pathology one second later.
+        let spec = json!({"base": {
+            "image": "img", "expose": {"port": 8080},
+            "probes": {"readiness": {"path": "/x", "periodSeconds": 5, "timeoutSeconds": 5}}
+        }});
+        let errs = validate_application_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.field == "spec.base.probes.readiness.timeoutSeconds"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_probe_that_still_declares_its_target_is_accepted() {
+        // Keeping the declaration in git while taking the probe off the pod is
+        // the reason `enabled` exists — it is not a contradiction.
+        let spec = json!({"base": {
+            "image": "img", "expose": {"port": 8080},
+            "probes": {"readiness": {"enabled": false, "path": "/healthz"}}
+        }});
+        assert!(validate_application_spec(&spec)
+            .iter()
+            .all(|e| !e.field.contains("probes")));
+    }
+
+    #[test]
+    fn an_env_scope_probe_is_checked_against_that_scopes_effective_port() {
+        // `prod` supplies its own port, so its probe resolves; `dev` inherits
+        // nothing because base has no expose, so its probe does not. Checking
+        // against the MERGED port per scope is the whole rule — a single
+        // whole-object check would pass both or fail both.
+        let spec = json!({"base": {"image": "img"}, "environments": {
+            "prod": {"expose": {"port": 9000}, "probes": {"readiness": {"path": "/x"}}},
+            "dev":  {"probes": {"readiness": {"path": "/x"}}}
+        }});
+        let errs = validate_application_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.field == "spec.environments.dev.probes.readiness.port"),
+            "{errs:?}"
+        );
+        assert!(
+            !errs
+                .iter()
+                .any(|e| e.field.starts_with("spec.environments.prod.probes")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn an_env_probe_inherits_the_base_port() {
+        // base declares the port, the env only tunes a number: the env's probe
+        // resolves through inheritance and must not be rejected.
+        let spec = json!({"base": {"image": "img", "expose": {"port": 8080}},
+            "environments": {"dev": {"probes": {"readiness": {"path": "/x", "periodSeconds": 3}}}}});
+        assert!(
+            validate_application_spec(&spec)
+                .iter()
+                .all(|e| !e.field.contains("probes")),
+            "{:?}",
+            validate_application_spec(&spec)
+        );
+    }
 
     /// Reads `#ClaimFieldsFor` out of `schemas/v1alpha1/application.cue`
     /// and parses each `type: ["field", ...]` line into `(type, fields)`

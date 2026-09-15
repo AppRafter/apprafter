@@ -16,6 +16,9 @@ pub use egress::{default_target, render_egress_policy, ConnectionTarget};
 mod env;
 pub use env::resolve_env;
 
+mod probes;
+pub use probes::{resolve_probes, ProbeKind, RenderedProbes};
+
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::ResourceRequirements;
 use k8s_openapi::api::core::v1::{
@@ -27,6 +30,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, 
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use operator_core::{
     AppResources, Application, ApplicationBaseSpec, ApplicationExpose, ExposeOverride, ImagePolicy,
+    Probe, Probes,
 };
 
 /// Output of `render_application`. Always carries a Deployment;
@@ -372,6 +376,51 @@ fn merge_resources(
     }
 }
 
+/// 2.28: deep-merge an environment's partial `probes` onto the base's, per
+/// PROBE and per FIELD — the same subfield override-wins model 2.16c gave
+/// `expose` and `resources`, one level deeper (like `merge_resources`).
+///
+/// Per-field rather than wholesale because the failure of a wholesale
+/// replace is silent and severe: an environment that tunes
+/// `readiness.periodSeconds` would drop the base's `readiness.path`,
+/// turning a health-checked HTTP probe into a bare TCP connect, and would
+/// drop a `liveness` it never mentioned altogether. Both leave a valid
+/// object that checks less than the manifest says.
+fn merge_probes(base: Option<Probes>, ovr: Option<Probes>) -> Option<Probes> {
+    match (base, ovr) {
+        (b, None) => b,
+        (None, o) => o,
+        (Some(b), Some(o)) => Some(Probes {
+            liveness: merge_probe(b.liveness, o.liveness),
+            readiness: merge_probe(b.readiness, o.readiness),
+            startup: merge_probe(b.startup, o.startup),
+        }),
+    }
+}
+
+/// Field-level override-wins for one probe slot. Every field is `Option`,
+/// so "the override set it" and "the override left it alone" are distinct,
+/// and `or` is exactly the right combinator: a field the override omits
+/// inherits, a field it sets replaces.
+fn merge_probe(base: Option<Probe>, ovr: Option<Probe>) -> Option<Probe> {
+    match (base, ovr) {
+        (b, None) => b,
+        (None, o) => o,
+        (Some(b), Some(o)) => Some(Probe {
+            enabled: o.enabled.or(b.enabled),
+            path: o.path.or(b.path),
+            port: o.port.or(b.port),
+            scheme: o.scheme.or(b.scheme),
+            headers: o.headers.or(b.headers),
+            initial_delay_seconds: o.initial_delay_seconds.or(b.initial_delay_seconds),
+            period_seconds: o.period_seconds.or(b.period_seconds),
+            timeout_seconds: o.timeout_seconds.or(b.timeout_seconds),
+            failure_threshold: o.failure_threshold.or(b.failure_threshold),
+            success_threshold: o.success_threshold.or(b.success_threshold),
+        }),
+    }
+}
+
 /// Compute the effective spec — `base` unified with the named
 /// environment override (when present). Fields set in the override
 /// replace base fields; the env map merges with override-wins on
@@ -413,6 +462,9 @@ pub fn effective_spec(
     // `limits.memory` does not drop base `limits.cpu`.
     effective.resources =
         merge_resources(effective.resources.take(), env_override.resources.clone())?;
+    // 2.28: `probes` deep-merges per probe AND per field, so an env tuning one
+    // number keeps the base's path and keeps a probe it never mentions.
+    effective.probes = merge_probes(effective.probes.take(), env_override.probes.clone());
     if let Some(env_env) = &env_override.env {
         let mut merged = effective.env.unwrap_or_default();
         for (k, v) in env_env {
@@ -588,6 +640,13 @@ fn render_deployment(
         ..Default::default()
     });
 
+    // 2.28 (ADR 0065 §1): the three probes. `resolve_probes` also supplies the
+    // default TCP readiness probe for an exposed workload that declares none,
+    // and derives a startup probe from a declared liveness — see its own doc
+    // for why each exists and what each costs.
+    let rendered_probes =
+        probes::resolve_probes(spec.probes.as_ref(), spec.expose.as_ref().map(|e| e.port));
+
     let container = Container {
         name: name.to_string(),
         image: Some(image),
@@ -603,6 +662,9 @@ fn render_deployment(
             Some(volume_mounts)
         },
         resources,
+        liveness_probe: rendered_probes.liveness,
+        readiness_probe: rendered_probes.readiness,
+        startup_probe: rendered_probes.startup,
         ..Default::default()
     };
 
@@ -1361,6 +1423,7 @@ mod tests {
             needs: b.needs,
             image_policy: b.image_policy,
             resources: b.resources,
+            probes: b.probes,
         }
     }
 
@@ -1383,6 +1446,137 @@ mod tests {
         app.metadata.namespace = Some("default".to_string());
         app.metadata.uid = Some("uid".to_string());
         app
+    }
+
+    #[test]
+    fn effective_spec_env_override_deep_merges_probes_per_field() {
+        // 2.16c partial-override semantics, one level deeper than `expose`.
+        // The bug this guards is a WHOLESALE replace: it would silently turn
+        // a health-checked HTTP readiness probe into a bare TCP connect (the
+        // path is gone) and drop the liveness probe the override never
+        // mentioned. Both leave a valid object that checks less than the
+        // manifest says, which is the failure nobody notices.
+        let mut envs = BTreeMap::new();
+        envs.insert(
+            "prod".to_string(),
+            ApplicationBaseSpec {
+                probes: Some(Probes {
+                    readiness: Some(Probe {
+                        period_seconds: Some(3),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let app = make_app_with_envs(
+            ApplicationBaseSpec {
+                image: Some("base".into()),
+                expose: Some(ApplicationExpose {
+                    port: 8080,
+                    network: None,
+                    hostname: None,
+                    tls: None,
+                }),
+                probes: Some(Probes {
+                    readiness: Some(Probe {
+                        path: Some("/healthz".into()),
+                        period_seconds: Some(10),
+                        ..Default::default()
+                    }),
+                    liveness: Some(Probe {
+                        path: Some("/livez".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            envs,
+        );
+        let eff = effective_spec(&app, Some("prod")).expect("effective");
+        let probes = eff.probes.expect("probes");
+        let r = probes.readiness.expect("readiness");
+        assert_eq!(
+            r.period_seconds,
+            Some(3),
+            "the override wins on the field it sets"
+        );
+        assert_eq!(
+            r.path.as_deref(),
+            Some("/healthz"),
+            "and inherits the one it does not"
+        );
+        assert_eq!(
+            probes.liveness.expect("liveness").path.as_deref(),
+            Some("/livez"),
+            "a probe the override never mentions survives untouched"
+        );
+    }
+
+    #[test]
+    fn a_rendered_deployment_carries_the_declared_and_the_defaulted_probes() {
+        let app = make_app_with_envs(
+            ApplicationBaseSpec {
+                image: Some("img".into()),
+                expose: Some(ApplicationExpose {
+                    port: 8080,
+                    network: None,
+                    hostname: None,
+                    tls: None,
+                }),
+                probes: Some(Probes {
+                    liveness: Some(Probe {
+                        path: Some("/livez".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            BTreeMap::new(),
+        );
+        let r = render_application(&app).unwrap();
+        let c = &r.deployment.spec.unwrap().template.spec.unwrap().containers[0];
+        assert!(
+            c.liveness_probe
+                .as_ref()
+                .expect("liveness")
+                .http_get
+                .is_some(),
+            "a declared liveness renders as an HTTP probe"
+        );
+        assert!(
+            c.readiness_probe
+                .as_ref()
+                .expect("readiness")
+                .tcp_socket
+                .is_some(),
+            "an undeclared readiness becomes the default TCP probe on expose.port"
+        );
+        assert!(
+            c.startup_probe.is_some(),
+            "a declared liveness derives a startup probe"
+        );
+    }
+
+    #[test]
+    fn an_unexposed_workload_renders_no_probes_at_all() {
+        // No port anywhere, so there is nothing to default onto: a worker
+        // must not acquire a probe it never asked for.
+        let app = make_app_with_envs(
+            ApplicationBaseSpec {
+                image: Some("img".into()),
+                ..Default::default()
+            },
+            BTreeMap::new(),
+        );
+        let r = render_application(&app).unwrap();
+        let c = &r.deployment.spec.unwrap().template.spec.unwrap().containers[0];
+        assert!(c.readiness_probe.is_none());
+        assert!(c.liveness_probe.is_none());
+        assert!(c.startup_probe.is_none());
     }
 
     #[test]
