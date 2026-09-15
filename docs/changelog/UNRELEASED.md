@@ -9,6 +9,191 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.69 — `app remove` names everything it destroys, and the write verbs refuse to guess (2.27b, unreleased)
+
+A manifest package is a **bundle**: one registration, 1..N workloads. b-2
+taught the read surfaces to say so; this is the write side, plus the two
+local gates that refuse a bad bundle before a cluster has to. It is the
+last of the three 2.27b plans and it closes the plan gate for item **b**.
+
+At one workload — today's entire fleet — every command below behaves
+exactly as it did, down to the `kubectl logs` argv and the wording of each
+prompt. What is new is emitted only where a second workload exists, with
+one deliberate exception noted where it happens.
+
+### Fixed
+
+- **`apprafter app remove` asked one line, in the singular, before
+  destroying a whole bundle.** The entire confirmation for tearing down a
+  registration that may deploy three workloads and drop several databases
+  was this:
+
+      Delete Application 'shop' (project: apps, repo: https://github.com/acme/shop)?
+
+  It named neither the workloads nor the data. Above one workload the
+  prompt now names **every** workload — never a count — and then
+  enumerates the `ResourceClaim`s and `SharedVolume`s the cascade
+  destroys, so the databases are on screen before you type `y` rather
+  than after.
+
+  That enumeration is a real cluster read, not a re-print of something
+  the CLI already held. The registration's own `status.resources[]` shows
+  only the claims a manifest declares, and structurally cannot see the
+  ones the operator generates from `needs.*` — which are exactly the
+  databases. So the prompt spends one extra namespace-scoped listing,
+  filtered by `ownerReference` back to this bundle's own workloads: a
+  namespace can hold a second registration's applications, and naming
+  their database in this one's blast radius is its own kind of wrong. The
+  read is spent only on an interactive removal of a multi-workload bundle
+  that will actually prune; every other path renders no data section at
+  all.
+
+  "We looked and there is none" and "we could not look" are different
+  sentences, and a failed read never collapses into the first: it states
+  the rule, says the list could not be read, and prints the command to
+  check by hand. With `--keep-data` the section says the opposite — the
+  workloads and their data are preserved. At one workload the prompt and
+  the success line are byte-identical to before, because the plural form
+  calls the single-line one rather than re-deriving it.
+
+- **`logs`, `open`, `rollback` and `unpin` acted on whichever workload of
+  a bundle sorted first**, and said nothing about the rest. All four now
+  take **`--workload <name>`**. The positional argument stays the
+  *application* — the registration — and never a workload; `--workload`
+  is the disambiguator, exactly as `--env` is.
+
+  Reads and writes get different defaults above one workload, and the
+  asymmetry is the point:
+
+    - **`rollback` and `unpin` refuse**, and list the candidates as one
+      copy-pasteable command per line, carrying the flags already typed.
+      Pinning whichever workload sorted first is how a pin lands on a
+      workload nobody named, and nothing downstream can tell that from a
+      pin somebody meant.
+    - **`open` asks** — a picker in a terminal, the candidate list
+      otherwise. Forwarding an arbitrary Service puts a different
+      application on `localhost:8080` than the one named, which is wrong
+      but recoverable, so demanding a re-run would buy no safety.
+    - **`logs` multiplexes every workload** of the bundle and names the
+      set up front. A bundle is deployed, synced and removed together, so
+      its lines interleave into one story — the API 500 and the worker
+      exception that caused it. Every line already carries its pod name
+      and the operator names each Deployment after its workload, so
+      attribution survives the fan-out, and the per-workload request
+      ceiling is raised so following a replicated bundle does not hit a
+      limit this CLI does not expose. `logs` does not *act* on its
+      resolution; the other three do, which is why the same generosity
+      there would be a wrong write or a wrong forward.
+
+  **`rollback`'s two branches have opposite cardinality, and each prompt
+  now says which is about to happen.** `--to <digest>` pins ONE workload;
+  `--to <git-revision>` moves the registration and therefore EVERY
+  workload of it. A `--workload` the resolved branch cannot honour is now
+  **refused** rather than accepted and silently discarded — including the
+  shape reached by accident, a bare `rollback --workload api` whose
+  workload has no image to roll back to and which used to fall through to
+  the previous Git revision and move all of them. `--yes` skips the
+  prompt, so disclosing cardinality at prompt time was not enough on its
+  own.
+
+  **One single-workload output changes on purpose, and it is a bug fix.**
+  The un-pin command quoted by the pin prompt and success line used to
+  name the workload. Wherever a registration and its workload are named
+  differently — a supported shape: registration `cms-prod` rendering a CR
+  `landing-cms` — that command matched no Argo CD object and no
+  `apprafter.io/application` label and failed `not found`, so the only
+  printed route out of a mode that keeps acting until somebody takes it
+  did not work. Both branches now put the application in the positional.
+  The strings coincide for every bundle whose application and workload
+  share a name, which is the scaffolded default.
+
+  Same defect, one surface over: `apprafter status`'s problem-application
+  roll-up indexed only the first workload of each registration, so a
+  bundle's sibling rendered as `shop/worker — logical name unresolved;
+  'app status' may not find it under this name`. That disclaimer was true
+  when it was written and b-2 made it false; a roll-up whose job is to
+  name what is burning must not disclaim the name of the thing that is
+  burning.
+
+- **`apprafter app validate` answered `✓ valid` for manifests the cluster
+  refuses at sync.** 2.27a taught the render sidecar to refuse four
+  intra-bundle contradictions — a package-scope manifest mixed with named
+  wrappers, workloads declaring different namespaces, a duplicate
+  `(namespace, name)`, and workloads declaring different
+  `spec.environment`. The local validator carried none of them: it ran
+  `cue vet` and that was the whole verdict. So a manifest validated clean
+  on a laptop and the operator learned about it from a red Argo CD tile,
+  which inverts the promise a local validator exists for.
+
+  All four now run, after `cue vet` succeeds — a package that does not
+  compile has no workloads to compare, and its real diagnostic is the
+  compile error. It is a **mirror**, not a second implementation: the
+  summary lines, the detail prose and the column widths are the sidecar's
+  verbatim, because a finding met twice — once here, once on a tile — has
+  to read as the same finding. Measured byte-identical on every refusing
+  fixture, and the tests drive the CLI from the **sidecar's own**
+  fixtures rather than private copies, since two layers asserting one
+  rule against two sets of fixtures drift into exactly the case this
+  closes. The one deliberate difference is the closing line: the sidecar
+  says nothing was applied, this says the sidecar would refuse it too.
+
+  `✓ valid` now also prints the workload roster, in declaration order and
+  at one workload too. A bare `✓ valid` cannot answer "how many workloads
+  is this?" — the first question a bundle raises, and the one that makes
+  "my workload never appeared" answerable: a wrapper with a mistyped
+  `apiVersion` is not a workload but an inert struct, and its only
+  symptom is a roster one line short.
+
+  The sidecar's own refusal still does not point at this command. That
+  line was removed in 2.27a precisely because these checks did not exist
+  yet; restoring it is a chart change and will ride the next one.
+
+- **`apprafter app add --path apps/api/Application.cue` created a
+  permanently broken registration.** Argo CD refuses a source path that
+  names a file rather than a directory — but at manifest-generation time,
+  not at admission. The apiserver therefore accepts the object, writes
+  it, and it sits in `ComparisonError` forever. There is no CRD
+  validation, no admission webhook and no later reconcile gate, so the
+  CLI is the only layer positioned to refuse at all, and the first signal
+  a reader got was a red tile complaining about directories for a path
+  they had been allowed to type.
+
+  `app add` now refuses it as its first act — before anything is
+  scaffolded and before any call reaches the network or the cluster, so a
+  registration that was never going to work leaves no side effects
+  behind. Inside a checkout the filesystem is consulted and is exact in
+  both directions: a directory named `manifest.yaml` is accepted, a file
+  named `Dockerfile` is refused. For a remote-only add run from outside
+  the repository, where there is nothing on disk to consult, a closed
+  list of four suffixes stands in — `.cue`, `.yaml`, `.yml`, `.json`,
+  our own manifest plus the three types Argo CD's directory mode reads.
+  Closed rather than "looks like it has an extension", because the
+  general rule would refuse a directory legitimately named `v1.0` or
+  `my.app` with no way around it. The gate covers the interactive prompt
+  as well as the flag, since the wizard bypasses the parser entirely.
+
+### Changed
+
+- **Removing ONE workload of a bundle is refused, and the refusal prints
+  the route that works.** `apprafter app add` writes
+  `syncPolicy.automated.selfHeal: true`, so deleting a single workload's
+  CR from the CLI is undone within one reconcile — the command would
+  report success for a change that does not survive a sync. This is how
+  GitOps works rather than a gap in the product, so the refusal says so
+  and hands over the steps that do work: delete the block from the
+  manifest, commit, push, and Argo CD prunes it on the next sync. It also
+  names the command that removes the whole bundle, for the reader who
+  meant that.
+
+  Naming the **sole** workload of a registration is an error too, with a
+  different message — nothing about that intent is unsupported, the
+  caller simply named the workload where the verb takes the application.
+  It hands over `apprafter app remove <application>` and stops rather
+  than acting on the caller's behalf: `--yes` skips the confirmation, so
+  proceeding would turn `apprafter app remove <workload> --yes`, an
+  invocation that fails safe today, into a registration delete. No bundle
+  size lets a workload name reach the delete.
+
 ## cli v0.2.68 — `app status` speaks for every workload in the bundle (2.27b, unreleased)
 
 A manifest package is a **bundle**: one registration, 1..N workloads.
