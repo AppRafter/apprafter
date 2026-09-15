@@ -1420,6 +1420,12 @@ fn print_workload_detail(inner_name: &str, dest_ns: &str, kubeconfig_path: &Path
             if let Some(url) = public_endpoint_line(&cr) {
                 println!("{url}");
             }
+            // Also identity, not diagnosis: the effective probe configuration
+            // exists nowhere else a reader can see it (the timing defaults are
+            // renderer-side, so they never reach the stored object).
+            if let Some(probes) = format_probes_line(&cr) {
+                println!("{probes}");
+            }
             for line in apprafter_cr_advisory_lines(&cr, &chrono::Utc::now()) {
                 if line.warn {
                     println!("{}", style::warn(&line.text));
@@ -2344,6 +2350,138 @@ pub(crate) fn public_endpoint_line(cr: &Value) -> Option<String> {
     };
     let urls: Vec<String> = hosts.iter().map(|h| format!("{scheme}://{h}")).collect();
     Some(format!("Public URL:      {}", urls.join(", ")))
+}
+
+/// The health checks this workload actually runs (2.28 / ADR 0065 §2.7), or
+/// `None` when it runs none.
+///
+/// **This line is the only place the effective configuration is visible.**
+/// The platform's timing defaults are renderer-side constants, not CRD
+/// defaults — `crdgen` strips every CUE default and the R4-M2 assertion
+/// forbids one reaching a CRD, so nothing stamps them into the stored
+/// object. Neither the manifest nor `kubectl get application -o yaml` shows
+/// what the pod got.
+///
+/// Two of the probes shown may not appear in the manifest at all, and each
+/// is labelled so nobody hunts for it in their own file: `(default)` marks
+/// the TCP readiness probe an exposed workload gets when it declares none,
+/// and `(derived)` marks the startup probe a declared liveness produces.
+///
+/// Reads `status.lastAppliedSpec` first and falls back to `spec`, for the
+/// same reason [`public_endpoint_line`] does: during a gated migration the
+/// stamped baseline is what is actually serving while `spec` is what is
+/// waiting for approval.
+pub(crate) fn format_probes_line(cr: &Value) -> Option<String> {
+    // MUST match `operator-rendering/src/probes.rs`. Pinned by
+    // `the_cli_probe_defaults_match_the_renderers` below — if that test
+    // fails, the operator moved and this did not.
+    const DEFAULT_PERIOD: i64 = 10;
+    const DERIVED_STARTUP_PERIOD: i64 = 5;
+
+    let root = cr
+        .pointer("/status/lastAppliedSpec")
+        .filter(|v| v.is_object())
+        .or_else(|| cr.pointer("/spec"))?;
+    let base = root.pointer("/base");
+    // The environment the operator selected, not one this command picks.
+    let env_scope = cr
+        .pointer("/status/environment")
+        .or_else(|| root.get("environment"))
+        .and_then(Value::as_str)
+        .and_then(|env| root.pointer(&format!("/environments/{env}")));
+
+    let port = env_scope
+        .and_then(|s| s.pointer("/expose/port"))
+        .or_else(|| base.and_then(|b| b.pointer("/expose/port")))
+        .and_then(Value::as_i64);
+
+    // Per-probe, per-field override-wins — the same merge `merge_probes`
+    // performs in the operator. A wholesale pick would report a path the pod
+    // does not have whenever an environment tunes one number.
+    let merged = |name: &str| -> Option<Value> {
+        let b = base.and_then(|b| b.pointer(&format!("/probes/{name}")));
+        let o = env_scope.and_then(|s| s.pointer(&format!("/probes/{name}")));
+        match (b, o) {
+            (None, None) => None,
+            (Some(v), None) | (None, Some(v)) => Some(v.clone()),
+            (Some(b), Some(o)) => {
+                let mut m = b.as_object()?.clone();
+                for (k, v) in o.as_object()? {
+                    m.insert(k.clone(), v.clone());
+                }
+                Some(Value::Object(m))
+            }
+        }
+    };
+
+    // One segment for a probe that will render, given its resolved port.
+    //
+    // `force_period` is `Some` ONLY for the derived startup probe, which
+    // takes the liveness probe's TARGET but not its cadence — the renderer
+    // deliberately does not inherit the period there (a liveness period
+    // answers how fast a hang is caught, not how long a start is tolerated),
+    // so reading `periodSeconds` off the liveness probe here would report a
+    // number the pod does not carry.
+    let segment =
+        |name: &str, p: &Value, force_period: Option<i64>, suffix: &str| -> Option<String> {
+            let probe_port = p.get("port").and_then(Value::as_i64).or(port)?;
+            let target = match p.get("path").and_then(Value::as_str) {
+                Some(path) => format!("http {path}:{probe_port}"),
+                None => format!("tcp :{probe_port}"),
+            };
+            let period = force_period.unwrap_or_else(|| {
+                p.get("periodSeconds")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(DEFAULT_PERIOD)
+            });
+            Some(format!("{name} {target} every {period}s{suffix}"))
+        };
+    let enabled = |p: &Value| p.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+
+    let mut parts: Vec<String> = Vec::new();
+
+    let liveness = merged("liveness");
+    for (name, declared) in [
+        ("liveness", liveness.clone()),
+        ("readiness", merged("readiness")),
+    ] {
+        match declared {
+            Some(p) if !enabled(&p) => parts.push(format!("{name} disabled")),
+            Some(p) => parts.extend(segment(name, &p, None, "")),
+            // Only readiness has a platform default to fall back to.
+            None if name == "readiness" => {
+                if let Some(port) = port {
+                    parts.push(format!(
+                        "readiness tcp :{port} every {DEFAULT_PERIOD}s (default)"
+                    ));
+                }
+            }
+            None => {}
+        }
+    }
+
+    match merged("startup") {
+        Some(p) if !enabled(&p) => parts.push("startup disabled".to_string()),
+        Some(p) => parts.extend(segment("startup", &p, None, "")),
+        None => {
+            // Derived from a declared, ENABLED liveness — the same condition
+            // `resolve_probes` applies, so this line cannot claim a probe the
+            // pod does not carry.
+            if let Some(l) = liveness.filter(enabled) {
+                parts.extend(segment(
+                    "startup",
+                    &l,
+                    Some(DERIVED_STARTUP_PERIOD),
+                    " (derived)",
+                ));
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("Probes:          {}", parts.join(", ")))
 }
 
 /// Pure helper — resolve an Argo CD Application's environment from
@@ -8719,6 +8857,141 @@ mod tests {
         assert!(!line.contains("@sha256"));
         assert!(!line.contains("->"));
         assert!(!line.contains("resolved"));
+    }
+
+    // ── format_probes_line (2.28 / ADR 0065) ──────────────────────────
+
+    #[test]
+    fn the_probes_line_shows_the_effective_configuration() {
+        let cr = json!({"spec": {"base": {
+            "expose": {"port": 8080},
+            "probes": {
+                "readiness": {"path": "/healthz"},
+                "liveness": {"path": "/livez", "periodSeconds": 30}
+            }
+        }}});
+        let line = format_probes_line(&cr).expect("line");
+        assert!(
+            line.contains("readiness http /healthz:8080 every 10s"),
+            "{line}"
+        );
+        assert!(
+            line.contains("liveness http /livez:8080 every 30s"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn the_derived_startup_probe_is_shown_with_its_own_cadence() {
+        // It must NOT report the liveness probe's period: the renderer does
+        // not inherit it, so printing 30s here would name a number the pod
+        // does not carry — the exact class of lie this line exists to prevent.
+        let cr = json!({"spec": {"base": {
+            "expose": {"port": 8080},
+            "probes": {"liveness": {"path": "/livez", "periodSeconds": 30}}
+        }}});
+        let line = format_probes_line(&cr).expect("line");
+        assert!(
+            line.contains("startup http /livez:8080 every 5s (derived)"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn the_probes_line_names_the_default_readiness_as_defaulted() {
+        let cr = json!({"spec": {"base": {"expose": {"port": 8080}}}});
+        let line = format_probes_line(&cr).expect("line");
+        assert!(
+            line.contains("readiness tcp :8080 every 10s (default)"),
+            "a reader must know they did not write this: {line}"
+        );
+    }
+
+    #[test]
+    fn an_unexposed_workload_has_no_probes_line() {
+        let cr = json!({"spec": {"base": {"image": "img"}}});
+        assert!(format_probes_line(&cr).is_none());
+    }
+
+    #[test]
+    fn a_disabled_readiness_is_reported_as_disabled() {
+        // Silence here would read as "the default is active", which is the
+        // opposite of what this manifest asked for.
+        let cr = json!({"spec": {"base": {
+            "expose": {"port": 8080},
+            "probes": {"readiness": {"enabled": false, "path": "/healthz"}}
+        }}});
+        let line = format_probes_line(&cr).expect("line");
+        assert!(line.contains("readiness disabled"), "{line}");
+        assert!(
+            !line.contains("(default)"),
+            "and the default is not claimed: {line}"
+        );
+    }
+
+    #[test]
+    fn the_probes_line_merges_the_environment_override_per_field() {
+        // The env tunes one number; the base's path must survive, or the line
+        // would report a TCP probe for a pod running an HTTP one.
+        let cr = json!({
+            "spec": {
+                "environment": "dev",
+                "base": {"expose": {"port": 8080}, "probes": {"readiness": {"path": "/healthz"}}},
+                "environments": {"dev": {"probes": {"readiness": {"periodSeconds": 3}}}}
+            }
+        });
+        let line = format_probes_line(&cr).expect("line");
+        assert!(
+            line.contains("readiness http /healthz:8080 every 3s"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn the_probes_line_prefers_the_stamped_baseline_over_the_pending_spec() {
+        // During a gated migration `spec` is what awaits approval and
+        // lastAppliedSpec is what is actually serving.
+        let cr = json!({
+            "spec": {"base": {"expose": {"port": 8080}, "probes": {"readiness": {"path": "/new"}}}},
+            "status": {"lastAppliedSpec": {"base": {
+                "expose": {"port": 8080}, "probes": {"readiness": {"path": "/old"}}
+            }}}
+        });
+        let line = format_probes_line(&cr).expect("line");
+        assert!(line.contains("/old"), "{line}");
+        assert!(!line.contains("/new"), "{line}");
+    }
+
+    #[test]
+    fn the_cli_probe_defaults_match_the_renderers() {
+        // These constants are duplicated across two cargo workspaces (the CLI
+        // cannot depend on operator-rendering), so nothing but this test keeps
+        // them honest. It reads the operator's source rather than trusting a
+        // comment — the same technique `declared_claim_fields` uses in the
+        // webhook for the CUE claim vocabulary.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../operator/operator-rendering/src/probes.rs");
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "{}: the renderer's probe defaults could not be read, so this \
+                 test would have judged nothing: {e}",
+                path.display()
+            )
+        });
+        for (needle, why) in [
+            ("const DEFAULT_PERIOD_SECONDS: i32 = 10;", "DEFAULT_PERIOD"),
+            (
+                "const DERIVED_STARTUP_PERIOD_SECONDS: i32 = 5;",
+                "DERIVED_STARTUP_PERIOD",
+            ),
+        ] {
+            assert!(
+                src.contains(needle),
+                "{why} in format_probes_line no longer matches the renderer: \
+                 expected to find {needle:?} in {}",
+                path.display()
+            );
+        }
     }
 
     // ── format_recommendation_line (T10 / 2.16e) ──────────────────────
