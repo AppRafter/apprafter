@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use crate::cnpg::BackendResources;
-use operator_core::{ResourceClaim, RetainedClaim};
+use operator_core::{ResourceClaim, RetainedClaim, SharedDatabase};
 
 /// Dragonfly's self-imposed RSS cap (`--maxmemory` server flag), sized BELOW
 /// the `BackendResources::dragonfly_t1` 320Mi cgroup limit so the process
@@ -593,9 +593,10 @@ pub fn used_dbnums_on_instance(claims: &[ResourceClaim], instance: &str) -> BTre
 
 /// The set of DB numbers RESERVED on `instance` — the union of (a) every
 /// LIVE `ResourceClaim`'s `status.dbnum` whose `status.instance` matches
-/// (the existing live source of truth) and (b) every `RetainedClaim`'s
+/// (the existing live source of truth), (b) every `RetainedClaim`'s
 /// `spec.dbnum` whose `spec.instance` matches (the ADR 0042 §8 reservation
-/// of freed-but-still-in-grace DBs).
+/// of freed-but-still-in-grace DBs), and (c) every `SharedDatabase`'s
+/// `status.dbnum` on the same instance (2.29 / ADR 0066).
 ///
 /// Why retained DBs MUST be reserved (data-loss bug otherwise): when a
 /// claim is deleted its DB is snapshotted into a `RetainedClaim` and held
@@ -608,15 +609,39 @@ pub fn used_dbnums_on_instance(claims: &[ResourceClaim], instance: &str) -> BTre
 /// all of them implements the §8 reservation without a per-snapshot
 /// deadline check here. The provision path LISTs `RetainedClaim`s in
 /// `apprafter-system` and passes them in.
+///
+/// Why SHARED databases must be reserved, for exactly the same reason one
+/// step removed: a `SharedDatabase` holds its `$N` in its OWN status, not in
+/// any claim's — its consumers' claims carry `sharedRef` and no `dbnum` of
+/// their own. An allocator blind to that source hands the same number to the
+/// next owned redis claim, and then two unrelated tenants are writing to one
+/// keyspace while either one's GC `FLUSHDB` wipes the other. `shared` is a
+/// REQUIRED parameter rather than a defaulted one so that a future call site
+/// cannot omit it and reintroduce this silently; the compiler asks the
+/// question instead.
 pub fn used_dbnums(
     live: &[ResourceClaim],
     retained: &[RetainedClaim],
+    shared: &[SharedDatabase],
     instance: &str,
 ) -> BTreeSet<u16> {
     let mut used = used_dbnums_on_instance(live, instance);
     used.extend(retained.iter().filter_map(|r| {
         if r.spec.instance.as_deref() == Some(instance) {
             r.spec.dbnum
+        } else {
+            None
+        }
+    }));
+    used.extend(shared.iter().filter_map(|s| {
+        let st = s.status.as_ref()?;
+        if st.instance.as_deref() == Some(instance) {
+            // `status.dbnum` is an i64 in the CRD (JSON has one number type);
+            // the allocator's domain is u16. An out-of-range value cannot be
+            // a number this allocator handed out, so it reserves nothing —
+            // and `try_into` is how that stays true without a cast that would
+            // silently fold 65536 onto 0 and reserve the WRONG DB.
+            u16::try_from(st.dbnum?).ok()
         } else {
             None
         }
@@ -956,7 +981,7 @@ mod tests {
             // A retained dbnum on a DIFFERENT instance — must NOT be reserved.
             retained_with_alloc("ret-b", "platform-redis-ephemeral-001", 9),
         ];
-        let used = used_dbnums(&live, &retained, "platform-redis-ephemeral-000");
+        let used = used_dbnums(&live, &retained, &[], "platform-redis-ephemeral-000");
         assert_eq!(used, [0u16, 2, 5].into_iter().collect());
     }
 
@@ -967,7 +992,7 @@ mod tests {
             "platform-redis-ephemeral-000",
             3,
         )];
-        let used = used_dbnums(&[], &retained, "platform-redis-ephemeral-000");
+        let used = used_dbnums(&[], &retained, &[], "platform-redis-ephemeral-000");
         assert_eq!(used, [3u16].into_iter().collect());
     }
 
@@ -978,8 +1003,71 @@ mod tests {
             "platform-redis-ephemeral-001",
             9,
         )];
-        let used = used_dbnums(&[], &retained, "platform-redis-ephemeral-000");
+        let used = used_dbnums(&[], &retained, &[], "platform-redis-ephemeral-000");
         assert!(used.is_empty());
+    }
+
+    /// Build a `SharedDatabase` holding an allocation in its own status.
+    fn shared_with_alloc(name: &str, instance: &str, dbnum: i64) -> SharedDatabase {
+        let mut sd = SharedDatabase::new(
+            name,
+            operator_core::SharedDatabaseSpec {
+                type_: "redis".into(),
+                ..Default::default()
+            },
+        );
+        sd.status = Some(operator_core::SharedDatabaseStatus {
+            instance: Some(instance.into()),
+            dbnum: Some(dbnum),
+            ..Default::default()
+        });
+        sd
+    }
+
+    #[test]
+    fn used_dbnums_reserves_a_shared_databases_own_dbnum() {
+        // The allocation lives in the SharedDatabase's status and in NO claim
+        // — its consumers reference it by name and carry no dbnum. Reading
+        // only claims would re-hand `4` to the next owned redis claim and put
+        // two tenants in one keyspace.
+        let live = vec![claim_with_alloc(
+            "a",
+            Some("platform-redis-ephemeral-000"),
+            Some(0),
+        )];
+        let shared = vec![shared_with_alloc(
+            "orders",
+            "platform-redis-ephemeral-000",
+            4,
+        )];
+        let used = used_dbnums(&live, &[], &shared, "platform-redis-ephemeral-000");
+        assert_eq!(used, [0u16, 4].into_iter().collect());
+    }
+
+    #[test]
+    fn used_dbnums_excludes_a_shared_database_on_another_instance() {
+        let shared = vec![shared_with_alloc(
+            "orders",
+            "platform-redis-persistent-000",
+            4,
+        )];
+        let used = used_dbnums(&[], &[], &shared, "platform-redis-ephemeral-000");
+        assert!(used.is_empty());
+    }
+
+    #[test]
+    fn used_dbnums_ignores_a_shared_dbnum_outside_the_allocator_domain() {
+        // `status.dbnum` is an i64 and the allocator's domain is u16. A value
+        // outside it cannot be one this allocator issued, so it reserves
+        // nothing — the point being that it must not WRAP: a cast would fold
+        // 65536 onto 0 and reserve a DB nobody is using while leaving the real
+        // one free.
+        let shared = vec![
+            shared_with_alloc("wrapped", "platform-redis-ephemeral-000", 65536),
+            shared_with_alloc("negative", "platform-redis-ephemeral-000", -1),
+        ];
+        let used = used_dbnums(&[], &[], &shared, "platform-redis-ephemeral-000");
+        assert!(used.is_empty(), "got {used:?}");
     }
 
     // --- resolve_allocation() (ADR 0042 §8 reattach vs fresh) ---

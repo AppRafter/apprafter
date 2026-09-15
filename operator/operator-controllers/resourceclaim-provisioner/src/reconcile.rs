@@ -944,6 +944,18 @@ async fn provision_dragonfly(
                 .await?
                 .items;
             let retained: Vec<RetainedClaim> = rc_api.list(&Default::default()).await?.items;
+            // ...and every SharedDatabase, cluster-wide (2.29 / ADR 0066). A
+            // shared cache holds its `$N` in its OWN status — no claim carries
+            // it — so an allocator reading only claims would hand the same
+            // number to this owned claim and put two unrelated tenants in one
+            // keyspace. Listed across all namespaces because the pool
+            // instances are cluster-wide: a shared database in namespace `a`
+            // and an owned claim in `b` contend for the same numbers.
+            let shared_dbs: Vec<operator_core::SharedDatabase> =
+                Api::<operator_core::SharedDatabase>::all(ctx.client.clone())
+                    .list(&Default::default())
+                    .await?
+                    .items;
             // Reattach only to a snapshot on THIS class's instance. Step 1 has
             // already committed the admin Secret + `Dragonfly` CR for the
             // class-derived `instance`; a snapshot on a different instance (a
@@ -958,7 +970,7 @@ async fn provision_dragonfly(
                     r.name_any() == object_name && r.spec.instance.as_deref() == Some(&instance)
                 })
                 .and_then(|r| Some((r.spec.instance.clone()?, r.spec.dbnum?)));
-            let used = dragonfly::used_dbnums(&live, &retained, &instance);
+            let used = dragonfly::used_dbnums(&live, &retained, &shared_dbs, &instance);
             match dragonfly::resolve_allocation(existing_snapshot, persistent, &used, dbnum_max) {
                 dragonfly::Resolution::Reattach {
                     instance: ri,

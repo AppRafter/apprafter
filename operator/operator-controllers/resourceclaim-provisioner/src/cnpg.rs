@@ -296,6 +296,46 @@ pub fn managed_role_entry(role: &str, secret_name: &str) -> Value {
     })
 }
 
+/// The single role CNPG creates on the platform's behalf for SHARED
+/// databases (2.29 / ADR 0066 §3.1). Everything else a shared database needs
+/// — the two groups, the per-consumer roles, their passwords — is created BY
+/// this role over SQL, because a `CREATEROLE` non-superuser may administer
+/// only the roles it created itself (measured;
+/// `docs/measurements/2.29-shared-database-2026-09-15.md`).
+///
+/// One role per CLUSTER, not per SharedDatabase: it is the platform's
+/// identity on the server, and a second copy would hold admin option on a
+/// disjoint set of roles and be unable to touch the first's.
+pub const PLATFORM_ROLE: &str = "apprafter_admin";
+
+/// `metadata.name` of the basic-auth Secret holding [`PLATFORM_ROLE`]'s
+/// password, in the CNPG namespace alongside the cluster it belongs to.
+pub fn platform_role_secret_name(cluster: &str) -> String {
+    format!("{cluster}-apprafter-admin")
+}
+
+/// Build the `spec.managed.roles[]` entry for [`PLATFORM_ROLE`].
+///
+/// `createrole: true` and `superuser: false` is the whole point. The platform
+/// needs to create roles; it must not be able to read every tenant's data, and
+/// a superuser here would also let `CREATE EXTENSION` run for anything a
+/// manifest names rather than only what the provider seed allows.
+///
+/// `createdb` stays false: databases arrive as CNPG `Database` CRs, so the
+/// declarative path stays the only one and a drift between the two cannot open
+/// up.
+pub fn platform_role_entry(secret_name: &str) -> Value {
+    json!({
+        "name": PLATFORM_ROLE,
+        "ensure": "present",
+        "login": true,
+        "superuser": false,
+        "createrole": true,
+        "createdb": false,
+        "passwordSecret": { "name": secret_name },
+    })
+}
+
 /// Build one `spec.managed.roles[]` entry that declares the role
 /// ABSENT (Phase 2.4f GC role-drop). CNPG drops a managed role only via
 /// an `ensure: absent` entry — pruning the entry merely un-manages it

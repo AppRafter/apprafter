@@ -78,6 +78,7 @@ pub mod pg_client;
 pub mod reaper;
 pub mod reconcile;
 pub mod redis_client;
+pub mod shared_database;
 pub mod shared_pg;
 pub mod shared_volume;
 
