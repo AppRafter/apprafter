@@ -262,6 +262,7 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
         },
         Commands::Volume { action } => commands::volume::run(action)?,
         Commands::Node { action } => commands::node_prep::run(action)?,
+        Commands::Top => commands::top::run()?,
         Commands::Export {
             namespace,
             select,

@@ -46,6 +46,7 @@ pub mod target_domain;
 pub mod target_firewall;
 pub mod target_machine;
 pub mod target_wizard;
+pub mod top;
 pub mod upgrade_tier;
 pub mod version_check;
 pub mod volume;

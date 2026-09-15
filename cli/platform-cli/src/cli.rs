@@ -322,6 +322,23 @@ pub enum Commands {
         #[command(subcommand)]
         action: NodeAction,
     },
+    /// Where the cluster's CPU, memory and disk have gone.
+    ///
+    /// Per node: capacity, allocatable, requested, schedulable
+    /// (allocatable minus requested), in-use and free (allocatable
+    /// minus in-use). Then the same cluster-wide, split into the
+    /// platform, the integrated data services (`needs.pg`,
+    /// `needs.redis`, `needs.jetstream`) and your applications.
+    ///
+    /// Requested and in-use answer different questions: a node can be
+    /// fully requested and barely used, or barely requested and full.
+    /// In-use is measured — from `metrics.k8s.io` for CPU and memory
+    /// and from the kubelet for disk — so where a cluster serves
+    /// neither, those columns read `—` with the reason printed
+    /// underneath rather than a zero.
+    ///
+    /// Read-only.
+    Top,
     /// Native data export (Kind 1) — pull pg dumps, volume tars and
     /// persistent-redis snapshots to a plain local folder +
     /// `manifest.json`. An ephemeral (`persistent: false`) redis claim

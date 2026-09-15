@@ -75,6 +75,7 @@ specific release rather than scraping these pages.
 | [`apprafter secret`](secret.md) | — | Seal secret material with the in-cluster sealed-secrets controller's public cert. |
 | [`apprafter status`](status.md) | — | Is anything wrong with this cluster? Rolls up the active target, the platform's version and any unhealthy condition, the applications reporting problems, the applications held at an image digest, and the MigrationPlans awaiting approval. |
 | [`apprafter target`](target.md) | `t` | Manage deployment targets — persistent named bundles of `(provider, region, credentials, defaults)`. |
+| [`apprafter top`](top.md) | — | Where the cluster's CPU, memory and disk have gone |
 | [`apprafter up`](up.md) | `bootstrap-all` | Stand a cluster up in one command: runs `apply` → polls for the k3s kubeconfig to become SSH-reachable → runs `cluster-bootstrap`. |
 | [`apprafter upgrade-tier`](upgrade-tier.md) | — | Upgrade the cluster from one tier to the next — NOT IMPLEMENTED, it validates `--to` and prints the move it would make. |
 | [`apprafter volume`](volume.md) | — | Manage SharedVolume CRs — persistent volumes shared across multiple Applications. |

@@ -48,20 +48,31 @@ pub fn parse_bytes(q: &str) -> Option<i64> {
 }
 
 /// Parse a CPU quantity to millicores: `2` → `2000`, `500m` → `500`,
-/// `0.5` → `500`. `None` on anything else.
+/// `0.5` → `500`, `412500000n` → `413`. `None` on anything else.
 ///
 /// `m` means milli here and nowhere else in this module — for memory the
 /// same letter is a decimal-SI milli-byte, which nothing emits. Keeping the
 /// two parsers separate is what stops `500m` of CPU being read as half a
 /// byte.
+///
+/// **`n` and `u` are not decoration.** `metrics.k8s.io` reports CPU in
+/// NANOCORES (`"412500000n"`) — every node and every pod, on every
+/// cluster that runs metrics-server; `kubectl top` divides them down
+/// before printing. A parser that knows only `m` answers `None` on the
+/// entire metrics API, and a `None` folded to zero shows a saturated node
+/// as idle. `u` (micro) is in the same suffix table and costs one arm.
 pub fn parse_millicores(q: &str) -> Option<i64> {
     let q = q.trim();
     if q.is_empty() {
         return None;
     }
-    if let Some(stripped) = q.strip_suffix('m') {
-        let n: f64 = stripped.parse().ok()?;
-        return Some(n.round() as i64);
+    // Longest suffix first: `m` is a prefix of nothing here, but the
+    // order is what keeps it that way if a suffix is ever added.
+    for (suffix, milli_per_unit) in [("n", 1e-6), ("u", 1e-3), ("m", 1.0)] {
+        if let Some(stripped) = q.strip_suffix(suffix) {
+            let n: f64 = stripped.parse().ok()?;
+            return Some((n * milli_per_unit).round() as i64);
+        }
     }
     let n: f64 = q.parse().ok()?;
     Some((n * 1000.0).round() as i64)
@@ -152,6 +163,20 @@ mod tests {
         assert_eq!(parse_millicores("1940m"), Some(1940));
         assert_eq!(parse_millicores("0"), Some(0));
         assert_eq!(parse_millicores("25m"), Some(25));
+    }
+
+    #[test]
+    fn the_metrics_api_reports_cpu_in_nanocores_and_it_must_not_read_as_nothing() {
+        // Every `metrics.k8s.io` node and pod sample arrives like this.
+        // Answering `None` here — and folding that to zero — is how a
+        // saturated node renders as idle.
+        assert_eq!(parse_millicores("412500000n"), Some(413));
+        assert_eq!(parse_millicores("31000000n"), Some(31));
+        assert_eq!(parse_millicores("0"), Some(0));
+        // Below half a millicore rounds to zero, which is the truthful
+        // reading of a pod that is genuinely doing nothing.
+        assert_eq!(parse_millicores("400000n"), Some(0));
+        assert_eq!(parse_millicores("2500u"), Some(3));
     }
 
     #[test]

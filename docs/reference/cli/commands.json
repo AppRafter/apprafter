@@ -3955,6 +3955,21 @@
     },
     {
       "path": [
+        "top"
+      ],
+      "aliases": [],
+      "about": "Where the cluster's CPU, memory and disk have gone",
+      "long_about": "Where the cluster's CPU, memory and disk have gone.\n\nPer node: capacity, allocatable, requested, schedulable (allocatable minus requested), in-use and free (allocatable minus in-use). Then the same cluster-wide, split into the platform, the integrated data services (`needs.pg`, `needs.redis`, `needs.jetstream`) and your applications.\n\nRequested and in-use answer different questions: a node can be fully requested and barely used, or barely requested and full. In-use is measured — from `metrics.k8s.io` for CPU and memory and from the kubelet for disk — so where a cluster serves neither, those columns read `—` with the reason printed underneath rather than a zero.\n\nRead-only.",
+      "usage": "Usage: apprafter top",
+      "hidden": false,
+      "examples": [
+        "apprafter top"
+      ],
+      "args": [],
+      "positionals": []
+    },
+    {
+      "path": [
         "up"
       ],
       "aliases": [

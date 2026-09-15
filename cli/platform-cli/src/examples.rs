@@ -568,6 +568,10 @@ pub const EXAMPLES: &[CommandExamples] = &[
         lines: &["apprafter target use <name>"],
     },
     CommandExamples {
+        path: &["top"],
+        lines: &["apprafter top"],
+    },
+    CommandExamples {
         path: &["up"],
         lines: &["apprafter up --server-type cx22", "apprafter up --dry-run"],
     },
