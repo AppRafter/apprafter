@@ -1006,13 +1006,21 @@ assert_contains "the row names its namespace" "$row" "$APP_NS"
 assert_contains "the row names the key it carries" "$row" "$SECRET_KEY"
 
 # And a REAL sealed-at stamp: only a seal made by this CLI carries
-# `apprafter.io/sealed-at`; anything else renders "-". Matching the row for an
-# RFC3339 date proves the provenance annotation survived the round trip, which
-# a bare "not empty" check would not.
-if [[ "$row" =~ 20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]T ]]; then
-    printf '  ok: the row carries a real sealed-at timestamp (not "-"): %s\n' "$row"
+# `apprafter.io/sealed-at`; anything else renders "-". Matching the row for a
+# date proves the provenance annotation survived the round trip, which a bare
+# "not empty" check would not.
+#
+# The annotation is STORED RFC3339 and the column RENDERS it
+# (`cli_core::timefmt::format_timestamp` — `2026-09-15 14:52 UTC`), so this
+# matches the rendered form on purpose: a raw `2026-09-15T14:52:01Z` reaching
+# the column means the render was skipped, which is the defect v0.2.70 fixed
+# and this is now the gate against. The nightly caught the reverse of that —
+# the fix shipped while this assertion still demanded the machine form.
+sealed_at_re='20[0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9] UTC'
+if [[ "$row" =~ $sealed_at_re ]]; then
+    printf '  ok: the row carries a real, RENDERED sealed-at timestamp (not "-", not raw RFC3339): %s\n' "$row"
 else
-    printf 'ERROR: the %s row shows no RFC3339 sealed-at stamp (apprafter.io/sealed-at missing?):\n%s\n' \
+    printf 'ERROR: the %s row shows no rendered sealed-at stamp — expected `YYYY-MM-DD HH:MM UTC` (apprafter.io/sealed-at missing, or reaching the column unrendered):\n%s\n' \
         "$SECRET_NAME" "$row" >&2
     exit 1
 fi
