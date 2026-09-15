@@ -56,8 +56,8 @@ post-launch work is not a roadmap phase and has no subscribe control.
 | Shipped | ✅ | On-demand Redis-compatible cache (`needs.redis`) | [Redis](operator-guide/redis.md) |
 | Shipped | ✅ | Message streams and durable consumers, declared in the manifest (`needs.jetstream`) | [JetStream](operator-guide/jetstream.md) |
 | Shipped | ✅ | Redelivery, acknowledgement and retention tuned per stream and per consumer, with a dead-letter queue | — |
-| Shipped | 🚧 | One Postgres database or cache shared between applications, each consumer with its own credential | — |
-| Shipped | ✅ | PostgreSQL extensions requested from the manifest, from a bounded list | — |
+| Shipped | 🚧 | One Postgres database or cache shared between applications, each consumer with its own credential | [Shared databases](operator-guide/shared-databases.md) |
+| Shipped | ✅ | PostgreSQL extensions requested from the manifest, from a bounded list | [Shared databases](operator-guide/shared-databases.md) |
 | Shipped | ✅ | On-demand block storage (`needs.disk`) | [Persistent disks](operator-guide/persistent-disk.md) |
 | Shipped | ✅ | One volume shared between applications, with removal refused while it is referenced | [Shared volumes](operator-guide/shared-volumes.md) |
 | Shipped | ✅ | Back up and restore a whole cluster, or export one dependency's data | [Back up a cluster](operator-guide/backup-restore.md) |

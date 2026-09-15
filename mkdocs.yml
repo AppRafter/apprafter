@@ -254,6 +254,7 @@ nav:
       - JetStream: operator-guide/jetstream.md
       - Persistent disk: operator-guide/persistent-disk.md
       - Shared volumes: operator-guide/shared-volumes.md
+      - Shared databases: operator-guide/shared-databases.md
       - Egress policy: operator-guide/egress-policy.md
       # 8-9: reading a failure, then the platform's own lifecycle.
       - Troubleshooting: operator-guide/troubleshooting.md
@@ -291,6 +292,7 @@ nav:
       - What cluster-bootstrap installs: how-it-works/what-cluster-bootstrap-installs.md
       - How the platform upgrades itself: how-it-works/platform-upgrades.md
       - Cross-application shared volumes: how-it-works/cross-application-shared-volumes.md
+      - Shared databases: how-it-works/shared-databases.md
       - How a restore replays a backup: how-it-works/how-a-restore-works.md
       - How retention and the integrity check work: how-it-works/backup-retention-and-checks.md
       - Per-environment deploy: how-it-works/per-environment-deploy.md

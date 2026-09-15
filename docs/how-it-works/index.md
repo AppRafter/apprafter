@@ -46,6 +46,9 @@ than taken on faith.
 - [Cross-application shared volumes](cross-application-shared-volumes.md) — why
   sharing is opt-in, why the namespace is the boundary on Tier 1, and what the
   capacity warning measures.
+- [Shared databases](shared-databases.md) — why the platform runs SQL to build
+  the roles, the one statement that makes sharing work at all, and what a
+  delete does in which order.
 - [How a restore replays a backup](how-a-restore-works.md) — the order, and the
   two invariants that order protects.
 - [How retention and the integrity check work](backup-retention-and-checks.md) —
