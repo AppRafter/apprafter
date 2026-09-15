@@ -1236,7 +1236,6 @@ mod tests {
     // --- acl_setuser_args() ---
 
     #[test]
-    #[test]
     fn a_shared_binding_uses_the_shared_channel_prefix() {
         // Channels are NOT database-scoped, so the per-user prefix that
         // correctly isolates an OWNED claim would leave two consumers of one
