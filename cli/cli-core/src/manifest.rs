@@ -222,8 +222,16 @@ pub struct ApplicationOuterSpec {
 pub struct ApplicationSpec {
     #[serde(default)]
     pub image: Option<String>,
+    /// `u64`, not `u32`, for the reason the [`ApplicationExpose`] doc comment
+    /// below gives: this type only has to DESERIALISE every shape the schema
+    /// permits, and being stricter here than the layers that enforce can only
+    /// cost reach. CUE says `int & >=0` (`schemas/v1alpha1/application.cue`)
+    /// and the CRD says `minimum: 0` with no maximum, so a value above
+    /// `u32::MAX` is legal at every layer that actually validates — and as a
+    /// member of a bundle it would fail the parse of every OTHER workload
+    /// beside it, not just its own.
     #[serde(default)]
-    pub replicas: Option<u32>,
+    pub replicas: Option<u64>,
     #[serde(default)]
     pub expose: Option<ApplicationExpose>,
     #[serde(default)]
@@ -276,33 +284,74 @@ pub struct ApplicationExpose {
     pub network: Option<String>,
 }
 
-/// Run `cue export <path> --out json` from `workdir` and parse the
-/// result as an [`ApplicationManifest`]. Walks the top-level object
-/// the same way `parse_infrastructure` does, picking the first
-/// value whose `kind == "Application"`.
-pub fn parse_application(workdir: &Path, path: &Path) -> Result<ApplicationManifest> {
+/// Every `kind: Application` document in a rendered package, ordered by
+/// `metadata.name`.
+///
+/// ORDER IS BY NAME, DELIBERATELY. `serde_json::Map` is a `BTreeMap`
+/// here (`cli/Cargo.toml` pulls `serde_json` without `preserve_order`),
+/// so iteration order is the CUE *binding* name in ASCII order — which
+/// is neither the declaration order the cue-cmp preserves nor anything
+/// the user chose. Sorting by `metadata.name` makes the order a property
+/// of the manifest instead of the map implementation.
+///
+/// Both layouts the renderer accepts are handled: an unwrapped package
+/// (the root object IS the manifest) and named wrappers (each top-level
+/// value is one).
+pub fn parse_applications(workdir: &Path, path: &Path) -> Result<Vec<ApplicationManifest>> {
     let value = cue::export_in(workdir, path)?;
-    parse_application_from_value(&value)
+    parse_applications_from_value(&value)
 }
 
-fn parse_application_from_value(value: &Value) -> Result<ApplicationManifest> {
-    let obj = value
-        .as_object()
-        .ok_or_else(|| CliError::Other("cue export did not yield a JSON object".to_string()))?;
+fn parse_applications_from_value(value: &Value) -> Result<Vec<ApplicationManifest>> {
+    // `kind` alone does NOT identify a workload, and the apiVersion half of
+    // this predicate is load-bearing rather than defensive: Argo CD's own CRD
+    // is `argoproj.io/v1alpha1, kind: Application`, the one foreign apiVersion
+    // that collides exactly with ours, and a package may legitimately ship one
+    // beside the workload it registers. This mirrors the row filter the
+    // renderer applies in `argocd-cue-cmp/entrypoint.sh` (fixture:
+    // `argocd-cue-cmp/testdata/bundle-foreign-kind/`) — the two layers must
+    // agree on what a bundle contains, or the CLI reports a workload count the
+    // renderer never emits.
+    let is_application = |v: &Value| {
+        v.get("kind").and_then(Value::as_str) == Some("Application")
+            && v.get("apiVersion")
+                .and_then(Value::as_str)
+                .is_some_and(|a| a.starts_with("apprafter.io/"))
+    };
 
-    for (_, candidate) in obj {
-        if candidate
-            .get("kind")
-            .and_then(Value::as_str)
-            .map(|k| k == "Application")
-            .unwrap_or(false)
-        {
-            return serde_json::from_value(candidate.clone()).map_err(CliError::from);
+    let mut out: Vec<ApplicationManifest> = Vec::new();
+    if is_application(value) {
+        out.push(serde_json::from_value(value.clone()).map_err(CliError::from)?);
+    } else {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| CliError::Other("cue export did not yield a JSON object".to_string()))?;
+        for candidate in obj.values().filter(|v| is_application(v)) {
+            out.push(serde_json::from_value(candidate.clone()).map_err(CliError::from)?);
         }
     }
-    Err(CliError::Other(
-        "cue export did not contain an Application document".to_string(),
-    ))
+
+    if out.is_empty() {
+        return Err(CliError::Other(
+            "cue export did not contain an Application document".to_string(),
+        ));
+    }
+    out.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+    Ok(out)
+}
+
+/// The first Application by name. Retained so the pre-2.27 consumers
+/// keep compiling; each moves to [`parse_applications`] as its surface
+/// learns to speak about more than one workload.
+pub fn parse_application(workdir: &Path, path: &Path) -> Result<ApplicationManifest> {
+    Ok(parse_applications(workdir, path)?
+        .into_iter()
+        .next()
+        // Not an error arm: `parse_applications` returns `Err` on empty, so
+        // this is unreachable by construction. Asserting the coupling beats
+        // duplicating the error string, which would be a second place to edit
+        // when that message changes.
+        .expect("parse_applications never returns an empty Ok"))
 }
 
 #[cfg(test)]
@@ -335,8 +384,9 @@ mod tests {
                 }
             }
         });
-        let parsed =
-            parse_application_from_value(&v).expect("mixed literal/claim/secret env must parse");
+        let parsed = parse_applications_from_value(&v)
+            .expect("mixed literal/claim/secret env must parse")
+            .remove(0);
         assert_eq!(parsed.metadata.namespace.as_deref(), Some("apprafter"));
         let envs: Vec<&String> = parsed.spec.environments.as_ref().unwrap().keys().collect();
         assert_eq!(envs, vec!["dev", "prod"]);
@@ -353,6 +403,107 @@ mod tests {
             base_env.get("PAYLOAD_SECRET"),
             Some(EnvValue::Reference(_))
         ));
+    }
+
+    #[test]
+    fn parse_applications_returns_every_application_sorted_by_name() {
+        // ADR 0062 §Context: the old first-wins walk returned ONE, and
+        // "first" was alphabetical because serde_json::Map is a BTreeMap
+        // without `preserve_order` — the opposite of the declaration order
+        // the cue-cmp deliberately preserves. Sorting by metadata.name makes
+        // the order a property of the data, not of the map implementation.
+        let v = json!({
+            "web": {
+                "apiVersion": "apprafter.io/v1alpha1", "kind": "Application",
+                "metadata": {"name": "zeta", "namespace": "shop"},
+                "spec": {"base": {"image": "ghcr.io/acme/web:1"}}
+            },
+            "api": {
+                "apiVersion": "apprafter.io/v1alpha1", "kind": "Application",
+                "metadata": {"name": "alpha", "namespace": "shop"},
+                "spec": {"base": {"image": "ghcr.io/acme/api:1"}}
+            }
+        });
+        let apps = parse_applications_from_value(&v).expect("two applications must parse");
+        let names: Vec<&str> = apps.iter().map(|a| a.metadata.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn parse_applications_accepts_an_unwrapped_style_a_manifest() {
+        // The root object IS the manifest. The old loop inspected the root's
+        // VALUES, none of which carries `kind`, so Style A parsed as "no
+        // Application document" even though the renderer handles it.
+        let v = json!({
+            "apiVersion": "apprafter.io/v1alpha1", "kind": "Application",
+            "metadata": {"name": "solo", "namespace": "apprafter"},
+            "spec": {"base": {"image": "ghcr.io/acme/solo:1"}}
+        });
+        let apps = parse_applications_from_value(&v).expect("Style A must parse");
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].metadata.name, "solo");
+    }
+
+    #[test]
+    fn parse_applications_ignores_non_application_kinds() {
+        let v = json!({
+            "app": {
+                "apiVersion": "apprafter.io/v1alpha1", "kind": "Application",
+                "metadata": {"name": "keep"}, "spec": {}
+            },
+            "sp": {
+                "apiVersion": "apprafter.io/v1alpha1", "kind": "ServiceProvider",
+                "metadata": {"name": "drop"}, "spec": {}
+            }
+        });
+        let apps = parse_applications_from_value(&v).unwrap();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].metadata.name, "keep");
+    }
+
+    #[test]
+    fn parse_applications_ignores_a_foreign_api_group_application() {
+        // Mirrors `argocd-cue-cmp/testdata/bundle-foreign-kind/`, the
+        // renderer's fixture for the one foreign apiVersion that collides
+        // exactly with ours: Argo CD's own CRD is `argoproj.io/v1alpha1,
+        // kind: Application`, and a package may legitimately ship one beside
+        // the workload it registers. `kind` alone does not make something a
+        // workload of this bundle, so the row filter in
+        // `argocd-cue-cmp/entrypoint.sh` carries an apiVersion predicate and
+        // this asserts the CLI agrees — otherwise the CLI counts TWO
+        // workloads where the renderer emits one, and since "foreign-argo"
+        // sorts before "foreign-web" the Argo document would win every
+        // first-by-name consumer (namespace `argocd`, no environments).
+        let v = json!({
+            "web": {
+                "apiVersion": "apprafter.io/v1alpha1", "kind": "Application",
+                "metadata": {"name": "foreign-web", "namespace": "apprafter"},
+                "spec": {"environment": "prod", "base": {"image": "nginxdemos/hello:plain-text"}}
+            },
+            "argoApp": {
+                "apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
+                "metadata": {"name": "foreign-argo", "namespace": "argocd"},
+                "spec": {"project": "default"}
+            }
+        });
+        let apps = parse_applications_from_value(&v).expect("the AppRafter workload must parse");
+        let names: Vec<&str> = apps.iter().map(|a| a.metadata.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["foreign-web"],
+            "only the apprafter.io document is a workload of this bundle"
+        );
+        assert_eq!(apps[0].metadata.namespace.as_deref(), Some("apprafter"));
+    }
+
+    #[test]
+    fn parse_applications_errors_when_there_is_none() {
+        // INVARIANT: empty is an Err, not an Ok(vec![]). `app add`'s wizard
+        // reads a successful parse as "this is the manifest" and hides the
+        // environment picker on Ok; an empty Ok would present a file with no
+        // applications in it as a base-only app.
+        let v = json!({"helper": {"some": "value"}});
+        assert!(parse_applications_from_value(&v).is_err());
     }
 
     #[test]
