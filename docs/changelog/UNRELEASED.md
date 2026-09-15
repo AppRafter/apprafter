@@ -9,6 +9,128 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.70 — a verb for rotations, a screen for capacity, and columns that stopped hiding their answer (2.27c–f, unreleased)
+
+CLI-only: no operator, chart or CRD change, so nothing has to reach a
+cluster for any of it except the new command's two read grants.
+
+### Added
+
+- **`apprafter app restart <application>`** ([ADR 0064]) replaces a
+  workload's pods with the pod template already applied, and changes
+  nothing else. An environment variable sourced from a Secret is read
+  once at pod start and never re-read, so after rotating a credential the
+  pods keep serving the old value; the platform has shown that drift
+  since 2.22c and had no verb to act on it, with the shipped docs
+  carrying a `kubectl rollout restart` exemption instead.
+
+  The roll is a partial server-side apply naming one pod-template
+  annotation, under its own field manager. It is explicit, never
+  automatic: the 60-second requeue can fire between a first and a second
+  seal, and nothing about a timer knows where a developer's editing
+  sequence ends.
+
+  Three refusals rather than three silent successes. A paused
+  `MigrationPlan` does **not** block it — the roll uses the applied
+  template, so it cannot push the gated change through — and it says so.
+  Zero replicas refuses, because rolling no pods and printing "restarted"
+  is a false claim; it names a `restore --data-only` in flight when the
+  annotation says so. A registration whose git renders a Deployment
+  directly refuses, because Argo CD owns that object and self-heal would
+  revert the annotation after the command reported success.
+
+- **`apprafter top`** — per node and cluster-wide: capacity, allocatable,
+  requested, schedulable, in-use and free, for CPU, memory and disk,
+  split into platform, integrated data services and applications.
+
+  Requested and in-use answer different questions. A node can be 95%
+  requested and 10% used, or 20% requested and 95% used; those are
+  opposite faults with opposite fixes, and the single "used" number most
+  tools print cannot tell them apart.
+
+  In-use is measured — `metrics.k8s.io` for CPU and memory, the kubelet
+  Summary API for disk — and where a source is absent the cells read `—`
+  with the cluster's own error underneath. They never read `0`: a zero in
+  a measurement column is a claim, and "no metrics-server" rendered as an
+  idle cluster is the exact failure the command exists to prevent. The
+  same rule covers the partial case, where a pod younger than the last
+  scrape is counted and named rather than averaged away. A cluster total
+  is absent, not short, when any one node went unmeasured.
+
+  Disk is `ephemeral-storage` — the node's whole root filesystem, images
+  and volume data included — so a node's in-use is legitimately larger
+  than the sum of the per-pod column, which counts only writable layers,
+  logs and emptyDir. The output states that rather than leaving it to be
+  discovered by subtraction. The `other` bucket is normally empty and
+  exists so a drifted classifier announces itself instead of quietly
+  losing pods.
+
+### Fixed
+
+- **A missing namespace stopped reading as an empty one.** A LIST does
+  not validate its namespace: `kubectl get <anything> -n <ns>` against a
+  namespace that was never created exits 0 with an empty list, exactly
+  like a real namespace holding nothing. `secret list`, `volume list`,
+  `volume status` and `volume remove` each answered a mistyped `-n` with
+  "you have nothing here".
+
+  `secret remove` was worse — `--ignore-not-found` made the delete
+  succeed against nothing, so it printed `✓ Removed …` over an empty
+  namespace while the secret stayed live elsewhere. It now checks before
+  the confirmation prompt, because a `y` typed at that prompt teaches the
+  reader their address was right.
+
+- **`secret seal` creates a missing namespace, and never silently** — not
+  even under `--yes`, which authorises it and still prints it. Sealing
+  before deploying is the order that keeps a new application out of a
+  restart loop, so refusing would be wrong; but a SealedSecret is
+  encrypted under its namespace and decrypts nowhere else, so a typo
+  produces ciphertext nobody can read rather than a mistake that can be
+  moved. Announcing it is the last place the typo is visible.
+
+- **`app add` accepted a destination namespace its manifest
+  contradicts.** Argo CD creates the destination namespace, applies each
+  workload into the namespace its own metadata names, and never
+  reconciles the two — so the mismatch produced an empty namespace and
+  workloads landing somewhere nothing had created. The wizard already
+  preselected the manifest's namespace; the flag path had no check at
+  all. It refuses rather than picking a side, because only the operator
+  knows which side is the mistake.
+
+- **`app status` hid the application's own address.** An app exposed
+  publicly answers on a URL that appeared nowhere in its status. It is
+  read from `status.lastAppliedSpec`, so it reports what is serving
+  rather than what the manifest would produce.
+
+- **The VPA recommendation printed a raw byte count** — the reported line
+  was `limits.memory: 183046954` — and its uncapped hint named
+  `resources.limits.memory` from inside the loop over resources, so a
+  capped **CPU** recommendation told the reader to raise a memory limit.
+
+- **`backup list` returned restic's order**, which is oldest-first, so
+  the snapshot an operator wants was furthest from the prompt and off the
+  screen on a repository with real history. Times are compared as
+  instants: `03:00+02:00` sorts before `02:00Z` lexically while being the
+  later moment.
+
+- **Five columns printed a machine timestamp** — `target domain list`'s
+  `Added At`, `secret list`'s `SEALED`, `app status`'s recent revisions
+  and pin line, and the stamp embedded in a `backup list` tag, which put
+  a second differently-formatted time on the same row as the TIME column.
+  Every renderer returns an unparseable value verbatim: it is still the
+  only record of whatever wrote it.
+
+### Internal
+
+- `cli_core::timefmt` and `cli_core::quantity`. The timestamp format was
+  private to `platform.rs`, which is exactly why half the CLI printed raw
+  RFC3339 instead; the implementation moved verbatim and that module's 39
+  existing tests still pin it. `parse_millicores` also learns `n` and `u`
+  — `metrics.k8s.io` reports every CPU sample in nanocores, so a parser
+  knowing only `m` answers `None` on the entire metrics API.
+
+[ADR 0064]: ../adr/0064-app-restart.md
+
 ## cli v0.2.69 — `app remove` names everything it destroys, and the write verbs refuse to guess (2.27b, unreleased)
 
 A manifest package is a **bundle**: one registration, 1..N workloads. b-2
