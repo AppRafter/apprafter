@@ -9,6 +9,85 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.67 — a `--data-only` restore no longer loads a database under live pods (2.27b, unreleased)
+
+One data-integrity fix, and three internal changes that change no
+command's behaviour today. This is the first of the three 2.27b plans;
+the plan gate stays open until all three land.
+
+### Fixed
+
+- **`apprafter restore --data-only` could load a database while the
+  application's own pods were still writing to it.** Before it loads, the
+  restore quiesces the workload with two patches in a fixed order:
+  auto-sync **off**, then scale-to-zero. The order is the whole point —
+  without the first, Argo CD self-heals the replica count within one
+  reconcile and the pods come straight back.
+
+  The auto-sync-off patch was built from a lookup that returned nothing on
+  a whole class of clusters, so only the scale-to-zero went out. Argo CD
+  put the replicas back, and the restore loaded into a database that live
+  application code was writing to — corrupting the very data the restore
+  existed to recover, and then reporting success.
+
+  **You were exposed if the Argo CD registration's name differs from the
+  workload's `metadata.name`** — in practice, if the repository basename
+  the registration defaults to is not the `metadata.name` in the manifest.
+  That is a supported shape, not a misconfiguration (an Argo CD app `cms`
+  rendering an AppRafter Application `landing-cms`), and it needs no
+  second workload: it fires on a single application.
+
+  The lookup now identifies the registration by what it **deploys**
+  (`status.resources[]`, scoped to the workload's own namespace) instead
+  of by a label that merely names it, and returns every registration that
+  claims the workload rather than the first — two registrations can claim
+  one workload, and leaving either of them auto-syncing reproduces the
+  defect in full. A reference whose namespace cannot be determined does
+  not match: quiescing a stranger's same-named application is not a safer
+  failure than missing your own.
+
+  The recorded set is now deduplicated as well, which the corrected join
+  is what makes necessary — every workload of a multi-workload bundle
+  resolves to the same registration. A repeat inflated the "auto-sync is
+  switched OFF on N Application(s)" count an operator reads while
+  recovering an interrupted restore, and handed them the same recovery
+  `kubectl` line N times to wonder how the N differed.
+
+- **The end-to-end walk that looks like coverage for this could not have
+  caught it, and will not catch a regression.** `e2e/backup-restore-walk.sh`
+  Phase 6 runs a full `--data-only` round-trip, but it deploys its
+  application with a bare `kubectl apply` of the `Application` CR — there
+  is no Argo CD registration for it at all. The lookup therefore came back
+  empty under the old code and the new one alike, nothing was self-healing
+  replicas, and the data came back; the step the defect lives in is
+  structurally unreachable from that walk. Closing the gap means
+  registering the walk's application through `apprafter app add` under a
+  registration name deliberately different from the CR name. Recorded
+  here, not done here — `e2e/` was out of scope for this plan.
+
+### Changed
+
+- **Three internal changes, no behaviour change.** They are the model the
+  remaining 2.27b plans are written against — the b-2 read surfaces and
+  the b-3 write surfaces are the consumers — and are called out only so
+  the release is not read as four fixes:
+
+  - manifest parsing returns **every** `Application` in a package, ordered
+    by `metadata.name`, instead of whichever CUE binding happened to sort
+    first; it also now parses an unwrapped, package-scope manifest, which
+    it previously could not read at all.
+  - registration→workload resolution returns every workload a
+    registration deploys rather than the first, with the namespace of a
+    reference that names none carried as *unknown* rather than defaulted.
+    This is the piece the restore fix above is built on, and its only
+    caller in this release.
+  - `AppIndex` joins the two cluster-wide listings — workloads and
+    registrations — in one place, so that a surface stops re-deriving a
+    partial answer from whichever of the two lists it happened to hold.
+    Nothing calls it yet; a compiler expectation on the dead code makes
+    the arrival of the first caller a machine-checked event rather than a
+    comment someone has to remember.
+
 ## platform-stack 0.2.72 / argocd-cue-cmp 0.1.26 — the manifest package is found where it lives, and a bundle that contradicts itself is refused (2.27a, unreleased)
 
 ### Fixed
