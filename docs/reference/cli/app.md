@@ -272,7 +272,7 @@ apprafter app unpin <name> --env prod --yes
 
 ## `apprafter app validate`
 
-Validate an AppRafter `Application.cue` manifest LOCALLY, reproducing the cluster's render-time `cue` pipeline. Lays the CLI's bundled schema + a generated `claim` binding into a temp workspace and runs `cue vet`, so bare `claim.<type>.<field>` selectors and braceless `secret: "name/key"` refs resolve EXACTLY as the cue-cmp resolves them at sync time — a plain `cue vet` on the repo can't (the `claim` binding is never committed). Requires `cue` on PATH. Without `[manifest]`: defaults to `<cwd>/apprafter/Application.cue`, then a single `*.cue` in the cwd; otherwise pass the path explicitly
+Validate an AppRafter `Application.cue` manifest LOCALLY, reproducing the cluster's render-time `cue` pipeline. Lays the CLI's bundled schema + a generated `claim` binding into a temp workspace and runs `cue vet`, so bare `claim.<type>.<field>` selectors and braceless `secret: "name/key"` refs resolve EXACTLY as the cue-cmp resolves them at sync time — a plain `cue vet` on the repo can't (the `claim` binding is never committed). Requires `cue` on PATH. Also applies the four intra-bundle consistency checks the render layer refuses on. Without `[manifest]`: the bundle directory `<cwd>/apprafter` when it exists, else the cwd itself when it holds `*.cue`. Either way a whole PACKAGE is validated, never one file of it — the checks compare workloads against each other, so a manifest read alone can only ever pass them
 
 ```text
 Usage: apprafter app validate [MANIFEST]
@@ -280,11 +280,11 @@ Usage: apprafter app validate [MANIFEST]
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `<MANIFEST>` | no | Manifest file (or directory holding `*.cue`) to validate. Omit to auto-discover |
+| `<MANIFEST>` | no | Directory holding the manifest package (a single `*.cue` file is also accepted). Omit to auto-discover |
 
 Examples:
 
 ```sh
-apprafter app validate  # auto-discovers <cwd>/apprafter/Application.cue
-apprafter app validate apprafter/Application.cue
+apprafter app validate  # auto-discovers the <cwd>/apprafter package
+apprafter app validate apprafter
 ```

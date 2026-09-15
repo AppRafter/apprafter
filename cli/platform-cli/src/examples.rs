@@ -171,8 +171,8 @@ pub const EXAMPLES: &[CommandExamples] = &[
     CommandExamples {
         path: &["app", "validate"],
         lines: &[
-            "apprafter app validate  # auto-discovers <cwd>/apprafter/Application.cue",
-            "apprafter app validate apprafter/Application.cue",
+            "apprafter app validate  # auto-discovers the <cwd>/apprafter package",
+            "apprafter app validate apprafter",
         ],
     },
     CommandExamples {

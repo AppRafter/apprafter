@@ -113,21 +113,77 @@ language: {
 /// name the cue-cmp's `entrypoint.sh` writes (`CLAIM_GEN`).
 const CLAIM_GEN_FILE: &str = "apprafter_claim_gen.cue";
 
-/// Resolve which manifest file/dir to validate, given the
+/// What the injected filesystem probe reports about one path — the
+/// whole of what the discovery rules need to know about it.
+///
+/// A plain `exists` predicate cannot express the rule below, because
+/// "`<cwd>/apprafter` is there" and "`<cwd>/apprafter` is a directory"
+/// are different questions and only the second one resolves a BUNDLE.
+/// Answering the first for the second is how a package gets half-read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKind {
+    /// Nothing at this path.
+    Missing,
+    /// Something that is not a directory.
+    File,
+    /// A directory — for `apprafter/`, the whole bundle.
+    Dir,
+}
+
+/// The real filesystem probe, and the one [`run_validate`] passes.
+///
+/// Both `is_dir` and `exists` follow symlinks, which is what
+/// `std::fs::read_dir` and `std::fs::copy` will do to the same path
+/// further down [`lay_out_workspace`] — so a symlinked bundle directory
+/// is classified the way it is later treated.
+pub fn fs_path_kind(p: &Path) -> PathKind {
+    if p.is_dir() {
+        PathKind::Dir
+    } else if p.exists() {
+        PathKind::File
+    } else {
+        PathKind::Missing
+    }
+}
+
+/// Resolve which manifest directory (or file) to validate, given the
 /// optional CLI argument and the cwd. Pure — filesystem
-/// presence is injected via `exists` so the discovery rules are
+/// presence is injected via `probe` so the discovery rules are
 /// unit-testable without touching disk.
 ///
-/// Rules (ADR 0046 Decision #6):
+/// Rules (ADR 0046 Decision #6, corrected for ADR 0062's bundle):
 ///   1. explicit `arg` always wins — error if it doesn't exist.
-///   2. else `<cwd>/apprafter/Application.cue` if it exists
+///   2. else the bundle DIRECTORY `<cwd>/apprafter` when it is one
 ///      (the `apprafter app scaffold` convention).
-///   3. else if cwd holds EXACTLY ONE `*.cue` file, use it.
+///   3. else `cwd` itself when it holds any `*.cue` — cwd IS the
+///      package directory, which is what `cd apprafter` produces.
 ///   4. else error, telling the user to pass a manifest path.
+///
+/// **Rules 2 and 3 resolve a DIRECTORY, and that is the whole point.**
+/// A CUE package is a directory; a manifest package is a bundle (ADR
+/// 0062); and the render layer this command is the local twin of
+/// evaluates the package instance in a directory (`cue export .`,
+/// `entrypoint.sh`). Resolving one FILE of it instead — which rule 2
+/// did until 2.27b, by naming `apprafter/Application.cue` — makes
+/// [`lay_out_workspace`] copy that file alone, so every sibling
+/// disappears before [`check_bundle_consistency`] runs, all four
+/// cross-workload checks see N=1, and none of them can fire. The local
+/// twin then returns the OPPOSITE verdict from the layer it twins, on
+/// the command's default invocation. This repository's own
+/// `landing/web/apprafter/` is exactly such a bundle.
+///
+/// Neither rule 3 nor the error below tells the reader to "pass the
+/// manifest explicitly", and that is deliberate: at N files, naming one
+/// of them reproduces the half-read this function exists to stop.
+///
+/// A `<cwd>/apprafter` that is a directory wins even when it holds no
+/// `*.cue` — [`lay_out_workspace`] then names it and says it is empty,
+/// which is the accurate answer. Falling through to a stray `.cue` in
+/// cwd would validate something the reader never pointed at.
 pub fn resolve_manifest_path(
     arg: Option<&Path>,
     cwd: &Path,
-    exists: &dyn Fn(&Path) -> bool,
+    probe: &dyn Fn(&Path) -> PathKind,
 ) -> Result<PathBuf> {
     if let Some(arg) = arg {
         let p = if arg.is_absolute() {
@@ -135,7 +191,7 @@ pub fn resolve_manifest_path(
         } else {
             cwd.join(arg)
         };
-        if exists(&p) {
+        if probe(&p) != PathKind::Missing {
             return Ok(p);
         }
         return Err(CliError::Other(format!(
@@ -144,27 +200,22 @@ pub fn resolve_manifest_path(
         )));
     }
 
-    let scaffold_default = cwd.join("apprafter").join("Application.cue");
-    if exists(&scaffold_default) {
-        return Ok(scaffold_default);
+    let bundle_dir = cwd.join("apprafter");
+    if probe(&bundle_dir) == PathKind::Dir {
+        return Ok(bundle_dir);
     }
 
-    let cues = list_cue_files(cwd);
-    match cues.as_slice() {
-        [single] => Ok(single.clone()),
-        [] => Err(CliError::Other(format!(
-            "no manifest found. Looked for '{}' and a single `*.cue` in '{}'. \
-             Pass an explicit manifest path: `apprafter app validate <manifest>`.",
-            scaffold_default.display(),
-            cwd.display()
-        ))),
-        many => Err(CliError::Other(format!(
-            "{} `*.cue` files found in '{}' — ambiguous. Pass the manifest \
-             explicitly: `apprafter app validate <manifest>`.",
-            many.len(),
-            cwd.display()
-        ))),
+    if !list_cue_files(cwd).is_empty() {
+        return Ok(cwd.to_path_buf());
     }
+
+    Err(CliError::Other(format!(
+        "no manifest found. Looked for the bundle directory '{}' and for `*.cue` files \
+         in '{}'. Pass the directory holding the manifests: \
+         `apprafter app validate <dir>`.",
+        bundle_dir.display(),
+        cwd.display()
+    )))
 }
 
 /// Enumerate top-level `*.cue` files directly under `dir`
@@ -205,14 +256,20 @@ pub fn validate_manifest(manifest: &Path) -> std::result::Result<(), Vec<String>
 /// need of `run_validate` alone — nothing else should have to skip past
 /// it.
 ///
-/// Returned in the package's DECLARATION order, which is what
-/// `top_level_names` reads out of `cue def`. Deriving the order from the
-/// exported JSON instead would sort it: `serde_json` builds objects on a
-/// `BTreeMap` unless the `preserve_order` feature is on, and it is not.
-/// The sidecar's `jq to_entries` preserves declaration order, so sorting
-/// here would print the same finding with its workloads in a different
-/// sequence from the Argo CD tile — which is precisely the kind of "two
-/// different problems" appearance this subphase exists to remove.
+/// Returned in the order the SIDECAR reads, taken from the exported
+/// JSON's own text ([`json_top_level_keys`]) — the same document, in the
+/// same sequence, that `entrypoint.sh` hands `jq to_entries`. Printing a
+/// different sequence from the Argo CD tile makes one finding read as
+/// two different problems, which is precisely what this subphase exists
+/// to remove.
+///
+/// `cue def` — which [`top_level_names`] reads, for the claim-binding
+/// scopes — is NOT that order and cannot be substituted for it. Measured
+/// on a two-FILE package: `cue export` emits the keys sorted while
+/// `cue def` follows file order, and `Application-preview.cue` sorts
+/// before `Application.cue`, so the two disagree on every bundle shaped
+/// like this repository's own `landing/web/apprafter/`. Reading the text
+/// sidesteps having to know either rule.
 fn validate_manifest_workloads(
     manifest: &Path,
 ) -> std::result::Result<Vec<BundleWorkload>, Vec<String>> {
@@ -245,8 +302,11 @@ fn validate_manifest_workloads(
     // either pipeline where every workload of a bundle is visible at
     // once. No extra `cue` concept: `cue export .` evaluates exactly the
     // package instance in cwd, which is what the sidecar renders.
-    let doc = cue_export_package(root)?;
-    let order = top_level_names(root);
+    //
+    // The key ORDER comes off the same call, read from the raw text
+    // before `serde_json` sorts it into a `BTreeMap` — see
+    // `json_top_level_keys`.
+    let (doc, order) = cue_export_package(root)?;
 
     if let Some(refusal) = check_bundle_consistency(&doc, &order) {
         return Err(vec![refusal]);
@@ -689,7 +749,84 @@ struct BundleWorkload {
     environments: Vec<String>,
 }
 
-/// Export the WHOLE package as one JSON document.
+/// Top-level keys of a JSON object, in the order its TEXT declares
+/// them.
+///
+/// The sidecar's `jq to_entries` walks the exported document in exactly
+/// this sequence, so the text is what the two layers have to agree on.
+/// Nothing downstream of `serde_json` can supply it: objects parse into
+/// a `BTreeMap` unless the `preserve_order` feature is enabled, and it
+/// deliberately is not — [ADR 0062](../../../../docs/adr/0062-manifest-package-is-a-bundle.md)
+/// records the alphabetical "first wins" defects that property caused,
+/// and turning it on globally would also reorder every map this CLI
+/// serialises, `.apprafter/state.json` included.
+///
+/// Reading the text also means not having to model `cue`'s own rule,
+/// which is not one rule: measured on cue v0.16.0, a single-FILE package
+/// exports its keys in declaration order while a multi-FILE package
+/// exports them sorted, and `cue def` follows file order in both cases.
+///
+/// A key is a string token at depth 1 immediately followed by `:`.
+/// Non-object roots, and any input malformed enough to run off the end,
+/// yield an empty vec — which [`ordered_keys`] treats as "sequence
+/// nothing", falling back to the parsed object's own key set rather than
+/// dropping a workload.
+fn json_top_level_keys(raw: &str) -> Vec<String> {
+    let b = raw.as_bytes();
+    let mut keys: Vec<String> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth -= 1;
+                i += 1;
+            }
+            b'"' => {
+                // Scan to the closing quote. A backslash escapes the
+                // next byte, and every byte JSON allows after one is
+                // ASCII, so stepping two never lands mid-character.
+                let start = i;
+                let mut j = i + 1;
+                while j < b.len() {
+                    match b[j] {
+                        b'\\' => j += 2,
+                        b'"' => break,
+                        _ => j += 1,
+                    }
+                }
+                if j >= b.len() {
+                    break; // unterminated string — give up, do not guess
+                }
+                let token = &raw[start..=j];
+                i = j + 1;
+                // A KEY is a string followed by `:`; a string VALUE is
+                // not. Both occur at depth 1 (Style A's `apiVersion` is
+                // a top-level value).
+                let mut k = i;
+                while k < b.len() && b[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if depth == 1 && k < b.len() && b[k] == b':' {
+                    if let Ok(name) = serde_json::from_str::<String>(token) {
+                        if !keys.contains(&name) {
+                            keys.push(name);
+                        }
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    keys
+}
+
+/// Export the WHOLE package as one JSON document, plus its top-level
+/// keys in the document's own textual order.
 ///
 /// `.`, not `./...`, mirroring `entrypoint.sh:644` — `./...` matches
 /// every package instance BELOW cwd as well, which would emit two
@@ -699,12 +836,19 @@ struct BundleWorkload {
 /// `.cue` files), so the two are equivalent here; `.` is the request
 /// that stays correct if that ever changes.
 ///
+/// The order rides along with the value rather than being recovered by a
+/// second call, because it is a property of THIS invocation's output —
+/// re-deriving it from a separate `cue` run would be a second opinion
+/// about a document nobody re-exported.
+///
 /// A failure is an ERROR, never a silent skip. `cue vet -c ./...` has
 /// already passed by the time this runs, so an export that then fails is
 /// a genuine anomaly — and swallowing it would turn the four checks into
 /// a guard that quietly stops guarding, which is the failure mode the
 /// whole subphase is about.
-fn cue_export_package(root: &Path) -> std::result::Result<serde_json::Value, Vec<String>> {
+fn cue_export_package(
+    root: &Path,
+) -> std::result::Result<(serde_json::Value, Vec<String>), Vec<String>> {
     let out = match Command::new(cue_bin())
         .current_dir(root)
         .args(["export", ".", "--out", "json"])
@@ -732,8 +876,11 @@ fn cue_export_package(root: &Path) -> std::result::Result<serde_json::Value, Vec
         }
         return Err(msgs);
     }
-    serde_json::from_slice(&out.stdout)
-        .map_err(|e| vec![format!("could not read the exported package as JSON: {e}")])
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let doc: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| vec![format!("could not read the exported package as JSON: {e}")])?;
+    let order = json_top_level_keys(&raw);
+    Ok((doc, order))
 }
 
 /// jq's `has("apiVersion") and has("kind")` on an object — the shape
@@ -768,16 +915,17 @@ fn field_or_empty(v: &serde_json::Value, path: &[&str]) -> String {
     }
 }
 
-/// Top-level keys of `doc` in declaration order.
+/// Top-level keys of `doc` in the order the sidecar reads them.
 ///
-/// `order` comes from `top_level_names` (i.e. from `cue def`, which
-/// preserves declaration order). The key SET is taken from the exported
-/// JSON, which is authoritative; `order` only sequences it. Anything the
-/// JSON carries that `cue def` did not name — including the cases where
-/// `cue def` fails outright and `top_level_names` returns nothing —
-/// still appears, appended in the JSON's own (sorted) order. A check
-/// that silently sees zero workloads because a helper returned an empty
-/// vec is a guard that stopped guarding.
+/// `order` comes from [`json_top_level_keys`] — the exported document's
+/// own text, which is the sequence `entrypoint.sh`'s `jq to_entries`
+/// walks. The key SET is taken from the parsed JSON, which is
+/// authoritative; `order` only sequences it. Anything the parse carries
+/// that the scan did not name — including the case where the scan
+/// returns nothing at all — still appears, appended in the parsed
+/// object's own (sorted) order. A check that silently sees zero
+/// workloads because a helper returned an empty vec is a guard that
+/// stopped guarding.
 fn ordered_keys(doc: &serde_json::Value, order: &[String]) -> Vec<String> {
     let Some(obj) = doc.as_object() else {
         return Vec::new();
@@ -1192,7 +1340,7 @@ fn format_roster(workloads: &[BundleWorkload]) -> Vec<String> {
 /// the process exits non-zero) on validation failure.
 pub fn run_validate(arg: Option<PathBuf>) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let manifest = resolve_manifest_path(arg.as_deref(), &cwd, &|p| p.exists())?;
+    let manifest = resolve_manifest_path(arg.as_deref(), &cwd, &fs_path_kind)?;
 
     println!("Validating {} …", manifest.display());
     match validate_manifest_workloads(&manifest) {
@@ -1237,12 +1385,36 @@ mod tests {
 
     // ── resolve_manifest_path — pure discovery rules ──────────
 
+    /// A probe that reports every listed path as a FILE and everything
+    /// else as missing.
+    fn files(paths: &[&str]) -> impl Fn(&Path) -> PathKind {
+        let present: HashSet<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        move |p: &Path| {
+            if present.contains(p) {
+                PathKind::File
+            } else {
+                PathKind::Missing
+            }
+        }
+    }
+
+    /// A probe that reports every listed path as a DIRECTORY.
+    fn dirs(paths: &[&str]) -> impl Fn(&Path) -> PathKind {
+        let present: HashSet<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        move |p: &Path| {
+            if present.contains(p) {
+                PathKind::Dir
+            } else {
+                PathKind::Missing
+            }
+        }
+    }
+
     #[test]
     fn resolve_explicit_arg_wins_when_present() {
         let cwd = Path::new("/work");
         let arg = Path::new("custom/My.cue");
-        let present: HashSet<PathBuf> = [PathBuf::from("/work/custom/My.cue")].into();
-        let got = resolve_manifest_path(Some(arg), cwd, &|p| present.contains(p)).unwrap();
+        let got = resolve_manifest_path(Some(arg), cwd, &files(&["/work/custom/My.cue"])).unwrap();
         assert_eq!(got, PathBuf::from("/work/custom/My.cue"));
     }
 
@@ -1250,45 +1422,68 @@ mod tests {
     fn resolve_explicit_absolute_arg_used_verbatim() {
         let cwd = Path::new("/work");
         let arg = Path::new("/elsewhere/App.cue");
-        let present: HashSet<PathBuf> = [PathBuf::from("/elsewhere/App.cue")].into();
-        let got = resolve_manifest_path(Some(arg), cwd, &|p| present.contains(p)).unwrap();
+        let got = resolve_manifest_path(Some(arg), cwd, &files(&["/elsewhere/App.cue"])).unwrap();
         assert_eq!(got, PathBuf::from("/elsewhere/App.cue"));
+    }
+
+    #[test]
+    fn resolve_explicit_directory_arg_is_the_bundle() {
+        // `apprafter app validate .` and `… apprafter/` are the forms
+        // that always read the WHOLE package; a directory argument must
+        // survive rule 1 unchanged.
+        let cwd = Path::new("/work");
+        let got = resolve_manifest_path(
+            Some(Path::new("apprafter")),
+            cwd,
+            &dirs(&["/work/apprafter"]),
+        )
+        .unwrap();
+        assert_eq!(got, PathBuf::from("/work/apprafter"));
     }
 
     #[test]
     fn resolve_explicit_missing_arg_errors() {
         let cwd = Path::new("/work");
         let arg = Path::new("nope.cue");
-        let err = resolve_manifest_path(Some(arg), cwd, &|_| false).unwrap_err();
+        let err = resolve_manifest_path(Some(arg), cwd, &|_| PathKind::Missing).unwrap_err();
         assert!(
             err.to_string().contains("does not exist"),
             "missing explicit arg must error with 'does not exist'; got: {err}"
         );
     }
 
+    // THE BUG THIS FILE SHIPPED: rule 2 resolved the FILE
+    // `apprafter/Application.cue`, so `lay_out_workspace` copied that
+    // one file and every sibling of a multi-file bundle was dropped
+    // before any check could see it. A bundle is a PACKAGE — the
+    // directory is the answer.
     #[test]
-    fn resolve_defaults_to_apprafter_application_cue() {
+    fn resolve_defaults_to_the_apprafter_bundle_directory() {
         let cwd = Path::new("/work");
-        let default = PathBuf::from("/work/apprafter/Application.cue");
-        let present: HashSet<PathBuf> = [default.clone()].into();
-        let got = resolve_manifest_path(None, cwd, &|p| present.contains(p)).unwrap();
-        assert_eq!(got, default);
+        let got = resolve_manifest_path(None, cwd, &dirs(&["/work/apprafter"])).unwrap();
+        assert_eq!(
+            got,
+            PathBuf::from("/work/apprafter"),
+            "the default must be the bundle DIRECTORY; resolving one file of it makes every \
+             cross-workload check see N=1 and silently pass"
+        );
     }
 
     #[test]
-    fn resolve_single_cue_in_cwd_when_no_scaffold_default() {
-        // No apprafter/Application.cue, but exactly one *.cue in cwd.
+    fn resolve_single_cue_in_cwd_when_no_bundle_directory() {
+        // No apprafter/ directory, but cwd itself holds *.cue — cwd IS
+        // the package.
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("App.cue"), "package x\n").unwrap();
-        let got = resolve_manifest_path(None, dir.path(), &|p| p.exists()).unwrap();
-        assert_eq!(got, dir.path().join("App.cue"));
+        let got = resolve_manifest_path(None, dir.path(), &fs_path_kind).unwrap();
+        assert_eq!(got, dir.path());
     }
 
     #[test]
     fn resolve_errors_when_no_manifest_found() {
-        // Empty dir, no scaffold default, no *.cue.
+        // Empty dir, no bundle directory, no *.cue.
         let dir = tempdir().unwrap();
-        let err = resolve_manifest_path(None, dir.path(), &|p| p.exists()).unwrap_err();
+        let err = resolve_manifest_path(None, dir.path(), &fs_path_kind).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("no manifest found") && msg.contains("apprafter app validate"),
@@ -1296,31 +1491,31 @@ mod tests {
         );
     }
 
+    // Running from INSIDE the bundle directory used to be the second
+    // half of the same defect: N `*.cue` read as "ambiguous, pass the
+    // manifest explicitly", and following that advice literally named
+    // one file — i.e. the error's own remedy reproduced the
+    // half-validation. cwd holding `*.cue` means cwd is the package.
     #[test]
-    fn resolve_errors_when_multiple_cue_files_ambiguous() {
+    fn resolve_from_inside_the_bundle_directory_takes_the_whole_package() {
         let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.cue"), "package x\n").unwrap();
-        fs::write(dir.path().join("b.cue"), "package x\n").unwrap();
-        let err = resolve_manifest_path(None, dir.path(), &|p| p.exists()).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("ambiguous"),
-            "multiple *.cue must error as ambiguous; got: {msg}"
+        fs::write(dir.path().join("Application.cue"), "package x\n").unwrap();
+        fs::write(dir.path().join("Application-preview.cue"), "package x\n").unwrap();
+        let got = resolve_manifest_path(None, dir.path(), &fs_path_kind).unwrap();
+        assert_eq!(
+            got,
+            dir.path(),
+            "two `*.cue` in cwd is a two-file package, not an ambiguity to push back to the user"
         );
     }
 
     #[test]
-    fn resolve_scaffold_default_preferred_over_single_cwd_cue() {
-        // Both an apprafter/Application.cue AND a cwd *.cue exist —
-        // the scaffold default must win.
+    fn resolve_bundle_directory_preferred_over_a_cwd_cue() {
+        // Both an apprafter/ directory AND a cwd *.cue exist — the
+        // convention directory must win.
         let cwd = Path::new("/work");
-        let default = PathBuf::from("/work/apprafter/Application.cue");
-        // `exists` only knows about the scaffold default (list_cue_files
-        // reads the real fs, so we keep this on the injected-`exists`
-        // path by ensuring the default is present).
-        let present: HashSet<PathBuf> = [default.clone()].into();
-        let got = resolve_manifest_path(None, cwd, &|p| present.contains(p)).unwrap();
-        assert_eq!(got, default);
+        let got = resolve_manifest_path(None, cwd, &dirs(&["/work/apprafter"])).unwrap();
+        assert_eq!(got, PathBuf::from("/work/apprafter"));
     }
 
     // ── WORKSPACE_SCHEMAS — the injected bundle is the whole package ──
@@ -1378,6 +1573,68 @@ mod tests {
         );
         assert_eq!(state["pg"]["unnamed"], serde_json::json!(true));
         assert_eq!(state["pg"]["names"], serde_json::json!(["main"]));
+    }
+
+    // ── json_top_level_keys — the sidecar's key order, from the text ──
+
+    #[test]
+    fn json_top_level_keys_reads_declaration_order_not_sorted_order() {
+        // The property the parsed `Value` cannot supply: `serde_json`
+        // builds objects on a `BTreeMap`, so by the time anything can
+        // read them `zeta` has moved behind `alpha`.
+        let raw = r#"{
+    "zeta": {"apiVersion": "apprafter.io/v1alpha1"},
+    "alpha": {"apiVersion": "apprafter.io/v1alpha1"}
+}"#;
+        assert_eq!(json_top_level_keys(raw), vec!["zeta", "alpha"]);
+        let parsed: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            parsed
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["alpha", "zeta"],
+            "if this ever matches the text order, `preserve_order` was turned on and the \
+             ordering comment above is stale"
+        );
+    }
+
+    #[test]
+    fn json_top_level_keys_ignores_nested_keys_and_string_values() {
+        let raw = r#"{
+    "apiVersion": "apprafter.io/v1alpha1",
+    "kind": "Application",
+    "metadata": {"name": "demo", "namespace": "apprafter"},
+    "spec": {"base": {"image": "x"}}
+}"#;
+        assert_eq!(
+            json_top_level_keys(raw),
+            vec!["apiVersion", "kind", "metadata", "spec"],
+            "only depth-1 strings followed by `:` are keys — `\"Application\"` is a value and \
+             `name` is nested"
+        );
+    }
+
+    #[test]
+    fn json_top_level_keys_survives_escapes_and_colons_in_values() {
+        // A `:` inside a string value, and an escaped quote, must not be
+        // mistaken for structure by a hand-rolled scanner.
+        let raw = r#"{
+    "one": {"note": "a \"quoted\" url: https://x/y"},
+    "two": {}
+}"#;
+        assert_eq!(json_top_level_keys(raw), vec!["one", "two"]);
+    }
+
+    #[test]
+    fn json_top_level_keys_of_a_non_object_is_empty() {
+        // `ordered_keys` then sequences nothing and falls back to the
+        // parsed object's own keys — it never drops a workload.
+        assert!(json_top_level_keys("[1, 2, 3]").is_empty());
+        assert!(json_top_level_keys("").is_empty());
+        assert!(json_top_level_keys(r#"{"unterminated: 1"#).is_empty());
     }
 
     #[test]
@@ -1782,6 +2039,141 @@ landing: v1alpha1.#Application & {
     #[test]
     fn validate_accepts_a_consistent_two_workload_bundle() {
         accept("inject-fixture-multi");
+    }
+
+    // ── The DEFAULT invocation, over a MULTI-FILE bundle ───────────
+    //
+    // Every check above hands `validate_manifest` the fixture DIRECTORY,
+    // which is the one form that always read the whole package. The bare
+    // `apprafter app validate` does not: it goes through
+    // `resolve_manifest_path` first, and that is where a bundle used to
+    // be reduced to one file of itself.
+    //
+    // All seven fixtures those checks share are a single `.cue` file, so
+    // none of them could tell the two apart — a one-file package is the
+    // same package whether you name the file or the directory. The two
+    // fixtures below are the ones that can, and they are modelled on
+    // this repository's own `landing/web/apprafter/`, the only
+    // multi-file bundle that exists today.
+    //
+    // These drive resolution and validation TOGETHER, deliberately.
+    // Splitting them would leave each half green while the command they
+    // compose stays wrong, which is exactly the state that shipped.
+
+    /// Run the bare `apprafter app validate` — no argument, from the
+    /// directory that HOLDS the fixture's `apprafter/` — and return what
+    /// the command would have reported.
+    ///
+    /// The `TempDir` guard rides along in the return so the caller keeps
+    /// the fixture alive for the length of the assertion.
+    fn bare_validate(
+        name: &str,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        std::result::Result<Vec<BundleWorkload>, Vec<String>>,
+    ) {
+        assert!(cue_available(), "{CUE_REQUIRED}");
+        let (guard, dir) = sidecar_fixture(name);
+        let cwd = dir
+            .parent()
+            .expect("the fixture's apprafter/ has a parent")
+            .to_path_buf();
+        let resolved = resolve_manifest_path(None, &cwd, &fs_path_kind)
+            .unwrap_or_else(|e| panic!("the bare command must resolve fixture '{name}': {e}"));
+        let outcome = validate_manifest_workloads(&resolved);
+        (guard, resolved, outcome)
+    }
+
+    #[test]
+    fn validate_reads_every_file_of_a_multi_file_bundle_by_default() {
+        let (_guard, resolved, outcome) = bare_validate("bundle-multi-file");
+        assert!(
+            resolved.is_dir(),
+            "the bare command must resolve the bundle DIRECTORY, not one file of it; got {}",
+            resolved.display()
+        );
+        let workloads = outcome.unwrap_or_else(|msgs| {
+            panic!(
+                "the consistent multi-file bundle must validate; got:\n{}",
+                msgs.join("\n")
+            )
+        });
+        // The SET, not the sequence — `validate_orders_workloads_the_way_the_sidecar_does`
+        // owns the order, so each defect keeps a test of its own.
+        let mut names: Vec<&str> = workloads.iter().map(|w| w.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["multi-file-web", "multi-file-web-preview"],
+            "a two-FILE bundle is two workloads. Reporting one is the shape that shipped: the \
+             sibling file was dropped at resolution, so all four cross-workload checks saw N=1 \
+             and none of them could fire"
+        );
+    }
+
+    #[test]
+    fn validate_refuses_a_multi_file_bundle_that_contradicts_itself_by_default() {
+        let (_guard, _resolved, outcome) = bare_validate("bundle-multi-file-split-ns");
+        let Err(msgs) = outcome else {
+            panic!(
+                "the cue-cmp sidecar REFUSES this bundle at render (`bundle is inconsistent: \
+                 workloads declare 2 different namespaces`); the bare `app validate` answering \
+                 `✓ valid` is the local twin returning the OPPOSITE verdict"
+            )
+        };
+        let msg = msgs.join("\n");
+        assert!(
+            msg.contains("2 different namespaces"),
+            "the refusal must name the divergence in the sidecar's words; got:\n{msg}"
+        );
+        assert!(
+            msg.contains(r#"splitFileWeb -> "prod""#)
+                && msg.contains(r#"splitFileWebPreview -> "preview""#),
+            "the refusal must name BOTH workloads and their values, across the file boundary; \
+             got:\n{msg}"
+        );
+    }
+
+    // Workload ORDER, which a multi-file bundle is also the only local
+    // shape that can test. `cue export . --out json` — the document the
+    // sidecar hands `jq to_entries` — emits a multi-file package's keys
+    // sorted, while `cue def ./...` follows FILE order. Measured on this
+    // fixture (and on `landing/web/apprafter`, which has the same file
+    // names): `Application-preview.cue` sorts before `Application.cue`,
+    // so the two disagree and the CLI printed the sidecar's findings in
+    // the reverse sequence from the Argo CD tile.
+    #[test]
+    fn validate_orders_workloads_the_way_the_sidecar_does() {
+        let (_guard, _resolved, outcome) = bare_validate("bundle-multi-file");
+        let workloads = outcome.expect("the consistent multi-file bundle must validate");
+        assert_eq!(
+            format_roster(&workloads),
+            vec![
+                "✓ valid — 2 workloads".to_string(),
+                "  • multi-file-web  namespace multi-file".to_string(),
+                "  • multi-file-web-preview  namespace multi-file".to_string(),
+            ],
+            "the roster must follow the exported JSON's own key order — the sequence the \
+             sidecar's `jq to_entries` walks — so one finding reads as one finding in both places"
+        );
+
+        // And the same order in a REFUSAL, which is the line Argo CD
+        // truncates onto the Application tile.
+        let (_g2, _r2, refused) = bare_validate("bundle-multi-file-split-ns");
+        let msg = refused
+            .expect_err("the split-namespace bundle must be refused")
+            .join("\n");
+        let web = msg
+            .find("splitFileWeb ->")
+            .expect("summary names the prod workload");
+        let preview = msg
+            .find("splitFileWebPreview ->")
+            .expect("summary names the preview workload");
+        assert!(
+            web < preview,
+            "the refusal must list the workloads in the sidecar's order; got:\n{msg}"
+        );
     }
 
     // A Style-A (unwrapped) package renders exactly ONE row into the

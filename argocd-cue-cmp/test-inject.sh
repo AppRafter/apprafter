@@ -92,6 +92,36 @@ assert_absent() {
     fi
 }
 
+# Asserts SEQUENCE, not just presence: $2 must appear before $3.
+# Both layers derive their workload order from the same exported JSON
+# document, so a divergence here is a reader meeting one finding twice
+# in two different sequences.
+#
+# Offsets in the WHOLE text, not line numbers — the refusal summary
+# carries both workloads on its first line (that line is what Argo CD
+# truncates onto the Application tile), so a line-wise comparison would
+# read them as tied.
+#
+# awk, not `grep -n | head`: grep exits non-zero on no match and head's
+# SIGPIPE would turn a match into a miss under `pipefail`. `index`
+# returns 0 for absent, which fails the comparison below rather than
+# passing vacuously.
+assert_before() {
+    local haystack=$1 first=$2 second=$3 label=$4
+    local first_at second_at
+    first_at=$(printf '%s\n' "$haystack" | awk -v n="$first" '{b = b $0 "\n"} END {print index(b, n)}')
+    second_at=$(printf '%s\n' "$haystack" | awk -v n="$second" '{b = b $0 "\n"} END {print index(b, n)}')
+    if [[ "$first_at" -gt 0 && "$second_at" -gt 0 && "$first_at" -lt "$second_at" ]]; then
+        echo "PASS: $label (offset $first_at before offset $second_at)"
+        pass=$((pass + 1))
+    else
+        echo "FAIL: $label — expected '$first' (at ${first_at}) before '$second' (at ${second_at}); 0 means absent"
+        echo "--- stdout was ---" >&2
+        printf '%s\n' "$haystack" >&2
+        fail=$((fail + 1))
+    fi
+}
+
 assert_count() {
     local haystack=$1 needle=$2 want=$3 label=$4
     local got
@@ -556,10 +586,12 @@ bundlemixed_fx="$script_dir/testdata/bundle-mixed-style"
 bundleenv_fx="$script_dir/testdata/bundle-split-env"
 bundleenvp_fx="$script_dir/testdata/bundle-env-partial"
 bundleforeign_fx="$script_dir/testdata/bundle-foreign-kind"
+bundlemfile_fx="$script_dir/testdata/bundle-multi-file"
+bundlemfilens_fx="$script_dir/testdata/bundle-multi-file-split-ns"
 
 scrub_bundle_fixtures() {
     find "$bundlens_fx" "$bundledup_fx" "$bundlemixed_fx" "$bundleenv_fx" "$bundleenvp_fx" \
-        "$bundleforeign_fx" \
+        "$bundleforeign_fx" "$bundlemfile_fx" "$bundlemfilens_fx" \
         \( -name cue.mod -type d -o -name apprafter_claim_gen.cue -type f \) \
         -prune -exec rm -rf {} +
 }
@@ -674,6 +706,56 @@ assert_count "$ep_out" "---" 2 "ADR 0063 §5: foreign kind — BOTH documents ar
 assert_contains "$ep_out" "name: foreign-web" "ADR 0063 §5: foreign kind — the AppRafter workload is emitted"
 assert_contains "$ep_out" "name: foreign-argo" "ADR 0063 §5: foreign kind — the argoproj.io object is emitted"
 assert_absent "$ep_err" "bundle is inconsistent" "ADR 0063 §5: foreign kind — no refusal (the apiVersion predicate is live)"
+
+# ── §5: a bundle spread over TWO FILES of one package ──────
+#
+# Every other fixture above is a single `.cue` file, and that gap had a
+# cost on the OTHER side of the pair. `apprafter app validate` — the
+# local twin ADR 0063 §Decision 5 puts on the same row as this layer —
+# resolved the FILE `apprafter/Application.cue` by default and dropped
+# every sibling, so all four checks saw N=1 and none could fire. On a
+# two-file bundle the twin therefore answered `✓ valid` for exactly what
+# this script asserts is refused: the opposite verdict, on the default
+# invocation of both commands.
+#
+# A single-file fixture cannot catch that — naming the file and naming
+# the directory are the same package when there is only one file. These
+# two can, and they are modelled on this repository's own
+# `landing/web/apprafter/` (prod in `Application.cue`, preview in
+# `Application-preview.cue`), which is the only multi-file bundle that
+# exists today.
+#
+# The CLI half asserts the same two directories in
+# `cli/platform-cli/src/commands/app_validate.rs`
+# (`validate_reads_every_file_of_a_multi_file_bundle_by_default`,
+# `validate_refuses_a_multi_file_bundle_that_contradicts_itself_by_default`,
+# `validate_orders_workloads_the_way_the_sidecar_does`). Sharing the
+# fixtures is what makes the two halves one gate rather than two.
+run_entrypoint_capture "$bundlemfile_fx" "$schema_src"
+scrub_bundle_fixtures
+assert_rc "$ep_rc" zero "ADR 0063 §5: a CONSISTENT two-FILE bundle renders (exit 0)"
+assert_count "$ep_out" "---" 2 "ADR 0063 §5: two files — BOTH documents are emitted"
+assert_contains "$ep_out" "name: multi-file-web" "ADR 0063 §5: two files — the workload from Application.cue is emitted"
+assert_contains "$ep_out" "name: multi-file-web-preview" "ADR 0063 §5: two files — the workload from Application-preview.cue is emitted"
+assert_absent "$ep_err" "bundle is inconsistent" "ADR 0063 §5: two files — a consistent bundle triggers no refusal"
+# ORDER, asserted on both sides of the pair. The emission order is
+# `cue export . --out json`'s own key order, which for a MULTI-file
+# package is not `cue def`'s (that one follows file order, and
+# `Application-preview.cue` sorts before `Application.cue`). The CLI read
+# `cue def` until 2.27b and so listed these two the other way round from
+# the tile.
+assert_before "$ep_out" "name: multi-file-web" "name: multi-file-web-preview" \
+    "ADR 0063 §5: two files — the prod workload is emitted BEFORE the preview one"
+
+run_entrypoint_capture "$bundlemfilens_fx" "$schema_src"
+scrub_bundle_fixtures
+assert_rc "$ep_rc" nonzero "ADR 0063 §5: two FILES declaring two namespaces REFUSE"
+assert_stdout_empty "ADR 0063 §5: two files, two namespaces write NOTHING to stdout"
+assert_contains "$ep_err" "2 different namespaces" "ADR 0063 §5: two files — the divergence is found across the file boundary"
+assert_contains "$ep_err" 'splitFileWeb -> "prod"' "ADR 0063 §5: two files — the summary names the workload from Application.cue"
+assert_contains "$ep_err" 'splitFileWebPreview -> "preview"' "ADR 0063 §5: two files — the summary names the workload from Application-preview.cue"
+assert_before "$ep_err" 'splitFileWeb -> "prod"' 'splitFileWebPreview -> "preview"' \
+    "ADR 0063 §5: two files — the refusal summary is in the exported document's order"
 
 # ── §5: the consistent bundles must be UNAFFECTED ──────────
 #

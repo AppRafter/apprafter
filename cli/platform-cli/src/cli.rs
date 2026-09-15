@@ -1091,12 +1091,16 @@ pub enum AppCommand {
     /// `secret: "name/key"` refs resolve EXACTLY as the cue-cmp
     /// resolves them at sync time — a plain `cue vet` on the repo
     /// can't (the `claim` binding is never committed). Requires
-    /// `cue` on PATH. Without `[manifest]`: defaults to
-    /// `<cwd>/apprafter/Application.cue`, then a single `*.cue`
-    /// in the cwd; otherwise pass the path explicitly.
+    /// `cue` on PATH. Also applies the four intra-bundle
+    /// consistency checks the render layer refuses on. Without
+    /// `[manifest]`: the bundle directory `<cwd>/apprafter` when
+    /// it exists, else the cwd itself when it holds `*.cue`.
+    /// Either way a whole PACKAGE is validated, never one file
+    /// of it — the checks compare workloads against each other,
+    /// so a manifest read alone can only ever pass them.
     Validate {
-        /// Manifest file (or directory holding `*.cue`) to
-        /// validate. Omit to auto-discover.
+        /// Directory holding the manifest package (a single
+        /// `*.cue` file is also accepted). Omit to auto-discover.
         manifest: Option<std::path::PathBuf>,
     },
     /// Port-forward the app's primary Service to localhost and
