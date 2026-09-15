@@ -304,6 +304,24 @@ Application 'parser' — 2 environment deployments:
 Every detail block carries its own `environment:` line, so an app with
 one environment shows which one it is too.
 
+A detail block describes one **workload**, and one deployment may hold
+more than one — that is what `WORKLOADS` counts in the table above. When
+it holds two or more, the block is a summary instead: one row per
+workload with its phase, its ready pod count and the image it is
+running, and underneath it a line saying how many are not `Ready`. That
+line is printed only when some are not, so its presence is the signal.
+Pass `--workload <name>` for the full block of one:
+
+```sh
+apprafter app status parser --workload parser-worker
+```
+
+The positional argument is always the **application**, never a workload.
+At one workload per package the two names are usually the same string,
+which is why the rule is fixed rather than guessed: `--workload` is the
+only way to name a workload, in the same sense `--env` names an
+environment.
+
 ## Working with one environment
 
 Every `apprafter app` command takes the **logical** name — `parser`. It

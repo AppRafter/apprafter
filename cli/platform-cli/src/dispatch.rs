@@ -128,7 +128,11 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
                 all_projects,
                 all_managed,
             } => commands::app::list(&project, all_projects, all_managed)?,
-            AppCommand::Status { name, resources } => commands::app::status(&name, resources)?,
+            AppCommand::Status {
+                name,
+                resources,
+                workload,
+            } => commands::app::status(&name, resources, workload.as_deref())?,
             AppCommand::Logs {
                 name,
                 env,

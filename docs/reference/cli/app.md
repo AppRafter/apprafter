@@ -228,11 +228,12 @@ Usage: apprafter app status [OPTIONS] <NAME>
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `<NAME>` | yes | LOGICAL application name (as passed to `apprafter app add`, listed via `apprafter app list`). When an app is deployed to multiple environments, `status` aggregates all of them grouped by the `apprafter.io/application=<name>` label and renders a per-environment section for each. A base-only app (one Application named exactly `<name>`) still resolves via the no-label fallback |
+| `<NAME>` | yes | LOGICAL application name (as passed to `apprafter app add`, listed via `apprafter app list`). NEVER a workload name: a manifest package is a bundle that may hold several workloads, and this argument always names the application that deploys them — use `--workload` to address one inside it (ADR 0062). When an app is deployed to multiple environments, `status` aggregates all of them grouped by the `apprafter.io/application=<name>` label and renders a per-environment section for each. A base-only app (one Application named exactly `<name>`) still resolves via the no-label fallback |
 
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--resources`, `-r` | flag | — | no | Show child workload state — Argo CD's `status.resources[]` plus pods in the destination namespace matching `app.kubernetes.io/name=<inner-app-name>` (the AppRafter operator's label) |
+| `--workload` | `<NAME>` | — | no | Show one workload of this application instead of the summary. A manifest package may hold several; the positional argument is always the application (the registration), never a workload — this is how you address one inside it. ADR 0062 |
 
 Examples:
 

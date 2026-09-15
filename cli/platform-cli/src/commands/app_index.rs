@@ -20,9 +20,21 @@
 
 // The whole module is built for the b-2 (read surfaces) and b-3 (write
 // surfaces) plans; nothing calls it yet, and `-D warnings` makes an
-// uncalled `pub(crate)` item an error. DELETE THIS ATTRIBUTE IN b-2, when
-// `app list` / `app status` become the callers — inventing a caller here
-// to satisfy the lint would be worse than saying so.
+// uncalled `pub(crate)` item an error. DELETE THIS ATTRIBUTE IN b-3, when
+// the write surfaces become the callers — inventing a caller here to
+// satisfy the lint would be worse than saying so.
+//
+// b-2 is now DONE and did not become that caller, which is a correction
+// to the sentence above rather than a slip. `app list` and `app status`
+// each hold the registration they are already rendering, and
+// `app_open::apprafter_app_refs` projects its workloads straight out of
+// the `status.resources[]` they fetched — so neither needs the join, and
+// neither should pay a second cluster-wide read to get it. What the
+// write surfaces need is the OTHER direction: given a string the user
+// typed, decide whether it named a registration or a workload, which is
+// exactly `AppIndex::resolve` and exactly what a read surface never asks
+// (it is handed a registration by the same resolution `status` already
+// does).
 //
 // `expect`, not `allow`, and the first use of it in this repository:
 // once b-2 supplies the callers the expectation goes unfulfilled and

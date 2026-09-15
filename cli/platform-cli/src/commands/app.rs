@@ -25,6 +25,7 @@
 //! `commands::k8s_helpers` — keeps the wire format consistent
 //! with the `platform` / `migration` wrappers.
 
+use std::collections::BTreeMap;
 use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::process::Command;
@@ -37,6 +38,7 @@ use tabled::{Table, Tabled};
 use cli_providers::k8s::kubectl::APPRAFTER_CLI_PIN_FIELD_MANAGER;
 
 use crate::commands::app_open;
+use crate::commands::app_open::CrRef;
 use crate::commands::k8s_helpers::{
     ensure_kubeconfig_tempfile, kubectl_apply_server_side, kubectl_get_json,
     kubectl_get_json_by_selector, kubectl_get_json_showing_managed_fields, kubectl_merge_patch,
@@ -1036,7 +1038,7 @@ pub(crate) fn empty_list_lines(
     out
 }
 
-pub fn status(name: &str, show_resources: bool) -> Result<()> {
+pub fn status(name: &str, show_resources: bool, workload: Option<&str>) -> Result<()> {
     let kc = ensure_kubeconfig_tempfile()?;
 
     // ADR 0044 (2.9): `name` is the LOGICAL app name. The same app is
@@ -1080,8 +1082,14 @@ pub fn status(name: &str, show_resources: bool) -> Result<()> {
     sorted.sort_by_key(|a| deployment_sort_key(a));
 
     let last = sorted.len().saturating_sub(1);
+    // ADR 0062: `--workload` narrows INSIDE each registration, and the
+    // registrations here are the per-environment deployments of one
+    // application. A workload that exists in `prod` but not in `dev` must
+    // not abort the whole command — each section says what it holds, and
+    // only a selector that matched NOWHERE is an error.
+    let mut matched_any = false;
     for (idx, app) in sorted.iter().enumerate() {
-        print_app_detail(app, show_resources, kc.path());
+        matched_any |= print_app_detail(name, app, show_resources, workload, kc.path());
         if idx != last {
             println!();
             println!("{}", "─".repeat(40));
@@ -1089,7 +1097,60 @@ pub fn status(name: &str, show_resources: bool) -> Result<()> {
         }
     }
 
+    if let Some(asked) = workload {
+        if !matched_any {
+            let mut available: Vec<String> = sorted
+                .iter()
+                .flat_map(|a| crate::commands::app_open::apprafter_app_refs(a))
+                .map(|r| r.name)
+                .collect();
+            available.sort();
+            available.dedup();
+            return Err(CliError::Other(unknown_workload_message(
+                name, asked, &available,
+            )));
+        }
+    }
+
     Ok(())
+}
+
+/// Pure helper — what `app status --workload <name>` says when no
+/// registration of the application deploys that workload.
+///
+/// It names what DOES exist, because every way to reach this message is
+/// a wrong `--workload` VALUE against a positional that already
+/// resolved, and the candidate list is what corrects it. A positional
+/// that is a workload name never gets here: it fails earlier in
+/// [`status`], at the `Application '<name>' not found in namespace
+/// argocd` error, which is where that courtesy belongs (ADR 0062
+/// §Addressing — "the courtesy lives on the error path").
+///
+/// The addressing sentence stays anyway, for the one reachable cause
+/// that is not a plain typo: an application whose workload is named
+/// something else, which this repository's own tests pin as supported
+/// (`app.rs`: Argo CD app `cms` rendering an AppRafter Application
+/// `landing-cms`). A reader who types `--workload cms` there guessed the
+/// application's name for the workload's, and needs to be told which
+/// argument holds which — with the real answer listed one line above.
+///
+/// An EMPTY `available` is reachable — every registration of the app is
+/// registered but unsynced — and must not render as "It deploys: .".
+pub(crate) fn unknown_workload_message(
+    application: &str,
+    asked: &str,
+    available: &[String],
+) -> String {
+    let what_exists = if available.is_empty() {
+        "It deploys no workload yet — Argo CD has not synced it.".to_string()
+    } else {
+        format!("It deploys: {}.", available.join(", "))
+    };
+    format!(
+        "Application '{application}' deploys no workload '{asked}'. {what_exists}\n\
+         The positional argument names the APPLICATION; a workload inside it is \
+         addressed only by `--workload` (ADR 0062)."
+    )
 }
 
 /// Pure helper — the index `app status` prints ahead of the per-env
@@ -1120,116 +1181,626 @@ pub(crate) fn env_deployment_index_lines(
 }
 
 /// Render ONE Argo CD Application's full status block — the Argo CD
-/// summary (`print_status`) plus the inner AppRafter CR phase, pods,
-/// services, and resource claims (each a best-effort kubectl read).
+/// summary (`print_status`) plus, for the workloads that registration
+/// deploys, either one full detail block or the bundle summary.
 /// Factored out of `status` so the per-environment aggregation loop
 /// reuses the identical single-app rendering for every `<name>-<env>`.
-fn print_app_detail(app: &Value, show_resources: bool, kubeconfig_path: &Path) {
+///
+/// `application` is the LOGICAL name the user typed — the thing the
+/// positional argument of every `app` verb names (ADR 0062) — so the
+/// summary's `--workload` hint quotes a command that works, not the
+/// `<name>-<env>` Argo object name which the positional does not take.
+///
+/// Returns whether this registration rendered a workload the caller
+/// asked for: `status` turns "no registration matched `--workload`" into
+/// an error, and cannot tell that from "one env has it and the other
+/// does not" without this.
+fn print_app_detail(
+    application: &str,
+    app: &Value,
+    show_resources: bool,
+    workload: Option<&str>,
+    kubeconfig_path: &Path,
+) -> bool {
     print_status(app);
 
-    // Resolve the INNER workload name + destination namespace
-    // once — all four default-path fetches key off them. The
-    // inner name is the operator's `app.kubernetes.io/name`
-    // label value (the AppRafter Application CR's metadata.name,
-    // which can differ from the Argo CD parent); dest_ns is
-    // where Argo CD lays down children. Both come from
-    // `status.resources[]` / `spec.destination.namespace`, so a
-    // not-yet-synced app yields `None` for either — in which
-    // case the workload detail is simply unavailable yet.
-    let inner = crate::commands::app_open::find_apprafter_app_name(app);
-    let dest_ns = app
-        .pointer("/spec/destination/namespace")
-        .and_then(Value::as_str);
+    // ADR 0062: one registration deploys 1..N workloads. Until 2.27 this
+    // took the FIRST and scoped all five downstream reads to it, so a
+    // sibling in CrashLoopBackOff printed as a clean healthy block.
+    // `apprafter_app_refs` is that list; `status_render_plan` is the
+    // decision over it, pure and table-tested.
+    let refs = crate::commands::app_open::apprafter_app_refs(app);
+    let plan = status_render_plan(&refs, workload);
+    // Answered by the PLAN, before any rendering: whether the selector
+    // named something here is a question about addressing, and whether
+    // the block can be drawn is a question about renderability. Deriving
+    // the first from the second made an unknown namespace report
+    // "deploys no workload 'web'. It deploys: web." and exit non-zero —
+    // on a state `apprafter_app_refs` documents as real.
+    let matched = plan_matched_selector(&plan);
 
-    match (inner.as_deref(), dest_ns) {
-        (Some(inner_name), Some(dest_ns)) => {
-            // 1. AppRafter Application phase (group-qualified
-            //    apprafter.io read). Non-fatal — a missing CR /
-            //    absent phase simply skips the line.
-            // Hoisted: the AppRafter CR is read once and reused below for the
-            // secret bindings (2.22c / D7) and the config-drift boundary
-            // (D6). Both are properties of THIS CR — an earlier draft passed
-            // the Argo CD Application to the bindings parser by mistake,
-            // which reads `spec.base.env` and would simply have found
-            // nothing, every time, silently.
-            let mut apprafter_cr: Option<Value> = None;
-            match kubectl_get_json(
-                "application.apprafter.io",
-                Some(inner_name),
-                Some(dest_ns),
-                kubeconfig_path,
-            ) {
-                Ok(Some(cr)) => {
-                    for line in apprafter_cr_advisory_lines(&cr, &chrono::Utc::now()) {
-                        if line.warn {
-                            println!("{}", style::warn(&line.text));
-                        } else {
-                            println!("{}", line.text);
-                        }
-                    }
-                    apprafter_cr = Some(cr);
+    match plan {
+        StatusPlan::Detail(r) => {
+            // The namespace is the ref's own, which already falls back to
+            // the registration's `spec.destination.namespace` — see
+            // `apprafter_app_refs`. `None` is UNKNOWN and must never reach
+            // `kubectl -n`, so it renders the same "not synced yet" line
+            // the pre-2.27 `(_, None)` arm printed.
+            match r.namespace.as_deref() {
+                Some(ns) => print_workload_detail(&r.name, ns, kubeconfig_path),
+                None => {
+                    println!();
+                    println!("(workload detail unavailable — app not synced yet)");
                 }
-                Ok(None) => {}
-                Err(e) => {
-                    eprintln!(
-                        "⚠ Could not fetch AppRafter Application phase ({e}). \
-                         Argo CD's view (above) is still authoritative."
-                    );
-                }
-            }
-
-            let config_changed_at = apprafter_cr
-                .as_ref()
-                .and_then(|cr| cr.pointer("/status/envConfig/changedAt"))
-                .and_then(Value::as_str);
-
-            // 2. Pods (moved out of --resources). Non-fatal.
-            match list_pods_for_apprafter_app(inner_name, dest_ns, kubeconfig_path) {
-                Ok(pods) => print_pod_summaries(&pods, inner_name, dest_ns, config_changed_at),
-                Err(e) => {
-                    eprintln!();
-                    eprintln!(
-                        "⚠ Could not fetch workload pod state ({e}). \
-                         Argo CD's view (above) is still authoritative \
-                         for sync/health from the apiserver perspective."
-                    );
-                }
-            }
-
-            // 3. Services. Non-fatal.
-            match list_services_for_apprafter_app(inner_name, dest_ns, kubeconfig_path) {
-                Ok(services) => print_service_summaries(&services, inner_name, dest_ns),
-                Err(e) => {
-                    eprintln!();
-                    eprintln!("⚠ Could not fetch workload service state ({e}).");
-                }
-            }
-
-            // 4. Resource provisioning (ResourceClaims). Non-fatal.
-            match list_resource_claims_for_app(inner_name, dest_ns, kubeconfig_path) {
-                Ok(claims) => print_resource_claims(&claims, dest_ns),
-                Err(e) => {
-                    eprintln!();
-                    eprintln!("⚠ Could not fetch resource-claim state ({e}).");
-                }
-            }
-
-            // 5. Secrets this app resolves (2.22c / D7). The app -> secrets
-            // half of the same index `secret seal` reads the other way for
-            // its blast radius. Non-fatal: this is a read that adds context,
-            // and failing `app status` over it would be the wrong trade.
-            if let Some(cr) = apprafter_cr.as_ref() {
-                print_secret_bindings_for_app(cr, inner_name, dest_ns);
             }
         }
-        _ => {
+        StatusPlan::Summary(workloads) => {
+            print_workload_summary(application, &workloads, kubeconfig_path);
+        }
+        StatusPlan::NoWorkloads => {
             println!();
             println!("(workload detail unavailable — app not synced yet)");
+        }
+        StatusPlan::UnknownWorkload { asked, available } => {
+            // Per-registration and NOT fatal: with two env deployments the
+            // workload may live in one of them. `status` raises the error
+            // only when no registration matched at all.
+            println!();
+            println!(
+                "(no workload '{asked}' here — this deployment has: {})",
+                if available.is_empty() {
+                    "none yet".to_string()
+                } else {
+                    available.join(", ")
+                }
+            );
         }
     }
 
     if show_resources {
         print_argocd_resources(app);
+    }
+    matched
+}
+
+/// Render ONE workload's detail block — the inner AppRafter CR phase,
+/// pods, services, resource claims and secret bindings (each a
+/// best-effort kubectl read).
+///
+/// Extracted VERBATIM from the `(Some, Some)` arm of the pre-2.27
+/// `print_app_detail`, which is what makes a single-workload bundle
+/// byte-identical to today by construction rather than by copying: the
+/// same function runs with the same arguments. The extracted arm never
+/// referenced the Argo CD `Application` — every read keys off the inner
+/// name and the namespace — so it is not a parameter here.
+///
+/// UNGUARDED, and this comment is the only record of it: **nothing
+/// inside this body is covered by a test.** The golden test pins the
+/// TEXT each section renders by composing the same pure line helpers
+/// itself, so it is blind to what this function does with them. Three
+/// mutations here were confirmed to leave the whole suite green —
+/// swapping the Pods and Services sections, DELETING the Services
+/// section outright, and transposing `inner_name`/`dest_ns` at a call
+/// site. Ordering, omission and argument swaps are all invisible.
+///
+/// Closing it means threading the four read RESULTS into a pure
+/// assembler, which moves every failure warning from stderr to stdout
+/// and changes the interleaving those warnings were written for; that
+/// was judged not worth the change. Two things bound the risk. Nothing
+/// inside this body moved in the extraction, so this commit adds none of
+/// it. And the argument-swap class is now structurally narrower than it
+/// was: the extraction dropped the Argo CD `Application` from this
+/// function's scope, so the historical bug it warns about below —
+/// passing the registration where the AppRafter CR belonged, which reads
+/// `spec.base.env` and silently finds nothing — is no longer
+/// representable here.
+fn print_workload_detail(inner_name: &str, dest_ns: &str, kubeconfig_path: &Path) {
+    // 1. AppRafter Application phase (group-qualified
+    //    apprafter.io read). Non-fatal — a missing CR /
+    //    absent phase simply skips the line.
+    // Hoisted: the AppRafter CR is read once and reused below for the
+    // secret bindings (2.22c / D7) and the config-drift boundary
+    // (D6). Both are properties of THIS CR — an earlier draft passed
+    // the Argo CD Application to the bindings parser by mistake,
+    // which reads `spec.base.env` and would simply have found
+    // nothing, every time, silently.
+    let mut apprafter_cr: Option<Value> = None;
+    match kubectl_get_json(
+        "application.apprafter.io",
+        Some(inner_name),
+        Some(dest_ns),
+        kubeconfig_path,
+    ) {
+        Ok(Some(cr)) => {
+            for line in apprafter_cr_advisory_lines(&cr, &chrono::Utc::now()) {
+                if line.warn {
+                    println!("{}", style::warn(&line.text));
+                } else {
+                    println!("{}", line.text);
+                }
+            }
+            apprafter_cr = Some(cr);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!(
+                "⚠ Could not fetch AppRafter Application phase ({e}). \
+                 Argo CD's view (above) is still authoritative."
+            );
+        }
+    }
+
+    let config_changed_at = apprafter_cr
+        .as_ref()
+        .and_then(|cr| cr.pointer("/status/envConfig/changedAt"))
+        .and_then(Value::as_str);
+
+    // 2. Pods (moved out of --resources). Non-fatal.
+    match list_pods_for_apprafter_app(inner_name, dest_ns, kubeconfig_path) {
+        Ok(pods) => print_pod_summaries(&pods, inner_name, dest_ns, config_changed_at),
+        Err(e) => {
+            eprintln!();
+            eprintln!(
+                "⚠ Could not fetch workload pod state ({e}). \
+                 Argo CD's view (above) is still authoritative \
+                 for sync/health from the apiserver perspective."
+            );
+        }
+    }
+
+    // 3. Services. Non-fatal.
+    match list_services_for_apprafter_app(inner_name, dest_ns, kubeconfig_path) {
+        Ok(services) => print_service_summaries(&services, inner_name, dest_ns),
+        Err(e) => {
+            eprintln!();
+            eprintln!("⚠ Could not fetch workload service state ({e}).");
+        }
+    }
+
+    // 4. Resource provisioning (ResourceClaims). Non-fatal.
+    match list_resource_claims_for_app(inner_name, dest_ns, kubeconfig_path) {
+        Ok(claims) => print_resource_claims(&claims, dest_ns),
+        Err(e) => {
+            eprintln!();
+            eprintln!("⚠ Could not fetch resource-claim state ({e}).");
+        }
+    }
+
+    // 5. Secrets this app resolves (2.22c / D7). The app -> secrets
+    // half of the same index `secret seal` reads the other way for
+    // its blast radius. Non-fatal: this is a read that adds context,
+    // and failing `app status` over it would be the wrong trade.
+    if let Some(cr) = apprafter_cr.as_ref() {
+        print_secret_bindings_for_app(cr, inner_name, dest_ns);
+    }
+}
+
+/// What `app status` renders for ONE registration, once the workloads it
+/// deploys are known (ADR 0062).
+///
+/// The decision is separated from the rendering because it is the whole
+/// of the bug: the pre-2.27 code took the first workload of however many
+/// and scoped five cluster reads to it, and no test could observe that
+/// choice because it was fused to the IO.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StatusPlan {
+    /// Render the full per-workload block for this one — the single
+    /// workload of a single-workload bundle, or the one `--workload`
+    /// named.
+    Detail(CrRef),
+    /// Render one row per workload, with a pointer at `--workload`.
+    /// NEVER N full blocks: a bundle of six would bury the one that is
+    /// broken under five that are not.
+    Summary(Vec<CrRef>),
+    /// `--workload` named something this registration does not deploy.
+    /// Carries what it DOES deploy, because the likeliest cause is a
+    /// typo and the second is the addressing rule not being known yet.
+    UnknownWorkload {
+        asked: String,
+        available: Vec<String>,
+    },
+    /// The registration tracks no workload at all.
+    ///
+    /// Distinct from `Summary(vec![])` on purpose. `status.resources[]`
+    /// is empty until Argo CD's first sync, and an empty summary table
+    /// would tell an operator their registration deploys nothing when
+    /// the truth is that nothing is known yet. This carries the
+    /// pre-2.27 `(workload detail unavailable — app not synced yet)`
+    /// line, unchanged.
+    NoWorkloads,
+}
+
+/// Pure helper — did this plan ANSWER the caller's `--workload`?
+///
+/// Purely about addressing: did the name the caller typed name something
+/// this registration deploys. It says nothing about whether the block
+/// can then be drawn — `Detail` over a workload whose namespace is
+/// UNKNOWN is a match that renders nothing, and reading "no" out of that
+/// is what made `status` report `deploys no workload 'web'. It deploys:
+/// web.` and exit non-zero on a state
+/// `apprafter_app_refs_reports_an_unknown_namespace_as_none` documents
+/// as real.
+///
+/// `Summary` counts as matched because a summary is only ever reached
+/// with no selector at all, so there is no question outstanding.
+pub(crate) fn plan_matched_selector(plan: &StatusPlan) -> bool {
+    matches!(plan, StatusPlan::Detail(_) | StatusPlan::Summary(_))
+}
+
+/// Pure helper — decide what [`print_app_detail`] renders for one
+/// registration. No IO, no clock: the whole addressing rule is
+/// table-tested without a cluster.
+///
+/// INVARIANT: `--workload` is validated even at N=1. Accepting any name
+/// when there is only one workload would let a typo silently render a
+/// different application's block than the one the reader asked for —
+/// and at N=1 the registration name and the workload name are usually
+/// the same string, so the typo is easy to make and invisible to catch.
+pub(crate) fn status_render_plan(refs: &[CrRef], workload: Option<&str>) -> StatusPlan {
+    if refs.is_empty() {
+        // Before ANY other rule: with nothing synced there is neither a
+        // summary to render nor a set of names to correct `--workload`
+        // against, and "there is no workload `api`" would be a narrower
+        // and wronger claim than "nothing has synced yet".
+        return StatusPlan::NoWorkloads;
+    }
+    match workload {
+        Some(asked) => match refs.iter().find(|r| r.name == asked) {
+            Some(r) => StatusPlan::Detail(r.clone()),
+            None => StatusPlan::UnknownWorkload {
+                asked: asked.to_string(),
+                available: refs.iter().map(|r| r.name.clone()).collect(),
+            },
+        },
+        None if refs.len() == 1 => StatusPlan::Detail(refs[0].clone()),
+        None => StatusPlan::Summary(refs.to_vec()),
+    }
+}
+
+/// One row of the bundle summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkloadSummary {
+    pub name: String,
+    /// The AppRafter CR's `status.phase`, or `—` when it could not be
+    /// read. Never blank — a blank cell reads as healthy.
+    pub phase: String,
+    /// `<ready>/<total>` pods, or `—` when the pod read failed.
+    pub pods: String,
+    /// See [`workload_image_cell`].
+    pub image: String,
+}
+
+/// Build one [`WorkloadSummary`] row.
+pub(crate) fn workload_summary(
+    name: &str,
+    phase: &str,
+    pods: &str,
+    image: &str,
+) -> WorkloadSummary {
+    WorkloadSummary {
+        name: name.to_string(),
+        phase: phase.to_string(),
+        pods: pods.to_string(),
+        image: image.to_string(),
+    }
+}
+
+/// The one phase that counts as fine. Anything else — including the
+/// em-dash of a read that failed — is in the roll-up.
+const READY_PHASE: &str = "Ready";
+
+/// Pure helper — is this row known to be serving?
+///
+/// TWO conditions, and the pod one is not redundant with the phase. The
+/// operator writes `status.phase = Ready` the moment it APPLIES the
+/// Deployment (`operator-controllers/application/src/lib.rs:1072`), so a
+/// workload in `CrashLoopBackOff` carries `phase: Ready` — the exact
+/// shape this subphase exists for would otherwise leave the roll-up
+/// silent and point the hint at the healthy sibling. The count is
+/// already on the row, read by this same command, so folding it in costs
+/// nothing.
+///
+/// ADR 0062 §Accepted does NOT license skipping this. It scopes the
+/// no-pod-visibility concession to `app list`'s HEALTH cell, which never
+/// reads pods. This summary has.
+///
+/// A `<ready>/<total>` that does not parse is the em-dash of a failed
+/// read and counts as NOT ready, the same rule the phase follows: this
+/// table never lets something unobserved render as fine. `0/0` does not
+/// — `ready == total` there, and a deliberately scaled-to-zero workload
+/// must not nag forever.
+fn workload_is_ready(row: &WorkloadSummary) -> bool {
+    if row.phase != READY_PHASE {
+        return false;
+    }
+    match row.pods.split_once('/') {
+        Some((ready, total)) => match (ready.parse::<usize>(), total.parse::<usize>()) {
+            (Ok(ready), Ok(total)) => ready >= total,
+            _ => false,
+        },
+        None => false,
+    }
+}
+
+/// Pure helper — the bundle summary `app status` prints for a
+/// registration that deploys more than one workload (ADR 0062).
+///
+/// `application` is the LOGICAL name, so the hint quotes a command that
+/// works: the positional argument is never a workload name.
+///
+/// INVARIANT: the roll-up line appears ONLY when something is not Ready,
+/// so its presence is the signal. The table above it already proves the
+/// command ran and saw every workload, which makes an "all fine" line
+/// pure noise — the inverse of `apprafter status`, whose silence would
+/// be ambiguous. Same reasoning as [`env_deployment_index_lines`].
+///
+/// "Not Ready" is [`workload_is_ready`], which reads the PODS cell as
+/// well as the phase — a `phase: Ready` workload whose pods are `0/1` is
+/// in the roll-up, and is what the hint points at. A workload whose
+/// phase or pod count did not read (`—`) counts as NOT Ready too: the
+/// failed-read warning sits beside this table, and excluding an
+/// unobserved workload from the count would recreate, one level down,
+/// the exact defect this subphase exists to fix — something unseen
+/// rendering as a clean bill of health.
+pub(crate) fn workload_summary_lines(
+    application: &str,
+    namespace: &str,
+    rows: &[WorkloadSummary],
+) -> Vec<String> {
+    // `str`'s Display padding counts CHARS, so the widths must too —
+    // otherwise every em-dash cell gains two spaces and the columns
+    // stagger, which is a normal state here rather than an exotic one.
+    let width = |f: fn(&WorkloadSummary) -> &String, header: usize| {
+        rows.iter()
+            .map(|r| f(r).chars().count())
+            .max()
+            .unwrap_or(header)
+            .max(header)
+    };
+    let name_w = width(|r| &r.name, "NAME".len());
+    let phase_w = width(|r| &r.phase, "PHASE".len());
+    let pods_w = width(|r| &r.pods, "PODS".len());
+
+    let mut out = vec![
+        String::new(),
+        format!("Workloads ({}, namespace {namespace}):", rows.len()),
+        format!(
+            "  {:<name_w$}  {:<phase_w$}  {:<pods_w$}  IMAGE",
+            "NAME",
+            "PHASE",
+            "PODS",
+            name_w = name_w,
+            phase_w = phase_w,
+            pods_w = pods_w,
+        ),
+    ];
+    for r in rows {
+        out.push(format!(
+            "  {:<name_w$}  {:<phase_w$}  {:<pods_w$}  {}",
+            r.name,
+            r.phase,
+            r.pods,
+            r.image,
+            name_w = name_w,
+            phase_w = phase_w,
+            pods_w = pods_w,
+        ));
+    }
+
+    let not_ready: Vec<&WorkloadSummary> = rows.iter().filter(|r| !workload_is_ready(r)).collect();
+    out.push(String::new());
+    if !not_ready.is_empty() {
+        out.push(format!(
+            "  {} of {} workloads {} not Ready.",
+            not_ready.len(),
+            rows.len(),
+            if not_ready.len() == 1 { "is" } else { "are" },
+        ));
+    }
+    // Point at a workload worth looking at — the first not-Ready one, so
+    // the hint is a next step rather than an example.
+    if let Some(pick) = not_ready.first().copied().or_else(|| rows.first()) {
+        out.push(format!(
+            "  Full detail for one: apprafter app status {application} --workload {}",
+            pick.name
+        ));
+    }
+    out
+}
+
+/// Pure helper — the ONE namespace a bundle lives in (ADR 0062: one
+/// package = one registration = one namespace).
+///
+/// `None` when the refs disagree or any of them is UNKNOWN. Neither is
+/// a thing to average or to drop: the summary's two reads are
+/// namespace-scoped, and guessing would read someone else's namespace
+/// or silently lose a workload.
+pub(crate) fn bundle_namespace(refs: &[CrRef]) -> Option<String> {
+    let mut it = refs.iter();
+    let first = it.next()?.namespace.clone()?;
+    it.all(|r| r.namespace.as_deref() == Some(first.as_str()))
+        .then_some(first)
+}
+
+/// The label selector that matches every operator-rendered pod in a
+/// namespace, whatever workload it belongs to.
+///
+/// `operator-rendering::make_labels` stamps `apprafter: "true"` and
+/// `app.kubernetes.io/name: <cr>` on the SAME label map, and that map
+/// goes on the Deployment's pod template — so one read covers the whole
+/// bundle and [`bucket_pod_readiness`] splits it by workload. That is
+/// what keeps the summary at two reads for N workloads rather than the
+/// four-per-workload of the detail path.
+pub(crate) const BUNDLE_POD_SELECTOR: &str = "apprafter=true";
+
+/// Pure helper — split one namespace-wide pod list into
+/// `workload -> (ready, total)`.
+///
+/// A pod with no `app.kubernetes.io/name` label belongs to no workload
+/// this command speaks for and is dropped rather than bucketed under an
+/// empty key.
+pub(crate) fn bucket_pod_readiness(pods: &[Value]) -> BTreeMap<String, (usize, usize)> {
+    let mut out: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for pod in pods {
+        let Some(name) = pod
+            .pointer("/metadata/labels/app.kubernetes.io~1name")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let ready = pod
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .is_some_and(|cs| {
+                cs.iter().any(|c| {
+                    c.get("type").and_then(Value::as_str) == Some("Ready")
+                        && c.get("status").and_then(Value::as_str) == Some("True")
+                })
+            });
+        let bucket = out.entry(name.to_string()).or_insert((0, 0));
+        bucket.1 += 1;
+        if ready {
+            bucket.0 += 1;
+        }
+    }
+    out
+}
+
+/// Pure helper — the summary's `IMAGE` cell for one workload CR.
+///
+/// `status.image.tag` first: that is what the operator actually
+/// deployed, with the per-environment merge already applied, and it is
+/// the same field the detail block's `image:` line reads. It is absent
+/// under `imagePolicy.resolve: off`, and then the DECLARED image is the
+/// honest answer — the effective one, so the env override wins over
+/// `base` exactly as the operator resolves it.
+///
+/// Unknown renders the em-dash, never a blank.
+pub(crate) fn workload_image_cell(cr: &Value) -> String {
+    if let Some(tag) = cr.pointer("/status/image/tag").and_then(Value::as_str) {
+        return tag.to_string();
+    }
+    cr.pointer("/spec/environment")
+        .and_then(Value::as_str)
+        .and_then(|env| {
+            cr.pointer("/spec/environments")
+                .and_then(|envs| envs.get(env))
+                .and_then(|e| e.get("image"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| cr.pointer("/spec/base/image").and_then(Value::as_str))
+        .unwrap_or("—")
+        .to_string()
+}
+
+/// Print the bundle summary: two namespace-scoped reads for the whole
+/// registration, against four per workload on the detail path.
+///
+/// Either read may fail, and then the affected columns render `—` and a
+/// warning names the command that failed. Never a blank: a blank cell
+/// reads as healthy, which is the failure mode this subphase exists to
+/// close.
+fn print_workload_summary(application: &str, refs: &[CrRef], kubeconfig_path: &Path) {
+    let Some(namespace) = bundle_namespace(refs) else {
+        let rows: Vec<WorkloadSummary> = refs
+            .iter()
+            .map(|r| workload_summary(&r.name, "—", "—", "—"))
+            .collect();
+        for line in workload_summary_lines(application, "—", &rows) {
+            println!("{line}");
+        }
+        eprintln!(
+            "⚠ The workloads of this application do not report one shared namespace, \
+             so their state could not be read. Run `apprafter app status {application} \
+             --workload <name>` for one of them."
+        );
+        return;
+    };
+
+    // Read 1 — every AppRafter CR in the namespace: phase + image.
+    let crs: Option<BTreeMap<String, Value>> = match kubectl_get_json(
+        "application.apprafter.io",
+        None,
+        Some(&namespace),
+        kubeconfig_path,
+    ) {
+        Ok(list) => Some(
+            list.as_ref()
+                .and_then(|l| l.get("items"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|cr| {
+                            Some((
+                                cr.pointer("/metadata/name")
+                                    .and_then(Value::as_str)?
+                                    .to_string(),
+                                cr.clone(),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
+        Err(e) => {
+            eprintln!(
+                "⚠ Could not fetch workload phases ({e}) — PHASE and IMAGE show —. \
+                 Failed: kubectl get application.apprafter.io -n {namespace}"
+            );
+            None
+        }
+    };
+
+    // Read 2 — every operator-rendered pod in the namespace, bucketed.
+    let pods: Option<BTreeMap<String, (usize, usize)>> = match kubectl_get_json_by_selector(
+        "pods",
+        BUNDLE_POD_SELECTOR,
+        Some(&namespace),
+        kubeconfig_path,
+    ) {
+        Ok(items) => Some(bucket_pod_readiness(&items)),
+        Err(e) => {
+            eprintln!(
+                "⚠ Could not fetch workload pod state ({e}) — PODS shows —. \
+                 Failed: kubectl get pods -n {namespace} -l {BUNDLE_POD_SELECTOR}"
+            );
+            None
+        }
+    };
+
+    let rows: Vec<WorkloadSummary> = refs
+        .iter()
+        .map(|r| {
+            let cr = crs.as_ref().and_then(|m| m.get(&r.name));
+            let phase = match &crs {
+                // The CR list read, but THIS workload is not in it: Argo CD
+                // tracks a resource the apiserver does not have. That is a
+                // real state (mid-prune, or a failed apply) and `—` is what
+                // this table says about anything it could not observe.
+                Some(_) => cr
+                    .and_then(|c| c.pointer("/status/phase"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("—")
+                    .to_string(),
+                None => "—".to_string(),
+            };
+            let image = cr
+                .map(workload_image_cell)
+                .unwrap_or_else(|| "—".to_string());
+            let pod_cell = match &pods {
+                Some(buckets) => {
+                    let (ready, total) = buckets.get(&r.name).copied().unwrap_or((0, 0));
+                    format!("{ready}/{total}")
+                }
+                None => "—".to_string(),
+            };
+            workload_summary(&r.name, &phase, &pod_cell, &image)
+        })
+        .collect();
+
+    for line in workload_summary_lines(application, &namespace, &rows) {
+        println!("{line}");
     }
 }
 
@@ -7910,4 +8481,548 @@ mod wizard_picker_tests {
         assert!(envs.is_empty(), "{envs:?}");
         assert_eq!(ns, None);
     }
+}
+
+#[cfg(test)]
+mod status_render_plan_tests {
+    use super::*;
+    use crate::commands::app_open::{apprafter_app_refs, CrRef};
+    use serde_json::json;
+
+    fn cr_ref(name: &str, namespace: &str) -> CrRef {
+        CrRef {
+            namespace: Some(namespace.to_string()),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_single_workload_registration_renders_the_full_detail_block() {
+        assert!(matches!(
+            status_render_plan(&[cr_ref("solo", "ns")], None),
+            StatusPlan::Detail(_)
+        ));
+    }
+
+    #[test]
+    fn a_multi_workload_registration_renders_the_summary() {
+        assert!(matches!(
+            status_render_plan(&[cr_ref("api", "shop"), cr_ref("web", "shop")], None),
+            StatusPlan::Summary(_)
+        ));
+    }
+
+    #[test]
+    fn an_explicit_workload_renders_its_detail_block() {
+        match status_render_plan(&[cr_ref("api", "shop"), cr_ref("web", "shop")], Some("web")) {
+            StatusPlan::Detail(r) => assert_eq!(r.name, "web"),
+            other => panic!("expected Detail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_workload_names_the_ones_that_exist() {
+        match status_render_plan(&[cr_ref("api", "shop")], Some("nope")) {
+            StatusPlan::UnknownWorkload { asked, available } => {
+                assert_eq!(asked, "nope");
+                assert_eq!(available, vec!["api".to_string()]);
+            }
+            other => panic!("expected UnknownWorkload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workload_selector_on_a_single_workload_registration_still_validates() {
+        // `--workload` naming the one workload is fine; naming a different one
+        // is an error even at N=1, or a typo silently shows the wrong app.
+        assert!(matches!(
+            status_render_plan(&[cr_ref("solo", "ns")], Some("solo")),
+            StatusPlan::Detail(_)
+        ));
+        assert!(matches!(
+            status_render_plan(&[cr_ref("solo", "ns")], Some("other")),
+            StatusPlan::UnknownWorkload { .. }
+        ));
+    }
+
+    #[test]
+    fn a_registration_with_no_tracked_workload_is_not_a_summary() {
+        // Before the first sync `status.resources[]` is empty, and that is
+        // NOT "this registration deploys nothing" — it is "nothing is known
+        // yet". An empty summary table would assert the first. `NoWorkloads`
+        // carries today's `(workload detail unavailable — app not synced
+        // yet)` line, unchanged, which is what the (None, _) arm of
+        // `print_app_detail` printed before this change.
+        assert_eq!(status_render_plan(&[], None), StatusPlan::NoWorkloads);
+        // With a selector too: "there is no workload `api`" would be a
+        // narrower and WRONGER claim than "nothing has synced yet", and
+        // `available: []` names nothing for the reader to correct towards.
+        assert_eq!(
+            status_render_plan(&[], Some("api")),
+            StatusPlan::NoWorkloads
+        );
+    }
+
+    #[test]
+    fn a_crashlooping_workload_is_in_the_roll_up_even_though_its_phase_says_ready() {
+        // THE case this subphase exists for. The operator writes
+        // `status.phase = Ready` the moment it applies the Deployment
+        // (`operator-controllers/application/src/lib.rs:1072`), so a
+        // workload in CrashLoopBackOff carries `phase: Ready`. On phase
+        // alone the roll-up stays silent and the hint points at the
+        // HEALTHY sibling — the summary's one designated mitigation (ADR
+        // 0062 §Risks: "its presence is the signal") failing on exactly
+        // the shape it mitigates. The pod count is already on the row.
+        let lines = workload_summary_lines(
+            "shop",
+            "shop",
+            &[
+                workload_summary("api", "Ready", "2/2", "ghcr.io/acme/api:1.9"),
+                workload_summary("worker", "Ready", "0/1", "ghcr.io/acme/worker:1.9"),
+            ],
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains("1 of 2 workloads is not Ready"), "{joined}");
+        assert!(
+            joined.contains("apprafter app status shop --workload worker"),
+            "the hint must name the BROKEN workload, not the healthy one: {joined}"
+        );
+    }
+
+    #[test]
+    fn a_partially_rolled_workload_is_not_ready_but_a_scaled_to_zero_one_is_left_alone() {
+        // `ready < total` is the rule, so 1/3 is in the roll-up …
+        let rolling = workload_summary_lines(
+            "shop",
+            "shop",
+            &[
+                workload_summary("api", "Ready", "1/3", "x"),
+                workload_summary("web", "Ready", "1/1", "x"),
+            ],
+        );
+        assert!(
+            rolling.join("\n").contains("1 of 2 workloads is not Ready"),
+            "{rolling:?}"
+        );
+
+        // … and `0/0` is NOT: ready == total, and a deliberately
+        // scaled-to-zero workload must not nag on every run.
+        let scaled_to_zero = workload_summary_lines(
+            "shop",
+            "shop",
+            &[
+                workload_summary("api", "Ready", "0/0", "x"),
+                workload_summary("web", "Ready", "1/1", "x"),
+            ],
+        );
+        assert!(
+            !scaled_to_zero.join("\n").contains("not Ready"),
+            "{scaled_to_zero:?}"
+        );
+    }
+
+    #[test]
+    fn a_pod_count_that_did_not_read_is_not_ready() {
+        // Same rule as the phase: this table never lets something
+        // unobserved render as fine. The failed-read warning that put the
+        // em-dash there is printed beside the table.
+        let lines = workload_summary_lines(
+            "shop",
+            "shop",
+            &[
+                workload_summary("api", "Ready", "1/1", "x"),
+                workload_summary("web", "Ready", "—", "x"),
+            ],
+        );
+        assert!(
+            lines.join("\n").contains("1 of 2 workloads is not Ready"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_selector_is_matched_by_the_plan_not_by_whether_the_block_can_render() {
+        // A workload whose namespace is UNKNOWN is a real state —
+        // `apprafter_app_refs_reports_an_unknown_namespace_as_none` — and
+        // naming it in `--workload` IS a match: the name was found, only
+        // the rendering is impossible. Deriving "matched" from "rendered"
+        // made `status` answer `deploys no workload 'web'. It deploys:
+        // web.` and exit non-zero on a state that is not a user error.
+        let unknown_ns = [CrRef {
+            namespace: None,
+            name: "web".to_string(),
+        }];
+        let plan = status_render_plan(&unknown_ns, Some("web"));
+        assert!(matches!(plan, StatusPlan::Detail(_)), "{plan:?}");
+        assert!(plan_matched_selector(&plan), "{plan:?}");
+
+        // The three arms that are NOT an answer to the selector, and the
+        // one that is vacuously one.
+        assert!(!plan_matched_selector(&status_render_plan(
+            &[],
+            Some("web")
+        )));
+        assert!(!plan_matched_selector(&status_render_plan(
+            &[cr_ref("api", "shop")],
+            Some("nope")
+        )));
+        assert!(plan_matched_selector(&status_render_plan(
+            &[cr_ref("api", "shop"), cr_ref("web", "shop")],
+            None
+        )));
+    }
+
+    #[test]
+    fn the_unknown_workload_error_names_what_exists_and_the_addressing_rule() {
+        let msg = unknown_workload_message("shop", "nope", &["api".into(), "web".into()]);
+        assert!(msg.contains("'nope'"), "{msg}");
+        assert!(msg.contains("It deploys: api, web."), "{msg}");
+        assert!(msg.contains("--workload"), "{msg}");
+
+        // Registered but unsynced: there is nothing to list, and "It
+        // deploys: ." would read as a rendering bug.
+        let unsynced = unknown_workload_message("shop", "api", &[]);
+        assert!(!unsynced.contains("It deploys:"), "{unsynced}");
+        assert!(unsynced.contains("has not synced"), "{unsynced}");
+    }
+
+    #[test]
+    fn summary_lines_name_every_workload_and_point_at_the_selector() {
+        let lines = workload_summary_lines(
+            "shop",
+            "shop",
+            &[
+                workload_summary("api", "Ready", "2/2", "ghcr.io/acme/api:1.9"),
+                workload_summary(
+                    "worker",
+                    "EnvSecretMissing",
+                    "0/1",
+                    "ghcr.io/acme/worker:1.9",
+                ),
+            ],
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains("Workloads (2, namespace shop)"), "{joined}");
+        assert!(joined.contains("worker"), "{joined}");
+        assert!(joined.contains("1 of 2 workloads is not Ready"), "{joined}");
+        assert!(
+            joined.contains("apprafter app status shop --workload worker"),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn summary_omits_the_roll_up_when_every_workload_is_ready() {
+        // The table above it already proves the command ran, so an "all fine"
+        // line here is noise — the inverse of `apprafter status`, whose silence
+        // WOULD be ambiguous. Same reasoning as env_deployment_index_lines.
+        let lines = workload_summary_lines(
+            "shop",
+            "shop",
+            &[
+                workload_summary("api", "Ready", "2/2", "x"),
+                workload_summary("web", "Ready", "1/1", "x"),
+            ],
+        );
+        assert!(!lines.join("\n").contains("not Ready"));
+    }
+
+    #[test]
+    fn the_roll_up_counts_a_workload_whose_phase_did_not_read_as_not_ready() {
+        // The em-dash is "unmeasured", and the one thing this subphase exists
+        // to stop is an unobserved workload rendering as a clean bill of
+        // health. The failed-read warning sits beside the table; the roll-up
+        // must not quietly exclude the row it covers.
+        let lines = workload_summary_lines(
+            "shop",
+            "shop",
+            &[
+                workload_summary("api", "Ready", "2/2", "x"),
+                workload_summary("web", "—", "—", "—"),
+            ],
+        );
+        assert!(
+            lines.join("\n").contains("1 of 2 workloads is not Ready"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn the_roll_up_is_plural_past_one() {
+        let lines = workload_summary_lines(
+            "shop",
+            "shop",
+            &[
+                workload_summary("api", "Pending", "0/1", "x"),
+                workload_summary("web", "Failed", "0/1", "x"),
+            ],
+        );
+        assert!(
+            lines.join("\n").contains("2 of 2 workloads are not Ready"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_bundle_namespace_is_the_one_every_workload_agrees_on() {
+        assert_eq!(
+            bundle_namespace(&[cr_ref("api", "shop"), cr_ref("web", "shop")]).as_deref(),
+            Some("shop")
+        );
+        // Disagreement is not a thing to average: ADR 0062 says one bundle
+        // is one namespace, so two answers means the caller must not read
+        // either one as "the" namespace.
+        assert_eq!(
+            bundle_namespace(&[cr_ref("api", "shop"), cr_ref("web", "other")]),
+            None
+        );
+        // UNKNOWN (CrRef::namespace == None) is never silently dropped.
+        assert_eq!(
+            bundle_namespace(&[
+                cr_ref("api", "shop"),
+                CrRef {
+                    namespace: None,
+                    name: "web".to_string()
+                }
+            ]),
+            None
+        );
+        assert_eq!(bundle_namespace(&[]), None);
+    }
+
+    #[test]
+    fn the_summary_reads_pods_off_the_label_the_operator_stamps_on_every_pod() {
+        // `operator-rendering::make_labels` puts BOTH `apprafter=true` and
+        // `app.kubernetes.io/name=<cr>` on the pod template, so one read
+        // covers the whole bundle and the bucket key is the workload name.
+        let items = vec![
+            json!({
+                "metadata": { "labels": { "apprafter": "true", "app.kubernetes.io/name": "api" } },
+                "status": { "conditions": [{ "type": "Ready", "status": "True" }] }
+            }),
+            json!({
+                "metadata": { "labels": { "apprafter": "true", "app.kubernetes.io/name": "api" } },
+                "status": { "conditions": [{ "type": "Ready", "status": "False" }] }
+            }),
+            json!({
+                "metadata": { "labels": { "apprafter": "true", "app.kubernetes.io/name": "web" } },
+                "status": { "conditions": [{ "type": "Ready", "status": "True" }] }
+            }),
+            // A pod with no workload label belongs to nothing this command
+            // speaks for and must not inflate a bucket.
+            json!({ "metadata": { "labels": { "apprafter": "true" } }, "status": {} }),
+        ];
+        let buckets = bucket_pod_readiness(&items);
+        assert_eq!(buckets.get("api"), Some(&(1, 2)));
+        assert_eq!(buckets.get("web"), Some(&(1, 1)));
+        assert_eq!(buckets.len(), 2);
+    }
+
+    #[test]
+    fn the_image_cell_prefers_what_the_operator_resolved() {
+        // status.image.tag is what the operator actually deployed (env merge
+        // already applied). It is absent under `imagePolicy.resolve: off`,
+        // and then the declared image is the honest answer.
+        let resolved = json!({
+            "spec": { "base": { "image": "ghcr.io/acme/web:declared" } },
+            "status": { "image": { "tag": "ghcr.io/acme/web:1.9" } }
+        });
+        assert_eq!(workload_image_cell(&resolved), "ghcr.io/acme/web:1.9");
+
+        let per_env = json!({
+            "spec": {
+                "environment": "prod",
+                "base": { "image": "ghcr.io/acme/web:base" },
+                "environments": { "prod": { "image": "ghcr.io/acme/web:prod" } }
+            }
+        });
+        assert_eq!(workload_image_cell(&per_env), "ghcr.io/acme/web:prod");
+
+        let base_only = json!({ "spec": { "base": { "image": "ghcr.io/acme/web:base" } } });
+        assert_eq!(workload_image_cell(&base_only), "ghcr.io/acme/web:base");
+
+        // Unknown is the em-dash, never a blank: a blank reads as healthy.
+        assert_eq!(workload_image_cell(&json!({})), "—");
+    }
+
+    // ── N=1 byte-identity (Step 3) ────────────────────────────────────
+
+    /// The detail block a single-workload registration renders, assembled
+    /// from the same pure renderers `print_workload_detail` calls, in the
+    /// same order. `print_workload_detail` itself interleaves four kubectl
+    /// reads and writes its failures to stderr, so it cannot be called from
+    /// a test; what is pinned here is every line of TEXT it emits on the
+    /// happy path, which is what a fleet-wide regression would show.
+    ///
+    /// The ORDER below is this test's own, not an observation of the
+    /// function's — which means this test cannot see what the function
+    /// does with these helpers at all. Confirmed by mutation: swapping
+    /// the Pods and Services sections there, deleting the Services
+    /// section there, and transposing `inner_name`/`dest_ns` at a call
+    /// site there each leave the suite green. Omission and argument
+    /// swaps, not only ordering. `print_workload_detail`'s own doc
+    /// comment carries the full statement of the gap and why it is left
+    /// open.
+    fn assembled_detail_lines(
+        argo: &Value,
+        cr: &Value,
+        pods: &Value,
+        services: &Value,
+        claims: &Value,
+        workload: &CrRef,
+        now: &chrono::DateTime<chrono::Utc>,
+    ) -> Vec<String> {
+        let inner = workload.name.as_str();
+        // UNKNOWN never reaches a namespaced read — the same refusal
+        // `print_app_detail` makes before calling `print_workload_detail`.
+        let ns = workload.namespace.as_deref().expect("a known namespace");
+        let mut out = status_detail_lines(argo);
+        out.extend(recent_revision_lines(argo));
+        out.extend(
+            apprafter_cr_advisory_lines(cr, now)
+                .into_iter()
+                .map(|l| l.text),
+        );
+        let config_changed_at = cr
+            .pointer("/status/envConfig/changedAt")
+            .and_then(Value::as_str);
+        out.extend(
+            render_pod_summary_lines(
+                &parse_pod_summaries(pods, now),
+                inner,
+                ns,
+                config_changed_at,
+            )
+            .into_iter()
+            .map(|l| l.text),
+        );
+        out.extend(render_service_lines(
+            &parse_service_summaries(services),
+            inner,
+            ns,
+        ));
+        out.extend(render_resource_claim_lines(
+            &parse_resource_claim_summaries(claims, inner),
+            ns,
+        ));
+        out.extend(render_secret_binding_lines(cr, inner, ns));
+        out
+    }
+
+    #[test]
+    fn a_single_workload_bundle_still_renders_todays_detail_block_verbatim() {
+        let argo = json!({
+            "metadata": { "name": "landing-web" },
+            "spec": {
+                "project": "apps",
+                "source": {
+                    "repoURL": "https://github.com/acme/landing-web",
+                    "targetRevision": "master",
+                    "path": "apprafter"
+                },
+                "destination": { "namespace": "landing" }
+            },
+            "status": {
+                "sync": { "status": "Synced" },
+                "health": { "status": "Healthy" },
+                "history": [
+                    { "id": 6, "revision": "a1b2c3d", "deployedAt": "2026-09-14T10:00:00Z" }
+                ],
+                "resources": [{
+                    "group": "apprafter.io",
+                    "version": "v1alpha1",
+                    "kind": "Application",
+                    "name": "landing-web",
+                    "namespace": "landing",
+                    "health": { "status": "Healthy" }
+                }]
+            }
+        });
+        let cr = json!({
+            "metadata": { "name": "landing-web", "namespace": "landing" },
+            "spec": { "base": {
+                "image": "ghcr.io/acme/landing-web:1.9",
+                "env": { "SESSION_KEY": { "secret": "landing-web-session/key" } }
+            }},
+            "status": {
+                "phase": "Ready",
+                "image": {
+                    "tag": "ghcr.io/acme/landing-web:1.9",
+                    "resolved": "ghcr.io/acme/landing-web@sha256:beef",
+                    "resolvedAt": "2026-09-14T11:55:00Z"
+                }
+            }
+        });
+        let pods = json!({ "items": [{
+            "metadata": { "name": "landing-web-7d4f-abc", "creationTimestamp": "2026-09-14T11:00:00Z" },
+            "spec": { "containers": [{ "name": "landing-web" }] },
+            "status": {
+                "phase": "Running",
+                "startTime": "2026-09-14T11:00:00Z",
+                "containerStatuses": [{
+                    "ready": true,
+                    "restartCount": 0,
+                    "state": { "running": { "startedAt": "2026-09-14T11:00:05Z" } }
+                }]
+            }
+        }]});
+        let services = json!({ "items": [{
+            "metadata": { "name": "landing-web" },
+            "spec": {
+                "type": "ClusterIP",
+                "clusterIP": "10.43.7.21",
+                "ports": [{ "port": 3000, "protocol": "TCP" }]
+            }
+        }]});
+        let claims = json!({ "items": [] });
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-14T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        // The decision comes first: at N=1 the plan MUST be Detail, and the
+        // block below is what Detail renders. Fold the two and a change that
+        // turned N=1 into a summary would fail here as well as above.
+        let refs = apprafter_app_refs(&argo);
+        let StatusPlan::Detail(r) = status_render_plan(&refs, None) else {
+            panic!("a single-workload registration must render the detail block");
+        };
+        assert_eq!(r.name, "landing-web");
+        assert_eq!(r.namespace.as_deref(), Some("landing"));
+
+        let rendered =
+            assembled_detail_lines(&argo, &cr, &pods, &services, &claims, &r, &now).join("\n");
+
+        assert_eq!(rendered, GOLDEN_SINGLE_WORKLOAD_DETAIL, "\n{rendered}");
+    }
+
+    const GOLDEN_SINGLE_WORKLOAD_DETAIL: &str = "\
+Application argocd/landing-web
+  project:       apps
+  repo:          https://github.com/acme/landing-web
+  revision:      master
+  path:          apprafter
+  destination:   landing
+  environment:   (base)
+  sync state:    Synced
+  health:        Healthy
+
+Recent revisions (last 1):
+  #  6 a1b2c3d    2026-09-14T10:00:00Z
+AppRafter phase: Ready
+  image:         ghcr.io/acme/landing-web:1.9 -> @sha256:beef (resolved 5m ago)
+
+Workload pods (landing, app.kubernetes.io/name=landing-web):
+  NAME                  READY  STATUS   RESTARTS  AGE
+  landing-web-7d4f-abc  1/1    Running  0         1h
+
+Workload services (landing, app.kubernetes.io/name=landing-web):
+  NAME         TYPE       CLUSTER-IP  PORTS
+  landing-web  ClusterIP  10.43.7.21  3000/TCP
+
+Resource provisioning (landing):
+  (none — the AppRafter Application declares no `needs.*` resources)
+
+Secrets (landing/landing-web):
+  ENV          SECRET/KEY  (SCOPE)
+  SESSION_KEY  landing-web-session/key  (base)";
 }
