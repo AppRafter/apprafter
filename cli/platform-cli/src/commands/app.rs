@@ -2274,12 +2274,25 @@ pub(crate) fn apprafter_cr_advisory_lines(
 /// them, because "where does this answer?" is what the reader came for and
 /// the advisories qualify a thing they must already be able to see.
 ///
-/// **Read from `status.lastAppliedSpec` first.** That is the operator's
-/// stamped record of the *effective* spec — base with the selected
-/// environment already unified onto it — so this does not re-implement the
-/// merge, and it reports what is actually serving rather than what the
-/// manifest would produce. It falls back to `spec.base.expose` before the
-/// first reconcile stamps one, where base IS the effective spec.
+/// **Read from `status.lastAppliedSpec` first, falling back to `spec`.**
+/// The stamped baseline is the last spec the operator successfully
+/// rendered and applied, so during a gated migration it is what is
+/// actually serving while `spec` is what is waiting for approval.
+///
+/// It is the **raw** spec, not a flattened one — `with_stamped_baseline`
+/// stamps `app.spec` verbatim — so it carries `base` and `environments`
+/// and the per-environment override still has to be folded on here. An
+/// earlier version of this read `status.lastAppliedSpec.expose` as though
+/// the operator stamped an effective spec; that path never resolved, so an
+/// application whose environment overrides its hostname was shown the base
+/// one, and the test asserting otherwise was built on a shape that does
+/// not occur.
+///
+/// The fold mirrors `operator-rendering::merge_expose` (2.16c):
+/// subfield-level override-wins, with unset override fields inheriting
+/// base. Only `network` and `hostname` are read here, so only those two
+/// are folded — `port` and `tls` participate in the operator's merge but
+/// `tls` is read straight from the winning layer below.
 ///
 /// `hostname` is `string | [...string]` in the schema (the 2.6b OneOrMany
 /// union), so both shapes are read. A `public` app with no hostname renders
@@ -2287,13 +2300,32 @@ pub(crate) fn apprafter_cr_advisory_lines(
 /// admission webhook refuses it — inventing a URL for it would be the only
 /// place in the product claiming it is reachable.
 pub(crate) fn public_endpoint_line(cr: &Value) -> Option<String> {
-    let expose = cr
-        .pointer("/status/lastAppliedSpec/expose")
-        .or_else(|| cr.pointer("/spec/base/expose"))?;
-    if expose.get("network").and_then(Value::as_str)? != "public" {
+    let root = cr
+        .pointer("/status/lastAppliedSpec")
+        .filter(|v| v.is_object())
+        .or_else(|| cr.pointer("/spec"))?;
+    let base = root.pointer("/base/expose");
+    // The environment the operator selected, not one this command picks.
+    let env_expose = cr
+        .pointer("/status/environment")
+        .or_else(|| root.get("environment"))
+        .and_then(Value::as_str)
+        .and_then(|env| root.pointer(&format!("/environments/{env}/expose")));
+    // Subfield override-wins; an unset override field inherits base.
+    let pick = |key: &str| -> Option<Value> {
+        env_expose
+            .and_then(|e| e.get(key))
+            .or_else(|| base.and_then(|b| b.get(key)))
+            .cloned()
+    };
+    if base.is_none() && env_expose.is_none() {
         return None;
     }
-    let raw = expose.get("hostname")?;
+    if pick("network")?.as_str()? != "public" {
+        return None;
+    }
+    let raw = pick("hostname")?;
+    let raw = &raw;
     let hosts: Vec<&str> = match raw {
         Value::String(s) => vec![s.as_str()],
         Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
@@ -2306,7 +2338,7 @@ pub(crate) fn public_endpoint_line(cr: &Value) -> Option<String> {
     // `tls` absent is not "no TLS": the platform terminates TLS on the
     // Gateway by default, and printing `http://` for a site that answers on
     // https would send the reader to a redirect and read as a misconfiguration.
-    let scheme = match expose.get("tls").and_then(Value::as_bool) {
+    let scheme = match pick("tls").as_ref().and_then(Value::as_bool) {
         Some(false) => "http",
         _ => "https",
     };
@@ -10083,13 +10115,30 @@ mod public_endpoint_tests {
     use super::*;
     use serde_json::json;
 
+    /// A CR in the shape the operator actually produces: `lastAppliedSpec`
+    /// is `app.spec` stamped verbatim, so it carries `base` and
+    /// `environments` — it is NOT a flattened effective spec.
+    fn cr(base: Value, envs: Value, env: Option<&str>) -> Value {
+        let mut last = json!({ "base": base });
+        if !envs.is_null() {
+            last["environments"] = envs;
+        }
+        let mut status = json!({ "lastAppliedSpec": last });
+        if let Some(e) = env {
+            status["environment"] = json!(e);
+        }
+        json!({ "status": status })
+    }
+
     #[test]
     fn a_public_app_shows_where_it_answers() {
-        let cr = json!({ "status": { "lastAppliedSpec": {
-            "expose": { "network": "public", "hostname": "shop.example.com" }
-        }}});
+        let c = cr(
+            json!({ "expose": { "network": "public", "hostname": "shop.example.com" } }),
+            Value::Null,
+            None,
+        );
         assert_eq!(
-            public_endpoint_line(&cr).unwrap(),
+            public_endpoint_line(&c).unwrap(),
             "Public URL:      https://shop.example.com"
         );
     }
@@ -10098,11 +10147,13 @@ mod public_endpoint_tests {
     fn several_hostnames_are_all_shown() {
         // `hostname` is `string | [...string]`; a list is the apex+www case
         // and dropping all but one would send the reader to the wrong site.
-        let cr = json!({ "status": { "lastAppliedSpec": { "expose": {
-            "network": "public",
-            "hostname": ["example.com", "www.example.com"]
-        }}}});
-        let line = public_endpoint_line(&cr).unwrap();
+        let c = cr(
+            json!({ "expose": { "network": "public",
+                                "hostname": ["example.com", "www.example.com"] } }),
+            Value::Null,
+            None,
+        );
+        let line = public_endpoint_line(&c).unwrap();
         assert!(line.contains("https://example.com"), "{line}");
         assert!(line.contains("https://www.example.com"), "{line}");
     }
@@ -10110,11 +10161,14 @@ mod public_endpoint_tests {
     #[test]
     fn an_internal_app_shows_nothing() {
         for network in ["internal", "vpn"] {
-            let cr = json!({ "status": { "lastAppliedSpec": { "expose": {
-                "network": network, "hostname": "not-served.example.com"
-            }}}});
+            let c = cr(
+                json!({ "expose": { "network": network,
+                                    "hostname": "not-served.example.com" } }),
+                Value::Null,
+                None,
+            );
             assert_eq!(
-                public_endpoint_line(&cr),
+                public_endpoint_line(&c),
                 None,
                 "{network} must not advertise a URL"
             );
@@ -10131,37 +10185,101 @@ mod public_endpoint_tests {
         // The operator emits no HTTPRoute for one and the webhook refuses
         // it, so a URL here would be the only claim in the product that it
         // is reachable.
-        let cr = json!({ "status": { "lastAppliedSpec": {
-            "expose": { "network": "public" }
-        }}});
-        assert_eq!(public_endpoint_line(&cr), None);
-        let empty = json!({ "status": { "lastAppliedSpec": {
-            "expose": { "network": "public", "hostname": "" }
-        }}});
-        assert_eq!(public_endpoint_line(&empty), None);
+        assert_eq!(
+            public_endpoint_line(&cr(
+                json!({ "expose": { "network": "public" } }),
+                Value::Null,
+                None
+            )),
+            None
+        );
+        assert_eq!(
+            public_endpoint_line(&cr(
+                json!({ "expose": { "network": "public", "hostname": "" } }),
+                Value::Null,
+                None
+            )),
+            None
+        );
     }
 
     #[test]
-    fn the_effective_spec_wins_over_the_manifest_base() {
-        // An environment override that changes the hostname must be what is
-        // shown: base is what the manifest says, `lastAppliedSpec` is what
-        // is actually serving.
-        let cr = json!({
-            "spec": { "base": { "expose": {
-                "network": "public", "hostname": "base.example.com" } } },
-            "status": { "lastAppliedSpec": { "expose": {
-                "network": "public", "hostname": "prod.example.com" } } }
-        });
-        let line = public_endpoint_line(&cr).unwrap();
-        assert!(line.contains("prod.example.com"), "{line}");
+    fn the_selected_environments_hostname_wins_over_base() {
+        // This is the case the first version of this function got wrong: it
+        // read `status.lastAppliedSpec.expose`, a path that never resolves
+        // because the stamp is the RAW spec, so a prod deploy was shown its
+        // base hostname — a URL that is not the one serving.
+        let c = cr(
+            json!({ "expose": { "network": "public", "hostname": "base.example.com" } }),
+            json!({ "prod": { "expose": { "hostname": "shop.example.com" } } }),
+            Some("prod"),
+        );
+        let line = public_endpoint_line(&c).unwrap();
+        assert!(line.contains("shop.example.com"), "{line}");
         assert!(!line.contains("base.example.com"), "{line}");
     }
 
     #[test]
-    fn before_the_first_reconcile_the_base_spec_answers() {
-        // No `lastAppliedSpec` yet — base IS the effective spec, and
-        // showing nothing would hide the URL exactly while the reader is
-        // waiting for the deploy to come up.
+    fn an_override_inherits_the_base_fields_it_does_not_set() {
+        // `merge_expose` is subfield override-wins: the prod block below
+        // sets only `hostname`, so `network: public` has to come from base
+        // or the URL disappears entirely.
+        let c = cr(
+            json!({ "expose": { "network": "public", "port": 3000,
+                                "hostname": "base.example.com" } }),
+            json!({ "prod": { "expose": { "hostname": "shop.example.com" } } }),
+            Some("prod"),
+        );
+        assert!(public_endpoint_line(&c)
+            .unwrap()
+            .contains("https://shop.example.com"));
+    }
+
+    #[test]
+    fn an_environment_that_overrides_nothing_keeps_the_base_url() {
+        let c = cr(
+            json!({ "expose": { "network": "public", "hostname": "base.example.com" } }),
+            json!({ "prod": { "replicas": 3 } }),
+            Some("prod"),
+        );
+        assert!(public_endpoint_line(&c)
+            .unwrap()
+            .contains("base.example.com"));
+    }
+
+    #[test]
+    fn an_environment_may_take_a_private_app_public() {
+        // No base `expose` at all, and the environment introduces one.
+        let c = cr(
+            json!({ "image": "x" }),
+            json!({ "prod": { "expose": { "network": "public", "port": 80,
+                                          "hostname": "only-prod.example.com" } } }),
+            Some("prod"),
+        );
+        assert!(public_endpoint_line(&c)
+            .unwrap()
+            .contains("https://only-prod.example.com"));
+    }
+
+    #[test]
+    fn another_environments_override_is_not_applied() {
+        // Only the SELECTED environment folds on. Reading the wrong block
+        // would advertise a hostname this deployment does not answer on.
+        let c = cr(
+            json!({ "expose": { "network": "public", "hostname": "base.example.com" } }),
+            json!({ "dev": { "expose": { "hostname": "dev.example.com" } } }),
+            Some("prod"),
+        );
+        let line = public_endpoint_line(&c).unwrap();
+        assert!(line.contains("base.example.com"), "{line}");
+        assert!(!line.contains("dev.example.com"), "{line}");
+    }
+
+    #[test]
+    fn before_the_first_reconcile_the_live_spec_answers() {
+        // No `lastAppliedSpec` yet — `spec` is all there is, and showing
+        // nothing would hide the URL exactly while the reader is waiting
+        // for the deploy to come up.
         let cr = json!({ "spec": { "base": { "expose": {
             "network": "public", "hostname": "new.example.com"
         }}}});
@@ -10171,13 +10289,32 @@ mod public_endpoint_tests {
     }
 
     #[test]
+    fn the_applied_spec_wins_over_one_waiting_for_approval() {
+        // During a gated migration `spec` holds the pending change while
+        // `lastAppliedSpec` holds what is serving. The URL must be the one
+        // answering now.
+        let c = json!({
+            "spec": { "base": { "expose": {
+                "network": "public", "hostname": "pending.example.com" } } },
+            "status": { "lastAppliedSpec": { "base": { "expose": {
+                "network": "public", "hostname": "serving.example.com" } } } }
+        });
+        let line = public_endpoint_line(&c).unwrap();
+        assert!(line.contains("serving.example.com"), "{line}");
+        assert!(!line.contains("pending.example.com"), "{line}");
+    }
+
+    #[test]
     fn tls_false_is_the_only_thing_that_makes_it_http() {
         // Absent `tls` means the Gateway terminates TLS, so `http://` would
         // send the reader to a redirect and read as a misconfiguration.
         let with = |tls: Value| {
-            json!({ "status": { "lastAppliedSpec": { "expose": {
-                "network": "public", "hostname": "h.example.com", "tls": tls
-            }}}})
+            cr(
+                json!({ "expose": { "network": "public",
+                                    "hostname": "h.example.com", "tls": tls } }),
+                Value::Null,
+                None,
+            )
         };
         assert!(public_endpoint_line(&with(json!(false)))
             .unwrap()
@@ -10185,6 +10322,13 @@ mod public_endpoint_tests {
         assert!(public_endpoint_line(&with(json!(true)))
             .unwrap()
             .contains("https://"));
+        // And an override may flip it for one environment only.
+        let c = cr(
+            json!({ "expose": { "network": "public", "hostname": "h.example.com" } }),
+            json!({ "dev": { "expose": { "tls": false } } }),
+            Some("dev"),
+        );
+        assert!(public_endpoint_line(&c).unwrap().contains("http://"));
     }
 }
 
