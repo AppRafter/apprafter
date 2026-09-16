@@ -1876,6 +1876,64 @@ compatibility: "0.2.69": {
 	]
 }
 
+compatibility: "0.2.74": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.50"
+	notes: """
+		Probes, the JetStream tuning surface, and shared databases —
+		ADR 0065 and ADR 0066, released together because both change
+		the `Application` CRD and two CRD upgrades back to back at a
+		live cluster is risk with no upside.
+
+		WHAT ROLLS, AND WHY. Every application that declares
+		`expose.port` and no readiness probe gets one — a TCP connect
+		on the port its own manifest names — so every such Deployment's
+		pod template changes and each rolls ONCE. Not repeatedly: the
+		rendered probe is stable, and the numbers behind it live in the
+		operator rather than in the stored object.
+
+		The second-order effect is the one to expect a report about.
+		An application whose `expose.port` does not match the port its
+		process listens on has been running with a Service pointing at
+		nothing, and now shows as not ready. Nothing broke at that
+		moment — it was already broken, and the platform stopped
+		concealing it. `probes: readiness: enabled: false` turns the
+		default off for a workload that legitimately does not listen.
+
+		NEW KIND: `SharedDatabase` (namespaced). A PostgreSQL database
+		or a Redis keyspace several applications bind, each through its
+		own credential, created out of band and outliving every
+		application bound to it. Nothing existing uses it, so an
+		upgrade that never creates one changes nothing about data.
+
+		NEW GATE: binding an application to a shared database for the
+		first time, and widening an existing binding from read-only to
+		read-write, pause for approval like any destructive change.
+		Applies only to applications that adopt `needs.<type>.ref`.
+
+		ONE FIELD IS NOW REFUSED THAT 0.2.73 ACCEPTED:
+		`needs.jetstream.streams[].consumerLimits`. It was accepted,
+		stored and inert — the JetStream controller this platform ships
+		runs its legacy reconciler, which never forwards stream-level
+		consumer limits to the server, so a manifest carrying it was
+		configuring nothing. A cluster with such a manifest will have
+		its next apply refused, naming `maxAckPending` on the `consume`
+		entry as the way that does reach the live consumer. Refused
+		rather than silently dropped, because storing a setting nothing
+		reads is what produced the situation.
+
+		Rendered chart vs 0.2.73: the operator and admission-webhook
+		image tags, the cue-cmp image tag (the sidecar bundles
+		`schemas/v1alpha1`), five CRDs, the operator ClusterRole
+		(`shareddatabases`), and one new webhook rule.
+		"""
+	references: [
+		"docs/adr/0065-probes-and-jetstream-tuning.md",
+		"docs/adr/0066-shared-database.md",
+		"docs/changelog/UNRELEASED.md",
+	]
+}
+
 compatibility: "0.2.73": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.49"

@@ -302,6 +302,31 @@ pub const EXAMPLES: &[CommandExamples] = &[
         ],
     },
     CommandExamples {
+        path: &["db", "create"],
+        lines: &[
+            "apprafter db create <name> --type pg --namespace <ns>",
+            "apprafter db create <name> --type pg --extension vector --extension pg_trgm --namespace <ns>",
+            "apprafter db create <name> --type redis --persistent --namespace <ns>",
+        ],
+    },
+    CommandExamples {
+        path: &["db", "list"],
+        lines: &[
+            "apprafter db list  # cluster-wide",
+            "apprafter db list --namespace <ns>",
+        ],
+    },
+    CommandExamples {
+        path: &["db", "status"],
+        lines: &["apprafter db status <name> --namespace <ns>  # includes who is bound"],
+    },
+    CommandExamples {
+        path: &["db", "rm"],
+        lines: &[
+            "apprafter db rm <name> --namespace <ns> --yes  # refused while anything is bound",
+        ],
+    },
+    CommandExamples {
         path: &["destroy"],
         lines: &[
             "apprafter destroy --yes  # every Hetzner resource tagged apprafter=true",

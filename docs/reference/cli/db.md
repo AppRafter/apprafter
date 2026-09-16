@@ -42,6 +42,14 @@ Usage: apprafter db create [OPTIONS] --type <TYPE> <NAME>
 | `--size` | — | — | no | Size class passed through to the backend (e.g. `small`) |
 | `--type` | `pg` \| `redis` | — | yes | `pg` or `redis` |
 
+Examples:
+
+```sh
+apprafter db create <name> --type pg --namespace <ns>
+apprafter db create <name> --type pg --extension vector --extension pg_trgm --namespace <ns>
+apprafter db create <name> --type redis --persistent --namespace <ns>
+```
+
 ## `apprafter db list`
 
 List SharedDatabases with their type, refCount and backing
@@ -55,6 +63,13 @@ Aliases: `ls` — accepted on the command line, not listed in `--help`.
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--namespace`, `-n` | — | — | no | Namespace to list. Omit for cluster-wide listing |
+
+Examples:
+
+```sh
+apprafter db list  # cluster-wide
+apprafter db list --namespace <ns>
+```
 
 ## `apprafter db rm`
 
@@ -73,6 +88,12 @@ Usage: apprafter db rm [OPTIONS] <NAME>
 | `--namespace`, `-n` | — | `default` | no | Namespace |
 | `--yes` | flag | — | no | Skip the confirmation prompt |
 
+Examples:
+
+```sh
+apprafter db rm <name> --namespace <ns> --yes  # refused while anything is bound
+```
+
 ## `apprafter db status`
 
 Show detail for one SharedDatabase, including who is bound to it
@@ -88,3 +109,9 @@ Usage: apprafter db status [OPTIONS] <NAME>
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--namespace`, `-n` | — | `default` | no | Namespace |
+
+Examples:
+
+```sh
+apprafter db status <name> --namespace <ns>  # includes who is bound
+```

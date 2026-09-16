@@ -56,7 +56,7 @@ post-launch work is not a roadmap phase and has no subscribe control.
 | Shipped | ✅ | On-demand Redis-compatible cache (`needs.redis`) | [Redis](operator-guide/redis.md) |
 | Shipped | ✅ | Message streams and durable consumers, declared in the manifest (`needs.jetstream`) | [JetStream](operator-guide/jetstream.md) |
 | Shipped | ✅ | Redelivery, acknowledgement and retention tuned per stream and per consumer, with a dead-letter queue | — |
-| Shipped | 🚧 | One Postgres database or cache shared between applications, each consumer with its own credential | [Shared databases](operator-guide/shared-databases.md) |
+| Shipped | ✅ | One Postgres database or cache shared between applications, each consumer with its own credential | [Shared databases](operator-guide/shared-databases.md) |
 | Shipped | ✅ | PostgreSQL extensions requested from the manifest, from a bounded list | [Shared databases](operator-guide/shared-databases.md) |
 | Shipped | ✅ | On-demand block storage (`needs.disk`) | [Persistent disks](operator-guide/persistent-disk.md) |
 | Shipped | ✅ | One volume shared between applications, with removal refused while it is referenced | [Shared volumes](operator-guide/shared-volumes.md) |
@@ -82,10 +82,11 @@ post-launch work is not a roadmap phase and has no subscribe control.
 > server keeps running untouched. A larger per-tier budget is planned.
 > JetStream stores are out of scope for backup and restore.
 
-> **What the `🚧` row above is missing, precisely.** A shared database can be created and bound —
-> the manifest surface, the validation, the SQL, the controller and the per-consumer credential are
-> all in place, and the SQL is proven against a real PostgreSQL — but the chain has not yet been run
-> end to end on a cluster. It stays `🚧` until a walk says otherwise.
+> **A shared database is created explicitly and outlives every application bound to it.** Removing
+> an application drops that application's own credential and nothing else; the data is never touched
+> by a consumer's lifecycle. Deleting the database itself is refused while anything is bound, by the
+> command and by the cluster both, and the refusal names the applications. A read-only consumer is
+> read-only to the database server, not by agreement — its writes are refused by PostgreSQL.
 
 > **One tuning field is refused rather than accepted:** a stream-level ceiling on unacknowledged
 > messages. The message controller this platform ships never forwards it to the server, so accepting

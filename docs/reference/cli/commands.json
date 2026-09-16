@@ -1,5 +1,5 @@
 {
-  "cli_version": "0.2.71",
+  "cli_version": "0.2.72",
   "commands": [
     {
       "path": [],
@@ -1848,7 +1848,11 @@
       "long_about": null,
       "usage": "Usage: apprafter db create [OPTIONS] --type <TYPE> <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter db create <name> --type pg --namespace <ns>",
+        "apprafter db create <name> --type pg --extension vector --extension pg_trgm --namespace <ns>",
+        "apprafter db create <name> --type redis --persistent --namespace <ns>"
+      ],
       "args": [
         {
           "id": "extensions",
@@ -1937,7 +1941,10 @@
       "long_about": null,
       "usage": "Usage: apprafter db list [OPTIONS]",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter db list  # cluster-wide",
+        "apprafter db list --namespace <ns>"
+      ],
       "args": [
         {
           "id": "namespace",
@@ -1964,7 +1971,9 @@
       "long_about": null,
       "usage": "Usage: apprafter db rm [OPTIONS] <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter db rm <name> --namespace <ns> --yes  # refused while anything is bound"
+      ],
       "args": [
         {
           "id": "namespace",
@@ -2012,7 +2021,9 @@
       "long_about": null,
       "usage": "Usage: apprafter db status [OPTIONS] <NAME>",
       "hidden": false,
-      "examples": [],
+      "examples": [
+        "apprafter db status <name> --namespace <ns>  # includes who is bound"
+      ],
       "args": [
         {
           "id": "namespace",
