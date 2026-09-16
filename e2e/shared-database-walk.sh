@@ -379,9 +379,37 @@ check "the status publishes no shared connection Secret" \
 # dwell STARTING is already the bug, and it is announced exactly once.
 check "the database records the cluster it lives on (the reaper vetoes on it)" \
     "$(jp "$SHDB_RES" "$APP_NS" "$PG_DB" '{.status.instance}')" "$PG_CLUSTER"
-REAPER_LOG=$(kubectl -n "$PLATFORM_NS" logs deploy/apprafter-operator --tail=2000 2>/dev/null \
-    | grep -c "has no tenants" || true)
-check "the reaper never called the occupied cluster tenant-less" "$REAPER_LOG" "0"
+# Read the VETO out of the operator's own metrics, through the apiserver's pod
+# proxy — no port-forward, no extra tooling.
+#
+# The first version of this check grepped the log for `has no tenants` and
+# demanded zero. That was wrong, and the way it was wrong is worth keeping:
+# the reaper legitimately announces a dwell while the cluster is still empty,
+# 39 seconds before the database finished provisioning on it. A count of one
+# is correct behaviour; what must be true is that the dwell is then VETOED,
+# and the veto is logged at `debug` because on a healthy cluster it fires
+# every tick for every instance. The counter is where it is observable.
+printf '  waiting for the reaper to veto on the shared database ...\n'
+_op_pod=$(kubectl -n "$PLATFORM_NS" get pods -l app.kubernetes.io/name=apprafter-operator \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+[ -n "$_op_pod" ] || die "could not find the operator pod to read metrics from"
+_deadline=$(( $(date +%s) + 180 ))
+VETO_COUNT=0
+while [ "$(date +%s)" -lt "$_deadline" ]; do
+    VETO_COUNT=$(kubectl get --raw \
+        "/api/v1/namespaces/${PLATFORM_NS}/pods/${_op_pod}:8080/proxy/metrics" 2>/dev/null \
+        | grep 'apprafter_shared_backend_reap_total' \
+        | grep 'veto_shared_database' \
+        | awk '{print $NF}' | head -1 || true)
+    case "${VETO_COUNT:-0}" in
+        ''|0|0.0|0*) VETO_COUNT=0; sleep 10 ;;
+        *) break ;;
+    esac
+done
+[ "${VETO_COUNT:-0}" != "0" ] \
+    || die "the reaper never vetoed on the shared database — it is on a dwell to delete the cluster the data is in"
+printf '  ok: the reaper vetoes reaping the cluster because a shared database occupies it (%s)\n' \
+    "$VETO_COUNT"
 
 # The allow list applies to a SharedDatabase too, and did not for a while: it
 # was enforced on `needs.pg.extensions` from the start while a SharedDatabase
