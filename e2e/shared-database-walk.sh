@@ -40,6 +40,10 @@
 #      per-user prefix would pass every unit test while leaving the two
 #      unable to talk.
 #   6. `pgvector` in a SHARED database, end to end from the manifest.
+#   7. Every shipped `apprafter db` verb actually RUNS — create, list, status
+#      and rm. `list` and `status` were for a while present only as strings
+#      inside other assertions, which proves the words exist and nothing about
+#      the commands.
 #
 # Judge this walk by READING THE LOG, not by its exit code — a sandboxed
 # runner can mask the inner status. Every phase prints `ok:` lines; the last
@@ -386,6 +390,21 @@ check "an unbound database reports refCount 0" \
     "$(jp "$SHDB_RES" "$APP_NS" "$PG_DB" '{.status.refCount}')" "0"
 # The absence is the design (ADR 0066 §1) and the reason the CRD exists: one
 # shared Secret here would be the thing per-consumer credentials replace.
+# `apprafter db list` — a shipped verb, so it runs here rather than being
+# assumed. The rule is that a walk exercises every shipped CLI subcommand;
+# `list` and `status` were the two this file used only as strings inside other
+# assertions, which proves the words exist and nothing about the command.
+LIST_OUT=$(apprafter db list -n "$APP_NS" 2>&1 || true)
+contains "db list names the database" "$LIST_OUT" "$PG_DB"
+contains "db list reports its type" "$LIST_OUT" "pg"
+contains "db list reports it ready" "$LIST_OUT" "true"
+contains "db list shows the backing it resolved" "$LIST_OUT" "$PG_DB_NAME"
+# Cluster-wide, with no -n, must find it too — that is the form an operator
+# reaches for when they do not know the namespace, and the one the `list`
+# error path exists for.
+LIST_ALL=$(apprafter db list 2>&1 || true)
+contains "db list with no namespace spans the cluster" "$LIST_ALL" "$PG_DB"
+
 check "the status publishes no shared connection Secret" \
     "$(jp "$SHDB_RES" "$APP_NS" "$PG_DB" '{.status.connectionSecretRef}')" ""
 
@@ -664,6 +683,18 @@ check "the ro consumer READS the rw consumer's row" "$RO_READ" "from-web"
 RO_WRITE=$(psql_as "$RO_ROLE" "$RO_PW" "$PG_DB_NAME" \
     "INSERT INTO shared_orders VALUES (2,'from-reporter');" || true)
 contains "the ro consumer's INSERT is refused" "$RO_WRITE" "permission denied"
+
+# `apprafter db status` — run WITH both consumers bound, because naming them
+# is the thing that distinguishes it from `volume status`. A refusal by count
+# tells an operator they are blocked without telling them by whom, and for a
+# database the binding is one line inside somebody's `needs` block.
+STATUS_OUT=$(apprafter db status "$PG_DB" -n "$APP_NS" 2>&1 || true)
+contains "db status reports the type" "$STATUS_OUT" "pg"
+contains "db status reports the backing" "$STATUS_OUT" "$PG_DB_NAME"
+contains "db status lists the declared extensions" "$STATUS_OUT" "vector"
+contains "db status counts both bound applications" "$STATUS_OUT" "Bound apps:   2"
+contains "db status NAMES the rw binder" "$STATUS_OUT" "${APP_RW}-pg"
+contains "db status NAMES the ro binder" "$STATUS_OUT" "${APP_RO}-pg"
 
 # ===============================================================
 phase "Phase 8: pgvector in the SHARED database"
