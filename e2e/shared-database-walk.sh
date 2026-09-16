@@ -541,7 +541,7 @@ PLAN_NAME="${PLAN#*/}"
 check "the plan's trigger names the bind" \
     "$(jp "$PLAN_RES" "$APP_NS" "$PLAN_NAME" '{.spec.trigger.type}')" "shared-database-bind"
 check "the bind is classified as a security boundary" \
-    "$(jp "$PLAN_RES" "$APP_NS" "$PLAN_NAME" '{.spec.classification}')" "security-boundary"
+    "$(jp "$PLAN_RES" "$APP_NS" "$PLAN_NAME" '{.spec.risks.classification}')" "security-boundary"
 contains "the plan names the database and the access level" \
     "$(jp "$PLAN_RES" "$APP_NS" "$PLAN_NAME" '{.spec.trigger.to}')" "$PG_DB"
 
