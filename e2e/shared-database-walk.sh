@@ -463,10 +463,16 @@ if [ "$PG_PROBE" != "1" ]; then
     die "the psql seam does not work — every SQL assertion below would be noise"
 fi
 printf '  ok: psql reaches the shared cluster as the platform role\n'
-GROUPS=$(psql_as apprafter_admin "$PG_ADMIN_PW" postgres \
+# NOT `GROUPS`. That is a bash BUILT-IN array of the current user's group
+# IDs: the assignment is silently ignored and the expansion yields the
+# primary GID. This walk spent two runs reporting
+# `100 does not contain shd_shop_orders` and looking at the controller — the
+# psql preflight above now proves the seam works, which is what finally made
+# the three characters legible as a GID rather than as query output.
+PG_ROLE_LIST=$(psql_as apprafter_admin "$PG_ADMIN_PW" postgres \
     "SELECT rolname FROM pg_roles WHERE rolname IN ('${PG_GROUP}','${PG_READER_GROUP}') ORDER BY 1;" || true)
-contains "the owning group exists on the server" "$GROUPS" "$PG_GROUP"
-contains "the reader group exists on the server" "$GROUPS" "$PG_READER_GROUP"
+contains "the owning group exists on the server" "$PG_ROLE_LIST" "$PG_GROUP"
+contains "the reader group exists on the server" "$PG_ROLE_LIST" "$PG_READER_GROUP"
 
 DB_OWNER=$(psql_as apprafter_admin "$PG_ADMIN_PW" postgres \
     "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname='${PG_DB_NAME}';" || true)
