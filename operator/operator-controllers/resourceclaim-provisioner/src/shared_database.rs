@@ -455,7 +455,22 @@ pub async fn reconcile_shared_database(
             .await?;
             return Ok(Action::requeue(Duration::from_secs(30)));
         }
-        drop_backing(&ctx, &sd, &ns, &name).await?;
+        // The finalizer is NOT released until the backing is actually gone.
+        //
+        // It used to be released in the same pass, which made the cleanup
+        // one-shot — and the pg cleanup CANNOT complete in one pass. Dropping
+        // the groups needs the database gone first (`DROP OWNED BY` is
+        // per-database, so privileges held inside the shared database are not
+        // reachable from `postgres`, and `DROP ROLE` then refuses with
+        // `N objects in database …`). CNPG takes a moment to act on
+        // `ensure: absent`, so the first attempt always loses the race and the
+        // groups would have leaked permanently, on every delete.
+        //
+        // Measured by `e2e/shared-pg-sql-check.sh` step 8, which is where
+        // these statements ran against a live server for the first time.
+        if !drop_backing(&ctx, &sd, &ns, &name).await? {
+            return Ok(Action::requeue(Duration::from_secs(15)));
+        }
         set_finalizers(&ctx.client, &ns, &name, without_finalizer(&finalizers)).await?;
         info!(%name, %ns, "SharedDatabase deleted — backing dropped, finalizer released");
         return Ok(Action::await_change());
@@ -931,12 +946,15 @@ async fn reconcile_redis(
 /// redis: flush the `$N`. The number itself needs no release: the allocator
 /// derives the reserved set from live objects, so it frees when the CR goes.
 /// The flush is what makes `db rm` mean what its prompt says.
+///
+/// Returns `true` when there is nothing left to do, and `false` while the
+/// caller should come back — the pg arm cannot finish in one pass.
 async fn drop_backing(
     ctx: &Arc<Context>,
     sd: &SharedDatabase,
     ns: &str,
     name: &str,
-) -> Result<(), ReconcileError> {
+) -> Result<bool, ReconcileError> {
     let providers: Vec<ServiceProvider> = Api::<ServiceProvider>::all(ctx.client.clone())
         .list(&Default::default())
         .await?
@@ -960,7 +978,7 @@ async fn drop_backing(
                 .and_then(|s| s.database.as_ref())
                 .is_none()
             {
-                return Ok(());
+                return Ok(true);
             }
             let cluster = cfg
                 .pointer("/cluster")
@@ -1011,16 +1029,25 @@ async fn drop_backing(
                         .execute_all(&dsn, &shared_pg::drop_groups(ns, name))
                         .await
                     {
-                        // Expected on the first pass: CNPG has not dropped the
-                        // database yet, so its owner cannot go. The requeue
-                        // picks it up.
-                        warn!(%name, %ns, error = %e, "could not drop the groups yet");
-                    } else {
-                        info!(%name, %ns, "dropped the shared database's groups");
+                        // EXPECTED on the early passes, and the reason this
+                        // function reports completion at all. Until CNPG has
+                        // actually dropped the database, BOTH groups still
+                        // hold privileges inside it and `DROP ROLE` refuses
+                        // with `N objects in database …` — `DROP OWNED BY` is
+                        // per-database and cannot reach them from `postgres`.
+                        // Returning `false` holds the finalizer so the next
+                        // pass tries again.
+                        info!(%name, %ns, error = %e, "groups not droppable yet — the database is still there");
+                        return Ok(false);
                     }
+                    info!(%name, %ns, "dropped the shared database's groups");
                 }
                 Err(e) => {
-                    warn!(%name, %ns, error = %e, "platform role secret unreadable; groups left")
+                    // A secret we cannot read is not a reason to hold an
+                    // object in Terminating forever: the groups are two
+                    // NOLOGIN roles holding no data, and a delete that never
+                    // finishes is worse than two roles an operator can drop.
+                    warn!(%name, %ns, error = %e, "platform role secret unreadable; the groups are LEFT — drop them by hand");
                 }
             }
         }
@@ -1030,7 +1057,7 @@ async fn drop_backing(
                 st.and_then(|s| s.instance.clone()),
                 st.and_then(|s| s.dbnum).and_then(|n| u16::try_from(n).ok()),
             ) else {
-                return Ok(());
+                return Ok(true);
             };
             let df_ns = cfg
                 .pointer("/namespace")
@@ -1060,7 +1087,7 @@ async fn drop_backing(
         }
         _ => {}
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Which backing a status write carries: the caller's override, or — when

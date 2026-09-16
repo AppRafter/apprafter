@@ -53,17 +53,19 @@ psql_as() { # <role> <db> <sql>
         < /dev/null 2>&1
 }
 
-printf '=== 1/6  the statements, from the module itself ===\n'
+printf '=== 1/8  the statements, from the module itself ===\n'
 SQL=$(cd "${REPO_ROOT}/operator" && cargo test -q -p operator-controllers-resourceclaim-provisioner \
     print_statements_for_the_live_sql_check -- --ignored --nocapture 2>/dev/null \
     | sed -n '/-- @@SETUP/,/-- @@END/p')
 [ -n "$SQL" ] || fail "the builder test printed nothing — the statement source is missing"
 SETUP=$(printf '%s\n' "$SQL" | sed -n '/-- @@SETUP/,/-- @@INDB/p' | grep -v '^-- @@')
-INDB=$(printf '%s\n' "$SQL" | sed -n '/-- @@INDB/,/-- @@END/p' | grep -v '^-- @@')
+INDB=$(printf '%s\n' "$SQL" | sed -n '/-- @@INDB/,/-- @@UNBIND/p' | grep -v '^-- @@')
+UNBIND=$(printf '%s\n' "$SQL" | sed -n '/-- @@UNBIND/,/-- @@DROPGROUPS/p' | grep -v '^-- @@')
+DROPGROUPS=$(printf '%s\n' "$SQL" | sed -n '/-- @@DROPGROUPS/,/-- @@END/p' | grep -v '^-- @@')
 printf '  ok: %s setup statement(s), %s in-database statement(s)\n' \
     "$(printf '%s\n' "$SETUP" | grep -c .)" "$(printf '%s\n' "$INDB" | grep -c .)"
 
-printf '\n=== 2/6  a PostgreSQL of the operand major ===\n'
+printf '\n=== 2/8  a PostgreSQL of the operand major ===\n'
 "$BUILDER" rm -f "$CTR" >/dev/null 2>&1 || true
 # The port is published for step 6: rootless podman gives the container no
 # address of its own that the host can dial, so `inspect .IPAddress` is empty
@@ -76,14 +78,14 @@ done
 VER=$(psql_as postgres postgres "SELECT version()" | head -1)
 printf '  ok: %s\n' "${VER:0:40}"
 
-printf '\n=== 3/6  the platform role, as CNPG managed.roles would create it ===\n'
+printf '\n=== 3/8  the platform role, as CNPG managed.roles would create it ===\n'
 # The ONE role CNPG creates. Not a superuser — that is the point of the whole
 # arrangement, and step 5 asserts it again at the end.
 psql_as postgres postgres "CREATE ROLE apprafter_admin LOGIN PASSWORD 'a' CREATEROLE CREATEDB;" >/dev/null \
     || fail "creating the platform role"
 printf '  ok: apprafter_admin created with CREATEROLE CREATEDB, no superuser\n'
 
-printf '\n=== 4/6  the builders run, as apprafter_admin ===\n'
+printf '\n=== 4/8  the builders run, as apprafter_admin ===\n'
 printf '%s\n' "$SETUP" | while IFS= read -r stmt; do
     [ -n "$stmt" ] || continue
     out=$(psql_as apprafter_admin postgres "$stmt") || {
@@ -102,7 +104,7 @@ printf '%s\n' "$INDB" | while IFS= read -r stmt; do
 done || fail "in-database statements"
 printf '  ok: reader grants applied, three consumers bound\n'
 
-printf '\n=== 5/6  the property the role model exists for ===\n'
+printf '\n=== 5/8  the property the role model exists for ===\n'
 OWNER=$("$BUILDER" exec -e PGPASSWORD="$PW" "$CTR" psql -U claim_apps_web_pg -d shd_apps_orders \
     -h 127.0.0.1 -v ON_ERROR_STOP=1 -tAc \
     "CREATE TABLE orders(id int primary key, note text); INSERT INTO orders VALUES (1,'from-web'); \
@@ -135,7 +137,7 @@ SUPER=$(psql_as postgres postgres "SELECT rolsuper FROM pg_roles WHERE rolname='
 [ "$SUPER" = "f" ] || fail "the platform role ended up a superuser (${SUPER})"
 printf '  ok: the platform role is still not a superuser\n'
 
-printf '\n=== 6/6  the Rust client drives the same sequence ===\n'
+printf '\n=== 6/8  the Rust client drives the same sequence ===\n'
 # The steps above prove the STATEMENTS, by piping them through psql. This
 # proves the CLIENT: that execute_all sequences a batch the way psql does, that
 # a failure is attributed to the right statement INDEX, and that the error
@@ -150,5 +152,87 @@ case "$CLIENT_OUT" in
     *) printf '%s\n' "$CLIENT_OUT" | tail -20 >&2
        fail "the Postgres client smoke test did not pass" ;;
 esac
+
+printf '\n=== 7/8  the UNBIND, which had never been executed anywhere ===\n'
+# `unbind_consumer` was written, unit-tested for the SHAPE of its strings, and
+# left with no caller. When it finally got one, its first live run failed on
+# statement #0 — and `PgAdminError` could only render the cause as "db error",
+# so the walk that found it could not say why. This step runs it against the
+# same live server the rest of the file uses, where psql prints what Postgres
+# actually said.
+#
+# The consumer unbound here is the READ-ONLY one, deliberately: it holds group
+# membership and a GRANT but owns nothing, which is the case most likely to be
+# waved through by reasoning and is exactly half the matrix. The rw consumer
+# below owns the table created in step 5 and is the other half.
+printf '%s\n' "$UNBIND" | while IFS= read -r stmt; do
+    [ -n "$stmt" ] || continue
+    out=$(psql_as apprafter_admin shd_apps_orders "$stmt") || {
+        printf 'FAILED: the unbind was rejected: %s\n' "$out" >&2
+        exit 1
+    }
+done || fail "unbind statements"
+LEFT=$(psql_as apprafter_admin postgres \
+    "SELECT count(*) FROM pg_roles WHERE rolname = 'claim_apps_rep_pg';")
+[ "$LEFT" = "0" ] || fail "the ro consumer's role survived its unbind (count=${LEFT})"
+printf '  ok: the ro consumer role is gone\n'
+
+# The rw consumer OWNS the table from step 5 — through the group, which is the
+# whole design, so `DROP OWNED BY` must not take the table with it.
+RW_UNBIND=$(cd "${REPO_ROOT}/operator" && cargo test -q \
+    -p operator-controllers-resourceclaim-provisioner \
+    print_statements_for_the_live_sql_check -- --ignored --nocapture 2>/dev/null \
+    | sed -n '/-- @@UNBIND/,/-- @@DROPGROUPS/p' | grep -v '^-- @@' \
+    | sed 's/claim_apps_rep_pg/claim_apps_web_pg/g')
+printf '%s\n' "$RW_UNBIND" | while IFS= read -r stmt; do
+    [ -n "$stmt" ] || continue
+    out=$(psql_as apprafter_admin shd_apps_orders "$stmt") || {
+        printf 'FAILED: unbinding the rw consumer was rejected: %s\n' "$out" >&2
+        exit 1
+    }
+done || fail "rw unbind statements"
+SURVIVED=$(psql_as apprafter_admin shd_apps_orders \
+    "SELECT note FROM orders WHERE id=1;")
+[ "$SURVIVED" = "from-web" ] \
+    || fail "the shared table did not survive its creator's unbind (got '${SURVIVED}')"
+printf '  ok: the rw consumer is gone and the table it created is still there\n'
+
+printf '\n=== 8/8  the group drop, and why it cannot precede the database ===\n'
+# `drop_backing` declares the CNPG Database absent and then drops the groups,
+# and that order is forced twice over. The owning group OWNS the database, and
+# both groups hold privileges INSIDE it — `DROP OWNED BY` is per-database, so
+# running it from `postgres` cannot reach them and `DROP ROLE` then refuses
+# with `N objects in database …`.
+#
+# Asserting the refusal is the point of this step. Without it, a change that
+# dropped the groups first would pass every unit test, and in the operator it
+# would not merely fail: the delete path used to release the finalizer in the
+# same pass, so a group that could not be dropped leaked PERMANENTLY, on every
+# delete. The finalizer is now held until this completes.
+while IFS= read -r stmt; do
+    [ -n "$stmt" ] || continue
+    if psql_as apprafter_admin postgres "$stmt" >/dev/null 2>&1; then
+        fail "a group dropped while the shared database still exists — the order in drop_backing is not load-bearing after all, which contradicts its comment"
+    fi
+done <<EOF
+$DROPGROUPS
+EOF
+printf '  ok: neither group can be dropped while the database exists\n'
+
+out=$(psql_as apprafter_admin postgres "DROP DATABASE shd_apps_orders;") \
+    || fail "dropping the database was rejected: ${out}"
+printf '  ok: the database drops\n'
+
+printf '%s\n' "$DROPGROUPS" | while IFS= read -r stmt; do
+    [ -n "$stmt" ] || continue
+    out=$(psql_as apprafter_admin postgres "$stmt") || {
+        printf 'FAILED: a group drop was rejected after the database went: %s\n' "$out" >&2
+        exit 1
+    }
+done || fail "group drops"
+LEFT=$(psql_as apprafter_admin postgres \
+    "SELECT count(*) FROM pg_roles WHERE rolname LIKE 'shd_apps_orders%';")
+[ "$LEFT" = "0" ] || fail "a group survived the drop (count=${LEFT})"
+printf '  ok: both groups drop once the database is gone\n'
 
 printf '\nGREEN — the shared-database SQL builders and the client both execute.\n'

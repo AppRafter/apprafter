@@ -257,14 +257,33 @@ pub fn grant_reader(namespace: &str, shared_name: &str, database: &str) -> Vec<S
 /// the whole CRD exists to provide. Only this consumer's own role goes.
 pub fn unbind_consumer(consumer_role: &str) -> Vec<String> {
     vec![
-        // REASSIGN before DROP: a role that owns nothing still cannot be
-        // dropped while it holds privileges, and one that owns something must
-        // not take it with it. `SET ROLE` means the consumer should own
-        // nothing in practice, so this is the belt for the case where a
-        // consumer connected before the ALTER landed.
+        // GRANT first, and it is not a formality — it is the same distinction
+        // that corrected §3.1 of the ADR, arriving one function later.
+        //
+        // `apprafter_admin` CREATED this role, so it holds ADMIN OPTION on it.
+        // `REASSIGN OWNED BY` does not accept admin option: it wants the
+        // PRIVILEGES OF the role, i.e. membership. Measured on PostgreSQL
+        // 18.4 by `e2e/shared-pg-sql-check.sh` step 7, which is where this
+        // statement was executed for the first time:
+        //
+        //   ERROR:  permission denied to reassign objects
+        //   DETAIL: Only roles with privileges of role "claim_apps_rep_pg"
+        //           may reassign objects owned by it.
+        //
+        // Admin option is exactly the right to grant the role, so the platform
+        // role can give itself membership; it vanishes with the role two
+        // statements later.
+        //
+        // REASSIGN before DROP OWNED: a consumer should own nothing, because
+        // `SET ROLE` put everything it created under the group — but a
+        // consumer that connected before that ALTER landed would own tables,
+        // and `DROP OWNED BY` alone would DELETE them. Reassigning first means
+        // the worst case is an object that changes hands, not one that is
+        // destroyed with the application that happened to create it.
         format!(
             "DO $apprafter$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = {lit}) \
-             THEN EXECUTE format('REASSIGN OWNED BY %I TO CURRENT_USER', {lit}); \
+             THEN EXECUTE format('GRANT %I TO CURRENT_USER', {lit}); \
+             EXECUTE format('REASSIGN OWNED BY %I TO CURRENT_USER', {lit}); \
              EXECUTE format('DROP OWNED BY %I', {lit}); \
              EXECUTE format('DROP ROLE %I', {lit}); END IF; END $apprafter$;",
             lit = quote_literal(consumer_role)
@@ -561,6 +580,22 @@ mod tests {
             for s in bind_consumer(ns, shared, role, &db, "p'w$$q", access) {
                 println!("{s}");
             }
+        }
+        // The UNBIND, which had never been executed anywhere. It was written,
+        // unit-tested for the shape of its strings, given no caller, and then
+        // given one — and the first live run failed on statement #0 with an
+        // error the type could only render as "db error". Printing it here
+        // puts it on the same live server as everything above, a minute's
+        // cycle instead of a walk's.
+        println!("-- @@UNBIND");
+        for s in unbind_consumer("claim_apps_rep_pg") {
+            println!("{s}");
+        }
+        // ...and the group drop, for the same reason: `drop_backing`'s doc
+        // comment described it long before a builder existed.
+        println!("-- @@DROPGROUPS");
+        for s in drop_groups(ns, shared) {
+            println!("{s}");
         }
         println!("-- @@END");
     }
