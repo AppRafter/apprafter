@@ -121,12 +121,19 @@ KUBECONFIG_FILE="${TMPDIR_WORK}/kubeconfig"
 
 cleanup() {
     if [ "$FAILED" = "1" ]; then
-        printf '\n----- diagnostics -----\n' >&2
+        printf '\n%s\n' '----- diagnostics -----' >&2
         kubectl -n "$APP_NS" get "$SHDB_RES" -o yaml >&2 2>&1 || true
         kubectl -n "$APP_NS" get "$CLAIM_RES" -o wide >&2 2>&1 || true
-        kubectl -n "$PLATFORM_NS" logs deploy/apprafter-operator --tail=120 >&2 2>&1 || true
+        # BY LABEL and prefixed, not `deploy/…`. With two pods mid-rollout
+        # `logs deploy/x` picks one, and run 10 got the DYING one — a log that
+        # stopped mid-startup, which read as an operator that had reconciled
+        # nothing when in fact it had been replaced.
+        kubectl -n "$PLATFORM_NS" logs -l app.kubernetes.io/name=apprafter-operator \
+            --prefix --tail=200 >&2 2>&1 || true
+        kubectl -n "$PLATFORM_NS" get pods -l app.kubernetes.io/name=apprafter-operator \
+            -o wide >&2 2>&1 || true
         kubectl -n "$CNPG_NS" get cluster,database >&2 2>&1 || true
-        printf '----- end diagnostics -----\n' >&2
+        printf '%s\n' '----- end diagnostics -----' >&2
     fi
     if [ "$K3D_CREATED" = "1" ]; then
         if [ -z "${APPRAFTER_E2E_SKIP_DESTROY:-}" ]; then
@@ -258,16 +265,29 @@ printf '  cluster-bootstrap complete\n'
 # ===============================================================
 phase "Phase 1b: build + load the working-tree operator + webhook"
 # ===============================================================
-build_load_restart apprafter-operator apprafter-operator
-build_load_restart admission-webhook admission-webhook
-
-# Argo CD owns the operator CRDs, so pause its sync before applying the
-# branch ones — otherwise it reverts them to the published set, which has no
-# SharedDatabase at all and the walk fails on a CRD that briefly existed.
+# ARGO CD'S SYNC GOES OFF FIRST, BEFORE ANYTHING IS BUILT, AND IS VERIFIED.
+#
+# It used to be switched off after the two image builds, which take minutes —
+# and Argo CD spent those minutes re-syncing the operator Application it owns,
+# undoing the branch CRDs and the branch ClusterRole as fast as they were
+# applied and rolling the Deployment underneath. Run 10 read a dying pod's log
+# that stopped mid-startup and reported a SharedDatabase nothing had
+# reconciled; run 5 saw the ClusterRole lose `shareddatabases` after the
+# database had already provisioned on it. Both were this.
+#
+# Verified rather than assumed, because the patch was `|| true` and silent: a
+# walk whose setup can fail invisibly spends its runs diagnosing the platform
+# for faults in itself.
 for _app in platform apprafter-operator; do
     kubectl -n argocd patch application.argoproj.io "$_app" --type=merge \
         -p '{"spec":{"syncPolicy":{"automated":null}}}' >/dev/null 2>&1 || true
+    _auto=$(kubectl -n argocd get application.argoproj.io "$_app" \
+        -o jsonpath='{.spec.syncPolicy.automated}' 2>/dev/null || true)
+    check "Argo CD auto-sync is off for ${_app}" "$_auto" ""
 done
+
+build_load_restart apprafter-operator apprafter-operator
+build_load_restart admission-webhook admission-webhook
 apply_branch_operator_crds
 for _crd in applications serviceproviders resourceclaims shareddatabases; do
     retry 12 5 -- kubectl wait --for=condition=Established \
