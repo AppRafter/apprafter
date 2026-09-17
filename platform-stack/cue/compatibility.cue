@@ -1934,6 +1934,78 @@ compatibility: "0.2.74": {
 	]
 }
 
+compatibility: "0.2.75": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.50"
+	notes: """
+		THE SYNC WAVES NOW ORDER SOMETHING. Since 0.2.30 they did not.
+
+		Argo CD dropped the health assessment of `argoproj.io/Application`
+		in 1.8 and v2.13.1 — what chart 7.7.7 ships — still has none, in
+		Lua or in Go. gitops-engine counts a resource with no health
+		assessment as finished the moment its apply returns, so a wave
+		made only of child Applications completed instantly and the next
+		wave began after the bare 2s `ARGOCD_SYNC_WAVE_DELAY`. Every
+		`syncWave` in this chart was decoration. `argocd-cm` now carries
+		the Lua script Argo CD's own operator manual prescribes for
+		"app-of-apps pattern and orchestrating synchronization using sync
+		waves", and the same key ships in the CLI loader's Argo CD install
+		— the FIRST root sync, the one that decides the order, runs before
+		this component has adopted anything.
+
+		THE KEY WAS HERE BEFORE. 0.2.26 added `argoproj.io_Application`
+		for an unrelated reason (an ADR 0048 banner on the root tile) and
+		0.2.30 removed it as dead, correctly: Argo applies it only to
+		Applications appearing as CHILDREN of another app, never to a
+		top-level app's own tile. Dead for the banner; load-bearing for
+		the waves, because the wave gate reads child health. That script
+		had the same `obj.status.health.status` fall-through as this one,
+		so the ordering worked from 0.2.26 to 0.2.29 and stopped at
+		0.2.30 — and since it never shipped in the loader, a FRESH
+		bootstrap raced in every one of those versions too.
+
+		WHAT WAS BROKEN. `gateway-api-crds` (wave -25) and `cilium` (-20)
+		raced: a git clone of kubernetes-sigs/gateway-api against a helm
+		pull of the cilium chart. On the runs cilium won, its pods rolled
+		with `enable-gateway-api=true` and no Gateway API CRDs in the
+		cluster, cilium-operator logged `Required GatewayAPI resources are
+		not found` and never registered its Gateway API controller, and no
+		Gateway ever reached Programmed — while every Argo CD Application
+		reported Synced/Healthy. Measured on kind+Cilium by
+		`e2e/gateway-order-probe.sh`: pods at 14:40:12-14, CRDs at
+		14:40:15. With the fix the cilium Application is not even CREATED
+		until gateway-api-crds reports Succeeded — a 20s margin — and the
+		Gateway reaches `Programmed=True`.
+
+		WHAT AN UPGRADING CLUSTER SEES. The argocd pods roll (the chart
+		stamps a cm checksum). No user workload restarts, no CRD moves.
+		The root `platform` Application's health now aggregates its
+		children's, so it reads Healthy only once every component really
+		is — the false-positive Healthy window `cluster-bootstrap` step 4c
+		works around. The corollary is the one to watch: a component stuck
+		Degraded now holds every LATER wave instead of being stepped over.
+		That is correct GitOps and a wider blast radius than before, so on
+		a cluster with a known-sick component, fix it before upgrading.
+
+		One ADR 0048 side effect. The root tile's health is the worst-of
+		aggregate over its managed `.status.resources`, and child
+		Applications now carry health, so the anchor ConfigMap's
+		`Suspended` — the purple "upgrade pending approval" nudge — can be
+		masked by any child that is merely Progressing. The approval path
+		itself is untouched: `apprafter migration approve` and the
+		MigrationPlan node in the tree work exactly as before.
+
+		A cluster already serving public traffic is unaffected — its
+		Gateway is Programmed, which is only reachable if the ordering
+		went its way. This bites fresh bootstraps, and it bit them at
+		about a coin flip.
+		"""
+	references: [
+		"e2e/gateway-order-probe.sh",
+		"docs/changelog/UNRELEASED.md",
+	]
+}
+
 compatibility: "0.2.73": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.49"

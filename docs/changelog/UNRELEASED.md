@@ -9,6 +9,72 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## platform-stack 0.2.75 / cli v0.2.73 — the sync waves order something again (unreleased)
+
+### Fixed
+
+- **A freshly bootstrapped cluster could come up with an ingress that can
+  never serve a request, and report itself healthy the whole way.** The
+  `gateway-api-crds` component syncs at wave -25 and `cilium` at -20 so that
+  Cilium's Gateway API controller starts in a cluster where the Gateway API
+  CRDs already exist. That ordering was not being enforced, so the two raced
+  — a git clone of `kubernetes-sigs/gateway-api` against a Helm pull of the
+  cilium chart — and the runs cilium won produced a cluster where nothing
+  listens.
+
+  Argo CD has no health assessment for `argoproj.io/Application`: it was
+  removed in 1.8 and v2.13.1, which chart 7.7.7 ships, has no replacement in
+  Lua or in Go. gitops-engine counts a resource with no health assessment as
+  finished the moment its apply returns, so a wave made only of child
+  Applications completed instantly and the next began after the bare 2s
+  `ARGOCD_SYNC_WAVE_DELAY`. Every `syncWave` in the chart was decoration —
+  including `cert-manager` at -10 and the VPA CRDs at -4, which
+  `component_vpa.cue` calls "the ONLY ordering constraint".
+
+  `argocd-cm` now carries the Lua script Argo CD's operator manual prescribes
+  for exactly this pattern, and it ships in the CLI loader's Argo CD install
+  as well as in the component — the first root sync, the one that decides the
+  -25/-20 order, runs before the `argocd` component has adopted anything.
+
+  Measured on a real kind+Cilium cluster with `e2e/gateway-order-probe.sh`.
+  Before: the cilium pods rolled at 14:40:12-14, the CRDs landed at 14:40:15,
+  cilium-operator logged `Required GatewayAPI resources are not found` and
+  never registered its Gateway API controller, a Gateway sat at
+  `Programmed=Unknown(Pending)` for three minutes, and all twelve Argo CD
+  Applications read `Synced/Healthy`. After: the `cilium` Application is not
+  created until `gateway-api-crds` reports `Succeeded` — a 20-second margin —
+  the operator goes straight on to `Starting Controller … Gateway`, and the
+  Gateway reaches `Programmed=True`.
+
+  This is what the `cluster-bootstrap` ingress gate added in v0.2.72 was
+  built to catch, and it caught it on its first two nights in CI: the
+  nightly Hetzner e2e and the kind+Cilium networkpolicy e2e both failed with
+  `these cilium pods started BEFORE the Gateway API CRDs existed`. The gate
+  was right.
+
+  The key had been in the chart before. 0.2.26 added it to render an
+  [ADR 0048] banner on the root tile and 0.2.30 removed it as dead, on a
+  correct finding — Argo applies the customization only to Applications
+  appearing as *children* of another app, never to a top-level app's own
+  tile. Dead for the banner; load-bearing for the waves, which read exactly
+  that child health. Its fall-through was the same one, so the ordering held
+  from 0.2.26 to 0.2.29 and stopped at 0.2.30. It never shipped in the
+  loader, so a fresh bootstrap raced in those versions too.
+
+  Two consequences on an upgrading cluster, neither of which touches a user
+  workload. The root `platform` Application's health now aggregates its
+  children's, so it reads `Healthy` only once every component really is —
+  and a component stuck `Degraded` now holds every later wave instead of
+  being stepped over. And because the root tile is a worst-of aggregate, the
+  [ADR 0048] anchor's `Suspended` nudge can be masked by any child that is
+  merely `Progressing`; the approval path itself is unchanged.
+
+  `e2e/gateway-order-probe.sh` is the reproduction, and it reads the
+  cilium-operator's own log rather than only the exit code — the two ways
+  a run can end green are not the same fact.
+
+[ADR 0048]: ../adr/0048-argo-platform-upgrade-approval-surface.md
+
 ## Unreleased — health checks, JetStream tuning, and the start of shared databases (plan 2.28 + 2.29)
 
 Not yet cut: 2.28 and 2.29 ship as one release pack, because both change the
