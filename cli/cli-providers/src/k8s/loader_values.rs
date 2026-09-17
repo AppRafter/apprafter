@@ -67,6 +67,32 @@ mod tests {
     }
 
     #[test]
+    fn argocd_loader_values_restore_application_health_for_sync_waves() {
+        // Argo CD removed the `argoproj.io/Application` health assessment in
+        // 1.8 and v2.13.1 still ships none, so gitops-engine completes a
+        // child-Application sync task the instant its apply succeeds and a
+        // wave made of child Applications never waits for anything. Without
+        // this key the chart's declared `syncWave` order is decoration:
+        // `gateway-api-crds` (-25) and `cilium` (-20) are applied ~2s apart
+        // and race, and the run where cilium wins has a cilium-operator that
+        // logged `Required GatewayAPI resources are not found` and a cluster
+        // whose ingress can never serve a request — while every Argo CD
+        // Application reads Synced/Healthy. Measured on a real kind+Cilium
+        // cluster by `e2e/gateway-order-probe.sh`.
+        //
+        // Pinned in the LOADER constant specifically: the first root sync —
+        // the one that decides that order — runs under the Argo CD
+        // `cluster-bootstrap` helm-installs, so losing the key here reopens
+        // the race even if `component_argocd.cue` still carries it.
+        assert!(
+            ARGOCD_LOADER_VALUES_YAML
+                .contains("resource.customizations.health.argoproj.io_Application"),
+            "missing the argoproj.io/Application health check — the chart's sync waves \
+             stop ordering anything:\n{ARGOCD_LOADER_VALUES_YAML}"
+        );
+    }
+
+    #[test]
     fn loader_values_are_non_empty_yaml() {
         // Sanity guard — build.rs must have produced non-empty
         // output. An empty / whitespace-only constant would mean

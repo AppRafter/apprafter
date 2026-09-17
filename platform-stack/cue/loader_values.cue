@@ -142,6 +142,89 @@ _loaderValues: {
 				// manifests at sync-wave -30. Each definition
 				// is byte-identical between the two paths.
 				projects: _appProjects
+
+				// THE SYNC WAVES DO NOT WORK WITHOUT THIS.
+				//
+				// Argo CD removed the health assessment of
+				// `argoproj.io/Application` in 1.8 (argoproj/argo-cd#3781)
+				// and never replaced it: v2.13.1 — the version chart 7.7.7
+				// ships — carries `resource_customizations/argoproj.io/`
+				// entries for AnalysisRun, ApplicationSet, CronWorkflow,
+				// EventBus, Experiment, Rollout and WorkflowTemplate, and
+				// none for Application; it is not in the Go-based health
+				// list either. gitops-engine treats a resource with NO
+				// health assessment as complete the moment its apply
+				// succeeds, so a wave containing only child Applications
+				// finishes instantly and the next wave starts after the
+				// bare `ARGOCD_SYNC_WAVE_DELAY` (2s). Argo CD's own
+				// operator manual prescribes exactly this Lua script for
+				// "app-of-apps pattern and orchestrating synchronization
+				// using sync waves".
+				//
+				// What that cost us, measured on a real kind+Cilium cluster
+				// (`e2e/gateway-order-probe.sh`): `cilium` (wave -20) rolled
+				// its pods at 14:40:12-14 and `gateway-api-crds` (wave -25)
+				// created the CRDs at 14:40:15 — two seconds LATE. The
+				// cilium-operator logged `Required GatewayAPI resources are
+				// not found` and never registered its Gateway API
+				// controller, so no Gateway ever reached Programmed — while
+				// every Argo CD Application reported Synced/Healthy. Which
+				// side of that boundary wins is a coin flip between a git
+				// clone of kubernetes-sigs/gateway-api and a helm pull of
+				// the cilium chart; the nightly Hetzner e2e and the
+				// kind+Cilium networkpolicy e2e lost it on every run.
+				//
+				// This lives in the LOADER values, not only in
+				// `component_argocd.cue`, because the FIRST root sync — the
+				// one that decides the -25/-20 order — runs under the Argo
+				// CD that `cluster-bootstrap` helm-installs, before the
+				// `argocd` component has adopted anything. The component
+				// inherits it for free: its `values` are
+				// `_loaderValues.argocd.values & {…}`.
+				//
+				// DO NOT DELETE THIS AS DEAD. It has been deleted once, and
+				// the reasoning was sound for the thing it was judged on.
+				// `argoproj.io_Application` was added in 0.2.26 (a26fe6f) to
+				// render an ADR 0048 "platform update pending approval"
+				// banner on the ROOT app's tile, and removed in 0.2.30
+				// (5b69f41) once a kind+Argo experiment disproved that:
+				// Argo applies the customization only to Applications that
+				// appear as CHILDREN in another app's tree, never to a
+				// top-level app's own tile. True, and it is exactly why the
+				// key belongs here — the wave gate reads CHILD health, which
+				// is the half that always worked. That banner script carried
+				// the same `obj.status.health.status` fall-through as this
+				// one, so from 0.2.26 to 0.2.29 the waves quietly ordered and
+				// from 0.2.30 they quietly stopped; it was never in the
+				// loader, so a FRESH bootstrap raced either way.
+				//
+				// What a child Application carrying health changes, since
+				// the root tile is a worst-of aggregate over its managed
+				// `.status.resources`. The root `platform` App reports
+				// Healthy only once every component really is — that is the
+				// point, it is the false-positive Healthy window
+				// `cluster-bootstrap` step 4c already works around — but a
+				// component stuck Degraded now holds every LATER wave rather
+				// than being stepped over, which is correct GitOps and a
+				// wider blast radius than before. And the ADR 0048 anchor
+				// ConfigMap's `Suspended` can now be masked by any child
+				// that is merely Progressing: the same masking limit already
+				// documented on the pin branch in `component_argocd.cue`,
+				// with more ways to trigger it.
+				cm: "resource.customizations.health.argoproj.io_Application": """
+					hs = {}
+					hs.status = "Progressing"
+					hs.message = ""
+					if obj.status ~= nil then
+					  if obj.status.health ~= nil then
+					    hs.status = obj.status.health.status
+					    if obj.status.health.message ~= nil then
+					      hs.message = obj.status.health.message
+					    end
+					  end
+					end
+					return hs
+					"""
 			}
 			repoServer: replicas: 1
 		}
