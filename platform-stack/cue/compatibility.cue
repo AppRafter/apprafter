@@ -1938,6 +1938,72 @@ compatibility: "0.2.77": {
 	change:          "safe"
 	operatorVersion: "v0.2.50"
 	notes: """
+		`needs.jetstream` DID NOT WORK ON ANY CLUSTER, and had not since
+		it shipped. Take this release if you use it.
+
+		Provisioning a jetstream claim merge-patches
+		`PlatformStack.spec.overrides.nats.enabled = true`, and both
+		`component_nack.cue` and ADR 0061 §1 state that this one key
+		covers the `nats` server AND the `nack` controller: "one override
+		covers both components; there is no separate `overrides.nack`".
+		The chart never implemented that. `templates/applications.yaml`
+		resolves an override by component NAME (`index $overrides
+		$name`), so `overrides.nats` never reached the component called
+		`nack`, its literal `enabled: false` stood, and the
+		`jetstream.nats.io` CRDs were never installed.
+
+		The visible end of it: every jetstream claim parks at
+		`Ready=False AwaitingNackCrds`, "waiting for the jetstream.nats.io
+		CRDs (the nack component) to be Established" — whose own doc
+		comment calls it transient and expects it to clear inside the
+		bootstrap window. Nothing was coming. Everything UPSTREAM of it
+		works and makes this hard to read: the account is rendered, the
+		NATS StatefulSet is Ready, the user authenticates and its account
+		has JetStream. Only the controller that would create declared
+		streams is absent — and the gate is unconditional, so a claim
+		declaring NO streams (an application that only publishes) is held
+		by it too.
+
+		THE FIX: `#Component.enabledFrom`. A component names another whose
+		`overrides.<name>.enabled` also governs it; `nack` declares
+		`enabledFrom: "nats"`. Precedence narrowest-first — a component's
+		own `overrides.<self>.enabled` still wins, in both directions, so
+		pinning one half of a pair stays possible. Declared rather than
+		special-cased in the template, because a name-specific branch in a
+		generic loop is a second invisible contract and this one already
+		cost four releases. It also fixes the HUMAN path: an operator
+		writing `overrides.nats.enabled: true` by hand — what every
+		comment tells them to do — now gets nack.
+
+		WHY NOTHING CAUGHT IT. `cue vet` is happy with `enabled: false`;
+		`helm lint` renders DEFAULT values, where nack is correctly
+		absent; and `e2e/needs-jetstream-walk.sh` applies the nats and
+		nack charts BY HAND, saying so in its header and dismissing "does
+		PlatformStack render a nats/nack Application from an override" as
+		"generic platform-stack plumbing already exercised by every other
+		component". It was not generic — nack is the only component here
+		whose enablement was meant to come from a DIFFERENT component's
+		key — and it was the one question the substitution carved out.
+		`scripts/check-component-enablement.sh` now renders the chart with
+		the exact override the provisioner writes and asserts both halves
+		appear, plus both precedence directions and the disable arm.
+
+		WHAT AN UPGRADING CLUSTER SEES. If a jetstream claim ever
+		provisioned, its PlatformStack already carries
+		`overrides.nats.enabled: true` — so on this upgrade the `nack`
+		Application appears, the CRDs install, and the parked claims
+		finish on their next 30s requeue. No manual step. A cluster that
+		never used `needs.jetstream` sees nothing.
+
+		To unblock before taking this release, add the missing key by
+		hand; it stays correct afterwards, since an explicit
+		`overrides.nack` wins either way:
+
+		    kubectl -n apprafter-system patch platformstack default \\
+		      --type merge -p '{"spec":{"overrides":{"nack":{"enabled":true}}}}'
+
+		─────────────────────────────────────────────────────────────
+
 		AN APPLICATION HELD BY THE OPERATOR READ AS ONE IN FLIGHT.
 		`argocd-cm`'s health script for `apprafter.io/Application`
 		handled two of the operator's five phases. The other three —

@@ -787,6 +787,12 @@ _applicationsTemplate: """
 	{{- range $name, $component := .Values.components }}
 	{{- $override := default (dict) (index $overrides $name) }}
 	{{- $enabled := $component.enabled }}
+	{{- if hasKey $component "enabledFrom" }}
+	{{- $from := default (dict) (index $overrides $component.enabledFrom) }}
+	{{- if hasKey $from "enabled" }}
+	{{- $enabled = $from.enabled }}
+	{{- end }}
+	{{- end }}
 	{{- if hasKey $override "enabled" }}
 	{{- $enabled = $override.enabled }}
 	{{- end }}

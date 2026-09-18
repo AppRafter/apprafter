@@ -133,6 +133,38 @@ package platformstack
 	// syncs.
 	project: string & =~"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$" | *"platform"
 
+	// Another component whose `overrides.<name>.enabled` ALSO
+	// governs this one.
+	//
+	// The template resolves an override by component NAME
+	// (`index $overrides $name`), so a component meant to be
+	// switched on together with a different one had no way to say
+	// so — and `nack` was written on the assumption that it did.
+	// `component_nack.cue` stated outright that
+	// `PlatformStack.spec.overrides.nats.enabled` was "one
+	// override covers both components; there is no separate
+	// `overrides.nack`", the provisioner's `ensure_nats_component
+	// _enabled` patches exactly that one key, and the template
+	// looked up `overrides.nack`, found nothing, and kept nack's
+	// literal `enabled: false`. So the `jetstream.nats.io` CRDs
+	// were never installed on any cluster, and every jetstream
+	// claim sat at `AwaitingNackCrds` — a reason whose own message
+	// says "waiting … to be Established", forever.
+	//
+	// Declared here rather than special-cased in the template
+	// because a name-specific branch in a generic loop is a second
+	// invisible contract, and this one already cost a subphase.
+	// It also fixes the HUMAN path, not only the provisioner's: an
+	// operator who writes `overrides.nats.enabled: true` by hand —
+	// which is what every comment and ADR 0061 §1 tell them to do
+	// — now gets nack too.
+	//
+	// Precedence, narrowest first: this component's OWN
+	// `overrides.<self>.enabled` wins if present, then the
+	// `enabledFrom` component's, then the literal below. So an
+	// operator can still pin one of a pair independently.
+	enabledFrom?: string & =~"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$"
+
 	// Argo CD sync-wave for the rendered Application. Argo CD
 	// sorts Applications by `argocd.argoproj.io/sync-wave`
 	// annotation ascending; a wave starts only after the

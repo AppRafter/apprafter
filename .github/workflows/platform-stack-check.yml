@@ -45,6 +45,7 @@ on:
       - 'scripts/check-version-coherence.sh'
       - 'scripts/check-platform-stack-version.sh'
       - 'scripts/check-gateway-render.sh'
+      - 'scripts/check-component-enablement.sh'
       - '.github/workflows/platform-stack-check.yml'
       - '.github/workflows/platform-stack-publish.yml'
   push:
@@ -56,6 +57,7 @@ on:
       - 'scripts/check-version-coherence.sh'
       - 'scripts/check-platform-stack-version.sh'
       - 'scripts/check-gateway-render.sh'
+      - 'scripts/check-component-enablement.sh'
       - '.github/workflows/platform-stack-check.yml'
       - '.github/workflows/platform-stack-publish.yml'
 
@@ -174,6 +176,15 @@ jobs:
             echo "::error::tier-2 render did not enable backstage"
             exit 1
           }
+
+      - name: Component enablement assertions (an override reaches what it names)
+        # `needs.jetstream` did not work on any cluster for four releases:
+        # the provisioner patches `overrides.nats.enabled=true`, the chart
+        # resolves overrides by component NAME, and `nack` — whose comment
+        # and ADR both said that one key covered it — kept its literal
+        # `enabled: false`. No other gate renders the chart with the
+        # override the running system writes, so none of them saw it.
+        run: bash scripts/check-component-enablement.sh
 
       - name: Gateway render assertions (1.83a public ingress)
         # Pins the host-network public-ingress contract: the platform

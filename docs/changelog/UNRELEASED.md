@@ -13,6 +13,74 @@ patch of each phase.
 
 ### Fixed
 
+- **`needs.jetstream` did not work on any cluster, and had not since it
+  shipped.** Provisioning a jetstream claim merge-patches
+  `PlatformStack.spec.overrides.nats.enabled = true`, and both
+  `component_nack.cue` and [ADR 0061] §1 state that this single key covers the
+  `nats` server *and* the `nack` controller — "one override covers both
+  components; there is no separate `overrides.nack`". The chart never
+  implemented that sentence. `templates/applications.yaml` resolves an
+  override by component **name** (`index $overrides $name`), so
+  `overrides.nats` never reached the component called `nack`, its literal
+  `enabled: false` stood, and the `jetstream.nats.io` CRDs were never
+  installed anywhere.
+
+  What that looks like from a cluster: every jetstream claim parks at
+
+  ```text
+  Ready=False AwaitingNackCrds: waiting for the jetstream.nats.io CRDs
+  (the nack component) to be Established
+  ```
+
+  — a reason whose own doc comment calls it transient and expects it to clear
+  inside the bootstrap window. Nothing was coming.
+
+  Everything upstream of it works, which is what makes the state hard to read:
+  the accounts file is rendered, the NATS StatefulSet is Ready, the user
+  authenticates and its account has JetStream. Only the controller that would
+  create declared streams is absent. And the gate is unconditional, so a claim
+  that declares **no** streams at all — an application that only publishes on
+  its own prefix — is held by it too.
+
+  `#Component.enabledFrom` makes the contract real: a component names another
+  whose `overrides.<name>.enabled` also governs it, and `nack` declares
+  `enabledFrom: "nats"`. Precedence is narrowest-first, so a component's own
+  `overrides.<self>.enabled` still wins in both directions and pinning one
+  half of a pair stays possible. Declared rather than special-cased in the
+  template, because a name-specific branch inside a generic loop is a second
+  invisible contract and this one already cost four releases. It fixes the
+  human path as well as the provisioner's: an operator who writes
+  `overrides.nats.enabled: true` by hand — which is what every comment and the
+  ADR tell them to do — now gets nack.
+
+  **Why nothing caught it.** `cue vet` type-checks the component and is
+  content with `enabled: false`. `helm lint` renders default values, where
+  nack is correctly absent. And `e2e/needs-jetstream-walk.sh` applies the nats
+  and nack charts **by hand**, states so in its header, and dismisses the
+  remaining question — "does PlatformStack render a nats/nack Application from
+  an override against a published chart" — as "generic platform-stack plumbing
+  already exercised by every other component". It was not generic: `nack` is
+  the only component in this chart whose enablement was designed to come from
+  a *different* component's key, and that was precisely the question the
+  substitution carved out. `scripts/check-component-enablement.sh` now renders
+  the chart with the exact override the provisioner writes and asserts both
+  halves appear, along with both precedence directions and the disable arm;
+  it runs in `just lint` and in `platform-stack-check.yml`.
+
+  **On upgrade**, a cluster whose PlatformStack already carries
+  `overrides.nats.enabled: true` — any cluster where a jetstream claim was
+  ever attempted — gets the `nack` Application, the CRDs install, and the
+  parked claims finish on their next 30-second requeue. No manual step. To
+  unblock before taking the release, add the missing key by hand; it stays
+  correct afterwards, since an explicit `overrides.nack` wins either way:
+
+  ```sh
+  kubectl -n apprafter-system patch platformstack default \
+    --type merge -p '{"spec":{"overrides":{"nack":{"enabled":true}}}}'
+  ```
+
+[ADR 0061]: ../adr/0061-needs-jetstream-nats.md
+
 - **An application the operator was deliberately holding read on the Argo CD
   tile as one merely in flight, indefinitely.** The `argocd-cm` health script
   for `apprafter.io/Application` handled two of the operator's five phases.

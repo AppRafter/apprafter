@@ -37,6 +37,7 @@ lint:
     ./scripts/check-argocd-cue-cmp-drift.sh
     ./scripts/check-cue-cmp-mirror.sh
     ./scripts/check-argocd-health-lua.sh
+    ./scripts/check-component-enablement.sh
     ./scripts/check-version-coherence.sh
     ./scripts/check-plan-checkboxes.sh
     # `docs-check.sh` byte-compares the generated CLI reference against a

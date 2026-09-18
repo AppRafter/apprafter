@@ -16,6 +16,23 @@ package platformstack
 // (`PlatformStack.spec.overrides.nats.enabled` — one override covers
 // both components; there is no separate `overrides.nack`).
 //
+// 0.2.77: that sentence was true of the DESIGN and false of the chart.
+// The template resolves an override by component NAME, so
+// `overrides.nats` never reached this component, `enabled` stayed the
+// literal `false` below, the `jetstream.nats.io` CRDs were never
+// installed on any cluster, and every `needs.jetstream` claim sat at
+// `AwaitingNackCrds` forever — a reason whose message reads "waiting …
+// to be Established" and whose own doc comment calls it transient. The
+// 2.5e walk could not catch it: it applies the nats AND nack charts by
+// hand and says so, dismissing "does PlatformController render a
+// nats/nack Application from an override" as generic plumbing already
+// covered elsewhere. It was not generic — nack is the only component
+// in this chart whose enablement was meant to come from a DIFFERENT
+// component's key — and it was the one question the substitution
+// carved out.
+//
+// `enabledFrom` below makes that contract real instead of asserted.
+//
 // Chart `nack` from the same repo as `nats`
 // (https://nats-io.github.io/k8s/helm/charts/), version 0.35.0
 // (`helm search repo nats/`, appVersion 0.24.0 — image
@@ -24,10 +41,14 @@ package platformstack
 // accounts Secret, the `mgr_<ns>` credential AND the NACK CRs there
 // together.
 _components: "nack": #Component & {
-	name:      "nack"
-	enabled:   false
-	namespace: "nats-system"
-	project:   "platform-providers"
+	name:    "nack"
+	enabled: false
+	// The key the provisioner and ADR 0061 §1 both name. Without this the
+	// literal above is the whole story and nack never installs — see the
+	// 0.2.77 note in this file's header.
+	enabledFrom: "nats"
+	namespace:   "nats-system"
+	project:     "platform-providers"
 	source: {
 		repoURL: "https://nats-io.github.io/k8s/helm/charts/"
 		chart:   "nack"
