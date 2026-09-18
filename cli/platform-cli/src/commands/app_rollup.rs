@@ -117,8 +117,12 @@ pub(crate) fn print_problem_applications(
     let live = live_applications(crs);
     let rows = problem_app_rows(&live, argo, now);
     if rows.is_empty() {
+        // Two sources, two scopes, and the line says so. A held reconcile is
+        // reported however old it is; the ledger is windowed, and a bare
+        // "none reporting problems (last 24h)" would leave a reader unsure
+        // whether an application stuck since Tuesday had simply aged out.
         println!(
-            "Applications: {} checked, none reporting problems ({}).",
+            "Applications: {} checked, none held, none reporting problems ({}).",
             live.len(),
             crate::commands::app::problem_window_label()
         );
@@ -268,6 +272,7 @@ pub(crate) fn problem_app_rows(crs: &[&Value], argo: &[Value], now: &DateTime<Ut
     let mut rows: Vec<(i64, String)> = Vec::new();
     for cr in crs {
         let problems = crate::commands::app::live_problems(cr, now);
+        let held = crate::commands::app::held_reconcile(cr, now);
         // The FRESHEST entry, explicitly — never `problems.first()`. The
         // operator writes `recentProblems` sorted by `firstSeen` ASCENDING
         // (`ProblemLedger::snapshot`), so element 0 is the problem that
@@ -276,9 +281,10 @@ pub(crate) fn problem_app_rows(crs: &[&Value], argo: &[Value], now: &DateTime<Ut
         // hide the live one behind "(+N more)" — and, because the same entry
         // is the sort key, would file the whole application in the wrong place
         // under a heading that promises "most recent first".
-        let Some(newest) = problems.iter().min_by_key(|p| p.age) else {
+        let newest = problems.iter().min_by_key(|p| p.age);
+        if newest.is_none() && held.is_none() {
             continue;
-        };
+        }
         let ns = cr
             .pointer("/metadata/namespace")
             .and_then(Value::as_str)
@@ -307,6 +313,29 @@ pub(crate) fn problem_app_rows(crs: &[&Value], argo: &[Value], now: &DateTime<Ut
                 " — claimed by no registered application (it may not have synced yet)".to_string(),
             ),
         };
+        // A HELD reconcile outranks anything in the ledger, and is not merely
+        // added beside it. The ledger describes a running application hitting
+        // something; a hold means the operator never applied the workload at
+        // all, so nothing in the ledger can be the thing to fix first. The
+        // ledger's entries are still counted, never dropped.
+        if let Some((reason, message, age)) = held {
+            let more = if problems.is_empty() {
+                String::new()
+            } else {
+                format!(" (+{} more)", problems.len())
+            };
+            // The message can be several joined diagnostics; a roll-up row is
+            // one line per application by construction, so it carries the
+            // first and sends the reader to `app status` for the rest — which
+            // is the line already printed under every roll-up.
+            let head = message.split("; ").next().unwrap_or(message).trim();
+            rows.push((
+                age,
+                format!("{identity}  {reason} (held): {head}{more}{suffix}"),
+            ));
+            continue;
+        }
+        let newest = newest.expect("checked non-empty above");
         // The newest surviving entry carries the row; the rest are counted.
         // A row per entry would put five lines on one application and bury
         // the other applications that are also broken.
@@ -604,6 +633,122 @@ mod tests {
         let rows = problem_app_rows(&[&cr], &argo, &t("2026-09-01T10:06:00+00:00"));
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert!(rows[0].contains("(+2 more)"), "{rows:?}");
+    }
+
+    /// An AppRafter CR the operator is deliberately holding: the shape every
+    /// held phase writes — `Ready=False`, `reason` = the phase, `message`
+    /// naming what is missing.
+    fn cr_held(ns: &str, name: &str, reason: &str, message: &str, since: &str) -> Value {
+        json!({
+            "metadata": { "namespace": ns, "name": name },
+            "status": {
+                "phase": reason,
+                "conditions": [
+                    { "type": "Ready", "status": "False", "reason": reason,
+                      "message": message, "lastTransitionTime": since }
+                ]
+            }
+        })
+    }
+
+    #[test]
+    fn a_held_application_is_a_problem_row() {
+        // The defect this covers: `recentProblems` is DELIBERATELY only the
+        // undesigned failures (`operator-core/src/problems.rs` says so in its
+        // first paragraph), so a roll-up reading the ledger alone answered
+        // "is anything wrong with this cluster?" with `none reporting
+        // problems` while five applications sat unstarted on a claim that
+        // never provisioned. Held states are the ones the platform models
+        // best and they were the ones it would not mention.
+        let cr = cr_held(
+            "atm",
+            "atm-api",
+            "ResourceClaimPending",
+            "paused awaiting ResourceClaim provisioning: atm-api-jetstream",
+            "2026-09-01T10:00:00+00:00",
+        );
+        let rows = problem_app_rows(&[&cr], &[], &t("2026-09-01T10:06:00+00:00"));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].contains("ResourceClaimPending"), "{rows:?}");
+        assert!(rows[0].contains("atm-api-jetstream"), "{rows:?}");
+        assert!(rows[0].contains("(held)"), "{rows:?}");
+    }
+
+    #[test]
+    fn a_hold_outranks_the_ledger_and_still_counts_it() {
+        // A hold means the workload was never applied, so nothing in the
+        // ledger can be the first thing to fix. The ledger is counted, not
+        // dropped — one row per application is the roll-up's whole shape.
+        let mut cr = cr_held(
+            "atm",
+            "atm-api",
+            "EnvSecretMissing",
+            "env GITHUB_APP_ID -> Secret atm/github-app-id: not found",
+            "2026-09-01T10:00:00+00:00",
+        );
+        cr["status"]["recentProblems"] = json!([
+            { "reason": "ClaimPruneForbidden", "message": "forbidden",
+              "firstSeen": "2026-09-01T09:00:00+00:00",
+              "lastSeen": "2026-09-01T10:05:00+00:00", "count": 3 }
+        ]);
+        let rows = problem_app_rows(&[&cr], &[], &t("2026-09-01T10:06:00+00:00"));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].contains("EnvSecretMissing"), "{rows:?}");
+        assert!(rows[0].contains("(+1 more)"), "{rows:?}");
+        assert!(
+            !rows[0].contains("ClaimPruneForbidden"),
+            "the hold carries the row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_standing_hold_never_ages_out() {
+        // The ledger's 24h horizon is what keeps it readable: a failure that
+        // STOPPED should disappear. A hold does not stop. Ageing it out would
+        // rebuild exactly the silence this row exists to break — and an
+        // application stuck since last week is the one most worth naming.
+        let cr = cr_held(
+            "atm",
+            "atm-api",
+            "ResourceClaimPending",
+            "paused awaiting ResourceClaim provisioning: atm-api-jetstream",
+            "2026-08-20T10:00:00+00:00",
+        );
+        let rows = problem_app_rows(&[&cr], &[], &t("2026-09-01T10:06:00+00:00"));
+        assert_eq!(
+            rows.len(),
+            1,
+            "a twelve-day hold must still be named: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_held_row_is_named_the_way_the_reader_must_type_it() {
+        // Same rule the ledger rows follow: the logical name `app status`
+        // takes, not the CR's author-chosen metadata.name.
+        let cr = cr_held(
+            "demo",
+            "parser-cr",
+            "AwaitingMigrationApproval",
+            "paused awaiting approval of MigrationPlan parser-abc",
+            "2026-09-01T10:00:00+00:00",
+        );
+        let argo = vec![argo_app("parser", "prod", "demo", "parser-cr")];
+        let rows = problem_app_rows(&[&cr], &argo, &t("2026-09-01T10:06:00+00:00"));
+        assert!(rows[0].contains("parser (prod)"), "{rows:?}");
+        assert!(!rows[0].contains("parser-cr"), "{rows:?}");
+    }
+
+    #[test]
+    fn a_ready_true_condition_is_not_a_hold() {
+        let cr = json!({
+            "metadata": { "namespace": "demo", "name": "web" },
+            "status": { "phase": "Ready", "conditions": [
+                { "type": "Ready", "status": "True", "reason": "Reconciled",
+                  "lastTransitionTime": "2026-09-01T10:00:00+00:00" }
+            ]}
+        });
+        assert!(problem_app_rows(&[&cr], &[], &t("2026-09-01T10:06:00+00:00")).is_empty());
     }
 
     #[test]

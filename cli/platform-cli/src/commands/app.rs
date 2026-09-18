@@ -2666,6 +2666,40 @@ pub(crate) struct ResourceClaimSummary {
     /// `{type: "Scheduled", status: "True"}` — the provisioner
     /// has placed the claim on a backing cluster.
     pub scheduled: bool,
+    /// `(reason, message)` off `status.conditions[type=Ready]` when it is
+    /// not `True` — WHY this claim has not provisioned.
+    ///
+    /// The table above answers `ready=false` and stops there, and that is
+    /// the whole distance between "something is wrong" and knowing what to
+    /// do: the provisioner writes remedies into this message, and some of
+    /// them are the opposite of each other. `NatsMemoryBudgetExceeded`
+    /// says outright that waiting will never clear it and that the fix is
+    /// elsewhere in the cluster; `AwaitingNatsUserReady` says the server
+    /// has not reloaded yet and clears itself in seconds. A reader given
+    /// only `false` cannot tell those apart, and the Application above
+    /// points straight here — `paused awaiting ResourceClaim
+    /// provisioning: <name>` names the claim and then the claim says
+    /// nothing.
+    ///
+    /// Same defect [`format_not_ready_line`] fixed one level up, on the
+    /// Application's own `Ready`; the claims table underneath it kept it.
+    pub not_ready: Option<(String, String)>,
+    /// Advisory conditions the provisioner is reporting — every
+    /// `status.conditions[]` entry that is `True`, is not `Ready` and is
+    /// not `Scheduled`.
+    ///
+    /// A jetstream claim carries up to seven of these
+    /// (`ForeignSubjectCapture`, `PrefixPreCaptured`, `QuotaExceeded`,
+    /// `NamespaceDrainRisk`, `WorkqueueSubjectOverlap`,
+    /// `ConsumeTargetMissing`, `StreamNameConflict`) and they are written
+    /// present-means-firing — a cleared one is REMOVED rather than flipped
+    /// to `False`, so anything here is live. Several are reports rather
+    /// than faults, which is exactly why they need a surface: a fan-in
+    /// stream collecting a neighbour's prefix is legitimate and gated, and
+    /// the platform's stated intent is that it not be a surprise. Read off
+    /// no list of known types, so a condition added later appears without
+    /// a CLI change.
+    pub advisories: Vec<(String, String)>,
 }
 
 /// Argo CD resource entry rendered into the tracked-
@@ -3352,6 +3386,56 @@ fn summarise_resource_claim(claim: &Value) -> ResourceClaimSummary {
             })
         })
         .unwrap_or(false);
+    let conds = claim
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let cond_text = |c: &Value| -> (String, String) {
+        (
+            c.get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("NotReady")
+                .to_string(),
+            c.get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        )
+    };
+    let not_ready = conds
+        .iter()
+        .find(|c| {
+            c.get("type").and_then(Value::as_str) == Some("Ready")
+                && c.get("status").and_then(Value::as_str) != Some("True")
+        })
+        .map(cond_text)
+        .filter(|(_, m)| !m.is_empty());
+    // Everything else that is FIRING. `Scheduled` is excluded because the
+    // table already carries it as a column, and `Ready` because it is the
+    // line above; nothing else is filtered, so a condition type added to
+    // the provisioner later shows up here without a CLI change.
+    let advisories: Vec<(String, String)> = conds
+        .iter()
+        .filter(|c| {
+            let t = c.get("type").and_then(Value::as_str).unwrap_or_default();
+            t != "Ready"
+                && t != "Scheduled"
+                && c.get("status").and_then(Value::as_str) == Some("True")
+        })
+        .map(|c| {
+            let (_, message) = cond_text(c);
+            (
+                c.get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                message,
+            )
+        })
+        .filter(|(_, m)| !m.is_empty())
+        .collect();
+
     ResourceClaimSummary {
         name,
         provider,
@@ -3360,6 +3444,8 @@ fn summarise_resource_claim(claim: &Value) -> ResourceClaimSummary {
         scheduled,
         backing: backing_resource(claim),
         size: claim_size_cell(claim),
+        not_ready,
+        advisories,
     }
 }
 
@@ -3630,6 +3716,39 @@ pub(crate) fn render_resource_claim_lines(
             name_w = name_w,
             provider_w = provider_w,
         ));
+    }
+
+    // Below the table, what the table cannot hold: why a claim is not
+    // ready, and whatever else the provisioner is reporting about it.
+    //
+    // Under the table rather than inside it because these are sentences —
+    // the NATS budget message is four lines and names the remedy, which is
+    // the part worth reading and the part a column would truncate.
+    for c in claims {
+        if let Some((reason, message)) = &c.not_ready {
+            out.push(String::new());
+            out.extend(claim_detail_lines(&c.name, reason, message));
+        }
+        for (type_, message) in &c.advisories {
+            out.push(String::new());
+            out.extend(claim_detail_lines(&c.name, type_, message));
+        }
+    }
+    out
+}
+
+/// One `<claim> — <label>:` heading plus its message, wrapped at the
+/// provisioner's own `; ` joins.
+///
+/// The split mirrors [`format_not_ready_line`]: these messages are built
+/// by joining per-item diagnostics, and at three items a single line is
+/// unreadable. Nothing is re-wrapped beyond that — the provisioner wrote
+/// prose meant to be read whole, and a CLI guessing at column widths
+/// would break the one remedy sentence across the wrong words.
+fn claim_detail_lines(claim: &str, label: &str, message: &str) -> Vec<String> {
+    let mut out = vec![format!("  {claim} — {label}:")];
+    for part in message.split("; ").filter(|p| !p.trim().is_empty()) {
+        out.push(format!("    {}", part.trim()));
     }
     out
 }
@@ -6839,6 +6958,58 @@ pub(crate) fn live_problems<'a>(
         });
     }
     out
+}
+
+/// A reconcile the operator is DELIBERATELY holding: `(reason, message,
+/// age_seconds)` off `status.conditions[type=Ready]` when it is not `True`.
+///
+/// The counterpart to [`live_problems`], and the two are disjoint by design.
+/// `operator-core/src/problems.rs` says so in its own first paragraph:
+/// `recentProblems` exists for "the failure nobody planned for", because
+/// "DESIGNED failures already surface well — `AwaitingResourceClaim`,
+/// `EnvSecretMissing`, `ImageResolved`, `MigrationPending` all reach
+/// `status.conditions` and are rendered by `apprafter app status`".
+///
+/// That premise is true of `app status <name>`. It was carried into the
+/// CLUSTER-WIDE roll-up, where nobody has run `app status` yet — and there a
+/// ledger-only reading answers "is anything wrong with this cluster?" with
+/// `none reporting problems` while every application in a namespace sits
+/// unstarted, waiting on a claim or on a Secret nobody sealed. Those are the
+/// failures the platform models BEST; they were the ones it would not
+/// mention.
+///
+/// NOT filtered by [`PROBLEM_RENDER_HORIZON_SECS`], unlike the ledger. A
+/// problem that stopped recurring should age out — that is what keeps the
+/// list readable. A hold does not stop: an application held for three days is
+/// held right now, and ageing it out would rebuild the silence this fixes.
+/// The age is carried only so the row sorts beside the ledger's.
+///
+/// An unparseable `lastTransitionTime` yields age 0 rather than dropping the
+/// row: a malformed timestamp is a reason to sort it first, never a reason to
+/// hide a held application.
+pub(crate) fn held_reconcile<'a>(
+    cr: &'a Value,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> Option<(&'a str, &'a str, i64)> {
+    let ready = cr
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|c| c.get("type").and_then(Value::as_str) == Some("Ready"))?;
+    if ready.get("status").and_then(Value::as_str) == Some("True") {
+        return None;
+    }
+    let reason = ready
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("NotReady");
+    let message = ready.get("message").and_then(Value::as_str).unwrap_or("");
+    let age = ready
+        .get("lastTransitionTime")
+        .and_then(Value::as_str)
+        .and_then(|t| age_secs(t, now))
+        .unwrap_or(0);
+    Some((reason, message, age))
 }
 
 /// How the render horizon reads to a human, derived from the constant so the
@@ -10320,6 +10491,8 @@ mod render_tests {
             backing: "pvc/data".into(),
             size: "1Gi".into(),
             scheduled: true,
+            not_ready: None,
+            advisories: Vec::new(),
         }
     }
 
@@ -10343,6 +10516,93 @@ mod render_tests {
             bound[3]
         );
         assert!(bound[3].contains("true"), "{:?}", bound[3]);
+    }
+
+    #[test]
+    fn a_not_ready_claim_says_why_under_the_table() {
+        // `ready=false` and nothing else is the distance between "something
+        // is wrong" and knowing what to do — and on a jetstream claim the
+        // remedies are opposites: this one says waiting will never help,
+        // while `AwaitingNatsUserReady` says it clears itself in seconds.
+        let mut c = claim("atm-api-jetstream", "jetstream-integrated", false, None);
+        c.not_ready = Some((
+            "NatsMemoryBudgetExceeded".into(),
+            "the shared NATS server has no JetStream memory budget left for this \
+             namespace's account. Remove a jetstream namespace (or move to a larger \
+             tier); waiting will not clear this."
+                .into(),
+        ));
+        let lines = render_resource_claim_lines(&[c], "atm");
+        let body = lines.join("\n");
+        assert!(
+            body.contains("atm-api-jetstream — NatsMemoryBudgetExceeded:"),
+            "{body}"
+        );
+        assert!(body.contains("waiting will not clear this"), "{body}");
+    }
+
+    #[test]
+    fn a_firing_advisory_condition_is_shown_too() {
+        // These are written present-means-firing — a cleared one is removed
+        // rather than flipped to False — so anything carried is live. Some
+        // are reports rather than faults, which is exactly why they need a
+        // surface: the platform's stated intent is that a neighbour's
+        // fan-in stream not be a surprise.
+        let mut c = claim("atm-api-jetstream", "jetstream-integrated", true, Some("s"));
+        c.advisories = vec![(
+            "PrefixPreCaptured".into(),
+            "atm-worker_rag-reindex already collects atm-api.".into(),
+        )];
+        let body = render_resource_claim_lines(&[c], "atm").join("\n");
+        assert!(
+            body.contains("atm-api-jetstream — PrefixPreCaptured:"),
+            "{body}"
+        );
+        assert!(body.contains("atm-worker_rag-reindex"), "{body}");
+    }
+
+    #[test]
+    fn a_healthy_claim_adds_no_lines_below_the_table() {
+        // The detail block must not turn every `app status` into a wall.
+        // A ready claim with nothing firing renders exactly the table.
+        let lines =
+            render_resource_claim_lines(&[claim("web-db", "postgres", true, Some("s"))], "apps");
+        assert_eq!(lines.len(), 4, "{lines:?}");
+    }
+
+    #[test]
+    fn claim_conditions_are_read_off_the_object_not_a_known_type_list() {
+        // Both halves come from `status.conditions[]` with no allow-list, so
+        // a condition the provisioner adds later appears without a CLI
+        // change. `Scheduled` is the one exclusion — it is already a column.
+        let obj = json!({
+            "metadata": {"name": "atm-api-jetstream"},
+            "status": {
+                "ready": false,
+                "conditions": [
+                    {"type": "Scheduled", "status": "True", "message": "placed"},
+                    {"type": "Ready", "status": "False", "reason": "AwaitingNatsUserReady",
+                     "message": "waiting for the server to reload the accounts file"},
+                    {"type": "SomethingAddedIn2027", "status": "True",
+                     "message": "a condition this CLI predates"},
+                    {"type": "ClearedAlready", "status": "False", "message": "not firing"}
+                ]
+            }
+        });
+        let s = summarise_resource_claim(&obj);
+        assert_eq!(
+            s.not_ready.as_ref().map(|(r, _)| r.as_str()),
+            Some("AwaitingNatsUserReady")
+        );
+        assert_eq!(
+            s.advisories,
+            vec![(
+                "SomethingAddedIn2027".to_string(),
+                "a condition this CLI predates".to_string()
+            )],
+            "Scheduled is a column, a False condition is not firing, and an \
+             unknown type must still surface"
+        );
     }
 
     #[test]

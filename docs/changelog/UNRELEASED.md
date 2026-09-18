@@ -79,6 +79,59 @@ patch of each phase.
   turn amber or red — that is the fix landing, and a cluster with something
   quietly stuck sees it immediately.
 
+- **`apprafter status` answered "is anything wrong with this cluster?" with
+  `none reporting problems` while five applications sat unstarted.** The
+  cluster-wide roll-up is driven entirely by `status.recentProblems`, and that
+  ledger deliberately excludes exactly these states.
+  `operator-core/src/problems.rs` says so in its own first paragraph:
+
+  > DESIGNED failures already surface well — `AwaitingResourceClaim`,
+  > `EnvSecretMissing`, `ImageResolved`, `MigrationPending` all reach
+  > `status.conditions` and are rendered by `apprafter app status`. What
+  > vanished was the failure nobody planned for.
+
+  The ledger's scope is right. The premise it rests on — "already surface
+  well" — is true of `app status <name>`, and it was carried into a
+  cluster-wide command where nobody has run `app status` yet, and where the
+  whole question being asked is which application to run it on. So the
+  failures the platform models *best*, with a condition naming the remedy,
+  were the ones the health roll-up would not mention.
+
+  A held reconcile is now a problem row, read from
+  `status.conditions[type=Ready]` rather than from any list of known phases,
+  so a phase added later appears without a CLI change. A hold **outranks** the
+  ledger rather than sitting beside it — a hold means the workload was never
+  applied, so nothing in the ledger can be the first thing to fix — and the
+  ledger's entries are still counted into `(+N more)`. Unlike the ledger it is
+  **not** horizon-filtered: a problem that stopped recurring should age out,
+  which is what keeps the list readable, but a hold does not stop, and an
+  application stuck since last week is the one most worth naming. The
+  all-clear line now reads `none held, none reporting problems (last 24h)`,
+  because the two sources have two scopes and a single window would misdescribe
+  one of them.
+
+- **The claims table under `apprafter app status` showed `ready=false` and no
+  reason.** The Application's own line points straight at the claim — `paused
+  awaiting ResourceClaim provisioning: atm-api-jetstream` — and then the claim
+  said nothing, which is the distance between "something is wrong" and knowing
+  what to do. On a jetstream claim the remedies are opposites:
+  `NatsMemoryBudgetExceeded` states outright that waiting will never clear it
+  and that the fix is elsewhere in the cluster, while `AwaitingNatsUserReady`
+  clears itself within seconds. `false` cannot tell those apart.
+
+  The claim's `Ready` reason and message now print under the table, and so do
+  the advisory conditions a claim carries — a jetstream claim has up to seven
+  (`ForeignSubjectCapture`, `PrefixPreCaptured`, `QuotaExceeded`,
+  `NamespaceDrainRisk`, `WorkqueueSubjectOverlap`, `ConsumeTargetMissing`,
+  `StreamNameConflict`), written present-means-firing, several of them reports
+  rather than faults. A fan-in stream collecting a neighbour's prefix is a
+  legitimate gated construct and the platform's stated intent is that it not
+  be a surprise; until now nothing surfaced it. Read off the object with no
+  allow-list, `Scheduled` excluded because it is already a column.
+
+  Same defect `format_not_ready_line` fixed one level up on the Application's
+  own `Ready`; the claims table underneath it kept it.
+
 - **`apprafter app status` printed a startup probe's cadence and hid its
   budget**, so `startup http /health:3904 every 5s (derived)` was read as five
   seconds of allowance to boot. The derived probe is `5s × 60` — five minutes
