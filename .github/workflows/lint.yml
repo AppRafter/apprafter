@@ -55,6 +55,8 @@ jobs:
               - 'cue.mod/**'
               - 'scripts/lint-cue.sh'
               - 'scripts/check-cue-cmp-mirror.sh'
+              - 'scripts/check-argocd-health-lua.sh'
+              - 'scripts/argocd-health-lua-test.lua'
               - '.github/workflows/lint.yml'
             rust_cli:
               - 'cli/**'
@@ -85,6 +87,18 @@ jobs:
       # `just lint` because no workflow runs `just lint`. ADR 0063 §Risks.
       - name: check-cue-cmp-mirror.sh
         run: ./scripts/check-cue-cmp-mirror.sh
+      # The argocd-cm health Lua is the only chart payload no other gate
+      # executes: `cue vet` and `helm template` both see an opaque string,
+      # and Argo CD swallows a broken script at run time. See the header of
+      # scripts/check-argocd-health-lua.sh for the two releases that cost.
+      # The interpreter is installed rather than left to the script's
+      # `nix run` fallback, which no runner here can take.
+      - name: Install Lua
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends lua5.4
+      - name: check-argocd-health-lua.sh
+        run: |
+          sudo ln -sf /usr/bin/lua5.4 /usr/local/bin/lua
+          ./scripts/check-argocd-health-lua.sh
 
   rust-cli:
     name: Rust cli/ (fmt + clippy)

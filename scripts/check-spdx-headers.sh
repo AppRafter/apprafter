@@ -35,6 +35,10 @@ PATTERNS=(
   # match today already carry the header; naming the pattern is what stops
   # the next one from being added without it.
   'scripts/*.py'
+  # The Argo CD resource-health fixtures (`check-argocd-health-lua.sh`).
+  # Same reasoning as the `.py` line above: the pattern is what stops the
+  # next one from arriving without a header.
+  'scripts/*.lua'
   'e2e/*.sh'
   '.devcontainer/*.sh'
   # Source code

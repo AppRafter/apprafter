@@ -165,6 +165,36 @@ _components: argocd: #Component & {
 			// wave or phase; the shipped app shape (one CR, no
 			// waves, no hooks, no managedNamespaceMetadata) does
 			// not, and that is an invariant to keep.
+			// 0.2.77: the fall-through below used to catch THREE
+			// held phases and report all of them as `Progressing /
+			// "Awaiting controller reconcile"`. The operator writes
+			// five phases; this script named two. `AwaitingResourceClaim`,
+			// `EnvSecretMissing` and `InvalidEffectiveSpec` all landed on
+			// a message saying the controller had not reconciled yet —
+			// when it had, repeatedly, and was deliberately holding with a
+			// `Ready=False` condition whose `reason` IS the phase and
+			// whose `message` names the missing claim, the missing env
+			// var or the renderer's diagnostic. The two terminal ones
+			// never clear on their own, so the tile read "in flight"
+			// forever for a state that needed a person.
+			//
+			// This is the `argoproj.io_Application` finding of 0.2.75 one
+			// layer down, and it costs more since that release: a
+			// `Progressing` child now HOLDS every later wave instead of
+			// being stepped over.
+			//
+			// So the fall-through now reads the condition the operator
+			// already writes. The split is by whether the state clears
+			// ITSELF: `ResourceClaimPending` does (a claim provisions in
+			// a minute or two) and stays `Progressing`; everything else
+			// `False` is `Degraded`, which is fail-CLOSED on purpose — a
+			// phase added later and forgotten here shows up as noise
+			// rather than disappearing into "in flight", which is exactly
+			// the failure being fixed.
+			//
+			// The bare `Progressing` remains for a CR with no status at
+			// all: freshly applied, not yet reconciled. There the message
+			// is true.
 			"resource.customizations.health.apprafter.io_Application": """
 				hs = {}
 				if obj.status ~= nil and obj.status.phase ~= nil then
@@ -199,8 +229,104 @@ _components: argocd: #Component & {
 				  hs.message = "Reconcile complete"
 				  return hs
 				end
+				if obj.status ~= nil and obj.status.conditions ~= nil then
+				  for _, c in ipairs(obj.status.conditions) do
+				    if c.type == "Ready" and c.status == "False" then
+				      if c.reason == "ResourceClaimPending" then
+				        hs.status = "Progressing"
+				      else
+				        hs.status = "Degraded"
+				      end
+				      hs.message = c.message or c.reason or "held by the controller"
+				      return hs
+				    end
+				  end
+				end
 				hs.status = "Progressing"
 				hs.message = "Awaiting controller reconcile"
+				return hs
+				"""
+
+			// 0.2.77: `SharedDatabase` and `SharedVolume` had NO health
+			// assessment, and gitops-engine counts a resource without one
+			// as finished the moment its apply returns. So a database
+			// that never provisioned — a `vector` the operand image does
+			// not carry, no matching ServiceProvider, a Postgres cluster
+			// that never answered — sat on the tile as `Healthy` while
+			// every application bound to it waited on a claim that could
+			// not bind. The one resource that could name the problem was
+			// the one reporting success.
+			//
+			// Same split as the Application script above, applied to the
+			// reason vocabulary these two controllers actually write:
+			// `AwaitingCluster` / `AwaitingDatabase` clear by themselves
+			// (their own constants say so) and read `Progressing`;
+			// `ExtensionUnavailable`, `NotInOperandImage`, `NoProvider`,
+			// `UnsupportedType`, `InsufficientCapacity` and `InUse` need
+			// a person and read `Degraded`. Matching on the `Awaiting`
+			// PREFIX rather than on a list keeps a future
+			// `Awaiting<something>` on the self-clearing side, which is
+			// the direction that stays quiet when it guesses wrong.
+			//
+			// `CapacityWarning` is a separate condition type and is not
+			// read here: a volume at 85% is a warning about the future,
+			// not a statement that the volume is unusable now.
+			"resource.customizations.health.apprafter.io_SharedDatabase": """
+				hs = {}
+				if obj.status ~= nil and obj.status.ready == true then
+				  hs.status = "Healthy"
+				  local backing = obj.status.database or obj.status.instance
+				  if backing ~= nil then
+				    hs.message = "Ready (" .. tostring(backing) .. ")"
+				  else
+				    hs.message = "Ready"
+				  end
+				  return hs
+				end
+				if obj.status ~= nil and obj.status.conditions ~= nil then
+				  for _, c in ipairs(obj.status.conditions) do
+				    if c.type == "Ready" and c.status == "False" then
+				      if c.reason ~= nil and string.sub(c.reason, 1, 8) == "Awaiting" then
+				        hs.status = "Progressing"
+				      else
+				        hs.status = "Degraded"
+				      end
+				      hs.message = c.message or c.reason or "not ready"
+				      return hs
+				    end
+				  end
+				end
+				hs.status = "Progressing"
+				hs.message = "Awaiting provisioning"
+				return hs
+				"""
+
+			"resource.customizations.health.apprafter.io_SharedVolume": """
+				hs = {}
+				if obj.status ~= nil and obj.status.ready == true then
+				  hs.status = "Healthy"
+				  if obj.status.pvcRef ~= nil then
+				    hs.message = "Ready (" .. tostring(obj.status.pvcRef) .. ")"
+				  else
+				    hs.message = "Ready"
+				  end
+				  return hs
+				end
+				if obj.status ~= nil and obj.status.conditions ~= nil then
+				  for _, c in ipairs(obj.status.conditions) do
+				    if c.type == "Ready" and c.status == "False" then
+				      if c.reason ~= nil and string.sub(c.reason, 1, 8) == "Awaiting" then
+				        hs.status = "Progressing"
+				      else
+				        hs.status = "Degraded"
+				      end
+				      hs.message = c.message or c.reason or "not ready"
+				      return hs
+				    end
+				  end
+				end
+				hs.status = "Progressing"
+				hs.message = "Awaiting provisioning"
 				return hs
 				"""
 

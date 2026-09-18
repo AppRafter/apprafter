@@ -2352,6 +2352,33 @@ pub(crate) fn public_endpoint_line(cr: &Value) -> Option<String> {
     Some(format!("Public URL:      {}", urls.join(", ")))
 }
 
+/// A probe's failure budget as a compact exact duration: `30s`, `5m`,
+/// `1m30s`, `2h`.
+///
+/// Exact, never rounded — unlike `cli_core::timefmt::humanise_relative`,
+/// which exists to PLACE an event and happily calls 90 seconds "2 minutes".
+/// This number is a budget someone is about to compare against their own
+/// application's boot time, so `1m30s` has to mean ninety seconds.
+fn humanize_seconds(total: i64) -> String {
+    if total <= 0 {
+        return format!("{total}s");
+    }
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    let mut out = String::new();
+    if h > 0 {
+        out.push_str(&format!("{h}h"));
+    }
+    if m > 0 {
+        out.push_str(&format!("{m}m"));
+    }
+    // Seconds are dropped only when a larger unit already carried the whole
+    // value — `300` is `5m`, not `5m0s`.
+    if s > 0 || out.is_empty() {
+        out.push_str(&format!("{s}s"));
+    }
+    out
+}
+
 /// The health checks this workload actually runs (2.28 / ADR 0065 §2.7), or
 /// `None` when it runs none.
 ///
@@ -2377,6 +2404,8 @@ pub(crate) fn format_probes_line(cr: &Value) -> Option<String> {
     // fails, the operator moved and this did not.
     const DEFAULT_PERIOD: i64 = 10;
     const DERIVED_STARTUP_PERIOD: i64 = 5;
+    const DEFAULT_FAILURE_THRESHOLD: i64 = 3;
+    const DERIVED_STARTUP_FAILURE_THRESHOLD: i64 = 60;
 
     let root = cr
         .pointer("/status/lastAppliedSpec")
@@ -2416,25 +2445,43 @@ pub(crate) fn format_probes_line(cr: &Value) -> Option<String> {
 
     // One segment for a probe that will render, given its resolved port.
     //
-    // `force_period` is `Some` ONLY for the derived startup probe, which
-    // takes the liveness probe's TARGET but not its cadence — the renderer
-    // deliberately does not inherit the period there (a liveness period
-    // answers how fast a hang is caught, not how long a start is tolerated),
-    // so reading `periodSeconds` off the liveness probe here would report a
-    // number the pod does not carry.
+    // `forced` is `Some` ONLY for the derived startup probe, which takes the
+    // liveness probe's TARGET but neither of its two numbers — the renderer
+    // deliberately does not inherit them there (a liveness period answers how
+    // fast a hang is caught, not how long a start is tolerated), so reading
+    // them off the liveness probe here would report numbers the pod does not
+    // carry.
+    //
+    // The failure budget is shown only when it is NOT Kubernetes' universal
+    // 3, and that rule is the whole reason this renders at all. A derived
+    // startup probe is `5s × 60` — five minutes to boot — and printing only
+    // the period made the line read as five SECONDS of startup budget, which
+    // is how it was read on a real deployment. Three is the number a reader
+    // already assumes; sixty is the one nothing else in the system tells them.
     let segment =
-        |name: &str, p: &Value, force_period: Option<i64>, suffix: &str| -> Option<String> {
+        |name: &str, p: &Value, forced: Option<(i64, i64)>, suffix: &str| -> Option<String> {
             let probe_port = p.get("port").and_then(Value::as_i64).or(port)?;
             let target = match p.get("path").and_then(Value::as_str) {
                 Some(path) => format!("http {path}:{probe_port}"),
                 None => format!("tcp :{probe_port}"),
             };
-            let period = force_period.unwrap_or_else(|| {
-                p.get("periodSeconds")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(DEFAULT_PERIOD)
-            });
-            Some(format!("{name} {target} every {period}s{suffix}"))
+            let (period, threshold) = match forced {
+                Some(pair) => pair,
+                None => (
+                    p.get("periodSeconds")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(DEFAULT_PERIOD),
+                    p.get("failureThreshold")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(DEFAULT_FAILURE_THRESHOLD),
+                ),
+            };
+            let budget = if threshold == DEFAULT_FAILURE_THRESHOLD {
+                String::new()
+            } else {
+                format!(", up to {}", humanize_seconds(period * threshold))
+            };
+            Some(format!("{name} {target} every {period}s{budget}{suffix}"))
         };
     let enabled = |p: &Value| p.get("enabled").and_then(Value::as_bool).unwrap_or(true);
 
@@ -2471,7 +2518,7 @@ pub(crate) fn format_probes_line(cr: &Value) -> Option<String> {
                 parts.extend(segment(
                     "startup",
                     &l,
-                    Some(DERIVED_STARTUP_PERIOD),
+                    Some((DERIVED_STARTUP_PERIOD, DERIVED_STARTUP_FAILURE_THRESHOLD)),
                     " (derived)",
                 ));
             }
@@ -8882,19 +8929,99 @@ mod tests {
     }
 
     #[test]
-    fn the_derived_startup_probe_is_shown_with_its_own_cadence() {
+    fn the_derived_startup_probe_is_shown_with_its_own_cadence_and_budget() {
         // It must NOT report the liveness probe's period: the renderer does
         // not inherit it, so printing 30s here would name a number the pod
         // does not carry — the exact class of lie this line exists to prevent.
+        //
+        // And it must report the BUDGET. `every 5s` alone was read on a real
+        // deployment as five seconds of startup allowance; the renderer's
+        // `5s × 60` is five minutes, and that number appears nowhere else —
+        // not in the manifest, not in `kubectl get application -o yaml`.
         let cr = json!({"spec": {"base": {
             "expose": {"port": 8080},
             "probes": {"liveness": {"path": "/livez", "periodSeconds": 30}}
         }}});
         let line = format_probes_line(&cr).expect("line");
         assert!(
-            line.contains("startup http /livez:8080 every 5s (derived)"),
+            line.contains("startup http /livez:8080 every 5s, up to 5m (derived)"),
             "{line}"
         );
+    }
+
+    #[test]
+    fn a_default_failure_budget_is_not_printed() {
+        // Three is Kubernetes' universal default and the number a reader
+        // already assumes. Printing `, up to 30s` on every probe would bury
+        // the one budget that is worth reading — which is the whole reason
+        // the rule is "show what departs from the default".
+        let cr = json!({"spec": {"base": {
+            "expose": {"port": 8080},
+            "probes": {
+                "readiness": {"path": "/healthz"},
+                "liveness": {"path": "/livez", "failureThreshold": 3}
+            }
+        }}});
+        let line = format_probes_line(&cr).expect("line");
+        assert!(
+            line.contains("readiness http /healthz:8080 every 10s,"),
+            "a default-threshold readiness must carry no budget: {line}"
+        );
+        assert!(
+            !line.contains("liveness http /livez:8080 every 10s, up to"),
+            "an explicit failureThreshold of 3 is still the default: {line}"
+        );
+    }
+
+    #[test]
+    fn a_tuned_failure_budget_is_printed_on_any_probe() {
+        // Not a startup-only rule: a liveness probe told to tolerate ten
+        // failures kills the pod after 100 seconds of them, and the reader
+        // cannot get that from `every 10s` either.
+        let cr = json!({"spec": {"base": {
+            "expose": {"port": 8080},
+            "probes": {"liveness": {"path": "/livez", "failureThreshold": 10}}
+        }}});
+        let line = format_probes_line(&cr).expect("line");
+        assert!(
+            line.contains("liveness http /livez:8080 every 10s, up to 1m40s"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_startup_probe_reports_its_own_budget_not_the_derived_one() {
+        // The renderer takes a declared startup probe outright — no merge
+        // with liveness — so the derived 5s × 60 must not leak into it.
+        let cr = json!({"spec": {"base": {
+            "expose": {"port": 8080},
+            "probes": {
+                "liveness": {"path": "/livez"},
+                "startup": {"path": "/boot", "periodSeconds": 2, "failureThreshold": 150}
+            }
+        }}});
+        let line = format_probes_line(&cr).expect("line");
+        assert!(
+            line.contains("startup http /boot:8080 every 2s, up to 5m"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("(derived)"),
+            "a declared startup probe is not derived: {line}"
+        );
+    }
+
+    #[test]
+    fn humanize_seconds_is_exact_rather_than_rounded() {
+        // The counterpart to `humanise_relative`, which rounds because it is
+        // placing an event. A budget is compared against a real boot time, so
+        // 90 seconds has to read as 90 seconds.
+        assert_eq!(humanize_seconds(30), "30s");
+        assert_eq!(humanize_seconds(300), "5m");
+        assert_eq!(humanize_seconds(90), "1m30s");
+        assert_eq!(humanize_seconds(3600), "1h");
+        assert_eq!(humanize_seconds(3661), "1h1m1s");
+        assert_eq!(humanize_seconds(0), "0s");
     }
 
     #[test]
@@ -8983,6 +9110,14 @@ mod tests {
             (
                 "const DERIVED_STARTUP_PERIOD_SECONDS: i32 = 5;",
                 "DERIVED_STARTUP_PERIOD",
+            ),
+            (
+                "const DEFAULT_FAILURE_THRESHOLD: i32 = 3;",
+                "DEFAULT_FAILURE_THRESHOLD",
+            ),
+            (
+                "const DERIVED_STARTUP_FAILURE_THRESHOLD: i32 = 60;",
+                "DERIVED_STARTUP_FAILURE_THRESHOLD",
             ),
         ] {
             assert!(

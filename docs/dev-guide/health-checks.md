@@ -144,11 +144,18 @@ what the instance actually got, including the two probes you may not have
 written:
 
 ```text
-Probes:          readiness http /healthz:8080 every 10s, liveness http /livez:8080 every 30s, startup http /livez:8080 every 5s (derived)
+Probes:          readiness http /healthz:8080 every 10s, liveness http /livez:8080 every 30s, startup http /livez:8080 every 5s, up to 5m (derived)
 ```
 
 `(default)` marks the readiness check you get for free; `(derived)` marks the
 startup check that came from your liveness probe.
+
+`up to 5m` is how long that probe keeps failing before it acts — its period
+multiplied by how many failures it tolerates. It appears only where that
+allowance is not the usual three failures, so a line without it is a probe
+that acts on the third miss. On the derived startup probe it is the number
+worth knowing: five seconds between checks, sixty of them, five minutes for
+your application to come up before the liveness probe takes over.
 
 ## What the platform refuses
 

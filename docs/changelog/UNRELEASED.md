@@ -9,7 +9,90 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
-## platform-stack 0.2.76 — a bundle may declare the database it binds (unreleased)
+## platform-stack 0.2.77 / cli v0.2.74 — what a held application looks like (unreleased)
+
+### Fixed
+
+- **An application the operator was deliberately holding read on the Argo CD
+  tile as one merely in flight, indefinitely.** The `argocd-cm` health script
+  for `apprafter.io/Application` handled two of the operator's five phases.
+  `AwaitingResourceClaim`, `EnvSecretMissing` and `InvalidEffectiveSpec` all
+  fell through to:
+
+  ```text
+  Progressing — Awaiting controller reconcile
+  ```
+
+  which is a claim about the controller, and the controller had reconciled —
+  repeatedly, on a 30-second requeue — and was holding on purpose. Two of the
+  three never clear without a person: a Secret has to be sealed, or a manifest
+  has to be fixed. So an application blocked on a human read as one blocked on
+  a machine, and kept reading that way.
+
+  Each of those states already writes a `Ready=False` condition whose `reason`
+  is the phase and whose `message` names the thing that is missing — the
+  unready claims, the env var and the Secret it points at, the renderer's
+  diagnostic. The script reads it now. `ResourceClaimPending` stays
+  `Progressing`, because a claim provisions by itself in a minute or two and
+  `Degraded` there would fire on every first deploy. Everything else `False`
+  is `Degraded`, which is fail-**closed** on purpose: a phase added later and
+  forgotten here becomes noise rather than disappearing into "in flight",
+  which is precisely the failure being fixed. A CR with no status at all keeps
+  the old message, where it is true.
+
+  `SharedDatabase` and `SharedVolume` had **no health assessment at all**, and
+  gitops-engine counts a resource without one as finished the instant its
+  apply returns — the same rule behind [the 0.2.75 sync-wave
+  finding](#platform-stack-0275--cli-v0273--the-sync-waves-order-something-again-unreleased).
+  So a database that never provisioned — a `vector` extension the operand
+  image does not carry, no matching `ServiceProvider`, a Postgres cluster that
+  never answered — sat green on the tile while every application bound to it
+  waited on a claim that could not bind. The resource that could name the
+  problem was the one reporting success. Both now report from `status.ready`
+  and the same `Ready` condition, split on whether the reason starts with
+  `Awaiting` (`AwaitingCluster`, `AwaitingDatabase` — their own constants say
+  they clear by themselves → `Progressing`) or not (`ExtensionUnavailable`,
+  `NotInOperandImage`, `NoProvider`, `UnsupportedType`, `InsufficientCapacity`,
+  `InUse` → `Degraded`). `CapacityWarning` is a separate condition type and is
+  deliberately not read: a volume at 91% is a warning about the future, not a
+  statement that it is unusable now.
+
+  This costs more than it used to. Since 0.2.75 a `Progressing` child holds
+  every later wave instead of being stepped over, so a mis-reported state is
+  no longer only a wrong colour.
+
+  **Nothing had ever executed these scripts.** `cue vet` and `helm template`
+  both see an opaque string, and Argo CD swallows a broken one at run time —
+  it logs and falls back. That is how `argoproj.io_Application` stayed missing
+  for 45 versions. `scripts/check-argocd-health-lua.sh` now exports all six
+  out of the CUE and runs them under a real interpreter against 38 fixtures,
+  wired into `just lint` and into `lint.yml`'s `cue` job. It also holds a
+  coverage contract in both directions: a health script that ships with no
+  fixture fails, and so does a fixture for a script that no longer ships —
+  that half is what catches the next kind rather than the ones already
+  written. Mutation-tested three ways: reverting the fall-through fails five
+  assertions, adding an uncovered script fails the contract, and dropping a
+  `then` from one script fails the compile.
+
+  On upgrade `argocd-cm` changes, so the argocd pods roll. No CRD moves and no
+  workload restarts. Tiles that read green or amber over a stuck resource will
+  turn amber or red — that is the fix landing, and a cluster with something
+  quietly stuck sees it immediately.
+
+- **`apprafter app status` printed a startup probe's cadence and hid its
+  budget**, so `startup http /health:3904 every 5s (derived)` was read as five
+  seconds of allowance to boot. The derived probe is `5s × 60` — five minutes
+  — and that number is nowhere else: the timing defaults are renderer-side
+  constants, so neither the manifest nor `kubectl get application -o yaml`
+  carries them, and this line is the only place the effective configuration
+  appears at all.
+
+  The line now reads `every 5s, up to 5m (derived)`. The budget is shown only
+  where the failure threshold is not Kubernetes' universal 3 — a line without
+  it is a probe that acts on the third miss, which is what a reader already
+  assumes. So it surfaces the derived startup probe and any probe somebody
+  tuned, and leaves the common case short. `docs/dev-guide/health-checks.md`
+  says what the number means.
 
 ### Fixed
 

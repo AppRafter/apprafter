@@ -1934,6 +1934,67 @@ compatibility: "0.2.74": {
 	]
 }
 
+compatibility: "0.2.77": {
+	change:          "safe"
+	operatorVersion: "v0.2.50"
+	notes: """
+		AN APPLICATION HELD BY THE OPERATOR READ AS ONE IN FLIGHT.
+		`argocd-cm`'s health script for `apprafter.io/Application`
+		handled two of the operator's five phases. The other three —
+		`AwaitingResourceClaim`, `EnvSecretMissing`,
+		`InvalidEffectiveSpec` — fell through to `Progressing / "Awaiting
+		controller reconcile"`, which is a statement about the
+		CONTROLLER, and the controller had reconciled, repeatedly, and
+		was deliberately holding. Two of the three never clear without a
+		person, so the tile read "in flight" forever for an application
+		that was waiting on a sealed Secret nobody had sealed.
+
+		Every one of those states already carries a `Ready=False`
+		condition whose `reason` IS the phase and whose `message` names
+		the missing claim, the missing env var or the renderer's
+		diagnostic. The script now reads it: `ResourceClaimPending` stays
+		`Progressing` (a claim provisions by itself in a minute or two),
+		everything else `False` is `Degraded`, and the bare "awaiting
+		reconcile" is left for a CR that genuinely has no status yet.
+
+		`SharedDatabase` and `SharedVolume` had NO health assessment at
+		all, and gitops-engine counts a resource without one as finished
+		the moment its apply returns. A database that never provisioned
+		sat on the tile as `Healthy` while every application bound to it
+		waited on a claim that could not bind — the one resource able to
+		name the problem was the one reporting success. Both now report
+		from `status.ready` and the same condition, splitting on whether
+		the reason starts with `Awaiting` (self-clearing → `Progressing`)
+		or not (`ExtensionUnavailable`, `NoProvider`, `InUse` …  →
+		`Degraded`).
+
+		This is 0.2.75's finding one layer down, and it costs more since
+		that release: a `Progressing` child now HOLDS every later wave
+		instead of being stepped over. Nothing had ever executed these
+		scripts — `cue vet` and `helm template` both see an opaque string,
+		and Argo CD swallows a broken one at run time — so
+		`scripts/check-argocd-health-lua.sh` now runs all six under a real
+		interpreter with 38 fixtures, in `just lint` and in `lint.yml`. It
+		also fails when a health script ships with no fixture, which is
+		the half that catches the next kind.
+
+		WHAT AN UPGRADING CLUSTER SEES: `argocd-cm` changes, so the argocd
+		pods roll. No CRD moves, no workload restarts. Tiles that were
+		green or amber for a stuck resource turn amber or red — that is
+		the fix, not a regression, and a cluster with something quietly
+		stuck will see it the moment this lands.
+
+		Found on the same deployment as 0.2.76's AppProject refusal, in
+		the sync that refusal had been blocking — the bundle got past the
+		project and straight into a tile that said nothing.
+		"""
+	references: [
+		"scripts/check-argocd-health-lua.sh",
+		"docs/adr/0065-probes-and-jetstream-tuning.md",
+		"docs/changelog/UNRELEASED.md",
+	]
+}
+
 compatibility: "0.2.76": {
 	change:          "safe"
 	operatorVersion: "v0.2.50"

@@ -26,6 +26,11 @@
             # Configuration language
             cue
 
+            # Argo CD ships custom resource health as Lua in `argocd-cm`, and a
+            # broken script fails SILENTLY — Argo logs it and falls back. This
+            # is what `scripts/check-argocd-health-lua.sh` runs them under.
+            lua
+
             # Rust toolchain
             cargo
             rustc
