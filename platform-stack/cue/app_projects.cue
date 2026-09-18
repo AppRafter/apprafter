@@ -115,6 +115,41 @@ _appProjects: {
 	// user app whose destination namespace doesn't exist
 	// yet — landing apps failed with `SyncFailed: resource
 	// :Namespace is not permitted in project apps`.
+	//
+	// 0.2.76: the namespace-scoped list stopped being a list
+	// of "the four kinds a user app renders" the moment a
+	// user-declarable CRD landed that wasn't on it. The
+	// whitelist was written in B.1.79a against the Phase-1
+	// surface — `Application` was then the only `apprafter.io`
+	// kind a bundle could hold — and neither ADR 0049
+	// (`SharedVolume`, 2.6c) nor ADR 0066 (`SharedDatabase`,
+	// 2.29) came back to it. Both are namespaced CRs a bundle
+	// may declare beside the applications that bind them
+	// (`examples/applications/shared-database.cue` is exactly
+	// that shape), and both failed the whole sync with
+	// `resource apprafter.io:SharedDatabase is not permitted
+	// in project apps` — every workload left Missing, not just
+	// the database.
+	//
+	// The rule the list now follows, so the next CRD doesn't
+	// repeat this: a kind belongs here when a USER's bundle can
+	// legitimately render it. That is the `apprafter.io` kinds
+	// with a public `#Definition` a manifest instantiates, plus
+	// what the platform tells people to commit beside them.
+	// Operator-authored kinds (`ResourceClaim`, `MigrationPlan`,
+	// `RetainedClaim`) stay off it: the operator writes them
+	// with its own field manager and no bundle should be able
+	// to hand Argo CD a competing copy. `SourceCredential`
+	// stays off deliberately too — it is a registry credential
+	// in `apprafter-system` that `apprafter registry add`
+	// creates, not app payload.
+	//
+	// `SealedSecret` is the "commit it beside the app" half of
+	// `apprafter secret seal --stdout`, which the secrets guide
+	// documents for exactly that. It is strictly narrower than
+	// the plaintext `Secret` already permitted above it: the
+	// ciphertext is bound to its own namespace and name and is
+	// readable only by the in-cluster controller's private key.
 	apps: #AppProjectSpec & {
 		description: "User applications registered via `apprafter app add`."
 		sourceRepos: ["*"]
@@ -130,11 +165,20 @@ _appProjects: {
 			group: "apprafter.io"
 			kind:  "Application"
 		}, {
+			group: "apprafter.io"
+			kind:  "SharedDatabase"
+		}, {
+			group: "apprafter.io"
+			kind:  "SharedVolume"
+		}, {
 			group: ""
 			kind:  "ConfigMap"
 		}, {
 			group: ""
 			kind:  "Secret"
+		}, {
+			group: "bitnami.com"
+			kind:  "SealedSecret"
 		}, {
 			group: "gateway.networking.k8s.io"
 			kind:  "HTTPRoute"

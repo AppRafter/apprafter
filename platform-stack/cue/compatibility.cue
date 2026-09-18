@@ -1934,6 +1934,67 @@ compatibility: "0.2.74": {
 	]
 }
 
+compatibility: "0.2.76": {
+	change:          "safe"
+	operatorVersion: "v0.2.50"
+	notes: """
+		A BUNDLE COULD NOT DECLARE A SharedDatabase OR A SharedVolume.
+		The `apps` AppProject refused the kind and Argo CD refused the
+		whole sync with it:
+
+		    resource apprafter.io:SharedDatabase is not permitted in
+		    project apps
+
+		Not the database alone — an AppProject refusal fails the sync,
+		so every application in that bundle stayed Missing/SyncFailed.
+
+		WHY IT WAS THERE. The project's `namespaceResourceWhitelist` was
+		written in B.1.79a (chart 0.1.40) against the Phase-1 surface,
+		where `Application` was the only `apprafter.io` kind a user
+		bundle could hold. `SharedVolume` (2.6c / ADR 0049) and
+		`SharedDatabase` (2.29 / ADR 0066) each added a namespaced CR a
+		bundle may legitimately declare beside the applications that bind
+		it, and neither came back to the list. The same omission produced
+		`resource :Namespace is not permitted in project apps` in walk-fix
+		#11 (0.1.47); this is that bug's second and third instance.
+
+		WHAT CHANGED. Three kinds added to the `apps` project:
+		`apprafter.io/SharedDatabase`, `apprafter.io/SharedVolume`, and
+		`bitnami.com/SealedSecret` — the last being the destination of
+		`apprafter secret seal --stdout`, which the secrets guide
+		documents for committing beside an application. It is narrower
+		than the plaintext `Secret` the project already permitted.
+
+		WHAT IS STILL REFUSED, deliberately: the operator-authored kinds
+		(`ResourceClaim`, `MigrationPlan`, `RetainedClaim`), so a bundle
+		cannot hand Argo CD a copy competing with the operator's own
+		field manager; and `SourceCredential`, which is a registry
+		credential `apprafter registry add` writes into
+		`apprafter-system`, not application payload.
+
+		WHAT AN UPGRADING CLUSTER SEES. One AppProject field changes at
+		sync-wave -30. No pod restarts, no CRD moves, no workload churn.
+		A bundle that was failing on this refusal syncs on the next
+		reconcile with nothing else to do; a cluster that never declared
+		one of these kinds sees no difference at all.
+
+		A DATABASE IN THE BUNDLE IS NOW A REAL CHOICE, so its lifecycle
+		is worth stating: an Argo CD prune of a `SharedDatabase` that
+		still has consumers is REFUSED at admission (`status.refCount >
+		0`, ADR 0066 §6) — the sync fails with that message and the data
+		stays. What the refusal cannot catch is a commit that removes the
+		last consumer and the declaration together: nothing is bound by
+		the time the delete is admitted. Out-of-band `apprafter db
+		create` (the shape the operator guide describes) remains the
+		conservative option for a database meant to outlive the bundle.
+		"""
+	references: [
+		"docs/adr/0066-shared-database.md",
+		"docs/adr/0049-cross-app-sharedvolume.md",
+		"docs/operator-guide/shared-databases.md",
+	]
+}
+
 compatibility: "0.2.75": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.50"

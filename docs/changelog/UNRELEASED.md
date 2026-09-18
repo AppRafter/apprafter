@@ -9,6 +9,65 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## platform-stack 0.2.76 — a bundle may declare the database it binds (unreleased)
+
+### Fixed
+
+- **Declaring a `SharedDatabase` or a `SharedVolume` in a manifest bundle
+  failed the entire sync**, not just that resource:
+
+  ```text
+  resource apprafter.io:SharedDatabase is not permitted in project apps
+  ```
+
+  Argo CD refuses a sync wholesale when any resource in it falls outside the
+  AppProject's whitelist, so a bundle of five applications and two databases
+  landed nothing at all and sat in `SyncFailed` with every workload `Missing`.
+
+  The `apps` project's `namespaceResourceWhitelist` was written in B.1.79a
+  (chart 0.1.40) and enumerated the kinds a user bundle could render *then*:
+  `Application`, `ConfigMap`, `Secret`, `HTTPRoute`. `SharedVolume` (2.6c,
+  [ADR 0049]) and `SharedDatabase` (2.29, [ADR 0066]) each introduced a
+  namespaced CR a bundle may legitimately declare beside the applications
+  that bind it — `examples/applications/shared-database.cue` is exactly that
+  shape — and neither subphase came back to the list. This is the same
+  omission that produced `resource :Namespace is not permitted in project
+  apps` as walk-fix #11 in 0.1.47, in its second and third instance.
+
+  Three kinds are now permitted: `apprafter.io/SharedDatabase`,
+  `apprafter.io/SharedVolume`, and `bitnami.com/SealedSecret` — the last
+  being where `apprafter secret seal --stdout` is meant to end up, since the
+  secrets guide offers it "for committing to a configuration repository".
+  A `SealedSecret` is narrower than the plaintext `Secret` the project
+  already permitted: its ciphertext is bound to the namespace and name it
+  was sealed for and is readable only by the in-cluster controller's key.
+
+  Three kinds stay refused on purpose. `ResourceClaim`, `MigrationPlan` and
+  `RetainedClaim` are operator-authored — a bundle able to render one could
+  hand Argo CD a copy competing with the operator's own field manager, and
+  the losing side of that argument would be whichever reconcile ran last.
+  `SourceCredential` is a registry credential `apprafter registry add`
+  writes into `apprafter-system`; it is platform configuration that happens
+  to be a CR, not application payload.
+
+  `app_projects.cue` now states the rule the list follows rather than only
+  its contents, because the list being a snapshot of one phase's surface is
+  what let two subphases walk past it.
+
+  One lifecycle note now that a database in a bundle is a real choice: an
+  Argo CD prune of a `SharedDatabase` that still has consumers is refused at
+  admission (`status.refCount > 0`, [ADR 0066] §6) — the sync fails with that
+  message and the data stays. What the refusal cannot catch is a commit that
+  removes the last consumer *and* the declaration together: by then nothing
+  is bound, so nothing objects. Creating it out of band with `apprafter db
+  create` — the shape the operator guide describes — remains the conservative
+  option for a database meant to outlive the bundle. The guide now says so
+  rather than saying the database "is not declared in any application's
+  manifest", which stopped being true the moment the project permitted it.
+
+[ADR 0049]: ../adr/0049-cross-app-sharedvolume.md
+[ADR 0066]: ../adr/0066-shared-database.md
+
 ## platform-stack 0.2.75 / cli v0.2.73 — the sync waves order something again (unreleased)
 
 ### Fixed

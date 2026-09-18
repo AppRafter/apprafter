@@ -21,11 +21,10 @@ Redis keyspace.
 apprafter db create orders --type pg -n shop
 ```
 
-It is not declared in any application's manifest, and that is the point: a
-database created by the first application to mention it would go away when
-that application does, taking its neighbours' data along. A shared database
-outlives every application bound to it, so it is created and deleted as its
-own thing.
+It is created as its own thing rather than inside an application, and that
+is the point: a database created by the first application to mention it
+would go away when that application does, taking its neighbours' data along.
+A shared database outlives every application bound to it.
 
 ```bash
 apprafter db list -n shop
@@ -35,6 +34,26 @@ apprafter db list -n shop
  NAME     TYPE   READY   BOUND   BACKING
  orders   pg     true    0       shd_shop_orders
 ```
+
+### Declaring it in the bundle instead
+
+A `SharedDatabase` is an ordinary namespaced resource, so a bundle may
+declare one beside the applications that bind it and let the sync create it.
+That is a real option and sometimes the right one — it keeps the database in
+the same review as the code that depends on it, and it is one fewer step to
+remember before a first deploy.
+
+What it costs is the independence above. The bundle's sync now owns the
+database's existence. Deleting the declaration alone is safe: the platform
+refuses the delete while anything is still bound, so the sync fails with
+that message and the data stays. What the refusal cannot catch is a commit
+that removes the last consumer *and* the declaration together — by then
+nothing is bound, so nothing objects, and the database goes with the
+applications.
+
+So: declare it in the bundle when the database belongs to that bundle and
+nothing else will ever bind it. Create it with `db create` when it is meant
+to outlive any one repository — which is the case sharing exists for.
 
 ## Binding an application to it
 

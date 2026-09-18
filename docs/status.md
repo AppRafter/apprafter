@@ -82,7 +82,7 @@ post-launch work is not a roadmap phase and has no subscribe control.
 > server keeps running untouched. A larger per-tier budget is planned.
 > JetStream stores are out of scope for backup and restore.
 
-> **A shared database is created explicitly and outlives every application bound to it.** Removing
+> **A shared database is created as its own resource and deleted as its own resource.** Removing
 > an application drops that application's own credential and nothing else; the data is never touched
 > by a consumer's lifecycle. Deleting the database itself is refused while anything is bound, by the
 > command and by the cluster both, and the refusal names the applications. A read-only consumer is

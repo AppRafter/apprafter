@@ -92,6 +92,99 @@ mod tests {
         );
     }
 
+    /// The `(group, kind)` pairs one AppProject permits on namespaced
+    /// resources, read out of the loader YAML.
+    ///
+    /// Parsed rather than grepped, and that is the whole point of the
+    /// helper: `ARGOCD_LOADER_VALUES_YAML.contains("SharedDatabase")` is
+    /// satisfied by the kind sitting in the `platform` project, which is
+    /// where it does a user bundle no good at all. The question is which
+    /// project lists it, so the test has to descend into one.
+    fn namespaced_whitelist(project: &str) -> Vec<(String, String)> {
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str(ARGOCD_LOADER_VALUES_YAML).expect("loader values are YAML");
+        let entries = doc["configs"]["projects"][project]["namespaceResourceWhitelist"]
+            .as_sequence()
+            .unwrap_or_else(|| {
+                panic!(
+                    "no `configs.projects.{project}.namespaceResourceWhitelist` in the loader \
+                     values:\n{ARGOCD_LOADER_VALUES_YAML}"
+                )
+            });
+        entries
+            .iter()
+            .map(|e| {
+                (
+                    e["group"].as_str().unwrap_or_default().to_string(),
+                    e["kind"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn apps_project_permits_every_kind_a_user_bundle_can_render() {
+        // 0.2.76. An AppProject refusal fails the WHOLE sync, not the
+        // offending resource: a bundle of five applications and two
+        // `SharedDatabase`s landed nothing and sat in SyncFailed with
+        // `resource apprafter.io:SharedDatabase is not permitted in
+        // project apps`, every workload Missing.
+        //
+        // The list was written in B.1.79a against the Phase-1 surface,
+        // where `Application` was the only `apprafter.io` kind a bundle
+        // could hold, and neither 2.6c (`SharedVolume`, ADR 0049) nor
+        // 2.29 (`SharedDatabase`, ADR 0066) came back to it. This test
+        // is the thing that makes the NEXT such CRD fail loudly here
+        // instead of on somebody's cluster.
+        //
+        // Pinned on the LOADER constant because that is the copy a fresh
+        // `cluster-bootstrap` installs Argo CD with, before the umbrella
+        // has synced its own wave -30 AppProjects. Both read the same
+        // `_appProjects` map, so a kind dropped from the map fails here.
+        let permitted = namespaced_whitelist("apps");
+        for (group, kind) in [
+            ("apprafter.io", "Application"),
+            ("apprafter.io", "SharedDatabase"),
+            ("apprafter.io", "SharedVolume"),
+            ("", "ConfigMap"),
+            ("", "Secret"),
+            ("bitnami.com", "SealedSecret"),
+            ("gateway.networking.k8s.io", "HTTPRoute"),
+        ] {
+            assert!(
+                permitted.contains(&(group.to_string(), kind.to_string())),
+                "the `apps` AppProject does not permit {group}:{kind} — a bundle declaring \
+                 one fails its ENTIRE sync, not just that resource. Permitted: {permitted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn apps_project_refuses_operator_authored_kinds() {
+        // The other half of the rule, and the reason the list is not
+        // simply `apprafter.io/*`. `ResourceClaim`, `MigrationPlan` and
+        // `RetainedClaim` are written by the operator under its own
+        // field manager; a bundle able to render one could hand Argo CD
+        // a competing copy, and the argument would be settled by
+        // whichever reconcile happened to run last. `SourceCredential`
+        // is a registry credential `apprafter registry add` writes into
+        // `apprafter-system` — platform configuration that happens to be
+        // a CR, not application payload.
+        let permitted = namespaced_whitelist("apps");
+        for kind in [
+            "ResourceClaim",
+            "MigrationPlan",
+            "RetainedClaim",
+            "SourceCredential",
+        ] {
+            assert!(
+                !permitted.contains(&("apprafter.io".to_string(), kind.to_string())),
+                "the `apps` AppProject permits apprafter.io:{kind}, which a user bundle has \
+                 no business rendering. Permitted: {permitted:?}"
+            );
+        }
+    }
+
     #[test]
     fn loader_values_are_non_empty_yaml() {
         // Sanity guard — build.rs must have produced non-empty
