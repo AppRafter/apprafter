@@ -67,6 +67,8 @@ spec: base: {
     // ... image / replicas / expose / needs ...
     env: {
         NATS_URL:            claim.jetstream.url
+        NATS_USER:           claim.jetstream.user
+        NATS_PASS:           claim.jetstream.pass
         NATS_SUBJECT_PREFIX: claim.jetstream.subjectPrefix
         NATS_INBOX_PREFIX:   claim.jetstream.inboxPrefix
     }
@@ -75,10 +77,33 @@ spec: base: {
 
 The env-var names are yours. `claim.jetstream.<field>` names a field of the
 connection Secret the platform will publish — `url`, `host`, `port`, `user`,
-`pass`, `account`, `subjectPrefix` and `inboxPrefix` are all available. `url`
-already carries the user and password, so it is the only one most clients need
-— but bind all three above, because the other two are not optional to use
-correctly and the next section is why.
+`pass`, `account`, `subjectPrefix` and `inboxPrefix` are all available. Bind
+all five above. None of the last four is optional to use correctly: the next
+section covers the credential, and [Three rules for using the
+connection](#three-rules-for-using-the-connection) covers the two prefixes.
+
+### Pass the credential the way your client reads it
+
+`url` is `nats://<user>:<pass>@<host>:<port>` — the credential is in it. Some
+clients parse that userinfo and authenticate with it; **others ignore it and
+authenticate only from explicit options**, and the JavaScript client is one of
+them: it builds an authenticator when `user`/`pass` (or `token`) are set, and
+a connection given nothing but a URL sends no credential at all.
+
+Handed a URL it does not read, such a client connects and the server refuses
+it:
+
+```text
+AuthorizationError: Authorization Violation
+```
+
+That message reads like a wrong password, which is the wrong place to look —
+the password is right and is simply not being sent. So bind `user` and `pass`
+as their own variables and give them to your client as options. It costs two
+lines, it is correct for every client, and it removes the question.
+
+`url` remains useful as the connection target; a client that wants an address
+with no credential in it can compose one from `host` and `port` instead.
 
 Check it before you push:
 
@@ -413,6 +438,7 @@ derived, and the reclaim after the grace window.
 | Symptom | Likely cause | Fix |
 | ------- | ------------ | --- |
 | The application connects and gets its credentials, but every operation times out from inside the pod | on a Cilium cluster, the egress rule for the message server is missing from the application's policy | Read it back: `kubectl get ciliumnetworkpolicy <application>-egress -n <namespace> -o yaml` should carry a rule for namespace `nats-system` on port 4222. If it does not, the operator is older than the release that added it — see [Egress policy](egress-policy.md). |
+| The application is refused at connect with `Authorization Violation`, and the claim is ready | the credential is only in `NATS_URL`, and the client does not read userinfo out of the server URL | Bind `claim.jetstream.user` and `claim.jetstream.pass` as their own variables and pass them to the client as options. The password is right and is simply not being sent — the message reads like a wrong password, which is the wrong place to look. See *Pass the credential the way your client reads it* above. |
 | A client times out after about ten seconds on operations that turn out to have happened anyway | the inbox prefix is not set | Set it from `claim.jetstream.inboxPrefix`, and check what already exists before retrying — a retry is what creates duplicates. See *Set the inbox prefix* above. |
 | The application stays at `AwaitingResourceClaim` and the claim never gets a provider | the `needs.jetstream.selector` matches no provider | Confirm the selector reads `tier=integrated`: `kubectl get serviceprovider jetstream-integrated -n apprafter-system -o yaml`. |
 | The claim stays unready with `AwaitingStreamCreation` | a declared stream has not been created yet, or could not be | Give it a few cycles, then read the claim's `Ready` condition message — it names the object that is not live. |
