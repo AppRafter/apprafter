@@ -255,9 +255,10 @@ impl Error for ResolveError {}
 ///
 /// * a `#` that opens a comment ends the line — `apprafter up  # alias:
 ///   apprafter bootstrap-all` documents one invocation, not two;
-/// * one level of `$( … )` and of backticks is unwrapped — and the
-///   outer line is read from the MASK, so a substitution's own flags
-///   are not charged to the command around it. The corpus needs the
+/// * one level of `$( … )`, `<( … )`, `>( … )` and of backticks is
+///   unwrapped — and the outer line is read from the MASK, so a
+///   substitution's own flags are not charged to the command around
+///   it. The corpus needs the
 ///   masking direction today: `apprafter target add bad --token
 ///   "$(python -c 'print("a"*64)')"` in `troubleshooting.md` reads as
 ///   `-c` on `target add` without it. The unwrapping direction was
@@ -441,8 +442,16 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
-/// Blank out every `$( … )` and backtick substitution, and hand back
-/// what was inside each with its offset.
+/// Blank out every substitution — `$( … )`, `<( … )`, `>( … )` and
+/// backticks — and hand back what was inside each with its offset.
+///
+/// Process substitution is here for the same reason command
+/// substitution is: what is inside it is a command line, and the only
+/// way to add a completion to a LIVE shell is `source <(apprafter
+/// completion … )`, so a reader who is told to type that is being told
+/// to run something. Unread, the whole line yields no invocation at
+/// all — silence rather than a finding — and its flags are judged by
+/// nobody.
 ///
 /// The mask is space-for-byte so offsets in it are offsets in the
 /// source; the caller relies on that to report a real position and to
@@ -454,8 +463,11 @@ fn unwrap_substitutions(text: &str) -> (String, Vec<(usize, String)>) {
 
     while at < text.len() {
         let rest = &text[at..];
-        if let Some(close) = rest
-            .starts_with("$(")
+        // All three openers put the `(` at index 1, so one branch
+        // covers command and process substitution alike.
+        if let Some(close) = ["$(", "<(", ">("]
+            .iter()
+            .any(|opener| rest.starts_with(opener))
             .then(|| matching_paren(rest.as_bytes(), 1))
             .flatten()
         {

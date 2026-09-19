@@ -404,7 +404,7 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
             keep_backup_schedule,
             discard_backup_schedule,
         )?,
-        Commands::Completion { shell } => commands::completions::run(shell)?,
+        Commands::Completion { shell, install } => commands::completions::run(shell, install)?,
     }
     Ok(())
 }

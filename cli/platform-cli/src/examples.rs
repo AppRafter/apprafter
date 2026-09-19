@@ -284,19 +284,34 @@ pub const EXAMPLES: &[CommandExamples] = &[
         lines: &["apprafter cluster-bootstrap  # phase 3 of `up`, on its own"],
     },
     // The flag list already names the shells; what it cannot show is
-    // where the script has to land, and that is both the whole
-    // difficulty and different for every shell. One line per shell that
-    // has a published recipe, each ending at its own destination.
+    // that installing and *using* completions are two different acts,
+    // and that no command can perform the second on a reader's behalf.
     CommandExamples {
         path: &["completion"],
-        // The `mkdir -p` is not decoration: on a clean machine none of
-        // these directories exists, and the redirect alone fails with
-        // `No such file or directory` and exit 1 — on the one command
-        // whose example IS the instruction. The developer quickstart's
-        // three recipes each open with the same line; these are those
-        // recipes, one line each.
+        // Three groups, and each is here because the other two do not
+        // show it.
+        //
+        // `-i` names its destination in the comment rather than saying
+        // "installs it": a flag that writes a file somewhere the reader
+        // cannot see from the example is asking them to trust it.
+        //
+        // The `mkdir -p … && … > …` recipes are what `-i` performs,
+        // spelled out. They are also still the ANSWER for `elvish` and
+        // `powershell`, which have no published destination — and the
+        // `mkdir` in them is not decoration: on a clean machine none of
+        // those directories exists, and the redirect alone fails with
+        // `No such file or directory` and exit 1.
+        //
+        // And the sourcing lines are the part no flag can perform: a
+        // child process cannot add a completion to the shell that
+        // spawned it, so only text that shell reads itself gets there.
         lines: &[
-            "mkdir -p ~/.local/share/bash-completion/completions && apprafter completion bash > ~/.local/share/bash-completion/completions/apprafter",
+            "apprafter completion bash -i  # → ~/.local/share/bash-completion/completions/apprafter",
+            "apprafter completion zsh -i  # → ~/.zfunc/_apprafter, and prints the fpath lines it still needs",
+            "apprafter completion fish -i  # → ~/.config/fish/completions/apprafter.fish",
+            "source <(apprafter completion bash -i)  # ...and completes in THIS shell too — same line in zsh",
+            "apprafter completion fish -i | source  # the fish spelling of the line above",
+            "mkdir -p ~/.local/share/bash-completion/completions && apprafter completion bash > ~/.local/share/bash-completion/completions/apprafter  # what -i does, by hand",
             "mkdir -p ~/.zfunc && apprafter completion zsh > ~/.zfunc/_apprafter  # ~/.zfunc must be on fpath",
             "mkdir -p ~/.config/fish/completions && apprafter completion fish > ~/.config/fish/completions/apprafter.fish",
         ],

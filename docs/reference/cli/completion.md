@@ -13,20 +13,31 @@ Print a shell completion script on stdout.
 
 The script is built from this binary's own command tree, so it completes the subcommands, flags and fixed-value choices of the version you are running rather than a newer or older one — and it goes stale when you upgrade, so re-run this then.
 
-Nothing is installed: the script goes to stdout and where it has to land differs per shell. The quickstart carries a recipe for `bash`, `zsh` and `fish`.
+By default nothing is installed: the script goes to stdout and where it has to land differs per shell. `--install` writes it there for `bash`, `zsh` and `fish` — creating the directory — and reports what a new shell still needs.
+
+Neither form can add a completion to the shell you are typing in; only that shell can. Sourcing this command's output is what does it, and it combines with the flag: `source <(apprafter completion bash --install)` installs for later shells and applies to this one.
 
 ```text
-Usage: apprafter completion <SHELL>
+Usage: apprafter completion [OPTIONS] <SHELL>
 ```
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `<SHELL>` | yes | Shell to emit the script for. Every value listed produces a working script; published install recipes cover `bash`, `zsh` and `fish`. One of `bash`, `elvish`, `fish`, `powershell`, `zsh`. |
+| `<SHELL>` | yes | Shell to emit the script for. Every value listed produces a working script; `--install` knows a destination for `bash`, `zsh` and `fish`. One of `bash`, `elvish`, `fish`, `powershell`, `zsh`. |
+
+| Flag | Value | Default | Required | Description |
+| --- | --- | --- | --- | --- |
+| `--install`, `-i` | flag | — | no | Also write the script where this shell reads completions from, creating the directory if it is missing |
 
 Examples:
 
 ```sh
-mkdir -p ~/.local/share/bash-completion/completions && apprafter completion bash > ~/.local/share/bash-completion/completions/apprafter
+apprafter completion bash -i  # → ~/.local/share/bash-completion/completions/apprafter
+apprafter completion zsh -i  # → ~/.zfunc/_apprafter, and prints the fpath lines it still needs
+apprafter completion fish -i  # → ~/.config/fish/completions/apprafter.fish
+source <(apprafter completion bash -i)  # ...and completes in THIS shell too — same line in zsh
+apprafter completion fish -i | source  # the fish spelling of the line above
+mkdir -p ~/.local/share/bash-completion/completions && apprafter completion bash > ~/.local/share/bash-completion/completions/apprafter  # what -i does, by hand
 mkdir -p ~/.zfunc && apprafter completion zsh > ~/.zfunc/_apprafter  # ~/.zfunc must be on fpath
 mkdir -p ~/.config/fish/completions && apprafter completion fish > ~/.config/fish/completions/apprafter.fish
 ```

@@ -456,15 +456,43 @@ pub enum Commands {
     /// version you are running rather than a newer or older one — and
     /// it goes stale when you upgrade, so re-run this then.
     ///
-    /// Nothing is installed: the script goes to stdout and where it has
-    /// to land differs per shell. The quickstart carries a recipe for
-    /// `bash`, `zsh` and `fish`.
+    /// By default nothing is installed: the script goes to stdout and
+    /// where it has to land differs per shell. `--install` writes it
+    /// there for `bash`, `zsh` and `fish` — creating the directory —
+    /// and reports what a new shell still needs.
+    ///
+    /// Neither form can add a completion to the shell you are typing
+    /// in; only that shell can. Sourcing this command's output is what
+    /// does it, and it combines with the flag:
+    /// `source <(apprafter completion bash --install)` installs for
+    /// later shells and applies to this one.
     Completion {
         /// Shell to emit the script for. Every value listed produces a
-        /// working script; published install recipes cover `bash`,
+        /// working script; `--install` knows a destination for `bash`,
         /// `zsh` and `fish`.
         #[arg(value_enum)]
         shell: clap_complete::Shell,
+        /// Also write the script where this shell reads completions
+        /// from, creating the directory if it is missing.
+        ///
+        /// `bash` →
+        /// `$XDG_DATA_HOME/bash-completion/completions/apprafter`,
+        /// `zsh` → `~/.zfunc/_apprafter` — which a new shell reads
+        /// only once that directory is on `fpath`, so the command
+        /// prints the two `~/.zshrc` lines — and `fish` →
+        /// `$XDG_CONFIG_HOME/fish/completions/apprafter.fish`. Those
+        /// three only: `elvish` and `powershell` are refused rather
+        /// than written to a guessed path, and still print a script
+        /// you can redirect yourself.
+        ///
+        /// Re-run after upgrading. The script describes the binary
+        /// that produced it, and an installed one goes stale silently.
+        ///
+        /// stdout keeps the script, so `source <(…)` applies it to
+        /// the current shell in the same command; on a terminal,
+        /// where nothing is reading it, only the report is printed.
+        #[arg(long, short = 'i', default_value_t = false)]
+        install: bool,
     },
 }
 

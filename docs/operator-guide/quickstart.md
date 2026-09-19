@@ -58,9 +58,11 @@ the archives and their checksums for a manual install, and the
 source and Nix alternatives.
 
 While you are there, install shell completion —
-`apprafter completion <shell>` prints the script and the
-[recipe per shell](../dev-guide/quickstart.md#shell-completion) says
-where to put it. Every command on this page becomes one Tab away, which
+`apprafter completion <shell> --install` writes the script where your
+shell reads it, and the
+[recipe per shell](../dev-guide/quickstart.md#shell-completion) covers
+the shells it has no destination for, and how to complete in the shell
+you are in. Every command on this page becomes one Tab away, which
 saves the most typing on the deeply nested ones such as
 `apprafter target firewall cloudflare-origin enable`.
 

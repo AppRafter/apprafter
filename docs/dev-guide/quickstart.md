@@ -88,44 +88,61 @@ recommended path; build-from-source is for contributors.
 ### Shell completion
 
 The CLI can complete its own subcommands, flags, and the values of the
-flags that take a fixed set. `apprafter completion <shell>` prints the
-script to stdout and installs nothing — putting that output where your
-shell reads completions from is the whole job, and where that is depends
-on the shell:
+flags that take a fixed set. `--install` writes the script where your
+shell reads completions from, creating the directory if it is missing —
+each tab below also spells out the redirect it performs, which is what
+you run for a shell it has no destination for:
 
 === "bash"
 
-    Needs the `bash-completion` package, which most distributions ship;
-    on macOS install it with `brew install bash-completion@2`.
+    ```sh
+    apprafter completion bash --install
+    ```
+
+    Writes `~/.local/share/bash-completion/completions/apprafter`
+    (under `$XDG_DATA_HOME` if you set it). By hand, that is:
 
     ```sh
     mkdir -p ~/.local/share/bash-completion/completions
     apprafter completion bash > ~/.local/share/bash-completion/completions/apprafter
     ```
 
-    Open a new shell to pick it up.
+    Either way it needs the `bash-completion` package, which most
+    distributions ship; on macOS, `brew install bash-completion@2`.
 
 === "zsh"
 
-    The script has to land in a directory on `fpath`:
+    ```sh
+    apprafter completion zsh --install
+    ```
+
+    Writes `~/.zfunc/_apprafter` — the file name is the completion
+    function's, not the command's. By hand:
 
     ```sh
     mkdir -p ~/.zfunc
     apprafter completion zsh > ~/.zfunc/_apprafter
     ```
 
-    If `~/.zfunc` is not on `fpath` already, add both of these to
-    `~/.zshrc`, in this order — `compinit` reads `fpath` as it runs, so
-    a line added after it has no effect until the next shell:
+    A new shell reads it only once `~/.zfunc` is on `fpath`, which no
+    command can arrange from outside your rc. If it is not there
+    already, add both of these to `~/.zshrc`, in this order — `compinit`
+    reads `fpath` as it runs, so a line added after it has no effect
+    until the next shell:
 
     ```sh
     fpath=(~/.zfunc $fpath)
     autoload -Uz compinit && compinit
     ```
 
-    Open a new shell to pick it up.
-
 === "fish"
+
+    ```sh
+    apprafter completion fish --install
+    ```
+
+    Writes `~/.config/fish/completions/apprafter.fish` (under
+    `$XDG_CONFIG_HOME` if you set it). By hand:
 
     ```sh
     mkdir -p ~/.config/fish/completions
@@ -134,14 +151,32 @@ on the shell:
 
     fish reads that directory at the next prompt; no restart needed.
 
+What no command can do from outside is add a completion to the shell
+you are already typing in — only that shell can, by reading the script
+itself. Sourcing the same command does both at once:
+
+=== "bash / zsh"
+
+    ```sh
+    source <(apprafter completion bash --install)
+    ```
+
+=== "fish"
+
+    ```sh
+    apprafter completion fish --install | source
+    ```
+
 To check it worked, type a partial command and press Tab — the
 subcommand list should complete.
 
 Two things worth knowing. The script describes the binary that produced
 it, so it goes stale when you upgrade: re-run the same command after
-installing a new release. And the three shells above are the ones with a
-published recipe, not the whole list — `apprafter completion --help`
-names every value the argument accepts.
+installing a new release. And `--install` covers the three shells above,
+not the whole list — `elvish` and `powershell` are refused rather than
+written to a guessed path; they still print a script, which you redirect
+the way the tabs above show. `apprafter completion --help` names every
+value the argument accepts.
 
 ## Prerequisites
 

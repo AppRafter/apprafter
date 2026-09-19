@@ -9,6 +9,87 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.75 — `completion --install` writes the file, and one line also completes the shell you are in (unreleased)
+
+### Added
+
+- **`apprafter completion <shell> --install` (`-i`) writes the script where
+  that shell reads completions from, creating the directory.** Until now the
+  command printed to stdout and installed nothing, which left the reader three
+  things to get right at once — the directory, the file name, and creating the
+  directory *first*, because on a clean machine none of them exists and the
+  redirect alone fails with `No such file or directory` and exit 1. That was
+  true of the one command whose example IS the instruction: all three shipped
+  examples opened with `mkdir -p`.
+
+  The destinations are the ones the published recipes already taught, now held
+  in one table in `commands::completions` instead of in three example lines and
+  a quickstart page: `$XDG_DATA_HOME/bash-completion/completions/apprafter`,
+  `~/.zfunc/_apprafter`, `$XDG_CONFIG_HOME/fish/completions/apprafter.fish`.
+  The XDG variables are honoured rather than `~/.local/share` and `~/.config`
+  hard-coded — a reader who moved either has moved the place their shell reads.
+
+  `elvish` and `powershell` are **refused by name** rather than written to a
+  guessed path: the module has always said that a recipe for a shell whose
+  conventions nobody here verified would be invented rather than known, and a
+  script at a plausible-looking wrong path completes nothing while reporting
+  success. Both still print a script to redirect by hand, and the refusal names
+  the three that do install.
+
+  That refusal gets its own diagnostic — `CliError::CompletionInstall`,
+  `apprafter::completion::install` — rather than the catch-all, whose `help:`
+  asks the reader to file an issue about recurring wording. This message is not
+  a surprise, it is the command deciding on purpose, and its help says the thing
+  that is actually useful: the plain form always works, redirect it yourself.
+
+  The write goes through a temporary file in the destination directory and a
+  rename, so a full disk or an interrupted run cannot leave a HALF-WRITTEN
+  script where a shell reads one — a truncated completion script is not an
+  absent completion, it is a syntax error every new shell evaluates.
+
+- **The report says what installing still cannot do.** A child process cannot
+  add a completion to the shell that spawned it: `complete` and `compdef` are
+  builtins and they change the shell that runs them. So `--install` prints, on
+  **stderr**, where the file went, what makes a *new* shell read it — for zsh
+  the two `~/.zshrc` lines that put the directory on `fpath`, which is the half
+  a written file does not give — and the `source <path>` that gets it into the
+  shell asking.
+
+  And the flag composes with that instead of restating it: stdout still carries
+  the script under `--install`, so
+
+  ```sh
+  source <(apprafter completion bash --install)   # fish: … --install | source
+  ```
+
+  installs for later shells and applies to this one in a single line. Verified
+  against real shells rather than asserted: bash reports `complete -F _apprafter
+  apprafter`, zsh `$_comps[apprafter]` = `_apprafter`, and fish completes
+  `apprafter targ` → `target`. The script is suppressed when stdout is a
+  terminal — the one case where nothing is reading it, and where several hundred
+  lines of shell would scroll the report off the screen. The report is on stderr
+  in both cases because stdout is sourced: a report in it would be fed to the
+  shell as code.
+
+### Changed
+
+- **The `completion` examples and the quickstart recipe show the flag, what it
+  writes, and the part no flag can perform.** Three groups now: `-i` per shell
+  with its destination named in the comment (a flag that writes a file the
+  reader cannot see from the example is asking them to trust it); the two
+  sourcing lines; and the original `mkdir -p … && apprafter completion … > …`
+  recipes, kept rather than replaced — they are what `-i` performs, spelled
+  out, and they are still the answer for `elvish` and `powershell`. The
+  developer quickstart's per-shell tabs keep the same pairing: the flag, the
+  path it writes, and the redirect by hand.
+
+- **`docsgen`'s invocation reader understands process substitution.** `<( … )`
+  and `>( … )` are unwrapped like `$( … )` and backticks. Without it `source
+  <(apprafter completion bash --install)` yields **no** invocation at all: for
+  an example that is a finding, but for a guide page it is silence — the command
+  and its flags judged by nobody. The line the CLI now documents is exactly the
+  shape that was invisible to the gate.
+
 ## platform-stack 0.2.77 / cli v0.2.74 — what a held application looks like (unreleased)
 
 ### Fixed

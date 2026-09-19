@@ -53,6 +53,28 @@ fn a_substitution_is_reached_through_a_pipeline_and_reported_in_order() {
 }
 
 #[test]
+fn a_process_substitution_is_read_like_any_other() {
+    // `source <(apprafter completion bash --install)` is the documented
+    // way to apply completions to the shell you are typing in, and
+    // `<( … )` is the only construct that can express it. Unread, the
+    // line yields NO invocation — which for an example is a finding and
+    // for a guide page is silence: the flags inside it would be judged
+    // by nobody.
+    let found = extract("source <(apprafter completion bash --install)");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].path, ["completion", "bash"]);
+    assert_eq!(found[0].flags, ["--install"]);
+
+    // The outer command is still read from the mask, so a substitution
+    // in the middle of a line does not hand its flags to the command
+    // around it.
+    let mixed = extract("diff <(apprafter export) /tmp/old --brief");
+    assert_eq!(mixed.len(), 1, "{mixed:?}");
+    assert_eq!(mixed[0].path, ["export"]);
+    assert!(mixed[0].flags.is_empty(), "{mixed:?}");
+}
+
+#[test]
 fn a_comment_is_prose_not_an_invocation() {
     // `# alias: apprafter bootstrap-all` documents a name; it is not run.
     assert!(extract("# alias: apprafter bootstrap-all").is_empty());

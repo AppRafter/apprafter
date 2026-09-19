@@ -373,6 +373,26 @@ pub enum CliError {
     )]
     Yaml(#[from] serde_yaml::Error),
 
+    /// `apprafter completion <shell> --install` could not work out
+    /// where to write: the shell has no published destination, or the
+    /// base directory it hangs off does not resolve.
+    ///
+    /// Typed rather than [`CliError::Other`] because it is a DECISION,
+    /// not a surprise — this command refuses a guessed path on purpose
+    /// — and the catch-all's help tells the reader to file an issue
+    /// about recurring wording, which is advice for the opposite case.
+    #[error("{0}")]
+    #[diagnostic(
+        code(apprafter::completion::install),
+        help(
+            "`apprafter completion <shell>` without `--install` always works: it prints the \
+             script, and you redirect it wherever that shell reads completions from. \
+             `--install` writes it for you only where the destination is known — bash, zsh \
+             and fish."
+        )
+    )]
+    CompletionInstall(String),
+
     /// Catch-all, free-form message. New call sites should prefer
     /// promoting recurring messages to dedicated variants with
     /// stable diagnostic codes. The miette `code()` here remains
