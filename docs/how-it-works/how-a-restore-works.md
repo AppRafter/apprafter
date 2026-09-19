@@ -133,6 +133,18 @@ Five behaviours are load-bearing:
   re-provisions (and FLUSHes) the DB mid-restore. Ephemeral
   (`persistent: false`) claims carry no snapshot and come back empty — see the
   note at the top of this page.
+- **JetStream** streams are restored over the NATS wire from a helper pod in
+  the namespace the message server runs in, authenticated as the namespace's
+  **manager** user (`nats-mgr-<ns>`) — a claim's own user is denied the
+  snapshot API by design, and the manager identity is the one the design
+  reserves for this. The stream is **deleted and replayed**, because a restore
+  refuses a stream that already exists, and the controller that creates
+  declared streams will have recreated this one empty from its declaration
+  moments earlier. Losing that race is retried rather than reported: the
+  snapshot carries the messages and the consumers with their pending state,
+  while the stream's *configuration* keeps coming from the declaration in Git.
+  On a `--data-only` run the same replacement happens to a live stream, so
+  anything it holds that the snapshot does not is discarded.
 
 ## Secrets are re-sealed, not copied
 

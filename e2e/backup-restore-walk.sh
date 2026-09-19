@@ -9,8 +9,10 @@
 #
 # It exercises the shipped CLI surface end-to-end:
 #
-#   deploy app (needs.pg + needs.disk + user secret + tracked migration) ->
-#   write known data (pg row + volume marker) ->
+#   deploy app (needs.pg + needs.disk + needs.redis + needs.jetstream + user
+#     secret + tracked migration) ->
+#   write known data (pg row + volume marker + redis key + stream messages
+#     with a durable consumer) ->
 #   SourceCredential round-trip (rev-5: material in apprafter-system) ->
 #   `apprafter export` -> assert openable dumps (pg_restore -l, tar -t) ->
 #   `apprafter backup create` -> assert encrypted restic repo + backup list ->
@@ -20,6 +22,11 @@
 #     no hang (claims ready, R1 no-deadlock), app auto-registers,
 #     tracked migration SKIPS on boot (sees restored _migrations),
 #     pg row + volume marker are the BACKED-UP data (H2/R3),
+#     jetstream messages + durable consumer replayed into the fresh account,
+#   [SINGLE-CLUSTER] jetstream `--data-only` round-trip: purge the stream to
+#     the state a restore target is in (exists, empty), drop the durable, then
+#     `apprafter restore --data-only` -> both come back. NOT gated on the
+#     second cluster, so the restore path is walked even when Phase 4 skips,
 #     user secret + SourceCredential material re-sealed in the target ->
 #   `--data-only` round-trip.
 #
@@ -117,6 +124,26 @@ DF_ADMIN_SECRET_P="platform-redis-persistent-000-admin"
 # Known key+value written into redis before export (proves round-trip).
 REDIS_T12_KEY="t12key"
 REDIS_T12_VAL="t12value"
+
+# 2.6d-6: jetstream capture coordinates. The claim name follows the
+# operator's derivation (`<app>-jetstream`), the stream is DECLARED in the
+# manifest so NACK creates it on both clusters, and its subject sits under the
+# application's own prefix (`<app>.`) — a first token that is not the app name
+# would be fan-in, which ADR 0061 §6 gates as an ADR 0052 trigger.
+JS_CLAIM="${APP}-jetstream"
+JS_CONN="${JS_CLAIM}-conn"
+JS_STREAM="orders"                  # as DECLARED in the manifest
+# …and as it exists IN NATS: `nats_stream_name(owner_app, declared)` joins the
+# two on `_` (ADR 0061), which is also why the declared half must be DNS-1123
+# — the alphabet excludes `_`, and that is what keeps the join injective. The
+# capture plans from `status.streams`, so this composite name is what ends up
+# in the artifact's file name, `_` and all.
+JS_NATS_STREAM="${APP}_${JS_STREAM}"
+JS_SUBJECT="${APP}.orders.new"
+JS_CONSUMER="walkworker"            # a DURABLE consumer — its pending state is
+                                    # half of what a stream snapshot carries
+JS_MSGS=3
+NATS_BOX_POD="nats-box"
 
 # Backup artifacts (host paths, under the temp workspace).
 RESTIC_PASS="walk-restic-passphrase-2026"
@@ -544,8 +571,13 @@ spec:
     # blocking Ready (2.4h best-effort). One harmless failing HEAD per
     # reconcile, no rollout impact.
     replicas: 1
-    expose:
-      port: 5432
+    # No 'expose'. The fixture's entrypoint runs a migration and sleeps — it
+    # serves nothing — and since 2.28 (ADR 0065 §1.3) an 'expose.port' with no
+    # declared readiness gets a DEFAULT TCP-connect probe on that port. This
+    # walk carried a decorative 'expose.port: 5432', so from 2.28 onward
+    # its deployment could never become Available: the probe dialled a port
+    # nothing listened on. Nothing noticed because no CI workflow runs this
+    # walk. Found 2026-09-19 while adding the jetstream fixture.
     env:
       DATABASE_URL:
         claim: "pg.url"
@@ -560,7 +592,103 @@ spec:
       redis:
         persistent: true
         selector: { tier: integrated }
+      jetstream:
+        selector: { tier: integrated }
+        streams:
+          # 'maxBytes' is REQUIRED by the CRD, deliberately: a stream without
+          # one silently claims the whole account quota. The walk found this
+          # by omitting it — the apiserver refused the Application outright.
+          - name: ${JS_STREAM}
+            subjects: ["${APP}.orders.>"]
+            maxBytes: "8Mi"
 YAML
+}
+
+
+# ---------------------------------------------------------------
+# 2.6d-6 — jetstream helpers
+#
+# All three run against whatever cluster $KUBECONFIG names, so the same
+# functions serve the source cluster (seed + assert before backup) and the
+# fresh one (assert after restore) without a second copy.
+# ---------------------------------------------------------------
+
+# secret_val <ns> <name> <key> — base64-decoded Secret data key.
+secret_val() {
+    kubectl -n "$1" get secret "$2" -o jsonpath="{.data.$3}" 2>/dev/null | base64 -d
+}
+
+# nats_box_up — an idempotent nats-box debug pod in the app namespace.
+# Pinned to the image the CLI's own helper pods use, so the walk exercises the
+# same `nats` CLI the capture ships against.
+nats_box_up() {
+    kubectl -n "$APP_NS" get pod "$NATS_BOX_POD" >/dev/null 2>&1 || \
+        kubectl -n "$APP_NS" run "$NATS_BOX_POD" --image=natsio/nats-box:0.18.0 \
+            --restart=Never --command -- sleep infinity
+    retry 40 5 -- kubectl -n "$APP_NS" wait --for=condition=Ready \
+        "pod/${NATS_BOX_POD}" --timeout=20s
+}
+
+# js_client <nats-args...> — run the `nats` CLI AS THE CLAIM USER against the
+# claim's own connection Secret.
+#
+# `--inbox-prefix` is load-bearing, not decoration: the JetStream API is
+# request/reply, the account denies `_INBOX.>` (ADR 0061 §3), and without the
+# prefix the reply subscription is refused — which the client reports as a
+# TIMEOUT while the request itself went through. `needs-jetstream-walk.sh`
+# Phase 6 measures exactly that.
+js_client() {
+    js_host=$(secret_val "$APP_NS" "$JS_CONN" host)
+    js_port=$(secret_val "$APP_NS" "$JS_CONN" port)
+    js_user=$(secret_val "$APP_NS" "$JS_CONN" user)
+    js_pass=$(secret_val "$APP_NS" "$JS_CONN" pass)
+    js_inbox=$(secret_val "$APP_NS" "$JS_CONN" inboxPrefix)
+    if [ -z "$js_host" ] || [ -z "$js_user" ] || [ -z "$js_inbox" ]; then
+        printf 'FAILED: connection Secret %s/%s is missing host/user/inboxPrefix\n' \
+            "$APP_NS" "$JS_CONN" >&2
+        return 1
+    fi
+    kubectl -n "$APP_NS" exec "$NATS_BOX_POD" -- nats \
+        --server "${js_host}:${js_port}" --user "$js_user" --password "$js_pass" \
+        --inbox-prefix "$js_inbox" "$@"
+}
+
+# mgr_client <nats-args...> — run the `nats` CLI as the namespace's MANAGEMENT
+# user (`mgr_<ns>`, password in `nats-mgr-<ns>` in the namespace NATS runs in).
+#
+# Needed because an application is NOT allowed to purge its own stream:
+# `allowPurge` defaults to false (ADR 0061 §6) and PURGE stays out of the
+# claim user's allow list until the manifest re-grants it. Setting up a
+# restore target's state is an operator action anyway, and this is the
+# identity the platform reserves for acting on an account from outside — the
+# same one `backup`/`restore` authenticate as. No inbox prefix: the manager
+# subscribes under `>` and `_INBOX.>` both.
+mgr_client() {
+    mgr_host=$(secret_val "$APP_NS" "$JS_CONN" host)
+    mgr_port=$(secret_val "$APP_NS" "$JS_CONN" port)
+    # `<statefulset>.<namespace>.svc` — the only place a walk (or a backup)
+    # can learn where the lazily-enabled NATS component was installed.
+    mgr_ns=${mgr_host#*.}
+    mgr_ns=${mgr_ns%%.*}
+    mgr_pass=$(secret_val "$mgr_ns" "nats-mgr-${APP_NS}" password)
+    if [ -z "$mgr_pass" ]; then
+        printf 'FAILED: no manager password in %s/nats-mgr-%s\n' "$mgr_ns" "$APP_NS" >&2
+        return 1
+    fi
+    kubectl -n "$APP_NS" exec "$NATS_BOX_POD" -- nats \
+        --server "${mgr_host}:${mgr_port}" --user "mgr_${APP_NS}" --password "$mgr_pass" "$@"
+}
+
+# js_message_count <stream> — messages the stream holds, or empty on failure.
+# Read out of `--json` with python3 (already a walk dependency, used for the
+# manifest) rather than grepped: a count is a number, and `grep -o` over JSON
+# would just as happily match a different field that ends in the same digits.
+js_message_count() {
+    js_info=$(js_client stream info "$1" --json 2>/dev/null || true)
+    [ -n "$js_info" ] || return 0
+    printf '%s' "$js_info" | python3 -c \
+        "import json,sys; print(json.load(sys.stdin).get('state',{}).get('messages',''))" \
+        2>/dev/null || true
 }
 
 # ===============================================================
@@ -667,6 +795,65 @@ redis_get=$(redis_admin_on "$DF_INSTANCE_P" "$DF_ADMIN_SECRET_P" \
 assert_eq "T12 — GET ${REDIS_T12_KEY} readable before export (sanity)" \
     "$redis_get" "$REDIS_T12_VAL"
 
+# 2.6d-6: seed the jetstream claim with messages AND a durable consumer.
+# The claim provisions lazily — the first jetstream claim on the cluster turns
+# the NATS component on through `PlatformStack.spec.overrides.nats.enabled`,
+# so Argo has to install nats + nack before it can go Ready. That is minutes,
+# not seconds, hence the wide budget.
+wait_jsonpath "$CLAIM_RES" "$APP_NS" "$JS_CLAIM" '{.status.ready}' true 900
+printf '  ok: jetstream claim %s ready (NATS + nack installed lazily)\n' "$JS_CLAIM"
+
+nats_box_up
+
+# The provisioner's stream INVENTORY has to list it before anything else here
+# means much: `plan_extraction` reads `status.streams.declared` to decide what
+# to dump, so an empty inventory is a backup that captures nothing while every
+# other signal is green. Waiting on it also solves a subtler problem — NACK
+# creates the stream a beat after the claim goes Ready, and a `nats pub` before
+# that lands in core NATS and is GONE (the publish still reports success).
+js_inventory_has_stream() {
+    js_declared=$(kubectl -n "$APP_NS" get "$CLAIM_RES" "$JS_CLAIM" \
+        -o jsonpath='{.status.streams.declared[*]}' 2>/dev/null || true)
+    case " $js_declared " in
+        *" $JS_NATS_STREAM "*) return 0 ;;
+        *) printf '  inventory so far: %s\n' "${js_declared:-<empty>}" >&2; return 1 ;;
+    esac
+}
+retry 60 10 -- js_inventory_has_stream
+printf '  ok: 2.6d-6 — claim inventory lists %s (the field the capture plans from)\n' \
+    "$JS_NATS_STREAM"
+
+js_i=1
+while [ "$js_i" -le "$JS_MSGS" ]; do
+    js_pub=$(js_client pub "$JS_SUBJECT" "walk-jetstream-message-${js_i}" 2>&1 || true)
+    case "$js_pub" in
+        *Published*) : ;;
+        *) printf 'FAILED: publish %d to %s did not confirm: %s\n' \
+               "$js_i" "$JS_SUBJECT" "$js_pub" >&2; exit 1 ;;
+    esac
+    js_i=$(( js_i + 1 ))
+done
+
+# A DURABLE consumer, written through a config file the way the sibling walk
+# does — `consumer add` without one prompts, and a prompt inside `kubectl exec`
+# hangs the walk rather than failing it.
+kubectl -n "$APP_NS" exec -i "$NATS_BOX_POD" -- sh -c 'cat > /tmp/walkconsumer.json' <<JSON
+{"durable_name":"${JS_CONSUMER}","ack_policy":"explicit","deliver_policy":"all"}
+JSON
+js_cons=$(js_client consumer add "$JS_NATS_STREAM" "$JS_CONSUMER" \
+    --config /tmp/walkconsumer.json 2>&1 || true)
+case "$js_cons" in
+    *created*) : ;;
+    *) printf 'FAILED: durable consumer %s not created: %s\n' "$JS_CONSUMER" "$js_cons" >&2
+       exit 1 ;;
+esac
+
+js_seeded=$(js_message_count "$JS_NATS_STREAM")
+assert_eq "2.6d-6 — stream ${JS_NATS_STREAM} holds the seeded messages (pre-export)" \
+    "$js_seeded" "$JS_MSGS"
+printf '  ok: 2.6d-6 — %s messages + durable consumer %s seeded in stream %s\n' \
+    "$JS_MSGS" "$JS_CONSUMER" "$JS_NATS_STREAM"
+
 # ===============================================================
 # Phase 1b: SourceCredential round-trip (rev-5)
 # ===============================================================
@@ -760,6 +947,30 @@ REDIS_DUMP_TAR="${EXPORT_DIR}/redis/${APP_NS}/${REDIS_CLAIM}/dump.tar"
 printf '  ok: T12 — redis dump.tar captured at %s (size=%s)\n' \
     "$REDIS_DUMP_TAR" "$(wc -c <"$REDIS_DUMP_TAR" | tr -d ' ')"
 
+# 2.6d-6: the stream artifact. `nats stream backup` writes a DIRECTORY
+# (`backup.json` + `stream.tar.s2`) and the extractor tars it, so both entries
+# must be inside — a tar holding only the metadata would restore an empty
+# stream and look like a capture.
+JS_TAR="${EXPORT_DIR}/jetstream/${APP_NS}/${JS_CLAIM}/${JS_NATS_STREAM}.tar"
+[ -f "$JS_TAR" ] || {
+    printf 'FAILED: 2.6d-6 — expected stream artifact %s missing\n' "$JS_TAR" >&2
+    ls -R "$EXPORT_DIR" >&2 2>&1 || true
+    exit 1
+}
+js_entries=$(tar -tf "$JS_TAR" 2>/dev/null || true)
+case "$js_entries" in
+    *stream.tar.s2*) : ;;
+    *) printf 'FAILED: 2.6d-6 — %s carries no stream.tar.s2:\n%s\n' "$JS_TAR" "$js_entries" >&2
+       exit 1 ;;
+esac
+case "$js_entries" in
+    *backup.json*) : ;;
+    *) printf 'FAILED: 2.6d-6 — %s carries no backup.json:\n%s\n' "$JS_TAR" "$js_entries" >&2
+       exit 1 ;;
+esac
+printf '  ok: 2.6d-6 — stream artifact %s carries backup.json + stream.tar.s2 (size=%s)\n' \
+    "$JS_TAR" "$(wc -c <"$JS_TAR" | tr -d ' ')"
+
 # ===============================================================
 # Phase 3: `apprafter backup create` -> encrypted restic repo + list + H1
 # ===============================================================
@@ -844,6 +1055,74 @@ else
     printf 'FAILED: rev-5 — SourceCredential material NOT captured (follow-the-reference broken)\n' >&2
     find "$DUMP_DIR" -name '*.json' >&2; exit 1
 fi
+
+# ===============================================================
+# Phase 3b: 2.6d-6 — jetstream restore, on ONE cluster
+# ===============================================================
+
+phase "Phase 3b: 2.6d-6 — jetstream --data-only round-trip (single cluster)"
+
+# This runs BEFORE the two-cluster phases and is NOT gated on them, because
+# the restore path must not be provable only when a second cluster comes up:
+# a SOFT-SKIP there would otherwise leave `load_jetstream` walked by nothing.
+#
+# The state it sets up is the one that matters. PURGE rather than delete: the
+# stream then EXISTS and is EMPTY — exactly what a restore target looks like
+# after NACK recreates a declared stream from its CR, which is the condition
+# `nats stream restore` refuses and the loader has to delete through. The
+# durable is removed too, so its return is a restoration rather than a
+# survival.
+# First, incidentally but worth pinning: the APPLICATION cannot purge its own
+# stream. `allowPurge` defaults to false (ADR 0061 §6), so PURGE is outside
+# the claim user's allow list until the manifest re-grants it — and this walk
+# declares no such re-grant. Found by this phase trying it.
+js_purge_denied=$(js_client stream purge "$JS_NATS_STREAM" -f 2>&1 || true)
+js_left=$(js_message_count "$JS_NATS_STREAM")
+assert_eq "2.6d-6 — the application cannot purge its own stream (allowPurge defaults false)" \
+    "$js_left" "$JS_MSGS"
+printf '  ok: 2.6d-6 — claim user refused PURGE, messages intact (%s)\n' \
+    "$(printf '%s' "$js_purge_denied" | tail -1)"
+
+# The MANAGER identity is the one that may — and the one the backup itself
+# authenticates as.
+mgr_client stream purge "$JS_NATS_STREAM" -f >/dev/null 2>&1 || {
+    printf 'FAILED: 2.6d-6 — the manager could not purge %s before the round-trip\n' \
+        "$JS_NATS_STREAM" >&2
+    exit 1
+}
+mgr_client consumer rm "$JS_NATS_STREAM" "$JS_CONSUMER" -f >/dev/null 2>&1 || {
+    printf 'FAILED: 2.6d-6 — the manager could not remove durable %s\n' "$JS_CONSUMER" >&2
+    exit 1
+}
+js_emptied=$(js_message_count "$JS_NATS_STREAM")
+assert_eq "2.6d-6 — stream emptied before the restore (the target's own state)" \
+    "$js_emptied" "0"
+js_no_consumer=$(js_client consumer ls "$JS_NATS_STREAM" 2>&1 || true)
+case "$js_no_consumer" in
+    *"$JS_CONSUMER"*)
+        printf 'FAILED: 2.6d-6 — durable %s still present after removal\n' "$JS_CONSUMER" >&2
+        exit 1 ;;
+esac
+printf '  ok: 2.6d-6 — %s exists and is empty, durable gone (restore has something to prove)\n' \
+    "$JS_NATS_STREAM"
+
+apprafter restore "$RESTIC_REPO" --data-only --passphrase "$RESTIC_PASS"
+
+js_restored=$(js_message_count "$JS_NATS_STREAM")
+assert_eq "2.6d-6 — messages replayed into the existing empty stream" \
+    "$js_restored" "$JS_MSGS"
+js_back=$(js_client consumer ls "$JS_NATS_STREAM" 2>&1 || true)
+case "$js_back" in
+    *"$JS_CONSUMER"*) : ;;
+    *) printf 'FAILED: 2.6d-6 — durable %s did not come back:\n%s\n' "$JS_CONSUMER" "$js_back" >&2
+       exit 1 ;;
+esac
+printf '  ok: 2.6d-6 — load_jetstream deleted the empty stream and replayed %s messages + durable %s\n' \
+    "$js_restored" "$JS_CONSUMER"
+
+# The data-only restore resumed the workload, so the app pod is a new one.
+POD="$(app_pod "$APP")"
+[ -n "$POD" ] || { printf 'FAILED: no app pod after the --data-only round-trip\n' >&2; exit 1; }
 
 # ===============================================================
 # Phase 4: FRESH target cluster (SOFT-skip if two clusters infeasible)
@@ -963,6 +1242,31 @@ else
     printf '  ok: T12 — load_redis replayed the snapshot on the fresh cluster (key %s=%s)\n' \
         "$REDIS_T12_KEY" "$REDIS_T12_VAL"
 
+    # 2.6d-6: the streams came back on the FRESH cluster. What is being
+    # proved is a replacement, not a survival: this cluster never saw the
+    # messages, its NATS was installed lazily by the restored claim, and NACK
+    # recreated the DECLARED stream EMPTY from its Stream CR before the loader
+    # deleted and replayed it. A count equal to the seed is therefore only
+    # explicable by the snapshot.
+    wait_jsonpath "$CLAIM_RES" "$APP_NS" "$JS_CLAIM" '{.status.ready}' true 900
+    nats_box_up
+    rjs_count=$(js_message_count "$JS_NATS_STREAM")
+    assert_eq "2.6d-6 — stream ${JS_NATS_STREAM} restored with its messages on the fresh cluster" \
+        "$rjs_count" "$JS_MSGS"
+
+    # …and its durable consumer, with its pending state. A stream restored
+    # without consumers replays everything to a subscriber that had already
+    # processed it, which is the half a message count cannot see.
+    rjs_consumers=$(js_client consumer ls "$JS_NATS_STREAM" 2>&1 || true)
+    case "$rjs_consumers" in
+        *"$JS_CONSUMER"*) : ;;
+        *) printf 'FAILED: 2.6d-6 — durable consumer %s did not come back:\n%s\n' \
+               "$JS_CONSUMER" "$rjs_consumers" >&2
+           exit 1 ;;
+    esac
+    printf '  ok: 2.6d-6 — %s messages + durable consumer %s restored into the fresh cluster\n' \
+        "$rjs_count" "$JS_CONSUMER"
+
     # The user secret + SourceCredential material were re-sealed + present.
     wait_jsonpath secret "$APP_NS" "$USER_SECRET" '{.metadata.name}' "$USER_SECRET" 120
     us_val=$(kubectl -n "$APP_NS" get secret "$USER_SECRET" -o jsonpath="{.data.${USER_SECRET_KEY}}" 2>/dev/null | base64 -d || true)
@@ -1041,7 +1345,7 @@ rm -rf "$TMPDIR_WORK"
 
 printf '\nbackup-restore-walk GREEN in %s\n' "$(elapsed)"
 if [ "$TWO_CLUSTER_OK" -eq 1 ]; then
-    printf 'Chain proven: deploy (pg+disk+redis+secret+tracked-migration) -> write data (pg row + volume marker + T12 redis key) -> SourceCredential round-trip -> export (openable pg dump + volume tar + T12 redis dump.tar) -> backup (encrypted restic + list + H1) -> restore-into-fresh (auto-register, migration SKIPS, backed-up data, T12 redis FLUSH+recovery, re-sealed secrets) -> --data-only round-trip (incl. T12 redis)\n'
+    printf 'Chain proven: deploy (pg+disk+redis+jetstream+secret+tracked-migration) -> write data (pg row + volume marker + T12 redis key + 3 stream messages with a durable) -> SourceCredential round-trip -> export (openable pg dump + volume tar + T12 redis dump.tar + stream snapshot) -> backup (encrypted restic + list + H1) -> 2.6d-6 jetstream --data-only round-trip (emptied stream + dropped durable both replayed) -> restore-into-fresh (auto-register, migration SKIPS, backed-up data, T12 redis FLUSH+recovery, stream messages + durable, re-sealed secrets) -> --data-only round-trip (incl. T12 redis)\n'
 else
-    printf 'Chain proven (single-cluster): deploy (pg+disk+redis+secret+tracked-migration) -> write data (pg row + volume marker + T12 redis key) -> SourceCredential round-trip -> export (openable pg dump + volume tar + T12 redis dump.tar captured) -> backup (encrypted restic + list + H1 + rev-5 material). Restore-into-fresh SOFT-skipped (two-cluster resource limit) -> rides the real-Hetzner manual walk (2.6d T13).\n'
+    printf 'Chain proven (single-cluster): deploy (pg+disk+redis+jetstream+secret+tracked-migration) -> write data (pg row + volume marker + T12 redis key + 3 stream messages with a durable) -> SourceCredential round-trip -> export (openable pg dump + volume tar + T12 redis dump.tar + stream snapshot captured) -> backup (encrypted restic + list + H1 + rev-5 material) -> 2.6d-6 jetstream --data-only round-trip (emptied stream + dropped durable both replayed, so the RESTORE path is walked here and not only in the two-cluster phases). Restore-into-fresh SOFT-skipped (two-cluster resource limit) -> rides the real-Hetzner manual walk (2.6d T13).\n'
 fi

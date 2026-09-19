@@ -80,7 +80,10 @@ post-launch work is not a roadmap phase and has no subscribe control.
 > Solo node today. The reservations are summed against that limit: a namespace that would not fit is
 > refused and told so on its own dependency, naming the budget, while every namespace already on the
 > server keeps running untouched. A larger per-tier budget is planned.
-> JetStream stores are out of scope for backup and restore.
+> A backup carries every stream an application owns — its messages and its consumers with their
+> pending state — and a restore replays them. Streams the platform cannot attribute to a
+> declaration stay out, as do snapshots taken before capture shipped, which say so when you
+> inspect them.
 
 > **A shared database is created as its own resource and deleted as its own resource.** Removing
 > an application drops that application's own credential and nothing else; the data is never touched

@@ -55,6 +55,50 @@ patch of each phase.
   artifact. A claim that never provisioned has no account to read and is
   skipped, exactly as an unprovisioned pg claim is.
 
+### Walked
+
+- **`e2e/backup-restore-walk.sh` carries the capture and the replay, end to
+  end, on a real cluster.** The walk's application declares `needs.jetstream`
+  with a stream of its own; the walk seeds it with messages and a DURABLE
+  consumer, waits for the claim's own inventory to list the stream — that is
+  the field the capture plans from, so an empty one would be a green backup of
+  nothing — and asserts the artifact
+  (`jetstream/demo/shop-jetstream/shop_orders.tar`, 5120 B, `backup.json` +
+  `stream.tar.s2`) produced by a helper pod in `nats-system` under
+  `nats-mgr-demo`. GREEN with ten assertions.
+
+  The replay is proved on ONE cluster and deliberately not gated on the
+  two-cluster phases: the stream is put into exactly the state a restore
+  target is in — existing and EMPTY, because the controller recreates a
+  declared stream from its CR — its durable is dropped, and
+  `apprafter restore --data-only` brings both back. The fresh-cluster
+  assertions stay for when a second cluster comes up; on this machine it twice
+  did not (the root Argo application never reaches `Synced` inside the
+  bootstrap's 600s), and a SOFT-SKIP there would otherwise have left
+  `load_jetstream` walked by nothing.
+
+  Four things the runs found, none of them in the subject of this work:
+
+  * `maxBytes` is REQUIRED on a declared stream — deliberately, since a stream
+    without one silently claims the whole account quota — and the apiserver
+    refuses the Application outright. The fixture was missing it.
+  * **The walk has been broken since 2.28.** ADR 0065 §1.3 gives an
+    `expose.port` with no declared readiness a default TCP-connect probe, and
+    this walk's fixture (a migration entrypoint that then sleeps) declared
+    `5432` decoratively and listens on nothing, so its deployment could never
+    become Available. No CI workflow runs this walk, so nothing said so for
+    four days. Swept the other walks: every one of them exposes a port its
+    image really serves, so this was the only one.
+  * A stream's NATS-side name is COMPOSITE — `nats_stream_name(app, declared)`
+    joins on `_` — so the artifact is `shop_orders.tar`, not `orders.tar`. The
+    capture already read it correctly (it plans from `status.streams`); the
+    fixture did not.
+  * A `nats pub` to a subject whose stream does not exist yet reports success
+    and the message is gone. The walk now waits for the inventory first.
+  * An application may NOT purge its own stream (`allowPurge` defaults false).
+    Pinned as its own assertion, and the manager identity — the one the backup
+    authenticates as — prepares the target state instead.
+
 ### Fixed
 
 - **A sequential backup of a `needs.disk` claim restored nothing, and said so
