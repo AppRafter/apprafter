@@ -348,11 +348,13 @@ pub enum Commands {
     ///
     /// Read-only.
     Top,
-    /// Native data export (Kind 1) — pull pg dumps, volume tars and
-    /// persistent-redis snapshots to a plain local folder +
-    /// `manifest.json`. An ephemeral (`persistent: false`) redis claim
-    /// is a cache by declaration and is skipped. No CRs, no secrets, no
-    /// encryption. A debugging / one-off-recovery convenience.
+    /// Native data export (Kind 1) — pull pg dumps, volume tars,
+    /// persistent-redis snapshots and JetStream stream snapshots to a
+    /// plain local folder + `manifest.json`. An ephemeral
+    /// (`persistent: false`) redis claim is a cache by declaration and
+    /// is skipped; so is a jetstream stream the claim does not own. No
+    /// CRs, no secrets, no encryption. A debugging / one-off-recovery
+    /// convenience.
     Export {
         /// Narrow scope to these namespaces (repeatable). Ignored unless
         /// `--select` is also passed.
@@ -374,10 +376,12 @@ pub enum Commands {
         action: BackupAction,
     },
     /// Restore a backup into a target cluster: replays the CRs, secrets and
-    /// native data (pg, volumes and persistent-redis snapshots) captured by
-    /// `apprafter backup`. A persistent redis claim is reloaded into the
-    /// running instance with `DFLY LOAD`; an ephemeral one comes back empty
-    /// because it holds no durable data. Modes:
+    /// native data (pg, volumes, persistent-redis snapshots and JetStream
+    /// streams) captured by `apprafter backup`. A persistent redis claim is
+    /// reloaded into the running instance with `DFLY LOAD`; an ephemeral one
+    /// comes back empty because it holds no durable data. A JetStream stream
+    /// is replaced by its snapshot — messages and consumers together — which
+    /// DISCARDS whatever the target's stream of that name holds. Modes:
     /// restore-into-running (default; the target must already be bootstrapped),
     /// `--data-only` (reload native data only, no CR/secret replay), and
     /// `--reprovision` (provision a fresh cluster first, then replay). Secrets

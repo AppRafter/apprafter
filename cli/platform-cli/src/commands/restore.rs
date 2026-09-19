@@ -2059,7 +2059,201 @@ fn load_data(data_dir: &Path, manifest: &BackupManifest, kubeconfig: &Path) -> R
     load_volumes(data_dir, manifest, &k, kubeconfig)?;
     // redis: data/redis/<ns>/<claim>/dump.tar → Dragonfly whole-instance snapshot.
     load_redis(data_dir, &k, kubeconfig)?;
+    // jetstream: data/jetstream/<ns>/<claim>/<stream>.tar → the stream, over
+    // the NATS wire, messages and consumers together (2.6d-6).
+    load_jetstream(data_dir, &k, kubeconfig)?;
     Ok(())
+}
+
+/// One dumped stream on disk: `jetstream/<ns>/<claim>/<stream>.tar`.
+struct StreamArtifact {
+    namespace: String,
+    claim: String,
+    /// The stream name, read off the file stem — verbatim, including the `_`
+    /// that a pod name could not have carried.
+    stream: String,
+    path: PathBuf,
+}
+
+/// Every stream artifact under `data_dir`, in stable order.
+///
+/// A sibling of [`discover_nested_artifacts`] rather than a call into it: that
+/// one looks for ONE known file name per claim directory, and here the file
+/// name is the payload's identity. A missing `data/jetstream` is not an error —
+/// a backup with no jetstream claim simply has none.
+fn discover_stream_artifacts(data_dir: &Path) -> Vec<StreamArtifact> {
+    let mut out = Vec::new();
+    let Ok(namespaces) = std::fs::read_dir(data_dir.join("jetstream")) else {
+        return out;
+    };
+    for ns_entry in namespaces.flatten() {
+        let ns_path = ns_entry.path();
+        if !ns_path.is_dir() {
+            continue;
+        }
+        let namespace = ns_entry.file_name().to_string_lossy().into_owned();
+        let Ok(claims) = std::fs::read_dir(&ns_path) else {
+            continue;
+        };
+        for claim_entry in claims.flatten() {
+            let claim_dir = claim_entry.path();
+            if !claim_dir.is_dir() {
+                continue;
+            }
+            let claim = claim_entry.file_name().to_string_lossy().into_owned();
+            let Ok(files) = std::fs::read_dir(&claim_dir) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let path = file.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("tar") {
+                    continue;
+                }
+                let Some(stream) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                out.push(StreamArtifact {
+                    namespace: namespace.clone(),
+                    claim: claim.clone(),
+                    stream: stream.to_string(),
+                    path,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        (&a.namespace, &a.claim, &a.stream).cmp(&(&b.namespace, &b.claim, &b.stream))
+    });
+    out
+}
+
+/// The one-shot `sh -c` script that replays one stream snapshot.
+///
+/// Three measured facts shape it (nats-server 2.14.3, `nats` CLI v0.2.3):
+///
+/// * `nats stream restore` takes the DIRECTORY `nats stream backup` wrote, so
+///   the tar is unpacked first — it arrives on stdin, which is why `tar x` is
+///   the only thing in here that reads it;
+/// * the restore REFUSES a stream that exists (`Stream "X" already exist`,
+///   exit 1), so the stream is deleted first;
+/// * NACK recreates a declared stream empty from its Stream CR on its own
+///   loop, so losing that race between the delete and the replay is expected.
+///   The loop retries on exactly that message and on nothing else — any other
+///   failure is surfaced with the server's own words rather than retried into
+///   a timeout.
+///
+/// What comes back is messages AND consumers with their pending state; a
+/// stream restored without its consumers would replay everything to a
+/// subscriber that had already processed it.
+fn jetstream_restore_script(stream: &str) -> String {
+    let stream_q = backup_core::helper_pod::shell_single_quote(stream);
+    format!(
+        "set -e; \
+         rm -rf /tmp/bk; mkdir -p /tmp/bk; \
+         tar x -C /tmp/bk; \
+         i=0; \
+         while :; do \
+           nats stream rm {stream_q} -f >/dev/null 2>&1 || true; \
+           if nats stream restore /tmp/bk --no-progress >/tmp/nats.err 2>&1; then exit 0; fi; \
+           if ! grep -q 'already exist' /tmp/nats.err; then cat /tmp/nats.err >&2; exit 1; fi; \
+           i=$((i+1)); \
+           if [ \"$i\" -ge 5 ]; then \
+             echo 'the stream was recreated faster than it could be restored' >&2; \
+             cat /tmp/nats.err >&2; exit 1; \
+           fi; \
+           sleep 2; \
+         done"
+    )
+}
+
+/// Replay every stream snapshot into the freshly-provisioned account.
+///
+/// Grouped by claim: the server coordinates and the manager credentials are
+/// per-claim, so one helper pod serves all of that claim's streams. The
+/// coordinates come from the RESTORED claim's connection Secret (the fresh
+/// ones, never the backed-up ones — the same rule the pg loader follows), and
+/// the credentials from `nats-mgr-<ns>`, because a claim user is denied the
+/// snapshot API by construction (ADR 0061 §4.2).
+fn load_jetstream(data_dir: &Path, k: &dyn KubeExec, kubeconfig: &Path) -> Result<()> {
+    let artifacts = discover_stream_artifacts(data_dir);
+    if artifacts.is_empty() {
+        return Ok(());
+    }
+
+    let mut by_claim: BTreeMap<(String, String), Vec<StreamArtifact>> = BTreeMap::new();
+    for a in artifacts {
+        by_claim
+            .entry((a.namespace.clone(), a.claim.clone()))
+            .or_default()
+            .push(a);
+    }
+
+    for ((ns, claim), streams) in by_claim {
+        let conn = resolve_claim_connection_secret(&ns, &claim, kubeconfig)?;
+        let host = k.get_secret_key(&conn, &ns, "host")?;
+        let port = k.get_secret_key(&conn, &ns, "port")?;
+        let nats_ns = backup_core::extract::nats_namespace_of_host(&host).ok_or_else(|| {
+            CliError::Other(format!(
+                "cannot tell which namespace NATS runs in from host {host:?} \
+                 (claim {ns}/{claim}): expected <service>.<namespace>.svc"
+            ))
+        })?;
+        let mgr = backup_core::extract::mgr_secret_name(&ns);
+        let user = k.get_secret_key(&mgr, &nats_ns, "user")?;
+        let password = k.get_secret_key(&mgr, &nats_ns, "password")?;
+
+        let pod_name = format!("rs-js-{}", backup_core::extract::pod_name_segment(&claim));
+        let spec = backup_core::helper_pod::nats_pod_spec(
+            &pod_name,
+            &nats_ns,
+            backup_core::images::JETSTREAM_IMAGE,
+            &format!("nats://{host}:{port}"),
+            &user,
+            &password,
+        );
+        k.apply_and_wait_pod_ready(&spec)?;
+
+        for artifact in &streams {
+            let script = jetstream_restore_script(&artifact.stream);
+            let argv: Vec<&str> = vec!["sh", "-c", &script];
+            let outcome = k.exec_stream_from_file(&pod_name, &nats_ns, &argv, &artifact.path);
+            if outcome.is_err() {
+                // Tear the pod down before surfacing, so a failed stream does
+                // not also leave a helper behind in the operator's namespace.
+                k.delete_pod_best_effort(&pod_name, &nats_ns);
+            }
+            outcome?;
+            println!(
+                "  ✓ stream restored: {ns}/{claim} → {} (messages + consumers)",
+                artifact.stream
+            );
+        }
+        k.delete_pod_best_effort(&pod_name, &nats_ns);
+    }
+    Ok(())
+}
+
+/// The connection Secret a freshly-provisioned claim published
+/// (`status.connectionSecretRef`), read off the regenerated claim.
+fn resolve_claim_connection_secret(ns: &str, claim: &str, kubeconfig: &Path) -> Result<String> {
+    let claim_json = kubectl_get_json(
+        "resourceclaims.apprafter.io",
+        Some(claim),
+        Some(ns),
+        kubeconfig,
+    )?
+    .ok_or_else(|| {
+        CliError::Other(format!(
+            "claim {ns}/{claim} not found at jetstream LoadData — was it gated/applied?"
+        ))
+    })?;
+    claim_status_field(
+        &claim_json,
+        "/status/connectionSecretRef",
+        "connectionSecretRef",
+        ns,
+        claim,
+    )
 }
 
 /// Restore every `data/pg/<ns>/<claim>.dump` via `pg_restore` over a helper
@@ -2595,11 +2789,10 @@ fn dfly_load_script(password: &str) -> String {
     )
 }
 
-/// POSIX-safe single-quote of an arbitrary string for embedding in a `sh -c`
-/// script (wraps in single quotes, escaping embedded single quotes).
-fn shell_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
+/// POSIX-safe single-quote, from `backup-core` — the dump side quotes stream
+/// names with the same function, and two quoting rules in one repository is
+/// how one of them ends up subtly different from the other.
+use backup_core::helper_pod::shell_single_quote;
 
 /// **ReSealUserSecrets** — re-seal each app user secret under
 /// `secrets/<ns>/<name>.json` (NOT `secrets/sourcecred/…`, which
@@ -3226,7 +3419,7 @@ fn find_claim_data_dir(root: &Path) -> Option<PathBuf> {
             if p.is_dir() {
                 if matches!(
                     p.file_name().and_then(|n| n.to_str()),
-                    Some("pg") | Some("redis") | Some("disk")
+                    Some("pg") | Some("redis") | Some("disk") | Some("jetstream")
                 ) {
                     has_payload = true;
                 }
@@ -5228,8 +5421,13 @@ mod tests {
         assert_eq!(m.cluster_id, "k3d-demo");
         assert_eq!(m.namespaces, vec!["demo".to_string()]);
         assert_eq!(
-            m.manifest_version, MANIFEST_VERSION_CURRENT,
-            "a shipped v1 manifest carries no manifestVersion and must default, not fail"
+            m.manifest_version, 1,
+            "a shipped v1 manifest carries no manifestVersion and must read as v1 — \
+             not as whatever version this build writes"
+        );
+        assert!(
+            m.manifest_version <= MANIFEST_VERSION_CURRENT,
+            "…and a version this build can read, so the restore is not refused"
         );
     }
 
@@ -6018,6 +6216,91 @@ mod tests {
         assert_eq!(redis.len(), 1);
         assert_eq!(redis[0].1, "cache");
         assert!(discover_nested_artifacts(dd.path(), "pg", "data.tar").is_empty());
+    }
+
+    /// A sequential run stages ONE claim per snapshot, so a snapshot holding
+    /// only a jetstream payload has to be recognised as a payload directory —
+    /// otherwise its data is restored by nothing and the restore reports
+    /// success.
+    #[test]
+    fn a_per_claim_snapshot_holding_only_streams_is_a_payload_directory() {
+        let root = tempfile::tempdir().unwrap();
+        write_at(
+            root.path(),
+            "claim-1/data/jetstream/atm/worker-js/orders.tar",
+            "TAR",
+        );
+        assert_eq!(
+            find_claim_data_dir(root.path()),
+            Some(root.path().join("claim-1/data"))
+        );
+    }
+
+    /// JetStream artifacts are keyed by STREAM, not by a fixed payload name:
+    /// `jetstream/<ns>/<claim>/<stream>.tar`. The volume/redis discovery looks
+    /// for one known file name and cannot read this tree at all.
+    #[test]
+    fn stream_artifacts_are_discovered_by_file_stem() {
+        let dd = tempfile::tempdir().unwrap();
+        write_at(dd.path(), "jetstream/atm/worker-js/orders.tar", "TAR-A");
+        write_at(dd.path(), "jetstream/atm/worker-js/orders_dlq.tar", "TAR-B");
+        write_at(dd.path(), "jetstream/atm/api-js/events.tar", "TAR-C");
+        // Not an artifact: the dump writes `<stream>.tar` and nothing else.
+        write_at(dd.path(), "jetstream/atm/worker-js/notes.txt", "x");
+
+        let found = discover_stream_artifacts(dd.path());
+        let seen: Vec<(String, String, String)> = found
+            .iter()
+            .map(|a| (a.namespace.clone(), a.claim.clone(), a.stream.clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "atm".to_string(),
+                    "api-js".to_string(),
+                    "events".to_string()
+                ),
+                (
+                    "atm".to_string(),
+                    "worker-js".to_string(),
+                    "orders".to_string()
+                ),
+                (
+                    "atm".to_string(),
+                    "worker-js".to_string(),
+                    "orders_dlq".to_string()
+                ),
+            ],
+            "stable order, stream read off the file stem, non-tar ignored"
+        );
+        assert!(discover_stream_artifacts(dd.path().join("nope").as_path()).is_empty());
+    }
+
+    /// Measured on a real server (nats 2.14.3 / CLI v0.2.3): `nats stream
+    /// restore` refuses a stream that exists — `Stream "X" already exist`,
+    /// exit 1 — and NACK recreates a DECLARED stream empty as soon as the
+    /// claim provisions. So the replay deletes first, and treats losing that
+    /// race as a retry rather than a failure.
+    #[test]
+    fn the_restore_script_deletes_before_it_replays_and_retries_the_race() {
+        let script = jetstream_restore_script("orders");
+        let rm = script.find("stream rm").expect("deletes the stream");
+        let restore = script.find("stream restore").expect("replays the snapshot");
+        assert!(rm < restore, "delete must precede replay: {script}");
+        assert!(
+            script.contains("already exist"),
+            "retries the race: {script}"
+        );
+        assert!(
+            script.contains("tar x -C"),
+            "reads the tar on stdin: {script}"
+        );
+        assert!(
+            script.contains("'orders'"),
+            "the stream is quoted: {script}"
+        );
+        assert!(script.starts_with("set -e"), "{script}");
     }
 
     /// `secrets/sourcecred/` is NOT a namespace: `ApplySourceCredentials` has

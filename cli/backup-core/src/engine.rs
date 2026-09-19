@@ -1634,20 +1634,42 @@ mod tests {
         );
     }
 
-    /// A6 FIRES: a jetstream claim is listed AND marked, and the marker is in
-    /// the manifest JSON. Listing it unmarked is the finding — a snapshot that
-    /// reads complete while the stream data is not in it.
+    /// A6's marker, in the manifest JSON, for a ref that carries it.
+    ///
+    /// Built directly rather than through a claim type, because 2.6d-6 emptied
+    /// `CLAIM_TYPES_WITHOUT_DATA_CAPTURE` — jetstream was its only entry and
+    /// its streams are captured now. What still has to hold is the SHAPE a
+    /// future entry would be written in: present as `true`, absent otherwise
+    /// (`nothing_else_carries_the_no_data_marker` below), so an older reader
+    /// treats the absent key as "data captured", which is correct.
     #[test]
-    fn a_jetstream_claim_is_listed_and_marked_as_carrying_no_data() {
+    fn the_no_data_marker_reaches_the_manifest_json_as_a_present_true() {
+        let marked = ResourceRef {
+            namespace: "demo".into(),
+            kind: "ResourceClaim".into(),
+            name: "events".into(),
+            claim_type: Some("clickhouse".into()),
+            no_data: true,
+        };
+        let v = serde_json::to_value(&marked).unwrap();
+        assert_eq!(v["no_data"], json!(true), "{v}");
+    }
+
+    /// The 2.6d-6 behaviour change, pinned from the manifest's side: a
+    /// jetstream claim is listed and NOT marked, because its streams are in
+    /// the snapshot now. A marker here would send a reader looking for data
+    /// that is present.
+    #[test]
+    fn a_jetstream_claim_is_listed_without_the_no_data_marker() {
         let claim = json!({
             "metadata": {"name": "events", "namespace": "demo"},
             "spec": {"type": "jetstream"}
         });
         let refs = resource_refs(&[], std::slice::from_ref(&claim));
         assert_eq!(refs.len(), 1, "the claim stays in the manifest");
-        assert!(refs[0].no_data);
+        assert!(!refs[0].no_data);
         let v = serde_json::to_value(&refs[0]).unwrap();
-        assert_eq!(v["no_data"], json!(true), "{v}");
+        assert_eq!(v.get("no_data"), None, "the key must be absent: {v}");
     }
 
     /// DOES NOT FIRE elsewhere, and the key is absent rather than `false`: a
@@ -2433,7 +2455,13 @@ mod tests {
         capture_non_claim_artifacts(&k, &opts, &claims, dir.path()).unwrap();
 
         let m = read_json(&dir.path().join("manifest.json"));
-        assert_eq!(m["manifestVersion"], json!(1));
+        // Written, and written as the version THIS build produces — a reader
+        // decides from it whether an absent jetstream artifact means "no
+        // streams" or "this format could not hold them" (2.6d-6).
+        assert_eq!(
+            m["manifestVersion"],
+            json!(crate::manifest::MANIFEST_VERSION_CURRENT)
+        );
         assert_eq!(m["clusterId"], json!("k3d-demo"));
         assert_eq!(m["namespaces"], json!(["demo"]));
 

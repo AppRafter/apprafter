@@ -412,19 +412,25 @@ off or re-register it elsewhere, not to retire one.
     are in
     [How it works](../how-it-works/needs-jetstream.md#the-grace-window-and-the-reclaim).
 
-## A backup does not carry the messages
+## What a backup carries
 
 `apprafter backup create` captures the **claim** — the account, the streams it
-declares, the connection binding — and none of the data in them. A restore
-brings the claim back and it comes back empty. This is stated at capture time
-rather than left to be discovered: the run summary names the claims it captured
-as configuration only, and `apprafter backup show` repeats it for the snapshot
-you are about to restore. See [What a backup
-captures](backup-restore.md#what-a-backup-captures).
+declares, the connection binding — and, since `apprafter` 0.2.75, the contents
+of every stream the claim owns: the messages and the consumers with their
+pending state, so a restore does not replay everything to a subscriber that had
+already processed it. Each stream travels as its own artifact.
 
-If the messages matter, copy them out yourself — `nats stream backup` against
-the account's own credentials — on whatever schedule matches what losing them
-would cost.
+Two things stay outside it. A stream the claim does not own is not backed up
+under that claim: an account's inventory can hold entries the platform cannot
+attribute to any declaration in the namespace, and they belong to nobody it can
+name. And a claim that never finished provisioning has no account to read.
+
+Snapshots taken **before 0.2.75** hold no stream data at all, whatever this
+version can capture — and they say so: `apprafter backup show` reads the
+snapshot's own format version, so an older one still reports its jetstream
+claims as captured-as-configuration-only rather than quietly reading as
+complete. See [What a backup
+captures](backup-restore.md#what-a-backup-captures).
 
 ## How it works
 

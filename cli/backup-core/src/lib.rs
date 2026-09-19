@@ -30,6 +30,8 @@ pub enum DataKind {
     Pg,
     Redis,
     Volume,
+    /// One JetStream stream, dumped over the NATS wire (2.6d-6).
+    JetStream,
 }
 
 /// A resource captured into the backup manifest.

@@ -9,6 +9,15 @@
 pub const DEFAULT_PG_IMAGE: &str = "postgres:16-alpine";
 pub const VOLUME_IMAGE: &str = "busybox:1.36";
 pub const REDIS_IMAGE: &str = "redis:7-alpine";
+/// The `nats` CLI image the JetStream dump/restore helper pod runs.
+///
+/// A stream is dumped over the NATS wire, not off a volume — the server owns
+/// its file layout and `nats stream backup` is the only supported reader — so
+/// this image is part of the artifact format: the CLI that writes a snapshot
+/// and the CLI that replays it have to agree. Pinned for the same reason the
+/// server itself is (`component_nats.cue`): a floating tag moves that pair
+/// under snapshots nobody re-reads until the day they are needed.
+pub const JETSTREAM_IMAGE: &str = "natsio/nats-box:0.18.0";
 
 /// Pick a `pg_dump` helper image whose major matches the CNPG server.
 ///
@@ -34,6 +43,10 @@ pub fn redis_helper_image() -> &'static str {
     REDIS_IMAGE
 }
 
+pub fn jetstream_helper_image() -> &'static str {
+    JETSTREAM_IMAGE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,5 +70,16 @@ mod tests {
     fn volume_and_redis_images_are_pinned() {
         assert_eq!(volume_helper_image(), VOLUME_IMAGE);
         assert_eq!(redis_helper_image(), REDIS_IMAGE);
+    }
+
+    #[test]
+    fn the_jetstream_helper_image_is_pinned_to_an_explicit_tag() {
+        // `nats stream backup` writes a format the matching `nats stream
+        // restore` reads. A floating tag would move that pair under snapshots
+        // nobody re-reads until the day they are needed — the same reasoning
+        // `component_nats.cue` gives for pinning the server itself.
+        assert_eq!(jetstream_helper_image(), JETSTREAM_IMAGE);
+        assert!(JETSTREAM_IMAGE.contains("nats-box:"), "{JETSTREAM_IMAGE}");
+        assert!(!JETSTREAM_IMAGE.ends_with(":latest"), "{JETSTREAM_IMAGE}");
     }
 }

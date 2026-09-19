@@ -1,6 +1,6 @@
 ---
 title: "apprafter restore"
-description: "Restore a backup into a target cluster: replays the CRs, secrets and native data (pg, volumes and persistent-redis snapshots) captured by `apprafter backup`."
+description: "Restore a backup into a target cluster: replays the CRs, secrets and native data (pg, volumes, persistent-redis snapshots and JetStream streams) captured by `apprafter backup`."
 audience: reference
 status: stable
 ---
@@ -9,7 +9,7 @@ status: stable
 
 # `apprafter restore`
 
-Restore a backup into a target cluster: replays the CRs, secrets and native data (pg, volumes and persistent-redis snapshots) captured by `apprafter backup`. A persistent redis claim is reloaded into the running instance with `DFLY LOAD`; an ephemeral one comes back empty because it holds no durable data. Modes: restore-into-running (default; the target must already be bootstrapped), `--data-only` (reload native data only, no CR/secret replay), and `--reprovision` (provision a fresh cluster first, then replay). Secrets are re-sealed against the target cluster's sealed-secrets key
+Restore a backup into a target cluster: replays the CRs, secrets and native data (pg, volumes, persistent-redis snapshots and JetStream streams) captured by `apprafter backup`. A persistent redis claim is reloaded into the running instance with `DFLY LOAD`; an ephemeral one comes back empty because it holds no durable data. A JetStream stream is replaced by its snapshot — messages and consumers together — which DISCARDS whatever the target's stream of that name holds. Modes: restore-into-running (default; the target must already be bootstrapped), `--data-only` (reload native data only, no CR/secret replay), and `--reprovision` (provision a fresh cluster first, then replay). Secrets are re-sealed against the target cluster's sealed-secrets key
 
 ```text
 Usage: apprafter restore [OPTIONS] <REPO>

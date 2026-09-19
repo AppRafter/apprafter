@@ -29,7 +29,8 @@ use cli_core::{CliError, Result};
 use serde_json::{json, Value};
 
 use crate::helper_pod::{
-    apply_and_wait_pod_ready, delete_pod_best_effort, exec_stream_to_file, volume_pod_spec,
+    apply_and_wait_pod_ready, delete_pod_best_effort, exec_stream_to_file, nats_pod_spec,
+    volume_pod_spec,
 };
 use crate::images;
 use crate::kube::KubeExec;
@@ -42,17 +43,21 @@ use crate::DataKind;
 /// The claim types this build stores NO data for, even though the claim itself
 /// is captured and replayed (A6).
 ///
-/// `jetstream` only, and deliberately only. `clickhouse` and `s3` fall through
-/// the same arm of [`plan_extraction`], but neither ships, so a claim of those
+/// **Empty since 2.6d-6**, and that is a claim about the product rather than a
+/// retired mechanism: `jetstream` was the only entry, and the helper pod this
+/// module now drives (`nats stream backup`, through the `mgr_<ns>` identity
+/// ADR 0061 §4.2 reserved for exactly this) captures it. `clickhouse`, `s3`
+/// and `notifications` still fall through [`plan_extraction`]'s catch-all and
+/// are still deliberately absent here: none of them ships, so a claim of those
 /// types provisions nothing and there is no data to miss — announcing them
-/// would be a warning about a situation that cannot occur. JetStream ships, so
-/// a cluster can hold real streams today, and a snapshot that listed the claim
-/// without saying this reads as complete while being short of the data.
+/// would be a warning about a situation that cannot occur.
 ///
-/// Capturing the streams is separate, larger work (a helper pod running `nats
-/// stream backup`) and is NOT in progress — nothing here should be read as a
-/// promise of it.
-pub const CLAIM_TYPES_WITHOUT_DATA_CAPTURE: &[&str] = &["jetstream"];
+/// The machinery stays wired end to end (manifest marker, `backup create`,
+/// `backup show`, `export`) because it is the guard for the NEXT type that
+/// ships without a capture path, and a guard nothing can reach is a guard that
+/// is already broken. [`claims_without_data_capture_in`] is what keeps it
+/// exercised while this table is empty.
+pub const CLAIM_TYPES_WITHOUT_DATA_CAPTURE: &[&str] = &[];
 
 /// Whether a claim of this `spec.type` has NO data in the backup. Pure.
 ///
@@ -61,6 +66,30 @@ pub const CLAIM_TYPES_WITHOUT_DATA_CAPTURE: &[&str] = &["jetstream"];
 /// conclusions about the same claim.
 pub fn claim_type_has_no_data_capture(claim_type: &str) -> bool {
     CLAIM_TYPES_WITHOUT_DATA_CAPTURE.contains(&claim_type)
+}
+
+/// When each type's capture landed, by manifest format version.
+///
+/// A snapshot written before that version cannot hold the type's data no
+/// matter what this build can capture today, and nothing inside such a
+/// snapshot says so — the `no_data` marker did not exist for it to carry, and
+/// an empty `jetstream/` directory is indistinguishable from a claim that had
+/// no streams.
+///
+/// This is the half of A6 that a capture path does not close: had the table
+/// above simply been emptied, every snapshot taken before 2.6d-6 would have
+/// gone quiet about its jetstream claims the day the code shipped — the exact
+/// "reads as complete while it is not" the finding named, pointed at the
+/// archive instead of at the run.
+pub const CAPTURE_LANDED_IN_MANIFEST_VERSION: &[(&str, u32)] = &[("jetstream", 2)];
+
+/// Whether a claim of this type has no data in a snapshot of this manifest
+/// version — the shipped table, OR a capture that postdates the snapshot.
+pub fn claim_type_has_no_data_in_manifest(claim_type: &str, manifest_version: u32) -> bool {
+    claim_type_has_no_data_capture(claim_type)
+        || CAPTURE_LANDED_IN_MANIFEST_VERSION
+            .iter()
+            .any(|(ty, since)| *ty == claim_type && manifest_version < *since)
 }
 
 /// A claim a run captures as configuration only — the counterpart of an
@@ -79,11 +108,20 @@ pub struct UncapturedClaim {
 /// in [`CLAIM_TYPES_WITHOUT_DATA_CAPTURE`] would be reported as empty while
 /// carrying data, and the test pair asserts they stay disjoint.
 pub fn claims_without_data_capture(claims: &[Value]) -> Vec<UncapturedClaim> {
+    claims_without_data_capture_in(claims, CLAIM_TYPES_WITHOUT_DATA_CAPTURE)
+}
+
+/// [`claims_without_data_capture`] against an explicit table.
+///
+/// Exists so the reporting path stays testable while the shipped table is
+/// empty: the behaviour under test is "a claim of an announced type is named",
+/// which cannot be exercised through a table with nothing in it.
+fn claims_without_data_capture_in(claims: &[Value], types: &[&str]) -> Vec<UncapturedClaim> {
     claims
         .iter()
         .filter_map(|c| {
             let ty = c.pointer("/spec/type").and_then(Value::as_str)?;
-            if !claim_type_has_no_data_capture(ty) {
+            if !types.contains(&ty) {
                 return None;
             }
             Some(UncapturedClaim {
@@ -112,7 +150,16 @@ pub struct ExtractItem {
     /// `Pg`     → `status.connectionSecretRef` (the connection Secret name).
     /// `Volume` → `status.volumeClaimRef` (the PVC name).
     /// `Redis`  → `status.instance` (the Dragonfly pool instance; snapshot PVC is `df-<instance>-0`).
+    /// `JetStream` → the STREAM name; one item per stream the claim owns.
     pub source: String,
+    /// `JetStream` only: the claim's `status.connectionSecretRef`.
+    ///
+    /// A field rather than a delimiter inside `source`, because a `:`-joined
+    /// pair is a parser nobody asked for — and one that would look safe right
+    /// up until a name carried the delimiter. The dump reads `host`/`port` off
+    /// this Secret to reach the server; the credentials it authenticates with
+    /// are the namespace's manager user, which lives elsewhere.
+    pub connection: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +208,7 @@ pub fn plan_extraction(claims: &[Value]) -> Vec<ExtractItem> {
                         claim_name: name,
                         kind: DataKind::Pg,
                         source: src.to_string(),
+                        connection: None,
                     });
                 }
             }
@@ -179,6 +227,7 @@ pub fn plan_extraction(claims: &[Value]) -> Vec<ExtractItem> {
                             claim_name: name,
                             kind: DataKind::Redis,
                             source: instance.to_string(),
+                            connection: None,
                         });
                     }
                 }
@@ -191,19 +240,123 @@ pub fn plan_extraction(claims: &[Value]) -> Vec<ExtractItem> {
                         claim_name: name,
                         kind: DataKind::Volume,
                         source: src.to_string(),
+                        connection: None,
+                    });
+                }
+            }
+            "jetstream" => {
+                // One item per stream, not one per claim: a claim owns N
+                // streams, each is dumped and replayed on its own, and a
+                // single artifact for the claim would make one stream's
+                // failure the whole claim's — and hide which one it was.
+                let Some(conn) = c
+                    .pointer("/status/connectionSecretRef")
+                    .and_then(Value::as_str)
+                else {
+                    // Never finished provisioning: no account, no server
+                    // coordinates, and nothing to dump.
+                    continue;
+                };
+                for stream in owned_streams(c) {
+                    items.push(ExtractItem {
+                        namespace: ns.clone(),
+                        claim_name: name.clone(),
+                        kind: DataKind::JetStream,
+                        source: stream,
+                        connection: Some(conn.to_string()),
                     });
                 }
             }
             _ => {
-                // jetstream / clickhouse / s3 / notifications — no extraction
-                // path. NOT silent for the ones that ship:
-                // `claims_without_data_capture` reports them, the manifest
-                // marks them `no_data`, and both `backup create` and
+                // clickhouse / s3 / notifications — no extraction path, and
+                // none of them ships. NOT silent for anything that does:
+                // `claims_without_data_capture` reports it, the manifest
+                // marks it `no_data`, and both `backup create` and
                 // `backup show` say so.
             }
         }
     }
     items
+}
+
+/// The streams a jetstream claim OWNS, in `status.streams` (ADR 0061 §9).
+///
+/// `declared` and `dynamic` — the ones the provisioner attributed to this
+/// application — and never `unattributed`, which that inventory defines as
+/// "streams touching `<app>.` that no declaration in the namespace accounts
+/// for … reported, never claimed". Dumping one would copy a neighbour's data
+/// into this claim's artifact and restore it under this claim's name.
+fn owned_streams(claim: &Value) -> Vec<String> {
+    ["declared", "dynamic"]
+        .iter()
+        .filter_map(|key| claim.pointer(&format!("/status/streams/{key}")))
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The namespace NATS runs in, read off a claim connection Secret's `host`.
+///
+/// The provisioner writes `host` as `<statefulset>.<namespace>.svc`
+/// (`reconcile.rs`), and that is the only place a backup can learn where the
+/// lazily-enabled NATS component was installed: the claim carries its account
+/// and its own user, never the component's namespace. `None` for a host that
+/// is not a service FQDN — a caller cannot guess, and guessing wrong would
+/// send the manager-credential read at some unrelated namespace.
+pub fn nats_namespace_of_host(host: &str) -> Option<String> {
+    let mut parts = host.split('.');
+    let _statefulset = parts.next()?;
+    let namespace = parts.next().filter(|ns| !ns.is_empty())?;
+    Some(namespace.to_string())
+}
+
+/// The per-namespace NATS manager Secret, by the provisioner's convention.
+///
+/// Restated rather than imported: `nats::mgr_secret_name` lives in the
+/// `operator/` workspace, which this crate does not depend on — the same
+/// cross-workspace restatement `df-<instance>-0` already makes for Dragonfly.
+/// `the_manager_secret_name_matches_the_provisioners_convention` is what keeps
+/// the restatement checkable.
+pub fn mgr_secret_name(namespace: &str) -> String {
+    format!("nats-mgr-{namespace}")
+}
+
+/// The one-shot `sh -c` script that dumps one stream and tars it to stdout.
+///
+/// `nats` writes a progress line and a summary to stdout; both would land in
+/// front of the tar and corrupt the artifact, so its output is discarded
+/// wholesale and only `tar` writes to the stream. `set -e` is what makes a
+/// failed dump a failed exec instead of an empty-but-successful tar — the
+/// shape the redis loader's `[ "$OUT" = OK ]` check exists for.
+fn jetstream_dump_script(stream: &str) -> String {
+    let stream_q = crate::helper_pod::shell_single_quote(stream);
+    format!(
+        "set -e; \
+         rm -rf /tmp/bk; mkdir -p /tmp/bk; \
+         nats stream backup {stream_q} /tmp/bk --no-progress >/dev/null 2>&1; \
+         tar c -C /tmp/bk ."
+    )
+}
+
+/// A pod-name segment from an arbitrary NATS name.
+///
+/// Stream names are not pod names: NATS allows `_`, which DNS-1123 does not,
+/// so `orders_dlq` would produce a pod the apiserver rejects. Anything outside
+/// `[a-z0-9]` folds to `-`; the ARTIFACT keeps the real stream name, because
+/// that is what the restore reads back.
+pub fn pod_name_segment(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +442,7 @@ pub fn run_extraction(
             DataKind::Pg => extract_pg(k, item, out_dir, pg_image)?,
             DataKind::Volume => extract_volume(k, item, out_dir)?,
             DataKind::Redis => extract_redis(k, item, out_dir)?,
+            DataKind::JetStream => extract_jetstream(k, item, out_dir)?,
         }
     }
     Ok(())
@@ -399,6 +553,81 @@ fn extract_volume(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Resul
     let argv: Vec<&str> = vec!["tar", "c", "-C", "/data", "."];
     exec_stream_to_file(k, &pod_name, ns, &argv, &tar_path)
     // _guard drops here (or on any earlier return) → delete_pod_best_effort called.
+}
+
+/// Extract one JetStream stream (2.6d-6).
+///
+/// `item.source` is the STREAM; `item.connection` is the claim's connection
+/// Secret, which is where the server coordinates come from. The credentials
+/// are NOT that Secret's: a claim user is denied `$JS.API.STREAM.SNAPSHOT` by
+/// construction (ADR 0061 §4.2 — its delivery subject is caller-chosen, which
+/// made it a read bypass), and the snapshot is the manager user's job. So this
+/// reads `nats-mgr-<ns>` from the namespace NATS runs in, which the `host`
+/// names and nothing else does.
+///
+/// The artifact is a tar of what `nats stream backup` writes — `backup.json`
+/// plus `stream.tar.s2` — because `nats stream restore` takes that DIRECTORY,
+/// not a single file. Consumers ride along: the CLI includes them unless told
+/// otherwise, and a stream restored without its consumers would replay every
+/// message to a subscriber that had already processed it.
+fn extract_jetstream(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Result<()> {
+    let ns = &item.namespace;
+    let claim = &item.claim_name;
+    let stream = &item.source;
+    let conn = item.connection.as_deref().ok_or_else(|| {
+        CliError::Other(format!(
+            "jetstream item {ns}/{claim} stream {stream} has no connection Secret — \
+             the planner must set it"
+        ))
+    })?;
+
+    // 1. Server coordinates from the claim's own connection Secret.
+    let host = k.get_secret_key(conn, ns, "host")?;
+    let port = k.get_secret_key(conn, ns, "port")?;
+    let nats_ns = nats_namespace_of_host(&host).ok_or_else(|| {
+        CliError::Other(format!(
+            "cannot tell which namespace NATS runs in from host {host:?} \
+             (claim {ns}/{claim}): expected <service>.<namespace>.svc"
+        ))
+    })?;
+
+    // 2. Manager credentials from that namespace.
+    let mgr = mgr_secret_name(ns);
+    let user = k.get_secret_key(&mgr, &nats_ns, "user")?;
+    let password = k.get_secret_key(&mgr, &nats_ns, "password")?;
+    let url = format!("nats://{host}:{port}");
+
+    // 3. Helper pod beside the server, guard armed before apply-wait.
+    let pod_name = truncate_pod_name(&format!(
+        "bk-js-{}-{}",
+        pod_name_segment(claim),
+        pod_name_segment(stream)
+    ));
+    let _guard = HelperPodGuard {
+        name: pod_name.clone(),
+        namespace: &nats_ns,
+        k,
+    };
+    let spec = nats_pod_spec(
+        &pod_name,
+        &nats_ns,
+        images::JETSTREAM_IMAGE,
+        &url,
+        &user,
+        &password,
+    );
+    apply_and_wait_pod_ready(k, &spec)?;
+
+    // 4. Dump + tar to `jetstream/<ns>/<claim>/<stream>.tar`. The file NAME is
+    //    the stream, verbatim, because that is what the restore reads back.
+    let dest = out_dir.join("jetstream").join(ns).join(claim);
+    fs::create_dir_all(&dest)
+        .map_err(|e| CliError::Other(format!("create dir {}: {e}", dest.display())))?;
+    let tar_path = dest.join(format!("{stream}.tar"));
+
+    let script = jetstream_dump_script(stream);
+    let argv: Vec<&str> = vec!["sh", "-c", &script];
+    exec_stream_to_file(k, &pod_name, &nats_ns, &argv, &tar_path)
 }
 
 /// Extract a persistent Redis (Dragonfly) claim's whole-instance snapshot.
@@ -601,28 +830,188 @@ mod tests {
     }
 
     // =======================================================================
+    // 2.6d-6 — JetStream capture
+    // =======================================================================
+
+    #[test]
+    fn a_jetstream_claim_yields_one_item_per_stream_it_owns() {
+        let claims = vec![json!({
+            "spec": {"type": "jetstream"},
+            "metadata": {"name": "atm-worker-jetstream", "namespace": "atm"},
+            "status": {
+                "ready": true,
+                "connectionSecretRef": "atm-worker-jetstream-conn",
+                "streams": {
+                    "declared": ["orders"],
+                    "dynamic": ["orders_dlq"],
+                    "unattributed": ["someone-elses"],
+                    "observedAt": "2026-09-19T00:00:00Z"
+                }
+            }
+        })];
+        let plan = plan_extraction(&claims);
+        let streams: Vec<&str> = plan.iter().map(|i| i.source.as_str()).collect();
+        // `unattributed` is reported, never claimed (ADR 0061 §9): dumping it
+        // would copy a neighbour's data into this claim's artifact.
+        assert_eq!(streams, vec!["orders", "orders_dlq"]);
+        assert!(plan.iter().all(|i| i.kind == DataKind::JetStream));
+        assert!(plan.iter().all(|i| i.claim_name == "atm-worker-jetstream"));
+        assert!(plan.iter().all(|i| i.namespace == "atm"));
+    }
+
+    #[test]
+    fn a_jetstream_item_carries_the_connection_secret_the_dump_authenticates_through() {
+        // `source` is the stream, so the server coordinates need a field of
+        // their own: the dump reads `host`/`port` off this Secret and then the
+        // manager credentials from the NATS namespace it names.
+        let claims = vec![json!({
+            "spec": {"type": "jetstream"},
+            "metadata": {"name": "c", "namespace": "atm"},
+            "status": {"connectionSecretRef": "c-conn", "streams": {"declared": ["s"]}}
+        })];
+        let plan = plan_extraction(&claims);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].connection.as_deref(), Some("c-conn"));
+    }
+
+    #[test]
+    fn a_jetstream_claim_with_no_observed_streams_yields_nothing() {
+        // Consume-only, or never provisioned: either way there is no stream of
+        // this claim's own to dump, and an item would send a helper pod after
+        // a stream that does not exist.
+        for status in [
+            json!({"connectionSecretRef": "c-conn"}),
+            json!({"connectionSecretRef": "c-conn", "streams": {"unattributed": ["x"]}}),
+            json!({"streams": {"declared": ["s"]}}),
+        ] {
+            let claims = vec![json!({
+                "spec": {"type": "jetstream"},
+                "metadata": {"name": "c", "namespace": "atm"},
+                "status": status
+            })];
+            assert!(
+                plan_extraction(&claims).is_empty(),
+                "must yield nothing: {claims:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_nats_namespace_comes_off_the_connection_host() {
+        // The provisioner writes `host` as `<statefulset>.<ns>.svc`; the
+        // manager Secret lives in that namespace, and nothing else a backup
+        // can read says where the NATS component was installed.
+        assert_eq!(
+            nats_namespace_of_host("nats.nats-system.svc"),
+            Some("nats-system".to_string())
+        );
+        assert_eq!(
+            nats_namespace_of_host("nats.messaging.svc.cluster.local"),
+            Some("messaging".to_string())
+        );
+        assert_eq!(nats_namespace_of_host("nats"), None);
+        assert_eq!(nats_namespace_of_host(""), None);
+    }
+
+    #[test]
+    fn the_manager_secret_name_matches_the_provisioners_convention() {
+        // `nats::mgr_secret_name` lives in the operator workspace, which this
+        // crate cannot depend on. The convention is restated here, and this
+        // test is what makes the restatement checkable rather than folklore.
+        assert_eq!(mgr_secret_name("atm"), "nats-mgr-atm");
+        assert_eq!(mgr_secret_name("a-b"), "nats-mgr-a-b");
+    }
+
+    #[test]
+    fn the_dump_script_leaves_only_the_tar_on_stdout() {
+        let script = jetstream_dump_script("orders");
+        // `nats` prints a progress line and a summary; anything it writes to
+        // stdout lands in front of the tar and corrupts the artifact.
+        assert!(script.contains(">/dev/null 2>&1"), "{script}");
+        assert!(script.contains("tar c -C"), "{script}");
+        assert!(script.starts_with("set -e"), "{script}");
+        assert!(
+            script.contains("'orders'"),
+            "stream must be quoted: {script}"
+        );
+    }
+
+    // =======================================================================
     // A6 — the claims a backup lists but holds no data for
     // =======================================================================
 
-    /// FIRES: a jetstream claim produces no extraction item AND is reported,
-    /// which together are the finding. Producing no item is the old behaviour;
-    /// being reported is what stops the snapshot reading as complete.
+    /// FIRES: a claim of an announced type produces no extraction item AND is
+    /// reported by name, which together are the finding — producing no item is
+    /// the old behaviour; being reported is what stops the snapshot reading as
+    /// complete.
+    ///
+    /// Driven through the table-taking half rather than the shipped table,
+    /// because 2.6d-6 emptied the shipped one: `jetstream` was the only entry
+    /// and its data is captured now. The reporting path must stay exercised
+    /// for the next type that ships without a capture path — a guard that
+    /// nothing can reach is a guard that is already broken.
     #[test]
-    fn a_jetstream_claim_is_extracted_by_nothing_and_reported_by_name() {
+    fn a_claim_of_an_announced_type_is_extracted_by_nothing_and_reported_by_name() {
         let claims = vec![json!({
-            "spec": {"type": "jetstream"},
+            "spec": {"type": "clickhouse"},
             "metadata": {"name": "events", "namespace": "demo"},
-            "status": {"ready": true, "account": "demo"}
+            "status": {"ready": true}
         })];
         assert!(plan_extraction(&claims).is_empty());
         assert_eq!(
-            claims_without_data_capture(&claims),
+            claims_without_data_capture_in(&claims, &["clickhouse"]),
             vec![UncapturedClaim {
                 namespace: "demo".into(),
                 name: "events".into(),
-                claim_type: "jetstream".into(),
+                claim_type: "clickhouse".into(),
             }]
         );
+    }
+
+    /// The shipped table is empty, and that is a claim about the product: every
+    /// `needs` type that ships has a capture path. Asserted on its own so the
+    /// two tests below, which iterate it, are visibly vacuous today rather than
+    /// silently so.
+    #[test]
+    fn no_shipped_need_type_is_announced_as_dataless_today() {
+        assert!(
+            CLAIM_TYPES_WITHOUT_DATA_CAPTURE.is_empty(),
+            "a type is announced as dataless: {CLAIM_TYPES_WITHOUT_DATA_CAPTURE:?} — if it \
+             ships, capture it; if it does not, it does not belong here"
+        );
+    }
+
+    #[test]
+    fn jetstream_is_no_longer_announced_because_its_data_is_captured() {
+        assert!(!claim_type_has_no_data_capture("jetstream"));
+    }
+
+    /// The archive half of A6: capture closes the gap for snapshots taken
+    /// AFTER it, and says nothing about the ones already in the repository.
+    /// Emptying the table alone would have silenced those — the finding's own
+    /// failure mode, pointed at the archive.
+    #[test]
+    fn a_snapshot_older_than_the_capture_still_reports_the_type_as_dataless() {
+        assert!(claim_type_has_no_data_in_manifest("jetstream", 1));
+        assert!(!claim_type_has_no_data_in_manifest("jetstream", 2));
+        // A type that was never in the table and never gained a capture path
+        // is not retroactively announced by the version rule.
+        assert!(!claim_type_has_no_data_in_manifest("pg", 1));
+    }
+
+    #[test]
+    fn every_capture_era_entry_names_a_version_this_build_can_write() {
+        // An entry whose version exceeds what `capture_non_claim_artifacts`
+        // stamps would mark EVERY snapshot this build writes as dataless for
+        // that type — a warning on data that is right there.
+        assert!(!CAPTURE_LANDED_IN_MANIFEST_VERSION.is_empty());
+        for (ty, since) in CAPTURE_LANDED_IN_MANIFEST_VERSION {
+            assert!(
+                *since <= crate::manifest::MANIFEST_VERSION_CURRENT,
+                "{ty} claims to be captured from manifest v{since}, but this build writes v{}",
+                crate::manifest::MANIFEST_VERSION_CURRENT
+            );
+        }
     }
 
     /// DOES NOT FIRE for the types whose data IS captured — a warning on a pg
@@ -642,13 +1031,13 @@ mod tests {
         assert!(claims_without_data_capture(&claims).is_empty());
     }
 
-    /// The narrowing, stated as a test: `clickhouse` and `s3` fall through the
-    /// same arm, and are deliberately NOT announced — neither ships, so such a
-    /// claim provisions nothing and there is no data to miss. A warning about
-    /// them would be a warning about an impossible situation.
+    /// The narrowing, stated as a test: `clickhouse`, `s3` and `notifications`
+    /// fall through the planner's catch-all and are deliberately NOT announced
+    /// — none of them ships, so such a claim provisions nothing and there is no
+    /// data to miss. A warning about them would be a warning about an
+    /// impossible situation.
     #[test]
-    fn only_the_shipped_dataless_type_is_announced() {
-        assert_eq!(CLAIM_TYPES_WITHOUT_DATA_CAPTURE, &["jetstream"]);
+    fn an_unshipped_type_is_neither_extracted_nor_announced() {
         for ty in ["clickhouse", "s3", "notifications"] {
             let claims = vec![json!({
                 "spec": {"type": ty},
@@ -661,7 +1050,11 @@ mod tests {
 
     /// The two lists must stay disjoint: a type the planner learns to extract
     /// while it is still named here would be reported as empty while its data
-    /// is in the snapshot — the same dishonesty pointing the other way.
+    /// is in the snapshot — the same dishonesty pointing the other way. This
+    /// is what forced 2.6d-6's two halves into one commit.
+    ///
+    /// Vacuous while the table is empty, which
+    /// `no_shipped_need_type_is_announced_as_dataless_today` states out loud.
     #[test]
     fn the_dataless_types_are_disjoint_from_what_the_planner_extracts() {
         for ty in CLAIM_TYPES_WITHOUT_DATA_CAPTURE {

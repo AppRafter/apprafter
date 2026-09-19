@@ -1934,6 +1934,42 @@ compatibility: "0.2.74": {
 	]
 }
 
+compatibility: "0.2.78": {
+	change:          "safe"
+	operatorVersion: "v0.2.50"
+	notes: """
+		THE NIGHTLY BACKUP NOW CAPTURES JETSTREAM DATA. Take this release
+		if any application declares `needs.jetstream` and you rely on the
+		scheduled backup rather than running `apprafter backup` by hand.
+
+		`apprafter` 0.2.76 taught the backup engine to dump every stream a
+		jetstream claim owns — messages and consumers — through the
+		per-namespace `mgr_<ns>` identity ADR 0061 §4.2 reserved for it.
+		The CLI got that the moment it was installed. The CronJob did not:
+		it runs ONE image, named by a literal in `platform.cue`
+		(`#BackupValues.image`), and nothing derives that literal. This
+		release moves the pin from `v0.2.66` to `v0.2.76`.
+
+		That split is the whole reason this entry exists. A stale runner
+		is a WORKING runner — it starts, exits zero and writes a snapshot
+		that is simply missing a service's data, and every green check
+		agrees with it. `scripts/check-backup-runner-pin.sh` is what
+		caught this one before it shipped.
+
+		WHAT AN UPGRADING CLUSTER SEES: the backup CronJob's pod template
+		changes, so the NEXT scheduled run pulls the new image. Nothing
+		restarts, no CRD moves, and a cluster with no jetstream claim gets
+		a byte-identical backup. Snapshots taken before this release still
+		hold no stream data, and `apprafter backup show` says so from
+		their own manifest version rather than assuming the current one.
+		"""
+	references: [
+		"docs/adr/0050-backup-restore.md",
+		"docs/adr/0061-needs-jetstream-nats.md",
+		"docs/changelog/UNRELEASED.md",
+	]
+}
+
 compatibility: "0.2.77": {
 	change:          "safe"
 	operatorVersion: "v0.2.50"

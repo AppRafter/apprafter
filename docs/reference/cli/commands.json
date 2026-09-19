@@ -1,5 +1,5 @@
 {
-  "cli_version": "0.2.75",
+  "cli_version": "0.2.76",
   "commands": [
     {
       "path": [],
@@ -2154,7 +2154,7 @@
         "export"
       ],
       "aliases": [],
-      "about": "Native data export (Kind 1) — pull pg dumps, volume tars and persistent-redis snapshots to a plain local folder + `manifest.json`. An ephemeral (`persistent: false`) redis claim is a cache by declaration and is skipped. No CRs, no secrets, no encryption. A debugging / one-off-recovery convenience",
+      "about": "Native data export (Kind 1) — pull pg dumps, volume tars, persistent-redis snapshots and JetStream stream snapshots to a plain local folder + `manifest.json`. An ephemeral (`persistent: false`) redis claim is a cache by declaration and is skipped; so is a jetstream stream the claim does not own. No CRs, no secrets, no encryption. A debugging / one-off-recovery convenience",
       "long_about": null,
       "usage": "Usage: apprafter export [OPTIONS]",
       "hidden": false,
@@ -3221,7 +3221,7 @@
         "restore"
       ],
       "aliases": [],
-      "about": "Restore a backup into a target cluster: replays the CRs, secrets and native data (pg, volumes and persistent-redis snapshots) captured by `apprafter backup`. A persistent redis claim is reloaded into the running instance with `DFLY LOAD`; an ephemeral one comes back empty because it holds no durable data. Modes: restore-into-running (default; the target must already be bootstrapped), `--data-only` (reload native data only, no CR/secret replay), and `--reprovision` (provision a fresh cluster first, then replay). Secrets are re-sealed against the target cluster's sealed-secrets key",
+      "about": "Restore a backup into a target cluster: replays the CRs, secrets and native data (pg, volumes, persistent-redis snapshots and JetStream streams) captured by `apprafter backup`. A persistent redis claim is reloaded into the running instance with `DFLY LOAD`; an ephemeral one comes back empty because it holds no durable data. A JetStream stream is replaced by its snapshot — messages and consumers together — which DISCARDS whatever the target's stream of that name holds. Modes: restore-into-running (default; the target must already be bootstrapped), `--data-only` (reload native data only, no CR/secret replay), and `--reprovision` (provision a fresh cluster first, then replay). Secrets are re-sealed against the target cluster's sealed-secrets key",
       "long_about": null,
       "usage": "Usage: apprafter restore [OPTIONS] <REPO>",
       "hidden": false,

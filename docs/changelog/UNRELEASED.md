@@ -9,6 +9,88 @@ patch of each phase.
 
 ## Phase 2 — Platform-services core closed 2026-06-10 (milestone M2, plan gate 2.1–2.12)
 
+## cli v0.2.76 / platform-stack 0.2.78 — a backup carries the streams now, and an older snapshot still says it does not (2.6d-6, unreleased)
+
+### Added
+
+- **`needs.jetstream` data is captured.** `apprafter backup create` and
+  `apprafter export` now dump every stream a jetstream claim owns — messages
+  **and** consumers with their pending state — to
+  `jetstream/<ns>/<claim>/<stream>.tar`, and `apprafter restore` replays them.
+  This closes the second half of finding A6; the first half (saying the data
+  was missing) shipped in `0608e9e`.
+
+  2.6d closed 2026-07-15 and `needs.jetstream` closed 2026-09-12, so the gap
+  was never a missed plan item — ADR 0061's `## Scope` put "backup and restore
+  of JetStream stores" outside 2.5 in as many words. What made it shippable now
+  is that ADR 0061 §4.2 had already reserved the identity: `$JS.API.STREAM.SNAPSHOT`
+  is denied to a claim user because its delivery subject is caller-chosen (a
+  measured read bypass), and "Snapshot is `mgr_<ns>`'s job under ADR 0050".
+  That manager user is rendered with `publish/subscribe: allow [">"]`, so the
+  capture needed **no operator change, no accounts-file change, no RBAC and no
+  network policy** — the runner's ClusterRole already carries
+  cluster-wide pods/exec and secrets, and the default-deny bundle covers the
+  `default` namespace only. The one thing outside `cli/` is the chart's runner
+  PIN: the scheduled CronJob runs a single image named by a literal in
+  `platform.cue`, so platform-stack **0.2.78** moves it from `v0.2.66` to
+  `v0.2.76`. Without that the nightly run would keep writing snapshots without
+  stream data while `apprafter backup` from a laptop wrote them with — a stale
+  runner is a working runner, which is the failure
+  `scripts/check-backup-runner-pin.sh` exists to catch, and did.
+
+  Three facts were measured against a real `nats:2.14.3-alpine` and `nats` CLI
+  v0.2.3 before any code was written, and each one decided a design point:
+  `nats stream backup <stream> <dir>` writes a DIRECTORY (`backup.json` +
+  `stream.tar.s2`), so the artifact is a tar of it; consumers are included by
+  default; and `nats stream restore` **refuses** a stream that exists (`Stream
+  "X" already exist`, exit 1), so the loader deletes first and treats NACK
+  recreating a declared stream underneath it as a race to retry rather than a
+  failure. Both shipped scripts were then run verbatim against that server: a
+  target holding a recreated EMPTY stream (0 messages, 0 consumers) came back
+  with all messages and the durable consumer's pending state intact.
+
+  Scope is the claim's own inventory: `status.streams.declared` and `.dynamic`,
+  never `.unattributed` — ADR 0061 §9 defines those as "reported, never
+  claimed", and dumping one would copy a neighbour's data into this claim's
+  artifact. A claim that never provisioned has no account to read and is
+  skipped, exactly as an unprovisioned pg claim is.
+
+### Changed
+
+- **The manifest is v2, and an absent `manifestVersion` now reads as v1.** The
+  bump is not about a field — it is what tells a reader whether the ABSENCE of
+  jetstream data means "captured, and this claim had no streams" or "this
+  format could not hold them". Without it, emptying
+  `CLAIM_TYPES_WITHOUT_DATA_CAPTURE` would have silenced every snapshot taken
+  before this release the day it shipped: A6's own failure mode, pointed at the
+  archive instead of at the run. `apprafter backup show` reads the snapshot's
+  own version, so a pre-0.2.76 snapshot still reports its jetstream claims as
+  captured-as-configuration-only — which is true of it.
+
+  The default moved with it. `manifestVersion` was absent in shipped v1
+  backups and defaulted to *the current constant*, so every old snapshot
+  claimed to be in whatever format the reading build writes. It now defaults to
+  1, the format that predates the field.
+
+- **`CLAIM_TYPES_WITHOUT_DATA_CAPTURE` is empty, and the machinery around it is
+  not.** Every `needs` type that ships has a capture path now. The marker, the
+  three summaries and the manifest field stay wired end to end for the next
+  type that ships without one, and their tests moved to a synthetic type —
+  a guard nothing can reach is a guard that is already broken.
+
+- **Docs, and a gate that keeps them honest.** The `needs` coverage table in
+  `backup-restore.md` moves `jetstream` into the captured half; `jetstream.md`
+  retires "A backup does not carry the messages"; `export` / `restore` `--help`
+  stop listing only pg, volumes and redis. A `docsgen behaviour::CLAIMS` entry
+  now watches the phrase `no jetstream data is in this` against the planner's
+  own `"jetstream" =>` arm, so restoring that sentence to a page fails
+  `docsgen gate` — mutation-tested, not assumed.
+
+- **One quoting rule, not two.** `shell_single_quote` moved into `backup-core`;
+  the dump side quotes stream names with the same function the restore side
+  quotes passwords with.
+
+
 ## cli v0.2.75 — `completion --install` writes the file, and one line also completes the shell you are in (unreleased)
 
 ### Added

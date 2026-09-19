@@ -9,7 +9,7 @@ status: stable
 
 # CLI reference
 
-Generated from `cli/platform-cli/src/cli.rs` at **apprafter v0.2.75** — the release
+Generated from `cli/platform-cli/src/cli.rs` at **apprafter v0.2.76** — the release
 this whole reference describes. Every command, flag, default and alias below is
 projected straight from the parser, so this page cannot describe a flag the
 binary does not have. Run `apprafter <command> --help` for the same information
@@ -61,7 +61,7 @@ specific release rather than scraping these pages.
 | [`apprafter db`](db.md) | — | Manage SharedDatabase CRs — a PostgreSQL database or a Redis keyspace several Applications bind, each with its own credential and its own access level. |
 | [`apprafter destroy`](destroy.md) | — | Destroy every `apprafter=true`-labelled resource in the provider project the token belongs to — servers, floating IPs, firewalls, networks and SSH keys |
 | [`apprafter doctor`](doctor.md) | — | Self-diagnostic over the active target's config, credentials and reachability plus the surrounding shell environment (kubectl, helm, ssh, DNS). |
-| [`apprafter export`](export.md) | — | Native data export (Kind 1) — pull pg dumps, volume tars and persistent-redis snapshots to a plain local folder + `manifest.json`. |
+| [`apprafter export`](export.md) | — | Native data export (Kind 1) — pull pg dumps, volume tars, persistent-redis snapshots and JetStream stream snapshots to a plain local folder + `manifest.json`. |
 | [`apprafter import`](import.md) | — | Rebuild local state from live Hetzner Cloud resources tagged with `apprafter=true`. |
 | [`apprafter init`](init.md) | — | Bootstrap a fresh cluster on the given provider/tier |
 | [`apprafter kubeconfig`](kubeconfig.md) | `kc` | Print the cached k3s kubeconfig (decrypted), fetching it over SSH on first use. |
@@ -72,7 +72,7 @@ specific release rather than scraping these pages.
 | [`apprafter plan`](plan.md) | — | Preview infrastructure changes — NOT IMPLEMENTED, it prints `no changes` unconditionally and never contacts the provider. |
 | [`apprafter platform`](platform.md) | — | Inspect and control the cluster's PlatformStack — the declarative platform-version resource managed by PlatformController |
 | [`apprafter repo`](repo.md) | — | Manage the credentials Argo CD uses to clone private user repos (and the workload pull-secrets for the matching registry). |
-| [`apprafter restore`](restore.md) | — | Restore a backup into a target cluster: replays the CRs, secrets and native data (pg, volumes and persistent-redis snapshots) captured by `apprafter backup`. |
+| [`apprafter restore`](restore.md) | — | Restore a backup into a target cluster: replays the CRs, secrets and native data (pg, volumes, persistent-redis snapshots and JetStream streams) captured by `apprafter backup`. |
 | [`apprafter secret`](secret.md) | — | Seal secret material with the in-cluster sealed-secrets controller's public cert. |
 | [`apprafter status`](status.md) | — | Is anything wrong with this cluster? Rolls up the active target, the platform's version and any unhealthy condition, the applications reporting problems, the applications held at an image digest, and the MigrationPlans awaiting approval. |
 | [`apprafter target`](target.md) | `t` | Manage deployment targets — persistent named bundles of `(provider, region, credentials, defaults)`. |

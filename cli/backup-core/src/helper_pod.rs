@@ -92,6 +92,62 @@ pub fn volume_pod_spec(name: &str, ns: &str, image: &str, pvc: &str, read_only: 
     })
 }
 
+/// Build a Pod spec that runs the `nats` CLI against one server (2.6d-6).
+///
+/// No volumes: a JetStream stream is read over the NATS wire, not off a disk,
+/// so this pod needs coordinates and credentials and nothing else. Both go in
+/// the container ENV rather than on the command line — the `nats` CLI reads
+/// `NATS_URL` / `NATS_USER` / `NATS_PASSWORD` natively, and an argv carrying
+/// the manager password would show up in `ps` inside the pod and in any
+/// `kubectl exec` audit entry. Same reasoning as `PGPASSWORD` above.
+///
+/// The pod belongs in the NAMESPACE NATS runs in: the manager Secret lives
+/// there, and the default-deny NetworkPolicy bundle (`default` namespace only)
+/// leaves same-namespace traffic to the server alone.
+pub fn nats_pod_spec(
+    name: &str,
+    ns: &str,
+    image: &str,
+    url: &str,
+    user: &str,
+    password: &str,
+) -> Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": name,
+            "namespace": ns,
+            "labels": { "apprafter.io/backup-helper": "true" }
+        },
+        "spec": {
+            "restartPolicy": "Never",
+            "containers": [{
+                "name": "dump",
+                "image": image,
+                "command": ["sleep", "3600"],
+                "env": [
+                    { "name": "NATS_URL", "value": url },
+                    { "name": "NATS_USER", "value": user },
+                    { "name": "NATS_PASSWORD", "value": password }
+                ]
+            }]
+        }
+    })
+}
+
+/// POSIX-safe single-quote of an arbitrary string for embedding in a `sh -c`
+/// script (wraps in single quotes, escaping embedded single quotes).
+///
+/// Shared by both sides of the backup: `extract` quotes stream names into the
+/// dump script, `restore` quotes generated passwords into the Dragonfly load
+/// script. It was private to the restore side until 2.6d-6 needed the same
+/// rule — and two quoting functions in one repository is how one of them ends
+/// up subtly different from the other.
+pub fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 // ---------------------------------------------------------------------------
 // Impure forwarding helpers — delegate to KubeExec
 // ---------------------------------------------------------------------------

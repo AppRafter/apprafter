@@ -5,13 +5,28 @@ use crate::ResourceRef;
 
 /// Manifest format version this build can read and write.
 ///
-/// v1 = initial (2.6d-4). `restore` rejects any backup whose `manifestVersion`
-/// exceeds this constant so that a future format bump surfaces a clear error
-/// instead of silent misparse (spec §Manifest / m8).
-pub const MANIFEST_VERSION_CURRENT: u32 = 1;
+/// * v1 = initial (2.6d-4).
+/// * v2 = 2.6d-6: a snapshot may carry `jetstream/<ns>/<claim>/<stream>.tar`.
+///   The bump is not about a field — it is what tells a reader whether the
+///   ABSENCE of jetstream data means "captured, and there was none" or "this
+///   format could not capture it". Without it, every snapshot taken before
+///   2.6d-6 would quietly start reading as complete.
+///
+/// `restore` rejects any backup whose `manifestVersion` exceeds this constant
+/// so that a future format bump surfaces a clear error instead of silent
+/// misparse (spec §Manifest / m8).
+pub const MANIFEST_VERSION_CURRENT: u32 = 2;
 
+/// The version a manifest with NO `manifestVersion` field is.
+///
+/// 1, not [`MANIFEST_VERSION_CURRENT`]: the field was introduced together with
+/// v1 and shipped v1 backups omit it, so an absent field means "written before
+/// the field existed" — which is v1 and nothing else. Defaulting it to the
+/// current version would make every old snapshot claim to be in whatever
+/// format this build writes, which is precisely how one would claim to hold
+/// data it does not have.
 fn default_manifest_version() -> u32 {
-    MANIFEST_VERSION_CURRENT
+    1
 }
 
 /// The `manifest.json` written at the root of an export/backup.
@@ -53,12 +68,19 @@ mod tests {
     use crate::ResourceRef;
 
     #[test]
-    fn manifest_defaults_to_current_version_for_shipped_v1_json() {
-        // old manifest without manifestVersion -> reads as MANIFEST_VERSION_CURRENT (1)
+    fn a_manifest_without_the_version_field_reads_as_v1_not_as_current() {
+        // Shipped v1 backups omit the field. Reading one as the CURRENT
+        // version would tell every later reader that a 2026-07 snapshot is in
+        // whatever format this build writes — and 2.6d-6 made that difference
+        // load-bearing: v1 cannot hold jetstream data, v2 can.
         let json = r#"{"clusterId":"c","createdAt":"t","platformVersion":"0.2.31","namespaces":[],"resources":[]}"#;
         let m: BackupManifest = serde_json::from_str(json).unwrap();
-        assert_eq!(m.manifest_version, MANIFEST_VERSION_CURRENT);
-        assert_eq!(MANIFEST_VERSION_CURRENT, 1);
+        assert_eq!(m.manifest_version, 1);
+        assert_ne!(
+            m.manifest_version, MANIFEST_VERSION_CURRENT,
+            "the two must differ for this test to mean anything — when a future \
+             bump makes them equal again, the default is what has to move"
+        );
     }
 
     /// A4: the origin-firewall intent is NOT a manifest field. It briefly was

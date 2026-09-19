@@ -124,6 +124,23 @@ pub const CLAIMS: &[Claim] = &[
         holds_today: false,
     },
     Claim {
+        // The sibling of the redis entry below, and the same incident one
+        // type later: the phrase was true, correct to publish, and false the
+        // day the planner grew an arm — with the generated reference and two
+        // guides carrying it. The anchor is that arm.
+        phrase: "no jetstream data is in this",
+        evidence: "cli/backup-core/src/extract.rs",
+        anchor: "\"jetstream\" =>",
+        truth: Expect::Absent,
+        because: "backup-restore.md and jetstream.md told operators a backup \
+                  holds no stream data and a restore brings the claim back \
+                  empty — true until 2.6d-6 captured it through the \
+                  `mgr_<ns>` identity. The runtime line survives for \
+                  pre-capture snapshots, which is why the phrase is watched \
+                  in the DOCS rather than deleted from the code.",
+        holds_today: false,
+    },
+    Claim {
         phrase: "redis contents are not captured",
         evidence: "cli/backup-core/src/extract.rs",
         anchor: "\"redis\" =>",

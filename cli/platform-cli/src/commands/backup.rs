@@ -2834,7 +2834,17 @@ where
     // say whether its DATA is. For the types that have no capture path, this
     // is the difference between a snapshot that reads complete and one that is
     // — so it is stated here, under the listing it qualifies.
-    for line in uncaptured_claims_lines(&uncaptured_claims_of(&resources), "snapshot") {
+    let manifest_version = manifest
+        .pointer("/manifestVersion")
+        .and_then(Value::as_u64)
+        // Absent means the format that predates the field, which is v1 — the
+        // same reading `manifest::default_manifest_version` makes, and for the
+        // same reason.
+        .unwrap_or(1) as u32;
+    for line in uncaptured_claims_lines(
+        &uncaptured_claims_of(&resources, manifest_version),
+        "snapshot",
+    ) {
         out.push_str(&line);
         out.push('\n');
     }
@@ -2845,10 +2855,16 @@ where
 /// (A6). Pure.
 ///
 /// Reads the manifest's own `no_data` marker first — a snapshot should be able
-/// to describe itself — and falls back to what THIS build knows has no capture
-/// path, so a snapshot taken before the marker existed still gets an honest
-/// answer instead of reading as complete.
-fn uncaptured_claims_of(resources: &[Value]) -> Vec<UncapturedClaim> {
+/// to describe itself — and falls back to what this build knows about a
+/// snapshot of THAT FORMAT VERSION, so one taken before the marker existed
+/// still gets an honest answer instead of reading as complete.
+///
+/// The version is what makes the fallback right in both directions. A v1
+/// snapshot holds no jetstream data, whatever this build can capture now; a v2
+/// one holds it unless the marker says otherwise. Without the version, the day
+/// jetstream capture shipped every older snapshot would have gone silent about
+/// exactly the claims A6 was about.
+fn uncaptured_claims_of(resources: &[Value], manifest_version: u32) -> Vec<UncapturedClaim> {
     resources
         .iter()
         .filter(|r| r.pointer("/kind").and_then(Value::as_str) == Some("ResourceClaim"))
@@ -2862,7 +2878,12 @@ fn uncaptured_claims_of(resources: &[Value]) -> Vec<UncapturedClaim> {
                 .or_else(|| r.pointer("/noData"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            if !marked && !backup_core::extract::claim_type_has_no_data_capture(claim_type) {
+            if !marked
+                && !backup_core::extract::claim_type_has_no_data_in_manifest(
+                    claim_type,
+                    manifest_version,
+                )
+            {
                 return None;
             }
             Some(UncapturedClaim {
@@ -9067,8 +9088,11 @@ mod tests {
     }
 
     /// A snapshot written before the marker existed still gets an honest
-    /// answer, from what this build knows has no capture path. The alternative
-    /// is a pre-marker snapshot reading as complete forever.
+    /// answer, from what this build knows about a snapshot of THAT format
+    /// version. The alternative is a pre-marker snapshot reading as complete
+    /// forever — and after 2.6d-6 that is no longer hypothetical: jetstream
+    /// data is captured now, so without the version every older snapshot would
+    /// have gone quiet about exactly the claims A6 was about.
     #[test]
     fn backup_show_falls_back_to_the_type_when_the_manifest_predates_the_marker() {
         let manifest = json!({
@@ -9081,6 +9105,30 @@ mod tests {
         let out =
             format_snapshot_contents("abc123", None, None, &manifest, Some(0), &chrono::Utc, None);
         assert!(out.contains("jetstream: 1 claim(s)"), "{out}");
+    }
+
+    /// …and the other direction: in a snapshot whose FORMAT can hold jetstream
+    /// data, an unmarked jetstream claim is one whose data is there. A warning
+    /// here would send an operator looking for data they already have.
+    ///
+    /// The pair is the whole point of versioning the fallback. After 2.6d-6
+    /// the claim type alone answers nothing — only the manifest version
+    /// distinguishes "captured, and this claim had no streams" from "this
+    /// format could not capture it".
+    #[test]
+    fn backup_show_is_silent_about_a_jetstream_claim_in_a_capture_era_snapshot() {
+        let manifest = json!({
+            "manifestVersion": backup_core::manifest::MANIFEST_VERSION_CURRENT,
+            "clusterId": "prod", "platformVersion": "0.2.75",
+            "resources": [
+                {"namespace": "demo", "kind": "ResourceClaim", "name": "events",
+                 "claim_type": "jetstream"},
+            ]
+        });
+        let out =
+            format_snapshot_contents("abc123", None, None, &manifest, Some(0), &chrono::Utc, None);
+        assert!(!out.contains("configuration only"), "{out}");
+        assert!(!out.contains("brings them back empty"), "{out}");
     }
 
     /// DOES NOT FIRE for a snapshot whose claims all carry data.
