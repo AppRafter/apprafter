@@ -55,6 +55,29 @@ patch of each phase.
   artifact. A claim that never provisioned has no account to read and is
   skipped, exactly as an unprovisioned pg claim is.
 
+### Fixed
+
+- **A sequential backup of a `needs.disk` claim restored nothing, and said so
+  in a note under a successful restore.** `find_claim_data_dir` recognises a
+  per-claim snapshot by the payload directories in it, and its list read `pg`,
+  `redis`, `disk` — while `extract_volume` writes `volumes/`, as it has since
+  the engine was split behind `KubeExec` (no version ever wrote `disk/`). So
+  the snapshot holding a volume looked payload-less, the merge was skipped with
+  `note: snapshot … carries no claim data`, and the restore reported success
+  over a volume that was never written.
+
+  Reachable only through `--staging-mode sequential`, which stages one claim
+  per snapshot — and `e2e/backup-s3-sequential-kind.sh` deploys pg and redis,
+  so the one walk that exercises that mode has no disk claim in it. Same class
+  as D26, which introduced this function: a second statement of a layout, one
+  directory name apart from the first.
+
+  The layout is now one statement. `DataKind::payload_dir` is an exhaustive
+  match — a new kind does not compile until it names its directory — and both
+  sides read it: `extract` builds its paths from it, `find_claim_data_dir`
+  recognises a snapshot by it. `DataKind::ALL` is checked against the planner
+  rather than trusted.
+
 ### Changed
 
 - **The manifest is v2, and an absent `manifestVersion` now reads as v1.** The

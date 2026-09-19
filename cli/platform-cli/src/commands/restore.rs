@@ -3409,7 +3409,11 @@ fn restic_output_to_result(argv: &[String], out: &std::process::Output) -> Resul
 ///
 /// Distinct from [`find_data_dir`], which anchors on `manifest.json` — only the
 /// commit point carries one. A per-claim snapshot is recognised by the data
-/// kinds the extractor writes.
+/// kinds the extractor writes, read from `DataKind::payload_dir` rather than
+/// restated: the restatement is what broke it. The list said `disk`, the
+/// extractor has always written `volumes`, and the mismatch meant a sequential
+/// run of a `needs.disk` claim restored nothing and said so in a note under a
+/// successful restore.
 fn find_claim_data_dir(root: &Path) -> Option<PathBuf> {
     fn search(dir: &Path) -> Option<PathBuf> {
         let mut subdirs = Vec::new();
@@ -3417,10 +3421,11 @@ fn find_claim_data_dir(root: &Path) -> Option<PathBuf> {
         for e in std::fs::read_dir(dir).ok()?.flatten() {
             let p = e.path();
             if p.is_dir() {
-                if matches!(
-                    p.file_name().and_then(|n| n.to_str()),
-                    Some("pg") | Some("redis") | Some("disk") | Some("jetstream")
-                ) {
+                if p.file_name().and_then(|n| n.to_str()).is_some_and(|name| {
+                    backup_core::DataKind::ALL
+                        .iter()
+                        .any(|kind| kind.payload_dir() == name)
+                }) {
                     has_payload = true;
                 }
                 subdirs.push(p);
@@ -6216,6 +6221,37 @@ mod tests {
         assert_eq!(redis.len(), 1);
         assert_eq!(redis[0].1, "cache");
         assert!(discover_nested_artifacts(dd.path(), "pg", "data.tar").is_empty());
+    }
+
+    /// Every payload directory the extractor writes has to be recognised, and
+    /// `volumes/` is the one that was not: the matcher listed `disk`, which no
+    /// version of the extractor has ever written (`extract_volume` has written
+    /// `volumes/` since the engine was split behind `KubeExec`). So a
+    /// sequential run backing up a `needs.disk` claim produced a snapshot the
+    /// restore skipped with a note — and reported success. Same class as D26,
+    /// which introduced this function, one directory name later.
+    #[test]
+    fn every_payload_directory_the_extractor_writes_is_recognised() {
+        for (kind, dir) in [
+            (backup_core::DataKind::Pg, "pg/demo/db.dump"),
+            (
+                backup_core::DataKind::Volume,
+                "volumes/demo/uploads/data.tar",
+            ),
+            (backup_core::DataKind::Redis, "redis/demo/cache/dump.tar"),
+            (
+                backup_core::DataKind::JetStream,
+                "jetstream/demo/events/orders.tar",
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            write_at(root.path(), &format!("claim-0/data/{dir}"), "PAYLOAD");
+            assert_eq!(
+                find_claim_data_dir(root.path()),
+                Some(root.path().join("claim-0/data")),
+                "{kind:?} writes {dir} and the matcher did not see it"
+            );
+        }
     }
 
     /// A sequential run stages ONE claim per snapshot, so a snapshot holding

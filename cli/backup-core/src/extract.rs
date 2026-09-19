@@ -505,7 +505,7 @@ fn extract_pg(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path, pg_image: &s
     apply_and_wait_pod_ready(k, &spec)?;
 
     // 3. Stream pg_dump output to disk.
-    let dest = out_dir.join("pg").join(ns);
+    let dest = out_dir.join(DataKind::Pg.payload_dir()).join(ns);
     fs::create_dir_all(&dest)
         .map_err(|e| CliError::Other(format!("create dir {}: {e}", dest.display())))?;
     let dump_path = dest.join(format!("{claim}.dump"));
@@ -545,7 +545,10 @@ fn extract_volume(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Resul
     );
     apply_and_wait_pod_ready(k, &spec)?;
 
-    let dest = out_dir.join("volumes").join(ns).join(claim);
+    let dest = out_dir
+        .join(DataKind::Volume.payload_dir())
+        .join(ns)
+        .join(claim);
     fs::create_dir_all(&dest)
         .map_err(|e| CliError::Other(format!("create dir {}: {e}", dest.display())))?;
     let tar_path = dest.join("data.tar");
@@ -620,7 +623,10 @@ fn extract_jetstream(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Re
 
     // 4. Dump + tar to `jetstream/<ns>/<claim>/<stream>.tar`. The file NAME is
     //    the stream, verbatim, because that is what the restore reads back.
-    let dest = out_dir.join("jetstream").join(ns).join(claim);
+    let dest = out_dir
+        .join(DataKind::JetStream.payload_dir())
+        .join(ns)
+        .join(claim);
     fs::create_dir_all(&dest)
         .map_err(|e| CliError::Other(format!("create dir {}: {e}", dest.display())))?;
     let tar_path = dest.join(format!("{stream}.tar"));
@@ -648,7 +654,10 @@ fn extract_redis(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Result
     let pod = format!("{instance}-0");
     let df_ns = "dragonfly-system";
 
-    let dest = out_dir.join("redis").join(ns).join(claim);
+    let dest = out_dir
+        .join(DataKind::Redis.payload_dir())
+        .join(ns)
+        .join(claim);
     fs::create_dir_all(&dest)
         .map_err(|e| CliError::Other(format!("create dir {}: {e}", dest.display())))?;
     let tar_path = dest.join("dump.tar");
@@ -990,6 +999,45 @@ mod tests {
     /// AFTER it, and says nothing about the ones already in the repository.
     /// Emptying the table alone would have silenced those — the finding's own
     /// failure mode, pointed at the archive.
+    /// `DataKind::ALL` is a hand-written list, and this is what keeps it
+    /// honest: the planner is run over a claim of every shipped type, and
+    /// every kind it produces must be listed. A kind with a planner arm and no
+    /// entry would go missing from `find_claim_data_dir`, which reads that
+    /// list to recognise a per-claim snapshot — the exact defect 2.6d-6 found
+    /// in the restated version.
+    #[test]
+    fn every_planned_kind_is_in_all() {
+        let claims = vec![
+            json!({"spec": {"type": "pg"}, "metadata": {"name": "db", "namespace": "demo"},
+                   "status": {"connectionSecretRef": "db-conn"}}),
+            json!({"spec": {"type": "disk"}, "metadata": {"name": "vol", "namespace": "demo"},
+                   "status": {"volumeClaimRef": "pvc"}}),
+            json!({"spec": {"type": "redis", "persistent": true},
+                   "metadata": {"name": "cache", "namespace": "demo"},
+                   "status": {"instance": "platform-redis-persistent-000"}}),
+            json!({"spec": {"type": "jetstream"}, "metadata": {"name": "js", "namespace": "demo"},
+                   "status": {"connectionSecretRef": "js-conn",
+                              "streams": {"declared": ["orders"]}}}),
+        ];
+        let plan = plan_extraction(&claims);
+        assert_eq!(plan.len(), 4, "one item per fixture: {plan:?}");
+        for item in &plan {
+            assert!(
+                DataKind::ALL.contains(&item.kind),
+                "{:?} is planned but missing from DataKind::ALL",
+                item.kind
+            );
+        }
+        // …and every listed kind names a distinct directory, or two payloads
+        // would land on one tree and the second would refuse to overwrite the
+        // first at restore time.
+        let mut dirs: Vec<&str> = DataKind::ALL.iter().map(|k| k.payload_dir()).collect();
+        dirs.sort();
+        let count = dirs.len();
+        dirs.dedup();
+        assert_eq!(dirs.len(), count, "two kinds share a payload directory");
+    }
+
     #[test]
     fn a_snapshot_older_than_the_capture_still_reports_the_type_as_dataless() {
         assert!(claim_type_has_no_data_in_manifest("jetstream", 1));

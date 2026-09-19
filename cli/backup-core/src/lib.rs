@@ -34,6 +34,43 @@ pub enum DataKind {
     JetStream,
 }
 
+impl DataKind {
+    /// Every kind an extraction can produce.
+    ///
+    /// The restatement is checked rather than trusted:
+    /// `every_planned_kind_is_in_all` runs the planner over a claim of each
+    /// shipped type and asserts what comes back is listed here, so a kind with
+    /// a planner arm and no entry fails a test rather than going missing from
+    /// whatever reads this list.
+    pub const ALL: &'static [DataKind] = &[
+        DataKind::Pg,
+        DataKind::Redis,
+        DataKind::Volume,
+        DataKind::JetStream,
+    ];
+
+    /// The directory this kind's artifacts land in under an extraction root.
+    ///
+    /// ONE statement of the layout, because the two sides of a backup read it
+    /// from opposite ends: `extract` writes the tree, and `restore` recognises
+    /// a per-claim snapshot by the directories in it. They were separate
+    /// literals until 2.6d-6, and they disagreed — the matcher looked for
+    /// `disk`, which no extractor has ever written, so a sequential run of a
+    /// `needs.disk` claim produced a snapshot the restore skipped with a note
+    /// and called the restore a success.
+    ///
+    /// Exhaustive on purpose: a new kind does not compile until its directory
+    /// is named here, and both sides pick it up at once.
+    pub fn payload_dir(self) -> &'static str {
+        match self {
+            DataKind::Pg => "pg",
+            DataKind::Redis => "redis",
+            DataKind::Volume => "volumes",
+            DataKind::JetStream => "jetstream",
+        }
+    }
+}
+
 /// A resource captured into the backup manifest.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ResourceRef {
