@@ -83,6 +83,8 @@ tmp/
 !/spec.md
 !/plan.md
 !/FEATURE_TRACKER.md
+# Written by ATM's changelog sync, not by hand — see the note at its top.
+!/CHANGELOG.md
 
 # scratch docs accidentally swept by a subagent git add -A (2026-06-10)
 /landing/docs/steps.md

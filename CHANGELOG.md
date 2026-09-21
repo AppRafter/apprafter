@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+**This file is generated from ATM** by the changelog sync; edit entries in ATM, not
+here, or the next release will overwrite them. Anything outside a `## [version]`
+section — such as this note — survives regeneration.
+
+**Which version the heading names.** This is a monorepo with several independently
+versioned streams, and their numbers are meant to differ. A heading here tracks the
+**platform-stack chart**, the artifact a cluster actually consumes; the CLI, the
+operator charts and the CUE CMP sidecar carry their own numbers. To see which of them
+a given release moved, read that version's record in
+`platform-stack/cue/compatibility.cue` — it carries the paired `operatorVersion` and
+the upgrade's change class. `CLAUDE.md` § "Releases and version streams" holds the full
+map. The narrative, per-phase ledger this repository kept before ATM lives on in
+`docs/changelog/UNRELEASED.md` and `docs/changelog/plan-history.md`.
+
 ## [0.2.79]
 
 ### Added
