@@ -1934,6 +1934,40 @@ compatibility: "0.2.74": {
 	]
 }
 
+compatibility: "0.2.79": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.51"
+	notes: """
+		A ROLLOUT NO LONGER DEADLOCKS ON A FULL NODE — AND EVERY APPLICATION
+		POD RESTARTS ONCE ON THIS UPGRADE. Take this release if a deploy has
+		ever appeared to hang: the old pods keep serving, so the symptom is
+		not an outage but a freeze nothing reports.
+
+		Below four replicas the renderer now pins
+		`RollingUpdate{maxSurge: 0, maxUnavailable: 1}` instead of leaving the
+		apiserver default. That default resolves to (maxSurge 1,
+		maxUnavailable 0) at one, two AND three replicas — `floor(0.25 * 3)`
+		is still 0 — so a rollout had to acquire capacity before it could
+		release any. On a node at its allocatable ceiling the replacement pod
+		stays Pending forever and nothing is ever released. Four is the first
+		count where the default already releases first, so it is left alone.
+
+		WHAT AN UPGRADING CLUSTER SEES: `spec.strategy` changes on every
+		Application Deployment below four replicas, which is a pod-template
+		change, so each rolls once. At exactly one replica the old pod now
+		goes away BEFORE its replacement is ready — a brief window with
+		nothing serving, accepted deliberately because a single replica on a
+		single node has no availability to lose and the alternative is a
+		rollout that never finishes. Applications mounting an owned disk are
+		untouched: they already roll with `Recreate`.
+		"""
+	references: [
+		"docs/adr/0043-needs-disk-named-claims.md",
+		"docs/how-it-works/node-reservations-and-swap.md",
+		"docs/changelog/UNRELEASED.md",
+	]
+}
+
 compatibility: "0.2.78": {
 	change:          "safe"
 	operatorVersion: "v0.2.50"
