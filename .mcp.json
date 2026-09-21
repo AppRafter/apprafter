@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "atm": {
+      "type": "http",
+      "url": "https://atm-mcp.omnixal.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${ATM_TOKEN}"
+      }
+    }
+  }
+}
