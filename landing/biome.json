@@ -21,6 +21,7 @@
       "**/*.lock",
       "**/bun.lockb",
       "cms/payload-types.ts",
+      "cms/next-env.d.ts",
       "cms/src/app/(payload)/admin/importMap.js",
       "cms/src/migrations"
     ]
