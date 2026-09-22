@@ -20,7 +20,17 @@ CLUSTER="apprafter-crd-validate"
 # upgrade cannot silently change which apiserver validates the CRDs — see the
 # note on APPRAFTER_KIND_NODE_IMAGE in e2e/lib.sh.
 : "${APPRAFTER_KIND_NODE_IMAGE:=kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed}"
-cleanup() { kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true; }
+# A PRIVATE kubeconfig. Without it `kind create` writes its context into the
+# caller's ~/.kube/config and makes it current, and `kind delete` then unsets
+# current-context — so a developer whose current context was a real cluster
+# found it silently switched away after every CRD gate. Nothing below needs
+# the caller's kubeconfig: every kubectl call names the kind context.
+KUBECONFIG="$(mktemp)"
+export KUBECONFIG
+cleanup() {
+    kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
+    rm -f "$KUBECONFIG"
+}
 trap cleanup EXIT
 
 echo "==> creating ephemeral kind cluster '$CLUSTER'"
