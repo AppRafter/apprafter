@@ -554,8 +554,8 @@ _components: argocd: #Component & {
 		// peak is the two heaviest operations plus the Go process.
 		// Re-run on kind with the 11 platform Applications, one cluster,
 		// 0.2.79 values then these: parallelism 0 / 256Mi peaked at
-		// 180Mi anon with 9 helm children at once, 10-20Mi under the
-		// OOM threshold below; parallelism 2 / 384Mi peaked at 92 and
+		// 180Mi anon with 9 helm children at once (the limit sweep below
+		// saw 192Mi OOM-kill 1 run in 2); parallelism 2 / 384Mi peaked at 92 and
 		// 98Mi (the argo-cd + cilium chart pulls; the monorepo
 		// index-pack), never more than 2 helm children, no OOM.
 		//
@@ -564,6 +564,14 @@ _components: argocd: #Component & {
 		// A cluster with dozens of Applications, or slow git sources
 		// holding both slots, would show ComparisonError retries and a
 		// high `argocd_repo_pending_request_total`; 3-4 is the next step.
+		// The same coupling in an OUTAGE: helm and git children run
+		// without the request's context, bounded only by
+		// ARGOCD_EXEC_TIMEOUT (90s), so a stalled registry or git host
+		// (ghcr.io serves the platform, operator, webhook and dragonfly
+		// charts) can hold both slots after its callers gave up, and
+		// Applications unrelated to it then ComparisonError until it
+		// recovers. At the old unlimited setting that coupling did not
+		// exist; it is the price of bounding the peak.
 		//
 		// Value type: the chart renders every `configs.params` value
 		// with `toString`, so this int lands as the string "2" the
