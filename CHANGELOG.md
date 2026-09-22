@@ -15,10 +15,17 @@ is a monorepo: a release moves some subset of independently versioned streams, a
 their numbers are meant to differ. So a heading names **the streams that actually
 moved**, which is this repository's own long-standing convention:
 
+The examples below are indented one space on purpose. Both ATM's changelog sync
+and `release-cli.yml` find releases by scanning for `##` at the start of a line,
+and neither knows what a fenced code block is — flush-left examples here become
+four releases, and a tag search answers with an illustration instead of its
+notes. Verified: before the indent, a lookup for `v0.2.75` returned the first
+line below.
+
 ```
-## cli v0.2.75 — …                              a CLI-only release
-## platform-stack 0.2.77 / cli v0.2.74 — …      both moved
-## platform-stack 0.2.69 / operator v0.2.49 — … no CLI change, so no CLI tag
+ ## cli v0.2.75 — …                              a CLI-only release
+ ## platform-stack 0.2.77 / cli v0.2.74 — …      both moved
+ ## platform-stack 0.2.69 / operator v0.2.49 — … no CLI change, so no CLI tag
 ```
 
 A CLI-only release carries no chart number because no chart was cut — the most common
