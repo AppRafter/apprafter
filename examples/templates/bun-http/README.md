@@ -15,7 +15,7 @@ image.
 | `src/app.module.ts`               | Root `@Module` — register controllers + providers here.              |
 | `src/health.controller.ts`        | `@Controller('/api')` with `/health` + `/ready`.                     |
 | `src/config.ts`                   | `envSchema` + `InferConfigType` module augmentation.                 |
-| `Dockerfile`                      | Multi-stage `oven/bun:1-debian` builder → `distroless/nodejs:nonroot`. |
+| `Dockerfile`                      | Multi-stage `oven/bun` (Debian) builder → `distroless/nodejs24-debian12:nonroot`. |
 | `apprafter/Application.cue`       | v1alpha1 Application manifest — drop into your bootstrap repo.        |
 
 ## Develop
@@ -40,7 +40,7 @@ docker push ghcr.io/your-org/bun-http-starter:0.1.0
 
 The Dockerfile bundles to a Node-compatible CommonJS file via
 `bun build --target node` so the runtime layer is
-`distroless/nodejs20-debian12:nonroot` — no Bun shipped in the
+`distroless/nodejs24-debian12:nonroot` — no Bun shipped in the
 image, ~30 MB final size.
 
 ## Deploy via AppRafter

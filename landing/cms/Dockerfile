@@ -80,7 +80,7 @@ RUN set -eu; mkdir -p /landing/runtime-deps; \
 # -----------------------------------------------------------------
 # Stage 2: minimal Node runtime
 # -----------------------------------------------------------------
-FROM node:24.12-alpine AS runtime
+FROM node:24.21-alpine AS runtime
 WORKDIR /app
 
 ENV NODE_ENV=production

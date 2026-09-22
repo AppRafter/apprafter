@@ -91,7 +91,8 @@ bun install --frozen-lockfile
 # image builds.
 docker build -f web/Dockerfile -t landing-web:dev .
 
-# CMS — Next standalone output; runtime is node:22-alpine.
+# CMS — Next standalone output; runtime is Node 24 on Alpine (the
+# runtime-stage FROM in cms/Dockerfile carries the pinned minor).
 docker build -f cms/Dockerfile -t landing-cms:dev .
 
 # Smoke-run locally on the same ports as the dev workflow:
