@@ -31,6 +31,13 @@
 # require them on musl Alpine.
 
 FROM docker.io/library/rust:1.98-alpine3.24 AS chef
+# Same cargo-chef as the operator images (scripts/upstream-pins.json
+# `image-cargo-chef` reads all three ARGs). Without `--version`, `cargo install`
+# resolves whatever crates.io calls newest on the day of the build.
+ARG CARGO_CHEF_VERSION=0.1.78
+RUN apk add --no-cache musl-dev perl make \
+ && cargo install cargo-chef --locked --version "${CARGO_CHEF_VERSION}"
+
 # ONE compiler for every stage: the one this image ships.
 #
 # cli/rust-toolchain.toml says channel "1.98", but the image names its
@@ -50,14 +57,13 @@ FROM docker.io/library/rust:1.98-alpine3.24 AS chef
 # still resolves elsewhere into a build failure instead of a silent download.
 # The file keeps the say over the MINOR: the planner refuses to build when the
 # image's rustc is not the minor cli/rust-toolchain.toml names.
+#
+# Set AFTER `cargo install`, which runs outside cli/ and so already uses the
+# image's toolchain; set before it, cargo warns that an environment variable
+# overrode the default toolchain, a warning in every release log that means
+# nothing.
 ENV RUSTUP_TOOLCHAIN=${RUST_VERSION} \
     RUSTUP_AUTO_INSTALL=0
-# Same cargo-chef as the operator images (scripts/upstream-pins.json
-# `image-cargo-chef` reads all three ARGs). Without `--version`, `cargo install`
-# resolves whatever crates.io calls newest on the day of the build.
-ARG CARGO_CHEF_VERSION=0.1.78
-RUN apk add --no-cache musl-dev perl make \
- && cargo install cargo-chef --locked --version "${CARGO_CHEF_VERSION}"
 WORKDIR /workspace/cli
 
 FROM chef AS planner
