@@ -427,7 +427,23 @@
       "compare": "numeric",
       "gate": null,
       "gateGap": "Building the images is the gate, and only one of the ten Dockerfiles in this tree is built on a PR (argocd-cue-cmp-check.yml:71). Wiring a build into the watch job would duplicate that workflow; the honest move is to add pull_request builds for the other images, which is a CI change of its own.",
-      "note": "Known drift: the CMP sidecar is on 3.20, the backup runner on 3.21."
+      "note": "Both copies are on the same minor since 2026-09-22 (the CMP sidecar was on 3.20 and the backup runner on 3.21 until then). The backup runner's tag also CHOOSES its restic: see the `restic` entry, whose build-time assertion fails when a bump here would move the restic minor."
+    },
+    {
+      "id": "restic",
+      "class": "container-package",
+      "title": "restic minor (backup runner image)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "cli/apprafter-backup/Dockerfile", "pattern": "(?m)^ARG RESTIC_MINOR=(\\S+)" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "restic/restic" },
+      "compare": "minor",
+      "gate": null,
+      "gateGap": "Moving the minor needs an Alpine tag that packages it, which neither a build-arg nor a watch job can supply. On the bump commit the image build is the first gate (its RESTIC_MINOR assertion fails when the tag ships another minor), and e2e/backup-s3-sequential-kind.sh -- a local two-cluster kind walk against in-cluster MinIO, run by no workflow -- is the one that exercises restic itself.",
+      "note": "RESTIC_MINOR does not choose restic. The runtime stage's `alpine:` tag does (`apk add restic`), and the build only ASSERTS that the minor it got is this one, failing loudly otherwise. So BEHIND here means a newer restic minor exists upstream, not that the runner can take it: the move is an Alpine tag that packages it (on 2026-09-22 alpine 3.24 ships 0.18.1, edge 0.19.1), a read of the restic changelog for repository-format and S3 behaviour changes, then RESTIC_MINOR and the tag in one commit. The tag itself is image-alpine's row."
     },
     {
       "id": "image-rust-builder",
@@ -468,39 +484,37 @@
     {
       "id": "image-node",
       "class": "container-base-image",
-      "multipleValuesOk": "Two different base flavours on purpose: the Backstage host needs glibc (bookworm-slim), the landing CMS runtime does not (alpine).",
-      "title": "node (Backstage host + landing CMS runtime)",
+      "title": "node LTS major (Backstage host + landing CMS base images)",
       "read": {
         "kind": "regex",
         "sources": [
-          { "files": "backstage-plugins/host/Dockerfile", "pattern": "FROM node:(\\S+) AS build" },
-          { "files": "landing/cms/Dockerfile", "pattern": "FROM node:(\\S+) AS runtime" }
+          { "files": "backstage-plugins/host/Dockerfile", "pattern": "(?m)^FROM node:(\\d+)(?:\\.\\d+)*-bookworm-slim\\b" },
+          { "files": "landing/cms/Dockerfile", "pattern": "(?m)^FROM node:(\\d+)(?:\\.\\d+)*-alpine AS runtime" }
         ]
       },
-      "upstream": { "kind": "docker-hub", "repository": "library/node", "tagPattern": "^\\d+-(alpine|bookworm-slim)$" },
-      "compare": "none",
+      "upstream": { "kind": "http-text", "url": "https://nodejs.org/dist/index.json", "pattern": "\"version\":\\s*\"v(\\d+)\\.\\d+\\.\\d+\"[^{}]*\"lts\":\\s*\"[^\"]+\"" },
+      "compare": "major",
       "gate": null,
-      "gateGap": "Two different base flavours (bookworm-slim vs alpine) with different major pins; a single `newest` is not a meaningful target. Needs a human decision per image.",
-      "note": "The Backstage host is on node 20 (out of upstream LTS support) and the landing CMS on node 24. Reported for review, never as `behind`, because the two are not comparable to one number."
+      "gateGap": "The build is the gate. landing/cms/Dockerfile is built only by release-landing.yml, after a landing/** change reaches master; the Backstage host Dockerfile is a template for an app @backstage/create-app scaffolds, and no workflow builds it. Build both locally on the bump commit.",
+      "note": "The MAJOR half of the node pin; the minor half is mise-node, which reads the same FROM lines. Reads only the leading number and asks nodejs.org's release index for the newest LTS line (the first entry carrying an `lts` codename; the index is ordered newest first), so an odd Current major, or an even one before it enters LTS, is never reported -- Backstage supports exactly two adjacent LTS majors (`engines.node` in its create-app template). The two rows never disagree: a new 24.x minor is BEHIND on mise-node only, a new LTS line on this row only (mise-node's upstream is scoped to the tree's major)."
     },
     {
       "id": "image-bun",
       "class": "container-base-image",
-      "multipleValuesOk": "alpine for the landing builders, debian for the scaffolded user template. Different flavours of the same major, not drift.",
-      "title": "oven/bun (landing + template builders)",
+      "title": "oven/bun major (landing + template builders)",
       "read": {
         "kind": "regex",
         "sources": [
-          { "files": "landing/web/Dockerfile", "pattern": "FROM oven/bun:(\\S+) AS builder" },
-          { "files": "landing/cms/Dockerfile", "pattern": "FROM oven/bun:(\\S+) AS builder" },
-          { "files": "examples/templates/bun-http/Dockerfile", "pattern": "FROM oven/bun:(\\S+) AS builder" }
+          { "files": "landing/web/Dockerfile", "pattern": "FROM oven/bun:(\\d+)(?:\\.\\d+)*-\\S+ AS builder" },
+          { "files": "landing/cms/Dockerfile", "pattern": "FROM oven/bun:(\\d+)(?:\\.\\d+)*-\\S+ AS builder" },
+          { "files": "examples/templates/bun-http/Dockerfile", "pattern": "FROM oven/bun:(\\d+)(?:\\.\\d+)*-\\S+ AS builder" }
         ]
       },
       "upstream": { "kind": "docker-hub", "repository": "oven/bun", "tagPattern": "^\\d+-(alpine|debian)$" },
       "compare": "major",
       "gate": null,
       "gateGap": "The gate is `bun run build` inside the image, which landing-preview-build.yml already performs on the landing side.",
-      "note": "Pinned to major 1 and floating within it on purpose -- only a major bump is news."
+      "note": "The MAJOR half of the bun pin, read as the leading number of each builder FROM and compared with the newest major published as an image in the two flavours the tree uses (alpine for the landing builders, debian for the scaffolded template). The minor half is mise-bun, which reads the same FROM lines against bun's GitHub releases. The two never disagree: a new 1.x minor is BEHIND on mise-bun only; a new major is BEHIND on both."
     },
     {
       "id": "image-caddy",
@@ -513,11 +527,11 @@
           { "files": "docs-site/Dockerfile", "pattern": "(?m)^FROM caddy:(\\S+)\\s*$" }
         ]
       },
-      "upstream": { "kind": "docker-hub", "repository": "library/caddy", "tagPattern": "^\\d+-alpine$" },
-      "compare": "major",
+      "upstream": { "kind": "docker-hub", "repository": "library/caddy", "tagPattern": "^\\d+\\.\\d+-alpine$" },
+      "compare": "minor",
       "gate": null,
       "gateGap": "The gate is the site smoke (scripts/landing-site-smoke.sh, scripts/docs-site-smoke.sh), which probes a deployed site rather than a candidate image.",
-      "note": "Pinned to major 2 and floating within it on purpose."
+      "note": "Pinned to a minor with the patch floating, like every base image here, and this is the only row for it: the upstream is the newest `<major>.<minor>-alpine` tag across all majors, so both a new minor and a new major read as BEHIND."
     },
     {
       "id": "image-distroless",
@@ -799,8 +813,8 @@
       "upstream": { "kind": "docker-hub", "repository": "library/node", "tagPattern": "^{major}\\.\\d+-alpine$" },
       "compare": "minor",
       "gate": null,
-      "gateGap": "Same as image-node: needs a human decision per image, and the build is what proves it.",
-      "note": "Newest minor WITHIN the major in the tree ({major}). An LTS line ships as a stream of minors and an old minor is rarely patched once the next is out (24.12 only ever had 24.12.0), so for node a minor pin is close to an exact pin: fixes land in LATER minors, and this row is what surfaces them. A new LTS major is not this row's question -- image-node's floating row shows it."
+      "gateGap": "Same as image-node: the build is the gate, and only release-landing.yml builds one of the two images (after merge).",
+      "note": "Newest minor WITHIN the major in the tree ({major}). An LTS line ships as a stream of minors and an old minor is rarely patched once the next is out (24.12 only ever had 24.12.0), so for node a minor pin is close to an exact pin: fixes land in LATER minors, and this row is what surfaces them. A new LTS major is not this row's question -- image-node asks it."
     },
     {
       "id": "mise-just",
