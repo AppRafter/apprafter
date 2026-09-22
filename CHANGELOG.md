@@ -34,7 +34,7 @@ Everything from before ATM is frozen in `docs/changelog/history.md` — 237 sect
 already-shipped work, kept because `release-cli.yml` still reads it for tags cut before
 the switch.
 
-## [0.2.79]
+## platform-stack 0.2.79 / operator v0.2.51 — 2026-09-22
 
 ### Added
 
@@ -49,6 +49,7 @@ the switch.
 
 - An application with fewer than four replicas now rolls out with `maxSurge: 0, maxUnavailable: 1` instead of the Kubernetes default. The default resolves to `maxSurge: 1, maxUnavailable: 0` at one, two and three replicas, which forces a rollout to acquire capacity before it may release any — on a node at its allocatable ceiling the replacement pod stays `Pending`, nothing is released, and the rollout deadlocks silently while the old pods keep serving. From four replicas upward the Kubernetes default already releases before it acquires and is left alone. At exactly one replica the old pod now terminates before its replacement is ready, so there is a brief window with nothing serving — accepted deliberately, since a single replica on a single node has no availability guarantee to lose. Applications mounting their own disk are unaffected: they already roll with `Recreate`. (WI-279)
 - `release-cli.yml` no longer publishes a release with the wrong notes, or with none. Two defects, both found by reading rather than by a failure — and both permanent when they bite, because the workflow runs once per tag and never regenerates an older release. (1) The section lookup was a substring test, so tag `v0.2.5` matched inside the heading `## cli v0.2.51 — …`; verified reproducible, and hidden until now only because the file is newest-first so the intended section happened to come first. The match is now anchored on both sides, the tag's dots are escaped so they cannot act as regex wildcards, and only the part of the heading before the dash is searched — prose after it mentions other versions. (2) A missing section fell back to a stub body and exited 0, publishing a green release that describes nothing; it now fails loudly. The lookup reads the canonical root `CHANGELOG.md` first and falls back to `docs/changelog/history.md` for tags cut before the switch. (WI-347)
+- `release-cli.yml` is parseable again, and a new `scripts/check-workflows.sh` gate (actionlint, wired into `just lint` and pre-commit) keeps it that way. A shell comment inside a `run:` block had contained empty GitHub Actions expression delimiters: Actions expands those before the shell sees the script and does not know the line is a comment, so an empty expression made the whole workflow unparseable. The failure mode is why this needs a gate rather than a fix — an unparseable workflow fails as a run with **zero jobs**, which `gh pr checks` does not list, so every pull-request check stays green while a release workflow is dead until the day it should have run. (WI-348)
 
 ### Internal
 
