@@ -455,14 +455,15 @@
         "kind": "regex",
         "sources": [
           { "files": "operator/apprafter-operator/Dockerfile", "pattern": "(?m)^ARG CARGO_CHEF_VERSION=(\\S+)" },
-          { "files": "operator/admission-webhook/Dockerfile", "pattern": "(?m)^ARG CARGO_CHEF_VERSION=(\\S+)" }
+          { "files": "operator/admission-webhook/Dockerfile", "pattern": "(?m)^ARG CARGO_CHEF_VERSION=(\\S+)" },
+          { "files": "cli/apprafter-backup/Dockerfile", "pattern": "(?m)^ARG CARGO_CHEF_VERSION=(\\S+)" }
         ]
       },
       "upstream": { "kind": "crates-io", "crate": "cargo-chef" },
       "compare": "numeric",
       "gate": null,
       "gateGap": "Same as the rust builder: the gate is the image build.",
-      "note": "A Dockerfile ARG, so `docker build --build-arg` can test a candidate without editing the tree."
+      "note": "A Dockerfile ARG, so `docker build --build-arg` can test a candidate without editing the tree. The operator images download the prebuilt release binary; the backup runner compiles the same version from crates.io (`cargo install --locked --version`)."
     },
     {
       "id": "image-node",

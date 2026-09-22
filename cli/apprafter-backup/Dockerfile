@@ -11,7 +11,7 @@
 #                  to emit recipe.json (source-free dep description).
 #   3. `builder` — cooks deps from recipe.json (cache-stable), then
 #                  builds ONLY `-p apprafter-backup` with musl target.
-#   4. runtime   — alpine:3.21 with restic + ca-certificates.
+#   4. runtime   — alpine:3.24 with restic + ca-certificates.
 #                  pg_dump / tar run in separate ephemeral helper pods
 #                  (NOT this image), so no postgres-client needed here.
 #
@@ -29,19 +29,28 @@
 # require them on musl Alpine.
 
 FROM docker.io/library/rust:1.98-alpine3.24 AS chef
-RUN apk add --no-cache musl-dev perl make && cargo install cargo-chef --locked
+# Same cargo-chef as the operator images (scripts/upstream-pins.json
+# `image-cargo-chef` reads all three ARGs). Without `--version`, `cargo install`
+# resolves whatever crates.io calls newest on the day of the build.
+ARG CARGO_CHEF_VERSION=0.1.78
+RUN apk add --no-cache musl-dev perl make \
+ && cargo install cargo-chef --locked --version "${CARGO_CHEF_VERSION}"
 WORKDIR /workspace/cli
 
 FROM chef AS planner
 COPY cli/ /workspace/cli/
 RUN cargo chef prepare --recipe-path recipe.json
 
+# `--locked` on BOTH cargo steps, as release-cli.yml builds the CLI: the image
+# resolves exactly what cli/Cargo.lock says, or fails. Without it a Cargo.lock
+# that lags a Cargo.toml edit is silently re-resolved inside the image, so the
+# runner ships dependency versions no test in the workspace ever ran.
 FROM chef AS builder
 COPY --from=planner /workspace/cli/recipe.json recipe.json
-RUN cargo chef cook --release -p apprafter-backup --recipe-path recipe.json \
+RUN cargo chef cook --release --locked -p apprafter-backup --recipe-path recipe.json \
         --target x86_64-unknown-linux-musl
 COPY cli/ /workspace/cli/
-RUN cargo build --release -p apprafter-backup \
+RUN cargo build --release --locked -p apprafter-backup \
         --target x86_64-unknown-linux-musl
 
 FROM alpine:3.24
