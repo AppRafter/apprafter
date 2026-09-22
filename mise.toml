@@ -11,8 +11,13 @@
 # gives up the security patches. Nothing here floats by design — a floating
 # line and a forgotten one read the same, so neither is allowed.
 #
+# ONE EXCEPTION, decided 2026-09-22: node pins its MAJOR. Node ships every
+# fix — security releases included (24.13.0, 24.17.0) — on the newest minor
+# of an LTS line and never patches an older minor, so a node minor pin is an
+# exact pin in practice. For node the release line IS the major.
+#
 # Where each minor comes from. scripts/upstream-versions.py reads every line
-# below (entries rust-toolchain-minor and mise-*) and reports DRIFT when a
+# below (entries rust-toolchain-minor, mise-* and image-node) and reports DRIFT when a
 # copy disagrees with the source named here:
 #
 #   rust  the rust:<minor>-alpine builder images and CI's dtolnay/rust-toolchain
@@ -21,7 +26,8 @@
 #         to move, not this line.
 #   bun   the oven/bun:<minor>-* builder images. The flake's nixpkgs lags it
 #         (bun 1.3 at the locked rev), same as rust.
-#   node  the node:<minor>-* base images. flake.nix ships no node.
+#   node  the node:<MAJOR>-* base images (the LTS line; see the exception
+#         above). flake.nix ships no node.
 #   just  the just in the flake-locked nixpkgs (nixos-26.05). Moves when
 #         flake.lock moves: `nix eval --raw --inputs-from . nixpkgs#just.version`.
 #   go    the go in the flake-locked nixpkgs, read the same way. flake.nix's
@@ -30,7 +36,7 @@
 [tools]
 rust = "1.98"
 bun  = "1.4"
-node = "24.21" # for Backstage build tooling
+node = "24"    # LTS major, not a minor -- see the exception above
 just = "1.51"
 go   = "1.26"  # for plugins / occasional Go dependencies
 

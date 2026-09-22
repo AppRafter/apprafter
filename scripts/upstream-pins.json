@@ -36,7 +36,7 @@
     "            major   -- report only when the leading number increases (for `@v4`-style",
     "                       refs that float within their major on purpose).",
     "            minor   -- report only when (major, minor) increases, for pins written as a",
-    "                       minor (`1.98`, `24.12`) whose patch floats on purpose. Under",
+    "                       minor (`1.98`, `1.4`) whose patch floats on purpose. Under",
     "                       `numeric` every patch release would read as BEHIND.",
     "            none    -- floating by design or not semver-comparable; never reported as",
     "                       behind. Requires `note` saying why.",
@@ -484,19 +484,20 @@
     {
       "id": "image-node",
       "class": "container-base-image",
-      "title": "node LTS major (Backstage host + landing CMS base images)",
+      "title": "node LTS major (Backstage host + landing CMS base images, mise.toml)",
       "read": {
         "kind": "regex",
         "sources": [
-          { "files": "backstage-plugins/host/Dockerfile", "pattern": "(?m)^FROM node:(\\d+)(?:\\.\\d+)*-bookworm-slim\\b" },
-          { "files": "landing/cms/Dockerfile", "pattern": "(?m)^FROM node:(\\d+)(?:\\.\\d+)*-alpine AS runtime" }
+          { "files": "backstage-plugins/host/Dockerfile", "pattern": "(?m)^FROM node:(\\d+)-bookworm-slim\\b" },
+          { "files": "landing/cms/Dockerfile", "pattern": "(?m)^FROM node:(\\d+)-alpine AS runtime" },
+          { "files": "mise.toml", "pattern": "(?m)^node\\s*=\\s*\"(\\d+)\"" }
         ]
       },
       "upstream": { "kind": "http-text", "url": "https://nodejs.org/dist/index.json", "pattern": "\"version\":\\s*\"v(\\d+)\\.\\d+\\.\\d+\"[^{}]*\"lts\":\\s*\"[^\"]+\"" },
       "compare": "major",
       "gate": null,
       "gateGap": "The build is the gate. landing/cms/Dockerfile is built only by release-landing.yml, after a landing/** change reaches master; the Backstage host Dockerfile is a template for an app @backstage/create-app scaffolds, and no workflow builds it. Build both locally on the bump commit.",
-      "note": "The MAJOR half of the node pin; the minor half is mise-node, which reads the same FROM lines. Reads only the leading number and asks nodejs.org's release index for the newest LTS line (the first entry carrying an `lts` codename; the index is ordered newest first), so an odd Current major, or an even one before it enters LTS, is never reported -- Backstage supports exactly two adjacent LTS majors (`engines.node` in its create-app template). The two rows never disagree: a new 24.x minor is BEHIND on mise-node only, a new LTS line on this row only (mise-node's upstream is scoped to the tree's major)."
+      "note": "Node is the ONE tool pinned to its MAJOR rather than a minor (owner decision 2026-09-22): Node ships every fix, security releases included (24.13.0 and 24.17.0 were new minors), on the newest minor of an LTS line and never patches an older minor, so a minor pin is an exact pin in practice (24.12 received 0 of the 35 CVE fixes after 24.12.0, and Docker Hub stops rebuilding a minor tag once the next ships). The patterns accept ONLY a bare major, so a minor slipping back into a FROM line or mise.toml reads UNREADABLE instead of passing. Reads the leading number and asks nodejs.org's release index for the newest LTS line (the first entry carrying an `lts` codename; the index is ordered newest first), so an odd Current major, or an even one before it enters LTS, is never reported -- Backstage supports exactly two adjacent LTS majors (`engines.node` in its create-app template)."
     },
     {
       "id": "image-bun",
@@ -798,23 +799,6 @@
       "gate": null,
       "gateGap": "Same as image-bun: `bun run build` inside the image, which landing-preview-build.yml performs.",
       "note": "Reads the minor out of every oven/bun FROM line as well as mise.toml, so a builder bump that forgets mise (or the reverse) is DRIFT. Upstream tags are `bun-vX.Y.Z`; the compare takes the digits. The flake's nixpkgs carries bun 1.3 -- behind this, and not read here."
-    },
-    {
-      "id": "mise-node",
-      "class": "toolchain-minor",
-      "title": "node minor (mise.toml mirrors the base images)",
-      "read": {
-        "kind": "regex",
-        "sources": [
-          { "files": "mise.toml", "pattern": "(?m)^node\\s*=\\s*\"([^\"]+)\"" },
-          { "files": "*Dockerfile", "pattern": "FROM node:(\\d+\\.\\d+)-" }
-        ]
-      },
-      "upstream": { "kind": "docker-hub", "repository": "library/node", "tagPattern": "^{major}\\.\\d+-alpine$" },
-      "compare": "minor",
-      "gate": null,
-      "gateGap": "Same as image-node: the build is the gate, and only release-landing.yml builds one of the two images (after merge).",
-      "note": "Newest minor WITHIN the major in the tree ({major}). An LTS line ships as a stream of minors and an old minor is rarely patched once the next is out (24.12 only ever had 24.12.0), so for node a minor pin is close to an exact pin: fixes land in LATER minors, and this row is what surfaces them. A new LTS major is not this row's question -- image-node asks it."
     },
     {
       "id": "mise-just",

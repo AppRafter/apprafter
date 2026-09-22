@@ -80,7 +80,10 @@ RUN set -eu; mkdir -p /landing/runtime-deps; \
 # -----------------------------------------------------------------
 # Stage 2: minimal Node runtime
 # -----------------------------------------------------------------
-FROM node:24.21-alpine AS runtime
+# Node pins its LTS MAJOR, not a minor: fixes (security releases included)
+# ship only on the line's newest minor, so a minor pin would freeze this
+# publicly reachable runtime. scripts/upstream-pins.json `image-node`.
+FROM node:24-alpine AS runtime
 WORKDIR /app
 
 ENV NODE_ENV=production
