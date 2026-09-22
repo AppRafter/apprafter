@@ -1,4 +1,10 @@
 [toolchain]
-channel    = "stable"
+# Pin the MINOR, let the patch float — the same decision as CI's
+# dtolnay/rust-toolchain `toolchain:` input, the rust:<minor>-alpine builder
+# images and mise.toml (scripts/upstream-pins.json `rust-toolchain-minor`).
+# This file OVERRIDES `rustup default` inside cli/, so a `stable` here would
+# silently un-pin every cli/ CI job — and release-cli.yml installs its cross
+# target for the pinned toolchain only.
+channel    = "1.98"
 components = ["rustfmt", "clippy"]
 profile    = "minimal"

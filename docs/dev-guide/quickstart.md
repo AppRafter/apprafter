@@ -68,7 +68,7 @@ recommended path; build-from-source is for contributors.
 
 === "Contributors — build from source"
 
-    Requires a Rust toolchain (`mise.toml` pins `stable`). From a repo
+    Requires a Rust toolchain (`mise.toml` pins Rust 1.98; the patch floats). From a repo
     checkout:
 
     ```sh
