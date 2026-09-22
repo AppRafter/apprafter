@@ -34,6 +34,10 @@ tokio       = { workspace = true, features = ["fs", "io-util", "rt-multi-thread"
 # in-cluster runner drives pg_dump / tar / restore-load helper pods through.
 kube        = { workspace = true, features = ["ws"] }
 k8s-openapi = { workspace = true }
+# Not a new crate — kube's own TLS stack. Named directly for ONE call:
+# `tls::install_rustls_crypto_provider` installs ring as the process-level
+# provider before the kube client is built (see `src/tls.rs`).
+rustls      = { workspace = true }
 futures     = { workspace = true }
 ureq        = { workspace = true }
 

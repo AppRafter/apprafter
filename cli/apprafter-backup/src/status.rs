@@ -254,4 +254,156 @@ mod tests {
         assert!(cm["data"].get("lastSuccess").is_none());
         assert_eq!(cm["data"]["lastRunFormat"], "sequential");
     }
+
+    // -- write_status against a stub apiserver --------------------------------
+    //
+    // `write_status` decides "create" vs "merge" on how the apiserver answers
+    // its GET, through kube-rs' `get_opt` — which reads a `Status` whose REASON
+    // is `NotFound` as absent. kube 3 replaced `ErrorResponse` with `Status`
+    // under that call, so the three answers that matter are pinned here: absent,
+    // present, and forbidden (which must NOT read as absent — the SSA would then
+    // overwrite the recorded history with this run's fields alone).
+
+    use std::convert::Infallible;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+
+    use http::{Request, Response};
+    use kube::client::Body;
+    use serde_json::{json, Value};
+    use tower_service::Service;
+
+    const CM_PATH: &str = "/api/v1/namespaces/apprafter-system/configmaps/apprafter-backup-status";
+
+    /// One request as the stub saw it: method, full URI, JSON body (if any).
+    type Seen = (String, String, Option<Value>);
+
+    /// Answers `GET` on the status ConfigMap with a fixed `(code, body)` and
+    /// every `PATCH` with the patch body echoed back; records every request
+    /// WITH its body, so a test can assert what the SSA actually sent.
+    #[derive(Clone)]
+    struct StubApiServer {
+        get: (u16, Value),
+        seen: Arc<Mutex<Vec<Seen>>>,
+    }
+
+    impl Service<Request<Body>> for StubApiServer {
+        type Response = Response<Body>;
+        type Error = Infallible;
+        type Future = Pin<Box<dyn Future<Output = Result<Response<Body>, Infallible>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Request<Body>) -> Self::Future {
+            let this = self.clone();
+            Box::pin(async move {
+                let (parts, body) = req.into_parts();
+                let bytes = body.collect_bytes().await.expect("read the request body");
+                let sent: Option<Value> = serde_json::from_slice(&bytes).ok();
+                let method = parts.method.as_str().to_string();
+                this.seen.lock().unwrap().push((
+                    method.clone(),
+                    parts.uri.to_string(),
+                    sent.clone(),
+                ));
+                let (code, answer) = match (method.as_str(), parts.uri.path()) {
+                    ("GET", CM_PATH) => this.get.clone(),
+                    ("PATCH", CM_PATH) => (200, sent.unwrap_or(Value::Null)),
+                    (_, path) => (
+                        404,
+                        json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                               "reason": "NotFound", "message": format!("{path} not found"),
+                               "code": 404}),
+                    ),
+                };
+                Ok(Response::builder()
+                    .status(code)
+                    .header("content-type", "application/json")
+                    .body(Body::from(answer.to_string().into_bytes()))
+                    .expect("build stub response"))
+            })
+        }
+    }
+
+    /// Run `write_status` for a FAILURE outcome at `t1` against a stub whose
+    /// GET answers `get`; return the result and every request the stub saw.
+    fn write_failure_against(get: (u16, Value)) -> (cli_core::Result<()>, Vec<Seen>) {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let svc = StubApiServer {
+            get,
+            seen: Arc::clone(&seen),
+        };
+        let client = {
+            let _guard = rt.enter();
+            kube::Client::new(svc, "default")
+        };
+        let outcome = crate::orchestrate::RunOutcome::Failure {
+            error: "boom".into(),
+        };
+        let res = rt.block_on(write_status(&client, &outcome, "monolithic", "t1"));
+        let seen = seen.lock().unwrap().clone();
+        (res, seen)
+    }
+
+    fn status_body(code: u16, reason: &str) -> Value {
+        json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+               "reason": reason, "message": "stub apiserver rejection", "code": code})
+    }
+
+    #[test]
+    fn write_status_reads_a_notfound_cm_as_absent_and_applies_this_runs_fields() {
+        let (res, seen) = write_failure_against((404, status_body(404, "NotFound")));
+        res.expect("an absent status CM is created, not an error");
+
+        assert_eq!(seen.len(), 2, "one GET, then one apply: {seen:?}");
+        assert_eq!(seen[0].0, "GET");
+        let (method, uri, body) = &seen[1];
+        assert_eq!(method, "PATCH");
+        assert!(
+            uri.contains("fieldManager=apprafter-backup") && uri.contains("force=true"),
+            "the write must be a forced SSA under the apprafter-backup manager: {uri}"
+        );
+        assert_eq!(
+            body.as_ref().expect("an apply body")["data"],
+            json!({"lastFailure": "t1", "lastError": "boom", "lastRunFormat": "monolithic"})
+        );
+    }
+
+    #[test]
+    fn write_status_merges_this_run_onto_the_live_cm() {
+        let live = json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": "apprafter-backup-status", "namespace": "apprafter-system"},
+            "data": {"lastSuccess": "t0", "lastRunFormat": "sequential"}
+        });
+        let (res, seen) = write_failure_against((200, live));
+        res.expect("merge onto the live CM");
+
+        assert_eq!(
+            seen[1].2.as_ref().expect("an apply body")["data"],
+            json!({
+                "lastSuccess": "t0",
+                "lastFailure": "t1",
+                "lastError": "boom",
+                "lastRunFormat": "monolithic"
+            }),
+            "the prior success must survive a failure run"
+        );
+    }
+
+    #[test]
+    fn write_status_does_not_read_a_forbidden_cm_as_absent() {
+        let (res, seen) = write_failure_against((403, status_body(403, "Forbidden")));
+        assert!(res.is_err(), "a forbidden read must be an error");
+        assert_eq!(
+            seen.iter().map(|s| s.0.as_str()).collect::<Vec<_>>(),
+            vec!["GET"],
+            "a forbidden read must not be followed by a history-erasing apply"
+        );
+    }
 }

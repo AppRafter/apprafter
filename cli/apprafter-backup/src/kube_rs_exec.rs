@@ -4,7 +4,7 @@
 //! `tests` module for exactly which parts a cluster is still required for —
 //! in short, the two WebSocket `exec` streams and nothing else).
 //!
-//! [`KubeRsExec`] implements [`backup_core::KubeExec`] using kube-rs 0.95 so the
+//! [`KubeRsExec`] implements [`backup_core::KubeExec`] using kube-rs so the
 //! in-cluster scheduled-backup runner drives the SAME portable backup engine
 //! (`backup_core::engine`) the CLI does — but through the apiserver directly,
 //! not by shelling out to `kubectl`. Every method mirrors the semantics of the
@@ -660,9 +660,11 @@ fn classify_exec_status(
 /// `pods/exec` **WebSocket** subresource. `Api::exec` returns an
 /// [`AttachedProcess`] whose stdin/stdout handles and status channel only exist
 /// once that upgrade has completed against a real, *running* pod; the type has
-/// no public constructor and no in-memory transport. Their bodies are therefore
-/// covered by the real-Hetzner walk and the kind-based `e2e/backup-*` scripts,
-/// NOT here. What *is* covered here is the verdict those two methods end on —
+/// no public constructor and no in-memory transport. `exec_stream_to_file` is
+/// therefore covered by the real-Hetzner walk, the kind-based `e2e/backup-*`
+/// scripts and `tests/kind_smoke_test.rs`, NOT here; `exec_stream_from_file`
+/// has no real-cluster coverage at all (see that test's module docs for why).
+/// What *is* covered here is the verdict those two methods end on —
 /// [`classify_exec_status`], the fail-closed rule extracted out of
 /// [`check_exec_status`] for exactly that reason.
 ///
@@ -881,18 +883,23 @@ mod tests {
     /// INVARIANT: only a 404 becomes `Ok(None)`. A 403 or a 500 must stay an
     /// error — reading "forbidden" as "absent" would let a backup silently skip
     /// resources the service account cannot see and still report success.
+    ///
+    /// The rule is the HTTP CODE, not the reason string: the reason here is
+    /// deliberately not `NotFound`, and kube's own `Status::is_not_found()`
+    /// would answer by reason alone (Go-client semantics). kube 3 folded
+    /// `ErrorResponse` into `Status`; the classification did not move with it.
     #[test]
     fn is_not_found_is_true_for_404_and_nothing_else() {
         let api = |code| {
-            kube::Error::Api(kube::core::ErrorResponse {
-                status: "Failure".into(),
-                message: "boom".into(),
-                reason: "Whatever".into(),
-                code,
-            })
+            kube::Error::Api(
+                kube::core::Status::failure("boom", "Whatever")
+                    .with_code(code)
+                    .boxed(),
+            )
         };
         assert!(is_not_found(&api(404)));
         assert!(!is_not_found(&api(403)));
+        assert!(!is_not_found(&api(409)));
         assert!(!is_not_found(&api(410)));
         assert!(!is_not_found(&api(500)));
         assert!(!is_not_found(&kube::Error::TlsRequired));
@@ -1015,6 +1022,131 @@ mod tests {
         assert_eq!(
             list_to_value(list, &claim_resource()).unwrap(),
             json!({"items": []})
+        );
+    }
+
+    // --- Kubernetes timestamps on the wire -----------------------------------
+    //
+    // k8s-openapi 0.23 held `Time`/`MicroTime` as `chrono::DateTime<Utc>`;
+    // 0.28 (with kube 3+) holds a `jiff::Timestamp` and formats it with its own
+    // strftime pattern. Every object the runner stages is re-serialized through
+    // those types (`metadata.creationTimestamp`, `managedFields[].time`, …), so
+    // the formatter swap reaches the snapshot bytes directly. The strings below
+    // are what 0.23 produced — verified against it, not copied from 0.28 — so a
+    // difference here is a change in what a backup writes.
+
+    /// `Time` into and back out of its wire form.
+    fn time_wire(s: &str) -> String {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        let t: Time = serde_json::from_value(json!(s)).expect("parse a metav1.Time");
+        serde_json::to_string(&t).expect("serialize a metav1.Time")
+    }
+
+    /// `MicroTime` into and back out of its wire form.
+    fn micro_time_wire(s: &str) -> String {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
+        let t: MicroTime = serde_json::from_value(json!(s)).expect("parse a metav1.MicroTime");
+        serde_json::to_string(&t).expect("serialize a metav1.MicroTime")
+    }
+
+    /// INVARIANT: `metav1.Time` is whole seconds, UTC, `Z`-suffixed. Sub-second
+    /// input is TRUNCATED (never rounded up into the next second) and an offset
+    /// is normalized to UTC.
+    #[test]
+    fn metav1_time_keeps_its_exact_wire_form() {
+        assert_eq!(
+            time_wire("2026-09-22T17:53:30Z"),
+            r#""2026-09-22T17:53:30Z""#
+        );
+        assert_eq!(
+            time_wire("2026-09-22T17:53:30.999999999Z"),
+            r#""2026-09-22T17:53:30Z""#
+        );
+        assert_eq!(
+            time_wire("2026-09-22T20:53:30+03:00"),
+            r#""2026-09-22T17:53:30Z""#
+        );
+        assert_eq!(
+            time_wire("1970-01-01T00:00:00Z"),
+            r#""1970-01-01T00:00:00Z""#
+        );
+    }
+
+    /// INVARIANT: `metav1.MicroTime` always carries EXACTLY six fractional
+    /// digits — zeros included, which is the case a formatter that elides a
+    /// zero fraction would break — truncated from nanoseconds, UTC, `Z`.
+    #[test]
+    fn metav1_micro_time_keeps_its_exact_wire_form() {
+        assert_eq!(
+            micro_time_wire("2026-09-22T17:53:30.123456Z"),
+            r#""2026-09-22T17:53:30.123456Z""#
+        );
+        assert_eq!(
+            micro_time_wire("2026-09-22T17:53:30Z"),
+            r#""2026-09-22T17:53:30.000000Z""#
+        );
+        assert_eq!(
+            micro_time_wire("2026-09-22T17:53:30.1Z"),
+            r#""2026-09-22T17:53:30.100000Z""#
+        );
+        assert_eq!(
+            micro_time_wire("2026-09-22T17:53:30.123456789Z"),
+            r#""2026-09-22T17:53:30.123456Z""#
+        );
+        assert_eq!(
+            micro_time_wire("2026-09-22T20:53:30.000001+03:00"),
+            r#""2026-09-22T17:53:30.000001Z""#
+        );
+    }
+
+    /// INVARIANT: a staged object's metadata timestamps reach the snapshot
+    /// byte-for-byte. This is the path the runner actually takes — the object is
+    /// decoded as a `DynamicObject` (whose metadata is the typed `ObjectMeta`)
+    /// and re-serialized by [`list_to_value`] — asserted on the serialized
+    /// bytes, not on a parsed value that would compare equal across formats.
+    #[test]
+    fn staged_object_metadata_timestamps_survive_byte_for_byte() {
+        let list: ObjectList<DynamicObject> = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "SecretList",
+            "items": [{
+                "metadata": {
+                    "name": "cf-cert",
+                    "namespace": "apprafter-system",
+                    "creationTimestamp": "2026-09-22T17:53:30Z",
+                    "deletionTimestamp": "2026-09-22T18:00:00Z",
+                    "managedFields": [{
+                        "manager": "apprafter",
+                        "operation": "Apply",
+                        "apiVersion": "v1",
+                        "time": "2026-09-22T17:53:31Z",
+                        "fieldsType": "FieldsV1",
+                        "fieldsV1": {"f:data": {"f:tls.crt": {}}}
+                    }]
+                },
+                "type": "kubernetes.io/tls"
+            }]
+        }))
+        .expect("decode a secret list with timestamps");
+
+        let secrets = ApiResource {
+            group: String::new(),
+            version: "v1".into(),
+            api_version: "v1".into(),
+            kind: "Secret".into(),
+            plural: "secrets".into(),
+        };
+        let v = list_to_value(list, &secrets).expect("serialize list");
+        assert_eq!(
+            serde_json::to_string(&v["items"][0]["metadata"]).unwrap(),
+            concat!(
+                r#"{"creationTimestamp":"2026-09-22T17:53:30Z","#,
+                r#""deletionTimestamp":"2026-09-22T18:00:00Z","#,
+                r#""managedFields":[{"apiVersion":"v1","fieldsType":"FieldsV1","#,
+                r#""fieldsV1":{"f:data":{"f:tls.crt":{}}},"manager":"apprafter","#,
+                r#""operation":"Apply","time":"2026-09-22T17:53:31Z"}],"#,
+                r#""name":"cf-cert","namespace":"apprafter-system"}"#,
+            )
         );
     }
 
@@ -1619,6 +1751,45 @@ mod tests {
             .get_json(&["get", "secrets", "-n", "gone", "-o", "json"])
             .expect("a 404 list must not be an error")
             .is_none());
+    }
+
+    /// A 404 whose body is NOT a `Status` — a proxy's plain `404 page not
+    /// found` — is absent too. kube-rs only builds the error from the HTTP code
+    /// when the body fails to decode, and [`is_not_found`] classifies by code,
+    /// so this pins the one path where the code does not come from the body.
+    /// kube 3 made every `Status` field optional (`ErrorResponse` required
+    /// `status` + `code`), which moved what "fails to decode" means: only a
+    /// non-object body still takes this path.
+    #[test]
+    fn get_json_reads_a_non_status_404_body_as_absent() {
+        let path = "/apis/apprafter.io/v1alpha1/namespaces/apprafter-system/platformstacks/default";
+        let mut routes = apprafter_discovery_routes();
+        routes.push(Route {
+            method: "GET",
+            path: path.to_string(),
+            status: 404,
+            body: "404 page not found\n".to_string(),
+        });
+        let h = Harness::new(routes);
+
+        let got = h
+            .exec
+            .get_json(&[
+                "get",
+                "platformstack",
+                "default",
+                "-n",
+                "apprafter-system",
+                "-o",
+                "json",
+            ])
+            .expect("a 404 must not be an error, whatever its body");
+        assert!(got.is_none(), "expected Ok(None), got {got:?}");
+        assert!(
+            h.seen().iter().any(|r| r == &format!("GET {path}")),
+            "the plain-text 404 must come from the object route: {:?}",
+            h.seen()
+        );
     }
 
     /// A forbidden read is NOT "absent": swallowing it would let a backup skip
