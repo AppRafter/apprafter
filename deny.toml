@@ -35,7 +35,9 @@
 version = 2
 # `all` includes transitive dependencies. The narrower `workspace` setting
 # would have reported NONE of the four unmaintained crates found on
-# 2026-09-22, because every one of them arrives through `kube`.
+# 2026-09-22 (rustls-pemfile, backoff, derivative, instant), because every one
+# of them arrived through kube 0.95. The kube 4.2 bump (WI-357) cleared all four
+# and their ignore entries went with it.
 unmaintained = "all"
 yanked = "deny"
 
@@ -60,36 +62,14 @@ the SealedSecret object carries no algorithm identifier or format version.
 RE-EXAMINE THIS if a private-key decrypt or sign ever enters a production path.
 That is the condition that makes this ignore wrong, not a version bump.
 """ },
-
-    { id = "RUSTSEC-2025-0134", reason = """
-`rustls-pemfile` is unmaintained (archived August 2025; the code moved into
-rustls-pki-types). Transitive via kube-client 0.95 — nothing here depends on
-it directly. CLEARED BY THE kube-rs BUMP (WI-357); delete this entry with it.
-""" },
-
-    { id = "RUSTSEC-2025-0012", reason = """
-`backoff` is unmaintained. Transitive via kube-runtime 0.95, which uses it for
-its own retry backoff — no call site of ours. CLEARED BY THE kube-rs BUMP
-(WI-357); delete this entry with it.
-""" },
-
-    { id = "RUSTSEC-2024-0388", reason = """
-`derivative` is unmaintained. A proc-macro, transitive via kube-runtime 0.95.
-CLEARED BY THE kube-rs BUMP (WI-357); delete this entry with it.
-""" },
-
-    { id = "RUSTSEC-2024-0384", reason = """
-`instant` is unmaintained. Transitive via backoff via kube-runtime 0.95 — it
-arrives with the `backoff` entry above and leaves with it. CLEARED BY THE
-kube-rs BUMP (WI-357); delete this entry with it.
-""" },
 ]
 
 [bans]
 # Duplicate versions are reported, not fatal. They are usually somebody else's
-# pin rather than a defect of ours — as of 2026-09-22 the only one left is
-# sha2 0.10 arriving through async-nats -> nkeys -> ed25519-dalek, while our
-# own direct dependencies are on 0.11. Worth seeing; not worth blocking on.
+# pin rather than a defect of ours — e.g. sha2 0.10 arriving through
+# async-nats -> nkeys -> ed25519-dalek while our own direct dependencies are on
+# 0.11, or rand 0.9 through kube-client's tungstenite beside the held rand 0.8
+# in cli/backup-core. Worth seeing; not worth blocking on.
 multiple-versions = "warn"
 wildcards = "deny"
 # The workspace's own crates depend on each other by `path`, which cargo-deny
