@@ -13,8 +13,8 @@
 //! second provider also links a second native crypto library into every binary.
 //!
 //! The usual way to get two is a dependency that enables rustls' DEFAULT
-//! features, which include aws-lc-rs (kube >= 0.96 splits the provider into
-//! its own `ring` / `aws-lc-rs` feature for the same reason).
+//! features, which include aws-lc-rs (kube >= 0.99 splits the provider into
+//! its own `ring` / `aws-lc-rs` feature for the same reason, kube-rs#1717).
 //!
 //! Feature unification makes the workspace test build a SUPERSET of each
 //! shipped binary's own build, so one provider here means at most one there;
