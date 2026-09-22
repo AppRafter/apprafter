@@ -354,6 +354,21 @@ pub fn dragonfly_object(
         "authentication": {
             "passwordFromSecret": { "name": admin_secret_name(name), "key": "password" }
         },
+        // NO `networkPolicyEnabled: false`, even though dragonfly-operator
+        // v1.6.0 narrows the 6379 rule of its per-instance NetworkPolicy to
+        // same-namespace peers and every consumer here (app pods, and this
+        // provisioner in apprafter-system) dials across namespaces.
+        //
+        // That NetworkPolicy is the only thing limiting who reaches port 9999,
+        // which the operator starts with `--admin_nopass`. On that listener
+        // Dragonfly v1.37.0 asks for no password and skips ACL validation
+        // (`Service::CreateContext`, the `ConnectionContext` constructor), so
+        // it is an open console over every tenant's `$N`.
+        // `false` makes the operator DELETE the policy (v1.5.0
+        // `internal/controller/dragonfly_instance.go`), which opens 9999 to
+        // every pod that no per-app egress CNP covers. The v1.6.0 break is
+        // fixed by an ADDITIONAL platform-owned ingress policy for 6379
+        // (NetworkPolicies are unioned allow-lists), not by removing this one.
     });
     if persistent {
         spec["snapshot"] = json!({
@@ -1296,6 +1311,31 @@ mod tests {
         );
         assert_eq!(cr["spec"]["image"], DRAGONFLY_SERVER_IMAGE);
         assert!(DRAGONFLY_SERVER_IMAGE.ends_with(":v1.37.0"));
+    }
+
+    #[test]
+    fn the_cr_never_switches_off_the_operator_network_policy() {
+        // The operator-created NetworkPolicy is the only ingress restriction
+        // on the admin port 9999, which runs `--admin_nopass` (no password,
+        // no ACL check). `false` makes the operator delete it, opening that
+        // console over every tenant's data to any pod without an egress CNP.
+        // Absent means the CRD default, `true`.
+        for persistent in [false, true] {
+            let cr = dragonfly_object(
+                &pool_instance_name(persistent, 0),
+                "dragonfly-system",
+                16,
+                1,
+                1,
+                persistent,
+                &BackendResources::dragonfly_t1(),
+            );
+            let np = cr["spec"].get("networkPolicyEnabled");
+            assert!(
+                np.is_none() || np == Some(&serde_json::Value::Bool(true)),
+                "networkPolicyEnabled must stay absent (CRD default true) or true, got {np:?}"
+            );
+        }
     }
 
     #[test]
