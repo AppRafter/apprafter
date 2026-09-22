@@ -25,7 +25,7 @@ rewritten for the audience that surface serves.
 `backup-restore.md`'s "Two defects to plan around" was written 2026-08-21 (`20b1ffc`). Both
 defects were fixed the next morning — `f7ee105` and `e94fb4c`, released as cli v0.2.49 — and
 `894bdfd` added e2e assertions proving the opposite of what the page says. The page was never
-reopened. The correct record went into `docs/changelog/UNRELEASED.md`, which is excluded from
+reopened. The correct record went into `docs/changelog/history.md`, which is excluded from
 the published site, and `docs/changelog/plan-history.md` received no entry at all.
 
 This is not rare. Between 2026-05 and 2026-08 the repository accumulated **79 corrective

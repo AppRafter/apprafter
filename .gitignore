@@ -83,8 +83,26 @@ tmp/
 !/spec.md
 !/plan.md
 !/FEATURE_TRACKER.md
+# Written by ATM's changelog sync, not by hand — see the note at its top.
+!/CHANGELOG.md
 
 # scratch docs accidentally swept by a subagent git add -A (2026-06-10)
 /landing/docs/steps.md
 
 /backup-test.env
+
+# --- ATM (AgentTaskManager) ---------------------------------------------------
+# Added by the ATM Claude pack. Everything else in this file is yours and is left
+# alone; these two lines are appended only if they are not already here.
+
+# Per-session state the discipline hooks write (one file per Claude Code session,
+# plus a lock and scratch files). Pruned at session start, never useful to commit —
+# and committing it is actively harmful: `git add -A` sweeps the current session's
+# file into a branch, and checking another branch out then DELETES it, which leaves
+# the stop gate judging the turn against no baseline at all.
+.claude/.atm/
+
+# The ATM project token. This is the one place the credential lives, and it reaches
+# both the MCP client and the discipline hooks. It must never be committed — unlike
+# .claude/settings.json, which this pack installs and which IS meant to be shared.
+.claude/settings.local.json

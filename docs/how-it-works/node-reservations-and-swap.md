@@ -92,6 +92,39 @@ tolerates paging, so mild swap (`swappiness=10`) is safe there. Tier-2 and above
 use etcd, which is latency-sensitive — paging etcd can trigger leader churn — so
 swap on those tiers is deferred and will use a stricter policy.
 
+## A rollout releases before it asks
+
+A node with no spare memory can also freeze a rollout, and the freeze is silent.
+
+Left to Kubernetes' own default, a Deployment rolls with
+`maxSurge: 25%, maxUnavailable: 25%`. Those percentages are resolved by rounding
+surge **up** and unavailable **down**, so at one, two or three replicas they
+become `maxSurge: 1, maxUnavailable: 0`. A zero `maxUnavailable` forbids any old
+pod from terminating until its replacement is Available — the rollout has to
+*acquire* capacity before it may *release* any. On a node already at its
+allocatable ceiling the replacement stays `Pending`, nothing is ever released,
+and the rollout sits in a stable deadlock. The old pods keep running and
+serving, so the application looks healthy from the outside while every further
+change to it is frozen.
+
+For applications below four replicas the platform therefore pins the inverse —
+`maxSurge: 0, maxUnavailable: 1` — so a rollout releases before it asks and
+completes regardless of headroom. Four is where the default stops being a
+problem on its own (it is the first count at which the 25% floor reaches one
+whole pod), so from four replicas upward the Kubernetes default is left alone.
+
+The cost is asymmetric and worth knowing:
+
+- At **one replica** the old pod goes away before its replacement is ready,
+  which leaves a brief window with nothing serving. A single replica on a single
+  node has no availability guarantee to lose, and the alternative is a rollout
+  that never finishes.
+- At **two or three replicas** there is no such window: one pod is replaced at a
+  time while the others keep serving.
+
+An application that mounts its own disk is unaffected — it already rolls with
+`Recreate`, because a read-write-once volume cannot be held by two pods at once.
+
 ## See also
 
 - [Node preparation](../operator-guide/node-prep.md) — the command that applies

@@ -30,8 +30,7 @@ edit_uri: edit/master/docs/
 # as a link.
 exclude_docs: |
   superpowers/
-  changelog/UNRELEASED.md
-  changelog/plan-history.md
+  changelog/history.md
   measurements/
   # The literate-nav fragment is nav data, not a page. literate-nav
   # already keeps it out of the nav and out of search, but it still

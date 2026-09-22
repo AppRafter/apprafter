@@ -19,7 +19,9 @@ pub use env::resolve_env;
 mod probes;
 pub use probes::{resolve_probes, ProbeKind, RenderedProbes};
 
-use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
+use k8s_openapi::api::apps::v1::{
+    Deployment, DeploymentSpec, DeploymentStrategy, RollingUpdateDeployment,
+};
 use k8s_openapi::api::core::v1::ResourceRequirements;
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EnvVar, PersistentVolumeClaimVolumeSource, PodSpec, PodTemplateSpec,
@@ -590,8 +592,8 @@ fn render_deployment(
     // When ANY owned disk is present the strategy is forced to `Recreate` —
     // an owned RWO PVC cannot be held by the old + new pod simultaneously
     // during a RollingUpdate; reference disks (SharedVolume bind) tolerate
-    // RollingUpdate on single-node RWO. With no owned disk the strategy stays
-    // unset (apiserver default RollingUpdate), unchanged from today.
+    // RollingUpdate on single-node RWO. With no owned disk the strategy falls
+    // through to the replica-count fenceposts below.
     let mut sorted_disks: Vec<&DiskMount> = disks.unwrap_or(&[]).iter().collect();
     sorted_disks.sort_by(|a, b| a.volume_name.cmp(&b.volume_name));
     let volume_mounts: Vec<VolumeMount> = sorted_disks
@@ -619,6 +621,58 @@ fn render_deployment(
         Some(DeploymentStrategy {
             type_: Some("Recreate".to_string()),
             rolling_update: None,
+        })
+    } else if replicas < 4 {
+        // Pin surge-free fenceposts below 4 replicas, because that is exactly
+        // where the apiserver default deadlocks on a memory-saturated node.
+        //
+        // Left unset, the apiserver defaults to
+        // `RollingUpdate{maxSurge: 25%, maxUnavailable: 25%}`. Kubernetes'
+        // `ResolveFenceposts` rounds surge UP and unavailable DOWN, which
+        // gives:
+        //
+        //     replicas 1 -> (maxSurge 1, maxUnavailable 0)
+        //     replicas 2 -> (maxSurge 1, maxUnavailable 0)
+        //     replicas 3 -> (maxSurge 1, maxUnavailable 0)
+        //     replicas 4 -> (maxSurge 1, maxUnavailable 1)
+        //
+        // `maxUnavailable: 0` forbids any old pod from terminating until the
+        // new one is Available — the rollout must ACQUIRE capacity before it
+        // RELEASES any. On a node already at ~99% of allocatable memory
+        // requests the surge pod stays `Pending` forever, nothing is ever
+        // released, and the rollout is stuck in a stable deadlock. It is also
+        // SILENT: the old pods keep running and serving, so from the outside
+        // the app looks healthy while every subsequent pod-template change is
+        // frozen. (Observed on a Tier-1 4GB node.)
+        //
+        // So `< 4` is the precise boundary of the defect, not a judgement
+        // call: 4 is the first replica count at which `floor(0.25 * n)`
+        // reaches 1 and the default can already release before it acquires.
+        // At 4+ there is nothing to fix, so we leave the default alone.
+        //
+        // Inverting to `(maxSurge 0, maxUnavailable 1)` makes a rollout
+        // release before it asks, so it completes regardless of headroom.
+        //
+        // The cost is asymmetric, and that asymmetry is the thing to
+        // understand here:
+        //
+        //   - At `replicas: 1` the old pod terminates BEFORE its replacement
+        //     is ready, leaving a brief window with ZERO pods serving. That is
+        //     a genuine availability regression versus the previous behaviour
+        //     on a node that DOES have headroom. It is accepted deliberately:
+        //     a single replica on a single node has no availability guarantee
+        //     to lose anyway, and the alternative is a permanent silent
+        //     freeze.
+        //   - At `replicas: 2` and `3` there is NO such gap. One pod is
+        //     replaced at a time while the rest keep serving (1 of 2, 2 of 3),
+        //     so the rollout stays available throughout and the change is
+        //     close to free.
+        Some(DeploymentStrategy {
+            type_: Some("RollingUpdate".to_string()),
+            rolling_update: Some(RollingUpdateDeployment {
+                max_surge: Some(IntOrString::Int(0)),
+                max_unavailable: Some(IntOrString::Int(1)),
+            }),
         })
     } else {
         None
@@ -891,6 +945,134 @@ mod tests {
         );
         let r = render_application(&app).unwrap();
         assert_eq!(r.deployment.spec.as_ref().unwrap().replicas, Some(1));
+    }
+
+    /// Extract the rendered `RollingUpdate` fenceposts, asserting the
+    /// strategy is present and of type `RollingUpdate`.
+    fn rolling_update_fenceposts(r: &RenderedApplication) -> (IntOrString, IntOrString) {
+        let strategy = r
+            .deployment
+            .spec
+            .as_ref()
+            .unwrap()
+            .strategy
+            .as_ref()
+            .expect("strategy must be pinned, not left to the apiserver default");
+        assert_eq!(strategy.type_.as_deref(), Some("RollingUpdate"));
+        let ru = strategy
+            .rolling_update
+            .as_ref()
+            .expect("rollingUpdate fenceposts must be set");
+        (
+            ru.max_surge.clone().expect("maxSurge set"),
+            ru.max_unavailable.clone().expect("maxUnavailable set"),
+        )
+    }
+
+    #[test]
+    fn single_replica_deployment_pins_surge_free_rollout_strategy() {
+        // replicas unset → 1. A rollout must be able to complete on a node
+        // with no spare memory, so it must release the old pod BEFORE it
+        // asks for the new one: maxSurge 0 / maxUnavailable 1.
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("ghcr.io/acme/x:1.0".to_string()),
+                    ..Default::default()
+                }),
+                environments: None,
+                environment: None,
+            },
+            "web",
+            "default",
+            "abc-123",
+        );
+        let r = render_application(&app).unwrap();
+        assert_eq!(r.deployment.spec.as_ref().unwrap().replicas, Some(1));
+        let (surge, unavailable) = rolling_update_fenceposts(&r);
+        assert_eq!(surge, IntOrString::Int(0));
+        assert_eq!(unavailable, IntOrString::Int(1));
+    }
+
+    #[test]
+    fn two_replica_deployment_also_pins_surge_free_rollout_strategy() {
+        // At 2 replicas the apiserver default still resolves to
+        // (maxSurge 1, maxUnavailable 0) — the same acquire-before-release
+        // deadlock — so the same fenceposts apply.
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("ghcr.io/acme/x:1.0".to_string()),
+                    replicas: Some(2),
+                    ..Default::default()
+                }),
+                environments: None,
+                environment: None,
+            },
+            "web",
+            "default",
+            "abc-123",
+        );
+        let r = render_application(&app).unwrap();
+        assert_eq!(r.deployment.spec.as_ref().unwrap().replicas, Some(2));
+        let (surge, unavailable) = rolling_update_fenceposts(&r);
+        assert_eq!(surge, IntOrString::Int(0));
+        assert_eq!(unavailable, IntOrString::Int(1));
+    }
+
+    #[test]
+    fn three_replica_deployment_pins_surge_free_strategy_because_floor_25_percent_is_zero() {
+        // 3 is the non-obvious case. `floor(0.25 * 3) == 0`, so the apiserver
+        // default STILL resolves to (maxSurge 1, maxUnavailable 0) here —
+        // the identical acquire-before-release deadlock as 1 and 2, not a
+        // safely-rolling replica count. Hence the bound is `< 4`, not `<= 2`.
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("ghcr.io/acme/x:1.0".to_string()),
+                    replicas: Some(3),
+                    ..Default::default()
+                }),
+                environments: None,
+                environment: None,
+            },
+            "web",
+            "default",
+            "abc-123",
+        );
+        let r = render_application(&app).unwrap();
+        assert_eq!(r.deployment.spec.as_ref().unwrap().replicas, Some(3));
+        let (surge, unavailable) = rolling_update_fenceposts(&r);
+        assert_eq!(surge, IntOrString::Int(0));
+        assert_eq!(unavailable, IntOrString::Int(1));
+    }
+
+    #[test]
+    fn four_replica_deployment_keeps_the_apiserver_default_strategy() {
+        // 4 is the first replica count where the 25%/25% default resolves to
+        // maxUnavailable 1 (`floor(0.25 * 4) == 1`), so the default can
+        // already release a pod before it acquires one. Nothing to fix —
+        // leave it alone.
+        let app = make_app_with_uid(
+            ApplicationSpec {
+                base: Some(ApplicationBaseSpec {
+                    image: Some("ghcr.io/acme/x:1.0".to_string()),
+                    replicas: Some(4),
+                    ..Default::default()
+                }),
+                environments: None,
+                environment: None,
+            },
+            "web",
+            "default",
+            "abc-123",
+        );
+        let r = render_application(&app).unwrap();
+        assert_eq!(r.deployment.spec.as_ref().unwrap().replicas, Some(4));
+        assert!(
+            r.deployment.spec.as_ref().unwrap().strategy.is_none(),
+            "4+ replicas must keep the apiserver default strategy"
+        );
     }
 
     #[test]
@@ -2448,9 +2630,12 @@ mod tests {
     }
 
     #[test]
-    fn no_disk_leaves_strategy_unchanged() {
-        // An app with no disk keeps today's strategy (unset → apiserver
-        // default RollingUpdate) and no volumes / volumeMounts.
+    fn no_disk_does_not_force_recreate() {
+        // An app with no disk must NOT be forced to Recreate, and must carry
+        // no volumes / volumeMounts. At the default 1 replica it gets the
+        // surge-free RollingUpdate fenceposts (see the strategy block in
+        // `render_deployment`) — the point here is only that the absence of a
+        // disk never selects Recreate.
         let app = make_app_with_uid(
             ApplicationSpec {
                 base: Some(ApplicationBaseSpec {
@@ -2475,18 +2660,17 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(
-            r.deployment.spec.as_ref().unwrap().strategy.is_none(),
-            "strategy unchanged (unset) when no disk"
-        );
+        let (surge, unavailable) = rolling_update_fenceposts(&r);
+        assert_eq!(surge, IntOrString::Int(0));
+        assert_eq!(unavailable, IntOrString::Int(1));
         assert!(container_volume_mounts(&r).is_none());
         assert!(pod_volumes(&r).is_none());
     }
 
     #[test]
-    fn empty_disks_slice_leaves_strategy_unchanged() {
-        // A threaded-but-empty disks slice (resolved claims yielded none)
-        // is treated like no disk — no strategy, no volumes.
+    fn empty_disks_slice_does_not_force_recreate() {
+        // A threaded-but-empty disks slice (resolved claims yielded none) is
+        // treated like no disk — no Recreate, no volumes.
         let app = make_app_with_uid(
             ApplicationSpec {
                 base: Some(ApplicationBaseSpec {
@@ -2511,7 +2695,9 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(r.deployment.spec.as_ref().unwrap().strategy.is_none());
+        let (surge, unavailable) = rolling_update_fenceposts(&r);
+        assert_eq!(surge, IntOrString::Int(0));
+        assert_eq!(unavailable, IntOrString::Int(1));
         assert!(container_volume_mounts(&r).is_none());
         assert!(pod_volumes(&r).is_none());
     }
@@ -2608,11 +2794,10 @@ mod tests {
             None,
         )
         .unwrap();
-        // Strategy must remain unset (apiserver default = RollingUpdate).
-        assert!(
-            r.deployment.spec.as_ref().unwrap().strategy.is_none(),
-            "reference-only disks must NOT force Recreate"
-        );
+        // Strategy must stay a RollingUpdate — never Recreate.
+        let (surge, unavailable) = rolling_update_fenceposts(&r);
+        assert_eq!(surge, IntOrString::Int(0));
+        assert_eq!(unavailable, IntOrString::Int(1));
         // The volume + volumeMount must still be present.
         let mounts = container_volume_mounts(&r).expect("volumeMounts present for reference disk");
         assert_eq!(mounts.len(), 1);

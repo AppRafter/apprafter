@@ -138,6 +138,81 @@ pre-commit:
           - name: docs-check
             glob: "{README.md,docs/{*.md,**/*.md},docs/measurements/docs-health.json,mkdocs.yml,docs/hooks/**,scripts/docs-check.sh,scripts/docs-artefacts-check.py,cli/platform-cli/src/**,cli/docsgen/**,cli/Cargo.toml,schemas/v1alpha1/*.cue,operator/charts/apprafter-operator/templates/crd-*.yaml}"
             run: ./scripts/docs-check.sh
+    # THE VERSION GATES.
+    #
+    # These lived ONLY in `just lint`, and no workflow invokes `just lint` —
+    # so the one check that catches "operator code changed but appVersion did
+    # not" fired only when somebody remembered to type it. It did not fire for
+    # the commit that shipped the surge-free rollout fix: that change passed
+    # fmt, clippy, the full workspace test suite and the docs gate, and would
+    # still never have become an image, because `release-operator`'s two-axis
+    # gate (tag exists + images exist) SKIPS the rebuild when appVersion has
+    # not moved. Committed, green, and silently not shipped — the class of
+    # miss behind the 0.2.40/0.2.41 double-yank.
+    #
+    # Safe on a pre-commit hook for two MEASURED reasons. Each script is ~2s,
+    # and they are listed FLAT rather than inside a `group:` so the hook's own
+    # `parallel: true` applies to them — measured: the same three scripts take
+    # 6251ms one after another and 1999ms together, and a `group:` carrying
+    # `parallel: true` ran them sequentially anyway on lefthook 2.1.5. A group
+    # here would buy a nicer heading and cost 4 seconds on every commit that
+    # touches platform-stack. Second reason: each asks `git ls-remote` whether
+    # its tag is already PUBLISHED, and with no network that call fails, which
+    # the scripts read as "not published yet — the bump is in flight" and exit
+    # 0. An offline commit therefore LOSES the check rather than breaking on it
+    # (verified by pointing them at a nonexistent remote).
+    #
+    # `version-coherence` gets no glob narrower than the union of the others:
+    # it cross-checks the platform-stack pins against BOTH chart appVersions
+    # and the cue-cmp version, so a file from any of those trees can break it.
+    - name: operator-version-bump
+      glob: "{operator/**,schemas/v1alpha1/*.cue}"
+      run: ./scripts/check-operator-version-bump.sh
+    - name: cli-version-bump
+      glob: "cli/**"
+      run: ./scripts/check-cli-version-bump.sh
+    - name: backup-runner-pin
+      glob: "{cli/apprafter-backup/**,cli/backup-core/**,cli/Cargo.toml,platform-stack/cue/platform.cue}"
+      run: ./scripts/check-backup-runner-pin.sh
+    - name: cue-cmp-drift
+      glob: "argocd-cue-cmp/**"
+      run: ./scripts/check-argocd-cue-cmp-drift.sh
+    - name: cue-cmp-mirror
+      glob: "{argocd-cue-cmp/plugin.yaml,platform-stack/cue/component_argocd.cue}"
+      run: ./scripts/check-cue-cmp-mirror.sh
+    - name: version-coherence
+      glob: "{operator/charts/**,platform-stack/**,argocd-cue-cmp/**,cli/Cargo.toml}"
+      run: ./scripts/check-version-coherence.sh
+    # The remaining `just lint` script gates. All offline, all under a second,
+    # all glob-scoped, so they cost nothing on a commit that cannot break them.
+    #
+    # What is deliberately NOT here: `just lint` also runs `cargo fmt`,
+    # `cargo clippy` and the docsgen property tests across two workspaces.
+    # Those are minutes, not seconds, and a pre-commit hook that costs minutes
+    # gets bypassed with `--no-verify`, which loses the cheap checks too. They
+    # stay in `just lint` and in the lint/test workflows, where a cold build is
+    # expected.
+    - name: heredoc-backticks
+      glob: "{scripts/**,e2e/**,.github/workflows/**,argocd-cue-cmp/**}"
+      run: ./scripts/check-heredoc-backticks.sh
+    # A workflow that does not parse fails as a run with ZERO JOBS, which
+    # `gh pr checks` does not list — every check can be green while a
+    # release workflow is broken. See the header of the script.
+    - name: workflows
+      glob: ".github/workflows/**"
+      run: ./scripts/check-workflows.sh
+    - name: crd-structural
+      glob: "operator/charts/apprafter-operator/templates/crd-*.yaml"
+      run: ./scripts/check-crd-structural.sh
+    - name: argocd-health-lua
+      glob: "platform-stack/**"
+      run: ./scripts/check-argocd-health-lua.sh
+    - name: component-enablement
+      glob: "platform-stack/**"
+      run: ./scripts/check-component-enablement.sh
+    - name: plan-checkboxes
+      glob: "plan.md"
+      run: ./scripts/check-plan-checkboxes.sh
     # There is deliberately NO job here for `landing/cms/payload-types.ts`,
     # the generated file the `payload-types drift` step in
     # .github/workflows/lint.yml checks. Both shapes were built and their

@@ -4,7 +4,7 @@
 > umbrella chart. One entry per published version
 > (`platform-stack/v<version>` tag). For source-tree-level changes
 > tracked per AppRafter monorepo release, see
-> `docs/changelog/UNRELEASED.md`.
+> `docs/changelog/history.md`.
 >
 > Format follows [Keep a Changelog] 1.1.0. Versioning follows
 > semver: MAJOR for chart-shape / component-set incompatibilities,
@@ -24,7 +24,7 @@ _Nothing pending. Note that this file has sections for 0.1.0,
 written up here. Their operator-facing notes live in
 `cue/compatibility.cue` (read by `PlatformController`, and the
 authoritative per-version record) and in
-`docs/changelog/UNRELEASED.md`._
+`docs/changelog/history.md`._
 
 **Build-tooling notes (not part of any chart release):**
 
