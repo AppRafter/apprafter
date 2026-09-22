@@ -6,8 +6,10 @@
 # Layer plan:
 #
 #   1. `chef`    — Rust + musl toolchain + cargo-chef (compiled from source).
-#                  Re-built only when the base image moves.
-#   2. `planner` — copies cli/ workspace, runs `cargo chef prepare`
+#                  Re-built only when the base image moves. Fixes the
+#                  compiler for every later stage to the image's own.
+#   2. `planner` — copies cli/ workspace, checks the image's rustc against
+#                  cli/rust-toolchain.toml, runs `cargo chef prepare`
 #                  to emit recipe.json (source-free dep description).
 #   3. `builder` — cooks deps from recipe.json (cache-stable), then
 #                  builds ONLY `-p apprafter-backup` with musl target.
@@ -29,6 +31,27 @@
 # require them on musl Alpine.
 
 FROM docker.io/library/rust:1.98-alpine3.24 AS chef
+# ONE compiler for every stage: the one this image ships.
+#
+# cli/rust-toolchain.toml says channel "1.98", but the image names its
+# toolchain by the full version (`1.98.1-x86_64-unknown-linux-musl`), so to
+# rustup "1.98" is a toolchain that is not installed — and rustup's default is
+# to download it on first use. Every cargo run inside cli/ did exactly that:
+# the planner, and `cargo chef cook` too, because cargo-chef copies the
+# toolchain file into recipe.json and writes it back before cooking. The
+# runner was built by a second compiler fetched from static.rust-lang.org at
+# build time, whose patch was whatever the channel said that day rather than
+# what this pinned image carries, and the build worked only because rustup
+# happens to auto-install by default.
+#
+# RUSTUP_TOOLCHAIN outranks the toolchain file, and RUST_VERSION is the
+# image's own `1.98.1`, so cook and the final build run the image's compiler
+# with nothing to download. RUSTUP_AUTO_INSTALL=0 turns any toolchain that
+# still resolves elsewhere into a build failure instead of a silent download.
+# The file keeps the say over the MINOR: the planner refuses to build when the
+# image's rustc is not the minor cli/rust-toolchain.toml names.
+ENV RUSTUP_TOOLCHAIN=${RUST_VERSION} \
+    RUSTUP_AUTO_INSTALL=0
 # Same cargo-chef as the operator images (scripts/upstream-pins.json
 # `image-cargo-chef` reads all three ARGs). Without `--version`, `cargo install`
 # resolves whatever crates.io calls newest on the day of the build.
@@ -39,18 +62,37 @@ WORKDIR /workspace/cli
 
 FROM chef AS planner
 COPY cli/ /workspace/cli/
-RUN cargo chef prepare --recipe-path recipe.json
+# The builder image and cli/rust-toolchain.toml are two copies of one pin
+# (scripts/upstream-pins.json `rust-toolchain-minor`). RUSTUP_TOOLCHAIN above
+# means the file no longer picks the compiler in here, so check it instead:
+# a FROM line bumped without the file (or the reverse) fails the build rather
+# than shipping a runner built by a rustc the file does not name.
+RUN channel="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)" \
+ && case "${RUST_VERSION}" in \
+      "${channel}"|"${channel}".*) \
+        echo "rustc ${RUST_VERSION} from the builder image (cli/rust-toolchain.toml: ${channel})" ;; \
+      *) echo "FATAL: the builder image ships rustc ${RUST_VERSION}, but" >&2; \
+         echo "cli/rust-toolchain.toml pins channel '${channel}'. Move the" >&2; \
+         echo "rust:<minor>-alpine FROM line and the toolchain file together." >&2; \
+         exit 1 ;; \
+    esac \
+ && cargo chef prepare --recipe-path recipe.json
 
 # `--locked` on BOTH cargo steps, as release-cli.yml builds the CLI: the image
 # resolves exactly what cli/Cargo.lock says, or fails. Without it a Cargo.lock
 # that lags a Cargo.toml edit is silently re-resolved inside the image, so the
 # runner ships dependency versions no test in the workspace ever ran.
+#
+# `rustup show active-toolchain` puts the compiler of each step in the build
+# log; cook and build must print the same line.
 FROM chef AS builder
 COPY --from=planner /workspace/cli/recipe.json recipe.json
-RUN cargo chef cook --release --locked -p apprafter-backup --recipe-path recipe.json \
+RUN rustup show active-toolchain \
+ && cargo chef cook --release --locked -p apprafter-backup --recipe-path recipe.json \
         --target x86_64-unknown-linux-musl
 COPY cli/ /workspace/cli/
-RUN cargo build --release --locked -p apprafter-backup \
+RUN rustup show active-toolchain \
+ && cargo build --release --locked -p apprafter-backup \
         --target x86_64-unknown-linux-musl
 
 FROM alpine:3.24
