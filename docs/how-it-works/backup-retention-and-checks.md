@@ -1,5 +1,5 @@
 ---
-description: "What a prune actually deletes, what the weekly integrity Job runs and where its result appears, and the three ceilings on the credential the cluster holds."
+description: "What a prune actually deletes, what the weekly integrity Job runs and where its result appears, how long a backup or check run may take, and the three ceilings on the credential the cluster holds."
 ---
 
 # How retention and the integrity check work
@@ -11,8 +11,9 @@ credentials](../operator-guide/backup-maintenance.md); running any of those
 commands needs none of this.
 
 Read it when a prune removed more than the keep numbers led you to expect, when
-the weekly check went red and `apprafter backup status` will not say why, or
-when you are deciding how much delete power to hand the cluster's S3 key.
+the weekly check went red and `apprafter backup status` will not say why, when
+a backup Job was stopped by its deadline, or when you are deciding how much
+delete power to hand the cluster's S3 key.
 
 The decisions behind all three — a restic repository written by the platform's
 own runner rather than a third-party backup operator, retention computed in code
@@ -260,6 +261,73 @@ credentials.
 
 The status ConfigMap is deliberately not chart-owned, so Argo CD does not
 reconcile the runner's self-report away.
+
+## How long a run may take
+
+Both CronJobs are `concurrencyPolicy: Forbid`: while one run is still active,
+the next scheduled run is skipped, not queued. A run that never ended would
+therefore stop every later one without anything failing — the Job would sit at
+`Running` indefinitely. So every run has an outer limit, and the steps inside
+it that wait on something outside the runner have their own.
+
+**The Job deadline.** Each Job template carries `activeDeadlineSeconds`, from
+`spec.backup.activeDeadlineSeconds` for the backup and
+`spec.backup.checkActiveDeadlineSeconds` for the check. Both default to six
+hours and must be at least ten minutes. When the deadline passes, Kubernetes
+stops the pod and fails the Job with reason `DeadlineExceeded`; the next
+scheduled run then starts as normal. `apprafter backup status` shows such a Job
+as `Failed`, and `kubectl -n apprafter-system describe job <name>` shows the
+reason. A run stopped this way has no chance to write `lastFailure` or call the
+failure webhook, so the Job's status is the record of it.
+`apprafter backup run` copies the same Job template, so a manual run has the
+same limit.
+
+Pick the value against the schedule it applies to:
+
+- **Shorter than the interval between two runs**, so a stuck run is stopped
+  before the next one is due. Six hours leaves the nightly default's next run
+  eighteen hours clear.
+- **Longer than the slowest run you expect to succeed**, because the deadline
+  stops a slow run exactly as it stops a stuck one. The first backup of a large
+  data set is the one to size it for.
+
+With a schedule more frequent than the deadline — hourly, under the default —
+a stuck run still costs every run until the deadline stops it, six of them.
+Set the deadline below the interval for such a schedule. A run that takes
+longer than the interval always cost the run it overlaps; that is `Forbid`,
+not the deadline.
+
+The check has one more reason to stay bounded: while it runs it holds the
+repository's exclusive lock, and a backup that starts meanwhile fails on it.
+Under the default schedules a stuck check is stopped by Sunday noon. Raise
+`checkActiveDeadlineSeconds` deliberately for `checkReadData: true` on a
+repository that takes longer than that to download.
+
+`apprafter backup set deadline 12h` and `apprafter backup set check-deadline
+12h` write the two fields; the CLI never writes them otherwise, so a cluster
+that has not set them runs on the chart's six hours.
+
+**Inside a run.** The steps that wait on something outside the runner are
+bounded too, far below the Job deadline. The first two fail the run with a
+reason of its own, recorded in `lastError` and sent to the failure webhook:
+
+| What the run waits on | Bound | What you see |
+| --- | --- | --- |
+| `pg_dump` taking its table locks | 5 minutes (`--lock-wait-timeout=300s`) | `pg dump of <namespace>/<claim> gave up: another session held a lock …`, followed by `pg_dump`'s own `LOCK TABLE` statement naming the tables |
+| a helper pod becoming Ready | 5 minutes | `pod … did not reach Ready within 300s` |
+| the failure webhook answering | 30 seconds | nothing: the notification is best-effort, and the run's outcome is already recorded |
+
+The lock wait bounds only the start of a dump: `pg_dump` takes a shared lock on
+every table it dumps before it reads a row, and a session holding a
+conflicting lock — a migration's `ALTER TABLE`, `VACUUM FULL`, `CLUSTER`, or a
+`LOCK TABLE` in a transaction left open — makes it wait. Once it holds its
+locks, a conflicting lock requested later waits for the dump rather than the
+other way round, and copying a large table is not limited by this bound. The
+same bound applies to `apprafter backup create`. A dump that gave up leaves no
+restorable snapshot behind: a `monolithic` run fails before restic writes
+anything, and a `sequential` run never writes the commit snapshot, so the
+claim snapshots it already wrote are ignored by restore and removed by the
+next prune.
 
 ## What the in-cluster credential can and cannot do
 

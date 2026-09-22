@@ -39,6 +39,7 @@ lint:
     ./scripts/check-cue-cmp-mirror.sh
     ./scripts/check-argocd-health-lua.sh
     ./scripts/check-component-enablement.sh
+    ./scripts/check-backup-render.sh
     ./scripts/check-version-coherence.sh
     ./scripts/check-plan-checkboxes.sh
     # Dependency health — advisories, unmaintained crates, licences, sources.

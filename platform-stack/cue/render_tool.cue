@@ -507,6 +507,13 @@ _backupTemplate: """
 	  failedJobsHistoryLimit: 3
 	  jobTemplate:
 	    spec:
+	      # Forbid means one run that never ends suppresses every later
+	      # scheduled run, with nothing failing. The deadline stops it and
+	      # fails the Job with reason DeadlineExceeded, whatever it was stuck
+	      # on. Shorter than the schedule's interval, longer than the slowest
+	      # good backup: see #BackupValues.activeDeadlineSeconds. `backup run`
+	      # copies this jobTemplate, so a manual run carries it too.
+	      activeDeadlineSeconds: {{ $b.activeDeadlineSeconds | default 21600 | int }}
 	      template:
 	        metadata:
 	          labels:
@@ -611,6 +618,9 @@ _backupTemplate: """
 	  failedJobsHistoryLimit: 3
 	  jobTemplate:
 	    spec:
+	      # The same umbrella as the backup Job's. A stuck check also holds
+	      # restic's EXCLUSIVE lock, which fails every backup until it ends.
+	      activeDeadlineSeconds: {{ $b.checkActiveDeadlineSeconds | default 21600 | int }}
 	      template:
 	        metadata:
 	          labels:
@@ -975,7 +985,9 @@ _valuesSchema: {
 						}
 					}
 				}
+				activeDeadlineSeconds: {type: "integer", minimum: 600}
 				checkSchedule: {type: "string"}
+				checkActiveDeadlineSeconds: {type: "integer", minimum: 600}
 				checkReadData: {type: "boolean"}
 				checkReadDataSubset: {type: "string"}
 				failureWebhook: {type: "string"}

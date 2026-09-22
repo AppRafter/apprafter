@@ -435,6 +435,27 @@ package platformstack
 	// Cron schedule for the full backup Job. Default nightly 03:00.
 	schedule: string | *"0 3 * * *"
 
+	// How long one backup Job may run before Kubernetes stops it →
+	// `jobTemplate.spec.activeDeadlineSeconds`; the Job then fails with
+	// reason `DeadlineExceeded`. Default six hours.
+	//
+	// The CronJob is `concurrencyPolicy: Forbid`, so without a deadline one
+	// run that never ends suppresses every later scheduled run, silently.
+	// The deadline is the bound that holds whatever the run is stuck on.
+	// Keep it SHORTER than the time between two scheduled runs, so a stuck
+	// run is stopped before the next slot, and LONGER than the slowest
+	// backup that is expected to succeed, which it would otherwise kill:
+	// six hours leaves the nightly default's next slot eighteen hours clear.
+	// With a schedule more frequent than the deadline, a stuck run still
+	// costs every slot until the deadline stops it — at most six hourly
+	// runs under the default — and a run slower than the interval costs
+	// the slot it overlaps, as it always has under `Forbid`.
+	//
+	// Ten minutes at least: below that, a normal run's helper-pod start
+	// and repository open are at risk, and a value that small is far more
+	// likely a unit mistake (minutes for seconds) than an intent.
+	activeDeadlineSeconds: int & >=600 | *21600
+
 	// Restic repository URL, e.g. `s3:https://<endpoint>/<bucket>` —
 	// NO credentials (those come from `credentialRef`). Empty until the
 	// operator enables backup; the guard keys off `enabled`, not this.
@@ -488,6 +509,14 @@ package platformstack
 	// Cron schedule for the weekly `restic check` Job. Default Sunday
 	// 06:00 (staggered clear of the daily backup).
 	checkSchedule: string | *"0 6 * * 0"
+
+	// `activeDeadlineSeconds` for the weekly check Job, with the same
+	// reasoning and the same floor. Default six hours: a stuck check under
+	// the default schedules is stopped by Sunday noon, well before the next
+	// nightly backup — which a check still holding its restic lock would
+	// otherwise fail. Raise it for `checkReadData: true` on a repository
+	// that takes longer than that to download.
+	checkActiveDeadlineSeconds: int & >=600 | *21600
 
 	// IANA timezone both schedules run in → `CronJob.spec.timeZone`
 	// (2.22g / D2). Empty = omit the field, which means the CronJob runs

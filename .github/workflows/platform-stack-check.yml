@@ -46,6 +46,7 @@ on:
       - 'scripts/check-platform-stack-version.sh'
       - 'scripts/check-gateway-render.sh'
       - 'scripts/check-component-enablement.sh'
+      - 'scripts/check-backup-render.sh'
       - '.github/workflows/platform-stack-check.yml'
       - '.github/workflows/platform-stack-publish.yml'
   push:
@@ -58,6 +59,7 @@ on:
       - 'scripts/check-platform-stack-version.sh'
       - 'scripts/check-gateway-render.sh'
       - 'scripts/check-component-enablement.sh'
+      - 'scripts/check-backup-render.sh'
       - '.github/workflows/platform-stack-check.yml'
       - '.github/workflows/platform-stack-publish.yml'
 
@@ -185,6 +187,14 @@ jobs:
         # `enabled: false`. No other gate renders the chart with the
         # override the running system writes, so none of them saw it.
         run: bash scripts/check-component-enablement.sh
+
+      - name: Backup CronJob deadline assertions (a stuck run cannot block the schedule)
+        # Both backup CronJobs are concurrencyPolicy: Forbid, so one run that
+        # never ends suppresses every later one without anything failing.
+        # jobTemplate.spec.activeDeadlineSeconds is the bound. The smoke render
+        # above uses default values, where backup is off and neither CronJob
+        # exists, so only this step sees the field.
+        run: bash scripts/check-backup-render.sh
 
       - name: Gateway render assertions (1.83a public ingress)
         # Pins the host-network public-ingress contract: the platform

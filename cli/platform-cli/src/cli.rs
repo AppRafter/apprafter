@@ -1805,7 +1805,13 @@ pub enum BackupAction {
     /// check-depth <structure|10%|full>, cluster-name <name>, timezone
     /// <IANA>, keep-daily <n>, keep-weekly <n>, keep-monthly <n>,
     /// enforce <operator|cluster>, staging-mode
-    /// <monolithic|sequential>, failure-webhook <url>.
+    /// <monolithic|sequential>, failure-webhook <url>, deadline
+    /// <duration>, check-deadline <duration>.
+    ///
+    /// `deadline` and `check-deadline` are how long one backup or check
+    /// Job may run before Kubernetes stops it (default 6h, minimum 10m):
+    /// `12h`, `90m`, `43200s`. Keep each shorter than the interval between
+    /// two runs of its schedule and longer than its slowest good run.
     ///
     /// `enabled` is the switch on its own, and it is how a configured
     /// but switched-off schedule comes back: after `backup disable`, or

@@ -130,6 +130,7 @@ mod tests {
         spec.backup = Some(operator_core::platform_stack::BackupConfig {
             enabled: true,
             schedule: "@daily".into(),
+            active_deadline_seconds: None,
             bucket: "s3:https://ep/b".into(),
             credential_ref: operator_core::platform_stack::CredentialRef {
                 name: "bkcreds".into(),
@@ -139,6 +140,7 @@ mod tests {
             staging_size_limit: None,
             retention: None,
             check_schedule: "@weekly".into(),
+            check_active_deadline_seconds: None,
             check_read_data: false,
             check_read_data_subset: None,
             time_zone: None,
@@ -163,6 +165,7 @@ mod tests {
         spec.backup = Some(operator_core::platform_stack::BackupConfig {
             enabled: true,
             schedule: "@daily".into(),
+            active_deadline_seconds: None,
             bucket: "s3:https://ep/b".into(),
             cluster_name: Some("prod".into()),
             credential_ref: operator_core::platform_stack::CredentialRef {
@@ -172,6 +175,7 @@ mod tests {
             staging_size_limit: None,
             retention: None,
             check_schedule: "@weekly".into(),
+            check_active_deadline_seconds: None,
             check_read_data: false,
             check_read_data_subset: None,
             time_zone: None,
@@ -187,6 +191,7 @@ mod tests {
         spec.backup = Some(operator_core::platform_stack::BackupConfig {
             enabled: true,
             schedule: "@daily".into(),
+            active_deadline_seconds: None,
             bucket: "s3:https://ep/b".into(),
             credential_ref: operator_core::platform_stack::CredentialRef {
                 name: "bkcreds".into(),
@@ -196,6 +201,7 @@ mod tests {
             staging_size_limit: None,
             retention: None,
             check_schedule: "@weekly".into(),
+            check_active_deadline_seconds: None,
             check_read_data: false,
             check_read_data_subset: Some("25%".into()),
             time_zone: None,
@@ -214,6 +220,7 @@ mod tests {
         spec.backup = Some(operator_core::platform_stack::BackupConfig {
             enabled: true,
             schedule: "@daily".into(),
+            active_deadline_seconds: None,
             bucket: "s3:https://ep/b".into(),
             credential_ref: operator_core::platform_stack::CredentialRef {
                 name: "bkcreds".into(),
@@ -223,6 +230,7 @@ mod tests {
             staging_size_limit: None,
             retention: None,
             check_schedule: "@weekly".into(),
+            check_active_deadline_seconds: None,
             check_read_data: false,
             check_read_data_subset: None,
             time_zone: Some("Europe/Berlin".into()),
@@ -254,6 +262,41 @@ mod tests {
             desired.helm_values["backup"]["credentialRef"]["name"],
             json!("bkcreds")
         );
+    }
+
+    /// The Job deadlines reach the chart when a CR sets them, and stay
+    /// ABSENT when it does not, so the chart's own six-hour default applies
+    /// rather than a `null` the template would have to special-case.
+    #[test]
+    fn job_deadlines_reach_the_chart_only_when_set() {
+        let config = |backup, check| operator_core::platform_stack::BackupConfig {
+            enabled: true,
+            schedule: "0 * * * *".into(),
+            active_deadline_seconds: backup,
+            bucket: "s3:https://ep/b".into(),
+            credential_ref: operator_core::platform_stack::CredentialRef {
+                name: "bkcreds".into(),
+            },
+            check_schedule: "@weekly".into(),
+            check_active_deadline_seconds: check,
+            staging_mode: "monolithic".into(),
+            ..Default::default()
+        };
+
+        let mut spec = base_spec();
+        spec.backup = Some(config(Some(2700), Some(43200)));
+        let values = build(&spec, "0.2.80").helm_values["backup"].clone();
+        assert_eq!(values["activeDeadlineSeconds"], json!(2700));
+        assert_eq!(values["checkActiveDeadlineSeconds"], json!(43200));
+
+        spec.backup = Some(config(None, None));
+        let values = build(&spec, "0.2.80").helm_values["backup"].clone();
+        for key in ["activeDeadlineSeconds", "checkActiveDeadlineSeconds"] {
+            assert!(
+                values.get(key).is_none(),
+                "{key} must stay absent: {values}"
+            );
+        }
     }
 
     #[test]

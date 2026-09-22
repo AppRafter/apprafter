@@ -110,10 +110,10 @@ this one. Use `set` for changes, `enable` for configuring.
 
 The other settable keys are `enabled`, `at`, `check`, `cluster-name`,
 `timezone`, `keep-daily`, `keep-weekly`, `keep-monthly`, `enforce`,
-`staging-mode` and `failure-webhook`. The bucket and its credential are
-deliberately not among them: pointing an existing schedule at a different
-repository is a new repository, with its own init and its own first backup, so
-it goes through `enable`.
+`staging-mode`, `failure-webhook`, `deadline` and `check-deadline`. The bucket
+and its credential are deliberately not among them: pointing an existing
+schedule at a different repository is a new repository, with its own init and
+its own first backup, so it goes through `enable`.
 
 #### Switching a configured schedule on and off
 
@@ -193,6 +193,32 @@ running backup is never touched. Reach for it when a Job was killed mid-run
 in-cluster CronJobs already unlock stale locks as their first step, so you
 mostly need `unlock` for operator-side `prune`/`check` against a repo whose last
 in-cluster run died unexpectedly.
+
+#### A run that stopped at its deadline
+
+A backup or check Job runs for six hours at most. Past that, Kubernetes stops
+it and fails the Job with reason `DeadlineExceeded`; `backup status` shows it
+as `Failed`, and the next scheduled run goes ahead as normal
+([how long a run may take](../how-it-works/backup-retention-and-checks.md#how-long-a-run-may-take)).
+If your backups legitimately take longer — typically the first one of a large
+data set — raise the limit:
+
+```sh
+apprafter backup set deadline 12h         # the backup Job; 6h by default
+apprafter backup set check-deadline 12h   # the weekly check Job; 6h by default
+```
+
+Both take whole hours, minutes or seconds (`12h`, `90m`, `43200s`), ten
+minutes at least. Keep each shorter than the interval between two runs of its
+schedule: if you run backups more often than every six hours, lower the limit
+below that interval rather than raising it. If the backup block is git-managed,
+set `activeDeadlineSeconds` / `checkActiveDeadlineSeconds` under
+`spec.backup` in your infra repo instead.
+
+A backup that failed with `pg dump of <namespace>/<claim> gave up` met the
+other limit: another session held a conflicting lock on one of that claim's
+tables for five minutes, typically a migration. The message names the tables.
+Run `apprafter backup run` again once that session has finished.
 
 ## The scoped-credentials ladder — `enforce: operator` vs `cluster`
 

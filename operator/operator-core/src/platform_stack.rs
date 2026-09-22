@@ -119,6 +119,16 @@ pub struct BackupConfig {
     #[serde(default)]
     pub enabled: bool,
     pub schedule: String,
+    /// `activeDeadlineSeconds` of each scheduled backup Job. `None` on a CR
+    /// that does not set it, which the chart then fills with its own
+    /// six-hour default — optional rather than defaulted here, like
+    /// `checkReadDataSubset`, so the default lives in one place.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "activeDeadlineSeconds"
+    )]
+    pub active_deadline_seconds: Option<i64>,
     pub bucket: String,
     /// Human name this cluster's snapshots are listed under (the restic
     /// `--host`). `None` on a CR written before the field existed, which the
@@ -145,6 +155,14 @@ pub struct BackupConfig {
     pub retention: Option<RetentionConfig>,
     #[serde(rename = "checkSchedule")]
     pub check_schedule: String,
+    /// `activeDeadlineSeconds` of each weekly check Job; `None` = the chart's
+    /// six-hour default.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "checkActiveDeadlineSeconds"
+    )]
+    pub check_active_deadline_seconds: Option<i64>,
     /// IANA timezone for both schedules → `CronJob.spec.timeZone` (2.22g).
     /// Absent = the kube-controller-manager's zone, which is what every
     /// cluster did before this field and is the trap the field closes.

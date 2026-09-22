@@ -54,8 +54,14 @@ spec:
                 type: boolean
               backup:
                 properties:
+                  activeDeadlineSeconds:
+                    minimum: 600
+                    type: integer
                   bucket:
                     type: string
+                  checkActiveDeadlineSeconds:
+                    minimum: 600
+                    type: integer
                   checkReadData:
                     type: boolean
                   checkReadDataSubset:

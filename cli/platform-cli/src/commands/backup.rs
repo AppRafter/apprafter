@@ -2928,7 +2928,49 @@ const BACKUP_SET_KEYS: &[&str] = &[
     "enforce",
     "staging-mode",
     "failure-webhook",
+    "deadline",
+    "check-deadline",
 ];
+
+/// The shortest Job deadline `backup set` writes, and the CRD's own minimum.
+const MIN_JOB_DEADLINE_SECS: u64 = 600;
+
+/// Parse a Job deadline written as a whole number of hours, minutes or
+/// seconds — `6h`, `90m`, `43200s` — into seconds.
+///
+/// One unit, no fractions and no bare numbers: a bare `6` is exactly the
+/// ambiguity (hours? seconds?) a deadline must not have, since the wrong
+/// reading either stops every run or never stops a stuck one.
+fn parse_job_deadline(key: &str, value: &str) -> Result<u64> {
+    let refuse = |why: &str| {
+        CliError::Other(format!(
+            "{key} takes a duration like `6h`, `90m` or `43200s` — got `{value}`: {why}. \
+             It must stay shorter than the interval between two runs of its schedule, and \
+             longer than the slowest run expected to succeed."
+        ))
+    };
+    let per_unit = match value.chars().last() {
+        Some('h') => 3600,
+        Some('m') => 60,
+        Some('s') => 1,
+        _ => return Err(refuse("the unit must be h, m or s")),
+    };
+    // The unit is one ASCII byte, so this slice is on a char boundary.
+    let digits = &value[..value.len() - 1];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(refuse("expected a whole number before the unit"));
+    }
+    let secs = digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(per_unit))
+        .filter(|s| i64::try_from(*s).is_ok())
+        .ok_or_else(|| refuse("too large"))?;
+    if secs < MIN_JOB_DEADLINE_SECS {
+        return Err(refuse("the minimum is 10m"));
+    }
+    Ok(secs)
+}
 
 /// Is this a value restic's `--read-data-subset` would accept?
 ///
@@ -3075,6 +3117,19 @@ fn backup_set_patch(key: &str, value: &str) -> Result<Value> {
         }
         "failure-webhook" => {
             field.insert("failureWebhook".into(), Value::String(value.to_string()));
+        }
+        // How long one Job may run before Kubernetes stops it; see
+        // `activeDeadlineSeconds` in the PlatformStack schema. Operator
+        // v0.2.52 is the first CRD to define these, and the readback in
+        // `run_backup_set` reports an older CRD pruning them.
+        "deadline" | "check-deadline" => {
+            let secs = parse_job_deadline(key, value)?;
+            let cr_key = if key == "deadline" {
+                "activeDeadlineSeconds"
+            } else {
+                "checkActiveDeadlineSeconds"
+            };
+            field.insert(cr_key.into(), Value::from(secs));
         }
         _ => {
             return Err(CliError::Other(format!(
@@ -6815,6 +6870,47 @@ mod tests {
         assert!(backup_set_patch("enforce", "cluster").is_ok());
         assert!(backup_set_patch("timezone", "Europe/Lisbon").is_ok());
         assert!(backup_set_patch("timezone", "CET-1CEST,M3.5.0").is_err());
+    }
+
+    #[test]
+    fn set_deadline_writes_seconds_to_the_field_the_chart_reads() {
+        let patch = backup_set_patch("deadline", "12h").unwrap();
+        assert_eq!(
+            patch,
+            json!({"spec": {"backup": {"activeDeadlineSeconds": 43200}}})
+        );
+        let patch = backup_set_patch("check-deadline", "90m").unwrap();
+        assert_eq!(
+            patch,
+            json!({"spec": {"backup": {"checkActiveDeadlineSeconds": 5400}}})
+        );
+        assert_eq!(
+            backup_set_patch("deadline", "600s").unwrap()["spec"]["backup"]
+                ["activeDeadlineSeconds"],
+            json!(600)
+        );
+    }
+
+    #[test]
+    fn set_deadline_refuses_what_it_cannot_read_one_way() {
+        for bad in [
+            "6",                     // hours? seconds? — the ambiguity itself
+            "9m",                    // under the ten-minute floor the CRD enforces
+            "599s",                  // likewise
+            "1.5h",                  // no fractions
+            "6h30m",                 // one unit
+            "-6h",                   // no sign
+            "h",                     // no number
+            "6d",                    // no days: a deadline that long outlives a daily slot
+            "",                      // nothing
+            "99999999999999999999h", // overflow
+            "6ｈ",                   // a fullwidth h: multi-byte, refused rather than sliced
+        ] {
+            let err = backup_set_patch("deadline", bad)
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains("deadline"), "names the key for {bad:?}: {err}");
+        }
     }
 
     #[test]

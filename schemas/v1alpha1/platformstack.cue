@@ -100,6 +100,20 @@ package v1alpha1
 		enabled:  bool | *false
 		schedule: string | *"0 3 * * *"
 
+		// How long one scheduled backup Job may run before Kubernetes
+		// stops it and fails it with reason `DeadlineExceeded` — the
+		// CronJob's `jobTemplate.spec.activeDeadlineSeconds`. Absent means
+		// the platform default, six hours.
+		//
+		// The CronJob never starts a run while the previous one is still
+		// going, so a run that never ends would otherwise suppress every
+		// later backup without anything failing. Keep it shorter than the
+		// interval between two runs of `schedule`, so a stuck run is
+		// stopped before the next slot, and longer than the slowest backup
+		// expected to succeed, which it would otherwise stop too. At least
+		// ten minutes.
+		activeDeadlineSeconds?: int & >=600
+
 		// IANA timezone the two schedules are interpreted in, written to
 		// `CronJob.spec.timeZone` (2.22g / D2). Absent means the CronJob
 		// runs in the kube-controller-manager's zone, which is what every
@@ -140,6 +154,14 @@ package v1alpha1
 			enforce:      "operator" | "cluster" | *"operator"
 		}
 		checkSchedule: string | *"0 6 * * 0"
+
+		// `activeDeadlineSeconds` for the weekly integrity check Job, with
+		// the same rule against `checkSchedule`. Absent means six hours.
+		// A running check holds the repository's exclusive lock, which
+		// fails any backup that starts meanwhile — so a long full-read
+		// check (`checkReadData`) wants this raised deliberately, not
+		// removed.
+		checkActiveDeadlineSeconds?: int & >=600
 
 		// Deep verify: re-download and re-hash EVERY pack on each weekly
 		// check. Complete, and proportionally expensive — a full repo's
