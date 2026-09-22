@@ -3,7 +3,9 @@
 // Versions follow mise.toml's rule: pin the MINOR, let the patch float. Each
 // feature below resolves a minor ("1.98") to its newest patch when the
 // container is built; "latest" / "lts" would give up the minor, and a
-// floating line reads the same as a forgotten one. The minors are copies:
+// floating line reads the same as a forgotten one. Node is mise.toml's one
+// exception and pins its MAJOR, the LTS line: node never patches an older
+// minor, so a node minor pin would be an exact pin. The values are copies:
 //
 //   rust, node, go   mise.toml (which names where each of those comes from)
 //   kubectl, helm    the flake-locked nixpkgs, which the dev container mirrors
@@ -26,7 +28,7 @@
       "profile": "default"
     },
     "ghcr.io/devcontainers/features/node:1": {
-      "version": "24.21",
+      "version": "24",
       // The installer that fetches node, pinned like the rest.
       "nvmVersion": "0.40",
       // Defaults to "latest"; nothing in this repository uses pnpm (bun is
