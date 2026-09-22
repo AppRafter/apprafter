@@ -1811,7 +1811,10 @@ pub enum BackupAction {
     /// `deadline` and `check-deadline` are how long one backup or check
     /// Job may run before Kubernetes stops it (default 6h, minimum 10m):
     /// `12h`, `90m`, `43200s`. Keep each shorter than the interval between
-    /// two runs of its schedule and longer than its slowest good run.
+    /// two runs of its schedule and longer than its slowest good run. The
+    /// check locks the repository exclusively, so also keep the backup's
+    /// below the gap from a backup to the next check (3h by default) and
+    /// the check's below the gap from the check to the next backup (21h).
     ///
     /// `enabled` is the switch on its own, and it is how a configured
     /// but switched-off schedule comes back: after `backup disable`, or

@@ -214,7 +214,15 @@ apprafter backup set check-deadline 12h   # the weekly check Job; 6h by default
 Both take whole hours, minutes or seconds (`12h`, `90m`, `43200s`), ten
 minutes at least. Keep each shorter than the interval between two runs of its
 schedule: if you run backups more often than every six hours, lower the limit
-below that interval rather than raising it. If the backup block is git-managed,
+below that interval rather than raising it. The two also bound each other,
+because the check takes the repository's exclusive lock and a backup and a
+check that overlap fail one another: keep the backup's limit below the time
+from a backup to the next check, and the check's below the time from the check
+to the next backup. Under the defaults that is three hours (03:00 to Sunday
+06:00) and twenty-one; if Sunday backups run past three hours, move the check
+later with `apprafter backup set check 12:00`
+([the two schedules bound each other](../how-it-works/backup-retention-and-checks.md#how-long-a-run-may-take)).
+If the backup block is git-managed,
 set `activeDeadlineSeconds` / `checkActiveDeadlineSeconds` under
 `spec.backup` in your infra repo instead.
 

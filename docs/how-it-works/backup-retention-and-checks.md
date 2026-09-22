@@ -322,11 +322,28 @@ for such a schedule. A run that simply takes longer than the interval has
 always delayed the next one — the slot it overlaps starts as soon as it ends;
 that is `Forbid`, not the deadline.
 
-The check has one more reason to stay bounded: while it runs it holds the
-repository's exclusive lock, and a backup that starts meanwhile fails on it.
-Under the default schedules a stuck check is stopped by Sunday noon. Raise
-`checkActiveDeadlineSeconds` deliberately for `checkReadData: true` on a
-repository that takes longer than that to download.
+**The two schedules bound each other.** `restic check` holds the repository's
+exclusive lock, and neither Job waits for a lock (no `--retry-lock`): a check
+that starts while a backup is running fails on the backup's lock, and a
+backup that starts while a check is running fails on the check's. So on top of
+its own interval, each deadline has a second ceiling:
+
+- the backup's deadline stays below the time from a backup's start to the next
+  check's start;
+- the check's deadline stays below the time from a check's start to the next
+  backup's start.
+
+Under the default schedules — the backup at 03:00 every day, the check at
+06:00 on Sundays — those gaps are three hours and twenty-one. The six-hour
+backup default is longer than the first: a Sunday backup still running at
+06:00, slow or stuck, makes that week's check fail on its lock (the check Job
+retries for about ten minutes, then fails), and the next week's check runs as
+usual. If Sunday backups take longer than three hours, move the check later —
+`apprafter backup set check 12:00` — rather than living with a failed check.
+The check's six hours end by Sunday noon, well clear of Monday's backup; when
+you raise `checkActiveDeadlineSeconds` for `checkReadData: true` on a
+repository that takes long to download, keep it under the twenty-one hours, or
+a slow full-read check fails Monday's backup instead.
 
 `apprafter backup set deadline 12h` and `apprafter backup set check-deadline
 12h` write the two fields; the CLI never writes them otherwise, so a cluster

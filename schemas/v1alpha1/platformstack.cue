@@ -112,8 +112,11 @@ package v1alpha1
 		// later backup without anything failing. Keep it shorter than the
 		// interval between two runs of `schedule`, so a stuck run is
 		// stopped before the next slot, and longer than the slowest backup
-		// expected to succeed, which it would otherwise stop too. At least
-		// ten minutes.
+		// expected to succeed, which it would otherwise stop too. Keep it
+		// below the time from a backup's start to the next check's start
+		// as well: the check takes the repository's exclusive lock and a
+		// backup still running then fails it (three hours under the
+		// default schedules). At least ten minutes.
 		activeDeadlineSeconds?: int & >=600
 
 		// IANA timezone the two schedules are interpreted in, written to
@@ -160,9 +163,11 @@ package v1alpha1
 		// `activeDeadlineSeconds` for the weekly integrity check Job, with
 		// the same rule against `checkSchedule`. Absent means six hours.
 		// A running check holds the repository's exclusive lock, which
-		// fails any backup that starts meanwhile — so a long full-read
-		// check (`checkReadData`) wants this raised deliberately, not
-		// removed.
+		// fails any backup that starts meanwhile — so keep it below the
+		// time from the check's start to the next backup's start
+		// (twenty-one hours under the default schedules), and raise it for
+		// a long full-read check (`checkReadData`) deliberately, not by
+		// removing it.
 		checkActiveDeadlineSeconds?: int & >=600
 
 		// Deep verify: re-download and re-hash EVERY pack on each weekly

@@ -216,7 +216,7 @@ Change ONE field of a configured backup, leaving the rest alone. `backup enable`
 
 Keys: enabled &lt;true|false>, at &lt;HH:MM>, check &lt;HH:MM|off>, check-depth &lt;structure|10%|full>, cluster-name &lt;name>, timezone &lt;IANA>, keep-daily &lt;n>, keep-weekly &lt;n>, keep-monthly &lt;n>, enforce &lt;operator|cluster>, staging-mode &lt;monolithic|sequential>, failure-webhook &lt;url>, deadline &lt;duration>, check-deadline &lt;duration>.
 
-`deadline` and `check-deadline` are how long one backup or check Job may run before Kubernetes stops it (default 6h, minimum 10m): `12h`, `90m`, `43200s`. Keep each shorter than the interval between two runs of its schedule and longer than its slowest good run.
+`deadline` and `check-deadline` are how long one backup or check Job may run before Kubernetes stops it (default 6h, minimum 10m): `12h`, `90m`, `43200s`. Keep each shorter than the interval between two runs of its schedule and longer than its slowest good run. The check locks the repository exclusively, so also keep the backup's below the gap from a backup to the next check (3h by default) and the check's below the gap from the check to the next backup (21h).
 
 `enabled` is the switch on its own, and it is how a configured but switched-off schedule comes back: after `backup disable`, or after a `restore`, which replays the source's whole backup block disabled. `backup enable` cannot do that job — it composes the whole block from its flags, so it would reset everything the restore just carried across.
 

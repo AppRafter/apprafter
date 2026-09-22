@@ -450,6 +450,13 @@ package platformstack
 	// run is stopped before the next slot, and LONGER than the slowest
 	// backup that is expected to succeed, which it would otherwise kill:
 	// six hours leaves the nightly default's next slot eighteen hours clear.
+	// It must ALSO stay below the time from a backup's start to the next
+	// check's start: the check takes restic's exclusive lock and neither Job
+	// retries a lock, so a backup still running when the check starts fails
+	// that check. Under the default schedules that gap is three hours
+	// (03:00 → Sunday 06:00), shorter than this default — a Sunday backup
+	// past three hours costs that week's check; move the check later if
+	// backups take that long.
 	// With a schedule more frequent than the deadline, a stuck run still
 	// costs the slots that fall while it is active: `Forbid` starts none of
 	// them, and when the run ends (no `startingDeadlineSeconds` is set) the
@@ -518,11 +525,13 @@ package platformstack
 	checkSchedule: string | *"0 6 * * 0"
 
 	// `activeDeadlineSeconds` for the weekly check Job, with the same
-	// reasoning and the same floor. Default six hours: a stuck check under
-	// the default schedules is stopped by Sunday noon, well before the next
-	// nightly backup — which a check still holding its restic lock would
-	// otherwise fail. Raise it for `checkReadData: true` on a repository
-	// that takes longer than that to download.
+	// reasoning and the same floor. It must ALSO stay below the time from
+	// the check's start to the next backup's start: a check still holding
+	// restic's exclusive lock fails that backup (no --retry-lock). Default
+	// six hours: under the default schedules a stuck check is stopped by
+	// Sunday noon, well inside the twenty-one hours to Monday's 03:00
+	// backup. Raise it for `checkReadData: true` on a repository that takes
+	// longer than that to download — and keep it under that gap.
 	checkActiveDeadlineSeconds: int & >=600 | *21600
 
 	// IANA timezone both schedules run in → `CronJob.spec.timeZone`
