@@ -249,7 +249,8 @@
         "sources": [
           { "files": ".github/workflows/*.yml", "pattern": "cue-lang/setup-cue@[^\\n]*\\n\\s*with:\\s*\\n\\s*version:\\s*'?\"?([^\\s'\"]+)" },
           { "files": ".devcontainer/post-create.sh", "pattern": "(?m)^CUE_VERSION=\"([^\"]+)\"" },
-          { "files": "argocd-cue-cmp/Dockerfile", "pattern": "(?m)^ARG CUE_VERSION=(\\S+)" }
+          { "files": "argocd-cue-cmp/Dockerfile", "pattern": "(?m)^ARG CUE_VERSION=(\\S+)" },
+          { "files": "flake.nix", "pattern": "(?m)^\\s*cueVersion = \"([^\"]+)\"" }
         ]
       },
       "upstream": { "kind": "github-release", "repo": "cue-lang/cue" },

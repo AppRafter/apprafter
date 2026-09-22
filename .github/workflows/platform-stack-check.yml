@@ -81,7 +81,7 @@ jobs:
       - name: Install CUE
         uses: cue-lang/setup-cue@v2.0.0
         with:
-          version: v0.10.0
+          version: v0.17.1
 
       - name: Install Helm
         uses: azure/setup-helm@v5

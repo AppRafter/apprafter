@@ -1975,8 +1975,17 @@ compatibility: "0.2.80": {
 		approval, and a moved config digest would make every application report
 		a configuration change once, for nothing.
 
-		Nothing in the rendered chart changes except the operator and webhook
-		image tags.
+		The Argo CD CUE sidecar also moves from cue v0.10.0 to v0.17.1. That is
+		the copy that evaluates YOUR manifests, so it was gated on the sidecar's
+		own 124-assertion injection suite under the candidate rather than on the
+		release notes — v0.17 redesigned comprehension execution, which is the
+		mechanism the two-pass claim injection is built on. cue.mod language
+		versions are deliberately NOT touched: a module declaring an older
+		language version is evaluated with that version's semantics, so manifests
+		keep parsing exactly as before.
+
+		Nothing in the rendered chart changes except the operator, webhook and
+		sidecar image tags.
 		"""
 	references: [
 		"WI-352",

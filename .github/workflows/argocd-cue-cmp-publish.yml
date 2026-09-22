@@ -70,7 +70,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: cue-lang/setup-cue@v2.0.0
         with:
-          version: v0.10.0
+          version: v0.17.1
 
       - name: Resolve version from version.cue or override
         id: version

@@ -102,7 +102,7 @@ jobs:
       - name: Install CUE (needed for currentVersion resolution)
         uses: cue-lang/setup-cue@v2.0.0
         with:
-          version: v0.10.0
+          version: v0.17.1
 
       - name: Resolve version from CUE or override
         id: version
@@ -295,7 +295,7 @@ jobs:
         # below both shell out to `cue`.
         uses: cue-lang/setup-cue@v2.0.0
         with:
-          version: v0.10.0
+          version: v0.17.1
 
       - name: Install Helm
         uses: azure/setup-helm@v5

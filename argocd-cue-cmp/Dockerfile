@@ -17,7 +17,7 @@
 #   - Pinned cue version via build arg so the image's tag and
 #     the embedded cue version don't drift.
 
-ARG CUE_VERSION=v0.10.0
+ARG CUE_VERSION=v0.17.1
 ARG ALPINE_VERSION=3.24
 
 # ---- stage 1: fetch cue binary --------------------------------
