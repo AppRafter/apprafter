@@ -1149,7 +1149,7 @@ mod tests {
     fn scope_drops_the_generated_reference_and_the_records() {
         assert!(!is_in_scope("docs/reference/cli/app.md"));
         assert!(!is_in_scope("docs/adr/0057-documentation-system.md"));
-        assert!(!is_in_scope("docs/changelog/UNRELEASED.md"));
+        assert!(!is_in_scope("docs/changelog/history.md"));
         assert!(!is_in_scope(
             "docs/measurements/2.16d-baseline-2026-08-08.md"
         ));

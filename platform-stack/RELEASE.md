@@ -204,7 +204,7 @@ It enforces:
   platform-stack chart and the CLI's hard-coded operator
   image tag remain coupled until sub-phase 1.71 lands the CLI
   cutover to consuming the published chart.)
-- Update `docs/changelog/UNRELEASED.md` with a one-paragraph
+- Update `docs/changelog/history.md` with a one-paragraph
   pointer to the new version. (The chart's own
   `platform-stack/CHANGELOG.md` already has the detailed
   entry.)

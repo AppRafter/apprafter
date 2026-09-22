@@ -237,7 +237,7 @@ not. The Lua check reads `status.phase`
 `phase = Ready` when the Deployment is applied
 (`operator/operator-controllers/application/src/lib.rs:1072`), so a
 CrashLooping app has always rendered `Synced / Healthy` — documented at
-`docs/changelog/UNRELEASED.md:7222-7232` and never fixed. This ADR makes the
+`docs/changelog/history.md:7222-7232` and never fixed. This ADR makes the
 cell cardinal and stops it *implying* it can see pods; it does not make it
 see them.
 

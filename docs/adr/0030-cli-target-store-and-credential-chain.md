@@ -350,7 +350,7 @@ Re-evaluate when:
 - `cli-dx-task.md` — full Track A specification (12 sub-items).
 - `plan.md` Phase 1.5 Track A history table (sub-phases
   1.66A.1 through 1.66A.12, versions v0.1.69 through v0.1.90).
-- `docs/changelog/UNRELEASED.md` — per-version changelog
+- `docs/changelog/history.md` — per-version changelog
   with operator-facing rationale for each step.
 - `docs/operator-guide/quickstart.md` — operator quickstart
   refreshed for the post-Track-A flow.

@@ -245,6 +245,8 @@ replaces.
   `cli-providers::k8s::application_crd`) and still asserts "no CUE→CRD/Rust
   generator yet" — this ADR's landing rewrites it.
 - CLAUDE.md — architecture note on hand-rolled CRD/Rust mirrors.
-- The `0.2.15` `additionalProperties` + `properties` incident
-  (`docs/changelog/plan-history.md`) — the structural CRD bug class this removes.
+- The `0.2.15` `additionalProperties` + `properties` incident — the structural
+  CRD bug class this removes. (Recorded at the time in the plan-level ledger
+  `docs/changelog/plan-history.md`, retired 2026-09-22 when ATM took over that
+  role; the entry remains in git history.)
 - `kube::CustomResourceExt`, `cue export --out openapi`.

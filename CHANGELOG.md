@@ -2,22 +2,37 @@
 
 All notable changes to this project are documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Sections follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions
+follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). **Headings do not**,
+deliberately — see below.
 
 **This file is generated from ATM** by the changelog sync; edit entries in ATM, not
-here, or the next release will overwrite them. Anything outside a `## [version]`
-section — such as this note — survives regeneration.
+here, or the next release will overwrite them. Anything outside a version section —
+such as this note — survives regeneration.
 
-**Which version the heading names.** This is a monorepo with several independently
-versioned streams, and their numbers are meant to differ. A heading here tracks the
-**platform-stack chart**, the artifact a cluster actually consumes; the CLI, the
-operator charts and the CUE CMP sidecar carry their own numbers. To see which of them
-a given release moved, read that version's record in
-`platform-stack/cue/compatibility.cue` — it carries the paired `operatorVersion` and
-the upgrade's change class. `CLAUDE.md` § "Releases and version streams" holds the full
-map. The narrative, per-phase ledger this repository kept before ATM lives on in
-`docs/changelog/UNRELEASED.md` and `docs/changelog/plan-history.md`.
+**What a heading names.** Keep a Changelog assumes one artifact with one number. This
+is a monorepo: a release moves some subset of independently versioned streams, and
+their numbers are meant to differ. So a heading names **the streams that actually
+moved**, which is this repository's own long-standing convention:
+
+```
+## cli v0.2.75 — …                              a CLI-only release
+## platform-stack 0.2.77 / cli v0.2.74 — …      both moved
+## platform-stack 0.2.69 / operator v0.2.49 — … no CLI change, so no CLI tag
+```
+
+A CLI-only release carries no chart number because no chart was cut — the most common
+shape in this repository's history, not an edge case. The CLI is written with its `v`,
+identically to its git tag, which is what lets `release-cli.yml` find a release's notes
+by tag alone. Only two of the numbers are chosen by a human — the chart train and the
+CLI; the operator and cue-cmp versions cannot move without forcing a chart bump.
+`CLAUDE.md` § "Releases and version streams" holds the full map, and each chart
+release's record in `platform-stack/cue/compatibility.cue` carries its paired
+`operatorVersion` and change class.
+
+Everything from before ATM is frozen in `docs/changelog/history.md` — 237 sections of
+already-shipped work, kept because `release-cli.yml` still reads it for tags cut before
+the switch.
 
 ## [0.2.79]
 

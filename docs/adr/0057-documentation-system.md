@@ -1783,7 +1783,7 @@ distinct alias invocations type seven alias tokens — `t`, `ls`, `info`, `rm`,
 carries its own witness: `docs/dev-guide/quickstart.md` and
 `docs/operator-guide/`'s `backup-restore.md`, `quickstart.md`,
 `shared-volumes.md`, `target-store.md` and `troubleshooting.md`. (This ADR,
-`UNRELEASED.md` and `plan-history.md` all said *five*, copied from one slip in
+`history.md` and `plan-history.md` all said *five*, copied from one slip in
 the closing report's narrative — whose own table listed six. The seven
 invocations and seven tokens re-derive; the page count did not. A count is
 not an assertion, including this one: the command that produces it is on

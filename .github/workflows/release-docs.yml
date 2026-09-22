@@ -75,13 +75,12 @@ on:
       # The corpus and every static file mkdocs copies out of docs_dir
       # (the four root images, docs/reference/cli/commands.json).
       - 'docs/**'
-      # …minus the three tracked paths `exclude_docs` drops, which is
-      # the Re-evaluation bullet above, verbatim. Spelled as the two
-      # exact changelog FILES rather than `docs/changelog/**`, exactly as
-      # mkdocs.yml spells them: a future published page in that
+      # …minus the tracked paths `exclude_docs` drops, which is the
+      # Re-evaluation bullet above, verbatim. Spelled as the exact
+      # changelog FILE rather than `docs/changelog/**`, exactly as
+      # mkdocs.yml spells it: a future published page in that
       # directory must not be silently unreleasable.
-      - '!docs/changelog/UNRELEASED.md'
-      - '!docs/changelog/plan-history.md'
+      - '!docs/changelog/history.md'
       - '!docs/measurements/**'
       # nav, theme, site_url, the `hooks:` registration, exclude_docs.
       - 'mkdocs.yml'
