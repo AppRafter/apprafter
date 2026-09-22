@@ -19,6 +19,13 @@ members = [
 version      = "0.1.2"
 edition      = "2021"
 rust-version = "1.88"
+# Never published to crates.io: these crates are a product, not a library,
+# and nothing in .github/workflows runs `cargo publish`. Declaring it makes
+# that explicit rather than merely true by omission, stops an accidental
+# publish, and is what lets cargo-deny treat them as private — without it
+# the licence check reads `FSL-1.1-Apache-2.0` (a real licence, but not an
+# SPDX identifier) as "unlicensed" on our own code.
+publish      = false
 license      = "FSL-1.1-Apache-2.0"
 authors      = ["AppRafter Authors"]
 repository   = "https://github.com/apprafter/apprafter"

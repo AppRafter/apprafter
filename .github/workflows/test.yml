@@ -81,6 +81,35 @@ jobs:
       - working-directory: operator
         run: cargo test --all --all-features
 
+  # Dependency HEALTH, which is a different question from the version watcher's
+  # "are we behind?" — a dead crate sits on its own final release forever and so
+  # is never behind, and an advisory with no patched version is not a version
+  # gap either. The first run of this found five things the watcher had never
+  # reported: rsa/Marvin plus four unmaintained crates, all four arriving
+  # through a single dependency.
+  #
+  # It runs HERE rather than only in `just lint` because `just lint` is invoked
+  # by no workflow at all — a gate that lives only there fires only when
+  # somebody happens to type it.
+  #
+  # The job installs the binary and runs scripts/cargo-deny.sh rather than
+  # calling a cargo-deny action directly, so CI and a local run execute the
+  # SAME gate. Two invocations of the same tool with separately-maintained
+  # arguments is how a CI gate and its local twin drift apart.
+  cargo-deny:
+    name: cargo-deny (advisories, licences, sources)
+    needs: changes
+    if: needs.changes.outputs.rust_cli == 'true' || needs.changes.outputs.rust_operator == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: bash scripts/cargo-deny.sh
+
   bun:
     name: bun test
     needs: changes

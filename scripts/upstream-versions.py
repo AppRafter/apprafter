@@ -107,6 +107,11 @@ TOOL_MISSING = "TOOL-MISSING"
 UNREACHABLE = "UNREACHABLE"
 BEHIND = "BEHIND"
 CURRENT = "CURRENT"
+# On the newest published version and STILL a dead end -- an upstream blocker,
+# an abandoned project, a fork that has not landed. "Are we behind?" cannot see
+# this class at all, which is how a dead dependency reads healthier in this
+# report than a maintained one that ships often.
+HELD = "HELD"
 FLOATING = "FLOATING"
 AGGREGATE = "AGGREGATE"
 ERROR_STATUSES = {UNREADABLE, TOOL_MISSING, UNREACHABLE}
@@ -634,6 +639,14 @@ def process(pin: dict, do_gates: bool, tmp: Path) -> Row:
         if is_time and row.status == BEHIND:
             days = (int(latest) - min(int(v) for v in values)) // 86400
             row.detail = f"{days} days behind"
+        # A held pin keeps its NUMERIC compare on purpose. The tempting
+        # `compare: "none"` would park it in the floating section forever, and
+        # then the row would never flip when the blocker finally expires --
+        # which is precisely the event this class exists to make loud. Holding
+        # only diverts a row that is CURRENT; the moment upstream releases past
+        # it the row is BEHIND and leaves for the behind table on its own.
+        if pin.get("held") and row.status == CURRENT:
+            row.status = HELD
 
     # --- stage 2
     gate = pin.get("gate")
@@ -670,6 +683,7 @@ def render(rows: list[Row], inv: dict, gates_on: bool) -> str:
     drifted = [r for r in rows if r.drift]
     behind = [r for r in rows if r.status == BEHIND]
     current = [r for r in rows if r.status == CURRENT]
+    held = [r for r in rows if r.status == HELD]
     floating = [r for r in rows if r.status == FLOATING]
     aggregates = [r for r in rows if r.status == AGGREGATE]
     red = [r for r in behind if r.gate.outcome == "fail"]
@@ -686,6 +700,7 @@ def render(rows: list[Row], inv: dict, gates_on: bool) -> str:
     L.append("")
     L.append(
         f"**{len(rows)} entries: {len(behind)} behind, {len(current)} up to date, "
+        f"{len(held)} held, "
         f"{len(drifted)} drifted, {len(floating)} floating/manual, "
         f"{len(aggregates)} aggregates, {len(errors)} could not be checked.** "
         f"Of the {len(behind)} behind, {len(green)} passed their gate and {len(red)} went red"
@@ -751,6 +766,28 @@ def render(rows: list[Row], inv: dict, gates_on: bool) -> str:
     else:
         L.append("None.")
         L.append("")
+
+    L.append("## Held: on the newest release and still a dead end")
+    L.append("")
+    L.append(
+        "NOT behind, and NOT fine. Each of these is on its newest published version "
+        "and stuck there for a stated reason -- an upstream blocker, an abandoned "
+        "project, a fork nobody has picked. A check that asks only *are we behind* "
+        "reports nothing for this class, which is how an abandoned dependency comes "
+        "to read healthier here than a maintained one that ships every week. "
+        "When `upstream newest` moves past `in tree` the row leaves this section for "
+        "the behind table -- that is the blocker expiring, and it is the event this "
+        "section exists to make loud."
+    )
+    L.append("")
+    L += (
+        table(
+            ["pin", "in tree", "upstream newest", "why it is held"],
+            [[f"`{r.id}`", f"`{r.current}`", f"`{r.available}`", r.pin.get("heldReason", "-")] for r in held],
+        )
+        if held
+        else ["None.", ""]
+    )
 
     L.append("## Up to date")
     L.append("")

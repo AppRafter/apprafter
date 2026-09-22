@@ -734,6 +734,60 @@
     },
 
     {
+      "id": "crate-rsa",
+      "class": "cargo-crate",
+      "title": "rsa (held)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "cli/Cargo.lock", "pattern": "name = \"rsa\"\nversion = \"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "crates-io", "crate": "rsa" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "Nothing to gate: the pin cannot move. See heldReason.",
+      "held": true,
+      "heldReason": "ON the newest stable and stuck. 0.10 has been in RC since 2025 (rc.18, 2026-04-27) and does NOT fix RUSTSEC-2023-0071 -- the advisory's patched list is empty and RustCrypto/RSA#626 is open. The real gate is `pkcs1` 0.8.0 final (RustCrypto/formats#2385, not started), because `from_pkcs1_pem` is a production call at cli/cli-providers/src/cert.rs:89. The advisory is NOT reachable here: the only production RsaPrivateKey use is cert.rs:67, to_public_key() + compare, and every .decrypt() is #[cfg(test)]. The algorithm is not ours to pick either -- RSA-OAEP is in the type signature of sealed-secrets' own Unseal(). Tracked as an explicit ignore in deny.toml. NOTE removing rsa alone would NOT unify the RustCrypto generation: `age` holds digest 0.10 / rand_core 0.6 independently -- see crate-age.",
+      "note": "Per-crate entry because the cargo AGGREGATE below reports a COUNT and cannot name a crate, and because a `behind latest` check reports nothing for a crate that is already on latest."
+    },
+    {
+      "id": "crate-serde-yaml",
+      "class": "cargo-crate",
+      "title": "serde_yaml (held -- archived)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "cli/Cargo.lock", "pattern": "name = \"serde_yaml\"\nversion = \"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "crates-io", "crate": "serde_yaml" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "Nothing to gate: the crate is archived, so there is no candidate version to try.",
+      "held": true,
+      "heldReason": "ARCHIVED. The newest published version is literally named `0.9.34+deprecated` (2024-03-25); dtolnay deprecated and archived the crate. cargo-deny does NOT catch this one -- there is no RUSTSEC advisory for it -- so without this entry it is invisible to every gate in the tree while reading as perfectly up to date. Successors exist (serde_yaml_ng, serde_norway, serde_yml) but differ in YAML 1.1/1.2 edge-case behaviour, and this repo parses YAML that USERS write, so the swap is a judged product decision rather than a rename. Tracked as WI-367.",
+      "note": "A workspace dependency in BOTH Cargo workspaces; used in cli-core, docsgen and the platform-stack tooling."
+    },
+    {
+      "id": "crate-age",
+      "class": "cargo-crate",
+      "title": "age (held -- holds the old RustCrypto generation)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "cli/Cargo.lock", "pattern": "name = \"age\"\nversion = \"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "crates-io", "crate": "age" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "Nothing to gate while it is on latest; the blocker is upstream's own dependency choice.",
+      "held": true,
+      "heldReason": "On the newest release and still pinning the OLD RustCrypto generation -- digest 0.10, generic-array 0.14, rand_core 0.6 -- independently of the rsa crate. Listed because the obvious conclusion from the rsa entry (\"remove rsa and the generation unifies\") is WRONG: both hold it, so any plan to move cli/backup-core onto sha2 0.11 / rand 0.9 has to clear this one too. Used for the age-encrypted state cache (cli/cli-core/src/secrets.rs).",
+      "note": "Encrypts the kubeconfig and argocd password cached under ~/.config/apprafter."
+    },
+    {
       "id": "deps-cargo-cli",
       "class": "package-manager",
       "title": "cargo dependencies (cli/ workspace)",

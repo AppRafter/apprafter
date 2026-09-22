@@ -41,6 +41,12 @@ lint:
     ./scripts/check-component-enablement.sh
     ./scripts/check-version-coherence.sh
     ./scripts/check-plan-checkboxes.sh
+    # Dependency health — advisories, unmaintained crates, licences, sources.
+    # A different question from the version watcher's "are we behind?", which
+    # cannot see an abandoned crate (it sits on its own final release forever)
+    # or an advisory with no patched version. Also runs in CI (test.yml), since
+    # this recipe is invoked by no workflow.
+    ./scripts/cargo-deny.sh
     # `docs-check.sh` byte-compares the generated CLI reference against a
     # fresh render, which cannot see a defect present in BOTH — a doc
     # comment that hard-wraps inside a token renders identically twice and

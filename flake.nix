@@ -38,6 +38,13 @@
             clippy
             rust-analyzer
 
+            # Dependency health, which the version watcher cannot see: an
+            # abandoned crate sits on its own final release forever and so is
+            # never "behind". `scripts/cargo-deny.sh` falls back to
+            # `nix run nixpkgs#cargo-deny` without this, but having it in the
+            # shell keeps the dev-loop run fast.
+            cargo-deny
+
             # JavaScript / TypeScript runtime (for Backstage tooling)
             bun
 
