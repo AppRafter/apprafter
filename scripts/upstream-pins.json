@@ -35,13 +35,27 @@
     "  compare   numeric -- compare the digit-runs of both strings, newest wins.",
     "            major   -- report only when the leading number increases (for `@v4`-style",
     "                       refs that float within their major on purpose).",
+    "            minor   -- report only when (major, minor) increases, for pins written as a",
+    "                       minor (`1.98`, `24.12`) whose patch floats on purpose. Under",
+    "                       `numeric` every patch release would read as BEHIND.",
     "            none    -- floating by design or not semver-comparable; never reported as",
     "                       behind. Requires `note` saying why.",
     "  gate      Stage 2. What to run against the CANDIDATE version, and what a green",
     "            actually proves. null requires `gateGap` -- the reason no cluster-free gate",
     "            exists. The report prints `proves` beside every pass, so a green can never",
     "            read as more than it is.",
-    "  note      anything a triager needs that is not obvious from the row."
+    "  note      anything a triager needs that is not obvious from the row.",
+    "",
+    "`{major}` in an upstream field is replaced by the leading number of the in-tree value",
+    "(\"the newest 24.x\"). Derived rather than written so the entry follows the tree when",
+    "it moves to a new major instead of silently reporting it as ahead of upstream.",
+    "",
+    "GITHUB ACTIONS are pinned by commit SHA with the release as a trailing comment",
+    "(`uses: owner/repo@<40-hex> # vX.Y.Z`; scripts/check-workflows.sh enforces the shape,",
+    "one SHA per action, one comment per SHA, and with --remote that the comment IS that",
+    "commit). Their entries therefore read the COMMENT, never the ref, and compare it",
+    "`numeric`: a SHA freezes the patch stream too, so a new release of any size reaches",
+    "this repository only when this report says so."
   ],
 
   "notCoveredClasses": [
@@ -49,11 +63,6 @@
       "class": "mise.toml tool pins",
       "where": "mise.toml:9-13 (rust=stable, bun=latest, node=lts, just=latest, go=latest)",
       "why": "Floating by design. flake.nix is the authoritative tool-belt per CLAUDE.md; mise.toml is dev ergonomics. Converting these to concrete versions would buy a new stream of bumps for a file that is not what CI uses."
-    },
-    {
-      "class": "dtolnay/rust-toolchain@stable",
-      "where": "13 workflows",
-      "why": "`stable` is the intended floating ref, not a stale pin. Tracked as a github-action entry with compare:none so it still appears in the report."
     }
   ],
 
@@ -539,42 +548,42 @@
       "id": "action-actions-checkout",
       "class": "github-action",
       "title": "actions/checkout",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/checkout@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/checkout@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "actions/checkout" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
-      "gateGap": "An action major bump can only be tested by running the workflows that use it. That is a pull request, not a script -- and it is the one class where opening a PR really is the right tool.",
-      "note": "46 uses -- the most-used action in the tree. The count is prose, not something the watcher computes, so re-derive it rather than trusting it: grep -c 'uses: actions/checkout@' .github/workflows/*.yml"
+      "gateGap": "An action bump can only be tested by running the workflows that use it. That is a pull request, not a script -- and it is the one class where opening a PR really is the right tool.",
+      "note": "47 uses -- the most-used action in the tree. The count is prose, not something the watcher computes, so re-derive it rather than trusting it: grep -c 'uses: actions/checkout@' .github/workflows/*.yml"
     },
     {
       "id": "action-setup-cue",
       "class": "github-action",
       "title": "cue-lang/setup-cue",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: cue-lang/setup-cue@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: cue-lang/setup-cue@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "cue-lang/setup-cue" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
-      "note": "Pinned to a full patch tag (v1.0.1), unlike the other actions which float within a major."
+      "note": "The action only installs cue; the cue VERSION is its `version:` input, which is tool-cue."
     },
     {
       "id": "action-rust-toolchain",
       "class": "github-action",
       "title": "dtolnay/rust-toolchain",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: dtolnay/rust-toolchain@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: dtolnay/rust-toolchain@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "none" },
       "compare": "none",
       "gate": null,
-      "gateGap": "Nothing to bump.",
-      "note": "`@stable` is a branch ref and the intended floating pin -- the action publishes a branch per toolchain channel. Listed so it is not mistaken for an unwatched pin."
+      "gateGap": "See actions/checkout.",
+      "note": "Publishes no releases: a branch per toolchain channel (`stable`, `1.98`, ...) plus `master`, and one tag, `v1`, which followed `master` when this was pinned (2026-09-22) -- hence the `# v1` comment. The old `@stable` was a BRANCH ref that also chose the toolchain; at a commit the toolchain is the required `toolchain:` input, tracked by rust-toolchain-minor. Nothing to compare: to refresh, pin the current `master` commit and run scripts/check-workflows.sh --remote, which fails if `v1` has moved on."
     },
     {
       "id": "action-setup-helm",
       "class": "github-action",
       "title": "azure/setup-helm",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: azure/setup-helm@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: azure/setup-helm@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "Azure/setup-helm" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": null
@@ -583,9 +592,9 @@
       "id": "action-setup-buildx",
       "class": "github-action",
       "title": "docker/setup-buildx-action",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: docker/setup-buildx-action@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: docker/setup-buildx-action@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "docker/setup-buildx-action" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": null
@@ -594,9 +603,9 @@
       "id": "action-login",
       "class": "github-action",
       "title": "docker/login-action",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: docker/login-action@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: docker/login-action@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "docker/login-action" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": null
@@ -605,9 +614,9 @@
       "id": "action-build-push",
       "class": "github-action",
       "title": "docker/build-push-action",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: docker/build-push-action@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: docker/build-push-action@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "docker/build-push-action" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": "Every published image in this repo goes through this action; a major bump touches all five release workflows at once."
@@ -616,9 +625,9 @@
       "id": "action-setup-kubectl",
       "class": "github-action",
       "title": "azure/setup-kubectl",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: azure/setup-kubectl@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: azure/setup-kubectl@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "Azure/setup-kubectl" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": null
@@ -627,9 +636,9 @@
       "id": "action-cache",
       "class": "github-action",
       "title": "actions/cache",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/cache@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/cache@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "actions/cache" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": null
@@ -638,9 +647,9 @@
       "id": "action-setup-bun",
       "class": "github-action",
       "title": "oven-sh/setup-bun",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: oven-sh/setup-bun@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: oven-sh/setup-bun@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "oven-sh/setup-bun" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": null
@@ -649,9 +658,9 @@
       "id": "action-paths-filter",
       "class": "github-action",
       "title": "dorny/paths-filter",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: dorny/paths-filter@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: dorny/paths-filter@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "dorny/paths-filter" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": "Decides which of lint.yml/test.yml's jobs run at all; a silent behaviour change here would look like tests passing."
@@ -660,20 +669,20 @@
       "id": "action-nix-installer",
       "class": "github-action",
       "title": "DeterminateSystems/nix-installer-action",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: DeterminateSystems/nix-installer-action@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: DeterminateSystems/nix-installer-action@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "DeterminateSystems/nix-installer-action" },
-      "compare": "none",
+      "compare": "numeric",
       "gate": null,
-      "gateGap": "Nothing to bump while it is pinned to a branch.",
-      "note": "PINNED TO @main IN THREE WORKFLOWS (crd-check.yml:43, docs.yml:118, release-docs.yml:173). That is a floating branch ref on a third-party action that runs in a job with repository write scope. It is the only unpinned action in the tree and the only entry here whose fix is to STOP floating; compare is `none` because there is nothing to compare, not because it is fine. The report shows upstream's newest tag so the hand-pin is a copy-paste."
+      "gateGap": "See actions/checkout.",
+      "note": "Upstream publishes integer releases (v21, v22, v23) and no semver tags, so the comment is `# v23`. The pin bounds the ACTION only; it installs the newest Determinate Nix regardless -- flake.lock is what pins the cue and cargo the jobs run. It runs in release-docs.yml, which holds `packages: write`."
     },
     {
       "id": "action-rust-cache",
       "class": "github-action",
       "title": "Swatinem/rust-cache",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: Swatinem/rust-cache@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: Swatinem/rust-cache@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "Swatinem/rust-cache" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": null
@@ -682,20 +691,20 @@
       "id": "action-cosign-installer",
       "class": "github-action",
       "title": "sigstore/cosign-installer",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: sigstore/cosign-installer@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: sigstore/cosign-installer@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "sigstore/cosign-installer" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
-      "note": null
+      "note": "Upstream publishes vX.Y.Z tags only -- no `v4` major tag or branch -- so the `@v4` this replaced resolved to nothing and both signing workflows would have failed at job set-up. Keep full-version comments here. The cosign binary itself is the `cosign-release:` input (v2.4.1, deliberately held below the v3 this action defaults to)."
     },
     {
       "id": "action-setup-oras",
       "class": "github-action",
       "title": "oras-project/setup-oras",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: oras-project/setup-oras@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: oras-project/setup-oras@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "oras-project/setup-oras" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": "Carries the channel-tag publish path (ADR 0041)."
@@ -704,9 +713,9 @@
       "id": "action-semantic-pr",
       "class": "github-action",
       "title": "amannn/action-semantic-pull-request",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: amannn/action-semantic-pull-request@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: amannn/action-semantic-pull-request@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "amannn/action-semantic-pull-request" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": "One of the two Conventional Commits enforcement points (the other is scripts/check-commit-msg.sh)."
@@ -715,9 +724,9 @@
       "id": "action-upload-artifact",
       "class": "github-action",
       "title": "actions/upload-artifact",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/upload-artifact@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/upload-artifact@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "actions/upload-artifact" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": null
@@ -726,12 +735,43 @@
       "id": "action-download-artifact",
       "class": "github-action",
       "title": "actions/download-artifact",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/download-artifact@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/download-artifact@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "actions/download-artifact" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": "Must move in lockstep with upload-artifact -- v3 and v4 artefacts are not interoperable."
+    },
+    {
+      "id": "action-install-action",
+      "class": "github-action",
+      "title": "taiki-e/install-action",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: taiki-e/install-action@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
+      "upstream": { "kind": "github-release", "repo": "taiki-e/install-action" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "See actions/checkout.",
+      "note": "Installs cargo-deny for test.yml. Releases several times a week, mostly to refresh its tool manifest, so expect this row BEHIND most weeks. That is not noise: the pinned commit also fixes WHICH cargo-deny gets installed, and an old cargo-deny can stop parsing a newer advisory database."
+    },
+
+    {
+      "id": "rust-toolchain-minor",
+      "class": "toolchain-minor",
+      "title": "Rust toolchain minor (CI, builder images, mise, cli/)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".github/workflows/*.yml", "pattern": "(?m)^\\s+toolchain:\\s*\"([^\"]+)\"" },
+          { "files": "*Dockerfile", "pattern": "FROM docker\\.io/library/rust:(\\d+\\.\\d+)-" },
+          { "files": "mise.toml", "pattern": "(?m)^rust\\s*=\\s*\"([^\"]+)\"" },
+          { "files": "cli/rust-toolchain.toml", "pattern": "(?m)^channel\\s*=\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "rust-lang/rust" },
+      "compare": "minor",
+      "gate": null,
+      "gateGap": "A Rust minor is proven by the whole cargo test + clippy matrix under the candidate, i.e. test.yml and lint.yml on a pull request that moves every copy at once. A watch job cannot run that honestly.",
+      "note": "One decision, four surfaces: CI's dtolnay/rust-toolchain `toolchain:` input, the rust:<minor>-alpine builder images, mise.toml, and cli/rust-toolchain.toml. The last OVERRIDES the first inside cli/ (rustup: toolchain file beats `rustup default`), so a `stable` there silently un-pins every cli/ job in CI, release-cli.yml included -- and the release matrix's cross target is installed for the pinned toolchain only. Minor pinned, patch floats. The flake's nixpkgs rustc is not written in the tree and is not read here (1.95 at the locked rev)."
     },
 
     {

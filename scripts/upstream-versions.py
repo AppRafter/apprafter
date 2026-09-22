@@ -7,6 +7,7 @@ Run from the repository root:
 
     python3 scripts/upstream-versions.py                  # report + gates
     python3 scripts/upstream-versions.py --no-gates       # report only, fast
+    python3 scripts/upstream-versions.py --read-only      # tree only, no network
     python3 scripts/upstream-versions.py --only tool-cue  # one entry
     python3 scripts/upstream-versions.py -o report.md     # write instead of stdout
 
@@ -71,7 +72,18 @@ COMPARISON
 semver and it handles the tag shapes in this tree, which semver does not.
 Candidates whose tag looks like a prerelease are dropped. `major` reports only
 when the leading number grows, for refs like `@v4` that float within a major on
-purpose. `none` never reports "behind" and requires a note saying why.
+purpose. `minor` reports only when (major, minor) grows, for pins written as a
+minor (`1.98`, `24.12`) whose patch floats on purpose -- the owner's "pin the
+minor, let the patch float" rule; under `numeric` every patch release would
+read as BEHIND against a value that deliberately carries no patch. `none` never
+reports "behind" and requires a note saying why.
+
+An upstream field may contain `{major}`, replaced by the leading number of the
+in-tree value before upstream is asked -- "the newest 24.x", for a pin that
+tracks minors within a major it chose deliberately. Deriving it from the tree
+rather than writing `24` into the inventory is what keeps the entry honest the
+day the tree moves to 26: a hard-coded 24 would then report the tree as ahead
+of upstream, i.e. CURRENT, forever.
 """
 
 from __future__ import annotations
@@ -115,6 +127,7 @@ HELD = "HELD"
 FLOATING = "FLOATING"
 AGGREGATE = "AGGREGATE"
 ERROR_STATUSES = {UNREADABLE, TOOL_MISSING, UNREACHABLE}
+COMPARES = {"numeric", "major", "minor", "none"}
 
 
 class Failure(Exception):
@@ -616,6 +629,16 @@ def process(pin: dict, do_gates: bool, tmp: Path) -> Row:
 
     # --- newest upstream
     up = pin["upstream"]
+    if any("{major}" in v for v in up.values() if isinstance(v, str)):
+        majors = sorted({str(numeric_key(v)[0]) for v in values})
+        if len(majors) != 1 or majors[0] == "-1":
+            row.status = UNREADABLE
+            row.error = (
+                f"upstream uses {{major}} but the tree holds {len(majors)} majors "
+                f"({', '.join(values)}) -- the placeholder needs exactly one"
+            )
+            return row
+        up = {k: v.replace("{major}", majors[0]) if isinstance(v, str) else v for k, v in up.items()}
     if up["kind"] == "none":
         row.status = FLOATING
         row.available = "n/a"
@@ -633,6 +656,10 @@ def process(pin: dict, do_gates: bool, tmp: Path) -> Row:
         elif compare == "major":
             behind = numeric_key(latest)[:1] > numeric_key(max(values, key=numeric_key))[:1]
             row.status = BEHIND if behind else CURRENT
+        elif compare == "minor":
+            # The OLDEST value, as under `numeric`: one stale copy is enough.
+            oldest = min(values, key=numeric_key)
+            row.status = BEHIND if numeric_key(latest)[:2] > numeric_key(oldest)[:2] else CURRENT
         else:
             oldest = min(values, key=numeric_key)
             row.status = BEHIND if numeric_key(latest) > numeric_key(oldest) else CURRENT
@@ -871,6 +898,10 @@ def validate_inventory(pins: list[dict]) -> list[str]:
                 problems.append(f"{pid}: missing `{field}`")
         if pin.get("gate") is None and not pin.get("gateGap"):
             problems.append(f"{pid}: no gate and no gateGap saying why")
+        if pin.get("compare") and pin.get("compare") not in COMPARES:
+            # Without this a typo fell through to the numeric branch and
+            # reported as if it had been meant.
+            problems.append(f"{pid}: unknown compare `{pin.get('compare')}` (one of {', '.join(sorted(COMPARES))})")
         if pin.get("compare") == "none" and not pin.get("note"):
             problems.append(f"{pid}: compare `none` needs a note saying why it floats")
         up = pin.get("upstream", {})
@@ -884,9 +915,46 @@ def validate_inventory(pins: list[dict]) -> list[str]:
     return problems
 
 
+def read_only(pins: list[dict]) -> int:
+    """Stage 0 alone: can every entry still READ its value out of the tree?
+
+    The cheap half of the watcher's contract, runnable offline after any edit
+    that moves a pin -- the failure it exists for is a pattern that quietly
+    stopped matching, which a full run would also report, but only after
+    asking fifty upstreams. `command` readers run a package manager rather
+    than read text, so they are listed as not read instead of being run.
+    """
+    unreadable = 0
+    for pin in pins:
+        read = pin["read"]
+        if read["kind"] == "command":
+            print(f"SKIP        {pin['id']}: `command` reader -- runs `{' '.join(read['cmd'])}`, not a tree read")
+            continue
+        try:
+            found = read_regex(read) if read["kind"] == "regex" else read_json_path(read)
+        except Failure as exc:
+            unreadable += 1
+            print(f"{UNREADABLE}  {pin['id']}: {exc}")
+            continue
+        values = sorted({v for v, _ in found})
+        drift = len(values) > 1 and not pin.get("multipleValuesOk")
+        print(
+            f"{'DRIFT' if drift else 'READ':<11} {pin['id']}: {', '.join(values)} "
+            f"({len(found)} site(s) in {len({p for _, p in found})} file(s))"
+        )
+    sys.stdout.flush()
+    print(f"\n{len(pins)} entries, {unreadable} unreadable.", file=sys.stderr)
+    return 1 if unreadable else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--no-gates", action="store_true", help="stage 1 only: do not try candidates")
+    ap.add_argument(
+        "--read-only",
+        action="store_true",
+        help="read every pin out of the tree and stop: no upstream query, no gate, no network",
+    )
     ap.add_argument("--only", action="append", default=[], metavar="ID", help="restrict to these pin ids")
     ap.add_argument("-o", "--output", metavar="FILE", help="write the report here instead of stdout")
     args = ap.parse_args()
@@ -915,6 +983,13 @@ def main() -> int:
         # The inventory becoming empty must never read as "all clear".
         print(f"ERROR: {INVENTORY} declares no pins.", file=sys.stderr)
         return 2
+
+    if args.read_only:
+        if args.output:
+            # A report file that is silently never written is worse than an error.
+            print("--read-only prints to stdout and writes no report; drop -o", file=sys.stderr)
+            return 2
+        return read_only(pins)
 
     rows: list[Row] = []
     with tempfile.TemporaryDirectory(prefix="upstream-watch-") as td:
