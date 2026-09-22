@@ -1227,6 +1227,7 @@ mod tests {
             _ns: &str,
             _argv: &[&str],
             out: &Path,
+            _first_output_within: Option<std::time::Duration>,
         ) -> Result<()> {
             if let Some(parent) = out.parent() {
                 std::fs::create_dir_all(parent).unwrap();

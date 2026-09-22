@@ -159,15 +159,17 @@ pub fn apply_and_wait_pod_ready(k: &dyn KubeExec, spec: &Value) -> Result<()> {
 }
 
 /// Stream data DOWN from a pod to a local file (backup extraction).
-/// Delegates to [`KubeExec::exec_stream_to_file`].
+/// Delegates to [`KubeExec::exec_stream_to_file`], which says what
+/// `first_output_within` bounds.
 pub fn exec_stream_to_file(
     k: &dyn KubeExec,
     pod: &str,
     ns: &str,
     argv: &[&str],
     out_path: &Path,
+    first_output_within: Option<std::time::Duration>,
 ) -> Result<()> {
-    k.exec_stream_to_file(pod, ns, argv, out_path)
+    k.exec_stream_to_file(pod, ns, argv, out_path, first_output_within)
 }
 
 /// Stream data UP from a local file into a pod (restore / LoadData L2).

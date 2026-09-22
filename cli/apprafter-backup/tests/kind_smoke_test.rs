@@ -225,6 +225,9 @@ fn smoke_kube_rs_exec_against_a_kind_cluster() {
             "printf 'hello\\n'; head -c 1048576 /dev/zero | tr '\\0' x",
         ],
         &out,
+        // Bounded, so the timed first read and the copy after it both run
+        // against a real stream: the whole of it must still arrive.
+        Some(std::time::Duration::from_secs(60)),
     )
     .expect("exec_stream_to_file");
     let got = std::fs::read(&out).unwrap();
@@ -233,7 +236,13 @@ fn smoke_kube_rs_exec_against_a_kind_cluster() {
 
     // --- exec: a non-zero exit is an error carrying the apiserver's Status ----
     let err = k
-        .exec_stream_to_file(POD, NS, &["sh", "-c", "exit 3"], &dir.path().join("x"))
+        .exec_stream_to_file(
+            POD,
+            NS,
+            &["sh", "-c", "exit 3"],
+            &dir.path().join("x"),
+            None,
+        )
         .expect_err("a non-zero exit must fail the step");
     let msg = format!("{err}");
     assert!(

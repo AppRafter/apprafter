@@ -40,7 +40,7 @@ use kube::api::{
 };
 use kube::discovery::{self, ApiResource};
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Field manager used for the server-side apply of helper Pods. Distinct from
 /// the operator's `apprafter-operator` and the CLI's other managers so its
@@ -355,7 +355,14 @@ impl KubeExec for KubeRsExec {
         })
     }
 
-    fn exec_stream_to_file(&self, pod: &str, ns: &str, argv: &[&str], out: &Path) -> Result<()> {
+    fn exec_stream_to_file(
+        &self,
+        pod: &str,
+        ns: &str,
+        argv: &[&str],
+        out: &Path,
+        first_output_within: Option<std::time::Duration>,
+    ) -> Result<()> {
         self.rt.block_on(async {
             let api: Api<Pod> = Api::namespaced(self.client.clone(), ns);
             let ap = AttachParams::default()
@@ -386,15 +393,41 @@ impl KubeExec for KubeRsExec {
                 ))
             })?;
 
-            // Stream the whole process stdout to the file.
+            let copy_error = |e: std::io::Error| {
+                CliError::Other(format!(
+                    "exec_stream_to_file: copy command stdout to {}: {e}",
+                    out.display()
+                ))
+            };
+
+            // The first read is timed when the caller bounded it: see
+            // `KubeExec::exec_stream_to_file`. Abandoning the exec ends this
+            // side only — the command keeps running in its pod until the pod
+            // goes, which is the caller's helper-pod guard, straight after.
+            if let Some(bound) = first_output_within {
+                let mut first = vec![0u8; 64 * 1024];
+                match tokio::time::timeout(bound, proc_stdout.read(&mut first)).await {
+                    Err(_elapsed) => {
+                        attached.abort();
+                        return Err(backup_core::kube::no_output_error(
+                            "exec_stream_to_file",
+                            argv,
+                            ns,
+                            pod,
+                            bound,
+                        ));
+                    }
+                    Ok(read) => {
+                        let n = read.map_err(copy_error)?;
+                        file.write_all(&first[..n]).await.map_err(copy_error)?;
+                    }
+                }
+            }
+
+            // Stream the (rest of the) process stdout to the file.
             tokio::io::copy(&mut proc_stdout, &mut file)
                 .await
-                .map_err(|e| {
-                    CliError::Other(format!(
-                        "exec_stream_to_file: copy command stdout to {}: {e}",
-                        out.display()
-                    ))
-                })?;
+                .map_err(copy_error)?;
             file.flush().await.map_err(|e| {
                 CliError::Other(format!(
                     "exec_stream_to_file: flush output file {}: {e}",
@@ -757,8 +790,6 @@ impl StderrCapture {
 
 /// Read `reader` to EOF (or its first error) into a [`StderrCapture`].
 async fn drain_stderr<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> StderrCapture {
-    use tokio::io::AsyncReadExt;
-
     let mut capture = StderrCapture::default();
     let mut buf = [0u8; 8192];
     loop {

@@ -3799,6 +3799,7 @@ mod tests {
             _ns: &str,
             _argv: &[&str],
             _out: &Path,
+            _first_output_within: Option<std::time::Duration>,
         ) -> Result<()> {
             unreachable!("restore never streams a pod's stdout to a file")
         }

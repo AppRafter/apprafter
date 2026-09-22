@@ -1081,6 +1081,34 @@ fn format_exec_error(
     }
 }
 
+/// Copy an exec's stdout to `out`, sending one message on `first_byte` as
+/// soon as the first byte has been read (before it is written), and never
+/// sending it for a command that wrote nothing.
+fn copy_exec_stdout<R: Read>(
+    stdout: R,
+    mut out: std::fs::File,
+    first_byte: Option<std::sync::mpsc::Sender<()>>,
+) -> Result<()> {
+    let copy_error =
+        |e: io::Error| CliError::Other(format!("copy kubectl exec stdout → file: {e}"));
+    let mut reader = BufReader::new(stdout);
+    if let Some(first_byte) = first_byte {
+        let chunk = loop {
+            match reader.fill_buf() {
+                Ok(chunk) => break chunk.len(),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(copy_error(e)),
+            }
+        };
+        if chunk == 0 {
+            return Ok(());
+        }
+        let _ = first_byte.send(());
+    }
+    io::copy(&mut reader, &mut out).map_err(copy_error)?;
+    Ok(())
+}
+
 impl KubeExec for KubectlExec {
     fn apply_and_wait_pod_ready(&self, spec: &serde_json::Value) -> Result<()> {
         let name = spec["metadata"]["name"]
@@ -1174,6 +1202,7 @@ impl KubeExec for KubectlExec {
         ns: &str,
         argv: &[&str],
         out_path: &Path,
+        first_output_within: Option<Duration>,
     ) -> Result<()> {
         let mut cmd = Command::new(&self.kubectl_bin);
         cmd.arg("exec")
@@ -1201,12 +1230,43 @@ impl KubeExec for KubectlExec {
 
         let stderr_buf = spawn_capturing_drainer(stderr);
 
-        let mut out_file = std::fs::File::create(out_path).map_err(|e| {
+        let out_file = std::fs::File::create(out_path).map_err(|e| {
             CliError::Other(format!("create output file {}: {e}", out_path.display()))
         })?;
-        let mut reader = BufReader::new(stdout);
-        io::copy(&mut reader, &mut out_file)
-            .map_err(|e| CliError::Other(format!("copy kubectl exec stdout → file: {e}")))?;
+        match first_output_within {
+            None => copy_exec_stdout(stdout, out_file, None)?,
+            Some(bound) => {
+                // The copy runs on its own thread so this one can stop
+                // waiting: the copier reports its first byte, and a command
+                // that has written nothing by `bound` has kubectl killed under
+                // it. kubectl is one process, so killing it closes the pipe
+                // and the copier ends; it is not joined all the same, because
+                // anything else holding the pipe open would hold this call.
+                let (first_byte, first_byte_seen) = std::sync::mpsc::channel();
+                let copier =
+                    thread::spawn(move || copy_exec_stdout(stdout, out_file, Some(first_byte)));
+                match first_byte_seen.recv_timeout(bound) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(backup_core::kube::no_output_error(
+                            "exec_stream_to_file",
+                            argv,
+                            ns,
+                            pod,
+                            bound,
+                        ));
+                    }
+                    // The first byte arrived, or the copier already finished
+                    // (EOF before any output, or a write error): either way
+                    // the copy's own result says the rest.
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+                }
+                copier.join().map_err(|_| {
+                    CliError::Other("copy kubectl exec stdout → file: the copy panicked".into())
+                })??;
+            }
+        }
 
         let status = child
             .wait()
@@ -9783,7 +9843,7 @@ mod tests {
             ),
         );
         let out = dir.path().join("dump.sql");
-        k.exec_stream_to_file("pg-0", "prod", &["pg_dump", "-Fc"], &out)
+        k.exec_stream_to_file("pg-0", "prod", &["pg_dump", "-Fc"], &out, None)
             .unwrap();
 
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "DUMPBYTES");
@@ -9802,7 +9862,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let k = stub_kubectl(&dir, "echo 'pg_dump: server version mismatch' >&2\nexit 7");
         let err = k
-            .exec_stream_to_file("pg-0", "prod", &["pg_dump"], &dir.path().join("out"))
+            .exec_stream_to_file("pg-0", "prod", &["pg_dump"], &dir.path().join("out"), None)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("exec_stream_to_file"), "{msg}");
@@ -9811,6 +9871,102 @@ mod tests {
             msg.contains("pg_dump: server version mismatch"),
             "the pod's own error is the only useful part: {msg}"
         );
+    }
+
+    /// Run `exec_stream_to_file` on a thread and give up after `watchdog`, so
+    /// a missing bound FAILS the test instead of hanging it.
+    fn stream_with_watchdog(
+        k: KubectlExec,
+        out: PathBuf,
+        bound: Option<Duration>,
+        watchdog: Duration,
+    ) -> (Duration, Result<()>) {
+        let (done, finished) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let result =
+                k.exec_stream_to_file("bk-pg-db", "prod", &["pg_dump", "-Fc"], &out, bound);
+            let _ = done.send((started.elapsed(), result));
+        });
+        finished
+            .recv_timeout(watchdog)
+            .unwrap_or_else(|_| panic!("exec_stream_to_file still running after {watchdog:?}"))
+    }
+
+    #[test]
+    fn a_command_that_writes_nothing_within_the_bound_is_abandoned() {
+        // The shape of a pg_dump waiting on a lock during its schema read:
+        // alive, silent, and not about to change.
+        let dir = tempfile::tempdir().unwrap();
+        let k = stub_kubectl(&dir, "exec sleep 60");
+        let bound = Duration::from_secs(1);
+        let (elapsed, result) = stream_with_watchdog(
+            k,
+            dir.path().join("out"),
+            Some(bound),
+            Duration::from_secs(20),
+        );
+        let err = result.expect_err("a command silent past its bound must fail");
+        assert!(backup_core::kube::is_no_output_error(&err), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("prod/bk-pg-db"), "{msg}");
+        assert!(
+            elapsed >= bound,
+            "gave up after {elapsed:?}, before the bound"
+        );
+        assert!(
+            elapsed < bound + Duration::from_secs(5),
+            "gave up after {elapsed:?}, well past the {bound:?} bound"
+        );
+    }
+
+    #[test]
+    fn the_bound_times_only_the_first_byte() {
+        // Writing at once and then going quiet for longer than the bound is a
+        // dump copying a large table: it must run to the end.
+        let dir = tempfile::tempdir().unwrap();
+        let k = stub_kubectl(&dir, "printf 'PGDMP'\nsleep 3\nprintf 'REST'");
+        let out = dir.path().join("out");
+        let (_, result) = stream_with_watchdog(
+            k,
+            out.clone(),
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(20),
+        );
+        result.expect("a command that wrote in time is never cut");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "PGDMPREST");
+    }
+
+    #[test]
+    fn a_first_byte_that_arrives_inside_the_bound_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = stub_kubectl(&dir, "sleep 1\nprintf 'PGDMP'");
+        let out = dir.path().join("out");
+        let (_, result) = stream_with_watchdog(
+            k,
+            out.clone(),
+            Some(Duration::from_secs(10)),
+            Duration::from_secs(20),
+        );
+        result.expect("a first byte inside the bound is a success");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "PGDMP");
+    }
+
+    #[test]
+    fn a_bounded_command_that_fails_before_writing_reports_its_own_error() {
+        // A pg_dump whose TABLE lock wait ran out exits before the first-output
+        // bound: its own error, not the bound's, is what must come back.
+        let dir = tempfile::tempdir().unwrap();
+        let k = stub_kubectl(&dir, "echo 'LOCK TABLE public.t1' >&2\nexit 1");
+        let (_, result) = stream_with_watchdog(
+            k,
+            dir.path().join("out"),
+            Some(Duration::from_secs(10)),
+            Duration::from_secs(20),
+        );
+        let msg = result.expect_err("exit 1 fails the step").to_string();
+        assert!(msg.contains("LOCK TABLE public.t1"), "{msg}");
+        assert!(!msg.contains(backup_core::kube::NO_OUTPUT_MARKER), "{msg}");
     }
 
     #[test]

@@ -308,26 +308,36 @@ repository that takes longer than that to download.
 that has not set them runs on the chart's six hours.
 
 **Inside a run.** The steps that wait on something outside the runner are
-bounded too, far below the Job deadline. The first two fail the run with a
+bounded too, far below the Job deadline. The first three fail the run with a
 reason of its own, recorded in `lastError` and sent to the failure webhook:
 
 | What the run waits on | Bound | What you see |
 | --- | --- | --- |
 | `pg_dump` taking its table locks | 5 minutes (`--lock-wait-timeout=300s`) | `pg dump of <namespace>/<claim> gave up: another session held a lock …`, followed by `pg_dump`'s own `LOCK TABLE` statement naming the tables |
+| `pg_dump` reading the schema, before the first byte of the dump | 10 minutes | `pg dump of <namespace>/<claim> gave up: pg_dump wrote nothing for 10 minutes …`, naming the locks it covers |
 | a helper pod becoming Ready | 5 minutes | `pod … did not reach Ready within 300s` |
 | the failure webhook answering | 30 seconds | nothing: the notification is best-effort, and the run's outcome is already recorded |
 
-The lock wait bounds only the start of a dump: `pg_dump` takes a shared lock on
-every table it dumps before it reads a row, and a session holding a
-conflicting lock — a migration's `ALTER TABLE`, `VACUUM FULL`, `CLUSTER`, or a
-`LOCK TABLE` in a transaction left open — makes it wait. Once it holds its
-locks, a conflicting lock requested later waits for the dump rather than the
-other way round, and copying a large table is not limited by this bound. The
-same bound applies to `apprafter backup create`. A dump that gave up leaves no
-restorable snapshot behind: a `monolithic` run fails before restic writes
-anything, and a `sequential` run never writes the commit snapshot, so the
-claim snapshots it already wrote are ignored by restore and removed by the
-next prune.
+Both `pg_dump` bounds cover the start of a dump, before it has read a row, and
+both are about a lock held by another session. `pg_dump` first takes a shared
+lock on every table it dumps; a session holding a conflicting lock — a
+migration's `ALTER TABLE`, `VACUUM FULL`, `CLUSTER`, or a `LOCK TABLE` in a
+transaction left open — makes it wait, and `--lock-wait-timeout` ends that
+wait after five minutes. It covers plain and partitioned tables only. After
+it, `pg_dump` reads the rest of the schema with no timeout of its own, and
+those reads wait on a lock held on a view, a materialized view or a sequence:
+a `REFRESH MATERIALIZED VIEW` still running or left in an open transaction, a
+migration that ran `CREATE OR REPLACE VIEW` or `ALTER SEQUENCE` in a
+transaction that has not ended. A custom-format dump writes nothing at all
+until that schema read is done, so the runner gives the dump ten minutes to
+write its first byte: five for the table locks, and five for a schema read
+that takes seconds even at ten thousand tables. Once the dump is writing,
+nothing but the Job deadline limits it, so copying a large table is never cut
+short. Both bounds apply to `apprafter backup create` and `apprafter export`
+too. A dump that gave up leaves no restorable snapshot behind: a `monolithic`
+run fails before restic writes anything, and a `sequential` run never writes
+the commit snapshot, so the claim snapshots it already wrote are ignored by
+restore and removed by the next prune.
 
 ## What the in-cluster credential can and cannot do
 

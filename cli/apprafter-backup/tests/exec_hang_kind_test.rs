@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! Real-cluster proof that the runner's pod-exec path ENDS: a `pg_dump` behind
 //! a held table lock fails within its `--lock-wait-timeout` with the lock named
-//! in the error, and a command that writes more stderr than kube-rs's 1 KiB
-//! pipe still returns. Both hung on kube-rs 4 before the fixes these tests
-//! came with, and neither shows up against a stub: the lock is PostgreSQL's,
+//! in the error; a `pg_dump` behind a held MATERIALIZED VIEW lock — which that
+//! flag does not cover — fails at its first-output bound with the lock
+//! explained; and a command that writes more stderr than kube-rs's 1 KiB pipe
+//! still returns. All three hung on kube-rs 4 before the fixes these tests
+//! came with, and none shows up against a stub: the locks are PostgreSQL's,
 //! and the pipe sits inside kube-rs's WebSocket message loop.
 //!
 //! Skipped by default. Opt in against a DISPOSABLE kind cluster:
@@ -21,17 +23,20 @@
 //! both of which are stock PostgreSQL in the CNPG image, and the path to it is
 //! the same helper pod → Service → server hop the runner takes.
 //!
-//! The lock test waits out the real five-minute bound, so it takes about six
-//! minutes. Each wait is guarded by a watchdog, so a regression FAILS instead
-//! of hanging the run. Refuses any kubeconfig whose current context is not a
-//! `kind-*` context.
+//! The lock tests wait out the real bounds — five minutes for the table lock,
+//! ten for the first output — so they take about six and twelve minutes. Each
+//! wait is guarded by a watchdog, so a regression FAILS instead of hanging the
+//! run. Refuses any kubeconfig whose current context is not a `kind-*`
+//! context.
 
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use apprafter_backup::kube_rs_exec::KubeRsExec;
-use backup_core::extract::{run_extraction, ExtractItem, PG_DUMP_LOCK_WAIT_TIMEOUT};
+use backup_core::extract::{
+    run_extraction, ExtractItem, PG_DUMP_FIRST_OUTPUT_WITHIN, PG_DUMP_LOCK_WAIT_TIMEOUT,
+};
 use backup_core::{DataKind, KubeExec};
 use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use kube::api::{Api, DeleteParams, Patch, PatchParams};
@@ -45,6 +50,13 @@ const LOCK_WAIT: Duration = Duration::from_secs(300);
 /// What a run may add on top of the lock wait: the helper pod's start, the
 /// dump's connect and catalog reads, the exec round trips.
 const SETUP_SLACK: Duration = Duration::from_secs(120);
+
+/// Prefix of a lock-holding pod's script: wait until the server answers
+/// through its Service. The Service is created once the server is Ready, and
+/// its endpoints reach the node's forwarding rules a moment later — a `psql`
+/// started in that gap fails, and the pod's restart backoff then outlasts the
+/// test's wait for the lock.
+const WAIT_FOR_SERVICE: &str = "until pg_isready -q -h pg -U postgres; do sleep 1; done;";
 
 /// Tables in the dumped database. pg_dump 18 names every one of them in the
 /// single `LOCK TABLE` statement its timeout error echoes — this many make that
@@ -151,6 +163,7 @@ fn psql(k: &KubeRsExec, ns: &str, sql: &str) -> String {
             sql,
         ],
         &out,
+        None,
     )
     .unwrap_or_else(|e| panic!("psql {sql:?}: {e}"));
     std::fs::read_to_string(&out)
@@ -175,6 +188,59 @@ fn wait_until(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// A PostgreSQL 18 server pod behind a Service in `ns`, and the decomposed
+/// connection Secret `db-conn` the provisioner would write for it.
+fn pg_server(k: &KubeRsExec, rt: &tokio::runtime::Runtime, client: &kube::Client, ns: &str) {
+    // --- a PostgreSQL 18 server behind a Service ------------------------------
+    k.apply_and_wait_pod_ready(&json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": "pg", "namespace": ns, "labels": {"app": "pg"}},
+        "spec": {
+            "terminationGracePeriodSeconds": 0,
+            "containers": [{
+                "name": "postgres", "image": PG_IMAGE, "imagePullPolicy": "IfNotPresent",
+                "env": [{"name": "POSTGRES_PASSWORD", "value": "pw"}],
+                // TCP, not the socket: the image's init phase serves only the
+                // socket, so this turns Ready once the real server is up.
+                "readinessProbe": {
+                    "exec": {"command": ["pg_isready", "-U", "postgres", "-h", "127.0.0.1"]},
+                    "periodSeconds": 1
+                }
+            }]
+        }
+    }))
+    .expect("the postgres pod reaches Ready");
+    rt.block_on(async {
+        Api::<Service>::namespaced(client.clone(), ns)
+            .patch(
+                "pg",
+                &PatchParams::apply(MANAGER).force(),
+                &Patch::Apply(json!({
+                    "apiVersion": "v1", "kind": "Service",
+                    "metadata": {"name": "pg", "namespace": ns},
+                    "spec": {"selector": {"app": "pg"}, "ports": [{"port": 5432}]}
+                })),
+            )
+            .await
+            .expect("apply the Service");
+        // The decomposed connection Secret the provisioner writes.
+        Api::<Secret>::namespaced(client.clone(), ns)
+            .patch(
+                "db-conn",
+                &PatchParams::apply(MANAGER).force(),
+                &Patch::Apply(json!({
+                    "apiVersion": "v1", "kind": "Secret",
+                    "metadata": {"name": "db-conn", "namespace": ns},
+                    "stringData": {"user": "postgres", "pass": "pw",
+                                   "host": format!("pg.{ns}.svc"), "port": "5432",
+                                   "db": "postgres"}
+                })),
+            )
+            .await
+            .expect("apply the connection Secret");
+    });
 }
 
 /// Run the runner's real extraction of one pg claim on a thread, and give up
@@ -211,54 +277,7 @@ fn a_held_table_lock_fails_the_dump_within_the_bound_and_a_released_one_dumps() 
     let k: &'static KubeRsExec = Box::leak(Box::new(k));
     let _ns = TestNamespace::create(NS, &rt, &client);
 
-    // --- a PostgreSQL 18 server behind a Service ------------------------------
-    k.apply_and_wait_pod_ready(&json!({
-        "apiVersion": "v1", "kind": "Pod",
-        "metadata": {"name": "pg", "namespace": NS, "labels": {"app": "pg"}},
-        "spec": {
-            "terminationGracePeriodSeconds": 0,
-            "containers": [{
-                "name": "postgres", "image": PG_IMAGE, "imagePullPolicy": "IfNotPresent",
-                "env": [{"name": "POSTGRES_PASSWORD", "value": "pw"}],
-                // TCP, not the socket: the image's init phase serves only the
-                // socket, so this turns Ready once the real server is up.
-                "readinessProbe": {
-                    "exec": {"command": ["pg_isready", "-U", "postgres", "-h", "127.0.0.1"]},
-                    "periodSeconds": 1
-                }
-            }]
-        }
-    }))
-    .expect("the postgres pod reaches Ready");
-    rt.block_on(async {
-        Api::<Service>::namespaced(client.clone(), NS)
-            .patch(
-                "pg",
-                &PatchParams::apply(MANAGER).force(),
-                &Patch::Apply(json!({
-                    "apiVersion": "v1", "kind": "Service",
-                    "metadata": {"name": "pg", "namespace": NS},
-                    "spec": {"selector": {"app": "pg"}, "ports": [{"port": 5432}]}
-                })),
-            )
-            .await
-            .expect("apply the Service");
-        // The decomposed connection Secret the provisioner writes.
-        Api::<Secret>::namespaced(client.clone(), NS)
-            .patch(
-                "db-conn",
-                &PatchParams::apply(MANAGER).force(),
-                &Patch::Apply(json!({
-                    "apiVersion": "v1", "kind": "Secret",
-                    "metadata": {"name": "db-conn", "namespace": NS},
-                    "stringData": {"user": "postgres", "pass": "pw",
-                                   "host": format!("pg.{NS}.svc"), "port": "5432",
-                                   "db": "postgres"}
-                })),
-            )
-            .await
-            .expect("apply the connection Secret");
-    });
+    pg_server(k, &rt, &client, NS);
     psql(
         k,
         NS,
@@ -279,8 +298,10 @@ fn a_held_table_lock_fails_the_dump_within_the_bound_and_a_released_one_dumps() 
             "containers": [{
                 "name": "psql", "image": PG_IMAGE, "imagePullPolicy": "IfNotPresent",
                 "env": [{"name": "PGPASSWORD", "value": "pw"}],
-                "command": ["psql", "-h", "pg", "-U", "postgres", "-c",
-                            "BEGIN; LOCK TABLE t1 IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(3600);"]
+                "command": ["sh", "-c", &format!(
+                    "{WAIT_FOR_SERVICE} exec psql -h pg -U postgres -c \
+                     'BEGIN; LOCK TABLE t1 IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(3600);'"
+                )]
             }]
         }
     }))
@@ -376,7 +397,7 @@ fn a_command_writing_more_stderr_than_the_exec_pipe_holds_still_returns() {
     let out = dir.path().join("out");
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(k.exec_stream_to_file("noisy", NS, &["sh", "-c", script], &out));
+        let _ = tx.send(k.exec_stream_to_file("noisy", NS, &["sh", "-c", script], &out, None));
     });
     let result = rx
         .recv_timeout(Duration::from_secs(60))
@@ -393,5 +414,152 @@ fn a_command_writing_more_stderr_than_the_exec_pipe_holds_still_returns() {
         msg.len() < 8 * 1024,
         "the error is bounded: {} bytes",
         msg.len()
+    );
+}
+
+/// How many sessions wait on a lock inside `pg_get_viewdef` — the catalog read
+/// `pg_dump` makes for a view or materialized view after its table locks.
+fn dumps_waiting_on_a_view_definition(k: &KubeRsExec, ns: &str) -> String {
+    psql(
+        k,
+        ns,
+        "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
+         AND query LIKE '%pg_get_viewdef%'",
+    )
+}
+
+#[test]
+#[ignore = "real cluster, ~12 min — set APPRAFTER_K8S_SMOKE=1 + KUBECONFIG (a kind cluster) to run"]
+fn a_held_materialized_view_lock_fails_the_dump_at_its_first_output_bound_and_a_released_one_dumps()
+{
+    const NS: &str = "apprafter-exec-hang-mv";
+    let (rt, client, k) = opted_in();
+    let k: &'static KubeRsExec = Box::leak(Box::new(k));
+    let _ns = TestNamespace::create(NS, &rt, &client);
+    pg_server(k, &rt, &client, NS);
+    psql(
+        k,
+        NS,
+        "CREATE TABLE t1 AS SELECT g AS id FROM generate_series(1, 1000) g; \
+         CREATE MATERIALIZED VIEW mv1 AS SELECT count(*) AS n FROM t1;",
+    );
+
+    // --- a REFRESH MATERIALIZED VIEW held in an open transaction -------------
+    // ACCESS EXCLUSIVE on the materialized view, and nothing on t1 that
+    // conflicts with the dump's ACCESS SHARE: its LOCK TABLE goes through, and
+    // --lock-wait-timeout never gets the chance to fire.
+    k.apply_and_wait_pod_ready(&json!({
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": "refresher", "namespace": NS},
+        "spec": {
+            "terminationGracePeriodSeconds": 0,
+            "containers": [{
+                "name": "psql", "image": PG_IMAGE, "imagePullPolicy": "IfNotPresent",
+                "env": [{"name": "PGPASSWORD", "value": "pw"}],
+                "command": ["sh", "-c", &format!(
+                    "{WAIT_FOR_SERVICE} exec psql -h pg -U postgres -c \
+                     'BEGIN; REFRESH MATERIALIZED VIEW mv1; SELECT pg_sleep(3600);'"
+                )]
+            }]
+        }
+    }))
+    .expect("the refresher pod starts");
+    let held_on_mv1 = || {
+        psql(
+            k,
+            NS,
+            "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
+             WHERE c.relname = 'mv1' AND l.mode = 'AccessExclusiveLock' AND l.granted",
+        )
+    };
+    wait_until(
+        "the refresher's lock on mv1",
+        Duration::from_secs(60),
+        || held_on_mv1() == "1",
+    );
+
+    let item = ExtractItem {
+        namespace: NS.to_string(),
+        claim_name: "db".to_string(),
+        kind: DataKind::Pg,
+        source: "db-conn".to_string(),
+        connection: None,
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // --- while the lock is held: silent, then abandoned at the bound ---------
+    let (tx, rx) = mpsc::channel();
+    {
+        let item = item.clone();
+        let out_dir = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = run_extraction(k, std::slice::from_ref(&item), &out_dir, PG_IMAGE);
+            let _ = tx.send((started.elapsed(), result));
+        });
+    }
+    // The dump is waiting on THIS lock, in its catalog read, not on anything
+    // else: the explanation below is only true if this holds.
+    wait_until(
+        "pg_dump to wait on mv1 in pg_get_viewdef",
+        SETUP_SLACK,
+        || dumps_waiting_on_a_view_definition(k, NS) == "1",
+    );
+    let (elapsed, result) = rx
+        .recv_timeout(PG_DUMP_FIRST_OUTPUT_WITHIN + SETUP_SLACK)
+        .unwrap_or_else(|_| {
+            panic!(
+                "the dump behind a held materialized-view lock was still running after \
+                 {:?}; its first output is bounded at {PG_DUMP_FIRST_OUTPUT_WITHIN:?}",
+                PG_DUMP_FIRST_OUTPUT_WITHIN + SETUP_SLACK
+            )
+        });
+    let msg = result
+        .expect_err("a dump that never wrote a byte must fail the run")
+        .to_string();
+    eprintln!("blocked dump failed after {elapsed:?}:\n{msg}");
+    assert!(
+        elapsed >= PG_DUMP_FIRST_OUTPUT_WITHIN,
+        "failed after {elapsed:?}, before the first-output bound: {msg}"
+    );
+    assert!(
+        msg.starts_with(&format!(
+            "pg dump of {NS}/db gave up: pg_dump wrote nothing"
+        )),
+        "the wait is explained first: {msg}"
+    );
+    assert!(msg.contains("REFRESH MATERIALIZED VIEW"), "{msg}");
+    assert!(msg.contains(backup_core::kube::NO_OUTPUT_MARKER), "{msg}");
+    // Not the table-lock path: pg_dump got its table locks and never timed out.
+    assert!(
+        !msg.contains("canceling statement due to statement timeout"),
+        "{msg}"
+    );
+
+    // --- lock released: the same extraction dumps ------------------------------
+    k.delete_pod_best_effort("refresher", NS);
+    wait_until("the lock on mv1 to go", Duration::from_secs(60), || {
+        held_on_mv1() == "0"
+    });
+    // The abandoned dump's helper pod is on its way out (the guard deleted
+    // it); the next extraction reuses the name, so let it go first.
+    let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client.clone(), NS);
+    wait_until(
+        "the abandoned helper pod to go",
+        Duration::from_secs(120),
+        || {
+            rt.block_on(pods.get_opt("bk-pg-db"))
+                .expect("get the helper pod")
+                .is_none()
+        },
+    );
+    let (elapsed, result) = extract_with_watchdog(k, item, dir.path(), SETUP_SLACK)
+        .unwrap_or_else(|waited| panic!("the unblocked dump was still running after {waited:?}"));
+    result.unwrap_or_else(|e| panic!("the unblocked dump failed after {elapsed:?}: {e}"));
+    let dump = std::fs::read(dir.path().join("pg").join(NS).join("db.dump")).expect("the dump");
+    assert!(dump.starts_with(b"PGDMP"), "not a custom-format dump");
+    assert!(
+        dump.windows(3).any(|w| w == b"mv1"),
+        "the materialized view is in the dump"
     );
 }

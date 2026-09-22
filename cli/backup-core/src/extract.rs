@@ -411,7 +411,8 @@ pub(crate) fn pg_dump_pod_spec_with_password(
 ///   `PGPASSWORD` injected into its container env; execs `pg_dump -Fc
 ///   --lock-wait-timeout=300s -h <host> -U <user> -p <port> <db>` (see
 ///   [`PG_DUMP_LOCK_WAIT_TIMEOUT`]) and streams stdout to
-///   `pg/<ns>/<claim>.dump`; deletes the pod (best-effort).
+///   `pg/<ns>/<claim>.dump`, failing if the first byte takes longer than
+///   [`PG_DUMP_FIRST_OUTPUT_WITHIN`]; deletes the pod (best-effort).
 ///
 /// * **Volume** — applies a busybox pod that mounts `item.source` (the PVC
 ///   name) at `/data` read-only; execs `tar c -C /data .` and streams to
@@ -513,23 +514,37 @@ fn extract_pg(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path, pg_image: &s
 
     let owned = pg_dump_argv(&db, &user, &host, &port);
     let argv: Vec<&str> = owned.iter().map(String::as_str).collect();
-    exec_stream_to_file(k, &pod_name, ns, &argv, &dump_path)
-        .map_err(|e| explain_pg_dump_error(e, ns, claim))
+    exec_stream_to_file(
+        k,
+        &pod_name,
+        ns,
+        &argv,
+        &dump_path,
+        Some(PG_DUMP_FIRST_OUTPUT_WITHIN),
+    )
+    .map_err(|e| explain_pg_dump_error(e, ns, claim))
     // _guard drops here (or on any earlier return) → delete_pod_best_effort called.
 }
 
 /// Put a sentence in front of a `pg_dump` failure whose cause is not obvious
-/// from `pg_dump`'s own words; any other error passes through unchanged.
+/// from the failure's own words; any other error passes through unchanged.
 ///
-/// Today that is the lock-wait timeout: `pg_dump` reports it as a cancelled
-/// statement (`canceling statement due to statement timeout`, with `Query was:
-/// LOCK TABLE …` as the detail), which reads like a slow query rather than
-/// another session holding a lock on the database. The original text is kept
-/// in full after the sentence — it names the tables.
+/// Two failures qualify, and both are a lock held by another session:
 ///
-/// Matches on the exec error's text, which carries `pg_dump`'s stderr on both
-/// `KubeExec` implementations (the CLI's `kubectl exec` and the runner's
-/// kube-rs exec).
+/// * **A table lock** — `--lock-wait-timeout` ran out. `pg_dump` reports it as
+///   a cancelled statement (`canceling statement due to statement timeout`,
+///   with `Query was: LOCK TABLE …` as the detail), which reads like a slow
+///   query rather than a lock. The original text follows the sentence: it
+///   names the tables.
+/// * **Any other lock the dump's catalog reads wait on** — the exec wrote
+///   nothing within [`PG_DUMP_FIRST_OUTPUT_WITHIN`] (see there for why that
+///   means a lock). The exec's own error says only that nothing was written.
+///
+/// Matches on the exec error's text: the lock-timeout words are `pg_dump`'s
+/// stderr, which both `KubeExec` implementations append (the CLI's `kubectl
+/// exec` and the runner's kube-rs exec), and the no-output words are
+/// [`crate::kube::NO_OUTPUT_MARKER`], which both build through
+/// [`crate::kube::no_output_error`].
 pub fn explain_pg_dump_error(err: CliError, ns: &str, claim: &str) -> CliError {
     let msg = err.to_string();
     if msg.contains("canceling statement due to statement timeout") && msg.contains("LOCK TABLE") {
@@ -540,6 +555,20 @@ pub fn explain_pg_dump_error(err: CliError, ns: &str, claim: &str) -> CliError {
              longer than {PG_DUMP_LOCK_WAIT_TIMEOUT}, so pg_dump stopped waiting and no data \
              was dumped. Run the backup again once that lock is released; \
              pg_stat_activity shows which session holds it.\n{msg}"
+        ));
+    }
+    if crate::kube::is_no_output_error(&err) {
+        return CliError::Other(format!(
+            "pg dump of {ns}/{claim} gave up: pg_dump wrote nothing for {} minutes. It \
+             writes nothing until it has read the database's whole schema, and what stops \
+             it there is a lock its catalog reads wait on that --lock-wait-timeout does not \
+             cover: a lock on a view, a materialized view or a sequence, held by another \
+             session — a REFRESH MATERIALIZED VIEW that is still running or sits in an open \
+             transaction, or a migration that ran CREATE OR REPLACE VIEW or ALTER SEQUENCE \
+             in a transaction that has not ended. No data was dumped. pg_locks shows the \
+             waiting lock and pg_stat_activity the session holding it; run the backup again \
+             once that session has finished.\n{msg}",
+            PG_DUMP_FIRST_OUTPUT_WITHIN.as_secs() / 60
         ));
     }
     err
@@ -583,7 +612,11 @@ fn extract_volume(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Resul
     let tar_path = dest.join("data.tar");
 
     let argv: Vec<&str> = vec!["tar", "c", "-C", "/data", "."];
-    exec_stream_to_file(k, &pod_name, ns, &argv, &tar_path)
+    // No first-output bound: `tar` writes its first header after one `stat`,
+    // so there is no silent phase to time, and a read stalled on the volume
+    // later is not what such a bound would catch. The run's deadline covers
+    // it (see `PG_DUMP_FIRST_OUTPUT_WITHIN` for the one step that has one).
+    exec_stream_to_file(k, &pod_name, ns, &argv, &tar_path, None)
     // _guard drops here (or on any earlier return) → delete_pod_best_effort called.
 }
 
@@ -662,7 +695,10 @@ fn extract_jetstream(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Re
 
     let script = jetstream_dump_script(stream);
     let argv: Vec<&str> = vec!["sh", "-c", &script];
-    exec_stream_to_file(k, &pod_name, &nats_ns, &argv, &tar_path)
+    // No first-output bound: the script writes nothing until `nats stream
+    // backup` has copied the whole stream, which legitimately takes as long
+    // as the stream is large.
+    exec_stream_to_file(k, &pod_name, &nats_ns, &argv, &tar_path, None)
 }
 
 /// Extract a persistent Redis (Dragonfly) claim's whole-instance snapshot.
@@ -698,41 +734,76 @@ fn extract_redis(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Result
         "-c",
         "redis-cli -p 9999 SAVE >/dev/null 2>&1 && tar c -C /dragonfly/snapshots .",
     ];
-    exec_stream_to_file(k, &pod, df_ns, &argv, &tar_path)
+    // No first-output bound: nothing is written until `SAVE` has written the
+    // whole snapshot, which legitimately takes as long as the instance is
+    // large.
+    exec_stream_to_file(k, &pod, df_ns, &argv, &tar_path, None)
 }
 
-/// How long `pg_dump` may wait for the table locks it takes before it reads
+/// How long `pg_dump` may wait for the TABLE locks it takes before it reads
 /// any data: its `--lock-wait-timeout`, in PostgreSQL's `statement_timeout`
 /// syntax.
 ///
-/// `pg_dump` starts by taking `ACCESS SHARE` on every table it will dump. A
-/// session holding a conflicting lock — a migration's `ALTER TABLE`, `VACUUM
-/// FULL`, `CLUSTER`, a `LOCK TABLE` left open in an idle transaction — makes
-/// it wait, silently, for as long as that lock is held. Without this flag the
-/// wait is unbounded, and the scheduled runner (a `concurrencyPolicy: Forbid`
-/// CronJob) then misses every later backup behind the one that is waiting.
+/// `pg_dump` starts by taking `ACCESS SHARE` on every table it will dump, in
+/// one `LOCK TABLE` statement (PostgreSQL 18). A session holding a conflicting
+/// lock — a migration's `ALTER TABLE`, `VACUUM FULL`, `CLUSTER`, a `LOCK TABLE`
+/// left open in an idle transaction — makes it wait, silently, for as long as
+/// that lock is held. The scheduled runner is a `concurrencyPolicy: Forbid`
+/// CronJob, so while it waits no later scheduled backup starts.
 ///
-/// The bound applies to lock acquisition ONLY: `pg_dump` sets
-/// `statement_timeout` for its `LOCK TABLE` statement and clears it before it
-/// reads a row, so a large table whose `COPY` runs for hours is unaffected
-/// (measured on PostgreSQL 18: a `COPY` stalled well past a 1 s bound
-/// completed). Once the locks are held nothing else can block the dump, which
-/// is why this one flag covers the lock-wait hang.
+/// What this bounds, exactly: the `LOCK TABLE` statement, which `pg_dump` runs
+/// under `statement_timeout` set to this value — and only that. It locks
+/// relations of kind `r` and `p` (plain and partitioned tables); a lock on a
+/// view resolves to its base tables and is bounded too. Directly afterwards
+/// `pg_dump` sets `statement_timeout = 0` and runs the rest of its catalog
+/// reads, and those wait unbounded on a lock held on a VIEW, a MATERIALIZED
+/// VIEW or a SEQUENCE: `pg_get_viewdef` behind a `REFRESH MATERIALIZED VIEW` or
+/// a `CREATE OR REPLACE VIEW` in an open transaction, the sequence read behind
+/// an `ALTER SEQUENCE` (all three reproduced on PostgreSQL 18.6). A
+/// `PGOPTIONS` `lock_timeout` does not help: `pg_dump` resets it when it
+/// connects. [`PG_DUMP_FIRST_OUTPUT_WITHIN`] is what bounds those waits. A
+/// long `COPY` is bounded by neither, by design (measured on PostgreSQL 18: a
+/// `COPY` stalled well past a 1 s bound completed).
 ///
 /// Why five minutes: it restores the bound the runner had by accident up to
-/// kube-rs 0.95. `pg_dump -Fc` writes nothing until it holds its locks, and
-/// the client's 295 s read timeout cut any exec stream that stayed silent that
-/// long, so a dump behind a held lock failed after about five minutes. kube-rs
-/// 4 keeps an exec stream alive with 60 s pings, which removed that cut — see
-/// `apprafter-backup`'s `tls` module. `300s` is that bound made explicit,
-/// rounded to a figure the documentation can state, and it applies to the
-/// CLI's `apprafter backup` as well, which shares this argv.
+/// kube-rs 0.95. `pg_dump -Fc` writes nothing until it has read the schema,
+/// and the client's 295 s read timeout cut any exec stream that stayed silent
+/// that long, so a dump behind a held lock failed after about five minutes.
+/// kube-rs 4 keeps an exec stream alive with 60 s pings, which removed that
+/// cut — see `apprafter-backup`'s `tls` module. `300s` is that bound made
+/// explicit, rounded to a figure the documentation can state, and it applies
+/// to the CLI's `apprafter backup create` as well, which shares this argv.
 ///
 /// When it fires, `pg_dump` exits 1 with `canceling statement due to statement
 /// timeout` and a `Query was: LOCK TABLE …` detail naming every table (one
 /// statement since PostgreSQL 18); [`explain_pg_dump_error`] turns that into
 /// a sentence about the lock.
 pub const PG_DUMP_LOCK_WAIT_TIMEOUT: &str = "300s";
+
+/// How long `pg_dump` may run before it writes the first byte of the dump;
+/// past it, the exec is abandoned and the claim's dump fails.
+///
+/// A custom-format dump (`-Fc`) to a pipe writes NOTHING until `pg_dump` has
+/// read the database's whole schema: the header, the table of contents and
+/// the data are all written when the archive is closed, after every catalog
+/// query has run (measured on PostgreSQL 18.6: zero bytes for as long as a
+/// catalog read waited). So the time to the first byte is exactly the silent
+/// phase in which `pg_dump` can wait on another session's lock — the table
+/// locks [`PG_DUMP_LOCK_WAIT_TIMEOUT`] bounds, and the view, materialized-view
+/// and sequence locks nothing else does. One bound on that time covers every
+/// lock the dump can wait on before it has read a row.
+///
+/// Why ten minutes: it must let the table-lock wait run out first, so a held
+/// table lock keeps reporting `pg_dump`'s own error, which names the tables —
+/// that is the first five minutes. The other five are for the rest of the
+/// schema read, which is quick: 6–7 s on PostgreSQL 18 for 10 000 tables with
+/// their sequences and 20 000 indexes, 1 000 views, 1 000 functions and 200
+/// materialized views (a 25 MB table of contents). Five minutes is some forty
+/// times that, room for a much larger schema on a much slower server.
+///
+/// Only the FIRST byte is timed. Once the dump is writing, a large table may
+/// take as long as it needs; the run's own deadline is what bounds that.
+pub const PG_DUMP_FIRST_OUTPUT_WITHIN: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Build the `pg_dump` argument vector for a custom-format dump.
 ///
@@ -934,6 +1005,114 @@ mod tests {
         assert!(msg.contains("300s"), "states the bound: {msg}");
         // pg_dump's own text survives: it is what names the tables.
         assert!(msg.contains("LOCK TABLE public.t1, public.t2"), "{msg}");
+    }
+
+    #[test]
+    fn a_dump_that_wrote_nothing_is_explained_as_a_lock_the_table_bound_does_not_cover() {
+        let raw = crate::kube::no_output_error(
+            "exec_stream_to_file",
+            &["pg_dump", "-Fc"],
+            "demo",
+            "bk-pg-db",
+            PG_DUMP_FIRST_OUTPUT_WITHIN,
+        );
+        let msg = explain_pg_dump_error(raw, "demo", "db").to_string();
+        assert!(msg.starts_with("pg dump of demo/db gave up"), "{msg}");
+        assert!(msg.contains("10 minutes"), "states the bound: {msg}");
+        for cause in [
+            "materialized view",
+            "REFRESH MATERIALIZED VIEW",
+            "CREATE OR REPLACE VIEW",
+            "ALTER SEQUENCE",
+            "--lock-wait-timeout does not",
+        ] {
+            assert!(msg.contains(cause), "names {cause:?}: {msg}");
+        }
+        // The exec's own words survive: they name the pod.
+        assert!(msg.contains("demo/bk-pg-db"), "{msg}");
+    }
+
+    #[test]
+    fn the_first_output_bound_lets_the_table_lock_wait_run_out_first() {
+        // A held TABLE lock must keep failing with pg_dump's own error, which
+        // names the tables — so the table-lock wait runs out well inside the
+        // first-output bound, with the rest of the schema read on top.
+        let lock_wait: u64 = PG_DUMP_LOCK_WAIT_TIMEOUT
+            .strip_suffix('s')
+            .and_then(|n| n.parse().ok())
+            .expect("the lock wait is written in seconds");
+        assert!(
+            PG_DUMP_FIRST_OUTPUT_WITHIN.as_secs() >= lock_wait + 300,
+            "{PG_DUMP_FIRST_OUTPUT_WITHIN:?} leaves under five minutes after the {lock_wait}s \
+             table-lock wait for the rest of the schema read"
+        );
+    }
+
+    /// A [`KubeExec`] that records every `exec_stream_to_file` and the
+    /// first-output bound it was given, and serves a fixed connection Secret.
+    #[derive(Default)]
+    struct RecordingKube {
+        execs: std::sync::Mutex<Vec<(String, Option<std::time::Duration>)>>,
+    }
+
+    impl KubeExec for RecordingKube {
+        fn apply_and_wait_pod_ready(&self, _spec: &Value) -> Result<()> {
+            Ok(())
+        }
+        fn exec_stream_to_file(
+            &self,
+            _pod: &str,
+            _ns: &str,
+            argv: &[&str],
+            out: &Path,
+            first_output_within: Option<std::time::Duration>,
+        ) -> Result<()> {
+            self.execs
+                .lock()
+                .unwrap()
+                .push((argv[0].to_string(), first_output_within));
+            fs::write(out, b"x").map_err(|e| CliError::Other(e.to_string()))
+        }
+        fn exec_stream_from_file(&self, _: &str, _: &str, _: &[&str], _: &Path) -> Result<()> {
+            unreachable!("extraction never streams into a pod")
+        }
+        fn delete_pod_best_effort(&self, _name: &str, _ns: &str) {}
+        fn get_secret_key(&self, _secret: &str, _ns: &str, key: &str) -> Result<String> {
+            Ok(match key {
+                "port" => "5432".into(),
+                "host" => "pg.demo.svc".into(),
+                other => format!("{other}-value"),
+            })
+        }
+        fn get_json(&self, _args: &[&str]) -> Result<Option<Value>> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn only_the_pg_dump_is_timed_to_its_first_byte() {
+        let k = RecordingKube::default();
+        let items = plan_extraction(&[
+            json!({"spec": {"type": "pg"}, "metadata": {"name": "db", "namespace": "demo"},
+                   "status": {"connectionSecretRef": "db-conn"}}),
+            json!({"spec": {"type": "disk"}, "metadata": {"name": "vol", "namespace": "demo"},
+                   "status": {"volumeClaimRef": "pvc"}}),
+            json!({"spec": {"type": "redis", "persistent": true},
+                   "metadata": {"name": "cache", "namespace": "demo"},
+                   "status": {"instance": "platform-redis-persistent-000"}}),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        run_extraction(&k, &items, dir.path(), images::DEFAULT_PG_IMAGE).unwrap();
+
+        let execs = k.execs.lock().unwrap().clone();
+        assert_eq!(
+            execs,
+            vec![
+                ("pg_dump".to_string(), Some(PG_DUMP_FIRST_OUTPUT_WITHIN)),
+                ("tar".to_string(), None),
+                ("sh".to_string(), None),
+            ]
+        );
     }
 
     #[test]

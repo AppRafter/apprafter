@@ -215,10 +215,13 @@ below that interval rather than raising it. If the backup block is git-managed,
 set `activeDeadlineSeconds` / `checkActiveDeadlineSeconds` under
 `spec.backup` in your infra repo instead.
 
-A backup that failed with `pg dump of <namespace>/<claim> gave up` met the
-other limit: another session held a conflicting lock on one of that claim's
-tables for five minutes, typically a migration. The message names the tables.
-Run `apprafter backup run` again once that session has finished.
+A backup that failed with `pg dump of <namespace>/<claim> gave up` met one of
+the two limits on a dump's start, both a lock held by another session. `gave
+up: another session held a lock` is a table lock held for five minutes,
+typically a migration, and the message names the tables. `gave up: pg_dump
+wrote nothing for 10 minutes` is a lock on a view, a materialized view or a
+sequence, typically a `REFRESH MATERIALIZED VIEW` or a migration's transaction
+left open. Run `apprafter backup run` again once that session has finished.
 
 ## The scoped-credentials ladder — `enforce: operator` vs `cluster`
 
