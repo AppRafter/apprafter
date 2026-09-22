@@ -372,6 +372,9 @@ impl KubeExec for KubeRsExec {
                     ))
                 })?;
 
+            // Before anything else can block: see `StderrDrain`.
+            let stderr = StderrDrain::start(&mut attached);
+
             let mut proc_stdout = attached.stdout().ok_or_else(|| {
                 CliError::Other("exec_stream_to_file: attached process exposed no stdout".into())
             })?;
@@ -399,7 +402,10 @@ impl KubeExec for KubeRsExec {
                 ))
             })?;
 
-            check_exec_status(&mut attached, "exec_stream_to_file", argv, ns, pod).await
+            let status =
+                check_exec_status(&mut attached, "exec_stream_to_file", argv, ns, pod).await;
+            let captured = stderr.finish().await;
+            status.map_err(|e| with_stderr(e, captured.as_ref()))
         })
     }
 
@@ -426,6 +432,9 @@ impl KubeExec for KubeRsExec {
                     ))
                 })?;
 
+            // Before anything else can block: see `StderrDrain`.
+            let stderr = StderrDrain::start(&mut attached);
+
             let mut proc_stdin = attached.stdin().ok_or_else(|| {
                 CliError::Other("exec_stream_from_file: attached process exposed no stdin".into())
             })?;
@@ -442,10 +451,10 @@ impl KubeExec for KubeRsExec {
             //
             // Neither result is propagated here, for the reason spelled out on
             // `KubectlExec::apply_and_wait_pod_ready` in platform-cli's
-            // `backup.rs`. `check_exec_status` below is what reads the remote
-            // command's exit status AND its stderr channel; returning early
-            // skips it and reports a transport error instead of the command's
-            // own explanation. The transport is a websocket rather than an OS
+            // `backup.rs`. `check_exec_status` below reads the remote
+            // command's exit status, and `StderrDrain` holds its stderr;
+            // returning early skips both and reports a transport error instead
+            // of the command's own explanation. The transport is a websocket rather than an OS
             // pipe, so there is no literal SIGPIPE — the apiserver closes the
             // stdin channel when the remote command exits, and the write comes
             // back `BrokenPipe`/`ConnectionReset`. The structure is identical.
@@ -460,7 +469,10 @@ impl KubeExec for KubeRsExec {
             let shutdown_result = proc_stdin.shutdown().await;
             drop(proc_stdin);
 
-            check_exec_status(&mut attached, "exec_stream_from_file", argv, ns, pod).await?;
+            let status =
+                check_exec_status(&mut attached, "exec_stream_from_file", argv, ns, pod).await;
+            let captured = stderr.finish().await;
+            status.map_err(|e| with_stderr(e, captured.as_ref()))?;
 
             // The command claimed success. That is its claim about what it did
             // with its input, not evidence the input arrived — a dump that was
@@ -647,6 +659,123 @@ fn classify_exec_status(
             "{context}: exec {argv:?} in {ns}/{pod} exposed no status channel — cannot verify \
              exit code (failing closed)",
         ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The remote command's stderr
+// ---------------------------------------------------------------------------
+
+/// Bytes of a remote command's stderr kept from its start (where `pg_dump`
+/// and `psql` put the error) and from its end (where `tar` does).
+const STDERR_HEAD_BYTES: usize = 2048;
+const STDERR_TAIL_BYTES: usize = 2048;
+
+/// Reads an exec'd command's stderr to EOF on its own task, for as long as the
+/// command runs.
+///
+/// Two reasons, and the first is a hang. kube-rs hands stderr over through an
+/// in-memory pipe of 1 KiB (`AttachParams::max_stderr_buf_size`'s default),
+/// written by the SAME task that reads the WebSocket. Asking for stderr and
+/// never reading it — what this module did up to 0.2.77 — means the first
+/// command to write more than 1 KiB there stalls that task: no more stdout, no
+/// terminal status, no pings, and no read on the socket for the client's read
+/// timeout to count. The run waits for ever. `pg_dump` 18 hitting its
+/// `--lock-wait-timeout` writes one `LOCK TABLE` statement naming every table
+/// in the database — 2 KiB for 62 tables.
+///
+/// The second: that text is the only explanation of a failure. The apiserver's
+/// terminal status says `exit code 1` and nothing about why.
+///
+/// Dropping the drain aborts its task, so an early `?` return leaves nothing
+/// behind.
+struct StderrDrain(Option<tokio::task::JoinHandle<StderrCapture>>);
+
+impl StderrDrain {
+    /// Take `attached`'s stderr and start reading it. Must run inside the
+    /// runtime (it spawns), which every `KubeRsExec` method body does.
+    fn start(attached: &mut AttachedProcess) -> Self {
+        Self(attached.stderr().map(|r| tokio::spawn(drain_stderr(r))))
+    }
+
+    /// What the command wrote to stderr. Call once the terminal status has
+    /// arrived: kube-rs closes the pipe as its message loop ends, so the task
+    /// is at, or moments from, EOF by then.
+    async fn finish(mut self) -> Option<StderrCapture> {
+        self.0.take()?.await.ok()
+    }
+}
+
+impl Drop for StderrDrain {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// A command's stderr, read to EOF but kept bounded: the first
+/// [`STDERR_HEAD_BYTES`], the last [`STDERR_TAIL_BYTES`], and how many bytes
+/// fell between. Bounded because it ends up in the status ConfigMap and the
+/// failure webhook.
+#[derive(Debug, Default)]
+struct StderrCapture {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    total: u64,
+}
+
+impl StderrCapture {
+    fn push(&mut self, bytes: &[u8]) {
+        self.total += bytes.len() as u64;
+        let into_head = STDERR_HEAD_BYTES
+            .saturating_sub(self.head.len())
+            .min(bytes.len());
+        self.head.extend_from_slice(&bytes[..into_head]);
+        self.tail.extend(&bytes[into_head..]);
+        let excess = self.tail.len().saturating_sub(STDERR_TAIL_BYTES);
+        self.tail.drain(..excess);
+    }
+
+    /// The captured text, `None` when the command wrote nothing (or only
+    /// whitespace).
+    fn render(&self) -> Option<String> {
+        let kept = (self.head.len() + self.tail.len()) as u64;
+        let mut text = String::from_utf8_lossy(&self.head).into_owned();
+        if self.total > kept {
+            text.push_str(&format!(
+                "\n[… {} bytes of stderr not kept …]\n",
+                self.total - kept
+            ));
+        }
+        let tail: Vec<u8> = self.tail.iter().copied().collect();
+        text.push_str(&String::from_utf8_lossy(&tail));
+        let text = text.trim_end();
+        (!text.trim().is_empty()).then(|| text.to_string())
+    }
+}
+
+/// Read `reader` to EOF (or its first error) into a [`StderrCapture`].
+async fn drain_stderr<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> StderrCapture {
+    use tokio::io::AsyncReadExt;
+
+    let mut capture = StderrCapture::default();
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => capture.push(&buf[..n]),
+        }
+    }
+    capture
+}
+
+/// Append the command's own stderr to an exec failure; the error unchanged
+/// when there is none.
+fn with_stderr(err: CliError, stderr: Option<&StderrCapture>) -> CliError {
+    match stderr.and_then(StderrCapture::render) {
+        Some(text) => CliError::Other(format!("{err}\ncommand stderr:\n{text}")),
+        None => err,
     }
 }
 
@@ -1273,6 +1402,105 @@ mod tests {
             msg.contains("command terminated with exit code 1"),
             "lost the message: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The remote command's stderr
+    // -----------------------------------------------------------------------
+
+    /// kube-rs's stderr pipe, as `AttachedProcess` builds it: a
+    /// `tokio::io::duplex` of `AttachParams::max_stderr_buf_size`'s default.
+    const KUBE_STDERR_PIPE_BYTES: usize = 1024;
+
+    /// The drain must keep reading however much the command writes — a
+    /// reader that stopped once it had "enough" would stall kube-rs's message
+    /// loop exactly as an unread pipe does — and it must keep the start and
+    /// the end of what it read.
+    #[test]
+    fn drain_stderr_reads_far_past_the_kube_pipe_and_keeps_both_ends() {
+        use tokio::io::AsyncWriteExt;
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let capture = rt.block_on(async {
+            let (mut writer, reader) = tokio::io::duplex(KUBE_STDERR_PIPE_BYTES);
+            // The writer is what kube-rs's message loop does with stderr
+            // frames: `write_all`, which parks while the pipe is full.
+            let written = tokio::spawn(async move {
+                writer
+                    .write_all(b"pg_dump: error: query failed: ERROR:  canceling statement\n")
+                    .await?;
+                for i in 0..2000 {
+                    writer
+                        .write_all(format!("public.app_orders_line_items_{i}, ").as_bytes())
+                        .await?;
+                }
+                writer.write_all(b"\nTHE LAST LINE\n").await?;
+                std::io::Result::Ok(())
+            });
+            let capture =
+                tokio::time::timeout(std::time::Duration::from_secs(10), drain_stderr(reader))
+                    .await
+                    .expect("the drain stopped reading: the writer is parked on a full pipe");
+            written.await.expect("join").expect("write");
+            capture
+        });
+
+        assert!(capture.total > 60_000, "total: {}", capture.total);
+        let text = capture.render().expect("stderr was written");
+        assert!(
+            text.starts_with("pg_dump: error: query failed"),
+            "the head is where pg_dump puts the error: {text}"
+        );
+        assert!(text.ends_with("THE LAST LINE"), "the tail: {text}");
+        assert!(text.contains("bytes of stderr not kept"), "{text}");
+        assert!(
+            text.len() < STDERR_HEAD_BYTES + STDERR_TAIL_BYTES + 100,
+            "bounded: {} bytes",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn a_short_stderr_is_kept_whole() {
+        let mut capture = StderrCapture::default();
+        capture.push(b"tar: ./x: Cannot open: Permission denied\n");
+        capture.push(b"tar: Exiting with failure status\n");
+        assert_eq!(
+            capture.render().as_deref(),
+            Some(
+                "tar: ./x: Cannot open: Permission denied\n\
+                 tar: Exiting with failure status"
+            )
+        );
+    }
+
+    #[test]
+    fn an_exec_failure_carries_the_commands_stderr_and_only_when_there_is_some() {
+        let failure = || {
+            classify_exec_status(
+                Some(Some(status("Failure"))),
+                "exec_stream_to_file",
+                &["pg_dump"],
+                "demo",
+                "bk-pg-alpha",
+            )
+            .expect_err("a Failure status")
+        };
+
+        let mut said = StderrCapture::default();
+        said.push(b"pg_dump: error: connection refused\n");
+        let msg = with_stderr(failure(), Some(&said)).to_string();
+        assert!(msg.contains("NonZeroExitCode"), "{msg}");
+        assert!(
+            msg.ends_with("command stderr:\npg_dump: error: connection refused"),
+            "{msg}"
+        );
+
+        let bare = failure().to_string();
+        let mut blank = StderrCapture::default();
+        blank.push(b"  \n");
+        assert_eq!(with_stderr(failure(), Some(&blank)).to_string(), bare);
+        assert_eq!(with_stderr(failure(), None).to_string(), bare);
     }
 
     // -----------------------------------------------------------------------

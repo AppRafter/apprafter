@@ -408,8 +408,9 @@ pub(crate) fn pg_dump_pod_spec_with_password(
 ///
 /// * **Pg** — reads the connection Secret (decomposed keys `user`, `pass`,
 ///   `host`, `port`, `db`) via `k.get_secret_key`; applies a helper pod with
-///   `PGPASSWORD` injected into its container env; execs `pg_dump -Fc -h
-///   <host> -U <user> -p <port> <db>` and streams stdout to
+///   `PGPASSWORD` injected into its container env; execs `pg_dump -Fc
+///   --lock-wait-timeout=300s -h <host> -U <user> -p <port> <db>` (see
+///   [`PG_DUMP_LOCK_WAIT_TIMEOUT`]) and streams stdout to
 ///   `pg/<ns>/<claim>.dump`; deletes the pod (best-effort).
 ///
 /// * **Volume** — applies a busybox pod that mounts `item.source` (the PVC
@@ -513,7 +514,35 @@ fn extract_pg(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path, pg_image: &s
     let owned = pg_dump_argv(&db, &user, &host, &port);
     let argv: Vec<&str> = owned.iter().map(String::as_str).collect();
     exec_stream_to_file(k, &pod_name, ns, &argv, &dump_path)
+        .map_err(|e| explain_pg_dump_error(e, ns, claim))
     // _guard drops here (or on any earlier return) → delete_pod_best_effort called.
+}
+
+/// Put a sentence in front of a `pg_dump` failure whose cause is not obvious
+/// from `pg_dump`'s own words; any other error passes through unchanged.
+///
+/// Today that is the lock-wait timeout: `pg_dump` reports it as a cancelled
+/// statement (`canceling statement due to statement timeout`, with `Query was:
+/// LOCK TABLE …` as the detail), which reads like a slow query rather than
+/// another session holding a lock on the database. The original text is kept
+/// in full after the sentence — it names the tables.
+///
+/// Matches on the exec error's text, which carries `pg_dump`'s stderr on both
+/// `KubeExec` implementations (the CLI's `kubectl exec` and the runner's
+/// kube-rs exec).
+pub fn explain_pg_dump_error(err: CliError, ns: &str, claim: &str) -> CliError {
+    let msg = err.to_string();
+    if msg.contains("canceling statement due to statement timeout") && msg.contains("LOCK TABLE") {
+        return CliError::Other(format!(
+            "pg dump of {ns}/{claim} gave up: another session held a lock that conflicts \
+             with the dump's read lock on one of its tables (an ALTER TABLE or other \
+             migration, VACUUM FULL, CLUSTER, or a LOCK TABLE in an open transaction) for \
+             longer than {PG_DUMP_LOCK_WAIT_TIMEOUT}, so pg_dump stopped waiting and no data \
+             was dumped. Run the backup again once that lock is released; \
+             pg_stat_activity shows which session holds it.\n{msg}"
+        ));
+    }
+    err
 }
 
 /// Extract a single `Volume` (disk / shared-disk) claim.
@@ -672,6 +701,39 @@ fn extract_redis(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Result
     exec_stream_to_file(k, &pod, df_ns, &argv, &tar_path)
 }
 
+/// How long `pg_dump` may wait for the table locks it takes before it reads
+/// any data: its `--lock-wait-timeout`, in PostgreSQL's `statement_timeout`
+/// syntax.
+///
+/// `pg_dump` starts by taking `ACCESS SHARE` on every table it will dump. A
+/// session holding a conflicting lock — a migration's `ALTER TABLE`, `VACUUM
+/// FULL`, `CLUSTER`, a `LOCK TABLE` left open in an idle transaction — makes
+/// it wait, silently, for as long as that lock is held. Without this flag the
+/// wait is unbounded, and the scheduled runner (a `concurrencyPolicy: Forbid`
+/// CronJob) then misses every later backup behind the one that is waiting.
+///
+/// The bound applies to lock acquisition ONLY: `pg_dump` sets
+/// `statement_timeout` for its `LOCK TABLE` statement and clears it before it
+/// reads a row, so a large table whose `COPY` runs for hours is unaffected
+/// (measured on PostgreSQL 18: a `COPY` stalled well past a 1 s bound
+/// completed). Once the locks are held nothing else can block the dump, which
+/// is why this one flag covers the lock-wait hang.
+///
+/// Why five minutes: it restores the bound the runner had by accident up to
+/// kube-rs 0.95. `pg_dump -Fc` writes nothing until it holds its locks, and
+/// the client's 295 s read timeout cut any exec stream that stayed silent that
+/// long, so a dump behind a held lock failed after about five minutes. kube-rs
+/// 4 keeps an exec stream alive with 60 s pings, which removed that cut — see
+/// `apprafter-backup`'s `tls` module. `300s` is that bound made explicit,
+/// rounded to a figure the documentation can state, and it applies to the
+/// CLI's `apprafter backup` as well, which shares this argv.
+///
+/// When it fires, `pg_dump` exits 1 with `canceling statement due to statement
+/// timeout` and a `Query was: LOCK TABLE …` detail naming every table (one
+/// statement since PostgreSQL 18); [`explain_pg_dump_error`] turns that into
+/// a sentence about the lock.
+pub const PG_DUMP_LOCK_WAIT_TIMEOUT: &str = "300s";
+
 /// Build the `pg_dump` argument vector for a custom-format dump.
 ///
 /// Returns a `Vec<String>` so the caller is not constrained by the lifetime of
@@ -682,6 +744,7 @@ pub fn pg_dump_argv(db: &str, user: &str, host: &str, port: &str) -> Vec<String>
         "pg_dump".to_string(),
         "-Fc".to_string(),
         "--compress=0".to_string(),
+        format!("--lock-wait-timeout={PG_DUMP_LOCK_WAIT_TIMEOUT}"),
         "-h".to_string(),
         host.to_string(),
         "-U".to_string(),
@@ -828,6 +891,62 @@ mod tests {
             "argv missing --compress=0: {argv:?}"
         );
         assert!(argv.iter().any(|a| a == "-Fc"), "argv: {argv:?}");
+    }
+
+    #[test]
+    fn pg_dump_argv_bounds_the_lock_wait_to_five_minutes() {
+        let argv = pg_dump_argv("appdb", "approle", "hostx", "5432");
+        let flag = argv
+            .iter()
+            .position(|a| a == "--lock-wait-timeout=300s")
+            .unwrap_or_else(|| panic!("argv missing --lock-wait-timeout=300s: {argv:?}"));
+        // The database is the one positional argument and stays last, so the
+        // flag is never read as a database name by a getopt that does not
+        // permute.
+        assert_eq!(argv.last().map(String::as_str), Some("appdb"), "{argv:?}");
+        assert!(flag < argv.len() - 1, "flag after the database: {argv:?}");
+        assert_eq!(
+            argv.iter()
+                .filter(|a| a.starts_with("--lock-wait-timeout"))
+                .count(),
+            1,
+            "{argv:?}"
+        );
+    }
+
+    /// The error `pg_dump` 18 printed when a `LOCK TABLE … IN ACCESS
+    /// EXCLUSIVE MODE` was held past `--lock-wait-timeout` (captured on a
+    /// `postgres:18-alpine` server), as the runner's exec reports it.
+    const PG18_LOCK_TIMEOUT_STDERR: &str = "pg_dump: error: query failed: ERROR:  canceling \
+        statement due to statement timeout\npg_dump: detail: Query was: LOCK TABLE public.t1, \
+        public.t2 IN ACCESS SHARE MODE";
+
+    #[test]
+    fn a_lock_wait_timeout_is_explained_as_a_held_lock() {
+        let raw = CliError::Other(format!(
+            "exec_stream_to_file: exec [\"pg_dump\"] in demo/bk-pg-db failed (status=Some(\"Failure\"), \
+             reason=NonZeroExitCode): command terminated with non-zero exit code\n\
+             command stderr:\n{PG18_LOCK_TIMEOUT_STDERR}"
+        ));
+        let msg = explain_pg_dump_error(raw, "demo", "db").to_string();
+        assert!(msg.starts_with("pg dump of demo/db gave up"), "{msg}");
+        assert!(msg.contains("lock"), "{msg}");
+        assert!(msg.contains("300s"), "states the bound: {msg}");
+        // pg_dump's own text survives: it is what names the tables.
+        assert!(msg.contains("LOCK TABLE public.t1, public.t2"), "{msg}");
+    }
+
+    #[test]
+    fn other_pg_dump_errors_pass_through_unchanged() {
+        for text in [
+            "pg_dump: error: server version mismatch",
+            // A statement timeout that is not the lock phase is not a lock.
+            "ERROR:  canceling statement due to statement timeout",
+            "Query was: LOCK TABLE public.t1 IN ACCESS SHARE MODE",
+        ] {
+            let msg = explain_pg_dump_error(CliError::Other(text.into()), "demo", "db").to_string();
+            assert_eq!(msg, text);
+        }
     }
 
     #[test]
