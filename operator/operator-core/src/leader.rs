@@ -22,6 +22,8 @@ use kube::Client;
 use thiserror::Error;
 use tracing::{info, warn};
 
+use crate::k8s_time::{from_micro_time, micro_time};
+
 /// Default Lease duration. The renew interval is one-third of this
 /// value so we get three renewal attempts before a takeover window
 /// opens.
@@ -183,12 +185,12 @@ impl LeaderElection {
 fn lease_spec(config: &LeaderConfig, now: DateTime<Utc>, prior: Option<&LeaseSpec>) -> LeaseSpec {
     let acquire_time = prior
         .and_then(|p| p.acquire_time.clone())
-        .unwrap_or(MicroTime(now));
+        .unwrap_or_else(|| micro_time(now));
     LeaseSpec {
         holder_identity: Some(config.holder_id.clone()),
         lease_duration_seconds: Some(config.lease_duration.as_secs() as i32),
         acquire_time: Some(acquire_time),
-        renew_time: Some(MicroTime(now)),
+        renew_time: Some(micro_time(now)),
         ..LeaseSpec::default()
     }
 }
@@ -225,7 +227,7 @@ fn is_lease_stale(
 ) -> bool {
     match renew_time {
         Some(t) => {
-            let elapsed = now.signed_duration_since(t.0);
+            let elapsed = now.signed_duration_since(from_micro_time(t));
             elapsed.num_seconds() > lease_duration.as_secs() as i64
         }
         None => true,
@@ -255,7 +257,7 @@ mod tests {
     #[test]
     fn fresh_lease_is_not_stale() {
         let now = Utc::now();
-        let renew = MicroTime(now);
+        let renew = micro_time(now);
         // 0 seconds elapsed — not stale.
         assert!(!is_lease_stale(Some(&renew), Duration::from_secs(30), now));
     }
@@ -264,7 +266,7 @@ mod tests {
     fn lease_older_than_lease_duration_is_stale() {
         let now = Utc::now();
         let earlier = now - chrono::Duration::seconds(31);
-        let renew = MicroTime(earlier);
+        let renew = micro_time(earlier);
         // 31s elapsed > 30s lease duration — stale.
         assert!(is_lease_stale(Some(&renew), Duration::from_secs(30), now));
     }
@@ -277,7 +279,7 @@ mod tests {
         // Declaring it stale one tick early is how two operators end up
         // applying the same objects at the same time.
         let now = Utc::now();
-        let renew = MicroTime(now - chrono::Duration::seconds(30));
+        let renew = micro_time(now - chrono::Duration::seconds(30));
         assert!(!is_lease_stale(Some(&renew), Duration::from_secs(30), now));
     }
 
@@ -338,14 +340,14 @@ mod tests {
         let acquired = Utc::now() - chrono::Duration::seconds(600);
         let prior = LeaseSpec {
             holder_identity: Some("operator-a".to_string()),
-            acquire_time: Some(MicroTime(acquired)),
-            renew_time: Some(MicroTime(acquired)),
+            acquire_time: Some(micro_time(acquired)),
+            renew_time: Some(micro_time(acquired)),
             ..LeaseSpec::default()
         };
         let now = Utc::now();
         let spec = lease_spec(&cfg, now, Some(&prior));
-        assert_eq!(spec.acquire_time, Some(MicroTime(acquired)));
-        assert_eq!(spec.renew_time, Some(MicroTime(now)));
+        assert_eq!(spec.acquire_time, Some(micro_time(acquired)));
+        assert_eq!(spec.renew_time, Some(micro_time(now)));
     }
 
     #[test]
@@ -356,7 +358,7 @@ mod tests {
         let cfg = LeaderConfig::for_apprafter_operator("operator-a");
         let now = Utc::now();
         let spec = lease_spec(&cfg, now, Some(&LeaseSpec::default()));
-        assert_eq!(spec.acquire_time, Some(MicroTime(now)));
+        assert_eq!(spec.acquire_time, Some(micro_time(now)));
     }
 
     #[test]
@@ -372,6 +374,35 @@ mod tests {
         assert_eq!(
             spec.lease_duration_seconds,
             Some(cfg.lease_duration.as_secs() as i32)
+        );
+    }
+
+    /// The written LeaseSpec, byte for byte. `acquireTime`/`renewTime` are
+    /// `metav1.MicroTime`, which the apiserver parses with Go's fixed-width
+    /// RFC3339Micro: exactly six fractional digits, `Z`. A whole-second
+    /// `now` is the case a lenient formatter breaks (it would drop the
+    /// `.000000` and every renewal on that second would be a 400). Pinning
+    /// the whole object also pins that no new optional LeaseSpec field
+    /// (`strategy`, `preferredHolder`) leaks onto the wire as a null.
+    #[test]
+    fn the_written_lease_spec_is_pinned_byte_for_byte() {
+        let cfg = LeaderConfig::for_apprafter_operator("operator-a");
+        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+        let prior = LeaseSpec {
+            holder_identity: Some("operator-a".to_string()),
+            acquire_time: Some(micro_time(at("2026-09-22T17:43:31.5Z"))),
+            renew_time: Some(micro_time(at("2026-09-22T17:53:21.123456Z"))),
+            ..LeaseSpec::default()
+        };
+        let renewal = lease_spec(&cfg, at("2026-09-22T17:53:31Z"), Some(&prior));
+        assert_eq!(
+            serde_json::to_string(&renewal).unwrap(),
+            r#"{"acquireTime":"2026-09-22T17:43:31.500000Z","holderIdentity":"operator-a","leaseDurationSeconds":30,"renewTime":"2026-09-22T17:53:31.000000Z"}"#
+        );
+        let first = lease_spec(&cfg, at("2026-09-22T17:53:31.987654321Z"), None);
+        assert_eq!(
+            serde_json::to_string(&first).unwrap(),
+            r#"{"acquireTime":"2026-09-22T17:53:31.987654Z","holderIdentity":"operator-a","leaseDurationSeconds":30,"renewTime":"2026-09-22T17:53:31.987654Z"}"#
         );
     }
 
@@ -482,8 +513,8 @@ mod tests {
             "spec": {
                 "holderIdentity": holder,
                 "leaseDurationSeconds": 30,
-                "acquireTime": MicroTime(acquired),
-                "renewTime": MicroTime(renewed),
+                "acquireTime": micro_time(acquired),
+                "renewTime": micro_time(renewed),
             },
         })
     }
@@ -536,9 +567,14 @@ mod tests {
             _ => (201, lease_json("operator-a", Utc::now(), Utc::now())),
         });
         let le = election(client.clone(), Duration::from_millis(1));
+        // A whole-second clock: the value a lenient MicroTime formatter
+        // would write without its `.000000`, which the apiserver rejects.
+        let now = DateTime::parse_from_rfc3339("2026-09-22T17:53:31Z")
+            .unwrap()
+            .with_timezone(&Utc);
 
         assert!(le
-            .acquire_or_renew(&lease_api(&client), Utc::now())
+            .acquire_or_renew(&lease_api(&client), now)
             .await
             .expect("creating the first Lease must succeed"));
 
@@ -567,6 +603,14 @@ mod tests {
                 .and_then(Value::as_i64),
             Some(30)
         );
+        // The bytes the real client put on the wire for both MicroTimes.
+        for field in ["/spec/acquireTime", "/spec/renewTime"] {
+            assert_eq!(
+                calls[1].body.pointer(field).and_then(Value::as_str),
+                Some("2026-09-22T17:53:31.000000Z"),
+                "{field} must be RFC3339Micro on the wire"
+            );
+        }
     }
 
     /// THE invariant of the whole module: a Lease held by another operator

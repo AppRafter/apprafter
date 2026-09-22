@@ -18,7 +18,7 @@ members = [
 [workspace.package]
 version      = "0.1.2"
 edition      = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 # Never published to crates.io: these crates are a product, not a library,
 # and nothing in .github/workflows runs `cargo publish`. Declaring it makes
 # that explicit rather than merely true by omission, stops an accidental
@@ -48,10 +48,25 @@ thiserror          = "2"
 # whole array and silently discard a concurrent co-owner. The feature adds
 # no compilation: `json-patch` is already an unconditional dependency of
 # kube-runtime, so this only makes the enum variant visible.
-kube               = { version = "0.95", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "jsonpatch"] }
-json-patch         = "2"
-k8s-openapi        = { version = "0.23", default-features = false, features = ["v1_31"] }
-schemars           = "0.8"
+#
+# `aws-lc-rs` names the rustls crypto provider: since kube 0.99 `rustls-tls`
+# no longer brings `ring` along, and with this feature kube-client installs
+# aws-lc-rs as the process default when nothing has yet. aws-lc-rs because
+# the operator, the webhook and the sourcecredential probes already install
+# `rustls::crypto::aws_lc_rs::default_provider()` explicitly (see
+# `install_rustls_crypto_provider`) and aws-lc-rs is already in the build.
+# async-nats (the provisioner's JetStream client) still compiles `ring` into
+# rustls as well, and with two providers rustls picks neither on its own —
+# which is why that explicit install stays load-bearing.
+#
+# k8s-openapi `v1_36` matches the Kubernetes production runs (1.36.x);
+# 0.28 carries v1_32..v1_36 only, and kube 4.x requires ^0.28. It swaps
+# chrono for jiff in `metav1::Time`/`MicroTime` — `operator_core::k8s_time`
+# is the one place that converts, and pins the wire format.
+kube               = { version = "4.2.0", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "aws-lc-rs", "jsonpatch"] }
+json-patch         = "4"
+k8s-openapi        = { version = "0.28.0", default-features = false, features = ["v1_36"] }
+schemars           = "1"
 futures            = "0.3"
 prometheus         = { version = "0.14", default-features = false }
 chrono             = { version = "0.4", default-features = false, features = ["clock", "serde"] }

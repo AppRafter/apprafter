@@ -1561,7 +1561,7 @@ async fn sweep_cnpg(
 mod tests {
     use super::*;
     use chrono::Utc;
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
     use operator_core::{
         ResourceClaimSpec, ResourceClaimStatus, RetainedClaimSpec, ServiceProviderSpec,
     };
@@ -1632,7 +1632,7 @@ mod tests {
     }
 
     fn terminating(mut c: ResourceClaim) -> ResourceClaim {
-        c.metadata.deletion_timestamp = Some(Time(Utc::now()));
+        c.metadata.deletion_timestamp = Some(operator_core::k8s_time::time(Utc::now()));
         c
     }
 
@@ -1789,9 +1789,7 @@ mod tests {
         // the reaper would hold a dwell open against an object that is
         // itself waiting to go.
         let mut sd = shared_on("orders", "pg", Some("platform-postgres"));
-        sd.metadata.deletion_timestamp = Some(
-            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(chrono::Utc::now()),
-        );
+        sd.metadata.deletion_timestamp = Some(operator_core::k8s_time::time(chrono::Utc::now()));
         assert_eq!(
             reap_decision(
                 &cnpg_target("platform-postgres"),
@@ -2491,7 +2489,15 @@ mod tests {
         assert_eq!(ops[1]["path"], "/metadata/ownerReferences/1");
 
         let mut doc = pvc_doc(&meta);
-        let patch: json_patch::Patch = serde_json::from_value(Value::Array(ops)).unwrap();
+        let patch: json_patch::Patch = serde_json::from_value(Value::Array(ops.clone())).unwrap();
+        // What `Patch::Json(patch)` puts on the wire is the ops verbatim:
+        // json-patch 4 parses `path` into a JSON Pointer and must serialize
+        // it back unchanged, or the apiserver tests/removes the wrong index.
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap(),
+            Value::Array(ops),
+            "the RFC 6902 body sent to the apiserver must be the ops as built"
+        );
         json_patch::patch(&mut doc, &patch).expect("the strip must apply cleanly");
         let left = doc["metadata"]["ownerReferences"].as_array().unwrap();
         assert_eq!(left.len(), 1, "the co-owner must survive the strip");

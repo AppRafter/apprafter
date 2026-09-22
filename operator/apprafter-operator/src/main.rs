@@ -20,7 +20,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use apprafter_operator::{build_router, install_rustls_crypto_provider};
+use apprafter_operator::{
+    build_router, install_rustls_crypto_provider, with_operator_client_defaults,
+};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::api::Api;
 use kube::Client;
@@ -117,7 +119,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     install_rustls_crypto_provider();
 
     let metrics = Arc::new(Metrics::new());
-    let client = Client::try_default().await?;
+    // `Client::try_default()` is `Config::infer()` + `Client::try_from`;
+    // the step between them restores the pre-kube-4 read timeout and
+    // switches off kube 4's in-call retries (see the helper's docs).
+    let client = Client::try_from(with_operator_client_defaults(kube::Config::infer().await?))?;
 
     let port: u16 = env::var("HTTP_PORT")
         .ok()

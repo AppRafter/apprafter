@@ -359,11 +359,9 @@ mod tests {
     fn declared_need_types() -> Vec<String> {
         let schema = schemars::schema_for!(operator_core::Needs);
         let props = schema
-            .schema
-            .object
-            .as_ref()
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
             .expect("Needs is an object schema")
-            .properties
             .keys()
             .cloned()
             .collect::<Vec<String>>();

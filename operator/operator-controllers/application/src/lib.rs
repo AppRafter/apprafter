@@ -18,9 +18,10 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::runtime::controller::{Action, Controller};
-use kube::runtime::events::{Event as KubeEvent, EventType, Recorder, Reporter};
+use kube::runtime::events::{Event as KubeEvent, EventType, Reporter};
 use kube::runtime::watcher;
 use kube::{Client, Resource, ResourceExt};
+use operator_core::events::ObjectRecorder;
 use serde_json::{json, Value};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -2719,13 +2720,13 @@ async fn selector_multiprovider_tripwire(
 /// given `Application`. Constructing per-reconcile keeps `reconcile` pure;
 /// `Recorder::new` is cheap (wires an Api + reference). Mirrors the scheduler
 /// / provisioner / platform-stack `build_recorder`.
-fn build_recorder(client: &Client, app: &Application) -> Recorder {
+fn build_recorder(client: &Client, app: &Application) -> ObjectRecorder {
     let reporter = Reporter {
         controller: EVENT_REPORTER_CONTROLLER.into(),
         instance: std::env::var("POD_NAME").ok(),
     };
     let reference: ObjectReference = app.object_ref(&());
-    Recorder::new(client.clone(), reporter, reference)
+    ObjectRecorder::new(client.clone(), reporter, reference)
 }
 
 /// 2.16b: flatten a `Needs` block into a `key → ServiceNeed` map keyed on
@@ -3015,7 +3016,8 @@ async fn emit_regate_signal(
         controller: EVENT_REPORTER_CONTROLLER.into(),
         instance: std::env::var("POD_NAME").ok(),
     };
-    let plan_recorder = Recorder::new(ctx.client.clone(), plan_reporter, plan.object_ref(&()));
+    let plan_recorder =
+        ObjectRecorder::new(ctx.client.clone(), plan_reporter, plan.object_ref(&()));
     if let Err(e) = plan_recorder
         .publish(build_regate_event(reason, &plan_name))
         .await
@@ -5065,10 +5067,9 @@ mod tests {
         // skip Applications carrying a deletionTimestamp, otherwise it
         // re-applies the Deployment a cascade delete is removing and the
         // Argo CD finalizer hangs forever.
-        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
         let mut app = Application::new("web", ApplicationSpec::default());
         assert!(!is_deletion_marked(&app));
-        app.metadata.deletion_timestamp = Some(Time(Utc::now()));
+        app.metadata.deletion_timestamp = Some(operator_core::k8s_time::time(Utc::now()));
         assert!(is_deletion_marked(&app));
     }
 
@@ -5818,9 +5819,7 @@ mod tests {
         // running and the retention snapshot is being written. A second
         // delete would race that.
         let mut c = owned_claim("web-pg", Some("uid-1"), true);
-        c.metadata.deletion_timestamp = Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
-            chrono::Utc::now(),
-        ));
+        c.metadata.deletion_timestamp = Some(operator_core::k8s_time::time(chrono::Utc::now()));
         assert!(claims_to_prune(&[c], "uid-1", &desired(&[])).is_empty());
     }
 

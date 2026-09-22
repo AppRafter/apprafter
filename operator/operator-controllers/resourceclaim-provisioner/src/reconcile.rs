@@ -2734,7 +2734,7 @@ async fn write_jetstream_status(
             instance: std::env::var("POD_NAME").ok(),
         };
         let reference: k8s_openapi::api::core::v1::ObjectReference = claim.object_ref(&());
-        kube::runtime::events::Recorder::new(ctx.client.clone(), reporter, reference)
+        operator_core::events::ObjectRecorder::new(ctx.client.clone(), reporter, reference)
     };
     let ev = kube::runtime::events::Event {
         type_: kube::runtime::events::EventType::Warning,
@@ -3153,7 +3153,7 @@ async fn snapshot_retained_claim(
         .metadata
         .deletion_timestamp
         .as_ref()
-        .map(|t| t.0)
+        .map(operator_core::k8s_time::from_time)
         .unwrap_or_else(Utc::now);
     let retain_until = grace::compute_retain_until(deletion, grace::GRACE_PERIOD).to_rfc3339();
 

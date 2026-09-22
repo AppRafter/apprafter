@@ -89,12 +89,11 @@ mod tests {
     /// twice shipped a controller whose RBAC did not match its code.
     #[test]
     fn a_wrapped_apiserver_error_keeps_the_apiservers_own_message() {
-        let denial = kube::Error::Api(kube::core::ErrorResponse {
-            status: "Failure".to_string(),
-            message: "resourceclaims.apprafter.io is forbidden".to_string(),
-            reason: "Forbidden".to_string(),
-            code: 403,
-        });
+        let denial = kube::Error::Api(
+            kube::core::Status::failure("resourceclaims.apprafter.io is forbidden", "Forbidden")
+                .with_code(403)
+                .boxed(),
+        );
         let shown = ReconcileError::from(denial).to_string();
         assert!(shown.contains("is forbidden"), "{shown}");
         assert!(shown.contains("Forbidden"), "{shown}");

@@ -843,9 +843,8 @@ mod tests {
             Some(true),
             Some("gone-conn"),
         );
-        deleting.metadata.deletion_timestamp = Some(
-            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(chrono::Utc::now()),
-        );
+        deleting.metadata.deletion_timestamp =
+            Some(operator_core::k8s_time::time(chrono::Utc::now()));
         let claims = vec![pg, deleting];
         assert!(claims_to_repin(&claims, "platform-redis-ephemeral-000").is_empty());
     }

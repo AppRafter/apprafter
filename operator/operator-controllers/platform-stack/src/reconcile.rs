@@ -19,10 +19,11 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::runtime::controller::{Action, Controller};
-use kube::runtime::events::{Event as KubeEvent, EventType, Recorder, Reporter};
+use kube::runtime::events::{Event as KubeEvent, EventType, Reporter};
 use kube::runtime::reflector::ObjectRef;
 use kube::runtime::watcher;
 use kube::{Client, Resource, ResourceExt};
+use operator_core::events::ObjectRecorder;
 use semver::Version;
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -84,13 +85,13 @@ const EVENT_REPORTER_CONTROLLER: &str = "platform-controller";
 /// reference + reporter. Constructing per-event keeps the
 /// reconcile function pure and avoids stashing mutable state
 /// in `Context`.
-fn build_recorder(ctx: &Context, stack: &PlatformStack) -> Recorder {
+fn build_recorder(ctx: &Context, stack: &PlatformStack) -> ObjectRecorder {
     let reporter = Reporter {
         controller: EVENT_REPORTER_CONTROLLER.into(),
         instance: std::env::var("POD_NAME").ok(),
     };
     let reference = stack.object_ref(&());
-    Recorder::new(ctx.client.clone(), reporter, reference)
+    ObjectRecorder::new(ctx.client.clone(), reporter, reference)
 }
 
 /// Static ObjectReference for the parent platform Application.
@@ -2285,12 +2286,14 @@ mod tests {
         // The exact failure that FROZE the reconcile pre-fix: a 403
         // Forbidden on the anchor GET must collapse to None (un-owned
         // plan), NOT propagate and abort before the status write.
-        let forbidden = kube::Error::Api(kube::core::ErrorResponse {
-            status: "Failure".to_string(),
-            message: "configmaps \"platform-migration-anchor\" is forbidden".to_string(),
-            reason: "Forbidden".to_string(),
-            code: 403,
-        });
+        let forbidden = kube::Error::Api(
+            kube::core::Status::failure(
+                "configmaps \"platform-migration-anchor\" is forbidden",
+                "Forbidden",
+            )
+            .with_code(403)
+            .boxed(),
+        );
         assert_eq!(anchor_uid_from_get(Err(forbidden)), None);
     }
 

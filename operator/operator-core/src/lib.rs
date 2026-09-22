@@ -3,6 +3,8 @@
 
 pub mod application;
 pub mod capacity;
+pub mod events;
+pub mod k8s_time;
 pub mod leader;
 pub mod matching;
 pub mod metrics;

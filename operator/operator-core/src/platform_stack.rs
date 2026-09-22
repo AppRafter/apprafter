@@ -297,10 +297,24 @@ pub struct PlatformStackValues {
 pub struct PlatformStackComponentOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin: Option<String>,
+    // `schema_with`, not the derived schema: schemars 1.x renders
+    // `serde_json::Value` as the boolean schema `true`, and the openapi3
+    // `ReplaceBoolSchemas` transform does not descend into
+    // `additionalProperties` — so under the `overrides` map this node stays a
+    // bare `true`, which kube-derive cannot read as a `JSONSchemaProps`, and
+    // `PlatformStack::crd()` panics (crdgen's assertion B is its only caller).
+    // `{"nullable": true}` is byte-for-byte what schemars 0.8 emitted here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "untyped_nullable")]
     pub values: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+}
+
+/// An untyped, nullable schema node — what schemars 0.8 derived for an
+/// `Option<serde_json::Value>`. See `PlatformStackComponentOverride.values`.
+fn untyped_nullable(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "nullable": true })
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -372,6 +386,21 @@ pub struct PlatformStackCondition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `PlatformStack::crd()` panicked under schemars 1.x ("valid
+    /// JSONSchemaProps from schemars schema: invalid type: boolean `true`")
+    /// because the untyped `overrides.*.values` node, nested under
+    /// `additionalProperties`, survived as the boolean schema `true`. crdgen's
+    /// assertion B is its only caller, so the panic would surface as a red
+    /// `crd-check` with no hint of the cause — pin the node here instead.
+    #[test]
+    fn the_derived_crd_builds_with_override_values_as_an_untyped_node() {
+        use kube::CustomResourceExt;
+        let crd = serde_json::to_value(PlatformStack::crd()).expect("derived CRD");
+        let values = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["overrides"]["additionalProperties"]["properties"]["values"];
+        assert_eq!(values, &serde_json::json!({ "nullable": true }));
+    }
 
     #[test]
     fn default_environment_round_trips_camel_case() {

@@ -26,9 +26,10 @@ use k8s_openapi::api::core::v1::{Node, ObjectReference};
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParams};
 use kube::core::GroupVersionKind;
 use kube::runtime::controller::Action;
-use kube::runtime::events::{Event as KubeEvent, EventType, Recorder, Reporter};
+use kube::runtime::events::{Event as KubeEvent, EventType, Reporter};
 use kube::runtime::reflector::{ObjectRef, Store};
 use kube::{Client, Resource, ResourceExt};
+use operator_core::events::ObjectRecorder;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
@@ -698,13 +699,13 @@ async fn first_node_name(client: &Client) -> Option<String> {
 /// Build a `Recorder` that publishes Events against the given
 /// `SharedVolume`. Per-reconcile construction keeps the reconcile pure;
 /// `Recorder::new` is cheap.
-fn build_recorder(client: &Client, sv: &SharedVolume) -> Recorder {
+fn build_recorder(client: &Client, sv: &SharedVolume) -> ObjectRecorder {
     let reporter = Reporter {
         controller: EVENT_REPORTER_CONTROLLER.into(),
         instance: std::env::var("POD_NAME").ok(),
     };
     let reference: ObjectReference = sv.object_ref(&());
-    Recorder::new(client.clone(), reporter, reference)
+    ObjectRecorder::new(client.clone(), reporter, reference)
 }
 
 /// Merge-patch the SharedVolume's `metadata.finalizers` to `list`.
