@@ -179,6 +179,15 @@ Judge a run **by reading the log**: every leg prints an `ok:` line, failures
 print `ERROR:` to stderr, and the final `GREEN` banner prints only on the
 success path (a `sandbox-run` wrapper masks the inner exit code).
 
+Do not size memory limits from a `sandbox-run` walk. The microVM's root
+filesystem is a tmpfs, so every file a pod writes (emptyDirs, container
+layers, git clones) is unreclaimable shared memory charged to the pod, and
+its memory numbers come out inflated; the Argo CD repo-server pod holds
+~390Mi it cannot reclaim there, roughly twice what it holds on a disk-backed
+node. Measure limits on disk-backed
+kind (rootless podman on the host) or in CI, and check `memory.stat` `shmem`
+before trusting a number.
+
 ## substrate-upgrade-hetzner.sh
 
 Real-Hetzner proof that a cluster can be moved onto a **bigger machine**
