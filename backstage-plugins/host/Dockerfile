@@ -5,7 +5,7 @@
 # 20 because Backstage 1.34+ requires it.
 
 # ---- builder ---------------------------------------------------
-FROM node:20-bookworm-slim AS build
+FROM node:24.12-bookworm-slim AS build
 
 WORKDIR /app
 
@@ -37,7 +37,7 @@ RUN yarn tsc \
  && yarn build:backend
 
 # ---- runtime ---------------------------------------------------
-FROM node:20-bookworm-slim
+FROM node:24.12-bookworm-slim
 
 # Native modules at runtime (sqlite3 if you stay on the default
 # config; libpq for Postgres).

@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Multi-stage build for the AppRafter bun-http-starter.
 #
-# Builder uses oven/bun:1-debian for npm-compatible install + the
+# Builder uses oven/bun:1.4-debian for npm-compatible install + the
 # Bun bundler; runtime is the distroless nodejs image (Bun bundles
 # to a self-contained CommonJS file the Node runtime can execute,
 # avoiding the need to ship Bun in the runtime layer).
 
-FROM oven/bun:1-debian AS builder
+FROM oven/bun:1.4-debian AS builder
 
 WORKDIR /workspace
 
@@ -26,7 +26,7 @@ RUN bun build src/index.ts \
         --format cjs \
         --minify
 
-FROM gcr.io/distroless/nodejs20-debian12:nonroot
+FROM gcr.io/distroless/nodejs24-debian12:nonroot
 
 COPY --from=builder /workspace/dist/index.cjs /app/index.cjs
 

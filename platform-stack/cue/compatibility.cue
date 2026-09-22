@@ -1934,6 +1934,42 @@ compatibility: "0.2.74": {
 	]
 }
 
+compatibility: "0.2.80": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.52"
+	notes: """
+		DEPENDENCY SWEEP — no behaviour change intended, and the operator and
+		webhook pods restart once on the new images.
+
+		Rust dependencies moved across both workspaces (issue #1's first
+		upstream version-watch run). The lockfile refresh alone clears four
+		RUSTSEC advisories, the load-bearing one being RUSTSEC-2026-0285:
+		rustls accepted TLS 1.3 handshake messages across encryption-level
+		boundaries, and rustls sits on the live path twice here — kube-client
+		and the outbound registry/HTTP clients.
+
+		Direct majors taken: axum 0.7 -> 0.8, axum-server 0.7 -> 0.8,
+		thiserror 1 -> 2, prometheus 0.13 -> 0.14, base64 0.22 -> 0.23,
+		rand 0.8 -> 0.9, redis 0.27 -> 1.7. The redis move is the only one
+		that changed code shape: redis 1.0 made ConnectionInfo and
+		RedisConnectionInfo non-constructible by struct literal, so the
+		Dragonfly admin client now builds them through the builder. Same
+		connection, same RESP2, and the password still never enters a URL.
+
+		Base images: the builder moves to rust 1.98-alpine3.24 and the
+		runtime bases to their current minors. Alpine 3.20 had been EOL since
+		2026-04-01 and 3.21 expires 2026-11-01, so the CMP sidecar and the
+		backup runner were building on unsupported bases.
+
+		Nothing in the rendered chart changes except the operator and webhook
+		image tags.
+		"""
+	references: [
+		"WI-352",
+		"https://github.com/AppRafter/apprafter/issues/1",
+	]
+}
+
 compatibility: "0.2.79": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.51"

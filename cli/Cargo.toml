@@ -15,7 +15,7 @@ members = [
 # Bumped to match each released patch tag per the CONTRIBUTING.md
 # "Versioning" rule. Drifted at 0.1.2 from initial v0.1.2 commit
 # through v0.1.76; the policy starts at v0.1.77.
-version      = "0.2.76"
+version      = "0.2.77"
 edition      = "2021"
 rust-version = "1.88"
 license      = "FSL-1.1-Apache-2.0"
@@ -29,7 +29,7 @@ clap                 = { version = "4.5", features = ["derive", "env"] }
 # verbatim rather than a floor of its own: one edit then moves both, and
 # a mismatch is a compile error rather than a subtly wrong script.
 clap_complete        = "4.5"
-thiserror            = "1.0"
+thiserror            = "2"
 tracing              = "0.1"
 tracing-subscriber   = { version = "0.3", features = ["env-filter", "fmt"] }
 serde                = { version = "1.0", features = ["derive"] }
@@ -42,18 +42,18 @@ predicates           = "3.1"
 tempfile             = "3.10"
 ureq                 = { version = "2.10", features = ["json"] }
 mockito              = "1.5"
-age                  = { version = "0.10", default-features = false, features = ["armor"] }
-base64               = "0.22"
+age                  = { version = "0.12", default-features = false, features = ["armor"] }
+base64               = "0.23"
 rsa                  = "0.9"
-aes-gcm              = "0.10"
+aes-gcm              = "0.11"
 sha2                 = "0.10"
-x509-cert            = { version = "0.2", features = ["pem"] }
+x509-cert            = { version = "0.3", features = ["pem"] }
 rand                 = "0.8"
 include_dir          = "0.7"
-dirs                 = "5"
-indicatif            = "0.17"
-inquire              = "0.7"
-tabled               = "0.15"
+dirs                 = "7"
+indicatif            = "0.18"
+inquire              = "0.9"
+tabled               = "0.22"
 semver               = { version = "1", features = ["serde"] }
 arboard              = { version = "3", default-features = false }
 chrono               = { version = "0.4", default-features = false, features = ["clock", "serde"] }

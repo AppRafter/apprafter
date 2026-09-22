@@ -33,7 +33,7 @@
 # result. If you want the image to build itself, change the flake, not
 # this file.
 
-FROM caddy:2-alpine
+FROM caddy:2.11-alpine
 
 COPY site /usr/share/caddy
 COPY Caddyfile /etc/caddy/Caddyfile

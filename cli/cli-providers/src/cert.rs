@@ -53,8 +53,8 @@ pub fn parse_and_validate(cert_pem: &str, key_pem: &str) -> Result<ImportedCert>
     }
 
     let spki_der = cert
-        .tbs_certificate
-        .subject_public_key_info
+        .tbs_certificate()
+        .subject_public_key_info()
         .to_der()
         .map_err(|e| CliError::Other(format!("encode certificate SPKI: {e}")))?;
     let cert_pub = RsaPublicKey::from_public_key_der(&spki_der).map_err(|_| {
@@ -73,8 +73,8 @@ pub fn parse_and_validate(cert_pem: &str, key_pem: &str) -> Result<ImportedCert>
 
     Ok(ImportedCert {
         sans,
-        not_before: time_to_utc(&cert.tbs_certificate.validity.not_before),
-        not_after: time_to_utc(&cert.tbs_certificate.validity.not_after),
+        not_before: time_to_utc(&cert.tbs_certificate().validity().not_before),
+        not_after: time_to_utc(&cert.tbs_certificate().validity().not_after),
         cert_pem: cert_pem.to_string(),
         key_pem: key_pem.to_string(),
     })
@@ -96,9 +96,12 @@ fn parse_rsa_private_key(key_pem: &str) -> Result<RsaPrivateKey> {
 }
 
 fn dns_sans(cert: &Certificate) -> Result<Vec<String>> {
+    // x509-cert 0.3 renamed the extension accessor `get` -> `get_extension`
+    // (still on TbsCertificate). Same semantics: Ok(None) when absent, Err
+    // when the extension appears more than once.
     let Some((_critical, san)) = cert
-        .tbs_certificate
-        .get::<SubjectAltName>()
+        .tbs_certificate()
+        .get_extension::<SubjectAltName>()
         .map_err(|e| CliError::Other(format!("decode SubjectAltName: {e}")))?
     else {
         return Ok(Vec::new());

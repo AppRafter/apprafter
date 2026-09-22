@@ -67,12 +67,18 @@
 # PROMPT interactively for the registry, which hangs the LOCAL_
 # OPERATOR e2e build (`e2e/needs-disk-walk.sh`). Docker buildx
 # resolves the qualified form identically, so CI is unaffected.
-FROM docker.io/library/rust:1.88-alpine3.21 AS chef
-ARG CARGO_CHEF_VERSION=0.1.71
-RUN apk add --no-cache musl-dev curl tar \
+FROM docker.io/library/rust:1.98-alpine3.24 AS chef
+ARG CARGO_CHEF_VERSION=0.1.78
+# cargo-chef switched its release tooling to cargo-dist at 0.1.75, which
+# changed BOTH the asset name (.tar.gz -> .tar.xz) and the archive layout
+# (the binary is now nested in a per-target directory). Hence the `xz`
+# package and `--strip-components=1`; without either, the build fails at
+# image-build time rather than anywhere a test would see it.
+RUN apk add --no-cache musl-dev curl tar xz \
  && curl --proto '=https' --tlsv1.2 -fsSL \
-      "https://github.com/LukeMathWalker/cargo-chef/releases/download/v${CARGO_CHEF_VERSION}/cargo-chef-x86_64-unknown-linux-musl.tar.gz" \
-    | tar -xz -C /usr/local/bin/ cargo-chef \
+      "https://github.com/LukeMathWalker/cargo-chef/releases/download/v${CARGO_CHEF_VERSION}/cargo-chef-x86_64-unknown-linux-musl.tar.xz" \
+    | tar -xJ --strip-components=1 -C /usr/local/bin/ \
+        cargo-chef-x86_64-unknown-linux-musl/cargo-chef \
  && chmod +x /usr/local/bin/cargo-chef
 WORKDIR /workspace
 

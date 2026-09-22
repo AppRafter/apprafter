@@ -16,7 +16,7 @@
 # -----------------------------------------------------------------
 # Stage 1: build the Next.js + Payload bundle
 # -----------------------------------------------------------------
-FROM oven/bun:1-alpine AS builder
+FROM oven/bun:1.4-alpine AS builder
 WORKDIR /landing
 
 # Build deps for Sharp's prebuilt musl binaries.
@@ -80,7 +80,7 @@ RUN set -eu; mkdir -p /landing/runtime-deps; \
 # -----------------------------------------------------------------
 # Stage 2: minimal Node runtime
 # -----------------------------------------------------------------
-FROM node:24-alpine AS runtime
+FROM node:24.12-alpine AS runtime
 WORKDIR /app
 
 ENV NODE_ENV=production

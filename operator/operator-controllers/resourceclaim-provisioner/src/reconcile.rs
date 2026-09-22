@@ -27,7 +27,7 @@ use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, Patch, PatchParam
 use kube::core::GroupVersionKind;
 use kube::runtime::controller::Action;
 use kube::{Client, Resource as _, ResourceExt};
-use rand::distributions::Alphanumeric;
+use rand::distr::Alphanumeric;
 use rand::Rng;
 use serde_json::{json, Value};
 use tracing::{info, warn};
@@ -4444,7 +4444,7 @@ fn without_finalizer(current: &[String]) -> Vec<String> {
 
 /// Generate a random alphanumeric password for a managed role.
 pub(crate) fn generate_password() -> String {
-    rand::thread_rng()
+    rand::rng()
         .sample_iter(&Alphanumeric)
         .take(PASSWORD_LEN)
         .map(char::from)
@@ -4469,6 +4469,45 @@ pub(crate) async fn find_provider(
 
 #[cfg(test)]
 mod tests {
+
+    // ---- generate_password: the shape of every managed credential ----
+    //
+    // Added during the 2026-09 rand 0.8 -> 0.9 bump, which renamed
+    // `rand::distributions` to `rand::distr` and `thread_rng()` to `rng()`.
+    // Both are compile errors, so THAT bump was safe — but nothing here
+    // asserted the resulting string's length or alphabet, so a future
+    // dependency move that changed either (a different sampler, a narrower
+    // alphabet) would weaken every Postgres and Redis role this operator
+    // creates, silently and with every test still green. These pin the
+    // contract rather than the implementation.
+
+    #[test]
+    fn a_generated_password_is_exactly_password_len_chars() {
+        for _ in 0..64 {
+            assert_eq!(super::generate_password().len(), super::PASSWORD_LEN);
+        }
+    }
+
+    #[test]
+    fn a_generated_password_is_ascii_alphanumeric_only() {
+        // The value is interpolated into DSNs and SQL role statements, so a
+        // non-alphanumeric byte is a quoting bug waiting to happen, not just
+        // an aesthetic change.
+        for _ in 0..64 {
+            let pw = super::generate_password();
+            assert!(
+                pw.chars().all(|c| c.is_ascii_alphanumeric()),
+                "generated password carried a non-alphanumeric character: {pw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_generated_passwords_differ() {
+        // Guards the degenerate failure mode a seeded or stubbed RNG would
+        // introduce: same value every call, every role, every cluster.
+        assert_ne!(super::generate_password(), super::generate_password());
+    }
 
     // ---- 2.22d / D8: the materiality rule, alone ----
 

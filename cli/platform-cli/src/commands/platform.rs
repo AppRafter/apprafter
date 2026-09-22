@@ -418,7 +418,7 @@ pub(crate) fn render_conditions_table(conditions: &[ConditionRow]) -> String {
     let used = type_w + status_w + reason_w + overhead;
     let message_budget = terminal_width.saturating_sub(used).max(20);
     let mut t = Table::new(conditions);
-    t.with(Modify::new(Columns::single(3)).with(Width::wrap(message_budget)));
+    t.with(Modify::new(Columns::one(3)).with(Width::wrap(message_budget)));
     t.to_string()
 }
 

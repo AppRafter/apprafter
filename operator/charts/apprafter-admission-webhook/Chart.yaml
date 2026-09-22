@@ -8,7 +8,7 @@ description: |
   issues + rotates the TLS Certificate.
 type: application
 version: v0.2.51
-appVersion: "v0.2.51"
+appVersion: "v0.2.52"
 kubeVersion: ">= 1.29.0-0"
 home: https://github.com/apprafter/apprafter
 sources:
