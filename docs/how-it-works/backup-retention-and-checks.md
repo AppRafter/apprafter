@@ -245,11 +245,15 @@ not wedge the next night's backup.
 
 `apprafter backup status` lists the Jobs in `apprafter-system` whose names begin
 with `apprafter-backup`, splits them into backup Jobs and check Jobs, and prints
-the most recent of each as `Succeeded`, `Running`, `Failed` or `Unknown`. A red
+the most recent of each as `Succeeded`, `Running`, `Failed` or `Unknown`. A
+failed Job carries the reason Kubernetes gave it — `Failed: DeadlineExceeded:
+Job was active longer than specified deadline` for one stopped at its deadline,
+`Failed: BackoffLimitExceeded: …` for one whose every attempt failed. A red
 weekly check is therefore visible on the `Last check Job:` line.
 
-What that line cannot give you is the reason, and this is the part worth
-knowing: **the check Job never writes the runner's status ConfigMap.** Only the
+What that line cannot give you is the reason restic failed, and this is the
+part worth knowing: **the check Job never writes the runner's status
+ConfigMap.** Only the
 backup runner writes `apprafter-backup-status`, using server-side apply under
 the field manager `apprafter-backup` and merging its fields so that
 `lastSuccess` and `lastFailure` both survive across alternating runs (a
@@ -282,9 +286,9 @@ of 6h …`, and the failure webhook — and to delete the helper pod it was
 working in, before it exits. Each of those steps has its own bound, and
 together they fit well inside the 90 seconds. The check is restic on its own:
 it receives the signal itself, removes its repository lock and exits.
-`apprafter backup status` shows such a Job as `Failed`, and the next
-scheduled run then starts as normal. `apprafter backup run` copies the same
-Job template, so a manual run has the same limit.
+`apprafter backup status` shows such a Job as `Failed: DeadlineExceeded`, and
+the next scheduled run then starts as normal. `apprafter backup run` copies
+the same Job template, so a manual run has the same limit.
 
 The deadline is also how long each helper pod lives: the pod a single
 `pg_dump` or `tar` runs in keeps itself alive for exactly the run's deadline,

@@ -198,7 +198,7 @@ in-cluster run died unexpectedly.
 
 A backup or check Job runs for six hours at most. Past that, Kubernetes stops
 it and fails the Job with reason `DeadlineExceeded`; `backup status` shows it
-as `Failed`, and the next scheduled run goes ahead as normal
+as `Failed: DeadlineExceeded`, and the next scheduled run goes ahead as normal
 ([how long a run may take](../how-it-works/backup-retention-and-checks.md#how-long-a-run-may-take)).
 A backup stopped this way records it like any other failure: `lastError` in
 `backup status` reads `run exceeded its deadline of 6h …`, and the failure

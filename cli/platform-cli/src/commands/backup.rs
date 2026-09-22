@@ -5363,6 +5363,22 @@ fn most_recent_job<'a>(jobs: &[&'a serde_json::Value]) -> Option<&'a serde_json:
     jobs.iter().copied().max_by_key(|j| job_start_time(j))
 }
 
+/// A Job's outcome as `backup status` prints it: the Job's own terminal
+/// condition when it has one — with the reason and message for a failure, so
+/// a run stopped at its deadline reads `Failed: DeadlineExceeded: Job was
+/// active longer than specified deadline` rather than a bare `Failed` — and
+/// the pod counts ([`job_outcome`]) while it has none.
+///
+/// The condition is what the Job controller decided; the pod counts are only
+/// what its pods did, and they cannot tell a deadline from a crash.
+fn job_line_outcome(j: &serde_json::Value) -> String {
+    match job_run_outcome(j) {
+        JobOutcome::Succeeded => "Succeeded".to_string(),
+        JobOutcome::Failed(why) => format!("Failed: {why}"),
+        JobOutcome::Running => job_outcome(j).to_string(),
+    }
+}
+
 /// Summarise a Job's terminal state from `.status.succeeded/.failed/.active`.
 fn job_outcome(j: &serde_json::Value) -> &'static str {
     let succeeded = j
@@ -5503,7 +5519,7 @@ where
     // last week's success and this morning's read identically.
     let job_line = |j: &serde_json::Value| -> String {
         let when = job_start_time(j);
-        let outcome = job_outcome(j);
+        let outcome = job_line_outcome(j);
         if when.is_empty() {
             format!("{} — {outcome}", job_metadata_name(j))
         } else {
@@ -7183,6 +7199,60 @@ mod tests {
         );
         assert!(s.contains("apprafter-backup-28900000"));
         assert!(s.contains("Succeeded"));
+    }
+
+    #[test]
+    fn status_names_why_a_job_failed_when_the_job_says() {
+        // A run stopped at its deadline: the pods say only "failed: 1", the
+        // Job's condition says why — and that is the difference between
+        // "raise the deadline" and "read the log".
+        let job = json!({
+            "metadata": {"name": "apprafter-backup-28900000"},
+            "status": {
+                "startTime": "2026-07-17T03:00:00Z",
+                "failed": 1,
+                "conditions": [
+                    {"type": "FailureTarget", "status": "True", "reason": "DeadlineExceeded",
+                     "message": "Job was active longer than specified deadline"},
+                    {"type": "Failed", "status": "True", "reason": "DeadlineExceeded",
+                     "message": "Job was active longer than specified deadline"}
+                ]
+            }
+        });
+        let spec = json!({"enabled": true, "bucket": "s3:x"});
+        let s = format_backup_status(
+            Some(&spec),
+            std::slice::from_ref(&job),
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
+        assert!(
+            s.contains(
+                "Last backup Job: apprafter-backup-28900000 — Failed: DeadlineExceeded: Job was \
+                 active longer than specified deadline (2026-07-17 12:00:00 Asia/Tokyo)"
+            ),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn a_job_still_running_is_read_off_its_pods() {
+        // No terminal condition yet: the pod counts are all there is, and a
+        // Job between a failed attempt and its retry must not read as a
+        // terminal failure with a reason it does not have.
+        let running = json!({
+            "metadata": {"name": "apprafter-backup-28900000"},
+            "status": {"active": 1, "failed": 1}
+        });
+        assert_eq!(job_line_outcome(&running), "Running");
+        let done = json!({
+            "metadata": {"name": "apprafter-backup-28900000"},
+            "status": {"succeeded": 1,
+                       "conditions": [{"type": "Complete", "status": "True"}]}
+        });
+        assert_eq!(job_line_outcome(&done), "Succeeded");
     }
 
     #[test]
