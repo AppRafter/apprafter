@@ -63,12 +63,20 @@ if ! git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
     }
 fi
 
-if git diff --quiet "refs/tags/${tag}..HEAD" -- "${paths[@]}"; then
+if # Compare the tag against the INDEX, not HEAD. As a pre-commit hook this runs
+# BEFORE the commit exists, so a `tag..HEAD` diff cannot see the very change
+# being committed — the guard passes, and only fires on the NEXT commit, by
+# which point the incomplete one has already landed. (Found 2026-09-22: an
+# `argocd-cue-cmp/Dockerfile` edit committed with no `version.cue` bump, waved
+# through by this hook and caught afterwards by `just lint`.) `--cached`
+# compares the tag to the index, which in CI equals HEAD and at pre-commit time
+# is exactly the tree about to become the commit.
+git diff --cached --quiet "refs/tags/${tag}" -- "${paths[@]}"; then
     echo "OK: no CLI source change since ${tag}."
     exit 0
 fi
 
-changed="$(git diff --name-only "refs/tags/${tag}..HEAD" -- "${paths[@]}" | head -20)"
+changed="$(git diff --cached --name-only "refs/tags/${tag}" -- "${paths[@]}" | head -20)"
 cat >&2 <<EOF
 ::error::CLI source changed since ${tag} was PUBLISHED, but cli/Cargo.toml still
 reads ${version}. release-cli.yml builds from the tag, so this change ships

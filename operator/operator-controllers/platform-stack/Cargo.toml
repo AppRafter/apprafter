@@ -25,7 +25,7 @@ chrono           = { workspace = true }
 serde            = { workspace = true }
 serde_json       = { workspace = true }
 serde_yaml       = { workspace = true }
-oci-distribution = { workspace = true }
+oci-client = { workspace = true }
 semver           = { workspace = true }
 async-trait      = { workspace = true }
 flate2           = { workspace = true }

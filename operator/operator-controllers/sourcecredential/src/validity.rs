@@ -29,9 +29,9 @@ use kube::api::{Api, ListParams};
 use kube::core::{DynamicObject, GroupVersionKind};
 use kube::discovery::ApiResource;
 use kube::Client;
-use oci_distribution::client::ClientConfig;
-use oci_distribution::secrets::RegistryAuth;
-use oci_distribution::{Client as OciClient, Reference};
+use oci_client::client::ClientConfig;
+use oci_client::secrets::RegistryAuth;
+use oci_client::{Client as OciClient, Reference};
 use operator_core::{Application, REASON_AUTH_REJECTED, REASON_REACHABLE, REASON_UNVERIFIED};
 use tracing::debug;
 
@@ -136,12 +136,10 @@ async fn probe_git(repo_url: &str, username: &str, password: &str) -> Validity {
 /// auth rejection is a credential verdict (`Invalid`); every other
 /// failure — 5xx, an unparsable manifest, a transport error — is
 /// inconclusive, so restricted egress can never look like a bad PAT.
-fn registry_validity_from_error(err: &oci_distribution::errors::OciDistributionError) -> Validity {
+fn registry_validity_from_error(err: &oci_client::errors::OciDistributionError) -> Validity {
     match err {
-        oci_distribution::errors::OciDistributionError::AuthenticationFailure(_)
-        | oci_distribution::errors::OciDistributionError::UnauthorizedError { .. } => {
-            Validity::Invalid
-        }
+        oci_client::errors::OciDistributionError::AuthenticationFailure(_)
+        | oci_client::errors::OciDistributionError::UnauthorizedError { .. } => Validity::Invalid,
         _ => Validity::Unverified,
     }
 }
@@ -576,7 +574,7 @@ mod tests {
     /// revoked PAT, which is exactly what this controller must never do.
     #[test]
     fn registry_error_maps_only_auth_failures_to_invalid() {
-        use oci_distribution::errors::OciDistributionError as E;
+        use oci_client::errors::OciDistributionError as E;
         assert_eq!(
             registry_validity_from_error(&E::AuthenticationFailure("bad token".into())),
             Validity::Invalid

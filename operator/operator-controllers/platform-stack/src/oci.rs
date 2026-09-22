@@ -13,9 +13,9 @@
 
 use std::future::Future;
 
-use oci_distribution::client::ClientConfig;
-use oci_distribution::secrets::RegistryAuth;
-use oci_distribution::{Client, Reference};
+use oci_client::client::ClientConfig;
+use oci_client::secrets::RegistryAuth;
+use oci_client::{Client, Reference};
 use semver::Version;
 use thiserror::Error;
 
@@ -113,7 +113,7 @@ pub async fn tags_in_channel(
     channel: Channel,
 ) -> Result<Vec<Version>, OciError> {
     let bare = strip_oci_scheme(upstream_url);
-    let reference: Reference = bare.parse().map_err(|e: oci_distribution::ParseError| {
+    let reference: Reference = bare.parse().map_err(|e: oci_client::ParseError| {
         OciError::InvalidReference(bare.to_string(), e.to_string())
     })?;
 

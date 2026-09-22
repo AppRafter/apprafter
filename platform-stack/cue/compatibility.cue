@@ -1961,6 +1961,20 @@ compatibility: "0.2.80": {
 		2026-04-01 and 3.21 expires 2026-11-01, so the CMP sidecar and the
 		backup runner were building on unsupported bases.
 
+		Also replaces the ABANDONED oci-distribution crate with oci-client, the
+		same project after its rename and move to the ORAS org: 0.11.0 was its
+		final release (2024-03-27) while oci-client is on 0.18.0. That crate is
+		on the registry path — ADR 0040 tag-to-digest resolution and the
+		platform-stack chart pull — and it was what actually held reqwest and
+		sha2 down, so both move with it (reqwest 0.12 -> 0.13, sha2 0.10 ->
+		0.11). sha2 0.11 dropped the hex formatting helper, so two hashes had to
+		be re-rendered by hand: the ADR 0052 approval content hash and
+		status.envConfig.digest. BOTH are proven byte-identical against
+		independently computed SHA-256 values rather than against whatever the
+		new code emits — a moved approval hash would invalidate every in-flight
+		approval, and a moved config digest would make every application report
+		a configuration change once, for nothing.
+
 		Nothing in the rendered chart changes except the operator and webhook
 		image tags.
 		"""

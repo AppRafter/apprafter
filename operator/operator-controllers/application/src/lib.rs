@@ -2061,7 +2061,21 @@ fn env_config_digest(material: &mut [(String, String, Vec<u8>)]) -> String {
         h.update((value.len() as u64).to_be_bytes());
         h.update(value);
     }
-    format!("sha256:{:x}", h.finalize())
+    // Hex by hand rather than `format!("{:x}", …)`: sha2 0.11 moved to
+    // hybrid-array, whose `Array` does not implement `LowerHex`. The bytes and
+    // the `sha256:` prefix are unchanged on purpose — this digest is compared
+    // against the one already stored in `status.envConfig.digest`, so a
+    // different RENDERING of the same hash would make every application on the
+    // cluster report a configuration change once, for nothing.
+    let digest = h.finalize();
+    let mut out = String::with_capacity(7 + 64);
+    out.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        // Writing to a String is infallible.
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Whether `secret` carries `key` in either `data` or `stringData`.
@@ -5630,6 +5644,34 @@ mod tests {
             ("s2".to_string(), "k".to_string(), b"v2".to_vec()),
         ];
         assert_eq!(env_config_digest(&mut a), env_config_digest(&mut b));
+    }
+
+    #[test]
+    fn the_digest_matches_an_independently_computed_sha256() {
+        // The two tests around this one assert only RELATIVE properties —
+        // order-independence and that a change is detected. Both would pass
+        // through a change to the digest FORMAT, which is the thing that
+        // actually hurts: the value is compared against the one already in
+        // `status.envConfig.digest`, so a re-rendered hash makes every
+        // application on the cluster report a config change once, for nothing.
+        // Added when sha2 0.10 -> 0.11 forced the hex encoding to be rewritten.
+        //
+        // The literal was computed OUTSIDE Rust, so this pins the framing
+        // (big-endian u64 length prefixes) as well as the rendering:
+        //
+        //   python3 -c "
+        //   import hashlib,struct
+        //   h=hashlib.sha256()
+        //   for s,k,v in [(b's',b'k',b'v')]:
+        //       h.update(struct.pack('>Q',len(s))); h.update(s)
+        //       h.update(struct.pack('>Q',len(k))); h.update(k)
+        //       h.update(struct.pack('>Q',len(v))); h.update(v)
+        //   print('sha256:'+h.hexdigest())"
+        let mut material = vec![("s".to_string(), "k".to_string(), b"v".to_vec())];
+        assert_eq!(
+            env_config_digest(&mut material),
+            "sha256:700477bc2b594dde8a0ed45f5ff99fd684f427c7475683fd213fb69be358274c"
+        );
     }
 
     #[test]

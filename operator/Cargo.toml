@@ -49,8 +49,8 @@ futures            = "0.3"
 prometheus         = { version = "0.14", default-features = false }
 chrono             = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 base64             = "0.23"
-oci-distribution   = { version = "0.11", default-features = false, features = ["rustls-tls"] }
-reqwest            = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+oci-client         = { version = "0.18", default-features = false, features = ["rustls-tls"] }
+reqwest            = { version = "0.13", default-features = false, features = ["rustls"] }
 semver             = { version = "1", features = ["serde"] }
 serde_yaml         = "0.9"
 async-trait        = "0.1"
@@ -58,7 +58,7 @@ flate2             = "1.0"
 tar                = "0.4"
 rand               = "0.9"
 anyhow             = "1"
-sha2               = "0.10"
+sha2               = "0.11"
 
 [profile.release]
 lto           = "thin"
