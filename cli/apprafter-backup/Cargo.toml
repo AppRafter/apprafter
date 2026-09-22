@@ -51,3 +51,6 @@ ureq        = { workspace = true }
 # kube-rs request builder and response/error decoder run against canned bytes.
 http          = "1"
 tower-service = "0.3"
+# `test-util`: `tls` tests pause the Tokio clock so a 295 s read timeout fires
+# in virtual time. Dev-only (resolver 2), so the runner binary never links it.
+tokio         = { workspace = true, features = ["test-util", "sync", "time"] }

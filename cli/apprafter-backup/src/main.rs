@@ -74,7 +74,8 @@ fn run() -> i32 {
     };
     //    Built through `tls::kube_client` (NOT `Client::try_default`) so the
     //    rustls crypto provider is installed before kube-rs builds its TLS
-    //    config — see `apprafter_backup::tls`. Inference order is unchanged:
+    //    config, and so the client carries the runner's read timeout and retry
+    //    settings — see `apprafter_backup::tls`. Inference order is unchanged:
     //    `try_default` is exactly `Config::infer` + `Client::try_from`.
     let client = match rt.block_on(async {
         let config = kube::Config::infer()
