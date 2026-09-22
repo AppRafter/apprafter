@@ -4,13 +4,35 @@
 # environment. Covers language runtimes; the full platform tool-belt
 # (CUE, kubectl, k9s, talosctl, cosign, ...) is best installed via
 # the Nix flake or the dev container — see docs/contributing/setup.md.
+#
+# flake.nix is the authoritative dev tool-belt and this file mirrors it for
+# people who do not run Nix. Every tool is pinned to a MINOR and lets the
+# patch float: `stable`/`latest` gives up control of the minor, an exact pin
+# gives up the security patches. Nothing here floats by design — a floating
+# line and a forgotten one read the same, so neither is allowed.
+#
+# Where each minor comes from. scripts/upstream-versions.py reads every line
+# below (entries rust-toolchain-minor and mise-*) and reports DRIFT when a
+# copy disagrees with the source named here:
+#
+#   rust  the rust:<minor>-alpine builder images and CI's dtolnay/rust-toolchain
+#         `toolchain:` input — the compiler that builds what ships. The flake's
+#         nixpkgs lags it (rustc 1.95 at the locked rev); the flake is the one
+#         to move, not this line.
+#   bun   the oven/bun:<minor>-* builder images. The flake's nixpkgs lags it
+#         (bun 1.3 at the locked rev), same as rust.
+#   node  the node:<minor>-* base images. flake.nix ships no node.
+#   just  the just in the flake-locked nixpkgs (nixos-26.05). Moves when
+#         flake.lock moves: `nix eval --raw --inputs-from . nixpkgs#just.version`.
+#   go    the go in the flake-locked nixpkgs, read the same way. flake.nix's
+#         devShell ships no go, and nothing in this repository builds Go today.
 
 [tools]
-rust = "stable"
-bun = "latest"
-node = "lts"   # for Backstage build tooling
-just = "latest"
-go  = "latest" # for plugins / occasional Go dependencies
+rust = "1.98"
+bun  = "1.4"
+node = "24.12" # for Backstage build tooling
+just = "1.51"
+go   = "1.26"  # for plugins / occasional Go dependencies
 
 [env]
 APPRAFTER_DEV = "1"

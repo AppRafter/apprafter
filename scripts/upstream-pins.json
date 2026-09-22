@@ -58,13 +58,7 @@
     "this repository only when this report says so."
   ],
 
-  "notCoveredClasses": [
-    {
-      "class": "mise.toml tool pins",
-      "where": "mise.toml:9-13 (rust=stable, bun=latest, node=lts, just=latest, go=latest)",
-      "why": "Floating by design. flake.nix is the authoritative tool-belt per CLAUDE.md; mise.toml is dev ergonomics. Converting these to concrete versions would buy a new stream of bumps for a file that is not what CI uses."
-    }
-  ],
+  "notCoveredClasses": [],
 
   "pins": [
     {
@@ -772,6 +766,62 @@
       "gate": null,
       "gateGap": "A Rust minor is proven by the whole cargo test + clippy matrix under the candidate, i.e. test.yml and lint.yml on a pull request that moves every copy at once. A watch job cannot run that honestly.",
       "note": "One decision, four surfaces: CI's dtolnay/rust-toolchain `toolchain:` input, the rust:<minor>-alpine builder images, mise.toml, and cli/rust-toolchain.toml. The last OVERRIDES the first inside cli/ (rustup: toolchain file beats `rustup default`), so a `stable` there silently un-pins every cli/ job in CI, release-cli.yml included -- and the release matrix's cross target is installed for the pinned toolchain only. Minor pinned, patch floats. The flake's nixpkgs rustc is not written in the tree and is not read here (1.95 at the locked rev)."
+    },
+    {
+      "id": "mise-bun",
+      "class": "toolchain-minor",
+      "title": "bun minor (mise.toml mirrors the builder images)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "mise.toml", "pattern": "(?m)^bun\\s*=\\s*\"([^\"]+)\"" },
+          { "files": "*Dockerfile", "pattern": "FROM oven/bun:(\\d+\\.\\d+)-" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "oven-sh/bun" },
+      "compare": "minor",
+      "gate": null,
+      "gateGap": "Same as image-bun: `bun run build` inside the image, which landing-preview-build.yml performs.",
+      "note": "Reads the minor out of every oven/bun FROM line as well as mise.toml, so a builder bump that forgets mise (or the reverse) is DRIFT. Upstream tags are `bun-vX.Y.Z`; the compare takes the digits. The flake's nixpkgs carries bun 1.3 -- behind this, and not read here."
+    },
+    {
+      "id": "mise-node",
+      "class": "toolchain-minor",
+      "title": "node minor (mise.toml mirrors the base images)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "mise.toml", "pattern": "(?m)^node\\s*=\\s*\"([^\"]+)\"" },
+          { "files": "*Dockerfile", "pattern": "FROM node:(\\d+\\.\\d+)-" }
+        ]
+      },
+      "upstream": { "kind": "docker-hub", "repository": "library/node", "tagPattern": "^{major}\\.\\d+-alpine$" },
+      "compare": "minor",
+      "gate": null,
+      "gateGap": "Same as image-node: needs a human decision per image, and the build is what proves it.",
+      "note": "Newest minor WITHIN the major in the tree ({major}). An LTS line ships as a stream of minors and an old minor is rarely patched once the next is out (24.12 only ever had 24.12.0), so for node a minor pin is close to an exact pin: fixes land in LATER minors, and this row is what surfaces them. A new LTS major is not this row's question -- image-node's floating row shows it."
+    },
+    {
+      "id": "mise-just",
+      "class": "toolchain-minor",
+      "title": "just minor (mise.toml mirrors the flake's nixpkgs)",
+      "read": { "kind": "regex", "sources": [ { "files": "mise.toml", "pattern": "(?m)^just\\s*=\\s*\"([^\"]+)\"" } ] },
+      "upstream": { "kind": "github-release", "repo": "casey/just" },
+      "compare": "none",
+      "gate": null,
+      "gateGap": "Same as tool-just: the thing to test is every recipe.",
+      "note": "Not compared: the authority is the just in the flake-locked nixpkgs (1.51 at the nixos-26.05 rev), which moves only with flake.lock (flake-nixpkgs), not with upstream releases. After a `nix flake update`, re-derive with `nix eval --raw --inputs-from . nixpkgs#just.version`. CI downloads its own just (tool-just, 1.58.0 today), so dev and CI run different just minors until the flake's release branch catches up."
+    },
+    {
+      "id": "mise-go",
+      "class": "toolchain-minor",
+      "title": "go minor (mise.toml mirrors the flake's nixpkgs)",
+      "read": { "kind": "regex", "sources": [ { "files": "mise.toml", "pattern": "(?m)^go\\s*=\\s*\"([^\"]+)\"" } ] },
+      "upstream": { "kind": "http-text", "url": "https://go.dev/VERSION?m=text", "pattern": "^go(\\d+\\.\\d+(?:\\.\\d+)?)" },
+      "compare": "none",
+      "gate": null,
+      "gateGap": "Nothing in this repository builds Go, so there is nothing to run.",
+      "note": "Not compared, for the reason mise-just gives: the value is the go in the flake-locked nixpkgs (1.26 at the nixos-26.05 rev; `nix eval --raw --inputs-from . nixpkgs#go.version`). flake.nix's devShell does not ship go at all, and no Go code is tracked -- mise.toml keeps it for plugin work."
     },
 
     {
