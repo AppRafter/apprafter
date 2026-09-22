@@ -195,6 +195,12 @@ pre-commit:
     - name: heredoc-backticks
       glob: "{scripts/**,e2e/**,.github/workflows/**,argocd-cue-cmp/**}"
       run: ./scripts/check-heredoc-backticks.sh
+    # A workflow that does not parse fails as a run with ZERO JOBS, which
+    # `gh pr checks` does not list — every check can be green while a
+    # release workflow is broken. See the header of the script.
+    - name: workflows
+      glob: ".github/workflows/**"
+      run: ./scripts/check-workflows.sh
     - name: crd-structural
       glob: "operator/charts/apprafter-operator/templates/crd-*.yaml"
       run: ./scripts/check-crd-structural.sh

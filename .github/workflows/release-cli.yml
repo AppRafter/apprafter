@@ -209,8 +209,16 @@ jobs:
           # its notes.
           #
           # `TAG` reaches this script through `env:` above and is used only
-          # as "$TAG" — no `${{ }}` interpolation occurs in this body, per
-          # the injection policy in this file's header.
+          # as "$TAG"; no Actions expression reaches this body, per the
+          # injection policy in this file's header.
+          #
+          # Never write Actions expression delimiters here, not even inside
+          # a shell comment and not even empty. Actions expands them before
+          # the shell ever sees the script, so it does not know this is a
+          # comment: an empty one is an unparseable expression and takes the
+          # WHOLE workflow down. It fails as a run with zero jobs, which
+          # `gh pr checks` does not show — this very comment, in its first
+          # form, said the words and thereby broke the file.
           #
           # The heading names the streams a release moved, which is this
           # repository's own long-standing convention and the reason a
