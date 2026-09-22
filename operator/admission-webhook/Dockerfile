@@ -29,6 +29,9 @@
 # — see `operator/apprafter-operator/Dockerfile` for full
 # rationale.
 FROM docker.io/library/rust:1.98-alpine3.24 AS chef
+# Build with the image's own compiler or fail, never with one rustup
+# downloads on the fly — see `operator/apprafter-operator/Dockerfile`.
+ENV RUSTUP_AUTO_INSTALL=0
 ARG CARGO_CHEF_VERSION=0.1.78
 # cargo-chef switched its release tooling to cargo-dist at 0.1.75, which
 # changed BOTH the asset name (.tar.gz -> .tar.xz) and the archive layout

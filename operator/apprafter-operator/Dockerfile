@@ -68,6 +68,15 @@
 # OPERATOR e2e build (`e2e/needs-disk-walk.sh`). Docker buildx
 # resolves the qualified form identically, so CI is unaffected.
 FROM docker.io/library/rust:1.98-alpine3.24 AS chef
+# The compiler is the one this image ships, and nothing else. operator/ has
+# no rust-toolchain.toml, so rustup resolves its default (the image's
+# 1.98.x) today; but a toolchain file added later would name a toolchain the
+# image does not have (it calls its own `1.98.1-<triple>`, not `1.98`), and
+# rustup's default is to download that silently and build with it. With
+# auto-install off the build fails instead. cli/apprafter-backup/Dockerfile
+# shows the way through if a file ever lands: RUSTUP_TOOLCHAIN to the image's
+# own, plus a check that the file names the same minor.
+ENV RUSTUP_AUTO_INSTALL=0
 ARG CARGO_CHEF_VERSION=0.1.78
 # cargo-chef switched its release tooling to cargo-dist at 0.1.75, which
 # changed BOTH the asset name (.tar.gz -> .tar.xz) and the archive layout
