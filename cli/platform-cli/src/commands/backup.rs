@@ -3060,7 +3060,12 @@ fn is_read_data_subset(v: &str) -> bool {
     if let Some((n, t)) = v.split_once('/') {
         return matches!((n.parse::<u64>(), t.parse::<u64>()), (Ok(n), Ok(t)) if t > 0 && n >= 1 && n <= t);
     }
-    let (digits, suffix) = v.split_at(v.len().saturating_sub(1));
+    // Split before the last CHARACTER, not the last byte: a byte index lands
+    // inside a multi-byte character (`5é`) and `split_at` panics there.
+    let Some((last, _)) = v.char_indices().next_back() else {
+        return false;
+    };
+    let (digits, suffix) = v.split_at(last);
     matches!(suffix, "k" | "K" | "m" | "M" | "g" | "G" | "t" | "T")
         && !digits.is_empty()
         && digits.parse::<u64>().is_ok_and(|n| n > 0)
@@ -6889,6 +6894,20 @@ mod tests {
                 .to_string();
             assert!(err.contains("check-depth"), "names the key: {err}");
         }
+    }
+
+    #[test]
+    fn a_subset_ending_in_a_multi_byte_character_is_refused_not_a_panic() {
+        // `split_at(len - 1)` landed inside `é` and panicked, taking the CLI
+        // down on a typo instead of naming the grammar.
+        for bad in ["5é", "é", "10€", "5ǵ", "1/1é"] {
+            assert!(!is_read_data_subset(bad), "{bad}");
+            let err = backup_set_patch("check-depth", bad)
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains("check-depth"), "names the key: {err}");
+        }
+        assert!(!is_read_data_subset(""));
     }
 
     #[test]
