@@ -86,13 +86,20 @@ FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
+# `--locked` on BOTH cargo steps, as release-cli.yml builds the CLI and the
+# backup runner image builds itself: the image resolves exactly what
+# operator/Cargo.lock says, or fails. Without it a Cargo.lock that lags a
+# Cargo.toml edit is silently re-resolved inside the image, so the operator
+# ships dependency versions no test in the workspace ever ran. `cargo chef
+# prepare` copies the lock into recipe.json as it is (it does not re-resolve),
+# so the cook step is where a stale lock fails, before the long compile.
 FROM chef AS builder
 COPY --from=planner /workspace/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json \
+RUN cargo chef cook --release --locked --recipe-path recipe.json \
         --target x86_64-unknown-linux-musl \
         --bin apprafter-operator
 COPY . .
-RUN cargo build --release --bin apprafter-operator \
+RUN cargo build --release --locked --bin apprafter-operator \
         --target x86_64-unknown-linux-musl
 
 FROM gcr.io/distroless/static-debian12:nonroot

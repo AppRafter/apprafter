@@ -47,13 +47,16 @@ FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
+# `--locked` on both cargo steps, for the reason given in
+# `operator/apprafter-operator/Dockerfile`: the image builds exactly what
+# operator/Cargo.lock says, or fails at the cook step.
 FROM chef AS builder
 COPY --from=planner /workspace/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json \
+RUN cargo chef cook --release --locked --recipe-path recipe.json \
         --target x86_64-unknown-linux-musl \
         --bin admission-webhook
 COPY . .
-RUN cargo build --release --bin admission-webhook \
+RUN cargo build --release --locked --bin admission-webhook \
         --target x86_64-unknown-linux-musl
 
 FROM gcr.io/distroless/static-debian12:nonroot
