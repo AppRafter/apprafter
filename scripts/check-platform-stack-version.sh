@@ -40,14 +40,21 @@ if [[ $# -gt 1 ]]; then
   exit 2
 fi
 
+# cue's stderr is captured SEPARATELY, never folded into a value with 2>&1:
+# since cue v0.17 a dirty working tree makes `cue export` print
+# "warning: Git tree '<path>' is dirty" on stderr, and folding it in turned the
+# resolved version into "warning: …" (and polluted the compatibility dump).
+CUE_ERR="$(mktemp)"
+trap 'rm -f "$CUE_ERR"' EXIT
+
 if [[ $# -eq 1 ]]; then
   VERSION="$1"
 else
   # Auto-resolve from the canonical source-of-truth.
   VERSION="$("${CUE_CMD[@]}" export ./platform-stack/cue/... \
-              -e currentVersion --out text 2>&1)" || {
+              -e currentVersion --out text 2>"$CUE_ERR")" || {
     echo "ERROR: failed to read currentVersion from platform-stack/cue/platform.cue" >&2
-    echo "$VERSION" >&2
+    cat "$CUE_ERR" >&2
     exit 1
   }
   if [[ -z "${VERSION:-}" ]]; then
@@ -63,7 +70,8 @@ fi
 # sanity check) and stderr (for the failure-case diagnostic).
 if ! out=$("${CUE_CMD[@]}" export ./platform-stack/cue/... \
             -e "compatibility[\"${VERSION}\"]" \
-            --out yaml 2>&1); then
+            --out yaml 2>"$CUE_ERR"); then
+  out="$(cat "$CUE_ERR")"
   cat >&2 <<EOF
 ERROR: platform-stack/cue/compatibility.cue has no entry for version "${VERSION}".
 

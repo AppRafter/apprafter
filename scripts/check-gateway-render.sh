@@ -66,10 +66,16 @@ fail() {
 # ---------------------------------------------------------------------------
 # 1. Resolve currentVersion + render the chart (self-contained).
 # ---------------------------------------------------------------------------
+# stderr is captured SEPARATELY, never folded into the value with 2>&1: since
+# cue v0.17 a dirty working tree makes `cue export` print
+# "warning: Git tree '<path>' is dirty" on stderr, and folding it in turned the
+# version into "warning: …" and the chart path below into nonsense.
+CUE_ERR="$(mktemp)"
+trap 'rm -f "$CUE_ERR"' EXIT
 VERSION="$("${CUE_CMD[@]}" export ./platform-stack/cue/... \
-            -e currentVersion --out text 2>&1)" || {
+            -e currentVersion --out text 2>"$CUE_ERR")" || {
   echo "ERROR: failed to read currentVersion from platform-stack/cue/platform.cue" >&2
-  echo "$VERSION" >&2
+  cat "$CUE_ERR" >&2
   exit 1
 }
 [[ -n "${VERSION:-}" ]] || fail "currentVersion is empty"
