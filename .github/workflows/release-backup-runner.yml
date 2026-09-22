@@ -80,7 +80,7 @@ jobs:
       should_publish: ${{ steps.gate.outputs.should_publish }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Resolve version from cli/Cargo.toml
         id: version
@@ -143,7 +143,7 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Compute lowercase image base
         id: image-base
@@ -154,17 +154,17 @@ jobs:
           echo "image=ghcr.io/${owner_lc}/apprafter-backup" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push runner image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           # The Dockerfile COPYs the whole `cli/` workspace, so the
           # build context is the repo root.
@@ -188,7 +188,7 @@ jobs:
     if: needs.detect.outputs.should_publish == 'true'
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Create GitHub Release + tag
         env:

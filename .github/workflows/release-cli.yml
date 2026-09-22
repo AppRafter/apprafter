@@ -94,7 +94,7 @@ jobs:
             runner: macos-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref_name }}
 
@@ -112,7 +112,7 @@ jobs:
       # nightly.yml already pin so all CI workflows share one
       # cue version.
       - name: Install CUE
-        uses: cue-lang/setup-cue@v1.0.1
+        uses: cue-lang/setup-cue@v2.0.0
         with:
           version: v0.10.0
 
@@ -173,7 +173,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Upload archive artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: apprafter-${{ matrix.target }}
           path: |
@@ -188,12 +188,12 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref_name }}
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 

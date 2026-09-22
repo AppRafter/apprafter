@@ -97,10 +97,10 @@ jobs:
       should_publish: ${{ steps.gate.outputs.should_publish }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install CUE (needed for currentVersion resolution)
-        uses: cue-lang/setup-cue@v1.0.1
+        uses: cue-lang/setup-cue@v2.0.0
         with:
           version: v0.10.0
 
@@ -163,7 +163,7 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Re-expose detect outputs as a single step source
         id: version
@@ -293,17 +293,17 @@ jobs:
         # runner, so we install CUE here too. The
         # compatibility-gate script + `make render-only`
         # below both shell out to `cue`.
-        uses: cue-lang/setup-cue@v1.0.1
+        uses: cue-lang/setup-cue@v2.0.0
         with:
           version: v0.10.0
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
-          version: v3.16.2
+          version: v3.22.0
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@v4
         with:
           cosign-release: v2.4.1
 
@@ -387,10 +387,10 @@ jobs:
         # channel-latest resolution on every release. Pinning the
         # action also makes the `:latest` step's runtime guard a
         # belt-and-braces check rather than the sole guarantee.
-        uses: oras-project/setup-oras@v1
+        uses: oras-project/setup-oras@v2
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -513,7 +513,7 @@ jobs:
           if command -v oras >/dev/null 2>&1; then
             oras tag "${IMAGE}:${VERSION}" latest
           else
-            echo "::warning::oras not available on this runner; :latest tag not updated. Add `uses: oras-project/setup-oras@v1` in a follow-up."
+            echo '::warning::oras not available on this runner; :latest tag not updated. Add "uses: oras-project/setup-oras@v2" in a follow-up.'
           fi
 
       - name: Create GitHub Release + tag

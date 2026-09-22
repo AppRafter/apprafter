@@ -16,12 +16,16 @@
 set -euo pipefail
 
 CLUSTER="apprafter-crd-validate"
+# Written down rather than inherited from the kind binary's default, so a kind
+# upgrade cannot silently change which apiserver validates the CRDs — see the
+# note on APPRAFTER_KIND_NODE_IMAGE in e2e/lib.sh.
+: "${APPRAFTER_KIND_NODE_IMAGE:=kindest/node:v1.31.0}"
 cleanup() { kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 echo "==> creating ephemeral kind cluster '$CLUSTER'"
 kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
-kind create cluster --name "$CLUSTER" --wait 90s >/dev/null
+kind create cluster --name "$CLUSTER" --image "$APPRAFTER_KIND_NODE_IMAGE" --wait 90s >/dev/null
 CTX="kind-$CLUSTER"
 
 rendered=$(mktemp)

@@ -33,8 +33,8 @@ jobs:
       rust_operator: ${{ steps.filter.outputs.rust_operator }}
       bun: ${{ steps.filter.outputs.bun }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
         id: filter
         with:
           # Filters per stack. Paths are evaluated against
@@ -76,8 +76,8 @@ jobs:
     if: needs.changes.outputs.cue == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: cue-lang/setup-cue@v1.0.1
+      - uses: actions/checkout@v7
+      - uses: cue-lang/setup-cue@v2.0.0
         with:
           version: v0.10.0
       - name: lint-cue.sh
@@ -106,13 +106,13 @@ jobs:
     if: needs.changes.outputs.rust_cli == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # cli/cli-providers/build.rs shells out to `cue export`
       # at compile time (Track B.1.71 — chart values are the
       # single source of truth, CLI loader values are derived
       # via cue export -e _loaderValues.<comp>). Without cue
       # on PATH the build script panics on the runner.
-      - uses: cue-lang/setup-cue@v1.0.1
+      - uses: cue-lang/setup-cue@v2.0.0
         with:
           version: v0.10.0
       - uses: dtolnay/rust-toolchain@stable
@@ -130,7 +130,7 @@ jobs:
     if: needs.changes.outputs.rust_operator == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -146,7 +146,7 @@ jobs:
     if: needs.changes.outputs.bun == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
       - name: Detect Bun workspaces
         id: detect

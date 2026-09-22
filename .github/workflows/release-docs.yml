@@ -164,7 +164,7 @@ jobs:
           echo "::error::release-docs publishes :latest, the tag the docs Application watches; refusing to publish from $REF. Merge to master first."
           exit 1
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # `docsgen gate` (pass 4 of scripts/docs-check.sh) ages every
           # documentation exemption by resolving its `since=vX.Y.Z` to
@@ -174,8 +174,12 @@ jobs:
           # machine — see the identical note in docs.yml.
           fetch-depth: 0
 
+      # Release tag, not @main — see the note in crd-check.yml. This job
+      # holds `packages: write` and pushes ghcr.io/apprafter/docs:latest,
+      # the tag the operator resolves to a digest, so it is the one of the
+      # three where a branch ref had real blast radius.
       - name: Install Nix (flake toolchain — mkdocs + cargo)
-        uses: DeterminateSystems/nix-installer-action@main
+        uses: DeterminateSystems/nix-installer-action@v23
 
       # Same workspace and same key expression as docs.yml, so the two
       # workflows share one cache: `docsgen check` links the whole CLI.
@@ -230,10 +234,10 @@ jobs:
           echo "image=ghcr.io/${owner_lc}/docs" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to ghcr.io
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -255,7 +259,7 @@ jobs:
       # a year, is a green build — both were measured green before the
       # smoke step existed. So the container is started and probed here.
       - name: Build the docs image (load into the runner, do not push)
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           # Context is docs-site/ because the Dockerfile copies `site`
           # and `Caddyfile` by their names inside it — the same paths the
@@ -289,7 +293,7 @@ jobs:
       # A cache hit on the step above — same context, same Dockerfile,
       # same digest — so this re-tags and uploads rather than rebuilding.
       - name: Push the smoke-tested image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: docs-site
           file: docs-site/Dockerfile

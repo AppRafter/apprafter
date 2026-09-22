@@ -38,8 +38,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      # Pinned to a release tag, not @main: this action runs third-party
+      # code inside the job, and a branch ref re-fetches whatever is on
+      # that branch at job start. It matters here specifically — crd-check
+      # is the ADR-0047 byte-identity gate, whose premise is that local and
+      # CI evaluate the SAME cue. The pin bounds the ACTION only; upstream
+      # installs the newest Determinate Nix either way. The cue version
+      # itself is pinned by flake.lock, which is what actually protects
+      # the byte comparison.
       - name: Install Nix (flake toolchain - cue + cargo)
-        uses: DeterminateSystems/nix-installer-action@main
+        uses: DeterminateSystems/nix-installer-action@v23
       - name: crdgen check
         run: bash scripts/crd-check.sh

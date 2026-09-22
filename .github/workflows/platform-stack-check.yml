@@ -71,7 +71,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history + tags so the drift check can diff
           # HEAD against `platform-stack/v<currentVersion>`
@@ -79,14 +79,14 @@ jobs:
           fetch-depth: 0
 
       - name: Install CUE
-        uses: cue-lang/setup-cue@v1.0.1
+        uses: cue-lang/setup-cue@v2.0.0
         with:
           version: v0.10.0
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
-          version: v3.16.2
+          version: v3.22.0
 
       - name: cue fmt --check
         run: cue fmt --check ./platform-stack/cue/...

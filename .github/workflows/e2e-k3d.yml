@@ -131,13 +131,13 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -149,19 +149,19 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install CUE
-        uses: cue-lang/setup-cue@v1.0.1
+        uses: cue-lang/setup-cue@v2.0.0
         with:
           version: v0.10.0
 
       - name: Install kubectl
-        uses: azure/setup-kubectl@v4
+        uses: azure/setup-kubectl@v5
         with:
-          version: 'v1.31.0'
+          version: 'v1.37.0'
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
-          version: v3.16.2
+          version: v3.22.0
 
       - name: Install kind
         run: |
@@ -199,7 +199,7 @@ jobs:
         # intermittently 403s GitHub Actions egress (observed
         # 2026-06-02, run 26815686851).
         env:
-          JUST_VERSION: 1.51.0
+          JUST_VERSION: 1.58.0
         run: |
           curl --proto '=https' --tlsv1.2 -sSfL --retry 5 --retry-connrefused \
             "https://github.com/casey/just/releases/download/${JUST_VERSION}/just-${JUST_VERSION}-x86_64-unknown-linux-musl.tar.gz" \

@@ -276,7 +276,7 @@
         "kind": "helm-lint",
         "proves": "the platform-stack umbrella chart still renders and passes `helm lint` under the candidate helm."
       },
-      "note": "Known drift: ten workflows say v3.16.2 and release-operator.yml:311 says v3.16.4. Nothing detects it today; this entry does."
+      "note": "ONE decision, twelve places. The v3.16.2/v3.16.4 drift this entry was written to catch was reconciled on 2026-09-22 -- and reconciled UPWARD past both, to v3.22.0, because 3.16 was the real defect: helm's support window is n-3, so a 3.16 binary was outside it for the 1.36.x that the unpinned k3s stable channel actually runs. v3.22.0 is the FINAL Helm 3 minor (security patches end 2027-02-10), so it is the terminus of this line and the next move is the Helm 4 decision."
     },
     {
       "id": "tool-kubectl",
@@ -308,8 +308,8 @@
       "upstream": { "kind": "github-release", "repo": "kubernetes-sigs/kind" },
       "compare": "numeric",
       "gate": null,
-      "gateGap": "Testing a kind bump means creating a cluster. Out of scope for a watch job by the same rule as kubectl.",
-      "note": "Eight copies of the same literal, no variable. `.github/workflows/**` is in no path-filter that would gate a change to them beyond the workflow's own trigger."
+      "gateGap": "Out of scope for a WATCH job, which must not stand up clusters on a schedule -- but not ungateable: `just crd-validate` (scripts/validate-crds.sh) creates an ephemeral kind cluster, honours APPRAFTER_KIND_NODE_IMAGE, and therefore gates the kind+node-image pair. CLAUDE.md already mandates it for CRD-changing releases. Run it locally on the bump commit. Caveat measured 2026-09-22: kind >= 0.33 mounts /sys/../lib/modules unconditionally and fails with `statfs /lib/modules: no such file or directory` on hosts that have no /lib/modules (some containers and microVMs), independently of the node image -- GitHub's ubuntu-latest runners do have it.",
+      "note": "Eight copies of the same literal, no variable. `.github/workflows/**` is in no path-filter that would gate a change to them beyond the workflow's own trigger. NOTE this pin is really TWO decisions: until 2026-09-22 no call site passed `--image`, so the kind BINARY silently chose the Kubernetes version of every e2e cluster (v0.24.0 -> k8s v1.31.0, against a production k3s on 1.36.x). The node image is now written down as APPRAFTER_KIND_NODE_IMAGE in e2e/lib.sh (with its own default in scripts/validate-crds.sh and e2e/jetstream-nack-shape-check.sh, neither of which sources lib.sh) and MUST move together with this pin -- kind supports a node image only with the release that ships it."
     },
     {
       "id": "tool-yq",
@@ -543,7 +543,7 @@
       "compare": "major",
       "gate": null,
       "gateGap": "An action major bump can only be tested by running the workflows that use it. That is a pull request, not a script -- and it is the one class where opening a PR really is the right tool.",
-      "note": "45 uses -- the most-used action in the tree."
+      "note": "46 uses -- the most-used action in the tree. The count is prose, not something the watcher computes, so re-derive it rather than trusting it: grep -c 'uses: actions/checkout@' .github/workflows/*.yml"
     },
     {
       "id": "action-setup-cue",

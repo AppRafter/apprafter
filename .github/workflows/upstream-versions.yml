@@ -65,7 +65,7 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # cue and helm are needed by the Stage-2 gates: `cue eval` lifts each
       # component's values out of platform-stack/cue, and `helm template`
@@ -73,14 +73,14 @@ jobs:
       # versions on purpose -- the candidate under test is the chart, not the
       # tool.
       - name: Install CUE
-        uses: cue-lang/setup-cue@v1.0.1
+        uses: cue-lang/setup-cue@v2.0.0
         with:
           version: v0.10.0
 
       - name: Install helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
-          version: v3.16.2
+          version: v3.22.0
 
       # For the two cargo aggregate entries.
       - name: Install Rust toolchain
