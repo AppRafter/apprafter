@@ -162,8 +162,14 @@ _kind_bin() { if command -v kind >/dev/null 2>&1; then echo "kind"; else echo "n
 #
 # Keep this in step with the kind binary pinned in .github/workflows/*.yml:
 # kind supports a node image only with the release that ships it, so the pair
-# moves together or not at all.
-: "${APPRAFTER_KIND_NODE_IMAGE:=kindest/node:v1.31.0}"
+# moves together or not at all. Current pair: kind v0.33.0 + k8s v1.36.4 —
+# which is EXACTLY the version production runs, so a CRD or API assertion here
+# now means what it appears to mean.
+#
+# Digest-pinned, not tag-pinned: `kindest/node:v1.36.4` is mutable upstream,
+# and a moved tag would change the apiserver under the e2e island without a
+# diff — the same class of invisible version drift this variable exists to end.
+: "${APPRAFTER_KIND_NODE_IMAGE:=kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed}"
 export APPRAFTER_KIND_NODE_IMAGE
 
 # _kind_uses_podman — true when podman is the container runtime, so kind
