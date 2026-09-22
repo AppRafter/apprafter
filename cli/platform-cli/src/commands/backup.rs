@@ -1464,7 +1464,11 @@ pub fn run_export(namespaces: &[String], select: bool, out: Option<&str>) -> Res
     let claims = claims_in_namespaces(&ns_set, kc.path())?;
     let plan = plan_extraction(&claims);
     let pg_image = pg_helper_image(first_cnpg_image(&ns_set, kc.path()).as_deref());
-    run_extraction(&k, &plan, &out_dir, &pg_image)?;
+    // No deadline stops an export; its helper pods live as long as the
+    // cluster's scheduled backup may run, the one number for how long an
+    // extraction may take (backup_core::helper_pod).
+    let keep_alive = backup_core::engine::read_run_deadline(&k)?;
+    run_extraction(&k, &plan, &out_dir, &pg_image, keep_alive)?;
 
     let platform_version = read_platform_version(kc.path())?;
     let manifest = export_manifest(&cluster_id, &platform_version, &ns_set, &claims);
@@ -1646,6 +1650,12 @@ pub fn run_backup(
 
     let pg_image = pg_helper_image(first_cnpg_image(&ns_set, kc.path()).as_deref());
     let platform_version = read_platform_version(kc.path())?;
+    // An interactive backup has no Job deadline — the person running it is
+    // the one who stops it. Its helper pods still live only as long as a
+    // scheduled backup of the same cluster may run: the same number bounds
+    // one extraction either way, and it reaps a helper pod this command was
+    // killed before deleting.
+    let helper_keep_alive = backup_core::engine::read_run_deadline(&k)?;
 
     // Stage everything under a tempdir; the engine writes data/ under this root.
     let staging = tempfile::Builder::new()
@@ -1663,6 +1673,7 @@ pub fn run_backup(
         select,
         staging.path(),
         pg_image,
+        helper_keep_alive,
         staging_mode,
     );
 
@@ -1695,6 +1706,7 @@ fn local_pull_backup_opts(
     is_subset: bool,
     staging_root: &Path,
     pg_image: String,
+    helper_keep_alive: Duration,
     staging_mode: StagingMode,
 ) -> BackupOpts {
     BackupOpts {
@@ -1708,6 +1720,7 @@ fn local_pull_backup_opts(
         is_subset,
         staging_root: staging_root.to_path_buf(),
         pg_image,
+        helper_keep_alive,
         staging_mode,
         backup_host: None,
     }
@@ -9037,6 +9050,7 @@ mod tests {
             true,
             Path::new("/staging"),
             "postgres:18-alpine".into(),
+            Duration::from_secs(43200),
             StagingMode::Sequential,
         );
         assert_eq!(opts.backup_host, None);
@@ -9051,6 +9065,9 @@ mod tests {
         assert_eq!(opts.namespaces, vec!["prod".to_string()]);
         assert_eq!(opts.staging_root, PathBuf::from("/staging"));
         assert_eq!(opts.pg_image, "postgres:18-alpine");
+        // The cluster's run deadline, not a fixed hour: it is how long each
+        // helper pod — and so each extraction — may live.
+        assert_eq!(opts.helper_keep_alive, Duration::from_secs(43200));
         assert!(matches!(opts.staging_mode, StagingMode::Sequential));
         assert!(
             chrono::DateTime::parse_from_rfc3339(&opts.created_at).is_ok(),

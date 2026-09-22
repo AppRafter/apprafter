@@ -31,11 +31,16 @@
 //!   `lastSuccess`, exit **0**.
 //! * the status-CM write and the failure webhook are BEST-EFFORT: a failure in
 //!   either is logged but NEVER changes the run's exit code.
+//! * SIGTERM — Kubernetes stopping the run at its Job deadline, or deleting
+//!   its pod — → the run is recorded as a `Failure` by [`stop::stop_run`]
+//!   instead of by the run itself, its helper pods deleted, exit **1**. Only
+//!   one of the two ever records ([`OutcomeClaim`]).
 
 use apprafter_backup::config::RunnerConfig;
 use apprafter_backup::kube_rs_exec::KubeRsExec;
 use apprafter_backup::orchestrate::{resolve_namespaces, RunOutcome};
 use apprafter_backup::status::write_status;
+use apprafter_backup::stop::{self, OutcomeClaim, StopContext};
 use apprafter_backup::webhook::post_failure;
 
 use backup_core::engine::{run_backup, BackupOpts};
@@ -53,6 +58,10 @@ fn main() {
 /// The whole run, returning the process exit code. NEVER panics: every error is
 /// funnelled into an exit code (see the module-level error contract).
 fn run() -> i32 {
+    // Before anything else, so a run stopped at its deadline reports how long
+    // it had been running rather than how long its setup took.
+    let started = std::time::Instant::now();
+
     // 1. Config. A missing/invalid env is a PRECONDITION error — the backup
     //    never even started, so this is exit 2, not a Failure outcome.
     let cfg = match RunnerConfig::from_env() {
@@ -99,10 +108,60 @@ fn run() -> i32 {
         StagingMode::Monolithic => "monolithic",
     };
 
+    // 2b. SIGTERM: at the Job's deadline (or when its pod is deleted)
+    //     Kubernetes sends it, then SIGKILL after the pod's grace period. As
+    //     PID 1 with no handler the runner would ignore the first and die by
+    //     the second with nothing recorded; see `stop`. A handler that cannot
+    //     be installed leaves the run exactly as it was before, so it is
+    //     reported and the backup goes ahead.
+    let claim = OutcomeClaim::default();
+    match rt.block_on(async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    }) {
+        Ok(mut sigterm) => {
+            let ctx = StopContext {
+                client: client.clone(),
+                live_helpers: k.live_helper_pods(),
+                started,
+                deadline: cfg.deadline,
+                format,
+                cluster_id: cfg.cluster_id.clone(),
+                failure_webhook: cfg.failure_webhook.clone(),
+            };
+            let claim = claim.clone();
+            rt.spawn(async move {
+                if sigterm.recv().await.is_none() {
+                    return;
+                }
+                if !claim.claim() {
+                    // The run finished first and is recording its own outcome;
+                    // it exits well inside the grace period.
+                    eprintln!("SIGTERM received while the run was already ending");
+                    return;
+                }
+                let outcome = stop::stop_run(&ctx).await;
+                std::process::exit(outcome.exit_code());
+            });
+        }
+        Err(e) => eprintln!(
+            "warning: cannot handle SIGTERM ({e}); a run stopped at its deadline will not \
+             record lastFailure"
+        ),
+    }
+
     // 3. The backup itself, wrapped so ANY error becomes a Failure outcome
     //    (never a panic, never a bare exit) — the engine ran, so the outcome is
     //    recorded in the status CM and the exit code is 1.
-    let outcome = match do_backup(&k, &r, &cfg) {
+    let result = do_backup(&k, &r, &cfg);
+    if !claim.claim() {
+        // Kubernetes stopped the run and the stop is recording it; an error
+        // here is the stop's own doing (it deleted the helper pod this run
+        // was reading from). Wait for the stop to exit the process.
+        loop {
+            std::thread::park();
+        }
+    }
+    let outcome = match result {
         Ok(snapshot) => RunOutcome::Success { snapshot },
         Err(e) => {
             // Surface the failure reason on stderr so `kubectl logs <runner-pod>`
@@ -207,6 +266,11 @@ fn do_backup(k: &dyn KubeExec, r: &dyn ResticRunner, cfg: &RunnerConfig) -> Resu
         is_subset: false,
         staging_root: staging.path().to_path_buf(),
         pg_image,
+        // Each helper pod lives as long as this run may: the Job's deadline.
+        // A Job template older than the variable gets the chart's default.
+        helper_keep_alive: cfg
+            .deadline
+            .unwrap_or(backup_core::helper_pod::DEFAULT_RUN_DEADLINE),
         staging_mode: cfg.staging_mode,
         // Stable restic `--host` — the operator-chosen cluster NAME when there
         // is one, else the fixed `apprafter-backup`. Never the pod name, which

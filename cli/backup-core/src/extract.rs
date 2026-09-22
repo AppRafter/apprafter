@@ -24,6 +24,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use cli_core::{CliError, Result};
 use serde_json::{json, Value};
@@ -371,6 +372,7 @@ pub(crate) fn pg_dump_pod_spec_with_password(
     ns: &str,
     image: &str,
     password: &str,
+    keep_alive: Duration,
 ) -> Value {
     json!({
         "apiVersion": "v1",
@@ -385,7 +387,7 @@ pub(crate) fn pg_dump_pod_spec_with_password(
             "containers": [{
                 "name": "dump",
                 "image": image,
-                "command": ["sleep", "3600"],
+                "command": crate::helper_pod::keep_alive_command(keep_alive),
                 "env": [{
                     "name": "PGPASSWORD",
                     "value": password
@@ -433,18 +435,23 @@ pub(crate) fn pg_dump_pod_spec_with_password(
 /// dump helper.  Pass `images::DEFAULT_PG_IMAGE` for the tier-1 default
 /// (pg 16); `images::pg_helper_image(Some(server_image_name))` when the CNPG
 /// Cluster's `spec.imageName` is known.
+///
+/// `keep_alive` is how long each helper pod keeps itself alive, and so the
+/// most any one extraction may take: the run's deadline (see
+/// [`crate::helper_pod`]).
 pub fn run_extraction(
     k: &dyn KubeExec,
     items: &[ExtractItem],
     out_dir: &Path,
     pg_image: &str,
+    keep_alive: Duration,
 ) -> Result<()> {
     for item in items {
         match item.kind {
-            DataKind::Pg => extract_pg(k, item, out_dir, pg_image)?,
-            DataKind::Volume => extract_volume(k, item, out_dir)?,
+            DataKind::Pg => extract_pg(k, item, out_dir, pg_image, keep_alive)?,
+            DataKind::Volume => extract_volume(k, item, out_dir, keep_alive)?,
             DataKind::Redis => extract_redis(k, item, out_dir)?,
-            DataKind::JetStream => extract_jetstream(k, item, out_dir)?,
+            DataKind::JetStream => extract_jetstream(k, item, out_dir, keep_alive)?,
         }
     }
     Ok(())
@@ -483,7 +490,13 @@ impl Drop for HelperPodGuard<'_> {
 /// 3. `k.exec_stream_to_file` → `pg_dump -Fc` → stream to
 ///    `out_dir/pg/<ns>/<claim>.dump`.
 /// 4. Delete the pod (best-effort, via `HelperPodGuard` drop).
-fn extract_pg(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path, pg_image: &str) -> Result<()> {
+fn extract_pg(
+    k: &dyn KubeExec,
+    item: &ExtractItem,
+    out_dir: &Path,
+    pg_image: &str,
+    keep_alive: Duration,
+) -> Result<()> {
     let secret_name = &item.source; // status.connectionSecretRef
     let ns = &item.namespace;
     let claim = &item.claim_name;
@@ -503,7 +516,7 @@ fn extract_pg(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path, pg_image: &s
         namespace: ns,
         k,
     };
-    let spec = pg_dump_pod_spec_with_password(&pod_name, ns, pg_image, &pass);
+    let spec = pg_dump_pod_spec_with_password(&pod_name, ns, pg_image, &pass, keep_alive);
     apply_and_wait_pod_ready(k, &spec)?;
 
     // 3. Stream pg_dump output to disk.
@@ -581,7 +594,12 @@ pub fn explain_pg_dump_error(err: CliError, ns: &str, claim: &str) -> CliError {
 /// 2. `k.exec_stream_to_file` → `tar c -C /data .` → stream to
 ///    `out_dir/volumes/<ns>/<claim>/data.tar`.
 /// 3. Delete the pod (best-effort, via `HelperPodGuard` drop).
-fn extract_volume(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Result<()> {
+fn extract_volume(
+    k: &dyn KubeExec,
+    item: &ExtractItem,
+    out_dir: &Path,
+    keep_alive: Duration,
+) -> Result<()> {
     let pvc_name = &item.source; // status.volumeClaimRef
     let ns = &item.namespace;
     let claim = &item.claim_name;
@@ -600,6 +618,7 @@ fn extract_volume(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Resul
         images::VOLUME_IMAGE,
         pvc_name,
         true, // read-only for backup
+        keep_alive,
     );
     apply_and_wait_pod_ready(k, &spec)?;
 
@@ -635,7 +654,12 @@ fn extract_volume(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Resul
 /// not a single file. Consumers ride along: the CLI includes them unless told
 /// otherwise, and a stream restored without its consumers would replay every
 /// message to a subscriber that had already processed it.
-fn extract_jetstream(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Result<()> {
+fn extract_jetstream(
+    k: &dyn KubeExec,
+    item: &ExtractItem,
+    out_dir: &Path,
+    keep_alive: Duration,
+) -> Result<()> {
     let ns = &item.namespace;
     let claim = &item.claim_name;
     let stream = &item.source;
@@ -680,6 +704,7 @@ fn extract_jetstream(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Re
         &url,
         &user,
         &password,
+        keep_alive,
     );
     apply_and_wait_pod_ready(k, &spec)?;
 
@@ -1053,10 +1078,12 @@ mod tests {
     #[derive(Default)]
     struct RecordingKube {
         execs: std::sync::Mutex<Vec<(String, Option<std::time::Duration>)>>,
+        applied: std::sync::Mutex<Vec<Value>>,
     }
 
     impl KubeExec for RecordingKube {
-        fn apply_and_wait_pod_ready(&self, _spec: &Value) -> Result<()> {
+        fn apply_and_wait_pod_ready(&self, spec: &Value) -> Result<()> {
+            self.applied.lock().unwrap().push(spec.clone());
             Ok(())
         }
         fn exec_stream_to_file(
@@ -1102,7 +1129,14 @@ mod tests {
                    "status": {"instance": "platform-redis-persistent-000"}}),
         ]);
         let dir = tempfile::tempdir().unwrap();
-        run_extraction(&k, &items, dir.path(), images::DEFAULT_PG_IMAGE).unwrap();
+        run_extraction(
+            &k,
+            &items,
+            dir.path(),
+            images::DEFAULT_PG_IMAGE,
+            crate::helper_pod::DEFAULT_RUN_DEADLINE,
+        )
+        .unwrap();
 
         let execs = k.execs.lock().unwrap().clone();
         assert_eq!(
@@ -1113,6 +1147,50 @@ mod tests {
                 ("sh".to_string(), None),
             ]
         );
+    }
+
+    #[test]
+    fn every_helper_pod_an_extraction_applies_lives_for_the_run_deadline() {
+        // The `sleep` ending kills every exec in the pod with 137, so the
+        // keep-alive caps each extraction: it must be the run's deadline, not
+        // the fixed hour it was.
+        let k = RecordingKube::default();
+        let items = plan_extraction(&[
+            json!({"spec": {"type": "pg"}, "metadata": {"name": "db", "namespace": "demo"},
+                   "status": {"connectionSecretRef": "db-conn"}}),
+            json!({"spec": {"type": "disk"}, "metadata": {"name": "vol", "namespace": "demo"},
+                   "status": {"volumeClaimRef": "pvc"}}),
+            json!({"spec": {"type": "jetstream"}, "metadata": {"name": "js", "namespace": "demo"},
+                   "status": {"connectionSecretRef": "js-conn",
+                              "streams": {"declared": ["orders"]}}}),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let twelve_hours = std::time::Duration::from_secs(43200);
+        // The jetstream item reads its NATS namespace off `host`; the fake's
+        // `pg.demo.svc` names `demo`.
+        run_extraction(
+            &k,
+            &items,
+            dir.path(),
+            images::DEFAULT_PG_IMAGE,
+            twelve_hours,
+        )
+        .unwrap();
+
+        let applied = k.applied.lock().unwrap().clone();
+        assert_eq!(applied.len(), 3, "{applied:?}");
+        for spec in applied {
+            assert_eq!(
+                spec["spec"]["containers"][0]["command"],
+                json!(["sleep", "43200"]),
+                "{}",
+                spec["metadata"]["name"]
+            );
+            assert_eq!(
+                spec["metadata"]["labels"]["apprafter.io/backup-helper"], "true",
+                "the runner's stop deletes only pods carrying this label"
+            );
+        }
     }
 
     #[test]

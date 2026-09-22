@@ -4,12 +4,24 @@
 //!
 //! # Pure pod-spec builders
 //!
-//! `pg_dump_pod_spec` / `volume_pod_spec` return serde_json::Value Pod specs
-//! that are applied via `apply_and_wait_pod_ready` and then exec'd into.
-//! Both use `["sleep", "3600"]` as the container command — a keep-alive so
-//! the CLI can exec before the tool needs to run.  `restartPolicy: Never`
-//! ensures a single attempt; the caller tears down with
-//! `delete_pod_best_effort` after the stream completes.
+//! `pg_dump_pod_spec` / `volume_pod_spec` / `nats_pod_spec` return
+//! serde_json::Value Pod specs that are applied via `apply_and_wait_pod_ready`
+//! and then exec'd into. Each runs [`keep_alive_command`] — `sleep` for the
+//! run's deadline — as its container command, so the pod is there to exec
+//! into. `restartPolicy: Never` ensures a single attempt; the caller tears
+//! down with `delete_pod_best_effort` after the stream completes.
+//!
+//! # How long a helper pod lives
+//!
+//! When the `sleep` ends, the container exits and every exec still running in
+//! it dies with exit code 137. So the keep-alive is a hard cap on each single
+//! extraction or load, whatever else allows it — and it used to be a fixed
+//! `sleep 3600`, so no one claim could take longer than an hour, even under a
+//! Job deadline of six. It is now the run's deadline ([`run_deadline_of`]):
+//! the scheduled runner passes its Job's `activeDeadlineSeconds`, and the CLI
+//! the same cluster setting, so one number decides how long a backup may
+//! take. It is also the reaper for a helper pod nobody deleted — a runner or a
+//! CLI killed before its cleanup ran.
 //!
 //! # Impure forwarding helpers
 //!
@@ -20,8 +32,40 @@
 use cli_core::Result;
 use serde_json::{json, Value};
 use std::path::Path;
+use std::time::Duration;
 
 use crate::kube::KubeExec;
+
+// ---------------------------------------------------------------------------
+// The run's deadline and the keep-alive it sets
+// ---------------------------------------------------------------------------
+
+/// The deadline of a backup run when `spec.backup.activeDeadlineSeconds` is
+/// unset: the chart's default for the backup Job's `activeDeadlineSeconds`,
+/// six hours. `scripts/check-backup-render.sh` asserts the two are the same
+/// number.
+pub const DEFAULT_RUN_DEADLINE: Duration = Duration::from_secs(21600);
+
+/// The cluster's backup run deadline, read off `PlatformStack/default`:
+/// `spec.backup.activeDeadlineSeconds`, else [`DEFAULT_RUN_DEADLINE`] — the
+/// same resolution the chart makes for the backup Job. Pure.
+///
+/// A value that is not a positive whole number reads as unset: the CRD holds it
+/// to 600 or more, so anything else is not a setting anyone made.
+pub fn run_deadline_of(platformstack: Option<&Value>) -> Duration {
+    platformstack
+        .and_then(|ps| ps.pointer("/spec/backup/activeDeadlineSeconds"))
+        .and_then(Value::as_u64)
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_RUN_DEADLINE)
+}
+
+/// The container command that keeps a helper pod alive for `keep_alive`, the
+/// run's deadline (see the module docs for why that is the right length).
+pub fn keep_alive_command(keep_alive: Duration) -> Value {
+    json!(["sleep", keep_alive.as_secs().max(1).to_string()])
+}
 
 // ---------------------------------------------------------------------------
 // Pure pod-spec builders
@@ -30,9 +74,9 @@ use crate::kube::KubeExec;
 /// Build a Pod spec for pg_dump extraction.
 ///
 /// No PVC mount — the container runs `pg_dump` over a TCP connection to the
-/// CNPG cluster Service.  The keep-alive command (`sleep 3600`) lets the CLI
-/// exec in and run the tool after the pod reaches Running.
-pub fn pg_dump_pod_spec(name: &str, ns: &str, image: &str) -> Value {
+/// CNPG cluster Service. The keep-alive command ([`keep_alive_command`]) lets
+/// the caller exec in and run the tool after the pod reaches Running.
+pub fn pg_dump_pod_spec(name: &str, ns: &str, image: &str, keep_alive: Duration) -> Value {
     json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -46,7 +90,7 @@ pub fn pg_dump_pod_spec(name: &str, ns: &str, image: &str) -> Value {
             "containers": [{
                 "name": "dump",
                 "image": image,
-                "command": ["sleep", "3600"]
+                "command": keep_alive_command(keep_alive)
             }]
         }
     })
@@ -60,7 +104,14 @@ pub fn pg_dump_pod_spec(name: &str, ns: &str, image: &str) -> Value {
 /// `persistentVolumeClaim.readOnly` field and the matching `volumeMounts`
 /// entry — Kubernetes enforces the readOnly flag on the mount, and a
 /// RWO PVC mounted read-write on restore allows `tar x` to write files (L1).
-pub fn volume_pod_spec(name: &str, ns: &str, image: &str, pvc: &str, read_only: bool) -> Value {
+pub fn volume_pod_spec(
+    name: &str,
+    ns: &str,
+    image: &str,
+    pvc: &str,
+    read_only: bool,
+    keep_alive: Duration,
+) -> Value {
     json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -81,7 +132,7 @@ pub fn volume_pod_spec(name: &str, ns: &str, image: &str, pvc: &str, read_only: 
             "containers": [{
                 "name": "dump",
                 "image": image,
-                "command": ["sleep", "3600"],
+                "command": keep_alive_command(keep_alive),
                 "volumeMounts": [{
                     "name": "data",
                     "mountPath": "/data",
@@ -111,6 +162,7 @@ pub fn nats_pod_spec(
     url: &str,
     user: &str,
     password: &str,
+    keep_alive: Duration,
 ) -> Value {
     json!({
         "apiVersion": "v1",
@@ -125,7 +177,7 @@ pub fn nats_pod_spec(
             "containers": [{
                 "name": "dump",
                 "image": image,
-                "command": ["sleep", "3600"],
+                "command": keep_alive_command(keep_alive),
                 "env": [
                     { "name": "NATS_URL", "value": url },
                     { "name": "NATS_USER", "value": user },
@@ -200,7 +252,12 @@ mod tests {
 
     #[test]
     fn pg_dump_pod_uses_pg_image_and_no_pvc_mount() {
-        let p = pg_dump_pod_spec("bk-pg-alpha", "demo", "postgres:16-alpine");
+        let p = pg_dump_pod_spec(
+            "bk-pg-alpha",
+            "demo",
+            "postgres:16-alpine",
+            DEFAULT_RUN_DEADLINE,
+        );
         assert_eq!(p["spec"]["containers"][0]["image"], "postgres:16-alpine");
         assert_eq!(p["metadata"]["namespace"], "demo");
         assert!(p["spec"]["containers"][0]["command"]
@@ -220,6 +277,7 @@ mod tests {
             "busybox:1.36",
             "sv-demo-shared",
             true,
+            DEFAULT_RUN_DEADLINE,
         );
         let vol = &p["spec"]["volumes"][0];
         assert_eq!(vol["persistentVolumeClaim"]["claimName"], "sv-demo-shared");
@@ -233,7 +291,14 @@ mod tests {
     #[test]
     fn volume_pod_rw_for_restore_load() {
         // L1: LoadData must WRITE the tree into the fresh PVC → read_only=false
-        let p = volume_pod_spec("ld-vol-data", "demo", "busybox:1.36", "claim-x", false);
+        let p = volume_pod_spec(
+            "ld-vol-data",
+            "demo",
+            "busybox:1.36",
+            "claim-x",
+            false,
+            DEFAULT_RUN_DEADLINE,
+        );
         assert_eq!(
             p["spec"]["volumes"][0]["persistentVolumeClaim"]["readOnly"],
             false
@@ -242,5 +307,56 @@ mod tests {
             p["spec"]["containers"][0]["volumeMounts"][0]["readOnly"],
             false
         );
+    }
+
+    #[test]
+    fn every_helper_pod_keeps_itself_alive_for_the_run_deadline_it_is_given() {
+        // Not an hour: the `sleep` ending kills every exec in the pod, so a
+        // fixed hour capped every single extraction at an hour, whatever the
+        // Job deadline said.
+        let twelve_hours = Duration::from_secs(43200);
+        let want = json!(["sleep", "43200"]);
+        for spec in [
+            pg_dump_pod_spec("bk-pg-db", "demo", "postgres:18-alpine", twelve_hours),
+            volume_pod_spec(
+                "bk-vol-v",
+                "demo",
+                "busybox:1.36",
+                "pvc",
+                true,
+                twelve_hours,
+            ),
+            nats_pod_spec(
+                "bk-js-s",
+                "nats",
+                "nats:2",
+                "nats://n:4222",
+                "u",
+                "p",
+                twelve_hours,
+            ),
+        ] {
+            assert_eq!(spec["spec"]["containers"][0]["command"], want, "{spec}");
+        }
+    }
+
+    #[test]
+    fn the_run_deadline_is_the_clusters_setting_or_six_hours() {
+        assert_eq!(DEFAULT_RUN_DEADLINE, Duration::from_secs(6 * 3600));
+        let set = json!({"spec": {"backup": {"activeDeadlineSeconds": 43200}}});
+        assert_eq!(run_deadline_of(Some(&set)), Duration::from_secs(43200));
+        for unset in [
+            json!({"spec": {"backup": {"enabled": true}}}),
+            json!({"spec": {}}),
+            json!({"spec": {"backup": {"activeDeadlineSeconds": 0}}}),
+            json!({"spec": {"backup": {"activeDeadlineSeconds": "12h"}}}),
+        ] {
+            assert_eq!(
+                run_deadline_of(Some(&unset)),
+                DEFAULT_RUN_DEADLINE,
+                "{unset}"
+            );
+        }
+        assert_eq!(run_deadline_of(None), DEFAULT_RUN_DEADLINE);
     }
 }

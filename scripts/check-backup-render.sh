@@ -3,7 +3,7 @@
 #
 # check-backup-render.sh — render the platform-stack chart with scheduled
 # backup switched on, and assert that both backup CronJobs carry a Job
-# deadline.
+# deadline, and that the pods under them stop cleanly when it passes.
 #
 # ## Why
 #
@@ -19,12 +19,26 @@
 # DEFAULT values, where backup is off and neither CronJob exists; `cue vet`
 # checks the values, not the template that reads them.
 #
+# At the deadline Kubernetes sends each Job's PID 1 SIGTERM. The runner turns
+# that into a recorded failure (lastFailure, the failure webhook, its helper
+# pods deleted), which needs three things from the render, none of which any
+# other gate looks at: the deadline in its env, the grace period that gives it
+# time, and — for the check, which is restic under a shell — `exec`, so the
+# signal reaches restic and it removes its exclusive repository lock (busybox
+# sh execs the last command of `-c` on its own today; that is one shell's
+# optimisation, and the explicit `exec` does not depend on it).
+#
 # Asserts, against a freshly rendered chart:
 #
 #   1. backup enabled, defaults: both CronJobs are Forbid and carry
-#      activeDeadlineSeconds 21600 (six hours).
-#   2. backup enabled, both knobs set: each CronJob carries its own value.
+#      activeDeadlineSeconds 21600 (six hours); the runner's
+#      APPRAFTER_BACKUP_DEADLINE_SECONDS says the same; the runner pod has a
+#      90 s termination grace period; the check execs restic.
+#   2. backup enabled, both knobs set: each CronJob carries its own value, and
+#      the runner's env follows the backup one.
 #   3. a deadline under ten minutes is refused by values.schema.json.
+#   4. the chart's default deadline is the one the runner and the CLI fall back
+#      to (backup-core's DEFAULT_RUN_DEADLINE).
 #
 # Usage: bash scripts/check-backup-render.sh
 # Exit 0 = every assertion held.
@@ -109,12 +123,39 @@ assert_cronjob() {
     echo "  ok: $label — $name: Forbid, activeDeadlineSeconds $want"
 }
 
+# `$1` label, `$2` rendered manifests, `$3` expected deadline in seconds: the
+# runner container of the backup CronJob carries it as
+# APPRAFTER_BACKUP_DEADLINE_SECONDS, and its pod has the grace period the
+# runner's SIGTERM handling is sized for.
+assert_runner_stops_cleanly() {
+    local label="$1" rendered="$2" want="$3" doc got
+    doc="$(cronjob_doc "$rendered" apprafter-backup)"
+    got="$(awk '/^            - name: APPRAFTER_BACKUP_DEADLINE_SECONDS$/{f=1; next}
+                f && /^              value: /{print $2; exit}' <<<"$doc")"
+    [[ "$got" == "\"$want\"" ]] \
+        || fail "$label: runner env APPRAFTER_BACKUP_DEADLINE_SECONDS is '${got:-absent}', want \"$want\" (the Job's activeDeadlineSeconds)"
+    grep -qE '^          terminationGracePeriodSeconds: 90$' <<<"$doc" \
+        || fail "$label: the runner pod has no 90 s terminationGracePeriodSeconds; at the deadline it is SIGKILLed before it records the failure"
+    echo "  ok: $label — runner env deadline $want, 90 s termination grace"
+}
+
+# `$1` label, `$2` rendered manifests: the check's restic is PID 1.
+assert_check_execs_restic() {
+    local label="$1" rendered="$2" doc
+    doc="$(cronjob_doc "$rendered" apprafter-backup-check)"
+    grep -qE '^ +exec restic -r "\$APPRAFTER_BACKUP_REPO" check' <<<"$doc" \
+        || fail "$label: the check does not exec restic; SIGTERM at the deadline would depend on the shell to reach restic, which must remove its exclusive lock"
+    echo "  ok: $label — the check execs restic"
+}
+
 echo "==> backup CronJob deadlines, chart $version"
 
 # 1. Defaults.
 helm template platform "$chart" --values "$enabled" >"$workdir/defaults.yaml"
 assert_cronjob "defaults" "$workdir/defaults.yaml" apprafter-backup 21600
 assert_cronjob "defaults" "$workdir/defaults.yaml" apprafter-backup-check 21600
+assert_runner_stops_cleanly "defaults" "$workdir/defaults.yaml" 21600
+assert_check_execs_restic "defaults" "$workdir/defaults.yaml"
 
 # 2. Both knobs set, to values that tell them apart.
 helm template platform "$chart" --values "$enabled" \
@@ -123,6 +164,7 @@ helm template platform "$chart" --values "$enabled" \
     >"$workdir/set.yaml"
 assert_cronjob "knobs set" "$workdir/set.yaml" apprafter-backup 2700
 assert_cronjob "knobs set" "$workdir/set.yaml" apprafter-backup-check 43200
+assert_runner_stops_cleanly "knobs set" "$workdir/set.yaml" 2700
 
 # 3. The ten-minute floor: a unit mistake is refused at install, not shipped
 #    as a deadline that stops every run.
@@ -136,4 +178,13 @@ for key in activeDeadlineSeconds checkActiveDeadlineSeconds; do
     echo "  ok: backup.${key}=360 is refused by the values schema"
 done
 
-echo "PASS: both backup CronJobs carry a Job deadline."
+# 4. The default the chart renders is the default the runner (no env) and the
+#    CLI (no spec.backup.activeDeadlineSeconds) keep their helper pods alive
+#    for. Two literals in two languages; this is what keeps them one number.
+rust_default="$(sed -nE 's/^pub const DEFAULT_RUN_DEADLINE: Duration = Duration::from_secs\(([0-9]+)\);$/\1/p' \
+    cli/backup-core/src/helper_pod.rs)"
+[[ "$rust_default" == "21600" ]] \
+    || fail "backup-core DEFAULT_RUN_DEADLINE is '${rust_default:-not found}', but the chart defaults the Job deadline to 21600"
+echo "  ok: backup-core's DEFAULT_RUN_DEADLINE is the chart's 21600"
+
+echo "PASS: both backup CronJobs carry a Job deadline, and stop cleanly at it."

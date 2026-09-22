@@ -64,12 +64,25 @@ const POD_READY_POLL_INTERVAL_SECS: u64 = 2;
 pub struct KubeRsExec {
     client: kube::Client,
     rt: tokio::runtime::Handle,
+    /// Every helper pod applied and not yet deleted, for the stop to delete
+    /// when Kubernetes ends the run first (`crate::stop`).
+    live_helpers: crate::stop::LiveHelperPods,
 }
 
 impl KubeRsExec {
     /// Construct a runner over `client`, blocking on `rt` for every call.
     pub fn new(client: kube::Client, rt: tokio::runtime::Handle) -> Self {
-        Self { client, rt }
+        Self {
+            client,
+            rt,
+            live_helpers: crate::stop::LiveHelperPods::default(),
+        }
+    }
+
+    /// The helper pods this exec has applied and not yet deleted — a handle
+    /// that stays current as the run goes on.
+    pub fn live_helper_pods(&self) -> crate::stop::LiveHelperPods {
+        self.live_helpers.clone()
     }
 
     /// Resolve a kubectl-style resource string (`applications.apprafter.io`,
@@ -158,6 +171,15 @@ fn pod_identity(spec: &Value) -> Result<(String, String)> {
         .ok_or_else(|| CliError::Other("pod spec missing metadata.namespace".into()))?
         .to_string();
     Ok((name, ns))
+}
+
+/// Whether a Pod spec is a backup helper pod — the label every
+/// `backup_core::helper_pod` builder stamps. Only those are the run's to
+/// delete when it is stopped.
+fn is_backup_helper(spec: &Value) -> bool {
+    spec.pointer("/metadata/labels/apprafter.io~1backup-helper")
+        .and_then(Value::as_str)
+        == Some("true")
 }
 
 /// Parsed shape of a `get_json` args vector.
@@ -322,6 +344,11 @@ impl KubeExec for KubeRsExec {
     fn apply_and_wait_pod_ready(&self, spec: &Value) -> Result<()> {
         self.rt.block_on(async {
             let (name, ns) = pod_identity(spec)?;
+            // Tracked BEFORE the apply: a pod whose apply went through and
+            // whose Ready wait is still running is the run's to delete too.
+            if is_backup_helper(spec) {
+                self.live_helpers.insert(&ns, &name);
+            }
 
             let api: Api<Pod> = Api::namespaced(self.client.clone(), &ns);
 
@@ -530,6 +557,9 @@ impl KubeExec for KubeRsExec {
             let api: Api<Pod> = Api::namespaced(self.client.clone(), ns);
             api.delete(name, &DeleteParams::default()).await
         });
+        // Forgotten whatever the delete answered: it is the only delete this
+        // run makes, and a stop that retried it would find the same answer.
+        self.live_helpers.remove(ns, name);
     }
 
     fn get_secret_key(&self, secret: &str, ns: &str, key: &str) -> Result<String> {
@@ -1774,6 +1804,38 @@ mod tests {
         );
     }
 
+    /// The stop deletes what is in the live set, so a helper pod must be in it
+    /// from its apply until its delete — and nothing else ever is.
+    #[test]
+    fn a_helper_pod_is_live_from_its_apply_until_its_delete_and_other_pods_never() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let h = Harness::new(vec![
+            ok_route("PATCH", path, running_ready_pod()),
+            ok_route("GET", path, running_ready_pod()),
+            ok_route("DELETE", path, running_ready_pod()),
+        ]);
+        let live = h.exec.live_helper_pods();
+        let mut spec = helper_pod_spec();
+        spec["metadata"]["labels"] = json!({"apprafter.io/backup-helper": "true"});
+
+        h.exec
+            .apply_and_wait_pod_ready(&spec)
+            .expect("apply + wait");
+        assert_eq!(
+            live.snapshot(),
+            vec![("demo".to_string(), "bk-pg-alpha".to_string())]
+        );
+        h.exec.delete_pod_best_effort("bk-pg-alpha", "demo");
+        assert!(live.snapshot().is_empty(), "{:?}", live.snapshot());
+
+        // A pod without the helper label — a test's own server, say — is not
+        // the stop's to delete.
+        h.exec
+            .apply_and_wait_pod_ready(&helper_pod_spec())
+            .expect("apply + wait");
+        assert!(live.snapshot().is_empty(), "{:?}", live.snapshot());
+    }
+
     /// A rejected apply must abort immediately — never fall through into the
     /// readiness poll, where a stale pod of the same name from an earlier run
     /// could report Ready and let the backup dump the WRONG database.
@@ -2440,6 +2502,7 @@ mod tests {
                 is_subset: false,
                 staging_root: staging.path().to_path_buf(),
                 pg_image: "postgres:16-alpine".to_string(),
+                helper_keep_alive: backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
                 staging_mode: backup_core::StagingMode::Monolithic,
                 backup_host: Some("apprafter-backup".to_string()),
             },

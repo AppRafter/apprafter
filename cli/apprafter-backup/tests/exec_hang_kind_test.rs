@@ -256,7 +256,13 @@ fn extract_with_watchdog(
     let out_dir = out_dir.to_path_buf();
     let started = Instant::now();
     std::thread::spawn(move || {
-        let result = run_extraction(k, std::slice::from_ref(&item), &out_dir, PG_IMAGE);
+        let result = run_extraction(
+            k,
+            std::slice::from_ref(&item),
+            &out_dir,
+            PG_IMAGE,
+            backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
+        );
         let _ = tx.send((started.elapsed(), result));
     });
     rx.recv_timeout(watchdog).map_err(|_| started.elapsed())
@@ -494,7 +500,13 @@ fn a_held_materialized_view_lock_fails_the_dump_at_its_first_output_bound_and_a_
         let out_dir = dir.path().to_path_buf();
         std::thread::spawn(move || {
             let started = Instant::now();
-            let result = run_extraction(k, std::slice::from_ref(&item), &out_dir, PG_IMAGE);
+            let result = run_extraction(
+                k,
+                std::slice::from_ref(&item),
+                &out_dir,
+                PG_IMAGE,
+                backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
+            );
             let _ = tx.send((started.elapsed(), result));
         });
     }

@@ -72,6 +72,11 @@ pub struct BackupOpts {
     pub staging_root: PathBuf,
     /// The `postgres:<major>-alpine` image to use for pg_dump helper pods.
     pub pg_image: String,
+    /// How long each helper pod keeps itself alive, and so the most any one
+    /// extraction may take: the run's deadline. The scheduled runner passes
+    /// its Job's `activeDeadlineSeconds`; the CLI the same cluster setting,
+    /// through [`read_run_deadline`]. See [`crate::helper_pod`].
+    pub helper_keep_alive: std::time::Duration,
     /// Staging / snapshotting behaviour.
     pub staging_mode: StagingMode,
     /// Fixed `--host` passed to every `restic backup` invocation for this run.
@@ -441,6 +446,16 @@ pub fn read_platform_version(k: &dyn KubeExec) -> Result<String> {
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string())
+}
+
+/// The cluster's backup run deadline — `spec.backup.activeDeadlineSeconds`,
+/// six hours when unset — which is how long a helper pod keeps itself alive
+/// ([`crate::helper_pod::run_deadline_of`]). The CLI reads it here; the
+/// scheduled runner has its Job's own value in its env.
+pub fn read_run_deadline(k: &dyn KubeExec) -> Result<std::time::Duration> {
+    Ok(crate::helper_pod::run_deadline_of(
+        get_platformstack(k)?.as_ref(),
+    ))
 }
 
 /// The CNPG operand image of the first CNPG Cluster found, for major-matched
@@ -882,7 +897,7 @@ fn run_backup_monolithic_with_summary(
     // 1. Native data extraction — the WHOLE plan into <staging>/data.
     let claims = claims_in_namespaces(k, &opts.namespaces)?;
     let plan = plan_extraction(&claims);
-    run_extraction(k, &plan, &data_dir, &opts.pg_image)?;
+    run_extraction(k, &plan, &data_dir, &opts.pg_image, opts.helper_keep_alive)?;
 
     // 2-4. CRs + secrets + manifest, colocated in <staging>/data.
     let non_claim = capture_non_claim_artifacts(k, opts, &claims, &data_dir)?;
@@ -951,7 +966,13 @@ fn run_backup_sequential_with_summary(
         // Extract exactly THIS claim — reuses run_extraction (and thus the same
         // extract_pg / extract_volume) on a one-element slice, so the per-claim
         // path is byte-identical to the monolithic per-claim layout.
-        run_extraction(k, std::slice::from_ref(item), &claim_dir, &opts.pg_image)?;
+        run_extraction(
+            k,
+            std::slice::from_ref(item),
+            &claim_dir,
+            &opts.pg_image,
+            opts.helper_keep_alive,
+        )?;
 
         snapshot_id = r.run_backup(
             &restic_backup_argv(
@@ -1293,9 +1314,39 @@ mod tests {
             is_subset: false,
             staging_root,
             pg_image: "postgres:16-alpine".into(),
+            helper_keep_alive: crate::helper_pod::DEFAULT_RUN_DEADLINE,
             staging_mode: mode,
             backup_host: None,
         }
+    }
+
+    #[test]
+    fn the_run_deadline_is_read_off_the_platformstack_and_defaults_to_six_hours() {
+        // How long the CLI's helper pods live: the same number the chart puts
+        // on the scheduled backup Job.
+        let ps_args = [
+            "get",
+            "platformstack",
+            "default",
+            "-n",
+            "apprafter-system",
+            "-o",
+            "json",
+        ];
+        let set = FakeKube::scripted().reply(
+            &ps_args,
+            json!({"spec": {"backup": {"activeDeadlineSeconds": 43200}}}),
+        );
+        assert_eq!(
+            read_run_deadline(&set).unwrap(),
+            std::time::Duration::from_secs(43200)
+        );
+        // No PlatformStack at all (a cluster restored into, before its
+        // platform is configured): the chart's default.
+        assert_eq!(
+            read_run_deadline(&FakeKube::scripted()).unwrap(),
+            crate::helper_pod::DEFAULT_RUN_DEADLINE
+        );
     }
 
     #[test]

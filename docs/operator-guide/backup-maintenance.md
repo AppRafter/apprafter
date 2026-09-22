@@ -200,8 +200,11 @@ A backup or check Job runs for six hours at most. Past that, Kubernetes stops
 it and fails the Job with reason `DeadlineExceeded`; `backup status` shows it
 as `Failed`, and the next scheduled run goes ahead as normal
 ([how long a run may take](../how-it-works/backup-retention-and-checks.md#how-long-a-run-may-take)).
-If your backups legitimately take longer — typically the first one of a large
-data set — raise the limit:
+A backup stopped this way records it like any other failure: `lastError` in
+`backup status` reads `run exceeded its deadline of 6h …`, and the failure
+webhook fires. If your backups legitimately take longer — typically the first
+one of a large data set, and the same limit applies to each claim's dump
+within it — raise the limit:
 
 ```sh
 apprafter backup set deadline 12h         # the backup Job; 6h by default

@@ -2053,15 +2053,20 @@ fn wait_claims_ready_with(
 /// into its freshly-provisioned backend.
 fn load_data(data_dir: &Path, manifest: &BackupManifest, kubeconfig: &Path) -> Result<()> {
     let k = KubectlExec::new(kubeconfig.to_path_buf());
+    // How long each load helper pod keeps itself alive, and so the most one
+    // load may take: the target cluster's backup run deadline, the number that
+    // bounds an extraction too (backup_core::helper_pod). It was a fixed hour,
+    // which killed any load that needed longer with exit code 137.
+    let keep_alive = backup_core::engine::read_run_deadline(&k)?;
     // pg: data/pg/<ns>/<claim>.dump
-    load_pg_dumps(data_dir, &k, kubeconfig)?;
+    load_pg_dumps(data_dir, &k, kubeconfig, keep_alive)?;
     // volumes: data/volumes/<ns>/<name>/data.tar
-    load_volumes(data_dir, manifest, &k, kubeconfig)?;
+    load_volumes(data_dir, manifest, &k, kubeconfig, keep_alive)?;
     // redis: data/redis/<ns>/<claim>/dump.tar → Dragonfly whole-instance snapshot.
     load_redis(data_dir, &k, kubeconfig)?;
     // jetstream: data/jetstream/<ns>/<claim>/<stream>.tar → the stream, over
     // the NATS wire, messages and consumers together (2.6d-6).
-    load_jetstream(data_dir, &k, kubeconfig)?;
+    load_jetstream(data_dir, &k, kubeconfig, keep_alive)?;
     Ok(())
 }
 
@@ -2174,7 +2179,12 @@ fn jetstream_restore_script(stream: &str) -> String {
 /// ones, never the backed-up ones — the same rule the pg loader follows), and
 /// the credentials from `nats-mgr-<ns>`, because a claim user is denied the
 /// snapshot API by construction (ADR 0061 §4.2).
-fn load_jetstream(data_dir: &Path, k: &dyn KubeExec, kubeconfig: &Path) -> Result<()> {
+fn load_jetstream(
+    data_dir: &Path,
+    k: &dyn KubeExec,
+    kubeconfig: &Path,
+    keep_alive: std::time::Duration,
+) -> Result<()> {
     let artifacts = discover_stream_artifacts(data_dir);
     if artifacts.is_empty() {
         return Ok(());
@@ -2210,6 +2220,7 @@ fn load_jetstream(data_dir: &Path, k: &dyn KubeExec, kubeconfig: &Path) -> Resul
             &format!("nats://{host}:{port}"),
             &user,
             &password,
+            keep_alive,
         );
         k.apply_and_wait_pod_ready(&spec)?;
 
@@ -2259,7 +2270,12 @@ fn resolve_claim_connection_secret(ns: &str, claim: &str, kubeconfig: &Path) -> 
 /// Restore every `data/pg/<ns>/<claim>.dump` via `pg_restore` over a helper
 /// pod, using the FRESH connection Secret (L3 — the post-provision creds, NOT
 /// the backed-up ones).
-fn load_pg_dumps(data_dir: &Path, k: &dyn KubeExec, kubeconfig: &Path) -> Result<()> {
+fn load_pg_dumps(
+    data_dir: &Path,
+    k: &dyn KubeExec,
+    kubeconfig: &Path,
+    keep_alive: std::time::Duration,
+) -> Result<()> {
     let dumps = discover_pg_dumps(data_dir);
     if dumps.is_empty() {
         return Ok(());
@@ -2277,7 +2293,9 @@ fn load_pg_dumps(data_dir: &Path, k: &dyn KubeExec, kubeconfig: &Path) -> Result
     let pg_image = pg_helper_image(first_cnpg_image(&namespaces, kubeconfig).as_deref());
 
     for (ns, claim, dump_path) in dumps {
-        load_one_pg(&ns, &claim, &dump_path, k, kubeconfig, &pg_image)?;
+        load_one_pg(
+            &ns, &claim, &dump_path, k, kubeconfig, &pg_image, keep_alive,
+        )?;
     }
     Ok(())
 }
@@ -2337,6 +2355,7 @@ fn load_one_pg(
     k: &dyn KubeExec,
     kubeconfig: &Path,
     pg_image: &str,
+    keep_alive: std::time::Duration,
 ) -> Result<()> {
     // Resolve the FRESH connection Secret name from the regenerated claim.
     let claim_json = kubectl_get_json(
@@ -2359,17 +2378,26 @@ fn load_one_pg(
     })?;
     let conn = pg_connection_from_secret(&secret, ns, &secret_name)?;
 
-    run_pg_restore(ns, claim, &conn, dump_path, k, pg_image, &|pod| {
-        // Wait for the TARGET database to actually accept a connection before
-        // streaming the dump. `WaitClaimsBound` only guarantees the
-        // ResourceClaim's `.status.ready` (a control-plane condition); for the
-        // FIRST claim that lazily provisions the shared CNPG cluster, the
-        // server can still be finishing initdb (connection refused) AND the
-        // per-claim database can be uncreated (`FATAL: database "…" does not
-        // exist`) when the claim flips ready, so an immediate `pg_restore`
-        // aborts the whole restore.
-        wait_pg_reachable(pod, ns, &conn, kubeconfig)
-    })
+    run_pg_restore(
+        ns,
+        claim,
+        &conn,
+        dump_path,
+        k,
+        pg_image,
+        keep_alive,
+        &|pod| {
+            // Wait for the TARGET database to actually accept a connection before
+            // streaming the dump. `WaitClaimsBound` only guarantees the
+            // ResourceClaim's `.status.ready` (a control-plane condition); for the
+            // FIRST claim that lazily provisions the shared CNPG cluster, the
+            // server can still be finishing initdb (connection refused) AND the
+            // per-claim database can be uncreated (`FATAL: database "…" does not
+            // exist`) when the claim flips ready, so an immediate `pg_restore`
+            // aborts the whole restore.
+            wait_pg_reachable(pod, ns, &conn, kubeconfig)
+        },
+    )
 }
 
 /// The FRESH connection Secret name of a regenerated claim (L3).
@@ -2452,8 +2480,14 @@ fn pg_restore_argv(conn: &PgConnection) -> Vec<String> {
 /// The pg helper pod spec (a network pod — the pg_dump image carries
 /// `pg_restore`) with `PGPASSWORD` injected so `pg_restore` never prompts for a
 /// password and hangs the restore.
-fn pg_helper_pod_spec(pod_name: &str, ns: &str, pg_image: &str, pass: &str) -> Value {
-    let mut spec = pg_dump_pod_spec(pod_name, ns, pg_image);
+fn pg_helper_pod_spec(
+    pod_name: &str,
+    ns: &str,
+    pg_image: &str,
+    pass: &str,
+    keep_alive: std::time::Duration,
+) -> Value {
+    let mut spec = pg_dump_pod_spec(pod_name, ns, pg_image, keep_alive);
     if let Some(container) = spec
         .pointer_mut("/spec/containers/0")
         .and_then(Value::as_object_mut)
@@ -2470,6 +2504,7 @@ fn pg_helper_pod_spec(pod_name: &str, ns: &str, pg_image: &str, pass: &str) -> V
 /// Stand a pg helper pod up, wait for the database behind `probe` to answer,
 /// and stream the dump into `pg_restore` on its stdin (L2). The pod is deleted
 /// on every return path by [`PodCleanupGuard`].
+#[allow(clippy::too_many_arguments)]
 fn run_pg_restore(
     ns: &str,
     claim: &str,
@@ -2477,10 +2512,11 @@ fn run_pg_restore(
     dump_path: &Path,
     k: &dyn KubeExec,
     pg_image: &str,
+    keep_alive: std::time::Duration,
     probe: &dyn Fn(&str) -> Result<()>,
 ) -> Result<()> {
     let pod_name = truncate_pod_name(&format!("ld-pg-{claim}"));
-    let spec = pg_helper_pod_spec(&pod_name, ns, pg_image, &conn.pass);
+    let spec = pg_helper_pod_spec(&pod_name, ns, pg_image, &conn.pass, keep_alive);
 
     let _guard = PodCleanupGuard {
         name: pod_name.clone(),
@@ -2580,10 +2616,11 @@ fn load_volumes(
     manifest: &BackupManifest,
     k: &dyn KubeExec,
     kubeconfig: &Path,
+    keep_alive: std::time::Duration,
 ) -> Result<()> {
     for (ns, name, tar_path) in discover_nested_artifacts(data_dir, "volumes", "data.tar") {
         let pvc = resolve_volume_pvc(&ns, &name, manifest, kubeconfig)?;
-        load_one_volume(&ns, &name, &pvc, &tar_path, k)?;
+        load_one_volume(&ns, &name, &pvc, &tar_path, k, keep_alive)?;
     }
     Ok(())
 }
@@ -2689,9 +2726,10 @@ fn load_one_volume(
     pvc: &str,
     tar_path: &Path,
     k: &dyn KubeExec,
+    keep_alive: std::time::Duration,
 ) -> Result<()> {
     let pod_name = truncate_pod_name(&format!("ld-vol-{name}"));
-    let spec = volume_pod_spec(&pod_name, ns, VOLUME_IMAGE, pvc, false); // L1: RW
+    let spec = volume_pod_spec(&pod_name, ns, VOLUME_IMAGE, pvc, false, keep_alive); // L1: RW
     let _guard = PodCleanupGuard {
         name: pod_name.clone(),
         namespace: ns.to_string(),
@@ -6459,10 +6497,22 @@ mod tests {
     /// the user gives up.
     #[test]
     fn pg_helper_pod_spec_injects_the_password_into_the_container_env() {
-        let spec = pg_helper_pod_spec("ld-pg-db", "demo", "postgres:18", "s3cret");
+        let spec = pg_helper_pod_spec(
+            "ld-pg-db",
+            "demo",
+            "postgres:18",
+            "s3cret",
+            backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
+        );
         assert_eq!(spec["metadata"]["name"], "ld-pg-db");
         assert_eq!(spec["metadata"]["namespace"], "demo");
         assert_eq!(spec["spec"]["containers"][0]["image"], "postgres:18");
+        // Alive for the run deadline it was given, not a fixed hour: the
+        // `sleep` ending kills a `pg_restore` still running in the pod.
+        assert_eq!(
+            spec["spec"]["containers"][0]["command"],
+            serde_json::json!(["sleep", "21600"])
+        );
         assert_eq!(
             spec["spec"]["containers"][0]["env"][0]["name"],
             "PGPASSWORD"
@@ -6549,6 +6599,7 @@ mod tests {
             dump.path(),
             &k,
             "postgres:18",
+            backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
             &|pod| {
                 probed.borrow_mut().push(pod.to_string());
                 Ok(())
@@ -6590,6 +6641,7 @@ mod tests {
             dump.path(),
             &k,
             "postgres:18",
+            backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
             &|_| Ok(()),
         );
         assert!(r.is_err());
@@ -6613,6 +6665,7 @@ mod tests {
             dump.path(),
             &k,
             "postgres:18",
+            backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
             &|_| Err(CliError::Other("unreachable".into())),
         );
         assert!(r.is_err());
@@ -6634,7 +6687,15 @@ mod tests {
         let k = FakeKube::default();
         let tar = tempfile::NamedTempFile::new().unwrap();
 
-        load_one_volume("demo", "uploads", "pvc-uploads", tar.path(), &k).unwrap();
+        load_one_volume(
+            "demo",
+            "uploads",
+            "pvc-uploads",
+            tar.path(),
+            &k,
+            backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
+        )
+        .unwrap();
 
         let applied = k.applied.borrow();
         let spec = &applied[0];

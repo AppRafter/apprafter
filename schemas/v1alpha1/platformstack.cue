@@ -103,7 +103,9 @@ package v1alpha1
 		// How long one scheduled backup Job may run before Kubernetes
 		// stops it and fails it with reason `DeadlineExceeded` — the
 		// CronJob's `jobTemplate.spec.activeDeadlineSeconds`. Absent means
-		// the platform default, six hours.
+		// the platform default, six hours. It is also how long each backup
+		// helper pod lives, the scheduled runner's and the CLI's alike, so
+		// it bounds a single claim's dump as well as the whole run.
 		//
 		// The CronJob never starts a run while the previous one is still
 		// going, so a run that never ends would otherwise suppress every

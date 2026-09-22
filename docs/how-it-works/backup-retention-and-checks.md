@@ -274,13 +274,27 @@ it that wait on something outside the runner have their own.
 `spec.backup.activeDeadlineSeconds` for the backup and
 `spec.backup.checkActiveDeadlineSeconds` for the check. Both default to six
 hours and must be at least ten minutes. When the deadline passes, Kubernetes
-stops the pod and fails the Job with reason `DeadlineExceeded`; the next
-scheduled run then starts as normal. `apprafter backup status` shows such a Job
-as `Failed`, and `kubectl -n apprafter-system describe job <name>` shows the
-reason. A run stopped this way has no chance to write `lastFailure` or call the
-failure webhook, so the Job's status is the record of it.
-`apprafter backup run` copies the same Job template, so a manual run has the
-same limit.
+fails the Job with reason `DeadlineExceeded` and stops its pod: it sends the
+pod SIGTERM, and SIGKILL once the pod's grace period has passed. The backup
+runner uses that grace period, 90 seconds, to record the run like any other
+failure — `lastFailure`, a `lastError` that reads `run exceeded its deadline
+of 6h …`, and the failure webhook — and to delete the helper pod it was
+working in, before it exits. Each of those steps has its own bound, and
+together they fit well inside the 90 seconds. The check is restic on its own:
+it receives the signal itself, removes its repository lock and exits.
+`apprafter backup status` shows such a Job as `Failed`, and the next
+scheduled run then starts as normal. `apprafter backup run` copies the same
+Job template, so a manual run has the same limit.
+
+The deadline is also how long each helper pod lives: the pod a single
+`pg_dump` or `tar` runs in keeps itself alive for exactly the run's deadline,
+and every command still running in it ends when it does. So the deadline
+bounds one claim's extraction as well as the whole run, and raising it gives a
+single large dump more time too. `apprafter backup create`, `apprafter export`
+and `apprafter restore` have no Job and no deadline — the person
+running them stops them — but their helper pods live the same
+`spec.backup.activeDeadlineSeconds` (six hours when unset), which is also what
+removes a helper pod the command was killed before it could delete.
 
 Pick the value against the schedule it applies to:
 
@@ -289,7 +303,8 @@ Pick the value against the schedule it applies to:
   eighteen hours clear.
 - **Longer than the slowest run you expect to succeed**, because the deadline
   stops a slow run exactly as it stops a stuck one. The first backup of a large
-  data set is the one to size it for.
+  data set is the one to size it for; the largest single claim in it is dumped
+  within the same limit.
 
 With a schedule more frequent than the deadline — hourly, under the default —
 a stuck run still costs every run until the deadline stops it, six of them.
@@ -332,7 +347,7 @@ transaction that has not ended. A custom-format dump writes nothing at all
 until that schema read is done, so the runner gives the dump ten minutes to
 write its first byte: five for the table locks, and five for a schema read
 that takes seconds even at ten thousand tables. Once the dump is writing,
-nothing but the Job deadline limits it, so copying a large table is never cut
+only the run's deadline limits it, so copying a large table is never cut
 short. Both bounds apply to `apprafter backup create` and `apprafter export`
 too. A dump that gave up leaves no restorable snapshot behind: a `monolithic`
 run fails before restic writes anything, and a `sequential` run never writes

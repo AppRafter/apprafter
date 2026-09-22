@@ -396,6 +396,10 @@ _backupTemplate: """
 	     platformstacks. */}}
 	{{- if .Values.backup.enabled }}
 	{{- $b := .Values.backup }}
+	{{- /* ONE value per Job deadline, read once: the backup Job's
+	     activeDeadlineSeconds and the runner's APPRAFTER_BACKUP_DEADLINE_SECONDS
+	     must never disagree, so both are this variable. */}}
+	{{- $deadline := $b.activeDeadlineSeconds | default 21600 | int }}
 	---
 	apiVersion: v1
 	kind: ServiceAccount
@@ -513,7 +517,7 @@ _backupTemplate: """
 	      # on. Shorter than the schedule's interval, longer than the slowest
 	      # good backup: see #BackupValues.activeDeadlineSeconds. `backup run`
 	      # copies this jobTemplate, so a manual run carries it too.
-	      activeDeadlineSeconds: {{ $b.activeDeadlineSeconds | default 21600 | int }}
+	      activeDeadlineSeconds: {{ $deadline }}
 	      template:
 	        metadata:
 	          labels:
@@ -521,10 +525,21 @@ _backupTemplate: """
 	        spec:
 	          serviceAccountName: apprafter-backup
 	          restartPolicy: Never
+	          # At the deadline Kubernetes sends the runner SIGTERM, and the
+	          # runner records the failure (lastFailure, the failure webhook)
+	          # and deletes its helper pods before it exits. This is the time it
+	          # has for that: helper-pod deletes, the status write and the
+	          # webhook are each bounded, 10 + 20 + 45 s at most, and the Job
+	          # turns Failed as soon as the runner has exited.
+	          terminationGracePeriodSeconds: 90
 	          containers:
 	          - name: runner
 	            image: {{ $b.image | quote }}
 	            env:
+	            # The Job's own deadline, so the runner can say it was stopped
+	            # by it and keep its helper pods alive exactly that long.
+	            - name: APPRAFTER_BACKUP_DEADLINE_SECONDS
+	              value: {{ $deadline | quote }}
 	            - name: RESTIC_PASSWORD
 	              valueFrom:
 	                secretKeyRef:
@@ -636,11 +651,20 @@ _backupTemplate: """
 	            # restic reads RESTIC_PASSWORD + AWS_* from the explicit secretKeyRef
 	            # entries below (Secret holds neutral S3_* keys) and the s3: repo from
 	            # APPRAFTER_BACKUP_REPO.
+	            #
+	            # `exec`: restic, not the shell, must be PID 1. At the Job
+	            # deadline Kubernetes sends PID 1 SIGTERM; restic handles it by
+	            # removing its EXCLUSIVE repository lock and exiting, while a
+	            # shell as PID 1 would ignore it, leaving restic to the SIGKILL
+	            # 30 s later and its lock to fail backups until it went stale.
+	            # The image's busybox sh happens to exec the last command of
+	            # `-c` by itself (measured), which is an optimisation of one
+	            # shell, not a contract; the explicit `exec` is.
 	            command: ["sh", "-c"]
 	            args:
 	            - >-
 	              restic -r "$APPRAFTER_BACKUP_REPO" unlock;
-	              restic -r "$APPRAFTER_BACKUP_REPO" check{{ if $b.checkReadData }} --read-data{{ else if $b.checkReadDataSubset }} --read-data-subset={{ $b.checkReadDataSubset }}{{ end }}
+	              exec restic -r "$APPRAFTER_BACKUP_REPO" check{{ if $b.checkReadData }} --read-data{{ else if $b.checkReadDataSubset }} --read-data-subset={{ $b.checkReadDataSubset }}{{ end }}
 	            env:
 	            - name: RESTIC_PASSWORD
 	              valueFrom:

@@ -437,7 +437,11 @@ package platformstack
 
 	// How long one backup Job may run before Kubernetes stops it →
 	// `jobTemplate.spec.activeDeadlineSeconds`; the Job then fails with
-	// reason `DeadlineExceeded`. Default six hours.
+	// reason `DeadlineExceeded`. Default six hours. The same value reaches
+	// the runner as APPRAFTER_BACKUP_DEADLINE_SECONDS: it records a run
+	// stopped at the deadline (lastFailure, the failure webhook) in the pod's
+	// 90 s grace period, and keeps each helper pod — and so each single
+	// claim's dump — alive exactly this long.
 	//
 	// The CronJob is `concurrencyPolicy: Forbid`, so without a deadline one
 	// run that never ends suppresses every later scheduled run, silently.

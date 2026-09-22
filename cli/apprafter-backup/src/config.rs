@@ -6,6 +6,7 @@
 //! [`RunnerConfig::from_env`] is the thin impure wrapper used by `main`.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use cli_core::{CliError, Result};
 
@@ -38,6 +39,12 @@ pub struct RunnerConfig {
     pub retention: backup_core::prune::RetentionPolicy,
     /// Optional URL to POST on backup failure.
     pub failure_webhook: Option<String>,
+    /// The run's deadline: the Job's `activeDeadlineSeconds`, which the chart
+    /// renders into `APPRAFTER_BACKUP_DEADLINE_SECONDS` from the same value.
+    /// Kubernetes stops the run there with SIGTERM; the runner uses it to say
+    /// so, and keeps its helper pods alive for exactly this long. `None` when
+    /// the variable is absent — a Job template older than it.
+    pub deadline: Option<Duration>,
 }
 
 impl RunnerConfig {
@@ -85,6 +92,11 @@ impl RunnerConfig {
             .filter(|s| !s.is_empty())
             .cloned();
 
+        let deadline = match e.get("APPRAFTER_BACKUP_DEADLINE_SECONDS") {
+            None => None,
+            Some(v) => Some(parse_deadline(v)?),
+        };
+
         Ok(RunnerConfig {
             repo,
             cluster_id,
@@ -94,6 +106,7 @@ impl RunnerConfig {
             enforce_in_cluster,
             retention,
             failure_webhook,
+            deadline,
         })
     }
 
@@ -112,6 +125,20 @@ fn require(e: &BTreeMap<String, String>, key: &str) -> Result<String> {
     e.get(key)
         .cloned()
         .ok_or_else(|| CliError::Other(format!("missing required env: {key}")))
+}
+
+/// `APPRAFTER_BACKUP_DEADLINE_SECONDS`: whole seconds, above zero. The chart
+/// renders the Job's `activeDeadlineSeconds` here, which its schema already
+/// holds to ten minutes or more; anything unreadable is a broken render, and a
+/// precondition error says so rather than running with no deadline at all.
+fn parse_deadline(value: &str) -> Result<Duration> {
+    match value.parse::<u64>() {
+        Ok(secs) if secs > 0 => Ok(Duration::from_secs(secs)),
+        _ => Err(CliError::Other(format!(
+            "env APPRAFTER_BACKUP_DEADLINE_SECONDS={value:?} is not a whole number of seconds \
+             above zero"
+        ))),
+    }
 }
 
 fn parse_u32(value: &str, key: &str) -> Result<u32> {
@@ -146,6 +173,7 @@ mod tests {
             ("RESTIC_PASSWORD", "p"),
             ("APPRAFTER_BACKUP_HOST", "prod"),
             ("APPRAFTER_BACKUP_FAILURE_WEBHOOK", "https://hook"),
+            ("APPRAFTER_BACKUP_DEADLINE_SECONDS", "21600"),
         ]);
         let c = RunnerConfig::from_env_map(&e).unwrap();
         assert_eq!(c.repo, "s3:https://ep/b");
@@ -156,6 +184,7 @@ mod tests {
         assert!(c.enforce_in_cluster);
         assert_eq!(c.retention.keep_daily, 5);
         assert_eq!(c.failure_webhook.as_deref(), Some("https://hook"));
+        assert_eq!(c.deadline, Some(Duration::from_secs(21600)));
     }
 
     #[test]
@@ -175,6 +204,27 @@ mod tests {
         assert_eq!(c.retention.keep_weekly, 4);
         assert_eq!(c.retention.keep_monthly, 6);
         assert!(c.failure_webhook.is_none());
+        assert!(c.deadline.is_none());
+    }
+
+    #[test]
+    fn an_unreadable_deadline_is_a_precondition_error_not_no_deadline() {
+        for bad in ["", "0", "-5", "6h", "21600.5", "abc"] {
+            let e = map(&[
+                ("APPRAFTER_BACKUP_REPO", "s3:x"),
+                ("APPRAFTER_CLUSTER_ID", "c"),
+                ("RESTIC_PASSWORD", "p"),
+                ("APPRAFTER_BACKUP_DEADLINE_SECONDS", bad),
+            ]);
+            let err = RunnerConfig::from_env_map(&e)
+                .err()
+                .unwrap_or_else(|| panic!("{bad:?} must be refused"));
+            assert!(
+                err.to_string()
+                    .contains("APPRAFTER_BACKUP_DEADLINE_SECONDS"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
