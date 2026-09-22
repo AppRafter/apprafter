@@ -269,9 +269,12 @@ reconcile the runner's self-report away.
 ## How long a run may take
 
 Both CronJobs are `concurrencyPolicy: Forbid`: while one run is still active,
-the next scheduled run is skipped, not queued. A run that never ended would
-therefore stop every later one without anything failing — the Job would sit at
-`Running` indefinitely. So every run has an outer limit, and the steps inside
+no scheduled run starts. The slots that fall meanwhile are neither queued nor
+all lost: neither CronJob sets `startingDeadlineSeconds`, so when the active
+run ends, the CronJob controller starts the most recent slot it missed at once,
+and every earlier one is lost. A run that never ended would therefore stop
+every later one without anything failing — the Job would sit at `Running`
+indefinitely. So every run has an outer limit, and the steps inside
 it that wait on something outside the runner have their own.
 
 **The Job deadline.** Each Job template carries `activeDeadlineSeconds`, from
@@ -287,8 +290,9 @@ working in, before it exits. Each of those steps has its own bound, and
 together they fit well inside the 90 seconds. The check is restic on its own:
 it receives the signal itself, removes its repository lock and exits.
 `apprafter backup status` shows such a Job as `Failed: DeadlineExceeded`, and
-the next scheduled run then starts as normal. `apprafter backup run` copies
-the same Job template, so a manual run has the same limit.
+scheduling resumes: the next slot runs on time or, if one fell while the
+stopped run was active, the latest such slot starts at once. `apprafter backup
+run` copies the same Job template, so a manual run has the same limit.
 
 The deadline is also how long each helper pod lives: the pod a single
 `pg_dump` or `tar` runs in keeps itself alive for exactly the run's deadline,
@@ -311,10 +315,12 @@ Pick the value against the schedule it applies to:
   within the same limit.
 
 With a schedule more frequent than the deadline — hourly, under the default —
-a stuck run still costs every run until the deadline stops it, six of them.
-Set the deadline below the interval for such a schedule. A run that takes
-longer than the interval always cost the run it overlaps; that is `Forbid`,
-not the deadline.
+a stuck run still costs the runs that fall while it is active: stuck from 00:00
+and stopped at 06:00, it loses the 01:00 to 05:00 runs, and the 06:00 run
+starts only once the stuck Job has failed. Set the deadline below the interval
+for such a schedule. A run that simply takes longer than the interval has
+always delayed the next one — the slot it overlaps starts as soon as it ends;
+that is `Forbid`, not the deadline.
 
 The check has one more reason to stay bounded: while it runs it holds the
 repository's exclusive lock, and a backup that starts meanwhile fails on it.

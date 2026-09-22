@@ -451,9 +451,12 @@ package platformstack
 	// backup that is expected to succeed, which it would otherwise kill:
 	// six hours leaves the nightly default's next slot eighteen hours clear.
 	// With a schedule more frequent than the deadline, a stuck run still
-	// costs every slot until the deadline stops it — at most six hourly
-	// runs under the default — and a run slower than the interval costs
-	// the slot it overlaps, as it always has under `Forbid`.
+	// costs the slots that fall while it is active: `Forbid` starts none of
+	// them, and when the run ends (no `startingDeadlineSeconds` is set) the
+	// CronJob controller starts the most recent one at once and drops the
+	// earlier ones — five hourly runs lost and the sixth late under the
+	// default. A run merely slower than the interval delays the slot it
+	// overlaps, as it always has under `Forbid`.
 	//
 	// Ten minutes at least: below that, a normal run's helper-pod start
 	// and repository open are at risk, and a value that small is far more
