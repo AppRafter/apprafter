@@ -79,36 +79,42 @@ fn main() {
 }
 
 /// Run `cue export -e <expr> --out yaml` against `chart_root`.
-/// Tries the bare `cue` binary first; on `not found` falls
-/// back to `nix run nixpkgs#cue --`. Panics with a clear
-/// error if both routes fail.
+///
+/// Goes through `scripts/cue`, the repo's single resolver for its PINNED cue,
+/// rather than resolving here. This used to try bare `cue` and fall back to
+/// `nix run nixpkgs#cue --`, and BOTH branches give whatever the machine or
+/// nixpkgs happens to carry rather than the version flake.nix pins — which is
+/// how a local build evaluated the chart under a different cue than CI.
+/// Falls back to a bare `cue` only when the resolver is unreachable (the
+/// crate built outside a checkout). Panics with a clear error if both fail.
 fn cue_export(chart_root: &PathBuf, expr: &str) -> String {
-    let try_bare = Command::new("cue")
-        .args(["export", "-e", expr, "--out", "yaml", "./..."])
-        .current_dir(chart_root)
-        .stdin(Stdio::null())
-        .output();
+    // CARGO_MANIFEST_DIR is cli/cli-providers; the resolver is at the repo root.
+    let resolver = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/cue")
+        .canonicalize()
+        .ok();
 
-    let out = match try_bare {
-        Ok(o) => o,
-        Err(_) => Command::new("nix")
-            .args([
-                "run",
-                "nixpkgs#cue",
-                "--",
-                "export",
-                "-e",
-                expr,
-                "--out",
-                "yaml",
-                "./...",
-            ])
+    let args = ["export", "-e", expr, "--out", "yaml", "./..."];
+    let via_resolver = resolver.as_ref().and_then(|r| {
+        Command::new(r)
+            .args(args)
+            .current_dir(chart_root)
+            .stdin(Stdio::null())
+            .output()
+            .ok()
+    });
+
+    let out = match via_resolver {
+        Some(o) => o,
+        None => Command::new("cue")
+            .args(args)
             .current_dir(chart_root)
             .stdin(Stdio::null())
             .output()
             .expect(
-                "cli-providers/build.rs: neither `cue` nor `nix run nixpkgs#cue` is on PATH. \
-                 Install cue (v0.10+) or run the build under `nix develop`.",
+                "cli-providers/build.rs: could not run scripts/cue, and no `cue` is on PATH. \
+                 Install the version flake.nix pins (grep cueVersion) or build under \
+                 `nix develop`.",
             ),
     };
 

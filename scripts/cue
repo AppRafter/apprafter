@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+#
+# THE cue binary for this repository. Call this instead of bare `cue`.
+#
+# ## Why a wrapper
+#
+# cue is one decision written in many places — the setup-cue inputs in
+# .github/workflows, argocd-cue-cmp/Dockerfile's ARG, .devcontainer, and
+# flake.nix's `cueVersion`. Seven SHELL call sites used to resolve it
+# independently with the same two-line idiom:
+#
+#     if command -v cue; then cue; else nix run nixpkgs#cue --; fi
+#
+# Both branches are wrong for this repo. `command -v cue` takes whatever is on
+# PATH, and `nix run nixpkgs#cue` takes whatever nixpkgs carries TODAY — which
+# is not what this repo pins. On 2026-09-22 that meant local runs evaluated the
+# corpus under cue 0.16.0 while CI installed 0.10.0, and `scripts/crd-check.sh`
+# claimed in its header that there was "ONE cue version across local and CI".
+#
+# The failure is not subtle once it bites, and that is the point: the root
+# `cue.mod/module.cue` declares a language version, and a cue OLDER than it is
+# a HARD error — "language version ... is too new for current language
+# version" — not a warning. Silently picking a different binary does not
+# degrade the answer, it stops the run. Before the module declared a version
+# above 0.10.0, the same mismatch was silent.
+#
+# ## Resolution order
+#
+#   1. $CUE / $CUE_BIN   explicit override, for bisecting a candidate version.
+#                    BOTH names are honoured because both already existed:
+#                    scripts/lint-cue.sh documented $CUE (without implementing
+#                    it) while the Rust side — cli-core/src/cue.rs,
+#                    docsgen/src/cuedoc.rs, app_validate.rs and two test files
+#                    — reads $CUE_BIN. Accepting one and not the other would
+#                    mean an override that works for half the tree.
+#   2. nix develop   the flake-pinned build (flake.nix `cueVersion`). This is
+#                    the repo's decision and matches CI and the sidecar.
+#   3. cue on PATH   for a checkout without nix. May not be the pinned
+#                    version; the language-version check is what catches that.
+#
+# `nix run nixpkgs#cue` is deliberately NOT in this list. It reads like a
+# reasonable fallback and is the one option guaranteed to be some other
+# version.
+set -euo pipefail
+
+if [ -n "${CUE:-}" ]; then
+    exec "$CUE" "$@"
+fi
+if [ -n "${CUE_BIN:-}" ]; then
+    exec "$CUE_BIN" "$@"
+fi
+
+_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+_want="$(sed -n 's/^[[:space:]]*cueVersion = "\(.*\)";$/\1/p' "$_root/flake.nix" | head -1)"
+
+# A cue already on PATH is used ONLY if it is the pinned version. The check is
+# the point: it is what turns "some cue" into "the cue", and it keeps the fast
+# path fast. Going through nix unconditionally is correct but costs a flake
+# evaluation per call, which serialises on the nix lock the moment anything
+# runs cue in parallel -- `cargo test` does, and it hangs.
+if [ -n "$_want" ] && command -v cue >/dev/null 2>&1; then
+    if [ "$(cue version 2>/dev/null | sed -n 's/^cue version //p' | head -1)" = "$_want" ]; then
+        exec cue "$@"
+    fi
+fi
+
+if command -v nix >/dev/null 2>&1 && [ -f "$_root/flake.nix" ]; then
+    # `nix run .#cue`, NOT `nix develop --command cue`: the dev shell's
+    # shellHook prints a banner onto STDOUT, which would land in the middle of
+    # any caller that captures cue's output (`cue export`, `cue eval`).
+    exec nix run "$_root#cue" -- "$@"
+fi
+
+# Last resort: a cue of the WRONG version, or none. Running it is still better
+# than refusing, because the language-version check gives a precise error if it
+# is too old -- but say so, or a stray binary looks like a passing run.
+if command -v cue >/dev/null 2>&1; then
+    echo "warning: using $(command -v cue) ($(cue version 2>/dev/null | head -1)), not the pinned ${_want}" >&2
+    exec cue "$@"
+fi
+
+echo "ERROR: no cue available." >&2
+echo "Install the version flake.nix pins (grep cueVersion), run inside" >&2
+echo "\`nix develop\`, or point \$CUE at a binary." >&2
+exit 2

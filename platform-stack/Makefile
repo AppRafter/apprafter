@@ -8,10 +8,10 @@
 # workflow (`.github/workflows/platform-stack-publish.yml`,
 # lands in plan.md sub-phase 1.68) has a single command to call.
 
-# Resolve the cue binary: prefer system `cue`, fall back to
-# `nix run nixpkgs#cue --` so anyone in the project's nix dev
-# shell or with nix available picks it up automatically.
-CUE := $(shell command -v cue 2>/dev/null || echo "nix run nixpkgs#cue --")
+# scripts/cue is the single resolver for this repo's PINNED cue. The old
+# `command -v cue || nix run nixpkgs#cue --` picked whatever the machine or
+# nixpkgs happened to carry, which is not what flake.nix pins.
+CUE := $(CURDIR)/../scripts/cue
 
 # Resolve helm similarly. Optional — `make render-only` skips
 # the lint step.

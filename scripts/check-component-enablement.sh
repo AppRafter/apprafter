@@ -44,14 +44,11 @@ set -euo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
-if command -v cue >/dev/null 2>&1; then
-    CUE_CMD=(cue)
-elif command -v nix >/dev/null 2>&1; then
-    CUE_CMD=(nix run nixpkgs#cue --)
-else
-    echo "::error::neither \`cue\` nor \`nix\` is on PATH" >&2
-    exit 2
-fi
+# Resolved through scripts/cue, the single resolver for this repo's pinned
+# cue. It used to be `command -v cue || nix run nixpkgs#cue`, where BOTH
+# branches give whatever the machine or nixpkgs happens to have rather than
+# the version flake.nix pins. See scripts/cue for the full reasoning.
+CUE_CMD=("$(git rev-parse --show-toplevel)/scripts/cue")
 command -v helm >/dev/null 2>&1 || {
     echo "::error::helm is not on PATH — run under \`nix develop\`" >&2
     exit 2

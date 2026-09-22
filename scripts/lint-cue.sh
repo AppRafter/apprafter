@@ -4,23 +4,21 @@
 # Lint CUE schemas and examples. Used both locally and in CI
 # (CI wiring lands in phase 0.5).
 #
-# Override the CUE binary by exporting CUE=<path>. If neither a
-# `cue` binary nor `nix` is available, the script exits with a
-# non-zero status and a hint.
+# The cue binary comes from `scripts/cue`, the single resolver for this repo's
+# PINNED version. Export CUE=<path> to override it (e.g. to bisect a candidate
+# release); that variable was documented here for a long time and only became
+# real in 2026-09.
+#
+# Why it is not resolved inline: this script used to do
+# `command -v cue || nix run nixpkgs#cue --`, and BOTH branches give whatever
+# the machine or nixpkgs carries rather than the version flake.nix pins. Six
+# other call sites had copied the same two lines.
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
-if command -v cue >/dev/null 2>&1; then
-    CUE_CMD=(cue)
-elif command -v nix >/dev/null 2>&1; then
-    CUE_CMD=(nix run nixpkgs#cue --)
-else
-    echo "ERROR: cue is not installed and nix is unavailable." >&2
-    echo "Install CUE >= 0.10 from https://cuelang.org/docs/install/" >&2
-    exit 2
-fi
+CUE_CMD=("$REPO_ROOT/scripts/cue")
 
 echo "==> cue fmt --check"
 "${CUE_CMD[@]}" fmt --check ./schemas/... ./examples/... ./platform-stack/cue/...

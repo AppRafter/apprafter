@@ -171,6 +171,11 @@
           '';
         };
 
+        # Exposed so `scripts/cue` can reach the pinned binary WITHOUT
+        # `nix develop`, whose shellHook prints a banner onto stdout and would
+        # corrupt every caller that captures cue's output.
+        packages.cue = cuePinned;
+
         formatter = pkgs.nixfmt;
       }
     );

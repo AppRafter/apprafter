@@ -40,8 +40,14 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 chart_cue="$repo_root/platform-stack/cue"
 
-# Resolve `cue` and `lua`, preferring a bare binary and falling back to
-# `nix run`. Each resolver echoes a command line the caller evals.
+# Resolve `lua`, preferring a bare binary and falling back to `nix run`.
+# Echoes a command line the caller evals.
+#
+# NOT used for cue: `scripts/cue` is the single resolver for this repo's
+# PINNED cue, and both branches below would give whatever the machine or
+# nixpkgs happens to carry instead. That is a real difference, not a
+# preference -- the root cue.mod declares a language version, and an older cue
+# rejects it outright rather than producing a slightly different answer.
 resolve_tool() {
     local bin="$1" attr="$2"
     if command -v "$bin" >/dev/null 2>&1; then
@@ -56,7 +62,7 @@ resolve_tool() {
     exit 2
 }
 
-CUE_CMD="$(resolve_tool cue cue)"
+CUE_CMD="$(git rev-parse --show-toplevel)/scripts/cue"
 LUA_CMD="$(resolve_tool lua lua)"
 
 workdir="$(mktemp -d)"
