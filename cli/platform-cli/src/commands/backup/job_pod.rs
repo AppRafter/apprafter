@@ -71,6 +71,13 @@ pub(crate) enum JobPod {
     NotStarted { reason: Option<String> },
     /// The pod's containers have started.
     Running,
+    /// No live pod because an attempt failed and the Job controller has not
+    /// started the next yet: it waits 10 s, doubling up to 6 min, between
+    /// attempts. `failed` attempts have failed of `attempts` at most
+    /// (`backoffLimit` + 1). The Job's counts alone read `Failed` here
+    /// (`active: 0`, `failed: 1`), but the Job has not failed, and a Job the
+    /// CronJob started still holds the schedule.
+    Retrying { failed: u64, attempts: u64 },
 }
 
 /// The state of `job`'s pod, read from `pods` (any listing that contains
@@ -83,6 +90,9 @@ pub(crate) enum JobPod {
 /// being deleted do not describe what the Job is doing now. A Job that
 /// retries has one of each, and a failed attempt must not hide the live one.
 /// Of the rest, the newest is read.
+///
+/// With no live pod, a Job that has failed attempts and attempts left is
+/// [`JobPod::Retrying`], read from the Job alone.
 pub(crate) fn job_pod(job: &Value, pods: &[Value]) -> JobPod {
     let live = pods
         .iter()
@@ -99,7 +109,66 @@ pub(crate) fn job_pod(job: &Value, pods: &[Value]) -> JobPod {
                 .and_then(Value::as_str)
                 .unwrap_or("")
         });
-    live.map_or(JobPod::None, classify)
+    match live {
+        Some(pod) => classify(pod),
+        None => retrying(job).unwrap_or(JobPod::None),
+    }
+}
+
+/// Kubernetes' default `backoffLimit`, for a Job read without one (the
+/// apiserver fills it in on every Job it stores).
+const DEFAULT_BACKOFF_LIMIT: u64 = 6;
+
+/// [`JobPod::Retrying`] when the Job, with no live pod, is between a failed
+/// attempt and the next one: some attempts failed, none is active or
+/// succeeded, attempts are left, it is not suspended, and the Job controller
+/// has not begun to fail or complete it. `FailureTarget` is the condition it
+/// sets first when the Job fails (a deadline, the last attempt), before
+/// `Failed` once the pods are gone; `SuccessCriteriaMet` is the same for
+/// success.
+fn retrying(job: &Value) -> Option<JobPod> {
+    let count = |key: &str| {
+        job.pointer(&format!("/status/{key}"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let failed = count("failed");
+    if failed == 0 || count("active") > 0 || count("succeeded") > 0 {
+        return None;
+    }
+    if job.pointer("/spec/suspend").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let ending = job
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .is_some_and(|cs| {
+            cs.iter().any(|c| {
+                c.get("status").and_then(Value::as_str) == Some("True")
+                    && matches!(
+                        c.get("type").and_then(Value::as_str),
+                        Some("FailureTarget" | "SuccessCriteriaMet" | "Failed" | "Complete")
+                    )
+            })
+        });
+    if ending {
+        return None;
+    }
+    let attempts = job
+        .pointer("/spec/backoffLimit")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_BACKOFF_LIMIT)
+        + 1;
+    (failed < attempts).then_some(JobPod::Retrying { failed, attempts })
+}
+
+/// `1 failed attempt`, `2 failed attempts`.
+fn failed_attempts(n: u64) -> String {
+    if n == 1 {
+        "1 failed attempt".to_string()
+    } else {
+        format!("{n} failed attempts")
+    }
 }
 
 fn owned_by(pod: &Value, job: &Value) -> bool {
@@ -259,6 +328,10 @@ pub(crate) fn status_outcome(state: &JobPod) -> Option<String> {
         JobPod::NotStarted { reason: Some(r) } => Some(format!("Pending: {r}")),
         JobPod::NotStarted { reason: None } => Some("Pending".to_string()),
         JobPod::Running => Some("Running".to_string()),
+        JobPod::Retrying { failed, attempts } => Some(format!(
+            "Retrying after {} ({attempts} attempts at most)",
+            failed_attempts(*failed)
+        )),
     }
 }
 
@@ -324,6 +397,11 @@ pub(crate) fn progress_note(
         JobPod::NotStarted { reason: None } => {
             format!("  … not started yet ({})", elapsed(waited))
         }
+        JobPod::Retrying { failed, attempts } => format!(
+            "  … retrying after {}, {attempts} attempts at most ({})",
+            failed_attempts(*failed),
+            elapsed(waited)
+        ),
         JobPod::Running | JobPod::None => format!("  … still running ({})", elapsed(waited)),
     }
 }
@@ -351,6 +429,10 @@ pub(crate) fn timeout_note(
         JobPod::NotStarted { reason: None } => {
             format!("its pod had not started after {timeout_minutes}m")
         }
+        JobPod::Retrying { failed, .. } => format!(
+            "it was retrying after {} when {timeout_minutes}m ran out",
+            failed_attempts(*failed)
+        ),
     };
     format!(
         "  {what}. No longer waiting. The Job is NOT cancelled:\n    \
@@ -639,6 +721,118 @@ mod tests {
         // With no live pod left, there is nothing to say.
         assert_eq!(job_pod(&job(), &[failed, deleting]), JobPod::None);
         assert_eq!(job_pod(&job(), &[]), JobPod::None);
+    }
+
+    /// A Job between an attempt that failed and the retry the Job controller
+    /// creates after a back-off (10 s, doubling up to 6 min): no live pod,
+    /// `active: 0`, `failed: 1`, and no condition.
+    fn job_between_attempts() -> Value {
+        json!({
+            "metadata": {"name": "apprafter-backup-29312345", "uid": JOB_UID},
+            "spec": {"backoffLimit": 6},
+            "status": {"failed": 1, "startTime": "2026-09-23T14:39:47Z"}
+        })
+    }
+
+    fn failed_attempt() -> Value {
+        let mut p = running_pod();
+        p["status"]["phase"] = json!("Failed");
+        p
+    }
+
+    #[test]
+    fn a_job_between_a_failed_attempt_and_its_retry_is_retrying() {
+        // Its counts read `Failed` (no pod active, one failed), but the Job
+        // has not failed: it has attempts left and will start the next one.
+        let j = job_between_attempts();
+        let retrying = JobPod::Retrying {
+            failed: 1,
+            attempts: 7,
+        };
+        assert_eq!(job_pod(&j, &[failed_attempt()]), retrying);
+        assert_eq!(job_pod(&j, &[]), retrying);
+        // The apiserver defaults `backoffLimit` to 6; a Job read without it
+        // gets the same default rather than none.
+        let mut no_limit = j.clone();
+        no_limit["spec"]
+            .as_object_mut()
+            .unwrap()
+            .remove("backoffLimit");
+        assert_eq!(job_pod(&no_limit, &[]), retrying);
+        let mut two = j.clone();
+        two["spec"]["backoffLimit"] = json!(2);
+        two["status"]["failed"] = json!(2);
+        assert_eq!(
+            job_pod(&two, &[]),
+            JobPod::Retrying {
+                failed: 2,
+                attempts: 3
+            }
+        );
+        // Once the retry's pod exists, it is what is read.
+        assert!(matches!(
+            job_pod(&j, &[failed_attempt(), unschedulable_pod()]),
+            JobPod::Unschedulable { .. }
+        ));
+    }
+
+    #[test]
+    fn a_job_that_is_failing_or_has_no_attempt_left_is_not_retrying() {
+        // The Job controller marks a failing Job `FailureTarget` first and
+        // `Failed` once its pods are gone: in between it is not retrying.
+        let mut failing = job_between_attempts();
+        failing["status"]["conditions"] = json!([
+            {"type": "FailureTarget", "status": "True", "reason": "DeadlineExceeded"}
+        ]);
+        assert_eq!(job_pod(&failing, &[]), JobPod::None);
+        // Every attempt used: the Failed condition is on its way.
+        let mut spent = job_between_attempts();
+        spent["spec"]["backoffLimit"] = json!(0);
+        assert_eq!(job_pod(&spent, &[]), JobPod::None);
+        // Suspended: nothing will be started.
+        let mut suspended = job_between_attempts();
+        suspended["spec"]["suspend"] = json!(true);
+        assert_eq!(job_pod(&suspended, &[]), JobPod::None);
+        // A pod is active but this listing did not catch it: say nothing.
+        let mut active = job_between_attempts();
+        active["status"]["active"] = json!(1);
+        assert_eq!(job_pod(&active, &[]), JobPod::None);
+        // Nothing failed: a Job whose first pod is not there yet.
+        let mut fresh = job_between_attempts();
+        fresh["status"] = json!({"startTime": "2026-09-23T14:39:47Z"});
+        assert_eq!(job_pod(&fresh, &[]), JobPod::None);
+    }
+
+    #[test]
+    fn a_retrying_job_is_said_to_retry_by_every_command() {
+        let r = JobPod::Retrying {
+            failed: 1,
+            attempts: 7,
+        };
+        assert_eq!(
+            status_outcome(&r).as_deref(),
+            Some("Retrying after 1 failed attempt (7 attempts at most)")
+        );
+        assert_eq!(
+            status_outcome(&JobPod::Retrying {
+                failed: 2,
+                attempts: 7
+            })
+            .as_deref(),
+            Some("Retrying after 2 failed attempts (7 attempts at most)")
+        );
+        let n = progress_note(&r, Duration::from_secs(40), None);
+        assert_eq!(
+            n,
+            "  … retrying after 1 failed attempt, 7 attempts at most (40s)"
+        );
+        let t = timeout_note(&r, 60, "apprafter-system", "j");
+        assert!(
+            t.contains("it was retrying after 1 failed attempt when 60m ran out"),
+            "{t}"
+        );
+        assert!(!t.contains("still running"), "{t}");
+        assert_eq!(status_hint(&job_between_attempts(), &r), None);
     }
 
     #[test]

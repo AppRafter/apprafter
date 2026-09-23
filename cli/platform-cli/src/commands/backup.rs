@@ -5930,8 +5930,12 @@ fn most_recent_job<'a>(jobs: &[&'a serde_json::Value]) -> Option<&'a serde_json:
 /// `status.active` counts a pod the scheduler could not place exactly like
 /// one that is running a backup, so a runner that never started read
 /// `Running`. With the pod in `pods` the line says `Pending, cannot be
-/// scheduled: <the scheduler's reason>` instead ([`job_pod`]). Without it, or
-/// for a shape that is not recognised, the counts are what is left.
+/// scheduled: <the scheduler's reason>` instead ([`job_pod`]). Between a
+/// failed attempt and its retry there is no live pod, and the counts
+/// (`active: 0`, `failed: 1`) read `Failed` for a Job that has attempts left:
+/// the line says `Retrying after 1 failed attempt (7 attempts at most)`
+/// instead. Without the pods, or for a shape that is not recognised, the
+/// counts are what is left.
 fn job_line_outcome(j: &serde_json::Value, pods: &[serde_json::Value]) -> String {
     match job_run_outcome(j) {
         JobOutcome::Succeeded => "Succeeded".to_string(),
@@ -12100,9 +12104,13 @@ mod tests {
             "metadata": {"name": "apprafter-backup-28900000"},
             "status": {"succeeded": 1}
         });
+        // A finished Job carries its condition. Counts alone (`failed: 1`,
+        // nothing active) are a Job between an attempt and its retry.
         let check_job = json!({
             "metadata": {"name": "apprafter-backup-check-28900000"},
-            "status": {"failed": 1}
+            "status": {"failed": 7, "conditions": [
+                {"type": "Failed", "status": "True", "reason": "BackoffLimitExceeded"}
+            ]}
         });
         let spec = json!({"enabled": true, "bucket": "s3:x"});
         let s = format_backup_status(
@@ -12218,6 +12226,37 @@ mod tests {
         );
         assert!(s.contains("apprafter-backup-manual-x — Running"), "{s}");
         assert!(!s.contains("`apprafter top`"), "{s}");
+    }
+
+    #[test]
+    fn backup_status_says_a_job_between_attempts_is_retrying_not_failed() {
+        // After an attempt fails the Job controller waits (10 s, doubling up
+        // to 6 min) before it starts the next. In that gap the Job has no
+        // live pod, `active: 0` and `failed: 1`, and the counts alone read
+        // `Failed`. It has not failed, and it still holds the schedule.
+        let spec = json!({"enabled": true, "bucket": "s3:x"});
+        let mut job = unfinished_job("apprafter-backup-29312345", "job-1", Some("CronJob"));
+        job["spec"]["backoffLimit"] = json!(6);
+        job["status"] = json!({"failed": 1, "startTime": "2026-09-23T14:39:47Z"});
+        let mut failed = pending_pod("job-1", "pod-1");
+        failed["spec"]["nodeName"] = json!("node-1");
+        failed["status"] = json!({"phase": "Failed", "reason": "Evicted"});
+        let s = format_backup_status(
+            Some(&spec),
+            std::slice::from_ref(&job),
+            &[failed],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
+        assert!(
+            s.contains(
+                "apprafter-backup-29312345 — Retrying after 1 failed attempt (7 attempts at most)"
+            ),
+            "{s}"
+        );
+        assert!(!s.contains("— Failed"), "{s}");
     }
 
     #[test]
@@ -12386,6 +12425,32 @@ mod tests {
         };
         let note = job_pod::timeout_note(&pod, 1, PLATFORMSTACK_NAMESPACE, "j");
         assert!(note.contains("could not be scheduled in 1m"), "{note}");
+    }
+
+    #[test]
+    fn the_wait_says_a_job_between_attempts_is_retrying_not_still_running() {
+        let mut job = unfinished_job("j", "job-1", None);
+        job["status"] = json!({"failed": 1, "startTime": "2026-09-23T14:39:47Z"});
+        let t0 = std::time::Instant::now();
+        let mut clock = UnschedulableClock::default();
+        let step = wait_step(
+            Some(&job),
+            &[],
+            &mut clock,
+            t0,
+            Duration::from_secs(40),
+            Duration::from_secs(3600),
+        );
+        assert_eq!(
+            step,
+            WaitStep::Wait(
+                JobPod::Retrying {
+                    failed: 1,
+                    attempts: 7
+                },
+                None
+            )
+        );
     }
 
     #[test]

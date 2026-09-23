@@ -245,7 +245,11 @@ not wedge the next night's backup.
 
 `apprafter backup status` lists the Jobs in `apprafter-system` whose names begin
 with `apprafter-backup`, splits them into backup Jobs and check Jobs, and prints
-the most recent of each as `Succeeded`, `Running`, `Failed` or `Unknown`. A
+the most recent of each as `Succeeded`, `Failed`, or, for a Job that has not
+finished, what it is doing: `Running`, `Pending` with the reason its pod has
+not started, or `Retrying after 1 failed attempt (7 attempts at most)` while
+the Job controller waits before its next attempt (10 seconds, doubling up to
+six minutes). `Unknown` is left for a Job with nothing to read. A
 failed Job carries the reason Kubernetes gave it — `Failed: DeadlineExceeded:
 Job was active longer than specified deadline` for one stopped at its deadline,
 `Failed: BackoffLimitExceeded: …` for one whose every attempt failed. A red
