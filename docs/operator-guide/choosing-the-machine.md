@@ -67,16 +67,24 @@ preparation](node-prep.md) has reserved the control plane's share:
 - the nightly off-site backup, while it runs;
 - about four small applications at the platform's default request.
 
-That is its limit. A further backend instance (an ephemeral `needs.redis`
-class, or `needs.jetstream`), more applications, or a second environment of
-one does not fit beside the backup: the applications keep running, but the
-nightly backup cannot start. `apprafter backup status` then shows its Job as
-`Pending, cannot be scheduled`, and `apprafter top` shows how much memory the
-node has left to give in its `SCHEDULABLE` column. [The backup runner's pod
-cannot be scheduled](backup-restore.md#runner-unschedulable) is the recipe for
-that state, and [Node reservations and
+That is its limit. More applications, an application whose request its
+recommendation has raised, or a second environment of one leaves no room for
+the backup: the applications keep running, but the nightly backup cannot
+start. `apprafter backup status` then shows its Job as `Pending, cannot be
+scheduled`, and `apprafter top` shows how much memory the node has left to
+give in its `SCHEDULABLE` column. [The backup runner's pod cannot be
+scheduled](backup-restore.md#runner-unschedulable) is the recipe for that
+state.
+
+A further backend instance does not fit on the node at all, whether or not a
+backup is running. An ephemeral `needs.redis` class runs a second Dragonfly
+instance and `needs.jetstream` a NATS server, and each asks for more memory
+than the node has left once the shared PostgreSQL and the first Dragonfly
+instance are placed. The backend's pod stays `Pending`, and the application
+that declared it waits at `AwaitingResourceClaim` without starting. [Node
+reservations and
 swap](../how-it-works/node-reservations-and-swap.md#what-a-4-gb-node-holds)
-shows the arithmetic.
+shows the arithmetic for both.
 
 If you expect to run more than that, choose a machine with more RAM from the
 start. Moving a running cluster to a bigger machine is a rebuild from a
