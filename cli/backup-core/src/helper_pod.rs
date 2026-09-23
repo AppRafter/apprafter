@@ -313,9 +313,10 @@ pub fn shell_single_quote(s: &str) -> String {
 ///   command in it ends with that `sleep`. Such a pod is a leftover of a
 ///   command stopped before its cleanup ran — `apprafter backup create` or
 ///   `export` interrupted with Ctrl-C, a runner pod lost — or the helper of a
-///   run still using it. Used as it was, a leftover created five hours
-///   earlier gave the next run's dump one hour, killed it with exit code 137
-///   well inside its Job deadline, and was then explained as the full
+///   run still using it, which then fails, and so does this one (see
+///   [`RUNNING_HELPER_REUSE_MARGIN`]). Used as it was, a leftover created five
+///   hours earlier gave the next run's dump one hour, killed it with exit code
+///   137 well inside its Job deadline, and was then explained as the full
 ///   keep-alive running out, with the advice to raise a deadline that played
 ///   no part in it.
 ///
@@ -372,17 +373,24 @@ pub fn stale_helper_reason(
 
 /// How much less than its whole keep-alive a running helper pod may have left
 /// and still be used as it is by a run that applies the same spec over it
-/// ([`stale_helper_reason`]): five minutes.
+/// ([`stale_helper_reason`]): five minutes. A reused pod therefore has at
+/// least its keep-alive less five minutes left, which is what
+/// [`explain_keep_alive_end`] relies on when it blames the keep-alive.
 ///
-/// The margin is not for leftovers, which are hours old by the time anything
-/// needs their name. It is for two things that make a pod look older than it
-/// is. One is the clock: the pod's age is this machine's time less the
-/// container's start as its node stamped it, and the two clocks can differ.
-/// The other is a helper another run created moments ago: two runs that need
-/// the same helper at the same time share it rather than one deleting it
-/// under the other. A reused pod therefore has at least its keep-alive less
-/// five minutes left, which is what [`explain_keep_alive_end`] relies on when
-/// it blames the keep-alive.
+/// The margin allows for two things. One is the clock: the pod's age is this
+/// machine's time less the container's start as its node stamped it, and the
+/// two clocks can differ. The other is a pod another run created moments
+/// ago, which is left alone rather than deleted under that run's command.
+///
+/// Leaving it alone does not make two runs that need the same helper at the
+/// same time safe together, and nothing here does. A helper's name has no
+/// owner, and each run deletes the pod by that name when it is done, so when
+/// they share it the first to finish deletes it under the other. When one
+/// replaces the other's pod — past the margin, or with another spec
+/// ([`is_immutable_pod_update`]) — both fail: the replaced run's command dies
+/// with its pod, and its cleanup then deletes the replacement by name. Only
+/// an owner stamp on the pod (a per-run uid, as a precondition of the
+/// delete) would let both finish.
 pub const RUNNING_HELPER_REUSE_MARGIN: Duration = Duration::from_secs(300);
 
 /// The keep-alive a helper pod or spec carries, read off its container
