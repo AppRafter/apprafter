@@ -351,10 +351,10 @@ pub fn nats_pod_spec(
 /// script (wraps in single quotes, escaping embedded single quotes).
 ///
 /// Shared by both sides of the backup: `extract` quotes stream names into the
-/// dump script, `restore` quotes generated passwords into the Dragonfly load
-/// script. It was private to the restore side until 2.6d-6 needed the same
-/// rule — and two quoting functions in one repository is how one of them ends
-/// up subtly different from the other.
+/// dump script, and `restore` into its JetStream load script. It was private
+/// to the restore side until 2.6d-6 needed the same rule — and two quoting
+/// functions in one repository is how one of them ends up subtly different
+/// from the other.
 pub fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }

@@ -136,8 +136,12 @@ Five behaviours are load-bearing:
 - **Redis** (persistent claims) is restored by live-loading the captured
   Dragonfly snapshot into the running instance with `DFLY LOAD`: the tar is
   unpacked into the instance's snapshot directory and the latest snapshot is
-  loaded on the data port (admin password read from the instance's `-admin`
-  Secret). Nothing is scaled or restarted, so the claim provisioner never
+  loaded on the data port. The load authenticates with the instance's admin
+  password as the Dragonfly container already holds it, in the
+  `DFLY_requirepass` variable its operator sets from the instance's `-admin`
+  Secret, so the password is on no command line and the restore never reads
+  it; a container without it stops the load before the snapshot directory is
+  touched. Nothing is scaled or restarted, so the claim provisioner never
   re-provisions (and FLUSHes) the DB mid-restore. Ephemeral
   (`persistent: false`) claims carry no snapshot and come back empty — see the
   note at the top of this page.

@@ -2886,16 +2886,10 @@ fn resolve_redis_instance(ns: &str, claim: &str, kubeconfig: &Path) -> Result<St
 /// the instance vanish and cannot re-provision (FLUSHDB) the claim's DB
 /// mid-restore (the failure the scale approach hit on --data-only).
 fn restore_one_redis_instance(instance: &str, tar_path: &Path, k: &dyn KubeExec) -> Result<()> {
-    // DFLY LOAD works on the data port 6379, which is password-auth'd; read the
-    // instance admin password (the admin port 9999 refuses DFLY LOAD).
-    let pw = k.get_secret_key(
-        &format!("{instance}-admin"),
-        DRAGONFLY_NAMESPACE,
-        "password",
-    )?;
-
-    let script = dfly_load_script(&pw);
-    let argv: Vec<&str> = vec!["sh", "-c", &script];
+    // DFLY LOAD works on the data port 6379, which is password-auth'd (the
+    // admin port 9999 refuses DFLY LOAD). The password is the container's
+    // own: see `DFLY_LOAD_SCRIPT`.
+    let argv: Vec<&str> = vec!["sh", "-c", DFLY_LOAD_SCRIPT];
     k.exec_stream_from_file(
         &format!("{instance}-0"),
         DRAGONFLY_NAMESPACE,
@@ -2913,28 +2907,29 @@ const DRAGONFLY_NAMESPACE: &str = "dragonfly-system";
 /// The one-shot `sh -c` script that replays a whole-instance Dragonfly snapshot.
 ///
 /// The tar streams to sh's stdin; `tar x` reads it; then `DFLY LOAD` replays the
-/// newest summary file. Two things are load-bearing: `set -e` plus the explicit
-/// `[ "$OUT" = OK ]` check, because `redis-cli` exits 0 even when the server
-/// answers with an error — without the check a failed load would report a
-/// successful restore over an empty instance; and the password goes through
-/// [`shell_single_quote`], because it is generated and may contain characters
-/// the shell would otherwise interpret.
-fn dfly_load_script(password: &str) -> String {
-    let pw_q = shell_single_quote(password);
-    format!(
-        "set -e; \
-         rm -f /dragonfly/snapshots/* 2>/dev/null || true; \
-         tar x -C /dragonfly/snapshots; \
-         SUM=$(ls -1 /dragonfly/snapshots/*summary.dfs | sort | tail -1); \
-         OUT=$(redis-cli -a {pw_q} --no-auth-warning -p 6379 DFLY LOAD \"$SUM\"); \
-         [ \"$OUT\" = OK ] || {{ echo \"DFLY LOAD failed: $OUT\" >&2; exit 1; }}"
-    )
-}
-
-/// POSIX-safe single-quote, from `backup-core` — the dump side quotes stream
-/// names with the same function, and two quoting rules in one repository is
-/// how one of them ends up subtly different from the other.
-use backup_core::helper_pod::shell_single_quote;
+/// newest summary file. Three things are load-bearing:
+///
+/// * `set -e` plus the explicit `[ "$OUT" = OK ]` check, because `redis-cli`
+///   exits 0 even when the server answers with an error — without the check a
+///   failed load would report a successful restore over an empty instance.
+/// * The password is the Dragonfly container's own `DFLY_requirepass`, which
+///   dragonfly-operator (v1.5.0 and v1.6.0) sets from the CR's
+///   `authentication.passwordFromSecret` — the instance's `<instance>-admin`
+///   Secret, key `password` — and which an exec'd process inherits. It reaches
+///   `redis-cli` as `REDISCLI_AUTH`, so it is never on an argv: not the CLI's
+///   `kubectl exec` (local `ps`, the apiserver's exec audit record), not
+///   `redis-cli`'s in the pod. The CLI never reads it at all.
+/// * A container without it stops the script BEFORE the snapshot directory is
+///   emptied, naming why, rather than running an unauthenticated `DFLY LOAD`.
+const DFLY_LOAD_SCRIPT: &str = "set -e; \
+     [ -n \"${DFLY_requirepass:-}\" ] || { echo \"this Dragonfly container has no \
+     DFLY_requirepass, the admin password its operator sets from the instance's -admin \
+     Secret, so DFLY LOAD cannot authenticate\" >&2; exit 1; }; \
+     rm -f /dragonfly/snapshots/* 2>/dev/null || true; \
+     tar x -C /dragonfly/snapshots; \
+     SUM=$(ls -1 /dragonfly/snapshots/*summary.dfs | sort | tail -1); \
+     OUT=$(REDISCLI_AUTH=\"$DFLY_requirepass\" redis-cli -p 6379 DFLY LOAD \"$SUM\"); \
+     [ \"$OUT\" = OK ] || { echo \"DFLY LOAD failed: $OUT\" >&2; exit 1; }";
 
 /// **ReSealUserSecrets** — re-seal each app user secret under
 /// `secrets/<ns>/<name>.json` (NOT `secrets/sourcecred/…`, which
@@ -3689,8 +3684,12 @@ mod tests {
 
     #[test]
     fn shell_single_quote_escapes_embedded_quotes() {
-        assert_eq!(super::shell_single_quote("abc123"), "'abc123'");
-        assert_eq!(super::shell_single_quote("a'b"), "'a'\\''b'");
+        // The stream-name quoting of the JetStream loader: backup-core's, the
+        // one the dump side quotes with — two quoting rules in one repository
+        // is how one of them ends up subtly different from the other.
+        use backup_core::helper_pod::shell_single_quote;
+        assert_eq!(shell_single_quote("abc123"), "'abc123'");
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
     }
 
     #[test]
@@ -3975,12 +3974,6 @@ mod tests {
     }
 
     impl FakeKube {
-        fn with_secret(mut self, secret: &str, ns: &str, key: &str, value: &str) -> Self {
-            self.secrets
-                .insert(format!("{ns}/{secret}/{key}"), value.to_string());
-            self
-        }
-
         fn failing_exec() -> Self {
             Self {
                 exec_fails: true,
@@ -7192,12 +7185,13 @@ mod tests {
     }
 
     /// A Dragonfly snapshot is replayed into the RUNNING instance's pod-0 in
-    /// `dragonfly-system`, using the instance's ADMIN password on the data port
-    /// — the admin port refuses `DFLY LOAD`.
+    /// `dragonfly-system`, authenticated on the data port with the container's
+    /// own admin password — the admin port refuses `DFLY LOAD`. The CLI reads
+    /// no Secret for it.
     #[test]
     fn restore_one_redis_instance_replays_into_the_running_pod_zero() {
-        let k =
-            FakeKube::default().with_secret("pool-a-admin", "dragonfly-system", "password", "pw");
+        // No Secret at all: the CLI must not need one.
+        let k = FakeKube::default();
         let tar = tempfile::NamedTempFile::new().unwrap();
 
         restore_one_redis_instance("pool-a", tar.path(), &k).unwrap();
@@ -7205,7 +7199,7 @@ mod tests {
         let execs = k.execs.borrow();
         assert_eq!(execs[0].0, "pool-a-0");
         assert_eq!(execs[0].1, "dragonfly-system");
-        assert_eq!(execs[0].2[0], "sh");
+        assert_eq!(execs[0].2, vec!["sh", "-c", DFLY_LOAD_SCRIPT]);
         assert_eq!(execs[0].3, tar.path());
         assert!(
             k.applied.borrow().is_empty(),
@@ -7213,30 +7207,33 @@ mod tests {
         );
     }
 
-    /// A missing admin Secret must abort the load rather than exec an
-    /// unauthenticated `DFLY LOAD` that silently does nothing.
-    #[test]
-    fn restore_one_redis_instance_fails_when_the_admin_password_is_absent() {
-        let k = FakeKube::default();
-        let tar = tempfile::NamedTempFile::new().unwrap();
-        assert!(restore_one_redis_instance("pool-a", tar.path(), &k).is_err());
-        assert!(k.execs.borrow().is_empty());
-    }
-
     /// The replay script must (a) check the reply, because `redis-cli` exits 0
     /// even when the server answers with an error — without the check a failed
-    /// load reports a successful restore over an empty instance — and (b) quote
-    /// the generated password, which may contain shell metacharacters.
+    /// load reports a successful restore over an empty instance; (b) take the
+    /// password from the container's environment into `REDISCLI_AUTH`, never
+    /// onto an argv (`-a`); and (c) stop before it empties the snapshot
+    /// directory when the container has no password, rather than run an
+    /// unauthenticated `DFLY LOAD` that fails after the old snapshot is gone.
     #[test]
-    fn dfly_load_script_checks_the_reply_and_quotes_the_password() {
-        let script = dfly_load_script("pa's$word");
-        assert!(script.contains("'pa'\\''s$word'"), "got: {script}");
-        assert!(script.contains("DFLY LOAD"), "got: {script}");
+    fn dfly_load_script_checks_the_reply_and_keeps_the_password_off_every_argv() {
+        let script = DFLY_LOAD_SCRIPT;
+        assert!(script.starts_with("set -e"), "got: {script}");
         assert!(
             script.contains("[ \"$OUT\" = OK ]"),
             "a redis-cli exit code is not evidence the load worked: {script}"
         );
-        assert!(script.starts_with("set -e"), "got: {script}");
+        assert!(
+            script.contains(
+                "OUT=$(REDISCLI_AUTH=\"$DFLY_requirepass\" redis-cli -p 6379 DFLY LOAD \"$SUM\")"
+            ),
+            "got: {script}"
+        );
+        assert!(!script.contains(" -a "), "no password on an argv: {script}");
+        let guard = script
+            .find("[ -n \"${DFLY_requirepass:-}\" ] || {")
+            .expect(script);
+        let wipe = script.find("rm -f /dragonfly/snapshots/*").expect(script);
+        assert!(guard < wipe, "the check comes before the wipe: {script}");
     }
 
     // =======================================================================
