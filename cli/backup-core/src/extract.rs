@@ -552,7 +552,8 @@ fn extract_pg(
 ///   names the tables.
 /// * **Any other lock the dump's catalog reads wait on** — the exec wrote
 ///   nothing within [`PG_DUMP_FIRST_OUTPUT_WITHIN`] (see there for why that
-///   means a lock). The exec's own error says only that nothing was written.
+///   means a lock, and why in a database with thousands of tables it can be
+///   table locks too). The exec's own error says only that nothing was written.
 ///
 /// Matches on the exec error's text: the lock-timeout words are `pg_dump`'s
 /// stderr, which both `KubeExec` implementations append (the CLI's `kubectl
@@ -579,9 +580,11 @@ pub fn explain_pg_dump_error(err: CliError, ns: &str, claim: &str) -> CliError {
              cover: a lock on a view, a materialized view or a sequence, held by another \
              session — a REFRESH MATERIALIZED VIEW that is still running or sits in an open \
              transaction, or a migration that ran CREATE OR REPLACE VIEW or ALTER SEQUENCE \
-             in a transaction that has not ended. No data was dumped. pg_locks shows the \
-             waiting lock and pg_stat_activity the session holding it; run the backup again \
-             once that session has finished.\n{msg}",
+             in a transaction that has not ended. In a database with thousands of tables it \
+             can also be table locks: pg_dump takes them in several LOCK TABLE statements, \
+             each allowed {PG_DUMP_LOCK_WAIT_TIMEOUT}, and waits on them add up. No data was \
+             dumped. pg_locks shows the waiting lock and pg_stat_activity the session holding \
+             it; run the backup again once that session has finished.\n{msg}",
             PG_DUMP_FIRST_OUTPUT_WITHIN.as_secs() / 60
         ));
     }
@@ -771,14 +774,20 @@ fn extract_redis(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Result
 /// syntax.
 ///
 /// `pg_dump` starts by taking `ACCESS SHARE` on every table it will dump, in
-/// one `LOCK TABLE` statement (PostgreSQL 18). A session holding a conflicting
+/// `LOCK TABLE` statements of about 100 KB of qualified table names each
+/// (PostgreSQL 18). That is one statement up to roughly 1,500 to 3,500 tables,
+/// depending on name length, and several beyond: 8,000 tables named
+/// `public.some_app_table_<n>` took three (measured on PostgreSQL 18.6: 100 082,
+/// 100 097 and 22 957 characters). A session holding a conflicting
 /// lock — a migration's `ALTER TABLE`, `VACUUM FULL`, `CLUSTER`, a `LOCK TABLE`
 /// left open in an idle transaction — makes it wait, silently, for as long as
 /// that lock is held. The scheduled runner is a `concurrencyPolicy: Forbid`
 /// CronJob, so while it waits no later scheduled backup starts.
 ///
-/// What this bounds, exactly: the `LOCK TABLE` statement, which `pg_dump` runs
-/// under `statement_timeout` set to this value — and only that. It locks
+/// What this bounds, exactly: each `LOCK TABLE` statement, which `pg_dump` runs
+/// under `statement_timeout` set to this value — and only those. A database
+/// that needs several statements can wait this long on each of them in turn
+/// (see [`PG_DUMP_FIRST_OUTPUT_WITHIN`] for what that does). It locks
 /// relations of kind `r` and `p` (plain and partitioned tables); a lock on a
 /// view resolves to its base tables and is bounded too. Directly afterwards
 /// `pg_dump` sets `statement_timeout = 0` and runs the rest of its catalog
@@ -801,9 +810,9 @@ fn extract_redis(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Result
 /// to the CLI's `apprafter backup create` as well, which shares this argv.
 ///
 /// When it fires, `pg_dump` exits 1 with `canceling statement due to statement
-/// timeout` and a `Query was: LOCK TABLE …` detail naming every table (one
-/// statement since PostgreSQL 18); [`explain_pg_dump_error`] turns that into
-/// a sentence about the lock.
+/// timeout` and a `Query was: LOCK TABLE …` detail naming the tables of the
+/// statement that timed out (every table, when one statement holds them all);
+/// [`explain_pg_dump_error`] turns that into a sentence about the lock.
 pub const PG_DUMP_LOCK_WAIT_TIMEOUT: &str = "300s";
 
 /// How long `pg_dump` may run before it writes the first byte of the dump;
@@ -821,7 +830,16 @@ pub const PG_DUMP_LOCK_WAIT_TIMEOUT: &str = "300s";
 ///
 /// Why ten minutes: it must let the table-lock wait run out first, so a held
 /// table lock keeps reporting `pg_dump`'s own error, which names the tables —
-/// that is the first five minutes. The other five are for the rest of the
+/// that is the first five minutes. That ordering holds while the table locks
+/// go in one `LOCK TABLE` statement. With several, each statement has its own
+/// five minutes and the waits add up, so statements that each wait just short
+/// of theirs can reach this bound before any of them times out (measured on
+/// PostgreSQL 18.6 with a 3 s lock wait and three holders, one per statement:
+/// the dump failed on the third after 8 s). That takes a database with
+/// thousands of tables and conflicting locks held on them one after another;
+/// the failure then names this bound instead of the tables, and
+/// [`explain_pg_dump_error`] says table locks can be the cause. The other five
+/// minutes are for the rest of the
 /// schema read, which is quick: 6–7 s on PostgreSQL 18 for 10 000 tables with
 /// their sequences and 20 000 indexes, 1 000 views, 1 000 functions and 200
 /// materialized views (a 25 MB table of contents). Five minutes is some forty
@@ -1082,6 +1100,11 @@ mod tests {
         ] {
             assert!(msg.contains(cause), "names {cause:?}: {msg}");
         }
+        // Table locks too, in a database large enough that pg_dump takes
+        // them in several statements, each with its own 300s: waits held
+        // just short of that in turn add up past this bound.
+        assert!(msg.contains("thousands of tables"), "{msg}");
+        assert!(msg.contains("LOCK TABLE statements"), "{msg}");
         // The exec's own words survive: they name the pod.
         assert!(msg.contains("demo/bk-pg-db"), "{msg}");
     }
@@ -1090,7 +1113,9 @@ mod tests {
     fn the_first_output_bound_lets_the_table_lock_wait_run_out_first() {
         // A held TABLE lock must keep failing with pg_dump's own error, which
         // names the tables — so the table-lock wait runs out well inside the
-        // first-output bound, with the rest of the schema read on top.
+        // first-output bound, with the rest of the schema read on top. That
+        // is one `LOCK TABLE` statement's wait: a database needing several
+        // can add theirs up past the bound (see PG_DUMP_FIRST_OUTPUT_WITHIN).
         let lock_wait: u64 = PG_DUMP_LOCK_WAIT_TIMEOUT
             .strip_suffix('s')
             .and_then(|n| n.parse().ok())

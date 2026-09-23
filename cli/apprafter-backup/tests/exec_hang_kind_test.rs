@@ -60,8 +60,9 @@ const SETUP_SLACK: Duration = Duration::from_secs(120);
 const WAIT_FOR_SERVICE: &str = "until pg_isready -q -h pg -U postgres; do sleep 1; done;";
 
 /// Tables in the dumped database. pg_dump 18 names every one of them in the
-/// single `LOCK TABLE` statement its timeout error echoes — this many make that
-/// error about 2 KiB, twice kube-rs's stderr pipe.
+/// `LOCK TABLE` statement its timeout error echoes (it starts another only
+/// past 100 KB of names, so here there is one) — this many make that error
+/// about 2 KiB, twice kube-rs's stderr pipe.
 const TABLES: usize = 60;
 
 fn opted_in() -> (tokio::runtime::Runtime, kube::Client, KubeRsExec) {

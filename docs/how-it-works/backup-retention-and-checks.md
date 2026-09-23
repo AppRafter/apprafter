@@ -373,7 +373,11 @@ migration that ran `CREATE OR REPLACE VIEW` or `ALTER SEQUENCE` in a
 transaction that has not ended. A custom-format dump writes nothing at all
 until that schema read is done, so the runner gives the dump ten minutes to
 write its first byte: five for the table locks, and five for a schema read
-that takes seconds even at ten thousand tables. Once the dump is writing,
+that takes seconds even at ten thousand tables. The five minutes for table
+locks are per `LOCK TABLE` statement, and `pg_dump` starts a new statement
+every 100 KB or so of table names. A database with thousands of tables needs
+several, and table locks held on them one after another can then add up past
+the ten minutes; the message for that bound says so. Once the dump is writing,
 only the run's deadline limits it, so copying a large table is never cut
 short. Both bounds apply to `apprafter backup create` and `apprafter export`
 too. A dump that gave up, or that a run's deadline stopped, does not stay
