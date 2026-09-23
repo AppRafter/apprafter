@@ -120,7 +120,9 @@ Five behaviours are load-bearing:
 - **PostgreSQL** is restored over an ephemeral helper pod that pipes the dump
   on **stdin** to `pg_restore --no-owner --clean --if-exists`. The connection
   credentials come from the claim's **fresh** `status.connectionSecretRef`
-  (the post-provision Secret), never the credentials embedded in the backup.
+  (the post-provision Secret), never the credentials embedded in the backup;
+  the helper's container reads the password from that Secret by reference, so
+  the Pod object carries none.
   `--no-owner` is assumed because the restored database role is the
   newly-provisioned one, not whatever owned the objects on the source. The
   helper connects with `client_connection_check_interval` set to ten seconds,
@@ -141,8 +143,9 @@ Five behaviours are load-bearing:
   note at the top of this page.
 - **JetStream** streams are restored over the NATS wire from a helper pod in
   the namespace the message server runs in, authenticated as the namespace's
-  **manager** user (`nats-mgr-<ns>`) — a claim's own user is denied the
-  snapshot API by design, and the manager identity is the one the design
+  **manager** user, whose name and password the helper's container reads by
+  reference from `nats-mgr-<ns>` beside the server — a claim's own user is
+  denied the snapshot API by design, and the manager identity is the one the design
   reserves for this. The stream is **deleted and replayed**, because a restore
   refuses a stream that already exists, and the controller that creates
   declared streams will have recreated this one empty from its declaration

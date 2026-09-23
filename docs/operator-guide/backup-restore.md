@@ -33,6 +33,13 @@ under the AppRafter config root; `--repo <path>` puts it elsewhere.
 and tag — the tag is `<cluster-uid>-<created-at>`, so it identifies the source
 cluster and the moment, never a single namespace.
 
+The dumps run in short-lived helper pods in the cluster. Ctrl-C (or SIGTERM)
+stops the command and deletes the helper pods it created — only those — within
+fifteen seconds, then exits with status 130 (143 for SIGTERM). A second Ctrl-C
+exits at once instead; a helper pod left that way is replaced by the next
+backup that needs it. `apprafter export` and `apprafter restore` behave the
+same way.
+
 ## What is in a backup
 
 ```sh

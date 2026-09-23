@@ -313,14 +313,23 @@ pods' time is the only limit on one dump or load. The six-hour floor is there
 for them: a deadline lowered to suit a frequent schedule does not cut a
 restore short. A command ended this way fails with a message that says its
 helper pod's keep-alive ran out and names `apprafter backup set deadline` as
-the way to allow longer, rather than with a bare exit code 137. A helper pod that
-a command or run was killed before it could delete stops running then, but
-the pod itself stays behind as `Completed` until something deletes it. The
-next command or run that needs a helper pod of that name, the same step for
-the same claim, deletes it, waits until it is gone, and creates its own. It
-does the same with a leftover it cannot update in place because an older
-version built it with a different spec. A pod still running with the same
-spec is used as it is.
+the way to allow longer, rather than with a bare exit code 137.
+
+`apprafter backup create`, `apprafter export` and `apprafter restore` delete
+the helper pods they created when they are interrupted with Ctrl-C or SIGTERM,
+as the runner deletes its own when its Job stops it. Each such pod is recorded
+before its apply is sent, with the uid of any pod of that name already there,
+and the interrupt deletes only a pod its own apply created, with that uid as
+the delete's precondition: a pod of the same name that another run is using is
+left alone. It undoes nothing else, and it takes at most fifteen seconds;
+a second Ctrl-C exits at once, without it. A helper pod that a command or run
+was killed before it could delete — `kill -9`, a lost node, that second Ctrl-C
+— keeps running until its keep-alive ends and then stays behind as
+`Completed` until something deletes it. The next command or run that needs a
+helper pod of that name, the same step for the same claim, deletes it, waits
+until it is gone, and creates its own. It does the same with a leftover it
+cannot update in place because an older version built it with a different
+spec. A pod still running with the same spec is used as it is.
 
 Pick the value against the schedule it applies to:
 
@@ -368,7 +377,7 @@ a slow full-read check fails Monday's backup instead.
 that has not set them runs on the chart's six hours.
 
 **Inside a run.** The steps that wait on something outside the runner are
-bounded too, far below the Job deadline. The first three fail the run with a
+bounded too, far below the Job deadline. The first four fail the run with a
 reason of its own, recorded in `lastError` and sent to the failure webhook:
 
 | What the run waits on | Bound | What you see |
@@ -376,6 +385,7 @@ reason of its own, recorded in `lastError` and sent to the failure webhook:
 | `pg_dump` taking its table locks | 5 minutes (`--lock-wait-timeout=300s`) | `pg dump of <namespace>/<claim> gave up: another session held a lock …`, followed by `pg_dump`'s own `LOCK TABLE` statement naming the tables |
 | `pg_dump` reading the schema, before the first byte of the dump | 10 minutes | `pg dump of <namespace>/<claim> gave up: pg_dump wrote nothing for 10 minutes …`, naming the locks it covers |
 | a helper pod becoming Ready | 5 minutes | `pod … did not reach Ready within 300s` |
+| a helper pod whose container cannot start because a Secret it reads a credential from, or the key in it, is missing | 15 seconds | `helper pod <namespace>/<pod> cannot start its container: secret "…" not found (CreateContainerConfigError) …`, in the kubelet's own words |
 | the failure webhook answering | 30 seconds | nothing: the notification is best-effort, and the run's outcome is already recorded |
 
 Both `pg_dump` bounds cover the start of a dump, before it has read a row, and
@@ -440,6 +450,25 @@ everything — with one line drawn explicitly: it holds **no write verb on
 `platformstacks`**, only `get`/`list`. A compromised backup pod cannot move the
 platform's upgrade target. The cluster-wide `pods/exec` is unavoidable rather
 than chosen: Kubernetes RBAC cannot scope exec to the runner's own helper pods.
+
+**Credentials in helper pods.** A helper pod never carries a password in its
+own spec. The PostgreSQL helper reads `PGPASSWORD` from the `pass` key of the
+claim's connection Secret, and the JetStream helper reads `NATS_USER` and
+`NATS_PASSWORD` from the `user` and `password` keys of the namespace's
+`nats-mgr-<namespace>` Secret, each through a `secretKeyRef`: the kubelet
+resolves them when it starts the container, and the Pod object carries only
+the Secret's name and key. So `get pods` — a right commonly granted more widely
+than `get secrets` — shows no credential, while the pod runs or after. Each of
+those Secrets already lives in the namespace its helper runs in — a
+PostgreSQL helper runs in its claim's namespace, a JetStream helper in the one
+NATS runs in — so a run creates no Secret of its own, the ClusterRole above
+needs no write verb on Secrets, and a backup never reads the password itself.
+The same holds for the helpers of `apprafter backup create`, `apprafter export`
+and `apprafter restore`; a restore reads a claim's connection Secret only to
+check that it has every key it needs. A Secret or key that is missing
+leaves the container unable to start; the run stops on that after fifteen
+seconds with the kubelet's own words (the table above), rather than waiting
+five minutes for a pod that cannot become Ready.
 
 **The network ceiling.** A CiliumNetworkPolicy, `apprafter-backup-egress`,
 selects pods labelled `apprafter.io/backup-runner: "true"` — which both

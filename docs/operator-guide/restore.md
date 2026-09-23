@@ -220,6 +220,14 @@ every Argo CD Application whose auto-sync it disabled:
   that puts the replica counts and auto-sync back.
 ```
 
+Interrupting it with Ctrl-C (or SIGTERM) deletes the helper pod it was loading
+data through — only the helper pods this restore created — and exits with
+status 130 (143 for SIGTERM), within fifteen seconds. It undoes nothing else:
+the applications stay down as above. The lines naming them are printed when
+the restore reaches them before it exits, which it is given a moment to do; a
+shorter line saying that applications it scaled down stay down is printed
+either way. A second Ctrl-C exits at once, without deleting the helper pod.
+
 **Re-running the same command is the remedy.** Its final step is the one that
 restores the replica counts and re-enables auto-sync, so a second run that
 reaches the end leaves the cluster correct.
