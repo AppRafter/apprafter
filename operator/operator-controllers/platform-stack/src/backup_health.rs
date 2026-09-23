@@ -601,30 +601,29 @@ fn no_finished_run(run: Run, cronjob: &Value, jobs: &[&Value]) -> Outcome {
 
 /// Trouble in a Job that has not finished, and when to look again if its pod
 /// is inside the grace.
+///
+/// An attempt that has already failed is judged first, and apart from the
+/// pod the Job is running now: that pod's grace covers a pod waiting for
+/// room, not a failure that has already happened. Judged the other way round,
+/// a runner killed at its limit read as healthy for as long as the Job's next
+/// pod was waiting — seconds while its container was created, up to the whole
+/// grace while a memory-pressure taint kept it off the node — and the
+/// condition turned `True` and `False` again on every retry.
 fn unfinished_trouble(
     run: Run,
     job: &Value,
     pods: &[Value],
     now: DateTime<Utc>,
 ) -> (Option<Outcome>, Option<DateTime<Utc>>) {
-    let noun = run.noun();
-    let job_name = name(job);
     let owned: Vec<&Value> = pods.iter().filter(|p| owned_by(p, job)).collect();
-    let grace = Duration::seconds(NOT_STARTED_GRACE_SECS);
     // A scheduled Job holds the schedule while it waits: the CronJob is
     // `concurrencyPolicy: Forbid`. A manual one holds nothing.
     let holds = if cronjob_owner(job).is_some() {
-        holds_the_schedule(noun)
+        holds_the_schedule(run.noun())
     } else {
         String::new()
     };
-
-    // When a wait that began at `since` stops being inside the grace, if it
-    // has not stopped already.
-    let not_yet = |since: Option<DateTime<Utc>>| -> Option<DateTime<Utc>> {
-        let due = since.unwrap_or(now) + grace;
-        (now < due).then_some(due)
-    };
+    let earlier = failed_attempt(run, job, &owned, pods);
 
     let live = owned
         .iter()
@@ -632,154 +631,27 @@ fn unfinished_trouble(
         .filter(|p| p.pointer("/metadata/deletionTimestamp").is_none())
         .max_by_key(|p| time_at(p, "/metadata/creationTimestamp"));
     if let Some(pod) = live {
-        let pod_name = name(pod);
-        let created = time_at(pod, "/metadata/creationTimestamp");
-        let placed = str_at(pod, "/spec/nodeName").is_some_and(|n| !n.is_empty());
-        if !placed {
-            let scheduled = pod_condition(pod, "PodScheduled");
-            let unschedulable = scheduled.filter(|c| {
-                c.get("status").and_then(Value::as_str) == Some("False")
-                    && c.get("reason").and_then(Value::as_str) == Some("Unschedulable")
-            });
-            if let Some(cond) = unschedulable {
-                if str_at(pod, "/status/nominatedNodeName").is_some_and(|n| !n.is_empty()) {
-                    // Room is being made by preemption; the pod's next change
-                    // (placement) wakes the controller.
-                    return (None, None);
-                }
-                let since_raw = cond
-                    .get("lastTransitionTime")
-                    .and_then(Value::as_str)
-                    .or_else(|| str_at(pod, "/metadata/creationTimestamp"));
-                let since = since_raw.and_then(parse_time).or(created);
-                if let Some(due) = not_yet(since) {
-                    return (None, Some(due));
-                }
-                let said = cond
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .filter(|m| !m.is_empty())
-                    .unwrap_or("the scheduler gave no reason");
-                let asks = requests(pod)
-                    .map(|r| format!(" It asks for {r}."))
-                    .unwrap_or_default();
+        match live_pod(run, job, pod, now) {
+            // The pod the Job runs now is the news; an attempt that failed
+            // before it is still said, before what the waiting pod holds.
+            LivePod::Trouble { reason, message } => {
+                let before = earlier.as_ref().map_or("", |e| e.beside.as_str());
                 return (
                     Some(Outcome::Trouble {
-                        reason: REASON_UNSCHEDULABLE,
-                        message: format!(
-                            "{noun} Job {job_name}: its pod {pod_name} has not been scheduled \
-                             since {}: {said}.{asks}{holds}",
-                            since_raw.unwrap_or("its creation"),
-                            said = said.trim_end_matches('.'),
-                        ),
+                        reason,
+                        message: format!("{message}{before}{holds}"),
                     }),
                     None,
                 );
             }
-            // Not tried yet, or held by a gate: counted from creation.
-            if let Some(due) = not_yet(created) {
-                return (None, Some(due));
-            }
-            let why = scheduled
-                .and_then(|c| {
-                    reason_with_message(
-                        c.get("reason").and_then(Value::as_str).unwrap_or(""),
-                        c.get("message").and_then(Value::as_str).unwrap_or(""),
-                    )
-                })
-                .map(|w| format!(": {w}"))
-                .unwrap_or_default();
-            return (
-                Some(Outcome::Trouble {
-                    reason: REASON_NOT_STARTED,
-                    message: format!(
-                        "{noun} Job {job_name}: its pod {pod_name} has not been scheduled since \
-                         {}{why}.{holds}",
-                        str_at(pod, "/metadata/creationTimestamp").unwrap_or("its creation"),
-                    ),
-                }),
-                None,
-            );
-        }
-        if str_at(pod, "/status/phase") == Some("Pending") {
-            // Placed, container not started. Counted from placement, which is
-            // when the image pull and the volume mounts begin.
-            let placed_at = pod_condition(pod, "PodScheduled")
-                .filter(|c| c.get("status").and_then(Value::as_str) == Some("True"))
-                .and_then(|c| c.get("lastTransitionTime").and_then(Value::as_str));
-            let since = placed_at.and_then(parse_time).or(created);
-            if let Some(due) = not_yet(since) {
-                return (None, Some(due));
-            }
-            let node = str_at(pod, "/spec/nodeName").unwrap_or("?");
-            let waiting = waiting_reason(pod)
-                .map(|w| format!(": {w}"))
-                .unwrap_or_default();
-            return (
-                Some(Outcome::Trouble {
-                    reason: REASON_NOT_STARTED,
-                    message: format!(
-                        "{noun} Job {job_name}: its pod {pod_name} was placed on {node} at {} \
-                         and its container has not started{waiting}.{holds}",
-                        placed_at
-                            .or_else(|| str_at(pod, "/metadata/creationTimestamp"))
-                            .unwrap_or("an unrecorded time"),
-                    ),
-                }),
-                None,
-            );
+            // Inside the grace: nothing to say about this pod yet, but its
+            // grace still ends, and no event marks that.
+            LivePod::Waiting(due) => return (earlier.map(FailedAttempt::alone), Some(due)),
+            LivePod::Fine => {}
         }
     }
-
-    // No live pod in trouble. An attempt that already died of a cause the
-    // runner cannot record is trouble now, even while the next attempt runs:
-    // the same data meets the same limit.
-    let last_failed = owned
-        .iter()
-        .filter(|p| str_at(p, "/status/phase") == Some("Failed"))
-        .max_by_key(|p| time_at(p, "/metadata/creationTimestamp"));
-    if let Some(pod) = last_failed {
-        // The Job's own count lags its pods by a sync; the failed pods it
-        // still has are the floor.
-        let failed = failed_attempts(job, pods).max(1);
-        let attempts = job
-            .pointer("/spec/backoffLimit")
-            .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_BACKOFF_LIMIT)
-            + 1;
-        let prefix = format!("{noun} Job {job_name}: its attempt {failed} of at most {attempts}");
-        let next = if failed < attempts {
-            " The Job retries until its backoff limit."
-        } else {
-            " It was the last attempt the Job makes."
-        };
-        match attempt_cause(pod) {
-            Cause::OomKilled(what) => {
-                return (
-                    Some(Outcome::Trouble {
-                        reason: REASON_OOM_KILLED,
-                        message: format!(
-                            "{prefix} {what}; a killed runner records nothing itself.{next}"
-                        ),
-                    }),
-                    None,
-                )
-            }
-            Cause::Evicted(what) => {
-                return (
-                    Some(Outcome::Trouble {
-                        reason: REASON_EVICTED,
-                        message: format!(
-                            "{prefix} {what}; an evicted runner records nothing itself.{next}"
-                        ),
-                    }),
-                    None,
-                )
-            }
-            // An ordinary non-zero exit: the runner recorded it itself, and
-            // the retry may well succeed. The Job's own ending decides.
-            Cause::Exited(_) | Cause::Unknown(_) => {}
-        }
+    if let Some(earlier) = earlier {
+        return (Some(earlier.alone()), None);
     }
 
     // No pod at all, and none the Job controller counts either: it has not
@@ -794,7 +666,7 @@ fn unfinished_trouble(
     // or failed, and is not "no pod".
     if owned.is_empty() && counts_no_pod(job) {
         let created_raw = str_at(job, "/metadata/creationTimestamp");
-        if let Some(due) = not_yet(created_raw.and_then(parse_time)) {
+        if let Some(due) = not_yet(created_raw.and_then(parse_time), now) {
             return (None, Some(due));
         }
         let why = if job.pointer("/spec/suspend").and_then(Value::as_bool) == Some(true) {
@@ -808,8 +680,9 @@ fn unfinished_trouble(
             Some(Outcome::Trouble {
                 reason: REASON_NOT_STARTED,
                 message: format!(
-                    "{noun} Job {job_name}: it has had no pod since it was created at {}: \
-                     {why}.{holds}",
+                    "{} Job {}: it has had no pod since it was created at {}: {why}.{holds}",
+                    run.noun(),
+                    name(job),
                     created_raw.unwrap_or("an unrecorded time"),
                 ),
             }),
@@ -817,6 +690,194 @@ fn unfinished_trouble(
         );
     }
     (None, None)
+}
+
+/// When a wait that began at `since` stops being inside the grace, if it has
+/// not stopped already. No recorded start counts from `now`.
+fn not_yet(since: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let due = since.unwrap_or(now) + Duration::seconds(NOT_STARTED_GRACE_SECS);
+    (now < due).then_some(due)
+}
+
+/// What the pod a Job is running now says about the run.
+enum LivePod {
+    /// Running, or being made room for by preemption: its next change wakes
+    /// the controller.
+    Fine,
+    /// Not placed or not started, inside the grace until this instant.
+    Waiting(DateTime<Utc>),
+    /// Not placed or not started past the grace. The message does not yet
+    /// say whether the Job holds the schedule; the caller ends it with that.
+    Trouble {
+        reason: &'static str,
+        message: String,
+    },
+}
+
+fn live_pod(run: Run, job: &Value, pod: &Value, now: DateTime<Utc>) -> LivePod {
+    let noun = run.noun();
+    let job_name = name(job);
+    let pod_name = name(pod);
+    let created = time_at(pod, "/metadata/creationTimestamp");
+    let placed = str_at(pod, "/spec/nodeName").is_some_and(|n| !n.is_empty());
+    if !placed {
+        let scheduled = pod_condition(pod, "PodScheduled");
+        let unschedulable = scheduled.filter(|c| {
+            c.get("status").and_then(Value::as_str) == Some("False")
+                && c.get("reason").and_then(Value::as_str) == Some("Unschedulable")
+        });
+        if let Some(cond) = unschedulable {
+            if str_at(pod, "/status/nominatedNodeName").is_some_and(|n| !n.is_empty()) {
+                // Room is being made by preemption; the pod's next change
+                // (placement) wakes the controller.
+                return LivePod::Fine;
+            }
+            let since_raw = cond
+                .get("lastTransitionTime")
+                .and_then(Value::as_str)
+                .or_else(|| str_at(pod, "/metadata/creationTimestamp"));
+            let since = since_raw.and_then(parse_time).or(created);
+            if let Some(due) = not_yet(since, now) {
+                return LivePod::Waiting(due);
+            }
+            let said = cond
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|m| !m.is_empty())
+                .unwrap_or("the scheduler gave no reason");
+            let asks = requests(pod)
+                .map(|r| format!(" It asks for {r}."))
+                .unwrap_or_default();
+            return LivePod::Trouble {
+                reason: REASON_UNSCHEDULABLE,
+                message: format!(
+                    "{noun} Job {job_name}: its pod {pod_name} has not been scheduled since {}: \
+                     {said}.{asks}",
+                    since_raw.unwrap_or("its creation"),
+                    said = said.trim_end_matches('.'),
+                ),
+            };
+        }
+        // Not tried yet, or held by a gate: counted from creation.
+        if let Some(due) = not_yet(created, now) {
+            return LivePod::Waiting(due);
+        }
+        let why = scheduled
+            .and_then(|c| {
+                reason_with_message(
+                    c.get("reason").and_then(Value::as_str).unwrap_or(""),
+                    c.get("message").and_then(Value::as_str).unwrap_or(""),
+                )
+            })
+            .map(|w| format!(": {w}"))
+            .unwrap_or_default();
+        return LivePod::Trouble {
+            reason: REASON_NOT_STARTED,
+            message: format!(
+                "{noun} Job {job_name}: its pod {pod_name} has not been scheduled since {}{why}.",
+                str_at(pod, "/metadata/creationTimestamp").unwrap_or("its creation"),
+            ),
+        };
+    }
+    if str_at(pod, "/status/phase") != Some("Pending") {
+        return LivePod::Fine;
+    }
+    // Placed, container not started. Counted from placement, which is when
+    // the image pull and the volume mounts begin.
+    let placed_at = pod_condition(pod, "PodScheduled")
+        .filter(|c| c.get("status").and_then(Value::as_str) == Some("True"))
+        .and_then(|c| c.get("lastTransitionTime").and_then(Value::as_str));
+    let since = placed_at.and_then(parse_time).or(created);
+    if let Some(due) = not_yet(since, now) {
+        return LivePod::Waiting(due);
+    }
+    let node = str_at(pod, "/spec/nodeName").unwrap_or("?");
+    let waiting = waiting_reason(pod)
+        .map(|w| format!(": {w}"))
+        .unwrap_or_default();
+    LivePod::Trouble {
+        reason: REASON_NOT_STARTED,
+        message: format!(
+            "{noun} Job {job_name}: its pod {pod_name} was placed on {node} at {} and its \
+             container has not started{waiting}.",
+            placed_at
+                .or_else(|| str_at(pod, "/metadata/creationTimestamp"))
+                .unwrap_or("an unrecorded time"),
+        ),
+    }
+}
+
+/// An attempt of an unfinished Job that has already failed, of a cause that
+/// is trouble now, whatever the Job's next attempt is doing.
+struct FailedAttempt {
+    reason: &'static str,
+    /// The message when this attempt is the whole story.
+    alone: String,
+    /// The same attempt as a sentence after the trouble of the pod that
+    /// replaced it.
+    beside: String,
+}
+
+impl FailedAttempt {
+    fn alone(self) -> Outcome {
+        Outcome::Trouble {
+            reason: self.reason,
+            message: self.alone,
+        }
+    }
+}
+
+/// The newest failed attempt of `job`, when its cause is one the runner
+/// cannot record: the same data meets the same limit, so it is trouble now,
+/// even while the next attempt runs.
+fn failed_attempt(
+    run: Run,
+    job: &Value,
+    owned: &[&Value],
+    pods: &[Value],
+) -> Option<FailedAttempt> {
+    let pod = owned
+        .iter()
+        .filter(|p| str_at(p, "/status/phase") == Some("Failed"))
+        .max_by_key(|p| time_at(p, "/metadata/creationTimestamp"))?;
+    let (reason, what, records) = match attempt_cause(pod) {
+        Cause::OomKilled(what) => (
+            REASON_OOM_KILLED,
+            what,
+            "a killed runner records nothing itself",
+        ),
+        Cause::Evicted(what) => (
+            REASON_EVICTED,
+            what,
+            "an evicted runner records nothing itself",
+        ),
+        // An ordinary non-zero exit: the runner recorded it itself, and
+        // the retry may well succeed. The Job's own ending decides.
+        Cause::Exited(_) | Cause::Unknown(_) => return None,
+    };
+    // The Job's own count lags its pods by a sync; the failed pods it still
+    // has are the floor.
+    let failed = failed_attempts(job, pods).max(1);
+    let attempts = job
+        .pointer("/spec/backoffLimit")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_BACKOFF_LIMIT)
+        + 1;
+    let attempt = format!("attempt {failed} of at most {attempts}");
+    let next = if failed < attempts {
+        " The Job retries until its backoff limit."
+    } else {
+        " It was the last attempt the Job makes."
+    };
+    Some(FailedAttempt {
+        reason,
+        alone: format!(
+            "{} Job {}: its {attempt} {what}; {records}.{next}",
+            run.noun(),
+            name(job)
+        ),
+        beside: format!(" Its {attempt} {what}."),
+    })
 }
 
 /// Does the Job controller count no pod of `job` at all — none active, none
@@ -1555,8 +1616,11 @@ mod tests {
             "2026-09-23T03:00:04Z",
         );
         p["status"]["nominatedNodeName"] = json!("node-1");
-        let (status, _, _) = cond_of(&run(&observed(vec![j], vec![p]), &[]));
-        assert_ne!(status, "False");
+        let a = run(&observed(vec![j], vec![p]), &[]);
+        assert_ne!(cond_of(&a).0, "False");
+        // Its placement is an event, and wakes the controller; a recheck
+        // would only spin it.
+        assert_eq!(a.recheck_after, None);
     }
 
     #[test]
@@ -1623,6 +1687,164 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("attempt 1 of at most 7"), "{message}");
+    }
+
+    /// The next attempt's pod, placed and still creating its container.
+    fn container_creating(mut p: Value, placed: &str) -> Value {
+        p["spec"]["nodeName"] = json!("node-1");
+        p["status"] = json!({
+            "phase": "Pending",
+            "conditions": [{ "type": "PodScheduled", "status": "True",
+                             "lastTransitionTime": placed }],
+            "containerStatuses": [{ "name": "runner", "state": { "waiting": {
+                "reason": "ContainerCreating" } } }],
+        });
+        p
+    }
+
+    /// Found by review: attempt 1 was OOM-killed, and while the Job's next
+    /// pod was placed but not yet started (inside the grace), the verdict
+    /// fell through to the last finished Job — an older success — and read
+    /// `True`. The next pod then ran and it read `False` again: every retry
+    /// flipped the condition, and each flip moved "FAILING since".
+    #[test]
+    fn an_oom_killed_attempt_stays_a_failure_while_the_next_pod_starts() {
+        let done = backup_job(
+            "apprafter-backup-29310900",
+            "2026-09-22T03:00:00Z",
+            complete("2026-09-22T03:40:00Z"),
+        );
+        let mut j = backup_job("apprafter-backup-29312340", "2026-09-23T03:00:00Z", vec![]);
+        j["status"]["failed"] = json!(1);
+        j["status"]["active"] = json!(1);
+        let first = oom_killed(
+            pod(&j, "aaaaa", "2026-09-23T03:00:00Z"),
+            "2026-09-23T03:50:00Z",
+        );
+        // Between the attempts: only the killed pod.
+        let between = run(
+            &observed(vec![done.clone(), j.clone()], vec![first.clone()]),
+            &[],
+        );
+        assert_eq!(cond_of(&between).1, REASON_OOM_KILLED);
+        // The next pod, placed, its container being created: inside the
+        // grace, and the killed attempt must still be the verdict.
+        let next = container_creating(
+            pod(&j, "bbbbb", "2026-09-23T03:50:12Z"),
+            "2026-09-23T03:50:12Z",
+        );
+        let creating = assess(
+            true,
+            Ok(&observed(
+                vec![done.clone(), j.clone()],
+                vec![first.clone(), next.clone()],
+            )),
+            &as_prior(&between),
+            parse_time("2026-09-23T03:50:15Z").unwrap(),
+        );
+        let (status, reason, message) = cond_of(&creating);
+        assert_eq!((status, reason), ("False", REASON_OOM_KILLED), "{message}");
+        assert!(
+            message.contains("apprafter-backup-29312340-aaaaa"),
+            "{message}"
+        );
+        // The grace of the pod being created still ends, and nothing else
+        // would wake the controller then.
+        assert!(creating.recheck_after.is_some());
+        // And once it runs, still the same failure — the same bytes.
+        let running_next = running(
+            pod(&j, "bbbbb", "2026-09-23T03:50:12Z"),
+            "2026-09-23T03:50:20Z",
+        );
+        let later = assess(
+            true,
+            Ok(&observed(vec![done, j], vec![first, running_next])),
+            &as_prior(&creating),
+            parse_time("2026-09-23T03:51:00Z").unwrap(),
+        );
+        assert_eq!(later.verdict, creating.verdict);
+    }
+
+    /// Found by review: attempt 1 evicted for node memory pressure, and the
+    /// next pod unschedulable on the memory-pressure taint, eight minutes into
+    /// its grace. The verdict read `True` for up to ten minutes.
+    #[test]
+    fn an_evicted_attempt_stays_a_failure_while_the_next_pod_waits_for_room() {
+        let done = backup_job(
+            "apprafter-backup-29310900",
+            "2026-09-22T03:00:00Z",
+            complete("2026-09-22T03:40:00Z"),
+        );
+        let mut j = backup_job("apprafter-backup-29312340", "2026-09-23T03:00:00Z", vec![]);
+        j["status"]["failed"] = json!(1);
+        j["status"]["active"] = json!(1);
+        let mut first = evicted(pod(&j, "aaaaa", "2026-09-23T03:00:00Z"));
+        first["status"]["message"] = json!("The node was low on resource: memory. ");
+        let mut next = pod(&j, "bbbbb", "2026-09-23T03:50:12Z");
+        next["status"]["conditions"] = json!([{
+            "type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+            "message": "0/1 nodes are available: 1 node(s) had untolerated taint \
+                        {node.kubernetes.io/memory-pressure: }.",
+            "lastTransitionTime": "2026-09-23T03:50:12Z",
+        }]);
+        let o = observed(vec![done, j], vec![first, next]);
+        let inside = assess(
+            true,
+            Ok(&o),
+            &[],
+            parse_time("2026-09-23T03:58:00Z").unwrap(),
+        );
+        let (status, reason, message) = cond_of(&inside);
+        assert_eq!((status, reason), ("False", REASON_EVICTED), "{message}");
+        assert!(message.contains("low on resource: memory"), "{message}");
+        // 03:50:12 + 10 min, from 03:58:00, plus the second past the edge.
+        assert_eq!(inside.recheck_after, Some(StdDuration::from_secs(133)));
+
+        // Past the grace the pod that cannot be placed is the news, and the
+        // eviction that came before it is still said.
+        let past = assess(
+            true,
+            Ok(&o),
+            &as_prior(&inside),
+            parse_time("2026-09-23T04:01:00Z").unwrap(),
+        );
+        let (status, reason, message) = cond_of(&past);
+        assert_eq!(
+            (status, reason),
+            ("False", REASON_UNSCHEDULABLE),
+            "{message}"
+        );
+        for needle in [
+            "its pod apprafter-backup-29312340-bbbbb has not been scheduled",
+            "memory-pressure",
+            "Its attempt 1 of at most 7 was evicted (pod apprafter-backup-29312340-aaaaa): The \
+             node was low on resource: memory.",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in {message}");
+        }
+        assert!(
+            message.ends_with("no later scheduled backup starts."),
+            "the schedule it holds is still the last word: {message}"
+        );
+    }
+
+    #[test]
+    fn an_oom_killed_attempt_stays_a_failure_while_room_is_made_for_the_next() {
+        let mut j = backup_job("apprafter-backup-29312340", "2026-09-23T03:00:00Z", vec![]);
+        j["status"]["failed"] = json!(1);
+        let first = oom_killed(
+            pod(&j, "aaaaa", "2026-09-23T03:00:00Z"),
+            "2026-09-23T03:00:40Z",
+        );
+        let mut next = unschedulable(
+            pod(&j, "bbbbb", "2026-09-23T03:00:55Z"),
+            "2026-09-23T03:00:55Z",
+        );
+        next["status"]["nominatedNodeName"] = json!("node-1");
+        let a = run(&observed(vec![j], vec![first, next]), &[]);
+        assert_eq!(cond_of(&a).0, "False");
+        assert_eq!(cond_of(&a).1, REASON_OOM_KILLED);
+        assert_eq!(a.recheck_after, None);
     }
 
     #[test]

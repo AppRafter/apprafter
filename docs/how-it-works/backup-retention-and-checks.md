@@ -568,7 +568,10 @@ Four rules keep it from raising false alarms, and from going quiet:
   instance being deleted can take three minutes to stop, the kubelet keeps a
   memory-pressure taint for five minutes after the pressure ends, and a node
   that restarts is not ready for a few minutes. A pod the scheduler is making
-  room for by preemption does not count at all.
+  room for by preemption does not count at all. The ten minutes are for the
+  pod the Job is waiting on, never for an attempt that has already failed: a
+  runner killed at its memory limit or evicted counts at once, and stays the
+  verdict while the Job's next pod waits for room or starts.
 - An attempt that ends with an ordinary error is left to the Job: the runner
   records that error itself, and the next attempt may succeed. Only the Job
   giving up turns the condition `False`.
