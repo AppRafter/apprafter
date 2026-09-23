@@ -30,7 +30,7 @@
     "              json    -- file + dotted path (flake.lock).",
     "              command -- argv + cwd + pattern; for package-manager aggregates, where",
     "                         the native tool is a better reader than anything we would write.",
-    "  upstream  where to ask for the newest value. kind: helm | oci-helm | github-release |",
+    "  upstream  where to ask for the newest value. kind: helm | oci-helm | oci | github-release |",
     "            github-branch | docker-hub | crates-io | http-text | none.",
     "  compare   numeric -- compare the digit-runs of both strings, newest wins.",
     "            major   -- report only when the leading number increases (for `@v4`-style",
@@ -916,6 +916,102 @@
       "gate": null,
       "gateGap": "The dev container build is its only consumer, and no workflow builds .devcontainer/ (see tool-k3d). Rebuild the container on the bump commit.",
       "note": "Used only to fetch node itself inside the dev container. A minor with the patch floating, like the rest of that file; upstream tags carry a `v`, and the compare takes the digits."
+    },
+    {
+      "id": "devcontainer-feature-rust",
+      "class": "devcontainer-feature",
+      "title": "dev container feature rust (locked)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".devcontainer/devcontainer-lock.json", "pattern": "\"ghcr\\.io/devcontainers/features/rust:[0-9]+\"\\s*:\\s*\\{\\s*\"version\"\\s*:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "oci", "registry": "ghcr.io", "repository": "devcontainers/features/rust" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "A feature is exercised only by building the dev container -- `npx @devcontainers/cli build --frozen-lockfile` needs a container engine, registry pulls and minutes, and no workflow builds .devcontainer/ (see tool-k3d). Rebuild it on the bump commit.",
+      "note": "The LOCKED feature release from .devcontainer/devcontainer-lock.json -- the version of the feature's install script, not of the tool it installs (that is the `rust-toolchain-minor` row). devcontainer.json names the feature by major (`:1`), and `devcontainer upgrade` moves the lock only within that major; a newer major needs the `:1` in devcontainer.json moved first, and may rename its options."
+    },
+    {
+      "id": "devcontainer-feature-node",
+      "class": "devcontainer-feature",
+      "title": "dev container feature node (locked)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".devcontainer/devcontainer-lock.json", "pattern": "\"ghcr\\.io/devcontainers/features/node:[0-9]+\"\\s*:\\s*\\{\\s*\"version\"\\s*:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "oci", "registry": "ghcr.io", "repository": "devcontainers/features/node" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "A feature is exercised only by building the dev container -- `npx @devcontainers/cli build --frozen-lockfile` needs a container engine, registry pulls and minutes, and no workflow builds .devcontainer/ (see tool-k3d). Rebuild it on the bump commit.",
+      "note": "The LOCKED feature release from .devcontainer/devcontainer-lock.json -- the version of the feature's install script, not of the tool it installs (that is `image-node` and `devcontainer-nvm`). devcontainer.json names the feature by major (`:1`), and `devcontainer upgrade` moves the lock only within that major; a newer major needs the `:1` in devcontainer.json moved first, and may rename its options. Upstream is on major 2 as of 2026-09-23, so this row reads BEHIND until that move is made."
+    },
+    {
+      "id": "devcontainer-feature-go",
+      "class": "devcontainer-feature",
+      "title": "dev container feature go (locked)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".devcontainer/devcontainer-lock.json", "pattern": "\"ghcr\\.io/devcontainers/features/go:[0-9]+\"\\s*:\\s*\\{\\s*\"version\"\\s*:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "oci", "registry": "ghcr.io", "repository": "devcontainers/features/go" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "A feature is exercised only by building the dev container -- `npx @devcontainers/cli build --frozen-lockfile` needs a container engine, registry pulls and minutes, and no workflow builds .devcontainer/ (see tool-k3d). Rebuild it on the bump commit.",
+      "note": "The LOCKED feature release from .devcontainer/devcontainer-lock.json -- the version of the feature's install script, not of the tool it installs (that is `mise-go`). devcontainer.json names the feature by major (`:1`), and `devcontainer upgrade` moves the lock only within that major; a newer major needs the `:1` in devcontainer.json moved first, and may rename its options."
+    },
+    {
+      "id": "devcontainer-feature-kubectl-helm-minikube",
+      "class": "devcontainer-feature",
+      "title": "dev container feature kubectl-helm-minikube (locked)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".devcontainer/devcontainer-lock.json", "pattern": "\"ghcr\\.io/devcontainers/features/kubectl\\-helm\\-minikube:[0-9]+\"\\s*:\\s*\\{\\s*\"version\"\\s*:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "oci", "registry": "ghcr.io", "repository": "devcontainers/features/kubectl-helm-minikube" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "A feature is exercised only by building the dev container -- `npx @devcontainers/cli build --frozen-lockfile` needs a container engine, registry pulls and minutes, and no workflow builds .devcontainer/ (see tool-k3d). Rebuild it on the bump commit.",
+      "note": "The LOCKED feature release from .devcontainer/devcontainer-lock.json -- the version of the feature's install script, not of the tool it installs (that is `devcontainer-kubectl` and `devcontainer-helm`). devcontainer.json names the feature by major (`:1`), and `devcontainer upgrade` moves the lock only within that major; a newer major needs the `:1` in devcontainer.json moved first, and may rename its options."
+    },
+    {
+      "id": "devcontainer-feature-docker-in-docker",
+      "class": "devcontainer-feature",
+      "title": "dev container feature docker-in-docker (locked)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".devcontainer/devcontainer-lock.json", "pattern": "\"ghcr\\.io/devcontainers/features/docker\\-in\\-docker:[0-9]+\"\\s*:\\s*\\{\\s*\"version\"\\s*:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "oci", "registry": "ghcr.io", "repository": "devcontainers/features/docker-in-docker" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "A feature is exercised only by building the dev container -- `npx @devcontainers/cli build --frozen-lockfile` needs a container engine, registry pulls and minutes, and no workflow builds .devcontainer/ (see tool-k3d). Rebuild it on the bump commit.",
+      "note": "The LOCKED feature release from .devcontainer/devcontainer-lock.json -- the version of the feature's install script, not of the tool it installs (that is nothing: the Docker engine it installs floats, as devcontainer.json says). devcontainer.json names the feature by major (`:2`), and `devcontainer upgrade` moves the lock only within that major; a newer major needs the `:2` in devcontainer.json moved first, and may rename its options. Upstream is on major 4 as of 2026-09-23, so this row reads BEHIND until that move is made."
+    },
+    {
+      "id": "devcontainer-feature-git",
+      "class": "devcontainer-feature",
+      "title": "dev container feature git (locked)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".devcontainer/devcontainer-lock.json", "pattern": "\"ghcr\\.io/devcontainers/features/git:[0-9]+\"\\s*:\\s*\\{\\s*\"version\"\\s*:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "oci", "registry": "ghcr.io", "repository": "devcontainers/features/git" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "A feature is exercised only by building the dev container -- `npx @devcontainers/cli build --frozen-lockfile` needs a container engine, registry pulls and minutes, and no workflow builds .devcontainer/ (see tool-k3d). Rebuild it on the bump commit.",
+      "note": "The LOCKED feature release from .devcontainer/devcontainer-lock.json -- the version of the feature's install script, not of the tool it installs (that is nothing: git comes from the Ubuntu packages and floats). devcontainer.json names the feature by major (`:1`), and `devcontainer upgrade` moves the lock only within that major; a newer major needs the `:1` in devcontainer.json moved first, and may rename its options."
     },
 
     {

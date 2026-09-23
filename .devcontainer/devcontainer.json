@@ -26,6 +26,22 @@
 // Ubuntu 22.04 packages, and the editor tools the go feature adds (gopls,
 // staticcheck, golangci-lint, ...). The `:1` / `:2` after each feature is
 // that feature's own major, not a tool version.
+//
+// The FEATURES themselves -- the install scripts published under
+// ghcr.io/devcontainers/features, as distinct from the tool versions they are
+// asked for above -- are locked by devcontainer-lock.json beside this file: a
+// build installs the release and sha256 digest recorded there, not the newest
+// in the major, and `--frozen-lockfile` fails when the lock no longer matches
+// this file. To move them within each major, or after adding or removing a
+// feature, regenerate the lock with the devcontainers CLI and commit it with
+// the change:
+//
+//   npx @devcontainers/cli upgrade --workspace-folder .            # rewrite
+//   npx @devcontainers/cli upgrade --workspace-folder . --dry-run  # preview
+//
+// then rebuild. A new major is an edit of the `:N` below first (its options
+// may be renamed). scripts/upstream-versions.py reads the locked releases (the
+// `devcontainer-feature-*` rows), so a lock left behind shows up as BEHIND.
 {
   "name": "AppRafter Dev",
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu-22.04",

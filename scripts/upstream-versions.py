@@ -403,6 +403,9 @@ def ask_http_text(up: dict) -> str:
 ASK = {
     "helm": ask_helm,
     "oci-helm": ask_oci_helm,
+    # Same registry API, for an OCI artifact that is not a Helm chart (the dev
+    # container features): the tag list of any OCI repository, newest wins.
+    "oci": ask_oci_helm,
     "github-release": ask_github_release,
     "github-branch": ask_github_branch,
     "docker-hub": ask_docker_hub,
