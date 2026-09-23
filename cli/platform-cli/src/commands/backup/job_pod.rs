@@ -28,22 +28,113 @@ use serde_json::Value;
 pub(crate) const RUNNER_UNSCHEDULABLE_DOC: &str =
     "https://docs.apprafter.dev/operator-guide/backup-restore/#runner-unschedulable";
 
-/// How long `backup run` lets its Job's pod stay unschedulable before it
-/// stops waiting.
+/// How long `backup run` lets its Job's pod stay unschedulable, for lack of
+/// room ([`Unplaced::NoRoom`]) or for a rule of the nodes
+/// ([`Unplaced::Other`]), before it stops waiting.
 ///
 /// A pod the scheduler could not place is tried again whenever a pod leaves
 /// the node, so a pod that only waits for room another pod is giving back is
-/// placed within seconds of that pod being gone. What bounds the wait is how
-/// long the departing pod takes to stop: 30 s by Kubernetes' default, 90 s for
-/// a backup runner stopped at its deadline (the chart's
-/// `terminationGracePeriodSeconds`), and about 60 s measured on a full 4 GB
-/// node mid-upgrade, where the new operator and autoscaler pods waited for the
-/// old ones. Two minutes covers all three. A pod still unschedulable after
-/// that is waiting for room that nothing is about to give back.
+/// placed within seconds of that pod being gone. While any pod in the cluster
+/// is stopping, the room it gives back may be what the runner waits for, and
+/// `backup run` does not count that time at all ([`stopping_pods`]): a CNPG
+/// instance being deleted can take three minutes to shut down. What is left
+/// is scheduling latency and the moment between a pod's deletion and its
+/// first sighting, so two minutes of no room with nothing stopping is a node
+/// that nothing is about to make room on.
 ///
 /// A pod whose room is being made by preemption is not unschedulable in this
 /// sense. It is [`JobPod::Preempting`], and the clock does not run for it.
 pub(crate) const UNSCHEDULABLE_GRACE: Duration = Duration::from_secs(120);
+
+/// How long `backup run` lets its Job's pod be kept off by a condition of
+/// the node ([`Unplaced::NodeCondition`]) before it stops waiting.
+///
+/// Such a condition lifts by itself, but not at once. The kubelet keeps a
+/// memory- or disk-pressure taint for five minutes after the pressure ends
+/// (`evictionPressureTransitionPeriod`), and a runner evicted by that pressure
+/// is retried straight into it. A node restarting is not ready for a few
+/// minutes. Ten minutes covers both. A condition still there after that is
+/// not about to lift.
+pub(crate) const NODE_CONDITION_GRACE: Duration = Duration::from_secs(600);
+
+/// Why the scheduler placed a pod on no node, read from the message it
+/// writes on the pod (`0/1 nodes are available: 1 Insufficient memory. …`).
+///
+/// Only a lack of room is answered by freeing memory or a bigger machine, so
+/// only [`Unplaced::NoRoom`] gets that advice. The message itself is printed
+/// in every case: it is the scheduler's own account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Unplaced {
+    /// The nodes the pod may use lack room for it: the scheduler counts at
+    /// least one node short of a resource (`Insufficient memory`, `Too many
+    /// pods`), and no node held off by a condition that lifts by itself.
+    /// A node the pod can never use (a taint it does not tolerate) does not
+    /// change what is short on the one it can.
+    NoRoom,
+    /// A node is held off by a condition of its own that lifts when the
+    /// condition ends: a `node.kubernetes.io/…` taint (memory, disk or PID
+    /// pressure, not ready, unreachable) or a cordon (`a cordon`). Each one
+    /// is named once.
+    NodeCondition(Vec<String>),
+    /// Neither: every reason is another rule of the nodes (a taint the runner
+    /// does not tolerate, an affinity), or the message could not be read.
+    Other,
+}
+
+/// The kind of [`Unplaced`] a message says. See there.
+pub(crate) fn unplaced(message: &str) -> Unplaced {
+    let Some((_, rest)) = message.split_once("nodes are available: ") else {
+        return Unplaced::Other;
+    };
+    // The per-node reasons end at the first sentence break; what follows is
+    // the scheduler's account of preemption.
+    let reasons = rest.split(". ").next().unwrap_or("").trim_end_matches('.');
+    let mut room = false;
+    let mut lifting: Vec<String> = Vec::new();
+    // Each reason is `<node count> <reason>`. Before Kubernetes 1.25 a taint
+    // read `node(s) had taint {…}, that the pod didn't tolerate`, whose tail
+    // becomes a piece of its own here and matches nothing.
+    for piece in reasons.split(", ") {
+        let reason = piece.trim().split_once(' ').map_or("", |(_, r)| r);
+        let condition = if reason.starts_with("Insufficient ") || reason == "Too many pods" {
+            room = true;
+            None
+        } else if reason == "node(s) were unschedulable" {
+            Some("a cordon".to_string())
+        } else {
+            taint_key(reason).filter(|k| k.starts_with("node.kubernetes.io/"))
+        };
+        if let Some(c) = condition {
+            if !lifting.contains(&c) {
+                lifting.push(c);
+            }
+        }
+    }
+    if !lifting.is_empty() {
+        Unplaced::NodeCondition(lifting)
+    } else if room {
+        Unplaced::NoRoom
+    } else {
+        Unplaced::Other
+    }
+}
+
+/// The key of the taint a reason names: `node(s) had untolerated taint
+/// {node.kubernetes.io/memory-pressure: }` gives
+/// `node.kubernetes.io/memory-pressure`.
+fn taint_key(reason: &str) -> Option<String> {
+    let (_, after) = reason.split_once("taint {")?;
+    let key = after.split([':', '}']).next()?.trim();
+    (!key.is_empty()).then(|| key.to_string())
+}
+
+/// How long `backup run` waits for a pod kept off for `cause`.
+pub(crate) fn grace_for(cause: &Unplaced) -> Duration {
+    match cause {
+        Unplaced::NodeCondition(_) => NODE_CONDITION_GRACE,
+        Unplaced::NoRoom | Unplaced::Other => UNSCHEDULABLE_GRACE,
+    }
+}
 
 /// A backup Job's pod as seen by the two commands that report on a Job that
 /// has not finished.
@@ -284,29 +375,41 @@ fn reason_with_message(reason: &str, message: &str) -> Option<String> {
 /// the Job itself, so it is watching from the pod's first minute.
 ///
 /// The streak ends on any observation that finds the pod in another state,
-/// and when the Job's current pod is a different one. A retry's new pod
-/// starts its own streak.
+/// when the Job's current pod is a different one, and when the kind of
+/// reason changes ([`Unplaced`]): a pod kept off by a pressure taint for five
+/// minutes that then finds no room has begun a new wait, not spent one. A
+/// retry's new pod starts its own streak.
 #[derive(Debug, Default)]
 pub(crate) struct UnschedulableClock {
-    streak: Option<(String, Instant)>,
+    streak: Option<(String, std::mem::Discriminant<Unplaced>, Instant)>,
 }
 
 impl UnschedulableClock {
     /// Record one observation. Returns how long the same pod has been
-    /// unschedulable, `Some(ZERO)` on the observation that starts a streak,
-    /// and `None` when it is not unschedulable now.
+    /// unschedulable for the same kind of reason, `Some(ZERO)` on the
+    /// observation that starts a streak, and `None` when it is not
+    /// unschedulable now.
     pub(crate) fn observe(&mut self, state: &JobPod, now: Instant) -> Option<Duration> {
-        let JobPod::Unschedulable { uid, .. } = state else {
+        let JobPod::Unschedulable { uid, message } = state else {
             self.streak = None;
             return None;
         };
+        let kind = std::mem::discriminant(&unplaced(message));
         match &self.streak {
-            Some((seen, since)) if seen == uid => Some(now.saturating_duration_since(*since)),
+            Some((seen, k, since)) if seen == uid && *k == kind => {
+                Some(now.saturating_duration_since(*since))
+            }
             _ => {
-                self.streak = Some((uid.clone(), now));
+                self.streak = Some((uid.clone(), kind, now));
                 Some(Duration::ZERO)
             }
         }
+    }
+
+    /// End the streak without an observation: the time that follows does
+    /// not count toward it.
+    pub(crate) fn reset(&mut self) {
+        self.streak = None;
     }
 }
 
@@ -343,10 +446,13 @@ pub(crate) fn status_outcome(state: &JobPod) -> Option<String> {
 /// this one runs or its deadline stops it. A chart that sets no deadline
 /// holds the schedule until the Job is deleted. A manual Job has no owner and
 /// holds nothing. Only the first kind gets that line.
+///
+/// What it says depends on the scheduler's reason ([`Unplaced`]): only a lack
+/// of room gets the runner's requests and `apprafter top`.
 pub(crate) fn status_hint(job: &Value, state: &JobPod) -> Option<String> {
-    if !matches!(state, JobPod::Unschedulable { .. }) {
+    let JobPod::Unschedulable { message, .. } = state else {
         return None;
-    }
+    };
     let scheduled = job
         .pointer("/metadata/ownerReferences")
         .and_then(Value::as_array)
@@ -354,13 +460,28 @@ pub(crate) fn status_hint(job: &Value, state: &JobPod) -> Option<String> {
             refs.iter()
                 .any(|r| r.get("kind").and_then(Value::as_str) == Some("CronJob"))
         });
-    let mut out = match runner_requests(job) {
-        Some(asks) => {
-            format!("    No node has room for the backup runner's pod, which asks for {asks}.\n")
+    let mut out = match unplaced(message) {
+        Unplaced::NoRoom => {
+            let mut room = match runner_requests(job) {
+                Some(asks) => format!(
+                    "    No node has room for the backup runner's pod, which asks for {asks}.\n"
+                ),
+                None => "    No node has room for the backup runner's pod.\n".to_string(),
+            };
+            room.push_str(
+                "    `apprafter top` shows how much of each node is requested, and by what.\n",
+            );
+            room
         }
-        None => "    No node has room for the backup runner's pod.\n".to_string(),
+        Unplaced::NodeCondition(what) => format!(
+            "    Its pod is kept off by {}, a condition of the node that lifts when it ends. A \
+             memory- or disk-pressure taint stays five minutes after the pressure does.\n",
+            what.join(" and ")
+        ),
+        Unplaced::Other => "    The scheduler's reasons are not a lack of room: no node accepts \
+                            the pod until they change.\n"
+            .to_string(),
     };
-    out.push_str("    `apprafter top` shows how much of each node is requested, and by what.\n");
     if scheduled {
         out.push_str(
             "    Until this Job runs or its deadline stops it, the schedule starts no other \
@@ -385,7 +506,7 @@ pub(crate) fn progress_note(
         JobPod::Unschedulable { message, .. } => format!(
             "  … its pod cannot be scheduled ({} so far, giving up at {}): {message}",
             elapsed(unschedulable_for.unwrap_or(Duration::ZERO)),
-            elapsed(UNSCHEDULABLE_GRACE),
+            elapsed(grace_for(&unplaced(message))),
         ),
         JobPod::Preempting { node } => format!(
             "  … waiting for room on {node} while the pods evicted there stop ({})",
@@ -472,45 +593,248 @@ pub(crate) fn runner_requests(job: &Value) -> Option<String> {
     }
 }
 
-/// What `backup run` prints when it gives up on a Job whose pod stayed
-/// unschedulable past [`UNSCHEDULABLE_GRACE`]. It goes to stdout, one fact per
-/// line, just before the typed error: inside the error, miette would wrap the
-/// scheduler's message and split the URL across lines.
-///
-/// `requests` is [`runner_requests`] of the Job. `deleted` is the outcome of
-/// deleting the Job; `Err` carries why it could not be deleted.
-pub(crate) fn unschedulable_report(
-    namespace: &str,
-    name: &str,
-    message: &str,
-    requests: Option<&str>,
-    deleted: Result<(), String>,
-) -> String {
-    let asks = match requests {
-        Some(r) => format!(
-            "    The runner asks for {r}. The scheduled backup asks for the same, so it cannot \
-             start either.\n"
-        ),
-        None => {
-            "    The scheduled backup asks for the same, so it cannot start either.\n".to_string()
+/// What `backup run` knows about its Job when it stops waiting for the pod.
+#[derive(Debug)]
+pub(crate) struct GiveUp<'a> {
+    pub(crate) namespace: &'a str,
+    pub(crate) name: &'a str,
+    /// The scheduler's message, as the pod carries it.
+    pub(crate) message: &'a str,
+    /// What that message says ([`unplaced`]).
+    pub(crate) cause: &'a Unplaced,
+    /// [`runner_requests`] of the Job.
+    pub(crate) requests: Option<&'a str>,
+    /// Attempts of this Job that failed before this one (`status.failed`).
+    pub(crate) failed: u64,
+    /// Why the newest of those failed ([`last_failed_attempt`]).
+    pub(crate) last_failure: Option<&'a str>,
+}
+
+impl GiveUp<'_> {
+    /// `The backup never started` for a first attempt; `Attempt 2 of the
+    /// backup could not be scheduled` once an attempt has run and failed,
+    /// which did start.
+    fn headline(&self) -> String {
+        let why = match self.cause {
+            Unplaced::NoRoom => "no node has room for its pod".to_string(),
+            Unplaced::NodeCondition(what) => {
+                format!("its pod was kept off by {}", what.join(" and "))
+            }
+            Unplaced::Other => "no node accepts its pod".to_string(),
+        };
+        if self.failed == 0 {
+            format!("The backup never started: {why}.")
+        } else {
+            format!(
+                "Attempt {} of the backup could not be scheduled: {why}.",
+                self.failed + 1
+            )
         }
-    };
-    let job_line = match deleted {
+    }
+}
+
+/// What `backup run` prints when it gives up on a Job whose pod stayed
+/// unschedulable past [`grace_for`] its reason. It goes to stdout, one fact
+/// per line, just before the typed error: inside the error, miette would
+/// wrap the scheduler's message and split the URL across lines.
+///
+/// `deleted` is the outcome of deleting the Job; `Err` carries why it could
+/// not be deleted.
+pub(crate) fn unschedulable_report(give_up: &GiveUp<'_>, deleted: Result<(), String>) -> String {
+    let GiveUp {
+        namespace,
+        name,
+        message,
+        cause,
+        requests,
+        failed,
+        last_failure,
+    } = give_up;
+    let mut out = format!(
+        "  ✗ {}\n    The scheduler says: {message}\n",
+        give_up.headline()
+    );
+    match cause {
+        Unplaced::NoRoom => {
+            match requests {
+                Some(r) => out.push_str(&format!(
+                    "    The runner asks for {r}. The scheduled backup asks for the same, so it \
+                     cannot start either.\n"
+                )),
+                None => out.push_str(
+                    "    The scheduled backup asks for the same, so it cannot start either.\n",
+                ),
+            }
+            out.push_str(
+                "    `apprafter top` shows how much of each node is requested, and by what.\n",
+            );
+        }
+        Unplaced::NodeCondition(_) => out.push_str(&format!(
+            "    That lifts when the node's condition ends, but it was still there after {}. \
+             The scheduled backup is kept off the same way while it lasts.\n",
+            elapsed(NODE_CONDITION_GRACE)
+        )),
+        Unplaced::Other => out.push_str(
+            "    That is not a lack of room: no node accepts the pod until it changes, and the \
+             scheduled backup meets the same rules.\n",
+        ),
+    }
+    if *failed > 0 {
+        let before = if *failed == 1 {
+            "1 attempt".to_string()
+        } else {
+            format!("{failed} attempts")
+        };
+        let why = match (last_failure, *failed) {
+            (Some(w), 1) => format!(" ({w})"),
+            (Some(w), _) => format!(" (the last: {w})"),
+            (None, _) => String::new(),
+        };
+        out.push_str(&format!(
+            "    Before it, {before} failed{why}. `apprafter backup status` shows the runner's \
+             lastError if one of them recorded it.\n"
+        ));
+    }
+    out.push_str(&format!(
+        "    What to check and change: {RUNNER_UNSCHEDULABLE_DOC}\n"
+    ));
+    out.push_str(&match deleted {
         Ok(()) => "    The Job is deleted, so it will not start later on its own, at a time \
                    nobody chose and possibly beside the scheduled backup.\n"
             .to_string(),
         Err(e) => format!(
             "    Deleting the Job failed ({e}). Delete it yourself, or it starts on its own \
-             whenever room appears:\n      kubectl -n {namespace} delete job {name}\n"
+             whenever a node takes it:\n      kubectl -n {namespace} delete job {name}\n"
         ),
+    });
+    out
+}
+
+/// The text and the help of the typed error `backup run` fails with after
+/// [`unschedulable_report`], for a wait of `waited`: `(what, help)`. The
+/// error reads `backup Job <name> <what>`.
+///
+/// Short on purpose: the report above it carries the scheduler's message and
+/// the link, which miette would wrap.
+pub(crate) fn give_up_error(give_up: &GiveUp<'_>, waited: Duration) -> (String, String) {
+    let why = match give_up.cause {
+        Unplaced::NoRoom => "no node had room for its pod".to_string(),
+        Unplaced::NodeCondition(what) => format!("its pod was kept off by {}", what.join(" and ")),
+        Unplaced::Other => "no node accepted its pod".to_string(),
+    };
+    let what = if give_up.failed == 0 {
+        format!("never started: {why} for {}", elapsed(waited))
+    } else {
+        format!(
+            "could not schedule attempt {} for {}, after {}: {why}",
+            give_up.failed + 1,
+            elapsed(waited),
+            failed_attempts(give_up.failed)
+        )
+    };
+    let help = match give_up.cause {
+        Unplaced::NoRoom => "The lines above give the scheduler's reason and what the runner asks \
+                             for. `apprafter top` shows how much of each node is requested, and \
+                             by what: free enough for the runner, or move to a bigger machine, \
+                             then run `apprafter backup run` again. Until then the scheduled \
+                             backup cannot start either."
+            .to_string(),
+        Unplaced::NodeCondition(what) => format!(
+            "The lines above give the scheduler's reason. {} keeps the runner off the node until \
+             the node's condition ends; run `apprafter backup run` again once it has. Until then \
+             the scheduled backup is kept off the same way.",
+            what.join(" and ")
+        ),
+        Unplaced::Other => "The lines above give the scheduler's reason, and it is not a lack of \
+                            room: no node accepts the runner's pod until it changes. Run \
+                            `apprafter backup run` again once it has; the scheduled backup meets \
+                            the same rules."
+            .to_string(),
+    };
+    (what, help)
+}
+
+/// Why the newest failed attempt of `job` failed, from its pod: the pod's own
+/// reason (`Evicted: The node was low on resource: memory.`), else its
+/// container's (`Error (exit 1)`), else `Failed`. `None` when no pod of the
+/// Job has failed.
+pub(crate) fn last_failed_attempt(job: &Value, pods: &[Value]) -> Option<String> {
+    let pod = pods
+        .iter()
+        .filter(|p| owned_by(p, job))
+        .filter(|p| p.pointer("/status/phase").and_then(Value::as_str) == Some("Failed"))
+        .max_by_key(|p| {
+            p.pointer("/metadata/creationTimestamp")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+        })?;
+    let text = |ptr: &str| pod.pointer(ptr).and_then(Value::as_str).unwrap_or("");
+    if let Some(r) = reason_with_message(text("/status/reason"), text("/status/message")) {
+        return Some(r);
+    }
+    let terminated = ["/status/initContainerStatuses", "/status/containerStatuses"]
+        .iter()
+        .filter_map(|p| pod.pointer(p).and_then(Value::as_array))
+        .flatten()
+        .find_map(|s| s.pointer("/state/terminated"))
+        .filter(|t| t.get("exitCode").and_then(Value::as_i64) != Some(0));
+    Some(match terminated {
+        Some(t) => {
+            let reason = t.get("reason").and_then(Value::as_str).unwrap_or("Failed");
+            match t.get("exitCode").and_then(Value::as_i64) {
+                Some(code) => format!("{reason} (exit {code})"),
+                None => reason.to_string(),
+            }
+        }
+        None => "Failed".to_string(),
+    })
+}
+
+/// The pods, as `namespace/name`, that are placed on a node and being
+/// deleted: the room they hold is given back when they are gone, and the
+/// scheduler then tries an unschedulable pod again. Sorted.
+///
+/// A finished pod holds no room, and one never placed held none.
+pub(crate) fn stopping_pods(pods: &[Value]) -> Vec<String> {
+    let mut out: Vec<String> = pods
+        .iter()
+        .filter(|p| p.pointer("/metadata/deletionTimestamp").is_some())
+        .filter(|p| {
+            p.pointer("/spec/nodeName")
+                .and_then(Value::as_str)
+                .is_some_and(|n| !n.is_empty())
+        })
+        .filter(|p| {
+            !matches!(
+                p.pointer("/status/phase").and_then(Value::as_str),
+                Some("Succeeded" | "Failed")
+            )
+        })
+        .map(|p| {
+            let field = |k: &str| {
+                p.pointer(&format!("/metadata/{k}"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            };
+            format!("{}/{}", field("namespace"), field("name"))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A progress line for `backup run` while its pod has no room and pods are
+/// stopping ([`stopping_pods`]): the unschedulable clock does not run.
+pub(crate) fn stopping_note(stopping: &[String], waited: Duration) -> String {
+    let pods = if stopping.len() == 1 {
+        "1 pod stops and gives its".to_string()
+    } else {
+        format!("{} pods stop and give theirs", stopping.len())
     };
     format!(
-        "  ✗ The backup never started: no node has room for its pod.\n    \
-         The scheduler says: {message}\n\
-         {asks}    \
-         `apprafter top` shows how much of each node is requested, and by what.\n    \
-         What to check and change: {RUNNER_UNSCHEDULABLE_DOC}\n\
-         {job_line}"
+        "  … no room for its pod yet; waiting while {pods} back: {} ({})",
+        stopping.join(", "),
+        elapsed(waited)
     )
 }
 
@@ -1000,13 +1324,7 @@ mod tests {
 
     #[test]
     fn the_give_up_report_carries_the_reason_the_requests_top_the_docs_and_the_job() {
-        let r = unschedulable_report(
-            "apprafter-system",
-            "apprafter-backup-manual-x",
-            INSUFFICIENT,
-            Some("256Mi of memory and 100m of CPU"),
-            Ok(()),
-        );
+        let r = unschedulable_report(&give_up(INSUFFICIENT, &Unplaced::NoRoom, 0), Ok(()));
         assert!(r.contains("never started"), "{r}");
         assert!(
             r.contains(&format!("The scheduler says: {INSUFFICIENT}\n")),
@@ -1026,13 +1344,11 @@ mod tests {
         );
         assert!(r.contains("The Job is deleted"), "{r}");
 
-        let r = unschedulable_report(
-            "apprafter-system",
-            "apprafter-backup-manual-x",
-            INSUFFICIENT,
-            None,
-            Err("forbidden".to_string()),
-        );
+        let no_requests = GiveUp {
+            requests: None,
+            ..give_up(INSUFFICIENT, &Unplaced::NoRoom, 0)
+        };
+        let r = unschedulable_report(&no_requests, Err("forbidden".to_string()));
         assert!(!r.contains("The runner asks for"), "{r}");
         assert!(r.contains("Deleting the Job failed (forbidden)"), "{r}");
         assert!(
@@ -1085,6 +1401,344 @@ mod tests {
                 .any(|l| l.starts_with('#') && l.trim_end().ends_with(&format!("{{#{anchor}}}"))),
             "{} has no heading with {{#{anchor}}}",
             file.display()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Why the scheduler placed no pod: room, a node condition, or neither
+    // ------------------------------------------------------------------
+
+    /// The kubelet taints a node under memory pressure, and keeps the taint
+    /// for five minutes after the pressure ends. A runner evicted by that
+    /// pressure is retried into this.
+    const MEMORY_PRESSURE: &str = "0/1 nodes are available: 1 node(s) had untolerated taint \
+                                   {node.kubernetes.io/memory-pressure: }. preemption: 0/1 nodes \
+                                   are available: 1 Preemption is not helpful for scheduling.";
+
+    #[test]
+    fn the_schedulers_reasons_are_read_as_room_a_node_condition_or_neither() {
+        let cases: &[(&str, Unplaced)] = &[
+            // The live run's message.
+            (INSUFFICIENT, Unplaced::NoRoom),
+            (
+                "0/1 nodes are available: 1 Insufficient cpu, 1 Insufficient memory.",
+                Unplaced::NoRoom,
+            ),
+            (
+                "0/1 nodes are available: 1 Too many pods. preemption: 0/1 nodes are available: \
+                 1 No preemption victims found for incoming pod.",
+                Unplaced::NoRoom,
+            ),
+            // A node the runner can never use does not change what is
+            // short on the one it can.
+            (
+                "0/3 nodes are available: 1 Insufficient memory, 2 node(s) had untolerated taint \
+                 {node-role.kubernetes.io/control-plane: }. preemption: 0/3 nodes are available: \
+                 1 No preemption victims found for incoming pod, 2 Preemption is not helpful for \
+                 scheduling.",
+                Unplaced::NoRoom,
+            ),
+            (
+                MEMORY_PRESSURE,
+                Unplaced::NodeCondition(vec!["node.kubernetes.io/memory-pressure".to_string()]),
+            ),
+            (
+                "0/1 nodes are available: 1 node(s) had untolerated taint \
+                 {node.kubernetes.io/not-ready: }.",
+                Unplaced::NodeCondition(vec!["node.kubernetes.io/not-ready".to_string()]),
+            ),
+            // The form Kubernetes used before 1.25, whose clause carries
+            // a comma of its own.
+            (
+                "0/1 nodes are available: 1 node(s) had taint {node.kubernetes.io/disk-pressure: \
+                 }, that the pod didn't tolerate.",
+                Unplaced::NodeCondition(vec!["node.kubernetes.io/disk-pressure".to_string()]),
+            ),
+            (
+                "0/1 nodes are available: 1 node(s) were unschedulable. preemption: 0/1 nodes \
+                 are available: 1 Preemption is not helpful for scheduling.",
+                Unplaced::NodeCondition(vec!["a cordon".to_string()]),
+            ),
+            // The last reason ends the sentence with its full stop.
+            (
+                "0/1 nodes are available: 1 node(s) were unschedulable.",
+                Unplaced::NodeCondition(vec!["a cordon".to_string()]),
+            ),
+            (
+                "0/1 nodes are available: 1 Too many pods.",
+                Unplaced::NoRoom,
+            ),
+            // Room short on one node while another is under pressure: the
+            // pressure may lift and that node take it.
+            (
+                "0/2 nodes are available: 1 Insufficient memory, 1 node(s) had untolerated taint \
+                 {node.kubernetes.io/memory-pressure: }.",
+                Unplaced::NodeCondition(vec!["node.kubernetes.io/memory-pressure".to_string()]),
+            ),
+            (
+                "0/1 nodes are available: 1 node(s) had untolerated taint {dedicated: gpu}.",
+                Unplaced::Other,
+            ),
+            (
+                "0/1 nodes are available: 1 node(s) didn't match Pod's node affinity/selector.",
+                Unplaced::Other,
+            ),
+            ("the scheduler gave no reason", Unplaced::Other),
+            ("", Unplaced::Other),
+        ];
+        for (message, want) in cases {
+            assert_eq!(&unplaced(message), want, "{message}");
+        }
+    }
+
+    #[test]
+    fn a_node_condition_is_waited_for_longer_than_the_kubelet_keeps_its_taint() {
+        // evictionPressureTransitionPeriod: 5 minutes by default.
+        assert!(grace_for(&Unplaced::NodeCondition(vec![])) > Duration::from_secs(300));
+        assert_eq!(grace_for(&Unplaced::NoRoom), UNSCHEDULABLE_GRACE);
+        assert_eq!(grace_for(&Unplaced::Other), UNSCHEDULABLE_GRACE);
+    }
+
+    fn unsched_with(uid: &str, message: &str) -> JobPod {
+        JobPod::Unschedulable {
+            uid: uid.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_new_kind_of_reason_starts_a_new_streak() {
+        // Five minutes kept off by a pressure taint, then the taint lifts
+        // and there is no room: that is a new wait, not one already spent.
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut c = UnschedulableClock::default();
+        assert_eq!(
+            c.observe(&unsched_with("a", MEMORY_PRESSURE), t0),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            c.observe(&unsched_with("a", MEMORY_PRESSURE), t0 + s(300)),
+            Some(s(300))
+        );
+        assert_eq!(c.observe(&unsched("a"), t0 + s(305)), Some(Duration::ZERO));
+        assert_eq!(c.observe(&unsched("a"), t0 + s(310)), Some(s(5)));
+        c.reset();
+        assert_eq!(c.observe(&unsched("a"), t0 + s(315)), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn only_a_lack_of_room_gets_the_room_advice() {
+        let mut manual = job();
+        manual["spec"] = json!({"template": {"spec": {"containers": [{
+            "resources": {"requests": {"cpu": "100m", "memory": "256Mi"}}
+        }]}}});
+        let h = status_hint(&manual, &unsched_with("a", MEMORY_PRESSURE)).unwrap();
+        assert!(
+            h.contains("kept off by node.kubernetes.io/memory-pressure"),
+            "{h}"
+        );
+        assert!(h.contains("five minutes after"), "{h}");
+        assert!(h.contains(RUNNER_UNSCHEDULABLE_DOC), "{h}");
+        for wrong in ["room", "256Mi", "apprafter top"] {
+            assert!(!h.contains(wrong), "{wrong} in {h}");
+        }
+        let h = status_hint(
+            &manual,
+            &unsched_with(
+                "a",
+                "0/1 nodes are available: 1 node(s) had untolerated taint {dedicated: gpu}.",
+            ),
+        )
+        .unwrap();
+        assert!(h.contains("not a lack of room"), "{h}");
+        assert!(!h.contains("256Mi"), "{h}");
+        assert!(!h.contains("apprafter top"), "{h}");
+        let n = progress_note(
+            &unsched_with("a", MEMORY_PRESSURE),
+            Duration::from_secs(95),
+            Some(Duration::from_secs(90)),
+        );
+        assert!(n.contains("giving up at 10m 0s"), "{n}");
+    }
+
+    fn give_up<'a>(message: &'a str, cause: &'a Unplaced, failed: u64) -> GiveUp<'a> {
+        GiveUp {
+            namespace: "apprafter-system",
+            name: "apprafter-backup-manual-x",
+            message,
+            cause,
+            requests: Some("256Mi of memory and 100m of CPU"),
+            failed,
+            last_failure: (failed > 0).then_some(
+                "Evicted: The node was low on resource: memory. Threshold quantity: 100Mi, \
+                 available: 87004Ki.",
+            ),
+        }
+    }
+
+    #[test]
+    fn an_attempt_after_one_that_failed_is_not_reported_as_never_started() {
+        let r = unschedulable_report(&give_up(INSUFFICIENT, &Unplaced::NoRoom, 1), Ok(()));
+        assert!(!r.contains("never started"), "{r}");
+        assert!(
+            r.contains("✗ Attempt 2 of the backup could not be scheduled: no node has room"),
+            "{r}"
+        );
+        assert!(
+            r.contains("Before it, 1 attempt failed (Evicted: The node was low on resource"),
+            "{r}"
+        );
+        assert!(r.contains("lastError"), "{r}");
+        let (what, _) = give_up_error(
+            &give_up(INSUFFICIENT, &Unplaced::NoRoom, 2),
+            Duration::from_secs(123),
+        );
+        assert_eq!(
+            what,
+            "could not schedule attempt 3 for 2m 3s, after 2 failed attempts: no node had room \
+             for its pod"
+        );
+        // With no attempt before it, it is the first and never started.
+        let (what, help) = give_up_error(
+            &give_up(INSUFFICIENT, &Unplaced::NoRoom, 0),
+            Duration::from_secs(123),
+        );
+        assert_eq!(
+            what,
+            "never started: no node had room for its pod for 2m 3s"
+        );
+        assert!(help.contains("`apprafter top`"), "{help}");
+        assert!(help.contains("`apprafter backup run`"), "{help}");
+        assert!(
+            help.contains("the scheduled backup cannot start either"),
+            "{help}"
+        );
+    }
+
+    #[test]
+    fn a_give_up_on_a_node_condition_names_it_and_gives_no_room_advice() {
+        let cause = Unplaced::NodeCondition(vec!["node.kubernetes.io/memory-pressure".to_string()]);
+        let r = unschedulable_report(&give_up(MEMORY_PRESSURE, &cause, 0), Ok(()));
+        assert!(
+            r.contains(
+                "✗ The backup never started: its pod was kept off by \
+                 node.kubernetes.io/memory-pressure."
+            ),
+            "{r}"
+        );
+        assert!(
+            r.contains(&format!("The scheduler says: {MEMORY_PRESSURE}\n")),
+            "{r}"
+        );
+        assert!(r.contains("still there after 10m 0s"), "{r}");
+        assert!(r.contains(RUNNER_UNSCHEDULABLE_DOC), "{r}");
+        for wrong in ["room", "256Mi", "apprafter top", "asks for"] {
+            assert!(!r.contains(wrong), "{wrong} in {r}");
+        }
+        let (what, help) =
+            give_up_error(&give_up(MEMORY_PRESSURE, &cause, 0), NODE_CONDITION_GRACE);
+        assert_eq!(
+            what,
+            "never started: its pod was kept off by node.kubernetes.io/memory-pressure for 10m 0s"
+        );
+        assert!(
+            help.contains("node.kubernetes.io/memory-pressure"),
+            "{help}"
+        );
+        assert!(help.contains("`apprafter backup run`"), "{help}");
+        for wrong in ["room", "apprafter top", "bigger machine"] {
+            assert!(!help.contains(wrong), "{wrong} in {help}");
+        }
+
+        let other = "0/1 nodes are available: 1 node(s) had untolerated taint {dedicated: gpu}.";
+        let r = unschedulable_report(&give_up(other, &Unplaced::Other, 0), Ok(()));
+        assert!(
+            r.contains("✗ The backup never started: no node accepts its pod."),
+            "{r}"
+        );
+        assert!(r.contains("not a lack of room"), "{r}");
+        assert!(!r.contains("256Mi"), "{r}");
+        assert!(!r.contains("apprafter top"), "{r}");
+        let (what, help) = give_up_error(&give_up(other, &Unplaced::Other, 0), UNSCHEDULABLE_GRACE);
+        assert_eq!(what, "never started: no node accepted its pod for 2m 0s");
+        assert!(help.contains("not a lack of room"), "{help}");
+    }
+
+    #[test]
+    fn the_last_failed_attempt_says_why_it_failed() {
+        let mut evicted = running_pod();
+        evicted["metadata"]["creationTimestamp"] = json!("2026-09-23T14:00:00Z");
+        evicted["status"] = json!({
+            "phase": "Failed", "reason": "Evicted",
+            "message": "The node was low on resource: memory."
+        });
+        let mut crashed = running_pod();
+        crashed["metadata"]["creationTimestamp"] = json!("2026-09-23T14:10:00Z");
+        crashed["status"] = json!({"phase": "Failed", "containerStatuses": [{
+            "name": "runner", "state": {"terminated": {"reason": "Error", "exitCode": 1}}
+        }]});
+        assert_eq!(
+            last_failed_attempt(&job(), &[evicted.clone()]).as_deref(),
+            Some("Evicted: The node was low on resource: memory.")
+        );
+        // The newest failed attempt, and the live pod is not one.
+        assert_eq!(
+            last_failed_attempt(
+                &job(),
+                &[evicted.clone(), crashed.clone(), unschedulable_pod()]
+            )
+            .as_deref(),
+            Some("Error (exit 1)")
+        );
+        let mut bare = crashed.clone();
+        bare["status"] = json!({"phase": "Failed"});
+        assert_eq!(
+            last_failed_attempt(&job(), &[bare]).as_deref(),
+            Some("Failed")
+        );
+        let mut foreign = evicted;
+        foreign["metadata"]["ownerReferences"] = owner("someone-else");
+        assert_eq!(
+            last_failed_attempt(&job(), &[foreign, unschedulable_pod()]),
+            None
+        );
+    }
+
+    #[test]
+    fn only_placed_pods_being_deleted_are_giving_room_back() {
+        let mut stopping = running_pod();
+        stopping["metadata"]["namespace"] = json!("demo");
+        stopping["metadata"]["name"] = json!("shop-pg-1");
+        stopping["metadata"]["deletionTimestamp"] = json!("2026-09-23T15:02:00Z");
+        let mut unplaced_deleting = unschedulable_pod();
+        unplaced_deleting["metadata"]["deletionTimestamp"] = json!("2026-09-23T15:02:00Z");
+        let mut finished_deleting = stopping.clone();
+        finished_deleting["metadata"]["name"] = json!("done");
+        finished_deleting["status"]["phase"] = json!("Succeeded");
+        assert_eq!(
+            stopping_pods(&[
+                running_pod(),
+                stopping,
+                unplaced_deleting,
+                finished_deleting,
+                unschedulable_pod()
+            ]),
+            vec!["demo/shop-pg-1".to_string()]
+        );
+        assert!(stopping_pods(&[running_pod()]).is_empty());
+    }
+
+    #[test]
+    fn a_wait_for_pods_that_are_stopping_names_them() {
+        let n = stopping_note(
+            &["demo/shop-pg-1".to_string(), "demo/vault-0".to_string()],
+            Duration::from_secs(150),
+        );
+        assert_eq!(
+            n,
+            "  … no room for its pod yet; waiting while 2 pods stop and give theirs back: \
+             demo/shop-pg-1, demo/vault-0 (2m 30s)"
         );
     }
 }

@@ -362,10 +362,10 @@ Job is created, and `--timeout <minutes>` bounds the wait — neither cancels
 anything, because the Job belongs to the cluster once it exists. Ctrl-C is
 equally safe.
 
-The one exception is a Job that never starts. If no node has room for its pod
-for two minutes, the command deletes the Job, prints the scheduler's reason and
-exits non-zero: [the backup runner's pod cannot be
-scheduled](#runner-unschedulable).
+The one exception is a Job whose pod no node takes. If no node has room for it
+for two minutes, or a condition of the node such as memory pressure keeps it off
+for ten, the command deletes the Job, prints the scheduler's reason and exits
+non-zero: [the backup runner's pod cannot be scheduled](#runner-unschedulable).
 
 A suspended schedule (`backup disable`) does not block a manual run: taking one
 last backup after turning the schedule off is a normal thing to want.
@@ -602,6 +602,16 @@ While the runner waits, `apprafter top` also reports `1 pod(s) are not
 scheduled to a node`. If the node's `SCHEDULABLE` memory is below 256Mi, the
 runner cannot be placed.
 
+Not every reason is a lack of room. A reason that names a taint of the node's
+own condition, such as `node.kubernetes.io/memory-pressure`, `disk-pressure` or
+`not-ready`, or a node that is cordoned, keeps the pod off until that condition
+ends. The kubelet keeps a pressure taint for five minutes after the pressure has
+gone, and a runner evicted under memory pressure is retried straight into it.
+`backup run` waits ten minutes for such a condition before it gives up, and it
+names the taint rather than the runner's requests. Any other reason, such as a
+taint the runner does not tolerate, is not answered by freeing memory either:
+the scheduler's text says what keeps the pod off.
+
 ??? note "Checking without the CLI"
 
     A runner pod in `Pending` with a `FailedScheduling` event is the case
@@ -621,10 +631,18 @@ only when `backup status` shows no Job running: two runs that need the same
 helper pod do not both finish.
 
 A pod that only waits for another pod to finish stopping is placed within
-seconds of that pod being gone. That is why `backup run` waits two minutes
-before it gives up. It deletes its Job when it gives up. Left in place, the
-Job would start on its own whenever room appeared, at a time nobody chose and
-possibly while the scheduled backup runs.
+seconds of that pod being gone. `backup run` does not count the time while any
+pod in the cluster is stopping, since a PostgreSQL instance being deleted can
+take minutes to shut down and the room it gives back may be what the runner
+needs. It gives up once there has been no room for two minutes with nothing
+stopping. It deletes its Job when it gives up. Left in place, the Job would
+start on its own whenever a node took it, at a time nobody chose and possibly
+while the scheduled backup runs.
+
+If an earlier attempt of the same Job ran and failed first, the report says
+which attempt could not be scheduled and why the one before it failed, for
+example `Evicted`. That attempt did start, and `backup status` shows the
+runner's `lastError` if it recorded one.
 
 A scheduled Job that cannot start holds the schedule: the CronJob starts no
 other backup while one of its Jobs is active. The Job's deadline, six hours by

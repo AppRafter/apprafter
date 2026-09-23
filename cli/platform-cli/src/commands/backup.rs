@@ -89,7 +89,7 @@ use crate::commands::k8s_helpers::{
 use crate::commands::state_paths::resolve_state_paths;
 
 mod job_pod;
-use job_pod::{job_pod, JobPod, UnschedulableClock, UNSCHEDULABLE_GRACE};
+use job_pod::{grace_for, job_pod, unplaced, JobPod, Unplaced, UnschedulableClock};
 
 /// Namespace the `PlatformStack` singleton + `SourceCredential`s + their sealed
 /// material live in. Mirrors `repo_creds::SOURCECRED_NAMESPACE` /
@@ -2486,19 +2486,26 @@ enum WaitStep {
     Failed(String),
     /// The Job is gone.
     Vanished,
-    /// Its pod has been unschedulable for `for_`, past
-    /// [`UNSCHEDULABLE_GRACE`]: the scheduler's message, and what the
-    /// runner asks for ([`job_pod::runner_requests`]).
+    /// Its pod has been unschedulable for `for_`, past [`grace_for`] its
+    /// reason: the scheduler's message and what it says, what the runner asks
+    /// for ([`job_pod::runner_requests`]), and the attempts that failed before
+    /// this one with the newest one's reason.
     Unschedulable {
         message: String,
+        cause: Unplaced,
         requests: Option<String>,
         for_: Duration,
+        failed: u64,
+        last_failure: Option<String>,
     },
     /// The caller's `--timeout` is up, with the pod in this state.
     TimedOut(JobPod),
     /// Keep waiting: the pod's state, and how long it has been unschedulable
     /// when it is.
     Wait(JobPod, Option<Duration>),
+    /// Keep waiting, with the clock stopped: no room for the pod, but these
+    /// pods are stopping, and the room they give back may be what it needs.
+    RoomReturning { pod: JobPod, stopping: Vec<String> },
 }
 
 /// Decide the wait's next step from one observation. Pure: the loop in
@@ -2509,9 +2516,16 @@ enum WaitStep {
 /// has finished, whatever its pods look like. A pod no node can take comes
 /// before the timeout, because a known reason beats "no longer waiting".
 /// The timeout comes last.
+///
+/// `stopping` is [`job_pod::stopping_pods`] of the whole cluster, read only
+/// while the pod has no room: while it is not empty, the room those pods
+/// give back may be what the runner waits for, and the clock does not run.
+/// It applies to a lack of room only; a node condition or another rule of
+/// the nodes does not change as pods leave.
 fn wait_step(
     job: Option<&Value>,
     pods: &[Value],
+    stopping: &[String],
     clock: &mut UnschedulableClock,
     now: std::time::Instant,
     waited: Duration,
@@ -2526,13 +2540,35 @@ fn wait_step(
         JobOutcome::Running => {}
     }
     let pod = job_pod(job, pods);
+    let cause = match &pod {
+        JobPod::Unschedulable { message, .. } => Some(unplaced(message)),
+        _ => None,
+    };
+    if cause == Some(Unplaced::NoRoom) && !stopping.is_empty() {
+        clock.reset();
+        if waited >= timeout {
+            return WaitStep::TimedOut(pod);
+        }
+        return WaitStep::RoomReturning {
+            pod,
+            stopping: stopping.to_vec(),
+        };
+    }
     let unschedulable_for = clock.observe(&pod, now);
-    if let (JobPod::Unschedulable { message, .. }, Some(for_)) = (&pod, unschedulable_for) {
-        if for_ >= UNSCHEDULABLE_GRACE {
+    if let (JobPod::Unschedulable { message, .. }, Some(cause), Some(for_)) =
+        (&pod, cause, unschedulable_for)
+    {
+        if for_ >= grace_for(&cause) {
             return WaitStep::Unschedulable {
                 message: message.clone(),
+                cause,
                 requests: job_pod::runner_requests(job),
                 for_,
+                failed: job
+                    .pointer("/status/failed")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                last_failure: job_pod::last_failed_attempt(job, pods),
             };
         }
     }
@@ -2549,19 +2585,22 @@ fn wait_step(
 /// backup that is still in progress. The message says so and hands over the
 /// two commands that follow it.
 ///
-/// A pod no node has room for is different: it is not a backup in progress,
-/// and it waits for room that nothing is about to free. Once it has been
-/// unschedulable for [`UNSCHEDULABLE_GRACE`], this deletes the Job and fails
-/// with the scheduler's reason. Deleting it matters. Left in place, the Job
-/// would start on its own whenever room appeared, at a time nobody chose and
-/// possibly beside the scheduled backup, where two runs that need the same
-/// helper pod do not both finish. On a chart whose Job has no deadline it
-/// would also never go away.
+/// A pod no node takes is different: it is not a backup in progress. Once it
+/// has been unschedulable for [`grace_for`] its reason ([`job_pod::UNSCHEDULABLE_GRACE`]
+/// for a lack of room, longer for a condition of the node that lifts by
+/// itself), this deletes the Job and fails with the scheduler's reason. Time
+/// in which pods elsewhere are stopping does not count toward a lack of room.
+/// Deleting the Job matters. Left in place, it would start on its own
+/// whenever a node took it, at a time nobody chose and possibly beside the
+/// scheduled backup, where two runs that need the same helper pod do not
+/// both finish. On a chart whose Job has no deadline it would also never go
+/// away.
 fn wait_for_backup_job(name: &str, timeout_minutes: u64, kubeconfig: &Path) -> Result<()> {
     let deadline = Duration::from_secs(timeout_minutes * 60);
     let started = std::time::Instant::now();
     let mut last_note = std::time::Instant::now();
     let mut clock = UnschedulableClock::default();
+    let mut noted_stopping = false;
 
     println!(
         "  waiting for it to finish (up to {timeout_minutes}m; Ctrl-C is safe — the Job \
@@ -2580,15 +2619,40 @@ fn wait_for_backup_job(name: &str, timeout_minutes: u64, kubeconfig: &Path) -> R
             }
             _ => Vec::new(),
         };
+        // Pods stopping anywhere in the cluster, read only while the pod has
+        // no room: that is when the room they give back matters. Best-effort:
+        // without the listing the wait gives up at the usual time.
+        let stopping = match &job {
+            Some(j)
+                if matches!(
+                    &job_pod(j, &pods),
+                    JobPod::Unschedulable { message, .. } if unplaced(message) == Unplaced::NoRoom
+                ) =>
+            {
+                kubectl_get_json_cluster_wide("pods", None, kubeconfig)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .map(|l| job_pod::stopping_pods(&items_of(l)))
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
         let now = std::time::Instant::now();
-        match wait_step(
+        let step = wait_step(
             job.as_ref(),
             &pods,
+            &stopping,
             &mut clock,
             now,
             started.elapsed(),
             deadline,
-        ) {
+        );
+        let was_stopping = std::mem::replace(
+            &mut noted_stopping,
+            matches!(step, WaitStep::RoomReturning { .. }),
+        );
+        match step {
             WaitStep::Succeeded => {
                 println!(
                     "✓ Backup complete in {}.",
@@ -2615,24 +2679,29 @@ fn wait_for_backup_job(name: &str, timeout_minutes: u64, kubeconfig: &Path) -> R
             }
             WaitStep::Unschedulable {
                 message,
+                cause,
                 requests,
                 for_,
+                failed,
+                last_failure,
             } => {
+                let give_up = job_pod::GiveUp {
+                    namespace: PLATFORMSTACK_NAMESPACE,
+                    name,
+                    message: &message,
+                    cause: &cause,
+                    requests: requests.as_deref(),
+                    failed,
+                    last_failure: last_failure.as_deref(),
+                };
                 let deleted = kubectl_delete("job", name, PLATFORMSTACK_NAMESPACE, kubeconfig)
                     .map_err(|e| e.to_string());
-                print!(
-                    "{}",
-                    job_pod::unschedulable_report(
-                        PLATFORMSTACK_NAMESPACE,
-                        name,
-                        &message,
-                        requests.as_deref(),
-                        deleted,
-                    )
-                );
+                print!("{}", job_pod::unschedulable_report(&give_up, deleted));
+                let (what, help) = job_pod::give_up_error(&give_up, for_);
                 return Err(CliError::BackupRunnerUnschedulable {
                     job: name.to_string(),
-                    waited: format_elapsed(for_.as_secs()),
+                    what,
+                    help,
                 });
             }
             WaitStep::TimedOut(pod) => {
@@ -2652,6 +2721,12 @@ fn wait_for_backup_job(name: &str, timeout_minutes: u64, kubeconfig: &Path) -> R
                         "{}",
                         job_pod::progress_note(&pod, started.elapsed(), unschedulable_for)
                     );
+                    last_note = now;
+                }
+            }
+            WaitStep::RoomReturning { stopping, .. } => {
+                if last_note.elapsed() >= Duration::from_secs(30) || !was_stopping {
+                    println!("{}", job_pod::stopping_note(&stopping, started.elapsed()));
                     last_note = now;
                 }
             }
@@ -6271,6 +6346,7 @@ pub fn run_backup_status() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use job_pod::UNSCHEDULABLE_GRACE;
     use serde_json::json;
 
     // ------------------------------------------------------------------
@@ -12294,6 +12370,7 @@ mod tests {
             wait_step(
                 Some(&job),
                 &pods,
+                &[],
                 clock,
                 t0 + Duration::from_secs(at),
                 Duration::from_secs(at),
@@ -12312,10 +12389,16 @@ mod tests {
         match step(&mut clock, 5 + UNSCHEDULABLE_GRACE.as_secs()) {
             WaitStep::Unschedulable {
                 message,
+                cause,
                 requests,
                 for_,
+                failed,
+                last_failure,
             } => {
                 assert_eq!(message, NO_ROOM);
+                assert_eq!(cause, Unplaced::NoRoom);
+                assert_eq!(failed, 0);
+                assert_eq!(last_failure, None);
                 assert_eq!(for_, UNSCHEDULABLE_GRACE);
                 assert_eq!(requests.as_deref(), Some("256Mi of memory and 100m of CPU"));
             }
@@ -12338,6 +12421,7 @@ mod tests {
         wait_step(
             Some(&job),
             &pending,
+            &[],
             &mut clock,
             at(0),
             Duration::ZERO,
@@ -12346,6 +12430,7 @@ mod tests {
         wait_step(
             Some(&job),
             &pending,
+            &[],
             &mut clock,
             at(100),
             Duration::from_secs(100),
@@ -12355,6 +12440,7 @@ mod tests {
             wait_step(
                 Some(&job),
                 &placed,
+                &[],
                 &mut clock,
                 at(110),
                 Duration::from_secs(110),
@@ -12368,6 +12454,7 @@ mod tests {
             wait_step(
                 Some(&job),
                 &placed,
+                &[],
                 &mut clock,
                 at(900),
                 Duration::from_secs(900),
@@ -12386,7 +12473,7 @@ mod tests {
         // Gone.
         let mut clock = UnschedulableClock::default();
         assert_eq!(
-            wait_step(None, &pods, &mut clock, t0, s(0), s(3600)),
+            wait_step(None, &pods, &[], &mut clock, t0, s(0), s(3600)),
             WaitStep::Vanished
         );
 
@@ -12394,14 +12481,14 @@ mod tests {
         let mut done = unfinished_job("j", "job-1", None);
         done["status"]["conditions"] = json!([{"type": "Complete", "status": "True"}]);
         assert_eq!(
-            wait_step(Some(&done), &pods, &mut clock, t0, s(0), s(3600)),
+            wait_step(Some(&done), &pods, &[], &mut clock, t0, s(0), s(3600)),
             WaitStep::Succeeded
         );
         let mut failed = unfinished_job("j", "job-1", None);
         failed["status"]["conditions"] =
             json!([{"type": "Failed", "status": "True", "reason": "DeadlineExceeded"}]);
         assert_eq!(
-            wait_step(Some(&failed), &pods, &mut clock, t0, s(0), s(3600)),
+            wait_step(Some(&failed), &pods, &[], &mut clock, t0, s(0), s(3600)),
             WaitStep::Failed("DeadlineExceeded".to_string())
         );
 
@@ -12409,17 +12496,25 @@ mod tests {
         // is what is reported, not "no longer waiting".
         let job = unfinished_job("j", "job-1", None);
         let mut clock = UnschedulableClock::default();
-        wait_step(Some(&job), &pods, &mut clock, t0, s(0), s(120));
+        wait_step(Some(&job), &pods, &[], &mut clock, t0, s(0), s(120));
         assert!(matches!(
-            wait_step(Some(&job), &pods, &mut clock, t0 + s(120), s(120), s(120)),
+            wait_step(
+                Some(&job),
+                &pods,
+                &[],
+                &mut clock,
+                t0 + s(120),
+                s(120),
+                s(120)
+            ),
             WaitStep::Unschedulable { .. }
         ));
 
         // A timeout shorter than the grace ends the wait first, and says the
         // pod never started rather than that it is running.
         let mut clock = UnschedulableClock::default();
-        wait_step(Some(&job), &pods, &mut clock, t0, s(0), s(60));
-        let step = wait_step(Some(&job), &pods, &mut clock, t0 + s(60), s(60), s(60));
+        wait_step(Some(&job), &pods, &[], &mut clock, t0, s(0), s(60));
+        let step = wait_step(Some(&job), &pods, &[], &mut clock, t0 + s(60), s(60), s(60));
         let WaitStep::TimedOut(pod) = step else {
             panic!("expected the timeout, got {step:?}");
         };
@@ -12435,6 +12530,7 @@ mod tests {
         let mut clock = UnschedulableClock::default();
         let step = wait_step(
             Some(&job),
+            &[],
             &[],
             &mut clock,
             t0,
@@ -12453,6 +12549,208 @@ mod tests {
         );
     }
 
+    /// A node under memory pressure: the kubelet taints it, and keeps the
+    /// taint for five minutes after the pressure ends.
+    const MEMORY_PRESSURE: &str = "0/1 nodes are available: 1 node(s) had untolerated taint \
+                                   {node.kubernetes.io/memory-pressure: }. preemption: 0/1 nodes \
+                                   are available: 1 Preemption is not helpful for scheduling.";
+
+    fn pending_pod_saying(job_uid: &str, pod_uid: &str, message: &str) -> Value {
+        let mut p = pending_pod(job_uid, pod_uid);
+        p["status"]["conditions"][0]["message"] = json!(message);
+        p
+    }
+
+    #[test]
+    fn a_pod_kept_off_by_a_node_condition_is_waited_for_past_the_taints_five_minutes() {
+        // A runner evicted under memory pressure is retried into the
+        // pressure taint, which outlives the pressure by five minutes. At
+        // two minutes that Job would still have run.
+        let job = unfinished_job("j", "job-1", None);
+        let pods = [pending_pod_saying("job-1", "pod-1", MEMORY_PRESSURE)];
+        let t0 = std::time::Instant::now();
+        let s = Duration::from_secs;
+        let mut clock = UnschedulableClock::default();
+        for at in [0, 125, 300, 599] {
+            assert!(
+                matches!(
+                    wait_step(
+                        Some(&job),
+                        &pods,
+                        &[],
+                        &mut clock,
+                        t0 + s(at),
+                        s(at),
+                        s(3600)
+                    ),
+                    WaitStep::Wait(JobPod::Unschedulable { .. }, Some(_))
+                ),
+                "at {at}s"
+            );
+        }
+        match wait_step(
+            Some(&job),
+            &pods,
+            &[],
+            &mut clock,
+            t0 + s(600),
+            s(600),
+            s(3600),
+        ) {
+            WaitStep::Unschedulable { cause, for_, .. } => {
+                assert_eq!(
+                    cause,
+                    Unplaced::NodeCondition(vec!["node.kubernetes.io/memory-pressure".to_string()])
+                );
+                assert_eq!(for_, s(600));
+            }
+            other => panic!("expected the give-up at ten minutes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_clock_does_not_run_while_pods_are_stopping_and_giving_room_back() {
+        // A CNPG pod being deleted shuts down smartly for up to 180 s, and
+        // holds its requests until it is gone: longer than the grace. The
+        // room it gives back may be exactly what the runner waits for.
+        let job = unfinished_job("j", "job-1", None);
+        let pods = [pending_pod("job-1", "pod-1")];
+        let stopping = ["demo/shop-pg-1".to_string()];
+        let t0 = std::time::Instant::now();
+        let s = Duration::from_secs;
+        let mut clock = UnschedulableClock::default();
+        // No room and nothing stopping yet: the clock starts.
+        assert!(matches!(
+            wait_step(Some(&job), &pods, &[], &mut clock, t0, s(0), s(3600)),
+            WaitStep::Wait(JobPod::Unschedulable { .. }, Some(d)) if d.is_zero()
+        ));
+        for at in [100, 200, 300] {
+            match wait_step(
+                Some(&job),
+                &pods,
+                &stopping,
+                &mut clock,
+                t0 + s(at),
+                s(at),
+                s(3600),
+            ) {
+                WaitStep::RoomReturning {
+                    stopping: named, ..
+                } => {
+                    assert_eq!(named, stopping.to_vec(), "at {at}s")
+                }
+                other => panic!("at {at}s expected to wait for the stopping pod, got {other:?}"),
+            }
+        }
+        // Gone, and still no room: the two minutes start again now, not at
+        // 0, where they first began.
+        assert!(matches!(
+            wait_step(Some(&job), &pods, &[], &mut clock, t0 + s(305), s(305), s(3600)),
+            WaitStep::Wait(JobPod::Unschedulable { .. }, Some(d)) if d.is_zero()
+        ));
+        assert!(matches!(
+            wait_step(
+                Some(&job),
+                &pods,
+                &[],
+                &mut clock,
+                t0 + s(424),
+                s(424),
+                s(3600)
+            ),
+            WaitStep::Wait(JobPod::Unschedulable { .. }, Some(_))
+        ));
+        assert!(matches!(
+            wait_step(
+                Some(&job),
+                &pods,
+                &[],
+                &mut clock,
+                t0 + s(425),
+                s(425),
+                s(3600)
+            ),
+            WaitStep::Unschedulable { .. }
+        ));
+        // The caller's timeout still ends a wait for stopping pods.
+        let mut clock = UnschedulableClock::default();
+        assert!(matches!(
+            wait_step(
+                Some(&job),
+                &pods,
+                &stopping,
+                &mut clock,
+                t0,
+                s(3600),
+                s(3600)
+            ),
+            WaitStep::TimedOut(JobPod::Unschedulable { .. })
+        ));
+        // A node condition is not a lack of room: pods stopping elsewhere
+        // do not change it, and its own clock runs.
+        let tainted = [pending_pod_saying("job-1", "pod-1", MEMORY_PRESSURE)];
+        let mut clock = UnschedulableClock::default();
+        wait_step(
+            Some(&job),
+            &tainted,
+            &stopping,
+            &mut clock,
+            t0,
+            s(0),
+            s(3600),
+        );
+        assert!(matches!(
+            wait_step(
+                Some(&job),
+                &tainted,
+                &stopping,
+                &mut clock,
+                t0 + s(600),
+                s(600),
+                s(3600)
+            ),
+            WaitStep::Unschedulable { .. }
+        ));
+    }
+
+    #[test]
+    fn the_give_up_carries_the_attempts_that_failed_before_it() {
+        let mut job = unfinished_job("j", "job-1", None);
+        job["status"]["failed"] = json!(1);
+        let mut evicted = pending_pod("job-1", "pod-0");
+        evicted["metadata"]["creationTimestamp"] = json!("2026-09-23T14:30:00Z");
+        evicted["spec"]["nodeName"] = json!("node-1");
+        evicted["status"] = json!({"phase": "Failed", "reason": "Evicted",
+                                   "message": "The node was low on resource: memory."});
+        let pods = [evicted, pending_pod("job-1", "pod-1")];
+        let t0 = std::time::Instant::now();
+        let s = Duration::from_secs;
+        let mut clock = UnschedulableClock::default();
+        wait_step(Some(&job), &pods, &[], &mut clock, t0, s(0), s(3600));
+        match wait_step(
+            Some(&job),
+            &pods,
+            &[],
+            &mut clock,
+            t0 + s(120),
+            s(120),
+            s(3600),
+        ) {
+            WaitStep::Unschedulable {
+                failed,
+                last_failure,
+                ..
+            } => {
+                assert_eq!(failed, 1);
+                assert_eq!(
+                    last_failure.as_deref(),
+                    Some("Evicted: The node was low on resource: memory.")
+                );
+            }
+            other => panic!("expected the give-up, got {other:?}"),
+        }
+    }
+
     #[test]
     fn preemption_never_runs_the_unschedulable_clock() {
         // The scheduler is evicting lower-priority pods to make room: the pod
@@ -12466,7 +12764,15 @@ mod tests {
         let mut clock = UnschedulableClock::default();
         for at in [0, 60, 120, 600, 1800] {
             assert!(matches!(
-                wait_step(Some(&job), &pods, &mut clock, t0 + s(at), s(at), s(3600)),
+                wait_step(
+                    Some(&job),
+                    &pods,
+                    &[],
+                    &mut clock,
+                    t0 + s(at),
+                    s(at),
+                    s(3600)
+                ),
                 WaitStep::Wait(JobPod::Preempting { .. }, None)
             ));
         }
@@ -12474,6 +12780,7 @@ mod tests {
             wait_step(
                 Some(&job),
                 &pods,
+                &[],
                 &mut clock,
                 t0 + s(3600),
                 s(3600),

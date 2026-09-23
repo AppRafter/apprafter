@@ -260,18 +260,21 @@ target-store files, re-create the offending target with
 ### `apprafter::backup::runner_unschedulable`
 
 `apprafter backup run` (or the first backup `apprafter backup enable`
-takes) created the backup Job, but for two minutes no node had room for
-its pod. The command deleted the Job and stopped. The lines it printed
-just before the error give the scheduler's reason
-(`0/1 nodes are available: 1 Insufficient memory. …`) and what the
-runner asks for.
+takes) created the backup Job, but no node took its pod: for two minutes
+no node had room for it, or for ten minutes a condition of the node, such
+as memory pressure, kept it off. The command deleted the Job and stopped.
+The lines it printed just before the error give the scheduler's reason
+(`0/1 nodes are available: 1 Insufficient memory. …`) and, for a lack of
+room, what the runner asks for.
 
-**Fix.** `apprafter top` shows how much of each node is requested, and by
-what. Free enough for the runner, or move to a bigger machine, then run
-`apprafter backup run` again. The scheduled backup asks for the same room,
-so it cannot start either until then. The whole case, including how to
-tell whether tonight's scheduled backup is stuck:
-[the backup runner's pod cannot be
+**Fix.** For a lack of room, `apprafter top` shows how much of each node
+is requested, and by what. Free enough for the runner, or move to a
+bigger machine, then run `apprafter backup run` again. The scheduled
+backup asks for the same room, so it cannot start either until then. A
+node condition such as `node.kubernetes.io/memory-pressure` lifts on its
+own once the condition ends; run `apprafter backup run` again then. The
+whole case, including how to tell whether tonight's scheduled backup is
+stuck: [the backup runner's pod cannot be
 scheduled](backup-restore.md#runner-unschedulable).
 
 ### `apprafter::cli::other`
