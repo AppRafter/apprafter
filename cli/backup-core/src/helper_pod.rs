@@ -21,10 +21,13 @@
 //! key and nothing else, so `get pods` — a right commonly granted more widely
 //! than `get secrets` — shows no credential, for the pod's whole life and
 //! after it (a leftover pod stays `Completed` until deleted, see below). The
-//! builders take no password at all, so none can be put in by mistake, and a
-//! backup never reads it either (a restore reads a pg claim's connection
-//! Secret whole, to check it has every key, and keeps nothing of the
-//! password).
+//! builders take no password at all, so none can be put in by mistake, and
+//! the extraction never reads it: the helper's container resolves it. (It
+//! still passes through two reads that take a Secret whole: the secret
+//! capture's listing of a namespace's Secrets, which keeps only the sealed
+//! ones and drops a connection Secret unwritten, and a restore's read of a pg
+//! claim's connection Secret, to check it has every key, which keeps nothing
+//! of the password.)
 //!
 //! Every such Secret is already where its helper runs, so a backup creates
 //! none of its own: a PostgreSQL helper runs in its claim's namespace, beside

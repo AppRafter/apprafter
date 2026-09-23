@@ -468,19 +468,25 @@ own spec. The PostgreSQL helper reads `PGPASSWORD` from the `pass` key of the
 claim's connection Secret, and the JetStream helper reads `NATS_USER` and
 `NATS_PASSWORD` from the `user` and `password` keys of the namespace's
 `nats-mgr-<namespace>` Secret, each through a `secretKeyRef`: the kubelet
-resolves them when it starts the container, and the Pod object carries only
-the Secret's name and key. So `get pods` — a right commonly granted more widely
+resolves them when it starts the container, and the Pod object carries only the
+Secret's name and key. So `get pods` — a right commonly granted more widely
 than `get secrets` — shows no credential, while the pod runs or after. Each of
-those Secrets already lives in the namespace its helper runs in — a
-PostgreSQL helper runs in its claim's namespace, a JetStream helper in the one
-NATS runs in — so a run creates no Secret of its own, the ClusterRole above
-needs no write verb on Secrets, and a backup never reads the password itself.
-The same holds for the helpers of `apprafter backup create`, `apprafter export`
-and `apprafter restore`; a restore reads a claim's connection Secret only to
-check that it has every key it needs. A Secret or key that is missing
-leaves the container unable to start; the run stops on that after fifteen
-seconds with the kubelet's own words (the table above), rather than waiting
-five minutes for a pod that cannot become Ready.
+those Secrets already lives in the namespace its helper runs in — a PostgreSQL
+helper runs in its claim's namespace, a JetStream helper in the one NATS runs
+in — so a run creates no Secret of its own, and the ClusterRole above needs no
+write verb on Secrets. The same holds for the helpers of
+`apprafter backup create`, `apprafter export` and `apprafter restore`. The step
+that extracts the data never reads the password — the helper's container
+resolves it — and a restore reads a claim's connection Secret only to check
+that it has every key it needs. The password does pass through a backup in one
+other place: the secret capture lists every Secret in each namespace that holds
+a SealedSecret, and a Secret list returns each Secret's data, before it keeps
+only the Secrets that have a SealedSecret behind them. A claim's connection
+Secret in such a namespace is therefore read there and then dropped; it is
+never written to the snapshot. A Secret or key that is missing leaves the
+container unable to start; the run stops on that after fifteen seconds with the
+kubelet's own words (the table above), rather than waiting five minutes for a
+pod that cannot become Ready.
 
 **The network ceiling.** A CiliumNetworkPolicy, `apprafter-backup-egress`,
 selects pods labelled `apprafter.io/backup-runner: "true"` — which both
