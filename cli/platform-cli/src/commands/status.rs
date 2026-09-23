@@ -50,8 +50,8 @@ use crate::commands::k8s_helpers::{
 };
 use crate::commands::migration::pending_plan_rows;
 use crate::commands::platform::{
-    render_conditions_table, unhealthy_condition_rows, version_summary_line, PLATFORMSTACK_NAME,
-    PLATFORMSTACK_NAMESPACE,
+    backup_health_lines, render_conditions_table, unhealthy_condition_rows, version_summary_line,
+    PLATFORMSTACK_NAME, PLATFORMSTACK_NAMESPACE,
 };
 use crate::commands::state_paths::resolve_state_paths;
 
@@ -126,6 +126,17 @@ pub fn run() -> Result<()> {
     for line in platform_lines(read) {
         println!("{line}");
     }
+    let now = chrono::Utc::now();
+
+    // Backups get their own section, off the same PlatformStack read: a
+    // backup that cannot run is the failure nobody notices until the day
+    // they need the backup, so it is never folded into the condition table.
+    if let Ok(Some(json)) = &stack {
+        println!();
+        for line in backup_health_lines(json, now) {
+            println!("{line}");
+        }
+    }
 
     // ONE cluster-wide application read, shared by both roll-ups, so the
     // two sections describe one instant.
@@ -133,7 +144,6 @@ pub fn run() -> Result<()> {
     if let Ok(items) = &apps.apps {
         print_pinned_applications(items);
     }
-    let now = chrono::Utc::now();
     print_problem_applications(apps.apps.as_deref(), apps.argo.as_deref(), &now);
 
     let plans = kubectl_get_json_cluster_wide("migrationplan", None, kc.path()).map(|json| {

@@ -248,8 +248,179 @@ pub(crate) fn condition_polarity(type_: &str) -> Option<ConditionPolarity> {
         // Gets its own section, which names the plans rather than just
         // asserting that some exist.
         "MigrationPending" => Some(ConditionPolarity::ReportedElsewhere),
+        // Positive (`True` is healthy), but with its own section
+        // ([`backup_health_lines`]) that says since when and what to run
+        // next, so the one-row table version would be a vaguer copy of it.
+        "BackupHealthy" => Some(ConditionPolarity::ReportedElsewhere),
         _ => None,
     }
+}
+
+/// Where a reader whose backup cannot run for lack of room is sent: the
+/// backup guide's troubleshooting entry, the same one `backup status` and
+/// `backup run` print. A test resolves it against the committed page.
+pub(crate) const BACKUP_UNSCHEDULABLE_DOC: &str =
+    "https://docs.apprafter.dev/operator-guide/backup-restore/#runner-unschedulable";
+
+/// Where every other `BackupHealthy` cause is explained, reason by reason.
+pub(crate) const BACKUP_HEALTH_DOC: &str =
+    "https://docs.apprafter.dev/how-it-works/backup-retention-and-checks/#when-a-backup-cannot-run";
+
+/// The backup section of `apprafter status` and `apprafter platform status`,
+/// from the operator's `BackupHealthy` condition.
+///
+/// The condition is built from the backup CronJobs, their Jobs and pods, so
+/// it sees what the runner's own record cannot: a pod no node has room for,
+/// a runner killed at its memory limit or evicted, a Job stopped by its
+/// deadline before its pod ever started. A backup that cannot run must not
+/// look healthy here, so anything but `True` is loud and names the next
+/// command, and a cluster that enabled backups on an operator too old to
+/// report on them says so instead of saying nothing.
+///
+/// A second backup condition (retention) belongs in this section too, as
+/// one more [`backup_condition_lines`] call with its own label and advice:
+/// the operator keeps it apart from `BackupHealthy` so that one never hides
+/// the other, and this section should print both for the same reason.
+pub(crate) fn backup_health_lines(json: &Value, now: DateTime<Utc>) -> Vec<String> {
+    let enabled = json
+        .pointer("/spec/backup/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let condition = json
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .and_then(|cs| cs.iter().find(|c| c["type"] == "BackupHealthy"));
+    let Some(c) = condition else {
+        return if enabled {
+            vec![cli_core::style::warn(
+                "Backups: enabled, but this cluster's operator does not report whether they \
+                 run — `apprafter backup status` shows the last Jobs.",
+            )]
+        } else {
+            vec!["Backups: not enabled.".to_string()]
+        };
+    };
+    backup_condition_lines(c, "Backups", now, backup_next_step)
+}
+
+/// One backup condition as lines: a single quiet line when it is `True`;
+/// otherwise a loud headline (with since when, for `False`), the operator's
+/// own message, what to run next and the page that explains it.
+fn backup_condition_lines(
+    c: &Value,
+    label: &str,
+    now: DateTime<Utc>,
+    next_step: fn(&str) -> Option<(&'static str, &'static str)>,
+) -> Vec<String> {
+    let field = |k: &str| c.get(k).and_then(Value::as_str).unwrap_or("");
+    let (status, reason, message) = (field("status"), field("reason"), field("message"));
+    if status == "True" {
+        return vec![format!("{label}: healthy — {message}")];
+    }
+    let mut lines = if status == "False" {
+        let since = c
+            .get("lastTransitionTime")
+            .and_then(Value::as_str)
+            .map(|t| format_timestamp_with_relative(t, now))
+            .unwrap_or_else(|| "an unrecorded time".to_string());
+        vec![cli_core::style::warn(&format!(
+            "{label}: FAILING since {since} — {reason}"
+        ))]
+    } else {
+        vec![cli_core::style::warn(&format!(
+            "{label}: not known to be working — {reason}"
+        ))]
+    };
+    if !message.is_empty() {
+        lines.push(cli_core::style::warn(&format!("  {message}")));
+    }
+    // A reason this build has never heard of still gets a next step: the
+    // one command that shows every backup Job.
+    let (next, doc) = next_step(reason).unwrap_or((
+        "`apprafter backup status` shows the Jobs and the runner's own record.",
+        BACKUP_HEALTH_DOC,
+    ));
+    lines.push(format!("  Next: {next}"));
+    // Its own line, so the URL can be copied whole from any terminal width.
+    lines.push(format!("  What it means and what to change: {doc}"));
+    lines
+}
+
+/// What to run next for each `BackupHealthy` reason the operator writes,
+/// and the page that explains it. Every reason is named, so a new one is a
+/// decision here rather than a silent fall-through to the generic advice
+/// (a test reads the reasons out of the operator's source).
+fn backup_next_step(reason: &str) -> Option<(&'static str, &'static str)> {
+    let step = match reason {
+        "RunnerUnschedulable" => (
+            "`apprafter backup status` shows the Job and its pod; `apprafter top` shows how \
+             much of the node is requested, and by what.",
+            BACKUP_UNSCHEDULABLE_DOC,
+        ),
+        // `backup status` reads the Job's pod, so for a Job the controller
+        // could not create a pod for it has nothing to say but `Unknown`
+        // (seen on kind): the FailedCreate events are the only record.
+        "RunnerNotStarted" => (
+            "`apprafter backup status` shows the Job and why its pod has not started. A Job \
+             with no pod at all shows as Unknown there; `kubectl -n apprafter-system describe \
+             job <name>` prints the FailedCreate events that say why.",
+            BACKUP_HEALTH_DOC,
+        ),
+        "RunnerOOMKilled" => (
+            "`apprafter backup status` shows the Job and its attempts; `apprafter top` shows \
+             the node's memory.",
+            BACKUP_HEALTH_DOC,
+        ),
+        // The kubelet evicts for two unrelated reasons, and the message
+        // quotes which: node memory pressure, or staging grown past the
+        // `/staging` volume's size limit.
+        "RunnerEvicted" => (
+            "`apprafter backup status` shows the Job and its attempts. For memory pressure, \
+             `apprafter top` shows the node's memory; for the staging size limit, `apprafter \
+             backup set staging-mode sequential` stages one namespace at a time.",
+            BACKUP_HEALTH_DOC,
+        ),
+        "DeadlineExceeded" => (
+            "`apprafter backup status` shows the Job; `apprafter top` shows whether the node \
+             has room for the next run.",
+            BACKUP_HEALTH_DOC,
+        ),
+        "BackoffLimitExceeded" | "Failed" => (
+            "`apprafter backup status` shows the Jobs and the runner's own record.",
+            BACKUP_HEALTH_DOC,
+        ),
+        // Only a later check Job clears it, and the schedule is weekly: say
+        // how to run one now instead of leaving the reader to wait a week.
+        "RepositoryCheckFailed" => (
+            "`apprafter backup check` runs the same check from this machine and prints \
+             restic's own output; `apprafter backup status` shows the check Job. Only a check \
+             that passes in the cluster clears this: `kubectl -n apprafter-system create job \
+             --from=cronjob/apprafter-backup-check apprafter-backup-check-rerun` runs one now.",
+            BACKUP_HEALTH_DOC,
+        ),
+        "ScheduleSuspended" => (
+            "resume the CronJob the message names: `kubectl -n apprafter-system patch cronjob \
+             <name> --type merge -p '{\"spec\":{\"suspend\":false}}'`.",
+            BACKUP_HEALTH_DOC,
+        ),
+        "NoRunYet" => (
+            "`apprafter backup run` takes a backup now instead of waiting for the schedule; \
+             `apprafter backup status` shows the schedule.",
+            BACKUP_HEALTH_DOC,
+        ),
+        "ScheduleNotDeployed" => (
+            "wait for the platform to sync the backup schedule (`apprafter status` shows the \
+             platform's sync), then `apprafter backup status`.",
+            BACKUP_HEALTH_DOC,
+        ),
+        "StateUnreadable" => (
+            "the operator could not read the backup Jobs, and its log says why; `apprafter \
+             backup status` reads them with your own credentials.",
+            BACKUP_HEALTH_DOC,
+        ),
+        _ => return None,
+    };
+    Some(step)
 }
 
 /// Every condition on the stack, as rows. Shared by the full table
@@ -382,6 +553,13 @@ fn print_status(json: &Value, now: DateTime<Utc>) {
     } else {
         println!("Conditions:");
         println!("{}", render_conditions_table(&conditions));
+    }
+    println!();
+
+    // The backup verdict again, in words: the table row above has no room
+    // for since when or for what to run next.
+    for line in backup_health_lines(json, now) {
+        println!("{line}");
     }
     println!();
 
@@ -1028,6 +1206,281 @@ mod tests {
     use serde_json::json;
 
     use chrono::TimeZone;
+
+    // ---- WI-386: the backup section ----
+
+    fn with_backup(enabled: bool, condition: Option<Value>) -> Value {
+        let mut conditions = vec![json!({ "type": "Ready", "status": "True" })];
+        conditions.extend(condition);
+        json!({
+            "spec": { "backup": { "enabled": enabled } },
+            "status": { "conditions": conditions },
+        })
+    }
+
+    fn backup_condition(status: &str, reason: &str, message: &str) -> Value {
+        json!({ "type": "BackupHealthy", "status": status, "reason": reason,
+                "message": message, "lastTransitionTime": "2026-09-23T03:10:05Z" })
+    }
+
+    const UNSCHEDULABLE_MESSAGE: &str = "backup Job apprafter-backup-29312340: its pod \
+        apprafter-backup-29312340-x7k2q has not been scheduled since 2026-09-23T03:00:04Z: \
+        0/1 nodes are available: 1 Insufficient memory.";
+
+    #[test]
+    fn a_backup_that_cannot_be_scheduled_is_loud_and_says_what_to_run() {
+        let stack = with_backup(
+            true,
+            Some(backup_condition(
+                "False",
+                "RunnerUnschedulable",
+                UNSCHEDULABLE_MESSAGE,
+            )),
+        );
+        let lines = backup_health_lines(&stack, frozen_now());
+        let text = lines.join("\n");
+        // What failed and since when.
+        assert!(
+            lines[0].contains("FAILING since 2026-09-23 03:10 UTC"),
+            "{text}"
+        );
+        assert!(lines[0].contains("RunnerUnschedulable"), "{text}");
+        assert!(text.contains("Insufficient memory"), "{text}");
+        assert!(text.contains("apprafter-backup-29312340"), "{text}");
+        // What to run next, and where the fix is described.
+        assert!(text.contains("`apprafter backup status`"), "{text}");
+        assert!(text.contains("`apprafter top`"), "{text}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.trim_end().ends_with(BACKUP_UNSCHEDULABLE_DOC)),
+            "the URL ends its own line so it copies whole: {text}"
+        );
+    }
+
+    #[test]
+    fn an_oom_killed_runner_points_at_the_node_and_the_reasons_page() {
+        let stack = with_backup(
+            true,
+            Some(backup_condition(
+                "False",
+                "RunnerOOMKilled",
+                "backup Job x: its attempt 1 of at most 7 was OOMKilled at its 384Mi memory limit",
+            )),
+        );
+        let text = backup_health_lines(&stack, frozen_now()).join("\n");
+        assert!(text.contains("OOMKilled at its 384Mi"), "{text}");
+        assert!(text.contains("`apprafter top`"), "{text}");
+        assert!(text.contains(BACKUP_HEALTH_DOC), "{text}");
+    }
+
+    #[test]
+    fn a_deadline_failure_sends_the_reader_to_backup_status() {
+        let stack = with_backup(
+            true,
+            Some(backup_condition(
+                "False",
+                "DeadlineExceeded",
+                "backup Job x: failed",
+            )),
+        );
+        let text = backup_health_lines(&stack, frozen_now()).join("\n");
+        assert!(text.contains("FAILING"), "{text}");
+        assert!(text.contains("`apprafter backup status`"), "{text}");
+        assert!(text.contains(BACKUP_HEALTH_DOC), "{text}");
+    }
+
+    #[test]
+    fn a_backup_not_known_to_work_is_never_rendered_as_healthy() {
+        for reason in ["NoRunYet", "StateUnreadable", "ScheduleNotDeployed"] {
+            let stack = with_backup(true, Some(backup_condition("Unknown", reason, "why")));
+            let text = backup_health_lines(&stack, frozen_now()).join("\n");
+            assert!(text.contains("not known to be working"), "{reason}: {text}");
+            assert!(!text.contains("healthy"), "{reason}: {text}");
+            assert!(
+                text.contains("`apprafter backup status`"),
+                "{reason}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_healthy_backup_is_one_quiet_line() {
+        let stack = with_backup(
+            true,
+            Some(backup_condition(
+                "True",
+                "Succeeded",
+                "the last backup, Job apprafter-backup-29312340, succeeded at 2026-09-23T03:01:02Z",
+            )),
+        );
+        let lines = backup_health_lines(&stack, frozen_now());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("Backups: healthy"), "{lines:?}");
+        assert!(lines[0].contains("apprafter-backup-29312340"), "{lines:?}");
+    }
+
+    #[test]
+    fn enabled_backups_with_no_condition_do_not_read_as_fine() {
+        // An operator from before the condition existed. Silence here would
+        // be read as "nothing wrong".
+        let text = backup_health_lines(&with_backup(true, None), frozen_now()).join("\n");
+        assert!(text.contains("does not report"), "{text}");
+        assert!(text.contains("`apprafter backup status`"), "{text}");
+    }
+
+    #[test]
+    fn a_cluster_without_backups_says_so_in_one_line() {
+        let lines = backup_health_lines(&with_backup(false, None), frozen_now());
+        assert_eq!(lines, vec!["Backups: not enabled.".to_string()]);
+    }
+
+    #[test]
+    fn a_failed_repository_check_sends_the_reader_to_backup_check() {
+        let stack = with_backup(
+            true,
+            Some(backup_condition(
+                "False",
+                "RepositoryCheckFailed",
+                "repository check Job apprafter-backup-check-29310000: failed at \
+                 2026-09-21T06:12:00Z after 7 failed attempts (BackoffLimitExceeded).",
+            )),
+        );
+        let text = backup_health_lines(&stack, frozen_now()).join("\n");
+        assert!(text.contains("FAILING since"), "{text}");
+        assert!(text.contains("`apprafter backup check`"), "{text}");
+        // The schedule is weekly, so the way to clear it now is named.
+        assert!(
+            text.contains("--from=cronjob/apprafter-backup-check"),
+            "{text}"
+        );
+        assert!(text.contains(BACKUP_HEALTH_DOC), "{text}");
+    }
+
+    #[test]
+    fn a_job_with_no_pod_is_sent_to_its_events() {
+        // As the kind proof printed it. `backup status` shows such a Job as
+        // Unknown, so the advice must name where the reason actually is.
+        let stack = with_backup(
+            true,
+            Some(backup_condition(
+                "False",
+                "RunnerNotStarted",
+                "backup Job apprafter-backup-29836689: it has had no pod since it was created at \
+                 2026-09-23T22:09:00Z: the Job controller has not created one.",
+            )),
+        );
+        let text = backup_health_lines(&stack, frozen_now()).join("\n");
+        assert!(text.contains("FAILING since"), "{text}");
+        assert!(
+            text.contains("`kubectl -n apprafter-system describe job <name>`"),
+            "{text}"
+        );
+        assert!(text.contains("FailedCreate"), "{text}");
+    }
+
+    #[test]
+    fn an_evicted_runner_names_both_ways_out() {
+        // As the kind proof printed it: the staging volume past its size
+        // limit, where pointing only at the node's memory would mislead.
+        let stack = with_backup(
+            true,
+            Some(backup_condition(
+                "False",
+                "RunnerEvicted",
+                "backup Job wi386h-evict: failed at 2026-09-23T21:57:36Z after 1 failed attempt \
+                 (BackoffLimitExceeded). The last one was evicted (pod wi386h-evict-vz8qf): Usage \
+                 of EmptyDir volume \"staging\" exceeds the limit \"16Mi\".",
+            )),
+        );
+        let text = backup_health_lines(&stack, frozen_now()).join("\n");
+        assert!(text.contains("exceeds the limit"), "{text}");
+        assert!(text.contains("`apprafter top`"), "{text}");
+        assert!(
+            text.contains("`apprafter backup set staging-mode sequential`"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_reason_this_build_does_not_know_still_gets_a_next_step() {
+        let stack = with_backup(true, Some(backup_condition("False", "SomethingNew", "why")));
+        let text = backup_health_lines(&stack, frozen_now()).join("\n");
+        assert!(text.contains("FAILING since"), "{text}");
+        assert!(text.contains("Next: `apprafter backup status`"), "{text}");
+        assert!(text.contains(BACKUP_HEALTH_DOC), "{text}");
+    }
+
+    #[test]
+    fn every_backup_reason_the_operator_writes_has_its_own_next_step() {
+        // The operator is a separate workspace, so its reasons are read out
+        // of its source, as the condition types are above. A reason added
+        // there fails here until somebody decides what the reader runs next,
+        // instead of silently getting the generic advice.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../operator/operator-controllers/platform-stack/src/backup_health.rs");
+        let src =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let reasons: Vec<String> = src
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("pub const REASON_"))
+            .filter_map(|l| l.split_once("= \""))
+            .filter_map(|(_, rest)| rest.split_once('"'))
+            .map(|(name, _)| name.to_string())
+            .collect();
+        assert!(
+            reasons.len() >= 12,
+            "only {reasons:?} parsed out of {} — the declaration shape changed, and an \
+             empty list would have passed",
+            path.display()
+        );
+        for reason in reasons.iter().filter(|r| *r != "Succeeded") {
+            assert!(
+                backup_next_step(reason).is_some(),
+                "the operator writes BackupHealthy reason `{reason}` and this build gives \
+                 it no next step of its own"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failing_backup_is_not_folded_into_the_condition_table() {
+        // Its own section says it better; a table row beside it would be a
+        // second, vaguer copy.
+        let stack = with_backup(
+            true,
+            Some(backup_condition(
+                "False",
+                "RunnerUnschedulable",
+                UNSCHEDULABLE_MESSAGE,
+            )),
+        );
+        assert!(unhealthy_condition_rows(&stack).is_empty());
+    }
+
+    #[test]
+    fn both_backup_documentation_links_resolve_to_committed_sections() {
+        // The URLs are printed to someone whose backup cannot run. The docs
+        // build checks links between pages, not a URL inside a Rust string.
+        for url in [BACKUP_UNSCHEDULABLE_DOC, BACKUP_HEALTH_DOC] {
+            let path = url
+                .strip_prefix("https://docs.apprafter.dev/")
+                .expect("a docs.apprafter.dev URL");
+            let (page, anchor) = path.split_once("/#").expect("<page>/#<anchor>");
+            let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs")
+                .join(format!("{page}.md"));
+            let text = std::fs::read_to_string(&file)
+                .unwrap_or_else(|e| panic!("{} must exist: {e}", file.display()));
+            assert!(
+                text.lines().any(
+                    |l| l.starts_with('#') && l.trim_end().ends_with(&format!("{{#{anchor}}}"))
+                ),
+                "{} has no heading with {{#{anchor}}}",
+                file.display()
+            );
+        }
+    }
 
     // ---- 2.23a: the two slices `apprafter status` lifts from here ----
 
