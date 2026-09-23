@@ -563,7 +563,7 @@ fn a_held_materialized_view_lock_fails_the_dump_at_its_first_output_bound_and_a_
     // --- the abandoned dump's server session ends, the lock still held --------
     // The guard deleted the helper pod, which kills pg_dump. Its server
     // session is waiting on mv1 and so does no socket I/O: only the server's
-    // own connection check (`PG_DUMP_PGOPTIONS`) ends it before the refresher
+    // own connection check (`PG_HELPER_PGOPTIONS`) ends it before the refresher
     // does. Without that check it would sit there, holding ACCESS SHARE on t1
     // and a connection slot, for as long as the refresher's transaction.
     let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client.clone(), NS);

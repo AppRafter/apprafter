@@ -171,7 +171,7 @@ pub async fn stop_run(ctx: &StopContext) -> RunOutcome {
     //    its database session, and the table locks that session holds, ended
     //    within seconds, even while it waits on a lock: the helper connects with
     //    `client_connection_check_interval`
-    //    (`backup_core::extract::PG_DUMP_PGOPTIONS`). Without that, the
+    //    (`backup_core::extract::PG_HELPER_PGOPTIONS`). Without that, the
     //    session would outlive the kill.
     let pods = ctx.live_helpers.snapshot();
     let deletes = pods.iter().map(|(ns, name)| {

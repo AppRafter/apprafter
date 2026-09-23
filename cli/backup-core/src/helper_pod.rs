@@ -4,7 +4,7 @@
 //!
 //! # Pure pod-spec builders
 //!
-//! `pg_dump_pod_spec` / `volume_pod_spec` / `nats_pod_spec` return
+//! `pg_helper_pod_spec` / `volume_pod_spec` / `nats_pod_spec` return
 //! serde_json::Value Pod specs that are applied via `apply_and_wait_pod_ready`
 //! and then exec'd into. Each runs [`keep_alive_command`] — `sleep` for the
 //! run's deadline — as its container command, so the pod is there to exec
@@ -78,12 +78,31 @@ pub fn keep_alive_command(keep_alive: Duration) -> Value {
 // Pure pod-spec builders
 // ---------------------------------------------------------------------------
 
-/// Build a Pod spec for pg_dump extraction.
+/// Build the Pod spec of a PostgreSQL helper: the pod a backup or an export
+/// runs `pg_dump` in, and the pod a restore runs `pg_restore` in.
 ///
-/// No PVC mount — the container runs `pg_dump` over a TCP connection to the
-/// CNPG cluster Service. The keep-alive command ([`keep_alive_command`]) lets
-/// the caller exec in and run the tool after the pod reaches Running.
-pub fn pg_dump_pod_spec(name: &str, ns: &str, image: &str, keep_alive: Duration) -> Value {
+/// No PVC mount — the container reaches the CNPG cluster Service over TCP. The
+/// keep-alive command ([`keep_alive_command`]) lets the caller exec in and run
+/// the tool after the pod reaches Running. Two variables go in the container
+/// env, so that no exec'd command has to carry them:
+///
+/// * `PGPASSWORD` — the tool never prompts (there is no TTY to answer on) and
+///   the password is never on an argv;
+/// * `PGOPTIONS` = [`crate::extract::PG_HELPER_PGOPTIONS`] — a session whose
+///   client is killed while it waits on a lock ends with it rather than
+///   holding its locks until that lock is released.
+///
+/// The one builder for both sides on purpose: the restore's copy used to
+/// replace the env with `PGPASSWORD` alone, so a `pg_restore` stopped while
+/// its `--clean` waited for an `ACCESS EXCLUSIVE` lock left that request
+/// queued on the server, blocking the application's queries on the table.
+pub fn pg_helper_pod_spec(
+    name: &str,
+    ns: &str,
+    image: &str,
+    password: &str,
+    keep_alive: Duration,
+) -> Value {
     json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -97,7 +116,11 @@ pub fn pg_dump_pod_spec(name: &str, ns: &str, image: &str, keep_alive: Duration)
             "containers": [{
                 "name": "dump",
                 "image": image,
-                "command": keep_alive_command(keep_alive)
+                "command": keep_alive_command(keep_alive),
+                "env": [
+                    { "name": "PGPASSWORD", "value": password },
+                    { "name": "PGOPTIONS", "value": crate::extract::PG_HELPER_PGOPTIONS }
+                ]
             }]
         }
     })
@@ -259,10 +282,11 @@ mod tests {
 
     #[test]
     fn pg_dump_pod_uses_pg_image_and_no_pvc_mount() {
-        let p = pg_dump_pod_spec(
+        let p = pg_helper_pod_spec(
             "bk-pg-alpha",
             "demo",
             "postgres:16-alpine",
+            "pw",
             DEFAULT_RUN_DEADLINE,
         );
         assert_eq!(p["spec"]["containers"][0]["image"], "postgres:16-alpine");
@@ -324,7 +348,7 @@ mod tests {
         let twelve_hours = Duration::from_secs(43200);
         let want = json!(["sleep", "43200"]);
         for spec in [
-            pg_dump_pod_spec("bk-pg-db", "demo", "postgres:18-alpine", twelve_hours),
+            pg_helper_pod_spec("bk-pg-db", "demo", "postgres:18-alpine", "pw", twelve_hours),
             volume_pod_spec(
                 "bk-vol-v",
                 "demo",

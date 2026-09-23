@@ -27,11 +27,11 @@ use std::path::Path;
 use std::time::Duration;
 
 use cli_core::{CliError, Result};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::helper_pod::{
     apply_and_wait_pod_ready, delete_pod_best_effort, exec_stream_to_file, nats_pod_spec,
-    volume_pod_spec,
+    pg_helper_pod_spec, volume_pod_spec,
 };
 use crate::images;
 use crate::kube::KubeExec;
@@ -364,40 +364,6 @@ pub fn pod_name_segment(s: &str) -> String {
 // Impure extraction driver (walk-validated; not unit-tested)
 // ---------------------------------------------------------------------------
 
-/// Build a `pg_dump` helper Pod spec with `PGPASSWORD` injected into the
-/// container environment so `pg_dump` never needs an interactive prompt, and
-/// [`PG_DUMP_PGOPTIONS`] so an abandoned dump's server session ends with it.
-/// All other fields mirror `helper_pod::pg_dump_pod_spec`.
-pub(crate) fn pg_dump_pod_spec_with_password(
-    name: &str,
-    ns: &str,
-    image: &str,
-    password: &str,
-    keep_alive: Duration,
-) -> Value {
-    json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": name,
-            "namespace": ns,
-            "labels": { "apprafter.io/backup-helper": "true" }
-        },
-        "spec": {
-            "restartPolicy": "Never",
-            "containers": [{
-                "name": "dump",
-                "image": image,
-                "command": crate::helper_pod::keep_alive_command(keep_alive),
-                "env": [
-                    { "name": "PGPASSWORD", "value": password },
-                    { "name": "PGOPTIONS", "value": PG_DUMP_PGOPTIONS }
-                ]
-            }]
-        }
-    })
-}
-
 /// Drive all extraction items to completion, writing each artifact under
 /// `out_dir`:
 ///
@@ -517,7 +483,7 @@ fn extract_pg(
         namespace: ns,
         k,
     };
-    let spec = pg_dump_pod_spec_with_password(&pod_name, ns, pg_image, &pass, keep_alive);
+    let spec = pg_helper_pod_spec(&pod_name, ns, pg_image, &pass, keep_alive);
     apply_and_wait_pod_ready(k, &spec)?;
 
     // 3. Stream pg_dump output to disk.
@@ -849,8 +815,10 @@ pub const PG_DUMP_LOCK_WAIT_TIMEOUT: &str = "300s";
 /// take as long as it needs; the run's own deadline is what bounds that.
 pub const PG_DUMP_FIRST_OUTPUT_WITHIN: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// The `PGOPTIONS` the `pg_dump` helper connects with: the server checks
-/// every ten seconds, while a statement runs, that the client is still there.
+/// The `PGOPTIONS` every PostgreSQL helper connects with — the `pg_dump` of a
+/// backup or export and the `pg_restore` of a restore
+/// ([`crate::helper_pod::pg_helper_pod_spec`]): the server checks every ten
+/// seconds, while a statement runs, that the client is still there.
 ///
 /// A run abandons a dump in two ways, [`PG_DUMP_FIRST_OUTPUT_WITHIN`] and the
 /// runner's stop at its deadline, and both end in deleting the helper pod,
@@ -863,6 +831,15 @@ pub const PG_DUMP_FIRST_OUTPUT_WITHIN: std::time::Duration = std::time::Duration
 /// first-output bound ends each stuck run at ten minutes instead of letting it
 /// block the next one, every scheduled run would add another such session.
 ///
+/// A restore stopped the same way is worse. `pg_restore --clean` starts with
+/// `DROP TABLE`, which waits for `ACCESS EXCLUSIVE` behind any open
+/// transaction that has read the table, and a queued `ACCESS EXCLUSIVE`
+/// request blocks every later reader of that table too. Measured on PostgreSQL
+/// 18.6: a `pg_restore` killed while its `DROP TABLE` waited behind a reader's
+/// open transaction left the `DROP` queued 20 s later, and a plain `SELECT` on
+/// the table timed out behind it; with the setting the session was gone and
+/// the `SELECT` answered.
+///
 /// `client_connection_check_interval` makes a running statement poll its
 /// socket, a lock wait included. Measured on PostgreSQL 18.6, with a `pg_dump`
 /// waiting in `pg_get_viewdef` behind a `REFRESH MATERIALIZED VIEW` held in an
@@ -870,12 +847,13 @@ pub const PG_DUMP_FIRST_OUTPUT_WITHIN: std::time::Duration = std::time::Duration
 /// session was still waiting, and still holding its table lock, 20 s later;
 /// with it the session was gone 5 s after the kill. `pg_dump` resets
 /// `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout`
-/// and `transaction_timeout` when it connects, but not this.
+/// and `transaction_timeout` when it connects, and `pg_restore` sets the same
+/// four from the archive, but neither touches this.
 ///
 /// The setting needs PostgreSQL 14 or later on Linux, and a server that does
 /// not know it refuses the connection outright. The platform's CNPG clusters
 /// run PostgreSQL 18 (`CNPG_OPERAND_IMAGE` in the provisioner).
-pub const PG_DUMP_PGOPTIONS: &str = "-c client_connection_check_interval=10s";
+pub const PG_HELPER_PGOPTIONS: &str = "-c client_connection_check_interval=10s";
 
 /// Build the `pg_dump` argument vector for a custom-format dump.
 ///

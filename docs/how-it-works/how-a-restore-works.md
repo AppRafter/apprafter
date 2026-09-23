@@ -122,7 +122,13 @@ Five behaviours are load-bearing:
   credentials come from the claim's **fresh** `status.connectionSecretRef`
   (the post-provision Secret), never the credentials embedded in the backup.
   `--no-owner` is assumed because the restored database role is the
-  newly-provisioned one, not whatever owned the objects on the source.
+  newly-provisioned one, not whatever owned the objects on the source. The
+  helper connects with `client_connection_check_interval` set to ten seconds,
+  as a backup's does. `--clean` starts with `DROP TABLE`, which waits behind
+  any open transaction that has read the table, and while it waits every later
+  query on that table queues behind it. Without the setting, a restore stopped
+  at that point would leave its `DROP` waiting on the server after the helper
+  pod was gone; with it, the server ends that session within seconds.
 - **Volumes** are restored by streaming the tar on stdin to `tar x` in a
   helper pod that mounts the fresh PVC read-write.
 - **Redis** (persistent claims) is restored by live-loading the captured

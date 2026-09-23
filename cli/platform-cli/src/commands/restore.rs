@@ -44,7 +44,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::commands::backup::KubectlExec;
-use backup_core::helper_pod::{pg_dump_pod_spec, volume_pod_spec};
+use backup_core::helper_pod::{pg_helper_pod_spec, volume_pod_spec};
 use backup_core::KubeExec;
 use base64::Engine as _;
 use cli_core::{CliError, Result};
@@ -2477,30 +2477,6 @@ fn pg_restore_argv(conn: &PgConnection) -> Vec<String> {
     ]
 }
 
-/// The pg helper pod spec (a network pod — the pg_dump image carries
-/// `pg_restore`) with `PGPASSWORD` injected so `pg_restore` never prompts for a
-/// password and hangs the restore.
-fn pg_helper_pod_spec(
-    pod_name: &str,
-    ns: &str,
-    pg_image: &str,
-    pass: &str,
-    keep_alive: std::time::Duration,
-) -> Value {
-    let mut spec = pg_dump_pod_spec(pod_name, ns, pg_image, keep_alive);
-    if let Some(container) = spec
-        .pointer_mut("/spec/containers/0")
-        .and_then(Value::as_object_mut)
-    {
-        // replaces env — pg_dump_pod_spec has no env; keep in sync if that changes
-        container.insert(
-            "env".to_string(),
-            serde_json::json!([{ "name": "PGPASSWORD", "value": pass }]),
-        );
-    }
-    spec
-}
-
 /// Stand a pg helper pod up, wait for the database behind `probe` to answer,
 /// and stream the dump into `pg_restore` on its stdin (L2). The pod is deleted
 /// on every return path by [`PodCleanupGuard`].
@@ -2516,6 +2492,10 @@ fn run_pg_restore(
     probe: &dyn Fn(&str) -> Result<()>,
 ) -> Result<()> {
     let pod_name = truncate_pod_name(&format!("ld-pg-{claim}"));
+    // The backup's own pg helper builder (the pg_dump image carries
+    // `pg_restore`): `PGPASSWORD` so `pg_restore` never prompts and hangs the
+    // restore, and `PGOPTIONS` so a `pg_restore` stopped while its `--clean`
+    // waits on a lock does not leave that request queued on the server.
     let spec = pg_helper_pod_spec(&pod_name, ns, pg_image, &conn.pass, keep_alive);
 
     let _guard = PodCleanupGuard {
@@ -6494,7 +6474,10 @@ mod tests {
 
     /// `PGPASSWORD` must reach the helper pod's environment, or `pg_restore`
     /// prompts for a password on a pod with no TTY and the restore hangs until
-    /// the user gives up.
+    /// the user gives up. `PGOPTIONS` must too: without it a `pg_restore`
+    /// stopped while its `--clean` waits for `ACCESS EXCLUSIVE` leaves that
+    /// request queued on the server, and every later reader of the table
+    /// queues behind it (measured on PostgreSQL 18.6).
     #[test]
     fn pg_helper_pod_spec_injects_the_password_into_the_container_env() {
         let spec = pg_helper_pod_spec(
@@ -6514,10 +6497,12 @@ mod tests {
             serde_json::json!(["sleep", "21600"])
         );
         assert_eq!(
-            spec["spec"]["containers"][0]["env"][0]["name"],
-            "PGPASSWORD"
+            spec["spec"]["containers"][0]["env"],
+            serde_json::json!([
+                { "name": "PGPASSWORD", "value": "s3cret" },
+                { "name": "PGOPTIONS", "value": "-c client_connection_check_interval=10s" }
+            ])
         );
-        assert_eq!(spec["spec"]["containers"][0]["env"][0]["value"], "s3cret");
     }
 
     /// The reachability probe runs `psql -d <db>`, NOT `pg_isready`: on a
@@ -6613,6 +6598,16 @@ mod tests {
             "the probe runs in the helper pod"
         );
         assert_eq!(k.applied.borrow().len(), 1);
+        // The pod the load really ran in carries the connection check: a
+        // `pg_restore` stopped while its `--clean` waits on a lock must not
+        // leave that request queued on the server.
+        assert_eq!(
+            k.applied.borrow()[0]["spec"]["containers"][0]["env"][1],
+            serde_json::json!({
+                "name": "PGOPTIONS",
+                "value": "-c client_connection_check_interval=10s"
+            })
+        );
         let execs = k.execs.borrow();
         assert_eq!(execs[0].0, "ld-pg-db");
         assert_eq!(execs[0].1, "demo");
