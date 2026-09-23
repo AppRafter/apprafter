@@ -21,6 +21,15 @@
 #
 # ## What it checks
 #
+#   0. each operator chart's `version` == its own `appVersion`. The chart is
+#      published under `version` (release-operator.yml packages it with
+#      `helm package`, which names the artefact after Chart.yaml `version`),
+#      while platform-stack pins it by that same string. A bump that moved
+#      only `appVersion` (7b3f4f2, caught by the wave-1 upgrade walk on
+#      2026-09-23) would re-publish the OLD chart version and never produce
+#      the pinned one: Argo CD's `helm pull --version vX` then fails, the
+#      operator and webhook Applications sit in ComparisonError on the old
+#      images, and the root Application still reports Synced/Healthy.
 #   1. platform-stack's operator pin == the operator chart's appVersion
 #   2. platform-stack's webhook pin == the webhook chart's appVersion
 #   3. the compatibility entry for `currentVersion` names that same operator
@@ -56,13 +65,15 @@ read_cue_field() { sed -n "s/^[[:space:]]*$2:[[:space:]]*\"\([^\"]*\)\".*/\1/p" 
 
 operator_app="$(read_yaml_field operator/charts/apprafter-operator/Chart.yaml appVersion)"
 webhook_app="$(read_yaml_field operator/charts/apprafter-admission-webhook/Chart.yaml appVersion)"
+operator_chart="$(read_yaml_field operator/charts/apprafter-operator/Chart.yaml version)"
+webhook_chart="$(read_yaml_field operator/charts/apprafter-admission-webhook/Chart.yaml version)"
 operator_pin="$(read_cue_field platform-stack/cue/component_apprafter-operator.cue version)"
 webhook_pin="$(read_cue_field platform-stack/cue/component_admission-webhook.cue version)"
 cuecmp_version="$(read_cue_field argocd-cue-cmp/version.cue version)"
 current_version="$(sed -n 's/^currentVersion:[[:space:]]*#Version[[:space:]]*&[[:space:]]*"\([^"]*\)".*/\1/p' \
     platform-stack/cue/platform.cue | head -1)"
 
-for v in operator_app webhook_app operator_pin webhook_pin cuecmp_version current_version; do
+for v in operator_app webhook_app operator_chart webhook_chart operator_pin webhook_pin cuecmp_version current_version; do
     if [[ -z "${!v:-}" ]]; then
         echo "::error::could not read ${v} — a version literal moved or changed shape" >&2
         exit 2
@@ -81,13 +92,28 @@ compat_operator="$(awk -v ver="\"${current_version}\"" '
 ' platform-stack/cue/compatibility.cue)"
 
 echo "==> version pins"
+note "operator chart version" "$operator_chart"
 note "operator chart appVersion" "$operator_app"
+note "webhook chart version" "$webhook_chart"
 note "webhook chart appVersion" "$webhook_app"
 note "platform-stack operator pin" "$operator_pin"
 note "platform-stack webhook pin" "$webhook_pin"
 note "platform-stack currentVersion" "$current_version"
 note "compatibility operatorVersion" "${compat_operator:-<missing>}"
 note "argocd-cue-cmp version" "$cuecmp_version"
+
+# --- 0: a chart is published under its `version` -------------------------
+if [[ "$operator_chart" != "$operator_app" ]]; then
+    bad "the operator chart declares version ${operator_chart} but appVersion ${operator_app}.
+release-operator.yml publishes the chart under \`version\`, and platform-stack pins it by that
+string, so chart ${operator_app} would never exist and clusters would stay on the old operator
+while the root Application reports Synced/Healthy.
+Fix: operator/charts/apprafter-operator/Chart.yaml — move \`version\` with \`appVersion\`"
+fi
+if [[ "$webhook_chart" != "$webhook_app" ]]; then
+    bad "the admission-webhook chart declares version ${webhook_chart} but appVersion ${webhook_app}.
+Fix: operator/charts/apprafter-admission-webhook/Chart.yaml — move \`version\` with \`appVersion\`"
+fi
 
 # --- 1-3: the pins must agree --------------------------------------------
 if [[ "$operator_pin" != "$operator_app" ]]; then
