@@ -202,7 +202,10 @@ as `Failed: DeadlineExceeded`, and the next scheduled run goes ahead as normal
 ([how long a run may take](../how-it-works/backup-retention-and-checks.md#how-long-a-run-may-take)).
 A backup stopped this way records it like any other failure: `lastError` in
 `backup status` reads `run exceeded its deadline of 6h …`, and the failure
-webhook fires. If your backups legitimately take longer — typically the first
+webhook fires. That record is the runner's own, so a Job whose pod never
+started records nothing but its `Failed: DeadlineExceeded` line: [the backup
+runner's pod cannot be scheduled](backup-restore.md#runner-unschedulable).
+If your backups legitimately take longer — typically the first
 one of a large data set, and the same limit applies to each claim's dump
 within it — raise the limit:
 

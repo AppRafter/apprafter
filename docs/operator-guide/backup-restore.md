@@ -362,6 +362,11 @@ Job is created, and `--timeout <minutes>` bounds the wait — neither cancels
 anything, because the Job belongs to the cluster once it exists. Ctrl-C is
 equally safe.
 
+The one exception is a Job that never starts. If no node has room for its pod
+for two minutes, the command deletes the Job, prints the scheduler's reason and
+exits non-zero: [the backup runner's pod cannot be
+scheduled](#runner-unschedulable).
+
 A suspended schedule (`backup disable`) does not block a manual run: taking one
 last backup after turning the schedule off is a normal thing to want.
 
@@ -550,6 +555,87 @@ any matching `pg_restore`, e.g. `pg_restore -l pg/demo/shop-pg.dump` to list
 the table of contents, or restore into a local database with
 `pg_restore --no-owner -d <local-db> pg/demo/shop-pg.dump`. Volume tars are
 plain tarballs: `tar -tf volumes/demo/shop-disk/data.tar`.
+
+## Troubleshooting
+
+### The backup runner's pod cannot be scheduled {#runner-unschedulable}
+
+`apprafter backup run` stops after about two minutes and exits non-zero:
+
+```text
+  … its pod cannot be scheduled (1m 37s so far, giving up at 2m 0s): 0/1 nodes are available: 1 Insufficient memory. …
+  ✗ The backup never started: no node has room for its pod.
+    The scheduler says: 0/1 nodes are available: 1 Insufficient memory. …
+    The runner asks for 256Mi of memory and 100m of CPU. The scheduled backup asks for the same, so it cannot start either.
+    …
+Error: apprafter::backup::runner_unschedulable
+
+  × backup Job apprafter-backup-manual-20260923-172005 never started: no node
+  │ had room for its pod for 2m 3s
+```
+
+`apprafter backup status` shows the Job the same way, instead of `Running`:
+
+```text
+  Last backup Job: apprafter-backup-29836406 — Pending, cannot be scheduled: 0/1 nodes are available: 1 Insufficient memory. … (2026-09-23 18:26:00 Europe/Lisbon)
+    No node has room for the backup runner's pod, which asks for 256Mi of memory and 100m of CPU.
+    `apprafter top` shows how much of each node is requested, and by what.
+    Until this Job runs or its deadline stops it, the schedule starts no other backup.
+```
+
+The backup runner's pod requests 256Mi of memory and 100m of CPU, and so does
+the weekly check's. Kubernetes places a pod only on a node whose allocatable
+capacity, less what the pods already there request, covers that request. On a
+node that is nearly fully requested, no node qualifies and the pod stays
+`Pending`. A 4 GB machine running an application that declares both
+`needs.pg` and a persistent `needs.redis` is such a node. The scheduled backup
+is the same Job with the same requests, so it cannot start either.
+
+Check how much room is left:
+
+```sh
+apprafter top            # SCHEDULABLE: what a new pod could still request
+apprafter backup status  # Last backup Job / Last check Job: Pending, cannot be scheduled
+```
+
+While the runner waits, `apprafter top` also reports `1 pod(s) are not
+scheduled to a node`. If the node's `SCHEDULABLE` memory is below 256Mi, the
+runner cannot be placed.
+
+??? note "Checking without the CLI"
+
+    A runner pod in `Pending` with a `FailedScheduling` event is the case
+    described here:
+
+    ```sh
+    kubectl -n apprafter-system get pods -l apprafter.io/backup-runner=true
+    kubectl -n apprafter-system get events --field-selector reason=FailedScheduling
+    ```
+
+To fix it, free enough requested memory for the runner's 256Mi, or move to a
+larger machine ([Moving to a bigger machine](moving-to-a-bigger-machine.md)). Once
+there is room, a scheduled Job that was waiting starts on its own within
+moments, and `apprafter backup status` shows it `Running` and then its result.
+Otherwise run `apprafter backup run` to confirm a backup completes. Start it
+only when `backup status` shows no Job running: two runs that need the same
+helper pod do not both finish.
+
+A pod that only waits for another pod to finish stopping is placed within
+seconds of that pod being gone. That is why `backup run` waits two minutes
+before it gives up. It deletes its Job when it gives up. Left in place, the
+Job would start on its own whenever room appeared, at a time nobody chose and
+possibly while the scheduled backup runs.
+
+A scheduled Job that cannot start holds the schedule: the CronJob starts no
+other backup while one of its Jobs is active. The Job's deadline, six hours by
+default ([A run that stopped at its
+deadline](backup-maintenance.md#a-run-that-stopped-at-its-deadline)), fails it
+as `Failed: DeadlineExceeded`, and the next night's Job meets the same full
+node. Because the runner never started, it records nothing itself: `lastError`
+is not written and the failure webhook does not fire. What shows the problem
+is the `Last backup Job:` line and a `lastSuccess` that stops moving. A
+platform chart older than 0.2.80 sets no deadline on the backup Job, so there
+a Job stuck this way waits, and holds the schedule, until the node has room.
 
 ## See also
 

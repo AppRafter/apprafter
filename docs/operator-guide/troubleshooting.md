@@ -257,6 +257,23 @@ socket. Common cases: missing directory, wrong permissions
 target-store files, re-create the offending target with
 `apprafter target add <name> --force`.
 
+### `apprafter::backup::runner_unschedulable`
+
+`apprafter backup run` (or the first backup `apprafter backup enable`
+takes) created the backup Job, but for two minutes no node had room for
+its pod. The command deleted the Job and stopped. The lines it printed
+just before the error give the scheduler's reason
+(`0/1 nodes are available: 1 Insufficient memory. …`) and what the
+runner asks for.
+
+**Fix.** `apprafter top` shows how much of each node is requested, and by
+what. Free enough for the runner, or move to a bigger machine, then run
+`apprafter backup run` again. The scheduled backup asks for the same room,
+so it cannot start either until then. The whole case, including how to
+tell whether tonight's scheduled backup is stuck:
+[the backup runner's pod cannot be
+scheduled](backup-restore.md#runner-unschedulable).
+
 ### `apprafter::cli::other`
 
 Catch-all for messages that haven't been promoted to a typed
