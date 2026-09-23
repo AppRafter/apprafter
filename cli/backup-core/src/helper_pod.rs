@@ -20,8 +20,15 @@
 //! Job deadline of six. It is now the run's deadline ([`run_deadline_of`]):
 //! the scheduled runner passes its Job's `activeDeadlineSeconds`, and the CLI
 //! the same cluster setting, so one number decides how long a backup may
-//! take. It is also the reaper for a helper pod nobody deleted — a runner or a
-//! CLI killed before its cleanup ran.
+//! take.
+//!
+//! For a helper pod nobody deleted (a runner or a CLI killed before its
+//! cleanup ran), the keep-alive ends the pod's process, not the Pod: with
+//! `restartPolicy: Never` the object stays behind, `Completed`, until
+//! something deletes it. The next run that applies a helper pod of that name
+//! (the same step for the same claim) fails on it: an unchanged spec applies,
+//! and the pod never becomes Ready within the five-minute wait. A backup's
+//! cleanup deletes it then, so it costs one failed run.
 //!
 //! # Impure forwarding helpers
 //!

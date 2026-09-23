@@ -301,8 +301,12 @@ bounds one claim's extraction as well as the whole run, and raising it gives a
 single large dump more time too. `apprafter backup create`, `apprafter export`
 and `apprafter restore` have no Job and no deadline — the person
 running them stops them — but their helper pods live the same
-`spec.backup.activeDeadlineSeconds` (six hours when unset), which is also what
-removes a helper pod the command was killed before it could delete.
+`spec.backup.activeDeadlineSeconds` (six hours when unset). A helper pod that
+a command or run was killed before it could delete stops running then, but
+the pod itself stays behind as `Completed` until something deletes it. The
+next command that uses a helper pod of that name, the same step for the same
+claim, fails on it after waiting five minutes for it to become ready. A backup
+then deletes it, so it costs one failed run.
 
 Pick the value against the schedule it applies to:
 

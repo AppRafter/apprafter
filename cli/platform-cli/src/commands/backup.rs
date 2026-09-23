@@ -1653,8 +1653,9 @@ pub fn run_backup(
     // An interactive backup has no Job deadline — the person running it is
     // the one who stops it. Its helper pods still live only as long as a
     // scheduled backup of the same cluster may run: the same number bounds
-    // one extraction either way, and it reaps a helper pod this command was
-    // killed before deleting.
+    // one extraction either way. For a helper pod this command was killed
+    // before deleting, it ends the pod's process; the Pod object stays,
+    // `Completed` (see `backup_core::helper_pod`).
     let helper_keep_alive = backup_core::engine::read_run_deadline(&k)?;
 
     // Stage everything under a tempdir; the engine writes data/ under this root.
