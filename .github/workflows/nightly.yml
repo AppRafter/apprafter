@@ -62,6 +62,15 @@ jobs:
         with:
           version: 'v1.37.0'
 
+      # cluster-bootstrap (inside `apprafter up`) shells out to helm for the
+      # Cilium and Argo CD loader releases. Without this step it would run
+      # whatever helm the runner image carries, a 3.x that changes when the
+      # image does. The same pin as every other workflow that sets up helm.
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.0
+
       - name: Install CUE
         uses: cue-lang/setup-cue@b0e30e540a2dae47304ebf16586a5b2db023b61c # v2.0.0
         with:
