@@ -64,6 +64,15 @@ pub const COND_NODE_DISK_PRESSURE: &str = "NodeDiskPressure";
 /// `spec.backup.enabled` is not true. See `backup_health`.
 pub const COND_BACKUP_HEALTHY: &str = "BackupHealthy";
 
+/// `BackupRetention` — whether the backup repository's retention is enforced
+/// in the cluster, with the repository's size and growth (WI-389). Built
+/// from the runner's own record of its check and prune: `False` for a key
+/// that may not delete (`PruneNotPermitted`) or for retention chosen to run
+/// outside the cluster, without marking backups as failing — that is
+/// `BackupHealthy`'s question. Absent while `spec.backup.enabled` is not
+/// true. See `backup_retention`.
+pub const COND_BACKUP_RETENTION: &str = "BackupRetention";
+
 /// Maximum entries kept in `PlatformStack.status.versionHistory`.
 /// Ring-buffer behaviour: oldest entry drops when this cap is
 /// exceeded. Per spec.md §3.11 ("recent N transitions"); 10 is

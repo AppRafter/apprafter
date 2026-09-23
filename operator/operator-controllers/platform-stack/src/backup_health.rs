@@ -68,16 +68,17 @@
 //! which is a failing backup in every sense that matters.
 //!
 //! Whether retention is enforced is a different question and gets its own
-//! condition, `BackupRetention`, rather than more reasons here. The
-//! in-cluster key that ADR 0050 recommends is scoped so that it cannot
-//! delete, and a cluster running on it can never prune: folded into this
-//! condition, that would be a permanent `False` on the recommended setup,
-//! and a real failure (a pod no node takes) would either hide behind it or
-//! push it out of sight. Two conditions keep both visible at once.
+//! condition, `BackupRetention` ([`crate::backup_retention`]), rather than
+//! more reasons here. The in-cluster key that ADR 0050 recommends is scoped
+//! so that it cannot delete, and a cluster running on it can never prune:
+//! folded into this condition, that would be a permanent `False` on the
+//! recommended setup, and a real failure (a pod no node takes) would either
+//! hide behind it or push it out of sight. Two conditions keep both visible
+//! at once.
 //!
-//! The model it follows is this one: the same reconcile writes it from the
-//! same [`Observed`] (the runner's status ConfigMap is already read, and
-//! is where a prune's outcome and the repository's size belong), through
+//! `BackupRetention` follows the same model: the same reconcile writes it
+//! from the same [`Observed`] (the runner's status ConfigMap, where the
+//! check run records its prune and the repository's size), through
 //! [`apply`] with its own type, in the same status write. One writer
 //! matters: `status.conditions` is an atomic list under the one field
 //! manager, so a condition written by anything else would need the CRD to
@@ -152,6 +153,11 @@ pub struct Observed {
     pub pods: Vec<Value>,
     /// `data` of [`RUNNER_STATUS_CONFIGMAP`], when it exists and was read.
     pub runner_status: Option<Value>,
+    /// Why [`RUNNER_STATUS_CONFIGMAP`] could not be read, when it could not.
+    /// `BackupHealthy` only quotes the record and ignores this;
+    /// `BackupRetention` is built from the record and says it is unreadable
+    /// rather than reading an absent record as "no check has run".
+    pub runner_status_error: Option<String>,
 }
 
 /// What the stack's `BackupHealthy` condition should be.
@@ -201,20 +207,32 @@ pub async fn observe(client: &Client) -> Result<Observed, String> {
         .list(&ListParams::default().labels(RUNNER_POD_SELECTOR))
         .await
         .map_err(|e| format!("listing the runner pods in {BACKUP_NAMESPACE}: {e}"))?;
-    // Enrichment only: a missing or unreadable record leaves the message
-    // without the runner's own words, and changes no verdict.
-    let runner_status = Api::<ConfigMap>::namespaced(client.clone(), BACKUP_NAMESPACE)
-        .get_opt(RUNNER_STATUS_CONFIGMAP)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|cm| cm.data)
-        .and_then(|d| serde_json::to_value(d).ok());
+    // For `BackupHealthy`, enrichment only: a missing or unreadable record
+    // leaves the message without the runner's own words, and changes no
+    // verdict. `BackupRetention` reads the error too.
+    let (runner_status, runner_status_error) =
+        match Api::<ConfigMap>::namespaced(client.clone(), BACKUP_NAMESPACE)
+            .get_opt(RUNNER_STATUS_CONFIGMAP)
+            .await
+        {
+            Ok(cm) => (
+                cm.and_then(|cm| cm.data)
+                    .and_then(|d| serde_json::to_value(d).ok()),
+                None,
+            ),
+            Err(e) => (
+                None,
+                Some(format!(
+                    "reading ConfigMap {BACKUP_NAMESPACE}/{RUNNER_STATUS_CONFIGMAP}: {e}"
+                )),
+            ),
+        };
     Ok(Observed {
         cronjobs: as_json(&cronjobs.items),
         jobs: as_json(&jobs.items),
         pods: as_json(&pods.items),
         runner_status,
+        runner_status_error,
     })
 }
 
@@ -369,13 +387,13 @@ impl Run {
 
     /// Where the runner's status ConfigMap records this run's failure, as
     /// `(time key, error key)`, so a failed Job can quote the runner's own
-    /// words. The check Job runs `restic check` directly and writes no
-    /// record, so a failed check quotes nothing; once it records its own
-    /// outcome, its keys go here and every failure message picks them up.
+    /// words. The check Job runs the runner in its check mode (WI-389),
+    /// which records `lastCheck` and, for a check that did not pass,
+    /// `lastCheckError` — empty for a pass, so a pass is never quoted.
     fn record_keys(self) -> Option<(&'static str, &'static str)> {
         match self {
             Run::Backup => Some(("lastFailure", "lastError")),
-            Run::Check => None,
+            Run::Check => Some(("lastCheck", "lastCheckError")),
         }
     }
 
@@ -1003,11 +1021,14 @@ fn runner_record(
     if last_failure < started || last_failure > window_end {
         return None;
     }
+    // One line: restic's own output — a failed check's especially — runs to
+    // many, which a condition message shows badly.
     let error = record
         .get(error_key)
         .and_then(Value::as_str)
-        .map(str::trim)
+        .map(|e| e.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|e| !e.is_empty())?;
+    let error = error.as_str();
     let mut quoted: String = error.chars().take(RUNNER_ERROR_QUOTE_MAX).collect();
     if quoted.len() < error.len() {
         quoted.push('…');
@@ -1338,6 +1359,7 @@ mod tests {
             jobs,
             pods,
             runner_status: None,
+            runner_status_error: None,
         }
     }
 
@@ -2034,10 +2056,13 @@ mod tests {
         );
         let mut o = observed(vec![good, check], vec![p]);
         o.cronjobs.push(cronjob(CHECK_CRONJOB));
-        // The runner's record is about backups; it is never quoted for a check.
-        o.runner_status = Some(
-            json!({ "lastFailure": "2026-09-21T06:11:00+00:00", "lastError": "backup error" }),
-        );
+        // The backup's record is never quoted for a check; the check's own
+        // is (WI-389), when it falls inside the check Job's life.
+        o.runner_status = Some(json!({
+            "lastFailure": "2026-09-21T06:11:00+00:00", "lastError": "backup error",
+            "lastCheck": "2026-09-21T06:11:08+00:00", "lastCheckResult": "failed",
+            "lastCheckError": "restic check:\n  pack 5e1f0a2b contains 1 error\n",
+        }));
         let (status, reason, message) = cond_of(&run(&o, &[]));
         // Every attempt of `restic check` ran and failed: the repository
         // reason, not the generic give-up the same ending is for a backup.
@@ -2052,6 +2077,42 @@ mod tests {
             "{message}"
         );
         assert!(!message.contains("backup error"), "{message}");
+        assert!(
+            message.contains("The runner recorded: restic check: pack 5e1f0a2b contains 1 error"),
+            "{message}"
+        );
+    }
+
+    /// A check that PASSED records `lastCheck` with an empty
+    /// `lastCheckError`: a later failed check Job (stopped at its deadline in
+    /// the prune, say) quotes nothing from it.
+    #[test]
+    fn a_passing_checks_record_is_never_quoted_as_a_failure() {
+        let good = backup_job(
+            "apprafter-backup-29312340",
+            "2026-09-23T03:00:00Z",
+            complete("2026-09-23T03:01:00Z"),
+        );
+        let mut check = job(
+            CHECK_CRONJOB,
+            "apprafter-backup-check-29310000",
+            "2026-09-21T06:00:00Z",
+            failed("BackoffLimitExceeded", "", "2026-09-21T06:12:00Z"),
+        );
+        check["status"]["failed"] = json!(1);
+        let p = exited(
+            pod(&check, "ccccc", "2026-09-21T06:11:00Z"),
+            1,
+            "2026-09-21T06:11:10Z",
+        );
+        let mut o = observed(vec![good, check], vec![p]);
+        o.cronjobs.push(cronjob(CHECK_CRONJOB));
+        o.runner_status = Some(json!({
+            "lastCheck": "2026-09-21T06:11:08+00:00", "lastCheckResult": "passed",
+            "lastCheckError": "",
+        }));
+        let (_, _, message) = cond_of(&run(&o, &[]));
+        assert!(!message.contains("The runner recorded"), "{message}");
     }
 
     #[test]

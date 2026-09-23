@@ -156,7 +156,25 @@ package v1alpha1
 			keepDaily?:   int & >0
 			keepWeekly?:  int & >0
 			keepMonthly?: int & >0
-			enforce:      "operator" | "cluster" | *"operator"
+
+			// Who prunes the repository. Absent means the platform
+			// default, `check`; set, it is kept across upgrades.
+			//
+			// - `check`: the weekly check Job, after a check that
+			//   passed, as far as the cluster's S3 key may delete. The
+			//   scoped key ADR 0050 recommends may not, and then nothing
+			//   is deleted and the `BackupRetention` condition says
+			//   retention is not enforced. A check that fails never
+			//   prunes.
+			// - `cluster`: the backup Job, after every backup. Needs a
+			//   key that may delete; a prune that fails fails the backup.
+			// - `operator`: nothing in the cluster prunes. Retention is
+			//   `apprafter backup prune`, run with full credentials.
+			//
+			// Optional rather than defaulted, so that a CR which sets
+			// only a keep count is valid and an absent value stays
+			// distinguishable from an explicit `operator`.
+			enforce?: "check" | "cluster" | "operator"
 		}
 		checkSchedule: string | *"0 6 * * 0"
 

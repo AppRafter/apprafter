@@ -195,6 +195,41 @@ else
     exit 1
 fi
 
+# WI-389. `retention.enforce` is optional, so that `apprafter backup set
+# keep-daily 5` — a merge-patch of `retention: {keepDaily: 5}` onto a CR that
+# never set retention — is accepted; with it required (as until WI-389) the
+# apiserver answered `spec.backup.retention.enforce: Required value`. Absent,
+# the chart's default applies (`check`); `check` is a value the enum takes.
+echo "==> regression: PlatformStack spec.backup.retention.enforce is optional and takes check (WI-389)"
+kubectl --context "$CTX" -n crd-validate patch platformstack crd-validate-tz --type merge \
+    -p '{"spec":{"backup":{"retention":{"keepDaily":5}}}}' >/dev/null 2>/tmp/crd-ret-err.txt || {
+    echo "==> REGRESSION: apiserver REJECTED a retention block with only a keep count" >&2
+    cat /tmp/crd-ret-err.txt >&2
+    exit 1
+}
+echo "    OK: a retention block with only keepDaily is accepted"
+kubectl --context "$CTX" -n crd-validate patch platformstack crd-validate-tz --type merge \
+    -p '{"spec":{"backup":{"retention":{"enforce":"check"}}}}' >/dev/null 2>/tmp/crd-ret-err.txt || {
+    echo "==> REGRESSION: apiserver REJECTED retention.enforce: check" >&2
+    cat /tmp/crd-ret-err.txt >&2
+    exit 1
+}
+_ret=$(kubectl --context "$CTX" -n crd-validate get platformstack crd-validate-tz \
+    -o jsonpath='{.spec.backup.retention.enforce}/{.spec.backup.retention.keepDaily}' 2>/dev/null || true)
+if [ "$_ret" = "check/5" ]; then
+    echo "    OK: retention.enforce check stored beside keepDaily (not pruned)"
+else
+    echo "==> REGRESSION: retention read back '${_ret}', want 'check/5'" >&2
+    exit 1
+fi
+if kubectl --context "$CTX" -n crd-validate patch platformstack crd-validate-tz --type merge \
+    -p '{"spec":{"backup":{"retention":{"enforce":"weekly"}}}}' >/dev/null 2>&1; then
+    echo "==> REGRESSION: apiserver ACCEPTED retention.enforce: weekly" >&2
+    exit 1
+fi
+echo "    OK: a retention mode that does not exist is rejected by the apiserver"
+rm -f /tmp/crd-ret-err.txt
+
 # A4, the same pruning failure mode one level up. `spec.firewall` is the ONLY
 # record of the Cloudflare origin-firewall intent that a backup can see — the
 # toggle itself is a cloud object the CLI reconciles from the operator's local

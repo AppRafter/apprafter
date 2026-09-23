@@ -538,7 +538,14 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     // and the condition must not freeze for its duration. Every write below
     // sends the WHOLE status — this condition included — under the one field
     // manager, so it is never pruned by a write that forgot it.
-    let backup_recheck = assess_backup_health(&ctx, spec, &prior_conds, now, &mut new_status).await;
+    let last_prune = stack
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(LAST_PRUNE_ANNOTATION))
+        .map(String::as_str);
+    let backup_recheck =
+        assess_backup_health(&ctx, spec, last_prune, &prior_conds, now, &mut new_status).await;
 
     // 6. In-flight gating. We do NOT fight an in-progress sync —
     //    Argo CD's app-controller is mid-apply; another patch
@@ -1204,17 +1211,23 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
     )))
 }
 
-/// Read the backup objects and put the `BackupHealthy` verdict on
-/// `new_status`. Returns when to look again because a runner pod's grace
-/// ends (see `backup_health`).
+/// The annotation `apprafter backup prune` stamps on the stack when it has
+/// pruned from outside the cluster. `BackupRetention` names it.
+const LAST_PRUNE_ANNOTATION: &str = "apprafter.io/last-prune";
+
+/// Read the backup objects and put the `BackupHealthy` and `BackupRetention`
+/// verdicts on `new_status`. Returns when to look again because a runner
+/// pod's grace ends (see `backup_health`).
 ///
 /// Never fails the reconcile. A read that fails is itself the verdict
-/// (`Unknown`, `StateUnreadable`), rather than a stale `True` left in place
-/// or a reconcile error that would freeze every other condition too — the
-/// ADR 0048 anchor-403 lesson. Nothing is read while backups are disabled.
+/// (`Unknown`, `StateUnreadable` / `RecordUnreadable`), rather than a stale
+/// `True` left in place or a reconcile error that would freeze every other
+/// condition too — the ADR 0048 anchor-403 lesson. Nothing is read while
+/// backups are disabled.
 async fn assess_backup_health(
     ctx: &Context,
     spec: &operator_core::PlatformStackSpec,
+    last_prune: Option<&str>,
     prior_conds: &[PlatformStackCondition],
     now: DateTime<Utc>,
     new_status: &mut PlatformStackStatus,
@@ -1239,6 +1252,18 @@ async fn assess_backup_health(
         new_status,
         crate::status::COND_BACKUP_HEALTHY,
         &assessment.verdict,
+        prior_conds,
+    );
+    // Retention, from the same reads, in the same write.
+    let retention = crate::backup_retention::assess(
+        spec.backup.as_ref(),
+        last_prune,
+        observed.as_ref().map_err(String::as_str),
+    );
+    crate::backup_health::apply(
+        new_status,
+        crate::status::COND_BACKUP_RETENTION,
+        &retention,
         prior_conds,
     );
     assessment.recheck_after
@@ -3537,7 +3562,7 @@ mod backup_reconcile_tests {
     use crate::backup_health::{
         REASON_NO_RUN_YET, REASON_SUCCEEDED, REASON_UNREADABLE, REASON_UNSCHEDULABLE,
     };
-    use crate::status::COND_BACKUP_HEALTHY;
+    use crate::status::{COND_BACKUP_HEALTHY, COND_BACKUP_RETENTION};
 
     #[derive(Clone, Debug)]
     struct Call {
@@ -3561,6 +3586,8 @@ mod backup_reconcile_tests {
         pods: Vec<Value>,
         /// Answer every Job list with 403, as a missing RBAC rule would.
         forbid_jobs: bool,
+        /// `data` of the runner's status ConfigMap; `None` answers 404.
+        runner_status: Option<Value>,
     }
 
     fn not_found() -> (u16, Value) {
@@ -3613,6 +3640,18 @@ mod backup_reconcile_tests {
                     call.uri
                 );
                 list("PodList", "v1", &cluster.pods)
+            }
+            ("GET", p) if p == format!("/api/v1{ns}/configmaps/apprafter-backup-status") => {
+                match &cluster.runner_status {
+                    Some(data) => (
+                        200,
+                        json!({ "apiVersion": "v1", "kind": "ConfigMap",
+                                "metadata": { "name": "apprafter-backup-status",
+                                              "namespace": "apprafter-system" },
+                                "data": data }),
+                    ),
+                    None => not_found(),
+                }
             }
             ("GET", p) if p.starts_with(&format!("/api/v1{ns}/configmaps/")) => not_found(),
             ("GET", p)
@@ -3857,6 +3896,7 @@ mod backup_reconcile_tests {
             jobs: vec![job(name, &ago(20), json!([]))],
             pods: vec![pending_pod(name, &ago(20))],
             forbid_jobs: false,
+            runner_status: None,
         })
         .await;
         let patch = status_patch(&calls);
@@ -3885,6 +3925,7 @@ mod backup_reconcile_tests {
             jobs: vec![job(name, &ago(5), json!([]))],
             pods: vec![pending_pod(name, &ago(5))],
             forbid_jobs: false,
+            runner_status: None,
         })
         .await;
         let c = written_condition(status_patch(&calls), COND_BACKUP_HEALTHY).unwrap();
@@ -3916,6 +3957,7 @@ mod backup_reconcile_tests {
             jobs: vec![job("apprafter-backup-29312340", &ago(61), done)],
             pods: vec![],
             forbid_jobs: false,
+            runner_status: None,
         })
         .await;
         let patch = status_patch(&calls);
@@ -3944,6 +3986,7 @@ mod backup_reconcile_tests {
             jobs: vec![],
             pods: vec![],
             forbid_jobs: false,
+            runner_status: None,
         })
         .await;
         let patch = status_patch(&calls);
@@ -3970,6 +4013,7 @@ mod backup_reconcile_tests {
             jobs: vec![],
             pods: vec![],
             forbid_jobs: true,
+            runner_status: None,
         })
         .await;
         let patch = status_patch(&calls);
@@ -3998,10 +4042,89 @@ mod backup_reconcile_tests {
             jobs: vec![job(name, &ago(20), json!([]))],
             pods: vec![pending_pod(name, &ago(20))],
             forbid_jobs: false,
+            runner_status: None,
         })
         .await;
         let c = written_condition(status_patch(&calls), COND_BACKUP_HEALTHY).unwrap();
         assert_eq!(c["reason"], REASON_UNSCHEDULABLE);
         assert_eq!(action, Action::requeue(IN_FLIGHT_REQUEUE));
+    }
+
+    /// WI-389: the scoped key's prune, recorded by the check run, reaches
+    /// the stack as its own condition in the same write — `BackupHealthy`
+    /// stays about the runs, and nothing else is lost.
+    #[tokio::test]
+    async fn a_prune_the_key_may_not_run_reaches_the_stack_as_its_own_condition() {
+        let mut stack = stack(true, vec![]);
+        stack["spec"]["backup"]["checkSchedule"] = json!("0 6 * * 0");
+        stack["metadata"]["annotations"] =
+            json!({ "apprafter.io/last-prune": "2026-09-01T10:00:00+00:00" });
+        let parent = parent(&stack, "0.2.80", "Synced");
+        let done = ago(60);
+        let (_, calls) = reconcile_once(Cluster {
+            parent,
+            stack,
+            cronjobs: vec![cronjob()],
+            jobs: vec![job(
+                "apprafter-backup-29312340",
+                &ago(70),
+                json!([{ "type": "Complete", "status": "True", "lastTransitionTime": done }]),
+            )],
+            pods: vec![],
+            forbid_jobs: false,
+            runner_status: Some(json!({
+                "lastSuccess": done,
+                "lastCheck": "2026-09-20T06:00:30+00:00", "lastCheckResult": "passed",
+                "lastCheckError": "",
+                "lastPrune": "2026-09-20T06:00:41+00:00", "lastPruneResult": "not-permitted",
+                "lastPruneBy": "check",
+                "lastPruneDetail": "not permitted: the storage refused to delete snapshot \
+                    ecd0be32 (Access Denied.), so nothing was deleted",
+                "repoStatsAt": "2026-09-20T06:00:44+00:00", "repoBytes": "1288490189",
+                "repoSnapshots": "42", "repoBlobs": "310512",
+            })),
+        })
+        .await;
+        let patch = status_patch(&calls);
+        let health = written_condition(patch, COND_BACKUP_HEALTHY).expect("BackupHealthy");
+        assert_eq!(
+            health["status"], "True",
+            "retention is not a failing backup"
+        );
+        let c = written_condition(patch, COND_BACKUP_RETENTION).expect("BackupRetention written");
+        assert_eq!(c["status"], "False");
+        assert_eq!(c["reason"], crate::backup_retention::REASON_NOT_PERMITTED);
+        let message = c["message"].as_str().unwrap();
+        assert!(message.contains("retention is not enforced"), "{message}");
+        assert!(message.contains("1.2 GiB in 42 snapshot(s)"), "{message}");
+        assert!(message.contains("2026-09-01T10:00:00+00:00"), "{message}");
+        assert_everything_else_carried(patch);
+    }
+
+    #[tokio::test]
+    async fn disabling_backups_removes_the_retention_condition_too() {
+        let old = json!({
+            "type": COND_BACKUP_RETENTION, "status": "False", "reason": "PruneNotPermitted",
+            "message": "m", "lastTransitionTime": "2026-09-22T03:10:05+00:00",
+        });
+        let stack = stack(false, vec![old]);
+        let parent = parent(&stack, "0.2.80", "Synced");
+        let (_, calls) = reconcile_once(Cluster {
+            parent,
+            stack,
+            cronjobs: vec![],
+            jobs: vec![],
+            pods: vec![],
+            forbid_jobs: false,
+            runner_status: None,
+        })
+        .await;
+        let patch = status_patch(&calls);
+        assert!(
+            written_condition(patch, COND_BACKUP_RETENTION).is_none(),
+            "{:#}",
+            patch.body
+        );
+        assert_everything_else_carried(patch);
     }
 }
