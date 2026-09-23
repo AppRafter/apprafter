@@ -22,19 +22,20 @@
 #
 # At the deadline Kubernetes sends each Job's PID 1 SIGTERM. The runner turns
 # that into a recorded failure (lastFailure, the failure webhook, its helper
-# pods deleted), which needs three things from the render, none of which any
-# other gate looks at: the deadline in its env, the grace period that gives it
-# time, and — for the check, which is restic under a shell — `exec`, so the
-# signal reaches restic and it removes its exclusive repository lock (busybox
-# sh execs the last command of `-c` on its own today; that is one shell's
-# optimisation, and the explicit `exec` does not depend on it).
+# pods deleted; for the check Job, lastCheck or the prune it was in), which
+# needs two things from the render, neither of which any other gate looks at:
+# the deadline in its env and the grace period that gives it time. Both Jobs
+# run the runner binary since WI-389: the check Job as `apprafter-backup
+# check`, with no shell in between, so the signal reaches the runner, which
+# passes it on to restic so that restic removes its exclusive lock.
 #
 # Asserts, against a freshly rendered chart:
 #
 #   1. backup enabled, defaults: both CronJobs are Forbid and carry
-#      activeDeadlineSeconds 21600 (six hours); the runner's
-#      APPRAFTER_BACKUP_DEADLINE_SECONDS says the same; the runner pod has a
-#      90 s termination grace period; the check execs restic.
+#      activeDeadlineSeconds 21600 (six hours); each runner's
+#      APPRAFTER_BACKUP_DEADLINE_SECONDS says the same as its own Job; both
+#      pods have a 90 s termination grace period; the check Job runs the
+#      runner as `check`.
 #   2. backup enabled, both knobs set: each CronJob carries its own value, and
 #      the runner's env follows the backup one.
 #   3. a deadline under ten minutes is refused by values.schema.json.
@@ -55,6 +56,12 @@
 #   7. the staging volume's sizeLimit and the limit the runner checks the
 #      volume against (APPRAFTER_BACKUP_STAGING_SIZE_LIMIT) are one value,
 #      defaulted and set.
+#   8. retention (WI-389): both CronJobs get APPRAFTER_BACKUP_ENFORCE, `check`
+#      when nothing sets it (the check Job prunes after a passing check) and
+#      an explicit `operator` kept as it is, with the keep counts on both;
+#      the check Job gets its depth from checkReadData / checkReadDataSubset
+#      and the cluster label for the failure webhook; the values schema
+#      refuses a mode that does not exist.
 #
 # Usage: bash scripts/check-backup-render.sh
 # Exit 0 = every assertion held.
@@ -148,29 +155,49 @@ assert_cronjob() {
     echo "  ok: $label — $name: Forbid, activeDeadlineSeconds $want"
 }
 
-# `$1` label, `$2` rendered manifests, `$3` expected deadline in seconds: the
-# runner container of the backup CronJob carries it as
+# `$1` rendered manifests, `$2` CronJob name, `$3` a yq path under that
+# CronJob's first container: the value there, or empty when it is absent.
+container_value() {
+    NAME="$2" "${YQ[@]}" -r "select(.kind == \"CronJob\" and .metadata.name == strenv(NAME))
+        | .spec.jobTemplate.spec.template.spec.containers[0]$3 // \"\"" "$1"
+}
+
+# `$1` rendered manifests, `$2` CronJob name, `$3` env var: its literal value,
+# or empty when the container does not carry it.
+env_value() {
+    VAR="$3" container_value "$1" "$2" '.env[] | select(.name == strenv(VAR)) | .value'
+}
+
+# `$1` label, `$2` rendered manifests, `$3` CronJob name, `$4` expected
+# deadline in seconds: that CronJob's runner container carries it as
 # APPRAFTER_BACKUP_DEADLINE_SECONDS, and its pod has the grace period the
 # runner's SIGTERM handling is sized for.
 assert_runner_stops_cleanly() {
-    local label="$1" rendered="$2" want="$3" doc got
-    doc="$(cronjob_doc "$rendered" apprafter-backup)"
+    local label="$1" rendered="$2" name="$3" want="$4" doc got
+    doc="$(cronjob_doc "$rendered" "$name")"
     got="$(awk '/^            - name: APPRAFTER_BACKUP_DEADLINE_SECONDS$/{f=1; next}
                 f && /^              value: /{print $2; exit}' <<<"$doc")"
     [[ "$got" == "\"$want\"" ]] \
-        || fail "$label: runner env APPRAFTER_BACKUP_DEADLINE_SECONDS is '${got:-absent}', want \"$want\" (the Job's activeDeadlineSeconds)"
+        || fail "$label: $name runner env APPRAFTER_BACKUP_DEADLINE_SECONDS is '${got:-absent}', want \"$want\" (the Job's activeDeadlineSeconds)"
     grep -qE '^          terminationGracePeriodSeconds: 90$' <<<"$doc" \
-        || fail "$label: the runner pod has no 90 s terminationGracePeriodSeconds; at the deadline it is SIGKILLed before it records the failure"
-    echo "  ok: $label — runner env deadline $want, 90 s termination grace"
+        || fail "$label: the $name pod has no 90 s terminationGracePeriodSeconds; at the deadline it is SIGKILLed before it records the failure"
+    echo "  ok: $label — $name: runner env deadline $want, 90 s termination grace"
 }
 
-# `$1` label, `$2` rendered manifests: the check's restic is PID 1.
-assert_check_execs_restic() {
-    local label="$1" rendered="$2" doc
-    doc="$(cronjob_doc "$rendered" apprafter-backup-check)"
-    grep -qE '^ +exec restic -r "\$APPRAFTER_BACKUP_REPO" check' <<<"$doc" \
-        || fail "$label: the check does not exec restic; SIGTERM at the deadline would depend on the shell to reach restic, which must remove its exclusive lock"
-    echo "  ok: $label — the check execs restic"
+# `$1` label, `$2` rendered manifests: the check Job runs the runner binary
+# (the image's entrypoint) in its check mode, with no shell in between — the
+# mode that checks, prunes after a passing check under `enforce: check`, and
+# records both. A `command` would replace the entrypoint: the WI-389 prune and
+# the record would silently not run.
+assert_check_runs_the_runner() {
+    local label="$1" rendered="$2" cmd args
+    cmd="$(container_value "$rendered" apprafter-backup-check '.command')"
+    [[ -z "$cmd" ]] \
+        || fail "$label: the check container sets command '$cmd'; it must run the image's entrypoint, the runner"
+    args="$(container_value "$rendered" apprafter-backup-check '.args // [] | join(" ")')"
+    [[ "$args" == "check" ]] \
+        || fail "$label: the check container's args are '${args:-absent}', want 'check' (the runner's check mode)"
+    echo "  ok: $label — the check Job runs the runner as \`check\`"
 }
 
 echo "==> backup CronJob deadlines, chart $version"
@@ -179,8 +206,9 @@ echo "==> backup CronJob deadlines, chart $version"
 helm template platform "$chart" --values "$enabled" >"$workdir/defaults.yaml"
 assert_cronjob "defaults" "$workdir/defaults.yaml" apprafter-backup 21600
 assert_cronjob "defaults" "$workdir/defaults.yaml" apprafter-backup-check 21600
-assert_runner_stops_cleanly "defaults" "$workdir/defaults.yaml" 21600
-assert_check_execs_restic "defaults" "$workdir/defaults.yaml"
+assert_runner_stops_cleanly "defaults" "$workdir/defaults.yaml" apprafter-backup 21600
+assert_runner_stops_cleanly "defaults" "$workdir/defaults.yaml" apprafter-backup-check 21600
+assert_check_runs_the_runner "defaults" "$workdir/defaults.yaml"
 
 # 2. Both knobs set, to values that tell them apart.
 helm template platform "$chart" --values "$enabled" \
@@ -190,7 +218,9 @@ helm template platform "$chart" --values "$enabled" \
     >"$workdir/set.yaml"
 assert_cronjob "knobs set" "$workdir/set.yaml" apprafter-backup 2700
 assert_cronjob "knobs set" "$workdir/set.yaml" apprafter-backup-check 43200
-assert_runner_stops_cleanly "knobs set" "$workdir/set.yaml" 2700
+assert_runner_stops_cleanly "knobs set" "$workdir/set.yaml" apprafter-backup 2700
+assert_runner_stops_cleanly "knobs set" "$workdir/set.yaml" apprafter-backup-check 43200
+assert_check_runs_the_runner "knobs set" "$workdir/set.yaml"
 
 # 3. The ten-minute floor: a unit mistake is refused at install, not shipped
 #    as a deadline that stops every run.
@@ -212,19 +242,6 @@ rust_default="$(sed -nE 's/^pub const DEFAULT_RUN_DEADLINE: Duration = Duration:
 [[ "$rust_default" == "21600" ]] \
     || fail "backup-core DEFAULT_RUN_DEADLINE is '${rust_default:-not found}', but the chart defaults the Job deadline to 21600"
 echo "  ok: backup-core's DEFAULT_RUN_DEADLINE is the chart's 21600"
-
-# `$1` rendered manifests, `$2` CronJob name, `$3` a yq path under that
-# CronJob's first container: the value there, or empty when it is absent.
-container_value() {
-    NAME="$2" "${YQ[@]}" -r "select(.kind == \"CronJob\" and .metadata.name == strenv(NAME))
-        | .spec.jobTemplate.spec.template.spec.containers[0]$3 // \"\"" "$1"
-}
-
-# `$1` rendered manifests, `$2` CronJob name, `$3` env var: its literal value,
-# or empty when the container does not carry it.
-env_value() {
-    VAR="$3" container_value "$1" "$2" '.env[] | select(.name == strenv(VAR)) | .value'
-}
 
 # `$1` label, `$2` rendered manifests, `$3` CronJob name: the measured
 # requests and limit, and no CPU limit.
@@ -303,5 +320,78 @@ done
 assert_staging_limit "defaults" "$workdir/defaults.yaml" 10Gi
 assert_staging_limit "knobs set" "$workdir/set.yaml" 3Gi
 
+echo "==> retention and the check Job's settings (WI-389), chart $version"
+
+# 8. Retention. Unset, both Jobs are told `check`: the check Job prunes after
+#    a passing check, the backup Job does not. The check Job gets its depth
+#    and the cluster label from the same values as ever.
+assert_env "defaults" "$workdir/defaults.yaml" apprafter-backup \
+    APPRAFTER_BACKUP_ENFORCE=check
+assert_env "defaults" "$workdir/defaults.yaml" apprafter-backup-check \
+    APPRAFTER_BACKUP_ENFORCE=check APPRAFTER_BACKUP_CHECK_READ_DATA=false \
+    APPRAFTER_BACKUP_CHECK_READ_DATA_SUBSET=10% APPRAFTER_CLUSTER_ID=platform \
+    APPRAFTER_BACKUP_REPO=s3:https://objects.example.com/backups
+for var in APPRAFTER_BACKUP_KEEP_DAILY APPRAFTER_BACKUP_KEEP_WEEKLY APPRAFTER_BACKUP_KEEP_MONTHLY; do
+    for name in apprafter-backup apprafter-backup-check; do
+        got="$(env_value "$workdir/defaults.yaml" "$name" "$var")"
+        [[ -z "$got" ]] \
+            || fail "defaults: $name carries $var=$got; unset, the runner's own 7/4/6 applies"
+    done
+done
+echo "  ok: defaults — no keep counts rendered; the runner's 7/4/6 applies"
+
+#    An explicit mode is kept, on both Jobs, with the keep counts, and the
+#    check's depth follows its knobs (a full read wins).
+helm template platform "$chart" --values "$enabled" \
+    --set backup.retention.enforce=operator \
+    --set backup.retention.keepDaily=14 \
+    --set backup.retention.keepWeekly=8 \
+    --set backup.retention.keepMonthly=12 \
+    --set backup.checkReadData=true \
+    --set backup.clusterName=eu-prod \
+    >"$workdir/retention.yaml"
+for name in apprafter-backup apprafter-backup-check; do
+    assert_env "explicit operator" "$workdir/retention.yaml" "$name" \
+        APPRAFTER_BACKUP_ENFORCE=operator APPRAFTER_BACKUP_KEEP_DAILY=14 \
+        APPRAFTER_BACKUP_KEEP_WEEKLY=8 APPRAFTER_BACKUP_KEEP_MONTHLY=12 \
+        APPRAFTER_CLUSTER_ID=eu-prod
+done
+assert_env "explicit operator" "$workdir/retention.yaml" apprafter-backup-check \
+    APPRAFTER_BACKUP_CHECK_READ_DATA=true
+helm template platform "$chart" --values "$enabled" \
+    --set backup.checkReadDataSubset= >"$workdir/structure.yaml"
+assert_env "structure-only check" "$workdir/structure.yaml" apprafter-backup-check \
+    APPRAFTER_BACKUP_CHECK_READ_DATA=false APPRAFTER_BACKUP_CHECK_READ_DATA_SUBSET=
+for mode in check cluster; do
+    helm template platform "$chart" --values "$enabled" \
+        --set "backup.retention.enforce=$mode" >"$workdir/mode.yaml"
+    assert_env "explicit $mode" "$workdir/mode.yaml" apprafter-backup-check \
+        "APPRAFTER_BACKUP_ENFORCE=$mode"
+done
+
+#    A PlatformStack that sets only a keep count reaches the chart as a
+#    `retention` map without `enforce` (the operator leaves out what the CR
+#    leaves out): the chart's default must still fill it in.
+cat >"$workdir/keep-only.yaml" <<'EOF2'
+backup:
+  retention:
+    keepDaily: 5
+EOF2
+helm template platform "$chart" --values "$enabled" --values "$workdir/keep-only.yaml" \
+    >"$workdir/keep-only-render.yaml"
+assert_env "keep count only" "$workdir/keep-only-render.yaml" apprafter-backup-check \
+    APPRAFTER_BACKUP_ENFORCE=check APPRAFTER_BACKUP_KEEP_DAILY=5
+
+#    A mode that does not exist is refused at install, not rendered into a
+#    runner that would read it as "prune nothing".
+if helm template platform "$chart" --values "$enabled" \
+    --set backup.retention.enforce=weekly >/dev/null 2>"$workdir/err"; then
+    fail "backup.retention.enforce=weekly rendered; values.schema.json must refuse it"
+fi
+grep -q "enforce" "$workdir/err" \
+    || fail "backup.retention.enforce=weekly failed for a reason that does not name the key: $(cat "$workdir/err")"
+echo "  ok: backup.retention.enforce=weekly is refused by the values schema"
+
 echo "PASS: both backup CronJobs carry a Job deadline, stop cleanly at it, and"
-echo "      carry the measured resources and restic settings."
+echo "      carry the measured resources and restic settings; the check Job runs"
+echo "      the runner with the retention mode and depth it is configured with."

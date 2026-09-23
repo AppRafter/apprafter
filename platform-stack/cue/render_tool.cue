@@ -345,7 +345,8 @@ _gatewayTemplate: """
 
 // `_backupTemplate` — emits the opt-in off-site scheduled-backup
 // component (2.6d-4): a ServiceAccount + scoped ClusterRole/-Binding, a
-// nightly backup CronJob, a weekly `restic check` CronJob, and a
+// nightly backup CronJob, a weekly check CronJob (`restic check`, then
+// the prune under `retention.enforce: check`), and a
 // CiliumNetworkPolicy pinning the runner pods' egress. The WHOLE block
 // is guarded by `{{- if .Values.backup.enabled }}` so a default tier-1
 // render (`backup.enabled: false`) produces NO resources — off-site
@@ -374,10 +375,12 @@ _gatewayTemplate: """
 // CR annotation). `pods`/`pods/exec` is unavoidably cluster-wide: k8s
 // RBAC cannot scope exec to "only the runner's own helper pods".
 //
-// The `check` CronJob runs `restic` directly (the runner image bundles
-// restic + a shell) rather than the runner binary — the chunk-2 runner
-// has no check-only mode, so this keeps the periodic repository check
-// operator-independent and needs no runner change.
+// The `check` CronJob runs the runner binary as `apprafter-backup check`
+// (WI-389): `restic check`, then — under `retention.enforce: check` and
+// only after a check that passed — the run-aware prune, as far as the
+// cluster's key may delete, then the repository's figures; each step
+// recorded in the status ConfigMap. Until WI-389 it ran `restic check`
+// under a shell and recorded nothing.
 //
 // Note the double-curly braces: this string is itself a Go template
 // Helm executes at install time, so we keep the `{{ }}` literal. CUE
@@ -387,9 +390,10 @@ _backupTemplate: """
 	     Rendered by `cue cmd render`. Do not edit.
 	     Off-site scheduled backup (2.6d-4): opt-in, default-off. Emitted only when
 	     .Values.backup.enabled. ServiceAccount + scoped ClusterRole/-Binding, a
-	     nightly backup CronJob (runner binary), a weekly `restic check` CronJob
-	     (restic directly), and a CiliumNetworkPolicy fixing the runner pods'
-	     egress (DNS + kube-apiserver + world:443 for S3/webhook). Credentials come
+	     nightly backup CronJob and a weekly check CronJob (both the runner
+	     binary; the check also prunes under retention.enforce: check), and a
+	     CiliumNetworkPolicy fixing the runner pods' egress (DNS +
+	     kube-apiserver + world:443 for S3/webhook). Credentials come
 	     ONLY from the operator-sealed Secret via explicit env secretKeyRef — never
 	     chart values; Secret holds neutral S3_* keys mapped to AWS_* for restic.
 	     RBAC matches the chunk-2 runner's actual reads and MUST NOT grant write on
@@ -430,7 +434,8 @@ _backupTemplate: """
 	# The cluster's own machine key: `kube-system`'s namespace UID, which the
 	# runner puts at the head of every restic tag so a repository SHARED by two
 	# clusters can tell their snapshots apart (E1) — and so the in-Job prune
-	# under `retention.enforce: cluster` never forgets the co-tenant's runs.
+	# (the check Job's under `retention.enforce: check`, the backup Job's
+	# under `cluster`) never forgets the co-tenant's runs.
 	# `get` on the one object; nothing here lists or writes namespaces.
 	- apiGroups: [""]
 	  resources: ["namespaces"]
@@ -580,8 +585,11 @@ _backupTemplate: """
 	              value: {{ $b.clusterName | default "apprafter-backup" | quote }}
 	            - name: APPRAFTER_BACKUP_STAGING_MODE
 	              value: {{ $b.stagingMode | default "monolithic" | quote }}
+	            # Who prunes (see #BackupValues.retention). This Job prunes
+	            # after the backup only under `cluster`; the check Job prunes
+	            # under `check`, the default.
 	            - name: APPRAFTER_BACKUP_ENFORCE
-	              value: {{ $b.retention.enforce | default "operator" | quote }}
+	              value: {{ $b.retention.enforce | default "check" | quote }}
 	            {{- if $b.retention.keepDaily }}
 	            - name: APPRAFTER_BACKUP_KEEP_DAILY
 	              value: {{ $b.retention.keepDaily | quote }}
@@ -710,29 +718,29 @@ _backupTemplate: """
 	        spec:
 	          serviceAccountName: apprafter-backup
 	          restartPolicy: Never
+	          # The runner records a check it is stopped in (lastCheck,
+	          # lastCheckError) or the prune after it, and the failure webhook,
+	          # in this grace period, as the backup's runner does; restic
+	          # removes its exclusive lock on the signal it passes on.
+	          terminationGracePeriodSeconds: 90
 	          containers:
 	          - name: check
 	            image: {{ $b.image | quote }}
-	            # The chunk-2 runner binary has no check-only mode, so the check Job
-	            # runs restic directly (the runner image bundles restic + a shell).
-	            # restic reads RESTIC_PASSWORD + AWS_* from the explicit secretKeyRef
-	            # entries below (Secret holds neutral S3_* keys) and the s3: repo from
-	            # APPRAFTER_BACKUP_REPO.
-	            #
-	            # `exec`: restic, not the shell, must be PID 1. At the Job
-	            # deadline Kubernetes sends PID 1 SIGTERM; restic handles it by
-	            # removing its EXCLUSIVE repository lock and exiting, while a
-	            # shell as PID 1 would ignore it, leaving restic to the SIGKILL
-	            # 30 s later and its lock to fail backups until it went stale.
-	            # The image's busybox sh happens to exec the last command of
-	            # `-c` by itself (measured), which is an optimisation of one
-	            # shell, not a contract; the explicit `exec` is.
-	            command: ["sh", "-c"]
-	            args:
-	            - >-
-	              restic -r "$APPRAFTER_BACKUP_REPO" unlock;
-	              exec restic -r "$APPRAFTER_BACKUP_REPO" check{{ if $b.checkReadData }} --read-data{{ else if $b.checkReadDataSubset }} --read-data-subset={{ $b.checkReadDataSubset }}{{ end }}
+	            # The runner binary in its check mode (WI-389): `restic check`
+	            # at the depth below; then, under `retention.enforce: check`
+	            # and only when the check passed, the run-aware prune of this
+	            # cluster's snapshots with the keep counts below — as far as
+	            # the key may delete: a key that may not (the scoped one ADR
+	            # 0050 recommends) deletes nothing and is recorded as
+	            # `not-permitted`; then the repository's figures. Each step goes
+	            # into the status ConfigMap. The runner is PID 1 and passes
+	            # SIGTERM on to restic, which removes its lock.
+	            args: ["check"]
 	            env:
+	            # The check Job's own deadline: the runner names it when it is
+	            # stopped there.
+	            - name: APPRAFTER_BACKUP_DEADLINE_SECONDS
+	              value: {{ $b.checkActiveDeadlineSeconds | default 21600 | int | quote }}
 	            - name: RESTIC_PASSWORD
 	              valueFrom:
 	                secretKeyRef:
@@ -756,10 +764,40 @@ _backupTemplate: """
 	                  optional: true
 	            - name: APPRAFTER_BACKUP_REPO
 	              value: {{ $b.bucket | quote }}
+	            # The same human label as the backup's, for the failure webhook.
+	            - name: APPRAFTER_CLUSTER_ID
+	              value: {{ $b.clusterName | default .Release.Name | quote }}
+	            # What the check reads: every pack, a part of them, or neither.
+	            # A full read wins, as it always has.
+	            - name: APPRAFTER_BACKUP_CHECK_READ_DATA
+	              value: {{ $b.checkReadData | default false | quote }}
+	            - name: APPRAFTER_BACKUP_CHECK_READ_DATA_SUBSET
+	              value: {{ $b.checkReadDataSubset | default "" | quote }}
+	            # Who prunes, and what is kept: the same values as the backup
+	            # Job's. This Job prunes only under `check`.
+	            - name: APPRAFTER_BACKUP_ENFORCE
+	              value: {{ $b.retention.enforce | default "check" | quote }}
+	            {{- if $b.retention.keepDaily }}
+	            - name: APPRAFTER_BACKUP_KEEP_DAILY
+	              value: {{ $b.retention.keepDaily | quote }}
+	            {{- end }}
+	            {{- if $b.retention.keepWeekly }}
+	            - name: APPRAFTER_BACKUP_KEEP_WEEKLY
+	              value: {{ $b.retention.keepWeekly | quote }}
+	            {{- end }}
+	            {{- if $b.retention.keepMonthly }}
+	            - name: APPRAFTER_BACKUP_KEEP_MONTHLY
+	              value: {{ $b.retention.keepMonthly | quote }}
+	            {{- end }}
+	            {{- if $b.failureWebhook }}
+	            - name: APPRAFTER_BACKUP_FAILURE_WEBHOOK
+	              value: {{ $b.failureWebhook | quote }}
+	            {{- end }}
 	            # The backup runner's restic settings, for the same reasons.
 	            # Measured (WI-386) with them: a check peaked at 43-51 MiB of
 	            # anonymous memory on a small repository and at 137 MiB on one of
-	            # 1.51M blobs.
+	            # 1.51M blobs, and a prune about as much as a backup (180 MiB at
+	            # 6.6k blobs, 304 MiB at 1.51M without GOMEMLIMIT).
 	            - name: GOMAXPROCS
 	              value: "2"
 	            - name: GOMEMLIMIT
@@ -774,7 +812,7 @@ _backupTemplate: """
 	            # cache: mkdir /.cache: permission denied`. The check itself
 	            # still uses a temporary cache of its own, now made inside this
 	            # directory rather than beside it in /tmp, and removes it when it
-	            # ends.
+	            # ends; the prune and the figures after it use this one.
 	            - name: RESTIC_CACHE_DIR
 	              value: /tmp/restic-cache
 	            resources:
@@ -1093,7 +1131,7 @@ _valuesSchema: {
 						keepMonthly: {type: "integer"}
 						enforce: {
 							type: "string"
-							enum: ["operator", "cluster"]
+							enum: ["check", "cluster", "operator"]
 						}
 					}
 				}

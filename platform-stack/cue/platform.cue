@@ -506,25 +506,44 @@ package platformstack
 	// `sequential`.
 	stagingSizeLimit: string | *"10Gi"
 
-	// Retention policy. `enforce: operator` (default) means the runner
-	// does NOT forget/prune (retention is the operator-side `apprafter
-	// backup prune` verb with full creds); `enforce: cluster` runs
-	// format-aware `forget --prune` in the Job (requires full creds in
-	// the cluster Secret). `keep*` are optional — the runner defaults
-	// to 7/4/6 when unset, so the chart only threads them through when
-	// explicitly configured.
+	// Retention policy: who prunes, and what is kept. `keep*` are
+	// optional — the runner defaults to 7/4/6 when unset, so the chart
+	// only threads them through when explicitly configured. `enforce`
+	// reaches BOTH CronJobs as APPRAFTER_BACKUP_ENFORCE:
+	//
+	// - `check` (default, WI-389): the weekly check Job runs the
+	//   run-aware prune after a check that PASSED, as far as the
+	//   cluster's key may delete. Under the scoped key ADR 0050
+	//   recommends the first delete is refused, nothing is deleted, and
+	//   the runner records `not-permitted` — the operator's
+	//   BackupRetention condition and `apprafter backup status` then say
+	//   retention is not enforced, with the repository's growth. A check
+	//   that fails never prunes.
+	// - `cluster`: the backup Job prunes after every backup (a prune
+	//   that fails fails the backup); needs full credentials in the
+	//   cluster Secret.
+	// - `operator`: nothing in the cluster prunes; retention is the
+	//   operator-side `apprafter backup prune` with full creds.
+	//
+	// The default was `operator` until WI-389. A PlatformStack that set
+	// `operator` explicitly keeps it; one that never set it gets
+	// `check`, and a cluster whose key MAY delete starts removing
+	// snapshots beyond the keep policy at its next weekly check.
 	retention: {
 		keepDaily?:   int
 		keepWeekly?:  int
 		keepMonthly?: int
-		enforce:      "operator" | "cluster" | *"operator"
+		enforce:      "check" | "cluster" | "operator" | *"check"
 	}
 
-	// Cron schedule for the weekly `restic check` Job. Default Sunday
-	// 06:00 (staggered clear of the daily backup).
+	// Cron schedule for the weekly check Job — `restic check`, then,
+	// under `retention.enforce: check`, the prune. Default Sunday
+	// 06:00 (staggered clear of the daily backup). Empty omits the
+	// CronJob, and with it the in-cluster prune of `enforce: check`.
 	checkSchedule: string | *"0 6 * * 0"
 
-	// `activeDeadlineSeconds` for the weekly check Job, with the same
+	// `activeDeadlineSeconds` for the weekly check Job — the check and,
+	// under `enforce: check`, the prune after it — with the same
 	// reasoning and the same floor. It must ALSO stay below the time from
 	// the check's start to the next backup's start: a check still holding
 	// restic's exclusive lock fails that backup (no --retry-lock). Default
