@@ -2212,34 +2212,67 @@ fn load_jetstream(
         let user = k.get_secret_key(&mgr, &nats_ns, "user")?;
         let password = k.get_secret_key(&mgr, &nats_ns, "password")?;
 
-        let pod_name = format!("rs-js-{}", backup_core::extract::pod_name_segment(&claim));
-        let spec = backup_core::helper_pod::nats_pod_spec(
-            &pod_name,
-            &nats_ns,
-            backup_core::images::JETSTREAM_IMAGE,
-            &format!("nats://{host}:{port}"),
-            &user,
-            &password,
-            keep_alive,
-        );
-        k.apply_and_wait_pod_ready(&spec)?;
+        let server = NatsServer {
+            namespace: nats_ns,
+            url: format!("nats://{host}:{port}"),
+            user,
+            password,
+        };
+        restore_claim_streams(k, &ns, &claim, &server, &streams, keep_alive)?;
+    }
+    Ok(())
+}
 
-        for artifact in &streams {
-            let script = jetstream_restore_script(&artifact.stream);
-            let argv: Vec<&str> = vec!["sh", "-c", &script];
-            let outcome = k.exec_stream_from_file(&pod_name, &nats_ns, &argv, &artifact.path);
-            if outcome.is_err() {
-                // Tear the pod down before surfacing, so a failed stream does
-                // not also leave a helper behind in the operator's namespace.
-                k.delete_pod_best_effort(&pod_name, &nats_ns);
-            }
-            outcome?;
-            println!(
-                "  ✓ stream restored: {ns}/{claim} → {} (messages + consumers)",
-                artifact.stream
-            );
-        }
-        k.delete_pod_best_effort(&pod_name, &nats_ns);
+/// Where one claim's streams are replayed: the NATS server's namespace and
+/// URL, and the manager credentials of the claim's namespace.
+struct NatsServer {
+    namespace: String,
+    url: String,
+    user: String,
+    password: String,
+}
+
+/// Replay one claim's streams through a helper pod beside the server.
+///
+/// The pod is deleted on every return path by [`PodCleanupGuard`], armed
+/// BEFORE the apply like the pg and volume loaders'. It used to be deleted by
+/// hand after a failed stream and at the end, which left out a failed Ready
+/// wait: the pod stayed, and since a helper pod's spec cannot change in place
+/// and a `Completed` one never becomes Ready again, every later jetstream
+/// restore of the claim failed on it until someone deleted it.
+fn restore_claim_streams(
+    k: &dyn KubeExec,
+    ns: &str,
+    claim: &str,
+    server: &NatsServer,
+    streams: &[StreamArtifact],
+    keep_alive: std::time::Duration,
+) -> Result<()> {
+    let pod_name = format!("rs-js-{}", backup_core::extract::pod_name_segment(claim));
+    let _guard = PodCleanupGuard {
+        name: pod_name.clone(),
+        namespace: server.namespace.clone(),
+        k,
+    };
+    let spec = backup_core::helper_pod::nats_pod_spec(
+        &pod_name,
+        &server.namespace,
+        backup_core::images::JETSTREAM_IMAGE,
+        &server.url,
+        &server.user,
+        &server.password,
+        keep_alive,
+    );
+    k.apply_and_wait_pod_ready(&spec)?;
+
+    for artifact in streams {
+        let script = jetstream_restore_script(&artifact.stream);
+        let argv: Vec<&str> = vec!["sh", "-c", &script];
+        k.exec_stream_from_file(&pod_name, &server.namespace, &argv, &artifact.path)?;
+        println!(
+            "  ✓ stream restored: {ns}/{claim} → {} (messages + consumers)",
+            artifact.stream
+        );
     }
     Ok(())
 }
@@ -3788,6 +3821,7 @@ mod tests {
         deleted: RefCell<Vec<(String, String)>>,
         secrets: BTreeMap<String, String>,
         exec_fails: bool,
+        apply_fails: bool,
     }
 
     impl FakeKube {
@@ -3803,11 +3837,24 @@ mod tests {
                 ..Self::default()
             }
         }
+
+        /// A helper pod that never becomes Ready (the apply-wait fails).
+        fn failing_apply() -> Self {
+            Self {
+                apply_fails: true,
+                ..Self::default()
+            }
+        }
     }
 
     impl KubeExec for FakeKube {
         fn apply_and_wait_pod_ready(&self, spec: &Value) -> Result<()> {
             self.applied.borrow_mut().push(spec.clone());
+            if self.apply_fails {
+                return Err(CliError::Other(
+                    "pod did not reach Ready within 300s".into(),
+                ));
+            }
             Ok(())
         }
 
@@ -6330,6 +6377,111 @@ mod tests {
             "stable order, stream read off the file stem, non-tar ignored"
         );
         assert!(discover_stream_artifacts(dd.path().join("nope").as_path()).is_empty());
+    }
+
+    fn nats_server() -> NatsServer {
+        NatsServer {
+            namespace: "nats".into(),
+            url: "nats://nats.nats.svc:4222".into(),
+            user: "mgr_atm".into(),
+            password: "pw".into(),
+        }
+    }
+
+    fn stream_artifacts(names: &[&str]) -> (tempfile::TempDir, Vec<StreamArtifact>) {
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = names
+            .iter()
+            .map(|stream| {
+                let path = dir.path().join(format!("{stream}.tar"));
+                std::fs::write(&path, b"tar").unwrap();
+                StreamArtifact {
+                    namespace: "atm".into(),
+                    claim: "worker-js".into(),
+                    stream: stream.to_string(),
+                    path,
+                }
+            })
+            .collect();
+        (dir, artifacts)
+    }
+
+    /// A helper pod that never becomes Ready is deleted too. It used to be
+    /// left behind — deleted by hand only after a failed stream and at the
+    /// end — and a leftover `rs-js-<claim>` failed every later jetstream
+    /// restore of the claim until someone deleted it.
+    #[test]
+    fn a_jetstream_helper_that_never_becomes_ready_is_deleted() {
+        let k = FakeKube::failing_apply();
+        let (_dir, streams) = stream_artifacts(&["orders"]);
+        let r = restore_claim_streams(
+            &k,
+            "atm",
+            "worker-js",
+            &nats_server(),
+            &streams,
+            backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
+        );
+        assert!(r.is_err());
+        assert!(
+            k.execs.borrow().is_empty(),
+            "no replay into a pod never Ready"
+        );
+        assert_eq!(
+            *k.deleted.borrow(),
+            vec![("rs-js-worker-js".to_string(), "nats".to_string())]
+        );
+    }
+
+    /// Every stream is replayed through the one pod beside the server, and the
+    /// pod is deleted exactly once — on success and when a stream fails.
+    #[test]
+    fn a_jetstream_helper_replays_every_stream_and_is_deleted_once() {
+        let k = FakeKube::default();
+        let (_dir, streams) = stream_artifacts(&["orders", "orders_dlq"]);
+        restore_claim_streams(
+            &k,
+            "atm",
+            "worker-js",
+            &nats_server(),
+            &streams,
+            backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
+        )
+        .unwrap();
+        let applied = k.applied.borrow();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0]["metadata"]["name"], "rs-js-worker-js");
+        assert_eq!(applied[0]["metadata"]["namespace"], "nats");
+        let execs = k.execs.borrow();
+        assert_eq!(execs.len(), 2);
+        assert!(execs
+            .iter()
+            .all(|e| e.0 == "rs-js-worker-js" && e.1 == "nats"));
+        assert_eq!(execs[1].3, streams[1].path);
+        assert_eq!(
+            *k.deleted.borrow(),
+            vec![("rs-js-worker-js".to_string(), "nats".to_string())]
+        );
+
+        let failing = FakeKube::failing_exec();
+        assert!(restore_claim_streams(
+            &failing,
+            "atm",
+            "worker-js",
+            &nats_server(),
+            &streams,
+            backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
+        )
+        .is_err());
+        assert_eq!(
+            failing.execs.borrow().len(),
+            1,
+            "stops at the failed stream"
+        );
+        assert_eq!(
+            *failing.deleted.borrow(),
+            vec![("rs-js-worker-js".to_string(), "nats".to_string())]
+        );
     }
 
     /// Measured on a real server (nats 2.14.3 / CLI v0.2.3): `nats stream
