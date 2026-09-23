@@ -43,6 +43,8 @@ on:
       - 'argocd-cue-cmp/version.cue'
       - 'operator/charts/*/Chart.yaml'
       - 'scripts/check-version-coherence.sh'
+      # Sourced by check-version-coherence.sh and the drift step below.
+      - 'scripts/lib/published-tag.sh'
       - 'scripts/check-platform-stack-version.sh'
       - 'scripts/check-gateway-render.sh'
       - 'scripts/check-component-enablement.sh'
@@ -56,6 +58,7 @@ on:
       - 'argocd-cue-cmp/version.cue'
       - 'operator/charts/*/Chart.yaml'
       - 'scripts/check-version-coherence.sh'
+      - 'scripts/lib/published-tag.sh'
       - 'scripts/check-platform-stack-version.sh'
       - 'scripts/check-gateway-render.sh'
       - 'scripts/check-component-enablement.sh'
@@ -226,10 +229,21 @@ jobs:
           # next publish workflow run will tag it. Source
           # changes here are part of preparing the bump. No
           # drift to check.
-          if ! git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
-            echo "::notice::${TAG} not on origin yet — currentVersion is in-flight, drift check no-op."
-            exit 0
-          fi
+          #
+          # scripts/lib/published-tag.sh tells that apart from
+          # origin being unreachable or listing no platform-stack
+          # tag at all, which this step used to read as "in
+          # flight" too — and passed without comparing anything.
+          # Those now fail the job (GITHUB_ACTIONS=true).
+          . scripts/lib/published-tag.sh
+          resolve_published_tag origin "platform-stack/v" "$VERSION"
+          case "$TAG_STATE" in
+            undecided) version_guard_undecided "$TAG_WHY" || exit 1; exit 0 ;;
+            in-flight)
+              echo "::notice::${TAG} not on origin yet — currentVersion is in-flight, drift check no-op."
+              exit 0
+              ;;
+          esac
           # Tag exists on origin → currentVersion is already
           # published. Any change to chart-source files vs the
           # published tag is drift.

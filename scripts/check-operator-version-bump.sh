@@ -22,7 +22,11 @@
 #
 # ## Semantics
 #
-# - appVersion tag NOT yet on origin  → an in-flight bump; nothing to check (OK).
+# - appVersion tag NOT yet on origin, which lists other operator/v* tags
+#   → an in-flight bump; nothing to check (OK).
+# - origin cannot be asked, lists no operator/v* tag, or the tag cannot be
+#   fetched → the check did not run: FAIL in CI, a warning locally
+#   (scripts/lib/published-tag.sh).
 # - appVersion tag IS on origin, and no image-affecting path changed since it → OK.
 # - appVersion tag IS on origin, and operator source / CRD templates /
 #   schemas/v1alpha1 changed since it → FAIL (bump appVersion + the
@@ -33,9 +37,11 @@
 # and the bundled CUE schema. `*.md` under operator/ is excluded.
 #
 # Run locally: scripts/check-operator-version-bump.sh
-# In CI: needs full history + tags (actions/checkout fetch-depth: 0).
+# In CI: .github/workflows/lint.yml `version-guards` (fetch-depth: 0).
 
 set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=lib/published-tag.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/published-tag.sh"
 
 CHART="operator/charts/apprafter-operator/Chart.yaml"
 REMOTE="${1:-origin}"
@@ -51,19 +57,18 @@ tag="operator/v${app_version}"
 # The image-affecting pathspec (exclude markdown docs under operator/).
 paths=(operator schemas/v1alpha1 ":(exclude)operator/**/*.md")
 
-# Is the current appVersion already published?
-if ! git ls-remote --tags --exit-code "$REMOTE" "refs/tags/${tag}" >/dev/null 2>&1; then
-    echo "OK: ${tag} not yet on ${REMOTE} — appVersion bump is in flight."
-    exit 0
-fi
-
-# The tag is published — make sure it's available locally for the diff.
-if ! git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
-    git fetch --quiet "$REMOTE" "refs/tags/${tag}:refs/tags/${tag}" 2>/dev/null || {
-        echo "::warning::could not fetch ${tag} for the diff — skipping the check." >&2
+# Is the current appVersion already published? Published, in flight, or
+# undecided — see scripts/lib/published-tag.sh for why "the remote could not
+# be asked" is no longer read as "in flight". A published tag comes back
+# fetched and ready for the diff.
+resolve_published_tag "$REMOTE" "operator/v" "$app_version"
+case "$TAG_STATE" in
+    undecided) version_guard_undecided "$TAG_WHY" || exit 1; exit 0 ;;
+    in-flight)
+        echo "OK: ${tag} not yet on ${REMOTE} — appVersion bump is in flight."
         exit 0
-    }
-fi
+        ;;
+esac
 
 if # Compare the tag against the INDEX, not HEAD. As a pre-commit hook this runs
 # BEFORE the commit exists, so a `tag..HEAD` diff cannot see the very change

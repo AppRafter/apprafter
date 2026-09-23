@@ -38,9 +38,11 @@
 # chart release for that would be noise the next person learns to skip.
 #
 # Usage: check-backup-runner-pin.sh [remote]   (default: origin)
-# In CI: needs full history + tags (actions/checkout fetch-depth: 0).
+# In CI: .github/workflows/lint.yml `version-guards` (fetch-depth: 0).
 
 set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=lib/published-tag.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/published-tag.sh"
 
 SOURCE="platform-stack/cue/platform.cue"
 REMOTE="${1:-origin}"
@@ -61,7 +63,15 @@ tag="apprafter-backup/v${version}"
 # check noisy enough to be ignored.
 paths=(cli/apprafter-backup cli/backup-core)
 
-if ! git ls-remote --tags --exit-code "$REMOTE" "refs/tags/${tag}" >/dev/null 2>&1; then
+# Published, in flight, or undecided — see scripts/lib/published-tag.sh for
+# why "the remote could not be asked" is no longer read as "not published".
+resolve_published_tag "$REMOTE" "apprafter-backup/v" "$version"
+if [[ "$TAG_STATE" == undecided ]]; then
+    version_guard_undecided "$TAG_WHY" || exit 1
+    exit 0
+fi
+
+if [[ "$TAG_STATE" == in-flight ]]; then
     # Not published (yet). Whether that is fine depends on ONE thing: the runner
     # version IS `cli/Cargo.toml` `workspace.package.version` — that is what
     # release-backup-runner.yml publishes from. So a pin naming exactly that
@@ -90,13 +100,6 @@ Either pin the published runner, or pin the version this tree is about to
 publish (${cli_version:-<unreadable>}).
 EOF
     exit 1
-fi
-
-if ! git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
-    git fetch --quiet "$REMOTE" "refs/tags/${tag}:refs/tags/${tag}" 2>/dev/null || {
-        echo "::warning::could not fetch ${tag} for the diff — skipping the check." >&2
-        exit 0
-    }
 fi
 
 if # Compare the tag against the INDEX, not HEAD. As a pre-commit hook this runs

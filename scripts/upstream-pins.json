@@ -380,6 +380,22 @@
       "note": "Tracks the Cilium minor by convention (v1.16.x beside chart 1.16.5)."
     },
     {
+      "id": "tool-actionlint",
+      "class": "ci-download",
+      "title": "actionlint (lint.yml `version-guards`)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".github/workflows/*.yml", "pattern": "(?m)^\\s*ACTIONLINT_VERSION:\\s*\"?([0-9][^\"\\s]*)\"?\\s*$" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "rhysd/actionlint" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "The gate for a candidate is scripts/check-workflows.sh run under it (`ACTIONLINT=<candidate binary> scripts/check-workflows.sh`): a newer actionlint can add a rule that turns the workflows red. No gate kind here downloads a tool and runs a repository script with it; run that by hand on the bump.",
+      "note": "Installed in .github/workflows/lint.yml from the release tarball and checked against ACTIONLINT_SHA256 in the same step, which moves WITH this version -- take it from the release's actionlint_<version>_checksums.txt. Locally scripts/check-workflows.sh uses the actionlint on PATH, else `nix run nixpkgs#actionlint`, which is not pinned, so a laptop and CI can run different releases."
+    },
+    {
       "id": "tool-k3d",
       "class": "ci-download",
       "title": "k3d (devcontainer)",
