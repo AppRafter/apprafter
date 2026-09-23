@@ -30,8 +30,8 @@ use cli_core::{CliError, Result};
 use serde_json::Value;
 
 use crate::helper_pod::{
-    apply_and_wait_pod_ready, delete_pod_best_effort, exec_stream_to_file, nats_pod_spec,
-    pg_helper_pod_spec, volume_pod_spec,
+    apply_and_wait_pod_ready, delete_pod_best_effort, exec_stream_to_file, explain_keep_alive_end,
+    nats_pod_spec, pg_helper_pod_spec, volume_pod_spec,
 };
 use crate::images;
 use crate::kube::KubeExec;
@@ -404,8 +404,9 @@ pub fn pod_name_segment(s: &str) -> String {
 /// Cluster's `spec.imageName` is known.
 ///
 /// `keep_alive` is how long each helper pod keeps itself alive, and so the
-/// most any one extraction may take: the run's deadline (see
-/// [`crate::helper_pod`]).
+/// most any one extraction may take ([`crate::helper_pod::helper_keep_alive`]
+/// of the run's deadline). One the keep-alive ends is explained
+/// ([`crate::helper_pod::explain_keep_alive_end`]).
 pub fn run_extraction(
     k: &dyn KubeExec,
     items: &[ExtractItem],
@@ -502,6 +503,7 @@ fn extract_pg(
         &dump_path,
         Some(PG_DUMP_FIRST_OUTPUT_WITHIN),
     )
+    .map_err(|e| explain_keep_alive_end(k, &pod_name, ns, e))
     .map_err(|e| explain_pg_dump_error(e, ns, claim))
     // _guard drops here (or on any earlier return) → delete_pod_best_effort called.
 }
@@ -606,6 +608,7 @@ fn extract_volume(
     // later is not what such a bound would catch. The run's deadline covers
     // it (see `PG_DUMP_FIRST_OUTPUT_WITHIN` for the one step that has one).
     exec_stream_to_file(k, &pod_name, ns, &argv, &tar_path, None)
+        .map_err(|e| explain_keep_alive_end(k, &pod_name, ns, e))
     // _guard drops here (or on any earlier return) → delete_pod_best_effort called.
 }
 
@@ -694,6 +697,7 @@ fn extract_jetstream(
     // backup` has copied the whole stream, which legitimately takes as long
     // as the stream is large.
     exec_stream_to_file(k, &pod_name, &nats_ns, &argv, &tar_path, None)
+        .map_err(|e| explain_keep_alive_end(k, &pod_name, &nats_ns, e))
 }
 
 /// Extract a persistent Redis (Dragonfly) claim's whole-instance snapshot.
@@ -1111,6 +1115,9 @@ mod tests {
     struct RecordingKube {
         execs: std::sync::Mutex<Vec<(String, Option<std::time::Duration>)>>,
         applied: std::sync::Mutex<Vec<Value>>,
+        /// Every exec is killed by its helper pod's keep-alive running out:
+        /// it fails with exit code 137, and the pod reads as ended.
+        keep_alive_runs_out: bool,
     }
 
     impl KubeExec for RecordingKube {
@@ -1130,6 +1137,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((argv[0].to_string(), first_output_within));
+            if self.keep_alive_runs_out {
+                return Err(CliError::Other(
+                    "exec_stream_to_file: exec failed (status=Some(\"Failure\"), \
+                     reason=NonZeroExitCode): command terminated with non-zero exit code: \
+                     error executing command, exit code 137"
+                        .into(),
+                ));
+            }
             fs::write(out, b"x").map_err(|e| CliError::Other(e.to_string()))
         }
         fn exec_stream_from_file(&self, _: &str, _: &str, _: &[&str], _: &Path) -> Result<()> {
@@ -1143,9 +1158,71 @@ mod tests {
                 other => format!("{other}-value"),
             })
         }
-        fn get_json(&self, _args: &[&str]) -> Result<Option<Value>> {
+        fn get_json(&self, args: &[&str]) -> Result<Option<Value>> {
+            if self.keep_alive_runs_out && args[..2] == ["get", "pods"] {
+                return Ok(Some(json!({
+                    "spec": {"containers": [{"command": ["sleep", "21600"]}]},
+                    "status": {"containerStatuses": [{"state": {"terminated": {"exitCode": 0}}}]}
+                })));
+            }
             Ok(None)
         }
+    }
+
+    /// Each helper exec that the keep-alive killed says so, instead of the
+    /// bare exit code 137 — for the dump, the volume copy and the stream.
+    #[test]
+    fn an_extraction_killed_by_its_helpers_keep_alive_says_so() {
+        for claim in [
+            json!({"spec": {"type": "pg"}, "metadata": {"name": "db", "namespace": "demo"},
+                   "status": {"connectionSecretRef": "db-conn"}}),
+            json!({"spec": {"type": "disk"}, "metadata": {"name": "vol", "namespace": "demo"},
+                   "status": {"volumeClaimRef": "pvc"}}),
+        ] {
+            let k = RecordingKube {
+                keep_alive_runs_out: true,
+                ..RecordingKube::default()
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let err = run_extraction(
+                &k,
+                &plan_extraction(std::slice::from_ref(&claim)),
+                dir.path(),
+                images::DEFAULT_PG_IMAGE,
+                crate::helper_pod::DEFAULT_RUN_DEADLINE,
+            )
+            .expect_err("a killed exec fails the extraction");
+            let msg = err.to_string();
+            assert!(msg.contains("keep-alive of 6h ran out"), "{claim}: {msg}");
+            assert!(
+                msg.contains("apprafter backup set deadline"),
+                "{claim}: {msg}"
+            );
+        }
+
+        let k = RecordingKube {
+            keep_alive_runs_out: true,
+            ..RecordingKube::default()
+        };
+        let item = ExtractItem {
+            namespace: "demo".into(),
+            claim_name: "events".into(),
+            kind: DataKind::JetStream,
+            source: "orders".into(),
+            connection: Some("events-conn".into()),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let err = extract_jetstream(
+            &k,
+            &item,
+            dir.path(),
+            crate::helper_pod::DEFAULT_RUN_DEADLINE,
+        )
+        .expect_err("a killed exec fails the stream's dump");
+        assert!(
+            err.to_string().contains("keep-alive of 6h ran out"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1184,8 +1261,8 @@ mod tests {
     #[test]
     fn every_helper_pod_an_extraction_applies_lives_for_the_run_deadline() {
         // The `sleep` ending kills every exec in the pod with 137, so the
-        // keep-alive caps each extraction: it must be the run's deadline, not
-        // the fixed hour it was.
+        // keep-alive caps each extraction: it must be the one it was given
+        // (helper_keep_alive of the run's deadline), not the fixed hour it was.
         let k = RecordingKube::default();
         let items = plan_extraction(&[
             json!({"spec": {"type": "pg"}, "metadata": {"name": "db", "namespace": "demo"},

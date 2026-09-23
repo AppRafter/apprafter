@@ -42,8 +42,9 @@ pub struct RunnerConfig {
     /// The run's deadline: the Job's `activeDeadlineSeconds`, which the chart
     /// renders into `APPRAFTER_BACKUP_DEADLINE_SECONDS` from the same value.
     /// Kubernetes stops the run there with SIGTERM; the runner uses it to say
-    /// so, and keeps its helper pods alive for exactly this long. `None` when
-    /// the variable is absent — a Job template older than it.
+    /// so, and keeps its helper pods alive at least this long
+    /// ([`Self::helper_keep_alive`]). `None` when the variable is absent — a
+    /// Job template older than it.
     pub deadline: Option<Duration>,
 }
 
@@ -115,6 +116,20 @@ impl RunnerConfig {
         let map: BTreeMap<String, String> = std::env::vars().collect();
         Self::from_env_map(&map)
     }
+
+    /// How long this run's helper pods keep themselves alive: the rule the
+    /// CLI's follow too (`backup_core::helper_pod::helper_keep_alive`) — the
+    /// deadline, never less than six hours; the chart's default deadline when
+    /// the variable is absent. One rule on both sides keeps one spec per
+    /// helper pod name, so the runner reuses a pod the CLI left running
+    /// rather than replacing it, and the other way round. The Job's deadline
+    /// still stops the run first.
+    pub fn helper_keep_alive(&self) -> Duration {
+        backup_core::helper_pod::helper_keep_alive(
+            self.deadline
+                .unwrap_or(backup_core::helper_pod::DEFAULT_RUN_DEADLINE),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +175,34 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn the_runners_helpers_follow_the_clis_keep_alive_rule() {
+        let base = [
+            ("APPRAFTER_BACKUP_REPO", "s3:https://h/b"),
+            ("APPRAFTER_CLUSTER_ID", "c"),
+            ("RESTIC_PASSWORD", "pw"),
+        ];
+        for (env, want) in [
+            // A deadline set for a frequent schedule: the Job stops the run at
+            // ten minutes, and its helpers have the CLI's six hours.
+            (Some("600"), 21600),
+            (Some("21600"), 21600),
+            (Some("43200"), 43200),
+            (None, 21600),
+        ] {
+            let mut pairs = base.to_vec();
+            if let Some(secs) = env {
+                pairs.push(("APPRAFTER_BACKUP_DEADLINE_SECONDS", secs));
+            }
+            let cfg = RunnerConfig::from_env_map(&map(&pairs)).unwrap();
+            assert_eq!(
+                cfg.helper_keep_alive(),
+                Duration::from_secs(want),
+                "{env:?}"
+            );
+        }
     }
 
     #[test]

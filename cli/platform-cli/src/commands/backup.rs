@@ -1608,10 +1608,11 @@ pub fn run_export(namespaces: &[String], select: bool, out: Option<&str>) -> Res
     let claims = claims_in_namespaces(&ns_set, kc.path())?;
     let plan = plan_extraction(&claims);
     let pg_image = pg_helper_image(first_cnpg_image(&ns_set, kc.path()).as_deref());
-    // No deadline stops an export; its helper pods live as long as the
-    // cluster's scheduled backup may run, the one number for how long an
-    // extraction may take (backup_core::helper_pod).
-    let keep_alive = backup_core::engine::read_run_deadline(&k)?;
+    // No deadline stops an export, so its helper pods' keep-alive is the only
+    // limit on one extraction: the cluster's backup deadline, never less than
+    // six hours however short a frequent schedule has made it
+    // (backup_core::helper_pod::helper_keep_alive).
+    let keep_alive = backup_core::engine::read_helper_keep_alive(&k)?;
     run_extraction(&k, &plan, &out_dir, &pg_image, keep_alive)?;
 
     let platform_version = read_platform_version(kc.path())?;
@@ -1795,13 +1796,15 @@ pub fn run_backup(
     let pg_image = pg_helper_image(first_cnpg_image(&ns_set, kc.path()).as_deref());
     let platform_version = read_platform_version(kc.path())?;
     // An interactive backup has no Job deadline — the person running it is
-    // the one who stops it. Its helper pods still live only as long as a
-    // scheduled backup of the same cluster may run: the same number bounds
-    // one extraction either way. For a helper pod this command was killed
-    // before deleting, it ends the pod's process; the Pod object stays,
-    // `Completed`, until the next command or run that needs it replaces it
-    // (see `backup_core::helper_pod`).
-    let helper_keep_alive = backup_core::engine::read_run_deadline(&k)?;
+    // the one who stops it — so its helper pods' keep-alive is the only limit
+    // on one extraction: the cluster's backup deadline, never less than six
+    // hours however short a frequent schedule has made it. The scheduled
+    // runner follows the same rule, so both build one spec for a helper's
+    // name. For a helper pod this command was killed before deleting, it ends
+    // the pod's process; the Pod object stays, `Completed`, until the next
+    // command or run that needs it replaces it (see
+    // `backup_core::helper_pod`).
+    let helper_keep_alive = backup_core::engine::read_helper_keep_alive(&k)?;
 
     // Stage everything under a tempdir; the engine writes data/ under this root.
     let staging = tempfile::Builder::new()
@@ -10573,6 +10576,95 @@ mod tests {
         );
         assert!(took < Duration::from_secs(90), "took {took:?}");
         eprintln!("kubectl: running leftover with another spec replaced in {took:?}");
+    }
+
+    /// Real-cluster proof, through `kubectl exec -i` as a restore runs it,
+    /// that a load killed by its helper pod's keep-alive is explained: the
+    /// words kubectl uses for the killed exec, and the kubelet's report of the
+    /// container's end. Skipped by default; opt in against a DISPOSABLE kind
+    /// cluster:
+    ///
+    /// ```text
+    /// APPRAFTER_K8S_SMOKE=1 KUBECONFIG=<kind kubeconfig> cargo test -p apprafter \
+    ///     --lib a_load_killed_by_its_keep_alive_is_explained_through_kubectl_on_kind \
+    ///     -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "needs a kind cluster: APPRAFTER_K8S_SMOKE=1 KUBECONFIG=<kind kubeconfig>"]
+    fn a_load_killed_by_its_keep_alive_is_explained_through_kubectl_on_kind() {
+        const NS: &str = "apprafter-keep-alive-kubectl";
+        const POD: &str = "ld-pg-keepalive";
+        assert_eq!(
+            std::env::var("APPRAFTER_K8S_SMOKE").as_deref(),
+            Ok("1"),
+            "run with APPRAFTER_K8S_SMOKE=1 (this test creates objects in the cluster)"
+        );
+        let kubeconfig = PathBuf::from(
+            std::env::var_os("KUBECONFIG").expect("KUBECONFIG must name the kind kubeconfig"),
+        );
+        let kubectl = |args: &[&str]| {
+            let out = Command::new("kubectl")
+                .args(args)
+                .env("KUBECONFIG", &kubeconfig)
+                .output()
+                .expect("run kubectl");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let ctx = kubectl(&["config", "current-context"]);
+        assert!(
+            ctx.starts_with("kind-"),
+            "refusing to run against context {ctx:?}: this test only targets kind clusters"
+        );
+        struct DeleteNs<'a>(&'a Path);
+        impl Drop for DeleteNs<'_> {
+            fn drop(&mut self) {
+                let _ = Command::new("kubectl")
+                    .args(["delete", "namespace", NS, "--wait=false"])
+                    .env("KUBECONFIG", self.0)
+                    .output();
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        while kubectl(&["get", "namespace", NS, "-o", "jsonpath={.status.phase}"]) == "Terminating"
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{NS} stuck Terminating"
+            );
+            thread::sleep(Duration::from_secs(1));
+        }
+        let _ = kubectl(&["create", "namespace", NS]);
+        let _cleanup = DeleteNs(&kubeconfig);
+
+        let k = KubectlExec::new(kubeconfig.clone());
+        k.apply_and_wait_pod_ready(&json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": POD, "namespace": NS,
+                         "labels": {"apprafter.io/backup-helper": "true"}},
+            "spec": {"restartPolicy": "Never", "containers": [{
+                "name": "dump", "image": "docker.io/library/alpine:3.24",
+                "imagePullPolicy": "IfNotPresent",
+                "command": backup_core::helper_pod::keep_alive_command(Duration::from_secs(8))}]}
+        }))
+        .expect("helper Ready");
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("dump");
+        std::fs::write(&input, b"payload").unwrap();
+        let started = std::time::Instant::now();
+        // Reads its stdin, then outlives the pod's keep-alive.
+        let err = k
+            .exec_stream_from_file(POD, NS, &["sh", "-c", "cat >/dev/null; sleep 60"], &input)
+            .expect_err("the keep-alive ends the load");
+        eprintln!("raw exec error after {:?}: {err}", started.elapsed());
+        assert!(backup_core::helper_pod::is_exit_137(&err), "{err}");
+        let explained =
+            backup_core::helper_pod::explain_keep_alive_end(&k, POD, NS, err).to_string();
+        eprintln!("explained: {explained}");
+        assert!(
+            explained.contains("keep-alive of 8s ran out"),
+            "{explained}"
+        );
     }
 
     #[test]

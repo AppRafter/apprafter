@@ -301,14 +301,19 @@ scheduling resumes: the next slot runs on time or, if one fell while the
 stopped run was active, the latest such slot starts at once. `apprafter backup
 run` copies the same Job template, so a manual run has the same limit.
 
-The deadline is also how long each helper pod lives: the pod a single
-`pg_dump` or `tar` runs in keeps itself alive for exactly the run's deadline,
-and every command still running in it ends when it does. So the deadline
-bounds one claim's extraction as well as the whole run, and raising it gives a
-single large dump more time too. `apprafter backup create`, `apprafter export`
-and `apprafter restore` have no Job and no deadline — the person
-running them stops them — but their helper pods live the same
-`spec.backup.activeDeadlineSeconds` (six hours when unset). A helper pod that
+The deadline also sets how long each helper pod lives. The pod a single
+`pg_dump`, `tar` or `pg_restore` runs in keeps itself alive for the deadline,
+but never less than six hours, and every command still running in it ends
+when that time is up. In a scheduled run the Job's deadline always comes
+first, so the whole run and each claim's extraction within it are bounded by
+the deadline, and raising it gives a single large dump more time too.
+`apprafter backup create`, `apprafter export` and `apprafter restore` have no
+Job and no deadline — the person running them stops them — so their helper
+pods' time is the only limit on one dump or load. The six-hour floor is there
+for them: a deadline lowered to suit a frequent schedule does not cut a
+restore short. A command ended this way fails with a message that says its
+helper pod's keep-alive ran out and names `apprafter backup set deadline` as
+the way to allow longer, rather than with a bare exit code 137. A helper pod that
 a command or run was killed before it could delete stops running then, but
 the pod itself stays behind as `Completed` until something deletes it. The
 next command or run that needs a helper pod of that name, the same step for

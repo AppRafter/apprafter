@@ -214,22 +214,8 @@ impl OutcomeClaim {
 }
 
 /// `6h`, `90m`, `45s`, `5h59m50s`: a duration as `apprafter backup set
-/// deadline` takes one, whole units and no zero parts.
-pub fn human_duration(d: Duration) -> String {
-    let total = d.as_secs();
-    let (h, m, s) = (total / 3600, total % 3600 / 60, total % 60);
-    let mut out = String::new();
-    if h > 0 {
-        out.push_str(&format!("{h}h"));
-    }
-    if m > 0 {
-        out.push_str(&format!("{m}m"));
-    }
-    if s > 0 || out.is_empty() {
-        out.push_str(&format!("{s}s"));
-    }
-    out
-}
+/// deadline` takes one. Shared with backup-core's keep-alive explanation.
+pub use backup_core::helper_pod::human_duration;
 
 /// The signal that stopped the run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -606,23 +592,6 @@ mod tests {
         assert_eq!(StopSignal::Interrupt.number(), libc::SIGINT);
         assert_eq!(StopSignal::Terminate.name(), "SIGTERM");
         assert_eq!(StopSignal::Interrupt.name(), "SIGINT");
-    }
-
-    #[test]
-    fn human_duration_writes_whole_units_only() {
-        for (secs, want) in [
-            (0, "0s"),
-            (45, "45s"),
-            (90, "1m30s"),
-            (600, "10m"),
-            (3600, "1h"),
-            (21600, "6h"),
-            (5400, "1h30m"),
-            (21590, "5h59m50s"),
-            (43200, "12h"),
-        ] {
-            assert_eq!(human_duration(Duration::from_secs(secs)), want, "{secs}s");
-        }
     }
 
     #[test]

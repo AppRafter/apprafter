@@ -44,7 +44,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::commands::backup::KubectlExec;
-use backup_core::helper_pod::{pg_helper_pod_spec, volume_pod_spec};
+use backup_core::helper_pod::{explain_keep_alive_end, pg_helper_pod_spec, volume_pod_spec};
 use backup_core::KubeExec;
 use base64::Engine as _;
 use cli_core::{CliError, Result};
@@ -2054,10 +2054,12 @@ fn wait_claims_ready_with(
 fn load_data(data_dir: &Path, manifest: &BackupManifest, kubeconfig: &Path) -> Result<()> {
     let k = KubectlExec::new(kubeconfig.to_path_buf());
     // How long each load helper pod keeps itself alive, and so the most one
-    // load may take: the target cluster's backup run deadline, the number that
-    // bounds an extraction too (backup_core::helper_pod). It was a fixed hour,
-    // which killed any load that needed longer with exit code 137.
-    let keep_alive = backup_core::engine::read_run_deadline(&k)?;
+    // load may take, since a restore has no Job deadline: the target
+    // cluster's backup deadline, never less than six hours however short a
+    // frequent schedule has made it (backup_core::helper_pod::
+    // helper_keep_alive). It was a fixed hour, then the deadline alone; a
+    // load killed by it is explained rather than left as exit code 137.
+    let keep_alive = backup_core::engine::read_helper_keep_alive(&k)?;
     // pg: data/pg/<ns>/<claim>.dump
     load_pg_dumps(data_dir, &k, kubeconfig, keep_alive)?;
     // volumes: data/volumes/<ns>/<name>/data.tar
@@ -2268,7 +2270,8 @@ fn restore_claim_streams(
     for artifact in streams {
         let script = jetstream_restore_script(&artifact.stream);
         let argv: Vec<&str> = vec!["sh", "-c", &script];
-        k.exec_stream_from_file(&pod_name, &server.namespace, &argv, &artifact.path)?;
+        k.exec_stream_from_file(&pod_name, &server.namespace, &argv, &artifact.path)
+            .map_err(|e| explain_keep_alive_end(k, &pod_name, &server.namespace, e))?;
         println!(
             "  ✓ stream restored: {ns}/{claim} → {} (messages + consumers)",
             artifact.stream
@@ -2541,7 +2544,8 @@ fn run_pg_restore(
 
     let argv = pg_restore_argv(conn);
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-    k.exec_stream_from_file(&pod_name, ns, &argv, dump_path)?;
+    k.exec_stream_from_file(&pod_name, ns, &argv, dump_path)
+        .map_err(|e| explain_keep_alive_end(k, &pod_name, ns, e))?;
     println!("  ✓ pg restored: {ns}/{claim}");
     Ok(())
 }
@@ -2750,7 +2754,8 @@ fn load_one_volume(
     };
     k.apply_and_wait_pod_ready(&spec)?;
     let argv: Vec<&str> = vec!["tar", "x", "-C", "/data"];
-    k.exec_stream_from_file(&pod_name, ns, &argv, tar_path)?;
+    k.exec_stream_from_file(&pod_name, ns, &argv, tar_path)
+        .map_err(|e| explain_keep_alive_end(k, &pod_name, ns, e))?;
     println!("  ✓ volume restored: {ns}/{name} → pvc {pvc}");
     Ok(())
 }
@@ -3822,6 +3827,9 @@ mod tests {
         secrets: BTreeMap<String, String>,
         exec_fails: bool,
         apply_fails: bool,
+        /// Every exec is killed by its helper pod's keep-alive running out:
+        /// it fails with exit code 137, and the pod reads as ended.
+        keep_alive_runs_out: bool,
     }
 
     impl FakeKube {
@@ -3885,6 +3893,13 @@ mod tests {
             if self.exec_fails {
                 return Err(CliError::Other("exec failed".into()));
             }
+            if self.keep_alive_runs_out {
+                return Err(CliError::Other(
+                    "exec_stream_from_file: kubectl exec exited with exit status: 137.\n\
+                     kubectl stderr:\n  command terminated with exit code 137"
+                        .into(),
+                ));
+            }
             Ok(())
         }
 
@@ -3901,8 +3916,15 @@ mod tests {
                 .ok_or_else(|| CliError::Other(format!("no secret {ns}/{secret}")))
         }
 
-        fn get_json(&self, _args: &[&str]) -> Result<Option<Value>> {
-            unreachable!("restore reads JSON through kubectl_get_json, not KubeExec")
+        fn get_json(&self, args: &[&str]) -> Result<Option<Value>> {
+            // Restore reads JSON through kubectl_get_json, not KubeExec — but
+            // for the helper pod a killed load ran in.
+            assert!(self.keep_alive_runs_out, "unexpected get_json {args:?}");
+            assert_eq!(args[..2], ["get", "pods"], "{args:?}");
+            Ok(Some(serde_json::json!({
+                "spec": {"containers": [{"command": ["sleep", "21600"]}]},
+                "status": {"containerStatuses": [{"state": {"terminated": {"exitCode": 0}}}]}
+            })))
         }
     }
 
@@ -6642,7 +6664,7 @@ mod tests {
         assert_eq!(spec["metadata"]["name"], "ld-pg-db");
         assert_eq!(spec["metadata"]["namespace"], "demo");
         assert_eq!(spec["spec"]["containers"][0]["image"], "postgres:18");
-        // Alive for the run deadline it was given, not a fixed hour: the
+        // Alive for the keep-alive it was given, not a fixed hour: the
         // `sleep` ending kills a `pg_restore` still running in the pod.
         assert_eq!(
             spec["spec"]["containers"][0]["command"],
@@ -6796,6 +6818,58 @@ mod tests {
             *k.deleted.borrow(),
             vec![("ld-pg-db".to_string(), "demo".to_string())]
         );
+    }
+
+    /// A load killed by its helper pod's keep-alive says so, and how to give
+    /// it longer — not a bare exit code 137 — for every loader with a helper.
+    #[test]
+    fn a_load_killed_by_its_helpers_keep_alive_says_so() {
+        let keep_alive_runs_out = || FakeKube {
+            keep_alive_runs_out: true,
+            ..FakeKube::default()
+        };
+        let dump = tempfile::NamedTempFile::new().unwrap();
+        let (_dir, streams) = stream_artifacts(&["orders"]);
+        let errors = [
+            run_pg_restore(
+                "demo",
+                "db",
+                &pg_conn(),
+                dump.path(),
+                &keep_alive_runs_out(),
+                "postgres:18",
+                backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
+                &|_| Ok(()),
+            ),
+            load_one_volume(
+                "demo",
+                "uploads",
+                "pvc-uploads",
+                dump.path(),
+                &keep_alive_runs_out(),
+                backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
+            ),
+            restore_claim_streams(
+                &keep_alive_runs_out(),
+                "atm",
+                "worker-js",
+                &nats_server(),
+                &streams,
+                backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
+            ),
+        ];
+        for (i, r) in errors.into_iter().enumerate() {
+            let msg = r.expect_err("a killed load fails").to_string();
+            assert!(
+                msg.contains("keep-alive of 6h ran out"),
+                "loader {i}: {msg}"
+            );
+            assert!(
+                msg.contains("apprafter backup set deadline"),
+                "loader {i}: {msg}"
+            );
+            assert!(msg.contains("exit code 137"), "loader {i}: {msg}");
+        }
     }
 
     /// A probe that never succeeds aborts the load BEFORE `pg_restore` runs —

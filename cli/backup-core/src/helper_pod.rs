@@ -6,21 +6,21 @@
 //!
 //! `pg_helper_pod_spec` / `volume_pod_spec` / `nats_pod_spec` return
 //! serde_json::Value Pod specs that are applied via `apply_and_wait_pod_ready`
-//! and then exec'd into. Each runs [`keep_alive_command`] — `sleep` for the
-//! run's deadline — as its container command, so the pod is there to exec
-//! into. `restartPolicy: Never` ensures a single attempt; the caller tears
+//! and then exec'd into. Each runs [`keep_alive_command`] — `sleep` for its
+//! keep-alive ([`helper_keep_alive`]) — as its container command, so the pod
+//! is there to exec into. `restartPolicy: Never` ensures a single attempt; the caller tears
 //! down with `delete_pod_best_effort` after the stream completes.
 //!
 //! # How long a helper pod lives
 //!
 //! When the `sleep` ends, the container exits and every exec still running in
 //! it dies with exit code 137. So the keep-alive is a hard cap on each single
-//! extraction or load, whatever else allows it — and it used to be a fixed
-//! `sleep 3600`, so no one claim could take longer than an hour, even under a
-//! Job deadline of six. It is now the run's deadline ([`run_deadline_of`]):
-//! the scheduled runner passes its Job's `activeDeadlineSeconds`, and the CLI
-//! the same cluster setting, so one number decides how long a backup may
-//! take.
+//! extraction or load, whatever else allows it. It used to be a fixed `sleep
+//! 3600`, so no one claim could take longer than an hour, even under a Job
+//! deadline of six. It is now [`helper_keep_alive`]: the cluster's backup
+//! deadline ([`run_deadline_of`]), and never less than six hours. A command
+//! killed by it is explained ([`explain_keep_alive_end`]); the bare exit code
+//! 137 says nothing about why.
 //!
 //! For a helper pod nobody deleted (a runner or a CLI killed before its
 //! cleanup ran), the keep-alive ends the pod's process, not the Pod: with
@@ -69,8 +69,59 @@ pub fn run_deadline_of(platformstack: Option<&Value>) -> Duration {
         .unwrap_or(DEFAULT_RUN_DEADLINE)
 }
 
-/// The container command that keeps a helper pod alive for `keep_alive`, the
-/// run's deadline (see the module docs for why that is the right length).
+/// How long a helper pod keeps itself alive, given the cluster's backup run
+/// deadline ([`run_deadline_of`]): that deadline, and never less than
+/// [`DEFAULT_RUN_DEADLINE`], six hours.
+///
+/// The scheduled runner and the CLI's `backup create`, `export` and `restore`
+/// all use this, and why the floor:
+///
+/// * **The interactive commands have no Job deadline**, so the keep-alive is
+///   the only limit on one dump or load of theirs. It used to be the backup
+///   deadline alone, and that knob is set for the SCHEDULE: a cluster backing
+///   up every fifteen minutes sets it to ten, and a restore whose `pg_restore`
+///   needed eleven was then killed at ten, with a bare exit code 137. The
+///   floor keeps it from shrinking with the schedule. Six hours is the
+///   platform's own default for how long one backup of the cluster's data may
+///   take, so an interactive run of the same data gets at least that; the old
+///   fixed hour killed large loads. Raising the deadline for larger data
+///   raises this too, which is the way to give a longer load more time.
+/// * **The scheduled runner's Job deadline stops it first** whatever this
+///   is, so the floor changes nothing about how long a scheduled run may
+///   take. It keeps the runner's helper pods the SAME spec as the CLI's: a
+///   pod's spec cannot change in place, so two specs for one name would
+///   replace each other's pods (see [`is_immutable_pod_update`]) where one
+///   spec simply reuses a running one.
+/// * **The cost of a long keep-alive** is how long a helper leaked by a
+///   killed command keeps running `sleep` — holding its env (a database
+///   password) and any volume mount. The runner deletes its helpers when it
+///   is stopped, and a leftover is replaced by the next run that needs its
+///   name ([`stale_helper_reason`]), so six hours is also the most such a
+///   leak lives by default.
+pub fn helper_keep_alive(run_deadline: Duration) -> Duration {
+    run_deadline.max(DEFAULT_RUN_DEADLINE)
+}
+
+/// `6h`, `90m`, `45s`, `5h59m50s`: a duration as `apprafter backup set
+/// deadline` takes one, whole units and no zero parts.
+pub fn human_duration(d: Duration) -> String {
+    let total = d.as_secs();
+    let (h, m, s) = (total / 3600, total % 3600 / 60, total % 60);
+    let mut out = String::new();
+    if h > 0 {
+        out.push_str(&format!("{h}h"));
+    }
+    if m > 0 {
+        out.push_str(&format!("{m}m"));
+    }
+    if s > 0 || out.is_empty() {
+        out.push_str(&format!("{s}s"));
+    }
+    out
+}
+
+/// The container command that keeps a helper pod alive for `keep_alive`
+/// ([`helper_keep_alive`]; see the module docs for why that is the length).
 pub fn keep_alive_command(keep_alive: Duration) -> Value {
     json!(["sleep", keep_alive.as_secs().max(1).to_string()])
 }
@@ -288,6 +339,130 @@ pub const STALE_POD_GONE_WITHIN: Duration = Duration::from_secs(60);
 /// all be spent waiting; the work in it, if any, is abandoned.
 pub const STALE_POD_DELETE_GRACE_SECONDS: u32 = 1;
 
+// ---------------------------------------------------------------------------
+// A command killed by its helper pod's keep-alive
+// ---------------------------------------------------------------------------
+
+/// How long [`explain_keep_alive_end`] waits for the pod's status to show
+/// that its container has ended. A command killed with its container returns
+/// at once, while the kubelet reports the container's end a second or two
+/// later.
+pub const KEEP_ALIVE_STATUS_WAIT: Duration = Duration::from_secs(15);
+
+/// Whether an exec error reports exit code 137 — a command killed by
+/// SIGKILL — in either implementation's words: kube-rs carries the
+/// apiserver's `exit code 137`, `kubectl exec` its own `exit status: 137`.
+pub fn is_exit_137(err: &cli_core::CliError) -> bool {
+    let msg = err.to_string();
+    msg.contains("exit code 137") || msg.contains("exit status: 137")
+}
+
+/// What a helper pod's status says about its keep-alive.
+#[derive(Debug, PartialEq, Eq)]
+pub enum KeepAliveState {
+    /// The container has ended with exit code 0: its `sleep` ran out. The
+    /// keep-alive it had, read off its own command.
+    Ended(Option<Duration>),
+    /// The container is still running.
+    Running,
+    /// Anything else: ended some other way, gone, or no status yet.
+    Other,
+}
+
+/// Read [`KeepAliveState`] off a helper pod. Pure.
+///
+/// `sleep` exits 0 only when its time is up; a container killed otherwise
+/// (the pod deleted, its node lost) ends with another code.
+pub fn keep_alive_state(pod: &Value) -> KeepAliveState {
+    let state = pod.pointer("/status/containerStatuses/0/state");
+    if let Some(ended) = state.and_then(|s| s.get("terminated")) {
+        if ended.get("exitCode").and_then(Value::as_i64) == Some(0) {
+            let keep_alive = pod
+                .pointer("/spec/containers/0/command")
+                .and_then(Value::as_array)
+                .and_then(|c| match c.as_slice() {
+                    [cmd, secs] if cmd == "sleep" => secs.as_str()?.parse::<u64>().ok(),
+                    _ => None,
+                })
+                .map(Duration::from_secs);
+            return KeepAliveState::Ended(keep_alive);
+        }
+        return KeepAliveState::Other;
+    }
+    if state.and_then(|s| s.get("running")).is_some() {
+        return KeepAliveState::Running;
+    }
+    KeepAliveState::Other
+}
+
+/// Explain an exec in helper pod `ns/pod` that was killed because the pod's
+/// keep-alive ran out; any other error comes back unchanged.
+///
+/// Only an exit code 137 is looked into ([`is_exit_137`]): the pod is read
+/// until its status shows the container ended ([`KEEP_ALIVE_STATUS_WAIT`]),
+/// and only an end with exit code 0 — `sleep` running out — is the
+/// keep-alive. The error then says so, how long the keep-alive was, and how
+/// to raise it.
+pub fn explain_keep_alive_end(
+    k: &dyn KubeExec,
+    pod: &str,
+    ns: &str,
+    err: cli_core::CliError,
+) -> cli_core::CliError {
+    explain_keep_alive_end_within(
+        k,
+        pod,
+        ns,
+        err,
+        KEEP_ALIVE_STATUS_WAIT,
+        Duration::from_secs(1),
+    )
+}
+
+/// [`explain_keep_alive_end`] with its wait and poll interval given.
+pub fn explain_keep_alive_end_within(
+    k: &dyn KubeExec,
+    pod: &str,
+    ns: &str,
+    err: cli_core::CliError,
+    wait: Duration,
+    interval: Duration,
+) -> cli_core::CliError {
+    if !is_exit_137(&err) {
+        return err;
+    }
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let state = match k.get_json(&["get", "pods", pod, "-n", ns, "-o", "json"]) {
+            Ok(Some(p)) => keep_alive_state(&p),
+            // Gone, or unreadable: nothing to say about it.
+            Ok(None) | Err(_) => return err,
+        };
+        match state {
+            KeepAliveState::Ended(keep_alive) => {
+                let how_long = keep_alive
+                    .map(|d| format!(" of {}", human_duration(d)))
+                    .unwrap_or_default();
+                return cli_core::CliError::Other(format!(
+                    "the command in helper pod {ns}/{pod} was killed (exit code 137) because \
+                     the pod's keep-alive{how_long} ran out: a helper pod keeps itself alive \
+                     for a fixed time, and every command still running in it ends when that \
+                     does. It is the cluster's backup deadline, and never less than six hours; \
+                     for a dump or load that needs longer, raise it with `apprafter backup set \
+                     deadline <longer>`, which also lets a scheduled backup run that long, and \
+                     run the command again.\n{err}"
+                ));
+            }
+            KeepAliveState::Other => return err,
+            KeepAliveState::Running => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return err;
+        }
+        std::thread::sleep(interval);
+    }
+}
+
 /// The line both implementations print when they replace a stale helper pod.
 pub fn replacing_stale_helper_note(ns: &str, name: &str, why: &str) -> String {
     format!("helper pod {ns}/{name} {why}; deleting it and creating it again")
@@ -472,6 +647,194 @@ mod tests {
         ] {
             assert!(!is_immutable_pod_update(other), "{other}");
         }
+    }
+
+    #[test]
+    fn a_helper_lives_for_the_deadline_and_never_less_than_six_hours() {
+        // A schedule-tuned deadline does not shorten it…
+        assert_eq!(
+            helper_keep_alive(Duration::from_secs(600)),
+            Duration::from_secs(6 * 3600)
+        );
+        assert_eq!(
+            helper_keep_alive(DEFAULT_RUN_DEADLINE),
+            DEFAULT_RUN_DEADLINE
+        );
+        // …a raised one lengthens it.
+        assert_eq!(
+            helper_keep_alive(Duration::from_secs(43200)),
+            Duration::from_secs(43200)
+        );
+    }
+
+    #[test]
+    fn human_duration_writes_whole_units_only() {
+        for (secs, want) in [
+            (0, "0s"),
+            (45, "45s"),
+            (90, "1m30s"),
+            (600, "10m"),
+            (3600, "1h"),
+            (21600, "6h"),
+            (5400, "1h30m"),
+            (21590, "5h59m50s"),
+            (43200, "12h"),
+        ] {
+            assert_eq!(human_duration(Duration::from_secs(secs)), want, "{secs}s");
+        }
+    }
+
+    fn helper_with(state: Value) -> Value {
+        json!({
+            "spec": {"containers": [{"name": "dump", "command": ["sleep", "21600"]}]},
+            "status": {"containerStatuses": [{"name": "dump", "state": state}]}
+        })
+    }
+
+    #[test]
+    fn only_a_sleep_that_ran_out_is_the_keep_alive() {
+        assert_eq!(
+            keep_alive_state(&helper_with(
+                json!({"terminated": {"exitCode": 0, "reason": "Completed"}})
+            )),
+            KeepAliveState::Ended(Some(Duration::from_secs(21600)))
+        );
+        // Killed with its pod (deleted, evicted): not the keep-alive.
+        assert_eq!(
+            keep_alive_state(&helper_with(
+                json!({"terminated": {"exitCode": 137, "reason": "Error"}})
+            )),
+            KeepAliveState::Other
+        );
+        assert_eq!(
+            keep_alive_state(&helper_with(
+                json!({"running": {"startedAt": "2026-09-23T00:00:00Z"}})
+            )),
+            KeepAliveState::Running
+        );
+        assert_eq!(keep_alive_state(&json!({})), KeepAliveState::Other);
+    }
+
+    /// Answers `get pods` from a script of pod documents, one per call, the
+    /// last repeated; `None` is a pod that is gone.
+    struct PodReads(
+        std::sync::Mutex<Vec<Option<Value>>>,
+        std::sync::Mutex<usize>,
+    );
+
+    impl KubeExec for PodReads {
+        fn apply_and_wait_pod_ready(&self, _: &Value) -> Result<()> {
+            unreachable!()
+        }
+        fn exec_stream_to_file(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[&str],
+            _: &Path,
+            _: Option<Duration>,
+        ) -> Result<()> {
+            unreachable!()
+        }
+        fn exec_stream_from_file(&self, _: &str, _: &str, _: &[&str], _: &Path) -> Result<()> {
+            unreachable!()
+        }
+        fn delete_pod_best_effort(&self, _: &str, _: &str) {
+            unreachable!()
+        }
+        fn get_secret_key(&self, _: &str, _: &str, _: &str) -> Result<String> {
+            unreachable!()
+        }
+        fn get_json(&self, args: &[&str]) -> Result<Option<Value>> {
+            assert_eq!(
+                args,
+                ["get", "pods", "ld-pg-db", "-n", "shop", "-o", "json"]
+            );
+            let mut n = self.1.lock().unwrap();
+            let script = self.0.lock().unwrap();
+            let answer = script[(*n).min(script.len() - 1)].clone();
+            *n += 1;
+            Ok(answer)
+        }
+    }
+
+    fn reads(script: Vec<Option<Value>>) -> PodReads {
+        PodReads(std::sync::Mutex::new(script), std::sync::Mutex::new(0))
+    }
+
+    fn killed() -> cli_core::CliError {
+        cli_core::CliError::Other(
+            "exec_stream_from_file: kubectl exec exited with exit status: 137.\n\
+             kubectl stderr:\n  command terminated with exit code 137"
+                .into(),
+        )
+    }
+
+    fn explain(k: &PodReads, err: cli_core::CliError) -> String {
+        explain_keep_alive_end_within(
+            k,
+            "ld-pg-db",
+            "shop",
+            err,
+            Duration::from_millis(200),
+            Duration::from_millis(10),
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn a_command_killed_by_the_keep_alive_is_told_so_and_how_to_raise_it() {
+        // The container's end reaches the pod's status a moment after the
+        // exec has failed: the explanation waits for it.
+        let k = reads(vec![
+            Some(helper_with(json!({"running": {}}))),
+            Some(helper_with(json!({"terminated": {"exitCode": 0}}))),
+        ]);
+        let msg = explain(&k, killed());
+        assert!(
+            msg.starts_with("the command in helper pod shop/ld-pg-db was killed (exit code 137)"),
+            "{msg}"
+        );
+        assert!(msg.contains("keep-alive of 6h ran out"), "{msg}");
+        assert!(msg.contains("apprafter backup set deadline"), "{msg}");
+        assert!(msg.contains("never less than six hours"), "{msg}");
+        assert!(
+            msg.ends_with("command terminated with exit code 137"),
+            "{msg}"
+        );
+
+        // kube-rs words it as the apiserver does.
+        let k = reads(vec![Some(helper_with(
+            json!({"terminated": {"exitCode": 0}}),
+        ))]);
+        let msg = explain(
+            &k,
+            cli_core::CliError::Other(
+                "exec_stream_to_file: exec [\"tar\"] in shop/ld-pg-db failed (status=Some(\"Failure\"), \
+                 reason=NonZeroExitCode): command terminated with non-zero exit code: error \
+                 executing command [tar], exit code 137"
+                    .into(),
+            ),
+        );
+        assert!(msg.contains("keep-alive of 6h ran out"), "{msg}");
+    }
+
+    #[test]
+    fn any_other_137_or_failure_is_left_as_it_is() {
+        let original = killed().to_string();
+        // Killed with its pod, gone, or still running past the wait.
+        for script in [
+            vec![Some(helper_with(json!({"terminated": {"exitCode": 137}})))],
+            vec![None],
+            vec![Some(helper_with(json!({"running": {}})))],
+        ] {
+            let k = reads(script.clone());
+            assert_eq!(explain(&k, killed()), original, "{script:?}");
+        }
+        // Not a 137 at all: the pod is not even read.
+        let k = reads(vec![]);
+        let other = cli_core::CliError::Other("pg_restore: error: could not connect".into());
+        assert_eq!(explain(&k, other), "pg_restore: error: could not connect");
     }
 
     #[test]

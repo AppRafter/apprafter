@@ -226,6 +226,13 @@ If the backup block is git-managed,
 set `activeDeadlineSeconds` / `checkActiveDeadlineSeconds` under
 `spec.backup` in your infra repo instead.
 
+The backup limit reaches `apprafter backup create`, `apprafter export` and
+`apprafter restore` too, though nothing stops those commands as a whole: each
+dump or load they run in a helper pod gets the limit, and never less than six
+hours, so lowering it for a frequent schedule does not cut a restore short. One
+that needs longer fails saying its helper pod's keep-alive ran out; raise the
+limit with `apprafter backup set deadline` and run the command again.
+
 A backup that failed with `pg dump of <namespace>/<claim> gave up` met one of
 the two limits on a dump's start, both a lock held by another session. `gave
 up: another session held a lock` is a table lock held for five minutes,

@@ -73,9 +73,10 @@ pub struct BackupOpts {
     /// The `postgres:<major>-alpine` image to use for pg_dump helper pods.
     pub pg_image: String,
     /// How long each helper pod keeps itself alive, and so the most any one
-    /// extraction may take: the run's deadline. The scheduled runner passes
-    /// its Job's `activeDeadlineSeconds`; the CLI the same cluster setting,
-    /// through [`read_run_deadline`]. See [`crate::helper_pod`].
+    /// extraction may take: [`crate::helper_pod::helper_keep_alive`] of the
+    /// run's deadline. The scheduled runner passes its Job's
+    /// `activeDeadlineSeconds`; the CLI the same cluster setting, through
+    /// [`read_helper_keep_alive`].
     pub helper_keep_alive: std::time::Duration,
     /// Staging / snapshotting behaviour.
     pub staging_mode: StagingMode,
@@ -449,13 +450,24 @@ pub fn read_platform_version(k: &dyn KubeExec) -> Result<String> {
 }
 
 /// The cluster's backup run deadline — `spec.backup.activeDeadlineSeconds`,
-/// six hours when unset — which is how long a helper pod keeps itself alive
-/// ([`crate::helper_pod::run_deadline_of`]). The CLI reads it here; the
-/// scheduled runner has its Job's own value in its env.
-pub fn read_run_deadline(k: &dyn KubeExec) -> Result<std::time::Duration> {
+/// six hours when unset ([`crate::helper_pod::run_deadline_of`]).
+///
+/// Crate-private on purpose: the CLI sized its helper pods with this once, and
+/// a deadline set for a frequent schedule then cut its restores short. What a
+/// caller outside wants is [`read_helper_keep_alive`].
+pub(crate) fn read_run_deadline(k: &dyn KubeExec) -> Result<std::time::Duration> {
     Ok(crate::helper_pod::run_deadline_of(
         get_platformstack(k)?.as_ref(),
     ))
+}
+
+/// How long the CLI's helper pods keep themselves alive (`backup create`,
+/// `export`, `restore`): [`crate::helper_pod::helper_keep_alive`] of the
+/// cluster's run deadline — never less than six hours, however short the
+/// schedule has made the deadline, because these commands have no Job
+/// deadline of their own and the keep-alive is their only limit.
+pub fn read_helper_keep_alive(k: &dyn KubeExec) -> Result<std::time::Duration> {
+    Ok(crate::helper_pod::helper_keep_alive(read_run_deadline(k)?))
 }
 
 /// The CNPG operand image of the first CNPG Cluster found, for major-matched
@@ -1346,6 +1358,41 @@ mod tests {
         assert_eq!(
             read_run_deadline(&FakeKube::scripted()).unwrap(),
             crate::helper_pod::DEFAULT_RUN_DEADLINE
+        );
+    }
+
+    #[test]
+    fn the_clis_helpers_live_the_deadline_but_never_less_than_six_hours() {
+        let ps_args = [
+            "get",
+            "platformstack",
+            "default",
+            "-n",
+            "apprafter-system",
+            "-o",
+            "json",
+        ];
+        let deadline = |secs: u64| {
+            FakeKube::scripted().reply(
+                &ps_args,
+                json!({"spec": {"backup": {"activeDeadlineSeconds": secs}}}),
+            )
+        };
+        // A deadline set for a frequent schedule does not cut an interactive
+        // restore short…
+        assert_eq!(
+            read_helper_keep_alive(&deadline(600)).unwrap(),
+            std::time::Duration::from_secs(6 * 3600)
+        );
+        // …a raised one gives it more time…
+        assert_eq!(
+            read_helper_keep_alive(&deadline(43200)).unwrap(),
+            std::time::Duration::from_secs(43200)
+        );
+        // …and none at all is the six hours.
+        assert_eq!(
+            read_helper_keep_alive(&FakeKube::scripted()).unwrap(),
+            std::time::Duration::from_secs(6 * 3600)
         );
     }
 

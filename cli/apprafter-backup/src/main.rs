@@ -281,11 +281,10 @@ fn do_backup(k: &dyn KubeExec, r: &dyn ResticRunner, cfg: &RunnerConfig) -> Resu
         is_subset: false,
         staging_root: staging.path().to_path_buf(),
         pg_image,
-        // Each helper pod lives as long as this run may: the Job's deadline.
-        // A Job template older than the variable gets the chart's default.
-        helper_keep_alive: cfg
-            .deadline
-            .unwrap_or(backup_core::helper_pod::DEFAULT_RUN_DEADLINE),
+        // Each helper pod lives at least as long as this run may: the Job's
+        // deadline, never less than six hours — the rule the CLI's helper
+        // pods follow too, so that both build one spec for a name.
+        helper_keep_alive: cfg.helper_keep_alive(),
         staging_mode: cfg.staging_mode,
         // Stable restic `--host` — the operator-chosen cluster NAME when there
         // is one, else the fixed `apprafter-backup`. Never the pod name, which
