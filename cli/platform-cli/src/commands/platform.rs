@@ -252,6 +252,10 @@ pub(crate) fn condition_polarity(type_: &str) -> Option<ConditionPolarity> {
         // ([`backup_health_lines`]) that says since when and what to run
         // next, so the one-row table version would be a vaguer copy of it.
         "BackupHealthy" => Some(ConditionPolarity::ReportedElsewhere),
+        // Retention, printed under `Backups:` by the same section
+        // ([`backup_retention_lines`]), which knows that `False` for a
+        // scoped key is a warning to act on, not a failing backup.
+        "BackupRetention" => Some(ConditionPolarity::ReportedElsewhere),
         _ => None,
     }
 }
@@ -277,11 +281,117 @@ pub(crate) const BACKUP_HEALTH_DOC: &str =
 /// command, and a cluster that enabled backups on an operator too old to
 /// report on them says so instead of saying nothing.
 ///
-/// A second backup condition (retention) belongs in this section too, as
-/// one more [`backup_condition_lines`] call with its own label and advice:
-/// the operator keeps it apart from `BackupHealthy` so that one never hides
-/// the other, and this section should print both for the same reason.
+/// The operator's second backup condition, `BackupRetention`, follows
+/// ([`backup_retention_lines`]): it is kept apart from `BackupHealthy` so
+/// that one never hides the other, and this section prints both for the
+/// same reason.
 pub(crate) fn backup_health_lines(json: &Value, now: DateTime<Utc>) -> Vec<String> {
+    let mut lines = backup_runs_lines(json, now);
+    lines.extend(backup_retention_lines(json, now));
+    lines
+}
+
+/// Where retention, and each reason it is not enforced, is explained.
+pub(crate) const BACKUP_RETENTION_DOC: &str =
+    "https://docs.apprafter.dev/how-it-works/backup-retention-and-checks/#who-runs-the-prune";
+
+/// The retention half of the backup section, from the operator's
+/// `BackupRetention` condition: one quiet line when a prune ran after the
+/// latest check; otherwise what is not enforced, since when, the operator's
+/// message (with the repository's size and growth) and what to run next.
+///
+/// Nothing while backups are off, and nothing from an operator that does
+/// not write the condition: every operator that reports `BackupHealthy`
+/// reports this too (they shipped together), and one that reports neither
+/// has already been named by the line above.
+pub(crate) fn backup_retention_lines(json: &Value, now: DateTime<Utc>) -> Vec<String> {
+    let enabled = json
+        .pointer("/spec/backup/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !enabled {
+        return Vec::new();
+    }
+    let conditions = json.pointer("/status/conditions").and_then(Value::as_array);
+    let Some(c) = conditions.and_then(|cs| cs.iter().find(|c| c["type"] == "BackupRetention"))
+    else {
+        return Vec::new();
+    };
+    let field = |k: &str| c.get(k).and_then(Value::as_str).unwrap_or("");
+    let (status, reason, message) = (field("status"), field("reason"), field("message"));
+    if status == "True" {
+        return vec![format!("Retention: enforced — {message}")];
+    }
+    let since = c
+        .get("lastTransitionTime")
+        .and_then(Value::as_str)
+        .map(|t| format_timestamp_with_relative(t, now))
+        .unwrap_or_else(|| "an unrecorded time".to_string());
+    let headline = match (status, reason) {
+        // Chosen: said plainly, as the state it is, not as a failure.
+        ("False", "EnforcedOutsideCluster") => {
+            format!("Retention: not enforced in the cluster, by choice — {reason}")
+        }
+        ("False", _) => format!("Retention: NOT ENFORCED since {since} — {reason}"),
+        _ => format!("Retention: not known yet — {reason}"),
+    };
+    let mut lines = vec![cli_core::style::warn(&headline)];
+    if !message.is_empty() {
+        lines.push(cli_core::style::warn(&format!("  {message}")));
+    }
+    let next = retention_next_step(reason).unwrap_or(
+        "`apprafter backup status` shows the runner's record of its last check and prune.",
+    );
+    lines.push(format!("  Next: {next}"));
+    lines.push(format!(
+        "  What it means and what to change: {BACKUP_RETENTION_DOC}"
+    ));
+    lines
+}
+
+/// What to run next for each `BackupRetention` reason the operator writes
+/// that is not `True`. Every reason is named, so a new one is a decision
+/// here (a test reads the reasons out of the operator's source).
+fn retention_next_step(reason: &str) -> Option<&'static str> {
+    Some(match reason {
+        "PruneNotPermitted" => {
+            "prune from outside the cluster with the operator's full credentials: `apprafter \
+             backup prune --credential-file <full-credentials.env>`. The cluster's key may not \
+             delete on purpose (it keeps a compromised cluster from erasing history), so this \
+             stays until retention runs where the full credentials are."
+        }
+        "EnforcedOutsideCluster" => {
+            "`apprafter backup prune` with the operator's full credentials, on your own \
+             cadence; or `apprafter backup set enforce check` to prune after the weekly check."
+        }
+        "CheckFailed" => {
+            "`apprafter backup status` shows why the check failed (`last check`), and \
+             `apprafter backup check` runs it from this machine. A check that does not pass \
+             never prunes; retention resumes after one that does."
+        }
+        "CheckOff" => {
+            "`apprafter backup set check 06:00` turns the weekly check, and the prune after it, \
+             back on; `apprafter backup prune` prunes from outside the cluster meanwhile."
+        }
+        "PruneFailed" => {
+            "`apprafter backup status` shows the prune's error; `apprafter backup prune` runs \
+             the same prune from this machine."
+        }
+        "NoCheckYet" | "NoPruneYet" => {
+            "`apprafter backup status` shows the schedule. `kubectl -n apprafter-system create \
+             job --from=cronjob/apprafter-backup-check apprafter-backup-check-now` runs the \
+             check, and the prune after it, now."
+        }
+        "RecordUnreadable" => {
+            "the operator could not read the runner's record, and its log says why; `apprafter \
+             backup status` reads it with your own credentials."
+        }
+        _ => return None,
+    })
+}
+
+/// The runs half of the backup section, from `BackupHealthy`.
+fn backup_runs_lines(json: &Value, now: DateTime<Utc>) -> Vec<String> {
     let enabled = json
         .pointer("/spec/backup/enabled")
         .and_then(Value::as_bool)
@@ -1462,7 +1572,11 @@ mod tests {
     fn both_backup_documentation_links_resolve_to_committed_sections() {
         // The URLs are printed to someone whose backup cannot run. The docs
         // build checks links between pages, not a URL inside a Rust string.
-        for url in [BACKUP_UNSCHEDULABLE_DOC, BACKUP_HEALTH_DOC] {
+        for url in [
+            BACKUP_UNSCHEDULABLE_DOC,
+            BACKUP_HEALTH_DOC,
+            BACKUP_RETENTION_DOC,
+        ] {
             let path = url
                 .strip_prefix("https://docs.apprafter.dev/")
                 .expect("a docs.apprafter.dev URL");
@@ -1478,6 +1592,172 @@ mod tests {
                 ),
                 "{} has no heading with {{#{anchor}}}",
                 file.display()
+            );
+        }
+    }
+
+    // ---- WI-389: retention, under the same section ----
+
+    fn with_retention(health: Option<Value>, retention: Option<Value>) -> Value {
+        let mut conditions = vec![json!({ "type": "Ready", "status": "True" })];
+        conditions.extend(health);
+        conditions.extend(retention);
+        json!({
+            "spec": { "backup": { "enabled": true } },
+            "status": { "conditions": conditions },
+        })
+    }
+
+    fn retention_condition(status: &str, reason: &str, message: &str) -> Value {
+        json!({ "type": "BackupRetention", "status": status, "reason": reason,
+                "message": message, "lastTransitionTime": "2026-09-20T06:00:41Z" })
+    }
+
+    const NOT_PERMITTED_MESSAGE: &str = "retention is not enforced: the cluster's S3 key may not \
+        delete, and the prune after the weekly check at 2026-09-20T06:00:41+00:00 was not \
+        permitted: the storage refused to delete snapshot ecd0be32 (Remove(<snapshot/ecd0be3219>) \
+        failed: client.RemoveObject: Access Denied.), so nothing was deleted. Run `apprafter \
+        backup prune` with full credentials. The repository held 1.2 GiB in 42 snapshot(s) and \
+        310512 blob(s) at 2026-09-20T06:00:44+00:00; +155.1 MiB, +7 snapshot(s), +11020 blob(s) \
+        since 2026-09-13T06:00:40+00:00.";
+
+    /// The recommended setup: backups healthy, retention not enforced. Both
+    /// say so, and the healthy line does not swallow the warning.
+    #[test]
+    fn a_key_that_may_not_delete_is_loud_beside_healthy_backups() {
+        let stack = with_retention(
+            Some(backup_condition(
+                "True",
+                "Succeeded",
+                "the last backup succeeded",
+            )),
+            Some(retention_condition(
+                "False",
+                "PruneNotPermitted",
+                NOT_PERMITTED_MESSAGE,
+            )),
+        );
+        let lines = backup_health_lines(&stack, frozen_now());
+        let text = lines.join("\n");
+        assert!(lines[0].starts_with("Backups: healthy"), "{text}");
+        assert!(
+            lines[1].contains("Retention: NOT ENFORCED since 2026-09-20 06:00 UTC"),
+            "{text}"
+        );
+        assert!(lines[1].contains("PruneNotPermitted"), "{text}");
+        assert!(text.contains("+155.1 MiB"), "the growth is shown: {text}");
+        assert!(
+            text.contains("`apprafter backup prune --credential-file <full-credentials.env>`"),
+            "{text}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.trim_end().ends_with(BACKUP_RETENTION_DOC)),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn enforced_retention_is_one_quiet_line() {
+        let stack = with_retention(
+            Some(backup_condition("True", "Succeeded", "ok")),
+            Some(retention_condition(
+                "True",
+                "Pruned",
+                "the prune after the weekly check at t: forgot 2 snapshot(s)",
+            )),
+        );
+        let lines = backup_health_lines(&stack, frozen_now());
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[1].starts_with("Retention: enforced — the prune after"),
+            "{lines:?}"
+        );
+    }
+
+    /// The explicit opt-out is stated as a choice, not as a failure.
+    #[test]
+    fn retention_chosen_to_run_outside_the_cluster_is_not_called_failing() {
+        let stack = with_retention(
+            Some(backup_condition("True", "Succeeded", "ok")),
+            Some(retention_condition(
+                "False",
+                "EnforcedOutsideCluster",
+                "spec.backup.retention.enforce is operator",
+            )),
+        );
+        let text = backup_health_lines(&stack, frozen_now()).join("\n");
+        assert!(
+            text.contains("not enforced in the cluster, by choice"),
+            "{text}"
+        );
+        assert!(!text.contains("NOT ENFORCED since"), "{text}");
+        assert!(
+            text.contains("`apprafter backup set enforce check`"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn retention_not_known_yet_is_never_rendered_as_enforced() {
+        for reason in ["NoCheckYet", "NoPruneYet", "RecordUnreadable"] {
+            let stack = with_retention(
+                Some(backup_condition("True", "Succeeded", "ok")),
+                Some(retention_condition("Unknown", reason, "why")),
+            );
+            let text = backup_health_lines(&stack, frozen_now()).join("\n");
+            assert!(
+                text.contains("Retention: not known yet"),
+                "{reason}: {text}"
+            );
+            assert!(!text.contains("Retention: enforced"), "{reason}: {text}");
+        }
+    }
+
+    #[test]
+    fn an_operator_that_does_not_report_retention_is_named_once() {
+        // An operator that reports neither condition is named once, by the
+        // runs line; the retention half adds nothing to it.
+        let neither = with_retention(None, None);
+        let lines = backup_health_lines(&neither, frozen_now());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("does not report"), "{lines:?}");
+        // Backups off: nothing about retention, even with a stale condition.
+        let mut off = with_retention(
+            None,
+            Some(retention_condition("False", "PruneNotPermitted", "m")),
+        );
+        off["spec"]["backup"]["enabled"] = json!(false);
+        assert!(backup_retention_lines(&off, frozen_now()).is_empty());
+    }
+
+    #[test]
+    fn every_retention_reason_the_operator_writes_has_its_own_next_step() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../operator/operator-controllers/platform-stack/src/backup_retention.rs");
+        let src =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let reasons: Vec<String> = src
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("pub const REASON_"))
+            .filter_map(|l| l.split_once("= \""))
+            .filter_map(|(_, rest)| rest.split_once('"'))
+            .map(|(name, _)| name.to_string())
+            .collect();
+        assert!(
+            reasons.len() >= 10,
+            "only {reasons:?} parsed out of {} — the declaration shape changed",
+            path.display()
+        );
+        for reason in reasons
+            .iter()
+            .filter(|r| !matches!(r.as_str(), "Pruned" | "NothingToPrune"))
+        {
+            assert!(
+                retention_next_step(reason).is_some(),
+                "the operator writes BackupRetention reason `{reason}` and this build gives it \
+                 no next step of its own"
             );
         }
     }

@@ -39,31 +39,74 @@
 //! * the staging volume holding more than its size limit → the run is
 //!   stopped the same way, by the runner itself, and recorded as a `Failure`
 //!   that names the limit ([`apprafter_backup::staging`]), exit **1**.
+//!
+//! # `apprafter-backup check` — the weekly check Job
+//!
+//! With the argument `check` the runner does not back up: it runs `restic
+//! check`, then — under `retention.enforce: check`, and only after a check
+//! that passed — the prune, then reads the repository's figures
+//! ([`apprafter_backup::check`]). Exit **1** when the check did not pass,
+//! **0** otherwise, whatever the prune did: a prune the cluster's key may not
+//! run, or one that fails, is recorded in the status ConfigMap and reported
+//! by the operator's `BackupRetention` condition, not as a failed check. The
+//! same stop handles its SIGTERM, and records the failure against the step
+//! it was in. Any other argument is a precondition error (exit **2**).
 
-use apprafter_backup::config::RunnerConfig;
+use apprafter_backup::check::{run_check, CheckPlan, PhaseCell};
+use apprafter_backup::config::{Enforce, RunnerConfig};
 use apprafter_backup::kube_rs_exec::KubeRsExec;
 use apprafter_backup::orchestrate::{resolve_namespaces, RunOutcome};
 use apprafter_backup::restic_child::ForwardingRestic;
 use apprafter_backup::staging;
-use apprafter_backup::status::write_status;
-use apprafter_backup::stop::{self, OutcomeClaim, StopContext, StopSignal};
+use apprafter_backup::status::{prune_record, status_configmap, write_status_data, PruneRecord};
+use apprafter_backup::stop::{self, OutcomeClaim, StopContext, StopKind, StopSignal};
 use apprafter_backup::webhook::post_failure;
 
 use backup_core::engine::{run_backup, BackupOpts};
-use backup_core::prune::run_prune;
+use backup_core::prune::{run_prune, PruneOutcome};
 use backup_core::restic::restic_unlock_argv;
 use backup_core::{KubeExec, ResticRunner, StagingMode};
 
 use cli_core::{CliError, Result};
 
+/// Which Job this process is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// The nightly backup (no argument): the CronJob, and `apprafter backup
+    /// run`, which copies its Job template.
+    Backup,
+    /// The weekly check Job (`check`).
+    Check,
+}
+
+impl Mode {
+    fn from_args(args: &[String]) -> Result<Self> {
+        match args {
+            [] => Ok(Mode::Backup),
+            [one] if one == "check" => Ok(Mode::Check),
+            other => Err(CliError::Other(format!(
+                "unknown arguments {other:?}: the runner takes none (a backup) or `check` (the \
+                 weekly check and the prune after it)"
+            ))),
+        }
+    }
+}
+
 fn main() {
-    let code = run();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let code = match Mode::from_args(&args) {
+        Ok(mode) => run(mode),
+        Err(e) => {
+            eprintln!("{e}");
+            2
+        }
+    };
     std::process::exit(code);
 }
 
 /// The whole run, returning the process exit code. NEVER panics: every error is
 /// funnelled into an exit code (see the module-level error contract).
-fn run() -> i32 {
+fn run(mode: Mode) -> i32 {
     // Before anything else, so a run stopped at its deadline reports how long
     // it had been running rather than how long its setup took.
     let started = std::time::Instant::now();
@@ -123,13 +166,19 @@ fn run() -> i32 {
     //     installed leaves the run exactly as it was before, so it is reported
     //     and the backup goes ahead.
     let claim = OutcomeClaim::default();
+    let phase = PhaseCell::default();
     let stop_ctx = StopContext {
         client: client.clone(),
         live_helpers: k.live_helper_pods(),
         restic: r.live_children(),
         started,
         deadline: cfg.deadline,
-        format,
+        kind: match mode {
+            Mode::Backup => StopKind::Backup { format },
+            Mode::Check => StopKind::Check {
+                phase: phase.clone(),
+            },
+        },
         cluster_id: cfg.cluster_id.clone(),
         failure_webhook: cfg.failure_webhook.clone(),
     };
@@ -168,6 +217,10 @@ fn run() -> i32 {
         ),
     }
 
+    if mode == Mode::Check {
+        return check(&k, &r, &cfg, &client, &rt, &phase, &claim);
+    }
+
     // 2c. The staging volume's size limit. The run stages under TMPDIR, which
     //     the chart sets to the staging volume, so that directory is the
     //     volume the limit applies to. Measured here every few seconds: a run
@@ -194,7 +247,8 @@ fn run() -> i32 {
     // 3. The backup itself, wrapped so ANY error becomes a Failure outcome
     //    (never a panic, never a bare exit) — the engine ran, so the outcome is
     //    recorded in the status CM and the exit code is 1.
-    let result = do_backup(&k, &r, &cfg);
+    let mut pruned: Option<PruneRecord> = None;
+    let result = do_backup(&k, &r, &cfg, &mut pruned);
     if !claim.claim() {
         // Kubernetes stopped the run, or its staging passed the limit, and the
         // stop is recording it; an error here is the stop's own doing (it
@@ -221,8 +275,16 @@ fn run() -> i32 {
     // 4. Status ConfigMap — BEST-EFFORT. A write failure is logged but does NOT
     //    change the run's exit code (the backup's success/failure is what the
     //    exit code reflects, not our ability to record it).
+    //    Under `enforce: cluster` the run's prune is recorded with it, so
+    //    that retention is reported whatever became of the backup.
     let now = chrono::Utc::now().to_rfc3339();
-    if let Err(e) = rt.block_on(write_status(&client, &outcome, format, &now)) {
+    let mut data = status_configmap(&outcome, format, &now)["data"].clone();
+    if let (Some(p), Some(fields)) = (&pruned, data.as_object_mut()) {
+        if let Some(prune) = prune_record(p, "backup", &now).as_object() {
+            fields.extend(prune.clone());
+        }
+    }
+    if let Err(e) = rt.block_on(write_status_data(&client, &data)) {
         eprintln!("warning: status ConfigMap write failed (non-fatal): {e}");
     }
 
@@ -235,10 +297,64 @@ fn run() -> i32 {
     outcome.exit_code()
 }
 
+/// The weekly check Job: check, prune after a check that passed, figures
+/// ([`apprafter_backup::check`]). Each step is recorded in the status
+/// ConfigMap as it ends — best-effort, like the backup's record — and a check
+/// that did not pass, or a prune that failed, is posted to the failure
+/// webhook.
+fn check(
+    k: &dyn KubeExec,
+    r: &dyn ResticRunner,
+    cfg: &RunnerConfig,
+    client: &kube::Client,
+    rt: &tokio::runtime::Runtime,
+    phase: &PhaseCell,
+    claim: &OutcomeClaim,
+) -> i32 {
+    let plan = CheckPlan {
+        repo: &cfg.repo,
+        passphrase: &cfg.passphrase,
+        depth: &cfg.check_depth,
+        enforce: cfg.enforce,
+        retention: &cfg.retention,
+    };
+    let mut record = |data: serde_json::Value| {
+        if let Err(e) = rt.block_on(write_status_data(client, &data)) {
+            eprintln!("warning: status ConfigMap write failed (non-fatal): {e}");
+        }
+    };
+    let run = run_check(
+        r,
+        &plan,
+        phase,
+        // The same identity read the backup makes (E1): the prune forgets
+        // this cluster's snapshots only.
+        &mut || backup_core::engine::read_cluster_uid(k),
+        &|| chrono::Utc::now().to_rfc3339(),
+        &mut record,
+    );
+    if !claim.claim() {
+        // Stopped: the stop records the step it was in and exits.
+        loop {
+            std::thread::park();
+        }
+    }
+    if let (Some((phase, error)), Some(url)) = (run.failure(), &cfg.failure_webhook) {
+        post_failure(url, &cfg.cluster_id, phase, &error);
+    }
+    run.exit_code()
+}
+
 /// Run one backup end-to-end, returning the restic snapshot id (or `None` when
 /// restic emitted no summary line). Every fallible step propagates its error up
-/// to [`run`], which turns it into a [`RunOutcome::Failure`].
-fn do_backup(k: &dyn KubeExec, r: &dyn ResticRunner, cfg: &RunnerConfig) -> Result<Option<String>> {
+/// to [`run`], which turns it into a [`RunOutcome::Failure`]. Under `enforce:
+/// cluster`, what became of the prune is left in `pruned` for the record.
+fn do_backup(
+    k: &dyn KubeExec,
+    r: &dyn ResticRunner,
+    cfg: &RunnerConfig,
+    pruned: &mut Option<PruneRecord>,
+) -> Result<Option<String>> {
     // a. Unlock a stale lock left by a previous crashed run. NON-FATAL: a fresh
     //    repo (or one restic can't reach yet) has no lock — log and continue so
     //    a spurious unlock error can never fail an otherwise-fine backup.
@@ -335,12 +451,65 @@ fn do_backup(k: &dyn KubeExec, r: &dyn ResticRunner, cfg: &RunnerConfig) -> Resu
     //    and the prune runs immediately after this run's own backup — so our
     //    snapshot is always the newest in its day, and an unscoped planner
     //    would make the co-tenant lose every bucket, structurally.
-    if cfg.enforce_in_cluster {
-        run_prune(r, &cfg.repo, &cfg.passphrase, &cfg.retention, &cluster_uid)?;
+    //
+    //    A key that may not delete fails the run too, as it always has under
+    //    `cluster`: this mode promises a prune after every backup. Nothing is
+    //    deleted — `run_prune` stops at the first refused delete — and the
+    //    record says `not-permitted`.
+    if cfg.enforce == Enforce::Cluster {
+        match run_prune(r, &cfg.repo, &cfg.passphrase, &cfg.retention, &cluster_uid) {
+            Ok(outcome @ PruneOutcome::NotPermitted { .. }) => {
+                let error = format!(
+                    "retention.enforce is cluster, and the prune after this backup was {}. \
+                     The backup itself was taken ({}). Give the cluster a key that may delete, \
+                     or set `apprafter backup set enforce check` (prune after the weekly check, \
+                     as far as the key allows) or `operator` (prune from outside the cluster)",
+                    outcome.describe(),
+                    snapshot
+                        .as_deref()
+                        .unwrap_or("its snapshot id was not reported")
+                );
+                *pruned = Some(PruneRecord::Done(outcome));
+                return Err(CliError::Other(error));
+            }
+            Ok(outcome) => *pruned = Some(PruneRecord::Done(outcome)),
+            Err(e) => {
+                *pruned = Some(PruneRecord::Failed(e.to_string()));
+                return Err(e);
+            }
+        }
     }
 
     // Keep `staging` alive until here (all restic snapshots are committed).
     drop(staging);
 
     Ok(snapshot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_argument_is_a_backup_and_check_is_the_check() {
+        assert_eq!(Mode::from_args(&[]).unwrap(), Mode::Backup);
+        assert_eq!(Mode::from_args(&args(&["check"])).unwrap(), Mode::Check);
+    }
+
+    /// An argument this runner does not know must not fall through to a
+    /// backup: a Job that asked for something else would take one instead.
+    #[test]
+    fn any_other_argument_is_refused() {
+        for bad in [&["prune"][..], &["check", "now"], &["--check"], &["Check"]] {
+            let err = Mode::from_args(&args(bad)).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown arguments"),
+                "{bad:?}: {err}"
+            );
+        }
+    }
 }

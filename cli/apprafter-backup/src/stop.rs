@@ -259,9 +259,53 @@ impl StopSignal {
     }
 }
 
-/// The `lastError` and webhook text for a run stopped by `signal`, after
-/// `ran_for` of a run whose deadline is `deadline` (`None`: not known).
+/// Which Job a stopped run belongs to: it decides what the stop records,
+/// and which knob its message names.
+#[derive(Clone, Debug)]
+pub enum StopKind {
+    /// A backup run. The stop records `lastFailure` / `lastError`, with the
+    /// staging format the run used.
+    Backup { format: &'static str },
+    /// The weekly check run. The stop records its failure against the step
+    /// under way ([`crate::check::CheckPhase`]): the check, or the prune
+    /// after it.
+    Check { phase: crate::check::PhaseCell },
+}
+
+impl StopKind {
+    /// What a message calls the Job and its work, the field that sets its
+    /// deadline, and the command that raises it.
+    fn deadline_knob(&self) -> (&'static str, &'static str, &'static str, &'static str) {
+        match self {
+            StopKind::Backup { .. } => (
+                "a backup Job",
+                "the backup needs",
+                "spec.backup.activeDeadlineSeconds",
+                "`apprafter backup set deadline`",
+            ),
+            StopKind::Check { .. } => (
+                "a check Job",
+                "the check and the prune after it need",
+                "spec.backup.checkActiveDeadlineSeconds",
+                "`apprafter backup set check-deadline`",
+            ),
+        }
+    }
+}
+
+/// The `lastError` and webhook text for a backup run stopped by `signal`,
+/// after `ran_for` of a run whose deadline is `deadline` (`None`: not known).
 pub fn stopped_message(
+    ran_for: Duration,
+    deadline: Option<Duration>,
+    signal: StopSignal,
+) -> String {
+    stopped_message_for(&StopKind::Backup { format: "" }, ran_for, deadline, signal)
+}
+
+/// [`stopped_message`] for a run of either Job.
+pub fn stopped_message_for(
+    kind: &StopKind,
     ran_for: Duration,
     deadline: Option<Duration>,
     signal: StopSignal,
@@ -270,14 +314,17 @@ pub fn stopped_message(
     if signal == StopSignal::Interrupt {
         return format!("run was interrupted (SIGINT) after {ran}");
     }
+    let (job, work, field, raise) = kind.deadline_knob();
     match deadline {
         Some(d) if ran_for + DEADLINE_START_ALLOWANCE >= d => format!(
-            "run exceeded its deadline of {} and was stopped after {ran}: a backup Job is \
-             stopped when its deadline passes (spec.backup.activeDeadlineSeconds). If the \
-             backup needs longer, raise it with `apprafter backup set deadline`; if it should \
-             not have taken this long, the run was stuck — the helper pods it was using have \
-             been deleted",
-            human_duration(d)
+            "run exceeded its deadline of {} and was stopped after {ran}: {job} is stopped \
+             when its deadline passes ({field}). If {work} longer, raise it with \
+             {raise}; if it should not have taken this long, the run was stuck{}",
+            human_duration(d),
+            match kind {
+                StopKind::Backup { .. } => " — the helper pods it was using have been deleted",
+                StopKind::Check { .. } => "",
+            }
         ),
         Some(d) => format!(
             "run was stopped by Kubernetes (SIGTERM) after {ran}, before its deadline of {}: \
@@ -292,6 +339,39 @@ pub fn stopped_message(
     }
 }
 
+/// What the stop records for `kind`, and the phase its failure webhook names:
+/// `(status fields, phase)`. An empty object records nothing: a check run
+/// stopped while reading the repository's figures has its check and prune
+/// recorded already.
+pub fn stop_record(kind: &StopKind, error: &str, now: &str) -> (serde_json::Value, &'static str) {
+    use crate::check::CheckPhase;
+    use crate::status::{check_record, prune_record, CheckResult, PruneRecord};
+    match kind {
+        StopKind::Backup { format } => (
+            crate::status::status_configmap(
+                &RunOutcome::Failure {
+                    error: error.to_string(),
+                },
+                format,
+                now,
+            )["data"]
+                .clone(),
+            "backup",
+        ),
+        StopKind::Check { phase } => match phase.get() {
+            CheckPhase::Check => (
+                check_record(&CheckResult::Failed(error.to_string()), now),
+                "check",
+            ),
+            CheckPhase::Prune => (
+                prune_record(&PruneRecord::Failed(error.to_string()), "check", now),
+                "prune",
+            ),
+            CheckPhase::Stats => (serde_json::json!({}), "check"),
+        },
+    }
+}
+
 /// Everything the stop needs, captured when the run starts. Cloned for each
 /// thing that can stop the run: a signal, or the staging volume passing its
 /// limit ([`crate::staging`]).
@@ -303,8 +383,8 @@ pub struct StopContext {
     pub restic: crate::restic_child::LiveResticChildren,
     pub started: Instant,
     pub deadline: Option<Duration>,
-    /// The staging format the status ConfigMap records.
-    pub format: &'static str,
+    /// Which Job this is, and so what the stop records.
+    pub kind: StopKind,
     pub cluster_id: String,
     pub failure_webhook: Option<String>,
 }
@@ -312,7 +392,7 @@ pub struct StopContext {
 /// Record a run `signal` is stopping (see the module docs). Returns once
 /// every step has finished or run out of time; the caller then exits.
 pub async fn stop_run(ctx: &StopContext, signal: StopSignal) -> RunOutcome {
-    let error = stopped_message(ctx.started.elapsed(), ctx.deadline, signal);
+    let error = stopped_message_for(&ctx.kind, ctx.started.elapsed(), ctx.deadline, signal);
     stop_run_with(ctx, error, signal.number()).await
 }
 
@@ -330,7 +410,7 @@ pub async fn stop_run_with(
     error: String,
     restic_signal: libc::c_int,
 ) -> RunOutcome {
-    eprintln!("backup stopped: {error}");
+    eprintln!("run stopped: {error}");
 
     // 1. Stop the work under way: the helper pods and restic, side by side.
     //
@@ -376,21 +456,25 @@ pub async fn stop_run_with(
         crate::restic_child::release_restic(&ctx.restic, restic_signal, RESTIC_RELEASE_BOUND);
     tokio::join!(delete_helpers, release_restic);
 
-    // 2. The status ConfigMap.
-    let outcome = RunOutcome::Failure { error };
+    // 2. The status ConfigMap: the backup's failure, or the check run's
+    //    against the step it was in.
     let now = chrono::Utc::now().to_rfc3339();
-    match tokio::time::timeout(
-        STATUS_WRITE_BOUND,
-        crate::status::write_status(&ctx.client, &outcome, ctx.format, &now),
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("warning: status ConfigMap write failed (non-fatal): {e}"),
-        Err(_) => eprintln!(
-            "warning: status ConfigMap write still running after {}s (non-fatal)",
-            STATUS_WRITE_BOUND.as_secs()
-        ),
+    let (data, phase) = stop_record(&ctx.kind, &error, &now);
+    let outcome = RunOutcome::Failure { error };
+    if data.as_object().is_some_and(|d| !d.is_empty()) {
+        match tokio::time::timeout(
+            STATUS_WRITE_BOUND,
+            crate::status::write_status_data(&ctx.client, &data),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("warning: status ConfigMap write failed (non-fatal): {e}"),
+            Err(_) => eprintln!(
+                "warning: status ConfigMap write still running after {}s (non-fatal)",
+                STATUS_WRITE_BOUND.as_secs()
+            ),
+        }
     }
 
     // 3. The failure webhook. ureq blocks, so it runs off the runtime's
@@ -399,7 +483,7 @@ pub async fn stop_run_with(
     if let (RunOutcome::Failure { error }, Some(url)) = (&outcome, &ctx.failure_webhook) {
         let (url, cluster, error) = (url.clone(), ctx.cluster_id.clone(), error.clone());
         let post = tokio::task::spawn_blocking(move || {
-            crate::webhook::post_failure(&url, &cluster, "backup", &error)
+            crate::webhook::post_failure(&url, &cluster, phase, &error)
         });
         if tokio::time::timeout(WEBHOOK_BOUND, post).await.is_err() {
             eprintln!(
@@ -511,7 +595,9 @@ mod tests {
                 restic: live_restic.clone(),
                 started: Instant::now(),
                 deadline: None,
-                format: "sequential",
+                kind: StopKind::Backup {
+                    format: "sequential",
+                },
                 cluster_id: "test".into(),
                 failure_webhook: None,
             };
@@ -590,7 +676,9 @@ mod tests {
             restic: live_restic.clone(),
             started: Instant::now(),
             deadline: Some(Duration::from_secs(21600)),
-            format: "monolithic",
+            kind: StopKind::Backup {
+                format: "monolithic",
+            },
             cluster_id: "test".into(),
             failure_webhook: None,
         };
@@ -656,6 +744,108 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("apprafter backup set deadline"), "{msg}");
+    }
+
+    #[test]
+    fn a_check_run_stopped_at_its_deadline_names_the_checks_own_knob() {
+        let kind = StopKind::Check {
+            phase: crate::check::PhaseCell::default(),
+        };
+        let msg = stopped_message_for(
+            &kind,
+            Duration::from_secs(6 * 3600 - 20),
+            Some(Duration::from_secs(6 * 3600)),
+            StopSignal::Terminate,
+        );
+        assert!(msg.starts_with("run exceeded its deadline of 6h"), "{msg}");
+        assert!(msg.contains("checkActiveDeadlineSeconds"), "{msg}");
+        assert!(msg.contains("apprafter backup set check-deadline"), "{msg}");
+        assert!(!msg.contains("helper pods"), "a check has none: {msg}");
+    }
+
+    /// A stopped check run records its failure against the step it was in:
+    /// a stop during the check is a check that did not pass; one during the
+    /// prune leaves the check's pass alone and fails the prune.
+    #[test]
+    fn a_stopped_check_run_records_the_step_it_was_in() {
+        use crate::check::PhaseCell;
+        let backup = StopKind::Backup {
+            format: "monolithic",
+        };
+        let (data, phase) = stop_record(&backup, "stopped", "t");
+        assert_eq!(phase, "backup");
+        assert_eq!(data["lastFailure"], "t");
+        assert_eq!(data["lastError"], "stopped");
+
+        let cell = PhaseCell::default();
+        let check = StopKind::Check {
+            phase: cell.clone(),
+        };
+        let (data, phase) = stop_record(&check, "stopped", "t");
+        assert_eq!(phase, "check");
+        assert_eq!(data["lastCheckResult"], "failed");
+        assert_eq!(data["lastCheckError"], "stopped");
+        assert!(data.get("lastFailure").is_none(), "{data}");
+
+        // Moved on by the run itself, through the same cell.
+        let mut records = Vec::new();
+        let r = StuckInPrune;
+        let depth = backup_core::restic::CheckDepth::Structure;
+        let retention = backup_core::prune::RetentionPolicy::default();
+        let plan = crate::check::CheckPlan {
+            repo: "s3:x",
+            passphrase: "pw",
+            depth: &depth,
+            enforce: crate::config::Enforce::Check,
+            retention: &retention,
+        };
+        let mut at_prune = None;
+        crate::check::run_check(
+            &r,
+            &plan,
+            &cell,
+            &mut || {
+                at_prune = Some(stop_record(&check, "stopped", "t"));
+                Ok("11111111-2222-3333-4444-555555555555".into())
+            },
+            &|| "t".into(),
+            &mut |v| records.push(v),
+        );
+        let (data, phase) = at_prune.expect("the prune began");
+        assert_eq!(phase, "prune");
+        assert_eq!(data["lastPruneResult"], "failed");
+        assert!(data.get("lastCheck").is_none(), "{data}");
+        let (data, _) = stop_record(&check, "stopped", "t");
+        assert_eq!(
+            data,
+            serde_json::json!({}),
+            "the figures step records nothing"
+        );
+    }
+
+    /// A restic whose every command succeeds with an empty repository.
+    struct StuckInPrune;
+
+    impl backup_core::ResticRunner for StuckInPrune {
+        fn run(&self, _: &[String], _: &str) -> cli_core::Result<()> {
+            Ok(())
+        }
+        fn run_stdout(&self, argv: &[String], _: &str) -> cli_core::Result<String> {
+            Ok(if argv[0] == "snapshots" { "[]" } else { "{}" }.into())
+        }
+        fn run_backup(&self, _: &[String], _: &str) -> cli_core::Result<Option<String>> {
+            Ok(None)
+        }
+        fn run_capture(
+            &self,
+            argv: &[String],
+            p: &str,
+        ) -> cli_core::Result<backup_core::ResticOutput> {
+            Ok(backup_core::ResticOutput {
+                stdout: self.run_stdout(argv, p)?,
+                stderr: String::new(),
+            })
+        }
     }
 
     #[test]

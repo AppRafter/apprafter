@@ -16,6 +16,51 @@ use cli_core::{CliError, Result};
 /// pre-`clusterName` cluster has been writing.
 pub const DEFAULT_BACKUP_HOST: &str = "apprafter-backup";
 
+/// Who enforces retention: `spec.backup.retention.enforce`, which the chart
+/// renders into `APPRAFTER_BACKUP_ENFORCE` for both CronJobs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Enforce {
+    /// The weekly check Job prunes after a check that passed, as far as the
+    /// cluster's key may delete (the platform default).
+    Check,
+    /// The backup Job prunes after every backup; a prune that fails fails the
+    /// backup.
+    Cluster,
+    /// Nothing in the cluster prunes: retention is `apprafter backup prune`,
+    /// run outside it with full credentials.
+    Operator,
+}
+
+impl Enforce {
+    /// The value as the chart and the status record spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Enforce::Check => "check",
+            Enforce::Cluster => "cluster",
+            Enforce::Operator => "operator",
+        }
+    }
+
+    /// Read `APPRAFTER_BACKUP_ENFORCE`. The runner deletes nothing unless it
+    /// is told to: an absent variable is `operator`, and so is a value this
+    /// runner does not know, with a warning — the CRD's enum allows none,
+    /// and a backup must not fail over a retention setting.
+    fn parse(value: Option<&str>) -> Self {
+        match value {
+            Some("check") => Enforce::Check,
+            Some("cluster") => Enforce::Cluster,
+            None | Some("operator") => Enforce::Operator,
+            Some(other) => {
+                eprintln!(
+                    "warning: APPRAFTER_BACKUP_ENFORCE={other:?} is not check, cluster or \
+                     operator; this run prunes nothing"
+                );
+                Enforce::Operator
+            }
+        }
+    }
+}
+
 /// Full resolved configuration for one backup runner invocation.
 pub struct RunnerConfig {
     /// Restic repository URL, e.g. `s3:https://endpoint/bucket`.
@@ -33,8 +78,10 @@ pub struct RunnerConfig {
     pub passphrase: String,
     /// Whether to run claims sequentially or as a single monolithic snapshot.
     pub staging_mode: backup_core::StagingMode,
-    /// When true, the runner verifies it is running inside the target cluster.
-    pub enforce_in_cluster: bool,
+    /// Who enforces retention. The backup run prunes after the backup only
+    /// under [`Enforce::Cluster`]; the check run prunes after a passing check
+    /// only under [`Enforce::Check`].
+    pub enforce: Enforce,
     /// How many daily/weekly/monthly run representatives to retain.
     pub retention: backup_core::prune::RetentionPolicy,
     /// Optional URL to POST on backup failure.
@@ -54,6 +101,12 @@ pub struct RunnerConfig {
     /// quantity this parser does not read; the kubelet's eviction is then the
     /// only bound, as it was before.
     pub staging_limit: Option<u64>,
+    /// How much data the check run's `restic check` reads:
+    /// `APPRAFTER_BACKUP_CHECK_READ_DATA` (`true` = every pack) and
+    /// `APPRAFTER_BACKUP_CHECK_READ_DATA_SUBSET` (`10%`, `n/t`, a size), from
+    /// `checkReadData` / `checkReadDataSubset`. Both absent is structure
+    /// only; the chart always renders the subset.
+    pub check_depth: backup_core::restic::CheckDepth,
 }
 
 impl RunnerConfig {
@@ -82,8 +135,7 @@ impl RunnerConfig {
                 backup_core::StagingMode::Monolithic
             };
 
-        let enforce_in_cluster =
-            e.get("APPRAFTER_BACKUP_ENFORCE").map(|s| s.as_str()) == Some("cluster");
+        let enforce = Enforce::parse(e.get("APPRAFTER_BACKUP_ENFORCE").map(String::as_str));
 
         let mut retention = backup_core::prune::RetentionPolicy::default();
         if let Some(v) = e.get("APPRAFTER_BACKUP_KEEP_DAILY") {
@@ -110,17 +162,37 @@ impl RunnerConfig {
             .get("APPRAFTER_BACKUP_STAGING_SIZE_LIMIT")
             .and_then(|v| parse_staging_limit(v));
 
+        let read_data = match e
+            .get("APPRAFTER_BACKUP_CHECK_READ_DATA")
+            .map(String::as_str)
+        {
+            None | Some("") | Some("false") => false,
+            Some("true") => true,
+            Some(other) => {
+                return Err(CliError::Other(format!(
+                    "env APPRAFTER_BACKUP_CHECK_READ_DATA={other:?} is not true or false"
+                )))
+            }
+        };
+        let check_depth = backup_core::restic::CheckDepth::from_knobs(
+            read_data,
+            e.get("APPRAFTER_BACKUP_CHECK_READ_DATA_SUBSET")
+                .map(String::as_str)
+                .unwrap_or(""),
+        );
+
         Ok(RunnerConfig {
             repo,
             cluster_id,
             backup_host,
             passphrase,
             staging_mode,
-            enforce_in_cluster,
+            enforce,
             retention,
             failure_webhook,
             deadline,
             staging_limit,
+            check_depth,
         })
     }
 
@@ -259,7 +331,7 @@ mod tests {
         assert_eq!(c.backup_host, "prod");
         assert_eq!(c.passphrase, "p");
         assert_eq!(c.staging_mode, backup_core::StagingMode::Sequential);
-        assert!(c.enforce_in_cluster);
+        assert_eq!(c.enforce, Enforce::Cluster);
         assert_eq!(c.retention.keep_daily, 5);
         assert_eq!(c.failure_webhook.as_deref(), Some("https://hook"));
         assert_eq!(c.deadline, Some(Duration::from_secs(21600)));
@@ -277,7 +349,9 @@ mod tests {
         // An unnamed cluster keeps the host it has always written under —
         // upgrading the runner must not re-group an existing repository.
         assert_eq!(c.backup_host, DEFAULT_BACKUP_HOST);
-        assert!(!c.enforce_in_cluster);
+        // Not told to prune: prunes nothing.
+        assert_eq!(c.enforce, Enforce::Operator);
+        assert_eq!(c.check_depth, backup_core::restic::CheckDepth::Structure);
         assert_eq!(c.retention.keep_daily, 7); // RetentionPolicy::default
         assert_eq!(c.retention.keep_weekly, 4);
         assert_eq!(c.retention.keep_monthly, 6);
@@ -363,6 +437,71 @@ mod tests {
             ("APPRAFTER_BACKUP_KEEP_DAILY", "not-a-number"),
         ]);
         assert!(RunnerConfig::from_env_map(&e).is_err());
+    }
+
+    #[test]
+    fn every_retention_mode_the_chart_renders_is_read_and_nothing_else_prunes() {
+        for (raw, want) in [
+            (Some("check"), Enforce::Check),
+            (Some("cluster"), Enforce::Cluster),
+            (Some("operator"), Enforce::Operator),
+            // Absent, or a value no CRD allows: the runner deletes nothing.
+            (None, Enforce::Operator),
+            (Some("Check"), Enforce::Operator),
+            (Some(""), Enforce::Operator),
+        ] {
+            let mut pairs = vec![
+                ("APPRAFTER_BACKUP_REPO", "s3:x"),
+                ("APPRAFTER_CLUSTER_ID", "c"),
+                ("RESTIC_PASSWORD", "p"),
+            ];
+            if let Some(v) = raw {
+                pairs.push(("APPRAFTER_BACKUP_ENFORCE", v));
+            }
+            let c = RunnerConfig::from_env_map(&map(&pairs)).unwrap();
+            assert_eq!(c.enforce, want, "{raw:?}");
+            if let Some(v) = raw.filter(|v| matches!(*v, "check" | "cluster" | "operator")) {
+                assert_eq!(c.enforce.as_str(), v);
+            }
+        }
+    }
+
+    #[test]
+    fn the_check_depth_follows_the_charts_two_knobs() {
+        use backup_core::restic::CheckDepth;
+        for (full, subset, want) in [
+            (None, Some("10%"), CheckDepth::Subset("10%".into())),
+            (Some("false"), Some("10%"), CheckDepth::Subset("10%".into())),
+            (Some("true"), Some("10%"), CheckDepth::Full),
+            (Some("false"), Some(""), CheckDepth::Structure),
+            (None, None, CheckDepth::Structure),
+        ] {
+            let mut pairs = vec![
+                ("APPRAFTER_BACKUP_REPO", "s3:x"),
+                ("APPRAFTER_CLUSTER_ID", "c"),
+                ("RESTIC_PASSWORD", "p"),
+            ];
+            if let Some(v) = full {
+                pairs.push(("APPRAFTER_BACKUP_CHECK_READ_DATA", v));
+            }
+            if let Some(v) = subset {
+                pairs.push(("APPRAFTER_BACKUP_CHECK_READ_DATA_SUBSET", v));
+            }
+            let c = RunnerConfig::from_env_map(&map(&pairs)).unwrap();
+            assert_eq!(c.check_depth, want, "{full:?} {subset:?}");
+        }
+        let err = RunnerConfig::from_env_map(&map(&[
+            ("APPRAFTER_BACKUP_REPO", "s3:x"),
+            ("APPRAFTER_CLUSTER_ID", "c"),
+            ("RESTIC_PASSWORD", "p"),
+            ("APPRAFTER_BACKUP_CHECK_READ_DATA", "yes"),
+        ]))
+        .err()
+        .expect("an unreadable knob is a precondition error, not a quieter check");
+        assert!(
+            err.to_string().contains("APPRAFTER_BACKUP_CHECK_READ_DATA"),
+            "{err}"
+        );
     }
 
     #[test]

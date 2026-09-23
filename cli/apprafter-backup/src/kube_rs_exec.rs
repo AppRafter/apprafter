@@ -2808,6 +2808,9 @@ mod tests {
         fn run_backup(&self, _argv: &[String], _pass: &str) -> Result<Option<String>> {
             Ok(Some("stub-snapshot".to_string()))
         }
+        fn run_capture(&self, _argv: &[String], _pass: &str) -> Result<backup_core::ResticOutput> {
+            Ok(backup_core::ResticOutput::default())
+        }
     }
 
     /// Discovery + collection routes for a one-namespace cluster carrying one

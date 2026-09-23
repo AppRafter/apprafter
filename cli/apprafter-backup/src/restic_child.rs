@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use backup_core::restic_runner::{backup_summary_snapshot_id, restic_error};
-use backup_core::ResticRunner;
+use backup_core::{ResticOutput, ResticRunner};
 use cli_core::{CliError, Result};
 
 /// The restic children a run has running, by pid. Shared between
@@ -205,6 +205,17 @@ impl ResticRunner for ForwardingRestic {
 
     fn run_backup(&self, argv: &[String], pass: &str) -> Result<Option<String>> {
         Ok(backup_summary_snapshot_id(&self.run_stdout(argv, pass)?))
+    }
+
+    fn run_capture(&self, argv: &[String], pass: &str) -> Result<ResticOutput> {
+        let out = self.output(argv, pass)?;
+        if !out.status.success() {
+            return Err(restic_error(argv, out.status.code(), &out.stderr));
+        }
+        Ok(ResticOutput {
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
     }
 }
 

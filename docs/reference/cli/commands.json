@@ -1287,12 +1287,12 @@
           "long": "enforce",
           "short": null,
           "takes_value": true,
-          "value_name": "ENFORCE",
+          "value_name": "check|cluster|operator",
           "default": null,
           "env": null,
           "required": false,
           "possible_values": [],
-          "help": "`operator` (default, cluster gets scoped creds) or `cluster` (in-cluster prune)"
+          "help": "Who prunes. `check` (default): the weekly check Job, after a check that passed, as far as the cluster's key may delete — a scoped key deletes nothing, and `backup status` says so. `cluster`: the backup Job, after every backup (needs a key that may delete). `operator`: nothing in the cluster; you run `apprafter backup prune`"
         },
         {
           "id": "failure_webhook",
@@ -1328,7 +1328,7 @@
           "env": null,
           "required": false,
           "possible_values": [],
-          "help": "How many daily snapshots `restic forget` keeps. Default 7. Retention is only APPLIED when `--enforce cluster` is set or you run `apprafter backup prune`; under the default `--enforce operator` the scheduled Job never forgets"
+          "help": "How many daily snapshots `restic forget` keeps. Default 7. Applied by whatever `--enforce` names: the weekly check Job (the default), the backup Job, or `apprafter backup prune`"
         },
         {
           "id": "keep_monthly",
@@ -1506,7 +1506,7 @@
       ],
       "aliases": [],
       "about": "Remove old snapshots from an S3-backed restic repository according to the configured retention policy. Run OUTSIDE the cluster with the operator's full S3 credentials",
-      "long_about": "Remove old snapshots from an S3-backed restic repository according to the configured retention policy. Run OUTSIDE the cluster with the operator's full S3 credentials.\n\nA prune forgets by explicit snapshot id and one repository can hold several clusters' runs, so it must know whose snapshots it may forget. Normally that is the cluster's own `kube-system` namespace UID, read from the kubeconfig. When the cluster is gone and only the repository is left, `--cluster-uid <uid>` names the identity explicitly and the command runs with no cluster at all.",
+      "long_about": "Remove old snapshots from an S3-backed restic repository according to the configured retention policy. Run OUTSIDE the cluster with the operator's full S3 credentials.\n\nA key that may not delete — the cluster's own, when it is scoped as recommended — deletes nothing: the command stops at the first refused delete and exits non-zero, naming `--credential-file`.\n\nA prune forgets by explicit snapshot id and one repository can hold several clusters' runs, so it must know whose snapshots it may forget. Normally that is the cluster's own `kube-system` namespace UID, read from the kubeconfig. When the cluster is gone and only the repository is left, `--cluster-uid <uid>` names the identity explicitly and the command runs with no cluster at all.",
       "usage": "Usage: apprafter backup prune [OPTIONS]",
       "hidden": false,
       "examples": [
@@ -1640,7 +1640,7 @@
       ],
       "aliases": [],
       "about": "Change ONE field of a configured backup, leaving the rest alone. `backup enable` rewrites the whole block, so it cannot be used to adjust a single setting without resetting the others",
-      "long_about": "Change ONE field of a configured backup, leaving the rest alone. `backup enable` rewrites the whole block, so it cannot be used to adjust a single setting without resetting the others.\n\nKeys: enabled <true|false>, at <HH:MM>, check <HH:MM|off>, check-depth <structure|10%|full>, cluster-name <name>, timezone <IANA>, keep-daily <n>, keep-weekly <n>, keep-monthly <n>, enforce <operator|cluster>, staging-mode <monolithic|sequential>, failure-webhook <url>, deadline <duration>, check-deadline <duration>.\n\n`deadline` and `check-deadline` are how long one backup or check Job may run before Kubernetes stops it (default 6h, minimum 10m): `12h`, `90m`, `43200s`. Keep each shorter than the interval between two runs of its schedule and longer than its slowest good run. The check locks the repository exclusively, so also keep the backup's below the gap from a backup to the next check (3h by default) and the check's below the gap from the check to the next backup (21h).\n\n`enabled` is the switch on its own, and it is how a configured but switched-off schedule comes back: after `backup disable`, or after a `restore`, which replays the source's whole backup block disabled. `backup enable` cannot do that job — it composes the whole block from its flags, so it would reset everything the restore just carried across.",
+      "long_about": "Change ONE field of a configured backup, leaving the rest alone. `backup enable` rewrites the whole block, so it cannot be used to adjust a single setting without resetting the others.\n\nKeys: enabled <true|false>, at <HH:MM>, check <HH:MM|off>, check-depth <structure|10%|full>, cluster-name <name>, timezone <IANA>, keep-daily <n>, keep-weekly <n>, keep-monthly <n>, enforce <check|cluster|operator>, staging-mode <monolithic|sequential>, failure-webhook <url>, deadline <duration>, check-deadline <duration>.\n\n`deadline` and `check-deadline` are how long one backup or check Job may run before Kubernetes stops it (default 6h, minimum 10m): `12h`, `90m`, `43200s`. Keep each shorter than the interval between two runs of its schedule and longer than its slowest good run. The check locks the repository exclusively, so also keep the backup's below the gap from a backup to the next check (3h by default) and the check's below the gap from the check to the next backup (21h).\n\n`enabled` is the switch on its own, and it is how a configured but switched-off schedule comes back: after `backup disable`, or after a `restore`, which replays the source's whole backup block disabled. `backup enable` cannot do that job — it composes the whole block from its flags, so it would reset everything the restore just carried across.",
       "usage": "Usage: apprafter backup set <KEY> <VALUE>",
       "hidden": false,
       "examples": [

@@ -1804,7 +1804,7 @@ pub enum BackupAction {
     /// Keys: enabled <true|false>, at <HH:MM>, check <HH:MM|off>,
     /// check-depth <structure|10%|full>, cluster-name <name>, timezone
     /// <IANA>, keep-daily <n>, keep-weekly <n>, keep-monthly <n>,
-    /// enforce <operator|cluster>, staging-mode
+    /// enforce <check|cluster|operator>, staging-mode
     /// <monolithic|sequential>, failure-webhook <url>, deadline
     /// <duration>, check-deadline <duration>.
     ///
@@ -1850,6 +1850,10 @@ pub enum BackupAction {
     /// Remove old snapshots from an S3-backed restic repository
     /// according to the configured retention policy. Run OUTSIDE the
     /// cluster with the operator's full S3 credentials.
+    ///
+    /// A key that may not delete — the cluster's own, when it is scoped
+    /// as recommended — deletes nothing: the command stops at the first
+    /// refused delete and exits non-zero, naming `--credential-file`.
     ///
     /// A prune forgets by explicit snapshot id and one repository can
     /// hold several clusters' runs, so it must know whose snapshots it
@@ -1995,9 +1999,8 @@ pub enum BackupAction {
         #[arg(long, value_name = "zone")]
         timezone: Option<String>,
         /// How many daily snapshots `restic forget` keeps. Default 7.
-        /// Retention is only APPLIED when `--enforce cluster` is set
-        /// or you run `apprafter backup prune`; under the default
-        /// `--enforce operator` the scheduled Job never forgets.
+        /// Applied by whatever `--enforce` names: the weekly check Job
+        /// (the default), the backup Job, or `apprafter backup prune`.
         #[arg(long, value_name = "count")]
         keep_daily: Option<u32>,
         /// How many weekly snapshots `restic forget` keeps. Default 4.
@@ -2008,8 +2011,13 @@ pub enum BackupAction {
         /// 6. Applied under the same rule as `--keep-daily`.
         #[arg(long, value_name = "count")]
         keep_monthly: Option<u32>,
-        /// `operator` (default, cluster gets scoped creds) or `cluster` (in-cluster prune).
-        #[arg(long)]
+        /// Who prunes. `check` (default): the weekly check Job, after a
+        /// check that passed, as far as the cluster's key may delete — a
+        /// scoped key deletes nothing, and `backup status` says so.
+        /// `cluster`: the backup Job, after every backup (needs a key that
+        /// may delete). `operator`: nothing in the cluster; you run
+        /// `apprafter backup prune`.
+        #[arg(long, value_name = "check|cluster|operator")]
         enforce: Option<String>,
         /// `monolithic` (default) or `sequential`.
         #[arg(long)]

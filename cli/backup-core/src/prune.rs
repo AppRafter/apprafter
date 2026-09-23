@@ -19,15 +19,15 @@
 //!
 //! [`plan_prune`] is the pure, deterministic JUDGMENT (what to forget);
 //! [`run_prune`] is the thin impure executor that derives the snapshot metadata
-//! from `restic snapshots --json`, calls [`plan_prune`], and runs
-//! `restic forget --prune` on the resulting id set.
+//! from `restic snapshots --json`, calls [`plan_prune`], forgets the resulting
+//! id set, checks that it is gone, and only then runs `restic prune`.
 
 use std::collections::BTreeMap;
 
 use cli_core::{CliError, Result};
 use serde_json::Value;
 
-use crate::restic::{restic_forget_argv, restic_snapshots_argv};
+use crate::restic::{restic_forget_argv, restic_prune_argv, restic_snapshots_argv};
 
 /// Metadata for one restic snapshot (as [`run_prune`] derives from
 /// `restic snapshots --json`).
@@ -68,6 +68,10 @@ impl Default for RetentionPolicy {
 #[derive(Debug, PartialEq)]
 pub struct PrunePlan {
     pub forget_ids: Vec<String>,
+    /// How many runs those ids make up: rotated-out runs and orphans.
+    pub forget_runs: usize,
+    /// How many of this cluster's runs the keep policy keeps.
+    pub kept_runs: usize,
 }
 
 /// A run: its representative (if any) plus every member snapshot id.
@@ -141,13 +145,17 @@ pub fn plan_prune(
     }
 
     let mut forget_ids: Vec<String> = Vec::new();
+    let mut forget_runs = 0;
 
     // 2. Orphans (no manifest member) → forget the whole set.
     // Collect the representatives of complete runs for the keep policy.
     let mut representatives: Vec<(&SnapshotMeta, &Vec<String>)> = Vec::new();
     for run in runs.values() {
         match &run.representative {
-            None => forget_ids.extend(run.ids.iter().cloned()),
+            None => {
+                forget_ids.extend(run.ids.iter().cloned());
+                forget_runs += 1;
+            }
             Some(rep) => representatives.push((rep, &run.ids)),
         }
     }
@@ -156,9 +164,13 @@ pub fn plan_prune(
     let kept = select_kept(&representatives, policy);
 
     // 4. Forget every group whose representative was not kept.
+    let mut kept_runs = 0;
     for (rep, ids) in &representatives {
-        if !kept.contains(&rep.id) {
+        if kept.contains(&rep.id) {
+            kept_runs += 1;
+        } else {
             forget_ids.extend(ids.iter().cloned());
+            forget_runs += 1;
         }
     }
 
@@ -166,7 +178,11 @@ pub fn plan_prune(
     forget_ids.sort();
     forget_ids.dedup();
 
-    PrunePlan { forget_ids }
+    PrunePlan {
+        forget_ids,
+        forget_runs,
+        kept_runs,
+    }
 }
 
 /// Return the set of representative ids kept by the union of the three buckets.
@@ -254,12 +270,103 @@ fn parse_date(time: &str) -> Option<(i32, u32, u32)> {
 // Executor (impure) — thin restic interaction around the pure planner.
 // ---------------------------------------------------------------------------
 
+/// What [`run_prune`] did to the repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PruneOutcome {
+    /// Every run of this cluster is inside the keep policy: nothing was
+    /// forgotten, and restic was not asked to delete anything.
+    NothingToPrune { kept_runs: usize },
+    /// Snapshots forgotten, and the data only they referred to removed.
+    Pruned {
+        forgot_snapshots: usize,
+        forgot_runs: usize,
+        kept_runs: usize,
+    },
+    /// The credential may not delete snapshots: the store refused the first
+    /// delete, the snapshot is still listed, and NOTHING was deleted or
+    /// written — the first `forget` names one snapshot, and no prune runs.
+    /// The scoped key ADR 0050 recommends for the cluster answers this way
+    /// by design.
+    NotPermitted {
+        /// The snapshot whose delete was refused.
+        snapshot: String,
+        /// What restic said about it (its stderr, trimmed).
+        restic_said: String,
+        /// Snapshots and runs the policy would have forgotten.
+        would_forget_snapshots: usize,
+        would_forget_runs: usize,
+    },
+}
+
+impl PruneOutcome {
+    /// One sentence on what happened, for a status record or a terminal.
+    pub fn describe(&self) -> String {
+        match self {
+            PruneOutcome::NothingToPrune { kept_runs } => format!(
+                "nothing to prune: all {kept_runs} run(s) of this cluster are inside the keep \
+                 policy"
+            ),
+            PruneOutcome::Pruned {
+                forgot_snapshots,
+                forgot_runs,
+                kept_runs,
+            } => format!(
+                "forgot {forgot_snapshots} snapshot(s) of {forgot_runs} run(s) and pruned the \
+                 data only they used; {kept_runs} run(s) kept"
+            ),
+            PruneOutcome::NotPermitted {
+                snapshot,
+                restic_said,
+                would_forget_snapshots,
+                would_forget_runs,
+            } => format!(
+                "not permitted: the storage refused to delete snapshot {} ({}), so nothing was \
+                 deleted; {would_forget_snapshots} snapshot(s) of {would_forget_runs} run(s) \
+                 are past the keep policy",
+                short_id(snapshot),
+                first_line(restic_said)
+            ),
+        }
+    }
+}
+
+/// restic's eight-character short form of a snapshot id.
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
+/// The first line of restic's stderr that says something, for a one-line
+/// record.
+fn first_line(stderr: &str) -> &str {
+    stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("restic gave no reason")
+}
+
 /// `restic snapshots --json` → derive [`SnapshotMeta`] → [`plan_prune`] →
-/// `restic forget --prune` the resulting id set.
+/// forget the resulting id set → `restic prune`.
 ///
 /// The JUDGMENT (what to forget) is entirely in the pure [`plan_prune`]; this
-/// only marshals restic I/O. A no-op prune (nothing to forget) skips the
-/// `forget` call entirely.
+/// only marshals restic I/O. A no-op prune (nothing to forget) runs neither
+/// `forget` nor `prune`.
+///
+/// # Forget, look, then prune
+///
+/// restic's own `forget <ids> --prune` is not safe to run with a credential
+/// that may not delete: restic 0.18.1 exits 0 from a `forget` whose deletes
+/// were refused, and then prunes as if those snapshots were gone (see
+/// [`crate::restic::restic_forget_argv`]). So this:
+///
+/// 1. forgets ONE snapshot of the plan, and lists the repository again. If
+///    it is still there, nothing has been deleted and nothing else is tried:
+///    [`PruneOutcome::NotPermitted`] when restic says the store refused the
+///    delete, an error otherwise;
+/// 2. forgets the rest, and lists again: a snapshot still there is an error,
+///    and no prune runs;
+/// 3. only then runs `restic prune`, which counts as used everything the
+///    listed snapshots refer to.
 ///
 /// `this_cluster_uid` is the caller's `kube-system` namespace UID. The listing
 /// is repository-WIDE (`restic snapshots` has no prefix filter, and the tag
@@ -273,15 +380,72 @@ pub fn run_prune(
     pass: &str,
     policy: &RetentionPolicy,
     this_cluster_uid: &str,
-) -> Result<()> {
+) -> Result<PruneOutcome> {
     let json = r.run_stdout(&restic_snapshots_argv(repo), pass)?;
     let snapshots = parse_snapshots(&json)?;
     let plan = plan_prune(&snapshots, policy, this_cluster_uid);
-    if plan.forget_ids.is_empty() {
-        return Ok(());
+    let Some((probe, rest)) = plan.forget_ids.split_first() else {
+        return Ok(PruneOutcome::NothingToPrune {
+            kept_runs: plan.kept_runs,
+        });
+    };
+
+    // 1. One snapshot first: under a key that may not delete, this is the
+    //    only request that reaches the store, and it changes nothing.
+    let said = r.run_capture(&restic_forget_argv(repo, std::slice::from_ref(probe)), pass)?;
+    if listed_ids(r, repo, pass)?.contains(probe) {
+        let restic_said = said.stderr.trim().to_string();
+        if crate::restic::delete_was_denied(&restic_said) {
+            return Ok(PruneOutcome::NotPermitted {
+                snapshot: probe.clone(),
+                restic_said,
+                would_forget_snapshots: plan.forget_ids.len(),
+                would_forget_runs: plan.forget_runs,
+            });
+        }
+        return Err(CliError::Other(format!(
+            "restic forget exited 0 but snapshot {probe} is still in the repository, so \
+             nothing was forgotten and the repository was not pruned. restic said: {}",
+            first_line(&restic_said)
+        )));
     }
-    r.run(&restic_forget_argv(repo, &plan.forget_ids), pass)?;
-    Ok(())
+
+    // 2. The rest of the plan.
+    if !rest.is_empty() {
+        let said = r.run_capture(&restic_forget_argv(repo, rest), pass)?;
+        let listed = listed_ids(r, repo, pass)?;
+        let left: Vec<&String> = rest.iter().filter(|id| listed.contains(*id)).collect();
+        if !left.is_empty() {
+            return Err(CliError::Other(format!(
+                "restic forget removed {} of the {} snapshot(s) past the keep policy, and {} \
+                 (first {}) are still in the repository, so the repository was not pruned. \
+                 restic said: {}",
+                plan.forget_ids.len() - left.len(),
+                plan.forget_ids.len(),
+                left.len(),
+                left[0],
+                first_line(said.stderr.trim())
+            )));
+        }
+    }
+
+    // 3. Every forgotten snapshot is gone: reclaim the data only they used.
+    r.run(&restic_prune_argv(repo), pass)?;
+    Ok(PruneOutcome::Pruned {
+        forgot_snapshots: plan.forget_ids.len(),
+        forgot_runs: plan.forget_runs,
+        kept_runs: plan.kept_runs,
+    })
+}
+
+/// The full ids of every snapshot the repository lists now.
+fn listed_ids(
+    r: &dyn crate::ResticRunner,
+    repo: &str,
+    pass: &str,
+) -> Result<std::collections::BTreeSet<String>> {
+    let json = r.run_stdout(&restic_snapshots_argv(repo), pass)?;
+    Ok(parse_snapshots(&json)?.into_iter().map(|s| s.id).collect())
 }
 
 /// Parse `restic snapshots --json` (an array of snapshot objects) into
@@ -775,66 +939,223 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // run_prune: the impure seam, with the forget argv actually inspected.
+    // run_prune: the impure seam, against a fake repository that deletes (or
+    // refuses to) the way restic 0.18.1 does.
     // -----------------------------------------------------------------------
 
-    #[derive(Default)]
-    struct FakeRestic {
-        listing: String,
+    /// How the fake store answers a delete.
+    #[derive(Clone, Copy)]
+    enum Deletes {
+        /// Every delete goes through.
+        Allowed,
+        /// Every delete is refused as S3 refuses it: restic prints the
+        /// refusal on stderr and still exits 0 (measured, restic 0.18.1).
+        Denied,
+        /// Every delete fails for another reason, again with exit 0.
+        TimesOut,
+        /// The first `forget` goes through; every later one is refused.
+        FirstOnly,
+    }
+
+    /// A repository restic is run against: `snapshots` lists what is left,
+    /// `forget` removes (or not), `prune` is recorded.
+    struct FakeRepo {
+        snapshots: std::cell::RefCell<Vec<Value>>,
+        deletes: Deletes,
+        forgets: std::cell::Cell<usize>,
         calls: std::cell::RefCell<Vec<Vec<String>>>,
     }
 
-    impl crate::ResticRunner for FakeRestic {
-        fn run(&self, argv: &[String], _p: &str) -> Result<()> {
-            self.calls.borrow_mut().push(argv.to_vec());
-            Ok(())
+    impl FakeRepo {
+        fn new(listing: &str, deletes: Deletes) -> Self {
+            Self {
+                snapshots: std::cell::RefCell::new(serde_json::from_str(listing).unwrap()),
+                deletes,
+                forgets: Default::default(),
+                calls: Default::default(),
+            }
         }
-        fn run_stdout(&self, argv: &[String], _p: &str) -> Result<String> {
-            self.calls.borrow_mut().push(argv.to_vec());
-            Ok(self.listing.clone())
+
+        fn verbs(&self) -> Vec<String> {
+            self.calls.borrow().iter().map(|c| c[0].clone()).collect()
+        }
+
+        fn left(&self) -> Vec<String> {
+            self.snapshots
+                .borrow()
+                .iter()
+                .map(|s| s["id"].as_str().unwrap().to_string())
+                .collect()
+        }
+
+        /// The ids a `forget` argv names: everything after `--repo <repo>`.
+        fn forget_ids(argv: &[String]) -> Vec<String> {
+            argv[3..].to_vec()
+        }
+    }
+
+    impl crate::ResticRunner for FakeRepo {
+        fn run(&self, argv: &[String], p: &str) -> Result<()> {
+            self.run_capture(argv, p).map(|_| ())
+        }
+        fn run_stdout(&self, argv: &[String], p: &str) -> Result<String> {
+            self.run_capture(argv, p).map(|o| o.stdout)
         }
         fn run_backup(&self, _argv: &[String], _p: &str) -> Result<Option<String>> {
             unreachable!("prune never takes a backup")
         }
+        fn run_capture(&self, argv: &[String], _p: &str) -> Result<crate::ResticOutput> {
+            self.calls.borrow_mut().push(argv.to_vec());
+            let mut out = crate::ResticOutput::default();
+            match argv[0].as_str() {
+                "snapshots" => {
+                    out.stdout = serde_json::to_string(&*self.snapshots.borrow()).unwrap()
+                }
+                "forget" => {
+                    let n = self.forgets.get();
+                    self.forgets.set(n + 1);
+                    let ids = Self::forget_ids(argv);
+                    let refuse = |why: &str| {
+                        ids.iter()
+                            .map(|id| {
+                                format!(
+                                    "Remove(<snapshot/{}>) failed: client.RemoveObject: {why}\n\
+                                     unable to remove snapshot/{id} from the repository\n",
+                                    &id[..id.len().min(10)]
+                                )
+                            })
+                            .collect::<String>()
+                    };
+                    match (self.deletes, n) {
+                        (Deletes::Allowed, _) | (Deletes::FirstOnly, 0) => self
+                            .snapshots
+                            .borrow_mut()
+                            .retain(|s| !ids.iter().any(|id| s["id"] == id.as_str())),
+                        (Deletes::Denied, _) | (Deletes::FirstOnly, _) => {
+                            out.stderr = refuse("Access Denied.")
+                        }
+                        (Deletes::TimesOut, _) => {
+                            out.stderr = refuse("dial tcp 10.0.0.1:443: i/o timeout")
+                        }
+                    }
+                }
+                "prune" => {}
+                other => panic!("prune never runs restic {other}"),
+            }
+            Ok(out)
+        }
     }
 
-    #[test]
-    fn run_prune_forgets_only_our_ids_from_a_shared_repository() {
-        let listing = format!(
+    /// Our two old runs (one sequential, one monolithic), our newest run,
+    /// and a co-tenant's old run.
+    fn shared_listing() -> String {
+        format!(
             r#"[
               {{"id":"theirs-old","time":"2026-07-10T03:00:00Z",
                 "tags":["{THEIRS}-2026-07-10T03:00:00Z"],"paths":["/s/data"]}},
-              {{"id":"mine-old","time":"2026-07-11T03:00:00Z",
-                "tags":["{MINE}-2026-07-11T03:00:00Z"],"paths":["/s/data"]}},
+              {{"id":"mine-old-claim","time":"2026-07-11T03:00:00Z",
+                "tags":["{MINE}-2026-07-11T03:00:00Z"],"paths":["/s/claim-0"]}},
+              {{"id":"mine-old-commit","time":"2026-07-11T03:00:05Z",
+                "tags":["{MINE}-2026-07-11T03:00:00Z"],"paths":["/s/commit"]}},
+              {{"id":"mine-mid","time":"2026-07-12T03:00:00Z",
+                "tags":["{MINE}-2026-07-12T03:00:00Z"],"paths":["/s/data"]}},
               {{"id":"mine-new","time":"2026-07-13T03:00:00Z",
                 "tags":["{MINE}-2026-07-13T03:00:00Z"],"paths":["/s/data"]}}
             ]"#
-        );
-        let r = FakeRestic {
-            listing,
-            calls: Default::default(),
-        };
-        let policy = RetentionPolicy {
-            keep_daily: 1,
-            keep_weekly: 0,
-            keep_monthly: 0,
-        };
-        run_prune(&r, "s3:repo", "pw", &policy, MINE).expect("prune runs");
+        )
+    }
 
+    const KEEP_ONE_DAY: RetentionPolicy = RetentionPolicy {
+        keep_daily: 1,
+        keep_weekly: 0,
+        keep_monthly: 0,
+    };
+
+    #[test]
+    fn run_prune_forgets_only_our_ids_from_a_shared_repository_then_prunes() {
+        let r = FakeRepo::new(&shared_listing(), Deletes::Allowed);
+        let outcome = run_prune(&r, "s3:repo", "pw", &KEEP_ONE_DAY, MINE).expect("prune runs");
+        assert_eq!(
+            outcome,
+            PruneOutcome::Pruned {
+                forgot_snapshots: 3,
+                forgot_runs: 2,
+                kept_runs: 1
+            }
+        );
+        assert_eq!(r.left(), vec!["theirs-old", "mine-new"]);
+        // One snapshot first, the listing checked, the rest, the listing
+        // checked, and only then the prune.
+        assert_eq!(
+            r.verbs(),
+            vec![
+                "snapshots",
+                "forget",
+                "snapshots",
+                "forget",
+                "snapshots",
+                "prune"
+            ]
+        );
         let calls = r.calls.borrow();
-        let forget = calls
-            .iter()
-            .find(|c| c.first().map(String::as_str) == Some("forget"))
-            .expect("a forget call was issued");
-        assert!(
-            forget.contains(&"mine-old".to_string()),
-            "our rotated-out run is forgotten: {forget:?}"
-        );
-        assert!(
-            !forget.contains(&"theirs-old".to_string()),
-            "the co-tenant's snapshot must not be in the forget set: {forget:?}"
-        );
-        assert!(!forget.contains(&"mine-new".to_string()), "{forget:?}");
+        assert_eq!(FakeRepo::forget_ids(&calls[1]).len(), 1, "{:?}", calls[1]);
+        for c in calls.iter().filter(|c| c[0] == "forget") {
+            assert!(!c.iter().any(|a| a == "--prune"), "{c:?}");
+            assert!(
+                !c.iter().any(|a| a == "theirs-old" || a == "mine-new"),
+                "{c:?}"
+            );
+        }
+    }
+
+    /// The scoped key ADR 0050 recommends: the first delete is refused, and
+    /// nothing else is asked of the store — no second forget, no prune.
+    #[test]
+    fn a_key_that_may_not_delete_prunes_nothing_and_says_so() {
+        let r = FakeRepo::new(&shared_listing(), Deletes::Denied);
+        let outcome = run_prune(&r, "s3:repo", "pw", &KEEP_ONE_DAY, MINE).expect("not an error");
+        let PruneOutcome::NotPermitted {
+            snapshot,
+            restic_said,
+            would_forget_snapshots,
+            would_forget_runs,
+        } = &outcome
+        else {
+            panic!("expected NotPermitted, got {outcome:?}");
+        };
+        assert_eq!(snapshot, "mine-mid");
+        assert!(restic_said.contains("Access Denied"), "{restic_said}");
+        assert_eq!((*would_forget_snapshots, *would_forget_runs), (3, 2));
+        assert_eq!(r.verbs(), vec!["snapshots", "forget", "snapshots"]);
+        assert_eq!(r.left().len(), 5, "every snapshot is still there");
+        let said = outcome.describe();
+        assert!(said.starts_with("not permitted"), "{said}");
+        assert!(said.contains("Access Denied"), "{said}");
+        assert!(said.contains("nothing was deleted"), "{said}");
+    }
+
+    /// A delete that failed for any other reason is not "not permitted": it
+    /// is an error, and still nothing more is asked of the store.
+    #[test]
+    fn a_delete_that_failed_otherwise_is_an_error_and_prunes_nothing() {
+        let r = FakeRepo::new(&shared_listing(), Deletes::TimesOut);
+        let err = run_prune(&r, "s3:repo", "pw", &KEEP_ONE_DAY, MINE).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("still in the repository"), "{msg}");
+        assert!(msg.contains("i/o timeout"), "{msg}");
+        assert_eq!(r.verbs(), vec!["snapshots", "forget", "snapshots"]);
+    }
+
+    /// The first forget went through and a later one did not: the prune
+    /// that would count the survivors' data as unused is never run.
+    #[test]
+    fn a_forget_that_left_snapshots_behind_is_never_followed_by_a_prune() {
+        let r = FakeRepo::new(&shared_listing(), Deletes::FirstOnly);
+        let err = run_prune(&r, "s3:repo", "pw", &KEEP_ONE_DAY, MINE).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("removed 1 of the 3"), "{msg}");
+        assert!(msg.contains("not pruned"), "{msg}");
+        assert!(!r.verbs().contains(&"prune".to_string()), "{:?}", r.verbs());
     }
 
     #[test]
@@ -843,22 +1164,26 @@ mod tests {
             r#"[{{"id":"theirs","time":"2026-07-10T03:00:00Z",
                   "tags":["{THEIRS}-2026-07-10T03:00:00Z"],"paths":["/s/data"]}}]"#
         );
-        let r = FakeRestic {
-            listing,
-            calls: Default::default(),
-        };
+        let r = FakeRepo::new(&listing, Deletes::Allowed);
         let policy = RetentionPolicy {
             keep_daily: 0,
             keep_weekly: 0,
             keep_monthly: 0,
         };
-        run_prune(&r, "s3:repo", "pw", &policy, MINE).expect("prune runs");
-        assert!(
-            !r.calls
-                .borrow()
-                .iter()
-                .any(|c| c.first().map(String::as_str) == Some("forget")),
-            "with nothing of ours to forget, restic forget is never invoked"
+        let outcome = run_prune(&r, "s3:repo", "pw", &policy, MINE).expect("prune runs");
+        assert_eq!(outcome, PruneOutcome::NothingToPrune { kept_runs: 0 });
+        assert_eq!(
+            r.verbs(),
+            vec!["snapshots"],
+            "with nothing of ours to forget, neither forget nor prune runs"
         );
+    }
+
+    #[test]
+    fn nothing_past_the_policy_is_nothing_to_prune() {
+        let r = FakeRepo::new(&shared_listing(), Deletes::Allowed);
+        let outcome = run_prune(&r, "s3:repo", "pw", &RetentionPolicy::default(), MINE).unwrap();
+        assert_eq!(outcome, PruneOutcome::NothingToPrune { kept_runs: 3 });
+        assert_eq!(r.verbs(), vec!["snapshots"]);
     }
 }

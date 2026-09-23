@@ -2109,6 +2109,11 @@ impl<R: ResticRunner> ResticRunner for RefusingAfterInterrupt<R> {
         helper_interrupt::refuse_if_interrupted()?;
         self.0.run_backup(argv, passphrase)
     }
+
+    fn run_capture(&self, argv: &[String], passphrase: &str) -> Result<backup_core::ResticOutput> {
+        helper_interrupt::refuse_if_interrupted()?;
+        self.0.run_capture(argv, passphrase)
+    }
 }
 
 /// Assemble the [`BackupOpts`] the CLI local-pull path hands to the engine.
@@ -3967,9 +3972,14 @@ fn backup_set_patch(key: &str, value: &str) -> Result<Value> {
             field.insert("retention".into(), Value::Object(retention));
         }
         "enforce" => {
-            if !matches!(value, "operator" | "cluster") {
+            if !matches!(value, "check" | "cluster" | "operator") {
                 return Err(CliError::Other(format!(
-                    "enforce takes `operator` or `cluster` — got `{value}`"
+                    "enforce takes `check`, `cluster` or `operator` — got `{value}`.\n  \
+                     check:    the weekly check Job prunes after a check that passed, as far \
+                     as the cluster's key may delete (the default).\n  \
+                     cluster:  the backup Job prunes after every backup; needs a key that may \
+                     delete.\n  \
+                     operator: nothing in the cluster prunes; run `apprafter backup prune`."
                 )));
             }
             let mut retention = serde_json::Map::new();
@@ -4706,6 +4716,20 @@ impl ResticRunner for CredentialedRestic {
         let stdout = self.run_stdout(argv, pass)?;
         Ok(snapshot_id_from_backup_json(&stdout))
     }
+
+    fn run_capture(&self, argv: &[String], pass: &str) -> Result<backup_core::ResticOutput> {
+        let out = self
+            .command(argv, pass)
+            .output()
+            .map_err(|e| CliError::Other(format!("spawn restic: {e}")))?;
+        if !out.status.success() {
+            return Err(restic_failure_error(argv, out.status.code(), &out.stderr));
+        }
+        Ok(backup_core::ResticOutput {
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5209,9 +5233,10 @@ pub fn run_backup_prune(
         }
     };
 
-    run_prune(&runner, &repo, &pass, &policy, &cluster_uid)?;
+    let outcome = run_prune(&runner, &repo, &pass, &policy, &cluster_uid)?;
+    refuse_an_unenforced_prune(&repo, &outcome, credential_file.is_some())?;
 
-    print!("{}", prune_summary(&repo, &policy));
+    print!("{}", prune_summary(&repo, &policy, &outcome));
 
     // Stamp last-prune so `backup status` can report it. Best-effort ordering:
     // the prune already succeeded, so a merge-patch failure here surfaces as an
@@ -5285,11 +5310,64 @@ fn offline_prune_scope(snapshots: &[Value], uid: &str) -> Result<String> {
 
 /// What `backup prune` prints after a successful prune. Pure — extracted from
 /// [`run_backup_prune`], which prints exactly this.
-fn prune_summary(repo: &str, policy: &RetentionPolicy) -> String {
+fn prune_summary(
+    repo: &str,
+    policy: &RetentionPolicy,
+    outcome: &backup_core::prune::PruneOutcome,
+) -> String {
     format!(
-        "✓ Pruned {repo}\n  retention: keepDaily={} keepWeekly={} keepMonthly={}\n",
-        policy.keep_daily, policy.keep_weekly, policy.keep_monthly
+        "✓ Pruned {repo}: {}\n  retention: keepDaily={} keepWeekly={} keepMonthly={}\n",
+        outcome.describe(),
+        policy.keep_daily,
+        policy.keep_weekly,
+        policy.keep_monthly
     )
+}
+
+/// A prune the credential was not permitted to run is an error — nothing was
+/// deleted — and must not read as `✓ Pruned` or stamp `last-prune`. Pure.
+fn refuse_an_unenforced_prune(
+    repo: &str,
+    outcome: &backup_core::prune::PruneOutcome,
+    had_credential_file: bool,
+) -> Result<()> {
+    match outcome {
+        backup_core::prune::PruneOutcome::NotPermitted { .. } => Err(prune_not_permitted_error(
+            repo,
+            outcome,
+            had_credential_file,
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The error `backup prune` ends with when the credential it ran with may
+/// not delete. Pure.
+///
+/// The usual cause is the one ADR 0050 recommends: with no credential file,
+/// and none in the environment, the command falls back to the cluster's own
+/// Secret, whose key is scoped so that a compromised cluster cannot erase
+/// history — and so cannot prune either. Nothing was deleted: the prune
+/// stopped at the first refused delete.
+fn prune_not_permitted_error(
+    repo: &str,
+    outcome: &backup_core::prune::PruneOutcome,
+    had_credential_file: bool,
+) -> CliError {
+    let which = if had_credential_file {
+        "The credential file this command read holds a key that may not delete from this \
+         repository."
+    } else {
+        "With no --credential-file, this command used the credentials in the environment or, \
+         failing those, the cluster's own backup Secret — whose key is usually scoped so that \
+         the cluster cannot delete history (ADR 0050), and so cannot prune it either."
+    };
+    CliError::Other(format!(
+        "retention was not enforced on {repo}: {}.\n\n{which} Run it again with the \
+         operator's full credentials: `apprafter backup prune --credential-file \
+         <full-credentials.env>` (S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, RESTIC_PASSWORD).",
+        outcome.describe()
+    ))
 }
 
 /// The merge-patch body stamping `apprafter.io/last-prune`.
@@ -5851,9 +5929,9 @@ pub(crate) fn resolve_cluster_name(explicit: Option<&str>, target_name: &str) ->
 /// prompt precisely so a typo costs nothing.
 fn validate_enable_enums(o: &EnableOpts) -> Result<()> {
     if let Some(enforce) = &o.enforce {
-        if enforce != "operator" && enforce != "cluster" {
+        if !matches!(enforce.as_str(), "check" | "cluster" | "operator") {
             return Err(CliError::Other(format!(
-                "invalid --enforce '{enforce}': expected 'operator' or 'cluster'"
+                "invalid --enforce '{enforce}': expected 'check', 'cluster' or 'operator'"
             )));
         }
     }
@@ -6364,17 +6442,22 @@ where
         )),
         None => {}
     }
-    // Retention sub-block.
-    if let Some(ret) = spec.get("retention") {
-        out.push_str("  retention:\n");
-        for key in ["keepDaily", "keepWeekly", "keepMonthly"] {
-            if let Some(n) = ret.get(key) {
-                out.push_str(&format!("    {key}: {n}\n"));
-            }
+    // Retention sub-block. Who prunes is always said: unset, it is the
+    // platform's default, which the operator's retention verdict below
+    // names (`check` since WI-389; `operator` before it).
+    out.push_str("  retention:\n");
+    let ret = spec.get("retention");
+    for key in ["keepDaily", "keepWeekly", "keepMonthly"] {
+        if let Some(n) = ret.and_then(|r| r.get(key)) {
+            out.push_str(&format!("    {key}: {n}\n"));
         }
-        if let Some(e) = ret.get("enforce").and_then(serde_json::Value::as_str) {
-            out.push_str(&format!("    enforce: {e}\n"));
-        }
+    }
+    match ret
+        .and_then(|r| r.get("enforce"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(e) => out.push_str(&format!("    enforce: {e}\n")),
+        None => out.push_str("    enforce: not set (the platform's default)\n"),
     }
 
     // --- Job outcomes ---
@@ -6469,14 +6552,162 @@ where
         out.push_str("  (no status ConfigMap yet — backup may not have run)\n");
     }
 
-    // --- Last prune ---
+    // --- Last prune from outside the cluster ---
     out.push_str(&format!(
-        "\nLast prune: {}\n",
+        "\nLast prune: {} (by `apprafter backup prune`, from outside the cluster)\n",
         last_prune
             .map(|p| format_timestamp_with_zone(p, tz, zone_label))
             .unwrap_or_else(|| "never".to_string())
     ));
 
+    out
+}
+
+/// How many lines of a failed check's output `backup status` quotes.
+const CHECK_ERROR_LINES: usize = 3;
+
+/// The repository block of `backup status`: the runner's record of its last
+/// check, its last prune and the repository's figures (WI-389), then what
+/// the operator makes of retention.
+///
+/// Pure. `status_cm` is the runner's ConfigMap (the object or its `data`);
+/// `stack` is `PlatformStack/default`, whose `BackupRetention` condition is
+/// the verdict. With an operator that writes no such condition, a prune the
+/// key did not permit is still said, from the record alone: that warning is
+/// the point of this block.
+pub(crate) fn format_repository_status<Tz>(
+    status_cm: Option<&Value>,
+    stack: Option<&Value>,
+    tz: &Tz,
+    zone_label: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    let data = status_cm.map(|cm| cm.get("data").filter(|d| d.is_object()).unwrap_or(cm));
+    let get = |key: &str| -> Option<&str> {
+        data.and_then(|d| d.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    let num = |key: &str| get(key).and_then(|v| v.parse::<i64>().ok());
+    let when = |t: &str| format_timestamp_with_zone(t, tz, zone_label);
+    let mut out = String::from("\nRepository (recorded by the weekly check):\n");
+
+    match get("lastCheck") {
+        Some(t) => {
+            let result = match get("lastCheckResult") {
+                Some("passed") => "passed".to_string(),
+                Some("failed") => "FAILED".to_string(),
+                other => other.unwrap_or("no result recorded").to_string(),
+            };
+            out.push_str(&format!("  last check:  {} — {result}\n", when(t)));
+            // restic's output runs long; the lines that name the damage come
+            // first, and the check pod's log has the rest.
+            if let Some(error) = get("lastCheckError") {
+                let lines: Vec<&str> = error
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                for line in lines.iter().take(CHECK_ERROR_LINES) {
+                    out.push_str(&format!("               {line}\n"));
+                }
+                if lines.len() > CHECK_ERROR_LINES {
+                    out.push_str(&format!(
+                        "               … {} more line(s): the check pod's log, or `apprafter \
+                         backup check`, has all of restic's output\n",
+                        lines.len() - CHECK_ERROR_LINES
+                    ));
+                }
+            }
+        }
+        None => out.push_str("  last check:  none recorded yet\n"),
+    }
+    match get("lastPrune") {
+        Some(t) => {
+            let after = match get("lastPruneBy") {
+                Some("backup") => "after a backup",
+                _ => "after the weekly check",
+            };
+            let result = match get("lastPruneResult") {
+                Some("not-permitted") => "NOT PERMITTED",
+                Some("failed") => "FAILED",
+                Some("pruned") => "pruned",
+                Some("nothing-to-prune") => "nothing to prune",
+                other => other.unwrap_or("no result recorded"),
+            };
+            out.push_str(&format!("  last prune:  {} {after} — {result}\n", when(t)));
+            if let Some(detail) = get("lastPruneDetail") {
+                out.push_str(&format!("               {detail}\n"));
+            }
+        }
+        None => out.push_str("  last prune:  none in the cluster yet\n"),
+    }
+    match (get("repoStatsAt"), num("repoBytes")) {
+        (Some(at), Some(bytes)) => {
+            let mut counts = Vec::new();
+            if let Some(n) = num("repoSnapshots") {
+                counts.push(format!("{n} snapshots"));
+            }
+            if let Some(n) = num("repoBlobs") {
+                counts.push(format!("{n} blobs"));
+            }
+            let counts = if counts.is_empty() {
+                String::new()
+            } else {
+                format!(" in {}", counts.join(" and "))
+            };
+            out.push_str(&format!(
+                "  size:        {}{counts} ({})\n",
+                human_size(bytes.max(0) as u64),
+                when(at)
+            ));
+            if let (Some(prev_at), Some(prev)) = (get("repoPrevStatsAt"), num("repoPrevBytes")) {
+                let delta = bytes - prev;
+                let mut moved = vec![format!(
+                    "{}{}",
+                    if delta < 0 { "-" } else { "+" },
+                    human_size(delta.unsigned_abs())
+                )];
+                if let (Some(n), Some(p)) = (num("repoSnapshots"), num("repoPrevSnapshots")) {
+                    moved.push(format!("{:+} snapshots", n - p));
+                }
+                if let (Some(n), Some(p)) = (num("repoBlobs"), num("repoPrevBlobs")) {
+                    moved.push(format!("{:+} blobs", n - p));
+                }
+                out.push_str(&format!(
+                    "  growth:      {} since {}\n",
+                    moved.join(", "),
+                    when(prev_at)
+                ));
+            }
+        }
+        _ => out.push_str("  size:        not measured yet (the weekly check measures it)\n"),
+    }
+
+    let verdict = stack
+        .map(|s| crate::commands::platform::backup_retention_lines(s, now))
+        .unwrap_or_default();
+    if !verdict.is_empty() {
+        out.push('\n');
+        for line in verdict {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    } else if get("lastPruneResult") == Some("not-permitted") {
+        out.push_str(&format!(
+            "\n{}\n  Next: `apprafter backup prune --credential-file <full-credentials.env>` \
+             prunes with the operator's full credentials.\n",
+            cli_core::style::warn(
+                "Retention: NOT ENFORCED — the cluster's key may not delete, so the last prune \
+                 deleted nothing and the repository keeps growing."
+            )
+        ));
+    }
     out
 }
 
@@ -6554,6 +6785,7 @@ pub fn run_backup_status() -> Result<()> {
         kc.path(),
     )?;
 
+    let zone = readers_zone();
     println!(
         "{}",
         format_backup_status(
@@ -6563,9 +6795,27 @@ pub fn run_backup_status() -> Result<()> {
             status_cm.as_ref(),
             last_prune.as_deref(),
             &chrono::Local,
-            readers_zone().as_deref(),
+            zone.as_deref(),
         )
     );
+    // The repository and retention (WI-389), for an enabled schedule.
+    if spec_backup
+        .as_ref()
+        .and_then(|s| s.get("enabled"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        println!(
+            "{}",
+            format_repository_status(
+                status_cm.as_ref(),
+                ps.as_ref(),
+                &chrono::Local,
+                zone.as_deref(),
+                chrono::Utc::now(),
+            )
+        );
+    }
     Ok(())
 }
 
@@ -7885,6 +8135,46 @@ mod tests {
         assert!(backup_set_patch("timezone", "CET-1CEST,M3.5.0").is_err());
     }
 
+    /// The three retention modes the CRD takes, and nothing else: a typo
+    /// would otherwise reach the apiserver as a 422, or — on an older CRD
+    /// without `check` — look like a platform bug.
+    #[test]
+    fn set_enforce_takes_the_three_modes_and_says_what_each_does() {
+        for mode in ["check", "cluster", "operator"] {
+            assert_eq!(
+                backup_set_patch("enforce", mode).unwrap(),
+                json!({"spec": {"backup": {"retention": {"enforce": mode}}}})
+            );
+        }
+        let err = backup_set_patch("enforce", "weekly")
+            .unwrap_err()
+            .to_string();
+        for says in [
+            "`check`",
+            "`cluster`",
+            "`operator`",
+            "after a check that passed",
+        ] {
+            assert!(err.contains(says), "{says}: {err}");
+        }
+        assert!(validate_enable_enums(&EnableOpts {
+            enforce: Some("check".into()),
+            ..Default::default()
+        })
+        .is_ok());
+        assert!(validate_enable_enums(&EnableOpts {
+            enforce: Some("Check".into()),
+            ..Default::default()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn set_validates_the_timezone_it_forwards() {
+        assert!(backup_set_patch("timezone", "Europe/Lisbon").is_ok());
+        assert!(backup_set_patch("timezone", "CET-1CEST,M3.5.0").is_err());
+    }
+
     #[test]
     fn set_deadline_writes_seconds_to_the_field_the_chart_reads() {
         let patch = backup_set_patch("deadline", "12h").unwrap();
@@ -8259,6 +8549,145 @@ mod tests {
             Some("Asia/Tokyo"),
         );
         assert!(s.contains("Last prune: never"));
+    }
+
+    /// WI-389: who prunes is always said, set or not.
+    #[test]
+    fn status_says_who_prunes_even_when_it_was_never_set() {
+        let unset = json!({"enabled": true, "bucket": "s3:x"});
+        let s = format_backup_status(Some(&unset), &[], &[], None, None, &tokyo(), None);
+        assert!(
+            s.contains("enforce: not set (the platform's default)"),
+            "{s}"
+        );
+        let set = json!({"enabled": true, "bucket": "s3:x",
+                         "retention": {"keepDaily": 5, "enforce": "operator"}});
+        let s = format_backup_status(Some(&set), &[], &[], None, None, &tokyo(), None);
+        assert!(s.contains("keepDaily: 5"), "{s}");
+        assert!(s.contains("enforce: operator"), "{s}");
+        assert!(!s.contains("not set"), "{s}");
+    }
+
+    /// The scoped key's week, as the runner records it.
+    fn scoped_record() -> Value {
+        json!({"data": {
+            "lastSuccess": "2026-09-20T03:01:00+00:00",
+            "lastCheck": "2026-09-20T06:00:30+00:00", "lastCheckResult": "passed",
+            "lastCheckError": "",
+            "lastPrune": "2026-09-20T06:00:41+00:00", "lastPruneResult": "not-permitted",
+            "lastPruneBy": "check",
+            "lastPruneDetail": "not permitted: the storage refused to delete snapshot ecd0be32 \
+                (Remove(<snapshot/ecd0be3219>) failed: client.RemoveObject: Access Denied.), so \
+                nothing was deleted; 9 snapshot(s) of 9 run(s) are past the keep policy",
+            "repoStatsAt": "2026-09-20T06:00:44+00:00", "repoBytes": "1288490189",
+            "repoSnapshots": "42", "repoBlobs": "310512",
+            "repoPrevStatsAt": "2026-09-13T06:00:40+00:00", "repoPrevBytes": "1125908480",
+            "repoPrevSnapshots": "35", "repoPrevBlobs": "299492",
+        }})
+    }
+
+    fn now_utc() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-09-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn repository_status_shows_the_check_the_prune_the_size_and_the_growth() {
+        let s = format_repository_status(
+            Some(&scoped_record()),
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+            now_utc(),
+        );
+        assert!(
+            s.contains("last check:  2026-09-20 15:00:30 Asia/Tokyo — passed"),
+            "{s}"
+        );
+        assert!(
+            s.contains("last prune:  2026-09-20 15:00:41 Asia/Tokyo after the weekly check — NOT PERMITTED"),
+            "{s}"
+        );
+        assert!(s.contains("Access Denied"), "{s}");
+        assert!(
+            s.contains("size:        1.2 GiB in 42 snapshots and 310512 blobs"),
+            "{s}"
+        );
+        assert!(
+            s.contains("growth:      +155.1 MiB, +7 snapshots, +11020 blobs since 2026-09-13"),
+            "{s}"
+        );
+        // No operator verdict to read: the record alone still warns.
+        assert!(s.contains("Retention: NOT ENFORCED"), "{s}");
+        assert!(
+            s.contains("--credential-file <full-credentials.env>"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn repository_status_prints_the_operators_retention_verdict_when_there_is_one() {
+        let stack = json!({
+            "spec": {"backup": {"enabled": true}},
+            "status": {"conditions": [{
+                "type": "BackupRetention", "status": "False", "reason": "PruneNotPermitted",
+                "message": "retention is not enforced: the cluster's S3 key may not delete",
+                "lastTransitionTime": "2026-09-20T06:00:41Z"}]},
+        });
+        let s = format_repository_status(
+            Some(&scoped_record()),
+            Some(&stack),
+            &tokyo(),
+            Some("Asia/Tokyo"),
+            now_utc(),
+        );
+        assert!(s.contains("Retention: NOT ENFORCED since"), "{s}");
+        assert!(s.contains("PruneNotPermitted"), "{s}");
+        assert!(
+            s.contains("backup-retention-and-checks/#who-runs-the-prune"),
+            "{s}"
+        );
+        assert_eq!(
+            s.matches("Retention:").count(),
+            1,
+            "one verdict, not two: {s}"
+        );
+    }
+
+    #[test]
+    fn repository_status_before_any_check_says_so_rather_than_nothing() {
+        let s = format_repository_status(None, None, &tokyo(), None, now_utc());
+        assert!(s.contains("last check:  none recorded yet"), "{s}");
+        assert!(s.contains("last prune:  none in the cluster yet"), "{s}");
+        assert!(s.contains("not measured yet"), "{s}");
+        assert!(!s.contains("NOT ENFORCED"), "{s}");
+    }
+
+    #[test]
+    fn a_failed_check_is_shown_with_its_reason_and_a_shrinking_repository_as_negative() {
+        let cm = json!({
+            "lastCheck": "2026-09-27T06:00:30+00:00", "lastCheckResult": "failed",
+            "lastCheckError": "restic check: pack 5e1f0a2b contains 1 error",
+            "repoStatsAt": "2026-09-20T06:00:44+00:00", "repoBytes": "1000",
+            "repoPrevStatsAt": "2026-09-13T06:00:40+00:00", "repoPrevBytes": "3048",
+        });
+        let s = format_repository_status(Some(&cm), None, &tokyo(), None, now_utc());
+        assert!(s.contains("— FAILED\n"), "{s}");
+        assert!(
+            s.contains("restic check: pack 5e1f0a2b contains 1 error"),
+            "{s}"
+        );
+        assert!(s.contains("growth:      -2.0 KiB since"), "{s}");
+        // restic's long output is cut to the lines that name the damage.
+        let long = json!({
+            "lastCheck": "2026-09-27T06:00:30+00:00", "lastCheckResult": "failed",
+            "lastCheckError": "error for tree a83ddebe:\n  decrypting blob failed\npack 1a5c contains 2 errors\n\nThe repository contains damaged pack files.\nFatal: repository contains errors\n",
+        });
+        let s = format_repository_status(Some(&long), None, &tokyo(), None, now_utc());
+        assert!(s.contains("pack 1a5c contains 2 errors"), "{s}");
+        assert!(!s.contains("Fatal: repository contains errors"), "{s}");
+        assert!(s.contains("… 2 more line(s)"), "{s}");
     }
 
     #[test]
@@ -9914,12 +10343,61 @@ mod tests {
                 keep_weekly: 2,
                 keep_monthly: 3,
             },
+            &backup_core::prune::PruneOutcome::Pruned {
+                forgot_snapshots: 4,
+                forgot_runs: 3,
+                kept_runs: 6,
+            },
         );
         assert!(s.contains("s3:https://h/b"), "{s}");
         assert!(
             s.contains("keepDaily=1 keepWeekly=2 keepMonthly=3"),
             "each number must sit against its own label: {s}"
         );
+        assert!(s.contains("forgot 4 snapshot(s) of 3 run(s)"), "{s}");
+        assert!(s.contains("6 run(s) kept"), "{s}");
+    }
+
+    /// The cluster's own scoped key is what `backup prune` falls back to with
+    /// no credential file, and it may not delete. That is an error, which
+    /// says nothing was deleted and names the flag that fixes it — not a
+    /// "✓ Pruned".
+    #[test]
+    fn a_prune_the_key_may_not_run_is_an_error_that_names_the_full_credentials() {
+        let outcome = backup_core::prune::PruneOutcome::NotPermitted {
+            snapshot: "ecd0be3219c6a9adb39e".into(),
+            restic_said: "Remove(<snapshot/ecd0be3219>) failed: client.RemoveObject: Access \
+                          Denied."
+                .into(),
+            would_forget_snapshots: 9,
+            would_forget_runs: 9,
+        };
+        // Only NotPermitted stops the command before the stamp.
+        assert!(refuse_an_unenforced_prune(
+            "s3:x",
+            &backup_core::prune::PruneOutcome::NothingToPrune { kept_runs: 2 },
+            false
+        )
+        .is_ok());
+        assert!(refuse_an_unenforced_prune("s3:x", &outcome, false).is_err());
+        for had_file in [false, true] {
+            let msg = prune_not_permitted_error("s3:https://h/b", &outcome, had_file).to_string();
+            assert!(
+                msg.contains("retention was not enforced on s3:https://h/b"),
+                "{msg}"
+            );
+            assert!(msg.contains("nothing was deleted"), "{msg}");
+            assert!(msg.contains("Access Denied"), "{msg}");
+            assert!(
+                msg.contains("--credential-file <full-credentials.env>"),
+                "{msg}"
+            );
+            assert_eq!(
+                msg.contains("cluster's own backup Secret"),
+                !had_file,
+                "{msg}"
+            );
+        }
     }
 
     #[test]
@@ -11731,6 +12209,10 @@ mod tests {
             fn run_backup(&self, _: &[String], _: &str) -> Result<Option<String>> {
                 self.0.set(self.0.get() + 1);
                 Ok(None)
+            }
+            fn run_capture(&self, _: &[String], _: &str) -> Result<backup_core::ResticOutput> {
+                self.0.set(self.0.get() + 1);
+                Ok(backup_core::ResticOutput::default())
             }
         }
         let r = RefusingAfterInterrupt(Counting(std::cell::Cell::new(0)));

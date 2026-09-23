@@ -114,10 +114,10 @@ Usage: apprafter backup enable [OPTIONS] --bucket <BUCKET>
 | `--credential` | — | — | no | Name of the credential Secret in apprafter-system. With --credential-file: the name to create (default: apprafter-backup-s3). Without --credential-file: an existing Secret to read creds from (required) |
 | `--credential-file` | — | — | no | Path to a dotenv file with S3 + restic creds (S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, RESTIC_PASSWORD; optional S3_REGION). AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION accepted as aliases. When given, the creds are probed against the repo and then auto-sealed into the cluster |
 | `--endpoint` | — | — | no | S3 endpoint host (e.g. `nbg1.your-objectstorage.com`). With a bare `--bucket` name, the CLI builds the `s3:https://<endpoint>/<bucket>` repo URL for you. Omit when passing a full restic URL in `--bucket` |
-| `--enforce` | — | — | no | `operator` (default, cluster gets scoped creds) or `cluster` (in-cluster prune) |
+| `--enforce` | `<check|cluster|operator>` | — | no | Who prunes. `check` (default): the weekly check Job, after a check that passed, as far as the cluster's key may delete — a scoped key deletes nothing, and `backup status` says so. `cluster`: the backup Job, after every backup (needs a key that may delete). `operator`: nothing in the cluster; you run `apprafter backup prune` |
 | `--failure-webhook` | `<url>` | — | no | URL the runner POSTs a JSON failure report to when a backup or check Job fails. Egress to this host is opened automatically in the platform network policy. No default — unset means failures surface only in `backup status` and the Job logs |
 | `--i-have-saved-credentials` | flag | — | no | Confirm you have saved the restic passphrase + S3 credentials OUTSIDE the cluster |
-| `--keep-daily` | `<count>` | — | no | How many daily snapshots `restic forget` keeps. Default 7. Retention is only APPLIED when `--enforce cluster` is set or you run `apprafter backup prune`; under the default `--enforce operator` the scheduled Job never forgets |
+| `--keep-daily` | `<count>` | — | no | How many daily snapshots `restic forget` keeps. Default 7. Applied by whatever `--enforce` names: the weekly check Job (the default), the backup Job, or `apprafter backup prune` |
 | `--keep-monthly` | `<count>` | — | no | How many monthly snapshots `restic forget` keeps. Default 6. Applied under the same rule as `--keep-daily` |
 | `--keep-weekly` | `<count>` | — | no | How many weekly snapshots `restic forget` keeps. Default 4. Applied under the same rule as `--keep-daily` |
 | `--no-initial-backup` | flag | — | no | Skip the first backup `enable` normally takes once the schedule is deployed. The schedule still runs at its configured time, and `apprafter backup run` takes one on demand |
@@ -165,6 +165,8 @@ apprafter backup list --repo <path>
 ## `apprafter backup prune`
 
 Remove old snapshots from an S3-backed restic repository according to the configured retention policy. Run OUTSIDE the cluster with the operator's full S3 credentials.
+
+A key that may not delete — the cluster's own, when it is scoped as recommended — deletes nothing: the command stops at the first refused delete and exits non-zero, naming `--credential-file`.
 
 A prune forgets by explicit snapshot id and one repository can hold several clusters' runs, so it must know whose snapshots it may forget. Normally that is the cluster's own `kube-system` namespace UID, read from the kubeconfig. When the cluster is gone and only the repository is left, `--cluster-uid <uid>` names the identity explicitly and the command runs with no cluster at all.
 
@@ -216,7 +218,7 @@ apprafter backup run --timeout 120
 
 Change ONE field of a configured backup, leaving the rest alone. `backup enable` rewrites the whole block, so it cannot be used to adjust a single setting without resetting the others.
 
-Keys: enabled &lt;true|false>, at &lt;HH:MM>, check &lt;HH:MM|off>, check-depth &lt;structure|10%|full>, cluster-name &lt;name>, timezone &lt;IANA>, keep-daily &lt;n>, keep-weekly &lt;n>, keep-monthly &lt;n>, enforce &lt;operator|cluster>, staging-mode &lt;monolithic|sequential>, failure-webhook &lt;url>, deadline &lt;duration>, check-deadline &lt;duration>.
+Keys: enabled &lt;true|false>, at &lt;HH:MM>, check &lt;HH:MM|off>, check-depth &lt;structure|10%|full>, cluster-name &lt;name>, timezone &lt;IANA>, keep-daily &lt;n>, keep-weekly &lt;n>, keep-monthly &lt;n>, enforce &lt;check|cluster|operator>, staging-mode &lt;monolithic|sequential>, failure-webhook &lt;url>, deadline &lt;duration>, check-deadline &lt;duration>.
 
 `deadline` and `check-deadline` are how long one backup or check Job may run before Kubernetes stops it (default 6h, minimum 10m): `12h`, `90m`, `43200s`. Keep each shorter than the interval between two runs of its schedule and longer than its slowest good run. The check locks the repository exclusively, so also keep the backup's below the gap from a backup to the next check (3h by default) and the check's below the gap from the check to the next backup (21h).
 

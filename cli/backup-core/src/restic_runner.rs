@@ -26,6 +26,23 @@ pub trait ResticRunner {
     /// Run `restic backup --json` and return the snapshot id extracted from the
     /// structured summary line, or `None` when the summary object is absent.
     fn run_backup(&self, argv: &[String], passphrase: &str) -> Result<Option<String>>;
+
+    /// Run a restic command and return what it printed on stdout AND on
+    /// stderr; `Err` on a non-zero exit, like the others.
+    ///
+    /// For a command whose exit status does not tell the whole story:
+    /// `restic forget` exits 0 when the store refused its deletes, and says
+    /// so only on stderr ([`crate::restic::delete_was_denied`]). Required
+    /// rather than defaulted, so that no runner can quietly answer with an
+    /// empty stderr and turn a refusal into "no reason given".
+    fn run_capture(&self, argv: &[String], passphrase: &str) -> Result<ResticOutput>;
+}
+
+/// What a restic command printed, for [`ResticRunner::run_capture`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResticOutput {
+    pub stdout: String,
+    pub stderr: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +103,21 @@ impl ResticRunner for SubprocessRestic {
 
     fn run_backup(&self, argv: &[String], pass: &str) -> Result<Option<String>> {
         Ok(backup_summary_snapshot_id(&self.run_stdout(argv, pass)?))
+    }
+
+    fn run_capture(&self, argv: &[String], pass: &str) -> Result<ResticOutput> {
+        let out = Command::new("restic")
+            .args(argv)
+            .env("RESTIC_PASSWORD", pass)
+            .output()
+            .map_err(|e| CliError::Other(format!("spawn restic: {e}")))?;
+        if !out.status.success() {
+            return Err(restic_error(argv, out.status.code(), &out.stderr));
+        }
+        Ok(ResticOutput {
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
     }
 }
 

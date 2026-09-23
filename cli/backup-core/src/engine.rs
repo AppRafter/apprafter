@@ -1177,6 +1177,12 @@ mod tests {
             }
             Ok(Some("snap".into()))
         }
+        fn run_capture(&self, argv: &[String], passphrase: &str) -> Result<crate::ResticOutput> {
+            Ok(crate::ResticOutput {
+                stdout: self.run_stdout(argv, passphrase)?,
+                stderr: String::new(),
+            })
+        }
     }
 
     /// Extract the value that follows `--tag` in a recorded restic argv.
