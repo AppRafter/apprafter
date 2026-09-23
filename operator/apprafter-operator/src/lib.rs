@@ -49,16 +49,17 @@ pub const CLIENT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 ///   exec/attach/port-forward sessions alive (the operator opens none) and
 ///   gave watches their own idle timeout instead. Without it, a plain GET
 ///   or PUT that the apiserver accepts and never answers blocks its caller
-///   for ever — including the Lease renewal, which would then hold the
-///   `is_leader` gate open while the Lease expires under it.
+///   for ever. 295s is still far too long for the Lease, so the leader loop
+///   bounds each of its own steps (`operator_core::leader`); this is the
+///   bound for everything else.
 /// * `default_retry`: off → on. kube 4.0 wraps every request in a retry of
 ///   429/503/504 with up to 15 attempts and delays growing to minutes. The
 ///   operator's failure handling is built on seeing those errors: the
-///   leader loop counts consecutive renewal failures against a 30s Lease
-///   (three misses at a 10s period, then exit), and every controller's
-///   `error_policy` requeues on its own backoff. A client that retries
-///   inside one call can outlast the Lease without reporting a single
-///   failure — two operators reconciling at once.
+///   leader loop retries a failed renewal on its own schedule and steps down
+///   20s after the last one that succeeded, well inside the 30s Lease, and
+///   every controller's `error_policy` requeues on its own backoff. A client
+///   that retries inside one call spends that time without reporting a
+///   single failure.
 pub fn with_operator_client_defaults(mut config: kube::Config) -> kube::Config {
     config.read_timeout = Some(CLIENT_READ_TIMEOUT);
     config.default_retry = false;

@@ -10,9 +10,10 @@
 //!   - the `Application` Controller — but only after we hold the
 //!     Lease.
 //!
-//! Any task exiting (HTTP server crash, controller stream end,
-//! leader-loss after 3 consecutive renewal failures, ctrl-c) tears
-//! the whole process down so the Deployment restart picks up.
+//! Any task exiting (HTTP server crash, controller stream end, ctrl-c)
+//! tears the whole process down so the Deployment restart picks up. A
+//! lost Lease (no renewal for the renew deadline, or another holder in
+//! it) exits the process from the leader task itself, immediately.
 
 use std::env;
 use std::net::SocketAddr;
@@ -151,9 +152,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let is_leader = leader.is_leader_handle();
 
+    // The loop only ever returns once this process must stop acting as
+    // leader, and the controllers never look at the gate again once started,
+    // so the process ends HERE, at that moment. Returning through the
+    // `select!` below is not enough: until it is reached (the startup probes
+    // in between wait on the apiserver with the 295s read timeout) the
+    // controllers would still be spawned after leadership was lost, and even
+    // then the runtime's drop waits on any blocking task still running.
     let leader_handle = tokio::spawn(async move {
         if let Err(err) = leader.run().await {
-            error!(%err, "leader election exited");
+            error!(%err, "leader election exited; ending the process");
+            std::process::exit(1);
         }
     });
 

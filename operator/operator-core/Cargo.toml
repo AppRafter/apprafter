@@ -36,3 +36,8 @@ http         = { workspace = true }
 # only way to assert WHICH requests the loop makes — and, for the
 # split-brain case, that it makes none.
 tower = { workspace = true }
+# `test-util` for `#[tokio::test(start_paused = true)]`: the step-down tests
+# run the loop at its real 30s/20s/10s timings on a paused clock, which jumps
+# to the next timer whenever every task is idle — so a request that never
+# answers costs no wall time, and the moment the loop gives up is exact.
+tokio = { workspace = true, features = ["test-util"] }

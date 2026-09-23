@@ -3,9 +3,13 @@
 //!
 //! Tier-1 single-replica scope: the operator creates (or takes over
 //! a stale) `coordination.k8s.io/v1` Lease in the operator's
-//! namespace, then renews it on every `renew_period`. Three
-//! consecutive renewal failures exit the process so the Deployment
-//! restart policy takes over.
+//! namespace, then renews it on every `renew_period`. A leader that
+//! has not renewed for `renew_deadline` steps down, and so does one
+//! that finds the Lease held by someone else; the binary exits on
+//! either, so the Deployment restart policy takes over.
+//!
+//! The step-down is decided by TIME, not by a count of failures, and
+//! every request is bounded — see [`LeaderConfig`] for why both.
 //!
 //! Multi-replica preemption with full leader-elector semantics
 //! (jitter, backoff, fast handoff) lands in a tier-2/3 HA cycle.
@@ -20,24 +24,63 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
 use kube::api::{Api, ObjectMeta, PostParams};
 use kube::Client;
 use thiserror::Error;
+use tokio::time::Instant;
 use tracing::{info, warn};
 
 use crate::k8s_time::{from_micro_time, micro_time};
 
-/// Default Lease duration. The renew interval is one-third of this
-/// value so we get three renewal attempts before a takeover window
-/// opens.
+/// How long after the last `renewTime` another replica may take the Lease.
 const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(30);
+/// How often a healthy leader renews.
 const DEFAULT_RENEW_PERIOD: Duration = Duration::from_secs(10);
-const RENEWAL_FAILURE_BUDGET: u32 = 3;
+/// How long a leader may go without a successful renewal before it steps
+/// down: two renew periods, which leaves the last third of the Lease as the
+/// margin between this process stopping and anyone else being allowed to
+/// start.
+const DEFAULT_RENEW_DEADLINE: Duration = Duration::from_secs(20);
+/// How soon a leader retries after a failed renewal.
+const DEFAULT_RETRY_PERIOD: Duration = Duration::from_secs(2);
+/// The longest one acquire/renew step (a GET plus at most one write) may
+/// take. Half a renew period, so a leader whose renewal hangs still gets a
+/// second attempt before its deadline.
+const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Where the Lease lives, who we are, and the timings.
+///
+/// The timings are four numbers with one job: a leader must STOP before any
+/// other replica may START. Another replica takes the Lease once its
+/// `renewTime` is older than `lease_duration`. This process stops leading
+/// once it has gone `renew_deadline` without a successful renewal, measured
+/// from the instant it stamped the `renewTime` it last wrote. So
+/// `renew_deadline < lease_duration`, and the gap between them is the room
+/// for clock skew between nodes and for the process to exit.
+///
+/// Counting failures cannot give that guarantee, which is why this module
+/// no longer does. Three strikes at a 10s renew period put the third strike
+/// at the thirtieth second — the moment the Lease becomes takeable — even
+/// when every failure is instant. And a request is only a strike once it
+/// returns: with the client's 295s read timeout, one GET that the apiserver
+/// accepted and never answered kept `is_leader` true while the Lease
+/// expired under it (the frozen `renewTime` the wave-1 upgrade walk saw).
+/// Hence `call_timeout`, and the deadline bounds that too: no step can run
+/// past the moment this process must stop.
 #[derive(Debug, Clone)]
 pub struct LeaderConfig {
     pub namespace: String,
     pub name: String,
     pub holder_id: String,
+    /// What every other replica measures staleness against.
     pub lease_duration: Duration,
+    /// A healthy leader's renewal cadence; also a standby's polling cadence.
     pub renew_period: Duration,
+    /// No successful renewal for this long → step down. Must be shorter
+    /// than `lease_duration`.
+    pub renew_deadline: Duration,
+    /// Delay before a leader retries a failed renewal.
+    pub retry_period: Duration,
+    /// Upper bound on one acquire/renew step. A step that hits it is a
+    /// failed step, exactly like an error response.
+    pub call_timeout: Duration,
 }
 
 impl LeaderConfig {
@@ -49,6 +92,9 @@ impl LeaderConfig {
             holder_id: holder_id.into(),
             lease_duration: DEFAULT_LEASE_DURATION,
             renew_period: DEFAULT_RENEW_PERIOD,
+            renew_deadline: DEFAULT_RENEW_DEADLINE,
+            retry_period: DEFAULT_RETRY_PERIOD,
+            call_timeout: DEFAULT_CALL_TIMEOUT,
         }
     }
 }
@@ -58,8 +104,20 @@ pub enum LeaderError {
     #[error("kube error: {0}")]
     Kube(#[from] kube::Error),
 
-    #[error("lost leadership after {0} consecutive renewal failures")]
-    LostLeadership(u32),
+    /// One acquire/renew step did not finish within its bound.
+    #[error("the apiserver did not answer the Lease request within {:.1}s", .0.as_secs_f64())]
+    Timeout(Duration),
+
+    /// The leader went `renew_deadline` without a successful renewal.
+    #[error(
+        "lost leadership: no successful Lease renewal for {:.1}s ({failures} consecutive failures)",
+        .since.as_secs_f64()
+    )]
+    LostLeadership { failures: u32, since: Duration },
+
+    /// The leader read the Lease and found another holder in it.
+    #[error("lost leadership: the Lease is held by another holder")]
+    Deposed,
 }
 
 pub struct LeaderElection {
@@ -85,17 +143,49 @@ impl LeaderElection {
         self.is_leader.clone()
     }
 
-    /// Run the leader-election loop forever. Returns
-    /// `LeaderError::LostLeadership` after `RENEWAL_FAILURE_BUDGET`
-    /// consecutive renewal failures so the caller can exit the
-    /// process cleanly.
+    /// Run the leader-election loop. It never returns `Ok`: it returns an
+    /// error once this process has held the Lease and must stop acting on
+    /// it — `LostLeadership` when no renewal succeeded for `renew_deadline`,
+    /// `Deposed` when the Lease turned out to be held by someone else. The
+    /// gate is closed before it returns, but the controllers do not watch
+    /// the gate once they have started, so the caller must end the process.
+    ///
+    /// A replica that never led keeps retrying through any failure: it is in
+    /// no race with a Lease it does not hold.
     pub async fn run(self) -> Result<(), LeaderError> {
         let api: Api<Lease> = Api::namespaced(self.client.clone(), &self.config.namespace);
         let mut consecutive_failures: u32 = 0;
+        // When this process stamped the `renewTime` it last wrote, on the
+        // monotonic clock (a wall-clock step must not stretch a tenure).
+        // `Some` exactly while we lead.
+        let mut renewed_at: Option<Instant> = None;
         loop {
-            match self.acquire_or_renew(&api, Utc::now()).await {
+            let started = Instant::now();
+            let budget = match renewed_at {
+                None => self.config.call_timeout,
+                Some(at) => {
+                    let since = started.saturating_duration_since(at);
+                    match step_budget(&self.config, since) {
+                        Some(budget) => budget,
+                        None => {
+                            return Err(self.step_down(LeaderError::LostLeadership {
+                                failures: consecutive_failures,
+                                since,
+                            }))
+                        }
+                    }
+                }
+            };
+            // `now` is stamped into `renewTime` and `started` is the same
+            // instant on the monotonic clock: the deadline counts from what
+            // the other replicas will count from.
+            let step = tokio::time::timeout(budget, self.acquire_or_renew(&api, Utc::now()))
+                .await
+                .unwrap_or_else(|_elapsed| Err(LeaderError::Timeout(budget)));
+            let next_attempt = match step {
                 Ok(true) => {
                     consecutive_failures = 0;
+                    renewed_at = Some(started);
                     if !self.is_leader.swap(true, Ordering::SeqCst) {
                         info!(
                             holder = %self.config.holder_id,
@@ -104,27 +194,45 @@ impl LeaderElection {
                             "became leader"
                         );
                     }
+                    started + self.config.renew_period
+                }
+                Ok(false) if renewed_at.is_some() => {
+                    // Nobody may take a Lease its holder is still renewing,
+                    // so reaching here means the clocks disagree by more than
+                    // the margin, or a human edited the Lease. Either way the
+                    // other holder is acting, so this one must not.
+                    return Err(self.step_down(LeaderError::Deposed));
                 }
                 Ok(false) => {
                     consecutive_failures = 0;
-                    if self.is_leader.swap(false, Ordering::SeqCst) {
-                        warn!(
-                            holder = %self.config.holder_id,
-                            "lost leadership (Lease held by another holder)"
-                        );
-                    }
+                    started + self.config.renew_period
                 }
                 Err(err) => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
-                    warn!(?err, consecutive_failures, "leader election step failed");
-                    if must_step_down(consecutive_failures, self.is_leader.load(Ordering::SeqCst)) {
-                        self.is_leader.store(false, Ordering::SeqCst);
-                        return Err(LeaderError::LostLeadership(consecutive_failures));
+                    warn!(
+                        %err,
+                        consecutive_failures,
+                        leading = renewed_at.is_some(),
+                        "leader election step failed"
+                    );
+                    match renewed_at {
+                        // Retry soon, but never later than the deadline:
+                        // the check at the top of the loop steps down there.
+                        Some(at) => (started + self.config.retry_period)
+                            .min(at + self.config.renew_deadline),
+                        None => started + self.config.renew_period,
                     }
                 }
-            }
-            tokio::time::sleep(self.config.renew_period).await;
+            };
+            tokio::time::sleep_until(next_attempt).await;
         }
+    }
+
+    /// Close the controller gate and hand back why.
+    fn step_down(&self, why: LeaderError) -> LeaderError {
+        self.is_leader.store(false, Ordering::SeqCst);
+        warn!(holder = %self.config.holder_id, reason = %why, "stepping down as leader");
+        why
     }
 
     /// Try to acquire (create / take over a stale Lease) or renew.
@@ -206,15 +314,24 @@ fn may_take_lease(holder: Option<&str>, stale: bool, me: &str) -> bool {
     holder == Some(me) || stale
 }
 
-/// Whether repeated apiserver failures must end the process.
+/// How long a LEADER's next acquire/renew step may take, given how long ago
+/// it stamped its last successful renewal. `None` means the renew deadline
+/// has passed and it must step down without trying again.
 ///
-/// Only a HOLDER steps down. Once we cannot renew, our Lease is expiring on a
-/// clock we no longer control, so the safe move is to exit and let the
-/// Deployment restart us. A replica that never became leader is in no such
-/// race: exiting there would turn an apiserver blip into a crash-looping
-/// standby, which is noise on top of an outage.
-fn must_step_down(consecutive_failures: u32, is_leader: bool) -> bool {
-    consecutive_failures >= RENEWAL_FAILURE_BUDGET && is_leader
+/// Bounded twice: by `call_timeout`, so one hung request cannot use up a
+/// whole renew cycle, and by the time left before the deadline, so no step
+/// can still be in flight — and, if it succeeded late, re-open the gate —
+/// after the moment this process has to stop.
+///
+/// Only a leader has a deadline. A replica that never led is in no race with
+/// a Lease it does not hold: stepping down there would turn an apiserver blip
+/// into a crash-looping standby, which is noise on top of an outage.
+fn step_budget(config: &LeaderConfig, since_renewal: Duration) -> Option<Duration> {
+    let left = config
+        .renew_deadline
+        .checked_sub(since_renewal)
+        .filter(|left| !left.is_zero())?;
+    Some(left.min(config.call_timeout))
 }
 
 /// Pure staleness check — extracted for testability. A Lease is
@@ -246,6 +363,29 @@ mod tests {
         assert_eq!(cfg.holder_id, "test-holder");
         assert_eq!(cfg.lease_duration, DEFAULT_LEASE_DURATION);
         assert_eq!(cfg.renew_period, DEFAULT_RENEW_PERIOD);
+        assert_eq!(cfg.renew_deadline, DEFAULT_RENEW_DEADLINE);
+        assert_eq!(cfg.retry_period, DEFAULT_RETRY_PERIOD);
+        assert_eq!(cfg.call_timeout, DEFAULT_CALL_TIMEOUT);
+    }
+
+    #[test]
+    fn the_defaults_stop_a_leader_before_anyone_may_take_its_lease() {
+        // The one relation the whole module rests on: the process stops
+        // acting as leader BEFORE the Lease it last renewed becomes takeable,
+        // with room left over for clock skew and for the process to exit.
+        let cfg = LeaderConfig::for_apprafter_operator("operator-a");
+        assert!(cfg.renew_deadline < cfg.lease_duration);
+        assert_eq!(
+            cfg.lease_duration - cfg.renew_deadline,
+            Duration::from_secs(10),
+            "the margin between stepping down and a possible takeover"
+        );
+        // A healthy leader renews at least once inside its own deadline…
+        assert!(cfg.renew_period < cfg.renew_deadline);
+        // …and one hung request cannot use up a whole renew cycle, so a hung
+        // renewal is retried before the deadline rather than being the last.
+        assert!(cfg.call_timeout < cfg.renew_period);
+        assert!(cfg.retry_period < cfg.renew_deadline - cfg.renew_period);
     }
 
     #[test]
@@ -305,25 +445,33 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // must_step_down — when losing the apiserver must end the process
+    // step_budget — how long a leader's next step may take, if at all
     // -----------------------------------------------------------------
 
     #[test]
-    fn a_leader_steps_down_only_after_the_whole_failure_budget() {
-        // Three attempts, because the renew period is a third of the lease
-        // duration: exiting earlier would restart the operator over a single
-        // blip that the next renewal would have covered.
-        assert!(!must_step_down(RENEWAL_FAILURE_BUDGET - 1, true));
-        assert!(must_step_down(RENEWAL_FAILURE_BUDGET, true));
+    fn a_leaders_step_is_bounded_by_the_call_timeout() {
+        // A renewal that is due on schedule gets the full per-call bound, not
+        // the client's 295s read timeout.
+        let cfg = LeaderConfig::for_apprafter_operator("operator-a");
+        assert_eq!(step_budget(&cfg, Duration::ZERO), Some(cfg.call_timeout));
+        assert_eq!(step_budget(&cfg, cfg.renew_period), Some(cfg.call_timeout));
     }
 
     #[test]
-    fn a_replica_that_never_led_does_not_exit_on_apiserver_failures() {
-        // A standby is in no race with an expiring Lease it does not hold.
-        // Exiting here turns an apiserver outage into a crash-looping pod —
-        // noise stacked on top of the real failure.
-        assert!(!must_step_down(RENEWAL_FAILURE_BUDGET, false));
-        assert!(!must_step_down(RENEWAL_FAILURE_BUDGET * 10, false));
+    fn a_leaders_step_never_runs_past_its_deadline() {
+        // Three seconds before the deadline, the step gets three seconds: a
+        // request still in flight at the deadline could succeed late and
+        // re-open the gate after the process should have stopped.
+        let cfg = LeaderConfig::for_apprafter_operator("operator-a");
+        let since = cfg.renew_deadline - Duration::from_secs(3);
+        assert_eq!(step_budget(&cfg, since), Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn at_or_past_the_deadline_a_leader_does_not_try_again() {
+        let cfg = LeaderConfig::for_apprafter_operator("operator-a");
+        assert_eq!(step_budget(&cfg, cfg.renew_deadline), None);
+        assert_eq!(step_budget(&cfg, cfg.lease_duration), None);
     }
 
     // -----------------------------------------------------------------
@@ -407,14 +555,26 @@ mod tests {
     }
 
     #[test]
-    fn stepping_down_reports_how_many_renewals_were_lost() {
-        // This message is the only record of why the process exited; the
-        // count is what tells a reader "the apiserver went away" apart from
-        // "another replica took over".
-        let err = LeaderError::LostLeadership(3);
+    fn stepping_down_says_why_the_process_exited() {
+        // These messages are the only record of why the process exited. The
+        // time and the count tell "the apiserver went away" apart from "it
+        // answered and said no", and both apart from "another replica took
+        // over".
+        let err = LeaderError::LostLeadership {
+            failures: 2,
+            since: Duration::from_secs(20),
+        };
         assert_eq!(
             err.to_string(),
-            "lost leadership after 3 consecutive renewal failures"
+            "lost leadership: no successful Lease renewal for 20.0s (2 consecutive failures)"
+        );
+        assert_eq!(
+            LeaderError::Deposed.to_string(),
+            "lost leadership: the Lease is held by another holder"
+        );
+        assert_eq!(
+            LeaderError::Timeout(Duration::from_millis(5000)).to_string(),
+            "the apiserver did not answer the Lease request within 5.0s"
         );
     }
 
@@ -430,7 +590,6 @@ mod tests {
     // serialisation, real 404/5xx mapping) without a cluster.
     // -----------------------------------------------------------------
 
-    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
 
     use kube::client::Body;
@@ -444,8 +603,18 @@ mod tests {
         body: Value,
     }
 
+    /// The status a responder returns to make the apiserver accept the
+    /// request and never answer it — the hang the client's read timeout only
+    /// ends after 295s.
+    const NEVER_ANSWER: u16 = 0;
+
+    fn hang() -> (u16, Value) {
+        (NEVER_ANSWER, Value::Null)
+    }
+
     /// A `Client` that answers from `respond`, plus the ordered log of every
-    /// request it was asked to serve.
+    /// request it was asked to serve (a request that is never answered is
+    /// logged when it arrives).
     fn scripted_apiserver<F>(respond: F) -> (Client, Arc<Mutex<Vec<Call>>>)
     where
         F: FnMut(&Call) -> (u16, Value) + Send + 'static,
@@ -467,6 +636,9 @@ mod tests {
                 };
                 let (code, payload) = (respond.lock().expect("responder"))(&call);
                 sink.lock().expect("log").push(call);
+                if code == NEVER_ANSWER {
+                    std::future::pending::<()>().await;
+                }
                 Ok::<_, std::convert::Infallible>(
                     http::Response::builder()
                         .status(code)
@@ -751,11 +923,13 @@ mod tests {
     }
 
     /// The other half of the gate: when the Lease moves to another holder,
-    /// the flag must CLOSE. A leader that keeps the gate open after losing
-    /// the Lease is the split-brain the Lease exists to prevent, and nothing
-    /// downstream re-checks.
+    /// the flag must CLOSE and the loop must END. Closing the gate alone is
+    /// not stepping down — the controllers only wait on it to START and never
+    /// look at it again — so a leader that carried on looping after seeing
+    /// another holder would keep reconciling beside it for as long as the
+    /// process lived.
     #[tokio::test]
-    async fn losing_the_lease_to_a_fresh_holder_closes_the_controller_gate() {
+    async fn losing_the_lease_to_a_fresh_holder_ends_the_leaders_loop() {
         let handover = Arc::new(AtomicBool::new(false));
         let script = handover.clone();
         let (client, _log) = scripted_apiserver(move |call| {
@@ -772,64 +946,204 @@ mod tests {
         assert!(reaches(&flag, true).await, "never became leader");
         handover.store(true, Ordering::SeqCst);
         let closed = reaches(&flag, false).await;
-        task.abort();
+        let ended = tokio::time::timeout(Duration::from_secs(2), task).await;
         assert!(
             closed,
             "kept reconciling after the Lease moved to another holder"
         );
+        let err = ended
+            .expect("a deposed leader must end its loop, not keep polling")
+            .expect("the loop must not panic")
+            .expect_err("a deposed leader must not report success");
+        assert!(matches!(err, LeaderError::Deposed), "{err}");
     }
 
-    /// A LEADER that has burned the whole renewal budget ends the process:
-    /// its Lease is expiring on a clock it no longer controls, so the safe
-    /// move is to exit and let the Deployment restart it. The error carries
-    /// the failure count, and the gate must be closed before it returns —
-    /// returning with the gate still open would leave the in-process
-    /// controllers reconciling all the way to exit.
-    #[tokio::test]
-    async fn a_leader_that_burns_the_renewal_budget_exits_with_the_gate_closed() {
-        let gets = AtomicUsize::new(0);
-        let (client, _log) = scripted_apiserver(move |call| match call.method.as_str() {
-            "GET" if gets.fetch_add(1, Ordering::SeqCst) == 0 => lease_not_found(),
-            "GET" => apiserver_unavailable(),
-            _ => (201, lease_json("operator-a", Utc::now(), Utc::now())),
-        });
-        let le = election(client, Duration::from_millis(1));
+    // -----------------------------------------------------------------
+    // The timing of a step-down, on tokio's paused clock
+    //
+    // These run the real loop at the real 30s/10s/20s timings: a paused
+    // runtime jumps its clock to the next timer whenever every task is idle,
+    // so a request that never answers costs no wall time, and the instant at
+    // which the loop gives up is exact rather than sampled.
+    // -----------------------------------------------------------------
+
+    /// A leader's first step: no Lease yet, so it creates one. Every request
+    /// after those two is answered by `then`.
+    fn leader_then<F>(mut then: F) -> impl FnMut(&Call) -> (u16, Value) + Send + 'static
+    where
+        F: FnMut(&Call) -> (u16, Value) + Send + 'static,
+    {
+        let mut served = 0usize;
+        move |call| {
+            served += 1;
+            match served {
+                1 => lease_not_found(),
+                2 => (201, lease_json("operator-a", Utc::now(), Utc::now())),
+                _ => then(call),
+            }
+        }
+    }
+
+    /// THE bug this loop was rewritten for. The leader holds the Lease, then
+    /// every request it makes is accepted and never answered. It must stop
+    /// leading while the Lease it last renewed is still its own — i.e. less
+    /// than `lease_duration` after it stamped that renewal, which is the
+    /// earliest any other replica may take it. Before the per-step bound, the
+    /// loop sat in the first hung GET with the gate open: a leader in its own
+    /// eyes for as long as the read timeout, and a takeable Lease in
+    /// everyone else's after thirty seconds.
+    #[tokio::test(start_paused = true)]
+    async fn a_leader_whose_requests_hang_steps_down_before_its_lease_is_takeable() {
+        let (client, log) = scripted_apiserver(leader_then(|_| hang()));
+        let cfg = LeaderConfig::for_apprafter_operator("operator-a");
+        let le = LeaderElection::new(client, cfg.clone());
+        let flag = le.is_leader_handle();
+        // The clock is paused and the first two answers are immediate, so the
+        // acquisition is stamped at exactly this instant.
+        let renewed_at = Instant::now();
+
+        let outcome = tokio::time::timeout(cfg.lease_duration * 3, le.run()).await;
+        let stopped_after = renewed_at.elapsed();
+
+        let err = outcome
+            .expect("a leader whose renewals hang must step down, not wait on the request")
+            .expect_err("a leader that cannot renew must not report success");
+        assert!(
+            stopped_after < cfg.lease_duration,
+            "stepped down {stopped_after:?} after its last renewal; another replica may take \
+             the Lease after {:?}",
+            cfg.lease_duration
+        );
+        assert!(
+            stopped_after >= cfg.renew_deadline,
+            "gave up at {stopped_after:?}, before its own deadline"
+        );
+        // Each hung step was cut off and counted as a failed renewal.
+        match err {
+            LeaderError::LostLeadership { failures, since } => {
+                assert_eq!(since, stopped_after);
+                assert!(failures >= 1, "the hung steps were never counted");
+            }
+            other => panic!("expected LostLeadership, got {other}"),
+        }
+        assert!(!flag.load(Ordering::SeqCst), "the gate must be closed");
+        let calls = log.lock().expect("log").clone();
+        assert!(
+            calls.len() >= 3,
+            "a hung renewal must be retried inside the deadline, not be the last attempt: \
+             {calls:?}"
+        );
+    }
+
+    /// One hung renewal is a failed step, not the end of the process and not
+    /// the end of the loop: the step is cut off, the retry succeeds, and the
+    /// leader keeps both the Lease and the gate. Without the bound the loop
+    /// is still inside that first request a minute later.
+    #[tokio::test(start_paused = true)]
+    async fn one_hung_renewal_is_retried_and_the_leader_keeps_the_lease() {
+        let mut after = 0usize;
+        let (client, log) = scripted_apiserver(leader_then(move |_| {
+            after += 1;
+            if after == 1 {
+                hang()
+            } else {
+                // Our own, freshly renewed Lease — for the GET and the PUT.
+                (200, lease_json("operator-a", Utc::now(), ago(600)))
+            }
+        }));
+        let cfg = LeaderConfig::for_apprafter_operator("operator-a");
+        let le = LeaderElection::new(client, cfg.clone());
         let flag = le.is_leader_handle();
 
-        let err = tokio::time::timeout(Duration::from_secs(5), le.run())
+        let outcome = tokio::time::timeout(cfg.lease_duration * 2, le.run()).await;
+        assert!(
+            outcome.is_err(),
+            "a single hung request must not end the loop: {outcome:?}"
+        );
+        assert!(flag.load(Ordering::SeqCst), "the leader lost its gate");
+        let calls = log.lock().expect("log").clone();
+        let renewals_after_the_hang = calls[3..].iter().filter(|c| c.method == "PUT").count();
+        assert!(
+            renewals_after_the_hang >= 3,
+            "the leader must go on renewing after the hung request: {calls:?}"
+        );
+    }
+
+    /// A LEADER whose apiserver keeps answering 500 retries every
+    /// `retry_period` and steps down at its deadline — not at a count of
+    /// failures. Three strikes at the renew period land on the thirtieth
+    /// second, the very moment another replica may take the Lease. The gate
+    /// must be closed before the loop returns, or the in-process controllers
+    /// keep reconciling all the way to exit.
+    #[tokio::test(start_paused = true)]
+    async fn a_leader_whose_renewals_fail_steps_down_at_its_deadline() {
+        let (client, _log) = scripted_apiserver(leader_then(|_| apiserver_unavailable()));
+        let cfg = LeaderConfig::for_apprafter_operator("operator-a");
+        let le = LeaderElection::new(client, cfg.clone());
+        let flag = le.is_leader_handle();
+        let renewed_at = Instant::now();
+
+        let err = tokio::time::timeout(cfg.lease_duration * 3, le.run())
             .await
             .expect("the loop must exit rather than spin on a dying Lease")
             .expect_err("a leader that cannot renew must not report success");
-        assert!(
-            matches!(err, LeaderError::LostLeadership(RENEWAL_FAILURE_BUDGET)),
-            "{err}"
-        );
+        let stopped_after = renewed_at.elapsed();
+        assert_eq!(stopped_after, cfg.renew_deadline);
+        // The first renewal is due one renew period in; from then on it is
+        // retried every retry period until the deadline.
+        let retries =
+            ((cfg.renew_deadline - cfg.renew_period).as_secs() / cfg.retry_period.as_secs()) as u32;
+        match err {
+            LeaderError::LostLeadership { failures, since } => {
+                assert_eq!(failures, retries);
+                assert_eq!(since, cfg.renew_deadline);
+            }
+            other => panic!("expected LostLeadership, got {other}"),
+        }
         assert!(
             !flag.load(Ordering::SeqCst),
             "the gate must close before the process exits"
         );
     }
 
-    /// A replica that never led is in no race with an expiring Lease, so the
-    /// same run of failures must NOT end it — it keeps retrying. Exiting here
-    /// turns an apiserver outage into a crash-looping standby, stacking
-    /// restart noise on top of the real failure and leaving nothing ready to
-    /// take over when the apiserver comes back.
-    #[tokio::test]
-    async fn a_standby_keeps_retrying_through_the_same_run_of_failures() {
+    /// A replica that never led is in no race with an expiring Lease, so no
+    /// run of failures ends it — it keeps retrying. Exiting here turns an
+    /// apiserver outage into a crash-looping standby, stacking restart noise
+    /// on top of the real failure and leaving nothing ready to take over
+    /// when the apiserver comes back.
+    #[tokio::test(start_paused = true)]
+    async fn a_standby_keeps_retrying_through_any_run_of_failures() {
         let (client, log) = scripted_apiserver(|_| apiserver_unavailable());
-        let le = election(client, Duration::from_millis(1));
+        let cfg = LeaderConfig::for_apprafter_operator("operator-a");
+        let le = LeaderElection::new(client, cfg.clone());
         let flag = le.is_leader_handle();
 
-        let outcome = tokio::time::timeout(Duration::from_millis(200), le.run()).await;
+        let outcome = tokio::time::timeout(cfg.lease_duration * 3, le.run()).await;
         assert!(
             outcome.is_err(),
             "a standby must not exit on apiserver failures: {outcome:?}"
         );
         assert!(!flag.load(Ordering::SeqCst), "a standby never leads");
         assert!(
-            log.lock().expect("log").len() > RENEWAL_FAILURE_BUDGET as usize,
-            "it must have kept trying past the budget a leader would step down on"
+            log.lock().expect("log").len() >= 9,
+            "it must keep polling once per renew period"
+        );
+    }
+
+    /// The same for a standby whose requests hang: each is cut off at the
+    /// per-step bound and it polls again on its cadence, instead of sitting
+    /// in one request and never noticing when the Lease is free.
+    #[tokio::test(start_paused = true)]
+    async fn a_standby_whose_requests_hang_keeps_polling() {
+        let (client, log) = scripted_apiserver(|_| hang());
+        let cfg = LeaderConfig::for_apprafter_operator("operator-a");
+        let le = LeaderElection::new(client, cfg.clone());
+
+        let outcome = tokio::time::timeout(cfg.lease_duration * 3, le.run()).await;
+        assert!(outcome.is_err(), "a standby must not exit: {outcome:?}");
+        assert!(
+            log.lock().expect("log").len() >= 9,
+            "every hung request must be cut off and the next one made"
         );
     }
 }
