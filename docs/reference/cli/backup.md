@@ -191,7 +191,9 @@ apprafter backup prune --credential-file <dotenv> --keep-daily 14 --keep-weekly 
 
 ## `apprafter backup run`
 
-Run the cluster's scheduled backup NOW, without waiting for its next window. Instantiates the platform's backup CronJob as a one-off Job, so it uses the cluster's own credentials — useful before an upgrade, and to prove a freshly enabled schedule works
+Run the cluster's scheduled backup NOW, without waiting for its next window. Instantiates the platform's backup CronJob as a one-off Job, so it uses the cluster's own credentials — useful before an upgrade, and to prove a freshly enabled schedule works.
+
+If no node has room for the Job's pod for two minutes, the command deletes the Job, prints the scheduler's reason and exits non-zero. That backup cannot start, and the scheduled one asks for the same room. `apprafter top` shows how much of each node is requested.
 
 ```text
 Usage: apprafter backup run [OPTIONS]

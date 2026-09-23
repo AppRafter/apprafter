@@ -145,6 +145,27 @@ pub enum CliError {
         hint: String,
     },
 
+    /// `backup run` gave up on a Job whose pod no node had room for.
+    ///
+    /// Typed rather than [`CliError::Other`] because the cause is known
+    /// and so is the next step. The catch-all's help asks the reader to
+    /// file an issue about recurring wording, which is the wrong advice
+    /// here. The scheduler's reason, the runner's requests and the
+    /// documentation link are printed on stdout just before this error,
+    /// one per line. Inside the diagnostic, miette would wrap them to the
+    /// terminal width and split the URL.
+    #[error("backup Job {job} never started: no node had room for its pod for {waited}")]
+    #[diagnostic(
+        code(apprafter::backup::runner_unschedulable),
+        help(
+            "The lines above give the scheduler's reason and what the runner asks for. \
+             `apprafter top` shows how much of each node is requested, and by what: free \
+             enough for the runner, or move to a bigger machine, then run `apprafter backup \
+             run` again. Until then the scheduled backup cannot start either."
+        )
+    )]
+    BackupRunnerUnschedulable { job: String, waited: String },
+
     /// A `kubectl` invocation failed, classified.
     ///
     /// Same shape as [`CliError::Restic`]: `hint` is derived from
@@ -729,6 +750,28 @@ mod tests {
         assert!(
             !help.contains("delete `.apprafter/`"),
             "help must not send the operator at a path state left in v0.1.154: {help}"
+        );
+    }
+
+    #[test]
+    fn an_unschedulable_backup_runner_has_its_own_code_and_no_file_an_issue_help() {
+        let err = CliError::BackupRunnerUnschedulable {
+            job: "apprafter-backup-manual-20260923-170848".into(),
+            waited: "2m 3s".into(),
+        };
+        assert_eq!(code_of(&err), "apprafter::backup::runner_unschedulable");
+        let text = err.to_string();
+        assert!(
+            text.contains("apprafter-backup-manual-20260923-170848"),
+            "{text}"
+        );
+        assert!(text.contains("2m 3s"), "{text}");
+        let help = help_of(&err);
+        assert!(help.contains("`apprafter top`"), "{help}");
+        assert!(help.contains("`apprafter backup run`"), "{help}");
+        assert!(
+            !help.contains("file an issue"),
+            "a known cause must not get the catch-all's advice: {help}"
         );
     }
 

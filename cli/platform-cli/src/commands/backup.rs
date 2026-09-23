@@ -83,10 +83,13 @@ use tempfile::NamedTempFile;
 
 use crate::commands::helper_interrupt;
 use crate::commands::k8s_helpers::{
-    ensure_kubeconfig_tempfile, kubectl_apply_server_side, kubectl_get_json,
+    ensure_kubeconfig_tempfile, kubectl_apply_server_side, kubectl_delete, kubectl_get_json,
     kubectl_get_json_cluster_wide, kubectl_merge_patch,
 };
 use crate::commands::state_paths::resolve_state_paths;
+
+mod job_pod;
+use job_pod::{job_pod, JobPod, UnschedulableClock, UNSCHEDULABLE_GRACE};
 
 /// Namespace the `PlatformStack` singleton + `SourceCredential`s + their sealed
 /// material live in. Mirrors `repo_creds::SOURCECRED_NAMESPACE` /
@@ -2474,16 +2477,91 @@ fn wait_for_synced_cronjob(
     }
 }
 
+/// What the wait does after one look at the Job and its pods.
+#[derive(Debug, PartialEq, Eq)]
+enum WaitStep {
+    /// The Job's `Complete` condition is True.
+    Succeeded,
+    /// The Job's `Failed` condition is True: its reason and message.
+    Failed(String),
+    /// The Job is gone.
+    Vanished,
+    /// Its pod has been unschedulable for `for_`, past
+    /// [`UNSCHEDULABLE_GRACE`]: the scheduler's message, and what the
+    /// runner asks for ([`job_pod::runner_requests`]).
+    Unschedulable {
+        message: String,
+        requests: Option<String>,
+        for_: Duration,
+    },
+    /// The caller's `--timeout` is up, with the pod in this state.
+    TimedOut(JobPod),
+    /// Keep waiting: the pod's state, and how long it has been unschedulable
+    /// when it is.
+    Wait(JobPod, Option<Duration>),
+}
+
+/// Decide the wait's next step from one observation. Pure: the loop in
+/// [`wait_for_backup_job`] fetches, and `now`/`waited` come in as values, so
+/// the order of the checks is pinned by tests instead of by a cluster.
+///
+/// The order matters. The Job's own verdict comes first: a Job that finished
+/// has finished, whatever its pods look like. A pod no node can take comes
+/// before the timeout, because a known reason beats "no longer waiting".
+/// The timeout comes last.
+fn wait_step(
+    job: Option<&Value>,
+    pods: &[Value],
+    clock: &mut UnschedulableClock,
+    now: std::time::Instant,
+    waited: Duration,
+    timeout: Duration,
+) -> WaitStep {
+    let Some(job) = job else {
+        return WaitStep::Vanished;
+    };
+    match job_run_outcome(job) {
+        JobOutcome::Succeeded => return WaitStep::Succeeded,
+        JobOutcome::Failed(why) => return WaitStep::Failed(why),
+        JobOutcome::Running => {}
+    }
+    let pod = job_pod(job, pods);
+    let unschedulable_for = clock.observe(&pod, now);
+    if let (JobPod::Unschedulable { message, .. }, Some(for_)) = (&pod, unschedulable_for) {
+        if for_ >= UNSCHEDULABLE_GRACE {
+            return WaitStep::Unschedulable {
+                message: message.clone(),
+                requests: job_pod::runner_requests(job),
+                for_,
+            };
+        }
+    }
+    if waited >= timeout {
+        return WaitStep::TimedOut(pod);
+    }
+    WaitStep::Wait(pod, unschedulable_for)
+}
+
 /// Poll a backup Job to its terminal state, reporting progress while it runs.
 ///
 /// A timeout is NOT a failure of the backup: the Job keeps running in the
 /// cluster, and saying otherwise would send an operator to clean up after a
 /// backup that is still in progress. The message says so and hands over the
 /// two commands that follow it.
+///
+/// A pod no node has room for is different: it is not a backup in progress,
+/// and it waits for room that nothing is about to free. Once it has been
+/// unschedulable for [`UNSCHEDULABLE_GRACE`], this deletes the Job and fails
+/// with the scheduler's reason. Deleting it matters. Left in place, the Job
+/// would start on its own whenever room appeared, at a time nobody chose and
+/// possibly beside the scheduled backup, where two runs that need the same
+/// helper pod do not both finish. On a chart whose Job has no deadline it
+/// would also never go away.
 fn wait_for_backup_job(name: &str, timeout_minutes: u64, kubeconfig: &Path) -> Result<()> {
     let deadline = Duration::from_secs(timeout_minutes * 60);
     let started = std::time::Instant::now();
     let mut last_note = std::time::Instant::now();
+    let mut clock = UnschedulableClock::default();
 
     println!(
         "  waiting for it to finish (up to {timeout_minutes}m; Ctrl-C is safe — the Job \
@@ -2491,8 +2569,27 @@ fn wait_for_backup_job(name: &str, timeout_minutes: u64, kubeconfig: &Path) -> R
     );
     loop {
         let job = kubectl_get_json("job", Some(name), Some(PLATFORMSTACK_NAMESPACE), kubeconfig)?;
-        match job.as_ref().map(job_run_outcome) {
-            Some(JobOutcome::Succeeded) => {
+        // The pods are read only while the Job has not finished: they are
+        // what tells a runner that is working from one that never started.
+        let pods = match &job {
+            Some(j) if job_run_outcome(j) == JobOutcome::Running => {
+                kubectl_get_json("pods", None, Some(PLATFORMSTACK_NAMESPACE), kubeconfig)?
+                    .as_ref()
+                    .map(items_of)
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        let now = std::time::Instant::now();
+        match wait_step(
+            job.as_ref(),
+            &pods,
+            &mut clock,
+            now,
+            started.elapsed(),
+            deadline,
+        ) {
+            WaitStep::Succeeded => {
                 println!(
                     "✓ Backup complete in {}.",
                     format_elapsed(started.elapsed().as_secs())
@@ -2500,7 +2597,7 @@ fn wait_for_backup_job(name: &str, timeout_minutes: u64, kubeconfig: &Path) -> R
                 println!("  `apprafter backup list` shows the new snapshot.");
                 return Ok(());
             }
-            Some(JobOutcome::Failed(why)) => {
+            WaitStep::Failed(why) => {
                 print_job_log_tail(name, kubeconfig);
                 return Err(CliError::Other(format!(
                     "backup Job {name} failed after {}: {why}\n  \
@@ -2510,28 +2607,54 @@ fn wait_for_backup_job(name: &str, timeout_minutes: u64, kubeconfig: &Path) -> R
             }
             // A Job that vanished mid-wait was deleted by someone else;
             // reporting success or failure would both be guesses.
-            None => {
+            WaitStep::Vanished => {
                 return Err(CliError::Other(format!(
                     "backup Job {name} disappeared while waiting for it — someone or something \
                      deleted it. `apprafter backup status` shows what the cluster has now."
                 )));
             }
-            Some(JobOutcome::Running) => {}
-        }
-        if started.elapsed() >= deadline {
-            println!(
-                "  still running after {timeout_minutes}m — no longer waiting. The Job is NOT \
-                 cancelled:\n    kubectl -n {PLATFORMSTACK_NAMESPACE} logs -f job/{name}\n    \
-                 apprafter backup status"
-            );
-            return Ok(());
-        }
-        if last_note.elapsed() >= Duration::from_secs(30) {
-            println!(
-                "  … still running ({})",
-                format_elapsed(started.elapsed().as_secs())
-            );
-            last_note = std::time::Instant::now();
+            WaitStep::Unschedulable {
+                message,
+                requests,
+                for_,
+            } => {
+                let deleted = kubectl_delete("job", name, PLATFORMSTACK_NAMESPACE, kubeconfig)
+                    .map_err(|e| e.to_string());
+                print!(
+                    "{}",
+                    job_pod::unschedulable_report(
+                        PLATFORMSTACK_NAMESPACE,
+                        name,
+                        &message,
+                        requests.as_deref(),
+                        deleted,
+                    )
+                );
+                return Err(CliError::BackupRunnerUnschedulable {
+                    job: name.to_string(),
+                    waited: format_elapsed(for_.as_secs()),
+                });
+            }
+            WaitStep::TimedOut(pod) => {
+                println!(
+                    "{}",
+                    job_pod::timeout_note(&pod, timeout_minutes, PLATFORMSTACK_NAMESPACE, name)
+                );
+                return Ok(());
+            }
+            WaitStep::Wait(pod, unschedulable_for) => {
+                // A new streak of "cannot be scheduled" is said at once, not
+                // up to 30 s later: it is the one state with a countdown.
+                if last_note.elapsed() >= Duration::from_secs(30)
+                    || unschedulable_for == Some(Duration::ZERO)
+                {
+                    println!(
+                        "{}",
+                        job_pod::progress_note(&pod, started.elapsed(), unschedulable_for)
+                    );
+                    last_note = now;
+                }
+            }
         }
         thread::sleep(JOB_POLL_INTERVAL);
     }
@@ -5802,11 +5925,20 @@ fn most_recent_job<'a>(jobs: &[&'a serde_json::Value]) -> Option<&'a serde_json:
 ///
 /// The condition is what the Job controller decided; the pod counts are only
 /// what its pods did, and they cannot tell a deadline from a crash.
-fn job_line_outcome(j: &serde_json::Value) -> String {
+///
+/// While there is no condition, the Job's pod says more than its counts:
+/// `status.active` counts a pod the scheduler could not place exactly like
+/// one that is running a backup, so a runner that never started read
+/// `Running`. With the pod in `pods` the line says `Pending, cannot be
+/// scheduled: <the scheduler's reason>` instead ([`job_pod`]). Without it, or
+/// for a shape that is not recognised, the counts are what is left.
+fn job_line_outcome(j: &serde_json::Value, pods: &[serde_json::Value]) -> String {
     match job_run_outcome(j) {
         JobOutcome::Succeeded => "Succeeded".to_string(),
         JobOutcome::Failed(why) => format!("Failed: {why}"),
-        JobOutcome::Running => job_outcome(j).to_string(),
+        JobOutcome::Running => {
+            job_pod::status_outcome(&job_pod(j, pods)).unwrap_or_else(|| job_outcome(j).to_string())
+        }
     }
 }
 
@@ -5853,9 +5985,15 @@ fn job_outcome(j: &serde_json::Value) -> &'static str {
 /// Jobs are selected by their `.metadata.name` prefix `apprafter-backup` (both
 /// CronJob-spawned Jobs share that prefix). For each of the two flavours (with
 /// and without `-check`) the most-recent Job (by `.status.startTime`) is shown.
+///
+/// `pods` is any listing that holds those Jobs' pods (the caller reads
+/// `apprafter-system`'s). It is what tells an unfinished Job whose runner
+/// works from one whose pod no node has room for; empty, the Job lines fall
+/// back to the Jobs' own pod counts.
 pub(crate) fn format_backup_status<Tz>(
     spec_backup: Option<&serde_json::Value>,
     jobs: &[serde_json::Value],
+    pods: &[serde_json::Value],
     status_cm: Option<&serde_json::Value>,
     last_prune: Option<&str>,
     tz: &Tz,
@@ -5948,27 +6086,37 @@ where
     // A Job line that says only WHETHER it succeeded leaves the question the
     // operator opened this screen with — is the backup current? — unanswered:
     // last week's success and this morning's read identically.
+    //
+    // A Job whose pod cannot be scheduled gets the reason on its line and,
+    // under it, where to look: that Job is not running, and the scheduled
+    // backup asks for the same room.
     let job_line = |j: &serde_json::Value| -> String {
         let when = job_start_time(j);
-        let outcome = job_line_outcome(j);
-        if when.is_empty() {
-            format!("{} — {outcome}", job_metadata_name(j))
+        let outcome = job_line_outcome(j, pods);
+        let mut line = if when.is_empty() {
+            format!("{} — {outcome}\n", job_metadata_name(j))
         } else {
             format!(
-                "{} — {outcome} ({})",
+                "{} — {outcome} ({})\n",
                 job_metadata_name(j),
                 format_timestamp_with_zone(when, tz, zone_label)
             )
+        };
+        if job_run_outcome(j) == JobOutcome::Running {
+            if let Some(hint) = job_pod::status_hint(j, &job_pod(j, pods)) {
+                line.push_str(&hint);
+            }
         }
+        line
     };
 
     out.push_str("\nJobs:\n");
     match most_recent_job(&backup_jobs) {
-        Some(j) => out.push_str(&format!("  Last backup Job: {}\n", job_line(j))),
+        Some(j) => out.push_str(&format!("  Last backup Job: {}", job_line(j))),
         None => out.push_str("  Last backup Job: none\n"),
     }
     match most_recent_job(&check_jobs) {
-        Some(j) => out.push_str(&format!("  Last check Job:  {}\n", job_line(j))),
+        Some(j) => out.push_str(&format!("  Last check Job:  {}", job_line(j))),
         None => out.push_str("  Last check Job:  none\n"),
     }
 
@@ -6074,6 +6222,21 @@ pub fn run_backup_status() -> Result<()> {
     let jobs_list = kubectl_get_json("jobs", None, Some(PLATFORMSTACK_NAMESPACE), kc.path())?;
     let jobs = backup_jobs_of(jobs_list.as_ref());
 
+    // 2b. The pods, only when a Job has not finished: a finished Job's
+    //     conditions say everything, and an unfinished one's `active` count
+    //     cannot tell a working runner from one no node has room for.
+    let pods = if jobs
+        .iter()
+        .any(|j| job_run_outcome(j) == JobOutcome::Running)
+    {
+        kubectl_get_json("pods", None, Some(PLATFORMSTACK_NAMESPACE), kc.path())?
+            .as_ref()
+            .map(items_of)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     // 3. Fetch the runner status ConfigMap.
     let status_cm = kubectl_get_json(
         "configmap",
@@ -6087,6 +6250,7 @@ pub fn run_backup_status() -> Result<()> {
         format_backup_status(
             spec_backup.as_ref(),
             &jobs,
+            &pods,
             status_cm.as_ref(),
             last_prune.as_deref(),
             &chrono::Local,
@@ -7481,6 +7645,7 @@ mod tests {
         let s = format_backup_status(
             Some(&spec),
             &[],
+            &[],
             Some(&cm),
             Some("2026-09-09T02:30:00Z"),
             &tokyo(),
@@ -7507,6 +7672,7 @@ mod tests {
         let s = format_backup_status(
             Some(&spec),
             std::slice::from_ref(&job),
+            &[],
             None,
             None,
             &tokyo(),
@@ -7523,6 +7689,7 @@ mod tests {
         let s = format_backup_status(
             Some(&spec),
             &[],
+            &[],
             Some(&cm),
             None,
             &tokyo(),
@@ -7533,14 +7700,22 @@ mod tests {
 
     #[test]
     fn status_disabled_when_no_spec_backup() {
-        let s = format_backup_status(None, &[], None, None, &tokyo(), Some("Asia/Tokyo"));
+        let s = format_backup_status(None, &[], &[], None, None, &tokyo(), Some("Asia/Tokyo"));
         assert!(s.to_lowercase().contains("disabled"));
     }
 
     #[test]
     fn status_disabled_when_enabled_false() {
         let spec = json!({"enabled": false, "bucket": "s3:x"});
-        let s = format_backup_status(Some(&spec), &[], None, None, &tokyo(), Some("Asia/Tokyo"));
+        let s = format_backup_status(
+            Some(&spec),
+            &[],
+            &[],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
         assert!(s.to_lowercase().contains("disabled"));
         // Config is retained and shown even when disabled.
         assert!(s.contains("s3:x"));
@@ -7551,6 +7726,7 @@ mod tests {
         let spec = json!({"enabled": true, "bucket": "s3:x", "schedule": "0 3 * * *", "stagingMode": "monolithic"});
         let s = format_backup_status(
             Some(&spec),
+            &[],
             &[],
             None,
             Some("2026-07-17T03:00:00Z"),
@@ -7572,7 +7748,15 @@ mod tests {
             "schedule": "30 22 * * *", "checkSchedule": "30 1 * * 0",
             "timeZone": "Europe/Berlin"
         });
-        let s = format_backup_status(Some(&spec), &[], None, None, &tokyo(), Some("Asia/Tokyo"));
+        let s = format_backup_status(
+            Some(&spec),
+            &[],
+            &[],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
         assert!(s.contains("daily at 22:30 Europe/Berlin"), "{s}");
         assert!(s.contains("Sundays at 01:30 Europe/Berlin"), "{s}");
     }
@@ -7586,7 +7770,15 @@ mod tests {
             "enabled": true, "bucket": "s3:x", "schedule": "0 3 * * *",
             "checkSchedule": "", "timeZone": "UTC"
         });
-        let s = format_backup_status(Some(&spec), &[], None, None, &tokyo(), Some("Asia/Tokyo"));
+        let s = format_backup_status(
+            Some(&spec),
+            &[],
+            &[],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
         assert!(s.contains("check:         off"), "{s}");
     }
 
@@ -7596,7 +7788,15 @@ mod tests {
         // alone reads as local time; it is actually the
         // kube-controller-manager's zone, which is the trap D2 is about.
         let spec = json!({"enabled": true, "bucket": "s3:x", "schedule": "0 3 * * *"});
-        let s = format_backup_status(Some(&spec), &[], None, None, &tokyo(), Some("Asia/Tokyo"));
+        let s = format_backup_status(
+            Some(&spec),
+            &[],
+            &[],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
         assert!(s.contains("cluster timezone"), "{s}");
         assert!(s.contains("backup enable"), "{s}");
     }
@@ -7609,7 +7809,15 @@ mod tests {
             "enabled": true, "bucket": "s3:x", "schedule": "*/5 * * * *",
             "timeZone": "UTC"
         });
-        let s = format_backup_status(Some(&spec), &[], None, None, &tokyo(), Some("Asia/Tokyo"));
+        let s = format_backup_status(
+            Some(&spec),
+            &[],
+            &[],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
         assert!(s.contains("*/5 * * * * UTC"), "{s}");
     }
 
@@ -7623,6 +7831,7 @@ mod tests {
         let s = format_backup_status(
             Some(&spec),
             std::slice::from_ref(&job),
+            &[],
             None,
             None,
             &tokyo(),
@@ -7654,6 +7863,7 @@ mod tests {
         let s = format_backup_status(
             Some(&spec),
             std::slice::from_ref(&job),
+            &[],
             None,
             None,
             &tokyo(),
@@ -7677,13 +7887,13 @@ mod tests {
             "metadata": {"name": "apprafter-backup-28900000"},
             "status": {"active": 1, "failed": 1}
         });
-        assert_eq!(job_line_outcome(&running), "Running");
+        assert_eq!(job_line_outcome(&running, &[]), "Running");
         let done = json!({
             "metadata": {"name": "apprafter-backup-28900000"},
             "status": {"succeeded": 1,
                        "conditions": [{"type": "Complete", "status": "True"}]}
         });
-        assert_eq!(job_line_outcome(&done), "Succeeded");
+        assert_eq!(job_line_outcome(&done, &[]), "Succeeded");
     }
 
     #[test]
@@ -7701,6 +7911,7 @@ mod tests {
         let spec = json!({"enabled": true, "bucket": "s3:x"});
         let s = format_backup_status(
             Some(&spec),
+            &[],
             &[],
             Some(&cm),
             None,
@@ -7728,7 +7939,15 @@ mod tests {
     #[test]
     fn status_last_prune_never_when_absent() {
         let spec = json!({"enabled": true, "bucket": "s3:x"});
-        let s = format_backup_status(Some(&spec), &[], None, None, &tokyo(), Some("Asia/Tokyo"));
+        let s = format_backup_status(
+            Some(&spec),
+            &[],
+            &[],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
         assert!(s.contains("Last prune: never"));
     }
 
@@ -7746,6 +7965,7 @@ mod tests {
         let s = format_backup_status(
             Some(&spec),
             &[job_old, job_new],
+            &[],
             None,
             None,
             &tokyo(),
@@ -9420,6 +9640,7 @@ mod tests {
         let s = format_backup_status(
             Some(&spec),
             std::slice::from_ref(&running),
+            &[],
             None,
             None,
             &tokyo(),
@@ -9432,6 +9653,7 @@ mod tests {
         let s = format_backup_status(
             Some(&spec),
             std::slice::from_ref(&bare),
+            &[],
             None,
             None,
             &tokyo(),
@@ -11886,6 +12108,7 @@ mod tests {
         let s = format_backup_status(
             Some(&spec),
             &[backup_job, check_job],
+            &[],
             None,
             None,
             &tokyo(),
@@ -11896,5 +12119,302 @@ mod tests {
         // backup is Succeeded, check is Failed
         assert!(s.contains("Succeeded"));
         assert!(s.contains("Failed"));
+    }
+
+    // ------------------------------------------------------------------
+    // A backup Job whose pod no node has room for (WI-386)
+    // ------------------------------------------------------------------
+
+    /// The scheduler's message, verbatim from the live run that found this.
+    const NO_ROOM: &str = "0/1 nodes are available: 1 Insufficient memory. no new claims to \
+                           deallocate, preemption: 0/1 nodes are available: 1 No preemption \
+                           victims found for incoming pod.";
+
+    fn unfinished_job(name: &str, uid: &str, owner_kind: Option<&str>) -> Value {
+        let mut j = json!({
+            "metadata": {"name": name, "uid": uid},
+            "spec": {"template": {"spec": {"containers": [{"name": "runner", "resources": {
+                "requests": {"cpu": "100m", "memory": "256Mi"}, "limits": {"memory": "512Mi"}
+            }}]}}},
+            "status": {"active": 1, "startTime": "2026-09-23T14:39:47Z"}
+        });
+        if let Some(kind) = owner_kind {
+            j["metadata"]["ownerReferences"] =
+                json!([{"kind": kind, "name": "apprafter-backup", "uid": "cj-uid"}]);
+        }
+        j
+    }
+
+    fn pending_pod(job_uid: &str, pod_uid: &str) -> Value {
+        json!({
+            "metadata": {"name": format!("{pod_uid}-pod"), "uid": pod_uid,
+                         "creationTimestamp": "2026-09-23T14:39:47Z",
+                         "ownerReferences": [{"kind": "Job", "uid": job_uid, "name": "x"}]},
+            "spec": {},
+            "status": {"phase": "Pending", "conditions": [{
+                "type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+                "message": NO_ROOM
+            }]}
+        })
+    }
+
+    #[test]
+    fn backup_status_says_a_runner_nobody_can_place_is_pending_not_running() {
+        // Live output on the 4 GB node:
+        //   Last backup Job: apprafter-backup-manual-20260923-144838 — Running (…)
+        // while its pod had been Pending for 22 minutes with FailedScheduling.
+        let spec = json!({"enabled": true, "bucket": "s3:x", "schedule": "0 3 * * *"});
+        let scheduled = unfinished_job("apprafter-backup-29312345", "job-1", Some("CronJob"));
+        let check = unfinished_job("apprafter-backup-check-29312346", "job-2", Some("CronJob"));
+        let pods = [pending_pod("job-1", "pod-1"), pending_pod("job-2", "pod-2")];
+        let s = format_backup_status(
+            Some(&spec),
+            &[scheduled, check],
+            &pods,
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
+        assert!(
+            s.contains(&format!(
+                "Last backup Job: apprafter-backup-29312345 — Pending, cannot be scheduled: \
+                 {NO_ROOM} (2026-09-23 23:39:47 Asia/Tokyo)"
+            )),
+            "{s}"
+        );
+        assert!(
+            s.contains("Last check Job:  apprafter-backup-check-29312346 — Pending, cannot be"),
+            "the check Job asks for the same room and is read the same way: {s}"
+        );
+        assert!(!s.contains("Running"), "{s}");
+        assert!(s.contains("`apprafter top`"), "{s}");
+        assert!(s.contains(job_pod::RUNNER_UNSCHEDULABLE_DOC), "{s}");
+        assert!(
+            s.contains("the schedule starts no other backup"),
+            "a scheduled Job holds the schedule while it waits: {s}"
+        );
+        // The hint sits under its own Job line, before the next section.
+        let backup_at = s.find("Last backup Job:").unwrap();
+        let hint_at = s.find("`apprafter top`").unwrap();
+        let check_at = s.find("Last check Job:").unwrap();
+        assert!(backup_at < hint_at && hint_at < check_at, "{s}");
+    }
+
+    #[test]
+    fn backup_status_without_the_pods_keeps_the_jobs_own_view() {
+        // No pod listing (or none matched): the Job's counts are what is
+        // left, as before. Nothing is invented.
+        let spec = json!({"enabled": true, "bucket": "s3:x"});
+        let job = unfinished_job("apprafter-backup-manual-x", "job-1", None);
+        let s = format_backup_status(
+            Some(&spec),
+            std::slice::from_ref(&job),
+            &[],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
+        assert!(s.contains("apprafter-backup-manual-x — Running"), "{s}");
+        assert!(!s.contains("`apprafter top`"), "{s}");
+    }
+
+    #[test]
+    fn a_finished_job_is_not_re_read_from_a_pod_left_behind() {
+        // The Job's condition is the verdict; a leftover pod cannot turn a
+        // failed Job into "Pending".
+        let spec = json!({"enabled": true, "bucket": "s3:x"});
+        let mut job = unfinished_job("apprafter-backup-1", "job-1", Some("CronJob"));
+        job["status"] = json!({"failed": 1, "startTime": "2026-09-23T14:39:47Z", "conditions": [
+            {"type": "Failed", "status": "True", "reason": "DeadlineExceeded",
+             "message": "Job was active longer than specified deadline"}
+        ]});
+        let s = format_backup_status(
+            Some(&spec),
+            std::slice::from_ref(&job),
+            &[pending_pod("job-1", "pod-1")],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
+        assert!(s.contains("— Failed: DeadlineExceeded"), "{s}");
+        assert!(!s.contains("Pending"), "{s}");
+        assert!(!s.contains("`apprafter top`"), "{s}");
+    }
+
+    #[test]
+    fn the_wait_gives_up_on_a_pod_unschedulable_for_the_whole_grace() {
+        let job = unfinished_job("apprafter-backup-manual-x", "job-1", None);
+        let pods = [pending_pod("job-1", "pod-1")];
+        let t0 = std::time::Instant::now();
+        let hour = Duration::from_secs(3600);
+        let mut clock = UnschedulableClock::default();
+        let step = |clock: &mut UnschedulableClock, at: u64| {
+            wait_step(
+                Some(&job),
+                &pods,
+                clock,
+                t0 + Duration::from_secs(at),
+                Duration::from_secs(at),
+                hour,
+            )
+        };
+        assert!(
+            matches!(step(&mut clock, 5), WaitStep::Wait(JobPod::Unschedulable { .. }, Some(d)) if d.is_zero()),
+            "the first sighting starts the streak"
+        );
+        let just_under = 5 + UNSCHEDULABLE_GRACE.as_secs() - 1;
+        assert!(matches!(
+            step(&mut clock, just_under),
+            WaitStep::Wait(JobPod::Unschedulable { .. }, Some(_))
+        ));
+        match step(&mut clock, 5 + UNSCHEDULABLE_GRACE.as_secs()) {
+            WaitStep::Unschedulable {
+                message,
+                requests,
+                for_,
+            } => {
+                assert_eq!(message, NO_ROOM);
+                assert_eq!(for_, UNSCHEDULABLE_GRACE);
+                assert_eq!(requests.as_deref(), Some("256Mi of memory and 100m of CPU"));
+            }
+            other => panic!("expected the give-up, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pod_placed_before_the_grace_ends_is_waited_for_as_usual() {
+        let job = unfinished_job("apprafter-backup-manual-x", "job-1", None);
+        let t0 = std::time::Instant::now();
+        let hour = Duration::from_secs(3600);
+        let mut clock = UnschedulableClock::default();
+        let pending = [pending_pod("job-1", "pod-1")];
+        let mut placed = pending_pod("job-1", "pod-1");
+        placed["spec"]["nodeName"] = json!("node-1");
+        placed["status"] = json!({"phase": "Running"});
+        let placed = [placed];
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        wait_step(
+            Some(&job),
+            &pending,
+            &mut clock,
+            at(0),
+            Duration::ZERO,
+            hour,
+        );
+        wait_step(
+            Some(&job),
+            &pending,
+            &mut clock,
+            at(100),
+            Duration::from_secs(100),
+            hour,
+        );
+        assert_eq!(
+            wait_step(
+                Some(&job),
+                &placed,
+                &mut clock,
+                at(110),
+                Duration::from_secs(110),
+                hour
+            ),
+            WaitStep::Wait(JobPod::Running, None)
+        );
+        // Long past the grace since the first sighting: nothing gives up on
+        // a runner that is running.
+        assert_eq!(
+            wait_step(
+                Some(&job),
+                &placed,
+                &mut clock,
+                at(900),
+                Duration::from_secs(900),
+                hour
+            ),
+            WaitStep::Wait(JobPod::Running, None)
+        );
+    }
+
+    #[test]
+    fn the_jobs_verdict_comes_before_its_pods_and_the_reason_before_the_timeout() {
+        let t0 = std::time::Instant::now();
+        let s = Duration::from_secs;
+        let pods = [pending_pod("job-1", "pod-1")];
+
+        // Gone.
+        let mut clock = UnschedulableClock::default();
+        assert_eq!(
+            wait_step(None, &pods, &mut clock, t0, s(0), s(3600)),
+            WaitStep::Vanished
+        );
+
+        // Finished: whatever a pod still says, the Job's condition wins.
+        let mut done = unfinished_job("j", "job-1", None);
+        done["status"]["conditions"] = json!([{"type": "Complete", "status": "True"}]);
+        assert_eq!(
+            wait_step(Some(&done), &pods, &mut clock, t0, s(0), s(3600)),
+            WaitStep::Succeeded
+        );
+        let mut failed = unfinished_job("j", "job-1", None);
+        failed["status"]["conditions"] =
+            json!([{"type": "Failed", "status": "True", "reason": "DeadlineExceeded"}]);
+        assert_eq!(
+            wait_step(Some(&failed), &pods, &mut clock, t0, s(0), s(3600)),
+            WaitStep::Failed("DeadlineExceeded".to_string())
+        );
+
+        // The grace and the timeout end on the same look: the known reason
+        // is what is reported, not "no longer waiting".
+        let job = unfinished_job("j", "job-1", None);
+        let mut clock = UnschedulableClock::default();
+        wait_step(Some(&job), &pods, &mut clock, t0, s(0), s(120));
+        assert!(matches!(
+            wait_step(Some(&job), &pods, &mut clock, t0 + s(120), s(120), s(120)),
+            WaitStep::Unschedulable { .. }
+        ));
+
+        // A timeout shorter than the grace ends the wait first, and says the
+        // pod never started rather than that it is running.
+        let mut clock = UnschedulableClock::default();
+        wait_step(Some(&job), &pods, &mut clock, t0, s(0), s(60));
+        let step = wait_step(Some(&job), &pods, &mut clock, t0 + s(60), s(60), s(60));
+        let WaitStep::TimedOut(pod) = step else {
+            panic!("expected the timeout, got {step:?}");
+        };
+        let note = job_pod::timeout_note(&pod, 1, PLATFORMSTACK_NAMESPACE, "j");
+        assert!(note.contains("could not be scheduled in 1m"), "{note}");
+    }
+
+    #[test]
+    fn preemption_never_runs_the_unschedulable_clock() {
+        // The scheduler is evicting lower-priority pods to make room: the pod
+        // will be placed. Only the caller's timeout ends that wait.
+        let job = unfinished_job("j", "job-1", None);
+        let mut pod = pending_pod("job-1", "pod-1");
+        pod["status"]["nominatedNodeName"] = json!("node-1");
+        let pods = [pod];
+        let t0 = std::time::Instant::now();
+        let s = Duration::from_secs;
+        let mut clock = UnschedulableClock::default();
+        for at in [0, 60, 120, 600, 1800] {
+            assert!(matches!(
+                wait_step(Some(&job), &pods, &mut clock, t0 + s(at), s(at), s(3600)),
+                WaitStep::Wait(JobPod::Preempting { .. }, None)
+            ));
+        }
+        assert!(matches!(
+            wait_step(
+                Some(&job),
+                &pods,
+                &mut clock,
+                t0 + s(3600),
+                s(3600),
+                s(3600)
+            ),
+            WaitStep::TimedOut(JobPod::Preempting { .. })
+        ));
     }
 }
