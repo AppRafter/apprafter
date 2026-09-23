@@ -53,9 +53,24 @@
 //! * a pod whose apply was never confirmed is read again, and judged the same
 //!   way against the uid from before the apply.
 //!
-//! From the moment the signal arrives the command's own thread deletes
-//! nothing (`KubectlExec::delete_pod_best_effort` returns at once): the
-//! deletes above, with their preconditions, are the only ones made.
+//! # The command's own thread, after the signal
+//!
+//! The signal does not stop the command's own thread. Ctrl-C reaches the
+//! whole foreground group, so the kubectl or restic the thread waits on
+//! usually dies with it; a SIGTERM sent to this process alone (`timeout`,
+//! systemd, a cancelled CI job) does not, and the thread carries on for as
+//! long as the stop waits. So from the moment the signal arrives it starts
+//! nothing ([`refuse_if_interrupted`]): `KubectlExec`, the kubectl wrappers
+//! of `k8s_helpers`, the restic runs of `backup create` and `restore`, and
+//! each step of a restore refuse before they spawn, and what was under way
+//! when the signal came is the last thing it does. Nor does it delete
+//! (`KubectlExec::delete_pod_best_effort` returns at once): the deletes
+//! above, with their preconditions, are the only ones made.
+//!
+//! `restore --reprovision` installs the handler only once its cluster
+//! exists. The provisioning before that runs in-process — Hetzner API calls,
+//! helm, kubectl — where no refusal reaches every call, and there is no
+//! helper pod to delete yet; a signal there ends the process at once.
 //!
 //! The in-cluster runner has its own, different stop (`apprafter-backup`'s
 //! `stop` module): it is PID 1 of a Job's pod, is stopped by SIGTERM at its
@@ -104,12 +119,77 @@ static NOTE: Mutex<Option<&'static str>> = Mutex::new(None);
 /// Whether this process has received SIGINT or SIGTERM (with the handler
 /// installed).
 pub(crate) fn interrupted() -> bool {
-    INTERRUPTED.load(Ordering::SeqCst)
+    INTERRUPTED.load(Ordering::SeqCst) || test_seam::this_thread_interrupted()
 }
 
 /// The error a helper operation refused after the interrupt returns.
 pub(crate) fn interrupted_error() -> CliError {
     CliError::Other("interrupted: the helper pods this command created are being deleted".into())
+}
+
+/// Refuse to start anything once the process has been interrupted: every
+/// `kubectl` and `restic` the command's own thread would run checks this
+/// first (see the module docs).
+pub(crate) fn refuse_if_interrupted() -> Result<()> {
+    if interrupted() {
+        return Err(interrupted_error());
+    }
+    Ok(())
+}
+
+/// The flag is process-wide, and the tests of one binary share a process: a
+/// test that set it would stop every test running beside it. So a test marks
+/// only its own thread interrupted ([`test_seam::interrupt_this_thread`]).
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use std::cell::Cell;
+
+    thread_local! {
+        static INTERRUPTED_HERE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn this_thread_interrupted() -> bool {
+        INTERRUPTED_HERE.with(Cell::get)
+    }
+
+    /// This thread reads as interrupted until the guard drops.
+    #[must_use = "the thread reads as interrupted only while this is held"]
+    pub(crate) struct Interrupted(());
+
+    impl Drop for Interrupted {
+        fn drop(&mut self) {
+            INTERRUPTED_HERE.with(|c| c.set(false));
+        }
+    }
+
+    pub(crate) fn interrupt_this_thread() -> Interrupted {
+        INTERRUPTED_HERE.with(|c| c.set(true));
+        Interrupted(())
+    }
+
+    /// A kubeconfig whose one cluster is `127.0.0.1:1`, where nothing
+    /// listens: a refusal test whose guard is broken spawns a kubectl that
+    /// reaches nothing, and fails on its answer.
+    pub(crate) fn unreachable_kubeconfig() -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            "apiVersion: v1\nkind: Config\nclusters:\n- name: none\n  cluster:\n    \
+             server: https://127.0.0.1:1\ncontexts:\n- name: none\n  context:\n    \
+             cluster: none\n    user: none\ncurrent-context: none\nusers:\n- name: none\n  \
+             user: {}\n",
+        )
+        .unwrap();
+        file
+    }
+}
+
+#[cfg(not(test))]
+mod test_seam {
+    #[inline(always)]
+    pub(super) fn this_thread_interrupted() -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------

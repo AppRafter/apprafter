@@ -850,6 +850,7 @@ pub(crate) fn read_platform_version(kubeconfig: &Path) -> Result<String> {
 /// the disaster-recovery case where a repository has to be listed with its
 /// cluster gone. A bounded wait keeps the attribution and keeps that fast.
 pub(crate) fn read_cluster_uid(kubeconfig: &Path) -> Result<String> {
+    helper_interrupt::refuse_if_interrupted()?;
     let out = Command::new("kubectl")
         .args([
             "get",
@@ -1958,7 +1959,7 @@ pub fn run_backup(
         staging_mode,
     )?;
 
-    let r = SubprocessRestic;
+    let r = RefusingAfterInterrupt(SubprocessRestic);
     let summary = backup_core::engine::run_backup_with_summary(&k, &r, &opts)?;
 
     print!(
@@ -1966,6 +1967,30 @@ pub fn run_backup(
         backup_summary_report(&cluster_id, &repo_str, &ns_set, &summary)
     );
     Ok(())
+}
+
+/// A [`ResticRunner`] that starts no restic once the command has been
+/// interrupted (`helper_interrupt`), as [`KubectlExec`] starts no kubectl: a
+/// SIGTERM sent to the CLI alone leaves the command's own thread running
+/// until the interrupt exits, and a `restic backup` begun in that time would
+/// write a snapshot after the user stopped the command.
+struct RefusingAfterInterrupt<R>(R);
+
+impl<R: ResticRunner> ResticRunner for RefusingAfterInterrupt<R> {
+    fn run(&self, argv: &[String], passphrase: &str) -> Result<()> {
+        helper_interrupt::refuse_if_interrupted()?;
+        self.0.run(argv, passphrase)
+    }
+
+    fn run_stdout(&self, argv: &[String], passphrase: &str) -> Result<String> {
+        helper_interrupt::refuse_if_interrupted()?;
+        self.0.run_stdout(argv, passphrase)
+    }
+
+    fn run_backup(&self, argv: &[String], passphrase: &str) -> Result<Option<String>> {
+        helper_interrupt::refuse_if_interrupted()?;
+        self.0.run_backup(argv, passphrase)
+    }
 }
 
 /// Assemble the [`BackupOpts`] the CLI local-pull path hands to the engine.
@@ -10871,6 +10896,45 @@ mod tests {
         assert!(k.get_json(&["get", "pods", "-n", "prod"]).is_err());
         k.delete_pod_best_effort("helper", "prod");
         assert!(!log.exists(), "{}", std::fs::read_to_string(&log).unwrap());
+    }
+
+    /// Nor does the command start restic, or read the cluster's identity,
+    /// once it has had its signal.
+    #[test]
+    fn once_interrupted_no_restic_and_no_identity_read_is_started() {
+        struct Counting(std::cell::Cell<usize>);
+        impl ResticRunner for Counting {
+            fn run(&self, _: &[String], _: &str) -> Result<()> {
+                self.0.set(self.0.get() + 1);
+                Ok(())
+            }
+            fn run_stdout(&self, _: &[String], _: &str) -> Result<String> {
+                self.0.set(self.0.get() + 1);
+                Ok(String::new())
+            }
+            fn run_backup(&self, _: &[String], _: &str) -> Result<Option<String>> {
+                self.0.set(self.0.get() + 1);
+                Ok(None)
+            }
+        }
+        let r = RefusingAfterInterrupt(Counting(std::cell::Cell::new(0)));
+        let argv = vec!["backup".to_string()];
+        r.run(&argv, "pw").unwrap();
+        r.run_stdout(&argv, "pw").unwrap();
+        r.run_backup(&argv, "pw").unwrap();
+        assert_eq!(r.0 .0.get(), 3, "before the signal every call goes through");
+
+        let kc = helper_interrupt::test_seam::unreachable_kubeconfig();
+        let _interrupted = helper_interrupt::test_seam::interrupt_this_thread();
+        for e in [
+            r.run(&argv, "pw").unwrap_err(),
+            r.run_stdout(&argv, "pw").unwrap_err(),
+            r.run_backup(&argv, "pw").unwrap_err(),
+            read_cluster_uid(kc.path()).unwrap_err(),
+        ] {
+            assert!(e.to_string().starts_with("interrupted"), "{e}");
+        }
+        assert_eq!(r.0 .0.get(), 3, "no restic after the signal");
     }
 
     /// WI-383, the CLI's side: a helper whose credential Secret is missing

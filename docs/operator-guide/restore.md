@@ -227,6 +227,10 @@ the applications stay down as above. The lines naming them are printed when
 the restore reaches them before it exits, which it is given a moment to do; a
 shorter line saying that applications it scaled down stay down is printed
 either way. A second Ctrl-C exits at once, without deleting the helper pod.
+Nothing new starts after the signal: a restore interrupted before it scaled
+an application down leaves that application running. With `--reprovision`,
+Ctrl-C while the new cluster is still being provisioned ends the command at
+once.
 
 **Re-running the same command is the remedy.** Its final step is the one that
 restores the replica counts and re-enables auto-sync, so a second run that

@@ -610,8 +610,9 @@ pub fn run_restore(
 ) -> Result<()> {
     // First, so it is dropped last: Ctrl-C deletes the helper pods this
     // restore created, and only those (`helper_interrupt`; see the note on
-    // signals below).
-    let _interruptible = crate::commands::helper_interrupt::install(Some(RESTORE_INTERRUPT_NOTE));
+    // signals below). Installed by the first step that works in the target
+    // cluster ([`installs_the_interrupt`]), not here.
+    let mut interruptible: Option<crate::commands::helper_interrupt::StopGuard> = None;
     reject_conflicting_modes(reprovision, data_only)?;
 
     // 0. External binaries, before the credential gate below (D11 / 2.22a —
@@ -705,13 +706,29 @@ pub fn run_restore(
     //   scale-to-zero it describes, so the recorded count survives a signal,
     //   a severed connection and a kill -9 alike, and the re-run recovers
     //   with or without anything having been printed.
+    // * Nor does THIS thread do anything more after the signal. The signal
+    //   does not stop it: a SIGTERM sent to this process alone (`timeout`,
+    //   systemd, a cancelled CI job) leaves the kubectl or restic it is
+    //   waiting on running, and the thread would carry on with the next step
+    //   — scale the applications down after the user stopped the restore —
+    //   for as long as the interrupt gives it before the exit. So no step
+    //   starts after the signal ([`run_restore_steps`]), and within a step
+    //   every kubectl and restic it would start refuses
+    //   (`helper_interrupt::refuse_if_interrupted`).
     //
     // This hint is the error path's. After an interrupt it is printed only if
     // this thread gets here before the interrupt exits (it waits a moment for
     // that: `helper_interrupt::UNWIND_BOUND`); the interrupt prints its own
     // line about what a restore leaves down (`RESTORE_INTERRUPT_NOTE`).
-    let outcome = (|| -> Result<()> {
-        for step in &steps {
+    let outcome = run_restore_steps(
+        &steps,
+        &crate::commands::helper_interrupt::interrupted,
+        &mut |step| {
+            if installs_the_interrupt(step) && interruptible.is_none() {
+                interruptible = Some(crate::commands::helper_interrupt::install(Some(
+                    RESTORE_INTERRUPT_NOTE,
+                )));
+            }
             // The Reprovision step provisions + bootstraps a fresh cluster in the
             // target (topology + cloud token come from the target's local config,
             // exactly as `apprafter up` — R2), then resolves the now-cached
@@ -723,7 +740,7 @@ pub fn run_restore(
                 );
                 crate::commands::bootstrap_all::run(target, false, server_type)?;
                 kc = Some(ensure_kubeconfig_tempfile_for_target(target)?);
-                continue;
+                return Ok(());
             }
             let kc = kc.as_ref().ok_or_else(|| {
                 CliError::Other("internal: kubeconfig unresolved before a restore step".into())
@@ -824,9 +841,9 @@ pub fn run_restore(
                     resume_workloads(&app_replicas, &suspended_argo, kc.path())?;
                 }
             }
-        }
-        Ok(())
-    })();
+            Ok(())
+        },
+    );
 
     // A restore that stopped partway leaves the cluster mid-restore, and until
     // now said nothing about it: the operator saw one error and a dead
@@ -851,6 +868,38 @@ pub fn run_restore(
         println!("{line}");
     }
     Ok(())
+}
+
+/// Run the restore's `steps` in order through `run`, and start none once
+/// `interrupted` says the process has had its SIGINT or SIGTERM: the step
+/// under way when the signal came is the last one this thread runs, and each
+/// kubectl and restic within it refuses as well
+/// (`helper_interrupt::refuse_if_interrupted`). `interrupted` is
+/// [`crate::commands::helper_interrupt::interrupted`] outside the tests.
+fn run_restore_steps(
+    steps: &[RestoreStep],
+    interrupted: &dyn Fn() -> bool,
+    run: &mut dyn FnMut(&RestoreStep) -> Result<()>,
+) -> Result<()> {
+    for step in steps {
+        if interrupted() {
+            return Err(crate::commands::helper_interrupt::interrupted_error());
+        }
+        run(step)?;
+    }
+    Ok(())
+}
+
+/// Whether `step` is one the restore runs with its interrupt installed
+/// (`helper_interrupt::install`): every step but `Reprovision`.
+///
+/// `Reprovision` provisions and bootstraps the cluster in-process — Hetzner
+/// API calls, helm, kubectl — and no helper pod can exist before it ends, so
+/// the interrupt would have nothing to delete there while its stop let the
+/// provisioning carry on for as long as it waited. Without it, a signal
+/// there ends the process at once, as it always has.
+fn installs_the_interrupt(step: &RestoreStep) -> bool {
+    !matches!(step, RestoreStep::Reprovision)
 }
 
 // ---------------------------------------------------------------------------
@@ -2643,6 +2692,7 @@ fn poll_pg_reachable(
 ) -> Result<()> {
     let mut last = String::new();
     for attempt in 0..attempts {
+        crate::commands::helper_interrupt::refuse_if_interrupted()?;
         match probe() {
             Ok(()) => return Ok(()),
             Err(e) => last = e,
@@ -3110,11 +3160,63 @@ fn suspend_running_workloads(
     suspended_argo: &mut Vec<(String, String)>,
     recorded: &mut Vec<((String, String), i64)>,
 ) -> Result<()> {
-    let claim_namespaces = claim_namespaces(manifest);
+    suspend_workloads(
+        &claim_namespaces(manifest),
+        &KubectlSuspend(kubeconfig),
+        suspended_argo,
+        recorded,
+    )
+}
 
+/// The cluster calls [`suspend_running_workloads`] makes, behind a seam so
+/// what it records and writes, and when it stops, is tested without a
+/// cluster.
+trait SuspendCluster {
+    /// The AppRafter Applications in `ns`.
+    fn applications(&self, ns: &str) -> Result<Vec<Value>>;
+    /// The user Argo Applications that deploy `name` in `ns`
+    /// ([`argo_apps_for`]).
+    fn argo_apps_for(&self, name: &str, ns: &str) -> Result<Vec<(String, String)>>;
+    /// One merge-patch.
+    fn patch(&self, patch: &MergePatch) -> Result<()>;
+}
+
+/// The production [`SuspendCluster`]: kubectl, through the kubeconfig at
+/// this path.
+struct KubectlSuspend<'a>(&'a Path);
+
+impl SuspendCluster for KubectlSuspend<'_> {
+    fn applications(&self, ns: &str) -> Result<Vec<Value>> {
+        list_items("applications.apprafter.io", Some(ns), self.0)
+    }
+
+    fn argo_apps_for(&self, name: &str, ns: &str) -> Result<Vec<(String, String)>> {
+        argo_apps_for(name, ns, self.0)
+    }
+
+    fn patch(&self, patch: &MergePatch) -> Result<()> {
+        kubectl_merge_patch(
+            patch.resource,
+            &patch.name,
+            Some(&patch.namespace),
+            None,
+            &patch.body,
+            self.0,
+        )
+    }
+}
+
+/// [`suspend_running_workloads`] over the claims' `namespaces`, through
+/// `cluster`.
+fn suspend_workloads(
+    namespaces: &[String],
+    cluster: &dyn SuspendCluster,
+    suspended_argo: &mut Vec<(String, String)>,
+    recorded: &mut Vec<((String, String), i64)>,
+) -> Result<()> {
     let before = recorded.len();
-    for ns in &claim_namespaces {
-        let apps = list_items("applications.apprafter.io", Some(ns), kubeconfig)?;
+    for ns in namespaces {
+        let apps = cluster.applications(ns)?;
         for decision in apps_to_suspend(&apps, ns, recorded) {
             let SuspendDecision {
                 name,
@@ -3140,7 +3242,13 @@ fn suspend_running_workloads(
             // with ONE already-located Application; copying the loop variable
             // onto every decision would give the same fact two sources of
             // truth that a later edit could let drift.
-            let argo = argo_apps_for(&name, ns, kubeconfig)?;
+            let argo = cluster.argo_apps_for(&name, ns)?;
+
+            // Not one more application once the process has had its signal
+            // (WI-383), and checked HERE, after the last read and before the
+            // records: the way out names every recorded app as down, and one
+            // this step never wrote to must not be among them.
+            crate::commands::helper_interrupt::refuse_if_interrupted()?;
 
             // Both records go in BEFORE the writes they describe, for the same
             // reason the annotation does: a patch that fails halfway through
@@ -3149,14 +3257,7 @@ fn suspend_running_workloads(
             record_suspended_argo(suspended_argo, argo.iter().cloned());
 
             for patch in suspend_patches(ns, &name, &argo, replicas) {
-                kubectl_merge_patch(
-                    patch.resource,
-                    &patch.name,
-                    Some(&patch.namespace),
-                    None,
-                    &patch.body,
-                    kubeconfig,
-                )?;
+                cluster.patch(&patch)?;
             }
         }
     }
@@ -3468,6 +3569,7 @@ pub(crate) fn is_remote_restic_repo(repo: &str) -> bool {
 /// `creds["RESTIC_PASSWORD"]` are the same value at the call sites.
 /// `restic …` capturing stdout — the listing side of [`run_restic_restore`].
 fn restic_stdout(argv: &[String], pass: &str, creds: &BTreeMap<String, String>) -> Result<String> {
+    crate::commands::helper_interrupt::refuse_if_interrupted()?;
     let mut cmd = std::process::Command::new("restic");
     cmd.args(argv).env("RESTIC_PASSWORD", pass);
     crate::commands::backup::apply_creds_to_command(&mut cmd, creds);
@@ -3562,6 +3664,7 @@ fn merge_data_tree(from: &Path, into: &Path) -> Result<()> {
 }
 
 fn run_restic_restore(argv: &[String], pass: &str, creds: &BTreeMap<String, String>) -> Result<()> {
+    crate::commands::helper_interrupt::refuse_if_interrupted()?;
     let mut cmd = std::process::Command::new("restic");
     cmd.args(argv).env("RESTIC_PASSWORD", pass);
     crate::commands::backup::apply_creds_to_command(&mut cmd, creds);
@@ -7287,5 +7390,187 @@ mod tests {
             msg.contains("snapshots"),
             "the failing subcommand must be named: {msg}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // WI-383: after the signal, the restore's own thread starts nothing
+    // ------------------------------------------------------------------
+
+    /// The step under way when the signal came is the last one the restore
+    /// runs. Here the signal lands while restic fetches the snapshot — a
+    /// SIGTERM sent to the CLI alone leaves restic to finish — and the
+    /// restore must not go on to scale the applications down.
+    #[test]
+    fn no_restore_step_starts_after_the_signal() {
+        let steps = restore_steps(RestoreMode::IntoRunning, true);
+        assert_eq!(
+            steps[..2],
+            [RestoreStep::RestoreArtifact, RestoreStep::SuspendWorkloads]
+        );
+        let signalled = std::cell::Cell::new(false);
+        let mut ran = Vec::new();
+        let e = run_restore_steps(&steps, &|| signalled.get(), &mut |step| {
+            ran.push(*step);
+            if *step == RestoreStep::RestoreArtifact {
+                signalled.set(true);
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(e.to_string().starts_with("interrupted"), "{e}");
+        assert_eq!(ran, vec![RestoreStep::RestoreArtifact]);
+
+        // Without a signal every step runs, in order, and the first failure
+        // ends the run.
+        let mut ran = Vec::new();
+        run_restore_steps(&steps, &|| false, &mut |step| {
+            ran.push(*step);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(ran, steps);
+        let mut ran = Vec::new();
+        run_restore_steps(&steps, &|| false, &mut |step| {
+            ran.push(*step);
+            Err(CliError::Other("boom".into()))
+        })
+        .unwrap_err();
+        assert_eq!(ran, vec![RestoreStep::RestoreArtifact]);
+    }
+
+    /// `--reprovision` provisions with no interrupt installed — a signal
+    /// there ends the process at once, as before WI-383 — and every step
+    /// that works in the cluster it made runs with one.
+    #[test]
+    fn only_the_reprovision_step_runs_without_the_interrupt() {
+        let steps = restore_steps(RestoreMode::Reprovision, false);
+        assert_eq!(steps[0], RestoreStep::Reprovision);
+        assert!(!installs_the_interrupt(&steps[0]));
+        for step in &steps[1..] {
+            assert!(installs_the_interrupt(step), "{step:?}");
+        }
+        for step in restore_steps(RestoreMode::IntoRunning, true) {
+            assert!(installs_the_interrupt(&step), "{step:?}");
+        }
+    }
+
+    /// A cluster for [`suspend_workloads`]: one Application per namespace
+    /// (`web` in each, 3 replicas), one Argo registration each, and every
+    /// call logged. `signal_at` names the Application whose Argo lookup the
+    /// signal arrives during.
+    struct FakeSuspend {
+        log: RefCell<Vec<String>>,
+        signal_at: Option<&'static str>,
+        signalled: RefCell<Option<crate::commands::helper_interrupt::test_seam::Interrupted>>,
+    }
+
+    impl SuspendCluster for FakeSuspend {
+        fn applications(&self, ns: &str) -> Result<Vec<Value>> {
+            self.log.borrow_mut().push(format!("list {ns}"));
+            Ok(vec![json!({
+                "metadata": {"name": "web", "namespace": ns},
+                "spec": {"base": {"replicas": 3}}
+            })])
+        }
+
+        fn argo_apps_for(&self, name: &str, ns: &str) -> Result<Vec<(String, String)>> {
+            self.log.borrow_mut().push(format!("argo {ns}/{name}"));
+            if self.signal_at == Some(ns) {
+                *self.signalled.borrow_mut() =
+                    Some(crate::commands::helper_interrupt::test_seam::interrupt_this_thread());
+            }
+            Ok(vec![("argocd".into(), format!("{ns}-{name}"))])
+        }
+
+        fn patch(&self, patch: &MergePatch) -> Result<()> {
+            self.log
+                .borrow_mut()
+                .push(format!("patch {}/{}", patch.namespace, patch.name));
+            Ok(())
+        }
+    }
+
+    fn fake_suspend(signal_at: Option<&'static str>) -> FakeSuspend {
+        FakeSuspend {
+            log: RefCell::new(Vec::new()),
+            signal_at,
+            signalled: RefCell::new(None),
+        }
+    }
+
+    /// The signal comes while the step looks up the second application: the
+    /// first stays suspended and recorded, the second is neither patched nor
+    /// recorded — the way out must not name it as down — and the step ends.
+    #[test]
+    fn suspend_stops_at_the_signal_and_records_only_what_it_wrote() {
+        let namespaces = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let cluster = fake_suspend(Some("b"));
+        let (mut argo, mut recorded) = (Vec::new(), Vec::new());
+        let e = suspend_workloads(&namespaces, &cluster, &mut argo, &mut recorded).unwrap_err();
+        assert!(e.to_string().starts_with("interrupted"), "{e}");
+        assert_eq!(
+            *cluster.log.borrow(),
+            vec![
+                "list a",
+                "argo a/web",
+                "patch argocd/a-web",
+                "patch a/web",
+                "list b",
+                "argo b/web"
+            ]
+        );
+        assert_eq!(recorded, vec![(("a".to_string(), "web".to_string()), 3)]);
+        assert_eq!(argo, vec![("argocd".to_string(), "a-web".to_string())]);
+        // Its guard un-signals this thread.
+        drop(cluster);
+
+        // No signal: every namespace's application, each recorded.
+        let cluster = fake_suspend(None);
+        let (mut argo, mut recorded) = (Vec::new(), Vec::new());
+        suspend_workloads(&namespaces, &cluster, &mut argo, &mut recorded).unwrap();
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(argo.len(), 3);
+    }
+
+    /// Through kubectl, the suspend and the resume refuse outright once the
+    /// signal has come: their first kubectl call is refused, so nothing is
+    /// listed, written or recorded.
+    #[test]
+    fn once_interrupted_suspend_and_resume_write_nothing() {
+        let kc = crate::commands::helper_interrupt::test_seam::unreachable_kubeconfig();
+        let _interrupted = crate::commands::helper_interrupt::test_seam::interrupt_this_thread();
+        let manifest = manifest_of(&["demo"], vec![resource("ResourceClaim", "demo", "db")]);
+        let (mut argo, mut recorded) = (Vec::new(), Vec::new());
+        let e =
+            suspend_running_workloads(&manifest, kc.path(), &mut argo, &mut recorded).unwrap_err();
+        assert!(e.to_string().starts_with("interrupted"), "{e}");
+        assert!(recorded.is_empty() && argo.is_empty());
+
+        let apps = vec![(("demo".to_string(), "web".to_string()), 3)];
+        let argo = vec![("argocd".to_string(), "demo-web".to_string())];
+        let e = resume_workloads(&apps, &argo, kc.path()).unwrap_err();
+        assert!(e.to_string().starts_with("interrupted"), "{e}");
+    }
+
+    /// Nor does it start restic, or one more reachability probe of a
+    /// database it is about to load.
+    #[test]
+    fn once_interrupted_the_restore_starts_no_restic_and_no_probe() {
+        let _interrupted = crate::commands::helper_interrupt::test_seam::interrupt_this_thread();
+        let argv = vec!["snapshots".to_string(), "--json".to_string()];
+        let creds = BTreeMap::new();
+        let e = restic_stdout(&argv, "pw", &creds).unwrap_err();
+        assert!(e.to_string().starts_with("interrupted"), "{e}");
+        let e = run_restic_restore(&argv, "pw", &creds).unwrap_err();
+        assert!(e.to_string().starts_with("interrupted"), "{e}");
+
+        let mut probed = 0;
+        let e = poll_pg_reachable(3, std::time::Duration::ZERO, &pg_conn(), &mut || {
+            probed += 1;
+            Err("not yet".into())
+        })
+        .unwrap_err();
+        assert!(e.to_string().starts_with("interrupted"), "{e}");
+        assert_eq!(probed, 0);
     }
 }

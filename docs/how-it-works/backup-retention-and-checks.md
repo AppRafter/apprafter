@@ -322,7 +322,15 @@ before its apply is sent, with the uid of any pod of that name already there,
 and the interrupt deletes only a pod its own apply created, with that uid as
 the delete's precondition: a pod of the same name that another run is using is
 left alone. It undoes nothing else, and it takes at most fifteen seconds;
-a second Ctrl-C exits at once, without it. A helper pod that a command or run
+a second Ctrl-C exits at once, without it. From the signal on, the command
+starts nothing new either: no `kubectl`, no `restic`, and no further restore
+step. A SIGTERM sent to the command's process alone — as `timeout`, systemd
+or a cancelled CI job send it — does not stop the `kubectl` or `restic` it is
+waiting on, so that one runs to its end, but nothing after it does: a restore
+stopped before it scaled the applications down does not scale them down
+afterwards. `apprafter restore --reprovision` handles the signal this way
+only once its new cluster exists; while it is still provisioning, Ctrl-C
+ends it at once. A helper pod that a command or run
 was killed before it could delete — `kill -9`, a lost node, that second Ctrl-C
 — keeps running until its keep-alive ends and then stays behind as
 `Completed` until something deletes it. The next command or run that needs a
