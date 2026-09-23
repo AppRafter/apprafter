@@ -48,6 +48,7 @@ on:
       - 'scripts/check-platform-stack-version.sh'
       - 'scripts/check-gateway-render.sh'
       - 'scripts/check-component-enablement.sh'
+      - 'scripts/check-component-claim-templates.sh'
       - 'scripts/check-backup-render.sh'
       - '.github/workflows/platform-stack-check.yml'
       - '.github/workflows/platform-stack-publish.yml'
@@ -62,6 +63,7 @@ on:
       - 'scripts/check-platform-stack-version.sh'
       - 'scripts/check-gateway-render.sh'
       - 'scripts/check-component-enablement.sh'
+      - 'scripts/check-component-claim-templates.sh'
       - 'scripts/check-backup-render.sh'
       - '.github/workflows/platform-stack-check.yml'
       - '.github/workflows/platform-stack-publish.yml'
@@ -190,6 +192,25 @@ jobs:
         # `enabled: false`. No other gate renders the chart with the
         # override the running system writes, so none of them saw it.
         run: bash scripts/check-component-enablement.sh
+
+      - name: Install yq
+        # The claim-template step below reads rendered charts with yq; the
+        # runner has no nix for the script's own fallback.
+        run: |
+          sudo curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 \
+            -o /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/download/v4.53.6/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Component volumeClaimTemplate shape (Argo CD can reach Synced)
+        # A StatefulSet volumeClaimTemplate rendered without the four fields
+        # the apiserver adds keeps its Application OutOfSync forever under
+        # server-side apply. The nats chart rendered none of them, so every
+        # jetstream cluster re-synced nats every ~3 minutes. This renders each
+        # component's own chart, which no other step here does, so it needs
+        # the network.
+        run: bash scripts/check-component-claim-templates.sh
 
       - name: Backup CronJob deadline assertions (a stuck run cannot block the schedule)
         # Both backup CronJobs are concurrencyPolicy: Forbid, so one run that

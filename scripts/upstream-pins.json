@@ -328,8 +328,8 @@
       "upstream": { "kind": "github-release", "repo": "mikefarah/yq" },
       "compare": "numeric",
       "gate": null,
-      "gateGap": "Only used inside two nightly e2e walks that need a cluster.",
-      "note": "e2e-pg-nightly.yml:106 and e2e-env-and-secrets-nightly.yml:107."
+      "gateGap": "Used inside two nightly e2e walks that need a cluster, and by the claim-template step of platform-stack-check.yml.",
+      "note": "e2e-pg-nightly.yml, e2e-env-and-secrets-nightly.yml and platform-stack-check.yml (scripts/check-component-claim-templates.sh)."
     },
     {
       "id": "tool-just",

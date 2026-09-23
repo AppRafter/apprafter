@@ -158,6 +158,33 @@ _components: "nats": #Component & {
 					// overhead, not merely equal it.
 					size:             "5Gi"
 					storageClassName: "local-path"
+					// Renders the volumeClaimTemplate exactly as the
+					// apiserver stores it. The chart leaves out four
+					// fields the apiserver adds: apiVersion, kind,
+					// spec.volumeMode and status.phase. Argo CD 2.13's
+					// server-side-apply diff replaces the whole template
+					// list (it is atomic) with the rendered one. It
+					// restores the two defaulted fields but not apiVersion
+					// or kind, and it adds `metadata.creationTimestamp:
+					// null`. So the `nats` Application sat OutOfSync on
+					// every jetstream cluster, and self-heal re-synced it
+					// every ~3 minutes, forever. When the rendered
+					// template equals the stored one, the diff predicts no
+					// change at all.
+					//
+					// This ignores nothing. A real template change, such
+					// as `size`, still shows as OutOfSync. An
+					// ignoreDifferences fix would have to hide all four
+					// fields, volumeMode included; hiding only apiVersion
+					// and kind leaves the creationTimestamp diff (measured
+					// on kind, Kubernetes 1.36.4). `merge` is the chart's
+					// own hook for this document.
+					merge: {
+						apiVersion: "v1"
+						kind:       "PersistentVolumeClaim"
+						spec: volumeMode: "Filesystem"
+						status: phase:    "Pending"
+					}
 				}
 				// Server-wide memory-store ceiling — REQUIRED, not
 				// optional, the moment any account requests a nonzero
@@ -250,9 +277,21 @@ _components: "nats": #Component & {
 		}
 	}
 
+	// The chart also ships a Deployment, `nats-box`, and its status
+	// carries `terminatingReplicas` too (measured on Kubernetes 1.36.4),
+	// a field Argo CD 2.13.1's schema lacks. A comparison that diffs it
+	// fails with `field not declared in schema` and the Application
+	// shows sync Unknown. The self-heal loop the volumeClaimTemplate
+	// diff above caused hid this, because each re-sync refreshed the
+	// comparison before it expired. With only that diff fixed, the
+	// Application went Unknown at the next 3-minute comparison refresh.
 	ignoreDifferences: [{
 		group: "apps"
 		kind:  "StatefulSet"
+		jsonPointers: ["/status/terminatingReplicas"]
+	}, {
+		group: "apps"
+		kind:  "Deployment"
 		jsonPointers: ["/status/terminatingReplicas"]
 	}]
 }

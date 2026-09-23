@@ -39,6 +39,8 @@ lint:
     ./scripts/check-cue-cmp-mirror.sh
     ./scripts/check-argocd-health-lua.sh
     ./scripts/check-component-enablement.sh
+    # Pulls each component's upstream chart, so it needs the network (~45s).
+    ./scripts/check-component-claim-templates.sh
     ./scripts/check-backup-render.sh
     ./scripts/check-version-coherence.sh
     ./scripts/check-plan-checkboxes.sh
