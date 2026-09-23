@@ -2250,7 +2250,9 @@ fn restore_claim_streams(
     streams: &[StreamArtifact],
     keep_alive: std::time::Duration,
 ) -> Result<()> {
-    let pod_name = format!("rs-js-{}", backup_core::extract::pod_name_segment(claim));
+    // The server's namespace is shared by every application namespace, so
+    // the name carries the claim's (and fits the 63-character limit).
+    let pod_name = backup_core::extract::jetstream_helper_pod_name("rs-js", ns, claim, None);
     let _guard = PodCleanupGuard {
         name: pod_name.clone(),
         namespace: server.namespace.clone(),
@@ -6428,9 +6430,42 @@ mod tests {
         (dir, artifacts)
     }
 
+    /// The replay helper of claim `worker-js` in namespace `ns`.
+    fn rs_js(ns: &str) -> String {
+        backup_core::extract::jetstream_helper_pod_name("rs-js", ns, "worker-js", None)
+    }
+
+    /// The replay helper runs in the NATS server's namespace, which every
+    /// application namespace shares: claims of one name in two namespaces get
+    /// two pods. They were both `rs-js-<claim>`, and two restores at once
+    /// deleted each other's.
+    #[test]
+    fn a_jetstream_helper_is_named_by_the_claims_namespace_too() {
+        let (_dir, streams) = stream_artifacts(&["orders"]);
+        let mut names = Vec::new();
+        for ns in ["shop", "blog"] {
+            let k = FakeKube::default();
+            restore_claim_streams(
+                &k,
+                ns,
+                "worker-js",
+                &nats_server(),
+                &streams,
+                backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
+            )
+            .unwrap();
+            let applied = k.applied.borrow();
+            assert_eq!(applied[0]["metadata"]["namespace"], "nats");
+            names.push(applied[0]["metadata"]["name"].as_str().unwrap().to_string());
+        }
+        assert!(names[0].starts_with("rs-js-shop-worker-js-"), "{names:?}");
+        assert!(names[1].starts_with("rs-js-blog-worker-js-"), "{names:?}");
+        assert_ne!(names[0], names[1]);
+    }
+
     /// A helper pod that never becomes Ready is deleted too. It used to be
     /// left behind — deleted by hand only after a failed stream and at the
-    /// end — and a leftover `rs-js-<claim>` failed every later jetstream
+    /// end — and a leftover replay helper failed every later jetstream
     /// restore of the claim until someone deleted it.
     #[test]
     fn a_jetstream_helper_that_never_becomes_ready_is_deleted() {
@@ -6451,7 +6486,7 @@ mod tests {
         );
         assert_eq!(
             *k.deleted.borrow(),
-            vec![("rs-js-worker-js".to_string(), "nats".to_string())]
+            vec![(rs_js("atm"), "nats".to_string())]
         );
     }
 
@@ -6472,17 +6507,15 @@ mod tests {
         .unwrap();
         let applied = k.applied.borrow();
         assert_eq!(applied.len(), 1);
-        assert_eq!(applied[0]["metadata"]["name"], "rs-js-worker-js");
+        assert_eq!(applied[0]["metadata"]["name"], rs_js("atm"));
         assert_eq!(applied[0]["metadata"]["namespace"], "nats");
         let execs = k.execs.borrow();
         assert_eq!(execs.len(), 2);
-        assert!(execs
-            .iter()
-            .all(|e| e.0 == "rs-js-worker-js" && e.1 == "nats"));
+        assert!(execs.iter().all(|e| e.0 == rs_js("atm") && e.1 == "nats"));
         assert_eq!(execs[1].3, streams[1].path);
         assert_eq!(
             *k.deleted.borrow(),
-            vec![("rs-js-worker-js".to_string(), "nats".to_string())]
+            vec![(rs_js("atm"), "nats".to_string())]
         );
 
         let failing = FakeKube::failing_exec();
@@ -6502,7 +6535,7 @@ mod tests {
         );
         assert_eq!(
             *failing.deleted.borrow(),
-            vec![("rs-js-worker-js".to_string(), "nats".to_string())]
+            vec![(rs_js("atm"), "nats".to_string())]
         );
     }
 

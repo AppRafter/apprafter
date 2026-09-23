@@ -360,6 +360,58 @@ pub fn pod_name_segment(s: &str) -> String {
         .collect()
 }
 
+/// The name of a JetStream helper pod: `bk-js` for a backup's dump of one
+/// stream (`stream` given), `rs-js` for a restore's replay of one claim's
+/// streams.
+///
+/// Every other helper pod runs in its claim's own namespace, so the claim's
+/// name alone keeps it apart. A JetStream helper runs in the namespace NATS
+/// runs in, which every application namespace shares, so its name carries the
+/// claim's namespace too. Without it, `shop/js` and `blog/js` named the same
+/// pod, and two runs at once — two restores, or a CLI backup beside the
+/// scheduled one — collided on it. The two pods differ in their credentials
+/// (`nats-mgr-<namespace>`), and a pod of another spec is replaced
+/// ([`crate::helper_pod`]), so the later run deleted the earlier one's pod
+/// under it; before replacement, it failed its own apply instead.
+///
+/// The readable part is `<prefix>-<namespace>-<claim>[-<stream>]`, each part
+/// through [`pod_name_segment`] and cut to fit the 63-character limit, and a
+/// hash of the exact namespace, claim and stream follows it. The hash is what
+/// keeps the name unique: folding and cutting can make two of them read alike
+/// (`a-b` + `c` and `a` + `b-c`; `orders_dlq` and `orders-dlq`; two long names
+/// with a common start). The same inputs give the same name on every run,
+/// which is how a run finds a leftover to replace. Pure.
+pub fn jetstream_helper_pod_name(
+    prefix: &str,
+    namespace: &str,
+    claim: &str,
+    stream: Option<&str>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in [namespace, claim, stream.unwrap_or_default()] {
+        // A separator no Kubernetes or NATS name contains.
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    let hash: String = hasher.finalize()[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let mut readable = format!(
+        "{prefix}-{}-{}",
+        pod_name_segment(namespace),
+        pod_name_segment(claim)
+    );
+    if let Some(stream) = stream {
+        readable.push('-');
+        readable.push_str(&pod_name_segment(stream));
+    }
+    // Room for `-<hash>` inside 63.
+    let readable = truncate_pod_name(&readable[..readable.len().min(63 - 1 - hash.len())]);
+    format!("{readable}-{hash}")
+}
+
 // ---------------------------------------------------------------------------
 // Impure extraction driver (walk-validated; not unit-tested)
 // ---------------------------------------------------------------------------
@@ -659,12 +711,9 @@ fn extract_jetstream(
     let password = k.get_secret_key(&mgr, &nats_ns, "password")?;
     let url = format!("nats://{host}:{port}");
 
-    // 3. Helper pod beside the server, guard armed before apply-wait.
-    let pod_name = truncate_pod_name(&format!(
-        "bk-js-{}-{}",
-        pod_name_segment(claim),
-        pod_name_segment(stream)
-    ));
+    // 3. Helper pod beside the server, guard armed before apply-wait. The
+    //    server's namespace is shared, so the name carries the claim's.
+    let pod_name = jetstream_helper_pod_name("bk-js", ns, claim, Some(stream));
     let _guard = HelperPodGuard {
         name: pod_name.clone(),
         namespace: &nats_ns,
@@ -1471,6 +1520,109 @@ mod tests {
             script.contains("'orders'"),
             "stream must be quoted: {script}"
         );
+    }
+
+    /// A pod name the apiserver takes: at most 63 characters of `[a-z0-9-]`,
+    /// starting and ending with a letter or digit.
+    fn is_dns_label(name: &str) -> bool {
+        name.len() <= 63
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && !name.starts_with('-')
+            && !name.ends_with('-')
+    }
+
+    /// The finding: the JetStream helpers run in the NATS server's namespace,
+    /// which every application namespace shares, and were named by the claim
+    /// alone — `shop/js` and `blog/js` collided on one pod.
+    #[test]
+    fn jetstream_helper_names_keep_claims_of_one_name_in_two_namespaces_apart() {
+        for stream in [Some("orders"), None] {
+            let shop = jetstream_helper_pod_name("bk-js", "shop", "js", stream);
+            let blog = jetstream_helper_pod_name("bk-js", "blog", "js", stream);
+            assert_ne!(shop, blog, "{stream:?}");
+            assert!(shop.starts_with("bk-js-shop-js"), "{shop}");
+        }
+        // The same inputs give the same name: a leftover is found by it.
+        assert_eq!(
+            jetstream_helper_pod_name("rs-js", "atm", "worker-js", None),
+            jetstream_helper_pod_name("rs-js", "atm", "worker-js", None)
+        );
+        assert_ne!(
+            jetstream_helper_pod_name("rs-js", "atm", "worker-js", None),
+            jetstream_helper_pod_name("bk-js", "atm", "worker-js", None)
+        );
+    }
+
+    /// Folding and cutting make names read alike; the hash keeps them apart,
+    /// and every result is a name the apiserver takes.
+    #[test]
+    fn jetstream_helper_names_stay_unique_and_valid_where_folding_or_cutting_meet() {
+        let long = "a".repeat(70);
+        let pairs = [
+            (("a-b", "c", Some("s")), ("a", "b-c", Some("s"))),
+            (
+                ("ns", "js", Some("orders_dlq")),
+                ("ns", "js", Some("orders-dlq")),
+            ),
+            (
+                ("ns", long.as_str(), Some("one")),
+                ("ns", long.as_str(), Some("two")),
+            ),
+            (("ns", "c", Some("x")), ("ns", "c-x", None)),
+        ];
+        for ((ns1, c1, s1), (ns2, c2, s2)) in pairs {
+            let one = jetstream_helper_pod_name("bk-js", ns1, c1, s1);
+            let two = jetstream_helper_pod_name("bk-js", ns2, c2, s2);
+            assert_ne!(one, two);
+            for name in [&one, &two] {
+                assert!(is_dns_label(name), "{name} ({} chars)", name.len());
+            }
+        }
+        // A long name is cut, never to a trailing `-` before the hash.
+        let cut = jetstream_helper_pod_name("bk-js", "ns", &format!("{}-b", "a".repeat(44)), None);
+        assert_eq!(cut.len(), 63 - 1, "{cut}");
+        assert!(!cut.contains("--"), "{cut}");
+    }
+
+    /// Both dumps of two claims named `js` in two namespaces are applied, in
+    /// the NATS server's namespace, as two pods.
+    #[test]
+    fn a_jetstream_dump_names_its_helper_by_the_claims_namespace() {
+        let k = RecordingKube::default();
+        let dir = tempfile::tempdir().unwrap();
+        for ns in ["shop", "blog"] {
+            let item = ExtractItem {
+                namespace: ns.into(),
+                claim_name: "js".into(),
+                kind: DataKind::JetStream,
+                source: "orders".into(),
+                connection: Some("js-conn".into()),
+            };
+            extract_jetstream(
+                &k,
+                &item,
+                dir.path(),
+                crate::helper_pod::DEFAULT_RUN_DEADLINE,
+            )
+            .unwrap();
+        }
+        let applied = k.applied.lock().unwrap().clone();
+        let names: Vec<&str> = applied
+            .iter()
+            .map(|s| s["metadata"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                jetstream_helper_pod_name("bk-js", "shop", "js", Some("orders")),
+                jetstream_helper_pod_name("bk-js", "blog", "js", Some("orders")),
+            ]
+        );
+        assert_ne!(names[0], names[1]);
+        // Both beside the server: the fake's `host` names `demo`.
+        assert!(applied.iter().all(|s| s["metadata"]["namespace"] == "demo"));
     }
 
     // =======================================================================
