@@ -292,6 +292,19 @@ of either is a seed comment calling an unpinned default a drift hazard.
 **Pinning it is deliberately out of scope here** — it gates nothing in this
 record, and the hazard it covers is a different one (§Risks).
 
+*Amended 2026-09-23.* The operand image is now pinned, for the drift hazard
+rather than for extensions: the provisioner renders `spec.imageName` from one
+constant, `ghcr.io/cloudnative-pg/postgresql:18.3-system-trixie` — exactly the
+default the pinned CloudNativePG operator had already written into every
+existing cluster, so the pin restarts nothing. It was taken ahead of a
+CloudNativePG chart upgrade whose operator defaults to a newer build: without
+the pin, a cluster created after that upgrade would get a different
+PostgreSQL than the ones created before it. Moving the constant is a deliberate
+PostgreSQL upgrade that rolls every instance; deleting it from the apply body
+would let the webhook re-default the field to whatever the running operator
+compiles in. The extension-detection design above is unchanged, and remains
+the only guard against an image that stops providing an extension.
+
 What this subphase does owe is detection, and it is nearly free because §3.1
 already puts a PostgreSQL client in the provisioner: on reconcile, compare each
 database's declared extensions against `pg_available_extensions` and raise a
