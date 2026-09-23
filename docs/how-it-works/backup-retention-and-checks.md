@@ -341,7 +341,12 @@ command or run that needs a helper pod of that name, the same step for the same
 claim, deletes it, waits until it is gone, and creates its own. It does the
 same with a leftover it cannot update in place because an older version built
 it with a different spec. A pod still running with the same spec is used as it
-is.
+is. Two runs that need the same helper pod at the same time —
+`apprafter backup create` while the scheduled backup is dumping the same claim
+— do not both finish. With the same spec they share the pod, and the first to
+finish deletes it under the other. With different specs, as a CLI and a backup
+runner of different versions build them while an upgrade is under way, the
+second run replaces the first one's pod and both fail.
 
 Pick the value against the schedule it applies to:
 

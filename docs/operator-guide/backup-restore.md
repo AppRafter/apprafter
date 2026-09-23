@@ -40,6 +40,12 @@ exits at once instead; a helper pod left that way is replaced by the next
 backup that needs it. `apprafter export` and `apprafter restore` behave the
 same way.
 
+Start `backup create` when no scheduled backup is running —
+`apprafter backup status` shows one that is. Two runs that need the same
+helper pod at the same time do not both finish, and while an upgrade is under
+way, with the CLI and the cluster's backup runner on different versions, both
+fail.
+
 ## What is in a backup
 
 ```sh
