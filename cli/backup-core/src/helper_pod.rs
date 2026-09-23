@@ -46,11 +46,12 @@
 //! 137 says nothing about why.
 //!
 //! A helper pod nobody deleted (a runner or a CLI killed before its cleanup
-//! ran — the CLI has no Ctrl-C handler, so an interrupted `backup create`,
-//! `export` or `restore` leaves its helper) keeps running `sleep` until its
-//! keep-alive ends. That ends the pod's process, not the Pod: with
-//! `restartPolicy: Never` the object stays behind, `Completed`, until
-//! something deletes it. The next run that applies a helper pod of that name
+//! ran: SIGKILL, a lost node or connection, a second Ctrl-C that does not
+//! wait for the first one's cleanup — a first Ctrl-C or a SIGTERM makes
+//! `backup create`, `export` and `restore` delete the helper pods they
+//! created) keeps running `sleep` until its keep-alive ends. That ends the
+//! pod's process, not the Pod: with `restartPolicy: Never` the object stays
+//! behind, `Completed`, until something deletes it. The next run that applies a helper pod of that name
 //! (the same step for the same claim) deletes it and creates its own
 //! ([`stale_helper_reason`]): when it has ended, and while it still runs but
 //! has used more than [`RUNNING_HELPER_REUSE_MARGIN`] of its keep-alive, since
@@ -128,8 +129,9 @@ pub fn run_deadline_of(platformstack: Option<&Value>) -> Duration {
 ///   killed command keeps running `sleep` — holding any volume mount and a
 ///   database or NATS session's worth of credentials in its container (not
 ///   in its Pod object, which carries only a reference to the Secret: see
-///   the module docs). The runner deletes its helpers when it is stopped, and
-///   a leftover is replaced by the next run that needs its name
+///   the module docs). The runner deletes its helpers when it is stopped, the
+///   interactive commands delete theirs on a first Ctrl-C or a SIGTERM, and a
+///   leftover is replaced by the next run that needs its name
 ///   ([`stale_helper_reason`]); with no such run, it lives out its
 ///   keep-alive, six hours by default.
 pub fn helper_keep_alive(run_deadline: Duration) -> Duration {
@@ -165,7 +167,8 @@ pub fn keep_alive_command(keep_alive: Duration) -> Value {
 // ---------------------------------------------------------------------------
 
 /// The label every helper pod builder stamps, `"true"`. Only pods carrying it
-/// are a run's to delete when the run is stopped (the runner's stop).
+/// are a run's to delete when the run is stopped (the runner's stop, the
+/// CLI's interrupt).
 pub const BACKUP_HELPER_LABEL: &str = "apprafter.io/backup-helper";
 
 /// Whether a Pod spec is a backup helper pod: [`BACKUP_HELPER_LABEL`] is
@@ -377,7 +380,8 @@ pub fn shell_single_quote(s: &str) -> String {
 ///   when the pod was created, not when this run applied over it, and every
 ///   command in it ends with that `sleep`. Such a pod is a leftover of a
 ///   command stopped before its cleanup ran — `apprafter backup create` or
-///   `export` interrupted with Ctrl-C, a runner pod lost — or the helper of a
+///   `export` killed outright (SIGKILL, a second Ctrl-C), a runner pod lost,
+///   a CLI older than its interrupt cleanup — or the helper of a
 ///   run still using it, which then fails, and so does this one (see
 ///   [`RUNNING_HELPER_REUSE_MARGIN`]). Used as it was, a leftover created five
 ///   hours earlier gave the next run's dump one hour, killed it with exit code

@@ -117,6 +117,12 @@ pub(crate) const PRE_RESTORE_REPLICAS_ANNOTATION: &str = "apprafter.io/pre-resto
 const CLAIM_READY_ATTEMPTS: u32 = 60;
 const CLAIM_READY_BACKOFF_SECS: u64 = 10;
 
+/// What an interrupted restore says, after the helper pods it deleted, about
+/// what it leaves as it is.
+const RESTORE_INTERRUPT_NOTE: &str = "  applications this restore had already scaled to zero \
+     stay down, with Argo CD auto-sync off: run the same restore command again to the end to \
+     bring them back";
+
 // ---------------------------------------------------------------------------
 // Internal types
 // ---------------------------------------------------------------------------
@@ -602,6 +608,10 @@ pub fn run_restore(
     keep_backup_schedule: bool,
     discard_backup_schedule: bool,
 ) -> Result<()> {
+    // First, so it is dropped last: Ctrl-C deletes the helper pods this
+    // restore created, and only those (`helper_interrupt`; see the note on
+    // signals below).
+    let _interruptible = crate::commands::helper_interrupt::install(Some(RESTORE_INTERRUPT_NOTE));
     reject_conflicting_modes(reprovision, data_only)?;
 
     // 0. External binaries, before the credential gate below (D11 / 2.22a —
@@ -680,15 +690,26 @@ pub fn run_restore(
     // interruption hint below then sees the partial state the steps already
     // wrote into the cluster, whichever of them failed.
     //
-    // THE ERROR PATH ONLY — signals are deliberately NOT handled. A default
-    // Ctrl-C kills the process without unwinding, so neither this hint nor any
-    // `Drop` guard runs. A SIGINT handler could print the same lines, but it
-    // could not safely undo a half-issued kubectl from another thread, so it
-    // would buy a message and a second exit path. The durable half of the
-    // answer is the [`PRE_RESTORE_REPLICAS_ANNOTATION`] instead: it is in the
-    // cluster before the scale-to-zero it describes, so the recorded count
-    // survives a signal, a severed connection and a kill -9 alike, and the
-    // re-run recovers with or without anything having been printed.
+    // Signals and restore state are handled apart, on purpose (WI-383):
+    //
+    // * A SIGINT or SIGTERM runs the interrupt of `helper_interrupt`
+    //   (installed at the top of this function), and it does ONE thing: it
+    //   deletes the helper pods this restore created — by uid, so never a pod
+    //   of the same name it did not create — and exits. Deleting one's own
+    //   helper is idempotent and cannot hurt anything else, while each one
+    //   left behind would sit there running `sleep` for six hours.
+    // * It does NOT undo restore state. Reversing a half-applied restore from
+    //   another thread, over a kubectl the same Ctrl-C has half-killed, is
+    //   not something a handler can do safely. The durable answer is the
+    //   [`PRE_RESTORE_REPLICAS_ANNOTATION`]: it is in the cluster before the
+    //   scale-to-zero it describes, so the recorded count survives a signal,
+    //   a severed connection and a kill -9 alike, and the re-run recovers
+    //   with or without anything having been printed.
+    //
+    // This hint is the error path's. After an interrupt it is printed only if
+    // this thread gets here before the interrupt exits (it waits a moment for
+    // that: `helper_interrupt::UNWIND_BOUND`); the interrupt prints its own
+    // line about what a restore leaves down (`RESTORE_INTERRUPT_NOTE`).
     let outcome = (|| -> Result<()> {
         for step in &steps {
             // The Reprovision step provisions + bootstraps a fresh cluster in the

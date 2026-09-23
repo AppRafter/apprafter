@@ -50,6 +50,16 @@ tabled        = { workspace = true }
 tempfile      = { workspace = true }
 tracing       = { workspace = true }
 ureq          = { workspace = true }
+# Neither is a new crate: both are already in the graph (signal-hook through
+# crossterm, libc through nearly everything). `signal-hook`: the Ctrl-C /
+# SIGTERM handler of `backup create`, `export` and `restore`, which deletes
+# the helper pods the command created (`commands::helper_interrupt`) — a flag
+# set in the handler itself, a second signal ending the process from the
+# handler, and the iterator the cleanup thread waits on. `libc`: the one
+# `sigaction` query std has no form of, whether a signal was ignored when the
+# process started (a background job's SIGINT stays ignored).
+signal-hook   = "0.3"
+libc          = "0.2"
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

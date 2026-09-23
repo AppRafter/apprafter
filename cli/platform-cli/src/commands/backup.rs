@@ -81,6 +81,7 @@ use cli_providers::k8s::sealing::{build_sealed_secret, fetch_controller_public_k
 use serde_json::Value;
 use tempfile::NamedTempFile;
 
+use crate::commands::helper_interrupt;
 use crate::commands::k8s_helpers::{
     ensure_kubeconfig_tempfile, kubectl_apply_server_side, kubectl_get_json,
     kubectl_get_json_cluster_wide, kubectl_merge_patch,
@@ -1019,6 +1020,11 @@ const STDERR_FLUSH_GRACE_MS: u64 = 100;
 
 /// CLI's concrete implementation of [`backup_core::KubeExec`]: shells out to
 /// `kubectl` with `KUBECONFIG=<path>`.
+///
+/// Once the process has been interrupted (Ctrl-C or SIGTERM, with the
+/// handler of [`helper_interrupt`] installed) every method refuses at once
+/// and spawns nothing: the interrupt's own cleanup deletes the helper pods
+/// the command created, and it alone does.
 pub(crate) struct KubectlExec {
     pub kubeconfig: PathBuf,
     /// The `kubectl` binary to spawn. Always `"kubectl"` in production (see
@@ -1027,6 +1033,10 @@ pub(crate) struct KubectlExec {
     /// process's streams and exit status, rather than leaving the whole
     /// subprocess layer unexercised.
     kubectl_bin: PathBuf,
+    /// The helper pods applied and not yet deleted, for the interrupt to
+    /// delete ([`helper_interrupt::HelperPods`]): the process-wide set in
+    /// production, a private one in the tests.
+    helpers: helper_interrupt::HelperPods,
 }
 
 impl KubectlExec {
@@ -1034,15 +1044,31 @@ impl KubectlExec {
         Self {
             kubeconfig,
             kubectl_bin: PathBuf::from(KUBECTL_BIN),
+            helpers: helper_interrupt::HelperPods::global(),
         }
+    }
+
+    /// Refuse the call once the process has been interrupted (see the type's
+    /// docs): the signal handler's flag, set the moment the signal arrives,
+    /// or the stop having closed the set of helper pods.
+    fn refuse_if_interrupted(&self) -> Result<()> {
+        if self.interrupted() {
+            return Err(helper_interrupt::interrupted_error());
+        }
+        Ok(())
+    }
+
+    fn interrupted(&self) -> bool {
+        helper_interrupt::interrupted() || self.helpers.is_closed()
     }
 }
 
 /// How often the Ready wait reads a helper pod.
 const POD_READY_POLL: Duration = Duration::from_secs(1);
 
-/// The `kubectl` executable [`KubectlExec`] spawns, resolved through `PATH`.
-const KUBECTL_BIN: &str = "kubectl";
+/// The `kubectl` executable [`KubectlExec`] spawns, resolved through `PATH`
+/// (and the interrupt's cleanup, `helper_interrupt`).
+pub(crate) const KUBECTL_BIN: &str = "kubectl";
 
 /// Spawn a thread that drains `reader` to EOF, retaining the last
 /// `STDERR_CAPTURE_LIMIT` lines in a shared buffer for error reporting.
@@ -1110,6 +1136,14 @@ fn copy_exec_stdout<R: Read>(
     }
     io::copy(&mut reader, &mut out).map_err(copy_error)?;
     Ok(())
+}
+
+/// A pod's `metadata.uid`, when it has one.
+fn uid_of(pod: &serde_json::Value) -> Option<String> {
+    pod.pointer("/metadata/uid")
+        .and_then(serde_json::Value::as_str)
+        .filter(|uid| !uid.is_empty())
+        .map(str::to_string)
 }
 
 /// What `kubectl apply` answered: [`KubectlExec::kubectl_apply`].
@@ -1235,12 +1269,38 @@ impl KubectlExec {
         })
     }
 
+    /// [`Self::kubectl_apply`] of a pod spec, with a backup helper recorded
+    /// for the interrupt first ([`helper_interrupt::HelperPods::begin_apply`]):
+    /// its name, the uid of the pod of that name seen before (`before`), and
+    /// the apply counted as under way until kubectl answers. Refused once the
+    /// interrupt has begun.
+    fn tracked_apply(
+        &self,
+        spec: &serde_json::Value,
+        ns: &str,
+        name: &str,
+        before: Option<String>,
+        json_bytes: &[u8],
+    ) -> Result<ApplyAnswer> {
+        let _in_flight = if backup_core::helper_pod::is_backup_helper(spec) {
+            Some(
+                self.helpers
+                    .begin_apply(&self.kubeconfig, ns, name, before)?,
+            )
+        } else {
+            None
+        };
+        self.kubectl_apply(ns, json_bytes)
+    }
+
     /// Read pod `name` until it is Running + Ready, for up to `timeout`, every
-    /// `poll` — the runner's `KubeRsExec` waits the same way. A container the
-    /// kubelet cannot configure for `grace` without a break (a credential
-    /// Secret or key missing: [`backup_core::helper_pod::container_config_error`])
-    /// ends the wait at once with the kubelet's words, rather than after the
-    /// whole `timeout` with none.
+    /// `poll` — the runner's `KubeRsExec` waits the same way. Each read also
+    /// settles which pod the apply left there, for the interrupt
+    /// ([`helper_interrupt::HelperPods::observed`]). A container the kubelet
+    /// cannot configure for `grace` without a break (a credential Secret or
+    /// key missing: [`backup_core::helper_pod::container_config_error`]) ends
+    /// the wait at once with the kubelet's words, rather than after the whole
+    /// `timeout` with none.
     fn wait_pod_ready(
         &self,
         name: &str,
@@ -1252,12 +1312,16 @@ impl KubectlExec {
         let deadline = std::time::Instant::now() + timeout;
         let mut config_error = backup_core::helper_pod::ConfigErrorWatch::default();
         loop {
+            self.refuse_if_interrupted()?;
             let pod = self.get_pod_if_present(name, ns)?.ok_or_else(|| {
                 CliError::Other(format!(
                     "pod {name} in {ns} is gone: it was deleted while this command waited for \
                      it to be Ready"
                 ))
             })?;
+            if let Some(uid) = uid_of(&pod) {
+                self.helpers.observed(ns, name, &uid);
+            }
             if backup_core::helper_pod::pod_is_ready(&pod) {
                 return Ok(());
             }
@@ -1313,6 +1377,7 @@ impl KubectlExec {
 
 impl KubeExec for KubectlExec {
     fn apply_and_wait_pod_ready(&self, spec: &serde_json::Value) -> Result<()> {
+        self.refuse_if_interrupted()?;
         let name = spec["metadata"]["name"]
             .as_str()
             .ok_or_else(|| CliError::Other("pod spec missing metadata.name".into()))?;
@@ -1328,6 +1393,7 @@ impl KubeExec for KubectlExec {
         // is about to go, and a running one hours into its keep-alive would
         // end this command's work in it early
         // (backup_core::helper_pod::stale_helper_reason).
+        let mut before = None;
         if let Some(existing) = self.get_pod_if_present(name, ns)? {
             if let Some(why) =
                 backup_core::helper_pod::stale_helper_reason(&existing, spec, chrono::Utc::now())
@@ -1337,12 +1403,16 @@ impl KubeExec for KubectlExec {
                     backup_core::helper_pod::replacing_stale_helper_note(ns, name, &why)
                 );
                 self.delete_and_wait_gone(name, ns)?;
+            } else {
+                // Left in place and applied over: the pod the interrupt must
+                // not take for one this command created.
+                before = uid_of(&existing);
             }
         }
 
         // So is one whose spec this one cannot be applied over — an older
         // CLI's or runner's, with another keep-alive or env.
-        match self.kubectl_apply(ns, &json_bytes)? {
+        match self.tracked_apply(spec, ns, name, before, &json_bytes)? {
             ApplyAnswer::Applied => {}
             ApplyAnswer::Refused { stderr, .. }
                 if backup_core::helper_pod::is_immutable_pod_update(&stderr) =>
@@ -1357,7 +1427,9 @@ impl KubeExec for KubectlExec {
                     )
                 );
                 self.delete_and_wait_gone(name, ns)?;
-                if let ApplyAnswer::Refused { error, .. } = self.kubectl_apply(ns, &json_bytes)? {
+                if let ApplyAnswer::Refused { error, .. } =
+                    self.tracked_apply(spec, ns, name, None, &json_bytes)?
+                {
                     return Err(error);
                 }
             }
@@ -1381,6 +1453,7 @@ impl KubeExec for KubectlExec {
         out_path: &Path,
         first_output_within: Option<Duration>,
     ) -> Result<()> {
+        self.refuse_if_interrupted()?;
         let mut cmd = Command::new(&self.kubectl_bin);
         cmd.arg("exec")
             .arg(pod)
@@ -1467,6 +1540,7 @@ impl KubeExec for KubectlExec {
         argv: &[&str],
         in_path: &Path,
     ) -> Result<()> {
+        self.refuse_if_interrupted()?;
         let mut cmd = Command::new(&self.kubectl_bin);
         cmd.arg("exec")
             .arg("-i")
@@ -1524,7 +1598,13 @@ impl KubeExec for KubectlExec {
     }
 
     fn delete_pod_best_effort(&self, name: &str, ns: &str) {
-        let _ = Command::new(&self.kubectl_bin)
+        // After an interrupt the interrupt's cleanup deletes this command's
+        // helpers, by uid; a delete by name from here could take a pod of the
+        // same name that this command never created.
+        if self.interrupted() {
+            return;
+        }
+        let deleted = Command::new(&self.kubectl_bin)
             .args([
                 "delete",
                 "pod",
@@ -1538,9 +1618,16 @@ impl KubeExec for KubectlExec {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        // Forgotten only when the delete went through: one that failed (or
+        // whose kubectl died of the same Ctrl-C) leaves the pod for the
+        // interrupt's cleanup.
+        if deleted.is_ok_and(|status| status.success()) {
+            self.helpers.deleted(ns, name);
+        }
     }
 
     fn get_secret_key(&self, secret: &str, ns: &str, key: &str) -> Result<String> {
+        self.refuse_if_interrupted()?;
         let out = Command::new(&self.kubectl_bin)
             .args([
                 "get",
@@ -1582,6 +1669,7 @@ impl KubeExec for KubectlExec {
     }
 
     fn get_json(&self, args: &[&str]) -> Result<Option<serde_json::Value>> {
+        self.refuse_if_interrupted()?;
         let mut c = Command::new(&self.kubectl_bin);
         c.args(args).env("KUBECONFIG", &self.kubeconfig);
 
@@ -1617,6 +1705,9 @@ impl KubeExec for KubectlExec {
 /// `namespaces` when `select` is set. Writes `<out>/{pg,volumes,redis}/…`
 /// plus a `<out>/manifest.json`. No CRs, no secrets, no encryption.
 pub fn run_export(namespaces: &[String], select: bool, out: Option<&str>) -> Result<()> {
+    // First, so it is dropped last: Ctrl-C deletes the helper pods this
+    // command created (`helper_interrupt`).
+    let _interruptible = helper_interrupt::install(None);
     // D11 / 2.22a: the external binaries this command spawns, checked
     // BEFORE any prompt, kubeconfig or provider call. The reported bug
     // was a passphrase typed into a command that could not have worked.
@@ -1803,6 +1894,9 @@ pub fn run_backup(
     passphrase: Option<&str>,
     staging_mode: Option<&str>,
 ) -> Result<()> {
+    // First, so it is dropped last: Ctrl-C deletes the helper pods this
+    // command created (`helper_interrupt`).
+    let _interruptible = helper_interrupt::install(None);
     // D11 / 2.22a: the external binaries this command spawns, checked
     // BEFORE any prompt, kubeconfig or provider call. The reported bug
     // was a passphrase typed into a command that could not have worked.
@@ -10257,9 +10351,15 @@ mod tests {
                 _ => break,
             }
         }
+        // The stub's kubeconfig: the interrupt's record of a helper apply
+        // keeps the file's bytes, so it must be there to read.
+        let kubeconfig = dir.path().join("kubeconfig.yaml");
+        std::fs::write(&kubeconfig, "apiVersion: v1\nkind: Config\n").unwrap();
         KubectlExec {
-            kubeconfig: dir.path().join("kubeconfig.yaml"),
+            kubeconfig,
             kubectl_bin: path,
+            // Private to the test: the process-wide set is the interrupt's.
+            helpers: helper_interrupt::HelperPods::default(),
         }
     }
 
@@ -10655,6 +10755,122 @@ mod tests {
         let spec: Value = serde_json::from_str(HELPER).unwrap();
         k.apply_and_wait_pod_ready(&spec).unwrap();
         assert_eq!(calls(&log), vec!["get", "apply", "delete", "apply", "get"]);
+    }
+
+    /// A backup helper pod spec, as the builders stamp it: the interrupt
+    /// tracks only pods carrying the helper label.
+    const LABELLED_HELPER: &str = r#"{"metadata": {"name": "helper", "namespace": "prod",
+        "labels": {"apprafter.io/backup-helper": "true"}}}"#;
+
+    /// WI-383: which pod each helper apply left under its name is recorded
+    /// for the interrupt — created by this command (deleted on Ctrl-C, by
+    /// uid) or there before it (left for the run using it).
+    #[test]
+    fn each_helper_apply_records_whether_it_created_its_pod() {
+        use helper_interrupt::Origin;
+        let spec: Value = serde_json::from_str(LABELLED_HELPER).unwrap();
+
+        // No pod of that name: this apply created the one that is there now.
+        let dir = tempfile::tempdir().unwrap();
+        let (k, _) = stateful_stub(&dir, "", "cat >/dev/null; exit 0");
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(
+            k.helpers.origin_of("prod", "helper"),
+            Some(Origin::Created("u-applied".into()))
+        );
+
+        // A running pod of the same spec, used as it is: not this command's.
+        let dir = tempfile::tempdir().unwrap();
+        let (k, _) = stateful_stub(
+            &dir,
+            r#"{"metadata": {"name": "helper", "uid": "u-theirs"}, "status": {"phase": "Running"}}"#,
+            "cat >/dev/null; exit 0",
+        );
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(
+            k.helpers.origin_of("prod", "helper"),
+            Some(Origin::Reused("u-theirs".into()))
+        );
+
+        // An ended leftover is replaced: the pod there now is this apply's.
+        let dir = tempfile::tempdir().unwrap();
+        let (k, _) = stateful_stub(
+            &dir,
+            r#"{"metadata": {"name": "helper", "uid": "u-old"}, "status": {"phase": "Succeeded"}}"#,
+            "cat >/dev/null; exit 0",
+        );
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(
+            k.helpers.origin_of("prod", "helper"),
+            Some(Origin::Created("u-applied".into()))
+        );
+
+        // A pod that is not a backup helper is none of the interrupt's.
+        let dir = tempfile::tempdir().unwrap();
+        let (k, _) = stateful_stub(&dir, "", "cat >/dev/null; exit 0");
+        k.apply_and_wait_pod_ready(&serde_json::from_str(HELPER).unwrap())
+            .unwrap();
+        assert_eq!(k.helpers.origin_of("prod", "helper"), None);
+    }
+
+    /// Forgotten once the command's own delete went through — and kept when
+    /// it did not (its kubectl may have died of the same Ctrl-C), for the
+    /// interrupt to delete.
+    #[test]
+    fn a_helper_is_forgotten_only_once_its_delete_went_through() {
+        use helper_interrupt::Origin;
+        let spec: Value = serde_json::from_str(LABELLED_HELPER).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (k, _) = stateful_stub(&dir, "", "cat >/dev/null; exit 0");
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        k.delete_pod_best_effort("helper", "prod");
+        assert_eq!(k.helpers.origin_of("prod", "helper"), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv");
+        let k = stub_kubectl(
+            &dir,
+            &format!(
+                "echo \"$@\" >> {log}\n\
+                 case \"$1\" in\n\
+                 get) [ -f {log}.applied ] && printf '%s' '{ready}'; exit 0;;\n\
+                 apply) cat >/dev/null; touch {log}.applied; exit 0;;\n\
+                 delete) exit 1;;\n\
+                 esac",
+                log = log.display(),
+                ready = ready_pod("u-1"),
+            ),
+        );
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        k.delete_pod_best_effort("helper", "prod");
+        assert_eq!(
+            k.helpers.origin_of("prod", "helper"),
+            Some(Origin::Created("u-1".into()))
+        );
+    }
+
+    /// Once interrupted, the command's own thread makes no kubectl call at
+    /// all: no apply that would outlive it, no exec, and no delete by name —
+    /// the interrupt's deletes, by uid, are the only ones.
+    #[test]
+    fn once_interrupted_no_kubectl_is_run_from_the_command() {
+        let spec: Value = serde_json::from_str(LABELLED_HELPER).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (k, log) = stateful_stub(&dir, "", "cat >/dev/null; exit 0");
+        k.helpers.close();
+        let refused = k.apply_and_wait_pod_ready(&spec).unwrap_err().to_string();
+        assert!(refused.starts_with("interrupted"), "{refused}");
+        let out = dir.path().join("out");
+        assert!(k
+            .exec_stream_to_file("helper", "prod", &["pg_dump"], &out, None)
+            .is_err());
+        assert!(k
+            .exec_stream_from_file("helper", "prod", &["pg_restore"], &out,)
+            .is_err());
+        assert!(k.get_secret_key("db-conn", "prod", "user").is_err());
+        assert!(k.get_json(&["get", "pods", "-n", "prod"]).is_err());
+        k.delete_pod_best_effort("helper", "prod");
+        assert!(!log.exists(), "{}", std::fs::read_to_string(&log).unwrap());
     }
 
     /// WI-383, the CLI's side: a helper whose credential Secret is missing
