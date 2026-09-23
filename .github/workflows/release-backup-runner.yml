@@ -8,16 +8,26 @@ name: release-backup-runner
 #
 # ## Trigger discipline
 #
-# The runner lives in the `cli/` workspace (`cli/apprafter-backup/`,
-# built on `cli/backup-core/`), so its code only changes when those
-# paths change — and a change to them is a CLI change, which bumps
-# `cli/Cargo.toml` `workspace.package.version` by the repo's
-# versioning rule. The workflow therefore triggers on master pushes
-# touching those two crates (+ this file), plus `workflow_dispatch`.
-# CLI tag pushes and pushes that don't touch the runner crates do
-# NOT wake it; a push that touches them without an image-worthy delta
-# wakes it but skips publish via the gate below (same image already
-# on ghcr.io).
+# The runner lives in the `cli/` workspace: `cli/apprafter-backup/`,
+# built on `cli/backup-core/`, and both depend on `cli/cli-core/`.
+# The image compiles those three crates against `cli/Cargo.toml`,
+# `cli/Cargo.lock` (every dependency version) and `cli/.cargo/`, and
+# its planner stage fails unless the builder image's rustc is the
+# minor `cli/rust-toolchain.toml` names. The workflow triggers on
+# master pushes touching any of those (+ this file), plus
+# `workflow_dispatch`. CLI tag pushes and pushes that touch none of
+# them do NOT wake it.
+#
+# Waking is not publishing: the gate below publishes only a version
+# whose tag or image is missing, and a new version always moves
+# `cli/Cargo.toml` (once `v<version>` is on origin, the pre-commit gate
+# scripts/check-cli-version-bump.sh refuses any other `cli/` change
+# until it does). So a release wakes this workflow through that file
+# alone. The other paths matter when the publish of a version still in
+# flight FAILED and the fix touches only them: a lock, toolchain or
+# cli-core fix would otherwise leave that version unpublished until
+# someone ran `workflow_dispatch`. A push that touches them for a
+# version already on ghcr.io wakes it and skips publish (same image).
 #
 # ## Tag stream
 #
@@ -61,7 +71,11 @@ on:
     paths:
       - 'cli/apprafter-backup/**'
       - 'cli/backup-core/**'
+      - 'cli/cli-core/**'
       - 'cli/Cargo.toml'
+      - 'cli/Cargo.lock'
+      - 'cli/rust-toolchain.toml'
+      - 'cli/.cargo/**'
       - '.github/workflows/release-backup-runner.yml'
   workflow_dispatch: {}
 
