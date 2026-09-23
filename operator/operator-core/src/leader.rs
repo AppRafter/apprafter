@@ -40,10 +40,10 @@ const DEFAULT_RENEW_PERIOD: Duration = Duration::from_secs(10);
 const DEFAULT_RENEW_DEADLINE: Duration = Duration::from_secs(20);
 /// How soon a leader retries after a failed renewal.
 const DEFAULT_RETRY_PERIOD: Duration = Duration::from_secs(2);
-/// The longest one acquire/renew step (a GET plus at most one write) may
-/// take. Half a renew period, so a leader whose renewal hangs still gets a
-/// second attempt before its deadline.
-const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// The longest a Lease READ may take before it is cut off and counted as a
+/// failed step. Half a renew period, so a leader whose renewal read hangs is
+/// cut off with half its window left: enough to try again.
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where the Lease lives, who we are, and the timings.
 ///
@@ -62,8 +62,21 @@ const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// returns: with the client's 295s read timeout, one GET that the apiserver
 /// accepted and never answered kept `is_leader` true while the Lease
 /// expired under it (the frozen `renewTime` the wave-1 upgrade walk saw).
-/// Hence `call_timeout`, and the deadline bounds that too: no step can run
-/// past the moment this process must stop.
+/// Hence the bounds on each request, and the deadline caps every one of
+/// them: nothing is still in flight past the moment this process must stop.
+///
+/// The bounds are per REQUEST, not per step, and only a read has one of its
+/// own. A renewal is a read and then a write, and a healthy apiserver in
+/// front of a slow disk answers both late. Bounded together at five
+/// seconds, a 3s read plus a 3s write failed every renewal after its write
+/// had already committed: a working leader stepped down, and the process
+/// that replaced it wrote itself into the Lease on every attempt without
+/// ever opening its gate, so nobody reconciled and nobody else could take
+/// over. So a read that has not answered within `read_timeout` is cut off —
+/// a retry still fits before the deadline — while a write gets everything
+/// left in its step. A write's latency is the storage's, and one cut short
+/// may already be committed: ending it early buys a retry that has to start
+/// with a fresh read anyway.
 #[derive(Debug, Clone)]
 pub struct LeaderConfig {
     pub namespace: String,
@@ -78,9 +91,10 @@ pub struct LeaderConfig {
     pub renew_deadline: Duration,
     /// Delay before a leader retries a failed renewal.
     pub retry_period: Duration,
-    /// Upper bound on one acquire/renew step. A step that hits it is a
-    /// failed step, exactly like an error response.
-    pub call_timeout: Duration,
+    /// Upper bound on one Lease read. A read that hits it fails its step,
+    /// exactly like an error response. Writes have no bound of their own:
+    /// they run until the step's window closes.
+    pub read_timeout: Duration,
 }
 
 impl LeaderConfig {
@@ -94,7 +108,7 @@ impl LeaderConfig {
             renew_period: DEFAULT_RENEW_PERIOD,
             renew_deadline: DEFAULT_RENEW_DEADLINE,
             retry_period: DEFAULT_RETRY_PERIOD,
-            call_timeout: DEFAULT_CALL_TIMEOUT,
+            read_timeout: DEFAULT_READ_TIMEOUT,
         }
     }
 }
@@ -104,9 +118,15 @@ pub enum LeaderError {
     #[error("kube error: {0}")]
     Kube(#[from] kube::Error),
 
-    /// One acquire/renew step did not finish within its bound.
-    #[error("the apiserver did not answer the Lease request within {:.1}s", .0.as_secs_f64())]
-    Timeout(Duration),
+    /// One Lease request was not answered within its bound.
+    #[error(
+        "the apiserver did not answer the Lease {request} within {:.1}s",
+        .after.as_secs_f64()
+    )]
+    Timeout {
+        request: &'static str,
+        after: Duration,
+    },
 
     /// The leader went `renew_deadline` without a successful renewal.
     #[error(
@@ -161,27 +181,19 @@ impl LeaderElection {
         let mut renewed_at: Option<Instant> = None;
         loop {
             let started = Instant::now();
-            let budget = match renewed_at {
-                None => self.config.call_timeout,
-                Some(at) => {
-                    let since = started.saturating_duration_since(at);
-                    match step_budget(&self.config, since) {
-                        Some(budget) => budget,
-                        None => {
-                            return Err(self.step_down(LeaderError::LostLeadership {
-                                failures: consecutive_failures,
-                                since,
-                            }))
-                        }
-                    }
-                }
+            let since_renewal = renewed_at.map(|at| started.saturating_duration_since(at));
+            let Some(window) = step_window(&self.config, since_renewal) else {
+                return Err(self.step_down(LeaderError::LostLeadership {
+                    failures: consecutive_failures,
+                    since: since_renewal.unwrap_or_default(),
+                }));
             };
             // `now` is stamped into `renewTime` and `started` is the same
             // instant on the monotonic clock: the deadline counts from what
             // the other replicas will count from.
-            let step = tokio::time::timeout(budget, self.acquire_or_renew(&api, Utc::now()))
-                .await
-                .unwrap_or_else(|_elapsed| Err(LeaderError::Timeout(budget)));
+            let step = self
+                .acquire_or_renew(&api, Utc::now(), started + window)
+                .await;
             let next_attempt = match step {
                 Ok(true) => {
                     consecutive_failures = 0;
@@ -238,12 +250,17 @@ impl LeaderElection {
     /// Try to acquire (create / take over a stale Lease) or renew.
     /// Returns `Ok(true)` if we hold the Lease at the end of the
     /// call, `Ok(false)` if another holder owns it and is fresh.
+    ///
+    /// Every request is over by `until`, the end of this step's window; see
+    /// [`request_bound`] for how much of it each one gets.
     async fn acquire_or_renew(
         &self,
         api: &Api<Lease>,
         now: DateTime<Utc>,
+        until: Instant,
     ) -> Result<bool, LeaderError> {
-        match api.get_opt(&self.config.name).await? {
+        let read = api.get_opt(&self.config.name);
+        match self.bounded(Request::Read, until, read).await? {
             Some(existing) => {
                 let holder = existing
                     .spec
@@ -257,8 +274,9 @@ impl LeaderElection {
                 if may_take_lease(holder, stale, &self.config.holder_id) {
                     let mut updated = existing.clone();
                     updated.spec = Some(lease_spec(&self.config, now, existing.spec.as_ref()));
-                    api.replace(&self.config.name, &PostParams::default(), &updated)
-                        .await?;
+                    let params = PostParams::default();
+                    let write = api.replace(&self.config.name, &params, &updated);
+                    self.bounded(Request::Write, until, write).await?;
                     Ok(true)
                 } else {
                     Ok(false)
@@ -273,9 +291,46 @@ impl LeaderElection {
                     },
                     spec: Some(lease_spec(&self.config, now, None)),
                 };
-                api.create(&PostParams::default(), &lease).await?;
+                let params = PostParams::default();
+                let write = api.create(&params, &lease);
+                self.bounded(Request::Write, until, write).await?;
                 Ok(true)
             }
+        }
+    }
+
+    /// Run one Lease request under its bound, a request that hits the bound
+    /// being a failure like any other.
+    async fn bounded<T>(
+        &self,
+        request: Request,
+        until: Instant,
+        call: impl std::future::Future<Output = Result<T, kube::Error>>,
+    ) -> Result<T, LeaderError> {
+        let left = until.saturating_duration_since(Instant::now());
+        let bound = request_bound(&self.config, request, left);
+        match tokio::time::timeout(bound, call).await {
+            Ok(answer) => Ok(answer?),
+            Err(_elapsed) => Err(LeaderError::Timeout {
+                request: request.as_str(),
+                after: bound,
+            }),
+        }
+    }
+}
+
+/// The two kinds of Lease request, which are bounded differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Request {
+    Read,
+    Write,
+}
+
+impl Request {
+    fn as_str(self) -> &'static str {
+        match self {
+            Request::Read => "read",
+            Request::Write => "write",
         }
     }
 }
@@ -314,24 +369,38 @@ fn may_take_lease(holder: Option<&str>, stale: bool, me: &str) -> bool {
     holder == Some(me) || stale
 }
 
-/// How long a LEADER's next acquire/renew step may take, given how long ago
-/// it stamped its last successful renewal. `None` means the renew deadline
-/// has passed and it must step down without trying again.
+/// How long the step starting now may run, given how long ago this process
+/// stamped its last successful renewal (`since_renewal`, which is `None`
+/// while it does not lead).
 ///
-/// Bounded twice: by `call_timeout`, so one hung request cannot use up a
-/// whole renew cycle, and by the time left before the deadline, so no step
-/// can still be in flight — and, if it succeeded late, re-open the gate —
-/// after the moment this process has to stop.
+/// A LEADER's step runs until its renew deadline, so no request can still be
+/// in flight — and, if it succeeded late, re-open the gate — after the
+/// moment this process has to stop. `None` means that moment has come: step
+/// down without trying again.
 ///
-/// Only a leader has a deadline. A replica that never led is in no race with
-/// a Lease it does not hold: stepping down there would turn an apiserver blip
-/// into a crash-looping standby, which is noise on top of an outage.
-fn step_budget(config: &LeaderConfig, since_renewal: Duration) -> Option<Duration> {
-    let left = config
-        .renew_deadline
-        .checked_sub(since_renewal)
-        .filter(|left| !left.is_zero())?;
-    Some(left.min(config.call_timeout))
+/// A replica that does not lead has no deadline. It is in no race with a
+/// Lease it does not hold, and stepping down there would turn an apiserver
+/// blip into a crash-looping standby, which is noise on top of an outage. Its
+/// step gets one renew period, the cadence it polls on anyway: room for a
+/// slow read and a slow write, and no request outlives the next poll.
+fn step_window(config: &LeaderConfig, since_renewal: Option<Duration>) -> Option<Duration> {
+    match since_renewal {
+        None => Some(config.renew_period),
+        Some(since) => config
+            .renew_deadline
+            .checked_sub(since)
+            .filter(|left| !left.is_zero()),
+    }
+}
+
+/// How long one request may take when `left` remains in its step's window:
+/// a read at most `read_timeout`, so a hung read is retried inside the
+/// window rather than using it up; a write all of it (see [`LeaderConfig`]).
+fn request_bound(config: &LeaderConfig, request: Request, left: Duration) -> Duration {
+    match request {
+        Request::Read => left.min(config.read_timeout),
+        Request::Write => left,
+    }
 }
 
 /// Pure staleness check — extracted for testability. A Lease is
@@ -365,7 +434,7 @@ mod tests {
         assert_eq!(cfg.renew_period, DEFAULT_RENEW_PERIOD);
         assert_eq!(cfg.renew_deadline, DEFAULT_RENEW_DEADLINE);
         assert_eq!(cfg.retry_period, DEFAULT_RETRY_PERIOD);
-        assert_eq!(cfg.call_timeout, DEFAULT_CALL_TIMEOUT);
+        assert_eq!(cfg.read_timeout, DEFAULT_READ_TIMEOUT);
     }
 
     #[test]
@@ -382,9 +451,10 @@ mod tests {
         );
         // A healthy leader renews at least once inside its own deadline…
         assert!(cfg.renew_period < cfg.renew_deadline);
-        // …and one hung request cannot use up a whole renew cycle, so a hung
-        // renewal is retried before the deadline rather than being the last.
-        assert!(cfg.call_timeout < cfg.renew_period);
+        // …and a renewal whose read hangs is cut off with time left in its
+        // window, so it is retried before the deadline rather than being the
+        // last attempt.
+        assert!(cfg.read_timeout < cfg.renew_deadline - cfg.renew_period);
         assert!(cfg.retry_period < cfg.renew_deadline - cfg.renew_period);
     }
 
@@ -445,33 +515,52 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // step_budget — how long a leader's next step may take, if at all
+    // step_window / request_bound — how long a step and each request in
+    // it may take
     // -----------------------------------------------------------------
 
     #[test]
-    fn a_leaders_step_is_bounded_by_the_call_timeout() {
-        // A renewal that is due on schedule gets the full per-call bound, not
-        // the client's 295s read timeout.
-        let cfg = LeaderConfig::for_apprafter_operator("operator-a");
-        assert_eq!(step_budget(&cfg, Duration::ZERO), Some(cfg.call_timeout));
-        assert_eq!(step_budget(&cfg, cfg.renew_period), Some(cfg.call_timeout));
-    }
-
-    #[test]
-    fn a_leaders_step_never_runs_past_its_deadline() {
-        // Three seconds before the deadline, the step gets three seconds: a
+    fn a_leaders_step_runs_until_its_deadline_and_never_past_it() {
+        // A renewal due on schedule has the ten seconds left before its
+        // deadline; three seconds before the deadline it has three. A
         // request still in flight at the deadline could succeed late and
         // re-open the gate after the process should have stopped.
         let cfg = LeaderConfig::for_apprafter_operator("operator-a");
+        assert_eq!(
+            step_window(&cfg, Some(cfg.renew_period)),
+            Some(cfg.renew_deadline - cfg.renew_period)
+        );
         let since = cfg.renew_deadline - Duration::from_secs(3);
-        assert_eq!(step_budget(&cfg, since), Some(Duration::from_secs(3)));
+        assert_eq!(step_window(&cfg, Some(since)), Some(Duration::from_secs(3)));
     }
 
     #[test]
     fn at_or_past_the_deadline_a_leader_does_not_try_again() {
         let cfg = LeaderConfig::for_apprafter_operator("operator-a");
-        assert_eq!(step_budget(&cfg, cfg.renew_deadline), None);
-        assert_eq!(step_budget(&cfg, cfg.lease_duration), None);
+        assert_eq!(step_window(&cfg, Some(cfg.renew_deadline)), None);
+        assert_eq!(step_window(&cfg, Some(cfg.lease_duration)), None);
+    }
+
+    #[test]
+    fn a_standbys_step_gets_one_renew_period() {
+        // No deadline, so the cadence it polls on: room for a slow read and
+        // a slow write, and nothing outlives the next poll.
+        let cfg = LeaderConfig::for_apprafter_operator("operator-a");
+        assert_eq!(step_window(&cfg, None), Some(cfg.renew_period));
+    }
+
+    #[test]
+    fn a_read_is_cut_at_the_read_timeout_and_a_write_gets_whatever_is_left() {
+        // Not the client's 295s: a read that hangs is cut off and retried.
+        // A write is slow for the storage's reasons and may commit anyway,
+        // so it keeps the rest of the window. Neither outlives the window.
+        let cfg = LeaderConfig::for_apprafter_operator("operator-a");
+        let ten = Duration::from_secs(10);
+        let two = Duration::from_secs(2);
+        assert_eq!(request_bound(&cfg, Request::Read, ten), cfg.read_timeout);
+        assert_eq!(request_bound(&cfg, Request::Write, ten), ten);
+        assert_eq!(request_bound(&cfg, Request::Read, two), two);
+        assert_eq!(request_bound(&cfg, Request::Write, two), two);
     }
 
     // -----------------------------------------------------------------
@@ -573,8 +662,20 @@ mod tests {
             "lost leadership: the Lease is held by another holder"
         );
         assert_eq!(
-            LeaderError::Timeout(Duration::from_millis(5000)).to_string(),
-            "the apiserver did not answer the Lease request within 5.0s"
+            LeaderError::Timeout {
+                request: Request::Read.as_str(),
+                after: Duration::from_millis(5000),
+            }
+            .to_string(),
+            "the apiserver did not answer the Lease read within 5.0s"
+        );
+        assert_eq!(
+            LeaderError::Timeout {
+                request: Request::Write.as_str(),
+                after: Duration::from_millis(7000),
+            }
+            .to_string(),
+            "the apiserver did not answer the Lease write within 7.0s"
         );
     }
 
@@ -701,6 +802,12 @@ mod tests {
         Api::namespaced(client.clone(), "apprafter-system")
     }
 
+    /// A step window no scripted answer comes near, for the tests that call
+    /// `acquire_or_renew` directly to see which requests it makes.
+    fn unhurried() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
     fn ago(secs: i64) -> DateTime<Utc> {
         Utc::now() - chrono::Duration::seconds(secs)
     }
@@ -746,7 +853,7 @@ mod tests {
             .with_timezone(&Utc);
 
         assert!(le
-            .acquire_or_renew(&lease_api(&client), now)
+            .acquire_or_renew(&lease_api(&client), now, unhurried())
             .await
             .expect("creating the first Lease must succeed"));
 
@@ -797,7 +904,7 @@ mod tests {
         let le = election(client.clone(), Duration::from_millis(1));
 
         assert!(!le
-            .acquire_or_renew(&lease_api(&client), Utc::now())
+            .acquire_or_renew(&lease_api(&client), Utc::now(), unhurried())
             .await
             .expect("reading someone else's Lease is not an error"));
 
@@ -824,7 +931,7 @@ mod tests {
         let le = election(client.clone(), Duration::from_millis(1));
 
         assert!(le
-            .acquire_or_renew(&lease_api(&client), Utc::now())
+            .acquire_or_renew(&lease_api(&client), Utc::now(), unhurried())
             .await
             .expect("a stale Lease is takeable"));
 
@@ -865,7 +972,7 @@ mod tests {
         let le = election(client.clone(), Duration::from_millis(1));
 
         assert!(le
-            .acquire_or_renew(&lease_api(&client), Utc::now())
+            .acquire_or_renew(&lease_api(&client), Utc::now(), unhurried())
             .await
             .expect("renewing our own Lease must succeed"));
 
@@ -888,7 +995,7 @@ mod tests {
         let le = election(client.clone(), Duration::from_millis(1));
 
         let err = le
-            .acquire_or_renew(&lease_api(&client), Utc::now())
+            .acquire_or_renew(&lease_api(&client), Utc::now(), unhurried())
             .await
             .expect_err("a 500 must not look like an acquirable Lease");
         assert!(matches!(err, LeaderError::Kube(_)), "{err}");
@@ -1145,5 +1252,275 @@ mod tests {
             log.lock().expect("log").len() >= 9,
             "every hung request must be cut off and the next one made"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // A slow but HEALTHY apiserver, on tokio's paused clock
+    //
+    // Everything above either answers at once or never. What a busy
+    // single-node control plane actually does is answer every request
+    // correctly and late: kine on sqlite on a small VDS can take seconds to
+    // commit a write under disk pressure. Slowness is not a failure, and
+    // the loop must not turn it into one: a leader that steps down over it
+    // restarts into a standby that never acquires, and while that standby
+    // keeps its own write landing, nobody else may take the Lease either.
+    // -----------------------------------------------------------------
+
+    use std::sync::atomic::AtomicU64;
+
+    /// An apiserver that keeps ONE Lease the way the real one does, and
+    /// answers late. A write is checked against `resourceVersion` (the
+    /// apiserver's optimistic concurrency) and COMMITTED the moment it
+    /// arrives; a read returns what is committed. Only the answer waits, for
+    /// the delay currently set for its kind of request.
+    #[derive(Default)]
+    struct SlowStore {
+        lease: Mutex<Option<Value>>,
+        version: AtomicU64,
+        delays: Mutex<(Duration, Duration)>,
+        /// When each write committed, on the tokio clock (the paused clock
+        /// does not move `Utc::now()`, so `renewTime` cannot be used).
+        commits: Mutex<Vec<Instant>>,
+    }
+
+    impl SlowStore {
+        fn with_delays(read: Duration, write: Duration) -> Arc<Self> {
+            let store = Arc::new(Self::default());
+            store.set_delays(read, write);
+            store
+        }
+
+        fn set_delays(&self, read: Duration, write: Duration) {
+            *self.delays.lock().expect("delays") = (read, write);
+        }
+
+        fn holder(&self) -> Option<String> {
+            self.lease
+                .lock()
+                .expect("lease")
+                .as_ref()
+                .and_then(|l| l.pointer("/spec/holderIdentity"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }
+
+        fn commits_since(&self, since: Instant) -> Vec<Instant> {
+            let commits = self.commits.lock().expect("commits");
+            commits.iter().copied().filter(|t| *t >= since).collect()
+        }
+
+        fn commit(&self, mut lease: Value, code: u16) -> (u16, Value) {
+            let version = self.version.fetch_add(1, Ordering::SeqCst) + 1;
+            lease["metadata"]["resourceVersion"] = json!(version.to_string());
+            *self.lease.lock().expect("lease") = Some(lease.clone());
+            self.commits.lock().expect("commits").push(Instant::now());
+            (code, lease)
+        }
+
+        /// The answer to one request, and how long it waits before it is
+        /// sent.
+        fn serve(&self, method: &str, body: Value) -> ((u16, Value), Duration) {
+            let (read, write) = *self.delays.lock().expect("delays");
+            let stored = self.lease.lock().expect("lease").clone();
+            match (method, stored) {
+                ("GET", Some(lease)) => ((200, lease), read),
+                ("GET", None) => (lease_not_found(), read),
+                ("POST", None) => (self.commit(body, 201), write),
+                ("POST", Some(_)) => (conflict("AlreadyExists", 409), write),
+                ("PUT", Some(lease)) => {
+                    let rv = |v: &Value| v.pointer("/metadata/resourceVersion").cloned();
+                    if rv(&body) == rv(&lease) {
+                        (self.commit(body, 200), write)
+                    } else {
+                        (conflict("Conflict", 409), write)
+                    }
+                }
+                ("PUT", None) => (lease_not_found(), write),
+                (other, _) => panic!("unexpected {other} on the Lease"),
+            }
+        }
+    }
+
+    /// The apiserver's 409, for a create that finds the Lease already there
+    /// (`AlreadyExists`) or a replace carrying a stale `resourceVersion`
+    /// (`Conflict`).
+    fn conflict(reason: &str, code: u16) -> (u16, Value) {
+        (
+            code,
+            json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "message": format!("leases.coordination.k8s.io \"apprafter-operator\": {reason}"),
+                "reason": reason, "code": code,
+            }),
+        )
+    }
+
+    fn slow_apiserver(store: Arc<SlowStore>) -> Client {
+        let service = tower::service_fn(move |req: http::Request<Body>| {
+            let store = store.clone();
+            async move {
+                let method = req.method().to_string();
+                let bytes = req.into_body().collect_bytes().await.expect("request body");
+                let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                let ((code, payload), delay) = store.serve(&method, body);
+                tokio::time::sleep(delay).await;
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(code)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&payload).expect("canned response"),
+                        ))
+                        .expect("canned response"),
+                )
+            }
+        });
+        Client::new(service, "apprafter-system")
+    }
+
+    /// How long until `flag` reads `want`, polled on the tokio clock for up
+    /// to `within`; `None` if it never does.
+    async fn reached_within(
+        flag: &Arc<AtomicBool>,
+        want: bool,
+        within: Duration,
+    ) -> Option<Duration> {
+        let begun = Instant::now();
+        while begun.elapsed() <= within {
+            if flag.load(Ordering::SeqCst) == want {
+                return Some(begun.elapsed());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        None
+    }
+
+    /// Every request answered 3s late; and reads quick while every write
+    /// takes 7s, which is longer than a read may take and still well inside
+    /// the ten seconds a renewal has before the deadline.
+    const SLOW_BUT_HEALTHY: [(Duration, Duration); 2] = [
+        (Duration::from_secs(3), Duration::from_secs(3)),
+        (Duration::from_millis(200), Duration::from_secs(7)),
+    ];
+
+    /// A leader already holding the Lease when the apiserver slows down must
+    /// keep holding it — and keep it FRESH — for as long as the slowness
+    /// lasts. The five-second bound on a whole GET-plus-PUT step cut every
+    /// 3s+3s renewal off after the PUT had already committed, so the Lease
+    /// was being renewed while the process counted failures and exited at
+    /// its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_leader_keeps_its_lease_through_a_slow_but_healthy_apiserver() {
+        for (read, write) in SLOW_BUT_HEALTHY {
+            let store = SlowStore::with_delays(Duration::ZERO, Duration::ZERO);
+            let cfg = LeaderConfig::for_apprafter_operator("operator-a");
+            let le = LeaderElection::new(slow_apiserver(store.clone()), cfg.clone());
+            let flag = le.is_leader_handle();
+            let task = tokio::spawn(le.run());
+            assert!(reaches(&flag, true).await, "never became leader");
+
+            store.set_delays(read, write);
+            let slowed = Instant::now();
+            tokio::time::sleep(Duration::from_secs(120)).await;
+
+            if task.is_finished() {
+                panic!(
+                    "read {read:?} / write {write:?}: the leader stopped: {:?}",
+                    task.await
+                );
+            }
+            task.abort();
+            assert!(flag.load(Ordering::SeqCst), "the leader closed its gate");
+            let renewals = store.commits_since(slowed);
+            assert!(
+                renewals.len() >= 11,
+                "read {read:?} / write {write:?}: {} renewals in 120s",
+                renewals.len()
+            );
+            // Never a gap anywhere near the deadline, let alone the Lease.
+            let mut last = slowed;
+            for at in renewals {
+                assert!(
+                    at - last < cfg.renew_deadline,
+                    "read {read:?} / write {write:?}: {:?} between two renewals",
+                    at - last
+                );
+                last = at;
+            }
+        }
+    }
+
+    /// The restart that follows: a fresh process against the same slow
+    /// apiserver must acquire the Lease on its first attempt and go on
+    /// leading. Bounded as a whole at five seconds, the 3s+3s acquisition
+    /// was cut off after its write had committed: the Lease named this
+    /// process, the gate never opened, and every later attempt refreshed the
+    /// Lease again — so for as long as the slowness lasted no operator
+    /// reconciled and no other replica could take over.
+    #[tokio::test(start_paused = true)]
+    async fn a_standby_acquires_through_a_slow_but_healthy_apiserver() {
+        for (read, write) in SLOW_BUT_HEALTHY {
+            let store = SlowStore::with_delays(read, write);
+            let cfg = LeaderConfig::for_apprafter_operator("operator-a");
+            let le = LeaderElection::new(slow_apiserver(store.clone()), cfg.clone());
+            let flag = le.is_leader_handle();
+            let task = tokio::spawn(le.run());
+
+            let opened = reached_within(&flag, true, Duration::from_secs(120)).await;
+            assert!(
+                opened.is_some_and(|after| after <= read + write + Duration::from_secs(1)),
+                "read {read:?} / write {write:?}: the gate opened after {opened:?} \
+                 (the Lease names {:?})",
+                store.holder()
+            );
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            if task.is_finished() {
+                panic!(
+                    "read {read:?} / write {write:?}: the new leader stopped: {:?}",
+                    task.await
+                );
+            }
+            task.abort();
+            assert!(flag.load(Ordering::SeqCst));
+        }
+    }
+
+    /// A write that never answers gets the rest of the leader's window and
+    /// not a moment more: cut at the deadline, the leader steps down there
+    /// exactly — with the margin before the Lease is takeable intact, and
+    /// with nothing in flight that could succeed late and re-open the gate.
+    /// Here the renewal's first read hangs too, so the write only starts
+    /// five seconds before the deadline, and a bound measured from the start
+    /// of the write (rather than from the last renewal) would overrun it.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_write_is_cut_at_the_leaders_deadline_and_not_later() {
+        let mut reads = 0usize;
+        let (client, log) =
+            scripted_apiserver(leader_then(move |call| match call.method.as_str() {
+                "GET" => {
+                    reads += 1;
+                    if reads == 1 {
+                        hang()
+                    } else {
+                        (200, lease_json("operator-a", Utc::now(), ago(600)))
+                    }
+                }
+                _ => hang(),
+            }));
+        let cfg = LeaderConfig::for_apprafter_operator("operator-a");
+        let le = LeaderElection::new(client, cfg.clone());
+        let flag = le.is_leader_handle();
+        let renewed_at = Instant::now();
+
+        let err = tokio::time::timeout(cfg.lease_duration * 3, le.run())
+            .await
+            .expect("a leader whose write hangs must step down, not wait on it")
+            .expect_err("a leader that cannot renew must not report success");
+        assert_eq!(renewed_at.elapsed(), cfg.renew_deadline);
+        assert!(matches!(err, LeaderError::LostLeadership { .. }), "{err}");
+        assert!(!flag.load(Ordering::SeqCst), "the gate must be closed");
+        let calls = log.lock().expect("log").clone();
+        let writes = calls[2..].iter().filter(|c| c.method == "PUT").count();
+        assert_eq!(writes, 1, "{calls:?}");
     }
 }
