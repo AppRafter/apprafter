@@ -1938,57 +1938,111 @@ compatibility: "0.2.80": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.52"
 	notes: """
-		DEPENDENCY SWEEP — no behaviour change intended, and the operator and
-		webhook pods restart once on the new images.
+		DEPENDENCY SWEEP, WAVE 1 — every platform controller restarts once; no
+		application pod and no Postgres or Dragonfly instance restarts. Five
+		behaviours change on purpose; read them before upgrading.
 
-		Rust dependencies moved across both workspaces (issue #1's first
-		upstream version-watch run). The lockfile refresh alone clears four
-		RUSTSEC advisories, the load-bearing one being RUSTSEC-2026-0285:
-		rustls accepted TLS 1.3 handshake messages across encryption-level
-		boundaries, and rustls sits on the live path twice here — kube-client
-		and the outbound registry/HTTP clients.
+		WHAT RESTARTS: the operator and admission webhook (v0.2.52); every Argo
+		CD pod except Redis (a cmd-params key changed, see 3); cert-manager's
+		controller, cainjector and webhook; the sealed-secrets controller; the
+		three VPA pods. WHAT DOES NOT: application pods — the operator adds an
+		apprafter.io/image-ref annotation to the Deployment's own metadata, which
+		bumps its generation once without touching the pod template; Postgres —
+		the CloudNativePG chart is unchanged and the operand image is now pinned
+		to exactly the build every cluster already runs
+		(ghcr.io/cloudnative-pg/postgresql:18.3-system-trixie), applied the next
+		time a pg claim is provisioned, still without a restart; Dragonfly.
 
-		Direct majors taken: axum 0.7 -> 0.8, axum-server 0.7 -> 0.8,
-		thiserror 1 -> 2, prometheus 0.13 -> 0.14, base64 0.22 -> 0.23,
-		rand 0.8 -> 0.9, redis 0.27 -> 1.7. The redis move is the only one
-		that changed code shape: redis 1.0 made ConnectionInfo and
-		RedisConnectionInfo non-constructible by struct literal, so the
-		Dragonfly admin client now builds them through the builder. Same
-		connection, same RESP2, and the password still never enters a URL.
+		KUBERNETES 1.36: the operator, the webhook and the backup runner are now
+		built on kube-rs 4.2 / k8s-openapi 0.28 against the 1.36 API that
+		production runs. CRDs are byte-identical except two new optional
+		PlatformStack fields (5). Written timestamps are byte-identical. Events
+		the operator emits are now named <object>.<hex> instead of
+		<controller>-<random>; nothing depends on their names.
 
-		Base images: the builder moves to rust 1.98-alpine3.24 and the
-		runtime bases to their current minors. Alpine 3.20 had been EOL since
-		2026-04-01 and 3.21 expires 2026-11-01, so the CMP sidecar and the
-		backup runner were building on unsupported bases.
+		1. LEADER ELECTION. The Lease timings are unchanged (30s, renewed every
+		10s), but a leader now bounds every Lease request, steps down 20s after
+		its last successful renewal — 10s before anyone may take the Lease — and
+		exits; it also exits when it reads another holder. An apiserver outage
+		longer than about 20s therefore restarts the operator pod (restartCount
+		+1, last state Error, log "stepping down as leader") instead of leaving
+		a leader reconciling on an expired Lease beside its successor.
 
-		Also replaces the ABANDONED oci-distribution crate with oci-client, the
-		same project after its rename and move to the ORAS org: 0.11.0 was its
-		final release (2024-03-27) while oci-client is on 0.18.0. That crate is
-		on the registry path — ADR 0040 tag-to-digest resolution and the
-		platform-stack chart pull — and it was what actually held reqwest and
-		sha2 down, so both move with it (reqwest 0.12 -> 0.13, sha2 0.10 ->
-		0.11). sha2 0.11 dropped the hex formatting helper, so two hashes had to
-		be re-rendered by hand: the ADR 0052 approval content hash and
-		status.envConfig.digest. BOTH are proven byte-identical against
-		independently computed SHA-256 values rather than against whatever the
-		new code emits — a moved approval hash would invalidate every in-flight
-		approval, and a moved config digest would make every application report
-		a configuration change once, for nothing.
+		2. A REGISTRY BLIP NO LONGER ROLLS YOUR APP. A failed tag-to-digest
+		lookup keeps the digest already running for that image reference and
+		reports ImageResolved=False/ResolveFailed; it used to render the tag,
+		then roll back to the digest on the next success — two rollouts of an
+		unchanged image. A moved tag still rolls on the next successful lookup.
+		After "apprafter app unpin" while the registry is unreachable, the app
+		stays on the pinned digest until a lookup succeeds. ADR 0040 is amended.
 
-		The Argo CD CUE sidecar also moves from cue v0.10.0 to v0.17.1. That is
-		the copy that evaluates YOUR manifests, so it was gated on the sidecar's
-		own 124-assertion injection suite under the candidate rather than on the
-		release notes — v0.17 redesigned comprehension execution, which is the
-		mechanism the two-pass claim injection is built on. cue.mod language
-		versions are deliberately NOT touched: a module declaring an older
-		language version is evaluated with that version's semantics, so manifests
-		keep parsing exactly as before.
+		3. ARGO CD RENDERS AT MOST TWO APPLICATIONS AT ONCE
+		(reposerver.parallelism.limit 2, was unlimited) and the repo-server
+		memory limit rises 256Mi -> 384Mi (request unchanged at 66Mi). A cold
+		start (node reboot, Argo CD upgrade) used to render everything at once
+		and peak close to the old limit; the peak now roughly halves and no
+		longer grows with the number of Applications. The price: a stalled
+		registry or git host can hold both slots for up to 90s, and unrelated
+		Applications show ComparisonError until it recovers. With many
+		Applications, raise the limit through
+		PlatformStack.spec.overrides.argocd.values.configs.params. The upgrade
+		itself re-renders from the Redis cache and is not a cold start.
 
-		Nothing in the rendered chart changes except the operator, webhook and
-		sidecar image tags.
+		4. PLATFORM COMPONENTS. cert-manager v1.16.2 -> v1.21.2: 1.16 was end
+		of life and never supported past Kubernetes 1.32. Existing certificates
+		are kept; each renewal now issues a new private key; the built-in edit
+		role no longer lets namespace editors create ACME Challenges or
+		create/patch/update Orders (GHSA-8rvj-mm4h-c258); the metrics port is
+		renamed http-metrics; an unused token Role is pruned. sealed-secrets
+		2.18.6 -> 2.20.0 (controller 0.40.0): keys, public certificate and wire
+		format unchanged, nothing to re-seal. VPA chart 0.11.0 -> 0.12.0 (VPA
+		1.7.1 unchanged): the new chart drops a permission 1.7.1 still needs to
+		clean up recommendations of deleted apps, so this release grants it.
+
+		5. SCHEDULED BACKUPS CAN NO LONGER HANG (runner apprafter-backup
+		0.2.77). Both backup CronJobs stop a Job at a deadline, 6h by default,
+		set with "apprafter backup set deadline" / "check-deadline" or
+		spec.backup.activeDeadlineSeconds / checkActiveDeadlineSeconds (minimum
+		600). A run stopped at its deadline now records lastFailure, fires the
+		failure webhook, deletes its helper pods and lets restic release its
+		repository lock. Under concurrencyPolicy Forbid a stuck run costs the
+		slots it overlaps; the most recent missed slot starts late once it
+		ends. pg_dump gives up after 5 minutes waiting for table locks and after
+		10 minutes without output (a lock on a view, materialized view or
+		sequence); the failure webhook is bounded to 30s; lastError now carries
+		the failing command's own error output; "apprafter backup status" names
+		why a Job failed. Mind the default schedules: the 6h backup deadline is
+		longer than the 3h gap from the 03:00 backup to the Sunday 06:00 check,
+		so a Sunday backup that long fails that week's check — move the check
+		with "apprafter backup set check 12:00". Helper pods now live
+		max(deadline, 6h) instead of one hour, so a single large dump or load no
+		longer dies at 60 minutes; interactive backup create, export and restore
+		get at least six hours too. JetStream helper pods are renamed to include the
+		claim's namespace; a Completed leftover under an old name is no longer
+		reused and can be removed with: kubectl delete pod -n <nats-namespace>
+		-l apprafter.io/backup-helper=true --field-selector=status.phase=Succeeded
+
+		UNDER THE HOOD. Rust dependencies refreshed across both workspaces,
+		clearing four RUSTSEC advisories — the load-bearing one RUSTSEC-2026-0285
+		(rustls on the kube-client and registry paths). The abandoned
+		oci-distribution crate is replaced by oci-client (the same project after
+		its move to the ORAS org); the two hashes that had to be re-rendered by
+		hand — the ADR 0052 approval content hash and status.envConfig.digest —
+		are proven byte-identical, so no in-flight approval and no application
+		sees a change. Base images move off end-of-life Alpine 3.20/3.21 to
+		3.24. The Argo CD CUE sidecar moves from cue v0.10.0 to v0.17.1, gated on
+		its own injection suite; cue.mod language versions are untouched, so
+		manifests evaluate exactly as before.
 		"""
 	references: [
+		"WI-349",
 		"WI-352",
+		"WI-354",
+		"WI-357",
+		"WI-370",
+		"WI-381",
+		"docs/adr/0040-image-digest-resolution.md",
+		"docs/adr/0066-shared-database.md",
 		"https://github.com/AppRafter/apprafter/issues/1",
 	]
 }
