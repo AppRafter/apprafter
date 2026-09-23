@@ -24,7 +24,10 @@
 //!    SIGINT, 143 for SIGTERM).
 //!
 //! All of it within [`STOP_BOUND`]. A second signal ends the process at once,
-//! from the signal handler itself, with the same code.
+//! from the signal handler itself, with the same code; the one thing it does
+//! first is remove the copies of the kubeconfig the stop writes for its own
+//! kubectl ([`COPY_PATHS`]), which would otherwise stay in `$TMPDIR`
+//! decrypted. The command's own temporary kubeconfig stays, as after any kill.
 //!
 //! Nothing else is undone. A restore stopped partway leaves its applications
 //! scaled down; the record of what to bring them back to is in the cluster,
@@ -85,7 +88,7 @@ use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Once};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -595,8 +598,20 @@ fn register(signals: &[i32]) -> std::io::Result<()> {
     for &signal in signals {
         // In this order, because signal-hook runs a signal's actions in the
         // order they were registered: the first signal finds the flag unset
-        // and only sets it; a second finds it set and ends the process from
-        // the handler itself, whatever the stop is doing.
+        // and only sets it; a second finds it set, removes the stop's copies
+        // of the kubeconfig and ends the process from the handler itself,
+        // whatever the stop is doing.
+        let flag = Arc::clone(&INTERRUPTED);
+        // SAFETY: the action runs inside the signal handler, and does only
+        // what is async-signal-safe there: atomic loads, and unlink(2) of
+        // paths whose memory is never freed ([`COPY_PATHS`]).
+        unsafe {
+            signal_hook::low_level::register(signal, move || {
+                if flag.load(Ordering::SeqCst) {
+                    unlink_all(&COPY_PATHS);
+                }
+            })?;
+        }
         signal_hook::flag::register_conditional_shutdown(
             signal,
             128 + signal,
@@ -649,7 +664,7 @@ fn stop(signal: i32) -> ! {
         say("  no helper pod of this command was running");
     }
     let kubectl = Path::new(crate::commands::backup::KUBECTL_BIN);
-    let mut copies: Vec<(Arc<[u8]>, tempfile::NamedTempFile)> = Vec::new();
+    let mut copies: Vec<(Arc<[u8]>, PrivateCopy)> = Vec::new();
     for ((ns, name), tracked) in pods {
         let path = match copies
             .iter()
@@ -694,15 +709,102 @@ fn stop(signal: i32) -> ! {
     std::process::exit(128 + signal)
 }
 
-/// The kubeconfig `bytes` in a file only this user can read, removed when
-/// dropped.
-fn private_copy(bytes: &[u8]) -> std::io::Result<tempfile::NamedTempFile> {
-    let mut file = tempfile::Builder::new()
+/// The stop's copies of the kubeconfig, as C paths, for a second signal to
+/// remove before it ends the process ([`register`]). That exit is `_exit`,
+/// from the signal handler: no destructor runs, so a copy is removed there or
+/// not at all, and a handler can do no more than read these and `unlink(2)`
+/// each. A slot holds a path while its copy exists ([`PrivateCopy`]); the
+/// memory of a path is never freed, because the handler may be reading it at
+/// any moment — a few dozen bytes per copy, and the stop makes one copy per
+/// kubeconfig, once per process.
+static COPY_PATHS: [AtomicPtr<libc::c_char>; COPY_SLOTS] =
+    [const { AtomicPtr::new(std::ptr::null_mut()) }; COPY_SLOTS];
+
+/// More than the stop ever needs: a command applies every helper through one
+/// kubeconfig.
+const COPY_SLOTS: usize = 8;
+
+/// `unlink(2)` every path in `slots`. Async-signal-safe: the second signal
+/// runs it from the handler.
+fn unlink_all(slots: &[AtomicPtr<libc::c_char>]) {
+    for slot in slots {
+        let path = slot.load(Ordering::SeqCst);
+        if !path.is_null() {
+            // SAFETY: a non-null slot holds a NUL-terminated path that is
+            // never freed (see `COPY_PATHS`).
+            unsafe {
+                libc::unlink(path);
+            }
+        }
+    }
+}
+
+/// Put `path` in a free slot of `slots` and return its index, or fail when
+/// none is free. The path's memory is leaked on purpose (see `COPY_PATHS`).
+fn claim_slot(slots: &[AtomicPtr<libc::c_char>], path: &Path) -> std::io::Result<usize> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())?.into_raw();
+    for (index, slot) in slots.iter().enumerate() {
+        if slot
+            .compare_exchange(
+                std::ptr::null_mut(),
+                c_path,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            return Ok(index);
+        }
+    }
+    // SAFETY: from `into_raw` above and never shared: no slot took it.
+    drop(unsafe { std::ffi::CString::from_raw(c_path) });
+    Err(std::io::Error::other(
+        "no room to record it for a second Ctrl-C to remove",
+    ))
+}
+
+/// A copy of the kubeconfig the stop runs its kubectl through: a file only
+/// this user can read, recorded in [`COPY_PATHS`] before the kubeconfig is
+/// written into it, removed when dropped, and removed by a second signal.
+struct PrivateCopy {
+    file: Option<tempfile::NamedTempFile>,
+    slot: usize,
+}
+
+impl PrivateCopy {
+    fn path(&self) -> &Path {
+        self.file.as_ref().expect("present until dropped").path()
+    }
+}
+
+impl Drop for PrivateCopy {
+    fn drop(&mut self) {
+        // The file first, then the slot: a second signal in between only
+        // unlinks a path that is gone.
+        if let Some(file) = self.file.take() {
+            let _ = file.close();
+        }
+        COPY_PATHS[self.slot].store(std::ptr::null_mut(), Ordering::SeqCst);
+    }
+}
+
+/// The kubeconfig `bytes` in a [`PrivateCopy`].
+fn private_copy(bytes: &[u8]) -> std::io::Result<PrivateCopy> {
+    let file = tempfile::Builder::new()
         .prefix("apprafter-interrupt-")
         .tempfile()?;
+    // No slot, no copy: the kubeconfig is never written where a second
+    // signal could not remove it.
+    let slot = claim_slot(&COPY_PATHS, file.path())?;
+    let mut copy = PrivateCopy {
+        file: Some(file),
+        slot,
+    };
+    let file = copy.file.as_mut().expect("just set");
     file.write_all(bytes)?;
     file.flush()?;
-    Ok(file)
+    Ok(copy)
 }
 
 #[cfg(test)]
@@ -1044,5 +1146,190 @@ mod tests {
             libc::signal(sig, prev);
         }
         assert!(!ignored_at_start(sig));
+    }
+
+    // ------------------------------------------------------------------
+    // A second signal removes the stop's kubeconfig copies
+    // ------------------------------------------------------------------
+
+    fn recorded(slots: &[AtomicPtr<libc::c_char>], path: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt as _;
+        slots.iter().any(|slot| {
+            let p = slot.load(Ordering::SeqCst);
+            // SAFETY: a non-null slot holds a NUL-terminated path never freed.
+            !p.is_null()
+                && unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes() == path.as_os_str().as_bytes()
+        })
+    }
+
+    #[test]
+    fn what_the_second_signal_runs_removes_every_recorded_path() {
+        let slots: [AtomicPtr<libc::c_char>; 2] =
+            [const { AtomicPtr::new(std::ptr::null_mut()) }; 2];
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, c) = (
+            dir.path().join("a"),
+            dir.path().join("b"),
+            dir.path().join("c"),
+        );
+        for p in [&a, &b, &c] {
+            std::fs::write(p, "kubeconfig").unwrap();
+        }
+        claim_slot(&slots, &a).unwrap();
+        claim_slot(&slots, &b).unwrap();
+        // Full: refused, so no copy is ever written unrecorded.
+        assert!(claim_slot(&slots, &c).is_err());
+        unlink_all(&slots);
+        assert!(!a.exists() && !b.exists());
+        assert!(c.exists(), "only what was recorded");
+    }
+
+    /// Each copy the stop writes is recorded before the kubeconfig goes in,
+    /// for as long as it exists, and no longer.
+    #[test]
+    fn a_copy_is_recorded_for_exactly_as_long_as_it_exists() {
+        let copy = private_copy(b"apiVersion: v1\n").unwrap();
+        let path = copy.path().to_path_buf();
+        assert!(path.exists());
+        assert!(recorded(&COPY_PATHS, &path));
+        drop(copy);
+        assert!(!path.exists());
+        assert!(!recorded(&COPY_PATHS, &path));
+    }
+
+    /// The whole of it, in a process of its own: the stop is deleting a
+    /// helper pod through its private copy of the kubeconfig — its kubectl
+    /// hangs — when a second SIGTERM comes. The process exits at once with
+    /// 143 and leaves no copy behind; before, `_exit` from the handler left
+    /// the decrypted kubeconfig in `$TMPDIR`.
+    #[test]
+    fn a_second_signal_exits_at_once_and_leaves_no_kubeconfig_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        // The stop's kubectl, found on the child's PATH: `delete` hangs.
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let stub_dir = tempfile::tempdir().unwrap();
+        let stub_path = stub(&stub_dir, "exec sleep 10");
+        std::fs::copy(&stub_path, bin.join("kubectl")).unwrap();
+        wait_until_executable(&bin.join("kubectl"));
+        let kc = dir.path().join("kubeconfig");
+        std::fs::write(&kc, "apiVersion: v1\nkind: Config\n").unwrap();
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::helper_interrupt::tests::second_signal_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("APPRAFTER_INTERRUPT_CHILD_KUBECONFIG", &kc)
+            .env("TMPDIR", tmp.path())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        let copies = || -> Vec<String> {
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|n| n.starts_with("apprafter-interrupt-"))
+                .collect()
+        };
+        let within = |what: &str, bound: Duration, done: &mut dyn FnMut() -> bool| {
+            let until = Instant::now() + bound;
+            while !done() {
+                if Instant::now() > until {
+                    // SAFETY: our own child.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    panic!("{what} within {bound:?}");
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        // Ready once the child has recorded its helper pod.
+        let ready = dir.path().join("ready");
+        within("the child is ready", Duration::from_secs(30), &mut || {
+            ready.exists()
+        });
+
+        // SAFETY: our own child.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        within(
+            "the stop writes its kubeconfig copy",
+            Duration::from_secs(10),
+            &mut || !copies().is_empty(),
+        );
+        // SAFETY: our own child.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let started = Instant::now();
+        let mut status = None;
+        within(
+            "the second signal ends it",
+            Duration::from_secs(5),
+            &mut || {
+                status = child.try_wait().unwrap();
+                status.is_some()
+            },
+        );
+        let mut stderr = String::new();
+        std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+        assert_eq!(status.unwrap().code(), Some(143), "{stderr}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "at once: {stderr}"
+        );
+        assert!(
+            stderr.contains("SIGTERM: deleting the helper pods this command created"),
+            "the first signal's stop had begun: {stderr}"
+        );
+        assert_eq!(copies(), Vec::<String>::new(), "{stderr}");
+        // The stop was in its delete, through the copy, when the second
+        // signal came.
+        let log = log(&stub_dir);
+        assert!(
+            log.starts_with("delete --raw /api/v1/namespaces/demo/pods/bk-pg-db -f -"),
+            "{log}"
+        );
+    }
+
+    /// Wait out `ETXTBSY` on a freshly written executable (see `stub`).
+    fn wait_until_executable(path: &Path) {
+        for _ in 0..200 {
+            match Command::new(path).arg("__probe").status() {
+                Err(e) if e.raw_os_error() == Some(26) => thread::sleep(Duration::from_millis(5)),
+                _ => break,
+            }
+        }
+    }
+
+    /// The child process of the test above, and nothing else: it installs
+    /// the interrupt, records one helper pod this process created, says it is
+    /// ready and waits for the signals. Run on its own it fails, loudly.
+    #[test]
+    #[ignore = "the child process of a_second_signal_exits_at_once_and_leaves_no_kubeconfig_copy"]
+    fn second_signal_child() {
+        let kc = std::env::var("APPRAFTER_INTERRUPT_CHILD_KUBECONFIG")
+            .expect("run only by a_second_signal_exits_at_once_and_leaves_no_kubeconfig_copy");
+        let kc = Path::new(&kc);
+        let _guard = install(None);
+        HelperPods::global()
+            .begin_apply(kc, "demo", "bk-pg-db")
+            .unwrap()
+            .answered(Origin::Created("u-1".into()));
+        std::fs::write(kc.with_file_name("ready"), "").unwrap();
+        loop {
+            thread::park();
+        }
     }
 }
