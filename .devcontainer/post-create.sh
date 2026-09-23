@@ -19,6 +19,8 @@ COSIGN_VERSION="v2.2.4"
 # exact pin gives up the security patches). Copies of mise.toml's `bun` and
 # `just`; lefthook is the flake-locked nixpkgs' minor, which mise does not
 # list (`nix eval --raw --inputs-from . nixpkgs#lefthook.version`).
+# scripts/upstream-versions.py reads these three lines, and the *_VERSION ones
+# above, by name (scripts/upstream-pins.json), so rename them there too.
 BUN_MINOR="1.4"
 JUST_MINOR="1.51"
 LEFTHOOK_MINOR="v2.1"

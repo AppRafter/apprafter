@@ -16,11 +16,16 @@
 //                    end by, is the nixpkgs input comment in flake.nix.
 //
 // bun, just and lefthook are installed by post-create.sh, with their minors
-// written there. What still floats, because no option can pin it and the
-// repository builds nothing with it: the Docker engine from docker-in-docker,
-// git from the Ubuntu 22.04 packages, and the editor tools the go feature adds
-// (gopls, staticcheck, golangci-lint, ...). The `:1` / `:2` after each feature
-// is that feature's own major, not a tool version.
+// written there. scripts/upstream-versions.py reads every version in both
+// files (the rows are in scripts/upstream-pins.json): a copy that disagrees
+// with another copy of the same decision reads as DRIFT, and one the reader
+// can no longer find reads as UNREADABLE.
+//
+// What still floats, because no option can pin it and the repository builds
+// nothing with it: the Docker engine from docker-in-docker, git from the
+// Ubuntu 22.04 packages, and the editor tools the go feature adds (gopls,
+// staticcheck, golangci-lint, ...). The `:1` / `:2` after each feature is
+// that feature's own major, not a tool version.
 {
   "name": "AppRafter Dev",
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu-22.04",
