@@ -36,11 +36,15 @@
 //!   [`stop::stop_run`] instead of by the run itself, its helper pods deleted
 //!   and the signal passed on to a restic it has running, exit **1**. Only one
 //!   of the two ever records ([`OutcomeClaim`]).
+//! * the staging volume holding more than its size limit → the run is
+//!   stopped the same way, by the runner itself, and recorded as a `Failure`
+//!   that names the limit ([`apprafter_backup::staging`]), exit **1**.
 
 use apprafter_backup::config::RunnerConfig;
 use apprafter_backup::kube_rs_exec::KubeRsExec;
 use apprafter_backup::orchestrate::{resolve_namespaces, RunOutcome};
 use apprafter_backup::restic_child::ForwardingRestic;
+use apprafter_backup::staging;
 use apprafter_backup::status::write_status;
 use apprafter_backup::stop::{self, OutcomeClaim, StopContext, StopSignal};
 use apprafter_backup::webhook::post_failure;
@@ -119,6 +123,16 @@ fn run() -> i32 {
     //     installed leaves the run exactly as it was before, so it is reported
     //     and the backup goes ahead.
     let claim = OutcomeClaim::default();
+    let stop_ctx = StopContext {
+        client: client.clone(),
+        live_helpers: k.live_helper_pods(),
+        restic: r.live_children(),
+        started,
+        deadline: cfg.deadline,
+        format,
+        cluster_id: cfg.cluster_id.clone(),
+        failure_webhook: cfg.failure_webhook.clone(),
+    };
     match rt.block_on(async {
         use tokio::signal::unix::{signal, SignalKind};
         Ok::<_, std::io::Error>((
@@ -127,16 +141,7 @@ fn run() -> i32 {
         ))
     }) {
         Ok((mut sigterm, mut sigint)) => {
-            let ctx = StopContext {
-                client: client.clone(),
-                live_helpers: k.live_helper_pods(),
-                restic: r.live_children(),
-                started,
-                deadline: cfg.deadline,
-                format,
-                cluster_id: cfg.cluster_id.clone(),
-                failure_webhook: cfg.failure_webhook.clone(),
-            };
+            let ctx = stop_ctx.clone();
             let claim = claim.clone();
             rt.spawn(async move {
                 let received = tokio::select! {
@@ -163,15 +168,38 @@ fn run() -> i32 {
         ),
     }
 
+    // 2c. The staging volume's size limit. The run stages under TMPDIR, which
+    //     the chart sets to the staging volume, so that directory is the
+    //     volume the limit applies to. Measured here every few seconds: a run
+    //     that outgrows it is stopped and recorded with a message that names
+    //     the limit, instead of being evicted late and recorded, if at all,
+    //     as stopped by Kubernetes. See `staging`.
+    if let Some(limit) = cfg.staging_limit {
+        let ctx = stop_ctx.clone();
+        let claim = claim.clone();
+        let root = std::env::temp_dir();
+        let mode = cfg.staging_mode;
+        rt.spawn(async move {
+            let used = staging::wait_for_overrun(root, limit, staging::POLL).await;
+            if !claim.claim() {
+                // The run is already ending, and records its own outcome.
+                return;
+            }
+            let error = staging::overrun_message(used, limit, mode);
+            let outcome = stop::stop_run_with(&ctx, error, libc::SIGTERM).await;
+            std::process::exit(outcome.exit_code());
+        });
+    }
+
     // 3. The backup itself, wrapped so ANY error becomes a Failure outcome
     //    (never a panic, never a bare exit) — the engine ran, so the outcome is
     //    recorded in the status CM and the exit code is 1.
     let result = do_backup(&k, &r, &cfg);
     if !claim.claim() {
-        // Kubernetes stopped the run and the stop is recording it; an error
-        // here is the stop's own doing (it deleted the helper pod this run
-        // was reading from, or signalled its restic). Wait for the stop to
-        // exit the process.
+        // Kubernetes stopped the run, or its staging passed the limit, and the
+        // stop is recording it; an error here is the stop's own doing (it
+        // deleted the helper pod this run was reading from, or signalled its
+        // restic). Wait for the stop to exit the process.
         loop {
             std::thread::park();
         }

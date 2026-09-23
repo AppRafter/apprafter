@@ -5,6 +5,7 @@ pub mod config;
 pub mod kube_rs_exec;
 pub mod orchestrate;
 pub mod restic_child;
+pub mod staging;
 pub mod status;
 pub mod stop;
 pub mod tls;

@@ -8,6 +8,13 @@ now `apprafter node prep`, which applies these reservations *and* provisions
 host swap. The reservation values and rationale below stand unchanged; only
 the command name and its now-expanded scope moved.
 
+**Amended 2026-09-23** — the Tier-1 budget did not count the off-site backup
+runner, and on a ~4GB node with a Postgres and a persistent Dragonfly instance
+the runner's 256Mi request found no room. The runner now requests a measured
+128Mi, and what a ~4GB node holds with backups on is stated in [the
+amendment](#amendment-the-backup-runner-in-the-tier-1-budget-2026-09-23) at the
+end. The rest of the decision stands.
+
 ADR for subphase 2.16d (`plan.md` §2.16d). Records the resource-governance
 model — pod QoS strategy, node reservations, and what is deferred — since
 2.16e (recommendation-based right-sizing) builds on it. Ships as a
@@ -216,6 +223,81 @@ Negative / neutral:
   `ServiceProvider.spec.config`, never a direct VPA target. Recording this
   now so 2.16e does not re-derive it.
 
+## Amendment — the backup runner in the Tier-1 budget (2026-09-23) {#amendment-the-backup-runner-in-the-tier-1-budget-2026-09-23}
+
+The budget-close in §6 counted the platform and a representative application
+with `needs.pg` and `needs.redis`. It did not count the off-site backup runner:
+a Job the schedule starts every night, whose pod asks the scheduler for memory
+of its own. "The budget closed with headroom" was true of the pods that were
+counted and not of the node as it runs.
+
+The walks before the platform-stack 0.2.80 release found it on the ~4GB machine
+Tier 1 is sized for. Allocatable memory is 1958Mi (3814Mi less the 1500Mi
+system reservation, the 256Mi kube reservation and the 100Mi eviction
+threshold). Two clusters, each running the platform, the shared Postgres
+(256Mi, Guaranteed) and one persistent Dragonfly instance (320Mi, Guaranteed),
+had requested 1792Mi with three small applications and 1824Mi with six: 91 and
+93 %. That left 166Mi and 134Mi. The runner requested 256Mi, so its pod stayed
+`Pending` with `Insufficient memory` and no preemption victim, and no nightly
+backup ran. Before 0.2.80 gave the backup Job a deadline, that one Job also
+held the schedule, so no later backup started either.
+
+**Decision.** The capacity model stays: no pod that reserves room for the
+runner, no larger minimum machine. Instead:
+
+1. **The runner's request is measured, and it keeps a limit.** A backup run's
+   memory is restic's; the runner itself holds about 8 MiB. restic sizes its
+   concurrency by the CPUs it sees, which with no CPU limit is every CPU of the
+   node (a first backup of a 2 GB database peaked at about 145 MiB of anonymous
+   memory on 2 CPUs and at 695 MiB on 32), and its memory grows with the
+   repository's index, by about 0.1 MiB per thousand blobs past a hundred
+   thousand, not with the size of the data, which only adds page cache the
+   limit reclaims. The chart therefore pins restic to two CPUs
+   (`GOMAXPROCS=2`) and has its garbage collector keep the heap near 96 MiB
+   (`GOMEMLIMIT=96MiB`). With those, a first backup of a 2 GB database peaked
+   at about 100 MiB of anonymous memory; a first backup of about 470 MB of
+   PostgreSQL, a persistent Dragonfly instance and a volume at 98 MiB, and the
+   later runs of the same data at 64 MiB; the weekly check at 137 MiB on a
+   repository of 1.51 million blobs; and the largest run measured, a first
+   backup into that repository followed by the in-Job prune, at 200 MiB. The
+   backup and check Jobs request **128Mi** of memory and 100m of CPU, and are
+   limited to **384Mi**. The request covers a typical run; the limit is 1.9
+   times the largest run measured, and without the two settings a backup into
+   that repository peaked at 280 MiB and passed under it. A run above its
+   request uses memory no other pod was promised, and under node memory
+   pressure it is among the first the kubelet evicts.
+
+   The same measurement found the staging volume unused: the runner staged in
+   the container's writable layer, where `stagingSizeLimit` bounded nothing.
+   It now stages, and keeps restic's cache for the run, on the staging volume,
+   and stops a run whose staging outgrows the limit with an error that names
+   the limit and what to change.
+2. **A backup that cannot run is reported, not masked.** `apprafter backup
+   run` stops waiting on a pod no node has room for and says so with the
+   scheduler's reason, `apprafter backup status` shows such a Job as
+   `Pending, cannot be scheduled` rather than `Running`, and the cluster's own
+   status reports a backup that failed or never started.
+3. **The limit that remains is documented** where an operator sizes a machine.
+
+**What a ~4GB node holds with backups on.** The platform (1120Mi of requests
+on the 0.2.80 walk), the shared Postgres, one Dragonfly instance and about four
+small applications at the 32Mi seed request, with the runner's 128Mi fitting
+in what is left: the two clusters above would have 38Mi and 6Mi to spare with
+it placed. A few more small applications, a second environment of one, an
+application whose request its recommendation has raised, or a further backend
+instance does not fit beside it: an ephemeral `needs.redis` class is another
+320Mi Dragonfly instance and `needs.jetstream` requests 384Mi, more than the
+node has left even before the runner is counted. A node in that position still
+runs its applications, but its nightly backup cannot start. The public pages that state this are [Choosing the
+machine](../operator-guide/choosing-the-machine.md#how-much-memory) and [Node
+reservations and swap](../how-it-works/node-reservations-and-swap.md#what-a-4-gb-node-holds);
+the troubleshooting entry for a runner that does not fit is [the backup
+runner's pod cannot be
+scheduled](../operator-guide/backup-restore.md#runner-unschedulable).
+
+The numbers the chart ships are asserted by `scripts/check-backup-render.sh`,
+so a change to them is a change to this budget.
+
 ## Owner
 
 Andrey Ryahovskiy.
@@ -232,6 +314,10 @@ Andrey Ryahovskiy.
   budget).
 - If the supported Tier-1 minimum node changes: re-run the baseline walk and
   re-check the D2 budget-close.
+- If restic moves a minor version, or a repository's index grows past the
+  1.5 million blobs it was measured at: re-measure the backup runner's peak.
+  Its request and limit are sized from restic 0.18.1, whose memory grows with
+  the index, not with the data.
 
 ## References
 

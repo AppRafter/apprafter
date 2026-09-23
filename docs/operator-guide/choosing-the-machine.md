@@ -1,5 +1,5 @@
 ---
-description: "Why AppRafter never picks a server type for you, how to read the live machine catalogue, the ways to supply a type and which one wins, and why changing the machine of a running cluster is a rebuild."
+description: "Why AppRafter never picks a server type for you, how much a 4 GB machine holds, how to read the live machine catalogue, the ways to supply a type and which one wins, and why changing the machine of a running cluster is a rebuild."
 ---
 
 # Choosing the machine
@@ -10,10 +10,11 @@ create a machine with no type chosen stops and says so, before it creates
 anything at all. Provisioning is where the spending starts, so the
 machine is yours to name.
 
-This page covers how to choose a type, the three ways to supply one, what
-the error means when you supply none, what happens to a cluster created
-before the default was removed, and why the machine of a running cluster
-cannot be changed in place — with what to do instead.
+This page covers how much memory the machine needs, how to choose a type,
+the three ways to supply one, what the error means when you supply none,
+what happens to a cluster created before the default was removed, and why
+the machine of a running cluster cannot be changed in place — with what to
+do instead.
 
 
 > There is no default machine type. Naming none is an error, not a
@@ -48,6 +49,38 @@ control plane alongside your workloads, and
 So read the `cores/ram/disk` figures twice over: the disk is everything
 the cluster will ever store, and the RAM covers the control plane, the
 platform's own components and your applications together.
+
+## How much memory {#how-much-memory}
+
+On a single-node cluster the node's memory is shared by its control plane, the
+platform's own components, the backends your applications declare, and the
+applications themselves. Kubernetes places a pod only if the memory it
+*requests* still fits in what the node has left, so the figure to size by is
+what everything requests, not what it happens to use.
+
+A machine with **4 GB of RAM** holds, once [node
+preparation](node-prep.md) has reserved the control plane's share:
+
+- the platform's own components;
+- the shared PostgreSQL behind `needs.pg`, and one Dragonfly instance behind a
+  persistent `needs.redis`;
+- the nightly off-site backup, while it runs;
+- about four small applications at the platform's default request.
+
+That is its limit. A further backend instance (an ephemeral `needs.redis`
+class, or `needs.jetstream`), more applications, or a second environment of
+one does not fit beside the backup: the applications keep running, but the
+nightly backup cannot start. `apprafter backup status` then shows its Job as
+`Pending, cannot be scheduled`, and `apprafter top` shows how much memory the
+node has left to give in its `SCHEDULABLE` column. [The backup runner's pod
+cannot be scheduled](backup-restore.md#runner-unschedulable) is the recipe for
+that state, and [Node reservations and
+swap](../how-it-works/node-reservations-and-swap.md#what-a-4-gb-node-holds)
+shows the arithmetic.
+
+If you expect to run more than that, choose a machine with more RAM from the
+start. Moving a running cluster to a bigger machine is a rebuild from a
+backup ([Moving to a bigger machine](moving-to-a-bigger-machine.md)).
 
 ## Reading the catalogue
 

@@ -400,6 +400,10 @@ _backupTemplate: """
 	     activeDeadlineSeconds and the runner's APPRAFTER_BACKUP_DEADLINE_SECONDS
 	     must never disagree, so both are this variable. */}}
 	{{- $deadline := $b.activeDeadlineSeconds | default 21600 | int }}
+	{{- /* ONE value for the staging volume's size, read once: the emptyDir's
+	     sizeLimit, which the kubelet evicts on, and the runner's
+	     APPRAFTER_BACKUP_STAGING_SIZE_LIMIT, which it stops a run on first. */}}
+	{{- $stagingLimit := $b.stagingSizeLimit | default "10Gi" }}
 	---
 	apiVersion: v1
 	kind: ServiceAccount
@@ -594,19 +598,82 @@ _backupTemplate: """
 	            - name: APPRAFTER_BACKUP_FAILURE_WEBHOOK
 	              value: {{ $b.failureWebhook | quote }}
 	            {{- end }}
+	            # restic's memory, measured with restic 0.18.1 (WI-386). restic
+	            # runs one blob saver per CPU it sees, and with no CPU limit it
+	            # sees every CPU of the node: a first backup of a 2 GB database
+	            # peaked at about 145 MiB of anonymous memory on 2 CPUs and at
+	            # 695 MiB on 32. GOMAXPROCS holds it to two on any node.
+	            # GOMEMLIMIT has its garbage collector keep the heap near 96 MiB;
+	            # only a very large repository index needs more, and restic then
+	            # runs slower instead of being killed. The runner starts every
+	            # restic with its own environment, so both reach each one (read
+	            # from each restic's /proc/<pid>/environ on kind); the runner
+	            # itself is Rust and reads neither.
+	            - name: GOMAXPROCS
+	              value: "2"
+	            - name: GOMEMLIMIT
+	              value: "96MiB"
+	            # `restic backup --json` prints a progress line 60 times a second
+	            # even without a terminal, and the runner holds all of restic's
+	            # output in memory until restic exits: about 36 MiB for each hour
+	            # of upload. The runner reads only the final summary line, so one
+	            # progress line a minute is plenty.
+	            - name: RESTIC_PROGRESS_FPS
+	              value: "0.0167"
+	            # The runner makes its staging directory under TMPDIR, and restic
+	            # writes its temporary pack files there too. Unset, that was /tmp
+	            # in the container's writable layer, where stagingSizeLimit does
+	            # not reach: every dump of every run landed there, bounded only by
+	            # the node's disk, and the limit below was never enforced.
+	            - name: TMPDIR
+	              value: /staging
+	            # The staging volume's sizeLimit, which the runner measures the
+	            # volume against every two seconds. The kubelet enforces it too,
+	            # by evicting the pod, but from a usage figure it refreshes about
+	            # once a minute and with two seconds' notice: on kind a run that
+	            # staged 652 MiB against 300Mi finished in 17 s and succeeded.
+	            # The runner stops the run itself and records that the staging
+	            # outgrew the limit, and what to change.
+	            - name: APPRAFTER_BACKUP_STAGING_SIZE_LIMIT
+	              value: {{ $stagingLimit | quote }}
+	            # restic's cache, for this run only: what one restic command of
+	            # the run downloads, the next one reads from here. It sits on the
+	            # staging volume, counts toward stagingSizeLimit, and goes with
+	            # the pod, so no run reads a cache it did not write. Without it
+	            # restic looked for $HOME/.cache, HOME is / for this user, and it
+	            # ran with no cache at all. Measured (WI-386): a sequential run
+	            # made 28 GET requests with it and 60 without, a run with the
+	            # in-Job prune 13-15 and 35, and a monolithic run without a prune
+	            # the same number either way.
+	            - name: RESTIC_CACHE_DIR
+	              value: /staging/restic-cache
+	            # Measured (WI-386) with the settings above: a first backup of a
+	            # 2 GB database peaked at about 100 MiB of anonymous memory, a
+	            # first backup of 470 MB of PostgreSQL, a persistent Dragonfly
+	            # instance and a volume at 98 MiB, and the later runs of that
+	            # data at 64 MiB; the kernel adds a few MiB. The data adds page
+	            # cache, which the limit reclaims, not restic heap. The request is
+	            # what the scheduler must find free on the node, so it covers the
+	            # typical run: a 4 GB node running the platform and one
+	            # application with needs.pg and a persistent needs.redis has room
+	            # for it. The limit is 1.9 times the largest run measured, a
+	            # first backup into a repository of 1.51M blobs followed by the
+	            # prune (200 MiB); without GOMEMLIMIT a backup into that
+	            # repository peaked at 280 MiB and passed under this limit, and
+	            # was killed under 256Mi.
 	            resources:
 	              requests:
 	                cpu: 100m
-	                memory: 256Mi
+	                memory: 128Mi
 	              limits:
-	                memory: 512Mi
+	                memory: 384Mi
 	            volumeMounts:
 	            - name: staging
 	              mountPath: /staging
 	          volumes:
 	          - name: staging
 	            emptyDir:
-	              sizeLimit: {{ $b.stagingSizeLimit | default "10Gi" | quote }}
+	              sizeLimit: {{ $stagingLimit | quote }}
 	---
 	{{- if $b.checkSchedule }}
 	# 2.22g / D2: an EMPTY checkSchedule omits this CronJob entirely — that is
@@ -689,12 +756,33 @@ _backupTemplate: """
 	                  optional: true
 	            - name: APPRAFTER_BACKUP_REPO
 	              value: {{ $b.bucket | quote }}
+	            # The backup runner's restic settings, for the same reasons.
+	            # Measured (WI-386) with them: a check peaked at 43-51 MiB of
+	            # anonymous memory on a small repository and at 137 MiB on one of
+	            # 1.51M blobs.
+	            - name: GOMAXPROCS
+	              value: "2"
+	            - name: GOMEMLIMIT
+	              value: "96MiB"
+	            # Without a terminal restic prints no periodic progress; with
+	            # this, a long check (checkReadData) logs where it is once a
+	            # minute.
+	            - name: RESTIC_PROGRESS_FPS
+	              value: "0.0167"
+	            # Without it the unlock looked for $HOME/.cache, HOME is / for
+	            # this user, and every check log opened with `unable to open
+	            # cache: mkdir /.cache: permission denied`. The check itself
+	            # still uses a temporary cache of its own, now made inside this
+	            # directory rather than beside it in /tmp, and removes it when it
+	            # ends.
+	            - name: RESTIC_CACHE_DIR
+	              value: /tmp/restic-cache
 	            resources:
 	              requests:
 	                cpu: 100m
-	                memory: 256Mi
+	                memory: 128Mi
 	              limits:
-	                memory: 512Mi
+	                memory: 384Mi
 	{{- end }}
 	{{- if .Capabilities.APIVersions.Has "cilium.io/v2" }}
 	---

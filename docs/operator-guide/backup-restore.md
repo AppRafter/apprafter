@@ -583,7 +583,7 @@ plain tarballs: `tar -tf volumes/demo/shop-disk/data.tar`.
   … its pod cannot be scheduled (1m 37s so far, giving up at 2m 0s): 0/1 nodes are available: 1 Insufficient memory. …
   ✗ The backup never started: no node has room for its pod.
     The scheduler says: 0/1 nodes are available: 1 Insufficient memory. …
-    The runner asks for 256Mi of memory and 100m of CPU. The scheduled backup asks for the same, so it cannot start either.
+    The runner asks for 128Mi of memory and 100m of CPU. The scheduled backup asks for the same, so it cannot start either.
     …
 Error: apprafter::backup::runner_unschedulable
 
@@ -595,18 +595,23 @@ Error: apprafter::backup::runner_unschedulable
 
 ```text
   Last backup Job: apprafter-backup-29836406 — Pending, cannot be scheduled: 0/1 nodes are available: 1 Insufficient memory. … (2026-09-23 18:26:00 Europe/Lisbon)
-    No node has room for the backup runner's pod, which asks for 256Mi of memory and 100m of CPU.
+    No node has room for the backup runner's pod, which asks for 128Mi of memory and 100m of CPU.
     `apprafter top` shows how much of each node is requested, and by what.
     Until this Job runs or its deadline stops it, the schedule starts no other backup.
 ```
 
-The backup runner's pod requests 256Mi of memory and 100m of CPU, and so does
-the weekly check's. Kubernetes places a pod only on a node whose allocatable
-capacity, less what the pods already there request, covers that request. On a
-node that is nearly fully requested, no node qualifies and the pod stays
-`Pending`. A 4 GB machine running an application that declares both
-`needs.pg` and a persistent `needs.redis` is such a node. The scheduled backup
-is the same Job with the same requests, so it cannot start either.
+The backup runner's pod requests 128Mi of memory and 100m of CPU, and so does
+the weekly check's (256Mi of memory with a platform chart older than 0.2.80;
+the report quotes whatever the Job asks for). Kubernetes places a pod only on
+a node whose allocatable capacity, less what the pods already there request,
+covers that request. On a node that is nearly fully requested, no node
+qualifies and the pod stays `Pending`. A 4 GB machine becomes such a node
+once it runs, beside the shared PostgreSQL of `needs.pg` and a persistent
+`needs.redis`, more than about four small applications or a further backend
+instance ([what a 4 GB node
+holds](../how-it-works/node-reservations-and-swap.md#what-a-4-gb-node-holds)).
+The scheduled backup is the same Job with the same requests, so it cannot
+start either.
 
 Check how much room is left:
 
@@ -616,7 +621,7 @@ apprafter backup status  # Last backup Job / Last check Job: Pending, cannot be 
 ```
 
 While the runner waits, `apprafter top` also reports `1 pod(s) are not
-scheduled to a node`. If the node's `SCHEDULABLE` memory is below 256Mi, the
+scheduled to a node`. If the node's `SCHEDULABLE` memory is below 128Mi, the
 runner cannot be placed.
 
 Not every reason is a lack of room. A reason that names a taint of the node's
@@ -639,7 +644,7 @@ the scheduler's text says what keeps the pod off.
     kubectl -n apprafter-system get events --field-selector reason=FailedScheduling
     ```
 
-To fix it, free enough requested memory for the runner's 256Mi, or move to a
+To fix it, free enough requested memory for the runner's 128Mi, or move to a
 larger machine ([Moving to a bigger machine](moving-to-a-bigger-machine.md)). Once
 there is room, a scheduled Job that was waiting starts on its own within
 moments, and `apprafter backup status` shows it `Running` and then its result.
@@ -676,6 +681,57 @@ is not written and the failure webhook does not fire. What shows the problem
 is the `Last backup Job:` line and a `lastSuccess` that stops moving. A
 platform chart older than 0.2.80 sets no deadline on the backup Job, so there
 a Job stuck this way waits, and holds the schedule, until the node has room.
+
+### The staging volume outgrew its limit {#staging-over-limit}
+
+`apprafter backup run` retries the Job and then fails it, and `apprafter backup
+status` shows why in the runner's `lastError`:
+
+```text
+Jobs:
+  Last backup Job: apprafter-backup-manual-20260923-215827 — Failed: BackoffLimitExceeded: Job has reached the specified backoff limit (2026-09-23 22:58:27 Europe/Lisbon)
+  …
+Runner status:
+  lastSuccess:    never
+  lastFailure:    2026-09-23 23:10:41 Europe/Lisbon
+  lastError:      the staging volume held 318Mi, more than its limit of 300Mi (spec.backup.stagingSizeLimit), so the run was stopped before Kubernetes evicts its pod. …
+```
+
+A backup first writes what it captures, each database's dump, each volume's
+archive and each Dragonfly snapshot, to a volume of the runner's pod, and
+restic keeps its temporary files and its cache for the run on the same volume.
+The volume is limited to `spec.backup.stagingSizeLimit` of the PlatformStack,
+10Gi by default, and lives on the node's disk. The runner measures it every
+two seconds and stops the run once it holds more. Each attempt of the Job meets
+the same limit, so the Job fails after its last attempt; the failure webhook
+fires with the same message.
+
+To fix it, stage one claim at a time, so that only the largest has to fit:
+
+```sh
+apprafter backup set staging-mode sequential
+```
+
+Or raise `spec.backup.stagingSizeLimit`, if the node's disk has the room
+(`apprafter top` shows the node's free disk). No `apprafter` command sets it,
+so it is a patch of the PlatformStack:
+
+??? note "Raising the limit"
+
+    ```sh
+    kubectl -n apprafter-system patch platformstack default --type merge \
+        -p '{"spec":{"backup":{"stagingSizeLimit":"20Gi"}}}'
+    ```
+
+    `apprafter backup enable` and `apprafter backup set` leave the value in
+    place.
+
+Then run `apprafter backup run` to confirm a backup completes.
+
+With a platform chart older than 0.2.80 the runner staged outside this volume,
+in the container's own filesystem, so the limit bounded nothing. After an
+upgrade, a cluster whose backups stage more than the limit fails this way where
+it used to succeed.
 
 ## See also
 

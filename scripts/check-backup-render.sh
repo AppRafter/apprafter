@@ -3,7 +3,8 @@
 #
 # check-backup-render.sh — render the platform-stack chart with scheduled
 # backup switched on, and assert that both backup CronJobs carry a Job
-# deadline, and that the pods under them stop cleanly when it passes.
+# deadline, that the pods under them stop cleanly when it passes, and that
+# they carry the resources and restic settings the runner was measured with.
 #
 # ## Why
 #
@@ -39,6 +40,21 @@
 #   3. a deadline under ten minutes is refused by values.schema.json.
 #   4. the chart's default deadline is the one the runner and the CLI fall back
 #      to (backup-core's DEFAULT_RUN_DEADLINE).
+#   5. both CronJobs request the memory the runner was measured to need and
+#      carry the limit sized from the same measurement, with no CPU limit
+#      (WI-386): 128Mi requested, 384Mi limit, 100m CPU requested.
+#   6. both CronJobs give restic the settings those numbers were measured
+#      with: GOMAXPROCS "2" and GOMEMLIMIT "96MiB". Without GOMAXPROCS restic
+#      sizes its concurrency by the node's CPU count, and a 32-CPU node took a
+#      first backup to 695 MiB. Both slow restic's progress output to one line
+#      a minute (the runner holds all of restic's output in memory until
+#      restic exits) and give restic a cache directory it can write (HOME is
+#      / for the image's user). The backup's runner also stages under the
+#      staging volume (TMPDIR is its mountPath, so stagingSizeLimit bounds the
+#      dumps) and keeps restic's cache there for the run.
+#   7. the staging volume's sizeLimit and the limit the runner checks the
+#      volume against (APPRAFTER_BACKUP_STAGING_SIZE_LIMIT) are one value,
+#      defaulted and set.
 #
 # Usage: bash scripts/check-backup-render.sh
 # Exit 0 = every assertion held.
@@ -67,6 +83,15 @@ fail() {
     echo "FAIL: $*" >&2
     exit 1
 }
+
+# yq reads the rendered containers: an env entry is found by its name, which
+# a line-oriented read of the YAML cannot do reliably. The same resolution as
+# check-component-claim-templates.sh; CI installs yq before this step.
+if command -v yq >/dev/null 2>&1; then
+    YQ=(yq)
+else
+    YQ=(nix run nixpkgs#yq-go --)
+fi
 
 # stderr kept apart from the value: a dirty tree makes cue print a warning
 # there, and folding it in would turn the version into that warning.
@@ -161,6 +186,7 @@ assert_check_execs_restic "defaults" "$workdir/defaults.yaml"
 helm template platform "$chart" --values "$enabled" \
     --set backup.activeDeadlineSeconds=2700 \
     --set backup.checkActiveDeadlineSeconds=43200 \
+    --set backup.stagingSizeLimit=3Gi \
     >"$workdir/set.yaml"
 assert_cronjob "knobs set" "$workdir/set.yaml" apprafter-backup 2700
 assert_cronjob "knobs set" "$workdir/set.yaml" apprafter-backup-check 43200
@@ -187,4 +213,95 @@ rust_default="$(sed -nE 's/^pub const DEFAULT_RUN_DEADLINE: Duration = Duration:
     || fail "backup-core DEFAULT_RUN_DEADLINE is '${rust_default:-not found}', but the chart defaults the Job deadline to 21600"
 echo "  ok: backup-core's DEFAULT_RUN_DEADLINE is the chart's 21600"
 
-echo "PASS: both backup CronJobs carry a Job deadline, and stop cleanly at it."
+# `$1` rendered manifests, `$2` CronJob name, `$3` a yq path under that
+# CronJob's first container: the value there, or empty when it is absent.
+container_value() {
+    NAME="$2" "${YQ[@]}" -r "select(.kind == \"CronJob\" and .metadata.name == strenv(NAME))
+        | .spec.jobTemplate.spec.template.spec.containers[0]$3 // \"\"" "$1"
+}
+
+# `$1` rendered manifests, `$2` CronJob name, `$3` env var: its literal value,
+# or empty when the container does not carry it.
+env_value() {
+    VAR="$3" container_value "$1" "$2" '.env[] | select(.name == strenv(VAR)) | .value'
+}
+
+# `$1` label, `$2` rendered manifests, `$3` CronJob name: the measured
+# requests and limit, and no CPU limit.
+assert_resources() {
+    local label="$1" rendered="$2" name="$3" got want
+    for pair in "requests.cpu=100m" "requests.memory=128Mi" "limits.memory=384Mi" "limits.cpu="; do
+        want="${pair#*=}"
+        got="$(container_value "$rendered" "$name" ".resources.${pair%%=*}")"
+        [[ "$got" == "$want" ]] \
+            || fail "$label: CronJob '$name' resources.${pair%%=*} is '${got:-absent}', want '${want:-absent}' (WI-386 measured a typical run at about 100 MiB of anonymous memory with the restic settings below, and sized the limit from the largest run measured, 200 MiB)"
+    done
+    echo "  ok: $label — $name: requests cpu 100m, memory 128Mi; limit memory 384Mi; no CPU limit"
+}
+
+# `$1` label, `$2` rendered manifests, `$3` CronJob name, then `VAR=value`
+# pairs the container's env must carry exactly.
+assert_env() {
+    local label="$1" rendered="$2" name="$3" pair got
+    shift 3
+    for pair in "$@"; do
+        got="$(env_value "$rendered" "$name" "${pair%%=*}")"
+        [[ "$got" == "${pair#*=}" ]] \
+            || fail "$label: CronJob '$name' env ${pair%%=*} is '${got:-absent}', want '${pair#*=}'"
+    done
+    echo "  ok: $label — $name env: $*"
+}
+
+# `$1` label, `$2` rendered manifests: the runner stages, and keeps restic's
+# cache, on the staging volume, the volume the size limit applies to.
+assert_staging_on_the_volume() {
+    local label="$1" rendered="$2" mount tmpdir cache
+    mount="$(container_value "$rendered" apprafter-backup '.volumeMounts[] | select(.name == "staging") | .mountPath')"
+    [[ -n "$mount" ]] || fail "$label: the runner does not mount the staging volume"
+    tmpdir="$(env_value "$rendered" apprafter-backup TMPDIR)"
+    [[ "$tmpdir" == "$mount" ]] \
+        || fail "$label: runner TMPDIR is '${tmpdir:-absent}', but the staging volume is mounted at '$mount'; the runner stages under TMPDIR, so the dumps would land outside the volume stagingSizeLimit bounds"
+    cache="$(env_value "$rendered" apprafter-backup RESTIC_CACHE_DIR)"
+    [[ "$cache" == "$mount"/* ]] \
+        || fail "$label: runner RESTIC_CACHE_DIR is '${cache:-absent}', not under the staging volume '$mount'"
+    echo "  ok: $label — runner stages under $mount (TMPDIR) and keeps restic's cache at $cache"
+}
+
+# `$1` label, `$2` rendered manifests, `$3` expected size: the staging
+# volume's sizeLimit and the limit the runner checks the volume against are
+# the same value. The kubelet evicts on the first, from a usage figure up to a
+# minute old and with two seconds' notice; the runner stops the run on the
+# second and says why. Two different numbers would leave one of them never
+# reached.
+assert_staging_limit() {
+    local label="$1" rendered="$2" want="$3" volume env
+    volume="$("${YQ[@]}" -r 'select(.kind == "CronJob" and .metadata.name == "apprafter-backup")
+        | .spec.jobTemplate.spec.template.spec.volumes[] | select(.name == "staging")
+        | .emptyDir.sizeLimit // ""' "$rendered")"
+    env="$(env_value "$rendered" apprafter-backup APPRAFTER_BACKUP_STAGING_SIZE_LIMIT)"
+    [[ "$volume" == "$want" ]] \
+        || fail "$label: the staging volume's sizeLimit is '${volume:-absent}', want '$want'"
+    [[ "$env" == "$want" ]] \
+        || fail "$label: runner env APPRAFTER_BACKUP_STAGING_SIZE_LIMIT is '${env:-absent}', but the staging volume's sizeLimit is '$volume'"
+    echo "  ok: $label — staging sizeLimit and the runner's own limit are both $want"
+}
+
+echo "==> backup CronJob resources and restic settings, chart $version"
+
+for rendered in "$workdir/defaults.yaml" "$workdir/set.yaml"; do
+    label="defaults"
+    [[ "$rendered" == "$workdir/set.yaml" ]] && label="knobs set"
+    assert_resources "$label" "$rendered" apprafter-backup
+    assert_resources "$label" "$rendered" apprafter-backup-check
+    assert_env "$label" "$rendered" apprafter-backup \
+        GOMAXPROCS=2 GOMEMLIMIT=96MiB RESTIC_PROGRESS_FPS=0.0167
+    assert_env "$label" "$rendered" apprafter-backup-check \
+        GOMAXPROCS=2 GOMEMLIMIT=96MiB RESTIC_PROGRESS_FPS=0.0167 \
+        RESTIC_CACHE_DIR=/tmp/restic-cache
+    assert_staging_on_the_volume "$label" "$rendered"
+done
+assert_staging_limit "defaults" "$workdir/defaults.yaml" 10Gi
+assert_staging_limit "knobs set" "$workdir/set.yaml" 3Gi
+
+echo "PASS: both backup CronJobs carry a Job deadline, stop cleanly at it, and"
+echo "      carry the measured resources and restic settings."

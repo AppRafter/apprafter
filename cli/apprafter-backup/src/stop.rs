@@ -40,6 +40,10 @@
 //! would run late on any pod but the first. The same path also records a run
 //! stopped for another reason — its pod deleted or evicted.
 //!
+//! The runner also stops a run itself, through the same steps
+//! ([`stop_run_with`]), when its staging volume holds more than its size
+//! limit ([`crate::staging`]); the failure it records then says so.
+//!
 //! Exactly one of the run and the stop records the outcome: [`OutcomeClaim`].
 
 use std::collections::BTreeSet;
@@ -288,7 +292,10 @@ pub fn stopped_message(
     }
 }
 
-/// Everything the stop needs, captured when the run starts.
+/// Everything the stop needs, captured when the run starts. Cloned for each
+/// thing that can stop the run: a signal, or the staging volume passing its
+/// limit ([`crate::staging`]).
+#[derive(Clone)]
 pub struct StopContext {
     pub client: kube::Client,
     pub live_helpers: LiveHelperPods,
@@ -306,6 +313,23 @@ pub struct StopContext {
 /// every step has finished or run out of time; the caller then exits.
 pub async fn stop_run(ctx: &StopContext, signal: StopSignal) -> RunOutcome {
     let error = stopped_message(ctx.started.elapsed(), ctx.deadline, signal);
+    stop_run_with(ctx, error, signal.number()).await
+}
+
+/// Stop the run for the reason `error` gives, the same way whatever stopped
+/// it: the work under way stopped (helper pods deleted, `restic_signal`
+/// passed on to a running restic so it removes its lock), then `error`
+/// recorded as the run's failure and posted to the failure webhook. Each step
+/// is bounded (the `*_BOUND` constants). Returns once every step has finished
+/// or run out of time; the caller then exits.
+///
+/// The caller must hold the run's [`OutcomeClaim`]: exactly one of the run
+/// and its stops records the outcome.
+pub async fn stop_run_with(
+    ctx: &StopContext,
+    error: String,
+    restic_signal: libc::c_int,
+) -> RunOutcome {
     eprintln!("backup stopped: {error}");
 
     // 1. Stop the work under way: the helper pods and restic, side by side.
@@ -349,7 +373,7 @@ pub async fn stop_run(ctx: &StopContext, signal: StopSignal) -> RunOutcome {
     };
     //    restic: the signal passed on, so that it removes its lock itself.
     let release_restic =
-        crate::restic_child::release_restic(&ctx.restic, signal.number(), RESTIC_RELEASE_BOUND);
+        crate::restic_child::release_restic(&ctx.restic, restic_signal, RESTIC_RELEASE_BOUND);
     tokio::join!(delete_helpers, release_restic);
 
     // 2. The status ConfigMap.
@@ -509,6 +533,88 @@ mod tests {
                 "the run is recorded: {seen:?}"
             );
         }
+    }
+
+    /// A stop for a reason of the runner's own (the staging volume past its
+    /// limit) takes the same steps, records the reason it is given rather
+    /// than a signal's, and passes on the signal it is told to.
+    #[test]
+    fn a_stop_for_the_runners_own_reason_records_that_reason() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let (started, got) = (dir.path().join("started"), dir.path().join("got"));
+        let bin = dir.path().join("restic");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = __probe ] && exit 0\n\
+                 trap 'echo TERM > {got}; exit 1' TERM\n\
+                 trap 'echo INT > {got}; exit 1' INT\n\
+                 touch {started}\nwhile :; do sleep 0.05; done\n",
+                got = got.display(),
+                started = started.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for _ in 0..200 {
+            match std::process::Command::new(&bin).arg("__probe").status() {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                _ => break,
+            }
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let seen = RecordingApiServer::default();
+        let client = {
+            let _guard = rt.enter();
+            kube::Client::new(seen.clone(), "default")
+        };
+        let restic = crate::restic_child::ForwardingRestic::new(&bin);
+        let live_restic = restic.live_children();
+        let run = std::thread::spawn(move || {
+            use backup_core::ResticRunner as _;
+            restic.run(&["backup".to_string()], "pw")
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !started.exists() {
+            assert!(Instant::now() < deadline, "the fake restic never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let live_helpers = LiveHelperPods::default();
+        drop(live_helpers.begin_apply("shop", "bk-pg-db").unwrap());
+        let ctx = StopContext {
+            client,
+            live_helpers,
+            restic: live_restic.clone(),
+            started: Instant::now(),
+            deadline: Some(Duration::from_secs(21600)),
+            format: "monolithic",
+            cluster_id: "test".into(),
+            failure_webhook: None,
+        };
+
+        let reason = "the staging volume held 1.5Gi, more than its limit of 1.0Gi";
+        let outcome = rt.block_on(stop_run_with(&ctx, reason.to_string(), libc::SIGINT));
+        match &outcome {
+            RunOutcome::Failure { error } => assert_eq!(error, reason),
+            RunOutcome::Success { .. } => panic!("a stopped run recorded success"),
+        }
+        assert_eq!(outcome.exit_code(), 1);
+        assert_eq!(std::fs::read_to_string(&got).unwrap(), "INT\n");
+        assert!(run.join().unwrap().is_err());
+        assert_eq!(live_restic.running(), 0);
+        let seen = seen.0.lock().unwrap().clone();
+        assert!(
+            seen.contains(&"DELETE /api/v1/namespaces/shop/pods/bk-pg-db".to_string()),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|r| r.contains("configmaps/apprafter-backup-status")),
+            "the run is recorded: {seen:?}"
+        );
     }
 
     #[test]

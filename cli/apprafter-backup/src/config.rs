@@ -46,6 +46,14 @@ pub struct RunnerConfig {
     /// ([`Self::helper_keep_alive`]). `None` when the variable is absent — a
     /// Job template older than it.
     pub deadline: Option<Duration>,
+    /// The staging volume's size limit in bytes: `spec.backup.stagingSizeLimit`,
+    /// which the chart renders into the volume's `sizeLimit` and, from the
+    /// same value, into `APPRAFTER_BACKUP_STAGING_SIZE_LIMIT`. The runner
+    /// stops a run whose staging passes it ([`crate::staging`]). `None` when
+    /// the variable is absent (a Job template older than it) or holds a
+    /// quantity this parser does not read; the kubelet's eviction is then the
+    /// only bound, as it was before.
+    pub staging_limit: Option<u64>,
 }
 
 impl RunnerConfig {
@@ -98,6 +106,10 @@ impl RunnerConfig {
             Some(v) => Some(parse_deadline(v)?),
         };
 
+        let staging_limit = e
+            .get("APPRAFTER_BACKUP_STAGING_SIZE_LIMIT")
+            .and_then(|v| parse_staging_limit(v));
+
         Ok(RunnerConfig {
             repo,
             cluster_id,
@@ -108,6 +120,7 @@ impl RunnerConfig {
             retention,
             failure_webhook,
             deadline,
+            staging_limit,
         })
     }
 
@@ -153,6 +166,26 @@ fn parse_deadline(value: &str) -> Result<Duration> {
             "env APPRAFTER_BACKUP_DEADLINE_SECONDS={value:?} is not a whole number of seconds \
              above zero"
         ))),
+    }
+}
+
+/// `APPRAFTER_BACKUP_STAGING_SIZE_LIMIT`: a Kubernetes quantity (`10Gi`,
+/// `500Mi`, `20G`) above zero, in bytes. The value already passed the
+/// apiserver as the volume's `sizeLimit`, so it is a quantity; one in a form
+/// [`cli_core::quantity::parse_bytes`] does not read (an exponent, `Ei`) is
+/// reported and leaves the runner without its own check rather than failing
+/// the run. The kubelet's eviction still bounds the volume.
+fn parse_staging_limit(value: &str) -> Option<u64> {
+    match cli_core::quantity::parse_bytes(value) {
+        Some(bytes) if bytes > 0 => Some(bytes as u64),
+        _ => {
+            eprintln!(
+                "warning: APPRAFTER_BACKUP_STAGING_SIZE_LIMIT={value:?} is not a size this runner \
+                 reads; it does not watch the staging volume, and only the kubelet's eviction \
+                 bounds it"
+            );
+            None
+        }
     }
 }
 
@@ -217,8 +250,10 @@ mod tests {
             ("APPRAFTER_BACKUP_HOST", "prod"),
             ("APPRAFTER_BACKUP_FAILURE_WEBHOOK", "https://hook"),
             ("APPRAFTER_BACKUP_DEADLINE_SECONDS", "21600"),
+            ("APPRAFTER_BACKUP_STAGING_SIZE_LIMIT", "10Gi"),
         ]);
         let c = RunnerConfig::from_env_map(&e).unwrap();
+        assert_eq!(c.staging_limit, Some(10 * 1024 * 1024 * 1024));
         assert_eq!(c.repo, "s3:https://ep/b");
         assert_eq!(c.cluster_id, "c1");
         assert_eq!(c.backup_host, "prod");
@@ -248,6 +283,33 @@ mod tests {
         assert_eq!(c.retention.keep_monthly, 6);
         assert!(c.failure_webhook.is_none());
         assert!(c.deadline.is_none());
+        assert!(c.staging_limit.is_none());
+    }
+
+    #[test]
+    fn the_staging_limit_reads_every_unit_the_chart_can_render() {
+        for (raw, want) in [
+            ("10Gi", Some(10u64 << 30)),
+            ("512Mi", Some(512u64 << 20)),
+            ("20G", Some(20_000_000_000u64)),
+            ("1073741824", Some(1u64 << 30)),
+            ("1.5Gi", Some(3u64 << 29)),
+            // Not a size this runner reads: no check of its own, and the run
+            // goes ahead under the kubelet's.
+            ("0", None),
+            ("1e9", None),
+            ("", None),
+        ] {
+            let e = map(&[
+                ("APPRAFTER_BACKUP_REPO", "s3:x"),
+                ("APPRAFTER_CLUSTER_ID", "c"),
+                ("RESTIC_PASSWORD", "p"),
+                ("APPRAFTER_BACKUP_STAGING_SIZE_LIMIT", raw),
+            ]);
+            let c = RunnerConfig::from_env_map(&e)
+                .unwrap_or_else(|err| panic!("{raw:?} failed the config: {err}"));
+            assert_eq!(c.staging_limit, want, "{raw:?}");
+        }
     }
 
     #[test]
