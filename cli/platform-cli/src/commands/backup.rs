@@ -1612,12 +1612,7 @@ pub fn run_export(namespaces: &[String], select: bool, out: Option<&str>) -> Res
     let claims = claims_in_namespaces(&ns_set, kc.path())?;
     let plan = plan_extraction(&claims);
     let pg_image = pg_helper_image(first_cnpg_image(&ns_set, kc.path()).as_deref());
-    // No deadline stops an export, so its helper pods' keep-alive is the only
-    // limit on one extraction: the cluster's backup deadline, never less than
-    // six hours however short a frequent schedule has made it
-    // (backup_core::helper_pod::helper_keep_alive).
-    let keep_alive = backup_core::engine::read_helper_keep_alive(&k)?;
-    run_extraction(&k, &plan, &out_dir, &pg_image, keep_alive)?;
+    export_extract(&k, &plan, &out_dir, &pg_image)?;
 
     let platform_version = read_platform_version(kc.path())?;
     let manifest = export_manifest(&cluster_id, &platform_version, &ns_set, &claims);
@@ -1635,6 +1630,26 @@ pub fn run_export(namespaces: &[String], select: bool, out: Option<&str>) -> Res
         )
     );
     Ok(())
+}
+
+/// Extract an export's data: every helper pod, sized as an interactive
+/// command's helpers are.
+///
+/// No deadline stops an export, so its helper pods' keep-alive is the only
+/// limit on one extraction: the cluster's backup deadline, never less than
+/// six hours however short a frequent schedule has made it
+/// ([`backup_core::engine::read_helper_keep_alive`]). The read is here rather
+/// than in [`run_export`] so the tests drive it: a keep-alive sized from the
+/// schedule's deadline alone once cut a long restore short, and what guards
+/// against it coming back is the pod specs this builds.
+fn export_extract(
+    k: &dyn KubeExec,
+    plan: &[backup_core::extract::ExtractItem],
+    out_dir: &Path,
+    pg_image: &str,
+) -> Result<()> {
+    let keep_alive = backup_core::engine::read_helper_keep_alive(k)?;
+    run_extraction(k, plan, out_dir, pg_image, keep_alive)
 }
 
 /// The output directory for `export`: the `--out` path, else
@@ -1799,16 +1814,6 @@ pub fn run_backup(
 
     let pg_image = pg_helper_image(first_cnpg_image(&ns_set, kc.path()).as_deref());
     let platform_version = read_platform_version(kc.path())?;
-    // An interactive backup has no Job deadline — the person running it is
-    // the one who stops it — so its helper pods' keep-alive is the only limit
-    // on one extraction: the cluster's backup deadline, never less than six
-    // hours however short a frequent schedule has made it. The scheduled
-    // runner follows the same rule, so both build one spec for a helper's
-    // name. For a helper pod this command was killed before deleting, it ends
-    // the pod's process; the Pod object stays, `Completed`, until the next
-    // command or run that needs it replaces it (see
-    // `backup_core::helper_pod`).
-    let helper_keep_alive = backup_core::engine::read_helper_keep_alive(&k)?;
 
     // Stage everything under a tempdir; the engine writes data/ under this root.
     let staging = tempfile::Builder::new()
@@ -1817,6 +1822,7 @@ pub fn run_backup(
         .map_err(|e| CliError::Other(format!("create staging dir: {e}")))?;
 
     let opts = local_pull_backup_opts(
+        &k,
         &repo_str,
         pass,
         &cluster_id,
@@ -1826,9 +1832,8 @@ pub fn run_backup(
         select,
         staging.path(),
         pg_image,
-        helper_keep_alive,
         staging_mode,
-    );
+    )?;
 
     let r = SubprocessRestic;
     let summary = backup_core::engine::run_backup_with_summary(&k, &r, &opts)?;
@@ -1842,14 +1847,25 @@ pub fn run_backup(
 
 /// Assemble the [`BackupOpts`] the CLI local-pull path hands to the engine.
 ///
-/// Pure — extracted from [`run_backup`] and called from both there and the
-/// tests. INVARIANT: `backup_host` is `None`. The CLI pull keeps the operator
+/// Extracted from [`run_backup`] and called from both there and the tests.
+/// INVARIANT: `backup_host` is `None`. The CLI pull keeps the operator
 /// workstation's own hostname as the restic group, which is what makes
 /// per-station grouping work; only the in-cluster runner pins
 /// `Some("apprafter-backup")` because its pod name is ephemeral (spec
 /// §Retention M-r3-1a).
+///
+/// The one cluster read is the helper pods' keep-alive
+/// ([`backup_core::engine::read_helper_keep_alive`]). An interactive backup
+/// has no Job deadline — the person running it is the one who stops it — so
+/// that keep-alive is the only limit on one extraction: the cluster's backup
+/// deadline, never less than six hours however short a frequent schedule has
+/// made it. The scheduled runner follows the same rule, so both build one
+/// spec for a helper's name. It is read here, not passed in, so the tests
+/// drive the read itself: a keep-alive sized from the schedule's deadline
+/// alone once cut a long restore short.
 #[allow(clippy::too_many_arguments)]
 fn local_pull_backup_opts(
+    k: &dyn KubeExec,
     repo: &str,
     passphrase: String,
     cluster_id: &str,
@@ -1859,10 +1875,9 @@ fn local_pull_backup_opts(
     is_subset: bool,
     staging_root: &Path,
     pg_image: String,
-    helper_keep_alive: Duration,
     staging_mode: StagingMode,
-) -> BackupOpts {
-    BackupOpts {
+) -> Result<BackupOpts> {
+    Ok(BackupOpts {
         repo: repo.to_string(),
         passphrase,
         cluster_id: cluster_id.to_string(),
@@ -1873,10 +1888,10 @@ fn local_pull_backup_opts(
         is_subset,
         staging_root: staging_root.to_path_buf(),
         pg_image,
-        helper_keep_alive,
+        helper_keep_alive: backup_core::engine::read_helper_keep_alive(k)?,
         staging_mode,
         backup_host: None,
-    }
+    })
 }
 
 /// The operator-facing summary `backup` prints on success. Pure — extracted
@@ -9277,12 +9292,83 @@ mod tests {
         assert!(s.contains("5 (2 extractable)"), "{s}");
     }
 
-    #[test]
-    fn the_local_pull_keeps_the_operator_stations_hostname_as_the_restic_group() {
-        // spec §Retention M-r3-1a: only the in-cluster runner pins a fixed
-        // host (its pod name is ephemeral). Pinning it here would merge every
-        // operator's snapshots into one retention group.
-        let opts = local_pull_backup_opts(
+    /// A cluster whose backup deadline is `deadline` seconds, recording
+    /// every helper pod applied in it — enough of one for the paths that
+    /// size and build an interactive command's helpers.
+    struct SizingKube {
+        deadline: u64,
+        applied: std::sync::Mutex<Vec<Value>>,
+    }
+
+    impl SizingKube {
+        fn with_deadline(deadline: u64) -> Self {
+            Self {
+                deadline,
+                applied: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn keep_alives(&self) -> Vec<Value> {
+            self.applied
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|spec| spec["spec"]["containers"][0]["command"].clone())
+                .collect()
+        }
+    }
+
+    impl KubeExec for SizingKube {
+        fn apply_and_wait_pod_ready(&self, spec: &Value) -> Result<()> {
+            self.applied.lock().unwrap().push(spec.clone());
+            Ok(())
+        }
+        fn exec_stream_to_file(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[&str],
+            out: &Path,
+            _: Option<Duration>,
+        ) -> Result<()> {
+            std::fs::write(out, b"DUMP").unwrap();
+            Ok(())
+        }
+        fn exec_stream_from_file(&self, _: &str, _: &str, _: &[&str], _: &Path) -> Result<()> {
+            unreachable!("nothing is loaded")
+        }
+        fn delete_pod_best_effort(&self, _: &str, _: &str) {}
+        fn get_secret_key(&self, _: &str, _: &str, key: &str) -> Result<String> {
+            Ok(match key {
+                "host" => "platform.nats.svc".to_string(),
+                "port" => "4222".to_string(),
+                other => format!("{other}-value"),
+            })
+        }
+        fn get_json(&self, args: &[&str]) -> Result<Option<Value>> {
+            assert_eq!(
+                args,
+                [
+                    "get",
+                    "platformstack",
+                    "default",
+                    "-n",
+                    "apprafter-system",
+                    "-o",
+                    "json"
+                ],
+                "the only read these paths make"
+            );
+            Ok(Some(json!({
+                "spec": {"backup": {"activeDeadlineSeconds": self.deadline}}
+            })))
+        }
+    }
+
+    /// `backup create`'s options, from a cluster with the given deadline.
+    fn local_pull_opts_under(k: &SizingKube) -> BackupOpts {
+        local_pull_backup_opts(
+            k,
             "s3:https://h/b",
             "pw".into(),
             "prod-cluster",
@@ -9292,9 +9378,67 @@ mod tests {
             true,
             Path::new("/staging"),
             "postgres:18-alpine".into(),
-            Duration::from_secs(43200),
             StagingMode::Sequential,
-        );
+        )
+        .unwrap()
+    }
+
+    /// The interactive commands have no Job deadline, so their helpers'
+    /// keep-alive is the only limit on one dump. A cluster backing up every
+    /// fifteen minutes sets a ten-minute deadline, and a helper sized by it
+    /// killed a long load at ten minutes; each path's helpers live six hours
+    /// all the same, and longer when the deadline is. `backup create` hands
+    /// the engine what [`local_pull_backup_opts`] read (the engine's own test
+    /// holds every helper to it); `export` applies them itself.
+    #[test]
+    fn an_interactive_backup_and_export_size_their_helpers_past_a_short_schedule_deadline() {
+        for (deadline, want) in [(600, "21600"), (43200, "43200")] {
+            let k = SizingKube::with_deadline(deadline);
+            assert_eq!(
+                local_pull_opts_under(&k).helper_keep_alive,
+                Duration::from_secs(want.parse().unwrap()),
+                "backup create under a deadline of {deadline}s"
+            );
+
+            let k = SizingKube::with_deadline(deadline);
+            let plan = plan_extraction(&[
+                json!({"spec": {"type": "pg"}, "metadata": {"name": "db", "namespace": "shop"},
+                       "status": {"connectionSecretRef": "db-conn"}}),
+                json!({"spec": {"type": "disk"}, "metadata": {"name": "files", "namespace": "shop"},
+                       "status": {"volumeClaimRef": "pvc"}}),
+                json!({"spec": {"type": "jetstream"}, "metadata": {"name": "js", "namespace": "shop"},
+                       "status": {"connectionSecretRef": "js-conn",
+                                  "streams": {"declared": ["orders"]}}}),
+            ]);
+            let dir = tempfile::tempdir().unwrap();
+            export_extract(&k, &plan, dir.path(), "postgres:18-alpine").unwrap();
+            assert_eq!(
+                k.keep_alives(),
+                vec![json!(["sleep", want]); 3],
+                "export under a deadline of {deadline}s"
+            );
+        }
+    }
+
+    #[test]
+    fn the_local_pull_keeps_the_operator_stations_hostname_as_the_restic_group() {
+        // spec §Retention M-r3-1a: only the in-cluster runner pins a fixed
+        // host (its pod name is ephemeral). Pinning it here would merge every
+        // operator's snapshots into one retention group.
+        let opts = local_pull_backup_opts(
+            &SizingKube::with_deadline(43200),
+            "s3:https://h/b",
+            "pw".into(),
+            "prod-cluster",
+            MINE,
+            "0.2.58",
+            &["prod".to_string()],
+            true,
+            Path::new("/staging"),
+            "postgres:18-alpine".into(),
+            StagingMode::Sequential,
+        )
+        .unwrap();
         assert_eq!(opts.backup_host, None);
         assert!(opts.is_subset, "--select must reach the tag decoration");
         assert_eq!(opts.repo, "s3:https://h/b");

@@ -2053,23 +2053,36 @@ fn wait_claims_ready_with(
 /// into its freshly-provisioned backend.
 fn load_data(data_dir: &Path, manifest: &BackupManifest, kubeconfig: &Path) -> Result<()> {
     let k = KubectlExec::new(kubeconfig.to_path_buf());
-    // How long each load helper pod keeps itself alive, and so the most one
-    // load may take, since a restore has no Job deadline: the target
-    // cluster's backup deadline, never less than six hours however short a
-    // frequent schedule has made it (backup_core::helper_pod::
-    // helper_keep_alive). It was a fixed hour, then the deadline alone; a
-    // load killed by it is explained rather than left as exit code 137.
-    let keep_alive = backup_core::engine::read_helper_keep_alive(&k)?;
+    // Each load helper pod reads how long it keeps itself alive — the most
+    // one load may take, since a restore has no Job deadline — right before
+    // it is built (restore_helper_keep_alive).
     // pg: data/pg/<ns>/<claim>.dump
-    load_pg_dumps(data_dir, &k, kubeconfig, keep_alive)?;
+    load_pg_dumps(data_dir, &k, kubeconfig)?;
     // volumes: data/volumes/<ns>/<name>/data.tar
-    load_volumes(data_dir, manifest, &k, kubeconfig, keep_alive)?;
+    load_volumes(data_dir, manifest, &k, kubeconfig)?;
     // redis: data/redis/<ns>/<claim>/dump.tar → Dragonfly whole-instance snapshot.
     load_redis(data_dir, &k, kubeconfig)?;
     // jetstream: data/jetstream/<ns>/<claim>/<stream>.tar → the stream, over
     // the NATS wire, messages and consumers together (2.6d-6).
-    load_jetstream(data_dir, &k, kubeconfig, keep_alive)?;
+    load_jetstream(data_dir, &k, kubeconfig)?;
     Ok(())
+}
+
+/// How long a restore's load helper pod keeps itself alive, and so the most
+/// one load may take, since a restore has no Job deadline: the target
+/// cluster's backup deadline, never less than six hours however short a
+/// frequent schedule has made it ([`backup_core::engine::read_helper_keep_alive`]).
+/// It was a fixed hour, then the deadline alone, which killed a long
+/// `pg_restore` at ten minutes on a cluster backing up every fifteen; a load
+/// killed by it is explained rather than left as exit code 137.
+///
+/// Read by each helper's builder ([`run_pg_restore`], [`load_one_volume`],
+/// [`restore_claim_streams`]) right before it builds the pod, not once for the
+/// whole restore and passed down: the rest of a restore is bound to `kubectl`,
+/// so the builders are where the tests reach, and a keep-alive handed to them
+/// is one the tests would never see sized. One PlatformStack read per helper.
+fn restore_helper_keep_alive(k: &dyn KubeExec) -> Result<std::time::Duration> {
+    backup_core::engine::read_helper_keep_alive(k)
 }
 
 /// One dumped stream on disk: `jetstream/<ns>/<claim>/<stream>.tar`.
@@ -2181,12 +2194,7 @@ fn jetstream_restore_script(stream: &str) -> String {
 /// ones, never the backed-up ones — the same rule the pg loader follows), and
 /// the credentials from `nats-mgr-<ns>`, because a claim user is denied the
 /// snapshot API by construction (ADR 0061 §4.2).
-fn load_jetstream(
-    data_dir: &Path,
-    k: &dyn KubeExec,
-    kubeconfig: &Path,
-    keep_alive: std::time::Duration,
-) -> Result<()> {
+fn load_jetstream(data_dir: &Path, k: &dyn KubeExec, kubeconfig: &Path) -> Result<()> {
     let artifacts = discover_stream_artifacts(data_dir);
     if artifacts.is_empty() {
         return Ok(());
@@ -2220,7 +2228,7 @@ fn load_jetstream(
             user,
             password,
         };
-        restore_claim_streams(k, &ns, &claim, &server, &streams, keep_alive)?;
+        restore_claim_streams(k, &ns, &claim, &server, &streams)?;
     }
     Ok(())
 }
@@ -2248,7 +2256,6 @@ fn restore_claim_streams(
     claim: &str,
     server: &NatsServer,
     streams: &[StreamArtifact],
-    keep_alive: std::time::Duration,
 ) -> Result<()> {
     // The server's namespace is shared by every application namespace, so
     // the name carries the claim's (and fits the 63-character limit).
@@ -2265,7 +2272,7 @@ fn restore_claim_streams(
         &server.url,
         &server.user,
         &server.password,
-        keep_alive,
+        restore_helper_keep_alive(k)?,
     );
     k.apply_and_wait_pod_ready(&spec)?;
 
@@ -2308,12 +2315,7 @@ fn resolve_claim_connection_secret(ns: &str, claim: &str, kubeconfig: &Path) -> 
 /// Restore every `data/pg/<ns>/<claim>.dump` via `pg_restore` over a helper
 /// pod, using the FRESH connection Secret (L3 — the post-provision creds, NOT
 /// the backed-up ones).
-fn load_pg_dumps(
-    data_dir: &Path,
-    k: &dyn KubeExec,
-    kubeconfig: &Path,
-    keep_alive: std::time::Duration,
-) -> Result<()> {
+fn load_pg_dumps(data_dir: &Path, k: &dyn KubeExec, kubeconfig: &Path) -> Result<()> {
     let dumps = discover_pg_dumps(data_dir);
     if dumps.is_empty() {
         return Ok(());
@@ -2331,9 +2333,7 @@ fn load_pg_dumps(
     let pg_image = pg_helper_image(first_cnpg_image(&namespaces, kubeconfig).as_deref());
 
     for (ns, claim, dump_path) in dumps {
-        load_one_pg(
-            &ns, &claim, &dump_path, k, kubeconfig, &pg_image, keep_alive,
-        )?;
+        load_one_pg(&ns, &claim, &dump_path, k, kubeconfig, &pg_image)?;
     }
     Ok(())
 }
@@ -2393,7 +2393,6 @@ fn load_one_pg(
     k: &dyn KubeExec,
     kubeconfig: &Path,
     pg_image: &str,
-    keep_alive: std::time::Duration,
 ) -> Result<()> {
     // Resolve the FRESH connection Secret name from the regenerated claim.
     let claim_json = kubectl_get_json(
@@ -2416,26 +2415,17 @@ fn load_one_pg(
     })?;
     let conn = pg_connection_from_secret(&secret, ns, &secret_name)?;
 
-    run_pg_restore(
-        ns,
-        claim,
-        &conn,
-        dump_path,
-        k,
-        pg_image,
-        keep_alive,
-        &|pod| {
-            // Wait for the TARGET database to actually accept a connection before
-            // streaming the dump. `WaitClaimsBound` only guarantees the
-            // ResourceClaim's `.status.ready` (a control-plane condition); for the
-            // FIRST claim that lazily provisions the shared CNPG cluster, the
-            // server can still be finishing initdb (connection refused) AND the
-            // per-claim database can be uncreated (`FATAL: database "…" does not
-            // exist`) when the claim flips ready, so an immediate `pg_restore`
-            // aborts the whole restore.
-            wait_pg_reachable(pod, ns, &conn, kubeconfig)
-        },
-    )
+    run_pg_restore(ns, claim, &conn, dump_path, k, pg_image, &|pod| {
+        // Wait for the TARGET database to actually accept a connection before
+        // streaming the dump. `WaitClaimsBound` only guarantees the
+        // ResourceClaim's `.status.ready` (a control-plane condition); for the
+        // FIRST claim that lazily provisions the shared CNPG cluster, the
+        // server can still be finishing initdb (connection refused) AND the
+        // per-claim database can be uncreated (`FATAL: database "…" does not
+        // exist`) when the claim flips ready, so an immediate `pg_restore`
+        // aborts the whole restore.
+        wait_pg_reachable(pod, ns, &conn, kubeconfig)
+    })
 }
 
 /// The FRESH connection Secret name of a regenerated claim (L3).
@@ -2526,7 +2516,6 @@ fn run_pg_restore(
     dump_path: &Path,
     k: &dyn KubeExec,
     pg_image: &str,
-    keep_alive: std::time::Duration,
     probe: &dyn Fn(&str) -> Result<()>,
 ) -> Result<()> {
     let pod_name = truncate_pod_name(&format!("ld-pg-{claim}"));
@@ -2534,7 +2523,13 @@ fn run_pg_restore(
     // `pg_restore`): `PGPASSWORD` so `pg_restore` never prompts and hangs the
     // restore, and `PGOPTIONS` so a `pg_restore` stopped while its `--clean`
     // waits on a lock does not leave that request queued on the server.
-    let spec = pg_helper_pod_spec(&pod_name, ns, pg_image, &conn.pass, keep_alive);
+    let spec = pg_helper_pod_spec(
+        &pod_name,
+        ns,
+        pg_image,
+        &conn.pass,
+        restore_helper_keep_alive(k)?,
+    );
 
     let _guard = PodCleanupGuard {
         name: pod_name.clone(),
@@ -2635,11 +2630,10 @@ fn load_volumes(
     manifest: &BackupManifest,
     k: &dyn KubeExec,
     kubeconfig: &Path,
-    keep_alive: std::time::Duration,
 ) -> Result<()> {
     for (ns, name, tar_path) in discover_nested_artifacts(data_dir, "volumes", "data.tar") {
         let pvc = resolve_volume_pvc(&ns, &name, manifest, kubeconfig)?;
-        load_one_volume(&ns, &name, &pvc, &tar_path, k, keep_alive)?;
+        load_one_volume(&ns, &name, &pvc, &tar_path, k)?;
     }
     Ok(())
 }
@@ -2745,9 +2739,9 @@ fn load_one_volume(
     pvc: &str,
     tar_path: &Path,
     k: &dyn KubeExec,
-    keep_alive: std::time::Duration,
 ) -> Result<()> {
     let pod_name = truncate_pod_name(&format!("ld-vol-{name}"));
+    let keep_alive = restore_helper_keep_alive(k)?;
     let spec = volume_pod_spec(&pod_name, ns, VOLUME_IMAGE, pvc, false, keep_alive); // L1: RW
     let _guard = PodCleanupGuard {
         name: pod_name.clone(),
@@ -3832,6 +3826,9 @@ mod tests {
         /// Every exec is killed by its helper pod's keep-alive running out:
         /// it fails with exit code 137, and the pod reads as ended.
         keep_alive_runs_out: bool,
+        /// The cluster's `spec.backup.activeDeadlineSeconds`; `None` is a
+        /// PlatformStack without one (six hours).
+        deadline: Option<u64>,
     }
 
     impl FakeKube {
@@ -3920,7 +3917,27 @@ mod tests {
 
         fn get_json(&self, args: &[&str]) -> Result<Option<Value>> {
             // Restore reads JSON through kubectl_get_json, not KubeExec — but
-            // for the helper pod a killed load ran in.
+            // for the keep-alive each load helper is given, and for the
+            // helper pod a killed load ran in.
+            if args[..2] == ["get", "platformstack"] {
+                assert_eq!(
+                    args,
+                    [
+                        "get",
+                        "platformstack",
+                        "default",
+                        "-n",
+                        "apprafter-system",
+                        "-o",
+                        "json"
+                    ]
+                );
+                let backup = match self.deadline {
+                    Some(secs) => serde_json::json!({"activeDeadlineSeconds": secs}),
+                    None => serde_json::json!({}),
+                };
+                return Ok(Some(serde_json::json!({"spec": {"backup": backup}})));
+            }
             assert!(self.keep_alive_runs_out, "unexpected get_json {args:?}");
             assert_eq!(args[..2], ["get", "pods"], "{args:?}");
             Ok(Some(serde_json::json!({
@@ -6445,15 +6462,7 @@ mod tests {
         let mut names = Vec::new();
         for ns in ["shop", "blog"] {
             let k = FakeKube::default();
-            restore_claim_streams(
-                &k,
-                ns,
-                "worker-js",
-                &nats_server(),
-                &streams,
-                backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
-            )
-            .unwrap();
+            restore_claim_streams(&k, ns, "worker-js", &nats_server(), &streams).unwrap();
             let applied = k.applied.borrow();
             assert_eq!(applied[0]["metadata"]["namespace"], "nats");
             names.push(applied[0]["metadata"]["name"].as_str().unwrap().to_string());
@@ -6471,14 +6480,7 @@ mod tests {
     fn a_jetstream_helper_that_never_becomes_ready_is_deleted() {
         let k = FakeKube::failing_apply();
         let (_dir, streams) = stream_artifacts(&["orders"]);
-        let r = restore_claim_streams(
-            &k,
-            "atm",
-            "worker-js",
-            &nats_server(),
-            &streams,
-            backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
-        );
+        let r = restore_claim_streams(&k, "atm", "worker-js", &nats_server(), &streams);
         assert!(r.is_err());
         assert!(
             k.execs.borrow().is_empty(),
@@ -6496,15 +6498,7 @@ mod tests {
     fn a_jetstream_helper_replays_every_stream_and_is_deleted_once() {
         let k = FakeKube::default();
         let (_dir, streams) = stream_artifacts(&["orders", "orders_dlq"]);
-        restore_claim_streams(
-            &k,
-            "atm",
-            "worker-js",
-            &nats_server(),
-            &streams,
-            backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
-        )
-        .unwrap();
+        restore_claim_streams(&k, "atm", "worker-js", &nats_server(), &streams).unwrap();
         let applied = k.applied.borrow();
         assert_eq!(applied.len(), 1);
         assert_eq!(applied[0]["metadata"]["name"], rs_js("atm"));
@@ -6519,15 +6513,9 @@ mod tests {
         );
 
         let failing = FakeKube::failing_exec();
-        assert!(restore_claim_streams(
-            &failing,
-            "atm",
-            "worker-js",
-            &nats_server(),
-            &streams,
-            backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
-        )
-        .is_err());
+        assert!(
+            restore_claim_streams(&failing, "atm", "worker-js", &nats_server(), &streams,).is_err()
+        );
         assert_eq!(
             failing.execs.borrow().len(),
             1,
@@ -6791,7 +6779,6 @@ mod tests {
             dump.path(),
             &k,
             "postgres:18",
-            backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
             &|pod| {
                 probed.borrow_mut().push(pod.to_string());
                 Ok(())
@@ -6843,7 +6830,6 @@ mod tests {
             dump.path(),
             &k,
             "postgres:18",
-            backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
             &|_| Ok(()),
         );
         assert!(r.is_err());
@@ -6851,6 +6837,51 @@ mod tests {
             *k.deleted.borrow(),
             vec![("ld-pg-db".to_string(), "demo".to_string())]
         );
+    }
+
+    /// Every loader with a helper sizes it itself, as an interactive
+    /// command's helpers are: a restore has no Job deadline, so the helper's
+    /// keep-alive is the only limit on one load. A cluster backing up every
+    /// fifteen minutes sets a ten-minute deadline, and a helper sized by it
+    /// killed a long `pg_restore` at ten minutes; the helpers live six hours
+    /// all the same, and longer when the deadline is.
+    #[test]
+    fn every_load_helper_outlives_a_short_schedule_deadline() {
+        let dump = tempfile::NamedTempFile::new().unwrap();
+        let (_dir, streams) = stream_artifacts(&["orders"]);
+        for (deadline, want) in [
+            (Some(600), "21600"),
+            (Some(43200), "43200"),
+            (None, "21600"),
+        ] {
+            let k = FakeKube {
+                deadline,
+                ..FakeKube::default()
+            };
+            run_pg_restore(
+                "demo",
+                "db",
+                &pg_conn(),
+                dump.path(),
+                &k,
+                "postgres:18",
+                &|_| Ok(()),
+            )
+            .unwrap();
+            load_one_volume("demo", "uploads", "pvc-uploads", dump.path(), &k).unwrap();
+            restore_claim_streams(&k, "atm", "worker-js", &nats_server(), &streams).unwrap();
+            let keep_alives: Vec<Value> = k
+                .applied
+                .borrow()
+                .iter()
+                .map(|spec| spec["spec"]["containers"][0]["command"].clone())
+                .collect();
+            assert_eq!(
+                keep_alives,
+                vec![serde_json::json!(["sleep", want]); 3],
+                "deadline {deadline:?}"
+            );
+        }
     }
 
     /// A load killed by its helper pod's keep-alive says so, and how to give
@@ -6871,7 +6902,6 @@ mod tests {
                 dump.path(),
                 &keep_alive_runs_out(),
                 "postgres:18",
-                backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
                 &|_| Ok(()),
             ),
             load_one_volume(
@@ -6880,7 +6910,6 @@ mod tests {
                 "pvc-uploads",
                 dump.path(),
                 &keep_alive_runs_out(),
-                backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
             ),
             restore_claim_streams(
                 &keep_alive_runs_out(),
@@ -6888,7 +6917,6 @@ mod tests {
                 "worker-js",
                 &nats_server(),
                 &streams,
-                backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
             ),
         ];
         for (i, r) in errors.into_iter().enumerate() {
@@ -6919,7 +6947,6 @@ mod tests {
             dump.path(),
             &k,
             "postgres:18",
-            backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
             &|_| Err(CliError::Other("unreachable".into())),
         );
         assert!(r.is_err());
@@ -6941,15 +6968,7 @@ mod tests {
         let k = FakeKube::default();
         let tar = tempfile::NamedTempFile::new().unwrap();
 
-        load_one_volume(
-            "demo",
-            "uploads",
-            "pvc-uploads",
-            tar.path(),
-            &k,
-            backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
-        )
-        .unwrap();
+        load_one_volume("demo", "uploads", "pvc-uploads", tar.path(), &k).unwrap();
 
         let applied = k.applied.borrow();
         let spec = &applied[0];

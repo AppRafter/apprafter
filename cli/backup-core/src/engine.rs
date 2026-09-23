@@ -454,7 +454,11 @@ pub fn read_platform_version(k: &dyn KubeExec) -> Result<String> {
 ///
 /// Crate-private on purpose: the CLI sized its helper pods with this once, and
 /// a deadline set for a frequent schedule then cut its restores short. What a
-/// caller outside wants is [`read_helper_keep_alive`].
+/// caller outside wants is [`read_helper_keep_alive`]. The visibility is a
+/// hint, not the guard: [`crate::helper_pod::run_deadline_of`] is public, and
+/// a CLI path could still size its helpers with it. What catches that is the
+/// tests of the pod specs each interactive path builds under a ten-minute
+/// deadline (`backup create`, `export`, `restore` in `platform-cli`).
 pub(crate) fn read_run_deadline(k: &dyn KubeExec) -> Result<std::time::Duration> {
     Ok(crate::helper_pod::run_deadline_of(
         get_platformstack(k)?.as_ref(),
@@ -1207,6 +1211,8 @@ mod tests {
         errors: BTreeMap<String, String>,
         /// Every `get_json` args vector the engine issued, in order.
         calls: RefCell<Vec<Vec<String>>>,
+        /// Every helper pod spec the engine applied, in order.
+        applied: RefCell<Vec<Value>>,
     }
 
     impl FakeKube {
@@ -1226,6 +1232,7 @@ mod tests {
                 replies: BTreeMap::new(),
                 errors: BTreeMap::new(),
                 calls: RefCell::new(Vec::new()),
+                applied: RefCell::new(Vec::new()),
             }
         }
 
@@ -1250,7 +1257,8 @@ mod tests {
     }
 
     impl KubeExec for FakeKube {
-        fn apply_and_wait_pod_ready(&self, _spec: &Value) -> Result<()> {
+        fn apply_and_wait_pod_ready(&self, spec: &Value) -> Result<()> {
+            self.applied.borrow_mut().push(spec.clone());
             Ok(())
         }
 
@@ -1394,6 +1402,34 @@ mod tests {
             read_helper_keep_alive(&FakeKube::scripted()).unwrap(),
             std::time::Duration::from_secs(6 * 3600)
         );
+    }
+
+    /// The keep-alive a caller puts in the options is the one every helper
+    /// pod of the run carries, in both staging modes: the CLI reads it off
+    /// the cluster (never less than six hours), the runner off its Job's
+    /// deadline, and nothing in between may swap it for another number.
+    #[test]
+    fn every_helper_a_backup_applies_carries_the_keep_alive_it_was_given() {
+        for mode in [StagingMode::Monolithic, StagingMode::Sequential] {
+            let staging = tempfile::tempdir().unwrap();
+            let k = FakeKube::with_pg_claims(2);
+            let r = RecordingRestic::default();
+            let mut opts = opts_for(mode, staging.path().to_path_buf());
+            opts.helper_keep_alive = std::time::Duration::from_secs(43210);
+
+            run_backup(&k, &r, &opts).expect("backup");
+
+            let applied = k.applied.borrow();
+            assert_eq!(applied.len(), 2, "{applied:?}");
+            for spec in applied.iter() {
+                assert_eq!(
+                    spec["spec"]["containers"][0]["command"],
+                    json!(["sleep", "43210"]),
+                    "{}",
+                    spec["metadata"]["name"]
+                );
+            }
+        }
     }
 
     #[test]
@@ -1550,6 +1586,7 @@ mod tests {
             replies,
             errors: BTreeMap::new(),
             calls: RefCell::new(Vec::new()),
+            applied: RefCell::new(Vec::new()),
         };
         assert_eq!(read_cluster_uid(&k).unwrap(), TEST_UID);
     }
@@ -1569,6 +1606,7 @@ mod tests {
             replies: BTreeMap::new(),
             errors,
             calls: RefCell::new(Vec::new()),
+            applied: RefCell::new(Vec::new()),
         };
         let e = read_cluster_uid(&k).expect_err("a 403 must not be swallowed");
         let msg = format!("{e}");
@@ -1583,6 +1621,7 @@ mod tests {
             replies: BTreeMap::new(),
             errors: BTreeMap::new(),
             calls: RefCell::new(Vec::new()),
+            applied: RefCell::new(Vec::new()),
         };
         // FakeKube reports absent (Ok(None)) for anything it has no reply for.
         assert!(read_cluster_uid(&k).is_err());
@@ -1597,6 +1636,7 @@ mod tests {
             replies,
             errors: BTreeMap::new(),
             calls: RefCell::new(Vec::new()),
+            applied: RefCell::new(Vec::new()),
         };
         assert!(read_cluster_uid(&k).is_err());
     }
