@@ -4,12 +4,28 @@
 
   inputs = {
     # A RELEASE branch, not nixos-unstable. Unstable already carries
-    # kubernetes-helm 4.x and nixpkgs has no `kubernetes-helm_3` fallback, so a
-    # routine `nix flake update` would have put Helm 4 in the dev shell while
-    # CI runs Helm 3 — a toolchain swap arriving as a side effect of a lockfile
+    # kubernetes-helm 4.x and nixpkgs has no `kubernetes-helm_3` fallback, so on
+    # unstable a routine `nix flake update` would swap the dev shell's helm
+    # major — a toolchain change arriving as a side effect of a lockfile
     # refresh, with nothing naming it. The release branch still moves (it is
     # a branch, and flake.lock pins the rev), it just does not cross majors
     # underneath us.
+    #
+    # HELM 3 HERE, HELM 4 IN CI — ON PURPOSE. Every workflow that installs
+    # helm pins 4.3.0 (scripts/upstream-pins.json `tool-helm`), while this
+    # shell and the dev container that mirrors it (`devcontainer-helm`) run
+    # this branch's helm 3, 3.20. `apprafter` runs whatever helm the user has
+    # installed, users have either major, and the two apply a release
+    # differently: helm 4 installs server-side, which is why re-running
+    # cluster-bootstrap after a loader change conflicts with Argo CD there
+    # (WI-369). The CLI has to work under both, and with CI on 4 this
+    # tool-belt is where helm 3 still gets run. Two facts bound the split:
+    # 3.20 receives no patches (the last was 3.20.2, 2026-04-09; helm 3 went on
+    # to 3.22), and helm 3 as a whole gets security fixes only until
+    # 2026-11-11. Move the shell and the dev container to helm 4 together
+    # before then: the next release branch (nixos-26.11) will carry helm 4,
+    # and if it is not out in time, pin a helm release binary here the way
+    # `cuePinned` pins cue.
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-utils.url = "github:numtide/flake-utils";
   };
