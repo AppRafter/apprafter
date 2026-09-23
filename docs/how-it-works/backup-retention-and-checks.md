@@ -373,7 +373,9 @@ that is `Forbid`, not the deadline.
 **The two schedules bound each other.** `restic check` holds the repository's
 exclusive lock, and neither Job waits for a lock (no `--retry-lock`): a check
 that starts while a backup is running fails on the backup's lock, and a
-backup that starts while a check is running fails on the check's. So on top of
+backup that starts while a check is running fails on the check's. For the
+same reason `apprafter backup run` starts nothing while a backup or check Job
+has not finished (`apprafter::backup::job_active`). So on top of
 its own interval, each deadline has a second ceiling:
 
 - the backup's deadline stays below the time from a backup's start to the next

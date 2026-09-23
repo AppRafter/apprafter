@@ -2396,18 +2396,166 @@ pub fn run_backup_trigger(wait: bool, timeout_minutes: u64) -> Result<()> {
     instantiate_backup_job(&cronjob, wait, timeout_minutes, kc.path())
 }
 
+/// A backup or check Job that has not finished, as `backup run` finds it
+/// before it starts another ([`active_runner_jobs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveJob {
+    name: String,
+    /// What it is doing, as `backup status` prints it (`Running`, `Pending,
+    /// cannot be scheduled: …`), or `Stopping (<reason>)` once the Job
+    /// controller has begun to fail it.
+    state: String,
+    /// Its pod ([`job_pod`]).
+    pod: JobPod,
+    /// The lines `backup status` prints under it ([`job_pod::status_hint`]).
+    hint: Option<String>,
+}
+
+/// The reason of `job`'s condition of type `kind` when it is True.
+fn true_condition_reason(job: &Value, kind: &str) -> Option<String> {
+    job.pointer("/status/conditions")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|c| {
+            c.get("type").and_then(Value::as_str) == Some(kind)
+                && c.get("status").and_then(Value::as_str) == Some("True")
+        })
+        .map(|c| {
+            c.get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or(kind)
+                .to_string()
+        })
+}
+
+/// The backup and check Jobs (names beginning `apprafter-backup`) that have
+/// not finished, newest first: no `Complete` or `Failed` condition, nothing
+/// succeeded, and not being deleted. Pure.
+///
+/// A Job the Job controller has begun to fail (`FailureTarget`) counts: its
+/// runner is still stopping, and holds its room and its repository lock
+/// until it has.
+fn active_runner_jobs(jobs: &[Value], pods: &[Value]) -> Vec<ActiveJob> {
+    let mut active: Vec<&Value> = jobs
+        .iter()
+        .filter(|j| job_metadata_name(j).starts_with("apprafter-backup"))
+        .filter(|j| j.pointer("/metadata/deletionTimestamp").is_none())
+        .filter(|j| job_run_outcome(j) == JobOutcome::Running)
+        .filter(|j| {
+            j.pointer("/status/succeeded")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                == 0
+        })
+        .collect();
+    active.sort_by_key(|j| std::cmp::Reverse(job_start_time(j)));
+    active
+        .into_iter()
+        .map(|j| {
+            let pod = job_pod(j, pods);
+            let state = match true_condition_reason(j, "FailureTarget") {
+                Some(r) => format!("Stopping ({r})"),
+                None => job_line_outcome(j, pods),
+            };
+            ActiveJob {
+                name: job_metadata_name(j).to_string(),
+                hint: job_pod::status_hint(j, &pod),
+                state,
+                pod,
+            }
+        })
+        .collect()
+}
+
+/// What `backup run` does instead of starting a run beside a backup or
+/// check Job that has not finished: the report it prints and the error it
+/// exits with. `None` when no such Job is active. Pure.
+///
+/// One run at a time. Two runs at once do not both finish: two backups need
+/// the same helper pods, and a backup and a check each fail on the other's
+/// repository lock, since neither waits for one. On a node with room for one
+/// runner, the second would not even be scheduled, and `backup run` would
+/// give up on it and report the scheduled backup as unable to start while
+/// that was the one running. A Job no node takes, or whose container cannot
+/// start, may hold on until its deadline, so for those the report also says
+/// how to clear it.
+fn refusal(jobs: &[Value], pods: &[Value]) -> Option<(String, CliError)> {
+    let active = active_runner_jobs(jobs, pods);
+    let first = active.first()?;
+    let mut out = String::new();
+    for a in &active {
+        out.push_str(&format!("  ✗ {} has not finished: {}\n", a.name, a.state));
+        if let Some(hint) = &a.hint {
+            out.push_str(hint);
+        }
+        if matches!(
+            a.pod,
+            JobPod::Unschedulable { .. } | JobPod::NotStarted { reason: Some(_) }
+        ) {
+            out.push_str(&format!(
+                "    It may hold on until its deadline stops it. To start a new run sooner, \
+                 delete it first:\n      kubectl -n {PLATFORMSTACK_NAMESPACE} delete job {}\n",
+                a.name
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "    A second run beside {} would not finish: two backups need the same helper pods, \
+         and a backup and a check each fail on the other's repository lock.\n",
+        if active.len() == 1 { "it" } else { "them" }
+    ));
+    Some((
+        out,
+        CliError::BackupJobActive {
+            job: first.name.clone(),
+        },
+    ))
+}
+
+/// The other backup and check Jobs whose runner is running: each holds room
+/// of the size `own`'s runner needs. Pure.
+fn room_holders(own: &str, jobs: &[Value], pods: &[Value]) -> Vec<String> {
+    active_runner_jobs(jobs, pods)
+        .into_iter()
+        .filter(|a| a.name != own && a.pod == JobPod::Running)
+        .map(|a| a.name)
+        .collect()
+}
+
 /// Create a one-off Job from `cronjob` and, unless told not to, wait for it.
 ///
 /// Shared by `backup run` and by `backup enable`'s first backup, so both
 /// produce the same object and the same reporting — a first backup that
 /// differed from a manual one would make neither of them evidence about the
 /// other.
+///
+/// Nothing is created while a backup or check Job has not finished
+/// ([`refusal`]), `--no-wait` included.
 fn instantiate_backup_job(
     cronjob: &Value,
     wait: bool,
     timeout_minutes: u64,
     kubeconfig: &Path,
 ) -> Result<()> {
+    let jobs = backup_jobs_of(
+        kubectl_get_json("jobs", None, Some(PLATFORMSTACK_NAMESPACE), kubeconfig)?.as_ref(),
+    );
+    let pods = if jobs
+        .iter()
+        .any(|j| job_run_outcome(j) == JobOutcome::Running)
+    {
+        kubectl_get_json("pods", None, Some(PLATFORMSTACK_NAMESPACE), kubeconfig)?
+            .as_ref()
+            .map(items_of)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if let Some((report, err)) = refusal(&jobs, &pods) {
+        print!("{report}");
+        return Err(err);
+    }
+
     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
     let name = manual_job_name(&stamp);
     let manifest = job_from_cronjob(cronjob, &name)?;
@@ -2685,12 +2833,26 @@ fn wait_for_backup_job(name: &str, timeout_minutes: u64, kubeconfig: &Path) -> R
                 failed,
                 last_failure,
             } => {
+                // Another runner that is running holds room of the same size,
+                // and may be the scheduled backup itself: the report names it
+                // rather than say the scheduled backup cannot start.
+                // Best-effort: without the listing the report is the general one.
+                let holders = if cause == Unplaced::NoRoom {
+                    kubectl_get_json("jobs", None, Some(PLATFORMSTACK_NAMESPACE), kubeconfig)
+                        .ok()
+                        .flatten()
+                        .map(|l| room_holders(name, &backup_jobs_of(Some(&l)), &pods))
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
                 let give_up = job_pod::GiveUp {
                     namespace: PLATFORMSTACK_NAMESPACE,
                     name,
                     message: &message,
                     cause: &cause,
                     requests: requests.as_deref(),
+                    holders: &holders,
                     failed,
                     last_failure: last_failure.as_deref(),
                 };
@@ -5621,8 +5783,20 @@ fn take_first_backup(run: impl FnOnce() -> Result<()>) -> Result<()> {
 /// that checks the exit code must not read that as working backups. A first
 /// backup that is not attempted at all (the chart has not synced) exits 0:
 /// nothing failed.
+///
+/// Beside a backup or check Job that has not finished, no first backup is
+/// started ([`refusal`]). That exits 0 too: nothing failed, and the Job
+/// already there is the one to watch.
 fn first_backup_outcome(e: CliError) -> (String, Option<CliError>) {
     match e {
+        CliError::BackupJobActive { job } => (
+            format!(
+                "  Backup IS enabled. Its first backup was not started beside {job}: `apprafter \
+                 backup status` shows that Job's result, and `apprafter backup run` takes a \
+                 backup once it has finished."
+            ),
+            None,
+        ),
         CliError::BackupRunnerUnschedulable { job, what, help } => (
             "  Backup IS enabled: the configuration above is applied. Its first backup could \
              not start."
@@ -12878,6 +13052,169 @@ mod tests {
             Some(CliError::Other(m)) => assert!(m.contains("BackoffLimitExceeded"), "{m}"),
             other => panic!("the error is passed on unchanged: {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // One run at a time: `backup run` beside a Job that has not finished
+    // ------------------------------------------------------------------
+
+    fn running_pod_of(job_uid: &str, pod_uid: &str) -> Value {
+        let mut p = pending_pod(job_uid, pod_uid);
+        p["spec"]["nodeName"] = json!("node-1");
+        p["status"] = json!({"phase": "Running", "conditions": [
+            {"type": "PodScheduled", "status": "True"}
+        ]});
+        p
+    }
+
+    fn with_start(mut j: Value, start: &str) -> Value {
+        j["status"]["startTime"] = json!(start);
+        j
+    }
+
+    #[test]
+    fn only_backup_and_check_jobs_that_have_not_finished_are_active() {
+        let running = with_start(
+            unfinished_job("apprafter-backup-check-29312350", "chk", Some("CronJob")),
+            "2026-09-23T06:00:00Z",
+        );
+        let pending = with_start(
+            unfinished_job("apprafter-backup-29312345", "bk", Some("CronJob")),
+            "2026-09-23T03:00:00Z",
+        );
+        let mut done = unfinished_job("apprafter-backup-29312300", "done", Some("CronJob"));
+        done["status"] = json!({"succeeded": 1, "conditions": [
+            {"type": "Complete", "status": "True"}
+        ]});
+        let mut failed = unfinished_job("apprafter-backup-29312301", "failed", Some("CronJob"));
+        failed["status"] = json!({"failed": 7, "conditions": [
+            {"type": "Failed", "status": "True", "reason": "BackoffLimitExceeded"}
+        ]});
+        // Succeeded, and the Complete condition not written yet.
+        let mut succeeded = unfinished_job("apprafter-backup-29312302", "ok", None);
+        succeeded["status"] = json!({"succeeded": 1});
+        let mut deleting = unfinished_job("apprafter-backup-manual-x", "del", None);
+        deleting["metadata"]["deletionTimestamp"] = json!("2026-09-23T07:00:00Z");
+        let other = unfinished_job("nightly-report", "rep", None);
+        let pods = [
+            running_pod_of("chk", "chk-pod"),
+            pending_pod("bk", "bk-pod"),
+        ];
+        let active = active_runner_jobs(
+            &[done, failed, succeeded, deleting, other, pending, running],
+            &pods,
+        );
+        let names: Vec<&str> = active.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "apprafter-backup-check-29312350",
+                "apprafter-backup-29312345"
+            ],
+            "newest first"
+        );
+        assert_eq!(active[0].state, "Running");
+        assert_eq!(active[0].pod, JobPod::Running);
+        assert!(
+            active[1]
+                .state
+                .starts_with("Pending, cannot be scheduled: 0/1 nodes are available"),
+            "{}",
+            active[1].state
+        );
+    }
+
+    #[test]
+    fn a_job_the_controller_is_failing_is_active_and_says_it_is_stopping() {
+        // FailureTarget comes first, while its pods stop (the runner takes
+        // up to 90 s); Failed follows once they are gone.
+        let mut stopping = unfinished_job("apprafter-backup-29312345", "bk", Some("CronJob"));
+        stopping["status"] = json!({"active": 1, "startTime": "2026-09-23T03:00:00Z",
+            "conditions": [{"type": "FailureTarget", "status": "True",
+                            "reason": "DeadlineExceeded"}]});
+        let active = active_runner_jobs(&[stopping], &[]);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].state, "Stopping (DeadlineExceeded)");
+    }
+
+    #[test]
+    fn a_run_is_refused_beside_a_job_that_has_not_finished() {
+        assert!(refusal(&[], &[]).is_none());
+        let mut done = unfinished_job("apprafter-backup-29312300", "done", Some("CronJob"));
+        done["status"]["conditions"] = json!([{"type": "Complete", "status": "True"}]);
+        assert!(refusal(&[done], &[]).is_none());
+
+        // The weekly check is running: a backup started now would fail on
+        // its exclusive lock, and on a full node it would not even start.
+        let check = unfinished_job("apprafter-backup-check-29312350", "chk", Some("CronJob"));
+        let (report, err) = refusal(
+            std::slice::from_ref(&check),
+            &[running_pod_of("chk", "chk-pod")],
+        )
+        .expect("refused");
+        assert!(
+            report.contains("  ✗ apprafter-backup-check-29312350 has not finished: Running"),
+            "{report}"
+        );
+        assert!(report.contains("would not finish"), "{report}");
+        assert!(
+            !report.contains("delete job"),
+            "a running Job is waited for: {report}"
+        );
+        match &err {
+            CliError::BackupJobActive { job } => {
+                assert_eq!(job, "apprafter-backup-check-29312350")
+            }
+            other => panic!("expected BackupJobActive, got {other:?}"),
+        }
+
+        // A scheduled Job no node takes holds the schedule: say why, and how
+        // to clear it, since it may hold on until its deadline.
+        let stuck = unfinished_job("apprafter-backup-29312345", "bk", Some("CronJob"));
+        let (report, _) =
+            refusal(std::slice::from_ref(&stuck), &[pending_pod("bk", "bk-pod")]).expect("refused");
+        assert!(
+            report.contains(
+                "  ✗ apprafter-backup-29312345 has not finished: Pending, cannot be scheduled:"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("`apprafter top`"), "{report}");
+        assert!(
+            report.contains("kubectl -n apprafter-system delete job apprafter-backup-29312345"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn the_jobs_holding_room_are_the_other_runners_that_are_running() {
+        let own = unfinished_job("apprafter-backup-manual-x", "own", None);
+        let check = unfinished_job("apprafter-backup-check-29312350", "chk", Some("CronJob"));
+        let waiting = unfinished_job("apprafter-backup-29312345", "bk", Some("CronJob"));
+        let pods = [
+            pending_pod("own", "own-pod"),
+            running_pod_of("chk", "chk-pod"),
+            pending_pod("bk", "bk-pod"),
+        ];
+        assert_eq!(
+            room_holders("apprafter-backup-manual-x", &[own, check, waiting], &pods),
+            vec!["apprafter-backup-check-29312350".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_enable_beside_a_job_that_has_not_finished_skips_its_first_backup_and_exits_zero() {
+        let (line, exit) = first_backup_outcome(CliError::BackupJobActive {
+            job: "apprafter-backup-29312345".into(),
+        });
+        assert!(line.contains("Backup IS enabled"), "{line}");
+        assert!(line.contains("apprafter-backup-29312345"), "{line}");
+        assert!(line.contains("`apprafter backup run`"), "{line}");
+        assert!(exit.is_none(), "nothing failed: {exit:?}");
+        assert!(take_first_backup(|| Err(CliError::BackupJobActive {
+            job: "apprafter-backup-29312345".into(),
+        }))
+        .is_ok());
     }
 
     #[test]

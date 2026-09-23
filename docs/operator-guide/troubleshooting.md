@@ -257,6 +257,25 @@ socket. Common cases: missing directory, wrong permissions
 target-store files, re-create the offending target with
 `apprafter target add <name> --force`.
 
+### `apprafter::backup::job_active`
+
+`apprafter backup run` (or the first backup `apprafter backup enable`
+takes) found a backup Job or a check Job that has not finished, and
+started nothing beside it. The lines it printed just before the error name
+that Job and say what it is doing, as `apprafter backup status` would:
+`Running`, `Pending, cannot be scheduled: …`, or `Retrying after 1 failed
+attempt`. Two runs at once do not both finish: two backups need the same
+helper pods, and a backup and a check each fail on the other's repository
+lock. `enable` does not fail on this: backup is enabled, and it skips only
+its first backup.
+
+**Fix.** Wait until `apprafter backup status` shows that Job finished, then
+run `apprafter backup run` again. A Job that cannot start may hold on
+until its deadline; the printed lines then include the command that
+deletes it, and [the backup runner's pod cannot be
+scheduled](backup-restore.md#runner-unschedulable) explains why it cannot
+start.
+
 ### `apprafter::backup::runner_unschedulable`
 
 `apprafter backup run` (or the first backup `apprafter backup enable`

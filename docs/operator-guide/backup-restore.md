@@ -375,6 +375,15 @@ for two minutes, or a condition of the node such as memory pressure keeps it off
 for ten, the command deletes the Job, prints the scheduler's reason and exits
 non-zero: [the backup runner's pod cannot be scheduled](#runner-unschedulable).
 
+One run at a time. While a backup Job or a check Job has not finished, whether
+it is `Running`, `Pending` or retrying, `backup run` starts nothing, `--no-wait`
+included. It prints what that Job is doing and exits non-zero with
+`apprafter::backup::job_active`. Two runs at once do not both finish: two
+backups need the same helper pods, and a backup and a check each fail on the
+other's repository lock. Wait until `apprafter backup status` shows the Job
+finished, then run it again. A Job that cannot start may hold on until its
+deadline, so for one of those the command also prints how to delete it.
+
 A suspended schedule (`backup disable`) does not block a manual run: taking one
 last backup after turning the schedule off is a normal thing to want.
 
@@ -634,9 +643,14 @@ To fix it, free enough requested memory for the runner's 256Mi, or move to a
 larger machine ([Moving to a bigger machine](moving-to-a-bigger-machine.md)). Once
 there is room, a scheduled Job that was waiting starts on its own within
 moments, and `apprafter backup status` shows it `Running` and then its result.
-Otherwise run `apprafter backup run` to confirm a backup completes. Start it
-only when `backup status` shows no Job running: two runs that need the same
-helper pod do not both finish.
+Otherwise run `apprafter backup run` to confirm a backup completes. It starts
+nothing while a backup or check Job has not finished, `Running` or `Pending`
+alike, and names that Job instead: two runs at once do not both finish.
+
+If another backup or check Job is running when `backup run` gives up, the
+report names that Job instead of saying the scheduled backup cannot start: it
+holds room of the same size, and may be the scheduled backup itself. Run
+`backup run` again once it has finished.
 
 A pod that only waits for another pod to finish stopping is placed within
 seconds of that pod being gone. `backup run` does not count the time while any

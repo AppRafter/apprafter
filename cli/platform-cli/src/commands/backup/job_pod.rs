@@ -604,6 +604,9 @@ pub(crate) struct GiveUp<'a> {
     pub(crate) cause: &'a Unplaced,
     /// [`runner_requests`] of the Job.
     pub(crate) requests: Option<&'a str>,
+    /// Other backup or check Jobs whose runner is running: each holds room
+    /// of the same size, and this one could start once they have finished.
+    pub(crate) holders: &'a [String],
     /// Attempts of this Job that failed before this one (`status.failed`).
     pub(crate) failed: u64,
     /// Why the newest of those failed ([`last_failed_attempt`]).
@@ -647,6 +650,7 @@ pub(crate) fn unschedulable_report(give_up: &GiveUp<'_>, deleted: Result<(), Str
         message,
         cause,
         requests,
+        holders,
         failed,
         last_failure,
     } = give_up;
@@ -656,14 +660,26 @@ pub(crate) fn unschedulable_report(give_up: &GiveUp<'_>, deleted: Result<(), Str
     );
     match cause {
         Unplaced::NoRoom => {
+            // Another runner that is running holds the room, and may be the
+            // scheduled backup itself: then "the scheduled backup cannot
+            // start either" would be false, and it is the one to name.
+            let who = if holders.is_empty() {
+                "The scheduled backup asks for the same, so it cannot start either.".to_string()
+            } else {
+                let (verb, own) = if holders.len() == 1 {
+                    ("is running and holds", "it has")
+                } else {
+                    ("are running and hold", "they have")
+                };
+                format!(
+                    "{} {verb} room of the same size; this backup can start once {own} \
+                     finished.",
+                    and_list(holders)
+                )
+            };
             match requests {
-                Some(r) => out.push_str(&format!(
-                    "    The runner asks for {r}. The scheduled backup asks for the same, so it \
-                     cannot start either.\n"
-                )),
-                None => out.push_str(
-                    "    The scheduled backup asks for the same, so it cannot start either.\n",
-                ),
+                Some(r) => out.push_str(&format!("    The runner asks for {r}. {who}\n")),
+                None => out.push_str(&format!("    {who}\n")),
             }
             out.push_str(
                 "    `apprafter top` shows how much of each node is requested, and by what.\n",
@@ -680,10 +696,10 @@ pub(crate) fn unschedulable_report(give_up: &GiveUp<'_>, deleted: Result<(), Str
         ),
     }
     if *failed > 0 {
-        let before = if *failed == 1 {
-            "1 attempt".to_string()
+        let (before, recorded) = if *failed == 1 {
+            ("1 attempt".to_string(), "that attempt recorded one")
         } else {
-            format!("{failed} attempts")
+            (format!("{failed} attempts"), "one of them recorded it")
         };
         let why = match (last_failure, *failed) {
             (Some(w), 1) => format!(" ({w})"),
@@ -692,7 +708,7 @@ pub(crate) fn unschedulable_report(give_up: &GiveUp<'_>, deleted: Result<(), Str
         };
         out.push_str(&format!(
             "    Before it, {before} failed{why}. `apprafter backup status` shows the runner's \
-             lastError if one of them recorded it.\n"
+             lastError if {recorded}.\n"
         ));
     }
     out.push_str(&format!(
@@ -733,6 +749,19 @@ pub(crate) fn give_up_error(give_up: &GiveUp<'_>, waited: Duration) -> (String, 
         )
     };
     let help = match give_up.cause {
+        Unplaced::NoRoom if !give_up.holders.is_empty() => {
+            let (verb, own) = if give_up.holders.len() == 1 {
+                ("is running and asks", "it has")
+            } else {
+                ("are running and ask", "they have")
+            };
+            format!(
+                "The lines above give the scheduler's reason. {} {verb} for the same room as \
+                 this backup. Run `apprafter backup run` again once `apprafter backup status` \
+                 shows {own} finished.",
+                and_list(give_up.holders)
+            )
+        }
         Unplaced::NoRoom => "The lines above give the scheduler's reason and what the runner asks \
                              for. `apprafter top` shows how much of each node is requested, and \
                              by what: free enough for the runner, or move to a bigger machine, \
@@ -752,6 +781,15 @@ pub(crate) fn give_up_error(give_up: &GiveUp<'_>, waited: Duration) -> (String, 
             .to_string(),
     };
     (what, help)
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn and_list(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 /// Why the newest failed attempt of `job` failed, from its pod: the pod's own
@@ -1569,6 +1607,7 @@ mod tests {
             message,
             cause,
             requests: Some("256Mi of memory and 100m of CPU"),
+            holders: &[],
             failed,
             last_failure: (failed > 0).then_some(
                 "Evicted: The node was low on resource: memory. Threshold quantity: 100Mi, \
@@ -1589,7 +1628,19 @@ mod tests {
             r.contains("Before it, 1 attempt failed (Evicted: The node was low on resource"),
             "{r}"
         );
-        assert!(r.contains("lastError"), "{r}");
+        assert!(
+            r.contains("shows the runner's lastError if that attempt recorded one."),
+            "{r}"
+        );
+        let r = unschedulable_report(&give_up(INSUFFICIENT, &Unplaced::NoRoom, 2), Ok(()));
+        assert!(
+            r.contains("Before it, 2 attempts failed (the last: Evicted"),
+            "{r}"
+        );
+        assert!(
+            r.contains("shows the runner's lastError if one of them recorded it."),
+            "{r}"
+        );
         let (what, _) = give_up_error(
             &give_up(INSUFFICIENT, &Unplaced::NoRoom, 2),
             Duration::from_secs(123),
@@ -1740,5 +1791,41 @@ mod tests {
             "  … no room for its pod yet; waiting while 2 pods stop and give theirs back: \
              demo/shop-pg-1, demo/vault-0 (2m 30s)"
         );
+    }
+
+    #[test]
+    fn a_give_up_while_another_runner_runs_names_it_instead_of_the_schedule() {
+        // The weekly check, or a scheduled backup, holds the room this run
+        // needs. Saying the scheduled backup cannot start would be wrong: it
+        // may be the one running.
+        let holders = ["apprafter-backup-check-29312350".to_string()];
+        let g = GiveUp {
+            holders: &holders,
+            ..give_up(INSUFFICIENT, &Unplaced::NoRoom, 0)
+        };
+        let r = unschedulable_report(&g, Ok(()));
+        assert!(
+            r.contains(
+                "The runner asks for 256Mi of memory and 100m of CPU. \
+                 apprafter-backup-check-29312350 is running and holds room of the same size; \
+                 this backup can start once it has finished."
+            ),
+            "{r}"
+        );
+        assert!(!r.contains("cannot start either"), "{r}");
+        let (_, help) = give_up_error(&g, UNSCHEDULABLE_GRACE);
+        assert!(help.contains("apprafter-backup-check-29312350"), "{help}");
+        assert!(help.contains("`apprafter backup status`"), "{help}");
+        assert!(!help.contains("cannot start either"), "{help}");
+        assert!(!help.contains("bigger machine"), "{help}");
+        let two = ["a".to_string(), "b".to_string()];
+        let r = unschedulable_report(
+            &GiveUp {
+                holders: &two,
+                ..give_up(INSUFFICIENT, &Unplaced::NoRoom, 0)
+            },
+            Ok(()),
+        );
+        assert!(r.contains("a and b are running and hold room"), "{r}");
     }
 }
