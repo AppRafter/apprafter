@@ -5565,15 +5565,21 @@ pub fn run_backup_enable(
         );
         return Ok(());
     }
+    //
+    //    By then the configuration is applied. A first backup that did not
+    //    complete does not undo that, and the command says so before it
+    //    exits ([`first_backup_outcome`]).
     match wait_for_synced_cronjob(&opts.bucket, CRONJOB_SYNC_WAIT_MINUTES, kc.path())? {
         Some(cronjob) => {
             println!("  → running the first backup now");
-            instantiate_backup_job(
-                &cronjob,
-                true,
-                DEFAULT_BACKUP_JOB_TIMEOUT_MINUTES,
-                kc.path(),
-            )?;
+            take_first_backup(|| {
+                instantiate_backup_job(
+                    &cronjob,
+                    true,
+                    DEFAULT_BACKUP_JOB_TIMEOUT_MINUTES,
+                    kc.path(),
+                )
+            })?;
         }
         None => {
             // The `enable` itself succeeded. A chart that has not synced
@@ -5587,6 +5593,56 @@ pub fn run_backup_enable(
         }
     }
     Ok(())
+}
+
+/// Run `backup enable`'s first backup with `run`, and end the way
+/// [`first_backup_outcome`] says when it does not complete.
+fn take_first_backup(run: impl FnOnce() -> Result<()>) -> Result<()> {
+    let Err(e) = run() else {
+        return Ok(());
+    };
+    let (line, exit) = first_backup_outcome(e);
+    println!("{line}");
+    exit.map_or(Ok(()), Err)
+}
+
+/// How `backup enable` ends when its first backup did not complete: the line
+/// it prints, and the error it exits with.
+///
+/// The PlatformStack patch is applied before the first backup starts, so
+/// backup IS enabled whatever happens to that backup, and a bare error reads
+/// as an `enable` that failed, which people answer by running it again. The
+/// line says it is enabled; for a runner no node would take, so does the
+/// error's help, ahead of the advice `backup run` gives.
+///
+/// The exit stays non-zero on purpose. The first backup is the proof
+/// `enable` offers that backups work, and one no node would take means the
+/// scheduled backup, which asks for the same, will not run either. A script
+/// that checks the exit code must not read that as working backups. A first
+/// backup that is not attempted at all (the chart has not synced) exits 0:
+/// nothing failed.
+fn first_backup_outcome(e: CliError) -> (String, Option<CliError>) {
+    match e {
+        CliError::BackupRunnerUnschedulable { job, what, help } => (
+            "  Backup IS enabled: the configuration above is applied. Its first backup could \
+             not start."
+                .to_string(),
+            Some(CliError::BackupRunnerUnschedulable {
+                job,
+                what,
+                help: format!(
+                    "Backup IS enabled, so do not run `apprafter backup enable` again; only its \
+                     first backup could not start. {help}"
+                ),
+            }),
+        ),
+        other => (
+            "  Backup IS enabled: the configuration above is applied. Its first backup did not \
+             complete:"
+                .to_string(),
+            Some(other),
+        ),
+    }
 }
 
 /// The cluster label to store: `--cluster-name` when given, else the target
@@ -12748,6 +12804,79 @@ mod tests {
                 );
             }
             other => panic!("expected the give-up, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // `backup enable` whose first backup does not complete
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn an_enable_whose_first_backup_cannot_start_says_backup_is_enabled() {
+        // The PlatformStack patch is applied before the first backup runs.
+        // A reader of a bare exit 1 re-runs `enable`; the words must say
+        // that is not needed, in the line printed and in the error's help.
+        let err = CliError::BackupRunnerUnschedulable {
+            job: "apprafter-backup-manual-x".to_string(),
+            what: "never started: no node had room for its pod for 2m 3s".to_string(),
+            help: "`apprafter top` shows how much of each node is requested.".to_string(),
+        };
+        let (line, exit) = first_backup_outcome(err);
+        assert!(line.contains("Backup IS enabled"), "{line}");
+        assert!(line.contains("could not start"), "{line}");
+        match exit {
+            Some(CliError::BackupRunnerUnschedulable { job, what, help }) => {
+                assert_eq!(job, "apprafter-backup-manual-x");
+                assert_eq!(
+                    what,
+                    "never started: no node had room for its pod for 2m 3s"
+                );
+                assert!(help.starts_with("Backup IS enabled"), "{help}");
+                assert!(
+                    help.contains("do not run `apprafter backup enable` again"),
+                    "{help}"
+                );
+                assert!(
+                    help.ends_with("`apprafter top` shows how much of each node is requested."),
+                    "the command's own advice is kept: {help}"
+                );
+            }
+            other => panic!("the exit stays an error, on purpose: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enable_exits_with_its_first_backups_error_and_zero_when_it_completed() {
+        assert!(take_first_backup(|| Ok(())).is_ok());
+        let unschedulable = take_first_backup(|| {
+            Err(CliError::BackupRunnerUnschedulable {
+                job: "j".into(),
+                what: "never started".into(),
+                help: "h".into(),
+            })
+        });
+        match unschedulable {
+            Err(CliError::BackupRunnerUnschedulable { help, .. }) => {
+                assert!(help.starts_with("Backup IS enabled"), "{help}")
+            }
+            other => panic!("expected the error with enable's help, got {other:?}"),
+        }
+        assert!(matches!(
+            take_first_backup(|| Err(CliError::Other("failed".into()))),
+            Err(CliError::Other(_))
+        ));
+    }
+
+    #[test]
+    fn an_enable_whose_first_backup_failed_says_backup_is_enabled_and_keeps_the_error() {
+        let (line, exit) = first_backup_outcome(CliError::Other(
+            "backup Job apprafter-backup-manual-x failed after 12s: BackoffLimitExceeded".into(),
+        ));
+        assert!(line.contains("Backup IS enabled"), "{line}");
+        assert!(line.contains("did not complete"), "{line}");
+        match exit {
+            Some(CliError::Other(m)) => assert!(m.contains("BackoffLimitExceeded"), "{m}"),
+            other => panic!("the error is passed on unchanged: {other:?}"),
         }
     }
 

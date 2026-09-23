@@ -344,6 +344,14 @@ cycle. If it has not landed in that window, `enable` says so and stops: backup
 is enabled either way, and `apprafter backup run` takes the first one whenever
 you like. `--no-initial-backup` skips this entirely.
 
+If the first backup runs but does not complete, because it fails or because no
+node takes its pod ([the backup runner's pod cannot be
+scheduled](#runner-unschedulable)), `enable` says `Backup IS enabled` and
+exits non-zero. The configuration is applied, so there is no need to run
+`enable` again. The exit is non-zero because no backup has been proven, and a
+runner no node takes means the scheduled backup cannot run either. Fix what the
+message names, then run `apprafter backup run`.
+
 ## Back up right now
 
 ```sh

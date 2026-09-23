@@ -265,7 +265,9 @@ no node had room for it, or for ten minutes a condition of the node, such
 as memory pressure, kept it off. The command deleted the Job and stopped.
 The lines it printed just before the error give the scheduler's reason
 (`0/1 nodes are available: 1 Insufficient memory. …`) and, for a lack of
-room, what the runner asks for.
+room, what the runner asks for. When `enable` took this backup, backup is
+enabled all the same: the error's help says so, and `enable` need not run
+again.
 
 **Fix.** For a lack of room, `apprafter top` shows how much of each node
 is requested, and by what. Free enough for the runner, or move to a
