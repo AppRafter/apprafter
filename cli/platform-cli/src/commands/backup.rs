@@ -1147,18 +1147,48 @@ fn uid_of(pod: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// What `kubectl apply` answered: [`KubectlExec::kubectl_apply`].
+/// How [`KubectlExec::kubectl_put`] puts a pod in place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Put {
+    /// `kubectl create`: there is no pod of that name, and the apiserver
+    /// refuses (`AlreadyExists`) rather than touch one another run created
+    /// since. Its answer is the one that says a pod is this process's.
+    Create,
+    /// `kubectl apply` over the pod of that name that is there.
+    Apply,
+}
+
+impl Put {
+    fn verb(self) -> &'static str {
+        match self {
+            Put::Create => "create",
+            Put::Apply => "apply",
+        }
+    }
+}
+
+/// What kubectl answered to a [`Put`]: [`KubectlExec::kubectl_put`].
 enum ApplyAnswer {
-    Applied,
+    /// Done: the uid of the pod the apiserver answered with (empty when
+    /// kubectl printed none).
+    Applied { uid: String },
     /// kubectl ran and refused: its error, and its whole stderr.
-    Refused {
-        error: CliError,
-        stderr: String,
-    },
+    Refused { error: CliError, stderr: String },
+}
+
+/// Whether kubectl's stderr is the apiserver refusing a create because an
+/// object of that name exists, as `kubectl create` prints it (Kubernetes
+/// 1.36): `Error from server (AlreadyExists): error when creating "STDIN":
+/// pods "<name>" already exists`.
+fn is_already_exists(stderr: &str) -> bool {
+    stderr.contains("(AlreadyExists)")
 }
 
 impl KubectlExec {
-    /// `kubectl apply -f - -n <ns>` with `json_bytes` on stdin.
+    /// `kubectl create --save-config` or `kubectl apply` of `json_bytes` in
+    /// `ns`, printing the uid of the pod the apiserver answered with
+    /// (`-o jsonpath={.metadata.uid}`). `--save-config` makes a created pod
+    /// the same object an apply would have created.
     ///
     /// A refusal comes with kubectl's WHOLE stderr beside its error. The
     /// error keeps the last lines, which is where a failing command usually
@@ -1167,15 +1197,46 @@ impl KubectlExec {
     /// with a hunk per changed field (a changed `sleep` alone is ten lines on
     /// Kubernetes 1.35), which a helper built by another version can run past
     /// the lines the error keeps. The caller needs that first line.
-    fn kubectl_apply(&self, ns: &str, json_bytes: &[u8]) -> Result<ApplyAnswer> {
+    fn kubectl_put(&self, put: Put, ns: &str, json_bytes: &[u8]) -> Result<ApplyAnswer> {
+        let verb = put.verb();
+        let mut args = vec![verb];
+        if put == Put::Create {
+            args.push("--save-config");
+        }
+        args.extend(["-f", "-", "-n", ns, "-o", "jsonpath={.metadata.uid}"]);
         let mut apply_child = Command::new(&self.kubectl_bin)
-            .args(["apply", "-f", "-", "-n", ns])
+            .args(&args)
             .env("KUBECONFIG", &self.kubeconfig)
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| CliError::Other(format!("spawn kubectl apply: {e}")))?;
+            .map_err(|e| CliError::Other(format!("spawn kubectl {verb}: {e}")))?;
+
+        // Both read whole, each on its own thread, so neither pipe can fill
+        // and block kubectl — and before the spec is written, so a kubectl
+        // that answers before it has read all of it cannot stall either.
+        let drain = |pipe: Option<Box<dyn Read + Send>>| {
+            thread::spawn(move || {
+                let mut text = String::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_string(&mut text);
+                }
+                text
+            })
+        };
+        let stdout_reader = drain(
+            apply_child
+                .stdout
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        );
+        let stderr_reader = drain(
+            apply_child
+                .stderr
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        );
 
         // The write result is held rather than propagated here, and the order
         // that follows is the point. A child that dies before reading its
@@ -1195,26 +1256,17 @@ impl KubectlExec {
             let mut stdin = apply_child
                 .stdin
                 .take()
-                .ok_or_else(|| CliError::Other("kubectl apply has no stdin".into()))?;
+                .ok_or_else(|| CliError::Other(format!("kubectl {verb} has no stdin")))?;
             stdin.write_all(json_bytes)
             // `stdin` drops here, closing the pipe — the child needs that EOF
             // to finish, so it must happen before the `wait()` below.
         };
 
-        let mut apply_stderr = apply_child
-            .stderr
-            .take()
-            .ok_or_else(|| CliError::Other("kubectl apply has no stderr".into()))?;
-        // Read whole, on its own thread so a long stderr cannot block kubectl.
-        let stderr_reader = thread::spawn(move || {
-            let mut text = String::new();
-            let _ = apply_stderr.read_to_string(&mut text);
-            text
-        });
         let apply_status = apply_child
             .wait()
-            .map_err(|e| CliError::Other(format!("wait kubectl apply: {e}")))?;
-        // kubectl has exited, so its stderr is at EOF (it starts no children).
+            .map_err(|e| CliError::Other(format!("wait kubectl {verb}: {e}")))?;
+        // kubectl has exited, so its pipes are at EOF (it starts no children).
+        let stdout = stdout_reader.join().unwrap_or_default();
         let stderr = stderr_reader.join().unwrap_or_default();
         if !apply_status.success() {
             let tail: Vec<String> = stderr
@@ -1227,15 +1279,17 @@ impl KubectlExec {
                 .rev()
                 .collect();
             let error = format_exec_error(
-                "apply_and_wait_pod_ready(apply)",
+                &format!("apply_and_wait_pod_ready({verb})"),
                 apply_status,
                 &Arc::new(Mutex::new(tail)),
             );
             return Ok(ApplyAnswer::Refused { error, stderr });
         }
         write_result
-            .map_err(|e| CliError::Other(format!("write pod spec to kubectl apply: {e}")))?;
-        Ok(ApplyAnswer::Applied)
+            .map_err(|e| CliError::Other(format!("write pod spec to kubectl {verb}: {e}")))?;
+        Ok(ApplyAnswer::Applied {
+            uid: stdout.trim().to_string(),
+        })
     }
 
     /// The pod `name` in `ns` as JSON, or `None` when there is none
@@ -1270,38 +1324,72 @@ impl KubectlExec {
         })
     }
 
-    /// [`Self::kubectl_apply`] of a pod spec, with a backup helper recorded
-    /// for the interrupt first ([`helper_interrupt::HelperPods::begin_apply`]):
-    /// its name, the uid of the pod of that name seen before (`before`), and
-    /// the apply counted as under way until kubectl answers. Refused once the
-    /// interrupt has begun.
-    fn tracked_apply(
+    /// [`Self::kubectl_put`] of a pod spec, with a backup helper recorded for
+    /// the interrupt first ([`helper_interrupt::HelperPods::begin_apply`]) and
+    /// settled by the apiserver's answer before the call stops counting as
+    /// under way:
+    ///
+    /// * a create answered with a uid: [`helper_interrupt::Origin::Created`],
+    ///   the one answer that makes a pod this process's;
+    /// * an apply answered with the uid of the pod read just before it
+    ///   (`seen`): [`helper_interrupt::Origin::Reused`]; answered with any
+    ///   other, the pod was replaced in between, and whether this apply
+    ///   created the one there now or went over another run's cannot be told
+    ///   — it stays unconfirmed;
+    /// * a create refused as `AlreadyExists`, or an apply refused as an
+    ///   immutable update: nothing was made, and the record is dropped;
+    /// * anything else — kubectl killed by the same Ctrl-C, a lost
+    ///   connection — stays unconfirmed, and the interrupt leaves that pod.
+    ///
+    /// Refused once the interrupt has begun.
+    fn tracked_put(
         &self,
         spec: &serde_json::Value,
         ns: &str,
         name: &str,
-        before: Option<String>,
+        put: Put,
+        seen: Option<&str>,
         json_bytes: &[u8],
     ) -> Result<ApplyAnswer> {
-        let _in_flight = if backup_core::helper_pod::is_backup_helper(spec) {
-            Some(
-                self.helpers
-                    .begin_apply(&self.kubeconfig, ns, name, before)?,
-            )
+        let in_flight = if backup_core::helper_pod::is_backup_helper(spec) {
+            Some(self.helpers.begin_apply(&self.kubeconfig, ns, name)?)
         } else {
             None
         };
-        self.kubectl_apply(ns, json_bytes)
+        let answer = self.kubectl_put(put, ns, json_bytes)?;
+        if let Some(in_flight) = in_flight {
+            use helper_interrupt::Origin;
+            match (&answer, put) {
+                (ApplyAnswer::Applied { uid }, _) if uid.is_empty() => {}
+                (ApplyAnswer::Applied { uid }, Put::Create) => {
+                    in_flight.answered(Origin::Created(uid.clone()));
+                }
+                (ApplyAnswer::Applied { uid }, Put::Apply) if seen == Some(uid.as_str()) => {
+                    in_flight.answered(Origin::Reused(uid.clone()));
+                }
+                (ApplyAnswer::Applied { .. }, Put::Apply) => {}
+                (ApplyAnswer::Refused { stderr, .. }, Put::Create) if is_already_exists(stderr) => {
+                    in_flight.not_created();
+                }
+                (ApplyAnswer::Refused { stderr, .. }, Put::Apply)
+                    if backup_core::helper_pod::is_immutable_pod_update(stderr) =>
+                {
+                    in_flight.not_created();
+                }
+                (ApplyAnswer::Refused { .. }, _) => {}
+            }
+        }
+        Ok(answer)
     }
 
     /// Read pod `name` until it is Running + Ready, for up to `timeout`, every
-    /// `poll` — the runner's `KubeRsExec` waits the same way. Each read also
-    /// settles which pod the apply left there, for the interrupt
-    /// ([`helper_interrupt::HelperPods::observed`]). A container the kubelet
+    /// `poll` — the runner's `KubeRsExec` waits the same way. A container the
+    /// kubelet
     /// cannot configure for `grace` without a break (a credential Secret or
     /// key missing: [`backup_core::helper_pod::container_config_error`]) ends
     /// the wait at once with the kubelet's words, rather than after the whole
-    /// `timeout` with none.
+    /// `timeout` with none. A read settles nothing for the interrupt: only the
+    /// apiserver's answer to the create does ([`Self::tracked_put`]).
     fn wait_pod_ready(
         &self,
         name: &str,
@@ -1320,9 +1408,6 @@ impl KubectlExec {
                      it to be Ready"
                 ))
             })?;
-            if let Some(uid) = uid_of(&pod) {
-                self.helpers.observed(ns, name, &uid);
-            }
             if backup_core::helper_pod::pod_is_ready(&pod) {
                 return Ok(());
             }
@@ -1338,6 +1423,82 @@ impl KubectlExec {
                 )));
             }
             thread::sleep(poll);
+        }
+    }
+
+    /// Put the pod `spec` describes in place under `name`, for
+    /// [`KubeExec::apply_and_wait_pod_ready`]: create it when there is none,
+    /// apply over one of the same spec that is still running, and replace
+    /// any other.
+    ///
+    /// A pod of this name left from an earlier run is replaced rather than
+    /// applied over: an ended one never becomes Ready, one being deleted is
+    /// about to go, and a running one hours into its keep-alive would end this
+    /// command's work in it early
+    /// ([`backup_core::helper_pod::stale_helper_reason`]). So is one whose
+    /// spec this one cannot be applied over — an older CLI's or runner's, with
+    /// another keep-alive or env.
+    ///
+    /// Where there is no pod the helper is CREATED, not applied: the
+    /// apiserver's answer to a create is what makes it this process's for the
+    /// interrupt ([`Self::tracked_put`]), and a create refuses, rather than
+    /// takes over, a pod another run created since the read. That pod is then
+    /// read and judged like any other, once.
+    fn put_helper(
+        &self,
+        spec: &serde_json::Value,
+        ns: &str,
+        name: &str,
+        json_bytes: &[u8],
+    ) -> Result<()> {
+        let mut raced = false;
+        loop {
+            let mut over: Option<Option<String>> = None;
+            if let Some(existing) = self.get_pod_if_present(name, ns)? {
+                if let Some(why) = backup_core::helper_pod::stale_helper_reason(
+                    &existing,
+                    spec,
+                    chrono::Utc::now(),
+                ) {
+                    eprintln!(
+                        "{}",
+                        backup_core::helper_pod::replacing_stale_helper_note(ns, name, &why)
+                    );
+                    self.delete_and_wait_gone(name, ns)?;
+                } else {
+                    over = Some(uid_of(&existing));
+                }
+            }
+
+            if let Some(seen) = over {
+                match self.tracked_put(spec, ns, name, Put::Apply, seen.as_deref(), json_bytes)? {
+                    ApplyAnswer::Applied { .. } => return Ok(()),
+                    ApplyAnswer::Refused { stderr, .. }
+                        if backup_core::helper_pod::is_immutable_pod_update(&stderr) =>
+                    {
+                        eprintln!(
+                            "{}",
+                            backup_core::helper_pod::replacing_stale_helper_note(
+                                ns,
+                                name,
+                                "was created with a spec this command's cannot be applied over \
+                                 (an earlier run of another version, or with another keep-alive)",
+                            )
+                        );
+                        self.delete_and_wait_gone(name, ns)?;
+                    }
+                    ApplyAnswer::Refused { error, .. } => return Err(error),
+                }
+            }
+
+            match self.tracked_put(spec, ns, name, Put::Create, None, json_bytes)? {
+                ApplyAnswer::Applied { .. } => return Ok(()),
+                // Another run created it since the read: judge that pod, once.
+                ApplyAnswer::Refused { stderr, .. } if !raced && is_already_exists(&stderr) => {
+                    raced = true;
+                }
+                ApplyAnswer::Refused { error, .. } => return Err(error),
+            }
         }
     }
 
@@ -1389,53 +1550,7 @@ impl KubeExec for KubectlExec {
         let json_bytes = serde_json::to_vec(spec)
             .map_err(|e| CliError::Other(format!("serialize pod spec: {e}")))?;
 
-        // A pod of this name left from an earlier run is replaced rather than
-        // applied over: an ended one never becomes Ready, one being deleted
-        // is about to go, and a running one hours into its keep-alive would
-        // end this command's work in it early
-        // (backup_core::helper_pod::stale_helper_reason).
-        let mut before = None;
-        if let Some(existing) = self.get_pod_if_present(name, ns)? {
-            if let Some(why) =
-                backup_core::helper_pod::stale_helper_reason(&existing, spec, chrono::Utc::now())
-            {
-                eprintln!(
-                    "{}",
-                    backup_core::helper_pod::replacing_stale_helper_note(ns, name, &why)
-                );
-                self.delete_and_wait_gone(name, ns)?;
-            } else {
-                // Left in place and applied over: the pod the interrupt must
-                // not take for one this command created.
-                before = uid_of(&existing);
-            }
-        }
-
-        // So is one whose spec this one cannot be applied over — an older
-        // CLI's or runner's, with another keep-alive or env.
-        match self.tracked_apply(spec, ns, name, before, &json_bytes)? {
-            ApplyAnswer::Applied => {}
-            ApplyAnswer::Refused { stderr, .. }
-                if backup_core::helper_pod::is_immutable_pod_update(&stderr) =>
-            {
-                eprintln!(
-                    "{}",
-                    backup_core::helper_pod::replacing_stale_helper_note(
-                        ns,
-                        name,
-                        "was created with a spec this command's cannot be applied over (an \
-                         earlier run of another version, or with another keep-alive)",
-                    )
-                );
-                self.delete_and_wait_gone(name, ns)?;
-                if let ApplyAnswer::Refused { error, .. } =
-                    self.tracked_apply(spec, ns, name, None, &json_bytes)?
-                {
-                    return Err(error);
-                }
-            }
-            ApplyAnswer::Refused { error, .. } => return Err(error),
-        }
+        self.put_helper(spec, ns, name, &json_bytes)?;
 
         self.wait_pod_ready(
             name,
@@ -10580,12 +10695,13 @@ mod tests {
         let log = dir.path().join("argv");
         let seen = dir.path().join("spec.json");
         let applied = dir.path().join("applied");
-        // `get` answers "no such pod" until the apply, and the Ready pod after.
+        // `get` answers "no such pod" until the create, and the Ready pod
+        // after.
         let k = stub_kubectl(
             &dir,
             &format!(
                 "echo \"$@\" >> {log}\n\
-                 if [ \"$1\" = apply ]; then cat > {seen}; touch {applied}; fi\n\
+                 if [ \"$1\" = create ]; then cat > {seen}; touch {applied}; fi\n\
                  if [ \"$1\" = get ] && [ -f {applied} ]; then printf '%s' '{ready}'; fi\n\
                  exit 0",
                 log = log.display(),
@@ -10610,14 +10726,15 @@ mod tests {
             .lines()
             .map(str::to_string)
             .collect();
-        // Read (no pod), applied, then read until Ready: readiness, not
-        // existence — a Pod that exists but is not Ready cannot be exec'd
-        // into, which is the only reason this helper is created.
+        // Read (no pod), created — the apiserver's answer names the pod it
+        // made — then read until Ready: readiness, not existence — a Pod that
+        // exists but is not Ready cannot be exec'd into, which is the only
+        // reason this helper is created.
         assert_eq!(
             argv,
             vec![
                 "get pod helper -n prod --ignore-not-found -o json",
-                "apply -f - -n prod",
+                "create --save-config -f - -n prod -o jsonpath={.metadata.uid}",
                 "get pod helper -n prod --ignore-not-found -o json",
             ]
         );
@@ -10625,11 +10742,13 @@ mod tests {
 
     /// A stub kubectl that logs every call and plays a pod named `helper`:
     /// `get` prints `pod` (a JSON document, or nothing: absent) until a
-    /// `delete` removes it; `apply` runs `apply` (a shell snippet; it must
-    /// read stdin) and, when that succeeds, leaves the pod Running and Ready —
-    /// with uid `u-applied` if there was none, else keeping the one it had,
-    /// as an apply over a pod does.
-    fn stateful_stub(dir: &tempfile::TempDir, pod: &str, apply: &str) -> (KubectlExec, PathBuf) {
+    /// `delete` removes it. `create` refuses as the apiserver does while
+    /// there is a pod (`AlreadyExists`); otherwise it and `apply` run `put`
+    /// (a shell snippet; it must read stdin) and, when that succeeds, leave
+    /// the pod Running and Ready and print its uid, as `-o jsonpath` does:
+    /// `u-created` for a pod a create made, and for an apply the uid the pod
+    /// had (`u-applied` if it had none).
+    fn stateful_stub(dir: &tempfile::TempDir, pod: &str, put: &str) -> (KubectlExec, PathBuf) {
         let log = dir.path().join("argv");
         let present = dir.path().join("present.json");
         if !pod.is_empty() {
@@ -10642,10 +10761,18 @@ mod tests {
                  case \"$1\" in\n\
                  get) cat {present} 2>/dev/null; exit 0;;\n\
                  delete) rm -f {present}; exit 0;;\n\
-                 apply) ( {apply} ); rc=$?\n\
+                 create) if [ -f {present} ]; then cat >/dev/null\n\
+                     echo 'Error from server (AlreadyExists): error when creating \"STDIN\": \
+                 pods \"helper\" already exists' >&2; exit 1; fi\n\
+                   ( {put} ); rc=$?\n\
+                   if [ $rc -eq 0 ]; then printf '{ready}' u-created > {present}; \
+                 printf u-created; fi\n\
+                   exit $rc;;\n\
+                 apply) ( {put} ); rc=$?\n\
                    if [ $rc -eq 0 ]; then\n\
                      uid=$(sed -n 's/.*\"uid\": *\"\\([^\"]*\\)\".*/\\1/p' {present} 2>/dev/null)\n\
                      printf '{ready}' \"${{uid:-u-applied}}\" > {present}\n\
+                     printf '%s' \"${{uid:-u-applied}}\"\n\
                    fi\n\
                    exit $rc;;\n\
                  esac",
@@ -10683,7 +10810,7 @@ mod tests {
         let spec: Value = serde_json::from_str(HELPER).unwrap();
         k.apply_and_wait_pod_ready(&spec).unwrap();
 
-        assert_eq!(calls(&log), vec!["get", "delete", "apply", "get"]);
+        assert_eq!(calls(&log), vec!["get", "delete", "create", "get"]);
         let argv = std::fs::read_to_string(&log).unwrap();
         assert!(
             argv.contains("get pod helper -n prod --ignore-not-found -o json"),
@@ -10740,7 +10867,7 @@ mod tests {
         let (spec, pod) = six_hour_helper(Duration::from_secs(5 * 3600));
         let (k, log) = stateful_stub(&dir, &pod, "cat >/dev/null; exit 0");
         k.apply_and_wait_pod_ready(&spec).unwrap();
-        assert_eq!(calls(&log), vec!["get", "delete", "apply", "get"]);
+        assert_eq!(calls(&log), vec!["get", "delete", "create", "get"]);
     }
 
     /// One another command created moments ago is used as it is.
@@ -10779,7 +10906,7 @@ mod tests {
         );
         let spec: Value = serde_json::from_str(HELPER).unwrap();
         k.apply_and_wait_pod_ready(&spec).unwrap();
-        assert_eq!(calls(&log), vec!["get", "apply", "delete", "apply", "get"]);
+        assert_eq!(calls(&log), vec!["get", "apply", "delete", "create", "get"]);
     }
 
     /// A backup helper pod spec, as the builders stamp it: the interrupt
@@ -10787,21 +10914,22 @@ mod tests {
     const LABELLED_HELPER: &str = r#"{"metadata": {"name": "helper", "namespace": "prod",
         "labels": {"apprafter.io/backup-helper": "true"}}}"#;
 
-    /// WI-383: which pod each helper apply left under its name is recorded
-    /// for the interrupt — created by this command (deleted on Ctrl-C, by
-    /// uid) or there before it (left for the run using it).
+    /// WI-383: which pod each helper put left under its name is recorded for
+    /// the interrupt, from the apiserver's answer — created by this command
+    /// (deleted on Ctrl-C, by uid) or there before it (left for the run using
+    /// it).
     #[test]
-    fn each_helper_apply_records_whether_it_created_its_pod() {
+    fn each_helper_put_records_whether_it_created_its_pod() {
         use helper_interrupt::Origin;
         let spec: Value = serde_json::from_str(LABELLED_HELPER).unwrap();
 
-        // No pod of that name: this apply created the one that is there now.
+        // No pod of that name: this command's create made the one there now.
         let dir = tempfile::tempdir().unwrap();
         let (k, _) = stateful_stub(&dir, "", "cat >/dev/null; exit 0");
         k.apply_and_wait_pod_ready(&spec).unwrap();
         assert_eq!(
             k.helpers.origin_of("prod", "helper"),
-            Some(Origin::Created("u-applied".into()))
+            Some(Origin::Created("u-created".into()))
         );
 
         // A running pod of the same spec, used as it is: not this command's.
@@ -10817,7 +10945,7 @@ mod tests {
             Some(Origin::Reused("u-theirs".into()))
         );
 
-        // An ended leftover is replaced: the pod there now is this apply's.
+        // An ended leftover is replaced: the pod there now is this create's.
         let dir = tempfile::tempdir().unwrap();
         let (k, _) = stateful_stub(
             &dir,
@@ -10827,7 +10955,7 @@ mod tests {
         k.apply_and_wait_pod_ready(&spec).unwrap();
         assert_eq!(
             k.helpers.origin_of("prod", "helper"),
-            Some(Origin::Created("u-applied".into()))
+            Some(Origin::Created("u-created".into()))
         );
 
         // A pod that is not a backup helper is none of the interrupt's.
@@ -10836,6 +10964,162 @@ mod tests {
         k.apply_and_wait_pod_ready(&serde_json::from_str(HELPER).unwrap())
             .unwrap();
         assert_eq!(k.helpers.origin_of("prod", "helper"), None);
+    }
+
+    /// The WI-383 review's case: no pod at the read, and another run — a
+    /// scheduled backup of the same claim — creates one before this
+    /// command's create lands. The create is refused (`AlreadyExists`), and
+    /// that pod is read and applied over like any other: recorded as there
+    /// before, so Ctrl-C leaves it and the other run's dump goes on. Before,
+    /// an apply "configured" it and the first read took it for this
+    /// command's.
+    #[test]
+    fn a_pod_another_run_created_after_the_read_is_not_taken_for_this_ones() {
+        use helper_interrupt::Origin;
+        let spec: Value = serde_json::from_str(LABELLED_HELPER).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv");
+        let theirs = dir.path().join("theirs.json");
+        std::fs::write(
+            &theirs,
+            r#"{"metadata": {"name": "helper", "uid": "u-theirs"}, "status": {"phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}]}}"#,
+        )
+        .unwrap();
+        // `get` finds nothing until the create; the other run's pod is there
+        // by the time the create reaches the apiserver.
+        let k = stub_kubectl(
+            &dir,
+            &format!(
+                "echo \"$@\" >> {log}\n\
+                 case \"$1\" in\n\
+                 get) [ -f {log}.raced ] && cat {theirs}; exit 0;;\n\
+                 create) cat >/dev/null; touch {log}.raced\n\
+                   echo 'Error from server (AlreadyExists): error when creating \"STDIN\": \
+                 pods \"helper\" already exists' >&2; exit 1;;\n\
+                 apply) cat >/dev/null; printf u-theirs; exit 0;;\n\
+                 esac",
+                log = log.display(),
+                theirs = theirs.display(),
+            ),
+        );
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(calls(&log), vec!["get", "create", "get", "apply", "get"]);
+        assert_eq!(
+            k.helpers.origin_of("prod", "helper"),
+            Some(Origin::Reused("u-theirs".into()))
+        );
+        assert_eq!(
+            helper_interrupt::cleanup_action(&Origin::Reused("u-theirs".into())),
+            helper_interrupt::CleanupAction::NotCreatedHere {
+                uid: "u-theirs".into()
+            }
+        );
+    }
+
+    /// A create refused as `AlreadyExists`, and an apply refused as an
+    /// immutable update, made nothing: when the step fails right after, the
+    /// interrupt has no record of that pod at all, rather than one it cannot
+    /// settle.
+    #[test]
+    fn a_refused_create_or_update_leaves_no_record() {
+        let spec: Value = serde_json::from_str(LABELLED_HELPER).unwrap();
+        // AlreadyExists, then the second read fails.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv");
+        let k = stub_kubectl(
+            &dir,
+            &format!(
+                "echo \"$@\" >> {log}\n\
+                 case \"$1\" in\n\
+                 get) [ -f {log}.raced ] && {{ echo 'Unable to connect' >&2; exit 1; }}; exit 0;;\n\
+                 create) cat >/dev/null; touch {log}.raced\n\
+                   echo 'Error from server (AlreadyExists): pods \"helper\" already exists' >&2\n\
+                   exit 1;;\n\
+                 esac",
+                log = log.display(),
+            ),
+        );
+        k.apply_and_wait_pod_ready(&spec).unwrap_err();
+        assert_eq!(calls(&log), vec!["get", "create", "get"]);
+        assert_eq!(k.helpers.origin_of("prod", "helper"), None);
+
+        // Refused as an immutable update, then the old pod will not go.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv");
+        let k = stub_kubectl(
+            &dir,
+            &format!(
+                "echo \"$@\" >> {log}\n\
+                 case \"$1\" in\n\
+                 get) echo '{{\"metadata\": {{\"name\": \"helper\", \"uid\": \"u-old\"}}, \
+                 \"status\": {{\"phase\": \"Running\"}}}}'; exit 0;;\n\
+                 apply) cat >/dev/null; echo 'The Pod \"helper\" is invalid: spec: Forbidden: pod \
+                 updates may not change fields other than `spec.containers[*].image`' >&2; exit 1;;\n\
+                 delete) echo 'timed out waiting for the condition' >&2; exit 1;;\n\
+                 esac",
+                log = log.display(),
+            ),
+        );
+        k.apply_and_wait_pod_ready(&spec).unwrap_err();
+        assert_eq!(calls(&log), vec!["get", "apply", "delete"]);
+        assert_eq!(k.helpers.origin_of("prod", "helper"), None);
+    }
+
+    /// Only an answer settles a pod. An apply answered with a pod other than
+    /// the one read just before it (that one was replaced in between), and a
+    /// create whose kubectl died unanswered — the same Ctrl-C reaches it —
+    /// stay unconfirmed, and the interrupt leaves both.
+    #[test]
+    fn a_put_without_a_telling_answer_stays_unconfirmed() {
+        use helper_interrupt::Origin;
+        let spec: Value = serde_json::from_str(LABELLED_HELPER).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let (k, _) = stateful_stub(
+            &dir,
+            r#"{"metadata": {"name": "helper", "uid": "u-theirs"}, "status": {"phase": "Running"}}"#,
+            // The apply lands on a pod created since the read.
+            &format!(
+                "cat >/dev/null; printf '{}' > {}",
+                r#"{"metadata": {"name": "helper", "uid": "u-other"}, "status": {"phase": "Running"}}"#,
+                dir.path().join("present.json").display()
+            ),
+        );
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(
+            k.helpers.origin_of("prod", "helper"),
+            Some(Origin::Unconfirmed)
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let (k, _) = stateful_stub(&dir, "", "cat >/dev/null; kill -9 $$");
+        k.apply_and_wait_pod_ready(&spec).unwrap_err();
+        assert_eq!(
+            k.helpers.origin_of("prod", "helper"),
+            Some(Origin::Unconfirmed)
+        );
+
+        // A create answered with no uid names no pod.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv");
+        let k = stub_kubectl(
+            &dir,
+            &format!(
+                "echo \"$@\" >> {log}\n\
+                 case \"$1\" in\n\
+                 get) [ -f {log}.made ] && printf '%s' '{ready}'; exit 0;;\n\
+                 create) cat >/dev/null; touch {log}.made; exit 0;;\n\
+                 esac",
+                log = log.display(),
+                ready = ready_pod("u-1"),
+            ),
+        );
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(
+            k.helpers.origin_of("prod", "helper"),
+            Some(Origin::Unconfirmed)
+        );
     }
 
     /// Forgotten once the command's own delete went through — and kept when
@@ -10859,7 +11143,7 @@ mod tests {
                 "echo \"$@\" >> {log}\n\
                  case \"$1\" in\n\
                  get) [ -f {log}.applied ] && printf '%s' '{ready}'; exit 0;;\n\
-                 apply) cat >/dev/null; touch {log}.applied; exit 0;;\n\
+                 create) cat >/dev/null; touch {log}.applied; printf u-1; exit 0;;\n\
                  delete) exit 1;;\n\
                  esac",
                 log = log.display(),
@@ -11404,17 +11688,17 @@ mod tests {
             "the documented five minutes (docs: How a run may take)"
         );
 
-        // apply itself fails → the apiserver's own complaint is carried. (The
-        // look for a leftover pod before it finds none.)
+        // the create itself fails → the apiserver's own complaint is carried.
+        // (The look for a leftover pod before it finds none.)
         let dir2 = tempfile::tempdir().unwrap();
         let applies = stub_kubectl(
             &dir2,
-            "if [ \"$1\" = apply ]; then\n  cat >/dev/null\n  \
+            "if [ \"$1\" = create ]; then\n  cat >/dev/null\n  \
              echo 'error: forbidden: pods is forbidden' >&2\n  exit 1\nfi\nexit 0",
         );
         let err = applies.apply_and_wait_pod_ready(&spec).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("apply_and_wait_pod_ready(apply)"), "{msg}");
+        assert!(msg.contains("apply_and_wait_pod_ready(create)"), "{msg}");
         assert!(msg.contains("pods is forbidden"), "{msg}");
     }
 
@@ -11442,7 +11726,7 @@ mod tests {
         });
         let dies = stub_kubectl(
             &dir,
-            "if [ \"$1\" = apply ]; then echo 'error: Unauthorized' >&2; exit 1; fi\nexit 0",
+            "if [ \"$1\" = create ]; then echo 'error: Unauthorized' >&2; exit 1; fi\nexit 0",
         );
         let msg = format!("{}", dies.apply_and_wait_pod_ready(&spec).unwrap_err());
         assert!(msg.contains("Unauthorized"), "{msg}");
@@ -11461,7 +11745,7 @@ mod tests {
         let dir2 = tempfile::tempdir().unwrap();
         let quiet = stub_kubectl(&dir2, "exit 0");
         let msg = format!("{}", quiet.apply_and_wait_pod_ready(&spec).unwrap_err());
-        assert!(msg.contains("write pod spec to kubectl apply"), "{msg}");
+        assert!(msg.contains("write pod spec to kubectl create"), "{msg}");
         assert!(msg.contains("Broken pipe"), "{msg}");
     }
 

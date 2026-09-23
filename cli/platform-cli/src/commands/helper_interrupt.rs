@@ -37,21 +37,26 @@
 //!
 //! A helper pod's name has no owner: two runs of the same step for the same
 //! claim use one name, and a run applies over a running pod of the same spec
-//! instead of replacing it. And the terminal sends Ctrl-C to every process in
-//! the foreground group — the `kubectl` this process is running included — so
-//! the apply under way may have died before or after it reached the
-//! apiserver. So each helper apply is recorded before it is sent, with the
-//! uid of the pod of that name seen just before, if any ([`Origin`]), and the
-//! first read of the pod after it settles which pod the apply left there. At
-//! stop time ([`cleanup_action`]):
+//! instead of replacing it. So only the apiserver can say which pod a run
+//! created, and it says so in one place: the answer to a CREATE. A helper
+//! that is not there is created (`kubectl create`, which fails rather than
+//! touch a pod another run created in the meantime) and one that is there is
+//! applied over; each is recorded before it is sent and settled by the
+//! apiserver's answer, the uid of the pod it created or applied over
+//! ([`Origin`]). At stop time ([`cleanup_action`]):
 //!
-//! * a pod this apply CREATED — its uid differs from the one before — is
-//!   deleted with that uid as the delete's precondition, so a pod of the same
-//!   name created in the meantime by someone else is never the one deleted;
-//! * a pod that was there BEFORE the apply is left alone: another run may be
-//!   using it, and that run deletes it;
-//! * a pod whose apply was never confirmed is read again, and judged the same
-//!   way against the uid from before the apply.
+//! * a pod this process's create was answered with is deleted, with that uid
+//!   as the delete's precondition, so a pod of the same name created since by
+//!   someone else is never the one deleted;
+//! * a pod this process applied over is left alone: another run may be using
+//!   it, and that run deletes it;
+//! * a pod whose create or apply was never answered is left too, and named
+//!   with the command that deletes it. The terminal sends Ctrl-C to every
+//!   process in the foreground group — the `kubectl` this process is running
+//!   included — so the call under way may have died before or after it
+//!   reached the apiserver, and a pod of that name found afterwards may just
+//!   as well be another run's. Only an answer makes a pod this process's; a
+//!   read after the fact cannot.
 //!
 //! # The command's own thread, after the signal
 //!
@@ -90,9 +95,9 @@ use cli_core::{CliError, Result};
 /// The most the whole stop may take, from the signal to the exit.
 pub const STOP_BOUND: Duration = Duration::from_secs(15);
 
-/// The most the stop waits for a helper apply under way to be answered before
-/// it reads the pods. `kubectl apply` answers in well under a second, or dies
-/// with the terminal's Ctrl-C at once.
+/// The most the stop waits for a helper create or apply under way to be
+/// answered before it acts on the pods. kubectl answers in well under a
+/// second, or dies with the terminal's Ctrl-C at once.
 pub const APPLY_SETTLE_BOUND: Duration = Duration::from_secs(5);
 
 /// The most the stop waits, once its deletes are done, for the command's own
@@ -196,17 +201,19 @@ mod test_seam {
 // The helper pods this process has applied
 // ---------------------------------------------------------------------------
 
-/// Which pod a helper apply left under its name.
+/// Which pod a helper create or apply left under its name, as the apiserver
+/// answered it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Origin {
-    /// Not known yet: the apply is under way, failed, or its pod has not been
-    /// read since. `before` is the uid of the pod of that name just before the
-    /// apply was sent, `None` when there was none.
-    Unconfirmed { before: Option<String> },
-    /// This process's apply created the pod with this uid.
+    /// No answer to go by: the call is under way, died unanswered (the same
+    /// Ctrl-C reaches its kubectl), or was answered with a pod other than the
+    /// one this process read just before it. Never deleted: a pod of that
+    /// name may be another run's.
+    Unconfirmed,
+    /// The apiserver answered this process's create with this uid.
     Created(String),
-    /// The pod with this uid was there before this process applied it (the
-    /// apply went over a running pod of the same spec).
+    /// This process applied over the pod with this uid, which was there
+    /// before it (a running pod of the same spec).
     Reused(String),
 }
 
@@ -234,14 +241,37 @@ struct State {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HelperPods(Arc<Mutex<State>>);
 
-/// An apply of a helper pod under way: held for exactly as long as its
-/// `kubectl apply`, which the stop waits out before it reads the pods.
-#[must_use = "the apply counts as under way only while this is held"]
-pub(crate) struct ApplyInFlight(HelperPods);
+/// A create or apply of a helper pod under way: held for exactly as long as
+/// its kubectl, which the stop waits out before it acts on the pods, and
+/// settled by the apiserver's answer ([`Self::answered`],
+/// [`Self::not_created`]). Dropped without either, the pod stays
+/// [`Origin::Unconfirmed`].
+#[must_use = "the call counts as under way only while this is held"]
+pub(crate) struct ApplyInFlight {
+    pods: HelperPods,
+    key: (String, String),
+}
+
+impl ApplyInFlight {
+    /// The apiserver answered: record which pod the call left there, BEFORE
+    /// the call stops counting as under way, so a stop waiting for it reads
+    /// the answer.
+    pub(crate) fn answered(self, origin: Origin) {
+        if let Some(tracked) = self.pods.lock().pods.get_mut(&self.key) {
+            tracked.origin = origin;
+        }
+    }
+
+    /// The apiserver refused a create because a pod of that name was already
+    /// there: this call created nothing, and that pod is not this process's.
+    pub(crate) fn not_created(self) {
+        self.pods.lock().pods.remove(&self.key);
+    }
+}
 
 impl Drop for ApplyInFlight {
     fn drop(&mut self) {
-        let mut state = self.0.lock();
+        let mut state = self.pods.lock();
         state.applying = state.applying.saturating_sub(1);
     }
 }
@@ -253,57 +283,37 @@ impl HelperPods {
         GLOBAL.clone()
     }
 
-    /// Record a helper pod about to be applied through `kubeconfig`, with the
-    /// uid of the pod of that name seen just before (`before`), and count the
-    /// apply as under way until the returned guard drops. Refused once the
-    /// stop has begun: a pod applied now would outlive the command.
+    /// Record a helper pod about to be created or applied through
+    /// `kubeconfig`, [`Origin::Unconfirmed`] until the apiserver answers, and
+    /// count the call as under way until the returned guard is settled or
+    /// dropped. Refused once the stop has begun: a pod made now would outlive
+    /// the command.
     pub(crate) fn begin_apply(
         &self,
         kubeconfig: &Path,
         namespace: &str,
         name: &str,
-        before: Option<String>,
     ) -> Result<ApplyInFlight> {
         let bytes: Arc<[u8]> = std::fs::read(kubeconfig)
             .map_err(|e| CliError::Other(format!("read kubeconfig {}: {e}", kubeconfig.display())))?
             .into();
+        let key = (namespace.to_string(), name.to_string());
         let mut state = self.lock();
         if state.stopping {
             return Err(interrupted_error());
         }
         state.pods.insert(
-            (namespace.to_string(), name.to_string()),
+            key.clone(),
             Tracked {
-                origin: Origin::Unconfirmed { before },
+                origin: Origin::Unconfirmed,
                 kubeconfig: bytes,
             },
         );
         state.applying += 1;
-        Ok(ApplyInFlight(self.clone()))
-    }
-
-    /// Record the uid of the pod `namespace/name` as read after its apply.
-    /// The first read settles an unconfirmed apply: a uid other than the one
-    /// from before was created by it, the same one was not. Later reads
-    /// change nothing.
-    pub(crate) fn observed(&self, namespace: &str, name: &str, uid: &str) {
-        if uid.is_empty() {
-            return;
-        }
-        let mut state = self.lock();
-        let Some(tracked) = state
-            .pods
-            .get_mut(&(namespace.to_string(), name.to_string()))
-        else {
-            return;
-        };
-        if let Origin::Unconfirmed { before } = &tracked.origin {
-            tracked.origin = if before.as_deref() == Some(uid) {
-                Origin::Reused(uid.to_string())
-            } else {
-                Origin::Created(uid.to_string())
-            };
-        }
+        Ok(ApplyInFlight {
+            pods: self.clone(),
+            key,
+        })
     }
 
     /// Forget a helper pod the command itself has deleted.
@@ -360,33 +370,20 @@ impl HelperPods {
 pub(crate) enum CleanupAction {
     /// Delete the pod with this uid, and only that one.
     Delete { uid: String },
-    /// Leave it: the pod with this uid was there before this process applied
-    /// it.
+    /// Leave it: this process applied over the pod with this uid, which was
+    /// there before it.
     NotCreatedHere { uid: String },
-    /// There is no pod of that name.
-    Gone,
-    /// Read the pod first, then decide ([`cleanup_action`] again with what
-    /// was read).
-    ReadFirst,
+    /// Leave it: no answer says this process created it.
+    NotConfirmed,
 }
 
-/// Decide what the stop does with a helper pod of origin `origin`, given the
-/// uid of the pod of that name as just read (`now`, `Some(None)` for none),
-/// or `None` when it has not been read. Pure.
-pub(crate) fn cleanup_action(origin: &Origin, now: Option<Option<&str>>) -> CleanupAction {
+/// Decide what the stop does with a helper pod of origin `origin`: delete
+/// only a pod the apiserver's answer to this process's create names. Pure.
+pub(crate) fn cleanup_action(origin: &Origin) -> CleanupAction {
     match origin {
         Origin::Created(uid) => CleanupAction::Delete { uid: uid.clone() },
         Origin::Reused(uid) => CleanupAction::NotCreatedHere { uid: uid.clone() },
-        Origin::Unconfirmed { before } => match now {
-            None => CleanupAction::ReadFirst,
-            Some(None) => CleanupAction::Gone,
-            Some(Some(uid)) if before.as_deref() == Some(uid) => CleanupAction::NotCreatedHere {
-                uid: uid.to_string(),
-            },
-            Some(Some(uid)) => CleanupAction::Delete {
-                uid: uid.to_string(),
-            },
-        },
+        Origin::Unconfirmed => CleanupAction::NotConfirmed,
     }
 }
 
@@ -408,7 +405,6 @@ pub(crate) fn delete_options(uid: &str) -> serde_json::Value {
 /// What a bounded `kubectl` run gave back.
 struct Ran {
     ok: bool,
-    stdout: String,
     stderr: String,
 }
 
@@ -467,9 +463,9 @@ fn kubectl_bounded(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                let _ = out.join();
                 return Some(Ran {
                     ok: status.success(),
-                    stdout: out.join().unwrap_or_default(),
                     stderr: err.join().unwrap_or_default(),
                 });
             }
@@ -483,9 +479,8 @@ fn kubectl_bounded(
     }
 }
 
-/// Clean up one helper pod `ns/name` of origin `origin`: read it if its
-/// origin needs that, then delete it or leave it ([`cleanup_action`]). Returns
-/// the line the stop prints for it.
+/// Clean up one helper pod `ns/name` of origin `origin`: delete it or leave
+/// it ([`cleanup_action`]). Returns the line the stop prints for it.
 pub(crate) fn clean_one(
     kubectl: &Path,
     kubeconfig: &Path,
@@ -495,45 +490,16 @@ pub(crate) fn clean_one(
     deadline: Instant,
 ) -> String {
     let by_hand = format!("delete it with `kubectl delete pod {name} -n {ns}` if nothing uses it");
-    let mut action = cleanup_action(origin, None);
-    if action == CleanupAction::ReadFirst {
-        let read = kubectl_bounded(
-            kubectl,
-            kubeconfig,
-            &[
-                "get",
-                "pod",
-                name,
-                "-n",
-                ns,
-                "--ignore-not-found",
-                "-o",
-                "jsonpath={.metadata.uid}",
-            ],
-            None,
-            deadline,
-        );
-        action = match read {
-            Some(r) if r.ok => {
-                let uid = r.stdout.trim();
-                cleanup_action(origin, Some((!uid.is_empty()).then_some(uid)))
-            }
-            Some(r) => {
-                return format!(
-                    "  could not read helper pod {ns}/{name} ({}): {by_hand}",
-                    r.stderr.trim()
-                )
-            }
-            None => return format!("  ran out of time reading helper pod {ns}/{name}: {by_hand}"),
-        };
-    }
-    match action {
-        CleanupAction::Gone => format!("  helper pod {ns}/{name} is already gone"),
+    match cleanup_action(origin) {
         CleanupAction::NotCreatedHere { .. } => format!(
             "  left helper pod {ns}/{name}: it was there before this command applied it, so \
              another run may be using it (that run deletes it)"
         ),
-        CleanupAction::ReadFirst => unreachable!("decided above"),
+        CleanupAction::NotConfirmed => format!(
+            "  left helper pod {ns}/{name}: the signal cut off this command's create of it \
+             before the answer came, so it cannot tell whether it created the pod of that name \
+             or another run did; {by_hand}"
+        ),
         CleanupAction::Delete { uid } => {
             let body = delete_options(&uid).to_string();
             let path = format!("/api/v1/namespaces/{ns}/pods/{name}");
@@ -749,108 +715,68 @@ mod tests {
         f
     }
 
-    /// A pod this process's apply created is deleted — that pod, by uid; one
-    /// that was there before the apply is left for the run using it; an
-    /// unconfirmed apply is settled by reading the pod.
+    /// Only a pod the apiserver's answer to this process's create names is
+    /// deleted — that pod, by uid. One applied over is left for the run using
+    /// it, and one no answer settled is left too: a pod of that name may be
+    /// another run's.
     #[test]
     fn only_a_pod_this_process_created_is_deleted() {
-        let created = Origin::Created("u-new".into());
         assert_eq!(
-            cleanup_action(&created, None),
+            cleanup_action(&Origin::Created("u-new".into())),
             CleanupAction::Delete {
                 uid: "u-new".into()
             }
         );
-        let reused = Origin::Reused("u-old".into());
         assert_eq!(
-            cleanup_action(&reused, None),
+            cleanup_action(&Origin::Reused("u-old".into())),
             CleanupAction::NotCreatedHere {
                 uid: "u-old".into()
             }
         );
-
-        let unconfirmed_over = Origin::Unconfirmed {
-            before: Some("u-old".into()),
-        };
         assert_eq!(
-            cleanup_action(&unconfirmed_over, None),
-            CleanupAction::ReadFirst
-        );
-        // The apply never reached the apiserver: the pod is the one from before.
-        assert_eq!(
-            cleanup_action(&unconfirmed_over, Some(Some("u-old"))),
-            CleanupAction::NotCreatedHere {
-                uid: "u-old".into()
-            }
-        );
-        // A different uid: the pod from before went (deleted by its own run)
-        // and this apply created the one there now.
-        assert_eq!(
-            cleanup_action(&unconfirmed_over, Some(Some("u-new"))),
-            CleanupAction::Delete {
-                uid: "u-new".into()
-            }
-        );
-        assert_eq!(
-            cleanup_action(&unconfirmed_over, Some(None)),
-            CleanupAction::Gone
-        );
-
-        let unconfirmed_fresh = Origin::Unconfirmed { before: None };
-        assert_eq!(
-            cleanup_action(&unconfirmed_fresh, Some(Some("u-new"))),
-            CleanupAction::Delete {
-                uid: "u-new".into()
-            }
-        );
-        assert_eq!(
-            cleanup_action(&unconfirmed_fresh, Some(None)),
-            CleanupAction::Gone
+            cleanup_action(&Origin::Unconfirmed),
+            CleanupAction::NotConfirmed
         );
     }
 
+    /// A call is unconfirmed until its answer; the answer is recorded before
+    /// the call stops counting as under way, so a stop that waited for it
+    /// reads it; a create refused because the pod was there drops the record.
     #[test]
-    fn the_first_read_after_an_apply_settles_its_origin_and_later_ones_do_not() {
+    fn the_apiservers_answer_settles_the_record_before_the_call_ends() {
         let kc = kubeconfig();
         let pods = HelperPods::default();
-        drop(
-            pods.begin_apply(kc.path(), "demo", "bk-pg-db", None)
-                .unwrap(),
-        );
+
+        let created = pods.begin_apply(kc.path(), "demo", "bk-pg-db").unwrap();
         assert_eq!(
             pods.origin_of("demo", "bk-pg-db"),
-            Some(Origin::Unconfirmed { before: None })
+            Some(Origin::Unconfirmed)
         );
-        pods.observed("demo", "bk-pg-db", "u-1");
-        pods.observed("demo", "bk-pg-db", "u-2");
+        assert_eq!(pods.applies_in_flight(), 1);
+        created.answered(Origin::Created("u-1".into()));
+        assert_eq!(pods.applies_in_flight(), 0);
         assert_eq!(
             pods.origin_of("demo", "bk-pg-db"),
             Some(Origin::Created("u-1".into()))
         );
 
-        drop(
-            pods.begin_apply(kc.path(), "demo", "bk-vol-v", Some("u-old".into()))
-                .unwrap(),
-        );
-        pods.observed("demo", "bk-vol-v", "");
+        // Cut off: dropped unanswered, it stays unconfirmed.
+        drop(pods.begin_apply(kc.path(), "demo", "bk-vol-v").unwrap());
         assert_eq!(
             pods.origin_of("demo", "bk-vol-v"),
-            Some(Origin::Unconfirmed {
-                before: Some("u-old".into())
-            }),
-            "an empty uid settles nothing"
+            Some(Origin::Unconfirmed)
         );
-        pods.observed("demo", "bk-vol-v", "u-old");
-        assert_eq!(
-            pods.origin_of("demo", "bk-vol-v"),
-            Some(Origin::Reused("u-old".into()))
-        );
+        assert_eq!(pods.applies_in_flight(), 0);
+
+        // Refused as AlreadyExists: nothing of this process's is there.
+        pods.begin_apply(kc.path(), "demo", "bk-vol-v")
+            .unwrap()
+            .not_created();
+        assert_eq!(pods.origin_of("demo", "bk-vol-v"), None);
+        assert_eq!(pods.applies_in_flight(), 0);
 
         pods.deleted("demo", "bk-pg-db");
         assert_eq!(pods.origin_of("demo", "bk-pg-db"), None);
-        // A pod never applied is never recorded by a read.
-        pods.observed("demo", "other", "u-9");
-        assert_eq!(pods.origin_of("demo", "other"), None);
     }
 
     /// Once the stop has begun, no helper is applied — and every apply under
@@ -859,12 +785,12 @@ mod tests {
     fn no_apply_begins_after_the_stop_and_those_under_way_are_counted() {
         let kc = kubeconfig();
         let pods = HelperPods::default();
-        let a = pods.begin_apply(kc.path(), "demo", "a", None).unwrap();
-        let b = pods.begin_apply(kc.path(), "demo", "b", None).unwrap();
+        let a = pods.begin_apply(kc.path(), "demo", "a").unwrap();
+        let b = pods.begin_apply(kc.path(), "demo", "b").unwrap();
         assert_eq!(pods.applies_in_flight(), 2);
         pods.close();
         let refused = pods
-            .begin_apply(kc.path(), "demo", "c", None)
+            .begin_apply(kc.path(), "demo", "c")
             .err()
             .expect("an apply after the stop began");
         assert!(refused.to_string().starts_with("interrupted"), "{refused}");
@@ -882,7 +808,7 @@ mod tests {
     fn the_kubeconfig_is_kept_as_it_was_when_the_pod_was_applied() {
         let kc = kubeconfig();
         let pods = HelperPods::default();
-        drop(pods.begin_apply(kc.path(), "demo", "a", None).unwrap());
+        drop(pods.begin_apply(kc.path(), "demo", "a").unwrap());
         let path = kc.path().to_path_buf();
         drop(kc);
         assert!(!path.exists());
@@ -913,9 +839,9 @@ mod tests {
     }
 
     /// A stub `kubectl` that logs its argv (and stdin, for a delete) and
-    /// answers `get` with `uid` and `delete` with `delete_answer` (a shell
-    /// snippet).
-    fn stub(dir: &tempfile::TempDir, uid: &str, delete_answer: &str) -> std::path::PathBuf {
+    /// answers `delete` with `delete_answer` (a shell snippet), anything else
+    /// with nothing.
+    fn stub(dir: &tempfile::TempDir, delete_answer: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         let path = dir.path().join("kubectl-stub");
         let log = dir.path().join("log");
@@ -925,7 +851,6 @@ mod tests {
                 "#!/bin/sh\ncase \"$1\" in __probe) exit 0;; esac\n\
                  echo \"$@\" >> {log}\n\
                  case \"$1\" in\n\
-                 get) printf '%s' '{uid}'; exit 0;;\n\
                  delete) cat >> {log}; echo >> {log}; {delete_answer};;\n\
                  esac",
                 log = log.display()
@@ -955,7 +880,7 @@ mod tests {
     #[test]
     fn a_created_pod_is_deleted_by_uid_without_being_read() {
         let dir = tempfile::tempdir().unwrap();
-        let kubectl = stub(&dir, "unused", "exit 0");
+        let kubectl = stub(&dir, "exit 0");
         let kc = kubeconfig();
         let line = clean_one(
             &kubectl,
@@ -978,63 +903,44 @@ mod tests {
         assert_eq!(body, delete_options("u-1"));
     }
 
+    /// A pod applied over, and one no answer settled, are left without a
+    /// kubectl run at all: nothing read after the fact makes a pod this
+    /// process's. The unsettled one is named with the command that deletes
+    /// it.
     #[test]
-    fn an_unconfirmed_apply_is_read_and_a_pod_from_before_it_is_left() {
-        let dir = tempfile::tempdir().unwrap();
-        let kubectl = stub(&dir, "u-old", "exit 0");
+    fn a_pod_not_confirmed_as_created_here_is_left_unread() {
         let kc = kubeconfig();
+        let dir = tempfile::tempdir().unwrap();
+        let kubectl = stub(&dir, "exit 0");
         let line = clean_one(
             &kubectl,
             kc.path(),
             "nats",
             "rs-js-x",
-            &Origin::Unconfirmed {
-                before: Some("u-old".into()),
-            },
+            &Origin::Reused("u-old".into()),
             soon(),
         );
         assert!(
             line.starts_with("  left helper pod nats/rs-js-x: it was there before"),
             "{line}"
         );
-        let log = log(&dir);
+        let line = clean_one(
+            &kubectl,
+            kc.path(),
+            "demo",
+            "ld-pg-db",
+            &Origin::Unconfirmed,
+            soon(),
+        );
         assert!(
-            log.starts_with(
-                "get pod rs-js-x -n nats --ignore-not-found -o jsonpath={.metadata.uid}"
-            ),
-            "{log}"
+            line.starts_with("  left helper pod demo/ld-pg-db: the signal cut off"),
+            "{line}"
         );
-        assert!(!log.contains("delete"), "{log}");
-    }
-
-    #[test]
-    fn an_unconfirmed_apply_that_created_its_pod_deletes_that_pod() {
-        let dir = tempfile::tempdir().unwrap();
-        let kubectl = stub(&dir, "u-new", "exit 0");
-        let kc = kubeconfig();
-        let line = clean_one(
-            &kubectl,
-            kc.path(),
-            "demo",
-            "ld-pg-db",
-            &Origin::Unconfirmed { before: None },
-            soon(),
+        assert!(
+            line.contains("kubectl delete pod ld-pg-db -n demo"),
+            "{line}"
         );
-        assert_eq!(line, "  deleted helper pod demo/ld-pg-db");
-        assert!(log(&dir).contains(r#""preconditions":{"uid":"u-new"}"#));
-
-        let dir = tempfile::tempdir().unwrap();
-        let kubectl = stub(&dir, "", "exit 0");
-        let line = clean_one(
-            &kubectl,
-            kc.path(),
-            "demo",
-            "ld-pg-db",
-            &Origin::Unconfirmed { before: None },
-            soon(),
-        );
-        assert_eq!(line, "  helper pod demo/ld-pg-db is already gone");
-        assert!(!log(&dir).contains("delete"));
+        assert_eq!(log(&dir), "", "no kubectl was run");
     }
 
     /// The apiserver's answers to a delete by uid, as `kubectl delete --raw`
@@ -1046,7 +952,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let kubectl = stub(
             &dir,
-            "",
             "echo 'Error from server (Conflict): Operation cannot be fulfilled on Pod \"bk-pg-db\": \
              the UID in the precondition (u-1) does not match the UID in record (u-2).' >&2; exit 1",
         );
@@ -1066,7 +971,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let kubectl = stub(
             &dir,
-            "",
             "echo 'Error from server (NotFound): pods \"bk-pg-db\" not found' >&2; exit 1",
         );
         let line = clean_one(
@@ -1080,11 +984,7 @@ mod tests {
         assert_eq!(line, "  helper pod demo/bk-pg-db is already gone");
 
         let dir = tempfile::tempdir().unwrap();
-        let kubectl = stub(
-            &dir,
-            "",
-            "echo 'Unable to connect to the server' >&2; exit 1",
-        );
+        let kubectl = stub(&dir, "echo 'Unable to connect to the server' >&2; exit 1");
         let line = clean_one(
             &kubectl,
             kc.path(),
@@ -1109,7 +1009,7 @@ mod tests {
     fn a_kubectl_that_hangs_is_killed_at_the_deadline() {
         let kc = kubeconfig();
         let dir = tempfile::tempdir().unwrap();
-        let kubectl = stub(&dir, "", "exec sleep 30");
+        let kubectl = stub(&dir, "exec sleep 30");
         let started = Instant::now();
         let line = clean_one(
             &kubectl,

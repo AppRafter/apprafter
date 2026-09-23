@@ -317,27 +317,31 @@ the way to allow longer, rather than with a bare exit code 137.
 
 `apprafter backup create`, `apprafter export` and `apprafter restore` delete
 the helper pods they created when they are interrupted with Ctrl-C or SIGTERM,
-as the runner deletes its own when its Job stops it. Each such pod is recorded
-before its apply is sent, with the uid of any pod of that name already there,
-and the interrupt deletes only a pod its own apply created, with that uid as
-the delete's precondition: a pod of the same name that another run is using is
-left alone. It undoes nothing else, and it takes at most fifteen seconds;
-a second Ctrl-C exits at once, without it. From the signal on, the command
-starts nothing new either: no `kubectl`, no `restic`, and no further restore
-step. A SIGTERM sent to the command's process alone — as `timeout`, systemd
-or a cancelled CI job send it — does not stop the `kubectl` or `restic` it is
-waiting on, so that one runs to its end, but nothing after it does: a restore
-stopped before it scaled the applications down does not scale them down
-afterwards. `apprafter restore --reprovision` handles the signal this way
-only once its new cluster exists; while it is still provisioning, Ctrl-C
-ends it at once. A helper pod that a command or run
-was killed before it could delete — `kill -9`, a lost node, that second Ctrl-C
-— keeps running until its keep-alive ends and then stays behind as
-`Completed` until something deletes it. The next command or run that needs a
-helper pod of that name, the same step for the same claim, deletes it, waits
-until it is gone, and creates its own. It does the same with a leftover it
-cannot update in place because an older version built it with a different
-spec. A pod still running with the same spec is used as it is.
+as the runner deletes its own when its Job stops it. A command creates a helper
+pod that is not there — the create fails rather than touch one another run has
+made in the meantime — and applies over one of the same spec that is. The
+interrupt deletes only a pod the apiserver named in its answer to the command's
+own create, with that pod's uid as the delete's precondition: a pod of the same
+name that another run is using is left alone. So is one whose create the same
+Ctrl-C cut off before the answer came, because a pod of that name found
+afterwards may be another run's; the command prints the `kubectl delete pod`
+line that removes it. It undoes nothing else, and it takes at most fifteen
+seconds; a second Ctrl-C exits at once, without it. From the signal on, the
+command starts nothing new either: no `kubectl`, no `restic`, and no further
+restore step. A SIGTERM sent to the command's process alone — as `timeout`,
+systemd or a cancelled CI job send it — does not stop the `kubectl` or `restic`
+it is waiting on, so that one runs to its end, but nothing after it does: a
+restore stopped before it scaled the applications down does not scale them down
+afterwards. `apprafter restore --reprovision` handles the signal this way only
+once its new cluster exists; while it is still provisioning, Ctrl-C ends it at
+once. A helper pod that a command or run was killed before it could delete —
+`kill -9`, a lost node, that second Ctrl-C — keeps running until its keep-alive
+ends and then stays behind as `Completed` until something deletes it. The next
+command or run that needs a helper pod of that name, the same step for the same
+claim, deletes it, waits until it is gone, and creates its own. It does the
+same with a leftover it cannot update in place because an older version built
+it with a different spec. A pod still running with the same spec is used as it
+is.
 
 Pick the value against the schedule it applies to:
 
