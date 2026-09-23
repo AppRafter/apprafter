@@ -44,7 +44,9 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::commands::backup::KubectlExec;
-use backup_core::helper_pod::{explain_keep_alive_end, pg_helper_pod_spec, volume_pod_spec};
+use backup_core::helper_pod::{
+    explain_keep_alive_end, pg_helper_pod_spec, volume_pod_spec, SecretKey,
+};
 use backup_core::KubeExec;
 use base64::Engine as _;
 use cli_core::{CliError, Result};
@@ -2193,7 +2195,9 @@ fn jetstream_restore_script(stream: &str) -> String {
 /// coordinates come from the RESTORED claim's connection Secret (the fresh
 /// ones, never the backed-up ones — the same rule the pg loader follows), and
 /// the credentials from `nats-mgr-<ns>`, because a claim user is denied the
-/// snapshot API by construction (ADR 0061 §4.2).
+/// snapshot API by construction (ADR 0061 §4.2). The helper's container reads
+/// those by reference, in the NATS namespace where that Secret is; the
+/// restore never reads them itself (see `backup_core::helper_pod`).
 fn load_jetstream(data_dir: &Path, k: &dyn KubeExec, kubeconfig: &Path) -> Result<()> {
     let artifacts = discover_stream_artifacts(data_dir);
     if artifacts.is_empty() {
@@ -2218,15 +2222,10 @@ fn load_jetstream(data_dir: &Path, k: &dyn KubeExec, kubeconfig: &Path) -> Resul
                  (claim {ns}/{claim}): expected <service>.<namespace>.svc"
             ))
         })?;
-        let mgr = backup_core::extract::mgr_secret_name(&ns);
-        let user = k.get_secret_key(&mgr, &nats_ns, "user")?;
-        let password = k.get_secret_key(&mgr, &nats_ns, "password")?;
-
         let server = NatsServer {
             namespace: nats_ns,
             url: format!("nats://{host}:{port}"),
-            user,
-            password,
+            manager_secret: backup_core::extract::mgr_secret_name(&ns),
         };
         restore_claim_streams(k, &ns, &claim, &server, &streams)?;
     }
@@ -2234,12 +2233,12 @@ fn load_jetstream(data_dir: &Path, k: &dyn KubeExec, kubeconfig: &Path) -> Resul
 }
 
 /// Where one claim's streams are replayed: the NATS server's namespace and
-/// URL, and the manager credentials of the claim's namespace.
+/// URL, and the Secret there holding the manager credentials of the claim's
+/// namespace (`nats-mgr-<ns>`).
 struct NatsServer {
     namespace: String,
     url: String,
-    user: String,
-    password: String,
+    manager_secret: String,
 }
 
 /// Replay one claim's streams through a helper pod beside the server.
@@ -2270,8 +2269,14 @@ fn restore_claim_streams(
         &server.namespace,
         backup_core::images::JETSTREAM_IMAGE,
         &server.url,
-        &server.user,
-        &server.password,
+        SecretKey {
+            secret: &server.manager_secret,
+            key: backup_core::extract::NATS_MGR_USER_KEY,
+        },
+        SecretKey {
+            secret: &server.manager_secret,
+            key: backup_core::extract::NATS_MGR_PASSWORD_KEY,
+        },
         restore_helper_keep_alive(k)?,
     );
     k.apply_and_wait_pod_ready(&spec)?;
@@ -2383,9 +2388,10 @@ fn discover_pg_dumps(data_dir: &Path) -> Vec<(String, String, PathBuf)> {
 /// Load one pg dump into a freshly-provisioned claim.
 ///
 /// L3: resolve the claim's CURRENT `status.connectionSecretRef` and read
-/// user/pass/host/port/db from THAT (the post-provision Secret), never the
-/// creds embedded in the backup. L2: `pg_restore` reads the dump on stdin via
-/// `exec_stream_from_file`; `PGPASSWORD` is injected into the helper pod env.
+/// user/host/port/db from THAT (the post-provision Secret), never the creds
+/// embedded in the backup. L2: `pg_restore` reads the dump on stdin via
+/// `exec_stream_from_file`; the helper's container reads `PGPASSWORD` from
+/// the same Secret's `pass` by reference.
 fn load_one_pg(
     ns: &str,
     claim: &str,
@@ -2445,19 +2451,26 @@ fn connection_secret_name(claim_json: &Value, ns: &str, claim: &str) -> Result<S
         })
 }
 
-/// The connection parameters of a freshly-provisioned pg claim.
+/// The connection parameters of a freshly-provisioned pg claim: the four
+/// that go on `pg_restore`'s command line, and the Secret the helper's
+/// container reads the password from (see `backup_core::helper_pod`).
 struct PgConnection {
     user: String,
-    pass: String,
     host: String,
     port: String,
     db: String,
+    /// The connection Secret, in the claim's namespace, whose
+    /// [`backup_core::extract::PG_CONNECTION_PASSWORD_KEY`] the helper's
+    /// `PGPASSWORD` reads.
+    secret: String,
 }
 
-/// Read the five connection keys out of a pg claim's connection Secret, naming
-/// the missing one when the Secret is incomplete. Every key is REQUIRED: a
+/// Read the connection keys out of a pg claim's connection Secret, naming the
+/// missing one when the Secret is incomplete. Every key is REQUIRED: a
 /// silently-defaulted host or db would point `pg_restore` at the wrong database
-/// and report success.
+/// and report success. The password is only checked for, not kept: the
+/// helper's container reads it from the Secret itself, and a Secret without it
+/// would otherwise surface as a container that cannot start.
 fn pg_connection_from_secret(
     secret: &BTreeMap<String, Vec<u8>>,
     ns: &str,
@@ -2473,12 +2486,14 @@ fn pg_connection_from_secret(
                 ))
             })
     };
+    let user = get("user")?;
+    get(backup_core::extract::PG_CONNECTION_PASSWORD_KEY)?;
     Ok(PgConnection {
-        user: get("user")?,
-        pass: get("pass")?,
+        user,
         host: get("host")?,
         port: get("port")?,
         db: get("db")?,
+        secret: secret_name.to_string(),
     })
 }
 
@@ -2520,14 +2535,18 @@ fn run_pg_restore(
 ) -> Result<()> {
     let pod_name = truncate_pod_name(&format!("ld-pg-{claim}"));
     // The backup's own pg helper builder (the pg_dump image carries
-    // `pg_restore`): `PGPASSWORD` so `pg_restore` never prompts and hangs the
-    // restore, and `PGOPTIONS` so a `pg_restore` stopped while its `--clean`
-    // waits on a lock does not leave that request queued on the server.
+    // `pg_restore`): `PGPASSWORD`, by reference to the connection Secret, so
+    // `pg_restore` never prompts and hangs the restore, and `PGOPTIONS` so a
+    // `pg_restore` stopped while its `--clean` waits on a lock does not leave
+    // that request queued on the server.
     let spec = pg_helper_pod_spec(
         &pod_name,
         ns,
         pg_image,
-        &conn.pass,
+        SecretKey {
+            secret: &conn.secret,
+            key: backup_core::extract::PG_CONNECTION_PASSWORD_KEY,
+        },
         restore_helper_keep_alive(k)?,
     );
 
@@ -2549,7 +2568,7 @@ fn run_pg_restore(
 
 /// Poll a real connection to the TARGET database inside an already-running
 /// helper pod until it succeeds, or a bounded timeout elapses. `PGPASSWORD` is
-/// already in the pod env (set by the caller).
+/// already in the pod env (read from the connection Secret by reference).
 ///
 /// A `pg_isready` probe is NOT enough: for a lazily-provisioned shared CNPG
 /// cluster, the SERVER accepts connections (to `postgres`) well before the
@@ -6424,8 +6443,7 @@ mod tests {
         NatsServer {
             namespace: "nats".into(),
             url: "nats://nats.nats.svc:4222".into(),
-            user: "mgr_atm".into(),
-            password: "pw".into(),
+            manager_secret: "nats-mgr-atm".into(),
         }
     }
 
@@ -6527,6 +6545,54 @@ mod tests {
         );
     }
 
+    /// WI-383: a restore's helpers read their credentials from the Secret
+    /// that holds them, by reference, and the Pod objects carry no password:
+    /// the pg loader's from the fresh connection Secret, the stream replay's
+    /// from the NATS manager Secret beside the server.
+    #[test]
+    fn a_restores_helpers_read_their_credentials_by_reference() {
+        let env_of = |spec: &Value, var: &str| {
+            spec["spec"]["containers"][0]["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == var)
+                .cloned()
+                .unwrap_or_else(|| panic!("no {var} in {spec}"))
+        };
+        let by_ref = |secret: &str, key: &str| json!({"valueFrom": {"secretKeyRef": {"name": secret, "key": key}}});
+
+        let k = FakeKube::default();
+        let dump = tempfile::NamedTempFile::new().unwrap();
+        run_pg_restore(
+            "demo",
+            "db",
+            &pg_conn(),
+            dump.path(),
+            &k,
+            "postgres:18",
+            &|_| Ok(()),
+        )
+        .unwrap();
+        let mut pg = env_of(&k.applied.borrow()[0], "PGPASSWORD");
+        pg.as_object_mut().unwrap().remove("name");
+        assert_eq!(pg, by_ref("db-conn", "pass"));
+
+        let k = FakeKube::default();
+        let (_dir, streams) = stream_artifacts(&["orders"]);
+        restore_claim_streams(&k, "atm", "worker-js", &nats_server(), &streams).unwrap();
+        let spec = k.applied.borrow()[0].clone();
+        for (var, key) in [("NATS_USER", "user"), ("NATS_PASSWORD", "password")] {
+            let mut env = env_of(&spec, var);
+            env.as_object_mut().unwrap().remove("name");
+            assert_eq!(env, by_ref("nats-mgr-atm", key), "{var}");
+        }
+        assert_eq!(
+            env_of(&spec, "NATS_URL")["value"],
+            "nats://nats.nats.svc:4222"
+        );
+    }
+
     /// Measured on a real server (nats 2.14.3 / CLI v0.2.3): `nats stream
     /// restore` refuses a stream that exists — `Stream "X" already exist`,
     /// exit 1 — and NACK recreates a DECLARED stream empty as soon as the
@@ -6592,10 +6658,10 @@ mod tests {
     fn pg_conn() -> PgConnection {
         PgConnection {
             user: "app".into(),
-            pass: "s3cret".into(),
             host: "db-rw.demo.svc".into(),
             port: "5432".into(),
             db: "claim_demo_db".into(),
+            secret: "db-conn".into(),
         }
     }
 
@@ -6631,15 +6697,21 @@ mod tests {
         let conn = pg_connection_from_secret(&full, "demo", "db-conn").unwrap();
         assert_eq!(conn.user, "app");
         assert_eq!(conn.db, "claim_demo_db");
+        // The Secret the helper reads the password from, not the password.
+        assert_eq!(conn.secret, "db-conn");
 
-        let mut missing = full.clone();
-        missing.remove("db");
-        // `.err()` rather than `unwrap_err()`: PgConnection deliberately has no
-        // Debug impl, because it carries the database password.
-        let e = pg_connection_from_secret(&missing, "demo", "db-conn")
-            .err()
-            .expect("an incomplete connection Secret must not resolve");
-        assert!(format!("{e}").contains("missing key `db`"), "got: {e}");
+        for key in ["db", "pass"] {
+            let mut missing = full.clone();
+            missing.remove(key);
+            // `.err()` rather than `unwrap_err()`: PgConnection has no Debug impl.
+            let e = pg_connection_from_secret(&missing, "demo", "db-conn")
+                .err()
+                .expect("an incomplete connection Secret must not resolve");
+            assert!(
+                format!("{e}").contains(&format!("missing key `{key}`")),
+                "got: {e}"
+            );
+        }
     }
 
     /// The restore argv: `--clean --if-exists` because the fresh database is
@@ -6669,7 +6741,8 @@ mod tests {
 
     /// `PGPASSWORD` must reach the helper pod's environment, or `pg_restore`
     /// prompts for a password on a pod with no TTY and the restore hangs until
-    /// the user gives up. `PGOPTIONS` must too: without it a `pg_restore`
+    /// the user gives up — by reference to the connection Secret, so the Pod
+    /// object never carries it. `PGOPTIONS` must too: without it a `pg_restore`
     /// stopped while its `--clean` waits for `ACCESS EXCLUSIVE` leaves that
     /// request queued on the server, and every later reader of the table
     /// queues behind it (measured on PostgreSQL 18.6).
@@ -6679,7 +6752,10 @@ mod tests {
             "ld-pg-db",
             "demo",
             "postgres:18",
-            "s3cret",
+            SecretKey {
+                secret: "db-conn",
+                key: "pass",
+            },
             backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
         );
         assert_eq!(spec["metadata"]["name"], "ld-pg-db");
@@ -6694,7 +6770,8 @@ mod tests {
         assert_eq!(
             spec["spec"]["containers"][0]["env"],
             serde_json::json!([
-                { "name": "PGPASSWORD", "value": "s3cret" },
+                { "name": "PGPASSWORD",
+                  "valueFrom": { "secretKeyRef": { "name": "db-conn", "key": "pass" } } },
                 { "name": "PGOPTIONS", "value": "-c client_connection_check_interval=10s" }
             ])
         );

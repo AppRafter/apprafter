@@ -1038,6 +1038,9 @@ impl KubectlExec {
     }
 }
 
+/// How often the Ready wait reads a helper pod.
+const POD_READY_POLL: Duration = Duration::from_secs(1);
+
 /// The `kubectl` executable [`KubectlExec`] spawns, resolved through `PATH`.
 const KUBECTL_BIN: &str = "kubectl";
 
@@ -1232,6 +1235,47 @@ impl KubectlExec {
         })
     }
 
+    /// Read pod `name` until it is Running + Ready, for up to `timeout`, every
+    /// `poll` — the runner's `KubeRsExec` waits the same way. A container the
+    /// kubelet cannot configure for `grace` without a break (a credential
+    /// Secret or key missing: [`backup_core::helper_pod::container_config_error`])
+    /// ends the wait at once with the kubelet's words, rather than after the
+    /// whole `timeout` with none.
+    fn wait_pod_ready(
+        &self,
+        name: &str,
+        ns: &str,
+        timeout: Duration,
+        poll: Duration,
+        grace: Duration,
+    ) -> Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut config_error = backup_core::helper_pod::ConfigErrorWatch::default();
+        loop {
+            let pod = self.get_pod_if_present(name, ns)?.ok_or_else(|| {
+                CliError::Other(format!(
+                    "pod {name} in {ns} is gone: it was deleted while this command waited for \
+                     it to be Ready"
+                ))
+            })?;
+            if backup_core::helper_pod::pod_is_ready(&pod) {
+                return Ok(());
+            }
+            if let Some(why) = config_error.observe(&pod, std::time::Instant::now(), grace) {
+                return Err(backup_core::helper_pod::container_config_error_message(
+                    ns, name, &why,
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(CliError::Other(format!(
+                    "pod {name} in {ns} did not reach Ready within {}s",
+                    timeout.as_secs()
+                )));
+            }
+            thread::sleep(poll);
+        }
+    }
+
     /// Delete a stale helper pod and wait until it is gone, within
     /// [`backup_core::helper_pod::STALE_POD_GONE_WITHIN`] (`kubectl delete
     /// --wait` watches the pod until it has).
@@ -1320,28 +1364,13 @@ impl KubeExec for KubectlExec {
             ApplyAnswer::Refused { error, .. } => return Err(error),
         }
 
-        let wait_status = Command::new(&self.kubectl_bin)
-            .args([
-                "wait",
-                "--for=condition=Ready",
-                &format!("pod/{name}"),
-                "-n",
-                ns,
-                "--timeout=300s",
-            ])
-            .env("KUBECONFIG", &self.kubeconfig)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|e| CliError::Other(format!("spawn kubectl wait: {e}")))?;
-
-        if wait_status.success() {
-            Ok(())
-        } else {
-            Err(CliError::Other(format!(
-                "pod {name} in {ns} did not reach Ready within 300s (kubectl wait exited {wait_status})"
-            )))
-        }
+        self.wait_pod_ready(
+            name,
+            ns,
+            backup_core::helper_pod::POD_READY_TIMEOUT,
+            POD_READY_POLL,
+            backup_core::helper_pod::CONTAINER_CONFIG_ERROR_GRACE,
+        )
     }
 
     fn exec_stream_to_file(
@@ -10410,17 +10439,34 @@ mod tests {
             .expect("an early-closing consumer that exits 0 is a success");
     }
 
+    /// A helper pod as `kubectl get` shows it once it is Running and Ready,
+    /// with uid `uid`.
+    fn ready_pod(uid: &str) -> String {
+        json!({
+            "metadata": {"name": "helper", "namespace": "prod", "uid": uid},
+            "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]}
+        })
+        .to_string()
+    }
+
     #[test]
     fn apply_and_wait_pod_ready_pipes_the_spec_in_and_then_waits_for_ready() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("argv");
         let seen = dir.path().join("spec.json");
+        let applied = dir.path().join("applied");
+        // `get` answers "no such pod" until the apply, and the Ready pod after.
         let k = stub_kubectl(
             &dir,
             &format!(
-                "echo \"$@\" >> {log}\nif [ \"$1\" = apply ]; then cat > {seen}; fi\nexit 0",
+                "echo \"$@\" >> {log}\n\
+                 if [ \"$1\" = apply ]; then cat > {seen}; touch {applied}; fi\n\
+                 if [ \"$1\" = get ] && [ -f {applied} ]; then printf '%s' '{ready}'; fi\n\
+                 exit 0",
                 log = log.display(),
-                seen = seen.display()
+                seen = seen.display(),
+                applied = applied.display(),
+                ready = ready_pod("u-1"),
             ),
         );
         let spec = json!({
@@ -10434,20 +10480,30 @@ mod tests {
         let piped: Value = serde_json::from_slice(&std::fs::read(&seen).unwrap()).unwrap();
         assert_eq!(piped, spec);
 
-        let argv = std::fs::read_to_string(&log).unwrap();
-        assert!(argv.contains("apply -f - -n prod"), "{argv}");
-        // Readiness, not existence: a Pod that exists but is not Ready cannot
-        // be exec'd into, which is the only reason this helper is created.
-        assert!(
-            argv.contains("wait --for=condition=Ready pod/helper -n prod --timeout=300s"),
-            "{argv}"
+        let argv: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        // Read (no pod), applied, then read until Ready: readiness, not
+        // existence — a Pod that exists but is not Ready cannot be exec'd
+        // into, which is the only reason this helper is created.
+        assert_eq!(
+            argv,
+            vec![
+                "get pod helper -n prod --ignore-not-found -o json",
+                "apply -f - -n prod",
+                "get pod helper -n prod --ignore-not-found -o json",
+            ]
         );
     }
 
     /// A stub kubectl that logs every call and plays a pod named `helper`:
     /// `get` prints `pod` (a JSON document, or nothing: absent) until a
-    /// `delete` removes it, `apply` runs `apply` (a shell snippet; it must
-    /// read stdin), and `wait` succeeds.
+    /// `delete` removes it; `apply` runs `apply` (a shell snippet; it must
+    /// read stdin) and, when that succeeds, leaves the pod Running and Ready —
+    /// with uid `u-applied` if there was none, else keeping the one it had,
+    /// as an apply over a pod does.
     fn stateful_stub(dir: &tempfile::TempDir, pod: &str, apply: &str) -> (KubectlExec, PathBuf) {
         let log = dir.path().join("argv");
         let present = dir.path().join("present.json");
@@ -10461,11 +10517,18 @@ mod tests {
                  case \"$1\" in\n\
                  get) cat {present} 2>/dev/null; exit 0;;\n\
                  delete) rm -f {present}; exit 0;;\n\
-                 apply) {apply};;\n\
-                 wait) exit 0;;\n\
+                 apply) ( {apply} ); rc=$?\n\
+                   if [ $rc -eq 0 ]; then\n\
+                     uid=$(sed -n 's/.*\"uid\": *\"\\([^\"]*\\)\".*/\\1/p' {present} 2>/dev/null)\n\
+                     printf '{ready}' \"${{uid:-u-applied}}\" > {present}\n\
+                   fi\n\
+                   exit $rc;;\n\
                  esac",
                 log = log.display(),
                 present = present.display(),
+                // Inside the single quotes of `printf`, where `"` is literal;
+                // the one `%s` is the uid.
+                ready = ready_pod("%s"),
             ),
         );
         (k, log)
@@ -10495,7 +10558,7 @@ mod tests {
         let spec: Value = serde_json::from_str(HELPER).unwrap();
         k.apply_and_wait_pod_ready(&spec).unwrap();
 
-        assert_eq!(calls(&log), vec!["get", "delete", "apply", "wait"]);
+        assert_eq!(calls(&log), vec!["get", "delete", "apply", "get"]);
         let argv = std::fs::read_to_string(&log).unwrap();
         assert!(
             argv.contains("get pod helper -n prod --ignore-not-found -o json"),
@@ -10524,7 +10587,7 @@ mod tests {
         );
         let spec: Value = serde_json::from_str(HELPER).unwrap();
         k.apply_and_wait_pod_ready(&spec).unwrap();
-        assert_eq!(calls(&log), vec!["get", "apply", "wait"]);
+        assert_eq!(calls(&log), vec!["get", "apply", "get"]);
     }
 
     /// The six-hour helper a command applies, and the same pod as `kubectl
@@ -10552,7 +10615,7 @@ mod tests {
         let (spec, pod) = six_hour_helper(Duration::from_secs(5 * 3600));
         let (k, log) = stateful_stub(&dir, &pod, "cat >/dev/null; exit 0");
         k.apply_and_wait_pod_ready(&spec).unwrap();
-        assert_eq!(calls(&log), vec!["get", "delete", "apply", "wait"]);
+        assert_eq!(calls(&log), vec!["get", "delete", "apply", "get"]);
     }
 
     /// One another command created moments ago is used as it is.
@@ -10562,7 +10625,7 @@ mod tests {
         let (spec, pod) = six_hour_helper(Duration::from_secs(10));
         let (k, log) = stateful_stub(&dir, &pod, "cat >/dev/null; exit 0");
         k.apply_and_wait_pod_ready(&spec).unwrap();
-        assert_eq!(calls(&log), vec!["get", "apply", "wait"]);
+        assert_eq!(calls(&log), vec!["get", "apply", "get"]);
     }
 
     /// A leftover whose spec cannot be applied over — an older CLI's or
@@ -10591,7 +10654,51 @@ mod tests {
         );
         let spec: Value = serde_json::from_str(HELPER).unwrap();
         k.apply_and_wait_pod_ready(&spec).unwrap();
-        assert_eq!(calls(&log), vec!["get", "apply", "delete", "apply", "wait"]);
+        assert_eq!(calls(&log), vec!["get", "apply", "delete", "apply", "get"]);
+    }
+
+    /// WI-383, the CLI's side: a helper whose credential Secret is missing
+    /// cannot start its container, and the wait says so with the kubelet's
+    /// words once that has held for the grace — not after five minutes.
+    #[test]
+    fn a_helper_whose_credential_secret_is_missing_fails_the_wait_with_the_kubelets_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = json!({
+            "metadata": {"name": "helper", "uid": "u-1"},
+            "status": {"phase": "Pending", "containerStatuses": [{"name": "dump",
+                "state": {"waiting": {"reason": "CreateContainerConfigError",
+                    "message": "couldn't find key pass in Secret prod/db-conn"}}}]}
+        });
+        // From a file: the kubelet's message has an apostrophe in it.
+        let pod = dir.path().join("pod.json");
+        std::fs::write(&pod, blocked.to_string()).unwrap();
+        let k = stub_kubectl(
+            &dir,
+            &format!("[ \"$1\" = get ] && cat {}\nexit 0", pod.display()),
+        );
+        let started = std::time::Instant::now();
+        let msg = k
+            .wait_pod_ready(
+                "helper",
+                "prod",
+                Duration::from_secs(20),
+                Duration::from_millis(50),
+                Duration::from_millis(300),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            msg.starts_with(
+                "helper pod prod/helper cannot start its container: couldn't find key pass in \
+                 Secret prod/db-conn (CreateContainerConfigError)"
+            ),
+            "{msg}"
+        );
     }
 
     /// Every other apply failure is the run's own, and nothing is deleted.
@@ -10990,14 +11097,32 @@ mod tests {
         // instead of the readiness message. That is what turned this test red
         // on a loaded CI runner (2026-09-10) after passing since it landed —
         // 500 local runs, including pinned to one CPU, never reproduced it.
+        //
+        // The wait itself is driven with a one-second timeout: the command's
+        // own is `POD_READY_TIMEOUT`, five minutes.
         let waits = stub_kubectl(
             &dir,
-            "if [ \"$1\" = wait ]; then exit 1; fi\ncat >/dev/null\nexit 0",
+            "if [ \"$1\" = get ]; then \
+             printf '%s' '{\"metadata\": {\"name\": \"helper\"}, \"status\": {\"phase\": \"Pending\"}}'; \
+             fi\ncat >/dev/null\nexit 0",
         );
-        let err = waits.apply_and_wait_pod_ready(&spec).unwrap_err();
+        let err = waits
+            .wait_pod_ready(
+                "helper",
+                "prod",
+                Duration::from_secs(1),
+                Duration::from_millis(50),
+                backup_core::helper_pod::CONTAINER_CONFIG_ERROR_GRACE,
+            )
+            .unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("did not reach Ready within 300s"), "{msg}");
+        assert!(msg.contains("did not reach Ready within 1s"), "{msg}");
         assert!(msg.contains("helper") && msg.contains("prod"), "{msg}");
+        assert_eq!(
+            backup_core::helper_pod::POD_READY_TIMEOUT,
+            Duration::from_secs(300),
+            "the documented five minutes (docs: How a run may take)"
+        );
 
         // apply itself fails → the apiserver's own complaint is carried. (The
         // look for a leftover pod before it finds none.)

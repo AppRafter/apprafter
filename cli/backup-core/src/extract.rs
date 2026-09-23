@@ -17,10 +17,14 @@
 //! The connection Secret (written by the provisioner at `status.connectionSecretRef`)
 //! carries decomposed keys `user`, `pass`, `host`, `port`, `db` — all
 //! `stringData` fields, stored base64 under `data`.  `run_extraction` reads
-//! each key via `KubeExec::get_secret_key` (which returns the base64-decoded
-//! string).  The password is then injected as the `PGPASSWORD` environment
-//! variable INTO THE HELPER POD SPEC (not via `kubectl exec --env`), so
-//! `pg_dump` reads it from the env and suppresses the interactive prompt.
+//! the four it puts on `pg_dump`'s command line via `KubeExec::get_secret_key`
+//! (which returns the base64-decoded string) and never reads the password:
+//! the helper pod's container takes `PGPASSWORD` from the Secret's `pass` key
+//! by reference ([`crate::helper_pod::SecretKey`]), so `pg_dump` reads it
+//! from its env and never prompts, while the Pod object carries only the
+//! Secret's name. The helper runs in the claim's namespace, which is where
+//! that Secret is. The JetStream dump does the same with the NATS manager
+//! user and password ([`NATS_MGR_USER_KEY`], [`NATS_MGR_PASSWORD_KEY`]).
 
 use std::fs;
 use std::path::Path;
@@ -31,7 +35,7 @@ use serde_json::Value;
 
 use crate::helper_pod::{
     apply_and_wait_pod_ready, delete_pod_best_effort, exec_stream_to_file, explain_keep_alive_end,
-    nats_pod_spec, pg_helper_pod_spec, volume_pod_spec,
+    nats_pod_spec, pg_helper_pod_spec, volume_pod_spec, SecretKey,
 };
 use crate::images;
 use crate::kube::KubeExec;
@@ -314,6 +318,16 @@ pub fn nats_namespace_of_host(host: &str) -> Option<String> {
     Some(namespace.to_string())
 }
 
+/// The key of a pg claim's connection Secret that holds the password — what
+/// a PostgreSQL helper's `PGPASSWORD` is read from.
+pub const PG_CONNECTION_PASSWORD_KEY: &str = "pass";
+
+/// The keys of a NATS manager Secret ([`mgr_secret_name`]) holding the
+/// manager user's name and password — what a JetStream helper's `NATS_USER`
+/// and `NATS_PASSWORD` are read from.
+pub const NATS_MGR_USER_KEY: &str = "user";
+pub const NATS_MGR_PASSWORD_KEY: &str = "password";
+
 /// The per-namespace NATS manager Secret, by the provisioner's convention.
 ///
 /// Restated rather than imported: `nats::mgr_secret_name` lives in the
@@ -427,9 +441,9 @@ pub fn jetstream_helper_pod_name(
 ///
 /// For each item:
 ///
-/// * **Pg** — reads the connection Secret (decomposed keys `user`, `pass`,
-///   `host`, `port`, `db`) via `k.get_secret_key`; applies a helper pod with
-///   `PGPASSWORD` injected into its container env; execs `pg_dump -Fc
+/// * **Pg** — reads the connection Secret's `user`, `host`, `port` and `db`
+///   via `k.get_secret_key`; applies a helper pod whose container reads
+///   `PGPASSWORD` from that Secret's `pass` by reference; execs `pg_dump -Fc
 ///   --lock-wait-timeout=300s -h <host> -U <user> -p <port> <db>` (see
 ///   [`PG_DUMP_LOCK_WAIT_TIMEOUT`]) and streams stdout to
 ///   `pg/<ns>/<claim>.dump`, failing if the first byte takes longer than
@@ -505,8 +519,10 @@ impl Drop for HelperPodGuard<'_> {
 
 /// Extract a single `Pg` claim.
 ///
-/// 1. Read connection creds from the connection Secret via `k.get_secret_key`.
-/// 2. Apply a pg-dump helper pod with `PGPASSWORD` in its container env.
+/// 1. Read the connection coordinates from the connection Secret via
+///    `k.get_secret_key` — not the password.
+/// 2. Apply a pg-dump helper pod whose container reads `PGPASSWORD` from the
+///    same Secret's `pass` key (the pod runs in the Secret's namespace).
 /// 3. `k.exec_stream_to_file` → `pg_dump -Fc` → stream to
 ///    `out_dir/pg/<ns>/<claim>.dump`.
 /// 4. Delete the pod (best-effort, via `HelperPodGuard` drop).
@@ -521,9 +537,9 @@ fn extract_pg(
     let ns = &item.namespace;
     let claim = &item.claim_name;
 
-    // 1. Read the decomposed connection Secret keys.
+    // 1. Read the decomposed connection Secret keys the argv needs. The
+    //    password is not one of them: the container reads it by reference.
     let user = k.get_secret_key(secret_name, ns, "user")?;
-    let pass = k.get_secret_key(secret_name, ns, "pass")?;
     let host = k.get_secret_key(secret_name, ns, "host")?;
     let port = k.get_secret_key(secret_name, ns, "port")?;
     let db = k.get_secret_key(secret_name, ns, "db")?;
@@ -536,7 +552,11 @@ fn extract_pg(
         namespace: ns,
         k,
     };
-    let spec = pg_helper_pod_spec(&pod_name, ns, pg_image, &pass, keep_alive);
+    let password = SecretKey {
+        secret: secret_name,
+        key: PG_CONNECTION_PASSWORD_KEY,
+    };
+    let spec = pg_helper_pod_spec(&pod_name, ns, pg_image, password, keep_alive);
     apply_and_wait_pod_ready(k, &spec)?;
 
     // 3. Stream pg_dump output to disk.
@@ -670,9 +690,10 @@ fn extract_volume(
 /// Secret, which is where the server coordinates come from. The credentials
 /// are NOT that Secret's: a claim user is denied `$JS.API.STREAM.SNAPSHOT` by
 /// construction (ADR 0061 §4.2 — its delivery subject is caller-chosen, which
-/// made it a read bypass), and the snapshot is the manager user's job. So this
-/// reads `nats-mgr-<ns>` from the namespace NATS runs in, which the `host`
-/// names and nothing else does.
+/// made it a read bypass), and the snapshot is the manager user's job. So the
+/// helper runs in the namespace NATS runs in, which the `host` names and
+/// nothing else does, and its container reads the user and password of
+/// `nats-mgr-<ns>` there, by reference: this never reads them itself.
 ///
 /// The artifact is a tar of what `nats stream backup` writes — `backup.json`
 /// plus `stream.tar.s2` — because `nats stream restore` takes that DIRECTORY,
@@ -705,10 +726,8 @@ fn extract_jetstream(
         ))
     })?;
 
-    // 2. Manager credentials from that namespace.
+    // 2. Manager credentials from that namespace, by reference.
     let mgr = mgr_secret_name(ns);
-    let user = k.get_secret_key(&mgr, &nats_ns, "user")?;
-    let password = k.get_secret_key(&mgr, &nats_ns, "password")?;
     let url = format!("nats://{host}:{port}");
 
     // 3. Helper pod beside the server, guard armed before apply-wait. The
@@ -724,8 +743,14 @@ fn extract_jetstream(
         &nats_ns,
         images::JETSTREAM_IMAGE,
         &url,
-        &user,
-        &password,
+        SecretKey {
+            secret: &mgr,
+            key: NATS_MGR_USER_KEY,
+        },
+        SecretKey {
+            secret: &mgr,
+            key: NATS_MGR_PASSWORD_KEY,
+        },
         keep_alive,
     );
     apply_and_wait_pod_ready(k, &spec)?;
@@ -1164,6 +1189,8 @@ mod tests {
     struct RecordingKube {
         execs: std::sync::Mutex<Vec<(String, Option<std::time::Duration>)>>,
         applied: std::sync::Mutex<Vec<Value>>,
+        /// Every Secret key read, as `(namespace, secret, key)`.
+        secret_reads: std::sync::Mutex<Vec<(String, String, String)>>,
         /// Every exec is killed by its helper pod's keep-alive running out:
         /// it fails with exit code 137, and the pod reads as ended.
         keep_alive_runs_out: bool,
@@ -1200,7 +1227,12 @@ mod tests {
             unreachable!("extraction never streams into a pod")
         }
         fn delete_pod_best_effort(&self, _name: &str, _ns: &str) {}
-        fn get_secret_key(&self, _secret: &str, _ns: &str, key: &str) -> Result<String> {
+        fn get_secret_key(&self, secret: &str, ns: &str, key: &str) -> Result<String> {
+            self.secret_reads.lock().unwrap().push((
+                ns.to_string(),
+                secret.to_string(),
+                key.to_string(),
+            ));
             Ok(match key {
                 "port" => "5432".into(),
                 "host" => "pg.demo.svc".into(),
@@ -1391,7 +1423,86 @@ mod tests {
             vec![json!("-c client_connection_check_interval=10s")],
             "{env}"
         );
-        assert_eq!(value_of("PGPASSWORD"), vec![json!("pass-value")], "{env}");
+        assert_eq!(value_of("PGPASSWORD"), vec![Value::Null], "{env}");
+    }
+
+    /// WI-383: an extraction never reads a credential and never writes one
+    /// into a helper pod. Each helper's container reads it from the Secret
+    /// that holds it, in the helper's own namespace — the claim's connection
+    /// Secret for a dump, `nats-mgr-<ns>` beside the NATS server for a
+    /// stream — so the Pod object, which `get pods` shows, carries only a
+    /// reference. It used to carry the password as a literal env value.
+    #[test]
+    fn an_extraction_reads_no_credential_and_its_helpers_only_reference_one() {
+        let k = RecordingKube::default();
+        let items = plan_extraction(&[
+            json!({"spec": {"type": "pg"}, "metadata": {"name": "db", "namespace": "demo"},
+                   "status": {"connectionSecretRef": "db-conn"}}),
+            json!({"spec": {"type": "disk"}, "metadata": {"name": "vol", "namespace": "demo"},
+                   "status": {"volumeClaimRef": "pvc"}}),
+            json!({"spec": {"type": "jetstream"}, "metadata": {"name": "js", "namespace": "demo"},
+                   "status": {"connectionSecretRef": "js-conn",
+                              "streams": {"declared": ["orders"]}}}),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        run_extraction(
+            &k,
+            &items,
+            dir.path(),
+            images::DEFAULT_PG_IMAGE,
+            crate::helper_pod::DEFAULT_RUN_DEADLINE,
+        )
+        .unwrap();
+
+        // What was read: the coordinates, never the password or the manager
+        // Secret. (The fake's `host`, `pg.demo.svc`, puts NATS in `demo`.)
+        let reads = k.secret_reads.lock().unwrap().clone();
+        let read = |ns: &str, secret: &str, key: &str| {
+            (ns.to_string(), secret.to_string(), key.to_string())
+        };
+        assert_eq!(
+            reads,
+            vec![
+                read("demo", "db-conn", "user"),
+                read("demo", "db-conn", "host"),
+                read("demo", "db-conn", "port"),
+                read("demo", "db-conn", "db"),
+                read("demo", "js-conn", "host"),
+                read("demo", "js-conn", "port"),
+            ]
+        );
+
+        // What each helper pod carries: a reference per credential, and no
+        // value the fake Secret could have given (it answers `<key>-value`).
+        let applied = k.applied.lock().unwrap().clone();
+        let secret_ref_of = |spec: &Value, var: &str| {
+            spec["spec"]["containers"][0]["env"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|e| e["name"] == var)
+                .map(|e| e["valueFrom"]["secretKeyRef"].clone())
+        };
+        assert_eq!(applied.len(), 3, "{applied:?}");
+        assert_eq!(
+            secret_ref_of(&applied[0], "PGPASSWORD"),
+            Some(json!({"name": "db-conn", "key": "pass"}))
+        );
+        assert_eq!(applied[2]["metadata"]["namespace"], "demo");
+        assert_eq!(
+            secret_ref_of(&applied[2], "NATS_USER"),
+            Some(json!({"name": "nats-mgr-demo", "key": "user"}))
+        );
+        assert_eq!(
+            secret_ref_of(&applied[2], "NATS_PASSWORD"),
+            Some(json!({"name": "nats-mgr-demo", "key": "password"}))
+        );
+        for spec in &applied {
+            let text = spec.to_string();
+            for secret_value in ["pass-value", "password-value"] {
+                assert!(!text.contains(secret_value), "{text}");
+            }
+        }
     }
 
     #[test]

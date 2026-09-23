@@ -11,6 +11,29 @@
 //! is there to exec into. `restartPolicy: Never` ensures a single attempt; the caller tears
 //! down with `delete_pod_best_effort` after the stream completes.
 //!
+//! # Credentials: a reference in the pod, never the value
+//!
+//! A helper that needs a password — the database's for `pg_dump` and
+//! `pg_restore`, the NATS manager user's for `nats` — reads it from a Secret
+//! that already holds it IN THE HELPER'S OWN NAMESPACE, through
+//! `valueFrom.secretKeyRef` ([`SecretKey`]); the kubelet resolves it when it
+//! starts the container. The Pod object then carries the Secret's name and
+//! key and nothing else, so `get pods` — a right commonly granted more widely
+//! than `get secrets` — shows no credential, for the pod's whole life and
+//! after it (a leftover pod stays `Completed` until deleted, see below). The
+//! builders take no password at all, so none can be put in by mistake, and a
+//! backup never reads it either (a restore reads a pg claim's connection
+//! Secret whole, to check it has every key, and keeps nothing of the
+//! password).
+//!
+//! Every such Secret is already where its helper runs, so a backup creates
+//! none of its own: a PostgreSQL helper runs in its claim's namespace, beside
+//! the claim's connection Secret (`pass`); a JetStream helper runs in the
+//! namespace NATS runs in, beside that namespace's `nats-mgr-<ns>` (`user`,
+//! `password`). A Secret or key that is missing leaves the container unable
+//! to start (`CreateContainerConfigError`), which the Ready wait reports with
+//! the kubelet's own words ([`container_config_error`]).
+//!
 //! # How long a helper pod lives
 //!
 //! When the `sleep` ends, the container exits and every exec still running in
@@ -102,10 +125,12 @@ pub fn run_deadline_of(platformstack: Option<&Value>) -> Duration {
 ///   [`is_immutable_pod_update`]) where one spec lets a run reuse a pod
 ///   another run has just created.
 /// * **The cost of a long keep-alive** is how long a helper leaked by a
-///   killed command keeps running `sleep` — holding its env (a database
-///   password) and any volume mount. The runner deletes its helpers when it
-///   is stopped, and a leftover is replaced by the next run that needs its
-///   name ([`stale_helper_reason`]); with no such run, it lives out its
+///   killed command keeps running `sleep` — holding any volume mount and a
+///   database or NATS session's worth of credentials in its container (not
+///   in its Pod object, which carries only a reference to the Secret: see
+///   the module docs). The runner deletes its helpers when it is stopped, and
+///   a leftover is replaced by the next run that needs its name
+///   ([`stale_helper_reason`]); with no such run, it lives out its
 ///   keep-alive, six hours by default.
 pub fn helper_keep_alive(run_deadline: Duration) -> Duration {
     run_deadline.max(DEFAULT_RUN_DEADLINE)
@@ -139,6 +164,40 @@ pub fn keep_alive_command(keep_alive: Duration) -> Value {
 // Pure pod-spec builders
 // ---------------------------------------------------------------------------
 
+/// The label every helper pod builder stamps, `"true"`. Only pods carrying it
+/// are a run's to delete when the run is stopped (the runner's stop).
+pub const BACKUP_HELPER_LABEL: &str = "apprafter.io/backup-helper";
+
+/// Whether a Pod spec is a backup helper pod: [`BACKUP_HELPER_LABEL`] is
+/// `"true"`. Pure.
+pub fn is_backup_helper(spec: &Value) -> bool {
+    spec.pointer("/metadata/labels")
+        .and_then(|labels| labels.get(BACKUP_HELPER_LABEL))
+        .and_then(Value::as_str)
+        == Some("true")
+}
+
+/// One key of a Secret in a helper pod's own namespace: where its container
+/// reads a credential from (see the module docs). A Secret must be in the
+/// namespace of the pod that references it, so the caller names one there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SecretKey<'a> {
+    pub secret: &'a str,
+    pub key: &'a str,
+}
+
+/// A container env entry whose value the kubelet reads from `from` when it
+/// starts the container. Not `optional`: a missing Secret or key stops the
+/// container from starting, which is what the Ready wait then reports,
+/// rather than starting it with an empty password that fails later with a
+/// misleading authentication error.
+fn env_from_secret(name: &str, from: SecretKey<'_>) -> Value {
+    json!({
+        "name": name,
+        "valueFrom": { "secretKeyRef": { "name": from.secret, "key": from.key } }
+    })
+}
+
 /// Build the Pod spec of a PostgreSQL helper: the pod a backup or an export
 /// runs `pg_dump` in, and the pod a restore runs `pg_restore` in.
 ///
@@ -147,8 +206,10 @@ pub fn keep_alive_command(keep_alive: Duration) -> Value {
 /// the tool after the pod reaches Running. Two variables go in the container
 /// env, so that no exec'd command has to carry them:
 ///
-/// * `PGPASSWORD` — the tool never prompts (there is no TTY to answer on) and
-///   the password is never on an argv;
+/// * `PGPASSWORD`, from `password` — the claim's connection Secret, key
+///   `pass` — by reference ([`SecretKey`]): the tool never prompts (there is
+///   no TTY to answer on), the password is never on an argv, and it is not in
+///   the Pod object either (see the module docs);
 /// * `PGOPTIONS` = [`crate::extract::PG_HELPER_PGOPTIONS`] — a session whose
 ///   client is killed while it waits on a lock ends with it rather than
 ///   holding its locks until that lock is released.
@@ -161,7 +222,7 @@ pub fn pg_helper_pod_spec(
     name: &str,
     ns: &str,
     image: &str,
-    password: &str,
+    password: SecretKey<'_>,
     keep_alive: Duration,
 ) -> Value {
     json!({
@@ -170,7 +231,7 @@ pub fn pg_helper_pod_spec(
         "metadata": {
             "name": name,
             "namespace": ns,
-            "labels": { "apprafter.io/backup-helper": "true" }
+            "labels": { BACKUP_HELPER_LABEL: "true" }
         },
         "spec": {
             "restartPolicy": "Never",
@@ -179,7 +240,7 @@ pub fn pg_helper_pod_spec(
                 "image": image,
                 "command": keep_alive_command(keep_alive),
                 "env": [
-                    { "name": "PGPASSWORD", "value": password },
+                    env_from_secret("PGPASSWORD", password),
                     { "name": "PGOPTIONS", "value": crate::extract::PG_HELPER_PGOPTIONS }
                 ]
             }]
@@ -209,7 +270,7 @@ pub fn volume_pod_spec(
         "metadata": {
             "name": name,
             "namespace": ns,
-            "labels": { "apprafter.io/backup-helper": "true" }
+            "labels": { BACKUP_HELPER_LABEL: "true" }
         },
         "spec": {
             "restartPolicy": "Never",
@@ -241,18 +302,22 @@ pub fn volume_pod_spec(
 /// the container ENV rather than on the command line — the `nats` CLI reads
 /// `NATS_URL` / `NATS_USER` / `NATS_PASSWORD` natively, and an argv carrying
 /// the manager password would show up in `ps` inside the pod and in any
-/// `kubectl exec` audit entry. Same reasoning as `PGPASSWORD` above.
+/// `kubectl exec` audit entry. Same reasoning as `PGPASSWORD` above, and the
+/// same delivery: the user and the password by reference to the manager
+/// Secret ([`SecretKey`]); only the server's URL, which is no secret, is
+/// written into the Pod.
 ///
 /// The pod belongs in the NAMESPACE NATS runs in: the manager Secret lives
-/// there, and the default-deny NetworkPolicy bundle (`default` namespace only)
-/// leaves same-namespace traffic to the server alone.
+/// there — and a Secret can be referenced only from its own namespace — and
+/// the default-deny NetworkPolicy bundle (`default` namespace only) leaves
+/// same-namespace traffic to the server alone.
 pub fn nats_pod_spec(
     name: &str,
     ns: &str,
     image: &str,
     url: &str,
-    user: &str,
-    password: &str,
+    user: SecretKey<'_>,
+    password: SecretKey<'_>,
     keep_alive: Duration,
 ) -> Value {
     json!({
@@ -261,7 +326,7 @@ pub fn nats_pod_spec(
         "metadata": {
             "name": name,
             "namespace": ns,
-            "labels": { "apprafter.io/backup-helper": "true" }
+            "labels": { BACKUP_HELPER_LABEL: "true" }
         },
         "spec": {
             "restartPolicy": "Never",
@@ -271,8 +336,8 @@ pub fn nats_pod_spec(
                 "command": keep_alive_command(keep_alive),
                 "env": [
                     { "name": "NATS_URL", "value": url },
-                    { "name": "NATS_USER", "value": user },
-                    { "name": "NATS_PASSWORD", "value": password }
+                    env_from_secret("NATS_USER", user),
+                    env_from_secret("NATS_PASSWORD", password)
                 ]
             }]
         }
@@ -552,6 +617,102 @@ pub fn replacing_stale_helper_note(ns: &str, name: &str, why: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Waiting for a helper pod to be Ready
+// ---------------------------------------------------------------------------
+
+/// How long a helper pod waits to become Ready, all told, before the command
+/// that applied it gives up: five minutes, the same in both implementations
+/// (it was `kubectl wait --timeout=300s` on the CLI's side).
+pub const POD_READY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Whether a pod is Ready to exec into: phase `Running` and a `Ready`
+/// condition that is `True`. Pure.
+pub fn pod_is_ready(pod: &Value) -> bool {
+    pod.pointer("/status/phase").and_then(Value::as_str) == Some("Running")
+        && pod
+            .pointer("/status/conditions")
+            .and_then(Value::as_array)
+            .is_some_and(|conds| {
+                conds.iter().any(|c| {
+                    c.get("type").and_then(Value::as_str) == Some("Ready")
+                        && c.get("status").and_then(Value::as_str) == Some("True")
+                })
+            })
+}
+
+/// The reason the kubelet gives for not starting a helper pod's container
+/// when it cannot build the container's configuration: waiting with reason
+/// `CreateContainerConfigError`, whose message names what is missing —
+/// `secret "db-conn" not found`, `couldn't find key pass in Secret demo/db-conn`.
+/// `None` for any other state. Pure.
+///
+/// For a helper this means a Secret its credentials are read from
+/// ([`SecretKey`]) is not there, or lacks the key, and it does not fix
+/// itself: the kubelet retries, but nothing the command does will create the
+/// Secret. So it ends the Ready wait once it has lasted
+/// [`CONTAINER_CONFIG_ERROR_GRACE`], with these words, instead of after the
+/// whole [`POD_READY_TIMEOUT`] with none.
+pub fn container_config_error(pod: &Value) -> Option<String> {
+    pod.pointer("/status/containerStatuses")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|c| c.pointer("/state/waiting"))
+        .find(|w| w.get("reason").and_then(Value::as_str) == Some("CreateContainerConfigError"))
+        .map(|w| {
+            w.get("message")
+                .and_then(Value::as_str)
+                .filter(|m| !m.is_empty())
+                .unwrap_or("CreateContainerConfigError")
+                .to_string()
+        })
+}
+
+/// How long a helper pod's container may be held by
+/// [`container_config_error`] before the Ready wait stops on it: fifteen
+/// seconds. Not zero, because the kubelet reports a Secret it has not yet
+/// synced the same way (`failed to sync secret cache`) under a busy
+/// apiserver, and that clears on its own within seconds.
+pub const CONTAINER_CONFIG_ERROR_GRACE: Duration = Duration::from_secs(15);
+
+/// The error a Ready wait ends with when [`container_config_error`] has held
+/// the container for [`CONTAINER_CONFIG_ERROR_GRACE`].
+pub fn container_config_error_message(ns: &str, name: &str, why: &str) -> cli_core::CliError {
+    cli_core::CliError::Other(format!(
+        "helper pod {ns}/{name} cannot start its container: {why} (CreateContainerConfigError). \
+         A helper reads its credentials from a Secret in its own namespace — a PostgreSQL \
+         helper from its claim's connection Secret, a JetStream one from the NATS namespace's \
+         nats-mgr-<namespace> — and that Secret, or the key in it, is not there. It is \
+         written when the claim is provisioned; check the claim's status."
+    ))
+}
+
+/// Tracks how long [`container_config_error`] has held a helper pod across
+/// the polls of one Ready wait: the error counts only while every poll since
+/// the first one showed it.
+#[derive(Debug, Default)]
+pub struct ConfigErrorWatch {
+    since: Option<std::time::Instant>,
+}
+
+impl ConfigErrorWatch {
+    /// Record one poll of the pod at `now`; `Some(why)` once
+    /// [`container_config_error`] has held it for `grace` without a break.
+    pub fn observe(
+        &mut self,
+        pod: &Value,
+        now: std::time::Instant,
+        grace: Duration,
+    ) -> Option<String> {
+        let Some(why) = container_config_error(pod) else {
+            self.since = None;
+            return None;
+        };
+        let since = *self.since.get_or_insert(now);
+        (now.duration_since(since) >= grace).then_some(why)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Impure forwarding helpers — delegate to KubeExec
 // ---------------------------------------------------------------------------
 
@@ -601,13 +762,133 @@ pub fn delete_pod_best_effort(k: &dyn KubeExec, name: &str, ns: &str) {
 mod tests {
     use super::*;
 
+    /// The connection Secret key a pg helper reads its password from, as the
+    /// extraction and the restore name it.
+    const PG_PASS: SecretKey<'static> = SecretKey {
+        secret: "db-conn",
+        key: "pass",
+    };
+    const NATS_USER: SecretKey<'static> = SecretKey {
+        secret: "nats-mgr-demo",
+        key: "user",
+    };
+    const NATS_PASSWORD: SecretKey<'static> = SecretKey {
+        secret: "nats-mgr-demo",
+        key: "password",
+    };
+
+    /// One of every helper pod this crate builds — each builder, and each
+    /// variant of one — kept alive for `keep_alive`. A builder added to this
+    /// module belongs in this list: the tests below hold each entry to the
+    /// rules every helper pod must follow.
+    fn every_helper_pod(keep_alive: Duration) -> Vec<Value> {
+        vec![
+            pg_helper_pod_spec(
+                "bk-pg-db",
+                "demo",
+                "postgres:18-alpine",
+                PG_PASS,
+                keep_alive,
+            ),
+            volume_pod_spec("bk-vol-v", "demo", "busybox:1.36", "pvc", true, keep_alive),
+            volume_pod_spec("ld-vol-v", "demo", "busybox:1.36", "pvc", false, keep_alive),
+            nats_pod_spec(
+                "bk-js-s",
+                "nats",
+                "nats:2",
+                "nats://n:4222",
+                NATS_USER,
+                NATS_PASSWORD,
+                keep_alive,
+            ),
+        ]
+    }
+
+    /// The env variables a helper may carry as a literal `value`: none of
+    /// them a credential. Any other variable must come `valueFrom` a Secret.
+    const LITERAL_ENV_ALLOWED: &[&str] = &["PGOPTIONS", "NATS_URL"];
+
+    /// The finding (WI-383): the pg helper carried `PGPASSWORD` and the NATS
+    /// helpers `NATS_USER` / `NATS_PASSWORD` as literal env values, so the
+    /// credential sat in the Pod object — readable with `get pods` — for the
+    /// pod's whole life, and for hours after a command interrupted before its
+    /// cleanup. Every helper pod now reads each credential by reference, and
+    /// a literal value is allowed only for the named non-credentials.
+    #[test]
+    fn no_helper_pod_carries_a_credential_as_a_literal_env_value() {
+        for spec in every_helper_pod(DEFAULT_RUN_DEADLINE) {
+            let name = spec["metadata"]["name"].as_str().unwrap().to_string();
+            for container in spec["spec"]["containers"].as_array().unwrap() {
+                for env in container["env"].as_array().into_iter().flatten() {
+                    let var = env["name"].as_str().unwrap();
+                    match (env.get("value"), env.get("valueFrom")) {
+                        (Some(_), None) => assert!(
+                            LITERAL_ENV_ALLOWED.contains(&var),
+                            "{name}: {var} is a literal value in the Pod object: {env}"
+                        ),
+                        (None, Some(from)) => assert!(
+                            from.pointer("/secretKeyRef/name").is_some()
+                                && from.pointer("/secretKeyRef/key").is_some(),
+                            "{name}: {var} is read from something other than a Secret: {env}"
+                        ),
+                        _ => panic!("{name}: {var} has neither or both of value/valueFrom: {env}"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// And each credential is read from the Secret and key it was given —
+    /// the claim's connection Secret for `PGPASSWORD`, the namespace's NATS
+    /// manager Secret for the NATS user and password.
+    #[test]
+    fn each_credential_is_read_from_the_secret_key_it_was_given() {
+        let secret_ref = |spec: &Value, var: &str| {
+            spec["spec"]["containers"][0]["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == var)
+                .unwrap_or_else(|| panic!("no {var} in {spec}"))["valueFrom"]["secretKeyRef"]
+                .clone()
+        };
+        let [pg, _, _, nats] = <[Value; 4]>::try_from(every_helper_pod(DEFAULT_RUN_DEADLINE))
+            .expect("four helper pods");
+        assert_eq!(
+            secret_ref(&pg, "PGPASSWORD"),
+            json!({"name": "db-conn", "key": "pass"})
+        );
+        assert_eq!(
+            secret_ref(&nats, "NATS_USER"),
+            json!({"name": "nats-mgr-demo", "key": "user"})
+        );
+        assert_eq!(
+            secret_ref(&nats, "NATS_PASSWORD"),
+            json!({"name": "nats-mgr-demo", "key": "password"})
+        );
+    }
+
+    #[test]
+    fn every_helper_pod_carries_the_helper_label_and_nothing_else_does() {
+        for spec in every_helper_pod(DEFAULT_RUN_DEADLINE) {
+            assert!(is_backup_helper(&spec), "{spec}");
+        }
+        for other in [
+            json!({"metadata": {"labels": {BACKUP_HELPER_LABEL: "false"}}}),
+            json!({"metadata": {"labels": {"app": "pg"}}}),
+            json!({"metadata": {"name": "pg"}}),
+        ] {
+            assert!(!is_backup_helper(&other), "{other}");
+        }
+    }
+
     #[test]
     fn pg_dump_pod_uses_pg_image_and_no_pvc_mount() {
         let p = pg_helper_pod_spec(
             "bk-pg-alpha",
             "demo",
             "postgres:16-alpine",
-            "pw",
+            PG_PASS,
             DEFAULT_RUN_DEADLINE,
         );
         assert_eq!(p["spec"]["containers"][0]["image"], "postgres:16-alpine");
@@ -668,26 +949,7 @@ mod tests {
         // Job deadline said.
         let twelve_hours = Duration::from_secs(43200);
         let want = json!(["sleep", "43200"]);
-        for spec in [
-            pg_helper_pod_spec("bk-pg-db", "demo", "postgres:18-alpine", "pw", twelve_hours),
-            volume_pod_spec(
-                "bk-vol-v",
-                "demo",
-                "busybox:1.36",
-                "pvc",
-                true,
-                twelve_hours,
-            ),
-            nats_pod_spec(
-                "bk-js-s",
-                "nats",
-                "nats:2",
-                "nats://n:4222",
-                "u",
-                "p",
-                twelve_hours,
-            ),
-        ] {
+        for spec in every_helper_pod(twelve_hours) {
             assert_eq!(spec["spec"]["containers"][0]["command"], want, "{spec}");
         }
     }
@@ -843,7 +1105,7 @@ mod tests {
                 "p",
                 "n",
                 "postgres:18-alpine",
-                "pw",
+                PG_PASS,
                 Duration::from_secs(43200)
             )),
             Some(Duration::from_secs(43200))
@@ -1079,5 +1341,106 @@ mod tests {
             );
         }
         assert_eq!(run_deadline_of(None), DEFAULT_RUN_DEADLINE);
+    }
+
+    /// A pod whose container the kubelet cannot configure — here, because
+    /// the Secret its password is read from is missing — as `get pods` shows
+    /// it (Kubernetes 1.36).
+    fn config_blocked(message: &str) -> Value {
+        json!({"status": {"phase": "Pending", "containerStatuses": [{
+            "name": "dump", "ready": false,
+            "state": {"waiting": {"reason": "CreateContainerConfigError", "message": message}}
+        }]}})
+    }
+
+    #[test]
+    fn a_container_the_kubelet_cannot_configure_says_why() {
+        assert_eq!(
+            container_config_error(&config_blocked("secret \"db-conn\" not found")).as_deref(),
+            Some("secret \"db-conn\" not found")
+        );
+        // Without a message, the reason itself.
+        let mut bare = config_blocked("");
+        bare["status"]["containerStatuses"][0]["state"]["waiting"]
+            .as_object_mut()
+            .unwrap()
+            .remove("message");
+        assert_eq!(
+            container_config_error(&bare).as_deref(),
+            Some("CreateContainerConfigError")
+        );
+        // Any other state is not this.
+        for other in [
+            json!({"status": {"phase": "Pending", "containerStatuses": [{"state": {"waiting":
+                {"reason": "ContainerCreating"}}}]}}),
+            json!({"status": {"phase": "Pending", "containerStatuses": [{"state": {"waiting":
+                {"reason": "ImagePullBackOff", "message": "back-off"}}}]}}),
+            json!({"status": {"phase": "Running", "containerStatuses": [{"state": {"running":
+                {"startedAt": "2026-09-23T12:00:00Z"}}}]}}),
+            json!({"status": {"phase": "Pending"}}),
+            json!({}),
+        ] {
+            assert_eq!(container_config_error(&other), None, "{other}");
+        }
+    }
+
+    /// The Ready wait stops on it only once it has held for the grace, with
+    /// no poll in between that showed it clear: a Secret the kubelet has not
+    /// yet synced reads the same way for a moment and then starts.
+    #[test]
+    fn a_config_error_ends_the_wait_only_once_it_has_held_for_the_grace() {
+        let t0 = std::time::Instant::now();
+        let grace = Duration::from_secs(15);
+        let blocked = config_blocked("couldn't find key pass in Secret demo/db-conn");
+        let pending = json!({"status": {"phase": "Pending"}});
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+
+        let mut watch = ConfigErrorWatch::default();
+        assert_eq!(watch.observe(&blocked, at(0), grace), None);
+        assert_eq!(watch.observe(&blocked, at(14), grace), None);
+        assert_eq!(
+            watch.observe(&blocked, at(15), grace).as_deref(),
+            Some("couldn't find key pass in Secret demo/db-conn")
+        );
+
+        // A poll that shows it clear starts the count again.
+        let mut watch = ConfigErrorWatch::default();
+        assert_eq!(watch.observe(&blocked, at(0), grace), None);
+        assert_eq!(watch.observe(&pending, at(10), grace), None);
+        assert_eq!(watch.observe(&blocked, at(20), grace), None);
+        assert_eq!(watch.observe(&blocked, at(34), grace), None);
+        assert!(watch.observe(&blocked, at(35), grace).is_some());
+    }
+
+    #[test]
+    fn the_config_error_names_the_pod_and_where_its_credentials_come_from() {
+        let msg =
+            container_config_error_message("nats", "bk-js-x", "secret \"nats-mgr-shop\" not found")
+                .to_string();
+        assert!(msg.starts_with("helper pod nats/bk-js-x cannot start its container: secret \"nats-mgr-shop\" not found"), "{msg}");
+        assert!(msg.contains("nats-mgr-<namespace>"), "{msg}");
+        assert!(msg.contains("connection Secret"), "{msg}");
+    }
+
+    #[test]
+    fn a_pod_is_ready_when_running_with_a_true_ready_condition() {
+        assert!(pod_is_ready(&json!({"status": {"phase": "Running",
+            "conditions": [{"type": "Initialized", "status": "True"},
+                           {"type": "Ready", "status": "True"}]}})));
+        for not_ready in [
+            json!({"status": {"phase": "Running"}}),
+            json!({"status": {"phase": "Running", "conditions": []}}),
+            json!({"status": {"phase": "Running",
+                "conditions": [{"type": "Ready", "status": "False"}]}}),
+            json!({"status": {"phase": "Running",
+                "conditions": [{"type": "Initialized", "status": "True"}]}}),
+            json!({"status": {"phase": "Pending",
+                "conditions": [{"type": "Ready", "status": "True"}]}}),
+            json!({"status": {"phase": "Succeeded",
+                "conditions": [{"type": "Ready", "status": "True"}]}}),
+            json!({}),
+        ] {
+            assert!(!pod_is_ready(&not_ready), "{not_ready}");
+        }
     }
 }

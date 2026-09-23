@@ -30,6 +30,10 @@
 
 use std::path::Path;
 
+// `is_backup_helper`: whether a Pod spec is a backup helper pod — the label
+// every `backup_core::helper_pod` builder stamps. Only those are the run's to
+// delete when it is stopped.
+use backup_core::helper_pod::is_backup_helper;
 use backup_core::KubeExec;
 use cli_core::{CliError, Result};
 use k8s_openapi::api::core::v1::{Pod, Secret};
@@ -47,12 +51,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// ownership never collides with a real workload's.
 const FIELD_MANAGER: &str = "apprafter-backup";
 
-/// Total budget for the pod-Ready poll (mirrors `kubectl wait --timeout=300s`
-/// used by `KubectlExec`).
-const POD_READY_TIMEOUT_SECS: u64 = 300;
-
-/// Interval between pod-Ready polls.
-const POD_READY_POLL_INTERVAL_SECS: u64 = 2;
+/// Interval between pod-Ready polls. The budget for the whole wait is
+/// [`backup_core::helper_pod::POD_READY_TIMEOUT`], the CLI's too.
+const POD_READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// In-cluster [`KubeExec`] backed by kube-rs.
 ///
@@ -171,15 +172,6 @@ fn pod_identity(spec: &Value) -> Result<(String, String)> {
         .ok_or_else(|| CliError::Other("pod spec missing metadata.namespace".into()))?
         .to_string();
     Ok((name, ns))
-}
-
-/// Whether a Pod spec is a backup helper pod — the label every
-/// `backup_core::helper_pod` builder stamps. Only those are the run's to
-/// delete when it is stopped.
-fn is_backup_helper(spec: &Value) -> bool {
-    spec.pointer("/metadata/labels/apprafter.io~1backup-helper")
-        .and_then(Value::as_str)
-        == Some("true")
 }
 
 /// Parsed shape of a `get_json` args vector.
@@ -450,6 +442,51 @@ impl KubeRsExec {
     }
 }
 
+impl KubeRsExec {
+    /// Poll pod `name` until it is Running + Ready, for up to `timeout`, every
+    /// `poll` — the CLI's `KubectlExec` waits the same way. A container the
+    /// kubelet cannot configure for `grace` without a break (a credential
+    /// Secret or key missing: [`backup_core::helper_pod::container_config_error`])
+    /// ends the wait at once with the kubelet's words, rather than after the
+    /// whole `timeout` with none.
+    async fn wait_pod_ready(
+        &self,
+        api: &Api<Pod>,
+        name: &str,
+        ns: &str,
+        timeout: std::time::Duration,
+        poll: std::time::Duration,
+        grace: std::time::Duration,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut config_error = backup_core::helper_pod::ConfigErrorWatch::default();
+        loop {
+            let pod = api.get(name).await.map_err(|e| {
+                CliError::Other(format!("get pod {name} in {ns} while waiting Ready: {e}"))
+            })?;
+            if pod_is_ready(&pod) {
+                return Ok(());
+            }
+            let seen = serde_json::to_value(&pod).map_err(CliError::from)?;
+            // Tokio's clock, so the grace can be driven in a test like the
+            // rest of this loop.
+            let now = tokio::time::Instant::now().into_std();
+            if let Some(why) = config_error.observe(&seen, now, grace) {
+                return Err(backup_core::helper_pod::container_config_error_message(
+                    ns, name, &why,
+                ));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(CliError::Other(format!(
+                    "pod {name} in {ns} did not reach Ready within {}s",
+                    timeout.as_secs()
+                )));
+            }
+            tokio::time::sleep(poll).await;
+        }
+    }
+}
+
 /// Interval between the polls that wait for a stale helper pod to be gone.
 const STALE_POD_GONE_POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(1);
 
@@ -465,27 +502,15 @@ impl KubeExec for KubeRsExec {
             // whose Ready wait is still running is the run's to delete too.
             self.apply_replacing_stale(&api, &name, &ns, spec).await?;
 
-            // Poll until Running + Ready (mirrors `kubectl wait
-            // --for=condition=Ready --timeout=300s`).
-            let deadline = tokio::time::Instant::now()
-                + tokio::time::Duration::from_secs(POD_READY_TIMEOUT_SECS);
-            loop {
-                let pod = api.get(&name).await.map_err(|e| {
-                    CliError::Other(format!("get pod {name} in {ns} while waiting Ready: {e}"))
-                })?;
-                if pod_is_ready(&pod) {
-                    return Ok(());
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(CliError::Other(format!(
-                        "pod {name} in {ns} did not reach Ready within {POD_READY_TIMEOUT_SECS}s"
-                    )));
-                }
-                tokio::time::sleep(tokio::time::Duration::from_secs(
-                    POD_READY_POLL_INTERVAL_SECS,
-                ))
-                .await;
-            }
+            self.wait_pod_ready(
+                &api,
+                &name,
+                &ns,
+                backup_core::helper_pod::POD_READY_TIMEOUT,
+                POD_READY_POLL_INTERVAL,
+                backup_core::helper_pod::CONTAINER_CONFIG_ERROR_GRACE,
+            )
+            .await
         })
     }
 
@@ -742,24 +767,10 @@ impl KubeExec for KubeRsExec {
 }
 
 /// True iff the Pod is `Running` AND carries a `Ready` condition with
-/// `status == "True"` (the kube-rs analogue of
-/// `kubectl wait --for=condition=Ready`).
+/// `status == "True"`: [`backup_core::helper_pod::pod_is_ready`], the rule the
+/// CLI's wait applies too, on the typed Pod.
 fn pod_is_ready(pod: &Pod) -> bool {
-    let Some(status) = pod.status.as_ref() else {
-        return false;
-    };
-    if status.phase.as_deref() != Some("Running") {
-        return false;
-    }
-    status
-        .conditions
-        .as_ref()
-        .map(|conds| {
-            conds
-                .iter()
-                .any(|c| c.type_ == "Ready" && c.status == "True")
-        })
-        .unwrap_or(false)
+    serde_json::to_value(pod).is_ok_and(|pod| backup_core::helper_pod::pod_is_ready(&pod))
 }
 
 /// Await the attached process's terminal status and translate a non-`Success`
@@ -1941,6 +1952,77 @@ mod tests {
             format!("GET {path}"),
             "readiness must be polled by GETting the same pod: {seen:?}"
         );
+    }
+
+    /// The helper pod as the kubelet leaves it when a Secret its container
+    /// reads a credential from is missing.
+    fn config_blocked_pod() -> Value {
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "bk-pg-alpha", "namespace": "demo"},
+            "status": {"phase": "Pending", "containerStatuses": [{
+                "name": "dump", "ready": false, "restartCount": 0, "image": "postgres:18-alpine",
+                "imageID": "",
+                "state": {"waiting": {"reason": "CreateContainerConfigError",
+                                      "message": "secret \"db-conn\" not found"}}
+            }]}
+        })
+    }
+
+    /// Wait for `bk-pg-alpha` in `demo` with bounds short enough for a test.
+    fn wait_ready_briefly(h: &Harness, grace: std::time::Duration) -> Result<()> {
+        let api: Api<Pod> = Api::namespaced(h.exec.client.clone(), "demo");
+        h.exec.rt.block_on(h.exec.wait_pod_ready(
+            &api,
+            "bk-pg-alpha",
+            "demo",
+            std::time::Duration::from_secs(20),
+            std::time::Duration::from_millis(50),
+            grace,
+        ))
+    }
+
+    /// WI-383: a helper reads its credentials from a Secret by reference, so
+    /// a missing Secret or key leaves its container unable to start. The wait
+    /// says so with the kubelet's words once that has held for the grace —
+    /// not after the whole five-minute timeout, with none.
+    #[test]
+    fn a_helper_whose_credential_secret_is_missing_fails_the_wait_with_the_kubelets_words() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let h = Harness::new(vec![ok_route("GET", path, config_blocked_pod())]);
+        let started = std::time::Instant::now();
+        let msg = wait_ready_briefly(&h, std::time::Duration::from_millis(300))
+            .expect_err("a container that cannot be configured never becomes Ready")
+            .to_string();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "gave up after {:?}, not at the grace",
+            started.elapsed()
+        );
+        assert!(
+            msg.starts_with(
+                "helper pod demo/bk-pg-alpha cannot start its container: secret \"db-conn\" \
+                 not found (CreateContainerConfigError)"
+            ),
+            "{msg}"
+        );
+    }
+
+    /// One that clears within the grace — a Secret the kubelet had not yet
+    /// synced — is waited out like any other start.
+    #[test]
+    fn a_config_error_that_clears_within_the_grace_is_waited_out() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let h = Harness::new(vec![seq_route(
+            "GET",
+            path,
+            vec![
+                (200, config_blocked_pod()),
+                (200, config_blocked_pod()),
+                (200, running_ready_pod()),
+            ],
+        )]);
+        wait_ready_briefly(&h, std::time::Duration::from_secs(10)).expect("Ready after all");
     }
 
     fn pod_in_phase(phase: &str) -> Value {
