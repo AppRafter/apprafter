@@ -1,19 +1,19 @@
 ---
-description: "What a prune actually deletes, what the weekly integrity Job runs and where its result appears, how long a backup or check run may take, and the three ceilings on the credential the cluster holds."
+description: "What a prune actually deletes, who runs it and what happens when the cluster's key may not delete, what the weekly integrity Job runs and where its result appears, how long a backup or check run may take, and the three ceilings on the credential the cluster holds."
 ---
 
 # How retention and the integrity check work
 
-What `apprafter backup prune` deletes, what the weekly check Job does, and what
+What a prune deletes and who runs it, what the weekly check Job does, and what
 the cluster's copy of the backup credential can reach. The recipe is [Backup
 retention, integrity and
 credentials](../operator-guide/backup-maintenance.md); running any of those
 commands needs none of this.
 
 Read it when a prune removed more than the keep numbers led you to expect, when
-the weekly check went red and `apprafter backup status` will not say why, when
-a backup Job was stopped by its deadline, when `apprafter status` says backups
-are failing, or when you are deciding how much delete power to hand the
+`apprafter status` says retention is not enforced, when the weekly check went
+red, when a backup Job was stopped by its deadline, when `apprafter status` says
+backups are failing, or when you are deciding how much delete power to hand the
 cluster's S3 key.
 
 The decisions behind all three — a restic repository written by the platform's
@@ -65,9 +65,9 @@ Two consequences follow, and they are the two that surprise people:
 
 `--keep-daily` and its siblings are never passed to restic. The platform reads
 `restic snapshots --json`, derives the tag, time and representative flag for
-each snapshot, computes the set of ids to remove, and then calls
-`restic forget <ids…> --prune` with that explicit set. If the set comes out
-empty, the `forget` call is skipped entirely.
+each snapshot, computes the set of ids to remove, and then removes exactly that
+set, in the three steps [below](#forget-look-then-prune). If the set comes out
+empty, nothing is run at all: no `forget`, no `prune`.
 
 The keep computation runs three passes over the representatives, each walking
 them newest-first:
@@ -91,6 +91,31 @@ fixed `apprafter-backup` when it has not. It changes nothing about retention —
 grouping is by tag alone — but it is what the CLUSTER column of a listing shows.
 A local `apprafter backup create` pulled to your own machine passes no host and
 uses the machine's own.
+
+### Forget, look, then prune {#forget-look-then-prune}
+
+Every prune — the weekly check Job's, the backup Job's under `enforce: cluster`,
+and `apprafter backup prune` — removes the set in the same three steps:
+
+1. `restic forget` of **one** snapshot of the set, then `restic snapshots` again.
+   If that snapshot is still listed, nothing else is tried: the prune ends as
+   *not permitted* when restic says the store refused the delete (S3's
+   `AccessDenied`), and as a failure otherwise.
+2. `restic forget` of the rest of the set, then `restic snapshots` again. A
+   snapshot of the set still listed is a failure, and no prune runs.
+3. `restic prune`, which removes the data no listed snapshot refers to any more.
+
+It is not restic's own `forget <ids…> --prune`, for a reason measured with
+restic 0.18.1: `forget` exits 0 when the store refused its deletes — it prints
+`unable to remove snapshot/<id> from the repository` and goes on — and with
+`--prune` it then prunes as if those snapshots were gone, counting the data only
+they use as unused. Under a key that may not delete, that prune writes a new
+index before it fails. Under a key that may delete packs but not snapshots, it
+would delete data a snapshot still in the repository needs. A bare `forget` of
+one snapshot under the same refusal changes nothing in the bucket: a restic
+lock is written and removed, and every other object is left exactly as it was.
+`restic prune` run on its own is safe whatever `forget` did before it, because
+it counts as used everything the listed snapshots refer to.
 
 ## Which snapshots are yours
 
@@ -154,26 +179,64 @@ unreferenced pack from an old but live one.
 [ADR 0050](../adr/0050-backup-restore.md) records this as a hard constraint
 rather than a preference.
 
-## Who runs the prune
+## Who runs the prune {#who-runs-the-prune}
 
-`spec.backup.retention.enforce` decides, and it reaches the runner as the
-environment variable `APPRAFTER_BACKUP_ENFORCE`. Only the exact value `cluster`
-turns in-Job pruning on.
+`spec.backup.retention.enforce` decides, and it reaches both CronJobs as the
+environment variable `APPRAFTER_BACKUP_ENFORCE`. It has three values:
 
-Under the default `operator`, the nightly Job takes the backup and stops. The
-repository grows until you run `apprafter backup prune` yourself. Under
-`cluster`, the prune runs inside the Job immediately after the backup, with the
-keep counts arriving as `APPRAFTER_BACKUP_KEEP_DAILY` / `_WEEKLY` / `_MONTHLY`
-— threaded through by the chart only when they are configured, and defaulting to
-7/4/6 in the runner otherwise. Unlike the status ConfigMap write and the failure
-webhook, which are both best-effort, **a prune failure fails the run**: a
-repository whose retention is silently not being enforced is a real fault.
+| `enforce` | Who prunes | When |
+| --- | --- | --- |
+| `check` (the default) | the weekly check Job | after a check that passed, as far as the cluster's key may delete |
+| `cluster` | the backup Job | after every backup |
+| `operator` | nothing in the cluster; you, with `apprafter backup prune` | when you run it |
+
+The keep counts reach both Jobs as `APPRAFTER_BACKUP_KEEP_DAILY` / `_WEEKLY` /
+`_MONTHLY` — threaded through by the chart only when they are configured, and
+defaulting to 7/4/6 in the runner otherwise.
+
+**`check`.** The weekly check Job runs `restic check` and, only when it passed,
+the prune; [what it runs](#what-the-weekly-check-runs) is below. A check that
+does not pass never prunes: a repository whose integrity is in doubt is the last
+one to delete from. How far the prune gets is up to the key the cluster holds.
+A key that may delete prunes. The scoped key recommended for the cluster (Put,
+Get and List on the repository, Delete only under `locks/`) may not: the store
+refuses the first delete, the prune stops there, and **nothing is deleted** — the
+bucket is left exactly as it was. The runner records the prune as
+`not-permitted`, the check still counts as passed, and `apprafter status` and
+`apprafter backup status` say that retention is not enforced, with the
+repository's size and how much it grew since the week before
+([whether retention is enforced](#whether-retention-is-enforced)). That is the
+scoped key doing its job — a compromised cluster cannot erase history, so it
+cannot prune it either — and the pruning then belongs where the full
+credentials are: `apprafter backup prune`, run from your machine.
+
+**`cluster`.** The prune runs inside the backup Job immediately after the
+backup. Unlike the status ConfigMap write and the failure webhook, which are
+both best-effort, **a prune failure fails the run**, and so does a key that may
+not delete: this mode promises a prune after every backup. The backup itself is
+taken first, and the failure names its snapshot.
+
+**`operator`.** Nothing in the cluster deletes a snapshot. The repository grows
+until you run `apprafter backup prune`, and `apprafter status` says so, with
+the repository's size.
+
+A `PlatformStack` that sets `enforce` keeps it. One that never set it runs the
+platform's default, which was `operator` before platform-stack 0.2.80 and is
+`check` from it on — so a cluster that never chose, and whose key may delete,
+starts removing the snapshots beyond its keep policy at its first weekly check
+after the upgrade. `apprafter backup set enforce operator` before the upgrade
+keeps the old behaviour.
 
 The operator-side `apprafter backup prune` resolves its policy as CLI flags →
 `spec.backup.retention` → 7/4/6, and its repository as `--repo` →
 `spec.backup.bucket`. On success it stamps `apprafter.io/last-prune` on the
-`PlatformStack` with the current time; that annotation is exactly what
-`apprafter backup status` prints as `Last prune`.
+`PlatformStack` with the current time; that annotation is what
+`apprafter backup status` prints as `Last prune`, and what the retention
+condition names as the last prune from outside the cluster. Its credentials
+resolve from `--credential-file`, then the environment, then the cluster's own
+Secret; with that last, scoped, one it ends the same way the Job's prune does —
+nothing deleted — and says to pass `--credential-file` with the full
+credentials.
 
 `apprafter backup prune` needs an **identity**, and that is the one input it
 will not infer. With a live cluster it reads the `kube-system` UID off the
@@ -197,22 +260,35 @@ alone makes either of them work with no cluster at all, which matters because
 verifying a repository before restoring from it tends to happen when the cluster
 is gone.
 
-## What the weekly check runs
+## What the weekly check runs {#what-the-weekly-check-runs}
 
 The chart emits a second CronJob, `apprafter-backup-check`, in
 `apprafter-system`. It runs on `checkSchedule` (default `0 6 * * 0`, Sundays at
 06:00) in `spec.backup.timeZone` when one is set, with
 `concurrencyPolicy: Forbid`, keeping three succeeded and three failed Jobs.
 An **empty** `checkSchedule` omits the CronJob from the render entirely — it is
-not created and suspended, it is not created.
+not created and suspended, it is not created. Under `enforce: check` that also
+means nothing in the cluster prunes, and the retention condition says so.
 
-It uses the runner image but not the runner binary, which has no check-only
-mode. What it executes is two restic commands in a shell:
+It runs the same runner binary as the backup, as `apprafter-backup check`, with
+the same ServiceAccount, the same resources and the same restic settings. One
+run is, in order:
 
-```text
-restic -r "$APPRAFTER_BACKUP_REPO" unlock
-restic -r "$APPRAFTER_BACKUP_REPO" check --read-data-subset=10%
-```
+1. `restic unlock`, whose failure is logged and does not fail the run;
+2. `restic check` at the depth below;
+3. under `enforce: check`, and only when the check passed, the prune
+   ([forget, look, then prune](#forget-look-then-prune)), scoped to this
+   cluster's own snapshots by its `kube-system` UID — the read it needs is the
+   one the backup makes;
+4. `restic stats --mode raw-data`: the repository's stored size, snapshots and
+   blobs, whatever the mode. The blob count is what the memory of every restic
+   command that loads the index grows with.
+
+Each step is written to the runner's status ConfigMap as soon as it ends
+([where the result shows up](#where-the-check-result-shows-up)). The Job fails
+only when the check did not pass. A prune the key may not run, or one that
+failed, is recorded and reported as retention, not as a failed check: the
+repository's integrity was confirmed, and the Job says so.
 
 `restic unlock` is invoked without `--remove-all`, so it removes stale locks
 only and never a live one held by a concurrent run.
@@ -242,31 +318,31 @@ The nightly backup Job opens the same way — an `unlock` first, whose failure i
 logged and does not fail the run — so a lock left behind by a crashed run does
 not wedge the next night's backup.
 
-## Where the check result shows up
+## Where the check result shows up {#where-the-check-result-shows-up}
 
-`apprafter backup status` lists the Jobs in `apprafter-system` whose names begin
-with `apprafter-backup`, splits them into backup Jobs and check Jobs, and prints
-the most recent of each as `Succeeded`, `Failed`, or, for a Job that has not
-finished, what it is doing: `Running`, `Pending` with the reason its pod has
-not started, or `Retrying after 1 failed attempt (7 attempts at most)` while
-the Job controller waits before its next attempt (10 seconds, doubling up to
-six minutes). `Unknown` is left for a Job with nothing to read. A
-failed Job carries the reason Kubernetes gave it — `Failed: DeadlineExceeded:
-Job was active longer than specified deadline` for one stopped at its deadline,
-`Failed: BackoffLimitExceeded: …` for one whose every attempt failed. A red
-weekly check is therefore visible on the `Last check Job:` line.
+The check Job writes the same `apprafter-backup-status` ConfigMap the backup
+runner writes, using server-side apply under the field manager
+`apprafter-backup` and merging its fields with what is there, so a check's
+record and a backup's never overwrite each other:
 
-What that line cannot give you is the reason restic failed, and this is the
-part worth knowing: **the check Job never writes the runner's status
-ConfigMap.** Only the
-backup runner writes `apprafter-backup-status`, using server-side apply under
-the field manager `apprafter-backup` and merging its fields so that
-`lastSuccess` and `lastFailure` both survive across alternating runs (a
-successful run additionally clears `lastError`, so a stale message never sits
-beside a fresh success). Everything under `Runner status:` — including
-`lastError` — is about a *backup*, never about a check. For a failed check, read
-the Job's pod log, or re-run `apprafter backup check` yourself with full
-credentials.
+| Key | What it holds |
+| --- | --- |
+| `lastCheck`, `lastCheckResult`, `lastCheckError` | when the last check ended, `passed` or `failed`, and restic's own output for a failure (empty after a pass) |
+| `lastPrune`, `lastPruneResult`, `lastPruneDetail`, `lastPruneBy` | when the last prune in the cluster ended; `pruned`, `nothing-to-prune`, `not-permitted` or `failed`; what was forgotten, or why not; and whether the check Job (`check`) or a backup Job (`backup`) ran it |
+| `repoStatsAt`, `repoBytes`, `repoSnapshots`, `repoBlobs`, `repoStatsRepo` | the repository's figures from the last check, and the repository they are of |
+| `repoPrev…` | the same figures from the check before, while the repository is the same one |
+
+`apprafter backup status` prints them as a `Repository` block — the last check
+(with the first lines of restic's output when it failed), the last prune, the
+size and the growth since the check before — followed by the operator's verdict
+on retention. The most recent check Job is still on its `Last check Job:` line,
+as `Succeeded`, `Failed`, or, for a Job that has not finished, what it is doing.
+
+A check that did not pass also turns the `BackupHealthy` condition `False` with
+reason `RepositoryCheckFailed`, quoting what the runner recorded
+([when a backup cannot run](#when-a-backup-cannot-run)). A red check therefore
+shows in `apprafter status`, in `apprafter backup status`, and in the check
+pod's log, which has all of restic's output.
 
 The status ConfigMap is deliberately not chart-owned, so Argo CD does not
 reconcile the runner's self-report away.
@@ -299,8 +375,11 @@ killed with the runner and leave its lock behind for 30 minutes, until restic
 counts it as stale. When the prune was running, that lock is exclusive, and a
 check or a manual run in those 30 minutes would fail on it. Each of those
 steps has its own bound, and together they fit inside the 90 seconds. The
-check is restic on its own: it receives the signal itself, removes its
-repository lock and exits.
+check Job's runner does the same in its own 90 seconds: it passes the signal on
+to restic and records the step it was stopped in — the check as not passed
+(`lastCheckError` names `spec.backup.checkActiveDeadlineSeconds` and `apprafter
+backup set check-deadline`), or the prune after it as failed, with the check's
+pass left as it was.
 `apprafter backup status` shows such a Job as `Failed: DeadlineExceeded`, and
 scheduling resumes: the next slot runs on time or, if one fell while the
 stopped run was active, the latest such slot starts at once. `apprafter backup
@@ -371,10 +450,12 @@ for such a schedule. A run that simply takes longer than the interval has
 always delayed the next one — the slot it overlaps starts as soon as it ends;
 that is `Forbid`, not the deadline.
 
-**The two schedules bound each other.** `restic check` holds the repository's
-exclusive lock, and neither Job waits for a lock (no `--retry-lock`): a check
-that starts while a backup is running fails on the backup's lock, and a
-backup that starts while a check is running fails on the check's. For the
+**The two schedules bound each other.** `restic check`, and the `forget` and
+`prune` after it, hold the repository's exclusive lock, and neither Job waits
+for a lock (no `--retry-lock`): a check that starts while a backup is running
+fails on the backup's lock, and a backup that starts while a check or its prune
+is running fails on theirs. The check Job's time is the check's and, under
+`enforce: check`, the prune's together. For the
 same reason `apprafter backup run` starts nothing while a backup or check Job
 has not finished (`apprafter::backup::job_active`). So on top of
 its own interval, each deadline has a second ceiling:
@@ -469,7 +550,7 @@ the operator's six-hour upstream check.
 | `False` | `RunnerEvicted` | The kubelet evicted an attempt: memory pressure on the node, or the staging directory grown past its size limit. The message quotes the kubelet. |
 | `False` | `DeadlineExceeded` | The Job was stopped by its deadline. The message says what the runner recorded, or that it recorded nothing, and, for a pod that was never placed, what the scheduler said before the deadline. |
 | `False` | `BackoffLimitExceeded` | Every attempt of a backup failed. The message says how the last one ended and quotes the runner's `lastError` when it wrote one. |
-| `False` | `RepositoryCheckFailed` | Every attempt of the weekly check ran and failed: `restic check` did not pass, because it found the repository damaged or could not read it. Its output is in the check pod's log, and `apprafter backup check` runs the same check from your machine. |
+| `False` | `RepositoryCheckFailed` | Every attempt of the weekly check ran and failed: `restic check` did not pass, because it found the repository damaged or could not read it. The message quotes what the runner recorded, `apprafter backup status` shows it under `last check`, the check pod's log has all of it, and `apprafter backup check` runs the same check from your machine. |
 | `False` | `Failed` | The Job failed for another reason, which the message quotes. |
 | `False` | `ScheduleSuspended` | The CronJob is suspended, so no scheduled backup starts. |
 | `Unknown` | `NoRunYet` | No backup has finished yet. |
@@ -516,6 +597,39 @@ condition of `PlatformStack/default` follows that health: a backup problem
 would read as a platform that is not ready. So the verdict stays on the
 `PlatformStack`, where `apprafter status` reads it.
 
+## Whether retention is enforced {#whether-retention-is-enforced}
+
+Whether the backups run is one question; whether anything prunes the
+repository is another, and it gets a condition of its own, `BackupRetention`,
+beside `BackupHealthy` on `PlatformStack/default`. Folded into
+`BackupHealthy`, the recommended scoped key — which can never prune — would be
+a permanent failure, and a real one would hide behind it. `apprafter status`
+prints it under the `Backups:` line as `Retention:`, and
+`apprafter backup status` after its `Repository` block.
+
+It is built from the runner's record (the table
+[above](#where-the-check-result-shows-up)): the last check, the prune recorded
+after it, and the repository's figures, which every message that has them
+carries with the growth since the check before.
+
+| Status | Reason | What happened |
+| --- | --- | --- |
+| `True` | `Pruned` | The prune after the latest check (or backup, under `enforce: cluster`) forgot the snapshots past the keep policy and removed the data only they used. |
+| `True` | `NothingToPrune` | The prune ran, and every run is inside the keep policy. |
+| `False` | `PruneNotPermitted` | The cluster's S3 key may not delete: the prune stopped at the first refused delete and nothing was deleted. Prune from outside the cluster with the full credentials. |
+| `False` | `PruneFailed` | The prune failed; the message quotes why. |
+| `False` | `CheckFailed` | The latest check did not pass, and a check that does not pass never prunes. `BackupHealthy` says why. |
+| `False` | `CheckOff` | `enforce: check` with the weekly check turned off: nothing in the cluster prunes. |
+| `False` | `EnforcedOutsideCluster` | `enforce: operator`: nothing in the cluster prunes, by choice. The message names the last `apprafter backup prune` against this cluster. |
+| `Unknown` | `NoCheckYet` | No check has recorded a result yet. |
+| `Unknown` | `NoPruneYet` | The latest check passed and no prune after it is recorded yet, or, under `enforce: cluster`, no backup has recorded one. |
+| `Unknown` | `RecordUnreadable` | The operator could not read the runner's record. |
+
+The condition is absent while backup is disabled. None of its `False` reasons
+touches `BackupHealthy`: a scoped key that cannot prune is not a failing backup.
+While it stays `False`, its transition time stays where retention stopped being
+enforced, whatever the reason becomes.
+
 ## What the in-cluster credential can and cannot do
 
 There are three ceilings on the backup Jobs, and they are enforced in different
@@ -530,7 +644,9 @@ through, `S3_ACCESS_KEY_ID` becomes `AWS_ACCESS_KEY_ID`,
 `AWS_DEFAULT_REGION` and is marked optional, because many S3-compatible stores
 do not need one. Everything beyond that is the bucket policy's job. Both Jobs open with
 `restic unlock`, and restic takes and releases its own lock while it works,
-which is what the scoped policy's delete under `locks/` is for.
+which is what the scoped policy's delete under `locks/` is for. Under that
+policy the check Job's prune asks the store for one more delete — of one
+snapshot — is refused, and stops; nothing else is deleted or written.
 
 One thing the S3 ceiling does not bound: the pod holds `RESTIC_PASSWORD`, and
 that passphrase is what the repository's encryption rests on. A scoped

@@ -353,7 +353,7 @@ Two checks are worth running before you trust the off-site backup, mapping to
 the design's Verify items:
 
 - **Confirm your provider honors a prefix-scoped delete.** With the
-  `enforce: operator` scoped credential, actively **test** that the cluster
+  scoped cluster credential, actively **test** that the cluster
   credential can delete an object under `locks/*` but is **refused** deleting an
   object under `data/` (or `snapshots/`). If the deny doesn't hold, your
   provider can't express the append-only guarantee — fall back to

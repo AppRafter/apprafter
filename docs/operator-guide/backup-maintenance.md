@@ -21,8 +21,15 @@ Retention keeps whole backup **runs**, not individual snapshots, by keep-daily /
 keep-weekly / keep-monthly counts (defaults **7 / 4 / 6**) — [what a run is, and
 how the three counts
 combine](../how-it-works/backup-retention-and-checks.md#what-retention-counts).
-In the default `enforce: operator` mode you run it yourself, outside the
-cluster, with full credentials:
+
+By default (`enforce: check`) the weekly check Job prunes, after a check that
+passed, as far as the cluster's S3 key may delete. With a key that may delete,
+that is all there is to it. With the scoped key [recommended
+below](#who-prunes-and-what-the-clusters-key-may-delete), the prune is refused
+at its first delete and **nothing is deleted**; `apprafter status` and
+`apprafter backup status` then say `Retention: NOT ENFORCED — PruneNotPermitted`,
+with the repository's size and its growth since the week before. That is the
+signal to prune from outside the cluster, with full credentials:
 
 ```text
 apprafter backup prune [--repo s3:…] \
@@ -34,12 +41,15 @@ apprafter backup prune [--repo s3:…] \
 `--repo` defaults to `PlatformStack.spec.backup.bucket`; the keep-* flags
 override the configured `spec.backup.retention` (else the 7/4/6 defaults).
 Credentials resolve from `--credential-file`, then the environment, then the
-credential Secret the cluster already holds (`spec.backup.credentialRef`) — so
-against a configured cluster this command needs no credential flags at all. On success
-`prune` stamps `apprafter.io/last-prune` on `PlatformStack`, which
-`backup status` then shows. Run it on your own cadence (e.g. monthly) — restic
-dedup makes growth sub-linear, so retention is a rare, deliberate operation, not
-a per-run one.
+credential Secret the cluster already holds (`spec.backup.credentialRef`). With
+a key that may delete in that Secret, the command needs no credential flags at
+all; with the scoped one, it stops at the first refused delete, deletes
+nothing, and exits non-zero saying so — pass `--credential-file` with the full
+credentials. On success `prune` stamps `apprafter.io/last-prune` on
+`PlatformStack`, which `backup status` shows and the retention verdict names.
+Run it on your own cadence (e.g. monthly) — restic dedup makes growth
+sub-linear, so retention is a rare, deliberate operation, not a per-run one;
+the size and growth `backup status` prints are what to judge the cadence by.
 
 `prune` needs an **identity**. It forgets by explicit snapshot id, one
 repository can hold more than one cluster's snapshots, and something has to say
@@ -85,7 +95,7 @@ apprafter backup check [--repo s3:…] [--credential-file <dotenv>] [--read-data
 
 `check` runs `restic check` against the repository — the same verification the
 in-cluster **`apprafter-backup-check` CronJob** runs weekly (default
-`0 6 * * 0`; [what that Job actually
+`0 6 * * 0`) before, under `enforce: check`, it prunes ([what that Job actually
 runs](../how-it-works/backup-retention-and-checks.md#what-the-weekly-check-runs)).
 By default it verifies structure only; `--read-data` re-downloads and re-hashes
 **every** pack for a deep verify (slower, bandwidth-heavy). Like `prune`, it
@@ -161,7 +171,9 @@ apprafter backup enable --bucket s3:… --credential apprafter-backup-s3 \
 ```
 
 The weekly CronJob is then not created at all, and `apprafter backup status`
-reports `check: off` so nobody has to infer it from an absence.
+reports `check: off` so nobody has to infer it from an absence. Under the
+default `enforce: check` that also turns the in-cluster prune off, and the
+retention verdict says `CheckOff`.
 
 Or set `PlatformStack.spec.backup.checkSchedule` to `""` in your infra repo, if
 the backup block is git-managed — that is the same thing, expressed durably.
@@ -175,13 +187,13 @@ Whichever you choose, run `apprafter backup check` operator-side on your own
 cadence — parking the in-cluster check means nothing verifies the repository
 until you do.
 
-> **Where check failures surface.** `apprafter backup status` reports the most
-> recent check Job on its `Last check Job:` line, so a red check is visible
-> there. What it cannot tell you is *why*: the check Job never writes the
-> runner's status ConfigMap, so the `lastError` you see is always a *backup*
-> error, never a check error. For the reason, read the failed Job's pod log — or
-> re-run `apprafter backup check` yourself with full credentials
-> ([why](../how-it-works/backup-retention-and-checks.md#where-the-check-result-shows-up)).
+> **Where check failures surface.** A check that does not pass turns
+> `apprafter status` red (`RepositoryCheckFailed`), and `apprafter backup status`
+> shows it under `last check` with the first lines of restic's output; the
+> failed Job's pod log has all of it, and `apprafter backup check` runs the same
+> check with full credentials. A check that does not pass never prunes
+> ([where the result is
+> recorded](../how-it-works/backup-retention-and-checks.md#where-the-check-result-shows-up)).
 
 ```text
 apprafter backup unlock [--repo s3:…] [--credential-file <dotenv>]
@@ -245,25 +257,34 @@ or a sequence, typically a `REFRESH MATERIALIZED VIEW` or a migration's
 transaction left open; in a database with thousands of tables it can also be
 table locks. Run `apprafter backup run` again once that session has finished.
 
-## The scoped-credentials ladder — `enforce: operator` vs `cluster`
+## Who prunes, and what the cluster's key may delete {#who-prunes-and-what-the-clusters-key-may-delete}
 
-`--enforce` controls **who runs retention** and therefore **how much delete
-power the cluster credential needs.** What that credential reaches once it is in
-the cluster — the S3 keys it maps to, and the Kubernetes verbs the runner's
-ServiceAccount holds — is [on the mechanism
+`--enforce` (and `apprafter backup set enforce`) controls **who runs
+retention**, and so **how much delete power the cluster credential needs.**
+What that credential reaches once it is in the cluster — the S3 keys it maps
+to, and the Kubernetes verbs the runner's ServiceAccount holds — is [on the
+mechanism
 page](../how-it-works/backup-retention-and-checks.md#what-the-in-cluster-credential-can-and-cannot-do).
 
-**`enforce: operator` (the default).** The in-cluster Secret should carry S3
-rights scoped to **Put / Get / List on the repository prefix, plus Delete only
-on `locks/*`.** The scheduled backup Job then does `restic backup` only — it
-**cannot** delete `data/`, `index/`, or `snapshots/` objects, so a cluster
-compromise (ransomware) cannot erase the backup history. Retention runs
-**outside** the cluster: you run `apprafter backup prune` with your **full**
+```sh
+apprafter backup set enforce check      # the default: the weekly check Job prunes, if the key may
+apprafter backup set enforce cluster    # the backup Job prunes after every backup
+apprafter backup set enforce operator   # nothing in the cluster prunes; you run backup prune
+```
+
+**Scoped key (recommended), with the default `enforce: check`.** The
+in-cluster Secret carries S3 rights scoped to **Put / Get / List on the
+repository prefix, plus Delete only on `locks/*`.** The backup Job does
+`restic backup` only; the weekly check Job checks, and its prune is refused at
+the first delete — it **cannot** delete `data/`, `index/`, or `snapshots/`
+objects, so a cluster compromise (ransomware) cannot erase the backup history.
+Nothing is deleted, and `apprafter status` says retention is not enforced, with
+the repository's growth: run `apprafter backup prune` with your **full**
 credentials ([Retention and prune](#retention-and-prune), above). A minimal
 bucket/IAM policy shape:
 
 ```jsonc
-// enforce: operator — cluster credential (scoped, append-only-ish)
+// scoped cluster credential (append-only-ish)
 {
   "Statement": [
     {                                    // write + read the repo
@@ -280,11 +301,30 @@ bucket/IAM policy shape:
 }
 ```
 
+**A key that may delete, with `enforce: check`.** The weekly check Job prunes
+after every check that passes, and nothing else is needed. A check that fails
+never prunes. A compromised cluster can now delete the history; use it only
+with compensating provider controls (object versioning / object lock).
+
 **`enforce: cluster`.** The in-cluster Secret carries **full** credentials, and
-the backup Job runs `restic forget --prune` in-cluster after each backup. No
-operator-side prune is needed, but a compromised cluster can now delete the
-whole history — the trade-off is documented and opt-in. Use it only with
-compensating provider controls (object versioning / object lock).
+the backup Job prunes after each backup: the repository never holds more than
+the keep policy between two weekly checks, at the cost of a prune and an
+exclusive lock every night. With a scoped key every backup fails at the prune
+(the snapshot is still taken), so this mode needs the key that may delete, with
+the same trade-off and the same compensating controls.
+
+**`enforce: operator`.** Nothing in the cluster prunes, whatever the key may
+do. Retention is `apprafter backup prune` on your cadence, and `apprafter
+status` says `not enforced in the cluster, by choice`, with the repository's
+size.
+
+> **Upgrading from before platform-stack 0.2.80.** The default was `operator`
+> until then. A cluster whose `spec.backup.retention.enforce` is set keeps what
+> it set; one that never set it runs `check` from 0.2.80 on, and **if its key
+> may delete, its first weekly check after the upgrade removes every snapshot
+> beyond the keep policy** (7 daily / 4 weekly / 6 monthly unless configured).
+> To keep the old behaviour, run `apprafter backup set enforce operator` before
+> upgrading. A cluster on the scoped key deletes nothing either way.
 
 > **Statement-level granularity is provider-dependent.** "Delete only on
 > `locks/*`" needs **statement-level** scoping (different actions on different
@@ -293,7 +333,8 @@ compensating provider controls (object versioning / object lock).
 > full delete, issue a credential with **no** Delete at all: `backup` still
 > works (restic uses non-exclusive locks), but the in-cluster `check` cannot
 > drop its own lock — [turn the in-cluster check off](#turning-the-in-cluster-check-off)
-> and run `apprafter backup check` operator-side instead. Verify your provider's
+> and run `apprafter backup check` and `apprafter backup prune` operator-side
+> instead. Verify your provider's
 > behavior — the Verify checklist below has a step for confirming it.
 
 > **Hetzner Object Storage (the flagship provider) — branch (a), verified.**

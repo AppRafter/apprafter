@@ -143,9 +143,9 @@ worth acting on:
   the S3 credentials inside it, and keep them.
 - **Scope the S3 credential to the one bucket.** Then what is inside a snapshot
   reaches no further than the repository it came from. [Backup
-  maintenance](backup-maintenance.md) narrows it further still: under the
-  default `enforce: operator`, the credential the *cluster* holds need not carry
-  delete rights at all.
+  maintenance](backup-maintenance.md) narrows it further still: the credential
+  the *cluster* holds need not carry delete rights at all — nothing in the
+  cluster can then erase a snapshot, and pruning runs from your machine.
 - **Rotating the S3 credential does not remove it from the snapshots already
   taken.** They still hold the old keys, readable with the same passphrase — so
   a rotation stops the old keys working, and re-keying the repository with stock
@@ -180,7 +180,7 @@ apprafter backup enable --bucket <name> --endpoint <host> [--prefix <path>] \
                         [--cluster-name <name>] \
                         [--at 03:00] [--timezone Europe/Berlin] \
                         [--staging-mode monolithic|sequential] \
-                        [--enforce operator|cluster] \
+                        [--enforce check|cluster|operator] \
                         [--keep-daily N] [--keep-weekly N] [--keep-monthly N] \
                         [--check off|06:00] [--failure-webhook <url>] \
                         --i-have-saved-credentials
@@ -314,7 +314,9 @@ doing it, none of them about safety.
 ### Defaults, and the time of day
 
 Defaults when a flag is omitted: `--at` `03:00` (nightly), `--check` three
-hours later on Sunday, `--staging-mode` `monolithic`, `--enforce` `operator`,
+hours later on Sunday, `--staging-mode` `monolithic`, `--enforce` `check` (the
+weekly check prunes, as far as the cluster's key may delete — [who
+prunes](backup-maintenance.md#who-prunes-and-what-the-clusters-key-may-delete)),
 retention `--keep-daily 7 --keep-weekly 4 --keep-monthly 6`.
 
 **`--timezone` defaults to the machine you run the command on.** A time of day
@@ -407,13 +409,17 @@ apprafter backup status
 - the last backup and check **Job** outcomes;
 - the non-chart-owned **`apprafter-backup-status` ConfigMap** in
   `apprafter-system` — the runner create-or-updates it on every run with
-  `lastSuccess`, `lastFailure`, `lastError` (short), and `lastRunFormat`. This
+  `lastSuccess`, `lastFailure`, `lastError` (short), and `lastRunFormat`, and
+  the weekly check adds its own result, the prune after it and the
+  repository's size and growth (the `Repository` block). This
   is why it is a ConfigMap and not just Job history: the `failedJobsHistoryLimit`
   can rotate the last *successful* Job out of view, but "when did the last
   successful backup run" — the core backup question — stays reliably
   answerable;
 - the `apprafter.io/last-prune` annotation stamped on `PlatformStack` by the
-  operator-side `backup prune`.
+  operator-side `backup prune`, and the operator's verdict on whether retention
+  is enforced ([what each answer
+  means](../how-it-works/backup-retention-and-checks.md#whether-retention-is-enforced)).
 
 ## What a backup captures
 
