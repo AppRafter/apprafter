@@ -4,7 +4,7 @@
 //!
 //! `main` assembles the pieces the prior chunks built into one run:
 //! [`RunnerConfig::from_env`] → an in-cluster kube-rs [`KubeRsExec`] +
-//! [`SubprocessRestic`] → [`backup_core::engine::run_backup`] (+ optional
+//! [`ForwardingRestic`] → [`backup_core::engine::run_backup`] (+ optional
 //! [`backup_core::prune::run_prune`]) → a status ConfigMap + optional failure
 //! webhook.
 //!
@@ -32,21 +32,23 @@
 //! * the status-CM write and the failure webhook are BEST-EFFORT: a failure in
 //!   either is logged but NEVER changes the run's exit code.
 //! * SIGTERM — Kubernetes stopping the run at its Job deadline, or deleting
-//!   its pod — → the run is recorded as a `Failure` by [`stop::stop_run`]
-//!   instead of by the run itself, its helper pods deleted, exit **1**. Only
-//!   one of the two ever records ([`OutcomeClaim`]).
+//!   its pod — or SIGINT → the run is recorded as a `Failure` by
+//!   [`stop::stop_run`] instead of by the run itself, its helper pods deleted
+//!   and the signal passed on to a restic it has running, exit **1**. Only one
+//!   of the two ever records ([`OutcomeClaim`]).
 
 use apprafter_backup::config::RunnerConfig;
 use apprafter_backup::kube_rs_exec::KubeRsExec;
 use apprafter_backup::orchestrate::{resolve_namespaces, RunOutcome};
+use apprafter_backup::restic_child::ForwardingRestic;
 use apprafter_backup::status::write_status;
-use apprafter_backup::stop::{self, OutcomeClaim, StopContext};
+use apprafter_backup::stop::{self, OutcomeClaim, StopContext, StopSignal};
 use apprafter_backup::webhook::post_failure;
 
 use backup_core::engine::{run_backup, BackupOpts};
 use backup_core::prune::run_prune;
 use backup_core::restic::restic_unlock_argv;
-use backup_core::{KubeExec, ResticRunner, StagingMode, SubprocessRestic};
+use backup_core::{KubeExec, ResticRunner, StagingMode};
 
 use cli_core::{CliError, Result};
 
@@ -100,7 +102,8 @@ fn run() -> i32 {
     };
 
     let k = KubeRsExec::new(client.clone(), rt.handle().clone());
-    let r = SubprocessRestic;
+    // restic as a child the stop can pass its signal on to (`restic_child`).
+    let r = ForwardingRestic::new("restic");
 
     // The status ConfigMap records which staging format this run used.
     let format = match cfg.staging_mode {
@@ -111,17 +114,23 @@ fn run() -> i32 {
     // 2b. SIGTERM: at the Job's deadline (or when its pod is deleted)
     //     Kubernetes sends it, then SIGKILL after the pod's grace period. As
     //     PID 1 with no handler the runner would ignore the first and die by
-    //     the second with nothing recorded; see `stop`. A handler that cannot
-    //     be installed leaves the run exactly as it was before, so it is
-    //     reported and the backup goes ahead.
+    //     the second with nothing recorded; see `stop`. SIGINT, from a run
+    //     started by hand, is handled the same way. A handler that cannot be
+    //     installed leaves the run exactly as it was before, so it is reported
+    //     and the backup goes ahead.
     let claim = OutcomeClaim::default();
     match rt.block_on(async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok::<_, std::io::Error>((
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::interrupt())?,
+        ))
     }) {
-        Ok(mut sigterm) => {
+        Ok((mut sigterm, mut sigint)) => {
             let ctx = StopContext {
                 client: client.clone(),
                 live_helpers: k.live_helper_pods(),
+                restic: r.live_children(),
                 started,
                 deadline: cfg.deadline,
                 format,
@@ -130,22 +139,27 @@ fn run() -> i32 {
             };
             let claim = claim.clone();
             rt.spawn(async move {
-                if sigterm.recv().await.is_none() {
-                    return;
-                }
+                let received = tokio::select! {
+                    Some(()) = sigterm.recv() => StopSignal::Terminate,
+                    Some(()) = sigint.recv() => StopSignal::Interrupt,
+                    else => return,
+                };
                 if !claim.claim() {
                     // The run finished first and is recording its own outcome;
                     // it exits well inside the grace period.
-                    eprintln!("SIGTERM received while the run was already ending");
+                    eprintln!(
+                        "{} received while the run was already ending",
+                        received.name()
+                    );
                     return;
                 }
-                let outcome = stop::stop_run(&ctx).await;
+                let outcome = stop::stop_run(&ctx, received).await;
                 std::process::exit(outcome.exit_code());
             });
         }
         Err(e) => eprintln!(
-            "warning: cannot handle SIGTERM ({e}); a run stopped at its deadline will not \
-             record lastFailure"
+            "warning: cannot handle SIGTERM/SIGINT ({e}); a run stopped at its deadline will \
+             not record lastFailure"
         ),
     }
 
@@ -156,7 +170,8 @@ fn run() -> i32 {
     if !claim.claim() {
         // Kubernetes stopped the run and the stop is recording it; an error
         // here is the stop's own doing (it deleted the helper pod this run
-        // was reading from). Wait for the stop to exit the process.
+        // was reading from, or signalled its restic). Wait for the stop to
+        // exit the process.
         loop {
             std::thread::park();
         }

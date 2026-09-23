@@ -11,10 +11,17 @@
 //!
 //! On SIGTERM the runner now, within that grace period:
 //!
-//! 1. deletes the helper pods it has applied and not yet deleted — which also
-//!    ends the exec the run was blocked in — after refusing every later apply
-//!    and waiting out the one under way, so that the main thread, still
-//!    running until that exec fails, cannot leave a pod behind the list;
+//! 1. stops the work under way, two things side by side:
+//!    - deletes the helper pods it has applied and not yet deleted — which
+//!      also ends the exec the run was blocked in — after refusing every later
+//!      apply and waiting out the one under way, so that the main thread,
+//!      still running until that exec fails, cannot leave a pod behind the
+//!      list;
+//!    - passes the signal on to a restic it has running (`restic backup`, the
+//!      prune's `restic forget --prune`) and gives it a moment to remove its
+//!      repository lock and exit ([`crate::restic_child`]). Otherwise restic
+//!      would be SIGKILLed with the runner and leave the lock for 30 minutes —
+//!      an exclusive one, when it was pruning;
 //! 2. records the failure in the status ConfigMap (`lastFailure`, `lastError`);
 //! 3. posts the failure webhook;
 //! 4. exits 1.
@@ -23,6 +30,9 @@
 //! in the grace period, so the runner always exits on its own before the
 //! SIGKILL. The Job itself still fails with reason `DeadlineExceeded`: the
 //! Job controller has decided that before it sends the signal.
+//!
+//! SIGINT — a run started by hand in a terminal, or `kill -INT 1` — is handled
+//! the same way, and passed on to restic as SIGINT.
 //!
 //! SIGTERM is the trigger rather than a timer of the runner's own because only
 //! the Job controller knows when the deadline is. It counts from the Job's
@@ -44,6 +54,21 @@ use crate::orchestrate::RunOutcome;
 
 /// The most the helper-pod deletes may take, all of them together.
 pub const HELPER_DELETE_BOUND: Duration = Duration::from_secs(10);
+/// The most a restic the stop has signalled may take to remove its lock and
+/// exit before it is killed. Removing the lock is one DELETE of `locks/<id>`
+/// in the repository, which a reachable S3 endpoint answers in well under a
+/// second: fifteen leaves room for a slow one and restic's own retry of it. A
+/// restic still running at the bound is killed, and its lock stays as it
+/// would have without the signal.
+pub const RESTIC_RELEASE_BOUND: Duration = Duration::from_secs(15);
+/// Step 1, stopping the work: the helper deletes and restic's release run
+/// side by side, so it takes the longer of the two bounds, not their sum.
+pub const STOP_WORK_BOUND: Duration =
+    if HELPER_DELETE_BOUND.as_millis() > RESTIC_RELEASE_BOUND.as_millis() {
+        HELPER_DELETE_BOUND
+    } else {
+        RESTIC_RELEASE_BOUND
+    };
 /// The most the status ConfigMap write may take.
 pub const STATUS_WRITE_BOUND: Duration = Duration::from_secs(20);
 /// The most the failure webhook may take: its own 30 s bound, plus room for
@@ -206,10 +231,44 @@ pub fn human_duration(d: Duration) -> String {
     out
 }
 
-/// The `lastError` and webhook text for a run Kubernetes stopped, after
+/// The signal that stopped the run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopSignal {
+    /// SIGTERM: Kubernetes, at the Job's deadline or on deleting the pod.
+    Terminate,
+    /// SIGINT: someone interrupting a run started by hand.
+    Interrupt,
+}
+
+impl StopSignal {
+    /// `SIGTERM` / `SIGINT`.
+    pub fn name(self) -> &'static str {
+        match self {
+            StopSignal::Terminate => "SIGTERM",
+            StopSignal::Interrupt => "SIGINT",
+        }
+    }
+
+    /// The signal's number, to pass it on to restic unchanged.
+    pub fn number(self) -> libc::c_int {
+        match self {
+            StopSignal::Terminate => libc::SIGTERM,
+            StopSignal::Interrupt => libc::SIGINT,
+        }
+    }
+}
+
+/// The `lastError` and webhook text for a run stopped by `signal`, after
 /// `ran_for` of a run whose deadline is `deadline` (`None`: not known).
-pub fn stopped_message(ran_for: Duration, deadline: Option<Duration>) -> String {
+pub fn stopped_message(
+    ran_for: Duration,
+    deadline: Option<Duration>,
+    signal: StopSignal,
+) -> String {
     let ran = human_duration(ran_for);
+    if signal == StopSignal::Interrupt {
+        return format!("run was interrupted (SIGINT) after {ran}");
+    }
     match deadline {
         Some(d) if ran_for + DEADLINE_START_ALLOWANCE >= d => format!(
             "run exceeded its deadline of {} and was stopped after {ran}: a backup Job is \
@@ -236,6 +295,8 @@ pub fn stopped_message(ran_for: Duration, deadline: Option<Duration>) -> String 
 pub struct StopContext {
     pub client: kube::Client,
     pub live_helpers: LiveHelperPods,
+    /// The restic processes the run has running.
+    pub restic: crate::restic_child::LiveResticChildren,
     pub started: Instant,
     pub deadline: Option<Duration>,
     /// The staging format the status ConfigMap records.
@@ -244,13 +305,15 @@ pub struct StopContext {
     pub failure_webhook: Option<String>,
 }
 
-/// Record a run Kubernetes is stopping (see the module docs). Returns once
+/// Record a run `signal` is stopping (see the module docs). Returns once
 /// every step has finished or run out of time; the caller then exits.
-pub async fn stop_run(ctx: &StopContext) -> RunOutcome {
-    let error = stopped_message(ctx.started.elapsed(), ctx.deadline);
+pub async fn stop_run(ctx: &StopContext, signal: StopSignal) -> RunOutcome {
+    let error = stopped_message(ctx.started.elapsed(), ctx.deadline, signal);
     eprintln!("backup stopped: {error}");
 
-    // 1. Helper pods first: deleting one ends the exec the run is blocked in.
+    // 1. Stop the work under way: the helper pods and restic, side by side.
+    //
+    //    Helper pods: deleting one ends the exec the run is blocked in.
     //    Grace 0, because the work in them is abandoned. A dump killed now has
     //    its database session, and the table locks that session holds, ended
     //    within seconds, even while it waits on a lock: the helper connects with
@@ -276,15 +339,21 @@ pub async fn stop_run(ctx: &StopContext) -> RunOutcome {
         });
         futures::future::join_all(deletes).await;
     };
-    if tokio::time::timeout(HELPER_DELETE_BOUND, delete_helpers)
-        .await
-        .is_err()
-    {
-        eprintln!(
-            "stop: helper-pod deletes still running after {}s; going on",
-            HELPER_DELETE_BOUND.as_secs()
-        );
-    }
+    let delete_helpers = async {
+        if tokio::time::timeout(HELPER_DELETE_BOUND, delete_helpers)
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "stop: helper-pod deletes still running after {}s; going on",
+                HELPER_DELETE_BOUND.as_secs()
+            );
+        }
+    };
+    //    restic: the signal passed on, so that it removes its lock itself.
+    let release_restic =
+        crate::restic_child::release_restic(&ctx.restic, signal.number(), RESTIC_RELEASE_BOUND);
+    tokio::join!(delete_helpers, release_restic);
 
     // 2. The status ConfigMap.
     let outcome = RunOutcome::Failure { error };
@@ -326,11 +395,135 @@ pub async fn stop_run(ctx: &StopContext) -> RunOutcome {
 mod tests {
     use super::*;
 
+    /// A stub apiserver that answers every request 200 with an empty object
+    /// and records `"<METHOD> <path>"`: enough for the stop's deletes and its
+    /// status write to go through.
+    #[derive(Clone, Default)]
+    struct RecordingApiServer(Arc<Mutex<Vec<String>>>);
+
+    impl tower_service::Service<http::Request<kube::client::Body>> for RecordingApiServer {
+        type Response = http::Response<kube::client::Body>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<kube::client::Body>) -> Self::Future {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", req.method(), req.uri().path()));
+            std::future::ready(Ok(http::Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(kube::client::Body::from(
+                    br#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"x"}}"#.to_vec(),
+                ))
+                .unwrap()))
+        }
+    }
+
+    /// The stop's first step reaches both halves of the work: the helper pod
+    /// is deleted, and the signal it received is passed on to the restic the
+    /// run has running, which exits — and only then is the run recorded.
+    #[test]
+    fn the_stop_deletes_the_helpers_and_passes_its_signal_on_to_restic() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let (started, got) = (dir.path().join("started"), dir.path().join("got"));
+        let bin = dir.path().join("restic");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = __probe ] && exit 0\n\
+                 trap 'echo TERM > {got}; exit 1' TERM\n\
+                 trap 'echo INT > {got}; exit 1' INT\n\
+                 touch {started}\nwhile :; do sleep 0.05; done\n",
+                got = got.display(),
+                started = started.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for _ in 0..200 {
+            match std::process::Command::new(&bin).arg("__probe").status() {
+                Err(e) if e.raw_os_error() == Some(26) => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                _ => break,
+            }
+        }
+
+        for (signal, name) in [
+            (StopSignal::Terminate, "TERM"),
+            (StopSignal::Interrupt, "INT"),
+        ] {
+            let _ = std::fs::remove_file(&started);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let seen = RecordingApiServer::default();
+            let client = {
+                let _guard = rt.enter();
+                kube::Client::new(seen.clone(), "default")
+            };
+            let restic = crate::restic_child::ForwardingRestic::new(&bin);
+            let live_restic = restic.live_children();
+            let run = std::thread::spawn(move || {
+                use backup_core::ResticRunner as _;
+                restic.run(&["backup".to_string()], "pw")
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !started.exists() {
+                assert!(Instant::now() < deadline, "the fake restic never started");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let live_helpers = LiveHelperPods::default();
+            drop(live_helpers.begin_apply("shop", "bk-pg-db").unwrap());
+
+            let ctx = StopContext {
+                client,
+                live_helpers,
+                restic: live_restic.clone(),
+                started: Instant::now(),
+                deadline: None,
+                format: "sequential",
+                cluster_id: "test".into(),
+                failure_webhook: None,
+            };
+            let t0 = Instant::now();
+            let outcome = rt.block_on(stop_run(&ctx, signal));
+            assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+            assert_eq!(outcome.exit_code(), 1);
+            assert_eq!(std::fs::read_to_string(&got).unwrap(), format!("{name}\n"));
+            assert!(run.join().unwrap().is_err());
+            assert_eq!(live_restic.running(), 0);
+            let seen = seen.0.lock().unwrap().clone();
+            assert!(
+                seen.contains(&"DELETE /api/v1/namespaces/shop/pods/bk-pg-db".to_string()),
+                "{seen:?}"
+            );
+            assert!(
+                seen.iter()
+                    .any(|r| r.contains("configmaps/apprafter-backup-status")),
+                "the run is recorded: {seen:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_stop_fits_in_the_grace_period_it_is_given() {
         // Every step at its bound still leaves the runner time to exit before
         // the SIGKILL; otherwise the record is lost exactly when it matters.
-        let worst = HELPER_DELETE_BOUND + STATUS_WRITE_BOUND + WEBHOOK_BOUND;
+        // Step 1's two halves run side by side: the longer one counts.
+        assert_eq!(
+            STOP_WORK_BOUND,
+            HELPER_DELETE_BOUND.max(RESTIC_RELEASE_BOUND)
+        );
+        let worst = STOP_WORK_BOUND + STATUS_WRITE_BOUND + WEBHOOK_BOUND;
         assert!(
             worst + Duration::from_secs(10) <= TERMINATION_GRACE,
             "{worst:?} of steps in a {TERMINATION_GRACE:?} grace period"
@@ -353,6 +546,7 @@ mod tests {
         let msg = stopped_message(
             Duration::from_secs(6 * 3600 - 20),
             Some(Duration::from_secs(6 * 3600)),
+            StopSignal::Terminate,
         );
         assert!(
             msg.starts_with("run exceeded its deadline of 6h and was stopped after 5h59m40s"),
@@ -367,6 +561,7 @@ mod tests {
         let msg = stopped_message(
             Duration::from_secs(3600 - 240),
             Some(Duration::from_secs(3600)),
+            StopSignal::Terminate,
         );
         assert!(msg.starts_with("run exceeded its deadline of 1h"), "{msg}");
     }
@@ -376,6 +571,7 @@ mod tests {
         let msg = stopped_message(
             Duration::from_secs(2 * 3600 + 13 * 60),
             Some(Duration::from_secs(6 * 3600)),
+            StopSignal::Terminate,
         );
         assert!(
             msg.starts_with(
@@ -388,10 +584,28 @@ mod tests {
 
     #[test]
     fn a_run_with_no_known_deadline_names_both_causes() {
-        let msg = stopped_message(Duration::from_secs(90), None);
+        let msg = stopped_message(Duration::from_secs(90), None, StopSignal::Terminate);
         assert!(msg.contains("after 1m30s"), "{msg}");
         assert!(msg.contains("deadline passed"), "{msg}");
         assert!(msg.contains("evicted"), "{msg}");
+    }
+
+    #[test]
+    fn a_run_interrupted_by_hand_is_not_blamed_on_kubernetes() {
+        let msg = stopped_message(
+            Duration::from_secs(6 * 3600 - 20),
+            Some(Duration::from_secs(6 * 3600)),
+            StopSignal::Interrupt,
+        );
+        assert_eq!(msg, "run was interrupted (SIGINT) after 5h59m40s");
+    }
+
+    #[test]
+    fn the_signal_passed_on_is_the_one_received() {
+        assert_eq!(StopSignal::Terminate.number(), libc::SIGTERM);
+        assert_eq!(StopSignal::Interrupt.number(), libc::SIGINT);
+        assert_eq!(StopSignal::Terminate.name(), "SIGTERM");
+        assert_eq!(StopSignal::Interrupt.name(), "SIGINT");
     }
 
     #[test]

@@ -43,7 +43,9 @@ pub struct SubprocessRestic;
 /// stderr is classified (wrong passphrase / missing repository / stale
 /// lock) and the remedy for that class becomes the diagnostic's help.
 /// An unrecognised failure carries an empty hint and renders verbatim.
-fn restic_error(argv: &[String], exit: Option<i32>, stderr: &[u8]) -> CliError {
+/// Public for the in-cluster runner's own [`ResticRunner`], which runs restic
+/// the same way but so that it can be signalled.
+pub fn restic_error(argv: &[String], exit: Option<i32>, stderr: &[u8]) -> CliError {
     let stderr = String::from_utf8_lossy(stderr).into_owned();
     let hint = cli_core::diagnose::classify_restic(&stderr)
         .hint()
@@ -83,17 +85,43 @@ impl ResticRunner for SubprocessRestic {
     }
 
     fn run_backup(&self, argv: &[String], pass: &str) -> Result<Option<String>> {
-        let stdout = self.run_stdout(argv, pass)?;
-        let snapshot_id = stdout.lines().find_map(|line| {
-            let obj: Value = serde_json::from_str(line.trim()).ok()?;
-            if obj.pointer("/message_type").and_then(Value::as_str) == Some("summary") {
-                obj.pointer("/snapshot_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            } else {
-                None
-            }
-        });
-        Ok(snapshot_id)
+        Ok(backup_summary_snapshot_id(&self.run_stdout(argv, pass)?))
+    }
+}
+
+/// The snapshot id in the summary line of `restic backup --json` output, or
+/// `None` when there is no summary line (a restic version difference — the
+/// backup still succeeded).
+pub fn backup_summary_snapshot_id(stdout: &str) -> Option<String> {
+    stdout.lines().find_map(|line| {
+        let obj: Value = serde_json::from_str(line.trim()).ok()?;
+        if obj.pointer("/message_type").and_then(Value::as_str) == Some("summary") {
+            obj.pointer("/snapshot_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_snapshot_id_comes_from_the_summary_line_only() {
+        let out = concat!(
+            r#"{"message_type":"status","percent_done":0.5}"#,
+            "\n",
+            r#"{"message_type":"summary","snapshot_id":"4f1c2e"}"#,
+            "\n"
+        );
+        assert_eq!(backup_summary_snapshot_id(out).as_deref(), Some("4f1c2e"));
+        assert_eq!(
+            backup_summary_snapshot_id(r#"{"message_type":"status","snapshot_id":"x"}"#),
+            None
+        );
+        assert_eq!(backup_summary_snapshot_id("not json\n"), None);
     }
 }

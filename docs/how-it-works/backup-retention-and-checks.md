@@ -285,10 +285,17 @@ fails the Job with reason `DeadlineExceeded` and stops its pod: it sends the
 pod SIGTERM, and SIGKILL once the pod's grace period has passed. The backup
 runner uses that grace period, 90 seconds, to record the run like any other
 failure — `lastFailure`, a `lastError` that reads `run exceeded its deadline
-of 6h …`, and the failure webhook — and to delete the helper pod it was
-working in, before it exits. Each of those steps has its own bound, and
-together they fit well inside the 90 seconds. The check is restic on its own:
-it receives the signal itself, removes its repository lock and exits.
+of 6h …`, and the failure webhook — and to stop the work it was doing before
+it exits. It deletes the helper pod it was working in, and it passes the
+signal on to restic if a `restic backup` or the prune was running, because
+Kubernetes signals only the runner. restic then removes its repository lock
+and exits; it is given 15 seconds to do so. Without that, restic would be
+killed with the runner and leave its lock behind for 30 minutes, until restic
+counts it as stale. When the prune was running, that lock is exclusive, and a
+check or a manual run in those 30 minutes would fail on it. Each of those
+steps has its own bound, and together they fit inside the 90 seconds. The
+check is restic on its own: it receives the signal itself, removes its
+repository lock and exits.
 `apprafter backup status` shows such a Job as `Failed: DeadlineExceeded`, and
 scheduling resumes: the next slot runs on time or, if one fell while the
 stopped run was active, the latest such slot starts at once. `apprafter backup

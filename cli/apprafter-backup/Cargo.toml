@@ -42,6 +42,12 @@ k8s-openapi = { workspace = true }
 rustls      = { workspace = true }
 futures     = { workspace = true }
 ureq        = { workspace = true }
+# Not a new crate — already in the graph through tokio and others. Named
+# directly for the two calls std has no safe form of (`restic_child`):
+# `kill(2)` to pass SIGTERM/SIGINT on to a restic child, and `waitid(2)` with
+# `WNOWAIT`, which waits for a child to exit without reaping it, so that its
+# pid cannot be reused while the stop may still signal it.
+libc        = "0.2"
 
 [dev-dependencies]
 # `kube_rs_exec` tests hand `kube::Client::new` a hand-written stub apiserver

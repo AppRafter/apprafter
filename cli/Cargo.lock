@@ -280,6 +280,7 @@ dependencies = [
  "http",
  "k8s-openapi",
  "kube",
+ "libc",
  "rustls",
  "serde_json",
  "tempfile",
