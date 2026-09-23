@@ -22,14 +22,20 @@
 //! killed by it is explained ([`explain_keep_alive_end`]); the bare exit code
 //! 137 says nothing about why.
 //!
-//! For a helper pod nobody deleted (a runner or a CLI killed before its
-//! cleanup ran), the keep-alive ends the pod's process, not the Pod: with
+//! A helper pod nobody deleted (a runner or a CLI killed before its cleanup
+//! ran — the CLI has no Ctrl-C handler, so an interrupted `backup create`,
+//! `export` or `restore` leaves its helper) keeps running `sleep` until its
+//! keep-alive ends. That ends the pod's process, not the Pod: with
 //! `restartPolicy: Never` the object stays behind, `Completed`, until
 //! something deletes it. The next run that applies a helper pod of that name
 //! (the same step for the same claim) deletes it and creates its own
-//! ([`stale_helper_reason`]); so does a run that finds one it cannot apply
-//! over, built by another version with another spec. Applying over it used to
-//! fail that run, after the whole five-minute Ready wait.
+//! ([`stale_helper_reason`]): when it has ended, and while it still runs but
+//! has used more than [`RUNNING_HELPER_REUSE_MARGIN`] of its keep-alive, since
+//! its `sleep` started with the pod and every command in it would end early.
+//! So does a run that finds one it cannot apply over, built by another version
+//! with another spec. Applying over an ended one used to fail that run, after
+//! the whole five-minute Ready wait; using a running one as it was gave the
+//! run only what was left of its `sleep`.
 //!
 //! # Impure forwarding helpers
 //!
@@ -88,16 +94,19 @@ pub fn run_deadline_of(platformstack: Option<&Value>) -> Duration {
 ///   raises this too, which is the way to give a longer load more time.
 /// * **The scheduled runner's Job deadline stops it first** whatever this
 ///   is, so the floor changes nothing about how long a scheduled run may
-///   take. It keeps the runner's helper pods the SAME spec as the CLI's: a
-///   pod's spec cannot change in place, so two specs for one name would
-///   replace each other's pods (see [`is_immutable_pod_update`]) where one
-///   spec simply reuses a running one.
+///   take: a helper the runner creates outlives its Job, and one it reuses
+///   has at most [`RUNNING_HELPER_REUSE_MARGIN`] less left (an older one is
+///   replaced, [`stale_helper_reason`]). It keeps the runner's helper pods
+///   the SAME spec as the CLI's: a pod's spec cannot change in place, so two
+///   specs for one name would replace each other's pods (see
+///   [`is_immutable_pod_update`]) where one spec lets a run reuse a pod
+///   another run has just created.
 /// * **The cost of a long keep-alive** is how long a helper leaked by a
 ///   killed command keeps running `sleep` — holding its env (a database
 ///   password) and any volume mount. The runner deletes its helpers when it
 ///   is stopped, and a leftover is replaced by the next run that needs its
-///   name ([`stale_helper_reason`]), so six hours is also the most such a
-///   leak lives by default.
+///   name ([`stale_helper_reason`]); with no such run, it lives out its
+///   keep-alive, six hours by default.
 pub fn helper_keep_alive(run_deadline: Duration) -> Duration {
     run_deadline.max(DEFAULT_RUN_DEADLINE)
 }
@@ -287,8 +296,10 @@ pub fn shell_single_quote(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Why an existing pod with a helper pod's name cannot serve as that helper
-/// and has to be deleted and created again; `None` when it can. Pure — both
-/// [`KubeExec::apply_and_wait_pod_ready`] implementations ask it.
+/// and has to be deleted and created again; `None` when it can. `spec` is the
+/// helper this run is applying, `now` the time to measure the pod's age
+/// against. Pure — both [`KubeExec::apply_and_wait_pod_ready`]
+/// implementations ask it.
 ///
 /// * **Ended** (`Succeeded` or `Failed`): a helper pod has `restartPolicy:
 ///   Never`, so once its keep-alive has run out, or its node lost it, it never
@@ -296,22 +307,94 @@ pub fn shell_single_quote(s: &str) -> String {
 ///   becomes Ready; that used to fail the run that needed it after the whole
 ///   five-minute Ready wait.
 /// * **Being deleted**: it is going away; the new one is created once it has.
+/// * **Running, with less of its keep-alive left than this run's helper is
+///   given** ([`RUNNING_HELPER_REUSE_MARGIN`] allowed for): its `sleep` started
+///   when the pod was created, not when this run applied over it, and every
+///   command in it ends with that `sleep`. Such a pod is a leftover of a
+///   command stopped before its cleanup ran — `apprafter backup create` or
+///   `export` interrupted with Ctrl-C, a runner pod lost — or the helper of a
+///   run still using it. Used as it was, a leftover created five hours
+///   earlier gave the next run's dump one hour, killed it with exit code 137
+///   well inside its Job deadline, and was then explained as the full
+///   keep-alive running out, with the advice to raise a deadline that played
+///   no part in it.
 ///
-/// A pod that is still running is not stale by this test: a run that applies
-/// the same spec over it uses it as it is.
-pub fn stale_helper_reason(pod: &Value) -> Option<String> {
+/// A running pod that has (nearly) its whole keep-alive left is not stale by
+/// this test: a run that applies the same spec over it uses it as it is. So
+/// is one whose age or keep-alive cannot be read (it has not started yet, or
+/// its command is not a `sleep`, which the apply then refuses as another
+/// spec: [`is_immutable_pod_update`]).
+pub fn stale_helper_reason(
+    pod: &Value,
+    spec: &Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
     if pod
         .pointer("/metadata/deletionTimestamp")
         .is_some_and(|t| !t.is_null())
     {
         return Some("is being deleted".to_string());
     }
-    match pod.pointer("/status/phase").and_then(Value::as_str) {
-        Some(phase @ ("Succeeded" | "Failed")) => Some(format!(
+    if let Some(phase @ ("Succeeded" | "Failed")) =
+        pod.pointer("/status/phase").and_then(Value::as_str)
+    {
+        return Some(format!(
             "has already ended (phase {phase}): it was left behind by an earlier run"
-        )),
-        _ => None,
+        ));
     }
+    let want = keep_alive_of(spec)?;
+    let had = keep_alive_of(pod)?;
+    let started = pod
+        .pointer("/status/containerStatuses/0/state/running/startedAt")
+        .and_then(Value::as_str)
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())?;
+    // Whole seconds, as the node stamps the start. A start stamped ahead of
+    // this clock is a pod of age zero.
+    let age = (now - started.with_timezone(&chrono::Utc))
+        .num_seconds()
+        .max(0)
+        .unsigned_abs();
+    let age = Duration::from_secs(age);
+    let left = had.saturating_sub(age);
+    if left + RUNNING_HELPER_REUSE_MARGIN >= want {
+        return None;
+    }
+    Some(format!(
+        "started {} ago, so only {} of its {} keep-alive is left where this run's helper is \
+         given {}: it was left running by an earlier run that was stopped before it could \
+         delete it (or is in use by another run)",
+        human_duration(age),
+        human_duration(left),
+        human_duration(had),
+        human_duration(want),
+    ))
+}
+
+/// How much less than its whole keep-alive a running helper pod may have left
+/// and still be used as it is by a run that applies the same spec over it
+/// ([`stale_helper_reason`]): five minutes.
+///
+/// The margin is not for leftovers, which are hours old by the time anything
+/// needs their name. It is for two things that make a pod look older than it
+/// is. One is the clock: the pod's age is this machine's time less the
+/// container's start as its node stamped it, and the two clocks can differ.
+/// The other is a helper another run created moments ago: two runs that need
+/// the same helper at the same time share it rather than one deleting it
+/// under the other. A reused pod therefore has at least its keep-alive less
+/// five minutes left, which is what [`explain_keep_alive_end`] relies on when
+/// it blames the keep-alive.
+pub const RUNNING_HELPER_REUSE_MARGIN: Duration = Duration::from_secs(300);
+
+/// The keep-alive a helper pod or spec carries, read off its container
+/// command ([`keep_alive_command`]); `None` for any other command. Pure.
+pub fn keep_alive_of(pod: &Value) -> Option<Duration> {
+    pod.pointer("/spec/containers/0/command")
+        .and_then(Value::as_array)
+        .and_then(|c| match c.as_slice() {
+            [cmd, secs] if cmd == "sleep" => secs.as_str()?.parse::<u64>().ok(),
+            _ => None,
+        })
+        .map(Duration::from_secs)
 }
 
 /// The apiserver's words for an update to a pod field that cannot change in
@@ -377,15 +460,7 @@ pub fn keep_alive_state(pod: &Value) -> KeepAliveState {
     let state = pod.pointer("/status/containerStatuses/0/state");
     if let Some(ended) = state.and_then(|s| s.get("terminated")) {
         if ended.get("exitCode").and_then(Value::as_i64) == Some(0) {
-            let keep_alive = pod
-                .pointer("/spec/containers/0/command")
-                .and_then(Value::as_array)
-                .and_then(|c| match c.as_slice() {
-                    [cmd, secs] if cmd == "sleep" => secs.as_str()?.parse::<u64>().ok(),
-                    _ => None,
-                })
-                .map(Duration::from_secs);
-            return KeepAliveState::Ended(keep_alive);
+            return KeepAliveState::Ended(keep_alive_of(pod));
         }
         return KeepAliveState::Other;
     }
@@ -609,11 +684,39 @@ mod tests {
         }
     }
 
+    /// 2026-09-23T12:00:00Z, the "now" the staleness tests measure against.
+    fn noon() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-09-23T12:00:00Z")
+            .unwrap()
+            .into()
+    }
+
+    /// The spec a run applies: a helper kept alive for six hours.
+    fn wanted() -> Value {
+        json!({"spec": {"containers": [{"name": "dump", "command": ["sleep", "21600"]}]}})
+    }
+
+    /// A running helper of the same spec whose container started `age` before
+    /// [`noon`].
+    fn running_for(age: Duration) -> Value {
+        let started = noon() - chrono::Duration::from_std(age).unwrap();
+        json!({
+            "metadata": {"name": "bk-pg-db"},
+            "spec": {"containers": [{"name": "dump", "command": ["sleep", "21600"]}]},
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [{"name": "dump", "state": {"running": {
+                    "startedAt": started.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+                }}}]
+            }
+        })
+    }
+
     #[test]
     fn an_ended_or_departing_pod_is_stale_and_a_live_one_is_not() {
         for phase in ["Succeeded", "Failed"] {
             let pod = json!({"metadata": {"name": "bk-pg-db"}, "status": {"phase": phase}});
-            let why = stale_helper_reason(&pod).expect(phase);
+            let why = stale_helper_reason(&pod, &wanted(), noon()).expect(phase);
             assert!(why.contains(phase), "{why}");
         }
         let deleting = json!({
@@ -621,7 +724,7 @@ mod tests {
             "status": {"phase": "Running"}
         });
         assert_eq!(
-            stale_helper_reason(&deleting).as_deref(),
+            stale_helper_reason(&deleting, &wanted(), noon()).as_deref(),
             Some("is being deleted")
         );
         for live in [
@@ -630,7 +733,120 @@ mod tests {
             json!({"metadata": {"name": "bk-pg-db", "deletionTimestamp": null}}),
             json!({"metadata": {"name": "bk-pg-db"}}),
         ] {
-            assert_eq!(stale_helper_reason(&live), None, "{live}");
+            assert_eq!(
+                stale_helper_reason(&live, &wanted(), noon()),
+                None,
+                "{live}"
+            );
+        }
+    }
+
+    /// The finding: a helper left running by a command stopped before its
+    /// cleanup (Ctrl-C) was reused with what was left of its `sleep`, so the
+    /// next run's dump died hours early. Five hours into a six-hour
+    /// keep-alive, it is replaced.
+    #[test]
+    fn a_running_leftover_with_hours_of_its_keep_alive_used_is_stale() {
+        let why = stale_helper_reason(
+            &running_for(Duration::from_secs(5 * 3600)),
+            &wanted(),
+            noon(),
+        )
+        .expect("a pod with one hour left is not this run's six-hour helper");
+        assert!(why.contains("started 5h ago"), "{why}");
+        assert!(
+            why.contains("only 1h of its 6h keep-alive is left"),
+            "{why}"
+        );
+        assert!(why.contains("this run's helper is given 6h"), "{why}");
+
+        // An older runner's `sleep 3600` helper, however new, has less than
+        // this run's whole keep-alive: replaced before any apply is tried
+        // (the kubectl path reads the pod first).
+        let mut old_runner = running_for(Duration::from_secs(1));
+        old_runner["spec"]["containers"][0]["command"] = json!(["sleep", "3600"]);
+        let why = stale_helper_reason(&old_runner, &wanted(), noon())
+            .expect("a one-hour helper is not a six-hour one");
+        assert!(why.contains("only 59m59s of its 1h keep-alive"), "{why}");
+
+        // Past its end with the status not yet showing it: nothing left.
+        let why = stale_helper_reason(
+            &running_for(Duration::from_secs(7 * 3600)),
+            &wanted(),
+            noon(),
+        )
+        .expect("a pod past its keep-alive");
+        assert!(why.contains("only 0s of its 6h keep-alive"), "{why}");
+    }
+
+    /// Reused: a pod another run created moments ago, one within the margin,
+    /// and one whose start its node stamped ahead of this clock.
+    #[test]
+    fn a_running_helper_with_its_keep_alive_nearly_whole_is_used_as_it_is() {
+        for age in [
+            Duration::ZERO,
+            Duration::from_secs(10),
+            RUNNING_HELPER_REUSE_MARGIN,
+        ] {
+            assert_eq!(
+                stale_helper_reason(&running_for(age), &wanted(), noon()),
+                None,
+                "{age:?}"
+            );
+        }
+        assert!(stale_helper_reason(
+            &running_for(RUNNING_HELPER_REUSE_MARGIN + Duration::from_secs(1)),
+            &wanted(),
+            noon()
+        )
+        .is_some());
+        let mut ahead = running_for(Duration::ZERO);
+        ahead["status"]["containerStatuses"][0]["state"]["running"]["startedAt"] =
+            json!("2026-09-23T12:03:00Z");
+        assert_eq!(stale_helper_reason(&ahead, &wanted(), noon()), None);
+    }
+
+    /// What cannot be measured is not called stale by this test: a pod whose
+    /// container has not started (image still pulling), one whose command is
+    /// not a `sleep` (another spec: the apply refuses it, and that replaces
+    /// it), and a spec that carries no keep-alive.
+    #[test]
+    fn a_running_helper_whose_age_or_keep_alive_is_unknown_is_not_stale_by_age() {
+        let old = running_for(Duration::from_secs(5 * 3600));
+        let mut pending = old.clone();
+        pending["status"]["containerStatuses"][0]["state"] =
+            json!({"waiting": {"reason": "ContainerCreating"}});
+        let mut not_sleep = old.clone();
+        not_sleep["spec"]["containers"][0]["command"] = json!(["sh", "-c", "sleep 21600"]);
+        let mut garbled = old.clone();
+        garbled["status"]["containerStatuses"][0]["state"]["running"]["startedAt"] =
+            json!("yesterday");
+        for pod in [pending, not_sleep, garbled] {
+            assert_eq!(stale_helper_reason(&pod, &wanted(), noon()), None, "{pod}");
+        }
+        assert_eq!(stale_helper_reason(&old, &json!({}), noon()), None);
+    }
+
+    /// Both sides of a replacement read the keep-alive the same way.
+    #[test]
+    fn the_keep_alive_is_read_off_the_sleep_command_only() {
+        assert_eq!(
+            keep_alive_of(&pg_helper_pod_spec(
+                "p",
+                "n",
+                "postgres:18-alpine",
+                "pw",
+                Duration::from_secs(43200)
+            )),
+            Some(Duration::from_secs(43200))
+        );
+        for other in [
+            json!({"spec": {"containers": [{"command": ["sh", "-c", "sleep 60"]}]}}),
+            json!({"spec": {"containers": [{"command": ["sleep", "forever"]}]}}),
+            json!({"spec": {"containers": [{"name": "dump"}]}}),
+            json!({}),
+        ] {
+            assert_eq!(keep_alive_of(&other), None, "{other}");
         }
     }
 

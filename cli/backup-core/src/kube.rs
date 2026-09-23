@@ -28,9 +28,10 @@ pub trait KubeExec {
     /// `kubectl apply -f -` (stdin JSON) + `kubectl wait --for=condition=Ready`.
     ///
     /// A pod of the same name left from an earlier run is replaced rather than
-    /// applied over when it cannot serve: one that has ended or is being
-    /// deleted ([`crate::helper_pod::stale_helper_reason`]), and one whose spec
-    /// the apiserver refuses to change in place
+    /// applied over when it cannot serve: one that has ended, is being
+    /// deleted, or is running with less of its keep-alive left than this
+    /// call's pod is given ([`crate::helper_pod::stale_helper_reason`]), and
+    /// one whose spec the apiserver refuses to change in place
     /// ([`crate::helper_pod::is_immutable_pod_update`]). It is deleted, the
     /// call waits until it is gone, and applies again, once.
     fn apply_and_wait_pod_ready(&self, spec: &Value) -> Result<()>;

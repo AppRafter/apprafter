@@ -1280,10 +1280,14 @@ impl KubeExec for KubectlExec {
             .map_err(|e| CliError::Other(format!("serialize pod spec: {e}")))?;
 
         // A pod of this name left from an earlier run is replaced rather than
-        // applied over: an ended one never becomes Ready, and one being
-        // deleted is about to go (backup_core::helper_pod::stale_helper_reason).
+        // applied over: an ended one never becomes Ready, one being deleted
+        // is about to go, and a running one hours into its keep-alive would
+        // end this command's work in it early
+        // (backup_core::helper_pod::stale_helper_reason).
         if let Some(existing) = self.get_pod_if_present(name, ns)? {
-            if let Some(why) = backup_core::helper_pod::stale_helper_reason(&existing) {
+            if let Some(why) =
+                backup_core::helper_pod::stale_helper_reason(&existing, spec, chrono::Utc::now())
+            {
                 eprintln!(
                     "{}",
                     backup_core::helper_pod::replacing_stale_helper_note(ns, name, &why)
@@ -10379,6 +10383,44 @@ mod tests {
         assert_eq!(calls(&log), vec!["get", "apply", "wait"]);
     }
 
+    /// The six-hour helper a command applies, and the same pod as `kubectl
+    /// get` shows it, running, its container started `ago` before now.
+    fn six_hour_helper(ago: Duration) -> (Value, String) {
+        let spec = json!({
+            "metadata": {"name": "helper", "namespace": "prod"},
+            "spec": {"containers": [{"name": "dump", "command": ["sleep", "21600"]}]}
+        });
+        let started = chrono::Utc::now() - chrono::Duration::from_std(ago).unwrap();
+        let mut pod = spec.clone();
+        pod["status"] = json!({"phase": "Running", "containerStatuses": [{"name": "dump",
+        "state": {"running": {
+            "startedAt": started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        }}}]});
+        (spec, pod.to_string())
+    }
+
+    /// A helper left running by a command interrupted before its cleanup —
+    /// Ctrl-C on `backup create` five hours ago — has one hour of its `sleep`
+    /// left, and a dump in it would die then. It is replaced.
+    #[test]
+    fn a_running_leftover_with_hours_of_its_keep_alive_used_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, pod) = six_hour_helper(Duration::from_secs(5 * 3600));
+        let (k, log) = stateful_stub(&dir, &pod, "cat >/dev/null; exit 0");
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(calls(&log), vec!["get", "delete", "apply", "wait"]);
+    }
+
+    /// One another command created moments ago is used as it is.
+    #[test]
+    fn a_running_helper_started_moments_ago_is_used_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, pod) = six_hour_helper(Duration::from_secs(10));
+        let (k, log) = stateful_stub(&dir, &pod, "cat >/dev/null; exit 0");
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(calls(&log), vec!["get", "apply", "wait"]);
+    }
+
     /// A leftover whose spec cannot be applied over — an older CLI's or
     /// runner's — is refused by the apiserver on the FIRST line of kubectl's
     /// stderr, above a diff of the pod spec that can run longer than the lines
@@ -10552,30 +10594,137 @@ mod tests {
         assert!(took < Duration::from_secs(90), "took {took:?}");
         eprintln!("kubectl: ended leftover replaced in {took:?}");
 
-        // A RUNNING leftover whose spec cannot change in place.
-        let _ = kubectl(&[
-            "delete",
-            "pod",
-            POD,
-            "-n",
-            NS,
-            "--grace-period=1",
-            "--wait=true",
-        ]);
-        k.apply_and_wait_pod_ready(&helper(3600))
-            .expect("the old helper Ready");
-        let old = field("jsonpath={.metadata.uid}");
-        let started = std::time::Instant::now();
-        k.apply_and_wait_pod_ready(&helper(21600))
-            .expect("a leftover with another keep-alive is replaced");
-        let took = started.elapsed();
-        assert_ne!(field("jsonpath={.metadata.uid}"), old);
+        // A RUNNING leftover with another keep-alive, two ways: an older
+        // runner's `sleep 3600` has less than this command's whole keep-alive
+        // and is replaced on what `kubectl get` shows, before any apply; one
+        // with a LONGER keep-alive (a deadline since lowered) passes that
+        // check, and the apiserver refuses to change its spec in place.
+        for (old_secs, how) in [
+            (3600, "by its keep-alive"),
+            (43200, "by the apply's refusal"),
+        ] {
+            let _ = kubectl(&[
+                "delete",
+                "pod",
+                POD,
+                "-n",
+                NS,
+                "--grace-period=1",
+                "--wait=true",
+            ]);
+            k.apply_and_wait_pod_ready(&helper(old_secs))
+                .expect("the old helper Ready");
+            let old = field("jsonpath={.metadata.uid}");
+            let started = std::time::Instant::now();
+            k.apply_and_wait_pod_ready(&helper(21600))
+                .expect("a leftover with another keep-alive is replaced");
+            let took = started.elapsed();
+            assert_ne!(field("jsonpath={.metadata.uid}"), old, "{old_secs}");
+            assert_eq!(
+                field("jsonpath={.spec.containers[0].command}"),
+                r#"["sleep","21600"]"#
+            );
+            assert!(took < Duration::from_secs(90), "took {took:?}");
+            eprintln!("kubectl: running `sleep {old_secs}` leftover replaced {how} in {took:?}");
+        }
+    }
+
+    /// Real-apiserver proof, through `kubectl`, that a running helper of the
+    /// SAME spec is used as it is while it is new and replaced once it has
+    /// used more than `RUNNING_HELPER_REUSE_MARGIN` of its keep-alive — the
+    /// helper an interrupted `backup create` leaves behind. It waits out the
+    /// margin, about six minutes. Skipped by default; opt in against a
+    /// DISPOSABLE kind cluster:
+    ///
+    /// ```text
+    /// APPRAFTER_K8S_SMOKE=1 KUBECONFIG=<kind kubeconfig> cargo test -p apprafter \
+    ///     --lib a_running_helper_is_reused_while_new_and_replaced_once_aged_through_kubectl \
+    ///     -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "needs a kind cluster: APPRAFTER_K8S_SMOKE=1 KUBECONFIG=<kind kubeconfig>"]
+    fn a_running_helper_is_reused_while_new_and_replaced_once_aged_through_kubectl_on_kind() {
+        const NS: &str = "apprafter-stale-helper-reuse-kubectl";
+        const POD: &str = "bk-vol-aged";
         assert_eq!(
-            field("jsonpath={.spec.containers[0].command}"),
-            r#"["sleep","21600"]"#
+            std::env::var("APPRAFTER_K8S_SMOKE").as_deref(),
+            Ok("1"),
+            "run with APPRAFTER_K8S_SMOKE=1 (this test creates objects in the cluster)"
         );
+        let kubeconfig = PathBuf::from(
+            std::env::var_os("KUBECONFIG").expect("KUBECONFIG must name the kind kubeconfig"),
+        );
+        let kubectl = |args: &[&str]| {
+            let out = Command::new("kubectl")
+                .args(args)
+                .env("KUBECONFIG", &kubeconfig)
+                .output()
+                .expect("run kubectl");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let ctx = kubectl(&["config", "current-context"]);
+        assert!(
+            ctx.starts_with("kind-"),
+            "refusing to run against context {ctx:?}: this test only targets kind clusters"
+        );
+        struct DeleteNs<'a>(&'a Path);
+        impl Drop for DeleteNs<'_> {
+            fn drop(&mut self) {
+                let _ = Command::new("kubectl")
+                    .args(["delete", "namespace", NS, "--wait=false"])
+                    .env("KUBECONFIG", self.0)
+                    .output();
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        while kubectl(&["get", "namespace", NS, "-o", "jsonpath={.status.phase}"]) == "Terminating"
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{NS} stuck Terminating"
+            );
+            thread::sleep(Duration::from_secs(1));
+        }
+        let _ = kubectl(&["create", "namespace", NS]);
+        let _cleanup = DeleteNs(&kubeconfig);
+
+        let k = KubectlExec::new(kubeconfig.clone());
+        let spec = json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": POD, "namespace": NS,
+                         "labels": {"apprafter.io/backup-helper": "true"}},
+            "spec": {"restartPolicy": "Never", "containers": [{
+                "name": "dump", "image": "docker.io/library/alpine:3.24",
+                "imagePullPolicy": "IfNotPresent",
+                "command": ["sleep", "21600"]}]}
+        });
+        let uid = || {
+            kubectl(&[
+                "get",
+                "pod",
+                POD,
+                "-n",
+                NS,
+                "-o",
+                "jsonpath={.metadata.uid}",
+            ])
+        };
+
+        k.apply_and_wait_pod_ready(&spec).expect("helper Ready");
+        let first = uid();
+        k.apply_and_wait_pod_ready(&spec)
+            .expect("a new helper is applied over");
+        assert_eq!(uid(), first, "a helper created a moment ago is reused");
+
+        let margin = backup_core::helper_pod::RUNNING_HELPER_REUSE_MARGIN;
+        thread::sleep(margin + Duration::from_secs(10));
+        let started = std::time::Instant::now();
+        k.apply_and_wait_pod_ready(&spec)
+            .expect("an aged helper is replaced");
+        let took = started.elapsed();
+        assert_ne!(uid(), first, "a new pod, not the aged one");
         assert!(took < Duration::from_secs(90), "took {took:?}");
-        eprintln!("kubectl: running leftover with another spec replaced in {took:?}");
+        eprintln!("kubectl: running helper aged past {margin:?} replaced in {took:?}");
     }
 
     /// Real-cluster proof, through `kubectl exec -i` as a restore runs it,

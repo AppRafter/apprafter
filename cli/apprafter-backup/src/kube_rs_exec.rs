@@ -344,8 +344,9 @@ impl KubeRsExec {
     /// Server-side apply `spec` (mirrors `kubectl apply -f -`), replacing a
     /// pod of the same name left from an earlier run (see
     /// [`backup_core::helper_pod::stale_helper_reason`]): one whose spec
-    /// cannot be applied over, and one the apply shows has ended or is going
-    /// away. Each is deleted, waited out, and the apply made again, once.
+    /// cannot be applied over, and one the apply shows has ended, is going
+    /// away, or has used more of its keep-alive than a reused helper may.
+    /// Each is deleted, waited out, and the apply made again, once.
     ///
     /// A backup helper pod's every PATCH is recorded in the live set first
     /// ([`Self::begin_helper_apply`]), which refuses it once the run is being
@@ -366,7 +367,7 @@ impl KubeRsExec {
         let stale = match applied {
             Ok(pod) => {
                 let pod = serde_json::to_value(&pod).map_err(CliError::from)?;
-                match backup_core::helper_pod::stale_helper_reason(&pod) {
+                match backup_core::helper_pod::stale_helper_reason(&pod, spec, chrono::Utc::now()) {
                     Some(why) => why,
                     None => return Ok(()),
                 }
@@ -1997,6 +1998,89 @@ mod tests {
                 format!("GET {path}"),
             ]
         );
+    }
+
+    /// A helper kept alive for six hours, as the builders shape one.
+    fn six_hour_helper_spec() -> Value {
+        let mut spec = helper_pod_spec();
+        spec["spec"]["containers"][0]["command"] = json!(["sleep", "21600"]);
+        spec
+    }
+
+    /// The same helper as the apply returns it: running, Ready, its container
+    /// started `ago` before now.
+    fn six_hour_helper_running_for(ago: std::time::Duration) -> Value {
+        let started = chrono::Utc::now() - chrono::Duration::from_std(ago).unwrap();
+        let mut pod = running_ready_pod();
+        pod["spec"] = six_hour_helper_spec()["spec"].clone();
+        pod["status"]["containerStatuses"] = json!([{"name": "dump", "state": {"running": {
+            "startedAt": started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        }}}]);
+        pod
+    }
+
+    /// A helper left running by a command stopped before its cleanup — an
+    /// earlier run's, five hours into its six-hour keep-alive — would give
+    /// this run's dump one hour. It is replaced, like an ended one.
+    #[test]
+    fn a_running_leftover_with_hours_of_its_keep_alive_used_is_replaced() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let h = Harness::new(vec![
+            seq_route(
+                "PATCH",
+                path,
+                vec![
+                    (
+                        200,
+                        six_hour_helper_running_for(std::time::Duration::from_secs(5 * 3600)),
+                    ),
+                    (200, pod_in_phase("Pending")),
+                ],
+            ),
+            ok_route("DELETE", path, pod_in_phase("Running")),
+            seq_route("GET", path, vec![not_found(), (200, running_ready_pod())]),
+        ]);
+
+        h.exec
+            .apply_and_wait_pod_ready(&six_hour_helper_spec())
+            .expect("the leftover is replaced");
+
+        let seen: Vec<String> = h
+            .seen()
+            .iter()
+            .map(|r| r.split('?').next().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                format!("PATCH {path}"),
+                format!("DELETE {path}"),
+                format!("GET {path}"),
+                format!("PATCH {path}"),
+                format!("GET {path}"),
+            ]
+        );
+    }
+
+    /// One another run created moments ago is used as it is: deleting it
+    /// would kill that run's command, and it has its keep-alive nearly whole.
+    #[test]
+    fn a_running_helper_started_moments_ago_is_used_as_it_is() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let fresh = six_hour_helper_running_for(std::time::Duration::from_secs(10));
+        let h = Harness::new(vec![
+            ok_route("PATCH", path, fresh.clone()),
+            ok_route("GET", path, fresh),
+        ]);
+        h.exec
+            .apply_and_wait_pod_ready(&six_hour_helper_spec())
+            .expect("apply + wait");
+        let seen: Vec<String> = h
+            .seen()
+            .iter()
+            .map(|r| r.split('?').next().unwrap().to_string())
+            .collect();
+        assert_eq!(seen, vec![format!("PATCH {path}"), format!("GET {path}")]);
     }
 
     /// A leftover with a spec this run's cannot be applied over — an older

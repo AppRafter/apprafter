@@ -7,6 +7,12 @@
 //! apiserver's own answer to each: the ended pod as the apply returns it, and
 //! the text of the refusal to change a pod's spec in place.
 //!
+//! A second test shows a running helper of the SAME spec is used as it is
+//! while it is new, and replaced once it has used more than
+//! `RUNNING_HELPER_REUSE_MARGIN` of its keep-alive: what that needs from the
+//! apiserver is the container's start in the pod the apply returns. It waits
+//! out the margin, so it takes about six minutes; the two run side by side.
+//!
 //! Skipped by default. Opt in against a DISPOSABLE kind cluster:
 //!
 //! ```text
@@ -16,7 +22,7 @@
 //!
 //! Refuses any kubeconfig whose current context is not a `kind-*` context.
 //! The helper image is `docker.io/library/alpine:3.24`, pulled `IfNotPresent`
-//! so it can be preloaded into the node. Takes about half a minute.
+//! so it can be preloaded into the node.
 
 use std::time::{Duration, Instant};
 
@@ -27,16 +33,18 @@ use kube::api::{Api, DeleteParams, Patch, PatchParams};
 use serde_json::{json, Value};
 
 const NS: &str = "apprafter-stale-helper-kind";
+const REUSE_NS: &str = "apprafter-stale-helper-reuse-kind";
 const POD: &str = "bk-vol-stale";
 const MANAGER: &str = "apprafter-stale-helper-kind";
 const IMAGE: &str = "docker.io/library/alpine:3.24";
 
-/// A helper pod as the builders shape one, keeping itself alive for `secs`.
-fn helper(secs: u64) -> Value {
+/// A helper pod as the builders shape one, in `ns`, keeping itself alive for
+/// `secs`.
+fn helper_in(ns: &str, secs: u64) -> Value {
     json!({
         "apiVersion": "v1", "kind": "Pod",
         "metadata": {
-            "name": POD, "namespace": NS,
+            "name": POD, "namespace": ns,
             "labels": {"apprafter.io/backup-helper": "true"}
         },
         "spec": {
@@ -49,84 +57,119 @@ fn helper(secs: u64) -> Value {
     })
 }
 
-#[test]
-#[ignore = "needs a kind cluster: APPRAFTER_K8S_SMOKE=1 KUBECONFIG=<kind kubeconfig>"]
-fn a_leftover_helper_pod_is_replaced_on_a_real_apiserver() {
-    // Explicitly opted in, so a missing precondition is a FAILURE, not a skip.
-    assert_eq!(
-        std::env::var("APPRAFTER_K8S_SMOKE").as_deref(),
-        Ok("1"),
-        "run with APPRAFTER_K8S_SMOKE=1 (this test creates objects in the cluster)"
-    );
-    assert!(
-        std::env::var_os("KUBECONFIG").is_some(),
-        "KUBECONFIG must name the kind cluster's kubeconfig explicitly"
-    );
-    let kc = kube::config::Kubeconfig::read().expect("read the kubeconfig named by KUBECONFIG");
-    let ctx = kc.current_context.clone().unwrap_or_default();
-    assert!(
-        ctx.starts_with("kind-"),
-        "refusing to run against context {ctx:?}: this test only targets kind clusters"
-    );
+fn helper(secs: u64) -> Value {
+    helper_in(NS, secs)
+}
 
-    // Built exactly as `main` builds it.
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let client = rt
-        .block_on(async {
-            let config = kube::Config::infer()
-                .await
-                .map_err(kube::Error::InferConfig)?;
-            apprafter_backup::tls::kube_client(config)
-        })
-        .expect("build the kube client");
-    let k = KubeRsExec::new(client.clone(), rt.handle().clone());
-    let namespaces: Api<Namespace> = Api::all(client.clone());
-    let pods: Api<Pod> = Api::namespaced(client.clone(), NS);
+/// A fresh namespace on the kind cluster, the runner's client and
+/// [`KubeRsExec`] built as `main` builds them, and the namespace deleted on
+/// drop.
+struct KindNs {
+    rt: tokio::runtime::Runtime,
+    k: KubeRsExec,
+    pods: Api<Pod>,
+    namespaces: Api<Namespace>,
+    ns: &'static str,
+}
 
-    rt.block_on(async {
-        let deadline = Instant::now() + Duration::from_secs(180);
-        while let Some(ns) = namespaces.get_opt(NS).await.expect("get the namespace") {
-            if ns.status.and_then(|s| s.phase).as_deref() != Some("Terminating") {
-                break;
+impl KindNs {
+    fn create(ns: &'static str) -> Self {
+        // Explicitly opted in, so a missing precondition is a FAILURE, not a skip.
+        assert_eq!(
+            std::env::var("APPRAFTER_K8S_SMOKE").as_deref(),
+            Ok("1"),
+            "run with APPRAFTER_K8S_SMOKE=1 (this test creates objects in the cluster)"
+        );
+        assert!(
+            std::env::var_os("KUBECONFIG").is_some(),
+            "KUBECONFIG must name the kind cluster's kubeconfig explicitly"
+        );
+        let kc = kube::config::Kubeconfig::read().expect("read the kubeconfig named by KUBECONFIG");
+        let ctx = kc.current_context.clone().unwrap_or_default();
+        assert!(
+            ctx.starts_with("kind-"),
+            "refusing to run against context {ctx:?}: this test only targets kind clusters"
+        );
+
+        // Built exactly as `main` builds it.
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let client = rt
+            .block_on(async {
+                let config = kube::Config::infer()
+                    .await
+                    .map_err(kube::Error::InferConfig)?;
+                apprafter_backup::tls::kube_client(config)
+            })
+            .expect("build the kube client");
+        let k = KubeRsExec::new(client.clone(), rt.handle().clone());
+        let namespaces: Api<Namespace> = Api::all(client.clone());
+        let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
+
+        rt.block_on(async {
+            let deadline = Instant::now() + Duration::from_secs(180);
+            while let Some(n) = namespaces.get_opt(ns).await.expect("get the namespace") {
+                if n.status.and_then(|s| s.phase).as_deref() != Some("Terminating") {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "namespace {ns} stuck Terminating"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
-            assert!(
-                Instant::now() < deadline,
-                "namespace {NS} stuck Terminating"
-            );
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        namespaces
-            .patch(
-                NS,
-                &PatchParams::apply(MANAGER).force(),
-                &Patch::Apply(json!({"apiVersion": "v1", "kind": "Namespace",
-                                     "metadata": {"name": NS}})),
-            )
-            .await
-            .expect("apply the namespace");
-    });
-    struct DeleteNs<'a>(&'a tokio::runtime::Runtime, Api<Namespace>);
-    impl Drop for DeleteNs<'_> {
-        fn drop(&mut self) {
-            let _ = self.0.block_on(self.1.delete(NS, &DeleteParams::default()));
+            namespaces
+                .patch(
+                    ns,
+                    &PatchParams::apply(MANAGER).force(),
+                    &Patch::Apply(json!({"apiVersion": "v1", "kind": "Namespace",
+                                         "metadata": {"name": ns}})),
+                )
+                .await
+                .expect("apply the namespace");
+        });
+        Self {
+            rt,
+            k,
+            pods,
+            namespaces,
+            ns,
         }
     }
-    let _cleanup = DeleteNs(&rt, namespaces.clone());
 
-    let uid = || {
-        rt.block_on(pods.get(POD))
+    fn uid(&self) -> String {
+        self.rt
+            .block_on(self.pods.get(POD))
             .expect("get the helper pod")
             .metadata
             .uid
             .expect("a pod has a uid")
-    };
-    let phase = || {
-        rt.block_on(pods.get(POD))
+    }
+
+    fn phase(&self) -> String {
+        self.rt
+            .block_on(self.pods.get(POD))
             .ok()
             .and_then(|p| p.status)
             .and_then(|s| s.phase)
             .unwrap_or_default()
-    };
+    }
+}
+
+impl Drop for KindNs {
+    fn drop(&mut self) {
+        let _ = self
+            .rt
+            .block_on(self.namespaces.delete(self.ns, &DeleteParams::default()));
+    }
+}
+
+#[test]
+#[ignore = "needs a kind cluster: APPRAFTER_K8S_SMOKE=1 KUBECONFIG=<kind kubeconfig>"]
+fn a_leftover_helper_pod_is_replaced_on_a_real_apiserver() {
+    let kind = KindNs::create(NS);
+    let (rt, k, pods) = (&kind.rt, &kind.k, &kind.pods);
+    let uid = || kind.uid();
+    let phase = || kind.phase();
 
     // --- 1. an ENDED leftover, same spec ------------------------------------
     // The pod a run was killed before deleting: its keep-alive has run out.
@@ -159,7 +202,7 @@ fn a_leftover_helper_pod_is_replaced_on_a_real_apiserver() {
         ..DeleteParams::default()
     };
     let _ = rt.block_on(pods.delete(POD, &quick));
-    wait_gone(&rt, &pods);
+    wait_gone(rt, pods);
     k.apply_and_wait_pod_ready(&helper(3600))
         .expect("the old runner's helper becomes Ready");
     let old = uid();
@@ -191,4 +234,42 @@ fn wait_gone(rt: &tokio::runtime::Runtime, pods: &Api<Pod>) {
         assert!(Instant::now() < deadline, "the helper pod never went");
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// A running helper of the same spec: used as it is while it is new (another
+/// run's, created a moment ago), replaced once more than
+/// `RUNNING_HELPER_REUSE_MARGIN` of its keep-alive has gone — the helper an
+/// interrupted `backup create` leaves, which gave the next run only what was
+/// left of its `sleep`.
+#[test]
+#[ignore = "needs a kind cluster: APPRAFTER_K8S_SMOKE=1 KUBECONFIG=<kind kubeconfig>"]
+fn a_running_helper_is_reused_while_new_and_replaced_once_aged_on_a_real_apiserver() {
+    let kind = KindNs::create(REUSE_NS);
+    let spec = helper_in(REUSE_NS, 21600);
+    kind.k
+        .apply_and_wait_pod_ready(&spec)
+        .expect("the helper becomes Ready");
+    let first = kind.uid();
+
+    // Moments later: the same pod.
+    kind.k
+        .apply_and_wait_pod_ready(&spec)
+        .expect("a new helper is applied over");
+    assert_eq!(kind.uid(), first, "a helper created a moment ago is reused");
+
+    // Past the margin: a new pod, with its whole keep-alive.
+    let margin = backup_core::helper_pod::RUNNING_HELPER_REUSE_MARGIN;
+    std::thread::sleep(margin + Duration::from_secs(10));
+    assert_eq!(kind.phase(), "Running", "the six-hour helper still runs");
+    let started = Instant::now();
+    kind.k
+        .apply_and_wait_pod_ready(&spec)
+        .expect("an aged helper is replaced");
+    let took = started.elapsed();
+    assert_ne!(kind.uid(), first, "a new pod, not the aged one");
+    assert!(
+        took < Duration::from_secs(90),
+        "replacing the aged helper took {took:?}"
+    );
+    eprintln!("running helper aged past {margin:?} replaced in {took:?}");
 }
