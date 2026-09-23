@@ -89,6 +89,18 @@ const EVENT_REPORTER_CONTROLLER: &str = "apprafter-application-controller";
 /// reconciles reuse the cached `status.image.resolved`.
 const MIN_IMAGE_RESOLVE_INTERVAL_SECS: i64 = 60;
 
+/// Annotation on the rendered Deployment naming the image reference, as the
+/// spec wrote it, that its container's digest was rendered for (ADR 0040,
+/// amended 2026-09-23). A failed lookup keeps that digest when the spec
+/// still names the same reference (`running_digest_for`).
+///
+/// It rides the same server-side apply as the image, so the two can never
+/// disagree. `status.image` can: it is written at the END of a reconcile, so
+/// a reconcile that applies a moved tag's Deployment and then fails leaves it
+/// naming the build from before the move. It sits on the Deployment's own
+/// metadata, not the pod template, so writing or changing it rolls nothing.
+pub const ANN_IMAGE_REF: &str = "apprafter.io/image-ref";
+
 /// Per-controller reconcile context.
 pub struct Context {
     pub client: Client,
@@ -678,10 +690,12 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     // so a moved tag auto-rolls the Deployment. Best-effort: ANY failure
     // (registry unreachable, missing credential, malformed reference)
     // sets ImageResolved=False and NEVER blocks the rollout. It keeps
-    // rendering the digest already running for the same tag, and the
-    // verbatim tag only when there is none (`resolution_outcome`, WI-381) —
-    // so a registry blip is a condition, not a rollout. `imagePolicy.resolve:
-    // "off"` skips the poll entirely — no I/O, no ImageResolved condition.
+    // rendering the digest the running Deployment was rendered with for the
+    // same reference, or failing that the one `status.image` recorded for
+    // it, and the verbatim tag only when there is neither
+    // (`resolution_outcome`, WI-381) — so a registry blip is a condition, not
+    // a rollout. `imagePolicy.resolve: "off"` skips the poll entirely — no
+    // I/O, no ImageResolved condition.
     //
     // 2.4h Fix 1 (C): list SourceCredentials ONCE here and thread the
     // result into both the resolution auth-pick AND `attach_pull_secret`
@@ -742,7 +756,9 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
                 None => oci_resolve::RegistryAuth::Anonymous,
             };
             let attempt = oci_resolve::resolve_digest(ctx.oci_http.as_ref(), tag, &auth).await;
-            let outcome = resolution_outcome(prior_image, tag, attempt, Utc::now());
+            let running = running_on_failure(&ctx.client, &namespace, &name, &attempt).await?;
+            let outcome =
+                resolution_outcome(prior_image, running.as_ref(), tag, attempt, Utc::now());
             if let Some(error) = &outcome.failure {
                 // The condition is spent on the rejected pin, the louder of
                 // the two; the registry failure still must not roll the app.
@@ -794,7 +810,9 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
                     None => oci_resolve::RegistryAuth::Anonymous,
                 };
                 let attempt = oci_resolve::resolve_digest(ctx.oci_http.as_ref(), tag, &auth).await;
-                let outcome = resolution_outcome(prior_image, tag, attempt, Utc::now());
+                let running = running_on_failure(&ctx.client, &namespace, &name, &attempt).await?;
+                let outcome =
+                    resolution_outcome(prior_image, running.as_ref(), tag, attempt, Utc::now());
                 image_resolved_cond = Some(match &outcome.failure {
                     None => {
                         ctx.metrics
@@ -807,7 +825,7 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
                         match &outcome.rendered {
                             Some(kept) => warn!(
                                 image = tag, %error, %kept,
-                                "image digest resolution failed; keeping the digest already running for this tag"
+                                "image digest resolution failed; keeping the digest last rendered for this tag"
                             ),
                             None => warn!(
                                 image = tag, %error,
@@ -904,6 +922,13 @@ pub async fn reconcile(app: Arc<Application>, ctx: Arc<Context>) -> Result<Actio
     .expect(
         "effective_spec validated at the migration gate (step 1) — render Ok is invariant here",
     );
+
+    // ADR 0040 (amended 2026-09-23): record, in the same apply as the image,
+    // which reference the rendered digest stands for. A later failed lookup
+    // keeps that digest for as long as the spec names the same reference.
+    if let (Some(_), Some(reference)) = (resolved_image.as_deref(), effective.image.as_deref()) {
+        stamp_image_ref(&mut rendered.deployment, reference);
+    }
 
     // Seam A (1.79c S3): if a SourceCredential covers this image's
     // registry, project its derived pull-secret into the workload
@@ -3242,6 +3267,14 @@ struct ResolutionOutcome {
 /// back again on the next success: two rollouts of an unchanged image. The
 /// failure is reported by the `ImageResolved` condition instead.
 ///
+/// What runs is read from the `running` Deployment first, whose
+/// `ANN_IMAGE_REF` says which reference its digest was rendered for, and
+/// from `prior` (`status.image`) only when the Deployment cannot say. The
+/// status alone is not enough: it is written at the end of a reconcile, so
+/// one that applied a moved tag's Deployment and then failed leaves it
+/// naming the build from before the move — and keeping that on a blip rolls
+/// the app BACK to it.
+///
 /// Keeping the digest changes none of ADR 0040's promises. A tag that MOVED
 /// is only ever learnt from a successful resolve, which renders the new
 /// digest and rolls. A changed reference in the spec does not match the
@@ -3253,9 +3286,11 @@ struct ResolutionOutcome {
 /// let the 60s throttle serve the kept digest as if the registry had just
 /// vouched for it; carried over, it is outside the window whenever the
 /// throttle is what sent this reconcile to the registry, so the next one
-/// asks again.
+/// asks again. A digest the status never recorded has no such time, so it
+/// gets none, and the next reconcile asks again for that reason.
 fn resolution_outcome(
     prior: Option<&StatusImage>,
+    running: Option<&Deployment>,
     tag: &str,
     attempt: Result<String, oci_resolve::OciResolveError>,
     now: DateTime<Utc>,
@@ -3263,10 +3298,14 @@ fn resolution_outcome(
     let (rendered, resolved_at, failure) = match attempt {
         Ok(digest) => (Some(digest), Some(now.to_rfc3339()), None),
         Err(e) => {
-            let kept = last_resolved_for(prior, tag);
-            let confirmed_at = kept
-                .as_ref()
-                .and_then(|_| prior.and_then(|p| p.resolved_at.clone()));
+            let recorded = last_resolved_for(prior, tag);
+            let kept = running_digest_for(running, tag).or_else(|| recorded.clone());
+            let confirmed_at = match (&kept, &recorded) {
+                (Some(kept), Some(recorded)) if kept == recorded => {
+                    prior.and_then(|p| p.resolved_at.clone())
+                }
+                _ => None,
+            };
             (kept, confirmed_at, Some(e.to_string()))
         }
     };
@@ -3286,27 +3325,92 @@ fn resolution_outcome(
     }
 }
 
-/// The digest already running for `tag` — resolved for it, or held by a pin
-/// that has since been lifted — from the controller's own `status.image`,
-/// which it writes under a forced field manager and which survives an
-/// operator restart, unlike anything held in memory. The live Deployment
-/// carries the digest too, but not the tag it came from.
+/// The digest `status.image` recorded for `tag` — resolved for it, or held
+/// by a pin that has since been lifted. The controller writes that field
+/// under a forced field manager and it survives an operator restart, unlike
+/// anything held in memory. It is the fallback for a Deployment that cannot
+/// say what it runs (see [`running_digest_for`]), because it is written last
+/// and so can be behind the Deployment.
 ///
 /// Only for the SAME tag string: a spec that now names a different reference
-/// must never run the previous reference's image. The digest is also checked
-/// to be a well-formed `sha256` reference into the tag's own repository
-/// before it is spliced into the pod spec, the same checks a pin gets.
+/// must never run the previous reference's image.
 fn last_resolved_for(prior: Option<&StatusImage>, tag: &str) -> Option<String> {
     let prior = prior?;
     if prior.tag.as_deref() != Some(tag) {
         return None;
     }
-    let resolved = prior.resolved.as_deref()?;
-    let kept = oci_resolve::parse_image_ref(resolved).ok()?;
+    digest_into_repository_of(prior.resolved.as_deref()?, tag)
+}
+
+/// The digest the running Deployment was rendered with for `tag`: its
+/// container's image, when its `ANN_IMAGE_REF` names that same reference.
+///
+/// The annotation is what makes the image usable here. An image alone does
+/// not say which reference it came from, and a Deployment rolled out for
+/// `:2.0` by a reconcile that then failed would otherwise be "kept" for a
+/// spec that has meanwhile gone back to `:1.0`. `None` for a Deployment
+/// applied before the annotation existed, so that one falls back to the
+/// status.
+fn running_digest_for(running: Option<&Deployment>, tag: &str) -> Option<String> {
+    let running = running?;
+    let rendered_for = running.metadata.annotations.as_ref()?.get(ANN_IMAGE_REF)?;
+    if rendered_for != tag {
+        return None;
+    }
+    // The renderer names the application's container after the Deployment.
+    let name = running.metadata.name.as_deref()?;
+    let image = running
+        .spec
+        .as_ref()?
+        .template
+        .spec
+        .as_ref()?
+        .containers
+        .iter()
+        .find(|c| c.name == name)?
+        .image
+        .as_deref()?;
+    digest_into_repository_of(image, tag)
+}
+
+/// `candidate` when it is a well-formed `sha256` digest reference into
+/// `tag`'s own repository: the checks anything spliced into a pod spec in
+/// the tag's place has to pass, the same a pin gets. Both sources of a kept
+/// digest are the controller's own writes, but they are still objects
+/// anyone with write access can edit.
+fn digest_into_repository_of(candidate: &str, tag: &str) -> Option<String> {
+    let kept = oci_resolve::parse_image_ref(candidate).ok()?;
     let wanted = oci_resolve::parse_image_ref(tag).ok()?;
     let same_repository = kept.host == wanted.host && kept.repository == wanted.repository;
     (kept.is_digest && oci_resolve::is_valid_sha256_digest(&kept.reference) && same_repository)
-        .then(|| resolved.to_string())
+        .then(|| candidate.to_string())
+}
+
+/// The Deployment as it runs now, read only when the lookup FAILED — the one
+/// case in which what runs decides what is rendered. An apiserver error here
+/// fails the reconcile, as it would a moment later at the Deployment apply:
+/// guessing instead is how a blip picks the wrong build.
+async fn running_on_failure<T, E>(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    attempt: &Result<T, E>,
+) -> Result<Option<Deployment>, ReconcileError> {
+    if attempt.is_ok() {
+        return Ok(None);
+    }
+    let api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    Ok(api.get_opt(name).await?)
+}
+
+/// Record on the Deployment which reference its image stands for
+/// ([`ANN_IMAGE_REF`]).
+fn stamp_image_ref(deployment: &mut Deployment, reference: &str) {
+    deployment
+        .metadata
+        .annotations
+        .get_or_insert_with(BTreeMap::new)
+        .insert(ANN_IMAGE_REF.to_string(), reference.to_string());
 }
 
 fn existing_baseline(app: &Application) -> Option<ApplicationSpec> {
@@ -4208,8 +4312,8 @@ pub enum ImageResolvedState {
     /// A pin annotation is present but not honourable; still following the tag.
     PinRejected { why: String, tag: String },
     /// Resolution failed this cycle. `kept` is the digest still rendered —
-    /// the one already running for this tag — or `None` when there is none
-    /// and the tag is rendered as written.
+    /// the one last rendered for this tag — or `None` when there is none and
+    /// the tag is rendered as written.
     ResolveFailed { error: String, kept: Option<String> },
 }
 
@@ -4245,7 +4349,7 @@ impl ImageResolvedState {
                 error,
                 kept: Some(kept),
             } => format!(
-                "ResolveFailed: {error}; keeping {kept}, the digest already running \
+                "ResolveFailed: {error}; keeping {kept}, the digest last rendered \
                  for this tag, until the registry answers"
             ),
             Self::ResolveFailed { error, kept: None } => format!(
@@ -8154,6 +8258,9 @@ mod image_reconcile_tests {
     struct Pass {
         /// The container image in the Deployment it applied.
         image: String,
+        /// The Deployment it applied, as the apiserver now holds it — what
+        /// the next pass finds running.
+        deployment: Value,
         /// The `status` it wrote.
         status: Value,
         registry_calls: usize,
@@ -8178,6 +8285,53 @@ mod image_reconcile_tests {
             }
             application(spec_image, resolve, Some(status), None)
         }
+    }
+
+    /// Everything about the cluster a pass runs against besides the
+    /// Application itself.
+    #[derive(Clone, Default)]
+    struct Cluster {
+        /// The Deployment a previous pass applied; `None` when there is none
+        /// yet (or it was deleted).
+        running: Option<Value>,
+        /// The Service apply fails the way an unavailable apiserver fails
+        /// it, so the reconcile fails AFTER the Deployment was applied.
+        service_apply_fails: bool,
+    }
+
+    impl Cluster {
+        fn running(pass_deployment: &Value) -> Self {
+            Self {
+                running: Some(pass_deployment.clone()),
+                ..Self::default()
+            }
+        }
+    }
+
+    /// What one reconcile did, whether or not it succeeded.
+    struct Attempt {
+        succeeded: bool,
+        /// The Deployment it applied, if it got that far.
+        deployment: Option<Value>,
+        /// The `status` it wrote, if it got that far.
+        status: Option<Value>,
+        registry_calls: usize,
+    }
+
+    impl Attempt {
+        fn image(&self) -> Option<&str> {
+            self.deployment
+                .as_ref()?
+                .pointer("/spec/template/spec/containers/0/image")
+                .and_then(Value::as_str)
+        }
+    }
+
+    /// Serve the application at `port` (it gets a Service, which the
+    /// failure scenarios need).
+    fn exposed(mut app: Value) -> Value {
+        app["spec"]["base"]["expose"] = json!({ "port": 8080 });
+        app
     }
 
     /// A resolution five minutes old: outside the throttle window.
@@ -8218,9 +8372,31 @@ mod image_reconcile_tests {
 
     /// The apiserver for a plain application (no needs, no env, no public
     /// route) on a cluster with neither Cilium nor Gateway API nor VPA: every
-    /// collection is empty, every named read is a 404, every write is
-    /// accepted as sent.
-    fn answer(method: &str, path: &str, body: &Value, app: &Value) -> (u16, Value) {
+    /// collection is empty, every named read is a 404 except the Deployment
+    /// `cluster` runs, and every write is accepted as sent unless `cluster`
+    /// fails it.
+    fn answer(
+        method: &str,
+        path: &str,
+        body: &Value,
+        app: &Value,
+        cluster: &Cluster,
+    ) -> (u16, Value) {
+        if path.ends_with("/namespaces/shop/deployments/web") && method == "GET" {
+            if let Some(running) = &cluster.running {
+                return (200, running.clone());
+            }
+        }
+        if cluster.service_apply_fails && method == "PATCH" && path.contains("/services/") {
+            return (
+                500,
+                json!({
+                    "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                    "message": "etcdserver: request timed out",
+                    "reason": "InternalError", "code": 500,
+                }),
+            );
+        }
         let collection = match path.rsplit('/').next().unwrap_or_default() {
             "migrationplans" => Some("MigrationPlanList"),
             "resourceclaims" => Some("ResourceClaimList"),
@@ -8251,19 +8427,21 @@ mod image_reconcile_tests {
         }
     }
 
-    async fn reconcile_once(app: Value, registry: Arc<Registry>) -> Pass {
+    /// One reconcile against `cluster`, successful or not.
+    async fn attempt(app: Value, registry: Arc<Registry>, cluster: Cluster) -> Attempt {
         let log = Arc::new(Mutex::new(Vec::<Call>::new()));
         let sink = log.clone();
         let stored = app.clone();
         let service = tower::service_fn(move |req: http::Request<Body>| {
             let sink = sink.clone();
             let stored = stored.clone();
+            let cluster = cluster.clone();
             async move {
                 let method = req.method().to_string();
                 let path = req.uri().path().to_string();
                 let bytes = req.into_body().collect_bytes().await.expect("request body");
                 let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-                let (code, payload) = answer(&method, &path, &body, &stored);
+                let (code, payload) = answer(&method, &path, &body, &stored, &cluster);
                 sink.lock().expect("log").push(Call { method, path, body });
                 Ok::<_, std::convert::Infallible>(
                     http::Response::builder()
@@ -8286,32 +8464,56 @@ mod image_reconcile_tests {
             problem_tuning: ProblemTuning::default(),
         });
         let app: Application = serde_json::from_value(app).expect("a valid Application");
-        reconcile(Arc::new(app), ctx)
-            .await
-            .expect("a registry failure must never fail the reconcile");
+        let succeeded = reconcile(Arc::new(app), ctx).await.is_ok();
 
         let calls = log.lock().expect("log").clone();
         let deployment = calls
             .iter()
             .find(|c| c.method == "PATCH" && c.path.contains("/deployments/"))
-            .unwrap_or_else(|| panic!("no Deployment was applied: {calls:?}"));
-        let image = deployment
-            .body
-            .pointer("/spec/template/spec/containers/0/image")
-            .and_then(Value::as_str)
-            .expect("the applied Deployment names an image")
-            .to_string();
+            .map(|c| c.body.clone());
         let status = calls
             .iter()
             .rev()
             .find(|c| c.method == "PATCH" && c.path.ends_with("/applications/web/status"))
-            .map(|c| c.body["status"].clone())
-            .unwrap_or_else(|| panic!("no status was written: {calls:?}"));
-        Pass {
-            image,
+            .map(|c| c.body["status"].clone());
+        Attempt {
+            succeeded,
+            deployment,
             status,
             registry_calls: registry.calls.load(Ordering::SeqCst),
         }
+    }
+
+    /// One reconcile against `cluster` that must succeed, apply a
+    /// Deployment and write a status.
+    async fn reconcile_in(app: Value, registry: Arc<Registry>, cluster: Cluster) -> Pass {
+        let done = attempt(app, registry, cluster).await;
+        assert!(
+            done.succeeded,
+            "a registry failure must never fail the reconcile"
+        );
+        let deployment = done.deployment.expect("no Deployment was applied");
+        let image = deployment
+            .pointer("/spec/template/spec/containers/0/image")
+            .and_then(Value::as_str)
+            .expect("the applied Deployment names an image")
+            .to_string();
+        Pass {
+            image,
+            deployment,
+            status: done.status.expect("no status was written"),
+            registry_calls: done.registry_calls,
+        }
+    }
+
+    /// The first reconcile: no Deployment exists yet.
+    async fn reconcile_once(app: Value, registry: Arc<Registry>) -> Pass {
+        reconcile_in(app, registry, Cluster::default()).await
+    }
+
+    /// A reconcile of a cluster running what `before` applied.
+    async fn reconcile_after(before: &Pass, app: Value, registry: Arc<Registry>) -> Pass {
+        reconcile_in(app, registry, Cluster::running(&before.deployment)).await
     }
 
     /// THE regression. A digest is resolved and rendered; the registry is
@@ -8327,7 +8529,7 @@ mod image_reconcile_tests {
             reconcile_once(application(IMAGE, None, None, None), Registry::serving('a')).await;
         assert_eq!(first.image, at_digest('a'));
 
-        let blip = reconcile_once(first.next(IMAGE, None), Registry::down()).await;
+        let blip = reconcile_after(&first, first.next(IMAGE, None), Registry::down()).await;
         assert_eq!(blip.registry_calls, 1, "the registry must still be asked");
         assert_eq!(
             blip.image, first.image,
@@ -8360,7 +8562,7 @@ mod image_reconcile_tests {
             "{carried}"
         );
 
-        let back = reconcile_once(blip.next(IMAGE, None), Registry::serving('a')).await;
+        let back = reconcile_after(&blip, blip.next(IMAGE, None), Registry::serving('a')).await;
         assert_eq!(back.registry_calls, 1, "the next reconcile must retry");
         assert_eq!(back.image, first.image);
         assert_eq!(back.condition(COND_IMAGE_RESOLVED)["status"], "True");
@@ -8380,8 +8582,8 @@ mod image_reconcile_tests {
     async fn a_tag_that_moved_during_the_outage_rolls_once_the_registry_answers() {
         let first =
             reconcile_once(application(IMAGE, None, None, None), Registry::serving('a')).await;
-        let blip = reconcile_once(first.next(IMAGE, None), Registry::down()).await;
-        let moved = reconcile_once(blip.next(IMAGE, None), Registry::serving('b')).await;
+        let blip = reconcile_after(&first, first.next(IMAGE, None), Registry::down()).await;
+        let moved = reconcile_after(&blip, blip.next(IMAGE, None), Registry::serving('b')).await;
         assert_eq!(moved.image, at_digest('b'));
         assert_eq!(
             moved.status["image"]["previous"]["resolved"],
@@ -8398,7 +8600,7 @@ mod image_reconcile_tests {
         let first =
             reconcile_once(application(IMAGE, None, None, None), Registry::serving('a')).await;
         let changed = "ghcr.io/acme/web:2.0";
-        let pass = reconcile_once(first.next(changed, None), Registry::down()).await;
+        let pass = reconcile_after(&first, first.next(changed, None), Registry::down()).await;
         assert_eq!(pass.image, changed);
         assert!(
             pass.status["image"].get("resolved").is_none(),
@@ -8433,7 +8635,7 @@ mod image_reconcile_tests {
         let first =
             reconcile_once(application(IMAGE, None, None, None), Registry::serving('a')).await;
         let registry = Registry::serving('b');
-        let pass = reconcile_once(first.next(IMAGE, Some("off")), registry).await;
+        let pass = reconcile_after(&first, first.next(IMAGE, Some("off")), registry).await;
         assert_eq!(pass.image, IMAGE);
         assert_eq!(pass.registry_calls, 0);
     }
@@ -8449,7 +8651,7 @@ mod image_reconcile_tests {
         let mut next = first.next(IMAGE, None);
         next["metadata"]["annotations"] =
             json!({ operator_core::ANN_IMAGE_PIN: "ghcr.io/acme/web:0.9" });
-        let pass = reconcile_once(next, Registry::down()).await;
+        let pass = reconcile_after(&first, next, Registry::down()).await;
         assert_eq!(pass.registry_calls, 1);
         assert_eq!(pass.image, first.image);
         assert_eq!(pass.condition(COND_IMAGE_RESOLVED)["reason"], "PinRejected");
@@ -8475,5 +8677,222 @@ mod image_reconcile_tests {
             last_resolved_for(Some(&recorded(&at_digest('a'))), IMAGE),
             Some(at_digest('a'))
         );
+    }
+
+    /// A tag that moved was rolled out, but a later apply in the same
+    /// reconcile failed, so `status.image` still names the digest from BEFORE
+    /// the move while the Deployment runs the one after it. A registry blip
+    /// on the next reconcile must keep what runs. Taking the status's word
+    /// for it rolls the app back to the older build for as long as the
+    /// registry is down, and forward again when it answers.
+    #[tokio::test]
+    async fn a_blip_keeps_the_running_digest_when_the_status_is_behind_it() {
+        let first = reconcile_once(
+            exposed(application(IMAGE, None, None, None)),
+            Registry::serving('a'),
+        )
+        .await;
+        assert_eq!(first.image, at_digest('a'));
+
+        // The tag moves to b. The Deployment is applied with b, then the
+        // Service apply fails: the reconcile errors and writes no status.
+        let moved = attempt(
+            exposed(first.next(IMAGE, None)),
+            Registry::serving('b'),
+            Cluster {
+                running: Some(first.deployment.clone()),
+                service_apply_fails: true,
+            },
+        )
+        .await;
+        assert!(!moved.succeeded, "the Service apply was made to fail");
+        assert_eq!(moved.image(), Some(at_digest('b').as_str()));
+        assert!(moved.status.is_none(), "{:?}", moved.status);
+        let running = moved.deployment.expect("the Deployment was applied");
+
+        // The registry is down, and the status is still the first pass's.
+        let blip = reconcile_in(
+            exposed(first.next(IMAGE, None)),
+            Registry::down(),
+            Cluster::running(&running),
+        )
+        .await;
+        assert_eq!(blip.registry_calls, 1, "the registry must still be asked");
+        assert_eq!(
+            blip.image,
+            at_digest('b'),
+            "a failed resolve rolled the app back to the build before the move"
+        );
+        let cond = blip.condition(COND_IMAGE_RESOLVED);
+        assert_eq!(cond["reason"], "ResolveFailed");
+        let message = cond["message"].as_str().unwrap_or_default();
+        assert!(message.contains(&at_digest('b')), "{message}");
+        // Recorded as what runs. The move the failed pass learnt IS a move,
+        // so the build before it becomes the rollback target (ADR 0059). The
+        // status never confirmed b, so there is no resolvedAt to carry and
+        // the next reconcile asks the registry again.
+        assert_eq!(blip.status["image"]["resolved"], json!(at_digest('b')));
+        assert_eq!(
+            blip.status["image"]["previous"]["resolved"],
+            json!(at_digest('a'))
+        );
+        assert!(
+            blip.status["image"].get("resolvedAt").is_none(),
+            "{}",
+            blip.status
+        );
+
+        let back = reconcile_after(
+            &blip,
+            exposed(blip.next(IMAGE, None)),
+            Registry::serving('b'),
+        )
+        .await;
+        assert_eq!(back.registry_calls, 1, "the next reconcile must retry");
+        assert_eq!(back.image, at_digest('b'));
+        assert_eq!(
+            back.status["image"]["previous"]["resolved"],
+            json!(at_digest('a'))
+        );
+    }
+
+    /// Why the Deployment records its reference. A reconcile rolls the
+    /// spec's new reference `:2.0` out and then fails, so the status still
+    /// says `:1.0` → a. The spec then goes back to `:1.0` while the registry
+    /// is down. What runs is a digest into the same repository, and the
+    /// status names the very tag the spec does — yet that digest is `:2.0`'s,
+    /// and keeping it would run 2.0 under a spec that says 1.0.
+    #[tokio::test]
+    async fn a_blip_never_keeps_a_digest_rendered_for_another_reference() {
+        let first = reconcile_once(
+            exposed(application(IMAGE, None, None, None)),
+            Registry::serving('a'),
+        )
+        .await;
+        let other = "ghcr.io/acme/web:2.0";
+        let rolled = attempt(
+            exposed(first.next(other, None)),
+            Registry::serving('c'),
+            Cluster {
+                running: Some(first.deployment.clone()),
+                service_apply_fails: true,
+            },
+        )
+        .await;
+        assert!(!rolled.succeeded, "the Service apply was made to fail");
+        assert_eq!(rolled.image(), Some(at_digest('c').as_str()));
+        let running = rolled.deployment.expect("the Deployment was applied");
+
+        let back = reconcile_in(
+            exposed(first.next(IMAGE, None)),
+            Registry::down(),
+            Cluster::running(&running),
+        )
+        .await;
+        assert_eq!(
+            back.image,
+            at_digest('a'),
+            "kept the digest rendered for {other} under a spec that names {IMAGE}"
+        );
+    }
+
+    /// A Deployment that cannot say what it runs — there is none (it was
+    /// deleted), or it was applied before it carried the record — leaves the
+    /// status as the only witness, and a blip keeps the digest the status
+    /// recorded for the tag, with the time the status confirmed it.
+    #[tokio::test]
+    async fn without_a_record_on_the_deployment_a_blip_keeps_the_status_digest() {
+        let first =
+            reconcile_once(application(IMAGE, None, None, None), Registry::serving('a')).await;
+
+        let deleted = reconcile_once(first.next(IMAGE, None), Registry::down()).await;
+        assert_eq!(deleted.image, at_digest('a'));
+
+        let mut unrecorded = first.deployment.clone();
+        unrecorded["metadata"]["annotations"]
+            .as_object_mut()
+            .expect("the first pass recorded its reference")
+            .remove(ANN_IMAGE_REF);
+        let before_the_record = reconcile_in(
+            first.next(IMAGE, None),
+            Registry::down(),
+            Cluster::running(&unrecorded),
+        )
+        .await;
+        assert_eq!(before_the_record.image, at_digest('a'));
+        assert!(
+            before_the_record.status["image"]["resolvedAt"].is_string(),
+            "{}",
+            before_the_record.status
+        );
+    }
+
+    /// What makes the record trustworthy: it is written in the same apply as
+    /// the image, on the Deployment's own metadata (on the pod template it
+    /// would roll the app whenever it changed), and only when a digest was
+    /// rendered for the reference. `resolve: off` drops it with the digest.
+    #[tokio::test]
+    async fn the_deployment_records_the_reference_its_digest_was_rendered_for() {
+        let record = |deployment: &Value, at: &str| {
+            deployment
+                .pointer(at)
+                .and_then(|annotations| annotations.get(ANN_IMAGE_REF))
+                .cloned()
+        };
+        let first =
+            reconcile_once(application(IMAGE, None, None, None), Registry::serving('a')).await;
+        assert_eq!(
+            record(&first.deployment, "/metadata/annotations"),
+            Some(json!(IMAGE))
+        );
+        assert_eq!(
+            record(&first.deployment, "/spec/template/metadata/annotations"),
+            None,
+            "on the pod template the record would roll the app"
+        );
+
+        let never = reconcile_once(application(IMAGE, None, None, None), Registry::down()).await;
+        assert_eq!(never.image, IMAGE);
+        assert_eq!(record(&never.deployment, "/metadata/annotations"), None);
+
+        let off = reconcile_after(
+            &first,
+            first.next(IMAGE, Some("off")),
+            Registry::serving('a'),
+        )
+        .await;
+        assert_eq!(off.image, IMAGE);
+        assert_eq!(record(&off.deployment, "/metadata/annotations"), None);
+    }
+
+    /// The running image is spliced back into the pod spec, so it must pass
+    /// the checks a recorded digest passes, and only for the reference it
+    /// was recorded for.
+    #[test]
+    fn a_running_digest_is_kept_only_for_its_own_reference_and_repository() {
+        let running = |rendered_for: &str, container: &str, image: &str| -> Deployment {
+            serde_json::from_value(json!({
+                "metadata": { "name": "web", "annotations": { ANN_IMAGE_REF: rendered_for } },
+                "spec": {
+                    "selector": {},
+                    "template": { "spec": { "containers": [ { "name": container, "image": image } ] } },
+                },
+            }))
+            .expect("a Deployment")
+        };
+        let kept = |d: Deployment| running_digest_for(Some(&d), IMAGE);
+        assert_eq!(
+            kept(running(IMAGE, "web", &at_digest('a'))),
+            Some(at_digest('a'))
+        );
+        assert_eq!(
+            kept(running("ghcr.io/acme/web:2.0", "web", &at_digest('a'))),
+            None
+        );
+        let foreign = format!("ghcr.io/attacker/web@sha256:{}", "a".repeat(64));
+        assert_eq!(kept(running(IMAGE, "web", &foreign)), None);
+        assert_eq!(kept(running(IMAGE, "web", IMAGE)), None);
+        assert_eq!(kept(running(IMAGE, "sidecar", &at_digest('a'))), None);
+        assert_eq!(running_digest_for(None, IMAGE), None);
     }
 }
