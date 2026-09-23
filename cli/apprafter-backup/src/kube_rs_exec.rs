@@ -346,6 +346,10 @@ impl KubeRsExec {
     /// [`backup_core::helper_pod::stale_helper_reason`]): one whose spec
     /// cannot be applied over, and one the apply shows has ended or is going
     /// away. Each is deleted, waited out, and the apply made again, once.
+    ///
+    /// A backup helper pod's every PATCH is recorded in the live set first
+    /// ([`Self::begin_helper_apply`]), which refuses it once the run is being
+    /// stopped: the re-apply after a replacement included.
     async fn apply_replacing_stale(
         &self,
         api: &Api<Pod>,
@@ -356,7 +360,10 @@ impl KubeRsExec {
         let pp = PatchParams::apply(FIELD_MANAGER).force();
         let apply_error =
             |e: kube::Error| CliError::Other(format!("apply pod {name} in {ns}: {e}"));
-        let stale = match api.patch(name, &pp, &Patch::Apply(spec)).await {
+        let in_flight = self.begin_helper_apply(spec, ns, name)?;
+        let applied = api.patch(name, &pp, &Patch::Apply(spec)).await;
+        drop(in_flight);
+        let stale = match applied {
             Ok(pod) => {
                 let pod = serde_json::to_value(&pod).map_err(CliError::from)?;
                 match backup_core::helper_pod::stale_helper_reason(&pod) {
@@ -379,10 +386,27 @@ impl KubeRsExec {
             backup_core::helper_pod::replacing_stale_helper_note(ns, name, &stale)
         );
         self.delete_and_wait_gone(api, name, ns).await?;
+        let _in_flight = self.begin_helper_apply(spec, ns, name)?;
         api.patch(name, &pp, &Patch::Apply(spec))
             .await
             .map_err(apply_error)?;
         Ok(())
+    }
+
+    /// Record `spec` in the live set as an apply under way, when it is a
+    /// backup helper pod (only those are the stop's to delete); refused once
+    /// the stop has begun ([`crate::stop::LiveHelperPods`]).
+    fn begin_helper_apply(
+        &self,
+        spec: &Value,
+        ns: &str,
+        name: &str,
+    ) -> Result<Option<crate::stop::ApplyInFlight>> {
+        if is_backup_helper(spec) {
+            self.live_helpers.begin_apply(ns, name).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Delete a stale helper pod and wait until it is gone, within
@@ -432,16 +456,12 @@ impl KubeExec for KubeRsExec {
     fn apply_and_wait_pod_ready(&self, spec: &Value) -> Result<()> {
         self.rt.block_on(async {
             let (name, ns) = pod_identity(spec)?;
-            // Tracked BEFORE the apply: a pod whose apply went through and
-            // whose Ready wait is still running is the run's to delete too.
-            if is_backup_helper(spec) {
-                self.live_helpers.insert(&ns, &name);
-            }
-
             let api: Api<Pod> = Api::namespaced(self.client.clone(), &ns);
 
             // Server-side apply (mirrors `kubectl apply -f -`), over a stale
-            // leftover of the same name if there is one.
+            // leftover of the same name if there is one. A helper pod is
+            // tracked from BEFORE its apply: one whose apply went through and
+            // whose Ready wait is still running is the run's to delete too.
             self.apply_replacing_stale(&api, &name, &ns, spec).await?;
 
             // Poll until Running + Ready (mirrors `kubectl wait
@@ -1666,12 +1686,23 @@ mod tests {
         path: String,
         replies: Vec<(u16, String)>,
         hits: std::sync::atomic::AtomicUsize,
+        /// Run on every request the route answers, before it answers: what a
+        /// test needs to happen at exactly that point of the exchange.
+        on_hit: Option<Box<dyn Fn() + Send + Sync>>,
     }
 
     impl Route {
         fn next_reply(&self) -> (u16, String) {
+            if let Some(hook) = &self.on_hit {
+                hook();
+            }
             let n = self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.replies[n.min(self.replies.len() - 1)].clone()
+        }
+
+        fn on_hit(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+            self.on_hit = Some(Box::new(hook));
+            self
         }
     }
 
@@ -1684,6 +1715,7 @@ mod tests {
                 .map(|(code, body)| (code, body.to_string()))
                 .collect(),
             hits: std::sync::atomic::AtomicUsize::new(0),
+            on_hit: None,
         }
     }
 
@@ -2083,6 +2115,81 @@ mod tests {
         assert!(live.snapshot().is_empty(), "{:?}", live.snapshot());
     }
 
+    /// Once the stop has begun, no helper pod is applied — not a single
+    /// request goes out — while a pod without the helper label still is.
+    #[test]
+    fn no_helper_pod_is_applied_once_the_run_is_being_stopped() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let h = Harness::new(vec![
+            ok_route("PATCH", path, running_ready_pod()),
+            ok_route("GET", path, running_ready_pod()),
+        ]);
+        h.exec.live_helper_pods().close();
+        let mut spec = helper_pod_spec();
+        spec["metadata"]["labels"] = json!({"apprafter.io/backup-helper": "true"});
+
+        let err = h
+            .exec
+            .apply_and_wait_pod_ready(&spec)
+            .expect_err("a helper pod is not applied once the run is being stopped");
+        assert!(err.to_string().contains("being stopped"), "{err}");
+        assert!(h.seen().is_empty(), "{:?}", h.seen());
+        assert!(h.exec.live_helper_pods().snapshot().is_empty());
+
+        h.exec
+            .apply_and_wait_pod_ready(&helper_pod_spec())
+            .expect("a pod that is not a backup helper is not the stop's");
+    }
+
+    /// The re-apply after a leftover's replacement is refused too, when the
+    /// stop begins while the leftover is being deleted.
+    #[test]
+    fn a_leftovers_replacement_is_not_created_once_the_run_is_being_stopped() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let live = Arc::new(Mutex::new(None::<crate::stop::LiveHelperPods>));
+        let stop = Arc::clone(&live);
+        let h = Harness::new(vec![
+            seq_route(
+                "PATCH",
+                path,
+                vec![
+                    (200, pod_in_phase("Succeeded")),
+                    (200, pod_in_phase("Pending")),
+                ],
+            ),
+            // The stop begins as the leftover is deleted.
+            ok_route("DELETE", path, pod_in_phase("Succeeded")).on_hit(move || {
+                if let Some(live) = stop.lock().unwrap().as_ref() {
+                    live.close();
+                }
+            }),
+            seq_route("GET", path, vec![not_found(), (200, running_ready_pod())]),
+        ]);
+        *live.lock().unwrap() = Some(h.exec.live_helper_pods());
+        let mut spec = helper_pod_spec();
+        spec["metadata"]["labels"] = json!({"apprafter.io/backup-helper": "true"});
+
+        let err = h
+            .exec
+            .apply_and_wait_pod_ready(&spec)
+            .expect_err("the replacement is not created once the stop has begun");
+        assert!(err.to_string().contains("being stopped"), "{err}");
+        let seen: Vec<String> = h
+            .seen()
+            .iter()
+            .map(|r| r.split('?').next().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                format!("PATCH {path}"),
+                format!("DELETE {path}"),
+                format!("GET {path}"),
+            ],
+            "no second PATCH"
+        );
+    }
+
     /// A rejected apply must abort immediately — never fall through into the
     /// readiness poll, where a stale pod of the same name from an earlier run
     /// could report Ready and let the backup dump the WRONG database.
@@ -2337,6 +2444,7 @@ mod tests {
             path: path.to_string(),
             replies: vec![(404, "404 page not found\n".to_string())],
             hits: std::sync::atomic::AtomicUsize::new(0),
+            on_hit: None,
         });
         let h = Harness::new(routes);
 

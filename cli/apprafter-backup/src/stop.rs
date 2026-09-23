@@ -12,7 +12,9 @@
 //! On SIGTERM the runner now, within that grace period:
 //!
 //! 1. deletes the helper pods it has applied and not yet deleted — which also
-//!    ends the exec the run was blocked in;
+//!    ends the exec the run was blocked in — after refusing every later apply
+//!    and waiting out the one under way, so that the main thread, still
+//!    running until that exec fails, cannot leave a pod behind the list;
 //! 2. records the failure in the status ConfigMap (`lastFailure`, `lastError`);
 //! 3. posts the failure webhook;
 //! 4. exits 1.
@@ -62,33 +64,115 @@ pub const DEADLINE_START_ALLOWANCE: Duration = Duration::from_secs(300);
 /// The helper pods a run has applied and not yet deleted, as
 /// `(namespace, name)`. Shared between the exec layer, which adds and removes
 /// them, and the stop, which deletes what is left.
+///
+/// The stop's view of them has to be complete, and the run's main thread
+/// keeps going while the stop runs: it ends only once the stop has made the
+/// exec it is blocked in fail. Two things close that race:
+///
+/// * [`LiveHelperPods::close`] — the stop's first step — makes every later
+///   [`LiveHelperPods::begin_apply`] fail, so no helper pod is applied after
+///   the stop has started, whatever the main thread moves on to (the next
+///   claim's dump, a leftover's replacement).
+/// * An apply already under way when the stop starts is waited for
+///   ([`LiveHelperPods::applies_in_flight`]) before the stop deletes: a delete
+///   that reached the apiserver before that apply's PATCH would answer 404,
+///   and the PATCH would then create the pod after all.
 #[derive(Clone, Debug, Default)]
-pub struct LiveHelperPods(Arc<Mutex<BTreeSet<(String, String)>>>);
+pub struct LiveHelperPods(Arc<Mutex<LiveHelperState>>);
+
+#[derive(Debug, Default)]
+struct LiveHelperState {
+    pods: BTreeSet<(String, String)>,
+    /// Applies begun and not yet answered.
+    applying: usize,
+    /// Set by the stop; no apply begins after it.
+    stopping: bool,
+}
+
+/// An apply of a helper pod under way: held for exactly as long as its
+/// PATCH, which the stop waits out before it deletes.
+#[must_use = "the apply counts as under way only while this is held"]
+pub struct ApplyInFlight(LiveHelperPods);
+
+impl Drop for ApplyInFlight {
+    fn drop(&mut self) {
+        let mut state = self.0.lock();
+        state.applying = state.applying.saturating_sub(1);
+    }
+}
 
 impl LiveHelperPods {
-    /// Record a helper pod about to be applied.
-    pub fn insert(&self, namespace: &str, name: &str) {
-        self.lock()
-            .insert((namespace.to_string(), name.to_string()));
+    /// Record a helper pod about to be applied, and count its apply as under
+    /// way until the returned guard drops. Fails once the stop has begun: the
+    /// run is over, and a pod applied now would outlive it.
+    pub fn begin_apply(&self, namespace: &str, name: &str) -> cli_core::Result<ApplyInFlight> {
+        let mut state = self.lock();
+        if state.stopping {
+            return Err(cli_core::CliError::Other(format!(
+                "the run is being stopped, so helper pod {namespace}/{name} was not applied"
+            )));
+        }
+        state.pods.insert((namespace.to_string(), name.to_string()));
+        state.applying += 1;
+        Ok(ApplyInFlight(self.clone()))
     }
 
     /// Forget a helper pod that has been deleted.
     pub fn remove(&self, namespace: &str, name: &str) {
         self.lock()
+            .pods
             .remove(&(namespace.to_string(), name.to_string()));
     }
 
     /// The helper pods live right now.
     pub fn snapshot(&self) -> Vec<(String, String)> {
-        self.lock().iter().cloned().collect()
+        self.lock().pods.iter().cloned().collect()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeSet<(String, String)>> {
-        // A panic while holding this lock cannot leave the set half-updated
-        // (every operation is one call on it), so a poisoned lock is still a
-        // good set.
+    /// Refuse every apply from now on ([`Self::begin_apply`]).
+    pub fn close(&self) {
+        self.lock().stopping = true;
+    }
+
+    /// How many applies have begun and not yet been answered.
+    pub fn applies_in_flight(&self) -> usize {
+        self.lock().applying
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LiveHelperState> {
+        // A panic while holding this lock cannot leave the state half-updated
+        // (every operation is one step on it), so a poisoned lock is still a
+        // good state.
         self.0.lock().unwrap_or_else(|p| p.into_inner())
     }
+}
+
+/// The most the stop waits for applies already under way to be answered
+/// before it deletes; part of [`HELPER_DELETE_BOUND`]. A PATCH takes
+/// milliseconds; one that takes longer than this is not waited for, and the
+/// pod it may yet create is the one this cannot catch.
+pub const HELPER_APPLY_SETTLE_BOUND: Duration = Duration::from_secs(5);
+
+/// The helper pods the stop must delete: refuse every later apply, wait up to
+/// `settle` for the ones under way, then take what is live.
+pub async fn helper_pods_to_delete(
+    live: &LiveHelperPods,
+    settle: Duration,
+) -> Vec<(String, String)> {
+    live.close();
+    let deadline = tokio::time::Instant::now() + settle;
+    while live.applies_in_flight() > 0 {
+        if tokio::time::Instant::now() >= deadline {
+            eprintln!(
+                "stop: {} helper-pod apply(s) still unanswered after {}s; deleting what is known",
+                live.applies_in_flight(),
+                settle.as_secs()
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    live.snapshot()
 }
 
 /// Which of the two writers records the run's outcome: the run, when it ends
@@ -173,21 +257,26 @@ pub async fn stop_run(ctx: &StopContext) -> RunOutcome {
     //    `client_connection_check_interval`
     //    (`backup_core::extract::PG_HELPER_PGOPTIONS`). Without that, the
     //    session would outlive the kill.
-    let pods = ctx.live_helpers.snapshot();
-    let deletes = pods.iter().map(|(ns, name)| {
-        let api: Api<Pod> = Api::namespaced(ctx.client.clone(), ns);
-        async move {
-            let dp = DeleteParams {
-                grace_period_seconds: Some(0),
-                ..DeleteParams::default()
-            };
-            match api.delete(name, &dp).await {
-                Ok(_) => eprintln!("stop: deleted helper pod {ns}/{name}"),
-                Err(e) => eprintln!("stop: delete helper pod {ns}/{name}: {e}"),
+    //    First every apply is refused and the ones under way are waited out,
+    //    so the set is complete (see `LiveHelperPods`).
+    let delete_helpers = async {
+        let pods = helper_pods_to_delete(&ctx.live_helpers, HELPER_APPLY_SETTLE_BOUND).await;
+        let deletes = pods.iter().map(|(ns, name)| {
+            let api: Api<Pod> = Api::namespaced(ctx.client.clone(), ns);
+            async move {
+                let dp = DeleteParams {
+                    grace_period_seconds: Some(0),
+                    ..DeleteParams::default()
+                };
+                match api.delete(name, &dp).await {
+                    Ok(_) => eprintln!("stop: deleted helper pod {ns}/{name}"),
+                    Err(e) => eprintln!("stop: delete helper pod {ns}/{name}: {e}"),
+                }
             }
-        }
-    });
-    if tokio::time::timeout(HELPER_DELETE_BOUND, futures::future::join_all(deletes))
+        });
+        futures::future::join_all(deletes).await;
+    };
+    if tokio::time::timeout(HELPER_DELETE_BOUND, delete_helpers)
         .await
         .is_err()
     {
@@ -334,12 +423,85 @@ mod tests {
     #[test]
     fn the_live_set_forgets_a_deleted_pod() {
         let live = LiveHelperPods::default();
-        live.insert("demo", "bk-pg-db");
-        live.insert("demo", "bk-vol-uploads");
+        drop(live.begin_apply("demo", "bk-pg-db").unwrap());
+        drop(live.begin_apply("demo", "bk-vol-uploads").unwrap());
         live.remove("demo", "bk-pg-db");
         assert_eq!(
             live.snapshot(),
             vec![("demo".to_string(), "bk-vol-uploads".to_string())]
         );
+    }
+
+    #[test]
+    fn no_helper_pod_is_applied_once_the_stop_has_begun() {
+        let live = LiveHelperPods::default();
+        let first = live.begin_apply("demo", "bk-pg-a").unwrap();
+        assert_eq!(live.applies_in_flight(), 1);
+        drop(first);
+        assert_eq!(live.applies_in_flight(), 0);
+
+        live.close();
+        let err = live
+            .begin_apply("demo", "bk-pg-b")
+            .err()
+            .expect("an apply after the stop has begun is refused");
+        assert!(err.to_string().contains("being stopped"), "{err}");
+        assert!(err.to_string().contains("demo/bk-pg-b"), "{err}");
+        // …and it was never recorded as live, nor as under way.
+        assert_eq!(
+            live.snapshot(),
+            vec![("demo".to_string(), "bk-pg-a".to_string())]
+        );
+        assert_eq!(live.applies_in_flight(), 0);
+    }
+
+    /// The stop takes its list only once an apply that was under way has been
+    /// answered: deleting before that PATCH lands answers 404, and the PATCH
+    /// then creates the pod after all.
+    #[test]
+    fn the_stop_waits_for_an_apply_under_way_before_it_lists_the_pods() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let live = LiveHelperPods::default();
+        let in_flight = live.begin_apply("demo", "bk-pg-db").unwrap();
+        let answered = Arc::new(AtomicBool::new(false));
+        let apply = {
+            let answered = Arc::clone(&answered);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                answered.store(true, Ordering::SeqCst);
+                drop(in_flight);
+            })
+        };
+        let started = Instant::now();
+        let pods = rt.block_on(helper_pods_to_delete(&live, Duration::from_secs(5)));
+        assert!(
+            answered.load(Ordering::SeqCst),
+            "the list was taken before the apply under way was answered"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert_eq!(pods, vec![("demo".to_string(), "bk-pg-db".to_string())]);
+        apply.join().unwrap();
+        assert!(live.begin_apply("demo", "bk-pg-next").is_err());
+    }
+
+    /// An apply that is never answered does not hold the stop past its bound.
+    #[test]
+    fn an_unanswered_apply_holds_the_stop_only_for_its_bound() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let live = LiveHelperPods::default();
+        let _stuck = live.begin_apply("demo", "bk-pg-db").unwrap();
+        let started = Instant::now();
+        let pods = rt.block_on(helper_pods_to_delete(&live, Duration::from_millis(200)));
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(200) && took < Duration::from_secs(2),
+            "{took:?}"
+        );
+        assert_eq!(pods, vec![("demo".to_string(), "bk-pg-db".to_string())]);
+    }
+
+    #[test]
+    fn waiting_out_applies_is_part_of_the_helper_delete_bound() {
+        assert!(HELPER_APPLY_SETTLE_BOUND < HELPER_DELETE_BOUND);
     }
 }
