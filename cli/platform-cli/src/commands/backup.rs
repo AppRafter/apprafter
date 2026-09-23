@@ -1109,18 +1109,27 @@ fn copy_exec_stdout<R: Read>(
     Ok(())
 }
 
-impl KubeExec for KubectlExec {
-    fn apply_and_wait_pod_ready(&self, spec: &serde_json::Value) -> Result<()> {
-        let name = spec["metadata"]["name"]
-            .as_str()
-            .ok_or_else(|| CliError::Other("pod spec missing metadata.name".into()))?;
-        let ns = spec["metadata"]["namespace"]
-            .as_str()
-            .ok_or_else(|| CliError::Other("pod spec missing metadata.namespace".into()))?;
+/// What `kubectl apply` answered: [`KubectlExec::kubectl_apply`].
+enum ApplyAnswer {
+    Applied,
+    /// kubectl ran and refused: its error, and its whole stderr.
+    Refused {
+        error: CliError,
+        stderr: String,
+    },
+}
 
-        let json_bytes = serde_json::to_vec(spec)
-            .map_err(|e| CliError::Other(format!("serialize pod spec: {e}")))?;
-
+impl KubectlExec {
+    /// `kubectl apply -f - -n <ns>` with `json_bytes` on stdin.
+    ///
+    /// A refusal comes with kubectl's WHOLE stderr beside its error. The
+    /// error keeps the last lines, which is where a failing command usually
+    /// explains itself; the apiserver's refusal of a pod update that cannot
+    /// change in place is the FIRST line, above a unified diff of the pod spec
+    /// with a hunk per changed field (a changed `sleep` alone is ten lines on
+    /// Kubernetes 1.35), which a helper built by another version can run past
+    /// the lines the error keeps. The caller needs that first line.
+    fn kubectl_apply(&self, ns: &str, json_bytes: &[u8]) -> Result<ApplyAnswer> {
         let mut apply_child = Command::new(&self.kubectl_bin)
             .args(["apply", "-f", "-", "-n", ns])
             .env("KUBECONFIG", &self.kubeconfig)
@@ -1149,28 +1158,163 @@ impl KubeExec for KubectlExec {
                 .stdin
                 .take()
                 .ok_or_else(|| CliError::Other("kubectl apply has no stdin".into()))?;
-            stdin.write_all(&json_bytes)
+            stdin.write_all(json_bytes)
             // `stdin` drops here, closing the pipe — the child needs that EOF
             // to finish, so it must happen before the `wait()` below.
         };
 
-        let apply_stderr = apply_child
+        let mut apply_stderr = apply_child
             .stderr
             .take()
             .ok_or_else(|| CliError::Other("kubectl apply has no stderr".into()))?;
-        let apply_stderr_buf = spawn_capturing_drainer(apply_stderr);
+        // Read whole, on its own thread so a long stderr cannot block kubectl.
+        let stderr_reader = thread::spawn(move || {
+            let mut text = String::new();
+            let _ = apply_stderr.read_to_string(&mut text);
+            text
+        });
         let apply_status = apply_child
             .wait()
             .map_err(|e| CliError::Other(format!("wait kubectl apply: {e}")))?;
+        // kubectl has exited, so its stderr is at EOF (it starts no children).
+        let stderr = stderr_reader.join().unwrap_or_default();
         if !apply_status.success() {
-            return Err(format_exec_error(
+            let tail: Vec<String> = stderr
+                .lines()
+                .rev()
+                .take(STDERR_CAPTURE_LIMIT)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let error = format_exec_error(
                 "apply_and_wait_pod_ready(apply)",
                 apply_status,
-                &apply_stderr_buf,
-            ));
+                &Arc::new(Mutex::new(tail)),
+            );
+            return Ok(ApplyAnswer::Refused { error, stderr });
         }
         write_result
             .map_err(|e| CliError::Other(format!("write pod spec to kubectl apply: {e}")))?;
+        Ok(ApplyAnswer::Applied)
+    }
+
+    /// The pod `name` in `ns` as JSON, or `None` when there is none
+    /// (`--ignore-not-found`: kubectl then prints nothing and exits 0).
+    fn get_pod_if_present(&self, name: &str, ns: &str) -> Result<Option<serde_json::Value>> {
+        let out = Command::new(&self.kubectl_bin)
+            .args([
+                "get",
+                "pod",
+                name,
+                "-n",
+                ns,
+                "--ignore-not-found",
+                "-o",
+                "json",
+            ])
+            .env("KUBECONFIG", &self.kubeconfig)
+            .output()
+            .map_err(|e| CliError::Other(format!("spawn kubectl get pod: {e}")))?;
+        if !out.status.success() {
+            return Err(CliError::Other(format!(
+                "kubectl get pod {name} -n {ns} failed (exit {:?}): {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        if out.stdout.iter().all(u8::is_ascii_whitespace) {
+            return Ok(None);
+        }
+        serde_json::from_slice(&out.stdout).map(Some).map_err(|e| {
+            CliError::Other(format!("kubectl get pod {name} -n {ns}: JSON parse: {e}"))
+        })
+    }
+
+    /// Delete a stale helper pod and wait until it is gone, within
+    /// [`backup_core::helper_pod::STALE_POD_GONE_WITHIN`] (`kubectl delete
+    /// --wait` watches the pod until it has).
+    fn delete_and_wait_gone(&self, name: &str, ns: &str) -> Result<()> {
+        let bound = backup_core::helper_pod::STALE_POD_GONE_WITHIN.as_secs();
+        let out = Command::new(&self.kubectl_bin)
+            .args([
+                "delete",
+                "pod",
+                name,
+                "-n",
+                ns,
+                "--ignore-not-found",
+                &format!(
+                    "--grace-period={}",
+                    backup_core::helper_pod::STALE_POD_DELETE_GRACE_SECONDS
+                ),
+                "--wait=true",
+                &format!("--timeout={bound}s"),
+            ])
+            .env("KUBECONFIG", &self.kubeconfig)
+            .output()
+            .map_err(|e| CliError::Other(format!("spawn kubectl delete pod: {e}")))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        Err(CliError::Other(format!(
+            "the stale helper pod {name} in {ns} was not gone {bound}s after it was deleted \
+             (its node may be unreachable); delete it with `kubectl delete pod {name} -n {ns} \
+             --force --grace-period=0` and run again. kubectl: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
+}
+
+impl KubeExec for KubectlExec {
+    fn apply_and_wait_pod_ready(&self, spec: &serde_json::Value) -> Result<()> {
+        let name = spec["metadata"]["name"]
+            .as_str()
+            .ok_or_else(|| CliError::Other("pod spec missing metadata.name".into()))?;
+        let ns = spec["metadata"]["namespace"]
+            .as_str()
+            .ok_or_else(|| CliError::Other("pod spec missing metadata.namespace".into()))?;
+
+        let json_bytes = serde_json::to_vec(spec)
+            .map_err(|e| CliError::Other(format!("serialize pod spec: {e}")))?;
+
+        // A pod of this name left from an earlier run is replaced rather than
+        // applied over: an ended one never becomes Ready, and one being
+        // deleted is about to go (backup_core::helper_pod::stale_helper_reason).
+        if let Some(existing) = self.get_pod_if_present(name, ns)? {
+            if let Some(why) = backup_core::helper_pod::stale_helper_reason(&existing) {
+                eprintln!(
+                    "{}",
+                    backup_core::helper_pod::replacing_stale_helper_note(ns, name, &why)
+                );
+                self.delete_and_wait_gone(name, ns)?;
+            }
+        }
+
+        // So is one whose spec this one cannot be applied over — an older
+        // CLI's or runner's, with another keep-alive or env.
+        match self.kubectl_apply(ns, &json_bytes)? {
+            ApplyAnswer::Applied => {}
+            ApplyAnswer::Refused { stderr, .. }
+                if backup_core::helper_pod::is_immutable_pod_update(&stderr) =>
+            {
+                eprintln!(
+                    "{}",
+                    backup_core::helper_pod::replacing_stale_helper_note(
+                        ns,
+                        name,
+                        "was created with a spec this command's cannot be applied over (an \
+                         earlier run of another version, or with another keep-alive)",
+                    )
+                );
+                self.delete_and_wait_gone(name, ns)?;
+                if let ApplyAnswer::Refused { error, .. } = self.kubectl_apply(ns, &json_bytes)? {
+                    return Err(error);
+                }
+            }
+            ApplyAnswer::Refused { error, .. } => return Err(error),
+        }
 
         let wait_status = Command::new(&self.kubectl_bin)
             .args([
@@ -1655,7 +1799,8 @@ pub fn run_backup(
     // scheduled backup of the same cluster may run: the same number bounds
     // one extraction either way. For a helper pod this command was killed
     // before deleting, it ends the pod's process; the Pod object stays,
-    // `Completed` (see `backup_core::helper_pod`).
+    // `Completed`, until the next command or run that needs it replaces it
+    // (see `backup_core::helper_pod`).
     let helper_keep_alive = backup_core::engine::read_run_deadline(&k)?;
 
     // Stage everything under a tempdir; the engine writes data/ under this root.
@@ -10148,6 +10293,288 @@ mod tests {
         );
     }
 
+    /// A stub kubectl that logs every call and plays a pod named `helper`:
+    /// `get` prints `pod` (a JSON document, or nothing: absent) until a
+    /// `delete` removes it, `apply` runs `apply` (a shell snippet; it must
+    /// read stdin), and `wait` succeeds.
+    fn stateful_stub(dir: &tempfile::TempDir, pod: &str, apply: &str) -> (KubectlExec, PathBuf) {
+        let log = dir.path().join("argv");
+        let present = dir.path().join("present.json");
+        if !pod.is_empty() {
+            std::fs::write(&present, pod).unwrap();
+        }
+        let k = stub_kubectl(
+            dir,
+            &format!(
+                "echo \"$@\" >> {log}\n\
+                 case \"$1\" in\n\
+                 get) cat {present} 2>/dev/null; exit 0;;\n\
+                 delete) rm -f {present}; exit 0;;\n\
+                 apply) {apply};;\n\
+                 wait) exit 0;;\n\
+                 esac",
+                log = log.display(),
+                present = present.display(),
+            ),
+        );
+        (k, log)
+    }
+
+    fn calls(log: &Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|l| l.split(' ').next().unwrap().to_string())
+            .collect()
+    }
+
+    const HELPER: &str = r#"{"metadata": {"name": "helper", "namespace": "prod"}}"#;
+
+    /// A helper pod left behind `Completed` by an earlier run never becomes
+    /// Ready again, so applying over it used to cost the whole five-minute
+    /// wait and then the run. It is deleted, waited out, and created again.
+    #[test]
+    fn an_ended_leftover_helper_is_deleted_and_created_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (k, log) = stateful_stub(
+            &dir,
+            r#"{"metadata": {"name": "helper"}, "status": {"phase": "Succeeded"}}"#,
+            "cat >/dev/null; exit 0",
+        );
+        let spec: Value = serde_json::from_str(HELPER).unwrap();
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+
+        assert_eq!(calls(&log), vec!["get", "delete", "apply", "wait"]);
+        let argv = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            argv.contains("get pod helper -n prod --ignore-not-found -o json"),
+            "{argv}"
+        );
+        // A short grace (its `sleep` ignores SIGTERM) and a wait until it has
+        // gone, bounded — the new pod cannot be created while it is there.
+        assert!(
+            argv.contains(
+                "delete pod helper -n prod --ignore-not-found --grace-period=1 --wait=true \
+                 --timeout=60s"
+            ),
+            "{argv}"
+        );
+    }
+
+    /// A pod that is still running is used as it is: a same-spec apply over
+    /// it changes nothing, and deleting it would kill whatever runs in it.
+    #[test]
+    fn a_running_helper_of_the_same_spec_is_applied_over_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (k, log) = stateful_stub(
+            &dir,
+            r#"{"metadata": {"name": "helper"}, "status": {"phase": "Running"}}"#,
+            "cat >/dev/null; exit 0",
+        );
+        let spec: Value = serde_json::from_str(HELPER).unwrap();
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(calls(&log), vec!["get", "apply", "wait"]);
+    }
+
+    /// A leftover whose spec cannot be applied over — an older CLI's or
+    /// runner's — is refused by the apiserver on the FIRST line of kubectl's
+    /// stderr, above a diff of the pod spec that can run longer than the lines
+    /// an error keeps (sixty here). It is replaced all the same.
+    #[test]
+    fn a_leftover_whose_spec_cannot_change_in_place_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let refused = dir.path().join("refused-once");
+        let (k, log) = stateful_stub(
+            &dir,
+            r#"{"metadata": {"name": "helper"}, "status": {"phase": "Running"}}"#,
+            &format!(
+                "cat >/dev/null\n\
+                 if [ ! -f {refused} ]; then\n\
+                   touch {refused}\n\
+                   echo 'The Pod \"helper\" is invalid: spec: Forbidden: pod updates may not \
+                 change fields other than `spec.containers[*].image`' >&2\n\
+                   i=0; while [ $i -lt 60 ]; do echo \"  diff line $i\" >&2; i=$((i+1)); done\n\
+                   exit 1\n\
+                 fi\n\
+                 exit 0",
+                refused = refused.display()
+            ),
+        );
+        let spec: Value = serde_json::from_str(HELPER).unwrap();
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(calls(&log), vec!["get", "apply", "delete", "apply", "wait"]);
+    }
+
+    /// Every other apply failure is the run's own, and nothing is deleted.
+    #[test]
+    fn another_apply_failure_deletes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (k, log) = stateful_stub(
+            &dir,
+            r#"{"metadata": {"name": "helper"}, "status": {"phase": "Running"}}"#,
+            "cat >/dev/null; echo 'The Pod \"helper\" is invalid: metadata.name' >&2; exit 1",
+        );
+        let spec: Value = serde_json::from_str(HELPER).unwrap();
+        let msg = k.apply_and_wait_pod_ready(&spec).unwrap_err().to_string();
+        assert!(msg.contains("metadata.name"), "{msg}");
+        assert_eq!(calls(&log), vec!["get", "apply"]);
+    }
+
+    /// A stale pod that will not go — its node unreachable — stops the step
+    /// with the way out, rather than applying over it.
+    #[test]
+    fn a_stale_helper_that_will_not_go_fails_with_the_way_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv");
+        let k = stub_kubectl(
+            &dir,
+            &format!(
+                "echo \"$@\" >> {log}\n\
+                 case \"$1\" in\n\
+                 get) echo '{{\"metadata\": {{\"name\": \"helper\", \"deletionTimestamp\": \
+                 \"2026-09-23T00:00:00Z\"}}}}'; exit 0;;\n\
+                 delete) echo 'error: timed out waiting for the condition' >&2; exit 1;;\n\
+                 *) cat >/dev/null; exit 0;;\n\
+                 esac",
+                log = log.display()
+            ),
+        );
+        let spec: Value = serde_json::from_str(HELPER).unwrap();
+        let msg = k.apply_and_wait_pod_ready(&spec).unwrap_err().to_string();
+        assert!(
+            msg.contains("was not gone 60s after it was deleted"),
+            "{msg}"
+        );
+        assert!(msg.contains("--force --grace-period=0"), "{msg}");
+        assert!(msg.contains("timed out waiting for the condition"), "{msg}");
+        assert_eq!(calls(&log), vec!["get", "delete"]);
+    }
+
+    /// Real-apiserver proof of the same replacement through `kubectl`: the
+    /// ended pod as `kubectl get` shows it, and the apiserver's refusal to
+    /// change a pod's spec in place as `kubectl apply` prints it — first line
+    /// of a long stderr. Skipped by default; opt in against a DISPOSABLE kind
+    /// cluster:
+    ///
+    /// ```text
+    /// APPRAFTER_K8S_SMOKE=1 KUBECONFIG=<kind kubeconfig> cargo test -p apprafter \
+    ///     --lib a_leftover_helper_pod_is_replaced_through_kubectl_on_kind -- --ignored
+    /// ```
+    ///
+    /// Refuses any context that is not `kind-*`. The helper image,
+    /// `docker.io/library/alpine:3.24`, is pulled `IfNotPresent`.
+    #[test]
+    #[ignore = "needs a kind cluster: APPRAFTER_K8S_SMOKE=1 KUBECONFIG=<kind kubeconfig>"]
+    fn a_leftover_helper_pod_is_replaced_through_kubectl_on_kind() {
+        const NS: &str = "apprafter-stale-helper-kubectl";
+        const POD: &str = "bk-vol-stale";
+        // Explicitly opted in, so a missing precondition is a FAILURE.
+        assert_eq!(
+            std::env::var("APPRAFTER_K8S_SMOKE").as_deref(),
+            Ok("1"),
+            "run with APPRAFTER_K8S_SMOKE=1 (this test creates objects in the cluster)"
+        );
+        let kubeconfig = PathBuf::from(
+            std::env::var_os("KUBECONFIG").expect("KUBECONFIG must name the kind kubeconfig"),
+        );
+        let kubectl = |args: &[&str]| {
+            let out = Command::new("kubectl")
+                .args(args)
+                .env("KUBECONFIG", &kubeconfig)
+                .output()
+                .expect("run kubectl");
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            )
+        };
+        let (_, ctx) = kubectl(&["config", "current-context"]);
+        assert!(
+            ctx.starts_with("kind-"),
+            "refusing to run against context {ctx:?}: this test only targets kind clusters"
+        );
+        struct DeleteNs<'a>(&'a Path);
+        impl Drop for DeleteNs<'_> {
+            fn drop(&mut self) {
+                let _ = Command::new("kubectl")
+                    .args(["delete", "namespace", NS, "--wait=false"])
+                    .env("KUBECONFIG", self.0)
+                    .output();
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        while kubectl(&["get", "namespace", NS, "-o", "jsonpath={.status.phase}"]).1
+            == "Terminating"
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{NS} stuck Terminating"
+            );
+            thread::sleep(Duration::from_secs(1));
+        }
+        let _ = kubectl(&["create", "namespace", NS]);
+        let _cleanup = DeleteNs(&kubeconfig);
+
+        let k = KubectlExec::new(kubeconfig.clone());
+        let helper = |secs: u64| {
+            json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": POD, "namespace": NS,
+                             "labels": {"apprafter.io/backup-helper": "true"}},
+                "spec": {"restartPolicy": "Never", "containers": [{
+                    "name": "dump", "image": "docker.io/library/alpine:3.24",
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": ["sleep", secs.to_string()]}]}
+            })
+        };
+        let field = |path: &str| kubectl(&["get", "pod", POD, "-n", NS, "-o", path]).1;
+
+        // An ENDED leftover of the same spec.
+        k.apply_and_wait_pod_ready(&helper(3))
+            .expect("first helper Ready");
+        let ended = field("jsonpath={.metadata.uid}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while field("jsonpath={.status.phase}") != "Succeeded" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the 3 s helper never ended"
+            );
+            thread::sleep(Duration::from_secs(1));
+        }
+        let started = std::time::Instant::now();
+        k.apply_and_wait_pod_ready(&helper(3))
+            .expect("an ended leftover is replaced");
+        let took = started.elapsed();
+        assert_ne!(field("jsonpath={.metadata.uid}"), ended);
+        assert!(took < Duration::from_secs(90), "took {took:?}");
+        eprintln!("kubectl: ended leftover replaced in {took:?}");
+
+        // A RUNNING leftover whose spec cannot change in place.
+        let _ = kubectl(&[
+            "delete",
+            "pod",
+            POD,
+            "-n",
+            NS,
+            "--grace-period=1",
+            "--wait=true",
+        ]);
+        k.apply_and_wait_pod_ready(&helper(3600))
+            .expect("the old helper Ready");
+        let old = field("jsonpath={.metadata.uid}");
+        let started = std::time::Instant::now();
+        k.apply_and_wait_pod_ready(&helper(21600))
+            .expect("a leftover with another keep-alive is replaced");
+        let took = started.elapsed();
+        assert_ne!(field("jsonpath={.metadata.uid}"), old);
+        assert_eq!(
+            field("jsonpath={.spec.containers[0].command}"),
+            r#"["sleep","21600"]"#
+        );
+        assert!(took < Duration::from_secs(90), "took {took:?}");
+        eprintln!("kubectl: running leftover with another spec replaced in {took:?}");
+    }
+
     #[test]
     fn a_pod_spec_without_an_identity_is_refused_before_kubectl_is_spawned() {
         let dir = tempfile::tempdir().unwrap();
@@ -10187,11 +10614,13 @@ mod tests {
         assert!(msg.contains("did not reach Ready within 300s"), "{msg}");
         assert!(msg.contains("helper") && msg.contains("prod"), "{msg}");
 
-        // apply itself fails → the apiserver's own complaint is carried.
+        // apply itself fails → the apiserver's own complaint is carried. (The
+        // look for a leftover pod before it finds none.)
         let dir2 = tempfile::tempdir().unwrap();
         let applies = stub_kubectl(
             &dir2,
-            "cat >/dev/null\necho 'error: forbidden: pods is forbidden' >&2\nexit 1",
+            "if [ \"$1\" = apply ]; then\n  cat >/dev/null\n  \
+             echo 'error: forbidden: pods is forbidden' >&2\n  exit 1\nfi\nexit 0",
         );
         let err = applies.apply_and_wait_pod_ready(&spec).unwrap_err();
         let msg = format!("{err}");

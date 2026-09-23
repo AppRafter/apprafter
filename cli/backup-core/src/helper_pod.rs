@@ -26,9 +26,10 @@
 //! cleanup ran), the keep-alive ends the pod's process, not the Pod: with
 //! `restartPolicy: Never` the object stays behind, `Completed`, until
 //! something deletes it. The next run that applies a helper pod of that name
-//! (the same step for the same claim) fails on it: an unchanged spec applies,
-//! and the pod never becomes Ready within the five-minute wait. A backup's
-//! cleanup deletes it then, so it costs one failed run.
+//! (the same step for the same claim) deletes it and creates its own
+//! ([`stale_helper_reason`]); so does a run that finds one it cannot apply
+//! over, built by another version with another spec. Applying over it used to
+//! fail that run, after the whole five-minute Ready wait.
 //!
 //! # Impure forwarding helpers
 //!
@@ -231,6 +232,68 @@ pub fn shell_single_quote(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// A helper pod left from an earlier run
+// ---------------------------------------------------------------------------
+
+/// Why an existing pod with a helper pod's name cannot serve as that helper
+/// and has to be deleted and created again; `None` when it can. Pure — both
+/// [`KubeExec::apply_and_wait_pod_ready`] implementations ask it.
+///
+/// * **Ended** (`Succeeded` or `Failed`): a helper pod has `restartPolicy:
+///   Never`, so once its keep-alive has run out, or its node lost it, it never
+///   runs again. Applying the same spec over it changes nothing, and it never
+///   becomes Ready; that used to fail the run that needed it after the whole
+///   five-minute Ready wait.
+/// * **Being deleted**: it is going away; the new one is created once it has.
+///
+/// A pod that is still running is not stale by this test: a run that applies
+/// the same spec over it uses it as it is.
+pub fn stale_helper_reason(pod: &Value) -> Option<String> {
+    if pod
+        .pointer("/metadata/deletionTimestamp")
+        .is_some_and(|t| !t.is_null())
+    {
+        return Some("is being deleted".to_string());
+    }
+    match pod.pointer("/status/phase").and_then(Value::as_str) {
+        Some(phase @ ("Succeeded" | "Failed")) => Some(format!(
+            "has already ended (phase {phase}): it was left behind by an earlier run"
+        )),
+        _ => None,
+    }
+}
+
+/// The apiserver's words for an update to a pod field that cannot change in
+/// place, such as a container's `command` or `env`. A helper pod left by a
+/// run that built a different spec for the same name — an older CLI or runner,
+/// with another keep-alive or env — answers every apply with them.
+pub const IMMUTABLE_POD_UPDATE: &str = "pod updates may not change fields";
+
+/// Whether an apply was refused because the pod it would update has a spec
+/// that cannot change in place ([`IMMUTABLE_POD_UPDATE`]). Such a pod is
+/// replaced, like an ended one.
+pub fn is_immutable_pod_update(message: &str) -> bool {
+    message.contains(IMMUTABLE_POD_UPDATE)
+}
+
+/// How long a replaced helper pod may take to be gone before the apply gives
+/// up. It is deleted with a one-second grace period
+/// ([`STALE_POD_DELETE_GRACE_SECONDS`]), so this is time for the kubelet to
+/// confirm, with a wide margin; a pod on an unreachable node never goes, and
+/// that is an error worth stopping on.
+pub const STALE_POD_GONE_WITHIN: Duration = Duration::from_secs(60);
+
+/// The grace period a stale helper pod is deleted with. Its `sleep` is PID 1
+/// of its container and ignores SIGTERM, so the default thirty seconds would
+/// all be spent waiting; the work in it, if any, is abandoned.
+pub const STALE_POD_DELETE_GRACE_SECONDS: u32 = 1;
+
+/// The line both implementations print when they replace a stale helper pod.
+pub fn replacing_stale_helper_note(ns: &str, name: &str, why: &str) -> String {
+    format!("helper pod {ns}/{name} {why}; deleting it and creating it again")
+}
+
+// ---------------------------------------------------------------------------
 // Impure forwarding helpers — delegate to KubeExec
 // ---------------------------------------------------------------------------
 
@@ -368,6 +431,46 @@ mod tests {
             ),
         ] {
             assert_eq!(spec["spec"]["containers"][0]["command"], want, "{spec}");
+        }
+    }
+
+    #[test]
+    fn an_ended_or_departing_pod_is_stale_and_a_live_one_is_not() {
+        for phase in ["Succeeded", "Failed"] {
+            let pod = json!({"metadata": {"name": "bk-pg-db"}, "status": {"phase": phase}});
+            let why = stale_helper_reason(&pod).expect(phase);
+            assert!(why.contains(phase), "{why}");
+        }
+        let deleting = json!({
+            "metadata": {"name": "bk-pg-db", "deletionTimestamp": "2026-09-23T00:00:00Z"},
+            "status": {"phase": "Running"}
+        });
+        assert_eq!(
+            stale_helper_reason(&deleting).as_deref(),
+            Some("is being deleted")
+        );
+        for live in [
+            json!({"metadata": {"name": "bk-pg-db"}, "status": {"phase": "Running"}}),
+            json!({"metadata": {"name": "bk-pg-db"}, "status": {"phase": "Pending"}}),
+            json!({"metadata": {"name": "bk-pg-db", "deletionTimestamp": null}}),
+            json!({"metadata": {"name": "bk-pg-db"}}),
+        ] {
+            assert_eq!(stale_helper_reason(&live), None, "{live}");
+        }
+    }
+
+    #[test]
+    fn only_the_apiservers_immutable_update_refusal_counts() {
+        // The apiserver's own text (k8s 1.35), trimmed.
+        assert!(is_immutable_pod_update(
+            "Pod \"bk-pg-db\" is invalid: spec: Forbidden: pod updates may not change fields \
+             other than `spec.containers[*].image`,`spec.initContainers[*].image`,..."
+        ));
+        for other in [
+            "pods \"bk-pg-db\" is forbidden: User cannot patch resource",
+            "Pod \"bk-pg-db\" is invalid: metadata.name: Invalid value",
+        ] {
+            assert!(!is_immutable_pod_update(other), "{other}");
         }
     }
 

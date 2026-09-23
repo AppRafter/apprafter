@@ -340,6 +340,94 @@ fn list_to_value(list: ObjectList<DynamicObject>, ar: &ApiResource) -> Result<Va
     Ok(serde_json::json!({ "items": items }))
 }
 
+impl KubeRsExec {
+    /// Server-side apply `spec` (mirrors `kubectl apply -f -`), replacing a
+    /// pod of the same name left from an earlier run (see
+    /// [`backup_core::helper_pod::stale_helper_reason`]): one whose spec
+    /// cannot be applied over, and one the apply shows has ended or is going
+    /// away. Each is deleted, waited out, and the apply made again, once.
+    async fn apply_replacing_stale(
+        &self,
+        api: &Api<Pod>,
+        name: &str,
+        ns: &str,
+        spec: &Value,
+    ) -> Result<()> {
+        let pp = PatchParams::apply(FIELD_MANAGER).force();
+        let apply_error =
+            |e: kube::Error| CliError::Other(format!("apply pod {name} in {ns}: {e}"));
+        let stale = match api.patch(name, &pp, &Patch::Apply(spec)).await {
+            Ok(pod) => {
+                let pod = serde_json::to_value(&pod).map_err(CliError::from)?;
+                match backup_core::helper_pod::stale_helper_reason(&pod) {
+                    Some(why) => why,
+                    None => return Ok(()),
+                }
+            }
+            Err(kube::Error::Api(ae))
+                if ae.code == 422
+                    && backup_core::helper_pod::is_immutable_pod_update(&ae.message) =>
+            {
+                "was created with a spec this run's cannot be applied over (an earlier run of \
+                 another version, or with another keep-alive)"
+                    .to_string()
+            }
+            Err(e) => return Err(apply_error(e)),
+        };
+        eprintln!(
+            "{}",
+            backup_core::helper_pod::replacing_stale_helper_note(ns, name, &stale)
+        );
+        self.delete_and_wait_gone(api, name, ns).await?;
+        api.patch(name, &pp, &Patch::Apply(spec))
+            .await
+            .map_err(apply_error)?;
+        Ok(())
+    }
+
+    /// Delete a stale helper pod and wait until it is gone, within
+    /// [`backup_core::helper_pod::STALE_POD_GONE_WITHIN`].
+    async fn delete_and_wait_gone(&self, api: &Api<Pod>, name: &str, ns: &str) -> Result<()> {
+        let dp = DeleteParams {
+            grace_period_seconds: Some(backup_core::helper_pod::STALE_POD_DELETE_GRACE_SECONDS),
+            ..DeleteParams::default()
+        };
+        match api.delete(name, &dp).await {
+            Ok(_) => {}
+            Err(e) if is_not_found(&e) => {}
+            Err(e) => {
+                return Err(CliError::Other(format!(
+                    "delete the stale helper pod {name} in {ns}: {e}"
+                )))
+            }
+        }
+        let bound = backup_core::helper_pod::STALE_POD_GONE_WITHIN;
+        let deadline = tokio::time::Instant::now() + bound;
+        loop {
+            let present = api.get_opt(name).await.map_err(|e| {
+                CliError::Other(format!(
+                    "get pod {name} in {ns} while waiting for it to be deleted: {e}"
+                ))
+            })?;
+            if present.is_none() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(CliError::Other(format!(
+                    "the stale helper pod {name} in {ns} was still there {}s after it was \
+                     deleted (its node may be unreachable); delete it with `kubectl delete pod \
+                     {name} -n {ns} --force --grace-period=0` and run again",
+                    bound.as_secs()
+                )));
+            }
+            tokio::time::sleep(STALE_POD_GONE_POLL_INTERVAL).await;
+        }
+    }
+}
+
+/// Interval between the polls that wait for a stale helper pod to be gone.
+const STALE_POD_GONE_POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(1);
+
 impl KubeExec for KubeRsExec {
     fn apply_and_wait_pod_ready(&self, spec: &Value) -> Result<()> {
         self.rt.block_on(async {
@@ -352,11 +440,9 @@ impl KubeExec for KubeRsExec {
 
             let api: Api<Pod> = Api::namespaced(self.client.clone(), &ns);
 
-            // Server-side apply (mirrors `kubectl apply -f -`).
-            let pp = PatchParams::apply(FIELD_MANAGER).force();
-            api.patch(&name, &pp, &Patch::Apply(spec))
-                .await
-                .map_err(|e| CliError::Other(format!("apply pod {name} in {ns}: {e}")))?;
+            // Server-side apply (mirrors `kubectl apply -f -`), over a stale
+            // leftover of the same name if there is one.
+            self.apply_replacing_stale(&api, &name, &ns, spec).await?;
 
             // Poll until Running + Ready (mirrors `kubectl wait
             // --for=condition=Ready --timeout=300s`).
@@ -1571,33 +1657,53 @@ mod tests {
     /// One canned apiserver reply, matched on METHOD + exact request PATH
     /// (query strings are recorded but not matched, so a test can assert the
     /// server-side-apply parameters without encoding them twice).
+    ///
+    /// A route answers its replies in order, one per request, and repeats the
+    /// last one from then on — so a route with one reply always gives it, and
+    /// a test can script a pod that changes between two requests.
     struct Route {
         method: &'static str,
         path: String,
-        status: u16,
-        body: String,
+        replies: Vec<(u16, String)>,
+        hits: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Route {
+        fn next_reply(&self) -> (u16, String) {
+            let n = self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.replies[n.min(self.replies.len() - 1)].clone()
+        }
+    }
+
+    fn seq_route(method: &'static str, path: &str, replies: Vec<(u16, Value)>) -> Route {
+        Route {
+            method,
+            path: path.to_string(),
+            replies: replies
+                .into_iter()
+                .map(|(code, body)| (code, body.to_string()))
+                .collect(),
+            hits: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 
     fn ok_route(method: &'static str, path: &str, body: Value) -> Route {
-        Route {
-            method,
-            path: path.to_string(),
-            status: 200,
-            body: body.to_string(),
-        }
+        seq_route(method, path, vec![(200, body)])
+    }
+
+    fn status_body(code: u16, reason: &str, message: &str) -> Value {
+        json!({
+            "kind": "Status", "apiVersion": "v1", "status": "Failure",
+            "reason": reason, "message": message, "code": code
+        })
     }
 
     fn err_route(method: &'static str, path: &str, code: u16, reason: &str) -> Route {
-        Route {
+        seq_route(
             method,
-            path: path.to_string(),
-            status: code,
-            body: json!({
-                "kind": "Status", "apiVersion": "v1", "status": "Failure",
-                "reason": reason, "message": "stub apiserver rejection", "code": code
-            })
-            .to_string(),
-        }
+            path,
+            vec![(code, status_body(code, reason, "stub apiserver rejection"))],
+        )
     }
 
     /// A `tower::Service` that answers from a fixed route table and records
@@ -1634,7 +1740,7 @@ mod tests {
                 .iter()
                 .find(|r| r.method == method && r.path == path)
             {
-                Some(r) => (r.status, r.body.clone()),
+                Some(r) => r.next_reply(),
                 None => (
                     404,
                     json!({
@@ -1801,6 +1907,147 @@ mod tests {
             seen[1],
             format!("GET {path}"),
             "readiness must be polled by GETting the same pod: {seen:?}"
+        );
+    }
+
+    fn pod_in_phase(phase: &str) -> Value {
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "bk-pg-alpha", "namespace": "demo"},
+            "status": {"phase": phase}
+        })
+    }
+
+    fn not_found() -> (u16, Value) {
+        (
+            404,
+            status_body(404, "NotFound", "pods \"bk-pg-alpha\" not found"),
+        )
+    }
+
+    /// A helper pod left behind by an earlier run, ended (`Completed`): the
+    /// apply answers with it unchanged, and it would never become Ready. It is
+    /// deleted, waited out, and the pod created again — not waited on for five
+    /// minutes and failed.
+    #[test]
+    fn an_ended_leftover_of_the_same_name_is_deleted_and_created_again() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let h = Harness::new(vec![
+            seq_route(
+                "PATCH",
+                path,
+                vec![
+                    (200, pod_in_phase("Succeeded")),
+                    (200, pod_in_phase("Pending")),
+                ],
+            ),
+            ok_route("DELETE", path, pod_in_phase("Succeeded")),
+            // The wait for the delete, then the Ready poll of the new pod.
+            seq_route("GET", path, vec![not_found(), (200, running_ready_pod())]),
+        ]);
+
+        h.exec
+            .apply_and_wait_pod_ready(&helper_pod_spec())
+            .expect("the leftover is replaced");
+
+        let seen: Vec<String> = h
+            .seen()
+            .iter()
+            .map(|r| r.split('?').next().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                format!("PATCH {path}"),
+                format!("DELETE {path}"),
+                format!("GET {path}"),
+                format!("PATCH {path}"),
+                format!("GET {path}"),
+            ]
+        );
+    }
+
+    /// A leftover with a spec this run's cannot be applied over — an older
+    /// runner's `sleep 3600`, say — is refused by the apiserver, and replaced.
+    #[test]
+    fn a_leftover_whose_spec_cannot_change_in_place_is_replaced() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let immutable = status_body(
+            422,
+            "Invalid",
+            "Pod \"bk-pg-alpha\" is invalid: spec: Forbidden: pod updates may not change \
+             fields other than `spec.containers[*].image`",
+        );
+        let h = Harness::new(vec![
+            seq_route(
+                "PATCH",
+                path,
+                vec![(422, immutable), (200, pod_in_phase("Pending"))],
+            ),
+            ok_route("DELETE", path, pod_in_phase("Running")),
+            seq_route(
+                "GET",
+                path,
+                vec![
+                    (200, pod_in_phase("Running")),
+                    not_found(),
+                    (200, running_ready_pod()),
+                ],
+            ),
+        ]);
+
+        h.exec
+            .apply_and_wait_pod_ready(&helper_pod_spec())
+            .expect("the leftover is replaced");
+
+        let seen: Vec<String> = h
+            .seen()
+            .iter()
+            .map(|r| r.split('?').next().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                format!("PATCH {path}"),
+                format!("DELETE {path}"),
+                // Still there once (terminating), then gone.
+                format!("GET {path}"),
+                format!("GET {path}"),
+                format!("PATCH {path}"),
+                format!("GET {path}"),
+            ]
+        );
+    }
+
+    /// Any other refusal is the run's error, and nothing is deleted: a 422 for
+    /// another reason is not a leftover.
+    #[test]
+    fn another_invalid_apply_deletes_nothing() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let h = Harness::new(vec![
+            seq_route(
+                "PATCH",
+                path,
+                vec![(
+                    422,
+                    status_body(
+                        422,
+                        "Invalid",
+                        "Pod \"bk-pg-alpha\" is invalid: metadata.name",
+                    ),
+                )],
+            ),
+            ok_route("DELETE", path, pod_in_phase("Running")),
+        ]);
+        let err = h
+            .exec
+            .apply_and_wait_pod_ready(&helper_pod_spec())
+            .expect_err("an invalid spec fails the step");
+        assert!(err.to_string().starts_with("apply pod "), "{err}");
+        assert!(
+            h.seen().iter().all(|r| !r.starts_with("DELETE")),
+            "{:?}",
+            h.seen()
         );
     }
 
@@ -2088,8 +2335,8 @@ mod tests {
         routes.push(Route {
             method: "GET",
             path: path.to_string(),
-            status: 404,
-            body: "404 page not found\n".to_string(),
+            replies: vec![(404, "404 page not found\n".to_string())],
+            hits: std::sync::atomic::AtomicUsize::new(0),
         });
         let h = Harness::new(routes);
 

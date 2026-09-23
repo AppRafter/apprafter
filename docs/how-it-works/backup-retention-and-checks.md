@@ -304,9 +304,11 @@ running them stops them — but their helper pods live the same
 `spec.backup.activeDeadlineSeconds` (six hours when unset). A helper pod that
 a command or run was killed before it could delete stops running then, but
 the pod itself stays behind as `Completed` until something deletes it. The
-next command that uses a helper pod of that name, the same step for the same
-claim, fails on it after waiting five minutes for it to become ready. A backup
-then deletes it, so it costs one failed run.
+next command or run that needs a helper pod of that name, the same step for
+the same claim, deletes it, waits until it is gone, and creates its own. It
+does the same with a leftover it cannot update in place because an older
+version built it with a different spec. A pod still running with the same
+spec is used as it is.
 
 Pick the value against the schedule it applies to:
 
