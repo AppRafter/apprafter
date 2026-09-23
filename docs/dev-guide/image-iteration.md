@@ -84,10 +84,12 @@ rather than blocking your rollout.
 ## When it cannot read the registry
 
 A private image with no covering credential, or a registry that is down, means
-the digest cannot be resolved. The rollout is **not** blocked: the platform
-falls back to the tag as written and says so in the application's status. What
-that costs you, and the hand-pinned reference that opts out of resolution
-entirely, are on
+the digest cannot be resolved. The rollout is **not** blocked, and nothing
+rolls: the platform keeps the workload on the digest it is already running and
+says so in the application's status. Only an image that has never been
+resolved, such as a private one that never had a covering credential, runs on
+the tag as written. What that costs you, and the hand-pinned reference that
+opts out of resolution entirely, are on
 [The image digest](../how-it-works/the-image-digest.md).
 
 ## See also
