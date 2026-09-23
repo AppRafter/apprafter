@@ -12,8 +12,9 @@ commands needs none of this.
 
 Read it when a prune removed more than the keep numbers led you to expect, when
 the weekly check went red and `apprafter backup status` will not say why, when
-a backup Job was stopped by its deadline, or when you are deciding how much
-delete power to hand the cluster's S3 key.
+a backup Job was stopped by its deadline, when `apprafter status` says backups
+are failing, or when you are deciding how much delete power to hand the
+cluster's S3 key.
 
 The decisions behind all three — a restic repository written by the platform's
 own runner rather than a third-party backup operator, retention computed in code
@@ -440,6 +441,80 @@ seconds, and the session ends within seconds of the kill. A dump that gave up le
 run fails before restic writes anything, and a `sequential` run never writes
 the commit snapshot, so the claim snapshots it already wrote are ignored by
 restore and removed by the next prune.
+
+## When a backup cannot run {#when-a-backup-cannot-run}
+
+Everything above is recorded by the runner, and a runner records only what
+happens while it runs. Some failures come before it starts, or end it without
+warning: a pod that no node has room for, a runner killed at its memory limit,
+a pod the kubelet evicts, a Job stopped by its deadline before its pod was ever
+placed. In each of those the runner's record is not updated and the failure
+webhook does not fire, so `lastSuccess` goes on showing the last run that got
+through.
+
+So the operator also watches the backup from outside the runner. It reads the
+`apprafter-backup` and `apprafter-backup-check` CronJobs, their Jobs and the
+runner pods in `apprafter-system`, and keeps its verdict in the `BackupHealthy`
+condition of `PlatformStack/default`. `apprafter status` and `apprafter
+platform status` print it as a `Backups:` line, with the time the failure began
+and what to run next. The condition moves when those objects change, not on
+the operator's six-hour upstream check.
+
+| Status | Reason | What happened |
+| --- | --- | --- |
+| `True` | `Succeeded` | The most recent finished backup succeeded, the most recent finished check passed (or none has run yet), and no unfinished run is in trouble. |
+| `False` | `RunnerUnschedulable` | The scheduler has found no node for the runner's pod for more than ten minutes, most often for lack of memory. The message quotes the scheduler and says what the pod asks for. A Job the schedule started holds the schedule while it waits: see [the troubleshooting entry](../operator-guide/backup-restore.md#runner-unschedulable). |
+| `False` | `RunnerNotStarted` | The pod has not started for ten minutes for another reason: its image cannot be pulled, a Secret it reads is missing, or the scheduler has not yet tried to place it. Or the Job has had no pod at all for ten minutes, because a quota, a LimitRange or an admission webhook refused it; the Job's `FailedCreate` events say which. |
+| `False` | `RunnerOOMKilled` | An attempt was killed at the runner's memory limit. The Job retries, but the same data meets the same limit, so this is reported at once rather than after the last attempt. |
+| `False` | `RunnerEvicted` | The kubelet evicted an attempt: memory pressure on the node, or the staging directory grown past its size limit. The message quotes the kubelet. |
+| `False` | `DeadlineExceeded` | The Job was stopped by its deadline. The message says what the runner recorded, or that it recorded nothing, and, for a pod that was never placed, what the scheduler said before the deadline. |
+| `False` | `BackoffLimitExceeded` | Every attempt of a backup failed. The message says how the last one ended and quotes the runner's `lastError` when it wrote one. |
+| `False` | `RepositoryCheckFailed` | Every attempt of the weekly check ran and failed: `restic check` did not pass, because it found the repository damaged or could not read it. Its output is in the check pod's log, and `apprafter backup check` runs the same check from your machine. |
+| `False` | `Failed` | The Job failed for another reason, which the message quotes. |
+| `False` | `ScheduleSuspended` | The CronJob is suspended, so no scheduled backup starts. |
+| `Unknown` | `NoRunYet` | No backup has finished yet. |
+| `Unknown` | `ScheduleNotDeployed` | `spec.backup.enabled` is true, but the CronJob does not exist: the platform chart has not deployed it. |
+| `Unknown` | `StateUnreadable` | The operator could not read the CronJobs, Jobs or pods. |
+
+The condition is absent while backup is disabled. It is never `True` on no
+evidence: a cluster whose objects could not be read, or whose first backup has
+not finished, is `Unknown`.
+
+Four rules keep it from raising false alarms, and from going quiet:
+
+- A pod that is waiting to be placed, or is placed with its container not yet
+  started, counts only after ten minutes. Room is often on its way: a database
+  instance being deleted can take three minutes to stop, the kubelet keeps a
+  memory-pressure taint for five minutes after the pressure ends, and a node
+  that restarts is not ready for a few minutes. A pod the scheduler is making
+  room for by preemption does not count at all.
+- An attempt that ends with an ordinary error is left to the Job: the runner
+  records that error itself, and the next attempt may succeed. Only the Job
+  giving up turns the condition `False`.
+- The newest finished run decides, whether the schedule started it or
+  `apprafter backup run` did, so a later successful run returns the condition
+  to `True`. An unfinished run in trouble counts before any finished one,
+  because a scheduled run that cannot start holds back every later one. A
+  failed check turns the condition `False` even while backups succeed, and a
+  backup failure is reported before a check failure.
+- While the condition stays `False`, its transition time stays where the
+  failure began, even when the cause changes: a pod that could not be placed,
+  and then the deadline that stopped its Job.
+
+Argo CD does not show this verdict on the platform's tile, on purpose.
+`PlatformStack/default` is created by `apprafter cluster-bootstrap`, not by an
+Argo CD Application, so no Argo CD health check ever evaluates it. Moving the
+verdict onto a resource the platform Application does manage would cost more
+than it shows. That Application syncs in waves, and in every wave but the
+last, Argo CD waits for each resource to become healthy before it applies the
+next wave: a `Degraded` resource fails the sync, and a `Progressing` or
+`Suspended` one holds it. The backup CronJob is not in the last wave, so a
+failing backup would stop every sync of the platform, the upgrade that might
+carry the fix included. A resource in the last wave would not stop a sync, but
+it would turn the whole platform Application `Degraded`, and the `Ready`
+condition of `PlatformStack/default` follows that health: a backup problem
+would read as a platform that is not ready. So the verdict stays on the
+`PlatformStack`, where `apprafter status` reads it.
 
 ## What the in-cluster credential can and cannot do
 

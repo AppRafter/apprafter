@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{ConfigMap, ObjectReference};
+use k8s_openapi::api::batch::v1::{CronJob, Job};
+use k8s_openapi::api::core::v1::{ConfigMap, ObjectReference, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams};
 use kube::core::GroupVersionKind;
@@ -203,7 +204,35 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), Error> {
         parent_app = format!("{PARENT_APPLICATION_NAMESPACE}/{PARENT_APPLICATION_NAME}").as_str(),
         "PlatformController Controller::run() entering watch loop"
     );
+    // `BackupHealthy` (WI-386) reads the backup CronJobs, their Jobs and the
+    // runner pods. Every change to one of them reconciles the singleton, so
+    // a pod the scheduler cannot place, a runner killed at its limit or a
+    // Job that fails shows on the stack within seconds, not at the next
+    // `checkInterval` (six hours by default). A pod still inside the grace,
+    // or a Job still waiting for its first pod, has no event left to wake
+    // the controller; the reconcile requeues for the end of the grace
+    // instead (`backup_health::Assessment::recheck_after`).
+    // RBAC: the operator chart's `-backup-health` Role, list + watch in
+    // `apprafter-system` only.
+    let backup_ns = crate::backup_health::BACKUP_NAMESPACE;
+    let to_singleton =
+        || Some(ObjectRef::<PlatformStack>::new(SINGLETON_NAME).within(SINGLETON_NAMESPACE));
     Controller::new(stacks, watcher::Config::default())
+        .watches(
+            Api::<CronJob>::namespaced(ctx.client.clone(), backup_ns),
+            watcher::Config::default(),
+            move |_: CronJob| to_singleton(),
+        )
+        .watches(
+            Api::<Job>::namespaced(ctx.client.clone(), backup_ns),
+            watcher::Config::default(),
+            move |_: Job| to_singleton(),
+        )
+        .watches(
+            Api::<Pod>::namespaced(ctx.client.clone(), backup_ns),
+            watcher::Config::default().labels(crate::backup_health::RUNNER_POD_SELECTOR),
+            move |_: Pod| to_singleton(),
+        )
         .watches_with(
             apps,
             ctx.app_api_resource.clone(),
@@ -504,6 +533,13 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         &prior_conds,
     );
 
+    // `BackupHealthy` (WI-386), BEFORE the in-flight early return: a
+    // platform upgrade in progress is exactly when a node is short of room,
+    // and the condition must not freeze for its duration. Every write below
+    // sends the WHOLE status — this condition included — under the one field
+    // manager, so it is never pruned by a write that forgot it.
+    let backup_recheck = assess_backup_health(&ctx, spec, &prior_conds, now, &mut new_status).await;
+
     // 6. In-flight gating. We do NOT fight an in-progress sync —
     //    Argo CD's app-controller is mid-apply; another patch
     //    from us would race with that.
@@ -518,7 +554,7 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         // so omit `versionHistory` from the SSA patch to preserve
         // server-side state.
         write_status_if_changed(&stack, &ctx, new_status, false).await?;
-        return Ok(Action::requeue(IN_FLIGHT_REQUEUE));
+        return Ok(Action::requeue(sooner(IN_FLIGHT_REQUEUE, backup_recheck)));
     }
 
     // 7. Decide what target_revision to put into the SSA patch.
@@ -1162,9 +1198,55 @@ async fn reconcile(stack: Arc<PlatformStack>, ctx: Arc<Context>) -> Result<Actio
         "PlatformController writing status"
     );
     write_status_if_changed(&stack, &ctx, new_status, appended_history).await?;
-    Ok(Action::requeue(parse_check_interval(
-        &spec.source.check_interval,
+    Ok(Action::requeue(sooner(
+        parse_check_interval(&spec.source.check_interval),
+        backup_recheck,
     )))
+}
+
+/// Read the backup objects and put the `BackupHealthy` verdict on
+/// `new_status`. Returns when to look again because a runner pod's grace
+/// ends (see `backup_health`).
+///
+/// Never fails the reconcile. A read that fails is itself the verdict
+/// (`Unknown`, `StateUnreadable`), rather than a stale `True` left in place
+/// or a reconcile error that would freeze every other condition too — the
+/// ADR 0048 anchor-403 lesson. Nothing is read while backups are disabled.
+async fn assess_backup_health(
+    ctx: &Context,
+    spec: &operator_core::PlatformStackSpec,
+    prior_conds: &[PlatformStackCondition],
+    now: DateTime<Utc>,
+    new_status: &mut PlatformStackStatus,
+) -> Option<Duration> {
+    let enabled = spec.backup.as_ref().is_some_and(|b| b.enabled);
+    let observed = if enabled {
+        crate::backup_health::observe(&ctx.client).await
+    } else {
+        // Disabled: `assess` returns `Absent` without looking at this.
+        Ok(crate::backup_health::Observed::default())
+    };
+    if let Err(e) = &observed {
+        warn!(error = %e, "could not read the backup objects; BackupHealthy=Unknown");
+    }
+    let assessment = crate::backup_health::assess(
+        enabled,
+        observed.as_ref().map_err(String::as_str),
+        prior_conds,
+        now,
+    );
+    crate::backup_health::apply(
+        new_status,
+        crate::status::COND_BACKUP_HEALTHY,
+        &assessment.verdict,
+        prior_conds,
+    );
+    assessment.recheck_after
+}
+
+/// The earlier of a reconcile's own requeue and a backup recheck.
+fn sooner(requeue: Duration, recheck: Option<Duration>) -> Duration {
+    recheck.map_or(requeue, |r| requeue.min(r))
 }
 
 /// Strict semver comparison: returns true iff `a > b`. Falls back
@@ -3434,5 +3516,492 @@ mod tests {
         };
         let plan = MigrationPlan::new("p", spec);
         assert_eq!(plan_classification(&plan), None);
+    }
+}
+
+/// Whole reconciles against a scripted apiserver (WI-386): the status patch a
+/// reconcile actually sends, with `BackupHealthy` in it, and the conditions
+/// and history it must carry forward beside it. `status.conditions` is an
+/// atomic list owned by one field manager, and an SSA write that leaves a
+/// field out prunes it — so a patch that got the backup verdict right and
+/// dropped `Ready` would be worse than no verdict at all.
+#[cfg(test)]
+mod backup_reconcile_tests {
+    use std::sync::{Arc, Mutex};
+
+    use kube::client::Body;
+    use operator_core::Metrics;
+    use serde_json::{json, Value};
+
+    use super::*;
+    use crate::backup_health::{
+        REASON_NO_RUN_YET, REASON_SUCCEEDED, REASON_UNREADABLE, REASON_UNSCHEDULABLE,
+    };
+    use crate::status::COND_BACKUP_HEALTHY;
+
+    #[derive(Clone, Debug)]
+    struct Call {
+        method: String,
+        uri: String,
+        body: Value,
+    }
+
+    impl Call {
+        fn path(&self) -> &str {
+            self.uri.split('?').next().unwrap_or("")
+        }
+    }
+
+    /// What the scripted cluster holds.
+    struct Cluster {
+        stack: Value,
+        parent: Value,
+        cronjobs: Vec<Value>,
+        jobs: Vec<Value>,
+        pods: Vec<Value>,
+        /// Answer every Job list with 403, as a missing RBAC rule would.
+        forbid_jobs: bool,
+    }
+
+    fn not_found() -> (u16, Value) {
+        (
+            404,
+            json!({ "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                    "reason": "NotFound", "code": 404, "message": "not found" }),
+        )
+    }
+
+    fn list(kind: &str, api_version: &str, items: &[Value]) -> (u16, Value) {
+        (
+            200,
+            json!({ "apiVersion": api_version, "kind": kind,
+                    "metadata": { "resourceVersion": "1" }, "items": items }),
+        )
+    }
+
+    fn respond(cluster: &Cluster, call: &Call) -> (u16, Value) {
+        let path = call.path();
+        let ns = "/namespaces/apprafter-system";
+        match (call.method.as_str(), path) {
+            ("GET", "/apis/argoproj.io/v1alpha1/namespaces/argocd/applications/platform") => {
+                (200, cluster.parent.clone())
+            }
+            ("GET", p) if p == format!("/apis/apprafter.io/v1alpha1{ns}/migrationplans") => {
+                list("MigrationPlanList", "apprafter.io/v1alpha1", &[])
+            }
+            ("GET", "/api/v1/nodes") => list("NodeList", "v1", &[]),
+            ("GET", p) if p == format!("/apis/batch/v1{ns}/cronjobs") => {
+                list("CronJobList", "batch/v1", &cluster.cronjobs)
+            }
+            ("GET", p) if p == format!("/apis/batch/v1{ns}/jobs") => {
+                if cluster.forbid_jobs {
+                    (
+                        403,
+                        json!({ "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                                "reason": "Forbidden", "code": 403,
+                                "message": "jobs.batch is forbidden: User \"system:serviceaccount:apprafter-system:apprafter-operator\" cannot list resource \"jobs\"" }),
+                    )
+                } else {
+                    list("JobList", "batch/v1", &cluster.jobs)
+                }
+            }
+            ("GET", p) if p == format!("/api/v1{ns}/pods") => {
+                assert!(
+                    call.uri
+                        .contains("labelSelector=apprafter.io%2Fbackup-runner%3Dtrue"),
+                    "the runner pods are listed by their label only: {}",
+                    call.uri
+                );
+                list("PodList", "v1", &cluster.pods)
+            }
+            ("GET", p) if p.starts_with(&format!("/api/v1{ns}/configmaps/")) => not_found(),
+            ("GET", p)
+                if p == format!(
+                    "/apis/apprafter.io/v1alpha1{ns}/platformstacks/default/status"
+                ) =>
+            {
+                (200, cluster.stack.clone())
+            }
+            ("PATCH", p)
+                if p == format!(
+                    "/apis/apprafter.io/v1alpha1{ns}/platformstacks/default/status"
+                ) =>
+            {
+                (200, cluster.stack.clone())
+            }
+            _ => panic!("unscripted request: {} {}", call.method, call.uri),
+        }
+    }
+
+    fn scripted(cluster: Cluster) -> (Client, Arc<Mutex<Vec<Call>>>) {
+        let log = Arc::new(Mutex::new(Vec::<Call>::new()));
+        let sink = log.clone();
+        let cluster = Arc::new(cluster);
+        let service = tower::service_fn(move |req: http::Request<Body>| {
+            let sink = sink.clone();
+            let cluster = cluster.clone();
+            async move {
+                let method = req.method().to_string();
+                let uri = req.uri().to_string();
+                let bytes = req.into_body().collect_bytes().await.expect("request body");
+                let call = Call {
+                    method,
+                    uri,
+                    body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+                };
+                let (code, payload) = respond(&cluster, &call);
+                sink.lock().expect("log").push(call);
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(code)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&payload).expect("payload")))
+                        .expect("response"),
+                )
+            }
+        });
+        (Client::new(service, "apprafter-system"), log)
+    }
+
+    fn context(client: Client) -> Arc<Context> {
+        Arc::new(Context {
+            client,
+            metrics: Arc::new(Metrics::new()),
+            app_api_resource: ApiResource::from_gvk(&GroupVersionKind {
+                group: "argoproj.io".into(),
+                version: "v1alpha1".into(),
+                kind: "Application".into(),
+            }),
+            capacity: operator_core::capacity::CapacityCache::new(),
+        })
+    }
+
+    fn ago(minutes: i64) -> String {
+        (Utc::now() - chrono::Duration::minutes(minutes))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    }
+
+    fn prior_condition(type_: &str, status: &str, reason: &str) -> Value {
+        json!({ "type": type_, "status": status, "reason": reason, "message": "m",
+                "lastTransitionTime": "2026-09-01T00:00:00+00:00" })
+    }
+
+    /// `PlatformStack/default` on `0.2.80`, recently polled (so no OCI
+    /// request), with every condition a settled cluster carries and one
+    /// history entry — the fields the backup verdict's write must not lose.
+    fn stack(backup_enabled: bool, extra_conditions: Vec<Value>) -> Value {
+        let mut conditions = vec![
+            prior_condition("Ready", "True", "Healthy"),
+            prior_condition("Synced", "True", "Reconciled"),
+            prior_condition("UpstreamReachable", "True", "Reachable"),
+            prior_condition("YankedVersion", "False", "NotYanked"),
+            prior_condition("MigrationPending", "False", "Clean"),
+            prior_condition("UpgradeAvailable", "False", "UpToDate"),
+            prior_condition("UnauthorizedSourceModification", "False", "Clean"),
+        ];
+        conditions.extend(extra_conditions);
+        json!({
+            "apiVersion": "apprafter.io/v1alpha1", "kind": "PlatformStack",
+            "metadata": { "name": "default", "namespace": "apprafter-system", "generation": 3,
+                          "uid": "ps-uid" },
+            "spec": {
+                "channel": "stable", "pin": "0.2.80",
+                "source": { "upstream": "oci://ghcr.io/apprafter/platform-stack",
+                            "repoURL": "oci://ghcr.io/apprafter/platform-stack",
+                            "checkInterval": "6h" },
+                "values": { "tier": 1 },
+                "backup": {
+                    "enabled": backup_enabled, "schedule": "0 3 * * *",
+                    "bucket": "s3:https://s3.example/bucket",
+                    "credentialRef": { "name": "apprafter-backup-s3" },
+                    "stagingMode": "monolithic", "checkSchedule": "",
+                },
+            },
+            "status": {
+                "currentVersion": "0.2.80", "targetVersion": "0.2.80",
+                "availableVersion": "0.2.80", "lastUpstreamCheck": Utc::now().to_rfc3339(),
+                "versionHistory": [{ "version": "0.2.80", "appliedAt": "2026-09-20T00:00:00+00:00",
+                                     "outcome": "succeeded" }],
+                "conditions": conditions,
+            },
+        })
+    }
+
+    /// The root Application, settled on what `stack` asks for, so the
+    /// reconcile patches nothing but status.
+    fn parent(stack: &Value, target: &str, sync: &str) -> Value {
+        let spec: PlatformStack = serde_json::from_value(stack.clone()).expect("stack");
+        let desired = build_desired(&spec.spec, "0.2.80");
+        json!({
+            "apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
+            "metadata": {
+                "name": "platform", "namespace": "argocd",
+                "managedFields": [{ "manager": "platform-controller", "operation": "Apply",
+                                    "fieldsV1": { "f:spec": { "f:source": { "f:targetRevision": {} } } } }],
+            },
+            "spec": { "source": { "targetRevision": target,
+                                  "helm": { "valuesObject": desired.helm_values } } },
+            "status": { "sync": { "status": sync }, "health": { "status": "Healthy" },
+                        "operationState": { "phase": "Succeeded" } },
+        })
+    }
+
+    fn cronjob() -> Value {
+        json!({
+            "apiVersion": "batch/v1", "kind": "CronJob",
+            "metadata": { "name": "apprafter-backup", "namespace": "apprafter-system" },
+            "spec": { "schedule": "0 3 * * *", "jobTemplate": {} },
+        })
+    }
+
+    fn job(name: &str, created: &str, conditions: Value) -> Value {
+        json!({
+            "apiVersion": "batch/v1", "kind": "Job",
+            "metadata": {
+                "name": name, "namespace": "apprafter-system", "uid": format!("{name}-uid"),
+                "creationTimestamp": created,
+                "ownerReferences": [{ "apiVersion": "batch/v1", "kind": "CronJob",
+                                      "name": "apprafter-backup", "uid": "cj-uid", "controller": true }],
+            },
+            "spec": { "activeDeadlineSeconds": 21600, "backoffLimit": 6, "template": {} },
+            "status": { "startTime": created, "conditions": conditions },
+        })
+    }
+
+    fn pending_pod(job_name: &str, since: &str) -> Value {
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {
+                "name": format!("{job_name}-x7k2q"), "namespace": "apprafter-system",
+                "creationTimestamp": since,
+                "labels": { "apprafter.io/backup-runner": "true" },
+                "ownerReferences": [{ "apiVersion": "batch/v1", "kind": "Job", "name": job_name,
+                                      "uid": format!("{job_name}-uid"), "controller": true }],
+            },
+            "spec": { "containers": [{ "name": "runner", "image": "runner",
+                "resources": { "requests": { "cpu": "100m", "memory": "256Mi" } } }] },
+            "status": { "phase": "Pending", "conditions": [{
+                "type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+                "message": "0/1 nodes are available: 1 Insufficient memory.",
+                "lastTransitionTime": since }] },
+        })
+    }
+
+    async fn reconcile_once(cluster: Cluster) -> (Action, Vec<Call>) {
+        let stack: PlatformStack = serde_json::from_value(cluster.stack.clone()).expect("stack");
+        let (client, log) = scripted(cluster);
+        let action = reconcile(Arc::new(stack), context(client))
+            .await
+            .expect("the reconcile succeeds");
+        let calls = log.lock().unwrap().clone();
+        (action, calls)
+    }
+
+    /// The one status patch the reconcile sent.
+    fn status_patch(calls: &[Call]) -> &Call {
+        let patches: Vec<&Call> = calls
+            .iter()
+            .filter(|c| c.method == "PATCH" && c.path().ends_with("/platformstacks/default/status"))
+            .collect();
+        assert_eq!(patches.len(), 1, "one status write: {calls:#?}");
+        patches[0]
+    }
+
+    fn written_condition<'a>(patch: &'a Call, type_: &str) -> Option<&'a Value> {
+        patch.body["status"]["conditions"]
+            .as_array()
+            .expect("the patch carries the conditions")
+            .iter()
+            .find(|c| c["type"] == type_)
+    }
+
+    fn assert_everything_else_carried(patch: &Call) {
+        for t in [
+            "Ready",
+            "Synced",
+            "UpstreamReachable",
+            "YankedVersion",
+            "MigrationPending",
+            "UpgradeAvailable",
+            "UnauthorizedSourceModification",
+        ] {
+            assert!(
+                written_condition(patch, t).is_some(),
+                "{t} must ride the same write, or SSA prunes it: {:#}",
+                patch.body
+            );
+        }
+        assert_eq!(
+            patch.body["status"]["versionHistory"][0]["version"], "0.2.80",
+            "the history rides the write too: {:#}",
+            patch.body
+        );
+        assert!(
+            patch.uri.contains("fieldManager=platform-controller")
+                && patch.uri.contains("force=true"),
+            "the controller's own SSA identity: {}",
+            patch.uri
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unschedulable_runner_reaches_the_stack_beside_every_other_condition() {
+        let stack = stack(true, vec![]);
+        let parent = parent(&stack, "0.2.80", "Synced");
+        let name = "apprafter-backup-29312340";
+        let (action, calls) = reconcile_once(Cluster {
+            parent,
+            stack,
+            cronjobs: vec![cronjob()],
+            jobs: vec![job(name, &ago(20), json!([]))],
+            pods: vec![pending_pod(name, &ago(20))],
+            forbid_jobs: false,
+        })
+        .await;
+        let patch = status_patch(&calls);
+        let c = written_condition(patch, COND_BACKUP_HEALTHY).expect("BackupHealthy written");
+        assert_eq!(c["status"], "False");
+        assert_eq!(c["reason"], REASON_UNSCHEDULABLE);
+        let message = c["message"].as_str().unwrap();
+        assert!(
+            message.contains(name) && message.contains("Insufficient memory"),
+            "{message}"
+        );
+        assert_everything_else_carried(patch);
+        // Nothing is waiting on a grace, so the ordinary cadence stands.
+        assert_eq!(action, Action::requeue(Duration::from_secs(6 * 3600)));
+    }
+
+    #[tokio::test]
+    async fn a_pod_inside_its_grace_brings_the_next_reconcile_forward() {
+        let stack = stack(true, vec![]);
+        let parent = parent(&stack, "0.2.80", "Synced");
+        let name = "apprafter-backup-29312340";
+        let (action, calls) = reconcile_once(Cluster {
+            parent,
+            stack,
+            cronjobs: vec![cronjob()],
+            jobs: vec![job(name, &ago(5), json!([]))],
+            pods: vec![pending_pod(name, &ago(5))],
+            forbid_jobs: false,
+        })
+        .await;
+        let c = written_condition(status_patch(&calls), COND_BACKUP_HEALTHY).unwrap();
+        assert_eq!(c["reason"], REASON_NO_RUN_YET);
+        // No watch event arrives when the grace ends, so the reconcile itself
+        // must come back then: about five minutes, never the six hours.
+        let wanted = |secs: u64| Action::requeue(Duration::from_secs(secs));
+        assert!(
+            (290..=302).any(|s| action == wanted(s)),
+            "expected a requeue at the end of the grace, got {action:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_success_clears_the_failure_on_the_stack() {
+        let failing = json!({
+            "type": COND_BACKUP_HEALTHY, "status": "False", "reason": REASON_UNSCHEDULABLE,
+            "message": "backup Job apprafter-backup-29310900: …",
+            "lastTransitionTime": "2026-09-22T03:10:05+00:00",
+        });
+        let stack = stack(true, vec![failing]);
+        let parent = parent(&stack, "0.2.80", "Synced");
+        let done = json!([{ "type": "Complete", "status": "True",
+                            "lastTransitionTime": ago(60) }]);
+        let (_, calls) = reconcile_once(Cluster {
+            parent,
+            stack,
+            cronjobs: vec![cronjob()],
+            jobs: vec![job("apprafter-backup-29312340", &ago(61), done)],
+            pods: vec![],
+            forbid_jobs: false,
+        })
+        .await;
+        let patch = status_patch(&calls);
+        let c = written_condition(patch, COND_BACKUP_HEALTHY).unwrap();
+        assert_eq!(c["status"], "True");
+        assert_eq!(c["reason"], REASON_SUCCEEDED);
+        assert_ne!(
+            c["lastTransitionTime"], "2026-09-22T03:10:05+00:00",
+            "the flip is a transition"
+        );
+        assert_everything_else_carried(patch);
+    }
+
+    #[tokio::test]
+    async fn disabling_backups_removes_the_condition_and_reads_nothing() {
+        let old = json!({
+            "type": COND_BACKUP_HEALTHY, "status": "False", "reason": REASON_UNSCHEDULABLE,
+            "message": "m", "lastTransitionTime": "2026-09-22T03:10:05+00:00",
+        });
+        let stack = stack(false, vec![old]);
+        let parent = parent(&stack, "0.2.80", "Synced");
+        let (_, calls) = reconcile_once(Cluster {
+            parent,
+            stack,
+            cronjobs: vec![],
+            jobs: vec![],
+            pods: vec![],
+            forbid_jobs: false,
+        })
+        .await;
+        let patch = status_patch(&calls);
+        assert!(
+            written_condition(patch, COND_BACKUP_HEALTHY).is_none(),
+            "{:#}",
+            patch.body
+        );
+        assert_everything_else_carried(patch);
+        assert!(
+            !calls.iter().any(|c| c.path().starts_with("/apis/batch/")),
+            "a cluster without backups is not read for them: {calls:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forbidden_read_is_unknown_and_the_reconcile_carries_on() {
+        let stack = stack(true, vec![]);
+        let parent = parent(&stack, "0.2.80", "Synced");
+        let (_, calls) = reconcile_once(Cluster {
+            parent,
+            stack,
+            cronjobs: vec![cronjob()],
+            jobs: vec![],
+            pods: vec![],
+            forbid_jobs: true,
+        })
+        .await;
+        let patch = status_patch(&calls);
+        let c = written_condition(patch, COND_BACKUP_HEALTHY).unwrap();
+        assert_eq!(c["status"], "Unknown");
+        assert_eq!(c["reason"], REASON_UNREADABLE);
+        assert!(
+            c["message"].as_str().unwrap().contains("forbidden"),
+            "{c:#}"
+        );
+        assert_everything_else_carried(patch);
+    }
+
+    #[tokio::test]
+    async fn a_platform_upgrade_in_flight_does_not_freeze_the_backup_verdict() {
+        // The parent is mid-sync to a new target: the reconcile takes its
+        // early in-flight return. That is when a small node is most short of
+        // room, so the verdict must be written on that path too.
+        let stack = stack(true, vec![]);
+        let parent = parent(&stack, "0.2.79", "OutOfSync");
+        let name = "apprafter-backup-29312340";
+        let (action, calls) = reconcile_once(Cluster {
+            parent,
+            stack,
+            cronjobs: vec![cronjob()],
+            jobs: vec![job(name, &ago(20), json!([]))],
+            pods: vec![pending_pod(name, &ago(20))],
+            forbid_jobs: false,
+        })
+        .await;
+        let c = written_condition(status_patch(&calls), COND_BACKUP_HEALTHY).unwrap();
+        assert_eq!(c["reason"], REASON_UNSCHEDULABLE);
+        assert_eq!(action, Action::requeue(IN_FLIGHT_REQUEUE));
     }
 }

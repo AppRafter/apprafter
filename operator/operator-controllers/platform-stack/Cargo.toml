@@ -31,3 +31,11 @@ semver           = { workspace = true }
 async-trait      = { workspace = true }
 flate2           = { workspace = true }
 tar              = { workspace = true }
+
+[dev-dependencies]
+# `reconcile.rs` drives whole reconciles against a scripted in-process
+# apiserver (`tower::service_fn` behind a real `kube::Client`), so the tests
+# see the exact status patch a reconcile sends — the only way to prove that
+# `BackupHealthy` rides every write alongside the conditions it must not prune.
+tower = { workspace = true }
+http  = { workspace = true }

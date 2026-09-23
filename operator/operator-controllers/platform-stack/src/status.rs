@@ -57,6 +57,13 @@ pub const COND_UPSTREAM_REACHABLE: &str = "UpstreamReachable";
 /// share that filesystem.
 pub const COND_NODE_DISK_PRESSURE: &str = "NodeDiskPressure";
 
+/// `BackupHealthy` — whether the scheduled off-site backup can run
+/// (WI-386). Built from the backup CronJobs, their Jobs and pods, not
+/// from the runner's own record, which cannot see a pod that was never
+/// scheduled or a runner killed at its memory limit. Absent while
+/// `spec.backup.enabled` is not true. See `backup_health`.
+pub const COND_BACKUP_HEALTHY: &str = "BackupHealthy";
+
 /// Maximum entries kept in `PlatformStack.status.versionHistory`.
 /// Ring-buffer behaviour: oldest entry drops when this cap is
 /// exceeded. Per spec.md §3.11 ("recent N transitions"); 10 is
