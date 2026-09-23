@@ -156,6 +156,19 @@ _components: "nats": #Component & {
 					// promise is carved out of, so it must exceed the
 					// ceiling with room for JetStream's own metadata
 					// overhead, not merely equal it.
+					//
+					// Neither `size` nor `storageClassName` can be changed
+					// on a running cluster by editing it here. The
+					// apiserver refuses any change to an existing
+					// StatefulSet's volumeClaimTemplates, so the sync
+					// fails with `Forbidden` and self-heal keeps retrying
+					// it. Rolling one out takes deleting the StatefulSet
+					// with `--cascade=orphan` (the pod keeps running), so
+					// the next sync recreates it. Even then the existing
+					// PVC keeps its size and class: the template shapes
+					// only PVCs created later, and a `local-path` class
+					// does not allow expansion, so a resize of that PVC is
+					// refused too (measured on kind, Kubernetes 1.36.4).
 					size:             "5Gi"
 					storageClassName: "local-path"
 					// Renders the volumeClaimTemplate exactly as the
@@ -173,7 +186,8 @@ _components: "nats": #Component & {
 					// change at all.
 					//
 					// This ignores nothing. A real template change, such
-					// as `size`, still shows as OutOfSync. An
+					// as `size`, still shows as OutOfSync (and does not
+					// sync; see the note above `size`). An
 					// ignoreDifferences fix would have to hide all four
 					// fields, volumeMode included; hiding only apiVersion
 					// and kind leaves the creationTimestamp diff (measured
