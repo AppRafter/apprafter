@@ -3,7 +3,8 @@
 //! a held table lock fails within its `--lock-wait-timeout` with the lock named
 //! in the error; a `pg_dump` behind a held MATERIALIZED VIEW lock — which that
 //! flag does not cover — fails at its first-output bound with the lock
-//! explained; and a command that writes more stderr than kube-rs's 1 KiB pipe
+//! explained, and its server session ends with it while the lock is still
+//! held; and a command that writes more stderr than kube-rs's 1 KiB pipe
 //! still returns. All three hung on kube-rs 4 before the fixes these tests
 //! came with, and none shows up against a stub: the locks are PostgreSQL's,
 //! and the pipe sits inside kube-rs's WebSocket message loop.
@@ -434,6 +435,16 @@ fn dumps_waiting_on_a_view_definition(k: &KubeRsExec, ns: &str) -> String {
     )
 }
 
+/// How many server sessions a `pg_dump` opened are still there: `pg_dump`
+/// connects with `application_name` `pg_dump`, and nothing else here does.
+fn dump_sessions(k: &KubeRsExec, ns: &str) -> String {
+    psql(
+        k,
+        ns,
+        "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'pg_dump'",
+    )
+}
+
 #[test]
 #[ignore = "real cluster, ~12 min — set APPRAFTER_K8S_SMOKE=1 + KUBECONFIG (a kind cluster) to run"]
 fn a_held_materialized_view_lock_fails_the_dump_at_its_first_output_bound_and_a_released_one_dumps()
@@ -548,13 +559,12 @@ fn a_held_materialized_view_lock_fails_the_dump_at_its_first_output_bound_and_a_
         "{msg}"
     );
 
-    // --- lock released: the same extraction dumps ------------------------------
-    k.delete_pod_best_effort("refresher", NS);
-    wait_until("the lock on mv1 to go", Duration::from_secs(60), || {
-        held_on_mv1() == "0"
-    });
-    // The abandoned dump's helper pod is on its way out (the guard deleted
-    // it); the next extraction reuses the name, so let it go first.
+    // --- the abandoned dump's server session ends, the lock still held --------
+    // The guard deleted the helper pod, which kills pg_dump. Its server
+    // session is waiting on mv1 and so does no socket I/O: only the server's
+    // own connection check (`PG_DUMP_PGOPTIONS`) ends it before the refresher
+    // does. Without that check it would sit there, holding ACCESS SHARE on t1
+    // and a connection slot, for as long as the refresher's transaction.
     let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client.clone(), NS);
     wait_until(
         "the abandoned helper pod to go",
@@ -565,6 +575,22 @@ fn a_held_materialized_view_lock_fails_the_dump_at_its_first_output_bound_and_a_
                 .is_none()
         },
     );
+    wait_until(
+        "the abandoned dump's server session to end",
+        Duration::from_secs(60),
+        || dump_sessions(k, NS) == "0",
+    );
+    assert_eq!(
+        held_on_mv1(),
+        "1",
+        "the session must end while the refresher still holds mv1, not because the lock went"
+    );
+
+    // --- lock released: the same extraction dumps ------------------------------
+    k.delete_pod_best_effort("refresher", NS);
+    wait_until("the lock on mv1 to go", Duration::from_secs(60), || {
+        held_on_mv1() == "0"
+    });
     let (elapsed, result) = extract_with_watchdog(k, item, dir.path(), SETUP_SLACK)
         .unwrap_or_else(|waited| panic!("the unblocked dump was still running after {waited:?}"));
     result.unwrap_or_else(|e| panic!("the unblocked dump failed after {elapsed:?}: {e}"));

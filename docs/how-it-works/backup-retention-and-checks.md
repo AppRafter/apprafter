@@ -376,7 +376,12 @@ write its first byte: five for the table locks, and five for a schema read
 that takes seconds even at ten thousand tables. Once the dump is writing,
 only the run's deadline limits it, so copying a large table is never cut
 short. Both bounds apply to `apprafter backup create` and `apprafter export`
-too. A dump that gave up leaves no restorable snapshot behind: a `monolithic`
+too. A dump that gave up, or that a run's deadline stopped, does not stay
+behind on the database. Deleting its helper pod kills `pg_dump`, but a server
+session waiting on a lock does not notice that its client has gone, and would
+keep its shared table locks and a connection until that lock was released. So
+the helper connects with `client_connection_check_interval` set to ten
+seconds, and the session ends within seconds of the kill. A dump that gave up leaves no restorable snapshot behind: a `monolithic`
 run fails before restic writes anything, and a `sequential` run never writes
 the commit snapshot, so the claim snapshots it already wrote are ignored by
 restore and removed by the next prune.

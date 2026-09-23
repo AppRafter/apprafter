@@ -167,8 +167,12 @@ pub async fn stop_run(ctx: &StopContext) -> RunOutcome {
     eprintln!("backup stopped: {error}");
 
     // 1. Helper pods first: deleting one ends the exec the run is blocked in.
-    //    Grace 0, because the work in them is abandoned and a dump killed now
-    //    releases its locks on the application's database now.
+    //    Grace 0, because the work in them is abandoned. A dump killed now has
+    //    its database session, and the table locks that session holds, ended
+    //    within seconds, even while it waits on a lock: the helper connects with
+    //    `client_connection_check_interval`
+    //    (`backup_core::extract::PG_DUMP_PGOPTIONS`). Without that, the
+    //    session would outlive the kill.
     let pods = ctx.live_helpers.snapshot();
     let deletes = pods.iter().map(|(ns, name)| {
         let api: Api<Pod> = Api::namespaced(ctx.client.clone(), ns);

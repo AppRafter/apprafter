@@ -365,7 +365,8 @@ pub fn pod_name_segment(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Build a `pg_dump` helper Pod spec with `PGPASSWORD` injected into the
-/// container environment so `pg_dump` never needs an interactive prompt.
+/// container environment so `pg_dump` never needs an interactive prompt, and
+/// [`PG_DUMP_PGOPTIONS`] so an abandoned dump's server session ends with it.
 /// All other fields mirror `helper_pod::pg_dump_pod_spec`.
 pub(crate) fn pg_dump_pod_spec_with_password(
     name: &str,
@@ -388,10 +389,10 @@ pub(crate) fn pg_dump_pod_spec_with_password(
                 "name": "dump",
                 "image": image,
                 "command": crate::helper_pod::keep_alive_command(keep_alive),
-                "env": [{
-                    "name": "PGPASSWORD",
-                    "value": password
-                }]
+                "env": [
+                    { "name": "PGPASSWORD", "value": password },
+                    { "name": "PGOPTIONS", "value": PG_DUMP_PGOPTIONS }
+                ]
             }]
         }
     })
@@ -830,6 +831,34 @@ pub const PG_DUMP_LOCK_WAIT_TIMEOUT: &str = "300s";
 /// take as long as it needs; the run's own deadline is what bounds that.
 pub const PG_DUMP_FIRST_OUTPUT_WITHIN: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// The `PGOPTIONS` the `pg_dump` helper connects with: the server checks
+/// every ten seconds, while a statement runs, that the client is still there.
+///
+/// A run abandons a dump in two ways, [`PG_DUMP_FIRST_OUTPUT_WITHIN`] and the
+/// runner's stop at its deadline, and both end in deleting the helper pod,
+/// which kills `pg_dump`. That alone does not end its server session.
+/// PostgreSQL notices a closed connection only when it next reads or writes
+/// it, and a session waiting on a lock does neither. The session keeps what
+/// it has already taken (ACCESS SHARE on every table, which the dump locks
+/// first, and a connection slot) until the lock it waits on is released. For a
+/// migration left idle in a transaction, that can be days. And because the
+/// first-output bound ends each stuck run at ten minutes instead of letting it
+/// block the next one, every scheduled run would add another such session.
+///
+/// `client_connection_check_interval` makes a running statement poll its
+/// socket, a lock wait included. Measured on PostgreSQL 18.6, with a `pg_dump`
+/// waiting in `pg_get_viewdef` behind a `REFRESH MATERIALIZED VIEW` held in an
+/// open transaction and then killed with SIGKILL: without the setting its
+/// session was still waiting, and still holding its table lock, 20 s later;
+/// with it the session was gone 5 s after the kill. `pg_dump` resets
+/// `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout`
+/// and `transaction_timeout` when it connects, but not this.
+///
+/// The setting needs PostgreSQL 14 or later on Linux, and a server that does
+/// not know it refuses the connection outright. The platform's CNPG clusters
+/// run PostgreSQL 18 (`CNPG_OPERAND_IMAGE` in the provisioner).
+pub const PG_DUMP_PGOPTIONS: &str = "-c client_connection_check_interval=10s";
+
 /// Build the `pg_dump` argument vector for a custom-format dump.
 ///
 /// Returns a `Vec<String>` so the caller is not constrained by the lifetime of
@@ -1191,6 +1220,49 @@ mod tests {
                 "the runner's stop deletes only pods carrying this label"
             );
         }
+    }
+
+    #[test]
+    fn the_pg_dump_helper_has_the_server_end_an_abandoned_dumps_session() {
+        // A dump abandoned while its server session waits on a lock — the
+        // first-output bound, the runner's stop — leaves that session behind
+        // unless the server polls for the dead client: it holds ACCESS SHARE
+        // on every table and a connection slot until the lock holder ends.
+        let k = RecordingKube::default();
+        let items = plan_extraction(&[json!({
+            "spec": {"type": "pg"}, "metadata": {"name": "db", "namespace": "demo"},
+            "status": {"connectionSecretRef": "db-conn"}
+        })]);
+        let dir = tempfile::tempdir().unwrap();
+        run_extraction(
+            &k,
+            &items,
+            dir.path(),
+            images::DEFAULT_PG_IMAGE,
+            crate::helper_pod::DEFAULT_RUN_DEADLINE,
+        )
+        .unwrap();
+
+        let applied = k.applied.lock().unwrap().clone();
+        assert_eq!(applied.len(), 1, "{applied:?}");
+        let env = &applied[0]["spec"]["containers"][0]["env"];
+        let value_of = |name: &str| {
+            env.as_array()
+                .into_iter()
+                .flatten()
+                .filter(|e| e["name"] == name)
+                .map(|e| e["value"].clone())
+                .collect::<Vec<_>>()
+        };
+        // Exactly this text: the server refuses a connection whose startup
+        // options name a setting it does not know, so a misspelt name would
+        // fail every dump rather than being ignored.
+        assert_eq!(
+            value_of("PGOPTIONS"),
+            vec![json!("-c client_connection_check_interval=10s")],
+            "{env}"
+        );
+        assert_eq!(value_of("PGPASSWORD"), vec![json!("pass-value")], "{env}");
     }
 
     #[test]
