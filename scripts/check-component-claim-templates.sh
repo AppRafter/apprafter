@@ -28,6 +28,9 @@
 # yet. Git-sourced components are plain manifests and are listed as not
 # rendered. None of them ships a StatefulSet today.
 #
+# The umbrella chart itself is rendered afresh into a temp directory. The
+# check never reads or writes platform-stack/dist/.
+#
 # Usage: bash scripts/check-component-claim-templates.sh
 # Exit 0 = every volumeClaimTemplate carries all four fields, and at least
 # one was checked.
@@ -48,16 +51,43 @@ else
     YQ=(nix run nixpkgs#yq-go --)
 fi
 
-version="$("${CUE_CMD[@]}" export ./platform-stack/cue/... -e currentVersion --out text)"
-chart="platform-stack/dist/platform-stack-${version}"
-if [[ ! -d "$chart" ]]; then
-    echo "==> rendering $chart"
-    make -C platform-stack render-only >/dev/null
-fi
-[[ -d "$chart" ]] || { echo "::error::no rendered chart at $chart" >&2; exit 1; }
-
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
+
+# The umbrella chart is rendered on every run, from the working tree, into
+# $workdir. Both shortcuts check the wrong source:
+#   - Reusing platform-stack/dist/. currentVersion stays the same for a whole
+#     dev cycle, so a dist from an earlier render has the right name and old
+#     content. This check then passed with the `merge` block removed.
+#   - Running `make -C platform-stack render-only`. It rm -rf's
+#     platform-stack/dist/ while other checks may be reading it.
+# So this copies every CUE file of the module, tracked or new, as it is on
+# disk, and renders the copy. The renderer writes `dist/` relative to its
+# working directory, the same way `make render-only` does.
+src="$workdir/src"
+while IFS= read -r -d '' f; do
+    [[ -f "$f" ]] || continue # tracked, but deleted in the working tree
+    mkdir -p "$src/$(dirname "$f")"
+    cp "$f" "$src/$f"
+done < <(git ls-files -z --cached --others --exclude-standard -- cue.mod '*.cue')
+[[ -f "$src/cue.mod/module.cue" ]] || {
+    echo "::error::copying the CUE module found no cue.mod/module.cue" >&2
+    exit 1
+}
+version="$(cd "$src" && "${CUE_CMD[@]}" export ./platform-stack/cue/... -e currentVersion --out text)" || {
+    echo "::error::cue could not evaluate platform-stack/cue (error above)" >&2
+    exit 1
+}
+chart="$src/platform-stack/dist/platform-stack-${version}"
+echo "==> rendering platform-stack $version from the working tree"
+(cd "$src/platform-stack" && "${CUE_CMD[@]}" cmd render ./cue/...) >/dev/null || {
+    echo "::error::cue could not render platform-stack/cue (error above)" >&2
+    exit 1
+}
+[[ -d "$chart" ]] || {
+    echo "::error::the render wrote no chart at ${chart#"$src"/}" >&2
+    exit 1
+}
 
 # Every component switched on, so the ones that ship `enabled: false` and are
 # turned on later by an override (nats, nack, backstage) are checked too.
