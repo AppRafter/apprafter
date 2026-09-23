@@ -2158,6 +2158,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "futures",
+ "http",
  "k8s-openapi",
  "kube",
  "oci-client",
@@ -2171,6 +2172,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "tokio",
+ "tower",
  "tracing",
 ]
 

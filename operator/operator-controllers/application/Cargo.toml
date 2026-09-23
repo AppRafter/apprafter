@@ -33,3 +33,12 @@ serde        = { workspace = true }
 serde_json   = { workspace = true }
 reqwest      = { workspace = true }
 async-trait  = { workspace = true }
+
+[dev-dependencies]
+# The reconcile-level tests drive the whole `reconcile` against a scripted
+# in-process apiserver. `kube::Client` is a thin wrapper over a
+# `tower::Service`, so a `tower::service_fn` answering from a script exercises
+# the real client with no cluster — the only way to read the Deployment a
+# reconcile actually APPLIES, which is what decides whether it is a rollout.
+tower = { workspace = true }
+http  = { workspace = true }

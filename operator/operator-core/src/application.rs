@@ -913,8 +913,9 @@ pub const ANN_IMAGE_PINNED_AT: &str = "apprafter.io/image-pinned-at";
 ///    stated intent is not in effect.
 ///  * `False` / `ResolveFailed` — resolution failed this cycle (registry
 ///    unreachable, no covering credential, malformed reference); the
-///    Deployment falls back to the verbatim tag. Resolution NEVER blocks
-///    the rollout (ADR 0040).
+///    Deployment keeps the digest already running for the same tag, or
+///    gets the verbatim tag when there is none. Resolution NEVER blocks the
+///    rollout (ADR 0040), and a failure alone never starts one.
 ///
 /// Absent when `imagePolicy.resolve: off`.
 pub const COND_IMAGE_RESOLVED: &str = "ImageResolved";

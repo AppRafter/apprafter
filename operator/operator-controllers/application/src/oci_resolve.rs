@@ -279,7 +279,7 @@ application/vnd.docker.distribution.manifest.v2+json";
 /// reference is returned verbatim (no I/O). On a 401 we run one bearer
 /// token exchange and retry once.
 pub async fn resolve_digest(
-    http: &impl RegistryHttp,
+    http: &(impl RegistryHttp + ?Sized),
     image: &str,
     auth: &RegistryAuth,
 ) -> Result<String, OciResolveError> {
