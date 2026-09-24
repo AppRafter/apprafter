@@ -26,11 +26,16 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
+/// The zone type of [`RetentionPolicy::zone`], re-exported so that a caller
+/// names a zone without a dependency of its own on the zone database.
+pub use chrono_tz::Tz;
 use cli_core::{CliError, Result};
 use serde_json::Value;
 
-use crate::restic::{restic_forget_argv, restic_prune_argv, restic_snapshots_argv};
+use crate::restic::{
+    restic_forget_argv, restic_prune_argv, restic_snapshots_argv, snapshot_instant,
+};
 
 /// How long past a run's newest snapshot, beyond the backup deadline, a run
 /// with no manifest is still left alone ([`unfinished_run_window`]): the pod's
@@ -77,12 +82,14 @@ pub struct SnapshotMeta {
     pub id: String,
     /// The shared `run-<id>` tag (== the backup tag).
     pub run_tag: String,
-    /// RFC-3339; lexicographically sortable. When its `restic backup`
-    /// started: what the keep policy buckets on.
+    /// When its `restic backup` started: what the keep policy buckets on.
+    /// RFC 3339 with the WRITER's offset — `…Z` from the runner, the
+    /// workstation's own from `backup create` — so NOT sortable as a string:
+    /// compared and bucketed as an instant ([`snapshot_instant`]).
     pub time: String,
     /// When its `restic backup` ended (`summary.backup_end`, restic 0.17+),
-    /// RFC-3339; `None` from an older restic. A large claim's upload lies
-    /// between `time` and this, and a run is alive until it
+    /// RFC 3339, the same way; `None` from an older restic. A large claim's
+    /// upload lies between `time` and this, and a run is alive until it
     /// ([`unfinished_run_window`]).
     pub ended: Option<String>,
     /// True iff this snapshot carries `manifest.json` (the run representative).
@@ -93,12 +100,17 @@ pub struct SnapshotMeta {
     pub tags: Vec<String>,
 }
 
-/// How many representatives to keep per calendar day / ISO week / calendar month.
+/// How many representatives to keep per calendar day / ISO week / calendar
+/// month, and in which zone those days, weeks and months are counted.
 #[derive(Clone, Copy, Debug)]
 pub struct RetentionPolicy {
     pub keep_daily: u32,
     pub keep_weekly: u32,
     pub keep_monthly: u32,
+    /// The zone whose calendar days, ISO weeks and months the policy counts:
+    /// the backup schedule's own, `spec.backup.timeZone` ([`policy_zone`]),
+    /// and UTC on a cluster that names none.
+    pub zone: Tz,
 }
 
 impl Default for RetentionPolicy {
@@ -107,8 +119,51 @@ impl Default for RetentionPolicy {
             keep_daily: 7,
             keep_weekly: 4,
             keep_monthly: 6,
+            zone: Tz::UTC,
         }
     }
+}
+
+/// The zone the keep policy counts its days, ISO weeks and months in, from
+/// `spec.backup.timeZone` — the zone both backup CronJobs run their
+/// schedules in. The CLI's `apprafter backup prune` reads it off the
+/// PlatformStack; the chart gives the runner the same value as
+/// `APPRAFTER_BACKUP_TIME_ZONE`. Both parse it here, against the one zone
+/// database compiled into both, so the two prunes bucket alike.
+///
+/// # Why the schedule's zone, and not UTC
+///
+/// A daily CronJob in zone Z starts one run per calendar day OF Z, every day
+/// of the year. Counted in Z, `keepDaily: 7` is therefore always the last
+/// seven scheduled runs, the weekly bucket is Z's Monday to Sunday and the
+/// monthly one Z's month. Counted in any other zone, UTC included, the day
+/// boundary falls at a different hour of Z's clock, and moves by an hour
+/// when Z changes to or from summer time: a schedule within an hour of that
+/// boundary then puts two runs in one counted day and none in the next, and
+/// `keepDaily` forgets one of the two. A nightly `--at 01:30 --timezone
+/// Europe/Berlin` runs at 00:30 UTC on the Sunday of the spring change and
+/// at 23:30 UTC the same day for Monday, so a UTC count throws Sunday's run
+/// away. The writer's own offset is no zone at all: the runner writes UTC
+/// and a workstation its local time, and a run's day then depended on who
+/// took it.
+///
+/// An empty value is a cluster whose schedules run in the
+/// kube-controller-manager's zone, which neither the CLI nor the runner can
+/// read; UTC stands in for it. A name this database does not know is an
+/// `Err` naming it, and the caller counts in UTC and says so: the zone only
+/// decides which run is the newest of its day, never how many are kept, and
+/// a prune must not stop over it.
+pub fn policy_zone(name: &str) -> std::result::Result<Tz, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(Tz::UTC);
+    }
+    name.parse::<Tz>().map_err(|_| {
+        format!(
+            "spec.backup.timeZone {name:?} is not a zone this build knows, so the keep policy \
+             counts its days, weeks and months in UTC"
+        )
+    })
 }
 
 /// The set of snapshot ids to `restic forget`.
@@ -163,10 +218,13 @@ struct Run {
 ///    it is an ORPHAN → ALL its snapshot ids are forgotten. (A monolithic run
 ///    is a single snapshot with `is_manifest == true` → it is its own
 ///    representative.)
-/// 3. Apply the keep policy to the set of representatives by `time`: keep the
-///    newest representative per distinct calendar day up to `keep_daily`, per
-///    distinct ISO week up to `keep_weekly`, per distinct calendar month up to
-///    `keep_monthly`. A representative kept by ANY of the three is kept (union).
+/// 3. Apply the keep policy to the set of representatives by `time`, read as
+///    an instant ([`snapshot_instant`]) and placed in the policy's zone
+///    ([`RetentionPolicy::zone`]): keep the newest representative per
+///    distinct calendar day up to `keep_daily`, per distinct ISO week up to
+///    `keep_weekly`, per distinct calendar month up to `keep_monthly`. A
+///    representative kept by ANY of the three is kept (union). One whose
+///    time does not parse belongs to no day, week or month, and is kept.
 /// 4. For every representative NOT kept → forget ALL its group's snapshot ids.
 /// 5. Representatives that ARE kept → keep all their group's members.
 ///
@@ -195,17 +253,18 @@ pub fn plan_prune(
         });
         run.ids.push(s.id.clone());
         for seen in std::iter::once(&s.time).chain(&s.ended) {
-            if let Ok(t) = DateTime::parse_from_rfc3339(seen) {
-                let t = t.with_timezone(&Utc);
+            if let Some(t) = snapshot_instant(seen) {
                 run.newest = Some(run.newest.map_or(t, |n| n.max(t)));
             }
         }
         if s.is_manifest {
             // If (pathologically) more than one member claims to be the
-            // manifest, the newest by time wins as the representative — its
-            // `time` is what the keep policy buckets on.
+            // manifest, the newest by the clock wins as the representative —
+            // its `time` is what the keep policy buckets on. A tie is broken
+            // by id, as in the keep policy's walk, so the choice does not
+            // depend on the order restic lists in.
             match &run.representative {
-                Some(cur) if cur.time >= s.time => {}
+                Some(cur) if newest_first(cur, s).is_le() => {}
                 _ => run.representative = Some(s.clone()),
             }
         }
@@ -276,47 +335,72 @@ fn may_still_be_written(
     }
 }
 
+/// Newest first by the clock ([`snapshot_instant`]), a time that does not
+/// parse after every one that does, and a tie broken by id — so neither the
+/// writer's offset nor the order restic lists in changes which run comes
+/// first.
+fn newest_first(a: &SnapshotMeta, b: &SnapshotMeta) -> std::cmp::Ordering {
+    snapshot_instant(&b.time)
+        .cmp(&snapshot_instant(&a.time))
+        .then_with(|| a.id.cmp(&b.id))
+}
+
 /// Return the set of representative ids kept by the union of the three buckets.
 ///
-/// For each bucket kind, walk the representatives newest-first and keep the
-/// newest one per distinct period (day / ISO-week / month) until `keep_*`
-/// distinct periods have been kept. A representative kept by ANY bucket is kept.
+/// A representative's day is the date its `time`, read as an instant, falls
+/// on in the policy's zone ([`RetentionPolicy::zone`]) — not the date its
+/// writer's clock showed. For each bucket kind, walk the representatives
+/// newest-first and keep the newest one per distinct period (day / ISO week /
+/// month) until `keep_*` distinct periods have been kept. A representative
+/// kept by ANY bucket is kept.
+///
+/// So is one whose time does not parse. It has no day, week or month to be
+/// counted in, and restic always writes a time, so it is not a run this
+/// planner understands: it is kept for someone to look at rather than
+/// deleted, and it takes no period's slot from a run that has one.
 fn select_kept(
     representatives: &[(&SnapshotMeta, &Vec<String>)],
     policy: &RetentionPolicy,
 ) -> std::collections::HashSet<String> {
     use std::collections::HashSet;
 
-    // Newest-first; ties broken by id for determinism.
     let mut reps: Vec<&SnapshotMeta> = representatives.iter().map(|(r, _)| *r).collect();
-    reps.sort_by(|a, b| b.time.cmp(&a.time).then_with(|| a.id.cmp(&b.id)));
+    reps.sort_by(|a, b| newest_first(a, b));
 
     let mut kept: HashSet<String> = HashSet::new();
+    let mut dated: Vec<(&str, NaiveDate)> = Vec::with_capacity(reps.len());
+    for rep in reps {
+        match snapshot_instant(&rep.time) {
+            Some(at) => dated.push((&rep.id, at.with_timezone(&policy.zone).date_naive())),
+            None => {
+                kept.insert(rep.id.clone());
+            }
+        }
+    }
 
-    keep_by_period(&reps, policy.keep_daily, period_day, &mut kept);
-    keep_by_period(&reps, policy.keep_weekly, period_week, &mut kept);
-    keep_by_period(&reps, policy.keep_monthly, period_month, &mut kept);
+    keep_by_period(&dated, policy.keep_daily, day_of, &mut kept);
+    keep_by_period(&dated, policy.keep_weekly, iso_week_of, &mut kept);
+    keep_by_period(&dated, policy.keep_monthly, month_of, &mut kept);
 
     kept
 }
 
 /// Keep the newest representative per distinct period, up to `keep` periods.
 ///
-/// `reps` MUST already be sorted newest-first. Adds kept ids into `kept`.
+/// `dated` (each representative's id and its date in the policy's zone) MUST
+/// already be sorted newest-first. Adds kept ids into `kept`.
 fn keep_by_period(
-    reps: &[&SnapshotMeta],
+    dated: &[(&str, NaiveDate)],
     keep: u32,
-    period_of: fn(&str) -> Option<String>,
+    period_of: fn(NaiveDate) -> (i32, u32),
     kept: &mut std::collections::HashSet<String>,
 ) {
     if keep == 0 {
         return;
     }
-    let mut seen_periods: Vec<String> = Vec::new();
-    for rep in reps {
-        let Some(period) = period_of(&rep.time) else {
-            continue; // unparseable time — never keep it by this bucket
-        };
+    let mut seen_periods: Vec<(i32, u32)> = Vec::new();
+    for (id, date) in dated {
+        let period = period_of(*date);
         if seen_periods.contains(&period) {
             continue; // already kept the newest representative in this period
         }
@@ -324,37 +408,26 @@ fn keep_by_period(
             break; // kept enough distinct periods for this bucket
         }
         seen_periods.push(period);
-        kept.insert(rep.id.clone());
+        kept.insert(id.to_string());
     }
 }
 
-/// Calendar-day period key `YYYY-MM-DD` from an RFC-3339 time.
-fn period_day(time: &str) -> Option<String> {
-    parse_date(time).map(|(y, m, d)| format!("{y:04}-{m:02}-{d:02}"))
+/// A calendar day: its year and day of the year.
+fn day_of(date: NaiveDate) -> (i32, u32) {
+    (date.year(), date.ordinal())
 }
 
-/// Calendar-month period key `YYYY-MM` from an RFC-3339 time.
-fn period_month(time: &str) -> Option<String> {
-    parse_date(time).map(|(y, m, _d)| format!("{y:04}-{m:02}"))
+/// An ISO 8601 week: its ISO week-year and week number (chrono `IsoWeek`, so
+/// a run on 2026-12-31 and one on 2027-01-01 land in the same week when they
+/// should).
+fn iso_week_of(date: NaiveDate) -> (i32, u32) {
+    let week = date.iso_week();
+    (week.year(), week.week())
 }
 
-/// ISO-8601 week period key `YYYY-Www` from an RFC-3339 time (chrono
-/// `IsoWeek` — correct ISO-week-year + week-number, so a run on 2026-12-31 and
-/// one on 2027-01-01 land in the same ISO week when they should).
-fn period_week(time: &str) -> Option<String> {
-    use chrono::Datelike;
-    let dt = chrono::DateTime::parse_from_rfc3339(time).ok()?;
-    let iso = dt.date_naive().iso_week();
-    Some(format!("{:04}-W{:02}", iso.year(), iso.week()))
-}
-
-/// Parse `(year, month, day)` from an RFC-3339 time. Uses chrono for a robust
-/// parse (offsets, fractional seconds, `Z`), falling back to nothing on error.
-fn parse_date(time: &str) -> Option<(i32, u32, u32)> {
-    use chrono::Datelike;
-    let dt = chrono::DateTime::parse_from_rfc3339(time).ok()?;
-    let d = dt.date_naive();
-    Some((d.year(), d.month(), d.day()))
+/// A calendar month: its year and month.
+fn month_of(date: NaiveDate) -> (i32, u32) {
+    (date.year(), date.month())
 }
 
 // ---------------------------------------------------------------------------
@@ -811,6 +884,7 @@ mod tests {
             keep_daily: 2,
             keep_weekly: 0,
             keep_monthly: 0,
+            zone: Tz::UTC,
         };
         let plan = plan_prune(&snaps, &policy, MINE, later(), SIX_HOURS);
         // The OLDEST run's ALL THREE snapshot ids are forgotten.
@@ -850,6 +924,7 @@ mod tests {
             keep_daily: 2,
             keep_weekly: 0,
             keep_monthly: 0,
+            zone: Tz::UTC,
         };
         let plan = plan_prune(&snaps, &policy, MINE, later(), SIX_HOURS);
         assert_eq!(plan.forget_ids, vec!["m-a-mono".to_string()]);
@@ -1107,6 +1182,7 @@ mod tests {
             keep_daily: 1,
             keep_weekly: 1,
             keep_monthly: 0,
+            zone: Tz::UTC,
         };
         let plan = plan_prune(&snaps, &policy, MINE, later(), SIX_HOURS);
         assert_eq!(plan.forget_ids, vec!["w-old-mono".to_string()]);
@@ -1119,6 +1195,7 @@ mod tests {
             keep_daily: 1,
             keep_weekly: 0,
             keep_monthly: 2,
+            zone: Tz::UTC,
         };
         let plan = plan_prune(&snaps, &policy, MINE, later(), SIX_HOURS);
         // daily keeps newest (July); monthly keeps newest-per-month for 2 months
@@ -1141,6 +1218,7 @@ mod tests {
             keep_daily: 0,
             keep_weekly: 0,
             keep_monthly: 0,
+            zone: Tz::UTC,
         };
         let plan = plan_prune(&snaps, &policy, MINE, later(), SIX_HOURS);
         let mut expected = vec![
@@ -1151,6 +1229,279 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(plan.forget_ids, expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // Times written at different offsets, and the zone the policy counts in.
+    // -----------------------------------------------------------------------
+
+    /// A complete monolithic run whose one snapshot restic lists with `time`
+    /// exactly as its writer recorded it: `…Z` from the runner, the
+    /// workstation's own offset from `apprafter backup create`.
+    fn run_at(label: &str, time: &str) -> SnapshotMeta {
+        let run_tag = format!("{MINE}-{label}");
+        SnapshotMeta {
+            id: label.to_string(),
+            run_tag: run_tag.clone(),
+            time: time.to_string(),
+            is_manifest: true,
+            ended: None,
+            tags: vec![run_tag],
+        }
+    }
+
+    fn keep_days(keep_daily: u32, zone: Tz) -> RetentionPolicy {
+        RetentionPolicy {
+            keep_daily,
+            keep_weekly: 0,
+            keep_monthly: 0,
+            zone,
+        }
+    }
+
+    fn berlin() -> Tz {
+        policy_zone("Europe/Berlin").unwrap()
+    }
+
+    /// The ids `plan_prune` forgets, with the listing in the order given
+    /// and reversed: the plan must not depend on the order restic lists in.
+    fn forgotten(snaps: &[SnapshotMeta], policy: &RetentionPolicy) -> Vec<String> {
+        let plan = plan_prune(snaps, policy, MINE, later(), SIX_HOURS);
+        let mut reversed = snaps.to_vec();
+        reversed.reverse();
+        let again = plan_prune(&reversed, policy, MINE, later(), SIX_HOURS);
+        assert_eq!(plan, again, "the plan depends on the listing's order");
+        plan.forget_ids
+    }
+
+    /// The reported failure: in one repository the runner (UTC) took a run
+    /// at 03:30:00Z, and a workstation an hour ahead of UTC had taken one at
+    /// 04:00:03+01:00, which is 03:00:03Z — half an hour EARLIER. Compared
+    /// as strings the workstation's was the newer, and the day's one kept
+    /// run was the older of the two.
+    #[test]
+    fn the_newer_run_of_a_day_is_kept_whichever_offset_its_writer_used() {
+        let json = format!(
+            r#"[
+              {{"id":"runner","time":"2026-09-24T03:30:00.1Z",
+                "tags":["{MINE}-2026-09-24T03:30:00Z"],"paths":["/s/r/data"]}},
+              {{"id":"cli","time":"2026-09-24T04:00:03.1+01:00",
+                "tags":["{MINE}-2026-09-24T03:00:00Z"],"paths":["/s/c/data"]}}
+            ]"#
+        );
+        let snaps = parse_snapshots(&json).unwrap();
+        for zone in [Tz::UTC, berlin(), policy_zone("Europe/London").unwrap()] {
+            assert_eq!(
+                forgotten(&snaps, &keep_days(1, zone)),
+                vec!["cli"],
+                "{zone}"
+            );
+        }
+        assert_eq!(
+            forgotten(&snaps, &RetentionPolicy::default()),
+            vec!["cli"],
+            "the default 7/4/6 keeps one run a day too"
+        );
+    }
+
+    /// A run's day is its day in the policy's zone, whoever wrote it — not
+    /// the date its writer's clock showed. Around midnight in Berlin (in
+    /// September two hours ahead of UTC), around midnight UTC, and around
+    /// midnight in New York (four hours behind).
+    #[test]
+    fn a_run_just_before_and_one_just_after_midnight_are_on_the_zones_two_days() {
+        // Berlin: a workstation there at 23:59 on the 23rd, the runner at
+        // 22:01Z — two minutes later, and 00:01 on the 24th in Berlin.
+        let snaps = vec![
+            run_at("older", "2026-09-22T10:00:00Z"),
+            run_at("berlin-2359", "2026-09-23T23:59:00+02:00"),
+            run_at("runner-2201z", "2026-09-23T22:01:00Z"),
+        ];
+        assert_eq!(forgotten(&snaps, &keep_days(2, berlin())), vec!["older"]);
+        // In UTC both are on the 23rd, and the later of them is its run.
+        assert_eq!(
+            forgotten(&snaps, &keep_days(2, Tz::UTC)),
+            vec!["berlin-2359"]
+        );
+
+        // UTC: the Berlin workstation at 01:59 on the 25th is 23:59Z on the
+        // 24th; the runner two minutes later is on the 25th.
+        let snaps = vec![
+            run_at("older", "2026-09-23T12:00:00Z"),
+            run_at("berlin-0159", "2026-09-25T01:59:00+02:00"),
+            run_at("runner-0001z", "2026-09-25T00:01:00Z"),
+        ];
+        assert_eq!(forgotten(&snaps, &keep_days(2, Tz::UTC)), vec!["older"]);
+        // In Berlin both are on the 25th.
+        assert_eq!(
+            forgotten(&snaps, &keep_days(2, berlin())),
+            vec!["berlin-0159"]
+        );
+
+        // New York: the runner at 03:30Z is 23:30 on the 23rd there; a
+        // workstation in New York at 00:10 on the 24th is 04:10Z.
+        let new_york = policy_zone("America/New_York").unwrap();
+        let snaps = vec![
+            run_at("older", "2026-09-22T12:00:00Z"),
+            run_at("runner-0330z", "2026-09-24T03:30:00Z"),
+            run_at("ny-0010", "2026-09-24T00:10:00-04:00"),
+        ];
+        assert_eq!(forgotten(&snaps, &keep_days(2, new_york)), vec!["older"]);
+        assert_eq!(
+            forgotten(&snaps, &keep_days(2, Tz::UTC)),
+            vec!["runner-0330z"]
+        );
+    }
+
+    /// Spring: a nightly `--at 01:30 --timezone Europe/Berlin` runs at
+    /// 00:30Z until Sunday 29 March 2026, the day the clocks go forward,
+    /// and at 23:30Z the day BEFORE from Monday. Counted in Berlin, every
+    /// run is its own day and `keepDaily: 7` is the last seven runs.
+    /// Counted in UTC, Sunday's and Monday's runs share the 29th, and
+    /// Sunday's is forgotten while an eighth-oldest run is kept.
+    #[test]
+    fn a_daily_schedule_is_one_run_a_day_across_the_spring_clock_change() {
+        let snaps: Vec<SnapshotMeta> = [
+            ("tue-24", "2026-03-24T00:30:00Z"),
+            ("wed-25", "2026-03-25T00:30:00Z"),
+            ("thu-26", "2026-03-26T00:30:00Z"),
+            ("fri-27", "2026-03-27T00:30:00Z"),
+            ("sat-28", "2026-03-28T00:30:00Z"),
+            ("sun-29", "2026-03-29T00:30:00Z"),
+            ("mon-30", "2026-03-29T23:30:00Z"),
+            ("tue-31", "2026-03-30T23:30:00Z"),
+        ]
+        .iter()
+        .map(|(label, time)| run_at(label, time))
+        .collect();
+        assert_eq!(forgotten(&snaps, &keep_days(7, berlin())), vec!["tue-24"]);
+        assert_eq!(forgotten(&snaps, &keep_days(7, Tz::UTC)), vec!["sun-29"]);
+    }
+
+    /// Autumn: on 25 October 2026 Berlin's clocks go from 03:00 back to
+    /// 02:00, so a workstation there writes 02:30+02:00 (00:30Z) and, forty
+    /// minutes later, 02:10+01:00 (01:10Z). The later run's string is the
+    /// smaller: one writer's times do not sort as strings either.
+    #[test]
+    fn the_later_of_two_runs_in_the_repeated_autumn_hour_is_the_days_run() {
+        let snaps = vec![
+            run_at("first", "2026-10-25T02:30:00+02:00"),
+            run_at("second", "2026-10-25T02:10:00+01:00"),
+        ];
+        for zone in [berlin(), Tz::UTC] {
+            assert_eq!(
+                forgotten(&snaps, &keep_days(1, zone)),
+                vec!["first"],
+                "{zone}"
+            );
+        }
+    }
+
+    /// Weeks and months are the zone's too: 22:30Z on Sunday 27 September
+    /// is 00:30 on Monday in Berlin (ISO week 40), and 22:30Z on 30 September
+    /// is 1 October there.
+    #[test]
+    fn weeks_and_months_are_counted_in_the_policy_zone() {
+        let weeks = RetentionPolicy {
+            keep_daily: 0,
+            keep_weekly: 2,
+            keep_monthly: 0,
+            zone: berlin(),
+        };
+        let snaps = vec![
+            run_at("w38", "2026-09-16T10:00:00Z"),
+            run_at("sun-w39", "2026-09-27T10:00:00Z"),
+            run_at("mon-w40-berlin", "2026-09-27T22:30:00Z"),
+        ];
+        assert_eq!(forgotten(&snaps, &weeks), vec!["w38"]);
+        let utc_weeks = RetentionPolicy {
+            zone: Tz::UTC,
+            ..weeks
+        };
+        assert_eq!(forgotten(&snaps, &utc_weeks), vec!["sun-w39"]);
+
+        let months = RetentionPolicy {
+            keep_daily: 0,
+            keep_weekly: 0,
+            keep_monthly: 2,
+            zone: berlin(),
+        };
+        let snaps = vec![
+            run_at("august", "2026-08-15T10:00:00Z"),
+            run_at("september", "2026-09-30T10:00:00Z"),
+            run_at("october-berlin", "2026-09-30T22:30:00Z"),
+        ];
+        assert_eq!(forgotten(&snaps, &months), vec!["august"]);
+        let utc_months = RetentionPolicy {
+            zone: Tz::UTC,
+            ..months
+        };
+        assert_eq!(forgotten(&snaps, &utc_months), vec!["september"]);
+    }
+
+    /// A run with two manifest members (which the engine never writes) is
+    /// represented by the later of them BY THE CLOCK: here 03:30Z, not the
+    /// 04:00:03+01:00 (03:00:03Z) whose string is the greater. That decides
+    /// whether it is the newer run of its day than one at 04:15+01:00
+    /// (03:15Z).
+    #[test]
+    fn the_later_manifest_member_by_the_clock_represents_its_run() {
+        let run_tag = format!("{MINE}-two-manifests");
+        let member = |id: &str, time: &str| SnapshotMeta {
+            id: id.to_string(),
+            run_tag: run_tag.clone(),
+            time: time.to_string(),
+            is_manifest: true,
+            ended: None,
+            tags: vec![run_tag.clone()],
+        };
+        let snaps = vec![
+            member("m-0300z", "2026-09-24T04:00:03+01:00"),
+            member("m-0330z", "2026-09-24T03:30:00Z"),
+            run_at("other-0315z", "2026-09-24T04:15:00+01:00"),
+        ];
+        assert_eq!(
+            forgotten(&snaps, &keep_days(1, Tz::UTC)),
+            vec!["other-0315z"]
+        );
+    }
+
+    /// A complete run whose time does not parse cannot be placed in a day,
+    /// a week or a month — and restic always writes one, so it is not a run
+    /// this planner understands. It is kept, whatever the policy; it does not
+    /// take a day's slot from a run that has a time.
+    #[test]
+    fn a_complete_run_whose_time_does_not_parse_is_never_forgotten() {
+        let snaps = vec![
+            run_at("mon", "2026-09-21T03:00:00Z"),
+            run_at("tue", "2026-09-22T03:00:00Z"),
+            run_at("no-time", ""),
+            run_at("odd-time", "yesterday"),
+            run_at("wed", "2026-09-23T03:00:00Z"),
+        ];
+        assert_eq!(
+            forgotten(&snaps, &keep_days(1, Tz::UTC)),
+            vec!["mon", "tue"]
+        );
+        let plan = plan_prune(&snaps, &keep_days(1, Tz::UTC), MINE, later(), SIX_HOURS);
+        assert_eq!((plan.forget_runs, plan.kept_runs), (2, 3), "{plan:?}");
+        let none = keep_days(0, Tz::UTC);
+        assert_eq!(forgotten(&snaps, &none), vec!["mon", "tue", "wed"]);
+    }
+
+    #[test]
+    fn the_policy_zone_is_the_schedules_or_utc() {
+        assert_eq!(policy_zone("").unwrap(), Tz::UTC);
+        assert_eq!(policy_zone("  ").unwrap(), Tz::UTC);
+        assert_eq!(policy_zone("UTC").unwrap(), Tz::UTC);
+        assert_eq!(
+            policy_zone("Europe/Berlin").unwrap().name(),
+            "Europe/Berlin"
+        );
+        let why = policy_zone("Mars/Olympus_Mons").unwrap_err();
+        assert!(why.contains("\"Mars/Olympus_Mons\""), "{why}");
+        assert!(why.contains("in UTC"), "{why}");
+        assert_eq!(RetentionPolicy::default().zone, Tz::UTC);
     }
 
     // --- is_manifest derivation (run_prune's impure seam) ---
@@ -1240,6 +1591,7 @@ mod tests {
             keep_daily: 1,
             keep_weekly: 0,
             keep_monthly: 0,
+            zone: Tz::UTC,
         };
         let plan = plan_prune(&snaps, &policy, MINE, later(), SIX_HOURS);
         assert!(
@@ -1270,6 +1622,7 @@ mod tests {
             keep_daily: 1,
             keep_weekly: 0,
             keep_monthly: 0,
+            zone: Tz::UTC,
         };
         let plan = plan_prune(&snaps, &policy, MINE, later(), SIX_HOURS);
         let mut expected = vec![
@@ -1297,6 +1650,7 @@ mod tests {
             keep_daily: 1,
             keep_weekly: 0,
             keep_monthly: 0,
+            zone: Tz::UTC,
         };
         let plan = plan_prune(&snaps, &policy, MINE, later(), SIX_HOURS);
         assert!(
@@ -1317,6 +1671,7 @@ mod tests {
             keep_daily: 1,
             keep_weekly: 0,
             keep_monthly: 0,
+            zone: Tz::UTC,
         };
         let plan = plan_prune(&snaps, &policy, MINE, later(), SIX_HOURS);
         assert_eq!(
@@ -1457,6 +1812,7 @@ mod tests {
         keep_daily: 1,
         keep_weekly: 0,
         keep_monthly: 0,
+        zone: Tz::UTC,
     };
 
     #[test]
@@ -1562,6 +1918,7 @@ mod tests {
             keep_daily: 0,
             keep_weekly: 0,
             keep_monthly: 0,
+            zone: Tz::UTC,
         };
         let outcome =
             run_prune(&r, "s3:repo", "pw", &policy, MINE, later(), SIX_HOURS).expect("prune runs");

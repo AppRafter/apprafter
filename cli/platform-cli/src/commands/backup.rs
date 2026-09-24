@@ -5321,12 +5321,18 @@ fn spec_backup_from_cluster(kubeconfig: Option<&Path>) -> Result<Option<Value>> 
 /// `.retention.{keepDaily,keepWeekly,keepMonthly}` when present → else the
 /// [`RetentionPolicy::default`] (7 / 4 / 6). Pure — the impure caller fetches
 /// `spec.backup` and reads the CLI flags.
+///
+/// The days, weeks and months are counted in `spec.backup.timeZone`, the zone
+/// the cluster's schedules run in — the zone the in-cluster prune counts in
+/// too ([`backup_core::prune::policy_zone`]), so the two keep the same runs.
+/// UTC with no cluster to read it from; UTC and a warning (the second value)
+/// when the zone is one this build does not know.
 fn retention_from_spec_backup(
     spec_backup: Option<&Value>,
     keep_daily: Option<u32>,
     keep_weekly: Option<u32>,
     keep_monthly: Option<u32>,
-) -> RetentionPolicy {
+) -> (RetentionPolicy, Option<String>) {
     let default = RetentionPolicy::default();
     let cr = |key: &str| -> Option<u32> {
         spec_backup
@@ -5334,7 +5340,15 @@ fn retention_from_spec_backup(
             .and_then(Value::as_u64)
             .map(|n| n as u32)
     };
-    RetentionPolicy {
+    let zone_name = spec_backup
+        .and_then(|s| s.pointer("/timeZone"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let (zone, warning) = match backup_core::prune::policy_zone(zone_name) {
+        Ok(zone) => (zone, None),
+        Err(why) => (default.zone, Some(why)),
+    };
+    let policy = RetentionPolicy {
         keep_daily: keep_daily
             .or_else(|| cr("keepDaily"))
             .unwrap_or(default.keep_daily),
@@ -5344,7 +5358,9 @@ fn retention_from_spec_backup(
         keep_monthly: keep_monthly
             .or_else(|| cr("keepMonthly"))
             .unwrap_or(default.keep_monthly),
-    }
+        zone,
+    };
+    (policy, warning)
 }
 
 /// `apprafter backup prune` — format-aware retention prune of an off-site restic
@@ -5429,7 +5445,11 @@ pub fn run_backup_prune(
     let pass = creds["RESTIC_PASSWORD"].clone();
 
     let repo = repo_from_spec_backup(repo_override, spec_backup)?;
-    let policy = retention_from_spec_backup(spec_backup, keep_daily, keep_weekly, keep_monthly);
+    let (policy, zone_warning) =
+        retention_from_spec_backup(spec_backup, keep_daily, keep_weekly, keep_monthly);
+    if let Some(why) = zone_warning {
+        eprintln!("{}", cli_core::style::warn(&why));
+    }
 
     let runner = CredentialedRestic { creds };
 
@@ -5571,11 +5591,13 @@ fn prune_summary(
     outcome: &backup_core::prune::PruneOutcome,
 ) -> String {
     format!(
-        "✓ Pruned {repo}: {}\n  retention: keepDaily={} keepWeekly={} keepMonthly={}\n",
+        "✓ Pruned {repo}: {}\n  retention: keepDaily={} keepWeekly={} keepMonthly={} (days, \
+         weeks and months in {})\n",
         outcome.describe(),
         policy.keep_daily,
         policy.keep_weekly,
-        policy.keep_monthly
+        policy.keep_monthly,
+        policy.zone.name()
     )
 }
 
@@ -7967,7 +7989,7 @@ mod tests {
             "bucket": "s3:x",
             "retention": { "keepDaily": 10, "keepWeekly": 8, "keepMonthly": 12 }
         });
-        let p = retention_from_spec_backup(Some(&spec), None, None, None);
+        let (p, _) = retention_from_spec_backup(Some(&spec), None, None, None);
         assert_eq!(p.keep_daily, 10);
         assert_eq!(p.keep_weekly, 8);
         assert_eq!(p.keep_monthly, 12);
@@ -7979,7 +8001,7 @@ mod tests {
             "retention": { "keepDaily": 10, "keepWeekly": 8, "keepMonthly": 12 }
         });
         // keep_daily override wins; the other two fall back to the CR.
-        let p = retention_from_spec_backup(Some(&spec), Some(3), None, None);
+        let (p, _) = retention_from_spec_backup(Some(&spec), Some(3), None, None);
         assert_eq!(p.keep_daily, 3);
         assert_eq!(p.keep_weekly, 8);
         assert_eq!(p.keep_monthly, 12);
@@ -7988,22 +8010,49 @@ mod tests {
     #[test]
     fn retention_from_spec_backup_all_unset_is_default_7_4_6() {
         // No CR retention block and no overrides → the 7/4/6 default.
-        let p = retention_from_spec_backup(None, None, None, None);
+        let (p, _) = retention_from_spec_backup(None, None, None, None);
         assert_eq!(p.keep_daily, 7);
         assert_eq!(p.keep_weekly, 4);
         assert_eq!(p.keep_monthly, 6);
         // A CR with no `.retention` also falls through to the default.
         let spec = json!({ "bucket": "s3:x" });
-        let p2 = retention_from_spec_backup(Some(&spec), None, None, None);
+        let (p2, _) = retention_from_spec_backup(Some(&spec), None, None, None);
         assert_eq!(p2.keep_daily, 7);
         assert_eq!(p2.keep_weekly, 4);
         assert_eq!(p2.keep_monthly, 6);
     }
 
+    /// The prune counts days in the zone the cluster's schedules run in —
+    /// the zone the in-cluster prune is given — and in UTC with no zone to
+    /// read. One it does not know is UTC and a warning that names it.
+    #[test]
+    fn retention_from_spec_backup_counts_days_in_the_schedules_zone() {
+        let spec = json!({ "bucket": "s3:x", "timeZone": "Europe/Berlin" });
+        let (p, warning) = retention_from_spec_backup(Some(&spec), None, None, None);
+        assert_eq!(p.zone.name(), "Europe/Berlin");
+        assert!(warning.is_none(), "{warning:?}");
+
+        for spec in [
+            None,
+            Some(json!({ "bucket": "s3:x" })),
+            Some(json!({ "timeZone": "" })),
+        ] {
+            let (p, warning) = retention_from_spec_backup(spec.as_ref(), None, None, None);
+            assert_eq!(p.zone, backup_core::prune::Tz::UTC, "{spec:?}");
+            assert!(warning.is_none(), "{spec:?}: {warning:?}");
+        }
+
+        let spec = json!({ "timeZone": "Europe/Atlantis" });
+        let (p, warning) = retention_from_spec_backup(Some(&spec), Some(2), None, None);
+        assert_eq!((p.zone, p.keep_daily), (backup_core::prune::Tz::UTC, 2));
+        let warning = warning.expect("an unknown zone is said");
+        assert!(warning.contains("Europe/Atlantis"), "{warning}");
+    }
+
     #[test]
     fn retention_override_applies_with_no_cr_retention() {
         let spec = json!({ "bucket": "s3:x" });
-        let p = retention_from_spec_backup(Some(&spec), Some(1), Some(2), Some(3));
+        let (p, _) = retention_from_spec_backup(Some(&spec), Some(1), Some(2), Some(3));
         assert_eq!(p.keep_daily, 1);
         assert_eq!(p.keep_weekly, 2);
         assert_eq!(p.keep_monthly, 3);
@@ -10815,6 +10864,7 @@ mod tests {
                 keep_daily: 1,
                 keep_weekly: 2,
                 keep_monthly: 3,
+                zone: backup_core::prune::policy_zone("Europe/Berlin").unwrap(),
             },
             &backup_core::prune::PruneOutcome::Pruned {
                 forgot_snapshots: 4,
@@ -10827,6 +10877,10 @@ mod tests {
         assert!(
             s.contains("keepDaily=1 keepWeekly=2 keepMonthly=3"),
             "each number must sit against its own label: {s}"
+        );
+        assert!(
+            s.contains("(days, weeks and months in Europe/Berlin)"),
+            "the zone the policy counted in is stated: {s}"
         );
         assert!(s.contains("forgot 4 snapshot(s) of 3 run(s)"), "{s}");
         assert!(s.contains("6 run(s) kept"), "{s}");

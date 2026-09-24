@@ -123,7 +123,7 @@ Usage: apprafter backup enable [OPTIONS] --bucket <BUCKET>
 | `--no-initial-backup` | flag | — | no | Skip the first backup `enable` normally takes once the schedule is deployed. The schedule still runs at its configured time, and `apprafter backup run` takes one on demand |
 | `--prefix` | — | — | no | Optional path prefix inside the bucket (e.g. `backups/prod`). Only used together with a bare `--bucket` name and `--endpoint`; omit when passing a full restic URL in `--bucket` |
 | `--staging-mode` | — | — | no | `monolithic` (default) or `sequential` |
-| `--timezone` | `<zone>` | — | no | IANA timezone the schedules run in (`Europe/Berlin`, `UTC`), written to the CronJob's `spec.timeZone`. Defaults to this machine's zone; if that cannot be determined the command refuses rather than assume UTC |
+| `--timezone` | `<zone>` | — | no | IANA timezone the schedules run in (`Europe/Berlin`, `UTC`), written to the CronJob's `spec.timeZone`; the keep counts' days, weeks and months are this zone's too. Defaults to this machine's zone; if that cannot be determined the command refuses rather than assume UTC |
 
 Examples:
 

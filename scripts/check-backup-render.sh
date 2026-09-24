@@ -97,6 +97,13 @@
 #      every runner had priority 0 like the platform's own pods, and on a
 #      nearly full node a waiting runner took the room a restarting Argo CD
 #      controller had just freed.
+#  12. both CronJobs give the runner the zone their schedules run in
+#      (backup.timeZone → spec.timeZone) as APPRAFTER_BACKUP_TIME_ZONE, and
+#      neither carries it when no zone is set (WI-389). The runner's prune
+#      counts the keep policy's days, weeks and months in it, as `apprafter
+#      backup prune` does from the same field; without it the in-cluster
+#      prune counted in UTC and the CLI's in the schedule's zone, and the two
+#      kept different runs of a day.
 #
 # Usage: bash scripts/check-backup-render.sh
 # Exit 0 = every assertion held.
@@ -537,6 +544,7 @@ helm template platform "$chart" --values "$enabled" \
     --set backup.retention.keepMonthly=12 \
     --set backup.failureWebhook=https://hooks.example.com/backup \
     --set backup.clusterName=eu-prod \
+    --set backup.timeZone=Europe/Berlin \
     >"$workdir/every-knob.yaml"
 names="$("${YQ[@]}" -r 'select(.kind == "CronJob")
     | .spec.jobTemplate.spec.template.spec.containers[0].env[].name
@@ -554,9 +562,32 @@ while read -r name; do
 done <<<"$names"
 echo "  ok: the runner reads each of the $count APPRAFTER_* variables the CronJobs render"
 
+echo "==> the keep policy's zone (WI-389), chart $version"
+
+# 12. The zone the schedules run in reaches the runner's prune, on both Jobs,
+#     as the same value the CronJob carries — and nothing when no zone is set.
+for name in apprafter-backup apprafter-backup-check; do
+    got="$(env_value "$workdir/defaults.yaml" "$name" APPRAFTER_BACKUP_TIME_ZONE)"
+    [[ -z "$got" ]] \
+        || fail "defaults: $name carries APPRAFTER_BACKUP_TIME_ZONE=$got with no backup.timeZone set"
+done
+echo "  ok: defaults — no backup.timeZone, no APPRAFTER_BACKUP_TIME_ZONE (the runner counts in UTC)"
+helm template platform "$chart" --values "$enabled" \
+    --set backup.timeZone=Europe/Berlin >"$workdir/zone.yaml"
+for name in apprafter-backup apprafter-backup-check; do
+    zone="$(NAME="$name" "${YQ[@]}" -r 'select(.kind == "CronJob" and .metadata.name == strenv(NAME))
+        | .spec.timeZone // ""' "$workdir/zone.yaml")"
+    [[ "$zone" == Europe/Berlin ]] \
+        || fail "backup.timeZone=Europe/Berlin: CronJob '$name' spec.timeZone is '${zone:-absent}'"
+    got="$(env_value "$workdir/zone.yaml" "$name" APPRAFTER_BACKUP_TIME_ZONE)"
+    [[ "$got" == "$zone" ]] \
+        || fail "backup.timeZone=Europe/Berlin: $name runner env APPRAFTER_BACKUP_TIME_ZONE is '${got:-absent}', but the CronJob runs its schedule in '$zone'; the in-cluster prune would count its days in another zone than \`apprafter backup prune\` and keep different runs"
+done
+echo "  ok: backup.timeZone=Europe/Berlin — both runners count the keep policy in the zone their CronJob runs in"
+
 echo "PASS: both backup CronJobs carry a Job deadline, stop cleanly at it, and"
 echo "      carry the measured resources and restic settings; both keep what"
 echo "      restic writes on the limited staging volume and fail at once when it"
 echo "      overruns; both runners' pods yield to every other pod; the check Job"
 echo "      runs the runner with the retention mode and depth it is configured"
-echo "      with."
+echo "      with; both runners count the keep policy in the schedules' zone."

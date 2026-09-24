@@ -4,6 +4,8 @@
 //! The passphrase is NEVER passed on argv — it is always injected via the
 //! `RESTIC_PASSWORD` environment variable at call time by the invoking layer.
 
+use chrono::{DateTime, Utc};
+
 /// `restic init` argv (RESTIC_PASSWORD passed via env, never argv).
 pub fn restic_init_argv(repo: &str) -> Vec<String> {
     vec!["init".into(), "--repo".into(), repo.into()]
@@ -46,6 +48,29 @@ pub fn restic_snapshots_argv(repo: &str) -> Vec<String> {
         repo.into(),
         "--json".into(),
     ]
+}
+
+/// A time `restic snapshots --json` lists (a snapshot's `time`, or its
+/// `summary.backup_end`) as an instant — which is what every comparison of
+/// two snapshot times must use: which run is `latest`
+/// ([`crate::restore`]), which run is the newest of its day, and how old a
+/// run is ([`crate::prune`]).
+///
+/// restic records the time with the WRITER's UTC offset: the in-cluster
+/// runner writes `…Z`, a `backup create` on a workstation writes its local
+/// offset (`…+01:00`), and one repository can hold both. Their strings do not
+/// order as their instants do — `2026-09-24T04:00:03+01:00` is half an hour
+/// BEFORE `2026-09-24T03:30:00Z` — and one writer's strings do not either in
+/// the hour a clock goes back (`02:30+02:00` comes before `02:10+01:00`). Nor
+/// does a string's date say which day the run was on, anywhere but at its
+/// writer.
+///
+/// `None` when the time does not parse as RFC 3339. `Option`'s order puts it
+/// before every instant, so such a snapshot never wins a `max_by_key`.
+pub fn snapshot_instant(time: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(time)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
 }
 
 /// `restic stats --json` argv, in `raw-data` mode.

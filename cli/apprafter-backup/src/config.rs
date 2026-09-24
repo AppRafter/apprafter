@@ -83,7 +83,9 @@ pub struct RunnerConfig {
     /// under [`Enforce::Cluster`]; the check run prunes after a passing check
     /// only under [`Enforce::Check`].
     pub enforce: Enforce,
-    /// How many daily/weekly/monthly run representatives to retain.
+    /// How many daily/weekly/monthly run representatives to retain, and the
+    /// zone those days are counted in (`APPRAFTER_BACKUP_TIME_ZONE`, the
+    /// schedules' own).
     pub retention: backup_core::prune::RetentionPolicy,
     /// Optional URL to POST on backup failure.
     pub failure_webhook: Option<String>,
@@ -156,6 +158,21 @@ impl RunnerConfig {
         if let Some(v) = e.get("APPRAFTER_BACKUP_KEEP_MONTHLY") {
             retention.keep_monthly = parse_u32(v, "APPRAFTER_BACKUP_KEEP_MONTHLY")?;
         }
+        // The zone the schedules run in (`spec.backup.timeZone`), which the
+        // chart renders here from the value it gives both CronJobs'
+        // `timeZone`: the keep policy counts its days in it, as the CLI's
+        // `backup prune` does. A name the zone database does not know is a
+        // warning and UTC — it moves no more than which run is the newest of
+        // its day, and a backup must not fail over it.
+        retention.zone = backup_core::prune::policy_zone(
+            e.get("APPRAFTER_BACKUP_TIME_ZONE")
+                .map(String::as_str)
+                .unwrap_or(""),
+        )
+        .unwrap_or_else(|why| {
+            eprintln!("warning: APPRAFTER_BACKUP_TIME_ZONE: {why}");
+            backup_core::prune::Tz::UTC
+        });
 
         let failure_webhook = e
             .get("APPRAFTER_BACKUP_FAILURE_WEBHOOK")
@@ -378,9 +395,41 @@ mod tests {
         assert_eq!(c.retention.keep_daily, 7); // RetentionPolicy::default
         assert_eq!(c.retention.keep_weekly, 4);
         assert_eq!(c.retention.keep_monthly, 6);
+        assert_eq!(c.retention.zone, backup_core::prune::Tz::UTC);
         assert!(c.failure_webhook.is_none());
         assert!(c.deadline.is_none());
         assert!(c.staging_limit.is_none());
+    }
+
+    /// The keep policy counts its days in the zone the schedules run in,
+    /// which the chart renders from `spec.backup.timeZone`; the CLI's prune
+    /// reads the same field, and both parse it with `policy_zone`.
+    #[test]
+    fn the_keep_policy_counts_days_in_the_schedules_zone() {
+        let zone_of = |value: Option<&str>| {
+            let mut pairs = vec![
+                ("APPRAFTER_BACKUP_REPO", "s3:x"),
+                ("APPRAFTER_CLUSTER_ID", "c"),
+                ("RESTIC_PASSWORD", "p"),
+            ];
+            if let Some(v) = value {
+                pairs.push(("APPRAFTER_BACKUP_TIME_ZONE", v));
+            }
+            RunnerConfig::from_env_map(&map(&pairs))
+                .unwrap()
+                .retention
+                .zone
+        };
+        assert_eq!(zone_of(Some("Europe/Berlin")).name(), "Europe/Berlin");
+        assert_eq!(zone_of(Some("America/New_York")).name(), "America/New_York");
+        assert_eq!(zone_of(None), backup_core::prune::Tz::UTC);
+        assert_eq!(zone_of(Some("")), backup_core::prune::Tz::UTC);
+        // A POSIX TZ rule is not a zone name: counted in UTC, with a
+        // warning, and the run goes on.
+        assert_eq!(
+            zone_of(Some("CET-1CEST,M3.5.0,M10.5.0/3")),
+            backup_core::prune::Tz::UTC
+        );
     }
 
     #[test]

@@ -329,21 +329,15 @@ fn time_of(s: &Value) -> String {
         .to_string()
 }
 
-/// A snapshot's time as an instant, which is what every comparison here uses.
-///
-/// restic records the time with the WRITER's UTC offset: the in-cluster
-/// runner writes `…Z`, a `backup create` on a workstation writes its local
-/// offset (`…+01:00`), and one repository can hold both. Their strings do not
-/// order as their instants do — `2026-09-24T04:00:03+01:00` is half an hour
-/// BEFORE `2026-09-24T03:30:00Z` — so comparing them picked the older run as
-/// `latest` and hid a newer unfinished one.
+/// A snapshot's time as an instant, which is what every comparison here uses
+/// ([`crate::restic::snapshot_instant`]): compared as strings, a run a
+/// workstation wrote at `04:00:03+01:00` beat a later one the runner wrote at
+/// `03:30:00Z` as `latest`, and hid a newer unfinished one.
 ///
 /// `None` — no time, or one that does not parse — orders before every
 /// instant, so such a snapshot never wins a `max_by_key`.
 fn instant_of(s: &Value) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s.get("time").and_then(Value::as_str)?)
-        .ok()
-        .map(|t| t.with_timezone(&Utc))
+    crate::restic::snapshot_instant(s.get("time").and_then(Value::as_str)?)
 }
 
 /// A snapshot's `paths`, as restic reports them.

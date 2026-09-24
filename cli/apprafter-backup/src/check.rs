@@ -367,6 +367,7 @@ mod tests {
             keep_daily: 1,
             keep_weekly: 0,
             keep_monthly: 0,
+            zone: backup_core::prune::Tz::UTC,
         };
         let plan = CheckPlan {
             repo: "s3:repo",

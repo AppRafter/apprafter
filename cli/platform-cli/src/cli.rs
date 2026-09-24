@@ -1995,7 +1995,8 @@ pub enum BackupAction {
         #[arg(long, value_name = "time")]
         at: Option<String>,
         /// IANA timezone the schedules run in (`Europe/Berlin`,
-        /// `UTC`), written to the CronJob's `spec.timeZone`. Defaults
+        /// `UTC`), written to the CronJob's `spec.timeZone`; the keep
+        /// counts' days, weeks and months are this zone's too. Defaults
         /// to this machine's zone; if that cannot be determined the
         /// command refuses rather than assume UTC.
         #[arg(long, value_name = "zone")]

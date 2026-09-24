@@ -91,6 +91,14 @@ chrono               = { version = "0.4", default-features = false, features = [
 # `/etc/localtime` was rejected: two of the three release targets are macOS,
 # where there is no `/etc/timezone` and the zoneinfo prefix differs.
 iana-time-zone       = "0.1"
+# WI-389: the retention prune counts days, ISO weeks and months in the backup
+# schedule's own zone (`spec.backup.timeZone`), so that a daily schedule makes
+# exactly one run per day the keep policy counts, across a DST change too. The
+# CLI prune and the in-cluster runner must bucket alike, so the zone rules are
+# compiled in (one IANA database for both, from this lock) rather than read
+# from a zoneinfo directory the runner's image and a workstation hold at
+# different versions, or not at all.
+chrono-tz            = "0.10"
 terminal_size        = "0.4"
 tokio                = { version = "1", features = ["macros", "rt-multi-thread"] }
 # `ring` is NOT implied by `rustls-tls` since kube 0.99 (kube-rs/kube#1717;

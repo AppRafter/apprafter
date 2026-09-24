@@ -97,6 +97,19 @@ not a sequence. The defaults are **7 / 4 / 6**. Note that the buckets count
 daily budget, and the older of the two is kept only if some other bucket rescues
 it.
 
+"Newest" is by the clock, and the days, weeks and months are those of
+`spec.backup.timeZone`, the zone the backup schedules run in — UTC when none is
+set. restic records each snapshot's time in its writer's offset: the in-cluster
+runner writes UTC, and `apprafter backup create` on a workstation writes that
+machine's local time, so one repository holds both. Every time is read as an
+instant before it is compared or given a day; compared as text, a run taken at
+`04:00+01:00` would pass for newer than one taken at `03:30Z`, half an hour
+later, and a run's day would depend on who took it. The schedule's zone is the
+one a daily schedule makes exactly one run a day in, including on the days the
+clocks change; counted in UTC, a schedule within an hour of midnight UTC puts
+two runs on one day when the clocks change, and keep-daily drops one of them. A representative whose
+time does not parse belongs to no day and is always kept.
+
 The runner pins a stable restic host rather than letting the ephemeral pod name
 become one: `spec.backup.clusterName` when the cluster has been named, and the
 fixed `apprafter-backup` when it has not. It changes nothing about retention —
@@ -205,7 +218,8 @@ environment variable `APPRAFTER_BACKUP_ENFORCE`. It has three values:
 
 The keep counts reach both Jobs as `APPRAFTER_BACKUP_KEEP_DAILY` / `_WEEKLY` /
 `_MONTHLY` — threaded through by the chart only when they are configured, and
-defaulting to 7/4/6 in the runner otherwise.
+defaulting to 7/4/6 in the runner otherwise — and `spec.backup.timeZone`
+reaches them as `APPRAFTER_BACKUP_TIME_ZONE` when it is set.
 
 **`check`.** The weekly check Job runs `restic check` and, only when it passed,
 the prune; [what it runs](#what-the-weekly-check-runs) is below. A check that
@@ -241,8 +255,9 @@ after the upgrade. `apprafter backup set enforce operator` before the upgrade
 keeps the old behaviour.
 
 The operator-side `apprafter backup prune` resolves its policy as CLI flags →
-`spec.backup.retention` → 7/4/6, and its repository as `--repo` →
-`spec.backup.bucket`. On success it stamps `apprafter.io/last-prune` on the
+`spec.backup.retention` → 7/4/6, counted in `spec.backup.timeZone` as the Jobs
+count it (UTC with no cluster to read it from; its summary names the zone), and
+its repository as `--repo` → `spec.backup.bucket`. On success it stamps `apprafter.io/last-prune` on the
 `PlatformStack` with the current time; that annotation is what
 `apprafter backup status` prints as `Last prune`, and what the retention
 condition names as the last prune from outside the cluster. Its credentials

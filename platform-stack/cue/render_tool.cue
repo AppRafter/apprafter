@@ -660,6 +660,14 @@ _backupTemplate: """
 	            - name: APPRAFTER_BACKUP_KEEP_MONTHLY
 	              value: {{ $b.retention.keepMonthly | quote }}
 	            {{- end }}
+	            # The keep policy counts its days, weeks and months in the
+	            # zone the schedules run in, as `apprafter backup prune` does:
+	            # a daily schedule is then one run per counted day, across a
+	            # clock change too. Absent, the runner counts in UTC.
+	            {{- with $b.timeZone }}
+	            - name: APPRAFTER_BACKUP_TIME_ZONE
+	              value: {{ . | quote }}
+	            {{- end }}
 	            {{- if $b.failureWebhook }}
 	            - name: APPRAFTER_BACKUP_FAILURE_WEBHOOK
 	              value: {{ $b.failureWebhook | quote }}
@@ -890,6 +898,14 @@ _backupTemplate: """
 	            {{- if $b.retention.keepMonthly }}
 	            - name: APPRAFTER_BACKUP_KEEP_MONTHLY
 	              value: {{ $b.retention.keepMonthly | quote }}
+	            {{- end }}
+	            # The keep policy counts its days, weeks and months in the
+	            # zone the schedules run in, as `apprafter backup prune` does:
+	            # a daily schedule is then one run per counted day, across a
+	            # clock change too. Absent, the runner counts in UTC.
+	            {{- with $b.timeZone }}
+	            - name: APPRAFTER_BACKUP_TIME_ZONE
+	              value: {{ . | quote }}
 	            {{- end }}
 	            {{- if $b.failureWebhook }}
 	            - name: APPRAFTER_BACKUP_FAILURE_WEBHOOK
