@@ -62,7 +62,7 @@ use backup_core::cluster::{
 };
 use backup_core::engine::{resource_refs, BackupOpts};
 use backup_core::extract::{claims_without_data_capture, plan_extraction, UncapturedClaim};
-use backup_core::prune::{run_prune, RetentionPolicy};
+use backup_core::prune::{run_prune, RetentionPolicy, Tz};
 use backup_core::restic::{
     restic_check_argv, restic_dump_argv, restic_ls_argv, restic_stats_argv, restic_unlock_argv,
 };
@@ -4979,16 +4979,19 @@ impl ResticRunner for CredentialedRestic {
 /// `check` and `unlock` have no retention inputs at all
 /// ([`RetentionArgs::NotApplicable`]); `prune` carries the three `--keep-*`
 /// overrides, any of which, when absent, must be read from
-/// `spec.backup.retention`.
+/// `spec.backup.retention`, and `--timezone`, which when absent must be read
+/// from `spec.backup.timeZone`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RetentionArgs {
     /// The verb has no retention inputs (`check`, `unlock`).
     NotApplicable,
-    /// `backup prune`'s `--keep-daily` / `--keep-weekly` / `--keep-monthly`.
+    /// `backup prune`'s `--keep-daily` / `--keep-weekly` / `--keep-monthly`,
+    /// and its `--timezone` ([`prune_zone_flag`]).
     Prune {
         keep_daily: Option<u32>,
         keep_weekly: Option<u32>,
         keep_monthly: Option<u32>,
+        time_zone: Option<Tz>,
     },
 }
 
@@ -5003,6 +5006,7 @@ impl RetentionArgs {
                 keep_daily,
                 keep_weekly,
                 keep_monthly,
+                time_zone: _,
             } => [
                 ("--keep-daily", keep_daily),
                 ("--keep-weekly", keep_weekly),
@@ -5030,6 +5034,10 @@ pub(crate) struct ClusterNeed {
     /// count it is a claim about whose data may be deleted, so the hint spells
     /// out what is being claimed.
     identity: bool,
+    /// One of the unresolved inputs is the zone the keep policy counts in
+    /// (prune). `--timezone` substitutes for it, and the hint says which
+    /// zone to name: the one the cluster's own prune counts in.
+    zone: bool,
 }
 
 impl ClusterNeed {
@@ -5063,6 +5071,16 @@ impl ClusterNeed {
                  tag its snapshots carry — `apprafter backup list --repo <repo> --all-clusters` \
                  names the identities a repository holds, and a prune against one it has never \
                  seen refuses instead of falling back to everything.",
+            );
+        }
+        if self.zone {
+            msg.push_str(
+                "\n\n`--timezone` is the zone the cluster's backup schedules ran in, its \
+                 `spec.backup.timeZone` (`apprafter backup status` shows it while the cluster \
+                 is there), or `UTC` if it named none. The keep policy counts its days, weeks \
+                 and months in that zone, as the cluster's own prune does. The command does \
+                 not assume one: counted in another zone, it keeps different runs than the \
+                 cluster's prune, and between them the two forget runs each would keep.",
             );
         }
         msg
@@ -5161,6 +5179,19 @@ pub(crate) fn cluster_need(
             .push("the retention policy (spec.backup.retention)");
         need.flags
             .extend(missing.into_iter().map(|f| format!("{f} <n>")));
+    }
+    // The keep policy's days, weeks and months are the zone the cluster's
+    // schedules run in, as the in-cluster prune counts them. Assumed rather
+    // than read, the two prunes of one repository keep different runs.
+    if let RetentionArgs::Prune {
+        time_zone: None, ..
+    } = retention
+    {
+        need.reasons.push(
+            "the zone its keep policy counts days, weeks and months in (spec.backup.timeZone)",
+        );
+        need.flags.push("--timezone <zone>".to_string());
+        need.zone = true;
     }
     // A prune DELETES, and a repository can be shared, so it must know whose
     // snapshots it is allowed to forget (E3/E4). The cluster answers that with
@@ -5322,16 +5353,21 @@ fn spec_backup_from_cluster(kubeconfig: Option<&Path>) -> Result<Option<Value>> 
 /// [`RetentionPolicy::default`] (7 / 4 / 6). Pure — the impure caller fetches
 /// `spec.backup` and reads the CLI flags.
 ///
-/// The days, weeks and months are counted in `spec.backup.timeZone`, the zone
-/// the cluster's schedules run in — the zone the in-cluster prune counts in
-/// too ([`backup_core::prune::policy_zone`]), so the two keep the same runs.
-/// UTC with no cluster to read it from; UTC and a warning (the second value)
-/// when the zone is one this build does not know.
+/// The days, weeks and months are counted in `--timezone` (`zone_flag`), else
+/// in `spec.backup.timeZone`, the zone the cluster's schedules run in — the
+/// zone the in-cluster prune counts in too
+/// ([`backup_core::prune::policy_zone`]), so the two keep the same runs. UTC
+/// with neither: [`cluster_need`] reaches for the cluster when the flag is
+/// absent, so that is a cluster with no backup configured. The second value
+/// is a warning: a cluster zone this build does not know (counted in UTC,
+/// as the runner does), or a flag that is not the zone the cluster's own
+/// prune counts in.
 fn retention_from_spec_backup(
     spec_backup: Option<&Value>,
     keep_daily: Option<u32>,
     keep_weekly: Option<u32>,
     keep_monthly: Option<u32>,
+    zone_flag: Option<Tz>,
 ) -> (RetentionPolicy, Option<String>) {
     let default = RetentionPolicy::default();
     let cr = |key: &str| -> Option<u32> {
@@ -5344,9 +5380,33 @@ fn retention_from_spec_backup(
         .and_then(|s| s.pointer("/timeZone"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    let (zone, warning) = match backup_core::prune::policy_zone(zone_name) {
-        Ok(zone) => (zone, None),
-        Err(why) => (default.zone, Some(why)),
+    let cluster_zone = backup_core::prune::policy_zone(zone_name);
+    let (zone, warning) = match (zone_flag, cluster_zone) {
+        (None, Ok(zone)) => (zone, None),
+        (None, Err(why)) => (default.zone, Some(why)),
+        (Some(flag), cluster_zone) => {
+            // Only a cluster that was read has a prune of its own to differ
+            // from.
+            let differs = spec_backup.and_then(|_| {
+                let (counted_in, because) = match cluster_zone {
+                    Ok(zone) if zone_name.trim().is_empty() => {
+                        (zone, "spec.backup.timeZone is not set".to_string())
+                    }
+                    Ok(zone) => (zone, "its spec.backup.timeZone".to_string()),
+                    Err(why) => (default.zone, why),
+                };
+                (counted_in != flag).then(|| {
+                    format!(
+                        "--timezone {} is not the zone this cluster's own prune counts in: {} \
+                         ({because}). Where both prune the same runs, the two keep different \
+                         ones, and between them forget runs each would keep.",
+                        flag.name(),
+                        counted_in.name()
+                    )
+                })
+            });
+            (flag, differs)
+        }
     };
     let policy = RetentionPolicy {
         keep_daily: keep_daily
@@ -5361,6 +5421,33 @@ fn retention_from_spec_backup(
         zone,
     };
     (policy, warning)
+}
+
+/// `backup prune --timezone <zone>`: a zone name the zone database compiled
+/// into this build knows — the database the in-cluster runner counts in, so
+/// a name it takes here is one the runner takes too. Pure.
+///
+/// A zone read off the cluster that this build does not know is counted in
+/// UTC with a warning, as the runner counts it
+/// ([`backup_core::prune::policy_zone`]). The flag is refused instead: it is
+/// the operator saying which zone, and a typo must not quietly count in
+/// another.
+pub(crate) fn prune_zone_flag(raw: &str) -> Result<Tz> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(CliError::Other(
+            "--timezone is empty: pass the zone the cluster's backup schedules ran in, its \
+             `spec.backup.timeZone` (such as `Europe/Berlin`), or `UTC` if it named none."
+                .into(),
+        ));
+    }
+    name.parse::<Tz>().map_err(|_| {
+        CliError::Other(format!(
+            "--timezone '{name}' is not a zone this build knows: pass the IANA name the \
+             cluster's `spec.backup.timeZone` held (such as `Europe/Berlin`), or `UTC` if it \
+             named none."
+        ))
+    })
 }
 
 /// `apprafter backup prune` — format-aware retention prune of an off-site restic
@@ -5391,6 +5478,19 @@ fn retention_from_spec_backup(
 /// this is. The repository checks that claim before anything is forgotten: a
 /// UID it has never seen is refused, naming the ones it holds, rather than
 /// falling through to the pre-identity snapshots.
+///
+/// ## …and a zone, from the cluster or from the operator
+///
+/// The keep policy counts days, weeks and months in the zone the cluster's
+/// schedules run in, and so does the in-cluster prune; counted in another
+/// zone, the two keep different runs of one repository and between them
+/// forget runs each would keep. So the zone is read like every other input
+/// the CR holds: `--timezone`, else `spec.backup.timeZone` off the cluster.
+/// With neither, the command reaches for the cluster, and refuses with the
+/// flag named when there is none — it used to count in UTC. It refuses
+/// before it lists anything, not only when something would be forgotten:
+/// a command that ran last week must not start refusing when a run ages
+/// out.
 pub fn run_backup_prune(
     repo_override: Option<&str>,
     credential_file: Option<&Path>,
@@ -5398,6 +5498,7 @@ pub fn run_backup_prune(
     keep_weekly: Option<u32>,
     keep_monthly: Option<u32>,
     cluster_uid_override: Option<&str>,
+    time_zone: Option<&str>,
 ) -> Result<()> {
     // D11 / 2.22a: the external binaries this command spawns, checked
     // BEFORE any prompt, kubeconfig or provider call. The reported bug
@@ -5417,10 +5518,13 @@ pub fn run_backup_prune(
         }
     }
 
+    let time_zone = time_zone.map(prune_zone_flag).transpose()?;
+
     let retention = RetentionArgs::Prune {
         keep_daily,
         keep_weekly,
         keep_monthly,
+        time_zone,
     };
     let source = cred_source(
         credential_file.is_some(),
@@ -5445,8 +5549,13 @@ pub fn run_backup_prune(
     let pass = creds["RESTIC_PASSWORD"].clone();
 
     let repo = repo_from_spec_backup(repo_override, spec_backup)?;
-    let (policy, zone_warning) =
-        retention_from_spec_backup(spec_backup, keep_daily, keep_weekly, keep_monthly);
+    let (policy, zone_warning) = retention_from_spec_backup(
+        spec_backup,
+        keep_daily,
+        keep_weekly,
+        keep_monthly,
+        time_zone,
+    );
     if let Some(why) = zone_warning {
         eprintln!("{}", cli_core::style::warn(&why));
     }
@@ -7989,7 +8098,7 @@ mod tests {
             "bucket": "s3:x",
             "retention": { "keepDaily": 10, "keepWeekly": 8, "keepMonthly": 12 }
         });
-        let (p, _) = retention_from_spec_backup(Some(&spec), None, None, None);
+        let (p, _) = retention_from_spec_backup(Some(&spec), None, None, None, None);
         assert_eq!(p.keep_daily, 10);
         assert_eq!(p.keep_weekly, 8);
         assert_eq!(p.keep_monthly, 12);
@@ -8001,7 +8110,7 @@ mod tests {
             "retention": { "keepDaily": 10, "keepWeekly": 8, "keepMonthly": 12 }
         });
         // keep_daily override wins; the other two fall back to the CR.
-        let (p, _) = retention_from_spec_backup(Some(&spec), Some(3), None, None);
+        let (p, _) = retention_from_spec_backup(Some(&spec), Some(3), None, None, None);
         assert_eq!(p.keep_daily, 3);
         assert_eq!(p.keep_weekly, 8);
         assert_eq!(p.keep_monthly, 12);
@@ -8010,13 +8119,13 @@ mod tests {
     #[test]
     fn retention_from_spec_backup_all_unset_is_default_7_4_6() {
         // No CR retention block and no overrides → the 7/4/6 default.
-        let (p, _) = retention_from_spec_backup(None, None, None, None);
+        let (p, _) = retention_from_spec_backup(None, None, None, None, None);
         assert_eq!(p.keep_daily, 7);
         assert_eq!(p.keep_weekly, 4);
         assert_eq!(p.keep_monthly, 6);
         // A CR with no `.retention` also falls through to the default.
         let spec = json!({ "bucket": "s3:x" });
-        let (p2, _) = retention_from_spec_backup(Some(&spec), None, None, None);
+        let (p2, _) = retention_from_spec_backup(Some(&spec), None, None, None, None);
         assert_eq!(p2.keep_daily, 7);
         assert_eq!(p2.keep_weekly, 4);
         assert_eq!(p2.keep_monthly, 6);
@@ -8028,7 +8137,7 @@ mod tests {
     #[test]
     fn retention_from_spec_backup_counts_days_in_the_schedules_zone() {
         let spec = json!({ "bucket": "s3:x", "timeZone": "Europe/Berlin" });
-        let (p, warning) = retention_from_spec_backup(Some(&spec), None, None, None);
+        let (p, warning) = retention_from_spec_backup(Some(&spec), None, None, None, None);
         assert_eq!(p.zone.name(), "Europe/Berlin");
         assert!(warning.is_none(), "{warning:?}");
 
@@ -8037,22 +8146,70 @@ mod tests {
             Some(json!({ "bucket": "s3:x" })),
             Some(json!({ "timeZone": "" })),
         ] {
-            let (p, warning) = retention_from_spec_backup(spec.as_ref(), None, None, None);
+            let (p, warning) = retention_from_spec_backup(spec.as_ref(), None, None, None, None);
             assert_eq!(p.zone, backup_core::prune::Tz::UTC, "{spec:?}");
             assert!(warning.is_none(), "{spec:?}: {warning:?}");
         }
 
         let spec = json!({ "timeZone": "Europe/Atlantis" });
-        let (p, warning) = retention_from_spec_backup(Some(&spec), Some(2), None, None);
+        let (p, warning) = retention_from_spec_backup(Some(&spec), Some(2), None, None, None);
         assert_eq!((p.zone, p.keep_daily), (backup_core::prune::Tz::UTC, 2));
         let warning = warning.expect("an unknown zone is said");
         assert!(warning.contains("Europe/Atlantis"), "{warning}");
     }
 
+    /// `--timezone` wins over the cluster's zone, as `--keep-*` win over its
+    /// counts — and says so when the cluster's own prune counts in another,
+    /// since the two then keep different runs.
+    #[test]
+    fn retention_from_spec_backup_timezone_flag_wins_and_says_when_it_differs() {
+        let berlin = prune_zone_flag("Europe/Berlin").unwrap();
+        let tokyo = prune_zone_flag("Asia/Tokyo").unwrap();
+        let in_berlin = json!({ "bucket": "s3:x", "timeZone": "Europe/Berlin" });
+        let unset = json!({ "bucket": "s3:x" });
+        let unknown = json!({ "bucket": "s3:x", "timeZone": "Europe/Atlantis" });
+
+        let (p, warning) =
+            retention_from_spec_backup(Some(&in_berlin), None, None, None, Some(berlin));
+        assert_eq!((p.zone, warning), (berlin, None));
+
+        let (p, warning) =
+            retention_from_spec_backup(Some(&in_berlin), None, None, None, Some(Tz::UTC));
+        assert_eq!(p.zone, Tz::UTC);
+        let warning = warning.expect("a zone other than the cluster's is said");
+        assert!(warning.contains("--timezone UTC"), "{warning}");
+        assert!(warning.contains("counts in: Europe/Berlin"), "{warning}");
+        assert!(warning.contains("keep different"), "{warning}");
+
+        let (p, warning) = retention_from_spec_backup(Some(&unset), None, None, None, Some(tokyo));
+        assert_eq!(p.zone, tokyo);
+        let warning = warning.expect("the cluster counts in UTC");
+        assert!(warning.contains("counts in: UTC"), "{warning}");
+        assert!(warning.contains("is not set"), "{warning}");
+        let (p, warning) =
+            retention_from_spec_backup(Some(&unset), None, None, None, Some(Tz::UTC));
+        assert_eq!((p.zone, warning), (Tz::UTC, None));
+
+        let (p, warning) =
+            retention_from_spec_backup(Some(&unknown), None, None, None, Some(berlin));
+        assert_eq!(p.zone, berlin);
+        let warning = warning.expect("the cluster counts an unknown zone in UTC");
+        assert!(warning.contains("counts in: UTC"), "{warning}");
+        assert!(warning.contains("Europe/Atlantis"), "{warning}");
+        let (p, warning) =
+            retention_from_spec_backup(Some(&unknown), None, None, None, Some(Tz::UTC));
+        assert_eq!((p.zone, warning), (Tz::UTC, None));
+
+        // No cluster read: the flag is the zone, and there is no prune of
+        // the cluster's to differ from.
+        let (p, warning) = retention_from_spec_backup(None, Some(1), None, None, Some(tokyo));
+        assert_eq!((p.zone, p.keep_daily, warning), (tokyo, 1, None));
+    }
+
     #[test]
     fn retention_override_applies_with_no_cr_retention() {
         let spec = json!({ "bucket": "s3:x" });
-        let (p, _) = retention_from_spec_backup(Some(&spec), Some(1), Some(2), Some(3));
+        let (p, _) = retention_from_spec_backup(Some(&spec), Some(1), Some(2), Some(3), None);
         assert_eq!(p.keep_daily, 1);
         assert_eq!(p.keep_weekly, 2);
         assert_eq!(p.keep_monthly, 3);
@@ -9074,12 +9231,93 @@ mod tests {
     //     no cluster at all (the DR case: the cluster is gone by design)
     // ------------------------------------------------------------------
 
-    /// `--keep-*` triple, for terse table rows below.
+    /// `--keep-*` triple, for terse table rows below — with `--timezone`
+    /// given, so the rows are about what they name ([`no_zone`] drops it).
     fn prune_keeps(d: Option<u32>, w: Option<u32>, m: Option<u32>) -> RetentionArgs {
         RetentionArgs::Prune {
             keep_daily: d,
             keep_weekly: w,
             keep_monthly: m,
+            time_zone: Some(Tz::UTC),
+        }
+    }
+
+    /// The same prune without `--timezone`.
+    fn no_zone(args: RetentionArgs) -> RetentionArgs {
+        match args {
+            RetentionArgs::Prune {
+                keep_daily,
+                keep_weekly,
+                keep_monthly,
+                ..
+            } => RetentionArgs::Prune {
+                keep_daily,
+                keep_weekly,
+                keep_monthly,
+                time_zone: None,
+            },
+            other => other,
+        }
+    }
+
+    /// The zone the keep policy counts in is an input the cluster holds,
+    /// like the keep counts: `--timezone` names it, and without the flag the
+    /// command reaches for the cluster, whose refusal names the flag. The
+    /// offline form used to count in UTC, and beside the cluster's own
+    /// prune in another zone the two forgot runs each would keep.
+    #[test]
+    fn the_zone_comes_from_the_cluster_unless_timezone_names_it() {
+        let repo = Some("s3:https://h/b");
+        let full = prune_keeps(Some(7), Some(4), Some(6));
+        assert!(!backup_verb_needs_cluster(
+            repo,
+            full,
+            CredSource::File,
+            Some(OFFLINE_UID)
+        ));
+        assert!(
+            backup_verb_needs_cluster(repo, no_zone(full), CredSource::File, Some(OFFLINE_UID)),
+            "every other input given, and still no zone"
+        );
+
+        let need = cluster_need(repo, no_zone(full), CredSource::File, Some(OFFLINE_UID));
+        assert_eq!(need.flags, vec!["--timezone <zone>".to_string()]);
+        assert!(need.reasons[0].contains("spec.backup.timeZone"), "{need:?}");
+        let h = need.hint("prune");
+        assert!(h.contains("pass --timezone <zone>"), "{h}");
+        assert!(h.contains("`UTC` if it named none"), "{h}");
+        assert!(h.contains("keeps different runs"), "says why it asks: {h}");
+
+        // With the zone given, a hint for another input does not ask for it.
+        let h = cluster_need(None, full, CredSource::File, Some(OFFLINE_UID)).hint("prune");
+        assert!(!h.contains("--timezone"), "{h}");
+        // check / unlock count nothing, so they never need a zone.
+        let h = cluster_need(
+            None,
+            RetentionArgs::NotApplicable,
+            CredSource::Cluster,
+            None,
+        )
+        .hint("check");
+        assert!(!h.contains("--timezone"), "{h}");
+    }
+
+    /// `--timezone` is refused when this build does not know the name,
+    /// where a zone read off the cluster is counted in UTC with a warning:
+    /// the flag is the operator saying which zone.
+    #[test]
+    fn the_timezone_flag_takes_a_zone_this_build_knows_and_nothing_else() {
+        assert_eq!(
+            prune_zone_flag("Europe/Berlin").unwrap().name(),
+            "Europe/Berlin"
+        );
+        assert_eq!(prune_zone_flag(" UTC ").unwrap(), Tz::UTC);
+        let e = prune_zone_flag("Europe/Atlantis").unwrap_err().to_string();
+        assert!(e.contains("--timezone 'Europe/Atlantis'"), "{e}");
+        assert!(e.contains("spec.backup.timeZone"), "{e}");
+        for empty in ["", "  "] {
+            let e = prune_zone_flag(empty).unwrap_err().to_string();
+            assert!(e.contains("--timezone is empty"), "{e}");
         }
     }
 

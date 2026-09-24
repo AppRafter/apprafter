@@ -1862,7 +1862,9 @@ pub enum BackupAction {
     /// may forget. Normally that is the cluster's own `kube-system`
     /// namespace UID, read from the kubeconfig. When the cluster is gone
     /// and only the repository is left, `--cluster-uid <uid>` names the
-    /// identity explicitly and the command runs with no cluster at all.
+    /// identity and `--timezone <zone>` the zone its schedules ran in; with
+    /// those, `--repo`, the three `--keep-*` and a credential file, the
+    /// command runs with no cluster at all.
     Prune {
         /// S3 restic repository URL (e.g. `s3:s3.amazonaws.com/my-bucket/prefix`).
         /// Defaults to `PlatformStack.spec.backup.bucket`.
@@ -1896,11 +1898,24 @@ pub enum BackupAction {
         /// before anything is forgotten: a UID that has never written
         /// here is refused, naming the ones that have.
         ///
-        /// With `--repo` and all three `--keep-*` flags this makes the
-        /// command need no cluster at all. Nothing is stamped on
-        /// `PlatformStack` in that case — there is no CR to stamp.
+        /// With `--repo`, all three `--keep-*` flags and `--timezone`,
+        /// this makes the command need no cluster at all. Nothing is
+        /// stamped on `PlatformStack` in that case — there is no CR to
+        /// stamp.
         #[arg(long = "cluster-uid")]
         cluster_uid: Option<String>,
+        /// IANA zone the keep counts' days, weeks and months are counted
+        /// in (`Europe/Berlin`, `UTC`). Defaults to the cluster's
+        /// `spec.backup.timeZone`, the zone its schedules and its own
+        /// prune use; with no cluster to read it from, the command refuses
+        /// rather than assume one.
+        ///
+        /// Name the zone the cluster's schedules ran in, or `UTC` if it
+        /// named none. Counted in another zone, this prune keeps different
+        /// runs than the cluster's own, and between them the two forget
+        /// runs each would keep.
+        #[arg(long, value_name = "zone")]
+        timezone: Option<String>,
     },
     /// Verify the structural integrity of an S3-backed restic repository
     /// (`restic check`). Run OUTSIDE the cluster with the operator's full

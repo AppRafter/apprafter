@@ -129,7 +129,8 @@ impl Default for RetentionPolicy {
 /// The zone the keep policy counts its days, ISO weeks and months in, from
 /// `spec.backup.timeZone` — the zone both backup CronJobs run their
 /// schedules in. The CLI's `apprafter backup prune` reads it off the
-/// PlatformStack; the chart gives the runner the same value as
+/// PlatformStack, or refuses to guess it with no cluster to read and no
+/// `--timezone`; the chart gives the runner the same value as
 /// `APPRAFTER_BACKUP_TIME_ZONE`. Both parse it here, against the one zone
 /// database compiled into both, so the two prunes bucket alike.
 ///

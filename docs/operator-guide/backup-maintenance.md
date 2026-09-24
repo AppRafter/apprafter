@@ -35,11 +35,14 @@ signal to prune from outside the cluster, with full credentials:
 apprafter backup prune [--repo s3:…] \
                        [--credential-file <dotenv>] \
                        [--keep-daily N] [--keep-weekly N] [--keep-monthly N] \
-                       [--cluster-uid <uid>]
+                       [--timezone <zone>] [--cluster-uid <uid>]
 ```
 
 `--repo` defaults to `PlatformStack.spec.backup.bucket`; the keep-* flags
-override the configured `spec.backup.retention` (else the 7/4/6 defaults).
+override the configured `spec.backup.retention` (else the 7/4/6 defaults), and
+`--timezone` the zone their days, weeks and months are counted in, which is
+`spec.backup.timeZone`, the zone the backup schedules run in (UTC when none is
+set).
 Credentials resolve from `--credential-file`, then the environment, then the
 credential Secret the cluster already holds (`spec.backup.credentialRef`). With
 a key that may delete in that Secret, the command needs no credential flags at
@@ -71,11 +74,17 @@ identity yourself:
 apprafter backup prune --repo s3:<endpoint>/<bucket>/<prefix> \
                        --credential-file ./operator-s3.env \
                        --keep-daily 7 --keep-weekly 4 --keep-monthly 6 \
+                       --timezone Europe/Berlin \
                        --cluster-uid <kube-system-uid>
 ```
 
-With `--repo`, all three `--keep-*` and the operator's credentials, that runs
-with no cluster at all. `--cluster-uid` is the destroyed cluster's `kube-system`
+With `--repo`, all three `--keep-*`, `--timezone` and the operator's
+credentials, that runs with no cluster at all. `--timezone` is the zone the
+destroyed cluster's backup schedules ran in, or `UTC` if it named none; without
+it the command refuses rather than assume one. A prune counted in another zone
+keeps different runs than the cluster's own prune did
+([why the zone matters](../how-it-works/backup-retention-and-checks.md#why-the-keep-numbers-are-not-restics-keep-flags)).
+`--cluster-uid` is the destroyed cluster's `kube-system`
 namespace UID, and passing it is a claim about **whose** history may be deleted
 — `apprafter backup list --repo <repo> --all-clusters` prints the identities a
 repository holds, under the listing. The claim is checked before anything is

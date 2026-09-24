@@ -265,9 +265,17 @@ after the upgrade. `apprafter backup set enforce operator` before the upgrade
 keeps the old behaviour.
 
 The operator-side `apprafter backup prune` resolves its policy as CLI flags →
-`spec.backup.retention` → 7/4/6, counted in `spec.backup.timeZone` as the Jobs
-count it (UTC with no cluster to read it from; its summary names the zone), and
-its repository as `--repo` → `spec.backup.bucket`. On success it stamps `apprafter.io/last-prune` on the
+`spec.backup.retention` → 7/4/6, and its repository as `--repo` →
+`spec.backup.bucket`. It counts days, weeks and months in `--timezone`, else in
+`spec.backup.timeZone` as the Jobs count them, and its summary names the zone.
+With neither the flag nor a cluster to read the zone from, it refuses rather
+than assume one: a prune that counts in another zone than the Jobs keeps
+different runs, and between them the two forget runs each would keep. A
+`--timezone` that differs from the cluster's zone is used, with a warning. The
+two sides agree only when both count in the zone: `apprafter` before 0.2.77 and
+the runner of platform-stack before 0.2.80 count in UTC, so while one side is
+upgraded and the other is not, their prunes can keep different runs. On success
+it stamps `apprafter.io/last-prune` on the
 `PlatformStack` with the current time; that annotation is what
 `apprafter backup status` prints as `Last prune`, and what the retention
 condition names as the last prune from outside the cluster. Its credentials
@@ -281,8 +289,8 @@ will not infer. With a live cluster it reads the `kube-system` UID off the
 kubeconfig. It used to go fully offline when `--repo` and all three `--keep-*`
 were supplied and nothing else, which planned across every snapshot in the
 bucket; that form is gone. The offline form that replaced it says whose history
-it means: `--cluster-uid <uid>`, with `--repo` and the three `--keep-*`, runs
-with no cluster at all. That is the real offline case — the cluster is gone, the
+it means: `--cluster-uid <uid>`, with `--repo`, the three `--keep-*` and
+`--timezone`, runs with no cluster at all. That is the real offline case — the cluster is gone, the
 repository remains, and its snapshots should be reclaimable.
 
 The claim is checked against the repository before anything is forgotten. A UID

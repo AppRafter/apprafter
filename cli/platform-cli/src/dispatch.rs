@@ -318,6 +318,7 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
                 keep_weekly,
                 keep_monthly,
                 cluster_uid,
+                timezone,
             } => commands::backup::run_backup_prune(
                 repo.as_deref(),
                 credential_file.as_deref(),
@@ -325,6 +326,7 @@ pub(crate) fn dispatch(args: Cli) -> cli_core::Result<()> {
                 keep_weekly,
                 keep_monthly,
                 cluster_uid.as_deref(),
+                timezone.as_deref(),
             )?,
             BackupAction::Check {
                 repo,

@@ -168,7 +168,7 @@ Remove old snapshots from an S3-backed restic repository according to the config
 
 A key that may not delete — the cluster's own, when it is scoped as recommended — deletes nothing: the command stops at the first refused delete and exits non-zero, naming `--credential-file`.
 
-A prune forgets by explicit snapshot id and one repository can hold several clusters' runs, so it must know whose snapshots it may forget. Normally that is the cluster's own `kube-system` namespace UID, read from the kubeconfig. When the cluster is gone and only the repository is left, `--cluster-uid <uid>` names the identity explicitly and the command runs with no cluster at all.
+A prune forgets by explicit snapshot id and one repository can hold several clusters' runs, so it must know whose snapshots it may forget. Normally that is the cluster's own `kube-system` namespace UID, read from the kubeconfig. When the cluster is gone and only the repository is left, `--cluster-uid <uid>` names the identity and `--timezone <zone>` the zone its schedules ran in; with those, `--repo`, the three `--keep-*` and a credential file, the command runs with no cluster at all.
 
 ```text
 Usage: apprafter backup prune [OPTIONS]
@@ -182,6 +182,7 @@ Usage: apprafter backup prune [OPTIONS]
 | `--keep-monthly` | — | — | no | Keep-monthly retention override (else spec.backup.retention, else 6) |
 | `--keep-weekly` | — | — | no | Keep-weekly retention override (else spec.backup.retention, else 4) |
 | `--repo` | — | — | no | S3 restic repository URL (e.g. `s3:s3.amazonaws.com/my-bucket/prefix`). Defaults to `PlatformStack.spec.backup.bucket` |
+| `--timezone` | `<zone>` | — | no | IANA zone the keep counts' days, weeks and months are counted in (`Europe/Berlin`, `UTC`). Defaults to the cluster's `spec.backup.timeZone`, the zone its schedules and its own prune use; with no cluster to read it from, the command refuses rather than assume one |
 
 Examples:
 
