@@ -43,6 +43,16 @@ the switch.
 
 ## platform-stack 0.2.80 / operator v0.2.52 / argocd-cue-cmp 0.1.29 / cli v0.2.77 — 2026-09-24
 
+### Upgrade notes
+
+Before a cluster moves to platform-stack 0.2.80:
+
+1. **Install apprafter 0.2.77 first.** Its `apprafter backup status` is what shows a backup or check Job left by 0.2.79 that can never start, with the command that clears it (see Migration below); older CLIs show such a Job as Running.
+2. **Decide retention.** A cluster that never set `spec.backup.retention.enforce`, and whose bucket key may delete, starts removing snapshots beyond its keep policy at its first weekly check after the upgrade. `apprafter backup set enforce operator` keeps the old behaviour; a cluster on the scoped key deletes nothing either way.
+3. **Add `--timezone <zone>`** to any script that runs `apprafter backup prune` offline.
+
+What the upgrade restarts, and what it does not, is in the 0.2.80 record of `platform-stack/cue/compatibility.cue`.
+
 ### Added
 
 - Dependency-health gating, which the repo had none of: `cargo-deny` now runs in CI (test.yml) and in `just lint`, over both workspaces, from one shared `deny.toml` whose every ignore carries its reasoning inline. Its first run found five things the version watcher had never reported — the rsa/Marvin advisory plus four unmaintained crates (rustls-pemfile, backoff, derivative, instant), all four arriving through `kube` 0.95 and all four gone with this release's move to kube 4.2, which leaves the rsa/Marvin ignore as the only one. The watcher also gains a `held` class for pins that are on their newest release and still a dead end: a dead crate sits on its own final release forever, so a "are we behind?" check reports nothing for it and it reads healthier than a maintained crate that ships weekly. `serde_yaml` (archived, published as `0.9.34+deprecated`) is the case that neither gate would have caught alone. (WI-366)
