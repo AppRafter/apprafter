@@ -6,6 +6,7 @@ version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
+publish.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
 
@@ -28,13 +29,25 @@ tempfile    = { workspace = true }
 # `rt-multi-thread`: `main` builds a manual `tokio::runtime::Runtime` (NOT
 # `#[tokio::main]`) so the SYNC backup engine runs on the main thread while
 # `KubeRsExec` block_on's its async kube-rs bodies onto the runtime handle.
-tokio       = { workspace = true, features = ["fs", "io-util", "rt-multi-thread"] }
+# `signal`: the SIGTERM a Job's deadline delivers (`stop`). `time`: the bounds
+# on the first read of an exec and on each step of the stop.
+tokio       = { workspace = true, features = ["fs", "io-util", "rt-multi-thread", "signal", "time"] }
 # `ws`: the WebSocket attach/exec subresource (`Api::<Pod>::exec`) the
 # in-cluster runner drives pg_dump / tar / restore-load helper pods through.
 kube        = { workspace = true, features = ["ws"] }
 k8s-openapi = { workspace = true }
+# Not a new crate — kube's own TLS stack. Named directly for ONE call:
+# `tls::install_rustls_crypto_provider` installs ring as the process-level
+# provider before the kube client is built (see `src/tls.rs`).
+rustls      = { workspace = true }
 futures     = { workspace = true }
 ureq        = { workspace = true }
+# Not a new crate — already in the graph through tokio and others. Named
+# directly for the two calls std has no safe form of (`restic_child`):
+# `kill(2)` to pass SIGTERM/SIGINT on to a restic child, and `waitid(2)` with
+# `WNOWAIT`, which waits for a child to exit without reaping it, so that its
+# pid cannot be reused while the stop may still signal it.
+libc        = "0.2"
 
 [dev-dependencies]
 # `kube_rs_exec` tests hand `kube::Client::new` a hand-written stub apiserver
@@ -46,3 +59,6 @@ ureq        = { workspace = true }
 # kube-rs request builder and response/error decoder run against canned bytes.
 http          = "1"
 tower-service = "0.3"
+# `test-util`: `tls` tests pause the Tokio clock so a 295 s read timeout fires
+# in virtual time. Dev-only (resolver 2), so the runner binary never links it.
+tokio         = { workspace = true, features = ["test-util", "sync", "time"] }

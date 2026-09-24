@@ -11,7 +11,7 @@ package platformstack
 // 0039) — the operator reads the controller-unsealed material
 // Secret and derives the Argo `repo-creds` + workload pull-secret.
 //
-// Pinned to chart 2.18.6 (appVersion 0.37.0). The `SealedSecret`
+// Pinned to chart 2.20.0 (appVersion 0.40.0). The `SealedSecret`
 // CRD (`sealedsecrets.bitnami.com`) ships in the chart's `crds/`
 // directory; Argo CD renders Helm sources with `--include-crds`
 // by default, so the CRD is installed alongside the controller —
@@ -29,13 +29,14 @@ _components: "sealed-secrets": #Component & {
 	namespace: "apprafter-system"
 	source: {
 		// Chart repo moved bitnami-labs.github.io -> bitnami.github.io
-		// (the `-labs` host 404s as of 2026-06; the new host serves the
-		// identical chart 2.18.6 / appVersion 0.37.0). A fresh bootstrap
-		// could not install the secrets controller from the dead host.
+		// (the `-labs` host 404s as of 2026-06; at the move the new host
+		// served the identical chart 2.18.6 / appVersion 0.37.0). A fresh
+		// bootstrap could not install the secrets controller from the
+		// dead host.
 		repoURL: "https://bitnami.github.io/sealed-secrets"
 		chart:   "sealed-secrets"
 	}
-	version: "2.18.6"
+	version: "2.20.0"
 	values: {
 		fullnameOverride: "sealed-secrets-controller"
 		// Tier-1 baseline — the controller is a single tiny

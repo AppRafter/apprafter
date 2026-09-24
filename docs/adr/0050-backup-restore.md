@@ -11,6 +11,11 @@ off-site-push section under Decision + the K8up entry under Alternatives).
 the target is honoured for the whole of `bootstrap_all::run`; it was honoured
 for two of its three phases, and the third acted on the active target. The
 correction is inline at that bullet; the decision itself is unchanged.
+**Amended 2026-09-23** — retention no longer defaults to "only outside the
+cluster": the weekly check Job prunes after a check that passed, as far as the
+cluster's key may delete, and says so when it may not. The two-tier credential
+model is unchanged. See [the
+amendment](#amendment-retention-after-the-weekly-check-2026-09-23) at the end.
 
 ## Context
 
@@ -235,7 +240,10 @@ DR gets it without the platform forcing a bucket purchase on anyone else.
   deletes whole run-sets by tag + sweeps orphans, then forgets by **explicit
   id** — never trusting restic's own keep-policy grouping. Prune is the
   operator-side `apprafter backup prune` verb (full creds, outside the
-  cluster) by default; it stamps `apprafter.io/last-prune`. **Bucket
+  cluster) by default; it stamps `apprafter.io/last-prune`. *(Amended
+  2026-09-23: the default is now the weekly check Job's prune, as far as the
+  cluster's key allows; the operator-side verb stays, and is what a scoped key
+  needs.)* **Bucket
   lifecycle rules are the wrong tool** — restic packs many snapshots into
   content-addressed pack files, so an object-age lifecycle rule would delete
   still-referenced packs and corrupt the repo; retention MUST flow through
@@ -337,6 +345,58 @@ future reader isn't misled:
 - **pg major mismatch on `pg_restore`.** The helper image is major-matched to
   the source CNPG image where visible; a mismatch surfaces as a `pg_restore`
   error, not silent corruption.
+
+## Amendment — retention after the weekly check (2026-09-23) {#amendment-retention-after-the-weekly-check-2026-09-23}
+
+Under the default `enforce: operator`, nothing in the cluster pruned, and the
+repository grew until someone ran `apprafter backup prune`. Measured before the
+platform-stack 0.2.80 release: about 155 MiB of compressed storage a night for
+~700 MB of staged data at ~2 % churn, and about 460 MB a night for ~2.4 GB — tens
+to a hundred-odd GB of S3 a year — while the restic index grew by 300–900 blobs
+a night. The index is the one input that raises the runner's memory over time,
+about 0.1 MiB per thousand blobs past a hundred thousand; with retention on
+(7/4/6) it stays flat, and one prune took 1.51M blobs down to 1,347. Nothing
+said the repository was growing.
+
+**Decision.**
+
+1. **`enforce` gains `check`, and it is the default.** The weekly check Job
+   runs the runner binary (`apprafter-backup check`) instead of `restic check`
+   under a shell: `restic check`, then — only when it passed — the same run-aware
+   prune, scoped to this cluster's snapshots, then `restic stats --mode
+   raw-data`. A check that does not pass never prunes. `cluster` (prune after
+   every backup) and `operator` (never in the cluster) remain; an explicit
+   `operator` is kept across the upgrade, and a `PlatformStack` that never set
+   one gets `check`. The field became optional in the CRD, which also lets a
+   retention block set only a keep count.
+2. **The key decides how far the prune gets, and the scoped key stays the
+   recommendation.** The two-tier model is unchanged. Under the scoped key
+   (Delete only on `locks/`) the store refuses the prune's first delete, and
+   nothing is deleted: the prune forgets one snapshot, lists the repository,
+   and stops when that snapshot is still there. restic's own
+   `forget <ids> --prune` is not used anywhere any more: restic 0.18.1 exits 0
+   from a `forget` whose deletes were refused and then prunes as if they had
+   gone, which under a scoped key wrote a new index object before failing
+   (measured on MinIO), and under a key that may delete packs but not snapshots
+   would delete data a surviving snapshot needs. Every prune — the check Job's,
+   the backup Job's, the CLI's — forgets, lists, and only then runs `restic
+   prune`.
+3. **Not enforced is said, not hidden.** The runner records the check, the
+   prune (`pruned`, `nothing-to-prune`, `not-permitted`, `failed`) and the
+   repository's size, snapshots and blobs, with the previous reading, in its
+   status ConfigMap. The operator turns that into a second condition,
+   `BackupRetention`, beside `BackupHealthy`: `False / PruneNotPermitted` for a
+   scoped key, with the growth, and the instruction to prune from outside the
+   cluster with full credentials. It never marks backups as failing. `apprafter
+   status` and `apprafter backup status` print it.
+
+**Consequences.** A cluster that never chose a mode and whose in-cluster key
+may delete starts removing snapshots beyond its keep policy at its first weekly
+check after upgrading to platform-stack 0.2.80. That was accepted, and the
+upgrade notes say it in those words. A cluster on the scoped key deletes nothing
+and is told, every week, that retention is waiting for its operator. The check
+Job's deadline now covers the prune too, and its resources are the backup's
+(the prune peaks about as high as a backup).
 
 ## Owner
 

@@ -30,32 +30,35 @@
     "              json    -- file + dotted path (flake.lock).",
     "              command -- argv + cwd + pattern; for package-manager aggregates, where",
     "                         the native tool is a better reader than anything we would write.",
-    "  upstream  where to ask for the newest value. kind: helm | oci-helm | github-release |",
+    "  upstream  where to ask for the newest value. kind: helm | oci-helm | oci | github-release |",
     "            github-branch | docker-hub | crates-io | http-text | none.",
     "  compare   numeric -- compare the digit-runs of both strings, newest wins.",
     "            major   -- report only when the leading number increases (for `@v4`-style",
     "                       refs that float within their major on purpose).",
+    "            minor   -- report only when (major, minor) increases, for pins written as a",
+    "                       minor (`1.98`, `1.4`) whose patch floats on purpose. Under",
+    "                       `numeric` every patch release would read as BEHIND.",
     "            none    -- floating by design or not semver-comparable; never reported as",
     "                       behind. Requires `note` saying why.",
     "  gate      Stage 2. What to run against the CANDIDATE version, and what a green",
     "            actually proves. null requires `gateGap` -- the reason no cluster-free gate",
     "            exists. The report prints `proves` beside every pass, so a green can never",
     "            read as more than it is.",
-    "  note      anything a triager needs that is not obvious from the row."
+    "  note      anything a triager needs that is not obvious from the row.",
+    "",
+    "`{major}` in an upstream field is replaced by the leading number of the in-tree value",
+    "(\"the newest 24.x\"). Derived rather than written so the entry follows the tree when",
+    "it moves to a new major instead of silently reporting it as ahead of upstream.",
+    "",
+    "GITHUB ACTIONS are pinned by commit SHA with the release as a trailing comment",
+    "(`uses: owner/repo@<40-hex> # vX.Y.Z`; scripts/check-workflows.sh enforces the shape,",
+    "one SHA per action, one comment per SHA, and with --remote that the comment IS that",
+    "commit). Their entries therefore read the COMMENT, never the ref, and compare it",
+    "`numeric`: a SHA freezes the patch stream too, so a new release of any size reaches",
+    "this repository only when this report says so."
   ],
 
-  "notCoveredClasses": [
-    {
-      "class": "mise.toml tool pins",
-      "where": "mise.toml:9-13 (rust=stable, bun=latest, node=lts, just=latest, go=latest)",
-      "why": "Floating by design. flake.nix is the authoritative tool-belt per CLAUDE.md; mise.toml is dev ergonomics. Converting these to concrete versions would buy a new stream of bumps for a file that is not what CI uses."
-    },
-    {
-      "class": "dtolnay/rust-toolchain@stable",
-      "where": "13 workflows",
-      "why": "`stable` is the intended floating ref, not a stale pin. Tracked as a github-action entry with compare:none so it still appears in the report."
-    }
-  ],
+  "notCoveredClasses": [],
 
   "pins": [
     {
@@ -249,7 +252,8 @@
         "sources": [
           { "files": ".github/workflows/*.yml", "pattern": "cue-lang/setup-cue@[^\\n]*\\n\\s*with:\\s*\\n\\s*version:\\s*'?\"?([^\\s'\"]+)" },
           { "files": ".devcontainer/post-create.sh", "pattern": "(?m)^CUE_VERSION=\"([^\"]+)\"" },
-          { "files": "argocd-cue-cmp/Dockerfile", "pattern": "(?m)^ARG CUE_VERSION=(\\S+)" }
+          { "files": "argocd-cue-cmp/Dockerfile", "pattern": "(?m)^ARG CUE_VERSION=(\\S+)" },
+          { "files": "flake.nix", "pattern": "(?m)^\\s*cueVersion = \"([^\"]+)\"" }
         ]
       },
       "upstream": { "kind": "github-release", "repo": "cue-lang/cue" },
@@ -276,7 +280,7 @@
         "kind": "helm-lint",
         "proves": "the platform-stack umbrella chart still renders and passes `helm lint` under the candidate helm."
       },
-      "note": "Known drift: ten workflows say v3.16.2 and release-operator.yml:311 says v3.16.4. Nothing detects it today; this entry does."
+      "note": "ONE decision, thirteen places (every azure/setup-helm step). On 4.3.0 since 2026-09-22 (WI-368), taken on the gate that matters: e2e/gitops-walk.sh on disk-backed host kind (rootless podman on btrfs, kindnet, k8s 1.36.4, published platform-stack 0.2.79) went GREEN three times under 4.3.0 and twice under the 3.22.0 control, zero restarts and zero OOM kills each. The helm-4 red that first blocked this was the sandbox microVM's tmpfs root (WI-370, GOTCHA-19), not helm. Bare --wait meaning the kstatus `watcher` strategy is NOT slower either: an alternating warm-image install of the argo-cd loader release took 17.7-24.3s under 4.3.0 against 20.4-23.9s under 3.22.0, and whole bootstraps spread 3m09-5m50 under the SAME helm 4 -- the earlier '~45% slower' was one pair of whole-bootstrap timings, which is Argo converging the platform, not helm. Static risks cleared too: chart render + lint, the ^Digest: line platform-stack-publish.yml scrapes (byte-identical digest), operator/webhook chart lint + package, identical `helm template` object sets (helm 4 only reorders documents), and both builds use client-go v0.37.0, so the Kubernetes window is unchanged. Those walks skip Cilium (kindnet); the CLI's Cilium release was bootstrapped under 4.3.0 on its own on 2026-09-23, in a rootful microVM on kind with kube-proxy and the default CNI off (as e2e/lib.sh kind_up_cilium): cluster-bootstrap rc=0 in two runs, cilium-1.16.5 deployed with manager `helm` operation Apply (the server-side path), `cilium status --wait` OK, 0 Cilium restarts. WHAT HELM 4 DOES CHANGE is the apply method: a fresh install is server-side apply (manager `helm`) and `--server-side auto` keeps it for every later upgrade of that release. Once Argo CD has adopted the loader-installed argocd release, the CLI's own `helm upgrade --install ... --wait` with a CHANGED loader fingerprint fails `UPGRADE FAILED: ... conflicts with \"argocd-controller\"` (reproduced; 3.22.0 upgrades the same release cleanly). CI never takes that path (one bootstrap per fresh cluster); a user on helm 4 takes it on the first CLI release that moves the loader values or chart version, and cli-core/src/tools.rs checks helm for PRESENCE only (WI-369). nightly.yml, the real-Hetzner Cilium bootstrap, joined on 2026-09-23 as the thirteenth: until then it had no setup-helm step and ran whatever helm the runner image carried (3.21.4 on ubuntu-24.04 20260907). NOT governed by this pin, on purpose: the dev shell and the dev container run helm 3 (row devcontainer-helm; the reason, and the date by which it has to end, are in flake.nix's nixpkgs comment)."
     },
     {
       "id": "tool-kubectl",
@@ -292,7 +296,7 @@
       "compare": "numeric",
       "gate": null,
       "gateGap": "kubectl is only exercised against a live apiserver. Every workflow that installs it (nightly.yml, e2e-k3d.yml, the seven e2e-*-nightly.yml) needs a cluster -- kind/k3d at minimum, real Hetzner credentials for nightly.yml. A version-watch job must not stand up clusters, so this pin is reported and not tested.",
-      "note": "Must move in lockstep with the k8s-openapi `features = [\"v1_31\"]` flag in BOTH Cargo workspaces (cli/Cargo.toml:69, operator/Cargo.toml:46). Nothing links them; this note is the link."
+      "note": "Must move in lockstep with the k8s-openapi `features = [\"v1_31\"]` flag in BOTH Cargo workspaces (cli/Cargo.toml:69, operator/Cargo.toml:46). Nothing links them; this note is the link. The dev container's kubectl is a separate decision (devcontainer-kubectl: the flake's nixpkgs minor)."
     },
 
     {
@@ -308,8 +312,8 @@
       "upstream": { "kind": "github-release", "repo": "kubernetes-sigs/kind" },
       "compare": "numeric",
       "gate": null,
-      "gateGap": "Testing a kind bump means creating a cluster. Out of scope for a watch job by the same rule as kubectl.",
-      "note": "Eight copies of the same literal, no variable. `.github/workflows/**` is in no path-filter that would gate a change to them beyond the workflow's own trigger."
+      "gateGap": "Out of scope for a WATCH job, which must not stand up clusters on a schedule -- but not ungateable: `just crd-validate` (scripts/validate-crds.sh) creates an ephemeral kind cluster, honours APPRAFTER_KIND_NODE_IMAGE, and therefore gates the kind+node-image pair. CLAUDE.md already mandates it for CRD-changing releases. Run it locally on the bump commit. Caveat measured 2026-09-22: kind >= 0.33 mounts /sys/../lib/modules unconditionally and fails with `statfs /lib/modules: no such file or directory` on hosts that have no /lib/modules (some containers and microVMs), independently of the node image -- GitHub's ubuntu-latest runners do have it.",
+      "note": "Eight copies of the same literal, no variable. `.github/workflows/**` is in no path-filter that would gate a change to them beyond the workflow's own trigger. NOTE this pin is really TWO decisions: until 2026-09-22 no call site passed `--image`, so the kind BINARY silently chose the Kubernetes version of every e2e cluster (v0.24.0 -> k8s v1.31.0, against a production k3s on 1.36.x). The node image is now written down as APPRAFTER_KIND_NODE_IMAGE in e2e/lib.sh (with its own default in scripts/validate-crds.sh and e2e/jetstream-nack-shape-check.sh, neither of which sources lib.sh) and MUST move together with this pin -- kind supports a node image only with the release that ships it."
     },
     {
       "id": "tool-yq",
@@ -324,8 +328,8 @@
       "upstream": { "kind": "github-release", "repo": "mikefarah/yq" },
       "compare": "numeric",
       "gate": null,
-      "gateGap": "Only used inside two nightly e2e walks that need a cluster.",
-      "note": "e2e-pg-nightly.yml:106 and e2e-env-and-secrets-nightly.yml:107."
+      "gateGap": "Used inside two nightly e2e walks that need a cluster, and by the claim-template step of platform-stack-check.yml.",
+      "note": "e2e-pg-nightly.yml, e2e-env-and-secrets-nightly.yml and platform-stack-check.yml (scripts/check-component-claim-templates.sh)."
     },
     {
       "id": "tool-just",
@@ -376,6 +380,22 @@
       "note": "Tracks the Cilium minor by convention (v1.16.x beside chart 1.16.5)."
     },
     {
+      "id": "tool-actionlint",
+      "class": "ci-download",
+      "title": "actionlint (lint.yml `version-guards`)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".github/workflows/*.yml", "pattern": "(?m)^\\s*ACTIONLINT_VERSION:\\s*\"?([0-9][^\"\\s]*)\"?\\s*$" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "rhysd/actionlint" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "The gate for a candidate is scripts/check-workflows.sh run under it (`ACTIONLINT=<candidate binary> scripts/check-workflows.sh`): a newer actionlint can add a rule that turns the workflows red. No gate kind here downloads a tool and runs a repository script with it; run that by hand on the bump.",
+      "note": "Installed in .github/workflows/lint.yml from the release tarball and checked against ACTIONLINT_SHA256 in the same step, which moves WITH this version -- take it from the release's actionlint_<version>_checksums.txt. Locally scripts/check-workflows.sh uses the actionlint on PATH, else `nix run nixpkgs#actionlint`, which is not pinned, so a laptop and CI can run different releases."
+    },
+    {
       "id": "tool-k3d",
       "class": "ci-download",
       "title": "k3d (devcontainer)",
@@ -405,7 +425,7 @@
       "compare": "numeric",
       "gate": null,
       "gateGap": "Signing tool; verifying a bump means signing and verifying a real artefact against the real transparency log, which belongs in the publish workflows, not here.",
-      "note": "CI uses sigstore/cosign-installer@v3 instead, which floats -- so this devcontainer pin and CI can disagree without anyone noticing."
+      "note": "Not the cosign CI signs with. The two signing workflows get theirs from sigstore/cosign-installer's `cosign-release:` input (v2.4.1), which no row reads, and the dev shell ships the flake's nixpkgs cosign (3.1.3 at the nixos-26.05 rev) -- three cosign versions, none checked against another."
     },
 
     {
@@ -423,7 +443,23 @@
       "compare": "numeric",
       "gate": null,
       "gateGap": "Building the images is the gate, and only one of the ten Dockerfiles in this tree is built on a PR (argocd-cue-cmp-check.yml:71). Wiring a build into the watch job would duplicate that workflow; the honest move is to add pull_request builds for the other images, which is a CI change of its own.",
-      "note": "Known drift: the CMP sidecar is on 3.20, the backup runner on 3.21."
+      "note": "Both copies are on the same minor since 2026-09-22 (the CMP sidecar was on 3.20 and the backup runner on 3.21 until then). The backup runner's tag also CHOOSES its restic: see the `restic` entry, whose build-time assertion fails when a bump here would move the restic minor."
+    },
+    {
+      "id": "restic",
+      "class": "container-package",
+      "title": "restic minor (backup runner image)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "cli/apprafter-backup/Dockerfile", "pattern": "(?m)^ARG RESTIC_MINOR=(\\S+)" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "restic/restic" },
+      "compare": "minor",
+      "gate": null,
+      "gateGap": "Moving the minor needs an Alpine tag that packages it, which neither a build-arg nor a watch job can supply. On the bump commit the image build is the first gate (its RESTIC_MINOR assertion fails when the tag ships another minor), and e2e/backup-s3-sequential-kind.sh -- a local two-cluster kind walk against in-cluster MinIO, run by no workflow -- is the one that exercises restic itself.",
+      "note": "RESTIC_MINOR does not choose restic. The runtime stage's `alpine:` tag does (`apk add restic`), and the build only ASSERTS that the minor it got is this one, failing loudly otherwise. So BEHIND here means a newer restic minor exists upstream, not that the runner can take it: the move is an Alpine tag that packages it (on 2026-09-22 alpine 3.24 ships 0.18.1, edge 0.19.1), a read of the restic changelog for repository-format and S3 behaviour changes, then RESTIC_MINOR and the tag in one commit. The tag itself is image-alpine's row."
     },
     {
       "id": "image-rust-builder",
@@ -451,51 +487,52 @@
         "kind": "regex",
         "sources": [
           { "files": "operator/apprafter-operator/Dockerfile", "pattern": "(?m)^ARG CARGO_CHEF_VERSION=(\\S+)" },
-          { "files": "operator/admission-webhook/Dockerfile", "pattern": "(?m)^ARG CARGO_CHEF_VERSION=(\\S+)" }
+          { "files": "operator/admission-webhook/Dockerfile", "pattern": "(?m)^ARG CARGO_CHEF_VERSION=(\\S+)" },
+          { "files": "cli/apprafter-backup/Dockerfile", "pattern": "(?m)^ARG CARGO_CHEF_VERSION=(\\S+)" }
         ]
       },
       "upstream": { "kind": "crates-io", "crate": "cargo-chef" },
       "compare": "numeric",
       "gate": null,
       "gateGap": "Same as the rust builder: the gate is the image build.",
-      "note": "A Dockerfile ARG, so `docker build --build-arg` can test a candidate without editing the tree."
+      "note": "A Dockerfile ARG, so `docker build --build-arg` can test a candidate without editing the tree. The operator images download the prebuilt release binary; the backup runner compiles the same version from crates.io (`cargo install --locked --version`)."
     },
     {
       "id": "image-node",
       "class": "container-base-image",
-      "multipleValuesOk": "Two different base flavours on purpose: the Backstage host needs glibc (bookworm-slim), the landing CMS runtime does not (alpine).",
-      "title": "node (Backstage host + landing CMS runtime)",
+      "title": "node LTS major (Backstage host + landing CMS base images, mise.toml, dev container)",
       "read": {
         "kind": "regex",
         "sources": [
-          { "files": "backstage-plugins/host/Dockerfile", "pattern": "FROM node:(\\S+) AS build" },
-          { "files": "landing/cms/Dockerfile", "pattern": "FROM node:(\\S+) AS runtime" }
+          { "files": "backstage-plugins/host/Dockerfile", "pattern": "(?m)^FROM node:(\\d+)-bookworm-slim\\b" },
+          { "files": "landing/cms/Dockerfile", "pattern": "(?m)^FROM node:(\\d+)-alpine AS runtime" },
+          { "files": "mise.toml", "pattern": "(?m)^node\\s*=\\s*\"(\\d+)\"" },
+          { "files": ".devcontainer/devcontainer.json", "pattern": "features/node:1\"\\s*:\\s*\\{[^}]*?\"version\"\\s*:\\s*\"(\\d+)\"" }
         ]
       },
-      "upstream": { "kind": "docker-hub", "repository": "library/node", "tagPattern": "^\\d+-(alpine|bookworm-slim)$" },
-      "compare": "none",
+      "upstream": { "kind": "http-text", "url": "https://nodejs.org/dist/index.json", "pattern": "\"version\":\\s*\"v(\\d+)\\.\\d+\\.\\d+\"[^{}]*\"lts\":\\s*\"[^\"]+\"" },
+      "compare": "major",
       "gate": null,
-      "gateGap": "Two different base flavours (bookworm-slim vs alpine) with different major pins; a single `newest` is not a meaningful target. Needs a human decision per image.",
-      "note": "The Backstage host is on node 20 (out of upstream LTS support) and the landing CMS on node 24. Reported for review, never as `behind`, because the two are not comparable to one number."
+      "gateGap": "The build is the gate. landing/cms/Dockerfile is built only by release-landing.yml, after a landing/** change reaches master; the Backstage host Dockerfile is a template for an app @backstage/create-app scaffolds, and no workflow builds it. Build both locally on the bump commit.",
+      "note": "Node is the ONE tool pinned to its MAJOR rather than a minor (owner decision 2026-09-22): Node ships every fix, security releases included (24.13.0 and 24.17.0 were new minors), on the newest minor of an LTS line and never patches an older minor, so a minor pin is an exact pin in practice (24.12 received 0 of the 35 CVE fixes after 24.12.0, and Docker Hub stops rebuilding a minor tag once the next ships). The patterns accept ONLY a bare major, so a minor slipping back into a FROM line, mise.toml or the dev container reads UNREADABLE instead of passing. Reads the leading number and asks nodejs.org's release index for the newest LTS line (the first entry carrying an `lts` codename; the index is ordered newest first), so an odd Current major, or an even one before it enters LTS, is never reported -- Backstage supports exactly two adjacent LTS majors (`engines.node` in its create-app template)."
     },
     {
       "id": "image-bun",
       "class": "container-base-image",
-      "multipleValuesOk": "alpine for the landing builders, debian for the scaffolded user template. Different flavours of the same major, not drift.",
-      "title": "oven/bun (landing + template builders)",
+      "title": "oven/bun major (landing + template builders)",
       "read": {
         "kind": "regex",
         "sources": [
-          { "files": "landing/web/Dockerfile", "pattern": "FROM oven/bun:(\\S+) AS builder" },
-          { "files": "landing/cms/Dockerfile", "pattern": "FROM oven/bun:(\\S+) AS builder" },
-          { "files": "examples/templates/bun-http/Dockerfile", "pattern": "FROM oven/bun:(\\S+) AS builder" }
+          { "files": "landing/web/Dockerfile", "pattern": "FROM oven/bun:(\\d+)(?:\\.\\d+)*-\\S+ AS builder" },
+          { "files": "landing/cms/Dockerfile", "pattern": "FROM oven/bun:(\\d+)(?:\\.\\d+)*-\\S+ AS builder" },
+          { "files": "examples/templates/bun-http/Dockerfile", "pattern": "FROM oven/bun:(\\d+)(?:\\.\\d+)*-\\S+ AS builder" }
         ]
       },
       "upstream": { "kind": "docker-hub", "repository": "oven/bun", "tagPattern": "^\\d+-(alpine|debian)$" },
       "compare": "major",
       "gate": null,
       "gateGap": "The gate is `bun run build` inside the image, which landing-preview-build.yml already performs on the landing side.",
-      "note": "Pinned to major 1 and floating within it on purpose -- only a major bump is news."
+      "note": "The MAJOR half of the bun pin, read as the leading number of each builder FROM and compared with the newest major published as an image in the two flavours the tree uses (alpine for the landing builders, debian for the scaffolded template). The minor half is mise-bun, which reads the same FROM lines against bun's GitHub releases. The two never disagree: a new 1.x minor is BEHIND on mise-bun only; a new major is BEHIND on both."
     },
     {
       "id": "image-caddy",
@@ -508,11 +545,11 @@
           { "files": "docs-site/Dockerfile", "pattern": "(?m)^FROM caddy:(\\S+)\\s*$" }
         ]
       },
-      "upstream": { "kind": "docker-hub", "repository": "library/caddy", "tagPattern": "^\\d+-alpine$" },
-      "compare": "major",
+      "upstream": { "kind": "docker-hub", "repository": "library/caddy", "tagPattern": "^\\d+\\.\\d+-alpine$" },
+      "compare": "minor",
       "gate": null,
       "gateGap": "The gate is the site smoke (scripts/landing-site-smoke.sh, scripts/docs-site-smoke.sh), which probes a deployed site rather than a candidate image.",
-      "note": "Pinned to major 2 and floating within it on purpose."
+      "note": "Pinned to a minor with the patch floating, like every base image here, and this is the only row for it: the upstream is the newest `<major>.<minor>-alpine` tag across all majors, so both a new minor and a new major read as BEHIND."
     },
     {
       "id": "image-distroless",
@@ -538,42 +575,42 @@
       "id": "action-actions-checkout",
       "class": "github-action",
       "title": "actions/checkout",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/checkout@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/checkout@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "actions/checkout" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
-      "gateGap": "An action major bump can only be tested by running the workflows that use it. That is a pull request, not a script -- and it is the one class where opening a PR really is the right tool.",
-      "note": "45 uses -- the most-used action in the tree."
+      "gateGap": "An action bump can only be tested by running the workflows that use it. That is a pull request, not a script -- and it is the one class where opening a PR really is the right tool.",
+      "note": "47 uses -- the most-used action in the tree. The count is prose, not something the watcher computes, so re-derive it rather than trusting it: grep -c 'uses: actions/checkout@' .github/workflows/*.yml"
     },
     {
       "id": "action-setup-cue",
       "class": "github-action",
       "title": "cue-lang/setup-cue",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: cue-lang/setup-cue@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: cue-lang/setup-cue@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "cue-lang/setup-cue" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
-      "note": "Pinned to a full patch tag (v1.0.1), unlike the other actions which float within a major."
+      "note": "The action only installs cue; the cue VERSION is its `version:` input, which is tool-cue."
     },
     {
       "id": "action-rust-toolchain",
       "class": "github-action",
       "title": "dtolnay/rust-toolchain",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: dtolnay/rust-toolchain@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: dtolnay/rust-toolchain@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "none" },
       "compare": "none",
       "gate": null,
-      "gateGap": "Nothing to bump.",
-      "note": "`@stable` is a branch ref and the intended floating pin -- the action publishes a branch per toolchain channel. Listed so it is not mistaken for an unwatched pin."
+      "gateGap": "See actions/checkout.",
+      "note": "Publishes no releases: a branch per toolchain channel (`stable`, `1.98`, ...) plus `master`, and one tag, `v1`, which followed `master` when this was pinned (2026-09-22) -- hence the `# v1` comment. The old `@stable` was a BRANCH ref that also chose the toolchain; at a commit the toolchain is the required `toolchain:` input, tracked by rust-toolchain-minor. Nothing to compare: to refresh, pin the current `master` commit and run scripts/check-workflows.sh --remote, which fails if `v1` has moved on."
     },
     {
       "id": "action-setup-helm",
       "class": "github-action",
       "title": "azure/setup-helm",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: azure/setup-helm@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: azure/setup-helm@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "Azure/setup-helm" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": null
@@ -582,9 +619,9 @@
       "id": "action-setup-buildx",
       "class": "github-action",
       "title": "docker/setup-buildx-action",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: docker/setup-buildx-action@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: docker/setup-buildx-action@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "docker/setup-buildx-action" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": null
@@ -593,9 +630,9 @@
       "id": "action-login",
       "class": "github-action",
       "title": "docker/login-action",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: docker/login-action@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: docker/login-action@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "docker/login-action" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": null
@@ -604,9 +641,9 @@
       "id": "action-build-push",
       "class": "github-action",
       "title": "docker/build-push-action",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: docker/build-push-action@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: docker/build-push-action@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "docker/build-push-action" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": "Every published image in this repo goes through this action; a major bump touches all five release workflows at once."
@@ -615,9 +652,9 @@
       "id": "action-setup-kubectl",
       "class": "github-action",
       "title": "azure/setup-kubectl",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: azure/setup-kubectl@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: azure/setup-kubectl@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "Azure/setup-kubectl" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": null
@@ -626,9 +663,9 @@
       "id": "action-cache",
       "class": "github-action",
       "title": "actions/cache",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/cache@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/cache@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "actions/cache" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": null
@@ -637,9 +674,9 @@
       "id": "action-setup-bun",
       "class": "github-action",
       "title": "oven-sh/setup-bun",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: oven-sh/setup-bun@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: oven-sh/setup-bun@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "oven-sh/setup-bun" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": null
@@ -648,9 +685,9 @@
       "id": "action-paths-filter",
       "class": "github-action",
       "title": "dorny/paths-filter",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: dorny/paths-filter@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: dorny/paths-filter@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "dorny/paths-filter" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": "Decides which of lint.yml/test.yml's jobs run at all; a silent behaviour change here would look like tests passing."
@@ -659,20 +696,20 @@
       "id": "action-nix-installer",
       "class": "github-action",
       "title": "DeterminateSystems/nix-installer-action",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: DeterminateSystems/nix-installer-action@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: DeterminateSystems/nix-installer-action@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "DeterminateSystems/nix-installer-action" },
-      "compare": "none",
+      "compare": "numeric",
       "gate": null,
-      "gateGap": "Nothing to bump while it is pinned to a branch.",
-      "note": "PINNED TO @main IN THREE WORKFLOWS (crd-check.yml:43, docs.yml:118, release-docs.yml:173). That is a floating branch ref on a third-party action that runs in a job with repository write scope. It is the only unpinned action in the tree and the only entry here whose fix is to STOP floating; compare is `none` because there is nothing to compare, not because it is fine. The report shows upstream's newest tag so the hand-pin is a copy-paste."
+      "gateGap": "See actions/checkout.",
+      "note": "Upstream publishes integer releases (v21, v22, v23) and no semver tags, so the comment is `# v23`. The pin bounds the ACTION only; it installs the newest Determinate Nix regardless -- flake.lock is what pins the cue and cargo the jobs run. It runs in release-docs.yml, which holds `packages: write`."
     },
     {
       "id": "action-rust-cache",
       "class": "github-action",
       "title": "Swatinem/rust-cache",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: Swatinem/rust-cache@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: Swatinem/rust-cache@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "Swatinem/rust-cache" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": null
@@ -681,20 +718,20 @@
       "id": "action-cosign-installer",
       "class": "github-action",
       "title": "sigstore/cosign-installer",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: sigstore/cosign-installer@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: sigstore/cosign-installer@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "sigstore/cosign-installer" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
-      "note": null
+      "note": "Upstream publishes vX.Y.Z tags only -- no `v4` major tag or branch -- so the `@v4` this replaced resolved to nothing and both signing workflows would have failed at job set-up. Keep full-version comments here. The cosign binary itself is the `cosign-release:` input (v2.4.1, deliberately held below the v3 this action defaults to)."
     },
     {
       "id": "action-setup-oras",
       "class": "github-action",
       "title": "oras-project/setup-oras",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: oras-project/setup-oras@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: oras-project/setup-oras@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "oras-project/setup-oras" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": "Carries the channel-tag publish path (ADR 0041)."
@@ -703,9 +740,9 @@
       "id": "action-semantic-pr",
       "class": "github-action",
       "title": "amannn/action-semantic-pull-request",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: amannn/action-semantic-pull-request@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: amannn/action-semantic-pull-request@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "amannn/action-semantic-pull-request" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": "One of the two Conventional Commits enforcement points (the other is scripts/check-commit-msg.sh)."
@@ -714,9 +751,9 @@
       "id": "action-upload-artifact",
       "class": "github-action",
       "title": "actions/upload-artifact",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/upload-artifact@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/upload-artifact@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "actions/upload-artifact" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": null
@@ -725,14 +762,328 @@
       "id": "action-download-artifact",
       "class": "github-action",
       "title": "actions/download-artifact",
-      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/download-artifact@([A-Za-z0-9._-]+)" } ] },
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: actions/download-artifact@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
       "upstream": { "kind": "github-release", "repo": "actions/download-artifact" },
-      "compare": "major",
+      "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
       "note": "Must move in lockstep with upload-artifact -- v3 and v4 artefacts are not interoperable."
     },
+    {
+      "id": "action-install-action",
+      "class": "github-action",
+      "title": "taiki-e/install-action",
+      "read": { "kind": "regex", "sources": [ { "files": ".github/workflows/*.yml", "pattern": "uses: taiki-e/install-action@[0-9a-f]{40}[ \\t]+#[ \\t]+(v[0-9][0-9.]*)" } ] },
+      "upstream": { "kind": "github-release", "repo": "taiki-e/install-action" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "See actions/checkout.",
+      "note": "Installs cargo-deny for test.yml. Releases several times a week, mostly to refresh its tool manifest, so expect this row BEHIND most weeks. That is not noise: the pinned commit fixes which cargo-deny PATCH of the pinned minor gets installed (see tool-cargo-deny), and an old cargo-deny can stop parsing a newer advisory database."
+    },
+    {
+      "id": "tool-cargo-deny",
+      "class": "ci-tool",
+      "title": "cargo-deny minor (test.yml)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".github/workflows/test.yml", "pattern": "tool:\\s*cargo-deny@([0-9][0-9.]*)" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "EmbarkStudios/cargo-deny" },
+      "compare": "minor",
+      "gate": null,
+      "gateGap": "The gate is the tool itself: on the bump commit test.yml's cargo-deny job runs scripts/cargo-deny.sh over both workspaces, and `bash scripts/cargo-deny.sh` with the new binary on PATH reproduces it locally. A watch job cannot run it honestly, because the advisory database it fetches moves on its own.",
+      "note": "Pinned to the minor on 2026-09-24 (WI-392): install-action installed whatever its manifest called latest, and 0.20 moved `--config` from the `check` subcommand to the top level, so the first CI run of the gate failed with \"unexpected argument '--config' found\" while every local run (the nixpkgs fallback, 0.19) passed. scripts/cargo-deny.sh now places the flag by the version it finds, so a bump here is a read of the cargo-deny changelog for CLI and config changes, then this literal."
+    },
 
+    {
+      "id": "rust-toolchain-minor",
+      "class": "toolchain-minor",
+      "title": "Rust toolchain minor (CI, builder images, mise, cli/, dev container)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".github/workflows/*.yml", "pattern": "(?m)^\\s+toolchain:\\s*\"([^\"]+)\"" },
+          { "files": "*Dockerfile", "pattern": "FROM docker\\.io/library/rust:(\\d+\\.\\d+)-" },
+          { "files": "mise.toml", "pattern": "(?m)^rust\\s*=\\s*\"([^\"]+)\"" },
+          { "files": "cli/rust-toolchain.toml", "pattern": "(?m)^channel\\s*=\\s*\"([^\"]+)\"" },
+          { "files": ".devcontainer/devcontainer.json", "pattern": "features/rust:1\"\\s*:\\s*\\{[^}]*?\"version\"\\s*:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "rust-lang/rust" },
+      "compare": "minor",
+      "gate": null,
+      "gateGap": "A Rust minor is proven by the whole cargo test + clippy matrix under the candidate, i.e. test.yml and lint.yml on a pull request that moves every copy at once. A watch job cannot run that honestly.",
+      "note": "One decision, five surfaces: CI's dtolnay/rust-toolchain `toolchain:` input, the rust:<minor>-alpine builder images, mise.toml, cli/rust-toolchain.toml, and the dev container's rust feature. The last OVERRIDES the first inside cli/ (rustup: toolchain file beats `rustup default`), so a `stable` there silently un-pins every cli/ job in CI, release-cli.yml included -- and the release matrix's cross target is installed for the pinned toolchain only. Minor pinned, patch floats. The flake's nixpkgs rustc is not written in the tree and is not read here (1.95 at the locked rev)."
+    },
+    {
+      "id": "mise-bun",
+      "class": "toolchain-minor",
+      "title": "bun minor (mise.toml and the dev container mirror the builder images)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "mise.toml", "pattern": "(?m)^bun\\s*=\\s*\"([^\"]+)\"" },
+          { "files": "*Dockerfile", "pattern": "FROM oven/bun:(\\d+\\.\\d+)-" },
+          { "files": ".devcontainer/post-create.sh", "pattern": "(?m)^BUN_MINOR=\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "oven-sh/bun" },
+      "compare": "minor",
+      "gate": null,
+      "gateGap": "Same as image-bun: `bun run build` inside the image, which landing-preview-build.yml performs.",
+      "note": "Reads the minor out of every oven/bun FROM line as well as mise.toml and the dev container's post-create.sh, so a builder bump that forgets mise or the dev container (or the reverse) is DRIFT. Upstream tags are `bun-vX.Y.Z`; the compare takes the digits. The flake's nixpkgs carries bun 1.3 -- behind this, and not read here."
+    },
+    {
+      "id": "mise-just",
+      "class": "toolchain-minor",
+      "title": "just minor (mise.toml and the dev container mirror the flake's nixpkgs)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "mise.toml", "pattern": "(?m)^just\\s*=\\s*\"([^\"]+)\"" },
+          { "files": ".devcontainer/post-create.sh", "pattern": "(?m)^JUST_MINOR=\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "casey/just" },
+      "compare": "none",
+      "gate": null,
+      "gateGap": "Same as tool-just: the thing to test is every recipe.",
+      "note": "Not compared: the authority is the just in the flake-locked nixpkgs (1.51 at the nixos-26.05 rev), which moves only with flake.lock (flake-nixpkgs), not with upstream releases. After a `nix flake update`, re-derive with `nix eval --raw --inputs-from . nixpkgs#just.version`. CI downloads its own just (tool-just, 1.58.0 today), so dev and CI run different just minors until the flake's release branch catches up."
+    },
+    {
+      "id": "mise-go",
+      "class": "toolchain-minor",
+      "title": "go minor (mise.toml and the dev container mirror the flake's nixpkgs)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "mise.toml", "pattern": "(?m)^go\\s*=\\s*\"([^\"]+)\"" },
+          { "files": ".devcontainer/devcontainer.json", "pattern": "features/go:1\"\\s*:\\s*\\{[^}]*?\"version\"\\s*:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "http-text", "url": "https://go.dev/VERSION?m=text", "pattern": "^go(\\d+\\.\\d+(?:\\.\\d+)?)" },
+      "compare": "none",
+      "gate": null,
+      "gateGap": "Nothing in this repository builds Go, so there is nothing to run.",
+      "note": "Not compared, for the reason mise-just gives: the value is the go in the flake-locked nixpkgs (1.26 at the nixos-26.05 rev; `nix eval --raw --inputs-from . nixpkgs#go.version`). flake.nix's devShell does not ship go at all, and no Go code is tracked -- mise.toml and the dev container keep it for plugin work (the dev container also builds lefthook with it)."
+    },
+    {
+      "id": "devcontainer-kubectl",
+      "class": "toolchain-minor",
+      "title": "kubectl minor (the dev container mirrors the flake's nixpkgs)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".devcontainer/devcontainer.json", "pattern": "features/kubectl-helm-minikube:1\"\\s*:\\s*\\{[^}]*?\"version\"\\s*:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "http-text", "url": "https://dl.k8s.io/release/stable.txt", "pattern": "^(v\\S+)" },
+      "compare": "none",
+      "gate": null,
+      "gateGap": "Same as tool-kubectl: kubectl is only exercised against a live apiserver.",
+      "note": "Not compared, for the reason mise-just gives: the value is the kubectl in the flake-locked nixpkgs (1.36 at the nixos-26.05 rev; `nix eval --raw --inputs-from . nixpkgs#kubectl.version`), which the dev shell ships and the dev container copies. A different decision from tool-kubectl, CI's exact pin (v1.37.0 today): CI follows upstream releases, the dev tool-belt follows flake.lock."
+    },
+    {
+      "id": "devcontainer-helm",
+      "class": "toolchain-minor",
+      "title": "helm minor (the dev container mirrors the flake's nixpkgs; helm 3 on purpose)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".devcontainer/devcontainer.json", "pattern": "features/kubectl-helm-minikube:1\"\\s*:\\s*\\{[^}]*?\"helm\"\\s*:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "helm/helm" },
+      "compare": "none",
+      "gate": null,
+      "gateGap": "Not compared, so there is never a candidate to try. tool-helm's helm-lint gate covers the charts under the helm CI runs.",
+      "note": "Not compared, for the reason mise-just gives: the value is the helm in the flake-locked nixpkgs (3.20 at the nixos-26.05 rev; `nix eval --raw --inputs-from . nixpkgs#kubernetes-helm.version`), which the dev shell ships and the dev container copies. A DIFFERENT decision from tool-helm, on purpose: CI runs helm 4.3.0, and the dev tool-belt stays on helm 3 because `apprafter` runs the user's helm, users have either major, and with CI on 4 this is where helm 3 still gets run (flake.nix's nixpkgs comment). The split has an end date this report cannot see: 3.20 receives no patches (the last was 3.20.2, 2026-04-09; helm 3 went on to 3.22), and helm 3 gets security fixes only until 2026-11-11. Move flake.nix and this line to helm 4 together before then."
+    },
+    {
+      "id": "devcontainer-lefthook",
+      "class": "toolchain-minor",
+      "title": "lefthook minor (the dev container mirrors the flake's nixpkgs)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".devcontainer/post-create.sh", "pattern": "(?m)^LEFTHOOK_MINOR=\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "evilmartians/lefthook" },
+      "compare": "none",
+      "gate": null,
+      "gateGap": "lefthook runs the git hooks; what a bump has to prove is lefthook.yml under the candidate, which only a commit exercises.",
+      "note": "Not compared, for the reason mise-just gives: the value is the lefthook in the flake-locked nixpkgs (2.1 at the nixos-26.05 rev; `nix eval --raw --inputs-from . nixpkgs#lefthook.version`). Written with its `v` because post-create.sh hands it to `go install .../lefthook/v2@v2.1`, a Go module query. mise.toml does not list lefthook and no workflow installs it."
+    },
+    {
+      "id": "devcontainer-nvm",
+      "class": "toolchain-minor",
+      "title": "nvm minor (the installer the dev container's node feature runs)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".devcontainer/devcontainer.json", "pattern": "features/node:1\"\\s*:\\s*\\{[^}]*?\"nvmVersion\"\\s*:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "nvm-sh/nvm" },
+      "compare": "minor",
+      "gate": null,
+      "gateGap": "The dev container build is its only consumer, and no workflow builds .devcontainer/ (see tool-k3d). Rebuild the container on the bump commit.",
+      "note": "Used only to fetch node itself inside the dev container. A minor with the patch floating, like the rest of that file; upstream tags carry a `v`, and the compare takes the digits."
+    },
+    {
+      "id": "devcontainer-feature-rust",
+      "class": "devcontainer-feature",
+      "title": "dev container feature rust (locked)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".devcontainer/devcontainer-lock.json", "pattern": "\"ghcr\\.io/devcontainers/features/rust:[0-9]+\"\\s*:\\s*\\{\\s*\"version\"\\s*:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "oci", "registry": "ghcr.io", "repository": "devcontainers/features/rust" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "A feature is exercised only by building the dev container -- `npx @devcontainers/cli build --frozen-lockfile` needs a container engine, registry pulls and minutes, and no workflow builds .devcontainer/ (see tool-k3d). Rebuild it on the bump commit.",
+      "note": "The LOCKED feature release from .devcontainer/devcontainer-lock.json -- the version of the feature's install script, not of the tool it installs (that is the `rust-toolchain-minor` row). devcontainer.json names the feature by major (`:1`), and `devcontainer upgrade` moves the lock only within that major; a newer major needs the `:1` in devcontainer.json moved first, and may rename its options."
+    },
+    {
+      "id": "devcontainer-feature-node",
+      "class": "devcontainer-feature",
+      "title": "dev container feature node (locked)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".devcontainer/devcontainer-lock.json", "pattern": "\"ghcr\\.io/devcontainers/features/node:[0-9]+\"\\s*:\\s*\\{\\s*\"version\"\\s*:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "oci", "registry": "ghcr.io", "repository": "devcontainers/features/node" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "A feature is exercised only by building the dev container -- `npx @devcontainers/cli build --frozen-lockfile` needs a container engine, registry pulls and minutes, and no workflow builds .devcontainer/ (see tool-k3d). Rebuild it on the bump commit.",
+      "note": "The LOCKED feature release from .devcontainer/devcontainer-lock.json -- the version of the feature's install script, not of the tool it installs (that is `image-node` and `devcontainer-nvm`). devcontainer.json names the feature by major (`:1`), and `devcontainer upgrade` moves the lock only within that major; a newer major needs the `:1` in devcontainer.json moved first, and may rename its options. Upstream is on major 2 as of 2026-09-23, so this row reads BEHIND until that move is made."
+    },
+    {
+      "id": "devcontainer-feature-go",
+      "class": "devcontainer-feature",
+      "title": "dev container feature go (locked)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".devcontainer/devcontainer-lock.json", "pattern": "\"ghcr\\.io/devcontainers/features/go:[0-9]+\"\\s*:\\s*\\{\\s*\"version\"\\s*:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "oci", "registry": "ghcr.io", "repository": "devcontainers/features/go" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "A feature is exercised only by building the dev container -- `npx @devcontainers/cli build --frozen-lockfile` needs a container engine, registry pulls and minutes, and no workflow builds .devcontainer/ (see tool-k3d). Rebuild it on the bump commit.",
+      "note": "The LOCKED feature release from .devcontainer/devcontainer-lock.json -- the version of the feature's install script, not of the tool it installs (that is `mise-go`). devcontainer.json names the feature by major (`:1`), and `devcontainer upgrade` moves the lock only within that major; a newer major needs the `:1` in devcontainer.json moved first, and may rename its options."
+    },
+    {
+      "id": "devcontainer-feature-kubectl-helm-minikube",
+      "class": "devcontainer-feature",
+      "title": "dev container feature kubectl-helm-minikube (locked)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".devcontainer/devcontainer-lock.json", "pattern": "\"ghcr\\.io/devcontainers/features/kubectl\\-helm\\-minikube:[0-9]+\"\\s*:\\s*\\{\\s*\"version\"\\s*:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "oci", "registry": "ghcr.io", "repository": "devcontainers/features/kubectl-helm-minikube" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "A feature is exercised only by building the dev container -- `npx @devcontainers/cli build --frozen-lockfile` needs a container engine, registry pulls and minutes, and no workflow builds .devcontainer/ (see tool-k3d). Rebuild it on the bump commit.",
+      "note": "The LOCKED feature release from .devcontainer/devcontainer-lock.json -- the version of the feature's install script, not of the tool it installs (that is `devcontainer-kubectl` and `devcontainer-helm`). devcontainer.json names the feature by major (`:1`), and `devcontainer upgrade` moves the lock only within that major; a newer major needs the `:1` in devcontainer.json moved first, and may rename its options."
+    },
+    {
+      "id": "devcontainer-feature-docker-in-docker",
+      "class": "devcontainer-feature",
+      "title": "dev container feature docker-in-docker (locked)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".devcontainer/devcontainer-lock.json", "pattern": "\"ghcr\\.io/devcontainers/features/docker\\-in\\-docker:[0-9]+\"\\s*:\\s*\\{\\s*\"version\"\\s*:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "oci", "registry": "ghcr.io", "repository": "devcontainers/features/docker-in-docker" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "A feature is exercised only by building the dev container -- `npx @devcontainers/cli build --frozen-lockfile` needs a container engine, registry pulls and minutes, and no workflow builds .devcontainer/ (see tool-k3d). Rebuild it on the bump commit.",
+      "note": "The LOCKED feature release from .devcontainer/devcontainer-lock.json -- the version of the feature's install script, not of the tool it installs (that is nothing: the Docker engine it installs floats, as devcontainer.json says). devcontainer.json names the feature by major (`:2`), and `devcontainer upgrade` moves the lock only within that major; a newer major needs the `:2` in devcontainer.json moved first, and may rename its options. Upstream is on major 4 as of 2026-09-23, so this row reads BEHIND until that move is made."
+    },
+    {
+      "id": "devcontainer-feature-git",
+      "class": "devcontainer-feature",
+      "title": "dev container feature git (locked)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".devcontainer/devcontainer-lock.json", "pattern": "\"ghcr\\.io/devcontainers/features/git:[0-9]+\"\\s*:\\s*\\{\\s*\"version\"\\s*:\\s*\"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "oci", "registry": "ghcr.io", "repository": "devcontainers/features/git" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "A feature is exercised only by building the dev container -- `npx @devcontainers/cli build --frozen-lockfile` needs a container engine, registry pulls and minutes, and no workflow builds .devcontainer/ (see tool-k3d). Rebuild it on the bump commit.",
+      "note": "The LOCKED feature release from .devcontainer/devcontainer-lock.json -- the version of the feature's install script, not of the tool it installs (that is nothing: git comes from the Ubuntu packages and floats). devcontainer.json names the feature by major (`:1`), and `devcontainer upgrade` moves the lock only within that major; a newer major needs the `:1` in devcontainer.json moved first, and may rename its options."
+    },
+
+    {
+      "id": "crate-rsa",
+      "class": "cargo-crate",
+      "title": "rsa (held)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "cli/Cargo.lock", "pattern": "name = \"rsa\"\nversion = \"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "crates-io", "crate": "rsa" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "Nothing to gate: the pin cannot move. See heldReason.",
+      "held": true,
+      "heldReason": "ON the newest stable and stuck. 0.10 has been in RC since 2025 (rc.18, 2026-04-27) and does NOT fix RUSTSEC-2023-0071 -- the advisory's patched list is empty and RustCrypto/RSA#626 is open. The real gate is `pkcs1` 0.8.0 final (RustCrypto/formats#2385, not started), because `from_pkcs1_pem` is a production call at cli/cli-providers/src/cert.rs:89. The advisory is NOT reachable here: the only production RsaPrivateKey use is cert.rs:67, to_public_key() + compare, and every .decrypt() is #[cfg(test)]. The algorithm is not ours to pick either -- RSA-OAEP is in the type signature of sealed-secrets' own Unseal(). Tracked as an explicit ignore in deny.toml. NOTE removing rsa alone would NOT unify the RustCrypto generation: `age` holds digest 0.10 / rand_core 0.6 independently -- see crate-age.",
+      "note": "Per-crate entry because the cargo AGGREGATE below reports a COUNT and cannot name a crate, and because a `behind latest` check reports nothing for a crate that is already on latest."
+    },
+    {
+      "id": "crate-serde-yaml",
+      "class": "cargo-crate",
+      "title": "serde_yaml (held -- archived)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "cli/Cargo.lock", "pattern": "name = \"serde_yaml\"\nversion = \"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "crates-io", "crate": "serde_yaml" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "Nothing to gate: the crate is archived, so there is no candidate version to try.",
+      "held": true,
+      "heldReason": "ARCHIVED. The newest published version is literally named `0.9.34+deprecated` (2024-03-25); dtolnay deprecated and archived the crate. cargo-deny does NOT catch this one -- there is no RUSTSEC advisory for it -- so without this entry it is invisible to every gate in the tree while reading as perfectly up to date. Successors exist (serde_yaml_ng, serde_norway, serde_yml) but differ in YAML 1.1/1.2 edge-case behaviour, and this repo parses YAML that USERS write, so the swap is a judged product decision rather than a rename. Tracked as WI-367.",
+      "note": "A workspace dependency in BOTH Cargo workspaces; used in cli-core, docsgen and the platform-stack tooling."
+    },
+    {
+      "id": "crate-age",
+      "class": "cargo-crate",
+      "title": "age (held -- holds the old RustCrypto generation)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": "cli/Cargo.lock", "pattern": "name = \"age\"\nversion = \"([^\"]+)\"" }
+        ]
+      },
+      "upstream": { "kind": "crates-io", "crate": "age" },
+      "compare": "numeric",
+      "gate": null,
+      "gateGap": "Nothing to gate while it is on latest; the blocker is upstream's own dependency choice.",
+      "held": true,
+      "heldReason": "On the newest release and still pinning the OLD RustCrypto generation -- digest 0.10, generic-array 0.14, rand_core 0.6 -- independently of the rsa crate. Listed because the obvious conclusion from the rsa entry (\"remove rsa and the generation unifies\") is WRONG: both hold it, so any plan to move cli/backup-core onto sha2 0.11 / rand 0.9 has to clear this one too. Used for the age-encrypted state cache (cli/cli-core/src/secrets.rs).",
+      "note": "Encrypts the kubeconfig and argocd password cached under ~/.config/apprafter."
+    },
     {
       "id": "deps-cargo-cli",
       "class": "package-manager",

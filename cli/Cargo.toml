@@ -15,9 +15,16 @@ members = [
 # Bumped to match each released patch tag per the CONTRIBUTING.md
 # "Versioning" rule. Drifted at 0.1.2 from initial v0.1.2 commit
 # through v0.1.76; the policy starts at v0.1.77.
-version      = "0.2.76"
+version      = "0.2.77"
 edition      = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
+# Never published to crates.io: these crates are a product, not a library,
+# and nothing in .github/workflows runs `cargo publish`. Declaring it makes
+# that explicit rather than merely true by omission, stops an accidental
+# publish, and is what lets cargo-deny treat them as private — without it
+# the licence check reads `FSL-1.1-Apache-2.0` (a real licence, but not an
+# SPDX identifier) as "unlicensed" on our own code.
+publish      = false
 license      = "FSL-1.1-Apache-2.0"
 authors      = ["AppRafter Authors"]
 repository   = "https://github.com/apprafter/apprafter"
@@ -29,7 +36,7 @@ clap                 = { version = "4.5", features = ["derive", "env"] }
 # verbatim rather than a floor of its own: one edit then moves both, and
 # a mismatch is a compile error rather than a subtly wrong script.
 clap_complete        = "4.5"
-thiserror            = "1.0"
+thiserror            = "2"
 tracing              = "0.1"
 tracing-subscriber   = { version = "0.3", features = ["env-filter", "fmt"] }
 serde                = { version = "1.0", features = ["derive"] }
@@ -42,18 +49,39 @@ predicates           = "3.1"
 tempfile             = "3.10"
 ureq                 = { version = "2.10", features = ["json"] }
 mockito              = "1.5"
-age                  = { version = "0.10", default-features = false, features = ["armor"] }
-base64               = "0.22"
+age                  = { version = "0.12", default-features = false, features = ["armor"] }
+base64               = "0.23"
+# HELD, not stale. 0.9.10 is the newest STABLE rsa; the 0.10 line has been in
+# RC since 2025 and does not fix RUSTSEC-2023-0071 either (the advisory's
+# `patched` list is empty, RustCrypto/RSA#626 is open). The real gate is
+# `pkcs1` 0.8.0 final (RustCrypto/formats#2385, not started), because
+# `from_pkcs1_pem` is a production call at cli-providers/src/cert.rs:89.
+#
+# The advisory is NOT reachable here: Marvin attacks private-key DECRYPTION,
+# and the only production `RsaPrivateKey` is cert.rs:67 calling
+# `to_public_key()` to compare against the certificate. Every `.decrypt()` in
+# the tree is `#[cfg(test)]`. Recorded as an explicit ignore in deny.toml —
+# re-examine it if a private-key decrypt or sign ever enters a production path.
+#
+# The algorithm is not ours to choose: RSA-OAEP is in the type signature of
+# sealed-secrets' own `Unseal(codecs, privKeys map[string]*rsa.PrivateKey)`,
+# and a SealedSecret carries no algorithm identifier or format version.
 rsa                  = "0.9"
-aes-gcm              = "0.10"
+aes-gcm              = "0.11"
+# sha2 and rand are held BELOW their newest by the RustCrypto generation that
+# `rsa` 0.9 AND `age` 0.12 both pin (digest 0.10, generic-array 0.14,
+# rand_core 0.6). Moving either alone changes nothing — backup-core/src/sealing.rs
+# hands a `Sha256` type parameter and an RNG straight to rsa, so all three move
+# together or not at all. The operator workspace is already on sha2 0.11; this
+# one cannot follow yet.
 sha2                 = "0.10"
-x509-cert            = { version = "0.2", features = ["pem"] }
+x509-cert            = { version = "0.3", features = ["pem"] }
 rand                 = "0.8"
 include_dir          = "0.7"
-dirs                 = "5"
-indicatif            = "0.17"
-inquire              = "0.7"
-tabled               = "0.15"
+dirs                 = "7"
+indicatif            = "0.18"
+inquire              = "0.9"
+tabled               = "0.22"
 semver               = { version = "1", features = ["serde"] }
 arboard              = { version = "3", default-features = false }
 chrono               = { version = "0.4", default-features = false, features = ["clock", "serde"] }
@@ -63,10 +91,30 @@ chrono               = { version = "0.4", default-features = false, features = [
 # `/etc/localtime` was rejected: two of the three release targets are macOS,
 # where there is no `/etc/timezone` and the zoneinfo prefix differs.
 iana-time-zone       = "0.1"
+# WI-389: the retention prune counts days, ISO weeks and months in the backup
+# schedule's own zone (`spec.backup.timeZone`), so that a daily schedule makes
+# exactly one run per day the keep policy counts, across a DST change too. The
+# CLI prune and the in-cluster runner must bucket alike, so the zone rules are
+# compiled in (one IANA database for both, from this lock) rather than read
+# from a zoneinfo directory the runner's image and a workstation hold at
+# different versions, or not at all.
+chrono-tz            = "0.10"
 terminal_size        = "0.4"
 tokio                = { version = "1", features = ["macros", "rt-multi-thread"] }
-kube                 = { version = "0.95", default-features = false, features = ["client", "runtime", "rustls-tls"] }
-k8s-openapi          = { version = "0.23", default-features = false, features = ["v1_31"] }
+# `ring` is NOT implied by `rustls-tls` since kube 0.99 (kube-rs/kube#1717;
+# 0.95 through 0.98 hard-wired ring into hyper-rustls): it names the rustls
+# crypto provider, and without it (or `aws-lc-rs`) rustls is compiled with NO
+# provider and the first `Client` construction panics with "Could not
+# automatically determine the process-level CryptoProvider". ring rather than
+# aws-lc-rs because ureq (the CLI's HTTP client) already enables rustls' ring:
+# choosing aws-lc-rs here would compile BOTH providers in, which is the other
+# way to get that panic. `rustls` below is that same crate, named directly so
+# the runner can install ring explicitly (`apprafter_backup::tls`);
+# `default-features = false` is load-bearing, because rustls' defaults include
+# aws-lc-rs.
+kube                 = { version = "4.2.0", default-features = false, features = ["client", "runtime", "rustls-tls", "ring"] }
+k8s-openapi          = { version = "0.28.0", default-features = false, features = ["v1_36"] }
+rustls               = { version = "0.23", default-features = false, features = ["ring", "std"] }
 futures              = "0.3"
 
 [profile.release]

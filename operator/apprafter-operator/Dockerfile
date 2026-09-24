@@ -67,12 +67,27 @@
 # PROMPT interactively for the registry, which hangs the LOCAL_
 # OPERATOR e2e build (`e2e/needs-disk-walk.sh`). Docker buildx
 # resolves the qualified form identically, so CI is unaffected.
-FROM docker.io/library/rust:1.88-alpine3.21 AS chef
-ARG CARGO_CHEF_VERSION=0.1.71
-RUN apk add --no-cache musl-dev curl tar \
+FROM docker.io/library/rust:1.98-alpine3.24 AS chef
+# The compiler is the one this image ships, and nothing else. operator/ has
+# no rust-toolchain.toml, so rustup resolves its default (the image's
+# 1.98.x) today; but a toolchain file added later would name a toolchain the
+# image does not have (it calls its own `1.98.1-<triple>`, not `1.98`), and
+# rustup's default is to download that silently and build with it. With
+# auto-install off the build fails instead. cli/apprafter-backup/Dockerfile
+# shows the way through if a file ever lands: RUSTUP_TOOLCHAIN to the image's
+# own, plus a check that the file names the same minor.
+ENV RUSTUP_AUTO_INSTALL=0
+ARG CARGO_CHEF_VERSION=0.1.78
+# cargo-chef switched its release tooling to cargo-dist at 0.1.75, which
+# changed BOTH the asset name (.tar.gz -> .tar.xz) and the archive layout
+# (the binary is now nested in a per-target directory). Hence the `xz`
+# package and `--strip-components=1`; without either, the build fails at
+# image-build time rather than anywhere a test would see it.
+RUN apk add --no-cache musl-dev curl tar xz \
  && curl --proto '=https' --tlsv1.2 -fsSL \
-      "https://github.com/LukeMathWalker/cargo-chef/releases/download/v${CARGO_CHEF_VERSION}/cargo-chef-x86_64-unknown-linux-musl.tar.gz" \
-    | tar -xz -C /usr/local/bin/ cargo-chef \
+      "https://github.com/LukeMathWalker/cargo-chef/releases/download/v${CARGO_CHEF_VERSION}/cargo-chef-x86_64-unknown-linux-musl.tar.xz" \
+    | tar -xJ --strip-components=1 -C /usr/local/bin/ \
+        cargo-chef-x86_64-unknown-linux-musl/cargo-chef \
  && chmod +x /usr/local/bin/cargo-chef
 WORKDIR /workspace
 
@@ -80,13 +95,20 @@ FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
+# `--locked` on BOTH cargo steps, as release-cli.yml builds the CLI and the
+# backup runner image builds itself: the image resolves exactly what
+# operator/Cargo.lock says, or fails. Without it a Cargo.lock that lags a
+# Cargo.toml edit is silently re-resolved inside the image, so the operator
+# ships dependency versions no test in the workspace ever ran. `cargo chef
+# prepare` copies the lock into recipe.json as it is (it does not re-resolve),
+# so the cook step is where a stale lock fails, before the long compile.
 FROM chef AS builder
 COPY --from=planner /workspace/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json \
+RUN cargo chef cook --release --locked --recipe-path recipe.json \
         --target x86_64-unknown-linux-musl \
         --bin apprafter-operator
 COPY . .
-RUN cargo build --release --bin apprafter-operator \
+RUN cargo build --release --locked --bin apprafter-operator \
         --target x86_64-unknown-linux-musl
 
 FROM gcr.io/distroless/static-debian12:nonroot

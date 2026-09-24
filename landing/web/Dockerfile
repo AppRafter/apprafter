@@ -18,7 +18,7 @@
 # -----------------------------------------------------------------
 # Stage 1: build the static Astro output
 # -----------------------------------------------------------------
-FROM oven/bun:1-alpine AS builder
+FROM oven/bun:1.4-alpine AS builder
 WORKDIR /landing
 
 # Workspace lockfile + manifest first — keeps the install layer
@@ -70,7 +70,7 @@ RUN cd web && bun run build
 # -----------------------------------------------------------------
 # Stage 2: minimal Caddy runtime
 # -----------------------------------------------------------------
-FROM caddy:2-alpine AS runtime
+FROM caddy:2.11-alpine AS runtime
 
 COPY --from=builder /landing/web/dist /usr/share/caddy
 COPY web/Caddyfile /etc/caddy/Caddyfile

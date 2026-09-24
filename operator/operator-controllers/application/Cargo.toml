@@ -6,6 +6,7 @@ version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
+publish.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
 
@@ -20,7 +21,7 @@ operator-rendering                    = { path = "../../operator-rendering" }
 
 kube             = { workspace = true }
 k8s-openapi      = { workspace = true }
-oci-distribution = { workspace = true }
+oci-client = { workspace = true }
 base64           = { workspace = true }
 sha2             = { workspace = true }
 tracing          = { workspace = true }
@@ -32,3 +33,12 @@ serde        = { workspace = true }
 serde_json   = { workspace = true }
 reqwest      = { workspace = true }
 async-trait  = { workspace = true }
+
+[dev-dependencies]
+# The reconcile-level tests drive the whole `reconcile` against a scripted
+# in-process apiserver. `kube::Client` is a thin wrapper over a
+# `tower::Service`, so a `tower::service_fn` answering from a script exercises
+# the real client with no cluster — the only way to read the Deployment a
+# reconcile actually APPLIES, which is what decides whether it is a rollout.
+tower = { workspace = true }
+http  = { workspace = true }

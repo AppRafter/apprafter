@@ -525,15 +525,127 @@ _components: argocd: #Component & {
 		// `repoServer.replicas` already comes from
 		// `_loaderValues.argocd` above; only the chart-only
 		// extras live here.
+		//
+		// Bound the repo-server's cold-start render fan-out. Chart
+		// 7.7.7 defaults `reposerver.parallelism.limit` to 0, which
+		// means no limit. After a cold start (node reboot, Argo CD
+		// upgrade, loss of the Redis manifest cache) the controller
+		// does not re-render Applications whose `reconciledAt` is
+		// fresh; it re-compares all of them together when the 180s
+		// `timeout.reconciliation` fires. At 0 the repo-server then
+		// runs every Application's work at once: 7-9 `helm pull` /
+		// `helm template` children (11-25Mi anon each, cilium the
+		// largest) plus a full-history `git fetch` per git source
+		// (Argo CD 2.13 has no depth option; the platform monorepo's
+		// `git index-pack` alone is ~59Mi). That peak grows with every
+		// chart or git Application added.
+		//
+		// Measured 2026-09-22 on disk-backed kind (k8s 1.36.4, Argo CD
+		// 2.13.1, 13 Applications including a Cilium 1.16.5 render),
+		// repo-server anon peak on a full cold start, limit lifted to
+		// 2Gi so no run was cut short:
+		//   0 (chart default)  127-158Mi   7-9 helm children at once
+		//   4                   90-101Mi
+		//   2                   67-76Mi    +2-3s to every app compared
+		//   1                   67-90Mi    no lower, +10-13s
+		// 1 buys nothing: one `git index-pack` plus the ~30Mi Go process
+		// is the floor. The semaphore (runRepoOperation) covers helm
+		// chart extraction/template and the git checkout, so at 2 the
+		// peak is the two heaviest operations plus the Go process.
+		// Re-run on kind with the 11 platform Applications, one cluster,
+		// 0.2.79 values then these: parallelism 0 / 256Mi peaked at
+		// 180Mi anon with 9 helm children at once (the limit sweep below
+		// saw 192Mi OOM-kill 1 run in 2); parallelism 2 / 384Mi peaked at 92 and
+		// 98Mi (the argo-cd + cilium chart pulls; the monorepo
+		// index-pack), never more than 2 helm children, no OOM.
+		//
+		// What to watch: queued work waits inside the controller's 60s
+		// repo-server RPC deadline (`controller.repo.server.timeout.seconds`).
+		// A cluster with dozens of Applications, or slow git sources
+		// holding both slots, would show ComparisonError retries and a
+		// high `argocd_repo_pending_request_total`; 3-4 is the next step.
+		// The same coupling in an OUTAGE: helm and git children run
+		// without the request's context, bounded only by
+		// ARGOCD_EXEC_TIMEOUT (90s), so a stalled registry or git host
+		// (ghcr.io serves the platform, operator, webhook and dragonfly
+		// charts) can hold both slots after its callers gave up, and
+		// Applications unrelated to it then ComparisonError until it
+		// recovers. At the old unlimited setting that coupling did not
+		// exist; it is the price of bounding the peak.
+		//
+		// Value type: the chart renders every `configs.params` value
+		// with `toString`, so this int lands as the string "2" the
+		// ConfigMap needs (the chart's own default is the int 0).
+		//
+		// ROLLOUT: every `configs.params` key feeds the chart's
+		// `checksum/cmd-params` pod annotation on the controller,
+		// server and repo-server (and the applicationset / dex
+		// templates), so changing ANY key here restarts every Argo CD
+		// pod except Redis at once. That is intended, and cheaper than
+		// it sounds: the restarted controller re-compares everything
+		// at the next 180s tick, and with Redis kept those compares are
+		// answered from its manifest cache (measured on kind, 0.2.79 ->
+		// this change: no helm or git child at all, 44Mi anon). What
+		// the restart does render (an Application whose source moved in
+		// the same release) renders under the new settings, because
+		// the replacement repo-server reads the new ConfigMap and gets
+		// the limit below in the same rollout. A full cold render needs
+		// the Redis cache gone as well (node reboot, Redis restart).
+		configs: params: "reposerver.parallelism.limit": 2
+
 		repoServer: {
-			// 2.16d: repo-server resources (measured 82Mi → req 66Mi / limit 256Mi).
+			// Two different numbers, measured two different ways.
+			//
+			// REQUEST 66Mi is the WORN-IN steady state (2.16d: 82Mi
+			// working set x 0.8; 2.16f saw 42-114Mi settled). Scheduling
+			// is unchanged.
+			//
+			// LIMIT has to cover the COLD full render, which the worn-in
+			// number says nothing about. Measured 2026-09-22 on
+			// disk-backed kind (13 Applications incl. Cilium) at
+			// parallelism 0: anon 94-158Mi on a cold start, 179Mi on a
+			// hard refresh of every Application (9 helm children at
+			// once), and an OOM threshold of ~190-200Mi (a 192Mi and a
+			// 160Mi limit each OOMed 1 run in 2, 128Mi always). The old
+			// 256Mi sat only ~55-65Mi above that threshold, and at
+			// parallelism 0 the peak rises with every chart or git
+			// Application added.
+			// 384Mi is ~2x over that parallelism-0 worst case and ~4x over
+			// the parallelism-2 cold peak (67-98Mi anon across both runs).
+			//
+			// It also clears a node whose pod storage is memory-backed (a
+			// tmpfs root, e.g. the sandbox microVM): there every file the
+			// pod writes (git clones, helm charts, the ~176Mi argocd
+			// binary copyutil puts in the `var-files` emptyDir) is
+			// unreclaimable shmem charged to the POD, whose limit is the
+			// sum of its container limits. That pod needs 386-404Mi:
+			// 256+128 = 384Mi OOM-looped, 384+128 = 512Mi was 4/4 green.
+			//
+			// A limit reserves nothing; the only cost is a higher
+			// overcommit ceiling on the node.
 			resources: {
 				requests: memory: "66Mi"
-				limits: memory:   "256Mi"
+				limits: memory:   "384Mi"
 			}
-			// 2.16f (M2): the repo-server container forks helm + git in the
-			// same 256Mi cap; 128MiB leaves ~128Mi for those forks + Go
-			// non-heap while sitting comfortably above the 82Mi steady set.
+			// GOMEMLIMIT/GOGC stay. The repo-server's own Go heap is
+			// ~30-40Mi, far under 128MiB, but its helm children inherit
+			// this environment (util/helm/cmd.go sets `cmd.Env =
+			// os.Environ()`), and together they take ~28Mi anon (~31Mi
+			// memory.peak) off the parallelism-0 cold peak; measured with
+			// both removed. GOMEMLIMIT spelling: see `controller.env`.
+			//
+			// A PlatformStack override of `repoServer.env` replaces this
+			// list wholesale (the chart's mergeOverwrite does not merge
+			// lists), so it must restate both entries.
+			//
+			// Deliberately NOT set: git's own memory caps
+			// (GIT_CONFIG_COUNT/KEY_n/VALUE_n with
+			// core.deltaBaseCacheLimit=16m + pack.threads=1; Argo CD runs
+			// git with HOME=/dev/null, so the environment is the only
+			// knob). They cut the monorepo fetch 65 -> 19Mi in the
+			// v2.13.1 image, but user repositories may be large and
+			// single-threaded packing slows them, and the parallelism
+			// limit above already bounds the peak.
 			env: [
 				{name: "GOMEMLIMIT", value: "128MiB"},
 				{name: "GOGC", value: "50"},

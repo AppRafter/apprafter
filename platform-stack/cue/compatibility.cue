@@ -1934,6 +1934,223 @@ compatibility: "0.2.74": {
 	]
 }
 
+compatibility: "0.2.80": {
+	change:          "requires-restart"
+	operatorVersion: "v0.2.52"
+	notes: """
+		DEPENDENCY SWEEP — every platform controller restarts once; no
+		application pod and no Postgres, Dragonfly or NATS pod restarts. Nine
+		behaviours change on purpose; read them, and the two checks before
+		upgrading, first.
+
+		BEFORE UPGRADING. (a) Retention: a cluster that never set
+		spec.backup.retention.enforce, and whose bucket key may delete, starts
+		pruning at its first weekly check after the upgrade (7). To keep the old
+		behaviour, run "apprafter backup set enforce operator" first. A cluster
+		on the scoped key deletes nothing either way. (b) A stuck backup or
+		check Job: 0.2.79 Jobs have no deadline, so a runner pod no node has room
+		for stays Pending until someone deletes it, and under concurrencyPolicy
+		Forbid its CronJob starts nothing else, not even after the upgrade. Run
+		"apprafter backup status" with apprafter 0.2.77 (older CLIs show such a
+		Job as Running); if it shows a Job "Pending, cannot be scheduled",
+		delete it with the kubectl command it prints before upgrading.
+
+		WHAT RESTARTS: the operator and admission webhook (v0.2.52); every Argo
+		CD pod except Redis (a cmd-params key changed, see 3); cert-manager's
+		controller, cainjector and webhook; the sealed-secrets controller; the
+		three VPA pods. WHAT DOES NOT: application pods — the operator adds an
+		apprafter.io/image-ref annotation to the Deployment's own metadata, which
+		bumps its generation once without touching the pod template; Postgres —
+		the CloudNativePG chart is unchanged and the operand image is now pinned
+		to exactly the build every cluster already runs
+		(ghcr.io/cloudnative-pg/postgresql:18.3-system-trixie), applied the next
+		time a pg claim is provisioned, still without a restart; Dragonfly;
+		NATS (9). The backup CronJobs take their new template from their next
+		run.
+
+		KUBERNETES 1.36: the operator, the webhook and the backup runner are now
+		built on kube-rs 4.2 / k8s-openapi 0.28 against the 1.36 API that
+		production runs. The CRDs are byte-identical except the PlatformStack
+		backup fields in 5 and 7: two new optional deadlines, and
+		retention.enforce, which takes check and is now optional. Written
+		timestamps are byte-identical. Events the operator emits are now named
+		<object>.<hex> instead of <controller>-<random>; nothing depends on their
+		names. The backup runner now retries a transient apiserver 429, 503 or
+		504 within the request instead of failing the run; the operator keeps
+		retries off. The operator gains a read-only Role in apprafter-system
+		(list and watch on cronjobs, jobs and pods) for 6 and 7.
+
+		1. LEADER ELECTION. The Lease timings are unchanged (30s, renewed every
+		10s), but a leader now bounds every Lease request, steps down 20s after
+		its last successful renewal — 10s before anyone may take the Lease — and
+		exits; it also exits when it reads another holder. An apiserver outage
+		that keeps the leader from renewing for 20s — one of 10 to 20s,
+		depending on when it starts — therefore restarts the operator pod
+		(restartCount +1, last state Error, log "stepping down as leader")
+		instead of leaving a leader reconciling on an expired Lease beside its
+		successor.
+
+		2. A REGISTRY BLIP NO LONGER ROLLS YOUR APP. A failed tag-to-digest
+		lookup keeps the digest already running for that image reference and
+		reports ImageResolved=False/ResolveFailed; it used to render the tag,
+		then roll back to the digest on the next success — two rollouts of an
+		unchanged image. A moved tag still rolls on the next successful lookup.
+		After "apprafter app unpin" while the registry is unreachable, the app
+		stays on the pinned digest until a lookup succeeds. ADR 0040 is amended.
+
+		3. ARGO CD RENDERS AT MOST TWO APPLICATIONS AT ONCE
+		(reposerver.parallelism.limit 2, was unlimited) and the repo-server
+		memory limit rises 256Mi -> 384Mi (request unchanged at 66Mi). A cold
+		start (node reboot, Argo CD upgrade) used to render everything at once
+		and peak close to the old limit; the peak now roughly halves and no
+		longer grows with the number of Applications. The price: a stalled
+		registry or git host can hold both slots for up to 90s, and unrelated
+		Applications show ComparisonError until it recovers. With many
+		Applications, raise the limit through
+		PlatformStack.spec.overrides.argocd.values.configs.params. The upgrade
+		itself re-renders from the Redis cache and is not a cold start.
+
+		4. PLATFORM COMPONENTS. cert-manager v1.16.2 -> v1.21.2: 1.16 was end
+		of life and never supported past Kubernetes 1.32. Existing certificates
+		are kept; each renewal now issues a new private key; the built-in edit
+		role no longer lets namespace editors create ACME Challenges or
+		create/patch/update Orders (GHSA-8rvj-mm4h-c258); the metrics port is
+		renamed http-metrics; an unused token Role is pruned. sealed-secrets
+		2.18.6 -> 2.20.0 (controller 0.40.0): keys, public certificate and wire
+		format unchanged, nothing to re-seal. VPA chart 0.11.0 -> 0.12.0 (VPA
+		1.7.1 unchanged): the new chart drops a permission 1.7.1 still needs to
+		clean up recommendations of deleted apps, so this release grants it.
+
+		5. SCHEDULED BACKUPS CAN NO LONGER HANG (runner apprafter-backup
+		0.2.77). Both backup CronJobs stop a Job at a deadline, 6h by default,
+		set with "apprafter backup set deadline" / "check-deadline" or
+		spec.backup.activeDeadlineSeconds / checkActiveDeadlineSeconds (minimum
+		600). A run stopped at its deadline now records lastFailure, fires the
+		failure webhook, deletes its helper pods and lets restic release its
+		repository lock. Under concurrencyPolicy Forbid a stuck run costs the
+		slots it overlaps; the most recent missed slot starts late once it
+		ends. pg_dump gives up after 5 minutes waiting for table locks and after
+		10 minutes without output (a lock on a view, materialized view or
+		sequence); the failure webhook is bounded to 30s; lastError now carries
+		the failing command's own error output; "apprafter backup status" names
+		why a Job failed. Mind the default schedules: the 6h backup deadline is
+		longer than the 3h gap from the 03:00 backup to the Sunday 06:00 check,
+		so a Sunday backup past three hours costs that week's check or that
+		backup — move the check with "apprafter backup set check 12:00". Helper
+		pods now live max(deadline, 6h) instead of one hour, so a single large
+		dump or load no longer dies at 60 minutes; interactive backup create,
+		export and restore
+		get at least six hours too. JetStream helper pods are renamed to include the
+		claim's namespace; a Completed leftover under an old name is no longer
+		reused and can be removed with: kubectl delete pod -n <nats-namespace>
+		-l apprafter.io/backup-helper=true --field-selector=status.phase=Succeeded
+
+		6. A BACKUP THAT CANNOT RUN IS REPORTED, AND THE RUNNER GIVES WAY. The
+		0.2.79 runner requested 256Mi, which a 4 GB node running the platform,
+		a pg and a persistent redis claim did not have: no nightly backup ran,
+		and nothing on the cluster said so. The runner now requests
+		128Mi (limit 512Mi -> 384Mi), measured against a real bucket: restic
+		runs with GOMAXPROCS=2 and GOMEMLIMIT=96MiB and uploads 4 MiB packs, so
+		a 2 GB first backup peaks near 107 MiB. The smaller packs mean about
+		three times as many objects for new data (existing packs are kept) and
+		uploads up to 16% slower where the round trip is the limit; mind it on a
+		store that bills per request. It stages on its own volume, so
+		stagingSizeLimit now bounds the staged dumps; an overrun fails the Job
+		at its first attempt with a lastError that names the limit. Both
+		CronJobs' pods run at PriorityClass apprafter-backup-runner (value -1,
+		preemptionPolicy Never): a runner never preempts anything, a pod that
+		needs a running runner's room preempts it, and the Job retries. A runner
+		pod created before the upgrade keeps the default priority and does not
+		give way; only the pods of Jobs the 0.2.80 CronJobs create do. A new
+		PlatformStack condition, BackupHealthy, reads the CronJobs, Jobs and
+		runner pods and says why a backup cannot run: RunnerUnschedulable,
+		RunnerNotStarted, RunnerOOMKilled, RunnerEvicted, RunnerPreempted,
+		RunnerStopped (a drain or a deletion), RunnerFailed, DeadlineExceeded,
+		BackoffLimitExceeded, RepositoryCheckFailed, Failed or
+		ScheduleSuspended; "apprafter status" and "apprafter platform status"
+		print it with the next step. "apprafter backup status" and "backup run"
+		say "cannot be scheduled" rather than Running, and "backup run" starts
+		nothing while another backup or check Job has not finished. Argo CD
+		health is left alone on purpose: a Degraded PlatformStack would block
+		every sync, the fixing upgrade included. What a 4 GB node holds with
+		backups on: docs/operator-guide/choosing-the-machine.md. Rolled back
+		below 0.2.80, the older operator carries both backup conditions (6, 7)
+		forward unchanged; apprafter 0.2.77 says they are not current, other
+		readers see them frozen.
+
+		7. RETENTION RUNS AFTER THE WEEKLY CHECK BY DEFAULT.
+		spec.backup.retention.enforce takes a third mode, check, which is the
+		new default (it was operator: nothing in the cluster pruned, and the
+		repository grew until someone ran "apprafter backup prune"). The weekly
+		check Job now runs the runner itself: restic check, then, only after a
+		check that passed, the prune to the keep policy (7 daily / 4 weekly / 6
+		monthly unless configured) as far as the cluster's key may delete. A
+		scoped key deletes nothing and writes nothing; the new condition
+		BackupRetention then reads False/PruneNotPermitted with the
+		repository's size and growth, and "apprafter status" names the prune to
+		run from outside. An explicit enforce is kept; under cluster a key that
+		may not delete fails the backup, as before. The keep policy counts days,
+		weeks and months in spec.backup.timeZone (UTC when unset) and files each
+		run under the day it started, so on a cluster with a zone the first
+		prune after the upgrade may keep other runs than the UTC count did. A
+		run a backup may still be writing is left alone until the backup
+		deadline (never less than six hours) plus an hour has passed since its
+		newest snapshot, and a lone claim snapshot no longer takes a complete
+		run's keep slot. Every prune now forgets, verifies that the store really
+		deleted, and only then prunes: restic 0.18.1 reports success for a
+		forget the store refused. "apprafter backup prune" now refuses,
+		deleting and writing nothing, when its key may not delete (restic used
+		to write a new index object into the bucket and then fail), and without
+		a cluster it needs --timezone <zone>. A prune that fails, or that the
+		key does not permit, does not fail the check Job. The check Job now
+		posts the failure
+		webhook for a failed check or a failed prune (not for a refused one),
+		records each step in apprafter-backup-status, and keeps restic's cache
+		and the packs a prune rewrites on the staging volume, bounded by
+		stagingSizeLimit: a very large repository may need a larger limit.
+
+		8. RESTORE TAKES THE NEWEST COMPLETE RUN (apprafter 0.2.77). After a
+		sequential backup (stagingMode sequential) stopped between its claims (a
+		deadline, a preemption, Ctrl-C), latest resolved to the unfinished run:
+		"apprafter backup show" misread the repository, and "apprafter restore"
+		without --snapshot failed on the missing manifest. latest is now the
+		newest complete run, compared as instants, and both commands name any
+		unfinished run newer than it. --snapshot with a claim's id restores that
+		claim's run, or refuses when the run never completed.
+
+		9. NATS SYNCS ON A JETSTREAM CLUSTER. Where an app declares
+		needs.jetstream, the nats Application stayed OutOfSync and Argo CD
+		re-synced its StatefulSet about every 3 minutes, for ever. The chart now
+		renders the JetStream volumeClaimTemplate as the apiserver stores it
+		and ignores the nats-box Deployment's status.terminatingReplicas; the
+		Application reaches Synced without a pod restart, and a real template
+		change such as the storage size still shows OutOfSync.
+
+		UNDER THE HOOD. Rust dependencies refreshed across both workspaces,
+		clearing five RUSTSEC advisories — the load-bearing one RUSTSEC-2026-0285
+		(rustls on the kube-client and registry paths). The abandoned
+		oci-distribution crate is replaced by oci-client (the same project after
+		its move to the ORAS org); the two hashes that had to be re-rendered by
+		hand — the ADR 0052 approval content hash and status.envConfig.digest —
+		are proven byte-identical, so no in-flight approval and no application
+		sees a change. Base images move to Alpine 3.24: 3.20 is end of life,
+		and 3.21 ends on 2026-11-01. The Argo CD CUE sidecar moves from cue
+		v0.10.0 to v0.17.1 with cue.mod language versions untouched; its
+		manifest-injection and discovery suites pass unchanged under it.
+		Backup, export and restore helper pods read the Postgres and NATS
+		passwords by secretKeyRef instead of carrying them in the Pod spec, and
+		the Dragonfly restore no longer passes its password on the command line.
+		"""
+	references: [
+		"docs/adr/0040-image-digest-resolution.md",
+		"docs/adr/0050-backup-restore.md",
+		"docs/adr/0053-resource-governance.md",
+		"docs/adr/0066-shared-database.md",
+		"docs/how-it-works/backup-retention-and-checks.md",
+		"https://github.com/AppRafter/apprafter/issues/1",
+	]
+}
+
 compatibility: "0.2.79": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.51"

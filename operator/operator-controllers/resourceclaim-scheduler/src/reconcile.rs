@@ -16,8 +16,9 @@ use chrono::Utc;
 use k8s_openapi::api::core::v1::ObjectReference;
 use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::controller::Action;
-use kube::runtime::events::{Event as KubeEvent, EventType, Recorder, Reporter};
+use kube::runtime::events::{Event as KubeEvent, EventType, Reporter};
 use kube::{Client, Resource, ResourceExt};
+use operator_core::events::ObjectRecorder;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
@@ -218,13 +219,13 @@ fn decide(name: &str, claim: &ResourceClaim, candidates: &[Candidate]) -> Decisi
 /// Build a `Recorder` that publishes events against the given
 /// `ResourceClaim`.  Constructing per-reconcile keeps the reconcile
 /// function pure; `Recorder::new` is cheap.
-fn build_recorder(client: &Client, claim: &ResourceClaim) -> Recorder {
+fn build_recorder(client: &Client, claim: &ResourceClaim) -> ObjectRecorder {
     let reporter = Reporter {
         controller: EVENT_REPORTER_CONTROLLER.into(),
         instance: std::env::var("POD_NAME").ok(),
     };
     let reference: ObjectReference = claim.object_ref(&());
-    Recorder::new(client.clone(), reporter, reference)
+    ObjectRecorder::new(client.clone(), reporter, reference)
 }
 
 /// Build a `ResourceClaimCondition`, preserving `lastTransitionTime`
@@ -986,12 +987,11 @@ mod tests {
     async fn error_policy_counts_the_error_on_both_metrics_and_retries() {
         let (client, log) = scripted_apiserver(|_| apiserver_unavailable());
         let ctx = context(client);
-        let err = ReconcileError::Kube(kube::Error::Api(kube::core::ErrorResponse {
-            status: "Failure".into(),
-            message: "serviceproviders.apprafter.io is forbidden".into(),
-            reason: "Forbidden".into(),
-            code: 403,
-        }));
+        let err = ReconcileError::Kube(kube::Error::Api(
+            kube::core::Status::failure("serviceproviders.apprafter.io is forbidden", "Forbidden")
+                .with_code(403)
+                .boxed(),
+        ));
 
         let action = error_policy(live_claim("pg", &[]), &err, ctx.clone());
 

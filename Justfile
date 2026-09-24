@@ -39,8 +39,17 @@ lint:
     ./scripts/check-cue-cmp-mirror.sh
     ./scripts/check-argocd-health-lua.sh
     ./scripts/check-component-enablement.sh
+    # Pulls each component's upstream chart, so it needs the network (~45s).
+    ./scripts/check-component-claim-templates.sh
+    ./scripts/check-backup-render.sh
     ./scripts/check-version-coherence.sh
     ./scripts/check-plan-checkboxes.sh
+    # Dependency health — advisories, unmaintained crates, licences, sources.
+    # A different question from the version watcher's "are we behind?", which
+    # cannot see an abandoned crate (it sits on its own final release forever)
+    # or an advisory with no patched version. Also runs in CI (test.yml), since
+    # this recipe is invoked by no workflow.
+    ./scripts/cargo-deny.sh
     # `docs-check.sh` byte-compares the generated CLI reference against a
     # fresh render, which cannot see a defect present in BOTH — a doc
     # comment that hard-wraps inside a token renders identically twice and

@@ -843,9 +843,7 @@ impl ApplicationMigrationStrategy {
                 .into_iter()
                 .collect(),
             ),
-            creation_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
-                Utc::now(),
-            )),
+            creation_timestamp: Some(operator_core::k8s_time::time(Utc::now())),
             ..ObjectMeta::default()
         };
         mp
@@ -1551,9 +1549,7 @@ impl SourceCredentialMigrationStrategy {
                 .into_iter()
                 .collect(),
             ),
-            creation_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
-                Utc::now(),
-            )),
+            creation_timestamp: Some(operator_core::k8s_time::time(Utc::now())),
             ..ObjectMeta::default()
         };
         mp

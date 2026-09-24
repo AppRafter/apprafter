@@ -120,23 +120,36 @@ Five behaviours are load-bearing:
 - **PostgreSQL** is restored over an ephemeral helper pod that pipes the dump
   on **stdin** to `pg_restore --no-owner --clean --if-exists`. The connection
   credentials come from the claim's **fresh** `status.connectionSecretRef`
-  (the post-provision Secret), never the credentials embedded in the backup.
+  (the post-provision Secret), never the credentials embedded in the backup;
+  the helper's container reads the password from that Secret by reference, so
+  the Pod object carries none.
   `--no-owner` is assumed because the restored database role is the
-  newly-provisioned one, not whatever owned the objects on the source.
+  newly-provisioned one, not whatever owned the objects on the source. The
+  helper connects with `client_connection_check_interval` set to ten seconds,
+  as a backup's does. `--clean` starts with `DROP TABLE`, which waits behind
+  any open transaction that has read the table, and while it waits every later
+  query on that table queues behind it. Without the setting, a restore stopped
+  at that point would leave its `DROP` waiting on the server after the helper
+  pod was gone; with it, the server ends that session within seconds.
 - **Volumes** are restored by streaming the tar on stdin to `tar x` in a
   helper pod that mounts the fresh PVC read-write.
 - **Redis** (persistent claims) is restored by live-loading the captured
   Dragonfly snapshot into the running instance with `DFLY LOAD`: the tar is
   unpacked into the instance's snapshot directory and the latest snapshot is
-  loaded on the data port (admin password read from the instance's `-admin`
-  Secret). Nothing is scaled or restarted, so the claim provisioner never
+  loaded on the data port. The load authenticates with the instance's admin
+  password as the Dragonfly container already holds it, in the
+  `DFLY_requirepass` variable its operator sets from the instance's `-admin`
+  Secret, so the password is on no command line and the restore never reads
+  it; a container without it stops the load before the snapshot directory is
+  touched. Nothing is scaled or restarted, so the claim provisioner never
   re-provisions (and FLUSHes) the DB mid-restore. Ephemeral
   (`persistent: false`) claims carry no snapshot and come back empty — see the
   note at the top of this page.
 - **JetStream** streams are restored over the NATS wire from a helper pod in
   the namespace the message server runs in, authenticated as the namespace's
-  **manager** user (`nats-mgr-<ns>`) — a claim's own user is denied the
-  snapshot API by design, and the manager identity is the one the design
+  **manager** user, whose name and password the helper's container reads by
+  reference from `nats-mgr-<ns>` beside the server — a claim's own user is
+  denied the snapshot API by design, and the manager identity is the one the design
   reserves for this. The stream is **deleted and replayed**, because a restore
   refuses a stream that already exists, and the controller that creates
   declared streams will have recreated this one empty from its declaration

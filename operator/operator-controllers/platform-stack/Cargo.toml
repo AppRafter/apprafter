@@ -6,6 +6,7 @@ version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
+publish.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
 
@@ -25,8 +26,16 @@ chrono           = { workspace = true }
 serde            = { workspace = true }
 serde_json       = { workspace = true }
 serde_yaml       = { workspace = true }
-oci-distribution = { workspace = true }
+oci-client = { workspace = true }
 semver           = { workspace = true }
 async-trait      = { workspace = true }
 flate2           = { workspace = true }
 tar              = { workspace = true }
+
+[dev-dependencies]
+# `reconcile.rs` drives whole reconciles against a scripted in-process
+# apiserver (`tower::service_fn` behind a real `kube::Client`), so the tests
+# see the exact status patch a reconcile sends — the only way to prove that
+# `BackupHealthy` rides every write alongside the conditions it must not prune.
+tower = { workspace = true }
+http  = { workspace = true }

@@ -2,14 +2,30 @@
 
 package platformstack
 
-// cert-manager + the AppRafter self-signed `ClusterIssuer`.
-// Pinned to v1.16.2 — same as v0.1.x cluster-bootstrap.
+// cert-manager — the controllers and CRDs behind the AppRafter
+// self-signed `ClusterIssuer`.
+//
+// Pinned to v1.21.2. Upstream supports 1.21 on Kubernetes 1.33-1.36;
+// the previous pin, v1.16.2, went end-of-life on 2025-06-10 and was
+// only ever supported up to Kubernetes 1.32. The 1.16 -> 1.21 jump
+// skips four minors, which upstream advises against ("one minor
+// version at a time"); it was proven as a single step on a kind
+// v1.36.4 apiserver instead: v1.16.2 installed, a certificate issued
+// and CA-injected, then upgraded in place — every CRD Established,
+// the existing certificate kept (not reissued), a new one issued.
+//
+// What 1.21 changes that is visible here: the aggregate
+// `cert-manager-edit` ClusterRole no longer lets namespace editors
+// create ACME Challenges or create/patch/update Orders
+// (GHSA-8rvj-mm4h-c258), the controller's self-`tokenrequest`
+// Role/RoleBinding is gone, and the metrics Service port is renamed
+// `tcp-prometheus-servicemonitor` -> `http-metrics`.
 //
 // The chart itself only installs the cert-manager controllers
 // and the `crds: enabled: true` flag wires its CRD bundle. The
-// `apprafter-selfsigned` ClusterIssuer is rendered separately
-// by the umbrella chart's `templates/applications.yaml` chart
-// template (Argo CD treats it as a plain manifest).
+// `apprafter-selfsigned` ClusterIssuer is NOT part of this
+// component: it ships in the admission-webhook chart
+// (`templates/clusterissuer.yaml`) beside the Certificate that uses it.
 _components: "cert-manager": #Component & {
 	name:      "cert-manager"
 	enabled:   bool | *true
@@ -18,7 +34,7 @@ _components: "cert-manager": #Component & {
 		repoURL: "https://charts.jetstack.io"
 		chart:   "cert-manager"
 	}
-	version: "v1.16.2"
+	version: "v1.21.2"
 	values: {
 		crds: {
 			enabled: true

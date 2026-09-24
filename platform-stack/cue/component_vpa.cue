@@ -3,7 +3,7 @@
 package platformstack
 
 // Vertical Pod Autoscaler (VPA) — right-sizes app requests in-place (2.16e /
-// ADR 0054). Official upstream chart `vertical-pod-autoscaler` 0.11.0 (VPA
+// ADR 0054). Official upstream chart `vertical-pod-autoscaler` 0.12.0 (VPA
 // appVersion 1.7.1). The operator emits one VerticalPodAutoscaler per managed
 // app-env (updateMode InPlace, RequestsOnly, containerName "*"); this component
 // only installs the three controllers + the CRDs.
@@ -54,8 +54,31 @@ _components: "vpa": #Component & {
 		repoURL: "https://kubernetes.github.io/autoscaler"
 		chart:   "vertical-pod-autoscaler"
 	}
-	version: "0.11.0"
+	version: "0.12.0"
 	values: {
+		// Chart 0.12.0 removed `namespaces: get, list` from the recommender's
+		// checkpoint-actor ClusterRole (upstream kubernetes/autoscaler
+		// 5dd768a9f0, "Refactor VPA Checkpoint GC"). The same commit rewrote
+		// the recommender so it no longer lists namespaces, but that rewrite is
+		// in no release yet: 0.12.0 still deploys appVersion 1.7.1, whose
+		// `GarbageCollectCheckpoints` starts with `Namespaces().List`. Without
+		// this rule the recommender logs `Cannot list namespaces ... forbidden`
+		// on every checkpoint-GC pass (default every 10m) and returns before
+		// deleting anything, so the VerticalPodAutoscalerCheckpoint of a deleted
+		// app is never collected. Nothing else fails, which is why it would go
+		// unnoticed.
+		//
+		// The chart appends `rbac.extraRules` to the recommender's
+		// `-metrics-reader` ClusterRole, which is bound to the recommender
+		// ServiceAccount only. REMOVE this block once the chart's appVersion is
+		// a VPA release that contains 5dd768a9f0 — check the recommender's
+		// pkg/recommender/input/cluster_feeder.go at that release tag, not the
+		// chart version.
+		rbac: extraRules: [{
+			apiGroups: [""]
+			resources: ["namespaces"]
+			verbs: ["get", "list"]
+		}]
 		admissionController: {
 			replicas:        1
 			registerWebhook: false

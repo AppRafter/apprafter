@@ -145,6 +145,49 @@ pub enum CliError {
         hint: String,
     },
 
+    /// `backup run` gave up on a Job whose pod no node would take.
+    ///
+    /// Typed rather than [`CliError::Other`] because the cause is known
+    /// and so is the next step. The catch-all's help asks the reader to
+    /// file an issue about recurring wording, which is the wrong advice
+    /// here. The scheduler's reason, the runner's requests and the
+    /// documentation link are printed on stdout just before this error,
+    /// one per line. Inside the diagnostic, miette would wrap them to the
+    /// terminal width and split the URL.
+    ///
+    /// `what` and `help` are written by the caller, because both depend on
+    /// what the scheduler said and on what came before: only a lack of room
+    /// is answered by freeing memory, a node's pressure taint lifts by
+    /// itself, and an attempt after one that ran and failed did start.
+    /// `backup enable` adds that the configuration is applied.
+    #[error("backup Job {job} {what}")]
+    #[diagnostic(code(apprafter::backup::runner_unschedulable), help("{help}"))]
+    BackupRunnerUnschedulable {
+        job: String,
+        what: String,
+        help: String,
+    },
+
+    /// `backup run` found a backup or check Job that has not finished, and
+    /// started nothing beside it.
+    ///
+    /// Two runs at once do not both finish: two backups need the same helper
+    /// pods, and a backup and a check each fail on the other's repository
+    /// lock (neither waits for one). On a node with room for one runner, the
+    /// second would not even be scheduled. What the Job is doing (`Running`,
+    /// `Pending, cannot be scheduled: …`) is printed on stdout just before.
+    #[error("Job {job} has not finished, so no second run was started beside it")]
+    #[diagnostic(
+        code(apprafter::backup::job_active),
+        help(
+            "The lines above say what {job} is doing. `apprafter backup status` shows when it \
+             has finished; run `apprafter backup run` then. Two runs at once do not both \
+             finish: two backups need the same helper pods, and a backup and a check each fail \
+             on the other's repository lock."
+        )
+    )]
+    BackupJobActive { job: String },
+
     /// A `kubectl` invocation failed, classified.
     ///
     /// Same shape as [`CliError::Restic`]: `hint` is derived from
@@ -730,6 +773,50 @@ mod tests {
             !help.contains("delete `.apprafter/`"),
             "help must not send the operator at a path state left in v0.1.154: {help}"
         );
+    }
+
+    #[test]
+    fn an_unschedulable_backup_runner_has_its_own_code_and_no_file_an_issue_help() {
+        // What happened and what to do depend on the scheduler's reason
+        // and on the command, so the caller writes both; the code is fixed.
+        let err = CliError::BackupRunnerUnschedulable {
+            job: "apprafter-backup-manual-20260923-170848".into(),
+            what: "never started: no node had room for its pod for 2m 3s".into(),
+            help: "`apprafter top` shows how much of each node is requested.".into(),
+        };
+        assert_eq!(code_of(&err), "apprafter::backup::runner_unschedulable");
+        assert_eq!(
+            err.to_string(),
+            "backup Job apprafter-backup-manual-20260923-170848 never started: no node had room \
+             for its pod for 2m 3s"
+        );
+        let help = help_of(&err);
+        assert_eq!(
+            help,
+            "`apprafter top` shows how much of each node is requested."
+        );
+        assert!(
+            !help.contains("file an issue"),
+            "a known cause must not get the catch-all's advice: {help}"
+        );
+    }
+
+    #[test]
+    fn a_run_refused_beside_an_active_job_has_its_own_code_and_names_the_job() {
+        let err = CliError::BackupJobActive {
+            job: "apprafter-backup-check-29312350".into(),
+        };
+        assert_eq!(code_of(&err), "apprafter::backup::job_active");
+        assert_eq!(
+            err.to_string(),
+            "Job apprafter-backup-check-29312350 has not finished, so no second run was started \
+             beside it"
+        );
+        let help = help_of(&err);
+        assert!(help.contains("`apprafter backup status`"), "{help}");
+        assert!(help.contains("`apprafter backup run`"), "{help}");
+        assert!(help.contains("do not both finish"), "{help}");
+        assert!(!help.contains("file an issue"), "{help}");
     }
 
     #[test]

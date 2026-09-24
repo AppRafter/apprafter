@@ -28,16 +28,11 @@ set -euo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
-# Resolve the CUE binary the same way scripts/lint-cue.sh does:
-# prefer local install, fall back to `nix run nixpkgs#cue --`.
-if command -v cue >/dev/null 2>&1; then
-  CUE_CMD=(cue)
-elif command -v nix >/dev/null 2>&1; then
-  CUE_CMD=(nix run nixpkgs#cue --)
-else
-  echo "ERROR: cue is not installed and nix is unavailable." >&2
-  exit 2
-fi
+# Resolved through scripts/cue, the single resolver for this repo's pinned
+# cue. It used to be `command -v cue || nix run nixpkgs#cue`, where BOTH
+# branches give whatever the machine or nixpkgs happens to have rather than
+# the version flake.nix pins. See scripts/cue for the full reasoning.
+CUE_CMD=("$(git rev-parse --show-toplevel)/scripts/cue")
 
 if [[ $# -gt 1 ]]; then
   echo "usage: $0 [<version>]" >&2
@@ -45,14 +40,21 @@ if [[ $# -gt 1 ]]; then
   exit 2
 fi
 
+# cue's stderr is captured SEPARATELY, never folded into a value with 2>&1:
+# since cue v0.17 a dirty working tree makes `cue export` print
+# "warning: Git tree '<path>' is dirty" on stderr, and folding it in turned the
+# resolved version into "warning: …" (and polluted the compatibility dump).
+CUE_ERR="$(mktemp)"
+trap 'rm -f "$CUE_ERR"' EXIT
+
 if [[ $# -eq 1 ]]; then
   VERSION="$1"
 else
   # Auto-resolve from the canonical source-of-truth.
   VERSION="$("${CUE_CMD[@]}" export ./platform-stack/cue/... \
-              -e currentVersion --out text 2>&1)" || {
+              -e currentVersion --out text 2>"$CUE_ERR")" || {
     echo "ERROR: failed to read currentVersion from platform-stack/cue/platform.cue" >&2
-    echo "$VERSION" >&2
+    cat "$CUE_ERR" >&2
     exit 1
   }
   if [[ -z "${VERSION:-}" ]]; then
@@ -68,7 +70,8 @@ fi
 # sanity check) and stderr (for the failure-case diagnostic).
 if ! out=$("${CUE_CMD[@]}" export ./platform-stack/cue/... \
             -e "compatibility[\"${VERSION}\"]" \
-            --out yaml 2>&1); then
+            --out yaml 2>"$CUE_ERR"); then
+  out="$(cat "$CUE_ERR")"
   cat >&2 <<EOF
 ERROR: platform-stack/cue/compatibility.cue has no entry for version "${VERSION}".
 

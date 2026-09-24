@@ -35,9 +35,14 @@ pub fn seal_value(pub_key: &RsaPublicKey, label: &[u8], plaintext: &[u8]) -> Res
     // (2) AES-256-GCM with a zero nonce + empty AAD.
     let cipher = Aes256Gcm::new_from_slice(&session_key)
         .map_err(|e| CliError::Other(format!("aes-256-gcm init: {e}")))?;
-    let nonce = Nonce::from_slice(&[0u8; 12]);
+    // aes-gcm 0.11 moved to hybrid-array and deprecated
+    // `Array::from_slice`. `Nonce::from` on a fixed-size array is the
+    // infallible replacement and produces the IDENTICAL 12 zero bytes —
+    // this is the bitnami sealed-secret wire format, so the nonce is
+    // load-bearing and must stay exactly what the controller expects.
+    let nonce = Nonce::from([0u8; 12]);
     let gcm_ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|e| CliError::Other(format!("aes-256-gcm encrypt: {e}")))?;
 
     // (3) RSA-OAEP-SHA256 wrap of the session key, label = scope bytes.

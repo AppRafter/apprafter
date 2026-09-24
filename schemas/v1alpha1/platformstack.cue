@@ -100,6 +100,25 @@ package v1alpha1
 		enabled:  bool | *false
 		schedule: string | *"0 3 * * *"
 
+		// How long one scheduled backup Job may run before Kubernetes
+		// stops it and fails it with reason `DeadlineExceeded` — the
+		// CronJob's `jobTemplate.spec.activeDeadlineSeconds`. Absent means
+		// the platform default, six hours. It is also how long each backup
+		// helper pod lives, the scheduled runner's and the CLI's alike, so
+		// it bounds a single claim's dump as well as the whole run.
+		//
+		// The CronJob never starts a run while the previous one is still
+		// going, so a run that never ends would otherwise suppress every
+		// later backup without anything failing. Keep it shorter than the
+		// interval between two runs of `schedule`, so a stuck run is
+		// stopped before the next slot, and longer than the slowest backup
+		// expected to succeed, which it would otherwise stop too. Keep it
+		// below the time from a backup's start to the next check's start
+		// as well: the check takes the repository's exclusive lock and a
+		// backup still running then fails it (three hours under the
+		// default schedules). At least ten minutes.
+		activeDeadlineSeconds?: int & >=600
+
 		// IANA timezone the two schedules are interpreted in, written to
 		// `CronJob.spec.timeZone` (2.22g / D2). Absent means the CronJob
 		// runs in the kube-controller-manager's zone, which is what every
@@ -137,9 +156,37 @@ package v1alpha1
 			keepDaily?:   int & >0
 			keepWeekly?:  int & >0
 			keepMonthly?: int & >0
-			enforce:      "operator" | "cluster" | *"operator"
+
+			// Who prunes the repository. Absent means the platform
+			// default, `check`; set, it is kept across upgrades.
+			//
+			// - `check`: the weekly check Job, after a check that
+			//   passed, as far as the cluster's S3 key may delete. The
+			//   scoped key ADR 0050 recommends may not, and then nothing
+			//   is deleted and the `BackupRetention` condition says
+			//   retention is not enforced. A check that fails never
+			//   prunes.
+			// - `cluster`: the backup Job, after every backup. Needs a
+			//   key that may delete; a prune that fails fails the backup.
+			// - `operator`: nothing in the cluster prunes. Retention is
+			//   `apprafter backup prune`, run with full credentials.
+			//
+			// Optional rather than defaulted, so that a CR which sets
+			// only a keep count is valid and an absent value stays
+			// distinguishable from an explicit `operator`.
+			enforce?: "check" | "cluster" | "operator"
 		}
 		checkSchedule: string | *"0 6 * * 0"
+
+		// `activeDeadlineSeconds` for the weekly integrity check Job, with
+		// the same rule against `checkSchedule`. Absent means six hours.
+		// A running check holds the repository's exclusive lock, which
+		// fails any backup that starts meanwhile — so keep it below the
+		// time from the check's start to the next backup's start
+		// (twenty-one hours under the default schedules), and raise it for
+		// a long full-read check (`checkReadData`) deliberately, not by
+		// removing it.
+		checkActiveDeadlineSeconds?: int & >=600
 
 		// Deep verify: re-download and re-hash EVERY pack on each weekly
 		// check. Complete, and proportionally expensive — a full repo's

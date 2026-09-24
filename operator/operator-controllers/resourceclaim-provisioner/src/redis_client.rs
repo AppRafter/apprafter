@@ -120,17 +120,21 @@ impl RedisClient {
     ) -> Result<redis::aio::MultiplexedConnection, RedisAdminError> {
         // The admin user on a Dragonfly instance is `default`; the
         // password comes from the per-instance admin Secret. Building the
-        // `ConnectionInfo` directly keeps the password out of any URL
-        // string (and thus out of any error rendering).
-        let conn_info = redis::ConnectionInfo {
-            addr: parse_host_port(addr),
-            redis: redis::RedisConnectionInfo {
-                db: 0,
-                username: None,
-                password: Some(admin_pw.to_string()),
-                protocol: redis::ProtocolVersion::RESP2,
-            },
-        };
+        // `ConnectionInfo` from a `ConnectionAddr` keeps the password out of
+        // any URL string (and thus out of any error rendering) — a
+        // `redis://:pw@host` URL would put it there.
+        //
+        // redis 1.0 made both structs non-constructible by struct literal
+        // (their fields went private), so this goes through the builder
+        // instead of naming the fields. `db: 0`, `username: None` and
+        // `protocol: RESP2` are all `RedisConnectionInfo::default()`, so
+        // only the password is set explicitly — same connection as before.
+        let conn_info = redis::IntoConnectionInfo::into_connection_info(parse_host_port(addr))
+            .map_err(|source| RedisAdminError::Connect {
+                addr: addr.to_string(),
+                source,
+            })?
+            .set_redis_settings(redis::RedisConnectionInfo::default().set_password(admin_pw));
         let client = redis::Client::open(conn_info).map_err(|source| RedisAdminError::Connect {
             addr: addr.to_string(),
             source,
@@ -321,7 +325,7 @@ impl RedisAdmin for FakeRedis {
             .ok_or_else(|| RedisAdminError::Command {
                 verb: "DBSIZE",
                 addr: addr.to_string(),
-                source: redis::RedisError::from((redis::ErrorKind::IoError, "fake instance down")),
+                source: redis::RedisError::from((redis::ErrorKind::Io, "fake instance down")),
             })
     }
 }

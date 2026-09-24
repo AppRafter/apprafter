@@ -10,9 +10,10 @@
 //!   - the `Application` Controller — but only after we hold the
 //!     Lease.
 //!
-//! Any task exiting (HTTP server crash, controller stream end,
-//! leader-loss after 3 consecutive renewal failures, ctrl-c) tears
-//! the whole process down so the Deployment restart picks up.
+//! Any task exiting (HTTP server crash, controller stream end, ctrl-c)
+//! tears the whole process down so the Deployment restart picks up. A
+//! lost Lease (no renewal for the renew deadline, or another holder in
+//! it) exits the process from the leader task itself, immediately.
 
 use std::env;
 use std::net::SocketAddr;
@@ -20,7 +21,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use apprafter_operator::{build_router, install_rustls_crypto_provider};
+use apprafter_operator::{
+    build_router, install_rustls_crypto_provider, with_operator_client_defaults,
+};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::api::Api;
 use kube::Client;
@@ -117,7 +120,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     install_rustls_crypto_provider();
 
     let metrics = Arc::new(Metrics::new());
-    let client = Client::try_default().await?;
+    // `Client::try_default()` is `Config::infer()` + `Client::try_from`;
+    // the step between them restores the pre-kube-4 read timeout and
+    // switches off kube 4's in-call retries (see the helper's docs).
+    let client = Client::try_from(with_operator_client_defaults(kube::Config::infer().await?))?;
 
     let port: u16 = env::var("HTTP_PORT")
         .ok()
@@ -146,9 +152,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let is_leader = leader.is_leader_handle();
 
+    // The loop only ever returns once this process must stop acting as
+    // leader, and the controllers never look at the gate again once started,
+    // so the process ends HERE, at that moment. Returning through the
+    // `select!` below is not enough: until it is reached (the startup probes
+    // in between wait on the apiserver with the 295s read timeout) the
+    // controllers would still be spawned after leadership was lost, and even
+    // then the runtime's drop waits on any blocking task still running.
     let leader_handle = tokio::spawn(async move {
         if let Err(err) = leader.run().await {
-            error!(%err, "leader election exited");
+            error!(%err, "leader election exited; ending the process");
+            std::process::exit(1);
         }
     });
 

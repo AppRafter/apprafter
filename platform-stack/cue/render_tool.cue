@@ -345,7 +345,9 @@ _gatewayTemplate: """
 
 // `_backupTemplate` — emits the opt-in off-site scheduled-backup
 // component (2.6d-4): a ServiceAccount + scoped ClusterRole/-Binding, a
-// nightly backup CronJob, a weekly `restic check` CronJob, and a
+// PriorityClass below the default for both Jobs' pods (WI-386), a
+// nightly backup CronJob, a weekly check CronJob (`restic check`, then
+// the prune under `retention.enforce: check`), and a
 // CiliumNetworkPolicy pinning the runner pods' egress. The WHOLE block
 // is guarded by `{{- if .Values.backup.enabled }}` so a default tier-1
 // render (`backup.enabled: false`) produces NO resources — off-site
@@ -374,10 +376,12 @@ _gatewayTemplate: """
 // CR annotation). `pods`/`pods/exec` is unavoidably cluster-wide: k8s
 // RBAC cannot scope exec to "only the runner's own helper pods".
 //
-// The `check` CronJob runs `restic` directly (the runner image bundles
-// restic + a shell) rather than the runner binary — the chunk-2 runner
-// has no check-only mode, so this keeps the periodic repository check
-// operator-independent and needs no runner change.
+// The `check` CronJob runs the runner binary as `apprafter-backup check`
+// (WI-389): `restic check`, then — under `retention.enforce: check` and
+// only after a check that passed — the run-aware prune, as far as the
+// cluster's key may delete, then the repository's figures; each step
+// recorded in the status ConfigMap. Until WI-389 it ran `restic check`
+// under a shell and recorded nothing.
 //
 // Note the double-curly braces: this string is itself a Go template
 // Helm executes at install time, so we keep the `{{ }}` literal. CUE
@@ -387,15 +391,27 @@ _backupTemplate: """
 	     Rendered by `cue cmd render`. Do not edit.
 	     Off-site scheduled backup (2.6d-4): opt-in, default-off. Emitted only when
 	     .Values.backup.enabled. ServiceAccount + scoped ClusterRole/-Binding, a
-	     nightly backup CronJob (runner binary), a weekly `restic check` CronJob
-	     (restic directly), and a CiliumNetworkPolicy fixing the runner pods'
-	     egress (DNS + kube-apiserver + world:443 for S3/webhook). Credentials come
+	     PriorityClass below the default that both Jobs' pods name, a
+	     nightly backup CronJob and a weekly check CronJob (both the runner
+	     binary; the check also prunes under retention.enforce: check), and a
+	     CiliumNetworkPolicy fixing the runner pods' egress (DNS +
+	     kube-apiserver + world:443 for S3/webhook). Credentials come
 	     ONLY from the operator-sealed Secret via explicit env secretKeyRef — never
 	     chart values; Secret holds neutral S3_* keys mapped to AWS_* for restic.
 	     RBAC matches the chunk-2 runner's actual reads and MUST NOT grant write on
 	     platformstacks. */}}
 	{{- if .Values.backup.enabled }}
 	{{- $b := .Values.backup }}
+	{{- /* ONE value per Job deadline, read once: the backup Job's
+	     activeDeadlineSeconds, its runner's APPRAFTER_BACKUP_DEADLINE_SECONDS
+	     and both runners' APPRAFTER_BACKUP_RUN_DEADLINE_SECONDS must never
+	     disagree, so all three are this variable. */}}
+	{{- $deadline := $b.activeDeadlineSeconds | default 21600 | int }}
+	{{- /* ONE value for the staging volume's size, read once: the emptyDir's
+	     sizeLimit, which the kubelet evicts on, and the runner's
+	     APPRAFTER_BACKUP_STAGING_SIZE_LIMIT, which it stops a run on first.
+	     Both Jobs mount the volume, and both read this one value. */}}
+	{{- $stagingLimit := $b.stagingSizeLimit | default "10Gi" }}
 	---
 	apiVersion: v1
 	kind: ServiceAccount
@@ -422,7 +438,8 @@ _backupTemplate: """
 	# The cluster's own machine key: `kube-system`'s namespace UID, which the
 	# runner puts at the head of every restic tag so a repository SHARED by two
 	# clusters can tell their snapshots apart (E1) — and so the in-Job prune
-	# under `retention.enforce: cluster` never forgets the co-tenant's runs.
+	# (the check Job's under `retention.enforce: check`, the backup Job's
+	# under `cluster`) never forgets the co-tenant's runs.
 	# `get` on the one object; nothing here lists or writes namespaces.
 	- apiGroups: [""]
 	  resources: ["namespaces"]
@@ -487,6 +504,38 @@ _backupTemplate: """
 	  name: apprafter-backup
 	  namespace: apprafter-system
 	---
+	# The runner's scheduling priority (WI-386), below every other pod's. Every
+	# pod outside kube-system has the default priority 0, and among pods of one
+	# priority the scheduler places the one that has waited longest first. On a
+	# nearly full node a runner that waited for room took the room a restarting
+	# Argo CD application controller had just freed, and that platform pod waited
+	# for the whole backup. Below the default, any other pod is placed before a
+	# waiting runner, and one that needs a running runner's room preempts it: the
+	# runner records the failure as it does at its deadline, deletes its helper
+	# pods and passes the signal on to restic, which removes its lock, and the Job
+	# retries it once there is room. `Never`: a runner never preempts a pod
+	# itself. -1 and not lower: the Kubernetes cluster autoscaler adds no node for
+	# a pod below -10 (its default expendable-pods-priority-cutoff), and on a tier
+	# that scales, a runner waiting for room should still get a node. Both Jobs'
+	# pods name it, and so does a `backup run` Job, which copies the backup's
+	# jobTemplate. Wave -30, the namespaces' wave: a pod naming a class that does
+	# not exist yet is refused at creation, so the class is in place before
+	# anything that can start a runner. `value` and `preemptionPolicy` cannot be
+	# changed on an existing class: a different value needs a different name.
+	apiVersion: scheduling.k8s.io/v1
+	kind: PriorityClass
+	metadata:
+	  name: apprafter-backup-runner
+	  annotations:
+	    argocd.argoproj.io/sync-wave: "-30"
+	  labels:
+	    apprafter.io/managed-by: apprafter
+	    apprafter.io/source: platform-stack
+	value: -1
+	preemptionPolicy: Never
+	globalDefault: false
+	description: "AppRafter's off-site backup runner: placed after every pod of the default priority, preempted by one that needs its room, never preempting."
+	---
 	apiVersion: batch/v1
 	kind: CronJob
 	metadata:
@@ -507,17 +556,57 @@ _backupTemplate: """
 	  failedJobsHistoryLimit: 3
 	  jobTemplate:
 	    spec:
+	      # Forbid means one run that never ends suppresses every later
+	      # scheduled run, with nothing failing. The deadline stops it and
+	      # fails the Job with reason DeadlineExceeded, whatever it was stuck
+	      # on. Shorter than the schedule's interval, longer than the slowest
+	      # good backup: see #BackupValues.activeDeadlineSeconds. `backup run`
+	      # copies this jobTemplate, so a manual run carries it too.
+	      activeDeadlineSeconds: {{ $deadline }}
+	      # A run whose staging volume outgrew stagingSizeLimit exits 3, the
+	      # runner's own code for it (EXIT_OVER_LIMIT). Another attempt would
+	      # stage the same claims into the same limit, after dumping every
+	      # database and volume again and posting the failure webhook again,
+	      # so that exit fails the Job at once instead of after its backoff
+	      # limit: on kind, 7 attempts took 12 minutes against a 300Mi limit.
+	      # Every other failure is retried as before.
+	      podFailurePolicy:
+	        rules:
+	        - action: FailJob
+	          onExitCodes:
+	            containerName: runner
+	            operator: In
+	            values: [3]
 	      template:
 	        metadata:
 	          labels:
 	            apprafter.io/backup-runner: "true"
 	        spec:
 	          serviceAccountName: apprafter-backup
+	          # Below every other pod: see the PriorityClass above.
+	          priorityClassName: apprafter-backup-runner
 	          restartPolicy: Never
+	          # At the deadline Kubernetes sends the runner SIGTERM, and the
+	          # runner records the failure (lastFailure, the failure webhook)
+	          # and deletes its helper pods before it exits. This is the time it
+	          # has for that: helper-pod deletes, the status write and the
+	          # webhook are each bounded, 10 + 20 + 45 s at most, and the Job
+	          # turns Failed as soon as the runner has exited.
+	          terminationGracePeriodSeconds: 90
 	          containers:
 	          - name: runner
 	            image: {{ $b.image | quote }}
 	            env:
+	            # The Job's own deadline, so the runner can say it was stopped
+	            # by it and keep its helper pods alive exactly that long.
+	            - name: APPRAFTER_BACKUP_DEADLINE_SECONDS
+	              value: {{ $deadline | quote }}
+	            # The backup Job's deadline, in both Jobs: a prune leaves a run
+	            # with no manifest alone until its newest snapshot is older than
+	            # this (never less than six hours) plus an hour, since a backup
+	            # may still be writing it. Here it is the same value as above.
+	            - name: APPRAFTER_BACKUP_RUN_DEADLINE_SECONDS
+	              value: {{ $deadline | quote }}
 	            - name: RESTIC_PASSWORD
 	              valueFrom:
 	                secretKeyRef:
@@ -554,8 +643,11 @@ _backupTemplate: """
 	              value: {{ $b.clusterName | default "apprafter-backup" | quote }}
 	            - name: APPRAFTER_BACKUP_STAGING_MODE
 	              value: {{ $b.stagingMode | default "monolithic" | quote }}
+	            # Who prunes (see #BackupValues.retention). This Job prunes
+	            # after the backup only under `cluster`; the check Job prunes
+	            # under `check`, the default.
 	            - name: APPRAFTER_BACKUP_ENFORCE
-	              value: {{ $b.retention.enforce | default "operator" | quote }}
+	              value: {{ $b.retention.enforce | default "check" | quote }}
 	            {{- if $b.retention.keepDaily }}
 	            - name: APPRAFTER_BACKUP_KEEP_DAILY
 	              value: {{ $b.retention.keepDaily | quote }}
@@ -568,23 +660,118 @@ _backupTemplate: """
 	            - name: APPRAFTER_BACKUP_KEEP_MONTHLY
 	              value: {{ $b.retention.keepMonthly | quote }}
 	            {{- end }}
+	            # The keep policy counts its days, weeks and months in the
+	            # zone the schedules run in, as `apprafter backup prune` does:
+	            # a daily schedule is then one run per counted day, across a
+	            # clock change too. Absent, the runner counts in UTC.
+	            {{- with $b.timeZone }}
+	            - name: APPRAFTER_BACKUP_TIME_ZONE
+	              value: {{ . | quote }}
+	            {{- end }}
 	            {{- if $b.failureWebhook }}
 	            - name: APPRAFTER_BACKUP_FAILURE_WEBHOOK
 	              value: {{ $b.failureWebhook | quote }}
 	            {{- end }}
+	            # restic's memory, measured with restic 0.18.1 (WI-386). restic
+	            # runs one blob saver per CPU it sees, and with no CPU limit it
+	            # sees every CPU of the node: a first backup of a 2 GB database
+	            # peaked at about 145 MiB of anonymous memory on 2 CPUs and at
+	            # 695 MiB on 32. GOMAXPROCS holds it to two on any node.
+	            # GOMEMLIMIT has its garbage collector keep the heap near 96 MiB;
+	            # only a very large repository index needs more, and restic then
+	            # runs slower instead of being killed. The runner starts every
+	            # restic with its own environment, so both reach each one (read
+	            # from each restic's /proc/<pid>/environ on kind); the runner
+	            # itself is Rust and reads neither.
+	            - name: GOMAXPROCS
+	              value: "2"
+	            - name: GOMEMLIMIT
+	              value: "96MiB"
+	            # restic's S3 backend asks its S3 library to send each pack file's
+	            # MD5 and hands it a reader it cannot rewind, so the library reads
+	            # the whole pack into memory before it sends it, and restic sends
+	            # up to five packs at once. When the bucket takes data more slowly
+	            # than restic fills packs, all five are in flight: with the default
+	            # 16 MiB packs, a first backup peaked at 171 MiB of anonymous memory
+	            # against Hetzner Object Storage and at 107 MiB against a local
+	            # MinIO, on the same data, and at 164 MiB against that MinIO behind
+	            # a 3 MB/s link (WI-386). 4 MiB, restic's smallest, bounds the
+	            # buffers at a quarter: 100 MiB against Hetzner, at the same upload
+	            # speed behind a 3 or a 20 MB/s link, and 16 % slower where the
+	            # round trip of each request and not the link was the limit. A
+	            # repository keeps the packs it has; new data takes about three
+	            # times as many objects (83 instead of 25 for 400 MB).
+	            - name: RESTIC_PACK_SIZE
+	              value: "4"
+	            # `restic backup --json` prints a progress line 60 times a second
+	            # even without a terminal, and the runner holds all of restic's
+	            # output in memory until restic exits: about 36 MiB for each hour
+	            # of upload. The runner reads only the final summary line, so one
+	            # progress line a minute is plenty.
+	            - name: RESTIC_PROGRESS_FPS
+	              value: "0.0167"
+	            # The runner makes its staging directory under TMPDIR, and restic
+	            # writes its temporary pack files there too. Unset, that was /tmp
+	            # in the container's writable layer, where stagingSizeLimit does
+	            # not reach: every dump of every run landed there, bounded only by
+	            # the node's disk, and the limit below was never enforced.
+	            - name: TMPDIR
+	              value: /staging
+	            # The staging volume's sizeLimit, which the runner measures the
+	            # volume against every two seconds. The kubelet enforces it too,
+	            # by evicting the pod, but from a usage figure it refreshes about
+	            # once a minute and with two seconds' notice: on kind a run that
+	            # staged 652 MiB against 300Mi finished in 17 s and succeeded.
+	            # The runner stops the run itself and records that the staging
+	            # outgrew the limit, and what to change.
+	            - name: APPRAFTER_BACKUP_STAGING_SIZE_LIMIT
+	              value: {{ $stagingLimit | quote }}
+	            # restic's cache, for this run only: what one restic command of
+	            # the run downloads, the next one reads from here. It sits on the
+	            # staging volume, counts toward stagingSizeLimit, and goes with
+	            # the pod, so no run reads a cache it did not write. Without it
+	            # restic looked for $HOME/.cache, HOME is / for this user, and it
+	            # ran with no cache at all. Measured (WI-386): a sequential run
+	            # made 28 GET requests with it and 60 without, a run with the
+	            # in-Job prune 13-15 and 35, and a monolithic run without a prune
+	            # the same number either way.
+	            - name: RESTIC_CACHE_DIR
+	              value: /staging/restic-cache
+	            # Measured (WI-386) with the settings above, against Hetzner Object
+	            # Storage on two CPUs: a first backup of 400 MB of incompressible
+	            # data peaked at 100 MiB of anonymous memory and one of 2 GB at
+	            # 107 MiB (111 MiB behind a 20 MB/s link), and a later run with
+	            # 40 MB new at 93 MiB. One with nothing new peaked at 47 MiB with
+	            # restic's default pack size, which does not matter when nothing
+	            # new is uploaded. The runner adds 2 MiB of anonymous memory of
+	            # its own, which leaves 19 MiB of the request (15 MiB behind the
+	            # 20 MB/s link) before the 2 to 10 MiB of kernel memory the
+	            # container is also charged: roughly 10 to 15 MiB to spare,
+	            # depending on the link.
+	            # The data adds page cache, which the limit reclaims, not restic
+	            # heap. The request is what the scheduler must find free on the
+	            # node, so it covers a first backup: a 4 GB node running the
+	            # platform and one application with needs.pg and a persistent
+	            # needs.redis has room for it. On a real 4 GB machine, before the
+	            # pack size above, a first backup of a 403 MB database peaked at
+	            # 155 MiB. The limit is 1.9 times the largest run measured, a first
+	            # backup into a repository of 1.51M blobs followed by the prune
+	            # (200 MiB, on kind); without GOMEMLIMIT a backup into that
+	            # repository peaked at 280 MiB and passed under this limit, and was
+	            # killed under 256Mi.
 	            resources:
 	              requests:
 	                cpu: 100m
-	                memory: 256Mi
+	                memory: 128Mi
 	              limits:
-	                memory: 512Mi
+	                memory: 384Mi
 	            volumeMounts:
 	            - name: staging
 	              mountPath: /staging
 	          volumes:
 	          - name: staging
 	            emptyDir:
-	              sizeLimit: {{ $b.stagingSizeLimit | default "10Gi" | quote }}
+	              sizeLimit: {{ $stagingLimit | quote }}
 	---
 	{{- if $b.checkSchedule }}
 	# 2.22g / D2: an EMPTY checkSchedule omits this CronJob entirely — that is
@@ -611,27 +798,59 @@ _backupTemplate: """
 	  failedJobsHistoryLimit: 3
 	  jobTemplate:
 	    spec:
+	      # The same umbrella as the backup Job's. A stuck check also holds
+	      # restic's EXCLUSIVE lock, which fails every backup until it ends.
+	      activeDeadlineSeconds: {{ $b.checkActiveDeadlineSeconds | default 21600 | int }}
+	      # The backup Job's rule, for the check's own use of the staging
+	      # volume below: a retry meets the same limit.
+	      podFailurePolicy:
+	        rules:
+	        - action: FailJob
+	          onExitCodes:
+	            containerName: check
+	            operator: In
+	            values: [3]
 	      template:
 	        metadata:
 	          labels:
 	            apprafter.io/backup-runner: "true"
 	        spec:
 	          serviceAccountName: apprafter-backup
+	          # The backup runner's priority, for the same reason: a check waits
+	          # behind any other pod, and yields its room to one that needs it.
+	          priorityClassName: apprafter-backup-runner
 	          restartPolicy: Never
+	          # The runner records a check it is stopped in (lastCheck,
+	          # lastCheckError) or the prune after it, and the failure webhook,
+	          # in this grace period, as the backup's runner does; restic
+	          # removes its exclusive lock on the signal it passes on.
+	          terminationGracePeriodSeconds: 90
 	          containers:
 	          - name: check
 	            image: {{ $b.image | quote }}
-	            # The chunk-2 runner binary has no check-only mode, so the check Job
-	            # runs restic directly (the runner image bundles restic + a shell).
-	            # restic reads RESTIC_PASSWORD + AWS_* from the explicit secretKeyRef
-	            # entries below (Secret holds neutral S3_* keys) and the s3: repo from
-	            # APPRAFTER_BACKUP_REPO.
-	            command: ["sh", "-c"]
-	            args:
-	            - >-
-	              restic -r "$APPRAFTER_BACKUP_REPO" unlock;
-	              restic -r "$APPRAFTER_BACKUP_REPO" check{{ if $b.checkReadData }} --read-data{{ else if $b.checkReadDataSubset }} --read-data-subset={{ $b.checkReadDataSubset }}{{ end }}
+	            # The runner binary in its check mode (WI-389): `restic check`
+	            # at the depth below; then, under `retention.enforce: check`
+	            # and only when the check passed, the run-aware prune of this
+	            # cluster's snapshots with the keep counts below — as far as
+	            # the key may delete: a key that may not (the scoped one ADR
+	            # 0050 recommends) deletes nothing and is recorded as
+	            # `not-permitted`; then the repository's figures. Each step goes
+	            # into the status ConfigMap. The runner is PID 1 and passes
+	            # SIGTERM on to restic, which removes its lock.
+	            args: ["check"]
 	            env:
+	            # The check Job's own deadline: the runner names it when it is
+	            # stopped there.
+	            - name: APPRAFTER_BACKUP_DEADLINE_SECONDS
+	              value: {{ $b.checkActiveDeadlineSeconds | default 21600 | int | quote }}
+	            # The BACKUP Job's deadline, which the prune after the check
+	            # waits out: a backup still dumping when the check starts holds
+	            # no restic lock, so the check passes beside it, and the run it
+	            # is writing — claim snapshots, no commit snapshot yet — is left
+	            # alone until its newest snapshot is older than this (never less
+	            # than six hours) plus an hour.
+	            - name: APPRAFTER_BACKUP_RUN_DEADLINE_SECONDS
+	              value: {{ $deadline | quote }}
 	            - name: RESTIC_PASSWORD
 	              valueFrom:
 	                secretKeyRef:
@@ -655,12 +874,93 @@ _backupTemplate: """
 	                  optional: true
 	            - name: APPRAFTER_BACKUP_REPO
 	              value: {{ $b.bucket | quote }}
+	            # The same human label as the backup's, for the failure webhook.
+	            - name: APPRAFTER_CLUSTER_ID
+	              value: {{ $b.clusterName | default .Release.Name | quote }}
+	            # What the check reads: every pack, a part of them, or neither.
+	            # A full read wins, as it always has.
+	            - name: APPRAFTER_BACKUP_CHECK_READ_DATA
+	              value: {{ $b.checkReadData | default false | quote }}
+	            - name: APPRAFTER_BACKUP_CHECK_READ_DATA_SUBSET
+	              value: {{ $b.checkReadDataSubset | default "" | quote }}
+	            # Who prunes, and what is kept: the same values as the backup
+	            # Job's. This Job prunes only under `check`.
+	            - name: APPRAFTER_BACKUP_ENFORCE
+	              value: {{ $b.retention.enforce | default "check" | quote }}
+	            {{- if $b.retention.keepDaily }}
+	            - name: APPRAFTER_BACKUP_KEEP_DAILY
+	              value: {{ $b.retention.keepDaily | quote }}
+	            {{- end }}
+	            {{- if $b.retention.keepWeekly }}
+	            - name: APPRAFTER_BACKUP_KEEP_WEEKLY
+	              value: {{ $b.retention.keepWeekly | quote }}
+	            {{- end }}
+	            {{- if $b.retention.keepMonthly }}
+	            - name: APPRAFTER_BACKUP_KEEP_MONTHLY
+	              value: {{ $b.retention.keepMonthly | quote }}
+	            {{- end }}
+	            # The keep policy counts its days, weeks and months in the
+	            # zone the schedules run in, as `apprafter backup prune` does:
+	            # a daily schedule is then one run per counted day, across a
+	            # clock change too. Absent, the runner counts in UTC.
+	            {{- with $b.timeZone }}
+	            - name: APPRAFTER_BACKUP_TIME_ZONE
+	              value: {{ . | quote }}
+	            {{- end }}
+	            {{- if $b.failureWebhook }}
+	            - name: APPRAFTER_BACKUP_FAILURE_WEBHOOK
+	              value: {{ $b.failureWebhook | quote }}
+	            {{- end }}
+	            # The backup runner's restic settings, for the same reasons: the
+	            # prune after the check uploads the packs it rewrites, as a backup
+	            # does. Measured (WI-386) with them: a check peaked at 43-51 MiB of
+	            # anonymous memory on a small repository and at 137 MiB on one of
+	            # 1.51M blobs, and a prune about as much as a backup (180 MiB at
+	            # 6.6k blobs, 304 MiB at 1.51M without GOMEMLIMIT).
+	            - name: GOMAXPROCS
+	              value: "2"
+	            - name: GOMEMLIMIT
+	              value: "96MiB"
+	            - name: RESTIC_PACK_SIZE
+	              value: "4"
+	            # Without a terminal restic prints no periodic progress; with
+	            # this it prints a line a minute. The runner copies each line
+	            # `restic check` and `restic prune` print into this pod's log as
+	            # restic prints it, so a long check (checkReadData) says where it
+	            # is once a minute.
+	            - name: RESTIC_PROGRESS_FPS
+	              value: "0.0167"
+	            # What restic writes to disk goes on the staging volume below,
+	            # with the backup's limit: its cache, and the pack files a prune
+	            # rewrites, which restic makes under TMPDIR. Both used to sit in
+	            # /tmp in the container's writable layer, where no limit counted
+	            # them and a failed pod kept them. The runner measures the volume
+	            # as it does the backup's, and stops a run that outgrows it.
+	            - name: TMPDIR
+	              value: /staging
+	            - name: APPRAFTER_BACKUP_STAGING_SIZE_LIMIT
+	              value: {{ $stagingLimit | quote }}
+	            # Without it the unlock looked for $HOME/.cache, HOME is / for
+	            # this user, and every check log opened with `unable to open
+	            # cache: mkdir /.cache: permission denied`. The check itself
+	            # uses a temporary cache of its own, made inside this directory,
+	            # and removes it when it ends; the prune and the figures after it
+	            # use this one, which goes with the pod.
+	            - name: RESTIC_CACHE_DIR
+	              value: /staging/restic-cache
 	            resources:
 	              requests:
 	                cpu: 100m
-	                memory: 256Mi
+	                memory: 128Mi
 	              limits:
-	                memory: 512Mi
+	                memory: 384Mi
+	            volumeMounts:
+	            - name: staging
+	              mountPath: /staging
+	          volumes:
+	          - name: staging
+	            emptyDir:
+	              sizeLimit: {{ $stagingLimit | quote }}
 	{{- end }}
 	{{- if .Capabilities.APIVersions.Has "cilium.io/v2" }}
 	---
@@ -971,11 +1271,13 @@ _valuesSchema: {
 						keepMonthly: {type: "integer"}
 						enforce: {
 							type: "string"
-							enum: ["operator", "cluster"]
+							enum: ["check", "cluster", "operator"]
 						}
 					}
 				}
+				activeDeadlineSeconds: {type: "integer", minimum: 600}
 				checkSchedule: {type: "string"}
+				checkActiveDeadlineSeconds: {type: "integer", minimum: 600}
 				checkReadData: {type: "boolean"}
 				checkReadDataSubset: {type: "string"}
 				failureWebhook: {type: "string"}

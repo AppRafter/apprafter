@@ -1,5 +1,5 @@
 ---
-description: "Why a Tier-1 node gets control-plane headroom and host swap, why pods never swap, the kubelet version the behaviour depends on, and why the tier decides the policy."
+description: "Why a Tier-1 node gets control-plane headroom and host swap, why pods never swap, the kubelet version the behaviour depends on, why the tier decides the policy, and what a 4 GB node holds once the reservations are taken."
 ---
 
 # Node reservations and swap
@@ -9,8 +9,9 @@ Why a Tier-1 node is prepared the way it is. The recipe is
 run it.
 
 Read it when `apprafter node status` reports something you did not expect, when
-you are deciding whether a workload is affected, or when you are wondering why
-the same treatment is not applied on a larger tier.
+you are deciding whether a workload is affected, when you are wondering why
+the same treatment is not applied on a larger tier, or when you want to know
+how much a 4 GB node can run.
 
 The decisions behind it are [ADR 0055](../adr/0055-node-swap-policy.md) (the
 swap policy) and [ADR 0053](../adr/0053-resource-governance.md) (the
@@ -92,6 +93,74 @@ tolerates paging, so mild swap (`swappiness=10`) is safe there. Tier-2 and above
 use etcd, which is latency-sensitive — paging etcd can trigger leader churn — so
 swap on those tiers is deferred and will use a stricter policy.
 
+## What a 4 GB node holds {#what-a-4-gb-node-holds}
+
+The reservations take their share of the machine before any pod is placed. On
+a machine with 4 GB of RAM, which the kernel reports as 3814Mi, the 1500Mi
+system reservation, the 256Mi kube reservation and the 100Mi eviction threshold
+leave **1958Mi of allocatable memory**. The scheduler places a pod only while
+the memory *requests* of the pods on the node, the new one included, fit
+inside that figure. What the pods actually use does not enter into it.
+
+Measured on such a machine, the requests add up like this:
+
+| What runs | Memory requested |
+| --- | --- |
+| The platform: Argo CD, Cilium, cert-manager, the AppRafter operator and admission webhook, sealed-secrets, the PostgreSQL and Dragonfly operators, the vertical pod autoscaler, and the cluster's DNS and metrics server | 1120Mi |
+| The shared PostgreSQL instance behind every `needs.pg` | 256Mi |
+| One Dragonfly instance, behind a persistent `needs.redis` | 320Mi |
+| The nightly backup runner, while it runs | 128Mi |
+| Each application at the platform's default request | 32Mi |
+
+So a 4 GB node holds the platform, the shared PostgreSQL, one Dragonfly
+instance, the backup runner and **about four small applications**: 1958Mi less
+the first four rows leaves 134Mi. Two such clusters, one with three
+applications and one with six, some above the default request, had requested
+1792Mi and 1824Mi before the backup runner, which leaves 38Mi and 6Mi once it
+is placed.
+
+It does not hold more beside the backup runner:
+
+- **A further backend instance.** An ephemeral `needs.redis` class runs a
+  second Dragonfly instance (320Mi), and `needs.jetstream` requests 384Mi.
+  Neither fits at all once PostgreSQL and a persistent Dragonfly instance are
+  there.
+- **More applications, or larger ones.** A second environment of an
+  application is a second set of its pods. An application's request can also
+  rise above 32Mi when its [recommendation](resources-and-autoscaling.md) says
+  so, and every such rise comes out of the same room.
+
+A node past that point keeps running its applications, but the nightly backup
+cannot start: its pod asks for 128Mi and no node has it. It is not silent.
+`apprafter backup run` and `apprafter backup status` report the pod as one the
+scheduler cannot place, with the scheduler's reason, and `apprafter top` shows
+what is left in its `SCHEDULABLE` column. The recipe is [the backup runner's
+pod cannot be scheduled](../operator-guide/backup-restore.md#runner-unschedulable).
+
+The backup is also the pod that gives way. From platform 0.2.80 its pods have a
+priority below every other pod's, so when the node is short of room any other
+pod waiting for it is placed first, and a pod that needs the room of a backup
+that is running stops that backup, which runs again once there is room. A
+platform component that restarts during an upgrade then waits at most for the
+backup's runner to stop, which takes up to its 90-second grace period, not for
+the backup to finish, and `apprafter status` reports the stopped backup. A
+runner pod created before the upgrade to 0.2.80 keeps the default priority it
+was created with and does not give way, so a backup Job still waiting for room
+is best deleted before upgrading (`apprafter backup status` names it); the next
+scheduled backup starts at the new priority. [ADR
+0053](../adr/0053-resource-governance.md#amendment-the-backup-runner-gives-way-2026-09-24)
+records why.
+
+The runner's 128Mi is measured, not guessed. restic's memory follows the size
+of the repository's index, the CPUs it is allowed, and how fast the bucket
+takes the data, not the size of the data. restic uploads the data in pack
+files and holds each one in memory until the bucket has it, up to five at a
+time, so the platform makes those files 4 MiB instead of restic's 16 MiB. It
+also holds restic to two CPUs and a 96 MiB heap target, and limits the runner
+to 384Mi. With those settings a first backup of 2 GB into a real bucket peaked
+at about 110 MiB. The decision and the measurements are in [ADR
+0053](../adr/0053-resource-governance.md#amendment-the-backup-runner-in-the-tier-1-budget-2026-09-23).
+
 ## A rollout releases before it asks
 
 A node with no spare memory can also freeze a rollout, and the freeze is silent.
@@ -131,3 +200,5 @@ An application that mounts its own disk is unaffected — it already rolls with
   all of this, and the state table `node status` prints.
 - [Right-sizing an application's requests](resources-and-autoscaling.md) — the
   other half of the same resource governance, on the pod side.
+- [Choosing the machine](../operator-guide/choosing-the-machine.md#how-much-memory)
+  — the same arithmetic, when the machine is still to be picked.

@@ -4,7 +4,7 @@
 //! `tests` module for exactly which parts a cluster is still required for —
 //! in short, the two WebSocket `exec` streams and nothing else).
 //!
-//! [`KubeRsExec`] implements [`backup_core::KubeExec`] using kube-rs 0.95 so the
+//! [`KubeRsExec`] implements [`backup_core::KubeExec`] using kube-rs so the
 //! in-cluster scheduled-backup runner drives the SAME portable backup engine
 //! (`backup_core::engine`) the CLI does — but through the apiserver directly,
 //! not by shelling out to `kubectl`. Every method mirrors the semantics of the
@@ -30,6 +30,10 @@
 
 use std::path::Path;
 
+// `is_backup_helper`: whether a Pod spec is a backup helper pod — the label
+// every `backup_core::helper_pod` builder stamps. Only those are the run's to
+// delete when it is stopped.
+use backup_core::helper_pod::is_backup_helper;
 use backup_core::KubeExec;
 use cli_core::{CliError, Result};
 use k8s_openapi::api::core::v1::{Pod, Secret};
@@ -40,19 +44,16 @@ use kube::api::{
 };
 use kube::discovery::{self, ApiResource};
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Field manager used for the server-side apply of helper Pods. Distinct from
 /// the operator's `apprafter-operator` and the CLI's other managers so its
 /// ownership never collides with a real workload's.
 const FIELD_MANAGER: &str = "apprafter-backup";
 
-/// Total budget for the pod-Ready poll (mirrors `kubectl wait --timeout=300s`
-/// used by `KubectlExec`).
-const POD_READY_TIMEOUT_SECS: u64 = 300;
-
-/// Interval between pod-Ready polls.
-const POD_READY_POLL_INTERVAL_SECS: u64 = 2;
+/// Interval between pod-Ready polls. The budget for the whole wait is
+/// [`backup_core::helper_pod::POD_READY_TIMEOUT`], the CLI's too.
+const POD_READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// In-cluster [`KubeExec`] backed by kube-rs.
 ///
@@ -64,12 +65,25 @@ const POD_READY_POLL_INTERVAL_SECS: u64 = 2;
 pub struct KubeRsExec {
     client: kube::Client,
     rt: tokio::runtime::Handle,
+    /// Every helper pod applied and not yet deleted, for the stop to delete
+    /// when Kubernetes ends the run first (`crate::stop`).
+    live_helpers: crate::stop::LiveHelperPods,
 }
 
 impl KubeRsExec {
     /// Construct a runner over `client`, blocking on `rt` for every call.
     pub fn new(client: kube::Client, rt: tokio::runtime::Handle) -> Self {
-        Self { client, rt }
+        Self {
+            client,
+            rt,
+            live_helpers: crate::stop::LiveHelperPods::default(),
+        }
+    }
+
+    /// The helper pods this exec has applied and not yet deleted — a handle
+    /// that stays current as the run goes on.
+    pub fn live_helper_pods(&self) -> crate::stop::LiveHelperPods {
+        self.live_helpers.clone()
     }
 
     /// Resolve a kubectl-style resource string (`applications.apprafter.io`,
@@ -318,44 +332,196 @@ fn list_to_value(list: ObjectList<DynamicObject>, ar: &ApiResource) -> Result<Va
     Ok(serde_json::json!({ "items": items }))
 }
 
+impl KubeRsExec {
+    /// Server-side apply `spec` (mirrors `kubectl apply -f -`), replacing a
+    /// pod of the same name left from an earlier run (see
+    /// [`backup_core::helper_pod::stale_helper_reason`]): one whose spec
+    /// cannot be applied over, and one the apply shows has ended, is going
+    /// away, or has used more of its keep-alive than a reused helper may.
+    /// Each is deleted, waited out, and the apply made again, once.
+    ///
+    /// A backup helper pod's every PATCH is recorded in the live set first
+    /// ([`Self::begin_helper_apply`]), which refuses it once the run is being
+    /// stopped: the re-apply after a replacement included.
+    async fn apply_replacing_stale(
+        &self,
+        api: &Api<Pod>,
+        name: &str,
+        ns: &str,
+        spec: &Value,
+    ) -> Result<()> {
+        let pp = PatchParams::apply(FIELD_MANAGER).force();
+        let apply_error =
+            |e: kube::Error| CliError::Other(format!("apply pod {name} in {ns}: {e}"));
+        let in_flight = self.begin_helper_apply(spec, ns, name)?;
+        let applied = api.patch(name, &pp, &Patch::Apply(spec)).await;
+        drop(in_flight);
+        let stale = match applied {
+            Ok(pod) => {
+                let pod = serde_json::to_value(&pod).map_err(CliError::from)?;
+                match backup_core::helper_pod::stale_helper_reason(&pod, spec, chrono::Utc::now()) {
+                    Some(why) => why,
+                    None => return Ok(()),
+                }
+            }
+            Err(kube::Error::Api(ae))
+                if ae.code == 422
+                    && backup_core::helper_pod::is_immutable_pod_update(&ae.message) =>
+            {
+                "was created with a spec this run's cannot be applied over (an earlier run of \
+                 another version, or with another keep-alive)"
+                    .to_string()
+            }
+            Err(e) => return Err(apply_error(e)),
+        };
+        eprintln!(
+            "{}",
+            backup_core::helper_pod::replacing_stale_helper_note(ns, name, &stale)
+        );
+        self.delete_and_wait_gone(api, name, ns).await?;
+        let _in_flight = self.begin_helper_apply(spec, ns, name)?;
+        api.patch(name, &pp, &Patch::Apply(spec))
+            .await
+            .map_err(apply_error)?;
+        Ok(())
+    }
+
+    /// Record `spec` in the live set as an apply under way, when it is a
+    /// backup helper pod (only those are the stop's to delete); refused once
+    /// the stop has begun ([`crate::stop::LiveHelperPods`]).
+    fn begin_helper_apply(
+        &self,
+        spec: &Value,
+        ns: &str,
+        name: &str,
+    ) -> Result<Option<crate::stop::ApplyInFlight>> {
+        if is_backup_helper(spec) {
+            self.live_helpers.begin_apply(ns, name).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Delete a stale helper pod and wait until it is gone, within
+    /// [`backup_core::helper_pod::STALE_POD_GONE_WITHIN`].
+    async fn delete_and_wait_gone(&self, api: &Api<Pod>, name: &str, ns: &str) -> Result<()> {
+        let dp = DeleteParams {
+            grace_period_seconds: Some(backup_core::helper_pod::STALE_POD_DELETE_GRACE_SECONDS),
+            ..DeleteParams::default()
+        };
+        match api.delete(name, &dp).await {
+            Ok(_) => {}
+            Err(e) if is_not_found(&e) => {}
+            Err(e) => {
+                return Err(CliError::Other(format!(
+                    "delete the stale helper pod {name} in {ns}: {e}"
+                )))
+            }
+        }
+        let bound = backup_core::helper_pod::STALE_POD_GONE_WITHIN;
+        let deadline = tokio::time::Instant::now() + bound;
+        loop {
+            let present = api.get_opt(name).await.map_err(|e| {
+                CliError::Other(format!(
+                    "get pod {name} in {ns} while waiting for it to be deleted: {e}"
+                ))
+            })?;
+            if present.is_none() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(CliError::Other(format!(
+                    "the stale helper pod {name} in {ns} was still there {}s after it was \
+                     deleted (its node may be unreachable); delete it with `kubectl delete pod \
+                     {name} -n {ns} --force --grace-period=0` and run again",
+                    bound.as_secs()
+                )));
+            }
+            tokio::time::sleep(STALE_POD_GONE_POLL_INTERVAL).await;
+        }
+    }
+}
+
+impl KubeRsExec {
+    /// Poll pod `name` until it is Running + Ready, for up to `timeout`, every
+    /// `poll` — the CLI's `KubectlExec` waits the same way. A container the
+    /// kubelet cannot configure for `grace` without a break (a credential
+    /// Secret or key missing: [`backup_core::helper_pod::container_config_error`])
+    /// ends the wait at once with the kubelet's words, rather than after the
+    /// whole `timeout` with none.
+    async fn wait_pod_ready(
+        &self,
+        api: &Api<Pod>,
+        name: &str,
+        ns: &str,
+        timeout: std::time::Duration,
+        poll: std::time::Duration,
+        grace: std::time::Duration,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut config_error = backup_core::helper_pod::ConfigErrorWatch::default();
+        loop {
+            let pod = api.get(name).await.map_err(|e| {
+                CliError::Other(format!("get pod {name} in {ns} while waiting Ready: {e}"))
+            })?;
+            if pod_is_ready(&pod) {
+                return Ok(());
+            }
+            let seen = serde_json::to_value(&pod).map_err(CliError::from)?;
+            // Tokio's clock, so the grace can be driven in a test like the
+            // rest of this loop.
+            let now = tokio::time::Instant::now().into_std();
+            if let Some(why) = config_error.observe(&seen, now, grace) {
+                return Err(backup_core::helper_pod::container_config_error_message(
+                    ns, name, &why,
+                ));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(CliError::Other(format!(
+                    "pod {name} in {ns} did not reach Ready within {}s",
+                    timeout.as_secs()
+                )));
+            }
+            tokio::time::sleep(poll).await;
+        }
+    }
+}
+
+/// Interval between the polls that wait for a stale helper pod to be gone.
+const STALE_POD_GONE_POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(1);
+
 impl KubeExec for KubeRsExec {
     fn apply_and_wait_pod_ready(&self, spec: &Value) -> Result<()> {
         self.rt.block_on(async {
             let (name, ns) = pod_identity(spec)?;
-
             let api: Api<Pod> = Api::namespaced(self.client.clone(), &ns);
 
-            // Server-side apply (mirrors `kubectl apply -f -`).
-            let pp = PatchParams::apply(FIELD_MANAGER).force();
-            api.patch(&name, &pp, &Patch::Apply(spec))
-                .await
-                .map_err(|e| CliError::Other(format!("apply pod {name} in {ns}: {e}")))?;
+            // Server-side apply (mirrors `kubectl apply -f -`), over a stale
+            // leftover of the same name if there is one. A helper pod is
+            // tracked from BEFORE its apply: one whose apply went through and
+            // whose Ready wait is still running is the run's to delete too.
+            self.apply_replacing_stale(&api, &name, &ns, spec).await?;
 
-            // Poll until Running + Ready (mirrors `kubectl wait
-            // --for=condition=Ready --timeout=300s`).
-            let deadline = tokio::time::Instant::now()
-                + tokio::time::Duration::from_secs(POD_READY_TIMEOUT_SECS);
-            loop {
-                let pod = api.get(&name).await.map_err(|e| {
-                    CliError::Other(format!("get pod {name} in {ns} while waiting Ready: {e}"))
-                })?;
-                if pod_is_ready(&pod) {
-                    return Ok(());
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(CliError::Other(format!(
-                        "pod {name} in {ns} did not reach Ready within {POD_READY_TIMEOUT_SECS}s"
-                    )));
-                }
-                tokio::time::sleep(tokio::time::Duration::from_secs(
-                    POD_READY_POLL_INTERVAL_SECS,
-                ))
-                .await;
-            }
+            self.wait_pod_ready(
+                &api,
+                &name,
+                &ns,
+                backup_core::helper_pod::POD_READY_TIMEOUT,
+                POD_READY_POLL_INTERVAL,
+                backup_core::helper_pod::CONTAINER_CONFIG_ERROR_GRACE,
+            )
+            .await
         })
     }
 
-    fn exec_stream_to_file(&self, pod: &str, ns: &str, argv: &[&str], out: &Path) -> Result<()> {
+    fn exec_stream_to_file(
+        &self,
+        pod: &str,
+        ns: &str,
+        argv: &[&str],
+        out: &Path,
+        first_output_within: Option<std::time::Duration>,
+    ) -> Result<()> {
         self.rt.block_on(async {
             let api: Api<Pod> = Api::namespaced(self.client.clone(), ns);
             let ap = AttachParams::default()
@@ -372,6 +538,9 @@ impl KubeExec for KubeRsExec {
                     ))
                 })?;
 
+            // Before anything else can block: see `StderrDrain`.
+            let stderr = StderrDrain::start(&mut attached);
+
             let mut proc_stdout = attached.stdout().ok_or_else(|| {
                 CliError::Other("exec_stream_to_file: attached process exposed no stdout".into())
             })?;
@@ -383,15 +552,41 @@ impl KubeExec for KubeRsExec {
                 ))
             })?;
 
-            // Stream the whole process stdout to the file.
+            let copy_error = |e: std::io::Error| {
+                CliError::Other(format!(
+                    "exec_stream_to_file: copy command stdout to {}: {e}",
+                    out.display()
+                ))
+            };
+
+            // The first read is timed when the caller bounded it: see
+            // `KubeExec::exec_stream_to_file`. Abandoning the exec ends this
+            // side only — the command keeps running in its pod until the pod
+            // goes, which is the caller's helper-pod guard, straight after.
+            if let Some(bound) = first_output_within {
+                let mut first = vec![0u8; 64 * 1024];
+                match tokio::time::timeout(bound, proc_stdout.read(&mut first)).await {
+                    Err(_elapsed) => {
+                        attached.abort();
+                        return Err(backup_core::kube::no_output_error(
+                            "exec_stream_to_file",
+                            argv,
+                            ns,
+                            pod,
+                            bound,
+                        ));
+                    }
+                    Ok(read) => {
+                        let n = read.map_err(copy_error)?;
+                        file.write_all(&first[..n]).await.map_err(copy_error)?;
+                    }
+                }
+            }
+
+            // Stream the (rest of the) process stdout to the file.
             tokio::io::copy(&mut proc_stdout, &mut file)
                 .await
-                .map_err(|e| {
-                    CliError::Other(format!(
-                        "exec_stream_to_file: copy command stdout to {}: {e}",
-                        out.display()
-                    ))
-                })?;
+                .map_err(copy_error)?;
             file.flush().await.map_err(|e| {
                 CliError::Other(format!(
                     "exec_stream_to_file: flush output file {}: {e}",
@@ -399,7 +594,10 @@ impl KubeExec for KubeRsExec {
                 ))
             })?;
 
-            check_exec_status(&mut attached, "exec_stream_to_file", argv, ns, pod).await
+            let status =
+                check_exec_status(&mut attached, "exec_stream_to_file", argv, ns, pod).await;
+            let captured = stderr.finish().await;
+            status.map_err(|e| with_stderr(e, captured.as_ref()))
         })
     }
 
@@ -426,6 +624,9 @@ impl KubeExec for KubeRsExec {
                     ))
                 })?;
 
+            // Before anything else can block: see `StderrDrain`.
+            let stderr = StderrDrain::start(&mut attached);
+
             let mut proc_stdin = attached.stdin().ok_or_else(|| {
                 CliError::Other("exec_stream_from_file: attached process exposed no stdin".into())
             })?;
@@ -442,10 +643,10 @@ impl KubeExec for KubeRsExec {
             //
             // Neither result is propagated here, for the reason spelled out on
             // `KubectlExec::apply_and_wait_pod_ready` in platform-cli's
-            // `backup.rs`. `check_exec_status` below is what reads the remote
-            // command's exit status AND its stderr channel; returning early
-            // skips it and reports a transport error instead of the command's
-            // own explanation. The transport is a websocket rather than an OS
+            // `backup.rs`. `check_exec_status` below reads the remote
+            // command's exit status, and `StderrDrain` holds its stderr;
+            // returning early skips both and reports a transport error instead
+            // of the command's own explanation. The transport is a websocket rather than an OS
             // pipe, so there is no literal SIGPIPE — the apiserver closes the
             // stdin channel when the remote command exits, and the write comes
             // back `BrokenPipe`/`ConnectionReset`. The structure is identical.
@@ -460,7 +661,10 @@ impl KubeExec for KubeRsExec {
             let shutdown_result = proc_stdin.shutdown().await;
             drop(proc_stdin);
 
-            check_exec_status(&mut attached, "exec_stream_from_file", argv, ns, pod).await?;
+            let status =
+                check_exec_status(&mut attached, "exec_stream_from_file", argv, ns, pod).await;
+            let captured = stderr.finish().await;
+            status.map_err(|e| with_stderr(e, captured.as_ref()))?;
 
             // The command claimed success. That is its claim about what it did
             // with its input, not evidence the input arrived — a dump that was
@@ -485,6 +689,9 @@ impl KubeExec for KubeRsExec {
             let api: Api<Pod> = Api::namespaced(self.client.clone(), ns);
             api.delete(name, &DeleteParams::default()).await
         });
+        // Forgotten whatever the delete answered: it is the only delete this
+        // run makes, and a stop that retried it would find the same answer.
+        self.live_helpers.remove(ns, name);
     }
 
     fn get_secret_key(&self, secret: &str, ns: &str, key: &str) -> Result<String> {
@@ -560,24 +767,10 @@ impl KubeExec for KubeRsExec {
 }
 
 /// True iff the Pod is `Running` AND carries a `Ready` condition with
-/// `status == "True"` (the kube-rs analogue of
-/// `kubectl wait --for=condition=Ready`).
+/// `status == "True"`: [`backup_core::helper_pod::pod_is_ready`], the rule the
+/// CLI's wait applies too, on the typed Pod.
 fn pod_is_ready(pod: &Pod) -> bool {
-    let Some(status) = pod.status.as_ref() else {
-        return false;
-    };
-    if status.phase.as_deref() != Some("Running") {
-        return false;
-    }
-    status
-        .conditions
-        .as_ref()
-        .map(|conds| {
-            conds
-                .iter()
-                .any(|c| c.type_ == "Ready" && c.status == "True")
-        })
-        .unwrap_or(false)
+    serde_json::to_value(pod).is_ok_and(|pod| backup_core::helper_pod::pod_is_ready(&pod))
 }
 
 /// Await the attached process's terminal status and translate a non-`Success`
@@ -651,6 +844,121 @@ fn classify_exec_status(
 }
 
 // ---------------------------------------------------------------------------
+// The remote command's stderr
+// ---------------------------------------------------------------------------
+
+/// Bytes of a remote command's stderr kept from its start (where `pg_dump`
+/// and `psql` put the error) and from its end (where `tar` does).
+const STDERR_HEAD_BYTES: usize = 2048;
+const STDERR_TAIL_BYTES: usize = 2048;
+
+/// Reads an exec'd command's stderr to EOF on its own task, for as long as the
+/// command runs.
+///
+/// Two reasons, and the first is a hang. kube-rs hands stderr over through an
+/// in-memory pipe of 1 KiB (`AttachParams::max_stderr_buf_size`'s default),
+/// written by the SAME task that reads the WebSocket. Asking for stderr and
+/// never reading it — what this module did up to 0.2.77 — means the first
+/// command to write more than 1 KiB there stalls that task: no more stdout, no
+/// terminal status, no pings, and no read on the socket for the client's read
+/// timeout to count. The run waits for ever. `pg_dump` 18 hitting its
+/// `--lock-wait-timeout` writes one `LOCK TABLE` statement naming every table
+/// in the database — 2 KiB for 62 tables.
+///
+/// The second: that text is the only explanation of a failure. The apiserver's
+/// terminal status says `exit code 1` and nothing about why.
+///
+/// Dropping the drain aborts its task, so an early `?` return leaves nothing
+/// behind.
+struct StderrDrain(Option<tokio::task::JoinHandle<StderrCapture>>);
+
+impl StderrDrain {
+    /// Take `attached`'s stderr and start reading it. Must run inside the
+    /// runtime (it spawns), which every `KubeRsExec` method body does.
+    fn start(attached: &mut AttachedProcess) -> Self {
+        Self(attached.stderr().map(|r| tokio::spawn(drain_stderr(r))))
+    }
+
+    /// What the command wrote to stderr. Call once the terminal status has
+    /// arrived: kube-rs closes the pipe as its message loop ends, so the task
+    /// is at, or moments from, EOF by then.
+    async fn finish(mut self) -> Option<StderrCapture> {
+        self.0.take()?.await.ok()
+    }
+}
+
+impl Drop for StderrDrain {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// A command's stderr, read to EOF but kept bounded: the first
+/// [`STDERR_HEAD_BYTES`], the last [`STDERR_TAIL_BYTES`], and how many bytes
+/// fell between. Bounded because it ends up in the status ConfigMap and the
+/// failure webhook.
+#[derive(Debug, Default)]
+struct StderrCapture {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    total: u64,
+}
+
+impl StderrCapture {
+    fn push(&mut self, bytes: &[u8]) {
+        self.total += bytes.len() as u64;
+        let into_head = STDERR_HEAD_BYTES
+            .saturating_sub(self.head.len())
+            .min(bytes.len());
+        self.head.extend_from_slice(&bytes[..into_head]);
+        self.tail.extend(&bytes[into_head..]);
+        let excess = self.tail.len().saturating_sub(STDERR_TAIL_BYTES);
+        self.tail.drain(..excess);
+    }
+
+    /// The captured text, `None` when the command wrote nothing (or only
+    /// whitespace).
+    fn render(&self) -> Option<String> {
+        let kept = (self.head.len() + self.tail.len()) as u64;
+        let mut text = String::from_utf8_lossy(&self.head).into_owned();
+        if self.total > kept {
+            text.push_str(&format!(
+                "\n[… {} bytes of stderr not kept …]\n",
+                self.total - kept
+            ));
+        }
+        let tail: Vec<u8> = self.tail.iter().copied().collect();
+        text.push_str(&String::from_utf8_lossy(&tail));
+        let text = text.trim_end();
+        (!text.trim().is_empty()).then(|| text.to_string())
+    }
+}
+
+/// Read `reader` to EOF (or its first error) into a [`StderrCapture`].
+async fn drain_stderr<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> StderrCapture {
+    let mut capture = StderrCapture::default();
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => capture.push(&buf[..n]),
+        }
+    }
+    capture
+}
+
+/// Append the command's own stderr to an exec failure; the error unchanged
+/// when there is none.
+fn with_stderr(err: CliError, stderr: Option<&StderrCapture>) -> CliError {
+    match stderr.and_then(StderrCapture::render) {
+        Some(text) => CliError::Other(format!("{err}\ncommand stderr:\n{text}")),
+        None => err,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -660,9 +968,11 @@ fn classify_exec_status(
 /// `pods/exec` **WebSocket** subresource. `Api::exec` returns an
 /// [`AttachedProcess`] whose stdin/stdout handles and status channel only exist
 /// once that upgrade has completed against a real, *running* pod; the type has
-/// no public constructor and no in-memory transport. Their bodies are therefore
-/// covered by the real-Hetzner walk and the kind-based `e2e/backup-*` scripts,
-/// NOT here. What *is* covered here is the verdict those two methods end on —
+/// no public constructor and no in-memory transport. `exec_stream_to_file` is
+/// therefore covered by the real-Hetzner walk, the kind-based `e2e/backup-*`
+/// scripts and `tests/kind_smoke_test.rs`, NOT here; `exec_stream_from_file`
+/// has no real-cluster coverage at all (see that test's module docs for why).
+/// What *is* covered here is the verdict those two methods end on —
 /// [`classify_exec_status`], the fail-closed rule extracted out of
 /// [`check_exec_status`] for exactly that reason.
 ///
@@ -881,18 +1191,23 @@ mod tests {
     /// INVARIANT: only a 404 becomes `Ok(None)`. A 403 or a 500 must stay an
     /// error — reading "forbidden" as "absent" would let a backup silently skip
     /// resources the service account cannot see and still report success.
+    ///
+    /// The rule is the HTTP CODE, not the reason string: the reason here is
+    /// deliberately not `NotFound`, and kube's own `Status::is_not_found()`
+    /// would answer by reason alone (Go-client semantics). kube 3 folded
+    /// `ErrorResponse` into `Status`; the classification did not move with it.
     #[test]
     fn is_not_found_is_true_for_404_and_nothing_else() {
         let api = |code| {
-            kube::Error::Api(kube::core::ErrorResponse {
-                status: "Failure".into(),
-                message: "boom".into(),
-                reason: "Whatever".into(),
-                code,
-            })
+            kube::Error::Api(
+                kube::core::Status::failure("boom", "Whatever")
+                    .with_code(code)
+                    .boxed(),
+            )
         };
         assert!(is_not_found(&api(404)));
         assert!(!is_not_found(&api(403)));
+        assert!(!is_not_found(&api(409)));
         assert!(!is_not_found(&api(410)));
         assert!(!is_not_found(&api(500)));
         assert!(!is_not_found(&kube::Error::TlsRequired));
@@ -1015,6 +1330,131 @@ mod tests {
         assert_eq!(
             list_to_value(list, &claim_resource()).unwrap(),
             json!({"items": []})
+        );
+    }
+
+    // --- Kubernetes timestamps on the wire -----------------------------------
+    //
+    // k8s-openapi 0.23 held `Time`/`MicroTime` as `chrono::DateTime<Utc>`;
+    // 0.28 (with kube 3+) holds a `jiff::Timestamp` and formats it with its own
+    // strftime pattern. Every object the runner stages is re-serialized through
+    // those types (`metadata.creationTimestamp`, `managedFields[].time`, …), so
+    // the formatter swap reaches the snapshot bytes directly. The strings below
+    // are what 0.23 produced — verified against it, not copied from 0.28 — so a
+    // difference here is a change in what a backup writes.
+
+    /// `Time` into and back out of its wire form.
+    fn time_wire(s: &str) -> String {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        let t: Time = serde_json::from_value(json!(s)).expect("parse a metav1.Time");
+        serde_json::to_string(&t).expect("serialize a metav1.Time")
+    }
+
+    /// `MicroTime` into and back out of its wire form.
+    fn micro_time_wire(s: &str) -> String {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::MicroTime;
+        let t: MicroTime = serde_json::from_value(json!(s)).expect("parse a metav1.MicroTime");
+        serde_json::to_string(&t).expect("serialize a metav1.MicroTime")
+    }
+
+    /// INVARIANT: `metav1.Time` is whole seconds, UTC, `Z`-suffixed. Sub-second
+    /// input is TRUNCATED (never rounded up into the next second) and an offset
+    /// is normalized to UTC.
+    #[test]
+    fn metav1_time_keeps_its_exact_wire_form() {
+        assert_eq!(
+            time_wire("2026-09-22T17:53:30Z"),
+            r#""2026-09-22T17:53:30Z""#
+        );
+        assert_eq!(
+            time_wire("2026-09-22T17:53:30.999999999Z"),
+            r#""2026-09-22T17:53:30Z""#
+        );
+        assert_eq!(
+            time_wire("2026-09-22T20:53:30+03:00"),
+            r#""2026-09-22T17:53:30Z""#
+        );
+        assert_eq!(
+            time_wire("1970-01-01T00:00:00Z"),
+            r#""1970-01-01T00:00:00Z""#
+        );
+    }
+
+    /// INVARIANT: `metav1.MicroTime` always carries EXACTLY six fractional
+    /// digits — zeros included, which is the case a formatter that elides a
+    /// zero fraction would break — truncated from nanoseconds, UTC, `Z`.
+    #[test]
+    fn metav1_micro_time_keeps_its_exact_wire_form() {
+        assert_eq!(
+            micro_time_wire("2026-09-22T17:53:30.123456Z"),
+            r#""2026-09-22T17:53:30.123456Z""#
+        );
+        assert_eq!(
+            micro_time_wire("2026-09-22T17:53:30Z"),
+            r#""2026-09-22T17:53:30.000000Z""#
+        );
+        assert_eq!(
+            micro_time_wire("2026-09-22T17:53:30.1Z"),
+            r#""2026-09-22T17:53:30.100000Z""#
+        );
+        assert_eq!(
+            micro_time_wire("2026-09-22T17:53:30.123456789Z"),
+            r#""2026-09-22T17:53:30.123456Z""#
+        );
+        assert_eq!(
+            micro_time_wire("2026-09-22T20:53:30.000001+03:00"),
+            r#""2026-09-22T17:53:30.000001Z""#
+        );
+    }
+
+    /// INVARIANT: a staged object's metadata timestamps reach the snapshot
+    /// byte-for-byte. This is the path the runner actually takes — the object is
+    /// decoded as a `DynamicObject` (whose metadata is the typed `ObjectMeta`)
+    /// and re-serialized by [`list_to_value`] — asserted on the serialized
+    /// bytes, not on a parsed value that would compare equal across formats.
+    #[test]
+    fn staged_object_metadata_timestamps_survive_byte_for_byte() {
+        let list: ObjectList<DynamicObject> = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "SecretList",
+            "items": [{
+                "metadata": {
+                    "name": "cf-cert",
+                    "namespace": "apprafter-system",
+                    "creationTimestamp": "2026-09-22T17:53:30Z",
+                    "deletionTimestamp": "2026-09-22T18:00:00Z",
+                    "managedFields": [{
+                        "manager": "apprafter",
+                        "operation": "Apply",
+                        "apiVersion": "v1",
+                        "time": "2026-09-22T17:53:31Z",
+                        "fieldsType": "FieldsV1",
+                        "fieldsV1": {"f:data": {"f:tls.crt": {}}}
+                    }]
+                },
+                "type": "kubernetes.io/tls"
+            }]
+        }))
+        .expect("decode a secret list with timestamps");
+
+        let secrets = ApiResource {
+            group: String::new(),
+            version: "v1".into(),
+            api_version: "v1".into(),
+            kind: "Secret".into(),
+            plural: "secrets".into(),
+        };
+        let v = list_to_value(list, &secrets).expect("serialize list");
+        assert_eq!(
+            serde_json::to_string(&v["items"][0]["metadata"]).unwrap(),
+            concat!(
+                r#"{"creationTimestamp":"2026-09-22T17:53:30Z","#,
+                r#""deletionTimestamp":"2026-09-22T18:00:00Z","#,
+                r#""managedFields":[{"apiVersion":"v1","fieldsType":"FieldsV1","#,
+                r#""fieldsV1":{"f:data":{"f:tls.crt":{}}},"manager":"apprafter","#,
+                r#""operation":"Apply","time":"2026-09-22T17:53:31Z"}],"#,
+                r#""name":"cf-cert","namespace":"apprafter-system"}"#,
+            )
         );
     }
 
@@ -1144,39 +1584,170 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // The remote command's stderr
+    // -----------------------------------------------------------------------
+
+    /// kube-rs's stderr pipe, as `AttachedProcess` builds it: a
+    /// `tokio::io::duplex` of `AttachParams::max_stderr_buf_size`'s default.
+    const KUBE_STDERR_PIPE_BYTES: usize = 1024;
+
+    /// The drain must keep reading however much the command writes — a
+    /// reader that stopped once it had "enough" would stall kube-rs's message
+    /// loop exactly as an unread pipe does — and it must keep the start and
+    /// the end of what it read.
+    #[test]
+    fn drain_stderr_reads_far_past_the_kube_pipe_and_keeps_both_ends() {
+        use tokio::io::AsyncWriteExt;
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let capture = rt.block_on(async {
+            let (mut writer, reader) = tokio::io::duplex(KUBE_STDERR_PIPE_BYTES);
+            // The writer is what kube-rs's message loop does with stderr
+            // frames: `write_all`, which parks while the pipe is full.
+            let written = tokio::spawn(async move {
+                writer
+                    .write_all(b"pg_dump: error: query failed: ERROR:  canceling statement\n")
+                    .await?;
+                for i in 0..2000 {
+                    writer
+                        .write_all(format!("public.app_orders_line_items_{i}, ").as_bytes())
+                        .await?;
+                }
+                writer.write_all(b"\nTHE LAST LINE\n").await?;
+                std::io::Result::Ok(())
+            });
+            let capture =
+                tokio::time::timeout(std::time::Duration::from_secs(10), drain_stderr(reader))
+                    .await
+                    .expect("the drain stopped reading: the writer is parked on a full pipe");
+            written.await.expect("join").expect("write");
+            capture
+        });
+
+        assert!(capture.total > 60_000, "total: {}", capture.total);
+        let text = capture.render().expect("stderr was written");
+        assert!(
+            text.starts_with("pg_dump: error: query failed"),
+            "the head is where pg_dump puts the error: {text}"
+        );
+        assert!(text.ends_with("THE LAST LINE"), "the tail: {text}");
+        assert!(text.contains("bytes of stderr not kept"), "{text}");
+        assert!(
+            text.len() < STDERR_HEAD_BYTES + STDERR_TAIL_BYTES + 100,
+            "bounded: {} bytes",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn a_short_stderr_is_kept_whole() {
+        let mut capture = StderrCapture::default();
+        capture.push(b"tar: ./x: Cannot open: Permission denied\n");
+        capture.push(b"tar: Exiting with failure status\n");
+        assert_eq!(
+            capture.render().as_deref(),
+            Some(
+                "tar: ./x: Cannot open: Permission denied\n\
+                 tar: Exiting with failure status"
+            )
+        );
+    }
+
+    #[test]
+    fn an_exec_failure_carries_the_commands_stderr_and_only_when_there_is_some() {
+        let failure = || {
+            classify_exec_status(
+                Some(Some(status("Failure"))),
+                "exec_stream_to_file",
+                &["pg_dump"],
+                "demo",
+                "bk-pg-alpha",
+            )
+            .expect_err("a Failure status")
+        };
+
+        let mut said = StderrCapture::default();
+        said.push(b"pg_dump: error: connection refused\n");
+        let msg = with_stderr(failure(), Some(&said)).to_string();
+        assert!(msg.contains("NonZeroExitCode"), "{msg}");
+        assert!(
+            msg.ends_with("command stderr:\npg_dump: error: connection refused"),
+            "{msg}"
+        );
+
+        let bare = failure().to_string();
+        let mut blank = StderrCapture::default();
+        blank.push(b"  \n");
+        assert_eq!(with_stderr(failure(), Some(&blank)).to_string(), bare);
+        assert_eq!(with_stderr(failure(), None).to_string(), bare);
+    }
+
+    // -----------------------------------------------------------------------
     // Stub apiserver — a `tower::Service` handed to `kube::Client::new`
     // -----------------------------------------------------------------------
 
     /// One canned apiserver reply, matched on METHOD + exact request PATH
     /// (query strings are recorded but not matched, so a test can assert the
     /// server-side-apply parameters without encoding them twice).
+    ///
+    /// A route answers its replies in order, one per request, and repeats the
+    /// last one from then on — so a route with one reply always gives it, and
+    /// a test can script a pod that changes between two requests.
     struct Route {
         method: &'static str,
         path: String,
-        status: u16,
-        body: String,
+        replies: Vec<(u16, String)>,
+        hits: std::sync::atomic::AtomicUsize,
+        /// Run on every request the route answers, before it answers: what a
+        /// test needs to happen at exactly that point of the exchange.
+        on_hit: Option<Box<dyn Fn() + Send + Sync>>,
+    }
+
+    impl Route {
+        fn next_reply(&self) -> (u16, String) {
+            if let Some(hook) = &self.on_hit {
+                hook();
+            }
+            let n = self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.replies[n.min(self.replies.len() - 1)].clone()
+        }
+
+        fn on_hit(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+            self.on_hit = Some(Box::new(hook));
+            self
+        }
+    }
+
+    fn seq_route(method: &'static str, path: &str, replies: Vec<(u16, Value)>) -> Route {
+        Route {
+            method,
+            path: path.to_string(),
+            replies: replies
+                .into_iter()
+                .map(|(code, body)| (code, body.to_string()))
+                .collect(),
+            hits: std::sync::atomic::AtomicUsize::new(0),
+            on_hit: None,
+        }
     }
 
     fn ok_route(method: &'static str, path: &str, body: Value) -> Route {
-        Route {
-            method,
-            path: path.to_string(),
-            status: 200,
-            body: body.to_string(),
-        }
+        seq_route(method, path, vec![(200, body)])
+    }
+
+    fn status_body(code: u16, reason: &str, message: &str) -> Value {
+        json!({
+            "kind": "Status", "apiVersion": "v1", "status": "Failure",
+            "reason": reason, "message": message, "code": code
+        })
     }
 
     fn err_route(method: &'static str, path: &str, code: u16, reason: &str) -> Route {
-        Route {
+        seq_route(
             method,
-            path: path.to_string(),
-            status: code,
-            body: json!({
-                "kind": "Status", "apiVersion": "v1", "status": "Failure",
-                "reason": reason, "message": "stub apiserver rejection", "code": code
-            })
-            .to_string(),
-        }
+            path,
+            vec![(code, status_body(code, reason, "stub apiserver rejection"))],
+        )
     }
 
     /// A `tower::Service` that answers from a fixed route table and records
@@ -1213,7 +1784,7 @@ mod tests {
                 .iter()
                 .find(|r| r.method == method && r.path == path)
             {
-                Some(r) => (r.status, r.body.clone()),
+                Some(r) => r.next_reply(),
                 None => (
                     404,
                     json!({
@@ -1380,6 +1951,408 @@ mod tests {
             seen[1],
             format!("GET {path}"),
             "readiness must be polled by GETting the same pod: {seen:?}"
+        );
+    }
+
+    /// The helper pod as the kubelet leaves it when a Secret its container
+    /// reads a credential from is missing.
+    fn config_blocked_pod() -> Value {
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "bk-pg-alpha", "namespace": "demo"},
+            "status": {"phase": "Pending", "containerStatuses": [{
+                "name": "dump", "ready": false, "restartCount": 0, "image": "postgres:18-alpine",
+                "imageID": "",
+                "state": {"waiting": {"reason": "CreateContainerConfigError",
+                                      "message": "secret \"db-conn\" not found"}}
+            }]}
+        })
+    }
+
+    /// Wait for `bk-pg-alpha` in `demo` with bounds short enough for a test.
+    fn wait_ready_briefly(h: &Harness, grace: std::time::Duration) -> Result<()> {
+        let api: Api<Pod> = Api::namespaced(h.exec.client.clone(), "demo");
+        h.exec.rt.block_on(h.exec.wait_pod_ready(
+            &api,
+            "bk-pg-alpha",
+            "demo",
+            std::time::Duration::from_secs(20),
+            std::time::Duration::from_millis(50),
+            grace,
+        ))
+    }
+
+    /// WI-383: a helper reads its credentials from a Secret by reference, so
+    /// a missing Secret or key leaves its container unable to start. The wait
+    /// says so with the kubelet's words once that has held for the grace —
+    /// not after the whole five-minute timeout, with none.
+    #[test]
+    fn a_helper_whose_credential_secret_is_missing_fails_the_wait_with_the_kubelets_words() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let h = Harness::new(vec![ok_route("GET", path, config_blocked_pod())]);
+        let started = std::time::Instant::now();
+        let msg = wait_ready_briefly(&h, std::time::Duration::from_millis(300))
+            .expect_err("a container that cannot be configured never becomes Ready")
+            .to_string();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "gave up after {:?}, not at the grace",
+            started.elapsed()
+        );
+        assert!(
+            msg.starts_with(
+                "helper pod demo/bk-pg-alpha cannot start its container: secret \"db-conn\" \
+                 not found (CreateContainerConfigError)"
+            ),
+            "{msg}"
+        );
+    }
+
+    /// One that clears within the grace — a Secret the kubelet had not yet
+    /// synced — is waited out like any other start.
+    #[test]
+    fn a_config_error_that_clears_within_the_grace_is_waited_out() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let h = Harness::new(vec![seq_route(
+            "GET",
+            path,
+            vec![
+                (200, config_blocked_pod()),
+                (200, config_blocked_pod()),
+                (200, running_ready_pod()),
+            ],
+        )]);
+        wait_ready_briefly(&h, std::time::Duration::from_secs(10)).expect("Ready after all");
+    }
+
+    fn pod_in_phase(phase: &str) -> Value {
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "bk-pg-alpha", "namespace": "demo"},
+            "status": {"phase": phase}
+        })
+    }
+
+    fn not_found() -> (u16, Value) {
+        (
+            404,
+            status_body(404, "NotFound", "pods \"bk-pg-alpha\" not found"),
+        )
+    }
+
+    /// A helper pod left behind by an earlier run, ended (`Completed`): the
+    /// apply answers with it unchanged, and it would never become Ready. It is
+    /// deleted, waited out, and the pod created again — not waited on for five
+    /// minutes and failed.
+    #[test]
+    fn an_ended_leftover_of_the_same_name_is_deleted_and_created_again() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let h = Harness::new(vec![
+            seq_route(
+                "PATCH",
+                path,
+                vec![
+                    (200, pod_in_phase("Succeeded")),
+                    (200, pod_in_phase("Pending")),
+                ],
+            ),
+            ok_route("DELETE", path, pod_in_phase("Succeeded")),
+            // The wait for the delete, then the Ready poll of the new pod.
+            seq_route("GET", path, vec![not_found(), (200, running_ready_pod())]),
+        ]);
+
+        h.exec
+            .apply_and_wait_pod_ready(&helper_pod_spec())
+            .expect("the leftover is replaced");
+
+        let seen: Vec<String> = h
+            .seen()
+            .iter()
+            .map(|r| r.split('?').next().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                format!("PATCH {path}"),
+                format!("DELETE {path}"),
+                format!("GET {path}"),
+                format!("PATCH {path}"),
+                format!("GET {path}"),
+            ]
+        );
+    }
+
+    /// A helper kept alive for six hours, as the builders shape one.
+    fn six_hour_helper_spec() -> Value {
+        let mut spec = helper_pod_spec();
+        spec["spec"]["containers"][0]["command"] = json!(["sleep", "21600"]);
+        spec
+    }
+
+    /// The same helper as the apply returns it: running, Ready, its container
+    /// started `ago` before now.
+    fn six_hour_helper_running_for(ago: std::time::Duration) -> Value {
+        let started = chrono::Utc::now() - chrono::Duration::from_std(ago).unwrap();
+        let mut pod = running_ready_pod();
+        pod["spec"] = six_hour_helper_spec()["spec"].clone();
+        pod["status"]["containerStatuses"] = json!([{"name": "dump", "state": {"running": {
+            "startedAt": started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        }}}]);
+        pod
+    }
+
+    /// A helper left running by a command stopped before its cleanup — an
+    /// earlier run's, five hours into its six-hour keep-alive — would give
+    /// this run's dump one hour. It is replaced, like an ended one.
+    #[test]
+    fn a_running_leftover_with_hours_of_its_keep_alive_used_is_replaced() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let h = Harness::new(vec![
+            seq_route(
+                "PATCH",
+                path,
+                vec![
+                    (
+                        200,
+                        six_hour_helper_running_for(std::time::Duration::from_secs(5 * 3600)),
+                    ),
+                    (200, pod_in_phase("Pending")),
+                ],
+            ),
+            ok_route("DELETE", path, pod_in_phase("Running")),
+            seq_route("GET", path, vec![not_found(), (200, running_ready_pod())]),
+        ]);
+
+        h.exec
+            .apply_and_wait_pod_ready(&six_hour_helper_spec())
+            .expect("the leftover is replaced");
+
+        let seen: Vec<String> = h
+            .seen()
+            .iter()
+            .map(|r| r.split('?').next().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                format!("PATCH {path}"),
+                format!("DELETE {path}"),
+                format!("GET {path}"),
+                format!("PATCH {path}"),
+                format!("GET {path}"),
+            ]
+        );
+    }
+
+    /// One another run created moments ago is used as it is: deleting it
+    /// would kill that run's command, and it has its keep-alive nearly whole.
+    #[test]
+    fn a_running_helper_started_moments_ago_is_used_as_it_is() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let fresh = six_hour_helper_running_for(std::time::Duration::from_secs(10));
+        let h = Harness::new(vec![
+            ok_route("PATCH", path, fresh.clone()),
+            ok_route("GET", path, fresh),
+        ]);
+        h.exec
+            .apply_and_wait_pod_ready(&six_hour_helper_spec())
+            .expect("apply + wait");
+        let seen: Vec<String> = h
+            .seen()
+            .iter()
+            .map(|r| r.split('?').next().unwrap().to_string())
+            .collect();
+        assert_eq!(seen, vec![format!("PATCH {path}"), format!("GET {path}")]);
+    }
+
+    /// A leftover with a spec this run's cannot be applied over — an older
+    /// runner's `sleep 3600`, say — is refused by the apiserver, and replaced.
+    #[test]
+    fn a_leftover_whose_spec_cannot_change_in_place_is_replaced() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let immutable = status_body(
+            422,
+            "Invalid",
+            "Pod \"bk-pg-alpha\" is invalid: spec: Forbidden: pod updates may not change \
+             fields other than `spec.containers[*].image`",
+        );
+        let h = Harness::new(vec![
+            seq_route(
+                "PATCH",
+                path,
+                vec![(422, immutable), (200, pod_in_phase("Pending"))],
+            ),
+            ok_route("DELETE", path, pod_in_phase("Running")),
+            seq_route(
+                "GET",
+                path,
+                vec![
+                    (200, pod_in_phase("Running")),
+                    not_found(),
+                    (200, running_ready_pod()),
+                ],
+            ),
+        ]);
+
+        h.exec
+            .apply_and_wait_pod_ready(&helper_pod_spec())
+            .expect("the leftover is replaced");
+
+        let seen: Vec<String> = h
+            .seen()
+            .iter()
+            .map(|r| r.split('?').next().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                format!("PATCH {path}"),
+                format!("DELETE {path}"),
+                // Still there once (terminating), then gone.
+                format!("GET {path}"),
+                format!("GET {path}"),
+                format!("PATCH {path}"),
+                format!("GET {path}"),
+            ]
+        );
+    }
+
+    /// Any other refusal is the run's error, and nothing is deleted: a 422 for
+    /// another reason is not a leftover.
+    #[test]
+    fn another_invalid_apply_deletes_nothing() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let h = Harness::new(vec![
+            seq_route(
+                "PATCH",
+                path,
+                vec![(
+                    422,
+                    status_body(
+                        422,
+                        "Invalid",
+                        "Pod \"bk-pg-alpha\" is invalid: metadata.name",
+                    ),
+                )],
+            ),
+            ok_route("DELETE", path, pod_in_phase("Running")),
+        ]);
+        let err = h
+            .exec
+            .apply_and_wait_pod_ready(&helper_pod_spec())
+            .expect_err("an invalid spec fails the step");
+        assert!(err.to_string().starts_with("apply pod "), "{err}");
+        assert!(
+            h.seen().iter().all(|r| !r.starts_with("DELETE")),
+            "{:?}",
+            h.seen()
+        );
+    }
+
+    /// The stop deletes what is in the live set, so a helper pod must be in it
+    /// from its apply until its delete — and nothing else ever is.
+    #[test]
+    fn a_helper_pod_is_live_from_its_apply_until_its_delete_and_other_pods_never() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let h = Harness::new(vec![
+            ok_route("PATCH", path, running_ready_pod()),
+            ok_route("GET", path, running_ready_pod()),
+            ok_route("DELETE", path, running_ready_pod()),
+        ]);
+        let live = h.exec.live_helper_pods();
+        let mut spec = helper_pod_spec();
+        spec["metadata"]["labels"] = json!({"apprafter.io/backup-helper": "true"});
+
+        h.exec
+            .apply_and_wait_pod_ready(&spec)
+            .expect("apply + wait");
+        assert_eq!(
+            live.snapshot(),
+            vec![("demo".to_string(), "bk-pg-alpha".to_string())]
+        );
+        h.exec.delete_pod_best_effort("bk-pg-alpha", "demo");
+        assert!(live.snapshot().is_empty(), "{:?}", live.snapshot());
+
+        // A pod without the helper label — a test's own server, say — is not
+        // the stop's to delete.
+        h.exec
+            .apply_and_wait_pod_ready(&helper_pod_spec())
+            .expect("apply + wait");
+        assert!(live.snapshot().is_empty(), "{:?}", live.snapshot());
+    }
+
+    /// Once the stop has begun, no helper pod is applied — not a single
+    /// request goes out — while a pod without the helper label still is.
+    #[test]
+    fn no_helper_pod_is_applied_once_the_run_is_being_stopped() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let h = Harness::new(vec![
+            ok_route("PATCH", path, running_ready_pod()),
+            ok_route("GET", path, running_ready_pod()),
+        ]);
+        h.exec.live_helper_pods().close();
+        let mut spec = helper_pod_spec();
+        spec["metadata"]["labels"] = json!({"apprafter.io/backup-helper": "true"});
+
+        let err = h
+            .exec
+            .apply_and_wait_pod_ready(&spec)
+            .expect_err("a helper pod is not applied once the run is being stopped");
+        assert!(err.to_string().contains("being stopped"), "{err}");
+        assert!(h.seen().is_empty(), "{:?}", h.seen());
+        assert!(h.exec.live_helper_pods().snapshot().is_empty());
+
+        h.exec
+            .apply_and_wait_pod_ready(&helper_pod_spec())
+            .expect("a pod that is not a backup helper is not the stop's");
+    }
+
+    /// The re-apply after a leftover's replacement is refused too, when the
+    /// stop begins while the leftover is being deleted.
+    #[test]
+    fn a_leftovers_replacement_is_not_created_once_the_run_is_being_stopped() {
+        let path = "/api/v1/namespaces/demo/pods/bk-pg-alpha";
+        let live = Arc::new(Mutex::new(None::<crate::stop::LiveHelperPods>));
+        let stop = Arc::clone(&live);
+        let h = Harness::new(vec![
+            seq_route(
+                "PATCH",
+                path,
+                vec![
+                    (200, pod_in_phase("Succeeded")),
+                    (200, pod_in_phase("Pending")),
+                ],
+            ),
+            // The stop begins as the leftover is deleted.
+            ok_route("DELETE", path, pod_in_phase("Succeeded")).on_hit(move || {
+                if let Some(live) = stop.lock().unwrap().as_ref() {
+                    live.close();
+                }
+            }),
+            seq_route("GET", path, vec![not_found(), (200, running_ready_pod())]),
+        ]);
+        *live.lock().unwrap() = Some(h.exec.live_helper_pods());
+        let mut spec = helper_pod_spec();
+        spec["metadata"]["labels"] = json!({"apprafter.io/backup-helper": "true"});
+
+        let err = h
+            .exec
+            .apply_and_wait_pod_ready(&spec)
+            .expect_err("the replacement is not created once the stop has begun");
+        assert!(err.to_string().contains("being stopped"), "{err}");
+        let seen: Vec<String> = h
+            .seen()
+            .iter()
+            .map(|r| r.split('?').next().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                format!("PATCH {path}"),
+                format!("DELETE {path}"),
+                format!("GET {path}"),
+            ],
+            "no second PATCH"
         );
     }
 
@@ -1621,6 +2594,46 @@ mod tests {
             .is_none());
     }
 
+    /// A 404 whose body is NOT a `Status` — a proxy's plain `404 page not
+    /// found` — is absent too. kube-rs only builds the error from the HTTP code
+    /// when the body fails to decode, and [`is_not_found`] classifies by code,
+    /// so this pins the one path where the code does not come from the body.
+    /// kube 3 made every `Status` field optional (`ErrorResponse` required
+    /// `status` + `code`), which moved what "fails to decode" means: only a
+    /// non-object body still takes this path.
+    #[test]
+    fn get_json_reads_a_non_status_404_body_as_absent() {
+        let path = "/apis/apprafter.io/v1alpha1/namespaces/apprafter-system/platformstacks/default";
+        let mut routes = apprafter_discovery_routes();
+        routes.push(Route {
+            method: "GET",
+            path: path.to_string(),
+            replies: vec![(404, "404 page not found\n".to_string())],
+            hits: std::sync::atomic::AtomicUsize::new(0),
+            on_hit: None,
+        });
+        let h = Harness::new(routes);
+
+        let got = h
+            .exec
+            .get_json(&[
+                "get",
+                "platformstack",
+                "default",
+                "-n",
+                "apprafter-system",
+                "-o",
+                "json",
+            ])
+            .expect("a 404 must not be an error, whatever its body");
+        assert!(got.is_none(), "expected Ok(None), got {got:?}");
+        assert!(
+            h.seen().iter().any(|r| r == &format!("GET {path}")),
+            "the plain-text 404 must come from the object route: {:?}",
+            h.seen()
+        );
+    }
+
     /// A forbidden read is NOT "absent": swallowing it would let a backup skip
     /// every CR the service account cannot see and still report success.
     #[test]
@@ -1794,6 +2807,9 @@ mod tests {
         }
         fn run_backup(&self, _argv: &[String], _pass: &str) -> Result<Option<String>> {
             Ok(Some("stub-snapshot".to_string()))
+        }
+        fn run_capture(&self, _argv: &[String], _pass: &str) -> Result<backup_core::ResticOutput> {
+            Ok(backup_core::ResticOutput::default())
         }
     }
 
@@ -2010,6 +3026,7 @@ mod tests {
                 is_subset: false,
                 staging_root: staging.path().to_path_buf(),
                 pg_image: "postgres:16-alpine".to_string(),
+                helper_keep_alive: backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
                 staging_mode: backup_core::StagingMode::Monolithic,
                 backup_host: Some("apprafter-backup".to_string()),
             },

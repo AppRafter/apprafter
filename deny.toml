@@ -1,0 +1,119 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+#
+# cargo-deny policy, shared by both Cargo workspaces (`cli/` and `operator/`
+# are separate workspaces with no top-level Cargo.toml, so `scripts/cargo-deny.sh`
+# runs cargo-deny once per workspace against THIS file).
+#
+# ## Why this file exists
+#
+# Until 2026-09 there was no advisory tooling here at all. The version watcher
+# (`scripts/upstream-versions.py`) asks "are we behind the newest release?",
+# which cannot see the two states that actually hurt:
+#
+#   * a crate that is ABANDONED sits on its own final release forever, so it is
+#     never "behind" — `oci-distribution` reported as perfectly current for
+#     eighteen months while the project had been renamed to `oci-client`;
+#   * a crate with an unfixable advisory is not behind either.
+#
+# So the report made a dead dependency look healthier than a maintained one
+# that ships often. This file asks the other two questions: is it alive, and is
+# it known-vulnerable.
+#
+# ## The rule for `ignore`
+#
+# Every entry below is a REVIEWED decision with its reasoning inline, and the
+# value is exactly that: without this file the same advisories were simply
+# silent. An ignore with no `reason` is not acceptable here — if it cannot be
+# justified in a sentence, it should not be ignored.
+#
+# When an ignored entry names a work item that clears it, delete the entry in
+# the same change that closes the item. `unmaintained` is set to `all` rather
+# than `workspace` on purpose: three of the four unmaintained crates below are
+# transitive, and transitive is where this class hides.
+
+[advisories]
+version = 2
+# `all` includes transitive dependencies. The narrower `workspace` setting
+# would have reported NONE of the four unmaintained crates found on
+# 2026-09-22 (rustls-pemfile, backoff, derivative, instant), because every one
+# of them arrived through kube 0.95. The kube 4.2 bump (WI-357) cleared all four
+# and their ignore entries went with it.
+unmaintained = "all"
+yanked = "deny"
+
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = """
+The Marvin timing side-channel in the `rsa` crate. NOT REACHABLE HERE, and
+no published version fixes it — 0.9.10 is the newest stable and the 0.10 RC
+line does not address it either (RustCrypto/RSA#626 is still open, and the
+advisory's own `patched` list is empty).
+
+Marvin attacks PRIVATE-KEY decryption. This repo performs none in production.
+The only production `RsaPrivateKey` is cli/cli-providers/src/cert.rs:67, which
+calls `to_public_key()` and compares it against the certificate's key — no
+decrypt, no sign. Every `.decrypt()` in the tree is inside a `#[cfg(test)]`
+module. The production RSA operation is `RsaPublicKey::encrypt(Oaep)` in
+cli/backup-core/src/sealing.rs, which is public-key only.
+
+The algorithm is not ours to change: RSA-OAEP is in the type signature of
+sealed-secrets' own `Unseal(codecs, privKeys map[string]*rsa.PrivateKey)`, and
+the SealedSecret object carries no algorithm identifier or format version.
+
+RE-EXAMINE THIS if a private-key decrypt or sign ever enters a production path.
+That is the condition that makes this ignore wrong, not a version bump.
+""" },
+]
+
+[bans]
+# Duplicate versions are reported, not fatal. They are usually somebody else's
+# pin rather than a defect of ours — e.g. sha2 0.10 arriving through
+# async-nats -> nkeys -> ed25519-dalek while our own direct dependencies are on
+# 0.11, or rand 0.9 through kube-client's tungstenite beside the held rand 0.8
+# in cli/backup-core. Worth seeing; not worth blocking on.
+multiple-versions = "warn"
+wildcards = "deny"
+# The workspace's own crates depend on each other by `path`, which cargo-deny
+# counts as a wildcard. That is the normal shape of a multi-crate workspace,
+# not a dependency we failed to pin — the check is here for wildcards on
+# THIRD-PARTY crates, which is where an unpinned range is a real hazard.
+allow-wildcard-paths = true
+
+[licenses]
+# Deliberately NOT a policy yet. A license allow-list is its own decision with
+# its own review, and asserting one here as a side effect of adding advisory
+# scanning would be the wrong way to make it. `version = 2` means unlisted
+# licenses are denied, so this list is the current, observed set rather than an
+# endorsement — extend it consciously.
+version = 2
+# Our own crates declare `license = "FSL-1.1-Apache-2.0"` (CLAUDE.md, ADR 0032),
+# which is a real licence but not an SPDX identifier, so cargo-deny reads them
+# as unlicensed. They are workspace members and are not published to crates.io,
+# so the licence question this section exists to answer — "what are we
+# redistributing?" — does not apply to them. SPDX conformance of our OWN
+# headers is `scripts/check-spdx-headers.sh`'s job, and it already runs.
+private = { ignore = true }
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    # Community Data License Agreement, Permissive 2.0 — the licence on
+    # `webpki-roots`, which is Mozilla's root-certificate bundle. It is a DATA
+    # licence rather than a code one, which is why it does not appear on the
+    # usual permissive-code list; permissive in the same sense.
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -78,9 +78,14 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Encrypt `plaintext` for a single recipient. Returns ASCII-armored
 /// ciphertext (`-----BEGIN AGE ENCRYPTED FILE-----` … `-----END …`).
 pub fn encrypt_for_recipient(plaintext: &str, recipient: &Recipient) -> Result<String> {
-    let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(recipient.clone())];
-    let encryptor = age::Encryptor::with_recipients(recipients)
-        .ok_or_else(|| CliError::Other("age encryptor: empty recipients".to_string()))?;
+    // age 0.11 changed `with_recipients` to take an iterator of `&dyn
+    // Recipient` and to validate eagerly, returning Result instead of Option.
+    // The recipient list here is a one-element literal, so the error arm is
+    // unreachable in practice — it is mapped rather than unwrapped so a future
+    // multi-recipient caller inherits the check instead of a panic.
+    let recipient_ref: &dyn age::Recipient = recipient;
+    let encryptor = age::Encryptor::with_recipients(std::iter::once(recipient_ref))
+        .map_err(|e| CliError::Other(format!("age encryptor: {e}")))?;
     let mut out: Vec<u8> = Vec::new();
     let armored = ArmoredWriter::wrap_output(&mut out, Format::AsciiArmor)
         .map_err(|e| CliError::Other(format!("age armor: {e}")))?;
@@ -102,17 +107,17 @@ pub fn encrypt_for_recipient(plaintext: &str, recipient: &Recipient) -> Result<S
 /// Decrypt ASCII-armored ciphertext with the given identity.
 pub fn decrypt_with_identity(armored: &str, identity: &Identity) -> Result<String> {
     let reader = ArmoredReader::new(armored.as_bytes());
-    let decryptor = match age::Decryptor::new(reader)
-        .map_err(|e| CliError::Other(format!("age decryptor init: {e}")))?
-    {
-        age::Decryptor::Recipients(d) => d,
-        age::Decryptor::Passphrase(_) => {
-            return Err(CliError::Other(
-                "age ciphertext is passphrase-protected; AppRafter expects recipient mode"
-                    .to_string(),
-            ))
-        }
-    };
+    // age 0.11 collapsed the `Decryptor::{Recipients,Passphrase}` enum into an
+    // opaque struct; passphrase mode is now asked about rather than matched on.
+    // `is_scrypt()` is the same question the old `Passphrase(_)` arm answered —
+    // an scrypt recipient stanza IS the passphrase mode.
+    let decryptor = age::Decryptor::new(reader)
+        .map_err(|e| CliError::Other(format!("age decryptor init: {e}")))?;
+    if decryptor.is_scrypt() {
+        return Err(CliError::Other(
+            "age ciphertext is passphrase-protected; AppRafter expects recipient mode".to_string(),
+        ));
+    }
     let mut reader = decryptor
         .decrypt(std::iter::once(identity as &dyn age::Identity))
         .map_err(|e| CliError::Other(format!("age decrypt: {e}")))?;

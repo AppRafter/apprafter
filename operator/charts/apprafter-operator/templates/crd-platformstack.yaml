@@ -54,8 +54,14 @@ spec:
                 type: boolean
               backup:
                 properties:
+                  activeDeadlineSeconds:
+                    minimum: 600
+                    type: integer
                   bucket:
                     type: string
+                  checkActiveDeadlineSeconds:
+                    minimum: 600
+                    type: integer
                   checkReadData:
                     type: boolean
                   checkReadDataSubset:
@@ -79,8 +85,9 @@ spec:
                     properties:
                       enforce:
                         enum:
-                        - operator
+                        - check
                         - cluster
+                        - operator
                         type: string
                       keepDaily:
                         exclusiveMinimum: true
@@ -94,8 +101,6 @@ spec:
                         exclusiveMinimum: true
                         minimum: 0
                         type: integer
-                    required:
-                    - enforce
                     type: object
                   schedule:
                     type: string

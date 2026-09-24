@@ -72,18 +72,31 @@ pub struct BackupOpts {
     pub staging_root: PathBuf,
     /// The `postgres:<major>-alpine` image to use for pg_dump helper pods.
     pub pg_image: String,
+    /// How long each helper pod keeps itself alive, and so the most any one
+    /// extraction may take: [`crate::helper_pod::helper_keep_alive`] of the
+    /// run's deadline. The scheduled runner passes its Job's
+    /// `activeDeadlineSeconds`; the CLI the same cluster setting, through
+    /// [`read_helper_keep_alive`].
+    pub helper_keep_alive: std::time::Duration,
     /// Staging / snapshotting behaviour.
     pub staging_mode: StagingMode,
     /// Fixed `--host` passed to every `restic backup` invocation for this run.
     ///
-    /// When `Some(h)`, restic groups snapshots under `h` so `restic forget`
-    /// retention policies apply across runs (spec §Retention M-r3-1a). Set to
-    /// `Some("apprafter-backup")` in the in-cluster runner (where the pod name
-    /// is ephemeral). Leave as `None` for the CLI local-pull path, which keeps
-    /// the machine's own hostname as the group (correct for a per-operator
-    /// station grouping).
+    /// The cluster's human name: `spec.backup.clusterName`, else
+    /// [`DEFAULT_BACKUP_HOST`] — what `backup list` shows in its CLUSTER
+    /// column. The in-cluster runner and `apprafter backup create` both pass
+    /// it, so one cluster's snapshots read as one cluster whoever took them.
+    /// `None` leaves restic to stamp the machine's hostname, which is never
+    /// a cluster's name: a pod's is ephemeral, and a workstation's names the
+    /// wrong thing.
     pub backup_host: Option<String>,
 }
+
+/// The restic `--host` of a cluster's backups when `spec.backup.clusterName`
+/// names nothing: the fixed host every cluster wrote before `clusterName`
+/// existed, which the chart also renders as the default. Shared by the
+/// in-cluster runner and `apprafter backup create`.
+pub const DEFAULT_BACKUP_HOST: &str = "apprafter-backup";
 
 // ---------------------------------------------------------------------------
 // Engine
@@ -441,6 +454,31 @@ pub fn read_platform_version(k: &dyn KubeExec) -> Result<String> {
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string())
+}
+
+/// The cluster's backup run deadline — `spec.backup.activeDeadlineSeconds`,
+/// six hours when unset ([`crate::helper_pod::run_deadline_of`]).
+///
+/// Crate-private on purpose: the CLI sized its helper pods with this once, and
+/// a deadline set for a frequent schedule then cut its restores short. What a
+/// caller outside wants is [`read_helper_keep_alive`]. The visibility is a
+/// hint, not the guard: [`crate::helper_pod::run_deadline_of`] is public, and
+/// a CLI path could still size its helpers with it. What catches that is the
+/// tests of the pod specs each interactive path builds under a ten-minute
+/// deadline (`backup create`, `export`, `restore` in `platform-cli`).
+pub(crate) fn read_run_deadline(k: &dyn KubeExec) -> Result<std::time::Duration> {
+    Ok(crate::helper_pod::run_deadline_of(
+        get_platformstack(k)?.as_ref(),
+    ))
+}
+
+/// How long the CLI's helper pods keep themselves alive (`backup create`,
+/// `export`, `restore`): [`crate::helper_pod::helper_keep_alive`] of the
+/// cluster's run deadline — never less than six hours, however short the
+/// schedule has made the deadline, because these commands have no Job
+/// deadline of their own and the keep-alive is their only limit.
+pub fn read_helper_keep_alive(k: &dyn KubeExec) -> Result<std::time::Duration> {
+    Ok(crate::helper_pod::helper_keep_alive(read_run_deadline(k)?))
 }
 
 /// The CNPG operand image of the first CNPG Cluster found, for major-matched
@@ -882,7 +920,7 @@ fn run_backup_monolithic_with_summary(
     // 1. Native data extraction — the WHOLE plan into <staging>/data.
     let claims = claims_in_namespaces(k, &opts.namespaces)?;
     let plan = plan_extraction(&claims);
-    run_extraction(k, &plan, &data_dir, &opts.pg_image)?;
+    run_extraction(k, &plan, &data_dir, &opts.pg_image, opts.helper_keep_alive)?;
 
     // 2-4. CRs + secrets + manifest, colocated in <staging>/data.
     let non_claim = capture_non_claim_artifacts(k, opts, &claims, &data_dir)?;
@@ -951,7 +989,13 @@ fn run_backup_sequential_with_summary(
         // Extract exactly THIS claim — reuses run_extraction (and thus the same
         // extract_pg / extract_volume) on a one-element slice, so the per-claim
         // path is byte-identical to the monolithic per-claim layout.
-        run_extraction(k, std::slice::from_ref(item), &claim_dir, &opts.pg_image)?;
+        run_extraction(
+            k,
+            std::slice::from_ref(item),
+            &claim_dir,
+            &opts.pg_image,
+            opts.helper_keep_alive,
+        )?;
 
         snapshot_id = r.run_backup(
             &restic_backup_argv(
@@ -1140,6 +1184,12 @@ mod tests {
             }
             Ok(Some("snap".into()))
         }
+        fn run_capture(&self, argv: &[String], passphrase: &str) -> Result<crate::ResticOutput> {
+            Ok(crate::ResticOutput {
+                stdout: self.run_stdout(argv, passphrase)?,
+                stderr: String::new(),
+            })
+        }
     }
 
     /// Extract the value that follows `--tag` in a recorded restic argv.
@@ -1174,6 +1224,8 @@ mod tests {
         errors: BTreeMap<String, String>,
         /// Every `get_json` args vector the engine issued, in order.
         calls: RefCell<Vec<Vec<String>>>,
+        /// Every helper pod spec the engine applied, in order.
+        applied: RefCell<Vec<Value>>,
     }
 
     impl FakeKube {
@@ -1193,6 +1245,7 @@ mod tests {
                 replies: BTreeMap::new(),
                 errors: BTreeMap::new(),
                 calls: RefCell::new(Vec::new()),
+                applied: RefCell::new(Vec::new()),
             }
         }
 
@@ -1217,7 +1270,8 @@ mod tests {
     }
 
     impl KubeExec for FakeKube {
-        fn apply_and_wait_pod_ready(&self, _spec: &Value) -> Result<()> {
+        fn apply_and_wait_pod_ready(&self, spec: &Value) -> Result<()> {
+            self.applied.borrow_mut().push(spec.clone());
             Ok(())
         }
 
@@ -1227,6 +1281,7 @@ mod tests {
             _ns: &str,
             _argv: &[&str],
             out: &Path,
+            _first_output_within: Option<std::time::Duration>,
         ) -> Result<()> {
             if let Some(parent) = out.parent() {
                 std::fs::create_dir_all(parent).unwrap();
@@ -1292,8 +1347,101 @@ mod tests {
             is_subset: false,
             staging_root,
             pg_image: "postgres:16-alpine".into(),
+            helper_keep_alive: crate::helper_pod::DEFAULT_RUN_DEADLINE,
             staging_mode: mode,
             backup_host: None,
+        }
+    }
+
+    #[test]
+    fn the_run_deadline_is_read_off_the_platformstack_and_defaults_to_six_hours() {
+        // How long the CLI's helper pods live: the same number the chart puts
+        // on the scheduled backup Job.
+        let ps_args = [
+            "get",
+            "platformstack",
+            "default",
+            "-n",
+            "apprafter-system",
+            "-o",
+            "json",
+        ];
+        let set = FakeKube::scripted().reply(
+            &ps_args,
+            json!({"spec": {"backup": {"activeDeadlineSeconds": 43200}}}),
+        );
+        assert_eq!(
+            read_run_deadline(&set).unwrap(),
+            std::time::Duration::from_secs(43200)
+        );
+        // No PlatformStack at all (a cluster restored into, before its
+        // platform is configured): the chart's default.
+        assert_eq!(
+            read_run_deadline(&FakeKube::scripted()).unwrap(),
+            crate::helper_pod::DEFAULT_RUN_DEADLINE
+        );
+    }
+
+    #[test]
+    fn the_clis_helpers_live_the_deadline_but_never_less_than_six_hours() {
+        let ps_args = [
+            "get",
+            "platformstack",
+            "default",
+            "-n",
+            "apprafter-system",
+            "-o",
+            "json",
+        ];
+        let deadline = |secs: u64| {
+            FakeKube::scripted().reply(
+                &ps_args,
+                json!({"spec": {"backup": {"activeDeadlineSeconds": secs}}}),
+            )
+        };
+        // A deadline set for a frequent schedule does not cut an interactive
+        // restore short…
+        assert_eq!(
+            read_helper_keep_alive(&deadline(600)).unwrap(),
+            std::time::Duration::from_secs(6 * 3600)
+        );
+        // …a raised one gives it more time…
+        assert_eq!(
+            read_helper_keep_alive(&deadline(43200)).unwrap(),
+            std::time::Duration::from_secs(43200)
+        );
+        // …and none at all is the six hours.
+        assert_eq!(
+            read_helper_keep_alive(&FakeKube::scripted()).unwrap(),
+            std::time::Duration::from_secs(6 * 3600)
+        );
+    }
+
+    /// The keep-alive a caller puts in the options is the one every helper
+    /// pod of the run carries, in both staging modes: the CLI reads it off
+    /// the cluster (never less than six hours), the runner off its Job's
+    /// deadline, and nothing in between may swap it for another number.
+    #[test]
+    fn every_helper_a_backup_applies_carries_the_keep_alive_it_was_given() {
+        for mode in [StagingMode::Monolithic, StagingMode::Sequential] {
+            let staging = tempfile::tempdir().unwrap();
+            let k = FakeKube::with_pg_claims(2);
+            let r = RecordingRestic::default();
+            let mut opts = opts_for(mode, staging.path().to_path_buf());
+            opts.helper_keep_alive = std::time::Duration::from_secs(43210);
+
+            run_backup(&k, &r, &opts).expect("backup");
+
+            let applied = k.applied.borrow();
+            assert_eq!(applied.len(), 2, "{applied:?}");
+            for spec in applied.iter() {
+                assert_eq!(
+                    spec["spec"]["containers"][0]["command"],
+                    json!(["sleep", "43210"]),
+                    "{}",
+                    spec["metadata"]["name"]
+                );
+            }
         }
     }
 
@@ -1451,6 +1599,7 @@ mod tests {
             replies,
             errors: BTreeMap::new(),
             calls: RefCell::new(Vec::new()),
+            applied: RefCell::new(Vec::new()),
         };
         assert_eq!(read_cluster_uid(&k).unwrap(), TEST_UID);
     }
@@ -1470,6 +1619,7 @@ mod tests {
             replies: BTreeMap::new(),
             errors,
             calls: RefCell::new(Vec::new()),
+            applied: RefCell::new(Vec::new()),
         };
         let e = read_cluster_uid(&k).expect_err("a 403 must not be swallowed");
         let msg = format!("{e}");
@@ -1484,6 +1634,7 @@ mod tests {
             replies: BTreeMap::new(),
             errors: BTreeMap::new(),
             calls: RefCell::new(Vec::new()),
+            applied: RefCell::new(Vec::new()),
         };
         // FakeKube reports absent (Ok(None)) for anything it has no reply for.
         assert!(read_cluster_uid(&k).is_err());
@@ -1498,6 +1649,7 @@ mod tests {
             replies,
             errors: BTreeMap::new(),
             calls: RefCell::new(Vec::new()),
+            applied: RefCell::new(Vec::new()),
         };
         assert!(read_cluster_uid(&k).is_err());
     }

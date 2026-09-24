@@ -119,6 +119,16 @@ pub struct BackupConfig {
     #[serde(default)]
     pub enabled: bool,
     pub schedule: String,
+    /// `activeDeadlineSeconds` of each scheduled backup Job. `None` on a CR
+    /// that does not set it, which the chart then fills with its own
+    /// six-hour default — optional rather than defaulted here, like
+    /// `checkReadDataSubset`, so the default lives in one place.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "activeDeadlineSeconds"
+    )]
+    pub active_deadline_seconds: Option<i64>,
     pub bucket: String,
     /// Human name this cluster's snapshots are listed under (the restic
     /// `--host`). `None` on a CR written before the field existed, which the
@@ -145,6 +155,14 @@ pub struct BackupConfig {
     pub retention: Option<RetentionConfig>,
     #[serde(rename = "checkSchedule")]
     pub check_schedule: String,
+    /// `activeDeadlineSeconds` of each weekly check Job; `None` = the chart's
+    /// six-hour default.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "checkActiveDeadlineSeconds"
+    )]
+    pub check_active_deadline_seconds: Option<i64>,
     /// IANA timezone for both schedules → `CronJob.spec.timeZone` (2.22g).
     /// Absent = the kube-controller-manager's zone, which is what every
     /// cluster did before this field and is the trap the field closes.
@@ -180,8 +198,9 @@ pub struct CredentialRef {
 }
 
 /// Snapshot retention policy. Absent → the platform-stack `backup`
-/// component's built-in defaults apply. `enforce` selects whether the
-/// operator or the in-cluster backup component prunes.
+/// component's built-in defaults apply. `enforce` selects who prunes: the
+/// weekly check Job (`check`), the backup Job (`cluster`), or nothing in the
+/// cluster (`operator`); absent, the chart's default (`check`).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct RetentionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "keepDaily")]
@@ -198,7 +217,26 @@ pub struct RetentionConfig {
         rename = "keepMonthly"
     )]
     pub keep_monthly: Option<i64>,
-    pub enforce: String,
+    /// `None` on a CR that does not set it — the chart then applies its own
+    /// default, `check` — rather than defaulted here, so the default lives
+    /// in one place and an explicit `operator` is never confused with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enforce: Option<String>,
+}
+
+/// The retention mode the platform chart applies when `spec.backup.retention`
+/// does not set one: `#BackupValues.retention.enforce` in
+/// `platform-stack/cue/platform.cue` (a test reads it from there).
+pub const DEFAULT_RETENTION_ENFORCE: &str = "check";
+
+/// Resolve the retention mode a backup config runs with: the one it sets, or
+/// [`DEFAULT_RETENTION_ENFORCE`].
+pub fn resolve_retention_enforce(backup: &BackupConfig) -> &str {
+    backup
+        .retention
+        .as_ref()
+        .and_then(|r| r.enforce.as_deref())
+        .unwrap_or(DEFAULT_RETENTION_ENFORCE)
 }
 
 /// A resource-name → quantity map (cpu/memory → "25m"/"32Mi"). Same shape as
@@ -297,10 +335,24 @@ pub struct PlatformStackValues {
 pub struct PlatformStackComponentOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin: Option<String>,
+    // `schema_with`, not the derived schema: schemars 1.x renders
+    // `serde_json::Value` as the boolean schema `true`, and the openapi3
+    // `ReplaceBoolSchemas` transform does not descend into
+    // `additionalProperties` — so under the `overrides` map this node stays a
+    // bare `true`, which kube-derive cannot read as a `JSONSchemaProps`, and
+    // `PlatformStack::crd()` panics (crdgen's assertion B is its only caller).
+    // `{"nullable": true}` is byte-for-byte what schemars 0.8 emitted here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "untyped_nullable")]
     pub values: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+}
+
+/// An untyped, nullable schema node — what schemars 0.8 derived for an
+/// `Option<serde_json::Value>`. See `PlatformStackComponentOverride.values`.
+fn untyped_nullable(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({ "nullable": true })
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -372,6 +424,21 @@ pub struct PlatformStackCondition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `PlatformStack::crd()` panicked under schemars 1.x ("valid
+    /// JSONSchemaProps from schemars schema: invalid type: boolean `true`")
+    /// because the untyped `overrides.*.values` node, nested under
+    /// `additionalProperties`, survived as the boolean schema `true`. crdgen's
+    /// assertion B is its only caller, so the panic would surface as a red
+    /// `crd-check` with no hint of the cause — pin the node here instead.
+    #[test]
+    fn the_derived_crd_builds_with_override_values_as_an_untyped_node() {
+        use kube::CustomResourceExt;
+        let crd = serde_json::to_value(PlatformStack::crd()).expect("derived CRD");
+        let values = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["overrides"]["additionalProperties"]["properties"]["values"];
+        assert_eq!(values, &serde_json::json!({ "nullable": true }));
+    }
 
     #[test]
     fn default_environment_round_trips_camel_case() {
@@ -502,7 +569,8 @@ mod tests {
         assert_eq!(r.keep_daily, Some(7));
         assert_eq!(r.keep_weekly, Some(4));
         assert_eq!(r.keep_monthly, Some(6));
-        assert_eq!(r.enforce, "cluster");
+        assert_eq!(r.enforce.as_deref(), Some("cluster"));
+        assert_eq!(resolve_retention_enforce(b), "cluster");
         assert_eq!(b.check_schedule, "0 6 * * 0");
         assert!(b.check_read_data);
         assert_eq!(
@@ -563,6 +631,59 @@ mod tests {
         assert!(v.pointer("/backup/stagingSizeLimit").is_none());
         assert!(v.pointer("/backup/retention").is_none());
         assert!(v.pointer("/backup/failureWebhook").is_none());
+    }
+
+    /// The upgrade rule of WI-389: a CR that never chose a retention mode
+    /// gets the chart's default (`check`), and one that chose `operator`
+    /// keeps it. An absent `enforce` must therefore reach the chart as
+    /// absent — serialized as `null` or as a default here, it would either
+    /// break the chart's `default` or pin every cluster to one mode.
+    #[test]
+    fn an_unset_retention_mode_stays_unset_and_an_explicit_one_is_kept() {
+        let with = |retention: serde_json::Value| -> BackupConfig {
+            serde_json::from_value(serde_json::json!({
+                "enabled": true, "schedule": "0 3 * * *", "bucket": "s3:x",
+                "credentialRef": {"name": "c"}, "stagingMode": "monolithic",
+                "checkSchedule": "0 6 * * 0", "checkReadData": false,
+                "retention": retention,
+            }))
+            .unwrap()
+        };
+        let only_a_count = with(serde_json::json!({"keepDaily": 5}));
+        assert_eq!(only_a_count.retention.as_ref().unwrap().enforce, None);
+        assert_eq!(resolve_retention_enforce(&only_a_count), "check");
+        let v = serde_json::to_value(&only_a_count).unwrap();
+        assert_eq!(v["retention"], serde_json::json!({"keepDaily": 5}));
+
+        let explicit = with(serde_json::json!({"enforce": "operator"}));
+        assert_eq!(resolve_retention_enforce(&explicit), "operator");
+        let v = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(v["retention"], serde_json::json!({"enforce": "operator"}));
+
+        let mut none = only_a_count.clone();
+        none.retention = None;
+        assert_eq!(resolve_retention_enforce(&none), "check");
+    }
+
+    /// The default here is the chart's: `#BackupValues.retention.enforce`.
+    /// Two literals in two languages; this keeps them one value.
+    #[test]
+    fn the_default_retention_mode_is_the_charts() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../platform-stack/cue/platform.cue");
+        let cue =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let line = cue
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("enforce:"))
+            .unwrap_or_else(|| panic!("no `enforce:` in {}", path.display()));
+        let default = line
+            .split('*')
+            .nth(1)
+            .and_then(|d| d.split('"').nth(1))
+            .unwrap_or_else(|| panic!("no `*\"…\"` default in `{line}`"));
+        assert_eq!(default, DEFAULT_RETENTION_ENFORCE, "{line}");
     }
 
     #[test]

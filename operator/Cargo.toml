@@ -18,15 +18,22 @@ members = [
 [workspace.package]
 version      = "0.1.2"
 edition      = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
+# Never published to crates.io: these crates are a product, not a library,
+# and nothing in .github/workflows runs `cargo publish`. Declaring it makes
+# that explicit rather than merely true by omission, stops an accidental
+# publish, and is what lets cargo-deny treat them as private — without it
+# the licence check reads `FSL-1.1-Apache-2.0` (a real licence, but not an
+# SPDX identifier) as "unlicensed" on our own code.
+publish      = false
 license      = "FSL-1.1-Apache-2.0"
 authors      = ["AppRafter Authors"]
 repository   = "https://github.com/apprafter/apprafter"
 
 [workspace.dependencies]
-axum               = "0.7"
+axum               = "0.8"
 tokio              = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
-axum-server        = { version = "0.7", features = ["tls-rustls"] }
+axum-server        = { version = "0.8", features = ["tls-rustls"] }
 tower              = { version = "0.5", features = ["util"] }
 http               = "1"
 http-body-util     = "0.1"
@@ -34,31 +41,46 @@ serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-thiserror          = "1"
+thiserror          = "2"
 # `jsonpatch` exposes `Patch::Json` (RFC 6902). The shared-backend reaper
 # needs it to remove ONE `ownerReferences` entry from a CNPG PVC under a
 # `test` precondition (ADR 0042 §9.3) — a merge-patch would replace the
 # whole array and silently discard a concurrent co-owner. The feature adds
 # no compilation: `json-patch` is already an unconditional dependency of
 # kube-runtime, so this only makes the enum variant visible.
-kube               = { version = "0.95", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "jsonpatch"] }
-json-patch         = "2"
-k8s-openapi        = { version = "0.23", default-features = false, features = ["v1_31"] }
-schemars           = "0.8"
+#
+# `aws-lc-rs` names the rustls crypto provider: since kube 0.99 `rustls-tls`
+# no longer brings `ring` along, and with this feature kube-client installs
+# aws-lc-rs as the process default when nothing has yet. aws-lc-rs because
+# the operator, the webhook and the sourcecredential probes already install
+# `rustls::crypto::aws_lc_rs::default_provider()` explicitly (see
+# `install_rustls_crypto_provider`) and aws-lc-rs is already in the build.
+# async-nats (the provisioner's JetStream client) still compiles `ring` into
+# rustls as well, and with two providers rustls picks neither on its own —
+# which is why that explicit install stays load-bearing.
+#
+# k8s-openapi `v1_36` matches the Kubernetes production runs (1.36.x);
+# 0.28 carries v1_32..v1_36 only, and kube 4.x requires ^0.28. It swaps
+# chrono for jiff in `metav1::Time`/`MicroTime` — `operator_core::k8s_time`
+# is the one place that converts, and pins the wire format.
+kube               = { version = "4.2.0", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "aws-lc-rs", "jsonpatch"] }
+json-patch         = "4"
+k8s-openapi        = { version = "0.28.0", default-features = false, features = ["v1_36"] }
+schemars           = "1"
 futures            = "0.3"
-prometheus         = { version = "0.13", default-features = false }
+prometheus         = { version = "0.14", default-features = false }
 chrono             = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-base64             = "0.22"
-oci-distribution   = { version = "0.11", default-features = false, features = ["rustls-tls"] }
-reqwest            = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+base64             = "0.23"
+oci-client         = { version = "0.18", default-features = false, features = ["rustls-tls"] }
+reqwest            = { version = "0.13", default-features = false, features = ["rustls"] }
 semver             = { version = "1", features = ["serde"] }
 serde_yaml         = "0.9"
 async-trait        = "0.1"
 flate2             = "1.0"
 tar                = "0.4"
-rand               = "0.8"
+rand               = "0.9"
 anyhow             = "1"
-sha2               = "0.10"
+sha2               = "0.11"
 
 [profile.release]
 lto           = "thin"

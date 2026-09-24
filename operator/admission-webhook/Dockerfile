@@ -28,12 +28,21 @@
 # registry fully qualified to avoid podman's short-name prompt
 # — see `operator/apprafter-operator/Dockerfile` for full
 # rationale.
-FROM docker.io/library/rust:1.88-alpine3.21 AS chef
-ARG CARGO_CHEF_VERSION=0.1.71
-RUN apk add --no-cache musl-dev curl tar \
+FROM docker.io/library/rust:1.98-alpine3.24 AS chef
+# Build with the image's own compiler or fail, never with one rustup
+# downloads on the fly — see `operator/apprafter-operator/Dockerfile`.
+ENV RUSTUP_AUTO_INSTALL=0
+ARG CARGO_CHEF_VERSION=0.1.78
+# cargo-chef switched its release tooling to cargo-dist at 0.1.75, which
+# changed BOTH the asset name (.tar.gz -> .tar.xz) and the archive layout
+# (the binary is now nested in a per-target directory). Hence the `xz`
+# package and `--strip-components=1`; without either, the build fails at
+# image-build time rather than anywhere a test would see it.
+RUN apk add --no-cache musl-dev curl tar xz \
  && curl --proto '=https' --tlsv1.2 -fsSL \
-      "https://github.com/LukeMathWalker/cargo-chef/releases/download/v${CARGO_CHEF_VERSION}/cargo-chef-x86_64-unknown-linux-musl.tar.gz" \
-    | tar -xz -C /usr/local/bin/ cargo-chef \
+      "https://github.com/LukeMathWalker/cargo-chef/releases/download/v${CARGO_CHEF_VERSION}/cargo-chef-x86_64-unknown-linux-musl.tar.xz" \
+    | tar -xJ --strip-components=1 -C /usr/local/bin/ \
+        cargo-chef-x86_64-unknown-linux-musl/cargo-chef \
  && chmod +x /usr/local/bin/cargo-chef
 WORKDIR /workspace
 
@@ -41,13 +50,16 @@ FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
+# `--locked` on both cargo steps, for the reason given in
+# `operator/apprafter-operator/Dockerfile`: the image builds exactly what
+# operator/Cargo.lock says, or fails at the cook step.
 FROM chef AS builder
 COPY --from=planner /workspace/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json \
+RUN cargo chef cook --release --locked --recipe-path recipe.json \
         --target x86_64-unknown-linux-musl \
         --bin admission-webhook
 COPY . .
-RUN cargo build --release --bin admission-webhook \
+RUN cargo build --release --locked --bin admission-webhook \
         --target x86_64-unknown-linux-musl
 
 FROM gcr.io/distroless/static-debian12:nonroot

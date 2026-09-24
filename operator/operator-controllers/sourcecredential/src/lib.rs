@@ -2996,9 +2996,7 @@ mod tests {
         });
 
         let mut cred = live_cred();
-        cred.metadata.deletion_timestamp = Some(
-            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Utc::now()),
-        );
+        cred.metadata.deletion_timestamp = Some(operator_core::k8s_time::time(Utc::now()));
         cred.metadata.finalizers = Some(vec![DERIVED_SECRETS_FINALIZER.to_string()]);
 
         let action = reconcile(Arc::new(cred), context(client))
@@ -3065,9 +3063,7 @@ mod tests {
         });
 
         let mut cred = live_cred();
-        cred.metadata.deletion_timestamp = Some(
-            k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(Utc::now()),
-        );
+        cred.metadata.deletion_timestamp = Some(operator_core::k8s_time::time(Utc::now()));
         cred.metadata.finalizers = Some(vec![DERIVED_SECRETS_FINALIZER.to_string()]);
 
         let err = reconcile(Arc::new(cred), context(client))

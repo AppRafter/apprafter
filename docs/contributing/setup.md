@@ -29,7 +29,7 @@ You get Rust + Bun + CUE + kubectl + k9s + helm + argocd + talosctl
 If you use VS Code, install the **Dev Containers** extension, open
 the repo, and pick "Reopen in Container". The container layout lives
 in `.devcontainer/devcontainer.json` and the post-create script
-fetches the rest (CUE, k3d, just, lefthook, cosign).
+fetches the rest (CUE, k3d, Bun, just, lefthook, cosign).
 
 ## Path C — Manual install
 

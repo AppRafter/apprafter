@@ -1804,8 +1804,17 @@ pub enum BackupAction {
     /// Keys: enabled <true|false>, at <HH:MM>, check <HH:MM|off>,
     /// check-depth <structure|10%|full>, cluster-name <name>, timezone
     /// <IANA>, keep-daily <n>, keep-weekly <n>, keep-monthly <n>,
-    /// enforce <operator|cluster>, staging-mode
-    /// <monolithic|sequential>, failure-webhook <url>.
+    /// enforce <check|cluster|operator>, staging-mode
+    /// <monolithic|sequential>, failure-webhook <url>, deadline
+    /// <duration>, check-deadline <duration>.
+    ///
+    /// `deadline` and `check-deadline` are how long one backup or check
+    /// Job may run before Kubernetes stops it (default 6h, minimum 10m):
+    /// `12h`, `90m`, `43200s`. Keep each shorter than the interval between
+    /// two runs of its schedule and longer than its slowest good run. The
+    /// check locks the repository exclusively, so also keep the backup's
+    /// below the gap from a backup to the next check (3h by default) and
+    /// the check's below the gap from the check to the next backup (21h).
     ///
     /// `enabled` is the switch on its own, and it is how a configured
     /// but switched-off schedule comes back: after `backup disable`, or
@@ -1823,13 +1832,20 @@ pub enum BackupAction {
     /// next window. Instantiates the platform's backup CronJob as a
     /// one-off Job, so it uses the cluster's own credentials — useful
     /// before an upgrade, and to prove a freshly enabled schedule works.
+    ///
+    /// If no node has room for the Job's pod for two minutes, the command
+    /// deletes the Job, prints the scheduler's reason and exits non-zero.
+    /// That backup cannot start, and the scheduled one asks for the same
+    /// room. `apprafter top` shows how much of each node is requested.
     Run {
         /// Return as soon as the Job is created instead of waiting for
         /// it to finish. The Job runs either way.
         #[arg(long, default_value_t = false)]
         no_wait: bool,
         /// How long to wait for the Job before handing back control, in
-        /// minutes. A timeout does not cancel the backup.
+        /// minutes. A timeout does not cancel the backup. It exits non-zero
+        /// when an attempt of the Job has failed by then, with that
+        /// attempt's reason.
         #[arg(long, default_value_t = crate::commands::backup::DEFAULT_BACKUP_JOB_TIMEOUT_MINUTES)]
         timeout: u64,
     },
@@ -1837,12 +1853,18 @@ pub enum BackupAction {
     /// according to the configured retention policy. Run OUTSIDE the
     /// cluster with the operator's full S3 credentials.
     ///
+    /// A key that may not delete — the cluster's own, when it is scoped
+    /// as recommended — deletes nothing: the command stops at the first
+    /// refused delete and exits non-zero, naming `--credential-file`.
+    ///
     /// A prune forgets by explicit snapshot id and one repository can
     /// hold several clusters' runs, so it must know whose snapshots it
     /// may forget. Normally that is the cluster's own `kube-system`
     /// namespace UID, read from the kubeconfig. When the cluster is gone
     /// and only the repository is left, `--cluster-uid <uid>` names the
-    /// identity explicitly and the command runs with no cluster at all.
+    /// identity and `--timezone <zone>` the zone its schedules ran in; with
+    /// those, `--repo`, the three `--keep-*` and a credential file, the
+    /// command runs with no cluster at all.
     Prune {
         /// S3 restic repository URL (e.g. `s3:s3.amazonaws.com/my-bucket/prefix`).
         /// Defaults to `PlatformStack.spec.backup.bucket`.
@@ -1876,11 +1898,24 @@ pub enum BackupAction {
         /// before anything is forgotten: a UID that has never written
         /// here is refused, naming the ones that have.
         ///
-        /// With `--repo` and all three `--keep-*` flags this makes the
-        /// command need no cluster at all. Nothing is stamped on
-        /// `PlatformStack` in that case — there is no CR to stamp.
+        /// With `--repo`, all three `--keep-*` flags and `--timezone`,
+        /// this makes the command need no cluster at all. Nothing is
+        /// stamped on `PlatformStack` in that case — there is no CR to
+        /// stamp.
         #[arg(long = "cluster-uid")]
         cluster_uid: Option<String>,
+        /// IANA zone the keep counts' days, weeks and months are counted
+        /// in (`Europe/Berlin`, `UTC`). Defaults to the cluster's
+        /// `spec.backup.timeZone`, the zone its schedules and its own
+        /// prune use; with no cluster to read it from, the command refuses
+        /// rather than assume one.
+        ///
+        /// Name the zone the cluster's schedules ran in, or `UTC` if it
+        /// named none. Counted in another zone, this prune keeps different
+        /// runs than the cluster's own, and between them the two forget
+        /// runs each would keep.
+        #[arg(long, value_name = "zone")]
+        timezone: Option<String>,
     },
     /// Verify the structural integrity of an S3-backed restic repository
     /// (`restic check`). Run OUTSIDE the cluster with the operator's full
@@ -1975,15 +2010,15 @@ pub enum BackupAction {
         #[arg(long, value_name = "time")]
         at: Option<String>,
         /// IANA timezone the schedules run in (`Europe/Berlin`,
-        /// `UTC`), written to the CronJob's `spec.timeZone`. Defaults
+        /// `UTC`), written to the CronJob's `spec.timeZone`; the keep
+        /// counts' days, weeks and months are this zone's too. Defaults
         /// to this machine's zone; if that cannot be determined the
         /// command refuses rather than assume UTC.
         #[arg(long, value_name = "zone")]
         timezone: Option<String>,
         /// How many daily snapshots `restic forget` keeps. Default 7.
-        /// Retention is only APPLIED when `--enforce cluster` is set
-        /// or you run `apprafter backup prune`; under the default
-        /// `--enforce operator` the scheduled Job never forgets.
+        /// Applied by whatever `--enforce` names: the weekly check Job
+        /// (the default), the backup Job, or `apprafter backup prune`.
         #[arg(long, value_name = "count")]
         keep_daily: Option<u32>,
         /// How many weekly snapshots `restic forget` keeps. Default 4.
@@ -1994,8 +2029,13 @@ pub enum BackupAction {
         /// 6. Applied under the same rule as `--keep-daily`.
         #[arg(long, value_name = "count")]
         keep_monthly: Option<u32>,
-        /// `operator` (default, cluster gets scoped creds) or `cluster` (in-cluster prune).
-        #[arg(long)]
+        /// Who prunes. `check` (default): the weekly check Job, after a
+        /// check that passed, as far as the cluster's key may delete — a
+        /// scoped key deletes nothing, and `backup status` says so.
+        /// `cluster`: the backup Job, after every backup (needs a key that
+        /// may delete). `operator`: nothing in the cluster; you run
+        /// `apprafter backup prune`.
+        #[arg(long, value_name = "check|cluster|operator")]
         enforce: Option<String>,
         /// `monolithic` (default) or `sequential`.
         #[arg(long)]
@@ -2003,8 +2043,10 @@ pub enum BackupAction {
         /// The weekly repository-integrity check: `off` to disable it,
         /// or `HH:MM` for its Sunday run time. Default: three hours
         /// after `--at`, so it never starts in the same minute as a
-        /// backup. The check is metadata-only; it does not re-download
-        /// the data.
+        /// backup. Besides the repository's structure, the check
+        /// re-downloads and verifies a random 10% of the data each week;
+        /// `apprafter backup set check-depth` changes that (`structure`
+        /// reads no data, `full` reads all of it).
         #[arg(long, value_name = "off|time")]
         check: Option<String>,
         /// URL the runner POSTs a JSON failure report to when a
@@ -2035,6 +2077,43 @@ pub enum BackupAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `backup enable --check` says how much of the data the weekly check
+    /// reads, and it is the platform chart's own default. The help used to
+    /// call the check "metadata-only; it does not re-download the data" for
+    /// a check that reads a random tenth of it every week.
+    #[test]
+    fn backup_enable_check_help_states_the_charts_default_depth() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let enable = cmd
+            .find_subcommand("backup")
+            .and_then(|b| b.find_subcommand("enable"))
+            .expect("`backup enable` is a subcommand");
+        let help = enable
+            .get_arguments()
+            .find(|a| a.get_id() == "check")
+            .and_then(|a| a.get_long_help().or_else(|| a.get_help()))
+            .map(|h| h.to_string())
+            .expect("`--check` has help");
+        let cue = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../platform-stack/cue/platform.cue"),
+        )
+        .expect("platform.cue");
+        let default = cue
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("checkReadDataSubset: string | *\""))
+            .and_then(|rest| rest.split_once('"'))
+            .map(|(d, _)| d.to_string())
+            .expect("the chart declares checkReadDataSubset's default");
+        assert!(
+            help.contains(&format!("{default} of")),
+            "the help must state the default depth, {default}: {help}"
+        );
+        assert!(!help.contains("metadata-only"), "{help}");
+        assert!(help.contains("check-depth"), "and how to change it: {help}");
+    }
 
     #[test]
     fn parses_target_cert_import() {

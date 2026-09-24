@@ -27,6 +27,8 @@
 # Usage: check-cli-version-bump.sh [remote]   (default: origin)
 
 set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=lib/published-tag.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/published-tag.sh"
 
 MANIFEST="cli/Cargo.toml"
 REMOTE="${1:-origin}"
@@ -51,24 +53,31 @@ tag="v${version}"
 #     CLI version bump that would ship an identical binary under a new number.
 paths=(cli ":(exclude)cli/**/*.md" ":(exclude)cli/docsgen/**")
 
-if ! git ls-remote --tags --exit-code "$REMOTE" "refs/tags/${tag}" >/dev/null 2>&1; then
-    echo "OK: ${tag} not yet on ${REMOTE} — version bump is in flight."
-    exit 0
-fi
-
-if ! git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
-    git fetch --quiet "$REMOTE" "refs/tags/${tag}:refs/tags/${tag}" 2>/dev/null || {
-        echo "::warning::could not fetch ${tag} for the diff — skipping the check." >&2
+# Published, in flight, or undecided — see scripts/lib/published-tag.sh for
+# why "the remote could not be asked" is no longer read as "in flight".
+resolve_published_tag "$REMOTE" "v" "$version"
+case "$TAG_STATE" in
+    undecided) version_guard_undecided "$TAG_WHY" || exit 1; exit 0 ;;
+    in-flight)
+        echo "OK: ${tag} not yet on ${REMOTE} — version bump is in flight."
         exit 0
-    }
-fi
+        ;;
+esac
 
-if git diff --quiet "refs/tags/${tag}..HEAD" -- "${paths[@]}"; then
+if # Compare the tag against the INDEX, not HEAD. As a pre-commit hook this runs
+# BEFORE the commit exists, so a `tag..HEAD` diff cannot see the very change
+# being committed — the guard passes, and only fires on the NEXT commit, by
+# which point the incomplete one has already landed. (Found 2026-09-22: an
+# `argocd-cue-cmp/Dockerfile` edit committed with no `version.cue` bump, waved
+# through by this hook and caught afterwards by `just lint`.) `--cached`
+# compares the tag to the index, which in CI equals HEAD and at pre-commit time
+# is exactly the tree about to become the commit.
+git diff --cached --quiet "refs/tags/${tag}" -- "${paths[@]}"; then
     echo "OK: no CLI source change since ${tag}."
     exit 0
 fi
 
-changed="$(git diff --name-only "refs/tags/${tag}..HEAD" -- "${paths[@]}" | head -20)"
+changed="$(git diff --cached --name-only "refs/tags/${tag}" -- "${paths[@]}" | head -20)"
 cat >&2 <<EOF
 ::error::CLI source changed since ${tag} was PUBLISHED, but cli/Cargo.toml still
 reads ${version}. release-cli.yml builds from the tag, so this change ships

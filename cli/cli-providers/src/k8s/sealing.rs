@@ -48,8 +48,8 @@ pub fn public_key_from_cert_pem(pem: &str) -> Result<RsaPublicKey> {
     let cert = Certificate::from_pem(pem.as_bytes())
         .map_err(|e| CliError::Other(format!("parse controller cert pem: {e}")))?;
     let spki_der = cert
-        .tbs_certificate
-        .subject_public_key_info
+        .tbs_certificate()
+        .subject_public_key_info()
         .to_der()
         .map_err(|e| CliError::Other(format!("encode subjectPublicKeyInfo: {e}")))?;
     RsaPublicKey::from_public_key_der(&spki_der)
@@ -110,8 +110,8 @@ mod tests {
         let session_key = priv_key.decrypt(padding, rsa_block).expect("rsa decrypt");
 
         let cipher = Aes256Gcm::new_from_slice(&session_key).unwrap();
-        let nonce = Nonce::from_slice(&[0u8; 12]);
-        cipher.decrypt(nonce, gcm_ciphertext).expect("aes decrypt")
+        let nonce = Nonce::from([0u8; 12]);
+        cipher.decrypt(&nonce, gcm_ciphertext).expect("aes decrypt")
     }
 
     #[test]

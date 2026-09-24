@@ -43,9 +43,18 @@ on:
       - 'argocd-cue-cmp/version.cue'
       - 'operator/charts/*/Chart.yaml'
       - 'scripts/check-version-coherence.sh'
+      # Sourced by check-version-coherence.sh and the drift step below.
+      - 'scripts/lib/published-tag.sh'
       - 'scripts/check-platform-stack-version.sh'
       - 'scripts/check-gateway-render.sh'
       - 'scripts/check-component-enablement.sh'
+      - 'scripts/check-component-claim-templates.sh'
+      - 'scripts/check-backup-render.sh'
+      # check-backup-render.sh also reads the runner's source: the default
+      # deadline, and the name of every variable the CronJobs render, which
+      # the runner must read. A rename on the runner's side alone breaks it.
+      - 'cli/apprafter-backup/src/**'
+      - 'cli/backup-core/src/helper_pod.rs'
       - '.github/workflows/platform-stack-check.yml'
       - '.github/workflows/platform-stack-publish.yml'
   push:
@@ -55,9 +64,14 @@ on:
       - 'argocd-cue-cmp/version.cue'
       - 'operator/charts/*/Chart.yaml'
       - 'scripts/check-version-coherence.sh'
+      - 'scripts/lib/published-tag.sh'
       - 'scripts/check-platform-stack-version.sh'
       - 'scripts/check-gateway-render.sh'
       - 'scripts/check-component-enablement.sh'
+      - 'scripts/check-component-claim-templates.sh'
+      - 'scripts/check-backup-render.sh'
+      - 'cli/apprafter-backup/src/**'
+      - 'cli/backup-core/src/helper_pod.rs'
       - '.github/workflows/platform-stack-check.yml'
       - '.github/workflows/platform-stack-publish.yml'
 
@@ -71,7 +85,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history + tags so the drift check can diff
           # HEAD against `platform-stack/v<currentVersion>`
@@ -79,14 +93,14 @@ jobs:
           fetch-depth: 0
 
       - name: Install CUE
-        uses: cue-lang/setup-cue@v1.0.1
+        uses: cue-lang/setup-cue@b0e30e540a2dae47304ebf16586a5b2db023b61c # v2.0.0
         with:
-          version: v0.10.0
+          version: v0.17.1
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
-          version: v3.16.2
+          version: v4.3.0
 
       - name: cue fmt --check
         run: cue fmt --check ./platform-stack/cue/...
@@ -186,6 +200,33 @@ jobs:
         # override the running system writes, so none of them saw it.
         run: bash scripts/check-component-enablement.sh
 
+      - name: Install yq
+        # The claim-template step below reads rendered charts with yq; the
+        # runner has no nix for the script's own fallback.
+        run: |
+          sudo curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 \
+            -o /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/download/v4.53.6/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Component volumeClaimTemplate shape (Argo CD can reach Synced)
+        # A StatefulSet volumeClaimTemplate rendered without the four fields
+        # the apiserver adds keeps its Application OutOfSync forever under
+        # server-side apply. The nats chart rendered none of them, so every
+        # jetstream cluster re-synced nats every ~3 minutes. This renders each
+        # component's own chart, which no other step here does, so it needs
+        # the network.
+        run: bash scripts/check-component-claim-templates.sh
+
+      - name: Backup CronJob deadline assertions (a stuck run cannot block the schedule)
+        # Both backup CronJobs are concurrencyPolicy: Forbid, so one run that
+        # never ends suppresses every later one without anything failing.
+        # jobTemplate.spec.activeDeadlineSeconds is the bound. The smoke render
+        # above uses default values, where backup is off and neither CronJob
+        # exists, so only this step sees the field.
+        run: bash scripts/check-backup-render.sh
+
       - name: Gateway render assertions (1.83a public ingress)
         # Pins the host-network public-ingress contract: the platform
         # Gateway + platform-http-redirect HTTPRoute are emitted ONLY
@@ -216,10 +257,21 @@ jobs:
           # next publish workflow run will tag it. Source
           # changes here are part of preparing the bump. No
           # drift to check.
-          if ! git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
-            echo "::notice::${TAG} not on origin yet — currentVersion is in-flight, drift check no-op."
-            exit 0
-          fi
+          #
+          # scripts/lib/published-tag.sh tells that apart from
+          # origin being unreachable or listing no platform-stack
+          # tag at all, which this step used to read as "in
+          # flight" too — and passed without comparing anything.
+          # Those now fail the job (GITHUB_ACTIONS=true).
+          . scripts/lib/published-tag.sh
+          resolve_published_tag origin "platform-stack/v" "$VERSION"
+          case "$TAG_STATE" in
+            undecided) version_guard_undecided "$TAG_WHY" || exit 1; exit 0 ;;
+            in-flight)
+              echo "::notice::${TAG} not on origin yet — currentVersion is in-flight, drift check no-op."
+              exit 0
+              ;;
+          esac
           # Tag exists on origin → currentVersion is already
           # published. Any change to chart-source files vs the
           # published tag is drift.

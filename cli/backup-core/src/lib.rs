@@ -21,6 +21,7 @@ pub mod sealing;
 
 pub use engine::StagingMode;
 pub use kube::KubeExec;
+pub use restic_runner::ResticOutput;
 pub use restic_runner::ResticRunner;
 pub use restic_runner::SubprocessRestic;
 

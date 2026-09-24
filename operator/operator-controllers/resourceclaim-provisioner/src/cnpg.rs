@@ -11,6 +11,42 @@ use serde_json::{json, Value};
 /// Max length of a Postgres identifier (`NAMEDATALEN - 1` = 63 bytes).
 const PG_IDENT_MAX: usize = 63;
 
+/// The Postgres OPERAND image every provisioner-created CNPG `Cluster` runs,
+/// emitted as `spec.imageName` by [`cluster_object`].
+///
+/// Pinned because customer data must not follow a chart default. Left unset,
+/// CNPG fills `spec.imageName` from the image its operator compiles in, so a
+/// `cloudnative-pg` chart bump silently changes the Postgres build that NEW
+/// clusters get (a fresh install, a recreated `platform-postgres`) while
+/// existing ones keep theirs. Chart 0.29.0 (operator 1.30.0) moves that
+/// default from 18.3 to 18.4.
+///
+/// The value is exactly the default of operator 1.29.1, which ships in chart
+/// 0.28.2, the only version `component_cloudnative-pg.cue` has ever pinned
+/// (`pkg/versions/versions.go` at tag v1.29.1: `DefaultImageName =
+/// "ghcr.io/cloudnative-pg/postgresql:18.3-system-trixie"`). CNPG's mutating
+/// webhook already stored that string in `spec.imageName` when each existing
+/// cluster was created, so emitting it changes no value, bumps no generation
+/// and restarts no instance. CNPG rolls a pod only when the requested image
+/// differs from `status.pgDataImageInfo.image` (`reconcileImage`) and the
+/// pod's image differs from `status.image` (`checkPodImageIsOutdated`).
+/// Measured on kind with operator 1.29.1 on 2026-09-22: same pod UID and
+/// same `pg_postmaster_start_time()` after the apply.
+///
+/// **Changing this value is a deliberate Postgres minor upgrade.** CNPG rolls
+/// every instance of every provisioner-created Cluster ("the instance is using
+/// a different image"), which is downtime on a single-instance cluster. Do it
+/// on purpose, in its own release, with a compatibility note. A chart bump
+/// with this value unchanged still rolls each instance ONCE, to upgrade the
+/// instance manager (the bootstrap image), but the Postgres build stays put.
+///
+/// **Never delete it from the apply body.** Once this field manager owns
+/// `spec.imageName`, an apply that omits it prunes the field, and CNPG's
+/// webhook re-defaults it IN THE SAME REQUEST to whatever the running operator
+/// compiles in. That is an unplanned minor upgrade (measured: 18.3 to 18.4
+/// under operator 1.30.0).
+pub const CNPG_OPERAND_IMAGE: &str = "ghcr.io/cloudnative-pg/postgresql:18.3-system-trixie";
+
 /// Derive a deterministic, valid Postgres identifier for a claim's role
 /// and database from its `(namespace, name)`.
 ///
@@ -172,6 +208,9 @@ pub fn cluster_object(
         },
         "spec": {
             "instances": instances,
+            // The operand image, pinned. See `CNPG_OPERAND_IMAGE` for why,
+            // and why this line must never be deleted.
+            "imageName": CNPG_OPERAND_IMAGE,
             "storage": {
                 "size": storage,
             },
@@ -512,6 +551,37 @@ mod tests {
         );
         // ephemeral-storage present on requests+limits
         assert_eq!(v["spec"]["resources"]["limits"]["ephemeral-storage"], "1Gi");
+    }
+
+    #[test]
+    fn cluster_object_pins_the_operand_image() {
+        // Customer data must not follow a chart default. Without the pin, a
+        // CNPG chart bump changes the Postgres build of every Cluster created
+        // after it.
+        let c = cluster_object(
+            "platform-postgres",
+            "cnpg-system",
+            1,
+            "10Gi",
+            &BackendResources::cnpg_t1(),
+        );
+        assert_eq!(c["spec"]["imageName"], CNPG_OPERAND_IMAGE);
+        // `imageName` and `imageCatalogRef` are two answers to one question,
+        // and a catalog would put the choice back outside this constant.
+        assert!(
+            c["spec"].get("imageCatalogRef").is_none(),
+            "the operand image must come from the pinned imageName alone: {}",
+            c["spec"]
+        );
+        // The tripwire. This string is what CNPG 1.29.1 (chart 0.28.2) stored
+        // in every existing Cluster, so it is the only value that restarts
+        // nothing on upgrade. Moving it is a Postgres minor upgrade that rolls
+        // every instance, so it must be a decision and never a side effect.
+        assert_eq!(
+            CNPG_OPERAND_IMAGE, "ghcr.io/cloudnative-pg/postgresql:18.3-system-trixie",
+            "moving the operand image rolls every Postgres instance; if that is \
+             intended, update this assertion and the compatibility note together"
+        );
     }
 
     #[test]

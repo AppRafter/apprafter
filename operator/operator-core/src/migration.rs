@@ -135,7 +135,20 @@ pub fn change_hash(changes: &[DestructiveChange]) -> String {
     let array = serde_json::Value::Array(items);
     // Serialising a `Value` never fails.
     let canonical = serde_json::to_string(&array).expect("serialising a JSON array cannot fail");
-    format!("{:x}", Sha256::digest(canonical.as_bytes()))
+    // Hex by hand rather than `format!("{:x}", …)`: sha2 0.11 moved to
+    // hybrid-array, whose `Array` does not implement `LowerHex`. The BYTES are
+    // unchanged — this is still SHA-256 of the same canonical JSON — and the
+    // rendering stays lowercase, unseparated, 64 chars, because this string is
+    // the ADR 0052 approval content hash that a human compares by eye and that
+    // migration_state matches a completed plan against.
+    let digest = Sha256::digest(canonical.as_bytes());
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        // Writing to a String is infallible.
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Per-scope behaviour shared between application + platform
@@ -167,6 +180,61 @@ pub trait MigrationStrategy: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::classification_severity;
+
+    // ---- change_hash: the ADR 0052 approval content hash ----
+    //
+    // Added during the 2026-09 sha2 0.10 -> 0.11 bump. sha2 0.11 dropped
+    // `LowerHex` on the digest output, so the hex rendering had to be
+    // rewritten by hand — and NOTHING pinned this value, even though a change
+    // to it silently invalidates every in-flight approval: migration_state
+    // matches a completed plan against the hash a human approved
+    // (`completed_plan_consumes_only_on_matching_content_hash`).
+    //
+    // The expected literal is NOT whatever this code happens to emit. It was
+    // computed independently, outside Rust:
+    //
+    //   printf '%s' '[["selector-change","needs.pg.selector","old","new"]]' \
+    //     | sha256sum
+    //
+    // so the assertion covers BOTH halves at once — that the canonical JSON is
+    // what the doc comment says it is, and that the hex encoding is unchanged.
+
+    #[test]
+    fn change_hash_matches_an_independently_computed_sha256() {
+        let changes = vec![super::DestructiveChange {
+            trigger_type: "selector-change".to_string(),
+            field: "needs.pg.selector".to_string(),
+            from: Some(serde_json::Value::String("old".to_string())),
+            to: Some(serde_json::Value::String("new".to_string())),
+            // NOT part of the canonical form — the hash covers
+            // [trigger_type, field, from, to] only.
+            classification: "data-migration".to_string(),
+        }];
+        assert_eq!(
+            super::change_hash(&changes),
+            "317d6715ef9137b8c113d5c6cce330ead87aab9a63fddc3d88aa00f121720030",
+            "the approval content hash moved — every in-flight approval a human \
+             already signed off is invalidated by this"
+        );
+    }
+
+    #[test]
+    fn change_hash_is_lowercase_hex_of_exactly_64_chars() {
+        let changes = vec![super::DestructiveChange {
+            trigger_type: "t".to_string(),
+            field: "f".to_string(),
+            from: None,
+            to: None,
+            classification: "safe".to_string(),
+        }];
+        let h = super::change_hash(&changes);
+        assert_eq!(h.len(), 64, "expected 64 hex chars, got {h:?}");
+        assert!(
+            h.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "the hash must render as LOWERCASE hex with no separators: {h:?}"
+        );
+    }
 
     #[test]
     fn severity_orders_data_migration_above_requires_restart() {

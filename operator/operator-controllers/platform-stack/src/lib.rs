@@ -18,6 +18,8 @@ use kube::Client;
 use operator_core::Metrics;
 use tracing::info;
 
+pub mod backup_health;
+pub mod backup_retention;
 pub mod compatibility;
 pub mod desired;
 pub mod oci;

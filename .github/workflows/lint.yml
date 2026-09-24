@@ -12,7 +12,8 @@ name: lint
 # changed. Now the workflow always fires on push to master
 # and on every PR, but the per-stack jobs each opt in via
 # their path filter — fast-path runs to ~10-30 seconds when
-# nothing in a given stack changed.
+# nothing in a given stack changed. The exception is `version-guards`,
+# which always runs: see its comment.
 
 on:
   pull_request:
@@ -33,8 +34,8 @@ jobs:
       rust_operator: ${{ steps.filter.outputs.rust_operator }}
       bun: ${{ steps.filter.outputs.bun }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         with:
           # Filters per stack. Paths are evaluated against
@@ -70,16 +71,105 @@ jobs:
               - 'scripts/check-payload-types.sh'
               - '.github/workflows/lint.yml'
 
+  # The version guards and the workflow linter, on EVERY pull request and push
+  # to master, with no path filter and no `needs: changes`: together they take
+  # seconds, and a guard that only wakes for some paths is one more place for
+  # a change to slip past.
+  #
+  # Until WI-373 these ran only from the pre-commit hook and `just lint`. Both
+  # are skipped by `git commit --no-verify`, by a checkout without `lefthook
+  # install`, by a web edit and by a merge commit, and the failure the version
+  # guards exist for is silent: operator code merged without an appVersion
+  # bump makes release-operator.yml's two-axis gate (tag + images exist) SKIP
+  # the rebuild, so the change never ships — the 0.2.40/0.2.41 double-yank.
+  #
+  # `check-version-coherence.sh` and `check-cue-cmp-mirror.sh` are NOT
+  # repeated here: platform-stack-check.yml and the `cue` job below already run
+  # them on every path that can break them.
+  version-guards:
+    name: version guards + workflow lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # scripts/lib/published-tag.sh: a guard that cannot tell whether its
+      # version is published (origin unreachable, no tags of its series
+      # visible, the tag not fetchable) FAILS instead of passing. GITHUB_ACTIONS
+      # already implies it; spelled out so the job states what it relies on.
+      VERSION_GUARD_STRICT: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history + every tag: each guard diffs the tree against the
+          # tag its version was PUBLISHED under. (A shallow checkout would
+          # still work — the helper fetches the one tag it needs — but then a
+          # fetch failure is one more way for the job to go red.)
+          fetch-depth: 0
+      # `!cancelled()` on every step: one red guard must not hide the verdict
+      # of the others.
+      - name: check-operator-version-bump.sh
+        if: ${{ !cancelled() }}
+        run: ./scripts/check-operator-version-bump.sh
+      - name: check-cli-version-bump.sh
+        if: ${{ !cancelled() }}
+        run: ./scripts/check-cli-version-bump.sh
+      - name: check-backup-runner-pin.sh
+        if: ${{ !cancelled() }}
+        run: ./scripts/check-backup-runner-pin.sh
+      - name: check-argocd-cue-cmp-drift.sh
+        if: ${{ !cancelled() }}
+        run: ./scripts/check-argocd-cue-cmp-drift.sh
+      # scripts/check-workflows.sh needs an actionlint binary and falls back to
+      # `nix run`, which no runner here has. A release tarball, verified
+      # against a pinned SHA-256: the version below is a pin like any other
+      # (scripts/upstream-pins.json `tool-actionlint` reports it), and the
+      # checksum moves with it — take it from the release's
+      # actionlint_<version>_checksums.txt.
+      #
+      # actionlint runs shellcheck on every `run:` block only when shellcheck
+      # is on PATH, and silently skips it otherwise; the runner image ships
+      # one, and this step fails if it ever stops doing so rather than let the
+      # gate quietly lose half its checks.
+      - name: Install actionlint
+        if: ${{ !cancelled() }}
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/actionlint" actionlint
+          echo "ACTIONLINT=$RUNNER_TEMP/actionlint/actionlint" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/actionlint/actionlint" --version
+          command -v shellcheck >/dev/null || {
+            echo "::error::shellcheck is not on PATH; actionlint would skip every run: block"
+            exit 1
+          }
+          shellcheck --version
+      # Offline pass only. `--remote` also proves each pin's version comment
+      # against upstream, which makes the verdict depend on something no pull
+      # request controls: dtolnay/rust-toolchain is pinned under its `v1` tag,
+      # which upstream re-points to follow its master branch (see
+      # `action-rust-toolchain` in scripts/upstream-pins.json), so the day it
+      # moves every open pull request would go red for a change nobody made.
+      # Run `--remote` by hand after a bump, as the script's header says.
+      - name: check-workflows.sh
+        if: ${{ !cancelled() }}
+        run: ./scripts/check-workflows.sh
+
   cue:
     name: CUE (fmt + vet)
     needs: changes
     if: needs.changes.outputs.cue == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: cue-lang/setup-cue@v1.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: cue-lang/setup-cue@b0e30e540a2dae47304ebf16586a5b2db023b61c # v2.0.0
         with:
-          version: v0.10.0
+          version: v0.17.1
       - name: lint-cue.sh
         run: ./scripts/lint-cue.sh
       # Why this guard exists: see the header of
@@ -106,17 +196,18 @@ jobs:
     if: needs.changes.outputs.rust_cli == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # cli/cli-providers/build.rs shells out to `cue export`
       # at compile time (Track B.1.71 — chart values are the
       # single source of truth, CLI loader values are derived
       # via cue export -e _loaderValues.<comp>). Without cue
       # on PATH the build script panics on the runner.
-      - uses: cue-lang/setup-cue@v1.0.1
+      - uses: cue-lang/setup-cue@b0e30e540a2dae47304ebf16586a5b2db023b61c # v2.0.0
         with:
-          version: v0.10.0
-      - uses: dtolnay/rust-toolchain@stable
+          version: v0.17.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
+          toolchain: "1.98"
           components: rustfmt, clippy
       - name: cargo fmt + clippy
         working-directory: cli
@@ -130,9 +221,10 @@ jobs:
     if: needs.changes.outputs.rust_operator == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
+          toolchain: "1.98"
           components: rustfmt, clippy
       - name: cargo fmt + clippy
         working-directory: operator
@@ -146,8 +238,8 @@ jobs:
     if: needs.changes.outputs.bun == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
       - name: Detect Bun workspaces
         id: detect
         run: |

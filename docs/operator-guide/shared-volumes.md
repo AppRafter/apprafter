@@ -201,7 +201,7 @@ line clears on the next reconcile, up to five minutes later. On Tier 1, where
 the figures are the host disk's, freeing space means freeing it **on the node**
 — every local-path volume, the databases and the image store share that
 filesystem, and the node reports its own version of this as a banner on every
-`apprafter` command.
+`apprafter` command that reaches beyond your machine.
 
 What gets sampled, why a Tier-1 volume's figures can be the node's, and where
 the node's own disk is reported are in [Cross-application shared

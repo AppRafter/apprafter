@@ -157,10 +157,15 @@ pre-commit:
     # `parallel: true` ran them sequentially anyway on lefthook 2.1.5. A group
     # here would buy a nicer heading and cost 4 seconds on every commit that
     # touches platform-stack. Second reason: each asks `git ls-remote` whether
-    # its tag is already PUBLISHED, and with no network that call fails, which
-    # the scripts read as "not published yet — the bump is in flight" and exit
-    # 0. An offline commit therefore LOSES the check rather than breaking on it
-    # (verified by pointing them at a nonexistent remote).
+    # its tag is already PUBLISHED, and with no network that call fails. Outside
+    # CI the scripts then print a warning that the check did NOT run and exit 0
+    # (scripts/lib/published-tag.sh; they used to say "in flight" instead). An
+    # offline commit therefore LOSES the check rather than breaking on it — and
+    # loses it only until the pull request: since WI-373 the `version-guards`
+    # job in .github/workflows/lint.yml runs the same scripts on every pull
+    # request and push to master, and there an undecided guard FAILS. That job
+    # is also what catches the commits this hook never sees: `--no-verify`, a
+    # clone without `lefthook install`, a web edit, a merge commit.
     #
     # `version-coherence` gets no glob narrower than the union of the others:
     # it cross-checks the platform-stack pins against BOTH chart appVersions

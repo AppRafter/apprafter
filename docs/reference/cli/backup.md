@@ -109,21 +109,21 @@ Usage: apprafter backup enable [OPTIONS] --bucket <BUCKET>
 | --- | --- | --- | --- | --- |
 | `--at` | `<time>` | — | no | Local time of day the nightly backup runs, `HH:MM` on a 24-hour clock. Default `03:00`. Interpreted in `--timezone`, so the time you write is the time it runs |
 | `--bucket` | — | — | yes | Bucket name (with `--endpoint`), or a full restic repo URL (`s3:https://host/bucket`, `b2:...`, a local path, ...). With a bare name, pass `--endpoint` and the CLI builds the `s3:https://<endpoint>/<bucket>` URL for you |
-| `--check` | `<off|time>` | — | no | The weekly repository-integrity check: `off` to disable it, or `HH:MM` for its Sunday run time. Default: three hours after `--at`, so it never starts in the same minute as a backup. The check is metadata-only; it does not re-download the data |
+| `--check` | `<off|time>` | — | no | The weekly repository-integrity check: `off` to disable it, or `HH:MM` for its Sunday run time. Default: three hours after `--at`, so it never starts in the same minute as a backup. Besides the repository's structure, the check re-downloads and verifies a random 10% of the data each week; `apprafter backup set check-depth` changes that (`structure` reads no data, `full` reads all of it) |
 | `--cluster-name` | `<name>` | — | no | Name this cluster's snapshots are listed under in the repository (the restic host). Defaults to the target name. Two clusters can share one bucket, and this is what makes a listing readable — it is a label, not an identity: snapshots are attributed by the cluster's own kube-system UID, which a restored copy cannot inherit |
 | `--credential` | — | — | no | Name of the credential Secret in apprafter-system. With --credential-file: the name to create (default: apprafter-backup-s3). Without --credential-file: an existing Secret to read creds from (required) |
 | `--credential-file` | — | — | no | Path to a dotenv file with S3 + restic creds (S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, RESTIC_PASSWORD; optional S3_REGION). AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION accepted as aliases. When given, the creds are probed against the repo and then auto-sealed into the cluster |
 | `--endpoint` | — | — | no | S3 endpoint host (e.g. `nbg1.your-objectstorage.com`). With a bare `--bucket` name, the CLI builds the `s3:https://<endpoint>/<bucket>` repo URL for you. Omit when passing a full restic URL in `--bucket` |
-| `--enforce` | — | — | no | `operator` (default, cluster gets scoped creds) or `cluster` (in-cluster prune) |
+| `--enforce` | `<check|cluster|operator>` | — | no | Who prunes. `check` (default): the weekly check Job, after a check that passed, as far as the cluster's key may delete — a scoped key deletes nothing, and `backup status` says so. `cluster`: the backup Job, after every backup (needs a key that may delete). `operator`: nothing in the cluster; you run `apprafter backup prune` |
 | `--failure-webhook` | `<url>` | — | no | URL the runner POSTs a JSON failure report to when a backup or check Job fails. Egress to this host is opened automatically in the platform network policy. No default — unset means failures surface only in `backup status` and the Job logs |
 | `--i-have-saved-credentials` | flag | — | no | Confirm you have saved the restic passphrase + S3 credentials OUTSIDE the cluster |
-| `--keep-daily` | `<count>` | — | no | How many daily snapshots `restic forget` keeps. Default 7. Retention is only APPLIED when `--enforce cluster` is set or you run `apprafter backup prune`; under the default `--enforce operator` the scheduled Job never forgets |
+| `--keep-daily` | `<count>` | — | no | How many daily snapshots `restic forget` keeps. Default 7. Applied by whatever `--enforce` names: the weekly check Job (the default), the backup Job, or `apprafter backup prune` |
 | `--keep-monthly` | `<count>` | — | no | How many monthly snapshots `restic forget` keeps. Default 6. Applied under the same rule as `--keep-daily` |
 | `--keep-weekly` | `<count>` | — | no | How many weekly snapshots `restic forget` keeps. Default 4. Applied under the same rule as `--keep-daily` |
 | `--no-initial-backup` | flag | — | no | Skip the first backup `enable` normally takes once the schedule is deployed. The schedule still runs at its configured time, and `apprafter backup run` takes one on demand |
 | `--prefix` | — | — | no | Optional path prefix inside the bucket (e.g. `backups/prod`). Only used together with a bare `--bucket` name and `--endpoint`; omit when passing a full restic URL in `--bucket` |
 | `--staging-mode` | — | — | no | `monolithic` (default) or `sequential` |
-| `--timezone` | `<zone>` | — | no | IANA timezone the schedules run in (`Europe/Berlin`, `UTC`), written to the CronJob's `spec.timeZone`. Defaults to this machine's zone; if that cannot be determined the command refuses rather than assume UTC |
+| `--timezone` | `<zone>` | — | no | IANA timezone the schedules run in (`Europe/Berlin`, `UTC`), written to the CronJob's `spec.timeZone`; the keep counts' days, weeks and months are this zone's too. Defaults to this machine's zone; if that cannot be determined the command refuses rather than assume UTC |
 
 Examples:
 
@@ -166,7 +166,9 @@ apprafter backup list --repo <path>
 
 Remove old snapshots from an S3-backed restic repository according to the configured retention policy. Run OUTSIDE the cluster with the operator's full S3 credentials.
 
-A prune forgets by explicit snapshot id and one repository can hold several clusters' runs, so it must know whose snapshots it may forget. Normally that is the cluster's own `kube-system` namespace UID, read from the kubeconfig. When the cluster is gone and only the repository is left, `--cluster-uid <uid>` names the identity explicitly and the command runs with no cluster at all.
+A key that may not delete — the cluster's own, when it is scoped as recommended — deletes nothing: the command stops at the first refused delete and exits non-zero, naming `--credential-file`.
+
+A prune forgets by explicit snapshot id and one repository can hold several clusters' runs, so it must know whose snapshots it may forget. Normally that is the cluster's own `kube-system` namespace UID, read from the kubeconfig. When the cluster is gone and only the repository is left, `--cluster-uid <uid>` names the identity and `--timezone <zone>` the zone its schedules ran in; with those, `--repo`, the three `--keep-*` and a credential file, the command runs with no cluster at all.
 
 ```text
 Usage: apprafter backup prune [OPTIONS]
@@ -180,6 +182,7 @@ Usage: apprafter backup prune [OPTIONS]
 | `--keep-monthly` | — | — | no | Keep-monthly retention override (else spec.backup.retention, else 6) |
 | `--keep-weekly` | — | — | no | Keep-weekly retention override (else spec.backup.retention, else 4) |
 | `--repo` | — | — | no | S3 restic repository URL (e.g. `s3:s3.amazonaws.com/my-bucket/prefix`). Defaults to `PlatformStack.spec.backup.bucket` |
+| `--timezone` | `<zone>` | — | no | IANA zone the keep counts' days, weeks and months are counted in (`Europe/Berlin`, `UTC`). Defaults to the cluster's `spec.backup.timeZone`, the zone its schedules and its own prune use; with no cluster to read it from, the command refuses rather than assume one |
 
 Examples:
 
@@ -191,7 +194,9 @@ apprafter backup prune --credential-file <dotenv> --keep-daily 14 --keep-weekly 
 
 ## `apprafter backup run`
 
-Run the cluster's scheduled backup NOW, without waiting for its next window. Instantiates the platform's backup CronJob as a one-off Job, so it uses the cluster's own credentials — useful before an upgrade, and to prove a freshly enabled schedule works
+Run the cluster's scheduled backup NOW, without waiting for its next window. Instantiates the platform's backup CronJob as a one-off Job, so it uses the cluster's own credentials — useful before an upgrade, and to prove a freshly enabled schedule works.
+
+If no node has room for the Job's pod for two minutes, the command deletes the Job, prints the scheduler's reason and exits non-zero. That backup cannot start, and the scheduled one asks for the same room. `apprafter top` shows how much of each node is requested.
 
 ```text
 Usage: apprafter backup run [OPTIONS]
@@ -200,7 +205,7 @@ Usage: apprafter backup run [OPTIONS]
 | Flag | Value | Default | Required | Description |
 | --- | --- | --- | --- | --- |
 | `--no-wait` | flag | — | no | Return as soon as the Job is created instead of waiting for it to finish. The Job runs either way |
-| `--timeout` | — | `60` | no | How long to wait for the Job before handing back control, in minutes. A timeout does not cancel the backup |
+| `--timeout` | — | `60` | no | How long to wait for the Job before handing back control, in minutes. A timeout does not cancel the backup. It exits non-zero when an attempt of the Job has failed by then, with that attempt's reason |
 
 Examples:
 
@@ -214,7 +219,9 @@ apprafter backup run --timeout 120
 
 Change ONE field of a configured backup, leaving the rest alone. `backup enable` rewrites the whole block, so it cannot be used to adjust a single setting without resetting the others.
 
-Keys: enabled &lt;true|false>, at &lt;HH:MM>, check &lt;HH:MM|off>, check-depth &lt;structure|10%|full>, cluster-name &lt;name>, timezone &lt;IANA>, keep-daily &lt;n>, keep-weekly &lt;n>, keep-monthly &lt;n>, enforce &lt;operator|cluster>, staging-mode &lt;monolithic|sequential>, failure-webhook &lt;url>.
+Keys: enabled &lt;true|false>, at &lt;HH:MM>, check &lt;HH:MM|off>, check-depth &lt;structure|10%|full>, cluster-name &lt;name>, timezone &lt;IANA>, keep-daily &lt;n>, keep-weekly &lt;n>, keep-monthly &lt;n>, enforce &lt;check|cluster|operator>, staging-mode &lt;monolithic|sequential>, failure-webhook &lt;url>, deadline &lt;duration>, check-deadline &lt;duration>.
+
+`deadline` and `check-deadline` are how long one backup or check Job may run before Kubernetes stops it (default 6h, minimum 10m): `12h`, `90m`, `43200s`. Keep each shorter than the interval between two runs of its schedule and longer than its slowest good run. The check locks the repository exclusively, so also keep the backup's below the gap from a backup to the next check (3h by default) and the check's below the gap from the check to the next backup (21h).
 
 `enabled` is the switch on its own, and it is how a configured but switched-off schedule comes back: after `backup disable`, or after a `restore`, which replays the source's whole backup block disabled. `backup enable` cannot do that job — it composes the whole block from its flags, so it would reset everything the restore just carried across.
 

@@ -3,7 +3,30 @@
   description = "AppRafter platform development environment";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # A RELEASE branch, not nixos-unstable. Unstable already carries
+    # kubernetes-helm 4.x and nixpkgs has no `kubernetes-helm_3` fallback, so on
+    # unstable a routine `nix flake update` would swap the dev shell's helm
+    # major — a toolchain change arriving as a side effect of a lockfile
+    # refresh, with nothing naming it. The release branch still moves (it is
+    # a branch, and flake.lock pins the rev), it just does not cross majors
+    # underneath us.
+    #
+    # HELM 3 HERE, HELM 4 IN CI — ON PURPOSE. Every workflow that installs
+    # helm pins 4.3.0 (scripts/upstream-pins.json `tool-helm`), while this
+    # shell and the dev container that mirrors it (`devcontainer-helm`) run
+    # this branch's helm 3, 3.20. `apprafter` runs whatever helm the user has
+    # installed, users have either major, and the two apply a release
+    # differently: helm 4 installs server-side, which is why re-running
+    # cluster-bootstrap after a loader change conflicts with Argo CD there
+    # (WI-369). The CLI has to work under both, and with CI on 4 this
+    # tool-belt is where helm 3 still gets run. Two facts bound the split:
+    # 3.20 receives no patches (the last was 3.20.2, 2026-04-09; helm 3 went on
+    # to 3.22), and helm 3 as a whole gets security fixes only until
+    # 2026-11-11. Move the shell and the dev container to helm 4 together
+    # before then: the next release branch (nixos-26.11) will carry helm 4,
+    # and if it is not out in time, pin a helm release binary here the way
+    # `cuePinned` pins cue.
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -17,14 +40,60 @@
       system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+
+        # CUE is pinned to the SAME version every other place in this repo pins
+        # it — the setup-cue inputs in .github/workflows, the CMP sidecar's
+        # Dockerfile ARG, and .devcontainer/post-create.sh.
+        #
+        # It is taken from the upstream release rather than from nixpkgs on
+        # purpose. `scripts/crd-check.sh` says it runs under `nix develop` so
+        # that cue is "the flake.lock-pinned version: ONE cue version across
+        # local and CI" — and until 2026-09 that claim was simply false. The
+        # flake gave whatever nixpkgs happened to carry (0.16.1) while CI's
+        # setup-cue installed 0.10.0, six minors apart, and the byte-identity
+        # gate that sentence exists to justify was comparing output from two
+        # different evaluators. Fetching the release binary is what makes the
+        # claim true, and it costs one hash instead of a Go rebuild.
+        #
+        # Bumping cue means editing THIS version and hash together with the
+        # workflow inputs, the Dockerfile ARG and the devcontainer script. The
+        # hash is the sha256 of the release tarball:
+        #   nix-prefetch-url --type sha256 \
+        #     https://github.com/cue-lang/cue/releases/download/vX.Y.Z/cue_vX.Y.Z_linux_amd64.tar.gz
+        # Written WITH the leading "v" so it is byte-identical to the string
+        # every other cue pin in this repo carries — the version watcher
+        # compares the captured strings literally and reports a mismatch as
+        # drift, which is the right behaviour and which a bare "0.17.1" here
+        # would trip on every run.
+        cueVersion = "v0.17.1";
+        cuePinned = pkgs.stdenv.mkDerivation {
+          pname = "cue";
+          version = pkgs.lib.removePrefix "v" cueVersion;
+          src = pkgs.fetchurl {
+            url = "https://github.com/cue-lang/cue/releases/download/${cueVersion}/cue_${cueVersion}_${
+              if pkgs.stdenv.hostPlatform.isDarwin then "darwin" else "linux"
+            }_${if pkgs.stdenv.hostPlatform.isAarch64 then "arm64" else "amd64"}.tar.gz";
+            sha256 =
+              {
+                "x86_64-linux" = "sha256-o5sMl2lQadldJ22Zvg9dursIHYAb/cm6Sbdu+vlOI2k=";
+              }
+              .${system} or (throw "flake.nix: no cue ${cueVersion} hash recorded for ${system} — add one beside the x86_64-linux entry");
+          };
+          sourceRoot = ".";
+          # A single static binary; there is nothing to build or patch.
+          dontBuild = true;
+          dontConfigure = true;
+          installPhase = "install -Dm755 cue $out/bin/cue";
+        };
       in
       {
         devShells.default = pkgs.mkShell {
           name = "apprafter";
 
           packages = with pkgs; [
-            # Configuration language
-            cue
+            # Configuration language — the version pinned above, NOT nixpkgs'.
+            # See the `cuePinned` comment for why.
+            cuePinned
 
             # Argo CD ships custom resource health as Lua in `argocd-cm`, and a
             # broken script fails SILENTLY — Argo logs it and falls back. This
@@ -37,6 +106,13 @@
             rustfmt
             clippy
             rust-analyzer
+
+            # Dependency health, which the version watcher cannot see: an
+            # abandoned crate sits on its own final release forever and so is
+            # never "behind". `scripts/cargo-deny.sh` falls back to
+            # `nix run nixpkgs#cargo-deny` without this, but having it in the
+            # shell keeps the dev-loop run fast.
+            cargo-deny
 
             # JavaScript / TypeScript runtime (for Backstage tooling)
             bun
@@ -110,6 +186,11 @@
             echo
           '';
         };
+
+        # Exposed so `scripts/cue` can reach the pinned binary WITHOUT
+        # `nix develop`, whose shellHook prints a banner onto stdout and would
+        # corrupt every caller that captures cue's output.
+        packages.cue = cuePinned;
 
         formatter = pkgs.nixfmt;
       }

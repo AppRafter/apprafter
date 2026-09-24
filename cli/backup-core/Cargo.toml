@@ -6,6 +6,7 @@ version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
+publish.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
 
@@ -14,6 +15,9 @@ cli-core   = { path = "../cli-core" }
 # RFC-3339 parse + ISO-week/month bucketing for the retention prune planner
 # (prune.rs). Already a workspace dependency (used by platform-cli / cli-providers).
 chrono     = { workspace = true }
+# The keep policy's days, weeks and months are the backup schedule's zone's
+# (prune.rs, `RetentionPolicy::zone`).
+chrono-tz  = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 tempfile   = { workspace = true }

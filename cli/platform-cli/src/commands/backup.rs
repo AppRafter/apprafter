@@ -62,11 +62,11 @@ use backup_core::cluster::{
 };
 use backup_core::engine::{resource_refs, BackupOpts};
 use backup_core::extract::{claims_without_data_capture, plan_extraction, UncapturedClaim};
-use backup_core::prune::{run_prune, RetentionPolicy};
+use backup_core::prune::{run_prune, RetentionPolicy, Tz};
 use backup_core::restic::{
     restic_check_argv, restic_dump_argv, restic_ls_argv, restic_stats_argv, restic_unlock_argv,
 };
-use backup_core::restore::resolve_latest_snapshot;
+use backup_core::restore::{resolve_latest_snapshot, UnfinishedRun};
 use backup_core::{KubeExec, ResticRunner, StagingMode, SubprocessRestic};
 use base64::Engine as _;
 use cli_core::diagnose::{classify_restic, ResticFailure};
@@ -81,11 +81,15 @@ use cli_providers::k8s::sealing::{build_sealed_secret, fetch_controller_public_k
 use serde_json::Value;
 use tempfile::NamedTempFile;
 
+use crate::commands::helper_interrupt;
 use crate::commands::k8s_helpers::{
-    ensure_kubeconfig_tempfile, kubectl_apply_server_side, kubectl_get_json,
+    ensure_kubeconfig_tempfile, kubectl_apply_server_side, kubectl_delete, kubectl_get_json,
     kubectl_get_json_cluster_wide, kubectl_merge_patch,
 };
 use crate::commands::state_paths::resolve_state_paths;
+
+mod job_pod;
+use job_pod::{grace_for, job_pod, unplaced, JobPod, Unplaced, UnschedulableClock};
 
 /// Namespace the `PlatformStack` singleton + `SourceCredential`s + their sealed
 /// material live in. Mirrors `repo_creds::SOURCECRED_NAMESPACE` /
@@ -849,6 +853,7 @@ pub(crate) fn read_platform_version(kubeconfig: &Path) -> Result<String> {
 /// the disaster-recovery case where a repository has to be listed with its
 /// cluster gone. A bounded wait keeps the attribution and keeps that fast.
 pub(crate) fn read_cluster_uid(kubeconfig: &Path) -> Result<String> {
+    helper_interrupt::refuse_if_interrupted()?;
     let out = Command::new("kubectl")
         .args([
             "get",
@@ -1019,6 +1024,11 @@ const STDERR_FLUSH_GRACE_MS: u64 = 100;
 
 /// CLI's concrete implementation of [`backup_core::KubeExec`]: shells out to
 /// `kubectl` with `KUBECONFIG=<path>`.
+///
+/// Once the process has been interrupted (Ctrl-C or SIGTERM, with the
+/// handler of [`helper_interrupt`] installed) every method refuses at once
+/// and spawns nothing: the interrupt's own cleanup deletes the helper pods
+/// the command created, and it alone does.
 pub(crate) struct KubectlExec {
     pub kubeconfig: PathBuf,
     /// The `kubectl` binary to spawn. Always `"kubectl"` in production (see
@@ -1027,6 +1037,10 @@ pub(crate) struct KubectlExec {
     /// process's streams and exit status, rather than leaving the whole
     /// subprocess layer unexercised.
     kubectl_bin: PathBuf,
+    /// The helper pods applied and not yet deleted, for the interrupt to
+    /// delete ([`helper_interrupt::HelperPods`]): the process-wide set in
+    /// production, a private one in the tests.
+    helpers: helper_interrupt::HelperPods,
 }
 
 impl KubectlExec {
@@ -1034,12 +1048,31 @@ impl KubectlExec {
         Self {
             kubeconfig,
             kubectl_bin: PathBuf::from(KUBECTL_BIN),
+            helpers: helper_interrupt::HelperPods::global(),
         }
+    }
+
+    /// Refuse the call once the process has been interrupted (see the type's
+    /// docs): the signal handler's flag, set the moment the signal arrives,
+    /// or the stop having closed the set of helper pods.
+    fn refuse_if_interrupted(&self) -> Result<()> {
+        if self.interrupted() {
+            return Err(helper_interrupt::interrupted_error());
+        }
+        Ok(())
+    }
+
+    fn interrupted(&self) -> bool {
+        helper_interrupt::interrupted() || self.helpers.is_closed()
     }
 }
 
-/// The `kubectl` executable [`KubectlExec`] spawns, resolved through `PATH`.
-const KUBECTL_BIN: &str = "kubectl";
+/// How often the Ready wait reads a helper pod.
+const POD_READY_POLL: Duration = Duration::from_secs(1);
+
+/// The `kubectl` executable [`KubectlExec`] spawns, resolved through `PATH`
+/// (and the interrupt's cleanup, `helper_interrupt`).
+pub(crate) const KUBECTL_BIN: &str = "kubectl";
 
 /// Spawn a thread that drains `reader` to EOF, retaining the last
 /// `STDERR_CAPTURE_LIMIT` lines in a shared buffer for error reporting.
@@ -1081,26 +1114,132 @@ fn format_exec_error(
     }
 }
 
-impl KubeExec for KubectlExec {
-    fn apply_and_wait_pod_ready(&self, spec: &serde_json::Value) -> Result<()> {
-        let name = spec["metadata"]["name"]
-            .as_str()
-            .ok_or_else(|| CliError::Other("pod spec missing metadata.name".into()))?;
-        let ns = spec["metadata"]["namespace"]
-            .as_str()
-            .ok_or_else(|| CliError::Other("pod spec missing metadata.namespace".into()))?;
+/// Copy an exec's stdout to `out`, sending one message on `first_byte` as
+/// soon as the first byte has been read (before it is written), and never
+/// sending it for a command that wrote nothing.
+fn copy_exec_stdout<R: Read>(
+    stdout: R,
+    mut out: std::fs::File,
+    first_byte: Option<std::sync::mpsc::Sender<()>>,
+) -> Result<()> {
+    let copy_error =
+        |e: io::Error| CliError::Other(format!("copy kubectl exec stdout → file: {e}"));
+    let mut reader = BufReader::new(stdout);
+    if let Some(first_byte) = first_byte {
+        let chunk = loop {
+            match reader.fill_buf() {
+                Ok(chunk) => break chunk.len(),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(copy_error(e)),
+            }
+        };
+        if chunk == 0 {
+            return Ok(());
+        }
+        let _ = first_byte.send(());
+    }
+    io::copy(&mut reader, &mut out).map_err(copy_error)?;
+    Ok(())
+}
 
-        let json_bytes = serde_json::to_vec(spec)
-            .map_err(|e| CliError::Other(format!("serialize pod spec: {e}")))?;
+/// A pod's `metadata.uid`, when it has one.
+fn uid_of(pod: &serde_json::Value) -> Option<String> {
+    pod.pointer("/metadata/uid")
+        .and_then(serde_json::Value::as_str)
+        .filter(|uid| !uid.is_empty())
+        .map(str::to_string)
+}
 
+/// How [`KubectlExec::kubectl_put`] puts a pod in place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Put {
+    /// `kubectl create`: there is no pod of that name, and the apiserver
+    /// refuses (`AlreadyExists`) rather than touch one another run created
+    /// since. Its answer is the one that says a pod is this process's.
+    Create,
+    /// `kubectl apply` over the pod of that name that is there.
+    Apply,
+}
+
+impl Put {
+    fn verb(self) -> &'static str {
+        match self {
+            Put::Create => "create",
+            Put::Apply => "apply",
+        }
+    }
+}
+
+/// What kubectl answered to a [`Put`]: [`KubectlExec::kubectl_put`].
+enum ApplyAnswer {
+    /// Done: the uid of the pod the apiserver answered with (empty when
+    /// kubectl printed none).
+    Applied { uid: String },
+    /// kubectl ran and refused: its error, and its whole stderr.
+    Refused { error: CliError, stderr: String },
+}
+
+/// Whether kubectl's stderr is the apiserver refusing a create because an
+/// object of that name exists, as `kubectl create` prints it (Kubernetes
+/// 1.36): `Error from server (AlreadyExists): error when creating "STDIN":
+/// pods "<name>" already exists`.
+fn is_already_exists(stderr: &str) -> bool {
+    stderr.contains("(AlreadyExists)")
+}
+
+impl KubectlExec {
+    /// `kubectl create --save-config` or `kubectl apply` of `json_bytes` in
+    /// `ns`, printing the uid of the pod the apiserver answered with
+    /// (`-o jsonpath={.metadata.uid}`). `--save-config` makes a created pod
+    /// the same object an apply would have created.
+    ///
+    /// A refusal comes with kubectl's WHOLE stderr beside its error. The
+    /// error keeps the last lines, which is where a failing command usually
+    /// explains itself; the apiserver's refusal of a pod update that cannot
+    /// change in place is the FIRST line, above a unified diff of the pod spec
+    /// with a hunk per changed field (a changed `sleep` alone is ten lines on
+    /// Kubernetes 1.35), which a helper built by another version can run past
+    /// the lines the error keeps. The caller needs that first line.
+    fn kubectl_put(&self, put: Put, ns: &str, json_bytes: &[u8]) -> Result<ApplyAnswer> {
+        let verb = put.verb();
+        let mut args = vec![verb];
+        if put == Put::Create {
+            args.push("--save-config");
+        }
+        args.extend(["-f", "-", "-n", ns, "-o", "jsonpath={.metadata.uid}"]);
         let mut apply_child = Command::new(&self.kubectl_bin)
-            .args(["apply", "-f", "-", "-n", ns])
+            .args(&args)
             .env("KUBECONFIG", &self.kubeconfig)
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| CliError::Other(format!("spawn kubectl apply: {e}")))?;
+            .map_err(|e| CliError::Other(format!("spawn kubectl {verb}: {e}")))?;
+
+        // Both read whole, each on its own thread, so neither pipe can fill
+        // and block kubectl — and before the spec is written, so a kubectl
+        // that answers before it has read all of it cannot stall either.
+        let drain = |pipe: Option<Box<dyn Read + Send>>| {
+            thread::spawn(move || {
+                let mut text = String::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_string(&mut text);
+                }
+                text
+            })
+        };
+        let stdout_reader = drain(
+            apply_child
+                .stdout
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        );
+        let stderr_reader = drain(
+            apply_child
+                .stderr
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        );
 
         // The write result is held rather than propagated here, and the order
         // that follows is the point. A child that dies before reading its
@@ -1120,52 +1259,309 @@ impl KubeExec for KubectlExec {
             let mut stdin = apply_child
                 .stdin
                 .take()
-                .ok_or_else(|| CliError::Other("kubectl apply has no stdin".into()))?;
-            stdin.write_all(&json_bytes)
+                .ok_or_else(|| CliError::Other(format!("kubectl {verb} has no stdin")))?;
+            stdin.write_all(json_bytes)
             // `stdin` drops here, closing the pipe — the child needs that EOF
             // to finish, so it must happen before the `wait()` below.
         };
 
-        let apply_stderr = apply_child
-            .stderr
-            .take()
-            .ok_or_else(|| CliError::Other("kubectl apply has no stderr".into()))?;
-        let apply_stderr_buf = spawn_capturing_drainer(apply_stderr);
         let apply_status = apply_child
             .wait()
-            .map_err(|e| CliError::Other(format!("wait kubectl apply: {e}")))?;
+            .map_err(|e| CliError::Other(format!("wait kubectl {verb}: {e}")))?;
+        // kubectl has exited, so its pipes are at EOF (it starts no children).
+        let stdout = stdout_reader.join().unwrap_or_default();
+        let stderr = stderr_reader.join().unwrap_or_default();
         if !apply_status.success() {
-            return Err(format_exec_error(
-                "apply_and_wait_pod_ready(apply)",
+            let tail: Vec<String> = stderr
+                .lines()
+                .rev()
+                .take(STDERR_CAPTURE_LIMIT)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let error = format_exec_error(
+                &format!("apply_and_wait_pod_ready({verb})"),
                 apply_status,
-                &apply_stderr_buf,
-            ));
+                &Arc::new(Mutex::new(tail)),
+            );
+            return Ok(ApplyAnswer::Refused { error, stderr });
         }
         write_result
-            .map_err(|e| CliError::Other(format!("write pod spec to kubectl apply: {e}")))?;
+            .map_err(|e| CliError::Other(format!("write pod spec to kubectl {verb}: {e}")))?;
+        Ok(ApplyAnswer::Applied {
+            uid: stdout.trim().to_string(),
+        })
+    }
 
-        let wait_status = Command::new(&self.kubectl_bin)
+    /// The pod `name` in `ns` as JSON, or `None` when there is none
+    /// (`--ignore-not-found`: kubectl then prints nothing and exits 0).
+    fn get_pod_if_present(&self, name: &str, ns: &str) -> Result<Option<serde_json::Value>> {
+        let out = Command::new(&self.kubectl_bin)
             .args([
-                "wait",
-                "--for=condition=Ready",
-                &format!("pod/{name}"),
+                "get",
+                "pod",
+                name,
                 "-n",
                 ns,
-                "--timeout=300s",
+                "--ignore-not-found",
+                "-o",
+                "json",
             ])
             .env("KUBECONFIG", &self.kubeconfig)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|e| CliError::Other(format!("spawn kubectl wait: {e}")))?;
-
-        if wait_status.success() {
-            Ok(())
-        } else {
-            Err(CliError::Other(format!(
-                "pod {name} in {ns} did not reach Ready within 300s (kubectl wait exited {wait_status})"
-            )))
+            .output()
+            .map_err(|e| CliError::Other(format!("spawn kubectl get pod: {e}")))?;
+        if !out.status.success() {
+            return Err(CliError::Other(format!(
+                "kubectl get pod {name} -n {ns} failed (exit {:?}): {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            )));
         }
+        if out.stdout.iter().all(u8::is_ascii_whitespace) {
+            return Ok(None);
+        }
+        serde_json::from_slice(&out.stdout).map(Some).map_err(|e| {
+            CliError::Other(format!("kubectl get pod {name} -n {ns}: JSON parse: {e}"))
+        })
+    }
+
+    /// [`Self::kubectl_put`] of a pod spec, with a backup helper recorded for
+    /// the interrupt first ([`helper_interrupt::HelperPods::begin_apply`]) and
+    /// settled by the apiserver's answer before the call stops counting as
+    /// under way:
+    ///
+    /// * a create answered with a uid: [`helper_interrupt::Origin::Created`],
+    ///   the one answer that makes a pod this process's;
+    /// * an apply answered with the uid of the pod read just before it
+    ///   (`seen`): [`helper_interrupt::Origin::Reused`]; answered with any
+    ///   other, the pod was replaced in between, and whether this apply
+    ///   created the one there now or went over another run's cannot be told
+    ///   — it stays unconfirmed;
+    /// * a create refused as `AlreadyExists`, or an apply refused as an
+    ///   immutable update: nothing was made, and the record is dropped;
+    /// * anything else — kubectl killed by the same Ctrl-C, a lost
+    ///   connection — stays unconfirmed, and the interrupt leaves that pod.
+    ///
+    /// Refused once the interrupt has begun.
+    fn tracked_put(
+        &self,
+        spec: &serde_json::Value,
+        ns: &str,
+        name: &str,
+        put: Put,
+        seen: Option<&str>,
+        json_bytes: &[u8],
+    ) -> Result<ApplyAnswer> {
+        let in_flight = if backup_core::helper_pod::is_backup_helper(spec) {
+            Some(self.helpers.begin_apply(&self.kubeconfig, ns, name)?)
+        } else {
+            None
+        };
+        let answer = self.kubectl_put(put, ns, json_bytes)?;
+        if let Some(in_flight) = in_flight {
+            use helper_interrupt::Origin;
+            match (&answer, put) {
+                (ApplyAnswer::Applied { uid }, _) if uid.is_empty() => {}
+                (ApplyAnswer::Applied { uid }, Put::Create) => {
+                    in_flight.answered(Origin::Created(uid.clone()));
+                }
+                (ApplyAnswer::Applied { uid }, Put::Apply) if seen == Some(uid.as_str()) => {
+                    in_flight.answered(Origin::Reused(uid.clone()));
+                }
+                (ApplyAnswer::Applied { .. }, Put::Apply) => {}
+                (ApplyAnswer::Refused { stderr, .. }, Put::Create) if is_already_exists(stderr) => {
+                    in_flight.not_created();
+                }
+                (ApplyAnswer::Refused { stderr, .. }, Put::Apply)
+                    if backup_core::helper_pod::is_immutable_pod_update(stderr) =>
+                {
+                    in_flight.not_created();
+                }
+                (ApplyAnswer::Refused { .. }, _) => {}
+            }
+        }
+        Ok(answer)
+    }
+
+    /// Read pod `name` until it is Running + Ready, for up to `timeout`, every
+    /// `poll` — the runner's `KubeRsExec` waits the same way. A container the
+    /// kubelet
+    /// cannot configure for `grace` without a break (a credential Secret or
+    /// key missing: [`backup_core::helper_pod::container_config_error`]) ends
+    /// the wait at once with the kubelet's words, rather than after the whole
+    /// `timeout` with none. A read settles nothing for the interrupt: only the
+    /// apiserver's answer to the create does ([`Self::tracked_put`]).
+    fn wait_pod_ready(
+        &self,
+        name: &str,
+        ns: &str,
+        timeout: Duration,
+        poll: Duration,
+        grace: Duration,
+    ) -> Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut config_error = backup_core::helper_pod::ConfigErrorWatch::default();
+        loop {
+            self.refuse_if_interrupted()?;
+            let pod = self.get_pod_if_present(name, ns)?.ok_or_else(|| {
+                CliError::Other(format!(
+                    "pod {name} in {ns} is gone: it was deleted while this command waited for \
+                     it to be Ready"
+                ))
+            })?;
+            if backup_core::helper_pod::pod_is_ready(&pod) {
+                return Ok(());
+            }
+            if let Some(why) = config_error.observe(&pod, std::time::Instant::now(), grace) {
+                return Err(backup_core::helper_pod::container_config_error_message(
+                    ns, name, &why,
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(CliError::Other(format!(
+                    "pod {name} in {ns} did not reach Ready within {}s",
+                    timeout.as_secs()
+                )));
+            }
+            thread::sleep(poll);
+        }
+    }
+
+    /// Put the pod `spec` describes in place under `name`, for
+    /// [`KubeExec::apply_and_wait_pod_ready`]: create it when there is none,
+    /// apply over one of the same spec that is still running, and replace
+    /// any other.
+    ///
+    /// A pod of this name left from an earlier run is replaced rather than
+    /// applied over: an ended one never becomes Ready, one being deleted is
+    /// about to go, and a running one hours into its keep-alive would end this
+    /// command's work in it early
+    /// ([`backup_core::helper_pod::stale_helper_reason`]). So is one whose
+    /// spec this one cannot be applied over — an older CLI's or runner's, with
+    /// another keep-alive or env.
+    ///
+    /// Where there is no pod the helper is CREATED, not applied: the
+    /// apiserver's answer to a create is what makes it this process's for the
+    /// interrupt ([`Self::tracked_put`]), and a create refuses, rather than
+    /// takes over, a pod another run created since the read. That pod is then
+    /// read and judged like any other, once.
+    fn put_helper(
+        &self,
+        spec: &serde_json::Value,
+        ns: &str,
+        name: &str,
+        json_bytes: &[u8],
+    ) -> Result<()> {
+        let mut raced = false;
+        loop {
+            let mut over: Option<Option<String>> = None;
+            if let Some(existing) = self.get_pod_if_present(name, ns)? {
+                if let Some(why) = backup_core::helper_pod::stale_helper_reason(
+                    &existing,
+                    spec,
+                    chrono::Utc::now(),
+                ) {
+                    eprintln!(
+                        "{}",
+                        backup_core::helper_pod::replacing_stale_helper_note(ns, name, &why)
+                    );
+                    self.delete_and_wait_gone(name, ns)?;
+                } else {
+                    over = Some(uid_of(&existing));
+                }
+            }
+
+            if let Some(seen) = over {
+                match self.tracked_put(spec, ns, name, Put::Apply, seen.as_deref(), json_bytes)? {
+                    ApplyAnswer::Applied { .. } => return Ok(()),
+                    ApplyAnswer::Refused { stderr, .. }
+                        if backup_core::helper_pod::is_immutable_pod_update(&stderr) =>
+                    {
+                        eprintln!(
+                            "{}",
+                            backup_core::helper_pod::replacing_stale_helper_note(
+                                ns,
+                                name,
+                                "was created with a spec this command's cannot be applied over \
+                                 (an earlier run of another version, or with another keep-alive)",
+                            )
+                        );
+                        self.delete_and_wait_gone(name, ns)?;
+                    }
+                    ApplyAnswer::Refused { error, .. } => return Err(error),
+                }
+            }
+
+            match self.tracked_put(spec, ns, name, Put::Create, None, json_bytes)? {
+                ApplyAnswer::Applied { .. } => return Ok(()),
+                // Another run created it since the read: judge that pod, once.
+                ApplyAnswer::Refused { stderr, .. } if !raced && is_already_exists(&stderr) => {
+                    raced = true;
+                }
+                ApplyAnswer::Refused { error, .. } => return Err(error),
+            }
+        }
+    }
+
+    /// Delete a stale helper pod and wait until it is gone, within
+    /// [`backup_core::helper_pod::STALE_POD_GONE_WITHIN`] (`kubectl delete
+    /// --wait` watches the pod until it has).
+    fn delete_and_wait_gone(&self, name: &str, ns: &str) -> Result<()> {
+        let bound = backup_core::helper_pod::STALE_POD_GONE_WITHIN.as_secs();
+        let out = Command::new(&self.kubectl_bin)
+            .args([
+                "delete",
+                "pod",
+                name,
+                "-n",
+                ns,
+                "--ignore-not-found",
+                &format!(
+                    "--grace-period={}",
+                    backup_core::helper_pod::STALE_POD_DELETE_GRACE_SECONDS
+                ),
+                "--wait=true",
+                &format!("--timeout={bound}s"),
+            ])
+            .env("KUBECONFIG", &self.kubeconfig)
+            .output()
+            .map_err(|e| CliError::Other(format!("spawn kubectl delete pod: {e}")))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        Err(CliError::Other(format!(
+            "the stale helper pod {name} in {ns} was not gone {bound}s after it was deleted \
+             (its node may be unreachable); delete it with `kubectl delete pod {name} -n {ns} \
+             --force --grace-period=0` and run again. kubectl: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
+}
+
+impl KubeExec for KubectlExec {
+    fn apply_and_wait_pod_ready(&self, spec: &serde_json::Value) -> Result<()> {
+        self.refuse_if_interrupted()?;
+        let name = spec["metadata"]["name"]
+            .as_str()
+            .ok_or_else(|| CliError::Other("pod spec missing metadata.name".into()))?;
+        let ns = spec["metadata"]["namespace"]
+            .as_str()
+            .ok_or_else(|| CliError::Other("pod spec missing metadata.namespace".into()))?;
+
+        let json_bytes = serde_json::to_vec(spec)
+            .map_err(|e| CliError::Other(format!("serialize pod spec: {e}")))?;
+
+        self.put_helper(spec, ns, name, &json_bytes)?;
+
+        self.wait_pod_ready(
+            name,
+            ns,
+            backup_core::helper_pod::POD_READY_TIMEOUT,
+            POD_READY_POLL,
+            backup_core::helper_pod::CONTAINER_CONFIG_ERROR_GRACE,
+        )
     }
 
     fn exec_stream_to_file(
@@ -1174,7 +1570,9 @@ impl KubeExec for KubectlExec {
         ns: &str,
         argv: &[&str],
         out_path: &Path,
+        first_output_within: Option<Duration>,
     ) -> Result<()> {
+        self.refuse_if_interrupted()?;
         let mut cmd = Command::new(&self.kubectl_bin);
         cmd.arg("exec")
             .arg(pod)
@@ -1201,12 +1599,43 @@ impl KubeExec for KubectlExec {
 
         let stderr_buf = spawn_capturing_drainer(stderr);
 
-        let mut out_file = std::fs::File::create(out_path).map_err(|e| {
+        let out_file = std::fs::File::create(out_path).map_err(|e| {
             CliError::Other(format!("create output file {}: {e}", out_path.display()))
         })?;
-        let mut reader = BufReader::new(stdout);
-        io::copy(&mut reader, &mut out_file)
-            .map_err(|e| CliError::Other(format!("copy kubectl exec stdout → file: {e}")))?;
+        match first_output_within {
+            None => copy_exec_stdout(stdout, out_file, None)?,
+            Some(bound) => {
+                // The copy runs on its own thread so this one can stop
+                // waiting: the copier reports its first byte, and a command
+                // that has written nothing by `bound` has kubectl killed under
+                // it. kubectl is one process, so killing it closes the pipe
+                // and the copier ends; it is not joined all the same, because
+                // anything else holding the pipe open would hold this call.
+                let (first_byte, first_byte_seen) = std::sync::mpsc::channel();
+                let copier =
+                    thread::spawn(move || copy_exec_stdout(stdout, out_file, Some(first_byte)));
+                match first_byte_seen.recv_timeout(bound) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(backup_core::kube::no_output_error(
+                            "exec_stream_to_file",
+                            argv,
+                            ns,
+                            pod,
+                            bound,
+                        ));
+                    }
+                    // The first byte arrived, or the copier already finished
+                    // (EOF before any output, or a write error): either way
+                    // the copy's own result says the rest.
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+                }
+                copier.join().map_err(|_| {
+                    CliError::Other("copy kubectl exec stdout → file: the copy panicked".into())
+                })??;
+            }
+        }
 
         let status = child
             .wait()
@@ -1230,6 +1659,7 @@ impl KubeExec for KubectlExec {
         argv: &[&str],
         in_path: &Path,
     ) -> Result<()> {
+        self.refuse_if_interrupted()?;
         let mut cmd = Command::new(&self.kubectl_bin);
         cmd.arg("exec")
             .arg("-i")
@@ -1287,7 +1717,13 @@ impl KubeExec for KubectlExec {
     }
 
     fn delete_pod_best_effort(&self, name: &str, ns: &str) {
-        let _ = Command::new(&self.kubectl_bin)
+        // After an interrupt the interrupt's cleanup deletes this command's
+        // helpers, by uid; a delete by name from here could take a pod of the
+        // same name that this command never created.
+        if self.interrupted() {
+            return;
+        }
+        let deleted = Command::new(&self.kubectl_bin)
             .args([
                 "delete",
                 "pod",
@@ -1301,9 +1737,16 @@ impl KubeExec for KubectlExec {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        // Forgotten only when the delete went through: one that failed (or
+        // whose kubectl died of the same Ctrl-C) leaves the pod for the
+        // interrupt's cleanup.
+        if deleted.is_ok_and(|status| status.success()) {
+            self.helpers.deleted(ns, name);
+        }
     }
 
     fn get_secret_key(&self, secret: &str, ns: &str, key: &str) -> Result<String> {
+        self.refuse_if_interrupted()?;
         let out = Command::new(&self.kubectl_bin)
             .args([
                 "get",
@@ -1345,6 +1788,7 @@ impl KubeExec for KubectlExec {
     }
 
     fn get_json(&self, args: &[&str]) -> Result<Option<serde_json::Value>> {
+        self.refuse_if_interrupted()?;
         let mut c = Command::new(&self.kubectl_bin);
         c.args(args).env("KUBECONFIG", &self.kubeconfig);
 
@@ -1380,6 +1824,9 @@ impl KubeExec for KubectlExec {
 /// `namespaces` when `select` is set. Writes `<out>/{pg,volumes,redis}/…`
 /// plus a `<out>/manifest.json`. No CRs, no secrets, no encryption.
 pub fn run_export(namespaces: &[String], select: bool, out: Option<&str>) -> Result<()> {
+    // First, so it is dropped last: Ctrl-C deletes the helper pods this
+    // command created (`helper_interrupt`).
+    let _interruptible = helper_interrupt::install(None);
     // D11 / 2.22a: the external binaries this command spawns, checked
     // BEFORE any prompt, kubeconfig or provider call. The reported bug
     // was a passphrase typed into a command that could not have worked.
@@ -1404,7 +1851,7 @@ pub fn run_export(namespaces: &[String], select: bool, out: Option<&str>) -> Res
     let claims = claims_in_namespaces(&ns_set, kc.path())?;
     let plan = plan_extraction(&claims);
     let pg_image = pg_helper_image(first_cnpg_image(&ns_set, kc.path()).as_deref());
-    run_extraction(&k, &plan, &out_dir, &pg_image)?;
+    export_extract(&k, &plan, &out_dir, &pg_image)?;
 
     let platform_version = read_platform_version(kc.path())?;
     let manifest = export_manifest(&cluster_id, &platform_version, &ns_set, &claims);
@@ -1422,6 +1869,26 @@ pub fn run_export(namespaces: &[String], select: bool, out: Option<&str>) -> Res
         )
     );
     Ok(())
+}
+
+/// Extract an export's data: every helper pod, sized as an interactive
+/// command's helpers are.
+///
+/// No deadline stops an export, so its helper pods' keep-alive is the only
+/// limit on one extraction: the cluster's backup deadline, never less than
+/// six hours however short a frequent schedule has made it
+/// ([`backup_core::engine::read_helper_keep_alive`]). The read is here rather
+/// than in [`run_export`] so the tests drive it: a keep-alive sized from the
+/// schedule's deadline alone once cut a long restore short, and what guards
+/// against it coming back is the pod specs this builds.
+fn export_extract(
+    k: &dyn KubeExec,
+    plan: &[backup_core::extract::ExtractItem],
+    out_dir: &Path,
+    pg_image: &str,
+) -> Result<()> {
+    let keep_alive = backup_core::engine::read_helper_keep_alive(k)?;
+    run_extraction(k, plan, out_dir, pg_image, keep_alive)
 }
 
 /// The output directory for `export`: the `--out` path, else
@@ -1546,6 +2013,9 @@ pub fn run_backup(
     passphrase: Option<&str>,
     staging_mode: Option<&str>,
 ) -> Result<()> {
+    // First, so it is dropped last: Ctrl-C deletes the helper pods this
+    // command created (`helper_interrupt`).
+    let _interruptible = helper_interrupt::install(None);
     // D11 / 2.22a: the external binaries this command spawns, checked
     // BEFORE any prompt, kubeconfig or provider call. The reported bug
     // was a passphrase typed into a command that could not have worked.
@@ -1583,6 +2053,8 @@ pub fn run_backup(
     // scheduled runner does — otherwise it lands as an unidentified snapshot in
     // a pool two clusters draw from.
     let cluster_uid = read_cluster_uid(kc.path())?;
+    // The name its snapshots carry, as the scheduled runner's do.
+    let backup_host = cluster_backup_host(spec_backup_from_cluster(Some(kc.path()))?.as_ref());
 
     let pg_image = pg_helper_image(first_cnpg_image(&ns_set, kc.path()).as_deref());
     let platform_version = read_platform_version(kc.path())?;
@@ -1594,6 +2066,7 @@ pub fn run_backup(
         .map_err(|e| CliError::Other(format!("create staging dir: {e}")))?;
 
     let opts = local_pull_backup_opts(
+        &k,
         &repo_str,
         pass,
         &cluster_id,
@@ -1604,9 +2077,10 @@ pub fn run_backup(
         staging.path(),
         pg_image,
         staging_mode,
-    );
+        backup_host,
+    )?;
 
-    let r = SubprocessRestic;
+    let r = RefusingAfterInterrupt(SubprocessRestic);
     let summary = backup_core::engine::run_backup_with_summary(&k, &r, &opts)?;
 
     print!(
@@ -1616,16 +2090,70 @@ pub fn run_backup(
     Ok(())
 }
 
+/// A [`ResticRunner`] that starts no restic once the command has been
+/// interrupted (`helper_interrupt`), as [`KubectlExec`] starts no kubectl: a
+/// SIGTERM sent to the CLI alone leaves the command's own thread running
+/// until the interrupt exits, and a `restic backup` begun in that time would
+/// write a snapshot after the user stopped the command.
+struct RefusingAfterInterrupt<R>(R);
+
+impl<R: ResticRunner> ResticRunner for RefusingAfterInterrupt<R> {
+    fn run(&self, argv: &[String], passphrase: &str) -> Result<()> {
+        helper_interrupt::refuse_if_interrupted()?;
+        self.0.run(argv, passphrase)
+    }
+
+    fn run_stdout(&self, argv: &[String], passphrase: &str) -> Result<String> {
+        helper_interrupt::refuse_if_interrupted()?;
+        self.0.run_stdout(argv, passphrase)
+    }
+
+    fn run_backup(&self, argv: &[String], passphrase: &str) -> Result<Option<String>> {
+        helper_interrupt::refuse_if_interrupted()?;
+        self.0.run_backup(argv, passphrase)
+    }
+
+    fn run_capture(&self, argv: &[String], passphrase: &str) -> Result<backup_core::ResticOutput> {
+        helper_interrupt::refuse_if_interrupted()?;
+        self.0.run_capture(argv, passphrase)
+    }
+}
+
+/// The restic `--host` a backup of this cluster carries: the
+/// `spec.backup.clusterName` the runner is given, else the runner's own
+/// default ([`backup_core::engine::DEFAULT_BACKUP_HOST`]). Pure.
+///
+/// `backup list` shows the host as the snapshot's CLUSTER. `backup create`
+/// used to pass none, so restic stamped the workstation's hostname, and a
+/// cluster's own snapshots listed under two names — the runner's and the
+/// laptop's — depending on who took them.
+fn cluster_backup_host(spec_backup: Option<&Value>) -> String {
+    spec_backup
+        .and_then(|s| s.pointer("/clusterName"))
+        .and_then(Value::as_str)
+        .filter(|n| !n.is_empty())
+        .unwrap_or(backup_core::engine::DEFAULT_BACKUP_HOST)
+        .to_string()
+}
+
 /// Assemble the [`BackupOpts`] the CLI local-pull path hands to the engine.
 ///
-/// Pure — extracted from [`run_backup`] and called from both there and the
-/// tests. INVARIANT: `backup_host` is `None`. The CLI pull keeps the operator
-/// workstation's own hostname as the restic group, which is what makes
-/// per-station grouping work; only the in-cluster runner pins
-/// `Some("apprafter-backup")` because its pod name is ephemeral (spec
-/// §Retention M-r3-1a).
+/// Extracted from [`run_backup`] and called from both there and the tests.
+/// INVARIANT: `backup_host` is the cluster's name ([`cluster_backup_host`]),
+/// the one the scheduled runner stamps — never the workstation's hostname.
+///
+/// The one cluster read is the helper pods' keep-alive
+/// ([`backup_core::engine::read_helper_keep_alive`]). An interactive backup
+/// has no Job deadline — the person running it is the one who stops it — so
+/// that keep-alive is the only limit on one extraction: the cluster's backup
+/// deadline, never less than six hours however short a frequent schedule has
+/// made it. The scheduled runner follows the same rule, so both build one
+/// spec for a helper's name. It is read here, not passed in, so the tests
+/// drive the read itself: a keep-alive sized from the schedule's deadline
+/// alone once cut a long restore short.
 #[allow(clippy::too_many_arguments)]
 fn local_pull_backup_opts(
+    k: &dyn KubeExec,
     repo: &str,
     passphrase: String,
     cluster_id: &str,
@@ -1636,8 +2164,9 @@ fn local_pull_backup_opts(
     staging_root: &Path,
     pg_image: String,
     staging_mode: StagingMode,
-) -> BackupOpts {
-    BackupOpts {
+    backup_host: String,
+) -> Result<BackupOpts> {
+    Ok(BackupOpts {
         repo: repo.to_string(),
         passphrase,
         cluster_id: cluster_id.to_string(),
@@ -1648,9 +2177,10 @@ fn local_pull_backup_opts(
         is_subset,
         staging_root: staging_root.to_path_buf(),
         pg_image,
+        helper_keep_alive: backup_core::engine::read_helper_keep_alive(k)?,
         staging_mode,
-        backup_host: None,
-    }
+        backup_host: Some(backup_host),
+    })
 }
 
 /// The operator-facing summary `backup` prints on success. Pure — extracted
@@ -1713,11 +2243,68 @@ fn backup_summary_report(
 /// The CronJob the platform chart deploys for scheduled backup.
 pub(crate) const BACKUP_CRONJOB_NAME: &str = "apprafter-backup";
 
+/// The CronJob the platform chart deploys for the weekly repository check.
+pub(crate) const CHECK_CRONJOB_NAME: &str = "apprafter-backup-check";
+
+/// Name prefix of the Jobs `backup run` creates ([`manual_job_name`]).
+const MANUAL_JOB_PREFIX: &str = "apprafter-backup-manual-";
+
 /// Name for a manually triggered backup Job: the CronJob's name, `manual`,
 /// and a UTC stamp, which is what makes two runs in the same minute
 /// distinguishable and any run identifiable in `kubectl get jobs`.
 fn manual_job_name(stamp: &str) -> String {
-    format!("{BACKUP_CRONJOB_NAME}-manual-{stamp}")
+    format!("{MANUAL_JOB_PREFIX}{stamp}")
+}
+
+/// Which of the two runners a Job is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RunnerJob {
+    /// A backup: the backup CronJob's, or one `backup run` created.
+    Backup,
+    /// A repository check: the check CronJob's.
+    Check,
+}
+
+/// Is `job` a backup or check runner, and which? `None` for any other Job.
+/// Pure.
+///
+/// The operator's `BackupHealthy` rule, exactly (`Run::owns` in the
+/// platform-stack controller's `backup_health.rs`), so the CLI and the
+/// cluster's status count the same Jobs:
+///
+/// * A Job with a CronJob owner is that CronJob's: `apprafter-backup` or
+///   `apprafter-backup-check`, whatever the Job is called. The Job controller
+///   sets the owner on every scheduled Job, and `kubectl create job
+///   --from=cronjob/<name> <any-name>` sets it too.
+/// * A Job with no owner is a backup only when `backup run` created it: its
+///   name and its `apprafter.io/manual` label ([`job_from_cronjob`] leaves the
+///   owner off on purpose, so the Job outlives its CronJob).
+///
+/// It used to be the name prefix `apprafter-backup`, while the operator used
+/// the owner. A Job made the usual Kubernetes way under another name was
+/// counted by the operator and invisible here: `backup status` printed
+/// "Last backup Job: none" beside it, and `backup run` started a second
+/// runner next to it.
+pub(crate) fn runner_job(job: &Value) -> Option<RunnerJob> {
+    let cronjob_owner = job
+        .pointer("/metadata/ownerReferences")
+        .and_then(Value::as_array)
+        .and_then(|refs| {
+            refs.iter()
+                .find(|r| r.get("kind").and_then(Value::as_str) == Some("CronJob"))
+        })
+        .map(|r| r.get("name").and_then(Value::as_str).unwrap_or(""));
+    match cronjob_owner {
+        Some(BACKUP_CRONJOB_NAME) => Some(RunnerJob::Backup),
+        Some(CHECK_CRONJOB_NAME) => Some(RunnerJob::Check),
+        Some(_) => None,
+        None => (job_metadata_name(job).starts_with(MANUAL_JOB_PREFIX)
+            && job
+                .pointer("/metadata/labels/apprafter.io~1manual")
+                .and_then(Value::as_str)
+                == Some("true"))
+        .then_some(RunnerJob::Backup),
+    }
 }
 
 /// Build a Job manifest from a CronJob's `spec.jobTemplate`.
@@ -1889,18 +2476,178 @@ pub fn run_backup_trigger(wait: bool, timeout_minutes: u64) -> Result<()> {
     instantiate_backup_job(&cronjob, wait, timeout_minutes, kc.path())
 }
 
+/// A backup or check Job that has not finished, as `backup run` finds it
+/// before it starts another ([`active_runner_jobs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveJob {
+    name: String,
+    /// What it is doing, as `backup status` prints it (`Running`, `Pending,
+    /// cannot be scheduled: …`), or `Stopping (<reason>)` once the Job
+    /// controller has begun to fail it.
+    state: String,
+    /// Its pod ([`job_pod`]).
+    pod: JobPod,
+    /// The lines `backup status` prints under it ([`job_pod::status_hint`]).
+    hint: Option<String>,
+    /// Its `activeDeadlineSeconds`; `None` for a Job of a chart that set none.
+    deadline: Option<u64>,
+}
+
+/// The reason of `job`'s condition of type `kind` when it is True.
+fn true_condition_reason(job: &Value, kind: &str) -> Option<String> {
+    job.pointer("/status/conditions")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|c| {
+            c.get("type").and_then(Value::as_str) == Some(kind)
+                && c.get("status").and_then(Value::as_str) == Some("True")
+        })
+        .map(|c| {
+            c.get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or(kind)
+                .to_string()
+        })
+}
+
+/// The backup and check Jobs ([`runner_job`]) that have not finished, newest
+/// first: no `Complete` or `Failed` condition, nothing succeeded, and not
+/// being deleted. Pure.
+///
+/// A Job the Job controller has begun to fail (`FailureTarget`) counts: its
+/// runner is still stopping, and holds its room and its repository lock
+/// until it has.
+fn active_runner_jobs(jobs: &[Value], pods: &[Value]) -> Vec<ActiveJob> {
+    let mut active: Vec<&Value> = jobs
+        .iter()
+        .filter(|j| runner_job(j).is_some())
+        .filter(|j| j.pointer("/metadata/deletionTimestamp").is_none())
+        .filter(|j| job_run_outcome(j) == JobOutcome::Running)
+        .filter(|j| {
+            j.pointer("/status/succeeded")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                == 0
+        })
+        .collect();
+    active.sort_by_key(|j| std::cmp::Reverse(job_start_time(j)));
+    active
+        .into_iter()
+        .map(|j| {
+            let pod = job_pod(j, pods);
+            let state = match true_condition_reason(j, "FailureTarget") {
+                Some(r) => format!("Stopping ({r})"),
+                None => job_line_outcome(j, pods),
+            };
+            ActiveJob {
+                name: job_metadata_name(j).to_string(),
+                hint: job_pod::status_hint(j, &pod),
+                deadline: job_pod::deadline_of(j),
+                state,
+                pod,
+            }
+        })
+        .collect()
+}
+
+/// What `backup run` does instead of starting a run beside a backup or
+/// check Job that has not finished: the report it prints and the error it
+/// exits with. `None` when no such Job is active. Pure.
+///
+/// One run at a time. Two runs at once do not both finish: two backups need
+/// the same helper pods, and a backup and a check each fail on the other's
+/// repository lock, since neither waits for one. On a node with room for one
+/// runner, the second would not even be scheduled, and `backup run` would
+/// give up on it and report the scheduled backup as unable to start while
+/// that was the one running. A Job no node takes, or whose container cannot
+/// start, may hold on until its deadline — or, with no deadline, until it is
+/// deleted — so for those the report also says how to clear it, once.
+fn refusal(jobs: &[Value], pods: &[Value]) -> Option<(String, CliError)> {
+    let active = active_runner_jobs(jobs, pods);
+    let first = active.first()?;
+    let mut out = String::new();
+    for a in &active {
+        out.push_str(&format!("  ✗ {} has not finished: {}\n", a.name, a.state));
+        if let Some(hint) = &a.hint {
+            out.push_str(hint);
+        }
+        let clear = job_pod::delete_command(PLATFORMSTACK_NAMESPACE, &a.name);
+        let hint_clears_it = a.hint.as_deref().is_some_and(|h| h.contains(&clear));
+        if matches!(
+            a.pod,
+            JobPod::Unschedulable { .. } | JobPod::NotStarted { reason: Some(_) }
+        ) && !hint_clears_it
+        {
+            let why = match a.deadline {
+                Some(_) => {
+                    "It may hold on until its deadline stops it. To start a new run sooner, \
+                     delete it first:"
+                }
+                None => {
+                    "It has no deadline, so nothing stops it: it holds on until it runs or is \
+                     deleted. To start a new run, delete it first:"
+                }
+            };
+            out.push_str(&format!("    {why}\n      {clear}\n"));
+        }
+    }
+    out.push_str(&format!(
+        "    A second run beside {} would not finish: two backups need the same helper pods, \
+         and a backup and a check each fail on the other's repository lock.\n",
+        if active.len() == 1 { "it" } else { "them" }
+    ));
+    Some((
+        out,
+        CliError::BackupJobActive {
+            job: first.name.clone(),
+        },
+    ))
+}
+
+/// The other backup and check Jobs whose runner is running: each holds room
+/// of the size `own`'s runner needs. Pure.
+fn room_holders(own: &str, jobs: &[Value], pods: &[Value]) -> Vec<String> {
+    active_runner_jobs(jobs, pods)
+        .into_iter()
+        .filter(|a| a.name != own && a.pod == JobPod::Running)
+        .map(|a| a.name)
+        .collect()
+}
+
 /// Create a one-off Job from `cronjob` and, unless told not to, wait for it.
 ///
 /// Shared by `backup run` and by `backup enable`'s first backup, so both
 /// produce the same object and the same reporting — a first backup that
 /// differed from a manual one would make neither of them evidence about the
 /// other.
+///
+/// Nothing is created while a backup or check Job has not finished
+/// ([`refusal`]), `--no-wait` included.
 fn instantiate_backup_job(
     cronjob: &Value,
     wait: bool,
     timeout_minutes: u64,
     kubeconfig: &Path,
 ) -> Result<()> {
+    let jobs = backup_jobs_of(
+        kubectl_get_json("jobs", None, Some(PLATFORMSTACK_NAMESPACE), kubeconfig)?.as_ref(),
+    );
+    let pods = if jobs
+        .iter()
+        .any(|j| job_run_outcome(j) == JobOutcome::Running)
+    {
+        kubectl_get_json("pods", None, Some(PLATFORMSTACK_NAMESPACE), kubeconfig)?
+            .as_ref()
+            .map(items_of)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if let Some((report, err)) = refusal(&jobs, &pods) {
+        print!("{report}");
+        return Err(err);
+    }
+
     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
     let name = manual_job_name(&stamp);
     let manifest = job_from_cronjob(cronjob, &name)?;
@@ -1970,16 +2717,136 @@ fn wait_for_synced_cronjob(
     }
 }
 
+/// What the wait does after one look at the Job and its pods.
+#[derive(Debug, PartialEq, Eq)]
+enum WaitStep {
+    /// The Job's `Complete` condition is True.
+    Succeeded,
+    /// The Job's `Failed` condition is True: its reason and message.
+    Failed(String),
+    /// The Job is gone.
+    Vanished,
+    /// Its pod has been unschedulable for `for_`, past [`grace_for`] its
+    /// reason: the scheduler's message and what it says, what the runner asks
+    /// for ([`job_pod::runner_requests`]), and the attempts that failed before
+    /// this one with the newest one's reason.
+    Unschedulable {
+        message: String,
+        cause: Unplaced,
+        requests: Option<String>,
+        for_: Duration,
+        failed: u64,
+        last_failure: Option<String>,
+    },
+    /// The caller's `--timeout` is up, with the pod in this state.
+    TimedOut(JobPod),
+    /// Keep waiting: the pod's state, and how long it has been unschedulable
+    /// when it is.
+    Wait(JobPod, Option<Duration>),
+    /// Keep waiting, with the clock stopped: no room for the pod, but these
+    /// pods are stopping, and the room they give back may be what it needs.
+    RoomReturning { pod: JobPod, stopping: Vec<String> },
+}
+
+/// Decide the wait's next step from one observation. Pure: the loop in
+/// [`wait_for_backup_job`] fetches, and `now`/`waited` come in as values, so
+/// the order of the checks is pinned by tests instead of by a cluster.
+///
+/// The order matters. The Job's own verdict comes first: a Job that finished
+/// has finished, whatever its pods look like. A pod no node can take comes
+/// before the timeout, because a known reason beats "no longer waiting".
+/// The timeout comes last.
+///
+/// `stopping` is [`job_pod::stopping_pods`] of the whole cluster, read only
+/// while the pod has no room: while it is not empty, the room those pods
+/// give back may be what the runner waits for, and the clock does not run.
+/// It applies to a lack of room only; a node condition or another rule of
+/// the nodes does not change as pods leave.
+fn wait_step(
+    job: Option<&Value>,
+    pods: &[Value],
+    stopping: &[String],
+    clock: &mut UnschedulableClock,
+    now: std::time::Instant,
+    waited: Duration,
+    timeout: Duration,
+) -> WaitStep {
+    let Some(job) = job else {
+        return WaitStep::Vanished;
+    };
+    match job_run_outcome(job) {
+        JobOutcome::Succeeded => return WaitStep::Succeeded,
+        JobOutcome::Failed(why) => return WaitStep::Failed(why),
+        JobOutcome::Running => {}
+    }
+    let pod = job_pod(job, pods);
+    let cause = match &pod {
+        JobPod::Unschedulable { message, .. } => Some(unplaced(message)),
+        _ => None,
+    };
+    if cause == Some(Unplaced::NoRoom) && !stopping.is_empty() {
+        clock.reset();
+        if waited >= timeout {
+            return WaitStep::TimedOut(pod);
+        }
+        return WaitStep::RoomReturning {
+            pod,
+            stopping: stopping.to_vec(),
+        };
+    }
+    let unschedulable_for = clock.observe(&pod, now);
+    if let (JobPod::Unschedulable { message, .. }, Some(cause), Some(for_)) =
+        (&pod, cause, unschedulable_for)
+    {
+        if for_ >= grace_for(&cause) {
+            return WaitStep::Unschedulable {
+                message: message.clone(),
+                cause,
+                requests: job_pod::runner_requests(job),
+                for_,
+                failed: job
+                    .pointer("/status/failed")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                last_failure: job_pod::last_failed_attempt(job, pods),
+            };
+        }
+    }
+    if waited >= timeout {
+        return WaitStep::TimedOut(pod);
+    }
+    WaitStep::Wait(pod, unschedulable_for)
+}
+
 /// Poll a backup Job to its terminal state, reporting progress while it runs.
 ///
 /// A timeout is NOT a failure of the backup: the Job keeps running in the
 /// cluster, and saying otherwise would send an operator to clean up after a
 /// backup that is still in progress. The message says so and hands over the
-/// two commands that follow it.
+/// two commands that follow it. It exits 0 only while no attempt of the Job
+/// has failed: once one has, the timeout is an error that says why the last
+/// one failed ([`job_pod::timed_out_failing`]), because a Job whose attempts
+/// fail has taken no backup, and each attempt can take many minutes to fail.
+/// Each failed attempt is also said as soon as it is seen, with its reason
+/// ([`job_pod::failed_attempt_note`]).
+///
+/// A pod no node takes is different: it is not a backup in progress. Once it
+/// has been unschedulable for [`grace_for`] its reason ([`job_pod::UNSCHEDULABLE_GRACE`]
+/// for a lack of room, longer for a condition of the node that lifts by
+/// itself), this deletes the Job and fails with the scheduler's reason. Time
+/// in which pods elsewhere are stopping does not count toward a lack of room.
+/// Deleting the Job matters. Left in place, it would start on its own
+/// whenever a node took it, at a time nobody chose and possibly beside the
+/// scheduled backup, where two runs that need the same helper pod do not
+/// both finish. On a chart whose Job has no deadline it would also never go
+/// away.
 fn wait_for_backup_job(name: &str, timeout_minutes: u64, kubeconfig: &Path) -> Result<()> {
     let deadline = Duration::from_secs(timeout_minutes * 60);
     let started = std::time::Instant::now();
     let mut last_note = std::time::Instant::now();
+    let mut clock = UnschedulableClock::default();
+    let mut noted_stopping = false;
+    let mut noted_failures: u64 = 0;
 
     println!(
         "  waiting for it to finish (up to {timeout_minutes}m; Ctrl-C is safe — the Job \
@@ -1987,8 +2854,78 @@ fn wait_for_backup_job(name: &str, timeout_minutes: u64, kubeconfig: &Path) -> R
     );
     loop {
         let job = kubectl_get_json("job", Some(name), Some(PLATFORMSTACK_NAMESPACE), kubeconfig)?;
-        match job.as_ref().map(job_run_outcome) {
-            Some(JobOutcome::Succeeded) => {
+        // The pods are read only while the Job has not finished: they are
+        // what tells a runner that is working from one that never started.
+        let pods = match &job {
+            Some(j) if job_run_outcome(j) == JobOutcome::Running => {
+                kubectl_get_json("pods", None, Some(PLATFORMSTACK_NAMESPACE), kubeconfig)?
+                    .as_ref()
+                    .map(items_of)
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        // Pods stopping anywhere in the cluster, read only while the pod has
+        // no room: that is when the room they give back matters. Best-effort:
+        // without the listing the wait gives up at the usual time.
+        let stopping = match &job {
+            Some(j)
+                if matches!(
+                    &job_pod(j, &pods),
+                    JobPod::Unschedulable { message, .. } if unplaced(message) == Unplaced::NoRoom
+                ) =>
+            {
+                kubectl_get_json_cluster_wide("pods", None, kubeconfig)
+                    .ok()
+                    .flatten()
+                    .as_ref()
+                    .map(|l| job_pod::stopping_pods(&items_of(l)))
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        let now = std::time::Instant::now();
+        let step = wait_step(
+            job.as_ref(),
+            &pods,
+            &stopping,
+            &mut clock,
+            now,
+            started.elapsed(),
+            deadline,
+        );
+        let was_stopping = std::mem::replace(
+            &mut noted_stopping,
+            matches!(step, WaitStep::RoomReturning { .. }),
+        );
+        // A failed attempt of a Job that has not finished: said once, with
+        // its reason. A finished Job reports its own ending below.
+        let failures = unfinished_failures(job.as_ref(), &step);
+        let why = match &job {
+            Some(j)
+                if failures > 0
+                    && (failures > noted_failures || matches!(step, WaitStep::TimedOut(_))) =>
+            {
+                failed_attempt_reason(j, &pods, kubeconfig)
+            }
+            _ => None,
+        };
+        if failures > noted_failures {
+            if let Some(j) = &job {
+                let attempts = j
+                    .pointer("/spec/backoffLimit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(6)
+                    + 1;
+                println!(
+                    "{}",
+                    job_pod::failed_attempt_note(failures, attempts, why.as_deref())
+                );
+            }
+            noted_failures = failures;
+        }
+        match step {
+            WaitStep::Succeeded => {
                 println!(
                     "✓ Backup complete in {}.",
                     format_elapsed(started.elapsed().as_secs())
@@ -1996,7 +2933,7 @@ fn wait_for_backup_job(name: &str, timeout_minutes: u64, kubeconfig: &Path) -> R
                 println!("  `apprafter backup list` shows the new snapshot.");
                 return Ok(());
             }
-            Some(JobOutcome::Failed(why)) => {
+            WaitStep::Failed(why) => {
                 print_job_log_tail(name, kubeconfig);
                 return Err(CliError::Other(format!(
                     "backup Job {name} failed after {}: {why}\n  \
@@ -2006,31 +2943,129 @@ fn wait_for_backup_job(name: &str, timeout_minutes: u64, kubeconfig: &Path) -> R
             }
             // A Job that vanished mid-wait was deleted by someone else;
             // reporting success or failure would both be guesses.
-            None => {
+            WaitStep::Vanished => {
                 return Err(CliError::Other(format!(
                     "backup Job {name} disappeared while waiting for it — someone or something \
                      deleted it. `apprafter backup status` shows what the cluster has now."
                 )));
             }
-            Some(JobOutcome::Running) => {}
-        }
-        if started.elapsed() >= deadline {
-            println!(
-                "  still running after {timeout_minutes}m — no longer waiting. The Job is NOT \
-                 cancelled:\n    kubectl -n {PLATFORMSTACK_NAMESPACE} logs -f job/{name}\n    \
-                 apprafter backup status"
-            );
-            return Ok(());
-        }
-        if last_note.elapsed() >= Duration::from_secs(30) {
-            println!(
-                "  … still running ({})",
-                format_elapsed(started.elapsed().as_secs())
-            );
-            last_note = std::time::Instant::now();
+            WaitStep::Unschedulable {
+                message,
+                cause,
+                requests,
+                for_,
+                failed,
+                last_failure,
+            } => {
+                // Another runner that is running holds room of the same size,
+                // and may be the scheduled backup itself: the report names it
+                // rather than say the scheduled backup cannot start.
+                // Best-effort: without the listing the report is the general one.
+                let holders = if cause == Unplaced::NoRoom {
+                    kubectl_get_json("jobs", None, Some(PLATFORMSTACK_NAMESPACE), kubeconfig)
+                        .ok()
+                        .flatten()
+                        .map(|l| room_holders(name, &backup_jobs_of(Some(&l)), &pods))
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let give_up = job_pod::GiveUp {
+                    namespace: PLATFORMSTACK_NAMESPACE,
+                    name,
+                    message: &message,
+                    cause: &cause,
+                    requests: requests.as_deref(),
+                    holders: &holders,
+                    failed,
+                    last_failure: last_failure.as_deref(),
+                };
+                let deleted = kubectl_delete("job", name, PLATFORMSTACK_NAMESPACE, kubeconfig)
+                    .map_err(|e| e.to_string());
+                print!("{}", job_pod::unschedulable_report(&give_up, deleted));
+                let (what, help) = job_pod::give_up_error(&give_up, for_);
+                return Err(CliError::BackupRunnerUnschedulable {
+                    job: name.to_string(),
+                    what,
+                    help,
+                });
+            }
+            WaitStep::TimedOut(pod) => {
+                println!(
+                    "{}",
+                    job_pod::timeout_note(&pod, timeout_minutes, PLATFORMSTACK_NAMESPACE, name)
+                );
+                return timed_out(name, timeout_minutes, failures, why.as_deref());
+            }
+            WaitStep::Wait(pod, unschedulable_for) => {
+                // A new streak of "cannot be scheduled" is said at once, not
+                // up to 30 s later: it is the one state with a countdown.
+                if last_note.elapsed() >= Duration::from_secs(30)
+                    || unschedulable_for == Some(Duration::ZERO)
+                {
+                    println!(
+                        "{}",
+                        job_pod::progress_note(&pod, started.elapsed(), unschedulable_for)
+                    );
+                    last_note = now;
+                }
+            }
+            WaitStep::RoomReturning { stopping, .. } => {
+                if last_note.elapsed() >= Duration::from_secs(30) || !was_stopping {
+                    println!("{}", job_pod::stopping_note(&stopping, started.elapsed()));
+                    last_note = now;
+                }
+            }
         }
         thread::sleep(JOB_POLL_INTERVAL);
     }
+}
+
+/// How many attempts of `job` have failed while it has not finished: its
+/// `status.failed` on a step that goes on waiting or ends the wait at the
+/// timeout, and 0 on any other, where the Job's own ending (or its pod no
+/// node takes) is the report. Pure.
+fn unfinished_failures(job: Option<&Value>, step: &WaitStep) -> u64 {
+    match (job, step) {
+        (Some(j), WaitStep::Wait(..) | WaitStep::RoomReturning { .. } | WaitStep::TimedOut(_)) => j
+            .pointer("/status/failed")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// How the wait ends at its `--timeout`: `Ok` while no attempt has failed,
+/// an error naming the last one's reason once `failures` have
+/// ([`job_pod::timed_out_failing`]). Pure.
+fn timed_out(name: &str, timeout_minutes: u64, failures: u64, why: Option<&str>) -> Result<()> {
+    if failures == 0 {
+        return Ok(());
+    }
+    Err(CliError::Other(job_pod::timed_out_failing(
+        name,
+        timeout_minutes,
+        failures,
+        why,
+    )))
+}
+
+/// Why the newest failed attempt of `job` failed: the runner's own
+/// `lastError` when it recorded one during that attempt
+/// ([`job_pod::runner_error_during`]), else what its pod says
+/// ([`job_pod::last_failed_attempt`]). Best-effort: a status ConfigMap that
+/// cannot be read leaves the pod's reason.
+fn failed_attempt_reason(job: &Value, pods: &[Value], kubeconfig: &Path) -> Option<String> {
+    let record = kubectl_get_json(
+        "configmap",
+        Some("apprafter-backup-status"),
+        Some(PLATFORMSTACK_NAMESPACE),
+        kubeconfig,
+    )
+    .ok()
+    .flatten();
+    job_pod::runner_error_during(job, pods, record.as_ref())
+        .or_else(|| job_pod::last_failed_attempt(job, pods))
 }
 
 /// `Xm Ys`, or `Ys` under a minute. Pure.
@@ -2928,7 +3963,49 @@ const BACKUP_SET_KEYS: &[&str] = &[
     "enforce",
     "staging-mode",
     "failure-webhook",
+    "deadline",
+    "check-deadline",
 ];
+
+/// The shortest Job deadline `backup set` writes, and the CRD's own minimum.
+const MIN_JOB_DEADLINE_SECS: u64 = 600;
+
+/// Parse a Job deadline written as a whole number of hours, minutes or
+/// seconds — `6h`, `90m`, `43200s` — into seconds.
+///
+/// One unit, no fractions and no bare numbers: a bare `6` is exactly the
+/// ambiguity (hours? seconds?) a deadline must not have, since the wrong
+/// reading either stops every run or never stops a stuck one.
+fn parse_job_deadline(key: &str, value: &str) -> Result<u64> {
+    let refuse = |why: &str| {
+        CliError::Other(format!(
+            "{key} takes a duration like `6h`, `90m` or `43200s` — got `{value}`: {why}. \
+             It must stay shorter than the interval between two runs of its schedule, and \
+             longer than the slowest run expected to succeed."
+        ))
+    };
+    let per_unit = match value.chars().last() {
+        Some('h') => 3600,
+        Some('m') => 60,
+        Some('s') => 1,
+        _ => return Err(refuse("the unit must be h, m or s")),
+    };
+    // The unit is one ASCII byte, so this slice is on a char boundary.
+    let digits = &value[..value.len() - 1];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(refuse("expected a whole number before the unit"));
+    }
+    let secs = digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(per_unit))
+        .filter(|s| i64::try_from(*s).is_ok())
+        .ok_or_else(|| refuse("too large"))?;
+    if secs < MIN_JOB_DEADLINE_SECS {
+        return Err(refuse("the minimum is 10m"));
+    }
+    Ok(secs)
+}
 
 /// Is this a value restic's `--read-data-subset` would accept?
 ///
@@ -2945,7 +4022,12 @@ fn is_read_data_subset(v: &str) -> bool {
     if let Some((n, t)) = v.split_once('/') {
         return matches!((n.parse::<u64>(), t.parse::<u64>()), (Ok(n), Ok(t)) if t > 0 && n >= 1 && n <= t);
     }
-    let (digits, suffix) = v.split_at(v.len().saturating_sub(1));
+    // Split before the last CHARACTER, not the last byte: a byte index lands
+    // inside a multi-byte character (`5é`) and `split_at` panics there.
+    let Some((last, _)) = v.char_indices().next_back() else {
+        return false;
+    };
+    let (digits, suffix) = v.split_at(last);
     matches!(suffix, "k" | "K" | "m" | "M" | "g" | "G" | "t" | "T")
         && !digits.is_empty()
         && digits.parse::<u64>().is_ok_and(|n| n > 0)
@@ -3056,9 +4138,14 @@ fn backup_set_patch(key: &str, value: &str) -> Result<Value> {
             field.insert("retention".into(), Value::Object(retention));
         }
         "enforce" => {
-            if !matches!(value, "operator" | "cluster") {
+            if !matches!(value, "check" | "cluster" | "operator") {
                 return Err(CliError::Other(format!(
-                    "enforce takes `operator` or `cluster` — got `{value}`"
+                    "enforce takes `check`, `cluster` or `operator` — got `{value}`.\n  \
+                     check:    the weekly check Job prunes after a check that passed, as far \
+                     as the cluster's key may delete (the default).\n  \
+                     cluster:  the backup Job prunes after every backup; needs a key that may \
+                     delete.\n  \
+                     operator: nothing in the cluster prunes; run `apprafter backup prune`."
                 )));
             }
             let mut retention = serde_json::Map::new();
@@ -3075,6 +4162,19 @@ fn backup_set_patch(key: &str, value: &str) -> Result<Value> {
         }
         "failure-webhook" => {
             field.insert("failureWebhook".into(), Value::String(value.to_string()));
+        }
+        // How long one Job may run before Kubernetes stops it; see
+        // `activeDeadlineSeconds` in the PlatformStack schema. Operator
+        // v0.2.52 is the first CRD to define these, and the readback in
+        // `run_backup_set` reports an older CRD pruning them.
+        "deadline" | "check-deadline" => {
+            let secs = parse_job_deadline(key, value)?;
+            let cr_key = if key == "deadline" {
+                "activeDeadlineSeconds"
+            } else {
+                "checkActiveDeadlineSeconds"
+            };
+            field.insert(cr_key.into(), Value::from(secs));
         }
         _ => {
             return Err(CliError::Other(format!(
@@ -3104,6 +4204,10 @@ fn backup_set_patch(key: &str, value: &str) -> Result<Value> {
 /// default now resolves through [`resolve_latest_snapshot`] — the same rule
 /// `restore` uses, deliberately the same function — so `show` and `restore`
 /// cannot disagree about which snapshot `latest` is.
+///
+/// That rule also makes `latest` the newest COMPLETE run: a newer sequential
+/// run stopped before its commit snapshot has no manifest to show, and is
+/// named above the contents instead ([`passed_over_lines`]).
 pub fn run_backup_show(
     snapshot: Option<&str>,
     repo_override: Option<&str>,
@@ -3148,7 +4252,7 @@ pub fn run_backup_show(
         Some(_) => None,
         None => Some(runner.run_stdout(&restic_snapshots_argv(&repo), &pass)?),
     };
-    let id = snapshot_to_show(snapshot, listing.as_deref(), this_uid.as_deref())?;
+    let (id, passed_over) = snapshot_to_show(snapshot, listing.as_deref(), this_uid.as_deref())?;
     let id = id.as_str();
     let inside = read_snapshot_insides(&runner, &repo, &pass, id)?;
 
@@ -3158,6 +4262,15 @@ pub fn run_backup_show(
     let (resolved_id, time) = snapshot_identity(&runner, &repo, &pass, id);
     let size = repo_stats(&runner, &repo, &pass, Some(id)).map(|s| s.total_size);
 
+    let zone = readers_zone();
+    for line in passed_over_lines(
+        &passed_over,
+        &format!("{resolved_id}, shown below"),
+        &chrono::Local,
+        zone.as_deref(),
+    ) {
+        println!("{line}");
+    }
     print!(
         "{}",
         format_snapshot_contents(
@@ -3174,7 +4287,8 @@ pub fn run_backup_show(
 }
 
 /// Which snapshot `backup show` inspects: the one the operator named, or —
-/// for the default — `latest` resolved inside THIS cluster's history. Pure.
+/// for the default — `latest` resolved inside THIS cluster's history, with
+/// the unfinished runs newer than it that `latest` passed over. Pure.
 ///
 /// The seam exists so the default is pinned by a test rather than by a walk
 /// against a shared repository, which is the one shape that shows the defect
@@ -3184,16 +4298,61 @@ fn snapshot_to_show(
     requested: Option<&str>,
     listing: Option<&str>,
     this_cluster_uid: Option<&str>,
-) -> Result<String> {
+) -> Result<(String, Vec<UnfinishedRun>)> {
     if let Some(id) = requested {
-        return Ok(id.to_string());
+        return Ok((id.to_string(), Vec::new()));
     }
     let listing = listing.ok_or_else(|| {
         CliError::Other(
             "internal: `backup show` needs the repository listing to resolve `latest`".into(),
         )
     })?;
-    resolve_latest_snapshot(listing, this_cluster_uid).map_err(CliError::Other)
+    let latest = resolve_latest_snapshot(listing, this_cluster_uid).map_err(CliError::Other)?;
+    Ok((latest.id, latest.passed_over))
+}
+
+/// What `backup show` and `restore` say when `latest` passed over newer runs
+/// that did not finish: the newest backup is not the one being shown or
+/// restored, and an operator in the middle of a recovery must not have to
+/// find that out from `backup list`. Empty — and silent — when nothing was
+/// passed over. `chosen` names the run `latest` resolved to, and what
+/// happens to it. Pure.
+pub(crate) fn passed_over_lines<Tz>(
+    passed_over: &[UnfinishedRun],
+    chosen: &str,
+    tz: &Tz,
+    zone_label: Option<&str>,
+) -> Vec<String>
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    if passed_over.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = passed_over
+        .iter()
+        .map(|run| {
+            // The untagged snapshots are one run with an empty tag, as the
+            // prune counts them.
+            let of_run = if run.tag.is_empty() {
+                "with no tag".to_string()
+            } else {
+                format!("of run {}", short_tag(&run.tag, tz))
+            };
+            format!(
+                "  ⚠ a newer backup run did not finish: {} snapshot(s) {of_run}, the last \
+                 written {}. None carries manifest.json — the run was interrupted before its \
+                 last snapshot, or is still being written.",
+                run.snapshots,
+                format_timestamp_with_zone(&run.newest, tz, zone_label)
+            )
+        })
+        .collect();
+    out.push(format!(
+        "  `latest` is the newest COMPLETE run: snapshot {chosen}."
+    ));
+    out
 }
 
 /// The short id and timestamp restic itself reports for a snapshot.
@@ -3325,7 +4484,7 @@ pub fn run_backup_set(key: &str, value: &str) -> Result<()> {
 /// timestamp's own date; this only answers "what do we call that zone".
 /// `None` when neither source gives an IANA name, which prints an
 /// unlabelled time rather than a wrong label.
-fn readers_zone() -> Option<String> {
+pub(crate) fn readers_zone() -> Option<String> {
     resolve_time_zone(
         None,
         std::env::var("TZ").ok().as_deref(),
@@ -3782,6 +4941,20 @@ impl ResticRunner for CredentialedRestic {
         let stdout = self.run_stdout(argv, pass)?;
         Ok(snapshot_id_from_backup_json(&stdout))
     }
+
+    fn run_capture(&self, argv: &[String], pass: &str) -> Result<backup_core::ResticOutput> {
+        let out = self
+            .command(argv, pass)
+            .output()
+            .map_err(|e| CliError::Other(format!("spawn restic: {e}")))?;
+        if !out.status.success() {
+            return Err(restic_failure_error(argv, out.status.code(), &out.stderr));
+        }
+        Ok(backup_core::ResticOutput {
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3806,16 +4979,19 @@ impl ResticRunner for CredentialedRestic {
 /// `check` and `unlock` have no retention inputs at all
 /// ([`RetentionArgs::NotApplicable`]); `prune` carries the three `--keep-*`
 /// overrides, any of which, when absent, must be read from
-/// `spec.backup.retention`.
+/// `spec.backup.retention`, and `--timezone`, which when absent must be read
+/// from `spec.backup.timeZone`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RetentionArgs {
     /// The verb has no retention inputs (`check`, `unlock`).
     NotApplicable,
-    /// `backup prune`'s `--keep-daily` / `--keep-weekly` / `--keep-monthly`.
+    /// `backup prune`'s `--keep-daily` / `--keep-weekly` / `--keep-monthly`,
+    /// and its `--timezone` ([`prune_zone_flag`]).
     Prune {
         keep_daily: Option<u32>,
         keep_weekly: Option<u32>,
         keep_monthly: Option<u32>,
+        time_zone: Option<Tz>,
     },
 }
 
@@ -3830,6 +5006,7 @@ impl RetentionArgs {
                 keep_daily,
                 keep_weekly,
                 keep_monthly,
+                time_zone: _,
             } => [
                 ("--keep-daily", keep_daily),
                 ("--keep-weekly", keep_weekly),
@@ -3857,6 +5034,10 @@ pub(crate) struct ClusterNeed {
     /// count it is a claim about whose data may be deleted, so the hint spells
     /// out what is being claimed.
     identity: bool,
+    /// One of the unresolved inputs is the zone the keep policy counts in
+    /// (prune). `--timezone` substitutes for it, and the hint says which
+    /// zone to name: the one the cluster's own prune counts in.
+    zone: bool,
 }
 
 impl ClusterNeed {
@@ -3890,6 +5071,16 @@ impl ClusterNeed {
                  tag its snapshots carry — `apprafter backup list --repo <repo> --all-clusters` \
                  names the identities a repository holds, and a prune against one it has never \
                  seen refuses instead of falling back to everything.",
+            );
+        }
+        if self.zone {
+            msg.push_str(
+                "\n\n`--timezone` is the zone the cluster's backup schedules ran in, its \
+                 `spec.backup.timeZone` (`apprafter backup status` shows it while the cluster \
+                 is there), or `UTC` if it named none. The keep policy counts its days, weeks \
+                 and months in that zone, as the cluster's own prune does. The command does \
+                 not assume one: counted in another zone, it keeps different runs than the \
+                 cluster's prune, and between them the two forget runs each would keep.",
             );
         }
         msg
@@ -3988,6 +5179,19 @@ pub(crate) fn cluster_need(
             .push("the retention policy (spec.backup.retention)");
         need.flags
             .extend(missing.into_iter().map(|f| format!("{f} <n>")));
+    }
+    // The keep policy's days, weeks and months are the zone the cluster's
+    // schedules run in, as the in-cluster prune counts them. Assumed rather
+    // than read, the two prunes of one repository keep different runs.
+    if let RetentionArgs::Prune {
+        time_zone: None, ..
+    } = retention
+    {
+        need.reasons.push(
+            "the zone its keep policy counts days, weeks and months in (spec.backup.timeZone)",
+        );
+        need.flags.push("--timezone <zone>".to_string());
+        need.zone = true;
     }
     // A prune DELETES, and a repository can be shared, so it must know whose
     // snapshots it is allowed to forget (E3/E4). The cluster answers that with
@@ -4148,12 +5352,23 @@ fn spec_backup_from_cluster(kubeconfig: Option<&Path>) -> Result<Option<Value>> 
 /// `.retention.{keepDaily,keepWeekly,keepMonthly}` when present → else the
 /// [`RetentionPolicy::default`] (7 / 4 / 6). Pure — the impure caller fetches
 /// `spec.backup` and reads the CLI flags.
+///
+/// The days, weeks and months are counted in `--timezone` (`zone_flag`), else
+/// in `spec.backup.timeZone`, the zone the cluster's schedules run in — the
+/// zone the in-cluster prune counts in too
+/// ([`backup_core::prune::policy_zone`]), so the two keep the same runs. UTC
+/// with neither: [`cluster_need`] reaches for the cluster when the flag is
+/// absent, so that is a cluster with no backup configured. The second value
+/// is a warning: a cluster zone this build does not know (counted in UTC,
+/// as the runner does), or a flag that is not the zone the cluster's own
+/// prune counts in.
 fn retention_from_spec_backup(
     spec_backup: Option<&Value>,
     keep_daily: Option<u32>,
     keep_weekly: Option<u32>,
     keep_monthly: Option<u32>,
-) -> RetentionPolicy {
+    zone_flag: Option<Tz>,
+) -> (RetentionPolicy, Option<String>) {
     let default = RetentionPolicy::default();
     let cr = |key: &str| -> Option<u32> {
         spec_backup
@@ -4161,7 +5376,39 @@ fn retention_from_spec_backup(
             .and_then(Value::as_u64)
             .map(|n| n as u32)
     };
-    RetentionPolicy {
+    let zone_name = spec_backup
+        .and_then(|s| s.pointer("/timeZone"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let cluster_zone = backup_core::prune::policy_zone(zone_name);
+    let (zone, warning) = match (zone_flag, cluster_zone) {
+        (None, Ok(zone)) => (zone, None),
+        (None, Err(why)) => (default.zone, Some(why)),
+        (Some(flag), cluster_zone) => {
+            // Only a cluster that was read has a prune of its own to differ
+            // from.
+            let differs = spec_backup.and_then(|_| {
+                let (counted_in, because) = match cluster_zone {
+                    Ok(zone) if zone_name.trim().is_empty() => {
+                        (zone, "spec.backup.timeZone is not set".to_string())
+                    }
+                    Ok(zone) => (zone, "its spec.backup.timeZone".to_string()),
+                    Err(why) => (default.zone, why),
+                };
+                (counted_in != flag).then(|| {
+                    format!(
+                        "--timezone {} is not the zone this cluster's own prune counts in: {} \
+                         ({because}). Where both prune the same runs, the two keep different \
+                         ones, and between them forget runs each would keep.",
+                        flag.name(),
+                        counted_in.name()
+                    )
+                })
+            });
+            (flag, differs)
+        }
+    };
+    let policy = RetentionPolicy {
         keep_daily: keep_daily
             .or_else(|| cr("keepDaily"))
             .unwrap_or(default.keep_daily),
@@ -4171,7 +5418,36 @@ fn retention_from_spec_backup(
         keep_monthly: keep_monthly
             .or_else(|| cr("keepMonthly"))
             .unwrap_or(default.keep_monthly),
+        zone,
+    };
+    (policy, warning)
+}
+
+/// `backup prune --timezone <zone>`: a zone name the zone database compiled
+/// into this build knows — the database the in-cluster runner counts in, so
+/// a name it takes here is one the runner takes too. Pure.
+///
+/// A zone read off the cluster that this build does not know is counted in
+/// UTC with a warning, as the runner counts it
+/// ([`backup_core::prune::policy_zone`]). The flag is refused instead: it is
+/// the operator saying which zone, and a typo must not quietly count in
+/// another.
+pub(crate) fn prune_zone_flag(raw: &str) -> Result<Tz> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(CliError::Other(
+            "--timezone is empty: pass the zone the cluster's backup schedules ran in, its \
+             `spec.backup.timeZone` (such as `Europe/Berlin`), or `UTC` if it named none."
+                .into(),
+        ));
     }
+    name.parse::<Tz>().map_err(|_| {
+        CliError::Other(format!(
+            "--timezone '{name}' is not a zone this build knows: pass the IANA name the \
+             cluster's `spec.backup.timeZone` held (such as `Europe/Berlin`), or `UTC` if it \
+             named none."
+        ))
+    })
 }
 
 /// `apprafter backup prune` — format-aware retention prune of an off-site restic
@@ -4202,6 +5478,19 @@ fn retention_from_spec_backup(
 /// this is. The repository checks that claim before anything is forgotten: a
 /// UID it has never seen is refused, naming the ones it holds, rather than
 /// falling through to the pre-identity snapshots.
+///
+/// ## …and a zone, from the cluster or from the operator
+///
+/// The keep policy counts days, weeks and months in the zone the cluster's
+/// schedules run in, and so does the in-cluster prune; counted in another
+/// zone, the two keep different runs of one repository and between them
+/// forget runs each would keep. So the zone is read like every other input
+/// the CR holds: `--timezone`, else `spec.backup.timeZone` off the cluster.
+/// With neither, the command reaches for the cluster, and refuses with the
+/// flag named when there is none — it used to count in UTC. It refuses
+/// before it lists anything, not only when something would be forgotten:
+/// a command that ran last week must not start refusing when a run ages
+/// out.
 pub fn run_backup_prune(
     repo_override: Option<&str>,
     credential_file: Option<&Path>,
@@ -4209,6 +5498,7 @@ pub fn run_backup_prune(
     keep_weekly: Option<u32>,
     keep_monthly: Option<u32>,
     cluster_uid_override: Option<&str>,
+    time_zone: Option<&str>,
 ) -> Result<()> {
     // D11 / 2.22a: the external binaries this command spawns, checked
     // BEFORE any prompt, kubeconfig or provider call. The reported bug
@@ -4228,10 +5518,13 @@ pub fn run_backup_prune(
         }
     }
 
+    let time_zone = time_zone.map(prune_zone_flag).transpose()?;
+
     let retention = RetentionArgs::Prune {
         keep_daily,
         keep_weekly,
         keep_monthly,
+        time_zone,
     };
     let source = cred_source(
         credential_file.is_some(),
@@ -4256,7 +5549,16 @@ pub fn run_backup_prune(
     let pass = creds["RESTIC_PASSWORD"].clone();
 
     let repo = repo_from_spec_backup(repo_override, spec_backup)?;
-    let policy = retention_from_spec_backup(spec_backup, keep_daily, keep_weekly, keep_monthly);
+    let (policy, zone_warning) = retention_from_spec_backup(
+        spec_backup,
+        keep_daily,
+        keep_weekly,
+        keep_monthly,
+        time_zone,
+    );
+    if let Some(why) = zone_warning {
+        eprintln!("{}", cli_core::style::warn(&why));
+    }
 
     let runner = CredentialedRestic { creds };
 
@@ -4285,20 +5587,51 @@ pub fn run_backup_prune(
         }
     };
 
-    run_prune(&runner, &repo, &pass, &policy, &cluster_uid)?;
+    // A run with no manifest is left alone while a backup may still be
+    // writing it: the scheduled backup, or a `backup create` into the same
+    // repository, is not stopped by this command. How long that is follows
+    // the cluster's backup deadline — the default six hours with no cluster.
+    let run_deadline = backup_core::helper_pod::run_deadline_of_spec_backup(spec_backup);
+    let outcome = run_prune(
+        &runner,
+        &repo,
+        &pass,
+        &policy,
+        &cluster_uid,
+        chrono::Utc::now(),
+        run_deadline,
+    )?;
+    refuse_an_unenforced_prune(&repo, &outcome, credential_file.is_some())?;
 
-    print!("{}", prune_summary(&repo, &policy));
+    print!("{}", prune_summary(&repo, &policy, &outcome));
 
     // Stamp last-prune so `backup status` can report it. Best-effort ordering:
     // the prune already succeeded, so a merge-patch failure here surfaces as an
     // error (the annotation is the audit trail — we don't want to swallow it).
-    // An offline prune has no CR to stamp; it says so rather than failing,
-    // because the cluster being gone is the whole premise of that path.
+    // Only a prune of THIS cluster's history is stamped on it
+    // ([`last_prune_stamp`]); any other says why it stamps nothing rather
+    // than failing — an offline prune's cluster being gone is the whole
+    // premise of that path.
+    let own_uid = match (kc_path, cluster_uid_override) {
+        (Some(_), None) => Ok(cluster_uid.clone()),
+        (Some(kc), Some(_)) => read_cluster_uid(kc).map_err(|e| e.to_string()),
+        (None, _) => Err("no cluster".to_string()),
+    };
+    let configured_repo = spec_backup
+        .and_then(|s| s.pointer("/bucket"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    if let Err(why) = last_prune_stamp(
+        kc_path.is_some(),
+        &repo,
+        configured_repo,
+        &cluster_uid,
+        own_uid.as_deref().map_err(String::as_str),
+    ) {
+        println!("  (`apprafter.io/last-prune` not stamped: {why})");
+        return Ok(());
+    }
     let Some(kc_path) = kc_path else {
-        println!(
-            "  (no cluster to stamp `apprafter.io/last-prune` on — offline prune by \
-             --cluster-uid)"
-        );
         return Ok(());
     };
     let ts = chrono::Utc::now().to_rfc3339();
@@ -4361,11 +5694,117 @@ fn offline_prune_scope(snapshots: &[Value], uid: &str) -> Result<String> {
 
 /// What `backup prune` prints after a successful prune. Pure — extracted from
 /// [`run_backup_prune`], which prints exactly this.
-fn prune_summary(repo: &str, policy: &RetentionPolicy) -> String {
+fn prune_summary(
+    repo: &str,
+    policy: &RetentionPolicy,
+    outcome: &backup_core::prune::PruneOutcome,
+) -> String {
     format!(
-        "✓ Pruned {repo}\n  retention: keepDaily={} keepWeekly={} keepMonthly={}\n",
-        policy.keep_daily, policy.keep_weekly, policy.keep_monthly
+        "✓ Pruned {repo}: {}\n  retention: keepDaily={} keepWeekly={} keepMonthly={} (days, \
+         weeks and months in {})\n",
+        outcome.describe(),
+        policy.keep_daily,
+        policy.keep_weekly,
+        policy.keep_monthly,
+        policy.zone.name()
     )
+}
+
+/// A prune the credential was not permitted to run is an error — nothing was
+/// deleted — and must not read as `✓ Pruned` or stamp `last-prune`. Pure.
+fn refuse_an_unenforced_prune(
+    repo: &str,
+    outcome: &backup_core::prune::PruneOutcome,
+    had_credential_file: bool,
+) -> Result<()> {
+    match outcome {
+        backup_core::prune::PruneOutcome::NotPermitted { .. } => Err(prune_not_permitted_error(
+            repo,
+            outcome,
+            had_credential_file,
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The error `backup prune` ends with when the credential it ran with may
+/// not delete. Pure.
+///
+/// The usual cause is the one ADR 0050 recommends: with no credential file,
+/// and none in the environment, the command falls back to the cluster's own
+/// Secret, whose key is scoped so that a compromised cluster cannot erase
+/// history — and so cannot prune either. Nothing was deleted: the prune
+/// stopped at the first refused delete.
+fn prune_not_permitted_error(
+    repo: &str,
+    outcome: &backup_core::prune::PruneOutcome,
+    had_credential_file: bool,
+) -> CliError {
+    let which = if had_credential_file {
+        "The credential file this command read holds a key that may not delete from this \
+         repository."
+    } else {
+        "With no --credential-file, this command used the credentials in the environment or, \
+         failing those, the cluster's own backup Secret — whose key is usually scoped so that \
+         the cluster cannot delete history (ADR 0050), and so cannot prune it either."
+    };
+    CliError::Other(format!(
+        "retention was not enforced on {repo}: {}.\n\n{which} Run it again with the \
+         operator's full credentials: `apprafter backup prune --credential-file \
+         <full-credentials.env>` (S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, RESTIC_PASSWORD).",
+        outcome.describe()
+    ))
+}
+
+/// Does `backup prune` stamp `apprafter.io/last-prune` on the cluster it
+/// resolved? `Ok` to stamp, else why not. Pure.
+///
+/// Only when what was pruned is that cluster's history: `repo` is the
+/// repository its `spec.backup.bucket` names, and `pruned_uid` — the
+/// identity whose snapshots the prune could forget — is its own
+/// `kube-system` UID (`own_uid`, or why it could not be read). The operator's
+/// `BackupRetention` quotes the stamp as "`apprafter backup prune` last ran
+/// against this cluster", and `backup status` shows it as the last prune.
+///
+/// It used to stamp whenever a cluster had been resolved at all. `backup
+/// prune --repo <a rehearsal repository> --cluster-uid <another cluster>`
+/// with no `--keep-*` flags resolves the ACTIVE cluster only to read its
+/// retention policy, and stamped it although neither the repository nor the
+/// identity was its own.
+fn last_prune_stamp(
+    have_cluster: bool,
+    repo: &str,
+    configured_repo: Option<&str>,
+    pruned_uid: &str,
+    own_uid: std::result::Result<&str, &str>,
+) -> std::result::Result<(), String> {
+    if !have_cluster {
+        return Err("no cluster to stamp it on — an offline prune by --cluster-uid".into());
+    }
+    let same_repo = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
+    match configured_repo {
+        None => {
+            return Err(format!(
+                "this cluster has no backup repository configured, so {repo} is not its \
+                 repository"
+            ))
+        }
+        Some(configured) if !same_repo(repo, configured) => {
+            return Err(format!(
+                "{repo} is not this cluster's backup repository, {configured}"
+            ))
+        }
+        Some(_) => {}
+    }
+    match own_uid {
+        Ok(own) if own == pruned_uid => Ok(()),
+        Ok(own) => Err(format!(
+            "the history pruned is cluster {pruned_uid}'s, and this cluster is {own}"
+        )),
+        Err(e) => Err(format!(
+            "this cluster's own identity could not be read to check it is {pruned_uid}: {e}"
+        )),
+    }
 }
 
 /// The merge-patch body stamping `apprafter.io/last-prune`.
@@ -4803,15 +6242,21 @@ pub fn run_backup_enable(
         );
         return Ok(());
     }
+    //
+    //    By then the configuration is applied. A first backup that did not
+    //    complete does not undo that, and the command says so before it
+    //    exits ([`first_backup_outcome`]).
     match wait_for_synced_cronjob(&opts.bucket, CRONJOB_SYNC_WAIT_MINUTES, kc.path())? {
         Some(cronjob) => {
             println!("  → running the first backup now");
-            instantiate_backup_job(
-                &cronjob,
-                true,
-                DEFAULT_BACKUP_JOB_TIMEOUT_MINUTES,
-                kc.path(),
-            )?;
+            take_first_backup(|| {
+                instantiate_backup_job(
+                    &cronjob,
+                    true,
+                    DEFAULT_BACKUP_JOB_TIMEOUT_MINUTES,
+                    kc.path(),
+                )
+            })?;
         }
         None => {
             // The `enable` itself succeeded. A chart that has not synced
@@ -4825,6 +6270,68 @@ pub fn run_backup_enable(
         }
     }
     Ok(())
+}
+
+/// Run `backup enable`'s first backup with `run`, and end the way
+/// [`first_backup_outcome`] says when it does not complete.
+fn take_first_backup(run: impl FnOnce() -> Result<()>) -> Result<()> {
+    let Err(e) = run() else {
+        return Ok(());
+    };
+    let (line, exit) = first_backup_outcome(e);
+    println!("{line}");
+    exit.map_or(Ok(()), Err)
+}
+
+/// How `backup enable` ends when its first backup did not complete: the line
+/// it prints, and the error it exits with.
+///
+/// The PlatformStack patch is applied before the first backup starts, so
+/// backup IS enabled whatever happens to that backup, and a bare error reads
+/// as an `enable` that failed, which people answer by running it again. The
+/// line says it is enabled; for a runner no node would take, so does the
+/// error's help, ahead of the advice `backup run` gives.
+///
+/// The exit stays non-zero on purpose. The first backup is the proof
+/// `enable` offers that backups work, and one no node would take means the
+/// scheduled backup, which asks for the same, will not run either. A script
+/// that checks the exit code must not read that as working backups. A first
+/// backup that is not attempted at all (the chart has not synced) exits 0:
+/// nothing failed.
+///
+/// Beside a backup or check Job that has not finished, no first backup is
+/// started ([`refusal`]). That exits 0 too: nothing failed, and the Job
+/// already there is the one to watch.
+fn first_backup_outcome(e: CliError) -> (String, Option<CliError>) {
+    match e {
+        CliError::BackupJobActive { job } => (
+            format!(
+                "  Backup IS enabled. Its first backup was not started beside {job}: `apprafter \
+                 backup status` shows that Job's result, and `apprafter backup run` takes a \
+                 backup once it has finished."
+            ),
+            None,
+        ),
+        CliError::BackupRunnerUnschedulable { job, what, help } => (
+            "  Backup IS enabled: the configuration above is applied. Its first backup could \
+             not start."
+                .to_string(),
+            Some(CliError::BackupRunnerUnschedulable {
+                job,
+                what,
+                help: format!(
+                    "Backup IS enabled, so do not run `apprafter backup enable` again; only its \
+                     first backup could not start. {help}"
+                ),
+            }),
+        ),
+        other => (
+            "  Backup IS enabled: the configuration above is applied. Its first backup did not \
+             complete:"
+                .to_string(),
+            Some(other),
+        ),
+    }
 }
 
 /// The cluster label to store: `--cluster-name` when given, else the target
@@ -4859,9 +6366,9 @@ pub(crate) fn resolve_cluster_name(explicit: Option<&str>, target_name: &str) ->
 /// prompt precisely so a typo costs nothing.
 fn validate_enable_enums(o: &EnableOpts) -> Result<()> {
     if let Some(enforce) = &o.enforce {
-        if enforce != "operator" && enforce != "cluster" {
+        if !matches!(enforce.as_str(), "check" | "cluster" | "operator") {
             return Err(CliError::Other(format!(
-                "invalid --enforce '{enforce}': expected 'operator' or 'cluster'"
+                "invalid --enforce '{enforce}': expected 'check', 'cluster' or 'operator'"
             )));
         }
     }
@@ -5230,6 +6737,35 @@ fn most_recent_job<'a>(jobs: &[&'a serde_json::Value]) -> Option<&'a serde_json:
     jobs.iter().copied().max_by_key(|j| job_start_time(j))
 }
 
+/// A Job's outcome as `backup status` prints it: the Job's own terminal
+/// condition when it has one — with the reason and message for a failure, so
+/// a run stopped at its deadline reads `Failed: DeadlineExceeded: Job was
+/// active longer than specified deadline` rather than a bare `Failed` — and
+/// the pod counts ([`job_outcome`]) while it has none.
+///
+/// The condition is what the Job controller decided; the pod counts are only
+/// what its pods did, and they cannot tell a deadline from a crash.
+///
+/// While there is no condition, the Job's pod says more than its counts:
+/// `status.active` counts a pod the scheduler could not place exactly like
+/// one that is running a backup, so a runner that never started read
+/// `Running`. With the pod in `pods` the line says `Pending, cannot be
+/// scheduled: <the scheduler's reason>` instead ([`job_pod`]). Between a
+/// failed attempt and its retry there is no live pod, and the counts
+/// (`active: 0`, `failed: 1`) read `Failed` for a Job that has attempts left:
+/// the line says `Retrying after 1 failed attempt (7 attempts at most)`
+/// instead. Without the pods, or for a shape that is not recognised, the
+/// counts are what is left.
+fn job_line_outcome(j: &serde_json::Value, pods: &[serde_json::Value]) -> String {
+    match job_run_outcome(j) {
+        JobOutcome::Succeeded => "Succeeded".to_string(),
+        JobOutcome::Failed(why) => format!("Failed: {why}"),
+        JobOutcome::Running => {
+            job_pod::status_outcome(&job_pod(j, pods)).unwrap_or_else(|| job_outcome(j).to_string())
+        }
+    }
+}
+
 /// Summarise a Job's terminal state from `.status.succeeded/.failed/.active`.
 fn job_outcome(j: &serde_json::Value) -> &'static str {
     let succeeded = j
@@ -5270,12 +6806,19 @@ fn job_outcome(j: &serde_json::Value) -> &'static str {
 /// * `apprafter-backup`       — the scheduled backup CronJob.
 /// * `apprafter-backup-check` — the weekly check CronJob.
 ///
-/// Jobs are selected by their `.metadata.name` prefix `apprafter-backup` (both
-/// CronJob-spawned Jobs share that prefix). For each of the two flavours (with
-/// and without `-check`) the most-recent Job (by `.status.startTime`) is shown.
+/// Jobs are told apart by [`runner_job`] — the CronJob that owns them, or the
+/// marks `backup run` leaves on its own — as the operator's `BackupHealthy`
+/// tells them apart. For each of the two the most-recent Job (by
+/// `.status.startTime`) is shown.
+///
+/// `pods` is any listing that holds those Jobs' pods (the caller reads
+/// `apprafter-system`'s). It is what tells an unfinished Job whose runner
+/// works from one whose pod no node has room for; empty, the Job lines fall
+/// back to the Jobs' own pod counts.
 pub(crate) fn format_backup_status<Tz>(
     spec_backup: Option<&serde_json::Value>,
     jobs: &[serde_json::Value],
+    pods: &[serde_json::Value],
     status_cm: Option<&serde_json::Value>,
     last_prune: Option<&str>,
     tz: &Tz,
@@ -5337,58 +6880,69 @@ where
         )),
         None => {}
     }
-    // Retention sub-block.
-    if let Some(ret) = spec.get("retention") {
-        out.push_str("  retention:\n");
-        for key in ["keepDaily", "keepWeekly", "keepMonthly"] {
-            if let Some(n) = ret.get(key) {
-                out.push_str(&format!("    {key}: {n}\n"));
-            }
+    // Retention sub-block. Who prunes is always said: unset, it is the
+    // platform's default, which the operator's retention verdict below
+    // names (`check` since WI-389; `operator` before it).
+    out.push_str("  retention:\n");
+    let ret = spec.get("retention");
+    for key in ["keepDaily", "keepWeekly", "keepMonthly"] {
+        if let Some(n) = ret.and_then(|r| r.get(key)) {
+            out.push_str(&format!("    {key}: {n}\n"));
         }
-        if let Some(e) = ret.get("enforce").and_then(serde_json::Value::as_str) {
-            out.push_str(&format!("    enforce: {e}\n"));
-        }
+    }
+    match ret
+        .and_then(|r| r.get("enforce"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(e) => out.push_str(&format!("    enforce: {e}\n")),
+        None => out.push_str("    enforce: not set (the platform's default)\n"),
     }
 
     // --- Job outcomes ---
-    // Partition into backup Jobs (name prefix `apprafter-backup` but NOT
-    // `apprafter-backup-check`) and check Jobs (prefix `apprafter-backup-check`).
+    // Partition into backup Jobs and check Jobs by what runs them.
     let backup_jobs: Vec<&serde_json::Value> = jobs
         .iter()
-        .filter(|j| {
-            let n = job_metadata_name(j);
-            n.starts_with("apprafter-backup") && !n.contains("check")
-        })
+        .filter(|j| runner_job(j) == Some(RunnerJob::Backup))
         .collect();
     let check_jobs: Vec<&serde_json::Value> = jobs
         .iter()
-        .filter(|j| job_metadata_name(j).contains("apprafter-backup-check"))
+        .filter(|j| runner_job(j) == Some(RunnerJob::Check))
         .collect();
 
     // A Job line that says only WHETHER it succeeded leaves the question the
     // operator opened this screen with — is the backup current? — unanswered:
     // last week's success and this morning's read identically.
+    //
+    // A Job whose pod cannot be scheduled gets the reason on its line and,
+    // under it, where to look: that Job is not running, and the scheduled
+    // backup asks for the same room.
     let job_line = |j: &serde_json::Value| -> String {
         let when = job_start_time(j);
-        let outcome = job_outcome(j);
-        if when.is_empty() {
-            format!("{} — {outcome}", job_metadata_name(j))
+        let outcome = job_line_outcome(j, pods);
+        let mut line = if when.is_empty() {
+            format!("{} — {outcome}\n", job_metadata_name(j))
         } else {
             format!(
-                "{} — {outcome} ({})",
+                "{} — {outcome} ({})\n",
                 job_metadata_name(j),
                 format_timestamp_with_zone(when, tz, zone_label)
             )
+        };
+        if job_run_outcome(j) == JobOutcome::Running {
+            if let Some(hint) = job_pod::status_hint(j, &job_pod(j, pods)) {
+                line.push_str(&hint);
+            }
         }
+        line
     };
 
     out.push_str("\nJobs:\n");
     match most_recent_job(&backup_jobs) {
-        Some(j) => out.push_str(&format!("  Last backup Job: {}\n", job_line(j))),
+        Some(j) => out.push_str(&format!("  Last backup Job: {}", job_line(j))),
         None => out.push_str("  Last backup Job: none\n"),
     }
     match most_recent_job(&check_jobs) {
-        Some(j) => out.push_str(&format!("  Last check Job:  {}\n", job_line(j))),
+        Some(j) => out.push_str(&format!("  Last check Job:  {}", job_line(j))),
         None => out.push_str("  Last check Job:  none\n"),
     }
 
@@ -5432,14 +6986,162 @@ where
         out.push_str("  (no status ConfigMap yet — backup may not have run)\n");
     }
 
-    // --- Last prune ---
+    // --- Last prune from outside the cluster ---
     out.push_str(&format!(
-        "\nLast prune: {}\n",
+        "\nLast prune: {} (by `apprafter backup prune`, from outside the cluster)\n",
         last_prune
             .map(|p| format_timestamp_with_zone(p, tz, zone_label))
             .unwrap_or_else(|| "never".to_string())
     ));
 
+    out
+}
+
+/// How many lines of a failed check's output `backup status` quotes.
+const CHECK_ERROR_LINES: usize = 3;
+
+/// The repository block of `backup status`: the runner's record of its last
+/// check, its last prune and the repository's figures (WI-389), then what
+/// the operator makes of retention.
+///
+/// Pure. `status_cm` is the runner's ConfigMap (the object or its `data`);
+/// `stack` is `PlatformStack/default`, whose `BackupRetention` condition is
+/// the verdict. With an operator that writes no such condition, a prune the
+/// key did not permit is still said, from the record alone: that warning is
+/// the point of this block.
+pub(crate) fn format_repository_status<Tz>(
+    status_cm: Option<&Value>,
+    stack: Option<&Value>,
+    tz: &Tz,
+    zone_label: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    let data = status_cm.map(|cm| cm.get("data").filter(|d| d.is_object()).unwrap_or(cm));
+    let get = |key: &str| -> Option<&str> {
+        data.and_then(|d| d.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    let num = |key: &str| get(key).and_then(|v| v.parse::<i64>().ok());
+    let when = |t: &str| format_timestamp_with_zone(t, tz, zone_label);
+    let mut out = String::from("\nRepository (recorded by the weekly check):\n");
+
+    match get("lastCheck") {
+        Some(t) => {
+            let result = match get("lastCheckResult") {
+                Some("passed") => "passed".to_string(),
+                Some("failed") => "FAILED".to_string(),
+                other => other.unwrap_or("no result recorded").to_string(),
+            };
+            out.push_str(&format!("  last check:  {} — {result}\n", when(t)));
+            // restic's output runs long; the lines that name the damage come
+            // first, and the check pod's log has the rest.
+            if let Some(error) = get("lastCheckError") {
+                let lines: Vec<&str> = error
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                for line in lines.iter().take(CHECK_ERROR_LINES) {
+                    out.push_str(&format!("               {line}\n"));
+                }
+                if lines.len() > CHECK_ERROR_LINES {
+                    out.push_str(&format!(
+                        "               … {} more line(s): the check pod's log, or `apprafter \
+                         backup check`, has all of restic's output\n",
+                        lines.len() - CHECK_ERROR_LINES
+                    ));
+                }
+            }
+        }
+        None => out.push_str("  last check:  none recorded yet\n"),
+    }
+    match get("lastPrune") {
+        Some(t) => {
+            let after = match get("lastPruneBy") {
+                Some("backup") => "after a backup",
+                _ => "after the weekly check",
+            };
+            let result = match get("lastPruneResult") {
+                Some("not-permitted") => "NOT PERMITTED",
+                Some("failed") => "FAILED",
+                Some("pruned") => "pruned",
+                Some("nothing-to-prune") => "nothing to prune",
+                other => other.unwrap_or("no result recorded"),
+            };
+            out.push_str(&format!("  last prune:  {} {after} — {result}\n", when(t)));
+            if let Some(detail) = get("lastPruneDetail") {
+                out.push_str(&format!("               {detail}\n"));
+            }
+        }
+        None => out.push_str("  last prune:  none in the cluster yet\n"),
+    }
+    match (get("repoStatsAt"), num("repoBytes")) {
+        (Some(at), Some(bytes)) => {
+            let mut counts = Vec::new();
+            if let Some(n) = num("repoSnapshots") {
+                counts.push(format!("{n} snapshots"));
+            }
+            if let Some(n) = num("repoBlobs") {
+                counts.push(format!("{n} blobs"));
+            }
+            let counts = if counts.is_empty() {
+                String::new()
+            } else {
+                format!(" in {}", counts.join(" and "))
+            };
+            out.push_str(&format!(
+                "  size:        {}{counts} ({})\n",
+                human_size(bytes.max(0) as u64),
+                when(at)
+            ));
+            if let (Some(prev_at), Some(prev)) = (get("repoPrevStatsAt"), num("repoPrevBytes")) {
+                let delta = bytes - prev;
+                let mut moved = vec![format!(
+                    "{}{}",
+                    if delta < 0 { "-" } else { "+" },
+                    human_size(delta.unsigned_abs())
+                )];
+                if let (Some(n), Some(p)) = (num("repoSnapshots"), num("repoPrevSnapshots")) {
+                    moved.push(format!("{:+} snapshots", n - p));
+                }
+                if let (Some(n), Some(p)) = (num("repoBlobs"), num("repoPrevBlobs")) {
+                    moved.push(format!("{:+} blobs", n - p));
+                }
+                out.push_str(&format!(
+                    "  growth:      {} since {}\n",
+                    moved.join(", "),
+                    when(prev_at)
+                ));
+            }
+        }
+        _ => out.push_str("  size:        not measured yet (the weekly check measures it)\n"),
+    }
+
+    let verdict = stack
+        .map(|s| crate::commands::platform::backup_retention_lines(s, now))
+        .unwrap_or_default();
+    if !verdict.is_empty() {
+        out.push('\n');
+        for line in verdict {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    } else if get("lastPruneResult") == Some("not-permitted") {
+        out.push_str(&format!(
+            "\n{}\n  Next: `apprafter backup prune --credential-file <full-credentials.env>` \
+             prunes with the operator's full credentials.\n",
+            cli_core::style::warn(
+                "Retention: NOT ENFORCED — the cluster's key may not delete, so the last prune \
+                 deleted nothing and the repository keeps growing."
+            )
+        ));
+    }
     out
 }
 
@@ -5455,18 +7157,19 @@ fn last_prune_annotation(ps: Option<&Value>) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The Jobs `backup status` reports on: `.items[]` of a Jobs listing, narrowed
-/// to the `apprafter-backup` name prefix.
+/// The Jobs `backup status` and `backup run` report on: `.items[]` of a Jobs
+/// listing, narrowed to the backup and check runners ([`runner_job`]).
 ///
 /// Pure — extracted from [`run_backup_status`] and called from both there and
-/// the tests. INVARIANT: the prefix filter is applied here, so an unrelated
-/// Job in `apprafter-system` never gets reported as somebody's backup.
+/// the tests. INVARIANT: the filter is applied here, so an unrelated Job in
+/// `apprafter-system` never gets reported as somebody's backup, and a runner
+/// Job is found whatever it is called.
 fn backup_jobs_of(jobs_list: Option<&Value>) -> Vec<Value> {
     jobs_list
         .map(items_of)
         .unwrap_or_default()
         .into_iter()
-        .filter(|j| job_metadata_name(j).starts_with("apprafter-backup"))
+        .filter(|j| runner_job(j).is_some())
         .collect()
 }
 
@@ -5490,9 +7193,24 @@ pub fn run_backup_status() -> Result<()> {
     let spec_backup = ps.as_ref().and_then(|p| p.pointer("/spec/backup")).cloned();
     let last_prune = last_prune_annotation(ps.as_ref());
 
-    // 2. List Jobs in apprafter-system and filter by name prefix.
+    // 2. List Jobs in apprafter-system and keep the runners.
     let jobs_list = kubectl_get_json("jobs", None, Some(PLATFORMSTACK_NAMESPACE), kc.path())?;
     let jobs = backup_jobs_of(jobs_list.as_ref());
+
+    // 2b. The pods, only when a Job has not finished: a finished Job's
+    //     conditions say everything, and an unfinished one's `active` count
+    //     cannot tell a working runner from one no node has room for.
+    let pods = if jobs
+        .iter()
+        .any(|j| job_run_outcome(j) == JobOutcome::Running)
+    {
+        kubectl_get_json("pods", None, Some(PLATFORMSTACK_NAMESPACE), kc.path())?
+            .as_ref()
+            .map(items_of)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     // 3. Fetch the runner status ConfigMap.
     let status_cm = kubectl_get_json(
@@ -5502,17 +7220,37 @@ pub fn run_backup_status() -> Result<()> {
         kc.path(),
     )?;
 
+    let zone = readers_zone();
     println!(
         "{}",
         format_backup_status(
             spec_backup.as_ref(),
             &jobs,
+            &pods,
             status_cm.as_ref(),
             last_prune.as_deref(),
             &chrono::Local,
-            readers_zone().as_deref(),
+            zone.as_deref(),
         )
     );
+    // The repository and retention (WI-389), for an enabled schedule.
+    if spec_backup
+        .as_ref()
+        .and_then(|s| s.get("enabled"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        println!(
+            "{}",
+            format_repository_status(
+                status_cm.as_ref(),
+                ps.as_ref(),
+                &chrono::Local,
+                zone.as_deref(),
+                chrono::Utc::now(),
+            )
+        );
+    }
     Ok(())
 }
 
@@ -5523,6 +7261,7 @@ pub fn run_backup_status() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use job_pod::UNSCHEDULABLE_GRACE;
     use serde_json::json;
 
     // ------------------------------------------------------------------
@@ -6359,7 +8098,7 @@ mod tests {
             "bucket": "s3:x",
             "retention": { "keepDaily": 10, "keepWeekly": 8, "keepMonthly": 12 }
         });
-        let p = retention_from_spec_backup(Some(&spec), None, None, None);
+        let (p, _) = retention_from_spec_backup(Some(&spec), None, None, None, None);
         assert_eq!(p.keep_daily, 10);
         assert_eq!(p.keep_weekly, 8);
         assert_eq!(p.keep_monthly, 12);
@@ -6371,7 +8110,7 @@ mod tests {
             "retention": { "keepDaily": 10, "keepWeekly": 8, "keepMonthly": 12 }
         });
         // keep_daily override wins; the other two fall back to the CR.
-        let p = retention_from_spec_backup(Some(&spec), Some(3), None, None);
+        let (p, _) = retention_from_spec_backup(Some(&spec), Some(3), None, None, None);
         assert_eq!(p.keep_daily, 3);
         assert_eq!(p.keep_weekly, 8);
         assert_eq!(p.keep_monthly, 12);
@@ -6380,22 +8119,97 @@ mod tests {
     #[test]
     fn retention_from_spec_backup_all_unset_is_default_7_4_6() {
         // No CR retention block and no overrides → the 7/4/6 default.
-        let p = retention_from_spec_backup(None, None, None, None);
+        let (p, _) = retention_from_spec_backup(None, None, None, None, None);
         assert_eq!(p.keep_daily, 7);
         assert_eq!(p.keep_weekly, 4);
         assert_eq!(p.keep_monthly, 6);
         // A CR with no `.retention` also falls through to the default.
         let spec = json!({ "bucket": "s3:x" });
-        let p2 = retention_from_spec_backup(Some(&spec), None, None, None);
+        let (p2, _) = retention_from_spec_backup(Some(&spec), None, None, None, None);
         assert_eq!(p2.keep_daily, 7);
         assert_eq!(p2.keep_weekly, 4);
         assert_eq!(p2.keep_monthly, 6);
     }
 
+    /// The prune counts days in the zone the cluster's schedules run in —
+    /// the zone the in-cluster prune is given — and in UTC with no zone to
+    /// read. One it does not know is UTC and a warning that names it.
+    #[test]
+    fn retention_from_spec_backup_counts_days_in_the_schedules_zone() {
+        let spec = json!({ "bucket": "s3:x", "timeZone": "Europe/Berlin" });
+        let (p, warning) = retention_from_spec_backup(Some(&spec), None, None, None, None);
+        assert_eq!(p.zone.name(), "Europe/Berlin");
+        assert!(warning.is_none(), "{warning:?}");
+
+        for spec in [
+            None,
+            Some(json!({ "bucket": "s3:x" })),
+            Some(json!({ "timeZone": "" })),
+        ] {
+            let (p, warning) = retention_from_spec_backup(spec.as_ref(), None, None, None, None);
+            assert_eq!(p.zone, backup_core::prune::Tz::UTC, "{spec:?}");
+            assert!(warning.is_none(), "{spec:?}: {warning:?}");
+        }
+
+        let spec = json!({ "timeZone": "Europe/Atlantis" });
+        let (p, warning) = retention_from_spec_backup(Some(&spec), Some(2), None, None, None);
+        assert_eq!((p.zone, p.keep_daily), (backup_core::prune::Tz::UTC, 2));
+        let warning = warning.expect("an unknown zone is said");
+        assert!(warning.contains("Europe/Atlantis"), "{warning}");
+    }
+
+    /// `--timezone` wins over the cluster's zone, as `--keep-*` win over its
+    /// counts — and says so when the cluster's own prune counts in another,
+    /// since the two then keep different runs.
+    #[test]
+    fn retention_from_spec_backup_timezone_flag_wins_and_says_when_it_differs() {
+        let berlin = prune_zone_flag("Europe/Berlin").unwrap();
+        let tokyo = prune_zone_flag("Asia/Tokyo").unwrap();
+        let in_berlin = json!({ "bucket": "s3:x", "timeZone": "Europe/Berlin" });
+        let unset = json!({ "bucket": "s3:x" });
+        let unknown = json!({ "bucket": "s3:x", "timeZone": "Europe/Atlantis" });
+
+        let (p, warning) =
+            retention_from_spec_backup(Some(&in_berlin), None, None, None, Some(berlin));
+        assert_eq!((p.zone, warning), (berlin, None));
+
+        let (p, warning) =
+            retention_from_spec_backup(Some(&in_berlin), None, None, None, Some(Tz::UTC));
+        assert_eq!(p.zone, Tz::UTC);
+        let warning = warning.expect("a zone other than the cluster's is said");
+        assert!(warning.contains("--timezone UTC"), "{warning}");
+        assert!(warning.contains("counts in: Europe/Berlin"), "{warning}");
+        assert!(warning.contains("keep different"), "{warning}");
+
+        let (p, warning) = retention_from_spec_backup(Some(&unset), None, None, None, Some(tokyo));
+        assert_eq!(p.zone, tokyo);
+        let warning = warning.expect("the cluster counts in UTC");
+        assert!(warning.contains("counts in: UTC"), "{warning}");
+        assert!(warning.contains("is not set"), "{warning}");
+        let (p, warning) =
+            retention_from_spec_backup(Some(&unset), None, None, None, Some(Tz::UTC));
+        assert_eq!((p.zone, warning), (Tz::UTC, None));
+
+        let (p, warning) =
+            retention_from_spec_backup(Some(&unknown), None, None, None, Some(berlin));
+        assert_eq!(p.zone, berlin);
+        let warning = warning.expect("the cluster counts an unknown zone in UTC");
+        assert!(warning.contains("counts in: UTC"), "{warning}");
+        assert!(warning.contains("Europe/Atlantis"), "{warning}");
+        let (p, warning) =
+            retention_from_spec_backup(Some(&unknown), None, None, None, Some(Tz::UTC));
+        assert_eq!((p.zone, warning), (Tz::UTC, None));
+
+        // No cluster read: the flag is the zone, and there is no prune of
+        // the cluster's to differ from.
+        let (p, warning) = retention_from_spec_backup(None, Some(1), None, None, Some(tokyo));
+        assert_eq!((p.zone, p.keep_daily, warning), (tokyo, 1, None));
+    }
+
     #[test]
     fn retention_override_applies_with_no_cr_retention() {
         let spec = json!({ "bucket": "s3:x" });
-        let p = retention_from_spec_backup(Some(&spec), Some(1), Some(2), Some(3));
+        let (p, _) = retention_from_spec_backup(Some(&spec), Some(1), Some(2), Some(3), None);
         assert_eq!(p.keep_daily, 1);
         assert_eq!(p.keep_weekly, 2);
         assert_eq!(p.keep_monthly, 3);
@@ -6764,6 +8578,20 @@ mod tests {
     }
 
     #[test]
+    fn a_subset_ending_in_a_multi_byte_character_is_refused_not_a_panic() {
+        // `split_at(len - 1)` landed inside `é` and panicked, taking the CLI
+        // down on a typo instead of naming the grammar.
+        for bad in ["5é", "é", "10€", "5ǵ", "1/1é"] {
+            assert!(!is_read_data_subset(bad), "{bad}");
+            let err = backup_set_patch("check-depth", bad)
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains("check-depth"), "names the key: {err}");
+        }
+        assert!(!is_read_data_subset(""));
+    }
+
+    #[test]
     fn set_writes_only_the_field_it_was_given() {
         // The whole point: `enable` rewrites `spec.backup` wholesale, so
         // it cannot be used to change one thing — it resets every field
@@ -6817,6 +8645,87 @@ mod tests {
         assert!(backup_set_patch("timezone", "CET-1CEST,M3.5.0").is_err());
     }
 
+    /// The three retention modes the CRD takes, and nothing else: a typo
+    /// would otherwise reach the apiserver as a 422, or — on an older CRD
+    /// without `check` — look like a platform bug.
+    #[test]
+    fn set_enforce_takes_the_three_modes_and_says_what_each_does() {
+        for mode in ["check", "cluster", "operator"] {
+            assert_eq!(
+                backup_set_patch("enforce", mode).unwrap(),
+                json!({"spec": {"backup": {"retention": {"enforce": mode}}}})
+            );
+        }
+        let err = backup_set_patch("enforce", "weekly")
+            .unwrap_err()
+            .to_string();
+        for says in [
+            "`check`",
+            "`cluster`",
+            "`operator`",
+            "after a check that passed",
+        ] {
+            assert!(err.contains(says), "{says}: {err}");
+        }
+        assert!(validate_enable_enums(&EnableOpts {
+            enforce: Some("check".into()),
+            ..Default::default()
+        })
+        .is_ok());
+        assert!(validate_enable_enums(&EnableOpts {
+            enforce: Some("Check".into()),
+            ..Default::default()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn set_validates_the_timezone_it_forwards() {
+        assert!(backup_set_patch("timezone", "Europe/Lisbon").is_ok());
+        assert!(backup_set_patch("timezone", "CET-1CEST,M3.5.0").is_err());
+    }
+
+    #[test]
+    fn set_deadline_writes_seconds_to_the_field_the_chart_reads() {
+        let patch = backup_set_patch("deadline", "12h").unwrap();
+        assert_eq!(
+            patch,
+            json!({"spec": {"backup": {"activeDeadlineSeconds": 43200}}})
+        );
+        let patch = backup_set_patch("check-deadline", "90m").unwrap();
+        assert_eq!(
+            patch,
+            json!({"spec": {"backup": {"checkActiveDeadlineSeconds": 5400}}})
+        );
+        assert_eq!(
+            backup_set_patch("deadline", "600s").unwrap()["spec"]["backup"]
+                ["activeDeadlineSeconds"],
+            json!(600)
+        );
+    }
+
+    #[test]
+    fn set_deadline_refuses_what_it_cannot_read_one_way() {
+        for bad in [
+            "6",                     // hours? seconds? — the ambiguity itself
+            "9m",                    // under the ten-minute floor the CRD enforces
+            "599s",                  // likewise
+            "1.5h",                  // no fractions
+            "6h30m",                 // one unit
+            "-6h",                   // no sign
+            "h",                     // no number
+            "6d",                    // no days: a deadline that long outlives a daily slot
+            "",                      // nothing
+            "99999999999999999999h", // overflow
+            "6ｈ",                   // a fullwidth h: multi-byte, refused rather than sliced
+        ] {
+            let err = backup_set_patch("deadline", bad)
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains("deadline"), "names the key for {bad:?}: {err}");
+        }
+    }
+
     #[test]
     fn an_unknown_key_lists_the_ones_that_exist() {
         let err = backup_set_patch("bucket", "s3:elsewhere")
@@ -6846,6 +8755,7 @@ mod tests {
         let s = format_backup_status(
             Some(&spec),
             &[],
+            &[],
             Some(&cm),
             Some("2026-09-09T02:30:00Z"),
             &tokyo(),
@@ -6866,12 +8776,14 @@ mod tests {
         // backup is current.
         let spec = json!({"enabled": true, "bucket": "s3:x", "schedule": "0 3 * * *"});
         let job = json!({
-            "metadata": {"name": "apprafter-backup-manual-20260910-221128"},
+            "metadata": {"name": "apprafter-backup-manual-20260910-221128",
+                         "labels": {"apprafter.io/manual": "true"}},
             "status": {"startTime": "2026-09-10T22:11:28Z", "succeeded": 1}
         });
         let s = format_backup_status(
             Some(&spec),
             std::slice::from_ref(&job),
+            &[],
             None,
             None,
             &tokyo(),
@@ -6888,6 +8800,7 @@ mod tests {
         let s = format_backup_status(
             Some(&spec),
             &[],
+            &[],
             Some(&cm),
             None,
             &tokyo(),
@@ -6898,14 +8811,22 @@ mod tests {
 
     #[test]
     fn status_disabled_when_no_spec_backup() {
-        let s = format_backup_status(None, &[], None, None, &tokyo(), Some("Asia/Tokyo"));
+        let s = format_backup_status(None, &[], &[], None, None, &tokyo(), Some("Asia/Tokyo"));
         assert!(s.to_lowercase().contains("disabled"));
     }
 
     #[test]
     fn status_disabled_when_enabled_false() {
         let spec = json!({"enabled": false, "bucket": "s3:x"});
-        let s = format_backup_status(Some(&spec), &[], None, None, &tokyo(), Some("Asia/Tokyo"));
+        let s = format_backup_status(
+            Some(&spec),
+            &[],
+            &[],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
         assert!(s.to_lowercase().contains("disabled"));
         // Config is retained and shown even when disabled.
         assert!(s.contains("s3:x"));
@@ -6916,6 +8837,7 @@ mod tests {
         let spec = json!({"enabled": true, "bucket": "s3:x", "schedule": "0 3 * * *", "stagingMode": "monolithic"});
         let s = format_backup_status(
             Some(&spec),
+            &[],
             &[],
             None,
             Some("2026-07-17T03:00:00Z"),
@@ -6937,7 +8859,15 @@ mod tests {
             "schedule": "30 22 * * *", "checkSchedule": "30 1 * * 0",
             "timeZone": "Europe/Berlin"
         });
-        let s = format_backup_status(Some(&spec), &[], None, None, &tokyo(), Some("Asia/Tokyo"));
+        let s = format_backup_status(
+            Some(&spec),
+            &[],
+            &[],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
         assert!(s.contains("daily at 22:30 Europe/Berlin"), "{s}");
         assert!(s.contains("Sundays at 01:30 Europe/Berlin"), "{s}");
     }
@@ -6951,7 +8881,15 @@ mod tests {
             "enabled": true, "bucket": "s3:x", "schedule": "0 3 * * *",
             "checkSchedule": "", "timeZone": "UTC"
         });
-        let s = format_backup_status(Some(&spec), &[], None, None, &tokyo(), Some("Asia/Tokyo"));
+        let s = format_backup_status(
+            Some(&spec),
+            &[],
+            &[],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
         assert!(s.contains("check:         off"), "{s}");
     }
 
@@ -6961,7 +8899,15 @@ mod tests {
         // alone reads as local time; it is actually the
         // kube-controller-manager's zone, which is the trap D2 is about.
         let spec = json!({"enabled": true, "bucket": "s3:x", "schedule": "0 3 * * *"});
-        let s = format_backup_status(Some(&spec), &[], None, None, &tokyo(), Some("Asia/Tokyo"));
+        let s = format_backup_status(
+            Some(&spec),
+            &[],
+            &[],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
         assert!(s.contains("cluster timezone"), "{s}");
         assert!(s.contains("backup enable"), "{s}");
     }
@@ -6974,20 +8920,29 @@ mod tests {
             "enabled": true, "bucket": "s3:x", "schedule": "*/5 * * * *",
             "timeZone": "UTC"
         });
-        let s = format_backup_status(Some(&spec), &[], None, None, &tokyo(), Some("Asia/Tokyo"));
+        let s = format_backup_status(
+            Some(&spec),
+            &[],
+            &[],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
         assert!(s.contains("*/5 * * * * UTC"), "{s}");
     }
 
     #[test]
     fn status_reports_job_outcome() {
         let job = json!({
-            "metadata": {"name": "apprafter-backup-28900000"},
+            "metadata": {"name": "apprafter-backup-28900000", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)},
             "status": {"succeeded": 1}
         });
         let spec = json!({"enabled": true, "bucket": "s3:x"});
         let s = format_backup_status(
             Some(&spec),
             std::slice::from_ref(&job),
+            &[],
             None,
             None,
             &tokyo(),
@@ -6995,6 +8950,61 @@ mod tests {
         );
         assert!(s.contains("apprafter-backup-28900000"));
         assert!(s.contains("Succeeded"));
+    }
+
+    #[test]
+    fn status_names_why_a_job_failed_when_the_job_says() {
+        // A run stopped at its deadline: the pods say only "failed: 1", the
+        // Job's condition says why — and that is the difference between
+        // "raise the deadline" and "read the log".
+        let job = json!({
+            "metadata": {"name": "apprafter-backup-28900000", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)},
+            "status": {
+                "startTime": "2026-07-17T03:00:00Z",
+                "failed": 1,
+                "conditions": [
+                    {"type": "FailureTarget", "status": "True", "reason": "DeadlineExceeded",
+                     "message": "Job was active longer than specified deadline"},
+                    {"type": "Failed", "status": "True", "reason": "DeadlineExceeded",
+                     "message": "Job was active longer than specified deadline"}
+                ]
+            }
+        });
+        let spec = json!({"enabled": true, "bucket": "s3:x"});
+        let s = format_backup_status(
+            Some(&spec),
+            std::slice::from_ref(&job),
+            &[],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
+        assert!(
+            s.contains(
+                "Last backup Job: apprafter-backup-28900000 — Failed: DeadlineExceeded: Job was \
+                 active longer than specified deadline (2026-07-17 12:00:00 Asia/Tokyo)"
+            ),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn a_job_still_running_is_read_off_its_pods() {
+        // No terminal condition yet: the pod counts are all there is, and a
+        // Job between a failed attempt and its retry must not read as a
+        // terminal failure with a reason it does not have.
+        let running = json!({
+            "metadata": {"name": "apprafter-backup-28900000"},
+            "status": {"active": 1, "failed": 1}
+        });
+        assert_eq!(job_line_outcome(&running, &[]), "Running");
+        let done = json!({
+            "metadata": {"name": "apprafter-backup-28900000"},
+            "status": {"succeeded": 1,
+                       "conditions": [{"type": "Complete", "status": "True"}]}
+        });
+        assert_eq!(job_line_outcome(&done, &[]), "Succeeded");
     }
 
     #[test]
@@ -7012,6 +9022,7 @@ mod tests {
         let spec = json!({"enabled": true, "bucket": "s3:x"});
         let s = format_backup_status(
             Some(&spec),
+            &[],
             &[],
             Some(&cm),
             None,
@@ -7039,24 +9050,172 @@ mod tests {
     #[test]
     fn status_last_prune_never_when_absent() {
         let spec = json!({"enabled": true, "bucket": "s3:x"});
-        let s = format_backup_status(Some(&spec), &[], None, None, &tokyo(), Some("Asia/Tokyo"));
+        let s = format_backup_status(
+            Some(&spec),
+            &[],
+            &[],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
         assert!(s.contains("Last prune: never"));
+    }
+
+    /// WI-389: who prunes is always said, set or not.
+    #[test]
+    fn status_says_who_prunes_even_when_it_was_never_set() {
+        let unset = json!({"enabled": true, "bucket": "s3:x"});
+        let s = format_backup_status(Some(&unset), &[], &[], None, None, &tokyo(), None);
+        assert!(
+            s.contains("enforce: not set (the platform's default)"),
+            "{s}"
+        );
+        let set = json!({"enabled": true, "bucket": "s3:x",
+                         "retention": {"keepDaily": 5, "enforce": "operator"}});
+        let s = format_backup_status(Some(&set), &[], &[], None, None, &tokyo(), None);
+        assert!(s.contains("keepDaily: 5"), "{s}");
+        assert!(s.contains("enforce: operator"), "{s}");
+        assert!(!s.contains("not set"), "{s}");
+    }
+
+    /// The scoped key's week, as the runner records it.
+    fn scoped_record() -> Value {
+        json!({"data": {
+            "lastSuccess": "2026-09-20T03:01:00+00:00",
+            "lastCheck": "2026-09-20T06:00:30+00:00", "lastCheckResult": "passed",
+            "lastCheckError": "",
+            "lastPrune": "2026-09-20T06:00:41+00:00", "lastPruneResult": "not-permitted",
+            "lastPruneBy": "check",
+            "lastPruneDetail": "not permitted: the storage refused to delete snapshot ecd0be32 \
+                (Remove(<snapshot/ecd0be3219>) failed: client.RemoveObject: Access Denied.), so \
+                nothing was deleted; 9 snapshot(s) of 9 run(s) are past the keep policy",
+            "repoStatsAt": "2026-09-20T06:00:44+00:00", "repoBytes": "1288490189",
+            "repoSnapshots": "42", "repoBlobs": "310512",
+            "repoPrevStatsAt": "2026-09-13T06:00:40+00:00", "repoPrevBytes": "1125908480",
+            "repoPrevSnapshots": "35", "repoPrevBlobs": "299492",
+        }})
+    }
+
+    fn now_utc() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-09-23T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn repository_status_shows_the_check_the_prune_the_size_and_the_growth() {
+        let s = format_repository_status(
+            Some(&scoped_record()),
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+            now_utc(),
+        );
+        assert!(
+            s.contains("last check:  2026-09-20 15:00:30 Asia/Tokyo — passed"),
+            "{s}"
+        );
+        assert!(
+            s.contains("last prune:  2026-09-20 15:00:41 Asia/Tokyo after the weekly check — NOT PERMITTED"),
+            "{s}"
+        );
+        assert!(s.contains("Access Denied"), "{s}");
+        assert!(
+            s.contains("size:        1.2 GiB in 42 snapshots and 310512 blobs"),
+            "{s}"
+        );
+        assert!(
+            s.contains("growth:      +155.1 MiB, +7 snapshots, +11020 blobs since 2026-09-13"),
+            "{s}"
+        );
+        // No operator verdict to read: the record alone still warns.
+        assert!(s.contains("Retention: NOT ENFORCED"), "{s}");
+        assert!(
+            s.contains("--credential-file <full-credentials.env>"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn repository_status_prints_the_operators_retention_verdict_when_there_is_one() {
+        let stack = json!({
+            "spec": {"backup": {"enabled": true}},
+            "status": {"conditions": [{
+                "type": "BackupRetention", "status": "False", "reason": "PruneNotPermitted",
+                "message": "retention is not enforced: the cluster's S3 key may not delete",
+                "lastTransitionTime": "2026-09-20T06:00:41Z"}]},
+        });
+        let s = format_repository_status(
+            Some(&scoped_record()),
+            Some(&stack),
+            &tokyo(),
+            Some("Asia/Tokyo"),
+            now_utc(),
+        );
+        assert!(s.contains("Retention: NOT ENFORCED since"), "{s}");
+        assert!(s.contains("PruneNotPermitted"), "{s}");
+        assert!(
+            s.contains("backup-retention-and-checks/#who-runs-the-prune"),
+            "{s}"
+        );
+        assert_eq!(
+            s.matches("Retention:").count(),
+            1,
+            "one verdict, not two: {s}"
+        );
+    }
+
+    #[test]
+    fn repository_status_before_any_check_says_so_rather_than_nothing() {
+        let s = format_repository_status(None, None, &tokyo(), None, now_utc());
+        assert!(s.contains("last check:  none recorded yet"), "{s}");
+        assert!(s.contains("last prune:  none in the cluster yet"), "{s}");
+        assert!(s.contains("not measured yet"), "{s}");
+        assert!(!s.contains("NOT ENFORCED"), "{s}");
+    }
+
+    #[test]
+    fn a_failed_check_is_shown_with_its_reason_and_a_shrinking_repository_as_negative() {
+        let cm = json!({
+            "lastCheck": "2026-09-27T06:00:30+00:00", "lastCheckResult": "failed",
+            "lastCheckError": "restic check: pack 5e1f0a2b contains 1 error",
+            "repoStatsAt": "2026-09-20T06:00:44+00:00", "repoBytes": "1000",
+            "repoPrevStatsAt": "2026-09-13T06:00:40+00:00", "repoPrevBytes": "3048",
+        });
+        let s = format_repository_status(Some(&cm), None, &tokyo(), None, now_utc());
+        assert!(s.contains("— FAILED\n"), "{s}");
+        assert!(
+            s.contains("restic check: pack 5e1f0a2b contains 1 error"),
+            "{s}"
+        );
+        assert!(s.contains("growth:      -2.0 KiB since"), "{s}");
+        // restic's long output is cut to the lines that name the damage.
+        let long = json!({
+            "lastCheck": "2026-09-27T06:00:30+00:00", "lastCheckResult": "failed",
+            "lastCheckError": "error for tree a83ddebe:\n  decrypting blob failed\npack 1a5c contains 2 errors\n\nThe repository contains damaged pack files.\nFatal: repository contains errors\n",
+        });
+        let s = format_repository_status(Some(&long), None, &tokyo(), None, now_utc());
+        assert!(s.contains("pack 1a5c contains 2 errors"), "{s}");
+        assert!(!s.contains("Fatal: repository contains errors"), "{s}");
+        assert!(s.contains("… 2 more line(s)"), "{s}");
     }
 
     #[test]
     fn status_picks_most_recent_job_by_start_time() {
         let job_old = json!({
-            "metadata": {"name": "apprafter-backup-28800000"},
+            "metadata": {"name": "apprafter-backup-28800000", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)},
             "status": {"startTime": "2026-07-16T03:00:00Z", "failed": 1}
         });
         let job_new = json!({
-            "metadata": {"name": "apprafter-backup-28900000"},
+            "metadata": {"name": "apprafter-backup-28900000", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)},
             "status": {"startTime": "2026-07-17T03:00:00Z", "succeeded": 1}
         });
         let spec = json!({"enabled": true, "bucket": "s3:x"});
         let s = format_backup_status(
             Some(&spec),
             &[job_old, job_new],
+            &[],
             None,
             None,
             &tokyo(),
@@ -7072,12 +9231,93 @@ mod tests {
     //     no cluster at all (the DR case: the cluster is gone by design)
     // ------------------------------------------------------------------
 
-    /// `--keep-*` triple, for terse table rows below.
+    /// `--keep-*` triple, for terse table rows below — with `--timezone`
+    /// given, so the rows are about what they name ([`no_zone`] drops it).
     fn prune_keeps(d: Option<u32>, w: Option<u32>, m: Option<u32>) -> RetentionArgs {
         RetentionArgs::Prune {
             keep_daily: d,
             keep_weekly: w,
             keep_monthly: m,
+            time_zone: Some(Tz::UTC),
+        }
+    }
+
+    /// The same prune without `--timezone`.
+    fn no_zone(args: RetentionArgs) -> RetentionArgs {
+        match args {
+            RetentionArgs::Prune {
+                keep_daily,
+                keep_weekly,
+                keep_monthly,
+                ..
+            } => RetentionArgs::Prune {
+                keep_daily,
+                keep_weekly,
+                keep_monthly,
+                time_zone: None,
+            },
+            other => other,
+        }
+    }
+
+    /// The zone the keep policy counts in is an input the cluster holds,
+    /// like the keep counts: `--timezone` names it, and without the flag the
+    /// command reaches for the cluster, whose refusal names the flag. The
+    /// offline form used to count in UTC, and beside the cluster's own
+    /// prune in another zone the two forgot runs each would keep.
+    #[test]
+    fn the_zone_comes_from_the_cluster_unless_timezone_names_it() {
+        let repo = Some("s3:https://h/b");
+        let full = prune_keeps(Some(7), Some(4), Some(6));
+        assert!(!backup_verb_needs_cluster(
+            repo,
+            full,
+            CredSource::File,
+            Some(OFFLINE_UID)
+        ));
+        assert!(
+            backup_verb_needs_cluster(repo, no_zone(full), CredSource::File, Some(OFFLINE_UID)),
+            "every other input given, and still no zone"
+        );
+
+        let need = cluster_need(repo, no_zone(full), CredSource::File, Some(OFFLINE_UID));
+        assert_eq!(need.flags, vec!["--timezone <zone>".to_string()]);
+        assert!(need.reasons[0].contains("spec.backup.timeZone"), "{need:?}");
+        let h = need.hint("prune");
+        assert!(h.contains("pass --timezone <zone>"), "{h}");
+        assert!(h.contains("`UTC` if it named none"), "{h}");
+        assert!(h.contains("keeps different runs"), "says why it asks: {h}");
+
+        // With the zone given, a hint for another input does not ask for it.
+        let h = cluster_need(None, full, CredSource::File, Some(OFFLINE_UID)).hint("prune");
+        assert!(!h.contains("--timezone"), "{h}");
+        // check / unlock count nothing, so they never need a zone.
+        let h = cluster_need(
+            None,
+            RetentionArgs::NotApplicable,
+            CredSource::Cluster,
+            None,
+        )
+        .hint("check");
+        assert!(!h.contains("--timezone"), "{h}");
+    }
+
+    /// `--timezone` is refused when this build does not know the name,
+    /// where a zone read off the cluster is counted in UTC with a warning:
+    /// the flag is the operator saying which zone.
+    #[test]
+    fn the_timezone_flag_takes_a_zone_this_build_knows_and_nothing_else() {
+        assert_eq!(
+            prune_zone_flag("Europe/Berlin").unwrap().name(),
+            "Europe/Berlin"
+        );
+        assert_eq!(prune_zone_flag(" UTC ").unwrap(), Tz::UTC);
+        let e = prune_zone_flag("Europe/Atlantis").unwrap_err().to_string();
+        assert!(e.contains("--timezone 'Europe/Atlantis'"), "{e}");
+        assert!(e.contains("spec.backup.timeZone"), "{e}");
+        for empty in ["", "  "] {
+            let e = prune_zone_flag(empty).unwrap_err().to_string();
+            assert!(e.contains("--timezone is empty"), "{e}");
         }
     }
 
@@ -7265,7 +9505,8 @@ mod tests {
     /// foreign restore.
     #[test]
     fn show_defaults_to_this_clusters_latest_not_the_repositorys() {
-        let id = snapshot_to_show(None, Some(&shared_show_listing()), Some(OFFLINE_UID)).unwrap();
+        let (id, _) =
+            snapshot_to_show(None, Some(&shared_show_listing()), Some(OFFLINE_UID)).unwrap();
         assert_eq!(
             id, "mine1",
             "the newest snapshot in the repository is theirs"
@@ -7280,12 +9521,12 @@ mod tests {
     fn show_honours_a_named_snapshot_without_reading_the_repository() {
         assert_eq!(
             snapshot_to_show(Some("theirs1"), None, Some(OFFLINE_UID)).unwrap(),
-            "theirs1"
+            ("theirs1".to_string(), Vec::new())
         );
         // …including with no identity at all.
         assert_eq!(
             snapshot_to_show(Some("abc123"), None, None).unwrap(),
-            "abc123"
+            ("abc123".to_string(), Vec::new())
         );
     }
 
@@ -7299,6 +9540,69 @@ mod tests {
             .to_string();
         assert!(err.contains("different clusters"), "{err}");
         assert!(err.contains("apprafter backup show <id>"), "{err}");
+    }
+
+    /// A complete sequential run, then a newer one a SIGINT stopped after its
+    /// first claim: no commit snapshot, so no `manifest.json` in it.
+    fn interrupted_show_listing() -> String {
+        let done = format!("{OFFLINE_UID}-2026-09-23T03:00:00Z");
+        let cut = format!("{OFFLINE_UID}-2026-09-24T03:00:00Z");
+        format!(
+            r#"[
+              {{"id":"done0","short_id":"done0","time":"2026-09-23T03:00:01Z",
+                "tags":["{done}"],"paths":["/staging/a/claim-0"]}},
+              {{"id":"donec","short_id":"donec","time":"2026-09-23T03:00:02Z",
+                "tags":["{done}"],"paths":["/staging/a/commit"]}},
+              {{"id":"cut0","short_id":"cut0","time":"2026-09-24T03:00:01Z",
+                "tags":["{cut}"],"paths":["/tmp/b/claim-0"]}}
+            ]"#
+        )
+    }
+
+    /// FIRES: after a sequential backup died between its claims, `backup
+    /// show` resolved `latest` to the dead run's claim snapshot and said the
+    /// repository "holds something else". It shows the newest complete run,
+    /// and says which newer run it passed over.
+    #[test]
+    fn show_defaults_to_the_newest_complete_run_and_names_the_one_it_passed_over() {
+        let (id, passed) =
+            snapshot_to_show(None, Some(&interrupted_show_listing()), Some(OFFLINE_UID)).unwrap();
+        assert_eq!(id, "donec");
+        assert_eq!(passed.len(), 1, "{passed:?}");
+
+        let lines = passed_over_lines(&passed, "donec, shown below", &chrono::Utc, Some("UTC"));
+        let text = lines.join("\n");
+        assert!(text.contains("did not finish"), "{text}");
+        assert!(text.contains("1 snapshot(s)"), "{text}");
+        assert!(
+            text.contains(&format!("{}…", &OFFLINE_UID[..8])),
+            "the run is named by its tag, shortened as `backup list` does: {text}"
+        );
+        assert!(text.contains("2026-09-24 03:00:01 UTC"), "{text}");
+        assert!(text.contains("manifest.json"), "{text}");
+        assert!(text.contains("still being written"), "{text}");
+        assert!(text.contains("snapshot donec, shown below"), "{text}");
+    }
+
+    /// DOES NOT FIRE: with nothing passed over, not a word.
+    #[test]
+    fn nothing_passed_over_prints_nothing() {
+        assert!(passed_over_lines(&[], "x", &chrono::Utc, None).is_empty());
+    }
+
+    /// The untagged snapshots are one run with an empty tag, as the prune
+    /// counts them; the line says they carry no tag rather than naming a run
+    /// called "".
+    #[test]
+    fn passed_over_untagged_snapshots_are_said_to_carry_no_tag() {
+        let passed = [UnfinishedRun {
+            tag: String::new(),
+            snapshots: 2,
+            newest: "2026-09-24T03:00:02Z".into(),
+        }];
+        let text = passed_over_lines(&passed, "donec", &chrono::Utc, Some("UTC")).join("\n");
+        assert!(text.contains("2 snapshot(s) with no tag,"), "{text}");
+        assert!(!text.contains("of run ,"), "{text}");
     }
 
     // ------------------------------------------------------------------
@@ -8686,6 +10990,110 @@ mod tests {
         assert_eq!(last_prune_annotation(Some(&json!({"metadata": {}}))), None);
     }
 
+    /// The restic host a CLI backup stamps is the one the runner stamps for
+    /// the same cluster: `spec.backup.clusterName`, else the runner's fixed
+    /// default — the chart renders `clusterName | default "apprafter-backup"`
+    /// and the runner falls back to the same constant.
+    #[test]
+    fn a_cli_backup_is_hosted_under_the_name_the_runner_uses() {
+        assert_eq!(
+            cluster_backup_host(Some(&json!({"clusterName": "prod-eu"}))),
+            "prod-eu"
+        );
+        for unnamed in [None, Some(json!({})), Some(json!({"clusterName": ""}))] {
+            assert_eq!(
+                cluster_backup_host(unnamed.as_ref()),
+                "apprafter-backup",
+                "{unnamed:?}"
+            );
+        }
+        let chart = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../platform-stack/cue/render_tool.cue"),
+        )
+        .expect("render_tool.cue");
+        let rendered = chart
+            .lines()
+            .skip_while(|l| !l.contains("name: APPRAFTER_BACKUP_HOST"))
+            .nth(1)
+            .expect("the chart renders APPRAFTER_BACKUP_HOST");
+        assert!(
+            rendered.contains(&format!(
+                "clusterName | default \"{}\"",
+                backup_core::engine::DEFAULT_BACKUP_HOST
+            )),
+            "the chart's default host is not the CLI's: {rendered}"
+        );
+    }
+
+    /// The cluster the prune resolved: its configured repository and UID.
+    const CLUSTER_REPO: &str = "s3:https://fsn1.example/bk/cluster";
+    const OTHER_UID: &str = "22222222-3333-4444-5555-666666666666";
+
+    /// Stamped: the cluster's own repository, pruned as the cluster's own
+    /// history — with or without `--repo` / `--cluster-uid` naming them.
+    #[test]
+    fn the_last_prune_stamp_goes_on_the_cluster_whose_history_was_pruned() {
+        for repo in [CLUSTER_REPO, "s3:https://fsn1.example/bk/cluster/"] {
+            assert_eq!(
+                last_prune_stamp(true, repo, Some(CLUSTER_REPO), OFFLINE_UID, Ok(OFFLINE_UID)),
+                Ok(())
+            );
+        }
+    }
+
+    /// FIRES (live walk): `backup prune --repo <a rehearsal repository>
+    /// --cluster-uid <another cluster>` with no `--keep-*` flags resolves the
+    /// ACTIVE cluster only to read its retention — and then stamped
+    /// `apprafter.io/last-prune` on it, so its `BackupRetention` said
+    /// `apprafter backup prune` last ran against it when nothing of it was
+    /// touched. Neither a different repository nor a different identity is
+    /// this cluster's prune.
+    #[test]
+    fn a_prune_of_another_repository_or_identity_stamps_nothing() {
+        let other_repo = last_prune_stamp(
+            true,
+            "/srv/rehearsal-repo",
+            Some(CLUSTER_REPO),
+            OFFLINE_UID,
+            Ok(OFFLINE_UID),
+        )
+        .unwrap_err();
+        assert!(other_repo.contains("/srv/rehearsal-repo"), "{other_repo}");
+        assert!(other_repo.contains(CLUSTER_REPO), "{other_repo}");
+
+        let other_uid = last_prune_stamp(
+            true,
+            CLUSTER_REPO,
+            Some(CLUSTER_REPO),
+            OTHER_UID,
+            Ok(OFFLINE_UID),
+        )
+        .unwrap_err();
+        assert!(other_uid.contains(OTHER_UID), "{other_uid}");
+        assert!(other_uid.contains(OFFLINE_UID), "{other_uid}");
+
+        let unconfigured =
+            last_prune_stamp(true, CLUSTER_REPO, None, OFFLINE_UID, Ok(OFFLINE_UID)).unwrap_err();
+        assert!(
+            unconfigured.contains("no backup repository"),
+            "{unconfigured}"
+        );
+
+        let unreadable = last_prune_stamp(
+            true,
+            CLUSTER_REPO,
+            Some(CLUSTER_REPO),
+            OTHER_UID,
+            Err("namespaces \"kube-system\" is forbidden"),
+        )
+        .unwrap_err();
+        assert!(unreadable.contains("forbidden"), "{unreadable}");
+
+        let offline =
+            last_prune_stamp(false, CLUSTER_REPO, None, OFFLINE_UID, Ok(OFFLINE_UID)).unwrap_err();
+        assert!(offline.contains("no cluster"), "{offline}");
+    }
+
     #[test]
     fn the_prune_summary_states_the_policy_that_was_applied() {
         let s = prune_summary(
@@ -8694,6 +11102,13 @@ mod tests {
                 keep_daily: 1,
                 keep_weekly: 2,
                 keep_monthly: 3,
+                zone: backup_core::prune::policy_zone("Europe/Berlin").unwrap(),
+            },
+            &backup_core::prune::PruneOutcome::Pruned {
+                forgot_snapshots: 4,
+                forgot_runs: 3,
+                kept_runs: 6,
+                unfinished_runs: 1,
             },
         );
         assert!(s.contains("s3:https://h/b"), "{s}");
@@ -8701,36 +11116,193 @@ mod tests {
             s.contains("keepDaily=1 keepWeekly=2 keepMonthly=3"),
             "each number must sit against its own label: {s}"
         );
+        assert!(
+            s.contains("(days, weeks and months in Europe/Berlin)"),
+            "the zone the policy counted in is stated: {s}"
+        );
+        assert!(s.contains("forgot 4 snapshot(s) of 3 run(s)"), "{s}");
+        assert!(s.contains("6 run(s) kept"), "{s}");
+        assert!(
+            s.contains("1 unfinished run(s) left alone, as a backup may still be writing them"),
+            "{s}"
+        );
+    }
+
+    /// The cluster's own scoped key is what `backup prune` falls back to with
+    /// no credential file, and it may not delete. That is an error, which
+    /// says nothing was deleted and names the flag that fixes it — not a
+    /// "✓ Pruned".
+    #[test]
+    fn a_prune_the_key_may_not_run_is_an_error_that_names_the_full_credentials() {
+        let outcome = backup_core::prune::PruneOutcome::NotPermitted {
+            snapshot: "ecd0be3219c6a9adb39e".into(),
+            restic_said: "Remove(<snapshot/ecd0be3219>) failed: client.RemoveObject: Access \
+                          Denied."
+                .into(),
+            would_forget_snapshots: 9,
+            would_forget_runs: 9,
+        };
+        // Only NotPermitted stops the command before the stamp.
+        assert!(refuse_an_unenforced_prune(
+            "s3:x",
+            &backup_core::prune::PruneOutcome::NothingToPrune {
+                kept_runs: 2,
+                unfinished_runs: 0
+            },
+            false
+        )
+        .is_ok());
+        assert!(refuse_an_unenforced_prune("s3:x", &outcome, false).is_err());
+        for had_file in [false, true] {
+            let msg = prune_not_permitted_error("s3:https://h/b", &outcome, had_file).to_string();
+            assert!(
+                msg.contains("retention was not enforced on s3:https://h/b"),
+                "{msg}"
+            );
+            assert!(msg.contains("nothing was deleted"), "{msg}");
+            assert!(msg.contains("Access Denied"), "{msg}");
+            assert!(
+                msg.contains("--credential-file <full-credentials.env>"),
+                "{msg}"
+            );
+            assert_eq!(
+                msg.contains("cluster's own backup Secret"),
+                !had_file,
+                "{msg}"
+            );
+        }
+    }
+
+    /// The `ownerReferences` the Job controller — or `kubectl create job
+    /// --from=cronjob/<cronjob>` — puts on a Job it makes from `cronjob`.
+    fn owned_by(cronjob: &str) -> Value {
+        json!([{
+            "apiVersion": "batch/v1", "kind": "CronJob", "name": cronjob,
+            "uid": format!("{cronjob}-uid"), "controller": true, "blockOwnerDeletion": true
+        }])
     }
 
     #[test]
     fn status_reports_only_apprafter_backup_jobs() {
         let list = json!({"items": [
-            {"metadata": {"name": "apprafter-backup-1"}},
-            {"metadata": {"name": "apprafter-backup-check-1"}},
+            {"metadata": {"name": "apprafter-backup-1", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)}},
+            {"metadata": {"name": "apprafter-backup-check-1",
+                          "ownerReferences": owned_by(CHECK_CRONJOB_NAME)}},
+            // `kubectl create job --from=cronjob/apprafter-backup <any-name>`.
+            {"metadata": {"name": "walk-from-014903", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)}},
+            {"metadata": {"name": "apprafter-backup-manual-20260923-030000",
+                          "labels": {"apprafter.io/manual": "true"}}},
             {"metadata": {"name": "some-other-job"}},
+            // The name alone makes nothing a backup: a lookalike with no
+            // owner and no mark, and another CronJob's Job.
+            {"metadata": {"name": "apprafter-backup-lookalike"}},
+            {"metadata": {"name": "apprafter-backup-7", "ownerReferences": owned_by("nightly-report")}},
         ]});
         let jobs = backup_jobs_of(Some(&list));
         let names: Vec<&str> = jobs.iter().map(job_metadata_name).collect();
         assert_eq!(
             names,
-            vec!["apprafter-backup-1", "apprafter-backup-check-1"]
+            vec![
+                "apprafter-backup-1",
+                "apprafter-backup-check-1",
+                "walk-from-014903",
+                "apprafter-backup-manual-20260923-030000"
+            ]
         );
         // No Jobs listing at all (or no items) is "none", not a failure.
         assert!(backup_jobs_of(None).is_empty());
         assert!(backup_jobs_of(Some(&json!({}))).is_empty());
     }
 
+    /// Which runner a Job is, by the operator's rule (`Run::owns`): the
+    /// CronJob that owns it, else the name and label of `backup run`'s own.
+    #[test]
+    fn a_runner_job_is_told_by_its_owner_not_its_name() {
+        let job = |meta: Value| json!({ "metadata": meta });
+        let cases = [
+            (
+                json!({"name": "x", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)}),
+                Some(RunnerJob::Backup),
+            ),
+            (
+                json!({"name": "apprafter-backup-y", "ownerReferences": owned_by(CHECK_CRONJOB_NAME)}),
+                Some(RunnerJob::Check),
+            ),
+            (
+                json!({"name": "apprafter-backup-check-z", "ownerReferences": owned_by("other")}),
+                None,
+            ),
+            (
+                json!({"name": "apprafter-backup-manual-1", "labels": {"apprafter.io/manual": "true"}}),
+                Some(RunnerJob::Backup),
+            ),
+            // The mark without the name, and the name without the mark.
+            (
+                json!({"name": "mine", "labels": {"apprafter.io/manual": "true"}}),
+                None,
+            ),
+            (json!({"name": "apprafter-backup-manual-2"}), None),
+            (json!({"name": "apprafter-backup-check-3"}), None),
+        ];
+        for (meta, want) in cases {
+            assert_eq!(runner_job(&job(meta.clone())), want, "{meta}");
+        }
+    }
+
+    /// FIRES (P4 of the live walk): a scheduled-style Job made the usual
+    /// Kubernetes way under another name. The operator counted it; `backup
+    /// status` printed "Last backup Job: none" beside it.
+    #[test]
+    fn status_shows_a_job_made_from_the_cronjob_under_any_name() {
+        let spec = json!({"enabled": true, "bucket": "s3:x"});
+        let job = json!({
+            "metadata": {"name": "walk-from-014903", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)},
+            "status": {"startTime": "2026-09-23T01:49:03Z", "succeeded": 1}
+        });
+        let s = format_backup_status(
+            Some(&spec),
+            std::slice::from_ref(&job),
+            &[],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
+        assert!(
+            s.contains("Last backup Job: walk-from-014903 — Succeeded"),
+            "{s}"
+        );
+        assert!(s.contains("Last check Job:  none"), "{s}");
+    }
+
+    /// FIRES: `backup run` beside such a Job would have started a second
+    /// runner. It refuses, naming the Job.
+    #[test]
+    fn backup_run_refuses_beside_a_job_made_from_the_cronjob_under_any_name() {
+        let mut job = unfinished_job("walk-from-014903", "job-1", Some("CronJob"));
+        job["metadata"]["ownerReferences"] = owned_by(BACKUP_CRONJOB_NAME);
+        let (report, err) = refusal(&[job], &[]).expect("a runner that has not finished");
+        assert!(
+            report.contains("walk-from-014903 has not finished"),
+            "{report}"
+        );
+        assert!(
+            matches!(err, CliError::BackupJobActive { ref job } if job == "walk-from-014903"),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn a_job_that_has_started_but_not_finished_is_neither_succeeded_nor_failed() {
         let spec = json!({"enabled": true, "bucket": "s3:x"});
         let running = json!({
-            "metadata": {"name": "apprafter-backup-running"},
+            "metadata": {"name": "apprafter-backup-running", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)},
             "status": {"active": 1}
         });
         let s = format_backup_status(
             Some(&spec),
             std::slice::from_ref(&running),
+            &[],
             None,
             None,
             &tokyo(),
@@ -8739,10 +11311,14 @@ mod tests {
         assert!(s.contains("Running"), "{s}");
 
         // A Job with no counters at all must not be reported as a success.
-        let bare = json!({"metadata": {"name": "apprafter-backup-bare"}, "status": {}});
+        let bare = json!({
+            "metadata": {"name": "apprafter-backup-bare", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)},
+            "status": {}
+        });
         let s = format_backup_status(
             Some(&spec),
             std::slice::from_ref(&bare),
+            &[],
             None,
             None,
             &tokyo(),
@@ -8866,12 +11442,83 @@ mod tests {
         assert!(s.contains("5 (2 extractable)"), "{s}");
     }
 
-    #[test]
-    fn the_local_pull_keeps_the_operator_stations_hostname_as_the_restic_group() {
-        // spec §Retention M-r3-1a: only the in-cluster runner pins a fixed
-        // host (its pod name is ephemeral). Pinning it here would merge every
-        // operator's snapshots into one retention group.
-        let opts = local_pull_backup_opts(
+    /// A cluster whose backup deadline is `deadline` seconds, recording
+    /// every helper pod applied in it — enough of one for the paths that
+    /// size and build an interactive command's helpers.
+    struct SizingKube {
+        deadline: u64,
+        applied: std::sync::Mutex<Vec<Value>>,
+    }
+
+    impl SizingKube {
+        fn with_deadline(deadline: u64) -> Self {
+            Self {
+                deadline,
+                applied: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn keep_alives(&self) -> Vec<Value> {
+            self.applied
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|spec| spec["spec"]["containers"][0]["command"].clone())
+                .collect()
+        }
+    }
+
+    impl KubeExec for SizingKube {
+        fn apply_and_wait_pod_ready(&self, spec: &Value) -> Result<()> {
+            self.applied.lock().unwrap().push(spec.clone());
+            Ok(())
+        }
+        fn exec_stream_to_file(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[&str],
+            out: &Path,
+            _: Option<Duration>,
+        ) -> Result<()> {
+            std::fs::write(out, b"DUMP").unwrap();
+            Ok(())
+        }
+        fn exec_stream_from_file(&self, _: &str, _: &str, _: &[&str], _: &Path) -> Result<()> {
+            unreachable!("nothing is loaded")
+        }
+        fn delete_pod_best_effort(&self, _: &str, _: &str) {}
+        fn get_secret_key(&self, _: &str, _: &str, key: &str) -> Result<String> {
+            Ok(match key {
+                "host" => "platform.nats.svc".to_string(),
+                "port" => "4222".to_string(),
+                other => format!("{other}-value"),
+            })
+        }
+        fn get_json(&self, args: &[&str]) -> Result<Option<Value>> {
+            assert_eq!(
+                args,
+                [
+                    "get",
+                    "platformstack",
+                    "default",
+                    "-n",
+                    "apprafter-system",
+                    "-o",
+                    "json"
+                ],
+                "the only read these paths make"
+            );
+            Ok(Some(json!({
+                "spec": {"backup": {"activeDeadlineSeconds": self.deadline}}
+            })))
+        }
+    }
+
+    /// `backup create`'s options, from a cluster with the given deadline.
+    fn local_pull_opts_under(k: &SizingKube) -> BackupOpts {
+        local_pull_backup_opts(
+            k,
             "s3:https://h/b",
             "pw".into(),
             "prod-cluster",
@@ -8882,8 +11529,75 @@ mod tests {
             Path::new("/staging"),
             "postgres:18-alpine".into(),
             StagingMode::Sequential,
-        );
-        assert_eq!(opts.backup_host, None);
+            "prod-eu".into(),
+        )
+        .unwrap()
+    }
+
+    /// The interactive commands have no Job deadline, so their helpers'
+    /// keep-alive is the only limit on one dump. A cluster backing up every
+    /// fifteen minutes sets a ten-minute deadline, and a helper sized by it
+    /// killed a long load at ten minutes; each path's helpers live six hours
+    /// all the same, and longer when the deadline is. `backup create` hands
+    /// the engine what [`local_pull_backup_opts`] read (the engine's own test
+    /// holds every helper to it); `export` applies them itself.
+    #[test]
+    fn an_interactive_backup_and_export_size_their_helpers_past_a_short_schedule_deadline() {
+        for (deadline, want) in [(600, "21600"), (43200, "43200")] {
+            let k = SizingKube::with_deadline(deadline);
+            assert_eq!(
+                local_pull_opts_under(&k).helper_keep_alive,
+                Duration::from_secs(want.parse().unwrap()),
+                "backup create under a deadline of {deadline}s"
+            );
+
+            let k = SizingKube::with_deadline(deadline);
+            let plan = plan_extraction(&[
+                json!({"spec": {"type": "pg"}, "metadata": {"name": "db", "namespace": "shop"},
+                       "status": {"connectionSecretRef": "db-conn"}}),
+                json!({"spec": {"type": "disk"}, "metadata": {"name": "files", "namespace": "shop"},
+                       "status": {"volumeClaimRef": "pvc"}}),
+                json!({"spec": {"type": "jetstream"}, "metadata": {"name": "js", "namespace": "shop"},
+                       "status": {"connectionSecretRef": "js-conn",
+                                  "streams": {"declared": ["orders"]}}}),
+            ]);
+            let dir = tempfile::tempdir().unwrap();
+            export_extract(&k, &plan, dir.path(), "postgres:18-alpine").unwrap();
+            assert_eq!(
+                k.keep_alives(),
+                vec![json!(["sleep", want]); 3],
+                "export under a deadline of {deadline}s"
+            );
+        }
+    }
+
+    /// FIRES (live walk): `backup create --repo <the cluster's repository>`
+    /// passed no `--host`, so restic stamped the workstation's hostname and
+    /// `backup list` showed "nixos" in the CLUSTER column beside the
+    /// runner's snapshots of the same cluster. The local pull is a backup
+    /// of the cluster, and carries the cluster's name as the runner does.
+    ///
+    /// (The old contract here was "keep the station's hostname as the
+    /// restic group, for retention". Retention no longer groups by host: the
+    /// prune plans by run tag and cluster UID and forgets by snapshot id.)
+    #[test]
+    fn the_local_pull_carries_the_clusters_name_as_its_restic_host() {
+        let opts = local_pull_backup_opts(
+            &SizingKube::with_deadline(43200),
+            "s3:https://h/b",
+            "pw".into(),
+            "prod-cluster",
+            MINE,
+            "0.2.58",
+            &["prod".to_string()],
+            true,
+            Path::new("/staging"),
+            "postgres:18-alpine".into(),
+            StagingMode::Sequential,
+            "prod-eu".into(),
+        )
+        .unwrap();
+        assert_eq!(opts.backup_host.as_deref(), Some("prod-eu"));
         assert!(opts.is_subset, "--select must reach the tag decoration");
         assert_eq!(opts.repo, "s3:https://h/b");
         assert_eq!(opts.cluster_id, "prod-cluster");
@@ -8895,6 +11609,9 @@ mod tests {
         assert_eq!(opts.namespaces, vec!["prod".to_string()]);
         assert_eq!(opts.staging_root, PathBuf::from("/staging"));
         assert_eq!(opts.pg_image, "postgres:18-alpine");
+        // The cluster's run deadline, not a fixed hour: it is how long each
+        // helper pod — and so each extraction — may live.
+        assert_eq!(opts.helper_keep_alive, Duration::from_secs(43200));
         assert!(matches!(opts.staging_mode, StagingMode::Sequential));
         assert!(
             chrono::DateTime::parse_from_rfc3339(&opts.created_at).is_ok(),
@@ -9669,9 +12386,15 @@ mod tests {
                 _ => break,
             }
         }
+        // The stub's kubeconfig: the interrupt's record of a helper apply
+        // keeps the file's bytes, so it must be there to read.
+        let kubeconfig = dir.path().join("kubeconfig.yaml");
+        std::fs::write(&kubeconfig, "apiVersion: v1\nkind: Config\n").unwrap();
         KubectlExec {
-            kubeconfig: dir.path().join("kubeconfig.yaml"),
+            kubeconfig,
             kubectl_bin: path,
+            // Private to the test: the process-wide set is the interrupt's.
+            helpers: helper_interrupt::HelperPods::default(),
         }
     }
 
@@ -9687,7 +12410,7 @@ mod tests {
             ),
         );
         let out = dir.path().join("dump.sql");
-        k.exec_stream_to_file("pg-0", "prod", &["pg_dump", "-Fc"], &out)
+        k.exec_stream_to_file("pg-0", "prod", &["pg_dump", "-Fc"], &out, None)
             .unwrap();
 
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "DUMPBYTES");
@@ -9706,7 +12429,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let k = stub_kubectl(&dir, "echo 'pg_dump: server version mismatch' >&2\nexit 7");
         let err = k
-            .exec_stream_to_file("pg-0", "prod", &["pg_dump"], &dir.path().join("out"))
+            .exec_stream_to_file("pg-0", "prod", &["pg_dump"], &dir.path().join("out"), None)
             .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("exec_stream_to_file"), "{msg}");
@@ -9715,6 +12438,102 @@ mod tests {
             msg.contains("pg_dump: server version mismatch"),
             "the pod's own error is the only useful part: {msg}"
         );
+    }
+
+    /// Run `exec_stream_to_file` on a thread and give up after `watchdog`, so
+    /// a missing bound FAILS the test instead of hanging it.
+    fn stream_with_watchdog(
+        k: KubectlExec,
+        out: PathBuf,
+        bound: Option<Duration>,
+        watchdog: Duration,
+    ) -> (Duration, Result<()>) {
+        let (done, finished) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let result =
+                k.exec_stream_to_file("bk-pg-db", "prod", &["pg_dump", "-Fc"], &out, bound);
+            let _ = done.send((started.elapsed(), result));
+        });
+        finished
+            .recv_timeout(watchdog)
+            .unwrap_or_else(|_| panic!("exec_stream_to_file still running after {watchdog:?}"))
+    }
+
+    #[test]
+    fn a_command_that_writes_nothing_within_the_bound_is_abandoned() {
+        // The shape of a pg_dump waiting on a lock during its schema read:
+        // alive, silent, and not about to change.
+        let dir = tempfile::tempdir().unwrap();
+        let k = stub_kubectl(&dir, "exec sleep 60");
+        let bound = Duration::from_secs(1);
+        let (elapsed, result) = stream_with_watchdog(
+            k,
+            dir.path().join("out"),
+            Some(bound),
+            Duration::from_secs(20),
+        );
+        let err = result.expect_err("a command silent past its bound must fail");
+        assert!(backup_core::kube::is_no_output_error(&err), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("prod/bk-pg-db"), "{msg}");
+        assert!(
+            elapsed >= bound,
+            "gave up after {elapsed:?}, before the bound"
+        );
+        assert!(
+            elapsed < bound + Duration::from_secs(5),
+            "gave up after {elapsed:?}, well past the {bound:?} bound"
+        );
+    }
+
+    #[test]
+    fn the_bound_times_only_the_first_byte() {
+        // Writing at once and then going quiet for longer than the bound is a
+        // dump copying a large table: it must run to the end.
+        let dir = tempfile::tempdir().unwrap();
+        let k = stub_kubectl(&dir, "printf 'PGDMP'\nsleep 3\nprintf 'REST'");
+        let out = dir.path().join("out");
+        let (_, result) = stream_with_watchdog(
+            k,
+            out.clone(),
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(20),
+        );
+        result.expect("a command that wrote in time is never cut");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "PGDMPREST");
+    }
+
+    #[test]
+    fn a_first_byte_that_arrives_inside_the_bound_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = stub_kubectl(&dir, "sleep 1\nprintf 'PGDMP'");
+        let out = dir.path().join("out");
+        let (_, result) = stream_with_watchdog(
+            k,
+            out.clone(),
+            Some(Duration::from_secs(10)),
+            Duration::from_secs(20),
+        );
+        result.expect("a first byte inside the bound is a success");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "PGDMP");
+    }
+
+    #[test]
+    fn a_bounded_command_that_fails_before_writing_reports_its_own_error() {
+        // A pg_dump whose TABLE lock wait ran out exits before the first-output
+        // bound: its own error, not the bound's, is what must come back.
+        let dir = tempfile::tempdir().unwrap();
+        let k = stub_kubectl(&dir, "echo 'LOCK TABLE public.t1' >&2\nexit 1");
+        let (_, result) = stream_with_watchdog(
+            k,
+            dir.path().join("out"),
+            Some(Duration::from_secs(10)),
+            Duration::from_secs(20),
+        );
+        let msg = result.expect_err("exit 1 fails the step").to_string();
+        assert!(msg.contains("LOCK TABLE public.t1"), "{msg}");
+        assert!(!msg.contains(backup_core::kube::NO_OUTPUT_MARKER), "{msg}");
     }
 
     #[test]
@@ -9755,17 +12574,35 @@ mod tests {
             .expect("an early-closing consumer that exits 0 is a success");
     }
 
+    /// A helper pod as `kubectl get` shows it once it is Running and Ready,
+    /// with uid `uid`.
+    fn ready_pod(uid: &str) -> String {
+        json!({
+            "metadata": {"name": "helper", "namespace": "prod", "uid": uid},
+            "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]}
+        })
+        .to_string()
+    }
+
     #[test]
     fn apply_and_wait_pod_ready_pipes_the_spec_in_and_then_waits_for_ready() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("argv");
         let seen = dir.path().join("spec.json");
+        let applied = dir.path().join("applied");
+        // `get` answers "no such pod" until the create, and the Ready pod
+        // after.
         let k = stub_kubectl(
             &dir,
             &format!(
-                "echo \"$@\" >> {log}\nif [ \"$1\" = apply ]; then cat > {seen}; fi\nexit 0",
+                "echo \"$@\" >> {log}\n\
+                 if [ \"$1\" = create ]; then cat > {seen}; touch {applied}; fi\n\
+                 if [ \"$1\" = get ] && [ -f {applied} ]; then printf '%s' '{ready}'; fi\n\
+                 exit 0",
                 log = log.display(),
-                seen = seen.display()
+                seen = seen.display(),
+                applied = applied.display(),
+                ready = ready_pod("u-1"),
             ),
         );
         let spec = json!({
@@ -9779,13 +12616,917 @@ mod tests {
         let piped: Value = serde_json::from_slice(&std::fs::read(&seen).unwrap()).unwrap();
         assert_eq!(piped, spec);
 
+        let argv: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        // Read (no pod), created — the apiserver's answer names the pod it
+        // made — then read until Ready: readiness, not existence — a Pod that
+        // exists but is not Ready cannot be exec'd into, which is the only
+        // reason this helper is created.
+        assert_eq!(
+            argv,
+            vec![
+                "get pod helper -n prod --ignore-not-found -o json",
+                "create --save-config -f - -n prod -o jsonpath={.metadata.uid}",
+                "get pod helper -n prod --ignore-not-found -o json",
+            ]
+        );
+    }
+
+    /// A stub kubectl that logs every call and plays a pod named `helper`:
+    /// `get` prints `pod` (a JSON document, or nothing: absent) until a
+    /// `delete` removes it. `create` refuses as the apiserver does while
+    /// there is a pod (`AlreadyExists`); otherwise it and `apply` run `put`
+    /// (a shell snippet; it must read stdin) and, when that succeeds, leave
+    /// the pod Running and Ready and print its uid, as `-o jsonpath` does:
+    /// `u-created` for a pod a create made, and for an apply the uid the pod
+    /// had (`u-applied` if it had none).
+    fn stateful_stub(dir: &tempfile::TempDir, pod: &str, put: &str) -> (KubectlExec, PathBuf) {
+        let log = dir.path().join("argv");
+        let present = dir.path().join("present.json");
+        if !pod.is_empty() {
+            std::fs::write(&present, pod).unwrap();
+        }
+        let k = stub_kubectl(
+            dir,
+            &format!(
+                "echo \"$@\" >> {log}\n\
+                 case \"$1\" in\n\
+                 get) cat {present} 2>/dev/null; exit 0;;\n\
+                 delete) rm -f {present}; exit 0;;\n\
+                 create) if [ -f {present} ]; then cat >/dev/null\n\
+                     echo 'Error from server (AlreadyExists): error when creating \"STDIN\": \
+                 pods \"helper\" already exists' >&2; exit 1; fi\n\
+                   ( {put} ); rc=$?\n\
+                   if [ $rc -eq 0 ]; then printf '{ready}' u-created > {present}; \
+                 printf u-created; fi\n\
+                   exit $rc;;\n\
+                 apply) ( {put} ); rc=$?\n\
+                   if [ $rc -eq 0 ]; then\n\
+                     uid=$(sed -n 's/.*\"uid\": *\"\\([^\"]*\\)\".*/\\1/p' {present} 2>/dev/null)\n\
+                     printf '{ready}' \"${{uid:-u-applied}}\" > {present}\n\
+                     printf '%s' \"${{uid:-u-applied}}\"\n\
+                   fi\n\
+                   exit $rc;;\n\
+                 esac",
+                log = log.display(),
+                present = present.display(),
+                // Inside the single quotes of `printf`, where `"` is literal;
+                // the one `%s` is the uid.
+                ready = ready_pod("%s"),
+            ),
+        );
+        (k, log)
+    }
+
+    fn calls(log: &Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|l| l.split(' ').next().unwrap().to_string())
+            .collect()
+    }
+
+    const HELPER: &str = r#"{"metadata": {"name": "helper", "namespace": "prod"}}"#;
+
+    /// A helper pod left behind `Completed` by an earlier run never becomes
+    /// Ready again, so applying over it used to cost the whole five-minute
+    /// wait and then the run. It is deleted, waited out, and created again.
+    #[test]
+    fn an_ended_leftover_helper_is_deleted_and_created_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (k, log) = stateful_stub(
+            &dir,
+            r#"{"metadata": {"name": "helper"}, "status": {"phase": "Succeeded"}}"#,
+            "cat >/dev/null; exit 0",
+        );
+        let spec: Value = serde_json::from_str(HELPER).unwrap();
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+
+        assert_eq!(calls(&log), vec!["get", "delete", "create", "get"]);
         let argv = std::fs::read_to_string(&log).unwrap();
-        assert!(argv.contains("apply -f - -n prod"), "{argv}");
-        // Readiness, not existence: a Pod that exists but is not Ready cannot
-        // be exec'd into, which is the only reason this helper is created.
         assert!(
-            argv.contains("wait --for=condition=Ready pod/helper -n prod --timeout=300s"),
+            argv.contains("get pod helper -n prod --ignore-not-found -o json"),
             "{argv}"
+        );
+        // A short grace (its `sleep` ignores SIGTERM) and a wait until it has
+        // gone, bounded — the new pod cannot be created while it is there.
+        assert!(
+            argv.contains(
+                "delete pod helper -n prod --ignore-not-found --grace-period=1 --wait=true \
+                 --timeout=60s"
+            ),
+            "{argv}"
+        );
+    }
+
+    /// A pod that is still running is used as it is: a same-spec apply over
+    /// it changes nothing, and deleting it would kill whatever runs in it.
+    #[test]
+    fn a_running_helper_of_the_same_spec_is_applied_over_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (k, log) = stateful_stub(
+            &dir,
+            r#"{"metadata": {"name": "helper"}, "status": {"phase": "Running"}}"#,
+            "cat >/dev/null; exit 0",
+        );
+        let spec: Value = serde_json::from_str(HELPER).unwrap();
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(calls(&log), vec!["get", "apply", "get"]);
+    }
+
+    /// The six-hour helper a command applies, and the same pod as `kubectl
+    /// get` shows it, running, its container started `ago` before now.
+    fn six_hour_helper(ago: Duration) -> (Value, String) {
+        let spec = json!({
+            "metadata": {"name": "helper", "namespace": "prod"},
+            "spec": {"containers": [{"name": "dump", "command": ["sleep", "21600"]}]}
+        });
+        let started = chrono::Utc::now() - chrono::Duration::from_std(ago).unwrap();
+        let mut pod = spec.clone();
+        pod["status"] = json!({"phase": "Running", "containerStatuses": [{"name": "dump",
+        "state": {"running": {
+            "startedAt": started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        }}}]});
+        (spec, pod.to_string())
+    }
+
+    /// A helper left running by a command interrupted before its cleanup —
+    /// Ctrl-C on `backup create` five hours ago — has one hour of its `sleep`
+    /// left, and a dump in it would die then. It is replaced.
+    #[test]
+    fn a_running_leftover_with_hours_of_its_keep_alive_used_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, pod) = six_hour_helper(Duration::from_secs(5 * 3600));
+        let (k, log) = stateful_stub(&dir, &pod, "cat >/dev/null; exit 0");
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(calls(&log), vec!["get", "delete", "create", "get"]);
+    }
+
+    /// One another command created moments ago is used as it is.
+    #[test]
+    fn a_running_helper_started_moments_ago_is_used_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, pod) = six_hour_helper(Duration::from_secs(10));
+        let (k, log) = stateful_stub(&dir, &pod, "cat >/dev/null; exit 0");
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(calls(&log), vec!["get", "apply", "get"]);
+    }
+
+    /// A leftover whose spec cannot be applied over — an older CLI's or
+    /// runner's — is refused by the apiserver on the FIRST line of kubectl's
+    /// stderr, above a diff of the pod spec that can run longer than the lines
+    /// an error keeps (sixty here). It is replaced all the same.
+    #[test]
+    fn a_leftover_whose_spec_cannot_change_in_place_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let refused = dir.path().join("refused-once");
+        let (k, log) = stateful_stub(
+            &dir,
+            r#"{"metadata": {"name": "helper"}, "status": {"phase": "Running"}}"#,
+            &format!(
+                "cat >/dev/null\n\
+                 if [ ! -f {refused} ]; then\n\
+                   touch {refused}\n\
+                   echo 'The Pod \"helper\" is invalid: spec: Forbidden: pod updates may not \
+                 change fields other than `spec.containers[*].image`' >&2\n\
+                   i=0; while [ $i -lt 60 ]; do echo \"  diff line $i\" >&2; i=$((i+1)); done\n\
+                   exit 1\n\
+                 fi\n\
+                 exit 0",
+                refused = refused.display()
+            ),
+        );
+        let spec: Value = serde_json::from_str(HELPER).unwrap();
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(calls(&log), vec!["get", "apply", "delete", "create", "get"]);
+    }
+
+    /// A backup helper pod spec, as the builders stamp it: the interrupt
+    /// tracks only pods carrying the helper label.
+    const LABELLED_HELPER: &str = r#"{"metadata": {"name": "helper", "namespace": "prod",
+        "labels": {"apprafter.io/backup-helper": "true"}}}"#;
+
+    /// WI-383: which pod each helper put left under its name is recorded for
+    /// the interrupt, from the apiserver's answer — created by this command
+    /// (deleted on Ctrl-C, by uid) or there before it (left for the run using
+    /// it).
+    #[test]
+    fn each_helper_put_records_whether_it_created_its_pod() {
+        use helper_interrupt::Origin;
+        let spec: Value = serde_json::from_str(LABELLED_HELPER).unwrap();
+
+        // No pod of that name: this command's create made the one there now.
+        let dir = tempfile::tempdir().unwrap();
+        let (k, _) = stateful_stub(&dir, "", "cat >/dev/null; exit 0");
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(
+            k.helpers.origin_of("prod", "helper"),
+            Some(Origin::Created("u-created".into()))
+        );
+
+        // A running pod of the same spec, used as it is: not this command's.
+        let dir = tempfile::tempdir().unwrap();
+        let (k, _) = stateful_stub(
+            &dir,
+            r#"{"metadata": {"name": "helper", "uid": "u-theirs"}, "status": {"phase": "Running"}}"#,
+            "cat >/dev/null; exit 0",
+        );
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(
+            k.helpers.origin_of("prod", "helper"),
+            Some(Origin::Reused("u-theirs".into()))
+        );
+
+        // An ended leftover is replaced: the pod there now is this create's.
+        let dir = tempfile::tempdir().unwrap();
+        let (k, _) = stateful_stub(
+            &dir,
+            r#"{"metadata": {"name": "helper", "uid": "u-old"}, "status": {"phase": "Succeeded"}}"#,
+            "cat >/dev/null; exit 0",
+        );
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(
+            k.helpers.origin_of("prod", "helper"),
+            Some(Origin::Created("u-created".into()))
+        );
+
+        // A pod that is not a backup helper is none of the interrupt's.
+        let dir = tempfile::tempdir().unwrap();
+        let (k, _) = stateful_stub(&dir, "", "cat >/dev/null; exit 0");
+        k.apply_and_wait_pod_ready(&serde_json::from_str(HELPER).unwrap())
+            .unwrap();
+        assert_eq!(k.helpers.origin_of("prod", "helper"), None);
+    }
+
+    /// The WI-383 review's case: no pod at the read, and another run — a
+    /// scheduled backup of the same claim — creates one before this
+    /// command's create lands. The create is refused (`AlreadyExists`), and
+    /// that pod is read and applied over like any other: recorded as there
+    /// before, so Ctrl-C leaves it and the other run's dump goes on. Before,
+    /// an apply "configured" it and the first read took it for this
+    /// command's.
+    #[test]
+    fn a_pod_another_run_created_after_the_read_is_not_taken_for_this_ones() {
+        use helper_interrupt::Origin;
+        let spec: Value = serde_json::from_str(LABELLED_HELPER).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv");
+        let theirs = dir.path().join("theirs.json");
+        std::fs::write(
+            &theirs,
+            r#"{"metadata": {"name": "helper", "uid": "u-theirs"}, "status": {"phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}]}}"#,
+        )
+        .unwrap();
+        // `get` finds nothing until the create; the other run's pod is there
+        // by the time the create reaches the apiserver.
+        let k = stub_kubectl(
+            &dir,
+            &format!(
+                "echo \"$@\" >> {log}\n\
+                 case \"$1\" in\n\
+                 get) [ -f {log}.raced ] && cat {theirs}; exit 0;;\n\
+                 create) cat >/dev/null; touch {log}.raced\n\
+                   echo 'Error from server (AlreadyExists): error when creating \"STDIN\": \
+                 pods \"helper\" already exists' >&2; exit 1;;\n\
+                 apply) cat >/dev/null; printf u-theirs; exit 0;;\n\
+                 esac",
+                log = log.display(),
+                theirs = theirs.display(),
+            ),
+        );
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(calls(&log), vec!["get", "create", "get", "apply", "get"]);
+        assert_eq!(
+            k.helpers.origin_of("prod", "helper"),
+            Some(Origin::Reused("u-theirs".into()))
+        );
+        assert_eq!(
+            helper_interrupt::cleanup_action(&Origin::Reused("u-theirs".into())),
+            helper_interrupt::CleanupAction::NotCreatedHere {
+                uid: "u-theirs".into()
+            }
+        );
+    }
+
+    /// A create refused as `AlreadyExists`, and an apply refused as an
+    /// immutable update, made nothing: when the step fails right after, the
+    /// interrupt has no record of that pod at all, rather than one it cannot
+    /// settle.
+    #[test]
+    fn a_refused_create_or_update_leaves_no_record() {
+        let spec: Value = serde_json::from_str(LABELLED_HELPER).unwrap();
+        // AlreadyExists, then the second read fails.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv");
+        let k = stub_kubectl(
+            &dir,
+            &format!(
+                "echo \"$@\" >> {log}\n\
+                 case \"$1\" in\n\
+                 get) [ -f {log}.raced ] && {{ echo 'Unable to connect' >&2; exit 1; }}; exit 0;;\n\
+                 create) cat >/dev/null; touch {log}.raced\n\
+                   echo 'Error from server (AlreadyExists): pods \"helper\" already exists' >&2\n\
+                   exit 1;;\n\
+                 esac",
+                log = log.display(),
+            ),
+        );
+        k.apply_and_wait_pod_ready(&spec).unwrap_err();
+        assert_eq!(calls(&log), vec!["get", "create", "get"]);
+        assert_eq!(k.helpers.origin_of("prod", "helper"), None);
+
+        // Refused as an immutable update, then the old pod will not go.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv");
+        let k = stub_kubectl(
+            &dir,
+            &format!(
+                "echo \"$@\" >> {log}\n\
+                 case \"$1\" in\n\
+                 get) echo '{{\"metadata\": {{\"name\": \"helper\", \"uid\": \"u-old\"}}, \
+                 \"status\": {{\"phase\": \"Running\"}}}}'; exit 0;;\n\
+                 apply) cat >/dev/null; echo 'The Pod \"helper\" is invalid: spec: Forbidden: pod \
+                 updates may not change fields other than `spec.containers[*].image`' >&2; exit 1;;\n\
+                 delete) echo 'timed out waiting for the condition' >&2; exit 1;;\n\
+                 esac",
+                log = log.display(),
+            ),
+        );
+        k.apply_and_wait_pod_ready(&spec).unwrap_err();
+        assert_eq!(calls(&log), vec!["get", "apply", "delete"]);
+        assert_eq!(k.helpers.origin_of("prod", "helper"), None);
+    }
+
+    /// Only an answer settles a pod. An apply answered with a pod other than
+    /// the one read just before it (that one was replaced in between), and a
+    /// create whose kubectl died unanswered — the same Ctrl-C reaches it —
+    /// stay unconfirmed, and the interrupt leaves both.
+    #[test]
+    fn a_put_without_a_telling_answer_stays_unconfirmed() {
+        use helper_interrupt::Origin;
+        let spec: Value = serde_json::from_str(LABELLED_HELPER).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let (k, _) = stateful_stub(
+            &dir,
+            r#"{"metadata": {"name": "helper", "uid": "u-theirs"}, "status": {"phase": "Running"}}"#,
+            // The apply lands on a pod created since the read.
+            &format!(
+                "cat >/dev/null; printf '{}' > {}",
+                r#"{"metadata": {"name": "helper", "uid": "u-other"}, "status": {"phase": "Running"}}"#,
+                dir.path().join("present.json").display()
+            ),
+        );
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(
+            k.helpers.origin_of("prod", "helper"),
+            Some(Origin::Unconfirmed)
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let (k, _) = stateful_stub(&dir, "", "cat >/dev/null; kill -9 $$");
+        k.apply_and_wait_pod_ready(&spec).unwrap_err();
+        assert_eq!(
+            k.helpers.origin_of("prod", "helper"),
+            Some(Origin::Unconfirmed)
+        );
+
+        // A create answered with no uid names no pod.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv");
+        let k = stub_kubectl(
+            &dir,
+            &format!(
+                "echo \"$@\" >> {log}\n\
+                 case \"$1\" in\n\
+                 get) [ -f {log}.made ] && printf '%s' '{ready}'; exit 0;;\n\
+                 create) cat >/dev/null; touch {log}.made; exit 0;;\n\
+                 esac",
+                log = log.display(),
+                ready = ready_pod("u-1"),
+            ),
+        );
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        assert_eq!(
+            k.helpers.origin_of("prod", "helper"),
+            Some(Origin::Unconfirmed)
+        );
+    }
+
+    /// Forgotten once the command's own delete went through — and kept when
+    /// it did not (its kubectl may have died of the same Ctrl-C), for the
+    /// interrupt to delete.
+    #[test]
+    fn a_helper_is_forgotten_only_once_its_delete_went_through() {
+        use helper_interrupt::Origin;
+        let spec: Value = serde_json::from_str(LABELLED_HELPER).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (k, _) = stateful_stub(&dir, "", "cat >/dev/null; exit 0");
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        k.delete_pod_best_effort("helper", "prod");
+        assert_eq!(k.helpers.origin_of("prod", "helper"), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv");
+        let k = stub_kubectl(
+            &dir,
+            &format!(
+                "echo \"$@\" >> {log}\n\
+                 case \"$1\" in\n\
+                 get) [ -f {log}.applied ] && printf '%s' '{ready}'; exit 0;;\n\
+                 create) cat >/dev/null; touch {log}.applied; printf u-1; exit 0;;\n\
+                 delete) exit 1;;\n\
+                 esac",
+                log = log.display(),
+                ready = ready_pod("u-1"),
+            ),
+        );
+        k.apply_and_wait_pod_ready(&spec).unwrap();
+        k.delete_pod_best_effort("helper", "prod");
+        assert_eq!(
+            k.helpers.origin_of("prod", "helper"),
+            Some(Origin::Created("u-1".into()))
+        );
+    }
+
+    /// Once interrupted, the command's own thread makes no kubectl call at
+    /// all: no apply that would outlive it, no exec, and no delete by name —
+    /// the interrupt's deletes, by uid, are the only ones.
+    #[test]
+    fn once_interrupted_no_kubectl_is_run_from_the_command() {
+        let spec: Value = serde_json::from_str(LABELLED_HELPER).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (k, log) = stateful_stub(&dir, "", "cat >/dev/null; exit 0");
+        k.helpers.close();
+        let refused = k.apply_and_wait_pod_ready(&spec).unwrap_err().to_string();
+        assert!(refused.starts_with("interrupted"), "{refused}");
+        let out = dir.path().join("out");
+        assert!(k
+            .exec_stream_to_file("helper", "prod", &["pg_dump"], &out, None)
+            .is_err());
+        assert!(k
+            .exec_stream_from_file("helper", "prod", &["pg_restore"], &out,)
+            .is_err());
+        assert!(k.get_secret_key("db-conn", "prod", "user").is_err());
+        assert!(k.get_json(&["get", "pods", "-n", "prod"]).is_err());
+        k.delete_pod_best_effort("helper", "prod");
+        assert!(!log.exists(), "{}", std::fs::read_to_string(&log).unwrap());
+    }
+
+    /// Nor does the command start restic, or read the cluster's identity,
+    /// once it has had its signal.
+    #[test]
+    fn once_interrupted_no_restic_and_no_identity_read_is_started() {
+        struct Counting(std::cell::Cell<usize>);
+        impl ResticRunner for Counting {
+            fn run(&self, _: &[String], _: &str) -> Result<()> {
+                self.0.set(self.0.get() + 1);
+                Ok(())
+            }
+            fn run_stdout(&self, _: &[String], _: &str) -> Result<String> {
+                self.0.set(self.0.get() + 1);
+                Ok(String::new())
+            }
+            fn run_backup(&self, _: &[String], _: &str) -> Result<Option<String>> {
+                self.0.set(self.0.get() + 1);
+                Ok(None)
+            }
+            fn run_capture(&self, _: &[String], _: &str) -> Result<backup_core::ResticOutput> {
+                self.0.set(self.0.get() + 1);
+                Ok(backup_core::ResticOutput::default())
+            }
+        }
+        let r = RefusingAfterInterrupt(Counting(std::cell::Cell::new(0)));
+        let argv = vec!["backup".to_string()];
+        r.run(&argv, "pw").unwrap();
+        r.run_stdout(&argv, "pw").unwrap();
+        r.run_backup(&argv, "pw").unwrap();
+        assert_eq!(r.0 .0.get(), 3, "before the signal every call goes through");
+
+        let kc = helper_interrupt::test_seam::unreachable_kubeconfig();
+        let _interrupted = helper_interrupt::test_seam::interrupt_this_thread();
+        for e in [
+            r.run(&argv, "pw").unwrap_err(),
+            r.run_stdout(&argv, "pw").unwrap_err(),
+            r.run_backup(&argv, "pw").unwrap_err(),
+            read_cluster_uid(kc.path()).unwrap_err(),
+        ] {
+            assert!(e.to_string().starts_with("interrupted"), "{e}");
+        }
+        assert_eq!(r.0 .0.get(), 3, "no restic after the signal");
+    }
+
+    /// WI-383, the CLI's side: a helper whose credential Secret is missing
+    /// cannot start its container, and the wait says so with the kubelet's
+    /// words once that has held for the grace — not after five minutes.
+    #[test]
+    fn a_helper_whose_credential_secret_is_missing_fails_the_wait_with_the_kubelets_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = json!({
+            "metadata": {"name": "helper", "uid": "u-1"},
+            "status": {"phase": "Pending", "containerStatuses": [{"name": "dump",
+                "state": {"waiting": {"reason": "CreateContainerConfigError",
+                    "message": "couldn't find key pass in Secret prod/db-conn"}}}]}
+        });
+        // From a file: the kubelet's message has an apostrophe in it.
+        let pod = dir.path().join("pod.json");
+        std::fs::write(&pod, blocked.to_string()).unwrap();
+        let k = stub_kubectl(
+            &dir,
+            &format!("[ \"$1\" = get ] && cat {}\nexit 0", pod.display()),
+        );
+        let started = std::time::Instant::now();
+        let msg = k
+            .wait_pod_ready(
+                "helper",
+                "prod",
+                Duration::from_secs(20),
+                Duration::from_millis(50),
+                Duration::from_millis(300),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            msg.starts_with(
+                "helper pod prod/helper cannot start its container: couldn't find key pass in \
+                 Secret prod/db-conn (CreateContainerConfigError)"
+            ),
+            "{msg}"
+        );
+    }
+
+    /// Every other apply failure is the run's own, and nothing is deleted.
+    #[test]
+    fn another_apply_failure_deletes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (k, log) = stateful_stub(
+            &dir,
+            r#"{"metadata": {"name": "helper"}, "status": {"phase": "Running"}}"#,
+            "cat >/dev/null; echo 'The Pod \"helper\" is invalid: metadata.name' >&2; exit 1",
+        );
+        let spec: Value = serde_json::from_str(HELPER).unwrap();
+        let msg = k.apply_and_wait_pod_ready(&spec).unwrap_err().to_string();
+        assert!(msg.contains("metadata.name"), "{msg}");
+        assert_eq!(calls(&log), vec!["get", "apply"]);
+    }
+
+    /// A stale pod that will not go — its node unreachable — stops the step
+    /// with the way out, rather than applying over it.
+    #[test]
+    fn a_stale_helper_that_will_not_go_fails_with_the_way_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv");
+        let k = stub_kubectl(
+            &dir,
+            &format!(
+                "echo \"$@\" >> {log}\n\
+                 case \"$1\" in\n\
+                 get) echo '{{\"metadata\": {{\"name\": \"helper\", \"deletionTimestamp\": \
+                 \"2026-09-23T00:00:00Z\"}}}}'; exit 0;;\n\
+                 delete) echo 'error: timed out waiting for the condition' >&2; exit 1;;\n\
+                 *) cat >/dev/null; exit 0;;\n\
+                 esac",
+                log = log.display()
+            ),
+        );
+        let spec: Value = serde_json::from_str(HELPER).unwrap();
+        let msg = k.apply_and_wait_pod_ready(&spec).unwrap_err().to_string();
+        assert!(
+            msg.contains("was not gone 60s after it was deleted"),
+            "{msg}"
+        );
+        assert!(msg.contains("--force --grace-period=0"), "{msg}");
+        assert!(msg.contains("timed out waiting for the condition"), "{msg}");
+        assert_eq!(calls(&log), vec!["get", "delete"]);
+    }
+
+    /// Real-apiserver proof of the same replacement through `kubectl`: the
+    /// ended pod as `kubectl get` shows it, and the apiserver's refusal to
+    /// change a pod's spec in place as `kubectl apply` prints it — first line
+    /// of a long stderr. Skipped by default; opt in against a DISPOSABLE kind
+    /// cluster:
+    ///
+    /// ```text
+    /// APPRAFTER_K8S_SMOKE=1 KUBECONFIG=<kind kubeconfig> cargo test -p apprafter \
+    ///     --lib a_leftover_helper_pod_is_replaced_through_kubectl_on_kind -- --ignored
+    /// ```
+    ///
+    /// Refuses any context that is not `kind-*`. The helper image,
+    /// `docker.io/library/alpine:3.24`, is pulled `IfNotPresent`.
+    #[test]
+    #[ignore = "needs a kind cluster: APPRAFTER_K8S_SMOKE=1 KUBECONFIG=<kind kubeconfig>"]
+    fn a_leftover_helper_pod_is_replaced_through_kubectl_on_kind() {
+        const NS: &str = "apprafter-stale-helper-kubectl";
+        const POD: &str = "bk-vol-stale";
+        // Explicitly opted in, so a missing precondition is a FAILURE.
+        assert_eq!(
+            std::env::var("APPRAFTER_K8S_SMOKE").as_deref(),
+            Ok("1"),
+            "run with APPRAFTER_K8S_SMOKE=1 (this test creates objects in the cluster)"
+        );
+        let kubeconfig = PathBuf::from(
+            std::env::var_os("KUBECONFIG").expect("KUBECONFIG must name the kind kubeconfig"),
+        );
+        let kubectl = |args: &[&str]| {
+            let out = Command::new("kubectl")
+                .args(args)
+                .env("KUBECONFIG", &kubeconfig)
+                .output()
+                .expect("run kubectl");
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            )
+        };
+        let (_, ctx) = kubectl(&["config", "current-context"]);
+        assert!(
+            ctx.starts_with("kind-"),
+            "refusing to run against context {ctx:?}: this test only targets kind clusters"
+        );
+        struct DeleteNs<'a>(&'a Path);
+        impl Drop for DeleteNs<'_> {
+            fn drop(&mut self) {
+                let _ = Command::new("kubectl")
+                    .args(["delete", "namespace", NS, "--wait=false"])
+                    .env("KUBECONFIG", self.0)
+                    .output();
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        while kubectl(&["get", "namespace", NS, "-o", "jsonpath={.status.phase}"]).1
+            == "Terminating"
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{NS} stuck Terminating"
+            );
+            thread::sleep(Duration::from_secs(1));
+        }
+        let _ = kubectl(&["create", "namespace", NS]);
+        let _cleanup = DeleteNs(&kubeconfig);
+
+        let k = KubectlExec::new(kubeconfig.clone());
+        let helper = |secs: u64| {
+            json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": POD, "namespace": NS,
+                             "labels": {"apprafter.io/backup-helper": "true"}},
+                "spec": {"restartPolicy": "Never", "containers": [{
+                    "name": "dump", "image": "docker.io/library/alpine:3.24",
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": ["sleep", secs.to_string()]}]}
+            })
+        };
+        let field = |path: &str| kubectl(&["get", "pod", POD, "-n", NS, "-o", path]).1;
+
+        // An ENDED leftover of the same spec.
+        k.apply_and_wait_pod_ready(&helper(3))
+            .expect("first helper Ready");
+        let ended = field("jsonpath={.metadata.uid}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while field("jsonpath={.status.phase}") != "Succeeded" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the 3 s helper never ended"
+            );
+            thread::sleep(Duration::from_secs(1));
+        }
+        let started = std::time::Instant::now();
+        k.apply_and_wait_pod_ready(&helper(3))
+            .expect("an ended leftover is replaced");
+        let took = started.elapsed();
+        assert_ne!(field("jsonpath={.metadata.uid}"), ended);
+        assert!(took < Duration::from_secs(90), "took {took:?}");
+        eprintln!("kubectl: ended leftover replaced in {took:?}");
+
+        // A RUNNING leftover with another keep-alive, two ways: an older
+        // runner's `sleep 3600` has less than this command's whole keep-alive
+        // and is replaced on what `kubectl get` shows, before any apply; one
+        // with a LONGER keep-alive (a deadline since lowered) passes that
+        // check, and the apiserver refuses to change its spec in place.
+        for (old_secs, how) in [
+            (3600, "by its keep-alive"),
+            (43200, "by the apply's refusal"),
+        ] {
+            let _ = kubectl(&[
+                "delete",
+                "pod",
+                POD,
+                "-n",
+                NS,
+                "--grace-period=1",
+                "--wait=true",
+            ]);
+            k.apply_and_wait_pod_ready(&helper(old_secs))
+                .expect("the old helper Ready");
+            let old = field("jsonpath={.metadata.uid}");
+            let started = std::time::Instant::now();
+            k.apply_and_wait_pod_ready(&helper(21600))
+                .expect("a leftover with another keep-alive is replaced");
+            let took = started.elapsed();
+            assert_ne!(field("jsonpath={.metadata.uid}"), old, "{old_secs}");
+            assert_eq!(
+                field("jsonpath={.spec.containers[0].command}"),
+                r#"["sleep","21600"]"#
+            );
+            assert!(took < Duration::from_secs(90), "took {took:?}");
+            eprintln!("kubectl: running `sleep {old_secs}` leftover replaced {how} in {took:?}");
+        }
+    }
+
+    /// Real-apiserver proof, through `kubectl`, that a running helper of the
+    /// SAME spec is used as it is while it is new and replaced once it has
+    /// used more than `RUNNING_HELPER_REUSE_MARGIN` of its keep-alive — the
+    /// helper an interrupted `backup create` leaves behind. It waits out the
+    /// margin, about six minutes. Skipped by default; opt in against a
+    /// DISPOSABLE kind cluster:
+    ///
+    /// ```text
+    /// APPRAFTER_K8S_SMOKE=1 KUBECONFIG=<kind kubeconfig> cargo test -p apprafter \
+    ///     --lib a_running_helper_is_reused_while_new_and_replaced_once_aged_through_kubectl \
+    ///     -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "needs a kind cluster: APPRAFTER_K8S_SMOKE=1 KUBECONFIG=<kind kubeconfig>"]
+    fn a_running_helper_is_reused_while_new_and_replaced_once_aged_through_kubectl_on_kind() {
+        const NS: &str = "apprafter-stale-helper-reuse-kubectl";
+        const POD: &str = "bk-vol-aged";
+        assert_eq!(
+            std::env::var("APPRAFTER_K8S_SMOKE").as_deref(),
+            Ok("1"),
+            "run with APPRAFTER_K8S_SMOKE=1 (this test creates objects in the cluster)"
+        );
+        let kubeconfig = PathBuf::from(
+            std::env::var_os("KUBECONFIG").expect("KUBECONFIG must name the kind kubeconfig"),
+        );
+        let kubectl = |args: &[&str]| {
+            let out = Command::new("kubectl")
+                .args(args)
+                .env("KUBECONFIG", &kubeconfig)
+                .output()
+                .expect("run kubectl");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let ctx = kubectl(&["config", "current-context"]);
+        assert!(
+            ctx.starts_with("kind-"),
+            "refusing to run against context {ctx:?}: this test only targets kind clusters"
+        );
+        struct DeleteNs<'a>(&'a Path);
+        impl Drop for DeleteNs<'_> {
+            fn drop(&mut self) {
+                let _ = Command::new("kubectl")
+                    .args(["delete", "namespace", NS, "--wait=false"])
+                    .env("KUBECONFIG", self.0)
+                    .output();
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        while kubectl(&["get", "namespace", NS, "-o", "jsonpath={.status.phase}"]) == "Terminating"
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{NS} stuck Terminating"
+            );
+            thread::sleep(Duration::from_secs(1));
+        }
+        let _ = kubectl(&["create", "namespace", NS]);
+        let _cleanup = DeleteNs(&kubeconfig);
+
+        let k = KubectlExec::new(kubeconfig.clone());
+        let spec = json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": POD, "namespace": NS,
+                         "labels": {"apprafter.io/backup-helper": "true"}},
+            "spec": {"restartPolicy": "Never", "containers": [{
+                "name": "dump", "image": "docker.io/library/alpine:3.24",
+                "imagePullPolicy": "IfNotPresent",
+                "command": ["sleep", "21600"]}]}
+        });
+        let uid = || {
+            kubectl(&[
+                "get",
+                "pod",
+                POD,
+                "-n",
+                NS,
+                "-o",
+                "jsonpath={.metadata.uid}",
+            ])
+        };
+
+        k.apply_and_wait_pod_ready(&spec).expect("helper Ready");
+        let first = uid();
+        k.apply_and_wait_pod_ready(&spec)
+            .expect("a new helper is applied over");
+        assert_eq!(uid(), first, "a helper created a moment ago is reused");
+
+        let margin = backup_core::helper_pod::RUNNING_HELPER_REUSE_MARGIN;
+        thread::sleep(margin + Duration::from_secs(10));
+        let started = std::time::Instant::now();
+        k.apply_and_wait_pod_ready(&spec)
+            .expect("an aged helper is replaced");
+        let took = started.elapsed();
+        assert_ne!(uid(), first, "a new pod, not the aged one");
+        assert!(took < Duration::from_secs(90), "took {took:?}");
+        eprintln!("kubectl: running helper aged past {margin:?} replaced in {took:?}");
+    }
+
+    /// Real-cluster proof, through `kubectl exec -i` as a restore runs it,
+    /// that a load killed by its helper pod's keep-alive is explained: the
+    /// words kubectl uses for the killed exec, and the kubelet's report of the
+    /// container's end. Skipped by default; opt in against a DISPOSABLE kind
+    /// cluster:
+    ///
+    /// ```text
+    /// APPRAFTER_K8S_SMOKE=1 KUBECONFIG=<kind kubeconfig> cargo test -p apprafter \
+    ///     --lib a_load_killed_by_its_keep_alive_is_explained_through_kubectl_on_kind \
+    ///     -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "needs a kind cluster: APPRAFTER_K8S_SMOKE=1 KUBECONFIG=<kind kubeconfig>"]
+    fn a_load_killed_by_its_keep_alive_is_explained_through_kubectl_on_kind() {
+        const NS: &str = "apprafter-keep-alive-kubectl";
+        const POD: &str = "ld-pg-keepalive";
+        assert_eq!(
+            std::env::var("APPRAFTER_K8S_SMOKE").as_deref(),
+            Ok("1"),
+            "run with APPRAFTER_K8S_SMOKE=1 (this test creates objects in the cluster)"
+        );
+        let kubeconfig = PathBuf::from(
+            std::env::var_os("KUBECONFIG").expect("KUBECONFIG must name the kind kubeconfig"),
+        );
+        let kubectl = |args: &[&str]| {
+            let out = Command::new("kubectl")
+                .args(args)
+                .env("KUBECONFIG", &kubeconfig)
+                .output()
+                .expect("run kubectl");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let ctx = kubectl(&["config", "current-context"]);
+        assert!(
+            ctx.starts_with("kind-"),
+            "refusing to run against context {ctx:?}: this test only targets kind clusters"
+        );
+        struct DeleteNs<'a>(&'a Path);
+        impl Drop for DeleteNs<'_> {
+            fn drop(&mut self) {
+                let _ = Command::new("kubectl")
+                    .args(["delete", "namespace", NS, "--wait=false"])
+                    .env("KUBECONFIG", self.0)
+                    .output();
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        while kubectl(&["get", "namespace", NS, "-o", "jsonpath={.status.phase}"]) == "Terminating"
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{NS} stuck Terminating"
+            );
+            thread::sleep(Duration::from_secs(1));
+        }
+        let _ = kubectl(&["create", "namespace", NS]);
+        let _cleanup = DeleteNs(&kubeconfig);
+
+        let k = KubectlExec::new(kubeconfig.clone());
+        k.apply_and_wait_pod_ready(&json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": POD, "namespace": NS,
+                         "labels": {"apprafter.io/backup-helper": "true"}},
+            "spec": {"restartPolicy": "Never", "containers": [{
+                "name": "dump", "image": "docker.io/library/alpine:3.24",
+                "imagePullPolicy": "IfNotPresent",
+                "command": backup_core::helper_pod::keep_alive_command(Duration::from_secs(8))}]}
+        }))
+        .expect("helper Ready");
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("dump");
+        std::fs::write(&input, b"payload").unwrap();
+        let started = std::time::Instant::now();
+        // Reads its stdin, then outlives the pod's keep-alive.
+        let err = k
+            .exec_stream_from_file(POD, NS, &["sh", "-c", "cat >/dev/null; sleep 60"], &input)
+            .expect_err("the keep-alive ends the load");
+        eprintln!("raw exec error after {:?}: {err}", started.elapsed());
+        assert!(backup_core::helper_pod::is_exit_137(&err), "{err}");
+        let explained =
+            backup_core::helper_pod::explain_keep_alive_end(&k, POD, NS, err).to_string();
+        eprintln!("explained: {explained}");
+        assert!(
+            explained.contains("keep-alive of 8s ran out"),
+            "{explained}"
         );
     }
 
@@ -9819,24 +13560,44 @@ mod tests {
         // instead of the readiness message. That is what turned this test red
         // on a loaded CI runner (2026-09-10) after passing since it landed —
         // 500 local runs, including pinned to one CPU, never reproduced it.
+        //
+        // The wait itself is driven with a one-second timeout: the command's
+        // own is `POD_READY_TIMEOUT`, five minutes.
         let waits = stub_kubectl(
             &dir,
-            "if [ \"$1\" = wait ]; then exit 1; fi\ncat >/dev/null\nexit 0",
+            "if [ \"$1\" = get ]; then \
+             printf '%s' '{\"metadata\": {\"name\": \"helper\"}, \"status\": {\"phase\": \"Pending\"}}'; \
+             fi\ncat >/dev/null\nexit 0",
         );
-        let err = waits.apply_and_wait_pod_ready(&spec).unwrap_err();
+        let err = waits
+            .wait_pod_ready(
+                "helper",
+                "prod",
+                Duration::from_secs(1),
+                Duration::from_millis(50),
+                backup_core::helper_pod::CONTAINER_CONFIG_ERROR_GRACE,
+            )
+            .unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("did not reach Ready within 300s"), "{msg}");
+        assert!(msg.contains("did not reach Ready within 1s"), "{msg}");
         assert!(msg.contains("helper") && msg.contains("prod"), "{msg}");
+        assert_eq!(
+            backup_core::helper_pod::POD_READY_TIMEOUT,
+            Duration::from_secs(300),
+            "the documented five minutes (docs: How a run may take)"
+        );
 
-        // apply itself fails → the apiserver's own complaint is carried.
+        // the create itself fails → the apiserver's own complaint is carried.
+        // (The look for a leftover pod before it finds none.)
         let dir2 = tempfile::tempdir().unwrap();
         let applies = stub_kubectl(
             &dir2,
-            "cat >/dev/null\necho 'error: forbidden: pods is forbidden' >&2\nexit 1",
+            "if [ \"$1\" = create ]; then\n  cat >/dev/null\n  \
+             echo 'error: forbidden: pods is forbidden' >&2\n  exit 1\nfi\nexit 0",
         );
         let err = applies.apply_and_wait_pod_ready(&spec).unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("apply_and_wait_pod_ready(apply)"), "{msg}");
+        assert!(msg.contains("apply_and_wait_pod_ready(create)"), "{msg}");
         assert!(msg.contains("pods is forbidden"), "{msg}");
     }
 
@@ -9864,7 +13625,7 @@ mod tests {
         });
         let dies = stub_kubectl(
             &dir,
-            "if [ \"$1\" = apply ]; then echo 'error: Unauthorized' >&2; exit 1; fi\nexit 0",
+            "if [ \"$1\" = create ]; then echo 'error: Unauthorized' >&2; exit 1; fi\nexit 0",
         );
         let msg = format!("{}", dies.apply_and_wait_pod_ready(&spec).unwrap_err());
         assert!(msg.contains("Unauthorized"), "{msg}");
@@ -9883,7 +13644,7 @@ mod tests {
         let dir2 = tempfile::tempdir().unwrap();
         let quiet = stub_kubectl(&dir2, "exit 0");
         let msg = format!("{}", quiet.apply_and_wait_pod_ready(&spec).unwrap_err());
-        assert!(msg.contains("write pod spec to kubectl apply"), "{msg}");
+        assert!(msg.contains("write pod spec to kubectl create"), "{msg}");
         assert!(msg.contains("Broken pipe"), "{msg}");
     }
 
@@ -10013,17 +13774,22 @@ mod tests {
     #[test]
     fn status_check_job_is_separated_from_backup_job() {
         let backup_job = json!({
-            "metadata": {"name": "apprafter-backup-28900000"},
+            "metadata": {"name": "apprafter-backup-28900000", "ownerReferences": owned_by(BACKUP_CRONJOB_NAME)},
             "status": {"succeeded": 1}
         });
+        // A finished Job carries its condition. Counts alone (`failed: 1`,
+        // nothing active) are a Job between an attempt and its retry.
         let check_job = json!({
-            "metadata": {"name": "apprafter-backup-check-28900000"},
-            "status": {"failed": 1}
+            "metadata": {"name": "apprafter-backup-check-28900000", "ownerReferences": owned_by(CHECK_CRONJOB_NAME)},
+            "status": {"failed": 7, "conditions": [
+                {"type": "Failed", "status": "True", "reason": "BackoffLimitExceeded"}
+            ]}
         });
         let spec = json!({"enabled": true, "bucket": "s3:x"});
         let s = format_backup_status(
             Some(&spec),
             &[backup_job, check_job],
+            &[],
             None,
             None,
             &tokyo(),
@@ -10034,5 +13800,927 @@ mod tests {
         // backup is Succeeded, check is Failed
         assert!(s.contains("Succeeded"));
         assert!(s.contains("Failed"));
+    }
+
+    // ------------------------------------------------------------------
+    // A backup Job whose pod no node has room for (WI-386)
+    // ------------------------------------------------------------------
+
+    /// The scheduler's message, verbatim from the live run that found this.
+    const NO_ROOM: &str = "0/1 nodes are available: 1 Insufficient memory. no new claims to \
+                           deallocate, preemption: 0/1 nodes are available: 1 No preemption \
+                           victims found for incoming pod.";
+
+    fn unfinished_job(name: &str, uid: &str, owner_kind: Option<&str>) -> Value {
+        let mut j = json!({
+            "metadata": {"name": name, "uid": uid},
+            "spec": {"template": {"spec": {"containers": [{"name": "runner", "resources": {
+                "requests": {"cpu": "100m", "memory": "256Mi"}, "limits": {"memory": "512Mi"}
+            }}]}}},
+            "status": {"active": 1, "startTime": "2026-09-23T14:39:47Z"}
+        });
+        let cronjob = if name.starts_with(CHECK_CRONJOB_NAME) {
+            CHECK_CRONJOB_NAME
+        } else {
+            BACKUP_CRONJOB_NAME
+        };
+        match owner_kind {
+            Some(kind) => {
+                j["metadata"]["ownerReferences"] =
+                    json!([{"kind": kind, "name": cronjob, "uid": "cj-uid"}]);
+            }
+            // `backup run`'s own Job: no owner, and its mark.
+            None => j["metadata"]["labels"] = json!({"apprafter.io/manual": "true"}),
+        }
+        j
+    }
+
+    fn pending_pod(job_uid: &str, pod_uid: &str) -> Value {
+        json!({
+            "metadata": {"name": format!("{pod_uid}-pod"), "uid": pod_uid,
+                         "creationTimestamp": "2026-09-23T14:39:47Z",
+                         "ownerReferences": [{"kind": "Job", "uid": job_uid, "name": "x"}]},
+            "spec": {},
+            "status": {"phase": "Pending", "conditions": [{
+                "type": "PodScheduled", "status": "False", "reason": "Unschedulable",
+                "message": NO_ROOM
+            }]}
+        })
+    }
+
+    #[test]
+    fn backup_status_says_a_runner_nobody_can_place_is_pending_not_running() {
+        // Live output on the 4 GB node:
+        //   Last backup Job: apprafter-backup-manual-20260923-144838 — Running (…)
+        // while its pod had been Pending for 22 minutes with FailedScheduling.
+        let spec = json!({"enabled": true, "bucket": "s3:x", "schedule": "0 3 * * *"});
+        let scheduled = unfinished_job("apprafter-backup-29312345", "job-1", Some("CronJob"));
+        let check = unfinished_job("apprafter-backup-check-29312346", "job-2", Some("CronJob"));
+        let pods = [pending_pod("job-1", "pod-1"), pending_pod("job-2", "pod-2")];
+        let s = format_backup_status(
+            Some(&spec),
+            &[scheduled, check],
+            &pods,
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
+        assert!(
+            s.contains(&format!(
+                "Last backup Job: apprafter-backup-29312345 — Pending, cannot be scheduled: \
+                 {NO_ROOM} (2026-09-23 23:39:47 Asia/Tokyo)"
+            )),
+            "{s}"
+        );
+        assert!(
+            s.contains("Last check Job:  apprafter-backup-check-29312346 — Pending, cannot be"),
+            "the check Job asks for the same room and is read the same way: {s}"
+        );
+        assert!(!s.contains("Running"), "{s}");
+        assert!(s.contains("`apprafter top`"), "{s}");
+        assert!(s.contains(job_pod::RUNNER_UNSCHEDULABLE_DOC), "{s}");
+        assert!(
+            s.contains("the schedule starts no other backup"),
+            "a scheduled Job holds the schedule while it waits: {s}"
+        );
+        // The hint sits under its own Job line, before the next section.
+        let backup_at = s.find("Last backup Job:").unwrap();
+        let hint_at = s.find("`apprafter top`").unwrap();
+        let check_at = s.find("Last check Job:").unwrap();
+        assert!(backup_at < hint_at && hint_at < check_at, "{s}");
+    }
+
+    #[test]
+    fn backup_status_without_the_pods_keeps_the_jobs_own_view() {
+        // No pod listing (or none matched): the Job's counts are what is
+        // left, as before. Nothing is invented.
+        let spec = json!({"enabled": true, "bucket": "s3:x"});
+        let job = unfinished_job("apprafter-backup-manual-x", "job-1", None);
+        let s = format_backup_status(
+            Some(&spec),
+            std::slice::from_ref(&job),
+            &[],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
+        assert!(s.contains("apprafter-backup-manual-x — Running"), "{s}");
+        assert!(!s.contains("`apprafter top`"), "{s}");
+    }
+
+    #[test]
+    fn backup_status_says_a_job_between_attempts_is_retrying_not_failed() {
+        // After an attempt fails the Job controller waits (10 s, doubling up
+        // to 6 min) before it starts the next. In that gap the Job has no
+        // live pod, `active: 0` and `failed: 1`, and the counts alone read
+        // `Failed`. It has not failed, and it still holds the schedule.
+        let spec = json!({"enabled": true, "bucket": "s3:x"});
+        let mut job = unfinished_job("apprafter-backup-29312345", "job-1", Some("CronJob"));
+        job["spec"]["backoffLimit"] = json!(6);
+        job["status"] = json!({"failed": 1, "startTime": "2026-09-23T14:39:47Z"});
+        let mut failed = pending_pod("job-1", "pod-1");
+        failed["spec"]["nodeName"] = json!("node-1");
+        failed["status"] = json!({"phase": "Failed", "reason": "Evicted"});
+        let s = format_backup_status(
+            Some(&spec),
+            std::slice::from_ref(&job),
+            &[failed],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
+        assert!(
+            s.contains(
+                "apprafter-backup-29312345 — Retrying after 1 failed attempt (7 attempts at most)"
+            ),
+            "{s}"
+        );
+        assert!(!s.contains("— Failed"), "{s}");
+    }
+
+    #[test]
+    fn a_finished_job_is_not_re_read_from_a_pod_left_behind() {
+        // The Job's condition is the verdict; a leftover pod cannot turn a
+        // failed Job into "Pending".
+        let spec = json!({"enabled": true, "bucket": "s3:x"});
+        let mut job = unfinished_job("apprafter-backup-1", "job-1", Some("CronJob"));
+        job["status"] = json!({"failed": 1, "startTime": "2026-09-23T14:39:47Z", "conditions": [
+            {"type": "Failed", "status": "True", "reason": "DeadlineExceeded",
+             "message": "Job was active longer than specified deadline"}
+        ]});
+        let s = format_backup_status(
+            Some(&spec),
+            std::slice::from_ref(&job),
+            &[pending_pod("job-1", "pod-1")],
+            None,
+            None,
+            &tokyo(),
+            Some("Asia/Tokyo"),
+        );
+        assert!(s.contains("— Failed: DeadlineExceeded"), "{s}");
+        assert!(!s.contains("Pending"), "{s}");
+        assert!(!s.contains("`apprafter top`"), "{s}");
+    }
+
+    #[test]
+    fn the_wait_gives_up_on_a_pod_unschedulable_for_the_whole_grace() {
+        let job = unfinished_job("apprafter-backup-manual-x", "job-1", None);
+        let pods = [pending_pod("job-1", "pod-1")];
+        let t0 = std::time::Instant::now();
+        let hour = Duration::from_secs(3600);
+        let mut clock = UnschedulableClock::default();
+        let step = |clock: &mut UnschedulableClock, at: u64| {
+            wait_step(
+                Some(&job),
+                &pods,
+                &[],
+                clock,
+                t0 + Duration::from_secs(at),
+                Duration::from_secs(at),
+                hour,
+            )
+        };
+        assert!(
+            matches!(step(&mut clock, 5), WaitStep::Wait(JobPod::Unschedulable { .. }, Some(d)) if d.is_zero()),
+            "the first sighting starts the streak"
+        );
+        let just_under = 5 + UNSCHEDULABLE_GRACE.as_secs() - 1;
+        assert!(matches!(
+            step(&mut clock, just_under),
+            WaitStep::Wait(JobPod::Unschedulable { .. }, Some(_))
+        ));
+        match step(&mut clock, 5 + UNSCHEDULABLE_GRACE.as_secs()) {
+            WaitStep::Unschedulable {
+                message,
+                cause,
+                requests,
+                for_,
+                failed,
+                last_failure,
+            } => {
+                assert_eq!(message, NO_ROOM);
+                assert_eq!(cause, Unplaced::NoRoom);
+                assert_eq!(failed, 0);
+                assert_eq!(last_failure, None);
+                assert_eq!(for_, UNSCHEDULABLE_GRACE);
+                assert_eq!(requests.as_deref(), Some("256Mi of memory and 100m of CPU"));
+            }
+            other => panic!("expected the give-up, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pod_placed_before_the_grace_ends_is_waited_for_as_usual() {
+        let job = unfinished_job("apprafter-backup-manual-x", "job-1", None);
+        let t0 = std::time::Instant::now();
+        let hour = Duration::from_secs(3600);
+        let mut clock = UnschedulableClock::default();
+        let pending = [pending_pod("job-1", "pod-1")];
+        let mut placed = pending_pod("job-1", "pod-1");
+        placed["spec"]["nodeName"] = json!("node-1");
+        placed["status"] = json!({"phase": "Running"});
+        let placed = [placed];
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        wait_step(
+            Some(&job),
+            &pending,
+            &[],
+            &mut clock,
+            at(0),
+            Duration::ZERO,
+            hour,
+        );
+        wait_step(
+            Some(&job),
+            &pending,
+            &[],
+            &mut clock,
+            at(100),
+            Duration::from_secs(100),
+            hour,
+        );
+        assert_eq!(
+            wait_step(
+                Some(&job),
+                &placed,
+                &[],
+                &mut clock,
+                at(110),
+                Duration::from_secs(110),
+                hour
+            ),
+            WaitStep::Wait(JobPod::Running, None)
+        );
+        // Long past the grace since the first sighting: nothing gives up on
+        // a runner that is running.
+        assert_eq!(
+            wait_step(
+                Some(&job),
+                &placed,
+                &[],
+                &mut clock,
+                at(900),
+                Duration::from_secs(900),
+                hour
+            ),
+            WaitStep::Wait(JobPod::Running, None)
+        );
+    }
+
+    #[test]
+    fn the_jobs_verdict_comes_before_its_pods_and_the_reason_before_the_timeout() {
+        let t0 = std::time::Instant::now();
+        let s = Duration::from_secs;
+        let pods = [pending_pod("job-1", "pod-1")];
+
+        // Gone.
+        let mut clock = UnschedulableClock::default();
+        assert_eq!(
+            wait_step(None, &pods, &[], &mut clock, t0, s(0), s(3600)),
+            WaitStep::Vanished
+        );
+
+        // Finished: whatever a pod still says, the Job's condition wins.
+        let mut done = unfinished_job("j", "job-1", None);
+        done["status"]["conditions"] = json!([{"type": "Complete", "status": "True"}]);
+        assert_eq!(
+            wait_step(Some(&done), &pods, &[], &mut clock, t0, s(0), s(3600)),
+            WaitStep::Succeeded
+        );
+        let mut failed = unfinished_job("j", "job-1", None);
+        failed["status"]["conditions"] =
+            json!([{"type": "Failed", "status": "True", "reason": "DeadlineExceeded"}]);
+        assert_eq!(
+            wait_step(Some(&failed), &pods, &[], &mut clock, t0, s(0), s(3600)),
+            WaitStep::Failed("DeadlineExceeded".to_string())
+        );
+
+        // The grace and the timeout end on the same look: the known reason
+        // is what is reported, not "no longer waiting".
+        let job = unfinished_job("j", "job-1", None);
+        let mut clock = UnschedulableClock::default();
+        wait_step(Some(&job), &pods, &[], &mut clock, t0, s(0), s(120));
+        assert!(matches!(
+            wait_step(
+                Some(&job),
+                &pods,
+                &[],
+                &mut clock,
+                t0 + s(120),
+                s(120),
+                s(120)
+            ),
+            WaitStep::Unschedulable { .. }
+        ));
+
+        // A timeout shorter than the grace ends the wait first, and says the
+        // pod never started rather than that it is running.
+        let mut clock = UnschedulableClock::default();
+        wait_step(Some(&job), &pods, &[], &mut clock, t0, s(0), s(60));
+        let step = wait_step(Some(&job), &pods, &[], &mut clock, t0 + s(60), s(60), s(60));
+        let WaitStep::TimedOut(pod) = step else {
+            panic!("expected the timeout, got {step:?}");
+        };
+        let note = job_pod::timeout_note(&pod, 1, PLATFORMSTACK_NAMESPACE, "j");
+        assert!(note.contains("could not be scheduled in 1m"), "{note}");
+    }
+
+    #[test]
+    fn the_wait_says_a_job_between_attempts_is_retrying_not_still_running() {
+        let mut job = unfinished_job("j", "job-1", None);
+        job["status"] = json!({"failed": 1, "startTime": "2026-09-23T14:39:47Z"});
+        let t0 = std::time::Instant::now();
+        let mut clock = UnschedulableClock::default();
+        let step = wait_step(
+            Some(&job),
+            &[],
+            &[],
+            &mut clock,
+            t0,
+            Duration::from_secs(40),
+            Duration::from_secs(3600),
+        );
+        assert_eq!(
+            step,
+            WaitStep::Wait(
+                JobPod::Retrying {
+                    failed: 1,
+                    attempts: 7
+                },
+                None
+            )
+        );
+    }
+
+    /// A timeout reached while the Job retries is an error that says why its
+    /// last attempt failed: that Job has taken no backup. The finding: an
+    /// over-limit staging failed every attempt, `backup run` said only
+    /// "retrying after N failed attempts" and, at its timeout, exited 0.
+    /// A timeout with no attempt failed stays a plain note: that backup is
+    /// only slow.
+    #[test]
+    fn a_timeout_after_failed_attempts_is_an_error_and_a_slow_backup_is_not() {
+        let t0 = std::time::Instant::now();
+        let s = Duration::from_secs;
+        let mut retrying = unfinished_job("j", "job-1", None);
+        retrying["status"] = json!({"failed": 2, "startTime": "2026-09-23T14:39:47Z"});
+        let mut clock = UnschedulableClock::default();
+        let step = wait_step(Some(&retrying), &[], &[], &mut clock, t0, s(3600), s(3600));
+        assert!(
+            matches!(step, WaitStep::TimedOut(JobPod::Retrying { failed: 2, .. })),
+            "{step:?}"
+        );
+        let failures = unfinished_failures(Some(&retrying), &step);
+        assert_eq!(failures, 2);
+        let err = timed_out("j", 60, failures, Some("the staging volume held 318Mi"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("backup Job j has taken no backup"), "{err}");
+        assert!(err.contains("2 failed attempts"), "{err}");
+        assert!(err.contains("the staging volume held 318Mi"), "{err}");
+
+        // A third attempt running when the wait ends: two have failed, and
+        // none has succeeded.
+        let mut third = retrying.clone();
+        third["status"]["active"] = json!(1);
+        let step = wait_step(Some(&third), &[], &[], &mut clock, t0, s(3600), s(3600));
+        assert!(matches!(step, WaitStep::TimedOut(_)), "{step:?}");
+        assert!(timed_out("j", 60, unfinished_failures(Some(&third), &step), None).is_err());
+
+        // Slow, with nothing failed: the wait ends quietly, as it always has.
+        let slow = unfinished_job("j", "job-1", None);
+        let step = wait_step(Some(&slow), &[], &[], &mut clock, t0, s(3600), s(3600));
+        assert!(matches!(step, WaitStep::TimedOut(_)), "{step:?}");
+        assert_eq!(unfinished_failures(Some(&slow), &step), 0);
+        assert!(timed_out("j", 60, 0, None).is_ok());
+
+        // A finished Job reports its own ending, not its attempts.
+        let mut failed = retrying;
+        failed["status"]["conditions"] =
+            json!([{"type": "Failed", "status": "True", "reason": "PodFailurePolicy"}]);
+        let step = wait_step(Some(&failed), &[], &[], &mut clock, t0, s(0), s(3600));
+        assert!(matches!(step, WaitStep::Failed(_)), "{step:?}");
+        assert_eq!(unfinished_failures(Some(&failed), &step), 0);
+    }
+
+    /// A node under memory pressure: the kubelet taints it, and keeps the
+    /// taint for five minutes after the pressure ends.
+    const MEMORY_PRESSURE: &str = "0/1 nodes are available: 1 node(s) had untolerated taint \
+                                   {node.kubernetes.io/memory-pressure: }. preemption: 0/1 nodes \
+                                   are available: 1 Preemption is not helpful for scheduling.";
+
+    fn pending_pod_saying(job_uid: &str, pod_uid: &str, message: &str) -> Value {
+        let mut p = pending_pod(job_uid, pod_uid);
+        p["status"]["conditions"][0]["message"] = json!(message);
+        p
+    }
+
+    #[test]
+    fn a_pod_kept_off_by_a_node_condition_is_waited_for_past_the_taints_five_minutes() {
+        // A runner evicted under memory pressure is retried into the
+        // pressure taint, which outlives the pressure by five minutes. At
+        // two minutes that Job would still have run.
+        let job = unfinished_job("j", "job-1", None);
+        let pods = [pending_pod_saying("job-1", "pod-1", MEMORY_PRESSURE)];
+        let t0 = std::time::Instant::now();
+        let s = Duration::from_secs;
+        let mut clock = UnschedulableClock::default();
+        for at in [0, 125, 300, 599] {
+            assert!(
+                matches!(
+                    wait_step(
+                        Some(&job),
+                        &pods,
+                        &[],
+                        &mut clock,
+                        t0 + s(at),
+                        s(at),
+                        s(3600)
+                    ),
+                    WaitStep::Wait(JobPod::Unschedulable { .. }, Some(_))
+                ),
+                "at {at}s"
+            );
+        }
+        match wait_step(
+            Some(&job),
+            &pods,
+            &[],
+            &mut clock,
+            t0 + s(600),
+            s(600),
+            s(3600),
+        ) {
+            WaitStep::Unschedulable { cause, for_, .. } => {
+                assert_eq!(
+                    cause,
+                    Unplaced::NodeCondition(vec!["node.kubernetes.io/memory-pressure".to_string()])
+                );
+                assert_eq!(for_, s(600));
+            }
+            other => panic!("expected the give-up at ten minutes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_clock_does_not_run_while_pods_are_stopping_and_giving_room_back() {
+        // A CNPG pod being deleted shuts down smartly for up to 180 s, and
+        // holds its requests until it is gone: longer than the grace. The
+        // room it gives back may be exactly what the runner waits for.
+        let job = unfinished_job("j", "job-1", None);
+        let pods = [pending_pod("job-1", "pod-1")];
+        let stopping = ["demo/shop-pg-1".to_string()];
+        let t0 = std::time::Instant::now();
+        let s = Duration::from_secs;
+        let mut clock = UnschedulableClock::default();
+        // No room and nothing stopping yet: the clock starts.
+        assert!(matches!(
+            wait_step(Some(&job), &pods, &[], &mut clock, t0, s(0), s(3600)),
+            WaitStep::Wait(JobPod::Unschedulable { .. }, Some(d)) if d.is_zero()
+        ));
+        for at in [100, 200, 300] {
+            match wait_step(
+                Some(&job),
+                &pods,
+                &stopping,
+                &mut clock,
+                t0 + s(at),
+                s(at),
+                s(3600),
+            ) {
+                WaitStep::RoomReturning {
+                    stopping: named, ..
+                } => {
+                    assert_eq!(named, stopping.to_vec(), "at {at}s")
+                }
+                other => panic!("at {at}s expected to wait for the stopping pod, got {other:?}"),
+            }
+        }
+        // Gone, and still no room: the two minutes start again now, not at
+        // 0, where they first began.
+        assert!(matches!(
+            wait_step(Some(&job), &pods, &[], &mut clock, t0 + s(305), s(305), s(3600)),
+            WaitStep::Wait(JobPod::Unschedulable { .. }, Some(d)) if d.is_zero()
+        ));
+        assert!(matches!(
+            wait_step(
+                Some(&job),
+                &pods,
+                &[],
+                &mut clock,
+                t0 + s(424),
+                s(424),
+                s(3600)
+            ),
+            WaitStep::Wait(JobPod::Unschedulable { .. }, Some(_))
+        ));
+        assert!(matches!(
+            wait_step(
+                Some(&job),
+                &pods,
+                &[],
+                &mut clock,
+                t0 + s(425),
+                s(425),
+                s(3600)
+            ),
+            WaitStep::Unschedulable { .. }
+        ));
+        // The caller's timeout still ends a wait for stopping pods.
+        let mut clock = UnschedulableClock::default();
+        assert!(matches!(
+            wait_step(
+                Some(&job),
+                &pods,
+                &stopping,
+                &mut clock,
+                t0,
+                s(3600),
+                s(3600)
+            ),
+            WaitStep::TimedOut(JobPod::Unschedulable { .. })
+        ));
+        // A node condition is not a lack of room: pods stopping elsewhere
+        // do not change it, and its own clock runs.
+        let tainted = [pending_pod_saying("job-1", "pod-1", MEMORY_PRESSURE)];
+        let mut clock = UnschedulableClock::default();
+        wait_step(
+            Some(&job),
+            &tainted,
+            &stopping,
+            &mut clock,
+            t0,
+            s(0),
+            s(3600),
+        );
+        assert!(matches!(
+            wait_step(
+                Some(&job),
+                &tainted,
+                &stopping,
+                &mut clock,
+                t0 + s(600),
+                s(600),
+                s(3600)
+            ),
+            WaitStep::Unschedulable { .. }
+        ));
+    }
+
+    #[test]
+    fn the_give_up_carries_the_attempts_that_failed_before_it() {
+        let mut job = unfinished_job("j", "job-1", None);
+        job["status"]["failed"] = json!(1);
+        let mut evicted = pending_pod("job-1", "pod-0");
+        evicted["metadata"]["creationTimestamp"] = json!("2026-09-23T14:30:00Z");
+        evicted["spec"]["nodeName"] = json!("node-1");
+        evicted["status"] = json!({"phase": "Failed", "reason": "Evicted",
+                                   "message": "The node was low on resource: memory."});
+        let pods = [evicted, pending_pod("job-1", "pod-1")];
+        let t0 = std::time::Instant::now();
+        let s = Duration::from_secs;
+        let mut clock = UnschedulableClock::default();
+        wait_step(Some(&job), &pods, &[], &mut clock, t0, s(0), s(3600));
+        match wait_step(
+            Some(&job),
+            &pods,
+            &[],
+            &mut clock,
+            t0 + s(120),
+            s(120),
+            s(3600),
+        ) {
+            WaitStep::Unschedulable {
+                failed,
+                last_failure,
+                ..
+            } => {
+                assert_eq!(failed, 1);
+                assert_eq!(
+                    last_failure.as_deref(),
+                    Some("Evicted: The node was low on resource: memory.")
+                );
+            }
+            other => panic!("expected the give-up, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // `backup enable` whose first backup does not complete
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn an_enable_whose_first_backup_cannot_start_says_backup_is_enabled() {
+        // The PlatformStack patch is applied before the first backup runs.
+        // A reader of a bare exit 1 re-runs `enable`; the words must say
+        // that is not needed, in the line printed and in the error's help.
+        let err = CliError::BackupRunnerUnschedulable {
+            job: "apprafter-backup-manual-x".to_string(),
+            what: "never started: no node had room for its pod for 2m 3s".to_string(),
+            help: "`apprafter top` shows how much of each node is requested.".to_string(),
+        };
+        let (line, exit) = first_backup_outcome(err);
+        assert!(line.contains("Backup IS enabled"), "{line}");
+        assert!(line.contains("could not start"), "{line}");
+        match exit {
+            Some(CliError::BackupRunnerUnschedulable { job, what, help }) => {
+                assert_eq!(job, "apprafter-backup-manual-x");
+                assert_eq!(
+                    what,
+                    "never started: no node had room for its pod for 2m 3s"
+                );
+                assert!(help.starts_with("Backup IS enabled"), "{help}");
+                assert!(
+                    help.contains("do not run `apprafter backup enable` again"),
+                    "{help}"
+                );
+                assert!(
+                    help.ends_with("`apprafter top` shows how much of each node is requested."),
+                    "the command's own advice is kept: {help}"
+                );
+            }
+            other => panic!("the exit stays an error, on purpose: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enable_exits_with_its_first_backups_error_and_zero_when_it_completed() {
+        assert!(take_first_backup(|| Ok(())).is_ok());
+        let unschedulable = take_first_backup(|| {
+            Err(CliError::BackupRunnerUnschedulable {
+                job: "j".into(),
+                what: "never started".into(),
+                help: "h".into(),
+            })
+        });
+        match unschedulable {
+            Err(CliError::BackupRunnerUnschedulable { help, .. }) => {
+                assert!(help.starts_with("Backup IS enabled"), "{help}")
+            }
+            other => panic!("expected the error with enable's help, got {other:?}"),
+        }
+        assert!(matches!(
+            take_first_backup(|| Err(CliError::Other("failed".into()))),
+            Err(CliError::Other(_))
+        ));
+    }
+
+    #[test]
+    fn an_enable_whose_first_backup_failed_says_backup_is_enabled_and_keeps_the_error() {
+        let (line, exit) = first_backup_outcome(CliError::Other(
+            "backup Job apprafter-backup-manual-x failed after 12s: BackoffLimitExceeded".into(),
+        ));
+        assert!(line.contains("Backup IS enabled"), "{line}");
+        assert!(line.contains("did not complete"), "{line}");
+        match exit {
+            Some(CliError::Other(m)) => assert!(m.contains("BackoffLimitExceeded"), "{m}"),
+            other => panic!("the error is passed on unchanged: {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // One run at a time: `backup run` beside a Job that has not finished
+    // ------------------------------------------------------------------
+
+    fn running_pod_of(job_uid: &str, pod_uid: &str) -> Value {
+        let mut p = pending_pod(job_uid, pod_uid);
+        p["spec"]["nodeName"] = json!("node-1");
+        p["status"] = json!({"phase": "Running", "conditions": [
+            {"type": "PodScheduled", "status": "True"}
+        ]});
+        p
+    }
+
+    fn with_start(mut j: Value, start: &str) -> Value {
+        j["status"]["startTime"] = json!(start);
+        j
+    }
+
+    #[test]
+    fn only_backup_and_check_jobs_that_have_not_finished_are_active() {
+        let running = with_start(
+            unfinished_job("apprafter-backup-check-29312350", "chk", Some("CronJob")),
+            "2026-09-23T06:00:00Z",
+        );
+        let pending = with_start(
+            unfinished_job("apprafter-backup-29312345", "bk", Some("CronJob")),
+            "2026-09-23T03:00:00Z",
+        );
+        let mut done = unfinished_job("apprafter-backup-29312300", "done", Some("CronJob"));
+        done["status"] = json!({"succeeded": 1, "conditions": [
+            {"type": "Complete", "status": "True"}
+        ]});
+        let mut failed = unfinished_job("apprafter-backup-29312301", "failed", Some("CronJob"));
+        failed["status"] = json!({"failed": 7, "conditions": [
+            {"type": "Failed", "status": "True", "reason": "BackoffLimitExceeded"}
+        ]});
+        // Succeeded, and the Complete condition not written yet.
+        let mut succeeded = unfinished_job("apprafter-backup-29312302", "ok", None);
+        succeeded["status"] = json!({"succeeded": 1});
+        let mut deleting = unfinished_job("apprafter-backup-manual-x", "del", None);
+        deleting["metadata"]["deletionTimestamp"] = json!("2026-09-23T07:00:00Z");
+        let other = unfinished_job("nightly-report", "rep", None);
+        let pods = [
+            running_pod_of("chk", "chk-pod"),
+            pending_pod("bk", "bk-pod"),
+        ];
+        let active = active_runner_jobs(
+            &[done, failed, succeeded, deleting, other, pending, running],
+            &pods,
+        );
+        let names: Vec<&str> = active.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "apprafter-backup-check-29312350",
+                "apprafter-backup-29312345"
+            ],
+            "newest first"
+        );
+        assert_eq!(active[0].state, "Running");
+        assert_eq!(active[0].pod, JobPod::Running);
+        assert!(
+            active[1]
+                .state
+                .starts_with("Pending, cannot be scheduled: 0/1 nodes are available"),
+            "{}",
+            active[1].state
+        );
+    }
+
+    #[test]
+    fn a_job_the_controller_is_failing_is_active_and_says_it_is_stopping() {
+        // FailureTarget comes first, while its pods stop (the runner takes
+        // up to 90 s); Failed follows once they are gone.
+        let mut stopping = unfinished_job("apprafter-backup-29312345", "bk", Some("CronJob"));
+        stopping["status"] = json!({"active": 1, "startTime": "2026-09-23T03:00:00Z",
+            "conditions": [{"type": "FailureTarget", "status": "True",
+                            "reason": "DeadlineExceeded"}]});
+        let active = active_runner_jobs(&[stopping], &[]);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].state, "Stopping (DeadlineExceeded)");
+    }
+
+    #[test]
+    fn a_run_is_refused_beside_a_job_that_has_not_finished() {
+        assert!(refusal(&[], &[]).is_none());
+        let mut done = unfinished_job("apprafter-backup-29312300", "done", Some("CronJob"));
+        done["status"]["conditions"] = json!([{"type": "Complete", "status": "True"}]);
+        assert!(refusal(&[done], &[]).is_none());
+
+        // The weekly check is running: a backup started now would fail on
+        // its exclusive lock, and on a full node it would not even start.
+        let check = unfinished_job("apprafter-backup-check-29312350", "chk", Some("CronJob"));
+        let (report, err) = refusal(
+            std::slice::from_ref(&check),
+            &[running_pod_of("chk", "chk-pod")],
+        )
+        .expect("refused");
+        assert!(
+            report.contains("  ✗ apprafter-backup-check-29312350 has not finished: Running"),
+            "{report}"
+        );
+        assert!(report.contains("would not finish"), "{report}");
+        assert!(
+            !report.contains("delete job"),
+            "a running Job is waited for: {report}"
+        );
+        match &err {
+            CliError::BackupJobActive { job } => {
+                assert_eq!(job, "apprafter-backup-check-29312350")
+            }
+            other => panic!("expected BackupJobActive, got {other:?}"),
+        }
+
+        // A scheduled Job no node takes holds the schedule: say why, and how
+        // to clear it, since it may hold on until its deadline.
+        let stuck = unfinished_job("apprafter-backup-29312345", "bk", Some("CronJob"));
+        let (report, _) =
+            refusal(std::slice::from_ref(&stuck), &[pending_pod("bk", "bk-pod")]).expect("refused");
+        assert!(
+            report.contains(
+                "  ✗ apprafter-backup-29312345 has not finished: Pending, cannot be scheduled:"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("`apprafter top`"), "{report}");
+        assert!(
+            report.contains("kubectl -n apprafter-system delete job apprafter-backup-29312345"),
+            "{report}"
+        );
+    }
+
+    /// FIRES (live walk): a Job with no `activeDeadlineSeconds` — every Job
+    /// of a chart before 0.2.80 — was said to "hold on until its deadline
+    /// stops it". It has none: it holds on until it is deleted. The report
+    /// says that, and gives the command once, whether the hint above it
+    /// already did (a scheduled Job) or not (one `backup run` made).
+    #[test]
+    fn backup_run_says_a_job_with_no_deadline_holds_on_until_it_is_deleted() {
+        let delete = "kubectl -n apprafter-system delete job";
+        for (name, owner) in [
+            ("apprafter-backup-29312345", Some("CronJob")),
+            ("apprafter-backup-manual-x", None),
+        ] {
+            let stuck = unfinished_job(name, "bk", owner);
+            assert!(job_pod::deadline_of(&stuck).is_none());
+            let (report, _) = refusal(std::slice::from_ref(&stuck), &[pending_pod("bk", "bk-pod")])
+                .expect("refused");
+            assert!(!report.contains("until its deadline"), "{report}");
+            assert!(report.contains("no deadline"), "{report}");
+            assert_eq!(
+                report.matches(&format!("{delete} {name}")).count(),
+                1,
+                "{report}"
+            );
+        }
+
+        // DOES NOT FIRE: a Job with a deadline is ended by it.
+        let mut stuck = unfinished_job("apprafter-backup-29312345", "bk", Some("CronJob"));
+        stuck["spec"]["activeDeadlineSeconds"] = json!(21600);
+        let (report, _) =
+            refusal(std::slice::from_ref(&stuck), &[pending_pod("bk", "bk-pod")]).expect("refused");
+        assert!(report.contains("until its deadline stops it"), "{report}");
+        assert!(!report.contains("no deadline"), "{report}");
+        assert_eq!(
+            report
+                .matches(&format!("{delete} apprafter-backup-29312345"))
+                .count(),
+            1,
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn the_jobs_holding_room_are_the_other_runners_that_are_running() {
+        let own = unfinished_job("apprafter-backup-manual-x", "own", None);
+        let check = unfinished_job("apprafter-backup-check-29312350", "chk", Some("CronJob"));
+        let waiting = unfinished_job("apprafter-backup-29312345", "bk", Some("CronJob"));
+        let pods = [
+            pending_pod("own", "own-pod"),
+            running_pod_of("chk", "chk-pod"),
+            pending_pod("bk", "bk-pod"),
+        ];
+        assert_eq!(
+            room_holders("apprafter-backup-manual-x", &[own, check, waiting], &pods),
+            vec!["apprafter-backup-check-29312350".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_enable_beside_a_job_that_has_not_finished_skips_its_first_backup_and_exits_zero() {
+        let (line, exit) = first_backup_outcome(CliError::BackupJobActive {
+            job: "apprafter-backup-29312345".into(),
+        });
+        assert!(line.contains("Backup IS enabled"), "{line}");
+        assert!(line.contains("apprafter-backup-29312345"), "{line}");
+        assert!(line.contains("`apprafter backup run`"), "{line}");
+        assert!(exit.is_none(), "nothing failed: {exit:?}");
+        assert!(take_first_backup(|| Err(CliError::BackupJobActive {
+            job: "apprafter-backup-29312345".into(),
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn preemption_never_runs_the_unschedulable_clock() {
+        // The scheduler is evicting lower-priority pods to make room: the pod
+        // will be placed. Only the caller's timeout ends that wait.
+        let job = unfinished_job("j", "job-1", None);
+        let mut pod = pending_pod("job-1", "pod-1");
+        pod["status"]["nominatedNodeName"] = json!("node-1");
+        let pods = [pod];
+        let t0 = std::time::Instant::now();
+        let s = Duration::from_secs;
+        let mut clock = UnschedulableClock::default();
+        for at in [0, 60, 120, 600, 1800] {
+            assert!(matches!(
+                wait_step(
+                    Some(&job),
+                    &pods,
+                    &[],
+                    &mut clock,
+                    t0 + s(at),
+                    s(at),
+                    s(3600)
+                ),
+                WaitStep::Wait(JobPod::Preempting { .. }, None)
+            ));
+        }
+        assert!(matches!(
+            wait_step(
+                Some(&job),
+                &pods,
+                &[],
+                &mut clock,
+                t0 + s(3600),
+                s(3600),
+                s(3600)
+            ),
+            WaitStep::TimedOut(JobPod::Preempting { .. })
+        ));
     }
 }

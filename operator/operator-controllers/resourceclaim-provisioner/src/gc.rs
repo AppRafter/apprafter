@@ -1404,7 +1404,6 @@ mod tests {
         );
     }
     use super::*;
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     use operator_core::ResourceClaimSpec;
     use serde_json::json;
 
@@ -1423,7 +1422,7 @@ mod tests {
         // A claim that is itself mid-deletion will produce its OWN fresh
         // RetainedClaim, so this older snapshot is not protected by it.
         let mut claim = ResourceClaim::new("demo-web-pg", ResourceClaimSpec::default());
-        claim.metadata.deletion_timestamp = Some(Time(Utc::now()));
+        claim.metadata.deletion_timestamp = Some(operator_core::k8s_time::time(Utc::now()));
         assert!(!claim_is_live(&claim));
     }
 
@@ -1935,7 +1934,7 @@ mod tests {
         );
 
         let mut deleting_disk = ResourceClaim::new("web-disk-data", ResourceClaimSpec::default());
-        deleting_disk.metadata.deletion_timestamp = Some(Time(Utc::now()));
+        deleting_disk.metadata.deletion_timestamp = Some(operator_core::k8s_time::time(Utc::now()));
         assert!(
             !claim_is_live(&deleting_disk),
             "a mid-deletion disk claim is not live — it produces its own fresh snapshot"

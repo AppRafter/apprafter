@@ -68,7 +68,7 @@ recommended path; build-from-source is for contributors.
 
 === "Contributors — build from source"
 
-    Requires a Rust toolchain (`mise.toml` pins `stable`). From a repo
+    Requires a Rust toolchain (`mise.toml` pins Rust 1.98; the patch floats). From a repo
     checkout:
 
     ```sh
@@ -278,8 +278,8 @@ docker build -t ghcr.io/<your-org>/my-service:0.1.0 .
 docker push ghcr.io/<your-org>/my-service:0.1.0
 ```
 
-The bun-http Dockerfile is multi-stage — `oven/bun:1-debian` builds,
-the runtime is `distroless/nodejs20-debian12:nonroot`. Final image is
+The bun-http Dockerfile is multi-stage — an `oven/bun` Debian image builds,
+the runtime is `distroless/nodejs24-debian12:nonroot`. Final image is
 ~30 MB. Pushing a moved tag re-rolls the deployment automatically; the
 build → push → redeploy iteration loop is covered in
 [Image iteration](./image-iteration.md).

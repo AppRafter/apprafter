@@ -15,6 +15,7 @@ pub(crate) mod cli;
 pub(crate) mod commands;
 mod dispatch;
 pub(crate) mod examples;
+mod startup;
 
 use clap::{CommandFactory, FromArgMatches};
 use cli_core::logging;
@@ -86,33 +87,6 @@ pub fn run() -> Result<()> {
 
     logging::init();
 
-    // npm-style courtesy check for a newer CLI release. Best-
-    // effort — never fails the invocation. A 6h cache means the
-    // network round-trip happens four times a day at most.
-    // STARTUP CHECKS REACH OUTSIDE THE PROCESS, AND THAT HAS A COST BEYOND
-    // LATENCY. One calls api.github.com, the other shells out to `kubectl`, and
-    // both cache their verdict to disk. In a harness that spawns this binary
-    // hundreds of times they are slow, they are non-deterministic, and they made
-    // the measured CODE COVERAGE of this crate depend on whether an earlier run
-    // had warmed the cache — two workspace measurements 0.14pp apart with
-    // nothing changed between them, traced to exactly this.
-    //
-    // `APPRAFTER_SKIP_STARTUP_CHECKS=1` turns both off. `cli/.cargo/config.toml`
-    // sets it for everything cargo runs, which covers the integration suite.
-    //
-    // It also applies to `cargo run`, and that is right rather than incidental:
-    // a source build is not a release, so telling its user that some published
-    // version is "newer" is noise about a comparison that does not mean what it
-    // appears to.
-    if std::env::var_os("APPRAFTER_SKIP_STARTUP_CHECKS").is_none() {
-        commands::version_check::maybe_warn_about_newer_version();
-        // 2.22d (D8): the node's disk is not specific to any one command — when
-        // it fills, every workload on that node stops writing at once — so it
-        // warns here, on the same hook, rather than waiting for someone to run
-        // the one status command that would have shown it.
-        commands::node_disk_check::maybe_warn_about_node_disk();
-    }
-
     // `Cli::parse()` would build the clap tree WITHOUT the worked
     // examples, so `--help` would be the one consumer of
     // `examples::EXAMPLES` that never sees it. Expanded here to the
@@ -126,5 +100,13 @@ pub fn run() -> Result<()> {
         Ok(args) => args,
         Err(error) => error.format(&mut command).exit(),
     };
+
+    // The newer-release notice and the node-disk banner, both of which reach
+    // outside this machine. Only now, after parsing: `--help`, `--version`
+    // and an argument error have already been answered and exited above, so
+    // they never run a `kubectl` against the current context. And only for a
+    // command that goes beyond this machine itself (`startup`).
+    startup::run_startup_checks(&args.command);
+
     dispatch(args).map_err(miette::Report::new)
 }

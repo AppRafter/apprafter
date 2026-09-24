@@ -152,7 +152,7 @@ on every `landing-v*` tag:
 | Image | Stage | Runtime | Built from |
 |---|---|---|---|
 | `ghcr.io/apprafter/landing-web:<tag>` | Caddy 2 / alpine | `:80` static | [`web/Dockerfile`](web/Dockerfile) + [`web/Caddyfile`](web/Caddyfile) |
-| `ghcr.io/apprafter/landing-cms:<tag>` | Node 22 / alpine | `:3000` Next standalone | [`cms/Dockerfile`](cms/Dockerfile) |
+| `ghcr.io/apprafter/landing-cms:<tag>` | Node 24 / alpine | `:3000` Next standalone | [`cms/Dockerfile`](cms/Dockerfile) |
 
 The web image is content-static — it ships with the JSON
 fallbacks baked in (`LANDING_USE_FALLBACK=1` during image build),

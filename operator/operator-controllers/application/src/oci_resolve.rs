@@ -12,7 +12,7 @@
 // not branch on) remain dead-code-allowed.
 #![allow(dead_code)]
 
-use oci_distribution::Reference;
+use oci_client::Reference;
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -60,7 +60,7 @@ pub fn is_valid_sha256_digest(digest: &str) -> bool {
 }
 
 /// Split an image string into host / repository / reference by
-/// delegating to `oci_distribution::Reference`, the same validated
+/// delegating to `oci_client::Reference`, the same validated
 /// parser `platform-stack::oci` uses — so the OCI reference grammar
 /// (lowercase repo names, `sha256:` digest format/length, `host:port`
 /// vs tag disambiguation, the `library/` Docker-Hub default) is
@@ -279,7 +279,7 @@ application/vnd.docker.distribution.manifest.v2+json";
 /// reference is returned verbatim (no I/O). On a 401 we run one bearer
 /// token exchange and retry once.
 pub async fn resolve_digest(
-    http: &impl RegistryHttp,
+    http: &(impl RegistryHttp + ?Sized),
     image: &str,
     auth: &RegistryAuth,
 ) -> Result<String, OciResolveError> {
@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn parse_image_ref_malformed_digest_is_rejected() {
         // The hand-rolled splitter silently accepted a 3-char digest;
-        // delegating to oci_distribution validates the sha256 length.
+        // delegating to oci_client validates the sha256 length.
         assert!(parse_image_ref("repo@sha256:abc").is_err());
     }
 
@@ -636,7 +636,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_digest_passthrough_when_already_digest() {
         // An already-digest reference needs no lookup. The digest must be a
-        // valid 64-hex sha256 (oci_distribution::Reference enforces this);
+        // valid 64-hex sha256 (oci_client::Reference enforces this);
         // resolve_digest parses the ref first, so a malformed digest would
         // fail resolution rather than pass through.
         let d = format!("sha256:{}", "a".repeat(64));

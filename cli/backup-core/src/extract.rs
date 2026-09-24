@@ -17,20 +17,25 @@
 //! The connection Secret (written by the provisioner at `status.connectionSecretRef`)
 //! carries decomposed keys `user`, `pass`, `host`, `port`, `db` — all
 //! `stringData` fields, stored base64 under `data`.  `run_extraction` reads
-//! each key via `KubeExec::get_secret_key` (which returns the base64-decoded
-//! string).  The password is then injected as the `PGPASSWORD` environment
-//! variable INTO THE HELPER POD SPEC (not via `kubectl exec --env`), so
-//! `pg_dump` reads it from the env and suppresses the interactive prompt.
+//! the four it puts on `pg_dump`'s command line via `KubeExec::get_secret_key`
+//! (which returns the base64-decoded string) and never reads the password:
+//! the helper pod's container takes `PGPASSWORD` from the Secret's `pass` key
+//! by reference ([`crate::helper_pod::SecretKey`]), so `pg_dump` reads it
+//! from its env and never prompts, while the Pod object carries only the
+//! Secret's name. The helper runs in the claim's namespace, which is where
+//! that Secret is. The JetStream dump does the same with the NATS manager
+//! user and password ([`NATS_MGR_USER_KEY`], [`NATS_MGR_PASSWORD_KEY`]).
 
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use cli_core::{CliError, Result};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::helper_pod::{
-    apply_and_wait_pod_ready, delete_pod_best_effort, exec_stream_to_file, nats_pod_spec,
-    volume_pod_spec,
+    apply_and_wait_pod_ready, delete_pod_best_effort, exec_stream_to_file, explain_keep_alive_end,
+    nats_pod_spec, pg_helper_pod_spec, volume_pod_spec, SecretKey,
 };
 use crate::images;
 use crate::kube::KubeExec;
@@ -313,6 +318,16 @@ pub fn nats_namespace_of_host(host: &str) -> Option<String> {
     Some(namespace.to_string())
 }
 
+/// The key of a pg claim's connection Secret that holds the password — what
+/// a PostgreSQL helper's `PGPASSWORD` is read from.
+pub const PG_CONNECTION_PASSWORD_KEY: &str = "pass";
+
+/// The keys of a NATS manager Secret ([`mgr_secret_name`]) holding the
+/// manager user's name and password — what a JetStream helper's `NATS_USER`
+/// and `NATS_PASSWORD` are read from.
+pub const NATS_MGR_USER_KEY: &str = "user";
+pub const NATS_MGR_PASSWORD_KEY: &str = "password";
+
 /// The per-namespace NATS manager Secret, by the provisioner's convention.
 ///
 /// Restated rather than imported: `nats::mgr_secret_name` lives in the
@@ -359,41 +374,61 @@ pub fn pod_name_segment(s: &str) -> String {
         .collect()
 }
 
+/// The name of a JetStream helper pod: `bk-js` for a backup's dump of one
+/// stream (`stream` given), `rs-js` for a restore's replay of one claim's
+/// streams.
+///
+/// Every other helper pod runs in its claim's own namespace, so the claim's
+/// name alone keeps it apart. A JetStream helper runs in the namespace NATS
+/// runs in, which every application namespace shares, so its name carries the
+/// claim's namespace too. Without it, `shop/js` and `blog/js` named the same
+/// pod, and two runs at once — two restores, or a CLI backup beside the
+/// scheduled one — collided on it. The two pods differ in their credentials
+/// (`nats-mgr-<namespace>`), and a pod of another spec is replaced
+/// ([`crate::helper_pod`]), so the later run deleted the earlier one's pod
+/// under it; before replacement, it failed its own apply instead.
+///
+/// The readable part is `<prefix>-<namespace>-<claim>[-<stream>]`, each part
+/// through [`pod_name_segment`] and cut to fit the 63-character limit, and a
+/// hash of the exact namespace, claim and stream follows it. The hash is what
+/// keeps the name unique: folding and cutting can make two of them read alike
+/// (`a-b` + `c` and `a` + `b-c`; `orders_dlq` and `orders-dlq`; two long names
+/// with a common start). The same inputs give the same name on every run,
+/// which is how a run finds a leftover to replace. Pure.
+pub fn jetstream_helper_pod_name(
+    prefix: &str,
+    namespace: &str,
+    claim: &str,
+    stream: Option<&str>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in [namespace, claim, stream.unwrap_or_default()] {
+        // A separator no Kubernetes or NATS name contains.
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    let hash: String = hasher.finalize()[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let mut readable = format!(
+        "{prefix}-{}-{}",
+        pod_name_segment(namespace),
+        pod_name_segment(claim)
+    );
+    if let Some(stream) = stream {
+        readable.push('-');
+        readable.push_str(&pod_name_segment(stream));
+    }
+    // Room for `-<hash>` inside 63.
+    let readable = truncate_pod_name(&readable[..readable.len().min(63 - 1 - hash.len())]);
+    format!("{readable}-{hash}")
+}
+
 // ---------------------------------------------------------------------------
 // Impure extraction driver (walk-validated; not unit-tested)
 // ---------------------------------------------------------------------------
-
-/// Build a `pg_dump` helper Pod spec with `PGPASSWORD` injected into the
-/// container environment so `pg_dump` never needs an interactive prompt.
-/// All other fields mirror `helper_pod::pg_dump_pod_spec`.
-pub(crate) fn pg_dump_pod_spec_with_password(
-    name: &str,
-    ns: &str,
-    image: &str,
-    password: &str,
-) -> Value {
-    json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": name,
-            "namespace": ns,
-            "labels": { "apprafter.io/backup-helper": "true" }
-        },
-        "spec": {
-            "restartPolicy": "Never",
-            "containers": [{
-                "name": "dump",
-                "image": image,
-                "command": ["sleep", "3600"],
-                "env": [{
-                    "name": "PGPASSWORD",
-                    "value": password
-                }]
-            }]
-        }
-    })
-}
 
 /// Drive all extraction items to completion, writing each artifact under
 /// `out_dir`:
@@ -406,11 +441,13 @@ pub(crate) fn pg_dump_pod_spec_with_password(
 ///
 /// For each item:
 ///
-/// * **Pg** — reads the connection Secret (decomposed keys `user`, `pass`,
-///   `host`, `port`, `db`) via `k.get_secret_key`; applies a helper pod with
-///   `PGPASSWORD` injected into its container env; execs `pg_dump -Fc -h
-///   <host> -U <user> -p <port> <db>` and streams stdout to
-///   `pg/<ns>/<claim>.dump`; deletes the pod (best-effort).
+/// * **Pg** — reads the connection Secret's `user`, `host`, `port` and `db`
+///   via `k.get_secret_key`; applies a helper pod whose container reads
+///   `PGPASSWORD` from that Secret's `pass` by reference; execs `pg_dump -Fc
+///   --lock-wait-timeout=300s -h <host> -U <user> -p <port> <db>` (see
+///   [`PG_DUMP_LOCK_WAIT_TIMEOUT`]) and streams stdout to
+///   `pg/<ns>/<claim>.dump`, failing if the first byte takes longer than
+///   [`PG_DUMP_FIRST_OUTPUT_WITHIN`]; deletes the pod (best-effort).
 ///
 /// * **Volume** — applies a busybox pod that mounts `item.source` (the PVC
 ///   name) at `/data` read-only; execs `tar c -C /data .` and streams to
@@ -431,18 +468,24 @@ pub(crate) fn pg_dump_pod_spec_with_password(
 /// dump helper.  Pass `images::DEFAULT_PG_IMAGE` for the tier-1 default
 /// (pg 16); `images::pg_helper_image(Some(server_image_name))` when the CNPG
 /// Cluster's `spec.imageName` is known.
+///
+/// `keep_alive` is how long each helper pod keeps itself alive, and so the
+/// most any one extraction may take ([`crate::helper_pod::helper_keep_alive`]
+/// of the run's deadline). One the keep-alive ends is explained
+/// ([`crate::helper_pod::explain_keep_alive_end`]).
 pub fn run_extraction(
     k: &dyn KubeExec,
     items: &[ExtractItem],
     out_dir: &Path,
     pg_image: &str,
+    keep_alive: Duration,
 ) -> Result<()> {
     for item in items {
         match item.kind {
-            DataKind::Pg => extract_pg(k, item, out_dir, pg_image)?,
-            DataKind::Volume => extract_volume(k, item, out_dir)?,
+            DataKind::Pg => extract_pg(k, item, out_dir, pg_image, keep_alive)?,
+            DataKind::Volume => extract_volume(k, item, out_dir, keep_alive)?,
             DataKind::Redis => extract_redis(k, item, out_dir)?,
-            DataKind::JetStream => extract_jetstream(k, item, out_dir)?,
+            DataKind::JetStream => extract_jetstream(k, item, out_dir, keep_alive)?,
         }
     }
     Ok(())
@@ -476,19 +519,27 @@ impl Drop for HelperPodGuard<'_> {
 
 /// Extract a single `Pg` claim.
 ///
-/// 1. Read connection creds from the connection Secret via `k.get_secret_key`.
-/// 2. Apply a pg-dump helper pod with `PGPASSWORD` in its container env.
+/// 1. Read the connection coordinates from the connection Secret via
+///    `k.get_secret_key` — not the password.
+/// 2. Apply a pg-dump helper pod whose container reads `PGPASSWORD` from the
+///    same Secret's `pass` key (the pod runs in the Secret's namespace).
 /// 3. `k.exec_stream_to_file` → `pg_dump -Fc` → stream to
 ///    `out_dir/pg/<ns>/<claim>.dump`.
 /// 4. Delete the pod (best-effort, via `HelperPodGuard` drop).
-fn extract_pg(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path, pg_image: &str) -> Result<()> {
+fn extract_pg(
+    k: &dyn KubeExec,
+    item: &ExtractItem,
+    out_dir: &Path,
+    pg_image: &str,
+    keep_alive: Duration,
+) -> Result<()> {
     let secret_name = &item.source; // status.connectionSecretRef
     let ns = &item.namespace;
     let claim = &item.claim_name;
 
-    // 1. Read the decomposed connection Secret keys.
+    // 1. Read the decomposed connection Secret keys the argv needs. The
+    //    password is not one of them: the container reads it by reference.
     let user = k.get_secret_key(secret_name, ns, "user")?;
-    let pass = k.get_secret_key(secret_name, ns, "pass")?;
     let host = k.get_secret_key(secret_name, ns, "host")?;
     let port = k.get_secret_key(secret_name, ns, "port")?;
     let db = k.get_secret_key(secret_name, ns, "db")?;
@@ -501,7 +552,11 @@ fn extract_pg(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path, pg_image: &s
         namespace: ns,
         k,
     };
-    let spec = pg_dump_pod_spec_with_password(&pod_name, ns, pg_image, &pass);
+    let password = SecretKey {
+        secret: secret_name,
+        key: PG_CONNECTION_PASSWORD_KEY,
+    };
+    let spec = pg_helper_pod_spec(&pod_name, ns, pg_image, password, keep_alive);
     apply_and_wait_pod_ready(k, &spec)?;
 
     // 3. Stream pg_dump output to disk.
@@ -512,8 +567,68 @@ fn extract_pg(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path, pg_image: &s
 
     let owned = pg_dump_argv(&db, &user, &host, &port);
     let argv: Vec<&str> = owned.iter().map(String::as_str).collect();
-    exec_stream_to_file(k, &pod_name, ns, &argv, &dump_path)
+    exec_stream_to_file(
+        k,
+        &pod_name,
+        ns,
+        &argv,
+        &dump_path,
+        Some(PG_DUMP_FIRST_OUTPUT_WITHIN),
+    )
+    .map_err(|e| explain_keep_alive_end(k, &pod_name, ns, e))
+    .map_err(|e| explain_pg_dump_error(e, ns, claim))
     // _guard drops here (or on any earlier return) → delete_pod_best_effort called.
+}
+
+/// Put a sentence in front of a `pg_dump` failure whose cause is not obvious
+/// from the failure's own words; any other error passes through unchanged.
+///
+/// Two failures qualify, and both are a lock held by another session:
+///
+/// * **A table lock** — `--lock-wait-timeout` ran out. `pg_dump` reports it as
+///   a cancelled statement (`canceling statement due to statement timeout`,
+///   with `Query was: LOCK TABLE …` as the detail), which reads like a slow
+///   query rather than a lock. The original text follows the sentence: it
+///   names the tables.
+/// * **Any other lock the dump's catalog reads wait on** — the exec wrote
+///   nothing within [`PG_DUMP_FIRST_OUTPUT_WITHIN`] (see there for why that
+///   means a lock, and why in a database with thousands of tables it can be
+///   table locks too). The exec's own error says only that nothing was written.
+///
+/// Matches on the exec error's text: the lock-timeout words are `pg_dump`'s
+/// stderr, which both `KubeExec` implementations append (the CLI's `kubectl
+/// exec` and the runner's kube-rs exec), and the no-output words are
+/// [`crate::kube::NO_OUTPUT_MARKER`], which both build through
+/// [`crate::kube::no_output_error`].
+pub fn explain_pg_dump_error(err: CliError, ns: &str, claim: &str) -> CliError {
+    let msg = err.to_string();
+    if msg.contains("canceling statement due to statement timeout") && msg.contains("LOCK TABLE") {
+        return CliError::Other(format!(
+            "pg dump of {ns}/{claim} gave up: another session held a lock that conflicts \
+             with the dump's read lock on one of its tables (an ALTER TABLE or other \
+             migration, VACUUM FULL, CLUSTER, or a LOCK TABLE in an open transaction) for \
+             longer than {PG_DUMP_LOCK_WAIT_TIMEOUT}, so pg_dump stopped waiting and no data \
+             was dumped. Run the backup again once that lock is released; \
+             pg_stat_activity shows which session holds it.\n{msg}"
+        ));
+    }
+    if crate::kube::is_no_output_error(&err) {
+        return CliError::Other(format!(
+            "pg dump of {ns}/{claim} gave up: pg_dump wrote nothing for {} minutes. It \
+             writes nothing until it has read the database's whole schema, and what stops \
+             it there is a lock its catalog reads wait on that --lock-wait-timeout does not \
+             cover: a lock on a view, a materialized view or a sequence, held by another \
+             session — a REFRESH MATERIALIZED VIEW that is still running or sits in an open \
+             transaction, or a migration that ran CREATE OR REPLACE VIEW or ALTER SEQUENCE \
+             in a transaction that has not ended. In a database with thousands of tables it \
+             can also be table locks: pg_dump takes them in several LOCK TABLE statements, \
+             each allowed {PG_DUMP_LOCK_WAIT_TIMEOUT}, and waits on them add up. No data was \
+             dumped. pg_locks shows the waiting lock and pg_stat_activity the session holding \
+             it; run the backup again once that session has finished.\n{msg}",
+            PG_DUMP_FIRST_OUTPUT_WITHIN.as_secs() / 60
+        ));
+    }
+    err
 }
 
 /// Extract a single `Volume` (disk / shared-disk) claim.
@@ -523,7 +638,12 @@ fn extract_pg(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path, pg_image: &s
 /// 2. `k.exec_stream_to_file` → `tar c -C /data .` → stream to
 ///    `out_dir/volumes/<ns>/<claim>/data.tar`.
 /// 3. Delete the pod (best-effort, via `HelperPodGuard` drop).
-fn extract_volume(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Result<()> {
+fn extract_volume(
+    k: &dyn KubeExec,
+    item: &ExtractItem,
+    out_dir: &Path,
+    keep_alive: Duration,
+) -> Result<()> {
     let pvc_name = &item.source; // status.volumeClaimRef
     let ns = &item.namespace;
     let claim = &item.claim_name;
@@ -542,6 +662,7 @@ fn extract_volume(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Resul
         images::VOLUME_IMAGE,
         pvc_name,
         true, // read-only for backup
+        keep_alive,
     );
     apply_and_wait_pod_ready(k, &spec)?;
 
@@ -554,7 +675,12 @@ fn extract_volume(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Resul
     let tar_path = dest.join("data.tar");
 
     let argv: Vec<&str> = vec!["tar", "c", "-C", "/data", "."];
-    exec_stream_to_file(k, &pod_name, ns, &argv, &tar_path)
+    // No first-output bound: `tar` writes its first header after one `stat`,
+    // so there is no silent phase to time, and a read stalled on the volume
+    // later is not what such a bound would catch. The run's deadline covers
+    // it (see `PG_DUMP_FIRST_OUTPUT_WITHIN` for the one step that has one).
+    exec_stream_to_file(k, &pod_name, ns, &argv, &tar_path, None)
+        .map_err(|e| explain_keep_alive_end(k, &pod_name, ns, e))
     // _guard drops here (or on any earlier return) → delete_pod_best_effort called.
 }
 
@@ -564,16 +690,22 @@ fn extract_volume(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Resul
 /// Secret, which is where the server coordinates come from. The credentials
 /// are NOT that Secret's: a claim user is denied `$JS.API.STREAM.SNAPSHOT` by
 /// construction (ADR 0061 §4.2 — its delivery subject is caller-chosen, which
-/// made it a read bypass), and the snapshot is the manager user's job. So this
-/// reads `nats-mgr-<ns>` from the namespace NATS runs in, which the `host`
-/// names and nothing else does.
+/// made it a read bypass), and the snapshot is the manager user's job. So the
+/// helper runs in the namespace NATS runs in, which the `host` names and
+/// nothing else does, and its container reads the user and password of
+/// `nats-mgr-<ns>` there, by reference: this never reads them itself.
 ///
 /// The artifact is a tar of what `nats stream backup` writes — `backup.json`
 /// plus `stream.tar.s2` — because `nats stream restore` takes that DIRECTORY,
 /// not a single file. Consumers ride along: the CLI includes them unless told
 /// otherwise, and a stream restored without its consumers would replay every
 /// message to a subscriber that had already processed it.
-fn extract_jetstream(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Result<()> {
+fn extract_jetstream(
+    k: &dyn KubeExec,
+    item: &ExtractItem,
+    out_dir: &Path,
+    keep_alive: Duration,
+) -> Result<()> {
     let ns = &item.namespace;
     let claim = &item.claim_name;
     let stream = &item.source;
@@ -594,18 +726,13 @@ fn extract_jetstream(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Re
         ))
     })?;
 
-    // 2. Manager credentials from that namespace.
+    // 2. Manager credentials from that namespace, by reference.
     let mgr = mgr_secret_name(ns);
-    let user = k.get_secret_key(&mgr, &nats_ns, "user")?;
-    let password = k.get_secret_key(&mgr, &nats_ns, "password")?;
     let url = format!("nats://{host}:{port}");
 
-    // 3. Helper pod beside the server, guard armed before apply-wait.
-    let pod_name = truncate_pod_name(&format!(
-        "bk-js-{}-{}",
-        pod_name_segment(claim),
-        pod_name_segment(stream)
-    ));
+    // 3. Helper pod beside the server, guard armed before apply-wait. The
+    //    server's namespace is shared, so the name carries the claim's.
+    let pod_name = jetstream_helper_pod_name("bk-js", ns, claim, Some(stream));
     let _guard = HelperPodGuard {
         name: pod_name.clone(),
         namespace: &nats_ns,
@@ -616,8 +743,15 @@ fn extract_jetstream(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Re
         &nats_ns,
         images::JETSTREAM_IMAGE,
         &url,
-        &user,
-        &password,
+        SecretKey {
+            secret: &mgr,
+            key: NATS_MGR_USER_KEY,
+        },
+        SecretKey {
+            secret: &mgr,
+            key: NATS_MGR_PASSWORD_KEY,
+        },
+        keep_alive,
     );
     apply_and_wait_pod_ready(k, &spec)?;
 
@@ -633,7 +767,11 @@ fn extract_jetstream(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Re
 
     let script = jetstream_dump_script(stream);
     let argv: Vec<&str> = vec!["sh", "-c", &script];
-    exec_stream_to_file(k, &pod_name, &nats_ns, &argv, &tar_path)
+    // No first-output bound: the script writes nothing until `nats stream
+    // backup` has copied the whole stream, which legitimately takes as long
+    // as the stream is large.
+    exec_stream_to_file(k, &pod_name, &nats_ns, &argv, &tar_path, None)
+        .map_err(|e| explain_keep_alive_end(k, &pod_name, &nats_ns, e))
 }
 
 /// Extract a persistent Redis (Dragonfly) claim's whole-instance snapshot.
@@ -669,8 +807,131 @@ fn extract_redis(k: &dyn KubeExec, item: &ExtractItem, out_dir: &Path) -> Result
         "-c",
         "redis-cli -p 9999 SAVE >/dev/null 2>&1 && tar c -C /dragonfly/snapshots .",
     ];
-    exec_stream_to_file(k, &pod, df_ns, &argv, &tar_path)
+    // No first-output bound: nothing is written until `SAVE` has written the
+    // whole snapshot, which legitimately takes as long as the instance is
+    // large.
+    exec_stream_to_file(k, &pod, df_ns, &argv, &tar_path, None)
 }
+
+/// How long `pg_dump` may wait for the TABLE locks it takes before it reads
+/// any data: its `--lock-wait-timeout`, in PostgreSQL's `statement_timeout`
+/// syntax.
+///
+/// `pg_dump` starts by taking `ACCESS SHARE` on every table it will dump, in
+/// `LOCK TABLE` statements of about 100 KB of qualified table names each
+/// (PostgreSQL 18). That is one statement up to roughly 1,500 to 3,500 tables,
+/// depending on name length, and several beyond: 8,000 tables named
+/// `public.some_app_table_<n>` took three (measured on PostgreSQL 18.6: 100 082,
+/// 100 097 and 22 957 characters). A session holding a conflicting
+/// lock — a migration's `ALTER TABLE`, `VACUUM FULL`, `CLUSTER`, a `LOCK TABLE`
+/// left open in an idle transaction — makes it wait, silently, for as long as
+/// that lock is held. The scheduled runner is a `concurrencyPolicy: Forbid`
+/// CronJob, so while it waits no later scheduled backup starts.
+///
+/// What this bounds, exactly: each `LOCK TABLE` statement, which `pg_dump` runs
+/// under `statement_timeout` set to this value — and only those. A database
+/// that needs several statements can wait this long on each of them in turn
+/// (see [`PG_DUMP_FIRST_OUTPUT_WITHIN`] for what that does). It locks
+/// relations of kind `r` and `p` (plain and partitioned tables); a lock on a
+/// view resolves to its base tables and is bounded too. Directly afterwards
+/// `pg_dump` sets `statement_timeout = 0` and runs the rest of its catalog
+/// reads, and those wait unbounded on a lock held on a VIEW, a MATERIALIZED
+/// VIEW or a SEQUENCE: `pg_get_viewdef` behind a `REFRESH MATERIALIZED VIEW` or
+/// a `CREATE OR REPLACE VIEW` in an open transaction, the sequence read behind
+/// an `ALTER SEQUENCE` (all three reproduced on PostgreSQL 18.6). A
+/// `PGOPTIONS` `lock_timeout` does not help: `pg_dump` resets it when it
+/// connects. [`PG_DUMP_FIRST_OUTPUT_WITHIN`] is what bounds those waits. A
+/// long `COPY` is bounded by neither, by design (measured on PostgreSQL 18: a
+/// `COPY` stalled well past a 1 s bound completed).
+///
+/// Why five minutes: it restores the bound the runner had by accident up to
+/// kube-rs 0.95. `pg_dump -Fc` writes nothing until it has read the schema,
+/// and the client's 295 s read timeout cut any exec stream that stayed silent
+/// that long, so a dump behind a held lock failed after about five minutes.
+/// kube-rs 4 keeps an exec stream alive with 60 s pings, which removed that
+/// cut — see `apprafter-backup`'s `tls` module. `300s` is that bound made
+/// explicit, rounded to a figure the documentation can state, and it applies
+/// to the CLI's `apprafter backup create` as well, which shares this argv.
+///
+/// When it fires, `pg_dump` exits 1 with `canceling statement due to statement
+/// timeout` and a `Query was: LOCK TABLE …` detail naming the tables of the
+/// statement that timed out (every table, when one statement holds them all);
+/// [`explain_pg_dump_error`] turns that into a sentence about the lock.
+pub const PG_DUMP_LOCK_WAIT_TIMEOUT: &str = "300s";
+
+/// How long `pg_dump` may run before it writes the first byte of the dump;
+/// past it, the exec is abandoned and the claim's dump fails.
+///
+/// A custom-format dump (`-Fc`) to a pipe writes NOTHING until `pg_dump` has
+/// read the database's whole schema: the header, the table of contents and
+/// the data are all written when the archive is closed, after every catalog
+/// query has run (measured on PostgreSQL 18.6: zero bytes for as long as a
+/// catalog read waited). So the time to the first byte is exactly the silent
+/// phase in which `pg_dump` can wait on another session's lock — the table
+/// locks [`PG_DUMP_LOCK_WAIT_TIMEOUT`] bounds, and the view, materialized-view
+/// and sequence locks nothing else does. One bound on that time covers every
+/// lock the dump can wait on before it has read a row.
+///
+/// Why ten minutes: it must let the table-lock wait run out first, so a held
+/// table lock keeps reporting `pg_dump`'s own error, which names the tables —
+/// that is the first five minutes. That ordering holds while the table locks
+/// go in one `LOCK TABLE` statement. With several, each statement has its own
+/// five minutes and the waits add up, so statements that each wait just short
+/// of theirs can reach this bound before any of them times out (measured on
+/// PostgreSQL 18.6 with a 3 s lock wait and three holders, one per statement:
+/// the dump failed on the third after 8 s). That takes a database with
+/// thousands of tables and conflicting locks held on them one after another;
+/// the failure then names this bound instead of the tables, and
+/// [`explain_pg_dump_error`] says table locks can be the cause. The other five
+/// minutes are for the rest of the
+/// schema read, which is quick: 6–7 s on PostgreSQL 18 for 10 000 tables with
+/// their sequences and 20 000 indexes, 1 000 views, 1 000 functions and 200
+/// materialized views (a 25 MB table of contents). Five minutes is some forty
+/// times that, room for a much larger schema on a much slower server.
+///
+/// Only the FIRST byte is timed. Once the dump is writing, a large table may
+/// take as long as it needs; the run's own deadline is what bounds that.
+pub const PG_DUMP_FIRST_OUTPUT_WITHIN: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The `PGOPTIONS` every PostgreSQL helper connects with — the `pg_dump` of a
+/// backup or export and the `pg_restore` of a restore
+/// ([`crate::helper_pod::pg_helper_pod_spec`]): the server checks every ten
+/// seconds, while a statement runs, that the client is still there.
+///
+/// A run abandons a dump in two ways, [`PG_DUMP_FIRST_OUTPUT_WITHIN`] and the
+/// runner's stop at its deadline, and both end in deleting the helper pod,
+/// which kills `pg_dump`. That alone does not end its server session.
+/// PostgreSQL notices a closed connection only when it next reads or writes
+/// it, and a session waiting on a lock does neither. The session keeps what
+/// it has already taken (ACCESS SHARE on every table, which the dump locks
+/// first, and a connection slot) until the lock it waits on is released. For a
+/// migration left idle in a transaction, that can be days. And because the
+/// first-output bound ends each stuck run at ten minutes instead of letting it
+/// block the next one, every scheduled run would add another such session.
+///
+/// A restore stopped the same way is worse. `pg_restore --clean` starts with
+/// `DROP TABLE`, which waits for `ACCESS EXCLUSIVE` behind any open
+/// transaction that has read the table, and a queued `ACCESS EXCLUSIVE`
+/// request blocks every later reader of that table too. Measured on PostgreSQL
+/// 18.6: a `pg_restore` killed while its `DROP TABLE` waited behind a reader's
+/// open transaction left the `DROP` queued 20 s later, and a plain `SELECT` on
+/// the table timed out behind it; with the setting the session was gone and
+/// the `SELECT` answered.
+///
+/// `client_connection_check_interval` makes a running statement poll its
+/// socket, a lock wait included. Measured on PostgreSQL 18.6, with a `pg_dump`
+/// waiting in `pg_get_viewdef` behind a `REFRESH MATERIALIZED VIEW` held in an
+/// open transaction and then killed with SIGKILL: without the setting its
+/// session was still waiting, and still holding its table lock, 20 s later;
+/// with it the session was gone 5 s after the kill. `pg_dump` resets
+/// `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout`
+/// and `transaction_timeout` when it connects, and `pg_restore` sets the same
+/// four from the archive, but neither touches this.
+///
+/// The setting needs PostgreSQL 14 or later on Linux, and a server that does
+/// not know it refuses the connection outright. The platform's CNPG clusters
+/// run PostgreSQL 18 (`CNPG_OPERAND_IMAGE` in the provisioner).
+pub const PG_HELPER_PGOPTIONS: &str = "-c client_connection_check_interval=10s";
 
 /// Build the `pg_dump` argument vector for a custom-format dump.
 ///
@@ -682,6 +943,7 @@ pub fn pg_dump_argv(db: &str, user: &str, host: &str, port: &str) -> Vec<String>
         "pg_dump".to_string(),
         "-Fc".to_string(),
         "--compress=0".to_string(),
+        format!("--lock-wait-timeout={PG_DUMP_LOCK_WAIT_TIMEOUT}"),
         "-h".to_string(),
         host.to_string(),
         "-U".to_string(),
@@ -831,6 +1093,432 @@ mod tests {
     }
 
     #[test]
+    fn pg_dump_argv_bounds_the_lock_wait_to_five_minutes() {
+        let argv = pg_dump_argv("appdb", "approle", "hostx", "5432");
+        let flag = argv
+            .iter()
+            .position(|a| a == "--lock-wait-timeout=300s")
+            .unwrap_or_else(|| panic!("argv missing --lock-wait-timeout=300s: {argv:?}"));
+        // The database is the one positional argument and stays last, so the
+        // flag is never read as a database name by a getopt that does not
+        // permute.
+        assert_eq!(argv.last().map(String::as_str), Some("appdb"), "{argv:?}");
+        assert!(flag < argv.len() - 1, "flag after the database: {argv:?}");
+        assert_eq!(
+            argv.iter()
+                .filter(|a| a.starts_with("--lock-wait-timeout"))
+                .count(),
+            1,
+            "{argv:?}"
+        );
+    }
+
+    /// The error `pg_dump` 18 printed when a `LOCK TABLE … IN ACCESS
+    /// EXCLUSIVE MODE` was held past `--lock-wait-timeout` (captured on a
+    /// `postgres:18-alpine` server), as the runner's exec reports it.
+    const PG18_LOCK_TIMEOUT_STDERR: &str = "pg_dump: error: query failed: ERROR:  canceling \
+        statement due to statement timeout\npg_dump: detail: Query was: LOCK TABLE public.t1, \
+        public.t2 IN ACCESS SHARE MODE";
+
+    #[test]
+    fn a_lock_wait_timeout_is_explained_as_a_held_lock() {
+        let raw = CliError::Other(format!(
+            "exec_stream_to_file: exec [\"pg_dump\"] in demo/bk-pg-db failed (status=Some(\"Failure\"), \
+             reason=NonZeroExitCode): command terminated with non-zero exit code\n\
+             command stderr:\n{PG18_LOCK_TIMEOUT_STDERR}"
+        ));
+        let msg = explain_pg_dump_error(raw, "demo", "db").to_string();
+        assert!(msg.starts_with("pg dump of demo/db gave up"), "{msg}");
+        assert!(msg.contains("lock"), "{msg}");
+        assert!(msg.contains("300s"), "states the bound: {msg}");
+        // pg_dump's own text survives: it is what names the tables.
+        assert!(msg.contains("LOCK TABLE public.t1, public.t2"), "{msg}");
+    }
+
+    #[test]
+    fn a_dump_that_wrote_nothing_is_explained_as_a_lock_the_table_bound_does_not_cover() {
+        let raw = crate::kube::no_output_error(
+            "exec_stream_to_file",
+            &["pg_dump", "-Fc"],
+            "demo",
+            "bk-pg-db",
+            PG_DUMP_FIRST_OUTPUT_WITHIN,
+        );
+        let msg = explain_pg_dump_error(raw, "demo", "db").to_string();
+        assert!(msg.starts_with("pg dump of demo/db gave up"), "{msg}");
+        assert!(msg.contains("10 minutes"), "states the bound: {msg}");
+        for cause in [
+            "materialized view",
+            "REFRESH MATERIALIZED VIEW",
+            "CREATE OR REPLACE VIEW",
+            "ALTER SEQUENCE",
+            "--lock-wait-timeout does not",
+        ] {
+            assert!(msg.contains(cause), "names {cause:?}: {msg}");
+        }
+        // Table locks too, in a database large enough that pg_dump takes
+        // them in several statements, each with its own 300s: waits held
+        // just short of that in turn add up past this bound.
+        assert!(msg.contains("thousands of tables"), "{msg}");
+        assert!(msg.contains("LOCK TABLE statements"), "{msg}");
+        // The exec's own words survive: they name the pod.
+        assert!(msg.contains("demo/bk-pg-db"), "{msg}");
+    }
+
+    #[test]
+    fn the_first_output_bound_lets_the_table_lock_wait_run_out_first() {
+        // A held TABLE lock must keep failing with pg_dump's own error, which
+        // names the tables — so the table-lock wait runs out well inside the
+        // first-output bound, with the rest of the schema read on top. That
+        // is one `LOCK TABLE` statement's wait: a database needing several
+        // can add theirs up past the bound (see PG_DUMP_FIRST_OUTPUT_WITHIN).
+        let lock_wait: u64 = PG_DUMP_LOCK_WAIT_TIMEOUT
+            .strip_suffix('s')
+            .and_then(|n| n.parse().ok())
+            .expect("the lock wait is written in seconds");
+        assert!(
+            PG_DUMP_FIRST_OUTPUT_WITHIN.as_secs() >= lock_wait + 300,
+            "{PG_DUMP_FIRST_OUTPUT_WITHIN:?} leaves under five minutes after the {lock_wait}s \
+             table-lock wait for the rest of the schema read"
+        );
+    }
+
+    /// A [`KubeExec`] that records every `exec_stream_to_file` and the
+    /// first-output bound it was given, and serves a fixed connection Secret.
+    #[derive(Default)]
+    struct RecordingKube {
+        execs: std::sync::Mutex<Vec<(String, Option<std::time::Duration>)>>,
+        applied: std::sync::Mutex<Vec<Value>>,
+        /// Every Secret key read, as `(namespace, secret, key)`.
+        secret_reads: std::sync::Mutex<Vec<(String, String, String)>>,
+        /// Every exec is killed by its helper pod's keep-alive running out:
+        /// it fails with exit code 137, and the pod reads as ended.
+        keep_alive_runs_out: bool,
+    }
+
+    impl KubeExec for RecordingKube {
+        fn apply_and_wait_pod_ready(&self, spec: &Value) -> Result<()> {
+            self.applied.lock().unwrap().push(spec.clone());
+            Ok(())
+        }
+        fn exec_stream_to_file(
+            &self,
+            _pod: &str,
+            _ns: &str,
+            argv: &[&str],
+            out: &Path,
+            first_output_within: Option<std::time::Duration>,
+        ) -> Result<()> {
+            self.execs
+                .lock()
+                .unwrap()
+                .push((argv[0].to_string(), first_output_within));
+            if self.keep_alive_runs_out {
+                return Err(CliError::Other(
+                    "exec_stream_to_file: exec failed (status=Some(\"Failure\"), \
+                     reason=NonZeroExitCode): command terminated with non-zero exit code: \
+                     error executing command, exit code 137"
+                        .into(),
+                ));
+            }
+            fs::write(out, b"x").map_err(|e| CliError::Other(e.to_string()))
+        }
+        fn exec_stream_from_file(&self, _: &str, _: &str, _: &[&str], _: &Path) -> Result<()> {
+            unreachable!("extraction never streams into a pod")
+        }
+        fn delete_pod_best_effort(&self, _name: &str, _ns: &str) {}
+        fn get_secret_key(&self, secret: &str, ns: &str, key: &str) -> Result<String> {
+            self.secret_reads.lock().unwrap().push((
+                ns.to_string(),
+                secret.to_string(),
+                key.to_string(),
+            ));
+            Ok(match key {
+                "port" => "5432".into(),
+                "host" => "pg.demo.svc".into(),
+                other => format!("{other}-value"),
+            })
+        }
+        fn get_json(&self, args: &[&str]) -> Result<Option<Value>> {
+            if self.keep_alive_runs_out && args[..2] == ["get", "pods"] {
+                return Ok(Some(json!({
+                    "spec": {"containers": [{"command": ["sleep", "21600"]}]},
+                    "status": {"containerStatuses": [{"state": {"terminated": {"exitCode": 0}}}]}
+                })));
+            }
+            Ok(None)
+        }
+    }
+
+    /// Each helper exec that the keep-alive killed says so, instead of the
+    /// bare exit code 137 — for the dump, the volume copy and the stream.
+    #[test]
+    fn an_extraction_killed_by_its_helpers_keep_alive_says_so() {
+        for claim in [
+            json!({"spec": {"type": "pg"}, "metadata": {"name": "db", "namespace": "demo"},
+                   "status": {"connectionSecretRef": "db-conn"}}),
+            json!({"spec": {"type": "disk"}, "metadata": {"name": "vol", "namespace": "demo"},
+                   "status": {"volumeClaimRef": "pvc"}}),
+        ] {
+            let k = RecordingKube {
+                keep_alive_runs_out: true,
+                ..RecordingKube::default()
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let err = run_extraction(
+                &k,
+                &plan_extraction(std::slice::from_ref(&claim)),
+                dir.path(),
+                images::DEFAULT_PG_IMAGE,
+                crate::helper_pod::DEFAULT_RUN_DEADLINE,
+            )
+            .expect_err("a killed exec fails the extraction");
+            let msg = err.to_string();
+            assert!(msg.contains("keep-alive of 6h ran out"), "{claim}: {msg}");
+            assert!(
+                msg.contains("apprafter backup set deadline"),
+                "{claim}: {msg}"
+            );
+        }
+
+        let k = RecordingKube {
+            keep_alive_runs_out: true,
+            ..RecordingKube::default()
+        };
+        let item = ExtractItem {
+            namespace: "demo".into(),
+            claim_name: "events".into(),
+            kind: DataKind::JetStream,
+            source: "orders".into(),
+            connection: Some("events-conn".into()),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let err = extract_jetstream(
+            &k,
+            &item,
+            dir.path(),
+            crate::helper_pod::DEFAULT_RUN_DEADLINE,
+        )
+        .expect_err("a killed exec fails the stream's dump");
+        assert!(
+            err.to_string().contains("keep-alive of 6h ran out"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn only_the_pg_dump_is_timed_to_its_first_byte() {
+        let k = RecordingKube::default();
+        let items = plan_extraction(&[
+            json!({"spec": {"type": "pg"}, "metadata": {"name": "db", "namespace": "demo"},
+                   "status": {"connectionSecretRef": "db-conn"}}),
+            json!({"spec": {"type": "disk"}, "metadata": {"name": "vol", "namespace": "demo"},
+                   "status": {"volumeClaimRef": "pvc"}}),
+            json!({"spec": {"type": "redis", "persistent": true},
+                   "metadata": {"name": "cache", "namespace": "demo"},
+                   "status": {"instance": "platform-redis-persistent-000"}}),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        run_extraction(
+            &k,
+            &items,
+            dir.path(),
+            images::DEFAULT_PG_IMAGE,
+            crate::helper_pod::DEFAULT_RUN_DEADLINE,
+        )
+        .unwrap();
+
+        let execs = k.execs.lock().unwrap().clone();
+        assert_eq!(
+            execs,
+            vec![
+                ("pg_dump".to_string(), Some(PG_DUMP_FIRST_OUTPUT_WITHIN)),
+                ("tar".to_string(), None),
+                ("sh".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_helper_pod_an_extraction_applies_lives_for_the_run_deadline() {
+        // The `sleep` ending kills every exec in the pod with 137, so the
+        // keep-alive caps each extraction: it must be the one it was given
+        // (helper_keep_alive of the run's deadline), not the fixed hour it was.
+        let k = RecordingKube::default();
+        let items = plan_extraction(&[
+            json!({"spec": {"type": "pg"}, "metadata": {"name": "db", "namespace": "demo"},
+                   "status": {"connectionSecretRef": "db-conn"}}),
+            json!({"spec": {"type": "disk"}, "metadata": {"name": "vol", "namespace": "demo"},
+                   "status": {"volumeClaimRef": "pvc"}}),
+            json!({"spec": {"type": "jetstream"}, "metadata": {"name": "js", "namespace": "demo"},
+                   "status": {"connectionSecretRef": "js-conn",
+                              "streams": {"declared": ["orders"]}}}),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let twelve_hours = std::time::Duration::from_secs(43200);
+        // The jetstream item reads its NATS namespace off `host`; the fake's
+        // `pg.demo.svc` names `demo`.
+        run_extraction(
+            &k,
+            &items,
+            dir.path(),
+            images::DEFAULT_PG_IMAGE,
+            twelve_hours,
+        )
+        .unwrap();
+
+        let applied = k.applied.lock().unwrap().clone();
+        assert_eq!(applied.len(), 3, "{applied:?}");
+        for spec in applied {
+            assert_eq!(
+                spec["spec"]["containers"][0]["command"],
+                json!(["sleep", "43200"]),
+                "{}",
+                spec["metadata"]["name"]
+            );
+            assert_eq!(
+                spec["metadata"]["labels"]["apprafter.io/backup-helper"], "true",
+                "the runner's stop deletes only pods carrying this label"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pg_dump_helper_has_the_server_end_an_abandoned_dumps_session() {
+        // A dump abandoned while its server session waits on a lock — the
+        // first-output bound, the runner's stop — leaves that session behind
+        // unless the server polls for the dead client: it holds ACCESS SHARE
+        // on every table and a connection slot until the lock holder ends.
+        let k = RecordingKube::default();
+        let items = plan_extraction(&[json!({
+            "spec": {"type": "pg"}, "metadata": {"name": "db", "namespace": "demo"},
+            "status": {"connectionSecretRef": "db-conn"}
+        })]);
+        let dir = tempfile::tempdir().unwrap();
+        run_extraction(
+            &k,
+            &items,
+            dir.path(),
+            images::DEFAULT_PG_IMAGE,
+            crate::helper_pod::DEFAULT_RUN_DEADLINE,
+        )
+        .unwrap();
+
+        let applied = k.applied.lock().unwrap().clone();
+        assert_eq!(applied.len(), 1, "{applied:?}");
+        let env = &applied[0]["spec"]["containers"][0]["env"];
+        let value_of = |name: &str| {
+            env.as_array()
+                .into_iter()
+                .flatten()
+                .filter(|e| e["name"] == name)
+                .map(|e| e["value"].clone())
+                .collect::<Vec<_>>()
+        };
+        // Exactly this text: the server refuses a connection whose startup
+        // options name a setting it does not know, so a misspelt name would
+        // fail every dump rather than being ignored.
+        assert_eq!(
+            value_of("PGOPTIONS"),
+            vec![json!("-c client_connection_check_interval=10s")],
+            "{env}"
+        );
+        assert_eq!(value_of("PGPASSWORD"), vec![Value::Null], "{env}");
+    }
+
+    /// WI-383: an extraction never reads a credential and never writes one
+    /// into a helper pod. Each helper's container reads it from the Secret
+    /// that holds it, in the helper's own namespace — the claim's connection
+    /// Secret for a dump, `nats-mgr-<ns>` beside the NATS server for a
+    /// stream — so the Pod object, which `get pods` shows, carries only a
+    /// reference. It used to carry the password as a literal env value.
+    #[test]
+    fn an_extraction_reads_no_credential_and_its_helpers_only_reference_one() {
+        let k = RecordingKube::default();
+        let items = plan_extraction(&[
+            json!({"spec": {"type": "pg"}, "metadata": {"name": "db", "namespace": "demo"},
+                   "status": {"connectionSecretRef": "db-conn"}}),
+            json!({"spec": {"type": "disk"}, "metadata": {"name": "vol", "namespace": "demo"},
+                   "status": {"volumeClaimRef": "pvc"}}),
+            json!({"spec": {"type": "jetstream"}, "metadata": {"name": "js", "namespace": "demo"},
+                   "status": {"connectionSecretRef": "js-conn",
+                              "streams": {"declared": ["orders"]}}}),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        run_extraction(
+            &k,
+            &items,
+            dir.path(),
+            images::DEFAULT_PG_IMAGE,
+            crate::helper_pod::DEFAULT_RUN_DEADLINE,
+        )
+        .unwrap();
+
+        // What was read: the coordinates, never the password or the manager
+        // Secret. (The fake's `host`, `pg.demo.svc`, puts NATS in `demo`.)
+        let reads = k.secret_reads.lock().unwrap().clone();
+        let read = |ns: &str, secret: &str, key: &str| {
+            (ns.to_string(), secret.to_string(), key.to_string())
+        };
+        assert_eq!(
+            reads,
+            vec![
+                read("demo", "db-conn", "user"),
+                read("demo", "db-conn", "host"),
+                read("demo", "db-conn", "port"),
+                read("demo", "db-conn", "db"),
+                read("demo", "js-conn", "host"),
+                read("demo", "js-conn", "port"),
+            ]
+        );
+
+        // What each helper pod carries: a reference per credential, and no
+        // value the fake Secret could have given (it answers `<key>-value`).
+        let applied = k.applied.lock().unwrap().clone();
+        let secret_ref_of = |spec: &Value, var: &str| {
+            spec["spec"]["containers"][0]["env"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|e| e["name"] == var)
+                .map(|e| e["valueFrom"]["secretKeyRef"].clone())
+        };
+        assert_eq!(applied.len(), 3, "{applied:?}");
+        assert_eq!(
+            secret_ref_of(&applied[0], "PGPASSWORD"),
+            Some(json!({"name": "db-conn", "key": "pass"}))
+        );
+        assert_eq!(applied[2]["metadata"]["namespace"], "demo");
+        assert_eq!(
+            secret_ref_of(&applied[2], "NATS_USER"),
+            Some(json!({"name": "nats-mgr-demo", "key": "user"}))
+        );
+        assert_eq!(
+            secret_ref_of(&applied[2], "NATS_PASSWORD"),
+            Some(json!({"name": "nats-mgr-demo", "key": "password"}))
+        );
+        for spec in &applied {
+            let text = spec.to_string();
+            for secret_value in ["pass-value", "password-value"] {
+                assert!(!text.contains(secret_value), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn other_pg_dump_errors_pass_through_unchanged() {
+        for text in [
+            "pg_dump: error: server version mismatch",
+            // A statement timeout that is not the lock phase is not a lock.
+            "ERROR:  canceling statement due to statement timeout",
+            "Query was: LOCK TABLE public.t1 IN ACCESS SHARE MODE",
+        ] {
+            let msg = explain_pg_dump_error(CliError::Other(text.into()), "demo", "db").to_string();
+            assert_eq!(msg, text);
+        }
+    }
+
+    #[test]
     fn truncate_pod_name_stays_under_64_chars() {
         let long = "bk-pg-".to_string() + &"a".repeat(100);
         let t = truncate_pod_name(&long);
@@ -943,6 +1631,109 @@ mod tests {
             script.contains("'orders'"),
             "stream must be quoted: {script}"
         );
+    }
+
+    /// A pod name the apiserver takes: at most 63 characters of `[a-z0-9-]`,
+    /// starting and ending with a letter or digit.
+    fn is_dns_label(name: &str) -> bool {
+        name.len() <= 63
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && !name.starts_with('-')
+            && !name.ends_with('-')
+    }
+
+    /// The finding: the JetStream helpers run in the NATS server's namespace,
+    /// which every application namespace shares, and were named by the claim
+    /// alone — `shop/js` and `blog/js` collided on one pod.
+    #[test]
+    fn jetstream_helper_names_keep_claims_of_one_name_in_two_namespaces_apart() {
+        for stream in [Some("orders"), None] {
+            let shop = jetstream_helper_pod_name("bk-js", "shop", "js", stream);
+            let blog = jetstream_helper_pod_name("bk-js", "blog", "js", stream);
+            assert_ne!(shop, blog, "{stream:?}");
+            assert!(shop.starts_with("bk-js-shop-js"), "{shop}");
+        }
+        // The same inputs give the same name: a leftover is found by it.
+        assert_eq!(
+            jetstream_helper_pod_name("rs-js", "atm", "worker-js", None),
+            jetstream_helper_pod_name("rs-js", "atm", "worker-js", None)
+        );
+        assert_ne!(
+            jetstream_helper_pod_name("rs-js", "atm", "worker-js", None),
+            jetstream_helper_pod_name("bk-js", "atm", "worker-js", None)
+        );
+    }
+
+    /// Folding and cutting make names read alike; the hash keeps them apart,
+    /// and every result is a name the apiserver takes.
+    #[test]
+    fn jetstream_helper_names_stay_unique_and_valid_where_folding_or_cutting_meet() {
+        let long = "a".repeat(70);
+        let pairs = [
+            (("a-b", "c", Some("s")), ("a", "b-c", Some("s"))),
+            (
+                ("ns", "js", Some("orders_dlq")),
+                ("ns", "js", Some("orders-dlq")),
+            ),
+            (
+                ("ns", long.as_str(), Some("one")),
+                ("ns", long.as_str(), Some("two")),
+            ),
+            (("ns", "c", Some("x")), ("ns", "c-x", None)),
+        ];
+        for ((ns1, c1, s1), (ns2, c2, s2)) in pairs {
+            let one = jetstream_helper_pod_name("bk-js", ns1, c1, s1);
+            let two = jetstream_helper_pod_name("bk-js", ns2, c2, s2);
+            assert_ne!(one, two);
+            for name in [&one, &two] {
+                assert!(is_dns_label(name), "{name} ({} chars)", name.len());
+            }
+        }
+        // A long name is cut, never to a trailing `-` before the hash.
+        let cut = jetstream_helper_pod_name("bk-js", "ns", &format!("{}-b", "a".repeat(44)), None);
+        assert_eq!(cut.len(), 63 - 1, "{cut}");
+        assert!(!cut.contains("--"), "{cut}");
+    }
+
+    /// Both dumps of two claims named `js` in two namespaces are applied, in
+    /// the NATS server's namespace, as two pods.
+    #[test]
+    fn a_jetstream_dump_names_its_helper_by_the_claims_namespace() {
+        let k = RecordingKube::default();
+        let dir = tempfile::tempdir().unwrap();
+        for ns in ["shop", "blog"] {
+            let item = ExtractItem {
+                namespace: ns.into(),
+                claim_name: "js".into(),
+                kind: DataKind::JetStream,
+                source: "orders".into(),
+                connection: Some("js-conn".into()),
+            };
+            extract_jetstream(
+                &k,
+                &item,
+                dir.path(),
+                crate::helper_pod::DEFAULT_RUN_DEADLINE,
+            )
+            .unwrap();
+        }
+        let applied = k.applied.lock().unwrap().clone();
+        let names: Vec<&str> = applied
+            .iter()
+            .map(|s| s["metadata"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                jetstream_helper_pod_name("bk-js", "shop", "js", Some("orders")),
+                jetstream_helper_pod_name("bk-js", "blog", "js", Some("orders")),
+            ]
+        );
+        assert_ne!(names[0], names[1]);
+        // Both beside the server: the fake's `host` names `demo`.
+        assert!(applied.iter().all(|s| s["metadata"]["namespace"] == "demo"));
     }
 
     // =======================================================================

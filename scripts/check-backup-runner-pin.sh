@@ -38,9 +38,11 @@
 # chart release for that would be noise the next person learns to skip.
 #
 # Usage: check-backup-runner-pin.sh [remote]   (default: origin)
-# In CI: needs full history + tags (actions/checkout fetch-depth: 0).
+# In CI: .github/workflows/lint.yml `version-guards` (fetch-depth: 0).
 
 set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=lib/published-tag.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/published-tag.sh"
 
 SOURCE="platform-stack/cue/platform.cue"
 REMOTE="${1:-origin}"
@@ -61,7 +63,15 @@ tag="apprafter-backup/v${version}"
 # check noisy enough to be ignored.
 paths=(cli/apprafter-backup cli/backup-core)
 
-if ! git ls-remote --tags --exit-code "$REMOTE" "refs/tags/${tag}" >/dev/null 2>&1; then
+# Published, in flight, or undecided — see scripts/lib/published-tag.sh for
+# why "the remote could not be asked" is no longer read as "not published".
+resolve_published_tag "$REMOTE" "apprafter-backup/v" "$version"
+if [[ "$TAG_STATE" == undecided ]]; then
+    version_guard_undecided "$TAG_WHY" || exit 1
+    exit 0
+fi
+
+if [[ "$TAG_STATE" == in-flight ]]; then
     # Not published (yet). Whether that is fine depends on ONE thing: the runner
     # version IS `cli/Cargo.toml` `workspace.package.version` — that is what
     # release-backup-runner.yml publishes from. So a pin naming exactly that
@@ -92,19 +102,20 @@ EOF
     exit 1
 fi
 
-if ! git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
-    git fetch --quiet "$REMOTE" "refs/tags/${tag}:refs/tags/${tag}" 2>/dev/null || {
-        echo "::warning::could not fetch ${tag} for the diff — skipping the check." >&2
-        exit 0
-    }
-fi
-
-if git diff --quiet "refs/tags/${tag}..HEAD" -- "${paths[@]}"; then
+if # Compare the tag against the INDEX, not HEAD. As a pre-commit hook this runs
+# BEFORE the commit exists, so a `tag..HEAD` diff cannot see the very change
+# being committed — the guard passes, and only fires on the NEXT commit, by
+# which point the incomplete one has already landed. (Found 2026-09-22: an
+# `argocd-cue-cmp/Dockerfile` edit committed with no `version.cue` bump, waved
+# through by this hook and caught afterwards by `just lint`.) `--cached`
+# compares the tag to the index, which in CI equals HEAD and at pre-commit time
+# is exactly the tree about to become the commit.
+git diff --cached --quiet "refs/tags/${tag}" -- "${paths[@]}"; then
     echo "OK: the backup runner is unchanged since ${tag}, which the chart pins."
     exit 0
 fi
 
-changed="$(git diff --name-only "refs/tags/${tag}..HEAD" -- "${paths[@]}" | head -20)"
+changed="$(git diff --cached --name-only "refs/tags/${tag}" -- "${paths[@]}" | head -20)"
 latest="$(git ls-remote --tags "$REMOTE" 'refs/tags/apprafter-backup/v*' \
     | sed 's|.*refs/tags/apprafter-backup/||' | sort -V | tail -1)"
 cat >&2 <<EOF

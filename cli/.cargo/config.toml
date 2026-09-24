@@ -3,7 +3,8 @@
 # Turn off the two startup checks for everything cargo runs.
 #
 # `apprafter` consults api.github.com (new-release courtesy notice) and shells
-# out to `kubectl` (node disk-pressure banner) before dispatching any command,
+# out to `kubectl` (node disk-pressure banner) before dispatching any command
+# that reaches beyond the machine it runs on (platform-cli/src/startup.rs),
 # caching each verdict to disk for hours. The integration suite spawns the real
 # binary in nineteen test files, so those checks ran hundreds of times per
 # `cargo test` — slowly, and against whatever the developer's cache happened to
@@ -15,7 +16,8 @@
 # workspace measurements came out 0.14pp apart with nothing changed in between,
 # and a number that moves on its own cannot be the 80% gate it is meant to be.
 #
-# Not `force = true`: a developer who wants the real behaviour can still set the
-# variable to something else in their own environment.
+# Not `force = true`: a value already in the environment is left as it is. Any
+# value turns the checks off, "0" included; the one test that needs them on
+# (platform-cli/tests/startup_checks_test.rs) clears its child's environment.
 [env]
 APPRAFTER_SKIP_STARTUP_CHECKS = "1"

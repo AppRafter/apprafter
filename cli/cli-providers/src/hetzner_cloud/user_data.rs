@@ -142,6 +142,26 @@ pub fn swap_eligible_from_env(base: bool) -> bool {
 pub const CLUSTER_CIDR_DUAL_STACK: &str = "10.42.0.0/16,fd00:42::/64";
 pub const SERVICE_CIDR_DUAL_STACK: &str = "10.43.0.0/16,fd00:43::/112";
 
+/// The k3s release channel every node installs from — a MINOR channel, not
+/// `stable` and not an exact version.
+///
+/// Until 2026-09 the install ran bare (`curl -sfL https://get.k3s.io | sh -`),
+/// which resolves the `stable` channel AT PROVISION TIME. Nothing recorded
+/// what that produced, so two clusters built weeks apart silently ran
+/// different Kubernetes minors, and a node replaced after an upstream
+/// promotion came back on a different minor than its siblings. That is the
+/// upgrade this platform is supposed to OWN arriving by accident.
+///
+/// Pinning the MINOR rather than the patch is the deliberate middle: `v1.36`
+/// still resolves to the newest 1.36.x, so Kubernetes CVE fixes keep arriving
+/// without anyone editing this file, while a jump to 1.37 becomes a commit.
+/// An exact-version pin would have frozen the security patches too.
+///
+/// Moving this is a real upgrade: it must clear the same compatibility matrix
+/// the platform components do (Cilium, cert-manager and CNPG each publish a
+/// tested Kubernetes range), so bump it with the same care as a chart version.
+pub const K3S_CHANNEL: &str = "v1.36";
+
 /// Absolute path of the k3s config file that carries the kubelet
 /// node reservations. k3s reads it at install and on every start.
 pub const K3S_CONFIG_PATH: &str = "/etc/rancher/k3s/config.yaml";
@@ -543,7 +563,7 @@ pub fn build_k3s_user_data(opts: &K3sBootstrapOptions) -> String {
         //    unit is still `enable`d, so `systemctl start k3s` below suffices
         //    (Q13 — NOT `enable --now`).
         out.push_str(&format!(
-            "  - 'curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true INSTALL_K3S_EXEC=\"{install_exec}\" sh -'\n"
+            "  - 'curl -sfL https://get.k3s.io | INSTALL_K3S_CHANNEL={K3S_CHANNEL} INSTALL_K3S_SKIP_START=true INSTALL_K3S_EXEC=\"{install_exec}\" sh -'\n"
         ));
         out.push_str("  - systemctl daemon-reload\n");
         // 2. Run the FAIL-SOFT swap block: a non-zero exit only logs + records
@@ -559,7 +579,7 @@ pub fn build_k3s_user_data(opts: &K3sBootstrapOptions) -> String {
         // install script starts k3s itself. Reservations + OOM drop-in still
         // apply (they ship via write_files above, unconditionally).
         out.push_str(&format!(
-            "  - 'curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC=\"{install_exec}\" sh -'\n"
+            "  - 'curl -sfL https://get.k3s.io | INSTALL_K3S_CHANNEL={K3S_CHANNEL} INSTALL_K3S_EXEC=\"{install_exec}\" sh -'\n"
         ));
         out.push_str("  - systemctl daemon-reload\n");
     }
@@ -652,6 +672,53 @@ mod tests {
         assert!(
             f2b_idx < k3s_idx,
             "fail2ban must enable BEFORE k3s install (k3s pulls in containerd which adds its own iptables; fail2ban startup needs to land in a clean state first).\n{s}"
+        );
+    }
+
+    #[test]
+    fn every_k3s_install_path_pins_the_minor_channel() {
+        // BOTH branches of build_k3s_user_data run their own `curl | sh`, and
+        // before 2026-09 neither passed a channel — so the Kubernetes minor
+        // was whatever `stable` resolved to at provision time. A test that
+        // only checked the swap-eligible path would have let the other one
+        // drift back, so this asserts on every install line it can find
+        // rather than on one rendering.
+        for swap_eligible in [true, false] {
+            let ud = build_k3s_user_data(&K3sBootstrapOptions {
+                dual_stack: true,
+                swap_eligible,
+            });
+            let install_lines: Vec<&str> =
+                ud.lines().filter(|l| l.contains("get.k3s.io")).collect();
+            assert!(
+                !install_lines.is_empty(),
+                "no k3s install line at all (swap_eligible={swap_eligible})\n{ud}"
+            );
+            for line in install_lines {
+                assert!(
+                    line.contains(&format!("INSTALL_K3S_CHANNEL={K3S_CHANNEL}")),
+                    "a k3s install line does not pin the channel, so this node \
+                     would take whatever `stable` resolves to at provision time \
+                     (swap_eligible={swap_eligible}):\n{line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_k3s_channel_is_a_minor_not_stable_and_not_an_exact_version() {
+        // The whole point of the pin is that a MINOR bump becomes a commit
+        // while patch fixes keep arriving on their own. `stable` gives up the
+        // first half; an exact `v1.36.4` gives up the second.
+        assert!(
+            K3S_CHANNEL.starts_with('v'),
+            "channel should look like v<major>.<minor>, got {K3S_CHANNEL:?}"
+        );
+        assert_eq!(
+            K3S_CHANNEL.split('.').count(),
+            2,
+            "channel must name a MINOR (v1.36), not `stable` and not an exact \
+             patch version — got {K3S_CHANNEL:?}"
         );
     }
 

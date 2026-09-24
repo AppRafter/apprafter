@@ -14,11 +14,11 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 
-use oci_distribution::client::ClientConfig;
-use oci_distribution::errors::{OciDistributionError, OciErrorCode};
-use oci_distribution::manifest::OciManifest;
-use oci_distribution::secrets::RegistryAuth;
-use oci_distribution::{Client, Reference};
+use oci_client::client::ClientConfig;
+use oci_client::errors::{OciDistributionError, OciErrorCode};
+use oci_client::manifest::OciManifest;
+use oci_client::secrets::RegistryAuth;
+use oci_client::{Client, Reference};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -160,11 +160,9 @@ pub async fn fetch_compatibility_doc_with_self_version(
 ) -> Result<(CompatibilityDoc, Option<semver::Version>), CompatError> {
     let bare = upstream_url.strip_prefix("oci://").unwrap_or(upstream_url);
     let with_tag = format!("{bare}:{version_tag}");
-    let reference: Reference = with_tag
-        .parse()
-        .map_err(|e: oci_distribution::ParseError| {
-            CompatError::InvalidReference(with_tag.clone(), e.to_string())
-        })?;
+    let reference: Reference = with_tag.parse().map_err(|e: oci_client::ParseError| {
+        CompatError::InvalidReference(with_tag.clone(), e.to_string())
+    })?;
 
     let client = Client::new(ClientConfig::default());
     // Classify the MANIFEST pull's error structurally: a missing
@@ -659,7 +657,7 @@ mod tests {
     // drift fails the test instead of silently regressing the
     // not-found → fallback decision.
 
-    use oci_distribution::errors::{OciEnvelope, OciError, OciErrorCode};
+    use oci_client::errors::{OciEnvelope, OciError, OciErrorCode};
 
     fn registry_err(code: OciErrorCode, message: &str) -> OciDistributionError {
         OciDistributionError::RegistryError {

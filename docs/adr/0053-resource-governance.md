@@ -8,6 +8,20 @@ now `apprafter node prep`, which applies these reservations *and* provisions
 host swap. The reservation values and rationale below stand unchanged; only
 the command name and its now-expanded scope moved.
 
+**Amended 2026-09-23** — the Tier-1 budget did not count the off-site backup
+runner, and on a ~4GB node with a Postgres and a persistent Dragonfly instance
+the runner's 256Mi request found no room. The runner now requests a measured
+128Mi, and what a ~4GB node holds with backups on is stated in [the
+amendment](#amendment-the-backup-runner-in-the-tier-1-budget-2026-09-23) at the
+end. The rest of the decision stands.
+
+**Amended 2026-09-24** — the runner's memory was measured again against a real
+bucket, where it was higher than against the local store of the first
+measurement, and restic now uploads in smaller pack files; and the runner's
+pods get a PriorityClass below the default, so they give way to every other
+pod. Decision 2 still holds for what it decided; see [the second
+amendment](#amendment-the-backup-runner-gives-way-2026-09-24).
+
 ADR for subphase 2.16d (`plan.md` §2.16d). Records the resource-governance
 model — pod QoS strategy, node reservations, and what is deferred — since
 2.16e (recommendation-based right-sizing) builds on it. Ships as a
@@ -89,6 +103,12 @@ killer selects victims by `oom_score_adj`, which the kubelet derives from
 process the kernel kills under live memory pressure. Guaranteed QoS already
 gives the backends the lowest `oom_score_adj`; a PriorityClass would add a
 knob that does not address the incident.
+
+> **Amended 2026-09-24.** The platform now has one PriorityClass: the backup
+> runner's, *below* the default. It is about the scheduling order, which is what
+> this section says priority governs; it protects no backend, and the OOM
+> killer's choice stays QoS-derived. See [the
+> amendment](#amendment-the-backup-runner-gives-way-2026-09-24).
 
 ### 3. Node reservations (kube/system-reserved, eviction-hard, OOMScoreAdjust)
 
@@ -216,6 +236,196 @@ Negative / neutral:
   `ServiceProvider.spec.config`, never a direct VPA target. Recording this
   now so 2.16e does not re-derive it.
 
+## Amendment — the backup runner in the Tier-1 budget (2026-09-23) {#amendment-the-backup-runner-in-the-tier-1-budget-2026-09-23}
+
+The budget-close in §6 counted the platform and a representative application
+with `needs.pg` and `needs.redis`. It did not count the off-site backup runner:
+a Job the schedule starts every night, whose pod asks the scheduler for memory
+of its own. "The budget closed with headroom" was true of the pods that were
+counted and not of the node as it runs.
+
+The walks before the platform-stack 0.2.80 release found it on the ~4GB machine
+Tier 1 is sized for. Allocatable memory is 1958Mi (3814Mi less the 1500Mi
+system reservation, the 256Mi kube reservation and the 100Mi eviction
+threshold). Two clusters, each running the platform, the shared Postgres
+(256Mi, Guaranteed) and one persistent Dragonfly instance (320Mi, Guaranteed),
+had requested 1792Mi with three small applications and 1824Mi with six: 91 and
+93 %. That left 166Mi and 134Mi. The runner requested 256Mi, so its pod stayed
+`Pending` with `Insufficient memory` and no preemption victim, and no nightly
+backup ran. Before 0.2.80 gave the backup Job a deadline, that one Job also
+held the schedule, so no later backup started either.
+
+**Decision.** The capacity model stays: no pod that reserves room for the
+runner, no larger minimum machine. Instead:
+
+1. **The runner's request is measured, and it keeps a limit.** A backup run's
+   memory is restic's; the runner itself holds under 2 MiB of anonymous memory
+   (7 to 8 MiB resident, counting the pages of its own binary), and every
+   figure below is anonymous memory too. restic sizes its concurrency by the
+   CPUs it sees, which with no CPU limit is every CPU of the node (a first
+   backup of a 2 GB database peaked at about 145 MiB of anonymous
+   memory on 2 CPUs and at 695 MiB on 32), and its memory grows with the
+   repository's index, by about 0.1 MiB per thousand blobs past a hundred
+   thousand, not with the size of the data, which only adds page cache the
+   limit reclaims. The chart therefore pins restic to two CPUs
+   (`GOMAXPROCS=2`) and has its garbage collector keep the heap near 96 MiB
+   (`GOMEMLIMIT=96MiB`).
+
+   The first measurement of those settings ran on kind against a MinIO on the
+   same machine, and it was low. On the ~4GB machine itself, against Hetzner
+   Object Storage, a first backup of a 403 MB database peaked at 155 MiB. The
+   difference is the link, not the data. restic uploads the repository in pack
+   files, 16 MiB by default, and up to five at once; its S3 backend asks the S3
+   library for each pack's MD5 and gives it a reader the library cannot
+   rewind, so the library reads each pack whole into memory before it sends
+   it. Against a store on the same machine each upload ends before the next
+   pack is full; against a real bucket all five are in flight. Measured again
+   with restic 0.18.1 held to two CPUs, on the same data each time, a first
+   backup of 400 MB of incompressible data peaked at 107 MiB of anonymous
+   memory against a local MinIO, at 164 MiB against that MinIO behind a 3 MB/s
+   link and 161 MiB behind a 20 MB/s one, and at 171 MiB against Hetzner
+   Object Storage; a first backup of 2 GB there at 175 MiB. Compressible data
+   was lower but not low (123 MiB against Hetzner), since its packs still wait
+   for the link. One upload at a time (`s3.connections=1`) held it to 98 MiB at
+   less than half the upload speed; the smallest pack restic makes, 4 MiB, to
+   100 MiB, at the same upload speed behind either link and 16 % slower against
+   Hetzner from a host where each request's round trip, not the link, was the
+   limit. The chart sets that pack size (`RESTIC_PACK_SIZE=4`); an existing
+   repository keeps its larger packs, and new data takes about three times as
+   many objects (83 instead of 25 for 400 MB).
+
+   With the three settings, against Hetzner Object Storage, a first backup of
+   400 MB peaked at 100 MiB of anonymous memory and one of 2 GB at 107 MiB
+   (111 MiB behind a 20 MB/s link); a later run that uploaded 40 MB at 93 MiB,
+   and compressible data at 94 MiB. A later run with nothing new peaked at
+   47 MiB; that one ran with restic's default pack size, which does not
+   matter when nothing new is uploaded (it added 2.6 KB). From the kind
+   measurement, where the link did not count: the weekly check at
+   137 MiB on a repository of 1.51 million blobs, and the largest run
+   measured, a first backup into that repository followed by the in-Job
+   prune, at 200 MiB. The backup and check Jobs request **128Mi** of memory
+   and 100m of CPU, and are limited to **384Mi**. The request covers a first
+   backup of 2 GB into a real bucket: restic's 107 MiB against Hetzner Object
+   Storage, or 111 MiB behind a 20 MB/s link, and the runner's own 2 MiB
+   leave 19 or 15 MiB of it, before the kernel memory the container is also
+   charged (2 to 10 MiB in the kind measurement). That is roughly 10 to
+   15 MiB to spare, depending on the link, and the later runs measured there
+   leave more; no first backup larger than 2 GB was measured. The limit is
+   1.9 times the largest run measured, and without the memory settings a
+   backup into that repository peaked at 280 MiB and passed under it. A run
+   above its request uses memory no other pod was promised, and under node
+   memory pressure it is the first the kubelet evicts (see the
+   [second amendment](#amendment-the-backup-runner-gives-way-2026-09-24)).
+
+   The same measurement found the staging volume unused: the runner staged in
+   the container's writable layer, where `stagingSizeLimit` bounded nothing.
+   The backup Job now stages on the staging volume, and both Jobs keep
+   restic's cache and temporary files there; the runner stops a run whose
+   volume outgrows the limit with an error that names the limit and what to
+   change, and the Job fails at once instead of retrying into the same limit.
+2. **A backup that cannot run is reported, not masked.** `apprafter backup
+   run` stops waiting on a pod no node has room for and says so with the
+   scheduler's reason, `apprafter backup status` shows such a Job as
+   `Pending, cannot be scheduled` rather than `Running`, and the cluster's own
+   status reports a backup that failed or never started.
+3. **The limit that remains is documented** where an operator sizes a machine.
+
+**What a ~4GB node holds with backups on.** The platform (1120Mi of requests
+on the 0.2.80 walk), the shared Postgres, one Dragonfly instance and about four
+small applications at the 32Mi seed request, with the runner's 128Mi fitting
+in what is left: the two clusters above would have 38Mi and 6Mi to spare with
+it placed. A few more small applications, a second environment of one, an
+application whose request its recommendation has raised, or a further backend
+instance does not fit beside it: an ephemeral `needs.redis` class is another
+320Mi Dragonfly instance and `needs.jetstream` requests 384Mi, more than the
+node has left even before the runner is counted. A node in that position still
+runs its applications, but its nightly backup cannot start. The public pages that state this are [Choosing the
+machine](../operator-guide/choosing-the-machine.md#how-much-memory) and [Node
+reservations and swap](../how-it-works/node-reservations-and-swap.md#what-a-4-gb-node-holds);
+the troubleshooting entry for a runner that does not fit is [the backup
+runner's pod cannot be
+scheduled](../operator-guide/backup-restore.md#runner-unschedulable).
+
+The numbers the chart ships are asserted by `scripts/check-backup-render.sh`,
+so a change to them is a change to this budget.
+
+## Amendment — the backup runner gives way (2026-09-24) {#amendment-the-backup-runner-gives-way-2026-09-24}
+
+A test upgrade of a ~4GB cluster from platform 0.2.79 to 0.2.80 found the
+runner in the way of the platform itself. A runner that had waited for room
+since before the upgrade was placed the moment Argo CD stopped its application
+controller for a rollout, in the room that pod had just given back, and the
+new application controller then waited for the whole backup. Only the pods in
+`kube-system` had a priority; the runner and every AppRafter, Argo CD, backend
+and application pod had the default, 0. Among pods of one priority the
+scheduler places the one that has waited longest, and a pod may preempt only
+pods of a *lower* priority, so the application controller had no way past the
+runner.
+
+**Decision.** The platform chart renders one PriorityClass with the backup
+resources, `apprafter-backup-runner`: value **-1**, `preemptionPolicy: Never`,
+not the global default. The pods of the backup and check Jobs name it, and so
+do those of `apprafter backup run`, which copies the backup's Job template.
+
+- **Any other pod is placed before a waiting runner.** Of two pods waiting for
+  the same room, the one with the higher priority is placed first.
+- **A pod that needs the room of a running runner preempts it.** The scheduler
+  deletes the runner's pod with its 90-second grace period; the runner records
+  the failure as it does at its deadline (`run was stopped by Kubernetes
+  (SIGTERM)`), deletes its helper pods and passes the signal on to restic,
+  which removes its lock; and the Job retries it, the retry waiting for room
+  like any runner. The preempted attempt counts against the Job's backoff
+  limit, and the Job's deadline still bounds the whole run. The cluster
+  status reports the preempted attempt at once (`BackupHealthy` `False`,
+  `RunnerPreempted`), as it reports a runner killed at its limit, and keeps
+  reporting it after the pod is gone, so a node whose other pods keep taking
+  the runner's room shows failing backups rather than healthy ones (Decision
+  2 of the first amendment). The same holds for a runner a node drain or a
+  deletion stops (`RunnerStopped`).
+- **A runner never preempts anything** (`Never`). Nothing is below it.
+- **Under node memory pressure** the kubelet evicts the pods that use more than
+  they request, lowest priority first, so a runner above its request goes
+  before any other pod above its own. The kernel's OOM killer still chooses by
+  QoS class (Decision 2).
+
+Measured on kind with the rendered objects and the real runner image, on a
+node left 64Mi short of the runner's request:
+
+| Sequence | Runner at priority 0, as before | Runner at -1 |
+| --- | --- | --- |
+| A runner waits; a platform pod created 20 seconds later waits too; room for one of them appears | the runner is placed, and the platform pod waits for the whole run (`No preemption victims found for incoming pod`) | the platform pod is placed; the runner goes on waiting |
+| A runner waits alone; room appears and it is placed; then a platform pod that needs that room is created (the test upgrade's sequence) | the platform pod waits for the whole run | the runner is preempted and the platform pod placed within a second; the runner recorded the stop; the Job's next pod waits for room |
+
+**Why -1 and not lower.** The Kubernetes cluster autoscaler treats a pod below
+-10 (its default `expendable-pods-priority-cutoff`) as expendable and adds no
+node for it. On a tier that scales, a runner waiting for room should still get
+a node. Every value below 0 gives the same order against the platform's pods.
+
+**Why the runner, and not a class above the default for the platform.** A class
+for the platform would have to be given to every component, and it would let
+platform pods preempt applications. The runner is the one pod that can wait:
+a backup a few minutes late loses nothing, and one stopped and retried loses
+only its time.
+
+**The helper pods keep the default.** The runner's helper pods (the
+`pg_dump` and volume pods in the application namespaces, and the NATS pod
+beside its server) request no memory. They never compete for room, removing one frees none, so the scheduler
+would not choose one to preempt, and as BestEffort pods they are already the
+first the kernel kills. The CLI also creates helper pods for a restore, on
+clusters where backup may be off and the class does not exist; a pod that names
+a missing class is refused.
+
+**Rollout.** The class is in sync wave -30, before anything that can start a
+runner, since a pod naming a class that does not exist yet is refused at
+creation. A class's value and preemption policy cannot be changed in place: a
+different value needs a new name. Priority is resolved when a pod is created,
+so a runner pod left from 0.2.79 keeps priority 0; the 0.2.80 compatibility
+note tells a cluster whose runner is stuck `Pending` to delete that Job before
+it upgrades.
+
+`scripts/check-backup-render.sh` asserts the class, its properties and that both
+Jobs' pods name it.
+
 ## Owner
 
 Andrey Ryahovskiy.
@@ -232,6 +442,12 @@ Andrey Ryahovskiy.
   budget).
 - If the supported Tier-1 minimum node changes: re-run the baseline walk and
   re-check the D2 budget-close.
+- If the platform's own pods ever get a PriorityClass: keep the backup
+  runner's below every one of them.
+- If restic moves a minor version, or a repository's index grows past the
+  1.5 million blobs it was measured at: re-measure the backup runner's peak.
+  Its request and limit are sized from restic 0.18.1, whose memory grows with
+  the index, not with the data.
 
 ## References
 

@@ -15,23 +15,23 @@
     "seed": "bun --env-file=.env run src/seed/seed.ts"
   },
   "dependencies": {
-    "payload": "^3.0.0",
-    "@payloadcms/db-postgres": "^3.0.0",
-    "@payloadcms/next": "^3.0.0",
-    "@payloadcms/richtext-lexical": "^3.0.0",
-    "@payloadcms/ui": "^3.0.0",
-    "next": "^15.0.0",
+    "payload": "^3.90.1",
+    "@payloadcms/db-postgres": "^3.90.1",
+    "@payloadcms/next": "^3.90.1",
+    "@payloadcms/richtext-lexical": "^3.90.1",
+    "@payloadcms/ui": "^3.90.1",
+    "next": "^16.3.3",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "pg": "^8.13.0",
-    "sharp": "^0.33.0",
-    "nodemailer": "^6.9.0",
+    "sharp": "^0.35.4",
+    "nodemailer": "^9.1.1",
     "graphql": "^16.9.0",
-    "undici": "7.24.4"
+    "undici": "7.29.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "@types/nodemailer": "^6.4.0",
+    "@types/nodemailer": "^7.0.0",
     "@types/pg": "^8.11.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",

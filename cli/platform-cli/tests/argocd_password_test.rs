@@ -95,8 +95,9 @@ fn argocd_password_decrypts_age_blob_using_identity_at_apprafter_age_key() {
     let plaintext = "argo-admin-hunter2";
     let mut armored_buf: Vec<u8> = Vec::new();
     {
-        let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(recipient)];
-        let encryptor = age::Encryptor::with_recipients(recipients).unwrap();
+        // age 0.11: an iterator of &dyn Recipient, validated eagerly.
+        let recipient_ref: &dyn age::Recipient = &recipient;
+        let encryptor = age::Encryptor::with_recipients(std::iter::once(recipient_ref)).unwrap();
         let armored = age::armor::ArmoredWriter::wrap_output(
             &mut armored_buf,
             age::armor::Format::AsciiArmor,

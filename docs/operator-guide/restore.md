@@ -24,7 +24,9 @@ apprafter restore <repo> [--target <name>] [--snapshot <id>] \
 `restore` replays a `backup create` artifact into a **running, already
 bootstrapped** target cluster. The target defaults to the active target; pass
 `--target <name>` to pick another registered target. `--snapshot` selects a
-specific snapshot (default `latest`).
+specific run (default `latest`) by the id of any of its snapshots: a per-claim
+snapshot restores its whole run, and a snapshot of a run that never finished is
+refused before anything is downloaded.
 
 `latest` stays inside one cluster's history. When the target has snapshots of
 its own in the repository, `latest` is the freshest of **those**. When it does
@@ -220,6 +222,18 @@ every Argo CD Application whose auto-sync it disabled:
   that puts the replica counts and auto-sync back.
 ```
 
+Interrupting it with Ctrl-C (or SIGTERM) deletes the helper pod it was loading
+data through — only the helper pods this restore created — and exits with
+status 130 (143 for SIGTERM), within fifteen seconds. It undoes nothing else:
+the applications stay down as above. The lines naming them are printed when
+the restore reaches them before it exits, which it is given a moment to do; a
+shorter line saying that applications it scaled down stay down is printed
+either way. A second Ctrl-C exits at once, without deleting the helper pod.
+Nothing new starts after the signal: a restore interrupted before it scaled
+an application down leaves that application running. With `--reprovision`,
+Ctrl-C while the new cluster is still being provisioned ends the command at
+once.
+
 **Re-running the same command is the remedy.** Its final step is the one that
 restores the replica counts and re-enables auto-sync, so a second run that
 reaches the end leaves the cluster correct.
@@ -341,7 +355,7 @@ Two checks are worth running before you trust the off-site backup, mapping to
 the design's Verify items:
 
 - **Confirm your provider honors a prefix-scoped delete.** With the
-  `enforce: operator` scoped credential, actively **test** that the cluster
+  scoped cluster credential, actively **test** that the cluster
   credential can delete an object under `locks/*` but is **refused** deleting an
   object under `data/` (or `snapshots/`). If the deny doesn't hold, your
   provider can't express the append-only guarantee — fall back to

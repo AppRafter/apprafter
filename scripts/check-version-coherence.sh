@@ -21,6 +21,15 @@
 #
 # ## What it checks
 #
+#   0. each operator chart's `version` == its own `appVersion`. The chart is
+#      published under `version` (release-operator.yml packages it with
+#      `helm package`, which names the artefact after Chart.yaml `version`),
+#      while platform-stack pins it by that same string. A bump that moved
+#      only `appVersion` (7b3f4f2, caught by the wave-1 upgrade walk on
+#      2026-09-23) would re-publish the OLD chart version and never produce
+#      the pinned one: Argo CD's `helm pull --version vX` then fails, the
+#      operator and webhook Applications sit in ComparisonError on the old
+#      images, and the root Application still reports Synced/Healthy.
 #   1. platform-stack's operator pin == the operator chart's appVersion
 #   2. platform-stack's webhook pin == the webhook chart's appVersion
 #   3. the compatibility entry for `currentVersion` names that same operator
@@ -30,11 +39,14 @@
 #
 # 1-3 are local and need no network. 4 asks the remote whether the current
 # chart version is already published; when it is not, the bump is in flight
-# and there is nothing to check.
+# and there is nothing to check. When the remote cannot answer, check 4 did
+# not run: a failure in CI, a warning locally (scripts/lib/published-tag.sh).
 #
 # Usage: check-version-coherence.sh [remote]   (default: origin)
 
 set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=lib/published-tag.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/published-tag.sh"
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
@@ -56,13 +68,15 @@ read_cue_field() { sed -n "s/^[[:space:]]*$2:[[:space:]]*\"\([^\"]*\)\".*/\1/p" 
 
 operator_app="$(read_yaml_field operator/charts/apprafter-operator/Chart.yaml appVersion)"
 webhook_app="$(read_yaml_field operator/charts/apprafter-admission-webhook/Chart.yaml appVersion)"
+operator_chart="$(read_yaml_field operator/charts/apprafter-operator/Chart.yaml version)"
+webhook_chart="$(read_yaml_field operator/charts/apprafter-admission-webhook/Chart.yaml version)"
 operator_pin="$(read_cue_field platform-stack/cue/component_apprafter-operator.cue version)"
 webhook_pin="$(read_cue_field platform-stack/cue/component_admission-webhook.cue version)"
 cuecmp_version="$(read_cue_field argocd-cue-cmp/version.cue version)"
 current_version="$(sed -n 's/^currentVersion:[[:space:]]*#Version[[:space:]]*&[[:space:]]*"\([^"]*\)".*/\1/p' \
     platform-stack/cue/platform.cue | head -1)"
 
-for v in operator_app webhook_app operator_pin webhook_pin cuecmp_version current_version; do
+for v in operator_app webhook_app operator_chart webhook_chart operator_pin webhook_pin cuecmp_version current_version; do
     if [[ -z "${!v:-}" ]]; then
         echo "::error::could not read ${v} — a version literal moved or changed shape" >&2
         exit 2
@@ -81,13 +95,28 @@ compat_operator="$(awk -v ver="\"${current_version}\"" '
 ' platform-stack/cue/compatibility.cue)"
 
 echo "==> version pins"
+note "operator chart version" "$operator_chart"
 note "operator chart appVersion" "$operator_app"
+note "webhook chart version" "$webhook_chart"
 note "webhook chart appVersion" "$webhook_app"
 note "platform-stack operator pin" "$operator_pin"
 note "platform-stack webhook pin" "$webhook_pin"
 note "platform-stack currentVersion" "$current_version"
 note "compatibility operatorVersion" "${compat_operator:-<missing>}"
 note "argocd-cue-cmp version" "$cuecmp_version"
+
+# --- 0: a chart is published under its `version` -------------------------
+if [[ "$operator_chart" != "$operator_app" ]]; then
+    bad "the operator chart declares version ${operator_chart} but appVersion ${operator_app}.
+release-operator.yml publishes the chart under \`version\`, and platform-stack pins it by that
+string, so chart ${operator_app} would never exist and clusters would stay on the old operator
+while the root Application reports Synced/Healthy.
+Fix: operator/charts/apprafter-operator/Chart.yaml — move \`version\` with \`appVersion\`"
+fi
+if [[ "$webhook_chart" != "$webhook_app" ]]; then
+    bad "the admission-webhook chart declares version ${webhook_chart} but appVersion ${webhook_app}.
+Fix: operator/charts/apprafter-admission-webhook/Chart.yaml — move \`version\` with \`appVersion\`"
+fi
 
 # --- 1-3: the pins must agree --------------------------------------------
 if [[ "$operator_pin" != "$operator_app" ]]; then
@@ -116,24 +145,40 @@ fi
 # source — but it lives outside `platform-stack/`, where the chart's own
 # drift guard looks. Without this, bumping the sidecar publishes an image
 # no chart points at.
-tag="platform-stack/v${current_version}"
-if git ls-remote --tags --exit-code "$REMOTE" "refs/tags/${tag}" >/dev/null 2>&1; then
-    if ! git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
-        git fetch --quiet "$REMOTE" "refs/tags/${tag}:refs/tags/${tag}" 2>/dev/null || true
-    fi
-    if git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
-        if ! git diff --quiet "${tag}" HEAD -- 'argocd-cue-cmp/version.cue'; then
+#
+# Published, in flight, or undecided — scripts/lib/published-tag.sh. This used
+# to swallow a failed fetch of a PUBLISHED tag with `|| true` and then skip the
+# comparison without a word, and to read an unreachable remote as "in flight".
+#
+# The diff is against the INDEX (`--cached`), for the reason the four bump
+# guards give (GOTCHA-8): as a pre-commit hook this runs before the commit
+# exists, so a `tag..HEAD` diff cannot see a version.cue bump being committed.
+# In CI the index is HEAD.
+resolve_published_tag "$REMOTE" "platform-stack/v" "$current_version"
+tag="$TAG"
+case "$TAG_STATE" in
+    published)
+        if ! git diff --cached --quiet "refs/tags/${tag}" -- 'argocd-cue-cmp/version.cue'; then
             bad "argocd-cue-cmp/version.cue changed since ${tag} was published, but currentVersion is
 still ${current_version}. The chart reads that file at render time, so the new sidecar image
 would be published with no chart pointing at it and clusters would keep the old one.
 Fix: bump currentVersion in platform-stack/cue/platform.cue, add its compatibility entry."
         fi
-    fi
-else
-    echo "  note: ${tag} not on ${REMOTE} yet — chart bump in flight, sidecar check skipped"
-fi
+        ;;
+    in-flight)
+        echo "  note: ${tag} not on ${REMOTE} yet — chart bump in flight, sidecar check skipped"
+        ;;
+    *)
+        version_guard_undecided "$TAG_WHY" || fail=1
+        sidecar_unchecked=1
+        ;;
+esac
 
 if [[ "$fail" -ne 0 ]]; then
     exit 1
 fi
-echo "version coherence OK: operator, webhook, compatibility and sidecar pins agree"
+if [[ -n "${sidecar_unchecked:-}" ]]; then
+    echo "version coherence OK for checks 0-3: operator, webhook and compatibility pins agree (check 4, the sidecar, did NOT run)"
+else
+    echo "version coherence OK: operator, webhook, compatibility and sidecar pins agree"
+fi

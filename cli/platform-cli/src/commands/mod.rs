@@ -21,6 +21,7 @@ pub mod destroy;
 pub mod doctor;
 pub mod firewall_spec;
 pub mod hcloud;
+pub(crate) mod helper_interrupt;
 pub mod import;
 pub mod init;
 pub mod k8s_helpers;

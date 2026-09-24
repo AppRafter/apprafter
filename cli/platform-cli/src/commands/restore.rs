@@ -44,7 +44,9 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::commands::backup::KubectlExec;
-use backup_core::helper_pod::{pg_dump_pod_spec, volume_pod_spec};
+use backup_core::helper_pod::{
+    explain_keep_alive_end, pg_helper_pod_spec, volume_pod_spec, SecretKey,
+};
 use backup_core::KubeExec;
 use base64::Engine as _;
 use cli_core::{CliError, Result};
@@ -114,6 +116,12 @@ pub(crate) const PRE_RESTORE_REPLICAS_ANNOTATION: &str = "apprafter.io/pre-resto
 /// consumer, so waiting for Bound would deadlock). 60 × 10s = 10 min.
 const CLAIM_READY_ATTEMPTS: u32 = 60;
 const CLAIM_READY_BACKOFF_SECS: u64 = 10;
+
+/// What an interrupted restore says, after the helper pods it deleted, about
+/// what it leaves as it is.
+const RESTORE_INTERRUPT_NOTE: &str = "  applications this restore had already scaled to zero \
+     stay down, with Argo CD auto-sync off: run the same restore command again to the end to \
+     bring them back";
 
 // ---------------------------------------------------------------------------
 // Internal types
@@ -600,6 +608,11 @@ pub fn run_restore(
     keep_backup_schedule: bool,
     discard_backup_schedule: bool,
 ) -> Result<()> {
+    // First, so it is dropped last: Ctrl-C deletes the helper pods this
+    // restore created, and only those (`helper_interrupt`; see the note on
+    // signals below). Installed by the first step that works in the target
+    // cluster ([`installs_the_interrupt`]), not here.
+    let mut interruptible: Option<crate::commands::helper_interrupt::StopGuard> = None;
     reject_conflicting_modes(reprovision, data_only)?;
 
     // 0. External binaries, before the credential gate below (D11 / 2.22a —
@@ -678,17 +691,44 @@ pub fn run_restore(
     // interruption hint below then sees the partial state the steps already
     // wrote into the cluster, whichever of them failed.
     //
-    // THE ERROR PATH ONLY — signals are deliberately NOT handled. A default
-    // Ctrl-C kills the process without unwinding, so neither this hint nor any
-    // `Drop` guard runs. A SIGINT handler could print the same lines, but it
-    // could not safely undo a half-issued kubectl from another thread, so it
-    // would buy a message and a second exit path. The durable half of the
-    // answer is the [`PRE_RESTORE_REPLICAS_ANNOTATION`] instead: it is in the
-    // cluster before the scale-to-zero it describes, so the recorded count
-    // survives a signal, a severed connection and a kill -9 alike, and the
-    // re-run recovers with or without anything having been printed.
-    let outcome = (|| -> Result<()> {
-        for step in &steps {
+    // Signals and restore state are handled apart, on purpose (WI-383):
+    //
+    // * A SIGINT or SIGTERM runs the interrupt of `helper_interrupt`
+    //   (installed at the top of this function), and it does ONE thing: it
+    //   deletes the helper pods this restore created — by uid, so never a pod
+    //   of the same name it did not create — and exits. Deleting one's own
+    //   helper is idempotent and cannot hurt anything else, while each one
+    //   left behind would sit there running `sleep` for six hours.
+    // * It does NOT undo restore state. Reversing a half-applied restore from
+    //   another thread, over a kubectl the same Ctrl-C has half-killed, is
+    //   not something a handler can do safely. The durable answer is the
+    //   [`PRE_RESTORE_REPLICAS_ANNOTATION`]: it is in the cluster before the
+    //   scale-to-zero it describes, so the recorded count survives a signal,
+    //   a severed connection and a kill -9 alike, and the re-run recovers
+    //   with or without anything having been printed.
+    // * Nor does THIS thread do anything more after the signal. The signal
+    //   does not stop it: a SIGTERM sent to this process alone (`timeout`,
+    //   systemd, a cancelled CI job) leaves the kubectl or restic it is
+    //   waiting on running, and the thread would carry on with the next step
+    //   — scale the applications down after the user stopped the restore —
+    //   for as long as the interrupt gives it before the exit. So no step
+    //   starts after the signal ([`run_restore_steps`]), and within a step
+    //   every kubectl and restic it would start refuses
+    //   (`helper_interrupt::refuse_if_interrupted`).
+    //
+    // This hint is the error path's. After an interrupt it is printed only if
+    // this thread gets here before the interrupt exits (it waits a moment for
+    // that: `helper_interrupt::UNWIND_BOUND`); the interrupt prints its own
+    // line about what a restore leaves down (`RESTORE_INTERRUPT_NOTE`).
+    let outcome = run_restore_steps(
+        &steps,
+        &crate::commands::helper_interrupt::interrupted,
+        &mut |step| {
+            if installs_the_interrupt(step) && interruptible.is_none() {
+                interruptible = Some(crate::commands::helper_interrupt::install(Some(
+                    RESTORE_INTERRUPT_NOTE,
+                )));
+            }
             // The Reprovision step provisions + bootstraps a fresh cluster in the
             // target (topology + cloud token come from the target's local config,
             // exactly as `apprafter up` — R2), then resolves the now-cached
@@ -700,7 +740,7 @@ pub fn run_restore(
                 );
                 crate::commands::bootstrap_all::run(target, false, server_type)?;
                 kc = Some(ensure_kubeconfig_tempfile_for_target(target)?);
-                continue;
+                return Ok(());
             }
             let kc = kc.as_ref().ok_or_else(|| {
                 CliError::Other("internal: kubeconfig unresolved before a restore step".into())
@@ -801,9 +841,9 @@ pub fn run_restore(
                     resume_workloads(&app_replicas, &suspended_argo, kc.path())?;
                 }
             }
-        }
-        Ok(())
-    })();
+            Ok(())
+        },
+    );
 
     // A restore that stopped partway leaves the cluster mid-restore, and until
     // now said nothing about it: the operator saw one error and a dead
@@ -828,6 +868,38 @@ pub fn run_restore(
         println!("{line}");
     }
     Ok(())
+}
+
+/// Run the restore's `steps` in order through `run`, and start none once
+/// `interrupted` says the process has had its SIGINT or SIGTERM: the step
+/// under way when the signal came is the last one this thread runs, and each
+/// kubectl and restic within it refuses as well
+/// (`helper_interrupt::refuse_if_interrupted`). `interrupted` is
+/// [`crate::commands::helper_interrupt::interrupted`] outside the tests.
+fn run_restore_steps(
+    steps: &[RestoreStep],
+    interrupted: &dyn Fn() -> bool,
+    run: &mut dyn FnMut(&RestoreStep) -> Result<()>,
+) -> Result<()> {
+    for step in steps {
+        if interrupted() {
+            return Err(crate::commands::helper_interrupt::interrupted_error());
+        }
+        run(step)?;
+    }
+    Ok(())
+}
+
+/// Whether `step` is one the restore runs with its interrupt installed
+/// (`helper_interrupt::install`): every step but `Reprovision`.
+///
+/// `Reprovision` provisions and bootstraps the cluster in-process — Hetzner
+/// API calls, helm, kubectl — and no helper pod can exist before it ends, so
+/// the interrupt would have nothing to delete there while its stop let the
+/// provisioning carry on for as long as it waited. Without it, a signal
+/// there ends the process at once, as it always has.
+fn installs_the_interrupt(step: &RestoreStep) -> bool {
+    !matches!(step, RestoreStep::Reprovision)
 }
 
 // ---------------------------------------------------------------------------
@@ -894,6 +966,21 @@ fn restore_artifact_tree(
     let run =
         backup_core::restore::resolve_run_snapshots(&listing, requested_snapshot, this_cluster_uid)
             .map_err(CliError::Other)?;
+    // `latest` is the newest COMPLETE run. A newer one that did not finish is
+    // named, so the operator knows the newest backup is not what is replayed.
+    let zone = crate::commands::backup::readers_zone();
+    for line in crate::commands::backup::passed_over_lines(
+        &run.passed_over,
+        &format!("{}, which this restore replays", short_id(&run.commit)),
+        &chrono::Local,
+        zone.as_deref(),
+    ) {
+        println!("{line}");
+    }
+    // A named per-claim snapshot resolves to its run's commit snapshot.
+    if let Some(line) = named_claim_line(&run) {
+        println!("{line}");
+    }
 
     restic.restore_snapshot(&run.commit, restore_root)?;
     let dd = find_data_dir(restore_root)?;
@@ -918,6 +1005,24 @@ fn restore_artifact_tree(
         }
     }
     Ok(dd)
+}
+
+/// What a restore says when the snapshot it was given does not complete its
+/// run: it replays the whole run, from a commit snapshot that is not the one
+/// named. `None` when the named snapshot is the commit point. Pure.
+fn named_claim_line(run: &backup_core::restore::RunSnapshots) -> Option<String> {
+    let named = run.resolved_from.as_deref()?;
+    Some(format!(
+        "  snapshot {} is one of its run's per-claim snapshots and carries no manifest.json; \
+         a restore replays the whole run, from its commit snapshot {}.",
+        short_id(named),
+        short_id(&run.commit)
+    ))
+}
+
+/// The eight-character short form restic prints for a snapshot id.
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
 }
 
 /// Locate the `data/` directory inside the restic restore target.
@@ -2053,6 +2158,9 @@ fn wait_claims_ready_with(
 /// into its freshly-provisioned backend.
 fn load_data(data_dir: &Path, manifest: &BackupManifest, kubeconfig: &Path) -> Result<()> {
     let k = KubectlExec::new(kubeconfig.to_path_buf());
+    // Each load helper pod reads how long it keeps itself alive — the most
+    // one load may take, since a restore has no Job deadline — right before
+    // it is built (restore_helper_keep_alive).
     // pg: data/pg/<ns>/<claim>.dump
     load_pg_dumps(data_dir, &k, kubeconfig)?;
     // volumes: data/volumes/<ns>/<name>/data.tar
@@ -2063,6 +2171,23 @@ fn load_data(data_dir: &Path, manifest: &BackupManifest, kubeconfig: &Path) -> R
     // the NATS wire, messages and consumers together (2.6d-6).
     load_jetstream(data_dir, &k, kubeconfig)?;
     Ok(())
+}
+
+/// How long a restore's load helper pod keeps itself alive, and so the most
+/// one load may take, since a restore has no Job deadline: the target
+/// cluster's backup deadline, never less than six hours however short a
+/// frequent schedule has made it ([`backup_core::engine::read_helper_keep_alive`]).
+/// It was a fixed hour, then the deadline alone, which killed a long
+/// `pg_restore` at ten minutes on a cluster backing up every fifteen; a load
+/// killed by it is explained rather than left as exit code 137.
+///
+/// Read by each helper's builder ([`run_pg_restore`], [`load_one_volume`],
+/// [`restore_claim_streams`]) right before it builds the pod, not once for the
+/// whole restore and passed down: the rest of a restore is bound to `kubectl`,
+/// so the builders are where the tests reach, and a keep-alive handed to them
+/// is one the tests would never see sized. One PlatformStack read per helper.
+fn restore_helper_keep_alive(k: &dyn KubeExec) -> Result<std::time::Duration> {
+    backup_core::engine::read_helper_keep_alive(k)
 }
 
 /// One dumped stream on disk: `jetstream/<ns>/<claim>/<stream>.tar`.
@@ -2173,7 +2298,9 @@ fn jetstream_restore_script(stream: &str) -> String {
 /// coordinates come from the RESTORED claim's connection Secret (the fresh
 /// ones, never the backed-up ones — the same rule the pg loader follows), and
 /// the credentials from `nats-mgr-<ns>`, because a claim user is denied the
-/// snapshot API by construction (ADR 0061 §4.2).
+/// snapshot API by construction (ADR 0061 §4.2). The helper's container reads
+/// those by reference, in the NATS namespace where that Secret is; the
+/// restore never reads them itself (see `backup_core::helper_pod`).
 fn load_jetstream(data_dir: &Path, k: &dyn KubeExec, kubeconfig: &Path) -> Result<()> {
     let artifacts = discover_stream_artifacts(data_dir);
     if artifacts.is_empty() {
@@ -2198,37 +2325,74 @@ fn load_jetstream(data_dir: &Path, k: &dyn KubeExec, kubeconfig: &Path) -> Resul
                  (claim {ns}/{claim}): expected <service>.<namespace>.svc"
             ))
         })?;
-        let mgr = backup_core::extract::mgr_secret_name(&ns);
-        let user = k.get_secret_key(&mgr, &nats_ns, "user")?;
-        let password = k.get_secret_key(&mgr, &nats_ns, "password")?;
+        let server = NatsServer {
+            namespace: nats_ns,
+            url: format!("nats://{host}:{port}"),
+            manager_secret: backup_core::extract::mgr_secret_name(&ns),
+        };
+        restore_claim_streams(k, &ns, &claim, &server, &streams)?;
+    }
+    Ok(())
+}
 
-        let pod_name = format!("rs-js-{}", backup_core::extract::pod_name_segment(&claim));
-        let spec = backup_core::helper_pod::nats_pod_spec(
-            &pod_name,
-            &nats_ns,
-            backup_core::images::JETSTREAM_IMAGE,
-            &format!("nats://{host}:{port}"),
-            &user,
-            &password,
+/// Where one claim's streams are replayed: the NATS server's namespace and
+/// URL, and the Secret there holding the manager credentials of the claim's
+/// namespace (`nats-mgr-<ns>`).
+struct NatsServer {
+    namespace: String,
+    url: String,
+    manager_secret: String,
+}
+
+/// Replay one claim's streams through a helper pod beside the server.
+///
+/// The pod is deleted on every return path by [`PodCleanupGuard`], armed
+/// BEFORE the apply like the pg and volume loaders'. It used to be deleted by
+/// hand after a failed stream and at the end, which left out a failed Ready
+/// wait: the pod stayed, and since a helper pod's spec cannot change in place
+/// and a `Completed` one never becomes Ready again, every later jetstream
+/// restore of the claim failed on it until someone deleted it.
+fn restore_claim_streams(
+    k: &dyn KubeExec,
+    ns: &str,
+    claim: &str,
+    server: &NatsServer,
+    streams: &[StreamArtifact],
+) -> Result<()> {
+    // The server's namespace is shared by every application namespace, so
+    // the name carries the claim's (and fits the 63-character limit).
+    let pod_name = backup_core::extract::jetstream_helper_pod_name("rs-js", ns, claim, None);
+    let _guard = PodCleanupGuard {
+        name: pod_name.clone(),
+        namespace: server.namespace.clone(),
+        k,
+    };
+    let spec = backup_core::helper_pod::nats_pod_spec(
+        &pod_name,
+        &server.namespace,
+        backup_core::images::JETSTREAM_IMAGE,
+        &server.url,
+        SecretKey {
+            secret: &server.manager_secret,
+            key: backup_core::extract::NATS_MGR_USER_KEY,
+        },
+        SecretKey {
+            secret: &server.manager_secret,
+            key: backup_core::extract::NATS_MGR_PASSWORD_KEY,
+        },
+        restore_helper_keep_alive(k)?,
+    );
+    k.apply_and_wait_pod_ready(&spec)?;
+
+    for artifact in streams {
+        let script = jetstream_restore_script(&artifact.stream);
+        let argv: Vec<&str> = vec!["sh", "-c", &script];
+        k.exec_stream_from_file(&pod_name, &server.namespace, &argv, &artifact.path)
+            .map_err(|e| explain_keep_alive_end(k, &pod_name, &server.namespace, e))?;
+        println!(
+            "  ✓ stream restored: {ns}/{claim} → {} (messages + consumers)",
+            artifact.stream
         );
-        k.apply_and_wait_pod_ready(&spec)?;
-
-        for artifact in &streams {
-            let script = jetstream_restore_script(&artifact.stream);
-            let argv: Vec<&str> = vec!["sh", "-c", &script];
-            let outcome = k.exec_stream_from_file(&pod_name, &nats_ns, &argv, &artifact.path);
-            if outcome.is_err() {
-                // Tear the pod down before surfacing, so a failed stream does
-                // not also leave a helper behind in the operator's namespace.
-                k.delete_pod_best_effort(&pod_name, &nats_ns);
-            }
-            outcome?;
-            println!(
-                "  ✓ stream restored: {ns}/{claim} → {} (messages + consumers)",
-                artifact.stream
-            );
-        }
-        k.delete_pod_best_effort(&pod_name, &nats_ns);
     }
     Ok(())
 }
@@ -2327,9 +2491,10 @@ fn discover_pg_dumps(data_dir: &Path) -> Vec<(String, String, PathBuf)> {
 /// Load one pg dump into a freshly-provisioned claim.
 ///
 /// L3: resolve the claim's CURRENT `status.connectionSecretRef` and read
-/// user/pass/host/port/db from THAT (the post-provision Secret), never the
-/// creds embedded in the backup. L2: `pg_restore` reads the dump on stdin via
-/// `exec_stream_from_file`; `PGPASSWORD` is injected into the helper pod env.
+/// user/host/port/db from THAT (the post-provision Secret), never the creds
+/// embedded in the backup. L2: `pg_restore` reads the dump on stdin via
+/// `exec_stream_from_file`; the helper's container reads `PGPASSWORD` from
+/// the same Secret's `pass` by reference.
 fn load_one_pg(
     ns: &str,
     claim: &str,
@@ -2389,19 +2554,26 @@ fn connection_secret_name(claim_json: &Value, ns: &str, claim: &str) -> Result<S
         })
 }
 
-/// The connection parameters of a freshly-provisioned pg claim.
+/// The connection parameters of a freshly-provisioned pg claim: the four
+/// that go on `pg_restore`'s command line, and the Secret the helper's
+/// container reads the password from (see `backup_core::helper_pod`).
 struct PgConnection {
     user: String,
-    pass: String,
     host: String,
     port: String,
     db: String,
+    /// The connection Secret, in the claim's namespace, whose
+    /// [`backup_core::extract::PG_CONNECTION_PASSWORD_KEY`] the helper's
+    /// `PGPASSWORD` reads.
+    secret: String,
 }
 
-/// Read the five connection keys out of a pg claim's connection Secret, naming
-/// the missing one when the Secret is incomplete. Every key is REQUIRED: a
+/// Read the connection keys out of a pg claim's connection Secret, naming the
+/// missing one when the Secret is incomplete. Every key is REQUIRED: a
 /// silently-defaulted host or db would point `pg_restore` at the wrong database
-/// and report success.
+/// and report success. The password is only checked for, not kept: the
+/// helper's container reads it from the Secret itself, and a Secret without it
+/// would otherwise surface as a container that cannot start.
 fn pg_connection_from_secret(
     secret: &BTreeMap<String, Vec<u8>>,
     ns: &str,
@@ -2417,12 +2589,14 @@ fn pg_connection_from_secret(
                 ))
             })
     };
+    let user = get("user")?;
+    get(backup_core::extract::PG_CONNECTION_PASSWORD_KEY)?;
     Ok(PgConnection {
-        user: get("user")?,
-        pass: get("pass")?,
+        user,
         host: get("host")?,
         port: get("port")?,
         db: get("db")?,
+        secret: secret_name.to_string(),
     })
 }
 
@@ -2449,27 +2623,10 @@ fn pg_restore_argv(conn: &PgConnection) -> Vec<String> {
     ]
 }
 
-/// The pg helper pod spec (a network pod — the pg_dump image carries
-/// `pg_restore`) with `PGPASSWORD` injected so `pg_restore` never prompts for a
-/// password and hangs the restore.
-fn pg_helper_pod_spec(pod_name: &str, ns: &str, pg_image: &str, pass: &str) -> Value {
-    let mut spec = pg_dump_pod_spec(pod_name, ns, pg_image);
-    if let Some(container) = spec
-        .pointer_mut("/spec/containers/0")
-        .and_then(Value::as_object_mut)
-    {
-        // replaces env — pg_dump_pod_spec has no env; keep in sync if that changes
-        container.insert(
-            "env".to_string(),
-            serde_json::json!([{ "name": "PGPASSWORD", "value": pass }]),
-        );
-    }
-    spec
-}
-
 /// Stand a pg helper pod up, wait for the database behind `probe` to answer,
 /// and stream the dump into `pg_restore` on its stdin (L2). The pod is deleted
 /// on every return path by [`PodCleanupGuard`].
+#[allow(clippy::too_many_arguments)]
 fn run_pg_restore(
     ns: &str,
     claim: &str,
@@ -2480,7 +2637,21 @@ fn run_pg_restore(
     probe: &dyn Fn(&str) -> Result<()>,
 ) -> Result<()> {
     let pod_name = truncate_pod_name(&format!("ld-pg-{claim}"));
-    let spec = pg_helper_pod_spec(&pod_name, ns, pg_image, &conn.pass);
+    // The backup's own pg helper builder (the pg_dump image carries
+    // `pg_restore`): `PGPASSWORD`, by reference to the connection Secret, so
+    // `pg_restore` never prompts and hangs the restore, and `PGOPTIONS` so a
+    // `pg_restore` stopped while its `--clean` waits on a lock does not leave
+    // that request queued on the server.
+    let spec = pg_helper_pod_spec(
+        &pod_name,
+        ns,
+        pg_image,
+        SecretKey {
+            secret: &conn.secret,
+            key: backup_core::extract::PG_CONNECTION_PASSWORD_KEY,
+        },
+        restore_helper_keep_alive(k)?,
+    );
 
     let _guard = PodCleanupGuard {
         name: pod_name.clone(),
@@ -2492,14 +2663,15 @@ fn run_pg_restore(
 
     let argv = pg_restore_argv(conn);
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-    k.exec_stream_from_file(&pod_name, ns, &argv, dump_path)?;
+    k.exec_stream_from_file(&pod_name, ns, &argv, dump_path)
+        .map_err(|e| explain_keep_alive_end(k, &pod_name, ns, e))?;
     println!("  ✓ pg restored: {ns}/{claim}");
     Ok(())
 }
 
 /// Poll a real connection to the TARGET database inside an already-running
 /// helper pod until it succeeds, or a bounded timeout elapses. `PGPASSWORD` is
-/// already in the pod env (set by the caller).
+/// already in the pod env (read from the connection Secret by reference).
 ///
 /// A `pg_isready` probe is NOT enough: for a lazily-provisioned shared CNPG
 /// cluster, the SERVER accepts connections (to `postgres`) well before the
@@ -2553,6 +2725,7 @@ fn poll_pg_reachable(
 ) -> Result<()> {
     let mut last = String::new();
     for attempt in 0..attempts {
+        crate::commands::helper_interrupt::refuse_if_interrupted()?;
         match probe() {
             Ok(()) => return Ok(()),
             Err(e) => last = e,
@@ -2691,7 +2864,8 @@ fn load_one_volume(
     k: &dyn KubeExec,
 ) -> Result<()> {
     let pod_name = truncate_pod_name(&format!("ld-vol-{name}"));
-    let spec = volume_pod_spec(&pod_name, ns, VOLUME_IMAGE, pvc, false); // L1: RW
+    let keep_alive = restore_helper_keep_alive(k)?;
+    let spec = volume_pod_spec(&pod_name, ns, VOLUME_IMAGE, pvc, false, keep_alive); // L1: RW
     let _guard = PodCleanupGuard {
         name: pod_name.clone(),
         namespace: ns.to_string(),
@@ -2699,7 +2873,8 @@ fn load_one_volume(
     };
     k.apply_and_wait_pod_ready(&spec)?;
     let argv: Vec<&str> = vec!["tar", "x", "-C", "/data"];
-    k.exec_stream_from_file(&pod_name, ns, &argv, tar_path)?;
+    k.exec_stream_from_file(&pod_name, ns, &argv, tar_path)
+        .map_err(|e| explain_keep_alive_end(k, &pod_name, ns, e))?;
     println!("  ✓ volume restored: {ns}/{name} → pvc {pvc}");
     Ok(())
 }
@@ -2744,16 +2919,10 @@ fn resolve_redis_instance(ns: &str, claim: &str, kubeconfig: &Path) -> Result<St
 /// the instance vanish and cannot re-provision (FLUSHDB) the claim's DB
 /// mid-restore (the failure the scale approach hit on --data-only).
 fn restore_one_redis_instance(instance: &str, tar_path: &Path, k: &dyn KubeExec) -> Result<()> {
-    // DFLY LOAD works on the data port 6379, which is password-auth'd; read the
-    // instance admin password (the admin port 9999 refuses DFLY LOAD).
-    let pw = k.get_secret_key(
-        &format!("{instance}-admin"),
-        DRAGONFLY_NAMESPACE,
-        "password",
-    )?;
-
-    let script = dfly_load_script(&pw);
-    let argv: Vec<&str> = vec!["sh", "-c", &script];
+    // DFLY LOAD works on the data port 6379, which is password-auth'd (the
+    // admin port 9999 refuses DFLY LOAD). The password is the container's
+    // own: see `DFLY_LOAD_SCRIPT`.
+    let argv: Vec<&str> = vec!["sh", "-c", DFLY_LOAD_SCRIPT];
     k.exec_stream_from_file(
         &format!("{instance}-0"),
         DRAGONFLY_NAMESPACE,
@@ -2771,28 +2940,29 @@ const DRAGONFLY_NAMESPACE: &str = "dragonfly-system";
 /// The one-shot `sh -c` script that replays a whole-instance Dragonfly snapshot.
 ///
 /// The tar streams to sh's stdin; `tar x` reads it; then `DFLY LOAD` replays the
-/// newest summary file. Two things are load-bearing: `set -e` plus the explicit
-/// `[ "$OUT" = OK ]` check, because `redis-cli` exits 0 even when the server
-/// answers with an error — without the check a failed load would report a
-/// successful restore over an empty instance; and the password goes through
-/// [`shell_single_quote`], because it is generated and may contain characters
-/// the shell would otherwise interpret.
-fn dfly_load_script(password: &str) -> String {
-    let pw_q = shell_single_quote(password);
-    format!(
-        "set -e; \
-         rm -f /dragonfly/snapshots/* 2>/dev/null || true; \
-         tar x -C /dragonfly/snapshots; \
-         SUM=$(ls -1 /dragonfly/snapshots/*summary.dfs | sort | tail -1); \
-         OUT=$(redis-cli -a {pw_q} --no-auth-warning -p 6379 DFLY LOAD \"$SUM\"); \
-         [ \"$OUT\" = OK ] || {{ echo \"DFLY LOAD failed: $OUT\" >&2; exit 1; }}"
-    )
-}
-
-/// POSIX-safe single-quote, from `backup-core` — the dump side quotes stream
-/// names with the same function, and two quoting rules in one repository is
-/// how one of them ends up subtly different from the other.
-use backup_core::helper_pod::shell_single_quote;
+/// newest summary file. Three things are load-bearing:
+///
+/// * `set -e` plus the explicit `[ "$OUT" = OK ]` check, because `redis-cli`
+///   exits 0 even when the server answers with an error — without the check a
+///   failed load would report a successful restore over an empty instance.
+/// * The password is the Dragonfly container's own `DFLY_requirepass`, which
+///   dragonfly-operator (v1.5.0 and v1.6.0) sets from the CR's
+///   `authentication.passwordFromSecret` — the instance's `<instance>-admin`
+///   Secret, key `password` — and which an exec'd process inherits. It reaches
+///   `redis-cli` as `REDISCLI_AUTH`, so it is never on an argv: not the CLI's
+///   `kubectl exec` (local `ps`, the apiserver's exec audit record), not
+///   `redis-cli`'s in the pod. The CLI never reads it at all.
+/// * A container without it stops the script BEFORE the snapshot directory is
+///   emptied, naming why, rather than running an unauthenticated `DFLY LOAD`.
+const DFLY_LOAD_SCRIPT: &str = "set -e; \
+     [ -n \"${DFLY_requirepass:-}\" ] || { echo \"this Dragonfly container has no \
+     DFLY_requirepass, the admin password its operator sets from the instance's -admin \
+     Secret, so DFLY LOAD cannot authenticate\" >&2; exit 1; }; \
+     rm -f /dragonfly/snapshots/* 2>/dev/null || true; \
+     tar x -C /dragonfly/snapshots; \
+     SUM=$(ls -1 /dragonfly/snapshots/*summary.dfs | sort | tail -1); \
+     OUT=$(REDISCLI_AUTH=\"$DFLY_requirepass\" redis-cli -p 6379 DFLY LOAD \"$SUM\"); \
+     [ \"$OUT\" = OK ] || { echo \"DFLY LOAD failed: $OUT\" >&2; exit 1; }";
 
 /// **ReSealUserSecrets** — re-seal each app user secret under
 /// `secrets/<ns>/<name>.json` (NOT `secrets/sourcecred/…`, which
@@ -3018,11 +3188,63 @@ fn suspend_running_workloads(
     suspended_argo: &mut Vec<(String, String)>,
     recorded: &mut Vec<((String, String), i64)>,
 ) -> Result<()> {
-    let claim_namespaces = claim_namespaces(manifest);
+    suspend_workloads(
+        &claim_namespaces(manifest),
+        &KubectlSuspend(kubeconfig),
+        suspended_argo,
+        recorded,
+    )
+}
 
+/// The cluster calls [`suspend_running_workloads`] makes, behind a seam so
+/// what it records and writes, and when it stops, is tested without a
+/// cluster.
+trait SuspendCluster {
+    /// The AppRafter Applications in `ns`.
+    fn applications(&self, ns: &str) -> Result<Vec<Value>>;
+    /// The user Argo Applications that deploy `name` in `ns`
+    /// ([`argo_apps_for`]).
+    fn argo_apps_for(&self, name: &str, ns: &str) -> Result<Vec<(String, String)>>;
+    /// One merge-patch.
+    fn patch(&self, patch: &MergePatch) -> Result<()>;
+}
+
+/// The production [`SuspendCluster`]: kubectl, through the kubeconfig at
+/// this path.
+struct KubectlSuspend<'a>(&'a Path);
+
+impl SuspendCluster for KubectlSuspend<'_> {
+    fn applications(&self, ns: &str) -> Result<Vec<Value>> {
+        list_items("applications.apprafter.io", Some(ns), self.0)
+    }
+
+    fn argo_apps_for(&self, name: &str, ns: &str) -> Result<Vec<(String, String)>> {
+        argo_apps_for(name, ns, self.0)
+    }
+
+    fn patch(&self, patch: &MergePatch) -> Result<()> {
+        kubectl_merge_patch(
+            patch.resource,
+            &patch.name,
+            Some(&patch.namespace),
+            None,
+            &patch.body,
+            self.0,
+        )
+    }
+}
+
+/// [`suspend_running_workloads`] over the claims' `namespaces`, through
+/// `cluster`.
+fn suspend_workloads(
+    namespaces: &[String],
+    cluster: &dyn SuspendCluster,
+    suspended_argo: &mut Vec<(String, String)>,
+    recorded: &mut Vec<((String, String), i64)>,
+) -> Result<()> {
     let before = recorded.len();
-    for ns in &claim_namespaces {
-        let apps = list_items("applications.apprafter.io", Some(ns), kubeconfig)?;
+    for ns in namespaces {
+        let apps = cluster.applications(ns)?;
         for decision in apps_to_suspend(&apps, ns, recorded) {
             let SuspendDecision {
                 name,
@@ -3048,7 +3270,13 @@ fn suspend_running_workloads(
             // with ONE already-located Application; copying the loop variable
             // onto every decision would give the same fact two sources of
             // truth that a later edit could let drift.
-            let argo = argo_apps_for(&name, ns, kubeconfig)?;
+            let argo = cluster.argo_apps_for(&name, ns)?;
+
+            // Not one more application once the process has had its signal
+            // (WI-383), and checked HERE, after the last read and before the
+            // records: the way out names every recorded app as down, and one
+            // this step never wrote to must not be among them.
+            crate::commands::helper_interrupt::refuse_if_interrupted()?;
 
             // Both records go in BEFORE the writes they describe, for the same
             // reason the annotation does: a patch that fails halfway through
@@ -3057,14 +3285,7 @@ fn suspend_running_workloads(
             record_suspended_argo(suspended_argo, argo.iter().cloned());
 
             for patch in suspend_patches(ns, &name, &argo, replicas) {
-                kubectl_merge_patch(
-                    patch.resource,
-                    &patch.name,
-                    Some(&patch.namespace),
-                    None,
-                    &patch.body,
-                    kubeconfig,
-                )?;
+                cluster.patch(&patch)?;
             }
         }
     }
@@ -3376,6 +3597,7 @@ pub(crate) fn is_remote_restic_repo(repo: &str) -> bool {
 /// `creds["RESTIC_PASSWORD"]` are the same value at the call sites.
 /// `restic …` capturing stdout — the listing side of [`run_restic_restore`].
 fn restic_stdout(argv: &[String], pass: &str, creds: &BTreeMap<String, String>) -> Result<String> {
+    crate::commands::helper_interrupt::refuse_if_interrupted()?;
     let mut cmd = std::process::Command::new("restic");
     cmd.args(argv).env("RESTIC_PASSWORD", pass);
     crate::commands::backup::apply_creds_to_command(&mut cmd, creds);
@@ -3470,6 +3692,7 @@ fn merge_data_tree(from: &Path, into: &Path) -> Result<()> {
 }
 
 fn run_restic_restore(argv: &[String], pass: &str, creds: &BTreeMap<String, String>) -> Result<()> {
+    crate::commands::helper_interrupt::refuse_if_interrupted()?;
     let mut cmd = std::process::Command::new("restic");
     cmd.args(argv).env("RESTIC_PASSWORD", pass);
     crate::commands::backup::apply_creds_to_command(&mut cmd, creds);
@@ -3494,8 +3717,12 @@ mod tests {
 
     #[test]
     fn shell_single_quote_escapes_embedded_quotes() {
-        assert_eq!(super::shell_single_quote("abc123"), "'abc123'");
-        assert_eq!(super::shell_single_quote("a'b"), "'a'\\''b'");
+        // The stream-name quoting of the JetStream loader: backup-core's, the
+        // one the dump side quotes with — two quoting rules in one repository
+        // is how one of them ends up subtly different from the other.
+        use backup_core::helper_pod::shell_single_quote;
+        assert_eq!(shell_single_quote("abc123"), "'abc123'");
+        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
     }
 
     #[test]
@@ -3770,18 +3997,27 @@ mod tests {
         deleted: RefCell<Vec<(String, String)>>,
         secrets: BTreeMap<String, String>,
         exec_fails: bool,
+        apply_fails: bool,
+        /// Every exec is killed by its helper pod's keep-alive running out:
+        /// it fails with exit code 137, and the pod reads as ended.
+        keep_alive_runs_out: bool,
+        /// The cluster's `spec.backup.activeDeadlineSeconds`; `None` is a
+        /// PlatformStack without one (six hours).
+        deadline: Option<u64>,
     }
 
     impl FakeKube {
-        fn with_secret(mut self, secret: &str, ns: &str, key: &str, value: &str) -> Self {
-            self.secrets
-                .insert(format!("{ns}/{secret}/{key}"), value.to_string());
-            self
-        }
-
         fn failing_exec() -> Self {
             Self {
                 exec_fails: true,
+                ..Self::default()
+            }
+        }
+
+        /// A helper pod that never becomes Ready (the apply-wait fails).
+        fn failing_apply() -> Self {
+            Self {
+                apply_fails: true,
                 ..Self::default()
             }
         }
@@ -3790,6 +4026,11 @@ mod tests {
     impl KubeExec for FakeKube {
         fn apply_and_wait_pod_ready(&self, spec: &Value) -> Result<()> {
             self.applied.borrow_mut().push(spec.clone());
+            if self.apply_fails {
+                return Err(CliError::Other(
+                    "pod did not reach Ready within 300s".into(),
+                ));
+            }
             Ok(())
         }
 
@@ -3799,6 +4040,7 @@ mod tests {
             _ns: &str,
             _argv: &[&str],
             _out: &Path,
+            _first_output_within: Option<std::time::Duration>,
         ) -> Result<()> {
             unreachable!("restore never streams a pod's stdout to a file")
         }
@@ -3819,6 +4061,13 @@ mod tests {
             if self.exec_fails {
                 return Err(CliError::Other("exec failed".into()));
             }
+            if self.keep_alive_runs_out {
+                return Err(CliError::Other(
+                    "exec_stream_from_file: kubectl exec exited with exit status: 137.\n\
+                     kubectl stderr:\n  command terminated with exit code 137"
+                        .into(),
+                ));
+            }
             Ok(())
         }
 
@@ -3835,8 +4084,35 @@ mod tests {
                 .ok_or_else(|| CliError::Other(format!("no secret {ns}/{secret}")))
         }
 
-        fn get_json(&self, _args: &[&str]) -> Result<Option<Value>> {
-            unreachable!("restore reads JSON through kubectl_get_json, not KubeExec")
+        fn get_json(&self, args: &[&str]) -> Result<Option<Value>> {
+            // Restore reads JSON through kubectl_get_json, not KubeExec — but
+            // for the keep-alive each load helper is given, and for the
+            // helper pod a killed load ran in.
+            if args[..2] == ["get", "platformstack"] {
+                assert_eq!(
+                    args,
+                    [
+                        "get",
+                        "platformstack",
+                        "default",
+                        "-n",
+                        "apprafter-system",
+                        "-o",
+                        "json"
+                    ]
+                );
+                let backup = match self.deadline {
+                    Some(secs) => serde_json::json!({"activeDeadlineSeconds": secs}),
+                    None => serde_json::json!({}),
+                };
+                return Ok(Some(serde_json::json!({"spec": {"backup": backup}})));
+            }
+            assert!(self.keep_alive_runs_out, "unexpected get_json {args:?}");
+            assert_eq!(args[..2], ["get", "pods"], "{args:?}");
+            Ok(Some(serde_json::json!({
+                "spec": {"containers": [{"command": ["sleep", "21600"]}]},
+                "status": {"containerStatuses": [{"state": {"terminated": {"exitCode": 0}}}]}
+            })))
         }
     }
 
@@ -5012,11 +5288,17 @@ mod tests {
 
     /// A sequential run's listing: two per-claim snapshots and the commit
     /// point, sharing one run tag (the only thing that groups them).
+    ///
+    /// The paths are the ones the writer gives each snapshot: they are what
+    /// says which snapshot completes the run, and so what `latest` resolves.
     fn sequential_listing() -> &'static str {
         r#"[
-          {"id":"claimA","short_id":"claimA","time":"2026-09-02T19:11:29Z","tags":["platform-run-1"]},
-          {"id":"claimB","short_id":"claimB","time":"2026-09-02T19:11:30Z","tags":["platform-run-1"]},
-          {"id":"commit","short_id":"commit","time":"2026-09-02T19:11:31Z","tags":["platform-run-1"]}
+          {"id":"claimA","short_id":"claimA","time":"2026-09-02T19:11:29Z","tags":["platform-run-1"],
+           "paths":["/tmp/apprafter-backup-x/claim-0"]},
+          {"id":"claimB","short_id":"claimB","time":"2026-09-02T19:11:30Z","tags":["platform-run-1"],
+           "paths":["/tmp/apprafter-backup-x/claim-1"]},
+          {"id":"commit","short_id":"commit","time":"2026-09-02T19:11:31Z","tags":["platform-run-1"],
+           "paths":["/tmp/apprafter-backup-x/commit"]}
         ]"#
     }
 
@@ -5068,6 +5350,133 @@ mod tests {
             ],
             "the commit point is restored first, then every claim snapshot of the run"
         );
+    }
+
+    /// A restore with no `--snapshot` right after a sequential backup died
+    /// between its claims. `latest` used to be the dead run's newest claim
+    /// snapshot, which carries no manifest, so the restore failed — the
+    /// disaster-recovery restore, at the moment it is needed. It replays the
+    /// newest COMPLETE run, and fetches none of the dead run's snapshots.
+    #[test]
+    fn restore_artifact_tree_replays_the_newest_complete_run_after_an_interrupted_one() {
+        let root = tempfile::tempdir().unwrap();
+        let listing = r#"[
+          {"id":"claimA","time":"2026-09-02T19:11:29Z","tags":["platform-run-1"],
+           "paths":["/tmp/apprafter-backup-x/claim-0"]},
+          {"id":"commit","time":"2026-09-02T19:11:31Z","tags":["platform-run-1"],
+           "paths":["/tmp/apprafter-backup-x/commit"]},
+          {"id":"deadA","time":"2026-09-03T19:11:29Z","tags":["platform-run-2"],
+           "paths":["/tmp/apprafter-backup-y/claim-0"]},
+          {"id":"deadB","time":"2026-09-03T19:11:30Z","tags":["platform-run-2"],
+           "paths":["/tmp/apprafter-backup-y/claim-1"]}
+        ]"#;
+        let restic = FakeRestic::new(listing)
+            .with_tree("commit", &[("staging/data/manifest.json", "{}")])
+            .with_tree("claimA", &[("claim-0/data/pg/demo/db.dump", "PGDUMP-A")]);
+
+        let dd =
+            restore_artifact_tree(&restic, "latest", root.path(), Some(TEST_CLUSTER_UID)).unwrap();
+
+        assert_eq!(
+            *restic.restored.borrow(),
+            vec!["commit".to_string(), "claimA".to_string()],
+            "the complete run, and nothing of the unfinished one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dd.join("pg/demo/db.dump")).unwrap(),
+            "PGDUMP-A"
+        );
+    }
+
+    /// FIRES: `--snapshot <a per-claim snapshot of a complete run>` took the
+    /// claim for the commit point, fetched its whole dump, then failed on
+    /// "no manifest.json". It restores the run the claim belongs to, commit
+    /// point first — exactly what naming the run's own commit snapshot does.
+    #[test]
+    fn restore_artifact_tree_restores_the_whole_run_of_a_named_claim_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let restic = FakeRestic::new(sequential_listing())
+            .with_tree("commit", &[("staging/data/manifest.json", "{}")])
+            .with_tree("claimA", &[("claim-0/data/pg/demo/db.dump", "PGDUMP-A")])
+            .with_tree(
+                "claimB",
+                &[("claim-1/data/redis/demo/cache/dump.tar", "TAR-B")],
+            );
+
+        let dd =
+            restore_artifact_tree(&restic, "claimB", root.path(), Some(TEST_CLUSTER_UID)).unwrap();
+
+        assert_eq!(
+            *restic.restored.borrow(),
+            vec![
+                "commit".to_string(),
+                "claimA".to_string(),
+                "claimB".to_string()
+            ],
+            "the named claim's whole run, commit point first"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dd.join("pg/demo/db.dump")).unwrap(),
+            "PGDUMP-A"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dd.join("redis/demo/cache/dump.tar")).unwrap(),
+            "TAR-B"
+        );
+    }
+
+    /// FIRES: a claim of a run that never finished was downloaded before the
+    /// restore failed on the missing manifest. It is refused, with nothing
+    /// fetched.
+    #[test]
+    fn restore_artifact_tree_refuses_a_claim_of_an_unfinished_run_before_fetching_it() {
+        let root = tempfile::tempdir().unwrap();
+        let listing = r#"[
+          {"id":"commit","time":"2026-09-02T19:11:31Z","tags":["platform-run-1"],
+           "paths":["/tmp/apprafter-backup-x/data"]},
+          {"id":"deadA","time":"2026-09-03T19:11:29Z","tags":["platform-run-2"],
+           "paths":["/tmp/apprafter-backup-y/claim-0"]},
+          {"id":"deadB","time":"2026-09-03T19:11:30Z","tags":["platform-run-2"],
+           "paths":["/tmp/apprafter-backup-y/claim-1"]}
+        ]"#;
+        let restic = FakeRestic::new(listing)
+            .with_tree("deadA", &[("claim-0/data/pg/demo/db.dump", "PGDUMP-A")]);
+
+        let err = restore_artifact_tree(&restic, "deadA", root.path(), Some(TEST_CLUSTER_UID))
+            .unwrap_err();
+
+        assert!(
+            restic.restored.borrow().is_empty(),
+            "nothing may be fetched: {:?}",
+            restic.restored.borrow()
+        );
+        let err = format!("{err}");
+        assert!(err.contains("platform-run-2"), "{err}");
+        assert!(err.contains("nothing was downloaded"), "{err}");
+    }
+
+    /// What the restore says when the snapshot it was given is a claim: the
+    /// commit snapshot it replays from is not the one named, and a silent
+    /// substitution would read as a restore of something else.
+    #[test]
+    fn a_named_claim_is_said_to_be_restored_as_its_whole_run() {
+        let run = backup_core::restore::RunSnapshots {
+            commit: "d1e2f3a4b5c6".into(),
+            claims: vec!["a1b2c3d4e5f6".into()],
+            passed_over: Vec::new(),
+            resolved_from: Some("a1b2c3d4e5f6".into()),
+        };
+        let line = named_claim_line(&run).expect("a claim was named");
+        assert!(line.contains("snapshot a1b2c3d4 "), "{line}");
+        assert!(line.contains("per-claim"), "{line}");
+        assert!(line.contains("whole run"), "{line}");
+        assert!(line.contains("commit snapshot d1e2f3a4"), "{line}");
+
+        let named_commit = backup_core::restore::RunSnapshots {
+            resolved_from: None,
+            ..run
+        };
+        assert_eq!(named_claim_line(&named_commit), None);
     }
 
     /// A monolithic backup is one snapshot carrying everything: nothing else is
@@ -6313,6 +6722,160 @@ mod tests {
         assert!(discover_stream_artifacts(dd.path().join("nope").as_path()).is_empty());
     }
 
+    fn nats_server() -> NatsServer {
+        NatsServer {
+            namespace: "nats".into(),
+            url: "nats://nats.nats.svc:4222".into(),
+            manager_secret: "nats-mgr-atm".into(),
+        }
+    }
+
+    fn stream_artifacts(names: &[&str]) -> (tempfile::TempDir, Vec<StreamArtifact>) {
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = names
+            .iter()
+            .map(|stream| {
+                let path = dir.path().join(format!("{stream}.tar"));
+                std::fs::write(&path, b"tar").unwrap();
+                StreamArtifact {
+                    namespace: "atm".into(),
+                    claim: "worker-js".into(),
+                    stream: stream.to_string(),
+                    path,
+                }
+            })
+            .collect();
+        (dir, artifacts)
+    }
+
+    /// The replay helper of claim `worker-js` in namespace `ns`.
+    fn rs_js(ns: &str) -> String {
+        backup_core::extract::jetstream_helper_pod_name("rs-js", ns, "worker-js", None)
+    }
+
+    /// The replay helper runs in the NATS server's namespace, which every
+    /// application namespace shares: claims of one name in two namespaces get
+    /// two pods. They were both `rs-js-<claim>`, and two restores at once
+    /// deleted each other's.
+    #[test]
+    fn a_jetstream_helper_is_named_by_the_claims_namespace_too() {
+        let (_dir, streams) = stream_artifacts(&["orders"]);
+        let mut names = Vec::new();
+        for ns in ["shop", "blog"] {
+            let k = FakeKube::default();
+            restore_claim_streams(&k, ns, "worker-js", &nats_server(), &streams).unwrap();
+            let applied = k.applied.borrow();
+            assert_eq!(applied[0]["metadata"]["namespace"], "nats");
+            names.push(applied[0]["metadata"]["name"].as_str().unwrap().to_string());
+        }
+        assert!(names[0].starts_with("rs-js-shop-worker-js-"), "{names:?}");
+        assert!(names[1].starts_with("rs-js-blog-worker-js-"), "{names:?}");
+        assert_ne!(names[0], names[1]);
+    }
+
+    /// A helper pod that never becomes Ready is deleted too. It used to be
+    /// left behind — deleted by hand only after a failed stream and at the
+    /// end — and a leftover replay helper failed every later jetstream
+    /// restore of the claim until someone deleted it.
+    #[test]
+    fn a_jetstream_helper_that_never_becomes_ready_is_deleted() {
+        let k = FakeKube::failing_apply();
+        let (_dir, streams) = stream_artifacts(&["orders"]);
+        let r = restore_claim_streams(&k, "atm", "worker-js", &nats_server(), &streams);
+        assert!(r.is_err());
+        assert!(
+            k.execs.borrow().is_empty(),
+            "no replay into a pod never Ready"
+        );
+        assert_eq!(
+            *k.deleted.borrow(),
+            vec![(rs_js("atm"), "nats".to_string())]
+        );
+    }
+
+    /// Every stream is replayed through the one pod beside the server, and the
+    /// pod is deleted exactly once — on success and when a stream fails.
+    #[test]
+    fn a_jetstream_helper_replays_every_stream_and_is_deleted_once() {
+        let k = FakeKube::default();
+        let (_dir, streams) = stream_artifacts(&["orders", "orders_dlq"]);
+        restore_claim_streams(&k, "atm", "worker-js", &nats_server(), &streams).unwrap();
+        let applied = k.applied.borrow();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0]["metadata"]["name"], rs_js("atm"));
+        assert_eq!(applied[0]["metadata"]["namespace"], "nats");
+        let execs = k.execs.borrow();
+        assert_eq!(execs.len(), 2);
+        assert!(execs.iter().all(|e| e.0 == rs_js("atm") && e.1 == "nats"));
+        assert_eq!(execs[1].3, streams[1].path);
+        assert_eq!(
+            *k.deleted.borrow(),
+            vec![(rs_js("atm"), "nats".to_string())]
+        );
+
+        let failing = FakeKube::failing_exec();
+        assert!(
+            restore_claim_streams(&failing, "atm", "worker-js", &nats_server(), &streams,).is_err()
+        );
+        assert_eq!(
+            failing.execs.borrow().len(),
+            1,
+            "stops at the failed stream"
+        );
+        assert_eq!(
+            *failing.deleted.borrow(),
+            vec![(rs_js("atm"), "nats".to_string())]
+        );
+    }
+
+    /// WI-383: a restore's helpers read their credentials from the Secret
+    /// that holds them, by reference, and the Pod objects carry no password:
+    /// the pg loader's from the fresh connection Secret, the stream replay's
+    /// from the NATS manager Secret beside the server.
+    #[test]
+    fn a_restores_helpers_read_their_credentials_by_reference() {
+        let env_of = |spec: &Value, var: &str| {
+            spec["spec"]["containers"][0]["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == var)
+                .cloned()
+                .unwrap_or_else(|| panic!("no {var} in {spec}"))
+        };
+        let by_ref = |secret: &str, key: &str| json!({"valueFrom": {"secretKeyRef": {"name": secret, "key": key}}});
+
+        let k = FakeKube::default();
+        let dump = tempfile::NamedTempFile::new().unwrap();
+        run_pg_restore(
+            "demo",
+            "db",
+            &pg_conn(),
+            dump.path(),
+            &k,
+            "postgres:18",
+            &|_| Ok(()),
+        )
+        .unwrap();
+        let mut pg = env_of(&k.applied.borrow()[0], "PGPASSWORD");
+        pg.as_object_mut().unwrap().remove("name");
+        assert_eq!(pg, by_ref("db-conn", "pass"));
+
+        let k = FakeKube::default();
+        let (_dir, streams) = stream_artifacts(&["orders"]);
+        restore_claim_streams(&k, "atm", "worker-js", &nats_server(), &streams).unwrap();
+        let spec = k.applied.borrow()[0].clone();
+        for (var, key) in [("NATS_USER", "user"), ("NATS_PASSWORD", "password")] {
+            let mut env = env_of(&spec, var);
+            env.as_object_mut().unwrap().remove("name");
+            assert_eq!(env, by_ref("nats-mgr-atm", key), "{var}");
+        }
+        assert_eq!(
+            env_of(&spec, "NATS_URL")["value"],
+            "nats://nats.nats.svc:4222"
+        );
+    }
+
     /// Measured on a real server (nats 2.14.3 / CLI v0.2.3): `nats stream
     /// restore` refuses a stream that exists — `Stream "X" already exist`,
     /// exit 1 — and NACK recreates a DECLARED stream empty as soon as the
@@ -6378,10 +6941,10 @@ mod tests {
     fn pg_conn() -> PgConnection {
         PgConnection {
             user: "app".into(),
-            pass: "s3cret".into(),
             host: "db-rw.demo.svc".into(),
             port: "5432".into(),
             db: "claim_demo_db".into(),
+            secret: "db-conn".into(),
         }
     }
 
@@ -6417,15 +6980,21 @@ mod tests {
         let conn = pg_connection_from_secret(&full, "demo", "db-conn").unwrap();
         assert_eq!(conn.user, "app");
         assert_eq!(conn.db, "claim_demo_db");
+        // The Secret the helper reads the password from, not the password.
+        assert_eq!(conn.secret, "db-conn");
 
-        let mut missing = full.clone();
-        missing.remove("db");
-        // `.err()` rather than `unwrap_err()`: PgConnection deliberately has no
-        // Debug impl, because it carries the database password.
-        let e = pg_connection_from_secret(&missing, "demo", "db-conn")
-            .err()
-            .expect("an incomplete connection Secret must not resolve");
-        assert!(format!("{e}").contains("missing key `db`"), "got: {e}");
+        for key in ["db", "pass"] {
+            let mut missing = full.clone();
+            missing.remove(key);
+            // `.err()` rather than `unwrap_err()`: PgConnection has no Debug impl.
+            let e = pg_connection_from_secret(&missing, "demo", "db-conn")
+                .err()
+                .expect("an incomplete connection Secret must not resolve");
+            assert!(
+                format!("{e}").contains(&format!("missing key `{key}`")),
+                "got: {e}"
+            );
+        }
     }
 
     /// The restore argv: `--clean --if-exists` because the fresh database is
@@ -6455,18 +7024,40 @@ mod tests {
 
     /// `PGPASSWORD` must reach the helper pod's environment, or `pg_restore`
     /// prompts for a password on a pod with no TTY and the restore hangs until
-    /// the user gives up.
+    /// the user gives up — by reference to the connection Secret, so the Pod
+    /// object never carries it. `PGOPTIONS` must too: without it a `pg_restore`
+    /// stopped while its `--clean` waits for `ACCESS EXCLUSIVE` leaves that
+    /// request queued on the server, and every later reader of the table
+    /// queues behind it (measured on PostgreSQL 18.6).
     #[test]
     fn pg_helper_pod_spec_injects_the_password_into_the_container_env() {
-        let spec = pg_helper_pod_spec("ld-pg-db", "demo", "postgres:18", "s3cret");
+        let spec = pg_helper_pod_spec(
+            "ld-pg-db",
+            "demo",
+            "postgres:18",
+            SecretKey {
+                secret: "db-conn",
+                key: "pass",
+            },
+            backup_core::helper_pod::DEFAULT_RUN_DEADLINE,
+        );
         assert_eq!(spec["metadata"]["name"], "ld-pg-db");
         assert_eq!(spec["metadata"]["namespace"], "demo");
         assert_eq!(spec["spec"]["containers"][0]["image"], "postgres:18");
+        // Alive for the keep-alive it was given, not a fixed hour: the
+        // `sleep` ending kills a `pg_restore` still running in the pod.
         assert_eq!(
-            spec["spec"]["containers"][0]["env"][0]["name"],
-            "PGPASSWORD"
+            spec["spec"]["containers"][0]["command"],
+            serde_json::json!(["sleep", "21600"])
         );
-        assert_eq!(spec["spec"]["containers"][0]["env"][0]["value"], "s3cret");
+        assert_eq!(
+            spec["spec"]["containers"][0]["env"],
+            serde_json::json!([
+                { "name": "PGPASSWORD",
+                  "valueFrom": { "secretKeyRef": { "name": "db-conn", "key": "pass" } } },
+                { "name": "PGOPTIONS", "value": "-c client_connection_check_interval=10s" }
+            ])
+        );
     }
 
     /// The reachability probe runs `psql -d <db>`, NOT `pg_isready`: on a
@@ -6561,6 +7152,16 @@ mod tests {
             "the probe runs in the helper pod"
         );
         assert_eq!(k.applied.borrow().len(), 1);
+        // The pod the load really ran in carries the connection check: a
+        // `pg_restore` stopped while its `--clean` waits on a lock must not
+        // leave that request queued on the server.
+        assert_eq!(
+            k.applied.borrow()[0]["spec"]["containers"][0]["env"][1],
+            serde_json::json!({
+                "name": "PGOPTIONS",
+                "value": "-c client_connection_check_interval=10s"
+            })
+        );
         let execs = k.execs.borrow();
         assert_eq!(execs[0].0, "ld-pg-db");
         assert_eq!(execs[0].1, "demo");
@@ -6596,6 +7197,100 @@ mod tests {
             *k.deleted.borrow(),
             vec![("ld-pg-db".to_string(), "demo".to_string())]
         );
+    }
+
+    /// Every loader with a helper sizes it itself, as an interactive
+    /// command's helpers are: a restore has no Job deadline, so the helper's
+    /// keep-alive is the only limit on one load. A cluster backing up every
+    /// fifteen minutes sets a ten-minute deadline, and a helper sized by it
+    /// killed a long `pg_restore` at ten minutes; the helpers live six hours
+    /// all the same, and longer when the deadline is.
+    #[test]
+    fn every_load_helper_outlives_a_short_schedule_deadline() {
+        let dump = tempfile::NamedTempFile::new().unwrap();
+        let (_dir, streams) = stream_artifacts(&["orders"]);
+        for (deadline, want) in [
+            (Some(600), "21600"),
+            (Some(43200), "43200"),
+            (None, "21600"),
+        ] {
+            let k = FakeKube {
+                deadline,
+                ..FakeKube::default()
+            };
+            run_pg_restore(
+                "demo",
+                "db",
+                &pg_conn(),
+                dump.path(),
+                &k,
+                "postgres:18",
+                &|_| Ok(()),
+            )
+            .unwrap();
+            load_one_volume("demo", "uploads", "pvc-uploads", dump.path(), &k).unwrap();
+            restore_claim_streams(&k, "atm", "worker-js", &nats_server(), &streams).unwrap();
+            let keep_alives: Vec<Value> = k
+                .applied
+                .borrow()
+                .iter()
+                .map(|spec| spec["spec"]["containers"][0]["command"].clone())
+                .collect();
+            assert_eq!(
+                keep_alives,
+                vec![serde_json::json!(["sleep", want]); 3],
+                "deadline {deadline:?}"
+            );
+        }
+    }
+
+    /// A load killed by its helper pod's keep-alive says so, and how to give
+    /// it longer — not a bare exit code 137 — for every loader with a helper.
+    #[test]
+    fn a_load_killed_by_its_helpers_keep_alive_says_so() {
+        let keep_alive_runs_out = || FakeKube {
+            keep_alive_runs_out: true,
+            ..FakeKube::default()
+        };
+        let dump = tempfile::NamedTempFile::new().unwrap();
+        let (_dir, streams) = stream_artifacts(&["orders"]);
+        let errors = [
+            run_pg_restore(
+                "demo",
+                "db",
+                &pg_conn(),
+                dump.path(),
+                &keep_alive_runs_out(),
+                "postgres:18",
+                &|_| Ok(()),
+            ),
+            load_one_volume(
+                "demo",
+                "uploads",
+                "pvc-uploads",
+                dump.path(),
+                &keep_alive_runs_out(),
+            ),
+            restore_claim_streams(
+                &keep_alive_runs_out(),
+                "atm",
+                "worker-js",
+                &nats_server(),
+                &streams,
+            ),
+        ];
+        for (i, r) in errors.into_iter().enumerate() {
+            let msg = r.expect_err("a killed load fails").to_string();
+            assert!(
+                msg.contains("keep-alive of 6h ran out"),
+                "loader {i}: {msg}"
+            );
+            assert!(
+                msg.contains("apprafter backup set deadline"),
+                "loader {i}: {msg}"
+            );
+            assert!(msg.contains("exit code 137"), "loader {i}: {msg}");
+        }
     }
 
     /// A probe that never succeeds aborts the load BEFORE `pg_restore` runs —
@@ -6656,12 +7351,13 @@ mod tests {
     }
 
     /// A Dragonfly snapshot is replayed into the RUNNING instance's pod-0 in
-    /// `dragonfly-system`, using the instance's ADMIN password on the data port
-    /// — the admin port refuses `DFLY LOAD`.
+    /// `dragonfly-system`, authenticated on the data port with the container's
+    /// own admin password — the admin port refuses `DFLY LOAD`. The CLI reads
+    /// no Secret for it.
     #[test]
     fn restore_one_redis_instance_replays_into_the_running_pod_zero() {
-        let k =
-            FakeKube::default().with_secret("pool-a-admin", "dragonfly-system", "password", "pw");
+        // No Secret at all: the CLI must not need one.
+        let k = FakeKube::default();
         let tar = tempfile::NamedTempFile::new().unwrap();
 
         restore_one_redis_instance("pool-a", tar.path(), &k).unwrap();
@@ -6669,7 +7365,7 @@ mod tests {
         let execs = k.execs.borrow();
         assert_eq!(execs[0].0, "pool-a-0");
         assert_eq!(execs[0].1, "dragonfly-system");
-        assert_eq!(execs[0].2[0], "sh");
+        assert_eq!(execs[0].2, vec!["sh", "-c", DFLY_LOAD_SCRIPT]);
         assert_eq!(execs[0].3, tar.path());
         assert!(
             k.applied.borrow().is_empty(),
@@ -6677,30 +7373,33 @@ mod tests {
         );
     }
 
-    /// A missing admin Secret must abort the load rather than exec an
-    /// unauthenticated `DFLY LOAD` that silently does nothing.
-    #[test]
-    fn restore_one_redis_instance_fails_when_the_admin_password_is_absent() {
-        let k = FakeKube::default();
-        let tar = tempfile::NamedTempFile::new().unwrap();
-        assert!(restore_one_redis_instance("pool-a", tar.path(), &k).is_err());
-        assert!(k.execs.borrow().is_empty());
-    }
-
     /// The replay script must (a) check the reply, because `redis-cli` exits 0
     /// even when the server answers with an error — without the check a failed
-    /// load reports a successful restore over an empty instance — and (b) quote
-    /// the generated password, which may contain shell metacharacters.
+    /// load reports a successful restore over an empty instance; (b) take the
+    /// password from the container's environment into `REDISCLI_AUTH`, never
+    /// onto an argv (`-a`); and (c) stop before it empties the snapshot
+    /// directory when the container has no password, rather than run an
+    /// unauthenticated `DFLY LOAD` that fails after the old snapshot is gone.
     #[test]
-    fn dfly_load_script_checks_the_reply_and_quotes_the_password() {
-        let script = dfly_load_script("pa's$word");
-        assert!(script.contains("'pa'\\''s$word'"), "got: {script}");
-        assert!(script.contains("DFLY LOAD"), "got: {script}");
+    fn dfly_load_script_checks_the_reply_and_keeps_the_password_off_every_argv() {
+        let script = DFLY_LOAD_SCRIPT;
+        assert!(script.starts_with("set -e"), "got: {script}");
         assert!(
             script.contains("[ \"$OUT\" = OK ]"),
             "a redis-cli exit code is not evidence the load worked: {script}"
         );
-        assert!(script.starts_with("set -e"), "got: {script}");
+        assert!(
+            script.contains(
+                "OUT=$(REDISCLI_AUTH=\"$DFLY_requirepass\" redis-cli -p 6379 DFLY LOAD \"$SUM\")"
+            ),
+            "got: {script}"
+        );
+        assert!(!script.contains(" -a "), "no password on an argv: {script}");
+        let guard = script
+            .find("[ -n \"${DFLY_requirepass:-}\" ] || {")
+            .expect(script);
+        let wipe = script.find("rm -f /dragonfly/snapshots/*").expect(script);
+        assert!(guard < wipe, "the check comes before the wipe: {script}");
     }
 
     // =======================================================================
@@ -6854,5 +7553,187 @@ mod tests {
             msg.contains("snapshots"),
             "the failing subcommand must be named: {msg}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // WI-383: after the signal, the restore's own thread starts nothing
+    // ------------------------------------------------------------------
+
+    /// The step under way when the signal came is the last one the restore
+    /// runs. Here the signal lands while restic fetches the snapshot — a
+    /// SIGTERM sent to the CLI alone leaves restic to finish — and the
+    /// restore must not go on to scale the applications down.
+    #[test]
+    fn no_restore_step_starts_after_the_signal() {
+        let steps = restore_steps(RestoreMode::IntoRunning, true);
+        assert_eq!(
+            steps[..2],
+            [RestoreStep::RestoreArtifact, RestoreStep::SuspendWorkloads]
+        );
+        let signalled = std::cell::Cell::new(false);
+        let mut ran = Vec::new();
+        let e = run_restore_steps(&steps, &|| signalled.get(), &mut |step| {
+            ran.push(*step);
+            if *step == RestoreStep::RestoreArtifact {
+                signalled.set(true);
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(e.to_string().starts_with("interrupted"), "{e}");
+        assert_eq!(ran, vec![RestoreStep::RestoreArtifact]);
+
+        // Without a signal every step runs, in order, and the first failure
+        // ends the run.
+        let mut ran = Vec::new();
+        run_restore_steps(&steps, &|| false, &mut |step| {
+            ran.push(*step);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(ran, steps);
+        let mut ran = Vec::new();
+        run_restore_steps(&steps, &|| false, &mut |step| {
+            ran.push(*step);
+            Err(CliError::Other("boom".into()))
+        })
+        .unwrap_err();
+        assert_eq!(ran, vec![RestoreStep::RestoreArtifact]);
+    }
+
+    /// `--reprovision` provisions with no interrupt installed — a signal
+    /// there ends the process at once, as before WI-383 — and every step
+    /// that works in the cluster it made runs with one.
+    #[test]
+    fn only_the_reprovision_step_runs_without_the_interrupt() {
+        let steps = restore_steps(RestoreMode::Reprovision, false);
+        assert_eq!(steps[0], RestoreStep::Reprovision);
+        assert!(!installs_the_interrupt(&steps[0]));
+        for step in &steps[1..] {
+            assert!(installs_the_interrupt(step), "{step:?}");
+        }
+        for step in restore_steps(RestoreMode::IntoRunning, true) {
+            assert!(installs_the_interrupt(&step), "{step:?}");
+        }
+    }
+
+    /// A cluster for [`suspend_workloads`]: one Application per namespace
+    /// (`web` in each, 3 replicas), one Argo registration each, and every
+    /// call logged. `signal_at` names the Application whose Argo lookup the
+    /// signal arrives during.
+    struct FakeSuspend {
+        log: RefCell<Vec<String>>,
+        signal_at: Option<&'static str>,
+        signalled: RefCell<Option<crate::commands::helper_interrupt::test_seam::Interrupted>>,
+    }
+
+    impl SuspendCluster for FakeSuspend {
+        fn applications(&self, ns: &str) -> Result<Vec<Value>> {
+            self.log.borrow_mut().push(format!("list {ns}"));
+            Ok(vec![json!({
+                "metadata": {"name": "web", "namespace": ns},
+                "spec": {"base": {"replicas": 3}}
+            })])
+        }
+
+        fn argo_apps_for(&self, name: &str, ns: &str) -> Result<Vec<(String, String)>> {
+            self.log.borrow_mut().push(format!("argo {ns}/{name}"));
+            if self.signal_at == Some(ns) {
+                *self.signalled.borrow_mut() =
+                    Some(crate::commands::helper_interrupt::test_seam::interrupt_this_thread());
+            }
+            Ok(vec![("argocd".into(), format!("{ns}-{name}"))])
+        }
+
+        fn patch(&self, patch: &MergePatch) -> Result<()> {
+            self.log
+                .borrow_mut()
+                .push(format!("patch {}/{}", patch.namespace, patch.name));
+            Ok(())
+        }
+    }
+
+    fn fake_suspend(signal_at: Option<&'static str>) -> FakeSuspend {
+        FakeSuspend {
+            log: RefCell::new(Vec::new()),
+            signal_at,
+            signalled: RefCell::new(None),
+        }
+    }
+
+    /// The signal comes while the step looks up the second application: the
+    /// first stays suspended and recorded, the second is neither patched nor
+    /// recorded — the way out must not name it as down — and the step ends.
+    #[test]
+    fn suspend_stops_at_the_signal_and_records_only_what_it_wrote() {
+        let namespaces = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let cluster = fake_suspend(Some("b"));
+        let (mut argo, mut recorded) = (Vec::new(), Vec::new());
+        let e = suspend_workloads(&namespaces, &cluster, &mut argo, &mut recorded).unwrap_err();
+        assert!(e.to_string().starts_with("interrupted"), "{e}");
+        assert_eq!(
+            *cluster.log.borrow(),
+            vec![
+                "list a",
+                "argo a/web",
+                "patch argocd/a-web",
+                "patch a/web",
+                "list b",
+                "argo b/web"
+            ]
+        );
+        assert_eq!(recorded, vec![(("a".to_string(), "web".to_string()), 3)]);
+        assert_eq!(argo, vec![("argocd".to_string(), "a-web".to_string())]);
+        // Its guard un-signals this thread.
+        drop(cluster);
+
+        // No signal: every namespace's application, each recorded.
+        let cluster = fake_suspend(None);
+        let (mut argo, mut recorded) = (Vec::new(), Vec::new());
+        suspend_workloads(&namespaces, &cluster, &mut argo, &mut recorded).unwrap();
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(argo.len(), 3);
+    }
+
+    /// Through kubectl, the suspend and the resume refuse outright once the
+    /// signal has come: their first kubectl call is refused, so nothing is
+    /// listed, written or recorded.
+    #[test]
+    fn once_interrupted_suspend_and_resume_write_nothing() {
+        let kc = crate::commands::helper_interrupt::test_seam::unreachable_kubeconfig();
+        let _interrupted = crate::commands::helper_interrupt::test_seam::interrupt_this_thread();
+        let manifest = manifest_of(&["demo"], vec![resource("ResourceClaim", "demo", "db")]);
+        let (mut argo, mut recorded) = (Vec::new(), Vec::new());
+        let e =
+            suspend_running_workloads(&manifest, kc.path(), &mut argo, &mut recorded).unwrap_err();
+        assert!(e.to_string().starts_with("interrupted"), "{e}");
+        assert!(recorded.is_empty() && argo.is_empty());
+
+        let apps = vec![(("demo".to_string(), "web".to_string()), 3)];
+        let argo = vec![("argocd".to_string(), "demo-web".to_string())];
+        let e = resume_workloads(&apps, &argo, kc.path()).unwrap_err();
+        assert!(e.to_string().starts_with("interrupted"), "{e}");
+    }
+
+    /// Nor does it start restic, or one more reachability probe of a
+    /// database it is about to load.
+    #[test]
+    fn once_interrupted_the_restore_starts_no_restic_and_no_probe() {
+        let _interrupted = crate::commands::helper_interrupt::test_seam::interrupt_this_thread();
+        let argv = vec!["snapshots".to_string(), "--json".to_string()];
+        let creds = BTreeMap::new();
+        let e = restic_stdout(&argv, "pw", &creds).unwrap_err();
+        assert!(e.to_string().starts_with("interrupted"), "{e}");
+        let e = run_restic_restore(&argv, "pw", &creds).unwrap_err();
+        assert!(e.to_string().starts_with("interrupted"), "{e}");
+
+        let mut probed = 0;
+        let e = poll_pg_reachable(3, std::time::Duration::ZERO, &pg_conn(), &mut || {
+            probed += 1;
+            Err("not yet".into())
+        })
+        .unwrap_err();
+        assert!(e.to_string().starts_with("interrupted"), "{e}");
+        assert_eq!(probed, 0);
     }
 }

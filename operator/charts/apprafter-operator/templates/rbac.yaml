@@ -669,6 +669,71 @@ subjects:
     name: {{ include "apprafter-operator.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 ---
+# WI-386 `BackupHealthy`: the PlatformController reads the two backup
+# CronJobs (`apprafter-backup`, `apprafter-backup-check`), their Jobs and
+# the runner pods (label `apprafter.io/backup-runner=true`) to tell whether
+# the scheduled backup can run — a pod that is never scheduled, a runner
+# killed at its memory limit or evicted, a Job stopped by its deadline.
+# `list` for the reads and `watch` for the triggers, so the condition moves
+# when those objects do rather than at the next `checkInterval`. The
+# runner's own status ConfigMap is read under the ClusterRole's existing
+# `configmaps` `get`.
+#
+# A Role, not ClusterRole lines: the code reads these in `apprafter-system`
+# only, the namespace the platform chart deploys the CronJobs into and the
+# controller hardcodes (`backup_health::BACKUP_NAMESPACE`), whatever
+# namespace this chart is installed in. Read-only — the operator never
+# creates, changes or deletes a backup Job.
+#
+# Granted in the SAME change as the code that uses it: a missing verb shows
+# only on a live cluster, as a watch that 403s forever and a condition stuck
+# at `Unknown` (`StateUnreadable`). Nor does the harm stay with backups:
+# kube-runtime backs off the controller's triggers as ONE stream, so every
+# failed watch here also delays the controller's reaction to PlatformStack
+# and Argo CD Application changes, by up to about 30 s each time (reconciles
+# still run, on their requeues). An upgrade reaches this Role within a sync;
+# a fork that trims it must drop the three backup `.watches` in
+# `operator-controllers/platform-stack/src/reconcile.rs` with it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "apprafter-operator.fullname" . }}-backup-health
+  namespace: apprafter-system
+  labels:
+    {{- include "apprafter-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - batch
+    resources:
+      - cronjobs
+      - jobs
+    verbs:
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "apprafter-operator.fullname" . }}-backup-health
+  namespace: apprafter-system
+  labels:
+    {{- include "apprafter-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "apprafter-operator.fullname" . }}-backup-health
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "apprafter-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
 # Lease for leader election — namespaced to the operator's own
 # namespace so the blast radius stays small.
 apiVersion: rbac.authorization.k8s.io/v1

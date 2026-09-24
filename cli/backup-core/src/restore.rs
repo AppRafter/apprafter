@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: FSL-1.1-Apache-2.0
 //! 2.6d restore: ordered step-decision state machine (pure, unit-testable).
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +61,45 @@ pub struct RunSnapshots {
     /// The per-claim snapshots of the same run, oldest first. Empty for a
     /// monolithic backup.
     pub claims: Vec<String>,
+    /// For `latest`: the runs NEWER than this one that it passed over because
+    /// they never completed ([`UnfinishedRun`]). Always empty for a snapshot
+    /// named by id.
+    pub passed_over: Vec<UnfinishedRun>,
+    /// The snapshot the caller named, when it is not the one that completes
+    /// its run — a per-claim snapshot of a sequential run. `commit` is then
+    /// that run's commit snapshot, and the named one is among `claims`.
+    /// `None` for `latest` and for a named snapshot that completes its run.
+    pub resolved_from: Option<String>,
+}
+
+/// A backup run no snapshot of which carries `manifest.json`: a sequential run
+/// stopped before its commit snapshot (a SIGINT, a kill, a Job's deadline), or
+/// one a backup is still writing — from the repository alone the two look the
+/// same.
+///
+/// `latest` never resolves to one ([`resolve_run_snapshots`]), and reports the
+/// ones newer than the run it chose, so an operator is not left believing the
+/// newest backup is the one being restored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnfinishedRun {
+    /// The run tag its snapshots share: their first tag, and empty for the
+    /// untagged snapshots, which the prune counts as one run.
+    pub tag: String,
+    /// How many snapshots it holds.
+    pub snapshots: usize,
+    /// The newest of their times, as restic reports it (RFC 3339, with the
+    /// writer's own UTC offset). "Newest" is by the clock, not the string.
+    pub newest: String,
+}
+
+/// What `latest` means for a caller that wants one snapshot rather than a
+/// whole run ([`resolve_latest_snapshot`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LatestSnapshot {
+    /// The snapshot carrying the newest complete run's `manifest.json`.
+    pub id: String,
+    /// The unfinished runs newer than it, as in [`RunSnapshots::passed_over`].
+    pub passed_over: Vec<UnfinishedRun>,
 }
 
 /// Group a `restic snapshots --json` listing into the run the caller asked for.
@@ -79,7 +119,8 @@ pub struct RunSnapshots {
 ///
 /// `requested` is the snapshot the user asked to restore: `latest`, or an id /
 /// short-id prefix. The commit point is that snapshot; its siblings are every
-/// other snapshot sharing at least one tag with it.
+/// other snapshot sharing its run tag — its FIRST tag, the key the prune
+/// groups by ([`run_tag_of`]).
 ///
 /// # `latest` in a SHARED repository (E2)
 ///
@@ -111,9 +152,29 @@ pub struct RunSnapshots {
 /// repository inspected with no target). `latest` then falls back to the
 /// single-cluster / refuse-if-ambiguous rule, which is the safe half.
 ///
+/// # `latest` is the newest COMPLETE run
+///
+/// Inside that pool, `latest` is the newest snapshot that completes its run —
+/// the one carrying `manifest.json`, by the rule the prune plans with
+/// ([`crate::prune::derive_manifest`]). It used to be the newest snapshot of
+/// any kind, and after a sequential backup was stopped between its claims
+/// (a SIGINT, a kill, a Job's deadline) that was a per-claim snapshot of a run
+/// with no manifest: `backup show` then said the repository held something
+/// other than a backup, and a restore with no `--snapshot` failed on the
+/// missing manifest until a newer complete run landed — so the restore right
+/// after a backup died, the one disaster recovery needs, was the one that
+/// could not run. The prune already treats such a run as unfinished and never
+/// as a run to keep; `latest` now agrees with it. The unfinished runs newer
+/// than the one chosen are returned in [`RunSnapshots::passed_over`], so the
+/// caller says so rather than skipping them silently.
+///
 /// An EXPLICIT snapshot id is always honoured, whatever cluster it belongs to:
 /// naming an id is the operator saying which run they mean, and it is the
-/// escape hatch the refusal above points at.
+/// escape hatch the refusal above points at. It names a RUN: a snapshot that
+/// does not complete its run — a per-claim one — resolves to the snapshot
+/// that does ([`RunSnapshots::resolved_from`] says so), and one whose run
+/// has no such snapshot is refused before anything is downloaded
+/// ([`commit_of_named_run`]).
 pub fn resolve_run_snapshots(
     snapshots_json: &str,
     requested: &str,
@@ -121,13 +182,14 @@ pub fn resolve_run_snapshots(
 ) -> Result<RunSnapshots, String> {
     let snaps = parse_snapshot_list(snapshots_json)?;
 
-    // `latest` is restic's own spelling for "newest by time", which is exactly
-    // what the sequential writer makes the commit point: it is written LAST —
-    // but only ever within ONE cluster's snapshots (E2).
-    let commit = if requested == "latest" {
-        choose_latest(&snaps, this_cluster_uid)?
+    // `latest` is the newest snapshot that completes its run — which is what
+    // the sequential writer makes the commit point: it is written LAST — and
+    // only ever within ONE cluster's snapshots (E2).
+    let (commit, passed_over, resolved_from) = if requested == "latest" {
+        let latest = choose_latest(&snaps, this_cluster_uid)?;
+        (latest.commit, latest.passed_over, None)
     } else {
-        snaps
+        let named = snaps
             .iter()
             .find(|s| {
                 let id = id_of(s);
@@ -135,35 +197,89 @@ pub fn resolve_run_snapshots(
                     || id.starts_with(requested)
                     || s.get("short_id").and_then(Value::as_str) == Some(requested)
             })
-            .ok_or_else(|| format!("no snapshot matching `{requested}` in this repository"))?
+            .ok_or_else(|| format!("no snapshot matching `{requested}` in this repository"))?;
+        let commit = commit_of_named_run(&snaps, named, requested)?;
+        let resolved_from = (!std::ptr::eq(commit, named)).then(|| id_of(named));
+        (commit, Vec::new(), resolved_from)
     };
 
     let commit_id = id_of(commit);
-    let commit_tags = crate::cluster::snapshot_tags(commit);
+    let run_tag = run_tag_of(commit);
 
     // An untagged snapshot cannot be grouped, and must not silently drag in
     // every other untagged snapshot in the repository.
-    let mut claims: Vec<(String, String)> = Vec::new();
-    if !commit_tags.is_empty() {
+    let mut claims: Vec<(Option<DateTime<Utc>>, String)> = Vec::new();
+    if !run_tag.is_empty() {
         for s in &snaps {
             let id = id_of(s);
-            if id == commit_id {
-                continue;
-            }
-            if crate::cluster::snapshot_tags(s)
-                .iter()
-                .any(|t| commit_tags.contains(t))
-            {
-                claims.push((time_of(s), id));
+            if id != commit_id && run_tag_of(s) == run_tag {
+                claims.push((instant_of(s), id));
             }
         }
     }
+    // Oldest first by the clock: the strings of one run need not order as
+    // its instants do (a run across the autumn clock change).
     claims.sort();
 
     Ok(RunSnapshots {
         commit: commit_id,
         claims: claims.into_iter().map(|(_, id)| id).collect(),
+        passed_over,
+        resolved_from,
     })
+}
+
+/// The snapshot a restore of `named` starts from: `named` when it completes
+/// its run, else the snapshot of its run that does — by the same rule as
+/// `latest` ([`RunSizes::completes`]) — and an error, before anything is
+/// downloaded, when the run has none.
+///
+/// A named snapshot used to be taken as the commit point whatever it was. A
+/// per-claim snapshot named that way was downloaded whole — a database dump,
+/// a volume — and the restore then failed on "no manifest.json … is this an
+/// AppRafter backup repo?". A restore replays whole runs, so a claim of a
+/// complete run means that run; a claim of an unfinished one has nothing to
+/// replay it from, and restoring part of a run is not supported.
+fn commit_of_named_run<'a>(
+    snaps: &'a [Value],
+    named: &'a Value,
+    requested: &str,
+) -> Result<&'a Value, String> {
+    let runs = RunSizes::of(snaps);
+    if runs.completes(named) {
+        return Ok(named);
+    }
+    let id = id_of(named);
+    let tag = run_tag_of(named);
+    if tag.is_empty() {
+        // The untagged snapshots are one group to the prune, but a restore
+        // never gathers them into a run (see the claims above).
+        return Err(format!(
+            "snapshot `{requested}` ({id}) carries no run tag, so no run can be put together \
+             around it, and it does not complete one by itself — it is not a backup run a \
+             restore can replay, so nothing was downloaded. `apprafter backup list` shows the \
+             complete runs; name one of those with `--snapshot <id>`, or leave `--snapshot` out \
+             for the newest complete run."
+        ));
+    }
+    let run: Vec<&Value> = snaps.iter().filter(|s| run_tag_of(s) == tag).collect();
+    if let Some(commit) = run
+        .iter()
+        .copied()
+        .filter(|s| runs.completes(s))
+        .max_by_key(|s| instant_of(s))
+    {
+        return Ok(commit);
+    }
+    Err(format!(
+        "snapshot `{requested}` ({id}) is one of the {} snapshot(s) of backup run {tag}, and none \
+         of them carries manifest.json: the run was interrupted before its last snapshot, or is \
+         still being written. A restore replays a whole run, starting from the snapshot that \
+         carries its manifest, and restoring part of a run is not supported — so nothing was \
+         downloaded. `apprafter backup list` shows the complete runs; name one of those with \
+         `--snapshot <id>`, or leave `--snapshot` out for the newest complete run.",
+        run.len()
+    ))
 }
 
 /// The snapshot id `latest` means for THIS cluster, for a caller that wants
@@ -177,9 +293,13 @@ pub fn resolve_run_snapshots(
 pub fn resolve_latest_snapshot(
     snapshots_json: &str,
     this_cluster_uid: Option<&str>,
-) -> Result<String, String> {
+) -> Result<LatestSnapshot, String> {
     let snaps = parse_snapshot_list(snapshots_json)?;
-    Ok(id_of(choose_latest(&snaps, this_cluster_uid)?))
+    let latest = choose_latest(&snaps, this_cluster_uid)?;
+    Ok(LatestSnapshot {
+        id: id_of(latest.commit),
+        passed_over: latest.passed_over,
+    })
 }
 
 /// Parse `restic snapshots --json` into a non-empty snapshot list.
@@ -200,8 +320,8 @@ fn id_of(s: &Value) -> String {
         .to_string()
 }
 
-/// A snapshot's RFC-3339 time, or the empty string — which sorts first, so an
-/// undated snapshot never wins a `max_by_key`.
+/// A snapshot's time as restic reports it, or the empty string. For display
+/// only: compare [`instant_of`].
 fn time_of(s: &Value) -> String {
     s.get("time")
         .and_then(Value::as_str)
@@ -209,20 +329,203 @@ fn time_of(s: &Value) -> String {
         .to_string()
 }
 
-/// The newest snapshot of [`latest_pool`] — THE definition of `latest` here,
-/// in one place so `restore` and `backup show` cannot drift apart.
+/// A snapshot's time as an instant, which is what every comparison here uses
+/// ([`crate::restic::snapshot_instant`]): compared as strings, a run a
+/// workstation wrote at `04:00:03+01:00` beat a later one the runner wrote at
+/// `03:30:00Z` as `latest`, and hid a newer unfinished one.
+///
+/// `None` — no time, or one that does not parse — orders before every
+/// instant, so such a snapshot never wins a `max_by_key`.
+fn instant_of(s: &Value) -> Option<DateTime<Utc>> {
+    crate::restic::snapshot_instant(s.get("time").and_then(Value::as_str)?)
+}
+
+/// A snapshot's `paths`, as restic reports them.
+fn paths_of(s: &Value) -> Vec<String> {
+    s.get("paths")
+        .and_then(Value::as_array)
+        .map(|p| {
+            p.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A snapshot's run tag: its FIRST tag, or `""` when it has none.
+///
+/// This is the key the prune groups runs by
+/// ([`crate::prune::parse_snapshots`]), so `latest`, a snapshot named by id
+/// and the prune agree on what one run is. Every AppRafter writer passes one
+/// `--tag`, the run tag; a tag an operator adds later (`restic tag --add`)
+/// comes after it and joins no runs together. The untagged snapshots — none
+/// of them written by AppRafter — are one group, `""`, as the prune has them.
+fn run_tag_of(s: &Value) -> String {
+    crate::cluster::snapshot_tags(s)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
+
+/// How many snapshots of a whole listing each run holds — which says, with
+/// a snapshot's paths, whether it completes its run.
+///
+/// Counted over the WHOLE listing, before any cluster filter, exactly as the
+/// prune counts.
+struct RunSizes(std::collections::HashMap<String, usize>);
+
+impl RunSizes {
+    fn of(snaps: &[Value]) -> Self {
+        let mut size: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for s in snaps {
+            *size.entry(run_tag_of(s)).or_default() += 1;
+        }
+        Self(size)
+    }
+
+    /// Does `s` complete its run — carry its `manifest.json`? The prune's
+    /// rule ([`crate::prune::derive_manifest`]) over the prune's grouping.
+    fn completes(&self, s: &Value) -> bool {
+        let alone = self.0.get(&run_tag_of(s)).copied().unwrap_or(0) <= 1;
+        crate::prune::derive_manifest(&paths_of(s), alone)
+    }
+}
+
+/// `latest` as [`choose_latest`] resolves it.
+struct Latest<'a> {
+    commit: &'a Value,
+    passed_over: Vec<UnfinishedRun>,
+}
+
+/// The newest snapshot of [`latest_pool`] that completes its run — THE
+/// definition of `latest` here, in one place so `restore` and `backup show`
+/// cannot drift apart — and the unfinished runs of the pool newer than it.
+///
+/// Which snapshot completes its run is the prune's rule
+/// ([`crate::prune::derive_manifest`]) over the prune's grouping
+/// ([`RunSizes`], [`run_tag_of`]): the snapshots sharing a first tag, the
+/// untagged ones being one group. A snapshot that completes nothing, in a
+/// run where nothing else does either, belongs to an [`UnfinishedRun`].
+///
+/// "Newest" is by the clock, never by the time string ([`instant_of`]).
 fn choose_latest<'a>(
     snaps: &'a [Value],
     this_cluster_uid: Option<&str>,
-) -> Result<&'a Value, String> {
-    latest_pool(snaps, this_cluster_uid)?
-        .into_iter()
-        .max_by_key(|s| time_of(s))
-        .ok_or_else(|| "no snapshots to choose from".to_string())
+) -> Result<Latest<'a>, String> {
+    let (pool, drawn_from) = latest_pool(snaps, this_cluster_uid)?;
+
+    let runs = RunSizes::of(snaps);
+    let (complete, rest): (Vec<&Value>, Vec<&Value>) =
+        pool.into_iter().partition(|s| runs.completes(s));
+    let commit = complete.iter().copied().max_by_key(|s| instant_of(s));
+
+    // The other snapshots, by run. A complete run's own per-claim snapshots
+    // are among them, but all are older than its commit — written last — so
+    // none is newer than the run `latest` chose, which is all that is
+    // reported; and with no complete run there are none.
+    //
+    // Each run carries its newest INSTANT beside the string it displays.
+    let mut unfinished: std::collections::BTreeMap<String, (UnfinishedRun, Option<DateTime<Utc>>)> =
+        std::collections::BTreeMap::new();
+    for s in rest {
+        let tag = run_tag_of(s);
+        let at = instant_of(s);
+        let (run, newest_at) = unfinished.entry(tag.clone()).or_insert_with(|| {
+            (
+                UnfinishedRun {
+                    tag,
+                    snapshots: 0,
+                    newest: time_of(s),
+                },
+                at,
+            )
+        });
+        run.snapshots += 1;
+        if at > *newest_at {
+            *newest_at = at;
+            run.newest = time_of(s);
+        }
+    }
+
+    let Some(commit) = commit else {
+        let newest = unfinished
+            .values()
+            .max_by_key(|(_, at)| *at)
+            .map(|(r, _)| r.newest.as_str());
+        // Every complete snapshot is outside the pool: another cluster's.
+        let elsewhere = snaps.iter().filter(|s| runs.completes(s)).count();
+        return Err(no_complete_run(
+            drawn_from,
+            unfinished.len(),
+            newest,
+            elsewhere,
+        ));
+    };
+    let chosen = instant_of(commit);
+    let mut passed_over: Vec<(UnfinishedRun, Option<DateTime<Utc>>)> = unfinished
+        .into_values()
+        .filter(|(_, at)| *at > chosen)
+        .collect();
+    passed_over.sort_by(|(_, a), (_, b)| b.cmp(a));
+    Ok(Latest {
+        commit,
+        passed_over: passed_over.into_iter().map(|(r, _)| r).collect(),
+    })
 }
 
-/// The snapshots `latest` is allowed to choose between — see
-/// [`resolve_run_snapshots`] for the rule and why each branch exists.
+/// Whose snapshots [`latest_pool`] drew `latest`'s candidates from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrawnFrom {
+    /// This cluster's own, with the legacy ones: every other snapshot in the
+    /// repository is another cluster's.
+    ThisCluster,
+    /// Every snapshot in the repository: no cluster to ask, or none of this
+    /// cluster's in a repository of at most one other.
+    Repository,
+}
+
+/// The error for a pool with no complete run in it.
+///
+/// It says whose runs it counted — "here" read as the whole repository when
+/// it meant only this cluster's — and, when another cluster's complete run
+/// IS in the repository, the way to reach it on purpose: the escape hatch
+/// the multi-cluster refusal in [`latest_pool`] gives. It offers none when
+/// there is nothing complete to name.
+fn no_complete_run(
+    drawn_from: DrawnFrom,
+    runs: usize,
+    newest: Option<&str>,
+    complete_elsewhere: usize,
+) -> String {
+    let (whose, listing) = match drawn_from {
+        DrawnFrom::ThisCluster => ("this cluster's", "`apprafter backup list`"),
+        DrawnFrom::Repository => ("the repository's", "`apprafter backup list --all-clusters`"),
+    };
+    let mut err = format!(
+        "no complete backup run to choose: {whose} snapshots form {runs} run(s), and none has \
+         the snapshot that completes it, the one carrying manifest.json{} — each was \
+         interrupted before its last snapshot, or is still being written. A sequential backup \
+         writes that snapshot last. Wait for a backup in progress to finish, or take one \
+         (`apprafter backup run`); {listing} shows them.",
+        newest
+            .map(|t| format!(" (the newest written at {t})"))
+            .unwrap_or_default(),
+    );
+    if complete_elsewhere > 0 {
+        err.push_str(&format!(
+            " The repository does hold {complete_elsewhere} complete run(s) of other clusters, \
+             which `latest` never picks for this one: `apprafter backup list --all-clusters` \
+             shows every snapshot with the cluster it belongs to; to use one of them on \
+             purpose, name it — `--snapshot <id>` for a restore, `apprafter backup show <id>` \
+             to look inside it first."
+        ));
+    }
+    err
+}
+
+/// The snapshots `latest` is allowed to choose between, and whose they are
+/// — see [`resolve_run_snapshots`] for the rule and why each branch exists.
 ///
 /// Separated out so the DECISION (which cluster's history is `latest` drawn
 /// from) is a single readable function rather than a condition threaded
@@ -230,7 +533,7 @@ fn choose_latest<'a>(
 fn latest_pool<'a>(
     snaps: &'a [Value],
     this_cluster_uid: Option<&str>,
-) -> Result<Vec<&'a Value>, String> {
+) -> Result<(Vec<&'a Value>, DrawnFrom), String> {
     if let Some(uid) = this_cluster_uid {
         // A pool of ONLY legacy snapshots is not a history of our own.
         //
@@ -257,12 +560,13 @@ fn latest_pool<'a>(
             )
         });
         if have_our_own {
-            return Ok(snaps
+            let ours = snaps
                 .iter()
                 .filter(|s| {
                     crate::cluster::owned_by_this_cluster(&crate::cluster::snapshot_tags(s), uid)
                 })
-                .collect());
+                .collect();
+            return Ok((ours, DrawnFrom::ThisCluster));
         }
     }
 
@@ -282,7 +586,7 @@ fn latest_pool<'a>(
             others.join(", ")
         ));
     }
-    Ok(snaps.iter().collect())
+    Ok((snaps.iter().collect(), DrawnFrom::Repository))
 }
 
 /// Decide the ordered restore steps for a mode + `--data-only`.
@@ -426,10 +730,14 @@ mod tests {
     fn a_different_run_is_never_dragged_in() {
         // THE isolation rule: two runs in one repository must not blend, or a
         // restore would load another backup's data over this one's.
+        //
+        // The newer run is a sequential one, spelled with the paths the writer
+        // gives it: a two-snapshot run whose paths name neither a claim nor
+        // the commit completes nothing, and `latest` never picks such a run.
         let two_runs = r#"[
-          {"id":"old1","short_id":"old1","time":"2026-09-01T10:00:00Z","tags":["platform-run-0"],"paths":["/a"]},
-          {"id":"new1","short_id":"new1","time":"2026-09-02T10:00:00Z","tags":["platform-run-1"],"paths":["/b"]},
-          {"id":"new2","short_id":"new2","time":"2026-09-02T10:00:01Z","tags":["platform-run-1"],"paths":["/c"]}
+          {"id":"old1","short_id":"old1","time":"2026-09-01T10:00:00Z","tags":["platform-run-0"],"paths":["/a/data"]},
+          {"id":"new1","short_id":"new1","time":"2026-09-02T10:00:00Z","tags":["platform-run-1"],"paths":["/b/claim-0"]},
+          {"id":"new2","short_id":"new2","time":"2026-09-02T10:00:01Z","tags":["platform-run-1"],"paths":["/b/commit"]}
         ]"#;
         let r = resolve_run_snapshots(two_runs, "latest", Some(MINE)).unwrap();
         assert_eq!(r.commit, "new2");
@@ -452,10 +760,12 @@ mod tests {
     #[test]
     fn an_untagged_snapshot_groups_with_nothing() {
         // Without a tag there is no run to reconstruct, and guessing would
-        // merge unrelated backups.
+        // merge unrelated backups. (Which untagged snapshot completes a run
+        // is the prune's rule — they are one group, and only a `commit` one
+        // completes it; see the tests on the prune's grouping below.)
         let untagged = r#"[
           {"id":"u1","short_id":"u1","time":"2026-09-02T10:00:00Z","tags":[],"paths":["/a"]},
-          {"id":"u2","short_id":"u2","time":"2026-09-02T10:00:01Z","tags":[],"paths":["/b"]}
+          {"id":"u2","short_id":"u2","time":"2026-09-02T10:00:01Z","tags":[],"paths":["/b/commit"]}
         ]"#;
         let r = resolve_run_snapshots(untagged, "latest", Some(MINE)).unwrap();
         assert_eq!(r.commit, "u2");
@@ -554,7 +864,9 @@ mod tests {
     /// restore, so a foreign answer here becomes a foreign restore.
     #[test]
     fn resolve_latest_snapshot_stays_inside_this_clusters_history() {
-        let id = resolve_latest_snapshot(&shared_listing(), Some(MINE)).unwrap();
+        let id = resolve_latest_snapshot(&shared_listing(), Some(MINE))
+            .unwrap()
+            .id;
         assert_eq!(id, "mine1", "the newest in the repository is theirs");
     }
 
@@ -563,7 +875,9 @@ mod tests {
     /// returns the oldest snapshot.
     #[test]
     fn resolve_latest_snapshot_from_the_other_side_resolves_to_that_cluster() {
-        let id = resolve_latest_snapshot(&shared_listing(), Some(THEIRS)).unwrap();
+        let id = resolve_latest_snapshot(&shared_listing(), Some(THEIRS))
+            .unwrap()
+            .id;
         assert_eq!(id, "theirs1");
     }
 
@@ -573,7 +887,7 @@ mod tests {
     #[test]
     fn show_and_restore_resolve_latest_to_the_same_snapshot() {
         for uid in [Some(MINE), Some(THEIRS), None] {
-            let shown = resolve_latest_snapshot(&shared_listing(), uid);
+            let shown = resolve_latest_snapshot(&shared_listing(), uid).map(|l| l.id);
             let restored =
                 resolve_run_snapshots(&shared_listing(), "latest", uid).map(|r| r.commit);
             assert_eq!(shown, restored, "uid={uid:?}");
@@ -649,6 +963,570 @@ mod tests {
             r.commit, "old",
             "legacy stays selectable; the foreign run is still excluded"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // `latest` is the newest COMPLETE run: an unfinished one is passed over.
+    // -----------------------------------------------------------------------
+
+    /// A complete sequential run, then a NEWER one stopped after two of its
+    /// claims — the shape a SIGINT, a kill or a deadline leaves: per-claim
+    /// snapshots and no commit snapshot, so no `manifest.json` anywhere in it.
+    fn interrupted_listing() -> String {
+        let done = format!("{MINE}-2026-09-23T03:00:00Z");
+        let cut = format!("{MINE}-2026-09-24T03:00:00Z");
+        format!(
+            r#"[
+              {{"id":"d-claim0","short_id":"d-claim0","time":"2026-09-23T03:00:01Z",
+                "tags":["{done}"],"paths":["/staging/apprafter-backup-a/claim-0"]}},
+              {{"id":"d-claim1","short_id":"d-claim1","time":"2026-09-23T03:00:02Z",
+                "tags":["{done}"],"paths":["/staging/apprafter-backup-a/claim-1"]}},
+              {{"id":"d-commit","short_id":"d-commit","time":"2026-09-23T03:00:03Z",
+                "tags":["{done}"],"paths":["/staging/apprafter-backup-a/commit"]}},
+              {{"id":"c-claim0","short_id":"c-claim0","time":"2026-09-24T03:00:01Z",
+                "tags":["{cut}"],"paths":["/tmp/apprafter-backup-b/claim-0"]}},
+              {{"id":"c-claim1","short_id":"c-claim1","time":"2026-09-24T03:00:02Z",
+                "tags":["{cut}"],"paths":["/tmp/apprafter-backup-b/claim-1"]}}
+            ]"#
+        )
+    }
+
+    /// FIRES: the newest snapshot belongs to a run that never wrote its commit
+    /// snapshot. `latest` used to resolve to it, so `backup show` said the
+    /// repository "holds something else" and a restore with no `--snapshot`
+    /// found no manifest — until a newer complete run landed, which is the
+    /// worst time to be told that: right after a backup died.
+    #[test]
+    fn latest_is_the_newest_complete_run_not_a_newer_unfinished_one() {
+        let r = resolve_run_snapshots(&interrupted_listing(), "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "d-commit", "the unfinished run has no manifest");
+        assert_eq!(
+            r.claims,
+            vec!["d-claim0", "d-claim1"],
+            "and the complete run's own claims come with it, not the unfinished run's"
+        );
+        let id = resolve_latest_snapshot(&interrupted_listing(), Some(MINE))
+            .unwrap()
+            .id;
+        assert_eq!(id, "d-commit", "`backup show` resolves the same run");
+    }
+
+    /// …and the run it passed over is reported, not skipped in silence: the
+    /// operator has to know the newest backup is not the one being restored.
+    /// Only the unfinished run — the complete run's own claim snapshots are
+    /// not "unfinished" merely for carrying no manifest themselves.
+    #[test]
+    fn latest_reports_the_newer_unfinished_run_it_passed_over() {
+        let cut = UnfinishedRun {
+            tag: format!("{MINE}-2026-09-24T03:00:00Z"),
+            snapshots: 2,
+            newest: "2026-09-24T03:00:02Z".into(),
+        };
+        let r = resolve_run_snapshots(&interrupted_listing(), "latest", Some(MINE)).unwrap();
+        assert_eq!(r.passed_over, vec![cut.clone()]);
+        let shown = resolve_latest_snapshot(&interrupted_listing(), Some(MINE)).unwrap();
+        assert_eq!(
+            shown.passed_over,
+            vec![cut],
+            "show and restore say the same"
+        );
+    }
+
+    /// An unfinished run OLDER than the one chosen is not news: `latest` did
+    /// not pass over it, and a note about last week's dead run on every
+    /// restore is a note nobody reads.
+    #[test]
+    fn an_older_unfinished_run_is_not_reported() {
+        let dead = format!("{MINE}-2026-09-20T03:00:00Z");
+        let done = format!("{MINE}-2026-09-23T03:00:00Z");
+        let listing = format!(
+            r#"[
+              {{"id":"x-claim0","time":"2026-09-20T03:00:01Z","tags":["{dead}"],
+                "paths":["/s/a/claim-0"]}},
+              {{"id":"mono","time":"2026-09-23T03:00:00Z","tags":["{done}"],
+                "paths":["/s/b/data"]}}
+            ]"#
+        );
+        let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "mono");
+        assert!(r.passed_over.is_empty(), "{:?}", r.passed_over);
+    }
+
+    /// A sequential run of ONE claim stopped before its commit is a lone
+    /// `claim-0` snapshot. Alone in its run it still completes nothing — the
+    /// prune's rule — so a monolithic run before it stays `latest`.
+    #[test]
+    fn a_lone_claim_snapshot_is_not_a_complete_run() {
+        let done = format!("{MINE}-2026-09-23T03:00:00Z");
+        let cut = format!("{MINE}-2026-09-24T03:00:00Z");
+        let listing = format!(
+            r#"[
+              {{"id":"mono","time":"2026-09-23T03:00:00Z","tags":["{done}"],
+                "paths":["/s/a/data"]}},
+              {{"id":"lone","time":"2026-09-24T03:00:01Z","tags":["{cut}"],
+                "paths":["/s/b/claim-0"]}}
+            ]"#
+        );
+        let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "mono");
+        assert_eq!(r.passed_over.len(), 1);
+        assert_eq!(r.passed_over[0].snapshots, 1);
+    }
+
+    /// The rule is the prune's, whole: in a run of several snapshots only the
+    /// one under `commit` completes it, so a run whose paths name neither a
+    /// claim nor the commit completes nothing, and the older run is `latest`.
+    #[test]
+    fn a_run_of_several_snapshots_with_no_commit_path_completes_nothing() {
+        let done = format!("{MINE}-2026-09-23T03:00:00Z");
+        let odd = format!("{MINE}-2026-09-24T03:00:00Z");
+        let listing = format!(
+            r#"[
+              {{"id":"mono","time":"2026-09-23T03:00:00Z","tags":["{done}"],"paths":["/s/a/data"]}},
+              {{"id":"odd1","time":"2026-09-24T03:00:01Z","tags":["{odd}"],"paths":["/s/b/data"]}},
+              {{"id":"odd2","time":"2026-09-24T03:00:02Z","tags":["{odd}"],"paths":["/s/c/data"]}}
+            ]"#
+        );
+        let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "mono");
+        assert_eq!(r.passed_over.len(), 1, "{:?}", r.passed_over);
+    }
+
+    /// Nothing complete at all — a first backup that died — is an error that
+    /// says what the repository holds and what to do, not "no manifest".
+    #[test]
+    fn latest_with_no_complete_run_says_every_run_is_unfinished() {
+        let cut = format!("{MINE}-2026-09-24T03:00:00Z");
+        let listing = format!(
+            r#"[
+              {{"id":"c0","time":"2026-09-24T03:00:01Z","tags":["{cut}"],"paths":["/s/claim-0"]}},
+              {{"id":"c1","time":"2026-09-24T03:00:02Z","tags":["{cut}"],"paths":["/s/claim-1"]}}
+            ]"#
+        );
+        for err in [
+            resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap_err(),
+            resolve_latest_snapshot(&listing, Some(MINE)).unwrap_err(),
+        ] {
+            assert!(err.contains("no complete backup run"), "{err}");
+            assert!(
+                err.contains("this cluster's snapshots form 1 run(s)"),
+                "{err}"
+            );
+            assert!(err.contains("manifest.json"), "{err}");
+            assert!(err.contains("2026-09-24T03:00:02Z"), "{err}");
+            assert!(err.contains("still being written"), "{err}");
+            assert!(err.contains("`apprafter backup list` shows them"), "{err}");
+            // Nothing complete anywhere: no run to name instead.
+            assert!(!err.contains("--all-clusters"), "{err}");
+            assert!(!err.contains("--snapshot"), "{err}");
+        }
+    }
+
+    /// FIRES: this cluster's only run is unfinished and ANOTHER cluster's
+    /// complete run is in the repository. `latest` rightly does not pick
+    /// theirs (E2), but the error said "1 run(s) here" — which reads as the
+    /// whole repository — and gave no way to reach the run that exists.
+    /// It now says whose runs it counted, and gives the refusal's escape
+    /// hatch: list every cluster's snapshots, then name one.
+    #[test]
+    fn with_no_complete_run_of_its_own_the_error_names_the_other_clusters_ones() {
+        let listing = format!(
+            r#"[
+              {{"id":"theirs","time":"2026-09-23T03:00:00Z",
+                "tags":["{THEIRS}-2026-09-23T03:00:00Z"],"paths":["/s/t/data"]}},
+              {{"id":"c0","time":"2026-09-24T03:00:01Z",
+                "tags":["{MINE}-2026-09-24T03:00:00Z"],"paths":["/s/claim-0"]}}
+            ]"#
+        );
+        for err in [
+            resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap_err(),
+            resolve_latest_snapshot(&listing, Some(MINE)).unwrap_err(),
+        ] {
+            assert!(
+                err.contains("this cluster's snapshots form 1 run(s)"),
+                "{err}"
+            );
+            assert!(!err.contains(" here"), "{err}");
+            assert!(err.contains("1 complete run(s) of other clusters"), "{err}");
+            assert!(
+                err.contains("`apprafter backup list --all-clusters`"),
+                "{err}"
+            );
+            assert!(err.contains("`--snapshot <id>` for a restore"), "{err}");
+            assert!(err.contains("`apprafter backup show <id>`"), "{err}");
+        }
+    }
+
+    /// With no cluster to ask (or none of this cluster's snapshots in a
+    /// one-cluster repository), `latest` looked at the whole repository,
+    /// and the error says that — and points at the listing that shows it.
+    #[test]
+    fn with_no_cluster_to_ask_the_error_counts_the_repositorys_runs() {
+        let listing = format!(
+            r#"[
+              {{"id":"c0","time":"2026-09-24T03:00:01Z",
+                "tags":["{MINE}-2026-09-24T03:00:00Z"],"paths":["/s/claim-0"]}}
+            ]"#
+        );
+        let fresh = "abcdabcd-0000-0000-0000-abcdabcdabcd";
+        for uid in [None, Some(fresh)] {
+            let err = resolve_latest_snapshot(&listing, uid).unwrap_err();
+            assert!(
+                err.contains("the repository's snapshots form 1 run(s)"),
+                "{err}"
+            );
+            assert!(!err.contains("this cluster"), "{err}");
+            assert!(
+                err.contains("`apprafter backup list --all-clusters` shows them"),
+                "{err}"
+            );
+            assert!(!err.contains("--snapshot"), "{err}");
+        }
+    }
+
+    /// A snapshot named by id is honoured as it always was, and `latest`'s
+    /// note does not follow it: nothing was passed over.
+    #[test]
+    fn a_named_snapshot_passes_nothing_over() {
+        let r = resolve_run_snapshots(&interrupted_listing(), "d-commit", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "d-commit");
+        assert!(r.passed_over.is_empty());
+        assert_eq!(
+            r.resolved_from, None,
+            "the named snapshot completes its run"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // A snapshot named by id that does not complete its run.
+    // -----------------------------------------------------------------------
+
+    /// FIRES: `--snapshot <a per-claim snapshot of a complete run>` took the
+    /// claim as the commit point, downloaded its whole dump, then failed on
+    /// "no manifest.json … is this an AppRafter backup repo?". A restore
+    /// replays whole runs, so it resolves to the run's commit snapshot, with
+    /// the named claim among the run's claims, and says which it named.
+    #[test]
+    fn a_named_claim_of_a_complete_run_resolves_to_that_runs_commit() {
+        for named in ["d-claim0", "d-claim1"] {
+            let r = resolve_run_snapshots(&interrupted_listing(), named, Some(MINE)).unwrap();
+            assert_eq!(r.commit, "d-commit", "{named}");
+            assert_eq!(r.claims, vec!["d-claim0", "d-claim1"], "{named}");
+            assert_eq!(r.resolved_from.as_deref(), Some(named));
+            assert!(r.passed_over.is_empty());
+        }
+        // By a short-id prefix, as `backup list` prints it, too.
+        let r = resolve_run_snapshots(&interrupted_listing(), "d-cla", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "d-commit");
+    }
+
+    /// FIRES: `--snapshot <a claim of an unfinished run>` was accepted and
+    /// downloaded before failing on the missing manifest. There is no commit
+    /// snapshot to resolve to, and restoring part of a run is not supported,
+    /// so it is refused before anything is fetched — naming the run.
+    #[test]
+    fn a_named_snapshot_of_an_unfinished_run_is_refused() {
+        let err = resolve_run_snapshots(&interrupted_listing(), "c-claim0", Some(MINE))
+            .expect_err("an unfinished run has nothing to restore from");
+        assert!(err.contains("`c-claim0`"), "{err}");
+        assert!(err.contains("2 snapshot(s) of backup run"), "{err}");
+        assert!(
+            err.contains(&format!("{MINE}-2026-09-24T03:00:00Z")),
+            "{err}"
+        );
+        assert!(err.contains("none of them carries manifest.json"), "{err}");
+        assert!(
+            err.contains("restoring part of a run is not supported"),
+            "{err}"
+        );
+        assert!(err.contains("nothing was downloaded"), "{err}");
+        assert!(err.contains("`--snapshot <id>`"), "{err}");
+    }
+
+    /// A lone `claim-0` — a one-claim sequential run stopped before its
+    /// commit — is an unfinished run of one snapshot, and refused the same
+    /// way.
+    #[test]
+    fn a_named_lone_claim_snapshot_is_refused() {
+        let listing = format!(
+            r#"[{{"id":"lone","time":"2026-09-24T03:00:01Z",
+                  "tags":["{MINE}-2026-09-24T03:00:00Z"],"paths":["/s/b/claim-0"]}}]"#
+        );
+        let err = resolve_run_snapshots(&listing, "lone", Some(MINE)).unwrap_err();
+        assert!(err.contains("1 snapshot(s) of backup run"), "{err}");
+    }
+
+    /// An untagged snapshot that does not complete a run — one of several
+    /// untagged snapshots, none a commit — has no run to resolve to at all:
+    /// refused, rather than downloaded to fail.
+    #[test]
+    fn a_named_untagged_snapshot_that_completes_nothing_is_refused() {
+        let listing = r#"[
+          {"id":"u1","time":"2026-09-24T03:00:01Z","tags":[],"paths":["/x/data"]},
+          {"id":"u2","time":"2026-09-24T03:00:02Z","tags":[],"paths":["/y/data"]}
+        ]"#;
+        let err = resolve_run_snapshots(listing, "u1", Some(MINE)).unwrap_err();
+        assert!(err.contains("`u1`"), "{err}");
+        assert!(err.contains("carries no run tag"), "{err}");
+        assert!(err.contains("nothing was downloaded"), "{err}");
+        // …while one untagged snapshot on its own completes its run, as the
+        // prune counts it, and is honoured.
+        let one = r#"[{"id":"u1","time":"2026-09-24T03:00:01Z","tags":[],"paths":["/x/data"]}]"#;
+        assert_eq!(
+            resolve_run_snapshots(one, "u1", Some(MINE)).unwrap().commit,
+            "u1"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Times are instants: restic keeps the WRITER's UTC offset.
+    // -----------------------------------------------------------------------
+
+    /// One repository, two writers. The in-cluster runner writes `…Z`; a
+    /// `backup create` from a workstation an hour east of UTC writes
+    /// `…+01:00` — the offset restic recorded in the field. The CLI's run
+    /// here committed at `04:00:03.1+01:00`, which is 03:00:03.1 UTC: half
+    /// an hour BEFORE the runner's 03:30 run, and the later string.
+    fn cli_run(tag_time: &str) -> String {
+        let tag = format!("{MINE}-{tag_time}");
+        format!(
+            r#"{{"id":"cli-claim0","time":"2026-09-24T04:00:01.1+01:00","tags":["{tag}"],
+                 "paths":["/tmp/apprafter-backup-c/claim-0"]}},
+               {{"id":"cli-commit","time":"2026-09-24T04:00:03.1+01:00","tags":["{tag}"],
+                 "paths":["/tmp/apprafter-backup-c/commit"]}}"#
+        )
+    }
+
+    /// FIRES: the newest complete run is the runner's, by the clock. Compared
+    /// as strings, `2026-09-24T04…` beat `2026-09-24T03…`, and `latest`
+    /// restored the CLI's older run.
+    #[test]
+    fn latest_orders_runs_by_instant_not_by_the_writers_offset() {
+        let listing = format!(
+            r#"[
+              {{"id":"runner-mono","time":"2026-09-24T03:30:00.1Z",
+                "tags":["{MINE}-2026-09-24T03:30:00Z"],"paths":["/staging/apprafter-backup-r/data"]}},
+              {}
+            ]"#,
+            cli_run("2026-09-24T03:00:00Z")
+        );
+        let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "runner-mono", "03:30Z is after 04:00:03+01:00");
+        assert!(r.claims.is_empty(), "{:?}", r.claims);
+        assert!(r.passed_over.is_empty(), "{:?}", r.passed_over);
+        let shown = resolve_latest_snapshot(&listing, Some(MINE)).unwrap();
+        assert_eq!(
+            shown.id, "runner-mono",
+            "`backup show` resolves the same run"
+        );
+    }
+
+    /// FIRES: a runner run cut at 03:30Z is newer than the CLI run `latest`
+    /// chose, and has to be named. Compared as strings it was "older" and
+    /// silently dropped; and two passed-over runs are listed newest first by
+    /// the clock, not by the string.
+    #[test]
+    fn a_newer_unfinished_run_is_reported_whatever_offset_either_writer_used() {
+        let listing = format!(
+            r#"[
+              {}
+              ,{{"id":"r-claim0","time":"2026-09-24T03:30:00.1Z",
+                "tags":["{MINE}-2026-09-24T03:29:00Z"],"paths":["/staging/apprafter-backup-r/claim-0"]}}
+              ,{{"id":"k-claim0","time":"2026-09-24T04:20:00+01:00",
+                "tags":["{MINE}-2026-09-24T03:19:00Z"],"paths":["/tmp/apprafter-backup-k/claim-0"]}}
+            ]"#,
+            cli_run("2026-09-24T03:00:00Z")
+        );
+        let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "cli-commit");
+        let newest: Vec<&str> = r.passed_over.iter().map(|u| u.newest.as_str()).collect();
+        assert_eq!(
+            newest,
+            vec!["2026-09-24T03:30:00.1Z", "2026-09-24T04:20:00+01:00"],
+            "both are newer than 03:00:03Z, and 03:30Z is newer than 03:20Z"
+        );
+        let shown = resolve_latest_snapshot(&listing, Some(MINE)).unwrap();
+        assert_eq!(
+            shown.passed_over, r.passed_over,
+            "show and restore say the same"
+        );
+    }
+
+    /// The autumn clock change inside one run: `claim-0` at 02:59:50 CEST is
+    /// 00:59:50 UTC, `claim-1` at 02:00:10 CET is 01:00:10 UTC. The claims
+    /// come oldest first by the clock, and an unfinished run's newest time is
+    /// the later instant, whatever its string says.
+    fn across_the_clock_change(done: &str, run: &str, last: &str) -> String {
+        format!(
+            r#"{{"id":"{run}-claim0","time":"2026-10-25T02:59:50+02:00","tags":["{done}"],
+                 "paths":["/tmp/apprafter-backup-{run}/claim-0"]}},
+               {{"id":"{run}-claim1","time":"2026-10-25T02:00:10+01:00","tags":["{done}"],
+                 "paths":["/tmp/apprafter-backup-{run}/claim-1"]}}{last}"#
+        )
+    }
+
+    #[test]
+    fn a_runs_claims_come_oldest_first_by_the_clock() {
+        let tag = format!("{MINE}-2026-10-25T00:59:00Z");
+        let commit = format!(
+            r#",{{"id":"x-commit","time":"2026-10-25T02:00:20+01:00","tags":["{tag}"],
+                  "paths":["/tmp/apprafter-backup-x/commit"]}}"#
+        );
+        let listing = format!("[{}]", across_the_clock_change(&tag, "x", &commit));
+        let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "x-commit");
+        assert_eq!(r.claims, vec!["x-claim0", "x-claim1"]);
+    }
+
+    #[test]
+    fn an_unfinished_runs_newest_time_is_the_later_instant() {
+        let tag = format!("{MINE}-2026-10-25T00:59:00Z");
+        let listing = format!(
+            r#"[
+              {{"id":"mono","time":"2026-10-24T03:00:00Z","tags":["{MINE}-2026-10-24T03:00:00Z"],
+                "paths":["/s/a/data"]}},
+              {}
+            ]"#,
+            across_the_clock_change(&tag, "y", "")
+        );
+        let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "mono");
+        assert_eq!(r.passed_over.len(), 1, "{:?}", r.passed_over);
+        assert_eq!(r.passed_over[0].newest, "2026-10-25T02:00:10+01:00");
+    }
+
+    /// With nothing complete, the error names the newest unfinished run's
+    /// time by the clock too.
+    #[test]
+    fn the_no_complete_run_error_names_the_newest_time_by_the_clock() {
+        let listing = format!(
+            r#"[
+              {{"id":"r-claim0","time":"2026-09-24T03:30:00.1Z",
+                "tags":["{MINE}-2026-09-24T03:29:00Z"],"paths":["/s/r/claim-0"]}},
+              {{"id":"k-claim0","time":"2026-09-24T04:20:00+01:00",
+                "tags":["{MINE}-2026-09-24T03:19:00Z"],"paths":["/s/k/claim-0"]}}
+            ]"#
+        );
+        let err = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap_err();
+        assert!(
+            err.contains("the newest written at 2026-09-24T03:30:00.1Z"),
+            "{err}"
+        );
+    }
+
+    /// A snapshot whose time does not parse is older than every one that
+    /// does — as a missing time always was. As a string, `yesterday` sorted
+    /// after every date and won.
+    #[test]
+    fn a_time_that_does_not_parse_never_wins_latest() {
+        for bad in [r#""time":"yesterday","#, ""] {
+            let listing = format!(
+                r#"[
+                  {{"id":"good","time":"2026-09-24T03:00:00Z",
+                    "tags":["{MINE}-2026-09-24T03:00:00Z"],"paths":["/s/a/data"]}},
+                  {{"id":"bad",{bad}"tags":["{MINE}-2026-09-25T03:00:00Z"],"paths":["/s/b/data"]}}
+                ]"#
+            );
+            let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+            assert_eq!(r.commit, "good", "bad time: {bad:?}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // A run is what the prune calls one: the snapshots sharing a FIRST tag.
+    // -----------------------------------------------------------------------
+
+    /// FIRES: the prune puts every untagged snapshot in one group, `""`, in
+    /// which only a `commit` snapshot completes the run — so it sweeps these
+    /// two as an orphan. `latest` counted each untagged snapshot as a run of
+    /// its own, complete, and chose the newer one: a snapshot the prune
+    /// would delete, and one with no manifest to restore.
+    #[test]
+    fn untagged_snapshots_are_one_run_as_the_prune_groups_them() {
+        let done = format!("{MINE}-2026-09-23T03:00:00Z");
+        let listing = format!(
+            r#"[
+              {{"id":"mono","time":"2026-09-23T03:00:00Z","tags":["{done}"],"paths":["/s/a/data"]}},
+              {{"id":"u1","time":"2026-09-24T03:00:01Z","tags":[],"paths":["/x/data"]}},
+              {{"id":"u2","time":"2026-09-24T03:00:02Z","paths":["/y/data"]}}
+            ]"#
+        );
+        let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "mono");
+        assert_eq!(
+            r.passed_over,
+            vec![UnfinishedRun {
+                tag: String::new(),
+                snapshots: 2,
+                newest: "2026-09-24T03:00:02Z".into(),
+            }],
+            "the untagged snapshots are ONE unfinished run, as the prune has them"
+        );
+    }
+
+    /// FIRES: a tag an operator adds later (`restic tag --add keep`) comes
+    /// after the run tag. The prune groups by the run tag alone, so these
+    /// are two complete monolithic runs. Counting every tag made `keep` join
+    /// them into one run with no commit snapshot — nothing complete — and
+    /// the restore of either run dragged the other one in as a "claim".
+    #[test]
+    fn a_tag_added_later_does_not_merge_two_runs() {
+        let listing = format!(
+            r#"[
+              {{"id":"one","time":"2026-09-23T03:00:00Z",
+                "tags":["{MINE}-2026-09-23T03:00:00Z","keep"],"paths":["/s/a/data"]}},
+              {{"id":"two","time":"2026-09-24T03:00:00Z",
+                "tags":["{MINE}-2026-09-24T03:00:00Z","keep"],"paths":["/s/b/data"]}}
+            ]"#
+        );
+        let r = resolve_run_snapshots(&listing, "latest", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "two");
+        assert!(r.claims.is_empty(), "{:?}", r.claims);
+        let one = resolve_run_snapshots(&listing, "one", Some(MINE)).unwrap();
+        assert!(one.claims.is_empty(), "{:?}", one.claims);
+    }
+
+    /// The claim this module makes — "by the rule the prune plans with" —
+    /// checked against the prune itself: for every snapshot of every shape
+    /// above, `latest`'s answer to "does it complete its run?" is the
+    /// prune's `is_manifest`.
+    #[test]
+    fn latest_and_the_prune_agree_on_which_snapshots_complete_a_run() {
+        let shapes = [
+            seq_listing().to_string(),
+            interrupted_listing(),
+            shared_listing(),
+            format!(
+                r#"[
+                  {{"id":"u1","time":"2026-09-24T03:00:01Z","tags":[],"paths":["/x/data"]}},
+                  {{"id":"u2","time":"2026-09-24T03:00:02Z","paths":["/y/data"]}},
+                  {{"id":"u3","time":"2026-09-24T03:00:03Z","tags":[],"paths":["/z/commit"]}},
+                  {{"id":"k1","time":"2026-09-23T03:00:00Z",
+                    "tags":["{MINE}-2026-09-23T03:00:00Z","keep"],"paths":["/s/a/data"]}},
+                  {{"id":"k2","time":"2026-09-24T03:00:00Z",
+                    "tags":["{MINE}-2026-09-24T03:00:00Z","keep"],"paths":["/s/b/data"]}},
+                  {{"id":"lone","time":"2026-09-25T03:00:00Z",
+                    "tags":["{MINE}-2026-09-25T03:00:00Z"],"paths":["/s/c/claim-0"]}}
+                ]"#
+            ),
+            r#"[{"id":"solo","time":"2026-09-24T03:00:00Z","tags":[],"paths":["/s/data"]}]"#
+                .to_string(),
+        ];
+        for listing in &shapes {
+            let snaps = parse_snapshot_list(listing).unwrap();
+            let runs = RunSizes::of(&snaps);
+            let prune = crate::prune::parse_snapshots(listing).unwrap();
+            assert_eq!(prune.len(), snaps.len());
+            for s in &snaps {
+                let id = id_of(s);
+                let meta = prune.iter().find(|m| m.id == id).unwrap();
+                assert_eq!(
+                    runs.completes(s),
+                    meta.is_manifest,
+                    "snapshot {id} of {listing}"
+                );
+            }
+        }
     }
 
     use super::*;

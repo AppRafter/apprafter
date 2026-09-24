@@ -16,12 +16,26 @@
 set -euo pipefail
 
 CLUSTER="apprafter-crd-validate"
-cleanup() { kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true; }
+# Written down rather than inherited from the kind binary's default, so a kind
+# upgrade cannot silently change which apiserver validates the CRDs — see the
+# note on APPRAFTER_KIND_NODE_IMAGE in e2e/lib.sh.
+: "${APPRAFTER_KIND_NODE_IMAGE:=kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed}"
+# A PRIVATE kubeconfig. Without it `kind create` writes its context into the
+# caller's ~/.kube/config and makes it current, and `kind delete` then unsets
+# current-context — so a developer whose current context was a real cluster
+# found it silently switched away after every CRD gate. Nothing below needs
+# the caller's kubeconfig: every kubectl call names the kind context.
+KUBECONFIG="$(mktemp)"
+export KUBECONFIG
+cleanup() {
+    kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
+    rm -f "$KUBECONFIG"
+}
 trap cleanup EXIT
 
 echo "==> creating ephemeral kind cluster '$CLUSTER'"
 kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
-kind create cluster --name "$CLUSTER" --wait 90s >/dev/null
+kind create cluster --name "$CLUSTER" --image "$APPRAFTER_KIND_NODE_IMAGE" --wait 90s >/dev/null
 CTX="kind-$CLUSTER"
 
 rendered=$(mktemp)
@@ -180,6 +194,41 @@ else
     echo "==> REGRESSION: empty checkSchedule did not survive: '${_cs}'" >&2
     exit 1
 fi
+
+# WI-389. `retention.enforce` is optional, so that `apprafter backup set
+# keep-daily 5` — a merge-patch of `retention: {keepDaily: 5}` onto a CR that
+# never set retention — is accepted; with it required (as until WI-389) the
+# apiserver answered `spec.backup.retention.enforce: Required value`. Absent,
+# the chart's default applies (`check`); `check` is a value the enum takes.
+echo "==> regression: PlatformStack spec.backup.retention.enforce is optional and takes check (WI-389)"
+kubectl --context "$CTX" -n crd-validate patch platformstack crd-validate-tz --type merge \
+    -p '{"spec":{"backup":{"retention":{"keepDaily":5}}}}' >/dev/null 2>/tmp/crd-ret-err.txt || {
+    echo "==> REGRESSION: apiserver REJECTED a retention block with only a keep count" >&2
+    cat /tmp/crd-ret-err.txt >&2
+    exit 1
+}
+echo "    OK: a retention block with only keepDaily is accepted"
+kubectl --context "$CTX" -n crd-validate patch platformstack crd-validate-tz --type merge \
+    -p '{"spec":{"backup":{"retention":{"enforce":"check"}}}}' >/dev/null 2>/tmp/crd-ret-err.txt || {
+    echo "==> REGRESSION: apiserver REJECTED retention.enforce: check" >&2
+    cat /tmp/crd-ret-err.txt >&2
+    exit 1
+}
+_ret=$(kubectl --context "$CTX" -n crd-validate get platformstack crd-validate-tz \
+    -o jsonpath='{.spec.backup.retention.enforce}/{.spec.backup.retention.keepDaily}' 2>/dev/null || true)
+if [ "$_ret" = "check/5" ]; then
+    echo "    OK: retention.enforce check stored beside keepDaily (not pruned)"
+else
+    echo "==> REGRESSION: retention read back '${_ret}', want 'check/5'" >&2
+    exit 1
+fi
+if kubectl --context "$CTX" -n crd-validate patch platformstack crd-validate-tz --type merge \
+    -p '{"spec":{"backup":{"retention":{"enforce":"weekly"}}}}' >/dev/null 2>&1; then
+    echo "==> REGRESSION: apiserver ACCEPTED retention.enforce: weekly" >&2
+    exit 1
+fi
+echo "    OK: a retention mode that does not exist is rejected by the apiserver"
+rm -f /tmp/crd-ret-err.txt
 
 # A4, the same pruning failure mode one level up. `spec.firewall` is the ONLY
 # record of the Cloudflare origin-firewall intent that a backup can see — the

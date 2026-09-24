@@ -33,6 +33,19 @@ under the AppRafter config root; `--repo <path>` puts it elsewhere.
 and tag — the tag is `<cluster-uid>-<created-at>`, so it identifies the source
 cluster and the moment, never a single namespace.
 
+The dumps run in short-lived helper pods in the cluster. Ctrl-C (or SIGTERM)
+stops the command and deletes the helper pods it created — only those — within
+fifteen seconds, then exits with status 130 (143 for SIGTERM). A second Ctrl-C
+exits at once instead; a helper pod left that way is replaced by the next
+backup that needs it. `apprafter export` and `apprafter restore` behave the
+same way.
+
+Start `backup create` when no scheduled backup is running —
+`apprafter backup status` shows one that is. Two runs that need the same
+helper pod at the same time do not both finish, and while an upgrade is under
+way, with the CLI and the cluster's backup runner on different versions, both
+fail.
+
 ## What is in a backup
 
 ```sh
@@ -92,6 +105,13 @@ is the mechanism.
 what you read before deciding what to restore, so it has to be looking at the
 snapshot a restore would replay.
 
+For both, the latest run is the latest **complete** one. A sequential backup
+writes the snapshot that carries `manifest.json` last, so a run stopped between
+its claims (a Ctrl-C, a killed process, a Job's deadline) holds claim snapshots
+and no manifest; a run still being written looks the same. `backup show` and a
+`restore` without `--snapshot` pass over such a run, name it above their output,
+and use the newest run that finished.
+
 ```text
 apprafter backup create [--repo <path>] [--passphrase <value>] \
                         [--namespace <ns> ...] [--select] \
@@ -130,9 +150,9 @@ worth acting on:
   the S3 credentials inside it, and keep them.
 - **Scope the S3 credential to the one bucket.** Then what is inside a snapshot
   reaches no further than the repository it came from. [Backup
-  maintenance](backup-maintenance.md) narrows it further still: under the
-  default `enforce: operator`, the credential the *cluster* holds need not carry
-  delete rights at all.
+  maintenance](backup-maintenance.md) narrows it further still: the credential
+  the *cluster* holds need not carry delete rights at all — nothing in the
+  cluster can then erase a snapshot, and pruning runs from your machine.
 - **Rotating the S3 credential does not remove it from the snapshots already
   taken.** They still hold the old keys, readable with the same passphrase — so
   a rotation stops the old keys working, and re-keying the repository with stock
@@ -167,7 +187,7 @@ apprafter backup enable --bucket <name> --endpoint <host> [--prefix <path>] \
                         [--cluster-name <name>] \
                         [--at 03:00] [--timezone Europe/Berlin] \
                         [--staging-mode monolithic|sequential] \
-                        [--enforce operator|cluster] \
+                        [--enforce check|cluster|operator] \
                         [--keep-daily N] [--keep-weekly N] [--keep-monthly N] \
                         [--check off|06:00] [--failure-webhook <url>] \
                         --i-have-saved-credentials
@@ -301,7 +321,9 @@ doing it, none of them about safety.
 ### Defaults, and the time of day
 
 Defaults when a flag is omitted: `--at` `03:00` (nightly), `--check` three
-hours later on Sunday, `--staging-mode` `monolithic`, `--enforce` `operator`,
+hours later on Sunday, `--staging-mode` `monolithic`, `--enforce` `check` (the
+weekly check prunes, as far as the cluster's key may delete — [who
+prunes](backup-maintenance.md#who-prunes-and-what-the-clusters-key-may-delete)),
 retention `--keep-daily 7 --keep-weekly 4 --keep-monthly 6`.
 
 **`--timezone` defaults to the machine you run the command on.** A time of day
@@ -331,6 +353,14 @@ cycle. If it has not landed in that window, `enable` says so and stops: backup
 is enabled either way, and `apprafter backup run` takes the first one whenever
 you like. `--no-initial-backup` skips this entirely.
 
+If the first backup runs but does not complete, because it fails or because no
+node takes its pod ([the backup runner's pod cannot be
+scheduled](#runner-unschedulable)), `enable` says `Backup IS enabled` and
+exits non-zero. The configuration is applied, so there is no need to run
+`enable` again. The exit is non-zero because no backup has been proven, and a
+runner no node takes means the scheduled backup cannot run either. Fix what the
+message names, then run `apprafter backup run`.
+
 ## Back up right now
 
 ```sh
@@ -348,6 +378,27 @@ The command waits and reports the result. `--no-wait` returns as soon as the
 Job is created, and `--timeout <minutes>` bounds the wait — neither cancels
 anything, because the Job belongs to the cluster once it exists. Ctrl-C is
 equally safe.
+
+The one exception is a Job whose pod no node takes. If no node has room for it
+for two minutes, or a condition of the node such as memory pressure keeps it off
+for ten, the command deletes the Job, prints the scheduler's reason and exits
+non-zero: [the backup runner's pod cannot be scheduled](#runner-unschedulable).
+
+An attempt that fails is retried by the Job, and the command prints each failed
+attempt with its reason, in the runner's own words when it recorded them. When
+the timeout ends the wait after an attempt has failed, the command exits
+non-zero with the last attempt's reason: a Job whose attempts fail has taken no
+backup yet, however long it goes on retrying.
+
+One run at a time. While a backup Job or a check Job has not finished, whether
+it is `Running`, `Pending` or retrying, `backup run` starts nothing, `--no-wait`
+included. It prints what that Job is doing and exits non-zero with
+`apprafter::backup::job_active`. Two runs at once do not both finish: two
+backups need the same helper pods, and a backup and a check each fail on the
+other's repository lock. Wait until `apprafter backup status` shows the Job
+finished, then run it again. A Job that cannot start may hold on until its
+deadline, or until it is deleted if it has none, so for one of those the
+command also prints how to delete it.
 
 A suspended schedule (`backup disable`) does not block a manual run: taking one
 last backup after turning the schedule off is a normal thing to want.
@@ -372,13 +423,17 @@ apprafter backup status
 - the last backup and check **Job** outcomes;
 - the non-chart-owned **`apprafter-backup-status` ConfigMap** in
   `apprafter-system` — the runner create-or-updates it on every run with
-  `lastSuccess`, `lastFailure`, `lastError` (short), and `lastRunFormat`. This
+  `lastSuccess`, `lastFailure`, `lastError` (short), and `lastRunFormat`, and
+  the weekly check adds its own result, the prune after it and the
+  repository's size and growth (the `Repository` block). This
   is why it is a ConfigMap and not just Job history: the `failedJobsHistoryLimit`
   can rotate the last *successful* Job out of view, but "when did the last
   successful backup run" — the core backup question — stays reliably
   answerable;
 - the `apprafter.io/last-prune` annotation stamped on `PlatformStack` by the
-  operator-side `backup prune`.
+  operator-side `backup prune`, and the operator's verdict on whether retention
+  is enforced ([what each answer
+  means](../how-it-works/backup-retention-and-checks.md#whether-retention-is-enforced)).
 
 ## What a backup captures
 
@@ -537,6 +592,196 @@ any matching `pg_restore`, e.g. `pg_restore -l pg/demo/shop-pg.dump` to list
 the table of contents, or restore into a local database with
 `pg_restore --no-owner -d <local-db> pg/demo/shop-pg.dump`. Volume tars are
 plain tarballs: `tar -tf volumes/demo/shop-disk/data.tar`.
+
+## Troubleshooting
+
+### The backup runner's pod cannot be scheduled {#runner-unschedulable}
+
+`apprafter backup run` stops after about two minutes and exits non-zero:
+
+```text
+  … its pod cannot be scheduled (1m 37s so far, giving up at 2m 0s): 0/1 nodes are available: 1 Insufficient memory. …
+  ✗ The backup never started: no node has room for its pod.
+    The scheduler says: 0/1 nodes are available: 1 Insufficient memory. …
+    The runner asks for 128Mi of memory and 100m of CPU. The scheduled backup asks for the same, so it cannot start either.
+    …
+Error: apprafter::backup::runner_unschedulable
+
+  × backup Job apprafter-backup-manual-20260923-172005 never started: no node
+  │ had room for its pod for 2m 3s
+```
+
+`apprafter backup status` shows the Job the same way, instead of `Running`:
+
+```text
+  Last backup Job: apprafter-backup-29836406 — Pending, cannot be scheduled: 0/1 nodes are available: 1 Insufficient memory. … (2026-09-23 18:26:00 Europe/Lisbon)
+    No node has room for the backup runner's pod, which asks for 128Mi of memory and 100m of CPU.
+    `apprafter top` shows how much of each node is requested, and by what.
+    Until this Job runs or its deadline stops it, the schedule starts no other backup.
+```
+
+The backup runner's pod requests 128Mi of memory and 100m of CPU, and so does
+the weekly check's (256Mi of memory with a platform chart older than 0.2.80;
+the report quotes whatever the Job asks for). Kubernetes places a pod only on
+a node whose allocatable capacity, less what the pods already there request,
+covers that request. On a node that is nearly fully requested, no node
+qualifies and the pod stays `Pending`. A 4 GB machine becomes such a node
+once it runs, beside the shared PostgreSQL of `needs.pg` and a persistent
+`needs.redis`, more than about four small applications or a further backend
+instance ([what a 4 GB node
+holds](../how-it-works/node-reservations-and-swap.md#what-a-4-gb-node-holds)).
+The scheduled backup is the same Job with the same requests, so it cannot
+start either.
+
+The runner's pods also have a priority below every other pod's (the
+`apprafter-backup-runner` priority class), so a full node always gives room to
+something else first. Any other pod waiting for room is placed before a waiting
+runner, and a pod that needs room a running backup holds preempts it. The
+runner then records `run was stopped by Kubernetes (SIGTERM) … its pod was
+deleted or evicted` as its `lastError`, and the Job's next pod waits for room
+like any other. On a node this full, an application rolling out can therefore
+stop a backup; the backup runs again once the rollout is done and the room is
+back. `apprafter status` reports the stopped attempt at once, as
+`RunnerPreempted` on its `Backups:` line, until a run succeeds.
+
+Check how much room is left:
+
+```sh
+apprafter top            # SCHEDULABLE: what a new pod could still request
+apprafter backup status  # Last backup Job / Last check Job: Pending, cannot be scheduled
+```
+
+While the runner waits, `apprafter top` also reports `1 pod(s) are not
+scheduled to a node`. If the node's `SCHEDULABLE` memory is below 128Mi, the
+runner cannot be placed.
+
+Not every reason is a lack of room. A reason that names a taint of the node's
+own condition, such as `node.kubernetes.io/memory-pressure`, `disk-pressure` or
+`not-ready`, or a node that is cordoned, keeps the pod off until that condition
+ends. The kubelet keeps a pressure taint for five minutes after the pressure has
+gone, and a runner evicted under memory pressure is retried straight into it.
+`backup run` waits ten minutes for such a condition before it gives up, and it
+names the taint rather than the runner's requests. Any other reason, such as a
+taint the runner does not tolerate, is not answered by freeing memory either:
+the scheduler's text says what keeps the pod off.
+
+??? note "Checking without the CLI"
+
+    A runner pod in `Pending` with a `FailedScheduling` event is the case
+    described here:
+
+    ```sh
+    kubectl -n apprafter-system get pods -l apprafter.io/backup-runner=true
+    kubectl -n apprafter-system get events --field-selector reason=FailedScheduling
+    ```
+
+    A runner that another pod preempted has a `Preempted` event naming that
+    pod:
+
+    ```sh
+    kubectl -n apprafter-system get events --field-selector reason=Preempted
+    ```
+
+To fix it, free enough requested memory for the runner's 128Mi, or move to a
+larger machine ([Moving to a bigger machine](moving-to-a-bigger-machine.md)). Once
+there is room, a scheduled Job that was waiting starts on its own within
+moments, and `apprafter backup status` shows it `Running` and then its result.
+Otherwise run `apprafter backup run` to confirm a backup completes. It starts
+nothing while a backup or check Job has not finished, `Running` or `Pending`
+alike, and names that Job instead: two runs at once do not both finish.
+
+If another backup or check Job is running when `backup run` gives up, the
+report names that Job instead of saying the scheduled backup cannot start: it
+holds room of the same size, and may be the scheduled backup itself. Run
+`backup run` again once it has finished.
+
+A pod that only waits for another pod to finish stopping is placed within
+seconds of that pod being gone. `backup run` does not count the time while any
+pod in the cluster is stopping, since a PostgreSQL instance being deleted can
+take minutes to shut down and the room it gives back may be what the runner
+needs. It gives up once there has been no room for two minutes with nothing
+stopping. It deletes its Job when it gives up. Left in place, the Job would
+start on its own whenever a node took it, at a time nobody chose and possibly
+while the scheduled backup runs.
+
+If an earlier attempt of the same Job ran and failed first, the report says
+which attempt could not be scheduled and why the one before it failed, for
+example `Evicted`. That attempt did start, and `backup status` shows the
+runner's `lastError` if it recorded one.
+
+A scheduled Job that cannot start holds the schedule: the CronJob starts no
+other backup while one of its Jobs is active. The Job's deadline, six hours by
+default ([A run that stopped at its
+deadline](backup-maintenance.md#a-run-that-stopped-at-its-deadline)), fails it
+as `Failed: DeadlineExceeded`, and the next night's Job meets the same full
+node. Because the runner never started, it records nothing itself: `lastError`
+is not written and the failure webhook does not fire. What shows the problem
+is the `Last backup Job:` line and a `lastSuccess` that stops moving. A
+platform chart older than 0.2.80 sets no deadline on the backup Job, so there
+a Job stuck this way waits, and holds the schedule, until the node has room or
+the Job is deleted. For such a Job `apprafter backup status` says it has no
+deadline and prints the command that deletes it; once it is gone, the next
+scheduled backup starts. Delete it before upgrading such a cluster to 0.2.80
+or later: a pod keeps the priority it was created with, so a runner from the
+older chart competes with the platform's pods as an equal, and can take the
+room a platform pod restarting during the upgrade has just given back.
+
+### The staging volume outgrew its limit {#staging-over-limit}
+
+`apprafter backup run` fails at the first attempt, and `apprafter backup
+status` shows why in the runner's `lastError`:
+
+```text
+Jobs:
+  Last backup Job: apprafter-backup-manual-20260924-002517 — Failed: PodFailurePolicy: Container runner for pod apprafter-system/apprafter-backup-manual-20260924-002517-x775g failed with exit code 3 matching FailJob rule at index 0 (2026-09-24 01:25:18 Europe/Lisbon)
+  …
+Runner status:
+  lastSuccess:    2026-09-24 01:24:53 Europe/Lisbon
+  lastFailure:    2026-09-24 01:25:27 Europe/Lisbon
+  lastError:      the staging volume held 23Mi, more than its limit of 8.0Mi (spec.backup.stagingSizeLimit), so the run was stopped before Kubernetes evicts its pod. …
+```
+
+A backup first writes what it captures, each database's dump, each volume's
+archive and each Dragonfly snapshot, to a volume of the runner's pod, and
+restic keeps its temporary files and its cache for the run on the same volume.
+The volume is limited to `spec.backup.stagingSizeLimit` of the PlatformStack,
+10Gi by default, and lives on the node's disk. The runner measures it every
+two seconds and stops the run once it holds more, with an exit code of its
+own, 3, on which the Job fails at once: another attempt would dump the same
+data into the same limit. The failure webhook fires with the same message.
+
+The weekly check Job has a volume of the same size for restic's cache and the
+pack files a prune rewrites, and is stopped the same way. Its message is
+recorded against the step it stopped, and `apprafter backup status` shows it
+under `last check` or `last prune`. The same `spec.backup.stagingSizeLimit`
+raises both.
+
+To fix it, stage one claim at a time, so that only the largest has to fit:
+
+```sh
+apprafter backup set staging-mode sequential
+```
+
+Or raise `spec.backup.stagingSizeLimit`, if the node's disk has the room
+(`apprafter top` shows the node's free disk). No `apprafter` command sets it,
+so it is a patch of the PlatformStack:
+
+??? note "Raising the limit"
+
+    ```sh
+    kubectl -n apprafter-system patch platformstack default --type merge \
+        -p '{"spec":{"backup":{"stagingSizeLimit":"20Gi"}}}'
+    ```
+
+    `apprafter backup enable` and `apprafter backup set` leave the value in
+    place.
+
+Then run `apprafter backup run` to confirm a backup completes.
+
+With a platform chart older than 0.2.80 the runner staged outside this volume,
+in the container's own filesystem, so the limit bounded nothing. After an
+upgrade, a cluster whose backups stage more than the limit fails this way where
+it used to succeed.
 
 ## See also
 

@@ -79,6 +79,17 @@ pub struct Tool {
     /// Arguments that make the tool print its version. `ssh -V` writes
     /// to stderr and some tools exit non-zero, which `check_tool`
     /// tolerates — any output at all counts as present.
+    ///
+    /// PRESENCE ONLY. The version is asked for and then thrown away:
+    /// nothing here declares or compares a minimum, and `RESTIC`'s
+    /// `install` string below already promises one ("restic (>= 0.14)")
+    /// that nothing enforces. That gap is not cosmetic — these are the
+    /// binaries that run on the OPERATOR's machine, which is the one
+    /// place with no pin at all. CI pins govern CI and image pins govern
+    /// the cluster, but `cluster-bootstrap` shells out to the user's
+    /// `helm` and `app validate` to the user's `cue`, and a cue older
+    /// than the `language.version` the render workspace declares does
+    /// not warn, it hard-rejects. Tracked as WI-369.
     pub version_args: &'static [&'static str],
 }
 

@@ -11,10 +11,10 @@
     "typecheck": "astro check"
   },
   "dependencies": {
-    "astro": "^5.0.0",
-    "@astrojs/svelte": "^7.0.0",
-    "@astrojs/sitemap": "^3.0.0",
-    "svelte": "^5.0.0",
+    "astro": "^7.3.3",
+    "@astrojs/svelte": "^9.0.1",
+    "@astrojs/sitemap": "^3.7.4",
+    "svelte": "^5.43.6",
     "@fontsource/roboto": "^5.1.0",
     "@fontsource/roboto-mono": "^5.1.0"
   },

@@ -1,18 +1,72 @@
+// JSON with comments, which the Dev Containers spec allows.
+//
+// Versions follow mise.toml's rule: pin the MINOR, let the patch float. Each
+// feature below resolves a minor ("1.98") to its newest patch when the
+// container is built; "latest" / "lts" would give up the minor, and a
+// floating line reads the same as a forgotten one. Node is mise.toml's one
+// exception and pins its MAJOR, the LTS line: node never patches an older
+// minor, so a node minor pin would be an exact pin. The values are copies:
+//
+//   rust, node, go   mise.toml (which names where each of those comes from)
+//   kubectl, helm    the flake-locked nixpkgs, which the dev container mirrors
+//                    (`nix eval --raw --inputs-from . nixpkgs#kubectl.version`,
+//                    `nixpkgs#kubernetes-helm.version`). Helm is 3.x here
+//                    while CI runs helm 4, on purpose: the CLI has to work
+//                    under both majors. Why, and the date that split has to
+//                    end by, is the nixpkgs input comment in flake.nix.
+//
+// bun, just and lefthook are installed by post-create.sh, with their minors
+// written there. scripts/upstream-versions.py reads every version in both
+// files (the rows are in scripts/upstream-pins.json): a copy that disagrees
+// with another copy of the same decision reads as DRIFT, and one the reader
+// can no longer find reads as UNREADABLE.
+//
+// What still floats, because no option can pin it and the repository builds
+// nothing with it: the Docker engine from docker-in-docker, git from the
+// Ubuntu 22.04 packages, and the editor tools the go feature adds (gopls,
+// staticcheck, golangci-lint, ...). The `:1` / `:2` after each feature is
+// that feature's own major, not a tool version.
+//
+// The FEATURES themselves -- the install scripts published under
+// ghcr.io/devcontainers/features, as distinct from the tool versions they are
+// asked for above -- are locked by devcontainer-lock.json beside this file: a
+// build installs the release and sha256 digest recorded there, not the newest
+// in the major, and `--frozen-lockfile` fails when the lock no longer matches
+// this file. To move them within each major, or after adding or removing a
+// feature, regenerate the lock with the devcontainers CLI and commit it with
+// the change:
+//
+//   npx @devcontainers/cli upgrade --workspace-folder .            # rewrite
+//   npx @devcontainers/cli upgrade --workspace-folder . --dry-run  # preview
+//
+// then rebuild. A new major is an edit of the `:N` below first (its options
+// may be renamed). scripts/upstream-versions.py reads the locked releases (the
+// `devcontainer-feature-*` rows), so a lock left behind shows up as BEHIND.
 {
   "name": "AppRafter Dev",
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu-22.04",
   "features": {
     "ghcr.io/devcontainers/features/rust:1": {
+      "version": "1.98",
       "profile": "default"
     },
     "ghcr.io/devcontainers/features/node:1": {
-      "version": "lts"
+      "version": "24",
+      // The installer that fetches node, pinned like the rest.
+      "nvmVersion": "0.40",
+      // Defaults to "latest"; nothing in this repository uses pnpm (bun is
+      // the package manager).
+      "pnpmVersion": "none"
     },
-    "ghcr.io/shyim/devcontainers-features/bun:0": {},
     "ghcr.io/devcontainers/features/go:1": {
-      "version": "latest"
+      "version": "1.26"
     },
-    "ghcr.io/devcontainers/features/kubectl-helm-minikube:1": {},
+    "ghcr.io/devcontainers/features/kubectl-helm-minikube:1": {
+      "version": "1.36",
+      "helm": "3.20",
+      // Local clusters are k3d (`just e2e-up`) or kind, never minikube.
+      "minikube": "none"
+    },
     "ghcr.io/devcontainers/features/docker-in-docker:2": {},
     "ghcr.io/devcontainers/features/git:1": {}
   },

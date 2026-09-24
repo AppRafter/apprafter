@@ -430,10 +430,53 @@ package platformstack
 	//
 	// `scripts/check-backup-runner-pin.sh` now fails CI when a published
 	// runner is newer than this line, so the next drift is loud.
-	image: string | *"ghcr.io/apprafter/apprafter-backup:v0.2.76"
+	image: string | *"ghcr.io/apprafter/apprafter-backup:v0.2.77"
 
 	// Cron schedule for the full backup Job. Default nightly 03:00.
 	schedule: string | *"0 3 * * *"
+
+	// How long one backup Job may run before Kubernetes stops it →
+	// `jobTemplate.spec.activeDeadlineSeconds`; the Job then fails with
+	// reason `DeadlineExceeded`. Default six hours. The same value reaches
+	// the runner as APPRAFTER_BACKUP_DEADLINE_SECONDS: it records a run
+	// stopped at the deadline (lastFailure, the failure webhook) in the pod's
+	// 90 s grace period, and keeps each helper pod — and so each single
+	// claim's dump — alive exactly this long. It also reaches BOTH runners
+	// as APPRAFTER_BACKUP_RUN_DEADLINE_SECONDS: a prune leaves a run with no
+	// manifest alone until its newest snapshot is older than this (never
+	// less than six hours) plus an hour, because a backup may still be
+	// writing it.
+	//
+	// The CronJob is `concurrencyPolicy: Forbid`, so without a deadline one
+	// run that never ends suppresses every later scheduled run, silently.
+	// The deadline is the bound that holds whatever the run is stuck on.
+	// Keep it SHORTER than the time between two scheduled runs, so a stuck
+	// run is stopped before the next slot, and LONGER than the slowest
+	// backup that is expected to succeed, which it would otherwise kill:
+	// six hours leaves the nightly default's next slot eighteen hours clear.
+	// It must ALSO stay below the time from a backup's start to the next
+	// check's start: the check (and the prune after it) takes restic's
+	// exclusive lock, and neither Job retries a lock. A backup holds a lock
+	// only while a restic command of its own runs — not while it dumps a
+	// claim — so a backup still running when the check starts costs one of
+	// the two: the check fails on the lock of a backup that is uploading,
+	// and a backup that is dumping fails on the check's lock at its next
+	// upload. Under the default schedules that gap is three hours
+	// (03:00 → Sunday 06:00), shorter than this default — a Sunday backup
+	// past three hours costs that week's check or that backup; move the
+	// check later if backups take that long.
+	// With a schedule more frequent than the deadline, a stuck run still
+	// costs the slots that fall while it is active: `Forbid` starts none of
+	// them, and when the run ends (no `startingDeadlineSeconds` is set) the
+	// CronJob controller starts the most recent one at once and drops the
+	// earlier ones — five hourly runs lost and the sixth late under the
+	// default. A run merely slower than the interval delays the slot it
+	// overlaps, as it always has under `Forbid`.
+	//
+	// Ten minutes at least: below that, a normal run's helper-pod start
+	// and repository open are at risk, and a value that small is far more
+	// likely a unit mistake (minutes for seconds) than an intent.
+	activeDeadlineSeconds: int & >=600 | *21600
 
 	// Restic repository URL, e.g. `s3:https://<endpoint>/<bucket>` —
 	// NO credentials (those come from `credentialRef`). Empty until the
@@ -466,28 +509,60 @@ package platformstack
 	// as `APPRAFTER_BACKUP_STAGING_MODE`.
 	stagingMode: "monolithic" | "sequential" | *"monolithic"
 
-	// `emptyDir.sizeLimit` for the staging volume. Overrun is a hard
-	// fail whose error suggests raising this or switching to
-	// `sequential`.
+	// `emptyDir.sizeLimit` for the staging volume of both Jobs: the
+	// backup's dumps, and restic's cache and temporary files in each.
+	// The runner stops a run whose volume outgrows it, and the Job fails
+	// at once (a podFailurePolicy on the runner's exit code 3) instead of
+	// retrying into the same limit; the error suggests raising this or
+	// switching to `sequential`.
 	stagingSizeLimit: string | *"10Gi"
 
-	// Retention policy. `enforce: operator` (default) means the runner
-	// does NOT forget/prune (retention is the operator-side `apprafter
-	// backup prune` verb with full creds); `enforce: cluster` runs
-	// format-aware `forget --prune` in the Job (requires full creds in
-	// the cluster Secret). `keep*` are optional — the runner defaults
-	// to 7/4/6 when unset, so the chart only threads them through when
-	// explicitly configured.
+	// Retention policy: who prunes, and what is kept. `keep*` are
+	// optional — the runner defaults to 7/4/6 when unset, so the chart
+	// only threads them through when explicitly configured. `enforce`
+	// reaches BOTH CronJobs as APPRAFTER_BACKUP_ENFORCE:
+	//
+	// - `check` (default, WI-389): the weekly check Job runs the
+	//   run-aware prune after a check that PASSED, as far as the
+	//   cluster's key may delete. Under the scoped key ADR 0050
+	//   recommends the first delete is refused, nothing is deleted, and
+	//   the runner records `not-permitted` — the operator's
+	//   BackupRetention condition and `apprafter backup status` then say
+	//   retention is not enforced, with the repository's growth. A check
+	//   that fails never prunes.
+	// - `cluster`: the backup Job prunes after every backup (a prune
+	//   that fails fails the backup); needs full credentials in the
+	//   cluster Secret.
+	// - `operator`: nothing in the cluster prunes; retention is the
+	//   operator-side `apprafter backup prune` with full creds.
+	//
+	// The default was `operator` until WI-389. A PlatformStack that set
+	// `operator` explicitly keeps it; one that never set it gets
+	// `check`, and a cluster whose key MAY delete starts removing
+	// snapshots beyond the keep policy at its next weekly check.
 	retention: {
 		keepDaily?:   int
 		keepWeekly?:  int
 		keepMonthly?: int
-		enforce:      "operator" | "cluster" | *"operator"
+		enforce:      "check" | "cluster" | "operator" | *"check"
 	}
 
-	// Cron schedule for the weekly `restic check` Job. Default Sunday
-	// 06:00 (staggered clear of the daily backup).
+	// Cron schedule for the weekly check Job — `restic check`, then,
+	// under `retention.enforce: check`, the prune. Default Sunday
+	// 06:00 (staggered clear of the daily backup). Empty omits the
+	// CronJob, and with it the in-cluster prune of `enforce: check`.
 	checkSchedule: string | *"0 6 * * 0"
+
+	// `activeDeadlineSeconds` for the weekly check Job — the check and,
+	// under `enforce: check`, the prune after it — with the same
+	// reasoning and the same floor. It must ALSO stay below the time from
+	// the check's start to the next backup's start: a check still holding
+	// restic's exclusive lock fails that backup (no --retry-lock). Default
+	// six hours: under the default schedules a stuck check is stopped by
+	// Sunday noon, well inside the twenty-one hours to Monday's 03:00
+	// backup. Raise it for `checkReadData: true` on a repository that takes
+	// longer than that to download — and keep it under that gap.
+	checkActiveDeadlineSeconds: int & >=600 | *21600
 
 	// IANA timezone both schedules run in → `CronJob.spec.timeZone`
 	// (2.22g / D2). Empty = omit the field, which means the CronJob runs
@@ -579,7 +654,7 @@ package platformstack
 // — a bump that forgets the compatibility entry fails `cue vet
 // -c` with an "incomplete value" error pointing at the missing
 // fields, before the publish workflow ever runs.
-currentVersion: #Version & "0.2.79"
+currentVersion: #Version & "0.2.80"
 
 // `_components` is the package-level base set, populated by
 // every `cue/component_<name>.cue` file declaring

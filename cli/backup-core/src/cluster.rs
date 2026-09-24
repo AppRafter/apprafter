@@ -26,8 +26,9 @@
 //! <kube-system-uid>-<rfc3339>[-ns-<a>_<b>]
 //! ```
 //!
-//! [`run_tag`] writes that form and [`tag_cluster_uid`] reads it back; they
-//! are inverses and must be changed together.
+//! [`run_tag`] writes that form, and [`tag_cluster_uid`] and
+//! [`tag_run_start`] read its identity and its start back; they are inverses
+//! and must be changed together.
 //!
 //! A human-readable label lives separately, in the restic `--host`
 //! (`spec.backup.clusterName`), because a UUID alone is unusable when an
@@ -45,6 +46,7 @@
 //! to whoever asks first. `apprafter backup list` marks them so that
 //! attribution is visible rather than assumed silently.
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 /// Length of a canonical RFC-4122 UUID: `8-4-4-4-12` plus four dashes.
@@ -189,8 +191,34 @@ pub fn run_tag(cluster_uid: &str, created_at: &str, subset_namespaces: &[String]
     if subset_namespaces.is_empty() {
         base
     } else {
-        format!("{base}-ns-{}", subset_namespaces.join("_"))
+        format!("{base}{NAMESPACES_MARK}{}", subset_namespaces.join("_"))
     }
+}
+
+/// What [`run_tag`] puts between the start time and a local pull's
+/// namespaces. An RFC 3339 time never contains it, so it also marks where
+/// the time ends ([`tag_run_start`]).
+const NAMESPACES_MARK: &str = "-ns-";
+
+/// When the run started: the RFC 3339 time [`run_tag`] wrote after the
+/// cluster UID, read as an instant. `None` for a tag with no UID in front —
+/// a legacy `<release-name>-<rfc3339>` one or a foreign tool's — and for one
+/// whose time does not parse.
+///
+/// Every snapshot of a run carries this start, however long the run took:
+/// a sequential run's commit snapshot is written hours after it, and its
+/// own `time` is when that last snapshot began. The keep policy files a run
+/// under this instant ([`crate::prune::plan_prune`]).
+///
+/// INVARIANT: the inverse of [`run_tag`]'s second component, as
+/// [`tag_cluster_uid`] is of its first; they change together.
+pub fn tag_run_start(tag: &str) -> Option<DateTime<Utc>> {
+    tag_cluster_uid(tag)?;
+    let rest = &tag[UUID_LEN + 1..];
+    let time = rest
+        .split_once(NAMESPACES_MARK)
+        .map_or(rest, |(time, _)| time);
+    crate::restic::snapshot_instant(time)
 }
 
 /// `metadata.uid` of a `Namespace` document, as the cluster's machine key.
@@ -269,6 +297,42 @@ mod tests {
         let t = run_tag(A, "2026-09-11T03:00:00Z", &["demo".into(), "prod".into()]);
         assert_eq!(t, format!("{A}-2026-09-11T03:00:00Z-ns-demo_prod"));
         assert_eq!(tag_cluster_uid(&t), Some(A));
+    }
+
+    /// The start [`run_tag`] writes is the one [`tag_run_start`] reads back,
+    /// whatever offset it was written in and with a local pull's namespaces
+    /// after it.
+    #[test]
+    fn run_tag_and_tag_run_start_are_inverses() {
+        let at = |t: &str| t.parse::<DateTime<Utc>>().unwrap();
+        for (created_at, instant) in [
+            // The runner's and the CLI's own form: `Utc::now().to_rfc3339()`.
+            (
+                "2026-09-11T03:00:00.123456789+00:00",
+                "2026-09-11T03:00:00.123456789Z",
+            ),
+            ("2026-09-11T03:00:00Z", "2026-09-11T03:00:00Z"),
+            // An offset with dashes of its own: the time ends at `-ns-`, not
+            // at the next dash.
+            ("2026-09-10T22:00:00-05:00", "2026-09-11T03:00:00Z"),
+        ] {
+            for ns in [vec![], vec!["demo".to_string(), "prod".to_string()]] {
+                let tag = run_tag(A, created_at, &ns);
+                assert_eq!(tag_run_start(&tag), Some(at(instant)), "{tag}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_tag_with_no_uid_or_no_readable_time_carries_no_start() {
+        // Legacy: the start is there, but nothing says where the release
+        // name ends, so it is not read.
+        assert_eq!(tag_run_start("platform-2026-09-11T03:00:00+00:00"), None);
+        assert_eq!(tag_run_start(&format!("{A}-yesterday")), None);
+        assert_eq!(tag_run_start(&format!("{A}-2026-09-11T03:00:00Z-x")), None);
+        assert_eq!(tag_run_start(&format!("{A}-")), None);
+        assert_eq!(tag_run_start(A), None);
+        assert_eq!(tag_run_start(""), None);
     }
 
     #[test]

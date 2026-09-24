@@ -257,6 +257,47 @@ socket. Common cases: missing directory, wrong permissions
 target-store files, re-create the offending target with
 `apprafter target add <name> --force`.
 
+### `apprafter::backup::job_active`
+
+`apprafter backup run` (or the first backup `apprafter backup enable`
+takes) found a backup Job or a check Job that has not finished, and
+started nothing beside it. The lines it printed just before the error name
+that Job and say what it is doing, as `apprafter backup status` would:
+`Running`, `Pending, cannot be scheduled: …`, or `Retrying after 1 failed
+attempt`. Two runs at once do not both finish: two backups need the same
+helper pods, and a backup and a check each fail on the other's repository
+lock. `enable` does not fail on this: backup is enabled, and it skips only
+its first backup.
+
+**Fix.** Wait until `apprafter backup status` shows that Job finished, then
+run `apprafter backup run` again. A Job that cannot start may hold on
+until its deadline; the printed lines then include the command that
+deletes it, and [the backup runner's pod cannot be
+scheduled](backup-restore.md#runner-unschedulable) explains why it cannot
+start.
+
+### `apprafter::backup::runner_unschedulable`
+
+`apprafter backup run` (or the first backup `apprafter backup enable`
+takes) created the backup Job, but no node took its pod: for two minutes
+no node had room for it, or for ten minutes a condition of the node, such
+as memory pressure, kept it off. The command deleted the Job and stopped.
+The lines it printed just before the error give the scheduler's reason
+(`0/1 nodes are available: 1 Insufficient memory. …`) and, for a lack of
+room, what the runner asks for. When `enable` took this backup, backup is
+enabled all the same: the error's help says so, and `enable` need not run
+again.
+
+**Fix.** For a lack of room, `apprafter top` shows how much of each node
+is requested, and by what. Free enough for the runner, or move to a
+bigger machine, then run `apprafter backup run` again. The scheduled
+backup asks for the same room, so it cannot start either until then. A
+node condition such as `node.kubernetes.io/memory-pressure` lifts on its
+own once the condition ends; run `apprafter backup run` again then. The
+whole case, including how to tell whether tonight's scheduled backup is
+stuck: [the backup runner's pod cannot be
+scheduled](backup-restore.md#runner-unschedulable).
+
 ### `apprafter::cli::other`
 
 Catch-all for messages that haven't been promoted to a typed
@@ -417,11 +458,14 @@ The public-domain path has several moving parts; work outward:
 
 Full runbook: [connect a domain](connect-a-domain.md).
 
-### Every command prints `Node disk: …` {#node-disk}
+### Commands print `Node disk: …` {#node-disk}
 
 The node's root filesystem has less than **15% free**, and the platform says
-so above every `apprafter` command until it does not. The banner carries the
-figure and what shares that filesystem:
+so above every `apprafter` command that reaches beyond your machine until it
+does not. `--help`, `--version` and the commands that only work with local
+files, such as `completion`, `target list` and `app validate`, neither print
+it nor read the cluster to find out. The banner carries the figure and what
+shares that filesystem:
 
 ```text
 warn: Node disk: the node's filesystem is 88% full (12% free). Every workload

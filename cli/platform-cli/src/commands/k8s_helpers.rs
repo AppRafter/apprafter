@@ -26,6 +26,16 @@
 //! override of their own (yet — Track A.9 will add it
 //! uniformly across the CLI). The helper therefore always
 //! resolves the active target.
+//!
+//! ## After Ctrl-C
+//!
+//! Every wrapper that spawns `kubectl` refuses, before it spawns,
+//! once an interruptible command (`backup create`, `export`,
+//! `restore`) has had its SIGINT or SIGTERM
+//! (`helper_interrupt::refuse_if_interrupted`): the command's own
+//! thread starts nothing in the cluster after the signal. In every
+//! other command no handler is installed, the flag is never set, and
+//! the check is a load.
 
 use std::io::Write;
 use std::path::Path;
@@ -37,6 +47,7 @@ use cli_core::{CliError, Result};
 use cli_state::State;
 use tempfile::NamedTempFile;
 
+use crate::commands::helper_interrupt::refuse_if_interrupted;
 use crate::commands::state_paths::resolve_state_paths;
 
 /// Build a classified [`CliError::Kubectl`] from a failed invocation.
@@ -233,6 +244,7 @@ fn kubectl_get_json_inner(
     kubeconfig_path: &Path,
     show_managed_fields: bool,
 ) -> Result<Option<serde_json::Value>> {
+    refuse_if_interrupted()?;
     let mut c = Command::new("kubectl");
     c.args(kubectl_get_args(
         resource,
@@ -324,6 +336,7 @@ pub(crate) fn kubectl_get_json_by_selector(
     namespace: Option<&str>,
     kubeconfig_path: &Path,
 ) -> Result<Vec<serde_json::Value>> {
+    refuse_if_interrupted()?;
     let mut c = Command::new("kubectl");
     c.args(kubectl_list_args(resource, selector, namespace))
         .env("KUBECONFIG", kubeconfig_path);
@@ -406,6 +419,7 @@ pub(crate) fn kubectl_get_json_cluster_wide(
     namespace: Option<&str>,
     kubeconfig_path: &Path,
 ) -> Result<Option<serde_json::Value>> {
+    refuse_if_interrupted()?;
     let mut c = Command::new("kubectl");
     c.args(kubectl_get_cluster_wide_args(resource, namespace))
         .env("KUBECONFIG", kubeconfig_path);
@@ -429,6 +443,7 @@ pub(crate) fn kubectl_get_json_cluster_wide(
 /// equivalent to `kubectl apply -f manifest.json`.  Use
 /// `kubectl_apply_server_side` when SSA field-manager ownership is required.
 pub fn kubectl_apply_json(manifest: &serde_json::Value, kubeconfig_path: &Path) -> Result<()> {
+    refuse_if_interrupted()?;
     let file = write_apply_tempfile(manifest)?;
 
     let out = Command::new("kubectl")
@@ -504,6 +519,7 @@ pub fn kubectl_delete(
     namespace: &str,
     kubeconfig_path: &Path,
 ) -> Result<()> {
+    refuse_if_interrupted()?;
     let out = Command::new("kubectl")
         .args(kubectl_delete_args(resource, name, namespace))
         .env("KUBECONFIG", kubeconfig_path)
@@ -566,6 +582,7 @@ pub fn kubectl_merge_patch(
     body_json: &str,
     kubeconfig_path: &Path,
 ) -> Result<()> {
+    refuse_if_interrupted()?;
     let mut c = Command::new("kubectl");
     c.args(kubectl_merge_patch_args(
         resource,
@@ -629,6 +646,7 @@ pub fn kubectl_apply_server_side(
 ) -> Result<()> {
     use std::process::Stdio;
 
+    refuse_if_interrupted()?;
     let mut child = Command::new("kubectl")
         .args(kubectl_server_side_apply_args(field_manager))
         .env("KUBECONFIG", kubeconfig_path)
@@ -682,6 +700,58 @@ pub fn kubectl_apply_server_side(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WI-383: once an interruptible command has had its signal, no wrapper
+    /// starts a kubectl — each answers with the interrupt's refusal, which no
+    /// kubectl run (or failure to spawn one) could have produced. A wrapper
+    /// that spawned anyway would reach no cluster
+    /// (`test_seam::unreachable_kubeconfig`).
+    #[test]
+    fn once_interrupted_no_wrapper_starts_a_kubectl() {
+        let kc = crate::commands::helper_interrupt::test_seam::unreachable_kubeconfig();
+        let kc = kc.path();
+        let _interrupted = crate::commands::helper_interrupt::test_seam::interrupt_this_thread();
+        let refused = |what: &str, r: std::result::Result<(), CliError>| {
+            let e = r.expect_err(what).to_string();
+            assert!(e.starts_with("interrupted"), "{what}: {e}");
+        };
+        refused(
+            "get",
+            kubectl_get_json("secret", Some("s"), Some("demo"), kc).map(drop),
+        );
+        refused(
+            "get --show-managed-fields",
+            kubectl_get_json_showing_managed_fields("pod", Some("p"), Some("demo"), kc).map(drop),
+        );
+        refused(
+            "list by selector",
+            kubectl_get_json_by_selector("pods", "a=b", Some("demo"), kc).map(drop),
+        );
+        refused(
+            "list",
+            kubectl_get_json_cluster_wide("applications.apprafter.io", None, kc).map(drop),
+        );
+        refused(
+            "apply",
+            kubectl_apply_json(&serde_json::json!({"kind": "ConfigMap"}), kc),
+        );
+        refused("delete", kubectl_delete("pod", "p", "demo", kc));
+        refused(
+            "merge patch",
+            kubectl_merge_patch(
+                "applications.apprafter.io",
+                "web",
+                Some("demo"),
+                None,
+                r#"{"spec":{"base":{"replicas":0}}}"#,
+                kc,
+            ),
+        );
+        refused(
+            "server-side apply",
+            kubectl_apply_server_side("kind: ConfigMap\n", "apprafter-restore", kc),
+        );
+    }
 
     #[test]
     fn list_by_selector_builds_label_args() {

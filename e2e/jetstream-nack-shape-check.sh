@@ -41,6 +41,10 @@ CHART_VERSION="$(grep -oE '^\s*version:\s*"[0-9.]+"' "${REPO_ROOT}/platform-stac
 CLUSTER_UP=0
 
 _kind() { if command -v kind >/dev/null 2>&1; then kind "$@"; else "$HOME/bin/kind" "$@"; fi; }
+# Written down rather than inherited from the kind binary's default — see the
+# note on APPRAFTER_KIND_NODE_IMAGE in e2e/lib.sh. This script does not source
+# lib.sh, so it carries its own default of the same variable.
+: "${APPRAFTER_KIND_NODE_IMAGE:=kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed}"
 _helm() { if command -v helm >/dev/null 2>&1; then helm "$@"; else "$HOME/bin/helm" "$@"; fi; }
 
 fail() { printf 'FAILED: %s\n' "$1" >&2; exit 1; }
@@ -66,7 +70,8 @@ printf '\n=== 2/4  kind cluster ===\n'
 _kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
 KUBECONFIG="$(mktemp -t apprafter-nack-kube.XXXXXX)"
 export KUBECONFIG
-_kind create cluster --name "$CLUSTER" >/dev/null 2>&1 || fail "kind create failed"
+_kind create cluster --name "$CLUSTER" --image "$APPRAFTER_KIND_NODE_IMAGE" >/dev/null 2>&1 \
+    || fail "kind create failed"
 CLUSTER_UP=1
 kubectl apply -f "$WORK/nack/crds/crds.yml" >/dev/null || fail "applying the NACK CRDs"
 kubectl wait --for=condition=Established --timeout=60s \
