@@ -278,6 +278,45 @@ jobs:
           done
           echo "  ok: argocd-cue-cmp:v${cmp_version} is pullable"
 
+          # Three more artefacts this chart pins come from other workflows,
+          # and an image being in the registry says nothing about them:
+          #   - the backup runner image, `#BackupValues.image` in platform.cue,
+          #     built by release-backup-runner from cli/Cargo.toml. Its pin is
+          #     a hand-written literal, so read it from that file;
+          #   - the operator and webhook Helm CHARTS at op_version, which
+          #     release-operator pushes in its helm-charts job only AFTER both
+          #     images exist — so the image checks above pass while the chart
+          #     push is still pending, and Argo CD cannot render the
+          #     components from a chart that is not there.
+          # Same registry probe (an OCI chart is a manifest like any image)
+          # and the same deadline. `|| true`: under pipefail a grep that
+          # matches nothing would end the step here, before the error below
+          # could say what is missing.
+          runner_tag="$(grep -oE '"ghcr\.io/[^"/]+/apprafter-backup:v[0-9]+\.[0-9]+\.[0-9]+"' \
+              platform-stack/cue/platform.cue \
+              | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || true)"
+          if [ -z "${runner_tag:-}" ]; then
+            echo "::error::could not read the pinned backup runner image from platform.cue (#BackupValues.image)"
+            exit 1
+          fi
+          echo "chart pins the backup runner at ${runner_tag}"
+          for pinned in "apprafter-backup ${runner_tag} release-backup-runner" \
+                        "charts/apprafter-operator ${op_version} release-operator (helm-charts job)" \
+                        "charts/apprafter-admission-webhook ${op_version} release-operator (helm-charts job)"; do
+            read -r artefact tag publisher <<<"$pinned"
+            until check_tag "$artefact" "$tag"; do
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "::error::${artefact}:${tag} is still absent from ghcr after 15 minutes."
+                echo "::error::Publishing this chart would advertise an artefact nobody can pull."
+                echo "::error::Check ${publisher} for this same commit — it publishes that tag."
+                exit 1
+              fi
+              echo "  ${artefact}:${tag} not in the registry yet — waiting 20s"
+              sleep 20
+            done
+            echo "  ok: ${artefact}:${tag} is pullable"
+          done
+
       - name: Compute lowercase owner
         id: owner
         env:
