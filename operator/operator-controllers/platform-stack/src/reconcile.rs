@@ -214,6 +214,17 @@ pub async fn run(client: Client, metrics: Arc<Metrics>) -> Result<(), Error> {
     // instead (`backup_health::Assessment::recheck_after`).
     // RBAC: the operator chart's `-backup-health` Role, list + watch in
     // `apprafter-system` only.
+    //
+    // These watches share the controller's ONE trigger stream, and
+    // kube-runtime 4.2 wraps that whole stream in a single `StreamBackoff`
+    // (`Controller::run`): an error from any watch — a 403 while the Role is
+    // not yet applied, or on a fork that trimmed it — backs off the
+    // PlatformStack and Application triggers too, by up to about 30 s each
+    // time. Reconciles still run on their requeues, and the reads in
+    // `backup_health::observe` fail on their own, so the condition says
+    // `StateUnreadable`. Isolating them would take a separate trigger stream
+    // with its own backoff, which kube-runtime offers only behind its
+    // `unstable-runtime-stream-control` feature; not taken for this.
     let backup_ns = crate::backup_health::BACKUP_NAMESPACE;
     let to_singleton =
         || Some(ObjectRef::<PlatformStack>::new(SINGLETON_NAME).within(SINGLETON_NAMESPACE));

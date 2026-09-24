@@ -686,8 +686,14 @@ subjects:
 # creates, changes or deletes a backup Job.
 #
 # Granted in the SAME change as the code that uses it: a missing verb shows
-# only on a live cluster, as a watch that 403s forever and a condition that
-# never appears.
+# only on a live cluster, as a watch that 403s forever and a condition stuck
+# at `Unknown` (`StateUnreadable`). Nor does the harm stay with backups:
+# kube-runtime backs off the controller's triggers as ONE stream, so every
+# failed watch here also delays the controller's reaction to PlatformStack
+# and Argo CD Application changes, by up to about 30 s each time (reconciles
+# still run, on their requeues). An upgrade reaches this Role within a sync;
+# a fork that trims it must drop the three backup `.watches` in
+# `operator-controllers/platform-stack/src/reconcile.rs` with it.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
