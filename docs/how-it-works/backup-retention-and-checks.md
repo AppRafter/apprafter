@@ -548,9 +548,10 @@ the operator's six-hour upstream check.
 | `False` | `RunnerNotStarted` | The pod has not started for ten minutes for another reason: its image cannot be pulled, a Secret it reads is missing, or the scheduler has not yet tried to place it. Or the Job has had no pod at all for ten minutes, because a quota, a LimitRange or an admission webhook refused it; the Job's `FailedCreate` events say which. |
 | `False` | `RunnerOOMKilled` | An attempt was killed at the runner's memory limit. The Job retries, but the same data meets the same limit, so this is reported at once rather than after the last attempt. |
 | `False` | `RunnerEvicted` | The kubelet evicted an attempt: memory pressure on the node, or the staging directory grown past its size limit. The message quotes the kubelet. |
-| `False` | `DeadlineExceeded` | The Job was stopped by its deadline. The message says what the runner recorded, or that it recorded nothing, and, for a pod that was never placed, what the scheduler said before the deadline. |
+| `False` | `RunnerFailed` | An attempt of a backup ran and failed: the runner exited non-zero, and the message quotes the error it recorded. Reported at once, while the Job retries, because the runner has already recorded the failure and posted its webhook; a retry that succeeds returns the condition to `True`. |
+| `False` | `DeadlineExceeded` | The Job was stopped by its deadline before any attempt failed on its own. The message says what the runner recorded, or that it recorded nothing, and, for a pod that was never placed, what the scheduler said before the deadline. A Job whose attempts had already failed keeps the reason they had (`RunnerFailed`, `RunnerOOMKilled`, `RunnerEvicted` or `RepositoryCheckFailed`), and its message says the deadline ended it. |
 | `False` | `BackoffLimitExceeded` | Every attempt of a backup failed. The message says how the last one ended and quotes the runner's `lastError` when it wrote one. |
-| `False` | `RepositoryCheckFailed` | Every attempt of the weekly check ran and failed: `restic check` did not pass, because it found the repository damaged or could not read it. The message quotes what the runner recorded, `apprafter backup status` shows it under `last check`, the check pod's log has all of it, and `apprafter backup check` runs the same check from your machine. |
+| `False` | `RepositoryCheckFailed` | An attempt of the weekly check ran and failed: `restic check` did not pass, because it found the repository damaged or could not read it. Reported at once, while the Job retries. The message quotes what the runner recorded, `apprafter backup status` shows it under `last check`, the check pod's log has all of it, and `apprafter backup check` runs the same check from your machine. |
 | `False` | `Failed` | The Job failed for another reason, which the message quotes. |
 | `False` | `ScheduleSuspended` | The CronJob is suspended, so no scheduled backup starts. |
 | `Unknown` | `NoRunYet` | No backup has finished yet. |
@@ -572,9 +573,12 @@ Four rules keep it from raising false alarms, and from going quiet:
   pod the Job is waiting on, never for an attempt that has already failed: a
   runner killed at its memory limit or evicted counts at once, and stays the
   verdict while the Job's next pod waits for room or starts.
-- An attempt that ends with an ordinary error is left to the Job: the runner
-  records that error itself, and the next attempt may succeed. Only the Job
-  giving up turns the condition `False`.
+- An attempt that runs and fails turns the condition `False` at once. The
+  runner has already recorded the error and posted its failure webhook, and
+  the Job's own ending can be far off: seven attempts by default, and an hour
+  each for a check that reads every pack. A retry that succeeds completes the
+  Job and returns the condition to `True`. A pod stopped from outside, by a
+  node drain or a deletion, is not an attempt that failed.
 - The newest finished run decides, whether the schedule started it or
   `apprafter backup run` did, so a later successful run returns the condition
   to `True`. An unfinished run in trouble counts before any finished one,

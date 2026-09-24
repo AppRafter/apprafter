@@ -490,9 +490,23 @@ fn backup_next_step(reason: &str) -> Option<(&'static str, &'static str)> {
              backup set staging-mode sequential` stages one namespace at a time.",
             BACKUP_HEALTH_DOC,
         ),
+        // Reported while the Job retries: the runner has recorded why, and
+        // posted its failure webhook, for this attempt.
+        "RunnerFailed" => (
+            "`apprafter backup status` shows the Job and the runner's own record of the error \
+             (`lastError`). A retry that succeeds clears this; `apprafter backup run` starts one \
+             once the Job has ended.",
+            BACKUP_HEALTH_DOC,
+        ),
+        // Only a Job no attempt of which failed on its own ends with this
+        // reason (the operator keeps the attempts' reason otherwise), so it
+        // is a runner that never started or one that ran out of time; the
+        // message says which.
         "DeadlineExceeded" => (
-            "`apprafter backup status` shows the Job; `apprafter top` shows whether the node \
-             has room for the next run.",
+            "`apprafter backup status` shows the Job and the runner's own record. A runner that \
+             never started needs room on the node (`apprafter top` shows it); one that ran out \
+             of time needs a longer deadline (`apprafter backup set deadline`, or `set \
+             check-deadline` for the check).",
             BACKUP_HEALTH_DOC,
         ),
         "BackoffLimitExceeded" | "Failed" => (
@@ -1397,7 +1411,34 @@ mod tests {
         let text = backup_health_lines(&stack, frozen_now()).join("\n");
         assert!(text.contains("FAILING"), "{text}");
         assert!(text.contains("`apprafter backup status`"), "{text}");
+        // Found by review: this advice named only room on the node, while a
+        // runner that ran and was too slow needs a longer deadline instead.
+        assert!(text.contains("`apprafter top`"), "{text}");
+        assert!(text.contains("`apprafter backup set deadline`"), "{text}");
         assert!(text.contains(BACKUP_HEALTH_DOC), "{text}");
+    }
+
+    #[test]
+    fn a_failed_attempt_sends_the_reader_to_the_runners_record() {
+        let stack = with_backup(
+            true,
+            Some(backup_condition(
+                "False",
+                "RunnerFailed",
+                "backup Job apprafter-backup-29312340: its attempt 1 of at most 7 exited with \
+                 code 1 (pod apprafter-backup-29312340-aaaaa, at 2026-09-23T03:00:30Z). The Job \
+                 retries until its backoff limit. The runner recorded: restic backup: Fatal: \
+                 unable to open repository: 503 Slow Down",
+            )),
+        );
+        let text = backup_health_lines(&stack, frozen_now()).join("\n");
+        assert!(text.contains("FAILING since"), "{text}");
+        assert!(text.contains("503 Slow Down"), "{text}");
+        assert!(
+            text.contains("`apprafter backup status` shows the Job and the runner's own record"),
+            "{text}"
+        );
+        assert!(text.contains("`lastError`"), "{text}");
     }
 
     #[test]

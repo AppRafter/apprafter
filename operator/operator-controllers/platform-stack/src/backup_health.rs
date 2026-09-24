@@ -50,8 +50,13 @@
 //! disk-pressure taint for five minutes after the pressure ends, and a node
 //! that restarts is not ready for a few minutes. A pod the scheduler is
 //! making room for by preemption (`status.nominatedNodeName`) is not trouble
-//! at all. A container that dies (`OOMKilled`, `Evicted`) is trouble at once:
-//! that attempt has failed and nothing will undo it.
+//! at all. An attempt that has failed is trouble at once, and stays the
+//! verdict while the Job's next pod waits or runs: nothing will undo it. That
+//! holds for a runner killed (`OOMKilled`) or evicted, which records nothing,
+//! and for one that exited non-zero (`RunnerFailed`, `RepositoryCheckFailed`
+//! for the check), which has recorded the failure and posted its webhook
+//! while the Job's own ending may be hours away. A retry that succeeds
+//! completes the Job, and that clears it.
 //!
 //! Messages are built from the objects' own timestamps, never from "how long
 //! ago", so re-reading unchanged objects gives a byte-identical condition and
@@ -128,11 +133,17 @@ pub const REASON_UNSCHEDULABLE: &str = "RunnerUnschedulable";
 pub const REASON_NOT_STARTED: &str = "RunnerNotStarted";
 pub const REASON_OOM_KILLED: &str = "RunnerOOMKilled";
 pub const REASON_EVICTED: &str = "RunnerEvicted";
+/// An attempt of a backup ran and failed on its own: the runner exited
+/// non-zero, and recorded why. Reported at once, while the Job retries, and
+/// kept when its deadline ends the Job before its backoff limit does.
+pub const REASON_RUNNER_FAILED: &str = "RunnerFailed";
 pub const REASON_DEADLINE_EXCEEDED: &str = "DeadlineExceeded";
 pub const REASON_BACKOFF_LIMIT: &str = "BackoffLimitExceeded";
-/// The weekly check Job gave up with every attempt failing by itself:
-/// `restic check` did not pass. Kept apart from [`REASON_BACKOFF_LIMIT`]
-/// because it is the one reason about the repository rather than the run.
+/// An attempt of the weekly check ran and failed by itself: `restic check`
+/// did not pass. Reported at once, while the Job retries, and kept when the
+/// Job gives up or its deadline stops it. Kept apart from
+/// [`REASON_BACKOFF_LIMIT`] because it is the one reason about the
+/// repository rather than the run.
 pub const REASON_CHECK_FAILED: &str = "RepositoryCheckFailed";
 pub const REASON_FAILED: &str = "Failed";
 
@@ -525,7 +536,7 @@ fn assess_run(
     let mut recheck_at: Option<DateTime<Utc>> = None;
     let mut trouble: Option<Outcome> = None;
     for job in jobs.iter().filter(|j| ending(j).is_none()) {
-        let (found, at) = unfinished_trouble(run, job, &observed.pods, now);
+        let (found, at) = unfinished_trouble(run, job, observed, now);
         recheck_at = earliest(recheck_at, at);
         if trouble.is_none() {
             trouble = found;
@@ -612,10 +623,10 @@ fn no_finished_run(run: Run, cronjob: &Value, jobs: &[&Value]) -> Outcome {
 fn unfinished_trouble(
     run: Run,
     job: &Value,
-    pods: &[Value],
+    observed: &Observed,
     now: DateTime<Utc>,
 ) -> (Option<Outcome>, Option<DateTime<Utc>>) {
-    let owned: Vec<&Value> = pods.iter().filter(|p| owned_by(p, job)).collect();
+    let owned: Vec<&Value> = observed.pods.iter().filter(|p| owned_by(p, job)).collect();
     // A scheduled Job holds the schedule while it waits: the CronJob is
     // `concurrencyPolicy: Forbid`. A manual one holds nothing.
     let holds = if cronjob_owner(job).is_some() {
@@ -623,7 +634,7 @@ fn unfinished_trouble(
     } else {
         String::new()
     };
-    let earlier = failed_attempt(run, job, &owned, pods);
+    let earlier = failed_attempt(run, job, observed, now);
 
     let live = owned
         .iter()
@@ -827,37 +838,26 @@ impl FailedAttempt {
     }
 }
 
-/// The newest failed attempt of `job`, when its cause is one the runner
-/// cannot record: the same data meets the same limit, so it is trouble now,
-/// even while the next attempt runs.
+/// The newest attempt of `job` that failed on its own, as trouble now,
+/// whatever the Job's next attempt is doing.
+///
+/// A runner killed at its limit or evicted records nothing, and the same
+/// data meets the same limit on the retry. A runner that exited non-zero has
+/// recorded why and posted the failure webhook — and the Job's own ending
+/// can be ten minutes away (seven attempts, 10 s to 320 s apart) or, for
+/// attempts that fail slowly, the six-hour deadline. Reading `True` meanwhile
+/// would contradict the runner's own record. A retry that succeeds completes
+/// the Job, and that is what clears it.
 fn failed_attempt(
     run: Run,
     job: &Value,
-    owned: &[&Value],
-    pods: &[Value],
+    observed: &Observed,
+    now: DateTime<Utc>,
 ) -> Option<FailedAttempt> {
-    let pod = owned
-        .iter()
-        .filter(|p| str_at(p, "/status/phase") == Some("Failed"))
-        .max_by_key(|p| time_at(p, "/metadata/creationTimestamp"))?;
-    let (reason, what, records) = match attempt_cause(pod) {
-        Cause::OomKilled(what) => (
-            REASON_OOM_KILLED,
-            what,
-            "a killed runner records nothing itself",
-        ),
-        Cause::Evicted(what) => (
-            REASON_EVICTED,
-            what,
-            "an evicted runner records nothing itself",
-        ),
-        // An ordinary non-zero exit: the runner recorded it itself, and
-        // the retry may well succeed. The Job's own ending decides.
-        Cause::Exited(_) | Cause::Unknown(_) => return None,
-    };
+    let pod = last_failed_attempt(job, &observed.pods)?;
     // The Job's own count lags its pods by a sync; the failed pods it still
     // has are the floor.
-    let failed = failed_attempts(job, pods).max(1);
+    let failed = failed_attempts(job, &observed.pods).max(1);
     let attempts = job
         .pointer("/spec/backoffLimit")
         .and_then(Value::as_u64)
@@ -869,15 +869,78 @@ fn failed_attempt(
     } else {
         " It was the last attempt the Job makes."
     };
+    let prefix = format!("{} Job {}: its {attempt}", run.noun(), name(job));
+    let (reason, what, alone) = match attempt_cause(pod) {
+        Cause::OomKilled(what) => {
+            let alone = format!("{prefix} {what}; a killed runner records nothing itself.{next}");
+            (REASON_OOM_KILLED, what, alone)
+        }
+        Cause::Evicted(what) => {
+            let alone = format!("{prefix} {what}; an evicted runner records nothing itself.{next}");
+            (REASON_EVICTED, what, alone)
+        }
+        Cause::Exited(what) | Cause::Unknown(what) => {
+            // The attempt's own record: written before its container exited.
+            let until = pod
+                .pointer("/status/containerStatuses")
+                .and_then(Value::as_array)
+                .and_then(|cs| {
+                    cs.iter()
+                        .find_map(|c| c.pointer("/state/terminated/finishedAt"))
+                })
+                .and_then(Value::as_str)
+                .and_then(parse_time)
+                .unwrap_or(now);
+            let recorded = run
+                .record_keys()
+                .and_then(|keys| {
+                    runner_record(job, Some(until), observed.runner_status.as_ref(), keys)
+                })
+                .map(|e| format!(" The runner recorded: {e}"))
+                .unwrap_or_default();
+            let means = what_a_failure_means(run);
+            // The quote last: restic's words end without a full stop.
+            let alone = format!("{prefix} {what}.{means}{next}{recorded}");
+            (ran_and_failed(run), what, alone)
+        }
+    };
     Some(FailedAttempt {
         reason,
-        alone: format!(
-            "{} Job {}: its {attempt} {what}; {records}.{next}",
-            run.noun(),
-            name(job)
-        ),
+        alone,
         beside: format!(" Its {attempt} {what}."),
     })
+}
+
+/// The newest pod of `job` that failed on its own. A pod being deleted — a
+/// node drain, `kubectl delete`, the Job controller stopping it at the
+/// deadline — was stopped from outside, and its exit code is the signal's.
+fn last_failed_attempt<'a>(job: &Value, pods: &'a [Value]) -> Option<&'a Value> {
+    pods.iter()
+        .filter(|p| owned_by(p, job))
+        .filter(|p| str_at(p, "/status/phase") == Some("Failed"))
+        .filter(|p| p.pointer("/metadata/deletionTimestamp").is_none())
+        .max_by_key(|p| time_at(p, "/metadata/creationTimestamp"))
+}
+
+/// The reason for attempts that ran and failed on their own: for a backup
+/// the runner failing, for the check `restic check` not passing — the one
+/// reason about the repository rather than the run.
+fn ran_and_failed(run: Run) -> &'static str {
+    match run {
+        Run::Backup => REASON_RUNNER_FAILED,
+        Run::Check => REASON_CHECK_FAILED,
+    }
+}
+
+/// What a failed attempt's non-zero exit means, where that is not obvious.
+fn what_a_failure_means(run: Run) -> &'static str {
+    match run {
+        Run::Backup => "",
+        Run::Check => {
+            " restic check exits non-zero when it finds the repository damaged, and when it \
+             cannot read the repository at all; its output is in that pod's log."
+        }
+    }
 }
 
 /// Does the Job controller count no pod of `job` at all — none active, none
@@ -932,13 +995,7 @@ fn failed_job(
     let when = at.unwrap_or("an unrecorded time");
     let failed_at = at.and_then(parse_time);
 
-    let last_failed = observed
-        .pods
-        .iter()
-        .filter(|p| owned_by(p, job))
-        .filter(|p| str_at(p, "/status/phase") == Some("Failed"))
-        .max_by_key(|p| time_at(p, "/metadata/creationTimestamp"));
-    let cause = last_failed.map(attempt_cause);
+    let cause = last_failed_attempt(job, &observed.pods).map(attempt_cause);
     let recorded = run
         .record_keys()
         .and_then(|keys| runner_record(job, failed_at, observed.runner_status.as_ref(), keys));
@@ -970,21 +1027,47 @@ fn failed_job(
                     let held = holds_the_schedule(noun);
                     m.strip_suffix(held.as_str()).unwrap_or(m).trim()
                 });
-            let evidence = if !recorded_text.is_empty() {
-                recorded_text.clone()
-            } else if let Some(before) = before {
-                format!(" Its runner never started: {before}")
-            } else if let Some(c) = &cause {
-                format!(" Its last attempt {}.", c.describe())
-            } else if run == Run::Backup {
-                " The runner recorded nothing for this run: its pod never started, or it was \
-                 killed before it could."
-                    .to_string()
-            } else {
-                " No pod of it is left to say how far it got.".to_string()
+            // Attempts that failed on their own before the deadline stopped
+            // the Job keep the reason they had while it retried: the deadline
+            // is how the Job ended, not why its runs failed, and its advice
+            // (room on the node, a longer deadline) would send the reader the
+            // wrong way. Slow failing attempts outlast the deadline before the
+            // backoff limit — seven one-hour checks with `--read-data` do.
+            let (reason, evidence) = match &cause {
+                Some(c) => {
+                    let (reason, means) = match c {
+                        Cause::OomKilled(_) => (REASON_OOM_KILLED, ""),
+                        Cause::Evicted(_) => (REASON_EVICTED, ""),
+                        Cause::Exited(_) | Cause::Unknown(_) => {
+                            (ran_and_failed(run), what_a_failure_means(run))
+                        }
+                    };
+                    (
+                        reason,
+                        format!(
+                            " Its last failed attempt {}.{means}{recorded_text}",
+                            c.describe()
+                        ),
+                    )
+                }
+                None if !recorded_text.is_empty() => {
+                    (REASON_DEADLINE_EXCEEDED, recorded_text.clone())
+                }
+                None => (
+                    REASON_DEADLINE_EXCEEDED,
+                    if let Some(before) = before {
+                        format!(" Its runner never started: {before}")
+                    } else if run == Run::Backup {
+                        " The runner recorded nothing for this run: its pod never started, or it \
+                         was killed before it could."
+                            .to_string()
+                    } else {
+                        " No pod of it is left to say how far it got.".to_string()
+                    },
+                ),
             };
             (
-                REASON_DEADLINE_EXCEEDED,
+                reason,
                 format!(
                     "{prefix} failed at {when}: DeadlineExceeded, active longer than \
                      {limit}.{evidence}"
@@ -1003,12 +1086,7 @@ fn failed_job(
             // reason and a word on what that exit means.
             let (ran_and_failed, what_it_means) = match run {
                 Run::Backup => (REASON_BACKOFF_LIMIT, ""),
-                Run::Check => (
-                    REASON_CHECK_FAILED,
-                    " restic check exits non-zero when it finds the repository damaged, and \
-                     when it cannot read the repository at all; its output is in that pod's \
-                     log.",
-                ),
+                Run::Check => (REASON_CHECK_FAILED, what_a_failure_means(run)),
             };
             let (reason, last) = match &cause {
                 Some(Cause::OomKilled(w)) => (REASON_OOM_KILLED, format!(" The last one {w}.")),
@@ -1141,8 +1219,16 @@ fn attempt_cause(pod: &Value) -> Cause {
         .pointer("/status/containerStatuses")
         .and_then(Value::as_array)
         .and_then(|cs| cs.iter().find_map(|c| c.pointer("/state/terminated")));
+    // A pod the kubelet refused (`OutOfmemory`), or one a node shutdown
+    // ended, has no container state to read; the pod's own reason says it.
+    let pod_said = reason_with_message(
+        str_at(pod, "/status/reason").unwrap_or(""),
+        str_at(pod, "/status/message").unwrap_or(""),
+    )
+    .map(|w| format!(": {w}"))
+    .unwrap_or_default();
     let Some(t) = terminated else {
-        return Cause::Unknown(format!("failed (pod {pod_name})"));
+        return Cause::Unknown(format!("failed (pod {pod_name}){pod_said}"));
     };
     let reason = t.get("reason").and_then(Value::as_str).unwrap_or("");
     let finished = t
@@ -1167,7 +1253,7 @@ fn attempt_cause(pod: &Value) -> Cause {
                 "exited with code {code}{named} (pod {pod_name}{finished})"
             ))
         }
-        None => Cause::Unknown(format!("failed (pod {pod_name})")),
+        None => Cause::Unknown(format!("failed (pod {pod_name}){pod_said}")),
     }
 }
 
@@ -1860,10 +1946,13 @@ mod tests {
         );
     }
 
+    /// Found by review: an attempt that exits non-zero was left to the Job's
+    /// own ending, and the Job retries seven times (the default backoff
+    /// limit) — ten minutes for fast failures, up to its six-hour deadline
+    /// for slow ones — while the runner had already recorded the failure and
+    /// posted its webhook. The stack read `True` all that time.
     #[test]
-    fn an_ordinary_failed_attempt_waits_for_the_jobs_own_verdict() {
-        // The runner records an ordinary error itself, and the next attempt
-        // may succeed: no alarm until the Job gives up.
+    fn a_backup_attempt_that_fails_is_a_failure_at_once_and_quotes_the_runner() {
         let done = backup_job(
             "apprafter-backup-29310900",
             "2026-09-22T03:00:00Z",
@@ -1871,13 +1960,282 @@ mod tests {
         );
         let mut j = backup_job("apprafter-backup-29312340", "2026-09-23T03:00:00Z", vec![]);
         j["status"]["failed"] = json!(1);
-        let p = exited(
+        j["status"]["active"] = json!(1);
+        let first = exited(
             pod(&j, "aaaaa", "2026-09-23T03:00:00Z"),
             1,
             "2026-09-23T03:00:30Z",
         );
-        let (status, _, _) = cond_of(&run(&observed(vec![done, j], vec![p]), &[]));
-        assert_eq!(status, "True");
+        let retry = running(
+            pod(&j, "bbbbb", "2026-09-23T03:00:45Z"),
+            "2026-09-23T03:00:46Z",
+        );
+        let mut o = observed(vec![done, j], vec![first, retry]);
+        o.runner_status = Some(json!({
+            "lastSuccess": "2026-09-22T03:01:00+00:00",
+            "lastFailure": "2026-09-23T03:00:29+00:00",
+            "lastError": "restic backup: Fatal: unable to open repository: 503 Slow Down",
+        }));
+        let (status, reason, message) = cond_of(&run(&o, &[]));
+        assert_eq!(
+            (status, reason),
+            ("False", REASON_RUNNER_FAILED),
+            "{message}"
+        );
+        for needle in [
+            "backup Job apprafter-backup-29312340: its attempt 1 of at most 7 exited with code 1 \
+             (pod apprafter-backup-29312340-aaaaa",
+            "The Job retries until its backoff limit. The runner recorded: restic backup: \
+             Fatal: unable to open repository: 503 Slow Down",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in {message}");
+        }
+        assert!(
+            message.ends_with("503 Slow Down"),
+            "the quote comes last: {message}"
+        );
+    }
+
+    /// The reviewer's probe: the weekly check's `restic check` failed, the
+    /// runner recorded it, and the Job's retry is running.
+    #[test]
+    fn a_check_attempt_that_fails_is_a_repository_check_failure_at_once() {
+        let good = backup_job(
+            "apprafter-backup-29312340",
+            "2026-09-20T03:00:00Z",
+            complete("2026-09-20T03:40:00Z"),
+        );
+        let passed = job(
+            CHECK_CRONJOB,
+            "apprafter-backup-check-1",
+            "2026-09-13T06:00:00Z",
+            complete("2026-09-13T06:20:00Z"),
+        );
+        let mut check = job(
+            CHECK_CRONJOB,
+            "apprafter-backup-check-2",
+            "2026-09-20T06:00:00Z",
+            vec![],
+        );
+        check["status"]["failed"] = json!(1);
+        check["status"]["active"] = json!(1);
+        let first = exited(
+            pod(&check, "aaaaa", "2026-09-20T06:00:00Z"),
+            1,
+            "2026-09-20T06:30:00Z",
+        );
+        let retry = running(
+            pod(&check, "bbbbb", "2026-09-20T06:30:20Z"),
+            "2026-09-20T06:30:20Z",
+        );
+        let mut o = observed(vec![good, passed, check], vec![first, retry]);
+        o.cronjobs.push(cronjob(CHECK_CRONJOB));
+        o.runner_status = Some(json!({
+            "lastCheck": "2026-09-20T06:30:00+00:00", "lastCheckResult": "failed",
+            "lastCheckError": "pack 3f damaged",
+        }));
+        let a = assess(
+            true,
+            Ok(&o),
+            &[],
+            parse_time("2026-09-20T06:31:00Z").unwrap(),
+        );
+        let (status, reason, message) = cond_of(&a);
+        assert_eq!(
+            (status, reason),
+            ("False", REASON_CHECK_FAILED),
+            "{message}"
+        );
+        for needle in [
+            "repository check Job apprafter-backup-check-2: its attempt 1 of at most 7 exited \
+             with code 1",
+            "finds the repository damaged",
+            "The runner recorded: pack 3f damaged",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in {message}");
+        }
+    }
+
+    #[test]
+    fn a_retry_that_succeeds_clears_the_failed_attempt() {
+        let mut j = backup_job(
+            "apprafter-backup-29312340",
+            "2026-09-23T03:00:00Z",
+            complete("2026-09-23T03:02:00Z"),
+        );
+        j["status"]["failed"] = json!(1);
+        j["status"]["succeeded"] = json!(1);
+        let first = exited(
+            pod(&j, "aaaaa", "2026-09-23T03:00:00Z"),
+            1,
+            "2026-09-23T03:00:30Z",
+        );
+        let (status, reason, _) = cond_of(&run(&observed(vec![j], vec![first]), &[]));
+        assert_eq!((status, reason), ("True", REASON_SUCCEEDED));
+    }
+
+    /// A pod being deleted — a node drain, `kubectl delete` — was stopped from
+    /// outside. Its exit code is the signal's, not the runner failing.
+    #[test]
+    fn an_attempt_stopped_by_a_deletion_is_not_a_failure_of_its_own() {
+        let done = backup_job(
+            "apprafter-backup-29310900",
+            "2026-09-22T03:00:00Z",
+            complete("2026-09-22T03:01:00Z"),
+        );
+        let mut j = backup_job("apprafter-backup-29312340", "2026-09-23T03:00:00Z", vec![]);
+        j["status"]["active"] = json!(1);
+        let mut drained = exited(
+            pod(&j, "aaaaa", "2026-09-23T03:00:00Z"),
+            143,
+            "2026-09-23T03:00:30Z",
+        );
+        drained["metadata"]["deletionTimestamp"] = json!("2026-09-23T03:00:25Z");
+        let retry = running(
+            pod(&j, "bbbbb", "2026-09-23T03:00:45Z"),
+            "2026-09-23T03:00:46Z",
+        );
+        let (status, _, message) =
+            cond_of(&run(&observed(vec![done, j], vec![drained, retry]), &[]));
+        assert_eq!(status, "True", "{message}");
+    }
+
+    #[test]
+    fn a_runner_record_from_before_the_job_is_not_quoted_for_its_attempt() {
+        let mut j = backup_job("apprafter-backup-29312340", "2026-09-23T03:00:00Z", vec![]);
+        j["status"]["failed"] = json!(1);
+        let first = exited(
+            pod(&j, "aaaaa", "2026-09-23T03:00:00Z"),
+            1,
+            "2026-09-23T03:00:30Z",
+        );
+        let mut o = observed(vec![j], vec![first]);
+        o.runner_status = Some(json!({
+            "lastFailure": "2026-09-22T03:04:00+00:00", "lastError": "yesterday's error",
+        }));
+        let (_, reason, message) = cond_of(&run(&o, &[]));
+        assert_eq!(reason, REASON_RUNNER_FAILED);
+        assert!(!message.contains("yesterday's error"), "{message}");
+        assert!(!message.contains("The runner recorded"), "{message}");
+    }
+
+    /// The quote beside an attempt's exit code is that attempt's record: a
+    /// later attempt's failure, recorded before its own pod has ended, is not
+    /// put beside an earlier one's.
+    #[test]
+    fn a_later_attempts_record_is_not_quoted_beside_an_earlier_attempt() {
+        let mut j = backup_job("apprafter-backup-29312340", "2026-09-23T03:00:00Z", vec![]);
+        j["status"]["failed"] = json!(1);
+        let first = exited(
+            pod(&j, "aaaaa", "2026-09-23T03:00:00Z"),
+            1,
+            "2026-09-23T03:00:30Z",
+        );
+        let second = running(
+            pod(&j, "bbbbb", "2026-09-23T03:00:45Z"),
+            "2026-09-23T03:00:46Z",
+        );
+        let mut o = observed(vec![j], vec![first, second]);
+        o.runner_status = Some(json!({
+            "lastFailure": "2026-09-23T03:40:00+00:00", "lastError": "the second attempt's error",
+        }));
+        let (_, reason, message) = cond_of(&run(&o, &[]));
+        assert_eq!(reason, REASON_RUNNER_FAILED);
+        assert!(!message.contains("second attempt's error"), "{message}");
+    }
+
+    /// Found by review: a check whose attempts fail slowly — an hour each
+    /// with `--read-data` — outlasts the six-hour deadline before its
+    /// backoff limit, and ended as `DeadlineExceeded`, whose advice is about
+    /// room on the node. Its attempts ran and failed: the repository reason
+    /// it had while retrying is the one it keeps.
+    #[test]
+    fn a_check_that_failed_until_its_deadline_stays_a_repository_check_failure() {
+        let mut check = job(
+            CHECK_CRONJOB,
+            "apprafter-backup-check-29310000",
+            "2026-09-20T06:00:00Z",
+            failed(
+                "DeadlineExceeded",
+                "Job was active longer than specified deadline",
+                "2026-09-20T12:00:02Z",
+            ),
+        );
+        check["status"]["failed"] = json!(6);
+        let own = exited(
+            pod(&check, "eeeee", "2026-09-20T10:00:00Z"),
+            1,
+            "2026-09-20T11:00:00Z",
+        );
+        let mut stopped = pod(&check, "fffff", "2026-09-20T11:00:20Z");
+        stopped = exited(stopped, 1, "2026-09-20T12:00:30Z");
+        stopped["metadata"]["deletionTimestamp"] = json!("2026-09-20T12:00:02Z");
+        let good = backup_job(
+            "apprafter-backup-29312340",
+            "2026-09-23T03:00:00Z",
+            complete("2026-09-23T03:01:00Z"),
+        );
+        let mut o = observed(vec![good, check], vec![own, stopped]);
+        o.cronjobs.push(cronjob(CHECK_CRONJOB));
+        o.runner_status = Some(json!({
+            "lastCheck": "2026-09-20T12:00:05+00:00", "lastCheckResult": "failed",
+            "lastCheckError": "check stopped: the Job's deadline of 6h passed",
+        }));
+        let (status, reason, message) = cond_of(&run(&o, &[]));
+        assert_eq!(
+            (status, reason),
+            ("False", REASON_CHECK_FAILED),
+            "{message}"
+        );
+        for needle in [
+            "failed at 2026-09-20T12:00:02Z: DeadlineExceeded, active longer than its 6h deadline",
+            "Its last failed attempt exited with code 1 (pod apprafter-backup-check-29310000-eeeee",
+            "finds the repository damaged",
+            "The runner recorded: check stopped",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in {message}");
+        }
+    }
+
+    #[test]
+    fn a_backup_that_failed_until_its_deadline_keeps_the_reason_its_attempts_had() {
+        let mut j = backup_job(
+            "apprafter-backup-29312340",
+            "2026-09-23T03:00:00Z",
+            failed(
+                "DeadlineExceeded",
+                "Job was active longer than specified deadline",
+                "2026-09-23T09:00:02Z",
+            ),
+        );
+        j["status"]["failed"] = json!(4);
+        let own = exited(
+            pod(&j, "ccccc", "2026-09-23T06:00:00Z"),
+            1,
+            "2026-09-23T07:30:00Z",
+        );
+        let (status, reason, message) = cond_of(&run(&observed(vec![j.clone()], vec![own]), &[]));
+        assert_eq!(
+            (status, reason),
+            ("False", REASON_RUNNER_FAILED),
+            "{message}"
+        );
+        assert!(message.contains("DeadlineExceeded"), "{message}");
+        assert!(
+            message.contains("Its last failed attempt exited with code 1"),
+            "{message}"
+        );
+        assert!(!message.contains("never started"), "{message}");
+
+        // A runner killed at its limit before the deadline: the kill is the
+        // reason, as it is when the Job gives up on its backoff limit.
+        let own = oom_killed(
+            pod(&j, "ccccc", "2026-09-23T06:00:00Z"),
+            "2026-09-23T07:30:00Z",
+        );
+        let (_, reason, message) = cond_of(&run(&observed(vec![j], vec![own]), &[]));
+        assert_eq!(reason, REASON_OOM_KILLED, "{message}");
+        assert!(message.contains("DeadlineExceeded"), "{message}");
     }
 
     // -- a Job that has failed --------------------------------------------------
