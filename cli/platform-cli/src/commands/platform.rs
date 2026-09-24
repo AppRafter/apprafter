@@ -663,7 +663,10 @@ pub(crate) fn unhealthy_condition_rows(json: &Value) -> Vec<ConditionRow> {
 /// is what a cluster sees when its running version was yanked after it was
 /// installed — the resolver skips yanked releases — and the line says that
 /// when `YankedVersion` does; it used to read "upgrade available" for a
-/// downgrade. A version that does not parse is named and not judged.
+/// downgrade. A version that does not parse is named and not judged — and so
+/// is the channel's release before anything is installed (`currentVersion`
+/// unset): there is nothing to upgrade from. Build metadata does not order
+/// releases.
 pub(crate) fn version_summary_line(json: &Value) -> String {
     let status = json.get("status").cloned().unwrap_or(Value::Null);
     let current = status
@@ -682,20 +685,26 @@ pub(crate) fn version_summary_line(json: &Value) -> String {
     let Some(available) = available else {
         return format!("Platform: {current}");
     };
-    match (semver(current), semver(available)) {
-        (Some(c), Some(a)) if a > c => {
+    // Precedence, not `Ord`: build metadata does not order releases (SemVer
+    // §10), so `0.2.80+build.1` and `0.2.80` are the same one; semver's `Ord`
+    // orders by it and called one "older" than the other.
+    let order = match (semver(current), semver(available)) {
+        (Some(c), Some(a)) => a.cmp_precedence(&c),
+        _ => return format!("Platform: {current} — the channel's newest release: {available}"),
+    };
+    match order {
+        std::cmp::Ordering::Greater => {
             format!("Platform: {current} — upgrade available: {available}")
         }
-        (Some(c), Some(a)) if a == c => format!("Platform: {current}"),
-        (Some(_), Some(_)) if yanked => format!(
+        std::cmp::Ordering::Equal => format!("Platform: {current}"),
+        std::cmp::Ordering::Less if yanked => format!(
             "Platform: {current} — yanked; the channel's newest release that is not yanked, \
              {available}, is older than this one, so there is no upgrade to take"
         ),
-        (Some(_), Some(_)) => format!(
+        std::cmp::Ordering::Less => format!(
             "Platform: {current} — no upgrade: the channel's newest release, {available}, is \
              older than this one"
         ),
-        _ => format!("Platform: {current} — the channel's newest release: {available}"),
     }
 }
 
@@ -2148,6 +2157,56 @@ mod tests {
             "status": { "currentVersion": "v0.2.80", "availableVersion": "0.2.80" }
         });
         assert_eq!(version_summary_line(&same), "Platform: v0.2.80");
+    }
+
+    /// FIRES: build metadata is not part of a version's precedence (SemVer
+    /// §10), so `0.2.80+build.1` and `0.2.80` are one release. semver's `Ord`
+    /// orders by it anyway, and the line called the channel's `0.2.80`
+    /// "older than this one". Pre-release still orders, as it must.
+    #[test]
+    fn version_summary_line_ignores_build_metadata() {
+        for (current, available) in [
+            ("0.2.80+build.1", "0.2.80"),
+            ("0.2.80", "0.2.80+build.1"),
+            ("0.2.80+a", "v0.2.80+b"),
+        ] {
+            let stack = json!({
+                "status": { "currentVersion": current, "availableVersion": available }
+            });
+            assert_eq!(
+                version_summary_line(&stack),
+                format!("Platform: {current}"),
+                "{current} vs {available}"
+            );
+        }
+        let rc = json!({
+            "status": { "currentVersion": "0.2.53-rc.1+build.7", "availableVersion": "0.2.53" }
+        });
+        assert!(
+            version_summary_line(&rc).contains("upgrade available: 0.2.53"),
+            "{}",
+            version_summary_line(&rc)
+        );
+        let newer_build = json!({
+            "status": { "currentVersion": "0.2.80", "availableVersion": "0.2.81+build.1" }
+        });
+        assert!(
+            version_summary_line(&newer_build).contains("upgrade available"),
+            "{}",
+            version_summary_line(&newer_build)
+        );
+    }
+
+    /// A PlatformStack with nothing installed yet — no `currentVersion` —
+    /// has nothing to upgrade FROM: the line names what the channel offers
+    /// and does not call it an upgrade. (It used to, by string inequality.)
+    #[test]
+    fn version_summary_line_before_anything_is_installed_names_the_channels_release() {
+        let stack = json!({ "status": { "availableVersion": "0.2.80" } });
+        assert_eq!(
+            version_summary_line(&stack),
+            "Platform: (unset) — the channel's newest release: 0.2.80"
+        );
     }
 
     /// A version that does not parse is neither an upgrade nor a downgrade:
