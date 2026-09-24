@@ -137,11 +137,17 @@ scheduler cannot place, with the scheduler's reason, and `apprafter top` shows
 what is left in its `SCHEDULABLE` column. The recipe is [the backup runner's
 pod cannot be scheduled](../operator-guide/backup-restore.md#runner-unschedulable).
 
-The backup is also the pod that gives way. Its pods have a priority below every
-other pod's, so when the node is short of room any other pod waiting for it is
-placed first, and a pod that needs the room of a backup that is running stops
-that backup, which runs again once there is room. A platform component that
-restarts during an upgrade never waits for a backup to finish. [ADR
+The backup is also the pod that gives way. From platform 0.2.80 its pods have a
+priority below every other pod's, so when the node is short of room any other
+pod waiting for it is placed first, and a pod that needs the room of a backup
+that is running stops that backup, which runs again once there is room. A
+platform component that restarts during an upgrade then waits at most for the
+backup's runner to stop, which takes up to its 90-second grace period, not for
+the backup to finish, and `apprafter status` reports the stopped backup. A
+runner pod created before the upgrade to 0.2.80 keeps the default priority it
+was created with and does not give way, so a backup Job still waiting for room
+is best deleted before upgrading (`apprafter backup status` names it); the next
+scheduled backup starts at the new priority. [ADR
 0053](../adr/0053-resource-governance.md#amendment-the-backup-runner-gives-way-2026-09-24)
 records why.
 
