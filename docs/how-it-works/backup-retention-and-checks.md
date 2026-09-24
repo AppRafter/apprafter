@@ -583,8 +583,9 @@ Four rules keep it from raising false alarms, and from going quiet:
   `apprafter backup run` did, so a later successful run returns the condition
   to `True`. An unfinished run in trouble counts before any finished one,
   because a scheduled run that cannot start holds back every later one. A
-  failed check turns the condition `False` even while backups succeed, and a
-  backup failure is reported before a check failure.
+  failed check turns the condition `False` even while backups succeed. When
+  both fail, the backup's failure is the reason, and the message ends by naming
+  the check's (`Also failing: repository check Job …`).
 - While the condition stays `False`, its transition time stays where the
   failure began, even when the cause changes: a pod that could not be placed,
   and then the deadline that stopped its Job.

@@ -36,7 +36,9 @@
 //!   recent finished check passed (or none has run yet), and no unfinished
 //!   run is in trouble.
 //! - **False** when a run is in trouble: named by `reason`, with a `message`
-//!   that names the Job, the pod and the cause.
+//!   that names the Job, the pod and the cause. When the backup and the check
+//!   are both in trouble, the backup's is the reason and the message ends by
+//!   naming the check's (`Also failing: …`).
 //! - **Unknown** when nothing can be judged yet: no run has finished, the
 //!   CronJob has not been deployed, or the objects could not be read. Never
 //!   `True` on no evidence.
@@ -338,9 +340,28 @@ pub fn assess(
         StdDuration::from_secs(u64::try_from(secs).unwrap_or(1))
     });
 
+    // One reason per condition, and a backup failure is it. A check that
+    // fails too is still named, at the end of the message, where the kept
+    // description of a failed Job does not carry it forward (`own_part`).
+    let check_subject = check
+        .as_ref()
+        .map(|c| c.subject.clone())
+        .unwrap_or_default();
     let verdict = match (backup.outcome, check.map(|c| c.outcome)) {
-        (Outcome::Trouble { reason, message }, _)
-        | (_, Some(Outcome::Trouble { reason, message })) => Verdict::Condition {
+        (Outcome::Trouble { reason, message }, check) => {
+            let also = match check {
+                Some(Outcome::Trouble { reason: r, .. }) => {
+                    format!("{ALSO_FAILING}{check_subject} ({r}).")
+                }
+                _ => String::new(),
+            };
+            Verdict::Condition {
+                status: "False",
+                reason,
+                message: format!("{message}{also}"),
+            }
+        }
+        (_, Some(Outcome::Trouble { reason, message })) => Verdict::Condition {
             status: "False",
             reason,
             message,
@@ -363,6 +384,17 @@ pub fn assess(
         verdict,
         recheck_after,
     }
+}
+
+/// What introduces the second run's trouble, after the first's message.
+const ALSO_FAILING: &str = " Also failing: ";
+
+/// A condition message without the other run's trouble named after it:
+/// what a failed Job's own description was.
+fn own_part(message: &str) -> &str {
+    message
+        .rfind(ALSO_FAILING)
+        .map_or(message, |i| &message[..i])
 }
 
 fn unknown(reason: &'static str, message: String) -> Verdict {
@@ -449,6 +481,9 @@ enum Outcome {
 struct RunAssessment {
     outcome: Outcome,
     recheck_at: Option<DateTime<Utc>>,
+    /// What the outcome is about, to name it beside the other run's
+    /// trouble: `repository check Job <name>`, or the CronJob itself.
+    subject: String,
 }
 
 /// How a finished Job ended.
@@ -510,6 +545,7 @@ fn assess_run(
                 ),
             },
             recheck_at: None,
+            subject: format!("CronJob {BACKUP_NAMESPACE}/{cron}"),
         };
     }
 
@@ -534,22 +570,27 @@ fn assess_run(
     // An unfinished run in trouble is the most urgent thing to say: a
     // scheduled one holds the schedule while it waits.
     let mut recheck_at: Option<DateTime<Utc>> = None;
-    let mut trouble: Option<Outcome> = None;
+    let mut trouble: Option<(Outcome, &Value)> = None;
     for job in jobs.iter().filter(|j| ending(j).is_none()) {
         let (found, at) = unfinished_trouble(run, job, observed, now);
         recheck_at = earliest(recheck_at, at);
         if trouble.is_none() {
-            trouble = found;
+            trouble = found.map(|o| (o, *job));
         }
     }
-    if let Some(outcome) = trouble {
+    if let Some((outcome, job)) = trouble {
         return RunAssessment {
             outcome,
             recheck_at,
+            subject: format!("{noun} Job {}", name(job)),
         };
     }
 
     let finished = jobs.iter().find_map(|j| ending(j).map(|e| (*j, e)));
+    let subject = finished
+        .as_ref()
+        .map(|(job, _)| format!("{noun} Job {}", name(job)))
+        .unwrap_or_default();
     let outcome = match finished {
         Some((
             job,
@@ -571,6 +612,7 @@ fn assess_run(
     RunAssessment {
         outcome,
         recheck_at,
+        subject,
     }
 }
 
@@ -1022,6 +1064,7 @@ fn failed_job(
                     )
                 })
                 .and_then(|p| p.message.as_deref())
+                .map(own_part)
                 .and_then(|m| m.strip_prefix(prefix.as_str()))
                 .map(|m| {
                     let held = holds_the_schedule(noun);
@@ -1131,7 +1174,10 @@ fn failed_job(
         {
             return Outcome::Trouble {
                 reason,
-                message: p.message.clone().unwrap_or(message),
+                message: p
+                    .message
+                    .as_deref()
+                    .map_or(message, |m| own_part(m).to_string()),
             };
         }
     }
@@ -2841,11 +2887,123 @@ mod tests {
         );
         let mut o = observed(vec![bad, check], vec![]);
         o.cronjobs.push(cronjob(CHECK_CRONJOB));
-        let (_, _, message) = cond_of(&run(&o, &[]));
+        let (_, reason, message) = cond_of(&run(&o, &[]));
+        assert_eq!(reason, REASON_DEADLINE_EXCEEDED);
         assert!(
             message.starts_with("backup Job apprafter-backup-29312340:"),
             "{message}"
         );
+        // Found by review: the check's failure was computed and dropped, so
+        // nothing said the repository check failed too until backups
+        // recovered. One reason per condition; the message names the other.
+        assert!(
+            message.ends_with(
+                " Also failing: repository check Job apprafter-backup-check-29310000 \
+                 (RepositoryCheckFailed)."
+            ),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_suspended_check_is_named_beside_a_failing_backup() {
+        let bad = backup_job(
+            "apprafter-backup-29312340",
+            "2026-09-23T03:00:00Z",
+            failed("DeadlineExceeded", "", "2026-09-23T03:30:00Z"),
+        );
+        let mut o = observed(vec![bad], vec![]);
+        let mut check = cronjob(CHECK_CRONJOB);
+        check["spec"]["suspend"] = json!(true);
+        o.cronjobs.push(check);
+        let (_, _, message) = cond_of(&run(&o, &[]));
+        assert!(
+            message.ends_with(
+                " Also failing: CronJob apprafter-system/apprafter-backup-check \
+                 (ScheduleSuspended)."
+            ),
+            "{message}"
+        );
+    }
+
+    /// The failed backup Job's description is kept once written (a finished
+    /// Job does not change), but what it says about the check is not part of
+    /// it: a check that has since passed must not stay named as failing.
+    #[test]
+    fn a_kept_backup_failure_drops_a_check_failure_that_has_cleared() {
+        let bad = backup_job(
+            "apprafter-backup-29312340",
+            "2026-09-23T03:00:00Z",
+            failed("DeadlineExceeded", "", "2026-09-23T03:30:00Z"),
+        );
+        let check_bad = job(
+            CHECK_CRONJOB,
+            "apprafter-backup-check-29310000",
+            "2026-09-21T06:00:00Z",
+            failed("BackoffLimitExceeded", "", "2026-09-21T06:12:00Z"),
+        );
+        let mut o = observed(vec![bad.clone(), check_bad.clone()], vec![]);
+        o.cronjobs.push(cronjob(CHECK_CRONJOB));
+        let both = run(&o, &[]);
+        assert!(cond_of(&both).2.contains("Also failing"), "{:?}", both);
+
+        let check_good = job(
+            CHECK_CRONJOB,
+            "apprafter-backup-check-29320000",
+            "2026-09-23T10:00:00Z",
+            complete("2026-09-23T10:20:00Z"),
+        );
+        let mut o = observed(vec![bad, check_bad, check_good], vec![]);
+        o.cronjobs.push(cronjob(CHECK_CRONJOB));
+        let after = assess(true, Ok(&o), &as_prior(&both), now());
+        let (status, reason, message) = cond_of(&after);
+        assert_eq!((status, reason), ("False", REASON_DEADLINE_EXCEEDED));
+        assert!(!message.contains("Also failing"), "{message}");
+        assert!(!message.contains("apprafter-backup-check"), "{message}");
+        // And it is still the kept description of the backup Job.
+        let (_, _, first) = cond_of(&both);
+        assert!(first.starts_with(message.as_str()), "{first} / {message}");
+    }
+
+    /// The deadline quotes what the condition said about a pod that was
+    /// never placed; that quote is the backup's own words, never the check
+    /// named after them, or a still-failing check is named twice.
+    #[test]
+    fn a_deadline_quotes_only_the_backups_own_earlier_words() {
+        let j = backup_job("apprafter-backup-29312340", "2026-09-23T03:00:00Z", vec![]);
+        let p = unschedulable(
+            pod(&j, "x7k2q", "2026-09-23T03:00:00Z"),
+            "2026-09-23T03:00:04Z",
+        );
+        let check = job(
+            CHECK_CRONJOB,
+            "apprafter-backup-check-29310000",
+            "2026-09-21T06:00:00Z",
+            failed("BackoffLimitExceeded", "", "2026-09-21T06:12:00Z"),
+        );
+        let mut o = observed(vec![j.clone(), check.clone()], vec![p]);
+        o.cronjobs.push(cronjob(CHECK_CRONJOB));
+        let before = run(&o, &[]);
+        assert_eq!(cond_of(&before).1, REASON_UNSCHEDULABLE);
+        assert!(cond_of(&before).2.contains("Also failing"));
+
+        let mut ended = j;
+        ended["status"]["conditions"] = json!(failed(
+            "DeadlineExceeded",
+            "Job was active longer than specified deadline",
+            "2026-09-23T09:00:02Z"
+        ));
+        let mut o = observed(vec![ended, check], vec![]);
+        o.cronjobs.push(cronjob(CHECK_CRONJOB));
+        let after = assess(true, Ok(&o), &as_prior(&before), now());
+        let (_, reason, message) = cond_of(&after);
+        assert_eq!(reason, REASON_DEADLINE_EXCEEDED);
+        assert!(message.contains("Its runner never started"), "{message}");
+        assert_eq!(message.matches("Also failing").count(), 1, "{message}");
+        assert!(!message.contains("no later scheduled"), "{message}");
+        // Re-read, the same bytes.
+        let again = assess(true, Ok(&o), &as_prior(&after), now());
+        assert_eq!(after.verdict, again.verdict);
     }
 
     #[test]
