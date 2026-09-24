@@ -977,6 +977,10 @@ fn restore_artifact_tree(
     ) {
         println!("{line}");
     }
+    // A named per-claim snapshot resolves to its run's commit snapshot.
+    if let Some(line) = named_claim_line(&run) {
+        println!("{line}");
+    }
 
     restic.restore_snapshot(&run.commit, restore_root)?;
     let dd = find_data_dir(restore_root)?;
@@ -1001,6 +1005,19 @@ fn restore_artifact_tree(
         }
     }
     Ok(dd)
+}
+
+/// What a restore says when the snapshot it was given does not complete its
+/// run: it replays the whole run, from a commit snapshot that is not the one
+/// named. `None` when the named snapshot is the commit point. Pure.
+fn named_claim_line(run: &backup_core::restore::RunSnapshots) -> Option<String> {
+    let named = run.resolved_from.as_deref()?;
+    Some(format!(
+        "  snapshot {} is one of its run's per-claim snapshots and carries no manifest.json; \
+         a restore replays the whole run, from its commit snapshot {}.",
+        short_id(named),
+        short_id(&run.commit)
+    ))
 }
 
 /// The eight-character short form restic prints for a snapshot id.
@@ -5369,6 +5386,97 @@ mod tests {
             std::fs::read_to_string(dd.join("pg/demo/db.dump")).unwrap(),
             "PGDUMP-A"
         );
+    }
+
+    /// FIRES: `--snapshot <a per-claim snapshot of a complete run>` took the
+    /// claim for the commit point, fetched its whole dump, then failed on
+    /// "no manifest.json". It restores the run the claim belongs to, commit
+    /// point first — exactly what naming the run's own commit snapshot does.
+    #[test]
+    fn restore_artifact_tree_restores_the_whole_run_of_a_named_claim_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let restic = FakeRestic::new(sequential_listing())
+            .with_tree("commit", &[("staging/data/manifest.json", "{}")])
+            .with_tree("claimA", &[("claim-0/data/pg/demo/db.dump", "PGDUMP-A")])
+            .with_tree(
+                "claimB",
+                &[("claim-1/data/redis/demo/cache/dump.tar", "TAR-B")],
+            );
+
+        let dd =
+            restore_artifact_tree(&restic, "claimB", root.path(), Some(TEST_CLUSTER_UID)).unwrap();
+
+        assert_eq!(
+            *restic.restored.borrow(),
+            vec![
+                "commit".to_string(),
+                "claimA".to_string(),
+                "claimB".to_string()
+            ],
+            "the named claim's whole run, commit point first"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dd.join("pg/demo/db.dump")).unwrap(),
+            "PGDUMP-A"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dd.join("redis/demo/cache/dump.tar")).unwrap(),
+            "TAR-B"
+        );
+    }
+
+    /// FIRES: a claim of a run that never finished was downloaded before the
+    /// restore failed on the missing manifest. It is refused, with nothing
+    /// fetched.
+    #[test]
+    fn restore_artifact_tree_refuses_a_claim_of_an_unfinished_run_before_fetching_it() {
+        let root = tempfile::tempdir().unwrap();
+        let listing = r#"[
+          {"id":"commit","time":"2026-09-02T19:11:31Z","tags":["platform-run-1"],
+           "paths":["/tmp/apprafter-backup-x/data"]},
+          {"id":"deadA","time":"2026-09-03T19:11:29Z","tags":["platform-run-2"],
+           "paths":["/tmp/apprafter-backup-y/claim-0"]},
+          {"id":"deadB","time":"2026-09-03T19:11:30Z","tags":["platform-run-2"],
+           "paths":["/tmp/apprafter-backup-y/claim-1"]}
+        ]"#;
+        let restic = FakeRestic::new(listing)
+            .with_tree("deadA", &[("claim-0/data/pg/demo/db.dump", "PGDUMP-A")]);
+
+        let err = restore_artifact_tree(&restic, "deadA", root.path(), Some(TEST_CLUSTER_UID))
+            .unwrap_err();
+
+        assert!(
+            restic.restored.borrow().is_empty(),
+            "nothing may be fetched: {:?}",
+            restic.restored.borrow()
+        );
+        let err = format!("{err}");
+        assert!(err.contains("platform-run-2"), "{err}");
+        assert!(err.contains("nothing was downloaded"), "{err}");
+    }
+
+    /// What the restore says when the snapshot it was given is a claim: the
+    /// commit snapshot it replays from is not the one named, and a silent
+    /// substitution would read as a restore of something else.
+    #[test]
+    fn a_named_claim_is_said_to_be_restored_as_its_whole_run() {
+        let run = backup_core::restore::RunSnapshots {
+            commit: "d1e2f3a4b5c6".into(),
+            claims: vec!["a1b2c3d4e5f6".into()],
+            passed_over: Vec::new(),
+            resolved_from: Some("a1b2c3d4e5f6".into()),
+        };
+        let line = named_claim_line(&run).expect("a claim was named");
+        assert!(line.contains("snapshot a1b2c3d4 "), "{line}");
+        assert!(line.contains("per-claim"), "{line}");
+        assert!(line.contains("whole run"), "{line}");
+        assert!(line.contains("commit snapshot d1e2f3a4"), "{line}");
+
+        let named_commit = backup_core::restore::RunSnapshots {
+            resolved_from: None,
+            ..run
+        };
+        assert_eq!(named_claim_line(&named_commit), None);
     }
 
     /// A monolithic backup is one snapshot carrying everything: nothing else is

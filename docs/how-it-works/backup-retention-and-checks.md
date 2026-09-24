@@ -163,7 +163,8 @@ anything:
   snapshots. When the target has none of its own and the repository holds more
   than one cluster, it refuses rather than guessing; when the repository holds
   exactly one cluster it resolves normally, which is the ordinary
-  disaster-recovery case. An explicit `--snapshot <id>` is always honoured.
+  disaster-recovery case. An explicit `--snapshot <id>` is honoured whichever
+  cluster wrote it.
 - **`apprafter backup show`** with no snapshot named resolves `latest` through
   that same rule, deliberately the same code. `show` is read-only, but it is
   what you read before choosing what to restore, so it must be looking at the

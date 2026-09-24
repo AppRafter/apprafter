@@ -65,6 +65,11 @@ pub struct RunSnapshots {
     /// they never completed ([`UnfinishedRun`]). Always empty for a snapshot
     /// named by id.
     pub passed_over: Vec<UnfinishedRun>,
+    /// The snapshot the caller named, when it is not the one that completes
+    /// its run — a per-claim snapshot of a sequential run. `commit` is then
+    /// that run's commit snapshot, and the named one is among `claims`.
+    /// `None` for `latest` and for a named snapshot that completes its run.
+    pub resolved_from: Option<String>,
 }
 
 /// A backup run no snapshot of which carries `manifest.json`: a sequential run
@@ -165,7 +170,11 @@ pub struct LatestSnapshot {
 ///
 /// An EXPLICIT snapshot id is always honoured, whatever cluster it belongs to:
 /// naming an id is the operator saying which run they mean, and it is the
-/// escape hatch the refusal above points at.
+/// escape hatch the refusal above points at. It names a RUN: a snapshot that
+/// does not complete its run — a per-claim one — resolves to the snapshot
+/// that does ([`RunSnapshots::resolved_from`] says so), and one whose run
+/// has no such snapshot is refused before anything is downloaded
+/// ([`commit_of_named_run`]).
 pub fn resolve_run_snapshots(
     snapshots_json: &str,
     requested: &str,
@@ -176,9 +185,9 @@ pub fn resolve_run_snapshots(
     // `latest` is the newest snapshot that completes its run — which is what
     // the sequential writer makes the commit point: it is written LAST — and
     // only ever within ONE cluster's snapshots (E2).
-    let (commit, passed_over) = if requested == "latest" {
+    let (commit, passed_over, resolved_from) = if requested == "latest" {
         let latest = choose_latest(&snaps, this_cluster_uid)?;
-        (latest.commit, latest.passed_over)
+        (latest.commit, latest.passed_over, None)
     } else {
         let named = snaps
             .iter()
@@ -189,7 +198,9 @@ pub fn resolve_run_snapshots(
                     || s.get("short_id").and_then(Value::as_str) == Some(requested)
             })
             .ok_or_else(|| format!("no snapshot matching `{requested}` in this repository"))?;
-        (named, Vec::new())
+        let commit = commit_of_named_run(&snaps, named, requested)?;
+        let resolved_from = (!std::ptr::eq(commit, named)).then(|| id_of(named));
+        (commit, Vec::new(), resolved_from)
     };
 
     let commit_id = id_of(commit);
@@ -214,7 +225,61 @@ pub fn resolve_run_snapshots(
         commit: commit_id,
         claims: claims.into_iter().map(|(_, id)| id).collect(),
         passed_over,
+        resolved_from,
     })
+}
+
+/// The snapshot a restore of `named` starts from: `named` when it completes
+/// its run, else the snapshot of its run that does — by the same rule as
+/// `latest` ([`RunSizes::completes`]) — and an error, before anything is
+/// downloaded, when the run has none.
+///
+/// A named snapshot used to be taken as the commit point whatever it was. A
+/// per-claim snapshot named that way was downloaded whole — a database dump,
+/// a volume — and the restore then failed on "no manifest.json … is this an
+/// AppRafter backup repo?". A restore replays whole runs, so a claim of a
+/// complete run means that run; a claim of an unfinished one has nothing to
+/// replay it from, and restoring part of a run is not supported.
+fn commit_of_named_run<'a>(
+    snaps: &'a [Value],
+    named: &'a Value,
+    requested: &str,
+) -> Result<&'a Value, String> {
+    let runs = RunSizes::of(snaps);
+    if runs.completes(named) {
+        return Ok(named);
+    }
+    let id = id_of(named);
+    let tag = run_tag_of(named);
+    if tag.is_empty() {
+        // The untagged snapshots are one group to the prune, but a restore
+        // never gathers them into a run (see the claims above).
+        return Err(format!(
+            "snapshot `{requested}` ({id}) carries no run tag, so no run can be put together \
+             around it, and it does not complete one by itself — it is not a backup run a \
+             restore can replay, so nothing was downloaded. `apprafter backup list` shows the \
+             complete runs; name one of those with `--snapshot <id>`, or leave `--snapshot` out \
+             for the newest complete run."
+        ));
+    }
+    let run: Vec<&Value> = snaps.iter().filter(|s| run_tag_of(s) == tag).collect();
+    if let Some(commit) = run
+        .iter()
+        .copied()
+        .filter(|s| runs.completes(s))
+        .max_by_key(|s| instant_of(s))
+    {
+        return Ok(commit);
+    }
+    Err(format!(
+        "snapshot `{requested}` ({id}) is one of the {} snapshot(s) of backup run {tag}, and none \
+         of them carries manifest.json: the run was interrupted before its last snapshot, or is \
+         still being written. A restore replays a whole run, starting from the snapshot that \
+         carries its manifest, and restoring part of a run is not supported — so nothing was \
+         downloaded. `apprafter backup list` shows the complete runs; name one of those with \
+         `--snapshot <id>`, or leave `--snapshot` out for the newest complete run.",
+        run.len()
+    ))
 }
 
 /// The snapshot id `latest` means for THIS cluster, for a caller that wants
@@ -1132,6 +1197,91 @@ mod tests {
         let r = resolve_run_snapshots(&interrupted_listing(), "d-commit", Some(MINE)).unwrap();
         assert_eq!(r.commit, "d-commit");
         assert!(r.passed_over.is_empty());
+        assert_eq!(
+            r.resolved_from, None,
+            "the named snapshot completes its run"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // A snapshot named by id that does not complete its run.
+    // -----------------------------------------------------------------------
+
+    /// FIRES: `--snapshot <a per-claim snapshot of a complete run>` took the
+    /// claim as the commit point, downloaded its whole dump, then failed on
+    /// "no manifest.json … is this an AppRafter backup repo?". A restore
+    /// replays whole runs, so it resolves to the run's commit snapshot, with
+    /// the named claim among the run's claims, and says which it named.
+    #[test]
+    fn a_named_claim_of_a_complete_run_resolves_to_that_runs_commit() {
+        for named in ["d-claim0", "d-claim1"] {
+            let r = resolve_run_snapshots(&interrupted_listing(), named, Some(MINE)).unwrap();
+            assert_eq!(r.commit, "d-commit", "{named}");
+            assert_eq!(r.claims, vec!["d-claim0", "d-claim1"], "{named}");
+            assert_eq!(r.resolved_from.as_deref(), Some(named));
+            assert!(r.passed_over.is_empty());
+        }
+        // By a short-id prefix, as `backup list` prints it, too.
+        let r = resolve_run_snapshots(&interrupted_listing(), "d-cla", Some(MINE)).unwrap();
+        assert_eq!(r.commit, "d-commit");
+    }
+
+    /// FIRES: `--snapshot <a claim of an unfinished run>` was accepted and
+    /// downloaded before failing on the missing manifest. There is no commit
+    /// snapshot to resolve to, and restoring part of a run is not supported,
+    /// so it is refused before anything is fetched — naming the run.
+    #[test]
+    fn a_named_snapshot_of_an_unfinished_run_is_refused() {
+        let err = resolve_run_snapshots(&interrupted_listing(), "c-claim0", Some(MINE))
+            .expect_err("an unfinished run has nothing to restore from");
+        assert!(err.contains("`c-claim0`"), "{err}");
+        assert!(err.contains("2 snapshot(s) of backup run"), "{err}");
+        assert!(
+            err.contains(&format!("{MINE}-2026-09-24T03:00:00Z")),
+            "{err}"
+        );
+        assert!(err.contains("none of them carries manifest.json"), "{err}");
+        assert!(
+            err.contains("restoring part of a run is not supported"),
+            "{err}"
+        );
+        assert!(err.contains("nothing was downloaded"), "{err}");
+        assert!(err.contains("`--snapshot <id>`"), "{err}");
+    }
+
+    /// A lone `claim-0` — a one-claim sequential run stopped before its
+    /// commit — is an unfinished run of one snapshot, and refused the same
+    /// way.
+    #[test]
+    fn a_named_lone_claim_snapshot_is_refused() {
+        let listing = format!(
+            r#"[{{"id":"lone","time":"2026-09-24T03:00:01Z",
+                  "tags":["{MINE}-2026-09-24T03:00:00Z"],"paths":["/s/b/claim-0"]}}]"#
+        );
+        let err = resolve_run_snapshots(&listing, "lone", Some(MINE)).unwrap_err();
+        assert!(err.contains("1 snapshot(s) of backup run"), "{err}");
+    }
+
+    /// An untagged snapshot that does not complete a run — one of several
+    /// untagged snapshots, none a commit — has no run to resolve to at all:
+    /// refused, rather than downloaded to fail.
+    #[test]
+    fn a_named_untagged_snapshot_that_completes_nothing_is_refused() {
+        let listing = r#"[
+          {"id":"u1","time":"2026-09-24T03:00:01Z","tags":[],"paths":["/x/data"]},
+          {"id":"u2","time":"2026-09-24T03:00:02Z","tags":[],"paths":["/y/data"]}
+        ]"#;
+        let err = resolve_run_snapshots(listing, "u1", Some(MINE)).unwrap_err();
+        assert!(err.contains("`u1`"), "{err}");
+        assert!(err.contains("carries no run tag"), "{err}");
+        assert!(err.contains("nothing was downloaded"), "{err}");
+        // …while one untagged snapshot on its own completes its run, as the
+        // prune counts it, and is honoured.
+        let one = r#"[{"id":"u1","time":"2026-09-24T03:00:01Z","tags":[],"paths":["/x/data"]}]"#;
+        assert_eq!(
+            resolve_run_snapshots(one, "u1", Some(MINE)).unwrap().commit,
+            "u1"
+        );
     }
 
     // -----------------------------------------------------------------------

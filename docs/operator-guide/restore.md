@@ -24,7 +24,9 @@ apprafter restore <repo> [--target <name>] [--snapshot <id>] \
 `restore` replays a `backup create` artifact into a **running, already
 bootstrapped** target cluster. The target defaults to the active target; pass
 `--target <name>` to pick another registered target. `--snapshot` selects a
-specific snapshot (default `latest`).
+specific run (default `latest`) by the id of any of its snapshots: a per-claim
+snapshot restores its whole run, and a snapshot of a run that never finished is
+refused before anything is downloaded.
 
 `latest` stays inside one cluster's history. When the target has snapshots of
 its own in the repository, `latest` is the freshest of **those**. When it does
