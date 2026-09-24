@@ -70,12 +70,15 @@ pub const HELPER_DELETE_BOUND: Duration = Duration::from_secs(10);
 /// `--limit-download`) are not used; the runner passes none. The signal does
 /// not cancel a pack transfer restic is throttling: restic finishes it at the
 /// throttled rate, and only then removes its lock and exits. So the wait is
-/// up to one pack's size over the rate, which for restic's default 16 MiB
-/// pack at 300 KiB/s is about a minute. Measured with restic 0.18.1 on a
-/// local repository, a `forget --prune` signalled two seconds into its
-/// repack at 300 KiB/s took 9.2 s to exit (SIGTERM and SIGINT alike, 30 MB
-/// of data). Past the bound, restic is killed and its exclusive prune lock
-/// stays.
+/// up to one pack's size over the rate. Both Jobs in the chart set
+/// `RESTIC_PACK_SIZE=4`, so a pack restic uploads is about 4 to 5 MiB (83 for
+/// 400 MB in the WI-386 measurement): about 15 s at 300 KiB/s. A pack it
+/// downloads has the size in use when it was written, restic's default
+/// 16 MiB before the chart set the smaller one: about a minute at the same
+/// rate. Measured with restic 0.18.1 on a local repository, a
+/// `forget --prune` signalled two seconds into its repack at 300 KiB/s took
+/// 9.2 s to exit (SIGTERM and SIGINT alike, 30 MB of data). Past the bound,
+/// restic is killed and its exclusive prune lock stays.
 pub const RESTIC_RELEASE_BOUND: Duration = Duration::from_secs(15);
 /// Step 1, stopping the work: the helper deletes and restic's release run
 /// side by side, so it takes the longer of the two bounds, not their sum.
