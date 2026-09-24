@@ -46,7 +46,10 @@ a key that may delete in that Secret, the command needs no credential flags at
 all; with the scoped one, it stops at the first refused delete, deletes
 nothing, and exits non-zero saying so — pass `--credential-file` with the full
 credentials. On success `prune` stamps `apprafter.io/last-prune` on
-`PlatformStack`, which `backup status` shows and the retention verdict names.
+`PlatformStack`, which `backup status` shows and the retention verdict names —
+but only when it pruned that cluster's own history: its configured repository,
+as its own identity. A prune of another repository, or of another
+`--cluster-uid`, says it stamps nothing.
 Run it on your own cadence (e.g. monthly) — restic dedup makes growth
 sub-linear, so retention is a rare, deliberate operation, not a per-run one;
 the size and growth `backup status` prints are what to judge the cadence by.

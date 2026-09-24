@@ -5443,13 +5443,30 @@ pub fn run_backup_prune(
     // Stamp last-prune so `backup status` can report it. Best-effort ordering:
     // the prune already succeeded, so a merge-patch failure here surfaces as an
     // error (the annotation is the audit trail — we don't want to swallow it).
-    // An offline prune has no CR to stamp; it says so rather than failing,
-    // because the cluster being gone is the whole premise of that path.
+    // Only a prune of THIS cluster's history is stamped on it
+    // ([`last_prune_stamp`]); any other says why it stamps nothing rather
+    // than failing — an offline prune's cluster being gone is the whole
+    // premise of that path.
+    let own_uid = match (kc_path, cluster_uid_override) {
+        (Some(_), None) => Ok(cluster_uid.clone()),
+        (Some(kc), Some(_)) => read_cluster_uid(kc).map_err(|e| e.to_string()),
+        (None, _) => Err("no cluster".to_string()),
+    };
+    let configured_repo = spec_backup
+        .and_then(|s| s.pointer("/bucket"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    if let Err(why) = last_prune_stamp(
+        kc_path.is_some(),
+        &repo,
+        configured_repo,
+        &cluster_uid,
+        own_uid.as_deref().map_err(String::as_str),
+    ) {
+        println!("  (`apprafter.io/last-prune` not stamped: {why})");
+        return Ok(());
+    }
     let Some(kc_path) = kc_path else {
-        println!(
-            "  (no cluster to stamp `apprafter.io/last-prune` on — offline prune by \
-             --cluster-uid)"
-        );
         return Ok(());
     };
     let ts = chrono::Utc::now().to_rfc3339();
@@ -5570,6 +5587,57 @@ fn prune_not_permitted_error(
          <full-credentials.env>` (S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, RESTIC_PASSWORD).",
         outcome.describe()
     ))
+}
+
+/// Does `backup prune` stamp `apprafter.io/last-prune` on the cluster it
+/// resolved? `Ok` to stamp, else why not. Pure.
+///
+/// Only when what was pruned is that cluster's history: `repo` is the
+/// repository its `spec.backup.bucket` names, and `pruned_uid` — the
+/// identity whose snapshots the prune could forget — is its own
+/// `kube-system` UID (`own_uid`, or why it could not be read). The operator's
+/// `BackupRetention` quotes the stamp as "`apprafter backup prune` last ran
+/// against this cluster", and `backup status` shows it as the last prune.
+///
+/// It used to stamp whenever a cluster had been resolved at all. `backup
+/// prune --repo <a rehearsal repository> --cluster-uid <another cluster>`
+/// with no `--keep-*` flags resolves the ACTIVE cluster only to read its
+/// retention policy, and stamped it although neither the repository nor the
+/// identity was its own.
+fn last_prune_stamp(
+    have_cluster: bool,
+    repo: &str,
+    configured_repo: Option<&str>,
+    pruned_uid: &str,
+    own_uid: std::result::Result<&str, &str>,
+) -> std::result::Result<(), String> {
+    if !have_cluster {
+        return Err("no cluster to stamp it on — an offline prune by --cluster-uid".into());
+    }
+    let same_repo = |a: &str, b: &str| a.trim_end_matches('/') == b.trim_end_matches('/');
+    match configured_repo {
+        None => {
+            return Err(format!(
+                "this cluster has no backup repository configured, so {repo} is not its \
+                 repository"
+            ))
+        }
+        Some(configured) if !same_repo(repo, configured) => {
+            return Err(format!(
+                "{repo} is not this cluster's backup repository, {configured}"
+            ))
+        }
+        Some(_) => {}
+    }
+    match own_uid {
+        Ok(own) if own == pruned_uid => Ok(()),
+        Ok(own) => Err(format!(
+            "the history pruned is cluster {pruned_uid}'s, and this cluster is {own}"
+        )),
+        Err(e) => Err(format!(
+            "this cluster's own identity could not be read to check it is {pruned_uid}: {e}"
+        )),
+    }
 }
 
 /// The merge-patch body stamping `apprafter.io/last-prune`.
@@ -10582,6 +10650,75 @@ mod tests {
         );
         assert_eq!(last_prune_annotation(None), None);
         assert_eq!(last_prune_annotation(Some(&json!({"metadata": {}}))), None);
+    }
+
+    /// The cluster the prune resolved: its configured repository and UID.
+    const CLUSTER_REPO: &str = "s3:https://fsn1.example/bk/cluster";
+    const OTHER_UID: &str = "22222222-3333-4444-5555-666666666666";
+
+    /// Stamped: the cluster's own repository, pruned as the cluster's own
+    /// history — with or without `--repo` / `--cluster-uid` naming them.
+    #[test]
+    fn the_last_prune_stamp_goes_on_the_cluster_whose_history_was_pruned() {
+        for repo in [CLUSTER_REPO, "s3:https://fsn1.example/bk/cluster/"] {
+            assert_eq!(
+                last_prune_stamp(true, repo, Some(CLUSTER_REPO), OFFLINE_UID, Ok(OFFLINE_UID)),
+                Ok(())
+            );
+        }
+    }
+
+    /// FIRES (live walk): `backup prune --repo <a rehearsal repository>
+    /// --cluster-uid <another cluster>` with no `--keep-*` flags resolves the
+    /// ACTIVE cluster only to read its retention — and then stamped
+    /// `apprafter.io/last-prune` on it, so its `BackupRetention` said
+    /// `apprafter backup prune` last ran against it when nothing of it was
+    /// touched. Neither a different repository nor a different identity is
+    /// this cluster's prune.
+    #[test]
+    fn a_prune_of_another_repository_or_identity_stamps_nothing() {
+        let other_repo = last_prune_stamp(
+            true,
+            "/srv/rehearsal-repo",
+            Some(CLUSTER_REPO),
+            OFFLINE_UID,
+            Ok(OFFLINE_UID),
+        )
+        .unwrap_err();
+        assert!(other_repo.contains("/srv/rehearsal-repo"), "{other_repo}");
+        assert!(other_repo.contains(CLUSTER_REPO), "{other_repo}");
+
+        let other_uid = last_prune_stamp(
+            true,
+            CLUSTER_REPO,
+            Some(CLUSTER_REPO),
+            OTHER_UID,
+            Ok(OFFLINE_UID),
+        )
+        .unwrap_err();
+        assert!(other_uid.contains(OTHER_UID), "{other_uid}");
+        assert!(other_uid.contains(OFFLINE_UID), "{other_uid}");
+
+        let unconfigured =
+            last_prune_stamp(true, CLUSTER_REPO, None, OFFLINE_UID, Ok(OFFLINE_UID)).unwrap_err();
+        assert!(
+            unconfigured.contains("no backup repository"),
+            "{unconfigured}"
+        );
+
+        let unreadable = last_prune_stamp(
+            true,
+            CLUSTER_REPO,
+            Some(CLUSTER_REPO),
+            OTHER_UID,
+            Err("namespaces \"kube-system\" is forbidden"),
+        )
+        .unwrap_err();
+        assert!(unreadable.contains("forbidden"), "{unreadable}");
+
+        let offline =
+            last_prune_stamp(false, CLUSTER_REPO, None, OFFLINE_UID, Ok(OFFLINE_UID)).unwrap_err();
+        assert!(offline.contains("no cluster"), "{offline}");
     }
 
     #[test]
