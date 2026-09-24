@@ -259,9 +259,11 @@ held the schedule, so no later backup started either.
 runner, no larger minimum machine. Instead:
 
 1. **The runner's request is measured, and it keeps a limit.** A backup run's
-   memory is restic's; the runner itself holds about 8 MiB. restic sizes its
-   concurrency by the CPUs it sees, which with no CPU limit is every CPU of the
-   node (a first backup of a 2 GB database peaked at about 145 MiB of anonymous
+   memory is restic's; the runner itself holds under 2 MiB of anonymous memory
+   (7 to 8 MiB resident, counting the pages of its own binary), and every
+   figure below is anonymous memory too. restic sizes its concurrency by the
+   CPUs it sees, which with no CPU limit is every CPU of the node (a first
+   backup of a 2 GB database peaked at about 145 MiB of anonymous
    memory on 2 CPUs and at 695 MiB on 32), and its memory grows with the
    repository's index, by about 0.1 MiB per thousand blobs past a hundred
    thousand, not with the size of the data, which only adds page cache the
@@ -301,12 +303,16 @@ runner, no larger minimum machine. Instead:
    measured, a first backup into that repository followed by the in-Job
    prune, at 200 MiB. The backup and check Jobs request **128Mi** of memory
    and 100m of CPU, and are limited to **384Mi**. The request covers a first
-   backup of 2 GB into a real bucket, with the runner's own 2 MiB, by about
-   15 MiB, and every later run by more; no first backup larger than 2 GB was
-   measured. The limit is 1.9 times the largest run measured, and without the
-   memory settings a backup into that repository peaked at 280 MiB and passed
-   under it. A run above its request uses memory no other pod was promised,
-   and under node memory pressure it is the first the kubelet evicts (see the
+   backup of 2 GB into a real bucket: restic's 107 MiB against Hetzner Object
+   Storage, or 111 MiB behind a 20 MB/s link, and the runner's own 2 MiB
+   leave 19 or 15 MiB of it, before the kernel memory the container is also
+   charged (2 to 10 MiB in the kind measurement). That is roughly 10 to
+   15 MiB to spare, depending on the link, and the later runs measured there
+   leave more; no first backup larger than 2 GB was measured. The limit is
+   1.9 times the largest run measured, and without the memory settings a
+   backup into that repository peaked at 280 MiB and passed under it. A run
+   above its request uses memory no other pod was promised, and under node
+   memory pressure it is the first the kubelet evicts (see the
    [second amendment](#amendment-the-backup-runner-gives-way-2026-09-24)).
 
    The same measurement found the staging volume unused: the runner staged in
