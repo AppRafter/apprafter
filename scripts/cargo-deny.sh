@@ -43,6 +43,24 @@ else
     _deny() { nix run nixpkgs#cargo-deny -- "$@"; }
 fi
 
+# cargo-deny 0.20 moved `--config` from the `check` subcommand to the top
+# level, and each side rejects the other form ("unexpected argument
+# '--config' found"). CI installs 0.20 (test.yml pins the minor); the nixpkgs
+# fallback above is 0.19 today. Place the flag by the version in use rather
+# than pinning one side and breaking the other.
+deny_version="$(_deny --version | awk '{print $2}')"
+IFS=. read -r deny_major deny_minor _ <<<"$deny_version"
+if [ -z "${deny_minor:-}" ]; then
+    echo "error: could not read the cargo-deny version (got '${deny_version}')" >&2
+    exit 1
+fi
+if [ "$deny_major" -gt 0 ] || [ "$deny_minor" -ge 20 ]; then
+    top_config=(--config "$CONFIG"); check_config=()
+else
+    top_config=(); check_config=(--config "$CONFIG")
+fi
+echo "==> cargo-deny ${deny_version}"
+
 status=0
 for ws in cli operator; do
     [ -f "$ROOT/$ws/Cargo.toml" ] || { echo "==> no $ws/Cargo.toml — skipping"; continue; }
@@ -51,7 +69,7 @@ for ws in cli operator; do
     # after `check` is rejected. It matters: a dependency reachable only behind
     # a feature flag still ships when that feature is on, and CI builds both
     # workspaces with --all-features.
-    if ! ( cd "$ROOT/$ws" && _deny --all-features check --config "$CONFIG" ); then
+    if ! ( cd "$ROOT/$ws" && _deny --all-features "${top_config[@]}" check "${check_config[@]}" ); then
         status=1
     fi
 done

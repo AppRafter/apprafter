@@ -111,9 +111,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: "1.98"
+      # The minor is pinned (patch floats): 0.20 moved `--config` to the top
+      # level, and an unpinned install picks up such a CLI change on the day
+      # install-action's manifest moves. scripts/cargo-deny.sh places the
+      # flag for 0.19 (the nixpkgs fallback) and 0.20 alike.
       - uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
         with:
-          tool: cargo-deny
+          tool: cargo-deny@0.20
       - run: bash scripts/cargo-deny.sh
 
   bun:

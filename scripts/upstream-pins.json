@@ -778,7 +778,23 @@
       "compare": "numeric",
       "gate": null,
       "gateGap": "See actions/checkout.",
-      "note": "Installs cargo-deny for test.yml. Releases several times a week, mostly to refresh its tool manifest, so expect this row BEHIND most weeks. That is not noise: the pinned commit also fixes WHICH cargo-deny gets installed, and an old cargo-deny can stop parsing a newer advisory database."
+      "note": "Installs cargo-deny for test.yml. Releases several times a week, mostly to refresh its tool manifest, so expect this row BEHIND most weeks. That is not noise: the pinned commit fixes which cargo-deny PATCH of the pinned minor gets installed (see tool-cargo-deny), and an old cargo-deny can stop parsing a newer advisory database."
+    },
+    {
+      "id": "tool-cargo-deny",
+      "class": "ci-tool",
+      "title": "cargo-deny minor (test.yml)",
+      "read": {
+        "kind": "regex",
+        "sources": [
+          { "files": ".github/workflows/test.yml", "pattern": "tool:\\s*cargo-deny@([0-9][0-9.]*)" }
+        ]
+      },
+      "upstream": { "kind": "github-release", "repo": "EmbarkStudios/cargo-deny" },
+      "compare": "minor",
+      "gate": null,
+      "gateGap": "The gate is the tool itself: on the bump commit test.yml's cargo-deny job runs scripts/cargo-deny.sh over both workspaces, and `bash scripts/cargo-deny.sh` with the new binary on PATH reproduces it locally. A watch job cannot run it honestly, because the advisory database it fetches moves on its own.",
+      "note": "Pinned to the minor on 2026-09-24 (WI-392): install-action installed whatever its manifest called latest, and 0.20 moved `--config` from the `check` subcommand to the top level, so the first CI run of the gate failed with \"unexpected argument '--config' found\" while every local run (the nixpkgs fallback, 0.19) passed. scripts/cargo-deny.sh now places the flag by the version it finds, so a bump here is a read of the cargo-deny changelog for CLI and config changes, then this literal."
     },
 
     {
