@@ -732,12 +732,14 @@ _backupTemplate: """
 	            # Measured (WI-386) with the settings above, against Hetzner Object
 	            # Storage on two CPUs: a first backup of 400 MB of incompressible
 	            # data peaked at 100 MiB of anonymous memory and one of 2 GB at
-	            # 107 MiB (111 MiB behind a 20 MB/s link); a later run with 40 MB
-	            # new at 93 MiB and one with nothing new at 47 MiB. The runner adds
-	            # 2 MiB of anonymous memory of its own, which leaves 19 MiB of the
-	            # request (15 MiB behind the 20 MB/s link) before the 2 to 10 MiB
-	            # of kernel memory the container is also charged: roughly 10 to
-	            # 15 MiB to spare, depending on the link.
+	            # 107 MiB (111 MiB behind a 20 MB/s link), and a later run with
+	            # 40 MB new at 93 MiB. One with nothing new peaked at 47 MiB with
+	            # restic's default pack size, which does not matter when nothing
+	            # new is uploaded. The runner adds 2 MiB of anonymous memory of
+	            # its own, which leaves 19 MiB of the request (15 MiB behind the
+	            # 20 MB/s link) before the 2 to 10 MiB of kernel memory the
+	            # container is also charged: roughly 10 to 15 MiB to spare,
+	            # depending on the link.
 	            # The data adds page cache, which the limit reclaims, not restic
 	            # heap. The request is what the scheduler must find free on the
 	            # node, so it covers a first backup: a 4 GB node running the

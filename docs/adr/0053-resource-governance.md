@@ -297,8 +297,10 @@ runner, no larger minimum machine. Instead:
    With the three settings, against Hetzner Object Storage, a first backup of
    400 MB peaked at 100 MiB of anonymous memory and one of 2 GB at 107 MiB
    (111 MiB behind a 20 MB/s link); a later run that uploaded 40 MB at 93 MiB,
-   one with nothing new at 47 MiB, and compressible data at 94 MiB. From the
-   kind measurement, where the link did not count: the weekly check at
+   and compressible data at 94 MiB. A later run with nothing new peaked at
+   47 MiB; that one ran with restic's default pack size, which does not
+   matter when nothing new is uploaded (it added 2.6 KB). From the kind
+   measurement, where the link did not count: the weekly check at
    137 MiB on a repository of 1.51 million blobs, and the largest run
    measured, a first backup into that repository followed by the in-Job
    prune, at 200 MiB. The backup and check Jobs request **128Mi** of memory
