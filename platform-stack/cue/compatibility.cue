@@ -1938,7 +1938,7 @@ compatibility: "0.2.80": {
 	change:          "requires-restart"
 	operatorVersion: "v0.2.52"
 	notes: """
-		DEPENDENCY SWEEP, WAVE 1 — every platform controller restarts once; no
+		DEPENDENCY SWEEP — every platform controller restarts once; no
 		application pod and no Postgres, Dragonfly or NATS pod restarts. Nine
 		behaviours change on purpose; read them, and the two checks before
 		upgrading, first.
@@ -1975,16 +1975,20 @@ compatibility: "0.2.80": {
 		retention.enforce, which takes check and is now optional. Written
 		timestamps are byte-identical. Events the operator emits are now named
 		<object>.<hex> instead of <controller>-<random>; nothing depends on their
-		names. The operator gains a read-only Role in apprafter-system (list and
-		watch on cronjobs, jobs and pods) for 6 and 7.
+		names. The backup runner now retries a transient apiserver 429, 503 or
+		504 within the request instead of failing the run; the operator keeps
+		retries off. The operator gains a read-only Role in apprafter-system
+		(list and watch on cronjobs, jobs and pods) for 6 and 7.
 
 		1. LEADER ELECTION. The Lease timings are unchanged (30s, renewed every
 		10s), but a leader now bounds every Lease request, steps down 20s after
 		its last successful renewal — 10s before anyone may take the Lease — and
 		exits; it also exits when it reads another holder. An apiserver outage
-		longer than about 20s therefore restarts the operator pod (restartCount
-		+1, last state Error, log "stepping down as leader") instead of leaving
-		a leader reconciling on an expired Lease beside its successor.
+		that keeps the leader from renewing for 20s — one of 10 to 20s,
+		depending on when it starts — therefore restarts the operator pod
+		(restartCount +1, last state Error, log "stepping down as leader")
+		instead of leaving a leader reconciling on an expired Lease beside its
+		successor.
 
 		2. A REGISTRY BLIP NO LONGER ROLLS YOUR APP. A failed tag-to-digest
 		lookup keeps the digest already running for that image reference and
@@ -2031,10 +2035,11 @@ compatibility: "0.2.80": {
 		the failing command's own error output; "apprafter backup status" names
 		why a Job failed. Mind the default schedules: the 6h backup deadline is
 		longer than the 3h gap from the 03:00 backup to the Sunday 06:00 check,
-		so a Sunday backup that long fails that week's check — move the check
-		with "apprafter backup set check 12:00". Helper pods now live
-		max(deadline, 6h) instead of one hour, so a single large dump or load no
-		longer dies at 60 minutes; interactive backup create, export and restore
+		so a Sunday backup past three hours costs that week's check or that
+		backup — move the check with "apprafter backup set check 12:00". Helper
+		pods now live max(deadline, 6h) instead of one hour, so a single large
+		dump or load no longer dies at 60 minutes; interactive backup create,
+		export and restore
 		get at least six hours too. JetStream helper pods are renamed to include the
 		claim's namespace; a Completed leftover under an old name is no longer
 		reused and can be removed with: kubectl delete pod -n <nats-namespace>
@@ -2054,7 +2059,9 @@ compatibility: "0.2.80": {
 		at its first attempt with a lastError that names the limit. Both
 		CronJobs' pods run at PriorityClass apprafter-backup-runner (value -1,
 		preemptionPolicy Never): a runner never preempts anything, a pod that
-		needs a running runner's room preempts it, and the Job retries. A new
+		needs a running runner's room preempts it, and the Job retries. A runner
+		pod created before the upgrade keeps the default priority and does not
+		give way; only the pods of Jobs the 0.2.80 CronJobs create do. A new
 		PlatformStack condition, BackupHealthy, reads the CronJobs, Jobs and
 		runner pods and says why a backup cannot run: RunnerUnschedulable,
 		RunnerNotStarted, RunnerOOMKilled, RunnerEvicted, RunnerPreempted,
@@ -2086,14 +2093,17 @@ compatibility: "0.2.80": {
 		weeks and months in spec.backup.timeZone (UTC when unset) and files each
 		run under the day it started, so on a cluster with a zone the first
 		prune after the upgrade may keep other runs than the UTC count did. A
-		run a backup may still be writing is left alone until its deadline plus
-		an hour has passed, and a lone claim snapshot no longer takes a complete
+		run a backup may still be writing is left alone until the backup
+		deadline (never less than six hours) plus an hour has passed since its
+		newest snapshot, and a lone claim snapshot no longer takes a complete
 		run's keep slot. Every prune now forgets, verifies that the store really
 		deleted, and only then prunes: restic 0.18.1 reports success for a
-		forget the store refused. "apprafter backup prune" refuses rather than
-		report success when its key may not delete, and without a cluster it
-		needs --timezone <zone>. A prune that fails, or that the key does not
-		permit, does not fail the check Job. The check Job now posts the failure
+		forget the store refused. "apprafter backup prune" now refuses,
+		deleting and writing nothing, when its key may not delete (restic used
+		to write a new index object into the bucket and then fail), and without
+		a cluster it needs --timezone <zone>. A prune that fails, or that the
+		key does not permit, does not fail the check Job. The check Job now
+		posts the failure
 		webhook for a failed check or a failed prune (not for a refused one),
 		records each step in apprafter-backup-status, and keeps restic's cache
 		and the packs a prune rewrites on the staging volume, bounded by
@@ -2117,30 +2127,21 @@ compatibility: "0.2.80": {
 		change such as the storage size still shows OutOfSync.
 
 		UNDER THE HOOD. Rust dependencies refreshed across both workspaces,
-		clearing four RUSTSEC advisories — the load-bearing one RUSTSEC-2026-0285
+		clearing five RUSTSEC advisories — the load-bearing one RUSTSEC-2026-0285
 		(rustls on the kube-client and registry paths). The abandoned
 		oci-distribution crate is replaced by oci-client (the same project after
 		its move to the ORAS org); the two hashes that had to be re-rendered by
 		hand — the ADR 0052 approval content hash and status.envConfig.digest —
 		are proven byte-identical, so no in-flight approval and no application
-		sees a change. Base images move off end-of-life Alpine 3.20/3.21 to
-		3.24. The Argo CD CUE sidecar moves from cue v0.10.0 to v0.17.1, gated on
-		its own injection suite; cue.mod language versions are untouched, so
-		manifests evaluate exactly as before. Backup, export and restore helper
-		pods read the Postgres and NATS passwords by secretKeyRef instead of
-		carrying them in the Pod spec, and the Dragonfly restore no longer
-		passes its password on the command line.
+		sees a change. Base images move to Alpine 3.24: 3.20 is end of life,
+		and 3.21 ends on 2026-11-01. The Argo CD CUE sidecar moves from cue
+		v0.10.0 to v0.17.1 with cue.mod language versions untouched; its
+		manifest-injection and discovery suites pass unchanged under it.
+		Backup, export and restore helper pods read the Postgres and NATS
+		passwords by secretKeyRef instead of carrying them in the Pod spec, and
+		the Dragonfly restore no longer passes its password on the command line.
 		"""
 	references: [
-		"WI-349",
-		"WI-352",
-		"WI-354",
-		"WI-357",
-		"WI-370",
-		"WI-381",
-		"WI-383",
-		"WI-386",
-		"WI-389",
 		"docs/adr/0040-image-digest-resolution.md",
 		"docs/adr/0050-backup-restore.md",
 		"docs/adr/0053-resource-governance.md",
