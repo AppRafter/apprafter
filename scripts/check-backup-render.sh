@@ -69,6 +69,10 @@
 #      the check Job gets its depth from checkReadData / checkReadDataSubset
 #      and the cluster label for the failure webhook; the values schema
 #      refuses a mode that does not exist.
+#   9. every APPRAFTER_* variable either CronJob renders is one the runner
+#      reads: the chart and the runner spell each name in a different
+#      language, and a name misspelt on either side is a setting that reaches
+#      nothing — the runner falls back to its default without a word.
 #
 # Usage: bash scripts/check-backup-render.sh
 # Exit 0 = every assertion held.
@@ -412,6 +416,31 @@ fi
 grep -q "enforce" "$workdir/err" \
     || fail "backup.retention.enforce=weekly failed for a reason that does not name the key: $(cat "$workdir/err")"
 echo "  ok: backup.retention.enforce=weekly is refused by the values schema"
+
+# 9. The names the chart renders are the names the runner reads, with every
+#    optional variable switched on.
+helm template platform "$chart" --values "$enabled" \
+    --set backup.retention.keepDaily=14 \
+    --set backup.retention.keepWeekly=8 \
+    --set backup.retention.keepMonthly=12 \
+    --set backup.failureWebhook=https://hooks.example.com/backup \
+    --set backup.clusterName=eu-prod \
+    >"$workdir/every-knob.yaml"
+names="$("${YQ[@]}" -r 'select(.kind == "CronJob")
+    | .spec.jobTemplate.spec.template.spec.containers[0].env[].name
+    | select(test("^APPRAFTER_"))' "$workdir/every-knob.yaml" | grep '^APPRAFTER_' | sort -u)"
+[[ -n "$names" ]] || fail "no APPRAFTER_* variable found in the rendered CronJobs"
+# The runner's code without its tests: a test that sets the variable by its
+# right name would otherwise stand in for code that reads a misspelt one.
+# Every file keeps its tests in one module at its end.
+runner_code="$(for f in cli/apprafter-backup/src/*.rs; do sed '/^#\[cfg(test)\]$/,$d' "$f"; done)"
+count=0
+while read -r name; do
+    grep -qF "\"$name\"" <<<"$runner_code" \
+        || fail "the chart renders $name, and the runner (cli/apprafter-backup/src, outside its tests) never reads it: the setting reaches nothing"
+    count=$((count + 1))
+done <<<"$names"
+echo "  ok: the runner reads each of the $count APPRAFTER_* variables the CronJobs render"
 
 echo "PASS: both backup CronJobs carry a Job deadline, stop cleanly at it, and"
 echo "      carry the measured resources and restic settings; the check Job runs"

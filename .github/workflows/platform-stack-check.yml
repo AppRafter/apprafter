@@ -50,6 +50,11 @@ on:
       - 'scripts/check-component-enablement.sh'
       - 'scripts/check-component-claim-templates.sh'
       - 'scripts/check-backup-render.sh'
+      # check-backup-render.sh also reads the runner's source: the default
+      # deadline, and the name of every variable the CronJobs render, which
+      # the runner must read. A rename on the runner's side alone breaks it.
+      - 'cli/apprafter-backup/src/**'
+      - 'cli/backup-core/src/helper_pod.rs'
       - '.github/workflows/platform-stack-check.yml'
       - '.github/workflows/platform-stack-publish.yml'
   push:
@@ -65,6 +70,8 @@ on:
       - 'scripts/check-component-enablement.sh'
       - 'scripts/check-component-claim-templates.sh'
       - 'scripts/check-backup-render.sh'
+      - 'cli/apprafter-backup/src/**'
+      - 'cli/backup-core/src/helper_pod.rs'
       - '.github/workflows/platform-stack-check.yml'
       - '.github/workflows/platform-stack-publish.yml'
 
